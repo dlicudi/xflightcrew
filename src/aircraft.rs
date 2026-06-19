@@ -50,6 +50,11 @@ pub struct AircraftProfile {
     /// Electrical systems — battery, avionics master (`set_electrical`).
     #[serde(default)]
     pub electrical: bool,
+    /// Cockpit flood lights (`set_flood_lights`). Separate from `lights` because
+    /// the floods use a mix of write mechanisms (a scalar plus an array element)
+    /// that the scalar-per-light `set_lights` can't express.
+    #[serde(default)]
+    pub flood_lights: bool,
     /// Whether the gear retracts. `false` (e.g. the 172) means no `gear` tool.
     #[serde(default)]
     #[allow(dead_code)]
@@ -169,6 +174,7 @@ fn cessna_172sp() -> AircraftProfile {
         ils: true,
         parking_brake: true,
         electrical: true,
+        flood_lights: true,
         flaps: Some(FlapProfile {
             detents: vec![
                 detent("up", "up", 0.0, None),

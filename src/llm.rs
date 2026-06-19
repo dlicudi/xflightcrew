@@ -173,6 +173,8 @@ mod tests {
             ("turn on the landing light", "set_lights", Some(("light", json!("landing")))),
             ("strobes off", "set_lights", Some(("on", json!(false)))),
             ("beacon on", "set_lights", Some(("light", json!("beacon")))),
+            ("flood lights on", "set_flood_lights", Some(("on", json!(true)))),
+            ("flood lights off", "set_flood_lights", Some(("on", json!(false)))),
             ("autopilot heading 270", "set_heading", None),
             ("fly heading 090", "set_heading", None),
             ("climb and maintain 7000", "set_altitude", None),

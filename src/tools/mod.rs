@@ -85,6 +85,10 @@ impl Registry {
             tools.push(Box::new(lights::SetLights::new(profile.lights.clone())));
         }
 
+        if profile.flood_lights {
+            tools.push(Box::new(lights::SetFloodLights));
+        }
+
         if profile.autopilot {
             tools.push(Box::new(autopilot::SetHeading));
             tools.push(Box::new(autopilot::SetAltitude));
