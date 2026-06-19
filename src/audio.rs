@@ -12,6 +12,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+use crate::ui::{LogKind, Reporter};
+
 /// The sample rate whisper.cpp models are trained on.
 pub const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
@@ -88,17 +90,18 @@ pub fn mic_check(threshold: f32) -> Result<()> {
 pub struct Listener {
     input: Input,
     segmenter: Segmenter,
+    reporter: Reporter,
 }
 
 impl Listener {
     /// Start capturing, then calibrate the VAD to the room's noise floor so the
     /// speech threshold sits above ambient. `vad_floor` is a hard minimum (the
     /// configured `XCOPILOT_VAD_RMS`), so a quiet room can't drive it too low.
-    pub fn start(vad_floor: f32) -> Result<Self> {
+    pub fn start(vad_floor: f32, reporter: Reporter) -> Result<Self> {
         let input = open_input()?;
         input.stream.play().context("starting input stream")?;
 
-        println!("  calibrating microphone — stay quiet for ~1 second…");
+        reporter.log(LogKind::Info, "calibrating microphone — stay quiet for ~1s…");
         std::thread::sleep(Duration::from_millis(300)); // discard startup transient
         input.buffer.lock().unwrap().clear();
         let mut ambient_peak = 0.0f32;
@@ -110,7 +113,10 @@ impl Listener {
             }
         }
         let initial = (ambient_peak * VAD_RATIO).max(vad_floor);
-        println!("  ambient ≈ {ambient_peak:.4} → speech threshold ≈ {initial:.4} (auto-adapts)\n");
+        reporter.log(
+            LogKind::Info,
+            format!("ambient ≈ {ambient_peak:.4} → speech threshold ≈ {initial:.4}"),
+        );
 
         Ok(Self {
             input,
@@ -123,6 +129,7 @@ impl Listener {
                 MAX_SPEECH_MS,
                 FRAME_MS,
             ),
+            reporter,
         })
     }
 
@@ -143,7 +150,9 @@ impl Listener {
             if new.is_empty() {
                 continue;
             }
-            pending.extend(downmix(&new, self.input.channels));
+            let mono = downmix(&new, self.input.channels);
+            self.reporter.mic(rms(&mono)); // feed the dashboard mic meter
+            pending.extend(mono);
 
             // Feed whole frames to the segmenter; keep the remainder for next time.
             let mut offset = 0;

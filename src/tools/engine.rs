@@ -107,7 +107,9 @@ impl Tool for StartEngine {
     fn description(&self) -> &str {
         "Start the engine: runs the start sequence (battery on, mixture rich, \
          throttle cracked, magnetos both, engage the starter). Use for 'start the \
-         engine', 'start her up', 'engine start'."
+         engine', 'start her up', 'engine start', 'engine on', 'engines on', \
+         'switch the engine on', 'turn the engine on'. Note: 'engine on' means \
+         START the engine, not an electrical switch."
     }
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": {}, "additionalProperties": false })
