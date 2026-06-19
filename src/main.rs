@@ -15,6 +15,7 @@ mod nav;
 mod stt;
 mod tts;
 mod tools;
+mod ui;
 mod xplane;
 
 use anyhow::{anyhow, Result};
@@ -24,6 +25,7 @@ use config::Config;
 use llm::Llm;
 use stt::Stt;
 use tools::{Registry, ToolCtx};
+use ui::Reporter;
 use xplane::XPlaneClient;
 
 // Single-threaded runtime: the cpal stream isn't `Send`, and the loop is
@@ -32,18 +34,26 @@ use xplane::XPlaneClient;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     use tracing_subscriber::prelude::*;
-    // Log to stderr (live) and to a daily-rolling file in logs/ (reviewable).
+    let config = Config::from_env()?;
+    let tui = config.ui == "tui";
+
+    // Always log to a daily-rolling file. In TUI mode the stderr layer would
+    // scribble over the dashboard, so it's omitted there (file only).
     let file_appender = tracing_appender::rolling::daily("logs", "x-copilot.log");
     let (file_writer, _log_guard) = tracing_appender::non_blocking(file_appender);
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "x_copilot=info".into());
+    let stderr_layer =
+        (!tui).then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(file_writer))
+        .with(stderr_layer)
         .init();
 
-    let config = Config::from_env()?;
+    // Route whisper/ggml C logging through tracing so its model-load chatter
+    // goes to the log file, not onto the terminal (which would corrupt the TUI).
+    whisper_rs::install_whisper_tracing_trampoline();
 
     // Diagnostic mode: `cargo run -- mic-check` prints live mic levels and exits
     // on Ctrl-C. Use it to confirm capture and tune XCOPILOT_VAD_RMS.
@@ -51,13 +61,14 @@ async fn main() -> Result<()> {
         return audio::mic_check(config.vad_threshold);
     }
 
-    let xplane = XPlaneClient::new(config.xplane_base_url.clone());
-
     // Resolve the aircraft profile: auto-detect from X-Plane's acf_ICAO when
     // configured as "auto", otherwise use the configured id. Falls back to the
-    // Cessna if detection fails (e.g. X-Plane not reachable yet).
+    // Cessna if detection fails (e.g. X-Plane not reachable yet). The probe
+    // client is used and dropped here — `run_session` makes its own (a reqwest
+    // client must be used on the runtime it runs on).
     let aircraft_id = if config.aircraft.eq_ignore_ascii_case("auto") {
-        match xplane.aircraft_icao().await {
+        let probe = XPlaneClient::new(config.xplane_base_url.clone());
+        match probe.aircraft_icao().await {
             Ok(icao) => {
                 let id = icao_to_profile(&icao);
                 tracing::info!(icao = %icao, profile = %id, "auto-detected aircraft");
@@ -85,35 +96,91 @@ async fn main() -> Result<()> {
     let stt = Stt::load(&config.whisper_model_path)?;
     let llm = Llm::new(&config);
     let registry = Registry::for_aircraft(&profile);
-    let specs = registry.specs();
 
     let continuous = config.listen_mode == "continuous";
     // "Explicit" = the user clearly addressed the copilot (push-to-talk, or a
     // wake word that matched). When not explicit, a non-command is ignored
     // silently rather than answered with an apology.
     let explicit = !continuous || !config.wake_word.is_empty();
+
+    if config.ui == "tui" {
+        // TUI: voice loop + aircraft poll run on background threads, each with
+        // its own runtime; the dashboard renders on the main thread.
+        let (tx, rx) = std::sync::mpsc::channel::<ui::Report>();
+        let title = format!("x-copilot · {}", profile.display_name);
+        let commands = command_hints();
+
+        let tx_poll = tx.clone();
+        let poll_base = config.xplane_base_url.clone();
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+            rt.block_on(async move {
+                let xp = XPlaneClient::new(poll_base);
+                loop {
+                    if let Some(ac) = poll_aircraft(&xp).await {
+                        if tx_poll.send(ui::Report::Aircraft(ac)).is_err() {
+                            break; // dashboard gone
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                }
+            });
+        });
+
+        let reporter = Reporter::Tui(tx);
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+            if let Err(e) =
+                rt.block_on(run_session(config, stt, llm, registry, continuous, explicit, reporter))
+            {
+                tracing::error!("voice loop ended: {e:#}");
+            }
+        });
+
+        ui::run_dashboard(title, commands, rx)?; // blocks until the user quits
+        Ok(())
+    } else {
+        println!("\n  x-copilot — {} ({}). Ctrl-C to quit.\n", profile.display_name, config.listen_mode);
+        run_session(config, stt, llm, registry, continuous, explicit, Reporter::Plain).await
+    }
+}
+
+/// The voice loop: listen → transcribe → pick a tool → confirm → execute → read
+/// back. Progress is emitted through `reporter` (plain stdout or the TUI), so
+/// the same code drives both UIs.
+async fn run_session(
+    config: Config,
+    stt: Stt,
+    llm: Llm,
+    registry: Registry,
+    continuous: bool,
+    explicit: bool,
+    reporter: Reporter,
+) -> Result<()> {
+    // Build the X-Plane client here, on whatever runtime this session runs on
+    // (main for plain, the voice thread for TUI) — a reqwest client's I/O is
+    // bound to the runtime it's used on.
+    let xplane = XPlaneClient::new(config.xplane_base_url.clone());
+    let specs = registry.specs();
     let mut listener = if continuous {
-        Some(Listener::start(config.vad_threshold)?)
+        Some(Listener::start(config.vad_threshold, reporter.clone())?)
     } else {
         None
     };
 
-    if continuous {
-        if config.wake_word.is_empty() {
-            println!("\n  x-copilot listening — {}. Just speak commands (e.g. \"flaps ten\", \"landing light on\"). Ctrl-C to quit.\n", profile.display_name);
+    reporter.log(
+        ui::LogKind::Info,
+        if !continuous {
+            "Ready — push-to-talk (Enter to start/stop).".to_string()
+        } else if config.wake_word.is_empty() {
+            "Listening — just speak commands.".to_string()
         } else {
-            println!(
-                "\n  x-copilot listening — {}. Say \"{}, <command>\". Ctrl-C to quit.\n",
-                profile.display_name, config.wake_word
-            );
-        }
-    } else {
-        println!("\n  x-copilot ready — {}. Ctrl-C to quit.\n", profile.display_name);
-    }
+            format!("Listening — say \"{}, <command>\".", config.wake_word)
+        },
+    );
 
     loop {
-        // 1. Capture an utterance (continuous: VAD-segmented; ptt: between
-        //    Enters) and transcribe it (with a confidence score).
+        reporter.status(ui::Phase::Listening);
         let heard = match listen_once(&mut listener, &stt) {
             Some(t) => t,
             None => continue,
@@ -121,27 +188,24 @@ async fn main() -> Result<()> {
         let transcript = heard.text;
         let confidence = heard.confidence;
         tracing::info!(transcript = %transcript, confidence, "heard utterance");
-        let marker = if continuous { "👂 heard" } else { "🗣️ " };
-        println!("{marker}: \"{transcript}\" (confidence {confidence:.2})");
+        reporter.log(ui::LogKind::Heard, format!("\"{transcript}\" ({confidence:.2})"));
 
-        // 2. Confidence gate. Low confidence = likely noise or a half-caught
-        //    word — re-ask instead of guessing it into a command.
+        // Confidence gate.
         if confidence < config.stt_min_confidence {
             if explicit {
-                speak_line(&config, "Say again?");
+                say(&config, &reporter, ui::LogKind::Info, "Say again?");
             } else {
-                println!("   ↳ low confidence, ignoring\n");
+                reporter.log(ui::LogKind::Info, "low confidence, ignored");
             }
             continue;
         }
 
-        // 3. Wake-word gate (continuous only). Only act on commands addressed to
-        //    the copilot; everything else is overheard chatter.
+        // Wake-word gate (continuous only).
         let command = if continuous {
             match gate_wake_word(&transcript, &config.wake_word) {
                 Some(cmd) if !cmd.is_empty() => cmd,
                 _ => {
-                    println!("   ↳ ignored (say \"{}, <command>\")\n", config.wake_word);
+                    reporter.log(ui::LogKind::Info, "ignored (no wake word)");
                     continue;
                 }
             }
@@ -149,32 +213,32 @@ async fn main() -> Result<()> {
             transcript.clone()
         };
 
-        // 4. Local LLM picks a tool.
+        // LLM picks a tool.
+        reporter.status(ui::Phase::Thinking);
         let mut call = match llm.choose_tool(&command, &specs).await {
             Ok(Some(call)) => call,
             Ok(None) => {
                 if explicit {
-                    speak_line(&config, "Sorry, I didn't catch a command I can action.");
+                    say(&config, &reporter, ui::LogKind::Warn, "Sorry, I didn't catch a command I can action.");
                 } else {
-                    tracing::info!(command = %command, "no matching tool — ignored");
+                    reporter.log(ui::LogKind::Info, format!("no matching tool: \"{command}\""));
                 }
                 continue;
             }
             Err(e) => {
                 tracing::error!("LLM tool selection failed: {e:#}");
+                reporter.log(ui::LogKind::Warn, "LLM unreachable");
                 continue;
             }
         };
         tracing::info!(tool = %call.name, args = %call.arguments, "tool selected");
+        reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
 
-        // 5. Confirmation gate with in-line correction. For safety-critical
-        //    commands, read back the interpreted intent and require "affirm".
-        //    A non-affirmative reply that carries a new value ("negative, 500")
-        //    is re-interpreted and re-confirmed; a plain "negative" cancels.
+        // Confirmation gate with in-line correction ("negative, 500").
         let proceed = 'confirm: loop {
             let Some(tool) = registry.get(&call.name) else {
                 tracing::warn!("LLM picked unknown tool: {}", call.name);
-                speak_line(&config, "That command isn't wired up yet.");
+                say(&config, &reporter, ui::LogKind::Warn, "That command isn't wired up yet.");
                 break 'confirm false;
             };
             let intent = if config.confirm_critical {
@@ -184,35 +248,34 @@ async fn main() -> Result<()> {
             };
             let Some(intent) = intent else { break 'confirm true };
 
-            speak_line(&config, &format!("Confirm, {intent}?"));
+            say(&config, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
+            reporter.status(ui::Phase::Listening);
             let Some(reply) = listen_once(&mut listener, &stt) else {
-                speak_line(&config, "Cancelled, no confirmation heard.");
+                say(&config, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
                 break 'confirm false;
             };
             if is_affirmative(&reply.text) {
-                println!("✅ confirmed: \"{}\"", reply.text);
-                tracing::info!(intent = %intent, reply = %reply.text, "confirmed");
+                reporter.log(ui::LogKind::Ok, format!("confirmed: \"{}\"", reply.text));
                 break 'confirm true;
             }
-            // Not a yes — does the reply carry a corrected value?
             match correction_text(&reply.text) {
                 Some(correction) => {
-                    println!("↻ correction: \"{correction}\"");
-                    tracing::info!(intent = %intent, correction = %correction, "correcting");
+                    reporter.log(ui::LogKind::Info, format!("correction: \"{correction}\""));
+                    reporter.status(ui::Phase::Thinking);
                     match llm.choose_tool(&format!("{command}, {correction}"), &specs).await {
                         Ok(Some(c)) => {
                             call = c;
-                            continue 'confirm; // re-confirm the corrected command
+                            reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
+                            continue 'confirm;
                         }
                         _ => {
-                            speak_line(&config, "Cancelled.");
+                            say(&config, &reporter, ui::LogKind::Warn, "Cancelled.");
                             break 'confirm false;
                         }
                     }
                 }
                 None => {
-                    tracing::info!(intent = %intent, reply = %reply.text, "cancelled");
-                    speak_line(&config, "Cancelled.");
+                    say(&config, &reporter, ui::LogKind::Warn, "Cancelled.");
                     break 'confirm false;
                 }
             }
@@ -221,12 +284,10 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        // 6. Execute the curated tool (writes the dataref + reads back).
+        // Execute the curated tool (writes the dataref + reads back).
+        reporter.status(ui::Phase::Thinking);
         let Some(tool) = registry.get(&call.name) else { continue };
-        let ctx = ToolCtx {
-            xplane: &xplane,
-            config: &config,
-        };
+        let ctx = ToolCtx { xplane: &xplane, config: &config };
         let readback = match tool.execute(&call.arguments, &ctx).await {
             Ok(line) => line,
             Err(e) => {
@@ -234,7 +295,7 @@ async fn main() -> Result<()> {
                 "Something went wrong actioning that.".to_string()
             }
         };
-        speak_line(&config, &readback);
+        say(&config, &reporter, ui::LogKind::Readback, &readback);
     }
 }
 
@@ -365,13 +426,75 @@ fn correction_text(reply: &str) -> Option<String> {
     }
 }
 
-/// Print and speak a readback line; TTS failures are logged, not fatal.
-fn speak_line(config: &Config, line: &str) {
-    tracing::info!(readback = %line, "spoke");
-    println!("🔊 {line}\n");
+/// Report a line and speak it. Sets the Speaking→Listening status around the
+/// (blocking) TTS call. Failures are logged, not fatal.
+fn say(config: &Config, reporter: &Reporter, kind: ui::LogKind, line: &str) {
+    tracing::info!(spoke = %line, "spoke");
+    reporter.status(ui::Phase::Speaking);
+    reporter.log(kind, line.to_string());
     if let Err(e) = tts::speak(config, line) {
         tracing::warn!("TTS failed: {e:#}");
     }
+    reporter.status(ui::Phase::Listening);
+}
+
+/// Read the live aircraft state for the dashboard panel. Returns `None` if
+/// X-Plane is unreachable (panel keeps its last values).
+async fn poll_aircraft(xp: &XPlaneClient) -> Option<ui::Aircraft> {
+    Some(ui::Aircraft {
+        heading: xp.get_float("sim/cockpit2/gauges/indicators/compass_heading_deg_mag").await.ok()?,
+        altitude: xp.get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot").await.ok()?,
+        ias: xp.get_float("sim/cockpit2/gauges/indicators/airspeed_kts_pilot").await.ok()?,
+        vsi: xp.get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot").await.ok()?,
+        flaps_pct: xp.get_float("sim/cockpit2/controls/flap_ratio").await.ok()? * 100.0,
+        ap_mode: ap_mode(xp).await,
+    })
+}
+
+/// Summarize the active autopilot lateral mode for the panel.
+async fn ap_mode(xp: &XPlaneClient) -> String {
+    if xp.get_float("sim/cockpit2/autopilot/servos_on").await.unwrap_or(0.0) <= 0.5 {
+        return "--".to_string();
+    }
+    let appr = xp.get_float("sim/cockpit2/autopilot/approach_status").await.unwrap_or(0.0);
+    let nav = xp.get_float("sim/cockpit2/autopilot/nav_status").await.unwrap_or(0.0);
+    let hdg = xp.get_float("sim/cockpit2/autopilot/heading_status").await.unwrap_or(0.0);
+    if appr >= 1.0 {
+        "APR".into()
+    } else if nav >= 1.0 {
+        "NAV".into()
+    } else if hdg >= 1.0 {
+        "HDG".into()
+    } else {
+        "ON".into()
+    }
+}
+
+/// Example commands shown in the dashboard's "say" panel.
+fn command_hints() -> Vec<String> {
+    [
+        "flaps ten / full",
+        "landing light on",
+        "strobes off",
+        "autopilot heading 270",
+        "climb and maintain 7000",
+        "descend at 500",
+        "throttle 60 percent",
+        "mixture full rich",
+        "start the engine",
+        "engine off",
+        "set altimeter 29.92",
+        "com one 118.5",
+        "squawk 1200",
+        "parking brake set",
+        "battery on / alternator on",
+        "avionics on",
+        "align the gyro",
+        "prepare the ILS for runway 13",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 #[cfg(test)]

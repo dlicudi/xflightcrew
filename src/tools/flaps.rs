@@ -87,8 +87,14 @@ impl Tool for SetFlaps {
             }
         };
 
-        // Safety gate: refuse *extending* above the target detent's Vfe.
         let current_ratio = ctx.xplane.get_float(FLAP_HANDLE).await?;
+
+        // Already at the commanded detent? Say so instead of re-commanding.
+        if (target.ratio - current_ratio).abs() <= 0.02 {
+            return Ok(format!("Flaps already {}.", target.spoken));
+        }
+
+        // Safety gate: refuse *extending* above the target detent's Vfe.
         let extending = target.ratio > current_ratio + 0.01;
         if extending {
             if let Some(vfe) = target.vfe_kts {

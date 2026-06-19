@@ -55,8 +55,14 @@ struct ValueResponse {
 
 impl XPlaneClient {
     pub fn new(base: String) -> Self {
+        // A per-request timeout so a stalled X-Plane call can never hang the
+        // voice loop forever — it errors, and the loop recovers to listening.
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             base: base.trim_end_matches('/').to_string(),
             id_cache: Mutex::new(HashMap::new()),
             command_cache: Mutex::new(HashMap::new()),

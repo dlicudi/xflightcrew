@@ -20,6 +20,15 @@ transponder: true      # set_transponder (squawk)
 ils: true              # prepare_ils (ILS approach lookup + setup)
 parking_brake: true    # set_parking_brake
 electrical: true       # set_electrical (battery, avionics master)
+flood_lights: true     # set_flood_lights (pilot + copilot cockpit floods)
+fuel_pump: true        # set_fuel_pump (electric/aux boost pump)
+magnetos: true         # set_magnetos (off/left/right/both — run-up mag check)
+carb_heat: true        # set_carb_heat (carb / alternate-air heat)
+fuel_selector: true    # set_fuel_selector (off/left/right/both)
+pitot_heat: true       # set_pitot_heat (anti-ice for the ASI)
+pitch_trim: true       # set_pitch_trim (nose up/down nudges, takeoff, neutral)
+nav_radio: true        # set_nav1 / set_obs (NAV1 frequency + OBS course)
+com2_radio: true       # set_com2 / swap_radio (COM2 + active/standby swap)
 retractable_gear: false # no gear tool — the 172 has fixed gear
 
 # Flap detents, retracted → full. Vfe is the max IAS (kts) to extend to each.

@@ -85,10 +85,15 @@ impl Registry {
             tools.push(Box::new(lights::SetLights::new(profile.lights.clone())));
         }
 
+        if profile.flood_lights {
+            tools.push(Box::new(lights::SetFloodLights));
+        }
+
         if profile.autopilot {
             tools.push(Box::new(autopilot::SetHeading));
             tools.push(Box::new(autopilot::SetAltitude));
             tools.push(Box::new(autopilot::SetVerticalSpeed));
+            tools.push(Box::new(autopilot::AutopilotOff));
         }
 
         if profile.engine {
@@ -98,8 +103,32 @@ impl Registry {
             tools.push(Box::new(engine::StopEngine));
         }
 
+        if profile.fuel_pump {
+            tools.push(Box::new(engine::SetFuelPump));
+        }
+
+        if profile.magnetos {
+            tools.push(Box::new(engine::SetMagnetos));
+        }
+
+        if profile.carb_heat {
+            tools.push(Box::new(engine::SetCarbHeat));
+        }
+
+        if profile.fuel_selector {
+            tools.push(Box::new(engine::SetFuelSelector));
+        }
+
         if profile.parking_brake {
             tools.push(Box::new(controls::SetParkingBrake));
+        }
+
+        if profile.pitch_trim {
+            tools.push(Box::new(controls::SetPitchTrim));
+        }
+
+        if profile.pitot_heat {
+            tools.push(Box::new(instruments::SetPitotHeat));
         }
 
         if profile.electrical {
@@ -118,8 +147,19 @@ impl Registry {
             tools.push(Box::new(radio::SetCom1));
         }
 
+        if profile.com2_radio {
+            tools.push(Box::new(radio::SetCom2));
+            tools.push(Box::new(radio::SwapRadio));
+        }
+
+        if profile.nav_radio {
+            tools.push(Box::new(radio::SetNav1));
+            tools.push(Box::new(radio::SetObs));
+        }
+
         if profile.transponder {
             tools.push(Box::new(radio::SetTransponder));
+            tools.push(Box::new(radio::SetTransponderMode));
         }
 
         if profile.ils {

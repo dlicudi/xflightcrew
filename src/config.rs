@@ -31,6 +31,8 @@ pub struct Config {
     /// utterance. Below this, the copilot asks you to say it again instead of
     /// guessing. Raise to be stricter; lower if clear commands get rejected.
     pub stt_min_confidence: f32,
+    /// UI mode: `plain` (stdout, default) or `tui` (terminal dashboard).
+    pub ui: String,
     /// TTS backend: `say` (macOS built-in, default) or `piper`.
     pub tts_backend: String,
     /// The `piper` binary to shell out to (used when `tts_backend = "piper"`).
@@ -66,6 +68,7 @@ impl Config {
             wake_word: env_or("XCOPILOT_WAKE_WORD", ""),
             vad_threshold: env_or("XCOPILOT_VAD_RMS", "0.012").parse().unwrap_or(0.012),
             stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.5").parse().unwrap_or(0.5),
+            ui: env_or("XCOPILOT_UI", "plain"),
             tts_backend: env_or("XCOPILOT_TTS", "say"),
             piper_binary: env_or("PIPER_BIN", "piper"),
             piper_voice: env_or("PIPER_VOICE", "models/en_US-amy-medium.onnx"),

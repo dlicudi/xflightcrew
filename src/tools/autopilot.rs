@@ -25,6 +25,8 @@ const VS_DIAL: &str = "sim/cockpit2/autopilot/vvi_dial_fpm";
 const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";
 /// Command: engage the servos.
 const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
+/// Command: disengage the servos (autopilot disconnect).
+const CMD_SERVOS_OFF: &str = "sim/autopilot/servos_off";
 /// Command: engage heading-select (HDG) mode.
 const CMD_HEADING_MODE: &str = "sim/autopilot/heading";
 /// Command: engage altitude select/hold (ALT) mode.
@@ -230,6 +232,37 @@ impl Tool for SetVerticalSpeed {
             Ok(format!("Roger, {phrase}, autopilot engaged."))
         } else {
             Ok(format!("{phrase} set, but the autopilot didn't engage — check the AP master."))
+        }
+    }
+}
+
+pub struct AutopilotOff;
+
+#[async_trait]
+impl Tool for AutopilotOff {
+    fn name(&self) -> &str {
+        "autopilot_off"
+    }
+
+    fn description(&self) -> &str {
+        "Disengage the autopilot — disconnect the servos so the pilot hand-flies. \
+         Use for 'autopilot off', 'disconnect the autopilot', 'disengage AP', \
+         'kill the autopilot', 'I have the airplane'."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+
+    async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        if !servos_engaged(ctx).await? {
+            return Ok("Autopilot's already off.".to_string());
+        }
+        ctx.xplane.run_command(CMD_SERVOS_OFF).await?;
+        if servos_engaged(ctx).await? {
+            Ok("The autopilot didn't disengage — disconnect it manually.".to_string())
+        } else {
+            Ok("Roger, autopilot off. You have the airplane.".to_string())
         }
     }
 }
