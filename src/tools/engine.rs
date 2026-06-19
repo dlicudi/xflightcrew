@@ -115,6 +115,19 @@ impl Tool for StartEngine {
         json!({ "type": "object", "properties": {}, "additionalProperties": false })
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        // Already running? Don't re-crank a live engine.
+        let already_running = ctx
+            .xplane
+            .get_float_array(ENGN_RUNNING)
+            .await
+            .ok()
+            .and_then(|v| v.first().copied())
+            .map(|r| r > 0.5)
+            .unwrap_or(false);
+        if already_running {
+            return Ok("Engine's already running.".to_string());
+        }
+
         // Pre-start configuration.
         ctx.xplane.set_int(BATTERY, 1).await?;
         ctx.xplane.set_float(MIXTURE, 1.0).await?; // full rich
