@@ -20,6 +20,11 @@ const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 const CMD_MAGS_BOTH: &str = "sim/magnetos/magnetos_both";
 const CMD_MAGS_OFF: &str = "sim/magnetos/magnetos_off";
 const CMD_STARTER: &str = "sim/starters/engage_starter_1";
+// Per-engine actuator arrays (the 172 is single-engine → element 0).
+const FUEL_PUMP: &str = "sim/cockpit2/engine/actuators/fuel_pump_on";
+const IGNITION_KEY: &str = "sim/cockpit2/engine/actuators/ignition_key"; // 0 off,1 R,2 L,3 both,4 start
+const CARB_HEAT: &str = "sim/cockpit2/engine/actuators/carb_heat_ratio"; // 0 cold .. 1 hot
+const FUEL_SELECTOR: &str = "sim/cockpit2/fuel/fuel_tank_selector"; // 0 off,1 left,2 right,4 both
 
 #[derive(Deserialize)]
 struct PercentArg {
@@ -153,6 +158,160 @@ impl Tool for StartEngine {
             }
         }
         Ok("Cranking — the engine hasn't caught. Check fuel and mixture, then try again.".to_string())
+    }
+}
+
+pub struct SetFuelPump;
+
+#[derive(Deserialize)]
+struct OnArg {
+    on: bool,
+}
+
+#[async_trait]
+impl Tool for SetFuelPump {
+    fn name(&self) -> &str {
+        "set_fuel_pump"
+    }
+    fn description(&self) -> &str {
+        "Turn the electric (auxiliary) fuel pump on or off. Use for 'fuel pump on', \
+         'boost pump on', 'fuel pump off', 'aux fuel pump on'."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "on": {"type": "boolean", "description": "true = on, false = off"} },
+            "required": ["on"]
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let a: OnArg = serde_json::from_value(args.clone())?;
+        ctx.xplane.set_int_array_elem(FUEL_PUMP, 0, a.on as i64).await?;
+        let on = ctx.xplane.get_float_array(FUEL_PUMP).await?.first().copied().unwrap_or(0.0) > 0.5;
+        Ok(format!("Roger, fuel pump {}.", if on { "on" } else { "off" }))
+    }
+}
+
+pub struct SetCarbHeat;
+
+#[async_trait]
+impl Tool for SetCarbHeat {
+    fn name(&self) -> &str {
+        "set_carb_heat"
+    }
+    fn description(&self) -> &str {
+        "Turn carburetor (alternate air) heat on or off. Use for 'carb heat on', \
+         'carb heat off', 'carburetor heat on'."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "on": {"type": "boolean", "description": "true = hot (on), false = cold (off)"} },
+            "required": ["on"]
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let a: OnArg = serde_json::from_value(args.clone())?;
+        ctx.xplane.set_int_array_elem(CARB_HEAT, 0, a.on as i64).await?;
+        let on = ctx.xplane.get_float_array(CARB_HEAT).await?.first().copied().unwrap_or(0.0) > 0.5;
+        Ok(format!("Roger, carb heat {}.", if on { "on" } else { "off" }))
+    }
+}
+
+pub struct SetMagnetos;
+
+#[derive(Deserialize)]
+struct MagArgs {
+    /// Magneto position: off, left, right, both.
+    position: String,
+}
+
+#[async_trait]
+impl Tool for SetMagnetos {
+    fn name(&self) -> &str {
+        "set_magnetos"
+    }
+    fn description(&self) -> &str {
+        "Set the magnetos / ignition position: off, left, right, or both. Used in \
+         the run-up mag check. Use for 'magnetos both', 'mags to left', 'mags \
+         right', 'magnetos off'. To start the engine use start_engine, not this."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "position": {"type": "string", "enum": ["off", "left", "right", "both"],
+                             "description": "Magneto selector position."}
+            },
+            "required": ["position"]
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let a: MagArgs = serde_json::from_value(args.clone())?;
+        let key = match a.position.to_ascii_lowercase().as_str() {
+            "off" => 0,
+            "right" => 1,
+            "left" => 2,
+            "both" => 3,
+            other => return Ok(format!("I didn't catch the magneto position '{other}'. Say off, left, right, or both.")),
+        };
+        ctx.xplane.set_int_array_elem(IGNITION_KEY, 0, key).await?;
+        let actual = ctx.xplane.get_float_array(IGNITION_KEY).await?.first().copied().unwrap_or(-1.0).round() as i64;
+        let name = match actual { 0 => "off", 1 => "right", 2 => "left", 3 => "both", 4 => "start", _ => "unknown" };
+        Ok(format!("Roger, magnetos {name}."))
+    }
+}
+
+pub struct SetFuelSelector;
+
+#[derive(Deserialize)]
+struct FuelSelArgs {
+    /// Tank position: off, left, right, both.
+    position: String,
+}
+
+#[async_trait]
+impl Tool for SetFuelSelector {
+    fn name(&self) -> &str {
+        "set_fuel_selector"
+    }
+    fn description(&self) -> &str {
+        "Set the fuel tank selector: off, left, right, or both. Use for 'fuel \
+         selector both', 'fuel to left tank', 'select right tank', 'fuel selector \
+         off'."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "position": {"type": "string", "enum": ["off", "left", "right", "both"],
+                             "description": "Fuel tank selector position."}
+            },
+            "required": ["position"]
+        })
+    }
+    fn confirm_prompt(&self, args: &Value) -> Option<String> {
+        let a: FuelSelArgs = serde_json::from_value(args.clone()).ok()?;
+        // Selecting OFF starves the engine — confirm that one.
+        if a.position.eq_ignore_ascii_case("off") {
+            Some("fuel selector to off — that cuts fuel to the engine".to_string())
+        } else {
+            None
+        }
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let a: FuelSelArgs = serde_json::from_value(args.clone())?;
+        let val = match a.position.to_ascii_lowercase().as_str() {
+            "off" => 0,
+            "left" => 1,
+            "right" => 2,
+            "both" => 4,
+            other => return Ok(format!("I didn't catch the fuel position '{other}'. Say off, left, right, or both.")),
+        };
+        ctx.xplane.set_int(FUEL_SELECTOR, val).await?;
+        let actual = ctx.xplane.get_float(FUEL_SELECTOR).await?.round() as i64;
+        let name = match actual { 0 => "off", 1 => "left", 2 => "right", 4 => "both", _ => "set" };
+        Ok(format!("Roger, fuel selector {name}."))
     }
 }
 

@@ -202,6 +202,22 @@ mod tests {
             ("set up the ILS runway 13", "prepare_ils", None),
             ("align the gyro", "align_gyro", None),
             ("sync the heading indicator", "align_gyro", None),
+            ("autopilot off", "autopilot_off", None),
+            ("disconnect the autopilot", "autopilot_off", None),
+            ("pitot heat on", "set_pitot_heat", Some(("on", json!(true)))),
+            ("fuel pump on", "set_fuel_pump", Some(("on", json!(true)))),
+            ("carb heat off", "set_carb_heat", Some(("on", json!(false)))),
+            ("magnetos both", "set_magnetos", Some(("position", json!("both")))),
+            ("fuel selector left", "set_fuel_selector", Some(("position", json!("left")))),
+            ("trim nose up", "set_pitch_trim", Some(("action", json!("nose_up")))),
+            ("set takeoff trim", "set_pitch_trim", Some(("action", json!("takeoff")))),
+            ("nav one 109.5", "set_nav1", None),
+            ("set the OBS to 240", "set_obs", None),
+            ("com two 121.9", "set_com2", None),
+            ("swap com one", "swap_radio", Some(("radio", json!("com1")))),
+            ("transponder standby", "set_transponder_mode", Some(("mode", json!("standby")))),
+            ("squawk altitude", "set_transponder_mode", Some(("mode", json!("altitude")))),
+            ("ident", "set_transponder_mode", Some(("mode", json!("ident")))),
         ];
 
         println!("\n  model: {}", cfg.model);

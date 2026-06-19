@@ -10,6 +10,7 @@ use super::{Tool, ToolCtx};
 const BARO: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot";
 const DG_SYNC: &str = "sim/instruments/DG_sync_mag";
 const DG_DRIFT: &str = "sim/cockpit/gyros/dg_drift_vac_deg";
+const PITOT_HEAT: &str = "sim/cockpit2/ice/ice_pitot_heat_on_pilot";
 
 pub struct SetBarometer;
 
@@ -52,6 +53,40 @@ impl Tool for SetBarometer {
         ctx.xplane.set_float(BARO, inhg).await?;
         let actual = ctx.xplane.get_float(BARO).await?;
         Ok(format!("Roger, altimeter {actual:.2}."))
+    }
+}
+
+pub struct SetPitotHeat;
+
+#[derive(Deserialize)]
+struct PitotArgs {
+    on: bool,
+}
+
+#[async_trait]
+impl Tool for SetPitotHeat {
+    fn name(&self) -> &str {
+        "set_pitot_heat"
+    }
+
+    fn description(&self) -> &str {
+        "Turn pitot heat on or off (anti-ice for the airspeed system). Use for \
+         'pitot heat on', 'pitot heat off', 'turn on pitot heat'."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "on": {"type": "boolean", "description": "true = on, false = off"} },
+            "required": ["on"]
+        })
+    }
+
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let a: PitotArgs = serde_json::from_value(args.clone())?;
+        ctx.xplane.set_int(PITOT_HEAT, a.on as i64).await?;
+        let on = ctx.xplane.get_float(PITOT_HEAT).await? > 0.5;
+        Ok(format!("Roger, pitot heat {}.", if on { "on" } else { "off" }))
     }
 }
 

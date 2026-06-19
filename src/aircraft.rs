@@ -55,6 +55,30 @@ pub struct AircraftProfile {
     /// that the scalar-per-light `set_lights` can't express.
     #[serde(default)]
     pub flood_lights: bool,
+    /// Electric/auxiliary fuel pump (`set_fuel_pump`).
+    #[serde(default)]
+    pub fuel_pump: bool,
+    /// Magneto/ignition selector (`set_magnetos`) — for the run-up mag check.
+    #[serde(default)]
+    pub magnetos: bool,
+    /// Carburetor / alternate-air heat (`set_carb_heat`).
+    #[serde(default)]
+    pub carb_heat: bool,
+    /// Fuel tank selector (`set_fuel_selector`): off/left/right/both.
+    #[serde(default)]
+    pub fuel_selector: bool,
+    /// Pitot heat anti-ice (`set_pitot_heat`).
+    #[serde(default)]
+    pub pitot_heat: bool,
+    /// Elevator pitch trim (`set_pitch_trim`).
+    #[serde(default)]
+    pub pitch_trim: bool,
+    /// NAV1 radio + OBS course (`set_nav1`, `set_obs`).
+    #[serde(default)]
+    pub nav_radio: bool,
+    /// Second comm radio + active/standby swap (`set_com2`, `swap_radio`).
+    #[serde(default)]
+    pub com2_radio: bool,
     /// Whether the gear retracts. `false` (e.g. the 172) means no `gear` tool.
     #[serde(default)]
     #[allow(dead_code)]
@@ -175,6 +199,14 @@ fn cessna_172sp() -> AircraftProfile {
         parking_brake: true,
         electrical: true,
         flood_lights: true,
+        fuel_pump: true,
+        magnetos: true,
+        carb_heat: true,
+        fuel_selector: true,
+        pitot_heat: true,
+        pitch_trim: true,
+        nav_radio: true,
+        com2_radio: true,
         flaps: Some(FlapProfile {
             detents: vec![
                 detent("up", "up", 0.0, None),
