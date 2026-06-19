@@ -24,7 +24,13 @@ const CMD_STARTER: &str = "sim/starters/engage_starter_1";
 const FUEL_PUMP: &str = "sim/cockpit2/engine/actuators/fuel_pump_on";
 const IGNITION_KEY: &str = "sim/cockpit2/engine/actuators/ignition_key"; // 0 off,1 R,2 L,3 both,4 start
 const CARB_HEAT: &str = "sim/cockpit2/engine/actuators/carb_heat_ratio"; // 0 cold .. 1 hot
-const FUEL_SELECTOR: &str = "sim/cockpit2/fuel/fuel_tank_selector"; // 0 off,1 left,2 right,4 both
+// Logical selector position (read-back): 1 left, 2 center, 3 right, 4 both/all.
+const FUEL_SELECTOR: &str = "sim/cockpit2/fuel/fuel_tank_selector";
+// The 172's selector knob is driven by these commands (a dataref write moves the
+// fuel logic but NOT the 3D knob — Laminar animates the knob from these).
+const CMD_FUEL_LEFT: &str = "sim/fuel/fuel_selector_lft";
+const CMD_FUEL_RIGHT: &str = "sim/fuel/fuel_selector_rgt";
+const CMD_FUEL_BOTH: &str = "sim/fuel/fuel_selector_all";
 
 #[derive(Deserialize)]
 struct PercentArg {
@@ -293,15 +299,17 @@ impl Tool for SetFuelSelector {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: FuelSelArgs = serde_json::from_value(args.clone())?;
-        let val = match a.position.to_ascii_lowercase().as_str() {
-            "left" => 1,
-            "right" => 2,
-            "both" => 4,
+        let cmd = match a.position.to_ascii_lowercase().as_str() {
+            "left" => CMD_FUEL_LEFT,
+            "right" => CMD_FUEL_RIGHT,
+            "both" => CMD_FUEL_BOTH,
             other => return Ok(format!("I didn't catch the fuel position '{other}'. Say left, both, or right.")),
         };
-        ctx.xplane.set_int(FUEL_SELECTOR, val).await?;
+        // Use the command so the cockpit knob moves with the fuel logic.
+        ctx.xplane.run_command(cmd).await?;
+        // Confirm via the logical position: 1 left, 3 right, 4 both.
         let actual = ctx.xplane.get_float(FUEL_SELECTOR).await?.round() as i64;
-        let name = match actual { 1 => "left", 2 => "right", 4 => "both", _ => "set" };
+        let name = match actual { 1 => "left", 3 => "right", 4 => "both", 2 => "center", _ => "set" };
         Ok(format!("Roger, fuel selector {name}."))
     }
 }
