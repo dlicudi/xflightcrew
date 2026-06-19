@@ -106,8 +106,12 @@ pub struct SetFloodLights;
 
 #[derive(Deserialize)]
 struct FloodArgs {
-    /// Desired state: true = on, false = off.
-    on: bool,
+    /// On/off shortcut (on = full bright, off = dark).
+    #[serde(default)]
+    on: Option<bool>,
+    /// Brightness 0-100 percent. Takes precedence over `on` when given.
+    #[serde(default)]
+    percent: Option<i64>,
 }
 
 #[async_trait]
@@ -117,51 +121,68 @@ impl Tool for SetFloodLights {
     }
 
     fn description(&self) -> &str {
-        "Turn the cockpit flood lights (both pilot and copilot) on or off \
-         together. Use for 'flood lights on', 'flood lights off', 'floods on', \
-         'cockpit flood lighting off'."
+        "Set the cockpit flood lights (both pilot and copilot together) — on, off, \
+         or a brightness percentage. Use for 'flood lights on', 'flood lights off', \
+         'flood lights fifty percent', 'dim the floods to 30', 'flood lights full'."
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "on": {"type": "boolean", "description": "true to turn on, false to turn off."}
-            },
-            "required": ["on"]
+                "on": {"type": "boolean", "description": "true = full bright, false = off. Use for plain on/off."},
+                "percent": {"type": "integer", "minimum": 0, "maximum": 100,
+                            "description": "Brightness 0-100%. Use when a level is named, e.g. 'floods to 40 percent'."}
+            }
         })
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: FloodArgs = serde_json::from_value(args.clone())?;
-        let level = if args.on { 1.0 } else { 0.0 };
+        // percent wins if given; else the on/off shortcut; else we didn't catch it.
+        let level = match (args.percent, args.on) {
+            (Some(p), _) => (p.clamp(0, 100) as f64) / 100.0,
+            (None, Some(true)) => 1.0,
+            (None, Some(false)) => 0.0,
+            (None, None) => return Ok("I didn't catch a flood-light setting — say on, off, or a percentage.".to_string()),
+        };
 
-        // Pilot side: scalar brightness. Copilot side: one array element.
+        // Pilot side: scalar brightness. Copilot side: one float array element.
         ctx.xplane.set_float(FLOOD_PILOT, level).await?;
         ctx.xplane
-            .set_int_array_elem(FLOOD_COPILOT, FLOOD_COPILOT_IDX, args.on as i64)
+            .set_float_array_elem(FLOOD_COPILOT, FLOOD_COPILOT_IDX, level)
             .await?;
 
         // Read both back and confirm they actually moved.
-        let pilot_on = ctx.xplane.get_float(FLOOD_PILOT).await? > 0.5;
-        let copilot_on = ctx
+        let pilot = ctx.xplane.get_float(FLOOD_PILOT).await?;
+        let copilot = ctx
             .xplane
             .get_float_array(FLOOD_COPILOT)
             .await?
             .get(FLOOD_COPILOT_IDX)
             .copied()
-            .map(|v| v > 0.5)
-            .unwrap_or(false);
+            .unwrap_or(0.0);
 
-        Ok(match (pilot_on, copilot_on) {
-            (true, true) => "Roger, flood lights on.".to_string(),
-            (false, false) => "Roger, flood lights off.".to_string(),
-            // One side didn't follow — name the lagging side.
-            _ => format!(
+        // If the two sides disagree by more than a touch, flag it.
+        if (pilot - copilot).abs() > 0.1 {
+            return Ok(format!(
                 "Heads up — pilot flood {}, copilot flood {}.",
-                if pilot_on { "on" } else { "off" },
-                if copilot_on { "on" } else { "off" }
-            ),
-        })
+                describe_level(pilot),
+                describe_level(copilot)
+            ));
+        }
+        Ok(format!("Roger, flood lights {}.", describe_level(pilot)))
+    }
+}
+
+/// Spoken description of a flood brightness level (0.0–1.0).
+fn describe_level(level: f64) -> String {
+    let pct = (level * 100.0).round();
+    if pct <= 0.0 {
+        "off".to_string()
+    } else if pct >= 100.0 {
+        "on".to_string()
+    } else {
+        format!("{pct:.0} percent")
     }
 }

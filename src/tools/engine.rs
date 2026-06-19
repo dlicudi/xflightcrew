@@ -276,41 +276,32 @@ impl Tool for SetFuelSelector {
         "set_fuel_selector"
     }
     fn description(&self) -> &str {
-        "Set the fuel tank selector: off, left, right, or both. Use for 'fuel \
-         selector both', 'fuel to left tank', 'select right tank', 'fuel selector \
-         off'."
+        // The 172's selector is LEFT/BOTH/RIGHT only; OFF is a separate fuel
+        // shutoff valve, not a selector position.
+        "Set the fuel tank selector: left, both, or right. Use for 'fuel selector \
+         both', 'fuel to left tank', 'select right tank'."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "position": {"type": "string", "enum": ["off", "left", "right", "both"],
+                "position": {"type": "string", "enum": ["left", "both", "right"],
                              "description": "Fuel tank selector position."}
             },
             "required": ["position"]
         })
     }
-    fn confirm_prompt(&self, args: &Value) -> Option<String> {
-        let a: FuelSelArgs = serde_json::from_value(args.clone()).ok()?;
-        // Selecting OFF starves the engine — confirm that one.
-        if a.position.eq_ignore_ascii_case("off") {
-            Some("fuel selector to off — that cuts fuel to the engine".to_string())
-        } else {
-            None
-        }
-    }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: FuelSelArgs = serde_json::from_value(args.clone())?;
         let val = match a.position.to_ascii_lowercase().as_str() {
-            "off" => 0,
             "left" => 1,
             "right" => 2,
             "both" => 4,
-            other => return Ok(format!("I didn't catch the fuel position '{other}'. Say off, left, right, or both.")),
+            other => return Ok(format!("I didn't catch the fuel position '{other}'. Say left, both, or right.")),
         };
         ctx.xplane.set_int(FUEL_SELECTOR, val).await?;
         let actual = ctx.xplane.get_float(FUEL_SELECTOR).await?.round() as i64;
-        let name = match actual { 0 => "off", 1 => "left", 2 => "right", 4 => "both", _ => "set" };
+        let name = match actual { 1 => "left", 2 => "right", 4 => "both", _ => "set" };
         Ok(format!("Roger, fuel selector {name}."))
     }
 }

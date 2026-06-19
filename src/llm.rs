@@ -175,6 +175,8 @@ mod tests {
             ("beacon on", "set_lights", Some(("light", json!("beacon")))),
             ("flood lights on", "set_flood_lights", Some(("on", json!(true)))),
             ("flood lights off", "set_flood_lights", Some(("on", json!(false)))),
+            ("flood lights 50 percent", "set_flood_lights", Some(("percent", json!(50)))),
+            ("dim the floods to 30 percent", "set_flood_lights", Some(("percent", json!(30)))),
             ("autopilot heading 270", "set_heading", None),
             ("fly heading 090", "set_heading", None),
             ("climb and maintain 7000", "set_altitude", None),

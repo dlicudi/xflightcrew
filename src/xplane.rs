@@ -258,4 +258,15 @@ impl XPlaneClient {
         let data: Vec<i64> = arr.iter().map(|v| v.round() as i64).collect();
         self.set_value(name, json!(data)).await
     }
+
+    /// Set one element of a float array dataref (read-modify-write), preserving
+    /// the other elements as floats — for things like a per-channel brightness.
+    pub async fn set_float_array_elem(&self, name: &str, index: usize, value: f64) -> Result<()> {
+        let mut arr = self.get_float_array(name).await?;
+        if index >= arr.len() {
+            return Err(anyhow!("array {name} has no index {index}"));
+        }
+        arr[index] = value;
+        self.set_value(name, json!(arr)).await
+    }
 }
