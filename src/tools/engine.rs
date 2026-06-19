@@ -13,6 +13,11 @@ use super::{Tool, ToolCtx};
 const THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 const MIXTURE: &str = "sim/cockpit2/engine/actuators/mixture_ratio_all";
 const BATTERY: &str = "sim/cockpit/electrical/battery_on";
+const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
+/// Below this bus voltage the battery is too flat to reliably crank the starter
+/// (the 172 is a 24V system; a healthy pre-start bus sits ~24-25V). Drops to the
+/// low 22s after accessories run with the engine off.
+const MIN_START_VOLTS: f64 = 23.0;
 const ONGROUND: &str = "sim/flightmodel/failures/onground_any";
 const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed"; // m/s
 const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
@@ -139,8 +144,17 @@ impl Tool for StartEngine {
             return Ok("Engine's already running.".to_string());
         }
 
-        // Pre-start configuration.
+        // Battery check: the battery must be on, and with enough voltage to crank.
+        // Cranking a flat battery just drains it further without catching.
         ctx.xplane.set_int(BATTERY, 1).await?;
+        let volts = ctx.xplane.get_float_array(BUS_VOLTS).await?.first().copied().unwrap_or(0.0);
+        if volts < MIN_START_VOLTS {
+            return Ok(format!(
+                "Battery's low, only {volts:.0} volts — connect ground power or you may not get a start."
+            ));
+        }
+
+        // Pre-start configuration.
         ctx.xplane.set_float(MIXTURE, 1.0).await?; // full rich
         ctx.xplane.set_float(THROTTLE, 0.1).await?; // crack the throttle
         ctx.xplane.run_command(CMD_MAGS_BOTH).await?;
