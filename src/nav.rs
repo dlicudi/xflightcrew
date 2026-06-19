@@ -70,6 +70,33 @@ pub fn find_ils(path: &str, runway: &str, lat: f64, lon: f64, max_nm: f64) -> Re
     Ok(best)
 }
 
+/// The airport (ICAO) of the ILS record nearest `(lat, lon)`, with its distance
+/// in nm — i.e. "which ILS-equipped field am I at/closest to". Used to catch
+/// "runway 13" when you're parked at a field that has no runway 13: the matched
+/// ILS would be at a *different*, farther airport.
+pub fn nearest_ils_airport(path: &str, lat: f64, lon: f64) -> Result<Option<(String, f64)>> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening nav data: {path}"))?;
+    let reader = BufReader::new(file);
+
+    let mut best: Option<(String, f64)> = None;
+    for line in reader.lines() {
+        let line = line?;
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 11 || f[0] != "4" {
+            continue;
+        }
+        let (rlat, rlon) = match (f[1].parse::<f64>(), f[2].parse::<f64>()) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => continue,
+        };
+        let d = haversine_nm(lat, lon, rlat, rlon);
+        if best.as_ref().map_or(true, |(_, bd)| d < *bd) {
+            best = Some((f[8].to_string(), d));
+        }
+    }
+    Ok(best)
+}
+
 /// Leading digits of a runway designator ("28L" → 28, "07" → 7).
 fn runway_number(s: &str) -> Option<u32> {
     let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();

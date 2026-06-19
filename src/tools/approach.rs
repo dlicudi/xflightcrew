@@ -22,9 +22,15 @@ const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 const CUR_ALT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot";
 const LAT: &str = "sim/flightmodel/position/latitude";
 const LON: &str = "sim/flightmodel/position/longitude";
-/// Only consider ILS records within this distance — keeps "runway 28" from
-/// tuning a localizer in another country when the local field has no 28.
-const MAX_NM: f64 = 60.0;
+/// Only consider ILS records within this distance. An ILS approach is briefed
+/// from at most ~30nm out, so a farther "match" is really a different airport —
+/// e.g. parked at Gibraltar (no runway 13), "runway 13" should NOT reach 50nm to
+/// Málaga. 30nm covers real approach setups and rejects cross-country mismatches.
+const MAX_NM: f64 = 30.0;
+/// If the nearest ILS-equipped field is within this distance, treat it as "the
+/// field you're at": a matching runway at a *different*, farther field is then a
+/// mistake (e.g. parked at LXGB, "runway 13" must not tune Málaga 60nm away).
+const AT_FIELD_NM: f64 = 10.0;
 
 pub struct PrepareIls;
 
@@ -74,6 +80,18 @@ impl Tool for PrepareIls {
             }
         };
 
+        // Airport sanity check: if we're sitting at an ILS-equipped field but the
+        // matched runway belongs to a *different*, farther field, that's almost
+        // certainly not what the pilot meant — don't silently tune it.
+        if let Ok(Some((near_icao, near_nm))) = nav::nearest_ils_airport(&ctx.config.nav_data_path, lat, lon) {
+            if near_nm <= AT_FIELD_NM && ils.airport != near_icao {
+                return Ok(format!(
+                    "{} has no ILS for runway {}. The nearest one is {} runway {}, {:.0} miles away — say again if that's the one you want.",
+                    near_icao, args.runway, ils.airport, ils.runway, ils.distance_nm
+                ));
+            }
+        }
+
         ctx.xplane.set_int(NAV1_FREQ, ils.freq_10khz).await?;
         ctx.xplane.set_float(NAV1_OBS, ils.course_mag).await?;
 
@@ -89,9 +107,10 @@ impl Tool for PrepareIls {
         ctx.xplane.run_command(CMD_ALT_HOLD).await?;
 
         Ok(format!(
-            "Roger, {} runway {}, ILS {:.2}, course {:03.0}, approach armed, holding {:.0} feet.",
+            "Roger, {} runway {}, {:.0} miles, ILS {:.2}, course {:03.0}, approach armed, holding {:.0} feet.",
             ils.airport,
             ils.runway,
+            ils.distance_nm,
             ils.freq_mhz(),
             ils.course_mag,
             alt
