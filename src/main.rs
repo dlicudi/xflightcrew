@@ -213,6 +213,19 @@ async fn run_session(
             transcript.clone()
         };
 
+        // Domain gate: high-confidence speech can still be phonetic nonsense
+        // ("Nautilapuku"), which the LLM tends to force-match to a tool. Require
+        // at least one aviation keyword before we act — and before we even ask
+        // the LLM.
+        if !looks_like_command(&command) {
+            if explicit {
+                say(&config, &reporter, ui::LogKind::Warn, "Sorry, that didn't sound like a command.");
+            } else {
+                reporter.log(ui::LogKind::Info, format!("not a command: \"{command}\""));
+            }
+            continue;
+        }
+
         // LLM picks a tool.
         reporter.status(ui::Phase::Thinking);
         let mut call = match llm.choose_tool(&command, &specs).await {
@@ -471,6 +484,45 @@ async fn ap_mode(xp: &XPlaneClient) -> String {
 }
 
 /// Example commands shown in the dashboard's "say" panel.
+/// Aviation vocabulary that a real command contains at least one of. Used to
+/// reject phonetic nonsense that whisper transcribes with high confidence
+/// ("Nautilapuku") before it reaches the LLM, which would otherwise force-match
+/// it to the nearest tool. Whole-word, case-insensitive.
+const COMMAND_KEYWORDS: &[&str] = &[
+    // flaps / gear / trim
+    "flap", "flaps", "gear", "trim",
+    // autopilot / vertical nav
+    "autopilot", "heading", "altitude", "climb", "descend", "maintain", "level",
+    "vertical", "vs", "approach", "ils", "localizer", "glideslope", "obs",
+    "course", "radial", "runway",
+    // lights
+    "light", "lights", "beacon", "strobe", "strobes", "taxi", "landing", "nav",
+    "navigation", "flood", "floods",
+    // engine / fuel
+    "throttle", "mixture", "engine", "engines", "start", "shutdown", "magneto",
+    "magnetos", "mags", "carb", "carburetor", "fuel", "pump", "boost", "primer",
+    "selector",
+    // electrical
+    "battery", "alternator", "avionics", "electrical", "bus",
+    // radios / transponder
+    "com", "comm", "radio", "frequency", "tune", "squawk", "transponder",
+    "ident", "barometer", "altimeter", "baro",
+    // instruments / misc controls
+    "gyro", "pitot", "brake", "brakes", "parking", "heat",
+];
+
+/// True if the utterance plausibly is an aircraft command (contains at least one
+/// keyword). Phonetic garbage that happens to transcribe confidently shares no
+/// vocabulary with the domain and is rejected here.
+fn looks_like_command(text: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|w| !w.is_empty())
+        .any(|w| {
+            let w = w.to_ascii_lowercase();
+            COMMAND_KEYWORDS.contains(&w.as_str())
+        })
+}
+
 fn command_hints() -> Vec<String> {
     [
         "flaps ten / full",
@@ -516,6 +568,33 @@ mod tests {
     #[test]
     fn empty_wake_word_passes_everything() {
         assert_eq!(gate_wake_word("flaps ten", "").as_deref(), Some("flaps ten"));
+    }
+
+    use super::looks_like_command;
+
+    #[test]
+    fn real_commands_pass_the_domain_gate() {
+        for c in [
+            "flaps ten", "gear up", "landing light on", "strobes off",
+            "autopilot heading 270", "climb and maintain 7000", "descend at 500",
+            "throttle 60 percent", "mixture full rich", "start the engine",
+            "battery on", "squawk 1200", "align the gyro", "pitot heat on",
+            "fuel pump on", "carb heat off", "magnetos both", "trim nose up",
+            "nav one 109.5", "set the OBS to 240", "com two 121.9",
+            "transponder standby", "prepare the ILS for runway 13", "flood lights on",
+        ] {
+            assert!(looks_like_command(c), "{c:?} should pass the domain gate");
+        }
+    }
+
+    #[test]
+    fn phonetic_garbage_is_rejected() {
+        for g in [
+            "Nautilapuku", "Mokuli ke maluku", "Reki ki panaki",
+            "Tiki Maliki, WaKiPi", "Take a look at the video", "",
+        ] {
+            assert!(!looks_like_command(g), "{g:?} should be rejected");
+        }
     }
 
     use super::is_affirmative;
