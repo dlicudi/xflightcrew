@@ -35,14 +35,36 @@ earns its keep over a Python runtime + GIL.
 |---|---|
 | Mic capture | `cpal` |
 | STT | `whisper-rs` (whisper.cpp bindings) — push-to-talk for v1 |
-| LLM tool-use | `reqwest` → Anthropic API, hand-rolled tool schema |
+| LLM tool-use | **Local** — `reqwest` → Ollama (`/api/chat`), backend-neutral tool schema |
 | X-Plane write | `reqwest` PATCH to the Web API (`PATCH /api/v1/datarefs/{id}/value`) |
 | TTS readback | shell out to `piper`, or run Kokoro ONNX via the `ort` crate later |
+
+**LLM runs locally — cloud is ruled out** because per-call API metering doesn't
+fit a real-time copilot you'd use for a whole flight. The whole loop is offline:
+whisper (ears) and piper (mouth) were always local, and the tool-picker (brain)
+is a local model served by Ollama. The tool schema is kept backend-neutral (just
+`name` + `description` + JSON-schema `parameters`) so the *local* backend can be
+swapped (Ollama → llama.cpp server, a different model) without touching the tool
+layer — not as a hook for a cloud option.
 
 **X-Plane access: REST first.** Start with the Web API over HTTP (separate
 process, same API Horizon polls). A native X-Plane plugin via the C SDK (`xplm`
 crate) is the lower-latency endgame — keep it in the back pocket, don't start there.
 Note: read Laminar's X-Plane SDK license before distributing a plugin.
+
+## Aircraft profiles drive the tool surface
+
+Tools and their limits are **per-airframe**, not global. An aircraft profile
+([src/aircraft.rs](src/aircraft.rs)) declares which systems exist and their
+limits; the tool registry is built *from* the profile. The stock **Cessna 172SP**
+is the first profile and shows why this is necessary: it has **fixed gear** (so
+no `gear` tool is exposed) and **discrete flap detents** (0°/10°/20°/30°) with
+**per-notch Vfe** (110 KIAS for the first 10°, 85 KIAS beyond) — none of which a
+generic dataref layer could know. Profiles load from `profiles/<id>.yaml`
+([profiles/cessna_172sp.yaml](profiles/cessna_172sp.yaml)) with a built-in Rust
+fallback, and the active aircraft is **auto-detected** from `acf_ICAO`
+(`XCOPILOT_AIRCRAFT=auto`). Datarefs/commands stay in the Rust tools; the YAML
+carries per-airframe config (flap detents, lights, capability flags).
 
 ## Core design rule: curated tool surface, not raw dataref access
 
