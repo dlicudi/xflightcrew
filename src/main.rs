@@ -16,6 +16,7 @@ mod stt;
 mod tts;
 mod tools;
 mod ui;
+mod voice;
 mod xplane;
 
 use anyhow::{anyhow, Result};
@@ -26,6 +27,7 @@ use llm::Llm;
 use stt::Stt;
 use tools::{Registry, ToolCtx};
 use ui::Reporter;
+use voice::{Priority, Voice};
 use xplane::XPlaneClient;
 
 // Single-threaded runtime: the cpal stream isn't `Send`, and the loop is
@@ -161,6 +163,9 @@ async fn run_session(
     // (main for plain, the voice thread for TUI) — a reqwest client's I/O is
     // bound to the runtime it's used on.
     let xplane = XPlaneClient::new(config.xplane_base_url.clone());
+    // All speech goes through one arbiter so readbacks (and later, monitor
+    // alerts) never talk over each other.
+    let voice = Voice::new(config.clone());
     let specs = registry.specs();
     let mut listener = if continuous {
         Some(Listener::start(config.vad_threshold, reporter.clone())?)
@@ -193,7 +198,7 @@ async fn run_session(
         // Confidence gate.
         if confidence < config.stt_min_confidence {
             if explicit {
-                say(&config, &reporter, ui::LogKind::Info, "Say again?");
+                say(&voice, &reporter, ui::LogKind::Info, "Say again?");
             } else {
                 reporter.log(ui::LogKind::Info, "low confidence, ignored");
             }
@@ -219,7 +224,7 @@ async fn run_session(
         // the LLM.
         if !looks_like_command(&command) {
             if explicit {
-                say(&config, &reporter, ui::LogKind::Warn, "Sorry, that didn't sound like a command.");
+                say(&voice, &reporter, ui::LogKind::Warn, "Sorry, that didn't sound like a command.");
             } else {
                 reporter.log(ui::LogKind::Info, format!("not a command: \"{command}\""));
             }
@@ -232,7 +237,7 @@ async fn run_session(
             Ok(Some(call)) => call,
             Ok(None) => {
                 if explicit {
-                    say(&config, &reporter, ui::LogKind::Warn, "Sorry, I didn't catch a command I can action.");
+                    say(&voice, &reporter, ui::LogKind::Warn, "Sorry, I didn't catch a command I can action.");
                 } else {
                     reporter.log(ui::LogKind::Info, format!("no matching tool: \"{command}\""));
                 }
@@ -251,7 +256,7 @@ async fn run_session(
         let proceed = 'confirm: loop {
             let Some(tool) = registry.get(&call.name) else {
                 tracing::warn!("LLM picked unknown tool: {}", call.name);
-                say(&config, &reporter, ui::LogKind::Warn, "That command isn't wired up yet.");
+                say(&voice, &reporter, ui::LogKind::Warn, "That command isn't wired up yet.");
                 break 'confirm false;
             };
             let intent = if config.confirm_critical {
@@ -261,10 +266,10 @@ async fn run_session(
             };
             let Some(intent) = intent else { break 'confirm true };
 
-            say(&config, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
+            say(&voice, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
             reporter.status(ui::Phase::Listening);
             let Some(reply) = listen_once(&mut listener, &stt) else {
-                say(&config, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
+                say(&voice, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
                 break 'confirm false;
             };
             if is_affirmative(&reply.text) {
@@ -282,13 +287,13 @@ async fn run_session(
                             continue 'confirm;
                         }
                         _ => {
-                            say(&config, &reporter, ui::LogKind::Warn, "Cancelled.");
+                            say(&voice, &reporter, ui::LogKind::Warn, "Cancelled.");
                             break 'confirm false;
                         }
                     }
                 }
                 None => {
-                    say(&config, &reporter, ui::LogKind::Warn, "Cancelled.");
+                    say(&voice, &reporter, ui::LogKind::Warn, "Cancelled.");
                     break 'confirm false;
                 }
             }
@@ -308,7 +313,7 @@ async fn run_session(
                 "Something went wrong actioning that.".to_string()
             }
         };
-        say(&config, &reporter, ui::LogKind::Readback, &readback);
+        say(&voice, &reporter, ui::LogKind::Readback, &readback);
     }
 }
 
@@ -439,15 +444,14 @@ fn correction_text(reply: &str) -> Option<String> {
     }
 }
 
-/// Report a line and speak it. Sets the Speaking→Listening status around the
-/// (blocking) TTS call. Failures are logged, not fatal.
-fn say(config: &Config, reporter: &Reporter, kind: ui::LogKind, line: &str) {
+/// Report a line and speak it through the arbiter. Blocks until the line has
+/// been spoken (so the loop doesn't listen over its own voice), setting the
+/// Speaking→Listening status around it.
+fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
     tracing::info!(spoke = %line, "spoke");
     reporter.status(ui::Phase::Speaking);
     reporter.log(kind, line.to_string());
-    if let Err(e) = tts::speak(config, line) {
-        tracing::warn!("TTS failed: {e:#}");
-    }
+    voice.say(Priority::Readback, line);
     reporter.status(ui::Phase::Listening);
 }
 
