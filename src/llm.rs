@@ -16,8 +16,8 @@ use crate::tools::ToolSpec;
 const SYSTEM_PROMPT: &str = "You are the copilot of an aircraft. The pilot speaks \
 a short command. Choose exactly one tool that performs it, and pick the closest \
 matching value from the tool's schema for each argument (speech may be slightly \
-misheard — e.g. map 'beak' to 'beacon', and 'probe'/'probe lights' to 'strobe'). \
-Numbers may be spoken as words. \
+misheard — e.g. map 'beak' to 'beacon', 'probe'/'probe lights' to 'strobe', and \
+'blood lights'/'bloodlights' to the flood lights). Numbers may be spoken as words. \
 'descend' means a negative vertical speed; 'climb' means positive. Examples: \
 'flaps ten' → set_flaps(notch=\"10\"); 'descend at five hundred' → \
 set_vertical_speed(fpm=-500); 'climb and maintain seven thousand' → \
@@ -378,6 +378,8 @@ mod tests {
             ("Nav Light on.", "set_lights", Some(("light", json!("nav")))), // (log)
             ("Taxi light off.", "set_lights", Some(("on", json!(false)))), // (log)
             ("probe lights on.", "set_lights", Some(("light", json!("strobe")))), // (log) strobe→probe
+            ("Floodlights on.", "set_flood_lights", Some(("on", json!(true)))), // (log) glued compound
+            ("Bloodlights off.", "set_flood_lights", Some(("on", json!(false)))), // (log) flood→blood
             ("Start engines.", "start_engine", None),                 // (log) plural
             ("at Radio 122.", "set_com1", None),                      // (log) radio→com1
         ];
