@@ -25,7 +25,10 @@ const MS_TO_KTS: f64 = 1.943_844;
 const M_TO_FT: f64 = 3.280_84;
 
 /// How often a Warning re-announces while the condition persists.
-const WARNING_REPEAT: Duration = Duration::from_secs(20);
+/// Minimum gap between two announcements of the *same* alert — whether it
+/// persisted (Warnings re-announce on this interval) or cleared and recurred
+/// (so cycling a switch off/on/off doesn't re-nag each time).
+const RENOTIFY_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Coarse flight phase, estimated from motion and height. Used to arm/disarm
 /// checks (e.g. "flaps up on final" only matters on Approach).
@@ -153,14 +156,21 @@ impl FireState {
         FireState { firing: false, last_spoken: None }
     }
 
-    /// Should we speak right now? On the rising edge always; thereafter only a
-    /// persisting Warning, and only once per `WARNING_REPEAT`.
+    /// Should we speak right now? Never more than once per `RENOTIFY_COOLDOWN` —
+    /// that single rule covers both cases: a persisting Warning re-announcing on
+    /// the interval, and a cleared-then-recurred alert (so fiddling a switch
+    /// doesn't re-nag). Once the cooldown has elapsed, a fresh occurrence (rising
+    /// edge) always speaks; a still-firing one only repeats if it's a Warning.
     fn should_speak(&self, sev: Severity, now: Instant) -> bool {
-        if !self.firing {
-            return true;
+        match self.last_spoken {
+            None => true, // never announced
+            Some(t) => {
+                if now.duration_since(t) < RENOTIFY_COOLDOWN {
+                    return false; // within cooldown — stay quiet
+                }
+                !self.firing || sev == Severity::Warning
+            }
         }
-        sev == Severity::Warning
-            && self.last_spoken.is_some_and(|t| now.duration_since(t) >= WARNING_REPEAT)
     }
 
     /// Condition is currently bad. Speak per [`should_speak`] and mark firing.
@@ -172,10 +182,10 @@ impl FireState {
         self.firing = true;
     }
 
-    /// Condition cleared — re-arm so it speaks again next time it recurs.
+    /// Condition cleared. Keep `last_spoken` so a quick recurrence is still
+    /// inside the cooldown and won't re-nag; only drop the firing flag.
     fn clear(&mut self) {
         self.firing = false;
-        self.last_spoken = None;
     }
 }
 
@@ -267,7 +277,7 @@ mod tests {
         st.firing = true;
         st.last_spoken = Some(t0);
         assert!(!st.should_speak(Severity::Warning, t0 + Duration::from_secs(1))); // too soon
-        assert!(st.should_speak(Severity::Warning, t0 + WARNING_REPEAT + Duration::from_secs(1))); // due
+        assert!(st.should_speak(Severity::Warning, t0 + RENOTIFY_COOLDOWN + Duration::from_secs(1))); // due
     }
 
     #[test]
@@ -277,8 +287,25 @@ mod tests {
         assert!(st.should_speak(Severity::Advisory, t0)); // rising edge
         st.firing = true;
         st.last_spoken = Some(t0);
-        // Even long after, an Advisory doesn't nag.
-        assert!(!st.should_speak(Severity::Advisory, t0 + WARNING_REPEAT * 3));
+        // Even long after, a still-firing Advisory doesn't nag.
+        assert!(!st.should_speak(Severity::Advisory, t0 + RENOTIFY_COOLDOWN * 3));
+    }
+
+    #[test]
+    fn fiddling_within_cooldown_does_not_renag() {
+        let mut st = FireState::new();
+        let t0 = Instant::now();
+        // First occurrence speaks.
+        assert!(st.should_speak(Severity::Warning, t0));
+        st.firing = true;
+        st.last_spoken = Some(t0);
+        // Pilot fixes it.
+        st.clear();
+        assert!(!st.firing);
+        // Recurs almost immediately → suppressed (still within cooldown).
+        assert!(!st.should_speak(Severity::Warning, t0 + Duration::from_secs(3)));
+        // Recurs well after the cooldown → speaks again.
+        assert!(st.should_speak(Severity::Warning, t0 + RENOTIFY_COOLDOWN + Duration::from_secs(1)));
     }
 
     #[test]
