@@ -1,0 +1,150 @@
+# Cessna 172SP checklists — x-copilot curated edition.
+#
+# Format: XChecklist (.txt), so community files for other aircraft load too.
+# Source/structure derived from KarlL's "Cessna 172SP Streamlined Procedures
+# for X-Plane" (v1.2, for the XChecklist plug-in) — credit to KarlL. The
+# procedure sequences are his; we re-authored the file and CORRECTED the verify
+# datarefs to the ones x-copilot's tools actually drive, so that when the copilot
+# offers to fix a failed item the re-read confirms it. Notable changes from the
+# original: lights verify via sim/cockpit2/switches/* (not sim/cockpit/electrical/*),
+# engine actuators via *_ratio_all (not [0]), pitot via cockpit2/ice/*, parking
+# brake via parking_brake_ratio, autopilot via servos_on, transponder via
+# cockpit2/radios/actuators/transponder_mode. Non-simulated steps stay in
+# [brackets] as spoken context.
+#
+# COND grammar: N (equals) | >N | <N | !N (not-equals) | LO|HI (inclusive range).
+#
+sw_checklist:BEFORE STARTING ENGINE:BEFORE STARTING ENGINE
+sw_remark:BEFORE STARTING ENGINE
+sw_itemvoid:[PREFLIGHT INSPECTION]|[COMPLETED]
+sw_itemvoid:[PASSENGER BRIEFING]|[COMPLETED]
+sw_itemvoid:[SEATS & BELTS]|[ADJUSTED & SECURE]
+sw_item:PARKING BRAKE|ON:sim/cockpit2/controls/parking_brake_ratio:>0.5
+sw_item:AUTOPILOT|OFF:sim/cockpit2/autopilot/servos_on:0
+sw_item:AVIONICS MASTER|OFF:sim/cockpit/electrical/avionics_on:0
+sw_item:FUEL SELECTOR|BOTH:sim/cockpit2/fuel/fuel_tank_selector:4
+sw_item:FUEL SHUTOFF VALVE|PUSHED IN
+sw_remark:BEFORE STARTING ENGINE COMPLETE
+#
+sw_checklist:STARTING ENGINE:STARTING ENGINE
+sw_remark:STARTING ENGINE
+sw_item:BATTERY|ON:sim/cockpit/electrical/battery_on:1
+sw_item:BEACON|ON:sim/cockpit2/switches/beacon_on:1
+sw_item:THROTTLE|OPEN 1/4 INCH:sim/cockpit2/engine/actuators/throttle_ratio_all:0.10|0.25
+sw_item:MIXTURE|FULL RICH:sim/cockpit2/engine/actuators/mixture_ratio_all:>0.95
+sw_item:CARB HEAT|COLD:sim/cockpit2/engine/actuators/carb_heat_ratio[0]:<0.5
+sw_item:PROPELLER AREA|CLEAR
+sw_item:IGNITION|START:sim/cockpit2/engine/actuators/ignition_key[0]:4
+sw_item:OIL PRESSURE|CHECKED
+sw_item:ALTERNATOR|ON:sim/cockpit/electrical/generator_on[0]:1
+sw_item:AVIONICS MASTER|ON:sim/cockpit/electrical/avionics_on:1
+sw_item:FLAPS|UP:sim/cockpit2/controls/flap_ratio:<0.02
+sw_remark:STARTING ENGINE COMPLETE
+#
+sw_checklist:BEFORE TAXI:BEFORE TAXI
+sw_remark:BEFORE TAXI
+sw_item:FUEL QUANTITY|CHECKED
+sw_item:FLIGHT CONTROLS|FREE & CORRECT
+sw_item:FLIGHT INSTRUMENTS|SET
+sw_item:RADIOS & AVIONICS|SET
+sw_item:TRANSPONDER|STANDBY:sim/cockpit2/radios/actuators/transponder_mode:1
+sw_item:TAXI LIGHT|ON:sim/cockpit2/switches/taxi_light_on:1
+sw_item:BRAKES|CHECKED
+sw_item:PARKING BRAKE|ON:sim/cockpit2/controls/parking_brake_ratio:>0.5
+sw_remark:BEFORE TAXI COMPLETE
+#
+sw_checklist:BEFORE TAKEOFF:BEFORE TAKEOFF
+sw_remark:BEFORE TAKEOFF
+sw_item:PARKING BRAKE|ON:sim/cockpit2/controls/parking_brake_ratio:>0.5
+sw_item:MIXTURE|FULL RICH:sim/cockpit2/engine/actuators/mixture_ratio_all:>0.9
+sw_item:FUEL SELECTOR|BOTH:sim/cockpit2/fuel/fuel_tank_selector:4
+sw_remark:MAGNETO CHECK — RUN UP TO 1800 RPM, MAX DROP 125, MAX DIFF 50
+sw_item:IGNITION|BOTH:sim/cockpit2/engine/actuators/ignition_key[0]:3
+sw_item:CARB HEAT|COLD:sim/cockpit2/engine/actuators/carb_heat_ratio[0]:<0.5
+sw_item:ENGINE INSTRUMENTS|CHECKED GREEN
+sw_item:STROBE LIGHTS|ON:sim/cockpit2/switches/strobe_lights_on:1
+sw_item:LANDING LIGHT|ON:sim/cockpit2/switches/landing_lights_on:1
+sw_item:AUTOPILOT|OFF:sim/cockpit2/autopilot/servos_on:0
+sw_item:ELEVATOR TRIM|SET FOR TAKEOFF:sim/cockpit2/controls/elevator_trim:-0.03|0.03
+sw_item:FLAPS|AS REQUIRED
+sw_remark:BEFORE TAKEOFF COMPLETE
+#
+sw_checklist:NORMAL TAKEOFF:NORMAL TAKEOFF
+sw_remark:NORMAL TAKEOFF
+sw_item:TAXI LIGHT|OFF:sim/cockpit2/switches/taxi_light_on:0
+sw_item:TRANSPONDER|ALTITUDE:sim/cockpit2/radios/actuators/transponder_mode:3
+sw_item:MIXTURE|FULL RICH:sim/cockpit2/engine/actuators/mixture_ratio_all:>0.9
+sw_item:PARKING BRAKE|OFF:sim/cockpit2/controls/parking_brake_ratio:<0.5
+sw_item:THROTTLE|FULL:sim/cockpit2/engine/actuators/throttle_ratio_all:>0.9
+sw_remark:ROTATE AT 55 TO 60 KNOTS — CLIMB 70 TO 85 KNOTS
+sw_item:FLAPS|UP:sim/cockpit2/controls/flap_ratio:<0.02
+sw_remark:NORMAL TAKEOFF COMPLETE
+#
+sw_checklist:CLIMB:CLIMB
+sw_remark:CLIMB
+sw_item:LANDING LIGHT|OFF:sim/cockpit2/switches/landing_lights_on:0
+sw_item:THROTTLE|FULL:sim/cockpit2/engine/actuators/throttle_ratio_all:>0.9
+sw_item:MIXTURE|FULL RICH:sim/cockpit2/engine/actuators/mixture_ratio_all:>0.9
+sw_remark:CLIMB AIRSPEED 70 TO 85 KNOTS
+sw_remark:CLIMB COMPLETE
+#
+sw_checklist:CRUISE:CRUISE
+sw_remark:CRUISE
+sw_item:POWER|SET 2100-2500 RPM:sim/cockpit2/engine/actuators/throttle_ratio_all:<0.99
+sw_item:ELEVATOR TRIM|ADJUSTED
+sw_item:MIXTURE|LEAN:sim/cockpit2/engine/actuators/mixture_ratio_all:<0.95
+sw_item:NAVAIDS & RADIOS|SET
+sw_item:ENGINE INSTRUMENTS|CHECKED GREEN
+sw_item:FUEL QUANTITY|SUFFICIENT
+sw_remark:CRUISE COMPLETE — REPEAT AS REQUIRED
+#
+sw_checklist:DESCENT:DESCENT
+sw_remark:DESCENT
+sw_item:POWER|ADJUSTED
+sw_item:MIXTURE|FULL RICH:sim/cockpit2/engine/actuators/mixture_ratio_all:>0.9
+sw_item:ALTIMETER|SET
+sw_item:FUEL SELECTOR|BOTH:sim/cockpit2/fuel/fuel_tank_selector:4
+sw_item:FLAPS|AS REQUIRED
+sw_remark:FLAPS 0-10 BELOW 110 KIAS, 10-30 BELOW 85 KIAS
+sw_remark:DESCENT COMPLETE
+#
+sw_checklist:BEFORE LANDING:BEFORE LANDING
+sw_remark:BEFORE LANDING
+sw_item:FUEL SELECTOR|BOTH:sim/cockpit2/fuel/fuel_tank_selector:4
+sw_item:MIXTURE|FULL RICH:sim/cockpit2/engine/actuators/mixture_ratio_all:>0.9
+sw_item:CARB HEAT|AS REQUIRED
+sw_item:LANDING LIGHT|ON:sim/cockpit2/switches/landing_lights_on:1
+sw_item:TAXI LIGHT|ON:sim/cockpit2/switches/taxi_light_on:1
+sw_item:AUTOPILOT|OFF:sim/cockpit2/autopilot/servos_on:0
+sw_remark:BEFORE LANDING COMPLETE
+#
+sw_checklist:NORMAL LANDING:NORMAL LANDING
+sw_remark:NORMAL LANDING
+sw_remark:APPROACH FLAPS UP 65-75 KNOTS, FLAPS DOWN 60-70 KNOTS
+sw_item:FLAPS|AS REQUIRED
+sw_remark:TOUCHDOWN MAIN WHEELS FIRST — LOWER NOSE GENTLY
+sw_item:FLAPS|UP:sim/cockpit2/controls/flap_ratio:<0.02
+sw_remark:NORMAL LANDING COMPLETE
+#
+sw_checklist:AFTER LANDING:AFTER LANDING
+sw_remark:AFTER LANDING
+sw_item:FLAPS|UP:sim/cockpit2/controls/flap_ratio:<0.02
+sw_item:LANDING LIGHT|OFF:sim/cockpit2/switches/landing_lights_on:0
+sw_item:STROBE LIGHTS|OFF:sim/cockpit2/switches/strobe_lights_on:0
+sw_item:TAXI LIGHT|ON:sim/cockpit2/switches/taxi_light_on:1
+sw_item:TRANSPONDER|STANDBY:sim/cockpit2/radios/actuators/transponder_mode:1
+sw_remark:AFTER LANDING COMPLETE
+#
+sw_checklist:ENGINE SHUTDOWN:ENGINE SHUTDOWN
+sw_remark:ENGINE SHUTDOWN
+sw_item:PARKING BRAKE|ON:sim/cockpit2/controls/parking_brake_ratio:>0.5
+sw_item:TRANSPONDER|OFF:sim/cockpit2/radios/actuators/transponder_mode:0
+sw_item:AUTOPILOT|OFF:sim/cockpit2/autopilot/servos_on:0
+sw_item:AVIONICS MASTER|OFF:sim/cockpit/electrical/avionics_on:0
+sw_item:MIXTURE|CUTOFF:sim/cockpit2/engine/actuators/mixture_ratio_all:<0.05
+sw_item:TAXI LIGHT|OFF:sim/cockpit2/switches/taxi_light_on:0
+sw_item:BEACON|OFF:sim/cockpit2/switches/beacon_on:0
+sw_item:IGNITION|OFF:sim/cockpit2/engine/actuators/ignition_key[0]:0
+sw_item:ALTERNATOR|OFF:sim/cockpit/electrical/generator_on[0]:0
+sw_item:BATTERY|OFF:sim/cockpit/electrical/battery_on:0
+sw_remark:ENGINE SHUTDOWN COMPLETE
