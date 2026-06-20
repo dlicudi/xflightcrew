@@ -42,6 +42,37 @@ struct PercentArg {
     percent: f64,
 }
 
+/// Drive a 0.0–1.0 actuator smoothly from its current value to `to`, like a hand
+/// easing a lever, rather than snapping it. The travel time scales with the size
+/// of the change (a small nudge is quick; a full idle→full sweep takes ~1.5s),
+/// and a smoothstep ease makes the start and stop of the motion feel natural.
+async fn ramp_actuator(ctx: &ToolCtx<'_>, dataref: &str, to: f64) -> Result<()> {
+    const STEP_MS: u64 = 50;
+    const FULL_SWEEP_MS: f64 = 1500.0; // time for a full 0.0→1.0 sweep
+    const MIN_MS: f64 = 150.0;
+
+    let from = ctx.xplane.get_float(dataref).await?.clamp(0.0, 1.0);
+    let to = to.clamp(0.0, 1.0);
+    let delta = (to - from).abs();
+
+    // Negligible change: just set it and skip the animation.
+    if delta < 0.01 {
+        ctx.xplane.set_float(dataref, to).await?;
+        return Ok(());
+    }
+
+    let steps = ((FULL_SWEEP_MS * delta).max(MIN_MS) / STEP_MS as f64).ceil() as u32;
+    for i in 1..=steps {
+        let t = i as f64 / steps as f64;
+        let eased = t * t * (3.0 - 2.0 * t); // smoothstep
+        ctx.xplane.set_float(dataref, from + (to - from) * eased).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(STEP_MS)).await;
+    }
+    // Land exactly on the target so float rounding can't leave it a hair short.
+    ctx.xplane.set_float(dataref, to).await?;
+    Ok(())
+}
+
 pub struct SetThrottle;
 
 #[async_trait]
@@ -66,7 +97,9 @@ impl Tool for SetThrottle {
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let p: PercentArg = serde_json::from_value(args.clone())?;
         let ratio = (p.percent / 100.0).clamp(0.0, 1.0);
-        ctx.xplane.set_float(THROTTLE, ratio).await?;
+        // Ease the lever to the target instead of snapping it — feels like a real
+        // hand on the throttle.
+        ramp_actuator(ctx, THROTTLE, ratio).await?;
         let actual = ctx.xplane.get_float(THROTTLE).await? * 100.0;
         Ok(format!("Roger, throttle {actual:.0} percent."))
     }
@@ -107,7 +140,8 @@ impl Tool for SetMixture {
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let p: PercentArg = serde_json::from_value(args.clone())?;
         let ratio = (p.percent / 100.0).clamp(0.0, 1.0);
-        ctx.xplane.set_float(MIXTURE, ratio).await?;
+        // Ease the mixture lever to the target instead of snapping it.
+        ramp_actuator(ctx, MIXTURE, ratio).await?;
         let actual = ctx.xplane.get_float(MIXTURE).await? * 100.0;
         Ok(format!("Roger, mixture {actual:.0} percent."))
     }
