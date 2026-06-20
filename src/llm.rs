@@ -24,6 +24,20 @@ set_altitude(altitude=7000); 'beacon on' → set_lights(light=\"beacon\", on=tru
 'start her up' → start_engine. Do not answer in prose and do not invent tools. \
 If no tool fits the command, do not call any tool.";
 
+/// Temperatures to retry at, in order, when the deterministic (temp 0) first
+/// pass returns no tool for an utterance the domain gate already accepted as a
+/// command. A little entropy escapes the greedy-decode dead-end where qwen emits
+/// no tool_call; we stop at the first concrete pick.
+///
+/// Values chosen empirically (see the `retry_temp_sweep` probe): recovery peaks
+/// at a *small* bump (~0.3) and *drops* as temperature rises — high temp just
+/// adds noise and wrong/empty picks. So both retries stay low. The second draw
+/// at 0.5 is the only temperature observed to recover "sync the heading
+/// indicator", so it earns its place as a diverse second attempt. Two retries
+/// also bounds the worst-case added latency (the bump only runs when the first
+/// pass already failed, which is rare).
+const RETRY_TEMPS: &[f64] = &[0.3, 0.5];
+
 /// A tool the LLM chose, plus the parsed arguments.
 #[derive(Debug)]
 pub struct ToolCall {
@@ -72,11 +86,46 @@ impl Llm {
     }
 
     /// Given a transcript and the available tools, ask the local model to pick
-    /// one. Returns `None` if the model declined to call any tool.
+    /// one. Returns `None` only if the model still declines after the retries.
+    ///
+    /// The first pass is deterministic (temperature 0): it's correct for the
+    /// vast majority of commands and *repeatable*, so a command that works keeps
+    /// working. But qwen2.5:7b intermittently emits **no tool call** for a clear,
+    /// in-domain command — greedy decoding lands on the "no tool" path for
+    /// certain phrasings (sensitive to casing/punctuation/articles in a way that
+    /// looks arbitrary). The caller only invokes us *after* the domain gate has
+    /// classified the utterance as a command, so an empty result there is almost
+    /// always the model fumbling, not a genuine "nothing fits". We give it
+    /// another look with a little sampling entropy to escape that dead-end —
+    /// applied **only on retry**, so the common case stays deterministic.
     pub async fn choose_tool(
         &self,
         transcript: &str,
         tools: &[ToolSpec],
+    ) -> Result<Option<ToolCall>> {
+        // Deterministic first pass.
+        if let Some(call) = self.choose_tool_at(transcript, tools, 0.0).await? {
+            return Ok(Some(call));
+        }
+        // Declined — retry with escalating temperature, stopping at the first
+        // concrete pick.
+        for &temp in RETRY_TEMPS {
+            tracing::debug!(temp, transcript = %transcript, "tool selection empty; retrying with temperature bump");
+            if let Some(call) = self.choose_tool_at(transcript, tools, temp).await? {
+                tracing::info!(temp, transcript = %transcript, tool = %call.name, "recovered tool on retry");
+                return Ok(Some(call));
+            }
+        }
+        Ok(None)
+    }
+
+    /// One tool-selection request at a given sampling temperature. `temperature`
+    /// = 0.0 is greedy/deterministic; a small positive value adds entropy.
+    async fn choose_tool_at(
+        &self,
+        transcript: &str,
+        tools: &[ToolSpec],
+        temperature: f64,
     ) -> Result<Option<ToolCall>> {
         let tool_specs: Vec<Value> = tools
             .iter()
@@ -95,9 +144,11 @@ impl Llm {
         let body = json!({
             "model": self.model,
             "stream": false,
-            // Deterministic tool selection: at default temperature qwen
-            // intermittently emits no tool call for a clear command.
-            "options": { "temperature": 0 },
+            // Temperature is supplied by the caller: 0 for the deterministic
+            // first pass, a bump on retry (see `choose_tool`). At the model's
+            // *default* temperature qwen intermittently emits no tool call for a
+            // clear command, which is why the first pass pins it to 0.
+            "options": { "temperature": temperature },
             "messages": [
                 { "role": "system", "content": SYSTEM_PROMPT },
                 { "role": "user", "content": transcript },
@@ -247,6 +298,47 @@ mod tests {
             }
         }
         assert_eq!(failures, 0, "{failures} command(s) routed incorrectly");
+    }
+
+    /// Probe: for the raw STT phrasings that miss at temperature 0, how reliably
+    /// does a temperature bump recover a tool call? Drives the choice of
+    /// `RETRY_TEMPS`. Runs each (phrase, temp) several times and prints the
+    /// hit-rate, since temp > 0 is stochastic.
+    /// Run: `cargo test retry_temp_sweep -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "requires a local Ollama server with a tool-calling model"]
+    async fn retry_temp_sweep() {
+        let cfg = test_config();
+        let llm = Llm::new(&cfg);
+        let profile = aircraft::builtin(&cfg.aircraft).unwrap();
+        let specs = Registry::for_aircraft(&profile).specs();
+
+        // Exact strings whisper produced live that miss at temp 0 (raw form).
+        let hard = [
+            ("Align the gyro.", "align_gyro"),
+            ("Fix gyro.", "align_gyro"),
+            ("Sync the heading indicator.", "align_gyro"),
+            ("Release the parking brake.", "set_parking_brake"),
+        ];
+        let temps = [0.0, 0.3, 0.5, 0.7, 0.9];
+        const TRIES: usize = 5;
+
+        println!("\n  model: {}   ({TRIES} tries per cell; right-tool hits)\n", cfg.model);
+        for (phrase, want) in hard {
+            print!("  {phrase:<32}");
+            for t in temps {
+                let mut hits = 0;
+                for _ in 0..TRIES {
+                    if let Some(c) = llm.choose_tool_at(phrase, &specs, t).await.expect("ollama") {
+                        if c.name == want {
+                            hits += 1;
+                        }
+                    }
+                }
+                print!("  t={t:.1}:{hits}/{TRIES}");
+            }
+            println!();
+        }
     }
 
     /// Near-full pipeline against live systems: transcript → qwen picks a tool →
