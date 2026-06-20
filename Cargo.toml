@@ -23,7 +23,11 @@ base64 = "0.22"
 
 # audio capture + speech-to-text
 cpal = "0.15"
-whisper-rs = { version = "0.12", features = ["whisper-cpp-tracing"] }
+# `metal` runs whisper inference on the Apple GPU instead of pegging CPU cores —
+# transcription was the app's main CPU cost (multi-threaded CPU inference spiking
+# to ~4 cores per utterance). WhisperContextParameters::default() has use_gpu=true,
+# so the feature is all that's needed to activate it on Apple Silicon.
+whisper-rs = { version = "0.12", features = ["whisper-cpp-tracing", "metal"] }
 
 # tooling glue
 async-trait = "0.1"

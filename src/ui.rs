@@ -37,7 +37,7 @@ pub enum Phase {
 }
 
 /// Live aircraft state for the right-hand panel.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct Aircraft {
     pub heading: f64,
     pub altitude: f64,
@@ -127,6 +127,16 @@ struct App {
 
 const MAX_LOG: usize = 500;
 
+/// Mic level moves the meter only in steps of roughly this much (RMS). The mic
+/// reporter fires ~33×/s (one per 30 ms audio frame), and the meter's `{:.3}`
+/// label would change on sub-milli jitter, so redrawing on every mic report
+/// pinned a full-screen ratatui render at ~20 fps even in a silent cockpit.
+/// Quantizing the redraw trigger to this deadband means a quiet room (rms
+/// hovering at the noise floor) stays in one bucket and triggers no redraws,
+/// while real speech still animates the meter. Tunable: smaller = smoother
+/// meter, more idle redraws.
+const MIC_REDRAW_STEP: f32 = 0.002;
+
 /// Run the dashboard on the calling (main) thread until the user quits. Drains
 /// `rx` for updates and polls the keyboard for `q`/Esc/Ctrl-C.
 pub fn run_dashboard(
@@ -144,8 +154,14 @@ pub fn run_dashboard(
         commands,
     };
 
+    // Redraw only when something visibly changed, not on a fixed timer — a full
+    // ratatui render every iteration was the dashboard's steady-state CPU cost.
+    // `dirty` starts true to paint the first frame.
+    let mut dirty = true;
+    let mut mic_bucket = i32::MIN; // last drawn mic deadband bucket
     let res = loop {
-        // Drain everything queued from the voice/poll threads.
+        // Drain everything queued from the voice/poll threads, marking the frame
+        // dirty only when the update actually changes what's on screen.
         while let Ok(r) = rx.try_recv() {
             match r {
                 Report::Log { kind, text } => {
@@ -153,21 +169,45 @@ pub fn run_dashboard(
                     if app.log.len() > MAX_LOG {
                         app.log.drain(0..app.log.len() - MAX_LOG);
                     }
+                    dirty = true;
                 }
-                Report::Status(p) => app.phase = p,
-                Report::Mic(l) => app.mic = l,
-                Report::Aircraft(a) => app.aircraft = a,
+                Report::Status(p) => {
+                    if app.phase != p {
+                        app.phase = p;
+                        dirty = true;
+                    }
+                }
+                Report::Mic(l) => {
+                    // Keep the latest value for the label, but only repaint when
+                    // the meter crosses a deadband bucket (see MIC_REDRAW_STEP).
+                    app.mic = l;
+                    let bucket = (l / MIC_REDRAW_STEP).round() as i32;
+                    if bucket != mic_bucket {
+                        mic_bucket = bucket;
+                        dirty = true;
+                    }
+                }
+                Report::Aircraft(a) => {
+                    if app.aircraft != a {
+                        app.aircraft = a;
+                        dirty = true;
+                    }
+                }
             }
         }
 
-        if let Err(e) = terminal.draw(|f| draw(f, &app)) {
-            break Err(e);
+        if dirty {
+            if let Err(e) = terminal.draw(|f| draw(f, &app)) {
+                break Err(e);
+            }
+            dirty = false;
         }
 
-        // ~20 fps; also services keypresses.
+        // Block up to 50 ms for input — this also paces the drain loop without a
+        // busy-wait. A keypress that isn't quit, or a resize, just needs a repaint.
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
                     let quit = matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
                         || (k.code == KeyCode::Char('c')
                             && k.modifiers.contains(event::KeyModifiers::CONTROL));
@@ -175,6 +215,8 @@ pub fn run_dashboard(
                         break Ok(());
                     }
                 }
+                Event::Resize(_, _) => dirty = true,
+                _ => {}
             }
         }
     };
