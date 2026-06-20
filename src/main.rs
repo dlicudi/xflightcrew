@@ -544,20 +544,35 @@ fn looks_like_command(text: &str) -> bool {
         .filter(|w| !w.is_empty())
         .any(|w| {
             let w = w.to_ascii_lowercase();
-            if COMMAND_KEYWORDS.contains(&w.as_str()) {
+            if matches_keyword(&w) {
                 return true;
             }
-            // Whisper routinely mangles a word by a single letter ("thrust" →
-            // "trust", "descend" → "descent"). Accept a one-edit near-miss of a
-            // keyword so it still reaches the LLM. True garbage shares no
-            // near-spelling with the domain and is still rejected. Restricted to
-            // 5+ char tokens/keywords so short common words don't match by luck.
-            w.len() >= 5
-                && COMMAND_KEYWORDS
-                    .iter()
-                    .filter(|k| k.len() >= 5)
-                    .any(|k| levenshtein(&w, k) <= 1)
+            // Whisper sometimes glues a spoken two-word compound into one token
+            // ("flood lights" → "floodlights", "landing light" → "landinglight"),
+            // which then matches no standalone keyword. Re-check the stem after
+            // dropping a trailing light/lights so the compound still reaches the
+            // LLM. The stem goes through the same fuzzy check, so the mishear
+            // "bloodlights" also passes (blood ~ flood, one edit).
+            if let Some(stem) = w.strip_suffix("lights").or_else(|| w.strip_suffix("light")) {
+                return !stem.is_empty() && matches_keyword(stem);
+            }
+            false
         })
+}
+
+/// True if a single lowercased token is, or is a one-letter mishearing of, a
+/// command keyword. Whisper routinely mangles a word by a letter ("thrust" →
+/// "trust", "descend" → "descent"); the near-miss is restricted to 5+ char
+/// tokens/keywords so short common words don't match by luck.
+fn matches_keyword(w: &str) -> bool {
+    if COMMAND_KEYWORDS.contains(&w) {
+        return true;
+    }
+    w.len() >= 5
+        && COMMAND_KEYWORDS
+            .iter()
+            .filter(|k| k.len() >= 5)
+            .any(|k| levenshtein(w, k) <= 1)
 }
 
 fn command_hints() -> Vec<String> {
@@ -626,8 +641,20 @@ mod tests {
             // Verbatim whisper output from logs/ that the gate used to reject —
             // recovered by the ignition/ascend/speed keywords.
             "Ignition on.", "Ascend 500 feet per minute.", "Physical speed 500.",
+            // Whisper glued "flood lights" into one token; the compound and its
+            // "blood" mishearing must still reach the LLM.
+            "Floodlights on.", "Turn on the floodlights.", "Increase floodlights.",
+            "Bloodlights on.", "landinglight on",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
+        }
+    }
+
+    #[test]
+    fn glued_light_compound_does_not_overmatch() {
+        // Stripping a light/lights suffix must not wave through non-cockpit words.
+        for g in ["moonlight", "highlight", "delight", "spotlight", "flashlight"] {
+            assert!(!looks_like_command(g), "{g:?} should still be rejected");
         }
     }
 
