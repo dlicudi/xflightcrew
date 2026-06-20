@@ -540,7 +540,19 @@ fn looks_like_command(text: &str) -> bool {
         .filter(|w| !w.is_empty())
         .any(|w| {
             let w = w.to_ascii_lowercase();
-            COMMAND_KEYWORDS.contains(&w.as_str())
+            if COMMAND_KEYWORDS.contains(&w.as_str()) {
+                return true;
+            }
+            // Whisper routinely mangles a word by a single letter ("thrust" →
+            // "trust", "descend" → "descent"). Accept a one-edit near-miss of a
+            // keyword so it still reaches the LLM. True garbage shares no
+            // near-spelling with the domain and is still rejected. Restricted to
+            // 5+ char tokens/keywords so short common words don't match by luck.
+            w.len() >= 5
+                && COMMAND_KEYWORDS
+                    .iter()
+                    .filter(|k| k.len() >= 5)
+                    .any(|k| levenshtein(&w, k) <= 1)
         })
 }
 
@@ -605,6 +617,14 @@ mod tests {
             "transponder standby", "prepare the ILS for runway 13", "flood lights on",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
+        }
+    }
+
+    #[test]
+    fn one_letter_mishearings_pass_the_gate() {
+        // Whisper drops/swaps a letter; these should still reach the LLM.
+        for c in ["trust 80 percent", "descent 500", "altitude 3000"] {
+            assert!(looks_like_command(c), "{c:?} should pass via near-miss");
         }
     }
 
