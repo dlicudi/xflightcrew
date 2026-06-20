@@ -1,8 +1,10 @@
 //! Electrical systems: `set_electrical` (battery, alternator, avionics master).
 //!
-//! Battery and avionics are scalar switches; the alternator is element 0 of the
-//! per-engine `generator_on` array. (X-Plane exposes only one avionics switch —
-//! the panel's BUS 1/BUS 2 both drive it — so there's nothing finer to control.)
+//! Battery is a scalar switch; the alternator is element 0 of the per-engine
+//! `generator_on` array. The C172's two AVIONICS panel switches are two separate
+//! systems — BUS 1 is the avionics master, BUS 2 is the electrical bus cross-tie
+//! — each driven by its own command (see the consts below). "avionics on" fires
+//! both so both panel switches move, not just one.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -12,7 +14,17 @@ use serde_json::{json, Value};
 use super::{Tool, ToolCtx};
 
 const BATTERY: &str = "sim/cockpit/electrical/battery_on";
-const AVIONICS: &str = "sim/cockpit2/switches/avionics_power_on";
+// The C172's two AVIONICS panel switches are two *different* systems, each
+// driven by a command (a dataref write sets the value but won't animate the 3D
+// switch — same quirk as the fuel selector). Verified with DataRefTool:
+//   BUS 1 = avionics master → sim/systems/avionics_on,  reads back via avionics_on
+//   BUS 2 = bus cross-tie    → sim/electrical/cross_tie_*, reads back via cross_tie
+const AVIONICS_BUS1: &str = "sim/cockpit/electrical/avionics_on";
+const AVIONICS_BUS2: &str = "sim/cockpit2/electrical/cross_tie";
+const CMD_AVIONICS_ON: &str = "sim/systems/avionics_on";
+const CMD_AVIONICS_OFF: &str = "sim/systems/avionics_off";
+const CMD_CROSS_TIE_ON: &str = "sim/electrical/cross_tie_on";
+const CMD_CROSS_TIE_OFF: &str = "sim/electrical/cross_tie_off";
 const GENERATOR: &str = "sim/cockpit/electrical/generator_on"; // array; [0] = alternator
 
 /// (key the LLM selects by, spoken form).
@@ -64,7 +76,13 @@ impl Tool for SetElectrical {
         if args.system.eq_ignore_ascii_case("all") {
             ctx.xplane.set_int(BATTERY, v).await?;
             ctx.xplane.set_int_array_elem(GENERATOR, 0, v).await?;
-            ctx.xplane.set_int(AVIONICS, v).await?;
+            if args.on {
+                ctx.xplane.run_command(CMD_AVIONICS_ON).await?;
+                ctx.xplane.run_command(CMD_CROSS_TIE_ON).await?;
+            } else {
+                ctx.xplane.run_command(CMD_AVIONICS_OFF).await?;
+                ctx.xplane.run_command(CMD_CROSS_TIE_OFF).await?;
+            }
             return Ok(format!(
                 "Roger, all electrical systems {}.",
                 if args.on { "on" } else { "off" }
@@ -86,8 +104,29 @@ impl Tool for SetElectrical {
                 ctx.xplane.get_float(BATTERY).await? > 0.5
             }
             "avionics" => {
-                ctx.xplane.set_int(AVIONICS, v).await?;
-                ctx.xplane.get_float(AVIONICS).await? > 0.5
+                // Two switches, two systems — commands (not dataref writes) so both
+                // 3D switches animate: BUS 1 = avionics master, BUS 2 = cross-tie.
+                if args.on {
+                    ctx.xplane.run_command(CMD_AVIONICS_ON).await?;
+                    ctx.xplane.run_command(CMD_CROSS_TIE_ON).await?;
+                } else {
+                    ctx.xplane.run_command(CMD_AVIONICS_OFF).await?;
+                    ctx.xplane.run_command(CMD_CROSS_TIE_OFF).await?;
+                }
+                // Read both back and name them so the pilot hears that both buses
+                // moved, not just a vague "avionics on".
+                let bus1 = ctx.xplane.get_float(AVIONICS_BUS1).await? > 0.5;
+                let bus2 = ctx.xplane.get_float(AVIONICS_BUS2).await? > 0.5;
+                return Ok(match (bus1, bus2) {
+                    (true, true) => "Roger, avionics master on — bus 1 and bus 2.".to_string(),
+                    (false, false) => "Roger, avionics master off — bus 1 and bus 2.".to_string(),
+                    // Mixed: report exactly what the panel shows rather than lie.
+                    (b1, b2) => format!(
+                        "Avionics bus 1 {}, bus 2 {}.",
+                        if b1 { "on" } else { "off" },
+                        if b2 { "on" } else { "off" }
+                    ),
+                });
             }
             "alternator" => {
                 ctx.xplane.set_int_array_elem(GENERATOR, 0, v).await?;

@@ -95,7 +95,7 @@ impl Tool for SetHeading {
         // Confirm the actual state, not the intent.
         let actual = ctx.xplane.get_float(HEADING_BUG).await?;
         if servos_engaged(ctx).await? {
-            Ok(format!("Roger, heading {:03.0}, autopilot engaged.", actual))
+            Ok(format!("Roger — autopilot engaged, heading mode, bug to {:03.0}.", actual))
         } else {
             Ok(format!(
                 "Heading bug set to {:03.0}, but the autopilot didn't engage — check the AP master.",
@@ -156,7 +156,7 @@ impl Tool for SetAltitude {
 
         let actual = ctx.xplane.get_float(ALT_DIAL).await?;
         if servos_engaged(ctx).await? {
-            Ok(format!("Roger, altitude {:.0} feet, autopilot engaged.", actual))
+            Ok(format!("Roger — autopilot engaged, altitude hold, {:.0} feet.", actual))
         } else {
             Ok(format!(
                 "Altitude set to {:.0} feet, but the autopilot didn't engage — check the AP master.",
@@ -229,7 +229,7 @@ impl Tool for SetVerticalSpeed {
         let actual = ctx.xplane.get_float(VS_DIAL).await?;
         let phrase = describe_vs(actual);
         if servos_engaged(ctx).await? {
-            Ok(format!("Roger, {phrase}, autopilot engaged."))
+            Ok(format!("Roger — autopilot engaged, vertical speed mode, {phrase}."))
         } else {
             Ok(format!("{phrase} set, but the autopilot didn't engage — check the AP master."))
         }

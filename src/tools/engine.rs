@@ -174,7 +174,12 @@ impl Tool for StartEngine {
                 .map(|r| r > 0.5)
                 .unwrap_or(false);
             if running {
-                return Ok("Roger, engine started.".to_string());
+                // Narrate the start sequence so the pilot hears what was done on
+                // their behalf, not just the end state.
+                return Ok(
+                    "Roger — mixture rich, throttle cracked, mags both, cranking. Engine started."
+                        .to_string(),
+                );
             }
         }
         Ok("Cranking — the engine hasn't caught. Check fuel and mixture, then try again.".to_string())
@@ -371,7 +376,7 @@ impl Tool for StopEngine {
                 .map(|r| r > 0.5)
                 .unwrap_or(false);
             if !running {
-                return Ok("Roger, engine shut down.".to_string());
+                return Ok("Roger — mixture to idle cutoff, magnetos off. Engine shut down.".to_string());
             }
         }
         Ok("Mixture to cutoff, engine winding down.".to_string())
