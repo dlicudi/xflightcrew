@@ -37,6 +37,7 @@ retractable_gear: false # no gear tool — the 172 has fixed gear
 fuel:
   reserve_caution_min: 45.0
   reserve_warning_min: 30.0
+  cruise_burn_kg_hr: 24.0   # ~8.5 gal/hr — used to estimate endurance pre-takeoff
 
 # Flap detents, retracted → full. Vfe is the max IAS (kts) to extend to each.
 flaps:

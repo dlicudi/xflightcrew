@@ -127,6 +127,9 @@ plumbing is proven.
 - fuel endurance (minutes at current burn) into a reserve band — caution at the
   profile's `reserve_caution_min`, warning at `reserve_warning_min` (172: 45/30),
   airborne + engine-running only
+- pre-takeoff fuel: on the ground + engine running, estimate endurance from the
+  profile's nominal `cruise_burn_kg_hr` (idle burn would read as ~infinite) and
+  caution once below the reserve — "low fuel for departure"
 - overspeed approaching Vno → Vne (trend, not just redline)
 - high sink rate near ground
 

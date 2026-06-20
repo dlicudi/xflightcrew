@@ -99,6 +99,10 @@ pub struct FuelProfile {
     pub reserve_caution_min: f64,
     /// Endurance (minutes) at or below which to warn (more urgent).
     pub reserve_warning_min: f64,
+    /// Nominal cruise fuel burn (kg/hr). Used by the *ground* check to estimate
+    /// endurance before takeoff (current idle burn would read as near-infinite),
+    /// so "you're low for a flight" can fire while parked. The 172 burns ~24 kg/hr.
+    pub cruise_burn_kg_hr: f64,
 }
 
 /// A flap system as an ordered list of detents, retracted → fully extended.
@@ -249,6 +253,7 @@ fn cessna_172sp() -> AircraftProfile {
         fuel: Some(FuelProfile {
             reserve_caution_min: 45.0,
             reserve_warning_min: 30.0,
+            cruise_burn_kg_hr: 24.0,
         }),
         lights: vec![
             light("nav", "navigation lights", "sim/cockpit2/switches/navigation_lights_on",

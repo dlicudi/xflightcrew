@@ -65,6 +65,10 @@ pub struct Snapshot {
     /// Minutes of fuel remaining at the current burn (total fuel ÷ fuel flow).
     /// `None` when it can't be computed (no fuel/flow read, or flow ≈ 0).
     pub endurance_min: Option<f64>,
+    /// Total fuel aboard, kg. `None` if the read failed. Used by the ground
+    /// check, which estimates endurance from a nominal cruise burn instead of
+    /// the (near-zero) idle burn.
+    pub fuel_kg: Option<f64>,
     pub phase: Phase,
 }
 
@@ -127,6 +131,7 @@ impl Snapshot {
             alternator_on,
             gyro_drift_deg,
             endurance_min,
+            fuel_kg,
             phase: Phase::Ground,
         };
         s.phase = estimate_phase(&s);
@@ -251,6 +256,10 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             at_or_below_min: fuel.reserve_warning_min,
             above_min: None,
         }));
+        checks.push(Box::new(FuelPreTakeoff {
+            caution_min: fuel.reserve_caution_min,
+            cruise_burn_kg_hr: fuel.cruise_burn_kg_hr,
+        }));
     }
     checks
 }
@@ -372,6 +381,40 @@ impl Check for FuelEndurance {
     }
 }
 
+/// On the ground with the engine running and not enough fuel for a sensible
+/// flight. The in-flight [`FuelEndurance`] check can't help here — idle burn
+/// makes its "minutes remaining" near-infinite — so this estimates endurance
+/// from a nominal *cruise* burn and cautions (once) below the reserve. Catches
+/// "you're about to depart low on fuel" before you're airborne. Advisory-grade
+/// Caution: a one-time nudge to go refuel, not a repeating nag.
+struct FuelPreTakeoff {
+    caution_min: f64,
+    cruise_burn_kg_hr: f64,
+}
+
+impl Check for FuelPreTakeoff {
+    fn id(&self) -> &'static str {
+        "fuel_pretakeoff"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Caution
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if !s.on_ground || !s.engine_running || self.cruise_burn_kg_hr <= 0.0 {
+            return None;
+        }
+        let fuel = s.fuel_kg?;
+        let endurance_min = fuel / self.cruise_burn_kg_hr * 60.0;
+        if endurance_min >= self.caution_min {
+            return None;
+        }
+        let approx = (endurance_min / 5.0).round() * 5.0;
+        Some(format!(
+            "Low fuel for departure — about {approx:.0} minutes at cruise burn. Consider refueling."
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +429,7 @@ mod tests {
             alternator_on,
             gyro_drift_deg: 0.0,
             endurance_min: None,
+            fuel_kg: None,
             phase: Phase::Ground,
         }
     }
@@ -438,6 +482,33 @@ mod tests {
         s.engine_running = true;
         s.endurance_min = None;
         assert!(warning.eval(&s).is_none());
+    }
+
+    #[test]
+    fn fuel_pretakeoff_cautions_on_ground_only_when_low() {
+        // 45 min caution; 24 kg/hr cruise → 18 kg ≈ 45 min, 14 kg ≈ 35 min.
+        let c = FuelPreTakeoff { caution_min: 45.0, cruise_burn_kg_hr: 24.0 };
+        let mut s = snap(true, true); // on ground, engine running
+
+        // Plenty for a flight: silent.
+        s.fuel_kg = Some(40.0); // 100 min at cruise
+        assert!(c.eval(&s).is_none());
+
+        // Low for departure: cautions.
+        s.fuel_kg = Some(14.0); // ~35 min at cruise
+        assert!(c.eval(&s).is_some());
+
+        // Airborne: this check is ground-only (FuelEndurance owns the air).
+        s.on_ground = false;
+        assert!(c.eval(&s).is_none());
+
+        // Engine off, or no fuel read: silent.
+        s.on_ground = true;
+        s.engine_running = false;
+        assert!(c.eval(&s).is_none());
+        s.engine_running = true;
+        s.fuel_kg = None;
+        assert!(c.eval(&s).is_none());
     }
 
     #[test]
