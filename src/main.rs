@@ -520,9 +520,9 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "light", "lights", "beacon", "strobe", "strobes", "taxi", "landing", "nav",
     "navigation", "flood", "floods",
     // engine / fuel
-    "throttle", "power", "idle", "mixture", "rich", "lean", "engine", "engines",
-    "start", "shutdown", "magneto", "magnetos", "mags", "carb", "carburetor",
-    "fuel", "pump", "boost", "primer", "selector",
+    "throttle", "thrust", "power", "idle", "mixture", "rich", "lean", "engine",
+    "engines", "start", "shutdown", "magneto", "magnetos", "mags", "carb",
+    "carburetor", "fuel", "pump", "boost", "primer", "selector",
     // electrical
     "battery", "alternator", "avionics", "electrical", "bus",
     // radios / transponder
