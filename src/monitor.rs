@@ -185,17 +185,27 @@ pub trait Check: Send {
     fn id(&self) -> &'static str;
     fn severity(&self) -> Severity;
     fn eval(&self, s: &Snapshot) -> Option<String>;
+    /// How long the condition must hold continuously before we speak. Defaults
+    /// to zero (fire on the rising edge). Override for conditions that are
+    /// briefly true during normal operation — e.g. the alternator is offline for
+    /// a few seconds during every engine start — so a transient doesn't nag.
+    fn min_duration(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 /// Per-check firing state: enforces edge-triggering and Warning repeats.
 struct FireState {
     firing: bool,
     last_spoken: Option<Instant>,
+    /// When the condition most recently became true (rising edge). Used to
+    /// enforce a check's `min_duration` sustain before the first callout.
+    since: Option<Instant>,
 }
 
 impl FireState {
     fn new() -> Self {
-        FireState { firing: false, last_spoken: None }
+        FireState { firing: false, last_spoken: None, since: None }
     }
 
     /// Should we speak right now? Never more than once per `RENOTIFY_COOLDOWN` —
@@ -215,9 +225,19 @@ impl FireState {
         }
     }
 
-    /// Condition is currently bad. Speak per [`should_speak`] and mark firing.
-    fn active(&mut self, msg: String, sev: Severity, voice: &Voice, now: Instant) {
-        if self.should_speak(sev, now) {
+    /// Has the condition held long enough to be worth speaking? Records the
+    /// rising edge on first call and returns whether `min_duration` has elapsed
+    /// since — so a transient that [`clear`](Self::clear)s before then never
+    /// reaches the speak path.
+    fn sustained(&mut self, min_duration: Duration, now: Instant) -> bool {
+        let since = *self.since.get_or_insert(now);
+        now.duration_since(since) >= min_duration
+    }
+
+    /// Condition is currently bad. Speak per [`should_speak`], but only once it
+    /// has held continuously for `min_duration`. Marks firing either way.
+    fn active(&mut self, msg: String, sev: Severity, min_duration: Duration, voice: &Voice, now: Instant) {
+        if self.sustained(min_duration, now) && self.should_speak(sev, now) {
             voice.alert(sev.into(), msg);
             self.last_spoken = Some(now);
         }
@@ -225,9 +245,11 @@ impl FireState {
     }
 
     /// Condition cleared. Keep `last_spoken` so a quick recurrence is still
-    /// inside the cooldown and won't re-nag; only drop the firing flag.
+    /// inside the cooldown and won't re-nag; drop the firing flag and reset the
+    /// sustain timer so the next occurrence must hold for `min_duration` again.
     fn clear(&mut self) {
         self.firing = false;
+        self.since = None;
     }
 }
 
@@ -285,7 +307,7 @@ pub async fn run(config: Config, profile: AircraftProfile, voice: Voice) {
             for check in &checks {
                 let state = states.get_mut(check.id()).expect("state per check");
                 match check.eval(&snap) {
-                    Some(msg) => state.active(msg, check.severity(), &voice, now),
+                    Some(msg) => state.active(msg, check.severity(), check.min_duration(), &voice, now),
                     None => state.clear(),
                 }
             }
@@ -293,6 +315,12 @@ pub async fn run(config: Config, profile: AircraftProfile, voice: Voice) {
         tokio::time::sleep(period).await;
     }
 }
+
+/// The alternator is normally offline for a few seconds during every engine
+/// start (the engine catches mid-crank, before the ALT switch goes on), so we
+/// only warn once it has stayed offline this long while running — a genuine
+/// "you forgot the alternator", not the start transient.
+const ALTERNATOR_SUSTAIN: Duration = Duration::from_secs(60);
 
 /// Engine running but the alternator switch is off → the bus is being drained
 /// with nothing charging it. A classic config slip a human copilot catches.
@@ -308,6 +336,9 @@ impl Check for AlternatorOffline {
     fn eval(&self, s: &Snapshot) -> Option<String> {
         (s.engine_running && !s.alternator_on)
             .then(|| "Alternator's offline — we're running on the battery.".to_string())
+    }
+    fn min_duration(&self) -> Duration {
+        ALTERNATOR_SUSTAIN
     }
 }
 
@@ -448,6 +479,26 @@ mod tests {
         assert!(c.eval(&snap(true, false)).is_some()); // running, alt off → alert
         assert!(c.eval(&snap(true, true)).is_none()); // running, alt on → ok
         assert!(c.eval(&snap(false, false)).is_none()); // shut down → ok
+        assert_eq!(c.min_duration(), ALTERNATOR_SUSTAIN); // sustained before warning
+    }
+
+    #[test]
+    fn sustain_suppresses_transient_then_fires_when_held() {
+        let t0 = Instant::now();
+        let d = ALTERNATOR_SUSTAIN;
+        let mut st = FireState::new();
+
+        // The start transient: alternator offline for a few seconds, then the
+        // ALT switch goes on and the condition clears — must never reach speak.
+        assert!(!st.sustained(d, t0)); // rising edge: timer starts, not yet due
+        assert!(!st.sustained(d, t0 + Duration::from_secs(3)));
+        st.clear(); // alternator came online
+
+        // A genuinely forgotten alternator: held continuously past the sustain.
+        let t1 = t0 + Duration::from_secs(10);
+        assert!(!st.sustained(d, t1)); // new rising edge — times from here
+        assert!(!st.sustained(d, t1 + d - Duration::from_secs(1))); // still short
+        assert!(st.sustained(d, t1 + d)); // held a full minute → now warn
     }
 
     #[test]
