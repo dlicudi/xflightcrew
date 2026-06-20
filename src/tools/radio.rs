@@ -82,7 +82,9 @@ impl Tool for SetTransponder {
 
     fn description(&self) -> &str {
         "Set the transponder squawk code (4 digits, each 0-7). Use for 'squawk \
-         1200', 'squawk 7000', 'set transponder to 4521'."
+         1200', 'squawk 7000', 'set transponder to 4521', 'squawk VFR' (1200), \
+         'set squawk 0021'. Common codes: VFR = 1200, emergency = 7700, lost \
+         comms = 7600, hijack = 7500."
     }
 
     fn parameters(&self) -> Value {
@@ -163,7 +165,8 @@ impl Tool for SwapRadio {
 
     fn description(&self) -> &str {
         "Swap a COM radio's active and standby frequencies. Use for 'swap com one', \
-         'flip com two', 'swap com one frequencies'."
+         'flip com two', 'swap com one frequencies', 'make standby active on com \
+         one', 'flip the frequencies', 'swap com radios'."
     }
 
     fn parameters(&self) -> Value {
@@ -248,7 +251,8 @@ impl Tool for SetObs {
     fn description(&self) -> &str {
         "Set the NAV1 OBS course (the selected VOR radial / course pointer) in \
          degrees. Use for 'set OBS 240', 'course 090', 'set the OBS to two four \
-         zero', 'select the 180 radial'."
+         zero', 'select the 180 radial', 'set the radial', 'course pointer to \
+         090', 'OBS to 360'."
     }
 
     fn parameters(&self) -> Value {
@@ -288,7 +292,8 @@ impl Tool for SetTransponderMode {
     fn description(&self) -> &str {
         "Set the transponder mode (off, standby, on, altitude) or send ident. Use \
          for 'transponder standby', 'squawk altitude', 'squawk mode charlie', \
-         'transponder on', 'ident', 'squawk ident'."
+         'transponder on', 'ident', 'squawk ident', 'transponder off', \
+         'go to standby', 'mode C on'."
     }
 
     fn parameters(&self) -> Value {

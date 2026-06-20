@@ -59,7 +59,11 @@ impl Tool for SetElectrical {
         "Turn an electrical system on or off: the battery master, the alternator, \
          the avionics master, or 'all' for every electrical system at once. Use \
          for 'battery on', 'alternator on', 'avionics off', 'switch on all \
-         electrical systems', 'all electrical off'."
+         electrical systems', 'all electrical off', 'electrics on', 'electrics \
+         off', 'master switch on', 'battery master on', 'generator on', \
+         'kill the avionics', 'power up the avionics'. 'electrics' or 'master' \
+         with no system named means 'all'. The alternator is also called the \
+         generator."
     }
 
     fn parameters(&self) -> Value {

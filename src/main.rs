@@ -524,10 +524,11 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "engines", "start", "shutdown", "magneto", "magnetos", "mags", "carb",
     "carburetor", "fuel", "pump", "boost", "primer", "selector",
     // electrical
-    "battery", "alternator", "avionics", "electrical", "bus",
+    "battery", "alternator", "generator", "avionics", "electrical", "electric",
+    "electrics", "bus", "master",
     // radios / transponder
     "com", "comm", "radio", "frequency", "tune", "squawk", "transponder",
-    "ident", "barometer", "altimeter", "baro",
+    "ident", "barometer", "altimeter", "baro", "kollsman", "qnh", "vor",
     // instruments / misc controls
     "gyro", "pitot", "brake", "brakes", "parking", "heat",
 ];
@@ -615,6 +616,10 @@ mod tests {
             "fuel pump on", "carb heat off", "magnetos both", "trim nose up",
             "nav one 109.5", "set the OBS to 240", "com two 121.9",
             "transponder standby", "prepare the ILS for runway 13", "flood lights on",
+            // Phrasings that previously fell through the gate (issue: rejected
+            // before reaching the LLM).
+            "electrics off", "fix the gyro drift", "master switch on",
+            "generator on", "squawk VFR",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
         }

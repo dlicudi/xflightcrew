@@ -51,8 +51,10 @@ impl Tool for SetFlaps {
     fn description(&self) -> &str {
         // Static text; the concrete notches are conveyed via the enum schema.
         "Set the wing flaps to a detent. Use for commands like 'flaps up', \
-         'flaps ten', 'flaps twenty', 'flaps full'. 'up' is retracted; higher \
-         numbers are more flap."
+         'flaps ten', 'flaps twenty', 'flaps full', 'retract the flaps', \
+         'bring the flaps up', 'give me ten degrees of flap', 'approach flaps', \
+         'flaps for landing', 'milk the flaps up', 'flaps down'. 'up' is \
+         retracted; higher numbers are more flap; 'down' means extend."
     }
 
     fn parameters(&self) -> Value {

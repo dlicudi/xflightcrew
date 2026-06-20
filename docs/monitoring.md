@@ -108,6 +108,7 @@ alerts:        # enable + per-alert tuning; absent = off
   overspeed_vne:          { enabled: true }
   low_fuel:               { enabled: true }
   alternator_offline:     { enabled: true }
+  gyro_drift:             { enabled: true, deg: 10 }
   high_sink_near_ground:  { enabled: true, fpm: -1000 }
 ```
 
@@ -121,6 +122,8 @@ plumbing is proven.
 - carb heat cold on descent (172-specific, icing-prone)
 - parking brake set as throttle advances on the roll
 - alternator offline / low bus volts with the engine running
+- directional gyro precessed past ~10° vs the compass, airborne (advisory; pairs
+  with the `align_gyro` tool to fix it)
 - low fuel / endurance below profile threshold
 - overspeed approaching Vno → Vne (trend, not just redline)
 - high sink rate near ground

@@ -59,7 +59,9 @@ impl Tool for SetHeading {
     fn description(&self) -> &str {
         "Command the autopilot to turn to and hold a magnetic heading. Engages \
          the autopilot and heading mode, then flies the given heading in degrees. \
-         Use for 'autopilot heading 270', 'fly heading 090', 'turn to heading 180'."
+         Use for 'autopilot heading 270', 'fly heading 090', 'turn to heading 180', \
+         'steer 270', 'come left to heading 200', 'heading bug 360', 'fly two \
+         seven zero', 'select heading 120'."
     }
 
     fn parameters(&self) -> Value {
@@ -122,7 +124,9 @@ impl Tool for SetAltitude {
     fn description(&self) -> &str {
         "Set the autopilot target altitude in feet and engage altitude hold. Use \
          for 'autopilot altitude 5500', 'climb and maintain 7000', 'set altitude \
-         3000'. Pair with set_vertical_speed to start a climb or descent."
+         3000', 'maintain 5500', 'level off at 6000', 'altitude to 4000', \
+         'select 7000 feet'. Pair with set_vertical_speed to start a climb or \
+         descent."
     }
 
     fn parameters(&self) -> Value {
@@ -183,7 +187,9 @@ impl Tool for SetVerticalSpeed {
     fn description(&self) -> &str {
         "Set the autopilot vertical speed in feet per minute and engage vertical \
          speed mode. Positive climbs, negative descends. Use for 'vertical speed \
-         500 up', 'descend at 700', 'VS 1000', 'vertical speed down 500'."
+         500 up', 'descend at 700', 'VS 1000', 'vertical speed down 500', \
+         'start a descent', 'climb at 500', 'rate of descent 700', 'ease down \
+         at 300'."
     }
 
     fn parameters(&self) -> Value {
@@ -247,7 +253,8 @@ impl Tool for AutopilotOff {
     fn description(&self) -> &str {
         "Disengage the autopilot — disconnect the servos so the pilot hand-flies. \
          Use for 'autopilot off', 'disconnect the autopilot', 'disengage AP', \
-         'kill the autopilot', 'I have the airplane'."
+         'kill the autopilot', 'I have the airplane', 'my airplane', 'I'll hand \
+         fly', 'drop the autopilot', 'take me off autopilot'."
     }
 
     fn parameters(&self) -> Value {

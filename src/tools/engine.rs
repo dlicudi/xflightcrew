@@ -83,7 +83,9 @@ impl Tool for SetThrottle {
     fn description(&self) -> &str {
         "Set the throttle (engine power / thrust) as a percentage, 0 (idle) to \
          100 (full power). Use for 'throttle 60 percent', 'full throttle', \
-         'maximum power', 'set thrust to 80 percent', 'throttle idle'."
+         'maximum power', 'set thrust to 80 percent', 'throttle idle', \
+         'power up', 'power to 75', 'throttle back to 40', 'reduce power', \
+         'advance the throttle', 'firewall it', 'throttle back'."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -116,7 +118,9 @@ impl Tool for SetMixture {
     fn description(&self) -> &str {
         "Set the fuel mixture as a percentage: 100 = full rich, 0 = idle cutoff, \
          intermediate values lean the mixture. Use for 'mixture full rich', \
-         'lean the mixture to 70 percent', 'mixture idle cutoff'."
+         'lean the mixture to 70 percent', 'mixture idle cutoff', \
+         'richen the mixture', 'enrich the mixture', 'lean it out', \
+         'mixture for cruise', 'full lean', 'mixture cutoff'."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -235,7 +239,8 @@ impl Tool for SetFuelPump {
     }
     fn description(&self) -> &str {
         "Turn the electric (auxiliary) fuel pump on or off. Use for 'fuel pump on', \
-         'boost pump on', 'fuel pump off', 'aux fuel pump on'."
+         'boost pump on', 'fuel pump off', 'aux fuel pump on', 'electric pump on', \
+         'auxiliary pump off'."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -261,7 +266,8 @@ impl Tool for SetCarbHeat {
     }
     fn description(&self) -> &str {
         "Turn carburetor (alternate air) heat on or off. Use for 'carb heat on', \
-         'carb heat off', 'carburetor heat on'."
+         'carb heat off', 'carburetor heat on', 'apply carb heat', 'carb heat \
+         cold', 'carb heat hot', 'alternate air on'."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -294,7 +300,8 @@ impl Tool for SetMagnetos {
     fn description(&self) -> &str {
         "Set the magnetos / ignition position: off, left, right, or both. Used in \
          the run-up mag check. Use for 'magnetos both', 'mags to left', 'mags \
-         right', 'magnetos off'. To start the engine use start_engine, not this."
+         right', 'magnetos off', 'ignition both', 'check the left mag', \
+         'mags to right'. To start the engine use start_engine, not this."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -339,7 +346,8 @@ impl Tool for SetFuelSelector {
         // The 172's selector is LEFT/BOTH/RIGHT only; OFF is a separate fuel
         // shutoff valve, not a selector position.
         "Set the fuel tank selector: left, both, or right. Use for 'fuel selector \
-         both', 'fuel to left tank', 'select right tank'."
+         both', 'fuel to left tank', 'select right tank', 'switch tanks', \
+         'change to the left tank', 'both tanks', 'feed from the right'."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -378,7 +386,8 @@ impl Tool for StopEngine {
     fn description(&self) -> &str {
         "Shut down the engine: pull the mixture to idle cutoff and turn the \
          magnetos off. Use for 'shut down the engine', 'engine off', 'kill the \
-         engine', 'shutdown'."
+         engine', 'shutdown', 'cut the engine', 'shut her down', 'secure the \
+         engine', 'stop the engine'."
     }
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": {}, "additionalProperties": false })

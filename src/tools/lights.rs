@@ -44,7 +44,8 @@ impl Tool for SetLights {
     fn description(&self) -> &str {
         "Turn an exterior or interior light on or off. Use for commands like \
          'landing light on', 'strobes off', 'beacon on', 'taxi light off', \
-         'nav lights on'."
+         'nav lights on', 'give me the landing light', 'kill the strobes', \
+         'turn off the beacon', 'position lights on'."
     }
 
     fn parameters(&self) -> Value {

@@ -33,7 +33,9 @@ impl Tool for SetBarometer {
     fn description(&self) -> &str {
         "Set the altimeter (barometric pressure) in inches of mercury. Use for \
          'set altimeter two niner niner two' (29.92), 'altimeter 30.15', \
-         'set baro 29.80'."
+         'set baro 29.80', 'set the Kollsman to 29.92', 'altimeter setting \
+         30.02', 'set QNH three zero one zero'. (inHg only — convert a hPa/QNH \
+         value before calling.)"
     }
 
     fn parameters(&self) -> Value {
@@ -75,7 +77,8 @@ impl Tool for SetPitotHeat {
 
     fn description(&self) -> &str {
         "Turn pitot heat on or off (anti-ice for the airspeed system). Use for \
-         'pitot heat on', 'pitot heat off', 'turn on pitot heat'."
+         'pitot heat on', 'pitot heat off', 'turn on pitot heat', 'pitot anti-ice \
+         on', 'pitot heat', 'anti-ice on'."
     }
 
     fn parameters(&self) -> Value {
@@ -106,8 +109,10 @@ impl Tool for AlignGyro {
 
     fn description(&self) -> &str {
         "Align the directional gyro (heading indicator) to the magnetic compass. \
+         This is the fix when the gyro/heading indicator has drifted or is wrong. \
          Use for 'align the gyro', 'sync the heading indicator', 'set the DG', \
-         'sync the directional gyro'."
+         'sync the directional gyro', 'fix the gyro drift', 'the gyro is drifting', \
+         'correct the heading indicator', 'the DG is off'."
     }
 
     fn parameters(&self) -> Value {

@@ -30,6 +30,14 @@ const M_TO_FT: f64 = 3.280_84;
 /// (so cycling a switch off/on/off doesn't re-nag each time).
 const RENOTIFY_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// Directional-gyro precession past this many degrees (vs the magnetic compass)
+/// is worth calling out. The vacuum DG drifts a few degrees every ~15 min in a
+/// real 172; ~10° is the "genuinely off, sync it" amount and matches the usual
+/// DG-vs-compass tolerance — small enough to be useful, large enough not to
+/// nag on normal precession. (`align_gyro` itself treats <2° as a good sync,
+/// deliberately tighter than this alert.)
+const GYRO_DRIFT_ADVISORY_DEG: f64 = 10.0;
+
 /// Coarse flight phase, estimated from motion and height. Used to arm/disarm
 /// checks (e.g. "flaps up on final" only matters on Approach).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -51,6 +59,9 @@ pub struct Snapshot {
     pub vsi_fpm: f64,
     pub engine_running: bool,
     pub alternator_on: bool,
+    /// Directional-gyro precession vs the magnetic compass, degrees, folded into
+    /// −180..180 (so a small *negative* drift reads as e.g. −4°, not 356°).
+    pub gyro_drift_deg: f64,
     pub phase: Phase,
 }
 
@@ -82,6 +93,12 @@ impl Snapshot {
             .copied()
             .unwrap_or(0.0)
             > 0.5;
+        // Best-effort: a missing/!unavailable drift dataref must not kill the
+        // whole snapshot (which would silence every other check), so default to
+        // 0.0 rather than propagating None. Fold into −180..180, same as the
+        // `align_gyro` tool, so a small negative drift doesn't read as ~360.
+        let gyro_drift_raw = xp.get_float("sim/cockpit/gyros/dg_drift_vac_deg").await.unwrap_or(0.0);
+        let gyro_drift_deg = (gyro_drift_raw + 180.0).rem_euclid(360.0) - 180.0;
 
         let mut s = Snapshot {
             on_ground,
@@ -90,6 +107,7 @@ impl Snapshot {
             vsi_fpm,
             engine_running,
             alternator_on,
+            gyro_drift_deg,
             phase: Phase::Ground,
         };
         s.phase = estimate_phase(&s);
@@ -195,6 +213,9 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     if profile.electrical {
         checks.push(Box::new(AlternatorOffline));
     }
+    if profile.directional_gyro {
+        checks.push(Box::new(GyroDrift));
+    }
     checks
 }
 
@@ -245,6 +266,33 @@ impl Check for AlternatorOffline {
     }
 }
 
+/// The directional gyro has precessed away from the magnetic compass. Vacuum DGs
+/// drift slowly, and on a long leg it's easy to forget to realign — a right-seat
+/// pilot catches it. Advisory only: the wet compass is still valid, so this is a
+/// nudge ("you might want to sync it"), spoken once per occurrence, not a nag.
+/// Airborne-only — on the ground you just align during the run-up.
+struct GyroDrift;
+
+impl Check for GyroDrift {
+    fn id(&self) -> &'static str {
+        "gyro_drift"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Advisory
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if s.on_ground || s.gyro_drift_deg.abs() < GYRO_DRIFT_ADVISORY_DEG {
+            return None;
+        }
+        // Round to the nearest 5° so the spoken figure sounds like an estimate
+        // ("about ten degrees"), not false precision.
+        let approx = (s.gyro_drift_deg.abs() / 5.0).round() * 5.0;
+        Some(format!(
+            "Heading indicator's drifted about {approx:.0} degrees — you might want to sync it."
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +305,7 @@ mod tests {
             vsi_fpm: 0.0,
             engine_running,
             alternator_on,
+            gyro_drift_deg: 0.0,
             phase: Phase::Ground,
         }
     }
@@ -267,6 +316,38 @@ mod tests {
         assert!(c.eval(&snap(true, false)).is_some()); // running, alt off → alert
         assert!(c.eval(&snap(true, true)).is_none()); // running, alt on → ok
         assert!(c.eval(&snap(false, false)).is_none()); // shut down → ok
+    }
+
+    #[test]
+    fn gyro_drift_fires_only_airborne_past_threshold() {
+        let c = GyroDrift;
+        let mut s = snap(true, true);
+
+        // On the ground: never fires, even with big drift (sync at run-up).
+        s.on_ground = true;
+        s.gyro_drift_deg = 20.0;
+        assert!(c.eval(&s).is_none());
+
+        // Airborne, small precession: under threshold, stays quiet.
+        s.on_ground = false;
+        s.gyro_drift_deg = 6.0;
+        assert!(c.eval(&s).is_none());
+
+        // Airborne, drifted past threshold: fires (either sign).
+        s.gyro_drift_deg = 12.0;
+        assert!(c.eval(&s).is_some());
+        s.gyro_drift_deg = -14.0;
+        assert!(c.eval(&s).is_some());
+    }
+
+    #[test]
+    fn gyro_drift_callout_rounds_to_nearest_five() {
+        let c = GyroDrift;
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        s.gyro_drift_deg = -13.0; // |13| → "about 15 degrees"
+        let msg = c.eval(&s).expect("should fire");
+        assert!(msg.contains("15 degrees"), "got: {msg}");
     }
 
     #[test]

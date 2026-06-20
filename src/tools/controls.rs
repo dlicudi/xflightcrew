@@ -31,7 +31,8 @@ impl Tool for SetParkingBrake {
 
     fn description(&self) -> &str {
         "Set or release the parking brake. Use for 'parking brake set', 'set the \
-         brakes', 'release parking brake', 'brakes off'."
+         brakes', 'release parking brake', 'brakes off', 'park brake on', \
+         'hold the brakes', 'release the brakes', 'parking brake off'."
     }
 
     fn parameters(&self) -> Value {
@@ -80,7 +81,8 @@ impl Tool for SetPitchTrim {
         "Adjust the elevator (pitch) trim. 'nose_up' and 'nose_down' nudge the \
          trim a step at a time; 'neutral' centres it; 'takeoff' sets the takeoff \
          position. Use for 'trim nose up', 'trim nose down', 'a little nose up \
-         trim', 'centre the trim', 'set takeoff trim'."
+         trim', 'centre the trim', 'set takeoff trim', 'trim up', 'trim down', \
+         'roll in some nose up trim', 'center the trim', 'trim for takeoff'."
     }
 
     fn parameters(&self) -> Value {
