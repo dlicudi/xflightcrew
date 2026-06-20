@@ -12,7 +12,9 @@ pub struct Config {
     /// Base URL of the local Ollama server, e.g. `http://127.0.0.1:11434`.
     pub ollama_base_url: String,
     /// Local model id used for tool selection. Must support tool-calling
-    /// (e.g. `llama3.1`, `qwen2.5`).
+    /// (e.g. `qwen3:8b`, `qwen2.5`, `llama3.1`). Default `qwen3:8b` won the
+    /// tool-pick battery (100% on the clean set, fastest of the perfect
+    /// scorers); `llm.rs` auto-disables its thinking mode for low latency.
     pub model: String,
     /// Base URL of the X-Plane Web API, e.g. `http://127.0.0.1:8086`.
     pub xplane_base_url: String,
@@ -64,7 +66,7 @@ impl Config {
 
         Ok(Self {
             ollama_base_url: env_or("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
-            model: env_or("XCOPILOT_MODEL", "llama3.1"),
+            model: env_or("XCOPILOT_MODEL", "qwen3:8b"),
             xplane_base_url: env_or("XPLANE_BASE_URL", "http://127.0.0.1:8086"),
             whisper_model_path: env_or("WHISPER_MODEL", "models/ggml-base.en.bin"),
             listen_mode: env_or("XCOPILOT_LISTEN", "continuous"),
