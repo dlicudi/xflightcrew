@@ -151,6 +151,8 @@ mod tests {
             piper_voice: String::new(),
             aircraft: "cessna_172sp".into(),
             confirm_critical: true,
+            monitor_enabled: false,
+            monitor_hz: 3.0,
         }
     }
 

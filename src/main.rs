@@ -11,6 +11,7 @@ mod aircraft;
 mod audio;
 mod config;
 mod llm;
+mod monitor;
 mod nav;
 mod stt;
 mod tts;
@@ -105,6 +106,22 @@ async fn main() -> Result<()> {
     // silently rather than answered with an apology.
     let explicit = !continuous || !config.wake_word.is_empty();
 
+    // The speech arbiter is shared by the command loop and the monitor, so it's
+    // created here (above both) and handed to each.
+    let voice = Voice::new(config.clone());
+
+    // Background monitor: watches for problems and speaks up. Its own thread +
+    // runtime + X-Plane client, sharing the speech arbiter. Runs in both UIs.
+    if config.monitor_enabled {
+        let mon_voice = voice.clone();
+        let mon_config = config.clone();
+        let mon_profile = profile.clone();
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+            rt.block_on(monitor::run(mon_config, mon_profile, mon_voice));
+        });
+    }
+
     if config.ui == "tui" {
         // TUI: voice loop + aircraft poll run on background threads, each with
         // its own runtime; the dashboard renders on the main thread.
@@ -132,9 +149,9 @@ async fn main() -> Result<()> {
         let reporter = Reporter::Tui(tx);
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
-            if let Err(e) =
-                rt.block_on(run_session(config, stt, llm, registry, continuous, explicit, reporter))
-            {
+            if let Err(e) = rt.block_on(run_session(
+                config, stt, llm, registry, voice, continuous, explicit, reporter,
+            )) {
                 tracing::error!("voice loop ended: {e:#}");
             }
         });
@@ -143,7 +160,7 @@ async fn main() -> Result<()> {
         Ok(())
     } else {
         println!("\n  x-copilot — {} ({}). Ctrl-C to quit.\n", profile.display_name, config.listen_mode);
-        run_session(config, stt, llm, registry, continuous, explicit, Reporter::Plain).await
+        run_session(config, stt, llm, registry, voice, continuous, explicit, Reporter::Plain).await
     }
 }
 
@@ -155,6 +172,7 @@ async fn run_session(
     stt: Stt,
     llm: Llm,
     registry: Registry,
+    voice: Voice,
     continuous: bool,
     explicit: bool,
     reporter: Reporter,
@@ -163,9 +181,6 @@ async fn run_session(
     // (main for plain, the voice thread for TUI) — a reqwest client's I/O is
     // bound to the runtime it's used on.
     let xplane = XPlaneClient::new(config.xplane_base_url.clone());
-    // All speech goes through one arbiter so readbacks (and later, monitor
-    // alerts) never talk over each other.
-    let voice = Voice::new(config.clone());
     let specs = registry.specs();
     let mut listener = if continuous {
         Some(Listener::start(config.vad_threshold, reporter.clone())?)
