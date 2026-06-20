@@ -25,6 +25,11 @@ const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 const CMD_MAGS_BOTH: &str = "sim/magnetos/magnetos_both";
 const CMD_MAGS_OFF: &str = "sim/magnetos/magnetos_off";
 const CMD_STARTER: &str = "sim/starters/engage_starter_1";
+// Alternator (generator #1): the ALT half of the master switch. Brought online
+// as part of the start so the running engine charges the bus — and so the
+// monitor's "alternator offline" check doesn't fire the instant we finish.
+const CMD_ALTERNATOR_ON: &str = "sim/electrical/generator_1_on";
+const GENERATOR: &str = "sim/cockpit/electrical/generator_on"; // array; [0] = alternator
 // Per-engine actuator arrays (the 172 is single-engine → element 0).
 const FUEL_PUMP: &str = "sim/cockpit2/engine/actuators/fuel_pump_on";
 const IGNITION_KEY: &str = "sim/cockpit2/engine/actuators/ignition_key"; // 0 off,1 R,2 L,3 both,4 start
@@ -213,12 +218,29 @@ impl Tool for StartEngine {
                 .map(|r| r > 0.5)
                 .unwrap_or(false);
             if running {
+                // Bring the alternator online now there's an engine to drive it,
+                // so we charge the bus instead of draining the battery (and so
+                // the monitor doesn't immediately call out an offline alternator).
+                ctx.xplane.run_command(CMD_ALTERNATOR_ON).await?;
+                let alt_on = ctx
+                    .xplane
+                    .get_float_array(GENERATOR)
+                    .await
+                    .ok()
+                    .and_then(|v| v.first().copied())
+                    .map(|g| g > 0.5)
+                    .unwrap_or(false);
                 // Narrate the start sequence so the pilot hears what was done on
                 // their behalf, not just the end state.
-                return Ok(
-                    "Roger — mixture rich, throttle cracked, mags both, cranking. Engine started."
-                        .to_string(),
-                );
+                return Ok(if alt_on {
+                    "Roger — mixture rich, throttle cracked, mags both, cranking. \
+                     Engine started, alternator on."
+                        .to_string()
+                } else {
+                    "Roger — mixture rich, throttle cracked, mags both, cranking. \
+                     Engine started — but the alternator didn't come on, check it."
+                        .to_string()
+                });
             }
         }
         Ok("Cranking — the engine hasn't caught. Check fuel and mixture, then try again.".to_string())
