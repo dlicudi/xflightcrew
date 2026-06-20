@@ -62,6 +62,9 @@ pub struct Snapshot {
     /// Directional-gyro precession vs the magnetic compass, degrees, folded into
     /// −180..180 (so a small *negative* drift reads as e.g. −4°, not 356°).
     pub gyro_drift_deg: f64,
+    /// Minutes of fuel remaining at the current burn (total fuel ÷ fuel flow).
+    /// `None` when it can't be computed (no fuel/flow read, or flow ≈ 0).
+    pub endurance_min: Option<f64>,
     pub phase: Phase,
 }
 
@@ -100,6 +103,21 @@ impl Snapshot {
         let gyro_drift_raw = xp.get_float("sim/cockpit/gyros/dg_drift_vac_deg").await.unwrap_or(0.0);
         let gyro_drift_deg = (gyro_drift_raw + 180.0).rem_euclid(360.0) - 180.0;
 
+        // Fuel endurance = total fuel ÷ current burn. Both best-effort (a missing
+        // read must not kill the snapshot); endurance is None when either is
+        // absent or the burn is ~0 (idle/shutdown), where "minutes remaining"
+        // is meaningless or infinite.
+        let fuel_kg = xp.get_float("sim/flightmodel/weight/m_fuel_total").await.ok();
+        let fuel_flow_kg_sec = xp
+            .get_float_array("sim/cockpit2/engine/indicators/fuel_flow_kg_sec")
+            .await
+            .ok()
+            .map(|v| v.iter().sum::<f64>());
+        let endurance_min = match (fuel_kg, fuel_flow_kg_sec) {
+            (Some(kg), Some(flow)) if flow > 1e-4 => Some(kg / flow / 60.0),
+            _ => None,
+        };
+
         let mut s = Snapshot {
             on_ground,
             groundspeed_kts,
@@ -108,6 +126,7 @@ impl Snapshot {
             engine_running,
             alternator_on,
             gyro_drift_deg,
+            endurance_min,
             phase: Phase::Ground,
         };
         s.phase = estimate_phase(&s);
@@ -216,6 +235,23 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     if profile.directional_gyro {
         checks.push(Box::new(GyroDrift));
     }
+    if let Some(fuel) = &profile.fuel {
+        // Two banded checks share one struct: caution between the thresholds,
+        // warning below the lower one. Disjoint bands so only one speaks at a
+        // time, and each gets its own fixed severity (the Check trait's model).
+        checks.push(Box::new(FuelEndurance {
+            id: "fuel_caution",
+            severity: Severity::Caution,
+            at_or_below_min: fuel.reserve_caution_min,
+            above_min: Some(fuel.reserve_warning_min),
+        }));
+        checks.push(Box::new(FuelEndurance {
+            id: "fuel_warning",
+            severity: Severity::Warning,
+            at_or_below_min: fuel.reserve_warning_min,
+            above_min: None,
+        }));
+    }
     checks
 }
 
@@ -293,6 +329,49 @@ impl Check for GyroDrift {
     }
 }
 
+/// Fuel endurance (minutes remaining at the current burn) has dropped into a
+/// reserve band. Tracking *time*, not gallons, is what a real copilot does — it
+/// folds in the power setting. Two instances run: a Caution band between the
+/// thresholds and a Warning band below the lower one; the bands are disjoint so
+/// only one speaks. Airborne + engine-running only — on the ground, idle burn
+/// makes "minutes remaining" misleadingly huge (a separate pre-takeoff
+/// quantity check would be the way to cover that case).
+struct FuelEndurance {
+    id: &'static str,
+    severity: Severity,
+    /// Fires when endurance ≤ this many minutes …
+    at_or_below_min: f64,
+    /// … and (if set) still above this — the next, more urgent band owns below it.
+    above_min: Option<f64>,
+}
+
+impl Check for FuelEndurance {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn severity(&self) -> Severity {
+        self.severity
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if s.on_ground || !s.engine_running {
+            return None;
+        }
+        let min = s.endurance_min?;
+        let in_band = min <= self.at_or_below_min && self.above_min.map_or(true, |a| min > a);
+        if !in_band {
+            return None;
+        }
+        // Round to the nearest 5 minutes — it's an estimate, not a stopwatch.
+        let approx = (min / 5.0).round() * 5.0;
+        Some(match self.severity {
+            Severity::Warning => {
+                format!("Low fuel — about {approx:.0} minutes at this burn. Plan to land.")
+            }
+            _ => format!("Fuel's getting low — about {approx:.0} minutes remaining."),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,8 +385,17 @@ mod tests {
             engine_running,
             alternator_on,
             gyro_drift_deg: 0.0,
+            endurance_min: None,
             phase: Phase::Ground,
         }
+    }
+
+    /// The 172's fuel bands: caution ≤ 45 min, warning ≤ 30 min.
+    fn fuel_caution() -> FuelEndurance {
+        FuelEndurance { id: "fuel_caution", severity: Severity::Caution, at_or_below_min: 45.0, above_min: Some(30.0) }
+    }
+    fn fuel_warning() -> FuelEndurance {
+        FuelEndurance { id: "fuel_warning", severity: Severity::Warning, at_or_below_min: 30.0, above_min: None }
     }
 
     #[test]
@@ -316,6 +404,40 @@ mod tests {
         assert!(c.eval(&snap(true, false)).is_some()); // running, alt off → alert
         assert!(c.eval(&snap(true, true)).is_none()); // running, alt on → ok
         assert!(c.eval(&snap(false, false)).is_none()); // shut down → ok
+    }
+
+    #[test]
+    fn fuel_bands_are_disjoint_and_airborne_only() {
+        let caution = fuel_caution();
+        let warning = fuel_warning();
+        let mut s = snap(true, true);
+        s.on_ground = false;
+
+        // Plenty of fuel: nothing fires.
+        s.endurance_min = Some(90.0);
+        assert!(caution.eval(&s).is_none() && warning.eval(&s).is_none());
+
+        // Caution band (30 < min ≤ 45): only caution.
+        s.endurance_min = Some(40.0);
+        assert!(caution.eval(&s).is_some());
+        assert!(warning.eval(&s).is_none());
+
+        // Warning band (≤ 30): only warning, not caution (disjoint handoff).
+        s.endurance_min = Some(25.0);
+        assert!(caution.eval(&s).is_none());
+        assert!(warning.eval(&s).is_some());
+
+        // On the ground: silent even when low (idle burn makes endurance moot).
+        s.on_ground = true;
+        assert!(caution.eval(&s).is_none() && warning.eval(&s).is_none());
+
+        // Engine off, or endurance uncomputable: silent.
+        s.on_ground = false;
+        s.engine_running = false;
+        assert!(warning.eval(&s).is_none());
+        s.engine_running = true;
+        s.endurance_min = None;
+        assert!(warning.eval(&s).is_none());
     }
 
     #[test]

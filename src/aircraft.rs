@@ -20,6 +20,9 @@ pub struct AircraftProfile {
     /// Flap system, if any. `None` means no `set_flaps` tool.
     #[serde(default)]
     pub flaps: Option<FlapProfile>,
+    /// Fuel endurance monitoring thresholds. `None` means no fuel callouts.
+    #[serde(default)]
+    pub fuel: Option<FuelProfile>,
     /// Exterior/interior lights this airframe has. Empty means no `set_lights` tool.
     #[serde(default)]
     pub lights: Vec<LightProfile>,
@@ -83,6 +86,19 @@ pub struct AircraftProfile {
     #[serde(default)]
     #[allow(dead_code)]
     pub retractable_gear: bool,
+}
+
+/// Fuel-endurance alert thresholds (minutes of fuel remaining at the current
+/// burn). The monitor warns as the figure drops through these — caution first,
+/// then warning. Defaults are the usual VFR reserves (30 min day / 45 min night
+/// → caution at 45, warning at 30), per-airframe so a thirstier type can raise
+/// them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuelProfile {
+    /// Endurance (minutes) at or below which to caution.
+    pub reserve_caution_min: f64,
+    /// Endurance (minutes) at or below which to warn (more urgent).
+    pub reserve_warning_min: f64,
 }
 
 /// A flap system as an ordered list of detents, retracted → fully extended.
@@ -168,6 +184,9 @@ mod tests {
         assert_eq!(flaps.detents[0].label, "up");
         assert_eq!(flaps.detents[3].label, "full");
         assert_eq!(flaps.detents[1].vfe_kts, Some(110.0));
+        let fuel = p.fuel.expect("has fuel thresholds");
+        assert_eq!(fuel.reserve_caution_min, 45.0);
+        assert_eq!(fuel.reserve_warning_min, 30.0);
     }
 
     #[test]
@@ -226,6 +245,10 @@ fn cessna_172sp() -> AircraftProfile {
                 detent("20", "twenty degrees", 2.0 / 3.0, Some(85.0)),
                 detent("full", "full", 1.0, Some(85.0)),
             ],
+        }),
+        fuel: Some(FuelProfile {
+            reserve_caution_min: 45.0,
+            reserve_warning_min: 30.0,
         }),
         lights: vec![
             light("nav", "navigation lights", "sim/cockpit2/switches/navigation_lights_on",

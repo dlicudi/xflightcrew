@@ -124,7 +124,9 @@ plumbing is proven.
 - alternator offline / low bus volts with the engine running
 - directional gyro precessed past ~10° vs the compass, airborne (advisory; pairs
   with the `align_gyro` tool to fix it)
-- low fuel / endurance below profile threshold
+- fuel endurance (minutes at current burn) into a reserve band — caution at the
+  profile's `reserve_caution_min`, warning at `reserve_warning_min` (172: 45/30),
+  airborne + engine-running only
 - overspeed approaching Vno → Vne (trend, not just redline)
 - high sink rate near ground
 

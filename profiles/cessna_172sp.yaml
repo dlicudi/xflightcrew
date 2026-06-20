@@ -31,6 +31,13 @@ nav_radio: true        # set_nav1 / set_obs (NAV1 frequency + OBS course)
 com2_radio: true       # set_com2 / swap_radio (COM2 + active/standby swap)
 retractable_gear: false # no gear tool — the 172 has fixed gear
 
+# Fuel-endurance alerting (minutes of fuel left at the current burn). The
+# monitor cautions at the first figure and warns at the second. Standard VFR
+# reserves: 30 min day / 45 min night.
+fuel:
+  reserve_caution_min: 45.0
+  reserve_warning_min: 30.0
+
 # Flap detents, retracted → full. Vfe is the max IAS (kts) to extend to each.
 flaps:
   detents:
