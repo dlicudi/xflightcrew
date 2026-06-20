@@ -113,8 +113,16 @@ pub struct LightProfile {
     pub key: String,
     /// Spoken form for the readback (e.g. `"landing light"`).
     pub spoken: String,
-    /// The 0/1 switch dataref controlling it.
+    /// The 0/1 switch dataref — read back to confirm the actual state.
     pub dataref: String,
+    /// Commands that drive the panel switch on/off. Preferred over a raw
+    /// `dataref` write: a write can set the value without animating the 3D
+    /// switch (as the avionics master did). When present the tool fires these;
+    /// `dataref` is still used for the readback. Falls back to a write if unset.
+    #[serde(default)]
+    pub command_on: Option<String>,
+    #[serde(default)]
+    pub command_off: Option<String>,
 }
 
 /// Load a profile by id: prefer `profiles/<id>.yaml`, else the built-in.
@@ -180,10 +188,14 @@ fn cessna_172sp() -> AircraftProfile {
         ratio,
         vfe_kts: vfe,
     };
-    let light = |key: &str, spoken: &str, dataref: &str| LightProfile {
-        key: key.into(),
-        spoken: spoken.into(),
-        dataref: dataref.into(),
+    let light = |key: &str, spoken: &str, dataref: &str, cmd_on: &str, cmd_off: &str| {
+        LightProfile {
+            key: key.into(),
+            spoken: spoken.into(),
+            dataref: dataref.into(),
+            command_on: Some(cmd_on.into()),
+            command_off: Some(cmd_off.into()),
+        }
     };
     AircraftProfile {
         id: "cessna_172sp".into(),
@@ -216,11 +228,16 @@ fn cessna_172sp() -> AircraftProfile {
             ],
         }),
         lights: vec![
-            light("nav", "navigation lights", "sim/cockpit2/switches/navigation_lights_on"),
-            light("beacon", "beacon", "sim/cockpit2/switches/beacon_on"),
-            light("strobe", "strobe lights", "sim/cockpit2/switches/strobe_lights_on"),
-            light("landing", "landing light", "sim/cockpit2/switches/landing_lights_on"),
-            light("taxi", "taxi light", "sim/cockpit2/switches/taxi_light_on"),
+            light("nav", "navigation lights", "sim/cockpit2/switches/navigation_lights_on",
+                  "sim/lights/nav_lights_on", "sim/lights/nav_lights_off"),
+            light("beacon", "beacon", "sim/cockpit2/switches/beacon_on",
+                  "sim/lights/beacon_lights_on", "sim/lights/beacon_lights_off"),
+            light("strobe", "strobe lights", "sim/cockpit2/switches/strobe_lights_on",
+                  "sim/lights/strobe_lights_on", "sim/lights/strobe_lights_off"),
+            light("landing", "landing light", "sim/cockpit2/switches/landing_lights_on",
+                  "sim/lights/landing_lights_on", "sim/lights/landing_lights_off"),
+            light("taxi", "taxi light", "sim/cockpit2/switches/taxi_light_on",
+                  "sim/lights/taxi_lights_on", "sim/lights/taxi_lights_off"),
         ],
     }
 }

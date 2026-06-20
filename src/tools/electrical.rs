@@ -13,7 +13,14 @@ use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx};
 
+// Battery and alternator: drive the panel switch with commands (a raw dataref
+// write can set the value without animating the 3D switch); the datarefs are
+// read back to confirm. The alternator is generator #1 (element 0 of the array).
 const BATTERY: &str = "sim/cockpit/electrical/battery_on";
+const CMD_BATTERY_ON: &str = "sim/electrical/battery_1_on";
+const CMD_BATTERY_OFF: &str = "sim/electrical/battery_1_off";
+const CMD_ALTERNATOR_ON: &str = "sim/electrical/generator_1_on";
+const CMD_ALTERNATOR_OFF: &str = "sim/electrical/generator_1_off";
 // The C172's two AVIONICS panel switches are two *different* systems, each
 // driven by a command (a dataref write sets the value but won't animate the 3D
 // switch — same quirk as the fuel selector). Verified with DataRefTool:
@@ -70,16 +77,18 @@ impl Tool for SetElectrical {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: Args = serde_json::from_value(args.clone())?;
-        let v = args.on as i64;
 
-        // "all" → battery + alternator + avionics together.
+        // "all" → battery + alternator + avionics together (all via commands so
+        // the panel switches animate).
         if args.system.eq_ignore_ascii_case("all") {
-            ctx.xplane.set_int(BATTERY, v).await?;
-            ctx.xplane.set_int_array_elem(GENERATOR, 0, v).await?;
             if args.on {
+                ctx.xplane.run_command(CMD_BATTERY_ON).await?;
+                ctx.xplane.run_command(CMD_ALTERNATOR_ON).await?;
                 ctx.xplane.run_command(CMD_AVIONICS_ON).await?;
                 ctx.xplane.run_command(CMD_CROSS_TIE_ON).await?;
             } else {
+                ctx.xplane.run_command(CMD_BATTERY_OFF).await?;
+                ctx.xplane.run_command(CMD_ALTERNATOR_OFF).await?;
                 ctx.xplane.run_command(CMD_AVIONICS_OFF).await?;
                 ctx.xplane.run_command(CMD_CROSS_TIE_OFF).await?;
             }
@@ -100,7 +109,9 @@ impl Tool for SetElectrical {
 
         let on = match key {
             "battery" => {
-                ctx.xplane.set_int(BATTERY, v).await?;
+                ctx.xplane
+                    .run_command(if args.on { CMD_BATTERY_ON } else { CMD_BATTERY_OFF })
+                    .await?;
                 ctx.xplane.get_float(BATTERY).await? > 0.5
             }
             "avionics" => {
@@ -129,7 +140,9 @@ impl Tool for SetElectrical {
                 });
             }
             "alternator" => {
-                ctx.xplane.set_int_array_elem(GENERATOR, 0, v).await?;
+                ctx.xplane
+                    .run_command(if args.on { CMD_ALTERNATOR_ON } else { CMD_ALTERNATOR_OFF })
+                    .await?;
                 ctx.xplane.get_float_array(GENERATOR).await?.first().copied().unwrap_or(0.0) > 0.5
             }
             _ => unreachable!(),

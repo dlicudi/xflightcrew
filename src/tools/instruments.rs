@@ -11,6 +11,10 @@ const BARO: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot"
 const DG_SYNC: &str = "sim/instruments/DG_sync_mag";
 const DG_DRIFT: &str = "sim/cockpit/gyros/dg_drift_vac_deg";
 const PITOT_HEAT: &str = "sim/cockpit2/ice/ice_pitot_heat_on_pilot";
+// Command-driven so the panel switch animates (a raw write may not); PITOT_HEAT
+// is read back to confirm.
+const CMD_PITOT_HEAT_ON: &str = "sim/ice/pitot_heat0_on";
+const CMD_PITOT_HEAT_OFF: &str = "sim/ice/pitot_heat0_off";
 
 pub struct SetBarometer;
 
@@ -84,7 +88,9 @@ impl Tool for SetPitotHeat {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: PitotArgs = serde_json::from_value(args.clone())?;
-        ctx.xplane.set_int(PITOT_HEAT, a.on as i64).await?;
+        ctx.xplane
+            .run_command(if a.on { CMD_PITOT_HEAT_ON } else { CMD_PITOT_HEAT_OFF })
+            .await?;
         let on = ctx.xplane.get_float(PITOT_HEAT).await? > 0.5;
         Ok(format!("Roger, pitot heat {}.", if on { "on" } else { "off" }))
     }

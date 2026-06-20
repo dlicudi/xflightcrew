@@ -40,9 +40,11 @@ flaps:
     - { label: full, spoken: full,           ratio: 1.0,    vfe_kts: 85.0 }
 
 # Switchable lights (key the LLM selects by, spoken form, 0/1 dataref).
+# command_on/command_off drive the panel switch (a raw dataref write can set the
+# value without animating the 3D switch); dataref is still read back to confirm.
 lights:
-  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on }
-  - { key: beacon,  spoken: beacon,            dataref: sim/cockpit2/switches/beacon_on }
-  - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on }
-  - { key: landing, spoken: landing light,     dataref: sim/cockpit2/switches/landing_lights_on }
-  - { key: taxi,    spoken: taxi light,        dataref: sim/cockpit2/switches/taxi_light_on }
+  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on, command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
+  - { key: beacon,  spoken: beacon,            dataref: sim/cockpit2/switches/beacon_on,            command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
+  - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
+  - { key: landing, spoken: landing light,     dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+  - { key: taxi,    spoken: taxi light,        dataref: sim/cockpit2/switches/taxi_light_on,        command_on: sim/lights/taxi_lights_on,    command_off: sim/lights/taxi_lights_off }

@@ -82,8 +82,18 @@ impl Tool for SetLights {
             }
         };
 
-        // Write, then read back the actual switch state and confirm *that*.
-        ctx.xplane.set_int(&light.dataref, args.on as i64).await?;
+        // Prefer the command (it animates the panel switch); fall back to a raw
+        // dataref write if the profile doesn't supply one. Either way, read the
+        // dataref back and confirm the *actual* state.
+        let cmd = if args.on {
+            light.command_on.as_deref()
+        } else {
+            light.command_off.as_deref()
+        };
+        match cmd {
+            Some(c) => ctx.xplane.run_command(c).await?,
+            None => ctx.xplane.set_int(&light.dataref, args.on as i64).await?,
+        }
         let actual_on = ctx.xplane.get_float(&light.dataref).await? > 0.5;
 
         Ok(format!(
