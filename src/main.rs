@@ -376,7 +376,7 @@ fn collapse(s: &str) -> String {
 }
 
 /// Standard Levenshtein edit distance.
-fn levenshtein(a: &str, b: &str) -> usize {
+pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();
@@ -516,12 +516,15 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "autopilot", "heading", "altitude", "climb", "descend", "maintain", "level",
     "vertical", "vs", "approach", "ils", "localizer", "glideslope", "obs",
     "course", "radial", "runway",
+    // vertical-nav synonyms whisper actually produced that the gate missed:
+    // "ascend 500" (for climb), "physical speed 500" (mishear of vertical speed).
+    "ascend", "ascent", "speed",
     // lights
     "light", "lights", "beacon", "strobe", "strobes", "taxi", "landing", "nav",
     "navigation", "flood", "floods",
     // engine / fuel
     "throttle", "thrust", "power", "idle", "mixture", "rich", "lean", "engine",
-    "engines", "start", "shutdown", "magneto", "magnetos", "mags", "carb",
+    "engines", "start", "ignition", "shutdown", "magneto", "magnetos", "mags", "carb",
     "carburetor", "fuel", "pump", "boost", "primer", "selector",
     // electrical
     "battery", "alternator", "generator", "avionics", "electrical", "electric",
@@ -620,6 +623,9 @@ mod tests {
             // before reaching the LLM).
             "electrics off", "fix the gyro drift", "master switch on",
             "generator on", "squawk VFR",
+            // Verbatim whisper output from logs/ that the gate used to reject —
+            // recovered by the ignition/ascend/speed keywords.
+            "Ignition on.", "Ascend 500 feet per minute.", "Physical speed 500.",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
         }
