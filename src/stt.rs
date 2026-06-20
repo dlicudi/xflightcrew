@@ -38,6 +38,12 @@ const HALLUCINATIONS: &[&str] = &[
     "♪",
 ];
 
+/// Structural markers of caption-style hallucinations (website plugs, "go to …
+/// for more information"). Catches the whole family without enumerating each
+/// phrase — a cockpit command never contains a URL or a "for more information"
+/// tail, so these are safe to treat as non-speech.
+const CAPTION_MARKERS: &[&str] = &["www.", "http", ".com", ".org", ".net", "for more information"];
+
 /// A loaded whisper model, reusable across utterances.
 pub struct Stt {
     ctx: WhisperContext,
@@ -66,9 +72,11 @@ impl Stt {
         params.set_language(Some("en"));
         // Bias decoding toward the cockpit vocabulary.
         params.set_initial_prompt(VOCAB_PROMPT);
-        // Reduce hallucination on non-speech: suppress non-speech tokens, don't
-        // carry context between segments.
+        // Reduce hallucination on non-speech: suppress non-speech tokens and
+        // leading blanks, and don't carry context between segments (so one ghost
+        // can't seed the next).
         params.set_suppress_non_speech_tokens(true);
+        params.set_suppress_blank(true);
         params.set_no_context(true);
 
         state.full(params, audio).context("running whisper inference")?;
@@ -103,10 +111,12 @@ impl Stt {
     }
 }
 
-/// True if the transcript matches a known whisper ghost phrase.
+/// True if the transcript is a known whisper ghost phrase or a caption-style
+/// hallucination (URL / "for more information").
 fn is_hallucination(text: &str) -> bool {
     let lower = text.to_lowercase();
     HALLUCINATIONS.iter().any(|h| lower.contains(h))
+        || CAPTION_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 #[cfg(test)]
@@ -159,7 +169,13 @@ mod tests {
             "Go to Beadaholique.com for all of your beading supplies needs!"
         ));
         assert!(is_hallucination("Thanks for watching!"));
+        // Caption-style ghost seen live — caught by the structural markers, not
+        // by an enumerated phrase.
+        assert!(is_hallucination("Go to www.cessna.com for more information."));
+        assert!(is_hallucination("Visit http://example.org now"));
         assert!(!is_hallucination("flaps ten degrees"));
         assert!(!is_hallucination("autopilot heading 270"));
+        // "go to" alone must not trip it — a pilot might say "go to heading 270".
+        assert!(!is_hallucination("go to heading 270"));
     }
 }
