@@ -116,12 +116,16 @@ impl Tool for AlignGyro {
 
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         ctx.xplane.run_command(DG_SYNC).await?;
-        // Confirm the drift is gone (best-effort).
-        let drift = ctx.xplane.get_float(DG_DRIFT).await.unwrap_or(0.0);
-        if drift.abs() < 1.0 {
+        // Confirm the drift is gone (best-effort). dg_drift_vac_deg reads near
+        // 360 for a small *negative* drift, so fold it into -180..180 first —
+        // otherwise a -4° drift would read back as "356 degrees".
+        let raw = ctx.xplane.get_float(DG_DRIFT).await.unwrap_or(0.0);
+        let drift = (raw + 180.0).rem_euclid(360.0) - 180.0;
+        // A couple of degrees is a good sync (the compass itself isn't perfect).
+        if drift.abs() < 2.0 {
             Ok("Roger, directional gyro synced to the compass.".to_string())
         } else {
-            Ok(format!("Gyro synced; still {drift:.0} degrees of drift."))
+            Ok(format!("Gyro synced; still {:.0} degrees of drift.", drift.abs()))
         }
     }
 }
