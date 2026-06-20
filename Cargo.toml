@@ -1,0 +1,42 @@
+[package]
+name = "x-copilot"
+version = "0.1.0"
+edition = "2021"
+description = "A voice-commanded copilot for X-Plane (working name; product name: Roger)"
+license = "LicenseRef-proprietary"
+publish = false
+
+[[bin]]
+name = "x-copilot"
+path = "src/main.rs"
+
+[dependencies]
+# async runtime + HTTP
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+base64 = "0.22"
+
+# audio capture + speech-to-text
+cpal = "0.15"
+whisper-rs = { version = "0.12", features = ["whisper-cpp-tracing"] }
+
+# tooling glue
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# Terminal dashboard (optional UI, XCOPILOT_UI=tui)
+ratatui = "0.29"
+dotenvy = "0.15"
+
+[dev-dependencies]
+# WAV reader, used only by the STT integration test.
+hound = "3"

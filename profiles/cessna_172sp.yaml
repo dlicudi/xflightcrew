@@ -1,0 +1,50 @@
+# Aircraft profile — X-Plane stock Cessna 172SP Skyhawk.
+# Loaded by src/aircraft.rs at startup. Capability flags gate which tools are
+# exposed; the tools own the standard X-Plane datarefs/commands. Flap detents,
+# their Vfe limits, and the light set are per-airframe and live here.
+#
+# To add an aircraft: copy this file to profiles/<id>.yaml, adjust, and select
+# it via XCOPILOT_AIRCRAFT=<id> (or add an acf_ICAO mapping in main.rs for
+# auto-detect).
+
+id: cessna_172sp
+display_name: Cessna 172SP Skyhawk
+
+# Capability flags — each gates a tool (or tool group).
+autopilot: true        # set_heading / set_altitude / set_vertical_speed
+engine: true           # set_throttle / set_mixture
+barometer: true        # set_barometer
+directional_gyro: true # align_gyro (sync DG to compass)
+com_radio: true        # set_com1
+transponder: true      # set_transponder (squawk)
+ils: true              # prepare_ils (ILS approach lookup + setup)
+parking_brake: true    # set_parking_brake
+electrical: true       # set_electrical (battery, avionics master)
+flood_lights: true     # set_flood_lights (pilot + copilot cockpit floods)
+fuel_pump: true        # set_fuel_pump (electric/aux boost pump)
+magnetos: true         # set_magnetos (off/left/right/both — run-up mag check)
+carb_heat: true        # set_carb_heat (carb / alternate-air heat)
+fuel_selector: true    # set_fuel_selector (off/left/right/both)
+pitot_heat: true       # set_pitot_heat (anti-ice for the ASI)
+pitch_trim: true       # set_pitch_trim (nose up/down nudges, takeoff, neutral)
+nav_radio: true        # set_nav1 / set_obs (NAV1 frequency + OBS course)
+com2_radio: true       # set_com2 / swap_radio (COM2 + active/standby swap)
+retractable_gear: false # no gear tool — the 172 has fixed gear
+
+# Flap detents, retracted → full. Vfe is the max IAS (kts) to extend to each.
+flaps:
+  detents:
+    - { label: up,   spoken: up,             ratio: 0.0 }
+    - { label: "10", spoken: ten degrees,    ratio: 0.3333, vfe_kts: 110.0 }
+    - { label: "20", spoken: twenty degrees, ratio: 0.6667, vfe_kts: 85.0 }
+    - { label: full, spoken: full,           ratio: 1.0,    vfe_kts: 85.0 }
+
+# Switchable lights (key the LLM selects by, spoken form, 0/1 dataref).
+# command_on/command_off drive the panel switch (a raw dataref write can set the
+# value without animating the 3D switch); dataref is still read back to confirm.
+lights:
+  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on, command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
+  - { key: beacon,  spoken: beacon,            dataref: sim/cockpit2/switches/beacon_on,            command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
+  - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
+  - { key: landing, spoken: landing light,     dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+  - { key: taxi,    spoken: taxi light,        dataref: sim/cockpit2/switches/taxi_light_on,        command_on: sim/lights/taxi_lights_on,    command_off: sim/lights/taxi_lights_off }
