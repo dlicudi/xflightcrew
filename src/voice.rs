@@ -20,6 +20,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Condvar, Mutex};
 
+use crate::audio::MicGate;
 use crate::config::Config;
 use crate::tts;
 
@@ -91,6 +92,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct Voice {
     inner: Arc<Inner>,
+    gate: MicGate,
 }
 
 impl Voice {
@@ -105,12 +107,20 @@ impl Voice {
             }),
             cv: Condvar::new(),
         });
+        let gate = MicGate::new();
         let speaker = inner.clone();
+        let speaker_gate = gate.clone();
         std::thread::Builder::new()
             .name("voice-speaker".into())
-            .spawn(move || speaker_loop(&speaker, config))
+            .spawn(move || speaker_loop(&speaker, config, speaker_gate))
             .expect("spawn voice speaker thread");
-        Voice { inner }
+        Voice { inner, gate }
+    }
+
+    /// The mic gate this arbiter raises while speaking — hand it to the listener
+    /// so it can mute itself and the copilot never hears its own voice.
+    pub fn mic_gate(&self) -> MicGate {
+        self.gate.clone()
     }
 
     fn enqueue(&self, priority: Priority, text: String, done: Option<Arc<Latch>>) {
@@ -150,20 +160,28 @@ impl Voice {
 
 /// The speaker thread: pop the highest-priority utterance (blocking until one is
 /// available), speak it to completion, signal any blocked caller, repeat.
-fn speaker_loop(inner: &Arc<Inner>, config: Config) {
+///
+/// `gate` is raised for the whole speaking run and only lowered once the queue
+/// drains — so a burst of utterances stays gated end to end, with no momentary
+/// gap between them for the mic to slip through.
+fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
     loop {
         let mut q = inner.queue.lock().unwrap();
         let utt = loop {
             if q.shutdown {
+                gate.set_speaking(false);
                 return;
             }
             if let Some(u) = q.heap.pop() {
                 break u;
             }
+            // Nothing to say — we're done speaking; let the mic listen again.
+            gate.set_speaking(false);
             q = inner.cv.wait(q).unwrap();
         };
         drop(q); // release the queue while we speak (which is slow)
 
+        gate.set_speaking(true);
         if let Err(e) = tts::speak(&config, &utt.text) {
             tracing::warn!("TTS failed: {e:#}");
         }

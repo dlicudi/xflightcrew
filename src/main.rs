@@ -183,7 +183,9 @@ async fn run_session(
     let xplane = XPlaneClient::new(config.xplane_base_url.clone());
     let specs = registry.specs();
     let mut listener = if continuous {
-        Some(Listener::start(config.vad_threshold, reporter.clone())?)
+        // Share the speech arbiter's mic gate so the listener mutes itself while
+        // the copilot speaks (readbacks and monitor alerts alike).
+        Some(Listener::start(config.vad_threshold, reporter.clone(), voice.mic_gate())?)
     } else {
         None
     };
