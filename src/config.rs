@@ -72,7 +72,7 @@ impl Config {
             // non-commands. Set a word here to require it as a prefix.
             wake_word: env_or("XCOPILOT_WAKE_WORD", ""),
             vad_threshold: env_or("XCOPILOT_VAD_RMS", "0.012").parse().unwrap_or(0.012),
-            stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.5").parse().unwrap_or(0.5),
+            stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.35").parse().unwrap_or(0.35),
             ui: env_or("XCOPILOT_UI", "plain"),
             tts_backend: env_or("XCOPILOT_TTS", "say"),
             piper_binary: env_or("PIPER_BIN", "piper"),
