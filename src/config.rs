@@ -48,6 +48,11 @@ pub struct Config {
     /// (autopilot flight-path changes). On by default — a misheard command
     /// should never move the aircraft unconfirmed.
     pub confirm_critical: bool,
+    /// Run the background monitor that calls out problems (e.g. alternator
+    /// offline). On by default; set `XCOPILOT_MONITOR=false` to silence it.
+    pub monitor_enabled: bool,
+    /// Monitor sample rate in Hz — how often it snapshots datarefs and re-checks.
+    pub monitor_hz: f32,
 }
 
 impl Config {
@@ -67,7 +72,7 @@ impl Config {
             // non-commands. Set a word here to require it as a prefix.
             wake_word: env_or("XCOPILOT_WAKE_WORD", ""),
             vad_threshold: env_or("XCOPILOT_VAD_RMS", "0.012").parse().unwrap_or(0.012),
-            stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.5").parse().unwrap_or(0.5),
+            stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.35").parse().unwrap_or(0.35),
             ui: env_or("XCOPILOT_UI", "plain"),
             tts_backend: env_or("XCOPILOT_TTS", "say"),
             piper_binary: env_or("PIPER_BIN", "piper"),
@@ -78,6 +83,8 @@ impl Config {
             ),
             aircraft: env_or("XCOPILOT_AIRCRAFT", "auto"),
             confirm_critical: env_or("XCOPILOT_CONFIRM", "true") != "false",
+            monitor_enabled: env_or("XCOPILOT_MONITOR", "true") != "false",
+            monitor_hz: env_or("XCOPILOT_MONITOR_HZ", "3").parse().unwrap_or(3.0),
         })
     }
 }

@@ -11,11 +11,13 @@ mod aircraft;
 mod audio;
 mod config;
 mod llm;
+mod monitor;
 mod nav;
 mod stt;
 mod tts;
 mod tools;
 mod ui;
+mod voice;
 mod xplane;
 
 use anyhow::{anyhow, Result};
@@ -26,6 +28,7 @@ use llm::Llm;
 use stt::Stt;
 use tools::{Registry, ToolCtx};
 use ui::Reporter;
+use voice::{Priority, Voice};
 use xplane::XPlaneClient;
 
 // Single-threaded runtime: the cpal stream isn't `Send`, and the loop is
@@ -103,6 +106,22 @@ async fn main() -> Result<()> {
     // silently rather than answered with an apology.
     let explicit = !continuous || !config.wake_word.is_empty();
 
+    // The speech arbiter is shared by the command loop and the monitor, so it's
+    // created here (above both) and handed to each.
+    let voice = Voice::new(config.clone());
+
+    // Background monitor: watches for problems and speaks up. Its own thread +
+    // runtime + X-Plane client, sharing the speech arbiter. Runs in both UIs.
+    if config.monitor_enabled {
+        let mon_voice = voice.clone();
+        let mon_config = config.clone();
+        let mon_profile = profile.clone();
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+            rt.block_on(monitor::run(mon_config, mon_profile, mon_voice));
+        });
+    }
+
     if config.ui == "tui" {
         // TUI: voice loop + aircraft poll run on background threads, each with
         // its own runtime; the dashboard renders on the main thread.
@@ -130,9 +149,9 @@ async fn main() -> Result<()> {
         let reporter = Reporter::Tui(tx);
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
-            if let Err(e) =
-                rt.block_on(run_session(config, stt, llm, registry, continuous, explicit, reporter))
-            {
+            if let Err(e) = rt.block_on(run_session(
+                config, stt, llm, registry, voice, continuous, explicit, reporter,
+            )) {
                 tracing::error!("voice loop ended: {e:#}");
             }
         });
@@ -141,7 +160,7 @@ async fn main() -> Result<()> {
         Ok(())
     } else {
         println!("\n  x-copilot — {} ({}). Ctrl-C to quit.\n", profile.display_name, config.listen_mode);
-        run_session(config, stt, llm, registry, continuous, explicit, Reporter::Plain).await
+        run_session(config, stt, llm, registry, voice, continuous, explicit, Reporter::Plain).await
     }
 }
 
@@ -153,6 +172,7 @@ async fn run_session(
     stt: Stt,
     llm: Llm,
     registry: Registry,
+    voice: Voice,
     continuous: bool,
     explicit: bool,
     reporter: Reporter,
@@ -163,7 +183,9 @@ async fn run_session(
     let xplane = XPlaneClient::new(config.xplane_base_url.clone());
     let specs = registry.specs();
     let mut listener = if continuous {
-        Some(Listener::start(config.vad_threshold, reporter.clone())?)
+        // Share the speech arbiter's mic gate so the listener mutes itself while
+        // the copilot speaks (readbacks and monitor alerts alike).
+        Some(Listener::start(config.vad_threshold, reporter.clone(), voice.mic_gate())?)
     } else {
         None
     };
@@ -193,7 +215,7 @@ async fn run_session(
         // Confidence gate.
         if confidence < config.stt_min_confidence {
             if explicit {
-                say(&config, &reporter, ui::LogKind::Info, "Say again?");
+                say(&voice, &reporter, ui::LogKind::Info, "Say again?");
             } else {
                 reporter.log(ui::LogKind::Info, "low confidence, ignored");
             }
@@ -219,7 +241,7 @@ async fn run_session(
         // the LLM.
         if !looks_like_command(&command) {
             if explicit {
-                say(&config, &reporter, ui::LogKind::Warn, "Sorry, that didn't sound like a command.");
+                say(&voice, &reporter, ui::LogKind::Warn, "Sorry, that didn't sound like a command.");
             } else {
                 reporter.log(ui::LogKind::Info, format!("not a command: \"{command}\""));
             }
@@ -232,7 +254,7 @@ async fn run_session(
             Ok(Some(call)) => call,
             Ok(None) => {
                 if explicit {
-                    say(&config, &reporter, ui::LogKind::Warn, "Sorry, I didn't catch a command I can action.");
+                    say(&voice, &reporter, ui::LogKind::Warn, "Sorry, I didn't catch a command I can action.");
                 } else {
                     reporter.log(ui::LogKind::Info, format!("no matching tool: \"{command}\""));
                 }
@@ -251,7 +273,7 @@ async fn run_session(
         let proceed = 'confirm: loop {
             let Some(tool) = registry.get(&call.name) else {
                 tracing::warn!("LLM picked unknown tool: {}", call.name);
-                say(&config, &reporter, ui::LogKind::Warn, "That command isn't wired up yet.");
+                say(&voice, &reporter, ui::LogKind::Warn, "That command isn't wired up yet.");
                 break 'confirm false;
             };
             let intent = if config.confirm_critical {
@@ -261,10 +283,10 @@ async fn run_session(
             };
             let Some(intent) = intent else { break 'confirm true };
 
-            say(&config, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
+            say(&voice, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
             reporter.status(ui::Phase::Listening);
             let Some(reply) = listen_once(&mut listener, &stt) else {
-                say(&config, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
+                say(&voice, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
                 break 'confirm false;
             };
             if is_affirmative(&reply.text) {
@@ -282,13 +304,13 @@ async fn run_session(
                             continue 'confirm;
                         }
                         _ => {
-                            say(&config, &reporter, ui::LogKind::Warn, "Cancelled.");
+                            say(&voice, &reporter, ui::LogKind::Warn, "Cancelled.");
                             break 'confirm false;
                         }
                     }
                 }
                 None => {
-                    say(&config, &reporter, ui::LogKind::Warn, "Cancelled.");
+                    say(&voice, &reporter, ui::LogKind::Warn, "Cancelled.");
                     break 'confirm false;
                 }
             }
@@ -308,7 +330,7 @@ async fn run_session(
                 "Something went wrong actioning that.".to_string()
             }
         };
-        say(&config, &reporter, ui::LogKind::Readback, &readback);
+        say(&voice, &reporter, ui::LogKind::Readback, &readback);
     }
 }
 
@@ -439,15 +461,14 @@ fn correction_text(reply: &str) -> Option<String> {
     }
 }
 
-/// Report a line and speak it. Sets the Speaking→Listening status around the
-/// (blocking) TTS call. Failures are logged, not fatal.
-fn say(config: &Config, reporter: &Reporter, kind: ui::LogKind, line: &str) {
+/// Report a line and speak it through the arbiter. Blocks until the line has
+/// been spoken (so the loop doesn't listen over its own voice), setting the
+/// Speaking→Listening status around it.
+fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
     tracing::info!(spoke = %line, "spoke");
     reporter.status(ui::Phase::Speaking);
     reporter.log(kind, line.to_string());
-    if let Err(e) = tts::speak(config, line) {
-        tracing::warn!("TTS failed: {e:#}");
-    }
+    voice.say(Priority::Readback, line);
     reporter.status(ui::Phase::Listening);
 }
 
@@ -499,9 +520,9 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "light", "lights", "beacon", "strobe", "strobes", "taxi", "landing", "nav",
     "navigation", "flood", "floods",
     // engine / fuel
-    "throttle", "power", "idle", "mixture", "rich", "lean", "engine", "engines",
-    "start", "shutdown", "magneto", "magnetos", "mags", "carb", "carburetor",
-    "fuel", "pump", "boost", "primer", "selector",
+    "throttle", "thrust", "power", "idle", "mixture", "rich", "lean", "engine",
+    "engines", "start", "shutdown", "magneto", "magnetos", "mags", "carb",
+    "carburetor", "fuel", "pump", "boost", "primer", "selector",
     // electrical
     "battery", "alternator", "avionics", "electrical", "bus",
     // radios / transponder
@@ -519,7 +540,19 @@ fn looks_like_command(text: &str) -> bool {
         .filter(|w| !w.is_empty())
         .any(|w| {
             let w = w.to_ascii_lowercase();
-            COMMAND_KEYWORDS.contains(&w.as_str())
+            if COMMAND_KEYWORDS.contains(&w.as_str()) {
+                return true;
+            }
+            // Whisper routinely mangles a word by a single letter ("thrust" →
+            // "trust", "descend" → "descent"). Accept a one-edit near-miss of a
+            // keyword so it still reaches the LLM. True garbage shares no
+            // near-spelling with the domain and is still rejected. Restricted to
+            // 5+ char tokens/keywords so short common words don't match by luck.
+            w.len() >= 5
+                && COMMAND_KEYWORDS
+                    .iter()
+                    .filter(|k| k.len() >= 5)
+                    .any(|k| levenshtein(&w, k) <= 1)
         })
 }
 
@@ -584,6 +617,14 @@ mod tests {
             "transponder standby", "prepare the ILS for runway 13", "flood lights on",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
+        }
+    }
+
+    #[test]
+    fn one_letter_mishearings_pass_the_gate() {
+        // Whisper drops/swaps a letter; these should still reach the LLM.
+        for c in ["trust 80 percent", "descent 500", "altitude 3000"] {
+            assert!(looks_like_command(c), "{c:?} should pass via near-miss");
         }
     }
 

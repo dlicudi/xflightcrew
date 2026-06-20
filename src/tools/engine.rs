@@ -81,8 +81,9 @@ impl Tool for SetThrottle {
         "set_throttle"
     }
     fn description(&self) -> &str {
-        "Set the throttle as a percentage, 0 (idle) to 100 (full power). Use for \
-         'throttle 60 percent', 'full throttle', 'throttle idle'."
+        "Set the throttle (engine power / thrust) as a percentage, 0 (idle) to \
+         100 (full power). Use for 'throttle 60 percent', 'full throttle', \
+         'maximum power', 'set thrust to 80 percent', 'throttle idle'."
     }
     fn parameters(&self) -> Value {
         json!({

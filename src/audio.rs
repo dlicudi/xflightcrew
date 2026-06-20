@@ -6,8 +6,9 @@
 //! Both deliver mono 16 kHz f32 ready for [`crate::stt`].
 
 use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -16,6 +17,31 @@ use crate::ui::{LogKind, Reporter};
 
 /// The sample rate whisper.cpp models are trained on.
 pub const WHISPER_SAMPLE_RATE: u32 = 16_000;
+
+/// How long after the copilot stops speaking to keep ignoring the mic — covers
+/// audio still buffered in the input and room echo, so the tail of a readback or
+/// alert can't leak in as a phantom command.
+const MIC_GATE_TAIL: Duration = Duration::from_millis(400);
+
+/// A shared "the copilot is speaking — don't listen" flag. The speech arbiter
+/// raises it around every utterance; the [`Listener`] drops captured audio while
+/// it's raised (and briefly after) so the copilot never hears itself. Half-duplex
+/// by design: a voice command and a spoken readback/alert never overlap.
+#[derive(Clone)]
+pub struct MicGate(Arc<AtomicBool>);
+
+impl MicGate {
+    pub fn new() -> Self {
+        MicGate(Arc::new(AtomicBool::new(false)))
+    }
+    /// Raise (true) while speaking, lower (false) when done.
+    pub fn set_speaking(&self, speaking: bool) {
+        self.0.store(speaking, Ordering::Relaxed);
+    }
+    pub fn is_speaking(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 /// An open input device: the live stream plus the buffer its callback fills.
 struct Input {
@@ -91,13 +117,15 @@ pub struct Listener {
     input: Input,
     segmenter: Segmenter,
     reporter: Reporter,
+    /// Raised while the copilot speaks; audio captured then is dropped.
+    gate: MicGate,
 }
 
 impl Listener {
     /// Start capturing, then calibrate the VAD to the room's noise floor so the
     /// speech threshold sits above ambient. `vad_floor` is a hard minimum (the
     /// configured `XCOPILOT_VAD_RMS`), so a quiet room can't drive it too low.
-    pub fn start(vad_floor: f32, reporter: Reporter) -> Result<Self> {
+    pub fn start(vad_floor: f32, reporter: Reporter, gate: MicGate) -> Result<Self> {
         let input = open_input()?;
         input.stream.play().context("starting input stream")?;
 
@@ -130,6 +158,7 @@ impl Listener {
                 FRAME_MS,
             ),
             reporter,
+            gate,
         })
     }
 
@@ -143,9 +172,26 @@ impl Listener {
 
         let frame_len = (self.input.sample_rate as usize * FRAME_MS as usize) / 1000;
         let mut pending: Vec<f32> = Vec::new();
+        // When the copilot last finished speaking — used for the post-speech tail.
+        let mut spoke_until: Option<Instant> = None;
 
         loop {
             std::thread::sleep(Duration::from_millis(FRAME_MS as u64));
+
+            // Half-duplex: while the copilot is speaking (or just did), throw away
+            // captured audio and hold the segmenter reset, so its own voice never
+            // becomes an utterance.
+            if self.gate.is_speaking() {
+                spoke_until = Some(Instant::now() + MIC_GATE_TAIL);
+            }
+            if spoke_until.is_some_and(|t| Instant::now() < t) {
+                self.input.buffer.lock().unwrap().clear();
+                self.segmenter.reset();
+                pending.clear();
+                self.reporter.mic(0.0);
+                continue;
+            }
+
             let new = std::mem::take(&mut *self.input.buffer.lock().unwrap());
             if new.is_empty() {
                 continue;
