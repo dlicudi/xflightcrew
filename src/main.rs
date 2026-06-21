@@ -715,8 +715,9 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "ident", "barometer", "altimeter", "baro", "kollsman", "qnh", "vor",
     // instruments / misc controls
     "gyro", "pitot", "brake", "brakes", "parking", "heat",
-    // phase-config macros (before/after each phase, configure, secure, …)
+    // checklist invocations (every phase + the reference card)
     "takeoff", "configure", "config", "departure", "secure", "clean", "cruise",
+    "preflight", "limits", "performance",
 ];
 
 /// True if the utterance plausibly is an aircraft command (contains at least one
