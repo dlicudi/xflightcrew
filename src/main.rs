@@ -654,7 +654,11 @@ fn looks_like_followup(text: &str) -> bool {
         "it", "that", "them", "those", "again", "back", "undo", "revert",
         "reset", "more", "less", "instead", "also", "other", "same", "too",
     ];
-    if has_number(text) {
+    // A SHORT bare quantity is an adjustment to the last command ("sixty
+    // percent", "two thousand five hundred"). A long string of numbers ("one two
+    // three … ten") is counting/noise, not a follow-up — rewriting it into a
+    // command spawns a cascade of conflicting actions, so cap the length.
+    if has_number(text) && text.split_whitespace().count() <= 5 {
         return true;
     }
     text.split(|c: char| !c.is_ascii_alphabetic())
@@ -800,7 +804,11 @@ mod tests {
         ] {
             assert!(looks_like_followup(c), "{c:?} should look like a follow-up");
         }
-        for c in ["nice weather today", "where are we", "hello copilot"] {
+        for c in [
+            "nice weather today", "where are we", "hello copilot",
+            // A long counting string is noise, not a bare-value follow-up.
+            "one two three four five six seven eight ten",
+        ] {
             assert!(!looks_like_followup(c), "{c:?} should not");
         }
     }

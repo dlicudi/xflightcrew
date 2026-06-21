@@ -52,6 +52,34 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+/// Collapse conflicting calls the model sometimes emits for one utterance — e.g.
+/// `set_flaps(10)`, `set_flaps(20)`, `set_flaps(full)` from a garbled input. A
+/// single-control tool can only hold one setting, so a later call overwrites the
+/// earlier: keep the LAST. Tools that ADDRESS a target — `set_lights` by `light`,
+/// `set_electrical` by `system`, `swap_radio` by `radio` — are deduped per
+/// (tool, target) instead, so a real compound ("landing and taxi lights on")
+/// keeps both. Order is preserved.
+fn dedup_calls(calls: Vec<ToolCall>) -> Vec<ToolCall> {
+    const TARGET_KEYS: &[&str] = &["light", "system", "radio"];
+    let key = |c: &ToolCall| -> String {
+        let target = TARGET_KEYS
+            .iter()
+            .find_map(|k| c.arguments.get(*k).map(|v| v.to_string()))
+            .unwrap_or_default();
+        format!("{}|{target}", c.name)
+    };
+    // Walk from the end keeping the first (= last) occurrence of each key, then
+    // restore original order.
+    let mut seen = std::collections::HashSet::new();
+    let mut keep = vec![false; calls.len()];
+    for (i, c) in calls.iter().enumerate().rev() {
+        if seen.insert(key(c)) {
+            keep[i] = true;
+        }
+    }
+    calls.into_iter().zip(keep).filter_map(|(c, k)| k.then_some(c)).collect()
+}
+
 /// Thin client over a local Ollama server.
 pub struct Llm {
     http: reqwest::Client,
@@ -118,7 +146,7 @@ impl Llm {
         // Deterministic first pass.
         let calls = self.choose_tool_at(transcript, tools, history, 0.0).await?;
         if !calls.is_empty() {
-            return Ok(calls);
+            return Ok(dedup_calls(calls));
         }
         // Declined — retry with escalating temperature, stopping at the first
         // concrete pick.
@@ -127,7 +155,7 @@ impl Llm {
             let calls = self.choose_tool_at(transcript, tools, history, temp).await?;
             if !calls.is_empty() {
                 tracing::info!(temp, transcript = %transcript, n = calls.len(), "recovered tool(s) on retry");
-                return Ok(calls);
+                return Ok(dedup_calls(calls));
             }
         }
         Ok(Vec::new())
@@ -238,6 +266,24 @@ mod tests {
     use crate::aircraft;
     use crate::config::Config;
     use crate::tools::Registry;
+
+    #[test]
+    fn dedup_collapses_conflicting_keeps_addressable() {
+        let c = |name: &str, args: Value| ToolCall { name: name.into(), arguments: args };
+        let out = dedup_calls(vec![
+            c("set_flaps", json!({ "notch": "10" })),
+            c("set_flaps", json!({ "notch": "20" })),
+            c("set_flaps", json!({ "notch": "full" })),
+            c("set_lights", json!({ "light": "landing", "on": true })),
+            c("set_lights", json!({ "light": "taxi", "on": true })),
+        ]);
+        // One flaps (the LAST setting wins) + both lights (different targets).
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].name, "set_flaps");
+        assert_eq!(out[0].arguments.get("notch").unwrap(), "full");
+        assert_eq!(out[1].arguments.get("light").unwrap(), "landing");
+        assert_eq!(out[2].arguments.get("light").unwrap(), "taxi");
+    }
 
     /// A minimal config pointing at the local Ollama. Model overridable via
     /// XCOPILOT_MODEL so we can compare models from the command line.
