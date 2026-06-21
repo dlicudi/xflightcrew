@@ -1,33 +1,69 @@
-//! Phase-config macros — the operational checklists transposed into one-command
-//! sequences, in the pure actor model (no checklist files, no verify/challenge,
-//! no per-item interaction; like [`engine::StartEngine`](super::engine::StartEngine)
-//! bundles the start). Each macro is a *table of steps* — literally the
-//! checklist — that composes the existing single-action tools, so there's no
-//! duplicated dataref logic.
+//! Checklists the copilot **runs for you** — say "run the before-takeoff
+//! checklist" (or "configure for takeoff") and it reads each item aloud, does the
+//! ones it can (the switches), and calls out the ones that are yours (visual
+//! checks, the run-up, judgment items). Autonomous: no back-and-forth, it just
+//! performs the flow top to bottom, like a pilot-monitoring would.
 //!
-//! Principle: a macro performs the **steady SET items** of a phase. It does NOT
-//! do *tests* (the brake check, the mag run-up — the pilot observes those),
-//! *judgment* items ("flaps as required", power settings), or *visual* checks
-//! (controls free, oil pressure). Those stay with the pilot.
+//! Each checklist is a plain table of [`Step`]s (no checklist files, no parsing).
+//! A step either carries an action the copilot performs, or is a spoken call-out
+//! the pilot owns. The interactive runner lives in `main.rs` (it needs the voice
+//! the way the old per-tool readback path doesn't).
 
 use anyhow::{bail, Result};
-use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::autopilot::AutopilotOff;
 use super::controls::{SetParkingBrake, SetPitchTrim};
 use super::electrical::SetElectrical;
-use super::engine::{SetCarbHeat, SetFuelSelector, SetMixture, SetThrottle, StopEngine};
+use super::engine::{SetFuelSelector, SetMixture, SetThrottle, StopEngine};
 use super::flaps::SetFlaps;
 use super::lights::SetLights;
 use super::radio::SetTransponderMode;
-use super::{Tool, ToolCtx};
+use super::{Tool, ToolCtx, ToolSpec};
 use crate::aircraft::{FlapProfile, LightProfile};
 
-/// Dispatch one macro step to the matching single-action tool. Keeps the macro
-/// definitions a plain `(tool, args)` table; lights/flaps tools are built from
-/// the profile passed through.
-async fn run_step(
+/// One checklist item. The copilot speaks `say`; if `act` is set it performs
+/// that action, otherwise the item is the pilot's and is only called out.
+pub struct Step {
+    pub say: String,
+    pub act: Option<(&'static str, Value)>,
+}
+
+fn act(say: &str, tool: &'static str, args: Value) -> Step {
+    Step { say: say.to_string(), act: Some((tool, args)) }
+}
+
+/// A pilot-owned item — spoken so the pilot knows it's theirs; not performed.
+fn pilot(say: &str) -> Step {
+    Step { say: say.to_string(), act: None }
+}
+
+/// One checklist: a name, the LLM-facing description, the steps, and the profile
+/// bits the actions need.
+pub struct Checklist {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub description: String,
+    pub steps: Vec<Step>,
+    pub lights: Vec<LightProfile>,
+    pub flaps: Option<FlapProfile>,
+}
+
+impl Checklist {
+    /// The tool spec the LLM routes against (no arguments — the name is the pick).
+    pub fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.id.to_string(),
+            description: self.description.clone(),
+            parameters: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        }
+    }
+}
+
+/// Perform one checklist action by dispatching to the matching single-action
+/// tool (which reads the dataref back, so the action is verified). Lights/flaps
+/// tools are built from the profile.
+pub async fn run_step(
     tool: &str,
     args: &Value,
     lights: &[LightProfile],
@@ -41,7 +77,6 @@ async fn run_step(
         "set_mixture" => SetMixture.execute(args, ctx).await,
         "set_throttle" => SetThrottle.execute(args, ctx).await,
         "set_fuel_selector" => SetFuelSelector.execute(args, ctx).await,
-        "set_carb_heat" => SetCarbHeat.execute(args, ctx).await,
         "set_transponder_mode" => SetTransponderMode.execute(args, ctx).await,
         "autopilot_off" => AutopilotOff.execute(args, ctx).await,
         "stop_engine" => StopEngine.execute(args, ctx).await,
@@ -50,193 +85,185 @@ async fn run_step(
             Some(f) => SetFlaps::new(f.clone()).execute(args, ctx).await,
             None => bail!("no flaps on this airframe"),
         },
-        other => bail!("macro step references unknown tool {other}"),
+        other => bail!("checklist step references unknown tool {other}"),
     }
 }
 
-/// One checklist transposed into a macro: a name, the LLM-facing description, the
-/// step table, and a spoken summary.
-pub struct PhaseMacro {
-    name: &'static str,
-    description: String,
-    summary: &'static str,
-    steps: Vec<(&'static str, Value)>,
-    lights: Vec<LightProfile>,
-    flaps: Option<FlapProfile>,
-}
-
-#[async_trait]
-impl Tool for PhaseMacro {
-    fn name(&self) -> &str {
-        self.name
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn parameters(&self) -> Value {
-        json!({ "type": "object", "properties": {}, "additionalProperties": false })
-    }
-
-    async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
-        let mut failed = 0usize;
-        for (tool, args) in &self.steps {
-            if run_step(tool, args, &self.lights, &self.flaps, ctx).await.is_err() {
-                failed += 1;
-            }
-        }
-        if failed == self.steps.len() {
-            bail!("couldn't run the {} flow — is X-Plane reachable?", self.name);
-        }
-        if failed == 0 {
-            Ok(self.summary.to_string())
-        } else {
-            Ok(format!("{} — but {failed} item(s) didn't take; check the panel.", self.summary))
-        }
-    }
-}
-
-/// Build the description with trigger phrases and the anti-greedy guard the model
-/// needs so a macro doesn't steal a single-system command.
-fn describe(does: &str, triggers: &str) -> String {
+/// Build a checklist's LLM description: trigger phrases plus the anti-greedy
+/// guard so it doesn't steal a single-system command.
+fn describe(name: &str, triggers: &str) -> String {
     format!(
-        "Run the WHOLE {does} in one step. ONLY for a single command asking for \
-         the entire flow: {triggers}. Do NOT use this when a single system is \
-         named (e.g. 'mixture rich', 'flaps up') — those have their own tools; \
-         pick this only when no individual system is mentioned."
+        "Run the {name} checklist — the copilot reads each item aloud, does the \
+         ones it can, and calls out the pilot's items. ONLY for a single command \
+         asking for the whole checklist: {triggers}. Do NOT use this when one \
+         system is named ('mixture rich', 'flaps up') — those have their own \
+         tools; pick this only when no individual system is mentioned."
     )
 }
 
-/// The operational checklists, transposed. Each is the *settable* subset of the
-/// checklist in order; tests, judgment, and visual items are left to the pilot.
-pub fn phase_macros(lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<Box<dyn Tool>> {
-    let m = |name, description, summary, steps: Vec<(&'static str, Value)>| -> Box<dyn Tool> {
-        Box::new(PhaseMacro { name, description, summary, steps, lights: lights.clone(), flaps: flaps.clone() })
+/// The operational checklists, transposed step-for-step. The copilot performs the
+/// settable items and calls out the tests/judgment/visual ones as the pilot's.
+pub fn checklists(lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<Checklist> {
+    let make = |id, title, description, steps| Checklist {
+        id,
+        title,
+        description,
+        steps,
+        lights: lights.clone(),
+        flaps: flaps.clone(),
     };
 
-    vec![
-        m(
+    let mut out = vec![
+        make(
             "before_starting_engine",
-            describe("before-starting-engine flow", "'before starting engine', 'before start', 'pre-start checklist'"),
-            "Roger — before start: parking brake set, autopilot off, avionics off, fuel selector both.",
+            "before starting engine",
+            describe("before-starting-engine", "'before starting engine', 'before start', 'pre-start checklist'"),
             vec![
-                ("set_parking_brake", json!({ "on": true })),
-                ("autopilot_off", json!({})),
-                ("set_electrical", json!({ "system": "avionics", "on": false })),
-                ("set_fuel_selector", json!({ "position": "both" })),
+                act("Parking brake, set.", "set_parking_brake", json!({ "on": true })),
+                act("Autopilot, off.", "autopilot_off", json!({})),
+                act("Avionics, off.", "set_electrical", json!({ "system": "avionics", "on": false })),
+                act("Fuel selector, both.", "set_fuel_selector", json!({ "position": "both" })),
             ],
         ),
-        m(
+        make(
             "before_taxi",
-            describe("before-taxi flow", "'before taxi', 'before taxi checklist', 'ready to taxi'"),
-            "Roger — before taxi: transponder standby, taxi light on.",
+            "before taxi",
+            describe("before-taxi", "'before taxi', 'before taxi checklist', 'ready to taxi'"),
             vec![
-                ("set_transponder_mode", json!({ "mode": "standby" })),
-                ("set_lights", json!({ "light": "taxi", "on": true })),
+                pilot("Fuel quantity — your check."),
+                pilot("Flight controls — free and correct, your check."),
+                pilot("Flight instruments — set, your check."),
+                act("Transponder, standby.", "set_transponder_mode", json!({ "mode": "standby" })),
+                act("Taxi light, on.", "set_lights", json!({ "light": "taxi", "on": true })),
+                pilot("Brakes — your check."),
+                act("Parking brake, set.", "set_parking_brake", json!({ "on": true })),
             ],
         ),
-        m(
+        make(
             "before_takeoff",
+            "before takeoff",
             describe(
-                "before-takeoff configuration",
+                "before-takeoff",
                 "'before takeoff', 'before takeoff checklist', 'configure for takeoff', 'takeoff config', 'set up for takeoff', 'get ready for takeoff'",
             ),
-            "Roger — before takeoff: brake set, mixture rich, fuel both, strobes and landing light on, autopilot off, trim set for takeoff. The mag check and flaps are yours.",
             vec![
-                ("set_parking_brake", json!({ "on": true })),
-                ("set_mixture", json!({ "percent": 100 })),
-                ("set_fuel_selector", json!({ "position": "both" })),
-                ("set_lights", json!({ "light": "strobe", "on": true })),
-                ("set_lights", json!({ "light": "landing", "on": true })),
-                ("autopilot_off", json!({})),
-                ("set_pitch_trim", json!({ "action": "takeoff" })),
+                act("Parking brake, set.", "set_parking_brake", json!({ "on": true })),
+                act("Mixture, rich.", "set_mixture", json!({ "percent": 100 })),
+                act("Fuel selector, both.", "set_fuel_selector", json!({ "position": "both" })),
+                pilot("Mag check — your run-up. Maximum drop one twenty-five, difference fifty."),
+                pilot("Engine instruments — green, your check."),
+                act("Strobe lights, on.", "set_lights", json!({ "light": "strobe", "on": true })),
+                act("Landing light, on.", "set_lights", json!({ "light": "landing", "on": true })),
+                act("Autopilot, off.", "autopilot_off", json!({})),
+                act("Trim, set for takeoff.", "set_pitch_trim", json!({ "action": "takeoff" })),
+                pilot("Flaps — as required, your call."),
             ],
         ),
-        m(
+        make(
             "normal_takeoff",
-            describe("normal-takeoff configuration", "'normal takeoff', 'normal takeoff checklist', 'lined up'"),
-            "Roger — takeoff items: taxi light off, transponder altitude, mixture rich. Throttle and brakes are yours.",
+            "normal takeoff",
+            describe("normal-takeoff", "'normal takeoff', 'normal takeoff checklist', 'lined up'"),
             vec![
-                ("set_lights", json!({ "light": "taxi", "on": false })),
-                ("set_transponder_mode", json!({ "mode": "altitude" })),
-                ("set_mixture", json!({ "percent": 100 })),
+                act("Taxi light, off.", "set_lights", json!({ "light": "taxi", "on": false })),
+                act("Transponder, altitude.", "set_transponder_mode", json!({ "mode": "altitude" })),
+                act("Mixture, rich.", "set_mixture", json!({ "percent": 100 })),
+                pilot("Throttle and brakes — yours for the roll. Rotate around sixty."),
             ],
         ),
-        m(
+        make(
             "climb",
-            describe("climb flow", "'climb', 'climb checklist', 'climb flow'"),
-            "Roger — climb: landing light off, throttle full, mixture rich.",
+            "climb",
+            describe("climb", "'climb', 'climb checklist', 'climb flow'"),
             vec![
-                ("set_lights", json!({ "light": "landing", "on": false })),
-                ("set_throttle", json!({ "percent": 100 })),
-                ("set_mixture", json!({ "percent": 100 })),
+                act("Landing light, off.", "set_lights", json!({ "light": "landing", "on": false })),
+                act("Throttle, full.", "set_throttle", json!({ "percent": 100 })),
+                act("Mixture, rich.", "set_mixture", json!({ "percent": 100 })),
             ],
         ),
-        m(
+        make(
             "cruise",
-            describe("cruise flow", "'cruise', 'cruise checklist', 'level off complete'"),
-            "Roger — cruise: mixture leaned. Power and trim are yours.",
-            vec![("set_mixture", json!({ "percent": 65 }))],
-        ),
-        m(
-            "descent",
-            describe("descent flow", "'descent', 'descent checklist', 'starting down'"),
-            "Roger — descent: mixture rich, fuel both. Power, altimeter, and flaps are yours.",
+            "cruise",
+            describe("cruise", "'cruise', 'cruise checklist', 'level off complete'"),
             vec![
-                ("set_mixture", json!({ "percent": 100 })),
-                ("set_fuel_selector", json!({ "position": "both" })),
+                pilot("Power — your call, twenty-one to twenty-five hundred RPM."),
+                pilot("Trim — your call."),
+                act("Mixture, leaned.", "set_mixture", json!({ "percent": 65 })),
+                pilot("Fuel quantity — your check."),
             ],
         ),
-        m(
+        make(
+            "descent",
+            "descent",
+            describe("descent", "'descent', 'descent checklist', 'starting down'"),
+            vec![
+                pilot("Power — your call."),
+                act("Mixture, rich.", "set_mixture", json!({ "percent": 100 })),
+                pilot("Altimeter — set, your check."),
+                act("Fuel selector, both.", "set_fuel_selector", json!({ "position": "both" })),
+                pilot("Flaps — as required, your call."),
+            ],
+        ),
+        make(
             "before_landing",
+            "before landing",
             describe(
-                "before-landing configuration",
+                "before-landing",
                 "'before landing', 'before landing checklist', 'configure for landing', 'set up for landing', 'get ready for landing'",
             ),
-            "Roger — before landing: fuel both, mixture rich, landing and taxi lights on, autopilot off.",
             vec![
-                ("set_fuel_selector", json!({ "position": "both" })),
-                ("set_mixture", json!({ "percent": 100 })),
-                ("set_lights", json!({ "light": "landing", "on": true })),
-                ("set_lights", json!({ "light": "taxi", "on": true })),
-                ("autopilot_off", json!({})),
+                act("Fuel selector, both.", "set_fuel_selector", json!({ "position": "both" })),
+                act("Mixture, rich.", "set_mixture", json!({ "percent": 100 })),
+                act("Landing light, on.", "set_lights", json!({ "light": "landing", "on": true })),
+                act("Taxi light, on.", "set_lights", json!({ "light": "taxi", "on": true })),
+                act("Autopilot, off.", "autopilot_off", json!({})),
             ],
         ),
-        m(
+        make(
             "after_landing",
-            describe("after-landing cleanup", "'after landing', 'after landing checklist', 'clean up', 'clear of the runway'"),
-            "Roger — after landing: flaps up, landing, strobe and nav lights off, transponder standby. Taxi light's still on.",
+            "after landing",
+            describe("after-landing", "'after landing', 'after landing checklist', 'clean up', 'clear of the runway'"),
             vec![
-                ("set_flaps", json!({ "notch": "up" })),
-                ("set_lights", json!({ "light": "landing", "on": false })),
-                ("set_lights", json!({ "light": "strobe", "on": false })),
-                ("set_lights", json!({ "light": "nav", "on": false })),
-                ("set_transponder_mode", json!({ "mode": "standby" })),
+                act("Flaps, up.", "set_flaps", json!({ "notch": "up" })),
+                act("Landing light, off.", "set_lights", json!({ "light": "landing", "on": false })),
+                act("Strobe lights, off.", "set_lights", json!({ "light": "strobe", "on": false })),
+                act("Nav lights, off.", "set_lights", json!({ "light": "nav", "on": false })),
+                act("Transponder, standby.", "set_transponder_mode", json!({ "mode": "standby" })),
             ],
         ),
-        m(
-            "secure_aircraft",
-            describe(
-                "shutdown-and-secure flow",
-                "'secure the aircraft', 'secure', 'engine shutdown', 'shutdown checklist', 'shut everything down', 'full shutdown'. For JUST the engine say 'shut down the engine'",
-            ),
-            "Roger — secured: parking brake set, engine shut down, all lights off, transponder off, avionics, alternator and master off. Have a good one.",
-            {
-                // Lights off: every exterior light this airframe has.
-                let mut steps: Vec<(&'static str, Value)> = vec![
-                    ("set_parking_brake", json!({ "on": true })),
-                    ("stop_engine", json!({})),
-                    ("set_transponder_mode", json!({ "mode": "off" })),
-                ];
-                for l in &lights {
-                    steps.push(("set_lights", json!({ "light": l.key, "on": false })));
-                }
-                steps.push(("set_electrical", json!({ "system": "avionics", "on": false })));
-                steps.push(("set_electrical", json!({ "system": "alternator", "on": false })));
-                steps.push(("set_electrical", json!({ "system": "master", "on": false })));
-                steps
-            },
+    ];
+
+    // Engine shutdown: brake, kill the engine, every light off, then shed the
+    // electrical load with the master last. Built dynamically for the lights.
+    let mut secure = vec![
+        act("Parking brake, set.", "set_parking_brake", json!({ "on": true })),
+        act("Transponder, off.", "set_transponder_mode", json!({ "mode": "off" })),
+        act("Autopilot, off.", "autopilot_off", json!({})),
+        act("Engine, shutting down — mixture cutoff, mags off.", "stop_engine", json!({})),
+    ];
+    for l in &lights {
+        secure.push(act(&format!("{}, off.", capitalize(&l.spoken)), "set_lights", json!({ "light": l.key, "on": false })));
+    }
+    secure.push(act("Avionics, off.", "set_electrical", json!({ "system": "avionics", "on": false })));
+    secure.push(act("Alternator, off.", "set_electrical", json!({ "system": "alternator", "on": false })));
+    secure.push(act("Master switch, off.", "set_electrical", json!({ "system": "master", "on": false })));
+    secure.push(pilot("Fuel selector — left or right if parked on a slope, your call."));
+    out.push(make(
+        "secure_aircraft",
+        "secure the aircraft",
+        describe(
+            "shutdown-and-secure",
+            "'secure the aircraft', 'secure', 'engine shutdown', 'shutdown checklist', 'shut everything down', 'full shutdown'. For JUST the engine say 'shut down the engine'",
         ),
-    ]
+        secure,
+    ));
+
+    out
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
 }

@@ -101,6 +101,8 @@ async fn main() -> Result<()> {
     let stt = Stt::load(&config.whisper_model_path)?;
     let llm = Llm::new(&config);
     let registry = Registry::for_aircraft(&profile);
+    // Checklists the copilot runs interactively (narrate + act + call out yours).
+    let checklists = tools::macros::checklists(profile.lights.clone(), profile.flaps.clone());
 
     let continuous = config.listen_mode == "continuous";
     // "Explicit" = the user clearly addressed the copilot (push-to-talk, or a
@@ -155,7 +157,7 @@ async fn main() -> Result<()> {
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             if let Err(e) = rt.block_on(run_session(
-                config, stt, llm, registry, voice, continuous, explicit, reporter, Some(cmd_rx),
+                config, stt, llm, registry, checklists, voice, continuous, explicit, reporter, Some(cmd_rx),
             )) {
                 tracing::error!("voice loop ended: {e:#}");
             }
@@ -165,7 +167,7 @@ async fn main() -> Result<()> {
         Ok(())
     } else {
         println!("\n  x-copilot — {} ({}). Ctrl-C to quit.\n", profile.display_name, config.listen_mode);
-        run_session(config, stt, llm, registry, voice, continuous, explicit, Reporter::Plain, None).await
+        run_session(config, stt, llm, registry, checklists, voice, continuous, explicit, Reporter::Plain, None).await
     }
 }
 
@@ -188,6 +190,7 @@ async fn run_session(
     stt: Stt,
     llm: Llm,
     registry: Registry,
+    checklists: Vec<tools::macros::Checklist>,
     voice: Voice,
     continuous: bool,
     explicit: bool,
@@ -198,7 +201,10 @@ async fn run_session(
     // (main for plain, the voice thread for TUI) — a reqwest client's I/O is
     // bound to the runtime it's used on.
     let xplane = XPlaneClient::new(config.xplane_base_url.clone());
-    let specs = registry.specs();
+    let mut specs = registry.specs();
+    // Each checklist is exposed to the LLM as a no-arg "tool" the loop intercepts
+    // and runs interactively.
+    specs.extend(checklists.iter().map(|c| c.spec()));
     // Rolling conversation memory: recent (command, readback, when) turns, used
     // to resolve back-references and to gate conversational follow-ups.
     let mut history: Vec<(String, String, Instant)> = Vec::new();
@@ -339,6 +345,14 @@ async fn run_session(
             tracing::info!(tool = %call.name, args = %call.arguments, "tool selected");
             reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
 
+            // A checklist isn't a one-shot tool — the copilot runs it: reads each
+            // item, does the ones it can, calls out the pilot's. Needs the voice,
+            // so it's handled here, not via the plain ToolCtx.
+            if let Some(cl) = checklists.iter().find(|c| c.id == call.name) {
+                run_checklist(cl, &xplane, &config, &voice, &reporter).await;
+                continue;
+            }
+
             // Confirmation gate with in-line correction ("negative, 500"). Applies
             // per call, so each safety-critical action in a compound command is
             // confirmed on its own.
@@ -426,6 +440,48 @@ async fn run_session(
             history.retain(|(_, _, t)| t.elapsed() < HISTORY_TTL);
         }
     }
+}
+
+/// Run a checklist the way a pilot-monitoring would: read each item aloud,
+/// perform the ones the copilot can (each tool reads the dataref back, so the
+/// action is verified), and call out the pilot's items. Autonomous — it performs
+/// the whole flow top to bottom without waiting. Narration is naturally paced by
+/// the speech queue (one utterance plays before the next).
+async fn run_checklist(
+    cl: &tools::macros::Checklist,
+    xplane: &XPlaneClient,
+    config: &Config,
+    voice: &Voice,
+    reporter: &Reporter,
+) {
+    say(voice, reporter, ui::LogKind::Info, &format!("Running the {} checklist.", cl.title));
+    let ctx = ToolCtx { xplane, config };
+    let mut failed = 0usize;
+    for step in &cl.steps {
+        match &step.act {
+            // The pilot's item — call it out, don't perform it.
+            None => say(voice, reporter, ui::LogKind::Confirm, &step.say),
+            // The copilot's item — do it, then read the item back (or flag it).
+            Some((tool, args)) => {
+                if tools::macros::run_step(tool, args, &cl.lights, &cl.flaps, &ctx).await.is_ok() {
+                    say(voice, reporter, ui::LogKind::Readback, &step.say);
+                } else {
+                    say(voice, reporter, ui::LogKind::Warn, &format!("{} Didn't take — check it.", step.say));
+                    failed += 1;
+                }
+            }
+        }
+    }
+    let summary = if failed == 0 {
+        format!("{} checklist complete.", cl.title)
+    } else {
+        format!(
+            "{} checklist complete — {failed} item{} didn't take, check the panel.",
+            cl.title,
+            if failed == 1 { "" } else { "s" }
+        )
+    };
+    say(voice, reporter, ui::LogKind::Ok, &summary);
 }
 
 /// Apply the wake-word gate, fuzzily. Speech-to-text mangles "copilot" into
