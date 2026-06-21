@@ -39,6 +39,10 @@ fuel:
   reserve_warning_min: 30.0
   cruise_burn_kg_hr: 24.0   # ~8.5 gal/hr — used to estimate endurance pre-takeoff
 
+# Clean (flaps-up, power-off) stall speed, KIAS. Drives the monitor's airspeed
+# callouts: a caution as you approach it, an urgent "lower the nose" below.
+vs_clean_kts: 48.0
+
 # Flap detents, retracted → full. Vfe is the max IAS (kts) to extend to each.
 flaps:
   detents:

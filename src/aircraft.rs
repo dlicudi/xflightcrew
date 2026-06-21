@@ -23,6 +23,10 @@ pub struct AircraftProfile {
     /// Fuel endurance monitoring thresholds. `None` means no fuel callouts.
     #[serde(default)]
     pub fuel: Option<FuelProfile>,
+    /// Clean (flaps-up) stall speed, KIAS — drives the monitor's airspeed
+    /// callouts. `None` means no stall caution.
+    #[serde(default)]
+    pub vs_clean_kts: Option<f64>,
     /// Exterior/interior lights this airframe has. Empty means no `set_lights` tool.
     #[serde(default)]
     pub lights: Vec<LightProfile>,
@@ -255,6 +259,8 @@ fn cessna_172sp() -> AircraftProfile {
             reserve_warning_min: 30.0,
             cruise_burn_kg_hr: 24.0,
         }),
+        // 172SP clean stall ~48 KIAS (power-off, flaps up).
+        vs_clean_kts: Some(48.0),
         lights: vec![
             light("nav", "navigation lights", "sim/cockpit2/switches/navigation_lights_on",
                   "sim/lights/nav_lights_on", "sim/lights/nav_lights_off"),

@@ -55,6 +55,15 @@ pub enum Phase {
 pub struct Snapshot {
     pub on_ground: bool,
     pub groundspeed_kts: f64,
+    /// Indicated airspeed, knots — drives the stall/airspeed callout.
+    pub ias_kts: f64,
+    /// Rate of change of IAS, knots per second (negative = decelerating).
+    /// Computed by the poll loop across ticks; lets the airspeed callout fire on
+    /// a fast washout *before* the speed actually reaches the threshold.
+    pub ias_trend_kts_per_s: f64,
+    /// Flap deflection 0.0–1.0 — stall speed drops with flaps, so the airspeed
+    /// callout's threshold scales with it.
+    pub flap_ratio: f64,
     pub agl_ft: f64,
     pub vsi_fpm: f64,
     pub engine_running: bool,
@@ -79,6 +88,11 @@ impl Snapshot {
         let on_ground = xp.get_float("sim/flightmodel/failures/onground_any").await.ok()? > 0.5;
         let groundspeed_kts =
             xp.get_float("sim/flightmodel/position/groundspeed").await.ok()? * MS_TO_KTS;
+        let ias_kts = xp
+            .get_float("sim/cockpit2/gauges/indicators/airspeed_kts_pilot")
+            .await
+            .ok()?;
+        let flap_ratio = xp.get_float("sim/cockpit2/controls/flap_ratio").await.unwrap_or(0.0);
         let agl_ft = xp.get_float("sim/flightmodel/position/y_agl").await.ok()? * M_TO_FT;
         let vsi_fpm = xp
             .get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot")
@@ -125,6 +139,9 @@ impl Snapshot {
         let mut s = Snapshot {
             on_ground,
             groundspeed_kts,
+            ias_kts,
+            ias_trend_kts_per_s: 0.0, // filled in by the poll loop (needs history)
+            flap_ratio,
             agl_ft,
             vsi_fpm,
             engine_running,
@@ -254,6 +271,81 @@ impl FireState {
 }
 
 /// Build the checks enabled for this airframe.
+/// Below this AGL the aircraft is in the landing flare, where slow-and-low is
+/// *intended* — so the airspeed callout is suppressed there to avoid nagging on
+/// every normal touchdown.
+const FLARE_AGL_FT: f64 = 50.0;
+
+/// Approach-to-stall airspeed callout: the copilot's "Airspeed!" — it warns and
+/// prompts the recovery, it never touches the controls (intent is the pilot's;
+/// auto-recovery would fight intentional slow flight). Airborne and above the
+/// flare only, sustained so a momentary dip in a turn doesn't trip it. Banded
+/// like the fuel check: a caution as you approach the stall, an urgent prompt
+/// below it.
+/// Flaps lower the stall speed by up to this fraction at full extension (172:
+/// clean Vs ≈ 48, full-flap Vs0 ≈ 40 → ~17%). The threshold scales with flaps so
+/// a normal slow-but-safe flaps-down approach doesn't trip it.
+const FLAP_STALL_REDUCTION: f64 = 0.17;
+
+/// How far ahead (seconds) to project a decaying airspeed. At a 3 kt/s washout
+/// this fires the caution ~12 kt early — enough lead to call it well before a
+/// mushing autopilot reaches its envelope limit and disconnects. Long enough to
+/// get ahead of the decay, short enough that a brief, intentional power
+/// reduction settles before it nags.
+const STALL_LOOKAHEAD_S: f64 = 4.0;
+
+struct StallSpeed {
+    id: &'static str,
+    severity: Severity,
+    /// Clean stall speed (kts) the bands scale off.
+    vs_clean_kts: f64,
+    /// Fires when IAS ≤ this × the flap-adjusted stall speed …
+    at_or_below_factor: f64,
+    /// … and (if set) still above this × it — the more urgent band owns below.
+    above_factor: Option<f64>,
+}
+
+impl Check for StallSpeed {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn severity(&self) -> Severity {
+        self.severity
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        // Airborne and above the flare. Engine state is irrelevant — a glide can
+        // stall too.
+        if s.on_ground || s.agl_ft < FLARE_AGL_FT {
+            return None;
+        }
+        // Stall speed for the current flap setting.
+        let vs = self.vs_clean_kts * (1.0 - FLAP_STALL_REDUCTION * s.flap_ratio.clamp(0.0, 1.0));
+        // Anticipate: when the speed is washing off, project it forward so the
+        // band trips while there's still margin to recover. Only a *decaying*
+        // trend counts (`.min(0.0)`), so this can lower the effective speed but
+        // never raises it — it never masks a genuine low reading.
+        let projected = s.ias_kts + s.ias_trend_kts_per_s.min(0.0) * STALL_LOOKAHEAD_S;
+        let in_band = projected <= self.at_or_below_factor * vs
+            && self.above_factor.map_or(true, |a| projected > a * vs);
+        if !in_band {
+            return None;
+        }
+        Some(match self.severity {
+            Severity::Warning => "Airspeed! Lower the nose, add power.".to_string(),
+            _ => "Airspeed — you're getting slow.".to_string(),
+        })
+    }
+    fn min_duration(&self) -> Duration {
+        // Speak quickly — a decaying airspeed needs lead time, not a long
+        // confirm. Just enough to ignore a single-frame glitch (~1–2 samples at
+        // the monitor's poll rate); the urgent band reacts fastest.
+        match self.severity {
+            Severity::Warning => Duration::from_millis(300),
+            _ => Duration::from_millis(700),
+        }
+    }
+}
+
 fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     let mut checks: Vec<Box<dyn Check>> = Vec::new();
     if profile.electrical {
@@ -261,6 +353,26 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     }
     if profile.directional_gyro {
         checks.push(Box::new(GyroDrift));
+    }
+    if let Some(vs) = profile.vs_clean_kts {
+        // Wide caution band (≤1.2×Vs) so it speaks with lead time, urgent prompt
+        // below ~1.1×Vs. Disjoint bands so only one speaks; the factors are
+        // applied to the *flap-adjusted* stall speed at eval time, so a slow but
+        // safe flaps-down approach doesn't trip it.
+        checks.push(Box::new(StallSpeed {
+            id: "airspeed_caution",
+            severity: Severity::Caution,
+            vs_clean_kts: vs,
+            at_or_below_factor: 1.20,
+            above_factor: Some(1.10),
+        }));
+        checks.push(Box::new(StallSpeed {
+            id: "airspeed_warning",
+            severity: Severity::Warning,
+            vs_clean_kts: vs,
+            at_or_below_factor: 1.10,
+            above_factor: None,
+        }));
     }
     if let Some(fuel) = &profile.fuel {
         // Two banded checks share one struct: caution between the thresholds,
@@ -301,9 +413,26 @@ pub async fn run(config: Config, profile: AircraftProfile, voice: Voice) {
     let mut states: HashMap<&'static str, FireState> =
         checks.iter().map(|c| (c.id(), FireState::new())).collect();
 
+    // IAS history for the rate-of-decay term. `trend` is an EMA (kts/s) so a
+    // single noisy sample doesn't read as a sharp washout.
+    let mut prev_ias: Option<(f64, Instant)> = None;
+    let mut trend = 0.0_f64;
+
     loop {
-        if let Some(snap) = Snapshot::read(&xp).await {
+        if let Some(mut snap) = Snapshot::read(&xp).await {
             let now = Instant::now();
+            if let Some((last, last_t)) = prev_ias {
+                let dt = now.duration_since(last_t).as_secs_f64();
+                // Ignore a stretched dt (a skipped/stalled tick) — the rate would
+                // be meaningless. Only update inside a sane sampling window.
+                if (0.1..=1.0).contains(&dt) {
+                    let inst = (snap.ias_kts - last) / dt;
+                    trend = 0.6 * trend + 0.4 * inst;
+                }
+            }
+            prev_ias = Some((snap.ias_kts, now));
+            snap.ias_trend_kts_per_s = trend;
+
             for check in &checks {
                 let state = states.get_mut(check.id()).expect("state per check");
                 match check.eval(&snap) {
@@ -454,6 +583,9 @@ mod tests {
         Snapshot {
             on_ground: true,
             groundspeed_kts: 0.0,
+            ias_kts: 0.0,
+            ias_trend_kts_per_s: 0.0,
+            flap_ratio: 0.0,
             agl_ft: 0.0,
             vsi_fpm: 0.0,
             engine_running,
@@ -463,6 +595,55 @@ mod tests {
             fuel_kg: None,
             phase: Phase::Ground,
         }
+    }
+
+    #[test]
+    fn airspeed_bands_and_flare_and_ground_suppression() {
+        // Vs=48 clean → caution ≤57.6 (and >52.8), warning ≤52.8.
+        let caution = StallSpeed { id: "c", severity: Severity::Caution, vs_clean_kts: 48.0, at_or_below_factor: 1.20, above_factor: Some(1.10) };
+        let warn = StallSpeed { id: "w", severity: Severity::Warning, vs_clean_kts: 48.0, at_or_below_factor: 1.10, above_factor: None };
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        s.agl_ft = 500.0; // airborne, above the flare
+
+        s.ias_kts = 65.0; // normal approach — silent
+        assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
+        s.ias_kts = 55.0; // getting slow — caution only
+        assert!(caution.eval(&s).is_some() && warn.eval(&s).is_none());
+        s.ias_kts = 50.0; // near stall — warning only (bands disjoint)
+        assert!(warn.eval(&s).is_some() && caution.eval(&s).is_none());
+
+        // Rate term: a fast washout trips the caution while the speed is still
+        // well above the line. 67 kt is silent steady, but decaying at 3 kt/s it
+        // projects to 67 − 3×4.0 = 55 → caution.
+        s.ias_kts = 67.0;
+        s.ias_trend_kts_per_s = 0.0;
+        assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
+        s.ias_trend_kts_per_s = -3.0;
+        assert!(caution.eval(&s).is_some() && warn.eval(&s).is_none());
+        // Same 67 kt accelerating away (recovering) stays silent — projection
+        // only ever lowers the effective speed, never raises it.
+        s.ias_trend_kts_per_s = 3.0;
+        assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
+        s.ias_trend_kts_per_s = 0.0;
+
+        // Flaps lower the stall speed, so the same 55 kt is now safe and silent;
+        // the band only fires once you're slow *for that configuration*.
+        s.flap_ratio = 1.0; // full flaps → Vs ≈ 39.8, caution ≤47.8
+        s.ias_kts = 55.0;
+        assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
+        s.ias_kts = 46.0; // slow for full flaps — caution
+        assert!(caution.eval(&s).is_some() && warn.eval(&s).is_none());
+        s.flap_ratio = 0.0;
+
+        // Slow but in the flare → suppressed (slow-and-low is intended there).
+        s.ias_kts = 50.0;
+        s.agl_ft = 20.0;
+        assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
+        // On the ground → suppressed.
+        s.agl_ft = 500.0;
+        s.on_ground = true;
+        assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
     }
 
     /// The 172's fuel bands: caution ≤ 45 min, warning ≤ 30 min.
