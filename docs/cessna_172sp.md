@@ -16,29 +16,53 @@ tool, x-copilot writes the dataref, then **reads back the actual result**
 
 ---
 
-## Phase macros — one command, a whole checklist
+## Checklists — the copilot runs them with you
 
-Each runs the **settable** items of a phase in sequence. Judgment and visual
-items (flaps-as-required, the mag run-up, controls-free) stay with you.
+Say a checklist's name and the copilot **runs it like a pilot-monitoring**: it
+reads each item aloud, **does the ones it can** (each verified by the tool's
+readback), and **calls out the items that are yours** — the run-up, controls-free,
+oil pressure, "flaps as required" — without pretending it did them. Autonomous:
+no back-and-forth, it performs the whole list top to bottom.
 
-| Say | Does |
+```
+🗣️  "run the before takeoff checklist"
+🔊  Running the before takeoff checklist.
+🔊  Parking brake, set.            ← did it
+🔊  Mixture, rich.                 ← did it
+🔊  Mag check — your run-up...      ← yours, called out
+🔊  Strobe lights, on.             ← did it
+🔊  Flaps — as required, your call. ← yours
+🔊  before takeoff checklist complete.
+```
+
+The full set, transposed line-for-line from the standard 172 checklist:
+
+| Say | What the copilot does (it also calls out your items) |
 |---|---|
-| **"before starting engine"** | parking brake on · autopilot off · avionics off · fuel selector both |
-| **"start the engine"** / "ignition start" | battery · mixture rich · throttle cracked · mags both · **crank** (waits for catch, voltage-gated) · alternator + avionics on |
-| **"before taxi"** | transponder standby · taxi light on |
-| **"before takeoff"** / "configure for takeoff" | brake on · mixture rich · fuel both · strobe + landing lights on · autopilot off · trim takeoff |
-| **"normal takeoff"** | taxi light off · transponder altitude · mixture rich |
-| **"climb"** | landing light off · throttle full · mixture rich |
+| **"performance limits"** | speaks the V-speeds & key limits (reference, no actions) |
+| **"preflight"** | the cabin power-up/test/power-down: brake, ignition off, the avionics/battery/pitot/flaps test toggles, trim takeoff |
+| **"before starting engine"** | parking brake, autopilot off, avionics off, fuel both |
+| **"starting engine"** | battery, beacon, throttle, mixture, carb heat, fuel-pump prime, **cranks the engine**, alternator + avionics on, flaps up |
+| **"before taxi"** | transponder standby, taxi light on, parking brake set |
+| **"before takeoff"** / "configure for takeoff" | brake, mixture rich, fuel both, strobe + landing on, autopilot off, trim takeoff |
+| **"normal takeoff"** | taxi light off, transponder altitude, mixture rich |
+| **"climb"** | landing light off, throttle full, mixture rich |
 | **"cruise"** | mixture leaned |
-| **"descent"** | mixture rich · fuel both |
-| **"before landing"** / "configure for landing" | fuel both · mixture rich · landing + taxi lights on · autopilot off |
-| **"after landing"** / "clean up" | flaps up · landing/strobe/nav lights off · transponder standby |
-| **"shut down the engine"** | mixture cutoff · magnetos off |
-| **"secure the aircraft"** / "full shutdown" | brake on · engine off · all lights off · transponder/avionics/alternator/master off |
+| **"descent"** | mixture rich, fuel both |
+| **"before landing"** / "configure for landing" | fuel both, mixture rich, landing + taxi lights on, autopilot off |
+| **"normal landing"** | flaps up after rollout (the approach/touchdown/braking are yours) |
+| **"after landing"** / "clean up" | flaps up, landing/strobe/nav lights off, transponder standby |
+| **"secure the aircraft"** / "shutdown" | brake, transponder/avionics off, idle, **engine off**, all lights off, alternator + master off |
 
-A full flight by voice: *before starting engine → start the engine → before taxi
-→ before takeoff → normal takeoff → climb → cruise → descent → before landing →
-after landing → secure the aircraft.*
+A full flight by voice: *preflight → before starting engine → starting engine →
+before taxi → before takeoff → normal takeoff → climb → cruise → descent → before
+landing → normal landing → after landing → secure the aircraft.*
+
+> **Checklist vs single command.** A checklist *runs the whole phase*. A single
+> command (next section) does one thing fast. Note the pair: **"starting engine"**
+> runs the start *checklist*; **"start the engine"** just cranks. **"secure the
+> aircraft"** runs the shutdown *checklist*; **"shut down the engine"** just kills
+> the engine.
 
 ---
 

@@ -19,8 +19,9 @@ per call).
 
 - **Single commands** across every 172 system — flaps, autopilot, engine, fuel,
   electrics, lights, radios, transponder, instruments.
-- **Phase macros** — one command runs a whole checklist's settable items
-  ("configure for takeoff", "secure the aircraft").
+- **Checklists the copilot runs** — say "run the before-takeoff checklist" and it
+  reads each item aloud, does the ones it can, and calls out the ones that are
+  yours. The full 172 checklist set, preflight to shutdown.
 - **Compound commands** — "flaps ten and throttle seventy" runs both.
 - **Conversational context** — "throttle fifty percent" then "seventy percent";
   "switch it back to both".
@@ -60,8 +61,9 @@ is the built-in default.
 
 - **Continuous** (default): just speak commands.
 - **Push-to-talk**: `XCOPILOT_LISTEN=ptt` — Enter to start/stop recording.
-- **TUI text input**: in the dashboard, type a command on the bottom line and
-  press Enter (great for testing — no mic, no STT mishears). Esc / Ctrl-C quit.
+- **TUI text input**: in the dashboard, press **Enter** to open the command line,
+  type a command, Enter to run it (Esc leaves, `q` quits). Great for testing — no
+  mic, no STT mishears.
 
 ## Stack
 
