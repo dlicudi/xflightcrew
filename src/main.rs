@@ -203,7 +203,7 @@ async fn run_session(
     let mut listener = if continuous {
         // Share the speech arbiter's mic gate so the listener mutes itself while
         // the copilot speaks (readbacks and monitor alerts alike).
-        Some(Listener::start(config.vad_threshold, reporter.clone(), voice.mic_gate())?)
+        Some(Listener::start(config.vad_threshold, config.end_silence_ms, reporter.clone(), voice.mic_gate())?)
     } else {
         None
     };
@@ -266,11 +266,12 @@ async fn run_session(
             continue;
         }
 
-        // LLM picks a tool.
+        // LLM picks the tool(s). A compound command ("taxi and nav lights on")
+        // yields more than one call; they're executed in spoken order.
         reporter.status(ui::Phase::Thinking);
-        let mut call = match llm.choose_tool(&command, &specs).await {
-            Ok(Some(call)) => call,
-            Ok(None) => {
+        let calls = match llm.choose_tool(&command, &specs).await {
+            Ok(calls) if !calls.is_empty() => calls,
+            Ok(_) => {
                 if explicit {
                     say(&voice, &reporter, ui::LogKind::Warn, "Sorry, I didn't catch a command I can action.");
                 } else {
@@ -284,86 +285,91 @@ async fn run_session(
                 continue;
             }
         };
-        tracing::info!(tool = %call.name, args = %call.arguments, "tool selected");
-        reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
 
-        // `run_checklist` isn't a normal one-shot tool — it's an interactive,
-        // multi-item flow (read each item, speak it, listen for an affirm to fix
-        // failures), so it needs the loop's voice/listener/llm/registry, not the
-        // plain ToolCtx. Handle it here and skip the single-tool path.
-        if call.name == "run_checklist" {
-            let want = call.arguments.get("checklist").and_then(|v| v.as_str()).unwrap_or_default();
-            match checklist::find(&checklists, want) {
-                Some(list) => {
-                    run_checklist(list, &xplane, &llm, &registry, &mut listener, &stt, &voice, &reporter, &config).await
+        for mut call in calls {
+            tracing::info!(tool = %call.name, args = %call.arguments, "tool selected");
+            reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
+
+            // `run_checklist` isn't a normal one-shot tool — it's an interactive,
+            // multi-item flow (read each item, speak it, listen for an affirm to
+            // fix failures), so it needs the loop's voice/listener/llm/registry,
+            // not the plain ToolCtx. Handle it here and move to the next call.
+            if call.name == "run_checklist" {
+                let want = call.arguments.get("checklist").and_then(|v| v.as_str()).unwrap_or_default();
+                match checklist::find(&checklists, want) {
+                    Some(list) => {
+                        run_checklist(list, &xplane, &llm, &registry, &mut listener, &stt, &voice, &reporter, &config).await
+                    }
+                    None => say(&voice, &reporter, ui::LogKind::Warn, "I don't have that checklist."),
                 }
-                None => say(&voice, &reporter, ui::LogKind::Warn, "I don't have that checklist."),
+                continue;
             }
-            continue;
-        }
 
-        // Confirmation gate with in-line correction ("negative, 500").
-        let proceed = 'confirm: loop {
-            let Some(tool) = registry.get(&call.name) else {
-                tracing::warn!("LLM picked unknown tool: {}", call.name);
-                say(&voice, &reporter, ui::LogKind::Warn, "That command isn't wired up yet.");
-                break 'confirm false;
-            };
-            let intent = if config.confirm_critical {
-                tool.confirm_prompt(&call.arguments)
-            } else {
-                None
-            };
-            let Some(intent) = intent else { break 'confirm true };
+            // Confirmation gate with in-line correction ("negative, 500"). Applies
+            // per call, so each safety-critical action in a compound command is
+            // confirmed on its own.
+            let proceed = 'confirm: loop {
+                let Some(tool) = registry.get(&call.name) else {
+                    tracing::warn!("LLM picked unknown tool: {}", call.name);
+                    say(&voice, &reporter, ui::LogKind::Warn, "That command isn't wired up yet.");
+                    break 'confirm false;
+                };
+                let intent = if config.confirm_critical {
+                    tool.confirm_prompt(&call.arguments)
+                } else {
+                    None
+                };
+                let Some(intent) = intent else { break 'confirm true };
 
-            say(&voice, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
-            reporter.status(ui::Phase::Listening);
-            let Some(reply) = listen_once(&mut listener, &stt) else {
-                say(&voice, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
-                break 'confirm false;
-            };
-            if is_affirmative(&reply.text) {
-                reporter.log(ui::LogKind::Ok, format!("confirmed: \"{}\"", reply.text));
-                break 'confirm true;
-            }
-            match correction_text(&reply.text) {
-                Some(correction) => {
-                    reporter.log(ui::LogKind::Info, format!("correction: \"{correction}\""));
-                    reporter.status(ui::Phase::Thinking);
-                    match llm.choose_tool(&format!("{command}, {correction}"), &specs).await {
-                        Ok(Some(c)) => {
-                            call = c;
-                            reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
-                            continue 'confirm;
-                        }
-                        _ => {
-                            say(&voice, &reporter, ui::LogKind::Warn, "Cancelled.");
-                            break 'confirm false;
+                say(&voice, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
+                reporter.status(ui::Phase::Listening);
+                let Some(reply) = listen_once(&mut listener, &stt) else {
+                    say(&voice, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
+                    break 'confirm false;
+                };
+                if is_affirmative(&reply.text) {
+                    reporter.log(ui::LogKind::Ok, format!("confirmed: \"{}\"", reply.text));
+                    break 'confirm true;
+                }
+                match correction_text(&reply.text) {
+                    Some(correction) => {
+                        reporter.log(ui::LogKind::Info, format!("correction: \"{correction}\""));
+                        reporter.status(ui::Phase::Thinking);
+                        match llm.choose_tool(&format!("{command}, {correction}"), &specs).await {
+                            Ok(mut cs) if !cs.is_empty() => {
+                                call = cs.remove(0);
+                                reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
+                                continue 'confirm;
+                            }
+                            _ => {
+                                say(&voice, &reporter, ui::LogKind::Warn, "Cancelled.");
+                                break 'confirm false;
+                            }
                         }
                     }
+                    None => {
+                        say(&voice, &reporter, ui::LogKind::Warn, "Cancelled.");
+                        break 'confirm false;
+                    }
                 }
-                None => {
-                    say(&voice, &reporter, ui::LogKind::Warn, "Cancelled.");
-                    break 'confirm false;
-                }
+            };
+            if !proceed {
+                continue;
             }
-        };
-        if !proceed {
-            continue;
-        }
 
-        // Execute the curated tool (writes the dataref + reads back).
-        reporter.status(ui::Phase::Thinking);
-        let Some(tool) = registry.get(&call.name) else { continue };
-        let ctx = ToolCtx { xplane: &xplane, config: &config };
-        let readback = match tool.execute(&call.arguments, &ctx).await {
-            Ok(line) => line,
-            Err(e) => {
-                tracing::error!("tool {} failed: {e:#}", call.name);
-                "Something went wrong actioning that.".to_string()
-            }
-        };
-        say(&voice, &reporter, ui::LogKind::Readback, &readback);
+            // Execute the curated tool (writes the dataref + reads back).
+            reporter.status(ui::Phase::Thinking);
+            let Some(tool) = registry.get(&call.name) else { continue };
+            let ctx = ToolCtx { xplane: &xplane, config: &config };
+            let readback = match tool.execute(&call.arguments, &ctx).await {
+                Ok(line) => line,
+                Err(e) => {
+                    tracing::error!("tool {} failed: {e:#}", call.name);
+                    "Something went wrong actioning that.".to_string()
+                }
+            };
+            say(&voice, &reporter, ui::LogKind::Readback, &readback);
+        }
     }
 }
 
@@ -482,7 +488,8 @@ async fn fix_item(
     reporter: &Reporter,
 ) -> bool {
     reporter.status(ui::Phase::Thinking);
-    let Ok(Some(call)) = llm.choose_tool(cmd, specs).await else { return false };
+    let Ok(call) = llm.choose_tool(cmd, specs).await.map(|mut v| v.drain(..).next()) else { return false };
+    let Some(call) = call else { return false };
     let Some(tool) = registry.get(&call.name) else { return false };
     let ctx = ToolCtx { xplane, config };
     match tool.execute(&call.arguments, &ctx).await {

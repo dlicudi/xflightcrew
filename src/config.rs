@@ -33,6 +33,10 @@ pub struct Config {
     /// utterance. Below this, the copilot asks you to say it again instead of
     /// guessing. Raise to be stricter; lower if clear commands get rejected.
     pub stt_min_confidence: f32,
+    /// Trailing silence (ms) that ends an utterance in continuous mode. Lower
+    /// feels snappier but clips mid-command hesitations; raise it if a slight
+    /// pause cuts you off. Default 900.
+    pub end_silence_ms: u32,
     /// UI mode: `plain` (stdout, default) or `tui` (terminal dashboard).
     pub ui: String,
     /// TTS backend: `say` (macOS built-in, default) or `piper`.
@@ -75,6 +79,7 @@ impl Config {
             wake_word: env_or("XCOPILOT_WAKE_WORD", ""),
             vad_threshold: env_or("XCOPILOT_VAD_RMS", "0.012").parse().unwrap_or(0.012),
             stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.35").parse().unwrap_or(0.35),
+            end_silence_ms: env_or("XCOPILOT_END_SILENCE_MS", "900").parse().unwrap_or(900),
             ui: env_or("XCOPILOT_UI", "plain"),
             tts_backend: env_or("XCOPILOT_TTS", "say"),
             piper_binary: env_or("PIPER_BIN", "piper"),

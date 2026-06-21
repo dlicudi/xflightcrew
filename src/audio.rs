@@ -125,7 +125,7 @@ impl Listener {
     /// Start capturing, then calibrate the VAD to the room's noise floor so the
     /// speech threshold sits above ambient. `vad_floor` is a hard minimum (the
     /// configured `XCOPILOT_VAD_RMS`), so a quiet room can't drive it too low.
-    pub fn start(vad_floor: f32, reporter: Reporter, gate: MicGate) -> Result<Self> {
+    pub fn start(vad_floor: f32, end_silence_ms: u32, reporter: Reporter, gate: MicGate) -> Result<Self> {
         let input = open_input()?;
         input.stream.play().context("starting input stream")?;
 
@@ -152,7 +152,7 @@ impl Listener {
                 vad_floor,
                 VAD_RATIO,
                 ambient_peak, // seed the adaptive floor
-                END_SILENCE_MS,
+                end_silence_ms,
                 MIN_SPEECH_MS,
                 MAX_SPEECH_MS,
                 FRAME_MS,
@@ -226,8 +226,6 @@ impl Listener {
 
 /// Frame size fed to the segmenter.
 const FRAME_MS: u32 = 30;
-/// Trailing silence that ends an utterance.
-const END_SILENCE_MS: u32 = 700;
 /// Minimum voiced duration to count as a real utterance (rejects blips).
 const MIN_SPEECH_MS: u32 = 300;
 /// Hard cap on one utterance — a runaway guard so a too-low floor can't wedge

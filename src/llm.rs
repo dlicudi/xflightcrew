@@ -14,7 +14,9 @@ use crate::config::Config;
 use crate::tools::ToolSpec;
 
 const SYSTEM_PROMPT: &str = "You are the copilot of an aircraft. The pilot speaks \
-a short command. Choose exactly one tool that performs it, and pick the closest \
+a short command. Choose the tool(s) that perform it — one tool call per distinct \
+action, so a command naming two things ('taxi and nav lights on') makes two \
+calls. Pick the closest \
 matching value from the tool's schema for each argument (speech may be slightly \
 misheard — e.g. map 'beak' to 'beacon', 'probe'/'probe lights' to 'strobe', and \
 'blood lights'/'bloodlights' to the flood lights). Numbers may be spoken as words. \
@@ -103,21 +105,23 @@ impl Llm {
         &self,
         transcript: &str,
         tools: &[ToolSpec],
-    ) -> Result<Option<ToolCall>> {
+    ) -> Result<Vec<ToolCall>> {
         // Deterministic first pass.
-        if let Some(call) = self.choose_tool_at(transcript, tools, 0.0).await? {
-            return Ok(Some(call));
+        let calls = self.choose_tool_at(transcript, tools, 0.0).await?;
+        if !calls.is_empty() {
+            return Ok(calls);
         }
         // Declined — retry with escalating temperature, stopping at the first
         // concrete pick.
         for &temp in RETRY_TEMPS {
             tracing::debug!(temp, transcript = %transcript, "tool selection empty; retrying with temperature bump");
-            if let Some(call) = self.choose_tool_at(transcript, tools, temp).await? {
-                tracing::info!(temp, transcript = %transcript, tool = %call.name, "recovered tool on retry");
-                return Ok(Some(call));
+            let calls = self.choose_tool_at(transcript, tools, temp).await?;
+            if !calls.is_empty() {
+                tracing::info!(temp, transcript = %transcript, n = calls.len(), "recovered tool(s) on retry");
+                return Ok(calls);
             }
         }
-        Ok(None)
+        Ok(Vec::new())
     }
 
     /// One tool-selection request at a given sampling temperature. `temperature`
@@ -127,7 +131,7 @@ impl Llm {
         transcript: &str,
         tools: &[ToolSpec],
         temperature: f64,
-    ) -> Result<Option<ToolCall>> {
+    ) -> Result<Vec<ToolCall>> {
         let tool_specs: Vec<Value> = tools
             .iter()
             .map(|t| {
@@ -200,10 +204,15 @@ impl Llm {
             .await
             .context("decoding Ollama chat response")?;
 
-        Ok(resp.message.tool_calls.into_iter().next().map(|tc| ToolCall {
-            name: tc.function.name,
-            arguments: tc.function.arguments,
-        }))
+        Ok(resp
+            .message
+            .tool_calls
+            .into_iter()
+            .map(|tc| ToolCall {
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+            })
+            .collect())
     }
 }
 
@@ -227,6 +236,7 @@ mod tests {
             wake_word: "copilot".into(),
             vad_threshold: 0.012,
             stt_min_confidence: 0.5,
+            end_silence_ms: 900,
             ui: "plain".into(),
             tts_backend: "say".into(),
             piper_binary: String::new(),
@@ -309,7 +319,7 @@ mod tests {
         println!("\n  model: {}", cfg.model);
         let mut failures = 0;
         for (utterance, expected_tool, expected_arg) in cases {
-            match llm.choose_tool(utterance, &specs).await.expect("ollama call failed") {
+            match llm.choose_tool(utterance, &specs).await.expect("ollama call failed").into_iter().next() {
                 Some(call) => {
                     let tool_ok = call.name == *expected_tool;
                     let arg_ok = expected_arg
@@ -403,7 +413,7 @@ mod tests {
                 gate_skipped += 1;
                 continue;
             }
-            match llm.choose_tool(utterance, &specs).await.expect("ollama call failed") {
+            match llm.choose_tool(utterance, &specs).await.expect("ollama call failed").into_iter().next() {
                 Some(call) => {
                     let tool_ok = call.name == *expected_tool;
                     let arg_ok = expected_arg
@@ -432,7 +442,7 @@ mod tests {
                 gate_skipped += 1;
                 continue;
             }
-            match llm.choose_tool(utterance, &specs).await.expect("ollama call failed") {
+            match llm.choose_tool(utterance, &specs).await.expect("ollama call failed").into_iter().next() {
                 None => println!("  ✓ {utterance:?} -> (declined, correct)"),
                 Some(call) => {
                     println!("  ✗ {utterance:?} -> {} {} (should have declined)", call.name, call.arguments);
@@ -474,7 +484,7 @@ mod tests {
             for t in temps {
                 let mut hits = 0;
                 for _ in 0..TRIES {
-                    if let Some(c) = llm.choose_tool_at(phrase, &specs, t).await.expect("ollama") {
+                    if let Some(c) = llm.choose_tool_at(phrase, &specs, t).await.expect("ollama").into_iter().next() {
                         if c.name == want {
                             hits += 1;
                         }
@@ -521,6 +531,8 @@ mod tests {
                 .choose_tool(utterance, &specs)
                 .await
                 .expect("ollama call failed")
+                .into_iter()
+                .next()
                 .unwrap_or_else(|| panic!("no tool chosen for {utterance:?}"));
             let tool = registry
                 .get(&call.name)
