@@ -168,11 +168,15 @@ impl Registry {
             tools.push(Box::new(approach::PrepareIls));
         }
 
-        // Phase-config macro: a single command that fires a curated sequence of
-        // the deterministic takeoff items (like `start_engine` bundles the start).
-        // Needs the engine systems it sets; passes the profile's lights through.
+        // Phase-config macros: a single command that fires a curated sequence of
+        // a phase's deterministic items (like `start_engine` bundles the start).
+        // They compose the single-action tools, so they need the engine systems
+        // they set; the profile's lights (and flaps) are passed through.
         if profile.engine {
             tools.push(Box::new(macros::ConfigureForTakeoff::new(profile.lights.clone())));
+            tools.push(Box::new(macros::ConfigureForLanding::new(profile.lights.clone())));
+            tools.push(Box::new(macros::AfterLanding::new(profile.lights.clone(), profile.flaps.clone())));
+            tools.push(Box::new(macros::SecureAircraft::new(profile.lights.clone())));
         }
 
         // Future, gated the same way:

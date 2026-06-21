@@ -615,8 +615,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "ident", "barometer", "altimeter", "baro", "kollsman", "qnh", "vor",
     // instruments / misc controls
     "gyro", "pitot", "brake", "brakes", "parking", "heat",
-    // phase-config macros (configure_for_takeoff, …)
-    "takeoff", "configure", "config", "departure",
+    // phase-config macros (configure_for_takeoff/landing, after_landing, secure)
+    "takeoff", "configure", "config", "departure", "secure", "clean",
 ];
 
 /// True if the utterance plausibly is an aircraft command (contains at least one
@@ -789,6 +789,9 @@ mod tests {
             // Phase-config macro invocations must reach the LLM.
             "configure for takeoff", "set up for takeoff", "takeoff config",
             "get ready for takeoff", "prep for departure",
+            "configure for landing", "get ready for landing",
+            "after landing", "clean up", "clear of the runway",
+            "secure the aircraft", "secure", "full shutdown",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
         }
