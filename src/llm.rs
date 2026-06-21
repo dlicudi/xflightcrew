@@ -471,6 +471,83 @@ mod tests {
         assert_eq!(failures, 0, "{failures} noisy case(s) handled incorrectly");
     }
 
+    /// **Checklist-vocabulary battery.** The product model is "the pilot reads a
+    /// paper checklist aloud and x-copilot executes each line", so every
+    /// actionable item on a real Cessna 172 checklist must be a working command.
+    /// The common verbs (mixture/flaps/lights) are covered by the clean battery;
+    /// this targets the checklist-specific *vocabulary* that the tool
+    /// descriptions may not anticipate — "ignition", "master switch", "fuel
+    /// valve", "prime", "mixture idle cutoff", "wing flaps". A ✗ is a gap to fix
+    /// (missing tool/alias) or a misroute. Each line is also checked against the
+    /// domain gate so we catch words that never reach the LLM.
+    ///
+    /// Run: `cargo test llm_checklist_vocabulary -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "requires a local Ollama server with a tool-calling model"]
+    async fn llm_checklist_vocabulary() {
+        let cfg = test_config();
+        let llm = Llm::new(&cfg);
+        let profile = aircraft::builtin(&cfg.aircraft).unwrap();
+        let specs = Registry::for_aircraft(&profile).specs();
+
+        // Spoken exactly as a pilot reads the C172 checklist. expected_tool = ""
+        // marks an item we suspect has NO tool yet (a known gap to confirm).
+        let cases: &[(&str, &str, Option<(&str, Value)>)] = &[
+            // electrical: "master switch" = battery, "avionics switch"
+            ("master switch on", "set_electrical", Some(("system", json!("master")))),
+            ("master switch off", "set_electrical", Some(("system", json!("master")))),
+            ("avionics switch off", "set_electrical", Some(("system", json!("avionics")))),
+            ("alternator off", "set_electrical", Some(("system", json!("alternator")))),
+            // fuel: the checklist says "fuel valve" / "fuel shutoff valve", not "selector"
+            ("fuel valve both", "set_fuel_selector", Some(("position", json!("both")))),
+            ("fuel valve off", "set_fuel_selector", Some(("position", json!("off")))),
+            ("fuel shutoff valve both", "set_fuel_selector", Some(("position", json!("both")))),
+            // ignition switch positions
+            ("ignition start", "start_engine", None),
+            ("ignition off", "set_magnetos", Some(("position", json!("off")))),
+            ("ignition both", "set_magnetos", Some(("position", json!("both")))),
+            // engine config vocabulary
+            ("mixture idle cutoff", "set_mixture", None),
+            ("prime the engine", "", None),           // suspected gap: no primer tool
+            ("prime as required", "", None),           // suspected gap
+            ("throttle open one eighth", "set_throttle", None),
+            ("throttle seventeen hundred RPM", "set_throttle", None),
+            ("carb heat cold", "set_carb_heat", Some(("on", json!(false)))),
+            // "wing flaps" (the checklist's wording) not just "flaps"
+            ("wing flaps up", "set_flaps", Some(("notch", json!("up")))),
+            ("wing flaps zero", "set_flaps", Some(("notch", json!("up")))),
+            // other checklist phrasings
+            ("beacon light on", "set_lights", Some(("light", json!("beacon")))),
+            ("transponder on alt", "set_transponder_mode", Some(("mode", json!("altitude")))),
+            ("trim set for takeoff", "set_pitch_trim", Some(("action", json!("takeoff")))),
+            ("brakes test and set", "set_parking_brake", Some(("on", json!(true)))),
+        ];
+
+        println!("\n  model: {}  (checklist vocabulary)\n", cfg.model);
+        let mut gaps = 0;
+        for (utterance, expected_tool, expected_arg) in cases {
+            let gated = crate::looks_like_command(utterance);
+            let call = llm.choose_tool(utterance, &specs, &[]).await.expect("ollama").into_iter().next();
+            let got = call.as_ref().map(|c| format!("{} {}", c.name, c.arguments)).unwrap_or_else(|| "(no tool)".into());
+            let ok = match (expected_tool, &call) {
+                (&"", None) => true, // confirmed gap
+                (&"", Some(_)) => true, // bonus: something handled it
+                (_, Some(c)) => {
+                    c.name == *expected_tool
+                        && expected_arg.as_ref().map(|(k, v)| c.arguments.get(*k) == Some(v)).unwrap_or(true)
+                }
+                (_, None) => false,
+            };
+            let mark = if !gated { "⊘" } else if ok { "✓" } else { "✗" };
+            let note = if expected_tool.is_empty() { "  [suspected gap]" } else { "" };
+            println!("  {mark} {utterance:?} -> {got}{note}");
+            if !gated || !ok {
+                gaps += 1;
+            }
+        }
+        println!("\n  {gaps} item(s) need attention (gate-blocked, misrouted, or gaps).");
+    }
+
     /// Probe: for the raw STT phrasings that miss at temperature 0, how reliably
     /// does a temperature bump recover a tool call? Drives the choice of
     /// `RETRY_TEMPS`. Runs each (phrase, temp) several times and prints the

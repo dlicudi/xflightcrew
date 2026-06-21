@@ -39,6 +39,10 @@ const SYSTEMS: &[(&str, &str)] = &[
     ("battery", "battery"),
     ("alternator", "alternator"),
     ("avionics", "avionics master"),
+    // The 172's master switch is a split BAT/ALT rocker — battery + alternator
+    // together. It deliberately does NOT touch avionics (a separate switch), so
+    // "master" is its own system, not "all".
+    ("master", "master"),
 ];
 
 pub struct SetElectrical;
@@ -56,14 +60,15 @@ impl Tool for SetElectrical {
     }
 
     fn description(&self) -> &str {
-        "Turn an electrical system on or off: the battery master, the alternator, \
-         the avionics master, or 'all' for every electrical system at once. Use \
-         for 'battery on', 'alternator on', 'avionics off', 'switch on all \
-         electrical systems', 'all electrical off', 'electrics on', 'electrics \
-         off', 'master switch on', 'battery master on', 'generator on', \
-         'kill the avionics', 'power up the avionics'. 'electrics' or 'master' \
-         with no system named means 'all'. The alternator is also called the \
-         generator."
+        "Turn an electrical system on or off: the battery, the alternator, the \
+         avionics master, the 'master' switch (battery + alternator together — \
+         the split BAT/ALT rocker, which does NOT include avionics), or 'all' for \
+         every electrical system at once. Use for 'battery on', 'alternator on', \
+         'avionics off', 'master switch on', 'master switch off', 'master on', \
+         'switch on all electrical systems', 'all electrical off', 'electrics on', \
+         'electrics off', 'generator on', 'kill the avionics'. 'master switch' or \
+         'master' → system 'master'. 'electrics' or 'all electrical' with no \
+         system named → 'all'. The alternator is also called the generator."
     }
 
     fn parameters(&self) -> Value {
@@ -148,6 +153,18 @@ impl Tool for SetElectrical {
                     .run_command(if args.on { CMD_ALTERNATOR_ON } else { CMD_ALTERNATOR_OFF })
                     .await?;
                 ctx.xplane.get_float_array(GENERATOR).await?.first().copied().unwrap_or(0.0) > 0.5
+            }
+            "master" => {
+                // Split BAT/ALT rocker: battery and alternator together, no avionics.
+                ctx.xplane.run_command(if args.on { CMD_BATTERY_ON } else { CMD_BATTERY_OFF }).await?;
+                ctx.xplane.run_command(if args.on { CMD_ALTERNATOR_ON } else { CMD_ALTERNATOR_OFF }).await?;
+                let bat = ctx.xplane.get_float(BATTERY).await? > 0.5;
+                let alt = ctx.xplane.get_float_array(GENERATOR).await?.first().copied().unwrap_or(0.0) > 0.5;
+                return Ok(if bat == alt {
+                    format!("Roger, master {} — battery and alternator.", if bat { "on" } else { "off" })
+                } else {
+                    format!("Battery {}, alternator {}.", if bat { "on" } else { "off" }, if alt { "on" } else { "off" })
+                });
             }
             _ => unreachable!(),
         };
