@@ -14,6 +14,10 @@
 #
 # COND grammar: N (equals) | >N | <N | !N (not-equals) | LO|HI (inclusive range).
 #
+# sw_require:<dataref>:<COND>:<spoken note> is an x-copilot phase guard (not a
+# checklist step): if it fails when the checklist is run, the copilot speaks the
+# note as a heads-up ("the engine isn't running") and runs the list anyway.
+#
 sw_checklist:BEFORE STARTING ENGINE:BEFORE STARTING ENGINE
 sw_remark:BEFORE STARTING ENGINE
 sw_itemvoid:[PREFLIGHT INSPECTION]|[COMPLETED]
@@ -43,6 +47,7 @@ sw_remark:STARTING ENGINE COMPLETE
 #
 sw_checklist:BEFORE TAXI:BEFORE TAXI
 sw_remark:BEFORE TAXI
+sw_require:sim/flightmodel/engine/ENGN_running[0]:>0.5:the engine isn't running
 sw_item:FUEL QUANTITY|CHECKED
 sw_item:FLIGHT CONTROLS|FREE & CORRECT
 sw_item:FLIGHT INSTRUMENTS|SET
@@ -55,6 +60,7 @@ sw_remark:BEFORE TAXI COMPLETE
 #
 sw_checklist:BEFORE TAKEOFF:BEFORE TAKEOFF
 sw_remark:BEFORE TAKEOFF
+sw_require:sim/flightmodel/engine/ENGN_running[0]:>0.5:the engine isn't running
 sw_item:PARKING BRAKE|ON:sim/cockpit2/controls/parking_brake_ratio:>0.5
 sw_item:MIXTURE|FULL RICH:sim/cockpit2/engine/actuators/mixture_ratio_all:>0.9
 sw_item:FUEL SELECTOR|BOTH:sim/cockpit2/fuel/fuel_tank_selector:4
@@ -71,6 +77,7 @@ sw_remark:BEFORE TAKEOFF COMPLETE
 #
 sw_checklist:NORMAL TAKEOFF:NORMAL TAKEOFF
 sw_remark:NORMAL TAKEOFF
+sw_require:sim/flightmodel/engine/ENGN_running[0]:>0.5:the engine isn't running
 sw_item:TAXI LIGHT|OFF:sim/cockpit2/switches/taxi_light_on:0
 sw_item:TRANSPONDER|ALTITUDE:sim/cockpit2/radios/actuators/transponder_mode:3
 sw_item:MIXTURE|FULL RICH:sim/cockpit2/engine/actuators/mixture_ratio_all:>0.9
@@ -82,6 +89,7 @@ sw_remark:NORMAL TAKEOFF COMPLETE
 #
 sw_checklist:CLIMB:CLIMB
 sw_remark:CLIMB
+sw_require:sim/flightmodel/engine/ENGN_running[0]:>0.5:the engine isn't running
 sw_item:LANDING LIGHT|OFF:sim/cockpit2/switches/landing_lights_on:0
 sw_item:THROTTLE|FULL:sim/cockpit2/engine/actuators/throttle_ratio_all:>0.9
 sw_item:MIXTURE|FULL RICH:sim/cockpit2/engine/actuators/mixture_ratio_all:>0.9
@@ -90,6 +98,7 @@ sw_remark:CLIMB COMPLETE
 #
 sw_checklist:CRUISE:CRUISE
 sw_remark:CRUISE
+sw_require:sim/flightmodel/engine/ENGN_running[0]:>0.5:the engine isn't running
 sw_item:POWER|SET 2100-2500 RPM:sim/cockpit2/engine/actuators/throttle_ratio_all:<0.99
 sw_item:ELEVATOR TRIM|ADJUSTED
 sw_item:MIXTURE|LEAN:sim/cockpit2/engine/actuators/mixture_ratio_all:<0.95
@@ -100,6 +109,7 @@ sw_remark:CRUISE COMPLETE — REPEAT AS REQUIRED
 #
 sw_checklist:DESCENT:DESCENT
 sw_remark:DESCENT
+sw_require:sim/flightmodel/engine/ENGN_running[0]:>0.5:the engine isn't running
 sw_item:POWER|ADJUSTED
 sw_item:MIXTURE|FULL RICH:sim/cockpit2/engine/actuators/mixture_ratio_all:>0.9
 sw_item:ALTIMETER|SET
@@ -110,6 +120,7 @@ sw_remark:DESCENT COMPLETE
 #
 sw_checklist:BEFORE LANDING:BEFORE LANDING
 sw_remark:BEFORE LANDING
+sw_require:sim/flightmodel/engine/ENGN_running[0]:>0.5:the engine isn't running
 sw_item:FUEL SELECTOR|BOTH:sim/cockpit2/fuel/fuel_tank_selector:4
 sw_item:MIXTURE|FULL RICH:sim/cockpit2/engine/actuators/mixture_ratio_all:>0.9
 sw_item:CARB HEAT|AS REQUIRED
@@ -120,6 +131,7 @@ sw_remark:BEFORE LANDING COMPLETE
 #
 sw_checklist:NORMAL LANDING:NORMAL LANDING
 sw_remark:NORMAL LANDING
+sw_require:sim/flightmodel/engine/ENGN_running[0]:>0.5:the engine isn't running
 sw_remark:APPROACH FLAPS UP 65-75 KNOTS, FLAPS DOWN 60-70 KNOTS
 sw_item:FLAPS|AS REQUIRED
 sw_remark:TOUCHDOWN MAIN WHEELS FIRST — LOWER NOSE GENTLY

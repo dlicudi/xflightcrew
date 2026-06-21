@@ -385,6 +385,17 @@ async fn run_checklist(
     reporter: &Reporter,
     config: &Config,
 ) {
+    // Phase guard: a copilot notices when a checklist is being run out of
+    // sequence (e.g. before-takeoff with the engine off) and says so — but never
+    // blocks; the pilot is in command. Speak the heads-up, then run it anyway.
+    // A read error leaves the guard silent rather than false-alarming.
+    if let Some(pre) = &list.precondition {
+        let met = read_dataref(xplane, &pre.check).await.map(|v| pre.check.pred.eval(v)).unwrap_or(true);
+        if !met {
+            say(voice, reporter, ui::LogKind::Warn, &format!("Heads up — {}.", pre.note));
+        }
+    }
+
     say(voice, reporter, ui::LogKind::Info, &format!("Running the {} checklist.", list.title.to_lowercase()));
     // Tool-only specs for the fix path — excludes run_checklist itself so a
     // fix can never recurse back into another checklist.

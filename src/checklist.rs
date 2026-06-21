@@ -88,7 +88,19 @@ pub struct Checklist {
     pub id: String,
     /// Spoken title, e.g. "BEFORE TAKEOFF".
     pub title: String,
+    /// Optional phase guard (`sw_require`): a condition that should hold before
+    /// this checklist is appropriate, e.g. the engine running for BEFORE TAKEOFF.
+    /// It's *not* a checklist step — the runner speaks a heads-up if it fails but
+    /// runs the list anyway (the pilot is in command).
+    pub precondition: Option<Precondition>,
     pub items: Vec<Item>,
+}
+
+/// A checklist's phase guard: verify `check`, and if it fails, speak `note`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Precondition {
+    pub check: Check,
+    pub note: String,
 }
 
 /// One checklist line.
@@ -185,7 +197,19 @@ pub fn parse(text: &str) -> Vec<Checklist> {
             "sw_checklist" => {
                 // `<menu>:<title>` — the title is the spoken name.
                 let title = rest.rsplit(':').next().unwrap_or(rest).trim().to_string();
-                out.push(Checklist { id: slug(&title), title, items: Vec::new() });
+                out.push(Checklist {
+                    id: slug(&title),
+                    title,
+                    precondition: None,
+                    items: Vec::new(),
+                });
+            }
+            "sw_require" => {
+                if let Some(p) = parse_require(rest) {
+                    if let Some(cl) = out.last_mut() {
+                        cl.precondition = Some(p);
+                    }
+                }
             }
             "sw_item" => {
                 if let Some(item) = parse_item(rest, false) {
@@ -238,6 +262,17 @@ fn parse_item(rest: &str, info: bool) -> Option<Item> {
     };
 
     Some(Item { challenge, response, check, info: info || bracketed })
+}
+
+/// Parse a `sw_require:<dataref>:<cond>:<spoken note>` phase guard.
+fn parse_require(rest: &str) -> Option<Precondition> {
+    let mut it = rest.splitn(3, ':');
+    let dr = it.next()?.trim();
+    let cond = it.next()?;
+    let note = it.next().unwrap_or("").trim().to_string();
+    let pred = Pred::parse(cond)?;
+    let (dataref, index) = split_index(dr);
+    Some(Precondition { check: Check { dataref, index, pred }, note })
 }
 
 /// Split a trailing `[n]` array index off a dataref token.
@@ -353,6 +388,23 @@ mod tests {
         // half-parsed verify silently dropped to a confirm).
         let verifiable = cls.iter().flat_map(|c| &c.items).filter(|i| i.check.is_some()).count();
         assert!(verifiable > 30, "only {verifiable} verifiable items parsed");
+    }
+
+    #[test]
+    fn precondition_parses_and_is_not_an_item() {
+        let cl = &parse(
+            "sw_checklist:BEFORE TAKEOFF:BEFORE TAKEOFF\n\
+             sw_require:sim/flightmodel/engine/ENGN_running[0]:>0.5:the engine isn't running\n\
+             sw_item:FLAPS|UP:sim/cockpit2/controls/flap_ratio:<0.02",
+        )[0];
+        let pre = cl.precondition.as_ref().expect("precondition");
+        assert_eq!(pre.check.dataref, "sim/flightmodel/engine/ENGN_running");
+        assert_eq!(pre.check.index, Some(0));
+        assert_eq!(pre.check.pred, Pred::Gt(0.5));
+        assert_eq!(pre.note, "the engine isn't running");
+        // The guard is not a checklist step.
+        assert_eq!(cl.items.len(), 1);
+        assert_eq!(cl.items[0].challenge, "FLAPS");
     }
 
     #[test]
