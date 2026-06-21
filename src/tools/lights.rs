@@ -33,6 +33,28 @@ impl SetLights {
     fn keys(&self) -> Vec<&str> {
         self.lights.iter().map(|l| l.key.as_str()).collect()
     }
+
+    /// Resolve a (possibly misheard) light name to one of the profile's lights.
+    /// Exact key match first; if that fails, snap an out-of-enum value to the
+    /// nearest key within a tight edit distance. The adversarial battery showed
+    /// *every* tested model passes whisper mishearings straight through — e.g.
+    /// "strobe" → "probe"/"probes" — and the LLM can't be relied on to correct
+    /// them. The threshold is deliberately tight (≤2) and plurals are normalized
+    /// first, so genuine unknowns ("disco lights") still fall through to the
+    /// clarifying prompt rather than snapping to something arbitrary.
+    fn resolve_light(&self, input: &str) -> Option<&LightProfile> {
+        let want = input.trim().to_ascii_lowercase();
+        if let Some(l) = self.lights.iter().find(|l| l.key.eq_ignore_ascii_case(&want)) {
+            return Some(l);
+        }
+        let stripped = want.strip_suffix('s').unwrap_or(want.as_str());
+        self.lights
+            .iter()
+            .map(|l| (crate::levenshtein(stripped, &l.key.to_ascii_lowercase()), l))
+            .filter(|(d, _)| *d <= 2)
+            .min_by_key(|(d, _)| *d)
+            .map(|(_, l)| l)
+    }
 }
 
 #[async_trait]
@@ -69,11 +91,7 @@ impl Tool for SetLights {
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: Args = serde_json::from_value(args.clone())?;
 
-        let light = match self
-            .lights
-            .iter()
-            .find(|l| l.key.eq_ignore_ascii_case(&args.light))
-        {
+        let light = match self.resolve_light(&args.light) {
             Some(l) => l,
             None => {
                 // Don't hard-fail (e.g. whisper hears "beak" for "beacon") —
@@ -183,6 +201,34 @@ impl Tool for SetFloodLights {
             ));
         }
         Ok(format!("Roger, flood lights {}.", describe_level(pilot)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aircraft;
+
+    /// The `probe`→`strobe` miss the adversarial battery surfaced on every
+    /// model: confirm the tool snaps the real misheard values to `strobe`,
+    /// regardless of which model produced them, while leaving exact names alone
+    /// and refusing to snap a genuine unknown.
+    #[test]
+    fn snaps_misheard_light_names() {
+        let profile = aircraft::builtin("cessna_172sp").unwrap();
+        let tool = SetLights::new(profile.lights);
+        let key = |s: &str| tool.resolve_light(s).map(|l| l.key.clone());
+
+        // Values the benchmarked models actually emitted for "strobe lights".
+        assert_eq!(key("probe").as_deref(), Some("strobe"));
+        assert_eq!(key("probes").as_deref(), Some("strobe"));
+        // Plural of the real key should resolve too.
+        assert_eq!(key("strobes").as_deref(), Some("strobe"));
+        // Exact names are untouched.
+        assert_eq!(key("landing").as_deref(), Some("landing"));
+        assert_eq!(key("beacon").as_deref(), Some("beacon"));
+        // A genuine unknown stays unresolved (→ clarifying prompt, not a guess).
+        assert_eq!(key("disco"), None);
     }
 }
 

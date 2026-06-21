@@ -125,7 +125,7 @@ impl Listener {
     /// Start capturing, then calibrate the VAD to the room's noise floor so the
     /// speech threshold sits above ambient. `vad_floor` is a hard minimum (the
     /// configured `XCOPILOT_VAD_RMS`), so a quiet room can't drive it too low.
-    pub fn start(vad_floor: f32, reporter: Reporter, gate: MicGate) -> Result<Self> {
+    pub fn start(vad_floor: f32, end_silence_ms: u32, reporter: Reporter, gate: MicGate) -> Result<Self> {
         let input = open_input()?;
         input.stream.play().context("starting input stream")?;
 
@@ -152,7 +152,7 @@ impl Listener {
                 vad_floor,
                 VAD_RATIO,
                 ambient_peak, // seed the adaptive floor
-                END_SILENCE_MS,
+                end_silence_ms,
                 MIN_SPEECH_MS,
                 MAX_SPEECH_MS,
                 FRAME_MS,
@@ -166,7 +166,11 @@ impl Listener {
     /// mono 16 kHz f32. Audio captured before this call (e.g. while we were
     /// transcribing or speaking) is discarded, so the copilot never hears its
     /// own readback.
-    pub fn next_utterance(&mut self) -> Result<Vec<f32>> {
+    /// Capture one utterance. With `idle_timeout`, return an **empty** vec if no
+    /// speech has started within that window (and we're not mid-utterance) — so a
+    /// caller can poll another input source between waits without blocking the
+    /// mic forever. `None` blocks until an utterance completes (the old behavior).
+    pub fn next_utterance(&mut self, idle_timeout: Option<Duration>) -> Result<Vec<f32>> {
         self.input.buffer.lock().unwrap().clear();
         self.segmenter.reset();
 
@@ -174,6 +178,7 @@ impl Listener {
         let mut pending: Vec<f32> = Vec::new();
         // When the copilot last finished speaking — used for the post-speech tail.
         let mut spoke_until: Option<Instant> = None;
+        let start = Instant::now();
 
         loop {
             std::thread::sleep(Duration::from_millis(FRAME_MS as u64));
@@ -190,6 +195,14 @@ impl Listener {
                 pending.clear();
                 self.reporter.mic(0.0);
                 continue;
+            }
+
+            // Idle timeout: only bail when no utterance is in progress, so we
+            // never cut off mid-speech; return empty to signal "nothing yet".
+            if let Some(to) = idle_timeout {
+                if !self.segmenter.in_speech() && start.elapsed() >= to {
+                    return Ok(Vec::new());
+                }
             }
 
             let new = std::mem::take(&mut *self.input.buffer.lock().unwrap());
@@ -226,8 +239,6 @@ impl Listener {
 
 /// Frame size fed to the segmenter.
 const FRAME_MS: u32 = 30;
-/// Trailing silence that ends an utterance.
-const END_SILENCE_MS: u32 = 700;
 /// Minimum voiced duration to count as a real utterance (rejects blips).
 const MIN_SPEECH_MS: u32 = 300;
 /// Hard cap on one utterance — a runaway guard so a too-low floor can't wedge
@@ -283,6 +294,11 @@ impl Segmenter {
             silence_ms: 0,
             speech_ms: 0,
         }
+    }
+
+    /// Whether an utterance is currently being captured (voiced, not yet ended).
+    pub fn in_speech(&self) -> bool {
+        self.in_speech
     }
 
     /// Current speech threshold from the adaptive floor.

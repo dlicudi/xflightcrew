@@ -123,6 +123,8 @@ struct App {
     mic: f32,
     aircraft: Aircraft,
     commands: Vec<String>,
+    /// Typed-command line (you can type a command instead of speaking it).
+    input: String,
 }
 
 const MAX_LOG: usize = 500;
@@ -143,6 +145,7 @@ pub fn run_dashboard(
     title: String,
     commands: Vec<String>,
     rx: Receiver<Report>,
+    cmd_tx: Sender<String>,
 ) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
     let mut app = App {
@@ -152,6 +155,7 @@ pub fn run_dashboard(
         mic: 0.0,
         aircraft: Aircraft::default(),
         commands,
+        input: String::new(),
     };
 
     // Redraw only when something visibly changed, not on a fixed timer — a full
@@ -208,11 +212,35 @@ pub fn run_dashboard(
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
-                    let quit = matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
-                        || (k.code == KeyCode::Char('c')
-                            && k.modifiers.contains(event::KeyModifiers::CONTROL));
-                    if quit {
-                        break Ok(());
+                    let ctrl = k.modifiers.contains(event::KeyModifiers::CONTROL);
+                    match k.code {
+                        // Ctrl-C always quits; Esc quits when the input line is
+                        // empty, otherwise it clears what you've typed.
+                        KeyCode::Char('c') if ctrl => break Ok(()),
+                        KeyCode::Esc => {
+                            if app.input.is_empty() {
+                                break Ok(());
+                            }
+                            app.input.clear();
+                            dirty = true;
+                        }
+                        KeyCode::Enter => {
+                            let cmd = app.input.trim().to_string();
+                            app.input.clear();
+                            if !cmd.is_empty() {
+                                let _ = cmd_tx.send(cmd); // loop gone = quitting anyway
+                            }
+                            dirty = true;
+                        }
+                        KeyCode::Backspace => {
+                            app.input.pop();
+                            dirty = true;
+                        }
+                        KeyCode::Char(c) if !ctrl => {
+                            app.input.push(c);
+                            dirty = true;
+                        }
+                        _ => {}
                     }
                 }
                 Event::Resize(_, _) => dirty = true,
@@ -308,14 +336,17 @@ fn draw(f: &mut Frame, app: &App) {
         cmdarea,
     );
 
-    // --- hint ---
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            " q quit · speak to command",
+    // --- input line: type a command instead of speaking it ---
+    let input_line = Line::from(vec![
+        Span::styled(" › ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(app.input.as_str()),
+        Span::styled("▏", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            "   type a command · Enter send · Esc clear/quit · or just speak",
             Style::default().fg(Color::DarkGray),
-        )),
-        hint,
-    );
+        ),
+    ]);
+    f.render_widget(Paragraph::new(input_line), hint);
 }
 
 fn kv(k: &str, v: String) -> Line<'static> {

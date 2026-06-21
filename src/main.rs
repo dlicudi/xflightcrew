@@ -20,6 +20,8 @@ mod ui;
 mod voice;
 mod xplane;
 
+use std::time::{Duration, Instant};
+
 use anyhow::{anyhow, Result};
 
 use audio::Listener;
@@ -146,27 +148,41 @@ async fn main() -> Result<()> {
             });
         });
 
+        // Typed-command channel: the dashboard (main thread) sends commands the
+        // pilot types; the voice loop picks them up alongside spoken utterances.
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
         let reporter = Reporter::Tui(tx);
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             if let Err(e) = rt.block_on(run_session(
-                config, stt, llm, registry, voice, continuous, explicit, reporter,
+                config, stt, llm, registry, voice, continuous, explicit, reporter, Some(cmd_rx),
             )) {
                 tracing::error!("voice loop ended: {e:#}");
             }
         });
 
-        ui::run_dashboard(title, commands, rx)?; // blocks until the user quits
+        ui::run_dashboard(title, commands, rx, cmd_tx)?; // blocks until the user quits
         Ok(())
     } else {
         println!("\n  x-copilot — {} ({}). Ctrl-C to quit.\n", profile.display_name, config.listen_mode);
-        run_session(config, stt, llm, registry, voice, continuous, explicit, Reporter::Plain).await
+        run_session(config, stt, llm, registry, voice, continuous, explicit, Reporter::Plain, None).await
     }
 }
 
 /// The voice loop: listen → transcribe → pick a tool → confirm → execute → read
 /// back. Progress is emitted through `reporter` (plain stdout or the TUI), so
 /// the same code drives both UIs.
+/// Recent turns kept for back-reference resolution (see [`Llm::choose_tool`]).
+const HISTORY_MAX: usize = 3;
+/// Turns older than this are dropped from context — stale state shouldn't bleed
+/// into a new command.
+const HISTORY_TTL: Duration = Duration::from_secs(90);
+/// After a command, a window in which a continuation utterance ("switch it back",
+/// "a bit more") is accepted even without a hard aviation keyword — the LLM
+/// resolves it from history. Outside the window the strict keyword gate applies.
+const FOLLOWUP_WINDOW: Duration = Duration::from_secs(45);
+
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     config: Config,
     stt: Stt,
@@ -176,16 +192,24 @@ async fn run_session(
     continuous: bool,
     explicit: bool,
     reporter: Reporter,
+    typed: Option<std::sync::mpsc::Receiver<String>>,
 ) -> Result<()> {
     // Build the X-Plane client here, on whatever runtime this session runs on
     // (main for plain, the voice thread for TUI) — a reqwest client's I/O is
     // bound to the runtime it's used on.
     let xplane = XPlaneClient::new(config.xplane_base_url.clone());
     let specs = registry.specs();
+    // Rolling conversation memory: recent (command, readback, when) turns, used
+    // to resolve back-references and to gate conversational follow-ups.
+    let mut history: Vec<(String, String, Instant)> = Vec::new();
+    // Subject of the last successful named command ("throttle", "set heading"),
+    // used to re-anchor a bare-value follow-up ("sixty percent" → "throttle
+    // sixty percent") into an explicit command.
+    let mut last_subject: Option<String> = None;
     let mut listener = if continuous {
         // Share the speech arbiter's mic gate so the listener mutes itself while
         // the copilot speaks (readbacks and monitor alerts alike).
-        Some(Listener::start(config.vad_threshold, reporter.clone(), voice.mic_gate())?)
+        Some(Listener::start(config.vad_threshold, config.end_silence_ms, reporter.clone(), voice.mic_gate())?)
     } else {
         None
     };
@@ -203,56 +227,97 @@ async fn run_session(
 
     loop {
         reporter.status(ui::Phase::Listening);
-        let heard = match listen_once(&mut listener, &stt) {
-            Some(t) => t,
+        // Input is spoken (gated like before) or typed in the TUI. A typed
+        // command is deliberate, so it skips the confidence/wake/domain gates and
+        // goes straight to the model.
+        let (mut command, from_text) = match next_input(&mut listener, &stt, typed.as_ref()) {
             None => continue,
-        };
-        let transcript = heard.text;
-        let confidence = heard.confidence;
-        tracing::info!(transcript = %transcript, confidence, "heard utterance");
-        reporter.log(ui::LogKind::Heard, format!("\"{transcript}\" ({confidence:.2})"));
-
-        // Confidence gate.
-        if confidence < config.stt_min_confidence {
-            if explicit {
-                say(&voice, &reporter, ui::LogKind::Info, "Say again?");
-            } else {
-                reporter.log(ui::LogKind::Info, "low confidence, ignored");
+            Some(Input::Typed(text)) => {
+                tracing::info!(typed = %text, "typed command");
+                reporter.log(ui::LogKind::Heard, format!("⌨  \"{text}\""));
+                (text, true)
             }
-            continue;
-        }
+            Some(Input::Spoken(heard)) => {
+                let transcript = heard.text;
+                let confidence = heard.confidence;
+                tracing::info!(transcript = %transcript, confidence, "heard utterance");
+                reporter.log(ui::LogKind::Heard, format!("\"{transcript}\" ({confidence:.2})"));
 
-        // Wake-word gate (continuous only).
-        let command = if continuous {
-            match gate_wake_word(&transcript, &config.wake_word) {
-                Some(cmd) if !cmd.is_empty() => cmd,
-                _ => {
-                    reporter.log(ui::LogKind::Info, "ignored (no wake word)");
+                // Confidence gate.
+                if confidence < config.stt_min_confidence {
+                    if explicit {
+                        say(&voice, &reporter, ui::LogKind::Info, "Say again?");
+                    } else {
+                        reporter.log(ui::LogKind::Info, "low confidence, ignored");
+                    }
                     continue;
                 }
+
+                // Wake-word gate (continuous only).
+                let cmd = if continuous {
+                    match gate_wake_word(&transcript, &config.wake_word) {
+                        Some(cmd) if !cmd.is_empty() => cmd,
+                        _ => {
+                            reporter.log(ui::LogKind::Info, "ignored (no wake word)");
+                            continue;
+                        }
+                    }
+                } else {
+                    transcript.clone()
+                };
+                (cmd, false)
             }
-        } else {
-            transcript.clone()
         };
 
-        // Domain gate: high-confidence speech can still be phonetic nonsense
-        // ("Nautilapuku"), which the LLM tends to force-match to a tool. Require
-        // at least one aviation keyword before we act — and before we even ask
-        // the LLM.
-        if !looks_like_command(&command) {
-            if explicit {
-                say(&voice, &reporter, ui::LogKind::Warn, "Sorry, that didn't sound like a command.");
-            } else {
-                reporter.log(ui::LogKind::Info, format!("not a command: \"{command}\""));
+        // Domain gate, follow-up, and bare-value rewrite apply to SPOKEN input
+        // only — phonetic nonsense and STT follow-ups are voice problems. A typed
+        // command is taken as-is.
+        if !from_text && !looks_like_command(&command) {
+            // A conversational follow-up shortly after a command is let through
+            // even without a keyword. Outside the window, the strict gate holds.
+            let in_followup = history
+                .last()
+                .is_some_and(|(_, _, t)| t.elapsed() < FOLLOWUP_WINDOW);
+            if !(in_followup && looks_like_followup(&command)) {
+                if explicit {
+                    say(&voice, &reporter, ui::LogKind::Warn, "Sorry, that didn't sound like a command.");
+                } else {
+                    reporter.log(ui::LogKind::Info, format!("not a command: \"{command}\""));
+                }
+                continue;
             }
-            continue;
+            // Re-anchor a bare-value follow-up onto the last command's system, so
+            // the model gets an explicit command ("throttle sixty percent")
+            // instead of having to infer continuation from chat history — which
+            // it does unreliably once the same tool repeats.
+            if has_number(&command) {
+                if let Some(subj) = &last_subject {
+                    let rewritten = format!("{subj} {command}");
+                    reporter.log(ui::LogKind::Info, format!("follow-up → \"{rewritten}\""));
+                    command = rewritten;
+                }
+            }
         }
 
-        // LLM picks a tool.
+        // History is only useful for the non-numeric voice references the rewrite
+        // can't handle ("switch it back to both"); a typed or named command is
+        // self-contained, and stale repeated turns only confuse the model.
+        let ctx_history: Vec<(String, String)> = if from_text || looks_like_command(&command) {
+            Vec::new()
+        } else {
+            history
+                .iter()
+                .filter(|(_, _, t)| t.elapsed() < HISTORY_TTL)
+                .map(|(u, a, _)| (u.clone(), a.clone()))
+                .collect()
+        };
+
+        // LLM picks the tool(s). A compound command ("taxi and nav lights on")
+        // yields more than one call; they're executed in spoken order.
         reporter.status(ui::Phase::Thinking);
-        let mut call = match llm.choose_tool(&command, &specs).await {
-            Ok(Some(call)) => call,
-            Ok(None) => {
+        let calls = match llm.choose_tool(&command, &specs, &ctx_history).await {
+            Ok(calls) if !calls.is_empty() => calls,
+            Ok(_) => {
                 if explicit {
                     say(&voice, &reporter, ui::LogKind::Warn, "Sorry, I didn't catch a command I can action.");
                 } else {
@@ -266,71 +331,100 @@ async fn run_session(
                 continue;
             }
         };
-        tracing::info!(tool = %call.name, args = %call.arguments, "tool selected");
-        reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
 
-        // Confirmation gate with in-line correction ("negative, 500").
-        let proceed = 'confirm: loop {
-            let Some(tool) = registry.get(&call.name) else {
-                tracing::warn!("LLM picked unknown tool: {}", call.name);
-                say(&voice, &reporter, ui::LogKind::Warn, "That command isn't wired up yet.");
-                break 'confirm false;
-            };
-            let intent = if config.confirm_critical {
-                tool.confirm_prompt(&call.arguments)
-            } else {
-                None
-            };
-            let Some(intent) = intent else { break 'confirm true };
+        // Readbacks from this utterance's actions, recorded as the assistant
+        // turn afterwards so the next command can refer back to what was done.
+        let mut turn_readbacks: Vec<String> = Vec::new();
+        for mut call in calls {
+            tracing::info!(tool = %call.name, args = %call.arguments, "tool selected");
+            reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
 
-            say(&voice, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
-            reporter.status(ui::Phase::Listening);
-            let Some(reply) = listen_once(&mut listener, &stt) else {
-                say(&voice, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
-                break 'confirm false;
-            };
-            if is_affirmative(&reply.text) {
-                reporter.log(ui::LogKind::Ok, format!("confirmed: \"{}\"", reply.text));
-                break 'confirm true;
-            }
-            match correction_text(&reply.text) {
-                Some(correction) => {
-                    reporter.log(ui::LogKind::Info, format!("correction: \"{correction}\""));
-                    reporter.status(ui::Phase::Thinking);
-                    match llm.choose_tool(&format!("{command}, {correction}"), &specs).await {
-                        Ok(Some(c)) => {
-                            call = c;
-                            reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
-                            continue 'confirm;
-                        }
-                        _ => {
-                            say(&voice, &reporter, ui::LogKind::Warn, "Cancelled.");
-                            break 'confirm false;
+            // Confirmation gate with in-line correction ("negative, 500"). Applies
+            // per call, so each safety-critical action in a compound command is
+            // confirmed on its own.
+            let proceed = 'confirm: loop {
+                let Some(tool) = registry.get(&call.name) else {
+                    tracing::warn!("LLM picked unknown tool: {}", call.name);
+                    say(&voice, &reporter, ui::LogKind::Warn, "That command isn't wired up yet.");
+                    break 'confirm false;
+                };
+                let intent = if config.confirm_critical {
+                    tool.confirm_prompt(&call.arguments)
+                } else {
+                    None
+                };
+                let Some(intent) = intent else { break 'confirm true };
+
+                say(&voice, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
+                reporter.status(ui::Phase::Listening);
+                let Some(reply) = listen_once(&mut listener, &stt, None) else {
+                    say(&voice, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
+                    break 'confirm false;
+                };
+                if is_affirmative(&reply.text) {
+                    reporter.log(ui::LogKind::Ok, format!("confirmed: \"{}\"", reply.text));
+                    break 'confirm true;
+                }
+                match correction_text(&reply.text) {
+                    Some(correction) => {
+                        reporter.log(ui::LogKind::Info, format!("correction: \"{correction}\""));
+                        reporter.status(ui::Phase::Thinking);
+                        match llm.choose_tool(&format!("{command}, {correction}"), &specs, &ctx_history).await {
+                            Ok(mut cs) if !cs.is_empty() => {
+                                call = cs.remove(0);
+                                reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
+                                continue 'confirm;
+                            }
+                            _ => {
+                                say(&voice, &reporter, ui::LogKind::Warn, "Cancelled.");
+                                break 'confirm false;
+                            }
                         }
                     }
+                    None => {
+                        say(&voice, &reporter, ui::LogKind::Warn, "Cancelled.");
+                        break 'confirm false;
+                    }
                 }
-                None => {
-                    say(&voice, &reporter, ui::LogKind::Warn, "Cancelled.");
-                    break 'confirm false;
-                }
+            };
+            if !proceed {
+                continue;
             }
-        };
-        if !proceed {
-            continue;
+
+            // Execute the curated tool (writes the dataref + reads back).
+            reporter.status(ui::Phase::Thinking);
+            let Some(tool) = registry.get(&call.name) else { continue };
+            let ctx = ToolCtx { xplane: &xplane, config: &config };
+            let readback = match tool.execute(&call.arguments, &ctx).await {
+                Ok(line) => line,
+                Err(e) => {
+                    tracing::error!("tool {} failed: {e:#}", call.name);
+                    "Something went wrong actioning that.".to_string()
+                }
+            };
+            say(&voice, &reporter, ui::LogKind::Readback, &readback);
+            turn_readbacks.push(readback);
         }
 
-        // Execute the curated tool (writes the dataref + reads back).
-        reporter.status(ui::Phase::Thinking);
-        let Some(tool) = registry.get(&call.name) else { continue };
-        let ctx = ToolCtx { xplane: &xplane, config: &config };
-        let readback = match tool.execute(&call.arguments, &ctx).await {
-            Ok(line) => line,
-            Err(e) => {
-                tracing::error!("tool {} failed: {e:#}", call.name);
-                "Something went wrong actioning that.".to_string()
+        // Record this turn for back-reference context, then bound the history by
+        // count and age so stale state can't accumulate.
+        if !turn_readbacks.is_empty() {
+            // Anchor for the next bare-value follow-up: the subject of this
+            // command if it named a system (covers rewritten follow-ups too,
+            // which are explicit by now, so a chain 80 → 70 → 60 stays anchored).
+            if looks_like_command(&command) {
+                let subj = command_subject(&command);
+                if !subj.is_empty() {
+                    last_subject = Some(subj);
+                }
             }
-        };
-        say(&voice, &reporter, ui::LogKind::Readback, &readback);
+            history.push((command.clone(), turn_readbacks.join(" "), Instant::now()));
+            let excess = history.len().saturating_sub(HISTORY_MAX);
+            if excess > 0 {
+                history.drain(0..excess);
+            }
+            history.retain(|(_, _, t)| t.elapsed() < HISTORY_TTL);
+        }
     }
 }
 
@@ -376,7 +470,7 @@ fn collapse(s: &str) -> String {
 }
 
 /// Standard Levenshtein edit distance.
-fn levenshtein(a: &str, b: &str) -> usize {
+pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();
@@ -404,17 +498,48 @@ fn icao_to_profile(icao: &str) -> String {
 
 /// Capture one utterance (continuous VAD or push-to-talk) and transcribe it.
 /// Returns `None` on silence/noise or a capture error.
-fn listen_once(listener: &mut Option<Listener>, stt: &Stt) -> Option<stt::Transcription> {
+fn listen_once(listener: &mut Option<Listener>, stt: &Stt, idle_timeout: Option<Duration>) -> Option<stt::Transcription> {
     let audio = match listener {
-        Some(l) => l.next_utterance().ok()?,
+        Some(l) => l.next_utterance(idle_timeout).ok()?,
         None => audio::record_push_to_talk().ok()?,
     };
     if audio.is_empty() {
-        return None;
+        return None; // idle timeout (continuous) or empty capture
     }
     match stt.transcribe(&audio) {
         Ok(t) if !t.text.is_empty() => Some(t),
         _ => None,
+    }
+}
+
+/// One pilot input — spoken (transcribed) or typed in the TUI.
+enum Input {
+    Spoken(stt::Transcription),
+    Typed(String),
+}
+
+/// Block until the next input arrives from either source. With a `typed`
+/// channel, the mic listen times out periodically so we can poll for typed
+/// commands without one starving the other; without it, just listen.
+fn next_input(
+    listener: &mut Option<Listener>,
+    stt: &Stt,
+    typed: Option<&std::sync::mpsc::Receiver<String>>,
+) -> Option<Input> {
+    let Some(typed) = typed else {
+        return listen_once(listener, stt, None).map(Input::Spoken);
+    };
+    loop {
+        if let Ok(t) = typed.try_recv() {
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                return Some(Input::Typed(t));
+            }
+        }
+        if let Some(utt) = listen_once(listener, stt, Some(Duration::from_millis(150))) {
+            return Some(Input::Spoken(utt));
+        }
+        // Timed out idle (or a discarded blip) — loop to re-check the typed channel.
     }
 }
 
@@ -429,7 +554,7 @@ fn is_affirmative(reply: &str) -> bool {
     let r = reply.to_lowercase();
     const YES: &[&str] = &[
         "affirm", "affirmative", "confirm", "yes", "yeah", "yep", "roger", "correct",
-        "copy", "proceed", "go ahead", "do it", "right",
+        "copy", "proceed", "go ahead", "do it", "right", "indeed", "okay", "absolutely",
     ];
     if NEGATIONS.iter().any(|w| r.contains(w)) {
         return false;
@@ -516,12 +641,15 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "autopilot", "heading", "altitude", "climb", "descend", "maintain", "level",
     "vertical", "vs", "approach", "ils", "localizer", "glideslope", "obs",
     "course", "radial", "runway",
+    // vertical-nav synonyms whisper actually produced that the gate missed:
+    // "ascend 500" (for climb), "physical speed 500" (mishear of vertical speed).
+    "ascend", "ascent", "speed",
     // lights
     "light", "lights", "beacon", "strobe", "strobes", "taxi", "landing", "nav",
     "navigation", "flood", "floods",
     // engine / fuel
     "throttle", "thrust", "power", "idle", "mixture", "rich", "lean", "engine",
-    "engines", "start", "shutdown", "magneto", "magnetos", "mags", "carb",
+    "engines", "start", "ignition", "shutdown", "magneto", "magnetos", "mags", "carb",
     "carburetor", "fuel", "pump", "boost", "primer", "selector",
     // electrical
     "battery", "alternator", "generator", "avionics", "electrical", "electric",
@@ -531,6 +659,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "ident", "barometer", "altimeter", "baro", "kollsman", "qnh", "vor",
     // instruments / misc controls
     "gyro", "pitot", "brake", "brakes", "parking", "heat",
+    // phase-config macros (before/after each phase, configure, secure, …)
+    "takeoff", "configure", "config", "departure", "secure", "clean", "cruise",
 ];
 
 /// True if the utterance plausibly is an aircraft command (contains at least one
@@ -541,20 +671,93 @@ fn looks_like_command(text: &str) -> bool {
         .filter(|w| !w.is_empty())
         .any(|w| {
             let w = w.to_ascii_lowercase();
-            if COMMAND_KEYWORDS.contains(&w.as_str()) {
+            if matches_keyword(&w) {
                 return true;
             }
-            // Whisper routinely mangles a word by a single letter ("thrust" →
-            // "trust", "descend" → "descent"). Accept a one-edit near-miss of a
-            // keyword so it still reaches the LLM. True garbage shares no
-            // near-spelling with the domain and is still rejected. Restricted to
-            // 5+ char tokens/keywords so short common words don't match by luck.
-            w.len() >= 5
-                && COMMAND_KEYWORDS
-                    .iter()
-                    .filter(|k| k.len() >= 5)
-                    .any(|k| levenshtein(&w, k) <= 1)
+            // Whisper sometimes glues a spoken two-word compound into one token
+            // ("flood lights" → "floodlights", "landing light" → "landinglight"),
+            // which then matches no standalone keyword. Re-check the stem after
+            // dropping a trailing light/lights so the compound still reaches the
+            // LLM. The stem goes through the same fuzzy check, so the mishear
+            // "bloodlights" also passes (blood ~ flood, one edit).
+            if let Some(stem) = w.strip_suffix("lights").or_else(|| w.strip_suffix("light")) {
+                return !stem.is_empty() && matches_keyword(stem);
+            }
+            false
         })
+}
+
+/// True if an utterance looks like a *continuation* of the previous command, so
+/// it can clear the gate (within the follow-up window) without a domain keyword
+/// and let the LLM resolve it from history. Two shapes count:
+/// - back-references / adjustments ("it", "that", "again", "more", "the other one");
+/// - a bare quantity ("seventy percent", "60%", "two thousand") — almost always
+///   re-stating the value of the command just given ("throttle fifty" → "seventy").
+fn looks_like_followup(text: &str) -> bool {
+    const FOLLOWUP_WORDS: &[&str] = &[
+        "it", "that", "them", "those", "again", "back", "undo", "revert",
+        "reset", "more", "less", "instead", "also", "other", "same", "too",
+    ];
+    // A SHORT bare quantity is an adjustment to the last command ("sixty
+    // percent", "two thousand five hundred"). A long string of numbers ("one two
+    // three … ten") is counting/noise, not a follow-up — rewriting it into a
+    // command spawns a cascade of conflicting actions, so cap the length.
+    if has_number(text) && text.split_whitespace().count() <= 5 {
+        return true;
+    }
+    text.split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|w| !w.is_empty())
+        .any(|w| FOLLOWUP_WORDS.contains(&w.to_ascii_lowercase().as_str()))
+}
+
+/// Spoken or written numbers, for spotting a bare-value follow-up.
+const NUMBER_WORDS: &[&str] = &[
+    "percent", "zero", "one", "two", "three", "four", "five", "six", "seven",
+    "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+    "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+    "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+    "hundred", "thousand",
+];
+
+/// True if the utterance carries a digit or a spoken number.
+fn has_number(text: &str) -> bool {
+    text.chars().any(|c| c.is_ascii_digit())
+        || text
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .any(|w| NUMBER_WORDS.contains(&w.to_ascii_lowercase().as_str()))
+}
+
+/// The leading non-numeric words of a command — its "subject" — used to
+/// re-anchor a bare-value follow-up onto the same system. "throttle eighty
+/// percent" → "throttle"; "set heading 270" → "set heading". Empty if the
+/// command starts with a number.
+fn command_subject(cmd: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for w in cmd.split_whitespace() {
+        let bare = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if bare.chars().any(|c| c.is_ascii_digit())
+            || NUMBER_WORDS.contains(&bare.to_ascii_lowercase().as_str())
+        {
+            break;
+        }
+        out.push(w);
+    }
+    out.join(" ")
+}
+
+/// True if a single lowercased token is, or is a one-letter mishearing of, a
+/// command keyword. Whisper routinely mangles a word by a letter ("thrust" →
+/// "trust", "descend" → "descent"); the near-miss is restricted to 5+ char
+/// tokens/keywords so short common words don't match by luck.
+fn matches_keyword(w: &str) -> bool {
+    if COMMAND_KEYWORDS.contains(&w) {
+        return true;
+    }
+    w.len() >= 5
+        && COMMAND_KEYWORDS
+            .iter()
+            .filter(|k| k.len() >= 5)
+            .any(|k| levenshtein(w, k) <= 1)
 }
 
 fn command_hints() -> Vec<String> {
@@ -620,8 +823,62 @@ mod tests {
             // before reaching the LLM).
             "electrics off", "fix the gyro drift", "master switch on",
             "generator on", "squawk VFR",
+            // Verbatim whisper output from logs/ that the gate used to reject —
+            // recovered by the ignition/ascend/speed keywords.
+            "Ignition on.", "Ascend 500 feet per minute.", "Physical speed 500.",
+            // Whisper glued "flood lights" into one token; the compound and its
+            // "blood" mishearing must still reach the LLM.
+            "Floodlights on.", "Turn on the floodlights.", "Increase floodlights.",
+            "Bloodlights on.", "landinglight on",
+            // Phase-config macro invocations must reach the LLM.
+            "configure for takeoff", "set up for takeoff", "takeoff config",
+            "get ready for takeoff", "prep for departure",
+            "configure for landing", "get ready for landing",
+            "after landing", "clean up", "clear of the runway",
+            "secure the aircraft", "secure", "full shutdown",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
+        }
+    }
+
+    use super::looks_like_followup;
+
+    #[test]
+    fn followups_are_recognized_but_plain_chatter_is_not() {
+        for c in [
+            "switch it back to both", "do that again", "a bit more", "undo that",
+            "the other tank", "seventy percent", "60%", "two thousand",
+        ] {
+            assert!(looks_like_followup(c), "{c:?} should look like a follow-up");
+        }
+        for c in [
+            "nice weather today", "where are we", "hello copilot",
+            // A long counting string is noise, not a bare-value follow-up.
+            "one two three four five six seven eight ten",
+        ] {
+            assert!(!looks_like_followup(c), "{c:?} should not");
+        }
+    }
+
+    use super::{command_subject, has_number};
+
+    #[test]
+    fn bare_value_followups_re_anchor_to_the_last_subject() {
+        assert_eq!(command_subject("throttle eighty percent"), "throttle");
+        assert_eq!(command_subject("set heading 270"), "set heading");
+        assert_eq!(command_subject("flaps ten"), "flaps");
+        assert_eq!(command_subject("60 percent"), ""); // starts with a number
+        assert!(has_number("sixty percent") && has_number("60%") && has_number("two thousand"));
+        assert!(!has_number("switch it back to both"));
+        // The rewrite a bare follow-up would produce:
+        assert_eq!(format!("{} {}", command_subject("throttle eighty percent"), "sixty percent"), "throttle sixty percent");
+    }
+
+    #[test]
+    fn glued_light_compound_does_not_overmatch() {
+        // Stripping a light/lights suffix must not wave through non-cockpit words.
+        for g in ["moonlight", "highlight", "delight", "spotlight", "flashlight"] {
+            assert!(!looks_like_command(g), "{g:?} should still be rejected");
         }
     }
 

@@ -18,6 +18,7 @@ pub mod engine;
 pub mod flaps;
 pub mod instruments;
 pub mod lights;
+pub mod macros;
 pub mod radio;
 
 use anyhow::Result;
@@ -93,6 +94,7 @@ impl Registry {
             tools.push(Box::new(autopilot::SetHeading));
             tools.push(Box::new(autopilot::SetAltitude));
             tools.push(Box::new(autopilot::SetVerticalSpeed));
+            tools.push(Box::new(autopilot::LevelOff));
             tools.push(Box::new(autopilot::AutopilotOff));
         }
 
@@ -164,6 +166,16 @@ impl Registry {
 
         if profile.ils {
             tools.push(Box::new(approach::PrepareIls));
+        }
+
+        // Phase-config macros: the operational checklists transposed into
+        // one-command sequences (like `start_engine` bundles the STARTING ENGINE
+        // flow). Each composes the single-action tools, so they need the engine
+        // systems they set; lights and flaps come from the profile.
+        if profile.engine {
+            for mac in macros::phase_macros(profile.lights.clone(), profile.flaps.clone()) {
+                tools.push(mac);
+            }
         }
 
         // Future, gated the same way:
