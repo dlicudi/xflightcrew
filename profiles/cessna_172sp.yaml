@@ -48,7 +48,15 @@ flood_lights: true     # set_flood_lights (pilot + copilot cockpit floods)
 fuel_pump: true        # set_fuel_pump (electric/aux boost pump)
 magnetos: true         # set_magnetos (off/left/right/both — run-up mag check)
 carb_heat: true        # set_carb_heat (carb / alternate-air heat)
-fuel_selector: true    # set_fuel_selector (off/left/right/both)
+# set_fuel_selector — LEFT/BOTH/RIGHT (OFF is a separate shutoff valve, not a
+# selector position). Commands animate the 3D knob; the logical position dataref
+# confirms (1 left, 3 right, 4 both).
+fuel_selector:
+  readback: sim/cockpit2/fuel/fuel_tank_selector
+  positions:
+    - { key: left,  spoken: left,  command: sim/fuel/fuel_selector_lft, value: 1 }
+    - { key: both,  spoken: both,  command: sim/fuel/fuel_selector_all, value: 4 }
+    - { key: right, spoken: right, command: sim/fuel/fuel_selector_rgt, value: 3 }
 pitot_heat: true       # set_pitot_heat (anti-ice for the ASI)
 pitch_trim: true       # set_pitch_trim (nose up/down nudges, takeoff, neutral)
 nav_radio: true        # set_nav1 / set_obs (NAV1 frequency + OBS course)
@@ -79,9 +87,9 @@ checklist: checklists/cessna_172sp.txt
 checklist_map:
   - { match: parkbrake,                     action: parking_brake }
   - { match: autopilot/autopilot_on,        action: autopilot_off }
-  - { match: electrical/battery_on,         action: { electrical: battery } }
-  - { match: electrical/avionics_on,        action: { electrical: avionics } }
-  - { match: electrical/generator_on,       action: { electrical: alternator } }
+  - { match: electrical/battery_on,         action: !electrical battery }
+  - { match: electrical/avionics_on,        action: !electrical avionics }
+  - { match: electrical/generator_on,       action: !electrical alternator }
   - { match: pitot_heat_on,                 action: pitot_heat }
   - { match: fuel_pump_on,                  action: fuel_pump }
   - { match: transponder_mode,              action: transponder }
@@ -91,12 +99,12 @@ checklist_map:
   - { match: throttle_ratio,                action: throttle }
   - { match: ignition_key,                  action: ignition }
   - { match: elevator_trim,                 action: pitch_trim }
-  - { match: taxi_light,                    action: { light: taxi } }
-  - { match: landing_lights,                action: { light: landing } }
-  - { match: strobe_lights,                 action: { light: strobe } }
-  - { match: beacon_lights,                 action: { light: beacon } }
-  - { match: navigation_lights,             action: { light: nav } }
-  - { match: nav_lights,                    action: { light: nav } }
+  - { match: taxi_light,                    action: !light taxi }
+  - { match: landing_lights,                action: !light landing }
+  - { match: strobe_lights,                 action: !light strobe }
+  - { match: beacon_lights,                 action: !light beacon }
+  - { match: navigation_lights,             action: !light nav }
+  - { match: nav_lights,                    action: !light nav }
 
 # Flap detents, retracted → full. Vfe is the max IAS (kts) to extend to each.
 flaps:

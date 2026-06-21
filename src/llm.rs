@@ -544,9 +544,11 @@ mod tests {
             ("master switch off", "set_electrical", Some(("system", json!("master")))),
             ("avionics switch off", "set_electrical", Some(("system", json!("avionics")))),
             ("alternator off", "set_electrical", Some(("system", json!("alternator")))),
-            // fuel: the checklist says "fuel valve" / "fuel shutoff valve", not "selector"
+            // fuel: the checklist says "fuel valve" / "fuel shutoff valve", not "selector".
+            // The 172 selector is LEFT/BOTH/RIGHT only — "off" is the separate red
+            // fuel shutoff valve, not a selector position, so it has no tool (a gap).
             ("fuel valve both", "set_fuel_selector", Some(("position", json!("both")))),
-            ("fuel valve off", "set_fuel_selector", Some(("position", json!("off")))),
+            ("fuel valve off", "", None),
             ("fuel shutoff valve both", "set_fuel_selector", Some(("position", json!("both")))),
             // ignition switch positions
             ("ignition start", "start_engine", None),

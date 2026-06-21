@@ -116,8 +116,8 @@ impl Registry {
             tools.push(Box::new(engine::SetCarbHeat));
         }
 
-        if profile.fuel_selector {
-            tools.push(Box::new(engine::SetFuelSelector));
+        if let Some(fs) = &profile.fuel_selector {
+            tools.push(Box::new(engine::SetFuelSelector::new(fs.clone())));
         }
 
         if profile.parking_brake {

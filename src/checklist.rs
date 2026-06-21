@@ -28,7 +28,8 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::aircraft::{
-    AircraftProfile, ChecklistAction, ChecklistMapEntry, ElectricalSystem, FlapProfile, LightProfile,
+    AircraftProfile, ChecklistAction, ChecklistMapEntry, ElectricalSystem, FlapProfile,
+    FuelSelectorProfile, LightProfile,
 };
 use crate::tools::autopilot::AutopilotOff;
 use crate::tools::controls::{SetParkingBrake, SetPitchTrim};
@@ -138,6 +139,7 @@ pub struct Checklist {
     pub lights: Vec<LightProfile>,
     pub flaps: Option<FlapProfile>,
     pub electrical: Vec<ElectricalSystem>,
+    pub fuel_selector: Option<FuelSelectorProfile>,
 }
 
 impl Checklist {
@@ -166,6 +168,7 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
     let lights = profile.lights.clone();
     let flaps = profile.flaps.clone();
     let electrical = &profile.electrical;
+    let fuel_selector = &profile.fuel_selector;
     let map = &profile.checklist_map;
     let mut out: Vec<Checklist> = Vec::new();
     let mut cur: Option<Checklist> = None;
@@ -206,6 +209,7 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
                     lights: lights.clone(),
                     flaps: flaps.clone(),
                     electrical: electrical.clone(),
+                    fuel_selector: fuel_selector.clone(),
                 });
             }
             // Both narration directives: arm the run-up confirm when the file
@@ -390,6 +394,7 @@ pub async fn run_step(
     lights: &[LightProfile],
     flaps: &Option<FlapProfile>,
     electrical: &[ElectricalSystem],
+    fuel_selector: &Option<FuelSelectorProfile>,
     ctx: &ToolCtx<'_>,
 ) -> Result<String> {
     match tool {
@@ -398,7 +403,10 @@ pub async fn run_step(
         "set_electrical" => SetElectrical::new(electrical.to_vec()).execute(args, ctx).await,
         "set_mixture" => SetMixture.execute(args, ctx).await,
         "set_throttle" => SetThrottle.execute(args, ctx).await,
-        "set_fuel_selector" => SetFuelSelector.execute(args, ctx).await,
+        "set_fuel_selector" => match fuel_selector {
+            Some(f) => SetFuelSelector::new(f.clone()).execute(args, ctx).await,
+            None => bail!("no fuel selector on this airframe"),
+        },
         "set_magnetos" => SetMagnetos.execute(args, ctx).await,
         "set_pitot_heat" => SetPitotHeat.execute(args, ctx).await,
         "set_carb_heat" => SetCarbHeat.execute(args, ctx).await,

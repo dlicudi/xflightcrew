@@ -81,9 +81,10 @@ pub struct AircraftProfile {
     /// Carburetor / alternate-air heat (`set_carb_heat`).
     #[serde(default)]
     pub carb_heat: bool,
-    /// Fuel tank selector (`set_fuel_selector`): off/left/right/both.
+    /// Fuel tank selector (`set_fuel_selector`), per-airframe positions.
+    /// `None` → no selector tool.
     #[serde(default)]
-    pub fuel_selector: bool,
+    pub fuel_selector: Option<FuelSelectorProfile>,
     /// Pitot heat anti-ice (`set_pitot_heat`).
     #[serde(default)]
     pub pitot_heat: bool,
@@ -117,6 +118,38 @@ pub struct FuelProfile {
     /// endurance before takeoff (current idle burn would read as near-infinite),
     /// so "you're low for a flight" can fire while parked. The 172 burns ~24 kg/hr.
     pub cruise_burn_kg_hr: f64,
+}
+
+/// Fuel tank selector positions, per airframe — the tool's whole surface is
+/// config, because airframes differ: the 172 selector is LEFT/BOTH/RIGHT (OFF is
+/// a separate shutoff valve, not a selector position); the SR22 is OFF/LEFT/RIGHT
+/// with no "both". Each position fires a `command` (commands animate the 3D knob;
+/// a raw dataref write may not), then — when `readback` is set and the position
+/// carries a known `value` — the dataref is read to confirm; otherwise the
+/// command is trusted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuelSelectorProfile {
+    /// Dataref read after switching to confirm the position (an enum int).
+    /// `None` → trust the command (no confirmation read).
+    #[serde(default)]
+    pub readback: Option<String>,
+    /// Selectable positions, in the order offered to the LLM.
+    pub positions: Vec<FuelPosition>,
+}
+
+/// One fuel-selector position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuelPosition {
+    /// Token the LLM selects by and returns (e.g. `"left"`, `"both"`, `"off"`).
+    pub key: String,
+    /// Spoken form for the readback (e.g. `"left"`, `"both"`, `"off"`).
+    pub spoken: String,
+    /// Command that selects this position (preferred — animates the knob).
+    pub command: String,
+    /// Expected `readback` value for this position. `None` → can't confirm by
+    /// value, so the command is trusted.
+    #[serde(default)]
+    pub value: Option<f64>,
 }
 
 /// A flap system as an ordered list of detents, retracted → fully extended.
@@ -282,6 +315,24 @@ mod tests {
     }
 
     #[test]
+    fn yaml_profiles_parse_strictly() {
+        // load() falls back to the built-in on a parse error, which silently
+        // masks a malformed profile (a bad dataref, an un-tagged action enum, a
+        // bare `off` collapsing to YAML 1.1 boolean false). Deserialize each file
+        // directly so any such breakage fails loudly here instead of vanishing
+        // behind the fallback.
+        for id in ["cessna_172sp", "cirrus_sr22"] {
+            let text = std::fs::read_to_string(format!("profiles/{id}.yaml")).unwrap();
+            let p: AircraftProfile = serde_yaml::from_str(&text)
+                .unwrap_or_else(|e| panic!("{id}.yaml failed to parse: {e:#}"));
+            assert_eq!(p.id, id);
+            let fs = p.fuel_selector.expect("fuel selector present");
+            assert!(fs.positions.iter().all(|p| !p.key.is_empty() && !p.command.is_empty()));
+            assert!(!p.checklist_map.is_empty());
+        }
+    }
+
+    #[test]
     fn unknown_profile_is_none() {
         // No YAML, no built-in → None (caller surfaces a clear error).
         assert!(load("does_not_exist").is_none());
@@ -294,7 +345,12 @@ mod tests {
         // Universal-dataref tools on (incl. engine — throttle/mixture/start);
         // SR22-specific systems still off until their tools exist.
         assert!(p.autopilot && p.parking_brake && p.pitot_heat && p.transponder && p.engine);
-        assert!(!p.magnetos && !p.fuel_pump && !p.fuel_selector && !p.directional_gyro);
+        assert!(!p.magnetos && !p.fuel_pump && !p.directional_gyro);
+        // Fuel selector is wired (verified deck commands): OFF / LEFT / RIGHT,
+        // no "both".
+        let fsel = p.fuel_selector.as_ref().expect("SR22 has a fuel selector");
+        let pos: Vec<&str> = fsel.positions.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(pos, ["off", "left", "right"]);
         // Dual electrical: BAT1/BAT2/ALT1/ALT2 + the pair switches + avionics.
         let elec: Vec<&str> = p.electrical.iter().map(|e| e.key.as_str()).collect();
         for k in ["battery1", "battery2", "alternator1", "alternator2", "batteries", "alternators", "avionics"] {
@@ -315,9 +371,11 @@ mod tests {
         for (a, b) in yaml_map.iter().zip(builtin_map) {
             assert_eq!(a.match_, b.match_);
         }
-        // The SR22-specific systems (dual electrical, fuel) are NOT mapped to act
-        // yet — they need their own tools. (Mixture maps via ENGN_mixt, but
-        // set_mixture writes the universal mixture_ratio_all, so that's safe.)
+        // The fuel selector tool now exists, but the SR22's fuel *checklist*
+        // items aren't mapped to it yet (the condition→position decode is still
+        // 172-specific), and the dual electrical likewise isn't checklist-mapped.
+        // (Mixture maps via ENGN_mixt, but set_mixture writes the universal
+        // mixture_ratio_all, so that's safe.)
         for e in yaml_map {
             assert!(!e.match_.contains("battery") && !e.match_.contains("generator")
                 && !e.match_.contains("fuel_tank") && !e.match_.contains("boost"));
@@ -344,6 +402,12 @@ fn cessna_172sp() -> AircraftProfile {
             command_on: Some(cmd_on.into()),
             command_off: Some(cmd_off.into()),
         }
+    };
+    let fuel_pos = |key: &str, spoken: &str, command: &str, value: Option<f64>| FuelPosition {
+        key: key.into(),
+        spoken: spoken.into(),
+        command: command.into(),
+        value,
     };
     AircraftProfile {
         id: "cessna_172sp".into(),
@@ -386,7 +450,17 @@ fn cessna_172sp() -> AircraftProfile {
         fuel_pump: true,
         magnetos: true,
         carb_heat: true,
-        fuel_selector: true,
+        // The 172 selector is LEFT/BOTH/RIGHT (OFF is a separate shutoff valve,
+        // not a selector position). Commands animate the 3D knob; the logical
+        // position dataref confirms (1 left, 3 right, 4 both).
+        fuel_selector: Some(FuelSelectorProfile {
+            readback: Some("sim/cockpit2/fuel/fuel_tank_selector".into()),
+            positions: vec![
+                fuel_pos("left", "left", "sim/fuel/fuel_selector_lft", Some(1.0)),
+                fuel_pos("both", "both", "sim/fuel/fuel_selector_all", Some(4.0)),
+                fuel_pos("right", "right", "sim/fuel/fuel_selector_rgt", Some(3.0)),
+            ],
+        }),
         pitot_heat: true,
         pitch_trim: true,
         nav_radio: true,
@@ -469,6 +543,12 @@ fn cirrus_sr22() -> AircraftProfile {
         command_on: Some(cmd_on.into()),
         command_off: Some(cmd_off.into()),
     };
+    let fuel_pos = |key: &str, spoken: &str, command: &str, value: Option<f64>| FuelPosition {
+        key: key.into(),
+        spoken: spoken.into(),
+        command: command.into(),
+        value,
+    };
     AircraftProfile {
         id: "cirrus_sr22".into(),
         display_name: "Cirrus SR22".into(),
@@ -522,7 +602,19 @@ fn cirrus_sr22() -> AircraftProfile {
         magnetos: false,
         carb_heat: false, // fuel-injected — no carb heat
         fuel_pump: false,
-        fuel_selector: false,
+        // OFF / LEFT / RIGHT — no "both" (low-wing twin tanks, fed one at a
+        // time). laminar/sr22 selector commands verified against the rustdecks
+        // deck; the position dataref (laminar/sr22/fuel_selector_pos) exists but
+        // its integer mapping is unverified, so no readback confirm yet — the
+        // verified command is trusted.
+        fuel_selector: Some(FuelSelectorProfile {
+            readback: None,
+            positions: vec![
+                fuel_pos("off", "off", "laminar/sr22/fuel_sel_left_off", None),
+                fuel_pos("left", "left", "laminar/sr22/fuel_sel_left_select", None),
+                fuel_pos("right", "right", "laminar/sr22/fuel_sel_right_select", None),
+            ],
+        }),
         directional_gyro: false, // G1000 glass — no vacuum DG
         flood_lights: false,
         pitch_trim: false,

@@ -42,7 +42,16 @@ electrical:
 magnetos: false        # key-start ignition differs from the 172 mag switch
 carb_heat: false       # fuel-injected — no carb heat
 fuel_pump: false       # laminar/sr22/switch/boost_pump
-fuel_selector: false   # off / left / right (no "both")
+# Fuel selector: OFF / LEFT / RIGHT — no "both" (low-wing twin tanks, fed one at
+# a time). laminar/sr22 selector commands verified against the rustdecks deck;
+# the position dataref (laminar/sr22/fuel_selector_pos) exists but its integer
+# mapping is unverified, so no readback confirm yet — the verified command is
+# trusted. ("off" is quoted: bare off is YAML boolean false.)
+fuel_selector:
+  positions:
+    - { key: "off",  spoken: "off",  command: laminar/sr22/fuel_sel_left_off }
+    - { key: left,   spoken: left,   command: laminar/sr22/fuel_sel_left_select }
+    - { key: right,  spoken: right,  command: laminar/sr22/fuel_sel_right_select }
 directional_gyro: false # G1000 glass — no vacuum DG to sync
 flood_lights: false
 pitch_trim: false      # verify trim dataref + range first
@@ -72,7 +81,7 @@ checklist: checklists/cirrus_sr22.txt
 lights:
   - { key: nav,     spoken: nav lights,    dataref: sim/cockpit2/switches/navigation_lights_on,   command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
   - { key: strobe,  spoken: strobe lights, dataref: sim/cockpit2/switches/strobe_lights_on,        command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
-  - { key: landing, spoken: landing light, dataref: sim/cockpit2/switches/landing_lights_switch[0], command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+  - { key: landing, spoken: landing light, dataref: "sim/cockpit2/switches/landing_lights_switch[0]", command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
 
 # Checklist action map. Acts on universal-dataref systems; the SR22's own systems
 # (dual battery/alternator, boost pump, off/left/right fuel selector) still
@@ -85,7 +94,7 @@ checklist_map:
   - { match: throttle_ratio,   action: throttle }     # throttle_ratio_all (universal)
   - { match: ENGN_mixt,        action: mixture }      # set_mixture writes mixture_ratio_all
   - { match: flap_handle,      action: flaps }        # set_flaps writes flap_ratio
-  - { match: avionics_on,      action: { electrical: avionics } }  # batteries are compound → call-out
-  - { match: nav_lights,       action: { light: nav } }
-  - { match: strobe_lights,    action: { light: strobe } }
-  - { match: landing_lights,   action: { light: landing } }
+  - { match: avionics_on,      action: !electrical avionics }  # batteries are compound → call-out
+  - { match: nav_lights,       action: !light nav }
+  - { match: strobe_lights,    action: !light strobe }
+  - { match: landing_lights,   action: !light landing }

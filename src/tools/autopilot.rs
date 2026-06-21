@@ -19,8 +19,11 @@ use super::{Tool, ToolCtx};
 const HEADING_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
 /// Selected altitude, feet (writable).
 const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
-/// Selected vertical speed, feet per minute (writable).
-const VS_DIAL: &str = "sim/cockpit2/autopilot/vvi_dial_fpm";
+/// Selected vertical speed, feet per minute (writable). Use the classic
+/// `vertical_velocity` dial, not cockpit2's `vvi_dial_fpm`: on the SR22's
+/// G1000/Perspective AP the latter isn't the dataref the autopilot follows —
+/// verified against the rustdecks SR22 deck, which reads/writes VS here.
+const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 /// Servo engagement status (read-only; 1 = autopilot flying).
 const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";
 /// Command: engage the servos.
@@ -47,6 +50,12 @@ const CURRENT_ALT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot";
 const MIN_AP_ALTITUDE_FT: f64 = 500.0;
 /// Command: engage vertical-speed (VS) mode.
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
+/// Mode status datarefs (0 = off, >0 = armed/engaged). Read before pressing a
+/// mode command, because the `sim/autopilot/*` mode commands are TOGGLES: firing
+/// one while its mode is already active switches it back OFF.
+const HEADING_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
+const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
+const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
 /// Descents steeper than this (fpm) are confirmed — anything shallower, and all
 /// climbs, execute immediately. A 172 descends ~500–1000 fpm routinely.
 const VS_CONFIRM_DESCENT_FPM: f64 = -1500.0;
@@ -54,6 +63,22 @@ const VS_CONFIRM_DESCENT_FPM: f64 = -1500.0;
 /// Read the servo status as a bool ("is the autopilot actually flying").
 async fn servos_engaged(ctx: &ToolCtx<'_>) -> Result<bool> {
     Ok(ctx.xplane.get_float(SERVOS_ON).await? > 0.5)
+}
+
+/// Read a mode's 0/1-ish status dataref ("is this mode armed/engaged").
+async fn mode_engaged(ctx: &ToolCtx<'_>, status: &str) -> bool {
+    ctx.xplane.get_float(status).await.unwrap_or(0.0) > 0.5
+}
+
+/// Engage an autopilot mode *idempotently*. The `sim/autopilot/*` mode commands
+/// are toggles, so pressing one whose mode is already active turns it back OFF —
+/// which is why a second "set vertical speed" (or heading, or altitude) in a row
+/// would silently drop the mode. Check the status first; only press when off.
+async fn engage_mode(ctx: &ToolCtx<'_>, status: &str, command: &str) -> Result<()> {
+    if !mode_engaged(ctx, status).await {
+        ctx.xplane.run_command(command).await?;
+    }
+    Ok(())
 }
 
 pub struct SetHeading;
@@ -105,7 +130,7 @@ impl Tool for SetHeading {
         // engaging a mode can snap the dial to a current value, so the target
         // must be the final write or it gets clobbered.
         ctx.xplane.run_command(CMD_SERVOS_ON).await?;
-        ctx.xplane.run_command(CMD_HEADING_MODE).await?;
+        engage_mode(ctx, HEADING_STATUS, CMD_HEADING_MODE).await?;
         ctx.xplane.set_float(HEADING_BUG, heading).await?;
 
         // Confirm the actual state, not the intent.
@@ -179,7 +204,7 @@ impl Tool for SetAltitude {
 
         // Engage first, then set the target LAST (see set_heading note).
         ctx.xplane.run_command(CMD_SERVOS_ON).await?;
-        ctx.xplane.run_command(CMD_ALT_HOLD).await?;
+        engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
         ctx.xplane.set_float(ALT_DIAL, altitude).await?;
 
         let actual = ctx.xplane.get_float(ALT_DIAL).await?;
@@ -225,7 +250,7 @@ impl Tool for LevelOff {
 
         ctx.xplane.run_command(CMD_SERVOS_ON).await?;
         ctx.xplane.run_command(CMD_WING_LEVELER).await?;
-        ctx.xplane.run_command(CMD_ALT_HOLD).await?;
+        engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
         ctx.xplane.set_float(ALT_DIAL, target).await?;
 
         if servos_engaged(ctx).await? {
@@ -293,19 +318,23 @@ impl Tool for SetVerticalSpeed {
         // command an extreme dive/climb.
         let fpm = args.fpm.clamp(-2000.0, 2000.0);
 
-        // Engage VS mode FIRST — `sim/autopilot/vertical_speed` is "at current
-        // VSI", so it snaps the dial to the live climb rate. Writing our target
-        // LAST is what makes the aircraft fly the value we confirmed.
+        // Engage VS mode FIRST — when it engages, `sim/autopilot/vertical_speed`
+        // snaps the dial to the live climb rate, so writing our target LAST is
+        // what makes the aircraft fly the value we confirmed. The command is a
+        // toggle, so guard it: a repeat VS command must not switch the mode back
+        // off (which would leave the dial holding a value the AP isn't flying).
         ctx.xplane.run_command(CMD_SERVOS_ON).await?;
-        ctx.xplane.run_command(CMD_VS_MODE).await?;
+        engage_mode(ctx, VS_STATUS, CMD_VS_MODE).await?;
         ctx.xplane.set_float(VS_DIAL, fpm).await?;
 
+        // Confirm the actual state, not the intent: both that the servos are
+        // flying and that VS mode actually latched.
         let actual = ctx.xplane.get_float(VS_DIAL).await?;
         let phrase = describe_vs(actual);
-        if servos_engaged(ctx).await? {
-            Ok(format!("Roger — autopilot engaged, vertical speed mode, {phrase}."))
-        } else {
-            Ok(format!("{phrase} set, but the autopilot didn't engage — check the AP master."))
+        match (servos_engaged(ctx).await?, mode_engaged(ctx, VS_STATUS).await) {
+            (true, true) => Ok(format!("Roger — autopilot engaged, vertical speed mode, {phrase}.")),
+            (true, false) => Ok(format!("{phrase} dialed, but vertical speed mode didn't latch — check the AP.")),
+            (false, _) => Ok(format!("{phrase} set, but the autopilot didn't engage — check the AP master.")),
         }
     }
 }

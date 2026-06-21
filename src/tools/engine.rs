@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx};
+use crate::aircraft::FuelSelectorProfile;
 
 const THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 const MIXTURE: &str = "sim/cockpit2/engine/actuators/mixture_ratio_all";
@@ -34,13 +35,6 @@ const GENERATOR: &str = "sim/cockpit/electrical/generator_on"; // array; [0] = a
 const FUEL_PUMP: &str = "sim/cockpit2/engine/actuators/fuel_pump_on";
 const IGNITION_KEY: &str = "sim/cockpit2/engine/actuators/ignition_key"; // 0 off,1 R,2 L,3 both,4 start
 const CARB_HEAT: &str = "sim/cockpit2/engine/actuators/carb_heat_ratio"; // 0 cold .. 1 hot
-// Logical selector position (read-back): 1 left, 2 center, 3 right, 4 both/all.
-const FUEL_SELECTOR: &str = "sim/cockpit2/fuel/fuel_tank_selector";
-// The 172's selector knob is driven by these commands (a dataref write moves the
-// fuel logic but NOT the 3D knob — Laminar animates the knob from these).
-const CMD_FUEL_LEFT: &str = "sim/fuel/fuel_selector_lft";
-const CMD_FUEL_RIGHT: &str = "sim/fuel/fuel_selector_rgt";
-const CMD_FUEL_BOTH: &str = "sim/fuel/fuel_selector_all";
 
 #[derive(Deserialize)]
 struct PercentArg {
@@ -357,11 +351,25 @@ impl Tool for SetMagnetos {
     }
 }
 
-pub struct SetFuelSelector;
+/// The fuel tank selector, built from the airframe profile. The positions differ
+/// per airframe (the 172 is LEFT/BOTH/RIGHT; the SR22 is OFF/LEFT/RIGHT, no
+/// "both"), so the surface and wiring are config, not code: each position fires a
+/// command (commands animate the 3D knob; a raw write may not), then — when the
+/// profile gives a readback dataref and the position a known value — the dataref
+/// is read to confirm the actual position.
+pub struct SetFuelSelector {
+    profile: FuelSelectorProfile,
+}
+
+impl SetFuelSelector {
+    pub fn new(profile: FuelSelectorProfile) -> Self {
+        Self { profile }
+    }
+}
 
 #[derive(Deserialize)]
 struct FuelSelArgs {
-    /// Tank position: off, left, right, both.
+    /// Selector position token (one of the profile's `positions`).
     position: String,
 }
 
@@ -371,36 +379,56 @@ impl Tool for SetFuelSelector {
         "set_fuel_selector"
     }
     fn description(&self) -> &str {
-        // The 172's selector is LEFT/BOTH/RIGHT only; OFF is a separate fuel
-        // shutoff valve, not a selector position.
-        "Set the fuel tank selector: left, both, or right. Use for 'fuel selector \
-         both', 'fuel to left tank', 'select right tank', 'switch tanks', \
-         'change to the left tank', 'both tanks', 'feed from the right'."
+        // Static base; the available positions are listed in `parameters`.
+        "Set the fuel tank selector. Use for 'fuel selector both', 'fuel to left \
+         tank', 'select right tank', 'switch tanks', 'change to the left tank', \
+         'both tanks', 'feed from the right', 'fuel selector off'."
     }
     fn parameters(&self) -> Value {
+        let keys: Vec<&str> = self.profile.positions.iter().map(|p| p.key.as_str()).collect();
+        let listing: Vec<String> =
+            self.profile.positions.iter().map(|p| format!("{} ({})", p.key, p.spoken)).collect();
         json!({
             "type": "object",
             "properties": {
-                "position": {"type": "string", "enum": ["left", "both", "right"],
-                             "description": "Fuel tank selector position."}
+                "position": {"type": "string", "enum": keys,
+                             "description": format!("Fuel tank selector position. Available: {}.", listing.join(", "))}
             },
             "required": ["position"]
         })
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: FuelSelArgs = serde_json::from_value(args.clone())?;
-        let cmd = match a.position.to_ascii_lowercase().as_str() {
-            "left" => CMD_FUEL_LEFT,
-            "right" => CMD_FUEL_RIGHT,
-            "both" => CMD_FUEL_BOTH,
-            other => return Ok(format!("I didn't catch the fuel position '{other}'. Say left, both, or right.")),
+        let Some(pos) = self
+            .profile
+            .positions
+            .iter()
+            .find(|p| p.key.eq_ignore_ascii_case(&a.position))
+        else {
+            let names: Vec<&str> = self.profile.positions.iter().map(|p| p.spoken.as_str()).collect();
+            return Ok(format!(
+                "I didn't catch the fuel position '{}'. I have {}.",
+                a.position,
+                names.join(", ")
+            ));
         };
-        // Use the command so the cockpit knob moves with the fuel logic.
-        ctx.xplane.run_command(cmd).await?;
-        // Confirm via the logical position: 1 left, 3 right, 4 both.
-        let actual = ctx.xplane.get_float(FUEL_SELECTOR).await?.round() as i64;
-        let name = match actual { 1 => "left", 3 => "right", 4 => "both", 2 => "center", _ => "set" };
-        Ok(format!("Roger, fuel selector {name}."))
+        // Command so the cockpit knob moves with the fuel logic.
+        ctx.xplane.run_command(&pos.command).await?;
+        // Confirm from the readback dataref when the position carries a known
+        // value; otherwise trust the command.
+        if let Some(dref) = &self.profile.readback {
+            if let Ok(actual) = ctx.xplane.get_float(dref).await {
+                if let Some(hit) = self
+                    .profile
+                    .positions
+                    .iter()
+                    .find(|p| p.value.is_some_and(|v| (v - actual).abs() < 0.5))
+                {
+                    return Ok(format!("Roger, fuel selector {}.", hit.spoken));
+                }
+            }
+        }
+        Ok(format!("Roger, fuel selector {}.", pos.spoken))
     }
 }
 
