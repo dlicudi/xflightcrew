@@ -791,18 +791,34 @@ fn looks_like_command(text: &str) -> bool {
         })
 }
 
-/// True if an utterance looks like a *continuation* of the previous command —
-/// back-references ("it", "that", "the other one") or "again/undo/more"-style
-/// words — so a follow-up can clear the gate (within the follow-up window) even
-/// without a domain keyword, and the LLM resolves it from history.
+/// True if an utterance looks like a *continuation* of the previous command, so
+/// it can clear the gate (within the follow-up window) without a domain keyword
+/// and let the LLM resolve it from history. Two shapes count:
+/// - back-references / adjustments ("it", "that", "again", "more", "the other one");
+/// - a bare quantity ("seventy percent", "60%", "two thousand") — almost always
+///   re-stating the value of the command just given ("throttle fifty" → "seventy").
 fn looks_like_followup(text: &str) -> bool {
     const FOLLOWUP_WORDS: &[&str] = &[
         "it", "that", "them", "those", "again", "back", "undo", "revert",
         "reset", "more", "less", "instead", "also", "other", "same", "too",
     ];
+    const NUMBER_WORDS: &[&str] = &[
+        "percent", "zero", "one", "two", "three", "four", "five", "six", "seven",
+        "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+        "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+        "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+        "hundred", "thousand",
+    ];
+    // A spoken or written number on its own is an adjustment to the last command.
+    if text.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
     text.split(|c: char| !c.is_ascii_alphabetic())
         .filter(|w| !w.is_empty())
-        .any(|w| FOLLOWUP_WORDS.contains(&w.to_ascii_lowercase().as_str()))
+        .any(|w| {
+            let w = w.to_ascii_lowercase();
+            FOLLOWUP_WORDS.contains(&w.as_str()) || NUMBER_WORDS.contains(&w.as_str())
+        })
 }
 
 /// True if a single lowercased token is, or is a one-letter mishearing of, a
@@ -902,7 +918,10 @@ mod tests {
 
     #[test]
     fn followups_are_recognized_but_plain_chatter_is_not() {
-        for c in ["switch it back to both", "do that again", "a bit more", "undo that", "the other tank"] {
+        for c in [
+            "switch it back to both", "do that again", "a bit more", "undo that",
+            "the other tank", "seventy percent", "60%", "two thousand",
+        ] {
             assert!(looks_like_followup(c), "{c:?} should look like a follow-up");
         }
         for c in ["nice weather today", "where are we", "hello copilot"] {
