@@ -119,7 +119,9 @@ pub enum Item {
     /// The pilot's item — spoken so they know it's theirs, not performed.
     CallOut(String),
     /// A system we own: perform it via a curated tool (which reads back).
-    Act { say: String, tool: &'static str, args: Value },
+    /// `confirm` is `Some(hazard)` for destructive steps (engine start/stop, the
+    /// run-up) — the runner asks "Confirm, {hazard}?" and skips on a no.
+    Act { say: String, tool: &'static str, args: Value, confirm: Option<&'static str> },
     /// A dataref we don't actuate but can read: confirm or flag it.
     Verify { say: String, dataref: String, index: Option<usize>, cond: Cond },
 }
@@ -157,6 +159,9 @@ pub fn load(path: &str, lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -
 pub fn parse(text: &str, lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<Checklist> {
     let mut out: Vec<Checklist> = Vec::new();
     let mut cur: Option<Checklist> = None;
+    // The "MAGNETO TEST" remark arms a one-time confirm on the next actioned
+    // step (the throttle-up that starts the run-up).
+    let mut arm_runup = false;
 
     let finish = |out: &mut Vec<Checklist>, cur: &mut Option<Checklist>| {
         if let Some(c) = cur.take() {
@@ -175,6 +180,7 @@ pub fn parse(text: &str, lights: Vec<LightProfile>, flaps: Option<FlapProfile>) 
         match dir {
             "sw_checklist" => {
                 finish(&mut out, &mut cur);
+                arm_runup = false; // don't let an arm leak across sections
                 // `MENU:TITLE` — the title is what we name and speak.
                 let title = rest.split_once(':').map(|(_, t)| t).unwrap_or(rest).trim();
                 cur = Some(Checklist {
@@ -188,6 +194,9 @@ pub fn parse(text: &str, lights: Vec<LightProfile>, flaps: Option<FlapProfile>) 
             }
             "sw_remark" => {
                 if let Some(c) = cur.as_mut() {
+                    if rest.to_lowercase().contains("magneto") {
+                        arm_runup = true;
+                    }
                     if let Some(text) = clean_narration(rest) {
                         c.items.push(Item::Narrate(text));
                     }
@@ -204,7 +213,16 @@ pub fn parse(text: &str, lights: Vec<LightProfile>, flaps: Option<FlapProfile>) 
             }
             "sw_item" => {
                 if let Some(c) = cur.as_mut() {
-                    c.items.push(parse_item(rest));
+                    let mut item = parse_item(rest);
+                    // Arm the run-up confirm on the first actioned step after the
+                    // magneto-test remark (the throttle-up).
+                    if arm_runup {
+                        if let Item::Act { confirm, .. } = &mut item {
+                            *confirm = Some("run the mag check and advance the throttle");
+                            arm_runup = false;
+                        }
+                    }
+                    c.items.push(item);
                 }
             }
             // Display-only directives (column width, etc.) — ignored.
@@ -237,8 +255,26 @@ fn parse_item(rest: &str) -> Item {
     let (base, index) = split_index(dataref);
 
     match action_for(&base, &cond) {
-        Some((tool, args)) => Item::Act { say, tool, args },
+        Some((tool, args)) => {
+            let confirm = confirm_for(tool, &args);
+            Item::Act { say, tool, args, confirm }
+        }
         None => Item::Verify { say, dataref: base, index, cond },
+    }
+}
+
+/// Steps the runner should confirm before performing — the engine-state changes.
+/// Cranking (`start_engine`), an explicit stop, and mixture-to-cutoff (which kills
+/// a running engine) are the destructive ones. The run-up is armed separately
+/// (it's a throttle-up, not a distinct tool).
+fn confirm_for(tool: &str, args: &Value) -> Option<&'static str> {
+    match tool {
+        "start_engine" => Some("start the engine"),
+        "stop_engine" => Some("shut the engine down"),
+        "set_mixture" if args.get("percent").and_then(Value::as_i64) == Some(0) => {
+            Some("cut the mixture and stop the engine")
+        }
+        _ => None,
     }
 }
 
@@ -477,10 +513,11 @@ mod tests {
         // Parking brake ON → set_parking_brake(on).
         let it = parse_item("PARKING BRAKE|ON:sim/flightmodel/controls/parkbrake:1");
         match it {
-            Item::Act { say, tool, args } => {
+            Item::Act { say, tool, args, confirm } => {
                 assert_eq!(tool, "set_parking_brake");
                 assert_eq!(args, json!({ "on": true }));
                 assert_eq!(say, "Parking brake, on.");
+                assert!(confirm.is_none()); // not a destructive step
             }
             _ => panic!("expected Act"),
         }
@@ -529,5 +566,29 @@ mod tests {
         // The before-takeoff list actuates the parking brake (first real item).
         let bt = cls.iter().find(|c| c.id == "before_takeoff").unwrap();
         assert!(bt.items.iter().any(|i| matches!(i, Item::Act { tool, .. } if *tool == "set_parking_brake")));
+    }
+
+    #[test]
+    fn destructive_steps_are_gated() {
+        let text = std::fs::read_to_string("checklists/cessna_172sp.txt").unwrap();
+        let cls = parse(&text, vec![], None);
+
+        // Engine start carries a confirm.
+        let start = cls.iter().find(|c| c.id == "starting_engine").unwrap();
+        assert!(start.items.iter().any(|i| matches!(i, Item::Act { tool, confirm, .. } if *tool == "start_engine" && confirm.is_some())));
+
+        // Engine shutdown kills the engine via mixture cutoff — that step is gated.
+        let shut = cls.iter().find(|c| c.id == "engine_shutdown").unwrap();
+        assert!(shut.items.iter().any(|i| matches!(i, Item::Act { tool, args, confirm, .. }
+            if *tool == "set_mixture" && args["percent"] == 0 && confirm.is_some())));
+
+        // The run-up is armed by the MAGNETO TEST remark: exactly one step in
+        // before-takeoff confirms (the throttle-up), and it's a throttle step.
+        let bt = cls.iter().find(|c| c.id == "before_takeoff").unwrap();
+        let gated: Vec<&str> = bt.items.iter().filter_map(|i| match i {
+            Item::Act { tool, confirm: Some(_), .. } => Some(*tool),
+            _ => None,
+        }).collect();
+        assert_eq!(gated, vec!["set_throttle"]);
     }
 }
