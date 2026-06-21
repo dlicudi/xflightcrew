@@ -9,7 +9,6 @@
 
 mod aircraft;
 mod audio;
-mod checklist;
 mod config;
 mod llm;
 mod monitor;
@@ -103,17 +102,6 @@ async fn main() -> Result<()> {
     let llm = Llm::new(&config);
     let registry = Registry::for_aircraft(&profile);
 
-    // Checklists are optional and per-airframe: load `checklists/<id>.txt`
-    // (XChecklist format), overridable via XCOPILOT_CHECKLISTS. A missing file
-    // simply disables the `run_checklist` tool.
-    let checklists = checklist::load(
-        &std::env::var("XCOPILOT_CHECKLISTS")
-            .unwrap_or_else(|_| format!("checklists/{aircraft_id}.txt")),
-    );
-    if !checklists.is_empty() {
-        tracing::info!(count = checklists.len(), "checklists loaded");
-    }
-
     let continuous = config.listen_mode == "continuous";
     // "Explicit" = the user clearly addressed the copilot (push-to-talk, or a
     // wake word that matched). When not explicit, a non-command is ignored
@@ -164,7 +152,7 @@ async fn main() -> Result<()> {
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             if let Err(e) = rt.block_on(run_session(
-                config, stt, llm, registry, checklists, voice, continuous, explicit, reporter,
+                config, stt, llm, registry, voice, continuous, explicit, reporter,
             )) {
                 tracing::error!("voice loop ended: {e:#}");
             }
@@ -174,7 +162,7 @@ async fn main() -> Result<()> {
         Ok(())
     } else {
         println!("\n  x-copilot — {} ({}). Ctrl-C to quit.\n", profile.display_name, config.listen_mode);
-        run_session(config, stt, llm, registry, checklists, voice, continuous, explicit, Reporter::Plain).await
+        run_session(config, stt, llm, registry, voice, continuous, explicit, Reporter::Plain).await
     }
 }
 
@@ -197,7 +185,6 @@ async fn run_session(
     stt: Stt,
     llm: Llm,
     registry: Registry,
-    checklists: Vec<checklist::Checklist>,
     voice: Voice,
     continuous: bool,
     explicit: bool,
@@ -207,11 +194,7 @@ async fn run_session(
     // (main for plain, the voice thread for TUI) — a reqwest client's I/O is
     // bound to the runtime it's used on.
     let xplane = XPlaneClient::new(config.xplane_base_url.clone());
-    let mut specs = registry.specs();
-    // Expose the checklist runner to the LLM only if checklists actually loaded.
-    if !checklists.is_empty() {
-        specs.push(checklist::run_checklist_spec(&checklists));
-    }
+    let specs = registry.specs();
     // Rolling conversation memory: recent (command, readback, when) turns, used
     // to resolve back-references and to gate conversational follow-ups.
     let mut history: Vec<(String, String, Instant)> = Vec::new();
@@ -343,21 +326,6 @@ async fn run_session(
             tracing::info!(tool = %call.name, args = %call.arguments, "tool selected");
             reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
 
-            // `run_checklist` isn't a normal one-shot tool — it's an interactive,
-            // multi-item flow (read each item, speak it, listen for an affirm to
-            // fix failures), so it needs the loop's voice/listener/llm/registry,
-            // not the plain ToolCtx. Handle it here and move to the next call.
-            if call.name == "run_checklist" {
-                let want = call.arguments.get("checklist").and_then(|v| v.as_str()).unwrap_or_default();
-                match checklist::find(&checklists, want) {
-                    Some(list) => {
-                        run_checklist(list, &xplane, &llm, &registry, &mut listener, &stt, &voice, &reporter, &config).await
-                    }
-                    None => say(&voice, &reporter, ui::LogKind::Warn, "I don't have that checklist."),
-                }
-                continue;
-            }
-
             // Confirmation gate with in-line correction ("negative, 500"). Applies
             // per call, so each safety-critical action in a compound command is
             // confirmed on its own.
@@ -444,150 +412,6 @@ async fn run_session(
             }
             history.retain(|(_, _, t)| t.elapsed() < HISTORY_TTL);
         }
-    }
-}
-
-/// Run one checklist interactively (the hybrid model). For each item: speak
-/// section context, verify what we can read against the aircraft, and on a
-/// failed item offer to fix it — routing the item's expected state through the
-/// normal tool pipeline only after a spoken affirm, then re-reading to confirm.
-/// Items we can't read (no dataref) are called out for the pilot to confirm and
-/// counted as still-open. Reuses everything: tool selection, execution, voice.
-#[allow(clippy::too_many_arguments)]
-async fn run_checklist(
-    list: &checklist::Checklist,
-    xplane: &XPlaneClient,
-    llm: &Llm,
-    registry: &Registry,
-    listener: &mut Option<Listener>,
-    stt: &Stt,
-    voice: &Voice,
-    reporter: &Reporter,
-    config: &Config,
-) {
-    // Phase guard: a copilot notices when a checklist is being run out of
-    // sequence (e.g. before-takeoff with the engine off) and says so — but never
-    // blocks; the pilot is in command. Speak the heads-up, then run it anyway.
-    // A read error leaves the guard silent rather than false-alarming.
-    if let Some(pre) = &list.precondition {
-        let met = read_dataref(xplane, &pre.check).await.map(|v| pre.check.pred.eval(v)).unwrap_or(true);
-        if !met {
-            say(voice, reporter, ui::LogKind::Warn, &format!("Heads up — {}.", pre.note));
-        }
-    }
-
-    say(voice, reporter, ui::LogKind::Info, &format!("Running the {} checklist.", list.title.to_lowercase()));
-    // Tool-only specs for the fix path — excludes run_checklist itself so a
-    // fix can never recurse back into another checklist.
-    let tool_specs = registry.specs();
-    let mut open: Vec<&str> = Vec::new();
-
-    for item in &list.items {
-        // Section context (remarks/guidance). Skip bracketed non-simulated notes.
-        if item.info {
-            if !item.challenge.starts_with('[') {
-                say(voice, reporter, ui::LogKind::Info, &item.challenge.to_lowercase());
-            }
-            continue;
-        }
-
-        let challenge = item.challenge.to_lowercase();
-        let response = item.response.to_lowercase();
-
-        // No dataref → we can't verify it; call it out for the pilot to confirm.
-        let Some(check) = &item.check else {
-            say(voice, reporter, ui::LogKind::Confirm, &format!("{challenge} — {response}."));
-            open.push(&item.challenge);
-            continue;
-        };
-
-        let pass = read_dataref(xplane, check).await.map(|v| check.pred.eval(v)).unwrap_or(false);
-        if pass {
-            say(voice, reporter, ui::LogKind::Readback, &format!("{challenge}, {response}. Check."));
-            continue;
-        }
-
-        // Failed verify. Offer to fix it (hybrid), acting only on an affirm.
-        let Some(cmd) = item.fix_command() else {
-            say(voice, reporter, ui::LogKind::Warn, &format!("{challenge} should be {response} — check it."));
-            open.push(&item.challenge);
-            continue;
-        };
-        say(voice, reporter, ui::LogKind::Warn, &format!("{challenge} isn't set — want me to make it {response}?"));
-        reporter.status(ui::Phase::Listening);
-        // Log the reply the same way the command loop does, so the pilot sees
-        // their own "affirm" in the conversation, not just the copilot's side.
-        let reply = listen_once(listener, stt);
-        if let Some(r) = &reply {
-            reporter.log(ui::LogKind::Heard, format!("\"{}\" ({:.2})", r.text, r.confidence));
-        }
-        let affirm = reply.map(|r| is_affirmative(&r.text)).unwrap_or(false);
-        if !affirm {
-            open.push(&item.challenge);
-            continue;
-        }
-        let fixed = fix_item(&cmd, llm, registry, &tool_specs, xplane, config, voice, reporter).await
-            && read_dataref(xplane, check).await.map(|v| check.pred.eval(v)).unwrap_or(false);
-        if !fixed {
-            say(voice, reporter, ui::LogKind::Warn, &format!("{challenge} still isn't right — check it."));
-            open.push(&item.challenge);
-        }
-    }
-
-    let summary = if open.is_empty() {
-        format!("{} checklist complete.", list.title.to_lowercase())
-    } else {
-        format!(
-            "{} checklist complete — {} item{} for you to confirm.",
-            list.title.to_lowercase(),
-            open.len(),
-            if open.len() == 1 { "" } else { "s" }
-        )
-    };
-    say(voice, reporter, ui::LogKind::Ok, &summary);
-}
-
-/// Route a checklist item's expected state ("fuel selector both") through the
-/// normal tool pipeline to correct it. Returns whether a tool executed; the
-/// caller re-reads the dataref to confirm it actually took.
-#[allow(clippy::too_many_arguments)]
-async fn fix_item(
-    cmd: &str,
-    llm: &Llm,
-    registry: &Registry,
-    specs: &[tools::ToolSpec],
-    xplane: &XPlaneClient,
-    config: &Config,
-    voice: &Voice,
-    reporter: &Reporter,
-) -> bool {
-    reporter.status(ui::Phase::Thinking);
-    let Ok(call) = llm.choose_tool(cmd, specs, &[]).await.map(|mut v| v.drain(..).next()) else { return false };
-    let Some(call) = call else { return false };
-    let Some(tool) = registry.get(&call.name) else { return false };
-    let ctx = ToolCtx { xplane, config };
-    match tool.execute(&call.arguments, &ctx).await {
-        Ok(line) => {
-            say(voice, reporter, ui::LogKind::Readback, &line);
-            true
-        }
-        Err(e) => {
-            tracing::error!("checklist fix '{cmd}' failed: {e:#}");
-            false
-        }
-    }
-}
-
-/// Read a checklist item's dataref as a float — an array element when the item
-/// gave an index, otherwise the scalar (falling back to element 0 for datarefs
-/// that turn out to be arrays). `None` if the read fails.
-async fn read_dataref(xplane: &XPlaneClient, check: &checklist::Check) -> Option<f64> {
-    if let Some(i) = check.index {
-        return xplane.get_float_array(&check.dataref).await.ok()?.get(i).copied();
-    }
-    match xplane.get_float(&check.dataref).await {
-        Ok(v) => Some(v),
-        Err(_) => xplane.get_float_array(&check.dataref).await.ok()?.first().copied(),
     }
 }
 
@@ -791,9 +615,6 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "ident", "barometer", "altimeter", "baro", "kollsman", "qnh", "vor",
     // instruments / misc controls
     "gyro", "pitot", "brake", "brakes", "parking", "heat",
-    // checklists (run_checklist) — the trigger word plus the phase names that
-    // don't already appear above (taxi/landing/descend/shutdown are keywords).
-    "checklist", "checklists", "takeoff", "cruise",
 ];
 
 /// True if the utterance plausibly is an aircraft command (contains at least one
@@ -959,9 +780,6 @@ mod tests {
             // "blood" mishearing must still reach the LLM.
             "Floodlights on.", "Turn on the floodlights.", "Increase floodlights.",
             "Bloodlights on.", "landinglight on",
-            // Checklist invocations must clear the gate to reach run_checklist.
-            "run the before takeoff checklist", "before takeoff checklist",
-            "do the engine shutdown checklist", "run the cruise checklist",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
         }

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(TEST=llm_picks_correct_tool /tmp/llm_bench.sh qwen3:8b)",
+      "Bash(perl -0pi -e 's/choose_tool\\\\\\(utterance, &specs\\\\\\)\\\\.await\\\\.expect\\\\\\(\"ollama call failed\"\\\\\\)/choose_tool\\(utterance, &specs, &[]\\).await.expect\\(\"ollama call failed\"\\)/g' src/llm.rs)",
+      "Bash(perl -0pi -e 's/choose_tool_at\\\\\\(phrase, &specs, t\\\\\\)/choose_tool_at\\(phrase, &specs, &[], t\\)/g' src/llm.rs)",
+      "Bash(perl -0pi -e 's/\\\\.choose_tool\\\\\\(utterance, &specs\\\\\\)\\\\n\\(\\\\s*\\)\\\\.await/.choose_tool\\(utterance, &specs, &[]\\)\\\\n$1.await/g' src/llm.rs)",
+      "Bash(curl -s http://127.0.0.1:11434/api/chat -d '{\"model\":\"qwen3:8b\",\"stream\":false,\"think\":false,\"messages\":[{\"role\":\"system\",\"content\":\"You are the copilot. Choose the tool\\(s\\) that perform the command. Resolve references like \\\\\"it\\\\\" from the recent turns.\"},{\"role\":\"user\",\"content\":\"Switch to left fuel tank.\"},{\"role\":\"assistant\",\"content\":\"Roger, fuel selector left.\"},{\"role\":\"user\",\"content\":\"Switch it back to both.\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"set_fuel_selector\",\"description\":\"Set fuel selector position\",\"parameters\":{\"type\":\"object\",\"properties\":{\"position\":{\"type\":\"string\",\"enum\":[\"left\",\"right\",\"both\"]}},\"required\":[\"position\"]}}}]}')",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); tc=d['message'].get\\('tool_calls',[]\\); print\\('resolved ->', tc[0]['function']['name'], tc[0]['function']['arguments'] if tc else '\\(none\\)'\\)\")",
+      "Bash(curl -s http://127.0.0.1:11434/api/chat -d '{\"model\":\"qwen3:8b\",\"stream\":false,\"think\":false,\"messages\":[{\"role\":\"system\",\"content\":\"You are the copilot. Choose the tool\\(s\\) that perform the command.\"},{\"role\":\"user\",\"content\":\"Switch it back to both.\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"set_fuel_selector\",\"description\":\"Set fuel selector position\",\"parameters\":{\"type\":\"object\",\"properties\":{\"position\":{\"type\":\"string\",\"enum\":[\"left\",\"right\",\"both\"]}},\"required\":[\"position\"]}}}]}')",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); tc=d['message'].get\\('tool_calls',[]\\); print\\('no-context ->', \\(tc[0]['function']['name']+' '+str\\(tc[0]['function']['arguments']\\)\\) if tc else '\\(none/ambiguous\\)'\\)\")"
+    ]
+  }
+}
