@@ -26,8 +26,19 @@ pitot_heat: true       # set_pitot_heat (universal pitot_heat_on)
 # (start_engine sets battery 1 + alternator 1 only; the SR22's BAT2/ALT2 need the
 # dual-electrical tool.)
 engine: true
+# Dual battery + dual alternator + avionics. Datarefs/commands verified against
+# the rustdecks SR22 deck. The pair keys ("batteries"/"alternators") switch both
+# at once; "all" hits every system.
+electrical:
+  - { key: battery1,    spoken: battery one,       on_commands: [sim/electrical/battery_1_on],  off_commands: [sim/electrical/battery_1_off],  readback: ["sim/cockpit2/electrical/battery_on[0]"] }
+  - { key: battery2,    spoken: battery two,       on_commands: [sim/electrical/battery_2_on],  off_commands: [sim/electrical/battery_2_off],  readback: ["sim/cockpit2/electrical/battery_on[1]"] }
+  - { key: alternator1, spoken: alternator one,    on_commands: [sim/electrical/generator_1_on], off_commands: [sim/electrical/generator_1_off], readback: ["sim/cockpit2/electrical/generator_on[0]"] }
+  - { key: alternator2, spoken: alternator two,    on_commands: [sim/electrical/generator_2_on], off_commands: [sim/electrical/generator_2_off], readback: ["sim/cockpit2/electrical/generator_on[1]"] }
+  - { key: batteries,   spoken: both batteries,    on_commands: [sim/electrical/battery_1_on, sim/electrical/battery_2_on],   off_commands: [sim/electrical/battery_1_off, sim/electrical/battery_2_off],   readback: ["sim/cockpit2/electrical/battery_on[0]", "sim/cockpit2/electrical/battery_on[1]"] }
+  - { key: alternators, spoken: both alternators,  on_commands: [sim/electrical/generator_1_on, sim/electrical/generator_2_on], off_commands: [sim/electrical/generator_1_off, sim/electrical/generator_2_off], readback: ["sim/cockpit2/electrical/generator_on[0]", "sim/cockpit2/electrical/generator_on[1]"] }
+  - { key: avionics,    spoken: avionics master,   on_commands: [sim/systems/avionics_on],       off_commands: [sim/systems/avionics_off],      readback: [sim/cockpit/electrical/avionics_on] }
+
 # --- SR22-specific: off until built and verified in the sim ---
-electrical: false      # DUAL BAT/ALT — the single-system tool is wrong for the SR22
 magnetos: false        # key-start ignition differs from the 172 mag switch
 carb_heat: false       # fuel-injected — no carb heat
 fuel_pump: false       # laminar/sr22/switch/boost_pump
@@ -74,6 +85,7 @@ checklist_map:
   - { match: throttle_ratio,   action: throttle }     # throttle_ratio_all (universal)
   - { match: ENGN_mixt,        action: mixture }      # set_mixture writes mixture_ratio_all
   - { match: flap_handle,      action: flaps }        # set_flaps writes flap_ratio
+  - { match: avionics_on,      action: { electrical: avionics } }  # batteries are compound → call-out
   - { match: nav_lights,       action: { light: nav } }
   - { match: strobe_lights,    action: { light: strobe } }
   - { match: landing_lights,   action: { light: landing } }

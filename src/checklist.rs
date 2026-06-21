@@ -27,7 +27,9 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::aircraft::{AircraftProfile, ChecklistAction, ChecklistMapEntry, FlapProfile, LightProfile};
+use crate::aircraft::{
+    AircraftProfile, ChecklistAction, ChecklistMapEntry, ElectricalSystem, FlapProfile, LightProfile,
+};
 use crate::tools::autopilot::AutopilotOff;
 use crate::tools::controls::{SetParkingBrake, SetPitchTrim};
 use crate::tools::electrical::SetElectrical;
@@ -135,6 +137,7 @@ pub struct Checklist {
     pub items: Vec<Item>,
     pub lights: Vec<LightProfile>,
     pub flaps: Option<FlapProfile>,
+    pub electrical: Vec<ElectricalSystem>,
 }
 
 impl Checklist {
@@ -162,6 +165,7 @@ pub fn load(profile: &AircraftProfile) -> Result<Vec<Checklist>> {
 pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
     let lights = profile.lights.clone();
     let flaps = profile.flaps.clone();
+    let electrical = &profile.electrical;
     let map = &profile.checklist_map;
     let mut out: Vec<Checklist> = Vec::new();
     let mut cur: Option<Checklist> = None;
@@ -201,6 +205,7 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
                     items: Vec::new(),
                     lights: lights.clone(),
                     flaps: flaps.clone(),
+                    electrical: electrical.clone(),
                 });
             }
             // Both narration directives: arm the run-up confirm when the file
@@ -384,12 +389,13 @@ pub async fn run_step(
     args: &Value,
     lights: &[LightProfile],
     flaps: &Option<FlapProfile>,
+    electrical: &[ElectricalSystem],
     ctx: &ToolCtx<'_>,
 ) -> Result<String> {
     match tool {
         "set_parking_brake" => SetParkingBrake.execute(args, ctx).await,
         "set_pitch_trim" => SetPitchTrim.execute(args, ctx).await,
-        "set_electrical" => SetElectrical.execute(args, ctx).await,
+        "set_electrical" => SetElectrical::new(electrical.to_vec()).execute(args, ctx).await,
         "set_mixture" => SetMixture.execute(args, ctx).await,
         "set_throttle" => SetThrottle.execute(args, ctx).await,
         "set_fuel_selector" => SetFuelSelector.execute(args, ctx).await,
@@ -639,7 +645,7 @@ mod tests {
         // system we haven't built (electrical, boost pump, fuel selector).
         let safe = [
             "set_parking_brake", "set_transponder_mode", "set_pitot_heat", "set_lights",
-            "set_throttle", "set_mixture", "set_flaps",
+            "set_throttle", "set_mixture", "set_flaps", "set_electrical",
         ];
         let mut acts = 0;
         for c in &cls {
