@@ -215,6 +215,10 @@ async fn run_session(
     // Rolling conversation memory: recent (command, readback, when) turns, used
     // to resolve back-references and to gate conversational follow-ups.
     let mut history: Vec<(String, String, Instant)> = Vec::new();
+    // Subject of the last successful named command ("throttle", "set heading"),
+    // used to re-anchor a bare-value follow-up ("sixty percent" → "throttle
+    // sixty percent") into an explicit command.
+    let mut last_subject: Option<String> = None;
     let mut listener = if continuous {
         // Share the speech arbiter's mic gate so the listener mutes itself while
         // the copilot speaks (readbacks and monitor alerts alike).
@@ -256,7 +260,7 @@ async fn run_session(
         }
 
         // Wake-word gate (continuous only).
-        let command = if continuous {
+        let mut command = if continuous {
             match gate_wake_word(&transcript, &config.wake_word) {
                 Some(cmd) if !cmd.is_empty() => cmd,
                 _ => {
@@ -274,8 +278,7 @@ async fn run_session(
         // the LLM.
         if !looks_like_command(&command) {
             // A conversational follow-up shortly after a command is let through
-            // even without a keyword ("switch it back to both") — the LLM
-            // resolves it from history. Outside the window, the strict gate holds.
+            // even without a keyword. Outside the window, the strict gate holds.
             let in_followup = history
                 .last()
                 .is_some_and(|(_, _, t)| t.elapsed() < FOLLOWUP_WINDOW);
@@ -287,14 +290,31 @@ async fn run_session(
                 }
                 continue;
             }
+            // Re-anchor a bare-value follow-up onto the last command's system, so
+            // the model gets an explicit command ("throttle sixty percent")
+            // instead of having to infer continuation from chat history — which
+            // it does unreliably once the same tool repeats.
+            if has_number(&command) {
+                if let Some(subj) = &last_subject {
+                    let rewritten = format!("{subj} {command}");
+                    reporter.log(ui::LogKind::Info, format!("follow-up → \"{rewritten}\""));
+                    command = rewritten;
+                }
+            }
         }
 
-        // Recent, non-stale turns for the LLM to resolve back-references against.
-        let ctx_history: Vec<(String, String)> = history
-            .iter()
-            .filter(|(_, _, t)| t.elapsed() < HISTORY_TTL)
-            .map(|(u, a, _)| (u.clone(), a.clone()))
-            .collect();
+        // History is only useful for the non-numeric references the rewrite can't
+        // handle ("switch it back to both"); an explicit/named command is
+        // self-contained, and stale repeated turns only confuse the model.
+        let ctx_history: Vec<(String, String)> = if looks_like_command(&command) {
+            Vec::new()
+        } else {
+            history
+                .iter()
+                .filter(|(_, _, t)| t.elapsed() < HISTORY_TTL)
+                .map(|(u, a, _)| (u.clone(), a.clone()))
+                .collect()
+        };
 
         // LLM picks the tool(s). A compound command ("taxi and nav lights on")
         // yields more than one call; they're executed in spoken order.
@@ -408,6 +428,15 @@ async fn run_session(
         // Record this turn for back-reference context, then bound the history by
         // count and age so stale state can't accumulate.
         if !turn_readbacks.is_empty() {
+            // Anchor for the next bare-value follow-up: the subject of this
+            // command if it named a system (covers rewritten follow-ups too,
+            // which are explicit by now, so a chain 80 → 70 → 60 stays anchored).
+            if looks_like_command(&command) {
+                let subj = command_subject(&command);
+                if !subj.is_empty() {
+                    last_subject = Some(subj);
+                }
+            }
             history.push((command.clone(), turn_readbacks.join(" "), Instant::now()));
             let excess = history.len().saturating_sub(HISTORY_MAX);
             if excess > 0 {
@@ -802,23 +831,47 @@ fn looks_like_followup(text: &str) -> bool {
         "it", "that", "them", "those", "again", "back", "undo", "revert",
         "reset", "more", "less", "instead", "also", "other", "same", "too",
     ];
-    const NUMBER_WORDS: &[&str] = &[
-        "percent", "zero", "one", "two", "three", "four", "five", "six", "seven",
-        "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
-        "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
-        "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
-        "hundred", "thousand",
-    ];
-    // A spoken or written number on its own is an adjustment to the last command.
-    if text.chars().any(|c| c.is_ascii_digit()) {
+    if has_number(text) {
         return true;
     }
     text.split(|c: char| !c.is_ascii_alphabetic())
         .filter(|w| !w.is_empty())
-        .any(|w| {
-            let w = w.to_ascii_lowercase();
-            FOLLOWUP_WORDS.contains(&w.as_str()) || NUMBER_WORDS.contains(&w.as_str())
-        })
+        .any(|w| FOLLOWUP_WORDS.contains(&w.to_ascii_lowercase().as_str()))
+}
+
+/// Spoken or written numbers, for spotting a bare-value follow-up.
+const NUMBER_WORDS: &[&str] = &[
+    "percent", "zero", "one", "two", "three", "four", "five", "six", "seven",
+    "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+    "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+    "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+    "hundred", "thousand",
+];
+
+/// True if the utterance carries a digit or a spoken number.
+fn has_number(text: &str) -> bool {
+    text.chars().any(|c| c.is_ascii_digit())
+        || text
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .any(|w| NUMBER_WORDS.contains(&w.to_ascii_lowercase().as_str()))
+}
+
+/// The leading non-numeric words of a command — its "subject" — used to
+/// re-anchor a bare-value follow-up onto the same system. "throttle eighty
+/// percent" → "throttle"; "set heading 270" → "set heading". Empty if the
+/// command starts with a number.
+fn command_subject(cmd: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for w in cmd.split_whitespace() {
+        let bare = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if bare.chars().any(|c| c.is_ascii_digit())
+            || NUMBER_WORDS.contains(&bare.to_ascii_lowercase().as_str())
+        {
+            break;
+        }
+        out.push(w);
+    }
+    out.join(" ")
 }
 
 /// True if a single lowercased token is, or is a one-letter mishearing of, a
@@ -927,6 +980,20 @@ mod tests {
         for c in ["nice weather today", "where are we", "hello copilot"] {
             assert!(!looks_like_followup(c), "{c:?} should not");
         }
+    }
+
+    use super::{command_subject, has_number};
+
+    #[test]
+    fn bare_value_followups_re_anchor_to_the_last_subject() {
+        assert_eq!(command_subject("throttle eighty percent"), "throttle");
+        assert_eq!(command_subject("set heading 270"), "set heading");
+        assert_eq!(command_subject("flaps ten"), "flaps");
+        assert_eq!(command_subject("60 percent"), ""); // starts with a number
+        assert!(has_number("sixty percent") && has_number("60%") && has_number("two thousand"));
+        assert!(!has_number("switch it back to both"));
+        // The rewrite a bare follow-up would produce:
+        assert_eq!(format!("{} {}", command_subject("throttle eighty percent"), "sixty percent"), "throttle sixty percent");
     }
 
     #[test]

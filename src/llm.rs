@@ -24,7 +24,11 @@ misheard — e.g. map 'beak' to 'beacon', 'probe'/'probe lights' to 'strobe', an
 'flaps ten' → set_flaps(notch=\"10\"); 'descend at five hundred' → \
 set_vertical_speed(fpm=-500); 'climb and maintain seven thousand' → \
 set_altitude(altitude=7000); 'beacon on' → set_lights(light=\"beacon\", on=true); \
-'start her up' → start_engine. Do not answer in prose and do not invent tools. \
+'start her up' → start_engine. A bare number or percentage on its own, with no \
+named system, CONTINUES the most recent command using the same tool — e.g. after \
+'throttle fifty percent', 'seventy percent' → set_throttle(percent=70), and \
+'sixty' → set_throttle(percent=60); after 'set heading 270', 'two eighty' → \
+set_heading(heading=280). Do not answer in prose and do not invent tools. \
 If no tool fits the command, do not call any tool.";
 
 /// Temperatures to retry at, in order, when the deterministic (temp 0) first
