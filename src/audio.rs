@@ -166,7 +166,11 @@ impl Listener {
     /// mono 16 kHz f32. Audio captured before this call (e.g. while we were
     /// transcribing or speaking) is discarded, so the copilot never hears its
     /// own readback.
-    pub fn next_utterance(&mut self) -> Result<Vec<f32>> {
+    /// Capture one utterance. With `idle_timeout`, return an **empty** vec if no
+    /// speech has started within that window (and we're not mid-utterance) — so a
+    /// caller can poll another input source between waits without blocking the
+    /// mic forever. `None` blocks until an utterance completes (the old behavior).
+    pub fn next_utterance(&mut self, idle_timeout: Option<Duration>) -> Result<Vec<f32>> {
         self.input.buffer.lock().unwrap().clear();
         self.segmenter.reset();
 
@@ -174,6 +178,7 @@ impl Listener {
         let mut pending: Vec<f32> = Vec::new();
         // When the copilot last finished speaking — used for the post-speech tail.
         let mut spoke_until: Option<Instant> = None;
+        let start = Instant::now();
 
         loop {
             std::thread::sleep(Duration::from_millis(FRAME_MS as u64));
@@ -190,6 +195,14 @@ impl Listener {
                 pending.clear();
                 self.reporter.mic(0.0);
                 continue;
+            }
+
+            // Idle timeout: only bail when no utterance is in progress, so we
+            // never cut off mid-speech; return empty to signal "nothing yet".
+            if let Some(to) = idle_timeout {
+                if !self.segmenter.in_speech() && start.elapsed() >= to {
+                    return Ok(Vec::new());
+                }
             }
 
             let new = std::mem::take(&mut *self.input.buffer.lock().unwrap());
@@ -281,6 +294,11 @@ impl Segmenter {
             silence_ms: 0,
             speech_ms: 0,
         }
+    }
+
+    /// Whether an utterance is currently being captured (voiced, not yet ended).
+    pub fn in_speech(&self) -> bool {
+        self.in_speech
     }
 
     /// Current speech threshold from the adaptive floor.

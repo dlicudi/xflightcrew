@@ -148,21 +148,24 @@ async fn main() -> Result<()> {
             });
         });
 
+        // Typed-command channel: the dashboard (main thread) sends commands the
+        // pilot types; the voice loop picks them up alongside spoken utterances.
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
         let reporter = Reporter::Tui(tx);
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             if let Err(e) = rt.block_on(run_session(
-                config, stt, llm, registry, voice, continuous, explicit, reporter,
+                config, stt, llm, registry, voice, continuous, explicit, reporter, Some(cmd_rx),
             )) {
                 tracing::error!("voice loop ended: {e:#}");
             }
         });
 
-        ui::run_dashboard(title, commands, rx)?; // blocks until the user quits
+        ui::run_dashboard(title, commands, rx, cmd_tx)?; // blocks until the user quits
         Ok(())
     } else {
         println!("\n  x-copilot — {} ({}). Ctrl-C to quit.\n", profile.display_name, config.listen_mode);
-        run_session(config, stt, llm, registry, voice, continuous, explicit, Reporter::Plain).await
+        run_session(config, stt, llm, registry, voice, continuous, explicit, Reporter::Plain, None).await
     }
 }
 
@@ -189,6 +192,7 @@ async fn run_session(
     continuous: bool,
     explicit: bool,
     reporter: Reporter,
+    typed: Option<std::sync::mpsc::Receiver<String>>,
 ) -> Result<()> {
     // Build the X-Plane client here, on whatever runtime this session runs on
     // (main for plain, the voice thread for TUI) — a reqwest client's I/O is
@@ -223,43 +227,52 @@ async fn run_session(
 
     loop {
         reporter.status(ui::Phase::Listening);
-        let heard = match listen_once(&mut listener, &stt) {
-            Some(t) => t,
+        // Input is spoken (gated like before) or typed in the TUI. A typed
+        // command is deliberate, so it skips the confidence/wake/domain gates and
+        // goes straight to the model.
+        let (mut command, from_text) = match next_input(&mut listener, &stt, typed.as_ref()) {
             None => continue,
-        };
-        let transcript = heard.text;
-        let confidence = heard.confidence;
-        tracing::info!(transcript = %transcript, confidence, "heard utterance");
-        reporter.log(ui::LogKind::Heard, format!("\"{transcript}\" ({confidence:.2})"));
-
-        // Confidence gate.
-        if confidence < config.stt_min_confidence {
-            if explicit {
-                say(&voice, &reporter, ui::LogKind::Info, "Say again?");
-            } else {
-                reporter.log(ui::LogKind::Info, "low confidence, ignored");
+            Some(Input::Typed(text)) => {
+                tracing::info!(typed = %text, "typed command");
+                reporter.log(ui::LogKind::Heard, format!("⌨  \"{text}\""));
+                (text, true)
             }
-            continue;
-        }
+            Some(Input::Spoken(heard)) => {
+                let transcript = heard.text;
+                let confidence = heard.confidence;
+                tracing::info!(transcript = %transcript, confidence, "heard utterance");
+                reporter.log(ui::LogKind::Heard, format!("\"{transcript}\" ({confidence:.2})"));
 
-        // Wake-word gate (continuous only).
-        let mut command = if continuous {
-            match gate_wake_word(&transcript, &config.wake_word) {
-                Some(cmd) if !cmd.is_empty() => cmd,
-                _ => {
-                    reporter.log(ui::LogKind::Info, "ignored (no wake word)");
+                // Confidence gate.
+                if confidence < config.stt_min_confidence {
+                    if explicit {
+                        say(&voice, &reporter, ui::LogKind::Info, "Say again?");
+                    } else {
+                        reporter.log(ui::LogKind::Info, "low confidence, ignored");
+                    }
                     continue;
                 }
+
+                // Wake-word gate (continuous only).
+                let cmd = if continuous {
+                    match gate_wake_word(&transcript, &config.wake_word) {
+                        Some(cmd) if !cmd.is_empty() => cmd,
+                        _ => {
+                            reporter.log(ui::LogKind::Info, "ignored (no wake word)");
+                            continue;
+                        }
+                    }
+                } else {
+                    transcript.clone()
+                };
+                (cmd, false)
             }
-        } else {
-            transcript.clone()
         };
 
-        // Domain gate: high-confidence speech can still be phonetic nonsense
-        // ("Nautilapuku"), which the LLM tends to force-match to a tool. Require
-        // at least one aviation keyword before we act — and before we even ask
-        // the LLM.
-        if !looks_like_command(&command) {
+        // Domain gate, follow-up, and bare-value rewrite apply to SPOKEN input
+        // only — phonetic nonsense and STT follow-ups are voice problems. A typed
+        // command is taken as-is.
+        if !from_text && !looks_like_command(&command) {
             // A conversational follow-up shortly after a command is let through
             // even without a keyword. Outside the window, the strict gate holds.
             let in_followup = history
@@ -286,10 +299,10 @@ async fn run_session(
             }
         }
 
-        // History is only useful for the non-numeric references the rewrite can't
-        // handle ("switch it back to both"); an explicit/named command is
+        // History is only useful for the non-numeric voice references the rewrite
+        // can't handle ("switch it back to both"); a typed or named command is
         // self-contained, and stale repeated turns only confuse the model.
-        let ctx_history: Vec<(String, String)> = if looks_like_command(&command) {
+        let ctx_history: Vec<(String, String)> = if from_text || looks_like_command(&command) {
             Vec::new()
         } else {
             history
@@ -344,7 +357,7 @@ async fn run_session(
 
                 say(&voice, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
                 reporter.status(ui::Phase::Listening);
-                let Some(reply) = listen_once(&mut listener, &stt) else {
+                let Some(reply) = listen_once(&mut listener, &stt, None) else {
                     say(&voice, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
                     break 'confirm false;
                 };
@@ -485,17 +498,48 @@ fn icao_to_profile(icao: &str) -> String {
 
 /// Capture one utterance (continuous VAD or push-to-talk) and transcribe it.
 /// Returns `None` on silence/noise or a capture error.
-fn listen_once(listener: &mut Option<Listener>, stt: &Stt) -> Option<stt::Transcription> {
+fn listen_once(listener: &mut Option<Listener>, stt: &Stt, idle_timeout: Option<Duration>) -> Option<stt::Transcription> {
     let audio = match listener {
-        Some(l) => l.next_utterance().ok()?,
+        Some(l) => l.next_utterance(idle_timeout).ok()?,
         None => audio::record_push_to_talk().ok()?,
     };
     if audio.is_empty() {
-        return None;
+        return None; // idle timeout (continuous) or empty capture
     }
     match stt.transcribe(&audio) {
         Ok(t) if !t.text.is_empty() => Some(t),
         _ => None,
+    }
+}
+
+/// One pilot input — spoken (transcribed) or typed in the TUI.
+enum Input {
+    Spoken(stt::Transcription),
+    Typed(String),
+}
+
+/// Block until the next input arrives from either source. With a `typed`
+/// channel, the mic listen times out periodically so we can poll for typed
+/// commands without one starving the other; without it, just listen.
+fn next_input(
+    listener: &mut Option<Listener>,
+    stt: &Stt,
+    typed: Option<&std::sync::mpsc::Receiver<String>>,
+) -> Option<Input> {
+    let Some(typed) = typed else {
+        return listen_once(listener, stt, None).map(Input::Spoken);
+    };
+    loop {
+        if let Ok(t) = typed.try_recv() {
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                return Some(Input::Typed(t));
+            }
+        }
+        if let Some(utt) = listen_once(listener, stt, Some(Duration::from_millis(150))) {
+            return Some(Input::Spoken(utt));
+        }
+        // Timed out idle (or a discarded blip) — loop to re-check the typed channel.
     }
 }
 
