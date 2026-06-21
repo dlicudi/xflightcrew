@@ -15,8 +15,11 @@ use serde_json::{json, Value};
 use super::autopilot::AutopilotOff;
 use super::controls::{SetParkingBrake, SetPitchTrim};
 use super::electrical::SetElectrical;
-use super::engine::{SetFuelSelector, SetMixture, SetThrottle, StopEngine};
+use super::engine::{
+    SetCarbHeat, SetFuelPump, SetFuelSelector, SetMagnetos, SetMixture, SetThrottle, StartEngine, StopEngine,
+};
 use super::flaps::SetFlaps;
+use super::instruments::SetPitotHeat;
 use super::lights::SetLights;
 use super::radio::SetTransponderMode;
 use super::{Tool, ToolCtx, ToolSpec};
@@ -77,8 +80,15 @@ pub async fn run_step(
         "set_mixture" => SetMixture.execute(args, ctx).await,
         "set_throttle" => SetThrottle.execute(args, ctx).await,
         "set_fuel_selector" => SetFuelSelector.execute(args, ctx).await,
+        "set_magnetos" => SetMagnetos.execute(args, ctx).await,
+        "set_pitot_heat" => SetPitotHeat.execute(args, ctx).await,
+        "set_carb_heat" => SetCarbHeat.execute(args, ctx).await,
+        "set_fuel_pump" => SetFuelPump.execute(args, ctx).await,
         "set_transponder_mode" => SetTransponderMode.execute(args, ctx).await,
         "autopilot_off" => AutopilotOff.execute(args, ctx).await,
+        // The start crank (voltage-gated, waits for catch, brings alt + avionics
+        // up) — invoked as the "Ignition, start" step of the starting checklist.
+        "start_engine" => StartEngine.execute(args, ctx).await,
         "stop_engine" => StopEngine.execute(args, ctx).await,
         "set_lights" => SetLights::new(lights.to_vec()).execute(args, ctx).await,
         "set_flaps" => match flaps {
@@ -101,8 +111,9 @@ fn describe(name: &str, triggers: &str) -> String {
     )
 }
 
-/// The operational checklists, transposed step-for-step. The copilot performs the
-/// settable items and calls out the tests/judgment/visual ones as the pilot's.
+/// The operational checklists, transposed step-for-step from the file. The
+/// copilot performs the settable items and calls out the tests/judgment/visual
+/// ones as the pilot's, so the whole list is read out top to bottom.
 pub fn checklists(lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<Checklist> {
     let make = |id, title, description, steps| Checklist {
         id,
@@ -115,14 +126,74 @@ pub fn checklists(lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<
 
     let mut out = vec![
         make(
+            "performance_limits",
+            "performance limits",
+            describe("performance-limits reference (spoken, nothing to do)", "'performance limits', 'limits', 'v speeds', 'say the limits'"),
+            vec![
+                pilot("Never-exceed, one sixty-three knots. Max cruise, one twenty-nine. Maneuvering, one oh-five."),
+                pilot("Flaps ten, one ten knots. Flaps twenty and full, eighty-five."),
+                pilot("Useable fuel, fifty-three gallons. Max gross weight, twenty-five fifty-eight pounds."),
+                pilot("Service ceiling, fourteen thousand feet. Max crosswind, fifteen knots."),
+            ],
+        ),
+        make(
+            "preflight",
+            "preflight",
+            describe("preflight cabin", "'preflight', 'preflight checklist', 'cabin preflight'"),
+            vec![
+                act("Parking brake, set.", "set_parking_brake", json!({ "on": true })),
+                act("Ignition, off.", "set_magnetos", json!({ "position": "off" })),
+                act("Avionics, off.", "set_electrical", json!({ "system": "avionics", "on": false })),
+                act("Master switch, on.", "set_electrical", json!({ "system": "battery", "on": true })),
+                pilot("Fuel quantity — sufficient, your check."),
+                act("Avionics, on.", "set_electrical", json!({ "system": "avionics", "on": true })),
+                pilot("Avionics cooling fan — audible, your check."),
+                act("Avionics, off.", "set_electrical", json!({ "system": "avionics", "on": false })),
+                pilot("Static source — normal, your check."),
+                pilot("Warning lights — tested, your check."),
+                act("Fuel selector, both.", "set_fuel_selector", json!({ "position": "both" })),
+                pilot("Fuel shutoff — pushed in, your check."),
+                act("Flaps, full — testing.", "set_flaps", json!({ "notch": "full" })),
+                act("Flaps, up.", "set_flaps", json!({ "notch": "up" })),
+                act("Pitot heat, on.", "set_pitot_heat", json!({ "on": true })),
+                pilot("Ammeter — load check, your check."),
+                act("Pitot heat, off.", "set_pitot_heat", json!({ "on": false })),
+                act("Master switch, off.", "set_electrical", json!({ "system": "battery", "on": false })),
+                act("Trim, set for takeoff.", "set_pitch_trim", json!({ "action": "takeoff" })),
+            ],
+        ),
+        make(
             "before_starting_engine",
             "before starting engine",
-            describe("before-starting-engine", "'before starting engine', 'before start', 'pre-start checklist'"),
+            describe("before-starting-engine (the pre-start setup, NOT the start itself)", "'before starting engine', 'before start', 'pre-start checklist'"),
             vec![
                 act("Parking brake, set.", "set_parking_brake", json!({ "on": true })),
                 act("Autopilot, off.", "autopilot_off", json!({})),
                 act("Avionics, off.", "set_electrical", json!({ "system": "avionics", "on": false })),
                 act("Fuel selector, both.", "set_fuel_selector", json!({ "position": "both" })),
+                pilot("Fuel shutoff — pushed in, your check."),
+            ],
+        ),
+        make(
+            "starting_engine",
+            "starting engine",
+            describe("starting-engine (actually STARTS the engine — cranks it)", "'starting engine', 'starting engine checklist', 'start the engine checklist'"),
+            vec![
+                act("Master switch, on.", "set_electrical", json!({ "system": "battery", "on": true })),
+                act("Beacon, on.", "set_lights", json!({ "light": "beacon", "on": true })),
+                act("Throttle, cracked.", "set_throttle", json!({ "percent": 15 })),
+                act("Mixture, rich.", "set_mixture", json!({ "percent": 100 })),
+                act("Carb heat, cold.", "set_carb_heat", json!({ "on": false })),
+                act("Aux fuel pump, prime.", "set_fuel_pump", json!({ "on": true })),
+                act("Aux fuel pump, off.", "set_fuel_pump", json!({ "on": false })),
+                pilot("Propeller area — clear, your check."),
+                act("Ignition, start.", "start_engine", json!({})),
+                pilot("Oil pressure — checked, your check."),
+                act("Alternator, on.", "set_electrical", json!({ "system": "alternator", "on": true })),
+                pilot("Ammeter — checked, your check."),
+                pilot("Nav lights — on at night, your call."),
+                act("Avionics, on.", "set_electrical", json!({ "system": "avionics", "on": true })),
+                act("Flaps, up.", "set_flaps", json!({ "notch": "up" })),
             ],
         ),
         make(
@@ -130,12 +201,14 @@ pub fn checklists(lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<
             "before taxi",
             describe("before-taxi", "'before taxi', 'before taxi checklist', 'ready to taxi'"),
             vec![
-                pilot("Fuel quantity — your check."),
+                pilot("Fuel quantity — checked, your check."),
                 pilot("Flight controls — free and correct, your check."),
+                pilot("Cabin doors — closed and latched, your check."),
                 pilot("Flight instruments — set, your check."),
+                pilot("Radios and avionics — set, your check."),
                 act("Transponder, standby.", "set_transponder_mode", json!({ "mode": "standby" })),
                 act("Taxi light, on.", "set_lights", json!({ "light": "taxi", "on": true })),
-                pilot("Brakes — your check."),
+                pilot("Brakes — checked, your check."),
                 act("Parking brake, set.", "set_parking_brake", json!({ "on": true })),
             ],
         ),
@@ -152,8 +225,10 @@ pub fn checklists(lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<
                 act("Fuel selector, both.", "set_fuel_selector", json!({ "position": "both" })),
                 pilot("Mag check — your run-up. Maximum drop one twenty-five, difference fifty."),
                 pilot("Engine instruments — green, your check."),
+                pilot("Warning lights — clear, your check."),
                 act("Strobe lights, on.", "set_lights", json!({ "light": "strobe", "on": true })),
                 act("Landing light, on.", "set_lights", json!({ "light": "landing", "on": true })),
+                pilot("Radios — checked and set, your check."),
                 act("Autopilot, off.", "autopilot_off", json!({})),
                 act("Trim, set for takeoff.", "set_pitch_trim", json!({ "action": "takeoff" })),
                 pilot("Flaps — as required, your call."),
@@ -166,8 +241,10 @@ pub fn checklists(lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<
             vec![
                 act("Taxi light, off.", "set_lights", json!({ "light": "taxi", "on": false })),
                 act("Transponder, altitude.", "set_transponder_mode", json!({ "mode": "altitude" })),
+                pilot("Flaps — as required, your call."),
                 act("Mixture, rich.", "set_mixture", json!({ "percent": 100 })),
-                pilot("Throttle and brakes — yours for the roll. Rotate around sixty."),
+                pilot("Throttle and brakes — yours for the roll. Rotate around sixty, climb seventy to eighty-five."),
+                pilot("Flaps — up once climbing, your call."),
             ],
         ),
         make(
@@ -178,6 +255,7 @@ pub fn checklists(lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<
                 act("Landing light, off.", "set_lights", json!({ "light": "landing", "on": false })),
                 act("Throttle, full.", "set_throttle", json!({ "percent": 100 })),
                 act("Mixture, rich.", "set_mixture", json!({ "percent": 100 })),
+                pilot("Climb airspeed — seventy to eighty-five knots."),
             ],
         ),
         make(
@@ -188,7 +266,11 @@ pub fn checklists(lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<
                 pilot("Power — your call, twenty-one to twenty-five hundred RPM."),
                 pilot("Trim — your call."),
                 act("Mixture, leaned.", "set_mixture", json!({ "percent": 65 })),
-                pilot("Fuel quantity — your check."),
+                pilot("Navaids and radios — set, your check."),
+                pilot("Navigation — on course, your check."),
+                pilot("Flight instruments — checked, your check."),
+                pilot("Engine instruments — green, your check."),
+                pilot("Fuel quantity — sufficient, your check."),
             ],
         ),
         make(
@@ -199,8 +281,9 @@ pub fn checklists(lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<
                 pilot("Power — your call."),
                 act("Mixture, rich.", "set_mixture", json!({ "percent": 100 })),
                 pilot("Altimeter — set, your check."),
+                pilot("Nav and GPS — set, your check."),
                 act("Fuel selector, both.", "set_fuel_selector", json!({ "position": "both" })),
-                pilot("Flaps — as required, your call."),
+                pilot("Flaps — as required. Zero to ten below a hundred and ten, ten to thirty below eighty-five."),
             ],
         ),
         make(
@@ -219,6 +302,17 @@ pub fn checklists(lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<
             ],
         ),
         make(
+            "normal_landing",
+            "normal landing",
+            describe("normal-landing", "'normal landing', 'normal landing checklist', 'on final', 'short final'"),
+            vec![
+                pilot("Flaps — as required. Approach flaps up sixty-five to seventy-five, flaps down sixty to seventy."),
+                pilot("Touchdown — mains first, then lower the nose gently."),
+                pilot("Brakes — minimum required, your call."),
+                act("Flaps, up.", "set_flaps", json!({ "notch": "up" })),
+            ],
+        ),
+        make(
             "after_landing",
             "after landing",
             describe("after-landing", "'after landing', 'after landing checklist', 'clean up', 'clear of the runway'"),
@@ -232,18 +326,19 @@ pub fn checklists(lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<
         ),
     ];
 
-    // Engine shutdown: brake, kill the engine, every light off, then shed the
-    // electrical load with the master last. Built dynamically for the lights.
+    // Engine shutdown: brake, shed the load, kill the engine, then master last.
+    // Built dynamically for the lights.
     let mut secure = vec![
         act("Parking brake, set.", "set_parking_brake", json!({ "on": true })),
         act("Transponder, off.", "set_transponder_mode", json!({ "mode": "off" })),
         act("Autopilot, off.", "autopilot_off", json!({})),
+        act("Avionics, off.", "set_electrical", json!({ "system": "avionics", "on": false })),
+        act("Throttle, idle, a thousand RPM.", "set_throttle", json!({ "percent": 12 })),
         act("Engine, shutting down — mixture cutoff, mags off.", "stop_engine", json!({})),
     ];
     for l in &lights {
         secure.push(act(&format!("{}, off.", capitalize(&l.spoken)), "set_lights", json!({ "light": l.key, "on": false })));
     }
-    secure.push(act("Avionics, off.", "set_electrical", json!({ "system": "avionics", "on": false })));
     secure.push(act("Alternator, off.", "set_electrical", json!({ "system": "alternator", "on": false })));
     secure.push(act("Master switch, off.", "set_electrical", json!({ "system": "master", "on": false })));
     secure.push(pilot("Fuel selector — left or right if parked on a slope, your call."));
@@ -252,7 +347,7 @@ pub fn checklists(lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<
         "secure the aircraft",
         describe(
             "shutdown-and-secure",
-            "'secure the aircraft', 'secure', 'engine shutdown', 'shutdown checklist', 'shut everything down', 'full shutdown'. For JUST the engine say 'shut down the engine'",
+            "'secure the aircraft', 'secure', 'engine shutdown', 'shutdown checklist', 'shut everything down', 'full shutdown'. For JUST the engine (no securing) say 'shut down the engine'",
         ),
         secure,
     ));
