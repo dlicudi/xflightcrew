@@ -55,6 +55,8 @@ pub enum Phase {
 pub struct Snapshot {
     pub on_ground: bool,
     pub groundspeed_kts: f64,
+    /// Indicated airspeed, knots — drives the stall/airspeed callout.
+    pub ias_kts: f64,
     pub agl_ft: f64,
     pub vsi_fpm: f64,
     pub engine_running: bool,
@@ -79,6 +81,10 @@ impl Snapshot {
         let on_ground = xp.get_float("sim/flightmodel/failures/onground_any").await.ok()? > 0.5;
         let groundspeed_kts =
             xp.get_float("sim/flightmodel/position/groundspeed").await.ok()? * MS_TO_KTS;
+        let ias_kts = xp
+            .get_float("sim/cockpit2/gauges/indicators/airspeed_kts_pilot")
+            .await
+            .ok()?;
         let agl_ft = xp.get_float("sim/flightmodel/position/y_agl").await.ok()? * M_TO_FT;
         let vsi_fpm = xp
             .get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot")
@@ -125,6 +131,7 @@ impl Snapshot {
         let mut s = Snapshot {
             on_ground,
             groundspeed_kts,
+            ias_kts,
             agl_ft,
             vsi_fpm,
             engine_running,
@@ -254,6 +261,59 @@ impl FireState {
 }
 
 /// Build the checks enabled for this airframe.
+/// Below this AGL the aircraft is in the landing flare, where slow-and-low is
+/// *intended* — so the airspeed callout is suppressed there to avoid nagging on
+/// every normal touchdown.
+const FLARE_AGL_FT: f64 = 50.0;
+
+/// Approach-to-stall airspeed callout: the copilot's "Airspeed!" — it warns and
+/// prompts the recovery, it never touches the controls (intent is the pilot's;
+/// auto-recovery would fight intentional slow flight). Airborne and above the
+/// flare only, sustained so a momentary dip in a turn doesn't trip it. Banded
+/// like the fuel check: a caution as you approach the stall, an urgent prompt
+/// below it.
+struct StallSpeed {
+    id: &'static str,
+    severity: Severity,
+    /// Fires when IAS ≤ this (kts) …
+    at_or_below_kts: f64,
+    /// … and (if set) still above this — the more urgent band owns below it.
+    above_kts: Option<f64>,
+}
+
+impl Check for StallSpeed {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn severity(&self) -> Severity {
+        self.severity
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        // Airborne and above the flare. Engine state is irrelevant — a glide can
+        // stall too.
+        if s.on_ground || s.agl_ft < FLARE_AGL_FT {
+            return None;
+        }
+        let in_band =
+            s.ias_kts <= self.at_or_below_kts && self.above_kts.map_or(true, |a| s.ias_kts > a);
+        if !in_band {
+            return None;
+        }
+        Some(match self.severity {
+            Severity::Warning => "Airspeed! Lower the nose, add power.".to_string(),
+            _ => "Airspeed — you're getting slow.".to_string(),
+        })
+    }
+    fn min_duration(&self) -> Duration {
+        // Brief sustain to ignore a single-frame dip; the urgent band reacts
+        // faster than the caution.
+        match self.severity {
+            Severity::Warning => Duration::from_millis(800),
+            _ => Duration::from_secs(2),
+        }
+    }
+}
+
 fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     let mut checks: Vec<Box<dyn Check>> = Vec::new();
     if profile.electrical {
@@ -261,6 +321,24 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     }
     if profile.directional_gyro {
         checks.push(Box::new(GyroDrift));
+    }
+    if let Some(vs) = profile.vs_clean_kts {
+        // Caution near 1.15×Vs, urgent prompt below ~1.05×Vs. Disjoint bands so
+        // only one speaks; thresholds scale off the airframe's stall speed.
+        let warn_kts = vs * 1.05;
+        let caution_kts = vs * 1.15;
+        checks.push(Box::new(StallSpeed {
+            id: "airspeed_caution",
+            severity: Severity::Caution,
+            at_or_below_kts: caution_kts,
+            above_kts: Some(warn_kts),
+        }));
+        checks.push(Box::new(StallSpeed {
+            id: "airspeed_warning",
+            severity: Severity::Warning,
+            at_or_below_kts: warn_kts,
+            above_kts: None,
+        }));
     }
     if let Some(fuel) = &profile.fuel {
         // Two banded checks share one struct: caution between the thresholds,
@@ -454,6 +532,7 @@ mod tests {
         Snapshot {
             on_ground: true,
             groundspeed_kts: 0.0,
+            ias_kts: 0.0,
             agl_ft: 0.0,
             vsi_fpm: 0.0,
             engine_running,
@@ -463,6 +542,30 @@ mod tests {
             fuel_kg: None,
             phase: Phase::Ground,
         }
+    }
+
+    #[test]
+    fn airspeed_bands_and_flare_and_ground_suppression() {
+        let caution = StallSpeed { id: "c", severity: Severity::Caution, at_or_below_kts: 55.0, above_kts: Some(50.0) };
+        let warn = StallSpeed { id: "w", severity: Severity::Warning, at_or_below_kts: 50.0, above_kts: None };
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        s.agl_ft = 500.0; // airborne, above the flare
+
+        s.ias_kts = 65.0; // normal approach — silent
+        assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
+        s.ias_kts = 53.0; // getting slow — caution only
+        assert!(caution.eval(&s).is_some() && warn.eval(&s).is_none());
+        s.ias_kts = 48.0; // near stall — warning only (bands disjoint)
+        assert!(warn.eval(&s).is_some() && caution.eval(&s).is_none());
+
+        // Slow but in the flare → suppressed (slow-and-low is intended there).
+        s.agl_ft = 20.0;
+        assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
+        // On the ground → suppressed.
+        s.agl_ft = 500.0;
+        s.on_ground = true;
+        assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
     }
 
     /// The 172's fuel bands: caution ≤ 45 min, warning ≤ 30 min.
