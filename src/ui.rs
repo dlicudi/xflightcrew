@@ -125,6 +125,9 @@ struct App {
     commands: Vec<String>,
     /// Typed-command line (you can type a command instead of speaking it).
     input: String,
+    /// Text mode: Enter enters it, Esc leaves. In command mode `q` quits; in text
+    /// mode every key types (so `q` is a normal letter, e.g. "qnh 2992").
+    editing: bool,
 }
 
 const MAX_LOG: usize = 500;
@@ -156,6 +159,7 @@ pub fn run_dashboard(
         aircraft: Aircraft::default(),
         commands,
         input: String::new(),
+        editing: false,
     };
 
     // Redraw only when something visibly changed, not on a fixed timer — a full
@@ -213,34 +217,46 @@ pub fn run_dashboard(
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
                     let ctrl = k.modifiers.contains(event::KeyModifiers::CONTROL);
-                    match k.code {
-                        // Ctrl-C always quits; Esc quits when the input line is
-                        // empty, otherwise it clears what you've typed.
-                        KeyCode::Char('c') if ctrl => break Ok(()),
-                        KeyCode::Esc => {
-                            if app.input.is_empty() {
-                                break Ok(());
+                    if ctrl && k.code == KeyCode::Char('c') {
+                        break Ok(()); // Ctrl-C always quits
+                    }
+                    if app.editing {
+                        // Text mode: keys type; Enter runs the command (staying in
+                        // text mode for the next one); Esc leaves text mode.
+                        match k.code {
+                            KeyCode::Esc => {
+                                app.editing = false;
+                                app.input.clear();
+                                dirty = true;
                             }
-                            app.input.clear();
-                            dirty = true;
-                        }
-                        KeyCode::Enter => {
-                            let cmd = app.input.trim().to_string();
-                            app.input.clear();
-                            if !cmd.is_empty() {
-                                let _ = cmd_tx.send(cmd); // loop gone = quitting anyway
+                            KeyCode::Enter => {
+                                let cmd = app.input.trim().to_string();
+                                app.input.clear();
+                                if !cmd.is_empty() {
+                                    let _ = cmd_tx.send(cmd); // loop gone = quitting anyway
+                                }
+                                dirty = true;
                             }
-                            dirty = true;
+                            KeyCode::Backspace => {
+                                app.input.pop();
+                                dirty = true;
+                            }
+                            KeyCode::Char(c) if !ctrl => {
+                                app.input.push(c);
+                                dirty = true;
+                            }
+                            _ => {}
                         }
-                        KeyCode::Backspace => {
-                            app.input.pop();
-                            dirty = true;
+                    } else {
+                        // Command mode: q/Esc quit; Enter opens the text line.
+                        match k.code {
+                            KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                            KeyCode::Enter => {
+                                app.editing = true;
+                                dirty = true;
+                            }
+                            _ => {}
                         }
-                        KeyCode::Char(c) if !ctrl => {
-                            app.input.push(c);
-                            dirty = true;
-                        }
-                        _ => {}
                     }
                 }
                 Event::Resize(_, _) => dirty = true,
@@ -336,16 +352,20 @@ fn draw(f: &mut Frame, app: &App) {
         cmdarea,
     );
 
-    // --- input line: type a command instead of speaking it ---
-    let input_line = Line::from(vec![
-        Span::styled(" › ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(app.input.as_str()),
-        Span::styled("▏", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            "   type a command · Enter send · Esc clear/quit · or just speak",
+    // --- bottom line: command-mode hint, or the text input when editing ---
+    let input_line = if app.editing {
+        Line::from(vec![
+            Span::styled(" › ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(app.input.as_str()),
+            Span::styled("▏", Style::default().fg(Color::Cyan)),
+            Span::styled("   Enter run · Esc done", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            " q quit · Enter to type a command · or just speak",
             Style::default().fg(Color::DarkGray),
-        ),
-    ]);
+        ))
+    };
     f.render_widget(Paragraph::new(input_line), hint);
 }
 
