@@ -1,0 +1,117 @@
+# Cessna 172SP — voice command reference
+
+Everything you can say (or type) to x-copilot when flying the stock X-Plane
+**Cessna 172SP Skyhawk**. The command surface is per-airframe — this is the set
+the 172 profile exposes ([profiles/cessna_172sp.yaml](../profiles/cessna_172sp.yaml)).
+
+How it works: you speak (or type in the TUI), a local LLM picks one curated
+tool, x-copilot writes the dataref, then **reads back the actual result**
+("Roger, flaps ten"). It confirms the *action*, not the intent.
+
+- **Compound commands** work: "flaps ten and throttle seventy" runs both.
+- **Follow-ups** work within ~45 s: after "throttle fifty percent", just say
+  "seventy percent" to adjust it; "switch it back to both" resolves "it".
+- **Safety-critical** commands (autopilot heading/altitude/VS) ask for a spoken
+  "affirm" first (disable with `XCOPILOT_CONFIRM=false`).
+
+---
+
+## Phase macros — one command, a whole checklist
+
+Each runs the **settable** items of a phase in sequence. Judgment and visual
+items (flaps-as-required, the mag run-up, controls-free) stay with you.
+
+| Say | Does |
+|---|---|
+| **"before starting engine"** | parking brake on · autopilot off · avionics off · fuel selector both |
+| **"start the engine"** / "ignition start" | battery · mixture rich · throttle cracked · mags both · **crank** (waits for catch, voltage-gated) · alternator + avionics on |
+| **"before taxi"** | transponder standby · taxi light on |
+| **"before takeoff"** / "configure for takeoff" | brake on · mixture rich · fuel both · strobe + landing lights on · autopilot off · trim takeoff |
+| **"normal takeoff"** | taxi light off · transponder altitude · mixture rich |
+| **"climb"** | landing light off · throttle full · mixture rich |
+| **"cruise"** | mixture leaned |
+| **"descent"** | mixture rich · fuel both |
+| **"before landing"** / "configure for landing" | fuel both · mixture rich · landing + taxi lights on · autopilot off |
+| **"after landing"** / "clean up" | flaps up · landing/strobe/nav lights off · transponder standby |
+| **"shut down the engine"** | mixture cutoff · magnetos off |
+| **"secure the aircraft"** / "full shutdown" | brake on · engine off · all lights off · transponder/avionics/alternator/master off |
+
+A full flight by voice: *before starting engine → start the engine → before taxi
+→ before takeoff → normal takeoff → climb → cruise → descent → before landing →
+after landing → secure the aircraft.*
+
+---
+
+## Single commands by system
+
+### Flight controls
+- **Flaps** — "flaps up / ten / twenty / full", "flaps down"
+- **Trim** — "trim nose up / down", "set takeoff trim", "trim neutral"
+- **Parking brake** — "parking brake on / off", "set the brakes"
+
+### Autopilot
+- **Heading** — "fly heading 270", "autopilot heading 090"
+- **Altitude** — "climb and maintain 7000", "set altitude 3000"
+- **Vertical speed** — "vertical speed 500 up", "descend at 700"
+- **Level off** — "auto level", "wings level", "hold this altitude", "stop the climb"
+- **Disconnect** — "autopilot off", "I have the airplane"
+
+### Engine & fuel
+- **Throttle** — "throttle 60 percent", "full power", "idle"
+- **Mixture** — "mixture full rich", "lean", "mixture idle cutoff"
+- **Start / stop** — "start the engine", "shut down the engine"
+- **Carb heat** — "carb heat on / off" (hot / cold)
+- **Fuel pump** — "fuel pump on / off"
+- **Fuel selector** — "fuel selector both / left / right", "fuel valve both"
+- **Magnetos / ignition** — "magnetos both / left / right / off", "ignition both / off"
+
+### Electrical
+- "battery on" · "master switch on / off" (battery + alternator) · "avionics on / off"
+  · "alternator on / off" · "all electrical off"
+
+### Lights
+- **Exterior** — "landing / taxi / strobe / nav / beacon light on / off"
+  (handles mishears like "floodlights"/"bloodlights")
+- **Flood lights** — "flood lights on / off", "floods to 30 percent"
+
+### Radios & transponder
+- **COM** — "com one 118.5", "com two 121.9", "swap com one"
+- **NAV** — "nav one 109.5", "set the OBS to 240"
+- **Transponder** — "squawk 1200", "transponder standby / altitude / off", "ident"
+
+### Instruments
+- **Altimeter** — "set altimeter 29.92", "altimeter 30.10"
+- **Pitot heat** — "pitot heat on / off"
+- **Gyro** — "align the gyro", "sync the heading indicator"
+
+### Approach
+- **ILS** — "prepare the ILS for runway 28", "set up the ILS"
+
+---
+
+## Safety gates
+
+x-copilot refuses (and explains) rather than do something unsafe:
+
+- **Flap Vfe** — flaps to 10° need < 110 KIAS; 20°/full need < 85 KIAS. Too fast →
+  refused ("103 knots is above the 85-knot limit for flaps full").
+- **Autopilot altitude** — a target below **500 ft MSL** is refused (use "level
+  off" to hold your current altitude). Catches a misheard/empty value.
+- **Engine start** — won't crank a flat battery (needs ≥ 23 V); connect ground power.
+- **Fixed gear** — the 172 has no gear tool; "gear up" does nothing (by design).
+
+## 172SP limits (reference)
+
+| | |
+|---|---|
+| Vne (never exceed) | 163 kt |
+| Vno (max structural cruise) | 129 kt |
+| Va (maneuvering) | 105 kt |
+| Vfe 10° / 20°–full | 110 / 85 kt |
+| Flap detents | up · 10° · 20° · full |
+| Lights | nav · beacon · strobe · landing · taxi · floods |
+
+## Background monitor
+
+A separate watcher calls out problems unprompted (alternator offline, low fuel
+endurance). See [monitoring.md](monitoring.md). Disable with `XCOPILOT_MONITOR=false`.

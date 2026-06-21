@@ -1,2 +1,104 @@
 # x-copilot
-X-Plane Copilot
+
+A voice-commanded copilot for X-Plane. You speak a command, a **local** LLM picks
+the matching action, x-copilot writes the X-Plane dataref, and it reads the
+result back aloud.
+
+```
+🎙️  "flaps ten"  →  whisper (STT)  →  LLM picks a tool  →  write dataref  →  "Roger, flaps ten."
+```
+
+It's the **actor** in the cockpit: you fly and command, it works the panel and
+confirms — hands stay on the controls, eyes stay outside. The whole loop is local
+and real-time (ears, brain, and mouth all run on your machine; nothing is metered
+per call).
+
+> `x-copilot` is the working name. (Product name TBD.)
+
+## What it can do
+
+- **Single commands** across every 172 system — flaps, autopilot, engine, fuel,
+  electrics, lights, radios, transponder, instruments.
+- **Phase macros** — one command runs a whole checklist's settable items
+  ("configure for takeoff", "secure the aircraft").
+- **Compound commands** — "flaps ten and throttle seventy" runs both.
+- **Conversational context** — "throttle fifty percent" then "seventy percent";
+  "switch it back to both".
+- **Safety gates + readbacks** — refuses unsafe actions (flap Vfe, low-altitude
+  AP targets), confirms safety-critical ones, and reads back the *actual* state.
+- **Background monitor** — calls out problems unprompted (alternator offline, low
+  fuel).
+
+➡️ **Full command + checklist reference: [docs/cessna_172sp.md](docs/cessna_172sp.md)**
+· Monitor details: [docs/monitoring.md](docs/monitoring.md)
+
+## Quick start
+
+You need three local pieces running:
+
+1. **X-Plane 12** with the Web API enabled (Settings → Network → Web API, port 8086).
+2. **[Ollama](https://ollama.com)** with a tool-calling model:
+   ```sh
+   ollama serve
+   ollama pull qwen3:8b        # the default; won the tool-pick battery
+   ```
+3. A **whisper.cpp** model for speech-to-text — a ggml `.bin` in `models/`
+   (e.g. `ggml-base.en.bin`).
+
+Then:
+
+```sh
+cp .env.example .env          # all defaults are sensible; tweak if needed
+cargo run                     # plain stdout UI
+XCOPILOT_UI=tui cargo run     # terminal dashboard (conversation, aircraft panel, mic)
+```
+
+The aircraft profile is auto-detected from X-Plane (`acf_ICAO`); the stock 172SP
+is the built-in default.
+
+### Speak or type
+
+- **Continuous** (default): just speak commands.
+- **Push-to-talk**: `XCOPILOT_LISTEN=ptt` — Enter to start/stop recording.
+- **TUI text input**: in the dashboard, type a command on the bottom line and
+  press Enter (great for testing — no mic, no STT mishears). Esc / Ctrl-C quit.
+
+## Stack
+
+| Stage | How |
+|---|---|
+| Mic capture | `cpal` |
+| Speech-to-text | `whisper-rs` (whisper.cpp, Metal GPU on Apple Silicon) |
+| LLM tool-picker | local **Ollama** (`/api/chat`), backend-neutral tool schema |
+| X-Plane write | `reqwest` → X-Plane Web API (`PATCH /api/v1/datarefs/...`) |
+| Text-to-speech | macOS `say` (default) or `piper` |
+
+The tool surface is per-airframe: an aircraft profile declares which systems
+exist and their limits, and the tool registry is built from it. See
+[CLAUDE.md](CLAUDE.md) for the design rationale.
+
+## Configuration
+
+All via environment / `.env` — see [.env.example](.env.example) for the full,
+documented list. Common knobs:
+
+| Var | Default | What |
+|---|---|---|
+| `XCOPILOT_MODEL` | `qwen3:8b` | Ollama tool-calling model |
+| `XCOPILOT_UI` | `plain` | `plain` or `tui` |
+| `XCOPILOT_LISTEN` | `continuous` | `continuous` or `ptt` |
+| `XCOPILOT_CONFIRM` | `true` | require "affirm" before safety-critical commands |
+| `XCOPILOT_MONITOR` | `true` | background problem callouts |
+| `XCOPILOT_END_SILENCE_MS` | `900` | trailing silence that ends an utterance |
+
+## Tests
+
+```sh
+cargo test                                   # unit tests (no sim/LLM needed)
+scripts/llm_bench.sh qwen3:8b                # compare models on the tool-pick battery (needs Ollama)
+```
+
+## Licensing
+
+Currently proprietary (all rights reserved) — a maybe-commercial product kept
+closed until there's a reason to open it.
