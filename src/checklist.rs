@@ -435,6 +435,13 @@ fn clean_narration(s: &str) -> Option<String> {
     if t.is_empty() {
         return None;
     }
+    // Drop the file's section header/footer boilerplate ("CRUISE CHECKLIST",
+    // "CLIMB CHECKLIST COMPLETED") — the runner already announces the start and
+    // end. The substantive remarks ("MAGNETO TEST", recommended speeds) don't
+    // mention "checklist", so this only sheds the duplicates.
+    if t.to_lowercase().contains("checklist") {
+        return None;
+    }
     let line = humanize(t);
     // Replace the challenge|response bar with a comma for natural reading.
     let line = line.replace('|', ", ");
@@ -566,6 +573,16 @@ mod tests {
         // The before-takeoff list actuates the parking brake (first real item).
         let bt = cls.iter().find(|c| c.id == "before_takeoff").unwrap();
         assert!(bt.items.iter().any(|i| matches!(i, Item::Act { tool, .. } if *tool == "set_parking_brake")));
+
+        // The file's "X CHECKLIST" / "...COMPLETED" boilerplate is dropped — the
+        // runner announces start/end itself, so none should survive as narration.
+        for c in &cls {
+            for item in &c.items {
+                if let Item::Narrate(t) = item {
+                    assert!(!t.to_lowercase().contains("checklist"), "leaked boilerplate: {t:?}");
+                }
+            }
+        }
     }
 
     #[test]
