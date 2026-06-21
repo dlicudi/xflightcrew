@@ -21,6 +21,8 @@ mod ui;
 mod voice;
 mod xplane;
 
+use std::time::{Duration, Instant};
+
 use anyhow::{anyhow, Result};
 
 use audio::Listener;
@@ -179,6 +181,16 @@ async fn main() -> Result<()> {
 /// The voice loop: listen → transcribe → pick a tool → confirm → execute → read
 /// back. Progress is emitted through `reporter` (plain stdout or the TUI), so
 /// the same code drives both UIs.
+/// Recent turns kept for back-reference resolution (see [`Llm::choose_tool`]).
+const HISTORY_MAX: usize = 3;
+/// Turns older than this are dropped from context — stale state shouldn't bleed
+/// into a new command.
+const HISTORY_TTL: Duration = Duration::from_secs(90);
+/// After a command, a window in which a continuation utterance ("switch it back",
+/// "a bit more") is accepted even without a hard aviation keyword — the LLM
+/// resolves it from history. Outside the window the strict keyword gate applies.
+const FOLLOWUP_WINDOW: Duration = Duration::from_secs(45);
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     config: Config,
@@ -200,6 +212,9 @@ async fn run_session(
     if !checklists.is_empty() {
         specs.push(checklist::run_checklist_spec(&checklists));
     }
+    // Rolling conversation memory: recent (command, readback, when) turns, used
+    // to resolve back-references and to gate conversational follow-ups.
+    let mut history: Vec<(String, String, Instant)> = Vec::new();
     let mut listener = if continuous {
         // Share the speech arbiter's mic gate so the listener mutes itself while
         // the copilot speaks (readbacks and monitor alerts alike).
@@ -258,18 +273,33 @@ async fn run_session(
         // at least one aviation keyword before we act — and before we even ask
         // the LLM.
         if !looks_like_command(&command) {
-            if explicit {
-                say(&voice, &reporter, ui::LogKind::Warn, "Sorry, that didn't sound like a command.");
-            } else {
-                reporter.log(ui::LogKind::Info, format!("not a command: \"{command}\""));
+            // A conversational follow-up shortly after a command is let through
+            // even without a keyword ("switch it back to both") — the LLM
+            // resolves it from history. Outside the window, the strict gate holds.
+            let in_followup = history
+                .last()
+                .is_some_and(|(_, _, t)| t.elapsed() < FOLLOWUP_WINDOW);
+            if !(in_followup && looks_like_followup(&command)) {
+                if explicit {
+                    say(&voice, &reporter, ui::LogKind::Warn, "Sorry, that didn't sound like a command.");
+                } else {
+                    reporter.log(ui::LogKind::Info, format!("not a command: \"{command}\""));
+                }
+                continue;
             }
-            continue;
         }
+
+        // Recent, non-stale turns for the LLM to resolve back-references against.
+        let ctx_history: Vec<(String, String)> = history
+            .iter()
+            .filter(|(_, _, t)| t.elapsed() < HISTORY_TTL)
+            .map(|(u, a, _)| (u.clone(), a.clone()))
+            .collect();
 
         // LLM picks the tool(s). A compound command ("taxi and nav lights on")
         // yields more than one call; they're executed in spoken order.
         reporter.status(ui::Phase::Thinking);
-        let calls = match llm.choose_tool(&command, &specs).await {
+        let calls = match llm.choose_tool(&command, &specs, &ctx_history).await {
             Ok(calls) if !calls.is_empty() => calls,
             Ok(_) => {
                 if explicit {
@@ -286,6 +316,9 @@ async fn run_session(
             }
         };
 
+        // Readbacks from this utterance's actions, recorded as the assistant
+        // turn afterwards so the next command can refer back to what was done.
+        let mut turn_readbacks: Vec<String> = Vec::new();
         for mut call in calls {
             tracing::info!(tool = %call.name, args = %call.arguments, "tool selected");
             reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
@@ -335,7 +368,7 @@ async fn run_session(
                     Some(correction) => {
                         reporter.log(ui::LogKind::Info, format!("correction: \"{correction}\""));
                         reporter.status(ui::Phase::Thinking);
-                        match llm.choose_tool(&format!("{command}, {correction}"), &specs).await {
+                        match llm.choose_tool(&format!("{command}, {correction}"), &specs, &ctx_history).await {
                             Ok(mut cs) if !cs.is_empty() => {
                                 call = cs.remove(0);
                                 reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
@@ -369,6 +402,18 @@ async fn run_session(
                 }
             };
             say(&voice, &reporter, ui::LogKind::Readback, &readback);
+            turn_readbacks.push(readback);
+        }
+
+        // Record this turn for back-reference context, then bound the history by
+        // count and age so stale state can't accumulate.
+        if !turn_readbacks.is_empty() {
+            history.push((command.clone(), turn_readbacks.join(" "), Instant::now()));
+            let excess = history.len().saturating_sub(HISTORY_MAX);
+            if excess > 0 {
+                history.drain(0..excess);
+            }
+            history.retain(|(_, _, t)| t.elapsed() < HISTORY_TTL);
         }
     }
 }
@@ -488,7 +533,7 @@ async fn fix_item(
     reporter: &Reporter,
 ) -> bool {
     reporter.status(ui::Phase::Thinking);
-    let Ok(call) = llm.choose_tool(cmd, specs).await.map(|mut v| v.drain(..).next()) else { return false };
+    let Ok(call) = llm.choose_tool(cmd, specs, &[]).await.map(|mut v| v.drain(..).next()) else { return false };
     let Some(call) = call else { return false };
     let Some(tool) = registry.get(&call.name) else { return false };
     let ctx = ToolCtx { xplane, config };
@@ -746,6 +791,20 @@ fn looks_like_command(text: &str) -> bool {
         })
 }
 
+/// True if an utterance looks like a *continuation* of the previous command —
+/// back-references ("it", "that", "the other one") or "again/undo/more"-style
+/// words — so a follow-up can clear the gate (within the follow-up window) even
+/// without a domain keyword, and the LLM resolves it from history.
+fn looks_like_followup(text: &str) -> bool {
+    const FOLLOWUP_WORDS: &[&str] = &[
+        "it", "that", "them", "those", "again", "back", "undo", "revert",
+        "reset", "more", "less", "instead", "also", "other", "same", "too",
+    ];
+    text.split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|w| !w.is_empty())
+        .any(|w| FOLLOWUP_WORDS.contains(&w.to_ascii_lowercase().as_str()))
+}
+
 /// True if a single lowercased token is, or is a one-letter mishearing of, a
 /// command keyword. Whisper routinely mangles a word by a letter ("thrust" →
 /// "trust", "descend" → "descent"); the near-miss is restricted to 5+ char
@@ -836,6 +895,18 @@ mod tests {
             "do the engine shutdown checklist", "run the cruise checklist",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
+        }
+    }
+
+    use super::looks_like_followup;
+
+    #[test]
+    fn followups_are_recognized_but_plain_chatter_is_not() {
+        for c in ["switch it back to both", "do that again", "a bit more", "undo that", "the other tank"] {
+            assert!(looks_like_followup(c), "{c:?} should look like a follow-up");
+        }
+        for c in ["nice weather today", "where are we", "hello copilot"] {
+            assert!(!looks_like_followup(c), "{c:?} should not");
         }
     }
 

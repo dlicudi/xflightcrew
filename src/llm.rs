@@ -101,13 +101,18 @@ impl Llm {
     /// always the model fumbling, not a genuine "nothing fits". We give it
     /// another look with a little sampling entropy to escape that dead-end —
     /// applied **only on retry**, so the common case stays deterministic.
+    ///
+    /// `history` is recent `(spoken command, readback)` turns, oldest first, so
+    /// the model can resolve back-references ("switch *it* back", "a bit more")
+    /// against what was just done. Pass an empty slice for a context-free pick.
     pub async fn choose_tool(
         &self,
         transcript: &str,
         tools: &[ToolSpec],
+        history: &[(String, String)],
     ) -> Result<Vec<ToolCall>> {
         // Deterministic first pass.
-        let calls = self.choose_tool_at(transcript, tools, 0.0).await?;
+        let calls = self.choose_tool_at(transcript, tools, history, 0.0).await?;
         if !calls.is_empty() {
             return Ok(calls);
         }
@@ -115,7 +120,7 @@ impl Llm {
         // concrete pick.
         for &temp in RETRY_TEMPS {
             tracing::debug!(temp, transcript = %transcript, "tool selection empty; retrying with temperature bump");
-            let calls = self.choose_tool_at(transcript, tools, temp).await?;
+            let calls = self.choose_tool_at(transcript, tools, history, temp).await?;
             if !calls.is_empty() {
                 tracing::info!(temp, transcript = %transcript, n = calls.len(), "recovered tool(s) on retry");
                 return Ok(calls);
@@ -130,6 +135,7 @@ impl Llm {
         &self,
         transcript: &str,
         tools: &[ToolSpec],
+        history: &[(String, String)],
         temperature: f64,
     ) -> Result<Vec<ToolCall>> {
         let tool_specs: Vec<Value> = tools
@@ -145,6 +151,15 @@ impl Llm {
                 })
             })
             .collect();
+
+        // system, then the recent turns as user/assistant pairs, then the new
+        // command — so the model reads the current utterance in context.
+        let mut messages = vec![json!({ "role": "system", "content": SYSTEM_PROMPT })];
+        for (user, assistant) in history {
+            messages.push(json!({ "role": "user", "content": user }));
+            messages.push(json!({ "role": "assistant", "content": assistant }));
+        }
+        messages.push(json!({ "role": "user", "content": transcript }));
 
         let mut body = json!({
             "model": self.model,
@@ -170,10 +185,7 @@ impl Llm {
                 // ever truncated — truncation would silently degrade selection.
                 "num_ctx": 8192,
             },
-            "messages": [
-                { "role": "system", "content": SYSTEM_PROMPT },
-                { "role": "user", "content": transcript },
-            ],
+            "messages": messages,
             "tools": tool_specs,
         });
 
@@ -319,7 +331,7 @@ mod tests {
         println!("\n  model: {}", cfg.model);
         let mut failures = 0;
         for (utterance, expected_tool, expected_arg) in cases {
-            match llm.choose_tool(utterance, &specs).await.expect("ollama call failed").into_iter().next() {
+            match llm.choose_tool(utterance, &specs, &[]).await.expect("ollama call failed").into_iter().next() {
                 Some(call) => {
                     let tool_ok = call.name == *expected_tool;
                     let arg_ok = expected_arg
@@ -413,7 +425,7 @@ mod tests {
                 gate_skipped += 1;
                 continue;
             }
-            match llm.choose_tool(utterance, &specs).await.expect("ollama call failed").into_iter().next() {
+            match llm.choose_tool(utterance, &specs, &[]).await.expect("ollama call failed").into_iter().next() {
                 Some(call) => {
                     let tool_ok = call.name == *expected_tool;
                     let arg_ok = expected_arg
@@ -442,7 +454,7 @@ mod tests {
                 gate_skipped += 1;
                 continue;
             }
-            match llm.choose_tool(utterance, &specs).await.expect("ollama call failed").into_iter().next() {
+            match llm.choose_tool(utterance, &specs, &[]).await.expect("ollama call failed").into_iter().next() {
                 None => println!("  ✓ {utterance:?} -> (declined, correct)"),
                 Some(call) => {
                     println!("  ✗ {utterance:?} -> {} {} (should have declined)", call.name, call.arguments);
@@ -484,7 +496,7 @@ mod tests {
             for t in temps {
                 let mut hits = 0;
                 for _ in 0..TRIES {
-                    if let Some(c) = llm.choose_tool_at(phrase, &specs, t).await.expect("ollama").into_iter().next() {
+                    if let Some(c) = llm.choose_tool_at(phrase, &specs, &[], t).await.expect("ollama").into_iter().next() {
                         if c.name == want {
                             hits += 1;
                         }
@@ -528,7 +540,7 @@ mod tests {
 
         for (utterance, expect) in commands {
             let call = llm
-                .choose_tool(utterance, &specs)
+                .choose_tool(utterance, &specs, &[])
                 .await
                 .expect("ollama call failed")
                 .into_iter()
