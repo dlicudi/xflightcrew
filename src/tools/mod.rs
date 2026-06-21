@@ -18,6 +18,7 @@ pub mod engine;
 pub mod flaps;
 pub mod instruments;
 pub mod lights;
+pub mod macros;
 pub mod radio;
 
 use anyhow::Result;
@@ -165,6 +166,13 @@ impl Registry {
 
         if profile.ils {
             tools.push(Box::new(approach::PrepareIls));
+        }
+
+        // Phase-config macro: a single command that fires a curated sequence of
+        // the deterministic takeoff items (like `start_engine` bundles the start).
+        // Needs the engine systems it sets; passes the profile's lights through.
+        if profile.engine {
+            tools.push(Box::new(macros::ConfigureForTakeoff::new(profile.lights.clone())));
         }
 
         // Future, gated the same way:
