@@ -219,6 +219,7 @@ pub fn load(id: &str) -> Option<AircraftProfile> {
 pub fn builtin(id: &str) -> Option<AircraftProfile> {
     match id {
         "cessna_172sp" => Some(cessna_172sp()),
+        "cirrus_sr22" => Some(cirrus_sr22()),
         _ => None,
     }
 }
@@ -258,6 +259,35 @@ mod tests {
     fn unknown_profile_is_none() {
         // No YAML, no built-in → None (caller surfaces a clear error).
         assert!(load("does_not_exist").is_none());
+    }
+
+    #[test]
+    fn sr22_yaml_loads_and_is_conservative() {
+        let p = load("cirrus_sr22").expect("SR22 profile loads");
+        assert_eq!(p.id, "cirrus_sr22");
+        // Universal-dataref tools on; SR22-specific systems off (scaffold).
+        assert!(p.autopilot && p.parking_brake && p.pitot_heat && p.transponder);
+        assert!(!p.engine && !p.electrical && !p.magnetos && !p.fuel_pump && !p.fuel_selector);
+        // Flaps 0/50/100.
+        let flaps = p.flaps.expect("has flaps");
+        assert_eq!(flaps.detents.len(), 3);
+        assert_eq!(flaps.detents[2].label, "full");
+        assert_eq!(flaps.detents[1].vfe_kts, Some(150.0));
+        assert_eq!(p.vs_clean_kts, Some(76.0));
+        assert_eq!(p.lights.len(), 3);
+        // Conservative map: only the universal-safe entries, and the YAML matches
+        // the built-in.
+        let yaml_map = &p.checklist_map;
+        let builtin_map = &cirrus_sr22().checklist_map;
+        assert_eq!(yaml_map.len(), builtin_map.len());
+        for (a, b) in yaml_map.iter().zip(builtin_map) {
+            assert_eq!(a.match_, b.match_);
+        }
+        // None of the volatile/SR22-specific systems are mapped to act yet.
+        for e in yaml_map {
+            assert!(!e.match_.contains("mixture") && !e.match_.contains("battery")
+                && !e.match_.contains("ignition") && !e.match_.contains("throttle"));
+        }
     }
 }
 
@@ -357,5 +387,96 @@ fn cessna_172sp() -> AircraftProfile {
             light("taxi", "taxi light", "sim/cockpit2/switches/taxi_light_on",
                   "sim/lights/taxi_lights_on", "sim/lights/taxi_lights_off"),
         ],
+    }
+}
+
+/// The X-Plane stock Cirrus SR22 (Laminar). **Scaffold** — built from the
+/// GoofyJP XChecklist file and the POH; datarefs marked "verify" below are
+/// unconfirmed against the sim. Conservative by design: only systems on
+/// universal X-Plane datarefs are enabled/actioned. The SR22's own systems —
+/// dual battery/alternator, the `ENGN_mixt` mixture, the `boost_pump`, the
+/// off/left/right fuel selector, key-start ignition — are left off until their
+/// datarefs/tools are built and verified in the cockpit.
+fn cirrus_sr22() -> AircraftProfile {
+    let detent = |label: &str, spoken: &str, ratio: f64, vfe: Option<f64>| FlapDetent {
+        label: label.into(),
+        spoken: spoken.into(),
+        ratio,
+        vfe_kts: vfe,
+    };
+    let light = |key: &str, spoken: &str, dataref: &str, cmd_on: &str, cmd_off: &str| LightProfile {
+        key: key.into(),
+        spoken: spoken.into(),
+        dataref: dataref.into(),
+        command_on: Some(cmd_on.into()),
+        command_off: Some(cmd_off.into()),
+    };
+    AircraftProfile {
+        id: "cirrus_sr22".into(),
+        display_name: "Cirrus SR22".into(),
+        retractable_gear: false,
+        // Universal-dataref tools — safe across airframes.
+        autopilot: true,
+        barometer: true,
+        com_radio: true,
+        com2_radio: true,
+        nav_radio: true,
+        transponder: true,
+        ils: true,
+        parking_brake: true,
+        pitot_heat: true,
+        // SR22-specific — off until built/verified.
+        engine: false,
+        electrical: false,
+        magnetos: false,
+        carb_heat: false, // fuel-injected — no carb heat
+        fuel_pump: false,
+        fuel_selector: false,
+        directional_gyro: false, // G1000 glass — no vacuum DG
+        flood_lights: false,
+        pitch_trim: false,
+        // Flaps 0 / 50% / 100% (Vfe 150 / 110 KIAS); set_flaps writes the
+        // universal flap_ratio. Detent ratios: verify.
+        flaps: Some(FlapProfile {
+            detents: vec![
+                detent("up", "up", 0.0, None),
+                detent("50", "fifty percent", 0.5, Some(150.0)),
+                detent("full", "full", 1.0, Some(110.0)),
+            ],
+        }),
+        // SR22 ~92 gal usable, ~17 gal/hr cruise (~46 kg/hr). Verify.
+        fuel: Some(FuelProfile {
+            reserve_caution_min: 45.0,
+            reserve_warning_min: 30.0,
+            cruise_burn_kg_hr: 46.0,
+        }),
+        // VS1 (clean) ~76 KIAS; VS0 (landing) ~61.
+        vs_clean_kts: Some(76.0),
+        checklist: Some("checklists/cirrus_sr22.txt".into()),
+        // Lights — datarefs/commands from the checklist file + universal commands;
+        // verify in the sim before trusting.
+        lights: vec![
+            light("nav", "nav lights", "sim/cockpit/electrical/nav_lights_on",
+                  "sim/lights/nav_lights_on", "sim/lights/nav_lights_off"),
+            light("strobe", "strobe lights", "sim/cockpit/electrical/strobe_lights_on",
+                  "sim/lights/strobe_lights_on", "sim/lights/strobe_lights_off"),
+            light("landing", "landing light", "sim/cockpit/electrical/landing_lights_on",
+                  "sim/lights/landing_lights_on", "sim/lights/landing_lights_off"),
+        ],
+        // CONSERVATIVE map — only rock-solid universal datarefs act. Everything
+        // else verifies / calls out. Promote entries here as you confirm SR22
+        // datarefs in the sim.
+        checklist_map: {
+            let m = |s: &str, a: ChecklistAction| ChecklistMapEntry { match_: s.into(), action: a };
+            use ChecklistAction::*;
+            vec![
+                m("parkbrake", ParkingBrake),
+                m("transponder_mode", Transponder),
+                m("pitot_heat_on", PitotHeat),
+                m("nav_lights", Light("nav".into())),
+                m("strobe_lights", Light("strobe".into())),
+                m("landing_lights", Light("landing".into())),
+            ]
+        },
     }
 }
