@@ -25,8 +25,11 @@ const VS_DIAL: &str = "sim/cockpit2/autopilot/vvi_dial_fpm";
 const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";
 /// Command: engage the servos.
 const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
-/// Command: disengage the servos (autopilot disconnect).
-const CMD_SERVOS_OFF: &str = "sim/autopilot/servos_off";
+/// Command: disengage the servos (autopilot disconnect). The stock 172's
+/// S-TEC-style AP does not register `sim/autopilot/servos_off` — X-Plane exposes
+/// `servos_off_any` (definitive off) and `servos_toggle`. We use the former so
+/// the disconnect is unambiguous regardless of the read-back state.
+const CMD_SERVOS_OFF: &str = "sim/autopilot/servos_off_any";
 /// Command: engage heading-select (HDG) mode.
 const CMD_HEADING_MODE: &str = "sim/autopilot/heading";
 /// Command: engage altitude select/hold (ALT) mode.
