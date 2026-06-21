@@ -230,17 +230,23 @@ impl Tool for StartEngine {
                     .and_then(|v| v.first().copied())
                     .map(|g| g > 0.5)
                     .unwrap_or(false);
+                // Bring the avionics master online now the engine's running and
+                // the alternator is charging — matches the STARTING ENGINE
+                // checklist (avionics OFF for the start, ON after) and closes the
+                // gap where the transponder/radios sat on a dead bus. Commands
+                // verified present in the sim.
+                let avionics_on = super::electrical::SetElectrical
+                    .execute(&json!({ "system": "avionics", "on": true }), ctx)
+                    .await
+                    .is_ok();
                 // Narrate the start sequence so the pilot hears what was done on
                 // their behalf, not just the end state.
-                return Ok(if alt_on {
+                let alt = if alt_on { "alternator on" } else { "but the alternator didn't come on, check it" };
+                let avi = if avionics_on { ", avionics on" } else { "" };
+                return Ok(format!(
                     "Roger — mixture rich, throttle cracked, mags both, cranking. \
-                     Engine started, alternator on."
-                        .to_string()
-                } else {
-                    "Roger — mixture rich, throttle cracked, mags both, cranking. \
-                     Engine started — but the alternator didn't come on, check it."
-                        .to_string()
-                });
+                     Engine started, {alt}{avi}."
+                ));
             }
         }
         Ok("Cranking — the engine hasn't caught. Check fuel and mixture, then try again.".to_string())
