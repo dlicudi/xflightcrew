@@ -510,7 +510,7 @@ fn is_affirmative(reply: &str) -> bool {
     let r = reply.to_lowercase();
     const YES: &[&str] = &[
         "affirm", "affirmative", "confirm", "yes", "yeah", "yep", "roger", "correct",
-        "copy", "proceed", "go ahead", "do it", "right",
+        "copy", "proceed", "go ahead", "do it", "right", "indeed", "okay", "absolutely",
     ];
     if NEGATIONS.iter().any(|w| r.contains(w)) {
         return false;

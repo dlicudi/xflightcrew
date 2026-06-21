@@ -93,6 +93,7 @@ impl Registry {
             tools.push(Box::new(autopilot::SetHeading));
             tools.push(Box::new(autopilot::SetAltitude));
             tools.push(Box::new(autopilot::SetVerticalSpeed));
+            tools.push(Box::new(autopilot::LevelOff));
             tools.push(Box::new(autopilot::AutopilotOff));
         }
 

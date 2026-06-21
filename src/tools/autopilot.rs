@@ -36,6 +36,15 @@ const CMD_SERVOS_OFF: &str = "sim/autopilot/servos_off_any";
 const CMD_HEADING_MODE: &str = "sim/autopilot/heading";
 /// Command: engage altitude select/hold (ALT) mode.
 const CMD_ALT_HOLD: &str = "sim/autopilot/altitude_hold";
+/// Command: wings-level / roll hold — for "auto level" / "straight and level".
+const CMD_WING_LEVELER: &str = "sim/autopilot/wing_leveler";
+/// Current indicated altitude (feet), read to capture "hold this altitude".
+const CURRENT_ALT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot";
+/// Autopilot altitude targets below this (feet MSL) are refused — a 172's AP is
+/// never commanded this low, so it's almost always a misheard/empty value (e.g.
+/// "auto level" misread as altitude 0). The gate catches it before the AP flies
+/// the aircraft into the ground.
+const MIN_AP_ALTITUDE_FT: f64 = 500.0;
 /// Command: engage vertical-speed (VS) mode.
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
 /// Descents steeper than this (fpm) are confirmed — anything shallower, and all
@@ -158,6 +167,16 @@ impl Tool for SetAltitude {
         let args: AltArgs = serde_json::from_value(args.clone())?;
         let altitude = args.altitude.max(0.0);
 
+        // Safety gate: refuse an absurdly-low target rather than fly the aircraft
+        // toward the ground. "auto level" with no number lands here as 0 feet —
+        // refuse and point at the right tool.
+        if altitude < MIN_AP_ALTITUDE_FT {
+            return Ok(format!(
+                "Negative — {altitude:.0} feet is too low for an altitude hold. Say a target like \
+                 five thousand, or 'level off' to hold your current altitude."
+            ));
+        }
+
         // Engage first, then set the target LAST (see set_heading note).
         ctx.xplane.run_command(CMD_SERVOS_ON).await?;
         ctx.xplane.run_command(CMD_ALT_HOLD).await?;
@@ -170,6 +189,50 @@ impl Tool for SetAltitude {
             Ok(format!(
                 "Altitude set to {:.0} feet, but the autopilot didn't engage — check the AP master.",
                 actual
+            ))
+        }
+    }
+}
+
+/// `level_off` — capture the current altitude, level the wings, and hold. The
+/// "auto level / straight and level" command, which has no target (it holds
+/// where you are now), so it can't be expressed as `set_altitude`.
+pub struct LevelOff;
+
+#[async_trait]
+impl Tool for LevelOff {
+    fn name(&self) -> &str {
+        "level_off"
+    }
+
+    fn description(&self) -> &str {
+        "Level the aircraft and hold the CURRENT altitude — engage the autopilot \
+         in altitude hold at the altitude you're at now, wings level. Takes no \
+         target. Use for 'auto level', 'level off', 'level the aircraft', 'wings \
+         level', 'straight and level', 'hold this altitude', 'hold present \
+         altitude', 'stop the climb', 'stop descending', 'level here'."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+
+    async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        // Capture where we are now and hold it (rounded to the nearest 100 ft,
+        // the way an ALT-button capture reads out).
+        let current = ctx.xplane.get_float(CURRENT_ALT).await?;
+        let target = (current / 100.0).round() * 100.0;
+
+        ctx.xplane.run_command(CMD_SERVOS_ON).await?;
+        ctx.xplane.run_command(CMD_WING_LEVELER).await?;
+        ctx.xplane.run_command(CMD_ALT_HOLD).await?;
+        ctx.xplane.set_float(ALT_DIAL, target).await?;
+
+        if servos_engaged(ctx).await? {
+            Ok(format!("Roger, wings level, holding {target:.0} feet."))
+        } else {
+            Ok(format!(
+                "Set to hold {target:.0} feet, but the autopilot didn't engage — check the AP master."
             ))
         }
     }
