@@ -515,7 +515,7 @@ async fn run_checklist(
                         }
                     }
                 }
-                if checklist::run_step(tool, args, &cl.lights, &cl.flaps, &ctx).await.is_ok() {
+                if checklist::run_step(tool, args, &cl.lights, &cl.flaps, &cl.electrical, &ctx).await.is_ok() {
                     say(voice, reporter, ui::LogKind::Readback, line);
                 } else {
                     say(voice, reporter, ui::LogKind::Warn, &format!("{line} Didn't take — check it."));

@@ -132,8 +132,8 @@ impl Registry {
             tools.push(Box::new(instruments::SetPitotHeat));
         }
 
-        if profile.electrical {
-            tools.push(Box::new(electrical::SetElectrical));
+        if !profile.electrical.is_empty() {
+            tools.push(Box::new(electrical::SetElectrical::new(profile.electrical.clone())));
         }
 
         if profile.barometer {

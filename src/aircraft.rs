@@ -63,9 +63,10 @@ pub struct AircraftProfile {
     /// Parking brake (`set_parking_brake`).
     #[serde(default)]
     pub parking_brake: bool,
-    /// Electrical systems — battery, avionics master (`set_electrical`).
+    /// Electrical systems the `set_electrical` tool exposes (per-airframe wiring).
+    /// Empty means no electrical tool.
     #[serde(default)]
-    pub electrical: bool,
+    pub electrical: Vec<ElectricalSystem>,
     /// Cockpit flood lights (`set_flood_lights`). Separate from `lights` because
     /// the floods use a mix of write mechanisms (a scalar plus an array element)
     /// that the scalar-per-light `set_lights` can't express.
@@ -156,6 +157,25 @@ pub struct LightProfile {
     pub command_on: Option<String>,
     #[serde(default)]
     pub command_off: Option<String>,
+}
+
+/// One electrical system the `set_electrical` tool can switch. Driven by the
+/// profile so airframes with different wiring (the 172's single battery + split
+/// master; the SR22's dual battery/alternator) need no code — just config.
+/// Switching fires `on_commands`/`off_commands` (commands animate the 3D switch;
+/// a raw dataref write may not); `readback` datarefs (any may be `name[i]`) are
+/// read after to confirm — all must match the target, else the mixed state is
+/// reported.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElectricalSystem {
+    /// Token the LLM selects by (e.g. `"battery"`, `"battery1"`, `"avionics"`).
+    pub key: String,
+    /// Spoken form for the readback (e.g. `"battery one"`, `"both batteries"`).
+    pub spoken: String,
+    pub on_commands: Vec<String>,
+    pub off_commands: Vec<String>,
+    #[serde(default)]
+    pub readback: Vec<String>,
 }
 
 /// One entry of the checklist action map: a dataref *substring* and the curated
@@ -253,6 +273,12 @@ mod tests {
         for (a, b) in yaml_map.iter().zip(builtin_map) {
             assert_eq!(a.match_, b.match_, "map entry mismatch (YAML vs built-in)");
         }
+        // Electrical loads from YAML (not a silent fall-back to the built-in) and
+        // matches it key-for-key.
+        let builtin = cessna_172sp();
+        let yaml_elec: Vec<&str> = p.electrical.iter().map(|e| e.key.as_str()).collect();
+        let builtin_elec: Vec<&str> = builtin.electrical.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(yaml_elec, builtin_elec, "electrical mismatch (YAML vs built-in)");
     }
 
     #[test]
@@ -268,7 +294,12 @@ mod tests {
         // Universal-dataref tools on (incl. engine — throttle/mixture/start);
         // SR22-specific systems still off until their tools exist.
         assert!(p.autopilot && p.parking_brake && p.pitot_heat && p.transponder && p.engine);
-        assert!(!p.electrical && !p.magnetos && !p.fuel_pump && !p.fuel_selector && !p.directional_gyro);
+        assert!(!p.magnetos && !p.fuel_pump && !p.fuel_selector && !p.directional_gyro);
+        // Dual electrical: BAT1/BAT2/ALT1/ALT2 + the pair switches + avionics.
+        let elec: Vec<&str> = p.electrical.iter().map(|e| e.key.as_str()).collect();
+        for k in ["battery1", "battery2", "alternator1", "alternator2", "batteries", "alternators", "avionics"] {
+            assert!(elec.contains(&k), "SR22 electrical missing {k}");
+        }
         // Flaps 0/50/100.
         let flaps = p.flaps.expect("has flaps");
         assert_eq!(flaps.detents.len(), 3);
@@ -326,7 +357,31 @@ fn cessna_172sp() -> AircraftProfile {
         transponder: true,
         ils: true,
         parking_brake: true,
-        electrical: true,
+        electrical: {
+            let e = |key: &str, spoken: &str, on: &[&str], off: &[&str], rb: &[&str]| ElectricalSystem {
+                key: key.into(),
+                spoken: spoken.into(),
+                on_commands: on.iter().map(|s| s.to_string()).collect(),
+                off_commands: off.iter().map(|s| s.to_string()).collect(),
+                readback: rb.iter().map(|s| s.to_string()).collect(),
+            };
+            vec![
+                e("battery", "battery", &["sim/electrical/battery_1_on"], &["sim/electrical/battery_1_off"],
+                  &["sim/cockpit/electrical/battery_on"]),
+                e("alternator", "alternator", &["sim/electrical/generator_1_on"], &["sim/electrical/generator_1_off"],
+                  &["sim/cockpit/electrical/generator_on[0]"]),
+                // The two AVIONICS switches: BUS 1 (avionics master) + BUS 2 (cross-tie).
+                e("avionics", "avionics master",
+                  &["sim/systems/avionics_on", "sim/electrical/cross_tie_on"],
+                  &["sim/systems/avionics_off", "sim/electrical/cross_tie_off"],
+                  &["sim/cockpit/electrical/avionics_on", "sim/cockpit2/electrical/cross_tie"]),
+                // Split BAT/ALT rocker — battery + alternator together, NOT avionics.
+                e("master", "master",
+                  &["sim/electrical/battery_1_on", "sim/electrical/generator_1_on"],
+                  &["sim/electrical/battery_1_off", "sim/electrical/generator_1_off"],
+                  &["sim/cockpit/electrical/battery_on", "sim/cockpit/electrical/generator_on[0]"]),
+            ]
+        },
         flood_lights: true,
         fuel_pump: true,
         magnetos: true,
@@ -433,8 +488,37 @@ fn cirrus_sr22() -> AircraftProfile {
         // rustdecks SR22 deck. (start_engine sets battery 1 + alternator 1 only;
         // the SR22's second battery/alternator need the dual-electrical tool.)
         engine: true,
-        // SR22-specific — off until built/verified.
-        electrical: false,
+        // Dual battery/alternator + avionics — datarefs/commands verified against
+        // the rustdecks SR22 deck.
+        electrical: {
+            let e = |key: &str, spoken: &str, on: &[&str], off: &[&str], rb: &[&str]| ElectricalSystem {
+                key: key.into(),
+                spoken: spoken.into(),
+                on_commands: on.iter().map(|s| s.to_string()).collect(),
+                off_commands: off.iter().map(|s| s.to_string()).collect(),
+                readback: rb.iter().map(|s| s.to_string()).collect(),
+            };
+            vec![
+                e("battery1", "battery one", &["sim/electrical/battery_1_on"], &["sim/electrical/battery_1_off"],
+                  &["sim/cockpit2/electrical/battery_on[0]"]),
+                e("battery2", "battery two", &["sim/electrical/battery_2_on"], &["sim/electrical/battery_2_off"],
+                  &["sim/cockpit2/electrical/battery_on[1]"]),
+                e("alternator1", "alternator one", &["sim/electrical/generator_1_on"], &["sim/electrical/generator_1_off"],
+                  &["sim/cockpit2/electrical/generator_on[0]"]),
+                e("alternator2", "alternator two", &["sim/electrical/generator_2_on"], &["sim/electrical/generator_2_off"],
+                  &["sim/cockpit2/electrical/generator_on[1]"]),
+                e("batteries", "both batteries",
+                  &["sim/electrical/battery_1_on", "sim/electrical/battery_2_on"],
+                  &["sim/electrical/battery_1_off", "sim/electrical/battery_2_off"],
+                  &["sim/cockpit2/electrical/battery_on[0]", "sim/cockpit2/electrical/battery_on[1]"]),
+                e("alternators", "both alternators",
+                  &["sim/electrical/generator_1_on", "sim/electrical/generator_2_on"],
+                  &["sim/electrical/generator_1_off", "sim/electrical/generator_2_off"],
+                  &["sim/cockpit2/electrical/generator_on[0]", "sim/cockpit2/electrical/generator_on[1]"]),
+                e("avionics", "avionics master", &["sim/systems/avionics_on"], &["sim/systems/avionics_off"],
+                  &["sim/cockpit/electrical/avionics_on"]),
+            ]
+        },
         magnetos: false,
         carb_heat: false, // fuel-injected — no carb heat
         fuel_pump: false,
@@ -485,6 +569,7 @@ fn cirrus_sr22() -> AircraftProfile {
                 m("throttle_ratio", Throttle),
                 m("ENGN_mixt", Mixture),
                 m("flap_handle", Flaps),
+                m("avionics_on", Electrical("avionics".into())), // batteries are compound → call-out
                 m("nav_lights", Light("nav".into())),
                 m("strobe_lights", Light("strobe".into())),
                 m("landing_lights", Light("landing".into())),

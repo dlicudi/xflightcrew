@@ -235,10 +235,10 @@ impl Tool for StartEngine {
                 // checklist (avionics OFF for the start, ON after) and closes the
                 // gap where the transponder/radios sat on a dead bus. Commands
                 // verified present in the sim.
-                let avionics_on = super::electrical::SetElectrical
-                    .execute(&json!({ "system": "avionics", "on": true }), ctx)
-                    .await
-                    .is_ok();
+                // The avionics-master ON command is universal (sim/systems/...),
+                // so fire it directly rather than coupling to the (now
+                // profile-built) electrical tool.
+                let avionics_on = ctx.xplane.run_command("sim/systems/avionics_on").await.is_ok();
                 // Narrate the start sequence so the pilot hears what was done on
                 // their behalf, not just the end state.
                 let alt = if alt_on { "alternator on" } else { "but the alternator didn't come on, check it" };

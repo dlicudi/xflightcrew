@@ -19,7 +19,31 @@ com_radio: true        # set_com1
 transponder: true      # set_transponder (squawk)
 ils: true              # prepare_ils (ILS approach lookup + setup)
 parking_brake: true    # set_parking_brake
-electrical: true       # set_electrical (battery, avionics master)
+# Electrical systems for set_electrical. Each fires on/off commands (which
+# animate the panel switch) and reads back to confirm. The 172 has a single
+# battery, a single alternator, the two-bus avionics master, and a split BAT/ALT
+# "master" rocker (battery+alternator together, NOT avionics).
+electrical:
+  - key: battery
+    spoken: battery
+    on_commands:  [sim/electrical/battery_1_on]
+    off_commands: [sim/electrical/battery_1_off]
+    readback:     [sim/cockpit/electrical/battery_on]
+  - key: alternator
+    spoken: alternator
+    on_commands:  [sim/electrical/generator_1_on]
+    off_commands: [sim/electrical/generator_1_off]
+    readback:     ["sim/cockpit/electrical/generator_on[0]"]
+  - key: avionics
+    spoken: avionics master
+    on_commands:  [sim/systems/avionics_on, sim/electrical/cross_tie_on]
+    off_commands: [sim/systems/avionics_off, sim/electrical/cross_tie_off]
+    readback:     [sim/cockpit/electrical/avionics_on, sim/cockpit2/electrical/cross_tie]
+  - key: master
+    spoken: master
+    on_commands:  [sim/electrical/battery_1_on, sim/electrical/generator_1_on]
+    off_commands: [sim/electrical/battery_1_off, sim/electrical/generator_1_off]
+    readback:     [sim/cockpit/electrical/battery_on, "sim/cockpit/electrical/generator_on[0]"]
 flood_lights: true     # set_flood_lights (pilot + copilot cockpit floods)
 fuel_pump: true        # set_fuel_pump (electric/aux boost pump)
 magnetos: true         # set_magnetos (off/left/right/both — run-up mag check)

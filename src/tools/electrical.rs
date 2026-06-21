@@ -1,10 +1,10 @@
-//! Electrical systems: `set_electrical` (battery, alternator, avionics master).
+//! Electrical systems: `set_electrical`, built from the airframe profile.
 //!
-//! Battery is a scalar switch; the alternator is element 0 of the per-engine
-//! `generator_on` array. The C172's two AVIONICS panel switches are two separate
-//! systems — BUS 1 is the avionics master, BUS 2 is the electrical bus cross-tie
-//! — each driven by its own command (see the consts below). "avionics on" fires
-//! both so both panel switches move, not just one.
+//! Each [`ElectricalSystem`] is a named set of on/off *commands* (commands drive
+//! the panel switch — a raw dataref write may set the value without animating the
+//! 3D switch) plus *readback* datarefs to confirm. So different wiring is config,
+//! not code: the 172 has a single battery + a split BAT/ALT master; the SR22 has
+//! dual battery/alternator. `all` switches every configured system at once.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -12,45 +12,60 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx};
+use crate::aircraft::ElectricalSystem;
 
-// Battery and alternator: drive the panel switch with commands (a raw dataref
-// write can set the value without animating the 3D switch); the datarefs are
-// read back to confirm. The alternator is generator #1 (element 0 of the array).
-const BATTERY: &str = "sim/cockpit/electrical/battery_on";
-const CMD_BATTERY_ON: &str = "sim/electrical/battery_1_on";
-const CMD_BATTERY_OFF: &str = "sim/electrical/battery_1_off";
-const CMD_ALTERNATOR_ON: &str = "sim/electrical/generator_1_on";
-const CMD_ALTERNATOR_OFF: &str = "sim/electrical/generator_1_off";
-// The C172's two AVIONICS panel switches are two *different* systems, each
-// driven by a command (a dataref write sets the value but won't animate the 3D
-// switch — same quirk as the fuel selector). Verified with DataRefTool:
-//   BUS 1 = avionics master → sim/systems/avionics_on,  reads back via avionics_on
-//   BUS 2 = bus cross-tie    → sim/electrical/cross_tie_*, reads back via cross_tie
-const AVIONICS_BUS1: &str = "sim/cockpit/electrical/avionics_on";
-const AVIONICS_BUS2: &str = "sim/cockpit2/electrical/cross_tie";
-const CMD_AVIONICS_ON: &str = "sim/systems/avionics_on";
-const CMD_AVIONICS_OFF: &str = "sim/systems/avionics_off";
-const CMD_CROSS_TIE_ON: &str = "sim/electrical/cross_tie_on";
-const CMD_CROSS_TIE_OFF: &str = "sim/electrical/cross_tie_off";
-const GENERATOR: &str = "sim/cockpit/electrical/generator_on"; // array; [0] = alternator
-
-/// (key the LLM selects by, spoken form).
-const SYSTEMS: &[(&str, &str)] = &[
-    ("battery", "battery"),
-    ("alternator", "alternator"),
-    ("avionics", "avionics master"),
-    // The 172's master switch is a split BAT/ALT rocker — battery + alternator
-    // together. It deliberately does NOT touch avionics (a separate switch), so
-    // "master" is its own system, not "all".
-    ("master", "master"),
-];
-
-pub struct SetElectrical;
+pub struct SetElectrical {
+    systems: Vec<ElectricalSystem>,
+}
 
 #[derive(Deserialize)]
 struct Args {
     system: String,
     on: bool,
+}
+
+impl SetElectrical {
+    pub fn new(systems: Vec<ElectricalSystem>) -> Self {
+        Self { systems }
+    }
+
+    /// Read a readback dataref (`name` or `name[i]`) as a 0/1-ish float.
+    async fn read(ctx: &ToolCtx<'_>, dref: &str) -> Option<f64> {
+        if let Some(open) = dref.find('[') {
+            let base = &dref[..open];
+            let idx: usize = dref[open + 1..dref.find(']')?].parse().ok()?;
+            ctx.xplane.get_float_array(base).await.ok()?.get(idx).copied()
+        } else {
+            ctx.xplane.get_float(dref).await.ok()
+        }
+    }
+
+    /// Fire a system's commands and read its state back.
+    async fn switch(&self, sys: &ElectricalSystem, on: bool, ctx: &ToolCtx<'_>) -> Result<String> {
+        let cmds = if on { &sys.on_commands } else { &sys.off_commands };
+        for c in cmds {
+            ctx.xplane.run_command(c).await?;
+        }
+        // Confirm from the readback datarefs: all on / all off / mixed.
+        let mut states = Vec::new();
+        for d in &sys.readback {
+            if let Some(v) = Self::read(ctx, d).await {
+                states.push(v > 0.5);
+            }
+        }
+        Ok(if states.is_empty() {
+            // No readback configured — trust the command.
+            format!("Roger, {} {}.", sys.spoken, if on { "on" } else { "off" })
+        } else if states.iter().all(|&s| s) {
+            format!("Roger, {} on.", sys.spoken)
+        } else if states.iter().all(|&s| !s) {
+            format!("Roger, {} off.", sys.spoken)
+        } else {
+            // Mixed — report rather than lie. (e.g. one of a pair didn't move.)
+            let on_n = states.iter().filter(|&&s| s).count();
+            format!("{}: {} of {} on — check the panel.", sys.spoken, on_n, states.len())
+        })
+    }
 }
 
 #[async_trait]
@@ -60,24 +75,27 @@ impl Tool for SetElectrical {
     }
 
     fn description(&self) -> &str {
-        "Turn an electrical system on or off: the battery, the alternator, the \
-         avionics master, the 'master' switch (battery + alternator together — \
-         the split BAT/ALT rocker, which does NOT include avionics), or 'all' for \
-         every electrical system at once. Use for 'battery on', 'alternator on', \
-         'avionics off', 'master switch on', 'master switch off', 'master on', \
-         'switch on all electrical systems', 'all electrical off', 'electrics on', \
-         'electrics off', 'generator on', 'kill the avionics'. 'master switch' or \
-         'master' → system 'master'. 'electrics' or 'all electrical' with no \
-         system named → 'all'. The alternator is also called the generator."
+        // Static base; the available systems are listed in `parameters`.
+        "Turn an electrical system on or off — e.g. the battery, the alternator \
+         (a.k.a. generator), the avionics master, or (where present) the split \
+         'master' switch / individual buses. Pass 'all' for every electrical \
+         system at once. Use for 'battery on', 'alternator on', 'avionics off', \
+         'master switch on', 'all electrical off', 'electrics on', 'kill the \
+         avionics'. 'electrics'/'all electrical' with no system named → 'all'."
     }
 
     fn parameters(&self) -> Value {
-        let mut keys: Vec<&str> = SYSTEMS.iter().map(|(k, _)| *k).collect();
+        let mut keys: Vec<&str> = self.systems.iter().map(|s| s.key.as_str()).collect();
         keys.push("all");
+        let listing: Vec<String> = self.systems.iter().map(|s| format!("{} ({})", s.key, s.spoken)).collect();
         json!({
             "type": "object",
             "properties": {
-                "system": {"type": "string", "enum": keys, "description": "Which electrical system, or 'all'."},
+                "system": {
+                    "type": "string",
+                    "enum": keys,
+                    "description": format!("Which system, or 'all'. Available: {}.", listing.join(", "))
+                },
                 "on": {"type": "boolean", "description": "true = on, false = off"}
             },
             "required": ["system", "on"]
@@ -87,19 +105,9 @@ impl Tool for SetElectrical {
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: Args = serde_json::from_value(args.clone())?;
 
-        // "all" → battery + alternator + avionics together (all via commands so
-        // the panel switches animate).
         if args.system.eq_ignore_ascii_case("all") {
-            if args.on {
-                ctx.xplane.run_command(CMD_BATTERY_ON).await?;
-                ctx.xplane.run_command(CMD_ALTERNATOR_ON).await?;
-                ctx.xplane.run_command(CMD_AVIONICS_ON).await?;
-                ctx.xplane.run_command(CMD_CROSS_TIE_ON).await?;
-            } else {
-                ctx.xplane.run_command(CMD_BATTERY_OFF).await?;
-                ctx.xplane.run_command(CMD_ALTERNATOR_OFF).await?;
-                ctx.xplane.run_command(CMD_AVIONICS_OFF).await?;
-                ctx.xplane.run_command(CMD_CROSS_TIE_OFF).await?;
+            for sys in &self.systems {
+                self.switch(sys, args.on, ctx).await?;
             }
             return Ok(format!(
                 "Roger, all electrical systems {}.",
@@ -107,67 +115,10 @@ impl Tool for SetElectrical {
             ));
         }
 
-        let Some((key, spoken)) = SYSTEMS
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(&args.system))
-            .copied()
-        else {
-            let names: Vec<&str> = SYSTEMS.iter().map(|(_, s)| *s).collect();
+        let Some(sys) = self.systems.iter().find(|s| s.key.eq_ignore_ascii_case(&args.system)) else {
+            let names: Vec<&str> = self.systems.iter().map(|s| s.spoken.as_str()).collect();
             return Ok(format!("I didn't catch which system. I have {}.", names.join(", ")));
         };
-
-        let on = match key {
-            "battery" => {
-                ctx.xplane
-                    .run_command(if args.on { CMD_BATTERY_ON } else { CMD_BATTERY_OFF })
-                    .await?;
-                ctx.xplane.get_float(BATTERY).await? > 0.5
-            }
-            "avionics" => {
-                // Two switches, two systems — commands (not dataref writes) so both
-                // 3D switches animate: BUS 1 = avionics master, BUS 2 = cross-tie.
-                if args.on {
-                    ctx.xplane.run_command(CMD_AVIONICS_ON).await?;
-                    ctx.xplane.run_command(CMD_CROSS_TIE_ON).await?;
-                } else {
-                    ctx.xplane.run_command(CMD_AVIONICS_OFF).await?;
-                    ctx.xplane.run_command(CMD_CROSS_TIE_OFF).await?;
-                }
-                // Read both back and name them so the pilot hears that both buses
-                // moved, not just a vague "avionics on".
-                let bus1 = ctx.xplane.get_float(AVIONICS_BUS1).await? > 0.5;
-                let bus2 = ctx.xplane.get_float(AVIONICS_BUS2).await? > 0.5;
-                return Ok(match (bus1, bus2) {
-                    (true, true) => "Roger, avionics master on — bus 1 and bus 2.".to_string(),
-                    (false, false) => "Roger, avionics master off — bus 1 and bus 2.".to_string(),
-                    // Mixed: report exactly what the panel shows rather than lie.
-                    (b1, b2) => format!(
-                        "Avionics bus 1 {}, bus 2 {}.",
-                        if b1 { "on" } else { "off" },
-                        if b2 { "on" } else { "off" }
-                    ),
-                });
-            }
-            "alternator" => {
-                ctx.xplane
-                    .run_command(if args.on { CMD_ALTERNATOR_ON } else { CMD_ALTERNATOR_OFF })
-                    .await?;
-                ctx.xplane.get_float_array(GENERATOR).await?.first().copied().unwrap_or(0.0) > 0.5
-            }
-            "master" => {
-                // Split BAT/ALT rocker: battery and alternator together, no avionics.
-                ctx.xplane.run_command(if args.on { CMD_BATTERY_ON } else { CMD_BATTERY_OFF }).await?;
-                ctx.xplane.run_command(if args.on { CMD_ALTERNATOR_ON } else { CMD_ALTERNATOR_OFF }).await?;
-                let bat = ctx.xplane.get_float(BATTERY).await? > 0.5;
-                let alt = ctx.xplane.get_float_array(GENERATOR).await?.first().copied().unwrap_or(0.0) > 0.5;
-                return Ok(if bat == alt {
-                    format!("Roger, master {} — battery and alternator.", if bat { "on" } else { "off" })
-                } else {
-                    format!("Battery {}, alternator {}.", if bat { "on" } else { "off" }, if alt { "on" } else { "off" })
-                });
-            }
-            _ => unreachable!(),
-        };
-        Ok(format!("Roger, {spoken} {}.", if on { "on" } else { "off" }))
+        self.switch(sys, args.on, ctx).await
     }
 }

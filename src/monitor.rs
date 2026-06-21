@@ -348,7 +348,7 @@ impl Check for StallSpeed {
 
 fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     let mut checks: Vec<Box<dyn Check>> = Vec::new();
-    if profile.electrical {
+    if !profile.electrical.is_empty() {
         checks.push(Box::new(AlternatorOffline));
     }
     if profile.directional_gyro {
