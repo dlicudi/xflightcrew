@@ -362,7 +362,7 @@ async fn run_session(
             // one and ignore any other calls the LLM returned in the same turn
             // (guards against chaining through several checklists at once).
             if let Some(cl) = checklists.iter().find(|c| c.id == call.name) {
-                run_checklist(cl, &xplane, &config, &mut listener, &stt, &voice, &reporter).await;
+                run_checklist(cl, &xplane, &config, &mut listener, &stt, typed.as_ref(), &voice, &reporter).await;
                 break;
             }
 
@@ -461,12 +461,19 @@ async fn run_session(
 /// performs the flow top to bottom, but **pauses to confirm destructive steps**
 /// (engine start/stop, the run-up). Narration is naturally paced by the speech
 /// queue (one utterance plays before the next).
+///
+/// Abortable: say "stop"/"abort"/"cancel" at any confirm prompt, or type it in
+/// the TUI at any point (polled between items) — it stops where it is, leaving
+/// what's already done. (Continuous-voice abort between every item isn't
+/// reliable with the half-duplex mic gate, so it's the confirm pauses + typed.)
+#[allow(clippy::too_many_arguments)]
 async fn run_checklist(
     cl: &checklist::Checklist,
     xplane: &XPlaneClient,
     config: &Config,
     listener: &mut Option<Listener>,
     stt: &Stt,
+    typed: Option<&std::sync::mpsc::Receiver<String>>,
     voice: &Voice,
     reporter: &Reporter,
 ) {
@@ -474,7 +481,19 @@ async fn run_checklist(
     say(voice, reporter, ui::LogKind::Info, &format!("Running the {} checklist.", cl.title));
     let ctx = ToolCtx { xplane, config };
     let mut failed = 0usize;
+    let mut aborted = false;
     for item in &cl.items {
+        // Typed abort (TUI): drain anything queued since the last item.
+        if let Some(rx) = typed {
+            while let Ok(msg) = rx.try_recv() {
+                if is_abort(&msg) {
+                    aborted = true;
+                }
+            }
+            if aborted {
+                break;
+            }
+        }
         match item {
             // Spoken context (remarks, reference lines).
             Item::Narrate(text) => say(voice, reporter, ui::LogKind::Info, text),
@@ -482,14 +501,22 @@ async fn run_checklist(
             Item::CallOut(text) => say(voice, reporter, ui::LogKind::Confirm, text),
             // The copilot's item — do it, then read the item back (or flag it).
             Item::Act { say: line, tool, args, confirm } => {
-                // Destructive step — ask first, skip on anything but a yes.
+                // Destructive step — ask first. Yes does it; "stop/abort/cancel"
+                // aborts the whole checklist; anything else just skips this step.
                 if let Some(hazard) = confirm {
                     say(voice, reporter, ui::LogKind::Confirm, &format!("Confirm, {hazard}?"));
                     reporter.status(ui::Phase::Listening);
-                    let ok = listen_once(listener, stt, None).is_some_and(|r| is_affirmative(&r.text));
-                    if !ok {
-                        say(voice, reporter, ui::LogKind::Info, &format!("{line} Skipped — your call."));
-                        continue;
+                    let reply = listen_once(listener, stt, None);
+                    match reply {
+                        Some(r) if is_affirmative(&r.text) => {} // proceed
+                        Some(r) if is_abort(&r.text) => {
+                            aborted = true;
+                            break;
+                        }
+                        _ => {
+                            say(voice, reporter, ui::LogKind::Info, &format!("{line} Skipped — your call."));
+                            continue;
+                        }
                     }
                 }
                 if checklist::run_step(tool, args, &cl.lights, &cl.flaps, &ctx).await.is_ok() {
@@ -515,7 +542,9 @@ async fn run_checklist(
             }
         }
     }
-    let summary = if failed == 0 {
+    let summary = if aborted {
+        format!("{} checklist aborted — stopped where we were.", cl.title)
+    } else if failed == 0 {
         format!("{} checklist complete.", cl.title)
     } else {
         format!(
@@ -525,6 +554,15 @@ async fn run_checklist(
         )
     };
     say(voice, reporter, ui::LogKind::Ok, &summary);
+}
+
+/// Is a reply an abort — "stop", "abort", "cancel" the whole checklist (distinct
+/// from a plain "no" at a step, which just skips that one item)?
+fn is_abort(reply: &str) -> bool {
+    let r = reply.to_lowercase();
+    ["abort", "stop", "cancel", "belay", "disregard", "halt", "quit"]
+        .iter()
+        .any(|w| r.contains(w))
 }
 
 /// Apply the wake-word gate, fuzzily. Speech-to-text mangles "copilot" into
@@ -890,7 +928,26 @@ fn command_hints() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::gate_wake_word;
+    use super::{gate_wake_word, is_abort, is_affirmative};
+
+    #[test]
+    fn abort_is_distinct_from_skip_and_yes() {
+        // Abort the whole checklist.
+        for w in ["stop", "abort", "cancel", "belay that", "disregard"] {
+            assert!(is_abort(w), "{w:?} should abort");
+            assert!(!is_affirmative(w), "{w:?} is not a yes");
+        }
+        // A plain no/negative skips the step but isn't an abort.
+        for w in ["no", "negative", "not yet"] {
+            assert!(!is_abort(w), "{w:?} should not abort");
+            assert!(!is_affirmative(w));
+        }
+        // Yes proceeds and isn't an abort.
+        for w in ["affirm", "yes", "go ahead", "do it"] {
+            assert!(is_affirmative(w));
+            assert!(!is_abort(w));
+        }
+    }
 
     #[test]
     fn strips_wake_word_and_punctuation() {
@@ -1003,8 +1060,6 @@ mod tests {
             assert!(!looks_like_command(g), "{g:?} should be rejected");
         }
     }
-
-    use super::is_affirmative;
 
     #[test]
     fn affirmatives_proceed() {
