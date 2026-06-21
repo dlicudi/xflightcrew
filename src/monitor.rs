@@ -288,10 +288,11 @@ const FLARE_AGL_FT: f64 = 50.0;
 const FLAP_STALL_REDUCTION: f64 = 0.17;
 
 /// How far ahead (seconds) to project a decaying airspeed. At a 3 kt/s washout
-/// this fires the caution ~7-8 kt early — the lead time a fixed threshold can't
-/// give. Long enough to anticipate a mushing autopilot, short enough that a
-/// brief, intentional power reduction settles before it nags.
-const STALL_LOOKAHEAD_S: f64 = 2.5;
+/// this fires the caution ~12 kt early — enough lead to call it well before a
+/// mushing autopilot reaches its envelope limit and disconnects. Long enough to
+/// get ahead of the decay, short enough that a brief, intentional power
+/// reduction settles before it nags.
+const STALL_LOOKAHEAD_S: f64 = 4.0;
 
 struct StallSpeed {
     id: &'static str,
@@ -613,14 +614,14 @@ mod tests {
         assert!(warn.eval(&s).is_some() && caution.eval(&s).is_none());
 
         // Rate term: a fast washout trips the caution while the speed is still
-        // well above the line. 63 kt is silent steady, but decaying at 3 kt/s it
-        // projects to 63 − 3×2.5 = 55.5 → caution.
-        s.ias_kts = 63.0;
+        // well above the line. 67 kt is silent steady, but decaying at 3 kt/s it
+        // projects to 67 − 3×4.0 = 55 → caution.
+        s.ias_kts = 67.0;
         s.ias_trend_kts_per_s = 0.0;
         assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
         s.ias_trend_kts_per_s = -3.0;
         assert!(caution.eval(&s).is_some() && warn.eval(&s).is_none());
-        // Same 63 kt accelerating away (recovering) stays silent — projection
+        // Same 67 kt accelerating away (recovering) stays silent — projection
         // only ever lowers the effective speed, never raises it.
         s.ias_trend_kts_per_s = 3.0;
         assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
