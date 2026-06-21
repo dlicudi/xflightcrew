@@ -57,6 +57,10 @@ pub struct Snapshot {
     pub groundspeed_kts: f64,
     /// Indicated airspeed, knots — drives the stall/airspeed callout.
     pub ias_kts: f64,
+    /// Rate of change of IAS, knots per second (negative = decelerating).
+    /// Computed by the poll loop across ticks; lets the airspeed callout fire on
+    /// a fast washout *before* the speed actually reaches the threshold.
+    pub ias_trend_kts_per_s: f64,
     /// Flap deflection 0.0–1.0 — stall speed drops with flaps, so the airspeed
     /// callout's threshold scales with it.
     pub flap_ratio: f64,
@@ -136,6 +140,7 @@ impl Snapshot {
             on_ground,
             groundspeed_kts,
             ias_kts,
+            ias_trend_kts_per_s: 0.0, // filled in by the poll loop (needs history)
             flap_ratio,
             agl_ft,
             vsi_fpm,
@@ -282,6 +287,12 @@ const FLARE_AGL_FT: f64 = 50.0;
 /// a normal slow-but-safe flaps-down approach doesn't trip it.
 const FLAP_STALL_REDUCTION: f64 = 0.17;
 
+/// How far ahead (seconds) to project a decaying airspeed. At a 3 kt/s washout
+/// this fires the caution ~7-8 kt early — the lead time a fixed threshold can't
+/// give. Long enough to anticipate a mushing autopilot, short enough that a
+/// brief, intentional power reduction settles before it nags.
+const STALL_LOOKAHEAD_S: f64 = 2.5;
+
 struct StallSpeed {
     id: &'static str,
     severity: Severity,
@@ -308,8 +319,13 @@ impl Check for StallSpeed {
         }
         // Stall speed for the current flap setting.
         let vs = self.vs_clean_kts * (1.0 - FLAP_STALL_REDUCTION * s.flap_ratio.clamp(0.0, 1.0));
-        let in_band = s.ias_kts <= self.at_or_below_factor * vs
-            && self.above_factor.map_or(true, |a| s.ias_kts > a * vs);
+        // Anticipate: when the speed is washing off, project it forward so the
+        // band trips while there's still margin to recover. Only a *decaying*
+        // trend counts (`.min(0.0)`), so this can lower the effective speed but
+        // never raises it — it never masks a genuine low reading.
+        let projected = s.ias_kts + s.ias_trend_kts_per_s.min(0.0) * STALL_LOOKAHEAD_S;
+        let in_band = projected <= self.at_or_below_factor * vs
+            && self.above_factor.map_or(true, |a| projected > a * vs);
         if !in_band {
             return None;
         }
@@ -396,9 +412,26 @@ pub async fn run(config: Config, profile: AircraftProfile, voice: Voice) {
     let mut states: HashMap<&'static str, FireState> =
         checks.iter().map(|c| (c.id(), FireState::new())).collect();
 
+    // IAS history for the rate-of-decay term. `trend` is an EMA (kts/s) so a
+    // single noisy sample doesn't read as a sharp washout.
+    let mut prev_ias: Option<(f64, Instant)> = None;
+    let mut trend = 0.0_f64;
+
     loop {
-        if let Some(snap) = Snapshot::read(&xp).await {
+        if let Some(mut snap) = Snapshot::read(&xp).await {
             let now = Instant::now();
+            if let Some((last, last_t)) = prev_ias {
+                let dt = now.duration_since(last_t).as_secs_f64();
+                // Ignore a stretched dt (a skipped/stalled tick) — the rate would
+                // be meaningless. Only update inside a sane sampling window.
+                if (0.1..=1.0).contains(&dt) {
+                    let inst = (snap.ias_kts - last) / dt;
+                    trend = 0.6 * trend + 0.4 * inst;
+                }
+            }
+            prev_ias = Some((snap.ias_kts, now));
+            snap.ias_trend_kts_per_s = trend;
+
             for check in &checks {
                 let state = states.get_mut(check.id()).expect("state per check");
                 match check.eval(&snap) {
@@ -550,6 +583,7 @@ mod tests {
             on_ground: true,
             groundspeed_kts: 0.0,
             ias_kts: 0.0,
+            ias_trend_kts_per_s: 0.0,
             flap_ratio: 0.0,
             agl_ft: 0.0,
             vsi_fpm: 0.0,
@@ -577,6 +611,20 @@ mod tests {
         assert!(caution.eval(&s).is_some() && warn.eval(&s).is_none());
         s.ias_kts = 50.0; // near stall — warning only (bands disjoint)
         assert!(warn.eval(&s).is_some() && caution.eval(&s).is_none());
+
+        // Rate term: a fast washout trips the caution while the speed is still
+        // well above the line. 63 kt is silent steady, but decaying at 3 kt/s it
+        // projects to 63 − 3×2.5 = 55.5 → caution.
+        s.ias_kts = 63.0;
+        s.ias_trend_kts_per_s = 0.0;
+        assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
+        s.ias_trend_kts_per_s = -3.0;
+        assert!(caution.eval(&s).is_some() && warn.eval(&s).is_none());
+        // Same 63 kt accelerating away (recovering) stays silent — projection
+        // only ever lowers the effective speed, never raises it.
+        s.ias_trend_kts_per_s = 3.0;
+        assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
+        s.ias_trend_kts_per_s = 0.0;
 
         // Flaps lower the stall speed, so the same 55 kt is now safe and silent;
         // the band only fires once you're slow *for that configuration*.
