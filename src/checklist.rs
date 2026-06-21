@@ -337,9 +337,11 @@ fn action_for(map: &[ChecklistMapEntry], dataref: &str, cond: &Cond) -> Option<(
             _ => None, // ">0" (shutoff pushed in) etc. → verify only
         },
         ChecklistAction::Flaps => match cond {
-            Cond::Lt(n) if *n <= 0.1 => Some(("set_flaps", json!({ "notch": "up" }))),
-            Cond::Gt(n) if *n >= 0.85 => Some(("set_flaps", json!({ "notch": "full" }))),
-            _ => None, // "as required" / intermediate → the pilot's call
+            // Files express "up"/"full" as either a bound (172: `<0.02`/`>0.90`)
+            // or an exact value (SR22: `0.0`/`1.0`).
+            Cond::Lt(n) | Cond::Eq(n) if *n <= 0.1 => Some(("set_flaps", json!({ "notch": "up" }))),
+            Cond::Gt(n) | Cond::Eq(n) if *n >= 0.85 => Some(("set_flaps", json!({ "notch": "full" }))),
+            _ => None, // "as required" / intermediate (e.g. 50%) → the pilot's call
         },
         ChecklistAction::Mixture => {
             let t = cond.target();
@@ -633,9 +635,12 @@ mod tests {
         let cls = load(&p).expect("SR22 checklist loads");
         assert!(cls.len() > 15, "expected the full SR22 section set");
 
-        // Everything it acts on is one of the conservative, universal-safe tools —
-        // never the SR22 systems we haven't built (electrical/mixture/throttle/…).
-        let safe = ["set_parking_brake", "set_transponder_mode", "set_pitot_heat", "set_lights"];
+        // Everything it acts on is a universal-dataref tool — never an SR22
+        // system we haven't built (electrical, boost pump, fuel selector).
+        let safe = [
+            "set_parking_brake", "set_transponder_mode", "set_pitot_heat", "set_lights",
+            "set_throttle", "set_mixture", "set_flaps",
+        ];
         let mut acts = 0;
         for c in &cls {
             for it in &c.items {

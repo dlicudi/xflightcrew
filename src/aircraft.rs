@@ -265,9 +265,10 @@ mod tests {
     fn sr22_yaml_loads_and_is_conservative() {
         let p = load("cirrus_sr22").expect("SR22 profile loads");
         assert_eq!(p.id, "cirrus_sr22");
-        // Universal-dataref tools on; SR22-specific systems off (scaffold).
-        assert!(p.autopilot && p.parking_brake && p.pitot_heat && p.transponder);
-        assert!(!p.engine && !p.electrical && !p.magnetos && !p.fuel_pump && !p.fuel_selector);
+        // Universal-dataref tools on (incl. engine — throttle/mixture/start);
+        // SR22-specific systems still off until their tools exist.
+        assert!(p.autopilot && p.parking_brake && p.pitot_heat && p.transponder && p.engine);
+        assert!(!p.electrical && !p.magnetos && !p.fuel_pump && !p.fuel_selector && !p.directional_gyro);
         // Flaps 0/50/100.
         let flaps = p.flaps.expect("has flaps");
         assert_eq!(flaps.detents.len(), 3);
@@ -283,10 +284,12 @@ mod tests {
         for (a, b) in yaml_map.iter().zip(builtin_map) {
             assert_eq!(a.match_, b.match_);
         }
-        // None of the volatile/SR22-specific systems are mapped to act yet.
+        // The SR22-specific systems (dual electrical, fuel) are NOT mapped to act
+        // yet — they need their own tools. (Mixture maps via ENGN_mixt, but
+        // set_mixture writes the universal mixture_ratio_all, so that's safe.)
         for e in yaml_map {
-            assert!(!e.match_.contains("mixture") && !e.match_.contains("battery")
-                && !e.match_.contains("ignition") && !e.match_.contains("throttle"));
+            assert!(!e.match_.contains("battery") && !e.match_.contains("generator")
+                && !e.match_.contains("fuel_tank") && !e.match_.contains("boost"));
         }
     }
 }
@@ -425,8 +428,12 @@ fn cirrus_sr22() -> AircraftProfile {
         ils: true,
         parking_brake: true,
         pitot_heat: true,
+        // Throttle/mixture/start write universal datarefs (throttle_ratio_all,
+        // mixture_ratio_all, the starter command) — confirmed against the
+        // rustdecks SR22 deck. (start_engine sets battery 1 + alternator 1 only;
+        // the SR22's second battery/alternator need the dual-electrical tool.)
+        engine: true,
         // SR22-specific — off until built/verified.
-        engine: false,
         electrical: false,
         magnetos: false,
         carb_heat: false, // fuel-injected — no carb heat
@@ -453,19 +460,21 @@ fn cirrus_sr22() -> AircraftProfile {
         // VS1 (clean) ~76 KIAS; VS0 (landing) ~61.
         vs_clean_kts: Some(76.0),
         checklist: Some("checklists/cirrus_sr22.txt".into()),
-        // Lights — datarefs/commands from the checklist file + universal commands;
-        // verify in the sim before trusting.
+        // Lights — datarefs verified against the rustdecks SR22 deck; universal
+        // on/off commands.
         lights: vec![
-            light("nav", "nav lights", "sim/cockpit/electrical/nav_lights_on",
+            light("nav", "nav lights", "sim/cockpit2/switches/navigation_lights_on",
                   "sim/lights/nav_lights_on", "sim/lights/nav_lights_off"),
-            light("strobe", "strobe lights", "sim/cockpit/electrical/strobe_lights_on",
+            light("strobe", "strobe lights", "sim/cockpit2/switches/strobe_lights_on",
                   "sim/lights/strobe_lights_on", "sim/lights/strobe_lights_off"),
-            light("landing", "landing light", "sim/cockpit/electrical/landing_lights_on",
+            light("landing", "landing light", "sim/cockpit2/switches/landing_lights_switch[0]",
                   "sim/lights/landing_lights_on", "sim/lights/landing_lights_off"),
         ],
-        // CONSERVATIVE map — only rock-solid universal datarefs act. Everything
-        // else verifies / calls out. Promote entries here as you confirm SR22
-        // datarefs in the sim.
+        // Acts on universal-dataref systems (parking brake, transponder, pitot,
+        // lights, throttle, mixture, flaps). The SR22's own systems — dual
+        // battery/alternator, boost pump, off/left/right fuel selector — still
+        // verify/call-out until their tools are built (verified datarefs are now
+        // known from the rustdecks deck).
         checklist_map: {
             let m = |s: &str, a: ChecklistAction| ChecklistMapEntry { match_: s.into(), action: a };
             use ChecklistAction::*;
@@ -473,6 +482,9 @@ fn cirrus_sr22() -> AircraftProfile {
                 m("parkbrake", ParkingBrake),
                 m("transponder_mode", Transponder),
                 m("pitot_heat_on", PitotHeat),
+                m("throttle_ratio", Throttle),
+                m("ENGN_mixt", Mixture),
+                m("flap_handle", Flaps),
                 m("nav_lights", Light("nav".into())),
                 m("strobe_lights", Light("strobe".into())),
                 m("landing_lights", Light("landing".into())),
