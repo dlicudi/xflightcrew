@@ -357,10 +357,13 @@ async fn run_session(
 
             // A checklist isn't a one-shot tool — the copilot runs it: reads each
             // item, does the ones it can, calls out the pilot's. Needs the voice,
-            // so it's handled here, not via the plain ToolCtx.
+            // so it's handled here, not via the plain ToolCtx. A checklist is a
+            // whole phase, run only on demand — so it's never compounded: run this
+            // one and ignore any other calls the LLM returned in the same turn
+            // (guards against chaining through several checklists at once).
             if let Some(cl) = checklists.iter().find(|c| c.id == call.name) {
                 run_checklist(cl, &xplane, &config, &mut listener, &stt, &voice, &reporter).await;
-                continue;
+                break;
             }
 
             // Confirmation gate with in-line correction ("negative, 500"). Applies
