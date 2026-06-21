@@ -168,15 +168,9 @@ impl Registry {
             tools.push(Box::new(approach::PrepareIls));
         }
 
-        // Phase-config macros: the operational checklists transposed into
-        // one-command sequences (like `start_engine` bundles the STARTING ENGINE
-        // flow). Each composes the single-action tools, so they need the engine
-        // systems they set; lights and flaps come from the profile.
-        if profile.engine {
-            for mac in macros::phase_macros(profile.lights.clone(), profile.flaps.clone()) {
-                tools.push(mac);
-            }
-        }
+        // Checklists are NOT registered as one-shot tools — the copilot runs them
+        // interactively (narrate + act + call out the pilot's items), which needs
+        // the voice, so the main loop intercepts the pick. See [`macros::checklists`].
 
         // Future, gated the same way:
         //   if profile.retractable_gear { tools.push(Box::new(gear::Gear::new())); }
