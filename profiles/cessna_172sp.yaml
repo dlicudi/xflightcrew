@@ -48,6 +48,32 @@ vs_clean_kts: 48.0
 # the ones it owns, verifies what it can read, and calls out the pilot's items.
 checklist: checklists/cessna_172sp.txt
 
+# Maps the checklist file's datarefs to curated actions. `match` is a substring of
+# the file's dataref; the first matching entry wins, so order specific → general.
+# The *value* (on/off, mode, percent, notch) is derived from the file's condition
+# in code — this table only says which dataref drives which system.
+checklist_map:
+  - { match: parkbrake,                     action: parking_brake }
+  - { match: autopilot/autopilot_on,        action: autopilot_off }
+  - { match: electrical/battery_on,         action: { electrical: battery } }
+  - { match: electrical/avionics_on,        action: { electrical: avionics } }
+  - { match: electrical/generator_on,       action: { electrical: alternator } }
+  - { match: pitot_heat_on,                 action: pitot_heat }
+  - { match: fuel_pump_on,                  action: fuel_pump }
+  - { match: transponder_mode,              action: transponder }
+  - { match: fuel_tank_selector,            action: fuel_selector }
+  - { match: flap_ratio,                    action: flaps }
+  - { match: mixture_ratio,                 action: mixture }
+  - { match: throttle_ratio,                action: throttle }
+  - { match: ignition_key,                  action: ignition }
+  - { match: elevator_trim,                 action: pitch_trim }
+  - { match: taxi_light,                    action: { light: taxi } }
+  - { match: landing_lights,                action: { light: landing } }
+  - { match: strobe_lights,                 action: { light: strobe } }
+  - { match: beacon_lights,                 action: { light: beacon } }
+  - { match: navigation_lights,             action: { light: nav } }
+  - { match: nav_lights,                    action: { light: nav } }
+
 # Flap detents, retracted → full. Vfe is the max IAS (kts) to extend to each.
 flaps:
   detents:
