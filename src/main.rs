@@ -359,7 +359,7 @@ async fn run_session(
             // item, does the ones it can, calls out the pilot's. Needs the voice,
             // so it's handled here, not via the plain ToolCtx.
             if let Some(cl) = checklists.iter().find(|c| c.id == call.name) {
-                run_checklist(cl, &xplane, &config, &voice, &reporter).await;
+                run_checklist(cl, &xplane, &config, &mut listener, &stt, &voice, &reporter).await;
                 continue;
             }
 
@@ -454,13 +454,16 @@ async fn run_session(
 
 /// Run a checklist the way a pilot-monitoring would: read each item aloud,
 /// perform the ones the copilot can (each tool reads the dataref back, so the
-/// action is verified), and call out the pilot's items. Autonomous — it performs
-/// the whole flow top to bottom without waiting. Narration is naturally paced by
-/// the speech queue (one utterance plays before the next).
+/// action is verified), and call out the pilot's items. Mostly autonomous — it
+/// performs the flow top to bottom, but **pauses to confirm destructive steps**
+/// (engine start/stop, the run-up). Narration is naturally paced by the speech
+/// queue (one utterance plays before the next).
 async fn run_checklist(
     cl: &checklist::Checklist,
     xplane: &XPlaneClient,
     config: &Config,
+    listener: &mut Option<Listener>,
+    stt: &Stt,
     voice: &Voice,
     reporter: &Reporter,
 ) {
@@ -475,7 +478,17 @@ async fn run_checklist(
             // The pilot's item — call it out, don't perform it.
             Item::CallOut(text) => say(voice, reporter, ui::LogKind::Confirm, text),
             // The copilot's item — do it, then read the item back (or flag it).
-            Item::Act { say: line, tool, args } => {
+            Item::Act { say: line, tool, args, confirm } => {
+                // Destructive step — ask first, skip on anything but a yes.
+                if let Some(hazard) = confirm {
+                    say(voice, reporter, ui::LogKind::Confirm, &format!("Confirm, {hazard}?"));
+                    reporter.status(ui::Phase::Listening);
+                    let ok = listen_once(listener, stt, None).is_some_and(|r| is_affirmative(&r.text));
+                    if !ok {
+                        say(voice, reporter, ui::LogKind::Info, &format!("{line} Skipped — your call."));
+                        continue;
+                    }
+                }
                 if checklist::run_step(tool, args, &cl.lights, &cl.flaps, &ctx).await.is_ok() {
                     say(voice, reporter, ui::LogKind::Readback, line);
                 } else {

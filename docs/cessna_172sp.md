@@ -35,7 +35,10 @@ ways per item:
 - **Calls out** the pilot's items (no dataref) — oil pressure, controls free,
   "flaps as required" — without pretending it did them.
 
-Autonomous: no back-and-forth, it performs the whole list top to bottom.
+It performs the list top to bottom on its own, but **pauses to confirm the
+destructive steps** — engine start, the mag run-up (which advances the throttle),
+and mixture-to-cutoff. It asks "Confirm, start the engine?"; say yes and it does
+it, anything else and it skips that step and leaves it to you.
 
 ```
 🗣️  "run the before takeoff checklist"
