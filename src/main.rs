@@ -624,6 +624,7 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
 fn icao_to_profile(icao: &str) -> String {
     match icao.to_uppercase().as_str() {
         "C172" => "cessna_172sp",
+        "SR22" => "cirrus_sr22",
         _ => "cessna_172sp",
     }
     .to_string()

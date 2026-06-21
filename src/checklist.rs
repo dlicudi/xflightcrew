@@ -628,6 +628,27 @@ mod tests {
     }
 
     #[test]
+    fn sr22_checklist_runs_conservatively() {
+        let p = crate::aircraft::builtin("cirrus_sr22").unwrap();
+        let cls = load(&p).expect("SR22 checklist loads");
+        assert!(cls.len() > 15, "expected the full SR22 section set");
+
+        // Everything it acts on is one of the conservative, universal-safe tools —
+        // never the SR22 systems we haven't built (electrical/mixture/throttle/…).
+        let safe = ["set_parking_brake", "set_transponder_mode", "set_pitot_heat", "set_lights"];
+        let mut acts = 0;
+        for c in &cls {
+            for it in &c.items {
+                if let Item::Act { tool, .. } = it {
+                    assert!(safe.contains(tool), "SR22 acted on a non-conservative tool: {tool}");
+                    acts += 1;
+                }
+            }
+        }
+        assert!(acts > 0, "expected at least the universal-safe acts");
+    }
+
+    #[test]
     fn empty_map_never_acts() {
         // With no checklist_map, an item we'd normally act on becomes a verify
         // (we can read it) — never an Act. This is the SR22's state until its

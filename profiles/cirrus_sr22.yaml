@@ -1,0 +1,72 @@
+# Aircraft profile — X-Plane stock Cirrus SR22 (Laminar).
+#
+# SCAFFOLD. Built from the GoofyJP XChecklist file and the POH; the datarefs
+# marked "verify" are unconfirmed against the sim. Conservative by design: only
+# tools/actions on *universal* X-Plane datarefs are enabled. The SR22's own
+# systems — dual battery/alternator, the ENGN_mixt mixture, the boost pump, the
+# off/left/right fuel selector, key-start ignition — are left off until their
+# datarefs/tools are built and verified in the cockpit.
+
+id: cirrus_sr22
+display_name: Cirrus SR22
+
+# Capability flags — universal-dataref tools only, for now.
+autopilot: true        # set_heading / set_altitude / set_vertical_speed (universal AP)
+barometer: true        # set_barometer (universal)
+com_radio: true        # set_com1
+com2_radio: true       # set_com2 / swap_radio
+nav_radio: true        # set_nav1 / set_obs
+transponder: true      # set_transponder (universal transponder_mode)
+ils: true              # prepare_ils
+parking_brake: true    # set_parking_brake (universal parkbrake)
+pitot_heat: true       # set_pitot_heat (universal pitot_heat_on)
+
+# --- SR22-specific: off until built and verified in the sim ---
+engine: false          # throttle is universal, but SR22 mixture is ENGN_mixt — verify first
+electrical: false      # DUAL BAT/ALT — the single-system tool is wrong for the SR22
+magnetos: false        # key-start ignition differs from the 172 mag switch
+carb_heat: false       # fuel-injected — no carb heat
+fuel_pump: false       # laminar/sr22/switch/boost_pump
+fuel_selector: false   # off / left / right (no "both")
+directional_gyro: false # G1000 glass — no vacuum DG to sync
+flood_lights: false
+pitch_trim: false      # verify trim dataref + range first
+retractable_gear: false
+
+# Fuel-endurance alerting. SR22 ~92 gal usable, ~17 gal/hr cruise (~46 kg/hr). VERIFY.
+fuel:
+  reserve_caution_min: 45.0
+  reserve_warning_min: 30.0
+  cruise_burn_kg_hr: 46.0
+
+# Clean (VS1) stall ~76 KIAS; landing config (VS0) ~61. Drives the airspeed monitor.
+vs_clean_kts: 76.0
+
+# Flaps 0 / 50% / 100% (Vfe 150 / 110 KIAS). set_flaps writes the universal
+# flap_ratio. Detent ratios: VERIFY.
+flaps:
+  detents:
+    - { label: up,   spoken: up,            ratio: 0.0 }
+    - { label: "50", spoken: fifty percent, ratio: 0.5, vfe_kts: 150.0 }
+    - { label: full, spoken: full,          ratio: 1.0, vfe_kts: 110.0 }
+
+# XChecklist file to interpret (GoofyJP, read-only).
+checklist: checklists/cirrus_sr22.txt
+
+# Lights — datarefs from the checklist file + universal commands. VERIFY IN SIM.
+lights:
+  - { key: nav,     spoken: nav lights,    dataref: sim/cockpit/electrical/nav_lights_on,     command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
+  - { key: strobe,  spoken: strobe lights, dataref: sim/cockpit/electrical/strobe_lights_on,  command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
+  - { key: landing, spoken: landing light, dataref: sim/cockpit/electrical/landing_lights_on, command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+
+# Checklist action map — CONSERVATIVE. Only rock-solid universal datarefs act;
+# every other checklist item verifies / calls out. Promote entries here (mixture,
+# throttle, electrical, fuel, flaps, ignition) as you confirm the SR22 datarefs
+# in the sim and build any SR22-specific tools they need.
+checklist_map:
+  - { match: parkbrake,        action: parking_brake }
+  - { match: transponder_mode, action: transponder }
+  - { match: pitot_heat_on,    action: pitot_heat }
+  - { match: nav_lights,       action: { light: nav } }
+  - { match: strobe_lights,    action: { light: strobe } }
+  - { match: landing_lights,   action: { light: landing } }
