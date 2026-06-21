@@ -27,6 +27,11 @@ pub struct AircraftProfile {
     /// callouts. `None` means no stall caution.
     #[serde(default)]
     pub vs_clean_kts: Option<f64>,
+    /// Path to an XChecklist file to interpret (relative to the working dir).
+    /// `None` means no checklists for this airframe. The file is read-only input;
+    /// the copilot interprets it (see [`crate::checklist`]).
+    #[serde(default)]
+    pub checklist: Option<String>,
     /// Exterior/interior lights this airframe has. Empty means no `set_lights` tool.
     #[serde(default)]
     pub lights: Vec<LightProfile>,
@@ -261,6 +266,7 @@ fn cessna_172sp() -> AircraftProfile {
         }),
         // 172SP clean stall ~48 KIAS (power-off, flaps up).
         vs_clean_kts: Some(48.0),
+        checklist: Some("checklists/cessna_172sp.txt".into()),
         lights: vec![
             light("nav", "navigation lights", "sim/cockpit2/switches/navigation_lights_on",
                   "sim/lights/nav_lights_on", "sim/lights/nav_lights_off"),

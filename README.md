@@ -20,8 +20,10 @@ per call).
 - **Single commands** across every 172 system — flaps, autopilot, engine, fuel,
   electrics, lights, radios, transponder, instruments.
 - **Checklists the copilot runs** — say "run the before-takeoff checklist" and it
-  reads each item aloud, does the ones it can, and calls out the ones that are
-  yours. The full 172 checklist set, preflight to shutdown.
+  reads each item aloud, **acts** the ones it can, **verifies** the ones it can
+  read, and **calls out** the ones that are yours. The lists are **interpreted
+  from XChecklist files** (the X-Plane community format), so any aircraft's
+  checklist drops straight in — preflight to shutdown.
 - **Compound commands** — "flaps ten and throttle seventy" runs both.
 - **Conversational context** — "throttle fifty percent" then "seventy percent";
   "switch it back to both".
