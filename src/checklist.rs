@@ -177,6 +177,11 @@ pub fn parse(text: &str, lights: Vec<LightProfile>, flaps: Option<FlapProfile>) 
             continue;
         }
         let Some((dir, rest)) = line.split_once(':') else { continue };
+        // Coloured variants (`sw_item_c`, `sw_itemvoid_c`, `sw_remark_c`) behave
+        // exactly like the plain directive — the colour is display-only and gets
+        // stripped from the text. `sw_define_colour`/`sw_continue` keep their
+        // names (no `_c` suffix) and fall through to "ignored".
+        let dir = dir.strip_suffix("_c").unwrap_or(dir);
         match dir {
             "sw_checklist" => {
                 finish(&mut out, &mut cur);
@@ -192,20 +197,14 @@ pub fn parse(text: &str, lights: Vec<LightProfile>, flaps: Option<FlapProfile>) 
                     flaps: flaps.clone(),
                 });
             }
-            "sw_remark" => {
+            // Both narration directives: arm the run-up confirm when the file
+            // announces the magneto test (some files use a remark, some an
+            // itemvoid header), then speak any substantive content.
+            "sw_remark" | "sw_itemvoid" => {
                 if let Some(c) = cur.as_mut() {
                     if rest.to_lowercase().contains("magneto") {
                         arm_runup = true;
                     }
-                    if let Some(text) = clean_narration(rest) {
-                        c.items.push(Item::Narrate(text));
-                    }
-                }
-            }
-            "sw_itemvoid" => {
-                if let Some(c) = cur.as_mut() {
-                    // Reference/header lines. Speak the ones that carry content,
-                    // skip separators and blanks.
                     if let Some(text) = clean_narration(rest) {
                         c.items.push(Item::Narrate(text));
                     }
@@ -233,26 +232,37 @@ pub fn parse(text: &str, lights: Vec<LightProfile>, flaps: Option<FlapProfile>) 
     out
 }
 
-/// Parse one `sw_item` body: `CHALLENGE|RESPONSE[:dataref[:cond]]`.
+/// Parse one item body: `CHALLENGE|RESPONSE[:condition]`. The text carries no
+/// colon, so the first colon (if any) splits the spoken text from the condition
+/// spec. Colour codes (`\green\…`) are stripped by [`humanize`].
 fn parse_item(rest: &str) -> Item {
-    // Datarefs use '/', conditions use '|' — neither uses ':' — so colon splits
-    // the three fields cleanly.
-    let mut segs = rest.splitn(3, ':');
-    let text = segs.next().unwrap_or("");
-    let dataref = segs.next();
-    let cond = segs.next();
+    let (text, condspec) = match rest.split_once(':') {
+        Some((t, c)) => (t, Some(c.trim())),
+        None => (rest, None),
+    };
 
     let (challenge, response) = text.split_once('|').unwrap_or((text, ""));
     let say = speak_item(challenge, response);
 
-    let Some(dataref) = dataref.map(str::trim).filter(|d| !d.is_empty()) else {
-        // No dataref → the pilot's call-out.
+    let Some(condspec) = condspec.filter(|c| !c.is_empty()) else {
+        // No condition → the pilot's call-out.
         return Item::CallOut(say);
     };
-    let Some(cond) = cond.and_then(Cond::parse) else {
+    // Compound (`&&`/`||`/parenthesised) and function (`closer_than(...)`)
+    // conditions are beyond our single-dataref evaluator — we can't act on or
+    // verify them honestly, so they become call-outs (the pilot's item).
+    if is_compound_condition(condspec) {
+        return Item::CallOut(say);
+    }
+    // A simple `dataref:cond` (dataref has no colon; cond uses `>`/`<`/`|`/etc.).
+    let Some((dataref, cond_str)) = condspec.split_once(':') else {
         return Item::CallOut(say);
     };
-    let (base, index) = split_index(dataref);
+    let Some(cond) = Cond::parse(cond_str) else {
+        // An operator we don't model (`><`, `+>`, `-<`, …) — don't fake it.
+        return Item::CallOut(say);
+    };
+    let (base, index) = split_index(dataref.trim());
 
     match action_for(&base, &cond) {
         Some((tool, args)) => {
@@ -261,6 +271,17 @@ fn parse_item(rest: &str) -> Item {
         }
         None => Item::Verify { say, dataref: base, index, cond },
     }
+}
+
+/// A condition we can't evaluate as a single `dataref:cond` — boolean compounds
+/// (`(a:1)&&(b:1)`, `||`), function predicates (`closer_than(...)`), or anything
+/// with braces/parens. Such items degrade to call-outs.
+fn is_compound_condition(c: &str) -> bool {
+    c.starts_with('(')
+        || c.contains("&&")
+        || c.contains("||")
+        || c.contains('(')
+        || c.contains('{')
 }
 
 /// Steps the runner should confirm before performing — the engine-state changes.
@@ -429,35 +450,69 @@ fn speak_item(challenge: &str, response: &str) -> String {
     }
 }
 
-/// Narration line, or `None` for separators/blanks we shouldn't speak.
+/// Decoration characters used for separators, rules, and pointers in the files.
+/// (No letters — trimming those would eat real words like "go"/"oxygen".)
+const DECORATION: &[char] = &['=', '-', '_', '*', '>', '<', '~', '.', ' '];
+
+/// Narration line, or `None` for separators/blanks/pointers we shouldn't speak.
 fn clean_narration(s: &str) -> Option<String> {
-    let t = s.trim().trim_matches('_').trim();
-    if t.is_empty() {
+    let t = strip_colors(s);
+    let t = t.trim();
+    // Navigation pointers ("\\cyan\\ >>> NEXT: BEFORE TAXI") are XChecklist's own
+    // "next section" hints — the runner advances on command, so they're noise.
+    if t.trim_start_matches(DECORATION).starts_with("NEXT")
+        || t.trim_start_matches(DECORATION).to_lowercase().starts_with("next:")
+    {
         return None;
     }
-    // Drop the file's section header/footer boilerplate ("CRUISE CHECKLIST",
-    // "CLIMB CHECKLIST COMPLETED") — the runner already announces the start and
-    // end. The substantive remarks ("MAGNETO TEST", recommended speeds) don't
-    // mention "checklist", so this only sheds the duplicates.
-    if t.to_lowercase().contains("checklist") {
+    // Pure decoration ("=====", "-----", "*** ", "-o-") → nothing to say. The
+    // ≤1 alphanumeric guard also catches lone leftovers like the "o" in "-o-".
+    let core = t.trim_matches(DECORATION);
+    if core.chars().filter(|c| c.is_alphanumeric()).count() <= 1 {
         return None;
     }
-    let line = humanize(t);
-    // Replace the challenge|response bar with a comma for natural reading.
-    let line = line.replace('|', ", ");
-    if line.trim().is_empty() {
+    // Drop section header/footer boilerplate ("CRUISE CHECKLIST", "... COMPLETED")
+    // — the runner announces start/end itself. Substantive remarks ("MAGNETO
+    // TEST", speeds) don't mention "checklist", so only duplicates are shed.
+    if core.to_lowercase().contains("checklist") {
+        return None;
+    }
+    let line = humanize(core).replace('|', ", ");
+    let line = line.trim().trim_end_matches('.');
+    if line.is_empty() {
         None
     } else {
-        Some(format!("{}.", line.trim_end_matches('.')))
+        Some(format!("{line}."))
     }
 }
 
-/// Lowercase, strip the `[...]` non-simulated brackets, and capitalize the first
-/// letter — readable for TTS without SHOUTING acronyms.
+/// Lowercase, strip colour codes and the `[...]` non-simulated brackets, and
+/// capitalize the first letter — readable for TTS without SHOUTING acronyms.
 fn humanize(s: &str) -> String {
-    let stripped: String = s.chars().filter(|&c| c != '[' && c != ']').collect();
+    let stripped: String = strip_colors(s).chars().filter(|&c| c != '[' && c != ']').collect();
     let lowered = stripped.trim().to_lowercase();
     cap_first(&lowered)
+}
+
+/// Remove XChecklist colour codes — `\green\`, `\white\`, … — which can appear
+/// anywhere in an item's text (`\green\Door(s)\yellow\, open`). A colour code is
+/// a backslash, an identifier, and a closing backslash.
+fn strip_colors(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // Consume up to and including the closing backslash.
+            for n in chars.by_ref() {
+                if n == '\\' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn cap_first(s: &str) -> String {
@@ -490,6 +545,54 @@ fn split_index(dr: &str) -> (String, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coloured_format_and_compound_conditions() {
+        // sw_item_c with colour codes mid-text — colours stripped, item mapped.
+        match parse_item(r"\green\Parking brakes\yellow\, engaged|\white\CHECK:sim/flightmodel/controls/parkbrake:1") {
+            Item::Act { say, tool, .. } => {
+                assert_eq!(tool, "set_parking_brake");
+                assert_eq!(say, "Parking brakes, engaged, check.");
+            }
+            other => panic!("expected Act, got {}", variant(&other)),
+        }
+        // Compound (&&) condition → call-out (can't evaluate honestly).
+        assert!(matches!(
+            parse_item(r"\green\Batteries\yellow\, both on|\white\CHECK:(sim/.../battery_on[0]:1)&&(sim/.../battery_on[1]:1)"),
+            Item::CallOut(_)
+        ));
+        // Function predicate → call-out.
+        assert!(matches!(
+            parse_item(r"\green\Altimeter\yellow\, set QNH|\white\CHECK:1:closer_than({a},{b},0.02)"),
+            Item::CallOut(_)
+        ));
+        // An operator we don't model (`><`) → call-out, never a fake verify.
+        assert!(matches!(
+            parse_item(r"\green\HDG Bug\yellow\, set|\white\CHECK:sim/cockpit/autopilot/heading:><0.01"),
+            Item::CallOut(_)
+        ));
+    }
+
+    #[test]
+    fn strips_colours_and_skips_decoration() {
+        assert_eq!(strip_colors(r"\green\Door(s)\yellow\, open"), "Door(s), open");
+        // Nav pointers and pure rules are silent…
+        assert_eq!(clean_narration(r"\cyan\ >>> NEXT: BEFORE TAXI"), None);
+        assert_eq!(clean_narration(r"\cyan\ ======================"), None);
+        assert_eq!(clean_narration(r"\cyan\ -o-"), None);
+        // …but a real heading survives, colour-stripped.
+        assert_eq!(clean_narration(r"\white\ *** MAGNETOS TEST").as_deref(), Some("Magnetos test."));
+    }
+
+    // Small helper so the panics above name the variant.
+    fn variant(i: &Item) -> &'static str {
+        match i {
+            Item::Narrate(_) => "Narrate",
+            Item::CallOut(_) => "CallOut",
+            Item::Act { .. } => "Act",
+            Item::Verify { .. } => "Verify",
+        }
+    }
 
     #[test]
     fn condition_grammar() {
