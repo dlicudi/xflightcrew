@@ -715,9 +715,11 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "ident", "barometer", "altimeter", "baro", "kollsman", "qnh", "vor",
     // instruments / misc controls
     "gyro", "pitot", "brake", "brakes", "parking", "heat",
-    // checklist invocations (every phase + the reference card)
-    "takeoff", "configure", "config", "departure", "secure", "clean", "cruise",
-    "preflight", "limits", "performance",
+    // checklist invocations: "checklist(s)" is the trigger word every one shares
+    // (so "normal take-off checklist" reaches the LLM even when STT splits
+    // "takeoff"), plus the phase words for the shorthand ("configure for takeoff").
+    "checklist", "checklists", "takeoff", "configure", "config", "departure",
+    "secure", "clean", "cruise", "preflight", "limits", "performance",
 ];
 
 /// True if the utterance plausibly is an aircraft command (contains at least one
@@ -893,6 +895,8 @@ mod tests {
             "configure for landing", "get ready for landing",
             "after landing", "clean up", "clear of the runway",
             "secure the aircraft", "secure", "full shutdown",
+            // "checklist" carries any phase past the gate, even hyphenated STT.
+            "Normal take-off checklist.", "starting engine checklist", "preflight checklist",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
         }
