@@ -326,7 +326,7 @@ impl Check for StallSpeed {
         // never raises it — it never masks a genuine low reading.
         let projected = s.ias_kts + s.ias_trend_kts_per_s.min(0.0) * STALL_LOOKAHEAD_S;
         let in_band = projected <= self.at_or_below_factor * vs
-            && self.above_factor.map_or(true, |a| projected > a * vs);
+            && self.above_factor.is_none_or(|a| projected > a * vs);
         if !in_band {
             return None;
         }
@@ -526,7 +526,7 @@ impl Check for FuelEndurance {
             return None;
         }
         let min = s.endurance_min?;
-        let in_band = min <= self.at_or_below_min && self.above_min.map_or(true, |a| min > a);
+        let in_band = min <= self.at_or_below_min && self.above_min.is_none_or(|a| min > a);
         if !in_band {
             return None;
         }

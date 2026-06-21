@@ -18,24 +18,37 @@ tool, x-copilot writes the dataref, then **reads back the actual result**
 
 ## Checklists — the copilot runs them with you
 
-Say a checklist's name and the copilot **runs it like a pilot-monitoring**: it
-reads each item aloud, **does the ones it can** (each verified by the tool's
-readback), and **calls out the items that are yours** — the run-up, controls-free,
-oil pressure, "flaps as required" — without pretending it did them. Autonomous:
-no back-and-forth, it performs the whole list top to bottom.
+Checklists are **interpreted from an XChecklist file**, not baked into the app —
+[checklists/cessna_172sp.txt](../checklists/cessna_172sp.txt), the de-facto
+X-Plane community format (the same files the XChecklist plug-in reads). The file
+is read-only input; the copilot interprets it. Drop in any aircraft's `.txt`,
+point the profile's `checklist:` at it, and it runs — so we're compatible with
+the whole ecosystem.
+
+Say a checklist's name and the copilot **runs it like a pilot-monitoring**, three
+ways per item:
+
+- **Acts** the systems it owns (each verified by the tool's readback) — "Parking
+  brake, on."
+- **Verifies** the ones it can read but doesn't actuate — reads the dataref and
+  confirms or flags ("Static source, off. Confirmed.").
+- **Calls out** the pilot's items (no dataref) — oil pressure, controls free,
+  "flaps as required" — without pretending it did them.
+
+Autonomous: no back-and-forth, it performs the whole list top to bottom.
 
 ```
 🗣️  "run the before takeoff checklist"
 🔊  Running the before takeoff checklist.
-🔊  Parking brake, set.            ← did it
-🔊  Mixture, rich.                 ← did it
-🔊  Mag check — your run-up...      ← yours, called out
-🔊  Strobe lights, on.             ← did it
-🔊  Flaps — as required, your call. ← yours
+🔊  Parking brake, on.             ← acted
+🔊  Mixture, full rich.            ← acted
+🔊  Magneto test.                  ← narrated, then it runs the run-up
+🔊  Strobe lights, on.             ← acted
+🔊  Flaps (0 or 10), as required.  ← yours, called out
 🔊  before takeoff checklist complete.
 ```
 
-The full set, transposed line-for-line from the standard 172 checklist:
+The full set, interpreted line-for-line from the file:
 
 | Say | What the copilot does (it also calls out your items) |
 |---|---|
@@ -44,7 +57,7 @@ The full set, transposed line-for-line from the standard 172 checklist:
 | **"before starting engine"** | parking brake, autopilot off, avionics off, fuel both |
 | **"starting engine"** | battery, beacon, throttle, mixture, carb heat, fuel-pump prime, **cranks the engine**, alternator + avionics on, flaps up |
 | **"before taxi"** | transponder standby, taxi light on, parking brake set |
-| **"before takeoff"** / "configure for takeoff" | brake, mixture rich, fuel both, strobe + landing on, autopilot off, trim takeoff |
+| **"before takeoff"** / "configure for takeoff" | brake, mixture rich, fuel both, **the mag run-up** (cycles ignition + throttle), strobe + landing on, autopilot off, trim takeoff |
 | **"normal takeoff"** | taxi light off, transponder altitude, mixture rich |
 | **"climb"** | landing light off, throttle full, mixture rich |
 | **"cruise"** | mixture leaned |
@@ -52,16 +65,16 @@ The full set, transposed line-for-line from the standard 172 checklist:
 | **"before landing"** / "configure for landing" | fuel both, mixture rich, landing + taxi lights on, autopilot off |
 | **"normal landing"** | flaps up after rollout (the approach/touchdown/braking are yours) |
 | **"after landing"** / "clean up" | flaps up, landing/strobe/nav lights off, transponder standby |
-| **"secure the aircraft"** / "shutdown" | brake, transponder/avionics off, idle, **engine off**, all lights off, alternator + master off |
+| **"engine shutdown"** / "shutdown" | brake, transponder/avionics off, idle, **engine off** (mixture cutoff), all lights off, alternator + master off |
 
 A full flight by voice: *preflight → before starting engine → starting engine →
 before taxi → before takeoff → normal takeoff → climb → cruise → descent → before
-landing → normal landing → after landing → secure the aircraft.*
+landing → normal landing → after landing → engine shutdown.*
 
 > **Checklist vs single command.** A checklist *runs the whole phase*. A single
 > command (next section) does one thing fast. Note the pair: **"starting engine"**
-> runs the start *checklist*; **"start the engine"** just cranks. **"secure the
-> aircraft"** runs the shutdown *checklist*; **"shut down the engine"** just kills
+> runs the start *checklist*; **"start the engine"** just cranks. **"engine
+> shutdown"** runs the shutdown *checklist*; **"shut down the engine"** just kills
 > the engine.
 
 ---

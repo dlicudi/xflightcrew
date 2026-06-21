@@ -18,7 +18,6 @@ pub mod engine;
 pub mod flaps;
 pub mod instruments;
 pub mod lights;
-pub mod macros;
 pub mod radio;
 
 use anyhow::Result;
@@ -169,8 +168,9 @@ impl Registry {
         }
 
         // Checklists are NOT registered as one-shot tools — the copilot runs them
-        // interactively (narrate + act + call out the pilot's items), which needs
-        // the voice, so the main loop intercepts the pick. See [`macros::checklists`].
+        // interactively (narrate + act + verify + call out the pilot's items),
+        // which needs the voice, so the main loop intercepts the pick. They're
+        // interpreted from the airframe's XChecklist file (see [`crate::checklist`]).
 
         // Future, gated the same way:
         //   if profile.retractable_gear { tools.push(Box::new(gear::Gear::new())); }

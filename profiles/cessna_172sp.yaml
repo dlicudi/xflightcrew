@@ -43,6 +43,11 @@ fuel:
 # callouts: a caution as you approach it, an urgent "lower the nose" below.
 vs_clean_kts: 48.0
 
+# XChecklist file to interpret (read-only; the de-facto X-Plane community format,
+# as used by the XChecklist plug-in). The copilot reads each item aloud, performs
+# the ones it owns, verifies what it can read, and calls out the pilot's items.
+checklist: checklists/cessna_172sp.txt
+
 # Flap detents, retracted → full. Vfe is the max IAS (kts) to extend to each.
 flaps:
   detents:

@@ -57,7 +57,7 @@ pub fn find_ils(path: &str, runway: &str, lat: f64, lon: f64, max_nm: f64) -> Re
         if d > max_nm {
             continue;
         }
-        if best.as_ref().map_or(true, |b| d < b.distance_nm) {
+        if best.as_ref().is_none_or(|b| d < b.distance_nm) {
             best = Some(Ils {
                 freq_10khz: f[4].parse().unwrap_or(0),
                 course_mag: (f[6].parse::<f64>().unwrap_or(0.0) / 360.0).rem_euclid(360.0),
@@ -90,7 +90,7 @@ pub fn nearest_ils_airport(path: &str, lat: f64, lon: f64) -> Result<Option<(Str
             _ => continue,
         };
         let d = haversine_nm(lat, lon, rlat, rlon);
-        if best.as_ref().map_or(true, |(_, bd)| d < *bd) {
+        if best.as_ref().is_none_or(|(_, bd)| d < *bd) {
             best = Some((f[8].to_string(), d));
         }
     }

@@ -9,6 +9,7 @@
 
 mod aircraft;
 mod audio;
+mod checklist;
 mod config;
 mod llm;
 mod monitor;
@@ -101,8 +102,17 @@ async fn main() -> Result<()> {
     let stt = Stt::load(&config.whisper_model_path)?;
     let llm = Llm::new(&config);
     let registry = Registry::for_aircraft(&profile);
-    // Checklists the copilot runs interactively (narrate + act + call out yours).
-    let checklists = tools::macros::checklists(profile.lights.clone(), profile.flaps.clone());
+    // Checklists the copilot runs interactively (narrate + act + verify + call
+    // out yours). Interpreted from the airframe's XChecklist file, not baked in.
+    let checklists = match &profile.checklist {
+        Some(path) => checklist::load(path, profile.lights.clone(), profile.flaps.clone())
+            .unwrap_or_else(|e| {
+                tracing::error!("checklist load failed: {e:#}; running without checklists");
+                Vec::new()
+            }),
+        None => Vec::new(),
+    };
+    tracing::info!(checklists = checklists.len(), "interpreted checklists");
 
     let continuous = config.listen_mode == "continuous";
     // "Explicit" = the user clearly addressed the copilot (push-to-talk, or a
@@ -190,7 +200,7 @@ async fn run_session(
     stt: Stt,
     llm: Llm,
     registry: Registry,
-    checklists: Vec<tools::macros::Checklist>,
+    checklists: Vec<checklist::Checklist>,
     voice: Voice,
     continuous: bool,
     explicit: bool,
@@ -448,26 +458,43 @@ async fn run_session(
 /// the whole flow top to bottom without waiting. Narration is naturally paced by
 /// the speech queue (one utterance plays before the next).
 async fn run_checklist(
-    cl: &tools::macros::Checklist,
+    cl: &checklist::Checklist,
     xplane: &XPlaneClient,
     config: &Config,
     voice: &Voice,
     reporter: &Reporter,
 ) {
+    use checklist::Item;
     say(voice, reporter, ui::LogKind::Info, &format!("Running the {} checklist.", cl.title));
     let ctx = ToolCtx { xplane, config };
     let mut failed = 0usize;
-    for step in &cl.steps {
-        match &step.act {
+    for item in &cl.items {
+        match item {
+            // Spoken context (remarks, reference lines).
+            Item::Narrate(text) => say(voice, reporter, ui::LogKind::Info, text),
             // The pilot's item — call it out, don't perform it.
-            None => say(voice, reporter, ui::LogKind::Confirm, &step.say),
+            Item::CallOut(text) => say(voice, reporter, ui::LogKind::Confirm, text),
             // The copilot's item — do it, then read the item back (or flag it).
-            Some((tool, args)) => {
-                if tools::macros::run_step(tool, args, &cl.lights, &cl.flaps, &ctx).await.is_ok() {
-                    say(voice, reporter, ui::LogKind::Readback, &step.say);
+            Item::Act { say: line, tool, args } => {
+                if checklist::run_step(tool, args, &cl.lights, &cl.flaps, &ctx).await.is_ok() {
+                    say(voice, reporter, ui::LogKind::Readback, line);
                 } else {
-                    say(voice, reporter, ui::LogKind::Warn, &format!("{} Didn't take — check it.", step.say));
+                    say(voice, reporter, ui::LogKind::Warn, &format!("{line} Didn't take — check it."));
                     failed += 1;
+                }
+            }
+            // A dataref we don't actuate — read it and confirm or flag.
+            Item::Verify { say: line, dataref, index, cond } => {
+                match checklist::read_dataref(xplane, dataref, *index).await {
+                    Some(v) if cond.eval(v) => {
+                        say(voice, reporter, ui::LogKind::Readback, &format!("{line} Confirmed."))
+                    }
+                    Some(_) => {
+                        say(voice, reporter, ui::LogKind::Warn, &format!("{line} Not set — check it."));
+                        failed += 1;
+                    }
+                    // Couldn't read it — just call it out, don't flag.
+                    None => say(voice, reporter, ui::LogKind::Confirm, line),
                 }
             }
         }
