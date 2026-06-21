@@ -27,7 +27,7 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::aircraft::{FlapProfile, LightProfile};
+use crate::aircraft::{AircraftProfile, ChecklistAction, ChecklistMapEntry, FlapProfile, LightProfile};
 use crate::tools::autopilot::AutopilotOff;
 use crate::tools::controls::{SetParkingBrake, SetPitchTrim};
 use crate::tools::electrical::SetElectrical;
@@ -148,15 +148,21 @@ impl Checklist {
     }
 }
 
-/// Read and interpret an XChecklist file into runnable checklists.
-pub fn load(path: &str, lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Result<Vec<Checklist>> {
+/// Read and interpret the airframe's XChecklist file into runnable checklists.
+/// `Ok(vec![])` if the profile names no checklist file.
+pub fn load(profile: &AircraftProfile) -> Result<Vec<Checklist>> {
+    let Some(path) = &profile.checklist else { return Ok(Vec::new()) };
     let text = std::fs::read_to_string(path).with_context(|| format!("reading checklist file {path}"))?;
-    Ok(parse(&text, lights, flaps))
+    Ok(parse(&text, profile))
 }
 
-/// Parse XChecklist text. Tolerant: unknown directives and malformed lines are
-/// skipped rather than failing the whole file.
-pub fn parse(text: &str, lights: Vec<LightProfile>, flaps: Option<FlapProfile>) -> Vec<Checklist> {
+/// Parse XChecklist text against an airframe profile (its `checklist_map` drives
+/// which datarefs become actions). Tolerant: unknown directives and malformed
+/// lines are skipped rather than failing the whole file.
+pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
+    let lights = profile.lights.clone();
+    let flaps = profile.flaps.clone();
+    let map = &profile.checklist_map;
     let mut out: Vec<Checklist> = Vec::new();
     let mut cur: Option<Checklist> = None;
     // The "MAGNETO TEST" remark arms a one-time confirm on the next actioned
@@ -212,7 +218,7 @@ pub fn parse(text: &str, lights: Vec<LightProfile>, flaps: Option<FlapProfile>) 
             }
             "sw_item" => {
                 if let Some(c) = cur.as_mut() {
-                    let mut item = parse_item(rest);
+                    let mut item = parse_item(rest, map);
                     // Arm the run-up confirm on the first actioned step after the
                     // magneto-test remark (the throttle-up).
                     if arm_runup {
@@ -235,7 +241,7 @@ pub fn parse(text: &str, lights: Vec<LightProfile>, flaps: Option<FlapProfile>) 
 /// Parse one item body: `CHALLENGE|RESPONSE[:condition]`. The text carries no
 /// colon, so the first colon (if any) splits the spoken text from the condition
 /// spec. Colour codes (`\green\…`) are stripped by [`humanize`].
-fn parse_item(rest: &str) -> Item {
+fn parse_item(rest: &str, map: &[ChecklistMapEntry]) -> Item {
     let (text, condspec) = match rest.split_once(':') {
         Some((t, c)) => (t, Some(c.trim())),
         None => (rest, None),
@@ -264,7 +270,7 @@ fn parse_item(rest: &str) -> Item {
     };
     let (base, index) = split_index(dataref.trim());
 
-    match action_for(&base, &cond) {
+    match action_for(map, &base, &cond) {
         Some((tool, args)) => {
             let confirm = confirm_for(tool, &args);
             Item::Act { say, tool, args, confirm }
@@ -299,49 +305,52 @@ fn confirm_for(tool: &str, args: &Value) -> Option<&'static str> {
     }
 }
 
-/// Map a file dataref + its pass condition to one of our curated tools. `None`
-/// means we don't actuate it (→ verify or call-out). Light datarefs are matched
-/// by name so both the file's namespaces (`cockpit/electrical/*_lights_on` and
-/// `cockpit2/switches/*`) resolve to the same tool.
-fn action_for(dataref: &str, cond: &Cond) -> Option<(&'static str, Value)> {
+/// Map a file dataref + its pass condition to one of our curated tools, using
+/// the airframe's [`checklist_map`](crate::aircraft::AircraftProfile). `None`
+/// means we don't actuate it (→ verify or call-out): no map entry matched, or
+/// the matched action can't honour this condition. *Which* dataref maps to
+/// *which* system is config (per-airframe); *how* the condition becomes the
+/// argument is the shared logic here.
+fn action_for(map: &[ChecklistMapEntry], dataref: &str, cond: &Cond) -> Option<(&'static str, Value)> {
+    let entry = map.iter().find(|e| dataref.contains(&e.match_))?;
     let on = cond.is_on();
-    let light = |key: &str| Some(("set_lights", json!({ "light": key, "on": on })));
-
-    match dataref {
-        "sim/flightmodel/controls/parkbrake" => Some(("set_parking_brake", json!({ "on": on }))),
-        "sim/cockpit2/autopilot/autopilot_on" => Some(("autopilot_off", json!({}))),
-        "sim/cockpit/electrical/battery_on" => Some(("set_electrical", json!({ "system": "battery", "on": on }))),
-        "sim/cockpit/electrical/avionics_on" => Some(("set_electrical", json!({ "system": "avionics", "on": on }))),
-        "sim/cockpit/electrical/generator_on" => Some(("set_electrical", json!({ "system": "alternator", "on": on }))),
-        "sim/cockpit/switches/pitot_heat_on" => Some(("set_pitot_heat", json!({ "on": on }))),
-        "sim/cockpit/engine/fuel_pump_on" => Some(("set_fuel_pump", json!({ "on": on }))),
-        "sim/cockpit/radios/transponder_mode" => match cond {
+    match &entry.action {
+        ChecklistAction::ParkingBrake => Some(("set_parking_brake", json!({ "on": on }))),
+        ChecklistAction::PitotHeat => Some(("set_pitot_heat", json!({ "on": on }))),
+        ChecklistAction::FuelPump => Some(("set_fuel_pump", json!({ "on": on }))),
+        ChecklistAction::AutopilotOff => Some(("autopilot_off", json!({}))),
+        ChecklistAction::PitchTrim => Some(("set_pitch_trim", json!({ "action": "takeoff" }))),
+        ChecklistAction::Electrical(system) => {
+            Some(("set_electrical", json!({ "system": system, "on": on })))
+        }
+        ChecklistAction::Light(key) => Some(("set_lights", json!({ "light": key, "on": on }))),
+        ChecklistAction::Transponder => match cond {
             Cond::Eq(n) => {
                 let mode = if *n < 0.5 { "off" } else if *n < 2.5 { "standby" } else { "altitude" };
                 Some(("set_transponder_mode", json!({ "mode": mode })))
             }
             _ => None,
         },
-        d if d.ends_with("fuel_tank_selector") => match cond {
+        ChecklistAction::FuelSelector => match cond {
             Cond::Eq(n) if (*n - 4.0).abs() < 0.5 => Some(("set_fuel_selector", json!({ "position": "both" }))),
             Cond::Ne(n) if (*n - 4.0).abs() < 0.5 => Some(("set_fuel_selector", json!({ "position": "left" }))),
             _ => None, // ">0" (shutoff pushed in) etc. → verify only
         },
-        d if d.ends_with("flap_ratio") => match cond {
+        ChecklistAction::Flaps => match cond {
             Cond::Lt(n) if *n <= 0.1 => Some(("set_flaps", json!({ "notch": "up" }))),
             Cond::Gt(n) if *n >= 0.85 => Some(("set_flaps", json!({ "notch": "full" }))),
-            _ => None, // "as required" → the pilot's call
+            _ => None, // "as required" / intermediate → the pilot's call
         },
-        d if d.ends_with("mixture_ratio") => {
+        ChecklistAction::Mixture => {
             let t = cond.target();
             let pct = if t >= 0.9 { 100 } else if t <= 0.1 { 0 } else { 65 };
             Some(("set_mixture", json!({ "percent": pct })))
         }
-        d if d.ends_with("throttle_ratio") => {
+        ChecklistAction::Throttle => {
             let pct = (cond.target() * 100.0).round() as i64;
             Some(("set_throttle", json!({ "percent": pct })))
         }
-        d if d.ends_with("ignition_key") => match cond {
+        ChecklistAction::Ignition => match cond {
             // 0 off · 1 right · 2 left · 3 both · 4 start.
             Cond::Eq(n) => {
                 let v = *n;
@@ -354,13 +363,6 @@ fn action_for(dataref: &str, cond: &Cond) -> Option<(&'static str, Value)> {
             }
             _ => None,
         },
-        d if d.ends_with("elevator_trim") => Some(("set_pitch_trim", json!({ "action": "takeoff" }))),
-        d if d.contains("taxi_light") => light("taxi"),
-        d if d.contains("landing_lights") => light("landing"),
-        d if d.contains("strobe_lights") => light("strobe"),
-        d if d.contains("beacon_lights") => light("beacon"),
-        d if d.contains("navigation_lights") || d.contains("nav_lights") => light("nav"),
-        _ => None,
     }
 }
 
@@ -546,8 +548,15 @@ fn split_index(dr: &str) -> (String, Option<usize>) {
 mod tests {
     use super::*;
 
+    /// The 172 profile (carries the real checklist_map the tests exercise).
+    fn p172() -> AircraftProfile {
+        crate::aircraft::builtin("cessna_172sp").unwrap()
+    }
+
     #[test]
     fn coloured_format_and_compound_conditions() {
+        let m = p172().checklist_map;
+        let parse_item = |r: &str| super::parse_item(r, &m);
         // sw_item_c with colour codes mid-text — colours stripped, item mapped.
         match parse_item(r"\green\Parking brakes\yellow\, engaged|\white\CHECK:sim/flightmodel/controls/parkbrake:1") {
             Item::Act { say, tool, .. } => {
@@ -619,7 +628,18 @@ mod tests {
     }
 
     #[test]
+    fn empty_map_never_acts() {
+        // With no checklist_map, an item we'd normally act on becomes a verify
+        // (we can read it) — never an Act. This is the SR22's state until its
+        // map is filled in: read-along + call-out, no actuation.
+        let it = super::parse_item("PARKING BRAKE|ON:sim/flightmodel/controls/parkbrake:1", &[]);
+        assert!(matches!(it, Item::Verify { .. }));
+    }
+
+    #[test]
     fn maps_actions_and_speech() {
+        let m = p172().checklist_map;
+        let parse_item = |r: &str| super::parse_item(r, &m);
         // Parking brake ON → set_parking_brake(on).
         let it = parse_item("PARKING BRAKE|ON:sim/flightmodel/controls/parkbrake:1");
         match it {
@@ -666,7 +686,7 @@ mod tests {
         let text = std::fs::read_to_string("checklists/cessna_172sp.txt")
             .or_else(|_| std::fs::read_to_string("profiles/Cessna_172SP_clist.txt"))
             .expect("172 checklist file present");
-        let cls = parse(&text, vec![], None);
+        let cls = parse(&text, &p172());
         // All the named sections come through with distinct slugs.
         let ids: Vec<&str> = cls.iter().map(|c| c.id.as_str()).collect();
         assert!(ids.contains(&"before_takeoff"));
@@ -691,7 +711,7 @@ mod tests {
     #[test]
     fn destructive_steps_are_gated() {
         let text = std::fs::read_to_string("checklists/cessna_172sp.txt").unwrap();
-        let cls = parse(&text, vec![], None);
+        let cls = parse(&text, &p172());
 
         // Engine start carries a confirm.
         let start = cls.iter().find(|c| c.id == "starting_engine").unwrap();

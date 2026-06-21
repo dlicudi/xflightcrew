@@ -104,14 +104,10 @@ async fn main() -> Result<()> {
     let registry = Registry::for_aircraft(&profile);
     // Checklists the copilot runs interactively (narrate + act + verify + call
     // out yours). Interpreted from the airframe's XChecklist file, not baked in.
-    let checklists = match &profile.checklist {
-        Some(path) => checklist::load(path, profile.lights.clone(), profile.flaps.clone())
-            .unwrap_or_else(|e| {
-                tracing::error!("checklist load failed: {e:#}; running without checklists");
-                Vec::new()
-            }),
-        None => Vec::new(),
-    };
+    let checklists = checklist::load(&profile).unwrap_or_else(|e| {
+        tracing::error!("checklist load failed: {e:#}; running without checklists");
+        Vec::new()
+    });
     tracing::info!(checklists = checklists.len(), "interpreted checklists");
 
     let continuous = config.listen_mode == "continuous";

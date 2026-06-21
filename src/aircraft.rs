@@ -32,6 +32,10 @@ pub struct AircraftProfile {
     /// the copilot interprets it (see [`crate::checklist`]).
     #[serde(default)]
     pub checklist: Option<String>,
+    /// Maps the checklist file's datarefs to curated actions, per-airframe. Empty
+    /// means the copilot only verifies/calls out checklist items (never acts).
+    #[serde(default)]
+    pub checklist_map: Vec<ChecklistMapEntry>,
     /// Exterior/interior lights this airframe has. Empty means no `set_lights` tool.
     #[serde(default)]
     pub lights: Vec<LightProfile>,
@@ -154,6 +158,45 @@ pub struct LightProfile {
     pub command_off: Option<String>,
 }
 
+/// One entry of the checklist action map: a dataref *substring* and the curated
+/// action it drives. When the interpreter ([`crate::checklist`]) meets a file
+/// item whose dataref contains `match_`, it runs that action — so *which*
+/// dataref maps to *which* system is per-airframe config here, while *how* a
+/// condition becomes the tool's argument stays shared logic in Rust. First match
+/// wins, so order more specific entries first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChecklistMapEntry {
+    /// Substring matched against the file's dataref (e.g. `"parkbrake"`,
+    /// `"battery_array_on[0]"`).
+    #[serde(rename = "match")]
+    pub match_: String,
+    /// The action this dataref drives.
+    pub action: ChecklistAction,
+}
+
+/// A curated action a checklist item can drive. The variant names *what* system;
+/// the condition supplies the value (handled in [`crate::checklist`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChecklistAction {
+    ParkingBrake,
+    PitotHeat,
+    FuelPump,
+    AutopilotOff,
+    Transponder,
+    FuelSelector,
+    Flaps,
+    Mixture,
+    Throttle,
+    /// Ignition key: start (crank) or magneto position, from the value.
+    Ignition,
+    PitchTrim,
+    /// Electrical system by name (`battery`, `alternator`, `avionics`, `master`).
+    Electrical(String),
+    /// A switchable light by its profile key (`nav`, `landing`, …).
+    Light(String),
+}
+
 /// Load a profile by id: prefer `profiles/<id>.yaml`, else the built-in.
 pub fn load(id: &str) -> Option<AircraftProfile> {
     let path = format!("profiles/{id}.yaml");
@@ -200,6 +243,15 @@ mod tests {
         let fuel = p.fuel.expect("has fuel thresholds");
         assert_eq!(fuel.reserve_caution_min, 45.0);
         assert_eq!(fuel.reserve_warning_min, 30.0);
+        // The checklist action map loads, and the YAML matches the built-in (same
+        // matches, in the same order) — so behaviour is identical either source.
+        let yaml_map = &p.checklist_map;
+        let builtin_map = &cessna_172sp().checklist_map;
+        assert!(!yaml_map.is_empty());
+        assert_eq!(yaml_map.len(), builtin_map.len());
+        for (a, b) in yaml_map.iter().zip(builtin_map) {
+            assert_eq!(a.match_, b.match_, "map entry mismatch (YAML vs built-in)");
+        }
     }
 
     #[test]
@@ -267,6 +319,32 @@ fn cessna_172sp() -> AircraftProfile {
         // 172SP clean stall ~48 KIAS (power-off, flaps up).
         vs_clean_kts: Some(48.0),
         checklist: Some("checklists/cessna_172sp.txt".into()),
+        checklist_map: {
+            let m = |s: &str, a: ChecklistAction| ChecklistMapEntry { match_: s.into(), action: a };
+            use ChecklistAction::*;
+            vec![
+                m("parkbrake", ParkingBrake),
+                m("autopilot/autopilot_on", AutopilotOff),
+                m("electrical/battery_on", Electrical("battery".into())),
+                m("electrical/avionics_on", Electrical("avionics".into())),
+                m("electrical/generator_on", Electrical("alternator".into())),
+                m("pitot_heat_on", PitotHeat),
+                m("fuel_pump_on", FuelPump),
+                m("transponder_mode", Transponder),
+                m("fuel_tank_selector", FuelSelector),
+                m("flap_ratio", Flaps),
+                m("mixture_ratio", Mixture),
+                m("throttle_ratio", Throttle),
+                m("ignition_key", Ignition),
+                m("elevator_trim", PitchTrim),
+                m("taxi_light", Light("taxi".into())),
+                m("landing_lights", Light("landing".into())),
+                m("strobe_lights", Light("strobe".into())),
+                m("beacon_lights", Light("beacon".into())),
+                m("navigation_lights", Light("nav".into())),
+                m("nav_lights", Light("nav".into())),
+            ]
+        },
         lights: vec![
             light("nav", "navigation lights", "sim/cockpit2/switches/navigation_lights_on",
                   "sim/lights/nav_lights_on", "sim/lights/nav_lights_off"),
