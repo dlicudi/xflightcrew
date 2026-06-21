@@ -21,8 +21,12 @@ ils: true              # prepare_ils
 parking_brake: true    # set_parking_brake (universal parkbrake)
 pitot_heat: true       # set_pitot_heat (universal pitot_heat_on)
 
+# Throttle/mixture/start write universal datarefs (throttle_ratio_all,
+# mixture_ratio_all, the starter command) — confirmed against the rustdecks deck.
+# (start_engine sets battery 1 + alternator 1 only; the SR22's BAT2/ALT2 need the
+# dual-electrical tool.)
+engine: true
 # --- SR22-specific: off until built and verified in the sim ---
-engine: false          # throttle is universal, but SR22 mixture is ENGN_mixt — verify first
 electrical: false      # DUAL BAT/ALT — the single-system tool is wrong for the SR22
 magnetos: false        # key-start ignition differs from the 172 mag switch
 carb_heat: false       # fuel-injected — no carb heat
@@ -53,20 +57,23 @@ flaps:
 # XChecklist file to interpret (GoofyJP, read-only).
 checklist: checklists/cirrus_sr22.txt
 
-# Lights — datarefs from the checklist file + universal commands. VERIFY IN SIM.
+# Lights — datarefs verified against the rustdecks SR22 deck; universal commands.
 lights:
-  - { key: nav,     spoken: nav lights,    dataref: sim/cockpit/electrical/nav_lights_on,     command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
-  - { key: strobe,  spoken: strobe lights, dataref: sim/cockpit/electrical/strobe_lights_on,  command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
-  - { key: landing, spoken: landing light, dataref: sim/cockpit/electrical/landing_lights_on, command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+  - { key: nav,     spoken: nav lights,    dataref: sim/cockpit2/switches/navigation_lights_on,   command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
+  - { key: strobe,  spoken: strobe lights, dataref: sim/cockpit2/switches/strobe_lights_on,        command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
+  - { key: landing, spoken: landing light, dataref: sim/cockpit2/switches/landing_lights_switch[0], command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
 
-# Checklist action map — CONSERVATIVE. Only rock-solid universal datarefs act;
-# every other checklist item verifies / calls out. Promote entries here (mixture,
-# throttle, electrical, fuel, flaps, ignition) as you confirm the SR22 datarefs
-# in the sim and build any SR22-specific tools they need.
+# Checklist action map. Acts on universal-dataref systems; the SR22's own systems
+# (dual battery/alternator, boost pump, off/left/right fuel selector) still
+# verify/call-out until their tools are built — their verified datarefs are now
+# known from the rustdecks deck.
 checklist_map:
   - { match: parkbrake,        action: parking_brake }
   - { match: transponder_mode, action: transponder }
   - { match: pitot_heat_on,    action: pitot_heat }
+  - { match: throttle_ratio,   action: throttle }     # throttle_ratio_all (universal)
+  - { match: ENGN_mixt,        action: mixture }      # set_mixture writes mixture_ratio_all
+  - { match: flap_handle,      action: flaps }        # set_flaps writes flap_ratio
   - { match: nav_lights,       action: { light: nav } }
   - { match: strobe_lights,    action: { light: strobe } }
   - { match: landing_lights,   action: { light: landing } }
