@@ -424,7 +424,13 @@ async fn run_checklist(
         };
         say(voice, reporter, ui::LogKind::Warn, &format!("{challenge} isn't set — want me to make it {response}?"));
         reporter.status(ui::Phase::Listening);
-        let affirm = listen_once(listener, stt).map(|r| is_affirmative(&r.text)).unwrap_or(false);
+        // Log the reply the same way the command loop does, so the pilot sees
+        // their own "affirm" in the conversation, not just the copilot's side.
+        let reply = listen_once(listener, stt);
+        if let Some(r) = &reply {
+            reporter.log(ui::LogKind::Heard, format!("\"{}\" ({:.2})", r.text, r.confidence));
+        }
+        let affirm = reply.map(|r| is_affirmative(&r.text)).unwrap_or(false);
         if !affirm {
             open.push(&item.challenge);
             continue;
