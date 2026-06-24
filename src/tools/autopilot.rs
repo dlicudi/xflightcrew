@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{Tool, ToolCtx};
+use super::{Tool, ToolCtx, CMD_SERVOS_ON};
 
 /// Pilot-side heading bug, degrees magnetic (writable).
 const HEADING_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
@@ -26,8 +26,6 @@ const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 /// Servo engagement status (read-only; 1 = autopilot flying).
 const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";
-/// Command: engage the servos.
-const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 /// Command: disconnect the autopilot. The stock 172's S-TEC-style AP has no
 /// master switch and does not register `sim/autopilot/servos_off`. X-Plane
 /// exposes `servos_off_any` ("disco servos, whichever side is active") and the

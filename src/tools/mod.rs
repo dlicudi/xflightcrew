@@ -28,6 +28,17 @@ use crate::aircraft::AircraftProfile;
 use crate::config::Config;
 use crate::xplane::XPlaneClient;
 
+// Datarefs/commands shared by more than one tool module, defined once here so the
+// two readers can't silently drift. Datarefs private to a single tool stay in
+// that tool's module.
+
+/// Parking-brake ratio dataref (0 = off, 1 = set). Written by `set_parking_brake`
+/// and read by `stop_engine`'s pre-shutdown check.
+pub(crate) const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
+/// Command: engage the autopilot servos. Pressed by the AP-mode tools
+/// (`set_heading`/`set_altitude`/…) and by the ILS setup in `approach`.
+pub(crate) const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
+
 /// Shared context handed to every tool invocation.
 pub struct ToolCtx<'a> {
     pub xplane: &'a XPlaneClient,

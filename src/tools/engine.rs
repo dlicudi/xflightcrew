@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{Tool, ToolCtx};
+use super::{Tool, ToolCtx, PARK_BRAKE};
 use crate::aircraft::FuelSelectorProfile;
 
 const THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
@@ -21,7 +21,6 @@ const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
 const MIN_START_VOLTS: f64 = 23.0;
 const ONGROUND: &str = "sim/flightmodel/failures/onground_any";
 const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed"; // m/s
-const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 const CMD_MAGS_BOTH: &str = "sim/magnetos/magnetos_both";
 const CMD_MAGS_OFF: &str = "sim/magnetos/magnetos_off";

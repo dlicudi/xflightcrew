@@ -10,12 +10,11 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{Tool, ToolCtx};
+use super::{Tool, ToolCtx, CMD_SERVOS_ON};
 use crate::nav;
 
 const NAV1_FREQ: &str = "sim/cockpit2/radios/actuators/nav1_frequency_hz";
 const NAV1_OBS: &str = "sim/cockpit2/radios/actuators/nav1_obs_deg_mag_pilot";
-const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_APPROACH: &str = "sim/autopilot/approach";
 const CMD_ALT_HOLD: &str = "sim/autopilot/altitude_hold";
 const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
