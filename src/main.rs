@@ -16,6 +16,8 @@ mod monitor;
 mod nav;
 mod stt;
 mod tts;
+#[cfg(feature = "onnx-tts")]
+mod tts_onnx;
 mod tools;
 mod ui;
 mod voice;

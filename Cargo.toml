@@ -41,6 +41,16 @@ tracing-appender = "0.2"
 ratatui = "0.29"
 dotenvy = "0.15"
 
+# In-process ONNX TTS (warm session) — optional, behind the `onnx-tts` feature so
+# the default build stays dependency-free. `ort` wraps libonnxruntime; `hound`
+# writes the synthesized PCM to a WAV for playback.
+ort = { version = "2.0.0-rc.12", optional = true }
+hound = { version = "3", optional = true }
+
 [dev-dependencies]
 # WAV reader, used only by the STT integration test.
 hound = "3"
+
+[features]
+# Build with: cargo build --features onnx-tts  (then XCOPILOT_TTS=onnx)
+onnx-tts = ["dep:ort", "dep:hound"]

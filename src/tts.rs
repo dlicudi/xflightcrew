@@ -63,9 +63,10 @@ fn speak_piper(config: &Config, text: &str) -> Result<()> {
     play(&wav_path)
 }
 
-/// Play a WAV file using the platform's default CLI player.
+/// Play a WAV file using the platform's default CLI player. `pub(crate)` so the
+/// in-process ONNX backend ([`crate::tts_onnx`]) can reuse it.
 #[cfg(target_os = "macos")]
-fn play(path: &std::path::Path) -> Result<()> {
+pub(crate) fn play(path: &std::path::Path) -> Result<()> {
     let status = Command::new("afplay")
         .arg(path)
         .status()
@@ -77,7 +78,7 @@ fn play(path: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn play(path: &std::path::Path) -> Result<()> {
+pub(crate) fn play(path: &std::path::Path) -> Result<()> {
     // Linux fallback: aplay ships with alsa-utils.
     let status = Command::new("aplay")
         .arg(path)
