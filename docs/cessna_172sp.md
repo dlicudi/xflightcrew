@@ -40,6 +40,27 @@ destructive steps** — engine start, the mag run-up (which advances the throttl
 and mixture-to-cutoff. It asks "Confirm, start the engine?"; say yes and it does
 it, anything else and it skips that step and leaves it to you.
 
+**The checklists** (say any by name, normal flight order):
+
+1. **preflight**
+2. **before starting engine**
+3. **starting engine**
+4. **before taxi**
+5. **before takeoff** ("configure for takeoff")
+6. **normal takeoff**
+7. **climb**
+8. **cruise**
+9. **descent**
+10. **before landing** ("configure for landing")
+11. **normal landing**
+12. **after landing** ("clean up")
+13. **engine shutdown** ("shutdown")
+
+Plus **"performance limits"** — a reference read-back (V-speeds & limits), not a
+runnable list. Each is interpreted line-for-line from
+[checklists/cessna_172sp.txt](../checklists/cessna_172sp.txt); the table below is
+what the copilot does per list.
+
 ```
 🗣️  "run the before takeoff checklist"
 🔊  Running the before takeoff checklist.

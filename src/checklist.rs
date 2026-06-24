@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 
 use crate::aircraft::{
     AircraftProfile, ChecklistAction, ChecklistMapEntry, ElectricalSystem, FlapProfile,
-    FuelSelectorProfile, LightProfile,
+    FuelPosition, FuelSelectorProfile, LightProfile,
 };
 use crate::tools::autopilot::AutopilotOff;
 use crate::tools::controls::{SetParkingBrake, SetPitchTrim};
@@ -169,6 +169,11 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
     let flaps = profile.flaps.clone();
     let electrical = &profile.electrical;
     let fuel_selector = &profile.fuel_selector;
+    // The selector's positions (with their dataref values) let `action_for`
+    // decode a file condition like `fuel_tank_selector:1` into the right position
+    // for *this* airframe (172: 4=both; SR22: 0=off/1=left/2=right).
+    let fuel_positions: &[FuelPosition] =
+        fuel_selector.as_ref().map_or(&[], |f| f.positions.as_slice());
     let map = &profile.checklist_map;
     let mut out: Vec<Checklist> = Vec::new();
     let mut cur: Option<Checklist> = None;
@@ -227,7 +232,7 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
             }
             "sw_item" => {
                 if let Some(c) = cur.as_mut() {
-                    let mut item = parse_item(rest, map);
+                    let mut item = parse_item(rest, map, fuel_positions);
                     // Arm the run-up confirm on the first actioned step after the
                     // magneto-test remark (the throttle-up).
                     if arm_runup {
@@ -250,7 +255,7 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
 /// Parse one item body: `CHALLENGE|RESPONSE[:condition]`. The text carries no
 /// colon, so the first colon (if any) splits the spoken text from the condition
 /// spec. Colour codes (`\green\…`) are stripped by [`humanize`].
-fn parse_item(rest: &str, map: &[ChecklistMapEntry]) -> Item {
+fn parse_item(rest: &str, map: &[ChecklistMapEntry], fuel: &[FuelPosition]) -> Item {
     let (text, condspec) = match rest.split_once(':') {
         Some((t, c)) => (t, Some(c.trim())),
         None => (rest, None),
@@ -279,7 +284,7 @@ fn parse_item(rest: &str, map: &[ChecklistMapEntry]) -> Item {
     };
     let (base, index) = split_index(dataref.trim());
 
-    match action_for(map, &base, &cond) {
+    match action_for(map, &base, &cond, fuel) {
         Some((tool, args)) => {
             let confirm = confirm_for(tool, &args);
             Item::Act { say, tool, args, confirm }
@@ -299,6 +304,12 @@ fn is_compound_condition(c: &str) -> bool {
         || c.contains('{')
 }
 
+/// Hazard text for pulling the mixture to idle cutoff. Only worth confirming
+/// when the engine is actually turning — pre-start (e.g. the SR22's "mixture
+/// lean" before-engine-start item) it's the normal lean, so the runner suppresses
+/// this prompt when the engine isn't running (see [`engine_running`]).
+pub const CONFIRM_MIXTURE_CUTOFF: &str = "cut the mixture and stop the engine";
+
 /// Steps the runner should confirm before performing — the engine-state changes.
 /// Cranking (`start_engine`), an explicit stop, and mixture-to-cutoff (which kills
 /// a running engine) are the destructive ones. The run-up is armed separately
@@ -308,10 +319,20 @@ fn confirm_for(tool: &str, args: &Value) -> Option<&'static str> {
         "start_engine" => Some("start the engine"),
         "stop_engine" => Some("shut the engine down"),
         "set_mixture" if args.get("percent").and_then(Value::as_i64) == Some(0) => {
-            Some("cut the mixture and stop the engine")
+            Some(CONFIRM_MIXTURE_CUTOFF)
         }
         _ => None,
     }
+}
+
+/// Is engine 1 running? Used to suppress the mixture-cutoff confirm pre-start.
+/// On a read error, assume running (fail safe — keep the confirm).
+pub async fn engine_running(xp: &XPlaneClient) -> bool {
+    xp.get_float_array("sim/flightmodel/engine/ENGN_running")
+        .await
+        .ok()
+        .and_then(|v| v.first().copied())
+        .is_none_or(|r| r > 0.5)
 }
 
 /// Map a file dataref + its pass condition to one of our curated tools, using
@@ -320,7 +341,12 @@ fn confirm_for(tool: &str, args: &Value) -> Option<&'static str> {
 /// the matched action can't honour this condition. *Which* dataref maps to
 /// *which* system is config (per-airframe); *how* the condition becomes the
 /// argument is the shared logic here.
-fn action_for(map: &[ChecklistMapEntry], dataref: &str, cond: &Cond) -> Option<(&'static str, Value)> {
+fn action_for(
+    map: &[ChecklistMapEntry],
+    dataref: &str,
+    cond: &Cond,
+    fuel: &[FuelPosition],
+) -> Option<(&'static str, Value)> {
     let entry = map.iter().find(|e| dataref.contains(&e.match_))?;
     let on = cond.is_on();
     match &entry.action {
@@ -340,11 +366,19 @@ fn action_for(map: &[ChecklistMapEntry], dataref: &str, cond: &Cond) -> Option<(
             }
             _ => None,
         },
-        ChecklistAction::FuelSelector => match cond {
-            Cond::Eq(n) if (*n - 4.0).abs() < 0.5 => Some(("set_fuel_selector", json!({ "position": "both" }))),
-            Cond::Ne(n) if (*n - 4.0).abs() < 0.5 => Some(("set_fuel_selector", json!({ "position": "left" }))),
-            _ => None, // ">0" (shutoff pushed in) etc. → verify only
-        },
+        ChecklistAction::FuelSelector => {
+            // Decode the file's selector value against this airframe's positions,
+            // so the same logic serves the 172 (4=both) and the SR22
+            // (0=off/1=left/2=right). `:N` picks the position whose dataref value
+            // is N; `:!N` ("not both" on the 172) picks the first position that
+            // isn't N. Inequalities (`:>0` shutoff-pushed-in) stay verify-only.
+            let key = match cond {
+                Cond::Eq(n) => fuel.iter().find(|p| p.value.is_some_and(|v| (v - n).abs() < 0.5)),
+                Cond::Ne(n) => fuel.iter().find(|p| p.value.is_some_and(|v| (v - n).abs() >= 0.5)),
+                _ => None,
+            }?;
+            Some(("set_fuel_selector", json!({ "position": key.key })))
+        }
         ChecklistAction::Flaps => match cond {
             // Files express "up"/"full" as either a bound (172: `<0.02`/`>0.90`)
             // or an exact value (SR22: `0.0`/`1.0`).
@@ -572,7 +606,7 @@ mod tests {
     #[test]
     fn coloured_format_and_compound_conditions() {
         let m = p172().checklist_map;
-        let parse_item = |r: &str| super::parse_item(r, &m);
+        let parse_item = |r: &str| super::parse_item(r, &m, &[]);
         // sw_item_c with colour codes mid-text — colours stripped, item mapped.
         match parse_item(r"\green\Parking brakes\yellow\, engaged|\white\CHECK:sim/flightmodel/controls/parkbrake:1") {
             Item::Act { say, tool, .. } => {
@@ -644,27 +678,37 @@ mod tests {
     }
 
     #[test]
-    fn sr22_checklist_runs_conservatively() {
+    fn sr22_checklist_acts_on_wired_tools_only() {
         let p = crate::aircraft::builtin("cirrus_sr22").unwrap();
         let cls = load(&p).expect("SR22 checklist loads");
         assert!(cls.len() > 15, "expected the full SR22 section set");
 
-        // Everything it acts on is a universal-dataref tool — never an SR22
-        // system we haven't built (electrical, boost pump, fuel selector).
-        let safe = [
+        // Everything it acts on is a tool the SR22 profile actually wires — the
+        // universal-dataref ones plus the rustdecks-verified boost pump, key-start
+        // ignition (set_magnetos / start_engine) and pitch trim. Never an unbuilt
+        // system (e.g. the off/left/right fuel selector isn't checklist-mapped).
+        let wired = [
             "set_parking_brake", "set_transponder_mode", "set_pitot_heat", "set_lights",
             "set_throttle", "set_mixture", "set_flaps", "set_electrical",
+            "set_fuel_pump", "set_magnetos", "start_engine", "set_pitch_trim",
+            "set_fuel_selector",
         ];
         let mut acts = 0;
+        let mut seen = std::collections::BTreeSet::new();
         for c in &cls {
             for it in &c.items {
                 if let Item::Act { tool, .. } = it {
-                    assert!(safe.contains(tool), "SR22 acted on a non-conservative tool: {tool}");
+                    assert!(wired.contains(tool), "SR22 acted on an unwired tool: {tool}");
+                    seen.insert(*tool);
                     acts += 1;
                 }
             }
         }
-        assert!(acts > 0, "expected at least the universal-safe acts");
+        assert!(acts > 0, "expected the wired acts");
+        // The newly-wired systems actually show up in the interpreted file.
+        for t in ["set_fuel_pump", "set_magnetos", "set_pitch_trim", "set_fuel_selector"] {
+            assert!(seen.contains(t), "expected the SR22 file to drive {t}");
+        }
     }
 
     #[test]
@@ -672,14 +716,14 @@ mod tests {
         // With no checklist_map, an item we'd normally act on becomes a verify
         // (we can read it) — never an Act. This is the SR22's state until its
         // map is filled in: read-along + call-out, no actuation.
-        let it = super::parse_item("PARKING BRAKE|ON:sim/flightmodel/controls/parkbrake:1", &[]);
+        let it = super::parse_item("PARKING BRAKE|ON:sim/flightmodel/controls/parkbrake:1", &[], &[]);
         assert!(matches!(it, Item::Verify { .. }));
     }
 
     #[test]
     fn maps_actions_and_speech() {
         let m = p172().checklist_map;
-        let parse_item = |r: &str| super::parse_item(r, &m);
+        let parse_item = |r: &str| super::parse_item(r, &m, &[]);
         // Parking brake ON → set_parking_brake(on).
         let it = parse_item("PARKING BRAKE|ON:sim/flightmodel/controls/parkbrake:1");
         match it {
@@ -719,6 +763,53 @@ mod tests {
             Item::Verify { cond, .. } => assert_eq!(cond, Cond::Lt(0.1)),
             _ => panic!("expected Verify"),
         }
+    }
+
+    #[test]
+    fn fuel_selector_decodes_per_airframe() {
+        use crate::aircraft::FuelPosition;
+        let pos = |key: &str, value: f64| FuelPosition {
+            key: key.into(),
+            spoken: key.into(),
+            command: String::new(),
+            value: Some(value),
+        };
+        let map = [ChecklistMapEntry {
+            match_: "fuel_tank_selector".into(),
+            action: ChecklistAction::FuelSelector,
+        }];
+        let act = |r: &str, fuel: &[FuelPosition]| super::parse_item(r, &map, fuel);
+
+        // 172 positions: left=1, both=4, right=3.
+        let c172 = [pos("left", 1.0), pos("both", 4.0), pos("right", 3.0)];
+        // `:4` → both; `:!4` ("left or right") → the first non-4 position (left).
+        match act("FUEL|BOTH:sim/cockpit2/fuel/fuel_tank_selector:4", &c172) {
+            Item::Act { args, .. } => assert_eq!(args, json!({ "position": "both" })),
+            other => panic!("expected Act both, got {}", variant(&other)),
+        }
+        match act("FUEL|L or R:sim/cockpit2/fuel/fuel_tank_selector:!4", &c172) {
+            Item::Act { args, .. } => assert_eq!(args, json!({ "position": "left" })),
+            other => panic!("expected Act left, got {}", variant(&other)),
+        }
+
+        // SR22 positions: off=0, left=1, right=2 — the case that used to fall
+        // through to a read-only verify.
+        let sr22 = [pos("off", 0.0), pos("left", 1.0), pos("right", 2.0)];
+        for (val, want) in [("0", "off"), ("1", "left"), ("2", "right")] {
+            match act(&format!("FUEL|X:sim/cockpit2/fuel/fuel_tank_selector:{val}"), &sr22) {
+                Item::Act { tool, args, .. } => {
+                    assert_eq!(tool, "set_fuel_selector");
+                    assert_eq!(args, json!({ "position": want }));
+                }
+                other => panic!("expected Act {want}, got {}", variant(&other)),
+            }
+        }
+        // "switch to fullest" (`:>0.1`) names no single position, so it stays a
+        // read-only verify rather than guessing a tank.
+        assert!(matches!(
+            act("FUEL|FULLEST:sim/cockpit2/fuel/fuel_tank_selector:>0.1", &sr22),
+            Item::Verify { .. }
+        ));
     }
 
     #[test]

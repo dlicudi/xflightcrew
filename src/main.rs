@@ -499,7 +499,17 @@ async fn run_checklist(
             Item::Act { say: line, tool, args, confirm } => {
                 // Destructive step — ask first. Yes does it; "stop/abort/cancel"
                 // aborts the whole checklist; anything else just skips this step.
-                if let Some(hazard) = confirm {
+                // Exception: mixture-to-cutoff only stops a *running* engine, so
+                // pre-start (the SR22's "mixture lean" before-start item) it's the
+                // normal lean — skip the prompt and just do it.
+                let ask = match confirm {
+                    Some(h) if *h == checklist::CONFIRM_MIXTURE_CUTOFF => {
+                        checklist::engine_running(xplane).await
+                    }
+                    other => other.is_some(),
+                };
+                if ask {
+                    let hazard = confirm.expect("ask implies a confirm hazard");
                     say(voice, reporter, ui::LogKind::Confirm, &format!("Confirm, {hazard}?"));
                     reporter.status(ui::Phase::Listening);
                     let reply = listen_once(listener, stt, None);

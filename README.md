@@ -32,7 +32,8 @@ per call).
 - **Background monitor** — calls out problems unprompted (alternator offline, low
   fuel).
 
-➡️ **Full command + checklist reference: [docs/cessna_172sp.md](docs/cessna_172sp.md)**
+➡️ **Full command + checklist reference:**
+[Cessna 172SP](docs/cessna_172sp.md) · [Cirrus SR22](docs/cirrus_sr22.md)
 · Monitor details: [docs/monitoring.md](docs/monitoring.md)
 
 ## Quick start

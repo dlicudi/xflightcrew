@@ -1,11 +1,10 @@
 # Aircraft profile — X-Plane stock Cirrus SR22 (Laminar).
 #
-# SCAFFOLD. Built from the GoofyJP XChecklist file and the POH; the datarefs
-# marked "verify" are unconfirmed against the sim. Conservative by design: only
-# tools/actions on *universal* X-Plane datarefs are enabled. The SR22's own
-# systems — dual battery/alternator, the ENGN_mixt mixture, the boost pump, the
-# off/left/right fuel selector, key-start ignition — are left off until their
-# datarefs/tools are built and verified in the cockpit.
+# Built from the GoofyJP XChecklist file, the POH, and the rustdecks SR22 deck
+# (the verified dataref/command source). Enabled tools write universal X-Plane
+# datarefs or rustdecks-verified commands: dual battery/alternator, mixture,
+# throttle, boost pump, key-start ignition, pitch trim, off/left/right fuel
+# selector. Off: carb heat (fuel-injected) and the vacuum DG (G1000 glass).
 
 id: cirrus_sr22
 display_name: Cirrus SR22
@@ -38,23 +37,30 @@ electrical:
   - { key: alternators, spoken: both alternators,  on_commands: [sim/electrical/generator_1_on, sim/electrical/generator_2_on], off_commands: [sim/electrical/generator_1_off, sim/electrical/generator_2_off], readback: ["sim/cockpit2/electrical/generator_on[0]", "sim/cockpit2/electrical/generator_on[1]"] }
   - { key: avionics,    spoken: avionics master,   on_commands: [sim/systems/avionics_on],       off_commands: [sim/systems/avionics_off],      readback: [sim/cockpit/electrical/avionics_on] }
 
-# --- SR22-specific: off until built and verified in the sim ---
-magnetos: false        # key-start ignition differs from the 172 mag switch
+# Key-start ignition: set_magnetos writes the universal ignition_key
+# (0 off/1 R/2 L/3 both/4 start); start_engine engages starter 1
+# (sim/starters/engage_starter_1 — the command the rustdecks deck uses).
+magnetos: true
 carb_heat: false       # fuel-injected — no carb heat
-fuel_pump: false       # laminar/sr22/switch/boost_pump
+# Boost pump: set_fuel_pump writes sim/cockpit2/engine/actuators/fuel_pump_on[0],
+# the dataref the rustdecks deck drives for BOOST (not laminar/sr22/switch/
+# boost_pump, which an earlier scaffold guessed).
+fuel_pump: true
 # Fuel selector: OFF / LEFT / RIGHT — no "both" (low-wing twin tanks, fed one at
-# a time). laminar/sr22 selector commands verified against the rustdecks deck;
-# the position dataref (laminar/sr22/fuel_selector_pos) exists but its integer
-# mapping is unverified, so no readback confirm yet — the verified command is
-# trusted. ("off" is quoted: bare off is YAML boolean false.)
+# a time). Selector commands verified against the rustdecks deck. The standard
+# sim/cockpit2/fuel/fuel_tank_selector (0=off/1=left/2=right) is the readback the
+# GoofyJP checklist trusts, so it confirms a write and lets the checklist decode
+# the file's `fuel_tank_selector:N` items. ("off" is quoted: bare off is YAML
+# boolean false.)
 fuel_selector:
+  readback: sim/cockpit2/fuel/fuel_tank_selector
   positions:
-    - { key: "off",  spoken: "off",  command: laminar/sr22/fuel_sel_left_off }
-    - { key: left,   spoken: left,   command: laminar/sr22/fuel_sel_left_select }
-    - { key: right,  spoken: right,  command: laminar/sr22/fuel_sel_right_select }
+    - { key: "off",  spoken: "off",  command: laminar/sr22/fuel_sel_left_off,     value: 0.0 }
+    - { key: left,   spoken: left,   command: laminar/sr22/fuel_sel_left_select,  value: 1.0 }
+    - { key: right,  spoken: right,  command: laminar/sr22/fuel_sel_right_select, value: 2.0 }
 directional_gyro: false # G1000 glass — no vacuum DG to sync
 flood_lights: false
-pitch_trim: false      # verify trim dataref + range first
+pitch_trim: true       # set_pitch_trim writes universal elevator_trim; T/O = centred
 retractable_gear: false
 
 # Fuel-endurance alerting. SR22 ~92 gal usable, ~17 gal/hr cruise (~46 kg/hr). VERIFY.
@@ -83,10 +89,10 @@ lights:
   - { key: strobe,  spoken: strobe lights, dataref: sim/cockpit2/switches/strobe_lights_on,        command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
   - { key: landing, spoken: landing light, dataref: "sim/cockpit2/switches/landing_lights_switch[0]", command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
 
-# Checklist action map. Acts on universal-dataref systems; the SR22's own systems
-# (dual battery/alternator, boost pump, off/left/right fuel selector) still
-# verify/call-out until their tools are built — their verified datarefs are now
-# known from the rustdecks deck.
+# Checklist action map. Acts on universal-dataref systems plus the now-wired
+# boost pump, key-start ignition, pitch trim and the off/left/right fuel selector
+# (decoded from the profile's position values). The dual battery/alternator stay
+# call-out — their file conditions are compound &&.
 checklist_map:
   - { match: parkbrake,        action: parking_brake }
   - { match: transponder_mode, action: transponder }
@@ -98,3 +104,8 @@ checklist_map:
   - { match: nav_lights,       action: !light nav }
   - { match: strobe_lights,    action: !light strobe }
   - { match: landing_lights,   action: !light landing }
+  - { match: boost_pump,         action: fuel_pump }    # set_fuel_pump → fuel_pump_on[0]
+  - { match: ignition_key,       action: ignition }     # actuators/ignition_key: 4=start, 0=off
+  - { match: ignition_on,        action: ignition }     # mag test: 1=R, 2=L, 3=both
+  - { match: elevator_trim,      action: pitch_trim }   # "set T/O" → centre (not ail_trim)
+  - { match: fuel_tank_selector, action: fuel_selector } # 0=off/1=left/2=right

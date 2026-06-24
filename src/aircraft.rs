@@ -342,10 +342,12 @@ mod tests {
     fn sr22_yaml_loads_and_is_conservative() {
         let p = load("cirrus_sr22").expect("SR22 profile loads");
         assert_eq!(p.id, "cirrus_sr22");
-        // Universal-dataref tools on (incl. engine — throttle/mixture/start);
-        // SR22-specific systems still off until their tools exist.
+        // Universal-dataref tools on (incl. engine — throttle/mixture/start), plus
+        // the rustdecks-verified boost pump, key-start ignition and pitch trim.
         assert!(p.autopilot && p.parking_brake && p.pitot_heat && p.transponder && p.engine);
-        assert!(!p.magnetos && !p.fuel_pump && !p.directional_gyro);
+        assert!(p.magnetos && p.fuel_pump && p.pitch_trim);
+        // Still off: carb heat (fuel-injected) and the vacuum DG (G1000 glass).
+        assert!(!p.carb_heat && !p.directional_gyro);
         // Fuel selector is wired (verified deck commands): OFF / LEFT / RIGHT,
         // no "both".
         let fsel = p.fuel_selector.as_ref().expect("SR22 has a fuel selector");
@@ -371,15 +373,22 @@ mod tests {
         for (a, b) in yaml_map.iter().zip(builtin_map) {
             assert_eq!(a.match_, b.match_);
         }
-        // The fuel selector tool now exists, but the SR22's fuel *checklist*
-        // items aren't mapped to it yet (the condition→position decode is still
-        // 172-specific), and the dual electrical likewise isn't checklist-mapped.
-        // (Mixture maps via ENGN_mixt, but set_mixture writes the universal
-        // mixture_ratio_all, so that's safe.)
+        // Still call-out, not mapped: the dual battery/alternator (their file
+        // conditions are compound `&&`).
         for e in yaml_map {
-            assert!(!e.match_.contains("battery") && !e.match_.contains("generator")
-                && !e.match_.contains("fuel_tank") && !e.match_.contains("boost"));
+            assert!(!e.match_.contains("battery") && !e.match_.contains("generator"));
         }
+        // The boost pump, key-start ignition, pitch trim and fuel selector ARE
+        // now mapped.
+        let matches: Vec<&str> = yaml_map.iter().map(|e| e.match_.as_str()).collect();
+        for m in ["boost_pump", "ignition_key", "ignition_on", "elevator_trim", "fuel_tank_selector"] {
+            assert!(matches.contains(&m), "SR22 map missing {m}");
+        }
+        // Fuel-selector positions carry their dataref values so the checklist can
+        // decode `fuel_tank_selector:N` (0=off/1=left/2=right).
+        let fsel = p.fuel_selector.as_ref().unwrap();
+        assert_eq!(fsel.readback.as_deref(), Some("sim/cockpit2/fuel/fuel_tank_selector"));
+        assert_eq!(fsel.positions.iter().filter_map(|p| p.value).count(), 3);
     }
 }
 
@@ -522,13 +531,12 @@ fn cessna_172sp() -> AircraftProfile {
     }
 }
 
-/// The X-Plane stock Cirrus SR22 (Laminar). **Scaffold** — built from the
-/// GoofyJP XChecklist file and the POH; datarefs marked "verify" below are
-/// unconfirmed against the sim. Conservative by design: only systems on
-/// universal X-Plane datarefs are enabled/actioned. The SR22's own systems —
-/// dual battery/alternator, the `ENGN_mixt` mixture, the `boost_pump`, the
-/// off/left/right fuel selector, key-start ignition — are left off until their
-/// datarefs/tools are built and verified in the cockpit.
+/// The X-Plane stock Cirrus SR22 (Laminar). Built from the GoofyJP XChecklist
+/// file, the POH, and the rustdecks SR22 deck (the verified dataref/command
+/// source). Enabled systems write universal X-Plane datarefs or rustdecks-
+/// verified commands: the dual battery/alternator, mixture, throttle, boost
+/// pump, key-start ignition, pitch trim, and the off/left/right fuel selector.
+/// Still off: carb heat (fuel-injected) and the vacuum DG (G1000 glass).
 fn cirrus_sr22() -> AircraftProfile {
     let detent = |label: &str, spoken: &str, ratio: f64, vfe: Option<f64>| FlapDetent {
         label: label.into(),
@@ -599,25 +607,33 @@ fn cirrus_sr22() -> AircraftProfile {
                   &["sim/cockpit/electrical/avionics_on"]),
             ]
         },
-        magnetos: false,
+        // Key-start ignition: set_magnetos writes the universal ignition_key
+        // (0 off/1 R/2 L/3 both/4 start) and start_engine engages starter 1
+        // (sim/starters/engage_starter_1, the command the rustdecks deck uses).
+        magnetos: true,
         carb_heat: false, // fuel-injected — no carb heat
-        fuel_pump: false,
+        // Boost pump: set_fuel_pump writes sim/cockpit2/engine/actuators/
+        // fuel_pump_on[0] — the dataref the rustdecks deck drives for BOOST
+        // (not laminar/sr22/switch/boost_pump, which an earlier scaffold guessed).
+        fuel_pump: true,
         // OFF / LEFT / RIGHT — no "both" (low-wing twin tanks, fed one at a
-        // time). laminar/sr22 selector commands verified against the rustdecks
-        // deck; the position dataref (laminar/sr22/fuel_selector_pos) exists but
-        // its integer mapping is unverified, so no readback confirm yet — the
-        // verified command is trusted.
+        // time). Selector commands verified against the rustdecks deck. The
+        // standard sim/cockpit2/fuel/fuel_tank_selector (0=off/1=left/2=right) is
+        // the readback the GoofyJP checklist trusts, so it both confirms a write
+        // and lets the checklist decode the file's `fuel_tank_selector:N` items.
         fuel_selector: Some(FuelSelectorProfile {
-            readback: None,
+            readback: Some("sim/cockpit2/fuel/fuel_tank_selector".into()),
             positions: vec![
-                fuel_pos("off", "off", "laminar/sr22/fuel_sel_left_off", None),
-                fuel_pos("left", "left", "laminar/sr22/fuel_sel_left_select", None),
-                fuel_pos("right", "right", "laminar/sr22/fuel_sel_right_select", None),
+                fuel_pos("off", "off", "laminar/sr22/fuel_sel_left_off", Some(0.0)),
+                fuel_pos("left", "left", "laminar/sr22/fuel_sel_left_select", Some(1.0)),
+                fuel_pos("right", "right", "laminar/sr22/fuel_sel_right_select", Some(2.0)),
             ],
         }),
         directional_gyro: false, // G1000 glass — no vacuum DG
         flood_lights: false,
-        pitch_trim: false,
+        // set_pitch_trim writes the universal elevator_trim; "takeoff" centres it
+        // (within the file's T/O band).
+        pitch_trim: true,
         // Flaps 0 / 50% / 100% (Vfe 150 / 110 KIAS); set_flaps writes the
         // universal flap_ratio. Detent ratios: verify.
         flaps: Some(FlapProfile {
@@ -646,11 +662,10 @@ fn cirrus_sr22() -> AircraftProfile {
             light("landing", "landing light", "sim/cockpit2/switches/landing_lights_switch[0]",
                   "sim/lights/landing_lights_on", "sim/lights/landing_lights_off"),
         ],
-        // Acts on universal-dataref systems (parking brake, transponder, pitot,
-        // lights, throttle, mixture, flaps). The SR22's own systems — dual
-        // battery/alternator, boost pump, off/left/right fuel selector — still
-        // verify/call-out until their tools are built (verified datarefs are now
-        // known from the rustdecks deck).
+        // Acts on universal-dataref systems plus the now-wired boost pump,
+        // key-start ignition, pitch trim and the off/left/right fuel selector
+        // (decoded from the profile's position values). The dual battery/
+        // alternator stay call-out — their file conditions are compound `&&`.
         checklist_map: {
             let m = |s: &str, a: ChecklistAction| ChecklistMapEntry { match_: s.into(), action: a };
             use ChecklistAction::*;
@@ -665,6 +680,11 @@ fn cirrus_sr22() -> AircraftProfile {
                 m("nav_lights", Light("nav".into())),
                 m("strobe_lights", Light("strobe".into())),
                 m("landing_lights", Light("landing".into())),
+                m("boost_pump", FuelPump),    // laminar/sr22/switch/boost_pump → set_fuel_pump
+                m("ignition_key", Ignition),  // actuators/ignition_key: 4=start, 0=off
+                m("ignition_on", Ignition),   // mag test: 1=R, 2=L, 3=both
+                m("elevator_trim", PitchTrim), // "set T/O" → centre (not ail_trim)
+                m("fuel_tank_selector", FuelSelector), // 0=off/1=left/2=right
             ]
         },
     }
