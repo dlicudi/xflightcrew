@@ -79,6 +79,35 @@ async fn engage_mode(ctx: &ToolCtx<'_>, status: &str, command: &str) -> Result<(
     Ok(())
 }
 
+/// Default climb/descent rate (fpm) for an altitude change with no rate given.
+const DEFAULT_VS_FPM: f64 = 500.0;
+/// Within this many feet of the target, treat it as "hold here" (no climb).
+const ALT_CAPTURE_BAND_FT: f64 = 100.0;
+
+/// Fly the autopilot to `altitude` at `rate` fpm and let it capture/level off.
+/// On this airframe ALT hold alone won't *change* altitude — you must arm the
+/// target AND command a vertical speed, so this sets both. Direction is inferred
+/// from current altitude. Returns ("Climbing to" | "Descending to" | "Holding at",
+/// servos_engaged).
+async fn fly_to(ctx: &ToolCtx<'_>, altitude: f64, rate: f64) -> Result<(&'static str, bool)> {
+    let current = ctx.xplane.get_float(CURRENT_ALT).await.unwrap_or(altitude);
+    let diff = altitude - current;
+    let (movement, signed) = if diff > ALT_CAPTURE_BAND_FT {
+        ("Climbing to", rate.abs())
+    } else if diff < -ALT_CAPTURE_BAND_FT {
+        ("Descending to", -rate.abs())
+    } else {
+        ("Holding at", 0.0)
+    };
+    // Engage both modes first, set both dials last (engaging snaps the dials).
+    ctx.xplane.run_command(CMD_SERVOS_ON).await?;
+    engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
+    engage_mode(ctx, VS_STATUS, CMD_VS_MODE).await?;
+    ctx.xplane.set_float(ALT_DIAL, altitude).await?;
+    ctx.xplane.set_float(VS_DIAL, signed).await?;
+    Ok((movement, servos_engaged(ctx).await?))
+}
+
 pub struct SetHeading;
 
 #[derive(Deserialize)]
@@ -200,18 +229,15 @@ impl Tool for SetAltitude {
             ));
         }
 
-        // Engage first, then set the target LAST (see set_heading note).
-        ctx.xplane.run_command(CMD_SERVOS_ON).await?;
-        engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
-        ctx.xplane.set_float(ALT_DIAL, altitude).await?;
-
-        let actual = ctx.xplane.get_float(ALT_DIAL).await?;
-        if servos_engaged(ctx).await? {
-            Ok(format!("Roger — autopilot engaged, altitude hold, {:.0} feet.", actual))
+        // Fly to it: arm the altitude AND command a vertical speed (ALT hold alone
+        // won't change altitude on this AP), then let the AP capture and level off.
+        let (movement, engaged) = fly_to(ctx, altitude, DEFAULT_VS_FPM).await?;
+        if engaged {
+            Ok(format!("Roger — {} {altitude:.0} feet.", movement.to_lowercase()))
         } else {
             Ok(format!(
-                "Altitude set to {:.0} feet, but the autopilot didn't engage — check the AP master.",
-                actual
+                "Set to {} {altitude:.0} feet, but the autopilot didn't engage — check the AP master.",
+                movement.to_lowercase()
             ))
         }
     }
@@ -397,29 +423,16 @@ impl Tool for SetClimb {
             ));
         }
         let rate = args.fpm.abs().clamp(0.0, 2000.0);
-        let current = ctx.xplane.get_float(CURRENT_ALT).await?;
-        let climbing = altitude >= current;
-        let signed = if climbing { rate } else { -rate };
-
-        // Engage both modes first, then set both dials last (engaging snaps the
-        // dials to live values). VS flies the rate; the armed altitude captures.
-        ctx.xplane.run_command(CMD_SERVOS_ON).await?;
-        engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
-        engage_mode(ctx, VS_STATUS, CMD_VS_MODE).await?;
-        ctx.xplane.set_float(ALT_DIAL, altitude).await?;
-        ctx.xplane.set_float(VS_DIAL, signed).await?;
-
-        let verb = if climbing { "Climbing" } else { "Descending" };
-        if servos_engaged(ctx).await? {
+        let (movement, engaged) = fly_to(ctx, altitude, rate).await?;
+        if engaged {
             Ok(format!(
-                "Roger — {} to {altitude:.0} feet at {rate:.0} feet per minute, \
-                 leveling off there.",
-                verb.to_lowercase()
+                "Roger — {} {altitude:.0} feet at {rate:.0} feet per minute, leveling off there.",
+                movement.to_lowercase()
             ))
         } else {
             Ok(format!(
-                "Set to {} to {altitude:.0} feet, but the autopilot didn't engage — check the AP master.",
-                verb.to_lowercase()
+                "Set to {} {altitude:.0} feet, but the autopilot didn't engage — check the AP master.",
+                movement.to_lowercase()
             ))
         }
     }
