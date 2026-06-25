@@ -192,8 +192,9 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         }
     }
 
-    // flood lights (on/off or a percent)
-    if has(t, "flood") {
+    // flood lights (on/off or a percent). Substring match so "floodlights" glued
+    // into one word by STT also resolves.
+    if t.contains("flood") {
         if let Some(n) = num {
             return Some(call("set_flood_lights", json!({ "percent": n })));
         }
@@ -275,8 +276,10 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("autopilot_off", json!({})));
     }
 
-    // parking brake
-    if t.contains("parking brake") || t.contains("park brake") {
+    // parking brake (STT often hears "brake" as "break")
+    if t.contains("parking brake") || t.contains("park brake")
+        || t.contains("parking break") || t.contains("park break")
+    {
         let release = has(t, "release") || has(t, "released") || has(t, "off");
         return Some(call("set_parking_brake", json!({ "on": !release })));
     }
@@ -406,6 +409,15 @@ mod tests {
         assert_eq!(one("level off").unwrap().0, "level_off");
         assert_eq!(one("autopilot off").unwrap().0, "autopilot_off");
         assert_eq!(one("parking brake set").unwrap(), ("set_parking_brake".into(), json!({"on":true})));
+    }
+
+    #[test]
+    fn stt_mishears_and_glued_words_still_resolve() {
+        // Live-flight gaps: "floodlights" glued, "brake" heard as "break".
+        assert_eq!(one("floodlights on").unwrap().0, "set_flood_lights");
+        assert_eq!(one("turn the floodlights on").unwrap().1, json!({"on":true}));
+        assert_eq!(one("parking break off").unwrap(), ("set_parking_brake".into(), json!({"on":false})));
+        assert_eq!(one("parking break set").unwrap().1, json!({"on":true}));
     }
 
     #[test]
