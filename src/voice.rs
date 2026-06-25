@@ -167,10 +167,35 @@ enum Speaker {
     /// In-process warm ONNX session (feature `onnx-tts`, `XCOPILOT_TTS=onnx`).
     #[cfg(feature = "onnx-tts")]
     Onnx(Box<crate::tts_onnx::OnnxTts>),
+    /// Warm Spark voice-clone sidecar (`XCOPILOT_TTS=sidecar`).
+    Sidecar(crate::tts_sidecar::SidecarTts),
 }
 
 impl Speaker {
     fn build(mut config: Config) -> Self {
+        if config.tts_backend == "sidecar" {
+            let built = if config.tts_sidecar_autospawn {
+                crate::tts_sidecar::SidecarTts::spawn(
+                    &config.tts_sidecar_url,
+                    &config.tts_sidecar_python,
+                    &config.tts_sidecar_temp,
+                    &config.voice,
+                    std::time::Duration::from_secs(config.tts_sidecar_ready_secs),
+                )
+            } else {
+                Ok(crate::tts_sidecar::SidecarTts::connect(config.tts_sidecar_url.clone()))
+            };
+            match built {
+                Ok(engine) => {
+                    tracing::info!(url = %config.tts_sidecar_url, "TTS: Spark voice-clone sidecar");
+                    return Speaker::Sidecar(engine);
+                }
+                Err(e) => {
+                    tracing::error!("sidecar TTS unavailable ({e:#}); falling back to `say`");
+                    config.tts_backend = "say".into();
+                }
+            }
+        }
         #[cfg(feature = "onnx-tts")]
         if config.tts_backend == "onnx" {
             match crate::tts_onnx::OnnxTts::load(&config.piper_voice) {
@@ -196,6 +221,7 @@ impl Speaker {
             Speaker::Subprocess(config) => tts::speak(config, text),
             #[cfg(feature = "onnx-tts")]
             Speaker::Onnx(engine) => engine.speak(text),
+            Speaker::Sidecar(engine) => engine.speak(text),
         }
     }
 }

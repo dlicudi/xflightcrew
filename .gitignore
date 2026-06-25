@@ -26,3 +26,13 @@ target
 
 # Run logs
 /logs/
+
+# Python cache (voice/ tooling)
+__pycache__/
+*.pyc
+
+# Voice assets: large reference audio + the user voice library (personal
+# recordings, generated/managed by voice/voices.py). Tooling + scripts are
+# tracked; the audio and the active-voice pointer stay local.
+*.wav
+voice/voices/

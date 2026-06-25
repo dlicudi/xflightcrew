@@ -47,18 +47,32 @@ const CAPTION_MARKERS: &[&str] = &["www.", "http", ".com", ".org", ".net", "for 
 /// A loaded whisper model, reusable across utterances.
 pub struct Stt {
     ctx: WhisperContext,
+    /// Decoding bias prompt (whisper `initial_prompt`). Defaults to the generic
+    /// cockpit vocab; [`set_prompt`](Self::set_prompt) swaps in a profile-aware one.
+    prompt: String,
 }
 
 impl Stt {
-    /// Load a whisper.cpp `.bin` model from disk.
-    pub fn load(model_path: &str) -> Result<Self> {
-        let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
+    /// Load a whisper.cpp `.bin` model from disk. `use_gpu=false` runs inference
+    /// on the CPU instead of the Metal GPU — slower, but it stops STT contending
+    /// with a GPU-bound X-Plane for frames (the M5's CPU has headroom to spare).
+    pub fn load(model_path: &str, use_gpu: bool) -> Result<Self> {
+        let mut params = WhisperContextParameters::default();
+        params.use_gpu(use_gpu);
+        let ctx = WhisperContext::new_with_params(model_path, params)
             .with_context(|| format!("loading whisper model: {model_path}"))?;
-        Ok(Self { ctx })
+        Ok(Self { ctx, prompt: VOCAB_PROMPT.to_string() })
+    }
+
+    /// Replace the decoding bias prompt — used to install the per-aircraft vocab
+    /// from [`build_prompt`].
+    pub fn set_prompt(&mut self, prompt: String) {
+        self.prompt = prompt;
     }
 
     /// Transcribe 16 kHz mono f32 audio to text plus a confidence score.
     pub fn transcribe(&self, audio: &[f32]) -> Result<Transcription> {
+        let started = std::time::Instant::now();
         let mut state = self.ctx.create_state().context("creating whisper state")?;
 
         // Beam search is more accurate than greedy for short, noisy commands.
@@ -70,8 +84,8 @@ impl Stt {
         params.set_print_special(false);
         params.set_print_realtime(false);
         params.set_language(Some("en"));
-        // Bias decoding toward the cockpit vocabulary.
-        params.set_initial_prompt(VOCAB_PROMPT);
+        // Bias decoding toward the cockpit vocabulary (profile-aware if set).
+        params.set_initial_prompt(&self.prompt);
         // Reduce hallucination on non-speech: suppress non-speech tokens and
         // leading blanks, and don't carry context between segments (so one ghost
         // can't seed the next).
@@ -107,8 +121,93 @@ impl Stt {
             return Ok(Transcription { text: String::new(), confidence: 0.0 });
         }
 
+        tracing::info!(
+            ms = started.elapsed().as_millis(),
+            audio_s = format!("{:.1}", audio.len() as f32 / 16_000.0),
+            "stt"
+        );
+        // Normalize spoken digit runs ("two seven zero" → "270") for the LLM.
+        let text = crate::phrase::normalize_numbers(&text);
         Ok(Transcription { text, confidence })
     }
+}
+
+/// Build a profile-aware decoding prompt: bias whisper toward the systems and
+/// phrasings the *active aircraft* actually exposes, plus number phraseology.
+/// Falls back to [`VOCAB_PROMPT`] for callers without a profile.
+pub fn build_prompt(p: &crate::aircraft::AircraftProfile) -> String {
+    let mut s = format!("{} cockpit commands. ", p.display_name);
+    if let Some(f) = &p.flaps {
+        let detents: Vec<String> = f.detents.iter().map(|d| format!("flaps {}", d.spoken)).collect();
+        if !detents.is_empty() {
+            s.push_str(&detents.join(", "));
+            s.push_str(". ");
+        }
+    }
+    if p.retractable_gear {
+        s.push_str("Gear up, gear down. ");
+    }
+    if !p.lights.is_empty() {
+        let lights: Vec<&str> = p.lights.iter().map(|l| l.spoken.as_str()).collect();
+        s.push_str(&format!("Lights: {} on or off. ", lights.join(", ")));
+    }
+    if p.flood_lights {
+        s.push_str("Flood lights. ");
+    }
+    if p.autopilot {
+        s.push_str("Autopilot heading, altitude hold, vertical speed, climb, descend, wings level. ");
+    }
+    if p.engine {
+        s.push_str("Throttle, mixture, start the engine, shut down. ");
+    }
+    if p.magnetos {
+        s.push_str("Magnetos left, right, both. ");
+    }
+    if p.carb_heat {
+        s.push_str("Carb heat. ");
+    }
+    if p.fuel_pump {
+        s.push_str("Fuel pump on or off. ");
+    }
+    if p.fuel_selector.is_some() {
+        s.push_str("Fuel selector left, right, both. ");
+    }
+    if p.pitot_heat {
+        s.push_str("Pitot heat. ");
+    }
+    if p.pitch_trim {
+        s.push_str("Trim nose up, nose down. ");
+    }
+    if p.parking_brake {
+        s.push_str("Parking brake set or released. ");
+    }
+    if !p.electrical.is_empty() {
+        s.push_str("Battery, alternator, avionics master. ");
+    }
+    if p.com_radio {
+        s.push_str("Com one, com two, tune frequency. ");
+    }
+    if p.nav_radio {
+        s.push_str("Nav one, set the OBS. ");
+    }
+    if p.transponder {
+        s.push_str("Squawk, ident, transponder standby. ");
+    }
+    if p.barometer {
+        s.push_str("Set altimeter. ");
+    }
+    if p.directional_gyro {
+        s.push_str("Align the gyro. ");
+    }
+    if p.ils {
+        s.push_str("Prepare the ILS for the runway. ");
+    }
+    s.push_str(
+        "Numbers are spoken digit by digit: heading two seven zero, squawk one two zero zero, \
+         com one one eight decimal five, altimeter two niner niner two; altitudes like seven \
+         thousand feet; knots, feet, degrees, percent.",
+    );
+    s
 }
 
 /// True if the transcript is a known whisper ghost phrase or a caption-style
@@ -154,7 +253,7 @@ mod tests {
 
         let model = std::env::var("WHISPER_MODEL")
             .unwrap_or_else(|_| "models/ggml-base.en.bin".into());
-        let stt = Stt::load(&model).expect("loading model");
+        let stt = Stt::load(&model, true).expect("loading model");
         let result = stt.transcribe(&samples).expect("transcribing");
         let text = result.text.to_lowercase();
 

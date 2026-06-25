@@ -28,8 +28,94 @@ set_altitude(altitude=7000); 'beacon on' → set_lights(light=\"beacon\", on=tru
 named system, CONTINUES the most recent command using the same tool — e.g. after \
 'throttle fifty percent', 'seventy percent' → set_throttle(percent=70), and \
 'sixty' → set_throttle(percent=60); after 'set heading 270', 'two eighty' → \
-set_heading(heading=280). Do not answer in prose and do not invent tools. \
+set_heading(heading=280). You may be given the aircraft's current state; use it to resolve relative or \
+ambiguous commands ('a bit more flaps' from 10 means flaps 20; 'level off' uses \
+the current altitude) and to pick sensible values — but never invent state you \
+weren't given. Do not answer in prose and do not invent tools. \
 If no tool fits the command, do not call any tool.";
+
+/// Unified prompt for [`Llm::act_or_answer`]: the model arbitrates between *doing*
+/// and *answering*, the way a human copilot would — so a polite "could you start
+/// the engines?" acts, while "what's our heading?" answers.
+const UNIFIED_PROMPT: &str = "You are the copilot of an aircraft, working with the \
+pilot. Choose ONE of two responses. ACT: if the pilot wants something done, call \
+the matching tool(s) — one call per distinct action (a command naming two things, \
+'taxi and nav lights on', makes two calls). This INCLUDES polite or indirect \
+phrasing: 'could you start the engines', 'let's get the gear up', 'I'd like flaps \
+ten', 'do you think you could switch the engines on' are all COMMANDS — call the \
+tool, do not just describe state. ANSWER: only when the pilot asks about the \
+flight and there is nothing to do, reply in ONE short spoken sentence, in ENGLISH \
+only, using digits for numbers — e.g. 'We're parked on the ground, engines off.' \
+or 'Heading 270, 3,300 feet, climbing.' Use only the state you are given; if it \
+isn't there, say you don't have that readout; never invent numbers. Prefer ACT \
+whenever an action is possible, and never both act and answer. For tool arguments \
+pick the closest schema value (speech may be misheard — map 'beak' to 'beacon', \
+'probe' to 'strobe', 'blood lights' to flood lights). Numbers may be spoken as \
+words. 'descend' is a negative vertical speed, 'climb' positive. A bare number or \
+percent with no named system CONTINUES the last command's tool (after 'throttle \
+fifty percent', 'seventy percent' means set_throttle(percent=70)). Use the current \
+aircraft state, when given, to resolve relative commands ('a bit more flaps' from \
+10 means flaps 20). Do not invent tools.";
+
+/// What to do with an utterance: perform action(s), or reply in prose to a
+/// question. `None` = the model produced neither (treated as "didn't catch").
+pub enum Decision {
+    Act(Vec<ToolCall>),
+    Reply(String),
+    None,
+}
+
+/// Coerce string-typed arguments to the numeric/boolean types the tool's schema
+/// declares. Small models (e.g. llama3.2:3b) reliably pick the right *tool* but
+/// often emit `"270"`/`"false"` for integer/boolean fields; this fixes the type
+/// in cheap deterministic Rust instead of needing a bigger model. Schema-aware,
+/// so genuine enum strings (`notch:"10"`, `light:"landing"`) are left untouched.
+fn coerce_args(name: &str, mut args: Value, tools: &[ToolSpec]) -> Value {
+    let Some(spec) = tools.iter().find(|t| t.name == name) else {
+        return args;
+    };
+    let Some(props) = spec.parameters.get("properties").and_then(|p| p.as_object()) else {
+        return args;
+    };
+    let props = props.clone();
+    let Some(obj) = args.as_object_mut() else {
+        return args;
+    };
+    for (key, pschema) in &props {
+        let Some(ty) = pschema.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let Some(Value::String(s)) = obj.get(key) else {
+            continue;
+        };
+        let s = s.trim();
+        let coerced = match ty {
+            "integer" => s.parse::<i64>().ok().map(Value::from),
+            "number" => s.parse::<f64>().ok().map(Value::from),
+            "boolean" => match s.to_ascii_lowercase().as_str() {
+                "true" => Some(Value::Bool(true)),
+                "false" => Some(Value::Bool(false)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(v) = coerced {
+            obj.insert(key.clone(), v);
+        }
+    }
+    args
+}
+
+/// Clean a prose reply for speaking: drop non-Latin characters (qwen3 sometimes
+/// code-switches into CJK when spelling numbers, e.g. "six十四") and collapse
+/// whitespace. The "use digits" instruction prevents most of it; this is the net.
+fn sanitize_reply(s: &str) -> String {
+    let kept: String = s
+        .chars()
+        .filter(|c| c.is_ascii() || matches!(c, '—' | '–' | '’' | '‘' | '“' | '”' | '…' | '°'))
+        .collect();
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// Temperatures to retry at, in order, when the deterministic (temp 0) first
 /// pass returns no tool for an utterance the domain gate already accepted as a
@@ -85,6 +171,12 @@ pub struct Llm {
     http: reqwest::Client,
     base: String,
     model: String,
+    /// Ollama `keep_alive`: how long the model stays resident (on the GPU) after a
+    /// call. Longer avoids cold-load latency mid-flight but holds GPU memory the
+    /// whole time; "0" frees it immediately (cold-loads each command).
+    keepalive: String,
+    /// Ollama `num_gpu` (layers on GPU), if set. `Some(0)` = LLM on CPU.
+    gpu_layers: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +188,9 @@ struct ChatResponse {
 struct ChatMessage {
     #[serde(default)]
     tool_calls: Vec<OllamaToolCall>,
+    /// Prose reply (used by [`Llm::answer`]; empty on the tool-pick path).
+    #[serde(default)]
+    content: String,
 }
 
 #[derive(Deserialize)]
@@ -117,6 +212,8 @@ impl Llm {
             http: reqwest::Client::new(),
             base: config.ollama_base_url.trim_end_matches('/').to_string(),
             model: config.model.clone(),
+            keepalive: config.llm_keepalive.clone(),
+            gpu_layers: config.llm_gpu_layers.trim().parse().ok(),
         }
     }
 
@@ -142,9 +239,10 @@ impl Llm {
         transcript: &str,
         tools: &[ToolSpec],
         history: &[(String, String)],
+        state: Option<&str>,
     ) -> Result<Vec<ToolCall>> {
         // Deterministic first pass.
-        let calls = self.choose_tool_at(transcript, tools, history, 0.0).await?;
+        let calls = self.choose_tool_at(transcript, tools, history, state, 0.0).await?;
         if !calls.is_empty() {
             return Ok(dedup_calls(calls));
         }
@@ -152,7 +250,7 @@ impl Llm {
         // concrete pick.
         for &temp in RETRY_TEMPS {
             tracing::debug!(temp, transcript = %transcript, "tool selection empty; retrying with temperature bump");
-            let calls = self.choose_tool_at(transcript, tools, history, temp).await?;
+            let calls = self.choose_tool_at(transcript, tools, history, state, temp).await?;
             if !calls.is_empty() {
                 tracing::info!(temp, transcript = %transcript, n = calls.len(), "recovered tool(s) on retry");
                 return Ok(dedup_calls(calls));
@@ -168,8 +266,88 @@ impl Llm {
         transcript: &str,
         tools: &[ToolSpec],
         history: &[(String, String)],
+        state: Option<&str>,
         temperature: f64,
     ) -> Result<Vec<ToolCall>> {
+        let msg = self
+            .chat_call(SYSTEM_PROMPT, transcript, tools, history, state, temperature)
+            .await?;
+        Ok(msg
+            .tool_calls
+            .into_iter()
+            .map(|tc| {
+                let args = coerce_args(&tc.function.name, tc.function.arguments, tools);
+                ToolCall { name: tc.function.name, arguments: args }
+            })
+            .collect())
+    }
+
+    /// Decide what to do with an utterance: ACT (call tools) or ANSWER (prose),
+    /// the copilot arbitrating like a human would — a polite "could you start the
+    /// engines?" acts; "what's our heading?" answers. Deterministic first pass,
+    /// then a light temperature retry only if the model produced neither.
+    pub async fn act_or_answer(
+        &self,
+        transcript: &str,
+        tools: &[ToolSpec],
+        history: &[(String, String)],
+        state: Option<&str>,
+    ) -> Result<Decision> {
+        let d = self.decide_at(transcript, tools, history, state, 0.0).await?;
+        if !matches!(d, Decision::None) {
+            return Ok(d);
+        }
+        for &temp in RETRY_TEMPS {
+            let d = self.decide_at(transcript, tools, history, state, temp).await?;
+            if !matches!(d, Decision::None) {
+                return Ok(d);
+            }
+        }
+        Ok(Decision::None)
+    }
+
+    /// One act-or-answer request at a given temperature.
+    async fn decide_at(
+        &self,
+        transcript: &str,
+        tools: &[ToolSpec],
+        history: &[(String, String)],
+        state: Option<&str>,
+        temperature: f64,
+    ) -> Result<Decision> {
+        let msg = self
+            .chat_call(UNIFIED_PROMPT, transcript, tools, history, state, temperature)
+            .await?;
+        let calls: Vec<ToolCall> = msg
+            .tool_calls
+            .into_iter()
+            .map(|tc| {
+                let args = coerce_args(&tc.function.name, tc.function.arguments, tools);
+                ToolCall { name: tc.function.name, arguments: args }
+            })
+            .collect();
+        if !calls.is_empty() {
+            return Ok(Decision::Act(dedup_calls(calls)));
+        }
+        let reply = sanitize_reply(&msg.content);
+        if !reply.is_empty() {
+            return Ok(Decision::Reply(reply));
+        }
+        Ok(Decision::None)
+    }
+
+    /// One chat request: `system` prompt, optional live state, recent turns, then
+    /// the utterance, with the curated tools attached. Returns the reply message
+    /// (tool calls and/or prose). Shared by the tool-pick and act-or-answer paths.
+    async fn chat_call(
+        &self,
+        system: &str,
+        transcript: &str,
+        tools: &[ToolSpec],
+        history: &[(String, String)],
+        state: Option<&str>,
+        temperature: f64,
+    ) -> Result<ChatMessage> {
         let tool_specs: Vec<Value> = tools
             .iter()
             .map(|t| {
@@ -184,56 +362,44 @@ impl Llm {
             })
             .collect();
 
-        // system, then the recent turns as user/assistant pairs, then the new
-        // command — so the model reads the current utterance in context.
-        let mut messages = vec![json!({ "role": "system", "content": SYSTEM_PROMPT })];
+        // system, then live state (if any), then recent turns, then the utterance.
+        let mut messages = vec![json!({ "role": "system", "content": system })];
+        if let Some(state) = state {
+            messages.push(json!({
+                "role": "system",
+                "content": format!("Current aircraft state: {state}."),
+            }));
+        }
         for (user, assistant) in history {
             messages.push(json!({ "role": "user", "content": user }));
             messages.push(json!({ "role": "assistant", "content": assistant }));
         }
         messages.push(json!({ "role": "user", "content": transcript }));
 
-        let mut body = json!({
+        let mut options = json!({
+            "temperature": temperature,
+            // Pin the context small: our prompt is the system instruction + tool
+            // schemas + a short utterance, so the model's full 32K window would
+            // only reserve KV-cache we never use. 8192 leaves headroom over the
+            // tool list so no definition is truncated.
+            "num_ctx": 8192,
+        });
+        // Optionally cap GPU layers (XCOPILOT_LLM_GPU_LAYERS) — 0 runs the LLM on
+        // the CPU so its inference doesn't contend with a GPU-bound X-Plane.
+        if let Some(n) = self.gpu_layers {
+            options["num_gpu"] = json!(n);
+        }
+        let body = self.with_think(json!({
             "model": self.model,
             "stream": false,
-            // Keep the model resident on the GPU between commands. A copilot is
-            // used in bursts across a whole flight; Ollama's default 5-minute
-            // eviction would cold-load the model (multi-GB into GPU memory) on
-            // the first command after any quiet stretch — exactly the latency
-            // spike we can't afford mid-flight. An hour stays warm through long
-            // cruise legs while still freeing the GPU if the app is left idle.
-            "keep_alive": "60m",
-            "options": {
-                // Temperature is supplied by the caller: 0 for the deterministic
-                // first pass, a bump on retry (see `choose_tool`). At the model's
-                // *default* temperature qwen intermittently emits no tool call for
-                // a clear command, which is why the first pass pins it to 0.
-                "temperature": temperature,
-                // Our prompt is only the system instruction + tool schemas + one
-                // short utterance. Without this, Ollama loads the model's full
-                // trained context (32K) and reserves KV-cache memory we never
-                // touch. Pin it small to cut that overhead. 8192 leaves generous
-                // headroom over the curated tool list, so no tool definition is
-                // ever truncated — truncation would silently degrade selection.
-                "num_ctx": 8192,
-            },
+            // How long the model stays resident (on the GPU) after a call. Longer
+            // avoids cold-load latency mid-flight; shorter frees GPU memory that a
+            // GPU-bound X-Plane wants. Configurable via XCOPILOT_LLM_KEEPALIVE.
+            "keep_alive": self.keepalive,
+            "options": options,
             "messages": messages,
             "tools": tool_specs,
-        });
-
-        // Reasoning ("thinking") models like Qwen3 deliberate before answering,
-        // which is dead weight for a one-shot tool pick and adds latency this
-        // real-time copilot can't spend. Disable it for the qwen3 *thinking*
-        // family via Ollama's `think: false`. We match the `qwen3:` prefix on
-        // purpose — it catches qwen3:8b/14b/etc. but NOT `qwen3-coder`, which is
-        // a non-reasoning model that would reject the `think` field. The
-        // `XCOPILOT_NO_THINK=1` override forces it for benchmarking other
-        // thinking models. Only send `think` to models that support it.
-        if self.model.starts_with("qwen3:")
-            || std::env::var("XCOPILOT_NO_THINK").as_deref() == Ok("1")
-        {
-            body["think"] = json!(false);
-        }
+        }));
 
         let url = format!("{}/api/chat", self.base);
         let resp: ChatResponse = self
@@ -247,16 +413,19 @@ impl Llm {
             .json()
             .await
             .context("decoding Ollama chat response")?;
+        Ok(resp.message)
+    }
 
-        Ok(resp
-            .message
-            .tool_calls
-            .into_iter()
-            .map(|tc| ToolCall {
-                name: tc.function.name,
-                arguments: tc.function.arguments,
-            })
-            .collect())
+    /// Disable qwen3-family "thinking" (latency we can't spend) on a request body.
+    /// Matches the `qwen3:` prefix (qwen3:8b/14b but not `qwen3-coder`, which would
+    /// reject the field); `XCOPILOT_NO_THINK=1` forces it for other models.
+    fn with_think(&self, mut body: Value) -> Value {
+        if self.model.starts_with("qwen3:")
+            || std::env::var("XCOPILOT_NO_THINK").as_deref() == Ok("1")
+        {
+            body["think"] = json!(false);
+        }
+        body
     }
 }
 
@@ -266,6 +435,29 @@ mod tests {
     use crate::aircraft;
     use crate::config::Config;
     use crate::tools::Registry;
+
+    #[test]
+    fn coerce_fixes_types_but_keeps_enum_strings() {
+        let tools = vec![ToolSpec {
+            name: "t".into(),
+            description: String::new(),
+            parameters: json!({"type":"object","properties":{
+                "heading":{"type":"integer"},
+                "on":{"type":"boolean"},
+                "pct":{"type":"number"},
+                "notch":{"type":"string"}
+            }}),
+        }];
+        // string-typed numbers/bools get coerced; the enum string is left alone.
+        let out = coerce_args("t", json!({"heading":"270","on":"false","pct":"50","notch":"10"}), &tools);
+        assert_eq!(out["heading"], json!(270));
+        assert_eq!(out["on"], json!(false));
+        assert_eq!(out["pct"], json!(50.0));
+        assert_eq!(out["notch"], json!("10"));
+        // already-typed args are untouched; an unknown tool passes through.
+        assert_eq!(coerce_args("t", json!({"heading":270}), &tools)["heading"], json!(270));
+        assert_eq!(coerce_args("unknown", json!({"a":"1"}), &tools), json!({"a":"1"}));
+    }
 
     #[test]
     fn dedup_collapses_conflicting_keeps_addressable() {
@@ -291,9 +483,12 @@ mod tests {
         Config {
             ollama_base_url: "http://127.0.0.1:11434".into(),
             model: std::env::var("XCOPILOT_MODEL").unwrap_or_else(|_| "qwen3:8b".into()),
+            llm_keepalive: "60m".into(),
+            llm_gpu_layers: String::new(),
             xplane_base_url: "http://127.0.0.1:8086".into(),
             nav_data_path: String::new(),
             whisper_model_path: String::new(),
+            whisper_gpu: true,
             listen_mode: "ptt".into(),
             wake_word: "copilot".into(),
             vad_threshold: 0.012,
@@ -301,8 +496,16 @@ mod tests {
             end_silence_ms: 900,
             ui: "plain".into(),
             tts_backend: "say".into(),
+            say_voice: String::new(),
+            say_rate: String::new(),
             piper_binary: String::new(),
             piper_voice: String::new(),
+            tts_sidecar_url: String::new(),
+            tts_sidecar_autospawn: false,
+            tts_sidecar_python: String::new(),
+            tts_sidecar_ready_secs: 90,
+            tts_sidecar_temp: "0.8".into(),
+            voice: String::new(),
             aircraft: "cessna_172sp".into(),
             confirm_critical: true,
             monitor_enabled: false,
@@ -381,7 +584,7 @@ mod tests {
         println!("\n  model: {}", cfg.model);
         let mut failures = 0;
         for (utterance, expected_tool, expected_arg) in cases {
-            match llm.choose_tool(utterance, &specs, &[]).await.expect("ollama call failed").into_iter().next() {
+            match llm.choose_tool(utterance, &specs, &[], None).await.expect("ollama call failed").into_iter().next() {
                 Some(call) => {
                     let tool_ok = call.name == *expected_tool;
                     let arg_ok = expected_arg
@@ -475,7 +678,7 @@ mod tests {
                 gate_skipped += 1;
                 continue;
             }
-            match llm.choose_tool(utterance, &specs, &[]).await.expect("ollama call failed").into_iter().next() {
+            match llm.choose_tool(utterance, &specs, &[], None).await.expect("ollama call failed").into_iter().next() {
                 Some(call) => {
                     let tool_ok = call.name == *expected_tool;
                     let arg_ok = expected_arg
@@ -504,7 +707,7 @@ mod tests {
                 gate_skipped += 1;
                 continue;
             }
-            match llm.choose_tool(utterance, &specs, &[]).await.expect("ollama call failed").into_iter().next() {
+            match llm.choose_tool(utterance, &specs, &[], None).await.expect("ollama call failed").into_iter().next() {
                 None => println!("  ✓ {utterance:?} -> (declined, correct)"),
                 Some(call) => {
                     println!("  ✗ {utterance:?} -> {} {} (should have declined)", call.name, call.arguments);
@@ -575,7 +778,7 @@ mod tests {
         let mut gaps = 0;
         for (utterance, expected_tool, expected_arg) in cases {
             let gated = crate::looks_like_command(utterance);
-            let call = llm.choose_tool(utterance, &specs, &[]).await.expect("ollama").into_iter().next();
+            let call = llm.choose_tool(utterance, &specs, &[], None).await.expect("ollama").into_iter().next();
             let got = call.as_ref().map(|c| format!("{} {}", c.name, c.arguments)).unwrap_or_else(|| "(no tool)".into());
             let ok = match (expected_tool, &call) {
                 (&"", None) => true, // confirmed gap
@@ -625,7 +828,7 @@ mod tests {
             for t in temps {
                 let mut hits = 0;
                 for _ in 0..TRIES {
-                    if let Some(c) = llm.choose_tool_at(phrase, &specs, &[], t).await.expect("ollama").into_iter().next() {
+                    if let Some(c) = llm.choose_tool_at(phrase, &specs, &[], None, t).await.expect("ollama").into_iter().next() {
                         if c.name == want {
                             hits += 1;
                         }
@@ -669,7 +872,7 @@ mod tests {
 
         for (utterance, expect) in commands {
             let call = llm
-                .choose_tool(utterance, &specs, &[])
+                .choose_tool(utterance, &specs, &[], None)
                 .await
                 .expect("ollama call failed")
                 .into_iter()

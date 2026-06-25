@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 # async runtime + HTTP
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
 
 # serde
 serde = { version = "1", features = ["derive"] }
@@ -41,16 +41,15 @@ tracing-appender = "0.2"
 ratatui = "0.29"
 dotenvy = "0.15"
 
-# In-process ONNX TTS (warm session) — optional, behind the `onnx-tts` feature so
-# the default build stays dependency-free. `ort` wraps libonnxruntime; `hound`
-# writes the synthesized PCM to a WAV for playback.
-ort = { version = "2.0.0-rc.12", optional = true }
-hound = { version = "3", optional = true }
-
-[dev-dependencies]
-# WAV reader, used only by the STT integration test.
+# WAV read/write: the `transcribe` subcommand reads a clip for whisper, and the
+# onnx backend writes synthesized PCM for playback. Pure Rust, always built.
 hound = "3"
+
+# In-process ONNX TTS (warm session) — optional, behind the `onnx-tts` feature so
+# the default build stays light. `ort` wraps libonnxruntime.
+ort = { version = "2.0.0-rc.12", optional = true }
+earshot = "1.1.0"
 
 [features]
 # Build with: cargo build --features onnx-tts  (then XCOPILOT_TTS=onnx)
-onnx-tts = ["dep:ort", "dep:hound"]
+onnx-tts = ["dep:ort"]

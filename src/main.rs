@@ -14,12 +14,16 @@ mod config;
 mod llm;
 mod monitor;
 mod nav;
+mod phrase;
+mod readback;
 mod stt;
 mod tts;
 #[cfg(feature = "onnx-tts")]
 mod tts_onnx;
+mod tts_sidecar;
 mod tools;
 mod ui;
+mod vad;
 mod voice;
 mod xplane;
 
@@ -29,7 +33,7 @@ use anyhow::{anyhow, Result};
 
 use audio::Listener;
 use config::Config;
-use llm::Llm;
+use llm::{Decision, Llm};
 use stt::Stt;
 use tools::{Registry, ToolCtx};
 use ui::Reporter;
@@ -69,6 +73,18 @@ async fn main() -> Result<()> {
         return audio::mic_check(config.vad_threshold);
     }
 
+    // `cargo run -- transcribe <audio-file>` prints the whisper transcript of a
+    // clip to stdout and exits. Used by `voice/voices.py` to auto-caption an
+    // imported voice sample (Spark needs the reference text to match the audio).
+    if std::env::args().nth(1).as_deref() == Some("transcribe") {
+        let path = std::env::args()
+            .nth(2)
+            .ok_or_else(|| anyhow!("usage: x-copilot transcribe <audio-file>"))?;
+        let text = transcribe_file(&config.whisper_model_path, &path)?;
+        println!("{text}");
+        return Ok(());
+    }
+
     // Resolve the aircraft profile: auto-detect from X-Plane's acf_ICAO when
     // configured as "auto", otherwise use the configured id. Falls back to the
     // Cessna if detection fails (e.g. X-Plane not reachable yet). The probe
@@ -100,8 +116,10 @@ async fn main() -> Result<()> {
         "starting x-copilot (local LLM via Ollama)"
     );
 
-    // whisper model load is the one slow init — do it once, up front.
-    let stt = Stt::load(&config.whisper_model_path)?;
+    // whisper model load is the one slow init — do it once, up front. Bias its
+    // decoding toward the active aircraft's actual systems and phraseology.
+    let mut stt = Stt::load(&config.whisper_model_path, config.whisper_gpu)?;
+    stt.set_prompt(stt::build_prompt(&profile));
     let llm = Llm::new(&config);
     let registry = Registry::for_aircraft(&profile);
     // Checklists the copilot runs interactively (narrate + act + verify + call
@@ -165,7 +183,7 @@ async fn main() -> Result<()> {
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             if let Err(e) = rt.block_on(run_session(
-                config, stt, llm, registry, checklists, voice, continuous, explicit, reporter, Some(cmd_rx),
+                config, stt, llm, registry, profile, checklists, voice, continuous, explicit, reporter, Some(cmd_rx),
             )) {
                 tracing::error!("voice loop ended: {e:#}");
             }
@@ -175,7 +193,7 @@ async fn main() -> Result<()> {
         Ok(())
     } else {
         println!("\n  x-copilot — {} ({}). Ctrl-C to quit.\n", profile.display_name, config.listen_mode);
-        run_session(config, stt, llm, registry, checklists, voice, continuous, explicit, Reporter::Plain, None).await
+        run_session(config, stt, llm, registry, profile, checklists, voice, continuous, explicit, Reporter::Plain, None).await
     }
 }
 
@@ -198,6 +216,7 @@ async fn run_session(
     stt: Stt,
     llm: Llm,
     registry: Registry,
+    profile: aircraft::AircraftProfile,
     checklists: Vec<checklist::Checklist>,
     voice: Voice,
     continuous: bool,
@@ -260,7 +279,8 @@ async fn run_session(
                 // Confidence gate.
                 if confidence < config.stt_min_confidence {
                     if explicit {
-                        say(&voice, &reporter, ui::LogKind::Info, "Say again?");
+                        say(&voice, &reporter, ui::LogKind::Info,
+                            readback::one_of(&["Say again?", "Didn't catch that.", "One more time?"]));
                     } else {
                         reporter.log(ui::LogKind::Info, "low confidence, ignored");
                     }
@@ -285,8 +305,9 @@ async fn run_session(
 
         // Domain gate, follow-up, and bare-value rewrite apply to SPOKEN input
         // only — phonetic nonsense and STT follow-ups are voice problems. A typed
-        // command is taken as-is.
-        if !from_text && !looks_like_command(&command) {
+        // command is taken as-is. Questions are let through too (the LLM decides
+        // act-vs-answer), so they aren't rejected as "not a command".
+        if !from_text && !looks_like_command(&command) && !looks_like_question(&command) {
             // A conversational follow-up shortly after a command is let through
             // even without a keyword. Outside the window, the strict gate holds.
             let in_followup = history
@@ -294,7 +315,11 @@ async fn run_session(
                 .is_some_and(|(_, _, t)| t.elapsed() < FOLLOWUP_WINDOW);
             if !(in_followup && looks_like_followup(&command)) {
                 if explicit {
-                    say(&voice, &reporter, ui::LogKind::Warn, "Sorry, that didn't sound like a command.");
+                    say(&voice, &reporter, ui::LogKind::Warn, readback::one_of(&[
+                        "Sorry, that didn't sound like a command.",
+                        "That didn't sound like a command.",
+                        "Didn't catch a command there.",
+                    ]));
                 } else {
                     reporter.log(ui::LogKind::Info, format!("not a command: \"{command}\""));
                 }
@@ -326,21 +351,38 @@ async fn run_session(
                 .collect()
         };
 
-        // LLM picks the tool(s). A compound command ("taxi and nav lights on")
-        // yields more than one call; they're executed in spoken order.
+        // The LLM arbitrates: ACT on a command (one call per distinct action, so
+        // "taxi and nav lights on" makes two) or ANSWER a question in prose — a
+        // polite "could you start the engines?" acts; "what's our heading?"
+        // answers. A live state snapshot grounds both ("a bit more flaps", "how
+        // high are we?").
         reporter.status(ui::Phase::Thinking);
-        let calls = match llm.choose_tool(&command, &specs, &ctx_history).await {
-            Ok(calls) if !calls.is_empty() => calls,
-            Ok(_) => {
+        let t = Instant::now();
+        let state = state_snapshot(&xplane, &profile).await;
+        tracing::info!(ms = t.elapsed().as_millis(), state = state.as_deref().unwrap_or("(none)"), "state snapshot");
+        let t = Instant::now();
+        let decision = llm.act_or_answer(&command, &specs, &ctx_history, state.as_deref()).await;
+        tracing::info!(ms = t.elapsed().as_millis(), "llm");
+        let calls = match decision {
+            Ok(Decision::Act(calls)) => calls,
+            Ok(Decision::Reply(text)) => {
+                say(&voice, &reporter, ui::LogKind::Readback, &text);
+                continue;
+            }
+            Ok(Decision::None) => {
                 if explicit {
-                    say(&voice, &reporter, ui::LogKind::Warn, "Sorry, I didn't catch a command I can action.");
+                    say(&voice, &reporter, ui::LogKind::Warn, readback::one_of(&[
+                        "Sorry, I didn't catch that.",
+                        "I can't action that one.",
+                        "Say again?",
+                    ]));
                 } else {
-                    reporter.log(ui::LogKind::Info, format!("no matching tool: \"{command}\""));
+                    reporter.log(ui::LogKind::Info, format!("no response: \"{command}\""));
                 }
                 continue;
             }
             Err(e) => {
-                tracing::error!("LLM tool selection failed: {e:#}");
+                tracing::error!("LLM act-or-answer failed: {e:#}");
                 reporter.log(ui::LogKind::Warn, "LLM unreachable");
                 continue;
             }
@@ -394,7 +436,7 @@ async fn run_session(
                     Some(correction) => {
                         reporter.log(ui::LogKind::Info, format!("correction: \"{correction}\""));
                         reporter.status(ui::Phase::Thinking);
-                        match llm.choose_tool(&format!("{command}, {correction}"), &specs, &ctx_history).await {
+                        match llm.choose_tool(&format!("{command}, {correction}"), &specs, &ctx_history, state.as_deref()).await {
                             Ok(mut cs) if !cs.is_empty() => {
                                 call = cs.remove(0);
                                 reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
@@ -631,6 +673,34 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Transcribe an audio file with whisper, for `x-copilot transcribe <file>`.
+/// Decodes/resamples to 16 kHz mono via macOS `afconvert` (handles mp3/m4a/wav/…
+/// — whisper needs 16 kHz mono), reads the PCM, and returns the text. Reuses the
+/// same STT model the live loop uses, so no extra model download.
+fn transcribe_file(model_path: &str, input: &str) -> Result<String> {
+    use std::process::Command;
+    if !std::path::Path::new(input).exists() {
+        return Err(anyhow!("no such file: {input}"));
+    }
+    let wav = std::env::temp_dir().join("x-copilot-transcribe-16k.wav");
+    let status = Command::new("afconvert")
+        .args([input, wav.to_str().unwrap(), "-d", "LEI16@16000", "-c", "1", "-f", "WAVE"])
+        .status()
+        .map_err(|e| anyhow!("spawning afconvert: {e}"))?;
+    if !status.success() {
+        return Err(anyhow!("afconvert failed to decode {input}"));
+    }
+    let reader = hound::WavReader::open(&wav).map_err(|e| anyhow!("reading {}: {e}", wav.display()))?;
+    let samples: Vec<f32> = reader
+        .into_samples::<i16>()
+        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| anyhow!("decoding samples: {e}"))?;
+    // Offline one-shot — GPU is fine here (not competing with the sim loop).
+    let stt = Stt::load(model_path, true)?;
+    Ok(stt.transcribe(&samples)?.text.trim().to_string())
+}
+
 /// Map an X-Plane ICAO type code to a profile id. Unknown types fall back to
 /// the Cessna so the app stays usable; add rows as profiles are added.
 fn icao_to_profile(icao: &str) -> String {
@@ -736,11 +806,65 @@ fn correction_text(reply: &str) -> Option<String> {
 /// been spoken (so the loop doesn't listen over its own voice), setting the
 /// Speaking→Listening status around it.
 fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
+    // Vary the acknowledgment on affirmative readbacks (bare callout most of the
+    // time, "Roger,"/"Copy," occasionally); non-affirmative lines pass through.
+    let line = readback::vary_ack(line);
     tracing::info!(spoke = %line, "spoke");
     reporter.status(ui::Phase::Speaking);
-    reporter.log(kind, line.to_string());
+    reporter.log(kind, line.clone());
     voice.say(Priority::Readback, line);
     reporter.status(ui::Phase::Listening);
+}
+
+/// A compact live-state line for the LLM's context, so it can ground relative or
+/// ambiguous commands ("a bit more flaps", "level off") in what's actually true.
+/// Each field is best-effort: a dataref that won't read is skipped, and if none
+/// read (X-Plane unreachable) this returns `None` and the model runs context-free.
+async fn state_snapshot(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> Option<String> {
+    // Fire every read concurrently — done sequentially this added ~130ms of
+    // round-trips per command (and hit X-Plane's web server in a burst).
+    let (alt, ias, vs, hdg, flap, gear, og, fuel, ap) = tokio::join!(
+        xp.get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot"),
+        xp.get_float("sim/cockpit2/gauges/indicators/airspeed_kts_pilot"),
+        xp.get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot"),
+        xp.get_float("sim/cockpit2/gauges/indicators/compass_heading_deg_mag"),
+        xp.get_float("sim/cockpit2/controls/flap_ratio"),
+        xp.get_float("sim/cockpit2/controls/gear_handle_down"),
+        xp.get_float("sim/flightmodel/failures/onground_any"),
+        xp.get_float("sim/flightmodel/weight/m_fuel_total"),
+        ap_mode(xp),
+    );
+    let mut parts: Vec<String> = Vec::new();
+    if let Ok(v) = alt {
+        parts.push(format!("altitude {v:.0} ft"));
+    }
+    if let Ok(v) = ias {
+        parts.push(format!("airspeed {v:.0} knots"));
+    }
+    if let Ok(v) = vs {
+        parts.push(format!("vertical speed {v:+.0} fpm"));
+    }
+    if let Ok(v) = hdg {
+        parts.push(format!("heading {v:03.0}"));
+    }
+    if let Ok(v) = flap {
+        parts.push(format!("flaps {:.0}%", v * 100.0));
+    }
+    if profile.retractable_gear {
+        if let Ok(v) = gear {
+            parts.push(format!("gear {}", if v > 0.5 { "down" } else { "up" }));
+        }
+    }
+    if let Ok(v) = og {
+        parts.push(format!("on the ground: {}", if v > 0.5 { "yes" } else { "no" }));
+    }
+    if let Ok(v) = fuel {
+        parts.push(format!("fuel on board {v:.0} kilograms"));
+    }
+    if ap != "--" {
+        parts.push(format!("autopilot {ap}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// Read the live aircraft state for the dashboard panel. Returns `None` if
@@ -758,12 +882,17 @@ async fn poll_aircraft(xp: &XPlaneClient) -> Option<ui::Aircraft> {
 
 /// Summarize the active autopilot lateral mode for the panel.
 async fn ap_mode(xp: &XPlaneClient) -> String {
-    if xp.get_float("sim/cockpit2/autopilot/servos_on").await.unwrap_or(0.0) <= 0.5 {
+    // Concurrent reads — this is called inside state_snapshot's hot path.
+    let (servos, appr, nav, hdg) = tokio::join!(
+        xp.get_float("sim/cockpit2/autopilot/servos_on"),
+        xp.get_float("sim/cockpit2/autopilot/approach_status"),
+        xp.get_float("sim/cockpit2/autopilot/nav_status"),
+        xp.get_float("sim/cockpit2/autopilot/heading_status"),
+    );
+    if servos.unwrap_or(0.0) <= 0.5 {
         return "--".to_string();
     }
-    let appr = xp.get_float("sim/cockpit2/autopilot/approach_status").await.unwrap_or(0.0);
-    let nav = xp.get_float("sim/cockpit2/autopilot/nav_status").await.unwrap_or(0.0);
-    let hdg = xp.get_float("sim/cockpit2/autopilot/heading_status").await.unwrap_or(0.0);
+    let (appr, nav, hdg) = (appr.unwrap_or(0.0), nav.unwrap_or(0.0), hdg.unwrap_or(0.0));
     if appr >= 1.0 {
         "APR".into()
     } else if nav >= 1.0 {
@@ -811,6 +940,23 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "checklist", "checklists", "takeoff", "configure", "config", "departure",
     "secure", "clean", "cruise", "preflight", "limits", "performance",
 ];
+
+/// True if the utterance is a question about the flight (answered from state,
+/// not actioned). Interrogative openers or a trailing "?". Kept conservative so
+/// it doesn't hijack commands — and misrouting is harmless anyway (answering is
+/// read-only). Command-ish openers like "can you set…" are deliberately excluded.
+fn looks_like_question(text: &str) -> bool {
+    let t = text.trim().to_ascii_lowercase();
+    if t.ends_with('?') {
+        return true;
+    }
+    const OPENERS: &[&str] = &[
+        "what", "what's", "whats", "how", "how's", "hows", "how much", "how many",
+        "how far", "how high", "how fast", "are we", "are the", "is the", "is it",
+        "do we", "did we", "have we", "where", "when", "which", "why", "tell me",
+    ];
+    OPENERS.iter().any(|o| t == *o || t.starts_with(&format!("{o} ")))
+}
 
 /// True if the utterance plausibly is an aircraft command (contains at least one
 /// keyword). Phonetic garbage that happens to transcribe confidently shares no
@@ -1082,6 +1228,25 @@ mod tests {
         // explicit no, and anything not clearly yes, must NOT proceed
         for r in ["negative", "no", "cancel", "stop", "abort", "uh what", "descend 700", ""] {
             assert!(!is_affirmative(r), "{r:?} must not confirm");
+        }
+    }
+
+    use super::looks_like_question;
+
+    #[test]
+    fn questions_are_detected_commands_are_not() {
+        for q in [
+            "how much fuel do we have", "what's our heading", "what is our altitude?",
+            "are we configured for landing", "how high are we", "tell me the airspeed",
+            "do we have enough fuel to make it?", "where are we",
+        ] {
+            assert!(looks_like_question(q), "{q:?} should be a question");
+        }
+        for c in [
+            "flaps ten", "gear up", "set heading 270", "throttle 60 percent",
+            "landing light on", "start the engine",
+        ] {
+            assert!(!looks_like_question(c), "{c:?} should not be a question");
         }
     }
 

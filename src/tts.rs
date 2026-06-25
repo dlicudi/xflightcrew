@@ -1,7 +1,10 @@
 //! Text-to-speech readback — the copilot's voice, confirming the *actual* action.
 //!
-//! Two local backends, selected by `config.tts_backend`:
-//!   - `say`   — macOS built-in. Zero install, always works. The default.
+//! The default backend is the warm Spark voice-clone `sidecar`
+//! ([`crate::tts_sidecar`]); this module covers the subprocess fallbacks selected
+//! by `config.tts_backend`:
+//!   - `say`   — macOS built-in. Zero install; the fallback when the sidecar
+//!     can't start.
 //!   - `piper` — shell out to the piper binary + a voice model (Horizon's trick).
 //!
 //! A later iteration could run Kokoro ONNX in-process via the `ort` crate.
@@ -16,15 +19,24 @@ use crate::config::Config;
 /// Speak `text` aloud using the configured backend.
 pub fn speak(config: &Config, text: &str) -> Result<()> {
     match config.tts_backend.as_str() {
-        "say" => speak_say(text),
+        "say" => speak_say(config, text),
         "piper" => speak_piper(config, text),
         other => bail!("unknown tts_backend: {other} (expected `say` or `piper`)"),
     }
 }
 
 /// macOS built-in speech synthesizer. Reads the text directly — no WAV step.
-fn speak_say(text: &str) -> Result<()> {
-    let status = Command::new("say")
+/// `XCOPILOT_SAY_VOICE` picks the voice (`say -v '?'` lists them); empty = the
+/// system default. `XCOPILOT_SAY_RATE` sets words-per-minute (empty = default).
+fn speak_say(config: &Config, text: &str) -> Result<()> {
+    let mut cmd = Command::new("say");
+    if !config.say_voice.is_empty() {
+        cmd.arg("-v").arg(&config.say_voice);
+    }
+    if !config.say_rate.is_empty() {
+        cmd.arg("-r").arg(&config.say_rate);
+    }
+    let status = cmd
         .arg(text)
         .status()
         .context("spawning `say` (macOS only)")?;

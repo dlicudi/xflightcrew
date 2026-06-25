@@ -119,6 +119,9 @@ pub struct Listener {
     reporter: Reporter,
     /// Raised while the copilot speaks; audio captured then is dropped.
     gate: MicGate,
+    /// Confirms a captured segment is speech before it's handed to whisper;
+    /// rejects non-speech bursts (sim/engine audio, knocks) the energy gate let in.
+    speech: crate::vad::SpeechFilter,
 }
 
 impl Listener {
@@ -159,6 +162,7 @@ impl Listener {
             ),
             reporter,
             gate,
+            speech: crate::vad::SpeechFilter::new(),
         })
     }
 
@@ -180,7 +184,7 @@ impl Listener {
         let mut spoke_until: Option<Instant> = None;
         let start = Instant::now();
 
-        loop {
+        'capture: loop {
             std::thread::sleep(Duration::from_millis(FRAME_MS as u64));
 
             // Half-duplex: while the copilot is speaking (or just did), throw away
@@ -218,15 +222,23 @@ impl Listener {
             while offset + frame_len <= pending.len() {
                 let frame = &pending[offset..offset + frame_len];
                 if let Some(utterance) = self.segmenter.push(frame) {
-                    let rest = pending.split_off(offset + frame_len);
-                    // Drop consumed audio; keep anything captured after the utterance.
+                    // Drop consumed audio; anything captured after starts fresh.
                     *self.input.buffer.lock().unwrap() = Vec::new();
-                    let _ = rest;
-                    return Ok(resample_linear(
+                    let resampled = resample_linear(
                         &utterance,
                         self.input.sample_rate,
                         WHISPER_SAMPLE_RATE,
-                    ));
+                    );
+                    // Speech gate: only hand real speech to whisper. Non-speech
+                    // bursts (sim/engine audio, knocks) are dropped, and we keep
+                    // listening rather than transcribing noise into a command.
+                    if self.speech.is_speech(&resampled) {
+                        return Ok(resampled);
+                    }
+                    self.reporter.log(LogKind::Info, "ignored (no speech detected)");
+                    pending.clear();
+                    self.segmenter.reset();
+                    continue 'capture;
                 }
                 offset += frame_len;
             }
@@ -246,6 +258,10 @@ const MIN_SPEECH_MS: u32 = 300;
 const MAX_SPEECH_MS: u32 = 12_000;
 /// Speech threshold = noise_floor × this (above the floor counts as voice).
 const VAD_RATIO: f32 = 2.5;
+/// Audio kept *before* speech onset and prepended to the utterance, so the attack
+/// of the first word (which sits below the threshold until the level rises) isn't
+/// clipped — "flaps" stops becoming "laps".
+const PREROLL_MS: u32 = 240;
 
 /// Energy-based voice-activity segmenter with an **adaptive noise floor**. Pure
 /// logic (no audio I/O), so it's unit-testable: feed it fixed-size mono frames;
@@ -268,6 +284,10 @@ pub struct Segmenter {
     speech: Vec<f32>,
     silence_ms: u32,
     speech_ms: u32,
+    /// Rolling window of the most recent ambient samples; prepended to `speech`
+    /// when an utterance starts so its onset isn't clipped.
+    preroll: std::collections::VecDeque<f32>,
+    preroll_ms: u32,
 }
 
 impl Segmenter {
@@ -293,6 +313,8 @@ impl Segmenter {
             speech: Vec::new(),
             silence_ms: 0,
             speech_ms: 0,
+            preroll: std::collections::VecDeque::new(),
+            preroll_ms: PREROLL_MS,
         }
     }
 
@@ -313,6 +335,17 @@ impl Segmenter {
         self.speech.clear();
         self.silence_ms = 0;
         self.speech_ms = 0;
+        self.preroll.clear();
+    }
+
+    /// Roll the pre-roll window: keep the most recent `preroll_ms` of ambient
+    /// audio so it can be prepended when speech starts.
+    fn push_preroll(&mut self, frame: &[f32]) {
+        let cap = (self.preroll_ms as usize / self.frame_ms.max(1) as usize) * frame.len();
+        self.preroll.extend(frame.iter().copied());
+        while self.preroll.len() > cap {
+            self.preroll.pop_front();
+        }
     }
 
     /// Feed one mono frame (`frame_ms` long). Returns `Some(samples)` when an
@@ -328,6 +361,10 @@ impl Segmenter {
         }
 
         if voiced {
+            if !self.in_speech {
+                // Onset: seed with the pre-roll so the first word's attack survives.
+                self.speech.extend(self.preroll.drain(..));
+            }
             self.in_speech = true;
             self.speech.extend_from_slice(frame);
             self.speech_ms += self.frame_ms;
@@ -345,7 +382,8 @@ impl Segmenter {
         }
 
         if !self.in_speech {
-            return None; // ambient silence; nothing to do
+            self.push_preroll(frame); // roll the pre-onset window
+            return None;
         }
 
         // In speech, hit a silent frame — keep it (natural trailing pause).
@@ -516,5 +554,30 @@ mod tests {
             }
         }
         assert!(got.is_none(), "short blip should be rejected");
+    }
+
+    #[test]
+    fn segmenter_preroll_keeps_onset() {
+        let frame_len = 480;
+        let mut seg = Segmenter::new(0.05, 2.5, 0.0, 90, 60, 100_000, 30);
+        let mut audio = vec![0.0f32; frame_len * 20]; // initial silence
+        audio.extend(std::iter::repeat(0.01).take(frame_len * 10)); // quiet pre-onset ambient
+        audio.extend(std::iter::repeat(0.3).take(frame_len * 16)); // speech
+        audio.extend(std::iter::repeat(0.0).take(frame_len * 10));
+
+        let mut utt = None;
+        for f in frames(&audio, frame_len) {
+            if let Some(u) = seg.push(f) {
+                utt = Some(u);
+                break;
+            }
+        }
+        let utt = utt.expect("utterance");
+        // The clip starts with the quiet pre-roll, not the loud onset — proof the
+        // first word's attack would survive.
+        assert!(utt[0].abs() < 0.05, "expected pre-roll before speech, got {}", utt[0]);
+        // Pre-roll (~240 ms = 8 frames) pads ahead of the 16 speech frames.
+        let captured = utt.len() / frame_len;
+        assert!(captured >= 16 + 6, "expected pre-roll padding, got {captured} frames");
     }
 }
