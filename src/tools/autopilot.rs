@@ -337,6 +337,94 @@ impl Tool for SetVerticalSpeed {
     }
 }
 
+/// `set_climb` — climb or descend to a target altitude at a chosen rate, then
+/// level off. Sets the AP target altitude AND vertical speed and lets the
+/// autopilot capture the altitude (it levels off on its own — no copilot polling
+/// loop, no overshoot). Direction is inferred from target vs current altitude.
+pub struct SetClimb;
+
+#[derive(Deserialize)]
+struct ClimbArgs {
+    /// Target altitude in feet MSL.
+    altitude: f64,
+    /// Climb/descent rate in feet per minute (magnitude; sign is inferred).
+    fpm: f64,
+}
+
+#[async_trait]
+impl Tool for SetClimb {
+    fn name(&self) -> &str {
+        "set_climb"
+    }
+
+    fn description(&self) -> &str {
+        "Climb or descend to a target altitude at a given rate, then level off \
+         automatically (the autopilot captures the altitude). One command for \
+         'climb to 7000 at 500', 'descend to 2000 at a thousand', 'take us up to \
+         5500 at 700', 'bring us down to 3000 at 500 feet per minute'. Direction \
+         is inferred from the target vs current altitude; fpm is the rate."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "altitude": {
+                    "type": "integer", "minimum": 0, "maximum": 60000,
+                    "description": "Target altitude in feet MSL."
+                },
+                "fpm": {
+                    "type": "integer", "minimum": 0, "maximum": 2000,
+                    "description": "Climb/descent rate in feet per minute (magnitude)."
+                }
+            },
+            "required": ["altitude", "fpm"]
+        })
+    }
+
+    fn confirm_prompt(&self, args: &Value) -> Option<String> {
+        let a: ClimbArgs = serde_json::from_value(args.clone()).ok()?;
+        Some(format!("altitude {:.0} feet at {:.0} feet per minute", a.altitude.max(0.0), a.fpm.abs()))
+    }
+
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let args: ClimbArgs = serde_json::from_value(args.clone())?;
+        let altitude = args.altitude.max(0.0);
+        if altitude < MIN_AP_ALTITUDE_FT {
+            return Ok(format!(
+                "Negative — {altitude:.0} feet is too low for an altitude hold. Say a target like \
+                 five thousand."
+            ));
+        }
+        let rate = args.fpm.abs().clamp(0.0, 2000.0);
+        let current = ctx.xplane.get_float(CURRENT_ALT).await?;
+        let climbing = altitude >= current;
+        let signed = if climbing { rate } else { -rate };
+
+        // Engage both modes first, then set both dials last (engaging snaps the
+        // dials to live values). VS flies the rate; the armed altitude captures.
+        ctx.xplane.run_command(CMD_SERVOS_ON).await?;
+        engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
+        engage_mode(ctx, VS_STATUS, CMD_VS_MODE).await?;
+        ctx.xplane.set_float(ALT_DIAL, altitude).await?;
+        ctx.xplane.set_float(VS_DIAL, signed).await?;
+
+        let verb = if climbing { "Climbing" } else { "Descending" };
+        if servos_engaged(ctx).await? {
+            Ok(format!(
+                "Roger — {} to {altitude:.0} feet at {rate:.0} feet per minute, \
+                 leveling off there.",
+                verb.to_lowercase()
+            ))
+        } else {
+            Ok(format!(
+                "Set to {} to {altitude:.0} feet, but the autopilot didn't engage — check the AP master.",
+                verb.to_lowercase()
+            ))
+        }
+    }
+}
+
 pub struct AutopilotOff;
 
 #[async_trait]

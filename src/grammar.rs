@@ -32,8 +32,8 @@ pub fn try_parse(
     profile: &AircraftProfile,
 ) -> Option<Vec<ToolCall>> {
     let t = transcript.trim().trim_end_matches(['.', '!', '?', ',']).to_lowercase();
-    if t.is_empty() || t.contains(" and ") {
-        return None; // empty or compound -> LLM
+    if t.is_empty() || is_compound(&t) {
+        return None; // empty or a real multi-action compound -> LLM
     }
     if RELATIVE.iter().any(|w| t.contains(w)) {
         return None; // relative/contextual -> LLM
@@ -86,11 +86,36 @@ fn number(t: &str) -> Option<i64> {
                 cur += val;
             }
             found = true;
+        } else if tok == "and" && found {
+            // spoken connector inside a number ("two hundred and forty")
         } else if found {
             break; // number run ended
         }
     }
     found.then_some(total + cur)
+}
+
+/// True if `t` is a real multi-action compound ("taxi and nav lights on") — an
+/// "and" whose neighbours aren't both number words. The "and" inside a spoken
+/// number ("two hundred and forty") is NOT a compound, so it stays on the
+/// fast-path.
+fn is_compound(t: &str) -> bool {
+    let toks: Vec<&str> = t.split_whitespace().collect();
+    let numish = |w: &str| {
+        let w = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        w.chars().all(|c| c.is_ascii_digit()) && !w.is_empty()
+            || word_value(&w.to_ascii_lowercase()).is_some()
+    };
+    for (i, w) in toks.iter().enumerate() {
+        if *w == "and" {
+            let prev_num = i.checked_sub(1).and_then(|j| toks.get(j)).is_some_and(|p| numish(p));
+            let next_num = toks.get(i + 1).is_some_and(|n| numish(n));
+            if !(prev_num && next_num) {
+                return true; // "and" joins non-numbers → genuine compound
+            }
+        }
+    }
+    false
 }
 
 /// First decimal number (for the altimeter, e.g. 29.92).
@@ -174,6 +199,18 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         };
         if let Some(d) = dir {
             return Some(call("set_heading", json!({ "heading": d })));
+        }
+    }
+
+    // climb/descend TO a target AT a rate -> set_climb (AP captures & levels off)
+    if has(t, "climb") || has(t, "descend") || has(t, "descent") || has(t, "altitude") {
+        if let Some((before, after)) = t.split_once(" at ") {
+            if let (Some(target), Some(rate)) = (
+                before.rsplit_once(" to ").and_then(|(_, a)| number(a)),
+                number(after),
+            ) {
+                return Some(call("set_climb", json!({ "altitude": target, "fpm": rate })));
+            }
         }
     }
 
@@ -426,6 +463,23 @@ mod tests {
         assert_eq!(one("turn the floodlights on").unwrap().1, json!({"on":true}));
         assert_eq!(one("parking break off").unwrap(), ("set_parking_brake".into(), json!({"on":false})));
         assert_eq!(one("parking break set").unwrap().1, json!({"on":true}));
+    }
+
+    #[test]
+    fn climb_to_target_at_rate_and_spoken_number_and() {
+        // climb/descend TO a target AT a rate -> set_climb
+        assert_eq!(
+            one("climb to seven thousand at five hundred").unwrap(),
+            ("set_climb".into(), json!({"altitude":7000,"fpm":500}))
+        );
+        assert_eq!(
+            one("descend to 2000 at a thousand").unwrap(),
+            ("set_climb".into(), json!({"altitude":2000,"fpm":1000}))
+        );
+        // "and" inside a spoken number is NOT a compound — stays on the fast-path.
+        assert_eq!(one("heading two hundred and forty").unwrap().1, json!({"heading":240}));
+        // but a genuine multi-action compound still goes to the LLM.
+        assert_eq!(one("flaps ten and gear up"), None);
     }
 
     #[test]
