@@ -904,7 +904,7 @@ fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
 async fn state_snapshot(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> Option<String> {
     // Fire every read concurrently — done sequentially this added ~130ms of
     // round-trips per command (and hit X-Plane's web server in a burst).
-    let (alt, ias, vs, hdg, flap, gear, og, fuel, ap) = tokio::join!(
+    let (alt, ias, vs, hdg, flap, gear, og, fuel, ap, engine) = tokio::join!(
         xp.get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot"),
         xp.get_float("sim/cockpit2/gauges/indicators/airspeed_kts_pilot"),
         xp.get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot"),
@@ -914,6 +914,7 @@ async fn state_snapshot(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) 
         xp.get_float("sim/flightmodel/failures/onground_any"),
         xp.get_float("sim/flightmodel/weight/m_fuel_total"),
         ap_mode(xp),
+        checklist::engine_running(xp),
     );
     let mut parts: Vec<String> = Vec::new();
     if let Ok(v) = alt {
@@ -941,6 +942,11 @@ async fn state_snapshot(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) 
     }
     if let Ok(v) = fuel {
         parts.push(format!("fuel on board {v:.0} kilograms"));
+    }
+    // Engine status — only when X-Plane is actually reachable (some scalar read
+    // succeeded), since engine_running defaults to true when it can't read.
+    if !parts.is_empty() {
+        parts.push(format!("engines {}", if engine { "running" } else { "off" }));
     }
     if ap != "--" {
         parts.push(format!("autopilot {ap}"));
