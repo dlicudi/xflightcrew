@@ -108,6 +108,10 @@ fn is_compound(t: &str) -> bool {
     };
     for (i, w) in toks.iter().enumerate() {
         if *w == "and" {
+            // "climb and maintain 7000" is one altitude command, not a compound.
+            if toks.get(i + 1).is_some_and(|n| *n == "maintain") {
+                continue;
+            }
             let prev_num = i.checked_sub(1).and_then(|j| toks.get(j)).is_some_and(|p| numish(p));
             let next_num = toks.get(i + 1).is_some_and(|n| numish(n));
             if !(prev_num && next_num) {
@@ -214,22 +218,22 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         }
     }
 
-    // vertical speed / climb / descend (when not an altitude command)
-    if (has(t, "vertical") || has(t, "climb") || has(t, "descend") || has(t, "descent"))
-        && !has(t, "altitude")
-        && !has(t, "maintain")
-    {
+    // climb / descend / altitude — one number, routed to an altitude TARGET or a
+    // vertical-speed RATE:
+    //   target  if "to X" / "altitude X" / "maintain X", or a value too big to be
+    //           a VS rate ("climb 7000" → altitude, not 7000 fpm)
+    //   rate    otherwise ("climb 500", "descend at 700")
+    let vertical = has(t, "vertical") || has(t, "climb") || has(t, "descend") || has(t, "descent");
+    if vertical || has(t, "altitude") || has(t, "maintain") {
         if let Some(n) = num {
+            let is_target =
+                t.contains(" to ") || has(t, "altitude") || has(t, "maintain") || n.abs() > 2500;
+            if is_target {
+                return Some(call("set_altitude", json!({ "altitude": n.abs() })));
+            }
             let down = has(t, "descend") || has(t, "descent") || has(t, "down");
             let fpm = if down { -n.abs() } else { n.abs() };
             return Some(call("set_vertical_speed", json!({ "fpm": fpm })));
-        }
-    }
-
-    // altitude / maintain
-    if has(t, "altitude") || has(t, "maintain") {
-        if let Some(n) = num {
-            return Some(call("set_altitude", json!({ "altitude": n })));
         }
     }
 
@@ -480,6 +484,19 @@ mod tests {
         assert_eq!(one("heading two hundred and forty").unwrap().1, json!({"heading":240}));
         // but a genuine multi-action compound still goes to the LLM.
         assert_eq!(one("flaps ten and gear up"), None);
+    }
+
+    #[test]
+    fn altitude_target_vs_vertical_speed_rate() {
+        // "to X" / big number / "maintain" → altitude target
+        assert_eq!(one("descend to one thousand two hundred feet").unwrap(), ("set_altitude".into(), json!({"altitude":1200})));
+        assert_eq!(one("climb to seven thousand").unwrap(), ("set_altitude".into(), json!({"altitude":7000})));
+        assert_eq!(one("climb and maintain seven thousand").unwrap(), ("set_altitude".into(), json!({"altitude":7000})));
+        assert_eq!(one("descend and maintain two thousand").unwrap(), ("set_altitude".into(), json!({"altitude":2000})));
+        assert_eq!(one("climb 7000").unwrap().0, "set_altitude"); // too big to be a VS rate
+        // no "to", in-range number → vertical-speed rate
+        assert_eq!(one("descend 500").unwrap(), ("set_vertical_speed".into(), json!({"fpm":-500})));
+        assert_eq!(one("climb at five hundred").unwrap(), ("set_vertical_speed".into(), json!({"fpm":500})));
     }
 
     #[test]
