@@ -132,16 +132,20 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("set_flaps", json!({ "notch": notch })));
     }
 
-    // throttle / power
-    if has(t, "throttle") {
+    // throttle / power ("power" is a throttle synonym: "power thirty percent",
+    // "40 percent power", "maximum/full throttle", "idle").
+    if has(t, "throttle") || has(t, "power") {
+        if t.contains("maximum") || t.contains("max") || t.contains("full") {
+            return Some(call("set_throttle", json!({ "percent": 100 })));
+        }
+        if t.contains("minimum") || t.contains("min") || has(t, "idle") {
+            return Some(call("set_throttle", json!({ "percent": 0 })));
+        }
         if let Some(n) = num {
             return Some(call("set_throttle", json!({ "percent": n })));
         }
     }
-    if t.contains("maximum power") || t.contains("max power") || t.contains("full power") {
-        return Some(call("set_throttle", json!({ "percent": 100 })));
-    }
-    if has(t, "idle") || t.contains("minimum power") || t.contains("min power") {
+    if has(t, "idle") {
         return Some(call("set_throttle", json!({ "percent": 0 })));
     }
 
@@ -395,6 +399,10 @@ mod tests {
         assert_eq!(one("flaps full").unwrap().1, json!({"notch":"full"}));
         assert_eq!(one("throttle eighty percent"), Some(("set_throttle".into(), json!({"percent":80}))));
         assert_eq!(one("maximum power").unwrap().1, json!({"percent":100}));
+        // "power" is a throttle synonym, and "maximum throttle"/"% power" forms.
+        assert_eq!(one("power thirty percent").unwrap(), ("set_throttle".into(), json!({"percent":30})));
+        assert_eq!(one("40 percent power").unwrap().1, json!({"percent":40}));
+        assert_eq!(one("maximum throttle").unwrap().1, json!({"percent":100}));
         assert_eq!(one("mixture 70 percent").unwrap().0, "set_mixture");
         assert_eq!(one("heading 270").unwrap().1, json!({"heading":270}));
         assert_eq!(one("turn heading south").unwrap().1, json!({"heading":180}));

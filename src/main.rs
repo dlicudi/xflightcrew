@@ -333,11 +333,12 @@ async fn run_session(
                 }
                 continue;
             }
-            // Re-anchor a bare-value follow-up onto the last command's system, so
-            // the model gets an explicit command ("throttle sixty percent")
-            // instead of having to infer continuation from chat history — which
-            // it does unreliably once the same tool repeats.
-            if has_number(&command) {
+            // Re-anchor a *truly bare* value follow-up onto the last command's
+            // system ("seventy percent" → "throttle seventy percent"). Only when
+            // the utterance is nothing but a number/percent — otherwise a misheard
+            // command ("fraudal at eighty percent") would get force-anchored to the
+            // wrong tool. Non-bare follow-ups go to the LLM with history as-is.
+            if is_bare_value(&command) {
                 if let Some(subj) = &last_subject {
                     let rewritten = format!("{subj} {command}");
                     reporter.log(ui::LogKind::Info, format!("follow-up → \"{rewritten}\""));
@@ -752,9 +753,9 @@ fn analyze_commands() -> Result<()> {
                     }
                 }
             } else if line.contains("command path") {
-                if line.contains("path=fast") {
+                if line.contains("path=\"fast\"") {
                     fast += 1;
-                } else if line.contains("path=llm") {
+                } else if line.contains("path=\"llm\"") {
                     llm += 1;
                     if let Some(t) = &last {
                         *tail.entry(t.clone()).or_default() += 1;
@@ -1102,6 +1103,29 @@ fn has_number(text: &str) -> bool {
             .any(|w| NUMBER_WORDS.contains(&w.to_ascii_lowercase().as_str()))
 }
 
+/// True if the utterance is *only* a number/percent value (digits, number words,
+/// and light filler like "to"/"at"/"point") — a genuine bare follow-up safe to
+/// re-anchor onto the last command. "fraudal at eighty percent" is NOT bare, so
+/// it won't be force-attached to the wrong tool.
+fn is_bare_value(text: &str) -> bool {
+    let mut any_token = false;
+    let mut any_number = false;
+    for w in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if w.is_empty() {
+            continue;
+        }
+        any_token = true;
+        let lw = w.to_ascii_lowercase();
+        let is_digits = lw.chars().all(|c| c.is_ascii_digit());
+        if is_digits || NUMBER_WORDS.contains(&lw.as_str()) {
+            any_number = true;
+        } else if !matches!(lw.as_str(), "to" | "at" | "point" | "decimal" | "a") {
+            return false; // a real content word — not bare
+        }
+    }
+    any_token && any_number
+}
+
 /// The leading non-numeric words of a command — its "subject" — used to
 /// re-anchor a bare-value follow-up onto the same system. "throttle eighty
 /// percent" → "throttle"; "set heading 270" → "set heading". Empty if the
@@ -1309,6 +1333,21 @@ mod tests {
         for r in ["negative", "no", "cancel", "stop", "abort", "uh what", "descend 700", ""] {
             assert!(!is_affirmative(r), "{r:?} must not confirm");
         }
+    }
+
+    use super::is_bare_value;
+
+    #[test]
+    fn bare_value_gates_followup_rewrite() {
+        // Genuine bare follow-ups (re-anchored to the last command).
+        assert!(is_bare_value("seventy percent"));
+        assert!(is_bare_value("60%"));
+        assert!(is_bare_value("two thousand five hundred"));
+        // Mishears / real words — must NOT be force-anchored to the last tool.
+        assert!(!is_bare_value("fraudal at eighty percent"));
+        assert!(!is_bare_value("total thirty percent"));
+        assert!(!is_bare_value("throttle eighty"));
+        assert!(!is_bare_value("switch it back"));
     }
 
     use super::looks_like_question;
