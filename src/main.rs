@@ -11,6 +11,7 @@ mod aircraft;
 mod audio;
 mod checklist;
 mod config;
+mod grammar;
 mod llm;
 mod monitor;
 mod nav;
@@ -83,6 +84,13 @@ async fn main() -> Result<()> {
         let text = transcribe_file(&config.whisper_model_path, &path)?;
         println!("{text}");
         return Ok(());
+    }
+
+    // `cargo run -- analyze` mines the logs for fast-path coverage and the
+    // ranked LLM-fallback phrasings — the candidates to promote into the
+    // deterministic grammar so coverage ratchets up over time.
+    if std::env::args().nth(1).as_deref() == Some("analyze") {
+        return analyze_commands();
     }
 
     // Resolve the aircraft profile: auto-detect from X-Plane's acf_ICAO when
@@ -360,31 +368,42 @@ async fn run_session(
         let t = Instant::now();
         let state = state_snapshot(&xplane, &profile).await;
         tracing::info!(ms = t.elapsed().as_millis(), state = state.as_deref().unwrap_or("(none)"), "state snapshot");
-        let t = Instant::now();
-        let decision = llm.act_or_answer(&command, &specs, &ctx_history, state.as_deref()).await;
-        tracing::info!(ms = t.elapsed().as_millis(), "llm");
-        let calls = match decision {
-            Ok(Decision::Act(calls)) => calls,
-            Ok(Decision::Reply(text)) => {
-                say(&voice, &reporter, ui::LogKind::Readback, &text);
-                continue;
-            }
-            Ok(Decision::None) => {
-                if explicit {
-                    say(&voice, &reporter, ui::LogKind::Warn, readback::one_of(&[
-                        "Sorry, I didn't catch that.",
-                        "I can't action that one.",
-                        "Say again?",
-                    ]));
-                } else {
-                    reporter.log(ui::LogKind::Info, format!("no response: \"{command}\""));
+
+        // Deterministic fast-path: resolve the common, regular commands with no
+        // LLM at all — no GPU burst, no latency, and it can't act on a question
+        // or pick the wrong tool. Anything it can't confidently parse falls
+        // through to the LLM. `path` is logged so `x-copilot analyze` can mine the
+        // LLM-fallback tail for new phrasings to promote into the grammar.
+        let calls = if let Some(c) = grammar::try_parse(&command, &registry, &profile) {
+            tracing::info!(path = "fast", tool = c.first().map(|x| x.name.as_str()).unwrap_or(""), "command path");
+            c
+        } else {
+            let t = Instant::now();
+            let decision = llm.act_or_answer(&command, &specs, &ctx_history, state.as_deref()).await;
+            tracing::info!(ms = t.elapsed().as_millis(), path = "llm", "command path");
+            match decision {
+                Ok(Decision::Act(calls)) => calls,
+                Ok(Decision::Reply(text)) => {
+                    say(&voice, &reporter, ui::LogKind::Readback, &text);
+                    continue;
                 }
-                continue;
-            }
-            Err(e) => {
-                tracing::error!("LLM act-or-answer failed: {e:#}");
-                reporter.log(ui::LogKind::Warn, "LLM unreachable");
-                continue;
+                Ok(Decision::None) => {
+                    if explicit {
+                        say(&voice, &reporter, ui::LogKind::Warn, readback::one_of(&[
+                            "Sorry, I didn't catch that.",
+                            "I can't action that one.",
+                            "Say again?",
+                        ]));
+                    } else {
+                        reporter.log(ui::LogKind::Info, format!("no response: \"{command}\""));
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!("LLM act-or-answer failed: {e:#}");
+                    reporter.log(ui::LogKind::Warn, "LLM unreachable");
+                    continue;
+                }
             }
         };
 
@@ -699,6 +718,67 @@ fn transcribe_file(model_path: &str, input: &str) -> Result<String> {
     // Offline one-shot — GPU is fine here (not competing with the sim loop).
     let stt = Stt::load(model_path, true)?;
     Ok(stt.transcribe(&samples)?.text.trim().to_string())
+}
+
+/// Mine the logs for fast-path coverage and the LLM-fallback tail. Pairs each
+/// spoken transcript with the `command path` line that followed it, then reports
+/// the fast/LLM split and the most frequent LLM-fallback phrasings — the ones
+/// worth promoting into [`grammar`] next. The ratchet that makes the copilot
+/// cheaper and more deterministic the more it's flown.
+fn analyze_commands() -> Result<()> {
+    use std::collections::HashMap;
+    let mut last: Option<String> = None;
+    let (mut fast, mut llm) = (0u32, 0u32);
+    let mut tail: HashMap<String, u32> = HashMap::new();
+
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir("logs")
+        .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
+        .unwrap_or_default();
+    paths.sort();
+    for p in paths {
+        let is_log = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("x-copilot.log"));
+        if !is_log {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&p) else { continue };
+        for line in content.lines() {
+            if let Some(i) = line.find("transcript=") {
+                let rest = &line[i + "transcript=".len()..];
+                last = Some(rest.split(" confidence=").next().unwrap_or(rest).trim().to_lowercase());
+            } else if line.contains("⌨") {
+                if let (Some(a), Some(b)) = (line.find('"'), line.rfind('"')) {
+                    if b > a {
+                        last = Some(line[a + 1..b].trim().to_lowercase());
+                    }
+                }
+            } else if line.contains("command path") {
+                if line.contains("path=fast") {
+                    fast += 1;
+                } else if line.contains("path=llm") {
+                    llm += 1;
+                    if let Some(t) = &last {
+                        *tail.entry(t.clone()).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let total = fast + llm;
+    if total == 0 {
+        println!("No command-path data in logs yet — run the app and issue some commands first.");
+        return Ok(());
+    }
+    println!("commands analyzed: {total}");
+    println!("  fast-path (no LLM): {fast:>5}  ({}%)", fast * 100 / total);
+    println!("  LLM fallback:       {llm:>5}  ({}%)", llm * 100 / total);
+    println!("\npromotion candidates — frequent LLM-fallback phrasings to add to grammar.rs:");
+    let mut v: Vec<(String, u32)> = tail.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (t, n) in v.into_iter().take(20) {
+        println!("  {n:>3}  {t}");
+    }
+    Ok(())
 }
 
 /// Map an X-Plane ICAO type code to a profile id. Unknown types fall back to
