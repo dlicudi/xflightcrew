@@ -51,6 +51,12 @@ struct Input {
     channels: usize,
 }
 
+/// Name of the default input device cpal will capture from — for display in the
+/// UI. `None` if no device is present or the platform won't name it.
+pub fn default_input_name() -> Option<String> {
+    cpal::default_host().default_input_device().and_then(|d| d.name().ok())
+}
+
 /// Open the default input device and build (but don't start) its stream.
 fn open_input() -> Result<Input> {
     let host = cpal::default_host();

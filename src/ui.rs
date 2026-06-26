@@ -121,6 +121,9 @@ struct App {
     log: Vec<(LogKind, String)>,
     phase: Phase,
     mic: f32,
+    /// Default input device name, shown in the mic panel title. Queried once at
+    /// startup (the OS default doesn't change mid-session for our purposes).
+    mic_name: Option<String>,
     aircraft: Aircraft,
     commands: Vec<String>,
     /// Typed-command line (you can type a command instead of speaking it).
@@ -159,6 +162,7 @@ pub fn run_dashboard(
         log: Vec::new(),
         phase: Phase::Idle,
         mic: 0.0,
+        mic_name: crate::audio::default_input_name(),
         aircraft: Aircraft::default(),
         commands,
         input: String::new(),
@@ -329,9 +333,13 @@ fn draw(f: &mut Frame, app: &App) {
     );
 
     let level = (app.mic * 12.0).clamp(0.0, 1.0) as f64; // ~0.08 RMS ≈ full
+    let mic_title = match &app.mic_name {
+        Some(name) => format!(" mic · {name} "),
+        None => " mic ".to_string(),
+    };
     f.render_widget(
         Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" mic "))
+            .block(Block::default().borders(Borders::ALL).title(mic_title))
             .gauge_style(Style::default().fg(Color::Green))
             .ratio(level)
             .label(format!("{:.3}", app.mic)),
