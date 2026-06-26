@@ -178,8 +178,15 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("set_throttle", json!({ "percent": 0 })));
     }
 
-    // mixture (numeric only; rich/lean left to the LLM)
+    // mixture: full rich / maximum → 100, idle cutoff → 0, else numeric. A bare
+    // "lean"/"enrich" (relative, no target) is still left to the LLM.
     if has(t, "mixture") {
+        if t.contains("maximum") || t.contains("max") || t.contains("full") || has(t, "rich") {
+            return Some(call("set_mixture", json!({ "percent": 100 })));
+        }
+        if t.contains("cutoff") || t.contains("cut off") || has(t, "cut") {
+            return Some(call("set_mixture", json!({ "percent": 0 })));
+        }
         if let Some(n) = num {
             return Some(call("set_mixture", json!({ "percent": n })));
         }
@@ -453,6 +460,9 @@ mod tests {
         assert_eq!(one("40 percent power").unwrap().1, json!({"percent":40}));
         assert_eq!(one("maximum throttle").unwrap().1, json!({"percent":100}));
         assert_eq!(one("mixture 70 percent").unwrap().0, "set_mixture");
+        assert_eq!(one("maximum mixture").unwrap(), ("set_mixture".into(), json!({"percent":100})));
+        assert_eq!(one("mixture full rich").unwrap().1, json!({"percent":100}));
+        assert_eq!(one("mixture idle cutoff").unwrap().1, json!({"percent":0}));
         assert_eq!(one("heading 270").unwrap().1, json!({"heading":270}));
         assert_eq!(one("turn heading south").unwrap().1, json!({"heading":180}));
         assert_eq!(one("descend 500").unwrap().1, json!({"fpm":-500}));
