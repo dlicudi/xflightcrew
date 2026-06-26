@@ -1,0 +1,31 @@
+# STT accuracy cases for `x-copilot stt-eval`.
+#
+# Each case is spoken (`say`), then checked two ways: word error rate against the
+# transcript, and — when `tool`/`args` are given — whether the deterministic
+# fast-path resolved it to the right command. Numbers are written as words
+# because that's how they're spoken; the pipeline normalizes them ("two seven
+# zero" → "270").
+#
+# These default to macOS `say` synthesis, which is a FLOOR — it under-states the
+# real error rate. For numbers that mean something, record the command yourself
+# and add `audio: path/to/clip.{wav,m4a,aiff}` to the case; the recording is used
+# instead of synthesis. The cases below are the cessna_172sp tool surface.
+
+- { say: "flaps ten",            tool: set_flaps,        args: { notch: "10" } }
+- { say: "flaps up",             tool: set_flaps,        args: { notch: "up" } }
+- { say: "flaps full",           tool: set_flaps,        args: { notch: "full" } }
+- { say: "throttle eighty percent", tool: set_throttle,  args: { percent: 80 } }
+- { say: "maximum power",        tool: set_throttle,     args: { percent: 100 } }
+- { say: "mixture full rich",    tool: set_mixture,      args: { percent: 100 } }
+- { say: "heading two seven zero", tool: set_heading,    args: { heading: 270 } }
+- { say: "climb and maintain seven thousand", tool: set_altitude, args: { altitude: 7000 } }
+- { say: "squawk one two zero zero", tool: set_transponder, args: { code: 1200 } }
+- { say: "set altimeter two niner niner two", tool: set_barometer } # float arg: tool-only
+- { say: "landing lights on",    tool: set_lights,       args: { light: landing, on: true } }
+- { say: "strobes off",          tool: set_lights,       args: { light: strobe, on: false } }
+- { say: "avionics on",          tool: set_electrical,   args: { system: avionics, on: true } }
+- { say: "start the engine",     tool: start_engine }
+- { say: "align gyro",           tool: align_gyro }
+- { say: "level off",            tool: level_off }
+- { say: "autopilot off",        tool: autopilot_off }
+- { say: "parking brake set",    tool: set_parking_brake, args: { on: true } }

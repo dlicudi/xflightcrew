@@ -19,6 +19,7 @@ mod nav;
 mod phrase;
 mod readback;
 mod stt;
+mod stt_eval;
 mod tts;
 #[cfg(feature = "onnx-tts")]
 mod tts_onnx;
@@ -92,6 +93,21 @@ async fn main() -> Result<()> {
     // deterministic grammar so coverage ratchets up over time.
     if std::env::args().nth(1).as_deref() == Some("analyze") {
         return analyze_commands();
+    }
+
+    // `cargo run -- stt-eval [manifest.yaml]` runs the offline speech-accuracy
+    // harness: each case through whisper + grammar, reporting WER and command
+    // accuracy. `WHISPER_MODEL=...` switches the model under test. Offline, so it
+    // uses a fixed profile (no X-Plane needed).
+    if std::env::args().nth(1).as_deref() == Some("stt-eval") {
+        let manifest = std::env::args().nth(2).unwrap_or_else(|| "bench/stt_cases.yaml".to_string());
+        let id = if config.aircraft.eq_ignore_ascii_case("auto") {
+            "cessna_172sp".to_string()
+        } else {
+            config.aircraft.clone()
+        };
+        let profile = aircraft::load(&id).ok_or_else(|| anyhow!("unknown aircraft profile: {id}"))?;
+        return stt_eval::run(&config.whisper_model_path, &profile, &manifest);
     }
 
     // Resolve the aircraft profile: auto-detect from X-Plane's acf_ICAO when
