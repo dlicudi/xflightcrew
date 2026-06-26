@@ -904,7 +904,7 @@ fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
 async fn state_snapshot(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> Option<String> {
     // Fire every read concurrently — done sequentially this added ~130ms of
     // round-trips per command (and hit X-Plane's web server in a burst).
-    let (alt, ias, vs, hdg, flap, gear, og, fuel, ap, engine) = tokio::join!(
+    let (alt, ias, vs, hdg, flap, gear, og, fuel, ap, engine, wind_dir, wind_kts, oat, vis, qnh) = tokio::join!(
         xp.get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot"),
         xp.get_float("sim/cockpit2/gauges/indicators/airspeed_kts_pilot"),
         xp.get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot"),
@@ -915,6 +915,14 @@ async fn state_snapshot(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) 
         xp.get_float("sim/flightmodel/weight/m_fuel_total"),
         ap_mode(xp),
         checklist::engine_running(xp),
+        // Weather, so "what's the weather?" gets real numbers. Wind/OAT are the
+        // cockpit-relative indicators (mirror the gauges); visibility and QNH come
+        // from the XP12 aircraft-weather datarefs. All confirmed reading live.
+        xp.get_float("sim/cockpit2/gauges/indicators/wind_heading_deg_mag"),
+        xp.get_float("sim/cockpit2/gauges/indicators/wind_speed_kts"),
+        xp.get_float("sim/cockpit2/temperature/outside_air_temp_degc"),
+        xp.get_float("sim/weather/aircraft/visibility_reported_sm"),
+        xp.get_float("sim/weather/aircraft/qnh_pas"),
     );
     let mut parts: Vec<String> = Vec::new();
     if let Ok(v) = alt {
@@ -942,6 +950,25 @@ async fn state_snapshot(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) 
     }
     if let Ok(v) = fuel {
         parts.push(format!("fuel on board {v:.0} kilograms"));
+    }
+    // Weather: wind as "direction at speed" (calm if barely moving), plus OAT.
+    if let (Ok(dir), Ok(spd)) = (wind_dir, wind_kts) {
+        if spd < 1.0 {
+            parts.push("wind calm".to_string());
+        } else {
+            parts.push(format!("wind {dir:03.0} at {spd:.0} knots"));
+        }
+    }
+    if let Ok(v) = oat {
+        parts.push(format!("outside air temperature {v:.0} degrees celsius"));
+    }
+    if let Ok(v) = vis {
+        parts.push(format!("visibility {v:.0} statute miles"));
+    }
+    if let Ok(v) = qnh {
+        // qnh_pas is sea-level pressure in Pascals; report as the altimeter
+        // setting in inches of mercury (1 inHg = 3386.389 Pa).
+        parts.push(format!("altimeter {:.2}", v / 3386.389));
     }
     // Engine status — only when X-Plane is actually reachable (some scalar read
     // succeeded), since engine_running defaults to true when it can't read.
