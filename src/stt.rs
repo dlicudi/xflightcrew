@@ -126,7 +126,10 @@ impl Stt {
             audio_s = format!("{:.1}", audio.len() as f32 / 16_000.0),
             "stt"
         );
-        // Normalize spoken digit runs ("two seven zero" → "270") for the LLM.
+        // Repair whole-word mishears the bias prompt can't prevent ("gyro" →
+        // "J-Rule"), then normalize spoken digit runs ("two seven zero" → "270").
+        // Both run before the domain gate so the real keyword reaches it.
+        let text = crate::phrase::fix_mishears(&text);
         let text = crate::phrase::normalize_numbers(&text);
         Ok(Transcription { text, confidence })
     }
@@ -136,76 +139,60 @@ impl Stt {
 /// phrasings the *active aircraft* actually exposes, plus number phraseology.
 /// Falls back to [`VOCAB_PROMPT`] for callers without a profile.
 pub fn build_prompt(p: &crate::aircraft::AircraftProfile) -> String {
-    let mut s = format!("{} cockpit commands. ", p.display_name);
-    if let Some(f) = &p.flaps {
-        let detents: Vec<String> = f.detents.iter().map(|d| format!("flaps {}", d.spoken)).collect();
-        if !detents.is_empty() {
-            s.push_str(&detents.join(", "));
-            s.push_str(". ");
-        }
-    }
-    if p.retractable_gear {
-        s.push_str("Gear up, gear down. ");
-    }
-    if !p.lights.is_empty() {
-        let lights: Vec<&str> = p.lights.iter().map(|l| l.spoken.as_str()).collect();
-        s.push_str(&format!("Lights: {} on or off. ", lights.join(", ")));
-    }
-    if p.flood_lights {
-        s.push_str("Flood lights. ");
-    }
-    if p.autopilot {
-        s.push_str("Autopilot heading, altitude hold, vertical speed, climb, descend, wings level. ");
+    // Whisper conditions on `initial_prompt` as if it were prior speech, so this
+    // must stay SHORT and sentence-like. An earlier version enumerated every
+    // system and value (~130 words); that long, clipped keyword list made the
+    // small base.en model bias toward that style and mis-split off-list words —
+    // notably "gyro" → "J-Rule" even though "gyro" was *in* the prompt. We now
+    // name only the systems the aircraft actually has, in one compact phrase,
+    // prime the one known-tricky term, and keep the number phraseology hint.
+    let mut terms: Vec<&str> = Vec::new();
+    if p.flaps.is_some() {
+        terms.push("flaps");
     }
     if p.engine {
-        s.push_str("Throttle, mixture, start the engine, shut down. ");
+        terms.push("throttle");
+        terms.push("mixture");
+    }
+    if p.retractable_gear {
+        terms.push("gear");
+    }
+    if !p.lights.is_empty() {
+        terms.push("lights");
+    }
+    if p.autopilot {
+        terms.push("autopilot heading and altitude");
     }
     if p.magnetos {
-        s.push_str("Magnetos left, right, both. ");
+        terms.push("magnetos");
     }
-    if p.carb_heat {
-        s.push_str("Carb heat. ");
-    }
-    if p.fuel_pump {
-        s.push_str("Fuel pump on or off. ");
-    }
-    if p.fuel_selector.is_some() {
-        s.push_str("Fuel selector left, right, both. ");
-    }
-    if p.pitot_heat {
-        s.push_str("Pitot heat. ");
-    }
-    if p.pitch_trim {
-        s.push_str("Trim nose up, nose down. ");
+    if p.fuel_pump || p.fuel_selector.is_some() {
+        terms.push("fuel");
     }
     if p.parking_brake {
-        s.push_str("Parking brake set or released. ");
+        terms.push("parking brake");
     }
     if !p.electrical.is_empty() {
-        s.push_str("Battery, alternator, avionics master. ");
+        terms.push("battery and avionics");
     }
-    if p.com_radio {
-        s.push_str("Com one, com two, tune frequency. ");
-    }
-    if p.nav_radio {
-        s.push_str("Nav one, set the OBS. ");
+    if p.com_radio || p.nav_radio {
+        terms.push("radios");
     }
     if p.transponder {
-        s.push_str("Squawk, ident, transponder standby. ");
+        terms.push("squawk");
     }
     if p.barometer {
-        s.push_str("Set altimeter. ");
+        terms.push("altimeter");
     }
+
+    let mut s = format!("{} cockpit commands: {}. ", p.display_name, terms.join(", "));
     if p.directional_gyro {
-        s.push_str("Align the gyro. ");
-    }
-    if p.ils {
-        s.push_str("Prepare the ILS for the runway. ");
+        // "gyro" is reliably misheard as "J-Rule" without priming.
+        s.push_str("Align the gyro, fix the gyro. ");
     }
     s.push_str(
         "Numbers are spoken digit by digit: heading two seven zero, squawk one two zero zero, \
-         com one one eight decimal five, altimeter two niner niner two; altitudes like seven \
-         thousand feet; knots, feet, degrees, percent.",
+         altimeter two niner niner two.",
     );
     s
 }

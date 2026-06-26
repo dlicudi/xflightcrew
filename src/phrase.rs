@@ -102,9 +102,50 @@ fn peek_is_digit(tokens: &[&str], idx: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// Repair distinctive *whole-word* mishearings whisper makes on cockpit terms,
+/// where the entire keyword is gone — so neither the domain gate's fuzzy match
+/// nor the grammar's token match can recover it (those only catch near-misses
+/// that keep the word, like "think gyro"). Only tokens that are meaningless in a
+/// cockpit are rewritten, so the false-positive risk is negligible. Run on
+/// spoken input before the gate, so both the gate and the grammar see the real
+/// word.
+pub fn fix_mishears(text: &str) -> String {
+    // "gyro" (JY-roh) is reliably rendered as "J-Rule"/"J rule" (jay-rool), which
+    // splits into tokens too far from "gyro" for the fuzzy gate to recover.
+    let mut out = replace_ci(text, "j-rule", "gyro");
+    out = replace_ci(&out, "j rule", "gyro");
+    out
+}
+
+/// Replace every case-insensitive occurrence of `needle` (which must be given in
+/// lowercase) with `replacement`, preserving the surrounding text verbatim.
+fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
+    let lower = haystack.to_ascii_lowercase();
+    let mut out = String::with_capacity(haystack.len());
+    let mut i = 0;
+    while let Some(pos) = lower[i..].find(needle) {
+        let start = i + pos;
+        out.push_str(&haystack[i..start]);
+        out.push_str(replacement);
+        i = start + needle.len();
+    }
+    out.push_str(&haystack[i..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixes_gyro_mishears() {
+        // "gyro" lost to "J-Rule"/"J rule" is restored, case-insensitively.
+        assert_eq!(fix_mishears("And then you fix the J-Rule."), "And then you fix the gyro.");
+        assert_eq!(fix_mishears("you think the j rule?"), "you think the gyro?");
+        // Unrelated text is untouched.
+        assert_eq!(fix_mishears("align the gyro"), "align the gyro");
+        assert_eq!(fix_mishears("flaps ten"), "flaps ten");
+    }
 
     #[test]
     fn collapses_digit_runs() {
