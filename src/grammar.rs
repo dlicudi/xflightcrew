@@ -226,12 +226,20 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     let vertical = has(t, "vertical") || has(t, "climb") || has(t, "descend") || has(t, "descent");
     if vertical || has(t, "altitude") || has(t, "maintain") {
         if let Some(n) = num {
-            let is_target =
-                t.contains(" to ") || has(t, "altitude") || has(t, "maintain") || n.abs() > 2500;
+            // An explicit "vertical speed" command is ALWAYS a rate, never an
+            // altitude target: the keyword names the VS control directly, so the
+            // "to X" / big-number heuristics that disambiguate a bare "climb X"
+            // must not override it ("set vertical speed to minus 1000" is -1000
+            // fpm, not an altitude of 1000; "vertical speed 3000 down" is -3000
+            // fpm, not a climb to 3000 ft).
+            let explicit_vs = has(t, "vertical");
+            let is_target = !explicit_vs
+                && (t.contains(" to ") || has(t, "altitude") || has(t, "maintain") || n.abs() > 2500);
             if is_target {
                 return Some(call("set_altitude", json!({ "altitude": n.abs() })));
             }
-            let down = has(t, "descend") || has(t, "descent") || has(t, "down");
+            let down = has(t, "descend") || has(t, "descent") || has(t, "down")
+                || has(t, "minus") || has(t, "negative");
             let fpm = if down { -n.abs() } else { n.abs() };
             return Some(call("set_vertical_speed", json!({ "fpm": fpm })));
         }
@@ -484,6 +492,22 @@ mod tests {
         assert_eq!(one("heading two hundred and forty").unwrap().1, json!({"heading":240}));
         // but a genuine multi-action compound still goes to the LLM.
         assert_eq!(one("flaps ten and gear up"), None);
+    }
+
+    #[test]
+    fn explicit_vertical_speed_is_never_an_altitude_target() {
+        // Regression: "vertical speed" commands were grabbed by set_altitude when
+        // they said "to X", or named a rate above the 2500 fpm disambiguation cut.
+        let vs = |s: &str| one(s).unwrap();
+        assert_eq!(vs("vertical speed descent three thousand"), ("set_vertical_speed".into(), json!({"fpm":-3000})));
+        assert_eq!(vs("vertical speed 3000 minus"), ("set_vertical_speed".into(), json!({"fpm":-3000})));
+        assert_eq!(vs("set vertical speed to minus one thousand"), ("set_vertical_speed".into(), json!({"fpm":-1000})));
+        assert_eq!(vs("vertical speed negative five hundred"), ("set_vertical_speed".into(), json!({"fpm":-500})));
+        assert_eq!(vs("vertical speed to seven hundred"), ("set_vertical_speed".into(), json!({"fpm":700})));
+        // Bare climb/descend WITHOUT "vertical" still disambiguates to an altitude
+        // target on "to X" or a value too big to be a rate.
+        assert_eq!(one("climb 7000").unwrap().0, "set_altitude");
+        assert_eq!(one("climb to 7000").unwrap(), ("set_altitude".into(), json!({"altitude":7000})));
     }
 
     #[test]
