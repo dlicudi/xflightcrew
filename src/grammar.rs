@@ -54,6 +54,10 @@ fn call(name: &str, args: Value) -> ToolCall {
 /// ("eighty" → 80, "five hundred" → 500, "two thousand" → 2000). Returns the
 /// magnitude; sign (climb/descend) is applied by the caller.
 fn number(t: &str) -> Option<i64> {
+    // Whisper writes large numbers with a thousands separator ("7,000"); strip it
+    // so the digit group parses as one number, not "7" then "000" → 70. (A comma
+    // elsewhere is already a token separator, so removing it changes nothing.)
+    let t = t.replace(',', "");
     let (mut total, mut cur, mut found) = (0i64, 0i64, false);
     for tok in t.split(|c: char| !c.is_ascii_alphanumeric()) {
         if tok.is_empty() {
@@ -557,6 +561,9 @@ mod tests {
         assert_eq!(one("climb to seven thousand").unwrap(), ("set_altitude".into(), json!({"altitude":7000})));
         assert_eq!(one("climb and maintain seven thousand").unwrap(), ("set_altitude".into(), json!({"altitude":7000})));
         assert_eq!(one("descend and maintain two thousand").unwrap(), ("set_altitude".into(), json!({"altitude":2000})));
+        // Whisper renders large numbers with a thousands separator — must not
+        // parse "7,000" as 70 (a dangerous altitude misread).
+        assert_eq!(one("climb and maintain 7,000").unwrap(), ("set_altitude".into(), json!({"altitude":7000})));
         assert_eq!(one("climb 7000").unwrap().0, "set_altitude"); // too big to be a VS rate
         // no "to", in-range number → vertical-speed rate
         assert_eq!(one("descend 500").unwrap(), ("set_vertical_speed".into(), json!({"fpm":-500})));
