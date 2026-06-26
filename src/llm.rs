@@ -6,6 +6,8 @@
 //! prompt and let the model emit a `tool_calls` entry, which we map back to one
 //! of the curated tools.
 
+use std::time::Instant;
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -46,8 +48,12 @@ ten', 'do you think you could switch the engines on' are all COMMANDS — call t
 tool, do not just describe state. ANSWER: only when the pilot asks about the \
 flight and there is nothing to do, reply in ONE short spoken sentence, in ENGLISH \
 only, using digits for numbers — e.g. 'We're parked on the ground, engines off.' \
-or 'Heading 270, 3,300 feet, climbing.' Use only the state you are given; if it \
-isn't there, say you don't have that readout; never invent numbers. Prefer ACT \
+or 'Heading 270, 3,300 feet, climbing.' Answer ONLY from the state you are given, \
+and answer the thing actually asked: if that specific reading isn't in the state, \
+say so plainly ('I don't have weather' / 'No reading for that') — do NOT substitute \
+an unrelated fact you do have (asked the weather with no weather in state, you say \
+you don't have it, you do NOT report heading or engine status instead). Never \
+invent numbers. Prefer ACT \
 whenever an action is possible, and never both act and answer. For tool arguments \
 pick the closest schema value (speech may be misheard — map 'beak' to 'beacon', \
 'probe' to 'strobe', 'blood lights' to flood lights). Numbers may be spoken as \
@@ -242,15 +248,20 @@ impl Llm {
         state: Option<&str>,
     ) -> Result<Vec<ToolCall>> {
         // Deterministic first pass.
+        let t = Instant::now();
         let calls = self.choose_tool_at(transcript, tools, history, state, 0.0).await?;
+        tracing::info!(pass = 0, temp = 0.0, ms = t.elapsed().as_millis(), n = calls.len(), "llm tool-pick pass");
         if !calls.is_empty() {
             return Ok(dedup_calls(calls));
         }
         // Declined — retry with escalating temperature, stopping at the first
-        // concrete pick.
-        for &temp in RETRY_TEMPS {
+        // concrete pick. Each retry is a *full* extra inference, so it's timed
+        // separately: that's how the logs tell "one slow call" from "three calls".
+        for (i, &temp) in RETRY_TEMPS.iter().enumerate() {
             tracing::debug!(temp, transcript = %transcript, "tool selection empty; retrying with temperature bump");
+            let t = Instant::now();
             let calls = self.choose_tool_at(transcript, tools, history, state, temp).await?;
+            tracing::info!(pass = i + 1, temp, ms = t.elapsed().as_millis(), n = calls.len(), "llm tool-pick retry");
             if !calls.is_empty() {
                 tracing::info!(temp, transcript = %transcript, n = calls.len(), "recovered tool(s) on retry");
                 return Ok(dedup_calls(calls));
@@ -293,12 +304,18 @@ impl Llm {
         history: &[(String, String)],
         state: Option<&str>,
     ) -> Result<Decision> {
+        let t = Instant::now();
         let d = self.decide_at(transcript, tools, history, state, 0.0).await?;
+        tracing::info!(pass = 0, temp = 0.0, ms = t.elapsed().as_millis(), decided = !matches!(d, Decision::None), "llm act-or-answer pass");
         if !matches!(d, Decision::None) {
             return Ok(d);
         }
-        for &temp in RETRY_TEMPS {
+        // Each retry is a full extra inference — timed separately so the logs
+        // attribute a slow turn to retries rather than one heavy call.
+        for (i, &temp) in RETRY_TEMPS.iter().enumerate() {
+            let t = Instant::now();
             let d = self.decide_at(transcript, tools, history, state, temp).await?;
+            tracing::info!(pass = i + 1, temp, ms = t.elapsed().as_millis(), decided = !matches!(d, Decision::None), "llm act-or-answer retry");
             if !matches!(d, Decision::None) {
                 return Ok(d);
             }
