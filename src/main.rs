@@ -11,6 +11,7 @@ mod aircraft;
 mod audio;
 mod checklist;
 mod config;
+mod datarefs;
 mod grammar;
 mod llm;
 mod monitor;
@@ -929,24 +930,24 @@ async fn state_snapshot(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) 
     // Fire every read concurrently — done sequentially this added ~130ms of
     // round-trips per command (and hit X-Plane's web server in a burst).
     let (alt, ias, vs, hdg, flap, gear, og, fuel, ap, engine, wind_dir, wind_kts, oat, vis, qnh) = tokio::join!(
-        xp.get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot"),
-        xp.get_float("sim/cockpit2/gauges/indicators/airspeed_kts_pilot"),
-        xp.get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot"),
-        xp.get_float("sim/cockpit2/gauges/indicators/compass_heading_deg_mag"),
-        xp.get_float("sim/cockpit2/controls/flap_ratio"),
-        xp.get_float("sim/cockpit2/controls/gear_handle_down"),
-        xp.get_float("sim/flightmodel/failures/onground_any"),
-        xp.get_float("sim/flightmodel/weight/m_fuel_total"),
+        xp.get_float(datarefs::ALTITUDE_FT),
+        xp.get_float(datarefs::AIRSPEED_KTS),
+        xp.get_float(datarefs::VVI_FPM),
+        xp.get_float(datarefs::COMPASS_HEADING_DEG),
+        xp.get_float(datarefs::FLAP_RATIO),
+        xp.get_float(datarefs::GEAR_HANDLE_DOWN),
+        xp.get_float(datarefs::ON_GROUND_ANY),
+        xp.get_float(datarefs::FUEL_TOTAL_KG),
         ap_mode(xp),
         checklist::engine_running(xp),
         // Weather, so "what's the weather?" gets real numbers. Wind/OAT are the
         // cockpit-relative indicators (mirror the gauges); visibility and QNH come
         // from the XP12 aircraft-weather datarefs. All confirmed reading live.
-        xp.get_float("sim/cockpit2/gauges/indicators/wind_heading_deg_mag"),
-        xp.get_float("sim/cockpit2/gauges/indicators/wind_speed_kts"),
-        xp.get_float("sim/cockpit2/temperature/outside_air_temp_degc"),
-        xp.get_float("sim/weather/aircraft/visibility_reported_sm"),
-        xp.get_float("sim/weather/aircraft/qnh_pas"),
+        xp.get_float(datarefs::WIND_HEADING_DEG),
+        xp.get_float(datarefs::WIND_SPEED_KTS),
+        xp.get_float(datarefs::OAT_DEG_C),
+        xp.get_float(datarefs::VISIBILITY_SM),
+        xp.get_float(datarefs::QNH_PASCALS),
     );
     let mut parts: Vec<String> = Vec::new();
     if let Ok(v) = alt {
@@ -1009,11 +1010,11 @@ async fn state_snapshot(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) 
 /// X-Plane is unreachable (panel keeps its last values).
 async fn poll_aircraft(xp: &XPlaneClient) -> Option<ui::Aircraft> {
     Some(ui::Aircraft {
-        heading: xp.get_float("sim/cockpit2/gauges/indicators/compass_heading_deg_mag").await.ok()?,
-        altitude: xp.get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot").await.ok()?,
-        ias: xp.get_float("sim/cockpit2/gauges/indicators/airspeed_kts_pilot").await.ok()?,
-        vsi: xp.get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot").await.ok()?,
-        flaps_pct: xp.get_float("sim/cockpit2/controls/flap_ratio").await.ok()? * 100.0,
+        heading: xp.get_float(datarefs::COMPASS_HEADING_DEG).await.ok()?,
+        altitude: xp.get_float(datarefs::ALTITUDE_FT).await.ok()?,
+        ias: xp.get_float(datarefs::AIRSPEED_KTS).await.ok()?,
+        vsi: xp.get_float(datarefs::VVI_FPM).await.ok()?,
+        flaps_pct: xp.get_float(datarefs::FLAP_RATIO).await.ok()? * 100.0,
         ap_mode: ap_mode(xp).await,
     })
 }
@@ -1022,10 +1023,10 @@ async fn poll_aircraft(xp: &XPlaneClient) -> Option<ui::Aircraft> {
 async fn ap_mode(xp: &XPlaneClient) -> String {
     // Concurrent reads — this is called inside state_snapshot's hot path.
     let (servos, appr, nav, hdg) = tokio::join!(
-        xp.get_float("sim/cockpit2/autopilot/servos_on"),
-        xp.get_float("sim/cockpit2/autopilot/approach_status"),
-        xp.get_float("sim/cockpit2/autopilot/nav_status"),
-        xp.get_float("sim/cockpit2/autopilot/heading_status"),
+        xp.get_float(datarefs::SERVOS_ON),
+        xp.get_float(datarefs::APPROACH_STATUS),
+        xp.get_float(datarefs::NAV_STATUS),
+        xp.get_float(datarefs::HEADING_STATUS),
     );
     if servos.unwrap_or(0.0) <= 0.5 {
         return "--".to_string();
@@ -1144,20 +1145,19 @@ fn looks_like_followup(text: &str) -> bool {
 }
 
 /// Spoken or written numbers, for spotting a bare-value follow-up.
-const NUMBER_WORDS: &[&str] = &[
-    "percent", "zero", "one", "two", "three", "four", "five", "six", "seven",
-    "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
-    "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
-    "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
-    "hundred", "thousand",
-];
+/// True if a token is a value word for the bare-value gates: any spoken number
+/// (shared with the STT normalizer and grammar via [`phrase::is_number_word`])
+/// plus the unit "percent".
+fn is_value_word(w: &str) -> bool {
+    phrase::is_number_word(w) || w == "percent"
+}
 
 /// True if the utterance carries a digit or a spoken number.
 fn has_number(text: &str) -> bool {
     text.chars().any(|c| c.is_ascii_digit())
         || text
             .split(|c: char| !c.is_ascii_alphabetic())
-            .any(|w| NUMBER_WORDS.contains(&w.to_ascii_lowercase().as_str()))
+            .any(|w| is_value_word(&w.to_ascii_lowercase()))
 }
 
 /// True if the utterance is *only* a number/percent value (digits, number words,
@@ -1174,7 +1174,7 @@ fn is_bare_value(text: &str) -> bool {
         any_token = true;
         let lw = w.to_ascii_lowercase();
         let is_digits = lw.chars().all(|c| c.is_ascii_digit());
-        if is_digits || NUMBER_WORDS.contains(&lw.as_str()) {
+        if is_digits || is_value_word(&lw) {
             any_number = true;
         } else if !matches!(lw.as_str(), "to" | "at" | "point" | "decimal" | "a") {
             return false; // a real content word — not bare
@@ -1192,7 +1192,7 @@ fn command_subject(cmd: &str) -> String {
     for w in cmd.split_whitespace() {
         let bare = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
         if bare.chars().any(|c| c.is_ascii_digit())
-            || NUMBER_WORDS.contains(&bare.to_ascii_lowercase().as_str())
+            || is_value_word(&bare.to_ascii_lowercase())
         {
             break;
         }

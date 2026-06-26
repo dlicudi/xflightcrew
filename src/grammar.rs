@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 
 use crate::aircraft::AircraftProfile;
 use crate::llm::ToolCall;
+use crate::phrase::word_value;
 use crate::tools::Registry;
 
 /// Markers of a relative/contextual command only the LLM can resolve.
@@ -47,24 +48,6 @@ pub fn try_parse(
 
 fn call(name: &str, args: Value) -> ToolCall {
     ToolCall { name: name.to_string(), arguments: args }
-}
-
-/// Value of a single number word: `(value, is_multiplier)`. Multipliers are
-/// hundred/thousand; everything else is a digit/teen/ten.
-fn word_value(w: &str) -> Option<(i64, bool)> {
-    let n = match w {
-        "zero" | "oh" => 0,
-        "one" => 1, "two" => 2, "three" => 3, "four" => 4, "five" => 5,
-        "six" => 6, "seven" => 7, "eight" => 8, "nine" => 9, "ten" => 10,
-        "eleven" => 11, "twelve" => 12, "thirteen" => 13, "fourteen" => 14,
-        "fifteen" => 15, "sixteen" => 16, "seventeen" => 17, "eighteen" => 18,
-        "nineteen" => 19, "twenty" => 20, "thirty" => 30, "forty" => 40,
-        "fifty" => 50, "sixty" => 60, "seventy" => 70, "eighty" => 80, "ninety" => 90,
-        "hundred" => return Some((100, true)),
-        "thousand" => return Some((1000, true)),
-        _ => return None,
-    };
-    Some((n, false))
 }
 
 /// First number in the text — digits (already-normalized "270") or spoken words

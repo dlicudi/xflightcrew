@@ -12,21 +12,56 @@
 //! hundred/thousand and are left for the LLM, which handles them well — so we
 //! never mis-fold "two thousand" into "2000"-style ambiguity here.
 
-/// Single-digit words → digit. ICAO variants (niner/fife/tree) included.
-fn digit_word(w: &str) -> Option<char> {
+/// Value of a single spoken digit (0–9), including ICAO variants
+/// (niner/fife/tree) and "oh"/"zero". The one place the digit vocabulary lives —
+/// the STT normalizer, the grammar fast-path, and the bare-value gate all build
+/// on this, so a spelling can't drift between them.
+pub fn digit_value(w: &str) -> Option<i64> {
     Some(match w {
-        "zero" | "oh" => '0',
-        "one" => '1',
-        "two" => '2',
-        "three" | "tree" => '3',
-        "four" => '4',
-        "five" | "fife" => '5',
-        "six" => '6',
-        "seven" => '7',
-        "eight" => '8',
-        "nine" | "niner" => '9',
+        "zero" | "oh" => 0,
+        "one" => 1,
+        "two" => 2,
+        "three" | "tree" => 3,
+        "four" => 4,
+        "five" | "fife" => 5,
+        "six" => 6,
+        "seven" => 7,
+        "eight" => 8,
+        "nine" | "niner" => 9,
         _ => return None,
     })
+}
+
+/// Value of any single number word: a digit (via [`digit_value`]), a teen, a ten,
+/// or a hundred/thousand multiplier — `(value, is_multiplier)`. Shared by the
+/// grammar number parser and the bare-value gates so the vocabulary stays in one
+/// place. (Stops at thousand: the grammar's additive parser hardcodes the
+/// thousand step, so larger multipliers belong to the LLM.)
+pub fn word_value(w: &str) -> Option<(i64, bool)> {
+    if let Some(d) = digit_value(w) {
+        return Some((d, false));
+    }
+    let n = match w {
+        "ten" => 10, "eleven" => 11, "twelve" => 12, "thirteen" => 13,
+        "fourteen" => 14, "fifteen" => 15, "sixteen" => 16, "seventeen" => 17,
+        "eighteen" => 18, "nineteen" => 19, "twenty" => 20, "thirty" => 30,
+        "forty" => 40, "fifty" => 50, "sixty" => 60, "seventy" => 70,
+        "eighty" => 80, "ninety" => 90,
+        "hundred" => return Some((100, true)),
+        "thousand" => return Some((1000, true)),
+        _ => return None,
+    };
+    Some((n, false))
+}
+
+/// True if `w` (lowercase) is any spoken number word.
+pub fn is_number_word(w: &str) -> bool {
+    word_value(w).is_some()
+}
+
+/// Single-digit words → digit char, for building digit strings.
+fn digit_word(w: &str) -> Option<char> {
+    digit_value(w).map(|d| (b'0' + d as u8) as char)
 }
 
 /// Magnitude words mark an *additive* number ("five hundred", "two thousand"),
