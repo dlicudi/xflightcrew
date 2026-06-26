@@ -152,6 +152,26 @@ pub fn fix_mishears(text: &str) -> String {
     out
 }
 
+/// Join intra-word hyphens whisper inserts into compounds ("auto-pilot" →
+/// "autopilot", "pre-flight" → "preflight") so the keyword gate and the grammar
+/// see one word — otherwise they split on the hyphen and the keyword is lost.
+/// Only a hyphen flanked by ASCII letters is removed; a digit hyphen is left
+/// intact (it isn't a compound, and could be a range).
+pub fn collapse_hyphens(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    for (i, &c) in chars.iter().enumerate() {
+        let joins_letters = c == '-'
+            && i > 0
+            && chars[i - 1].is_ascii_alphabetic()
+            && chars.get(i + 1).is_some_and(|n| n.is_ascii_alphabetic());
+        if !joins_letters {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Replace every case-insensitive occurrence of `needle` (which must be given in
 /// lowercase) with `replacement`, preserving the surrounding text verbatim.
 fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
@@ -180,6 +200,17 @@ mod tests {
         // Unrelated text is untouched.
         assert_eq!(fix_mishears("align the gyro"), "align the gyro");
         assert_eq!(fix_mishears("flaps ten"), "flaps ten");
+    }
+
+    #[test]
+    fn collapses_intra_word_hyphens_only() {
+        // Compound the keyword gate/grammar would otherwise split on.
+        assert_eq!(collapse_hyphens("auto-pilot off"), "autopilot off");
+        assert_eq!(collapse_hyphens("pre-flight check"), "preflight check");
+        // Digit hyphens and dangling hyphens are left intact.
+        assert_eq!(collapse_hyphens("flaps 10"), "flaps 10");
+        assert_eq!(collapse_hyphens("set 29-92"), "set 29-92");
+        assert_eq!(collapse_hyphens("- gear up"), "- gear up");
     }
 
     #[test]

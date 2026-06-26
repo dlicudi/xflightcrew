@@ -79,10 +79,13 @@ impl Stt {
         if t.text.is_empty() {
             return Ok(t);
         }
-        // Repair whole-word mishears the bias prompt can't prevent ("gyro" →
-        // "J-Rule"), then normalize spoken digit runs ("two seven zero" → "270").
-        // Both run before the domain gate so the real keyword reaches it.
-        let text = crate::phrase::fix_mishears(&t.text);
+        // Clean the transcript for the gate and grammar: join hyphenated compounds
+        // ("auto-pilot" → "autopilot"), repair whole-word mishears the bias prompt
+        // can't prevent ("gyro" → "J-Rule"), then normalize spoken digit runs
+        // ("two seven zero" → "270"). All run before the domain gate so the real
+        // keyword reaches it.
+        let text = crate::phrase::collapse_hyphens(&t.text);
+        let text = crate::phrase::fix_mishears(&text);
         let text = crate::phrase::normalize_numbers(&text);
         Ok(Transcription { text, ..t })
     }
@@ -199,7 +202,11 @@ pub fn build_prompt(p: &crate::aircraft::AircraftProfile) -> String {
         terms.push("altimeter");
     }
 
-    let mut s = format!("{} cockpit commands: {}. ", p.display_name, terms.join(", "));
+    // No aircraft name in the prompt: it's not vocabulary the pilot speaks, and
+    // whisper conditions on the prompt as prior speech — leading with "Cessna
+    // 172SP Skyhawk" leaks "Skyhawk" into short transcripts ("align gyro" →
+    // "skyhawk and gyro"). Bias on the systems and phraseology only.
+    let mut s = format!("Cockpit commands: {}. ", terms.join(", "));
     if p.directional_gyro {
         // "gyro" is reliably misheard as "J-Rule" without priming.
         s.push_str("Align the gyro, fix the gyro. ");
