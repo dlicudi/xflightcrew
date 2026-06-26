@@ -413,6 +413,12 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         if let Some(inhg) = altimeter_inhg(t) {
             return Some(call("set_barometer", json!({ "inhg": inhg })));
         }
+        // No setting spoken ("set the altimeter", "altimeter to field") → dial in
+        // the current local QNH. But a number that just didn't parse as a valid
+        // setting ("altimeter 50") falls to the LLM rather than silently setting it.
+        if !t.chars().any(|c| c.is_ascii_digit()) {
+            return Some(call("set_altimeter_current", json!({})));
+        }
     }
 
     None
@@ -508,8 +514,13 @@ mod tests {
         assert!((inhg("set baro 3010") - 30.10).abs() < 0.005); // 4-digit inHg×100
         assert!((inhg("set qnh 1013") - 29.91).abs() < 0.02); // hPa/QNH → inHg
         // A bare integer outside both the inHg and hPa ranges isn't a setting —
-        // fall back to the LLM rather than write garbage.
+        // fall back to the LLM rather than write garbage (and not the auto-setter).
         assert!(one("set altimeter 50").is_none());
+        // No value spoken → set to the current local QNH automatically.
+        assert_eq!(one("set the altimeter").unwrap().0, "set_altimeter_current");
+        assert_eq!(one("give me the local altimeter").unwrap().0, "set_altimeter_current");
+        assert_eq!(one("altimeter to field").unwrap().0, "set_altimeter_current");
+        assert_eq!(one("set the local qnh").unwrap().0, "set_altimeter_current");
     }
 
     #[test]

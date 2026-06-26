@@ -8,6 +8,8 @@ use serde_json::{json, Value};
 use super::{Tool, ToolCtx};
 
 const BARO: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot";
+/// Pascals per inch of mercury (1013.25 hPa ≈ 29.92 inHg).
+const PA_PER_INHG: f64 = 3386.389;
 const DG_SYNC: &str = "sim/instruments/DG_sync_mag";
 const DG_DRIFT: &str = "sim/cockpit/gyros/dg_drift_vac_deg";
 const PITOT_HEAT: &str = "sim/cockpit2/ice/ice_pitot_heat_on_pilot";
@@ -59,6 +61,38 @@ impl Tool for SetBarometer {
         ctx.xplane.set_float(BARO, inhg).await?;
         let actual = ctx.xplane.get_float(BARO).await?;
         Ok(format!("Roger, altimeter {actual:.2}."))
+    }
+}
+
+pub struct SetAltimeterCurrent;
+
+#[async_trait]
+impl Tool for SetAltimeterCurrent {
+    fn name(&self) -> &str {
+        "set_altimeter_current"
+    }
+
+    fn description(&self) -> &str {
+        "Set the altimeter to the CURRENT local pressure (QNH) automatically — no \
+         number needed; the correct value is read from the environment. Use when the \
+         pilot wants it right without stating a setting: 'set the altimeter', 'set \
+         altimeter to current', 'altimeter to field', 'give me the local altimeter', \
+         'correct the altimeter', 'set the local QNH', 'update the altimeter'. For an \
+         explicit value ('altimeter two niner niner two') use set_barometer instead."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+
+    async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        // The sim's ambient sea-level pressure (QNH) is the "correct" setting — with
+        // it dialled in, the altimeter reads true MSL/field elevation.
+        let pa = ctx.xplane.get_float(crate::datarefs::QNH_PASCALS).await?;
+        let inhg = (pa / PA_PER_INHG).clamp(28.0, 31.5);
+        ctx.xplane.set_float(BARO, inhg).await?;
+        let actual = ctx.xplane.get_float(BARO).await?;
+        Ok(format!("Roger, altimeter set to the local {actual:.2}."))
     }
 }
 

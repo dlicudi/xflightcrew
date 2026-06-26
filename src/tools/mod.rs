@@ -150,6 +150,7 @@ impl Registry {
 
         if profile.barometer {
             tools.push(Box::new(instruments::SetBarometer));
+            tools.push(Box::new(instruments::SetAltimeterCurrent));
         }
 
         if profile.directional_gyro {
