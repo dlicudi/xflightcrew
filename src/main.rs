@@ -364,11 +364,11 @@ async fn run_session(
         // "taxi and nav lights on" makes two) or ANSWER a question in prose — a
         // polite "could you start the engines?" acts; "what's our heading?"
         // answers. A live state snapshot grounds both ("a bit more flaps", "how
-        // high are we?").
+        // high are we?") — but only the LLM and the correction path read it, never
+        // the fast-path, so it's computed lazily below: the common fast-path
+        // command pays nothing for the burst of X-Plane reads it never uses.
         reporter.status(ui::Phase::Thinking);
-        let t = Instant::now();
-        let state = state_snapshot(&xplane, &profile).await;
-        tracing::info!(ms = t.elapsed().as_millis(), state = state.as_deref().unwrap_or("(none)"), "state snapshot");
+        let mut state: Option<String> = None;
 
         // Deterministic fast-path: resolve the common, regular commands with no
         // LLM at all — no GPU burst, no latency, and it can't pick the wrong tool.
@@ -386,9 +386,14 @@ async fn run_session(
             tracing::info!(path = "fast", tool = c.first().map(|x| x.name.as_str()).unwrap_or(""), "command path");
             c
         } else {
+            // Fast-path missed — now the LLM needs live state.
+            let ts = Instant::now();
+            let snap = state_snapshot(&xplane, &profile).await;
+            tracing::info!(ms = ts.elapsed().as_millis(), state = snap.as_deref().unwrap_or("(none)"), "state snapshot");
             let t = Instant::now();
-            let decision = llm.act_or_answer(&command, &specs, &ctx_history, state.as_deref()).await;
+            let decision = llm.act_or_answer(&command, &specs, &ctx_history, snap.as_deref()).await;
             tracing::info!(ms = t.elapsed().as_millis(), path = "llm", "command path");
+            state = snap; // reuse for the correction path if it confirms
             match decision {
                 Ok(Decision::Act(calls)) => calls,
                 Ok(Decision::Reply(text)) => {
@@ -463,6 +468,11 @@ async fn run_session(
                     Some(correction) => {
                         reporter.log(ui::LogKind::Info, format!("correction: \"{correction}\""));
                         reporter.status(ui::Phase::Thinking);
+                        // A fast-path command never took the snapshot — take it now
+                        // so the correction is grounded in live state.
+                        if state.is_none() {
+                            state = state_snapshot(&xplane, &profile).await;
+                        }
                         match llm.choose_tool(&format!("{command}, {correction}"), &specs, &ctx_history, state.as_deref()).await {
                             Ok(mut cs) if !cs.is_empty() => {
                                 call = cs.remove(0);
