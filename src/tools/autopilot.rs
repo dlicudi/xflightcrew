@@ -122,24 +122,24 @@ async fn fly_to(ctx: &ToolCtx<'_>, altitude: f64, rate: f64) -> Result<(&'static
         ("Holding at", 0.0)
     } else {
         // CLIMB or DESCENT. Arm the target in the altitude window and fly to it in
-        // VS mode — VS is the only *active* pitch mode; the window arms ALT capture
-        // on its own and levels off when reached. Do NOT engage `altitude_hold`
-        // here: that holds the CURRENT altitude and cancels the climb (the bug that
-        // left the aircraft accelerating in level flight at full power). Set the VS
-        // dial LAST — engaging VS snaps the dial to the live rate, so our target
-        // must be written after.
+        // VS mode — VS is the only *active* pitch mode. Do NOT engage `altitude_hold`
+        // *now*: at the current altitude it would hold here and cancel the climb.
+        // Set the VS dial LAST — engaging VS snaps the dial to the live rate, so our
+        // target must be written after. The stock 172 AP does NOT reliably capture
+        // the preselected altitude from VS mode, so a watcher levels us off when we
+        // reach it (and eases the climb throttle back). Set the VS dial LAST.
         let signed = if diff > 0.0 { rate.abs() } else { -rate.abs() };
         ctx.xplane.set_float(ALT_DIAL, altitude).await?;
         engage_mode(ctx, VS_STATUS, CMD_VS_MODE).await?;
         ctx.xplane.set_float(VS_DIAL, signed).await?;
         // A climb needs power — the AP pitches up to hold VS, and on cruise power a
-        // 172 just bleeds airspeed. Full throttle for the climb, then a watcher
-        // eases it back to cruise once we level off. (Autothrottle will replace
-        // this once we've confirmed the climb itself works.)
-        if signed > 0.0 {
+        // 172 just bleeds airspeed. Full throttle for the climb; the watcher eases
+        // it back to cruise at capture. (Autothrottle will replace this later.)
+        let climb = signed > 0.0;
+        if climb {
             let _ = ctx.xplane.set_float(THROTTLE_ALL, 1.0).await;
-            ease_power_at_capture(ctx.config.xplane_base_url.clone(), altitude);
         }
+        capture_at_altitude(ctx.config.xplane_base_url.clone(), altitude, climb);
         (if diff > 0.0 { "Climbing to" } else { "Descending to" }, signed)
     };
 
@@ -162,58 +162,71 @@ async fn fly_to(ctx: &ToolCtx<'_>, altitude: f64, rate: f64) -> Result<(&'static
     Ok((movement, servos_engaged(ctx).await?))
 }
 
-/// Generation stamp for climb watchers. Each new climb bumps this; a watcher
-/// stands down as soon as it sees a newer generation, so at most one watcher is
-/// ever live no matter how many climbs are commanded in quick succession (the
-/// `ALT_DIAL` stand-down only catches a *different* target — two climbs to the
+/// Generation stamp for capture watchers. Each climb/descent bumps this; a watcher
+/// stands down as soon as it sees a newer generation, so at most one is ever live
+/// no matter how many altitude changes are commanded in quick succession (the
+/// `ALT_DIAL` stand-down only catches a *different* target — two commands to the
 /// same altitude, or a re-command, would otherwise stack independent watchers).
 static CLIMB_WATCHER_GEN: AtomicU64 = AtomicU64::new(0);
 
-/// After a full-power climb the AP levels at the target on its own but leaves the
-/// throttle on the stop — so the aircraft accelerates instead of settling. Spawn
-/// a one-shot watcher (own thread + runtime + client, like the dashboard poller —
-/// the session runs a current-thread runtime that's blocked on the audio listener
-/// between commands, so a `tokio::spawn` task would be starved; the watcher needs
-/// to poll independently) that waits for the capture, then eases the throttle to
-/// cruise — what a copilot does once established. Self-terminating and guarded: it
-/// stands down without touching the throttle if a newer climb supersedes it, if
-/// the selector dial moves off `target`, or if the pilot has taken manual
-/// throttle. Fire-and-forget; a dropped poll just means the next tick retries.
-fn ease_power_at_capture(base: String, target: f64) {
+/// Fly the AP to a selected altitude in VS mode, then **level off** there.
+///
+/// The stock 172 AP does not reliably capture the preselected altitude from VS
+/// mode on its own, so the copilot does it: a one-shot watcher polls until the
+/// aircraft reaches `target`, then engages ALT hold (idempotently — a no-op if the
+/// AP already captured) so it holds instead of flying straight through. For a
+/// `was_climb` it also eases the firewalled throttle back to cruise.
+///
+/// Own thread + runtime + client (like the dashboard poller): the session runs a
+/// current-thread runtime blocked on the audio listener between commands, so a
+/// `tokio::spawn` task would be starved — the watcher must poll independently.
+/// Self-terminating and guarded: it stands down without touching anything if a
+/// newer command supersedes it (generation), if the selector dial moves off
+/// `target` (pilot re-commanded), and it won't override a throttle the pilot has
+/// taken manually. Fire-and-forget; a dropped poll just retries next tick.
+fn capture_at_altitude(base: String, target: f64, was_climb: bool) {
     let my_gen = CLIMB_WATCHER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
         rt.block_on(async move {
             let xp = XPlaneClient::new(base);
-            // 400 ticks × 3 s ≈ 20 min — even a long climb at 300 fpm finishes
-            // well inside this; if it doesn't, we simply stop watching.
+            // 400 ticks × 3 s ≈ 20 min — even a long change at 300 fpm finishes well
+            // inside this; if it doesn't, we simply stop watching.
             for _ in 0..400 {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                // A newer climb was commanded — it owns the throttle now. Stand
-                // down so we don't ease back a climb that isn't ours.
+                // A newer command was issued — it owns the level-off now.
                 if CLIMB_WATCHER_GEN.load(Ordering::SeqCst) != my_gen {
                     return;
                 }
                 // Pilot changed plans? The selected altitude is no longer ours —
-                // stand down so we don't throttle back the new climb.
+                // stand down so we don't level off / throttle back the new command.
                 match xp.get_float(ALT_DIAL).await {
                     Ok(dial) if (dial - target).abs() > ALT_CAPTURE_BAND_FT => return,
                     Ok(_) => {}
                     Err(_) => continue, // transient; try again next tick
                 }
-                // Captured? Ease to cruise and we're done — but only if the throttle
-                // is still where we left it (full). If the pilot has taken manual
-                // throttle mid-climb (e.g. "throttle 80 percent", which doesn't move
-                // the altitude dial so the stand-down above never fires), it now
-                // reads below the firewall floor — leave it alone rather than
-                // silently overriding their setting back to cruise.
+                // Reached the target band? Level off and we're done.
                 if let Ok(alt) = xp.get_float(CURRENT_ALT).await {
                     if (alt - target).abs() <= ALT_CAPTURE_BAND_FT {
-                        match xp.get_float(THROTTLE_ALL).await {
-                            Ok(thr) if thr >= FIREWALL_HANDBACK_FLOOR => {
-                                let _ = xp.set_float(THROTTLE_ALL, CRUISE_THROTTLE).await;
+                        // Engage ALT hold so the AP holds here instead of flying
+                        // through in VS. Idempotent (the command is a toggle): if the
+                        // AP already captured on its own, leave it engaged.
+                        let held = xp.get_float(ALT_HOLD_STATUS).await.map(|v| v > 0.5).unwrap_or(false);
+                        if !held {
+                            let _ = xp.run_command(CMD_ALT_HOLD).await;
+                        }
+                        // Ease a firewalled climb back to cruise — but only if the
+                        // throttle is still where we left it (full). If the pilot took
+                        // manual throttle mid-climb (which doesn't move the alt dial,
+                        // so the stand-down above never fired), it now reads below the
+                        // floor — leave it rather than overriding their setting.
+                        if was_climb {
+                            match xp.get_float(THROTTLE_ALL).await {
+                                Ok(thr) if thr >= FIREWALL_HANDBACK_FLOOR => {
+                                    let _ = xp.set_float(THROTTLE_ALL, CRUISE_THROTTLE).await;
+                                }
+                                _ => {} // pilot took manual throttle — don't touch it
                             }
-                            _ => {} // pilot took manual throttle — don't touch it
                         }
                         return;
                     }
