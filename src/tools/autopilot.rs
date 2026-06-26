@@ -100,15 +100,79 @@ async fn engage_mode(ctx: &ToolCtx<'_>, status: &str, command: &str) -> Result<(
 /// managing power, so a high commanded VS just bleeds airspeed. 300 is safe for
 /// both climb and descent; say an explicit rate ("climb to X at 700") for more.
 const DEFAULT_VS_FPM: f64 = 300.0;
+/// Max climb rate (fpm) the 172 sustains at full power without bleeding airspeed —
+/// the cap when auto-scaling the rate to the altitude change. (Per-airframe later.)
+const MAX_CLIMB_FPM: f64 = 700.0;
+/// Max auto descent rate (fpm) commanded for an altitude change — gentle enough
+/// not to build speed toward Vne without active power management. (Per-airframe.)
+const MAX_DESCENT_FPM: f64 = 1000.0;
+/// Altitude targets above this (ft MSL) are refused — above the airframe's
+/// service ceiling it can't get there. (Per-airframe later; 172 ≈ 14,000.)
+const SERVICE_CEILING_FT: f64 = 14_000.0;
+/// Minimum height above the terrain below (ft) an altitude target may be. Replaces
+/// a fixed MSL floor, which is meaningless at a high-elevation airport.
+const MIN_TARGET_AGL_FT: f64 = 500.0;
+/// Feet per meter — `y_agl` is metres.
+const METERS_TO_FEET: f64 = 3.280_84;
 /// Within this many feet of the target, treat it as "hold here" (no climb).
 const ALT_CAPTURE_BAND_FT: f64 = 100.0;
+
+/// Vertical speed (fpm, magnitude) for an altitude change of `delta_ft`: scaled so
+/// any change captures in roughly three minutes, floored at the gentle default so
+/// small steps aren't sluggish, and capped at the airframe's sustainable rate for
+/// the direction so a commanded climb never outruns the available power.
+fn auto_vs_fpm(delta_ft: f64, climb: bool) -> f64 {
+    let cap = if climb { MAX_CLIMB_FPM } else { MAX_DESCENT_FPM };
+    (delta_ft.abs() / 3.0).clamp(DEFAULT_VS_FPM, cap)
+}
+
+/// The lowest safe target altitude (ft MSL): the terrain below plus a margin.
+/// `agl_m` is height above ground in metres, `current_msl` the current altitude.
+fn terrain_floor_ft(current_msl: f64, agl_m: f64) -> f64 {
+    let ground = current_msl - agl_m * METERS_TO_FEET;
+    ground + MIN_TARGET_AGL_FT
+}
+
+/// Reject an altitude target that's above the ceiling or into the terrain. Returns
+/// `Some(refusal)` to speak back, or `None` if the target is safe to fly to. Fails
+/// safe: if the terrain read is unavailable, falls back to the fixed MSL floor.
+async fn reject_unsafe_target(ctx: &ToolCtx<'_>, target: f64) -> Option<String> {
+    if target > SERVICE_CEILING_FT {
+        return Some(format!(
+            "Negative — {target:.0} feet is above this aircraft's service ceiling. \
+             Say something at or below {SERVICE_CEILING_FT:.0}."
+        ));
+    }
+    let agl = ctx.xplane.get_float(crate::datarefs::AGL_METERS).await.ok();
+    let current = ctx.xplane.get_float(CURRENT_ALT).await.ok();
+    match (agl, current) {
+        (Some(agl_m), Some(current_msl)) => {
+            let floor = terrain_floor_ft(current_msl, agl_m);
+            if target < floor {
+                let ground = current_msl - agl_m * METERS_TO_FEET;
+                return Some(format!(
+                    "Negative — {target:.0} feet is into the terrain; the ground here is about \
+                     {ground:.0} feet. Say a higher altitude, or 'level off' to hold this one."
+                ));
+            }
+            None
+        }
+        // Terrain unknown — fall back to the fixed floor so we never fly blind low.
+        _ if target < MIN_AP_ALTITUDE_FT => Some(format!(
+            "Negative — {target:.0} feet is too low for an altitude hold. Say a target like \
+             five thousand, or 'level off' to hold your current altitude."
+        )),
+        _ => None,
+    }
+}
 
 /// Fly the autopilot to `altitude` at `rate` fpm and let it capture/level off.
 /// On this airframe ALT hold alone won't *change* altitude — you must arm the
 /// target AND command a vertical speed, so this sets both. Direction is inferred
 /// from current altitude. Returns ("Climbing to" | "Descending to" | "Holding at",
-/// servos_engaged).
-async fn fly_to(ctx: &ToolCtx<'_>, altitude: f64, rate: f64) -> Result<(&'static str, bool)> {
+/// commanded_fpm_magnitude, servos_engaged).
+/// `rate` is the magnitude in fpm; `None` auto-scales it to the altitude change.
+async fn fly_to(ctx: &ToolCtx<'_>, altitude: f64, rate: Option<f64>) -> Result<(&'static str, f64, bool)> {
     let current = ctx.xplane.get_float(CURRENT_ALT).await.unwrap_or(altitude);
     let diff = altitude - current;
     ctx.xplane.run_command(CMD_SERVOS_ON).await?;
@@ -128,14 +192,17 @@ async fn fly_to(ctx: &ToolCtx<'_>, altitude: f64, rate: f64) -> Result<(&'static
         // target must be written after. The stock 172 AP does NOT reliably capture
         // the preselected altitude from VS mode, so a watcher levels us off when we
         // reach it (and eases the climb throttle back). Set the VS dial LAST.
-        let signed = if diff > 0.0 { rate.abs() } else { -rate.abs() };
+        let climb = diff > 0.0;
+        // Explicit rate (set_climb) is used as given; an absent rate (set_altitude)
+        // scales to the change so a big climb isn't a 30-minute crawl at 300 fpm.
+        let mag = rate.map(f64::abs).unwrap_or_else(|| auto_vs_fpm(diff, climb));
+        let signed = if climb { mag } else { -mag };
         ctx.xplane.set_float(ALT_DIAL, altitude).await?;
         engage_mode(ctx, VS_STATUS, CMD_VS_MODE).await?;
         ctx.xplane.set_float(VS_DIAL, signed).await?;
         // A climb needs power — the AP pitches up to hold VS, and on cruise power a
         // 172 just bleeds airspeed. Full throttle for the climb; the watcher eases
         // it back to cruise at capture. (Autothrottle will replace this later.)
-        let climb = signed > 0.0;
         if climb {
             let _ = ctx.xplane.set_float(THROTTLE_ALL, 1.0).await;
         }
@@ -159,7 +226,7 @@ async fn fly_to(ctx: &ToolCtx<'_>, altitude: f64, rate: f64) -> Result<(&'static
         target_alt = altitude,
         "fly_to latched"
     );
-    Ok((movement, servos_engaged(ctx).await?))
+    Ok((movement, signed.abs(), servos_engaged(ctx).await?))
 }
 
 /// Generation stamp for capture watchers. Each climb/descent bumps this; a watcher
@@ -350,19 +417,17 @@ impl Tool for SetAltitude {
         let args: AltArgs = serde_json::from_value(args.clone())?;
         let altitude = args.altitude.max(0.0);
 
-        // Safety gate: refuse an absurdly-low target rather than fly the aircraft
-        // toward the ground. "auto level" with no number lands here as 0 feet —
-        // refuse and point at the right tool.
-        if altitude < MIN_AP_ALTITUDE_FT {
-            return Ok(format!(
-                "Negative — {altitude:.0} feet is too low for an altitude hold. Say a target like \
-                 five thousand, or 'level off' to hold your current altitude."
-            ));
+        // Safety gate: refuse a target into the terrain or above the ceiling rather
+        // than fly the aircraft toward the ground. "auto level" with no number lands
+        // here as 0 feet — refused, and pointed at the right tool.
+        if let Some(refusal) = reject_unsafe_target(ctx, altitude).await {
+            return Ok(refusal);
         }
 
         // Fly to it: arm the altitude AND command a vertical speed (ALT hold alone
-        // won't change altitude on this AP), then let the AP capture and level off.
-        let (movement, engaged) = fly_to(ctx, altitude, DEFAULT_VS_FPM).await?;
+        // won't change altitude on this AP), at a rate scaled to the change, then
+        // capture and level off.
+        let (movement, _fpm, engaged) = fly_to(ctx, altitude, None).await?;
         // fly_to firewalls the throttle on a climb; say so.
         let power = if movement.starts_with("Climbing") { "full power, " } else { "" };
         if engaged {
@@ -552,25 +617,19 @@ impl Tool for SetClimb {
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: ClimbArgs = serde_json::from_value(args.clone())?;
         let altitude = args.altitude.max(0.0);
-        if altitude < MIN_AP_ALTITUDE_FT {
-            return Ok(format!(
-                "Negative — {altitude:.0} feet is too low for an altitude hold. Say a target like \
-                 five thousand."
-            ));
+        if let Some(refusal) = reject_unsafe_target(ctx, altitude).await {
+            return Ok(refusal);
         }
         // A zero (or near-zero) rate would arm the target but command VS 0 and skip
         // the climb power firewall — a silent no-op that still reads back "climbing."
         // The schema permits fpm 0, so treat anything under 1 fpm as "unspecified"
-        // and use the default rate, the same as a plain set_altitude.
-        let rate = match args.fpm.abs() {
-            r if r >= 1.0 => r.min(2000.0),
-            _ => DEFAULT_VS_FPM,
-        };
-        let (movement, engaged) = fly_to(ctx, altitude, rate).await?;
+        // and auto-scale the rate, the same as a plain set_altitude.
+        let rate = (args.fpm.abs() >= 1.0).then(|| args.fpm.abs().min(2000.0));
+        let (movement, fpm, engaged) = fly_to(ctx, altitude, rate).await?;
         let power = if movement.starts_with("Climbing") { "full power, " } else { "" };
         if engaged {
             Ok(format!(
-                "Roger — {power}{} {altitude:.0} feet at {rate:.0} feet per minute, leveling off there.",
+                "Roger — {power}{} {altitude:.0} feet at {fpm:.0} feet per minute, leveling off there.",
                 movement.to_lowercase()
             ))
         } else {
@@ -623,5 +682,34 @@ fn describe_vs(fpm: f64) -> String {
         format!("climb {mag:.0} feet per minute")
     } else {
         format!("descend {mag:.0} feet per minute")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_rate_scales_with_the_change_and_is_bounded() {
+        // Small step → the gentle default floor, not sluggish.
+        assert_eq!(auto_vs_fpm(300.0, true), DEFAULT_VS_FPM);
+        // Mid change → scaled (≈ delta / 3).
+        assert_eq!(auto_vs_fpm(1500.0, true), 500.0);
+        // Big climb → capped at the airframe's sustainable climb rate, so it can't
+        // outrun the available power.
+        assert_eq!(auto_vs_fpm(9000.0, true), MAX_CLIMB_FPM);
+        // Descents get their own (higher) cap.
+        assert_eq!(auto_vs_fpm(9000.0, false), MAX_DESCENT_FPM);
+        // Direction is by magnitude — sign of the delta doesn't matter here.
+        assert_eq!(auto_vs_fpm(-1500.0, false), 500.0);
+    }
+
+    #[test]
+    fn terrain_floor_is_ground_relative() {
+        // At a sea-level field (current 0, agl 0) the floor is just the margin.
+        assert_eq!(terrain_floor_ft(0.0, 0.0), MIN_TARGET_AGL_FT);
+        // Flying at 8000 ft MSL with 3000 ft AGL → ground ≈ 5000 ft, floor ≈ 5500.
+        let floor = terrain_floor_ft(8000.0, 3000.0 / METERS_TO_FEET);
+        assert!((floor - (5000.0 + MIN_TARGET_AGL_FT)).abs() < 1.0, "floor was {floor}");
     }
 }

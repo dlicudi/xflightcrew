@@ -16,6 +16,8 @@ pub const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
 // --- Airframe state ---
 pub const GEAR_HANDLE_DOWN: &str = "sim/cockpit2/controls/gear_handle_down";
 pub const ON_GROUND_ANY: &str = "sim/flightmodel/failures/onground_any";
+/// Height above the terrain directly below, in METERS (× 3.28084 for feet).
+pub const AGL_METERS: &str = "sim/flightmodel/position/y_agl";
 /// Total fuel mass. X-Plane reports this in kilograms regardless of airframe.
 pub const FUEL_TOTAL_KG: &str = "sim/flightmodel/weight/m_fuel_total";
 
