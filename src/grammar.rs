@@ -3,9 +3,12 @@
 //! The bulk of real commands are regular — `<subject> <number>`, `<system>
 //! on/off`, `flaps <detent>`, and a handful of fixed verbs (log-mined from actual
 //! usage: ~80%). This parses those straight to tool calls with **no LLM** — no
-//! GPU burst, no latency, and it physically can't act on a question or pick the
-//! wrong tool. Anything it can't confidently match (compound, relative, fuzzy,
-//! novel) returns `None`, and the caller falls back to the LLM.
+//! GPU burst, no latency, and it can't pick the wrong tool. Anything it can't
+//! confidently match (compound, relative, fuzzy, novel) returns `None`, and the
+//! caller falls back to the LLM. Note this matches on shape, not intent: a
+//! question like "is our heading 270?" has the same keyword+number form as a
+//! command, so the caller must withhold questions from the fast-path (the LLM
+//! arbitrates act-vs-answer) before calling in.
 //!
 //! Every candidate is **validated against the live tool schema** before use, so a
 //! value this airframe doesn't support (e.g. a flap detent it lacks) fails closed

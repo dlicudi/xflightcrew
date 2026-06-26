@@ -371,11 +371,18 @@ async fn run_session(
         tracing::info!(ms = t.elapsed().as_millis(), state = state.as_deref().unwrap_or("(none)"), "state snapshot");
 
         // Deterministic fast-path: resolve the common, regular commands with no
-        // LLM at all — no GPU burst, no latency, and it can't act on a question
-        // or pick the wrong tool. Anything it can't confidently parse falls
-        // through to the LLM. `path` is logged so `x-copilot analyze` can mine the
-        // LLM-fallback tail for new phrasings to promote into the grammar.
-        let calls = if let Some(c) = grammar::try_parse(&command, &registry, &profile) {
+        // LLM at all — no GPU burst, no latency, and it can't pick the wrong tool.
+        // Anything it can't confidently parse falls through to the LLM. Questions
+        // are held back from the fast-path entirely ("is our heading 270?" shares
+        // the keyword+number shape of a command, so the grammar would *act* on it);
+        // they go to the LLM, which arbitrates act-vs-answer. `path` is logged so
+        // `x-copilot analyze` can mine the LLM-fallback tail for new phrasings.
+        let fast = if looks_like_question(&command) {
+            None
+        } else {
+            grammar::try_parse(&command, &registry, &profile)
+        };
+        let calls = if let Some(c) = fast {
             tracing::info!(path = "fast", tool = c.first().map(|x| x.name.as_str()).unwrap_or(""), "command path");
             c
         } else {
@@ -1391,6 +1398,10 @@ mod tests {
             "how much fuel do we have", "what's our heading", "what is our altitude?",
             "are we configured for landing", "how high are we", "tell me the airspeed",
             "do we have enough fuel to make it?", "where are we",
+            // Keyword+number questions: same shape as a command, so they must be
+            // caught here and withheld from the grammar fast-path (which would
+            // otherwise *act* on them) — see the fast-path gate in run_session.
+            "is the heading 270?", "did we set flaps to ten?",
         ] {
             assert!(looks_like_question(q), "{q:?} should be a question");
         }
