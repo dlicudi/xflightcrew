@@ -70,8 +70,27 @@ impl Stt {
         self.prompt = prompt;
     }
 
-    /// Transcribe 16 kHz mono f32 audio to text plus a confidence score.
+    /// Transcribe 16 kHz mono f32 audio to text plus a confidence score, applying
+    /// the command-loop domain fixes (mishear repair + digit-run normalization) so
+    /// the real keyword/number reaches the gate. Use [`transcribe_verbatim`] for
+    /// callers that need the literal words (e.g. voice-clone captioning).
     pub fn transcribe(&self, audio: &[f32]) -> Result<Transcription> {
+        let t = self.transcribe_verbatim(audio)?;
+        if t.text.is_empty() {
+            return Ok(t);
+        }
+        // Repair whole-word mishears the bias prompt can't prevent ("gyro" →
+        // "J-Rule"), then normalize spoken digit runs ("two seven zero" → "270").
+        // Both run before the domain gate so the real keyword reaches it.
+        let text = crate::phrase::fix_mishears(&t.text);
+        let text = crate::phrase::normalize_numbers(&text);
+        Ok(Transcription { text, ..t })
+    }
+
+    /// Transcribe to the literal words whisper heard — no domain normalization.
+    /// The captioning path needs this: a voice-clone reference text must match the
+    /// audio's actual phonemes, so "two seven zero" must stay words, not "270".
+    pub fn transcribe_verbatim(&self, audio: &[f32]) -> Result<Transcription> {
         let started = std::time::Instant::now();
         let mut state = self.ctx.create_state().context("creating whisper state")?;
 
@@ -126,11 +145,6 @@ impl Stt {
             audio_s = format!("{:.1}", audio.len() as f32 / 16_000.0),
             "stt"
         );
-        // Repair whole-word mishears the bias prompt can't prevent ("gyro" →
-        // "J-Rule"), then normalize spoken digit runs ("two seven zero" → "270").
-        // Both run before the domain gate so the real keyword reaches it.
-        let text = crate::phrase::fix_mishears(&text);
-        let text = crate::phrase::normalize_numbers(&text);
         Ok(Transcription { text, confidence })
     }
 }

@@ -725,7 +725,10 @@ fn transcribe_file(model_path: &str, input: &str) -> Result<String> {
         .map_err(|e| anyhow!("decoding samples: {e}"))?;
     // Offline one-shot — GPU is fine here (not competing with the sim loop).
     let stt = Stt::load(model_path, true)?;
-    Ok(stt.transcribe(&samples)?.text.trim().to_string())
+    // Verbatim: a voice-clone reference caption must match the audio's actual
+    // words, so don't apply the command-loop's digit/mishear normalization
+    // ("two seven zero" must stay words, not become "270").
+    Ok(stt.transcribe_verbatim(&samples)?.text.trim().to_string())
 }
 
 /// Mine the logs for fast-path coverage and the LLM-fallback tail. Pairs each
