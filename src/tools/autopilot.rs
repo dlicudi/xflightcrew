@@ -28,7 +28,7 @@ const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 /// verified against the rustdecks SR22 deck, which reads/writes VS here.
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 /// Servo engagement status (read-only; 1 = autopilot flying).
-const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";
+const SERVOS_ON: &str = crate::datarefs::SERVOS_ON;
 /// Command: disconnect the autopilot. The stock 172's S-TEC-style AP has no
 /// master switch and does not register `sim/autopilot/servos_off`. X-Plane
 /// exposes `servos_off_any` ("disco servos, whichever side is active") and the
@@ -43,7 +43,7 @@ const CMD_ALT_HOLD: &str = "sim/autopilot/altitude_hold";
 /// Command: wings-level / roll hold — for "auto level" / "straight and level".
 const CMD_WING_LEVELER: &str = "sim/autopilot/wing_leveler";
 /// Current indicated altitude (feet), read to capture "hold this altitude".
-const CURRENT_ALT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot";
+const CURRENT_ALT: &str = crate::datarefs::ALTITUDE_FT;
 /// Autopilot altitude targets below this (feet MSL) are refused — a 172's AP is
 /// never commanded this low, so it's almost always a misheard/empty value (e.g.
 /// "auto level" misread as altitude 0). The gate catches it before the AP flies
@@ -67,7 +67,7 @@ const FIREWALL_HANDBACK_FLOOR: f64 = 0.9;
 /// Mode status datarefs (0 = off, >0 = armed/engaged). Read before pressing a
 /// mode command, because the `sim/autopilot/*` mode commands are TOGGLES: firing
 /// one while its mode is already active switches it back OFF.
-const HEADING_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
+const HEADING_STATUS: &str = crate::datarefs::HEADING_STATUS;
 const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
 const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
 /// Descents steeper than this (fpm) are confirmed — anything shallower, and all
