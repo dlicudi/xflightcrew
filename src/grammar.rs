@@ -125,10 +125,36 @@ fn is_compound(t: &str) -> bool {
     false
 }
 
-/// First decimal number (for the altimeter, e.g. 29.92).
-fn first_float(t: &str) -> Option<f64> {
-    t.split(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .find_map(|w| if w.contains('.') { w.parse::<f64>().ok() } else { None })
+/// Parse a spoken/normalized altimeter setting to inches of mercury. Handles the
+/// three forms that occur after number-normalization (which only inserts a decimal
+/// for an explicit "point", so "two niner niner two" arrives as "2992"):
+///   - a decimal inHg ("29.92", "30.15") — used as-is;
+///   - a bare 4-digit inHg×100 ("two niner niner two" → "2992" → 29.92);
+///   - a 3–4 digit hPa/QNH ("set QNH one zero one three" → "1013" → 29.91 inHg).
+///
+/// The inHg×100 (2800–3150) and hPa (950–1100) ranges don't overlap, so a bare
+/// integer is unambiguous. Returns None if no token looks like a setting.
+fn altimeter_inhg(t: &str) -> Option<f64> {
+    /// hPa per inHg (1013.25 hPa ≈ 29.92 inHg).
+    const HPA_PER_INHG: f64 = 33.8639;
+    for w in t.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        if w.is_empty() {
+            continue;
+        }
+        if w.contains('.') {
+            if let Ok(f) = w.parse::<f64>() {
+                return Some(f); // already inHg, e.g. 29.92
+            }
+        } else if let Ok(n) = w.parse::<i64>() {
+            if (2800..=3150).contains(&n) {
+                return Some(n as f64 / 100.0); // inHg×100, e.g. 2992 → 29.92
+            }
+            if (950..=1100).contains(&n) {
+                return Some(n as f64 / HPA_PER_INHG); // hPa/QNH → inHg
+            }
+        }
+    }
+    None
 }
 
 /// Whole-word membership (so "on" doesn't match inside "engine").
@@ -396,9 +422,9 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     }
 
     // altimeter / barometer
-    if has(t, "altimeter") || has(t, "barometer") || has(t, "baro") {
-        if let Some(f) = first_float(t) {
-            return Some(call("set_barometer", json!({ "inhg": f })));
+    if has(t, "altimeter") || has(t, "barometer") || has(t, "baro") || has(t, "qnh") {
+        if let Some(inhg) = altimeter_inhg(t) {
+            return Some(call("set_barometer", json!({ "inhg": inhg })));
         }
     }
 
@@ -479,6 +505,24 @@ mod tests {
         assert_eq!(one("level off").unwrap().0, "level_off");
         assert_eq!(one("autopilot off").unwrap().0, "autopilot_off");
         assert_eq!(one("parking brake set").unwrap(), ("set_parking_brake".into(), json!({"on":true})));
+    }
+
+    #[test]
+    fn altimeter_accepts_digit_runs_and_hpa() {
+        // Input is post-normalization, which only inserts a decimal for a spoken
+        // "point" — so "set altimeter two niner niner two" arrives as "2992".
+        let inhg = |t: &str| -> f64 {
+            let (name, args) = one(t).unwrap_or_else(|| panic!("no parse: {t:?}"));
+            assert_eq!(name, "set_barometer", "{t:?}");
+            args["inhg"].as_f64().expect("inhg is a number")
+        };
+        assert!((inhg("set altimeter 2992") - 29.92).abs() < 0.005); // digit run
+        assert!((inhg("altimeter 29.92") - 29.92).abs() < 0.005); // explicit decimal
+        assert!((inhg("set baro 3010") - 30.10).abs() < 0.005); // 4-digit inHg×100
+        assert!((inhg("set qnh 1013") - 29.91).abs() < 0.02); // hPa/QNH → inHg
+        // A bare integer outside both the inHg and hPa ranges isn't a setting —
+        // fall back to the LLM rather than write garbage.
+        assert!(one("set altimeter 50").is_none());
     }
 
     #[test]
