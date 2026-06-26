@@ -379,19 +379,26 @@ impl Llm {
             })
             .collect();
 
-        // system, then live state (if any), then recent turns, then the utterance.
+        // Order matters for latency. The system prompt + tool schemas are a stable
+        // ~3k-token prefix; Ollama keeps it in the KV cache across calls (prefill
+        // drops from ~3.4s to ~0.2s on a hit). The live state, though, *changes
+        // every command in flight* (altitude/heading/VS tick constantly) — so a
+        // state message placed early in the prompt busts the cache for the whole
+        // prefix and forces a full re-prefill every time (the bulk of the per-
+        // command latency). We therefore keep [system, history...] stable and fold
+        // the volatile state into the *current* user turn (last position), where it
+        // only re-prefills its own ~60 tokens. History turns are stored without
+        // state, so they stay byte-identical and cacheable as new turns append.
         let mut messages = vec![json!({ "role": "system", "content": system })];
-        if let Some(state) = state {
-            messages.push(json!({
-                "role": "system",
-                "content": format!("Current aircraft state: {state}."),
-            }));
-        }
         for (user, assistant) in history {
             messages.push(json!({ "role": "user", "content": user }));
             messages.push(json!({ "role": "assistant", "content": assistant }));
         }
-        messages.push(json!({ "role": "user", "content": transcript }));
+        let user_content = match state {
+            Some(state) => format!("{transcript}\n\n(current aircraft state: {state})"),
+            None => transcript.to_string(),
+        };
+        messages.push(json!({ "role": "user", "content": user_content }));
 
         let mut options = json!({
             "temperature": temperature,
