@@ -496,7 +496,10 @@ async fn run_session(
                     "Something went wrong actioning that.".to_string()
                 }
             };
-            say(&voice, &reporter, ui::LogKind::Readback, &readback);
+            // Vary the acknowledgment on affirmative readbacks (bare callout most
+            // of the time, "Roger,"/"Copy," occasionally); the canonical readback
+            // is what's recorded for history context.
+            say(&voice, &reporter, ui::LogKind::Readback, &readback::vary_ack(&readback));
             turn_readbacks.push(readback);
         }
 
@@ -893,16 +896,17 @@ fn correction_text(reply: &str) -> Option<String> {
     }
 }
 
-/// Report a line and speak it through the arbiter. Blocks until the line has
-/// been spoken (so the loop doesn't listen over its own voice), setting the
-/// Speaking→Listening status around it.
+/// Report a line and speak it through the arbiter, verbatim. Blocks until the
+/// line has been spoken (so the loop doesn't listen over its own voice), setting
+/// the Speaking→Listening status around it. Acknowledgment variation is NOT
+/// applied here — only curated tool readbacks get that, via [`readback::vary_ack`]
+/// at the call site, so it never touches LLM free-text answers, refusals, or
+/// prompts (an answer that happened to start with "Roger" would lose its first
+/// word otherwise).
 fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
-    // Vary the acknowledgment on affirmative readbacks (bare callout most of the
-    // time, "Roger,"/"Copy," occasionally); non-affirmative lines pass through.
-    let line = readback::vary_ack(line);
     tracing::info!(spoke = %line, "spoke");
     reporter.status(ui::Phase::Speaking);
-    reporter.log(kind, line.clone());
+    reporter.log(kind, line);
     voice.say(Priority::Readback, line);
     reporter.status(ui::Phase::Listening);
 }
