@@ -8,6 +8,8 @@
 //! profiles), so the tool owns them; the aircraft profile only declares that an
 //! autopilot exists.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -56,6 +58,12 @@ const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 /// power for a 172). Not a precise %, just "off the climb stop" so the aircraft
 /// settles at the altitude instead of accelerating at full power.
 const CRUISE_THROTTLE: f64 = 0.65;
+/// The capture watcher only backs off the throttle *it* firewalled to full. If
+/// the pilot has since taken manual throttle (set_throttle writes the same
+/// dataref), it will read below this floor — and the watcher stands down rather
+/// than clobbering the pilot's setting back to cruise. The firewall sets 1.0 and
+/// cruise is 0.65, so a value below 0.9 means a human moved it.
+const FIREWALL_HANDBACK_FLOOR: f64 = 0.9;
 /// Mode status datarefs (0 = off, >0 = armed/engaged). Read before pressing a
 /// mode command, because the `sim/autopilot/*` mode commands are TOGGLES: firing
 /// one while its mode is already active switches it back OFF.
@@ -154,15 +162,25 @@ async fn fly_to(ctx: &ToolCtx<'_>, altitude: f64, rate: f64) -> Result<(&'static
     Ok((movement, servos_engaged(ctx).await?))
 }
 
+/// Generation stamp for climb watchers. Each new climb bumps this; a watcher
+/// stands down as soon as it sees a newer generation, so at most one watcher is
+/// ever live no matter how many climbs are commanded in quick succession (the
+/// `ALT_DIAL` stand-down only catches a *different* target — two climbs to the
+/// same altitude, or a re-command, would otherwise stack independent watchers).
+static CLIMB_WATCHER_GEN: AtomicU64 = AtomicU64::new(0);
+
 /// After a full-power climb the AP levels at the target on its own but leaves the
 /// throttle on the stop — so the aircraft accelerates instead of settling. Spawn
-/// a one-shot watcher (own thread + runtime + client, like the dashboard poller)
-/// that waits for the capture, then eases the throttle to cruise — what a copilot
-/// does once established. Self-terminating and guarded: if the pilot re-commands a
-/// different altitude the selector dial moves off `target`, and the watcher stands
-/// down without touching the throttle, so a *later* climb is never cut to cruise
-/// mid-climb. Fire-and-forget; a dropped poll just means the next tick retries.
+/// a one-shot watcher (own thread + runtime + client, like the dashboard poller —
+/// the session runs a current-thread runtime that's blocked on the audio listener
+/// between commands, so a `tokio::spawn` task would be starved; the watcher needs
+/// to poll independently) that waits for the capture, then eases the throttle to
+/// cruise — what a copilot does once established. Self-terminating and guarded: it
+/// stands down without touching the throttle if a newer climb supersedes it, if
+/// the selector dial moves off `target`, or if the pilot has taken manual
+/// throttle. Fire-and-forget; a dropped poll just means the next tick retries.
 fn ease_power_at_capture(base: String, target: f64) {
+    let my_gen = CLIMB_WATCHER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
         rt.block_on(async move {
@@ -171,6 +189,11 @@ fn ease_power_at_capture(base: String, target: f64) {
             // well inside this; if it doesn't, we simply stop watching.
             for _ in 0..400 {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                // A newer climb was commanded — it owns the throttle now. Stand
+                // down so we don't ease back a climb that isn't ours.
+                if CLIMB_WATCHER_GEN.load(Ordering::SeqCst) != my_gen {
+                    return;
+                }
                 // Pilot changed plans? The selected altitude is no longer ours —
                 // stand down so we don't throttle back the new climb.
                 match xp.get_float(ALT_DIAL).await {
@@ -178,10 +201,20 @@ fn ease_power_at_capture(base: String, target: f64) {
                     Ok(_) => {}
                     Err(_) => continue, // transient; try again next tick
                 }
-                // Captured? Ease to cruise and we're done.
+                // Captured? Ease to cruise and we're done — but only if the throttle
+                // is still where we left it (full). If the pilot has taken manual
+                // throttle mid-climb (e.g. "throttle 80 percent", which doesn't move
+                // the altitude dial so the stand-down above never fires), it now
+                // reads below the firewall floor — leave it alone rather than
+                // silently overriding their setting back to cruise.
                 if let Ok(alt) = xp.get_float(CURRENT_ALT).await {
                     if (alt - target).abs() <= ALT_CAPTURE_BAND_FT {
-                        let _ = xp.set_float(THROTTLE_ALL, CRUISE_THROTTLE).await;
+                        match xp.get_float(THROTTLE_ALL).await {
+                            Ok(thr) if thr >= FIREWALL_HANDBACK_FLOOR => {
+                                let _ = xp.set_float(THROTTLE_ALL, CRUISE_THROTTLE).await;
+                            }
+                            _ => {} // pilot took manual throttle — don't touch it
+                        }
                         return;
                     }
                 }
@@ -512,7 +545,14 @@ impl Tool for SetClimb {
                  five thousand."
             ));
         }
-        let rate = args.fpm.abs().clamp(0.0, 2000.0);
+        // A zero (or near-zero) rate would arm the target but command VS 0 and skip
+        // the climb power firewall — a silent no-op that still reads back "climbing."
+        // The schema permits fpm 0, so treat anything under 1 fpm as "unspecified"
+        // and use the default rate, the same as a plain set_altitude.
+        let rate = match args.fpm.abs() {
+            r if r >= 1.0 => r.min(2000.0),
+            _ => DEFAULT_VS_FPM,
+        };
         let (movement, engaged) = fly_to(ctx, altitude, rate).await?;
         let power = if movement.starts_with("Climbing") { "full power, " } else { "" };
         if engaged {
