@@ -16,6 +16,34 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
+/// Web API requests can transiently fail on a busy sim frame (a timeout, a dropped
+/// connection, a 5xx). Every dataref op here is idempotent — reads, and writes
+/// that set an absolute value — so retrying a couple of times is safe and stops a
+/// single hiccup from failing a trust-critical action (the parking-brake case: one
+/// PATCH failed, the identical retry worked).
+const HTTP_ATTEMPTS: usize = 3;
+const HTTP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// Run an idempotent Web API request, retrying a few times on failure.
+async fn with_retry<T, F, Fut>(op: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < HTTP_ATTEMPTS => {
+                tracing::warn!(attempt, "X-Plane request failed, retrying: {e:#}");
+                tokio::time::sleep(HTTP_RETRY_DELAY).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// The dataref/command surface a tool uses to talk to the simulator. Abstracting
 /// it behind a trait lets the trust-critical tool logic (autopilot capture, safety
 /// gates) be unit-tested against a fake, with no running X-Plane. The live impl is
@@ -95,17 +123,19 @@ impl XPlaneClient {
         }
 
         let url = format!("{}/api/v1/datarefs", self.base);
-        let index: DatarefIndex = self
-            .http
-            .get(&url)
-            .query(&[("filter[name]", name)])
-            .send()
-            .await
-            .with_context(|| format!("GET {url} (is X-Plane running with the Web API enabled?)"))?
-            .error_for_status()?
-            .json()
-            .await
-            .context("decoding dataref index")?;
+        let index: DatarefIndex = with_retry(|| async {
+            self.http
+                .get(&url)
+                .query(&[("filter[name]", name)])
+                .send()
+                .await
+                .with_context(|| format!("GET {url} (is X-Plane running with the Web API enabled?)"))?
+                .error_for_status()?
+                .json()
+                .await
+                .context("decoding dataref index")
+        })
+        .await?;
 
         let id = index
             .data
@@ -122,16 +152,18 @@ impl XPlaneClient {
     pub async fn get_float(&self, name: &str) -> Result<f64> {
         let id = self.dataref_id(name).await?;
         let url = format!("{}/api/v1/datarefs/{}/value", self.base, id);
-        let resp: ValueResponse = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?
-            .error_for_status()?
-            .json()
-            .await
-            .context("decoding dataref value")?;
+        let resp: ValueResponse = with_retry(|| async {
+            self.http
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("GET {url}"))?
+                .error_for_status()?
+                .json()
+                .await
+                .context("decoding dataref value")
+        })
+        .await?;
 
         resp.data
             .as_f64()
@@ -153,14 +185,18 @@ impl XPlaneClient {
     async fn set_value(&self, name: &str, value: serde_json::Value) -> Result<()> {
         let id = self.dataref_id(name).await?;
         let url = format!("{}/api/v1/datarefs/{}/value", self.base, id);
-        self.http
-            .patch(&url)
-            .json(&json!({ "data": value }))
-            .send()
-            .await
-            .with_context(|| format!("PATCH {url}"))?
-            .error_for_status()?;
-        Ok(())
+        let body = json!({ "data": value });
+        with_retry(|| async {
+            self.http
+                .patch(&url)
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| format!("PATCH {url}"))?
+                .error_for_status()?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
     }
 
     /// Resolve a command's numeric id (commands are on the v2 API). The v2
@@ -171,16 +207,18 @@ impl XPlaneClient {
             return Ok(id);
         }
         let url = format!("{}/api/v2/commands", self.base);
-        let index: CommandIndex = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?
-            .error_for_status()?
-            .json()
-            .await
-            .context("decoding command index")?;
+        let index: CommandIndex = with_retry(|| async {
+            self.http
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("GET {url}"))?
+                .error_for_status()?
+                .json()
+                .await
+                .context("decoding command index")
+        })
+        .await?;
 
         let id = index
             .data
@@ -198,16 +236,18 @@ impl XPlaneClient {
     pub async fn get_string(&self, name: &str) -> Result<String> {
         let id = self.dataref_id(name).await?;
         let url = format!("{}/api/v1/datarefs/{}/value", self.base, id);
-        let resp: ValueResponse = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?
-            .error_for_status()?
-            .json()
-            .await
-            .context("decoding string dataref")?;
+        let resp: ValueResponse = with_retry(|| async {
+            self.http
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("GET {url}"))?
+                .error_for_status()?
+                .json()
+                .await
+                .context("decoding string dataref")
+        })
+        .await?;
         let b64 = resp
             .data
             .as_str()
@@ -236,6 +276,9 @@ impl XPlaneClient {
     pub async fn run_command_for(&self, name: &str, duration: f64) -> Result<()> {
         let id = self.command_id(name).await?;
         let url = format!("{}/api/v2/command/{}/activate", self.base, id);
+        // NOT retried: a command can be a toggle (chocks, GPU), so a retry after a
+        // lost response could activate it twice. Absolute-value writes (set_value)
+        // are idempotent and do retry; command activation isn't.
         self.http
             .post(&url)
             .json(&json!({ "duration": duration }))
@@ -250,16 +293,18 @@ impl XPlaneClient {
     pub async fn get_float_array(&self, name: &str) -> Result<Vec<f64>> {
         let id = self.dataref_id(name).await?;
         let url = format!("{}/api/v1/datarefs/{}/value", self.base, id);
-        let resp: ValueResponse = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?
-            .error_for_status()?
-            .json()
-            .await
-            .context("decoding array dataref")?;
+        let resp: ValueResponse = with_retry(|| async {
+            self.http
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("GET {url}"))?
+                .error_for_status()?
+                .json()
+                .await
+                .context("decoding array dataref")
+        })
+        .await?;
         let arr = resp
             .data
             .as_array()
