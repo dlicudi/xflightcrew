@@ -1188,6 +1188,17 @@ async fn answer_state_query(
             parts.push(format!("fuel flow {:.1} gallons an hour", v * 3600.0 / AVGAS_KG_PER_GAL));
         }
     }
+    if t.contains("ammeter") || t.contains("amps") || t.contains("charging") {
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/electrical/battery_amps").await {
+            let state = if v > 1.0 { "charging" } else if v < -1.0 { "discharging" } else { "steady" };
+            parts.push(format!("ammeter {v:+.0} amps, {state}"));
+        }
+    }
+    if t.contains("vacuum") || t.contains("suction") {
+        if let Ok(v) = read1(live, xp, "sim/cockpit/misc/vacuum").await {
+            parts.push(format!("suction {v:.1} inches"));
+        }
+    }
     // A question — answer plainly; "Roger" is a command acknowledgment.
     (!parts.is_empty()).then(|| format!("{}.", parts.join(", ")))
 }

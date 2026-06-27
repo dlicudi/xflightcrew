@@ -12,6 +12,9 @@ const BARO: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot"
 const PA_PER_INHG: f64 = 3386.389;
 const DG_SYNC: &str = "sim/instruments/DG_sync_mag";
 const DG_DRIFT: &str = "sim/cockpit/gyros/dg_drift_vac_deg";
+// Low-vacuum annunciator: the DG is vacuum-driven, so a sync won't hold if the
+// vacuum's failed — worth saying so rather than confirming a sync that'll drift.
+const LOW_VACUUM: &str = "sim/cockpit/warnings/annunciators/low_vacuum";
 const PITOT_HEAT: &str = "sim/cockpit2/ice/ice_pitot_heat_on_pilot";
 // Command-driven so the panel switch animates (a raw write may not); PITOT_HEAT
 // is read back to confirm.
@@ -160,6 +163,13 @@ impl Tool for AlignGyro {
         // otherwise a -4° drift would read back as "356 degrees".
         let raw = ctx.xplane.get_float(DG_DRIFT).await.unwrap_or(0.0);
         let drift = (raw + 180.0).rem_euclid(360.0) - 180.0;
+        // If the vacuum's low, the gyro itself is failing — a sync won't hold, so
+        // flag that instead of confirming a sync that'll just drift back off.
+        if ctx.xplane.get_float(LOW_VACUUM).await.unwrap_or(0.0) > 0.5 {
+            return Ok("Synced the gyro, but vacuum's low — it won't hold. \
+                       Use the compass and cross-check the attitude indicator."
+                .to_string());
+        }
         // A couple of degrees is a good sync (the compass itself isn't perfect).
         if drift.abs() < 2.0 {
             Ok("Roger, directional gyro synced to the compass.".to_string())

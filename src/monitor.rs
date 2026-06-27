@@ -89,6 +89,19 @@ pub struct Snapshot {
     pub oil_temp_c: Option<f64>,
     /// Cylinder head temperature, °C (`None` if the read failed).
     pub cht_c: Option<f64>,
+    /// Outside air temp, °C — for the carb-ice advisory.
+    pub oat_c: f64,
+    /// Dewpoint, °C — a humidity proxy (small OAT−dewpoint spread = moist air).
+    pub dewpoint_c: f64,
+    /// Carburettor heat applied (ratio > 0.5).
+    pub carb_heat_on: bool,
+    /// Engine RPM — low RPM (descent/idle, throttle closed) is the worst regime
+    /// for carburettor ice.
+    pub rpm: f64,
+    /// Low-vacuum annunciator — the vacuum-driven gyros (AI/DG) may be unreliable.
+    pub low_vacuum: bool,
+    /// Battery ammeter, amps. Positive = charging, negative = discharging.
+    pub battery_amps: f64,
     pub phase: Phase,
 }
 
@@ -172,6 +185,36 @@ impl Snapshot {
             .ok()
             .and_then(engine0);
 
+        // Carb-ice / vacuum / electrical inputs, best-effort. Defaults chosen so a
+        // failed read can't raise a false advisory (mild OAT, dry, no discharge).
+        let oat_c = xp.get_float("sim/cockpit2/temperature/outside_air_temp_degc").await.unwrap_or(15.0);
+        let dewpoint_c = xp
+            .get_float_array("sim/weather/aircraft/dewpoint_deg_c")
+            .await
+            .ok()
+            .and_then(engine0)
+            .unwrap_or(-30.0);
+        let carb_heat_on = xp
+            .get_float_array("sim/cockpit2/engine/actuators/carb_heat_ratio")
+            .await
+            .ok()
+            .and_then(engine0)
+            .unwrap_or(0.0)
+            > 0.5;
+        let rpm = xp
+            .get_float_array("sim/cockpit2/engine/indicators/prop_speed_rpm")
+            .await
+            .ok()
+            .and_then(engine0)
+            .unwrap_or(0.0);
+        let low_vacuum = xp.get_float("sim/cockpit/warnings/annunciators/low_vacuum").await.unwrap_or(0.0) > 0.5;
+        let battery_amps = xp
+            .get_float_array("sim/cockpit2/electrical/battery_amps")
+            .await
+            .ok()
+            .and_then(engine0)
+            .unwrap_or(0.0);
+
         let mut s = Snapshot {
             on_ground,
             groundspeed_kts,
@@ -190,6 +233,12 @@ impl Snapshot {
             oil_pressure_psi,
             oil_temp_c,
             cht_c,
+            oat_c,
+            dewpoint_c,
+            carb_heat_on,
+            rpm,
+            low_vacuum,
+            battery_amps,
             phase: Phase::Ground,
         };
         s.phase = estimate_phase(&s);
@@ -512,13 +561,104 @@ impl Check for EngineHealth {
     }
 }
 
+/// Carburettor-ice advisory (predictive). The stock 172 is carburetted, and the
+/// classic trap is ice forming at low power in a descent — throttle closed, moist
+/// air — quietly starving the engine. Fires when conditions are ripe and carb heat
+/// is off, so the copilot prompts before it bites. Advisory, not alarm.
+struct CarbIce;
+
+impl Check for CarbIce {
+    fn id(&self) -> &'static str {
+        "carb_ice"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Advisory
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if !s.engine_running || s.carb_heat_on || s.on_ground {
+            return None;
+        }
+        // Ice-prone: moist air (small temp–dewpoint spread) in the −10..+27 °C band,
+        // at low power (throttled back for descent/idle), where icing is worst.
+        let prone_temp = (-10.0..=27.0).contains(&s.oat_c);
+        let humid = (s.oat_c - s.dewpoint_c) < 13.0;
+        let low_power = s.rpm > 100.0 && s.rpm < 2000.0;
+        (prone_temp && humid && low_power)
+            .then(|| "Conditions are right for carburettor ice — recommend carb heat.".to_string())
+    }
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(10)
+    }
+}
+
+/// Low vacuum: the engine-driven pump spins the attitude and heading gyros; if
+/// suction drops those instruments lie. Uses the sim's low-vacuum annunciator.
+/// Caution — critical in IMC, a cross-check reminder in VMC.
+struct LowVacuum;
+
+impl Check for LowVacuum {
+    fn id(&self) -> &'static str {
+        "low_vacuum"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Caution
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        (s.engine_running && s.low_vacuum).then(|| {
+            "Low vacuum — the attitude and heading indicators may be unreliable. \
+             Cross-check the compass and turn coordinator."
+                .to_string()
+        })
+    }
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(3)
+    }
+}
+
+/// Alternator not charging: the switch is on but the ammeter shows the battery
+/// discharging — a failed or declutched alternator the on/off check can't see.
+/// Pairs with [`AlternatorOffline`] (switch off). Caution: shed load before the
+/// battery dies.
+struct AlternatorNotCharging;
+
+impl Check for AlternatorNotCharging {
+    fn id(&self) -> &'static str {
+        "alt_not_charging"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Caution
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if !s.engine_running || !s.alternator_on {
+            return None;
+        }
+        (s.battery_amps < -5.0).then(|| {
+            format!(
+                "Alternator's not charging — battery's draining at {:.0} amps. \
+                 Check the alternator and shed electrical load.",
+                s.battery_amps.abs()
+            )
+        })
+    }
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+}
+
 fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     let mut checks: Vec<Box<dyn Check>> = Vec::new();
     if !profile.electrical.is_empty() {
         checks.push(Box::new(AlternatorOffline));
+        // Switch-on-but-not-charging, caught via the ammeter.
+        checks.push(Box::new(AlternatorNotCharging));
     }
     if profile.directional_gyro {
         checks.push(Box::new(GyroDrift));
+        // The vacuum system drives the DG/AI, so an airframe with a gyro has one.
+        checks.push(Box::new(LowVacuum));
+    }
+    if profile.carb_heat {
+        checks.push(Box::new(CarbIce));
     }
     if profile.engine {
         // Engine instruments, grounded in the C172 POH (oil 50–90 PSI, 100–245°F)
@@ -835,6 +975,12 @@ mod tests {
             oil_pressure_psi: None,
             oil_temp_c: None,
             cht_c: None,
+            oat_c: 15.0,
+            dewpoint_c: -30.0,
+            carb_heat_on: false,
+            rpm: 0.0,
+            low_vacuum: false,
+            battery_amps: 0.0,
             phase: Phase::Ground,
         }
     }
@@ -863,6 +1009,46 @@ mod tests {
         assert!(caution.eval(&s).is_some() && warn.eval(&s).is_none(), "caution band only");
         s.oil_temp_c = Some(120.0);
         assert!(warn.eval(&s).is_some() && caution.eval(&s).is_none(), "warning band only");
+    }
+
+    #[test]
+    fn carb_ice_advisory_conditions() {
+        let c = CarbIce;
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        s.oat_c = 10.0;
+        s.dewpoint_c = 5.0; // spread 5 → humid
+        s.rpm = 1500.0; // throttled back
+        assert!(c.eval(&s).is_some(), "ripe conditions → advise carb heat");
+        s.carb_heat_on = true;
+        assert!(c.eval(&s).is_none(), "carb heat already on → silent");
+        s.carb_heat_on = false;
+        s.dewpoint_c = -30.0; // dry
+        assert!(c.eval(&s).is_none(), "dry air → silent");
+        s.dewpoint_c = 5.0;
+        s.rpm = 2400.0; // cruise power
+        assert!(c.eval(&s).is_none(), "high power → silent");
+    }
+
+    #[test]
+    fn low_vacuum_and_alternator_ammeter() {
+        let v = LowVacuum;
+        let mut s = snap(true, true);
+        assert!(v.eval(&s).is_none(), "vacuum ok → silent");
+        s.low_vacuum = true;
+        assert!(v.eval(&s).is_some(), "low vacuum → warn unreliable gyros");
+        s.engine_running = false;
+        assert!(v.eval(&s).is_none(), "engine off → no vacuum check");
+
+        let a = AlternatorNotCharging;
+        let mut s = snap(true, true); // alternator switch on
+        s.battery_amps = 8.0; // charging
+        assert!(a.eval(&s).is_none(), "charging → silent");
+        s.battery_amps = -10.0; // discharging with alternator on
+        assert!(a.eval(&s).is_some(), "not charging → caution");
+        let mut s = snap(true, false); // alternator off — AlternatorOffline's job
+        s.battery_amps = -10.0;
+        assert!(a.eval(&s).is_none(), "switch off → handled elsewhere");
     }
 
     #[test]
