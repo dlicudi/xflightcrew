@@ -163,6 +163,19 @@ fn onoff(t: &str) -> Option<bool> {
 fn parse_one(t: &str) -> Option<ToolCall> {
     let num = number(t);
 
+    // Smart leaning (no explicit percentage): "lean for cruise", "lean it out",
+    // "lean for max power". Must beat the throttle branch ("max power" → throttle)
+    // — the word "lean" means the mixture. A number, or an explicit rich/cutoff,
+    // falls through to set_mixture below.
+    if num.is_none() && !has(t, "rich") && !t.contains("cutoff") {
+        let wants_lean = has(t, "lean")
+            || (has(t, "mixture") && (t.contains("cruise") || t.contains("peak") || t.contains("egt")));
+        if wants_lean {
+            let mode = if t.contains("power") || t.contains("rpm") { "power" } else { "auto" };
+            return Some(call("lean_mixture", json!({ "mode": mode })));
+        }
+    }
+
     // Ground / ramp ops first — "ground power" must beat the throttle branch (which
     // matches "power"), and these are unambiguous ground-crew calls.
     if has(t, "chocks") || has(t, "chock") {
@@ -224,8 +237,7 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("set_throttle", json!({ "percent": 0 })));
     }
 
-    // mixture: full rich / maximum → 100, idle cutoff → 0, else numeric. A bare
-    // "lean"/"enrich" (relative, no target) is still left to the LLM.
+    // mixture: full rich / maximum → 100, idle cutoff → 0, else numeric.
     if has(t, "mixture") {
         if t.contains("maximum") || t.contains("max") || t.contains("full") || has(t, "rich") {
             return Some(call("set_mixture", json!({ "percent": 100 })));
@@ -515,6 +527,12 @@ mod tests {
         assert_eq!(one("maximum mixture").unwrap(), ("set_mixture".into(), json!({"percent":100})));
         assert_eq!(one("mixture full rich").unwrap().1, json!({"percent":100}));
         assert_eq!(one("mixture idle cutoff").unwrap().1, json!({"percent":0}));
+        // Smart leaning (no number) routes to lean_mixture; an explicit % stays set_mixture.
+        assert_eq!(one("lean for cruise").unwrap(), ("lean_mixture".into(), json!({"mode":"auto"})));
+        assert_eq!(one("lean it out").unwrap().0, "lean_mixture");
+        assert_eq!(one("mixture for cruise").unwrap(), ("lean_mixture".into(), json!({"mode":"auto"})));
+        assert_eq!(one("lean for max power").unwrap(), ("lean_mixture".into(), json!({"mode":"power"})));
+        assert_eq!(one("lean the mixture to 70 percent").unwrap().0, "set_mixture");
         assert_eq!(one("heading 270").unwrap().1, json!({"heading":270}));
         assert_eq!(one("turn heading south").unwrap().1, json!({"heading":180}));
         assert_eq!(one("descend 500").unwrap().1, json!({"fpm":-500}));

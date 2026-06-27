@@ -118,6 +118,7 @@ impl Registry {
         if profile.engine {
             tools.push(Box::new(engine::SetThrottle));
             tools.push(Box::new(engine::SetMixture));
+            tools.push(Box::new(engine::LeanMixture));
             tools.push(Box::new(engine::StartEngine));
             tools.push(Box::new(engine::StopEngine));
         }

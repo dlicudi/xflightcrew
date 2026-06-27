@@ -34,6 +34,32 @@ const GENERATOR: &str = "sim/cockpit/electrical/generator_on"; // array; [0] = a
 const FUEL_PUMP: &str = "sim/cockpit2/engine/actuators/fuel_pump_on";
 const IGNITION_KEY: &str = "sim/cockpit2/engine/actuators/ignition_key"; // 0 off,1 R,2 L,3 both,4 start
 const CARB_HEAT: &str = "sim/cockpit2/engine/actuators/carb_heat_ratio"; // 0 cold .. 1 hot
+// Engine indicators (per-engine arrays; element 0). Names verified against the
+// stock 172's cockpitdecks mapping.
+const EGT_CEL: &str = "sim/cockpit2/engine/indicators/EGT_deg_cel";
+const PROP_RPM: &str = "sim/cockpit2/engine/indicators/prop_speed_rpm";
+const FUEL_FLOW_KG_S: &str = "sim/cockpit2/engine/indicators/fuel_flow_kg_sec";
+const ALT_FT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot";
+// Above this altitude (ft MSL) a normally-aspirated engine makes well under 75%
+// power even at full throttle, so leaning to peak EGT is safe and called for;
+// below it we keep the mixture rich (the takeoff/climb/pattern regime). Mirrors
+// the POH's "as altitude increases, the pilot leans the mixture".
+const LEAN_FLOOR_ALT_FT: f64 = 3000.0;
+// Auto-lean never pulls the mixture below this — a guard against an over-lean that
+// would stumble the engine; real cruise leaning stays well rich of idle-cutoff.
+const MIX_LEAN_FLOOR: f64 = 0.30;
+// Avgas mass per US gallon (~6.0 lb/gal), to turn fuel flow (kg/s) into gal/hr.
+const AVGAS_KG_PER_GAL: f64 = 2.72;
+
+/// First element of a per-engine array dataref (engine 1), or `default`.
+async fn engine0(ctx: &ToolCtx<'_>, dataref: &str, default: f64) -> f64 {
+    ctx.xplane
+        .get_float_array(dataref)
+        .await
+        .ok()
+        .and_then(|v| v.first().copied())
+        .unwrap_or(default)
+}
 
 #[derive(Deserialize)]
 struct PercentArg {
@@ -114,11 +140,12 @@ impl Tool for SetMixture {
         "set_mixture"
     }
     fn description(&self) -> &str {
-        "Set the fuel mixture as a percentage: 100 = full rich, 0 = idle cutoff, \
-         intermediate values lean the mixture. Use for 'mixture full rich', \
-         'lean the mixture to 70 percent', 'mixture idle cutoff', \
-         'richen the mixture', 'enrich the mixture', 'lean it out', \
-         'mixture for cruise', 'full lean', 'mixture cutoff'."
+        "Set the fuel mixture to an explicit percentage: 100 = full rich, 0 = idle \
+         cutoff, intermediate values lean the mixture. Use for 'mixture full rich', \
+         'lean the mixture to 70 percent', 'mixture idle cutoff', 'richen the \
+         mixture', 'enrich the mixture', 'mixture 80 percent', 'mixture cutoff'. \
+         For automatic/optimal leaning (peak EGT, max RPM, by phase) with no number, \
+         use lean_mixture instead."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -147,6 +174,123 @@ impl Tool for SetMixture {
         ramp_actuator(ctx, MIXTURE, ratio).await?;
         let actual = ctx.xplane.get_float(MIXTURE).await? * 100.0;
         Ok(format!("Roger, mixture {actual:.0} percent."))
+    }
+}
+
+/// Ease the mixture leaner step by step from a rich start, sampling `metric`
+/// (EGT or RPM) after each step, until it peaks (drops `drop_margin` below the
+/// best seen) or the lean floor is reached. Returns the mixture at the peak and
+/// the peak value. Approaching from the rich side means the metric rises to the
+/// peak then falls, which is what makes the peak detectable.
+async fn seek_metric_peak(ctx: &ToolCtx<'_>, metric: &str, drop_margin: f64) -> Result<(f64, f64)> {
+    const STEP: f64 = 0.03;
+    const SETTLE_MS: u64 = 220;
+
+    ramp_actuator(ctx, MIXTURE, 0.95).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let mut mix = 0.95;
+    let mut best_mix = mix;
+    let mut best_val = engine0(ctx, metric, 0.0).await;
+    while mix > MIX_LEAN_FLOOR {
+        mix = (mix - STEP).max(MIX_LEAN_FLOOR);
+        ctx.xplane.set_float(MIXTURE, mix).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(SETTLE_MS)).await;
+        let val = engine0(ctx, metric, 0.0).await;
+        if val > best_val {
+            best_val = val;
+            best_mix = mix;
+        } else if best_val - val >= drop_margin {
+            break; // clearly past the peak
+        }
+    }
+    Ok((best_mix, best_val))
+}
+
+pub struct LeanMixture;
+
+#[derive(Deserialize, Default)]
+struct LeanArgs {
+    /// auto | economy | power. Absent = auto.
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[async_trait]
+impl Tool for LeanMixture {
+    fn name(&self) -> &str {
+        "lean_mixture"
+    }
+    fn description(&self) -> &str {
+        "Automatically set the correct fuel mixture for the current phase of flight \
+         — the smart alternative to set_mixture (which takes an explicit percentage). \
+         It leans to peak EGT for cruise economy, leans for maximum RPM when power is \
+         asked for, and keeps the mixture full rich below 3000 feet. Use for 'lean \
+         the mixture', 'lean for cruise', 'set the mixture for cruise', 'lean it out', \
+         'lean to peak EGT', 'lean for max power', 'lean for max RPM', 'set an \
+         appropriate mixture', 'sort out the mixture'. For an exact percentage use \
+         set_mixture instead."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["auto", "economy", "power"],
+                         "description": "auto = pick by altitude (default); economy = lean to peak EGT for cruise; power = lean for max RPM (climb / high-elevation takeoff)"}
+            }
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let a: LeanArgs = serde_json::from_value(args.clone()).unwrap_or_default();
+        let mode = a.mode.unwrap_or_else(|| "auto".into()).to_ascii_lowercase();
+
+        if engine0(ctx, ENGN_RUNNING, 0.0).await <= 0.5 {
+            return Ok("Engine's not running — nothing to lean.".to_string());
+        }
+        let alt = ctx.xplane.get_float(ALT_FT).await.unwrap_or(0.0);
+
+        // Resolve `auto` by altitude: rich down low, lean to economy up in the cruise.
+        let resolved = match mode.as_str() {
+            "economy" => "economy",
+            "power" => "power",
+            _ => if alt >= LEAN_FLOOR_ALT_FT { "economy" } else { "rich" },
+        };
+
+        match resolved {
+            "rich" => {
+                ramp_actuator(ctx, MIXTURE, 1.0).await?;
+                Ok(format!(
+                    "Below {LEAN_FLOOR_ALT_FT:.0} feet — mixture full rich. I'll lean for cruise once we're higher."
+                ))
+            }
+            "economy" => {
+                // Don't lean to peak at high power down low — detonation risk. (Up
+                // high, full throttle is still <75% power, so leaning is correct.)
+                if alt < LEAN_FLOOR_ALT_FT && ctx.xplane.get_float(THROTTLE).await.unwrap_or(0.0) > 0.80 {
+                    return Ok(
+                        "We're at high power down low — I'll hold off leaning to peak; \
+                         leaning hard there risks detonation. Reduce to cruise power or climb first."
+                            .to_string(),
+                    );
+                }
+                let (best, egt) = seek_metric_peak(ctx, EGT_CEL, 12.0).await?;
+                // Set slightly rich of peak so EGT sits just below peak — the safe
+                // side the POH calls for ("slightly below the peak observed EGT").
+                ramp_actuator(ctx, MIXTURE, (best + 0.03).min(1.0)).await?;
+                let pct = ctx.xplane.get_float(MIXTURE).await? * 100.0;
+                let gph = engine0(ctx, FUEL_FLOW_KG_S, 0.0).await * 3600.0 / AVGAS_KG_PER_GAL;
+                Ok(format!(
+                    "Leaned for cruise — mixture {pct:.0} percent, peak EGT {egt:.0} degrees, burning {gph:.1} gallons an hour."
+                ))
+            }
+            _ => {
+                // power: lean for max RPM (the high-DA takeoff / climb procedure).
+                let (best, rpm) = seek_metric_peak(ctx, PROP_RPM, 25.0).await?;
+                ramp_actuator(ctx, MIXTURE, best).await?;
+                let pct = ctx.xplane.get_float(MIXTURE).await? * 100.0;
+                Ok(format!("Leaned for max power — {rpm:.0} RPM at mixture {pct:.0} percent."))
+            }
+        }
     }
 }
 
