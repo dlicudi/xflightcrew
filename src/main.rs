@@ -18,6 +18,7 @@ mod llm;
 mod monitor;
 mod nav;
 mod phrase;
+mod plugin_status;
 mod readback;
 mod stt;
 mod stt_eval;
@@ -207,6 +208,12 @@ async fn main() -> Result<()> {
     // created here (above both) and handed to each.
     let voice = Voice::new(config.clone());
 
+    // In-sim status panel (the bundled plugin): mirror phase/heard/action into its
+    // datarefs. Best-effort — a no-op if the plugin isn't loaded.
+    let status_sink = config
+        .plugin_status
+        .then(|| plugin_status::StatusSink::start(&config.xplane_base_url));
+
     // Background monitor: watches for problems and speaks up. Its own thread +
     // runtime + X-Plane client, sharing the speech arbiter. Runs in both UIs.
     if config.monitor_enabled {
@@ -254,7 +261,10 @@ async fn main() -> Result<()> {
         // Typed-command channel: the dashboard (main thread) sends commands the
         // pilot types; the voice loop picks them up alongside spoken utterances.
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
-        let reporter = Reporter::Tui(tx);
+        let mut reporter = Reporter::tui(tx);
+        if let Some(s) = status_sink.clone() {
+            reporter = reporter.with_status(s);
+        }
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             if let Err(e) = rt.block_on(run_session(
@@ -268,7 +278,11 @@ async fn main() -> Result<()> {
         Ok(())
     } else {
         println!("\n  x-copilot — {} ({}). Ctrl-C to quit.\n", profile.display_name, config.listen_mode);
-        run_session(config, stt, llm, registry, profile, checklists, voice, continuous, explicit, ptt, Reporter::Plain, None).await
+        let mut reporter = Reporter::plain();
+        if let Some(s) = status_sink {
+            reporter = reporter.with_status(s);
+        }
+        run_session(config, stt, llm, registry, profile, checklists, voice, continuous, explicit, ptt, reporter, None).await
     }
 }
 

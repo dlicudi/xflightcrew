@@ -55,18 +55,51 @@ pub enum Report {
     Aircraft(Aircraft),
 }
 
-/// Output sink for the voice loop: either plain stdout or the TUI channel.
+/// Where log/status output goes: plain stdout or the TUI channel.
 #[derive(Clone)]
-pub enum Reporter {
+enum Sink {
     Plain,
     Tui(Sender<Report>),
 }
 
+/// Output sink for the voice loop. Drives the chosen UI and, when present, also
+/// mirrors phase/heard/action into the in-sim plugin panel.
+#[derive(Clone)]
+pub struct Reporter {
+    sink: Sink,
+    status: Option<crate::plugin_status::StatusSink>,
+}
+
 impl Reporter {
+    /// Plain-stdout reporter (no TUI).
+    pub fn plain() -> Self {
+        Reporter { sink: Sink::Plain, status: None }
+    }
+    /// TUI reporter feeding the dashboard channel.
+    pub fn tui(tx: Sender<Report>) -> Self {
+        Reporter { sink: Sink::Tui(tx), status: None }
+    }
+    /// Also mirror status into the in-sim plugin panel.
+    pub fn with_status(mut self, status: crate::plugin_status::StatusSink) -> Self {
+        self.status = Some(status);
+        self
+    }
+
     pub fn log(&self, kind: LogKind, text: impl Into<String>) {
-        self.send(Report::Log { kind, text: text.into() });
+        let text = text.into();
+        if let Some(s) = &self.status {
+            match kind {
+                LogKind::Heard => s.heard(&text),
+                LogKind::Readback => s.action(&text),
+                _ => {}
+            }
+        }
+        self.send(Report::Log { kind, text });
     }
     pub fn status(&self, phase: Phase) {
+        if let Some(s) = &self.status {
+            s.phase(phase_code(phase));
+        }
         self.send(Report::Status(phase));
     }
     pub fn mic(&self, level: f32) {
@@ -74,12 +107,23 @@ impl Reporter {
     }
 
     fn send(&self, r: Report) {
-        match self {
-            Reporter::Tui(tx) => {
+        match &self.sink {
+            Sink::Tui(tx) => {
                 let _ = tx.send(r);
             }
-            Reporter::Plain => print_plain(&r),
+            Sink::Plain => print_plain(&r),
         }
+    }
+}
+
+/// Activity code shared with the plugin panel: 0 idle, 1 listening, 2 thinking,
+/// 3 speaking.
+fn phase_code(p: Phase) -> u8 {
+    match p {
+        Phase::Idle => 0,
+        Phase::Listening => 1,
+        Phase::Thinking => 2,
+        Phase::Speaking => 3,
     }
 }
 

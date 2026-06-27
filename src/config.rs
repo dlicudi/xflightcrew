@@ -108,6 +108,10 @@ pub struct Config {
     pub monitor_enabled: bool,
     /// Monitor sample rate in Hz — how often it snapshots datarefs and re-checks.
     pub monitor_hz: f32,
+    /// Mirror copilot status (phase / last heard / last action) into the bundled
+    /// X-Plane plugin's in-sim panel. On by default; best-effort — a no-op if the
+    /// plugin isn't installed. Set `XCOPILOT_PLUGIN_STATUS=false` to disable.
+    pub plugin_status: bool,
 }
 
 impl Config {
@@ -153,6 +157,7 @@ impl Config {
             confirm_critical: env_or("XCOPILOT_CONFIRM", "true") != "false",
             monitor_enabled: env_or("XCOPILOT_MONITOR", "true") != "false",
             monitor_hz: env_or("XCOPILOT_MONITOR_HZ", "3").parse().unwrap_or(3.0),
+            plugin_status: env_or("XCOPILOT_PLUGIN_STATUS", "true") != "false",
         })
     }
 }

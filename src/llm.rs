@@ -516,6 +516,7 @@ mod tests {
             listen_mode: "ptt".into(),
             ptt_key: String::new(),
             ptt_dataref: String::new(),
+            plugin_status: false,
             vad_threshold: 0.012,
             stt_min_confidence: 0.5,
             end_silence_ms: 900,
