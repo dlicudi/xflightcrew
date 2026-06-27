@@ -123,6 +123,85 @@ fn sanitize_reply(s: &str) -> String {
     kept.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Extract balanced `{...}` JSON object substrings (with their byte offsets),
+/// ignoring braces inside quoted strings. Used to recover a tool call a small
+/// model wrote as prose instead of via the tool-call API.
+fn json_objects(s: &str) -> Vec<(usize, String)> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'{' {
+            let (mut depth, mut j, mut in_str, mut esc) = (0i32, i, false, false);
+            while j < b.len() {
+                let c = b[j];
+                if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c == b'\\' {
+                        esc = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else if c == b'"' {
+                    in_str = true;
+                } else if c == b'{' {
+                    depth += 1;
+                } else if c == b'}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        out.push((i, s[i..=j].to_string()));
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Recover tool call(s) from a model that emitted them as TEXT instead of using
+/// the tool-call API — small local models sometimes echo the prompt's
+/// `ACT: <tool> {json}` format as content. Best-effort; returns what it can parse.
+fn recover_text_toolcalls(content: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
+    let mut out = Vec::new();
+    for (start, blob) in json_objects(content) {
+        let Ok(v) = serde_json::from_str::<Value>(&blob) else { continue };
+        // Form A: a full call object {"name": "...", "arguments"|"parameters": {...}}.
+        if let Some(name) = v.get("name").and_then(Value::as_str) {
+            if let Some(spec) = tools.iter().find(|t| t.name == name) {
+                let raw = v.get("arguments").or_else(|| v.get("parameters")).cloned();
+                let raw = raw.filter(Value::is_object).unwrap_or_else(|| json!({}));
+                out.push(ToolCall { name: spec.name.clone(), arguments: coerce_args(&spec.name, raw, tools) });
+                continue;
+            }
+        }
+        // Form B: a bare args object preceded by a tool-name token (`set_flaps {…}`).
+        if v.is_object() {
+            let prefix = content[..start].trim_end();
+            if let Some(spec) = tools.iter().find(|t| prefix.ends_with(t.name.as_str())) {
+                out.push(ToolCall { name: spec.name.clone(), arguments: coerce_args(&spec.name, v, tools) });
+            }
+        }
+    }
+    dedup_calls(out)
+}
+
+/// Does the content look like a tool call the model wrote as prose (so it must
+/// never be spoken aloud)? True for a leading `ACT:` or a known tool name beside
+/// a brace.
+fn looks_like_toolcall_echo(content: &str, tools: &[ToolSpec]) -> bool {
+    if content.trim_start().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("act:")) {
+        return true;
+    }
+    let lc = content.to_ascii_lowercase();
+    content.contains('{') && tools.iter().any(|t| lc.contains(t.name.as_str()))
+}
+
 /// Temperatures to retry at, in order, when the deterministic (temp 0) first
 /// pass returns no tool for an utterance the domain gate already accepted as a
 /// command. A little entropy escapes the greedy-decode dead-end where qwen emits
@@ -346,6 +425,19 @@ impl Llm {
         if !calls.is_empty() {
             return Ok(Decision::Act(dedup_calls(calls)));
         }
+        // Some local models emit the tool call as TEXT instead of using the API
+        // (echoing the prompt's "ACT: <tool> {json}" format). Recover it so the
+        // action still happens.
+        let recovered = recover_text_toolcalls(&msg.content, tools);
+        if !recovered.is_empty() {
+            return Ok(Decision::Act(recovered));
+        }
+        // Couldn't parse it, but it still looks like a tool-call attempt — never
+        // speak the raw JSON aloud; treat as "didn't catch" so the retry can fire.
+        if looks_like_toolcall_echo(&msg.content, tools) {
+            tracing::warn!(content = %msg.content, "model wrote a tool-call as text; suppressed");
+            return Ok(Decision::None);
+        }
         let reply = sanitize_reply(&msg.content);
         if !reply.is_empty() {
             return Ok(Decision::Reply(reply));
@@ -459,6 +551,30 @@ mod tests {
     use crate::aircraft;
     use crate::config::Config;
     use crate::tools::Registry;
+
+    #[test]
+    fn recovers_toolcall_emitted_as_text() {
+        let tools = vec![ToolSpec {
+            name: "set_fuel_pump".into(),
+            description: String::new(),
+            parameters: json!({"type":"object","properties":{"on":{"type":"boolean"}}}),
+        }];
+        // The exact failure seen in the panel: the model echoed the prompt's
+        // "ACT: <tool> {json}" format as content instead of calling the tool.
+        let content = r#"ACT: set_fuel_pump {"name":"set_fuel_pump", "arguments": {"on": true}}"#;
+        let calls = recover_text_toolcalls(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "set_fuel_pump");
+        assert_eq!(calls[0].arguments, json!({"on": true}));
+        assert!(looks_like_toolcall_echo(content, &tools));
+        // Form B: bare args after a tool-name token.
+        let b = recover_text_toolcalls(r#"set_fuel_pump {"on": false}"#, &tools);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].arguments, json!({"on": false}));
+        // Genuine prose is never mistaken for a tool call.
+        assert!(!looks_like_toolcall_echo("We're at 3,000 feet, climbing.", &tools));
+        assert!(recover_text_toolcalls("We're parked, engines off.", &tools).is_empty());
+    }
 
     #[test]
     fn coerce_fixes_types_but_keeps_enum_strings() {
