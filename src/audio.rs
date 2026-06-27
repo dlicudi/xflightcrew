@@ -102,65 +102,73 @@ pub fn parse_ptt_key(s: &str) -> Option<device_query::Keycode> {
     Some(key)
 }
 
-/// Record while a global PTT key is held — works regardless of which window has
-/// focus (X-Plane included), since the key state is polled globally. Waits up to
-/// `idle_timeout` for the key to go down (so the caller can poll typed input);
-/// returns empty if it doesn't. Then captures until the key is released.
-pub fn record_hotkey_ptt(key: device_query::Keycode, idle_timeout: Option<Duration>) -> Result<Vec<f32>> {
-    use device_query::{DeviceQuery, DeviceState};
-    let dev = DeviceState::new();
-    let held = || dev.get_keys().contains(&key);
+/// Audio kept *before* the PTT press, prepended to the capture so the start of a
+/// command isn't lost. It covers two latencies that otherwise clipped short
+/// commands: the mic device's warm-up (eliminated here by keeping the stream
+/// open) and, for the sim-dataref trigger, the lag between the physical button and
+/// the dataref reflecting it. Generous on purpose — silence at the front is free,
+/// a clipped first word isn't.
+const PTT_PREROLL_MS: u32 = 300;
 
-    let start = Instant::now();
-    while !held() {
-        if idle_timeout.is_some_and(|t| start.elapsed() >= t) {
-            return Ok(Vec::new()); // no key this window — let the caller re-poll
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
-    // Key down — capture until release. (Open-on-press, like record_push_to_talk;
-    // the pilot presses then speaks, so the small device-open latency is fine.)
-    let input = open_input()?;
-    input.stream.play().context("starting input stream")?;
-    while held() {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    drop(input.stream);
-
-    let interleaved = std::mem::take(&mut *input.buffer.lock().unwrap());
-    let mono = downmix(&interleaved, input.channels);
-    Ok(resample_linear(&mono, input.sample_rate, WHISPER_SAMPLE_RATE))
+/// Warm push-to-talk mic: the input stream stays open across presses, so there's
+/// no per-press device warm-up to clip the onset of a command. While idle the
+/// buffer is trimmed to a short pre-roll; on press that pre-roll is kept and
+/// capture runs until release. Works for both triggers — a held key or a sim
+/// dataref — via the `is_active` closure.
+pub struct PttMic {
+    input: Input,
 }
 
-/// Record while a PTT dataref reads active — the cockpit equivalent of
-/// [`record_hotkey_ptt`], driven by a button bound inside X-Plane (the bundled
-/// plugin's `xcopilot/ptt_active`). `is_active` is polled (typically a `LiveState`
-/// read), so this needs no global key permission and doesn't key the radio. Waits
-/// up to `idle_timeout` for it to go active; returns empty if it doesn't, then
-/// captures until it goes inactive.
-pub fn record_dataref_ptt(
-    is_active: impl Fn() -> bool,
-    idle_timeout: Option<Duration>,
-) -> Result<Vec<f32>> {
-    let start = Instant::now();
-    while !is_active() {
-        if idle_timeout.is_some_and(|t| start.elapsed() >= t) {
-            return Ok(Vec::new()); // not pressed this window — let the caller re-poll
+impl PttMic {
+    /// Open the default input and start streaming. The stream stays live for the
+    /// session; one `PttMic` serves every press.
+    pub fn start() -> Result<PttMic> {
+        let input = open_input()?;
+        input.stream.play().context("starting input stream")?;
+        Ok(PttMic { input })
+    }
+
+    /// Wait up to `idle_timeout` for `is_active` to go true (returning empty if it
+    /// doesn't, so the caller can poll typed input), then capture pre-roll plus
+    /// everything until `is_active` goes false, at whisper's sample rate.
+    pub fn capture(
+        &self,
+        is_active: impl Fn() -> bool,
+        idle_timeout: Option<Duration>,
+    ) -> Result<Vec<f32>> {
+        let preroll = (self.input.sample_rate as usize * PTT_PREROLL_MS as usize / 1000)
+            * self.input.channels.max(1);
+
+        let start = Instant::now();
+        while !is_active() {
+            // Keep the idle buffer bounded to ~pre-roll of the most recent audio.
+            self.trim_to(preroll);
+            if idle_timeout.is_some_and(|t| start.elapsed() >= t) {
+                return Ok(Vec::new()); // not pressed this window — let the caller re-poll
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
-        std::thread::sleep(Duration::from_millis(10));
+
+        // Pressed: the buffer already holds up to ~pre-roll of audio from just
+        // before the press — keep it, then accumulate until release.
+        while is_active() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let interleaved = std::mem::take(&mut *self.input.buffer.lock().unwrap());
+        let mono = downmix(&interleaved, self.input.channels);
+        Ok(resample_linear(&mono, self.input.sample_rate, WHISPER_SAMPLE_RATE))
     }
 
-    let input = open_input()?;
-    input.stream.play().context("starting input stream")?;
-    while is_active() {
-        std::thread::sleep(Duration::from_millis(10));
+    /// Drop all but the last `keep` samples so the idle buffer can't grow unbounded
+    /// while we wait for a press.
+    fn trim_to(&self, keep: usize) {
+        let mut buf = self.input.buffer.lock().unwrap();
+        let len = buf.len();
+        if len > keep {
+            buf.drain(0..len - keep);
+        }
     }
-    drop(input.stream);
-
-    let interleaved = std::mem::take(&mut *input.buffer.lock().unwrap());
-    let mono = downmix(&interleaved, input.channels);
-    Ok(resample_linear(&mono, input.sample_rate, WHISPER_SAMPLE_RATE))
 }
 
 /// Record a push-to-talk utterance. Blocks on two Enter presses (start, stop).

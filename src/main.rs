@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
-use audio::Listener;
+use audio::{Listener, PttMic};
 use config::Config;
 use livestate::LiveState;
 use llm::{Decision, Llm};
@@ -359,6 +359,10 @@ async fn run_session(
     } else {
         None
     };
+    // Warm push-to-talk mic: kept open across presses so the device warm-up never
+    // clips the start of a command. Only one of `listener`/`ptt_mic` opens the
+    // device — they're mutually exclusive (continuous vs PTT).
+    let ptt_mic = if ptt.is_some() { Some(PttMic::start()?) } else { None };
 
     reporter.log(
         ui::LogKind::Info,
@@ -375,7 +379,7 @@ async fn run_session(
         // Input is spoken (gated like before) or typed in the TUI. A typed
         // command is deliberate, so it skips the confidence/wake/domain gates and
         // goes straight to the model.
-        let (mut command, from_text) = match next_input(&mut listener, &stt, &ptt, typed.as_ref()) {
+        let (mut command, from_text) = match next_input(&mut listener, &ptt_mic, &stt, &ptt, typed.as_ref()) {
             None => continue,
             Some(Input::Typed(text)) => {
                 tracing::info!(typed = %text, "typed command");
@@ -547,7 +551,7 @@ async fn run_session(
             // one and ignore any other calls the LLM returned in the same turn
             // (guards against chaining through several checklists at once).
             if let Some(cl) = checklists.iter().find(|c| c.id == call.name) {
-                run_checklist(cl, &xplane, &config, &mut listener, &stt, &ptt, typed.as_ref(), &voice, &reporter).await;
+                run_checklist(cl, &xplane, &config, &mut listener, &ptt_mic, &stt, &ptt, typed.as_ref(), &voice, &reporter).await;
                 break;
             }
 
@@ -569,7 +573,7 @@ async fn run_session(
 
                 say(&voice, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
                 reporter.status(ui::Phase::Listening);
-                let Some(reply) = listen_once(&mut listener, &stt, &ptt, None) else {
+                let Some(reply) = listen_once(&mut listener, &ptt_mic, &stt, &ptt, None) else {
                     say(&voice, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
                     break 'confirm false;
                 };
@@ -665,6 +669,7 @@ async fn run_checklist(
     xplane: &XPlaneClient,
     config: &Config,
     listener: &mut Option<Listener>,
+    ptt_mic: &Option<PttMic>,
     stt: &Stt,
     ptt: &Option<Ptt>,
     typed: Option<&std::sync::mpsc::Receiver<String>>,
@@ -710,7 +715,7 @@ async fn run_checklist(
                     let hazard = confirm.expect("ask implies a confirm hazard");
                     say(voice, reporter, ui::LogKind::Confirm, &format!("Confirm, {hazard}?"));
                     reporter.status(ui::Phase::Listening);
-                    let reply = listen_once(listener, stt, ptt, None);
+                    let reply = listen_once(listener, ptt_mic, stt, ptt, None);
                     match reply {
                         Some(r) if is_affirmative(&r.text) => {} // proceed
                         Some(r) if is_abort(&r.text) => {
@@ -898,21 +903,30 @@ fn icao_to_profile(icao: &str) -> String {
 /// Returns `None` on silence/noise or a capture error.
 fn listen_once(
     listener: &mut Option<Listener>,
+    ptt_mic: &Option<PttMic>,
     stt: &Stt,
     ptt: &Option<Ptt>,
     idle_timeout: Option<Duration>,
 ) -> Option<stt::Transcription> {
-    let audio = match (ptt, listener) {
-        // Hold-a-key push-to-talk (works while X-Plane has focus).
-        (Some(Ptt::Key(key)), _) => audio::record_hotkey_ptt(*key, idle_timeout).ok()?,
-        // Sim-dataref push-to-talk (the X-Plane plugin's bound button).
-        (Some(Ptt::Dataref { live, name }), _) => {
-            audio::record_dataref_ptt(|| Ptt::dataref_active(live, name), idle_timeout).ok()?
+    let audio = match (ptt, ptt_mic, listener) {
+        // Hold-a-key push-to-talk (works while X-Plane has focus), warm mic.
+        (Some(Ptt::Key(key)), Some(mic), _) => {
+            use device_query::DeviceQuery;
+            let dev = device_query::DeviceState::new();
+            let key = *key;
+            mic.capture(|| dev.get_keys().contains(&key), idle_timeout).ok()?
+        }
+        // Sim-dataref push-to-talk (the X-Plane plugin's bound button), warm mic.
+        (Some(Ptt::Dataref { live, name }), Some(mic), _) => {
+            mic.capture(|| Ptt::dataref_active(live, name), idle_timeout).ok()?
         }
         // Continuous, VAD-segmented.
-        (None, Some(l)) => l.next_utterance(idle_timeout).ok()?,
+        (None, _, Some(l)) => l.next_utterance(idle_timeout).ok()?,
         // Enter-to-talk.
-        (None, None) => audio::record_push_to_talk().ok()?,
+        (None, _, None) => audio::record_push_to_talk().ok()?,
+        // PTT configured but the warm mic failed to open (start() would have
+        // errored earlier) — nothing to capture.
+        (Some(_), None, _) => return None,
     };
     if audio.is_empty() {
         return None; // idle timeout (continuous) or empty capture
@@ -934,12 +948,13 @@ enum Input {
 /// commands without one starving the other; without it, just listen.
 fn next_input(
     listener: &mut Option<Listener>,
+    ptt_mic: &Option<PttMic>,
     stt: &Stt,
     ptt: &Option<Ptt>,
     typed: Option<&std::sync::mpsc::Receiver<String>>,
 ) -> Option<Input> {
     let Some(typed) = typed else {
-        return listen_once(listener, stt, ptt, None).map(Input::Spoken);
+        return listen_once(listener, ptt_mic, stt, ptt, None).map(Input::Spoken);
     };
     loop {
         if let Ok(t) = typed.try_recv() {
@@ -948,7 +963,7 @@ fn next_input(
                 return Some(Input::Typed(t));
             }
         }
-        if let Some(t) = listen_once(listener, stt, ptt, Some(Duration::from_millis(150))) {
+        if let Some(t) = listen_once(listener, ptt_mic, stt, ptt, Some(Duration::from_millis(150))) {
             return Some(Input::Spoken(t));
         }
         // Timed out idle (or a discarded blip) — loop to re-check the typed channel.
