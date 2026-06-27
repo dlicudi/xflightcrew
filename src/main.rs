@@ -19,6 +19,7 @@ mod monitor;
 mod nav;
 mod phrase;
 mod readback;
+mod speaker;
 mod stt;
 mod stt_eval;
 mod tts;
@@ -101,6 +102,13 @@ async fn main() -> Result<()> {
     // harness: each case through whisper + grammar, reporting WER and command
     // accuracy. `WHISPER_MODEL=...` switches the model under test. Offline, so it
     // uses a fixed profile (no X-Plane needed).
+    // `cargo run -- learn-pilot-voice <enroll.wav> [verify.wav ...]` enrols the
+    // pilot's voice (via the speaker sidecar) and saves the voiceprint.
+    if std::env::args().nth(1).as_deref() == Some("learn-pilot-voice") {
+        let files: Vec<String> = std::env::args().skip(2).collect();
+        return learn_pilot_voice(&config, &files).await;
+    }
+
     if std::env::args().nth(1).as_deref() == Some("stt-eval") {
         let manifest = std::env::args().nth(2).unwrap_or_else(|| "bench/stt_cases.yaml".to_string());
         let id = if config.aircraft.eq_ignore_ascii_case("auto") {
@@ -767,12 +775,13 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
 /// Decodes/resamples to 16 kHz mono via macOS `afconvert` (handles mp3/m4a/wav/…
 /// — whisper needs 16 kHz mono), reads the PCM, and returns the text. Reuses the
 /// same STT model the live loop uses, so no extra model download.
-fn transcribe_file(model_path: &str, input: &str) -> Result<String> {
+/// Decode any audio file to 16 kHz mono f32 samples via `afconvert` (macOS).
+fn load_wav_16k(input: &str) -> Result<Vec<f32>> {
     use std::process::Command;
     if !std::path::Path::new(input).exists() {
         return Err(anyhow!("no such file: {input}"));
     }
-    let wav = std::env::temp_dir().join("x-copilot-transcribe-16k.wav");
+    let wav = std::env::temp_dir().join("x-copilot-16k.wav");
     let status = Command::new("afconvert")
         .args([input, wav.to_str().unwrap(), "-d", "LEI16@16000", "-c", "1", "-f", "WAVE"])
         .status()
@@ -781,17 +790,61 @@ fn transcribe_file(model_path: &str, input: &str) -> Result<String> {
         return Err(anyhow!("afconvert failed to decode {input}"));
     }
     let reader = hound::WavReader::open(&wav).map_err(|e| anyhow!("reading {}: {e}", wav.display()))?;
-    let samples: Vec<f32> = reader
+    reader
         .into_samples::<i16>()
         .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
         .collect::<std::result::Result<_, _>>()
-        .map_err(|e| anyhow!("decoding samples: {e}"))?;
+        .map_err(|e| anyhow!("decoding samples: {e}"))
+}
+
+fn transcribe_file(model_path: &str, input: &str) -> Result<String> {
+    let samples = load_wav_16k(input)?;
     // Offline one-shot — GPU is fine here (not competing with the sim loop).
     let stt = Stt::load(model_path, true)?;
     // Verbatim: a voice-clone reference caption must match the audio's actual
     // words, so don't apply the command-loop's digit/mishear normalization
     // ("two seven zero" must stay words, not become "270").
     Ok(stt.transcribe_verbatim(&samples)?.text.trim().to_string())
+}
+
+/// `learn-pilot-voice <enroll.wav> [verify.wav ...]` — enrol the pilot's voice for
+/// recognition: embed the clip via the speaker sidecar and save the voiceprint.
+/// Extra files are embedded and compared (cosine) so you can sanity-check the
+/// separation (your other clips high, an ATC clip low) before enabling the gate.
+async fn learn_pilot_voice(config: &Config, files: &[String]) -> Result<()> {
+    let Some((enroll, verify)) = files.split_first() else {
+        return Err(anyhow!(
+            "usage: x-copilot learn-pilot-voice <enroll.wav> [verify.wav ...]\n\
+             (start the sidecar first: python voice/speaker_sidecar.py)"
+        ));
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?;
+
+    let print = speaker::embed(&client, &config.speaker_url, &load_wav_16k(enroll)?).await?;
+    let vp = speaker::Voiceprint { embedding: print };
+    vp.save(speaker::VOICEPRINT_PATH)?;
+    println!(
+        "Enrolled pilot voice from {enroll} ({} dims) → {}",
+        vp.embedding.len(),
+        speaker::VOICEPRINT_PATH
+    );
+
+    for f in verify {
+        match load_wav_16k(f) {
+            Ok(samples) => match speaker::embed(&client, &config.speaker_url, &samples).await {
+                Ok(emb) => {
+                    let sim = speaker::cosine(&vp.embedding, &emb);
+                    let verdict = if sim >= speaker::DEFAULT_THRESHOLD { "ACCEPT" } else { "reject" };
+                    println!("  {f}: similarity {sim:+.3}  [{verdict} @ {:.2}]", speaker::DEFAULT_THRESHOLD);
+                }
+                Err(e) => println!("  {f}: embed failed: {e:#}"),
+            },
+            Err(e) => println!("  {f}: {e:#}"),
+        }
+    }
+    Ok(())
 }
 
 /// Mine the logs for fast-path coverage and the LLM-fallback tail. Pairs each

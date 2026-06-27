@@ -530,6 +530,8 @@ mod tests {
             tts_sidecar_ready_secs: 90,
             tts_sidecar_temp: "0.8".into(),
             voice: String::new(),
+            speaker_url: "http://127.0.0.1:8770".into(),
+            speaker_id: false,
             aircraft: "cessna_172sp".into(),
             confirm_critical: true,
             monitor_enabled: false,

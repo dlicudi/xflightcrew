@@ -88,6 +88,15 @@ pub struct Config {
     /// = let the sidecar default (its `.active` file, set by `voice/voices.py use`,
     /// else `roger`). Forwarded to the sidecar as its env default.
     pub voice: String,
+    /// URL of the speaker-ID sidecar ([`voice/speaker_sidecar.py`]) used to
+    /// recognise the pilot's voice. POST raw f32 16 kHz PCM to `/embed`.
+    pub speaker_url: String,
+    /// Gate commands on the enrolled pilot voiceprint — recognise the pilot and
+    /// ignore ATC/ambient, so continuous mode needs no wake word. Off by default;
+    /// requires a voiceprint (run `learn-pilot-voice`) and the sidecar running.
+    /// Falls back to the wake word if the sidecar's down or no voiceprint exists.
+    #[allow(dead_code)] // consumed by the in-loop gate (next phase)
+    pub speaker_id: bool,
     /// Path to X-Plane's `earth_nav.dat` (for ILS lookup).
     pub nav_data_path: String,
     /// Active aircraft profile id (see [`crate::aircraft`]), e.g. `cessna_172sp`.
@@ -142,6 +151,8 @@ impl Config {
                 .unwrap_or(90),
             tts_sidecar_temp: env_or("XCOPILOT_TTS_SIDECAR_TEMP", "0.6"),
             voice: env_or("XCOPILOT_VOICE", ""),
+            speaker_url: env_or("XCOPILOT_SPEAKER_URL", "http://127.0.0.1:8770"),
+            speaker_id: env_or("XCOPILOT_SPEAKER_ID", "false") == "true",
             nav_data_path: env_or(
                 "XPLANE_NAV_DATA",
                 "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_nav.dat",
