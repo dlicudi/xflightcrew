@@ -13,6 +13,7 @@ mod checklist;
 mod config;
 mod datarefs;
 mod grammar;
+mod livestate;
 mod llm;
 mod monitor;
 mod nav;
@@ -36,6 +37,7 @@ use anyhow::{anyhow, Result};
 
 use audio::Listener;
 use config::Config;
+use livestate::LiveState;
 use llm::{Decision, Llm};
 use stt::Stt;
 use tools::{Registry, ToolCtx};
@@ -253,6 +255,10 @@ async fn run_session(
     // (main for plain, the voice thread for TUI) — a reqwest client's I/O is
     // bound to the runtime it's used on.
     let xplane = XPlaneClient::new(config.xplane_base_url.clone());
+    // Subscribe to the continuously-read state over the WebSocket so snapshots are
+    // instant cache reads instead of a REST burst. Best-effort: reads fall back to
+    // REST until (or unless) the subscription warms up.
+    let live = LiveState::start(&config.xplane_base_url, SNAPSHOT_DATAREFS);
     let mut specs = registry.specs();
     // Each checklist is exposed to the LLM as a no-arg "tool" the loop intercepts
     // and runs interactively.
@@ -405,7 +411,7 @@ async fn run_session(
         } else {
             // Fast-path missed — now the LLM needs live state.
             let ts = Instant::now();
-            let snap = state_snapshot(&xplane, &profile).await;
+            let snap = state_snapshot(&xplane, &profile, Some(&live)).await;
             tracing::info!(ms = ts.elapsed().as_millis(), state = snap.as_deref().unwrap_or("(none)"), "state snapshot");
             let t = Instant::now();
             let decision = llm.act_or_answer(&command, &specs, &ctx_history, snap.as_deref()).await;
@@ -488,7 +494,7 @@ async fn run_session(
                         // A fast-path command never took the snapshot — take it now
                         // so the correction is grounded in live state.
                         if state.is_none() {
-                            state = state_snapshot(&xplane, &profile).await;
+                            state = state_snapshot(&xplane, &profile, Some(&live)).await;
                         }
                         match llm.choose_tool(&format!("{command}, {correction}"), &specs, &ctx_history, state.as_deref()).await {
                             Ok(mut cs) if !cs.is_empty() => {
@@ -938,32 +944,59 @@ fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
     reporter.status(ui::Phase::Listening);
 }
 
+/// The datarefs the live-state cache subscribes to over the WebSocket — the
+/// continuously-read snapshot + autopilot-status set. (Arrays like engine-running,
+/// and the tool path's read-after-write confirms, stay on REST.)
+const SNAPSHOT_DATAREFS: &[&str] = &[
+    datarefs::ALTITUDE_FT, datarefs::AIRSPEED_KTS, datarefs::VVI_FPM,
+    datarefs::COMPASS_HEADING_DEG, datarefs::FLAP_RATIO, datarefs::GEAR_HANDLE_DOWN,
+    datarefs::ON_GROUND_ANY, datarefs::FUEL_TOTAL_KG, datarefs::WIND_HEADING_DEG,
+    datarefs::WIND_SPEED_KTS, datarefs::OAT_DEG_C, datarefs::VISIBILITY_SM,
+    datarefs::QNH_PASCALS, datarefs::SERVOS_ON, datarefs::APPROACH_STATUS,
+    datarefs::NAV_STATUS, datarefs::HEADING_STATUS,
+];
+
+/// Read a dataref preferring the live-state cache (instant, no round-trip), with a
+/// REST read as the fallback on a cache miss — so it's never worse than polling
+/// and near-free once the WebSocket subscription is warm.
+async fn read1(live: Option<&LiveState>, xp: &XPlaneClient, name: &str) -> Result<f64> {
+    if let Some(v) = live.and_then(|l| l.get(name)) {
+        return Ok(v);
+    }
+    xp.get_float(name).await
+}
+
 /// A compact live-state line for the LLM's context, so it can ground relative or
 /// ambiguous commands ("a bit more flaps", "level off") in what's actually true.
 /// Each field is best-effort: a dataref that won't read is skipped, and if none
 /// read (X-Plane unreachable) this returns `None` and the model runs context-free.
-async fn state_snapshot(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> Option<String> {
-    // Fire every read concurrently — done sequentially this added ~130ms of
-    // round-trips per command (and hit X-Plane's web server in a burst).
+async fn state_snapshot(
+    xp: &XPlaneClient,
+    profile: &aircraft::AircraftProfile,
+    live: Option<&LiveState>,
+) -> Option<String> {
+    // Reads prefer the live-state WebSocket cache (instant, no round-trip) and
+    // fall back to a concurrent REST read on a cache miss — so this is never worse
+    // than the old all-REST burst, and near-free once the subscription is warm.
     let (alt, ias, vs, hdg, flap, gear, og, fuel, ap, engine, wind_dir, wind_kts, oat, vis, qnh) = tokio::join!(
-        xp.get_float(datarefs::ALTITUDE_FT),
-        xp.get_float(datarefs::AIRSPEED_KTS),
-        xp.get_float(datarefs::VVI_FPM),
-        xp.get_float(datarefs::COMPASS_HEADING_DEG),
-        xp.get_float(datarefs::FLAP_RATIO),
-        xp.get_float(datarefs::GEAR_HANDLE_DOWN),
-        xp.get_float(datarefs::ON_GROUND_ANY),
-        xp.get_float(datarefs::FUEL_TOTAL_KG),
-        ap_mode(xp),
+        read1(live, xp, datarefs::ALTITUDE_FT),
+        read1(live, xp, datarefs::AIRSPEED_KTS),
+        read1(live, xp, datarefs::VVI_FPM),
+        read1(live, xp, datarefs::COMPASS_HEADING_DEG),
+        read1(live, xp, datarefs::FLAP_RATIO),
+        read1(live, xp, datarefs::GEAR_HANDLE_DOWN),
+        read1(live, xp, datarefs::ON_GROUND_ANY),
+        read1(live, xp, datarefs::FUEL_TOTAL_KG),
+        ap_mode(xp, live),
         checklist::engine_running(xp),
         // Weather, so "what's the weather?" gets real numbers. Wind/OAT are the
         // cockpit-relative indicators (mirror the gauges); visibility and QNH come
         // from the XP12 aircraft-weather datarefs. All confirmed reading live.
-        xp.get_float(datarefs::WIND_HEADING_DEG),
-        xp.get_float(datarefs::WIND_SPEED_KTS),
-        xp.get_float(datarefs::OAT_DEG_C),
-        xp.get_float(datarefs::VISIBILITY_SM),
-        xp.get_float(datarefs::QNH_PASCALS),
+        read1(live, xp, datarefs::WIND_HEADING_DEG),
+        read1(live, xp, datarefs::WIND_SPEED_KTS),
+        read1(live, xp, datarefs::OAT_DEG_C),
+        read1(live, xp, datarefs::VISIBILITY_SM),
+        read1(live, xp, datarefs::QNH_PASCALS),
     );
     let mut parts: Vec<String> = Vec::new();
     if let Ok(v) = alt {
@@ -1031,18 +1064,18 @@ async fn poll_aircraft(xp: &XPlaneClient) -> Option<ui::Aircraft> {
         ias: xp.get_float(datarefs::AIRSPEED_KTS).await.ok()?,
         vsi: xp.get_float(datarefs::VVI_FPM).await.ok()?,
         flaps_pct: xp.get_float(datarefs::FLAP_RATIO).await.ok()? * 100.0,
-        ap_mode: ap_mode(xp).await,
+        ap_mode: ap_mode(xp, None).await,
     })
 }
 
-/// Summarize the active autopilot lateral mode for the panel.
-async fn ap_mode(xp: &XPlaneClient) -> String {
-    // Concurrent reads — this is called inside state_snapshot's hot path.
+/// Summarize the active autopilot lateral mode for the panel. Reads prefer the
+/// live-state cache when given one (snapshot's hot path), else REST (the poller).
+async fn ap_mode(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
     let (servos, appr, nav, hdg) = tokio::join!(
-        xp.get_float(datarefs::SERVOS_ON),
-        xp.get_float(datarefs::APPROACH_STATUS),
-        xp.get_float(datarefs::NAV_STATUS),
-        xp.get_float(datarefs::HEADING_STATUS),
+        read1(live, xp, datarefs::SERVOS_ON),
+        read1(live, xp, datarefs::APPROACH_STATUS),
+        read1(live, xp, datarefs::NAV_STATUS),
+        read1(live, xp, datarefs::HEADING_STATUS),
     );
     if servos.unwrap_or(0.0) <= 0.5 {
         return "--".to_string();
