@@ -79,11 +79,14 @@ fn open_input() -> Result<Input> {
 /// sensible PTT keys; returns `None` for an unknown name.
 pub fn parse_ptt_key(s: &str) -> Option<device_query::Keycode> {
     use device_query::Keycode::*;
-    Some(match s.to_ascii_lowercase().replace(['_', '-', ' '], "").as_str() {
+    let key = match s.to_ascii_lowercase().replace(['_', '-', ' '], "").as_str() {
+        // Mac modifiers: Command = Meta, Option = Option (NOT Alt) in device_query.
+        "rcmd" | "rightcommand" | "rightcmd" => RMeta,
+        "lcmd" | "leftcommand" | "leftcmd" => LMeta,
+        "ralt" | "roption" | "rightoption" | "rightalt" => ROption,
+        "lalt" | "loption" | "leftoption" | "leftalt" => LOption,
         "rctrl" | "rightctrl" | "rcontrol" => RControl,
         "lctrl" | "leftctrl" | "lcontrol" => LControl,
-        "ralt" | "rightalt" | "rightoption" => RAlt,
-        "lalt" | "leftalt" | "leftoption" => LAlt,
         "rshift" | "rightshift" => RShift,
         "lshift" | "leftshift" => LShift,
         "space" => Space,
@@ -92,8 +95,11 @@ pub fn parse_ptt_key(s: &str) -> Option<device_query::Keycode> {
         "f8" => F8,
         "f9" => F9,
         "f10" => F10,
-        _ => return None,
-    })
+        // Otherwise accept a raw device_query keycode name (e.g. "RMeta", "Command")
+        // so any key found via `key-probe` works without a code change.
+        _ => return s.parse().ok(),
+    };
+    Some(key)
 }
 
 /// Record while a global PTT key is held — works regardless of which window has

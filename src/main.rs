@@ -78,6 +78,25 @@ async fn main() -> Result<()> {
         return audio::mic_check(config.vad_threshold);
     }
 
+    // `cargo run -- key-probe` prints each key's name as you press it, so you can
+    // find the right value for XCOPILOT_PTT_KEY (e.g. press Right Command → "RMeta").
+    if std::env::args().nth(1).as_deref() == Some("key-probe") {
+        use device_query::{DeviceQuery, DeviceState};
+        let ds = DeviceState::new();
+        println!("Press a key to see its name (grant Input Monitoring if prompted). Ctrl-C to quit.");
+        let mut last: Vec<device_query::Keycode> = Vec::new();
+        loop {
+            let keys = ds.get_keys();
+            if keys != last {
+                if !keys.is_empty() {
+                    println!("  {keys:?}");
+                }
+                last = keys;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+    }
+
     // `cargo run -- transcribe <audio-file>` prints the whisper transcript of a
     // clip to stdout and exits. Used by `voice/voices.py` to auto-caption an
     // imported voice sample (Spark needs the reference text to match the audio).
