@@ -29,3 +29,10 @@
 - { say: "level off",            tool: level_off }
 - { say: "autopilot off",        tool: autopilot_off }
 - { say: "parking brake set",    tool: set_parking_brake, args: { on: true } }
+
+# Questions (no `tool:`) — the LLM answers these from the state snapshot, so they
+# don't resolve to a fast-path tool. WER-only: they just verify STT hears them.
+- { say: "how much fuel do we have" }
+- { say: "what's our endurance" }
+- { say: "how long can we fly" }
+- { say: "what's our altitude" }
