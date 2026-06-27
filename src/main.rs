@@ -1031,7 +1031,19 @@ async fn state_snapshot(
         parts.push(format!("on the ground: {}", if v > 0.5 { "yes" } else { "no" }));
     }
     if let Ok(v) = fuel {
-        parts.push(format!("fuel on board {v:.0} kilograms"));
+        // Report in gallons (how a GA pilot thinks) with the mass alongside, plus an
+        // endurance estimate from the profile's cruise burn so "how long can we fly?"
+        // has a real answer. 100LL avgas ≈ 2.72 kg/gal (~6 lb/gal).
+        const AVGAS_KG_PER_GAL: f64 = 2.72;
+        let gal = v / AVGAS_KG_PER_GAL;
+        let mut s = format!("fuel on board {gal:.0} gallons ({v:.0} kg)");
+        if let Some(f) = &profile.fuel {
+            if f.cruise_burn_kg_hr > 0.0 {
+                let hours = v / f.cruise_burn_kg_hr;
+                s.push_str(&format!(", about {hours:.1} hours endurance at cruise"));
+            }
+        }
+        parts.push(s);
     }
     // Weather: wind as "direction at speed" (calm if barely moving), plus OAT.
     if let (Ok(dir), Ok(spd)) = (wind_dir, wind_kts) {
