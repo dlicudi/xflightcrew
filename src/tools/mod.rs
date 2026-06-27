@@ -16,6 +16,7 @@ pub mod controls;
 pub mod electrical;
 pub mod engine;
 pub mod flaps;
+pub mod ground;
 pub mod instruments;
 pub mod lights;
 pub mod radio;
@@ -26,15 +27,31 @@ use serde_json::Value;
 
 use crate::aircraft::AircraftProfile;
 use crate::config::Config;
-use crate::xplane::XPlaneClient;
+use crate::voice::Voice;
+use crate::xplane::XPlane;
+
+// Datarefs/commands shared by more than one tool module, defined once here so the
+// two readers can't silently drift. Datarefs private to a single tool stay in
+// that tool's module.
+
+/// Parking-brake ratio dataref (0 = off, 1 = set). Written by `set_parking_brake`
+/// and read by `stop_engine`'s pre-shutdown check.
+pub(crate) const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
+/// Command: engage the autopilot servos. Pressed by the AP-mode tools
+/// (`set_heading`/`set_altitude`/…) and by the ILS setup in `approach`.
+pub(crate) const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 
 /// Shared context handed to every tool invocation.
 pub struct ToolCtx<'a> {
-    pub xplane: &'a XPlaneClient,
+    pub xplane: &'a dyn XPlane,
     // Available to tools that need global config; unused by `set_flaps` (its
     // limits come from the aircraft profile).
     #[allow(dead_code)]
     pub config: &'a Config,
+    /// The speech arbiter, for the rare action that announces *later* than its
+    /// readback — the autopilot capture watcher calls out the level-off when it
+    /// reaches the target, minutes after the command. `None` outside the live loop.
+    pub voice: Option<&'a Voice>,
 }
 
 /// One curated action the copilot can take.
@@ -93,6 +110,7 @@ impl Registry {
             tools.push(Box::new(autopilot::SetHeading));
             tools.push(Box::new(autopilot::SetAltitude));
             tools.push(Box::new(autopilot::SetVerticalSpeed));
+            tools.push(Box::new(autopilot::SetClimb));
             tools.push(Box::new(autopilot::LevelOff));
             tools.push(Box::new(autopilot::AutopilotOff));
         }
@@ -138,6 +156,7 @@ impl Registry {
 
         if profile.barometer {
             tools.push(Box::new(instruments::SetBarometer));
+            tools.push(Box::new(instruments::SetAltimeterCurrent));
         }
 
         if profile.directional_gyro {
@@ -166,6 +185,13 @@ impl Registry {
         if profile.ils {
             tools.push(Box::new(approach::PrepareIls));
         }
+
+        // Ramp / ground-ops — sim ground-crew actions (chocks, ground power,
+        // pushback, services). Not airframe systems, so available on any aircraft.
+        tools.push(Box::new(ground::SetChocks));
+        tools.push(Box::new(ground::SetGroundPower));
+        tools.push(Box::new(ground::Pushback));
+        tools.push(Box::new(ground::RequestService));
 
         // Checklists are NOT registered as one-shot tools — the copilot runs them
         // interactively (narrate + act + verify + call out the pilot's items),

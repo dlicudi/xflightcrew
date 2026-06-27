@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
@@ -118,9 +118,14 @@ fn color(k: LogKind) -> Color {
 /// Dashboard UI state.
 struct App {
     title: String,
+    /// Active engines, shown right-of-status ("whisper base.en · llm qwen3:8b · tts say").
+    engines: String,
     log: Vec<(LogKind, String)>,
     phase: Phase,
     mic: f32,
+    /// Default input device name, shown in the mic panel title. Queried once at
+    /// startup (the OS default doesn't change mid-session for our purposes).
+    mic_name: Option<String>,
     aircraft: Aircraft,
     commands: Vec<String>,
     /// Typed-command line (you can type a command instead of speaking it).
@@ -128,6 +133,9 @@ struct App {
     /// Text mode: Enter enters it, Esc leaves. In command mode `q` quits; in text
     /// mode every key types (so `q` is a normal letter, e.g. "qnh 2992").
     editing: bool,
+    /// Scroll offset (top row) of the "say" example-command panel — Up/Down in
+    /// command mode scroll it, since the list is longer than the panel.
+    say_scroll: usize,
 }
 
 const MAX_LOG: usize = 500;
@@ -146,6 +154,7 @@ const MIC_REDRAW_STEP: f32 = 0.002;
 /// `rx` for updates and polls the keyboard for `q`/Esc/Ctrl-C.
 pub fn run_dashboard(
     title: String,
+    engines: String,
     commands: Vec<String>,
     rx: Receiver<Report>,
     cmd_tx: Sender<String>,
@@ -153,13 +162,16 @@ pub fn run_dashboard(
     let mut terminal = ratatui::init();
     let mut app = App {
         title,
+        engines,
         log: Vec::new(),
         phase: Phase::Idle,
         mic: 0.0,
+        mic_name: crate::audio::default_input_name(),
         aircraft: Aircraft::default(),
         commands,
         input: String::new(),
         editing: false,
+        say_scroll: 0,
     };
 
     // Redraw only when something visibly changed, not on a fixed timer — a full
@@ -248,11 +260,21 @@ pub fn run_dashboard(
                             _ => {}
                         }
                     } else {
-                        // Command mode: q/Esc quit; Enter opens the text line.
+                        // Command mode: q/Esc quit; Enter opens the text line;
+                        // Up/Down scroll the "say" example panel.
                         match k.code {
                             KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                             KeyCode::Enter => {
                                 app.editing = true;
+                                dirty = true;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.say_scroll =
+                                    (app.say_scroll + 1).min(app.commands.len().saturating_sub(1));
+                                dirty = true;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.say_scroll = app.say_scroll.saturating_sub(1);
                                 dirty = true;
                             }
                             _ => {}
@@ -284,12 +306,24 @@ fn draw(f: &mut Frame, app: &App) {
         Phase::Speaking => ("◑", "speaking", Color::Cyan),
         Phase::Idle => ("○", "idle", Color::DarkGray),
     };
+    // Title + phase on the left; the active engines right-aligned on the same line.
+    let [status_left, status_right] =
+        Layout::horizontal([Constraint::Min(20), Constraint::Length(app.engines.len() as u16 + 1)])
+            .areas(status);
     let status_line = Line::from(vec![
         Span::styled(format!(" {} ", app.title), Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(format!("{dot} {label}"), Style::default().fg(c)),
     ]);
-    f.render_widget(Paragraph::new(status_line), status);
+    f.render_widget(Paragraph::new(status_line), status_left);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!("{} ", app.engines),
+            Style::default().fg(Color::DarkGray),
+        ))
+        .alignment(Alignment::Right),
+        status_right,
+    );
 
     // --- body: log (left) | aircraft + commands (right) ---
     let [left, right] = Layout::horizontal([Constraint::Min(30), Constraint::Length(26)]).areas(body);
@@ -315,9 +349,13 @@ fn draw(f: &mut Frame, app: &App) {
     );
 
     let level = (app.mic * 12.0).clamp(0.0, 1.0) as f64; // ~0.08 RMS ≈ full
+    let mic_title = match &app.mic_name {
+        Some(name) => format!(" mic · {name} "),
+        None => " mic ".to_string(),
+    };
     f.render_widget(
         Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" mic "))
+            .block(Block::default().borders(Borders::ALL).title(mic_title))
             .gauge_style(Style::default().fg(Color::Green))
             .ratio(level)
             .label(format!("{:.3}", app.mic)),
@@ -342,13 +380,25 @@ fn draw(f: &mut Frame, app: &App) {
         acarea,
     );
 
-    let cmds: Vec<ListItem> = app
-        .commands
+    // "say" example panel — scrollable (Up/Down in command mode) since the hint
+    // list is longer than the box. Slice from the scroll offset, clamped so the
+    // last page can't scroll into emptiness, and flag more-above/below in the title.
+    let rows = cmdarea.height.saturating_sub(2).max(1) as usize;
+    let len = app.commands.len();
+    let max_start = len.saturating_sub(rows);
+    let start = app.say_scroll.min(max_start);
+    let cmds: Vec<ListItem> = app.commands[start..]
         .iter()
+        .take(rows)
         .map(|c| ListItem::new(Span::styled(c.clone(), Style::default().fg(Color::DarkGray))))
         .collect();
+    let title = if len > rows {
+        format!(" say {}{} ", if start > 0 { "↑" } else { " " }, if start < max_start { "↓" } else { " " })
+    } else {
+        " say ".to_string()
+    };
     f.render_widget(
-        List::new(cmds).block(Block::default().borders(Borders::ALL).title(" say ")),
+        List::new(cmds).block(Block::default().borders(Borders::ALL).title(title)),
         cmdarea,
     );
 

@@ -5,9 +5,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{Tool, ToolCtx};
+use super::{Tool, ToolCtx, PARK_BRAKE};
 
-const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 /// Elevator trim, -1.0 (full nose down) .. +1.0 (full nose up), 0 = neutral.
 const ELEV_TRIM: &str = "sim/cockpit2/controls/elevator_trim";
 /// How much one "trim nose up/down" nudge moves the trim wheel.

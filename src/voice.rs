@@ -158,6 +158,74 @@ impl Voice {
     }
 }
 
+/// How the speaker thread turns text into sound. Built once, reused for every
+/// utterance — which is what lets the in-process ONNX backend keep its model
+/// session warm (the subprocess `say`/`piper` paths are stateless per call).
+enum Speaker {
+    /// Shell out per utterance: `say` or `piper` (see [`tts::speak`]).
+    Subprocess(Config),
+    /// In-process warm ONNX session (feature `onnx-tts`, `XCOPILOT_TTS=onnx`).
+    #[cfg(feature = "onnx-tts")]
+    Onnx(Box<crate::tts_onnx::OnnxTts>),
+    /// Warm Spark voice-clone sidecar (`XCOPILOT_TTS=sidecar`).
+    Sidecar(crate::tts_sidecar::SidecarTts),
+}
+
+impl Speaker {
+    fn build(mut config: Config) -> Self {
+        if config.tts_backend == "sidecar" {
+            let built = if config.tts_sidecar_autospawn {
+                crate::tts_sidecar::SidecarTts::spawn(
+                    &config.tts_sidecar_url,
+                    &config.tts_sidecar_python,
+                    &config.tts_sidecar_temp,
+                    &config.voice,
+                    std::time::Duration::from_secs(config.tts_sidecar_ready_secs),
+                )
+            } else {
+                Ok(crate::tts_sidecar::SidecarTts::connect(config.tts_sidecar_url.clone()))
+            };
+            match built {
+                Ok(engine) => {
+                    tracing::info!(url = %config.tts_sidecar_url, "TTS: Spark voice-clone sidecar");
+                    return Speaker::Sidecar(engine);
+                }
+                Err(e) => {
+                    tracing::error!("sidecar TTS unavailable ({e:#}); falling back to `say`");
+                    config.tts_backend = "say".into();
+                }
+            }
+        }
+        #[cfg(feature = "onnx-tts")]
+        if config.tts_backend == "onnx" {
+            match crate::tts_onnx::OnnxTts::load(&config.piper_voice) {
+                Ok(engine) => {
+                    tracing::info!(model = %config.piper_voice, "TTS: warm in-process ONNX session");
+                    return Speaker::Onnx(Box::new(engine));
+                }
+                Err(e) => {
+                    tracing::error!("onnx TTS load failed ({e:#}); falling back to `say`");
+                    config.tts_backend = "say".into();
+                }
+            }
+        }
+        // `onnx` requested but the feature isn't built in → fall back to `say`.
+        if config.tts_backend == "onnx" {
+            config.tts_backend = "say".into();
+        }
+        Speaker::Subprocess(config)
+    }
+
+    fn speak(&mut self, text: &str) -> anyhow::Result<()> {
+        match self {
+            Speaker::Subprocess(config) => tts::speak(config, text),
+            #[cfg(feature = "onnx-tts")]
+            Speaker::Onnx(engine) => engine.speak(text),
+            Speaker::Sidecar(engine) => engine.speak(text),
+        }
+    }
+}
+
 /// The speaker thread: pop the highest-priority utterance (blocking until one is
 /// available), speak it to completion, signal any blocked caller, repeat.
 ///
@@ -165,6 +233,7 @@ impl Voice {
 /// drains — so a burst of utterances stays gated end to end, with no momentary
 /// gap between them for the mic to slip through.
 fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
+    let mut speaker = Speaker::build(config);
     loop {
         let mut q = inner.queue.lock().unwrap();
         let utt = loop {
@@ -182,7 +251,7 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         drop(q); // release the queue while we speak (which is slow)
 
         gate.set_speaking(true);
-        if let Err(e) = tts::speak(&config, &utt.text) {
+        if let Err(e) = speaker.speak(&utt.text) {
             tracing::warn!("TTS failed: {e:#}");
         }
 

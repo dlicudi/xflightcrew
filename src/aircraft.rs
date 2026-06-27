@@ -27,6 +27,10 @@ pub struct AircraftProfile {
     /// callouts. `None` means no stall caution.
     #[serde(default)]
     pub vs_clean_kts: Option<f64>,
+    /// Never-exceed speed (Vne), KIAS — drives the monitor's overspeed callout.
+    /// `None` means no overspeed caution.
+    #[serde(default)]
+    pub vne_kts: Option<f64>,
     /// Path to an XChecklist file to interpret (relative to the working dir).
     /// `None` means no checklists for this airframe. The file is read-only input;
     /// the copilot interprets it (see [`crate::checklist`]).
@@ -489,6 +493,8 @@ fn cessna_172sp() -> AircraftProfile {
         }),
         // 172SP clean stall ~48 KIAS (power-off, flaps up).
         vs_clean_kts: Some(48.0),
+        // 172SP Vne (never-exceed) 163 KIAS.
+        vne_kts: Some(163.0),
         checklist: Some("checklists/cessna_172sp.txt".into()),
         checklist_map: {
             let m = |s: &str, a: ChecklistAction| ChecklistMapEntry { match_: s.into(), action: a };
@@ -651,6 +657,8 @@ fn cirrus_sr22() -> AircraftProfile {
         }),
         // VS1 (clean) ~76 KIAS; VS0 (landing) ~61.
         vs_clean_kts: Some(76.0),
+        // SR22 Vne (never-exceed) 205 KIAS.
+        vne_kts: Some(205.0),
         checklist: Some("checklists/cirrus_sr22.txt".into()),
         // Lights — datarefs verified against the rustdecks SR22 deck; universal
         // on/off commands.

@@ -8,12 +8,16 @@
 //! profiles), so the tool owns them; the aircraft profile only declares that an
 //! autopilot exists.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{Tool, ToolCtx};
+use super::{Tool, ToolCtx, CMD_SERVOS_ON};
+use crate::voice::{Priority, Voice};
+use crate::xplane::XPlaneClient;
 
 /// Pilot-side heading bug, degrees magnetic (writable).
 const HEADING_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
@@ -25,9 +29,7 @@ const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 /// verified against the rustdecks SR22 deck, which reads/writes VS here.
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 /// Servo engagement status (read-only; 1 = autopilot flying).
-const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";
-/// Command: engage the servos.
-const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
+const SERVOS_ON: &str = crate::datarefs::SERVOS_ON;
 /// Command: disconnect the autopilot. The stock 172's S-TEC-style AP has no
 /// master switch and does not register `sim/autopilot/servos_off`. X-Plane
 /// exposes `servos_off_any` ("disco servos, whichever side is active") and the
@@ -42,7 +44,7 @@ const CMD_ALT_HOLD: &str = "sim/autopilot/altitude_hold";
 /// Command: wings-level / roll hold — for "auto level" / "straight and level".
 const CMD_WING_LEVELER: &str = "sim/autopilot/wing_leveler";
 /// Current indicated altitude (feet), read to capture "hold this altitude".
-const CURRENT_ALT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot";
+const CURRENT_ALT: &str = crate::datarefs::ALTITUDE_FT;
 /// Autopilot altitude targets below this (feet MSL) are refused — a 172's AP is
 /// never commanded this low, so it's almost always a misheard/empty value (e.g.
 /// "auto level" misread as altitude 0). The gate catches it before the AP flies
@@ -50,10 +52,23 @@ const CURRENT_ALT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot";
 const MIN_AP_ALTITUDE_FT: f64 = 500.0;
 /// Command: engage vertical-speed (VS) mode.
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
+/// Throttle (all engines), 0..1. A commanded climb sets this to full — the AP
+/// only controls pitch, so without power a 172 trades airspeed for altitude.
+const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
+/// Throttle restored once a climb captures its target / on level-off (~cruise
+/// power for a 172). Not a precise %, just "off the climb stop" so the aircraft
+/// settles at the altitude instead of accelerating at full power.
+const CRUISE_THROTTLE: f64 = 0.65;
+/// The capture watcher only backs off the throttle *it* firewalled to full. If
+/// the pilot has since taken manual throttle (set_throttle writes the same
+/// dataref), it will read below this floor — and the watcher stands down rather
+/// than clobbering the pilot's setting back to cruise. The firewall sets 1.0 and
+/// cruise is 0.65, so a value below 0.9 means a human moved it.
+const FIREWALL_HANDBACK_FLOOR: f64 = 0.9;
 /// Mode status datarefs (0 = off, >0 = armed/engaged). Read before pressing a
 /// mode command, because the `sim/autopilot/*` mode commands are TOGGLES: firing
 /// one while its mode is already active switches it back OFF.
-const HEADING_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
+const HEADING_STATUS: &str = crate::datarefs::HEADING_STATUS;
 const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
 const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
 /// Descents steeper than this (fpm) are confirmed — anything shallower, and all
@@ -79,6 +94,309 @@ async fn engage_mode(ctx: &ToolCtx<'_>, status: &str, command: &str) -> Result<(
         ctx.xplane.run_command(command).await?;
     }
     Ok(())
+}
+
+/// Default climb/descent rate (fpm) for an altitude change with no rate given.
+/// Gentle on purpose: a 172 climbs ~500-700 fpm flat-out, and the copilot isn't
+/// managing power, so a high commanded VS just bleeds airspeed. 300 is safe for
+/// both climb and descent; say an explicit rate ("climb to X at 700") for more.
+const DEFAULT_VS_FPM: f64 = 300.0;
+/// Max climb rate (fpm) the 172 sustains at full power without bleeding airspeed —
+/// the cap when auto-scaling the rate to the altitude change. (Per-airframe later.)
+const MAX_CLIMB_FPM: f64 = 700.0;
+/// Max auto descent rate (fpm) commanded for an altitude change — gentle enough
+/// not to build speed toward Vne without active power management. (Per-airframe.)
+const MAX_DESCENT_FPM: f64 = 1000.0;
+/// Altitude targets above this (ft MSL) are refused — above the airframe's
+/// service ceiling it can't get there. (Per-airframe later; 172 ≈ 14,000.)
+const SERVICE_CEILING_FT: f64 = 14_000.0;
+/// Minimum height above the terrain below (ft) an altitude target may be. Replaces
+/// a fixed MSL floor, which is meaningless at a high-elevation airport.
+const MIN_TARGET_AGL_FT: f64 = 500.0;
+/// Feet per meter — `y_agl` is metres.
+const METERS_TO_FEET: f64 = 3.280_84;
+/// Within this many feet of the target, treat it as "hold here" (no climb), and
+/// the band the capture watcher uses to detect a pilot re-command (dial moved).
+const ALT_CAPTURE_BAND_FT: f64 = 100.0;
+/// The watcher levels off once the aircraft *reaches* the target in its direction
+/// of travel (climb: at/above; descent: at/below), minus this small lead so the
+/// roll-out settles on the target rather than the band edge. Reliable because the
+/// watcher polls fast near the target (see `capture_at_altitude`); tune against the
+/// "capture" log line if the AP consistently settles above/below the target.
+const CAPTURE_LEAD_FT: f64 = 0.0;
+/// Inside this distance from the target, the watcher polls fast so the level-off
+/// isn't skipped between ticks even at a brisk rate.
+const CAPTURE_APPROACH_FT: f64 = 400.0;
+
+/// Vertical speed (fpm, magnitude) for an altitude change of `delta_ft`: scaled so
+/// any change captures in roughly three minutes, floored at the gentle default so
+/// small steps aren't sluggish, and capped at the airframe's sustainable rate for
+/// the direction so a commanded climb never outruns the available power.
+fn auto_vs_fpm(delta_ft: f64, climb: bool) -> f64 {
+    let cap = if climb { MAX_CLIMB_FPM } else { MAX_DESCENT_FPM };
+    (delta_ft.abs() / 3.0).clamp(DEFAULT_VS_FPM, cap)
+}
+
+/// The lowest safe target altitude (ft MSL): the terrain below plus a margin.
+/// `agl_m` is height above ground in metres, `current_msl` the current altitude.
+fn terrain_floor_ft(current_msl: f64, agl_m: f64) -> f64 {
+    let ground = current_msl - agl_m * METERS_TO_FEET;
+    ground + MIN_TARGET_AGL_FT
+}
+
+/// Reject an altitude target that's above the ceiling or into the terrain. Returns
+/// `Some(refusal)` to speak back, or `None` if the target is safe to fly to. Fails
+/// safe: if the terrain read is unavailable, falls back to the fixed MSL floor.
+async fn reject_unsafe_target(ctx: &ToolCtx<'_>, target: f64) -> Option<String> {
+    if target > SERVICE_CEILING_FT {
+        return Some(format!(
+            "Negative — {target:.0} feet is above this aircraft's service ceiling. \
+             Say something at or below {SERVICE_CEILING_FT:.0}."
+        ));
+    }
+    let agl = ctx.xplane.get_float(crate::datarefs::AGL_METERS).await.ok();
+    let current = ctx.xplane.get_float(CURRENT_ALT).await.ok();
+    match (agl, current) {
+        (Some(agl_m), Some(current_msl)) => {
+            let floor = terrain_floor_ft(current_msl, agl_m);
+            if target < floor {
+                let ground = current_msl - agl_m * METERS_TO_FEET;
+                return Some(format!(
+                    "Negative — {target:.0} feet is into the terrain; the ground here is about \
+                     {ground:.0} feet. Say a higher altitude, or 'level off' to hold this one."
+                ));
+            }
+            None
+        }
+        // Terrain unknown — fall back to the fixed floor so we never fly blind low.
+        _ if target < MIN_AP_ALTITUDE_FT => Some(format!(
+            "Negative — {target:.0} feet is too low for an altitude hold. Say a target like \
+             five thousand, or 'level off' to hold your current altitude."
+        )),
+        _ => None,
+    }
+}
+
+/// Fly the autopilot to `altitude` at `rate` fpm and let it capture/level off.
+/// On this airframe ALT hold alone won't *change* altitude — you must arm the
+/// target AND command a vertical speed, so this sets both. Direction is inferred
+/// from current altitude. Returns ("Climbing to" | "Descending to" | "Holding at",
+/// commanded_fpm_magnitude, servos_engaged).
+/// `rate` is the magnitude in fpm; `None` auto-scales it to the altitude change.
+async fn fly_to(ctx: &ToolCtx<'_>, altitude: f64, rate: Option<f64>) -> Result<(&'static str, f64, bool)> {
+    let (movement, signed, capture) = arm_altitude(ctx, altitude, rate).await?;
+    // A climb/descent needs the watcher to level us off (and ease a climb throttle);
+    // a hold is already done. The watcher calls out the level-off when it reaches
+    // the target, so hand it a voice clone.
+    if let Some(was_climb) = capture {
+        capture_at_altitude(
+            ctx.config.xplane_base_url.clone(),
+            altitude,
+            was_climb,
+            ctx.voice.cloned(),
+        );
+    }
+
+    // Diagnostic: dump what the AP actually latched so a flight test shows the
+    // truth (did VS engage? is the dial holding our rate? did ALT hold sneak on?).
+    let vs_dial = ctx.xplane.get_float(VS_DIAL).await.unwrap_or(f64::NAN);
+    let vs_mode = mode_engaged(ctx, VS_STATUS).await;
+    let alt_hold_mode = mode_engaged(ctx, ALT_HOLD_STATUS).await;
+    tracing::info!(
+        target: "x_copilot::autopilot",
+        movement,
+        commanded_fpm = signed,
+        vs_dial,
+        vs_mode,
+        alt_hold_mode,
+        target_alt = altitude,
+        "fly_to latched"
+    );
+    Ok((movement, signed.abs(), servos_engaged(ctx).await?))
+}
+
+/// The synchronous part of [`fly_to`]: read the current altitude, infer the
+/// direction, and arm the autopilot (altitude window + VS mode + rate, plus the
+/// climb power firewall). Returns the movement phrase, the *signed* commanded fpm,
+/// and `Some(was_climb)` if a capture watcher should be spawned (climb/descent) or
+/// `None` for a hold. Split out from the threaded watcher so the trust-critical
+/// writes are unit-testable against a fake sim.
+async fn arm_altitude(
+    ctx: &ToolCtx<'_>,
+    altitude: f64,
+    rate: Option<f64>,
+) -> Result<(&'static str, f64, Option<bool>)> {
+    let current = ctx.xplane.get_float(CURRENT_ALT).await.unwrap_or(altitude);
+    let diff = altitude - current;
+    ctx.xplane.run_command(CMD_SERVOS_ON).await?;
+
+    if diff.abs() <= ALT_CAPTURE_BAND_FT {
+        // HOLD: we're already at it. Capture the current altitude now — this is the
+        // one case where `altitude_hold` is right (hold where you are).
+        let hold = (current / 100.0).round() * 100.0;
+        engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
+        ctx.xplane.set_float(ALT_DIAL, hold).await?;
+        return Ok(("Holding at", 0.0, None));
+    }
+
+    // CLIMB or DESCENT. Arm the target in the altitude window and fly to it in VS
+    // mode — VS is the only *active* pitch mode. Do NOT engage `altitude_hold` now:
+    // at the current altitude it would hold here and cancel the climb. Set the VS
+    // dial LAST — engaging VS snaps the dial to the live rate, so the target must be
+    // written after. The stock 172 AP does NOT reliably capture the preselected
+    // altitude from VS mode, so the watcher levels us off when we reach it.
+    let climb = diff > 0.0;
+    // Explicit rate (set_climb) is used as given; an absent rate (set_altitude)
+    // scales to the change so a big climb isn't a 30-minute crawl at 300 fpm.
+    let mag = rate.map(f64::abs).unwrap_or_else(|| auto_vs_fpm(diff, climb));
+    let signed = if climb { mag } else { -mag };
+    ctx.xplane.set_float(ALT_DIAL, altitude).await?;
+    engage_mode(ctx, VS_STATUS, CMD_VS_MODE).await?;
+    ctx.xplane.set_float(VS_DIAL, signed).await?;
+    // A climb needs power — the AP pitches up to hold VS, and on cruise power a 172
+    // just bleeds airspeed. Full throttle for the climb; the watcher eases it back
+    // to cruise at capture. (Autothrottle will replace this later.)
+    if climb {
+        let _ = ctx.xplane.set_float(THROTTLE_ALL, 1.0).await;
+    }
+    Ok((if climb { "Climbing to" } else { "Descending to" }, signed, Some(climb)))
+}
+
+/// What the capture watcher should do on a tick, given the selected-altitude dial
+/// it's watching, its `target`, and the current altitude. Pure, so the capture
+/// logic is testable without the polling thread.
+#[derive(Debug, PartialEq, Eq)]
+enum Capture {
+    /// The dial moved off our target — the pilot re-commanded; stop watching.
+    StandDown,
+    /// Not there yet — keep watching.
+    Wait,
+    /// Within the band — level off (engage ALT hold) and finish.
+    LevelOff,
+}
+
+fn capture_action(dial: f64, target: f64, current_alt: f64, climb: bool) -> Capture {
+    if (dial - target).abs() > ALT_CAPTURE_BAND_FT {
+        return Capture::StandDown; // dial moved off our target — pilot re-commanded
+    }
+    // Level off once we've arrived at the target in the direction of travel (with a
+    // small lead), so we settle on it rather than at the band edge. Directional so
+    // a climb doesn't trip on the way up to a higher re-command, etc.
+    let reached = if climb {
+        current_alt >= target - CAPTURE_LEAD_FT
+    } else {
+        current_alt <= target + CAPTURE_LEAD_FT
+    };
+    if reached {
+        Capture::LevelOff
+    } else {
+        Capture::Wait
+    }
+}
+
+/// Generation stamp for capture watchers. Each climb/descent bumps this; a watcher
+/// stands down as soon as it sees a newer generation, so at most one is ever live
+/// no matter how many altitude changes are commanded in quick succession (the
+/// `ALT_DIAL` stand-down only catches a *different* target — two commands to the
+/// same altitude, or a re-command, would otherwise stack independent watchers).
+static CLIMB_WATCHER_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Fly the AP to a selected altitude in VS mode, then **level off** there.
+///
+/// The stock 172 AP does not reliably capture the preselected altitude from VS
+/// mode on its own, so the copilot does it: a one-shot watcher polls until the
+/// aircraft reaches `target`, then engages ALT hold (idempotently — a no-op if the
+/// AP already captured) so it holds instead of flying straight through. For a
+/// `was_climb` it also eases the firewalled throttle back to cruise.
+///
+/// Own thread + runtime + client (like the dashboard poller): the session runs a
+/// current-thread runtime blocked on the audio listener between commands, so a
+/// `tokio::spawn` task would be starved — the watcher must poll independently.
+/// Self-terminating and guarded: it stands down without touching anything if a
+/// newer command supersedes it (generation), if the selector dial moves off
+/// `target` (pilot re-commanded), and it won't override a throttle the pilot has
+/// taken manually. Fire-and-forget; a dropped poll just retries next tick.
+fn capture_at_altitude(base: String, target: f64, was_climb: bool, voice: Option<Voice>) {
+    let my_gen = CLIMB_WATCHER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+        rt.block_on(async move {
+            let xp = XPlaneClient::new(base);
+            // Wall-clock budget: even a long, slow change finishes inside 20 min; if
+            // it somehow doesn't, we stop watching.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20 * 60);
+            while std::time::Instant::now() < deadline {
+                // A newer command was issued — it owns the level-off now.
+                if CLIMB_WATCHER_GEN.load(Ordering::SeqCst) != my_gen {
+                    return;
+                }
+                // Need both the selected dial (did the pilot re-command?) and the
+                // current altitude (are we there yet?) to decide; a dropped read just
+                // retries next tick.
+                let (Ok(dial), Ok(alt)) =
+                    (xp.get_float(ALT_DIAL).await, xp.get_float(CURRENT_ALT).await)
+                else {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                };
+                match capture_action(dial, target, alt, was_climb) {
+                    Capture::StandDown => return,
+                    Capture::LevelOff => {
+                        // Diagnostic: where did we engage vs the target? If the AP
+                        // settles consistently off-target, tune CAPTURE_LEAD_FT from
+                        // (alt_at_capture - target) and the settled altitude.
+                        tracing::info!(
+                            target: "x_copilot::autopilot",
+                            target_alt = target,
+                            alt_at_capture = alt,
+                            was_climb,
+                            "capture: levelling off"
+                        );
+                        // Re-affirm the exact target in the window, then engage ALT
+                        // hold so the AP holds here instead of flying through in VS.
+                        // Idempotent (the command is a toggle): if the AP already
+                        // captured on its own, leave it engaged.
+                        let _ = xp.set_float(ALT_DIAL, target).await;
+                        let held = xp.get_float(ALT_HOLD_STATUS).await.map(|v| v > 0.5).unwrap_or(false);
+                        if !held {
+                            let _ = xp.run_command(CMD_ALT_HOLD).await;
+                        }
+                        // Ease a firewalled climb back to cruise — but only if the
+                        // throttle is still where we left it (full). If the pilot took
+                        // manual throttle mid-climb (which doesn't move the alt dial,
+                        // so the stand-down never fired), it now reads below the floor —
+                        // leave it rather than overriding their setting.
+                        let mut eased = false;
+                        if was_climb {
+                            match xp.get_float(THROTTLE_ALL).await {
+                                Ok(thr) if thr >= FIREWALL_HANDBACK_FLOOR => {
+                                    let _ = xp.set_float(THROTTLE_ALL, CRUISE_THROTTLE).await;
+                                    eased = true;
+                                }
+                                _ => {} // pilot took manual throttle — don't touch it
+                            }
+                        }
+                        // Call out the capture — this lands minutes after the command,
+                        // so it's the copilot telling you it actually levelled off.
+                        if let Some(v) = &voice {
+                            let line = if eased {
+                                format!("Reached {target:.0} feet — easing the power back, levelling off.")
+                            } else {
+                                format!("Reached {target:.0} feet — levelling off.")
+                            };
+                            v.say(Priority::Readback, line);
+                        }
+                        return;
+                    }
+                    Capture::Wait => {}
+                }
+                // Poll fast near the target so the tight level-off trigger isn't
+                // skipped between ticks; slow when far to keep the load light.
+                let secs = if (alt - target).abs() <= CAPTURE_APPROACH_FT { 1 } else { 3 };
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            }
+        });
+    });
 }
 
 pub struct SetHeading;
@@ -183,37 +501,38 @@ impl Tool for SetAltitude {
         })
     }
 
-    fn confirm_prompt(&self, args: &Value) -> Option<String> {
-        let a: AltArgs = serde_json::from_value(args.clone()).ok()?;
-        Some(format!("altitude {:.0} feet", a.altitude.max(0.0)))
-    }
+    // No confirm: an altitude assignment is routine ("climb and maintain X"), and the
+    // *dangerous* mishears are already gated — `reject_unsafe_target` refuses anything
+    // into the terrain or above the service ceiling, so a misheard "climb 17000" or a
+    // descent into the ground can't execute even on the LLM-free fast-path. The
+    // readback ("descending to 2000 feet") is the catch for an in-envelope mishear,
+    // undone instantly with "level off". A confirm on every level change is friction
+    // without payoff; the steep case worth gating — a fast descent rate — still
+    // confirms in `set_vertical_speed`/`set_climb`.
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: AltArgs = serde_json::from_value(args.clone())?;
         let altitude = args.altitude.max(0.0);
 
-        // Safety gate: refuse an absurdly-low target rather than fly the aircraft
-        // toward the ground. "auto level" with no number lands here as 0 feet —
-        // refuse and point at the right tool.
-        if altitude < MIN_AP_ALTITUDE_FT {
-            return Ok(format!(
-                "Negative — {altitude:.0} feet is too low for an altitude hold. Say a target like \
-                 five thousand, or 'level off' to hold your current altitude."
-            ));
+        // Safety gate: refuse a target into the terrain or above the ceiling rather
+        // than fly the aircraft toward the ground. "auto level" with no number lands
+        // here as 0 feet — refused, and pointed at the right tool.
+        if let Some(refusal) = reject_unsafe_target(ctx, altitude).await {
+            return Ok(refusal);
         }
 
-        // Engage first, then set the target LAST (see set_heading note).
-        ctx.xplane.run_command(CMD_SERVOS_ON).await?;
-        engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
-        ctx.xplane.set_float(ALT_DIAL, altitude).await?;
-
-        let actual = ctx.xplane.get_float(ALT_DIAL).await?;
-        if servos_engaged(ctx).await? {
-            Ok(format!("Roger — autopilot engaged, altitude hold, {:.0} feet.", actual))
+        // Fly to it: arm the altitude AND command a vertical speed (ALT hold alone
+        // won't change altitude on this AP), at a rate scaled to the change, then
+        // capture and level off.
+        let (movement, _fpm, engaged) = fly_to(ctx, altitude, None).await?;
+        // fly_to firewalls the throttle on a climb; say so.
+        let power = if movement.starts_with("Climbing") { "full power, " } else { "" };
+        if engaged {
+            Ok(format!("Roger — {power}{} {altitude:.0} feet.", movement.to_lowercase()))
         } else {
             Ok(format!(
-                "Altitude set to {:.0} feet, but the autopilot didn't engage — check the AP master.",
-                actual
+                "Set to {} {altitude:.0} feet, but the autopilot didn't engage — check the AP master.",
+                movement.to_lowercase()
             ))
         }
     }
@@ -252,9 +571,17 @@ impl Tool for LevelOff {
         ctx.xplane.run_command(CMD_WING_LEVELER).await?;
         engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
         ctx.xplane.set_float(ALT_DIAL, target).await?;
+        // Settle to cruise power. Intentional even though it overrides the pilot's
+        // throttle: the only power that *holds* an altitude on a 172 is ~cruise, and
+        // the pre-level-off setting is by definition not a hold power (full from a
+        // climb would accelerate; idle from a descent would decay toward a stall).
+        // Converging to cruise from either direction is the safe default until
+        // airspeed-aware power management lands — making it conditional (leave the
+        // pilot's setting) would risk that decay when levelling from a descent.
+        let _ = ctx.xplane.set_float(THROTTLE_ALL, CRUISE_THROTTLE).await;
 
         if servos_engaged(ctx).await? {
-            Ok(format!("Roger, wings level, holding {target:.0} feet."))
+            Ok(format!("Roger, wings level, cruise power, holding {target:.0} feet."))
         } else {
             Ok(format!(
                 "Set to hold {target:.0} feet, but the autopilot didn't engage — check the AP master."
@@ -339,6 +666,83 @@ impl Tool for SetVerticalSpeed {
     }
 }
 
+/// `set_climb` — climb or descend to a target altitude at a chosen rate, then
+/// level off. Sets the AP target altitude AND vertical speed and lets the
+/// autopilot capture the altitude (it levels off on its own — no copilot polling
+/// loop, no overshoot). Direction is inferred from target vs current altitude.
+pub struct SetClimb;
+
+#[derive(Deserialize)]
+struct ClimbArgs {
+    /// Target altitude in feet MSL.
+    altitude: f64,
+    /// Climb/descent rate in feet per minute (magnitude; sign is inferred).
+    fpm: f64,
+}
+
+#[async_trait]
+impl Tool for SetClimb {
+    fn name(&self) -> &str {
+        "set_climb"
+    }
+
+    fn description(&self) -> &str {
+        "Climb or descend to a target altitude at a given rate, then level off \
+         automatically (the autopilot captures the altitude). One command for \
+         'climb to 7000 at 500', 'descend to 2000 at a thousand', 'take us up to \
+         5500 at 700', 'bring us down to 3000 at 500 feet per minute'. Direction \
+         is inferred from the target vs current altitude; fpm is the rate."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "altitude": {
+                    "type": "integer", "minimum": 0, "maximum": 60000,
+                    "description": "Target altitude in feet MSL."
+                },
+                "fpm": {
+                    "type": "integer", "minimum": 0, "maximum": 2000,
+                    "description": "Climb/descent rate in feet per minute (magnitude)."
+                }
+            },
+            "required": ["altitude", "fpm"]
+        })
+    }
+
+    fn confirm_prompt(&self, args: &Value) -> Option<String> {
+        let a: ClimbArgs = serde_json::from_value(args.clone()).ok()?;
+        Some(format!("altitude {:.0} feet at {:.0} feet per minute", a.altitude.max(0.0), a.fpm.abs()))
+    }
+
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let args: ClimbArgs = serde_json::from_value(args.clone())?;
+        let altitude = args.altitude.max(0.0);
+        if let Some(refusal) = reject_unsafe_target(ctx, altitude).await {
+            return Ok(refusal);
+        }
+        // A zero (or near-zero) rate would arm the target but command VS 0 and skip
+        // the climb power firewall — a silent no-op that still reads back "climbing."
+        // The schema permits fpm 0, so treat anything under 1 fpm as "unspecified"
+        // and auto-scale the rate, the same as a plain set_altitude.
+        let rate = (args.fpm.abs() >= 1.0).then(|| args.fpm.abs().min(2000.0));
+        let (movement, fpm, engaged) = fly_to(ctx, altitude, rate).await?;
+        let power = if movement.starts_with("Climbing") { "full power, " } else { "" };
+        if engaged {
+            Ok(format!(
+                "Roger — {power}{} {altitude:.0} feet at {fpm:.0} feet per minute, leveling off there.",
+                movement.to_lowercase()
+            ))
+        } else {
+            Ok(format!(
+                "Set to {} {altitude:.0} feet, but the autopilot didn't engage — check the AP master.",
+                movement.to_lowercase()
+            ))
+        }
+    }
+}
+
 pub struct AutopilotOff;
 
 #[async_trait]
@@ -380,5 +784,130 @@ fn describe_vs(fpm: f64) -> String {
         format!("climb {mag:.0} feet per minute")
     } else {
         format!("descend {mag:.0} feet per minute")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_rate_scales_with_the_change_and_is_bounded() {
+        // Small step → the gentle default floor, not sluggish.
+        assert_eq!(auto_vs_fpm(300.0, true), DEFAULT_VS_FPM);
+        // Mid change → scaled (≈ delta / 3).
+        assert_eq!(auto_vs_fpm(1500.0, true), 500.0);
+        // Big climb → capped at the airframe's sustainable climb rate, so it can't
+        // outrun the available power.
+        assert_eq!(auto_vs_fpm(9000.0, true), MAX_CLIMB_FPM);
+        // Descents get their own (higher) cap.
+        assert_eq!(auto_vs_fpm(9000.0, false), MAX_DESCENT_FPM);
+        // Direction is by magnitude — sign of the delta doesn't matter here.
+        assert_eq!(auto_vs_fpm(-1500.0, false), 500.0);
+    }
+
+    #[test]
+    fn terrain_floor_is_ground_relative() {
+        // At a sea-level field (current 0, agl 0) the floor is just the margin.
+        assert_eq!(terrain_floor_ft(0.0, 0.0), MIN_TARGET_AGL_FT);
+        // Flying at 8000 ft MSL with 3000 ft AGL → ground ≈ 5000 ft, floor ≈ 5500.
+        let floor = terrain_floor_ft(8000.0, 3000.0 / METERS_TO_FEET);
+        assert!((floor - (5000.0 + MIN_TARGET_AGL_FT)).abs() < 1.0, "floor was {floor}");
+    }
+
+    #[test]
+    fn capture_action_levels_off_stands_down_and_waits() {
+        // Climb: level off once we reach the target, not before.
+        assert_eq!(capture_action(7000.0, 7000.0, 7000.0, true), Capture::LevelOff);
+        assert_eq!(capture_action(7000.0, 7000.0, 6900.0, true), Capture::Wait);
+        // Descent: level off once we come down to the target, not before.
+        assert_eq!(capture_action(3000.0, 3000.0, 3000.0, false), Capture::LevelOff);
+        assert_eq!(capture_action(3000.0, 3000.0, 3100.0, false), Capture::Wait);
+        // The selected dial moved off our target (pilot re-commanded) → stand down,
+        // even if we happen to be near the old target's altitude.
+        assert_eq!(capture_action(3000.0, 7000.0, 6950.0, true), Capture::StandDown);
+    }
+
+    // --- arm_altitude / reject_unsafe_target: the trust-critical writes, against a
+    // fake sim so they're tested without a running X-Plane. ---
+
+    use crate::tools::ToolCtx;
+    use crate::xplane::FakeXPlane;
+
+    fn ctx<'a>(fake: &'a FakeXPlane, cfg: &'a crate::config::Config) -> ToolCtx<'a> {
+        ToolCtx { xplane: fake, config: cfg, voice: None }
+    }
+
+    #[tokio::test]
+    async fn arm_altitude_climb_arms_target_vs_and_firewalls_power() {
+        let fake = FakeXPlane::with_reads(&[(CURRENT_ALT, 2000.0)]);
+        let cfg = crate::config::Config::default();
+        let (movement, signed, capture) = arm_altitude(&ctx(&fake, &cfg), 7000.0, None).await.unwrap();
+
+        assert_eq!(movement, "Climbing to");
+        assert!(signed > 0.0, "climb VS should be positive, was {signed}");
+        assert_eq!(capture, Some(true), "a climb needs a capture watcher (was_climb)");
+        assert_eq!(fake.last_write(ALT_DIAL), Some(7000.0), "arms the target altitude");
+        assert!(fake.ran(CMD_VS_MODE), "engages VS mode");
+        assert_eq!(fake.last_write(VS_DIAL), Some(signed), "dials the commanded VS");
+        assert_eq!(fake.last_write(THROTTLE_ALL), Some(1.0), "firewalls the throttle for the climb");
+    }
+
+    #[tokio::test]
+    async fn arm_altitude_descent_does_not_touch_the_throttle() {
+        let fake = FakeXPlane::with_reads(&[(CURRENT_ALT, 9000.0)]);
+        let cfg = crate::config::Config::default();
+        let (movement, signed, capture) = arm_altitude(&ctx(&fake, &cfg), 3000.0, None).await.unwrap();
+
+        assert_eq!(movement, "Descending to");
+        assert!(signed < 0.0, "descent VS should be negative, was {signed}");
+        assert_eq!(capture, Some(false), "a descent still needs the level-off watcher");
+        assert_eq!(fake.last_write(VS_DIAL), Some(signed));
+        assert!(!fake.wrote(THROTTLE_ALL), "descent must not firewall (or touch) the throttle");
+    }
+
+    #[tokio::test]
+    async fn arm_altitude_at_target_holds() {
+        // Within the capture band of the current altitude → hold, no climb/descent.
+        let fake = FakeXPlane::with_reads(&[(CURRENT_ALT, 5020.0)]);
+        let cfg = crate::config::Config::default();
+        let (movement, signed, capture) = arm_altitude(&ctx(&fake, &cfg), 5000.0, None).await.unwrap();
+
+        assert_eq!(movement, "Holding at");
+        assert_eq!(signed, 0.0);
+        assert_eq!(capture, None, "a hold needs no capture watcher");
+        assert!(fake.ran(CMD_ALT_HOLD), "engages altitude hold");
+        assert!(!fake.wrote(VS_DIAL), "hold doesn't command a vertical speed");
+    }
+
+    #[tokio::test]
+    async fn reject_target_into_the_terrain() {
+        // Ground ≈ 4000 ft (5000 MSL − 1000 ft AGL); floor ≈ 4500. A 3000 ft target
+        // is into the terrain → refused.
+        let fake = FakeXPlane::with_reads(&[
+            (CURRENT_ALT, 5000.0),
+            (crate::datarefs::AGL_METERS, 1000.0 / METERS_TO_FEET),
+        ]);
+        let cfg = crate::config::Config::default();
+        let refusal = reject_unsafe_target(&ctx(&fake, &cfg), 3000.0).await;
+        assert!(refusal.is_some(), "target into terrain must be refused");
+        // A target well above the floor is accepted.
+        assert!(reject_unsafe_target(&ctx(&fake, &cfg), 8000.0).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reject_target_above_ceiling() {
+        let fake = FakeXPlane::new();
+        let cfg = crate::config::Config::default();
+        assert!(reject_unsafe_target(&ctx(&fake, &cfg), SERVICE_CEILING_FT + 1000.0).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn reject_falls_back_to_msl_floor_when_terrain_unknown() {
+        // No AGL preset → terrain read fails → fall back to the fixed MSL floor.
+        let fake = FakeXPlane::with_reads(&[(CURRENT_ALT, 600.0)]);
+        let cfg = crate::config::Config::default();
+        assert!(reject_unsafe_target(&ctx(&fake, &cfg), 300.0).await.is_some(), "below MSL floor");
+        assert!(reject_unsafe_target(&ctx(&fake, &cfg), 5000.0).await.is_none(), "above MSL floor");
     }
 }

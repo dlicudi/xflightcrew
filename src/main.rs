@@ -11,13 +11,23 @@ mod aircraft;
 mod audio;
 mod checklist;
 mod config;
+mod datarefs;
+mod grammar;
+mod livestate;
 mod llm;
 mod monitor;
 mod nav;
+mod phrase;
+mod readback;
 mod stt;
+mod stt_eval;
 mod tts;
+#[cfg(feature = "onnx-tts")]
+mod tts_onnx;
+mod tts_sidecar;
 mod tools;
 mod ui;
+mod vad;
 mod voice;
 mod xplane;
 
@@ -27,7 +37,8 @@ use anyhow::{anyhow, Result};
 
 use audio::Listener;
 use config::Config;
-use llm::Llm;
+use livestate::LiveState;
+use llm::{Decision, Llm};
 use stt::Stt;
 use tools::{Registry, ToolCtx};
 use ui::Reporter;
@@ -67,6 +78,40 @@ async fn main() -> Result<()> {
         return audio::mic_check(config.vad_threshold);
     }
 
+    // `cargo run -- transcribe <audio-file>` prints the whisper transcript of a
+    // clip to stdout and exits. Used by `voice/voices.py` to auto-caption an
+    // imported voice sample (Spark needs the reference text to match the audio).
+    if std::env::args().nth(1).as_deref() == Some("transcribe") {
+        let path = std::env::args()
+            .nth(2)
+            .ok_or_else(|| anyhow!("usage: x-copilot transcribe <audio-file>"))?;
+        let text = transcribe_file(&config.whisper_model_path, &path)?;
+        println!("{text}");
+        return Ok(());
+    }
+
+    // `cargo run -- analyze` mines the logs for fast-path coverage and the
+    // ranked LLM-fallback phrasings — the candidates to promote into the
+    // deterministic grammar so coverage ratchets up over time.
+    if std::env::args().nth(1).as_deref() == Some("analyze") {
+        return analyze_commands();
+    }
+
+    // `cargo run -- stt-eval [manifest.yaml]` runs the offline speech-accuracy
+    // harness: each case through whisper + grammar, reporting WER and command
+    // accuracy. `WHISPER_MODEL=...` switches the model under test. Offline, so it
+    // uses a fixed profile (no X-Plane needed).
+    if std::env::args().nth(1).as_deref() == Some("stt-eval") {
+        let manifest = std::env::args().nth(2).unwrap_or_else(|| "bench/stt_cases.yaml".to_string());
+        let id = if config.aircraft.eq_ignore_ascii_case("auto") {
+            "cessna_172sp".to_string()
+        } else {
+            config.aircraft.clone()
+        };
+        let profile = aircraft::load(&id).ok_or_else(|| anyhow!("unknown aircraft profile: {id}"))?;
+        return stt_eval::run(&config.whisper_model_path, &profile, &manifest);
+    }
+
     // Resolve the aircraft profile: auto-detect from X-Plane's acf_ICAO when
     // configured as "auto", otherwise use the configured id. Falls back to the
     // Cessna if detection fails (e.g. X-Plane not reachable yet). The probe
@@ -98,8 +143,10 @@ async fn main() -> Result<()> {
         "starting x-copilot (local LLM via Ollama)"
     );
 
-    // whisper model load is the one slow init — do it once, up front.
-    let stt = Stt::load(&config.whisper_model_path)?;
+    // whisper model load is the one slow init — do it once, up front. Bias its
+    // decoding toward the active aircraft's actual systems and phraseology.
+    let mut stt = Stt::load(&config.whisper_model_path, config.whisper_gpu)?;
+    stt.set_prompt(stt::build_prompt(&profile));
     let llm = Llm::new(&config);
     let registry = Registry::for_aircraft(&profile);
     // Checklists the copilot runs interactively (narrate + act + verify + call
@@ -137,6 +184,14 @@ async fn main() -> Result<()> {
         // its own runtime; the dashboard renders on the main thread.
         let (tx, rx) = std::sync::mpsc::channel::<ui::Report>();
         let title = format!("x-copilot · {}", profile.display_name);
+        // The active engines, shown in the status bar: STT (whisper model), LLM,
+        // and TTS backend — so it's obvious at a glance what's running.
+        let engines = format!(
+            "whisper {} · llm {} · tts {}",
+            whisper_model_label(&config.whisper_model_path),
+            config.model,
+            config.tts_backend,
+        );
         let commands = command_hints();
 
         let tx_poll = tx.clone();
@@ -163,17 +218,17 @@ async fn main() -> Result<()> {
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             if let Err(e) = rt.block_on(run_session(
-                config, stt, llm, registry, checklists, voice, continuous, explicit, reporter, Some(cmd_rx),
+                config, stt, llm, registry, profile, checklists, voice, continuous, explicit, reporter, Some(cmd_rx),
             )) {
                 tracing::error!("voice loop ended: {e:#}");
             }
         });
 
-        ui::run_dashboard(title, commands, rx, cmd_tx)?; // blocks until the user quits
+        ui::run_dashboard(title, engines, commands, rx, cmd_tx)?; // blocks until the user quits
         Ok(())
     } else {
         println!("\n  x-copilot — {} ({}). Ctrl-C to quit.\n", profile.display_name, config.listen_mode);
-        run_session(config, stt, llm, registry, checklists, voice, continuous, explicit, Reporter::Plain, None).await
+        run_session(config, stt, llm, registry, profile, checklists, voice, continuous, explicit, Reporter::Plain, None).await
     }
 }
 
@@ -196,6 +251,7 @@ async fn run_session(
     stt: Stt,
     llm: Llm,
     registry: Registry,
+    profile: aircraft::AircraftProfile,
     checklists: Vec<checklist::Checklist>,
     voice: Voice,
     continuous: bool,
@@ -207,6 +263,10 @@ async fn run_session(
     // (main for plain, the voice thread for TUI) — a reqwest client's I/O is
     // bound to the runtime it's used on.
     let xplane = XPlaneClient::new(config.xplane_base_url.clone());
+    // Subscribe to the continuously-read state over the WebSocket so snapshots are
+    // instant cache reads instead of a REST burst. Best-effort: reads fall back to
+    // REST until (or unless) the subscription warms up.
+    let live = LiveState::start(&config.xplane_base_url, SNAPSHOT_DATAREFS);
     let mut specs = registry.specs();
     // Each checklist is exposed to the LLM as a no-arg "tool" the loop intercepts
     // and runs interactively.
@@ -258,7 +318,8 @@ async fn run_session(
                 // Confidence gate.
                 if confidence < config.stt_min_confidence {
                     if explicit {
-                        say(&voice, &reporter, ui::LogKind::Info, "Say again?");
+                        say(&voice, &reporter, ui::LogKind::Info,
+                            readback::one_of(&["Say again?", "Didn't catch that.", "One more time?"]));
                     } else {
                         reporter.log(ui::LogKind::Info, "low confidence, ignored");
                     }
@@ -283,8 +344,9 @@ async fn run_session(
 
         // Domain gate, follow-up, and bare-value rewrite apply to SPOKEN input
         // only — phonetic nonsense and STT follow-ups are voice problems. A typed
-        // command is taken as-is.
-        if !from_text && !looks_like_command(&command) {
+        // command is taken as-is. Questions are let through too (the LLM decides
+        // act-vs-answer), so they aren't rejected as "not a command".
+        if !from_text && !looks_like_command(&command) && !looks_like_question(&command) {
             // A conversational follow-up shortly after a command is let through
             // even without a keyword. Outside the window, the strict gate holds.
             let in_followup = history
@@ -292,17 +354,22 @@ async fn run_session(
                 .is_some_and(|(_, _, t)| t.elapsed() < FOLLOWUP_WINDOW);
             if !(in_followup && looks_like_followup(&command)) {
                 if explicit {
-                    say(&voice, &reporter, ui::LogKind::Warn, "Sorry, that didn't sound like a command.");
+                    say(&voice, &reporter, ui::LogKind::Warn, readback::one_of(&[
+                        "Sorry, that didn't sound like a command.",
+                        "That didn't sound like a command.",
+                        "Didn't catch a command there.",
+                    ]));
                 } else {
                     reporter.log(ui::LogKind::Info, format!("not a command: \"{command}\""));
                 }
                 continue;
             }
-            // Re-anchor a bare-value follow-up onto the last command's system, so
-            // the model gets an explicit command ("throttle sixty percent")
-            // instead of having to infer continuation from chat history — which
-            // it does unreliably once the same tool repeats.
-            if has_number(&command) {
+            // Re-anchor a *truly bare* value follow-up onto the last command's
+            // system ("seventy percent" → "throttle seventy percent"). Only when
+            // the utterance is nothing but a number/percent — otherwise a misheard
+            // command ("fraudal at eighty percent") would get force-anchored to the
+            // wrong tool. Non-bare follow-ups go to the LLM with history as-is.
+            if is_bare_value(&command) {
                 if let Some(subj) = &last_subject {
                     let rewritten = format!("{subj} {command}");
                     reporter.log(ui::LogKind::Info, format!("follow-up → \"{rewritten}\""));
@@ -324,23 +391,82 @@ async fn run_session(
                 .collect()
         };
 
-        // LLM picks the tool(s). A compound command ("taxi and nav lights on")
-        // yields more than one call; they're executed in spoken order.
+        // The LLM arbitrates: ACT on a command (one call per distinct action, so
+        // "taxi and nav lights on" makes two) or ANSWER a question in prose — a
+        // polite "could you start the engines?" acts; "what's our heading?"
+        // answers. A live state snapshot grounds both ("a bit more flaps", "how
+        // high are we?") — but only the LLM and the correction path read it, never
+        // the fast-path, so it's computed lazily below: the common fast-path
+        // command pays nothing for the burst of X-Plane reads it never uses.
         reporter.status(ui::Phase::Thinking);
-        let calls = match llm.choose_tool(&command, &specs, &ctx_history).await {
-            Ok(calls) if !calls.is_empty() => calls,
-            Ok(_) => {
-                if explicit {
-                    say(&voice, &reporter, ui::LogKind::Warn, "Sorry, I didn't catch a command I can action.");
-                } else {
-                    reporter.log(ui::LogKind::Info, format!("no matching tool: \"{command}\""));
-                }
+
+        // Deterministic state queries answered without the LLM — the model proved
+        // unreliable here (it had the fuel in its context and still said "I don't
+        // have fuel information"). A fuel question reads the datarefs and is spoken
+        // straight back.
+        if is_fuel_query(&command) {
+            let line = fuel_report(&xplane, &profile, Some(&live)).await;
+            say(&voice, &reporter, ui::LogKind::Readback, &line);
+            continue;
+        }
+        // Other state reads ("what's our altitude/heading/airspeed") — deterministic
+        // too, but only when it's a question, so "set heading 270" still commands.
+        if looks_like_question(&command) {
+            if let Some(answer) = answer_state_query(&command, &xplane, Some(&live)).await {
+                say(&voice, &reporter, ui::LogKind::Readback, &answer);
                 continue;
             }
-            Err(e) => {
-                tracing::error!("LLM tool selection failed: {e:#}");
-                reporter.log(ui::LogKind::Warn, "LLM unreachable");
-                continue;
+        }
+
+        let mut state: Option<String> = None;
+
+        // Deterministic fast-path: resolve the common, regular commands with no
+        // LLM at all — no GPU burst, no latency, and it can't pick the wrong tool.
+        // Anything it can't confidently parse falls through to the LLM. Questions
+        // are held back from the fast-path entirely ("is our heading 270?" shares
+        // the keyword+number shape of a command, so the grammar would *act* on it);
+        // they go to the LLM, which arbitrates act-vs-answer. `path` is logged so
+        // `x-copilot analyze` can mine the LLM-fallback tail for new phrasings.
+        let fast = if looks_like_question(&command) {
+            None
+        } else {
+            grammar::try_parse(&command, &registry, &profile)
+        };
+        let calls = if let Some(c) = fast {
+            tracing::info!(path = "fast", tool = c.first().map(|x| x.name.as_str()).unwrap_or(""), "command path");
+            c
+        } else {
+            // Fast-path missed — now the LLM needs live state.
+            let ts = Instant::now();
+            let snap = state_snapshot(&xplane, &profile, Some(&live)).await;
+            tracing::info!(ms = ts.elapsed().as_millis(), state = snap.as_deref().unwrap_or("(none)"), "state snapshot");
+            let t = Instant::now();
+            let decision = llm.act_or_answer(&command, &specs, &ctx_history, snap.as_deref()).await;
+            tracing::info!(ms = t.elapsed().as_millis(), path = "llm", "command path");
+            state = snap; // reuse for the correction path if it confirms
+            match decision {
+                Ok(Decision::Act(calls)) => calls,
+                Ok(Decision::Reply(text)) => {
+                    say(&voice, &reporter, ui::LogKind::Readback, &text);
+                    continue;
+                }
+                Ok(Decision::None) => {
+                    if explicit {
+                        say(&voice, &reporter, ui::LogKind::Warn, readback::one_of(&[
+                            "Sorry, I didn't catch that.",
+                            "I can't action that one.",
+                            "Say again?",
+                        ]));
+                    } else {
+                        reporter.log(ui::LogKind::Info, format!("no response: \"{command}\""));
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!("LLM act-or-answer failed: {e:#}");
+                    reporter.log(ui::LogKind::Warn, "LLM unreachable");
+                    continue;
+                }
             }
         };
 
@@ -392,7 +518,12 @@ async fn run_session(
                     Some(correction) => {
                         reporter.log(ui::LogKind::Info, format!("correction: \"{correction}\""));
                         reporter.status(ui::Phase::Thinking);
-                        match llm.choose_tool(&format!("{command}, {correction}"), &specs, &ctx_history).await {
+                        // A fast-path command never took the snapshot — take it now
+                        // so the correction is grounded in live state.
+                        if state.is_none() {
+                            state = state_snapshot(&xplane, &profile, Some(&live)).await;
+                        }
+                        match llm.choose_tool(&format!("{command}, {correction}"), &specs, &ctx_history, state.as_deref()).await {
                             Ok(mut cs) if !cs.is_empty() => {
                                 call = cs.remove(0);
                                 reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
@@ -417,7 +548,7 @@ async fn run_session(
             // Execute the curated tool (writes the dataref + reads back).
             reporter.status(ui::Phase::Thinking);
             let Some(tool) = registry.get(&call.name) else { continue };
-            let ctx = ToolCtx { xplane: &xplane, config: &config };
+            let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice) };
             let readback = match tool.execute(&call.arguments, &ctx).await {
                 Ok(line) => line,
                 Err(e) => {
@@ -425,7 +556,10 @@ async fn run_session(
                     "Something went wrong actioning that.".to_string()
                 }
             };
-            say(&voice, &reporter, ui::LogKind::Readback, &readback);
+            // Vary the acknowledgment on affirmative readbacks (bare callout most
+            // of the time, "Roger,"/"Copy," occasionally); the canonical readback
+            // is what's recorded for history context.
+            say(&voice, &reporter, ui::LogKind::Readback, &readback::vary_ack(&readback));
             turn_readbacks.push(readback);
         }
 
@@ -475,7 +609,7 @@ async fn run_checklist(
 ) {
     use checklist::Item;
     say(voice, reporter, ui::LogKind::Info, &format!("Running the {} checklist.", cl.title));
-    let ctx = ToolCtx { xplane, config };
+    let ctx = ToolCtx { xplane, config, voice: Some(voice) };
     let mut failed = 0usize;
     let mut aborted = false;
     for item in &cl.items {
@@ -629,6 +763,98 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Transcribe an audio file with whisper, for `x-copilot transcribe <file>`.
+/// Decodes/resamples to 16 kHz mono via macOS `afconvert` (handles mp3/m4a/wav/…
+/// — whisper needs 16 kHz mono), reads the PCM, and returns the text. Reuses the
+/// same STT model the live loop uses, so no extra model download.
+fn transcribe_file(model_path: &str, input: &str) -> Result<String> {
+    use std::process::Command;
+    if !std::path::Path::new(input).exists() {
+        return Err(anyhow!("no such file: {input}"));
+    }
+    let wav = std::env::temp_dir().join("x-copilot-transcribe-16k.wav");
+    let status = Command::new("afconvert")
+        .args([input, wav.to_str().unwrap(), "-d", "LEI16@16000", "-c", "1", "-f", "WAVE"])
+        .status()
+        .map_err(|e| anyhow!("spawning afconvert: {e}"))?;
+    if !status.success() {
+        return Err(anyhow!("afconvert failed to decode {input}"));
+    }
+    let reader = hound::WavReader::open(&wav).map_err(|e| anyhow!("reading {}: {e}", wav.display()))?;
+    let samples: Vec<f32> = reader
+        .into_samples::<i16>()
+        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| anyhow!("decoding samples: {e}"))?;
+    // Offline one-shot — GPU is fine here (not competing with the sim loop).
+    let stt = Stt::load(model_path, true)?;
+    // Verbatim: a voice-clone reference caption must match the audio's actual
+    // words, so don't apply the command-loop's digit/mishear normalization
+    // ("two seven zero" must stay words, not become "270").
+    Ok(stt.transcribe_verbatim(&samples)?.text.trim().to_string())
+}
+
+/// Mine the logs for fast-path coverage and the LLM-fallback tail. Pairs each
+/// spoken transcript with the `command path` line that followed it, then reports
+/// the fast/LLM split and the most frequent LLM-fallback phrasings — the ones
+/// worth promoting into [`grammar`] next. The ratchet that makes the copilot
+/// cheaper and more deterministic the more it's flown.
+fn analyze_commands() -> Result<()> {
+    use std::collections::HashMap;
+    let mut last: Option<String> = None;
+    let (mut fast, mut llm) = (0u32, 0u32);
+    let mut tail: HashMap<String, u32> = HashMap::new();
+
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir("logs")
+        .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
+        .unwrap_or_default();
+    paths.sort();
+    for p in paths {
+        let is_log = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("x-copilot.log"));
+        if !is_log {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&p) else { continue };
+        for line in content.lines() {
+            if let Some(i) = line.find("transcript=") {
+                let rest = &line[i + "transcript=".len()..];
+                last = Some(rest.split(" confidence=").next().unwrap_or(rest).trim().to_lowercase());
+            } else if line.contains("⌨") {
+                if let (Some(a), Some(b)) = (line.find('"'), line.rfind('"')) {
+                    if b > a {
+                        last = Some(line[a + 1..b].trim().to_lowercase());
+                    }
+                }
+            } else if line.contains("command path") {
+                if line.contains("path=\"fast\"") {
+                    fast += 1;
+                } else if line.contains("path=\"llm\"") {
+                    llm += 1;
+                    if let Some(t) = &last {
+                        *tail.entry(t.clone()).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let total = fast + llm;
+    if total == 0 {
+        println!("No command-path data in logs yet — run the app and issue some commands first.");
+        return Ok(());
+    }
+    println!("commands analyzed: {total}");
+    println!("  fast-path (no LLM): {fast:>5}  ({}%)", fast * 100 / total);
+    println!("  LLM fallback:       {llm:>5}  ({}%)", llm * 100 / total);
+    println!("\npromotion candidates — frequent LLM-fallback phrasings to add to grammar.rs:");
+    let mut v: Vec<(String, u32)> = tail.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (t, n) in v.into_iter().take(20) {
+        println!("  {n:>3}  {t}");
+    }
+    Ok(())
+}
+
 /// Map an X-Plane ICAO type code to a profile id. Unknown types fall back to
 /// the Cessna so the app stays usable; add rows as profiles are added.
 fn icao_to_profile(icao: &str) -> String {
@@ -730,38 +956,270 @@ fn correction_text(reply: &str) -> Option<String> {
     }
 }
 
-/// Report a line and speak it through the arbiter. Blocks until the line has
-/// been spoken (so the loop doesn't listen over its own voice), setting the
-/// Speaking→Listening status around it.
+/// Report a line and speak it through the arbiter, verbatim. Blocks until the
+/// line has been spoken (so the loop doesn't listen over its own voice), setting
+/// the Speaking→Listening status around it. Acknowledgment variation is NOT
+/// applied here — only curated tool readbacks get that, via [`readback::vary_ack`]
+/// at the call site, so it never touches LLM free-text answers, refusals, or
+/// prompts (an answer that happened to start with "Roger" would lose its first
+/// word otherwise).
 fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
     tracing::info!(spoke = %line, "spoke");
     reporter.status(ui::Phase::Speaking);
-    reporter.log(kind, line.to_string());
+    reporter.log(kind, line);
     voice.say(Priority::Readback, line);
     reporter.status(ui::Phase::Listening);
+}
+
+/// The datarefs the live-state cache subscribes to over the WebSocket — the
+/// continuously-read snapshot + autopilot-status set. (Arrays like engine-running,
+/// and the tool path's read-after-write confirms, stay on REST.)
+const SNAPSHOT_DATAREFS: &[&str] = &[
+    datarefs::ALTITUDE_FT, datarefs::AIRSPEED_KTS, datarefs::VVI_FPM,
+    datarefs::COMPASS_HEADING_DEG, datarefs::FLAP_RATIO, datarefs::GEAR_HANDLE_DOWN,
+    datarefs::ON_GROUND_ANY, datarefs::FUEL_TOTAL_KG, datarefs::WIND_HEADING_DEG,
+    datarefs::WIND_SPEED_KTS, datarefs::OAT_DEG_C, datarefs::VISIBILITY_SM,
+    datarefs::QNH_PASCALS, datarefs::SERVOS_ON, datarefs::APPROACH_STATUS,
+    datarefs::NAV_STATUS, datarefs::HEADING_STATUS,
+];
+
+/// Read a dataref preferring the live-state cache (instant, no round-trip), with a
+/// REST read as the fallback on a cache miss — so it's never worse than polling
+/// and near-free once the WebSocket subscription is warm.
+async fn read1(live: Option<&LiveState>, xp: &XPlaneClient, name: &str) -> Result<f64> {
+    if let Some(v) = live.and_then(|l| l.get(name)) {
+        return Ok(v);
+    }
+    xp.get_float(name).await
+}
+
+/// 100LL avgas ≈ 2.72 kg/gal (~6 lb/gal) — to report fuel in gallons.
+const AVGAS_KG_PER_GAL: f64 = 2.72;
+
+/// True if the utterance is asking about fuel/endurance (a question we answer
+/// deterministically), not commanding the fuel *system* (pump/selector).
+fn is_fuel_query(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    let asks = t.contains("fuel") || t.contains("gas") || t.contains("endurance");
+    // Exclude fuel *commands* — system switches (pump/selector) and the ground
+    // refuel request ("refuel"/"top off"/"fill") — those are actions, not queries.
+    let command = t.contains("pump")
+        || t.contains("selector")
+        || t.contains("boost")
+        || t.contains("primer")
+        || t.contains("refuel")
+        || t.contains("top off")
+        || t.contains("fill");
+    asks && !command
+}
+
+/// Deterministic spoken fuel report — total in gallons, endurance from the
+/// profile's cruise burn, and the left/right balance. Read straight from the
+/// datarefs (cache when warm, REST otherwise); never goes near the LLM.
+async fn fuel_report(xp: &XPlaneClient, profile: &aircraft::AircraftProfile, live: Option<&LiveState>) -> String {
+    let Ok(total_kg) = read1(live, xp, datarefs::FUEL_TOTAL_KG).await else {
+        return "I can't read the fuel right now — check the connection to X-Plane.".to_string();
+    };
+    let gal = total_kg / AVGAS_KG_PER_GAL;
+    let mut line = format!("{gal:.0} gallons on board");
+    if let Some(f) = &profile.fuel {
+        if f.cruise_burn_kg_hr > 0.0 {
+            let hours = total_kg / f.cruise_burn_kg_hr;
+            let (h, m) = (hours.trunc() as i32, (hours.fract() * 60.0).round() as i32);
+            let mut dur = String::new();
+            if h > 0 {
+                dur.push_str(&format!("{h} hour{}", if h == 1 { "" } else { "s" }));
+            }
+            if m > 0 {
+                if !dur.is_empty() {
+                    dur.push(' ');
+                }
+                dur.push_str(&format!("{m} minute{}", if m == 1 { "" } else { "s" }));
+            }
+            if !dur.is_empty() {
+                line.push_str(&format!(", about {dur} at cruise"));
+            }
+        }
+    }
+    // Per-tank balance, when the airframe has two tanks.
+    if let Ok(tanks) = xp.get_float_array(datarefs::FUEL_PER_TANK_KG).await {
+        if tanks.len() == 2 {
+            let (l, r) = (tanks[0] / AVGAS_KG_PER_GAL, tanks[1] / AVGAS_KG_PER_GAL);
+            line.push_str(&format!(". Left {l:.0}, right {r:.0}"));
+            if (l - r).abs() >= 5.0 {
+                line.push_str(if l > r { " — favor the right" } else { " — favor the left" });
+            }
+        }
+    }
+    // A question — just answer it; "Roger" is for acknowledging a command.
+    format!("{line}.")
+}
+
+/// Answer the common "what's our X" state questions deterministically, straight
+/// from the datarefs — no LLM (it proved unreliable even with the data in hand).
+/// Multiple fields can be asked at once ("altitude and heading"). Returns `None`
+/// for anything not a recognized state read, to fall through to the LLM for the
+/// open-ended questions ("do we have enough fuel to reach Bristol?"). Only call
+/// this for utterances that are questions, so "set heading 270" still commands.
+async fn answer_state_query(
+    cmd: &str,
+    xp: &XPlaneClient,
+    live: Option<&LiveState>,
+) -> Option<String> {
+    let t = cmd.to_ascii_lowercase();
+    let mut parts: Vec<String> = Vec::new();
+    if t.contains("altitude") || t.contains("how high") {
+        if let Ok(v) = read1(live, xp, datarefs::ALTITUDE_FT).await {
+            parts.push(format!("{v:.0} feet"));
+        }
+    }
+    if t.contains("heading") {
+        if let Ok(v) = read1(live, xp, datarefs::COMPASS_HEADING_DEG).await {
+            parts.push(format!("heading {v:03.0}"));
+        }
+    }
+    let vs_q = t.contains("vertical speed") || t.contains("climb rate") || t.contains("rate of");
+    if vs_q {
+        if let Ok(v) = read1(live, xp, datarefs::VVI_FPM).await {
+            parts.push(format!("{v:+.0} feet per minute"));
+        }
+    }
+    // "speed" alone → airspeed, unless it was "vertical speed".
+    if t.contains("airspeed") || t.contains("air speed") || t.contains("how fast") || (t.contains("speed") && !vs_q) {
+        if let Ok(v) = read1(live, xp, datarefs::AIRSPEED_KTS).await {
+            parts.push(format!("{v:.0} knots"));
+        }
+    }
+    // A question — answer plainly; "Roger" is a command acknowledgment.
+    (!parts.is_empty()).then(|| format!("{}.", parts.join(", ")))
+}
+
+/// A compact live-state line for the LLM's context, so it can ground relative or
+/// ambiguous commands ("a bit more flaps", "level off") in what's actually true.
+/// Each field is best-effort: a dataref that won't read is skipped, and if none
+/// read (X-Plane unreachable) this returns `None` and the model runs context-free.
+async fn state_snapshot(
+    xp: &XPlaneClient,
+    profile: &aircraft::AircraftProfile,
+    live: Option<&LiveState>,
+) -> Option<String> {
+    // Reads prefer the live-state WebSocket cache (instant, no round-trip) and
+    // fall back to a concurrent REST read on a cache miss — so this is never worse
+    // than the old all-REST burst, and near-free once the subscription is warm.
+    let (alt, ias, vs, hdg, flap, gear, og, fuel, ap, engine, wind_dir, wind_kts, oat, vis, qnh) = tokio::join!(
+        read1(live, xp, datarefs::ALTITUDE_FT),
+        read1(live, xp, datarefs::AIRSPEED_KTS),
+        read1(live, xp, datarefs::VVI_FPM),
+        read1(live, xp, datarefs::COMPASS_HEADING_DEG),
+        read1(live, xp, datarefs::FLAP_RATIO),
+        read1(live, xp, datarefs::GEAR_HANDLE_DOWN),
+        read1(live, xp, datarefs::ON_GROUND_ANY),
+        read1(live, xp, datarefs::FUEL_TOTAL_KG),
+        ap_mode(xp, live),
+        checklist::engine_running(xp),
+        // Weather, so "what's the weather?" gets real numbers. Wind/OAT are the
+        // cockpit-relative indicators (mirror the gauges); visibility and QNH come
+        // from the XP12 aircraft-weather datarefs. All confirmed reading live.
+        read1(live, xp, datarefs::WIND_HEADING_DEG),
+        read1(live, xp, datarefs::WIND_SPEED_KTS),
+        read1(live, xp, datarefs::OAT_DEG_C),
+        read1(live, xp, datarefs::VISIBILITY_SM),
+        read1(live, xp, datarefs::QNH_PASCALS),
+    );
+    let mut parts: Vec<String> = Vec::new();
+    if let Ok(v) = alt {
+        parts.push(format!("altitude {v:.0} ft"));
+    }
+    if let Ok(v) = ias {
+        parts.push(format!("airspeed {v:.0} knots"));
+    }
+    if let Ok(v) = vs {
+        parts.push(format!("vertical speed {v:+.0} fpm"));
+    }
+    if let Ok(v) = hdg {
+        parts.push(format!("heading {v:03.0}"));
+    }
+    if let Ok(v) = flap {
+        parts.push(format!("flaps {:.0}%", v * 100.0));
+    }
+    if profile.retractable_gear {
+        if let Ok(v) = gear {
+            parts.push(format!("gear {}", if v > 0.5 { "down" } else { "up" }));
+        }
+    }
+    if let Ok(v) = og {
+        parts.push(format!("on the ground: {}", if v > 0.5 { "yes" } else { "no" }));
+    }
+    if let Ok(v) = fuel {
+        // Report in gallons (how a GA pilot thinks) with the mass alongside, plus an
+        // endurance estimate from the profile's cruise burn so "how long can we fly?"
+        // has a real answer.
+        let gal = v / AVGAS_KG_PER_GAL;
+        let mut s = format!("fuel on board {gal:.0} gallons ({v:.0} kg)");
+        if let Some(f) = &profile.fuel {
+            if f.cruise_burn_kg_hr > 0.0 {
+                let hours = v / f.cruise_burn_kg_hr;
+                s.push_str(&format!(", about {hours:.1} hours endurance at cruise"));
+            }
+        }
+        parts.push(s);
+    }
+    // Weather: wind as "direction at speed" (calm if barely moving), plus OAT.
+    if let (Ok(dir), Ok(spd)) = (wind_dir, wind_kts) {
+        if spd < 1.0 {
+            parts.push("wind calm".to_string());
+        } else {
+            parts.push(format!("wind {dir:03.0} at {spd:.0} knots"));
+        }
+    }
+    if let Ok(v) = oat {
+        parts.push(format!("outside air temperature {v:.0} degrees celsius"));
+    }
+    if let Ok(v) = vis {
+        parts.push(format!("visibility {v:.0} statute miles"));
+    }
+    if let Ok(v) = qnh {
+        // qnh_pas is sea-level pressure in Pascals; report as the altimeter
+        // setting in inches of mercury (1 inHg = 3386.389 Pa).
+        parts.push(format!("altimeter {:.2}", v / 3386.389));
+    }
+    // Engine status — only when X-Plane is actually reachable (some scalar read
+    // succeeded), since engine_running defaults to true when it can't read.
+    if !parts.is_empty() {
+        parts.push(format!("engines {}", if engine { "running" } else { "off" }));
+    }
+    if ap != "--" {
+        parts.push(format!("autopilot {ap}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// Read the live aircraft state for the dashboard panel. Returns `None` if
 /// X-Plane is unreachable (panel keeps its last values).
 async fn poll_aircraft(xp: &XPlaneClient) -> Option<ui::Aircraft> {
     Some(ui::Aircraft {
-        heading: xp.get_float("sim/cockpit2/gauges/indicators/compass_heading_deg_mag").await.ok()?,
-        altitude: xp.get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot").await.ok()?,
-        ias: xp.get_float("sim/cockpit2/gauges/indicators/airspeed_kts_pilot").await.ok()?,
-        vsi: xp.get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot").await.ok()?,
-        flaps_pct: xp.get_float("sim/cockpit2/controls/flap_ratio").await.ok()? * 100.0,
-        ap_mode: ap_mode(xp).await,
+        heading: xp.get_float(datarefs::COMPASS_HEADING_DEG).await.ok()?,
+        altitude: xp.get_float(datarefs::ALTITUDE_FT).await.ok()?,
+        ias: xp.get_float(datarefs::AIRSPEED_KTS).await.ok()?,
+        vsi: xp.get_float(datarefs::VVI_FPM).await.ok()?,
+        flaps_pct: xp.get_float(datarefs::FLAP_RATIO).await.ok()? * 100.0,
+        ap_mode: ap_mode(xp, None).await,
     })
 }
 
-/// Summarize the active autopilot lateral mode for the panel.
-async fn ap_mode(xp: &XPlaneClient) -> String {
-    if xp.get_float("sim/cockpit2/autopilot/servos_on").await.unwrap_or(0.0) <= 0.5 {
+/// Summarize the active autopilot lateral mode for the panel. Reads prefer the
+/// live-state cache when given one (snapshot's hot path), else REST (the poller).
+async fn ap_mode(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
+    let (servos, appr, nav, hdg) = tokio::join!(
+        read1(live, xp, datarefs::SERVOS_ON),
+        read1(live, xp, datarefs::APPROACH_STATUS),
+        read1(live, xp, datarefs::NAV_STATUS),
+        read1(live, xp, datarefs::HEADING_STATUS),
+    );
+    if servos.unwrap_or(0.0) <= 0.5 {
         return "--".to_string();
     }
-    let appr = xp.get_float("sim/cockpit2/autopilot/approach_status").await.unwrap_or(0.0);
-    let nav = xp.get_float("sim/cockpit2/autopilot/nav_status").await.unwrap_or(0.0);
-    let hdg = xp.get_float("sim/cockpit2/autopilot/heading_status").await.unwrap_or(0.0);
+    let (appr, nav, hdg) = (appr.unwrap_or(0.0), nav.unwrap_or(0.0), hdg.unwrap_or(0.0));
     if appr >= 1.0 {
         "APR".into()
     } else if nav >= 1.0 {
@@ -809,6 +1267,23 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "checklist", "checklists", "takeoff", "configure", "config", "departure",
     "secure", "clean", "cruise", "preflight", "limits", "performance",
 ];
+
+/// True if the utterance is a question about the flight (answered from state,
+/// not actioned). Interrogative openers or a trailing "?". Kept conservative so
+/// it doesn't hijack commands — and misrouting is harmless anyway (answering is
+/// read-only). Command-ish openers like "can you set…" are deliberately excluded.
+fn looks_like_question(text: &str) -> bool {
+    let t = text.trim().to_ascii_lowercase();
+    if t.ends_with('?') {
+        return true;
+    }
+    const OPENERS: &[&str] = &[
+        "what", "what's", "whats", "how", "how's", "hows", "how much", "how many",
+        "how far", "how high", "how fast", "are we", "are the", "is the", "is it",
+        "do we", "did we", "have we", "where", "when", "which", "why", "tell me",
+    ];
+    OPENERS.iter().any(|o| t == *o || t.starts_with(&format!("{o} ")))
+}
 
 /// True if the utterance plausibly is an aircraft command (contains at least one
 /// keyword). Phonetic garbage that happens to transcribe confidently shares no
@@ -858,20 +1333,42 @@ fn looks_like_followup(text: &str) -> bool {
 }
 
 /// Spoken or written numbers, for spotting a bare-value follow-up.
-const NUMBER_WORDS: &[&str] = &[
-    "percent", "zero", "one", "two", "three", "four", "five", "six", "seven",
-    "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
-    "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
-    "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
-    "hundred", "thousand",
-];
+/// True if a token is a value word for the bare-value gates: any spoken number
+/// (shared with the STT normalizer and grammar via [`phrase::is_number_word`])
+/// plus the unit "percent".
+fn is_value_word(w: &str) -> bool {
+    phrase::is_number_word(w) || w == "percent"
+}
 
 /// True if the utterance carries a digit or a spoken number.
 fn has_number(text: &str) -> bool {
     text.chars().any(|c| c.is_ascii_digit())
         || text
             .split(|c: char| !c.is_ascii_alphabetic())
-            .any(|w| NUMBER_WORDS.contains(&w.to_ascii_lowercase().as_str()))
+            .any(|w| is_value_word(&w.to_ascii_lowercase()))
+}
+
+/// True if the utterance is *only* a number/percent value (digits, number words,
+/// and light filler like "to"/"at"/"point") — a genuine bare follow-up safe to
+/// re-anchor onto the last command. "fraudal at eighty percent" is NOT bare, so
+/// it won't be force-attached to the wrong tool.
+fn is_bare_value(text: &str) -> bool {
+    let mut any_token = false;
+    let mut any_number = false;
+    for w in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if w.is_empty() {
+            continue;
+        }
+        any_token = true;
+        let lw = w.to_ascii_lowercase();
+        let is_digits = lw.chars().all(|c| c.is_ascii_digit());
+        if is_digits || is_value_word(&lw) {
+            any_number = true;
+        } else if !matches!(lw.as_str(), "to" | "at" | "point" | "decimal" | "a") {
+            return false; // a real content word — not bare
+        }
+    }
+    any_token && any_number
 }
 
 /// The leading non-numeric words of a command — its "subject" — used to
@@ -883,7 +1380,7 @@ fn command_subject(cmd: &str) -> String {
     for w in cmd.split_whitespace() {
         let bare = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
         if bare.chars().any(|c| c.is_ascii_digit())
-            || NUMBER_WORDS.contains(&bare.to_ascii_lowercase().as_str())
+            || is_value_word(&bare.to_ascii_lowercase())
         {
             break;
         }
@@ -905,6 +1402,14 @@ fn matches_keyword(w: &str) -> bool {
             .iter()
             .filter(|k| k.len() >= 5)
             .any(|k| levenshtein(w, k) <= 1)
+}
+
+/// Short label for the whisper model from its path, for the status bar:
+/// `models/ggml-base.en.bin` → `base.en`, `…/ggml-large-v3-turbo.bin` → `large-v3-turbo`.
+fn whisper_model_label(path: &str) -> String {
+    let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let stem = file.strip_suffix(".bin").unwrap_or(file);
+    stem.strip_prefix("ggml-").unwrap_or(stem).to_string()
 }
 
 fn command_hints() -> Vec<String> {
@@ -1080,6 +1585,66 @@ mod tests {
         // explicit no, and anything not clearly yes, must NOT proceed
         for r in ["negative", "no", "cancel", "stop", "abort", "uh what", "descend 700", ""] {
             assert!(!is_affirmative(r), "{r:?} must not confirm");
+        }
+    }
+
+    use super::is_bare_value;
+
+    #[test]
+    fn bare_value_gates_followup_rewrite() {
+        // Genuine bare follow-ups (re-anchored to the last command).
+        assert!(is_bare_value("seventy percent"));
+        assert!(is_bare_value("60%"));
+        assert!(is_bare_value("two thousand five hundred"));
+        // Mishears / real words — must NOT be force-anchored to the last tool.
+        assert!(!is_bare_value("fraudal at eighty percent"));
+        assert!(!is_bare_value("total thirty percent"));
+        assert!(!is_bare_value("throttle eighty"));
+        assert!(!is_bare_value("switch it back"));
+    }
+
+    use super::looks_like_question;
+
+    #[test]
+    fn fuel_query_detects_questions_not_system_commands() {
+        use super::is_fuel_query;
+        assert!(is_fuel_query("how much fuel do we have"));
+        assert!(is_fuel_query("what's our fuel"));
+        assert!(is_fuel_query("how much gas"));
+        assert!(is_fuel_query("what's our endurance"));
+        // Fuel *system* commands must NOT be hijacked — they go to their tools.
+        assert!(!is_fuel_query("fuel pump on"));
+        assert!(!is_fuel_query("fuel selector both"));
+        assert!(!is_fuel_query("boost pump on"));
+        assert!(!is_fuel_query("flaps ten"));
+    }
+
+    #[test]
+    fn whisper_label_strips_path_prefix_and_suffix() {
+        use super::whisper_model_label;
+        assert_eq!(whisper_model_label("models/ggml-base.en.bin"), "base.en");
+        assert_eq!(whisper_model_label("/a/b/ggml-large-v3-turbo.bin"), "large-v3-turbo");
+        assert_eq!(whisper_model_label("small.en"), "small.en");
+    }
+
+    #[test]
+    fn questions_are_detected_commands_are_not() {
+        for q in [
+            "how much fuel do we have", "what's our heading", "what is our altitude?",
+            "are we configured for landing", "how high are we", "tell me the airspeed",
+            "do we have enough fuel to make it?", "where are we",
+            // Keyword+number questions: same shape as a command, so they must be
+            // caught here and withheld from the grammar fast-path (which would
+            // otherwise *act* on them) — see the fast-path gate in run_session.
+            "is the heading 270?", "did we set flaps to ten?",
+        ] {
+            assert!(looks_like_question(q), "{q:?} should be a question");
+        }
+        for c in [
+            "flaps ten", "gear up", "set heading 270", "throttle 60 percent",
+            "landing light on", "start the engine",
+        ] {
+            assert!(!looks_like_question(c), "{c:?} should not be a question");
         }
     }
 
