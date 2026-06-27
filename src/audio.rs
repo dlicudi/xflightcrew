@@ -133,6 +133,36 @@ pub fn record_hotkey_ptt(key: device_query::Keycode, idle_timeout: Option<Durati
     Ok(resample_linear(&mono, input.sample_rate, WHISPER_SAMPLE_RATE))
 }
 
+/// Record while a PTT dataref reads active — the cockpit equivalent of
+/// [`record_hotkey_ptt`], driven by a button bound inside X-Plane (the bundled
+/// plugin's `xcopilot/ptt_active`). `is_active` is polled (typically a `LiveState`
+/// read), so this needs no global key permission and doesn't key the radio. Waits
+/// up to `idle_timeout` for it to go active; returns empty if it doesn't, then
+/// captures until it goes inactive.
+pub fn record_dataref_ptt(
+    is_active: impl Fn() -> bool,
+    idle_timeout: Option<Duration>,
+) -> Result<Vec<f32>> {
+    let start = Instant::now();
+    while !is_active() {
+        if idle_timeout.is_some_and(|t| start.elapsed() >= t) {
+            return Ok(Vec::new()); // not pressed this window — let the caller re-poll
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let input = open_input()?;
+    input.stream.play().context("starting input stream")?;
+    while is_active() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(input.stream);
+
+    let interleaved = std::mem::take(&mut *input.buffer.lock().unwrap());
+    let mono = downmix(&interleaved, input.channels);
+    Ok(resample_linear(&mono, input.sample_rate, WHISPER_SAMPLE_RATE))
+}
+
 /// Record a push-to-talk utterance. Blocks on two Enter presses (start, stop).
 pub fn record_push_to_talk() -> Result<Vec<f32>> {
     let input = open_input()?;

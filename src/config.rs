@@ -38,6 +38,11 @@ pub struct Config {
     /// captures only while this key is held — works while X-Plane has focus, so no
     /// wake word and ambient/ATC can't trigger it. Empty = use `listen_mode`.
     pub ptt_key: String,
+    /// Push-to-talk dataref (e.g. `xcopilot/ptt_active`, set by the bundled X-Plane
+    /// plugin). When set, the copilot captures only while this dataref reads nonzero
+    /// — a button bound inside X-Plane drives it, so no macOS permission and no radio
+    /// keying. Empty = use `ptt_key`/`listen_mode`. Takes precedence over `ptt_key`.
+    pub ptt_dataref: String,
     /// VAD energy threshold (RMS, 0.0..1.0). Above this counts as speech.
     /// Raise it in a noisy room, lower it if quiet speech is missed.
     pub vad_threshold: f32,
@@ -122,6 +127,7 @@ impl Config {
             whisper_gpu: env_or("XCOPILOT_WHISPER_GPU", "true") != "false",
             listen_mode: env_or("XCOPILOT_LISTEN", "continuous"),
             ptt_key: env_or("XCOPILOT_PTT_KEY", ""),
+            ptt_dataref: env_or("XCOPILOT_PTT_DATAREF", ""),
             vad_threshold: env_or("XCOPILOT_VAD_RMS", "0.012").parse().unwrap_or(0.012),
             stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.35").parse().unwrap_or(0.35),
             end_silence_ms: env_or("XCOPILOT_END_SILENCE_MS", "900").parse().unwrap_or(900),

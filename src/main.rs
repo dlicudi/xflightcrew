@@ -176,22 +176,31 @@ async fn main() -> Result<()> {
     });
     tracing::info!(checklists = checklists.len(), "interpreted checklists");
 
-    // Global push-to-talk key, if configured (and recognised). When set it takes
-    // over capture: the copilot listens only while the key is held, so there's no
-    // wake word and ambient/ATC can't trigger it.
-    let ptt_key = if config.ptt_key.is_empty() {
-        None
-    } else {
-        let k = audio::parse_ptt_key(&config.ptt_key);
-        if k.is_none() {
-            tracing::warn!(key = %config.ptt_key, "XCOPILOT_PTT_KEY not recognised — ignoring");
+    // Push-to-talk, if configured. When set it takes over capture: the copilot
+    // listens only while the button/key is held, so there's no wake word and
+    // ambient/ATC can't trigger it. A sim dataref (the bundled X-Plane plugin)
+    // takes precedence over a global key — it needs no OS permission.
+    let ptt = if !config.ptt_dataref.is_empty() {
+        // Leak the name to 'static for the dedicated subscription (lives for the
+        // whole run); a one-time leak of one config string.
+        let name: &'static str = Box::leak(config.ptt_dataref.clone().into_boxed_str());
+        let live = std::sync::Arc::new(LiveState::start(&config.xplane_base_url, &[name]));
+        Some(Ptt::Dataref { live, name: config.ptt_dataref.clone() })
+    } else if !config.ptt_key.is_empty() {
+        match audio::parse_ptt_key(&config.ptt_key) {
+            Some(k) => Some(Ptt::Key(k)),
+            None => {
+                tracing::warn!(key = %config.ptt_key, "XCOPILOT_PTT_KEY not recognised — ignoring");
+                None
+            }
         }
-        k
+    } else {
+        None
     };
     // Continuous only when not using PTT. "Explicit" = the user clearly addressed
     // the copilot (any push-to-talk); a non-command is then ignored silently rather
     // than answered with an apology.
-    let continuous = config.listen_mode == "continuous" && ptt_key.is_none();
+    let continuous = config.listen_mode == "continuous" && ptt.is_none();
     let explicit = !continuous;
 
     // The speech arbiter is shared by the command loop and the monitor, so it's
@@ -249,7 +258,7 @@ async fn main() -> Result<()> {
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             if let Err(e) = rt.block_on(run_session(
-                config, stt, llm, registry, profile, checklists, voice, continuous, explicit, ptt_key, reporter, Some(cmd_rx),
+                config, stt, llm, registry, profile, checklists, voice, continuous, explicit, ptt, reporter, Some(cmd_rx),
             )) {
                 tracing::error!("voice loop ended: {e:#}");
             }
@@ -259,7 +268,7 @@ async fn main() -> Result<()> {
         Ok(())
     } else {
         println!("\n  x-copilot — {} ({}). Ctrl-C to quit.\n", profile.display_name, config.listen_mode);
-        run_session(config, stt, llm, registry, profile, checklists, voice, continuous, explicit, ptt_key, Reporter::Plain, None).await
+        run_session(config, stt, llm, registry, profile, checklists, voice, continuous, explicit, ptt, Reporter::Plain, None).await
     }
 }
 
@@ -276,6 +285,25 @@ const HISTORY_TTL: Duration = Duration::from_secs(90);
 /// resolves it from history. Outside the window the strict keyword gate applies.
 const FOLLOWUP_WINDOW: Duration = Duration::from_secs(45);
 
+/// How the loop decides when to capture audio. Absent (`None`) means continuous
+/// VAD or Enter-to-talk; present means push-to-talk, gated either way.
+#[derive(Clone)]
+enum Ptt {
+    /// Hold a global key — polled via `device_query`, so it works while X-Plane
+    /// has focus. Needs macOS Input-Monitoring permission.
+    Key(device_query::Keycode),
+    /// A sim dataref goes nonzero while a bound button is held (the bundled
+    /// X-Plane plugin's `xcopilot/ptt_active`). No OS permission, no radio keying.
+    Dataref { live: std::sync::Arc<LiveState>, name: String },
+}
+
+impl Ptt {
+    /// True while the PTT dataref reads pressed (only meaningful for `Dataref`).
+    fn dataref_active(live: &LiveState, name: &str) -> bool {
+        live.get(name).unwrap_or(0.0) > 0.5
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     config: Config,
@@ -287,7 +315,7 @@ async fn run_session(
     voice: Voice,
     continuous: bool,
     explicit: bool,
-    ptt_key: Option<device_query::Keycode>,
+    ptt: Option<Ptt>,
     reporter: Reporter,
     typed: Option<std::sync::mpsc::Receiver<String>>,
 ) -> Result<()> {
@@ -320,12 +348,11 @@ async fn run_session(
 
     reporter.log(
         ui::LogKind::Info,
-        if ptt_key.is_some() {
-            format!("Ready — hold {} to talk.", config.ptt_key)
-        } else if !continuous {
-            "Ready — push-to-talk (Enter to start/stop).".to_string()
-        } else {
-            "Listening — just speak commands.".to_string()
+        match &ptt {
+            Some(Ptt::Key(_)) => format!("Ready — hold {} to talk.", config.ptt_key),
+            Some(Ptt::Dataref { .. }) => "Ready — hold your bound PTT button to talk.".to_string(),
+            None if !continuous => "Ready — push-to-talk (Enter to start/stop).".to_string(),
+            None => "Listening — just speak commands.".to_string(),
         },
     );
 
@@ -334,7 +361,7 @@ async fn run_session(
         // Input is spoken (gated like before) or typed in the TUI. A typed
         // command is deliberate, so it skips the confidence/wake/domain gates and
         // goes straight to the model.
-        let (mut command, from_text) = match next_input(&mut listener, &stt, ptt_key, typed.as_ref()) {
+        let (mut command, from_text) = match next_input(&mut listener, &stt, &ptt, typed.as_ref()) {
             None => continue,
             Some(Input::Typed(text)) => {
                 tracing::info!(typed = %text, "typed command");
@@ -506,7 +533,7 @@ async fn run_session(
             // one and ignore any other calls the LLM returned in the same turn
             // (guards against chaining through several checklists at once).
             if let Some(cl) = checklists.iter().find(|c| c.id == call.name) {
-                run_checklist(cl, &xplane, &config, &mut listener, &stt, ptt_key, typed.as_ref(), &voice, &reporter).await;
+                run_checklist(cl, &xplane, &config, &mut listener, &stt, &ptt, typed.as_ref(), &voice, &reporter).await;
                 break;
             }
 
@@ -528,7 +555,7 @@ async fn run_session(
 
                 say(&voice, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
                 reporter.status(ui::Phase::Listening);
-                let Some(reply) = listen_once(&mut listener, &stt, ptt_key, None) else {
+                let Some(reply) = listen_once(&mut listener, &stt, &ptt, None) else {
                     say(&voice, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
                     break 'confirm false;
                 };
@@ -625,7 +652,7 @@ async fn run_checklist(
     config: &Config,
     listener: &mut Option<Listener>,
     stt: &Stt,
-    ptt_key: Option<device_query::Keycode>,
+    ptt: &Option<Ptt>,
     typed: Option<&std::sync::mpsc::Receiver<String>>,
     voice: &Voice,
     reporter: &Reporter,
@@ -669,7 +696,7 @@ async fn run_checklist(
                     let hazard = confirm.expect("ask implies a confirm hazard");
                     say(voice, reporter, ui::LogKind::Confirm, &format!("Confirm, {hazard}?"));
                     reporter.status(ui::Phase::Listening);
-                    let reply = listen_once(listener, stt, ptt_key, None);
+                    let reply = listen_once(listener, stt, ptt, None);
                     match reply {
                         Some(r) if is_affirmative(&r.text) => {} // proceed
                         Some(r) if is_abort(&r.text) => {
@@ -858,12 +885,16 @@ fn icao_to_profile(icao: &str) -> String {
 fn listen_once(
     listener: &mut Option<Listener>,
     stt: &Stt,
-    ptt_key: Option<device_query::Keycode>,
+    ptt: &Option<Ptt>,
     idle_timeout: Option<Duration>,
 ) -> Option<stt::Transcription> {
-    let audio = match (ptt_key, listener) {
+    let audio = match (ptt, listener) {
         // Hold-a-key push-to-talk (works while X-Plane has focus).
-        (Some(key), _) => audio::record_hotkey_ptt(key, idle_timeout).ok()?,
+        (Some(Ptt::Key(key)), _) => audio::record_hotkey_ptt(*key, idle_timeout).ok()?,
+        // Sim-dataref push-to-talk (the X-Plane plugin's bound button).
+        (Some(Ptt::Dataref { live, name }), _) => {
+            audio::record_dataref_ptt(|| Ptt::dataref_active(live, name), idle_timeout).ok()?
+        }
         // Continuous, VAD-segmented.
         (None, Some(l)) => l.next_utterance(idle_timeout).ok()?,
         // Enter-to-talk.
@@ -890,11 +921,11 @@ enum Input {
 fn next_input(
     listener: &mut Option<Listener>,
     stt: &Stt,
-    ptt_key: Option<device_query::Keycode>,
+    ptt: &Option<Ptt>,
     typed: Option<&std::sync::mpsc::Receiver<String>>,
 ) -> Option<Input> {
     let Some(typed) = typed else {
-        return listen_once(listener, stt, ptt_key, None).map(Input::Spoken);
+        return listen_once(listener, stt, ptt, None).map(Input::Spoken);
     };
     loop {
         if let Ok(t) = typed.try_recv() {
@@ -903,7 +934,7 @@ fn next_input(
                 return Some(Input::Typed(t));
             }
         }
-        if let Some(t) = listen_once(listener, stt, ptt_key, Some(Duration::from_millis(150))) {
+        if let Some(t) = listen_once(listener, stt, ptt, Some(Duration::from_millis(150))) {
             return Some(Input::Spoken(t));
         }
         // Timed out idle (or a discarded blip) — loop to re-check the typed channel.
