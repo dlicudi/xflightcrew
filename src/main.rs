@@ -409,6 +409,14 @@ async fn run_session(
             say(&voice, &reporter, ui::LogKind::Readback, &line);
             continue;
         }
+        // Other state reads ("what's our altitude/heading/airspeed") — deterministic
+        // too, but only when it's a question, so "set heading 270" still commands.
+        if looks_like_question(&command) {
+            if let Some(answer) = answer_state_query(&command, &xplane, Some(&live)).await {
+                say(&voice, &reporter, ui::LogKind::Readback, &answer);
+                continue;
+            }
+        }
 
         let mut state: Option<String> = None;
 
@@ -1024,6 +1032,44 @@ async fn fuel_report(xp: &XPlaneClient, profile: &aircraft::AircraftProfile, liv
         }
     }
     format!("Roger — {line}.")
+}
+
+/// Answer the common "what's our X" state questions deterministically, straight
+/// from the datarefs — no LLM (it proved unreliable even with the data in hand).
+/// Multiple fields can be asked at once ("altitude and heading"). Returns `None`
+/// for anything not a recognized state read, to fall through to the LLM for the
+/// open-ended questions ("do we have enough fuel to reach Bristol?"). Only call
+/// this for utterances that are questions, so "set heading 270" still commands.
+async fn answer_state_query(
+    cmd: &str,
+    xp: &XPlaneClient,
+    live: Option<&LiveState>,
+) -> Option<String> {
+    let t = cmd.to_ascii_lowercase();
+    let mut parts: Vec<String> = Vec::new();
+    if t.contains("altitude") || t.contains("how high") {
+        if let Ok(v) = read1(live, xp, datarefs::ALTITUDE_FT).await {
+            parts.push(format!("{v:.0} feet"));
+        }
+    }
+    if t.contains("heading") {
+        if let Ok(v) = read1(live, xp, datarefs::COMPASS_HEADING_DEG).await {
+            parts.push(format!("heading {v:03.0}"));
+        }
+    }
+    let vs_q = t.contains("vertical speed") || t.contains("climb rate") || t.contains("rate of");
+    if vs_q {
+        if let Ok(v) = read1(live, xp, datarefs::VVI_FPM).await {
+            parts.push(format!("{v:+.0} feet per minute"));
+        }
+    }
+    // "speed" alone → airspeed, unless it was "vertical speed".
+    if t.contains("airspeed") || t.contains("air speed") || t.contains("how fast") || (t.contains("speed") && !vs_q) {
+        if let Ok(v) = read1(live, xp, datarefs::AIRSPEED_KTS).await {
+            parts.push(format!("{v:.0} knots"));
+        }
+    }
+    (!parts.is_empty()).then(|| format!("Roger — {}.", parts.join(", ")))
 }
 
 /// A compact live-state line for the LLM's context, so it can ground relative or
