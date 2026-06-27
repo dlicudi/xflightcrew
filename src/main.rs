@@ -1034,8 +1034,8 @@ fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
 const SNAPSHOT_DATAREFS: &[&str] = &[
     datarefs::ALTITUDE_FT, datarefs::AIRSPEED_KTS, datarefs::VVI_FPM,
     datarefs::COMPASS_HEADING_DEG, datarefs::FLAP_RATIO, datarefs::GEAR_HANDLE_DOWN,
-    datarefs::ON_GROUND_ANY, datarefs::FUEL_TOTAL_KG, datarefs::WIND_HEADING_DEG,
-    datarefs::WIND_SPEED_KTS, datarefs::OAT_DEG_C, datarefs::VISIBILITY_SM,
+    datarefs::ON_GROUND_ANY, datarefs::FUEL_TOTAL_KG, datarefs::WIND_DIR_DEG_TRUE,
+    datarefs::WIND_SPEED_MSC, datarefs::OAT_DEG_C, datarefs::VISIBILITY_SM,
     datarefs::QNH_PASCALS, datarefs::SERVOS_ON, datarefs::APPROACH_STATUS,
     datarefs::NAV_STATUS, datarefs::HEADING_STATUS,
 ];
@@ -1052,6 +1052,9 @@ async fn read1(live: Option<&LiveState>, xp: &XPlaneClient, name: &str) -> Resul
 
 /// 100LL avgas ≈ 2.72 kg/gal (~6 lb/gal) — to report fuel in gallons.
 const AVGAS_KG_PER_GAL: f64 = 2.72;
+
+/// Meters per second → knots.
+const MS_TO_KTS: f64 = 1.943_844;
 
 /// First element of a per-engine array dataref (engine 1), or `None` on a failed
 /// read. Engine indicators are arrays, so they bypass the scalar `read1`/cache.
@@ -1154,6 +1157,34 @@ async fn answer_state_query(
             parts.push(format!("{v:.0} knots"));
         }
     }
+    // Weather — answered deterministically, not via the LLM (same reliability fix
+    // as fuel). "weather" gives the lot; specific words give just that field.
+    let wx = t.contains("weather") || t.contains("metar") || t.contains("conditions");
+    if wx || t.contains("wind") {
+        if let (Ok(dir), Ok(spd_ms)) =
+            (read1(live, xp, datarefs::WIND_DIR_DEG_TRUE).await, read1(live, xp, datarefs::WIND_SPEED_MSC).await)
+        {
+            let kts = spd_ms * MS_TO_KTS;
+            parts.push(if kts < 1.0 { "wind calm".to_string() } else { format!("wind {dir:03.0} at {kts:.0} knots") });
+        }
+    }
+    if wx || t.contains("visibility") {
+        if let Ok(v) = read1(live, xp, datarefs::VISIBILITY_SM).await {
+            parts.push(format!("visibility {v:.0} statute miles"));
+        }
+    }
+    if wx || t.contains("altimeter") || t.contains("qnh") || t.contains("pressure") {
+        if let Ok(v) = read1(live, xp, datarefs::QNH_PASCALS).await {
+            // qnh in Pascals → altimeter setting in inHg (1 inHg = 3386.389 Pa).
+            parts.push(format!("altimeter {:.2}", v / 3386.389));
+        }
+    }
+    if wx || (t.contains("temperature") && !t.contains("oil")) || t.contains("how cold") || t.contains("how hot") || t.contains(" oat") {
+        if let Ok(v) = read1(live, xp, datarefs::OAT_DEG_C).await {
+            parts.push(format!("outside air temperature {v:.0} degrees celsius"));
+        }
+    }
+
     // Engine instruments (per-engine arrays → element 0). Temperatures spoken in
     // °F to match the 172's gauges and the POH. Names verified against the stock
     // 172's cockpitdecks mapping.
@@ -1229,8 +1260,8 @@ async fn state_snapshot(
         // Weather, so "what's the weather?" gets real numbers. Wind/OAT are the
         // cockpit-relative indicators (mirror the gauges); visibility and QNH come
         // from the XP12 aircraft-weather datarefs. All confirmed reading live.
-        read1(live, xp, datarefs::WIND_HEADING_DEG),
-        read1(live, xp, datarefs::WIND_SPEED_KTS),
+        read1(live, xp, datarefs::WIND_DIR_DEG_TRUE),
+        read1(live, xp, datarefs::WIND_SPEED_MSC),
         read1(live, xp, datarefs::OAT_DEG_C),
         read1(live, xp, datarefs::VISIBILITY_SM),
         read1(live, xp, datarefs::QNH_PASCALS),
@@ -1274,11 +1305,13 @@ async fn state_snapshot(
         parts.push(s);
     }
     // Weather: wind as "direction at speed" (calm if barely moving), plus OAT.
-    if let (Ok(dir), Ok(spd)) = (wind_dir, wind_kts) {
-        if spd < 1.0 {
+    // Wind speed is m/s from the aircraft-weather dataref → knots.
+    if let (Ok(dir), Ok(spd_ms)) = (wind_dir, wind_kts) {
+        let kts = spd_ms * MS_TO_KTS;
+        if kts < 1.0 {
             parts.push("wind calm".to_string());
         } else {
-            parts.push(format!("wind {dir:03.0} at {spd:.0} knots"));
+            parts.push(format!("wind {dir:03.0} at {kts:.0} knots"));
         }
     }
     if let Ok(v) = oat {

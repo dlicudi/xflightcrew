@@ -25,8 +25,11 @@ pub const FUEL_TOTAL_KG: &str = "sim/flightmodel/weight/m_fuel_total";
 pub const FUEL_PER_TANK_KG: &str = "sim/flightmodel/weight/m_fuel";
 
 // --- Weather (XP12 aircraft-relative) ---
-pub const WIND_HEADING_DEG: &str = "sim/cockpit2/gauges/indicators/wind_heading_deg_mag";
-pub const WIND_SPEED_KTS: &str = "sim/cockpit2/gauges/indicators/wind_speed_kts";
+/// Wind direction at the aircraft, degrees TRUE. (The `cockpit2/gauges` wind
+/// datarefs don't exist in XP12 — these aircraft-weather ones are the live values.)
+pub const WIND_DIR_DEG_TRUE: &str = "sim/weather/aircraft/wind_now_direction_degt";
+/// Wind speed at the aircraft, METERS PER SECOND (× 1.943844 for knots).
+pub const WIND_SPEED_MSC: &str = "sim/weather/aircraft/wind_now_speed_msc";
 pub const OAT_DEG_C: &str = "sim/cockpit2/temperature/outside_air_temp_degc";
 pub const VISIBILITY_SM: &str = "sim/weather/aircraft/visibility_reported_sm";
 /// Sea-level pressure in Pascals (1 inHg = 3386.389 Pa).
