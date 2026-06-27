@@ -529,7 +529,7 @@ async fn run_session(
             // Execute the curated tool (writes the dataref + reads back).
             reporter.status(ui::Phase::Thinking);
             let Some(tool) = registry.get(&call.name) else { continue };
-            let ctx = ToolCtx { xplane: &xplane, config: &config };
+            let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice) };
             let readback = match tool.execute(&call.arguments, &ctx).await {
                 Ok(line) => line,
                 Err(e) => {
@@ -590,7 +590,7 @@ async fn run_checklist(
 ) {
     use checklist::Item;
     say(voice, reporter, ui::LogKind::Info, &format!("Running the {} checklist.", cl.title));
-    let ctx = ToolCtx { xplane, config };
+    let ctx = ToolCtx { xplane, config, voice: Some(voice) };
     let mut failed = 0usize;
     let mut aborted = false;
     for item in &cl.items {

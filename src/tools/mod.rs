@@ -26,6 +26,7 @@ use serde_json::Value;
 
 use crate::aircraft::AircraftProfile;
 use crate::config::Config;
+use crate::voice::Voice;
 use crate::xplane::XPlane;
 
 // Datarefs/commands shared by more than one tool module, defined once here so the
@@ -46,6 +47,10 @@ pub struct ToolCtx<'a> {
     // limits come from the aircraft profile).
     #[allow(dead_code)]
     pub config: &'a Config,
+    /// The speech arbiter, for the rare action that announces *later* than its
+    /// readback — the autopilot capture watcher calls out the level-off when it
+    /// reaches the target, minutes after the command. `None` outside the live loop.
+    pub voice: Option<&'a Voice>,
 }
 
 /// One curated action the copilot can take.

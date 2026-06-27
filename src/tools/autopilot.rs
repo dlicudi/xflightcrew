@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx, CMD_SERVOS_ON};
+use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
 /// Pilot-side heading bug, degrees magnetic (writable).
@@ -114,8 +115,16 @@ const SERVICE_CEILING_FT: f64 = 14_000.0;
 const MIN_TARGET_AGL_FT: f64 = 500.0;
 /// Feet per meter — `y_agl` is metres.
 const METERS_TO_FEET: f64 = 3.280_84;
-/// Within this many feet of the target, treat it as "hold here" (no climb).
+/// Within this many feet of the target, treat it as "hold here" (no climb), and
+/// the band the capture watcher uses to detect a pilot re-command (dial moved).
 const ALT_CAPTURE_BAND_FT: f64 = 100.0;
+/// The watcher levels off within this many feet of the target — tighter than the
+/// capture band so we settle close to the commanded altitude, not ±100. Reliable
+/// because the watcher polls faster as it nears the target (see `capture_at_altitude`).
+const CAPTURE_TRIGGER_FT: f64 = 50.0;
+/// Inside this distance from the target, the watcher polls fast so the tight
+/// level-off trigger isn't skipped between ticks even at a brisk rate.
+const CAPTURE_APPROACH_FT: f64 = 400.0;
 
 /// Vertical speed (fpm, magnitude) for an altitude change of `delta_ft`: scaled so
 /// any change captures in roughly three minutes, floored at the gentle default so
@@ -175,9 +184,15 @@ async fn reject_unsafe_target(ctx: &ToolCtx<'_>, target: f64) -> Option<String> 
 async fn fly_to(ctx: &ToolCtx<'_>, altitude: f64, rate: Option<f64>) -> Result<(&'static str, f64, bool)> {
     let (movement, signed, capture) = arm_altitude(ctx, altitude, rate).await?;
     // A climb/descent needs the watcher to level us off (and ease a climb throttle);
-    // a hold is already done.
+    // a hold is already done. The watcher calls out the level-off when it reaches
+    // the target, so hand it a voice clone.
     if let Some(was_climb) = capture {
-        capture_at_altitude(ctx.config.xplane_base_url.clone(), altitude, was_climb);
+        capture_at_altitude(
+            ctx.config.xplane_base_url.clone(),
+            altitude,
+            was_climb,
+            ctx.voice.cloned(),
+        );
     }
 
     // Diagnostic: dump what the AP actually latched so a flight test shows the
@@ -261,7 +276,7 @@ enum Capture {
 fn capture_action(dial: f64, target: f64, current_alt: f64) -> Capture {
     if (dial - target).abs() > ALT_CAPTURE_BAND_FT {
         Capture::StandDown
-    } else if (current_alt - target).abs() <= ALT_CAPTURE_BAND_FT {
+    } else if (current_alt - target).abs() <= CAPTURE_TRIGGER_FT {
         Capture::LevelOff
     } else {
         Capture::Wait
@@ -290,16 +305,16 @@ static CLIMB_WATCHER_GEN: AtomicU64 = AtomicU64::new(0);
 /// newer command supersedes it (generation), if the selector dial moves off
 /// `target` (pilot re-commanded), and it won't override a throttle the pilot has
 /// taken manually. Fire-and-forget; a dropped poll just retries next tick.
-fn capture_at_altitude(base: String, target: f64, was_climb: bool) {
+fn capture_at_altitude(base: String, target: f64, was_climb: bool, voice: Option<Voice>) {
     let my_gen = CLIMB_WATCHER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
         rt.block_on(async move {
             let xp = XPlaneClient::new(base);
-            // 400 ticks × 3 s ≈ 20 min — even a long change at 300 fpm finishes well
-            // inside this; if it doesn't, we simply stop watching.
-            for _ in 0..400 {
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            // Wall-clock budget: even a long, slow change finishes inside 20 min; if
+            // it somehow doesn't, we stop watching.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20 * 60);
+            while std::time::Instant::now() < deadline {
                 // A newer command was issued — it owns the level-off now.
                 if CLIMB_WATCHER_GEN.load(Ordering::SeqCst) != my_gen {
                     return;
@@ -310,11 +325,11 @@ fn capture_at_altitude(base: String, target: f64, was_climb: bool) {
                 let (Ok(dial), Ok(alt)) =
                     (xp.get_float(ALT_DIAL).await, xp.get_float(CURRENT_ALT).await)
                 else {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
                 };
                 match capture_action(dial, target, alt) {
                     Capture::StandDown => return,
-                    Capture::Wait => continue,
                     Capture::LevelOff => {
                         // Engage ALT hold so the AP holds here instead of flying
                         // through in VS. Idempotent (the command is a toggle): if the
@@ -328,17 +343,34 @@ fn capture_at_altitude(base: String, target: f64, was_climb: bool) {
                         // manual throttle mid-climb (which doesn't move the alt dial,
                         // so the stand-down never fired), it now reads below the floor —
                         // leave it rather than overriding their setting.
+                        let mut eased = false;
                         if was_climb {
                             match xp.get_float(THROTTLE_ALL).await {
                                 Ok(thr) if thr >= FIREWALL_HANDBACK_FLOOR => {
                                     let _ = xp.set_float(THROTTLE_ALL, CRUISE_THROTTLE).await;
+                                    eased = true;
                                 }
                                 _ => {} // pilot took manual throttle — don't touch it
                             }
                         }
+                        // Call out the capture — this lands minutes after the command,
+                        // so it's the copilot telling you it actually levelled off.
+                        if let Some(v) = &voice {
+                            let line = if eased {
+                                format!("Reached {target:.0} feet — easing the power back, levelling off.")
+                            } else {
+                                format!("Reached {target:.0} feet — levelling off.")
+                            };
+                            v.say(Priority::Readback, line);
+                        }
                         return;
                     }
+                    Capture::Wait => {}
                 }
+                // Poll fast near the target so the tight level-off trigger isn't
+                // skipped between ticks; slow when far to keep the load light.
+                let secs = if (alt - target).abs() <= CAPTURE_APPROACH_FT { 1 } else { 3 };
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
             }
         });
     });
@@ -762,8 +794,10 @@ mod tests {
 
     #[test]
     fn capture_action_levels_off_stands_down_and_waits() {
-        // Reached the band around the target → level off.
-        assert_eq!(capture_action(7000.0, 7000.0, 6950.0), Capture::LevelOff);
+        // Within the (tight) level-off trigger of the target → level off.
+        assert_eq!(capture_action(7000.0, 7000.0, 6960.0), Capture::LevelOff);
+        // Close but still outside the trigger (settles nearer the target, not ±100).
+        assert_eq!(capture_action(7000.0, 7000.0, 6900.0), Capture::Wait);
         // Still climbing toward it → keep watching.
         assert_eq!(capture_action(7000.0, 7000.0, 5000.0), Capture::Wait);
         // The selected dial moved off our target (pilot re-commanded) → stand down,
@@ -778,7 +812,7 @@ mod tests {
     use crate::xplane::FakeXPlane;
 
     fn ctx<'a>(fake: &'a FakeXPlane, cfg: &'a crate::config::Config) -> ToolCtx<'a> {
-        ToolCtx { xplane: fake, config: cfg }
+        ToolCtx { xplane: fake, config: cfg, voice: None }
     }
 
     #[tokio::test]
