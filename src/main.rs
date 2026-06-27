@@ -275,6 +275,10 @@ async fn run_session(
     // instant cache reads instead of a REST burst. Best-effort: reads fall back to
     // REST until (or unless) the subscription warms up.
     let live = LiveState::start(&config.xplane_base_url, SNAPSHOT_DATAREFS);
+    // Pilot-voice gate: recognise the pilot so continuous mode needs no wake word
+    // and ATC/ambient is ignored. Only active when enabled AND a voiceprint is
+    // enrolled; otherwise the loop uses the wake word.
+    let speaker_gate = build_speaker_gate(&config);
     let mut specs = registry.specs();
     // Each checklist is exposed to the LLM as a no-arg "tool" the loop intercepts
     // and runs interactively.
@@ -317,7 +321,7 @@ async fn run_session(
                 reporter.log(ui::LogKind::Heard, format!("⌨  \"{text}\""));
                 (text, true)
             }
-            Some(Input::Spoken(heard)) => {
+            Some(Input::Spoken(heard, samples)) => {
                 let transcript = heard.text;
                 let confidence = heard.confidence;
                 tracing::info!(transcript = %transcript, confidence, "heard utterance");
@@ -334,14 +338,28 @@ async fn run_session(
                     continue;
                 }
 
-                // Wake-word gate (continuous only).
+                // Addressing gate (continuous only). Prefer speaker-ID — recognise
+                // the pilot's voice so no wake word is needed and ATC/ambient is
+                // ignored. Fall back to the wake word when speaker-ID is off,
+                // unenrolled, or the sidecar's unavailable.
                 let cmd = if continuous {
-                    match gate_wake_word(&transcript, &config.wake_word) {
-                        Some(cmd) if !cmd.is_empty() => cmd,
-                        _ => {
-                            reporter.log(ui::LogKind::Info, "ignored (no wake word)");
+                    let by_voice = match &speaker_gate {
+                        Some(g) => g.accepts(&samples).await,
+                        None => None,
+                    };
+                    match by_voice {
+                        Some(true) => transcript.clone(), // recognised the pilot
+                        Some(false) => {
+                            reporter.log(ui::LogKind::Info, "ignored (not the pilot's voice)");
                             continue;
                         }
+                        None => match gate_wake_word(&transcript, &config.wake_word) {
+                            Some(cmd) if !cmd.is_empty() => cmd,
+                            _ => {
+                                reporter.log(ui::LogKind::Info, "ignored (no wake word)");
+                                continue;
+                            }
+                        },
                     }
                 } else {
                     transcript.clone()
@@ -514,7 +532,7 @@ async fn run_session(
 
                 say(&voice, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
                 reporter.status(ui::Phase::Listening);
-                let Some(reply) = listen_once(&mut listener, &stt, None) else {
+                let Some((reply, _)) = listen_once(&mut listener, &stt, None) else {
                     say(&voice, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
                     break 'confirm false;
                 };
@@ -654,7 +672,7 @@ async fn run_checklist(
                     let hazard = confirm.expect("ask implies a confirm hazard");
                     say(voice, reporter, ui::LogKind::Confirm, &format!("Confirm, {hazard}?"));
                     reporter.status(ui::Phase::Listening);
-                    let reply = listen_once(listener, stt, None);
+                    let reply = listen_once(listener, stt, None).map(|(t, _)| t);
                     match reply {
                         Some(r) if is_affirmative(&r.text) => {} // proceed
                         Some(r) if is_abort(&r.text) => {
@@ -921,7 +939,11 @@ fn icao_to_profile(icao: &str) -> String {
 
 /// Capture one utterance (continuous VAD or push-to-talk) and transcribe it.
 /// Returns `None` on silence/noise or a capture error.
-fn listen_once(listener: &mut Option<Listener>, stt: &Stt, idle_timeout: Option<Duration>) -> Option<stt::Transcription> {
+fn listen_once(
+    listener: &mut Option<Listener>,
+    stt: &Stt,
+    idle_timeout: Option<Duration>,
+) -> Option<(stt::Transcription, Vec<f32>)> {
     let audio = match listener {
         Some(l) => l.next_utterance(idle_timeout).ok()?,
         None => audio::record_push_to_talk().ok()?,
@@ -929,16 +951,64 @@ fn listen_once(listener: &mut Option<Listener>, stt: &Stt, idle_timeout: Option<
     if audio.is_empty() {
         return None; // idle timeout (continuous) or empty capture
     }
+    // Return the raw samples too — the speaker-ID gate needs the audio, not just
+    // the transcript.
     match stt.transcribe(&audio) {
-        Ok(t) if !t.text.is_empty() => Some(t),
+        Ok(t) if !t.text.is_empty() => Some((t, audio)),
         _ => None,
     }
 }
 
-/// One pilot input — spoken (transcribed) or typed in the TUI.
+/// One pilot input — spoken (transcript + the raw audio, for the speaker gate) or
+/// typed in the TUI.
 enum Input {
-    Spoken(stt::Transcription),
+    Spoken(stt::Transcription, Vec<f32>),
     Typed(String),
+}
+
+/// The pilot-voice gate: embeds an utterance via the speaker sidecar and accepts
+/// it only if it matches the enrolled voiceprint. Present only when speaker-ID is
+/// on and a voiceprint exists; otherwise the loop falls back to the wake word.
+struct SpeakerGate {
+    client: reqwest::Client,
+    url: String,
+    voiceprint: speaker::Voiceprint,
+    threshold: f32,
+}
+
+impl SpeakerGate {
+    /// `Some(true)`/`Some(false)` = recognised / not the pilot; `None` = couldn't
+    /// decide (sidecar down / embed failed) → caller falls back to the wake word.
+    async fn accepts(&self, samples: &[f32]) -> Option<bool> {
+        let emb = speaker::embed(&self.client, &self.url, samples).await.ok()?;
+        let sim = speaker::cosine(&self.voiceprint.embedding, &emb);
+        tracing::info!(similarity = sim, threshold = self.threshold, "speaker gate");
+        Some(sim >= self.threshold)
+    }
+}
+
+/// Build the gate if speaker-ID is enabled and a voiceprint is enrolled.
+fn build_speaker_gate(config: &Config) -> Option<SpeakerGate> {
+    if !config.speaker_id {
+        return None;
+    }
+    let Some(voiceprint) = speaker::Voiceprint::load(speaker::VOICEPRINT_PATH) else {
+        tracing::warn!(
+            "XCOPILOT_SPEAKER_ID is set but no voiceprint at {} — run `learn-pilot-voice`; using the wake word",
+            speaker::VOICEPRINT_PATH
+        );
+        return None;
+    };
+    let threshold = std::env::var("XCOPILOT_SPEAKER_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(speaker::DEFAULT_THRESHOLD);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    tracing::info!(threshold, url = %config.speaker_url, "speaker-ID enabled (pilot voiceprint loaded)");
+    Some(SpeakerGate { client, url: config.speaker_url.clone(), voiceprint, threshold })
 }
 
 /// Block until the next input arrives from either source. With a `typed`
@@ -950,7 +1020,7 @@ fn next_input(
     typed: Option<&std::sync::mpsc::Receiver<String>>,
 ) -> Option<Input> {
     let Some(typed) = typed else {
-        return listen_once(listener, stt, None).map(Input::Spoken);
+        return listen_once(listener, stt, None).map(|(t, a)| Input::Spoken(t, a));
     };
     loop {
         if let Ok(t) = typed.try_recv() {
@@ -959,8 +1029,8 @@ fn next_input(
                 return Some(Input::Typed(t));
             }
         }
-        if let Some(utt) = listen_once(listener, stt, Some(Duration::from_millis(150))) {
-            return Some(Input::Spoken(utt));
+        if let Some((t, a)) = listen_once(listener, stt, Some(Duration::from_millis(150))) {
+            return Some(Input::Spoken(t, a));
         }
         // Timed out idle (or a discarded blip) — loop to re-check the typed channel.
     }
