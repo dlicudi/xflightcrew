@@ -66,6 +66,10 @@ pub struct Snapshot {
     pub flap_ratio: f64,
     pub agl_ft: f64,
     pub vsi_fpm: f64,
+    /// Pushback tug attached (`sim/aircraft/overflow/pushback_attached`).
+    pub tug_attached: bool,
+    /// Pushback/tow actively underway (`sim/flightmodel2/misc/tow_in_progress`).
+    pub pushing_back: bool,
     pub engine_running: bool,
     pub alternator_on: bool,
     /// Directional-gyro precession vs the magnetic compass, degrees, folded into
@@ -98,6 +102,11 @@ impl Snapshot {
             .get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot")
             .await
             .ok()?;
+        // Best-effort (a missing read must not kill the snapshot): pushback state.
+        let tug_attached =
+            xp.get_float("sim/aircraft/overflow/pushback_attached").await.unwrap_or(0.0) > 0.5;
+        let pushing_back =
+            xp.get_float("sim/flightmodel2/misc/tow_in_progress").await.unwrap_or(0.0) > 0.5;
         let engine_running = xp
             .get_float_array("sim/flightmodel/engine/ENGN_running")
             .await
@@ -144,6 +153,8 @@ impl Snapshot {
             flap_ratio,
             agl_ft,
             vsi_fpm,
+            tug_attached,
+            pushing_back,
             engine_running,
             alternator_on,
             gyro_drift_deg,
@@ -489,10 +500,28 @@ pub async fn run(config: Config, profile: AircraftProfile, voice: Voice) {
     // single noisy sample doesn't read as a sharp washout.
     let mut prev_ias: Option<(f64, Instant)> = None;
     let mut trend = 0.0_f64;
+    // Pushback progress is a sequence of *events*, not a sustained condition, so
+    // it's called out on transitions here rather than as Checks.
+    let mut prev_attached = false;
+    let mut prev_pushing = false;
 
     loop {
         if let Some(mut snap) = Snapshot::read(&xp).await {
             let now = Instant::now();
+
+            // Pushback callouts (on the ground): tug hooks up → pushing → clear.
+            if snap.on_ground {
+                if snap.tug_attached && !prev_attached && !snap.pushing_back {
+                    voice.alert(Priority::Advisory, "Tug connected, ready for pushback.");
+                }
+                if snap.pushing_back && !prev_pushing {
+                    voice.alert(Priority::Advisory, "Pushing back.");
+                } else if !snap.pushing_back && prev_pushing {
+                    voice.alert(Priority::Advisory, "Pushback complete, tug clear.");
+                }
+            }
+            prev_attached = snap.tug_attached;
+            prev_pushing = snap.pushing_back;
             if let Some((last, last_t)) = prev_ias {
                 let dt = now.duration_since(last_t).as_secs_f64();
                 // Ignore a stretched dt (a skipped/stalled tick) — the rate would
@@ -660,6 +689,8 @@ mod tests {
             flap_ratio: 0.0,
             agl_ft: 0.0,
             vsi_fpm: 0.0,
+            tug_attached: false,
+            pushing_back: false,
             engine_running,
             alternator_on,
             gyro_drift_deg: 0.0,
