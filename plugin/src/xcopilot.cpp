@@ -1,29 +1,42 @@
-// x-copilot X-Plane plugin — a virtual push-to-talk and a compact in-sim status
-// panel for the x-copilot voice assistant.
+// x-copilot X-Plane plugin — a virtual push-to-talk plus a slick in-sim status
+// panel (Dear ImGui) for the x-copilot voice assistant.
 //
-// PTT: registers a command `xcopilot/ptt` (bind it to a joystick button or key in
-// X-Plane → Settings → Keyboard/Joystick) and a readable dataref
-// `xcopilot/ptt_active` that is 1 while the command is held. The x-copilot app
-// reads that dataref over the Web API and captures the mic only while it's 1 — a
-// dedicated PTT that doesn't key the radio and needs no macOS permission.
+// PTT: command `xcopilot/ptt` (bind to a button/key) drives the readable dataref
+// `xcopilot/ptt_active` (1 while held). The app captures the mic only while it's
+// 1 — no radio keying, no macOS permission.
 //
-// Status panel: registers writable datarefs the app pushes into —
+// Panel: writable datarefs the app pushes into —
 //   xcopilot/status/phase  (int: 0 idle, 1 listening, 2 thinking, 3 speaking)
 //   xcopilot/status/heard  (text: last transcript)
 //   xcopilot/status/action (text: last readback)
-// and draws them in a small floating window (toggle via Plugins → x-copilot).
+// rendered as a toolbar of status chips + a scrolling transmission log.
+// Toggle via Plugins → x-copilot.
 //
 // Build/install: see plugin/README.md.
 
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include "XPLMDataAccess.h"
 #include "XPLMDisplay.h"
 #include "XPLMGraphics.h"
 #include "XPLMMenus.h"
 #include "XPLMPlugin.h"
-#include "XPLMUtilities.h"
+
+#include "imgui.h"
+#include "ImgWindow.h"
+#include "ImgFontAtlas.h"
+
+// ---- colours ----------------------------------------------------------------
+
+static const ImU32 COL_GREEN = IM_COL32(120, 225, 140, 255);
+static const ImU32 COL_DIM   = IM_COL32(150, 155, 165, 255);
+static const ImU32 COL_AMBER = IM_COL32(255, 185, 40, 255);
+static const ImU32 COL_CYAN  = IM_COL32(90, 200, 255, 255);
+static const ImU32 COL_WHITE = IM_COL32(235, 235, 240, 255);
 
 // ---- PTT --------------------------------------------------------------------
 
@@ -31,24 +44,16 @@ static int g_ptt_active = 0;
 static XPLMCommandRef g_ptt_cmd = nullptr;
 static XPLMDataRef g_ptt_dref = nullptr;
 
-static int PttCommandHandler(XPLMCommandRef /*cmd*/, XPLMCommandPhase phase, void* /*ref*/) {
-    if (phase == xplm_CommandBegin) {
-        g_ptt_active = 1;
-    } else if (phase == xplm_CommandEnd) {
-        g_ptt_active = 0;
-    }
-    return 1;  // not consumed; there's no default behaviour for a custom command
+static int PttCommandHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
+    if (phase == xplm_CommandBegin) g_ptt_active = 1;
+    else if (phase == xplm_CommandEnd) g_ptt_active = 0;
+    return 1;
 }
+static int ReadPttActive(void*) { return g_ptt_active; }
 
-static int ReadPttActive(void* /*ref*/) { return g_ptt_active; }
+// ---- status datarefs --------------------------------------------------------
 
-// ---- Status datarefs --------------------------------------------------------
-
-// A small fixed text buffer exposed as a writable byte-array dataref.
-struct TextRef {
-    char buf[128];
-    int len;
-};
+struct TextRef { char buf[128]; int len; };
 
 static int g_phase = 0;
 static TextRef g_heard = {{0}, 0};
@@ -58,10 +63,21 @@ static XPLMDataRef g_phase_dref = nullptr;
 static XPLMDataRef g_heard_dref = nullptr;
 static XPLMDataRef g_action_dref = nullptr;
 
-static int ReadPhase(void* /*ref*/) { return g_phase; }
-static void WritePhase(void* /*ref*/, int v) { g_phase = v; }
+// Transmission log shown in the panel.
+struct LogEntry { std::string tag; ImU32 color; std::string text; };
+static std::vector<LogEntry> g_log;
+static bool g_log_scroll = false;
 
-// Byte-array read: NULL out = size query; else copy [offset, offset+max).
+static void AppendLog(const char* tag, ImU32 color, const char* text) {
+    if (text == nullptr || text[0] == '\0') return;
+    g_log.push_back({tag, color, text});
+    if (g_log.size() > 60) g_log.erase(g_log.begin());
+    g_log_scroll = true;
+}
+
+static int ReadPhase(void*) { return g_phase; }
+static void WritePhase(void*, int v) { g_phase = v; }
+
 static int ReadText(void* ref, void* out, int offset, int max) {
     TextRef* t = static_cast<TextRef*>(ref);
     if (out == nullptr) return t->len;
@@ -72,10 +88,8 @@ static int ReadText(void* ref, void* out, int offset, int max) {
     return n;
 }
 
-// Byte-array write: the app PATCHes the whole value at offset 0; we keep it
-// NUL-terminated so the draw code can treat it as a C string.
-static void WriteText(void* ref, void* in, int offset, int len) {
-    TextRef* t = static_cast<TextRef*>(ref);
+// Store the whole value (the app PATCHes at offset 0), NUL-terminated.
+static void StoreText(TextRef* t, void* in, int offset, int len) {
     if (offset != 0) return;
     if (len > 127) len = 127;
     if (len < 0) len = 0;
@@ -84,93 +98,102 @@ static void WriteText(void* ref, void* in, int offset, int len) {
     t->len = len;
 }
 
-// ---- Status panel -----------------------------------------------------------
+static void WriteHeard(void*, void* in, int offset, int len) {
+    StoreText(&g_heard, in, offset, len);
+    AppendLog("HEARD", COL_DIM, g_heard.buf);
+}
+static void WriteAction(void*, void* in, int offset, int len) {
+    StoreText(&g_action, in, offset, len);
+    AppendLog("ROGER", COL_GREEN, g_action.buf);
+}
 
-static XPLMWindowID g_win = nullptr;
-static XPLMMenuID g_menu = nullptr;
+// ---- panel ------------------------------------------------------------------
 
 static const char* PhaseLabel(int p) {
     switch (p) {
-        case 1: return "Listening";
-        case 2: return "Thinking";
-        case 3: return "Speaking";
-        default: return "Idle";
+        case 1: return "LISTENING";
+        case 2: return "THINKING";
+        case 3: return "SPEAKING";
+        default: return "IDLE";
+    }
+}
+static ImU32 PhaseColor(int p) {
+    switch (p) {
+        case 1: return COL_GREEN;
+        case 2: return COL_AMBER;
+        case 3: return COL_CYAN;
+        default: return COL_DIM;
     }
 }
 
-static void DrawPanel(XPLMWindowID win, void* /*ref*/) {
-    int l, t, r, b;
-    XPLMGetWindowGeometry(win, &l, &t, &r, &b);
-
-    float white[] = {0.92f, 0.92f, 0.92f};
-    float green[] = {0.25f, 0.9f, 0.35f};
-    float dim[]   = {0.45f, 0.45f, 0.45f};
-    float amber[] = {1.0f, 0.72f, 0.15f};
-    float cyan[]  = {0.35f, 0.8f, 1.0f};
-
-    int x = l + 8;
-    int y = t - 16;
-
-    XPLMDrawString(white, x, y, const_cast<char*>("x-copilot"), nullptr, xplmFont_Proportional);
-    y -= 18;
-
-    // PTT light + current phase, side by side.
-    float* ptt_col = g_ptt_active ? green : dim;
-    XPLMDrawString(ptt_col, x, y, const_cast<char*>("[PTT]"), nullptr, xplmFont_Proportional);
-    float* ph_col = g_phase == 1 ? green : g_phase == 2 ? amber : g_phase == 3 ? cyan : dim;
-    XPLMDrawString(ph_col, x + 46, y, const_cast<char*>(PhaseLabel(g_phase)), nullptr,
-                   xplmFont_Proportional);
-    y -= 16;
-
-    if (g_heard.len > 0) {
-        char line[160];
-        std::snprintf(line, sizeof line, "> %s", g_heard.buf);
-        XPLMDrawString(white, x, y, line, nullptr, xplmFont_Proportional);
-    }
-    y -= 16;
-    if (g_action.len > 0) {
-        char line[160];
-        std::snprintf(line, sizeof line, "= %s", g_action.buf);
-        XPLMDrawString(green, x, y, line, nullptr, xplmFont_Proportional);
-    }
+// A small outlined "chip" (like the mockup's RAMP tags), drawn in `col` at the
+// current cursor; advances the cursor by its size so SameLine() text follows.
+static void Chip(const char* label, ImU32 col) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImVec2 ts = ImGui::CalcTextSize(label);
+    const float padx = 6.0f, pady = 2.0f;
+    ImVec2 size(ts.x + padx * 2, ts.y + pady * 2);
+    dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y), col, 3.0f, 0, 1.2f);
+    dl->AddText(ImVec2(p.x + padx, p.y + pady), col, label);
+    ImGui::Dummy(size);
 }
 
-static int NoMouse(XPLMWindowID, int, int, XPLMMouseStatus, void*) { return 1; }
-static XPLMCursorStatus NoCursor(XPLMWindowID, int, int, void*) { return xplm_CursorDefault; }
-static int NoWheel(XPLMWindowID, int, int, int, int, void*) { return 1; }
-static void NoKey(XPLMWindowID, char, XPLMKeyFlags, char, void*, int) {}
-
-static void CreatePanel() {
-    int sl, st, sr, sb;
-    XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
-
-    XPLMCreateWindow_t p;
-    std::memset(&p, 0, sizeof p);
-    p.structSize = sizeof p;
-    p.left = sl + 50;
-    p.top = st - 50;
-    p.right = p.left + 240;
-    p.bottom = p.top - 92;
-    p.visible = 1;
-    p.drawWindowFunc = DrawPanel;
-    p.handleMouseClickFunc = NoMouse;
-    p.handleRightClickFunc = NoMouse;
-    p.handleMouseWheelFunc = NoWheel;
-    p.handleKeyFunc = NoKey;
-    p.handleCursorFunc = NoCursor;
-    p.refcon = nullptr;
-    p.layer = xplm_WindowLayerFloatingWindows;
-    p.decorateAsFloatingWindow = xplm_WindowDecorationRoundRectangle;
-    g_win = XPLMCreateWindowEx(&p);
-}
-
-static void MenuHandler(void* /*menu*/, void* /*item*/) {
-    if (g_win) {
-        XPLMSetWindowIsVisible(g_win, !XPLMGetWindowIsVisible(g_win));
+class XCopilotPanel : public ImgWindow {
+public:
+    XCopilotPanel(int l, int t, int r, int b)
+        : ImgWindow(l, t, r, b, xplm_WindowDecorationRoundRectangle,
+                    xplm_WindowLayerFloatingWindows) {
+        SetWindowTitle("x-copilot");
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        ImGuiStyle& s = ImGui::GetStyle();
+        s.WindowRounding = 8.0f;
+        s.ChildRounding = 6.0f;
+        s.FrameRounding = 4.0f;
+        s.ItemSpacing = ImVec2(8, 6);
+        s.Colors[ImGuiCol_WindowBg] = ImVec4(0.13f, 0.14f, 0.16f, 0.94f);
+        s.Colors[ImGuiCol_ChildBg]  = ImVec4(0.10f, 0.11f, 0.13f, 0.85f);
+        s.Colors[ImGuiCol_Border]   = ImVec4(0.30f, 0.32f, 0.36f, 0.60f);
     }
+
+protected:
+    void buildInterface() override {
+        // Toolbar: PTT light + current phase, as chips.
+        Chip("PTT", g_ptt_active ? COL_GREEN : COL_DIM);
+        ImGui::SameLine();
+        Chip(PhaseLabel(g_phase), PhaseColor(g_phase));
+        ImGui::Separator();
+
+        // Transmission log — recent heard/action lines with coloured tags.
+        const float footer = ImGui::GetFrameHeightWithSpacing();
+        ImGui::BeginChild("log", ImVec2(0, -footer), true);
+        for (const LogEntry& e : g_log) {
+            Chip(e.tag.c_str(), e.color);
+            ImGui::SameLine();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(e.color), "%s", e.text.c_str());
+        }
+        if (g_log_scroll) { ImGui::SetScrollHereY(1.0f); g_log_scroll = false; }
+        ImGui::EndChild();
+
+        // Footer hint.
+        if (g_log.empty()) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "Hold your PTT button and speak.");
+        } else {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", PhaseLabel(g_phase));
+        }
+    }
+};
+
+static std::unique_ptr<XCopilotPanel> g_panel;
+static XPLMMenuID g_menu = nullptr;
+
+static void MenuHandler(void*, void*) {
+    if (g_panel) g_panel->SetVisible(!g_panel->GetVisible());
 }
 
-// ---- Plugin lifecycle -------------------------------------------------------
+// ---- lifecycle --------------------------------------------------------------
 
 PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
     std::strcpy(name, "x-copilot");
@@ -178,51 +201,52 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
     std::strcpy(desc, "Push-to-talk and status panel for the x-copilot voice assistant.");
 
     g_ptt_cmd = XPLMCreateCommand("xcopilot/ptt", "x-copilot: hold to talk");
-    XPLMRegisterCommandHandler(g_ptt_cmd, PttCommandHandler, 1 /*before*/, nullptr);
+    XPLMRegisterCommandHandler(g_ptt_cmd, PttCommandHandler, 1, nullptr);
 
     g_ptt_dref = XPLMRegisterDataAccessor(
-        "xcopilot/ptt_active", xplmType_Int, 0 /*not writable*/,
+        "xcopilot/ptt_active", xplmType_Int, 0,
         ReadPttActive, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-
     g_phase_dref = XPLMRegisterDataAccessor(
-        "xcopilot/status/phase", xplmType_Int, 1 /*writable*/,
+        "xcopilot/status/phase", xplmType_Int, 1,
         ReadPhase, WritePhase, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-
     g_heard_dref = XPLMRegisterDataAccessor(
-        "xcopilot/status/heard", xplmType_Data, 1 /*writable*/,
+        "xcopilot/status/heard", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-        nullptr, nullptr, nullptr, nullptr, ReadText, WriteText, &g_heard, &g_heard);
-
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteHeard, &g_heard, &g_heard);
     g_action_dref = XPLMRegisterDataAccessor(
-        "xcopilot/status/action", xplmType_Data, 1 /*writable*/,
+        "xcopilot/status/action", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-        nullptr, nullptr, nullptr, nullptr, ReadText, WriteText, &g_action, &g_action);
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteAction, &g_action, &g_action);
 
-    CreatePanel();
+    // One shared font atlas for all ImgWindows (uses ImGui's default font).
+    ImgWindow::sFontAtlas = std::make_shared<ImgFontAtlas>();
+
+    int sl, st, sr, sb;
+    XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
+    int wl = sl + 50, wt = st - 50, wr = wl + 420, wb = wt - 300;
+    g_panel = std::make_unique<XCopilotPanel>(wl, wt, wr, wb);
 
     int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "x-copilot", nullptr, 0);
     g_menu = XPLMCreateMenu("x-copilot", XPLMFindPluginsMenu(), idx, MenuHandler, nullptr);
     XPLMAppendMenuItem(g_menu, "Toggle status panel", (void*)"toggle", 0);
 
-    XPLMDebugString("x-copilot plugin: started (ptt + status panel)\n");
+    XPLMDebugString("x-copilot plugin: started (ptt + ImGui status panel)\n");
     return 1;
 }
 
 PLUGIN_API void XPluginStop(void) {
-    if (g_win) { XPLMDestroyWindow(g_win); g_win = nullptr; }
+    g_panel.reset();
+    ImgWindow::sFontAtlas.reset();
     if (g_menu) { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
     if (g_action_dref) { XPLMUnregisterDataAccessor(g_action_dref); g_action_dref = nullptr; }
     if (g_heard_dref) { XPLMUnregisterDataAccessor(g_heard_dref); g_heard_dref = nullptr; }
     if (g_phase_dref) { XPLMUnregisterDataAccessor(g_phase_dref); g_phase_dref = nullptr; }
     if (g_ptt_dref) { XPLMUnregisterDataAccessor(g_ptt_dref); g_ptt_dref = nullptr; }
-    if (g_ptt_cmd) {
-        XPLMUnregisterCommandHandler(g_ptt_cmd, PttCommandHandler, 1, nullptr);
-        g_ptt_cmd = nullptr;
-    }
+    if (g_ptt_cmd) { XPLMUnregisterCommandHandler(g_ptt_cmd, PttCommandHandler, 1, nullptr); g_ptt_cmd = nullptr; }
 }
 
 PLUGIN_API int XPluginEnable(void) { return 1; }
 PLUGIN_API void XPluginDisable(void) {}
-PLUGIN_API void XPluginReceiveMessage(XPLMPluginID /*from*/, int /*msg*/, void* /*param*/) {}
+PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int, void*) {}

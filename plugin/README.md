@@ -13,7 +13,14 @@ the mic only while it's `1`. Unlike `sim/operation/contact_atc_ptt`, this does
 **not** key the radio, and unlike a global keyboard hook it needs **no macOS
 Input-Monitoring permission** — the button press is read by X-Plane itself.
 
-A status display (copilot phase / last heard / last action) is the planned phase 2.
+The panel is a small Dear ImGui window: a toolbar of status chips (PTT light +
+phase) over a scrolling transmission log of what was heard and read back.
+
+## Vendored libraries
+
+`third_party/` holds Dear ImGui (MIT) and the `ImgWindow` X-Plane↔ImGui bridge
+(BSD-3, Christopher Collins) — committed so the build is self-contained. On macOS
+ImGui renders through the system OpenGL framework; no extra GL loader is needed.
 
 ## Build (macOS)
 

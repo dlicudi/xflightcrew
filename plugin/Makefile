@@ -11,16 +11,24 @@ XPLANE  ?= $(HOME)/X-Plane 12
 
 CXX      := clang++
 ARCHS    := -arch arm64 -arch x86_64
-CXXFLAGS := -std=c++17 -fPIC -fvisibility=hidden -O2 \
+CXXFLAGS := -std=c++17 -fPIC -fvisibility=hidden -O2 -mmacosx-version-min=11.0 \
+            -Wno-deprecated-declarations \
             -DAPL=1 -DIBM=0 -DLIN=0 -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 \
-            -I$(SDK)/CHeaders/XPLM
-LDFLAGS  := -dynamiclib -F$(SDK)/Libraries/Mac -framework XPLM
+            -I$(SDK)/CHeaders/XPLM -Ithird_party/imgui -Ithird_party/ImgWindow
+LDFLAGS  := -dynamiclib -mmacosx-version-min=11.0 -F$(SDK)/Libraries/Mac \
+            -framework XPLM -framework OpenGL -framework ApplicationServices \
+            -framework CoreFoundation
+
+SRCS := src/$(PLUGIN).cpp \
+        third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp \
+        third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp \
+        third_party/ImgWindow/ImgWindow.cpp third_party/ImgWindow/ImgFontAtlas.cpp
 
 OUT := build/mac_x64/$(PLUGIN).xpl
 
-$(OUT): src/$(PLUGIN).cpp
+$(OUT): $(SRCS)
 	@mkdir -p build/mac_x64
-	$(CXX) $(ARCHS) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
+	$(CXX) $(ARCHS) $(CXXFLAGS) $(LDFLAGS) -o $@ $(SRCS)
 	@echo "built $@"
 
 .PHONY: install clean
