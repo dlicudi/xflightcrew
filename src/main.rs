@@ -1609,6 +1609,22 @@ mod tests {
     use super::looks_like_question;
 
     #[test]
+    fn wake_word_gates_ambient_and_atc_speech() {
+        use super::gate_wake_word;
+        // Addressed to the copilot → command passes (wake word stripped).
+        assert_eq!(gate_wake_word("copilot flaps ten", "copilot").as_deref(), Some("flaps ten"));
+        assert_eq!(gate_wake_word("hey copilot, gear up", "copilot").as_deref(), Some("gear up"));
+        assert_eq!(gate_wake_word("co pilot flaps ten", "copilot").as_deref(), Some("flaps ten")); // mishear
+        // ATC / ambient speech (no wake word) is dropped — even though it shares
+        // our command vocabulary.
+        assert_eq!(gate_wake_word("climb and maintain five thousand", "copilot"), None);
+        assert_eq!(gate_wake_word("cessna one two three squawk seven thousand", "copilot"), None);
+        assert_eq!(gate_wake_word("flaps ten", "copilot"), None);
+        // Empty wake word = act on everything (PTT / clean-mic mode).
+        assert_eq!(gate_wake_word("flaps ten", "").as_deref(), Some("flaps ten"));
+    }
+
+    #[test]
     fn fuel_query_detects_questions_not_system_commands() {
         use super::is_fuel_query;
         assert!(is_fuel_query("how much fuel do we have"));

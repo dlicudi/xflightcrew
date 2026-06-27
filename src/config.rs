@@ -120,9 +120,11 @@ impl Config {
             whisper_model_path: env_or("WHISPER_MODEL", "models/ggml-base.en.bin"),
             whisper_gpu: env_or("XCOPILOT_WHISPER_GPU", "true") != "false",
             listen_mode: env_or("XCOPILOT_LISTEN", "continuous"),
-            // Empty by default: act on every clear utterance, let the LLM ignore
-            // non-commands. Set a word here to require it as a prefix.
-            wake_word: env_or("XCOPILOT_WAKE_WORD", ""),
+            // Wake word required as a prefix in continuous mode (like "Alexa, …") —
+            // so ambient/ATC speech, which shares our command vocabulary
+            // ("climb and maintain", "fly heading", "squawk"), isn't acted on. Set
+            // empty to act on every utterance (only safe with a clean mic / PTT).
+            wake_word: env_or("XCOPILOT_WAKE_WORD", "copilot"),
             vad_threshold: env_or("XCOPILOT_VAD_RMS", "0.012").parse().unwrap_or(0.012),
             stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.35").parse().unwrap_or(0.35),
             end_silence_ms: env_or("XCOPILOT_END_SILENCE_MS", "900").parse().unwrap_or(900),
