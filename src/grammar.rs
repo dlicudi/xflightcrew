@@ -163,6 +163,36 @@ fn onoff(t: &str) -> Option<bool> {
 fn parse_one(t: &str) -> Option<ToolCall> {
     let num = number(t);
 
+    // Ground / ramp ops first — "ground power" must beat the throttle branch (which
+    // matches "power"), and these are unambiguous ground-crew calls.
+    if has(t, "chocks") || has(t, "chock") {
+        let on = !(has(t, "out") || has(t, "off") || has(t, "remove") || has(t, "pull") || has(t, "away"));
+        return Some(call("set_chocks", json!({ "on": on })));
+    }
+    if (has(t, "ground") && has(t, "power")) || has(t, "gpu") {
+        let on = !(has(t, "off") || has(t, "disconnect") || has(t, "remove") || has(t, "away"));
+        return Some(call("set_ground_power", json!({ "on": on })));
+    }
+    if has(t, "pushback") || (has(t, "push") && has(t, "back")) {
+        let action = if has(t, "stop") || has(t, "halt") || has(t, "hold") {
+            "stop"
+        } else if has(t, "left") {
+            "left"
+        } else if has(t, "right") {
+            "right"
+        } else {
+            "straight"
+        };
+        return Some(call("pushback", json!({ "action": action })));
+    }
+    if has(t, "refuel")
+        || (has(t, "ground") && (has(t, "service") || has(t, "services")))
+        || (has(t, "service") && has(t, "plane"))
+        || (has(t, "top") && has(t, "off"))
+    {
+        return Some(call("request_service", json!({})));
+    }
+
     // flaps up / ten / twenty / full
     if has(t, "flaps") || has(t, "flap") {
         let notch = if has(t, "up") {
@@ -521,6 +551,22 @@ mod tests {
         assert_eq!(one("give me the local altimeter").unwrap().0, "set_altimeter_current");
         assert_eq!(one("altimeter to field").unwrap().0, "set_altimeter_current");
         assert_eq!(one("set the local qnh").unwrap().0, "set_altimeter_current");
+    }
+
+    #[test]
+    fn ground_ops_resolve() {
+        assert_eq!(one("chocks out").unwrap(), ("set_chocks".into(), json!({"on":false})));
+        assert_eq!(one("set the chocks").unwrap(), ("set_chocks".into(), json!({"on":true})));
+        assert_eq!(one("remove the chocks").unwrap().1, json!({"on":false}));
+        assert_eq!(one("request ground power").unwrap(), ("set_ground_power".into(), json!({"on":true})));
+        assert_eq!(one("disconnect ground power").unwrap().1, json!({"on":false}));
+        assert_eq!(one("push back").unwrap(), ("pushback".into(), json!({"action":"straight"})));
+        assert_eq!(one("pushback left").unwrap().1, json!({"action":"left"}));
+        assert_eq!(one("stop pushback").unwrap().1, json!({"action":"stop"}));
+        assert_eq!(one("request ground services").unwrap().0, "request_service");
+        assert_eq!(one("refuel").unwrap().0, "request_service");
+        // "ground power" must NOT be grabbed by the throttle branch (it has "power").
+        assert_ne!(one("ground power on").unwrap().0, "set_throttle");
     }
 
     #[test]

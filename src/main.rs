@@ -1001,8 +1001,16 @@ const AVGAS_KG_PER_GAL: f64 = 2.72;
 fn is_fuel_query(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
     let asks = t.contains("fuel") || t.contains("gas") || t.contains("endurance");
-    let system = t.contains("pump") || t.contains("selector") || t.contains("boost") || t.contains("primer");
-    asks && !system
+    // Exclude fuel *commands* — system switches (pump/selector) and the ground
+    // refuel request ("refuel"/"top off"/"fill") — those are actions, not queries.
+    let command = t.contains("pump")
+        || t.contains("selector")
+        || t.contains("boost")
+        || t.contains("primer")
+        || t.contains("refuel")
+        || t.contains("top off")
+        || t.contains("fill");
+    asks && !command
 }
 
 /// Deterministic spoken fuel report — total in gallons, endurance from the
@@ -1018,7 +1026,19 @@ async fn fuel_report(xp: &XPlaneClient, profile: &aircraft::AircraftProfile, liv
         if f.cruise_burn_kg_hr > 0.0 {
             let hours = total_kg / f.cruise_burn_kg_hr;
             let (h, m) = (hours.trunc() as i32, (hours.fract() * 60.0).round() as i32);
-            line.push_str(&format!(", about {h} hours {m} minutes at cruise"));
+            let mut dur = String::new();
+            if h > 0 {
+                dur.push_str(&format!("{h} hour{}", if h == 1 { "" } else { "s" }));
+            }
+            if m > 0 {
+                if !dur.is_empty() {
+                    dur.push(' ');
+                }
+                dur.push_str(&format!("{m} minute{}", if m == 1 { "" } else { "s" }));
+            }
+            if !dur.is_empty() {
+                line.push_str(&format!(", about {dur} at cruise"));
+            }
         }
     }
     // Per-tank balance, when the airframe has two tanks.
@@ -1031,7 +1051,8 @@ async fn fuel_report(xp: &XPlaneClient, profile: &aircraft::AircraftProfile, liv
             }
         }
     }
-    format!("Roger — {line}.")
+    // A question — just answer it; "Roger" is for acknowledging a command.
+    format!("{line}.")
 }
 
 /// Answer the common "what's our X" state questions deterministically, straight
@@ -1069,7 +1090,8 @@ async fn answer_state_query(
             parts.push(format!("{v:.0} knots"));
         }
     }
-    (!parts.is_empty()).then(|| format!("Roger — {}.", parts.join(", ")))
+    // A question — answer plainly; "Roger" is a command acknowledgment.
+    (!parts.is_empty()).then(|| format!("{}.", parts.join(", ")))
 }
 
 /// A compact live-state line for the LLM's context, so it can ground relative or

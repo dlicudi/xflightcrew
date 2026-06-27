@@ -16,6 +16,7 @@ pub mod controls;
 pub mod electrical;
 pub mod engine;
 pub mod flaps;
+pub mod ground;
 pub mod instruments;
 pub mod lights;
 pub mod radio;
@@ -184,6 +185,13 @@ impl Registry {
         if profile.ils {
             tools.push(Box::new(approach::PrepareIls));
         }
+
+        // Ramp / ground-ops — sim ground-crew actions (chocks, ground power,
+        // pushback, services). Not airframe systems, so available on any aircraft.
+        tools.push(Box::new(ground::SetChocks));
+        tools.push(Box::new(ground::SetGroundPower));
+        tools.push(Box::new(ground::Pushback));
+        tools.push(Box::new(ground::RequestService));
 
         // Checklists are NOT registered as one-shot tools — the copilot runs them
         // interactively (narrate + act + verify + call out the pilot's items),
