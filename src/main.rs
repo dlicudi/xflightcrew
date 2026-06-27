@@ -832,15 +832,41 @@ fn transcribe_file(model_path: &str, input: &str) -> Result<String> {
 /// Extra files are embedded and compared (cosine) so you can sanity-check the
 /// separation (your other clips high, an ATC clip low) before enabling the gate.
 async fn learn_pilot_voice(config: &Config, files: &[String]) -> Result<()> {
-    let Some((enroll, verify)) = files.split_first() else {
-        return Err(anyhow!(
-            "usage: x-copilot learn-pilot-voice <enroll.wav> [verify.wav ...]\n\
-             (start the sidecar first: python voice/speaker_sidecar.py)"
-        ));
-    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()?;
+
+    // No files → record a few short command-like clips live and average them. This
+    // enrols in the *same* conditions the gate hears (mic, 16 kHz, short utterances),
+    // which matters more than a clean external clip.
+    if files.is_empty() {
+        const CLIPS: usize = 3;
+        println!(
+            "Re-learning your voice — say a short command each time (e.g. \"flaps ten\", \
+             \"gear up\"). {CLIPS} clips.\n(Start the sidecar first: python voice/speaker_sidecar.py)\n"
+        );
+        let mut embeddings = Vec::new();
+        for i in 1..=CLIPS {
+            println!("Clip {i}/{CLIPS}:");
+            let samples = audio::record_push_to_talk()?;
+            embeddings.push(speaker::embed(&client, &config.speaker_url, &samples).await?);
+        }
+        let vp = speaker::Voiceprint { embedding: speaker::average(&embeddings) };
+        vp.save(speaker::VOICEPRINT_PATH)?;
+        println!(
+            "\nEnrolled pilot voice from {CLIPS} clips ({} dims) → {}",
+            vp.embedding.len(),
+            speaker::VOICEPRINT_PATH
+        );
+        return Ok(());
+    }
+
+    let Some((enroll, verify)) = files.split_first() else {
+        return Err(anyhow!(
+            "usage: x-copilot learn-pilot-voice [enroll.wav verify.wav ...]\n\
+             (no args = record live; start the sidecar first: python voice/speaker_sidecar.py)"
+        ));
+    };
 
     let print = speaker::embed(&client, &config.speaker_url, &load_wav_16k(enroll)?).await?;
     let vp = speaker::Voiceprint { embedding: print };

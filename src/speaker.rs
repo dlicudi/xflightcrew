@@ -31,7 +31,6 @@ pub struct Voiceprint {
 
 impl Voiceprint {
     /// Load the enrolled voiceprint, or `None` if it doesn't exist / won't parse.
-    #[allow(dead_code)] // used by the in-loop gate (next phase)
     pub fn load(path: &str) -> Option<Voiceprint> {
         serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
     }
@@ -66,6 +65,27 @@ pub async fn embed(client: &reqwest::Client, base_url: &str, samples: &[f32]) ->
         return Err(anyhow!("sidecar returned an empty embedding"));
     }
     Ok(parsed.embedding)
+}
+
+/// Mean of several embeddings, re-normalized — a more robust voiceprint than a
+/// single clip (averages out noise / a bad take). Empty input → empty.
+pub fn average(embeddings: &[Vec<f32>]) -> Vec<f32> {
+    let Some(first) = embeddings.first() else {
+        return Vec::new();
+    };
+    let mut sum = vec![0.0f32; first.len()];
+    for e in embeddings {
+        for (s, x) in sum.iter_mut().zip(e) {
+            *s += x;
+        }
+    }
+    let norm = sum.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for s in &mut sum {
+            *s /= norm;
+        }
+    }
+    sum
 }
 
 /// Cosine similarity of two embeddings (the sidecar L2-normalizes, but normalize
