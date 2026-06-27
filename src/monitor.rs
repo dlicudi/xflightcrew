@@ -294,6 +294,11 @@ const FLAP_STALL_REDUCTION: f64 = 0.17;
 /// reduction settles before it nags.
 const STALL_LOOKAHEAD_S: f64 = 4.0;
 
+/// How far ahead (seconds) to project a *building* airspeed for the overspeed
+/// callout — so a descent accelerating toward redline is called with lead time,
+/// not at Vne. Only a rising trend counts (see `Overspeed::eval`).
+const OVERSPEED_LOOKAHEAD_S: f64 = 4.0;
+
 struct StallSpeed {
     id: &'static str,
     severity: Severity,
@@ -346,6 +351,54 @@ impl Check for StallSpeed {
     }
 }
 
+/// Overspeed callout: the copilot's "Airspeed!" on the *high* side — it warns as
+/// the speed builds toward Vne (e.g. a descent left at cruise power) and prompts
+/// the recovery; like the stall check it never touches the controls. Airborne
+/// only; banded — a caution approaching redline, an urgent prompt at or above it.
+struct Overspeed {
+    id: &'static str,
+    severity: Severity,
+    /// Never-exceed speed (kts) the bands scale off.
+    vne_kts: f64,
+    /// Fires when IAS ≥ this × Vne …
+    at_or_above_factor: f64,
+    /// … and (if set) still below this × Vne — the more urgent band owns above.
+    below_factor: Option<f64>,
+}
+
+impl Check for Overspeed {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn severity(&self) -> Severity {
+        self.severity
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if s.on_ground {
+            return None; // can't meaningfully overspeed on the ground
+        }
+        // Anticipate: project only a *rising* trend forward (`.max(0.0)`), so the
+        // band trips with margin before redline. A decaying trend never raises the
+        // projected speed, so it can't mask a falling-back-to-safe reading.
+        let projected = s.ias_kts + s.ias_trend_kts_per_s.max(0.0) * OVERSPEED_LOOKAHEAD_S;
+        let in_band = projected >= self.at_or_above_factor * self.vne_kts
+            && self.below_factor.is_none_or(|b| projected < b * self.vne_kts);
+        if !in_band {
+            return None;
+        }
+        Some(match self.severity {
+            Severity::Warning => "Overspeed! Reduce power, ease off the descent.".to_string(),
+            _ => "Airspeed — you're getting fast.".to_string(),
+        })
+    }
+    fn min_duration(&self) -> Duration {
+        match self.severity {
+            Severity::Warning => Duration::from_millis(300),
+            _ => Duration::from_millis(700),
+        }
+    }
+}
+
 fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     let mut checks: Vec<Box<dyn Check>> = Vec::new();
     if !profile.electrical.is_empty() {
@@ -372,6 +425,25 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             vs_clean_kts: vs,
             at_or_below_factor: 1.10,
             above_factor: None,
+        }));
+    }
+    if let Some(vne) = profile.vne_kts {
+        // Caution from ~0.90×Vne up to redline (leaves margin below in normal fast
+        // cruise/descent), urgent prompt at or above Vne. Disjoint bands so only
+        // one speaks.
+        checks.push(Box::new(Overspeed {
+            id: "overspeed_caution",
+            severity: Severity::Caution,
+            vne_kts: vne,
+            at_or_above_factor: 0.90,
+            below_factor: Some(1.0),
+        }));
+        checks.push(Box::new(Overspeed {
+            id: "overspeed_warning",
+            severity: Severity::Warning,
+            vne_kts: vne,
+            at_or_above_factor: 1.0,
+            below_factor: None,
         }));
     }
     if let Some(fuel) = &profile.fuel {
