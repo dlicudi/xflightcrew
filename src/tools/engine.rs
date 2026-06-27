@@ -279,8 +279,9 @@ impl Tool for LeanMixture {
                 ramp_actuator(ctx, MIXTURE, (best + 0.03).min(1.0)).await?;
                 let pct = ctx.xplane.get_float(MIXTURE).await? * 100.0;
                 let gph = engine0(ctx, FUEL_FLOW_KG_S, 0.0).await * 3600.0 / AVGAS_KG_PER_GAL;
+                let egt_f = egt * 9.0 / 5.0 + 32.0; // gauge/POH read EGT in °F
                 Ok(format!(
-                    "Leaned for cruise — mixture {pct:.0} percent, peak EGT {egt:.0} degrees, burning {gph:.1} gallons an hour."
+                    "Leaned for cruise — mixture {pct:.0} percent, peak EGT {egt_f:.0} degrees, burning {gph:.1} gallons an hour."
                 ))
             }
             _ => {
