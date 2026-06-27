@@ -34,6 +34,10 @@ pub struct Config {
     /// Capture mode: `continuous` (always listening, VAD-segmented) or `ptt`
     /// (push-to-talk, Enter to start/stop).
     pub listen_mode: String,
+    /// Global push-to-talk key (e.g. `rctrl`, `f8`, `space`). When set, the copilot
+    /// captures only while this key is held — works while X-Plane has focus, so no
+    /// wake word and ambient/ATC can't trigger it. Empty = use `listen_mode`.
+    pub ptt_key: String,
     /// VAD energy threshold (RMS, 0.0..1.0). Above this counts as speech.
     /// Raise it in a noisy room, lower it if quiet speech is missed.
     pub vad_threshold: f32,
@@ -117,6 +121,7 @@ impl Config {
             whisper_model_path: env_or("WHISPER_MODEL", "models/ggml-base.en.bin"),
             whisper_gpu: env_or("XCOPILOT_WHISPER_GPU", "true") != "false",
             listen_mode: env_or("XCOPILOT_LISTEN", "continuous"),
+            ptt_key: env_or("XCOPILOT_PTT_KEY", ""),
             vad_threshold: env_or("XCOPILOT_VAD_RMS", "0.012").parse().unwrap_or(0.012),
             stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.35").parse().unwrap_or(0.35),
             end_silence_ms: env_or("XCOPILOT_END_SILENCE_MS", "900").parse().unwrap_or(900),

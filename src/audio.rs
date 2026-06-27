@@ -75,6 +75,58 @@ fn open_input() -> Result<Input> {
     Ok(Input { stream, buffer, sample_rate, channels })
 }
 
+/// Map a config string to a push-to-talk key (`XCOPILOT_PTT_KEY`). A small set of
+/// sensible PTT keys; returns `None` for an unknown name.
+pub fn parse_ptt_key(s: &str) -> Option<device_query::Keycode> {
+    use device_query::Keycode::*;
+    Some(match s.to_ascii_lowercase().replace(['_', '-', ' '], "").as_str() {
+        "rctrl" | "rightctrl" | "rcontrol" => RControl,
+        "lctrl" | "leftctrl" | "lcontrol" => LControl,
+        "ralt" | "rightalt" | "rightoption" => RAlt,
+        "lalt" | "leftalt" | "leftoption" => LAlt,
+        "rshift" | "rightshift" => RShift,
+        "lshift" | "leftshift" => LShift,
+        "space" => Space,
+        "grave" | "backtick" => Grave,
+        "f7" => F7,
+        "f8" => F8,
+        "f9" => F9,
+        "f10" => F10,
+        _ => return None,
+    })
+}
+
+/// Record while a global PTT key is held — works regardless of which window has
+/// focus (X-Plane included), since the key state is polled globally. Waits up to
+/// `idle_timeout` for the key to go down (so the caller can poll typed input);
+/// returns empty if it doesn't. Then captures until the key is released.
+pub fn record_hotkey_ptt(key: device_query::Keycode, idle_timeout: Option<Duration>) -> Result<Vec<f32>> {
+    use device_query::{DeviceQuery, DeviceState};
+    let dev = DeviceState::new();
+    let held = || dev.get_keys().contains(&key);
+
+    let start = Instant::now();
+    while !held() {
+        if idle_timeout.is_some_and(|t| start.elapsed() >= t) {
+            return Ok(Vec::new()); // no key this window — let the caller re-poll
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Key down — capture until release. (Open-on-press, like record_push_to_talk;
+    // the pilot presses then speaks, so the small device-open latency is fine.)
+    let input = open_input()?;
+    input.stream.play().context("starting input stream")?;
+    while held() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(input.stream);
+
+    let interleaved = std::mem::take(&mut *input.buffer.lock().unwrap());
+    let mono = downmix(&interleaved, input.channels);
+    Ok(resample_linear(&mono, input.sample_rate, WHISPER_SAMPLE_RATE))
+}
+
 /// Record a push-to-talk utterance. Blocks on two Enter presses (start, stop).
 pub fn record_push_to_talk() -> Result<Vec<f32>> {
     let input = open_input()?;

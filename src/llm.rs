@@ -514,6 +514,7 @@ mod tests {
             whisper_model_path: String::new(),
             whisper_gpu: true,
             listen_mode: "ptt".into(),
+            ptt_key: String::new(),
             vad_threshold: 0.012,
             stt_min_confidence: 0.5,
             end_silence_ms: 900,
