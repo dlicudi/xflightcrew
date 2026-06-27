@@ -302,6 +302,8 @@ async fn run_session(
         ui::LogKind::Info,
         if !continuous {
             "Ready — push-to-talk (Enter to start/stop).".to_string()
+        } else if speaker_gate.is_some() {
+            "Listening — recognising your voice (no wake word needed).".to_string()
         } else if config.wake_word.is_empty() {
             "Listening — just speak commands.".to_string()
         } else {
