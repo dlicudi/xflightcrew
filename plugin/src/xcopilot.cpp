@@ -171,7 +171,12 @@ protected:
         for (const LogEntry& e : g_log) {
             Chip(e.tag.c_str(), e.color);
             ImGui::SameLine();
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(e.color), "%s", e.text.c_str());
+            // Wrap long readbacks at the panel edge instead of running off it.
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(e.color));
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(e.text.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
         }
         if (g_log_scroll) { ImGui::SetScrollHereY(1.0f); g_log_scroll = false; }
         ImGui::EndChild();
