@@ -7,7 +7,7 @@
 use anyhow::Result;
 
 /// All the knobs the loop needs to run end to end.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     /// Base URL of the local Ollama server, e.g. `http://127.0.0.1:11434`.
     pub ollama_base_url: String,

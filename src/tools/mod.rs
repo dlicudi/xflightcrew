@@ -26,7 +26,7 @@ use serde_json::Value;
 
 use crate::aircraft::AircraftProfile;
 use crate::config::Config;
-use crate::xplane::XPlaneClient;
+use crate::xplane::XPlane;
 
 // Datarefs/commands shared by more than one tool module, defined once here so the
 // two readers can't silently drift. Datarefs private to a single tool stay in
@@ -41,7 +41,7 @@ pub(crate) const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 
 /// Shared context handed to every tool invocation.
 pub struct ToolCtx<'a> {
-    pub xplane: &'a XPlaneClient,
+    pub xplane: &'a dyn XPlane,
     // Available to tools that need global config; unused by `set_flaps` (its
     // limits come from the aircraft profile).
     #[allow(dead_code)]

@@ -10,10 +10,29 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
+
+/// The dataref/command surface a tool uses to talk to the simulator. Abstracting
+/// it behind a trait lets the trust-critical tool logic (autopilot capture, safety
+/// gates) be unit-tested against a fake, with no running X-Plane. The live impl is
+/// [`XPlaneClient`]; tests use a recording fake. (Index/string helpers like
+/// `aircraft_icao` stay inherent to the client — only the loop, not the tools,
+/// needs them.)
+#[async_trait]
+pub trait XPlane: Send + Sync {
+    async fn get_float(&self, name: &str) -> Result<f64>;
+    async fn set_float(&self, name: &str, value: f64) -> Result<()>;
+    async fn set_int(&self, name: &str, value: i64) -> Result<()>;
+    async fn run_command(&self, name: &str) -> Result<()>;
+    async fn run_command_for(&self, name: &str, duration: f64) -> Result<()>;
+    async fn get_float_array(&self, name: &str) -> Result<Vec<f64>>;
+    async fn set_int_array_elem(&self, name: &str, index: usize, value: i64) -> Result<()>;
+    async fn set_float_array_elem(&self, name: &str, index: usize, value: f64) -> Result<()>;
+}
 
 /// HTTP client for one running X-Plane instance.
 pub struct XPlaneClient {
@@ -268,5 +287,124 @@ impl XPlaneClient {
         }
         arr[index] = value;
         self.set_value(name, json!(arr)).await
+    }
+}
+
+// The trait just forwards to the inherent methods above (which stay the canonical
+// implementation, and which the loop calls directly for the index/string helpers).
+#[async_trait]
+impl XPlane for XPlaneClient {
+    async fn get_float(&self, name: &str) -> Result<f64> {
+        XPlaneClient::get_float(self, name).await
+    }
+    async fn set_float(&self, name: &str, value: f64) -> Result<()> {
+        XPlaneClient::set_float(self, name, value).await
+    }
+    async fn set_int(&self, name: &str, value: i64) -> Result<()> {
+        XPlaneClient::set_int(self, name, value).await
+    }
+    async fn run_command(&self, name: &str) -> Result<()> {
+        XPlaneClient::run_command(self, name).await
+    }
+    async fn run_command_for(&self, name: &str, duration: f64) -> Result<()> {
+        XPlaneClient::run_command_for(self, name, duration).await
+    }
+    async fn get_float_array(&self, name: &str) -> Result<Vec<f64>> {
+        XPlaneClient::get_float_array(self, name).await
+    }
+    async fn set_int_array_elem(&self, name: &str, index: usize, value: i64) -> Result<()> {
+        XPlaneClient::set_int_array_elem(self, name, index, value).await
+    }
+    async fn set_float_array_elem(&self, name: &str, index: usize, value: f64) -> Result<()> {
+        XPlaneClient::set_float_array_elem(self, name, index, value).await
+    }
+}
+
+/// Recording fake for tests: reads come from a preset table, writes and commands
+/// are recorded for assertions. A read with no preset value errors (so a test
+/// fails loudly if the code under test reads a dataref it didn't set up).
+#[cfg(test)]
+pub(crate) struct FakeXPlane {
+    reads: std::sync::Mutex<HashMap<String, f64>>,
+    /// Every set_float/set_int, in order, as (dataref, value).
+    writes: std::sync::Mutex<Vec<(String, f64)>>,
+    /// Every command run, in order.
+    commands: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl FakeXPlane {
+    pub fn new() -> Self {
+        Self {
+            reads: std::sync::Mutex::new(HashMap::new()),
+            writes: std::sync::Mutex::new(Vec::new()),
+            commands: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Preset the values reads will return.
+    pub fn with_reads(pairs: &[(&str, f64)]) -> Self {
+        let me = Self::new();
+        let mut r = me.reads.lock().unwrap();
+        for (k, v) in pairs {
+            r.insert((*k).to_string(), *v);
+        }
+        drop(r);
+        me
+    }
+
+    /// The most recent value written to `name`, if any.
+    pub fn last_write(&self, name: &str) -> Option<f64> {
+        self.writes.lock().unwrap().iter().rev().find(|(n, _)| n == name).map(|(_, v)| *v)
+    }
+
+    /// Whether `name` was ever written.
+    pub fn wrote(&self, name: &str) -> bool {
+        self.writes.lock().unwrap().iter().any(|(n, _)| n == name)
+    }
+
+    /// Whether `command` was ever run.
+    pub fn ran(&self, command: &str) -> bool {
+        self.commands.lock().unwrap().iter().any(|c| c == command)
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl XPlane for FakeXPlane {
+    async fn get_float(&self, name: &str) -> Result<f64> {
+        self.reads
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .ok_or_else(|| anyhow!("FakeXPlane: no read preset for {name}"))
+    }
+    async fn set_float(&self, name: &str, value: f64) -> Result<()> {
+        self.writes.lock().unwrap().push((name.to_string(), value));
+        Ok(())
+    }
+    async fn set_int(&self, name: &str, value: i64) -> Result<()> {
+        self.writes.lock().unwrap().push((name.to_string(), value as f64));
+        Ok(())
+    }
+    async fn run_command(&self, name: &str) -> Result<()> {
+        self.commands.lock().unwrap().push(name.to_string());
+        Ok(())
+    }
+    async fn run_command_for(&self, name: &str, _duration: f64) -> Result<()> {
+        self.commands.lock().unwrap().push(name.to_string());
+        Ok(())
+    }
+    async fn get_float_array(&self, _name: &str) -> Result<Vec<f64>> {
+        Ok(Vec::new())
+    }
+    async fn set_int_array_elem(&self, name: &str, _index: usize, value: i64) -> Result<()> {
+        self.writes.lock().unwrap().push((name.to_string(), value as f64));
+        Ok(())
+    }
+    async fn set_float_array_elem(&self, name: &str, _index: usize, value: f64) -> Result<()> {
+        self.writes.lock().unwrap().push((name.to_string(), value));
+        Ok(())
     }
 }
