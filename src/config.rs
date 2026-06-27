@@ -34,9 +34,6 @@ pub struct Config {
     /// Capture mode: `continuous` (always listening, VAD-segmented) or `ptt`
     /// (push-to-talk, Enter to start/stop).
     pub listen_mode: String,
-    /// Wake word required to act in `continuous` mode (e.g. `copilot`). Empty
-    /// disables the gate (acts on every utterance — not recommended).
-    pub wake_word: String,
     /// VAD energy threshold (RMS, 0.0..1.0). Above this counts as speech.
     /// Raise it in a noisy room, lower it if quiet speech is missed.
     pub vad_threshold: f32,
@@ -88,15 +85,6 @@ pub struct Config {
     /// = let the sidecar default (its `.active` file, set by `voice/voices.py use`,
     /// else `roger`). Forwarded to the sidecar as its env default.
     pub voice: String,
-    /// URL of the speaker-ID sidecar ([`voice/speaker_sidecar.py`]) used to
-    /// recognise the pilot's voice. POST raw f32 16 kHz PCM to `/embed`.
-    pub speaker_url: String,
-    /// Gate commands on the enrolled pilot voiceprint — recognise the pilot and
-    /// ignore ATC/ambient, so continuous mode needs no wake word. Off by default;
-    /// requires a voiceprint (run `learn-pilot-voice`) and the sidecar running.
-    /// Falls back to the wake word if the sidecar's down or no voiceprint exists.
-    #[allow(dead_code)] // consumed by the in-loop gate (next phase)
-    pub speaker_id: bool,
     /// Path to X-Plane's `earth_nav.dat` (for ILS lookup).
     pub nav_data_path: String,
     /// Active aircraft profile id (see [`crate::aircraft`]), e.g. `cessna_172sp`.
@@ -129,11 +117,6 @@ impl Config {
             whisper_model_path: env_or("WHISPER_MODEL", "models/ggml-base.en.bin"),
             whisper_gpu: env_or("XCOPILOT_WHISPER_GPU", "true") != "false",
             listen_mode: env_or("XCOPILOT_LISTEN", "continuous"),
-            // Wake word required as a prefix in continuous mode (like "Alexa, …") —
-            // so ambient/ATC speech, which shares our command vocabulary
-            // ("climb and maintain", "fly heading", "squawk"), isn't acted on. Set
-            // empty to act on every utterance (only safe with a clean mic / PTT).
-            wake_word: env_or("XCOPILOT_WAKE_WORD", "copilot"),
             vad_threshold: env_or("XCOPILOT_VAD_RMS", "0.012").parse().unwrap_or(0.012),
             stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.35").parse().unwrap_or(0.35),
             end_silence_ms: env_or("XCOPILOT_END_SILENCE_MS", "900").parse().unwrap_or(900),
@@ -151,8 +134,6 @@ impl Config {
                 .unwrap_or(90),
             tts_sidecar_temp: env_or("XCOPILOT_TTS_SIDECAR_TEMP", "0.6"),
             voice: env_or("XCOPILOT_VOICE", ""),
-            speaker_url: env_or("XCOPILOT_SPEAKER_URL", "http://127.0.0.1:8770"),
-            speaker_id: env_or("XCOPILOT_SPEAKER_ID", "false") == "true",
             nav_data_path: env_or(
                 "XPLANE_NAV_DATA",
                 "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_nav.dat",

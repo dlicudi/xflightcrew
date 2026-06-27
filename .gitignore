@@ -36,3 +36,4 @@ __pycache__/
 # tracked; the audio and the active-voice pointer stay local.
 *.wav
 voice/voices/
+.venv-spk

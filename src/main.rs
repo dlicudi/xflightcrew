@@ -5,7 +5,7 @@
 //!   write dataref + read back → say/piper (TTS) confirms.
 //!
 //! Two capture modes (config `listen_mode`): `continuous` (always listening,
-//! VAD-segmented, gated by a wake word) or `ptt` (push-to-talk).
+//! VAD-segmented) or `ptt` (push-to-talk).
 
 mod aircraft;
 mod audio;
@@ -19,7 +19,6 @@ mod monitor;
 mod nav;
 mod phrase;
 mod readback;
-mod speaker;
 mod stt;
 mod stt_eval;
 mod tts;
@@ -102,13 +101,6 @@ async fn main() -> Result<()> {
     // harness: each case through whisper + grammar, reporting WER and command
     // accuracy. `WHISPER_MODEL=...` switches the model under test. Offline, so it
     // uses a fixed profile (no X-Plane needed).
-    // `cargo run -- learn-pilot-voice <enroll.wav> [verify.wav ...]` enrols the
-    // pilot's voice (via the speaker sidecar) and saves the voiceprint.
-    if std::env::args().nth(1).as_deref() == Some("learn-pilot-voice") {
-        let files: Vec<String> = std::env::args().skip(2).collect();
-        return learn_pilot_voice(&config, &files).await;
-    }
-
     if std::env::args().nth(1).as_deref() == Some("stt-eval") {
         let manifest = std::env::args().nth(2).unwrap_or_else(|| "bench/stt_cases.yaml".to_string());
         let id = if config.aircraft.eq_ignore_ascii_case("auto") {
@@ -166,10 +158,10 @@ async fn main() -> Result<()> {
     tracing::info!(checklists = checklists.len(), "interpreted checklists");
 
     let continuous = config.listen_mode == "continuous";
-    // "Explicit" = the user clearly addressed the copilot (push-to-talk, or a
-    // wake word that matched). When not explicit, a non-command is ignored
-    // silently rather than answered with an apology.
-    let explicit = !continuous || !config.wake_word.is_empty();
+    // "Explicit" = the user clearly addressed the copilot (push-to-talk). When
+    // not explicit, a non-command is ignored silently rather than answered with
+    // an apology.
+    let explicit = !continuous;
 
     // The speech arbiter is shared by the command loop and the monitor, so it's
     // created here (above both) and handed to each.
@@ -275,10 +267,6 @@ async fn run_session(
     // instant cache reads instead of a REST burst. Best-effort: reads fall back to
     // REST until (or unless) the subscription warms up.
     let live = LiveState::start(&config.xplane_base_url, SNAPSHOT_DATAREFS);
-    // Pilot-voice gate: recognise the pilot so continuous mode needs no wake word
-    // and ATC/ambient is ignored. Only active when enabled AND a voiceprint is
-    // enrolled; otherwise the loop uses the wake word.
-    let speaker_gate = build_speaker_gate(&config);
     let mut specs = registry.specs();
     // Each checklist is exposed to the LLM as a no-arg "tool" the loop intercepts
     // and runs interactively.
@@ -302,12 +290,8 @@ async fn run_session(
         ui::LogKind::Info,
         if !continuous {
             "Ready — push-to-talk (Enter to start/stop).".to_string()
-        } else if speaker_gate.is_some() {
-            "Listening — recognising your voice (no wake word needed).".to_string()
-        } else if config.wake_word.is_empty() {
-            "Listening — just speak commands.".to_string()
         } else {
-            format!("Listening — say \"{}, <command>\".", config.wake_word)
+            "Listening — just speak commands.".to_string()
         },
     );
 
@@ -323,7 +307,7 @@ async fn run_session(
                 reporter.log(ui::LogKind::Heard, format!("⌨  \"{text}\""));
                 (text, true)
             }
-            Some(Input::Spoken(heard, samples)) => {
+            Some(Input::Spoken(heard)) => {
                 let transcript = heard.text;
                 let confidence = heard.confidence;
                 tracing::info!(transcript = %transcript, confidence, "heard utterance");
@@ -340,33 +324,9 @@ async fn run_session(
                     continue;
                 }
 
-                // Addressing gate (continuous only). Prefer speaker-ID — recognise
-                // the pilot's voice so no wake word is needed and ATC/ambient is
-                // ignored. Fall back to the wake word when speaker-ID is off,
-                // unenrolled, or the sidecar's unavailable.
-                let cmd = if continuous {
-                    let by_voice = match &speaker_gate {
-                        Some(g) => g.accepts(&samples).await,
-                        None => None,
-                    };
-                    match by_voice {
-                        Some(true) => transcript.clone(), // recognised the pilot
-                        Some(false) => {
-                            reporter.log(ui::LogKind::Info, "ignored (not the pilot's voice)");
-                            continue;
-                        }
-                        None => match gate_wake_word(&transcript, &config.wake_word) {
-                            Some(cmd) if !cmd.is_empty() => cmd,
-                            _ => {
-                                reporter.log(ui::LogKind::Info, "ignored (no wake word)");
-                                continue;
-                            }
-                        },
-                    }
-                } else {
-                    transcript.clone()
-                };
-                (cmd, false)
+                // Continuous mode acts on the transcript directly — the downstream
+                // domain gate (`looks_like_command`) filters non-commands.
+                (transcript, false)
             }
         };
 
@@ -534,7 +494,7 @@ async fn run_session(
 
                 say(&voice, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
                 reporter.status(ui::Phase::Listening);
-                let Some((reply, _)) = listen_once(&mut listener, &stt, None) else {
+                let Some(reply) = listen_once(&mut listener, &stt, None) else {
                     say(&voice, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
                     break 'confirm false;
                 };
@@ -674,7 +634,7 @@ async fn run_checklist(
                     let hazard = confirm.expect("ask implies a confirm hazard");
                     say(voice, reporter, ui::LogKind::Confirm, &format!("Confirm, {hazard}?"));
                     reporter.status(ui::Phase::Listening);
-                    let reply = listen_once(listener, stt, None).map(|(t, _)| t);
+                    let reply = listen_once(listener, stt, None);
                     match reply {
                         Some(r) if is_affirmative(&r.text) => {} // proceed
                         Some(r) if is_abort(&r.text) => {
@@ -733,47 +693,6 @@ fn is_abort(reply: &str) -> bool {
         .any(|w| r.contains(w))
 }
 
-/// Apply the wake-word gate, fuzzily. Speech-to-text mangles "copilot" into
-/// "go pilot", "co-pilot", "copilet", etc., so we match the wake word against
-/// the first few tokens (1- or 2-token spans) with a small edit-distance
-/// tolerance, then return the rest as the command. Empty `wake` disables it.
-fn gate_wake_word(transcript: &str, wake: &str) -> Option<String> {
-    if wake.is_empty() {
-        return Some(transcript.trim().to_string());
-    }
-    let wake = collapse(wake);
-    let orig: Vec<&str> = transcript.split_whitespace().collect();
-    let norm: Vec<String> = orig.iter().map(|w| collapse(w)).collect();
-
-    // Scan the first few words: the wake word may be 1 or 2 tokens ("copilot"
-    // vs "go pilot") and may follow filler ("hey copilot ...").
-    for s in 0..norm.len().min(3) {
-        for (take, max_dist) in [(2usize, 2usize), (1usize, 1usize)] {
-            if s + take > norm.len() {
-                continue;
-            }
-            let cand: String = norm[s..s + take].concat();
-            if !cand.is_empty() && levenshtein(&cand, &wake) <= max_dist {
-                let rest = orig[s + take..].join(" ");
-                return Some(
-                    rest.trim_start_matches(|c: char| !c.is_alphanumeric())
-                        .trim()
-                        .to_string(),
-                );
-            }
-        }
-    }
-    None
-}
-
-/// Lowercase and strip non-alphanumerics (drops punctuation whisper adds).
-fn collapse(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
-
 /// Standard Levenshtein edit distance.
 pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
@@ -825,72 +744,6 @@ fn transcribe_file(model_path: &str, input: &str) -> Result<String> {
     // words, so don't apply the command-loop's digit/mishear normalization
     // ("two seven zero" must stay words, not become "270").
     Ok(stt.transcribe_verbatim(&samples)?.text.trim().to_string())
-}
-
-/// `learn-pilot-voice <enroll.wav> [verify.wav ...]` — enrol the pilot's voice for
-/// recognition: embed the clip via the speaker sidecar and save the voiceprint.
-/// Extra files are embedded and compared (cosine) so you can sanity-check the
-/// separation (your other clips high, an ATC clip low) before enabling the gate.
-async fn learn_pilot_voice(config: &Config, files: &[String]) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()?;
-
-    // No files → record a few short command-like clips live and average them. This
-    // enrols in the *same* conditions the gate hears (mic, 16 kHz, short utterances),
-    // which matters more than a clean external clip.
-    if files.is_empty() {
-        const CLIPS: usize = 3;
-        println!(
-            "Re-learning your voice — say a short command each time (e.g. \"flaps ten\", \
-             \"gear up\"). {CLIPS} clips.\n(Start the sidecar first: python voice/speaker_sidecar.py)\n"
-        );
-        let mut embeddings = Vec::new();
-        for i in 1..=CLIPS {
-            println!("Clip {i}/{CLIPS}:");
-            let samples = audio::record_push_to_talk()?;
-            embeddings.push(speaker::embed(&client, &config.speaker_url, &samples).await?);
-        }
-        let vp = speaker::Voiceprint { embedding: speaker::average(&embeddings) };
-        vp.save(speaker::VOICEPRINT_PATH)?;
-        println!(
-            "\nEnrolled pilot voice from {CLIPS} clips ({} dims) → {}",
-            vp.embedding.len(),
-            speaker::VOICEPRINT_PATH
-        );
-        return Ok(());
-    }
-
-    let Some((enroll, verify)) = files.split_first() else {
-        return Err(anyhow!(
-            "usage: x-copilot learn-pilot-voice [enroll.wav verify.wav ...]\n\
-             (no args = record live; start the sidecar first: python voice/speaker_sidecar.py)"
-        ));
-    };
-
-    let print = speaker::embed(&client, &config.speaker_url, &load_wav_16k(enroll)?).await?;
-    let vp = speaker::Voiceprint { embedding: print };
-    vp.save(speaker::VOICEPRINT_PATH)?;
-    println!(
-        "Enrolled pilot voice from {enroll} ({} dims) → {}",
-        vp.embedding.len(),
-        speaker::VOICEPRINT_PATH
-    );
-
-    for f in verify {
-        match load_wav_16k(f) {
-            Ok(samples) => match speaker::embed(&client, &config.speaker_url, &samples).await {
-                Ok(emb) => {
-                    let sim = speaker::cosine(&vp.embedding, &emb);
-                    let verdict = if sim >= speaker::DEFAULT_THRESHOLD { "ACCEPT" } else { "reject" };
-                    println!("  {f}: similarity {sim:+.3}  [{verdict} @ {:.2}]", speaker::DEFAULT_THRESHOLD);
-                }
-                Err(e) => println!("  {f}: embed failed: {e:#}"),
-            },
-            Err(e) => println!("  {f}: {e:#}"),
-        }
-    }
-    Ok(())
 }
 
 /// Mine the logs for fast-path coverage and the LLM-fallback tail. Pairs each
@@ -971,7 +824,7 @@ fn listen_once(
     listener: &mut Option<Listener>,
     stt: &Stt,
     idle_timeout: Option<Duration>,
-) -> Option<(stt::Transcription, Vec<f32>)> {
+) -> Option<stt::Transcription> {
     let audio = match listener {
         Some(l) => l.next_utterance(idle_timeout).ok()?,
         None => audio::record_push_to_talk().ok()?,
@@ -979,64 +832,16 @@ fn listen_once(
     if audio.is_empty() {
         return None; // idle timeout (continuous) or empty capture
     }
-    // Return the raw samples too — the speaker-ID gate needs the audio, not just
-    // the transcript.
     match stt.transcribe(&audio) {
-        Ok(t) if !t.text.is_empty() => Some((t, audio)),
+        Ok(t) if !t.text.is_empty() => Some(t),
         _ => None,
     }
 }
 
-/// One pilot input — spoken (transcript + the raw audio, for the speaker gate) or
-/// typed in the TUI.
+/// One pilot input — spoken (a transcript) or typed in the TUI.
 enum Input {
-    Spoken(stt::Transcription, Vec<f32>),
+    Spoken(stt::Transcription),
     Typed(String),
-}
-
-/// The pilot-voice gate: embeds an utterance via the speaker sidecar and accepts
-/// it only if it matches the enrolled voiceprint. Present only when speaker-ID is
-/// on and a voiceprint exists; otherwise the loop falls back to the wake word.
-struct SpeakerGate {
-    client: reqwest::Client,
-    url: String,
-    voiceprint: speaker::Voiceprint,
-    threshold: f32,
-}
-
-impl SpeakerGate {
-    /// `Some(true)`/`Some(false)` = recognised / not the pilot; `None` = couldn't
-    /// decide (sidecar down / embed failed) → caller falls back to the wake word.
-    async fn accepts(&self, samples: &[f32]) -> Option<bool> {
-        let emb = speaker::embed(&self.client, &self.url, samples).await.ok()?;
-        let sim = speaker::cosine(&self.voiceprint.embedding, &emb);
-        tracing::info!(similarity = sim, threshold = self.threshold, "speaker gate");
-        Some(sim >= self.threshold)
-    }
-}
-
-/// Build the gate if speaker-ID is enabled and a voiceprint is enrolled.
-fn build_speaker_gate(config: &Config) -> Option<SpeakerGate> {
-    if !config.speaker_id {
-        return None;
-    }
-    let Some(voiceprint) = speaker::Voiceprint::load(speaker::VOICEPRINT_PATH) else {
-        tracing::warn!(
-            "XCOPILOT_SPEAKER_ID is set but no voiceprint at {} — run `learn-pilot-voice`; using the wake word",
-            speaker::VOICEPRINT_PATH
-        );
-        return None;
-    };
-    let threshold = std::env::var("XCOPILOT_SPEAKER_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(speaker::DEFAULT_THRESHOLD);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    tracing::info!(threshold, url = %config.speaker_url, "speaker-ID enabled (pilot voiceprint loaded)");
-    Some(SpeakerGate { client, url: config.speaker_url.clone(), voiceprint, threshold })
 }
 
 /// Block until the next input arrives from either source. With a `typed`
@@ -1048,7 +853,7 @@ fn next_input(
     typed: Option<&std::sync::mpsc::Receiver<String>>,
 ) -> Option<Input> {
     let Some(typed) = typed else {
-        return listen_once(listener, stt, None).map(|(t, a)| Input::Spoken(t, a));
+        return listen_once(listener, stt, None).map(Input::Spoken);
     };
     loop {
         if let Ok(t) = typed.try_recv() {
@@ -1057,8 +862,8 @@ fn next_input(
                 return Some(Input::Typed(t));
             }
         }
-        if let Some((t, a)) = listen_once(listener, stt, Some(Duration::from_millis(150))) {
-            return Some(Input::Spoken(t, a));
+        if let Some(t) = listen_once(listener, stt, Some(Duration::from_millis(150))) {
+            return Some(Input::Spoken(t));
         }
         // Timed out idle (or a discarded blip) — loop to re-check the typed channel.
     }
@@ -1594,7 +1399,7 @@ fn command_hints() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{gate_wake_word, is_abort, is_affirmative};
+    use super::{is_abort, is_affirmative};
 
     #[test]
     fn abort_is_distinct_from_skip_and_yes() {
@@ -1613,23 +1418,6 @@ mod tests {
             assert!(is_affirmative(w));
             assert!(!is_abort(w));
         }
-    }
-
-    #[test]
-    fn strips_wake_word_and_punctuation() {
-        assert_eq!(gate_wake_word("copilot flaps ten", "copilot").as_deref(), Some("flaps ten"));
-        assert_eq!(gate_wake_word("Copilot, flaps full", "copilot").as_deref(), Some("flaps full"));
-        assert_eq!(gate_wake_word("hey copilot — gear up", "copilot").as_deref(), Some("gear up"));
-    }
-
-    #[test]
-    fn rejects_utterances_without_wake_word() {
-        assert_eq!(gate_wake_word("descend to flight level one zero zero", "copilot"), None);
-    }
-
-    #[test]
-    fn empty_wake_word_passes_everything() {
-        assert_eq!(gate_wake_word("flaps ten", "").as_deref(), Some("flaps ten"));
     }
 
     use super::looks_like_command;
@@ -1758,22 +1546,6 @@ mod tests {
     }
 
     use super::looks_like_question;
-
-    #[test]
-    fn wake_word_gates_ambient_and_atc_speech() {
-        use super::gate_wake_word;
-        // Addressed to the copilot → command passes (wake word stripped).
-        assert_eq!(gate_wake_word("copilot flaps ten", "copilot").as_deref(), Some("flaps ten"));
-        assert_eq!(gate_wake_word("hey copilot, gear up", "copilot").as_deref(), Some("gear up"));
-        assert_eq!(gate_wake_word("co pilot flaps ten", "copilot").as_deref(), Some("flaps ten")); // mishear
-        // ATC / ambient speech (no wake word) is dropped — even though it shares
-        // our command vocabulary.
-        assert_eq!(gate_wake_word("climb and maintain five thousand", "copilot"), None);
-        assert_eq!(gate_wake_word("cessna one two three squawk seven thousand", "copilot"), None);
-        assert_eq!(gate_wake_word("flaps ten", "copilot"), None);
-        // Empty wake word = act on everything (PTT / clean-mic mode).
-        assert_eq!(gate_wake_word("flaps ten", "").as_deref(), Some("flaps ten"));
-    }
 
     #[test]
     fn fuel_query_detects_questions_not_system_commands() {
