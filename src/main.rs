@@ -399,6 +399,17 @@ async fn run_session(
         // the fast-path, so it's computed lazily below: the common fast-path
         // command pays nothing for the burst of X-Plane reads it never uses.
         reporter.status(ui::Phase::Thinking);
+
+        // Deterministic state queries answered without the LLM — the model proved
+        // unreliable here (it had the fuel in its context and still said "I don't
+        // have fuel information"). A fuel question reads the datarefs and is spoken
+        // straight back.
+        if is_fuel_query(&command) {
+            let line = fuel_report(&xplane, &profile, Some(&live)).await;
+            say(&voice, &reporter, ui::LogKind::Readback, &line);
+            continue;
+        }
+
         let mut state: Option<String> = None;
 
         // Deterministic fast-path: resolve the common, regular commands with no
@@ -974,6 +985,47 @@ async fn read1(live: Option<&LiveState>, xp: &XPlaneClient, name: &str) -> Resul
     xp.get_float(name).await
 }
 
+/// 100LL avgas ≈ 2.72 kg/gal (~6 lb/gal) — to report fuel in gallons.
+const AVGAS_KG_PER_GAL: f64 = 2.72;
+
+/// True if the utterance is asking about fuel/endurance (a question we answer
+/// deterministically), not commanding the fuel *system* (pump/selector).
+fn is_fuel_query(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    let asks = t.contains("fuel") || t.contains("gas") || t.contains("endurance");
+    let system = t.contains("pump") || t.contains("selector") || t.contains("boost") || t.contains("primer");
+    asks && !system
+}
+
+/// Deterministic spoken fuel report — total in gallons, endurance from the
+/// profile's cruise burn, and the left/right balance. Read straight from the
+/// datarefs (cache when warm, REST otherwise); never goes near the LLM.
+async fn fuel_report(xp: &XPlaneClient, profile: &aircraft::AircraftProfile, live: Option<&LiveState>) -> String {
+    let Ok(total_kg) = read1(live, xp, datarefs::FUEL_TOTAL_KG).await else {
+        return "I can't read the fuel right now — check the connection to X-Plane.".to_string();
+    };
+    let gal = total_kg / AVGAS_KG_PER_GAL;
+    let mut line = format!("{gal:.0} gallons on board");
+    if let Some(f) = &profile.fuel {
+        if f.cruise_burn_kg_hr > 0.0 {
+            let hours = total_kg / f.cruise_burn_kg_hr;
+            let (h, m) = (hours.trunc() as i32, (hours.fract() * 60.0).round() as i32);
+            line.push_str(&format!(", about {h} hours {m} minutes at cruise"));
+        }
+    }
+    // Per-tank balance, when the airframe has two tanks.
+    if let Ok(tanks) = xp.get_float_array(datarefs::FUEL_PER_TANK_KG).await {
+        if tanks.len() == 2 {
+            let (l, r) = (tanks[0] / AVGAS_KG_PER_GAL, tanks[1] / AVGAS_KG_PER_GAL);
+            line.push_str(&format!(". Left {l:.0}, right {r:.0}"));
+            if (l - r).abs() >= 5.0 {
+                line.push_str(if l > r { " — favor the right" } else { " — favor the left" });
+            }
+        }
+    }
+    format!("Roger — {line}.")
+}
+
 /// A compact live-state line for the LLM's context, so it can ground relative or
 /// ambiguous commands ("a bit more flaps", "level off") in what's actually true.
 /// Each field is best-effort: a dataref that won't read is skipped, and if none
@@ -1033,8 +1085,7 @@ async fn state_snapshot(
     if let Ok(v) = fuel {
         // Report in gallons (how a GA pilot thinks) with the mass alongside, plus an
         // endurance estimate from the profile's cruise burn so "how long can we fly?"
-        // has a real answer. 100LL avgas ≈ 2.72 kg/gal (~6 lb/gal).
-        const AVGAS_KG_PER_GAL: f64 = 2.72;
+        // has a real answer.
         let gal = v / AVGAS_KG_PER_GAL;
         let mut s = format!("fuel on board {gal:.0} gallons ({v:.0} kg)");
         if let Some(f) = &profile.fuel {
@@ -1485,6 +1536,20 @@ mod tests {
     }
 
     use super::looks_like_question;
+
+    #[test]
+    fn fuel_query_detects_questions_not_system_commands() {
+        use super::is_fuel_query;
+        assert!(is_fuel_query("how much fuel do we have"));
+        assert!(is_fuel_query("what's our fuel"));
+        assert!(is_fuel_query("how much gas"));
+        assert!(is_fuel_query("what's our endurance"));
+        // Fuel *system* commands must NOT be hijacked — they go to their tools.
+        assert!(!is_fuel_query("fuel pump on"));
+        assert!(!is_fuel_query("fuel selector both"));
+        assert!(!is_fuel_query("boost pump on"));
+        assert!(!is_fuel_query("flaps ten"));
+    }
 
     #[test]
     fn whisper_label_strips_path_prefix_and_suffix() {

@@ -20,6 +20,9 @@ pub const ON_GROUND_ANY: &str = "sim/flightmodel/failures/onground_any";
 pub const AGL_METERS: &str = "sim/flightmodel/position/y_agl";
 /// Total fuel mass. X-Plane reports this in kilograms regardless of airframe.
 pub const FUEL_TOTAL_KG: &str = "sim/flightmodel/weight/m_fuel_total";
+/// Per-tank fuel mass (kg), one element per tank. For a 2-tank single it's
+/// `[left, right]`. Read as an array (not cached); used for the balance callout.
+pub const FUEL_PER_TANK_KG: &str = "sim/flightmodel/weight/m_fuel";
 
 // --- Weather (XP12 aircraft-relative) ---
 pub const WIND_HEADING_DEG: &str = "sim/cockpit2/gauges/indicators/wind_heading_deg_mag";
