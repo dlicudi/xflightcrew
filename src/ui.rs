@@ -87,14 +87,26 @@ impl Reporter {
 
     pub fn log(&self, kind: LogKind, text: impl Into<String>) {
         let text = text.into();
+        // Readback mirrors verbatim to the panel; Heard is mirrored via `heard()`
+        // so the panel gets the clean transcript without the desktop log's
+        // confidence suffix.
         if let Some(s) = &self.status {
-            match kind {
-                LogKind::Heard => s.heard(&text),
-                LogKind::Readback => s.action(&text),
-                _ => {}
+            if let LogKind::Readback = kind {
+                s.action(&text);
             }
         }
         self.send(Report::Log { kind, text });
+    }
+    /// Report a heard utterance: the desktop log shows the transcript with its
+    /// confidence (useful for tuning), the in-sim panel gets just the transcript.
+    pub fn heard(&self, transcript: &str, confidence: f32) {
+        if let Some(s) = &self.status {
+            s.heard(transcript);
+        }
+        self.send(Report::Log {
+            kind: LogKind::Heard,
+            text: format!("\"{transcript}\" ({confidence:.2})"),
+        });
     }
     pub fn status(&self, phase: Phase) {
         if let Some(s) = &self.status {

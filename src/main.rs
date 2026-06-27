@@ -390,7 +390,7 @@ async fn run_session(
                 let transcript = heard.text;
                 let confidence = heard.confidence;
                 tracing::info!(transcript = %transcript, confidence, "heard utterance");
-                reporter.log(ui::LogKind::Heard, format!("\"{transcript}\" ({confidence:.2})"));
+                reporter.heard(&transcript, confidence);
 
                 // Confidence gate.
                 if confidence < config.stt_min_confidence {
