@@ -575,7 +575,7 @@ impl Check for AlternatorOffline {
 /// The directional gyro has precessed away from the magnetic compass. Vacuum DGs
 /// drift slowly, and on a long leg it's easy to forget to realign — a right-seat
 /// pilot catches it. Advisory only: the wet compass is still valid, so this is a
-/// nudge ("you might want to sync it"), spoken once per occurrence, not a nag.
+/// flat advisory ("recommend syncing the gyro"), spoken once per occurrence, not a nag.
 /// Airborne-only — on the ground you just align during the run-up.
 struct GyroDrift;
 
@@ -594,7 +594,7 @@ impl Check for GyroDrift {
         // ("about ten degrees"), not false precision.
         let approx = (s.gyro_drift_deg.abs() / 5.0).round() * 5.0;
         Some(format!(
-            "Heading indicator's drifted about {approx:.0} degrees — you might want to sync it."
+            "Heading indicator's drifted about {approx:.0} degrees — recommend syncing the gyro."
         ))
     }
 }
