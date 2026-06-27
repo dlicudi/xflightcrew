@@ -446,13 +446,14 @@ impl Tool for SetAltitude {
         })
     }
 
-    // No confirm: an altitude assignment is routine ("climb and maintain X"), the
-    // change is gentle (default 300 fpm) and the AP captures, the MIN_AP_ALTITUDE
-    // gate already refuses absurd/empty targets, and the readback ("descending to
-    // 2000 feet") *is* the confirmation — a mishear is undone instantly with "level
-    // off". A confirm on every level change is friction without payoff. The steep
-    // case that *is* worth gating — a fast descent rate — still confirms in
-    // `set_vertical_speed`/`set_climb`.
+    // No confirm: an altitude assignment is routine ("climb and maintain X"), and the
+    // *dangerous* mishears are already gated — `reject_unsafe_target` refuses anything
+    // into the terrain or above the service ceiling, so a misheard "climb 17000" or a
+    // descent into the ground can't execute even on the LLM-free fast-path. The
+    // readback ("descending to 2000 feet") is the catch for an in-envelope mishear,
+    // undone instantly with "level off". A confirm on every level change is friction
+    // without payoff; the steep case worth gating — a fast descent rate — still
+    // confirms in `set_vertical_speed`/`set_climb`.
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: AltArgs = serde_json::from_value(args.clone())?;
@@ -515,8 +516,13 @@ impl Tool for LevelOff {
         ctx.xplane.run_command(CMD_WING_LEVELER).await?;
         engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
         ctx.xplane.set_float(ALT_DIAL, target).await?;
-        // Stopping a climb means coming off full power — ease to cruise so the
-        // aircraft settles at this altitude instead of accelerating.
+        // Settle to cruise power. Intentional even though it overrides the pilot's
+        // throttle: the only power that *holds* an altitude on a 172 is ~cruise, and
+        // the pre-level-off setting is by definition not a hold power (full from a
+        // climb would accelerate; idle from a descent would decay toward a stall).
+        // Converging to cruise from either direction is the safe default until
+        // airspeed-aware power management lands — making it conditional (leave the
+        // pilot's setting) would risk that decay when levelling from a descent.
         let _ = ctx.xplane.set_float(THROTTLE_ALL, CRUISE_THROTTLE).await;
 
         if servos_engaged(ctx).await? {
