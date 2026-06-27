@@ -82,6 +82,13 @@ pub struct Snapshot {
     /// check, which estimates endurance from a nominal cruise burn instead of
     /// the (near-zero) idle burn.
     pub fuel_kg: Option<f64>,
+    /// Engine oil pressure, PSI (`None` if the read failed). Normal 50–90 (POH).
+    pub oil_pressure_psi: Option<f64>,
+    /// Engine oil temperature, °C (`None` if the read failed). Normal 100–245°F
+    /// = 37.8–118.3°C (POH); spoken back in °F to match the gauge.
+    pub oil_temp_c: Option<f64>,
+    /// Cylinder head temperature, °C (`None` if the read failed).
+    pub cht_c: Option<f64>,
     pub phase: Phase,
 }
 
@@ -145,6 +152,26 @@ impl Snapshot {
             _ => None,
         };
 
+        // Engine instruments, best-effort (a missing read must not kill the
+        // snapshot). Per-engine arrays; element 0. Names verified against the
+        // stock 172's cockpitdecks mapping.
+        let engine0 = |v: Vec<f64>| v.first().copied();
+        let oil_pressure_psi = xp
+            .get_float_array("sim/cockpit2/engine/indicators/oil_pressure_psi")
+            .await
+            .ok()
+            .and_then(engine0);
+        let oil_temp_c = xp
+            .get_float_array("sim/cockpit2/engine/indicators/oil_temperature_deg_C")
+            .await
+            .ok()
+            .and_then(engine0);
+        let cht_c = xp
+            .get_float_array("sim/cockpit2/engine/indicators/CHT_deg_C")
+            .await
+            .ok()
+            .and_then(engine0);
+
         let mut s = Snapshot {
             on_ground,
             groundspeed_kts,
@@ -160,6 +187,9 @@ impl Snapshot {
             gyro_drift_deg,
             endurance_min,
             fuel_kg,
+            oil_pressure_psi,
+            oil_temp_c,
+            cht_c,
             phase: Phase::Ground,
         };
         s.phase = estimate_phase(&s);
@@ -410,6 +440,78 @@ impl Check for Overspeed {
     }
 }
 
+/// Which engine instrument an [`EngineHealth`] check watches.
+#[derive(Clone, Copy)]
+enum EngineParam {
+    OilPressure,
+    OilTemp,
+    Cht,
+}
+
+impl EngineParam {
+    fn value(self, s: &Snapshot) -> Option<f64> {
+        match self {
+            EngineParam::OilPressure => s.oil_pressure_psi,
+            EngineParam::OilTemp => s.oil_temp_c,
+            EngineParam::Cht => s.cht_c,
+        }
+    }
+}
+
+/// An engine instrument out of its normal range. One struct, instantiated per
+/// parameter and band, mirroring the stall/overspeed pattern. `trip` is the
+/// threshold to cross; `clear` (toward the more-severe side) keeps bands disjoint
+/// so only one severity speaks. Thresholds are in the dataref's native unit (PSI,
+/// or °C for temps); temperatures are spoken in °F to match the gauge and the POH.
+struct EngineHealth {
+    id: &'static str,
+    severity: Severity,
+    param: EngineParam,
+    /// True for a low-side alarm (value below `trip`); false for high-side.
+    low_side: bool,
+    trip: f64,
+    /// Boundary toward the next (more severe) band, so bands don't overlap.
+    clear: Option<f64>,
+    min_dur: Duration,
+}
+
+impl Check for EngineHealth {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn severity(&self) -> Severity {
+        self.severity
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        // Only meaningful with the engine running and the instrument reading.
+        if !s.engine_running {
+            return None;
+        }
+        let v = self.param.value(s)?;
+        let in_band = if self.low_side {
+            v < self.trip && self.clear.is_none_or(|c| v >= c)
+        } else {
+            v > self.trip && self.clear.is_none_or(|c| v <= c)
+        };
+        if !in_band {
+            return None;
+        }
+        let (name, unit, shown) = match self.param {
+            EngineParam::OilPressure => ("Oil pressure", "pounds", v),
+            EngineParam::OilTemp => ("Oil temperature", "degrees", v * 9.0 / 5.0 + 32.0),
+            EngineParam::Cht => ("Cylinder head temperature", "degrees", v * 9.0 / 5.0 + 32.0),
+        };
+        let dir = if self.low_side { "low" } else { "high" };
+        Some(match self.severity {
+            Severity::Warning => format!("{name} {dir} — {shown:.0} {unit}. Check it now."),
+            _ => format!("{name} {dir}, {shown:.0} {unit}."),
+        })
+    }
+    fn min_duration(&self) -> Duration {
+        self.min_dur
+    }
+}
+
 fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     let mut checks: Vec<Box<dyn Check>> = Vec::new();
     if !profile.electrical.is_empty() {
@@ -417,6 +519,40 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     }
     if profile.directional_gyro {
         checks.push(Box::new(GyroDrift));
+    }
+    if profile.engine {
+        // Engine instruments, grounded in the C172 POH (oil 50–90 PSI, 100–245°F)
+        // and the Lycoming O-360 CHT limit (500°F redline). Low oil pressure and
+        // high temps are the dangerous ones → Warning; the approach bands Caution.
+        // min_dur skips the post-start pressure build-up and cold-start spikes.
+        let secs = Duration::from_secs;
+        // Oil pressure: low (warning) and high (caution).
+        checks.push(Box::new(EngineHealth {
+            id: "oil_press_low", severity: Severity::Warning, param: EngineParam::OilPressure,
+            low_side: true, trip: 50.0, clear: None, min_dur: secs(4),
+        }));
+        checks.push(Box::new(EngineHealth {
+            id: "oil_press_high", severity: Severity::Caution, param: EngineParam::OilPressure,
+            low_side: false, trip: 90.0, clear: None, min_dur: secs(3),
+        }));
+        // Oil temperature: caution band 240–245°F, warning at/over 245°F (118.3°C).
+        checks.push(Box::new(EngineHealth {
+            id: "oil_temp_caution", severity: Severity::Caution, param: EngineParam::OilTemp,
+            low_side: false, trip: 115.5, clear: Some(118.3), min_dur: secs(5),
+        }));
+        checks.push(Box::new(EngineHealth {
+            id: "oil_temp_warn", severity: Severity::Warning, param: EngineParam::OilTemp,
+            low_side: false, trip: 118.3, clear: None, min_dur: secs(3),
+        }));
+        // CHT: caution from ~450°F (232°C), warning at the 500°F (260°C) redline.
+        checks.push(Box::new(EngineHealth {
+            id: "cht_caution", severity: Severity::Caution, param: EngineParam::Cht,
+            low_side: false, trip: 232.0, clear: Some(260.0), min_dur: secs(5),
+        }));
+        checks.push(Box::new(EngineHealth {
+            id: "cht_warn", severity: Severity::Warning, param: EngineParam::Cht,
+            low_side: false, trip: 260.0, clear: None, min_dur: secs(3),
+        }));
     }
     if let Some(vs) = profile.vs_clean_kts {
         // Wide caution band (≤1.2×Vs) so it speaks with lead time, urgent prompt
@@ -696,8 +832,37 @@ mod tests {
             gyro_drift_deg: 0.0,
             endurance_min: None,
             fuel_kg: None,
+            oil_pressure_psi: None,
+            oil_temp_c: None,
+            cht_c: None,
             phase: Phase::Ground,
         }
+    }
+
+    #[test]
+    fn engine_health_gating_and_disjoint_bands() {
+        let z = Duration::ZERO;
+        let low = EngineHealth { id: "l", severity: Severity::Warning, param: EngineParam::OilPressure, low_side: true, trip: 50.0, clear: None, min_dur: z };
+        let high = EngineHealth { id: "h", severity: Severity::Caution, param: EngineParam::OilPressure, low_side: false, trip: 90.0, clear: None, min_dur: z };
+
+        let mut s = snap(true, true);
+        assert!(low.eval(&s).is_none(), "no reading → silent");
+        s.oil_pressure_psi = Some(40.0);
+        assert!(low.eval(&s).is_some() && high.eval(&s).is_none(), "low fires, high doesn't");
+        s.oil_pressure_psi = Some(70.0);
+        assert!(low.eval(&s).is_none() && high.eval(&s).is_none(), "healthy → silent");
+        s.engine_running = false;
+        s.oil_pressure_psi = Some(40.0);
+        assert!(low.eval(&s).is_none(), "engine off suppresses");
+
+        // Oil-temp bands are disjoint: only one severity speaks (°C thresholds).
+        let caution = EngineHealth { id: "c", severity: Severity::Caution, param: EngineParam::OilTemp, low_side: false, trip: 115.5, clear: Some(118.3), min_dur: z };
+        let warn = EngineHealth { id: "w", severity: Severity::Warning, param: EngineParam::OilTemp, low_side: false, trip: 118.3, clear: None, min_dur: z };
+        let mut s = snap(true, true);
+        s.oil_temp_c = Some(116.5);
+        assert!(caution.eval(&s).is_some() && warn.eval(&s).is_none(), "caution band only");
+        s.oil_temp_c = Some(120.0);
+        assert!(warn.eval(&s).is_some() && caution.eval(&s).is_none(), "warning band only");
     }
 
     #[test]

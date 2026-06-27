@@ -1053,6 +1053,12 @@ async fn read1(live: Option<&LiveState>, xp: &XPlaneClient, name: &str) -> Resul
 /// 100LL avgas ≈ 2.72 kg/gal (~6 lb/gal) — to report fuel in gallons.
 const AVGAS_KG_PER_GAL: f64 = 2.72;
 
+/// First element of a per-engine array dataref (engine 1), or `None` on a failed
+/// read. Engine indicators are arrays, so they bypass the scalar `read1`/cache.
+async fn read_engine0(xp: &XPlaneClient, name: &str) -> Option<f64> {
+    xp.get_float_array(name).await.ok().and_then(|v| v.first().copied())
+}
+
 /// True if the utterance is asking about fuel/endurance (a question we answer
 /// deterministically), not commanding the fuel *system* (pump/selector).
 fn is_fuel_query(text: &str) -> bool {
@@ -1067,7 +1073,8 @@ fn is_fuel_query(text: &str) -> bool {
         || t.contains("refuel")
         || t.contains("top off")
         || t.contains("fill");
-    asks && !command
+    // "fuel flow" is an engine-instrument read, answered in answer_state_query.
+    asks && !command && !t.contains("flow")
 }
 
 /// Deterministic spoken fuel report — total in gallons, endurance from the
@@ -1145,6 +1152,40 @@ async fn answer_state_query(
     if t.contains("airspeed") || t.contains("air speed") || t.contains("how fast") || (t.contains("speed") && !vs_q) {
         if let Ok(v) = read1(live, xp, datarefs::AIRSPEED_KTS).await {
             parts.push(format!("{v:.0} knots"));
+        }
+    }
+    // Engine instruments (per-engine arrays → element 0). Temperatures spoken in
+    // °F to match the 172's gauges and the POH. Names verified against the stock
+    // 172's cockpitdecks mapping.
+    let c_to_f = |c: f64| c * 9.0 / 5.0 + 32.0;
+    if t.contains("oil pressure") {
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_pressure_psi").await {
+            parts.push(format!("oil pressure {v:.0} pounds"));
+        }
+    }
+    if t.contains("oil temp") || (t.contains("oil") && t.contains("temperature")) {
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_temperature_deg_C").await {
+            parts.push(format!("oil temperature {:.0} degrees", c_to_f(v)));
+        }
+    }
+    if t.contains("egt") || t.contains("exhaust") {
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/EGT_deg_cel").await {
+            parts.push(format!("exhaust gas temperature {:.0} degrees", c_to_f(v)));
+        }
+    }
+    if t.contains("cht") || t.contains("cylinder") {
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/CHT_deg_C").await {
+            parts.push(format!("cylinder head temperature {:.0} degrees", c_to_f(v)));
+        }
+    }
+    if t.contains("rpm") || t.contains("r p m") || t.contains("engine speed") {
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm").await {
+            parts.push(format!("{v:.0} R P M"));
+        }
+    }
+    if t.contains("fuel flow") || t.contains("flow") || t.contains("burning") {
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/fuel_flow_kg_sec").await {
+            parts.push(format!("fuel flow {:.1} gallons an hour", v * 3600.0 / AVGAS_KG_PER_GAL));
         }
     }
     // A question — answer plainly; "Roger" is a command acknowledgment.
@@ -1660,6 +1701,9 @@ mod tests {
         assert!(!is_fuel_query("fuel selector both"));
         assert!(!is_fuel_query("boost pump on"));
         assert!(!is_fuel_query("flaps ten"));
+        // "fuel flow" is an engine-instrument read (answer_state_query), not the
+        // total-fuel report.
+        assert!(!is_fuel_query("what's the fuel flow"));
     }
 
     #[test]
