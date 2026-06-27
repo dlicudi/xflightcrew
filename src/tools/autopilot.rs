@@ -118,12 +118,14 @@ const METERS_TO_FEET: f64 = 3.280_84;
 /// Within this many feet of the target, treat it as "hold here" (no climb), and
 /// the band the capture watcher uses to detect a pilot re-command (dial moved).
 const ALT_CAPTURE_BAND_FT: f64 = 100.0;
-/// The watcher levels off within this many feet of the target — tighter than the
-/// capture band so we settle close to the commanded altitude, not ±100. Reliable
-/// because the watcher polls faster as it nears the target (see `capture_at_altitude`).
-const CAPTURE_TRIGGER_FT: f64 = 50.0;
-/// Inside this distance from the target, the watcher polls fast so the tight
-/// level-off trigger isn't skipped between ticks even at a brisk rate.
+/// The watcher levels off once the aircraft *reaches* the target in its direction
+/// of travel (climb: at/above; descent: at/below), minus this small lead so the
+/// roll-out settles on the target rather than the band edge. Reliable because the
+/// watcher polls fast near the target (see `capture_at_altitude`); tune against the
+/// "capture" log line if the AP consistently settles above/below the target.
+const CAPTURE_LEAD_FT: f64 = 0.0;
+/// Inside this distance from the target, the watcher polls fast so the level-off
+/// isn't skipped between ticks even at a brisk rate.
 const CAPTURE_APPROACH_FT: f64 = 400.0;
 
 /// Vertical speed (fpm, magnitude) for an altitude change of `delta_ft`: scaled so
@@ -273,10 +275,19 @@ enum Capture {
     LevelOff,
 }
 
-fn capture_action(dial: f64, target: f64, current_alt: f64) -> Capture {
+fn capture_action(dial: f64, target: f64, current_alt: f64, climb: bool) -> Capture {
     if (dial - target).abs() > ALT_CAPTURE_BAND_FT {
-        Capture::StandDown
-    } else if (current_alt - target).abs() <= CAPTURE_TRIGGER_FT {
+        return Capture::StandDown; // dial moved off our target — pilot re-commanded
+    }
+    // Level off once we've arrived at the target in the direction of travel (with a
+    // small lead), so we settle on it rather than at the band edge. Directional so
+    // a climb doesn't trip on the way up to a higher re-command, etc.
+    let reached = if climb {
+        current_alt >= target - CAPTURE_LEAD_FT
+    } else {
+        current_alt <= target + CAPTURE_LEAD_FT
+    };
+    if reached {
         Capture::LevelOff
     } else {
         Capture::Wait
@@ -328,12 +339,24 @@ fn capture_at_altitude(base: String, target: f64, was_climb: bool, voice: Option
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
                 };
-                match capture_action(dial, target, alt) {
+                match capture_action(dial, target, alt, was_climb) {
                     Capture::StandDown => return,
                     Capture::LevelOff => {
-                        // Engage ALT hold so the AP holds here instead of flying
-                        // through in VS. Idempotent (the command is a toggle): if the
-                        // AP already captured on its own, leave it engaged.
+                        // Diagnostic: where did we engage vs the target? If the AP
+                        // settles consistently off-target, tune CAPTURE_LEAD_FT from
+                        // (alt_at_capture - target) and the settled altitude.
+                        tracing::info!(
+                            target: "x_copilot::autopilot",
+                            target_alt = target,
+                            alt_at_capture = alt,
+                            was_climb,
+                            "capture: levelling off"
+                        );
+                        // Re-affirm the exact target in the window, then engage ALT
+                        // hold so the AP holds here instead of flying through in VS.
+                        // Idempotent (the command is a toggle): if the AP already
+                        // captured on its own, leave it engaged.
+                        let _ = xp.set_float(ALT_DIAL, target).await;
                         let held = xp.get_float(ALT_HOLD_STATUS).await.map(|v| v > 0.5).unwrap_or(false);
                         if !held {
                             let _ = xp.run_command(CMD_ALT_HOLD).await;
@@ -794,15 +817,15 @@ mod tests {
 
     #[test]
     fn capture_action_levels_off_stands_down_and_waits() {
-        // Within the (tight) level-off trigger of the target → level off.
-        assert_eq!(capture_action(7000.0, 7000.0, 6960.0), Capture::LevelOff);
-        // Close but still outside the trigger (settles nearer the target, not ±100).
-        assert_eq!(capture_action(7000.0, 7000.0, 6900.0), Capture::Wait);
-        // Still climbing toward it → keep watching.
-        assert_eq!(capture_action(7000.0, 7000.0, 5000.0), Capture::Wait);
+        // Climb: level off once we reach the target, not before.
+        assert_eq!(capture_action(7000.0, 7000.0, 7000.0, true), Capture::LevelOff);
+        assert_eq!(capture_action(7000.0, 7000.0, 6900.0, true), Capture::Wait);
+        // Descent: level off once we come down to the target, not before.
+        assert_eq!(capture_action(3000.0, 3000.0, 3000.0, false), Capture::LevelOff);
+        assert_eq!(capture_action(3000.0, 3000.0, 3100.0, false), Capture::Wait);
         // The selected dial moved off our target (pilot re-commanded) → stand down,
         // even if we happen to be near the old target's altitude.
-        assert_eq!(capture_action(3000.0, 7000.0, 6950.0), Capture::StandDown);
+        assert_eq!(capture_action(3000.0, 7000.0, 6950.0, true), Capture::StandDown);
     }
 
     // --- arm_altitude / reject_unsafe_target: the trust-critical writes, against a
