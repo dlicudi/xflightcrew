@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
@@ -118,6 +118,8 @@ fn color(k: LogKind) -> Color {
 /// Dashboard UI state.
 struct App {
     title: String,
+    /// Active engines, shown right-of-status ("whisper base.en · llm qwen3:8b · tts say").
+    engines: String,
     log: Vec<(LogKind, String)>,
     phase: Phase,
     mic: f32,
@@ -152,6 +154,7 @@ const MIC_REDRAW_STEP: f32 = 0.002;
 /// `rx` for updates and polls the keyboard for `q`/Esc/Ctrl-C.
 pub fn run_dashboard(
     title: String,
+    engines: String,
     commands: Vec<String>,
     rx: Receiver<Report>,
     cmd_tx: Sender<String>,
@@ -159,6 +162,7 @@ pub fn run_dashboard(
     let mut terminal = ratatui::init();
     let mut app = App {
         title,
+        engines,
         log: Vec::new(),
         phase: Phase::Idle,
         mic: 0.0,
@@ -302,12 +306,24 @@ fn draw(f: &mut Frame, app: &App) {
         Phase::Speaking => ("◑", "speaking", Color::Cyan),
         Phase::Idle => ("○", "idle", Color::DarkGray),
     };
+    // Title + phase on the left; the active engines right-aligned on the same line.
+    let [status_left, status_right] =
+        Layout::horizontal([Constraint::Min(20), Constraint::Length(app.engines.len() as u16 + 1)])
+            .areas(status);
     let status_line = Line::from(vec![
         Span::styled(format!(" {} ", app.title), Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(format!("{dot} {label}"), Style::default().fg(c)),
     ]);
-    f.render_widget(Paragraph::new(status_line), status);
+    f.render_widget(Paragraph::new(status_line), status_left);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!("{} ", app.engines),
+            Style::default().fg(Color::DarkGray),
+        ))
+        .alignment(Alignment::Right),
+        status_right,
+    );
 
     // --- body: log (left) | aircraft + commands (right) ---
     let [left, right] = Layout::horizontal([Constraint::Min(30), Constraint::Length(26)]).areas(body);

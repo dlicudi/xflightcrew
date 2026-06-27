@@ -184,6 +184,14 @@ async fn main() -> Result<()> {
         // its own runtime; the dashboard renders on the main thread.
         let (tx, rx) = std::sync::mpsc::channel::<ui::Report>();
         let title = format!("x-copilot · {}", profile.display_name);
+        // The active engines, shown in the status bar: STT (whisper model), LLM,
+        // and TTS backend — so it's obvious at a glance what's running.
+        let engines = format!(
+            "whisper {} · llm {} · tts {}",
+            whisper_model_label(&config.whisper_model_path),
+            config.model,
+            config.tts_backend,
+        );
         let commands = command_hints();
 
         let tx_poll = tx.clone();
@@ -216,7 +224,7 @@ async fn main() -> Result<()> {
             }
         });
 
-        ui::run_dashboard(title, commands, rx, cmd_tx)?; // blocks until the user quits
+        ui::run_dashboard(title, engines, commands, rx, cmd_tx)?; // blocks until the user quits
         Ok(())
     } else {
         println!("\n  x-copilot — {} ({}). Ctrl-C to quit.\n", profile.display_name, config.listen_mode);
@@ -1265,6 +1273,14 @@ fn matches_keyword(w: &str) -> bool {
             .any(|k| levenshtein(w, k) <= 1)
 }
 
+/// Short label for the whisper model from its path, for the status bar:
+/// `models/ggml-base.en.bin` → `base.en`, `…/ggml-large-v3-turbo.bin` → `large-v3-turbo`.
+fn whisper_model_label(path: &str) -> String {
+    let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let stem = file.strip_suffix(".bin").unwrap_or(file);
+    stem.strip_prefix("ggml-").unwrap_or(stem).to_string()
+}
+
 fn command_hints() -> Vec<String> {
     [
         "flaps ten / full",
@@ -1457,6 +1473,14 @@ mod tests {
     }
 
     use super::looks_like_question;
+
+    #[test]
+    fn whisper_label_strips_path_prefix_and_suffix() {
+        use super::whisper_model_label;
+        assert_eq!(whisper_model_label("models/ggml-base.en.bin"), "base.en");
+        assert_eq!(whisper_model_label("/a/b/ggml-large-v3-turbo.bin"), "large-v3-turbo");
+        assert_eq!(whisper_model_label("small.en"), "small.en");
+    }
 
     #[test]
     fn questions_are_detected_commands_are_not() {
