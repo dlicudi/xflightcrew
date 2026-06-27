@@ -1261,6 +1261,9 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "ident", "barometer", "altimeter", "baro", "kollsman", "qnh", "vor",
     // instruments / misc controls
     "gyro", "pitot", "brake", "brakes", "parking", "heat",
+    // ramp / ground-ops: chocks, ground power, pushback, services
+    "chocks", "chock", "pushback", "push", "tug", "gpu", "ground", "refuel",
+    "service", "services",
     // checklist invocations: "checklist(s)" is the trigger word every one shares
     // (so "normal take-off checklist" reaches the LLM even when STT splits
     // "takeoff"), plus the phase words for the shorthand ("configure for takeoff").
