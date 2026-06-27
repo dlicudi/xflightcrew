@@ -1195,18 +1195,21 @@ async fn answer_state_query(
         }
     }
     if t.contains("oil temp") || (t.contains("oil") && t.contains("temperature")) {
+        // oil_temperature_deg_C is misnamed — reads °F already.
         if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_temperature_deg_C").await {
-            parts.push(format!("oil temperature {:.0} degrees", c_to_f(v)));
+            parts.push(format!("oil temperature {v:.0} degrees"));
         }
     }
     if t.contains("egt") || t.contains("exhaust") {
+        // EGT_deg_cel is genuinely Celsius → convert to °F for the readout.
         if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/EGT_deg_cel").await {
             parts.push(format!("exhaust gas temperature {:.0} degrees", c_to_f(v)));
         }
     }
     if t.contains("cht") || t.contains("cylinder") {
+        // CHT_deg_C is misnamed — reads °F already.
         if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/CHT_deg_C").await {
-            parts.push(format!("cylinder head temperature {:.0} degrees", c_to_f(v)));
+            parts.push(format!("cylinder head temperature {v:.0} degrees"));
         }
     }
     if t.contains("rpm") || t.contains("r p m") || t.contains("engine speed") {

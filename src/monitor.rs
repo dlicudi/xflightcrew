@@ -84,11 +84,13 @@ pub struct Snapshot {
     pub fuel_kg: Option<f64>,
     /// Engine oil pressure, PSI (`None` if the read failed). Normal 50–90 (POH).
     pub oil_pressure_psi: Option<f64>,
-    /// Engine oil temperature, °C (`None` if the read failed). Normal 100–245°F
-    /// = 37.8–118.3°C (POH); spoken back in °F to match the gauge.
-    pub oil_temp_c: Option<f64>,
-    /// Cylinder head temperature, °C (`None` if the read failed).
-    pub cht_c: Option<f64>,
+    /// Engine oil temperature, °F (`None` if the read failed). NOTE: the
+    /// `oil_temperature_deg_C` dataref is misnamed — it reads °F (verified live:
+    /// ~205°F running, 59°F = ambient cold). Normal 100–245°F (POH).
+    pub oil_temp_f: Option<f64>,
+    /// Cylinder head temperature, °F (`None` if the read failed). The `CHT_deg_C`
+    /// dataref is likewise misnamed — it reads °F (verified live: ~354°F cruise).
+    pub cht_f: Option<f64>,
     /// Outside air temp, °C — for the carb-ice advisory.
     pub oat_c: f64,
     /// Dewpoint, °C — a humidity proxy (small OAT−dewpoint spread = moist air).
@@ -174,12 +176,14 @@ impl Snapshot {
             .await
             .ok()
             .and_then(engine0);
-        let oil_temp_c = xp
+        // NOTE: despite the "_deg_C"/"deg_C" names, both of these read °F in XP12
+        // (verified live: ~205°F oil, ~354°F CHT at cruise). Stored as °F.
+        let oil_temp_f = xp
             .get_float_array("sim/cockpit2/engine/indicators/oil_temperature_deg_C")
             .await
             .ok()
             .and_then(engine0);
-        let cht_c = xp
+        let cht_f = xp
             .get_float_array("sim/cockpit2/engine/indicators/CHT_deg_C")
             .await
             .ok()
@@ -231,8 +235,8 @@ impl Snapshot {
             endurance_min,
             fuel_kg,
             oil_pressure_psi,
-            oil_temp_c,
-            cht_c,
+            oil_temp_f,
+            cht_f,
             oat_c,
             dewpoint_c,
             carb_heat_on,
@@ -501,8 +505,8 @@ impl EngineParam {
     fn value(self, s: &Snapshot) -> Option<f64> {
         match self {
             EngineParam::OilPressure => s.oil_pressure_psi,
-            EngineParam::OilTemp => s.oil_temp_c,
-            EngineParam::Cht => s.cht_c,
+            EngineParam::OilTemp => s.oil_temp_f,
+            EngineParam::Cht => s.cht_f,
         }
     }
 }
@@ -545,10 +549,11 @@ impl Check for EngineHealth {
         if !in_band {
             return None;
         }
+        // oil_temp_f / cht_f already read in °F; no conversion.
         let (name, unit, shown) = match self.param {
             EngineParam::OilPressure => ("Oil pressure", "pounds", v),
-            EngineParam::OilTemp => ("Oil temperature", "degrees", v * 9.0 / 5.0 + 32.0),
-            EngineParam::Cht => ("Cylinder head temperature", "degrees", v * 9.0 / 5.0 + 32.0),
+            EngineParam::OilTemp => ("Oil temperature", "degrees", v),
+            EngineParam::Cht => ("Cylinder head temperature", "degrees", v),
         };
         let dir = if self.low_side { "low" } else { "high" };
         Some(match self.severity {
@@ -661,37 +666,43 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         checks.push(Box::new(CarbIce));
     }
     if profile.engine {
-        // Engine instruments, grounded in the C172 POH (oil 50–90 PSI, 100–245°F)
-        // and the Lycoming O-360 CHT limit (500°F redline). Low oil pressure and
-        // high temps are the dangerous ones → Warning; the approach bands Caution.
-        // min_dur skips the post-start pressure build-up and cold-start spikes.
+        // Engine instruments, calibrated to the 172's gauges (verified live):
+        // OIL TEMP green to 245°F redline; OIL PRESS 0–115 PSI; CHT to 500°F. Oil
+        // temp and CHT datarefs read °F despite their "_deg_C" names. min_dur skips
+        // post-start build-up and cold-start spikes.
         let secs = Duration::from_secs;
-        // Oil pressure: low (warning) and high (caution).
+        // Oil pressure (PSI): idle legitimately sits well below the 50–90 green
+        // band, so only the genuinely-dangerous extremes alarm — below the 20 PSI
+        // redline (warning), and above the ~115 PSI redline (caution then warning).
         checks.push(Box::new(EngineHealth {
             id: "oil_press_low", severity: Severity::Warning, param: EngineParam::OilPressure,
-            low_side: true, trip: 50.0, clear: None, min_dur: secs(4),
+            low_side: true, trip: 20.0, clear: None, min_dur: secs(4),
         }));
         checks.push(Box::new(EngineHealth {
-            id: "oil_press_high", severity: Severity::Caution, param: EngineParam::OilPressure,
-            low_side: false, trip: 90.0, clear: None, min_dur: secs(3),
+            id: "oil_press_high_caution", severity: Severity::Caution, param: EngineParam::OilPressure,
+            low_side: false, trip: 105.0, clear: Some(115.0), min_dur: secs(4),
         }));
-        // Oil temperature: caution band 240–245°F, warning at/over 245°F (118.3°C).
+        checks.push(Box::new(EngineHealth {
+            id: "oil_press_high_warn", severity: Severity::Warning, param: EngineParam::OilPressure,
+            low_side: false, trip: 115.0, clear: None, min_dur: secs(3),
+        }));
+        // Oil temperature (°F): caution band 240–245°F, warning at/over the 245°F redline.
         checks.push(Box::new(EngineHealth {
             id: "oil_temp_caution", severity: Severity::Caution, param: EngineParam::OilTemp,
-            low_side: false, trip: 115.5, clear: Some(118.3), min_dur: secs(5),
+            low_side: false, trip: 240.0, clear: Some(245.0), min_dur: secs(5),
         }));
         checks.push(Box::new(EngineHealth {
             id: "oil_temp_warn", severity: Severity::Warning, param: EngineParam::OilTemp,
-            low_side: false, trip: 118.3, clear: None, min_dur: secs(3),
+            low_side: false, trip: 245.0, clear: None, min_dur: secs(3),
         }));
-        // CHT: caution from ~450°F (232°C), warning at the 500°F (260°C) redline.
+        // CHT (°F): caution from ~450°F, warning at the 500°F redline.
         checks.push(Box::new(EngineHealth {
             id: "cht_caution", severity: Severity::Caution, param: EngineParam::Cht,
-            low_side: false, trip: 232.0, clear: Some(260.0), min_dur: secs(5),
+            low_side: false, trip: 450.0, clear: Some(500.0), min_dur: secs(5),
         }));
         checks.push(Box::new(EngineHealth {
             id: "cht_warn", severity: Severity::Warning, param: EngineParam::Cht,
-            low_side: false, trip: 260.0, clear: None, min_dur: secs(3),
+            low_side: false, trip: 500.0, clear: None, min_dur: secs(3),
         }));
     }
     if let Some(vs) = profile.vs_clean_kts {
@@ -973,8 +984,8 @@ mod tests {
             endurance_min: None,
             fuel_kg: None,
             oil_pressure_psi: None,
-            oil_temp_c: None,
-            cht_c: None,
+            oil_temp_f: None,
+            cht_f: None,
             oat_c: 15.0,
             dewpoint_c: -30.0,
             carb_heat_on: false,
@@ -988,26 +999,28 @@ mod tests {
     #[test]
     fn engine_health_gating_and_disjoint_bands() {
         let z = Duration::ZERO;
-        let low = EngineHealth { id: "l", severity: Severity::Warning, param: EngineParam::OilPressure, low_side: true, trip: 50.0, clear: None, min_dur: z };
-        let high = EngineHealth { id: "h", severity: Severity::Caution, param: EngineParam::OilPressure, low_side: false, trip: 90.0, clear: None, min_dur: z };
+        // Oil pressure (PSI): warn below the 20 PSI redline; idle lows (e.g. 40)
+        // are NOT alarmed (that idle nuisance was the original false positive).
+        let low = EngineHealth { id: "l", severity: Severity::Warning, param: EngineParam::OilPressure, low_side: true, trip: 20.0, clear: None, min_dur: z };
 
         let mut s = snap(true, true);
         assert!(low.eval(&s).is_none(), "no reading → silent");
         s.oil_pressure_psi = Some(40.0);
-        assert!(low.eval(&s).is_some() && high.eval(&s).is_none(), "low fires, high doesn't");
-        s.oil_pressure_psi = Some(70.0);
-        assert!(low.eval(&s).is_none() && high.eval(&s).is_none(), "healthy → silent");
+        assert!(low.eval(&s).is_none(), "idle-low 40 PSI is fine, no alarm");
+        s.oil_pressure_psi = Some(15.0);
+        assert!(low.eval(&s).is_some(), "below 20 PSI redline → warn");
         s.engine_running = false;
-        s.oil_pressure_psi = Some(40.0);
         assert!(low.eval(&s).is_none(), "engine off suppresses");
 
-        // Oil-temp bands are disjoint: only one severity speaks (°C thresholds).
-        let caution = EngineHealth { id: "c", severity: Severity::Caution, param: EngineParam::OilTemp, low_side: false, trip: 115.5, clear: Some(118.3), min_dur: z };
-        let warn = EngineHealth { id: "w", severity: Severity::Warning, param: EngineParam::OilTemp, low_side: false, trip: 118.3, clear: None, min_dur: z };
+        // Oil-temp bands are disjoint (°F thresholds): caution 240–245, warn >245.
+        let caution = EngineHealth { id: "c", severity: Severity::Caution, param: EngineParam::OilTemp, low_side: false, trip: 240.0, clear: Some(245.0), min_dur: z };
+        let warn = EngineHealth { id: "w", severity: Severity::Warning, param: EngineParam::OilTemp, low_side: false, trip: 245.0, clear: None, min_dur: z };
         let mut s = snap(true, true);
-        s.oil_temp_c = Some(116.5);
+        s.oil_temp_f = Some(205.0);
+        assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none(), "205°F cruise → silent");
+        s.oil_temp_f = Some(242.0);
         assert!(caution.eval(&s).is_some() && warn.eval(&s).is_none(), "caution band only");
-        s.oil_temp_c = Some(120.0);
+        s.oil_temp_f = Some(250.0);
         assert!(warn.eval(&s).is_some() && caution.eval(&s).is_none(), "warning band only");
     }
 
