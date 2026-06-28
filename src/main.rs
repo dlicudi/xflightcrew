@@ -637,7 +637,7 @@ async fn run_session(
             // Execute the curated tool (writes the dataref + reads back).
             reporter.status(ui::Phase::Thinking);
             let Some(tool) = registry.get(&call.name) else { continue };
-            let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice) };
+            let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice), status: reporter.status_sink() };
             // Execute, retrying once on error: a single transient blip (a dropped
             // Web API request, including the autopilot-engage commands the client
             // doesn't itself retry) shouldn't fail an action. Every tool is safe to
@@ -711,7 +711,7 @@ async fn run_checklist(
 ) {
     use checklist::Item;
     say(voice, reporter, ui::LogKind::Info, &format!("Running the {} checklist.", cl.title));
-    let ctx = ToolCtx { xplane, config, voice: Some(voice) };
+    let ctx = ToolCtx { xplane, config, voice: Some(voice), status: reporter.status_sink() };
     let mut failed = 0usize;
     let mut aborted = false;
     for item in &cl.items {

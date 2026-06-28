@@ -84,6 +84,11 @@ impl Reporter {
         self.status = Some(status);
         self
     }
+    /// The in-sim panel sink, for handing to a `ToolCtx` (e.g. the autopilot
+    /// capture watcher's later level-off announcement).
+    pub fn status_sink(&self) -> Option<&crate::plugin_status::StatusSink> {
+        self.status.as_ref()
+    }
 
     pub fn log(&self, kind: LogKind, text: impl Into<String>) {
         let text = text.into();

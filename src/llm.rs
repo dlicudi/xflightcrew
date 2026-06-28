@@ -1000,7 +1000,7 @@ mod tests {
         let profile = aircraft::builtin(&cfg.aircraft).unwrap();
         let registry = Registry::for_aircraft(&profile);
         let specs = registry.specs();
-        let ctx = ToolCtx { xplane: &xplane, config: &cfg, voice: None };
+        let ctx = ToolCtx { xplane: &xplane, config: &cfg, voice: None, status: None };
 
         println!("\n  model: {} | aircraft: {}\n", cfg.model, profile.display_name);
 

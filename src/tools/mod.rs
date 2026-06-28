@@ -49,9 +49,12 @@ pub struct ToolCtx<'a> {
     #[allow(dead_code)]
     pub config: &'a Config,
     /// The speech arbiter, for the rare action that announces *later* than its
-    /// readback — the autopilot capture watcher calls out the level-off when it
+    /// readback: the autopilot capture watcher calls out the level-off when it
     /// reaches the target, minutes after the command. `None` outside the live loop.
     pub voice: Option<&'a Voice>,
+    /// The in-sim panel sink, so a later announcement (the level-off callout) shows
+    /// on the panel too, not just spoken. `None` outside the live loop / no plugin.
+    pub status: Option<&'a crate::plugin_status::StatusSink>,
 }
 
 /// One curated action the copilot can take.

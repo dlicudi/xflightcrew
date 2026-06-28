@@ -198,6 +198,7 @@ async fn fly_to(ctx: &ToolCtx<'_>, altitude: f64, rate: Option<f64>) -> Result<(
             altitude,
             was_climb,
             ctx.voice.cloned(),
+            ctx.status.cloned(),
         );
     }
 
@@ -320,7 +321,13 @@ static CLIMB_WATCHER_GEN: AtomicU64 = AtomicU64::new(0);
 /// newer command supersedes it (generation), if the selector dial moves off
 /// `target` (pilot re-commanded), and it won't override a throttle the pilot has
 /// taken manually. Fire-and-forget; a dropped poll just retries next tick.
-fn capture_at_altitude(base: String, target: f64, was_climb: bool, voice: Option<Voice>) {
+fn capture_at_altitude(
+    base: String,
+    target: f64,
+    was_climb: bool,
+    voice: Option<Voice>,
+    status: Option<crate::plugin_status::StatusSink>,
+) {
     let my_gen = CLIMB_WATCHER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
@@ -380,14 +387,19 @@ fn capture_at_altitude(base: String, target: f64, was_climb: bool, voice: Option
                                 _ => {} // pilot took manual throttle — don't touch it
                             }
                         }
-                        // Call out the capture — this lands minutes after the command,
+                        // Call out the capture. This lands minutes after the command,
                         // so it's the copilot telling you it actually levelled off.
+                        // Spoken via Voice and mirrored to the panel (which the
+                        // Reporter never sees for this background announcement).
+                        let line = if eased {
+                            format!("Reached {target:.0} feet, easing the power back, levelling off.")
+                        } else {
+                            format!("Reached {target:.0} feet, levelling off.")
+                        };
+                        if let Some(s) = &status {
+                            s.action(&line);
+                        }
                         if let Some(v) = &voice {
-                            let line = if eased {
-                                format!("Reached {target:.0} feet — easing the power back, levelling off.")
-                            } else {
-                                format!("Reached {target:.0} feet — levelling off.")
-                            };
                             v.say(Priority::Readback, line);
                         }
                         return;
@@ -846,7 +858,7 @@ mod tests {
     use crate::xplane::FakeXPlane;
 
     fn ctx<'a>(fake: &'a FakeXPlane, cfg: &'a crate::config::Config) -> ToolCtx<'a> {
-        ToolCtx { xplane: fake, config: cfg, voice: None }
+        ToolCtx { xplane: fake, config: cfg, voice: None, status: None }
     }
 
     #[tokio::test]
