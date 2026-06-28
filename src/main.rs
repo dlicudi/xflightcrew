@@ -358,8 +358,9 @@ async fn run_session(
     let mut fp_cache: Option<(Instant, simbrief::FlightPlan)> = None;
     // Memory of armed reminders, so the copilot can recall and cancel them.
     let reminders = tools::reminder::Reminders::default();
-    // The previous value of whatever the last command changed, for "belay that".
-    let mut last_action: Option<UndoSnapshot> = None;
+    // Recovery for recent utterances (a stack), so "belay that" can walk back the
+    // last command, then the one before it, each with how to undo it.
+    let mut undo_stack: Vec<UndoSnapshot> = Vec::new();
     let mut listener = if continuous {
         // Share the speech arbiter's mic gate so the listener mutes itself while
         // the copilot speaks (readbacks and monitor alerts alike).
@@ -413,12 +414,22 @@ async fn run_session(
         // must beat every gate: a panic word that's low-confidence, or glued to an
         // echoed readback, still has to land. Deterministic and instant.
         if is_undo(&command) {
-            match last_action.take() {
+            match undo_stack.pop() {
                 None => say(&voice, &reporter, ui::LogKind::Warn, "Nothing to undo."),
                 Some(snap) => {
+                    tracing::info!(undid = %snap.label, "undo");
                     let mut acts: Vec<String> = Vec::new();
-                    // Disengage first — stop the aircraft flying the wrong thing,
-                    // then tidy the dial back. "servos_off_any" is a clean disconnect.
+                    // Recover non-value actions first (e.g. restart after a shutdown).
+                    for (tname, targs) in &snap.inverse {
+                        if let Some(tool) = registry.get(tname) {
+                            let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice), status: reporter.status_sink(), reminders: Some(&reminders) };
+                            if tool.execute(targs, &ctx).await.is_ok() {
+                                acts.push(recovery_label(tname));
+                            }
+                        }
+                    }
+                    // Disengage the autopilot before resetting its dials — stop the
+                    // aircraft flying the wrong thing first. servos_off_any is clean.
                     if snap.disengage_ap && xplane.run_command("sim/autopilot/servos_off_any").await.is_ok() {
                         acts.push("autopilot disengaged".to_string());
                     }
@@ -721,6 +732,11 @@ async fn run_session(
         // Readbacks from this utterance's actions, recorded as the assistant
         // turn afterwards so the next command can refer back to what was done.
         let mut turn_readbacks: Vec<String> = Vec::new();
+        // Recovery for everything this utterance does, gathered so one "belay that"
+        // undoes the whole set of commands, not just the last tool.
+        let mut turn_reverts: Vec<(String, String, f64)> = Vec::new();
+        let mut turn_disengage_ap = false;
+        let mut turn_inverse: Vec<(String, serde_json::Value)> = Vec::new();
         for mut call in calls {
             tracing::info!(tool = %call.name, args = %call.arguments, "tool selected");
             reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
@@ -829,16 +845,33 @@ async fn run_session(
                     }
                 }
             };
-            // Arm the undo for this action (replacing any prior one — single-level,
-            // the last command is what "belay that" targets).
-            if ok && (!pre.is_empty() || ap_was_off) {
-                last_action = Some(UndoSnapshot { reverts: pre, disengage_ap: ap_was_off });
+            // Gather this action's recovery into the turn (pushed once after the loop).
+            if ok {
+                turn_reverts.extend(pre);
+                turn_disengage_ap |= ap_was_off;
+                // Actions with no value to revert get an explicit inverse command.
+                if call.name == "stop_engine" {
+                    turn_inverse.push(("start_engine".to_string(), serde_json::json!({})));
+                }
             }
             // Vary the acknowledgment on affirmative readbacks (bare callout most
             // of the time, "Roger,"/"Copy," occasionally); the canonical readback
             // is what's recorded for history context.
             say(&voice, &reporter, ui::LogKind::Readback, &readback::vary_ack(&readback));
             turn_readbacks.push(readback);
+        }
+
+        // Push this utterance's recovery onto the undo stack (newest on top), bounded.
+        if !turn_reverts.is_empty() || turn_disengage_ap || !turn_inverse.is_empty() {
+            undo_stack.push(UndoSnapshot {
+                label: command.clone(),
+                reverts: turn_reverts,
+                disengage_ap: turn_disengage_ap,
+                inverse: turn_inverse,
+            });
+            if undo_stack.len() > UNDO_STACK_MAX {
+                undo_stack.remove(0);
+            }
         }
 
         // Record this turn for back-reference context, then bound the history by
@@ -2000,15 +2033,25 @@ async fn ap_mode(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
     }
 }
 
-/// The previous state the last command changed, so an emergency "belay that" can
-/// restore it. Single-level: only the most recent action.
+/// How to recover from one utterance's worth of actions. The command loop keeps a
+/// stack of these so "belay that" can walk back command by command, each with its
+/// own recovery (the whole point: remember what was done and how to undo it).
 struct UndoSnapshot {
-    /// (dataref, spoken label, previous value).
+    /// What the pilot said, for the readback ("belay the throttle").
+    label: String,
+    /// (dataref, spoken label, previous value) to write back.
     reverts: Vec<(String, String, f64)>,
-    /// The last command switched the autopilot on (it was off before), so undo
-    /// should switch it back off, not just reset the dial it was flying to.
+    /// The action switched the autopilot on (it was off before), so undo should
+    /// switch it back off, not just reset the dial it was flying to.
     disengage_ap: bool,
+    /// Tools to run to recover an action that isn't a simple value write — e.g.
+    /// `start_engine` to undo an engine shutdown.
+    inverse: Vec<(String, serde_json::Value)>,
 }
+
+/// Keep recovery for the last dozen utterances — enough to walk back a bad stretch,
+/// bounded so it can't grow without limit over a long flight.
+const UNDO_STACK_MAX: usize = 12;
 
 /// Tools that can engage the autopilot servos. If one of these turns the AP on,
 /// "belay that" disengages it again.
@@ -2037,6 +2080,14 @@ fn undoable_drefs(tool: &str) -> &'static [(&'static str, &'static str)] {
         "set_altitude" => &[("sim/cockpit2/autopilot/altitude_dial_ft", "the altitude select")],
         "set_vertical_speed" | "set_climb" => &[("sim/cockpit/autopilot/vertical_velocity", "vertical speed")],
         _ => &[],
+    }
+}
+
+/// Spoken label for an inverse recovery tool run during undo.
+fn recovery_label(tool: &str) -> String {
+    match tool {
+        "start_engine" => "engine restarted".to_string(),
+        other => format!("{} run", other.replace('_', " ")),
     }
 }
 
