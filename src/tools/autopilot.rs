@@ -111,6 +111,13 @@ const MAX_CLIMB_FPM: f64 = 700.0;
 /// Max auto descent rate (fpm) commanded for an altitude change — gentle enough
 /// not to build speed toward Vne without active power management. (Per-airframe.)
 const MAX_DESCENT_FPM: f64 = 1000.0;
+/// During a climb the watcher protects airspeed: if IAS bleeds below this (kt),
+/// it reduces the commanded vertical speed (pitch down) so a too-steep climb can't
+/// stall — power's already at the firewall, so climb rate is the lever to trade.
+/// ~12 kt above the 172's clean stall; normal full-power climbs sit well above it.
+const CLIMB_MIN_KTS: f64 = 60.0;
+/// How much to ease (or restore) the climb rate per check, fpm.
+const VS_TRIM_FPM: f64 = 100.0;
 /// Altitude targets above this (ft MSL) are refused — above the airframe's
 /// service ceiling it can't get there. (Per-airframe later; 172 ≈ 14,000.)
 const SERVICE_CEILING_FT: f64 = 14_000.0;
@@ -336,6 +343,10 @@ fn capture_at_altitude(
             // Wall-clock budget: even a long, slow change finishes inside 20 min; if
             // it somehow doesn't, we stop watching.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20 * 60);
+            // The commanded climb rate — the ceiling the airspeed protection won't
+            // exceed when it restores the climb after backing off.
+            let initial_vs = xp.get_float(VS_DIAL).await.unwrap_or(0.0);
+            let mut eased_for_speed = false;
             while std::time::Instant::now() < deadline {
                 // A newer command was issued — it owns the level-off now.
                 if CLIMB_WATCHER_GEN.load(Ordering::SeqCst) != my_gen {
@@ -404,11 +415,46 @@ fn capture_at_altitude(
                         }
                         return;
                     }
-                    Capture::Wait => {}
+                    Capture::Wait => {
+                        // Airspeed-protected climb: hold the fastest climb that keeps
+                        // IAS above the floor. Below it, ease the vertical speed down
+                        // (pitch down for speed); once speed's healthy again, restore
+                        // the climb toward what was commanded. Power stays firewalled.
+                        if was_climb && initial_vs > 0.0 {
+                            if let Ok(ias) = xp.get_float(crate::datarefs::AIRSPEED_KTS).await {
+                                let cur = xp.get_float(VS_DIAL).await.unwrap_or(initial_vs);
+                                if ias < CLIMB_MIN_KTS {
+                                    let new = (cur - VS_TRIM_FPM).max(0.0);
+                                    if new < cur {
+                                        let _ = xp.set_float(VS_DIAL, new).await;
+                                        if !eased_for_speed {
+                                            eased_for_speed = true;
+                                            let line = "Easing the climb to hold airspeed.".to_string();
+                                            if let Some(s) = &status {
+                                                s.alert(crate::plugin_status::AlertLevel::Caution, &line);
+                                            }
+                                            if let Some(v) = &voice {
+                                                v.alert(Priority::Caution, line);
+                                            }
+                                        }
+                                    }
+                                } else if ias > CLIMB_MIN_KTS + 8.0 && cur < initial_vs {
+                                    let new = (cur + VS_TRIM_FPM).min(initial_vs);
+                                    let _ = xp.set_float(VS_DIAL, new).await;
+                                }
+                            }
+                        }
+                    }
                 }
-                // Poll fast near the target so the tight level-off trigger isn't
-                // skipped between ticks; slow when far to keep the load light.
-                let secs = if (alt - target).abs() <= CAPTURE_APPROACH_FT { 1 } else { 3 };
+                // Poll fast near the target (tight level-off trigger) and during a
+                // climb (so airspeed protection reacts promptly); slower otherwise.
+                let secs = if (alt - target).abs() <= CAPTURE_APPROACH_FT {
+                    1
+                } else if was_climb {
+                    2
+                } else {
+                    3
+                };
                 tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
             }
         });
