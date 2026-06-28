@@ -183,39 +183,42 @@ impl Tool for SetMixture {
 /// observed peak and the peak value. Approaching from the rich side means the
 /// metric rises to the peak then falls, which is what makes the peak detectable.
 ///
-/// The lever moves in tiny direct increments on a steady tick (no per-step ramp or
-/// long settle pauses), so it looks like a hand slowly leaning it rather than
-/// hopping between detents. The metric lags the lever by ~a second in the sim, so
-/// the detected peak sits a little lean of the true peak — the caller nudges back
-/// rich to compensate.
+/// Done the way a pilot does it: glide the lever a small amount, hold and watch
+/// the gauge, repeat — slow enough that the metric actually responds and the peak
+/// is real, not a reading that's lagging the lever. Each step eases smoothly
+/// (like the throttle), then holds long enough for the metric to settle before
+/// it's sampled. The long start hold lets the rich baseline settle so it can't
+/// masquerade as the peak.
 async fn seek_metric_peak(ctx: &ToolCtx<'_>, metric: &str, drop_margin: f64) -> Result<(f64, f64)> {
-    const INCREMENT: f64 = 0.004; // per tick — tiny, for a smooth continuous creep
-    const TICK_MS: u64 = 70;
-    // Lean at least this far past the rich start before a drop can end it (clears
-    // the rich plateau and the initial lag).
-    const MIN_LEAN_BEFORE_STOP: f64 = 0.08;
-    // Sustained ticks below the peak before stopping (debounce lag/noise).
-    const CONSEC_DROPS_TO_STOP: u32 = 6;
+    const STEP: f64 = 0.02;
+    const SETTLE_MS: u64 = 900; // hold to let the metric respond before reading
+    const START_SETTLE_MS: u64 = 1500;
+    // Lean a few steps past the rich start before a drop can end it (clears the
+    // rich plateau), then require the metric to stay down to confirm the peak.
+    const MIN_STEPS_BEFORE_STOP: u32 = 3;
+    const CONSEC_DROPS_TO_STOP: u32 = 2;
 
     ramp_actuator(ctx, MIXTURE, 0.95).await?; // ease to the rich start
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await; // let it settle
+    tokio::time::sleep(std::time::Duration::from_millis(START_SETTLE_MS)).await;
 
     let mut mix = 0.95;
     let mut best_mix = mix;
     let mut best_val = engine0(ctx, metric, 0.0).await;
+    let mut steps = 0u32;
     let mut drops = 0u32;
     while mix > MIX_LEAN_FLOOR {
-        mix = (mix - INCREMENT).max(MIX_LEAN_FLOOR);
-        ctx.xplane.set_float(MIXTURE, mix).await?; // direct tiny write = smooth creep
-        tokio::time::sleep(std::time::Duration::from_millis(TICK_MS)).await;
+        mix = (mix - STEP).max(MIX_LEAN_FLOOR);
+        ramp_actuator(ctx, MIXTURE, mix).await?; // smooth glide to the next step
+        tokio::time::sleep(std::time::Duration::from_millis(SETTLE_MS)).await; // watch the gauge
         let val = engine0(ctx, metric, 0.0).await;
+        steps += 1;
         if val > best_val {
             best_val = val;
             best_mix = mix;
             drops = 0;
-        } else if best_val - val >= drop_margin && (0.95 - mix) > MIN_LEAN_BEFORE_STOP {
+        } else if best_val - val >= drop_margin {
             drops += 1;
-            if drops >= CONSEC_DROPS_TO_STOP {
+            if steps > MIN_STEPS_BEFORE_STOP && drops >= CONSEC_DROPS_TO_STOP {
                 break; // confirmed past the peak
             }
         } else {
@@ -291,18 +294,22 @@ impl Tool for LeanMixture {
                             .to_string(),
                     );
                 }
-                // Altitude-based target: the best-economy lever position leans with
-                // altitude (EGT peak tracks air density). Deterministic and reliable
-                // — a live peak-EGT seek is too fragile with the sim's EGT lag.
-                // ~0.92 near sea level down to ~0.55 up high.
-                let target = (0.92 - (alt / 1000.0) * 0.033).clamp(0.50, 0.95);
-                // Smooth eased ramp to the target, same as the throttle.
-                ramp_actuator(ctx, MIXTURE, target).await?;
+                // Lean to peak EGT, then enrich slightly so EGT sits just rich of
+                // peak — the safe side the POH calls for ("slightly below the peak
+                // observed EGT").
+                let (best, egt) = seek_metric_peak(ctx, EGT_CEL, 12.0).await?;
+                if best > 0.92 {
+                    // Never saw EGT climb — low power, or the engine isn't loaded
+                    // enough to lean. Leave it rich rather than report a bogus value.
+                    ramp_actuator(ctx, MIXTURE, 1.0).await?;
+                    return Ok("Couldn't find a clear EGT peak, leaving the mixture rich. Try leaning at cruise power.".to_string());
+                }
+                ramp_actuator(ctx, MIXTURE, (best + 0.03).min(1.0)).await?;
                 let pct = ctx.xplane.get_float(MIXTURE).await? * 100.0;
                 let gph = engine0(ctx, FUEL_FLOW_KG_S, 0.0).await * 3600.0 / AVGAS_KG_PER_GAL;
-                let egt_f = engine0(ctx, EGT_CEL, 0.0).await * 9.0 / 5.0 + 32.0; // dataref is °C
+                let egt_f = egt * 9.0 / 5.0 + 32.0; // dataref is °C
                 Ok(format!(
-                    "Leaned for cruise, mixture {pct:.0} percent, EGT {egt_f:.0} degrees, burning {gph:.1} gallons an hour."
+                    "Leaned to peak EGT, mixture {pct:.0} percent, EGT {egt_f:.0} degrees, burning {gph:.1} gallons an hour."
                 ))
             }
             _ => {
