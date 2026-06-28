@@ -23,8 +23,9 @@ const DR_HEARD: &str = "xcopilot/status/heard";
 const DR_ACTION: &str = "xcopilot/status/action";
 const DR_ALERT: &str = "xcopilot/status/alert";
 
-/// Keep text within the plugin's fixed display buffer (128 bytes, NUL-terminated).
-const TEXT_MAX: usize = 120;
+/// Keep text within the plugin's fixed display buffer (512 bytes, NUL-terminated)
+/// — long enough for a full engine/weather summary readback.
+const TEXT_MAX: usize = 500;
 
 /// One status change to mirror into the sim.
 enum Update {

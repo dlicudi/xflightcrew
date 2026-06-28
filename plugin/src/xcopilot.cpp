@@ -54,7 +54,7 @@ static int ReadPttActive(void*) { return g_ptt_active; }
 
 // ---- status datarefs --------------------------------------------------------
 
-struct TextRef { char buf[128]; int len; };
+struct TextRef { char buf[512]; int len; };
 
 static int g_phase = 0;
 static TextRef g_heard = {{0}, 0};
@@ -94,7 +94,7 @@ static int ReadText(void* ref, void* out, int offset, int max) {
 // Store the whole value (the app PATCHes at offset 0), NUL-terminated.
 static void StoreText(TextRef* t, void* in, int offset, int len) {
     if (offset != 0) return;
-    if (len > 127) len = 127;
+    if (len > 511) len = 511;
     if (len < 0) len = 0;
     std::memset(t->buf, 0, sizeof t->buf);
     std::memcpy(t->buf, in, static_cast<size_t>(len));
