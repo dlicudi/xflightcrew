@@ -75,6 +75,20 @@ fn speak_piper(config: &Config, text: &str) -> Result<()> {
     play(&wav_path)
 }
 
+/// Kill any in-progress playback (and `say`) right now — the barge-in path. Every
+/// backend ends up at `afplay` (or `say`), so terminating those stops the audio
+/// whatever the TTS engine. Best-effort: errors (nothing playing) are ignored.
+#[cfg(target_os = "macos")]
+pub fn stop_playback() {
+    let _ = Command::new("pkill").args(["-x", "afplay"]).status();
+    let _ = Command::new("pkill").args(["-x", "say"]).status();
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn stop_playback() {
+    let _ = Command::new("pkill").args(["-x", "aplay"]).status();
+}
+
 /// Play a WAV file using the platform's default CLI player. `pub(crate)` so the
 /// in-process ONNX backend ([`crate::tts_onnx`]) can reuse it.
 #[cfg(target_os = "macos")]

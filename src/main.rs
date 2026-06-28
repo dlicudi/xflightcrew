@@ -318,6 +318,17 @@ impl Ptt {
     fn dataref_active(live: &LiveState, name: &str) -> bool {
         live.get(name).unwrap_or(0.0) > 0.5
     }
+
+    /// True while PTT is held, whichever source — for the barge-in watcher.
+    fn is_pressed(&self) -> bool {
+        match self {
+            Ptt::Key(key) => {
+                use device_query::DeviceQuery;
+                device_query::DeviceState::new().get_keys().contains(key)
+            }
+            Ptt::Dataref { live, name } => Ptt::dataref_active(live, name),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -361,6 +372,32 @@ async fn run_session(
     // Recovery for recent utterances (a stack), so "belay that" can walk back the
     // last command, then the one before it, each with how to undo it.
     let mut undo_stack: Vec<UndoSnapshot> = Vec::new();
+
+    // Barge-in: a watcher thread that, while the copilot is speaking, kills the
+    // audio the instant PTT is pressed — so the pilot is never talked over and a
+    // long readback or checklist yields immediately. Readbacks and checklists block
+    // the command loop while speaking, so the interrupt can't come from it; it needs
+    // its own thread. The flag lets a running checklist see the press and stop.
+    let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(ptt) = ptt.clone() {
+        let wv = voice.clone();
+        let wi = interrupt.clone();
+        std::thread::Builder::new()
+            .name("barge-in".into())
+            .spawn(move || {
+                let mut was_pressed = false;
+                loop {
+                    let pressed = ptt.is_pressed();
+                    if pressed && !was_pressed && wv.is_speaking() {
+                        wv.shutup();
+                        wi.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    was_pressed = pressed;
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            })
+            .expect("spawn barge-in watcher");
+    }
     let mut listener = if continuous {
         // Share the speech arbiter's mic gate so the listener mutes itself while
         // the copilot speaks (readbacks and monitor alerts alike).
@@ -748,7 +785,7 @@ async fn run_session(
             // one and ignore any other calls the LLM returned in the same turn
             // (guards against chaining through several checklists at once).
             if let Some(cl) = checklists.iter().find(|c| c.id == call.name) {
-                run_checklist(cl, &xplane, &config, &mut listener, &ptt_mic, &stt, &ptt, typed.as_ref(), &voice, &reporter).await;
+                run_checklist(cl, &xplane, &config, &mut listener, &ptt_mic, &stt, &ptt, typed.as_ref(), &voice, &reporter, &interrupt).await;
                 break;
             }
 
@@ -903,10 +940,9 @@ async fn run_session(
 /// (engine start/stop, the run-up). Narration is naturally paced by the speech
 /// queue (one utterance plays before the next).
 ///
-/// Abortable: say "stop"/"abort"/"cancel" at any confirm prompt, or type it in
-/// the TUI at any point (polled between items) — it stops where it is, leaving
-/// what's already done. (Continuous-voice abort between every item isn't
-/// reliable with the half-duplex mic gate, so it's the confirm pauses + typed.)
+/// Abortable: press PTT at any point (the barge-in watcher stops it between
+/// items), say "stop"/"abort"/"cancel" at any confirm prompt, or type it in the
+/// TUI — it stops where it is, leaving what's already done.
 #[allow(clippy::too_many_arguments)]
 async fn run_checklist(
     cl: &checklist::Checklist,
@@ -919,13 +955,22 @@ async fn run_checklist(
     typed: Option<&std::sync::mpsc::Receiver<String>>,
     voice: &Voice,
     reporter: &Reporter,
+    interrupt: &std::sync::atomic::AtomicBool,
 ) {
     use checklist::Item;
+    use std::sync::atomic::Ordering;
+    // Start clean — only a press *during* this run should stop it.
+    interrupt.store(false, Ordering::Relaxed);
     say(voice, reporter, ui::LogKind::Info, &format!("Running the {} checklist.", cl.title));
     let ctx = ToolCtx { xplane, config, voice: Some(voice), status: reporter.status_sink(), reminders: None };
     let mut failed = 0usize;
     let mut aborted = false;
     for item in &cl.items {
+        // Barge-in (PTT pressed during the run) stops the checklist where it is.
+        if interrupt.swap(false, Ordering::Relaxed) {
+            aborted = true;
+            break;
+        }
         // Typed abort (TUI): drain anything queued since the last item.
         if let Some(rx) = typed {
             while let Ok(msg) = rx.try_recv() {

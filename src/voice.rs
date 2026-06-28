@@ -139,6 +139,31 @@ impl Voice {
         self.gate.clone()
     }
 
+    /// True while the copilot is speaking — the barge-in watcher only interrupts
+    /// when there's actually audio to cut.
+    pub fn is_speaking(&self) -> bool {
+        self.gate.is_speaking()
+    }
+
+    /// Barge-in: stop talking *now*. Drop everything queued (unblocking any caller
+    /// waiting on a blocking `say`) and kill the audio currently playing. Used when
+    /// the pilot keys PTT or interrupts — the copilot must yield, not talk over them.
+    pub fn shutup(&self) {
+        {
+            let mut q = self.inner.queue.lock().unwrap();
+            for utt in q.heap.drain() {
+                if let Some(latch) = utt.done {
+                    *latch.spoken.lock().unwrap() = true;
+                    latch.cv.notify_all();
+                }
+            }
+        }
+        // The in-flight utterance (already popped by the speaker) ends when its
+        // audio is killed: speak() returns and the speaker signals its latch.
+        crate::tts::stop_playback();
+        self.gate.set_speaking(false);
+    }
+
     /// True if `heard` closely matches something the copilot said in the last few
     /// seconds — i.e. its own readback bleeding back through the speakers. The
     /// command loop drops such transcripts instead of acting on them.
