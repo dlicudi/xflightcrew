@@ -500,10 +500,17 @@ async fn run_session(
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
+            // "wake me / remind me / let me know / tell me when ..." is a reminder to
+            // arm, not a status query to answer now. Let it fall through to the tool
+            // layer so it doesn't get hijacked by the nav-progress branch below (both
+            // mention "next waypoint").
+            let is_reminder = tl.contains("wake") || tl.contains("remind") || tl.contains("notify")
+                || tl.contains("let me know") || tl.contains("tell me when") || tl.contains("heads up");
             // Navigation progress (often a command, not a question): ETA / distance /
             // time to the next waypoint.
-            if tl.contains("next waypoint") || tl.contains("next fix") || tl.contains("eta")
-                || tl.contains("how far") || tl.contains("time to") || tl.contains("distance to")
+            if !is_reminder
+                && (tl.contains("next waypoint") || tl.contains("next fix") || tl.contains("eta")
+                    || tl.contains("how far") || tl.contains("time to") || tl.contains("distance to"))
             {
                 let line = nav_progress(&xplane, Some(&live)).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
