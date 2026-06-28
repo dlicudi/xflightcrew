@@ -500,10 +500,13 @@ async fn run_session(
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
+            // "route" is reliably misheard as "root"/"road" (both meaningless in a
+            // cockpit), so accept them as synonyms.
+            let routeish = tl.contains("route") || tl.contains("root") || tl.contains("road");
             // Load the SimBrief route into the GPS/FMS (checked before the brief, so
             // "load the flight plan" loads rather than just reading it back).
             let wants_load = (tl.contains("load") || tl.contains("program") || tl.contains("send"))
-                && (tl.contains("route") || tl.contains("plan") || tl.contains("gps") || tl.contains("fms") || tl.contains("flight"));
+                && (routeish || tl.contains("plan") || tl.contains("gps") || tl.contains("fms") || tl.contains("flight"));
             if wants_load {
                 reporter.status(ui::Phase::Thinking);
                 let refresh = tl.contains("refresh") || tl.contains("reload") || tl.contains("update");
@@ -514,11 +517,11 @@ async fn run_session(
             // SimBrief flight plan (cached fetch) + advice. Route, full brief, or refresh.
             let is_plan = tl.contains("flight plan") || tl.contains("simbrief") || tl.contains("fetch the plan")
                 || tl.contains("where are we going") || tl.contains("where are we headed")
-                || tl.contains("our route") || tl.contains("the route") || tl.contains("flight route");
+                || (routeish && (tl.contains("our") || tl.contains("the") || tl.contains("what")));
             if is_plan {
                 reporter.status(ui::Phase::Thinking);
                 let refresh = tl.contains("refresh") || tl.contains("reload") || tl.contains("update");
-                let want_route = tl.contains("route");
+                let want_route = routeish;
                 let line = flight_plan_report(&config, &xplane, &mut fp_cache, refresh, want_route).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
