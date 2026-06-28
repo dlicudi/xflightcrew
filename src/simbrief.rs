@@ -40,6 +40,7 @@ pub struct FlightPlan {
 }
 
 /// A route waypoint for the FMS: an ident plus position and planned altitude.
+#[derive(Clone)]
 pub struct Waypoint {
     pub ident: String,
     pub lat: f64,

@@ -506,6 +506,19 @@ async fn run_session(
             // mention "next waypoint").
             let is_reminder = tl.contains("wake") || tl.contains("remind") || tl.contains("notify")
                 || tl.contains("let me know") || tl.contains("tell me when") || tl.contains("heads up");
+            // ETA to the destination ("time before we land", "when do we get in"):
+            // distance to the destination airport over groundspeed. Needs a destination
+            // cue plus a time cue, so it beats the next-waypoint branch below.
+            if !is_reminder
+                && (tl.contains("land") || tl.contains("destination") || tl.contains("arrive")
+                    || tl.contains("arrival") || tl.contains("get there") || tl.contains("get in"))
+                && (tl.contains("time") || tl.contains("eta") || tl.contains("when")
+                    || tl.contains("how long") || tl.contains("estimat"))
+            {
+                let line = eta_to_destination(&config, &xplane, &mut fp_cache).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
             // Navigation progress (often a command, not a question): ETA / distance /
             // time to the next waypoint.
             if !is_reminder
@@ -1163,6 +1176,56 @@ async fn nav_progress(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
     format!("{}.", s.trim_end_matches([',', ' ']))
 }
 
+/// Great-circle distance in nautical miles between two lat/lon points (haversine).
+fn haversine_nm(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS_NM: f64 = 3440.065;
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_NM * a.sqrt().asin()
+}
+
+/// Estimated time to the destination ("time before we land", "when do we get in"):
+/// great-circle distance from our position to the destination airport over current
+/// groundspeed. Needs the SimBrief plan (for the destination coordinates) and us
+/// actually moving — a straight-line estimate, not the routed distance.
+async fn eta_to_destination(
+    config: &Config,
+    xp: &XPlaneClient,
+    cache: &mut Option<(Instant, simbrief::FlightPlan)>,
+) -> String {
+    if let Err(msg) = ensure_plan(config, cache, false).await {
+        return msg;
+    }
+    let Some((_, fp)) = cache.as_ref() else {
+        return "Couldn't fetch your SimBrief plan.".to_string();
+    };
+    let Some(dest) = fp.waypoints.last().cloned() else {
+        return "No destination in the plan.".to_string();
+    };
+    let dest_name = if fp.destination.is_empty() { dest.ident.clone() } else { fp.destination.clone() };
+    let (lat, lon, gs_ms) = match (
+        xp.get_float("sim/flightmodel/position/latitude").await,
+        xp.get_float("sim/flightmodel/position/longitude").await,
+        xp.get_float("sim/flightmodel/position/groundspeed").await,
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => return "I can't read our position right now.".to_string(),
+    };
+    let dist = haversine_nm(lat, lon, dest.lat, dest.lon);
+    let gs_kts = gs_ms * MS_TO_KTS;
+    if gs_kts < 30.0 {
+        return format!(
+            "{dest_name} is {dist:.0} miles out. I'll have a time once we're up and moving."
+        );
+    }
+    let mins = (dist / gs_kts * 60.0).round() as i64;
+    let (h, m) = (mins / 60, mins % 60);
+    let eta = if h > 0 { format!("{h} hours {m} minutes") } else { format!("{m} minutes") };
+    format!("About {eta} to {dest_name}, {dist:.0} miles out at {gs_kts:.0} knots.")
+}
+
 /// First element of a per-engine array dataref (engine 1), or `None` on a failed
 /// read. Engine indicators are arrays, so they bypass the scalar `read1`/cache.
 async fn read_engine0(xp: &XPlaneClient, name: &str) -> Option<f64> {
@@ -1803,6 +1866,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "navigate", "follow", "track",
     // navigation progress queries
     "waypoint", "eta",
+    // ETA to the destination ("time before we land", "when do we arrive")
+    "land", "destination", "arrive", "arrival",
     // reminders ("wake me at top of descent", "remind me in 10 minutes")
     "wake", "remind", "notify", "heads-up",
 ];
