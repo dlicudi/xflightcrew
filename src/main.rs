@@ -354,6 +354,8 @@ async fn run_session(
     // used to re-anchor a bare-value follow-up ("sixty percent" → "throttle
     // sixty percent") into an explicit command.
     let mut last_subject: Option<String> = None;
+    // Cached SimBrief plan (it doesn't change mid-flight); re-fetched on TTL or "refresh".
+    let mut fp_cache: Option<(Instant, simbrief::FlightPlan)> = None;
     let mut listener = if continuous {
         // Share the speech arbiter's mic gate so the listener mutes itself while
         // the copilot speaks (readbacks and monitor alerts alike).
@@ -498,12 +500,15 @@ async fn run_session(
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
-            // SimBrief flight plan (online fetch) + fuel check.
-            if tl.contains("flight plan") || tl.contains("simbrief") || tl.contains("fetch the plan")
+            // SimBrief flight plan (cached fetch) + advice. Route, full brief, or refresh.
+            let is_plan = tl.contains("flight plan") || tl.contains("simbrief") || tl.contains("fetch the plan")
                 || tl.contains("where are we going") || tl.contains("where are we headed")
-            {
+                || tl.contains("our route") || tl.contains("the route") || tl.contains("flight route");
+            if is_plan {
                 reporter.status(ui::Phase::Thinking);
-                let line = flight_plan_report(&config, &xplane).await;
+                let refresh = tl.contains("refresh") || tl.contains("reload") || tl.contains("update");
+                let want_route = tl.contains("route");
+                let line = flight_plan_report(&config, &xplane, &mut fp_cache, refresh, want_route).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
@@ -1140,20 +1145,66 @@ async fn systems_check(xp: &XPlaneClient) -> String {
     }
 }
 
-/// Fetch the SimBrief flight plan and brief it, with a fuel check against what's
-/// actually on board. Deterministic (no LLM); the one network call beyond X-Plane.
-async fn flight_plan_report(config: &Config, xp: &XPlaneClient) -> String {
+/// How long a fetched SimBrief plan is reused before re-fetching (it doesn't
+/// change mid-flight). "refresh"/"reload" forces a re-fetch.
+const FLIGHT_PLAN_TTL: Duration = Duration::from_secs(600);
+
+/// Fetch (or reuse) the SimBrief flight plan and brief it. Deterministic (no LLM);
+/// the one network call beyond X-Plane. `want_route` reads back the airway route;
+/// otherwise it's a full brief: route summary, climb-to-cruise, top of descent,
+/// and a fuel check against what's actually on board.
+async fn flight_plan_report(
+    config: &Config,
+    xp: &XPlaneClient,
+    cache: &mut Option<(Instant, simbrief::FlightPlan)>,
+    refresh: bool,
+    want_route: bool,
+) -> String {
     if config.simbrief_id.trim().is_empty() {
         return "No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can pull your flight plan.".to_string();
     }
-    let fp = match simbrief::fetch(&config.simbrief_id).await {
-        Ok(fp) => fp,
-        Err(e) => {
-            tracing::warn!("simbrief fetch failed: {e:#}");
-            return "Couldn't fetch your SimBrief plan. Generate one first, or check the ID.".to_string();
+    // Reuse a cached plan unless it's stale or a refresh was asked for; on a failed
+    // re-fetch, fall back to the cached one rather than losing it.
+    let fresh = cache.as_ref().is_some_and(|(t, _)| t.elapsed() < FLIGHT_PLAN_TTL);
+    if refresh || !fresh {
+        match simbrief::fetch(&config.simbrief_id).await {
+            Ok(fp) => *cache = Some((Instant::now(), fp)),
+            Err(e) => {
+                tracing::warn!("simbrief fetch failed: {e:#}");
+                if cache.is_none() {
+                    return "Couldn't fetch your SimBrief plan. Generate one first, or check the ID.".to_string();
+                }
+            }
         }
+    }
+    let Some((_, fp)) = cache.as_ref() else {
+        return "Couldn't fetch your SimBrief plan.".to_string();
     };
+
+    if want_route {
+        return if fp.route.is_empty() {
+            "No route in the plan.".to_string()
+        } else {
+            format!("Route, {} {} {}.", fp.origin, fp.route, fp.destination)
+        };
+    }
+
     let mut line = fp.summary();
+    // Where we are vs planned cruise.
+    if let Ok(alt) = xp.get_float(datarefs::ALTITUDE_FT).await {
+        let diff = fp.cruise_alt_ft - alt;
+        if diff > 300.0 {
+            line.push_str(&format!(" You're at {alt:.0}, {diff:.0} to climb to cruise."));
+        } else if diff < -300.0 {
+            line.push_str(&format!(" You're at {alt:.0}, above planned cruise."));
+        } else {
+            line.push_str(" At planned cruise.");
+        }
+    }
+    // Top of descent.
+    if fp.tod_to_dest_nm > 0.5 {
+        line.push_str(&format!(" Top of descent about {:.0} miles before {}.", fp.tod_to_dest_nm, fp.destination));
+    }
     // Fuel check: planned block vs what's in the tanks (read in kg, report gallons).
     if let Ok(kg) = xp.get_float(datarefs::FUEL_TOTAL_KG).await {
         let aboard = kg / AVGAS_KG_PER_GAL;
@@ -1161,7 +1212,7 @@ async fn flight_plan_report(config: &Config, xp: &XPlaneClient) -> String {
             line.push_str(&format!(" You have {aboard:.0} gallons aboard, enough for the plan."));
         } else {
             line.push_str(&format!(
-                " You have {aboard:.0} gallons aboard, but the plan needs {:.0}; short about {:.0}.",
+                " You have {aboard:.0} aboard, but the plan needs {:.0}; short about {:.0}.",
                 fp.block_fuel_gal,
                 fp.block_fuel_gal - aboard
             ));
@@ -1631,7 +1682,7 @@ const COMMAND_KEYWORDS: &[&str] = &[
     // aircraft-info queries
     "aircraft", "plane", "cessna", "skyhawk",
     // SimBrief flight plan
-    "simbrief", "flightplan", "plan",
+    "simbrief", "flightplan", "plan", "route",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,

@@ -28,6 +28,13 @@ pub struct FlightPlan {
     pub block_fuel_gal: f64, // plan_ramp (total fuel loaded)
     pub trip_fuel_gal: f64,  // enroute burn
     pub reserve_gal: f64,
+    pub route: String,
+    /// Average wind component, knots: negative = headwind, positive = tailwind.
+    pub wind_comp_kts: f64,
+    pub wind_dir: f64,
+    pub wind_spd_kts: f64,
+    /// Distance from top-of-descent to destination, nm (0 if not in the navlog).
+    pub tod_to_dest_nm: f64,
 }
 
 /// Fetch and parse the user's latest SimBrief OFP. `Err` if the id is empty, the
@@ -75,6 +82,11 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
         block_fuel_gal: to_gal(n("/fuel/plan_ramp")),
         trip_fuel_gal: to_gal(n("/fuel/enroute_burn")),
         reserve_gal: to_gal(n("/fuel/reserve")),
+        route: s("/general/route"),
+        wind_comp_kts: n("/general/avg_wind_comp"),
+        wind_dir: n("/general/avg_wind_dir"),
+        wind_spd_kts: n("/general/avg_wind_spd"),
+        tod_to_dest_nm: navlog_tod_to_dest(&v),
     })
 }
 
@@ -90,12 +102,45 @@ impl FlightPlan {
         };
         let acft = if self.aircraft.is_empty() { String::new() } else { format!("{}, ", self.aircraft) };
         format!(
-            "Flight plan: {}{} to {}{}. Cruise {:.0} feet, {:.0} nautical miles, about {} hours {} minutes enroute. \
+            "Flight plan: {}{} to {}{}. Cruise {:.0} feet, {:.0} nautical miles, about {} hours {} minutes enroute{}. \
              Block fuel {:.0} gallons, {:.0} for the trip, {:.0} reserve.",
             acft, self.origin, self.destination, altn, self.cruise_alt_ft, self.distance_nm,
-            h, m, self.block_fuel_gal, self.trip_fuel_gal, self.reserve_gal,
+            h, m, self.wind_phrase(), self.block_fuel_gal, self.trip_fuel_gal, self.reserve_gal,
         )
     }
+
+    /// ", wind 184 at 13, 10 knot headwind" / "" when calm.
+    pub fn wind_phrase(&self) -> String {
+        if self.wind_spd_kts < 1.0 {
+            return String::new();
+        }
+        let comp = if self.wind_comp_kts <= -3.0 {
+            format!(", {:.0} knot headwind", self.wind_comp_kts.abs())
+        } else if self.wind_comp_kts >= 3.0 {
+            format!(", {:.0} knot tailwind", self.wind_comp_kts)
+        } else {
+            String::new()
+        };
+        format!(", wind {:03.0} at {:.0}{}", self.wind_dir, self.wind_spd_kts, comp)
+    }
+}
+
+/// Distance (nm) from the top-of-descent fix to the destination: the sum of the
+/// leg distances *after* the TOD fix in the navlog. 0 if there's no TOD fix.
+fn navlog_tod_to_dest(v: &Value) -> f64 {
+    let Some(fixes) = v.pointer("/navlog/fix").and_then(Value::as_array) else {
+        return 0.0;
+    };
+    let mut after_tod = false;
+    let mut sum = 0.0;
+    for f in fixes {
+        if after_tod {
+            sum += f.get("distance").and_then(num_of).unwrap_or(0.0);
+        } else if f.get("ident").and_then(Value::as_str) == Some("TOD") {
+            after_tod = true;
+        }
+    }
+    sum
 }
 
 /// A JSON value as `f64`, whether a number or a numeric string (SimBrief sends
