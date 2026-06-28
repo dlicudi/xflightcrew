@@ -149,7 +149,36 @@ pub fn fix_mishears(text: &str) -> String {
     // splits into tokens too far from "gyro" for the fuzzy gate to recover.
     let mut out = replace_ci(text, "j-rule", "gyro");
     out = replace_ci(&out, "j rule", "gyro");
+    // "throttle" is reliably heard as "total" when it leads a value-set
+    // ("total twenty percent" → "throttle ..."). Whisper drops the "thr-".
+    out = fix_total_throttle(&out);
     out
+}
+
+/// Rewrite a leading "total" to "throttle" when a throttle value follows — a
+/// number, percent, or full/idle/max. Guarded to a leading "total" + value so a
+/// genuine "total" ("total fuel", "what's the total") is never touched.
+fn fix_total_throttle(text: &str) -> String {
+    let trimmed = text.trim_start();
+    let starts_total = trimmed.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("total"))
+        && trimmed[5..].chars().next().is_none_or(|c| c.is_whitespace());
+    if !starts_total {
+        return text.to_string();
+    }
+    let low = trimmed.to_ascii_lowercase();
+    let has_value = low.contains("percent")
+        || low.contains('%')
+        || low.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| {
+            !w.is_empty()
+                && (is_number_word(w)
+                    || w.bytes().all(|b| b.is_ascii_digit())
+                    || matches!(w, "full" | "idle" | "max" | "maximum"))
+        });
+    if !has_value {
+        return text.to_string();
+    }
+    let lead = &text[..text.len() - trimmed.len()];
+    format!("{lead}throttle{}", &trimmed[5..])
 }
 
 /// Join intra-word hyphens whisper inserts into compounds ("auto-pilot" →
@@ -199,6 +228,18 @@ mod tests {
         assert_eq!(fix_mishears("you think the j rule?"), "you think the gyro?");
         // Unrelated text is untouched.
         assert_eq!(fix_mishears("align the gyro"), "align the gyro");
+    }
+
+    #[test]
+    fn fixes_total_throttle_mishear() {
+        // "throttle" → "total" before a value is recovered.
+        assert_eq!(fix_mishears("Total twenty percent."), "throttle twenty percent.");
+        assert_eq!(fix_mishears("total 40"), "throttle 40");
+        assert_eq!(fix_mishears("total full"), "throttle full");
+        // A genuine "total" (no throttle value) is left alone.
+        assert_eq!(fix_mishears("what's our total fuel"), "what's our total fuel");
+        assert_eq!(fix_mishears("total fuel"), "total fuel");
+        assert_eq!(fix_mishears("totally fine"), "totally fine");
         assert_eq!(fix_mishears("flaps ten"), "flaps ten");
     }
 
