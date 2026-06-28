@@ -31,6 +31,10 @@ pub struct AircraftProfile {
     /// `None` means no overspeed caution.
     #[serde(default)]
     pub vne_kts: Option<f64>,
+    /// Static reference figures (V-speeds, weights, limits) the copilot recites
+    /// when asked. Per-airframe, from the POH/POM. `None` = no reference answers.
+    #[serde(default)]
+    pub reference: Option<ReferenceProfile>,
     /// Path to an XChecklist file to interpret (relative to the working dir).
     /// `None` means no checklists for this airframe. The file is read-only input;
     /// the copilot interprets it (see [`crate::checklist`]).
@@ -177,6 +181,39 @@ pub struct FlapDetent {
     pub vfe_kts: Option<f64>,
 }
 
+/// Static reference figures recited on request (V-speeds, weights, limits), from
+/// the airframe's POH/POM. Every field is optional so a profile fills in only what
+/// it knows; a missing figure is simply not offered. Vne and clean-stall live at
+/// the top level (the monitor uses them) and aren't duplicated here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReferenceProfile {
+    #[serde(default)] pub vno_kts: Option<f64>,            // max structural cruise
+    #[serde(default)] pub va_kts: Option<f64>,             // maneuvering
+    #[serde(default)] pub vx_kts: Option<f64>,             // best angle of climb
+    #[serde(default)] pub vy_kts: Option<f64>,             // best rate of climb
+    #[serde(default)] pub vr_kts: Option<f64>,             // rotate
+    #[serde(default)] pub best_glide_kts: Option<f64>,
+    #[serde(default)] pub vs0_kts: Option<f64>,            // stall, full flaps
+    #[serde(default)] pub approach_kts: Option<f64>,
+    #[serde(default)] pub max_crosswind_kts: Option<f64>,  // demonstrated
+    #[serde(default)] pub cruise_kts: Option<f64>,
+    #[serde(default)] pub best_climb_fpm: Option<f64>,
+    #[serde(default)] pub max_gross_lb: Option<f64>,
+    #[serde(default)] pub empty_weight_lb: Option<f64>,
+    #[serde(default)] pub useful_load_lb: Option<f64>,
+    #[serde(default)] pub service_ceiling_ft: Option<f64>,
+    #[serde(default)] pub fuel_capacity_gal: Option<f64>,
+    #[serde(default)] pub fuel_useable_gal: Option<f64>,
+    #[serde(default)] pub endurance_hours: Option<f64>,
+    #[serde(default)] pub takeoff_distance_ft: Option<f64>,
+    #[serde(default)] pub landing_distance_ft: Option<f64>,
+    #[serde(default)] pub max_rpm: Option<f64>,
+    #[serde(default)] pub oil_temp_min_f: Option<f64>,
+    #[serde(default)] pub oil_temp_max_f: Option<f64>,
+    #[serde(default)] pub oil_press_min_psi: Option<f64>,
+    #[serde(default)] pub oil_press_max_psi: Option<f64>,
+}
+
 /// One switchable light.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightProfile {
@@ -301,6 +338,12 @@ mod tests {
         let fuel = p.fuel.expect("has fuel thresholds");
         assert_eq!(fuel.reserve_caution_min, 45.0);
         assert_eq!(fuel.reserve_warning_min, 30.0);
+        // Reference figures load from YAML (and match the built-in), so the
+        // copilot can recite V-speeds/limits without hardcoded literals.
+        let r = p.reference.as_ref().expect("has reference figures");
+        assert_eq!(r.best_glide_kts, Some(68.0));
+        assert_eq!(r.va_kts, Some(99.0));
+        assert_eq!(r.vx_kts, cessna_172sp().reference.unwrap().vx_kts);
         // The checklist action map loads, and the YAML matches the built-in (same
         // matches, in the same order) — so behaviour is identical either source.
         let yaml_map = &p.checklist_map;
@@ -495,6 +538,34 @@ fn cessna_172sp() -> AircraftProfile {
         vs_clean_kts: Some(48.0),
         // 172SP Vne (never-exceed) 163 KIAS.
         vne_kts: Some(163.0),
+        // Reference figures from the X-Plane C172 Pilot's Operating Manual.
+        reference: Some(ReferenceProfile {
+            vno_kts: Some(129.0),
+            va_kts: Some(99.0),
+            vx_kts: Some(62.0),
+            vy_kts: Some(74.0),
+            vr_kts: Some(55.0),
+            best_glide_kts: Some(68.0),
+            vs0_kts: Some(40.0),
+            approach_kts: Some(65.0),
+            max_crosswind_kts: Some(15.0),
+            cruise_kts: Some(124.0),
+            best_climb_fpm: Some(730.0),
+            max_gross_lb: Some(2558.0),
+            empty_weight_lb: Some(1640.0),
+            useful_load_lb: Some(918.0),
+            service_ceiling_ft: Some(14000.0),
+            fuel_capacity_gal: Some(56.0),
+            fuel_useable_gal: Some(53.0),
+            endurance_hours: Some(4.0),
+            takeoff_distance_ft: Some(1630.0),
+            landing_distance_ft: Some(1335.0),
+            max_rpm: Some(2700.0),
+            oil_temp_min_f: Some(100.0),
+            oil_temp_max_f: Some(245.0),
+            oil_press_min_psi: Some(50.0),
+            oil_press_max_psi: Some(90.0),
+        }),
         checklist: Some("checklists/cessna_172sp.txt".into()),
         checklist_map: {
             let m = |s: &str, a: ChecklistAction| ChecklistMapEntry { match_: s.into(), action: a };
@@ -659,6 +730,9 @@ fn cirrus_sr22() -> AircraftProfile {
         vs_clean_kts: Some(76.0),
         // SR22 Vne (never-exceed) 205 KIAS.
         vne_kts: Some(205.0),
+        // No reference card yet for the SR22 (no manual on hand) — reference
+        // queries fall back to the LLM until one is filled in.
+        reference: None,
         checklist: Some("checklists/cirrus_sr22.txt".into()),
         // Lights — datarefs verified against the rustdecks SR22 deck; universal
         // on/off commands.

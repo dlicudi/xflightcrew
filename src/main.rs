@@ -626,7 +626,7 @@ async fn run_session(
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
-            if let Some(line) = reference_limits(&tl) {
+            if let Some(line) = reference_limits(&profile, &tl) {
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
@@ -1663,98 +1663,219 @@ fn aircraft_info(profile: &aircraft::AircraftProfile, t: &str) -> Option<String>
         || ((t.contains("tell me about") || t.contains("describe") || t.contains("about the"))
             && (t.contains("aircraft") || t.contains("plane") || t.contains("cessna")
                 || t.contains("172") || t.contains("skyhawk")));
-    asks.then(|| {
-        format!(
-            "We're in the {}, a single-engine four-seat aircraft. Cruise about 124 knots, \
-             Vne 163, service ceiling 14,000 feet, 53 gallons useable for roughly 4 hours.",
-            profile.display_name
-        )
-    })
+    if !asks {
+        return None;
+    }
+    let mut line = format!("We're in the {}, a single-engine aircraft.", profile.display_name);
+    let r = profile.reference.as_ref();
+    if let Some(v) = r.and_then(|r| r.cruise_kts) {
+        line.push_str(&format!(" Cruise about {v:.0} knots."));
+    }
+    if let Some(v) = profile.vne_kts {
+        line.push_str(&format!(" Vne {v:.0}."));
+    }
+    if let Some(v) = r.and_then(|r| r.service_ceiling_ft) {
+        line.push_str(&format!(" Service ceiling {} feet.", with_commas(v)));
+    }
+    if let (Some(g), Some(h)) = (
+        r.and_then(|r| r.fuel_useable_gal),
+        r.and_then(|r| r.endurance_hours),
+    ) {
+        line.push_str(&format!(" {g:.0} gallons useable for roughly {h:.0} hours.", ));
+    }
+    Some(line)
 }
 
-/// Static 172 reference limits (V-speeds, weights, ceiling), answered as a spoken
-/// query — what the old "performance limits" checklist recited, now a question you
-/// can ask. (172-specific literals; move to the aircraft profile if a second
-/// airframe is added.) `None` if the utterance asks about none of them.
-fn reference_limits(t: &str) -> Option<String> {
+/// Static reference figures (V-speeds, weights, limits) answered as a spoken query
+/// — the old "performance limits" checklist, now a question. Every figure comes
+/// from the airframe profile ([`aircraft::ReferenceProfile`]), so it's per-aircraft
+/// and not hardcoded. `None` if the profile has no figures or the utterance asks
+/// about none of them.
+fn reference_limits(profile: &aircraft::AircraftProfile, t: &str) -> Option<String> {
+    let r = profile.reference.as_ref();
     let mut parts: Vec<String> = Vec::new();
+    let kt = |v: f64| format!("{v:.0} knots");
+
     if t.contains("vne") || t.contains("never exceed") {
-        parts.push("Vne 163 knots".into());
+        if let Some(v) = profile.vne_kts {
+            parts.push(format!("Vne {}", kt(v)));
+        }
     }
     if t.contains("vno") || t.contains("max cruise") || t.contains("structural cruise") {
-        parts.push("Vno 129 knots".into());
+        if let Some(v) = r.and_then(|r| r.vno_kts) {
+            parts.push(format!("Vno {}", kt(v)));
+        }
     }
     if t.contains("maneuver") {
-        parts.push("Va, maneuvering speed, 99 knots".into());
+        if let Some(v) = r.and_then(|r| r.va_kts) {
+            parts.push(format!("Va, maneuvering speed, {}", kt(v)));
+        }
     }
     if t.contains("vfe") || t.contains("flap speed") || t.contains("flaps speed") || t.contains("flap limit") {
-        parts.push("Vfe 110 knots at 10 degrees, 85 at 20 or full".into());
+        if let Some(p) = vfe_phrase(profile) {
+            parts.push(p);
+        }
     }
     if t.contains("stall") {
-        parts.push("stall 48 knots clean, 40 with full flaps".into());
+        match (profile.vs_clean_kts, r.and_then(|r| r.vs0_kts)) {
+            (Some(c), Some(f)) => parts.push(format!("stall {c:.0} knots clean, {f:.0} with full flaps")),
+            (Some(c), None) => parts.push(format!("stall {c:.0} knots clean")),
+            (None, Some(f)) => parts.push(format!("stall {f:.0} knots with full flaps")),
+            (None, None) => {}
+        }
     }
-    // Takeoff / climb / approach speeds, from the X-Plane C172 POM.
     if t.contains("vx") || t.contains("best angle") {
-        parts.push("Vx, best angle of climb, 62 knots".into());
+        if let Some(v) = r.and_then(|r| r.vx_kts) {
+            parts.push(format!("Vx, best angle of climb, {}", kt(v)));
+        }
     }
     if t.contains("vy") || t.contains("best rate") || t.contains("best climb") {
-        parts.push("Vy, best rate of climb, 74 knots".into());
+        if let Some(v) = r.and_then(|r| r.vy_kts) {
+            parts.push(format!("Vy, best rate of climb, {}", kt(v)));
+        }
     }
     if t.contains("rotat") || t.contains("liftoff") || t.contains("lift off") || t.contains("takeoff speed") {
-        parts.push("rotate at 55 knots".into());
+        if let Some(v) = r.and_then(|r| r.vr_kts) {
+            parts.push(format!("rotate at {}", kt(v)));
+        }
     }
     if t.contains("glide") {
-        parts.push("best glide 68 knots".into());
+        if let Some(v) = r.and_then(|r| r.best_glide_kts) {
+            parts.push(format!("best glide {}", kt(v)));
+        }
     }
     if t.contains("approach") || t.contains("landing speed") || t.contains("final approach") {
-        parts.push("approach around 65 knots, 70 flaps up".into());
+        if let Some(v) = r.and_then(|r| r.approach_kts) {
+            parts.push(format!("approach around {}", kt(v)));
+        }
     }
     if t.contains("crosswind") {
-        parts.push("max demonstrated crosswind 15 knots".into());
+        if let Some(v) = r.and_then(|r| r.max_crosswind_kts) {
+            parts.push(format!("max demonstrated crosswind {}", kt(v)));
+        }
     }
     if t.contains("rate of climb") || t.contains("climb rate") {
-        parts.push("best rate of climb about 730 feet per minute".into());
+        if let Some(v) = r.and_then(|r| r.best_climb_fpm) {
+            parts.push(format!("best rate of climb about {v:.0} feet per minute"));
+        }
     }
     if t.contains("gross weight") || t.contains("max weight") || t.contains("max gross") {
-        parts.push("max gross weight 2,558 pounds".into());
+        if let Some(v) = r.and_then(|r| r.max_gross_lb) {
+            parts.push(format!("max gross weight {} pounds", with_commas(v)));
+        }
     }
     if t.contains("useful load") {
-        parts.push("useful load 918 pounds".into());
+        if let Some(v) = r.and_then(|r| r.useful_load_lb) {
+            parts.push(format!("useful load {} pounds", with_commas(v)));
+        }
     }
     if t.contains("empty weight") {
-        parts.push("empty weight 1,640 pounds".into());
+        if let Some(v) = r.and_then(|r| r.empty_weight_lb) {
+            parts.push(format!("empty weight {} pounds", with_commas(v)));
+        }
     }
     if t.contains("service ceiling") || t.contains("max altitude") {
-        parts.push("service ceiling 14,000 feet".into());
+        if let Some(v) = r.and_then(|r| r.service_ceiling_ft) {
+            parts.push(format!("service ceiling {} feet", with_commas(v)));
+        }
     }
     if t.contains("fuel capacity") || t.contains("tank capacity") {
-        parts.push("fuel capacity 56 gallons, 53 useable".into());
+        match (r.and_then(|r| r.fuel_capacity_gal), r.and_then(|r| r.fuel_useable_gal)) {
+            (Some(c), Some(u)) => parts.push(format!("fuel capacity {c:.0} gallons, {u:.0} useable")),
+            (Some(c), None) => parts.push(format!("fuel capacity {c:.0} gallons")),
+            _ => {}
+        }
     }
     if t.contains("takeoff distance") || t.contains("takeoff roll") {
-        parts.push("takeoff distance about 1,630 feet".into());
+        if let Some(v) = r.and_then(|r| r.takeoff_distance_ft) {
+            parts.push(format!("takeoff distance about {} feet", with_commas(v)));
+        }
     }
     if t.contains("landing distance") || t.contains("landing roll") {
-        parts.push("landing distance about 1,335 feet".into());
+        if let Some(v) = r.and_then(|r| r.landing_distance_ft) {
+            parts.push(format!("landing distance about {} feet", with_commas(v)));
+        }
     }
     if t.contains("oil") && (t.contains("limit") || t.contains("range") || t.contains("normal")) {
-        parts.push("oil temperature normal 100 to 245 Fahrenheit, oil pressure 50 to 90 PSI".into());
+        if let (Some(tmin), Some(tmax), Some(pmin), Some(pmax)) = (
+            r.and_then(|r| r.oil_temp_min_f),
+            r.and_then(|r| r.oil_temp_max_f),
+            r.and_then(|r| r.oil_press_min_psi),
+            r.and_then(|r| r.oil_press_max_psi),
+        ) {
+            parts.push(format!(
+                "oil temperature normal {tmin:.0} to {tmax:.0} Fahrenheit, oil pressure {pmin:.0} to {pmax:.0} PSI"
+            ));
+        }
     }
     if t.contains("redline") || t.contains("max rpm") || t.contains("maximum rpm") || t.contains("red line") {
-        parts.push("maximum RPM 2,700".into());
+        if let Some(v) = r.and_then(|r| r.max_rpm) {
+            parts.push(format!("maximum RPM {}", with_commas(v)));
+        }
     }
     // A general "performance limits" / "V-speeds" ask gets the key summary.
     if parts.is_empty()
         && (t.contains("performance limit") || t.contains("v speed") || t.contains("v-speed")
             || (t.contains("limits") && t.contains("performance")))
     {
-        parts.push(
-            "Vne 163, Vno 129, Va 99, Vfe 110 then 85, stall 48 clean. \
-             Vx 62, Vy 74, rotate 55, best glide 68. \
-             Max gross 2,558 pounds, service ceiling 14,000 feet"
-                .into(),
-        );
+        let mut s: Vec<String> = Vec::new();
+        if let Some(v) = profile.vne_kts { s.push(format!("Vne {v:.0}")); }
+        if let Some(v) = r.and_then(|r| r.vno_kts) { s.push(format!("Vno {v:.0}")); }
+        if let Some(v) = r.and_then(|r| r.va_kts) { s.push(format!("Va {v:.0}")); }
+        if let Some(v) = r.and_then(|r| r.vy_kts) { s.push(format!("Vy {v:.0}")); }
+        if let Some(v) = r.and_then(|r| r.best_glide_kts) { s.push(format!("best glide {v:.0}")); }
+        if let Some(v) = profile.vs_clean_kts { s.push(format!("stall {v:.0} clean")); }
+        if let Some(v) = r.and_then(|r| r.max_gross_lb) { s.push(format!("max gross {} pounds", with_commas(v))); }
+        if let Some(v) = r.and_then(|r| r.service_ceiling_ft) { s.push(format!("service ceiling {} feet", with_commas(v))); }
+        if !s.is_empty() {
+            parts.push(s.join(", "));
+        }
     }
     (!parts.is_empty()).then(|| format!("{}.", parts.join(", ")))
+}
+
+/// Vfe phrase built from the flap detents' per-notch limits, grouped by speed:
+/// "Vfe 110 at ten degrees, 85 at twenty degrees and full". `None` if no detent
+/// carries a Vfe.
+fn vfe_phrase(profile: &aircraft::AircraftProfile) -> Option<String> {
+    let detents = &profile.flaps.as_ref()?.detents;
+    let mut groups: Vec<(i64, Vec<String>)> = Vec::new();
+    for d in detents {
+        let Some(vfe) = d.vfe_kts else { continue };
+        let v = vfe.round() as i64;
+        match groups.last_mut() {
+            Some(g) if g.0 == v => g.1.push(d.spoken.clone()),
+            _ => groups.push((v, vec![d.spoken.clone()])),
+        }
+    }
+    if groups.is_empty() {
+        return None;
+    }
+    let phrase = groups
+        .iter()
+        .map(|(v, notches)| format!("{v} at {}", join_and(notches)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("Vfe {phrase}"))
+}
+
+/// Format an integer-valued number with thousands separators ("2558" -> "2,558").
+fn with_commas(n: f64) -> String {
+    let n = n.round() as i64;
+    let digits = n.abs().to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::new();
+    for (i, c) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*c as char);
+    }
+    if n < 0 {
+        format!("-{out}")
+    } else {
+        out
+    }
 }
 
 /// True if the utterance is asking about fuel/endurance (a question we answer
@@ -2475,6 +2596,21 @@ mod tests {
         assert!(!undoable_drefs("set_throttle").is_empty());
         assert!(undoable_drefs("start_engine").is_empty());
         assert!(undoable_drefs("pushback").is_empty());
+    }
+
+    #[test]
+    fn reference_limits_come_from_the_profile() {
+        let p = super::aircraft::load("cessna_172sp").expect("profile");
+        assert_eq!(super::reference_limits(&p, "what's best glide").as_deref(), Some("best glide 68 knots."));
+        assert_eq!(super::reference_limits(&p, "rotation speed").as_deref(), Some("rotate at 55 knots."));
+        assert!(super::reference_limits(&p, "what's vy").unwrap().contains("74 knots"));
+        // Vfe is derived from the flap detents, grouped by speed.
+        assert_eq!(
+            super::reference_limits(&p, "flap speed").as_deref(),
+            Some("Vfe 110 at ten degrees, 85 at twenty degrees and full.")
+        );
+        // A non-limits utterance returns nothing.
+        assert!(super::reference_limits(&p, "set flaps ten").is_none());
     }
 
     #[test]

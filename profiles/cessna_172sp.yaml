@@ -79,6 +79,37 @@ vs_clean_kts: 48.0
 # caution as you approach redline, an urgent prompt at or above it.
 vne_kts: 163.0
 
+# Static reference figures recited on request ("what's best glide?", "Va?",
+# "performance limits"). From the X-Plane C172 Pilot's Operating Manual. Vne and
+# clean stall live above (the monitor uses them) and aren't repeated here.
+# Note: the manual lists Va 99; the real-world 172S POH lists 105 at gross.
+reference:
+  vno_kts: 129.0           # max structural cruise
+  va_kts: 99.0             # maneuvering (manual value)
+  vx_kts: 62.0             # best angle of climb
+  vy_kts: 74.0             # best rate of climb
+  vr_kts: 55.0             # rotate
+  best_glide_kts: 68.0
+  vs0_kts: 40.0            # stall, full flaps
+  approach_kts: 65.0
+  max_crosswind_kts: 15.0  # demonstrated
+  cruise_kts: 124.0
+  best_climb_fpm: 730.0
+  max_gross_lb: 2558.0
+  empty_weight_lb: 1640.0
+  useful_load_lb: 918.0
+  service_ceiling_ft: 14000.0
+  fuel_capacity_gal: 56.0
+  fuel_useable_gal: 53.0
+  endurance_hours: 4.0
+  takeoff_distance_ft: 1630.0
+  landing_distance_ft: 1335.0
+  max_rpm: 2700.0
+  oil_temp_min_f: 100.0
+  oil_temp_max_f: 245.0
+  oil_press_min_psi: 50.0
+  oil_press_max_psi: 90.0
+
 # XChecklist file to interpret (read-only; the de-facto X-Plane community format,
 # as used by the XChecklist plug-in). The copilot reads each item aloud, performs
 # the ones it owns, verifies what it can read, and calls out the pilot's items.
