@@ -20,6 +20,7 @@ mod nav;
 mod phrase;
 mod plugin_status;
 mod readback;
+mod simbrief;
 mod stt;
 mod stt_eval;
 mod tts;
@@ -494,6 +495,15 @@ async fn run_session(
                 continue;
             }
             if let Some(line) = aircraft_info(&profile, &tl) {
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
+            // SimBrief flight plan (online fetch) + fuel check.
+            if tl.contains("flight plan") || tl.contains("simbrief") || tl.contains("fetch the plan")
+                || tl.contains("where are we going") || tl.contains("where are we headed")
+            {
+                reporter.status(ui::Phase::Thinking);
+                let line = flight_plan_report(&config, &xplane).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
@@ -1130,6 +1140,36 @@ async fn systems_check(xp: &XPlaneClient) -> String {
     }
 }
 
+/// Fetch the SimBrief flight plan and brief it, with a fuel check against what's
+/// actually on board. Deterministic (no LLM); the one network call beyond X-Plane.
+async fn flight_plan_report(config: &Config, xp: &XPlaneClient) -> String {
+    if config.simbrief_id.trim().is_empty() {
+        return "No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can pull your flight plan.".to_string();
+    }
+    let fp = match simbrief::fetch(&config.simbrief_id).await {
+        Ok(fp) => fp,
+        Err(e) => {
+            tracing::warn!("simbrief fetch failed: {e:#}");
+            return "Couldn't fetch your SimBrief plan. Generate one first, or check the ID.".to_string();
+        }
+    };
+    let mut line = fp.summary();
+    // Fuel check: planned block vs what's in the tanks (read in kg, report gallons).
+    if let Ok(kg) = xp.get_float(datarefs::FUEL_TOTAL_KG).await {
+        let aboard = kg / AVGAS_KG_PER_GAL;
+        if aboard + 0.5 >= fp.block_fuel_gal {
+            line.push_str(&format!(" You have {aboard:.0} gallons aboard, enough for the plan."));
+        } else {
+            line.push_str(&format!(
+                " You have {aboard:.0} gallons aboard, but the plan needs {:.0}; short about {:.0}.",
+                fp.block_fuel_gal,
+                fp.block_fuel_gal - aboard
+            ));
+        }
+    }
+    line
+}
+
 /// A brief spoken answer to "what are we flying / tell me about this aircraft",
 /// from the profile + the 172 reference figures, instead of the LLM declining for
 /// lack of data. `None` if the utterance isn't asking about the aircraft.
@@ -1590,6 +1630,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "systems", "system", "vne", "vno", "vfe", "vspeed", "vspeeds",
     // aircraft-info queries
     "aircraft", "plane", "cessna", "skyhawk",
+    // SimBrief flight plan
+    "simbrief", "flightplan", "plan",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,

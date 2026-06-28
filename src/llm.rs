@@ -633,6 +633,7 @@ mod tests {
             ptt_key: String::new(),
             ptt_dataref: String::new(),
             plugin_status: false,
+            simbrief_id: String::new(),
             vad_threshold: 0.012,
             stt_min_confidence: 0.5,
             end_silence_ms: 900,
