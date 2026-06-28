@@ -124,16 +124,27 @@ fn run(base: String, rx: Receiver<Update>) {
         tracing::debug!("plugin_status: status datarefs not found (plugin not loaded?)");
     }
 
-    while let Ok(update) = rx.recv() {
-        let (id, value) = match update {
-            Update::Phase(code) => (phase_id, json!(code)),
-            Update::Heard(text) => (heard_id, json!(STANDARD.encode(text.as_bytes()))),
-            Update::Action(text) => (action_id, json!(STANDARD.encode(text.as_bytes()))),
-            Update::Alert(level, text) => {
+    // Re-send the phase on idle as a heartbeat, so the plugin can tell "app
+    // connected but idle" from "app not running" (and show NOT CONNECTED for the
+    // latter). When the app exits, the channel drops and the heartbeat stops.
+    use std::sync::mpsc::RecvTimeoutError;
+    const HEARTBEAT: Duration = Duration::from_secs(1);
+    let mut last_phase = 0u8;
+    loop {
+        let (id, value) = match rx.recv_timeout(HEARTBEAT) {
+            Ok(Update::Phase(code)) => {
+                last_phase = code;
+                (phase_id, json!(code))
+            }
+            Ok(Update::Heard(text)) => (heard_id, json!(STANDARD.encode(text.as_bytes()))),
+            Ok(Update::Action(text)) => (action_id, json!(STANDARD.encode(text.as_bytes()))),
+            Ok(Update::Alert(level, text)) => {
                 // Prefix a severity marker so the plugin can colour the chip.
                 let payload = format!("{}{}", level.code(), text);
                 (alert_id, json!(STANDARD.encode(payload.as_bytes())))
             }
+            Err(RecvTimeoutError::Timeout) => (phase_id, json!(last_phase)), // heartbeat
+            Err(RecvTimeoutError::Disconnected) => break,
         };
         let Some(id) = id else { continue };
         let url = format!("{rest}/datarefs/{id}/value");

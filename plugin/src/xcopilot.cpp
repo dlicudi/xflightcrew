@@ -25,6 +25,11 @@
 #include "XPLMGraphics.h"
 #include "XPLMMenus.h"
 #include "XPLMPlugin.h"
+#include "XPLMProcessing.h"
+
+// Project version. Single version for the whole product (app + plugin ship and
+// must be compatible as a pair); keep in sync with Cargo.toml.
+#define NINER_VERSION "0.1.0"
 
 #include "imgui.h"
 #include "ImgWindow.h"
@@ -78,8 +83,15 @@ static void AppendLog(const char* tag, ImU32 color, const char* text) {
     g_log_scroll = true;
 }
 
+// Last time the app wrote any status (sim seconds). The app heartbeats the phase
+// ~1/s, so a stale value means it isn't running → NOT CONNECTED. Starts stale.
+static float g_last_status_time = -1000.0f;
+
 static int ReadPhase(void*) { return g_phase; }
-static void WritePhase(void*, int v) { g_phase = v; }
+static void WritePhase(void*, int v) {
+    g_phase = v;
+    g_last_status_time = XPLMGetElapsedTime();
+}
 
 static int ReadText(void* ref, void* out, int offset, int max) {
     TextRef* t = static_cast<TextRef*>(ref);
@@ -129,23 +141,22 @@ static void WriteAlert(void*, void* in, int offset, int len) {
 
 // ---- panel ------------------------------------------------------------------
 
-// Phase 1 is the app's resting "listening" state — but with push-to-talk the mic
-// is shut until you press, so "CONNECTED" is the honest label (the green [PTT]
-// chip shows when audio is actually being captured).
+// While the app is connected: 0/1 = resting ("CONNECTED" — with push-to-talk the
+// mic is shut until you press, and the green [PTT] chip shows actual capture),
+// 2 = working on a command, 3 = reading back. A stale heartbeat (handled in
+// DrawPanel) shows NOT CONNECTED instead.
 static const char* PhaseLabel(int p) {
     switch (p) {
-        case 1: return "CONNECTED";
         case 2: return "THINKING";
         case 3: return "SPEAKING";
-        default: return "IDLE";
+        default: return "CONNECTED";
     }
 }
 static ImU32 PhaseColor(int p) {
     switch (p) {
-        case 1: return COL_GREEN;
         case 2: return COL_AMBER;
         case 3: return COL_CYAN;
-        default: return COL_DIM;
+        default: return COL_GREEN;
     }
 }
 
@@ -167,7 +178,7 @@ public:
     XCopilotPanel(int l, int t, int r, int b)
         : ImgWindow(l, t, r, b, xplm_WindowDecorationRoundRectangle,
                     xplm_WindowLayerFloatingWindows) {
-        SetWindowTitle("x-copilot");
+        SetWindowTitle("Niner");
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
         ImGuiStyle& s = ImGui::GetStyle();
@@ -182,10 +193,16 @@ public:
 
 protected:
     void buildInterface() override {
-        // Toolbar: PTT light + current phase, as chips.
+        // Toolbar: PTT light + connection/phase, as chips. The app heartbeats the
+        // phase ~1/s, so a stale timestamp means it isn't running.
+        bool connected = (XPLMGetElapsedTime() - g_last_status_time) < 3.0f;
         Chip("PTT", g_ptt_active ? COL_GREEN : COL_DIM);
         ImGui::SameLine();
-        Chip(PhaseLabel(g_phase), PhaseColor(g_phase));
+        if (connected) {
+            Chip(PhaseLabel(g_phase), PhaseColor(g_phase));
+        } else {
+            Chip("NOT CONNECTED", COL_RED);
+        }
         ImGui::Separator();
 
         // Transmission log — recent heard/action lines with coloured tags.
@@ -205,9 +222,10 @@ protected:
         ImGui::EndChild();
 
         // Footer hint.
-        if (g_log.empty()) {
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
-                               "Hold your PTT button and speak.");
+        if (!connected) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "Waiting for the copilot to connect.");
+        } else if (g_log.empty()) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "Niner " NINER_VERSION ". Hold your PTT button and speak.");
         } else {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", PhaseLabel(g_phase));
         }
@@ -224,9 +242,9 @@ static void MenuHandler(void*, void*) {
 // ---- lifecycle --------------------------------------------------------------
 
 PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
-    std::strcpy(name, "x-copilot");
+    std::strcpy(name, "Niner");
     std::strcpy(sig, "com.dlicudi.xcopilot");
-    std::strcpy(desc, "Push-to-talk and status panel for the x-copilot voice assistant.");
+    std::strcpy(desc, "Niner " NINER_VERSION ", push-to-talk and status panel for the voice copilot.");
 
     g_ptt_cmd = XPLMCreateCommand("xcopilot/ptt", "x-copilot: hold to talk");
     XPLMRegisterCommandHandler(g_ptt_cmd, PttCommandHandler, 1, nullptr);
@@ -260,8 +278,8 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
     int wl = sl + 50, wt = st - 50, wr = wl + 420, wb = wt - 300;
     g_panel = std::make_unique<XCopilotPanel>(wl, wt, wr, wb);
 
-    int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "x-copilot", nullptr, 0);
-    g_menu = XPLMCreateMenu("x-copilot", XPLMFindPluginsMenu(), idx, MenuHandler, nullptr);
+    int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "Niner", nullptr, 0);
+    g_menu = XPLMCreateMenu("Niner", XPLMFindPluginsMenu(), idx, MenuHandler, nullptr);
     XPLMAppendMenuItem(g_menu, "Toggle status panel", (void*)"toggle", 0);
 
     XPLMDebugString("x-copilot plugin: started (ptt + ImGui status panel)\n");

@@ -231,7 +231,7 @@ async fn main() -> Result<()> {
         // TUI: voice loop + aircraft poll run on background threads, each with
         // its own runtime; the dashboard renders on the main thread.
         let (tx, rx) = std::sync::mpsc::channel::<ui::Report>();
-        let title = format!("x-copilot · {}", profile.display_name);
+        let title = format!("x-copilot {} · {}", env!("CARGO_PKG_VERSION"), profile.display_name);
         // The active engines, shown in the status bar: STT (whisper model), LLM,
         // and TTS backend — so it's obvious at a glance what's running.
         let engines = format!(
