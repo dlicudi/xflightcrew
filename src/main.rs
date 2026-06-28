@@ -564,9 +564,10 @@ async fn run_session(
             // cue plus a time cue, so it beats the next-waypoint branch below.
             if !is_reminder
                 && (tl.contains("land") || tl.contains("destination") || tl.contains("arrive")
-                    || tl.contains("arrival") || tl.contains("get there") || tl.contains("get in"))
+                    || tl.contains("arrival") || tl.contains("get there") || tl.contains("get in")
+                    || tl.contains("en route") || tl.contains("enroute") || tl.contains("on route"))
                 && (tl.contains("time") || tl.contains("eta") || tl.contains("when")
-                    || tl.contains("how long") || tl.contains("estimat"))
+                    || tl.contains("how long") || tl.contains("estimat") || tl.contains("remaining"))
             {
                 let line = eta_to_destination(&config, &xplane, &mut fp_cache).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);

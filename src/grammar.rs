@@ -167,9 +167,14 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     // "remind me in 10 minutes", "let me know at the next waypoint". The verb gates
     // it so a plain "top of descent" or a bare altitude isn't swallowed; an
     // unrecognized target falls through (e.g. "tell me the weather").
-    let reminder_verb = has(t, "wake") || has(t, "remind") || has(t, "notify")
-        || (has(t, "tell") && has(t, "me")) || t.contains("let me know")
-        || t.contains("heads up") || t.contains("heads-up");
+    // A complaint or past-tense reference ("you didn't remind me", "you never woke
+    // me") is not a request to arm one.
+    let negated = t.contains("didn't") || t.contains("did not") || t.contains("never")
+        || t.contains("forgot") || t.contains("should have") || t.contains("supposed to");
+    let reminder_verb = !negated
+        && (has(t, "wake") || has(t, "remind") || has(t, "notify")
+            || (has(t, "tell") && has(t, "me")) || t.contains("let me know")
+            || t.contains("heads up") || t.contains("heads-up"));
     if reminder_verb {
         if t.contains("top of descent") || has(t, "tod") || (has(t, "descent") && !has(t, "rate")) {
             return Some(call("set_reminder", json!({ "kind": "top_of_descent" })));
@@ -576,6 +581,8 @@ mod tests {
         assert_eq!(one("wake me at 5000 feet").unwrap(), ("set_reminder".into(), json!({"kind":"altitude","value":5000})));
         // A reminder verb with no recognized target falls through (not a reminder).
         assert!(one("tell me the altitude").map(|c| c.0) != Some("set_reminder".into()));
+        // A complaint must not arm a new reminder.
+        assert!(one("you didn't remind me of the last waypoint").map(|c| c.0) != Some("set_reminder".into()));
     }
 
     #[test]
