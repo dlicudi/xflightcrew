@@ -29,7 +29,7 @@
 
 // Project version. Single version for the whole product (app + plugin ship and
 // must be compatible as a pair); keep in sync with Cargo.toml.
-#define NINER_VERSION "0.1.0"
+#define XCOPILOT_VERSION "0.1.0"
 
 #include "imgui.h"
 #include "ImgWindow.h"
@@ -178,7 +178,7 @@ public:
     XCopilotPanel(int l, int t, int r, int b)
         : ImgWindow(l, t, r, b, xplm_WindowDecorationRoundRectangle,
                     xplm_WindowLayerFloatingWindows) {
-        SetWindowTitle("Niner");
+        SetWindowTitle("X-COPILOT PLUGIN v" XCOPILOT_VERSION);
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
         ImGuiStyle& s = ImGui::GetStyle();
@@ -221,13 +221,13 @@ protected:
         if (g_log_scroll) { ImGui::SetScrollHereY(1.0f); g_log_scroll = false; }
         ImGui::EndChild();
 
-        // Footer hint.
+        // Footer: connection state + version.
         if (!connected) {
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "Waiting for the copilot to connect.");
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "Not connected. Start x-copilot.");
         } else if (g_log.empty()) {
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "Niner " NINER_VERSION ". Hold your PTT button and speak.");
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_GREEN), "Connected to x-copilot v" XCOPILOT_VERSION ". Hold your PTT button and speak.");
         } else {
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", PhaseLabel(g_phase));
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_GREEN), "Connected to x-copilot v" XCOPILOT_VERSION);
         }
     }
 };
@@ -242,9 +242,9 @@ static void MenuHandler(void*, void*) {
 // ---- lifecycle --------------------------------------------------------------
 
 PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
-    std::strcpy(name, "Niner");
+    std::strcpy(name, "X-COPILOT");
     std::strcpy(sig, "com.dlicudi.xcopilot");
-    std::strcpy(desc, "Niner " NINER_VERSION ", push-to-talk and status panel for the voice copilot.");
+    std::strcpy(desc, "X-COPILOT " XCOPILOT_VERSION ", push-to-talk and status panel for the voice copilot.");
 
     g_ptt_cmd = XPLMCreateCommand("xcopilot/ptt", "x-copilot: hold to talk");
     XPLMRegisterCommandHandler(g_ptt_cmd, PttCommandHandler, 1, nullptr);
@@ -278,8 +278,8 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
     int wl = sl + 50, wt = st - 50, wr = wl + 420, wb = wt - 300;
     g_panel = std::make_unique<XCopilotPanel>(wl, wt, wr, wb);
 
-    int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "Niner", nullptr, 0);
-    g_menu = XPLMCreateMenu("Niner", XPLMFindPluginsMenu(), idx, MenuHandler, nullptr);
+    int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "X-COPILOT", nullptr, 0);
+    g_menu = XPLMCreateMenu("X-COPILOT", XPLMFindPluginsMenu(), idx, MenuHandler, nullptr);
     XPLMAppendMenuItem(g_menu, "Toggle status panel", (void*)"toggle", 0);
 
     XPLMDebugString("x-copilot plugin: started (ptt + ImGui status panel)\n");
