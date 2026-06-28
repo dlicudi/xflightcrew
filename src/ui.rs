@@ -91,8 +91,11 @@ impl Reporter {
         // so the panel gets the clean transcript without the desktop log's
         // confidence suffix.
         if let Some(s) = &self.status {
-            if let LogKind::Readback = kind {
-                s.action(&text);
+            match kind {
+                LogKind::Readback => s.action(&text),
+                // Surface refusals/cancellations and confirm prompts on the panel too.
+                LogKind::Warn | LogKind::Confirm => s.alert(&text),
+                _ => {}
             }
         }
         self.send(Report::Log { kind, text });

@@ -58,10 +58,12 @@ struct TextRef { char buf[128]; int len; };
 static int g_phase = 0;
 static TextRef g_heard = {{0}, 0};
 static TextRef g_action = {{0}, 0};
+static TextRef g_alert = {{0}, 0};
 
 static XPLMDataRef g_phase_dref = nullptr;
 static XPLMDataRef g_heard_dref = nullptr;
 static XPLMDataRef g_action_dref = nullptr;
+static XPLMDataRef g_alert_dref = nullptr;
 
 // Transmission log shown in the panel.
 struct LogEntry { std::string tag; ImU32 color; std::string text; };
@@ -105,6 +107,10 @@ static void WriteHeard(void*, void* in, int offset, int len) {
 static void WriteAction(void*, void* in, int offset, int len) {
     StoreText(&g_action, in, offset, len);
     AppendLog("ROGER", COL_GREEN, g_action.buf);
+}
+static void WriteAlert(void*, void* in, int offset, int len) {
+    StoreText(&g_alert, in, offset, len);
+    AppendLog("ALERT", COL_AMBER, g_alert.buf);
 }
 
 // ---- panel ------------------------------------------------------------------
@@ -227,6 +233,10 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         "xcopilot/status/action", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteAction, &g_action, &g_action);
+    g_alert_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/alert", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteAlert, &g_alert, &g_alert);
 
     // One shared font atlas for all ImgWindows (uses ImGui's default font).
     ImgWindow::sFontAtlas = std::make_shared<ImgFontAtlas>();
@@ -248,6 +258,7 @@ PLUGIN_API void XPluginStop(void) {
     g_panel.reset();
     ImgWindow::sFontAtlas.reset();
     if (g_menu) { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
+    if (g_alert_dref) { XPLMUnregisterDataAccessor(g_alert_dref); g_alert_dref = nullptr; }
     if (g_action_dref) { XPLMUnregisterDataAccessor(g_action_dref); g_action_dref = nullptr; }
     if (g_heard_dref) { XPLMUnregisterDataAccessor(g_heard_dref); g_heard_dref = nullptr; }
     if (g_phase_dref) { XPLMUnregisterDataAccessor(g_phase_dref); g_phase_dref = nullptr; }

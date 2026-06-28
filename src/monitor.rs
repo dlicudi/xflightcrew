@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::aircraft::AircraftProfile;
 use crate::config::Config;
+use crate::plugin_status::StatusSink;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -347,8 +348,21 @@ impl FireState {
 
     /// Condition is currently bad. Speak per [`should_speak`], but only once it
     /// has held continuously for `min_duration`. Marks firing either way.
-    fn active(&mut self, msg: String, sev: Severity, min_duration: Duration, voice: &Voice, now: Instant) {
+    fn active(
+        &mut self,
+        msg: String,
+        sev: Severity,
+        min_duration: Duration,
+        voice: &Voice,
+        status: Option<&StatusSink>,
+        now: Instant,
+    ) {
         if self.sustained(min_duration, now) && self.should_speak(sev, now) {
+            // Mirror the callout to the in-sim panel (monitor speaks via Voice,
+            // which otherwise bypasses the panel's Reporter).
+            if let Some(s) = status {
+                s.alert(&msg);
+            }
             voice.alert(sev.into(), msg);
             self.last_spoken = Some(now);
         }
@@ -770,7 +784,7 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
 
 /// Run the monitor loop until the process exits. Spawned on its own thread +
 /// runtime with its own X-Plane client; shares the [`Voice`] arbiter.
-pub async fn run(config: Config, profile: AircraftProfile, voice: Voice) {
+pub async fn run(config: Config, profile: AircraftProfile, voice: Voice, status: Option<StatusSink>) {
     let checks = build_checks(&profile);
     if checks.is_empty() {
         tracing::info!("monitor: no checks for this airframe; not starting");
@@ -798,13 +812,19 @@ pub async fn run(config: Config, profile: AircraftProfile, voice: Voice) {
 
             // Pushback callouts (on the ground): tug hooks up → pushing → clear.
             if snap.on_ground {
+                let say = |line: &str| {
+                    if let Some(s) = status.as_ref() {
+                        s.alert(line);
+                    }
+                    voice.alert(Priority::Advisory, line.to_string());
+                };
                 if snap.tug_attached && !prev_attached && !snap.pushing_back {
-                    voice.alert(Priority::Advisory, "Tug connected, ready for pushback.");
+                    say("Tug connected, ready for pushback.");
                 }
                 if snap.pushing_back && !prev_pushing {
-                    voice.alert(Priority::Advisory, "Pushing back.");
+                    say("Pushing back.");
                 } else if !snap.pushing_back && prev_pushing {
-                    voice.alert(Priority::Advisory, "Pushback complete, tug clear.");
+                    say("Pushback complete, tug clear.");
                 }
             }
             prev_attached = snap.tug_attached;
@@ -824,7 +844,7 @@ pub async fn run(config: Config, profile: AircraftProfile, voice: Voice) {
             for check in &checks {
                 let state = states.get_mut(check.id()).expect("state per check");
                 match check.eval(&snap) {
-                    Some(msg) => state.active(msg, check.severity(), check.min_duration(), &voice, now),
+                    Some(msg) => state.active(msg, check.severity(), check.min_duration(), &voice, status.as_ref(), now),
                     None => state.clear(),
                 }
             }

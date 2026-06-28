@@ -21,6 +21,7 @@ use serde_json::json;
 const DR_PHASE: &str = "xcopilot/status/phase";
 const DR_HEARD: &str = "xcopilot/status/heard";
 const DR_ACTION: &str = "xcopilot/status/action";
+const DR_ALERT: &str = "xcopilot/status/alert";
 
 /// Keep text within the plugin's fixed display buffer (128 bytes, NUL-terminated).
 const TEXT_MAX: usize = 120;
@@ -33,6 +34,8 @@ enum Update {
     Heard(String),
     /// Last action read back.
     Action(String),
+    /// A monitor callout or command-loop warning (caution/warning/advisory).
+    Alert(String),
 }
 
 /// Cloneable handle the [`crate::ui::Reporter`] uses to mirror status. Sends are
@@ -60,6 +63,9 @@ impl StatusSink {
     }
     pub fn action(&self, text: &str) {
         let _ = self.0.send(Update::Action(clip(text)));
+    }
+    pub fn alert(&self, text: &str) {
+        let _ = self.0.send(Update::Alert(clip(text)));
     }
 }
 
@@ -91,6 +97,7 @@ fn run(base: String, rx: Receiver<Update>) {
     let phase_id = resolve_id(&http, &rest, DR_PHASE);
     let heard_id = resolve_id(&http, &rest, DR_HEARD);
     let action_id = resolve_id(&http, &rest, DR_ACTION);
+    let alert_id = resolve_id(&http, &rest, DR_ALERT);
     if phase_id.is_none() && heard_id.is_none() && action_id.is_none() {
         tracing::debug!("plugin_status: status datarefs not found (plugin not loaded?)");
     }
@@ -100,6 +107,7 @@ fn run(base: String, rx: Receiver<Update>) {
             Update::Phase(code) => (phase_id, json!(code)),
             Update::Heard(text) => (heard_id, json!(STANDARD.encode(text.as_bytes()))),
             Update::Action(text) => (action_id, json!(STANDARD.encode(text.as_bytes()))),
+            Update::Alert(text) => (alert_id, json!(STANDARD.encode(text.as_bytes()))),
         };
         let Some(id) = id else { continue };
         let url = format!("{rest}/datarefs/{id}/value");

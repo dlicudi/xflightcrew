@@ -220,9 +220,10 @@ async fn main() -> Result<()> {
         let mon_voice = voice.clone();
         let mon_config = config.clone();
         let mon_profile = profile.clone();
+        let mon_status = status_sink.clone();
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
-            rt.block_on(monitor::run(mon_config, mon_profile, mon_voice));
+            rt.block_on(monitor::run(mon_config, mon_profile, mon_voice, mon_status));
         });
     }
 
@@ -1197,6 +1198,36 @@ async fn answer_state_query(
     if wx || (t.contains("temperature") && !t.contains("oil")) || t.contains("how cold") || t.contains("how hot") || t.contains(" oat") {
         if let Ok(v) = read1(live, xp, datarefs::OAT_DEG_C).await {
             parts.push(format!("outside air temperature {v:.0} degrees celsius"));
+        }
+    }
+
+    // General "how's the engine?" → a one-line health summary. Only when no
+    // specific instrument is named (those are handled below, no double-up).
+    if t.contains("engine")
+        && !["oil", "egt", "exhaust", "cht", "cylinder", "rpm", "fuel flow"].iter().any(|k| t.contains(k))
+    {
+        let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running").await.is_some_and(|v| v > 0.5);
+        if !running {
+            parts.push("engine off".to_string());
+        } else {
+            let mut bits = vec!["engine running".to_string()];
+            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm").await {
+                bits.push(format!("{v:.0} R P M"));
+            }
+            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_pressure_psi").await {
+                bits.push(format!("oil pressure {v:.0} pounds"));
+            }
+            // oil_temp / CHT datarefs read °F despite their names.
+            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_temperature_deg_C").await {
+                bits.push(format!("oil temp {v:.0} degrees"));
+            }
+            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/CHT_deg_C").await {
+                bits.push(format!("C H T {v:.0}"));
+            }
+            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/fuel_flow_kg_sec").await {
+                bits.push(format!("fuel flow {:.1} gallons an hour", v * 3600.0 / AVGAS_KG_PER_GAL));
+            }
+            parts.push(bits.join(", "));
         }
     }
 
