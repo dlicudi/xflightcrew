@@ -387,6 +387,9 @@ async fn run_session(
         // Input is spoken (gated like before) or typed in the TUI. A typed
         // command is deliberate, so it skips the confidence/wake/domain gates and
         // goes straight to the model.
+        // Confidence of a spoken utterance, applied *after* the abort check so a
+        // panic word lands even if whisper wasn't sure. `None` for typed input.
+        let mut spoken_confidence: Option<f32> = None;
         let (mut command, from_text) = match next_input(&mut listener, &ptt_mic, &stt, &ptt, typed.as_ref()) {
             None => continue,
             Some(Input::Typed(text)) => {
@@ -395,42 +398,20 @@ async fn run_session(
                 (text, true)
             }
             Some(Input::Spoken(heard)) => {
-                let transcript = heard.text;
-                let confidence = heard.confidence;
-                tracing::info!(transcript = %transcript, confidence, "heard utterance");
-                reporter.heard(&transcript, confidence);
-
-                // Confidence gate.
-                if confidence < config.stt_min_confidence {
-                    if explicit {
-                        say(&voice, &reporter, ui::LogKind::Info,
-                            readback::one_of(&["Say again?", "Didn't catch that.", "One more time?"]));
-                    } else {
-                        reporter.log(ui::LogKind::Info, "low confidence, ignored");
-                    }
-                    continue;
-                }
-
-                // Echo gate: if this transcript matches a readback the copilot just
-                // spoke, it's the copilot's own voice coming back through the speakers
-                // (not the pilot). Drop it, so a readback can't re-trigger itself into
-                // a feedback loop. Headphones avoid the bleed; this covers speakers.
-                if voice.is_self_echo(&transcript) {
-                    reporter.log(ui::LogKind::Info, "ignored self-echo (own readback)");
-                    continue;
-                }
-
+                tracing::info!(transcript = %heard.text, confidence = heard.confidence, "heard utterance");
+                reporter.heard(&heard.text, heard.confidence);
+                spoken_confidence = Some(heard.confidence);
                 // Continuous mode acts on the transcript directly — the downstream
                 // domain gate (`looks_like_command`) filters non-commands.
-                (transcript, false)
+                (heard.text, false)
             }
         };
 
-        // EMERGENCY ABORT — highest priority, checked before the domain gate and any
-        // LLM. "belay that", "undo", "abort", "scratch that", "as you were" restore
-        // the datarefs the last command changed, so a misheard or wrong action (an
-        // echoed "heading zero", flaps at the wrong speed) can be pulled straight
-        // back. Deterministic and instant: a panic button must never wait on a model.
+        // EMERGENCY ABORT — the very first thing checked, before the confidence,
+        // echo, and domain gates and any LLM. "belay that", "undo", "abort",
+        // "scratch that", "as you were" restore what the last command changed. It
+        // must beat every gate: a panic word that's low-confidence, or glued to an
+        // echoed readback, still has to land. Deterministic and instant.
         if is_undo(&command) {
             match last_action.take() {
                 None => say(&voice, &reporter, ui::LogKind::Warn, "Nothing to undo."),
@@ -455,6 +436,26 @@ async fn run_session(
                 }
             }
             continue;
+        }
+
+        // Confidence + echo gates (spoken input only) — now that abort has had its
+        // chance. Confidence: drop what whisper wasn't sure of. Echo: drop the
+        // copilot's own readback bleeding back through the speakers, so it can't
+        // re-trigger itself. Both bypassed for typed input.
+        if let Some(confidence) = spoken_confidence {
+            if confidence < config.stt_min_confidence {
+                if explicit {
+                    say(&voice, &reporter, ui::LogKind::Info,
+                        readback::one_of(&["Say again?", "Didn't catch that.", "One more time?"]));
+                } else {
+                    reporter.log(ui::LogKind::Info, "low confidence, ignored");
+                }
+                continue;
+            }
+            if voice.is_self_echo(&command) {
+                reporter.log(ui::LogKind::Info, "ignored self-echo (own readback)");
+                continue;
+            }
         }
 
         // Domain gate, follow-up, and bare-value rewrite apply to SPOKEN input
@@ -2055,8 +2056,11 @@ fn is_undo(text: &str) -> bool {
         || t.contains("cancel that")
         || t.contains("abort that")
         || t.contains("abort the last")
-        || t == "abort"
-        || t.starts_with("abort.")
+        || t.contains("abort")
+        // "abort" is reliably misheard as "a boat" / "a board" — both meaningless in
+        // a cockpit, and too important a word to lose to a transcription slip.
+        || t.contains("a boat")
+        || t.contains("a board")
 }
 
 /// Join words as "a", "a and b", or "a, b and c" for a natural spoken list.
@@ -2304,7 +2308,8 @@ mod tests {
     #[test]
     fn undo_recognizes_emergency_phrasings() {
         for w in ["belay that", "undo", "undo that", "abort", "scratch that", "as you were",
-                  "disregard", "revert", "reverse that", "take it back", "cancel that"] {
+                  "disregard", "revert", "reverse that", "take it back", "cancel that",
+                  "abort. didn't catch a command there. abort.", "a boat"] {
             assert!(is_undo(w), "{w:?} should trigger undo");
         }
         // Not an undo (would clobber normal speech / the reminder cancel).
