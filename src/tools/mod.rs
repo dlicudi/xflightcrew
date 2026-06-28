@@ -56,6 +56,9 @@ pub struct ToolCtx<'a> {
     /// The in-sim panel sink, so a later announcement (the level-off callout) shows
     /// on the panel too, not just spoken. `None` outside the live loop / no plugin.
     pub status: Option<&'a crate::plugin_status::StatusSink>,
+    /// The armed-reminder registry, so `set_reminder` records what it arms and the
+    /// copilot can recall/cancel them. `None` outside the live loop.
+    pub reminders: Option<&'a reminder::Reminders>,
 }
 
 /// One curated action the copilot can take.

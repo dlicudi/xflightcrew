@@ -947,7 +947,7 @@ mod tests {
     use crate::xplane::FakeXPlane;
 
     fn ctx<'a>(fake: &'a FakeXPlane, cfg: &'a crate::config::Config) -> ToolCtx<'a> {
-        ToolCtx { xplane: fake, config: cfg, voice: None, status: None }
+        ToolCtx { xplane: fake, config: cfg, voice: None, status: None, reminders: None }
     }
 
     #[tokio::test]

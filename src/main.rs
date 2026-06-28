@@ -356,6 +356,8 @@ async fn run_session(
     let mut last_subject: Option<String> = None;
     // Cached SimBrief plan (it doesn't change mid-flight); re-fetched on TTL or "refresh".
     let mut fp_cache: Option<(Instant, simbrief::FlightPlan)> = None;
+    // Memory of armed reminders, so the copilot can recall and cancel them.
+    let reminders = tools::reminder::Reminders::default();
     let mut listener = if continuous {
         // Share the speech arbiter's mic gate so the listener mutes itself while
         // the copilot speaks (readbacks and monitor alerts alike).
@@ -485,6 +487,42 @@ async fn run_session(
         // routed here, not behind the question gate.
         {
             let tl = command.to_ascii_lowercase();
+            // Reminder memory: cancel or list what's armed ("cancel the reminders",
+            // "do we have a reminder set?"). Checked before set_reminder so "cancel"
+            // wins over arming.
+            if tl.contains("reminder") {
+                if tl.contains("cancel") || tl.contains("clear") || tl.contains("forget")
+                    || tl.contains("remove") || tl.contains("delete") || tl.contains("scrap")
+                    || tl.contains("never mind") || tl.contains("nevermind")
+                {
+                    let n = reminders.cancel_all();
+                    let line = match n {
+                        0 => "No reminders to cancel.".to_string(),
+                        1 => "Cancelled the reminder.".to_string(),
+                        _ => format!("Cancelled {n} reminders."),
+                    };
+                    say(&voice, &reporter, ui::LogKind::Readback, &line);
+                    continue;
+                }
+                // A mention of reminders with no arming cue is a recall ("do we have a
+                // reminder?"). If it names a condition ("set a reminder to wake me at
+                // 5000 feet"), fall through to arm it instead.
+                let arming = tl.contains("wake") || tl.contains("descent") || tl.contains("feet")
+                    || tl.contains("altitude") || tl.contains("minute") || tl.contains("waypoint")
+                    || tl.contains("reach");
+                if !arming {
+                    let list = reminders.active();
+                    let line = if list.is_empty() {
+                        "No reminders set.".to_string()
+                    } else if list.len() == 1 {
+                        format!("One reminder, {}.", list[0])
+                    } else {
+                        format!("{} reminders: {}.", list.len(), list.join(", "))
+                    };
+                    say(&voice, &reporter, ui::LogKind::Readback, &line);
+                    continue;
+                }
+            }
             if tl.contains("all systems") || tl.contains("systems check") || tl.contains("safe parameter")
                 || tl.contains("in the green") || tl.contains("status check")
             {
@@ -714,7 +752,7 @@ async fn run_session(
             // Execute the curated tool (writes the dataref + reads back).
             reporter.status(ui::Phase::Thinking);
             let Some(tool) = registry.get(&call.name) else { continue };
-            let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice), status: reporter.status_sink() };
+            let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice), status: reporter.status_sink(), reminders: Some(&reminders) };
             // Execute, retrying once on error: a single transient blip (a dropped
             // Web API request, including the autopilot-engage commands the client
             // doesn't itself retry) shouldn't fail an action. Every tool is safe to
@@ -788,7 +826,7 @@ async fn run_checklist(
 ) {
     use checklist::Item;
     say(voice, reporter, ui::LogKind::Info, &format!("Running the {} checklist.", cl.title));
-    let ctx = ToolCtx { xplane, config, voice: Some(voice), status: reporter.status_sink() };
+    let ctx = ToolCtx { xplane, config, voice: Some(voice), status: reporter.status_sink(), reminders: None };
     let mut failed = 0usize;
     let mut aborted = false;
     for item in &cl.items {
@@ -1952,7 +1990,7 @@ const COMMAND_KEYWORDS: &[&str] = &[
     // time/distance to top of descent
     "descent", "tod",
     // reminders ("wake me at top of descent", "remind me in 10 minutes")
-    "wake", "remind", "notify", "heads-up",
+    "wake", "remind", "notify", "heads-up", "reminder", "reminders", "cancel",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,
