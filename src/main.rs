@@ -1685,7 +1685,7 @@ fn reference_limits(t: &str) -> Option<String> {
         parts.push("Vno 129 knots".into());
     }
     if t.contains("maneuver") {
-        parts.push("Va, maneuvering speed, 105 knots".into());
+        parts.push("Va, maneuvering speed, 99 knots".into());
     }
     if t.contains("vfe") || t.contains("flap speed") || t.contains("flaps speed") || t.contains("flap limit") {
         parts.push("Vfe 110 knots at 10 degrees, 85 at 20 or full".into());
@@ -1693,14 +1693,36 @@ fn reference_limits(t: &str) -> Option<String> {
     if t.contains("stall") {
         parts.push("stall 48 knots clean, 40 with full flaps".into());
     }
+    // Takeoff / climb / approach speeds, from the X-Plane C172 POM.
+    if t.contains("vx") || t.contains("best angle") {
+        parts.push("Vx, best angle of climb, 62 knots".into());
+    }
+    if t.contains("vy") || t.contains("best rate") || t.contains("best climb") {
+        parts.push("Vy, best rate of climb, 74 knots".into());
+    }
+    if t.contains("rotat") || t.contains("liftoff") || t.contains("lift off") || t.contains("takeoff speed") {
+        parts.push("rotate at 55 knots".into());
+    }
+    if t.contains("glide") {
+        parts.push("best glide 68 knots".into());
+    }
+    if t.contains("approach") || t.contains("landing speed") || t.contains("final approach") {
+        parts.push("approach around 65 knots, 70 flaps up".into());
+    }
+    if t.contains("crosswind") {
+        parts.push("max demonstrated crosswind 15 knots".into());
+    }
+    if t.contains("rate of climb") || t.contains("climb rate") {
+        parts.push("best rate of climb about 730 feet per minute".into());
+    }
     if t.contains("gross weight") || t.contains("max weight") || t.contains("max gross") {
         parts.push("max gross weight 2,558 pounds".into());
     }
     if t.contains("useful load") {
-        parts.push("useful load 895 pounds".into());
+        parts.push("useful load 918 pounds".into());
     }
     if t.contains("empty weight") {
-        parts.push("empty weight 1,663 pounds".into());
+        parts.push("empty weight 1,640 pounds".into());
     }
     if t.contains("service ceiling") || t.contains("max altitude") {
         parts.push("service ceiling 14,000 feet".into());
@@ -1708,13 +1730,26 @@ fn reference_limits(t: &str) -> Option<String> {
     if t.contains("fuel capacity") || t.contains("tank capacity") {
         parts.push("fuel capacity 56 gallons, 53 useable".into());
     }
+    if t.contains("takeoff distance") || t.contains("takeoff roll") {
+        parts.push("takeoff distance about 1,630 feet".into());
+    }
+    if t.contains("landing distance") || t.contains("landing roll") {
+        parts.push("landing distance about 1,335 feet".into());
+    }
+    if t.contains("oil") && (t.contains("limit") || t.contains("range") || t.contains("normal")) {
+        parts.push("oil temperature normal 100 to 245 Fahrenheit, oil pressure 50 to 90 PSI".into());
+    }
+    if t.contains("redline") || t.contains("max rpm") || t.contains("maximum rpm") || t.contains("red line") {
+        parts.push("maximum RPM 2,700".into());
+    }
     // A general "performance limits" / "V-speeds" ask gets the key summary.
     if parts.is_empty()
         && (t.contains("performance limit") || t.contains("v speed") || t.contains("v-speed")
             || (t.contains("limits") && t.contains("performance")))
     {
         parts.push(
-            "Vne 163, Vno 129, Va 105, Vfe 110 then 85, stall 48 clean. \
+            "Vne 163, Vno 129, Va 99, Vfe 110 then 85, stall 48 clean. \
+             Vx 62, Vy 74, rotate 55, best glide 68. \
              Max gross 2,558 pounds, service ceiling 14,000 feet"
                 .into(),
         );
