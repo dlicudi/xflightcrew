@@ -435,18 +435,21 @@ async fn run_session(
             match last_action.take() {
                 None => say(&voice, &reporter, ui::LogKind::Warn, "Nothing to undo."),
                 Some(snap) => {
-                    let mut restored: Vec<String> = Vec::new();
+                    let mut acts: Vec<String> = Vec::new();
+                    // Disengage first — stop the aircraft flying the wrong thing,
+                    // then tidy the dial back. "servos_off_any" is a clean disconnect.
+                    if snap.disengage_ap && xplane.run_command("sim/autopilot/servos_off_any").await.is_ok() {
+                        acts.push("autopilot disengaged".to_string());
+                    }
                     for (dr, label, old) in &snap.reverts {
                         if xplane.set_float(dr, *old).await.is_ok() {
-                            if !restored.contains(label) {
-                                restored.push(label.clone());
-                            }
+                            acts.push(format!("{label} restored"));
                         }
                     }
-                    let line = if restored.is_empty() {
+                    let line = if acts.is_empty() {
                         "I couldn't revert that.".to_string()
                     } else {
-                        format!("Belay that. Restored {}.", join_and(&restored))
+                        format!("Belay that, {}.", join_and(&acts))
                     };
                     say(&voice, &reporter, ui::LogKind::Warn, &line);
                 }
@@ -802,6 +805,10 @@ async fn run_session(
                     pre.push((dr.to_string(), label.to_string(), v));
                 }
             }
+            // If this command can switch the autopilot on and it's off right now,
+            // undo should switch it back off (not leave it flying the reset dial).
+            let ap_was_off = engages_autopilot(&call.name)
+                && matches!(xplane.get_float(datarefs::SERVOS_ON).await, Ok(v) if v <= 0.5);
             let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice), status: reporter.status_sink(), reminders: Some(&reminders) };
             // Execute, retrying once on error: a single transient blip (a dropped
             // Web API request, including the autopilot-engage commands the client
@@ -823,8 +830,8 @@ async fn run_session(
             };
             // Arm the undo for this action (replacing any prior one — single-level,
             // the last command is what "belay that" targets).
-            if ok && !pre.is_empty() {
-                last_action = Some(UndoSnapshot { reverts: pre });
+            if ok && (!pre.is_empty() || ap_was_off) {
+                last_action = Some(UndoSnapshot { reverts: pre, disengage_ap: ap_was_off });
             }
             // Vary the acknowledgment on affirmative readbacks (bare callout most
             // of the time, "Roger,"/"Copy," occasionally); the canonical readback
@@ -1992,11 +1999,23 @@ async fn ap_mode(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
     }
 }
 
-/// The previous value of every dataref the last command changed, so an emergency
-/// "belay that" can restore them. Single-level: only the most recent action.
+/// The previous state the last command changed, so an emergency "belay that" can
+/// restore it. Single-level: only the most recent action.
 struct UndoSnapshot {
     /// (dataref, spoken label, previous value).
     reverts: Vec<(String, String, f64)>,
+    /// The last command switched the autopilot on (it was off before), so undo
+    /// should switch it back off, not just reset the dial it was flying to.
+    disengage_ap: bool,
+}
+
+/// Tools that can engage the autopilot servos. If one of these turns the AP on,
+/// "belay that" disengages it again.
+fn engages_autopilot(tool: &str) -> bool {
+    matches!(
+        tool,
+        "set_heading" | "set_altitude" | "set_vertical_speed" | "set_climb" | "navigate"
+    )
 }
 
 /// The reversible dataref(s) a tool writes, with a spoken label, so the command
