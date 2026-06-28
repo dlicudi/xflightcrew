@@ -358,6 +358,8 @@ async fn run_session(
     let mut fp_cache: Option<(Instant, simbrief::FlightPlan)> = None;
     // Memory of armed reminders, so the copilot can recall and cancel them.
     let reminders = tools::reminder::Reminders::default();
+    // The previous value of whatever the last command changed, for "belay that".
+    let mut last_action: Option<UndoSnapshot> = None;
     let mut listener = if continuous {
         // Share the speech arbiter's mic gate so the listener mutes itself while
         // the copilot speaks (readbacks and monitor alerts alike).
@@ -423,6 +425,34 @@ async fn run_session(
                 (transcript, false)
             }
         };
+
+        // EMERGENCY ABORT — highest priority, checked before the domain gate and any
+        // LLM. "belay that", "undo", "abort", "scratch that", "as you were" restore
+        // the datarefs the last command changed, so a misheard or wrong action (an
+        // echoed "heading zero", flaps at the wrong speed) can be pulled straight
+        // back. Deterministic and instant: a panic button must never wait on a model.
+        if is_undo(&command) {
+            match last_action.take() {
+                None => say(&voice, &reporter, ui::LogKind::Warn, "Nothing to undo."),
+                Some(snap) => {
+                    let mut restored: Vec<String> = Vec::new();
+                    for (dr, label, old) in &snap.reverts {
+                        if xplane.set_float(dr, *old).await.is_ok() {
+                            if !restored.contains(label) {
+                                restored.push(label.clone());
+                            }
+                        }
+                    }
+                    let line = if restored.is_empty() {
+                        "I couldn't revert that.".to_string()
+                    } else {
+                        format!("Belay that. Restored {}.", join_and(&restored))
+                    };
+                    say(&voice, &reporter, ui::LogKind::Warn, &line);
+                }
+            }
+            continue;
+        }
 
         // Domain gate, follow-up, and bare-value rewrite apply to SPOKEN input
         // only — phonetic nonsense and STT follow-ups are voice problems. A typed
@@ -762,25 +792,40 @@ async fn run_session(
             // Execute the curated tool (writes the dataref + reads back).
             reporter.status(ui::Phase::Thinking);
             let Some(tool) = registry.get(&call.name) else { continue };
+            // Snapshot the datarefs this tool is about to change, so "belay that"
+            // can put them back. Captured before the write; stored only if the write
+            // succeeds. Tools with no reversible dataref (engine start, pushback)
+            // contribute nothing and simply can't be undone.
+            let mut pre: Vec<(String, String, f64)> = Vec::new();
+            for (dr, label) in undoable_drefs(&call.name) {
+                if let Ok(v) = xplane.get_float(dr).await {
+                    pre.push((dr.to_string(), label.to_string(), v));
+                }
+            }
             let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice), status: reporter.status_sink(), reminders: Some(&reminders) };
             // Execute, retrying once on error: a single transient blip (a dropped
             // Web API request, including the autopilot-engage commands the client
             // doesn't itself retry) shouldn't fail an action. Every tool is safe to
             // re-run — value writes are idempotent and the toggle tools read state
             // before toggling — so a retry can't double-apply.
-            let readback = match tool.execute(&call.arguments, &ctx).await {
-                Ok(line) => line,
+            let (readback, ok) = match tool.execute(&call.arguments, &ctx).await {
+                Ok(line) => (line, true),
                 Err(first) => {
                     tracing::warn!("tool {} failed: {first:#}; retrying once", call.name);
                     match tool.execute(&call.arguments, &ctx).await {
-                        Ok(line) => line,
+                        Ok(line) => (line, true),
                         Err(e) => {
                             tracing::error!("tool {} failed on retry: {e:#}", call.name);
-                            "Something went wrong actioning that.".to_string()
+                            ("Something went wrong actioning that.".to_string(), false)
                         }
                     }
                 }
             };
+            // Arm the undo for this action (replacing any prior one — single-level,
+            // the last command is what "belay that" targets).
+            if ok && !pre.is_empty() {
+                last_action = Some(UndoSnapshot { reverts: pre });
+            }
             // Vary the acknowledgment on affirmative readbacks (bare callout most
             // of the time, "Roger,"/"Copy," occasionally); the canonical readback
             // is what's recorded for history context.
@@ -1947,6 +1992,64 @@ async fn ap_mode(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
     }
 }
 
+/// The previous value of every dataref the last command changed, so an emergency
+/// "belay that" can restore them. Single-level: only the most recent action.
+struct UndoSnapshot {
+    /// (dataref, spoken label, previous value).
+    reverts: Vec<(String, String, f64)>,
+}
+
+/// The reversible dataref(s) a tool writes, with a spoken label, so the command
+/// loop can snapshot them before the write and restore on "belay that". Tools that
+/// fire commands rather than set values (engine start, pushback, gyro align) have
+/// no entry and so can't be undone. Kept here, next to the undo logic, rather than
+/// in each tool: undo is a loop-level concern and this stays in one place.
+fn undoable_drefs(tool: &str) -> &'static [(&'static str, &'static str)] {
+    match tool {
+        "set_flaps" => &[("sim/cockpit2/controls/flap_ratio", "flaps")],
+        "set_throttle" => &[("sim/cockpit2/engine/actuators/throttle_ratio_all", "throttle")],
+        "set_mixture" | "lean_mixture" => &[("sim/cockpit2/engine/actuators/mixture_ratio_all", "mixture")],
+        "set_pitch_trim" => &[("sim/cockpit2/controls/elevator_trim", "pitch trim")],
+        "set_barometer" | "set_altimeter_current" => {
+            &[("sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot", "the altimeter")]
+        }
+        "set_heading" => &[("sim/cockpit2/autopilot/heading_dial_deg_mag_pilot", "the heading bug")],
+        "set_altitude" => &[("sim/cockpit2/autopilot/altitude_dial_ft", "the altitude select")],
+        "set_vertical_speed" | "set_climb" => &[("sim/cockpit/autopilot/vertical_velocity", "vertical speed")],
+        _ => &[],
+    }
+}
+
+/// An emergency abort/undo of the last action. Deterministic and matched before any
+/// gate or model, so it always works. Phrased a few natural ways a pilot would say
+/// it under stress.
+fn is_undo(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("belay")
+        || t.contains("undo")
+        || t.contains("scratch that")
+        || t.contains("as you were")
+        || t.contains("disregard")
+        || t.contains("revert")
+        || t.contains("reverse that")
+        || t.contains("take it back")
+        || t.contains("cancel that")
+        || t.contains("abort that")
+        || t.contains("abort the last")
+        || t == "abort"
+        || t.starts_with("abort.")
+}
+
+/// Join words as "a", "a and b", or "a, b and c" for a natural spoken list.
+fn join_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [a] => a.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
 /// Example commands shown in the dashboard's "say" panel.
 /// Aviation vocabulary that a real command contains at least one of. Used to
 /// reject phonetic nonsense that whisper transcribes with high confidence
@@ -2001,6 +2104,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "descent", "tod",
     // reminders ("wake me at top of descent", "remind me in 10 minutes")
     "wake", "remind", "notify", "heads-up", "reminder", "reminders", "cancel",
+    // emergency abort/undo of the last action
+    "belay", "undo", "abort", "disregard", "scratch", "revert",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,
@@ -2175,7 +2280,37 @@ fn command_hints() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_abort, is_affirmative};
+    use super::{is_abort, is_affirmative, is_undo, join_and, undoable_drefs};
+
+    #[test]
+    fn undo_recognizes_emergency_phrasings() {
+        for w in ["belay that", "undo", "undo that", "abort", "scratch that", "as you were",
+                  "disregard", "revert", "reverse that", "take it back", "cancel that"] {
+            assert!(is_undo(w), "{w:?} should trigger undo");
+        }
+        // Not an undo (would clobber normal speech / the reminder cancel).
+        for w in ["set heading 270", "cancel the reminders", "flaps up"] {
+            assert!(!is_undo(w), "{w:?} should not trigger undo");
+        }
+    }
+
+    #[test]
+    fn value_tools_are_undoable_command_tools_are_not() {
+        assert!(!undoable_drefs("set_heading").is_empty());
+        assert!(!undoable_drefs("set_throttle").is_empty());
+        assert!(undoable_drefs("start_engine").is_empty());
+        assert!(undoable_drefs("pushback").is_empty());
+    }
+
+    #[test]
+    fn join_and_reads_naturally() {
+        assert_eq!(join_and(&["flaps".into()]), "flaps");
+        assert_eq!(join_and(&["flaps".into(), "throttle".into()]), "flaps and throttle");
+        assert_eq!(
+            join_and(&["flaps".into(), "throttle".into(), "mixture".into()]),
+            "flaps, throttle, and mixture"
+        );
+    }
 
     #[test]
     fn abort_is_distinct_from_skip_and_yes() {
