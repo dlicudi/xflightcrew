@@ -177,51 +177,49 @@ impl Tool for SetMixture {
     }
 }
 
-/// Ease the mixture leaner step by step from a rich start, sampling `metric`
-/// (EGT or RPM) after each step, until it peaks (drops `drop_margin` below the
-/// best seen) or the lean floor is reached. Returns the mixture at the peak and
-/// the peak value. Approaching from the rich side means the metric rises to the
-/// peak then falls, which is what makes the peak detectable.
+/// Draw the mixture leaner in a smooth, continuous creep from a rich start,
+/// sampling `metric` (EGT or RPM) as it goes, until it peaks (drops `drop_margin`
+/// below the best seen) or the lean floor is reached. Returns the mixture at the
+/// observed peak and the peak value. Approaching from the rich side means the
+/// metric rises to the peak then falls, which is what makes the peak detectable.
+///
+/// The lever moves in tiny direct increments on a steady tick (no per-step ramp or
+/// long settle pauses), so it looks like a hand slowly leaning it rather than
+/// hopping between detents. The metric lags the lever by ~a second in the sim, so
+/// the detected peak sits a little lean of the true peak — the caller nudges back
+/// rich to compensate.
 async fn seek_metric_peak(ctx: &ToolCtx<'_>, metric: &str, drop_margin: f64) -> Result<(f64, f64)> {
-    // Small increments, each eased, so the lever creeps naturally like a hand
-    // leaning it rather than hopping.
-    const STEP: f64 = 0.02;
-    // EGT/RPM lag the mixture by ~a second in the sim, so settle generously or the
-    // reading trails the lever and the peak is misread (the old fast sweep bailed
-    // at the rich start, leaving ~98%).
-    const SETTLE_MS: u64 = 600;
-    // Don't declare a peak until we've leaned past the rich plateau...
-    const MIN_STEPS_BEFORE_STOP: u32 = 4;
-    // ...and the metric has stayed down for two samples (debounce lag/noise).
-    const CONSEC_DROPS_TO_STOP: u32 = 2;
+    const INCREMENT: f64 = 0.004; // per tick — tiny, for a smooth continuous creep
+    const TICK_MS: u64 = 70;
+    // Lean at least this far past the rich start before a drop can end it (clears
+    // the rich plateau and the initial lag).
+    const MIN_LEAN_BEFORE_STOP: f64 = 0.08;
+    // Sustained ticks below the peak before stopping (debounce lag/noise).
+    const CONSEC_DROPS_TO_STOP: u32 = 6;
 
-    ramp_actuator(ctx, MIXTURE, 0.95).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    ramp_actuator(ctx, MIXTURE, 0.95).await?; // ease to the rich start
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await; // let it settle
 
     let mut mix = 0.95;
     let mut best_mix = mix;
     let mut best_val = engine0(ctx, metric, 0.0).await;
-    let mut steps = 0u32;
-    let mut consec_drops = 0u32;
+    let mut drops = 0u32;
     while mix > MIX_LEAN_FLOOR {
-        mix = (mix - STEP).max(MIX_LEAN_FLOOR);
-        // Ease each step like a hand on the lever (same as the throttle), then let
-        // the reading settle before sampling.
-        ramp_actuator(ctx, MIXTURE, mix).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(SETTLE_MS)).await;
+        mix = (mix - INCREMENT).max(MIX_LEAN_FLOOR);
+        ctx.xplane.set_float(MIXTURE, mix).await?; // direct tiny write = smooth creep
+        tokio::time::sleep(std::time::Duration::from_millis(TICK_MS)).await;
         let val = engine0(ctx, metric, 0.0).await;
-        steps += 1;
         if val > best_val {
             best_val = val;
             best_mix = mix;
-            consec_drops = 0;
-        } else if best_val - val >= drop_margin {
-            consec_drops += 1;
-            if steps > MIN_STEPS_BEFORE_STOP && consec_drops >= CONSEC_DROPS_TO_STOP {
+            drops = 0;
+        } else if best_val - val >= drop_margin && (0.95 - mix) > MIN_LEAN_BEFORE_STOP {
+            drops += 1;
+            if drops >= CONSEC_DROPS_TO_STOP {
                 break; // confirmed past the peak
             }
         } else {
-            consec_drops = 0;
+            drops = 0;
         }
     }
     Ok((best_mix, best_val))
