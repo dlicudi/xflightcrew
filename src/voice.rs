@@ -50,6 +50,8 @@ struct Utterance {
     /// Monotonic enqueue order, for FIFO tie-breaking within a priority.
     seq: u64,
     text: String,
+    /// Play the attention chime just before speaking this one (reminders).
+    chime: bool,
     /// Present for blocking callers; signalled once the utterance is spoken.
     done: Option<Arc<Latch>>,
 }
@@ -123,7 +125,7 @@ impl Voice {
         self.gate.clone()
     }
 
-    fn enqueue(&self, priority: Priority, text: String, done: Option<Arc<Latch>>) {
+    fn enqueue(&self, priority: Priority, text: String, done: Option<Arc<Latch>>, chime: bool) {
         // No em/en dashes reach the TTS — they trip it up. One chokepoint for
         // every spoken utterance (readbacks, monitor callouts, prompts).
         let text = crate::phrase::scrub_dashes(&text);
@@ -134,6 +136,7 @@ impl Voice {
             priority,
             seq,
             text,
+            chime,
             done,
         });
         drop(q);
@@ -143,7 +146,13 @@ impl Voice {
     /// Queue an utterance and return immediately (monitor alerts).
     #[allow(dead_code)] // used by the monitor (next milestone)
     pub fn alert(&self, priority: Priority, text: impl Into<String>) {
-        self.enqueue(priority, text.into(), None);
+        self.enqueue(priority, text.into(), None, false);
+    }
+
+    /// Queue an utterance preceded by the attention chime, and return immediately.
+    /// Used by reminders: a short beep, then the heads-up.
+    pub fn chime(&self, priority: Priority, text: impl Into<String>) {
+        self.enqueue(priority, text.into(), None, true);
     }
 
     /// Queue an utterance and block until it has been spoken (command readbacks:
@@ -153,7 +162,7 @@ impl Voice {
             spoken: Mutex::new(false),
             cv: Condvar::new(),
         });
-        self.enqueue(priority, text.into(), Some(latch.clone()));
+        self.enqueue(priority, text.into(), Some(latch.clone()), false);
         let mut spoken = latch.spoken.lock().unwrap();
         while !*spoken {
             spoken = latch.cv.wait(spoken).unwrap();
@@ -236,6 +245,7 @@ impl Speaker {
 /// drains — so a burst of utterances stays gated end to end, with no momentary
 /// gap between them for the mic to slip through.
 fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
+    let chime_path = resolve_chime(&config.chime_path);
     let mut speaker = Speaker::build(config);
     loop {
         let mut q = inner.queue.lock().unwrap();
@@ -254,6 +264,13 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         drop(q); // release the queue while we speak (which is slow)
 
         gate.set_speaking(true);
+        if utt.chime {
+            if let Some(path) = &chime_path {
+                if let Err(e) = crate::tts::play(path) {
+                    tracing::warn!("chime failed: {e:#}");
+                }
+            }
+        }
         if let Err(e) = speaker.speak(&utt.text) {
             tracing::warn!("TTS failed: {e:#}");
         }
@@ -265,12 +282,27 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
     }
 }
 
+/// Resolve the reminder chime to a playable file, or `None` to skip it. An
+/// explicit `XCOPILOT_CHIME` wins; otherwise fall back to a pleasant macOS system
+/// sound. Only returns a path that actually exists, so a stale setting just means
+/// "no chime" rather than a failed play every time.
+fn resolve_chime(configured: &str) -> Option<std::path::PathBuf> {
+    let candidate = if !configured.is_empty() {
+        std::path::PathBuf::from(configured)
+    } else if cfg!(target_os = "macos") {
+        std::path::PathBuf::from("/System/Library/Sounds/Glass.aiff")
+    } else {
+        return None;
+    };
+    candidate.exists().then_some(candidate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn utt(priority: Priority, seq: u64) -> Utterance {
-        Utterance { priority, seq, text: String::new(), done: None }
+        Utterance { priority, seq, text: String::new(), chime: false, done: None }
     }
 
     #[test]

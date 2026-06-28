@@ -641,6 +641,7 @@ mod tests {
             tts_backend: "say".into(),
             say_voice: String::new(),
             say_rate: String::new(),
+            chime_path: String::new(),
             piper_binary: String::new(),
             piper_voice: String::new(),
             tts_sidecar_url: String::new(),

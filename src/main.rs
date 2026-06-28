@@ -1796,6 +1796,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "navigate", "follow", "track",
     // navigation progress queries
     "waypoint", "eta",
+    // reminders ("wake me at top of descent", "remind me in 10 minutes")
+    "wake", "remind", "notify", "heads-up",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,

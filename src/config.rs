@@ -69,6 +69,11 @@ pub struct Config {
     /// macOS `say` rate in words per minute (used when `tts_backend = "say"`).
     /// Empty = default (~175). Lower for a calmer cadence.
     pub say_rate: String,
+    /// Sound played just before a reminder calls out (a short chime, so a heads-up
+    /// gets your attention before the words). A WAV/AIFF path; empty = a platform
+    /// default (macOS `Glass.aiff`). Point it at any sound you like, including one
+    /// pulled from X-Plane's `Resources/sounds`. `XCOPILOT_CHIME`.
+    pub chime_path: String,
     /// The `piper` binary to shell out to (used when `tts_backend = "piper"`).
     pub piper_binary: String,
     /// Path to a piper voice model (`.onnx`); the matching `.onnx.json` must sit beside it.
@@ -143,6 +148,7 @@ impl Config {
             tts_backend: env_or("XCOPILOT_TTS", "sidecar"),
             say_voice: env_or("XCOPILOT_SAY_VOICE", ""),
             say_rate: env_or("XCOPILOT_SAY_RATE", ""),
+            chime_path: env_or("XCOPILOT_CHIME", ""),
             piper_binary: env_or("PIPER_BIN", "piper"),
             piper_voice: env_or("PIPER_VOICE", "models/en_US-amy-medium.onnx"),
             tts_sidecar_url: env_or("XCOPILOT_TTS_SIDECAR_URL", "http://127.0.0.1:8765/synth"),

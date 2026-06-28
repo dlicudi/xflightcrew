@@ -20,6 +20,7 @@ pub mod ground;
 pub mod instruments;
 pub mod lights;
 pub mod radio;
+pub mod reminder;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -197,6 +198,10 @@ impl Registry {
         tools.push(Box::new(ground::SetGroundPower));
         tools.push(Box::new(ground::Pushback));
         tools.push(Box::new(ground::RequestService));
+
+        // Reminders ("wake me at top of descent", "tell me at the next waypoint") are
+        // crew memory, not an airframe system, so available on any aircraft.
+        tools.push(Box::new(reminder::SetReminder));
 
         // Checklists are NOT registered as one-shot tools — the copilot runs them
         // interactively (narrate + act + verify + call out the pilot's items),

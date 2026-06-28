@@ -163,6 +163,31 @@ fn onoff(t: &str) -> Option<bool> {
 fn parse_one(t: &str) -> Option<ToolCall> {
     let num = number(t);
 
+    // Reminders: "wake me at top of descent", "tell me when we reach 5000 feet",
+    // "remind me in 10 minutes", "let me know at the next waypoint". The verb gates
+    // it so a plain "top of descent" or a bare altitude isn't swallowed; an
+    // unrecognized target falls through (e.g. "tell me the weather").
+    let reminder_verb = has(t, "wake") || has(t, "remind") || has(t, "notify")
+        || (has(t, "tell") && has(t, "me")) || t.contains("let me know")
+        || t.contains("heads up") || t.contains("heads-up");
+    if reminder_verb {
+        if t.contains("top of descent") || has(t, "tod") || (has(t, "descent") && !has(t, "rate")) {
+            return Some(call("set_reminder", json!({ "kind": "top_of_descent" })));
+        }
+        if has(t, "waypoint") || has(t, "fix") {
+            return Some(call("set_reminder", json!({ "kind": "next_waypoint" })));
+        }
+        if (has(t, "minute") || has(t, "minutes")) && num.is_some() {
+            return Some(call("set_reminder", json!({ "kind": "minutes", "value": num })));
+        }
+        if num.is_some()
+            && (has(t, "feet") || has(t, "foot") || has(t, "altitude") || has(t, "reach")
+                || has(t, "at") || has(t, "when"))
+        {
+            return Some(call("set_reminder", json!({ "kind": "altitude", "value": num })));
+        }
+    }
+
     // Smart leaning. An explicit "lean ..." (auto/power) must beat the throttle
     // branch ("max power" → throttle), since "lean" means the mixture. A bare
     // mixture adjustment with no target ("adjust the mixture", "mixture for
@@ -541,6 +566,16 @@ mod tests {
             let c = v.remove(0);
             (c.name, c.arguments)
         })
+    }
+
+    #[test]
+    fn reminders_resolve_deterministically() {
+        assert_eq!(one("wake me at top of descent").unwrap(), ("set_reminder".into(), json!({"kind":"top_of_descent"})));
+        assert_eq!(one("let me know at the next waypoint").unwrap(), ("set_reminder".into(), json!({"kind":"next_waypoint"})));
+        assert_eq!(one("remind me in 10 minutes").unwrap(), ("set_reminder".into(), json!({"kind":"minutes","value":10})));
+        assert_eq!(one("wake me at 5000 feet").unwrap(), ("set_reminder".into(), json!({"kind":"altitude","value":5000})));
+        // A reminder verb with no recognized target falls through (not a reminder).
+        assert!(one("tell me the altitude").map(|c| c.0) != Some("set_reminder".into()));
     }
 
     #[test]
