@@ -150,6 +150,25 @@ pub fn scrub_dashes(s: &str) -> String {
         .replace('–', "-")
 }
 
+/// Word-set Jaccard similarity in 0..1, case/punctuation-insensitive. Used to spot
+/// the copilot hearing its own readback over the speakers: a high score against
+/// something it just spoke means the "command" is an echo, not the pilot.
+pub fn word_similarity(a: &str, b: &str) -> f64 {
+    use std::collections::HashSet;
+    let toks = |s: &str| -> HashSet<String> {
+        s.to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let (a, b) = (toks(a), toks(b));
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    a.intersection(&b).count() as f64 / a.union(&b).count() as f64
+}
+
 /// Repair distinctive *whole-word* mishearings whisper makes on cockpit terms,
 /// where the entire keyword is gone — so neither the domain gate's fuzzy match
 /// nor the grammar's token match can recover it (those only catch near-misses
@@ -233,6 +252,20 @@ fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn echo_scores_high_real_command_low() {
+        // A full readback coming back (numbers spelled out, minor mishears) scores
+        // above the 0.55 echo threshold.
+        let spoken = "Roger, autopilot engaged, vertical speed mode, climb 500 feet per minute.";
+        let echo = "Roger. Autopilot engaged. Vertical speed mode. Climb five hundred feet per minute.";
+        assert!(word_similarity(echo, spoken) >= 0.55, "echo should score high");
+        // An echo fragment glued to a real command stays below, so the command survives.
+        let mixed = "Throttle one hundred percent. Descend to three thousand feet.";
+        assert!(word_similarity(mixed, "Throttle 100 percent.") < 0.55, "mixed should score low");
+        // Unrelated commands don't collide.
+        assert!(word_similarity("flaps up", "throttle 100 percent") < 0.55);
+    }
 
     #[test]
     fn fixes_gyro_mishears() {

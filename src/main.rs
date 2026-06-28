@@ -409,6 +409,15 @@ async fn run_session(
                     continue;
                 }
 
+                // Echo gate: if this transcript matches a readback the copilot just
+                // spoke, it's the copilot's own voice coming back through the speakers
+                // (not the pilot). Drop it, so a readback can't re-trigger itself into
+                // a feedback loop. Headphones avoid the bleed; this covers speakers.
+                if voice.is_self_echo(&transcript) {
+                    reporter.log(ui::LogKind::Info, "ignored self-echo (own readback)");
+                    continue;
+                }
+
                 // Continuous mode acts on the transcript directly — the downstream
                 // domain gate (`looks_like_command`) filters non-commands.
                 (transcript, false)

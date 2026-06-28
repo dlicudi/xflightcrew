@@ -19,10 +19,19 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 use crate::audio::MicGate;
 use crate::config::Config;
 use crate::tts;
+
+/// How long a spoken phrase stays on the echo watch-list. Long enough to cover a
+/// readback bleeding back after a pause, short enough not to gag a genuine repeat.
+const ECHO_MEMORY: std::time::Duration = std::time::Duration::from_secs(12);
+/// Word-overlap at or above this against something just said = treat as self-echo.
+/// Tuned so a full readback coming back scores high while a partial overlap (an
+/// echo fragment glued to a real command) stays below and is still acted on.
+const ECHO_SIMILARITY: f64 = 0.55;
 
 /// Speech priority. Declaration order *is* the ranking (low → high); a max-heap
 /// pops the highest first. Warning preempts Caution preempts a command readback
@@ -87,6 +96,10 @@ struct Inner {
     queue: Mutex<Queue>,
     /// Signalled when work is queued (or on shutdown) to wake the speaker.
     cv: Condvar,
+    /// What the copilot has spoken recently, with when it finished. The listener
+    /// checks heard transcripts against this to reject its own voice coming back
+    /// over the speakers (echo) rather than acting on it.
+    spoken: Mutex<Vec<(Instant, String)>>,
 }
 
 /// Handle to the speech arbiter. Cheap to clone — hand one to every thread that
@@ -108,6 +121,7 @@ impl Voice {
                 shutdown: false,
             }),
             cv: Condvar::new(),
+            spoken: Mutex::new(Vec::new()),
         });
         let gate = MicGate::new();
         let speaker = inner.clone();
@@ -123,6 +137,16 @@ impl Voice {
     /// so it can mute itself and the copilot never hears its own voice.
     pub fn mic_gate(&self) -> MicGate {
         self.gate.clone()
+    }
+
+    /// True if `heard` closely matches something the copilot said in the last few
+    /// seconds — i.e. its own readback bleeding back through the speakers. The
+    /// command loop drops such transcripts instead of acting on them.
+    pub fn is_self_echo(&self, heard: &str) -> bool {
+        let said = self.inner.spoken.lock().unwrap();
+        said.iter()
+            .filter(|(t, _)| t.elapsed() < ECHO_MEMORY)
+            .any(|(_, text)| crate::phrase::word_similarity(heard, text) >= ECHO_SIMILARITY)
     }
 
     fn enqueue(&self, priority: Priority, text: String, done: Option<Arc<Latch>>, chime: bool) {
@@ -273,6 +297,13 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         }
         if let Err(e) = speaker.speak(&utt.text) {
             tracing::warn!("TTS failed: {e:#}");
+        }
+        // Remember what we just said (it just finished playing) so the listener can
+        // reject this audio if it bleeds back through the mic. Prune the old.
+        {
+            let mut said = inner.spoken.lock().unwrap();
+            said.push((Instant::now(), utt.text.clone()));
+            said.retain(|(t, _)| t.elapsed() < ECHO_MEMORY);
         }
 
         if let Some(latch) = utt.done {
