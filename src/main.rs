@@ -470,8 +470,13 @@ async fn run_session(
                     if snap.disengage_ap && xplane.run_command("sim/autopilot/servos_off_any").await.is_ok() {
                         acts.push("autopilot disengaged".to_string());
                     }
-                    for (dr, label, old) in &snap.reverts {
-                        if xplane.set_float(dr, *old).await.is_ok() {
+                    for (dr, label, old, is_int) in &snap.reverts {
+                        let restored = if *is_int {
+                            xplane.set_int(dr, old.round() as i64).await.is_ok()
+                        } else {
+                            xplane.set_float(dr, *old).await.is_ok()
+                        };
+                        if restored {
                             acts.push(format!("{label} restored"));
                         }
                     }
@@ -771,7 +776,7 @@ async fn run_session(
         let mut turn_readbacks: Vec<String> = Vec::new();
         // Recovery for everything this utterance does, gathered so one "belay that"
         // undoes the whole set of commands, not just the last tool.
-        let mut turn_reverts: Vec<(String, String, f64)> = Vec::new();
+        let mut turn_reverts: Vec<(String, String, f64, bool)> = Vec::new();
         let mut turn_disengage_ap = false;
         let mut turn_inverse: Vec<(String, serde_json::Value)> = Vec::new();
         for mut call in calls {
@@ -853,10 +858,10 @@ async fn run_session(
             // can put them back. Captured before the write; stored only if the write
             // succeeds. Tools with no reversible dataref (engine start, pushback)
             // contribute nothing and simply can't be undone.
-            let mut pre: Vec<(String, String, f64)> = Vec::new();
-            for (dr, label) in undoable_drefs(&call.name) {
+            let mut pre: Vec<(String, String, f64, bool)> = Vec::new();
+            for (dr, label, is_int) in undoable_drefs(&call.name) {
                 if let Ok(v) = xplane.get_float(dr).await {
-                    pre.push((dr.to_string(), label.to_string(), v));
+                    pre.push((dr.to_string(), label.to_string(), v, *is_int));
                 }
             }
             // If this command can switch the autopilot on and it's off right now,
@@ -2084,8 +2089,8 @@ async fn ap_mode(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
 struct UndoSnapshot {
     /// What the pilot said, for the readback ("belay the throttle").
     label: String,
-    /// (dataref, spoken label, previous value) to write back.
-    reverts: Vec<(String, String, f64)>,
+    /// (dataref, spoken label, previous value, is-integer) to write back.
+    reverts: Vec<(String, String, f64, bool)>,
     /// The action switched the autopilot on (it was off before), so undo should
     /// switch it back off, not just reset the dial it was flying to.
     disengage_ap: bool,
@@ -2107,23 +2112,38 @@ fn engages_autopilot(tool: &str) -> bool {
     )
 }
 
-/// The reversible dataref(s) a tool writes, with a spoken label, so the command
-/// loop can snapshot them before the write and restore on "belay that". Tools that
-/// fire commands rather than set values (engine start, pushback, gyro align) have
-/// no entry and so can't be undone. Kept here, next to the undo logic, rather than
-/// in each tool: undo is a loop-level concern and this stays in one place.
-fn undoable_drefs(tool: &str) -> &'static [(&'static str, &'static str)] {
+/// One reversible dataref a tool writes: (dataref, spoken label, is it an integer
+/// dataref). The int flag matters on restore — transponder/radio datarefs are
+/// integers and must be written with `set_int`, not `set_float`.
+type Undoable = (&'static str, &'static str, bool);
+const F: bool = false; // float dataref
+const I: bool = true; // integer dataref
+
+/// The reversible dataref(s) a tool writes, so the command loop can snapshot them
+/// before the write and restore on "belay that". Tools that fire commands rather
+/// than set values (engine start, pushback, gyro align) have no entry; engine
+/// shutdown is undone by an inverse command instead (see the capture loop). Kept
+/// here, next to the undo logic, rather than in each tool: undo is a loop-level
+/// concern and this keeps it in one place.
+fn undoable_drefs(tool: &str) -> &'static [Undoable] {
     match tool {
-        "set_flaps" => &[("sim/cockpit2/controls/flap_ratio", "flaps")],
-        "set_throttle" => &[("sim/cockpit2/engine/actuators/throttle_ratio_all", "throttle")],
-        "set_mixture" | "lean_mixture" => &[("sim/cockpit2/engine/actuators/mixture_ratio_all", "mixture")],
-        "set_pitch_trim" => &[("sim/cockpit2/controls/elevator_trim", "pitch trim")],
+        "set_flaps" => &[("sim/cockpit2/controls/flap_ratio", "flaps", F)],
+        "set_throttle" => &[("sim/cockpit2/engine/actuators/throttle_ratio_all", "throttle", F)],
+        "set_mixture" | "lean_mixture" => &[("sim/cockpit2/engine/actuators/mixture_ratio_all", "mixture", F)],
+        "set_pitch_trim" => &[("sim/cockpit2/controls/elevator_trim", "pitch trim", F)],
         "set_barometer" | "set_altimeter_current" => {
-            &[("sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot", "the altimeter")]
+            &[("sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot", "the altimeter", F)]
         }
-        "set_heading" => &[("sim/cockpit2/autopilot/heading_dial_deg_mag_pilot", "the heading bug")],
-        "set_altitude" => &[("sim/cockpit2/autopilot/altitude_dial_ft", "the altitude select")],
-        "set_vertical_speed" | "set_climb" => &[("sim/cockpit/autopilot/vertical_velocity", "vertical speed")],
+        "set_parking_brake" => &[("sim/cockpit2/controls/parking_brake_ratio", "the parking brake", F)],
+        "set_heading" => &[("sim/cockpit2/autopilot/heading_dial_deg_mag_pilot", "the heading bug", F)],
+        "set_altitude" => &[("sim/cockpit2/autopilot/altitude_dial_ft", "the altitude select", F)],
+        "set_vertical_speed" | "set_climb" => &[("sim/cockpit/autopilot/vertical_velocity", "vertical speed", F)],
+        "set_transponder" => &[("sim/cockpit2/radios/actuators/transponder_code", "the squawk", I)],
+        "set_transponder_mode" => &[("sim/cockpit2/radios/actuators/transponder_mode", "the transponder mode", I)],
+        "set_com1" => &[("sim/cockpit2/radios/actuators/com1_frequency_hz_833", "com 1", I)],
+        "set_com2" => &[("sim/cockpit2/radios/actuators/com2_frequency_hz_833", "com 2", I)],
+        "set_nav1" => &[("sim/cockpit2/radios/actuators/nav1_frequency_hz", "nav 1", I)],
+        "set_obs" => &[("sim/cockpit2/radios/actuators/nav1_obs_deg_mag_pilot", "the OBS", F)],
         _ => &[],
     }
 }
