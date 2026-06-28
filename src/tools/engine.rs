@@ -278,35 +278,31 @@ impl Tool for LeanMixture {
             "rich" => {
                 ramp_actuator(ctx, MIXTURE, 1.0).await?;
                 Ok(format!(
-                    "Below {LEAN_FLOOR_ALT_FT:.0} feet — mixture full rich. I'll lean for cruise once we're higher."
+                    "Below {LEAN_FLOOR_ALT_FT:.0} feet, mixture full rich. I'll lean for cruise once we're higher."
                 ))
             }
             "economy" => {
-                // Don't lean to peak at high power down low — detonation risk. (Up
-                // high, full throttle is still <75% power, so leaning is correct.)
+                // Don't lean hard at high power down low (detonation risk). Up high,
+                // full throttle is still under 75% power, so leaning is correct.
                 if alt < LEAN_FLOOR_ALT_FT && ctx.xplane.get_float(THROTTLE).await.unwrap_or(0.0) > 0.80 {
                     return Ok(
-                        "We're at high power down low — I'll hold off leaning to peak; \
+                        "We're at high power down low, I'll hold off leaning; \
                          leaning hard there risks detonation. Reduce to cruise power or climb first."
                             .to_string(),
                     );
                 }
-                let (best, egt) = seek_metric_peak(ctx, EGT_CEL, 12.0).await?;
-                // If the peak is still right at the rich start, the seek never saw
-                // EGT climb (low power, or the engine isn't loaded enough to lean) —
-                // leave it rich and say so rather than reporting a bogus ~98%.
-                if best > 0.90 {
-                    ramp_actuator(ctx, MIXTURE, 1.0).await?;
-                    return Ok("Couldn't find a clear EGT peak, leaving the mixture rich. Try leaning at cruise power.".to_string());
-                }
-                // Set slightly rich of peak so EGT sits just below peak, the safe
-                // side the POH calls for ("slightly below the peak observed EGT").
-                ramp_actuator(ctx, MIXTURE, (best + 0.03).min(1.0)).await?;
+                // Altitude-based target: the best-economy lever position leans with
+                // altitude (EGT peak tracks air density). Deterministic and reliable
+                // — a live peak-EGT seek is too fragile with the sim's EGT lag.
+                // ~0.92 near sea level down to ~0.55 up high.
+                let target = (0.92 - (alt / 1000.0) * 0.033).clamp(0.50, 0.95);
+                // Smooth eased ramp to the target, same as the throttle.
+                ramp_actuator(ctx, MIXTURE, target).await?;
                 let pct = ctx.xplane.get_float(MIXTURE).await? * 100.0;
                 let gph = engine0(ctx, FUEL_FLOW_KG_S, 0.0).await * 3600.0 / AVGAS_KG_PER_GAL;
-                let egt_f = egt * 9.0 / 5.0 + 32.0; // gauge/POH read EGT in °F
+                let egt_f = engine0(ctx, EGT_CEL, 0.0).await * 9.0 / 5.0 + 32.0; // dataref is °C
                 Ok(format!(
-                    "Leaned for cruise — mixture {pct:.0} percent, peak EGT {egt_f:.0} degrees, burning {gph:.1} gallons an hour."
+                    "Leaned for cruise, mixture {pct:.0} percent, EGT {egt_f:.0} degrees, burning {gph:.1} gallons an hour."
                 ))
             }
             _ => {
