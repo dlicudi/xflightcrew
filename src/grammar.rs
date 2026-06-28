@@ -163,14 +163,17 @@ fn onoff(t: &str) -> Option<bool> {
 fn parse_one(t: &str) -> Option<ToolCall> {
     let num = number(t);
 
-    // Smart leaning (no explicit percentage): "lean for cruise", "lean it out",
-    // "lean for max power". Must beat the throttle branch ("max power" → throttle)
-    // — the word "lean" means the mixture. A number, or an explicit rich/cutoff,
+    // Smart leaning. An explicit "lean ..." (auto/power) must beat the throttle
+    // branch ("max power" → throttle), since "lean" means the mixture. A bare
+    // mixture adjustment with no target ("adjust the mixture", "mixture for
+    // cruise") also means "set it appropriately" → lean_mixture, rather than the
+    // LLM guessing a percentage. A number, idle cutoff, or a rich/full/max request
     // falls through to set_mixture below.
-    if num.is_none() && !has(t, "rich") && !t.contains("cutoff") {
-        let wants_lean = has(t, "lean")
-            || (has(t, "mixture") && (t.contains("cruise") || t.contains("peak") || t.contains("egt")));
-        if wants_lean {
+    if num.is_none() && !t.contains("cutoff") {
+        let lean_word = has(t, "lean");
+        let bare_mixture =
+            has(t, "mixture") && !t.contains("rich") && !t.contains("full") && !t.contains("max");
+        if lean_word || bare_mixture {
             let mode = if t.contains("power") || t.contains("rpm") { "power" } else { "auto" };
             return Some(call("lean_mixture", json!({ "mode": mode })));
         }
@@ -237,9 +240,11 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("set_throttle", json!({ "percent": 0 })));
     }
 
-    // mixture: full rich / maximum → 100, idle cutoff → 0, else numeric.
+    // mixture: full rich / maximum → 100, idle cutoff → 0, else numeric. (A bare
+    // mixture adjustment was already routed to lean_mixture above.) "rich" as a
+    // substring so "enrich"/"richen" also go full rich, not lean.
     if has(t, "mixture") {
-        if t.contains("maximum") || t.contains("max") || t.contains("full") || has(t, "rich") {
+        if t.contains("maximum") || t.contains("max") || t.contains("full") || t.contains("rich") {
             return Some(call("set_mixture", json!({ "percent": 100 })));
         }
         if t.contains("cutoff") || t.contains("cut off") || has(t, "cut") {
@@ -543,6 +548,12 @@ mod tests {
         assert_eq!(one("mixture for cruise").unwrap(), ("lean_mixture".into(), json!({"mode":"auto"})));
         assert_eq!(one("lean for max power").unwrap(), ("lean_mixture".into(), json!({"mode":"power"})));
         assert_eq!(one("lean the mixture to 70 percent").unwrap().0, "set_mixture");
+        // A bare mixture adjustment (no number) means "set it right" → lean_mixture.
+        assert_eq!(one("adjust the mixture").unwrap(), ("lean_mixture".into(), json!({"mode":"auto"})));
+        assert_eq!(one("sort out the mixture").unwrap().0, "lean_mixture");
+        // ...but enrich/richen/full still go full rich, not lean.
+        assert_eq!(one("enrich the mixture").unwrap(), ("set_mixture".into(), json!({"percent":100})));
+        assert_eq!(one("richen the mixture").unwrap().1, json!({"percent":100}));
         assert_eq!(one("heading 270").unwrap().1, json!({"heading":270}));
         assert_eq!(one("turn heading south").unwrap().1, json!({"heading":180}));
         assert_eq!(one("change heading to northeast").unwrap().1, json!({"heading":45}));
