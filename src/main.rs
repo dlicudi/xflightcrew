@@ -500,6 +500,15 @@ async fn run_session(
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
+            // Navigation progress (often a command, not a question): ETA / distance /
+            // time to the next waypoint.
+            if tl.contains("next waypoint") || tl.contains("next fix") || tl.contains("eta")
+                || tl.contains("how far") || tl.contains("time to") || tl.contains("distance to")
+            {
+                let line = nav_progress(&xplane, Some(&live)).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
             // "route" is reliably misheard as "root"/"road" (both meaningless in a
             // cockpit), so accept them as synonyms.
             let routeish = tl.contains("route") || tl.contains("root") || tl.contains("road");
@@ -1122,6 +1131,31 @@ const AVGAS_KG_PER_GAL: f64 = 2.72;
 /// Meters per second → knots.
 const MS_TO_KTS: f64 = 1.943_844;
 
+/// The active GPS waypoint with distance and time/ETA to it — answers "ETA",
+/// "distance/time to next waypoint", "how far". Often phrased as a command, not a
+/// question, so it's dispatched unconditionally rather than via answer_state_query.
+async fn nav_progress(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
+    let wp = xp.get_string("sim/cockpit2/radios/indicators/gps_nav_id").await.unwrap_or_default();
+    let dist = read1(live, xp, "sim/cockpit2/radios/indicators/gps_dme_distance_nm").await.ok();
+    let tmin = read1(live, xp, "sim/cockpit2/radios/indicators/gps_dme_time_min").await.ok();
+    if wp.trim().is_empty() && dist.is_none() {
+        return "No active GPS waypoint. Load and navigate a route first.".to_string();
+    }
+    let mut s = String::new();
+    if !wp.trim().is_empty() {
+        s.push_str(&format!("Next waypoint {}, ", wp.trim()));
+    }
+    if let Some(d) = dist {
+        s.push_str(&format!("{d:.0} miles", ));
+    }
+    if let Some(tm) = tmin {
+        let (h, mn) = ((tm / 60.0) as i32, (tm % 60.0).round() as i32);
+        let time = if h > 0 { format!("{h} hours {mn} minutes") } else { format!("{mn} minutes") };
+        s.push_str(&format!(", {time}"));
+    }
+    format!("{}.", s.trim_end_matches([',', ' ']))
+}
+
 /// First element of a per-engine array dataref (engine 1), or `None` on a failed
 /// read. Engine indicators are arrays, so they bypass the scalar `read1`/cache.
 async fn read_engine0(xp: &XPlaneClient, name: &str) -> Option<f64> {
@@ -1427,31 +1461,6 @@ async fn answer_state_query(
     let t = cmd.to_ascii_lowercase();
     let mut parts: Vec<String> = Vec::new();
 
-    // Navigation progress: the active GPS waypoint with distance and ETA to it.
-    if t.contains("next waypoint") || t.contains("next fix") || t.contains("eta")
-        || t.contains("how far") || t.contains("time to") || t.contains("distance to")
-    {
-        let wp = xp.get_string("sim/cockpit2/radios/indicators/gps_nav_id").await.unwrap_or_default();
-        let dist = read1(live, xp, "sim/cockpit2/radios/indicators/gps_dme_distance_nm").await.ok();
-        let tmin = read1(live, xp, "sim/cockpit2/radios/indicators/gps_dme_time_min").await.ok();
-        if wp.trim().is_empty() && dist.is_none() {
-            parts.push("no active GPS waypoint, load and navigate a route first".to_string());
-        } else {
-            let mut s = String::new();
-            if !wp.trim().is_empty() {
-                s.push_str(&format!("next waypoint {}, ", wp.trim()));
-            }
-            if let Some(d) = dist {
-                s.push_str(&format!("{d:.0} miles", ));
-            }
-            if let Some(tm) = tmin {
-                let (h, mn) = ((tm / 60.0) as i32, (tm % 60.0).round() as i32);
-                let time = if h > 0 { format!("{h} hours {mn} minutes") } else { format!("{mn} minutes") };
-                s.push_str(&format!(", {time}"));
-            }
-            parts.push(s.trim_end_matches([',', ' ']).to_string());
-        }
-    }
     // Current control settings (e.g. "what's the mixture/throttle set to").
     if t.contains("mixture") {
         if let Ok(v) = read1(live, xp, "sim/cockpit2/engine/actuators/mixture_ratio_all").await {
