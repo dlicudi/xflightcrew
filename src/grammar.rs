@@ -255,7 +255,17 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         if let Some(n) = num {
             return Some(call("set_heading", json!({ "heading": n })));
         }
-        let dir = if has(t, "north") {
+        // Intercardinals first (so "northeast"/"north east" aren't shadowed by the
+        // cardinal checks), each in one-word and two-word spellings.
+        let dir = if has(t, "northeast") || (has(t, "north") && has(t, "east")) {
+            Some(45)
+        } else if has(t, "southeast") || (has(t, "south") && has(t, "east")) {
+            Some(135)
+        } else if has(t, "southwest") || (has(t, "south") && has(t, "west")) {
+            Some(225)
+        } else if has(t, "northwest") || (has(t, "north") && has(t, "west")) {
+            Some(315)
+        } else if has(t, "north") {
             Some(0)
         } else if has(t, "east") {
             Some(90)
@@ -535,6 +545,9 @@ mod tests {
         assert_eq!(one("lean the mixture to 70 percent").unwrap().0, "set_mixture");
         assert_eq!(one("heading 270").unwrap().1, json!({"heading":270}));
         assert_eq!(one("turn heading south").unwrap().1, json!({"heading":180}));
+        assert_eq!(one("change heading to northeast").unwrap().1, json!({"heading":45}));
+        assert_eq!(one("heading north west").unwrap().1, json!({"heading":315}));
+        assert_eq!(one("fly heading southeast").unwrap().1, json!({"heading":135}));
         assert_eq!(one("descend 500").unwrap().1, json!({"fpm":-500}));
         assert_eq!(one("climb 500").unwrap().1, json!({"fpm":500}));
         assert_eq!(one("avionics on").unwrap(), ("set_electrical".into(), json!({"system":"avionics","on":true})));
