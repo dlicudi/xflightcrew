@@ -506,6 +506,17 @@ async fn run_session(
             // mention "next waypoint").
             let is_reminder = tl.contains("wake") || tl.contains("remind") || tl.contains("notify")
                 || tl.contains("let me know") || tl.contains("tell me when") || tl.contains("heads up");
+            // Time/distance to top of descent ("how long before TOD"). Guarded by
+            // is_reminder so "wake me at top of descent" still arms the reminder.
+            if !is_reminder
+                && (tl.contains("top of descent")
+                    || tl.contains("t o d")
+                    || tl.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "tod"))
+            {
+                let line = time_to_tod(&config, &xplane, &mut fp_cache).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
             // ETA to the destination ("time before we land", "when do we get in"):
             // distance to the destination airport over groundspeed. Needs a destination
             // cue plus a time cue, so it beats the next-waypoint branch below.
@@ -1174,6 +1185,72 @@ async fn nav_progress(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
         s.push_str(&format!(", {time}"));
     }
     format!("{}.", s.trim_end_matches([',', ' ']))
+}
+
+/// A 3-degree descent loses ~1000 ft every 3 nm; Stratos (and most pilots) use a
+/// slightly gentler ~3.5 nm per 1000 ft as the planning ring. Used only when
+/// neither the FMS nor the SimBrief navlog gives a top-of-descent directly.
+const TOD_NM_PER_1000FT: f64 = 3.5;
+
+/// Time and distance to the top of descent ("how long before TOD"), with three
+/// fallbacks so it works whether or not the box has VNAV:
+///   1. the FMS's own computed TOD distance (when the avionics publish one);
+///   2. SimBrief's planned TOD ring (`tod_to_dest_nm`) measured back from the
+///      destination, which most GA boxes never compute themselves;
+///   3. the altitude rule of thumb, cruise_alt/1000 * 3.5 nm, as a last resort.
+async fn time_to_tod(
+    config: &Config,
+    xp: &XPlaneClient,
+    cache: &mut Option<(Instant, simbrief::FlightPlan)>,
+) -> String {
+    const TOD_DIST: &str = "sim/cockpit2/radios/indicators/fms_distance_to_tod_pilot";
+    // 1. The avionics' own VNAV TOD, if it computes one.
+    let fms = xp.get_float(TOD_DIST).await.unwrap_or(0.0);
+    if fms > 0.0 {
+        return tod_phrase(fms, xp).await;
+    }
+    // 2/3. Derive it from the flight plan: the SimBrief TOD ring, else the formula.
+    if let Err(msg) = ensure_plan(config, cache, false).await {
+        return msg;
+    }
+    let Some((_, fp)) = cache.as_ref() else {
+        return "Couldn't fetch your SimBrief plan.".to_string();
+    };
+    let Some(dest) = fp.waypoints.last().cloned() else {
+        return "No destination in the plan.".to_string();
+    };
+    let ring_nm = if fp.tod_to_dest_nm > 0.0 {
+        fp.tod_to_dest_nm
+    } else {
+        fp.cruise_alt_ft / 1000.0 * TOD_NM_PER_1000FT
+    };
+    let (lat, lon) = match (
+        xp.get_float("sim/flightmodel/position/latitude").await,
+        xp.get_float("sim/flightmodel/position/longitude").await,
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return "I can't read our position right now.".to_string(),
+    };
+    let to_tod = haversine_nm(lat, lon, dest.lat, dest.lon) - ring_nm;
+    tod_phrase(to_tod, xp).await
+}
+
+/// Format a distance-to-TOD as a spoken line, paced by groundspeed.
+async fn tod_phrase(dist_nm: f64, xp: &XPlaneClient) -> String {
+    if dist_nm <= 0.0 {
+        return "We're at top of descent, time to start down.".to_string();
+    }
+    let gs_kts = xp.get_float("sim/flightmodel/position/groundspeed").await.unwrap_or(0.0) * MS_TO_KTS;
+    if gs_kts < 30.0 {
+        return format!("Top of descent about {dist_nm:.0} miles ahead.");
+    }
+    let mins = (dist_nm / gs_kts * 60.0).round() as i64;
+    let time = if mins >= 60 {
+        format!("{} hours {} minutes", mins / 60, mins % 60)
+    } else {
+        format!("{mins} minutes")
+    };
+    format!("About {time} to top of descent, {dist_nm:.0} miles ahead.")
 }
 
 /// Great-circle distance in nautical miles between two lat/lon points (haversine).
@@ -1868,6 +1945,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "waypoint", "eta",
     // ETA to the destination ("time before we land", "when do we arrive")
     "land", "destination", "arrive", "arrival",
+    // time/distance to top of descent
+    "descent", "tod",
     // reminders ("wake me at top of descent", "remind me in 10 minutes")
     "wake", "remind", "notify", "heads-up",
 ];
