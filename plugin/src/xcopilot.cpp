@@ -37,6 +37,7 @@ static const ImU32 COL_DIM   = IM_COL32(150, 155, 165, 255);
 static const ImU32 COL_AMBER = IM_COL32(255, 185, 40, 255);
 static const ImU32 COL_CYAN  = IM_COL32(90, 200, 255, 255);
 static const ImU32 COL_WHITE = IM_COL32(235, 235, 240, 255);
+static const ImU32 COL_RED   = IM_COL32(240, 90, 80, 255);
 
 // ---- PTT --------------------------------------------------------------------
 
@@ -110,7 +111,20 @@ static void WriteAction(void*, void* in, int offset, int len) {
 }
 static void WriteAlert(void*, void* in, int offset, int len) {
     StoreText(&g_alert, in, offset, len);
-    AppendLog("ALERT", COL_AMBER, g_alert.buf);
+    // First char is a severity marker ('1' advisory, '2' caution, '3' warning) —
+    // the standard annunciator hierarchy. Strip it and pick the chip accordingly.
+    const char* text = g_alert.buf;
+    const char* tag = "CAUTION";
+    ImU32 col = COL_AMBER;
+    if (g_alert.len >= 1) {
+        switch (g_alert.buf[0]) {
+            case '1': tag = "ADVISORY"; col = COL_CYAN; text++; break;
+            case '2': tag = "CAUTION";  col = COL_AMBER; text++; break;
+            case '3': tag = "WARNING";  col = COL_RED;  text++; break;
+            default: break;  // no marker (legacy) — treat as caution
+        }
+    }
+    AppendLog(tag, col, text);
 }
 
 // ---- panel ------------------------------------------------------------------

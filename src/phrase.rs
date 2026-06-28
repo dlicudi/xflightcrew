@@ -137,6 +137,19 @@ fn peek_is_digit(tokens: &[&str], idx: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// Replace em/en dashes with plain ASCII. X-Plane's TTS and the in-sim panel
+/// font both choke on `—`/`–`, so no spoken or displayed text should carry them.
+/// A spaced dash becomes a comma (a natural speech pause); a bare one a hyphen.
+pub fn scrub_dashes(s: &str) -> String {
+    if !s.contains('—') && !s.contains('–') {
+        return s.to_string();
+    }
+    s.replace(" — ", ", ")
+        .replace(" – ", ", ")
+        .replace('—', "-")
+        .replace('–', "-")
+}
+
 /// Repair distinctive *whole-word* mishearings whisper makes on cockpit terms,
 /// where the entire keyword is gone — so neither the domain gate's fuzzy match
 /// nor the grammar's token match can recover it (those only catch near-misses

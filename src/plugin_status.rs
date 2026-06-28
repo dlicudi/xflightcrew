@@ -34,8 +34,28 @@ enum Update {
     Heard(String),
     /// Last action read back.
     Action(String),
-    /// A monitor callout or command-loop warning (caution/warning/advisory).
-    Alert(String),
+    /// A monitor callout or command-loop warning, with its severity.
+    Alert(AlertLevel, String),
+}
+
+/// Severity of a panel alert — drives the chip colour/label in the plugin.
+#[derive(Clone, Copy)]
+pub enum AlertLevel {
+    Advisory,
+    Caution,
+    Warning,
+}
+
+impl AlertLevel {
+    /// Single-char marker prefixed to the alert payload so the plugin can colour
+    /// it without a second (race-prone) dataref.
+    fn code(self) -> char {
+        match self {
+            AlertLevel::Advisory => '1',
+            AlertLevel::Caution => '2',
+            AlertLevel::Warning => '3',
+        }
+    }
 }
 
 /// Cloneable handle the [`crate::ui::Reporter`] uses to mirror status. Sends are
@@ -64,16 +84,17 @@ impl StatusSink {
     pub fn action(&self, text: &str) {
         let _ = self.0.send(Update::Action(clip(text)));
     }
-    pub fn alert(&self, text: &str) {
-        let _ = self.0.send(Update::Alert(clip(text)));
+    pub fn alert(&self, level: AlertLevel, text: &str) {
+        let _ = self.0.send(Update::Alert(level, clip(text)));
     }
 }
 
-/// Trim to the plugin buffer, on a char boundary so base64 of the bytes stays
-/// valid UTF-8 for the panel.
+/// Scrub em/en dashes (the panel font can't render them) and trim to the plugin
+/// buffer, on a char boundary so base64 of the bytes stays valid UTF-8.
 fn clip(s: &str) -> String {
+    let s = crate::phrase::scrub_dashes(s);
     if s.len() <= TEXT_MAX {
-        return s.to_string();
+        return s;
     }
     let mut end = TEXT_MAX;
     while end > 0 && !s.is_char_boundary(end) {
@@ -107,7 +128,11 @@ fn run(base: String, rx: Receiver<Update>) {
             Update::Phase(code) => (phase_id, json!(code)),
             Update::Heard(text) => (heard_id, json!(STANDARD.encode(text.as_bytes()))),
             Update::Action(text) => (action_id, json!(STANDARD.encode(text.as_bytes()))),
-            Update::Alert(text) => (alert_id, json!(STANDARD.encode(text.as_bytes()))),
+            Update::Alert(level, text) => {
+                // Prefix a severity marker so the plugin can colour the chip.
+                let payload = format!("{}{}", level.code(), text);
+                (alert_id, json!(STANDARD.encode(payload.as_bytes())))
+            }
         };
         let Some(id) = id else { continue };
         let url = format!("{rest}/datarefs/{id}/value");

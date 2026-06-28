@@ -124,6 +124,9 @@ impl Voice {
     }
 
     fn enqueue(&self, priority: Priority, text: String, done: Option<Arc<Latch>>) {
+        // No em/en dashes reach the TTS — they trip it up. One chokepoint for
+        // every spoken utterance (readbacks, monitor callouts, prompts).
+        let text = crate::phrase::scrub_dashes(&text);
         let mut q = self.inner.queue.lock().unwrap();
         let seq = q.seq;
         q.seq += 1;

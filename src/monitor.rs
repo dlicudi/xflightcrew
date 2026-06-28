@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::aircraft::AircraftProfile;
 use crate::config::Config;
-use crate::plugin_status::StatusSink;
+use crate::plugin_status::{AlertLevel, StatusSink};
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -359,9 +359,14 @@ impl FireState {
     ) {
         if self.sustained(min_duration, now) && self.should_speak(sev, now) {
             // Mirror the callout to the in-sim panel (monitor speaks via Voice,
-            // which otherwise bypasses the panel's Reporter).
+            // which otherwise bypasses the panel's Reporter), coloured by severity.
             if let Some(s) = status {
-                s.alert(&msg);
+                let level = match sev {
+                    Severity::Advisory => AlertLevel::Advisory,
+                    Severity::Caution => AlertLevel::Caution,
+                    Severity::Warning => AlertLevel::Warning,
+                };
+                s.alert(level, &msg);
             }
             voice.alert(sev.into(), msg);
             self.last_spoken = Some(now);
@@ -814,7 +819,7 @@ pub async fn run(config: Config, profile: AircraftProfile, voice: Voice, status:
             if snap.on_ground {
                 let say = |line: &str| {
                     if let Some(s) = status.as_ref() {
-                        s.alert(line);
+                        s.alert(AlertLevel::Advisory, line);
                     }
                     voice.alert(Priority::Advisory, line.to_string());
                 };

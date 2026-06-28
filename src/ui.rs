@@ -94,7 +94,8 @@ impl Reporter {
             match kind {
                 LogKind::Readback => s.action(&text),
                 // Surface refusals/cancellations and confirm prompts on the panel too.
-                LogKind::Warn | LogKind::Confirm => s.alert(&text),
+                LogKind::Warn => s.alert(crate::plugin_status::AlertLevel::Caution, &text),
+                LogKind::Confirm => s.alert(crate::plugin_status::AlertLevel::Advisory, &text),
                 _ => {}
             }
         }
