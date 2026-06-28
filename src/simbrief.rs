@@ -35,6 +35,16 @@ pub struct FlightPlan {
     pub wind_spd_kts: f64,
     /// Distance from top-of-descent to destination, nm (0 if not in the navlog).
     pub tod_to_dest_nm: f64,
+    /// Enroute waypoints (named fixes + destination), for loading into the GPS/FMS.
+    pub waypoints: Vec<Waypoint>,
+}
+
+/// A route waypoint for the FMS: an ident plus position and planned altitude.
+pub struct Waypoint {
+    pub ident: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub alt: f64,
 }
 
 /// Fetch and parse the user's latest SimBrief OFP. `Err` if the id is empty, the
@@ -87,6 +97,7 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
         wind_dir: n("/general/avg_wind_dir"),
         wind_spd_kts: n("/general/avg_wind_spd"),
         tod_to_dest_nm: navlog_tod_to_dest(&v),
+        waypoints: parse_waypoints(&v),
     })
 }
 
@@ -123,6 +134,38 @@ impl FlightPlan {
         };
         format!(", wind {:03.0} at {:.0}{}", self.wind_dir, self.wind_spd_kts, comp)
     }
+}
+
+/// Real route waypoints from the navlog (named fixes + the destination airport),
+/// skipping the pseudo points (top of climb/descent). Capped so the serialised
+/// route stays within the plugin's fixed buffer — ample for a GA route.
+fn parse_waypoints(v: &Value) -> Vec<Waypoint> {
+    const MAX_WAYPOINTS: usize = 14;
+    let Some(fixes) = v.pointer("/navlog/fix").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for f in fixes {
+        let ident = f.get("ident").and_then(Value::as_str).unwrap_or("");
+        if ident.is_empty() || ident == "TOC" || ident == "TOD" {
+            continue;
+        }
+        let (Some(lat), Some(lon)) =
+            (f.get("pos_lat").and_then(num_of), f.get("pos_long").and_then(num_of))
+        else {
+            continue;
+        };
+        out.push(Waypoint {
+            ident: ident.to_string(),
+            lat,
+            lon,
+            alt: f.get("altitude_feet").and_then(num_of).unwrap_or(0.0),
+        });
+        if out.len() >= MAX_WAYPOINTS {
+            break;
+        }
+    }
+    out
 }
 
 /// Distance (nm) from the top-of-descent fix to the destination: the sum of the

@@ -181,6 +181,13 @@ impl XPlaneClient {
         self.set_value(name, json!(value)).await
     }
 
+    /// Write a `data` (byte-array) dataref, base64-encoded as the Web API expects.
+    /// Used to hand the plugin a payload (e.g. the FMS route).
+    pub async fn set_data(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        self.set_value(name, json!(b64)).await
+    }
+
     /// Write a raw JSON value to a dataref's `value` endpoint.
     async fn set_value(&self, name: &str, value: serde_json::Value) -> Result<()> {
         let id = self.dataref_id(name).await?;

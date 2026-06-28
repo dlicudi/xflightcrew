@@ -500,6 +500,17 @@ async fn run_session(
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
+            // Load the SimBrief route into the GPS/FMS (checked before the brief, so
+            // "load the flight plan" loads rather than just reading it back).
+            let wants_load = (tl.contains("load") || tl.contains("program") || tl.contains("send"))
+                && (tl.contains("route") || tl.contains("plan") || tl.contains("gps") || tl.contains("fms") || tl.contains("flight"));
+            if wants_load {
+                reporter.status(ui::Phase::Thinking);
+                let refresh = tl.contains("refresh") || tl.contains("reload") || tl.contains("update");
+                let line = load_route_to_fms(&config, &xplane, &mut fp_cache, refresh).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
             // SimBrief flight plan (cached fetch) + advice. Route, full brief, or refresh.
             let is_plan = tl.contains("flight plan") || tl.contains("simbrief") || tl.contains("fetch the plan")
                 || tl.contains("where are we going") || tl.contains("where are we headed")
@@ -1149,6 +1160,64 @@ async fn systems_check(xp: &XPlaneClient) -> String {
 /// change mid-flight). "refresh"/"reload" forces a re-fetch.
 const FLIGHT_PLAN_TTL: Duration = Duration::from_secs(600);
 
+/// Make sure `cache` holds a usable plan: reuse it unless stale or `refresh`, and
+/// on a failed re-fetch keep the cached one. `Err` carries a spoken message.
+async fn ensure_plan(
+    config: &Config,
+    cache: &mut Option<(Instant, simbrief::FlightPlan)>,
+    refresh: bool,
+) -> Result<(), String> {
+    if config.simbrief_id.trim().is_empty() {
+        return Err("No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can pull your flight plan.".to_string());
+    }
+    let fresh = cache.as_ref().is_some_and(|(t, _)| t.elapsed() < FLIGHT_PLAN_TTL);
+    if refresh || !fresh {
+        match simbrief::fetch(&config.simbrief_id).await {
+            Ok(fp) => *cache = Some((Instant::now(), fp)),
+            Err(e) => {
+                tracing::warn!("simbrief fetch failed: {e:#}");
+                if cache.is_none() {
+                    return Err("Couldn't fetch your SimBrief plan. Generate one first, or check the ID.".to_string());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Load the SimBrief route into the GPS/FMS: hand the waypoints to the plugin
+/// (only it can touch the FMS, via XPLMNavigation) and trigger the load.
+async fn load_route_to_fms(
+    config: &Config,
+    xp: &XPlaneClient,
+    cache: &mut Option<(Instant, simbrief::FlightPlan)>,
+    refresh: bool,
+) -> String {
+    if let Err(msg) = ensure_plan(config, cache, refresh).await {
+        return msg;
+    }
+    let Some((_, fp)) = cache.as_ref() else {
+        return "Couldn't fetch your SimBrief plan.".to_string();
+    };
+    if fp.waypoints.is_empty() {
+        return "No waypoints in the plan to load.".to_string();
+    }
+    // "IDENT,lat,lon,alt|..." — the plugin parses this and builds the FMS route.
+    let payload = fp
+        .waypoints
+        .iter()
+        .map(|w| format!("{},{:.4},{:.4},{}", w.ident, w.lat, w.lon, w.alt as i64))
+        .collect::<Vec<_>>()
+        .join("|");
+    let (origin, dest, n) = (fp.origin.clone(), fp.destination.clone(), fp.waypoints.len());
+    if xp.set_data("xcopilot/fms/route", payload.as_bytes()).await.is_err()
+        || xp.set_int("xcopilot/fms/load", 1).await.is_err()
+    {
+        return "Couldn't reach the plugin to load the route. Is the X-COPILOT plugin running?".to_string();
+    }
+    format!("Loading {n} waypoints into the GPS, {origin} to {dest}. Check the flight plan page.")
+}
+
 /// Fetch (or reuse) the SimBrief flight plan and brief it. Deterministic (no LLM);
 /// the one network call beyond X-Plane. `want_route` reads back the airway route;
 /// otherwise it's a full brief: route summary, climb-to-cruise, top of descent,
@@ -1160,22 +1229,8 @@ async fn flight_plan_report(
     refresh: bool,
     want_route: bool,
 ) -> String {
-    if config.simbrief_id.trim().is_empty() {
-        return "No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can pull your flight plan.".to_string();
-    }
-    // Reuse a cached plan unless it's stale or a refresh was asked for; on a failed
-    // re-fetch, fall back to the cached one rather than losing it.
-    let fresh = cache.as_ref().is_some_and(|(t, _)| t.elapsed() < FLIGHT_PLAN_TTL);
-    if refresh || !fresh {
-        match simbrief::fetch(&config.simbrief_id).await {
-            Ok(fp) => *cache = Some((Instant::now(), fp)),
-            Err(e) => {
-                tracing::warn!("simbrief fetch failed: {e:#}");
-                if cache.is_none() {
-                    return "Couldn't fetch your SimBrief plan. Generate one first, or check the ID.".to_string();
-                }
-            }
-        }
+    if let Err(msg) = ensure_plan(config, cache, refresh).await {
+        return msg;
     }
     let Some((_, fp)) = cache.as_ref() else {
         return "Couldn't fetch your SimBrief plan.".to_string();
@@ -1681,8 +1736,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "systems", "system", "vne", "vno", "vfe", "vspeed", "vspeeds",
     // aircraft-info queries
     "aircraft", "plane", "cessna", "skyhawk",
-    // SimBrief flight plan
-    "simbrief", "flightplan", "plan", "route",
+    // SimBrief flight plan + loading the route into the GPS/FMS
+    "simbrief", "flightplan", "plan", "route", "load", "program", "gps", "fms",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,

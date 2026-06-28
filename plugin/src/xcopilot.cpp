@@ -15,6 +15,7 @@
 // Build/install: see plugin/README.md.
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -24,6 +25,7 @@
 #include "XPLMDisplay.h"
 #include "XPLMGraphics.h"
 #include "XPLMMenus.h"
+#include "XPLMNavigation.h"
 #include "XPLMPlugin.h"
 #include "XPLMProcessing.h"
 
@@ -137,6 +139,71 @@ static void WriteAlert(void*, void* in, int offset, int len) {
         }
     }
     AppendLog(tag, col, text);
+}
+
+// ---- FMS route loading ------------------------------------------------------
+// The app writes the SimBrief route into xcopilot/fms/route as
+// "IDENT,lat,lon,alt|IDENT,lat,lon,alt|...", then writes 1 to xcopilot/fms/load
+// to build it in the GPS/FMS (only the plugin can, via XPLMNavigation).
+
+static TextRef g_fms_route = {{0}, 0};
+static int g_fms_load = 0;
+static XPLMDataRef g_fms_route_dref = nullptr;
+static XPLMDataRef g_fms_load_dref = nullptr;
+
+static void WriteFmsRoute(void*, void* in, int offset, int len) {
+    StoreText(&g_fms_route, in, offset, len);
+}
+
+static void load_fms_route() {
+    // Clear the existing flight plan (high to low so indices stay valid).
+    for (int i = XPLMCountFMSEntries() - 1; i >= 0; --i) {
+        XPLMClearFMSEntry(i);
+    }
+    char buf[sizeof g_fms_route.buf];
+    std::strncpy(buf, g_fms_route.buf, sizeof buf);
+    buf[sizeof buf - 1] = '\0';
+
+    const XPLMNavType kTypes = xplm_Nav_Fix | xplm_Nav_VOR | xplm_Nav_NDB |
+                               xplm_Nav_DME | xplm_Nav_Airport;
+    int idx = 0;
+    char* save1 = nullptr;
+    for (char* tok = strtok_r(buf, "|", &save1); tok; tok = strtok_r(nullptr, "|", &save1)) {
+        char* save2 = nullptr;
+        char* ident = strtok_r(tok, ",", &save2);
+        char* slat = strtok_r(nullptr, ",", &save2);
+        char* slon = strtok_r(nullptr, ",", &save2);
+        char* salt = strtok_r(nullptr, ",", &save2);
+        if (!slat || !slon) continue;
+        float lat = static_cast<float>(std::atof(slat));
+        float lon = static_cast<float>(std::atof(slon));
+        int alt = salt ? std::atoi(salt) : 0;
+        // Prefer the named navaid near this position; fall back to a lat/lon point.
+        XPLMNavRef ref = XPLM_NAV_NOT_FOUND;
+        if (ident && ident[0]) {
+            ref = XPLMFindNavAid(nullptr, ident, &lat, &lon, nullptr, kTypes);
+        }
+        if (ref != XPLM_NAV_NOT_FOUND) {
+            XPLMSetFMSEntryInfo(idx, ref, alt);
+        } else {
+            XPLMSetFMSEntryLatLon(idx, lat, lon, alt);
+        }
+        idx++;
+    }
+    if (idx > 0) {
+        XPLMSetDestinationFMSEntry(0); // active leg = first waypoint
+    }
+    char msg[96];
+    std::snprintf(msg, sizeof msg, "x-copilot plugin: loaded %d FMS waypoints\n", idx);
+    XPLMDebugString(msg);
+}
+
+static int ReadFmsLoad(void*) { return g_fms_load; }
+static void WriteFmsLoad(void*, int v) {
+    if (v != 0) {
+        load_fms_route();
+    }
+    g_fms_load = 0; // edge-triggered; reset so a re-load needs a fresh write
 }
 
 // ---- panel ------------------------------------------------------------------
@@ -269,6 +336,14 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         "xcopilot/status/alert", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteAlert, &g_alert, &g_alert);
+    g_fms_route_dref = XPLMRegisterDataAccessor(
+        "xcopilot/fms/route", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteFmsRoute, &g_fms_route, &g_fms_route);
+    g_fms_load_dref = XPLMRegisterDataAccessor(
+        "xcopilot/fms/load", xplmType_Int, 1,
+        ReadFmsLoad, WriteFmsLoad, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
 
     // One shared font atlas for all ImgWindows (uses ImGui's default font).
     ImgWindow::sFontAtlas = std::make_shared<ImgFontAtlas>();
@@ -290,6 +365,8 @@ PLUGIN_API void XPluginStop(void) {
     g_panel.reset();
     ImgWindow::sFontAtlas.reset();
     if (g_menu) { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
+    if (g_fms_load_dref) { XPLMUnregisterDataAccessor(g_fms_load_dref); g_fms_load_dref = nullptr; }
+    if (g_fms_route_dref) { XPLMUnregisterDataAccessor(g_fms_route_dref); g_fms_route_dref = nullptr; }
     if (g_alert_dref) { XPLMUnregisterDataAccessor(g_alert_dref); g_alert_dref = nullptr; }
     if (g_action_dref) { XPLMUnregisterDataAccessor(g_action_dref); g_action_dref = nullptr; }
     if (g_heard_dref) { XPLMUnregisterDataAccessor(g_heard_dref); g_heard_dref = nullptr; }
