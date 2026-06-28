@@ -1426,6 +1426,44 @@ async fn answer_state_query(
 ) -> Option<String> {
     let t = cmd.to_ascii_lowercase();
     let mut parts: Vec<String> = Vec::new();
+
+    // Navigation progress: the active GPS waypoint with distance and ETA to it.
+    if t.contains("next waypoint") || t.contains("next fix") || t.contains("eta")
+        || t.contains("how far") || t.contains("time to") || t.contains("distance to")
+    {
+        let wp = xp.get_string("sim/cockpit2/radios/indicators/gps_nav_id").await.unwrap_or_default();
+        let dist = read1(live, xp, "sim/cockpit2/radios/indicators/gps_dme_distance_nm").await.ok();
+        let tmin = read1(live, xp, "sim/cockpit2/radios/indicators/gps_dme_time_min").await.ok();
+        if wp.trim().is_empty() && dist.is_none() {
+            parts.push("no active GPS waypoint, load and navigate a route first".to_string());
+        } else {
+            let mut s = String::new();
+            if !wp.trim().is_empty() {
+                s.push_str(&format!("next waypoint {}, ", wp.trim()));
+            }
+            if let Some(d) = dist {
+                s.push_str(&format!("{d:.0} miles", ));
+            }
+            if let Some(tm) = tmin {
+                let (h, mn) = ((tm / 60.0) as i32, (tm % 60.0).round() as i32);
+                let time = if h > 0 { format!("{h} hours {mn} minutes") } else { format!("{mn} minutes") };
+                s.push_str(&format!(", {time}"));
+            }
+            parts.push(s.trim_end_matches([',', ' ']).to_string());
+        }
+    }
+    // Current control settings (e.g. "what's the mixture/throttle set to").
+    if t.contains("mixture") {
+        if let Ok(v) = read1(live, xp, "sim/cockpit2/engine/actuators/mixture_ratio_all").await {
+            parts.push(format!("mixture {:.0} percent", v * 100.0));
+        }
+    }
+    if t.contains("throttle") {
+        if let Ok(v) = read1(live, xp, "sim/cockpit2/engine/actuators/throttle_ratio_all").await {
+            parts.push(format!("throttle {:.0} percent", v * 100.0));
+        }
+    }
+
     if t.contains("altitude") || t.contains("how high") {
         if let Ok(v) = read1(live, xp, datarefs::ALTITUDE_FT).await {
             parts.push(format!("{v:.0} feet"));
@@ -1747,6 +1785,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "simbrief", "flightplan", "plan", "route", "load", "program", "gps", "fms",
     // couple the autopilot to the flight plan
     "navigate", "follow", "track",
+    // navigation progress queries
+    "waypoint", "eta",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,
