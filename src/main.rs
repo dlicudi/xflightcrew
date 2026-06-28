@@ -493,6 +493,10 @@ async fn run_session(
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
+            if let Some(line) = aircraft_info(&profile, &tl) {
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
         }
         // Other state reads ("what's our altitude/heading/airspeed") — deterministic
         // too, but only when it's a question, so "set heading 270" still commands.
@@ -1126,6 +1130,26 @@ async fn systems_check(xp: &XPlaneClient) -> String {
     }
 }
 
+/// A brief spoken answer to "what are we flying / tell me about this aircraft",
+/// from the profile + the 172 reference figures, instead of the LLM declining for
+/// lack of data. `None` if the utterance isn't asking about the aircraft.
+fn aircraft_info(profile: &aircraft::AircraftProfile, t: &str) -> Option<String> {
+    let asks = t.contains("what are we flying")
+        || t.contains("what aircraft")
+        || t.contains("what plane")
+        || t.contains("what are we in")
+        || ((t.contains("tell me about") || t.contains("describe") || t.contains("about the"))
+            && (t.contains("aircraft") || t.contains("plane") || t.contains("cessna")
+                || t.contains("172") || t.contains("skyhawk")));
+    asks.then(|| {
+        format!(
+            "We're in the {}, a single-engine four-seat aircraft. Cruise about 124 knots, \
+             Vne 163, service ceiling 14,000 feet, 53 gallons useable for roughly 4 hours.",
+            profile.display_name
+        )
+    })
+}
+
 /// Static 172 reference limits (V-speeds, weights, ceiling), answered as a spoken
 /// query — what the old "performance limits" checklist recited, now a question you
 /// can ask. (172-specific literals; move to the aircraft profile if a second
@@ -1564,6 +1588,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "secure", "clean", "cruise", "preflight", "limits", "performance",
     // systems-status check + reference-limit / V-speed queries
     "systems", "system", "vne", "vno", "vfe", "vspeed", "vspeeds",
+    // aircraft-info queries
+    "aircraft", "plane", "cessna", "skyhawk",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,

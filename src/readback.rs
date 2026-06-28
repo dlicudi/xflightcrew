@@ -70,10 +70,9 @@ fn strip_roger(line: &str) -> Option<&str> {
 /// a signature rather than wallpaper.
 fn weighted_prefix() -> Option<&'static str> {
     match rng_next() % 10 {
-        0..=5 => None,            // 60% — "Flaps ten."
-        6 | 7 => Some("Roger,"),  // 20%
-        8 => Some("Copy,"),       // 10%
-        _ => Some("Wilco,"),      // 10% — "will comply", apt for acting on a command
+        0..=5 => None,                  // 60% — "Flaps ten."
+        6..=8 => Some("Roger,"),        // 30%
+        _ => Some("Copy,"),             // 10%
     }
 }
 

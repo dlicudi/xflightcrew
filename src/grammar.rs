@@ -235,6 +235,11 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         if let Some(n) = num {
             return Some(call("set_throttle", json!({ "percent": n })));
         }
+        // "throttle to cruise" / "cruise power" with no number → a typical cruise
+        // setting rather than guessing via the LLM.
+        if t.contains("cruise") {
+            return Some(call("set_throttle", json!({ "percent": 65 })));
+        }
     }
     if has(t, "idle") {
         return Some(call("set_throttle", json!({ "percent": 0 })));
@@ -538,6 +543,7 @@ mod tests {
         assert_eq!(one("power thirty percent").unwrap(), ("set_throttle".into(), json!({"percent":30})));
         assert_eq!(one("40 percent power").unwrap().1, json!({"percent":40}));
         assert_eq!(one("maximum throttle").unwrap().1, json!({"percent":100}));
+        assert_eq!(one("throttle to cruise").unwrap(), ("set_throttle".into(), json!({"percent":65})));
         assert_eq!(one("mixture 70 percent").unwrap().0, "set_mixture");
         assert_eq!(one("maximum mixture").unwrap(), ("set_mixture".into(), json!({"percent":100})));
         assert_eq!(one("mixture full rich").unwrap().1, json!({"percent":100}));
