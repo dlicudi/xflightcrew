@@ -616,11 +616,22 @@ async fn run_session(
             reporter.status(ui::Phase::Thinking);
             let Some(tool) = registry.get(&call.name) else { continue };
             let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice) };
+            // Execute, retrying once on error: a single transient blip (a dropped
+            // Web API request, including the autopilot-engage commands the client
+            // doesn't itself retry) shouldn't fail an action. Every tool is safe to
+            // re-run — value writes are idempotent and the toggle tools read state
+            // before toggling — so a retry can't double-apply.
             let readback = match tool.execute(&call.arguments, &ctx).await {
                 Ok(line) => line,
-                Err(e) => {
-                    tracing::error!("tool {} failed: {e:#}", call.name);
-                    "Something went wrong actioning that.".to_string()
+                Err(first) => {
+                    tracing::warn!("tool {} failed: {first:#}; retrying once", call.name);
+                    match tool.execute(&call.arguments, &ctx).await {
+                        Ok(line) => line,
+                        Err(e) => {
+                            tracing::error!("tool {} failed on retry: {e:#}", call.name);
+                            "Something went wrong actioning that.".to_string()
+                        }
+                    }
                 }
             };
             // Vary the acknowledgment on affirmative readbacks (bare callout most
@@ -1173,7 +1184,11 @@ async fn answer_state_query(
             parts.push(format!("visibility {v:.0} statute miles"));
         }
     }
-    if wx || t.contains("altimeter") || t.contains("qnh") || t.contains("pressure") {
+    // "pressure" alone could mean the altimeter or the oil — exclude oil pressure
+    // so "how's the oil pressure?" doesn't also blurt the altimeter setting.
+    if wx || t.contains("altimeter") || t.contains("qnh") || t.contains("barometric")
+        || (t.contains("pressure") && !t.contains("oil"))
+    {
         if let Ok(v) = read1(live, xp, datarefs::QNH_PASCALS).await {
             // qnh in Pascals → altimeter setting in inHg (1 inHg = 3386.389 Pa).
             parts.push(format!("altimeter {:.2}", v / 3386.389));
