@@ -74,6 +74,10 @@ const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
 /// Descents steeper than this (fpm) are confirmed — anything shallower, and all
 /// climbs, execute immediately. A 172 descends ~500–1000 fpm routinely.
 const VS_CONFIRM_DESCENT_FPM: f64 = -1500.0;
+/// A set_climb rate magnitude above this (fpm) is implausible for a 172 (it climbs
+/// ~700, descends ~1000) and likely a mishear, so it still confirms; normal,
+/// sensible rates execute directly — the unsafe-target gate is the real safety net.
+const CLIMB_CONFIRM_RATE_FPM: f64 = 1500.0;
 
 /// Read the servo status as a bool ("is the autopilot actually flying").
 async fn servos_engaged(ctx: &ToolCtx<'_>) -> Result<bool> {
@@ -713,7 +717,14 @@ impl Tool for SetClimb {
 
     fn confirm_prompt(&self, args: &Value) -> Option<String> {
         let a: ClimbArgs = serde_json::from_value(args.clone()).ok()?;
-        Some(format!("altitude {:.0} feet at {:.0} feet per minute", a.altitude.max(0.0), a.fpm.abs()))
+        // A sensible climb/descent executes directly — execute()'s unsafe-target
+        // gate (terrain floor / service ceiling) is the real safety net. Only a
+        // grossly abnormal rate (a likely mishear) still confirms.
+        if a.fpm.abs() > CLIMB_CONFIRM_RATE_FPM {
+            Some(format!("altitude {:.0} feet at {:.0} feet per minute", a.altitude.max(0.0), a.fpm.abs()))
+        } else {
+            None
+        }
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
