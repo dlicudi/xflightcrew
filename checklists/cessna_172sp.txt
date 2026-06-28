@@ -9,39 +9,9 @@
 #
 # v1.2
 #
-sw_checklist:*** CESSNA 172SP ***:PERFORMANCE LIMITS
-sw_rcolsize:60
-sw_itemvoid:CESSNA 172SP PERFORMANCE LIMITS
-sw_itemvoid:________________________________________________
-sw_itemvoid:MAX AIRSPEEED (VNE)|163 KNOTS
-sw_itemvoid:MAX CRUISE (VNO)|129 KNOTS
-sw_itemvoid:MAX MANEUVERING SPEED (VA)|105 KNOTS
-sw_itemvoid:MAX W FLAPS EXTENDED (VFE-10 DEG)|110 KNOTS
-sw_itemvoid:MAX W FLAPS EXTENDED (VFE-20/30 DEG)|85 KNOTS
-sw_itemvoid:
-sw_itemvoid:FUEL CAPACITY (MAX)|56 US GAL
-sw_itemvoid:FUEL CAPACITY (USEABLE)|53 US GAL
-sw_itemvoid:ENDURANCE (8500 FT, 75% PWR, 53 GAL)|4.2 HRS
-sw_itemvoid:RANGE (8500 FT, 75% PWR, 53 GAL)|518 NM
-sw_itemvoid:MAX ENDURANCE (10000 FT, 45% PWR, 53 GAL)|6.7 HRS
-sw_itemvoid:MAX RANGE (10000 FT, 45% PWR, 53 GAL)|638 NM
-sw_itemvoid:
-sw_itemvoid:MAX GROSS WEIGHT|2,558 LBS
-sw_itemvoid:EMPTY WEIGHT|1,663 LBS
-sw_itemvoid:USEFUL LOAD|895 LBS
-sw_itemvoid:
-sw_itemvoid:SERVICE CEILING|14,000 FT
-sw_itemvoid:CLIMB RATE (SEA LEVEL)|730 FPM
-sw_itemvoid:
-sw_itemvoid:TAKEOFF GROUND ROLL|960 FT
-sw_itemvoid:TAKEOFF DISTANCE OVER 50 FT OBSTACLE|1,630 FT
-sw_itemvoid:LANDING GROUND ROLL|575 FT
-sw_itemvoid:LANDING DISTANCE OVER 50 FT OBSTACLE|1,335 FT
-sw_itemvoid:MAX CROSSWIND TAKEOFF/LANDING|15 KNOTS
-sw_itemvoid:
-sw_item:CESSNA 172SP PERFORMANCE LIMITS|ACKNOWLEDGED
-sw_itemvoid:________________________________________________
-sw_itemvoid:Checklists by KarlL - v 1.2 - Updated April 8, 2019
+# Performance limits are reference data, not a procedure, so they're no longer a
+# checklist. The app answers them as spoken queries instead ("what's Vne",
+# "performance limits"), and "check all systems" does a live systems check.
 #
 sw_checklist:PREFLIGHT:PREFLIGHT
 sw_rcolsize:60

@@ -477,6 +477,23 @@ async fn run_session(
             say(&voice, &reporter, ui::LogKind::Readback, &line);
             continue;
         }
+        // Live systems check + static reference limits — often phrased as commands,
+        // not questions ("check all systems", "performance limits"), so they're
+        // routed here, not behind the question gate.
+        {
+            let tl = command.to_ascii_lowercase();
+            if tl.contains("all systems") || tl.contains("systems check") || tl.contains("safe parameter")
+                || tl.contains("in the green") || tl.contains("status check")
+            {
+                let line = systems_check(&xplane).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
+            if let Some(line) = reference_limits(&tl) {
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
+        }
         // Other state reads ("what's our altitude/heading/airspeed") — deterministic
         // too, but only when it's a question, so "set heading 270" still commands.
         if looks_like_question(&command) {
@@ -1074,6 +1091,91 @@ async fn read_engine0(xp: &XPlaneClient, name: &str) -> Option<f64> {
     xp.get_float_array(name).await.ok().and_then(|v| v.first().copied())
 }
 
+/// Live "are all systems within safe parameters?" check — reads the engine,
+/// vacuum, and electrical instruments and reports status against the same limits
+/// the monitor uses, instead of reciting static POH numbers. (oil temp / CHT
+/// datarefs read °F despite their names.) The deterministic answer to "check all
+/// systems".
+async fn systems_check(xp: &XPlaneClient) -> String {
+    let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running").await.is_some_and(|v| v > 0.5);
+    if !running {
+        return "Engine's not running, nothing to check.".to_string();
+    }
+    let mut ok: Vec<String> = Vec::new();
+    let mut flags: Vec<String> = Vec::new();
+    if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_pressure_psi").await {
+        if (20.0..=105.0).contains(&v) { ok.push(format!("oil pressure {v:.0}")); }
+        else { flags.push(format!("oil pressure {v:.0} pounds")); }
+    }
+    if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_temperature_deg_C").await {
+        if v < 240.0 { ok.push(format!("oil temp {v:.0}")); } else { flags.push(format!("oil temp {v:.0} degrees")); }
+    }
+    if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/CHT_deg_C").await {
+        if v < 450.0 { ok.push(format!("C H T {v:.0}")); } else { flags.push(format!("C H T {v:.0} degrees")); }
+    }
+    if let Ok(v) = xp.get_float("sim/cockpit/misc/vacuum").await {
+        if v >= 4.0 { ok.push(format!("vacuum {v:.1}")); } else { flags.push(format!("low vacuum {v:.1}")); }
+    }
+    if let Some(v) = read_engine0(xp, "sim/cockpit2/electrical/battery_amps").await {
+        if v >= -5.0 { ok.push("charging".to_string()); } else { flags.push(format!("battery discharging {:.0} amps", v.abs())); }
+    }
+    if flags.is_empty() {
+        format!("All systems in the green. {}.", ok.join(", "))
+    } else {
+        format!("Heads up, {}. Otherwise {}.", flags.join(", "), ok.join(", "))
+    }
+}
+
+/// Static 172 reference limits (V-speeds, weights, ceiling), answered as a spoken
+/// query — what the old "performance limits" checklist recited, now a question you
+/// can ask. (172-specific literals; move to the aircraft profile if a second
+/// airframe is added.) `None` if the utterance asks about none of them.
+fn reference_limits(t: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if t.contains("vne") || t.contains("never exceed") {
+        parts.push("Vne 163 knots".into());
+    }
+    if t.contains("vno") || t.contains("max cruise") || t.contains("structural cruise") {
+        parts.push("Vno 129 knots".into());
+    }
+    if t.contains("maneuver") {
+        parts.push("Va, maneuvering speed, 105 knots".into());
+    }
+    if t.contains("vfe") || t.contains("flap speed") || t.contains("flaps speed") || t.contains("flap limit") {
+        parts.push("Vfe 110 knots at 10 degrees, 85 at 20 or full".into());
+    }
+    if t.contains("stall") {
+        parts.push("stall 48 knots clean, 40 with full flaps".into());
+    }
+    if t.contains("gross weight") || t.contains("max weight") || t.contains("max gross") {
+        parts.push("max gross weight 2,558 pounds".into());
+    }
+    if t.contains("useful load") {
+        parts.push("useful load 895 pounds".into());
+    }
+    if t.contains("empty weight") {
+        parts.push("empty weight 1,663 pounds".into());
+    }
+    if t.contains("service ceiling") || t.contains("max altitude") {
+        parts.push("service ceiling 14,000 feet".into());
+    }
+    if t.contains("fuel capacity") || t.contains("tank capacity") {
+        parts.push("fuel capacity 56 gallons, 53 useable".into());
+    }
+    // A general "performance limits" / "V-speeds" ask gets the key summary.
+    if parts.is_empty()
+        && (t.contains("performance limit") || t.contains("v speed") || t.contains("v-speed")
+            || (t.contains("limits") && t.contains("performance")))
+    {
+        parts.push(
+            "Vne 163, Vno 129, Va 105, Vfe 110 then 85, stall 48 clean. \
+             Max gross 2,558 pounds, service ceiling 14,000 feet"
+                .into(),
+        );
+    }
+    (!parts.is_empty()).then(|| format!("{}.", parts.join(", ")))
+}
+
 /// True if the utterance is asking about fuel/endurance (a question we answer
 /// deterministically), not commanding the fuel *system* (pump/selector).
 fn is_fuel_query(text: &str) -> bool {
@@ -1460,6 +1562,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     // "takeoff"), plus the phase words for the shorthand ("configure for takeoff").
     "checklist", "checklists", "takeoff", "configure", "config", "departure",
     "secure", "clean", "cruise", "preflight", "limits", "performance",
+    // systems-status check + reference-limit / V-speed queries
+    "systems", "system", "vne", "vno", "vfe", "vspeed", "vspeeds",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,
