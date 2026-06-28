@@ -15,6 +15,8 @@ use crate::xplane::XPlaneClient;
 
 const ALT_FT: &str = crate::datarefs::ALTITUDE_FT;
 const TOD_DIST: &str = "sim/cockpit2/radios/indicators/fms_distance_to_tod_pilot";
+const LAT: &str = "sim/flightmodel/position/latitude";
+const LON: &str = "sim/flightmodel/position/longitude";
 const GPS_NAV_ID: &str = "sim/cockpit2/radios/indicators/gps_nav_id";
 /// Reminders give up after this long if their condition never arrives.
 const REMINDER_DEADLINE_SECS: u64 = 4 * 60 * 60;
@@ -59,7 +61,12 @@ impl Tool for SetReminder {
         let status = ctx.status.cloned();
         match a.kind.as_str() {
             "top_of_descent" => {
-                arm_tod(base, voice, status);
+                // Resolve a TOD ring up front so the watcher fires even on avionics
+                // with no VNAV (the 172's GNS530): SimBrief's planned TOD, else the
+                // cruise-altitude rule of thumb. The watcher still prefers the FMS's
+                // own TOD distance when the box publishes one.
+                let ring = tod_ring(&ctx.config.simbrief_id).await;
+                arm_tod(base, ring, voice, status);
                 Ok("Roger, I'll call out the top of descent.".to_string())
             }
             "altitude" => {
@@ -164,18 +171,49 @@ fn arm_waypoint(base: String, from: String, voice: Option<Voice>, status: Option
     });
 }
 
-fn arm_tod(base: String, voice: Option<Voice>, status: Option<StatusSink>) {
+/// Destination position and the TOD ring (nm before the destination), resolved
+/// from the SimBrief plan: its planned TOD if the navlog has one, else the
+/// cruise-altitude rule of thumb. `None` if there's no plan to work from.
+async fn tod_ring(simbrief_id: &str) -> Option<(f64, f64, f64)> {
+    if simbrief_id.trim().is_empty() {
+        return None;
+    }
+    let fp = crate::simbrief::fetch(simbrief_id).await.ok()?;
+    let dest = fp.waypoints.last()?;
+    let ring_nm = if fp.tod_to_dest_nm > 0.0 {
+        fp.tod_to_dest_nm
+    } else {
+        fp.cruise_alt_ft / 1000.0 * crate::TOD_NM_PER_1000FT
+    };
+    Some((dest.lat, dest.lon, ring_nm))
+}
+
+/// Distance to TOD this instant: the FMS's own VNAV TOD if it has one, else our
+/// distance to the destination minus the precomputed ring. `None` if unknowable.
+async fn dist_to_tod(xp: &XPlaneClient, ring: Option<(f64, f64, f64)>) -> Option<f64> {
+    if let Ok(d) = xp.get_float(TOD_DIST).await {
+        if d > 0.0 {
+            return Some(d);
+        }
+    }
+    let (dlat, dlon, ring_nm) = ring?;
+    let (lat, lon) = (xp.get_float(LAT).await.ok()?, xp.get_float(LON).await.ok()?);
+    Some(crate::haversine_nm(lat, lon, dlat, dlon) - ring_nm)
+}
+
+fn arm_tod(base: String, ring: Option<(f64, f64, f64)>, voice: Option<Voice>, status: Option<StatusSink>) {
     spawn(async move {
         let xp = XPlaneClient::new(base);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(REMINDER_DEADLINE_SECS);
-        // Wait until there's a valid TOD ahead (a positive distance), then fire when
-        // it's within a couple of miles.
+        // Wait until TOD is genuinely ahead (a positive distance) before arming the
+        // trigger, so arming while already descending doesn't fire instantly; then
+        // call out when we're within a couple of miles.
         let mut seen_ahead = false;
         while std::time::Instant::now() < deadline {
-            if let Ok(d) = xp.get_float(TOD_DIST).await {
+            if let Some(d) = dist_to_tod(&xp, ring).await {
                 if d > 2.0 {
                     seen_ahead = true;
-                } else if seen_ahead && d >= 0.0 {
+                } else if seen_ahead {
                     announce(&voice, &status, "Heads up, approaching top of descent.");
                     return;
                 }

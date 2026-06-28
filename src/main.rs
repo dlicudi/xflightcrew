@@ -508,8 +508,12 @@ async fn run_session(
                 || tl.contains("let me know") || tl.contains("tell me when") || tl.contains("heads up");
             // Time/distance to top of descent ("how long before TOD"). Guarded by
             // is_reminder so "wake me at top of descent" still arms the reminder.
+            // "top of descent" is reliably misheard ("when is top of descent" came in
+            // as "1 is top descent"), so match top+descent loosely rather than the
+            // exact phrase. This also keeps such an utterance out of the vertical-speed
+            // grammar, which would otherwise read "descend 1 feet per minute".
             if !is_reminder
-                && (tl.contains("top of descent")
+                && ((tl.contains("top") && tl.contains("descent"))
                     || tl.contains("t o d")
                     || tl.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "tod"))
             {
@@ -1190,7 +1194,7 @@ async fn nav_progress(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
 /// A 3-degree descent loses ~1000 ft every 3 nm; Stratos (and most pilots) use a
 /// slightly gentler ~3.5 nm per 1000 ft as the planning ring. Used only when
 /// neither the FMS nor the SimBrief navlog gives a top-of-descent directly.
-const TOD_NM_PER_1000FT: f64 = 3.5;
+pub(crate) const TOD_NM_PER_1000FT: f64 = 3.5;
 
 /// Time and distance to the top of descent ("how long before TOD"), with three
 /// fallbacks so it works whether or not the box has VNAV:
@@ -1254,7 +1258,7 @@ async fn tod_phrase(dist_nm: f64, xp: &XPlaneClient) -> String {
 }
 
 /// Great-circle distance in nautical miles between two lat/lon points (haversine).
-fn haversine_nm(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+pub(crate) fn haversine_nm(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     const EARTH_RADIUS_NM: f64 = 3440.065;
     let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
     let dlat = (lat2 - lat1).to_radians();
