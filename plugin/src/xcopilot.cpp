@@ -190,8 +190,13 @@ static void load_fms_route() {
         }
         idx++;
     }
-    if (idx > 0) {
-        XPLMSetDestinationFMSEntry(0); // active leg = first waypoint
+    // Active leg = the first fix *after* the origin (entry 1), so we fly forward up
+    // the route rather than back to the departure airport at entry 0. The GPS then
+    // sequences onward by itself. (With a single entry, just target it.)
+    if (idx > 1) {
+        XPLMSetDestinationFMSEntry(1);
+    } else if (idx == 1) {
+        XPLMSetDestinationFMSEntry(0);
     }
     char msg[96];
     std::snprintf(msg, sizeof msg, "x-copilot plugin: loaded %d FMS waypoints\n", idx);

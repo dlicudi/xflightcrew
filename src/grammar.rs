@@ -291,6 +291,17 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         }
     }
 
+    // Couple the autopilot to the GPS flight plan (NAV mode). "nav" alone is the
+    // nav lights, so require navigate/follow/track + a route word, or "nav mode".
+    if has(t, "navigate")
+        || ((has(t, "follow") || has(t, "track") || has(t, "fly"))
+            && (t.contains("flight plan") || t.contains("route") || t.contains("root")
+                || t.contains("road") || has(t, "plan")))
+        || (has(t, "nav") && (t.contains("mode") || has(t, "engage")) && !t.contains("light"))
+    {
+        return Some(call("navigate", json!({})));
+    }
+
     // climb/descend TO a target AT a rate -> set_climb (AP captures & levels off)
     if has(t, "climb") || has(t, "descend") || has(t, "descent") || has(t, "altitude") {
         if let Some((before, after)) = t.split_once(" at ") {
@@ -563,6 +574,11 @@ mod tests {
         assert_eq!(one("heading 270").unwrap().1, json!({"heading":270}));
         assert_eq!(one("turn heading south").unwrap().1, json!({"heading":180}));
         assert_eq!(one("change heading to northeast").unwrap().1, json!({"heading":45}));
+        // navigate (couple AP to GPS) vs nav lights
+        assert_eq!(one("navigate").unwrap().0, "navigate");
+        assert_eq!(one("follow the flight plan").unwrap().0, "navigate");
+        assert_eq!(one("engage nav").unwrap().0, "navigate");
+        assert_eq!(one("nav lights on").unwrap().0, "set_lights");
         assert_eq!(one("heading north west").unwrap().1, json!({"heading":315}));
         assert_eq!(one("fly heading southeast").unwrap().1, json!({"heading":135}));
         assert_eq!(one("descend 500").unwrap().1, json!({"fpm":-500}));

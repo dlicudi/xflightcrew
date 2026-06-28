@@ -514,10 +514,14 @@ async fn run_session(
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
-            // SimBrief flight plan (cached fetch) + advice. Route, full brief, or refresh.
-            let is_plan = tl.contains("flight plan") || tl.contains("simbrief") || tl.contains("fetch the plan")
-                || tl.contains("where are we going") || tl.contains("where are we headed")
-                || (routeish && (tl.contains("our") || tl.contains("the") || tl.contains("what")));
+            // SimBrief flight plan (cached fetch) + advice. Route, full brief, or
+            // refresh. Not when the intent is to *fly* it ("follow/navigate/track"),
+            // which is the navigate tool (handled via the grammar/LLM path below).
+            let nav_intent = tl.contains("navigate") || tl.contains("follow") || tl.contains("track");
+            let is_plan = !nav_intent
+                && (tl.contains("flight plan") || tl.contains("simbrief") || tl.contains("fetch the plan")
+                    || tl.contains("where are we going") || tl.contains("where are we headed")
+                    || (routeish && (tl.contains("our") || tl.contains("the") || tl.contains("what"))));
             if is_plan {
                 reporter.status(ui::Phase::Thinking);
                 let refresh = tl.contains("refresh") || tl.contains("reload") || tl.contains("update");
@@ -1741,6 +1745,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "aircraft", "plane", "cessna", "skyhawk",
     // SimBrief flight plan + loading the route into the GPS/FMS
     "simbrief", "flightplan", "plan", "route", "load", "program", "gps", "fms",
+    // couple the autopilot to the flight plan
+    "navigate", "follow", "track",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,

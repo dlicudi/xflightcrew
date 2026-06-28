@@ -111,6 +111,7 @@ impl Registry {
 
         if profile.autopilot {
             tools.push(Box::new(autopilot::SetHeading));
+            tools.push(Box::new(autopilot::Navigate));
             tools.push(Box::new(autopilot::SetAltitude));
             tools.push(Box::new(autopilot::SetVerticalSpeed));
             tools.push(Box::new(autopilot::SetClimb));

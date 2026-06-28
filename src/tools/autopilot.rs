@@ -39,6 +39,12 @@ const SERVOS_ON: &str = crate::datarefs::SERVOS_ON;
 const CMD_SERVOS_OFF: &str = "sim/autopilot/servos_off_any";
 /// Command: engage heading-select (HDG) mode.
 const CMD_HEADING_MODE: &str = "sim/autopilot/heading";
+/// Command: engage NAV mode (follow the active nav source).
+const CMD_NAV_MODE: &str = "sim/autopilot/NAV";
+/// Command: select GPS as the CDI/HSI source (so NAV follows the GPS flight plan).
+const CMD_HSI_GPS: &str = "sim/autopilot/hsi_select_gps";
+/// NAV-mode status (> 0 = armed/engaged).
+const NAV_STATUS: &str = crate::datarefs::NAV_STATUS;
 /// Command: engage altitude select/hold (ALT) mode.
 const CMD_ALT_HOLD: &str = "sim/autopilot/altitude_hold";
 /// Command: wings-level / roll hold — for "auto level" / "straight and level".
@@ -522,6 +528,43 @@ impl Tool for SetHeading {
                 "Heading bug set to {:03.0}, but the autopilot didn't engage — check the AP master.",
                 actual
             ))
+        }
+    }
+}
+
+pub struct Navigate;
+
+#[async_trait]
+impl Tool for Navigate {
+    fn name(&self) -> &str {
+        "navigate"
+    }
+
+    fn description(&self) -> &str {
+        "Couple the autopilot to the GPS flight plan and follow it: selects GPS as \
+         the nav source and engages NAV mode. Use for 'navigate', 'follow the flight \
+         plan', 'follow the route', 'track the flight plan', 'fly the route', \
+         'engage nav', 'nav mode', 'GPS nav'. Load the route first with load_route."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+
+    async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        // GPS as the CDI source, servos on, then NAV mode (a toggle, so guarded).
+        ctx.xplane.run_command(CMD_HSI_GPS).await?;
+        ctx.xplane.run_command(CMD_SERVOS_ON).await?;
+        engage_mode(ctx, NAV_STATUS, CMD_NAV_MODE).await?;
+
+        match (servos_engaged(ctx).await?, mode_engaged(ctx, NAV_STATUS).await) {
+            (true, true) => Ok("Roger, following the flight plan, GPS nav engaged.".to_string()),
+            (true, false) => {
+                Ok("GPS selected and servos on, but NAV didn't engage, check the autopilot.".to_string())
+            }
+            (false, _) => {
+                Ok("Set GPS nav, but the autopilot didn't engage, check the AP master.".to_string())
+            }
         }
     }
 }
