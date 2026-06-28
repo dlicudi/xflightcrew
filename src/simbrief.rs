@@ -81,9 +81,31 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
     let n = |path: &str| v.pointer(path).and_then(num_of).unwrap_or(0.0);
 
     let route_dist = n("/general/route_distance");
+    let origin = s("/origin/icao_code");
+    let destination = s("/destination/icao_code");
+
+    // Enroute fixes, then bookended by the airports so the FMS plan reads
+    // origin → ... → destination. The navlog usually ends at the destination
+    // airport already; the origin is missing (the route starts at the first SID
+    // fix), so prepend it.
+    let mut waypoints = parse_waypoints(&v);
+    let o_lat = n("/origin/pos_lat");
+    let o_lon = n("/origin/pos_long");
+    if !origin.is_empty() && (o_lat != 0.0 || o_lon != 0.0) {
+        waypoints.insert(0, Waypoint { ident: origin.clone(), lat: o_lat, lon: o_lon, alt: 0.0 });
+    }
+    let d_lat = n("/destination/pos_lat");
+    let d_lon = n("/destination/pos_long");
+    if !destination.is_empty()
+        && waypoints.last().map(|w| w.ident.as_str()) != Some(destination.as_str())
+        && (d_lat != 0.0 || d_lon != 0.0)
+    {
+        waypoints.push(Waypoint { ident: destination.clone(), lat: d_lat, lon: d_lon, alt: 0.0 });
+    }
+
     Ok(FlightPlan {
-        origin: s("/origin/icao_code"),
-        destination: s("/destination/icao_code"),
+        origin,
+        destination,
         alternate: s("/alternate/icao_code"),
         aircraft: s("/aircraft/icaocode"),
         cruise_alt_ft: n("/general/initial_altitude"),
@@ -97,7 +119,7 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
         wind_dir: n("/general/avg_wind_dir"),
         wind_spd_kts: n("/general/avg_wind_spd"),
         tod_to_dest_nm: navlog_tod_to_dest(&v),
-        waypoints: parse_waypoints(&v),
+        waypoints,
     })
 }
 
