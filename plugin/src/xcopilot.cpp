@@ -109,9 +109,12 @@ static void WriteAction(void*, void* in, int offset, int len) {
 
 // ---- panel ------------------------------------------------------------------
 
+// Phase 1 is the app's resting "listening" state — but with push-to-talk the mic
+// is shut until you press, so "CONNECTED" is the honest label (the green [PTT]
+// chip shows when audio is actually being captured).
 static const char* PhaseLabel(int p) {
     switch (p) {
-        case 1: return "LISTENING";
+        case 1: return "CONNECTED";
         case 2: return "THINKING";
         case 3: return "SPEAKING";
         default: return "IDLE";
