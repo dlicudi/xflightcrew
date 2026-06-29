@@ -23,6 +23,10 @@ const IGN_DWN: &str = "laminar/md82cmd/ignition_sys_dwn";
 const N2: &str = "sim/cockpit2/engine/indicators/N2_percent"; // float array, %
 const ENGN_MIXT: &str = "sim/flightmodel/engine/ENGN_mixt"; // float array, 1 = fuel/run
 const BLEED: &str = "sim/cockpit2/bleedair/indicators/bleed_available_center";
+// Battery: the APU start needs a powered bus. The battery alone is enough (no GPU
+// required), so the sequence brings it on rather than assuming it.
+const BATTERY: &str = "sim/cockpit/electrical/battery_on";
+const BATTERY_ON: &str = "sim/electrical/battery_1_on";
 // APU: switch to START (2), running indicator, and the bleed-air valve that
 // actually feeds the air-driven starters (the step I'd missed).
 const APU_SWITCH: &str = "sim/cockpit/engine/APU_switch"; // int, 2 = start
@@ -104,6 +108,13 @@ async fn wait_n2(xp: &XPlaneClient, idx: usize, pct: f64, secs: u64) -> bool {
 }
 
 async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<StatusSink>) {
+    // 0. Power: the APU and starters need a powered bus. The battery alone is
+    //    enough (no GPU required), so make sure it's on rather than assume it.
+    if xp.get_float(BATTERY).await.unwrap_or(0.0) < 0.5 {
+        xp.run_command(BATTERY_ON).await.ok();
+        announce(voice, status, "Battery on.");
+    }
+
     // 1. Bleed air for the air-driven starters. If none, start the APU AND open its
     //    bleed valve (apu_bleed) — running the APU alone doesn't supply bleed.
     if xp.get_float(BLEED).await.unwrap_or(0.0) <= 1.0 {
