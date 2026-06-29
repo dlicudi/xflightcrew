@@ -391,6 +391,29 @@ public:
         s.Colors[ImGuiCol_WindowBg] = ImVec4(0.13f, 0.14f, 0.16f, 0.94f);
         s.Colors[ImGuiCol_ChildBg]  = ImVec4(0.10f, 0.11f, 0.13f, 0.85f);
         s.Colors[ImGuiCol_Border]   = ImVec4(0.30f, 0.32f, 0.36f, 0.60f);
+        // Allow shrinking down to the toolbar row (collapsed view).
+        SetWindowResizingLimits(260, kCollapsedH, 1400, 1400);
+    }
+
+private:
+    // Collapse to just the toolbar row (status chips under the title bar), so the
+    // panel can tuck out of the way without closing. Remembers the expanded size.
+    static constexpr int kCollapsedH = 46;
+    bool mCollapsed = false;
+    int mExpW = 420, mExpH = 300;
+
+    void toggleCollapse() {
+        int l, t, r, b;
+        GetWindowGeometry(l, t, r, b);
+        if (!mCollapsed) {
+            mExpW = r - l;
+            mExpH = t - b;
+            SetWindowGeometry(l, t, r, t - kCollapsedH); // keep position, shrink height
+            mCollapsed = true;
+        } else {
+            SetWindowGeometry(l, t, l + mExpW, t - mExpH); // restore size at current spot
+            mCollapsed = false;
+        }
     }
 
 protected:
@@ -410,6 +433,11 @@ protected:
         } else {
             Chip("NOT CONNECTED", COL_RED);
         }
+        // Collapse / expand to just this toolbar row, to tuck the panel away.
+        ImGui::SameLine();
+        if (ImGui::SmallButton(mCollapsed ? "+" : "_")) {
+            toggleCollapse();
+        }
         // One-click reload after a rebuild. The SDK can only reload *all* plugins
         // (there's no single-plugin reload), so this bounces every plugin — handy
         // when iterating, just don't fat-finger it mid-approach.
@@ -418,6 +446,10 @@ protected:
             XPLMReloadPlugins();
         }
         ImGui::Separator();
+        // Collapsed: stop here — just the toolbar shows under the title bar.
+        if (mCollapsed) {
+            return;
+        }
 
         // Transmission log — recent heard/action lines with coloured tags.
         const float footer = ImGui::GetFrameHeightWithSpacing();
