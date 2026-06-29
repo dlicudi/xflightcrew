@@ -58,10 +58,10 @@ pub struct Config {
     /// when attached to an interactive terminal, `plain` otherwise (piped output,
     /// CI) — the dashboard needs a real TTY to take over the screen and read keys.
     pub ui: String,
-    /// TTS backend: `sidecar` (warm Spark voice-clone server — the default, see
-    /// `voice/spark_sidecar.py`; auto-spawned and falls back to `say` if it can't
-    /// start), `say` (macOS built-in), `piper`, or `onnx` (in-process ONNX,
-    /// feature `onnx-tts`).
+    /// TTS backend: `onnx` (the default — warm in-process ONNX voice via `ort`,
+    /// native arm64, see [`crate::tts_onnx`]; falls back to `say` if the model
+    /// can't load), `say` (macOS built-in), `piper` (subprocess), or `sidecar`
+    /// (Spark voice-clone Python server, see `voice/spark_sidecar.py`).
     pub tts_backend: String,
     /// macOS `say` voice name (used when `tts_backend = "say"`). Empty = system
     /// default. List options with `say -v '?'` (e.g. `Daniel`, `Samantha`, `Karen`).
@@ -145,7 +145,7 @@ impl Config {
             stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.35").parse().unwrap_or(0.35),
             end_silence_ms: env_or("XCOPILOT_END_SILENCE_MS", "900").parse().unwrap_or(900),
             ui: env_or("XCOPILOT_UI", default_ui()),
-            tts_backend: env_or("XCOPILOT_TTS", "sidecar"),
+            tts_backend: env_or("XCOPILOT_TTS", "onnx"),
             say_voice: env_or("XCOPILOT_SAY_VOICE", ""),
             say_rate: env_or("XCOPILOT_SAY_RATE", ""),
             chime_path: env_or("XCOPILOT_CHIME", ""),
