@@ -1141,16 +1141,17 @@ async fn run_checklist(
                 }
             }
             // A dataref we don't actuate — read it and confirm or flag.
-            Item::Verify { say: line, dataref, index, cond } => {
+            Item::Verify { say: line, dataref, index, cond, settable } => {
                 match checklist::read_dataref(xplane, dataref, *index).await {
                     Some(v) if cond.eval(v) => {
                         say(voice, reporter, ui::LogKind::Readback, &format!("{line} Confirmed."))
                     }
-                    Some(_) => {
-                        // Not in the desired state — go ahead and set it to the
-                        // checklist's own target value (it's the authored procedure,
-                        // not an arbitrary write), then confirm. If the write doesn't
-                        // take (a read-only/xlua dataref), fall back to flagging it.
+                    // Not in the desired state.
+                    Some(_) if *settable => {
+                        // An actionable switch — set it to the checklist's own
+                        // target value (it's the authored procedure, not an
+                        // arbitrary write), then confirm. If the write doesn't take,
+                        // flag it.
                         let target = cond.target();
                         let wrote = match index {
                             Some(i) => xplane.set_float_array_elem(dataref, *i, target).await.is_ok(),
@@ -1164,6 +1165,9 @@ async fn run_checklist(
                             failed += 1;
                         }
                     }
+                    // Observe-only item (CHECK/test step or read-only indicator) not
+                    // yet in state — call it out for the pilot, don't write or flag.
+                    Some(_) => say(voice, reporter, ui::LogKind::Confirm, line),
                     // Couldn't read it — just call it out, don't flag.
                     None => say(voice, reporter, ui::LogKind::Confirm, line),
                 }

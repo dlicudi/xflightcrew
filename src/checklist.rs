@@ -125,9 +125,13 @@ pub enum Item {
     /// `confirm` is `Some(hazard)` for destructive steps (engine start/stop, the
     /// run-up) — the runner asks "Confirm, {hazard}?" and skips on a no.
     Act { say: String, tool: &'static str, args: Value, confirm: Option<&'static str> },
-    /// A dataref outside our curated tools: read it, and if it's not in the
-    /// checklist's desired state, set it to the condition's target (then confirm).
-    Verify { say: String, dataref: String, index: Option<usize>, cond: Cond },
+    /// A dataref outside our curated tools: read it and check the state. When
+    /// `settable` it's an actionable switch we may write to the condition's target
+    /// if it's not already there (then confirm). When `!settable` it's an
+    /// observe-only item — a CHECK/test step or a read-only indicator/annunciator
+    /// (or a custom `laminar/*` dataref we can't write from outside): read and
+    /// confirm if satisfied, otherwise just call it out for the pilot. Never write.
+    Verify { say: String, dataref: String, index: Option<usize>, cond: Cond, settable: bool },
 }
 
 /// One interpreted checklist. Carries the profile bits its actions need (lights,
@@ -290,8 +294,46 @@ fn parse_item(rest: &str, map: &[ChecklistMapEntry], fuel: &[FuelPosition]) -> I
             let confirm = confirm_for(tool, &args);
             Item::Act { say, tool, args, confirm }
         }
-        None => Item::Verify { say, dataref: base, index, cond },
+        None => {
+            // Only auto-set items that are both an action (not a CHECK/observe
+            // response) and a plausibly-writable dataref. CHECK/test steps and
+            // read-only indicators (annunciators, indicators, warnings, custom
+            // `laminar/*` datarefs) are observe-only — reading them is honest,
+            // writing them fails and floods the readback with "couldn't set it".
+            let settable = !is_observe_response(response) && !is_readonly_dataref(&base);
+            Item::Verify { say, dataref: base, index, cond, settable }
+        }
     }
+}
+
+/// A response verb that means "look at it / confirm it", not "set it" — so the
+/// runner reads and confirms but never writes. Covers the XChecklist CHECK/test
+/// vocabulary and the open-ended "as required" responses.
+fn is_observe_response(resp: &str) -> bool {
+    let r = resp.trim().to_ascii_uppercase();
+    const OBSERVE: &[&str] = &[
+        "CHECK", "VERIFY", "CONFIRM", "MONITOR", "NOTE", "OBSERVE", "TEST",
+        "CHECKED", "ENSURE",
+    ];
+    OBSERVE.iter().any(|w| r.starts_with(w))
+        || r.contains("AS REQ")
+        || r.contains("AS DESIRED")
+        || r.contains("AS NEEDED")
+        || r.contains("IF NEED")    // "ON IF NEEDED" — pilot's discretion, don't force it
+        || r.contains("IF REQ")
+        || r.contains("COMPLETE")
+}
+
+/// A dataref that's a status/indicator readout (or a custom `laminar/*` dataref),
+/// which is read-only from the Web API — writing it can't take, so the runner
+/// must only read it, never try to set it.
+fn is_readonly_dataref(d: &str) -> bool {
+    d.starts_with("laminar/")
+        || d.contains("/annunciators/")
+        || d.contains("/indicators/")
+        || d.contains("/warnings/")
+        || d.contains("/failures/")
+        || d.contains("/gauges/")
 }
 
 /// A condition we can't evaluate as a single `dataref:cond` — boolean compounds
@@ -511,11 +553,12 @@ const DECORATION: &[char] = &['=', '-', '_', '*', '>', '<', '~', '.', ' '];
 fn clean_narration(s: &str) -> Option<String> {
     let t = strip_colors(s);
     let t = t.trim();
-    // Navigation pointers ("\\cyan\\ >>> NEXT: BEFORE TAXI") are XChecklist's own
-    // "next section" hints — the runner advances on command, so they're noise.
-    if t.trim_start_matches(DECORATION).starts_with("NEXT")
-        || t.trim_start_matches(DECORATION).to_lowercase().starts_with("next:")
-    {
+    // Lines led with `>>>` are XChecklist pointer/sub-note decoration — "next
+    // section" hints ("\\cyan\\ >>> NEXT: BEFORE TAXI") and conditional advisory
+    // headers (">>>If ICING Conditions", ">>> Temp below 10 C / Fog / Rain"). They
+    // frame the items that follow rather than being steps themselves, so reading
+    // them aloud is noise — the actionable items below carry the real responses.
+    if t.starts_with('>') {
         return None;
     }
     // Pure decoration ("=====", "-----", "*** ", "-o-") → nothing to say. The
@@ -759,11 +802,44 @@ mod tests {
         }
         // No dataref → call-out.
         assert!(matches!(parse_item("FUEL QUANTITY|SUFFICIENT"), Item::CallOut(_)));
-        // A dataref we don't own → verify.
+        // A dataref we don't own → verify, and a writable switch is settable.
         match parse_item("STATIC PRESSURE ALTERNATE|OFF:sim/cockpit2/switches/alternate_static_air_ratio:<0.1") {
-            Item::Verify { cond, .. } => assert_eq!(cond, Cond::Lt(0.1)),
+            Item::Verify { cond, settable, .. } => {
+                assert_eq!(cond, Cond::Lt(0.1));
+                assert!(settable, "a writable switch with an action response is settable");
+            }
             _ => panic!("expected Verify"),
         }
+    }
+
+    #[test]
+    fn observe_and_readonly_items_are_not_settable() {
+        let parse_item = |r: &str| super::parse_item(r, &[], &[]);
+        // A CHECK response → observe-only, never written.
+        match parse_item("CLEAR MASTER CAUTION|CHECK:sim/cockpit/warnings/annunciators/master_caution:0") {
+            Item::Verify { settable, .. } => assert!(!settable, "CHECK is observe-only"),
+            other => panic!("expected Verify, got {}", variant(&other)),
+        }
+        // A read-only indicator dataref → observe-only even with an action response.
+        match parse_item("APU POWER|ON:sim/cockpit2/bleedair/indicators/bleed_available_center:1") {
+            Item::Verify { settable, .. } => assert!(!settable, "an indicator dataref isn't writable"),
+            other => panic!("expected Verify, got {}", variant(&other)),
+        }
+        // "ON IF NEEDED" is the pilot's discretion → observe-only.
+        match parse_item("ENGINE ANTI ICE|ON IF NEEDED:sim/cockpit/switches/anti_ice_inlet_heat_per_engine[0]:1") {
+            Item::Verify { settable, .. } => assert!(!settable, "conditional 'if needed' isn't forced"),
+            other => panic!("expected Verify, got {}", variant(&other)),
+        }
+    }
+
+    #[test]
+    fn pointer_remarks_are_dropped() {
+        // `>>>` advisory headers ("If ICING Conditions", weather descriptors) are
+        // sub-note decoration, not spoken steps.
+        assert_eq!(super::clean_narration(">>>If ICING Conditions"), None);
+        assert_eq!(super::clean_narration(">>> Temp below 10 C / Fog / Rain / Snow"), None);
+        // A substantive remark still survives.
+        assert!(super::clean_narration("MAGNETO TEST").is_some());
     }
 
     #[test]
