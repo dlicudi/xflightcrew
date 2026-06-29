@@ -136,6 +136,34 @@ fn env_scale(name: &str, default: f64) -> f32 {
     std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(default as f32)
 }
 
+/// Spoken names for A–Z, so acronyms spelled letter-by-letter ("A P U", "C H T")
+/// are read as letters. espeak-ng otherwise reads a lone "A" as a schwa ("uh"),
+/// turning "A P U" into "uh-pee-you" (sounds like "P.U.").
+const LETTER_NAMES: [&str; 26] = [
+    "ay", "bee", "see", "dee", "ee", "eff", "jee", "aitch", "eye", "jay", "kay", "el", "em", "en",
+    "oh", "pee", "cue", "ar", "ess", "tee", "you", "vee", "double you", "ex", "why", "zee",
+];
+
+/// Expand standalone single capital letters to their spoken names (keeping any
+/// attached punctuation), so the spelled-out acronym convention in the readbacks
+/// is pronounced correctly. Lowercase words and multi-letter tokens are untouched.
+fn say_letters(text: &str) -> String {
+    text.split(' ')
+        .map(|tok| {
+            let core = tok.trim_matches(|c: char| !c.is_alphanumeric());
+            if core.len() == 1 {
+                if let Some(c) = core.chars().next() {
+                    if c.is_ascii_uppercase() {
+                        return tok.replacen(core, LETTER_NAMES[(c as u8 - b'A') as usize], 1);
+                    }
+                }
+            }
+            tok.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Sentence/clause punctuation that piper voices model as pause/intonation tokens
 /// (they're in the voice's phoneme_id_map). `espeak-ng --ipa` collapses these to
 /// newlines and drops the mark itself, so we phonemize *between* them and splice
@@ -146,6 +174,7 @@ const PUNCT: &[char] = &[',', '.', '?', '!', ';', ':'];
 /// phonemized on its own (no internal punctuation for espeak to swallow), and the
 /// original punctuation mark is reinserted between clauses so its prosody survives.
 fn phonemize(text: &str) -> Result<String> {
+    let text = say_letters(text); // "A P U" -> "ay pee you" before espeak
     let mut out = String::new();
     let mut seg = String::new();
     for ch in text.chars() {
