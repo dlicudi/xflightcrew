@@ -410,7 +410,12 @@ mod tests {
         assert_eq!(flaps.detents.len(), 3);
         assert_eq!(flaps.detents[2].label, "full");
         assert_eq!(flaps.detents[1].vfe_kts, Some(150.0));
-        assert_eq!(p.vs_clean_kts, Some(76.0));
+        assert_eq!(p.vs_clean_kts, Some(70.0));
+        assert_eq!(p.vne_kts, Some(204.0));
+        // Reference card loads from YAML — the SR22's own numbers.
+        let r = p.reference.as_ref().expect("sr22 reference");
+        assert_eq!(r.best_glide_kts, Some(88.0));
+        assert_eq!(r.max_gross_lb, Some(3600.0));
         assert_eq!(p.lights.len(), 3);
         // Conservative map: only the universal-safe entries, and the YAML matches
         // the built-in.
@@ -727,12 +732,39 @@ fn cirrus_sr22() -> AircraftProfile {
             cruise_burn_kg_hr: 46.0,
         }),
         // VS1 (clean) ~76 KIAS; VS0 (landing) ~61.
-        vs_clean_kts: Some(76.0),
-        // SR22 Vne (never-exceed) 205 KIAS.
-        vne_kts: Some(205.0),
-        // No reference card yet for the SR22 (no manual on hand) — reference
-        // queries fall back to the LLM until one is filled in.
-        reference: None,
+        // SR22 clean stall (Vs) 70 KIAS, per the X-Plane SR22 POM.
+        vs_clean_kts: Some(70.0),
+        // SR22 Vne (never-exceed) 204 KIAS.
+        vne_kts: Some(204.0),
+        // Reference figures from the X-Plane Cirrus SR22 Pilot's Operating Manual
+        // (the modeled aircraft is the turbo TSIO-550-K, ceiling 25,000 ft).
+        reference: Some(ReferenceProfile {
+            vno_kts: Some(178.0),
+            va_kts: Some(133.0),
+            vx_kts: Some(88.0),
+            vy_kts: Some(101.0),
+            vr_kts: Some(73.0),
+            best_glide_kts: Some(88.0),
+            vs0_kts: Some(60.0),
+            approach_kts: None,
+            max_crosswind_kts: Some(21.0),
+            cruise_kts: Some(180.0), // normal cruise (manual lists 213 KTAS max)
+            best_climb_fpm: Some(1200.0),
+            max_gross_lb: Some(3600.0),
+            empty_weight_lb: Some(2354.0),
+            useful_load_lb: Some(1260.0),
+            service_ceiling_ft: Some(25000.0),
+            fuel_capacity_gal: Some(92.0),
+            fuel_useable_gal: None,
+            endurance_hours: Some(5.0), // 92 gal / ~18 gph
+            takeoff_distance_ft: None,
+            landing_distance_ft: None,
+            max_rpm: Some(2700.0),
+            oil_temp_min_f: None,
+            oil_temp_max_f: None,
+            oil_press_min_psi: None,
+            oil_press_max_psi: None,
+        }),
         checklist: Some("checklists/cirrus_sr22.txt".into()),
         // Lights — datarefs verified against the rustdecks SR22 deck; universal
         // on/off commands.

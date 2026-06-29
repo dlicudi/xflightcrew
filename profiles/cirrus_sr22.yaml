@@ -69,8 +69,33 @@ fuel:
   reserve_warning_min: 30.0
   cruise_burn_kg_hr: 46.0
 
-# Clean (VS1) stall ~76 KIAS; landing config (VS0) ~61. Drives the airspeed monitor.
-vs_clean_kts: 76.0
+# Clean stall (Vs) 70 KIAS; landing config (Vso) 60. Drives the airspeed monitor.
+vs_clean_kts: 70.0
+
+# Never-exceed speed (Vne), KIAS — drives the monitor's overspeed callout.
+vne_kts: 204.0
+
+# Static reference figures recited on request, from the X-Plane Cirrus SR22
+# Pilot's Operating Manual (the modeled aircraft is the turbo TSIO-550-K,
+# ceiling 25,000 ft). Vne and clean stall live above (the monitor uses them).
+reference:
+  vno_kts: 178.0
+  va_kts: 133.0
+  vx_kts: 88.0
+  vy_kts: 101.0
+  vr_kts: 73.0
+  best_glide_kts: 88.0
+  vs0_kts: 60.0
+  max_crosswind_kts: 21.0
+  cruise_kts: 180.0          # normal cruise (manual lists 213 KTAS max)
+  best_climb_fpm: 1200.0
+  max_gross_lb: 3600.0
+  empty_weight_lb: 2354.0
+  useful_load_lb: 1260.0
+  service_ceiling_ft: 25000.0
+  fuel_capacity_gal: 92.0
+  endurance_hours: 5.0       # 92 gal / ~18 gph
+  max_rpm: 2700.0
 
 # Flaps 0 / 50% / 100% (Vfe 150 / 110 KIAS). set_flaps writes the universal
 # flap_ratio. Detent ratios: VERIFY.
