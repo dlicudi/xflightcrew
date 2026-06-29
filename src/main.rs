@@ -166,17 +166,10 @@ async fn main() -> Result<()> {
 
     // whisper model load is the one slow init — do it once, up front. Bias its
     // decoding toward the active aircraft's actual systems and phraseology.
-    let mut stt = Stt::load(&config.whisper_model_path, config.whisper_gpu)?;
-    stt.set_prompt(stt::build_prompt(&profile));
+    let stt = Stt::load(&config.whisper_model_path, config.whisper_gpu)?;
     let llm = Llm::new(&config);
-    let registry = Registry::for_aircraft(&profile);
-    // Checklists the copilot runs interactively (narrate + act + verify + call
-    // out yours). Interpreted from the airframe's XChecklist file, not baked in.
-    let checklists = checklist::load(&profile).unwrap_or_else(|e| {
-        tracing::error!("checklist load failed: {e:#}; running without checklists");
-        Vec::new()
-    });
-    tracing::info!(checklists = checklists.len(), "interpreted checklists");
+    // The tool registry, STT prompt, and checklists are all derived from the
+    // profile inside run_session — and rebuilt there when the aircraft switches.
 
     // Push-to-talk, if configured. When set it takes over capture: the copilot
     // listens only while the button/key is held, so there's no wake word and
@@ -215,16 +208,58 @@ async fn main() -> Result<()> {
         .plugin_status
         .then(|| plugin_status::StatusSink::start(&config.xplane_base_url));
 
+    // The active profile, shared so the aircraft can be switched live. Seeded with
+    // the startup detection; the poller below corrects it if the sim's aircraft
+    // differs or changes (or if X-Plane wasn't up yet at launch).
+    let live_profile = LiveProfile::new(profile.clone());
+
+    // Aircraft-change poller: re-read acf_ICAO periodically and swap the profile
+    // when it changes, so the copilot reconfigures itself (tools, limits, monitor)
+    // instead of staying on whatever was loaded at startup. Auto-detect only.
+    if config.aircraft.eq_ignore_ascii_case("auto") {
+        let live = live_profile.clone();
+        let base = config.xplane_base_url.clone();
+        let det_voice = voice.clone();
+        let det_status = status_sink.clone();
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+            rt.block_on(async move {
+                let xp = XPlaneClient::new(base);
+                loop {
+                    if let Ok(icao) = xp.aircraft_icao().await {
+                        let icao = icao.trim().to_string();
+                        if !icao.is_empty() {
+                            let id = icao_to_profile(&icao);
+                            if id != live.id() {
+                                if let Some(p) = aircraft::load(&id) {
+                                    let name = p.display_name.clone();
+                                    tracing::info!(icao = %icao, profile = %id, "aircraft changed; switching profile");
+                                    live.swap(p);
+                                    if let Some(s) = det_status.as_ref() {
+                                        s.alert(plugin_status::AlertLevel::Advisory, &format!("Now set up for the {name}."));
+                                    }
+                                    det_voice.alert(voice::Priority::Advisory, format!("Now set up for the {name}."));
+                                }
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+            });
+        });
+    }
+
     // Background monitor: watches for problems and speaks up. Its own thread +
     // runtime + X-Plane client, sharing the speech arbiter. Runs in both UIs.
+    // Reads the live profile so its limits switch with the aircraft.
     if config.monitor_enabled {
         let mon_voice = voice.clone();
         let mon_config = config.clone();
-        let mon_profile = profile.clone();
+        let mon_live = live_profile.clone();
         let mon_status = status_sink.clone();
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
-            rt.block_on(monitor::run(mon_config, mon_profile, mon_voice, mon_status));
+            rt.block_on(monitor::run(mon_config, mon_live, mon_voice, mon_status));
         });
     }
 
@@ -270,7 +305,7 @@ async fn main() -> Result<()> {
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             if let Err(e) = rt.block_on(run_session(
-                config, stt, llm, registry, profile, checklists, voice, continuous, explicit, ptt, reporter, Some(cmd_rx),
+                config, stt, llm, live_profile, voice, continuous, explicit, ptt, reporter, Some(cmd_rx),
             )) {
                 tracing::error!("voice loop ended: {e:#}");
             }
@@ -284,7 +319,7 @@ async fn main() -> Result<()> {
         if let Some(s) = status_sink {
             reporter = reporter.with_status(s);
         }
-        run_session(config, stt, llm, registry, profile, checklists, voice, continuous, explicit, ptt, reporter, None).await
+        run_session(config, stt, llm, live_profile, voice, continuous, explicit, ptt, reporter, None).await
     }
 }
 
@@ -313,6 +348,38 @@ enum Ptt {
     Dataref { live: std::sync::Arc<LiveState>, name: String },
 }
 
+/// The active aircraft profile, shared between the command loop, the monitor, and
+/// the detection poller. The poller swaps it when the sim's aircraft changes;
+/// consumers notice via the generation counter and rebuild off the new profile.
+pub(crate) struct LiveProfile {
+    inner: std::sync::RwLock<aircraft::AircraftProfile>,
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl LiveProfile {
+    fn new(p: aircraft::AircraftProfile) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner: std::sync::RwLock::new(p),
+            generation: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+    /// A clone of the current profile.
+    pub(crate) fn get(&self) -> aircraft::AircraftProfile {
+        self.inner.read().unwrap().clone()
+    }
+    fn id(&self) -> String {
+        self.inner.read().unwrap().id.clone()
+    }
+    /// Bumps every time the profile is swapped — consumers compare to know to rebuild.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn swap(&self, p: aircraft::AircraftProfile) {
+        *self.inner.write().unwrap() = p;
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl Ptt {
     /// True while the PTT dataref reads pressed (only meaningful for `Dataref`).
     fn dataref_active(live: &LiveState, name: &str) -> bool {
@@ -334,11 +401,9 @@ impl Ptt {
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     config: Config,
-    stt: Stt,
+    mut stt: Stt,
     llm: Llm,
-    registry: Registry,
-    profile: aircraft::AircraftProfile,
-    checklists: Vec<checklist::Checklist>,
+    live_profile: std::sync::Arc<LiveProfile>,
     voice: Voice,
     continuous: bool,
     explicit: bool,
@@ -354,9 +419,20 @@ async fn run_session(
     // instant cache reads instead of a REST burst. Best-effort: reads fall back to
     // REST until (or unless) the subscription warms up.
     let live = LiveState::start(&config.xplane_base_url, SNAPSHOT_DATAREFS);
+
+    // Profile-derived state, rebuilt whenever the aircraft switches (see the
+    // generation check at the top of the loop). Seeded from the live profile.
+    let mut active_gen = live_profile.generation();
+    let mut profile = live_profile.get();
+    let mut registry = Registry::for_aircraft(&profile);
+    let mut checklists = checklist::load(&profile).unwrap_or_else(|e| {
+        tracing::error!("checklist load failed: {e:#}; running without checklists");
+        Vec::new()
+    });
+    stt.set_prompt(stt::build_prompt(&profile));
+    // Tool specs for the LLM = curated tools + each checklist as a no-arg "tool"
+    // the loop intercepts and runs interactively.
     let mut specs = registry.specs();
-    // Each checklist is exposed to the LLM as a no-arg "tool" the loop intercepts
-    // and runs interactively.
     specs.extend(checklists.iter().map(|c| c.spec()));
     // Rolling conversation memory: recent (command, readback, when) turns, used
     // to resolve back-references and to gate conversational follow-ups.
@@ -444,6 +520,21 @@ async fn run_session(
                 (heard.text, false)
             }
         };
+
+        // Aircraft switched? Rebuild everything profile-derived before acting on this
+        // command, so the tools, limits, prompt, and checklists match what's actually
+        // in the sim. (The poller swaps the shared profile; the monitor reacts on its
+        // own.) The switch itself is announced by the poller.
+        if live_profile.generation() != active_gen {
+            active_gen = live_profile.generation();
+            profile = live_profile.get();
+            registry = Registry::for_aircraft(&profile);
+            checklists = checklist::load(&profile).unwrap_or_default();
+            stt.set_prompt(stt::build_prompt(&profile));
+            specs = registry.specs();
+            specs.extend(checklists.iter().map(|c| c.spec()));
+            tracing::info!(aircraft = %profile.display_name, "reconfigured for new aircraft");
+        }
 
         // EMERGENCY ABORT — the very first thing checked, before the confidence,
         // echo, and domain gates and any LLM. "belay that", "undo", "abort",

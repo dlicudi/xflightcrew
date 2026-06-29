@@ -789,12 +789,12 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
 
 /// Run the monitor loop until the process exits. Spawned on its own thread +
 /// runtime with its own X-Plane client; shares the [`Voice`] arbiter.
-pub async fn run(config: Config, profile: AircraftProfile, voice: Voice, status: Option<StatusSink>) {
-    let checks = build_checks(&profile);
-    if checks.is_empty() {
-        tracing::info!("monitor: no checks for this airframe; not starting");
-        return;
-    }
+pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice: Voice, status: Option<StatusSink>) {
+    // Checks are built from the active profile and rebuilt when the aircraft
+    // switches (the generation counter changes), so a jet doesn't keep a 172's
+    // stall/overspeed limits after a profile swap.
+    let mut gen = live.generation();
+    let mut checks = build_checks(&live.get());
     tracing::info!(checks = checks.len(), hz = config.monitor_hz, "monitor started");
 
     let xp = XPlaneClient::new(config.xplane_base_url.clone());
@@ -812,6 +812,13 @@ pub async fn run(config: Config, profile: AircraftProfile, voice: Voice, status:
     let mut prev_pushing = false;
 
     loop {
+        // Aircraft switched → rebuild the checks for the new airframe.
+        if live.generation() != gen {
+            gen = live.generation();
+            checks = build_checks(&live.get());
+            states = checks.iter().map(|c| (c.id(), FireState::new())).collect();
+            tracing::info!(checks = checks.len(), "monitor: reconfigured for new aircraft");
+        }
         if let Some(mut snap) = Snapshot::read(&xp).await {
             let now = Instant::now();
 
