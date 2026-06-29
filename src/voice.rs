@@ -253,8 +253,12 @@ impl Speaker {
         }
         // `onnx` requested but the feature isn't built in → fall back to `say`.
         if config.tts_backend == "onnx" {
+            tracing::warn!("onnx TTS requested but not built in (need the onnx-tts feature); using `say`");
             config.tts_backend = "say".into();
         }
+        // Always announce the resolved backend so the active voice is never a
+        // guess — the `say`/`piper` subprocess paths were previously silent.
+        tracing::info!(backend = %config.tts_backend, "TTS: subprocess backend (per-utterance)");
         Speaker::Subprocess(config)
     }
 
