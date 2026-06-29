@@ -70,6 +70,14 @@ async fn main() -> Result<()> {
         .with(stderr_layer)
         .init();
 
+    // First line in the log: which build this is, so there's no doubt about whether
+    // a rebuilt copilot was actually picked up (pairs with the plugin's build line).
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        build = env!("XCOPILOT_BUILD"),
+        "x-copilot starting"
+    );
+
     // Route whisper/ggml C logging through tracing so its model-load chatter
     // goes to the log file, not onto the terminal (which would corrupt the TUI).
     whisper_rs::install_whisper_tracing_trampoline();
@@ -276,7 +284,12 @@ async fn main() -> Result<()> {
         // TUI: voice loop + aircraft poll run on background threads, each with
         // its own runtime; the dashboard renders on the main thread.
         let (tx, rx) = std::sync::mpsc::channel::<ui::Report>();
-        let title = format!("x-copilot {} · {}", env!("CARGO_PKG_VERSION"), profile.display_name);
+        let title = format!(
+            "x-copilot {} ({}) · {}",
+            env!("CARGO_PKG_VERSION"),
+            env!("XCOPILOT_BUILD"),
+            profile.display_name
+        );
         // The active engines, shown in the status bar: STT (whisper model), LLM,
         // and TTS backend — so it's obvious at a glance what's running.
         let engines = format!(
