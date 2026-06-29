@@ -2729,6 +2729,13 @@ mod tests {
         // electrical systems on" has a tool to land on.
         assert!(reg.get("set_electrical").is_some());
         assert!(p.electrical.iter().any(|e| e.key == "all"));
+        // Jet start sequence, not the piston one-shot.
+        assert!(reg.get("start_engines").is_some());
+        assert!(reg.get("start_engine").is_none());
+        // ...and the piston 172 is the other way round.
+        let c172 = super::tools::Registry::for_aircraft(&super::aircraft::load("cessna_172sp").unwrap());
+        assert!(c172.get("start_engines").is_none());
+        assert!(c172.get("start_engine").is_some());
         // Reference card answers from the POM.
         assert!(super::reference_limits(&p, "service ceiling").unwrap().contains("37,000"));
         // The MD-82 checklist parses.

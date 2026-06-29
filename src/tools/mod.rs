@@ -17,6 +17,7 @@ pub mod electrical;
 pub mod engine;
 pub mod flaps;
 pub mod gear;
+pub mod jet_start;
 pub mod ground;
 pub mod instruments;
 pub mod lights;
@@ -131,6 +132,10 @@ impl Registry {
         // Thrust levers: any piston engine, or a turbine that declares `throttle`.
         if profile.engine || profile.throttle {
             tools.push(Box::new(engine::SetThrottle));
+        }
+        // Turbine start sequence (jets) — distinct from the piston one-shot start.
+        if profile.turbine_start {
+            tools.push(Box::new(jet_start::StartEngines));
         }
         if profile.engine {
             tools.push(Box::new(engine::SetMixture));

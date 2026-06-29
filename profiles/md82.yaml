@@ -14,6 +14,7 @@ display_name: McDonnell Douglas MD-82
 # Capability flags.
 autopilot: true        # set_heading / set_altitude / set_vertical_speed
 throttle: true         # set_throttle (thrust levers) — jet, so NO piston engine group
+turbine_start: true    # start_engines (bleed/fuel/ignition/crank sequence)
 barometer: true        # set_barometer
 pitot_heat: true       # set_pitot_heat
 pitch_trim: true       # set_pitch_trim (the checklist sets elevator_trim)

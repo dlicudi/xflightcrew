@@ -58,6 +58,10 @@ pub struct AircraftProfile {
     /// `engine` already implies a throttle, so it's only set for jets/turboprops.
     #[serde(default)]
     pub throttle: bool,
+    /// Turbine start sequence (`start_engines`) — bleed/fuel/ignition/crank with N2
+    /// monitoring, as opposed to the piston `engine` group's one-shot start.
+    #[serde(default)]
+    pub turbine_start: bool,
     /// Adjustable altimeter (`set_barometer`).
     #[serde(default)]
     pub barometer: bool,
@@ -482,6 +486,7 @@ fn cessna_172sp() -> AircraftProfile {
         autopilot: true,
         engine: true,
         throttle: false,
+        turbine_start: false,
         barometer: true,
         directional_gyro: true,
         com_radio: true,
@@ -665,6 +670,7 @@ fn cirrus_sr22() -> AircraftProfile {
         // the SR22's second battery/alternator need the dual-electrical tool.)
         engine: true,
         throttle: false,
+        turbine_start: false,
         // Dual battery/alternator + avionics — datarefs/commands verified against
         // the rustdecks SR22 deck.
         electrical: {
