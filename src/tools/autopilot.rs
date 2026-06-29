@@ -903,10 +903,14 @@ fn describe_vs(fpm: f64) -> String {
 
 /// The AP airspeed select (standard X-Plane AP dataref).
 const AIRSPEED_DIAL: &str = "sim/cockpit2/autopilot/airspeed_dial_kts";
-/// MD-82 autothrottle: a custom on/off switch driven by a toggle command (the
-/// generic sim/autopilot/autothrottle_on doesn't move it).
+/// MD-82 autothrottle: a custom on/off switch (arm) driven by a toggle command;
+/// engaging into the detent needs an EPR thrust rating selected then EPR_lim, which
+/// clamps autothrottle_enabled to a holding mode (needs the flight director on).
 const AT_SWITCH: &str = "laminar/md82/autopilot/autothrottle_switch";
+const AT_ENABLED: &str = "sim/cockpit2/autopilot/autothrottle_enabled"; // 0 arm, 1 speed, 2 EPR
 const CMD_AT_TOGGLE: &str = "laminar/md82cmd/autopilot/autothrottle_switch";
+const CMD_EPR_CLIMB: &str = "laminar/md82cmd/autopilot/EPR_CL"; // select climb thrust rating
+const CMD_EPR_ENGAGE: &str = "laminar/md82cmd/autopilot/EPR_lim"; // engage EPR mode (clamp)
 
 pub struct SetSpeed;
 
@@ -969,12 +973,25 @@ impl Tool for Autothrottle {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: AtArgs = serde_json::from_value(args.clone())?;
-        let cur = ctx.xplane.get_float(AT_SWITCH).await.unwrap_or(0.0) > 0.5;
-        if cur != a.on {
+        let armed = ctx.xplane.get_float(AT_SWITCH).await.unwrap_or(0.0) > 0.5;
+        if !a.on {
+            if armed {
+                ctx.xplane.run_command(CMD_AT_TOGGLE).await?; // also clears the mode
+            }
+            return Ok("Autothrottle off.".to_string());
+        }
+        // Arm, select a thrust rating (climb), then engage into the detent.
+        if !armed {
             ctx.xplane.run_command(CMD_AT_TOGGLE).await?;
         }
-        let now = ctx.xplane.get_float(AT_SWITCH).await.unwrap_or(0.0) > 0.5;
-        Ok(format!("Autothrottle {}.", if now { "armed" } else { "off" }))
+        ctx.xplane.run_command(CMD_EPR_CLIMB).await.ok();
+        ctx.xplane.run_command(CMD_EPR_ENGAGE).await?;
+        // Engaged only if it clamped into a holding mode (needs the flight director).
+        if ctx.xplane.get_float(AT_ENABLED).await.unwrap_or(0.0) >= 0.5 {
+            Ok("Autothrottle engaged, climb thrust.".to_string())
+        } else {
+            Ok("Autothrottle armed, but it didn't engage. Check the flight director is on.".to_string())
+        }
     }
 }
 
