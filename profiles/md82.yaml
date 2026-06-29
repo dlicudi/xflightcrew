@@ -54,11 +54,15 @@ electrical:
     on_commands:  [sim/systems/avionics_on]
     off_commands: [sim/systems/avionics_off]
     readback:     [sim/cockpit/electrical/avionics_on]
+  # "All electrical on" = the pre-start essentials that can actually come up on the
+  # ground: battery and avionics. The engine generators need the engines running
+  # (they energise during the start sequence), so they're NOT commanded here -- that
+  # would claim power that isn't there. Ask for "generators" after engine start.
   - key: all
     spoken: all electrical
-    on_commands:  [sim/electrical/battery_1_on, sim/electrical/generator_1_on, sim/electrical/generator_2_on, sim/systems/avionics_on]
-    off_commands: [sim/systems/avionics_off, sim/electrical/generator_1_off, sim/electrical/generator_2_off, sim/electrical/battery_1_off]
-    readback:     [sim/cockpit/electrical/battery_on, "sim/cockpit/electrical/generator_on[0]", "sim/cockpit/electrical/generator_on[1]"]
+    on_commands:  [sim/electrical/battery_1_on, sim/systems/avionics_on]
+    off_commands: [sim/systems/avionics_off, sim/electrical/battery_1_off]
+    readback:     [sim/cockpit/electrical/battery_on, sim/cockpit/electrical/avionics_on]
 
 # Exterior lights (standard X-Plane switch datarefs).
 lights:

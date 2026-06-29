@@ -23,7 +23,15 @@ const IGN_DWN: &str = "laminar/md82cmd/ignition_sys_dwn";
 const N2: &str = "sim/cockpit2/engine/indicators/N2_percent"; // float array, %
 const ENGN_MIXT: &str = "sim/flightmodel/engine/ENGN_mixt"; // float array, 1 = fuel/run
 const BLEED: &str = "sim/cockpit2/bleedair/indicators/bleed_available_center";
-const APU_START: &str = "sim/electrical/APU_start";
+// APU: switch to START (2), running indicator, and the bleed-air valve that
+// actually feeds the air-driven starters (the step I'd missed).
+const APU_SWITCH: &str = "sim/cockpit/engine/APU_switch"; // int, 2 = start
+const APU_RUNNING: &str = "sim/cockpit/engine/APU_running";
+const APU_BLEED: &str = "sim/cockpit2/bleedair/actuators/apu_bleed";
+const APU_START_CMD: &str = "sim/electrical/APU_start";
+// Engine bleed cross-feeds route the APU start air to the engines.
+const XFEED_L: &str = "laminar/md82/bleedair/engineL_xfeed_lever";
+const XFEED_R: &str = "laminar/md82/bleedair/engineR_xfeed_lever";
 
 /// N2 at which the starter has the engine turning fast enough to introduce fuel.
 const N2_LIGHT_PCT: f64 = 20.0;
@@ -96,26 +104,38 @@ async fn wait_n2(xp: &XPlaneClient, idx: usize, pct: f64, secs: u64) -> bool {
 }
 
 async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<StatusSink>) {
-    // 1. Bleed air for the air-driven starter — start the APU if it isn't available.
-    if xp.get_float(BLEED).await.unwrap_or(0.0) < 1.0 {
+    // 1. Bleed air for the air-driven starters. If none, start the APU AND open its
+    //    bleed valve (apu_bleed) — running the APU alone doesn't supply bleed.
+    if xp.get_float(BLEED).await.unwrap_or(0.0) <= 1.0 {
         announce(voice, status, "Starting the A P U for bleed air.");
-        xp.run_command(APU_START).await.ok();
+        xp.set_int(APU_SWITCH, 2).await.ok(); // start
+        xp.run_command(APU_START_CMD).await.ok(); // some builds drive it by command
+        xp.set_float(APU_BLEED, 1.0).await.ok(); // open the bleed valve (the missing step)
+        // Wait for the APU to spool and bleed to come up (it takes a while).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut ready = false;
         while std::time::Instant::now() < deadline {
-            if xp.get_float(BLEED).await.unwrap_or(0.0) >= 1.0 {
+            if xp.get_float(BLEED).await.unwrap_or(0.0) > 1.0 {
                 ready = true;
                 break;
+            }
+            // Keep nudging the bleed valve open in case the APU wasn't running yet.
+            if xp.get_float(APU_RUNNING).await.unwrap_or(0.0) > 0.5 {
+                xp.set_float(APU_BLEED, 1.0).await.ok();
             }
             tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
         }
         if !ready {
-            announce(voice, status, "No bleed air, the A P U didn't come online. Holding the start.");
+            announce(voice, status, "Still no bleed air. Check the A P U and its bleed valve. Holding the start.");
             return;
         }
     }
+    announce(voice, status, "Bleed air available.");
 
-    // 2. Fuel boost pumps on (center, left, right tanks).
+    // 2. Route start air to the engines (bleed cross-feeds) and run the fuel boost
+    //    pumps (center, left, right tanks).
+    xp.set_float(XFEED_L, 1.0).await.ok();
+    xp.set_float(XFEED_R, 1.0).await.ok();
     for i in 0..3 {
         xp.set_int_array_elem(FUEL_PUMP, i, 1).await.ok();
     }
