@@ -2473,6 +2473,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     // vertical-nav synonyms whisper actually produced that the gate missed:
     // "ascend 500" (for climb), "physical speed 500" (mishear of vertical speed).
     "ascend", "ascent", "speed",
+    // airliner autoflight: AP speed select + autothrottle
+    "airspeed", "autothrottle",
     // lights
     "light", "lights", "beacon", "strobe", "strobes", "taxi", "landing", "nav",
     "navigation", "flood", "floods",

@@ -899,6 +899,85 @@ fn describe_vs(fpm: f64) -> String {
     }
 }
 
+// ---- airliner autoflight (jets): speed select + autothrottle -----------------
+
+/// The AP airspeed select (standard X-Plane AP dataref).
+const AIRSPEED_DIAL: &str = "sim/cockpit2/autopilot/airspeed_dial_kts";
+/// MD-82 autothrottle: a custom on/off switch driven by a toggle command (the
+/// generic sim/autopilot/autothrottle_on doesn't move it).
+const AT_SWITCH: &str = "laminar/md82/autopilot/autothrottle_switch";
+const CMD_AT_TOGGLE: &str = "laminar/md82cmd/autopilot/autothrottle_switch";
+
+pub struct SetSpeed;
+
+#[derive(Deserialize)]
+struct SpeedArgs {
+    /// Target indicated airspeed, knots.
+    knots: f64,
+}
+
+#[async_trait]
+impl Tool for SetSpeed {
+    fn name(&self) -> &str {
+        "set_speed"
+    }
+    fn description(&self) -> &str {
+        "Set the autopilot target airspeed (the speed bug). Use for 'set speed \
+         250', 'speed 280', 'select 300 knots', 'set the bug to 240', 'airspeed \
+         250'."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "knots": {"type": "number", "description": "target IAS, knots"} },
+            "required": ["knots"]
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let a: SpeedArgs = serde_json::from_value(args.clone())?;
+        let kts = a.knots.clamp(80.0, 400.0);
+        ctx.xplane.set_float(AIRSPEED_DIAL, kts).await?;
+        let actual = ctx.xplane.get_float(AIRSPEED_DIAL).await.unwrap_or(kts);
+        Ok(format!("Speed bug {actual:.0} knots."))
+    }
+}
+
+pub struct Autothrottle;
+
+#[derive(Deserialize)]
+struct AtArgs {
+    /// true = engage, false = disengage.
+    on: bool,
+}
+
+#[async_trait]
+impl Tool for Autothrottle {
+    fn name(&self) -> &str {
+        "autothrottle"
+    }
+    fn description(&self) -> &str {
+        "Engage or disengage the autothrottle. Use for 'autothrottle on', 'engage \
+         the autothrottle', 'autothrottle off', 'disconnect the autothrottle', \
+         'auto throttle arm'."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "on": {"type": "boolean", "description": "true = engage, false = disengage"} },
+            "required": ["on"]
+        })
+    }
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let a: AtArgs = serde_json::from_value(args.clone())?;
+        let cur = ctx.xplane.get_float(AT_SWITCH).await.unwrap_or(0.0) > 0.5;
+        if cur != a.on {
+            ctx.xplane.run_command(CMD_AT_TOGGLE).await?;
+        }
+        let now = ctx.xplane.get_float(AT_SWITCH).await.unwrap_or(0.0) > 0.5;
+        Ok(format!("Autothrottle {}.", if now { "armed" } else { "off" }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -263,6 +263,25 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("set_flaps", json!({ "notch": notch })));
     }
 
+    // Autothrottle (jets) — before the throttle rule. "autothrottle on/off".
+    if t.contains("autothrottle") || t.contains("auto throttle") {
+        let on = !(has(t, "off") || t.contains("disconnect") || t.contains("disengage"));
+        return Some(call("autothrottle", json!({ "on": on })));
+    }
+    // AP airspeed select: "set speed 250", "speed 280", "airspeed 250". Excludes
+    // vertical/ground speed (handled elsewhere) and percent (that's throttle).
+    if (has(t, "speed") || has(t, "airspeed"))
+        && !has(t, "vertical")
+        && !has(t, "ground")
+        && !has(t, "climb")
+        && !has(t, "descend")
+        && !t.contains("percent")
+    {
+        if let Some(n) = num {
+            return Some(call("set_speed", json!({ "knots": n })));
+        }
+    }
+
     // throttle / power ("power" is a throttle synonym: "power thirty percent",
     // "40 percent power", "maximum/full throttle", "idle").
     if has(t, "throttle") || has(t, "power") {
@@ -593,6 +612,19 @@ mod tests {
         assert!(one("tell me the altitude").map(|c| c.0) != Some("set_reminder".into()));
         // A complaint must not arm a new reminder.
         assert!(one("you didn't remind me of the last waypoint").map(|c| c.0) != Some("set_reminder".into()));
+    }
+
+    #[test]
+    fn ap_speed_and_autothrottle_resolve() {
+        let prof = aircraft::load("md82").expect("md82");
+        let reg = Registry::for_aircraft(&prof);
+        let g = |t: &str| try_parse(t, &reg, &prof).map(|mut v| { let c = v.remove(0); (c.name, c.arguments) });
+        assert_eq!(g("set speed 250").unwrap(), ("set_speed".into(), json!({"knots":250})));
+        assert_eq!(g("airspeed 280").unwrap().0, "set_speed");
+        assert_eq!(g("autothrottle on").unwrap(), ("autothrottle".into(), json!({"on":true})));
+        assert_eq!(g("autothrottle off").unwrap().1, json!({"on":false}));
+        // "vertical speed 1000" must still be a rate, not an airspeed select.
+        assert_eq!(g("vertical speed 1000").unwrap().0, "set_vertical_speed");
     }
 
     #[test]

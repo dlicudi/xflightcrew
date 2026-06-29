@@ -142,6 +142,11 @@ impl Registry {
         if profile.auto_prep {
             tools.push(Box::new(power::PowerUp));
         }
+        // Airliner autoflight extras: AP speed select + autothrottle.
+        if profile.autothrottle {
+            tools.push(Box::new(autopilot::SetSpeed));
+            tools.push(Box::new(autopilot::Autothrottle));
+        }
         if profile.engine {
             tools.push(Box::new(engine::SetMixture));
             tools.push(Box::new(engine::LeanMixture));
