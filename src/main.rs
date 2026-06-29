@@ -2725,6 +2725,10 @@ mod tests {
         assert!(reg.get("set_mixture").is_none(), "no mixture on a jet");
         assert!(reg.get("start_engine").is_none(), "no piston start on a jet");
         assert!(reg.get("set_flaps").is_some());
+        // Electrical is wired (battery, generators, avionics, "all"), so "all
+        // electrical systems on" has a tool to land on.
+        assert!(reg.get("set_electrical").is_some());
+        assert!(p.electrical.iter().any(|e| e.key == "all"));
         // Reference card answers from the POM.
         assert!(super::reference_limits(&p, "service ceiling").unwrap().contains("37,000"));
         // The MD-82 checklist parses.

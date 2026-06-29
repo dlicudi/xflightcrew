@@ -31,8 +31,33 @@ magnetos: false
 carb_heat: false
 fuel_pump: false
 directional_gyro: false # IRS-aligned, no vacuum DG to sync
-# Electrical (AC/DC buses, two generators, APU, external power) is a flight-engineer
-# era panel — left out for now rather than wired with wrong datarefs.
+
+# Electrical: battery, two engine generators, avionics, and an "all"/master that
+# brings the lot up ("all electrical systems on"). Actions fire the standard
+# X-Plane electrical commands (Laminar's own aircraft respond to them); readback
+# datarefs are the ones the MD-82 checklist reads. The APU and bus cross-ties use
+# custom laminar/md82 datarefs and stay pilot items for now. VERIFY in the sim.
+electrical:
+  - key: battery
+    spoken: battery
+    on_commands:  [sim/electrical/battery_1_on]
+    off_commands: [sim/electrical/battery_1_off]
+    readback:     [sim/cockpit/electrical/battery_on]
+  - key: generators
+    spoken: generators
+    on_commands:  [sim/electrical/generator_1_on, sim/electrical/generator_2_on]
+    off_commands: [sim/electrical/generator_1_off, sim/electrical/generator_2_off]
+    readback:     ["sim/cockpit/electrical/generator_on[0]", "sim/cockpit/electrical/generator_on[1]"]
+  - key: avionics
+    spoken: avionics
+    on_commands:  [sim/systems/avionics_on]
+    off_commands: [sim/systems/avionics_off]
+    readback:     [sim/cockpit/electrical/avionics_on]
+  - key: all
+    spoken: all electrical
+    on_commands:  [sim/electrical/battery_1_on, sim/electrical/generator_1_on, sim/electrical/generator_2_on, sim/systems/avionics_on]
+    off_commands: [sim/systems/avionics_off, sim/electrical/generator_1_off, sim/electrical/generator_2_off, sim/electrical/battery_1_off]
+    readback:     [sim/cockpit/electrical/battery_on, "sim/cockpit/electrical/generator_on[0]", "sim/cockpit/electrical/generator_on[1]"]
 
 # Exterior lights (standard X-Plane switch datarefs).
 lights:
@@ -66,11 +91,14 @@ reference:
 # laminar/md82/* datarefs or compound conditions, so they stay pilot call-outs).
 checklist: checklists/md82.txt
 checklist_map:
-  - { match: parkbrake,        action: parking_brake }
-  - { match: transponder_mode, action: transponder }
-  - { match: pitot_heat,       action: pitot_heat }
-  - { match: elevator_trim,    action: pitch_trim }
-  - { match: taxi_light,       action: !light taxi }
+  - { match: parkbrake,                 action: parking_brake }
+  - { match: transponder_mode,          action: transponder }
+  - { match: pitot_heat,                action: pitot_heat }
+  - { match: elevator_trim,             action: pitch_trim }
+  - { match: taxi_light,                action: !light taxi }
+  - { match: electrical/generator_on,   action: !electrical generators }
+  - { match: electrical/battery_on,     action: !electrical battery }
+  - { match: electrical/avionics_on,    action: !electrical avionics }
 
 # Flap handle detents 0 / 11 / 15 / 28 / 40 degrees (slats extend automatically).
 # Ratios and per-notch Vfe are best-effort from MD-80 placards — VERIFY in the sim.
