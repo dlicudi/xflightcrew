@@ -114,6 +114,8 @@ impl Tool for SetPitchTrim {
 /// Speedbrake/spoiler lever: 1 = fully extended, 0 = stowed, -0.5 = armed (auto
 /// deploy on touchdown). The MD-82 uses this standard, writable dataref.
 const SPEEDBRAKE: &str = "sim/cockpit2/controls/speedbrake_ratio";
+/// Gear handle (1 = down). Read by the speedbrake-on-final guard.
+const GEAR_HANDLE_DOWN: &str = "sim/cockpit2/controls/gear_handle_down";
 
 pub struct SetSpeedbrake;
 
@@ -154,6 +156,20 @@ impl Tool for SetSpeedbrake {
             "arm" => (-0.5, "armed"),
             other => return Ok(format!("I can extend, retract, or arm the speedbrakes, not '{other}'.")),
         };
+        // Safety gate: don't deploy the speedbrakes on short final. With the gear
+        // down and low above the ground, full speedbrake dumps lift right where a
+        // go-around or flare needs it. (Arming for landing is fine — that's the
+        // ground-spoiler auto-deploy, not lift-dumping in the air.)
+        if target > 0.5 {
+            let agl_ft = ctx.xplane.get_float(crate::datarefs::AGL_METERS).await.unwrap_or(99999.0) * 3.28084;
+            let gear_down = ctx.xplane.get_float(GEAR_HANDLE_DOWN).await.unwrap_or(0.0) > 0.5;
+            let on_ground = ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(1.0) > 0.5;
+            if !on_ground && gear_down && agl_ft < 1000.0 {
+                return Ok(format!(
+                    "Negative, we're on final at {agl_ft:.0} feet with the gear down. I won't deploy the speedbrakes here."
+                ));
+            }
+        }
         ctx.xplane.set_float(SPEEDBRAKE, target).await?;
         let actual = ctx.xplane.get_float(SPEEDBRAKE).await.unwrap_or(target);
         let state = if actual > 0.05 {

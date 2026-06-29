@@ -674,7 +674,7 @@ async fn run_session(
         // have fuel information"). A fuel question reads the datarefs and is spoken
         // straight back.
         if is_fuel_query(&command) {
-            let line = fuel_report(&xplane, &profile, Some(&live)).await;
+            let line = fuel_report(&xplane, &profile, Some(&live), is_endurance_query(&command)).await;
             say(&voice, &reporter, ui::LogKind::Readback, &line);
             continue;
         }
@@ -2028,34 +2028,75 @@ fn is_fuel_query(text: &str) -> bool {
     asks && !command && !t.contains("flow")
 }
 
+/// True when the fuel question is about *time* remaining ("how long will the fuel
+/// last", "what's our endurance", "how much longer can we fly") rather than the
+/// quantity on board. Drives `fuel_report` to lead with the duration.
+fn is_endurance_query(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("endurance")
+        || t.contains("how long")
+        || t.contains("how much longer")
+        || (t.contains("last") && (t.contains("fuel") || t.contains("gas")))
+}
+
 /// Deterministic spoken fuel report — total in gallons, endurance from the
 /// profile's cruise burn, and the left/right balance. Read straight from the
 /// datarefs (cache when warm, REST otherwise); never goes near the LLM.
-async fn fuel_report(xp: &XPlaneClient, profile: &aircraft::AircraftProfile, live: Option<&LiveState>) -> String {
+async fn fuel_report(
+    xp: &XPlaneClient,
+    profile: &aircraft::AircraftProfile,
+    live: Option<&LiveState>,
+    endurance_first: bool,
+) -> String {
     let Ok(total_kg) = read1(live, xp, datarefs::FUEL_TOTAL_KG).await else {
         return "I can't read the fuel right now — check the connection to X-Plane.".to_string();
     };
     let gal = total_kg / AVGAS_KG_PER_GAL;
-    let mut line = format!("{gal:.0} gallons on board");
-    if let Some(f) = &profile.fuel {
-        if f.cruise_burn_kg_hr > 0.0 {
-            let hours = total_kg / f.cruise_burn_kg_hr;
-            let (h, m) = (hours.trunc() as i32, (hours.fract() * 60.0).round() as i32);
-            let mut dur = String::new();
-            if h > 0 {
-                dur.push_str(&format!("{h} hour{}", if h == 1 { "" } else { "s" }));
-            }
-            if m > 0 {
-                if !dur.is_empty() {
-                    dur.push(' ');
-                }
-                dur.push_str(&format!("{m} minute{}", if m == 1 { "" } else { "s" }));
-            }
-            if !dur.is_empty() {
-                line.push_str(&format!(", about {dur} at cruise"));
-            }
+
+    // Endurance: prefer the live burn (sum of per-engine fuel flow) when the
+    // engines are running, since it reflects the actual power setting; fall back
+    // to the profile's cruise figure on the ground or with engines shut down.
+    let live_burn_kg_hr = xp
+        .get_float_array(datarefs::FUEL_FLOW_KG_SEC)
+        .await
+        .map(|f| f.iter().sum::<f64>() * 3600.0)
+        .unwrap_or(0.0);
+    let burn_kg_hr = if live_burn_kg_hr > 1.0 {
+        live_burn_kg_hr
+    } else {
+        profile.fuel.as_ref().map(|f| f.cruise_burn_kg_hr).unwrap_or(0.0)
+    };
+    let basis = if live_burn_kg_hr > 1.0 { "at this burn" } else { "at cruise" };
+
+    let dur = if burn_kg_hr > 0.0 {
+        let hours = total_kg / burn_kg_hr;
+        let (h, m) = (hours.trunc() as i32, (hours.fract() * 60.0).round() as i32);
+        let mut d = String::new();
+        if h > 0 {
+            d.push_str(&format!("{h} hour{}", if h == 1 { "" } else { "s" }));
         }
-    }
+        if m > 0 {
+            if !d.is_empty() {
+                d.push(' ');
+            }
+            d.push_str(&format!("{m} minute{}", if m == 1 { "" } else { "s" }));
+        }
+        d
+    } else {
+        String::new()
+    };
+
+    // An endurance question wants the *time* first; a plain fuel question leads
+    // with the quantity and tacks the duration on.
+    let mut line = if endurance_first && !dur.is_empty() {
+        format!("About {dur} of fuel {basis}, {gal:.0} gallons on board")
+    } else {
+        let mut l = format!("{gal:.0} gallons on board");
+        if !dur.is_empty() {
+            l.push_str(&format!(", about {dur} {basis}"));
+        }
+        l
+    };
     // Per-tank balance, when the airframe has two tanks.
     if let Ok(tanks) = xp.get_float_array(datarefs::FUEL_PER_TANK_KG).await {
         if tanks.len() == 2 {

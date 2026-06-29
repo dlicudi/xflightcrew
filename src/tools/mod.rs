@@ -109,7 +109,7 @@ impl Registry {
         }
 
         if profile.retractable_gear {
-            tools.push(Box::new(gear::Gear));
+            tools.push(Box::new(gear::Gear { vlo_kts: profile.vlo_kts }));
         }
 
         if !profile.lights.is_empty() {

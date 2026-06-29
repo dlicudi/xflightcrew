@@ -169,6 +169,14 @@ impl Tool for SetMixture {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let p: PercentArg = serde_json::from_value(args.clone())?;
+        // Safety gate: don't cut the mixture to idle cutoff in flight — that stops
+        // the engine. (On the ground it's a normal shutdown, confirmed separately.)
+        // Default to airborne if the read fails, so an unknown state errs safe.
+        if p.percent <= 0.0
+            && ctx.xplane.get_float("sim/flightmodel/failures/onground_any").await.unwrap_or(0.0) <= 0.5
+        {
+            return Ok("Negative, I won't cut the mixture in flight.".to_string());
+        }
         let ratio = (p.percent / 100.0).clamp(0.0, 1.0);
         // Ease the mixture lever to the target instead of snapping it.
         ramp_actuator(ctx, MIXTURE, ratio).await?;

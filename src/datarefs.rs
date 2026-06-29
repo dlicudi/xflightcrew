@@ -23,6 +23,9 @@ pub const FUEL_TOTAL_KG: &str = "sim/flightmodel/weight/m_fuel_total";
 /// Per-tank fuel mass (kg), one element per tank. For a 2-tank single it's
 /// `[left, right]`. Read as an array (not cached); used for the balance callout.
 pub const FUEL_PER_TANK_KG: &str = "sim/flightmodel/weight/m_fuel";
+/// Per-engine fuel flow, kg/sec, one element per engine. Summed × 3600 gives the
+/// live burn rate (kg/hr) for an endurance answer; ~0 with engines off.
+pub const FUEL_FLOW_KG_SEC: &str = "sim/cockpit2/engine/indicators/fuel_flow_kg_sec";
 
 // --- Weather (XP12 aircraft-relative) ---
 /// Wind direction at the aircraft, degrees TRUE. (The `cockpit2/gauges` wind

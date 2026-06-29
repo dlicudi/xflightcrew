@@ -31,6 +31,10 @@ pub struct AircraftProfile {
     /// `None` means no overspeed caution.
     #[serde(default)]
     pub vne_kts: Option<f64>,
+    /// Landing-gear operating/extended limit speed (VLO/VLE), KIAS — the `gear`
+    /// tool refuses cycling the gear above it. `None` = no gear speed gate.
+    #[serde(default)]
+    pub vlo_kts: Option<f64>,
     /// Static reference figures (V-speeds, weights, limits) the copilot recites
     /// when asked. Per-airframe, from the POH/POM. `None` = no reference answers.
     #[serde(default)]
@@ -571,6 +575,7 @@ fn cessna_172sp() -> AircraftProfile {
         vs_clean_kts: Some(48.0),
         // 172SP Vne (never-exceed) 163 KIAS.
         vne_kts: Some(163.0),
+        vlo_kts: None,
         // Reference figures from the X-Plane C172 Pilot's Operating Manual.
         reference: Some(ReferenceProfile {
             kind: Some("single-engine aircraft".into()),
@@ -770,6 +775,7 @@ fn cirrus_sr22() -> AircraftProfile {
         vs_clean_kts: Some(70.0),
         // SR22 Vne (never-exceed) 204 KIAS.
         vne_kts: Some(204.0),
+        vlo_kts: None,
         // Reference figures from the X-Plane Cirrus SR22 Pilot's Operating Manual
         // (the modeled aircraft is the turbo TSIO-550-K, ceiling 25,000 ft).
         reference: Some(ReferenceProfile {

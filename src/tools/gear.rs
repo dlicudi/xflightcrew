@@ -13,8 +13,12 @@ use super::{Tool, ToolCtx};
 const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 /// 1 while any wheel is on the ground — the gate against retracting on the runway.
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
+const IAS_KTS: &str = "sim/cockpit2/gauges/indicators/airspeed_kts_pilot";
 
-pub struct Gear;
+pub struct Gear {
+    /// Gear limit speed (VLO/VLE), KIAS — refuse cycling above it. `None` = no gate.
+    pub vlo_kts: Option<f64>,
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -53,6 +57,15 @@ impl Tool for Gear {
             let on_ground = ctx.xplane.get_float(ON_GROUND).await.unwrap_or(0.0) > 0.5;
             if on_ground {
                 return Ok("Negative, we're on the ground. I won't raise the gear.".to_string());
+            }
+        }
+        // Safety gate: don't cycle the gear above its limit speed (VLO/VLE).
+        if let Some(vlo) = self.vlo_kts {
+            let ias = ctx.xplane.get_float(IAS_KTS).await.unwrap_or(0.0);
+            if ias > vlo {
+                return Ok(format!(
+                    "Negative, {ias:.0} knots is over the {vlo:.0} knot gear limit. Slow down first."
+                ));
             }
         }
 

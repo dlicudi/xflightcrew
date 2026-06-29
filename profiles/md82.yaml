@@ -72,6 +72,8 @@ lights:
 
 # Never-exceed for the monitor = Vmo (max operating speed), 340 KIAS (Mmo 0.84).
 vne_kts: 340.0
+# Landing-gear limit speed (VLO/VLE) ~270 KIAS — gear tool refuses cycling above it.
+vlo_kts: 270.0
 # No fixed clean-stall figure: a jet's stall speed varies strongly with weight and
 # config, so the fixed-value airspeed caution is left off (vs_clean_kts unset).
 
