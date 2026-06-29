@@ -169,9 +169,14 @@ impl Voice {
     /// command loop drops such transcripts instead of acting on them.
     pub fn is_self_echo(&self, heard: &str) -> bool {
         let said = self.inner.spoken.lock().unwrap();
-        said.iter()
-            .filter(|(t, _)| t.elapsed() < ECHO_MEMORY)
-            .any(|(_, text)| crate::phrase::word_similarity(heard, text) >= ECHO_SIMILARITY)
+        // Long heard text that's mostly a subset of a recent readback is a partial
+        // echo (Jaccard is diluted by the readback's extra words). The word-count
+        // floor keeps a short real command ("heading 180") from being swallowed.
+        let long = crate::phrase::word_count(heard) >= 5;
+        said.iter().filter(|(t, _)| t.elapsed() < ECHO_MEMORY).any(|(_, text)| {
+            crate::phrase::word_similarity(heard, text) >= ECHO_SIMILARITY
+                || (long && crate::phrase::word_containment(heard, text) >= 0.85)
+        })
     }
 
     fn enqueue(&self, priority: Priority, text: String, done: Option<Arc<Latch>>, chime: bool) {

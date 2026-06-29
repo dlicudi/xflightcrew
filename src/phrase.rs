@@ -169,6 +169,32 @@ pub fn word_similarity(a: &str, b: &str) -> f64 {
     a.intersection(&b).count() as f64 / a.union(&b).count() as f64
 }
 
+/// Fraction of `heard`'s words that also appear in `whole` (0..1). High means
+/// `heard` is mostly *contained in* `whole` — which catches a partial echo of a
+/// long readback, where the symmetric similarity is diluted by the readback's many
+/// extra words. Pair with a minimum word count so a short real command that
+/// happens to be a subset of a recent readback isn't dropped.
+pub fn word_containment(heard: &str, whole: &str) -> f64 {
+    use std::collections::HashSet;
+    let toks = |s: &str| -> HashSet<String> {
+        s.to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let (h, w) = (toks(heard), toks(whole));
+    if h.is_empty() {
+        return 0.0;
+    }
+    h.intersection(&w).count() as f64 / h.len() as f64
+}
+
+/// Number of word tokens in `s`.
+pub fn word_count(s: &str) -> usize {
+    s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).count()
+}
+
 /// Repair distinctive *whole-word* mishearings whisper makes on cockpit terms,
 /// where the entire keyword is gone — so neither the domain gate's fuzzy match
 /// nor the grammar's token match can recover it (those only catch near-misses
@@ -265,6 +291,13 @@ mod tests {
         assert!(word_similarity(mixed, "Throttle 100 percent.") < 0.55, "mixed should score low");
         // Unrelated commands don't collide.
         assert!(word_similarity("flaps up", "throttle 100 percent") < 0.55);
+        // A partial echo of a long readback: low Jaccard, but high containment.
+        let spoken = "We're in the McDonnell Douglas MD-82, a twin-engine jet. Cruise about 439 knots. Max speed 340. Service ceiling 37,000 feet.";
+        let echo = "We're in the McDonnell Douglas MD-82, a twin engine jet cruise.";
+        assert!(word_similarity(echo, spoken) < 0.55, "diluted Jaccard");
+        assert!(word_containment(echo, spoken) >= 0.85, "but mostly contained");
+        // A short real command isn't mostly-contained enough to be a false echo.
+        assert!(word_containment("heading 180", "autopilot engaged, heading mode, bug to 270") < 0.85);
     }
 
     #[test]
