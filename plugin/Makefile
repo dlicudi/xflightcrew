@@ -13,7 +13,7 @@ CXX      := clang++
 ARCHS    := -arch arm64 -arch x86_64
 # Git build id (short SHA, with -dirty when there are uncommitted changes), so the
 # plugin's startup log and panel title show exactly which build is loaded.
-BUILD    := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell git diff --quiet 2>/dev/null || echo -dirty)
+BUILD    := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell git diff --quiet 2>/dev/null || echo -dirty.$$(date +%H%M%S))
 CXXFLAGS := -std=c++17 -fPIC -fvisibility=hidden -O2 -mmacosx-version-min=11.0 \
             -Wno-deprecated-declarations \
             -DAPL=1 -DIBM=0 -DLIN=0 -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 \

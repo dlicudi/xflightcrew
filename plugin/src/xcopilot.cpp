@@ -28,6 +28,7 @@
 #include "XPLMNavigation.h"
 #include "XPLMPlugin.h"
 #include "XPLMProcessing.h"
+#include "XPLMUtilities.h"
 
 // Project version. Single version for the whole product (app + plugin ship and
 // must be compatible as a pair); keep in sync with Cargo.toml.
@@ -167,6 +168,63 @@ static void WriteFmsRoute(void*, void* in, int offset, int len) {
     StoreText(&g_fms_route, in, offset, len);
 }
 
+// One parsed route point from the app's "IDENT,lat,lon,alt|..." payload, with the
+// navaid it resolved to (if any) so we can pick the right .fms row type.
+struct RoutePoint {
+    std::string ident;
+    float lat, lon;
+    int alt;
+    XPLMNavRef ref;     // XPLM_NAV_NOT_FOUND for a bare lat/lon point
+    XPLMNavType type;   // the navaid's type (only meaningful when ref is set)
+};
+
+// X-Plane's loaded AIRAC cycle (e.g. "2406"), read once from the nav-data header
+// so the flight plans we generate carry the *matching* cycle — a mismatch pops
+// X-Plane's "different AIRAC cycle" warning on every load. Empty if undetermined.
+static std::string g_airac_cycle;
+
+static void read_airac_cycle() {
+    char base[1024] = {0};
+    XPLMGetSystemPath(base);
+    std::string root = base;
+    // XPLMGetSystemPath usually ends in a separator, but don't rely on it.
+    if (!root.empty() && root.back() != '/' && root.back() != '\\') {
+        root += '/';
+    }
+    // Custom nav data (Navigraph etc.) overrides the default when present, so try
+    // it first; the cycle is in the file's header line ("... data cycle 2406 ...").
+    const char* rels[] = {"Custom Data/earth_nav.dat", "Resources/default data/earth_nav.dat"};
+    for (const char* rel : rels) {
+        std::string path = root + rel;
+        FILE* f = std::fopen(path.c_str(), "r");
+        if (!f) continue; // e.g. no Custom Data installed — fall through to default
+        char ln[512];
+        for (int i = 0; i < 4 && std::fgets(ln, sizeof ln, f); ++i) {
+            const char* m = std::strstr(ln, "data cycle ");
+            if (m) {
+                int c = std::atoi(m + std::strlen("data cycle "));
+                if (c > 0) {
+                    char cy[16];
+                    std::snprintf(cy, sizeof cy, "%d", c);
+                    g_airac_cycle = cy;
+                }
+                break;
+            }
+        }
+        std::fclose(f);
+        if (!g_airac_cycle.empty()) return;
+    }
+}
+
+// Map an X-Plane navaid type to the X-Plane .fms row code.
+static int fms_row_type(const RoutePoint& p) {
+    if (p.ref == XPLM_NAV_NOT_FOUND) return 28; // lat/lon
+    if (p.type & xplm_Nav_Airport) return 1;
+    if (p.type & xplm_Nav_NDB) return 2;
+    if (p.type & xplm_Nav_VOR) return 3;
+    return 11; // fix / intersection / DME
+}
+
 static void load_fms_route() {
     char buf[sizeof g_fms_route.buf];
     std::strncpy(buf, g_fms_route.buf, sizeof buf);
@@ -175,20 +233,8 @@ static void load_fms_route() {
     const XPLMNavType kTypes = xplm_Nav_Fix | xplm_Nav_VOR | xplm_Nav_NDB |
                                xplm_Nav_DME | xplm_Nav_Airport;
 
-    // X-Plane keeps two separate route structures: the legacy GPS flight plan
-    // (XPLMSetFMSEntry*) that the GA Garmins read, and the X-Plane 12 native FMS
-    // *primary* flight plan (XPLMSetFMSFlightPlanEntry*, xplm_Fpl_Pilot_Primary)
-    // that study CDUs like the MD-82 read — and which carries the ORIGIN/DEST
-    // airport fields. Populate BOTH so every airframe sees the route. Clear each
-    // high-to-low so indices stay valid as entries drop.
-    for (int i = XPLMCountFMSEntries() - 1; i >= 0; --i) {
-        XPLMClearFMSEntry(i);
-    }
-    for (int i = XPLMCountFMSFlightPlanEntries(xplm_Fpl_Pilot_Primary) - 1; i >= 0; --i) {
-        XPLMClearFMSFlightPlanEntry(xplm_Fpl_Pilot_Primary, i);
-    }
-
-    int idx = 0;
+    // Parse the payload into points, resolving each to a navaid near its position.
+    std::vector<RoutePoint> pts;
     char* save1 = nullptr;
     for (char* tok = strtok_r(buf, "|", &save1); tok; tok = strtok_r(nullptr, "|", &save1)) {
         char* save2 = nullptr;
@@ -197,35 +243,58 @@ static void load_fms_route() {
         char* slon = strtok_r(nullptr, ",", &save2);
         char* salt = strtok_r(nullptr, ",", &save2);
         if (!slat || !slon) continue;
-        float lat = static_cast<float>(std::atof(slat));
-        float lon = static_cast<float>(std::atof(slon));
-        int alt = salt ? std::atoi(salt) : 0;
-        // Prefer the named navaid near this position; fall back to a lat/lon point.
-        // Airports resolved here become the CDU's ORIGIN (entry 0) and DEST (last).
-        XPLMNavRef ref = XPLM_NAV_NOT_FOUND;
-        if (ident && ident[0]) {
-            ref = XPLMFindNavAid(nullptr, ident, &lat, &lon, nullptr, kTypes);
-        }
-        if (ref != XPLM_NAV_NOT_FOUND) {
-            XPLMSetFMSEntryInfo(idx, ref, alt);
-            XPLMSetFMSFlightPlanEntryInfo(xplm_Fpl_Pilot_Primary, idx, ref, alt);
-        } else {
-            XPLMSetFMSEntryLatLon(idx, lat, lon, alt);
-            // Keep the ident on the native entry so the CDU labels the waypoint.
-            if (ident && ident[0]) {
-                XPLMSetFMSFlightPlanEntryLatLonWithId(
-                    xplm_Fpl_Pilot_Primary, idx, lat, lon, alt, ident,
-                    static_cast<unsigned int>(std::strlen(ident)));
-            } else {
-                XPLMSetFMSFlightPlanEntryLatLon(xplm_Fpl_Pilot_Primary, idx, lat, lon, alt);
+        RoutePoint p;
+        p.ident = ident ? ident : "";
+        p.lat = static_cast<float>(std::atof(slat));
+        p.lon = static_cast<float>(std::atof(slon));
+        p.alt = salt ? std::atoi(salt) : 0;
+        p.ref = XPLM_NAV_NOT_FOUND;
+        p.type = 0;
+        if (!p.ident.empty()) {
+            float la = p.lat, lo = p.lon;
+            p.ref = XPLMFindNavAid(nullptr, p.ident.c_str(), &la, &lo, nullptr, kTypes);
+            if (p.ref != XPLM_NAV_NOT_FOUND) {
+                XPLMGetNavAidInfo(p.ref, &p.type, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                  nullptr, nullptr, nullptr);
             }
         }
-        idx++;
+        pts.push_back(p);
     }
-    // Active leg = the first fix *after* the origin (entry 1), so we fly forward up
-    // the route rather than back to the departure airport at entry 0. The FMS then
-    // sequences onward by itself. (With a single entry, just target it.) Set it on
-    // both plans.
+
+    // The CDU's ORIGIN/DEST airport fields are only set by *loading* a flight plan
+    // (X-Plane parses the ADEP/ADES lines) — the per-entry API just adds waypoints
+    // and leaves ORIGIN/DEST blank (confirmed: entry 0 was LEBL type-1 yet the page
+    // stayed empty). So build an X-Plane 11 .fms with explicit ADEP/ADES and load
+    // it; that drives both the GA GPS and the native FMS on device 0.
+    if (pts.size() >= 2) {
+        const RoutePoint& dep = pts.front();
+        const RoutePoint& des = pts.back();
+        std::string fms = "I\n1100 Version\n";
+        // Stamp X-Plane's own AIRAC cycle so the loader doesn't warn about a cycle
+        // mismatch on every load. Omit the line if we couldn't read it.
+        if (!g_airac_cycle.empty()) {
+            fms += "CYCLE " + g_airac_cycle + "\n";
+        }
+        fms += "ADEP " + dep.ident + "\n";
+        fms += "ADES " + des.ident + "\n";
+        char line[256];
+        std::snprintf(line, sizeof line, "NUMENR %d\n", static_cast<int>(pts.size()));
+        fms += line;
+        for (size_t i = 0; i < pts.size(); ++i) {
+            const RoutePoint& p = pts[i];
+            const char* via = (i == 0) ? "ADEP" : (i + 1 == pts.size()) ? "ADES" : "DRCT";
+            int rowtype = (i == 0 || i + 1 == pts.size()) ? 1 : fms_row_type(p);
+            std::snprintf(line, sizeof line, "%d %s %s %d %.6f %.6f\n", rowtype,
+                          p.ident.c_str(), via, p.alt, p.lat, p.lon);
+            fms += line;
+        }
+        XPLMLoadFMSFlightPlan(0, fms.c_str(), static_cast<unsigned int>(fms.size()));
+    }
+
+    // Active leg = the first fix *after* the origin (entry 1) so we fly forward up
+    // the route, not back to the departure airport at entry 0. Set it on both the
+    // legacy GPS plan and the native FMS plan.
+    int idx = static_cast<int>(pts.size());
     if (idx > 1) {
         XPLMSetDestinationFMSEntry(1);
         XPLMSetDestinationFMSFlightPlanEntry(xplm_Fpl_Pilot_Primary, 1);
@@ -341,6 +410,13 @@ protected:
         } else {
             Chip("NOT CONNECTED", COL_RED);
         }
+        // One-click reload after a rebuild. The SDK can only reload *all* plugins
+        // (there's no single-plugin reload), so this bounces every plugin — handy
+        // when iterating, just don't fat-finger it mid-approach.
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reload")) {
+            XPLMReloadPlugins();
+        }
         ImGui::Separator();
 
         // Transmission log — recent heard/action lines with coloured tags.
@@ -383,6 +459,10 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
     std::strcpy(name, "X-COPILOT");
     std::strcpy(sig, "com.dlicudi.xcopilot");
     std::strcpy(desc, "X-COPILOT " XCOPILOT_VERSION ", push-to-talk and status panel for the voice copilot.");
+
+    // Get POSIX paths from the SDK, not legacy Mac HFS ("Macintosh HD:Users:...");
+    // otherwise fopen can't open the nav-data file we read the AIRAC cycle from.
+    XPLMEnableFeature("XPLM_USE_NATIVE_PATHS", 1);
 
     g_ptt_cmd = XPLMCreateCommand("xcopilot/ptt", "x-copilot: hold to talk");
     XPLMRegisterCommandHandler(g_ptt_cmd, PttCommandHandler, 1, nullptr);
@@ -432,7 +512,13 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
     g_menu = XPLMCreateMenu("X-COPILOT", XPLMFindPluginsMenu(), idx, MenuHandler, nullptr);
     XPLMAppendMenuItem(g_menu, "Toggle status panel", (void*)"toggle", 0);
 
-    XPLMDebugString("x-copilot plugin: started, build " XCOPILOT_BUILD " (ptt + ImGui status panel)\n");
+    read_airac_cycle(); // for stamping generated flight plans with the matching cycle
+
+    char started[160];
+    std::snprintf(started, sizeof started,
+                  "x-copilot plugin: started, build %s, AIRAC %s (ptt + ImGui status panel)\n",
+                  XCOPILOT_BUILD, g_airac_cycle.empty() ? "unknown" : g_airac_cycle.c_str());
+    XPLMDebugString(started);
     return 1;
 }
 
