@@ -67,6 +67,9 @@ pub struct Snapshot {
     pub flap_ratio: f64,
     pub agl_ft: f64,
     pub vsi_fpm: f64,
+    /// Elevator/stabilizer trim, -1 (full nose down) .. +1 (full nose up). Used to
+    /// catch trim pinned at a limit (out of authority / possible runaway).
+    pub elevator_trim: f64,
     /// Pushback tug attached (`sim/aircraft/overflow/pushback_attached`).
     pub tug_attached: bool,
     /// Pushback/tow actively underway (`sim/flightmodel2/misc/tow_in_progress`).
@@ -212,6 +215,7 @@ impl Snapshot {
             .ok()
             .and_then(engine0)
             .unwrap_or(0.0);
+        let elevator_trim = xp.get_float("sim/cockpit2/controls/elevator_trim").await.unwrap_or(0.0);
         let low_vacuum = xp.get_float("sim/cockpit/warnings/annunciators/low_vacuum").await.unwrap_or(0.0) > 0.5;
         let battery_amps = xp
             .get_float_array("sim/cockpit2/electrical/battery_amps")
@@ -228,6 +232,7 @@ impl Snapshot {
             flap_ratio,
             agl_ft,
             vsi_fpm,
+            elevator_trim,
             tug_attached,
             pushing_back,
             engine_running,
@@ -784,6 +789,9 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             cruise_burn_kg_hr: fuel.cruise_burn_kg_hr,
         }));
     }
+    if profile.pitch_trim {
+        checks.push(Box::new(StabTrim));
+    }
     checks
 }
 
@@ -918,6 +926,32 @@ impl Check for GyroDrift {
     }
 }
 
+/// Elevator/stabilizer trim pinned at (or essentially at) its travel limit while
+/// airborne — out of trim authority, the signature of a mistrim or a runaway. Set
+/// high (0.98) so normal trim, including the MD-80's nose-down Mach trim at speed,
+/// doesn't trip it; only a trim that's actually hit the stop does.
+const TRIM_LIMIT: f64 = 0.98;
+
+struct StabTrim;
+impl Check for StabTrim {
+    fn id(&self) -> &'static str {
+        "stab_trim_limit"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Caution
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if s.on_ground || s.elevator_trim.abs() < TRIM_LIMIT {
+            return None;
+        }
+        let dir = if s.elevator_trim < 0.0 { "nose down" } else { "nose up" };
+        Some(format!("Stabilizer trim's at the {dir} limit, check the trim."))
+    }
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+}
+
 /// Fuel endurance (minutes remaining at the current burn) has dropped into a
 /// reserve band. Tracking *time*, not gallons, is what a real copilot does — it
 /// folds in the power setting. Two instances run: a Caution band between the
@@ -1008,6 +1042,7 @@ mod tests {
             flap_ratio: 0.0,
             agl_ft: 0.0,
             vsi_fpm: 0.0,
+            elevator_trim: 0.0,
             tug_attached: false,
             pushing_back: false,
             engine_running,
