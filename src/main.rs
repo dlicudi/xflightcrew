@@ -880,6 +880,17 @@ async fn run_session(
         let mut turn_disengage_ap = false;
         let mut turn_inverse: Vec<(String, serde_json::Value)> = Vec::new();
         for mut call in calls {
+            // On aircraft with a procedural power-up, "all electrical on" must run the
+            // step-by-step procedure, not set_electrical's one-shot "all" (which would
+            // skip the APU start and the callouts). Remap it here so it's caught
+            // whether grammar or the LLM produced it.
+            if call.name == "set_electrical"
+                && call.arguments.get("system").and_then(|s| s.as_str()) == Some("all")
+                && registry.get("power_up").is_some()
+            {
+                call.name = "power_up".to_string();
+                call.arguments = serde_json::json!({});
+            }
             tracing::info!(tool = %call.name, args = %call.arguments, "tool selected");
             reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
 
@@ -2737,7 +2748,8 @@ mod tests {
         // Electrical is wired (battery, generators, avionics, "all"), so "all
         // electrical systems on" has a tool to land on.
         assert!(reg.get("set_electrical").is_some());
-        assert!(p.electrical.iter().any(|e| e.key == "all"));
+        // "All electrical systems on" is the procedural power_up, not a one-shot key.
+        assert!(reg.get("power_up").is_some());
         // Jet start sequence, not the piston one-shot.
         assert!(reg.get("start_engines").is_some());
         assert!(reg.get("start_engine").is_none());

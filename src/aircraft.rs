@@ -62,6 +62,11 @@ pub struct AircraftProfile {
     /// monitoring, as opposed to the piston `engine` group's one-shot start.
     #[serde(default)]
     pub turbine_start: bool,
+    /// Procedural power-up (`power_up`) — "all electrical systems on" runs the
+    /// electrical bring-up step by step (battery, APU, bleed, buses, generators),
+    /// calling out each, rather than a one-shot shortcut.
+    #[serde(default)]
+    pub auto_prep: bool,
     /// Adjustable altimeter (`set_barometer`).
     #[serde(default)]
     pub barometer: bool,
@@ -487,6 +492,7 @@ fn cessna_172sp() -> AircraftProfile {
         engine: true,
         throttle: false,
         turbine_start: false,
+        auto_prep: false,
         barometer: true,
         directional_gyro: true,
         com_radio: true,
@@ -671,6 +677,7 @@ fn cirrus_sr22() -> AircraftProfile {
         engine: true,
         throttle: false,
         turbine_start: false,
+        auto_prep: false,
         // Dual battery/alternator + avionics — datarefs/commands verified against
         // the rustdecks SR22 deck.
         electrical: {

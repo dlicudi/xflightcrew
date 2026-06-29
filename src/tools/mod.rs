@@ -21,6 +21,7 @@ pub mod jet_start;
 pub mod ground;
 pub mod instruments;
 pub mod lights;
+pub mod power;
 pub mod radio;
 pub mod reminder;
 
@@ -136,6 +137,10 @@ impl Registry {
         // Turbine start sequence (jets) — distinct from the piston one-shot start.
         if profile.turbine_start {
             tools.push(Box::new(jet_start::StartEngines));
+        }
+        // Procedural electrical power-up (step-by-step with callouts).
+        if profile.auto_prep {
+            tools.push(Box::new(power::PowerUp));
         }
         if profile.engine {
             tools.push(Box::new(engine::SetMixture));

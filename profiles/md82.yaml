@@ -15,6 +15,7 @@ display_name: McDonnell Douglas MD-82
 autopilot: true        # set_heading / set_altitude / set_vertical_speed
 throttle: true         # set_throttle (thrust levers) — jet, so NO piston engine group
 turbine_start: true    # start_engines (bleed/fuel/ignition/crank sequence)
+auto_prep: true        # power_up — "all electrical on" run as individual steps
 barometer: true        # set_barometer
 pitot_heat: true       # set_pitot_heat
 pitch_trim: true       # set_pitch_trim (the checklist sets elevator_trim)
@@ -54,16 +55,10 @@ electrical:
     on_commands:  [sim/systems/avionics_on]
     off_commands: [sim/systems/avionics_off]
     readback:     [sim/cockpit/electrical/avionics_on]
-  # "All electrical on" brings the aircraft to life via X-Plane's built-in prep
-  # (sim/operation/auto_board) -- battery, APU (spins up), generators, cross-ties,
-  # bleed. The MD-82's own electrical switches are xlua-driven and don't respond to
-  # external dataref writes, but auto_board drives that logic internally. Verified
-  # live. (It's the "prep for boarding" the sim menu runs.)
-  - key: all
-    spoken: all electrical
-    on_commands:  [sim/operation/auto_board]
-    off_commands: [sim/systems/avionics_off, sim/electrical/battery_1_off]
-    readback:     [sim/cockpit/electrical/battery_on, sim/cockpit2/electrical/APU_generator_on]
+  # "All electrical systems on" is NOT an electrical-tool key -- it's the procedural
+  # power_up tool (auto_prep), which runs battery -> APU -> bleed -> buses ->
+  # generators as individual steps with a callout each, driving the real laminar
+  # controls (semantics from the MD-82's xlua scripts).
 
 # Exterior lights (standard X-Plane switch datarefs).
 lights:
