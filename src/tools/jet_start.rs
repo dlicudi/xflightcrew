@@ -25,6 +25,9 @@ const XFEED_R: &str = "laminar/md82/bleedair/engineR_xfeed_lever";
 // Post-start: transfer to engine generators and shut the APU down (start-only).
 const APU_ON: &str = "laminar/md82/bleedair/APU_on";
 const CMD_APU_BLEED_OFF: &str = "laminar/md82cmd/bleedair/APU_up"; // "up" decrements 1 -> 0
+const CMD_APU_BLEED_ON: &str = "laminar/md82cmd/bleedair/APU_dwn"; // "dwn" increments 0 -> 1
+// Bleed-air manifold pressure needle — the pneumatic starters need this up to crank.
+const BLEED_NEEDLE: &str = "laminar/md82/bleedair/bleedair_needle";
 const XTIE_L: &str = "laminar/md82/electrical/cross_tie_APU_L";
 const XTIE_R: &str = "laminar/md82/electrical/cross_tie_APU_R";
 const CMD_XTIE_L: &str = "laminar/md82cmd/electrical/cross_tie_APU_L";
@@ -113,6 +116,34 @@ async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<
         }
     }
 
+    // The pneumatic starters need APU bleed air on the manifold. The APU can be
+    // spinning (N1 > 95) with its bleed valve CLOSED — e.g. a prior start's
+    // post-shutdown closes it — so an N1 check alone isn't enough; cranking then
+    // gets no air and the engine "won't spool". Make sure the bleed valve is open
+    // and pressure is up before we crank.
+    if xp.get_float(APU_ON).await.unwrap_or(0.0) < 0.5 {
+        say(voice, status, "Opening A P U bleed.");
+        xp.run_command(CMD_APU_BLEED_ON).await.ok();
+    }
+    let mut needle = 0.0;
+    for _ in 0..10 {
+        needle = xp.get_float(BLEED_NEEDLE).await.unwrap_or(0.0);
+        if needle > 2.0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    tracing::info!(
+        apu_n1 = xp.get_float(APU_N1).await.unwrap_or(0.0),
+        apu_bleed = xp.get_float(APU_ON).await.unwrap_or(0.0),
+        bleed_needle = needle,
+        "jet start: pre-crank bleed state"
+    );
+    if needle < 2.0 {
+        say(voice, status, "No bleed pressure on the manifold, can't crank. Check the A P U bleed.");
+        return;
+    }
+
     // Crank each engine in turn: right (idx 1, starter 2), then left (idx 0, starter 1).
     for (idx, starter, lever_open, lever_close, side) in [
         (1usize, "sim/starters/engage_starter_2", XFEED_R, XFEED_L, "right"),
@@ -127,6 +158,12 @@ async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<
         say(voice, status, &format!("Cranking the {side} engine."));
         xp.run_command_for(starter, STARTER_HOLD_SECS).await.ok();
         if !wait_n2(xp, idx, N2_LIGHT, 30).await {
+            tracing::warn!(
+                side,
+                n2 = n2(xp, idx).await,
+                bleed_needle = xp.get_float(BLEED_NEEDLE).await.unwrap_or(0.0),
+                "jet start: engine failed to spool"
+            );
             say(voice, status, &format!("The {side} engine won't spool, check bleed air. Start aborted."));
             return;
         }
