@@ -41,6 +41,12 @@ const CMD_SERVOS_OFF: &str = "sim/autopilot/servos_off_any";
 const CMD_HEADING_MODE: &str = "sim/autopilot/heading";
 /// Command: engage NAV mode (follow the active nav source).
 const CMD_NAV_MODE: &str = "sim/autopilot/NAV";
+/// Command: engage GPSS (lateral nav / LNAV) — fly the *GPS flight plan*. This is
+/// the correct "track the magenta line" mode; `NAV` arms VOR/LOC capture instead.
+/// Study airliners like the MD-82 fly the FMS route only under GPSS, not NAV.
+const CMD_GPSS: &str = "sim/autopilot/gpss";
+/// GPSS (LNAV) engaged status.
+const GPSS_STATUS: &str = "sim/cockpit2/autopilot/gpss_status";
 /// Command: select GPS as the CDI/HSI source (so NAV follows the GPS flight plan).
 const CMD_HSI_GPS: &str = "sim/autopilot/hsi_select_gps";
 /// NAV-mode status (> 0 = armed/engaged).
@@ -552,15 +558,24 @@ impl Tool for Navigate {
     }
 
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
-        // GPS as the CDI source, servos on, then NAV mode (a toggle, so guarded).
+        // GPS as the CDI source, servos on, then LNAV. Following a *GPS flight plan*
+        // is GPSS (lateral nav) — NAV mode is VOR/LOC capture, a different thing.
+        // The MD-82 (and other study FMS aircraft) only fly the loaded route under
+        // GPSS. Engage GPSS first; fall back to NAV for any AP that tracks the GPS
+        // under NAV instead (keeps the simpler GA setups working).
         ctx.xplane.run_command(CMD_HSI_GPS).await?;
         ctx.xplane.run_command(CMD_SERVOS_ON).await?;
-        engage_mode(ctx, NAV_STATUS, CMD_NAV_MODE).await?;
+        engage_mode(ctx, GPSS_STATUS, CMD_GPSS).await?;
+        let mut lnav = mode_engaged(ctx, GPSS_STATUS).await;
+        if !lnav {
+            engage_mode(ctx, NAV_STATUS, CMD_NAV_MODE).await?;
+            lnav = mode_engaged(ctx, NAV_STATUS).await;
+        }
 
-        match (servos_engaged(ctx).await?, mode_engaged(ctx, NAV_STATUS).await) {
-            (true, true) => Ok("Roger, following the flight plan, GPS nav engaged.".to_string()),
+        match (servos_engaged(ctx).await?, lnav) {
+            (true, true) => Ok("Roger, following the flight plan, LNAV engaged.".to_string()),
             (true, false) => {
-                Ok("GPS selected and servos on, but NAV didn't engage, check the autopilot.".to_string())
+                Ok("GPS selected and servos on, but LNAV didn't engage — check the autopilot.".to_string())
             }
             (false, _) => {
                 Ok("Set GPS nav, but the autopilot didn't engage, check the AP master.".to_string())
