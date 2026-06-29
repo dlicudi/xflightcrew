@@ -136,10 +136,41 @@ fn env_scale(name: &str, default: f64) -> f32 {
     std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(default as f32)
 }
 
-/// Phonemize with espeak-ng (IPA) — the phonemizer piper itself uses.
+/// Sentence/clause punctuation that piper voices model as pause/intonation tokens
+/// (they're in the voice's phoneme_id_map). `espeak-ng --ipa` collapses these to
+/// newlines and drops the mark itself, so we phonemize *between* them and splice
+/// the punctuation back — otherwise every readback is a flat, pauseless run-on.
+const PUNCT: &[char] = &[',', '.', '?', '!', ';', ':'];
+
+/// Phonemize `text` to an IPA string with punctuation preserved. Each clause is
+/// phonemized on its own (no internal punctuation for espeak to swallow), and the
+/// original punctuation mark is reinserted between clauses so its prosody survives.
 fn phonemize(text: &str) -> Result<String> {
+    let mut out = String::new();
+    let mut seg = String::new();
+    for ch in text.chars() {
+        if PUNCT.contains(&ch) {
+            if !seg.trim().is_empty() {
+                out.push_str(&espeak_ipa(seg.trim())?);
+            }
+            seg.clear();
+            out.push(' '); // keep the mark a standalone token for the id map
+            out.push(ch);
+            out.push(' ');
+        } else {
+            seg.push(ch);
+        }
+    }
+    if !seg.trim().is_empty() {
+        out.push_str(&espeak_ipa(seg.trim())?);
+    }
+    Ok(out.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// Run espeak-ng on a punctuation-free clause and return its IPA phonemes.
+fn espeak_ipa(clause: &str) -> Result<String> {
     let out = Command::new("espeak-ng")
-        .args(["-v", "en-us", "-q", "--ipa", text])
+        .args(["-v", "en-us", "-q", "--ipa", clause])
         .stderr(Stdio::null())
         .output()
         .context("running espeak-ng (install it: brew install espeak-ng)")?;
