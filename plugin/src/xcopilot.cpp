@@ -438,11 +438,13 @@ protected:
         if (ImGui::SmallButton(mCollapsed ? "+" : "_")) {
             toggleCollapse();
         }
-        // One-click reload after a rebuild. The SDK can only reload *all* plugins
-        // (there's no single-plugin reload), so this bounces every plugin — handy
-        // when iterating, just don't fat-finger it mid-approach.
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Reload")) {
+        // One-click reload after a rebuild — right-aligned and set apart from the
+        // other buttons so it can't be fat-fingered (it bounces ALL plugins; the
+        // SDK can't reload just one).
+        const char* reloadLbl = "Reload";
+        float reloadW = ImGui::CalcTextSize(reloadLbl).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - reloadW);
+        if (ImGui::SmallButton(reloadLbl)) {
             XPLMReloadPlugins();
         }
         ImGui::Separator();
