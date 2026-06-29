@@ -1,10 +1,10 @@
-//! Jet engine start — `start_engines`. A study-level aircraft like the MD-82 hides
-//! its start logic in xlua scripts whose custom datarefs/commands don't respond to
-//! external activation. But X-Plane's built-in operations DO work over the Web API
-//! and drive that logic internally: `sim/operation/auto_board` brings up the APU
-//! and electrical, and `sim/operation/auto_start` cranks the engines. So the start
-//! is: ensure the APU is up (auto_board), then auto_start, watching N2/running.
-//! Verified live on the MD-82. Generic — no airframe-specific datarefs.
+//! Jet engine start — `start_engines`. Runs the MD-82 start the way the crew (and
+//! the aircraft's own autostart) does it: crank each engine on bleed air, watch
+//! N2, introduce fuel at 20%, wait for idle. Steps and controls come from the
+//! aircraft's xlua autostart script and were verified live: the starter is a HELD
+//! command, the fuel handle is `mixture_ratio[idx]` (not ENGN_mixt), and the
+//! engine bleed cross-feeds route start air. If the APU/electrical isn't up yet it
+//! runs the power-up first (as the autostart does).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -15,13 +15,19 @@ use crate::plugin_status::{AlertLevel, StatusSink};
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
-const AUTO_BOARD: &str = "sim/operation/auto_board"; // APU + electrical bring-up
-const AUTO_START: &str = "sim/operation/auto_start"; // engine start
-const APU_N1: &str = "sim/cockpit/engine/APU_N1";
+const APU_N1: &str = "sim/cockpit2/electrical/APU_N1_percent";
 const N2: &str = "sim/cockpit2/engine/indicators/N2_percent";
+const MIXTURE: &str = "sim/cockpit2/engine/actuators/mixture_ratio"; // the fuel handle
+const GEN_ON: &str = "sim/cockpit2/electrical/generator_on";
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
+const XFEED_L: &str = "laminar/md82/bleedair/engineL_xfeed_lever";
+const XFEED_R: &str = "laminar/md82/bleedair/engineR_xfeed_lever";
 
+const N2_LIGHT: f64 = 20.0; // introduce fuel above this
+const N2_IDLE: f64 = 50.0; // self-sustaining
 const POLL_SECS: u64 = 2;
+/// Hold the starter this long (X-Plane keeps it ~6s more), enough to reach 20% N2.
+const STARTER_HOLD_SECS: f64 = 10.0;
 
 pub struct StartEngines;
 
@@ -31,17 +37,17 @@ impl Tool for StartEngines {
         "start_engines"
     }
     fn description(&self) -> &str {
-        "Start the jet engines: bring up the APU/electrical if needed, then run the \
-         engine start. Use for 'start engines', 'start the engines', 'engines on', \
-         'start up the engines', 'spool up the engines', 'crank the engines', 'fire \
-         up the engines'."
+        "Start the jet engines: crank each on bleed air, introduce fuel, bring to \
+         idle, calling out each. Use for 'start engines', 'start the engines', \
+         'engines on', 'start up the engines', 'crank the engines', 'fire up the \
+         engines'."
     }
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": {} })
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         if let Ok(r) = ctx.xplane.get_float_array(ENGN_RUNNING).await {
-            if r.iter().take(2).all(|&v| v > 0.5) && r.len() >= 2 {
+            if r.len() >= 2 && r.iter().take(2).all(|&v| v > 0.5) {
                 return Ok("Engines are already running.".to_string());
             }
         }
@@ -50,7 +56,7 @@ impl Tool for StartEngines {
     }
 }
 
-fn announce(voice: &Option<Voice>, status: &Option<StatusSink>, line: &str) {
+fn say(voice: &Option<Voice>, status: &Option<StatusSink>, line: &str) {
     if let Some(s) = status {
         s.alert(AlertLevel::Advisory, line);
     }
@@ -71,60 +77,68 @@ fn spawn(base: String, voice: Option<Voice>, status: Option<StatusSink>) {
     });
 }
 
-/// Count of the first two engines that are running.
-async fn running_count(xp: &XPlaneClient) -> usize {
-    xp.get_float_array(ENGN_RUNNING)
-        .await
-        .map(|r| r.iter().take(2).filter(|&&v| v > 0.5).count())
-        .unwrap_or(0)
+async fn n2(xp: &XPlaneClient, idx: usize) -> f64 {
+    xp.get_float_array(N2).await.ok().and_then(|v| v.get(idx).copied()).unwrap_or(0.0)
 }
 
-async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<StatusSink>) {
-    // 1. APU up for bleed/power? If not, prep the aircraft (starts the APU) and wait
-    //    for it to spool, since auto_start needs bleed air.
-    if xp.get_float(APU_N1).await.unwrap_or(0.0) < 90.0 {
-        announce(voice, status, "Bringing up the A P U and electrical.");
-        xp.run_command(AUTO_BOARD).await.ok();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(75);
-        let mut ready = false;
-        while std::time::Instant::now() < deadline {
-            if xp.get_float(APU_N1).await.unwrap_or(0.0) >= 90.0 {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
-        }
-        if !ready {
-            announce(voice, status, "The A P U didn't come up. Holding the start.");
-            return;
-        }
-    }
-
-    // 2. Crank the engines. auto_start can take a moment per engine; re-issue once
-    //    if the second hasn't caught after a while.
-    announce(voice, status, "Cranking the engines.");
-    xp.run_command(AUTO_START).await.ok();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
-    let mut renudged = false;
-    loop {
-        let running = running_count(xp).await;
-        if running >= 2 {
-            announce(voice, status, "Both engines running, start complete.");
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            let line = match running {
-                1 => "One engine running, the other didn't catch. Check it.",
-                _ => "The engines didn't start. Check bleed air and fuel.",
-            };
-            announce(voice, status, line);
-            return;
-        }
-        // Halfway through, give auto_start another go for the lagging engine.
-        if !renudged && std::time::Instant::now() > deadline - std::time::Duration::from_secs(45) {
-            xp.run_command(AUTO_START).await.ok();
-            renudged = true;
+/// Poll engine `idx`'s N2 until it passes `pct`, or give up after `secs`.
+async fn wait_n2(xp: &XPlaneClient, idx: usize, pct: f64, secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if n2(xp, idx).await > pct {
+            return true;
         }
         tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
     }
+    false
+}
+
+async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<StatusSink>) {
+    // Electrical/APU/bleed must be up first (the autostart runs the boarding prep
+    // if it isn't). Reuse the same procedural power-up.
+    if xp.get_float(APU_N1).await.unwrap_or(0.0) < 95.0 {
+        say(voice, status, "Electrical isn't up. Powering up first.");
+        crate::tools::power::run_prep(xp, voice, status).await;
+        if xp.get_float(APU_N1).await.unwrap_or(0.0) < 95.0 {
+            say(voice, status, "No A P U bleed, can't start the engines.");
+            return;
+        }
+    }
+
+    // Crank each engine in turn: right (idx 1, starter 2), then left (idx 0, starter 1).
+    for (idx, starter, lever_open, lever_close, side) in [
+        (1usize, "sim/starters/engage_starter_2", XFEED_R, XFEED_L, "right"),
+        (0usize, "sim/starters/engage_starter_1", XFEED_L, XFEED_R, "left"),
+    ] {
+        // Generator on for this engine; route start air to it (open its cross-feed,
+        // close the other).
+        xp.set_int_array_elem(GEN_ON, idx, 1).await.ok();
+        xp.set_float(lever_open, 1.0).await.ok();
+        xp.set_float(lever_close, 0.0).await.ok();
+
+        say(voice, status, &format!("Cranking the {side} engine."));
+        xp.run_command_for(starter, STARTER_HOLD_SECS).await.ok();
+        if !wait_n2(xp, idx, N2_LIGHT, 30).await {
+            say(voice, status, &format!("The {side} engine won't spool, check bleed air. Start aborted."));
+            return;
+        }
+        // 20% N2 — introduce fuel (the fuel handle), then wait for idle.
+        say(voice, status, &format!("{} fuel on.", cap(side)));
+        xp.set_float_array_elem(MIXTURE, idx, 1.0).await.ok();
+        if !wait_n2(xp, idx, N2_IDLE, 60).await {
+            say(voice, status, &format!("The {side} engine hung below idle, watch it."));
+            return;
+        }
+        say(voice, status, &format!("The {side} engine is running."));
+    }
+
+    // Both cross-feeds open for normal ops.
+    xp.set_float(XFEED_L, 1.0).await.ok();
+    xp.set_float(XFEED_R, 1.0).await.ok();
+    say(voice, status, "Both engines running, start complete.");
+}
+
+fn cap(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
 }

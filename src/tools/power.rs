@@ -97,7 +97,10 @@ async fn wait_until(xp: &XPlaneClient, dr: &str, secs: u64, ok: impl Fn(f64) -> 
     false
 }
 
-async fn run_prep(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<StatusSink>) {
+/// The electrical bring-up, step by step. `pub(crate)` so the engine start can run
+/// it first when the APU/bleed isn't up yet (mirrors the aircraft's autostart,
+/// which runs autoboard first).
+pub(crate) async fn run_prep(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<StatusSink>) {
     // 1. Battery on (and locked).
     if xp.get_float(BATTERY_ON).await.unwrap_or(0.0) < 0.5 {
         xp.run_command(CMD_BATTERY).await.ok();
