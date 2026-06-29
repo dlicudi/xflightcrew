@@ -217,127 +217,6 @@ static void WriteFmsLoad(void*, int v) {
     g_fms_load = 0; // edge-triggered; reset so a re-load needs a fresh write
 }
 
-// ---- jet engine start -------------------------------------------------------
-// The app writes 1 to xcopilot/cmd/start_engines; the plugin runs the turbine
-// start IN-PROCESS. This is the whole point of doing it here: XPLMCommandOnce
-// reaches laminar's own command handlers (APU bleed, ignition select), which the
-// X-Plane Web/REST API can't activate from outside the sim. A flight-loop state
-// machine steps the sequence, watching N2 like a pilot holding the starter.
-//
-// MD-82-specific datarefs/commands for now (laminar/md82...); null-checked, so on
-// other aircraft the steps that don't apply are simply skipped.
-
-static int g_start_cmd = 0;
-static XPLMDataRef g_start_cmd_dref = nullptr;
-
-enum StartState { ST_IDLE, ST_PREP, ST_CRANK, ST_LIGHT, ST_RUN_WAIT, ST_FINISH };
-static StartState g_start_state = ST_IDLE;
-static int g_start_pos = 0;       // index into the start order
-static float g_start_timer = 0.f; // seconds elapsed in the current wait
-
-// Cached refs (resolved lazily once the MD-82 — and its plugin — are loaded).
-static XPLMDataRef dr_n2 = nullptr, dr_mixt = nullptr, dr_fuelpump = nullptr,
-                   dr_apu_on = nullptr, dr_ign = nullptr, dr_xfl = nullptr, dr_xfr = nullptr;
-static XPLMCommandRef cmd_apu_up = nullptr, cmd_ign_up = nullptr, cmd_ign_dwn = nullptr;
-static bool g_start_refs_ready = false;
-
-// Start order: right engine (index 1) first, then left (index 0) — one starter on
-// the bleed at a time, as the checklist runs it.
-static const int kStartOrder[2] = {1, 0};
-
-static void init_start_refs() {
-    if (g_start_refs_ready) return;
-    dr_n2       = XPLMFindDataRef("sim/cockpit2/engine/indicators/N2_percent");
-    dr_mixt     = XPLMFindDataRef("sim/flightmodel/engine/ENGN_mixt");
-    dr_fuelpump = XPLMFindDataRef("sim/cockpit2/fuel/fuel_tank_pump_on");
-    dr_apu_on   = XPLMFindDataRef("laminar/md82/bleedair/APU_on");
-    dr_ign      = XPLMFindDataRef("laminar/md82/ignition_sys");
-    dr_xfl      = XPLMFindDataRef("laminar/md82/bleedair/engineL_xfeed_lever");
-    dr_xfr      = XPLMFindDataRef("laminar/md82/bleedair/engineR_xfeed_lever");
-    cmd_apu_up  = XPLMFindCommand("laminar/md82cmd/bleedair/APU_up");
-    cmd_ign_up  = XPLMFindCommand("laminar/md82cmd/ignition_sys_up");
-    cmd_ign_dwn = XPLMFindCommand("laminar/md82cmd/ignition_sys_dwn");
-    g_start_refs_ready = true;
-}
-
-static float N2_of(int eng) {
-    if (!dr_n2) return 0.f;
-    float v[8] = {0};
-    XPLMGetDatavf(dr_n2, v, 0, 8);
-    return (eng >= 0 && eng < 8) ? v[eng] : 0.f;
-}
-
-// Stepped by the flight loop every ~0.5s. Returns seconds to next call (0 = stop).
-static float StartFlightLoop(float, float, int, void*) {
-    switch (g_start_state) {
-    case ST_IDLE:
-        return 0.f; // disabled until armed again
-    case ST_PREP: {
-        // Open the APU bleed valve (command — the dataref is read-only), engine
-        // bleed cross-feeds (writable), fuel boost pumps, and select ignition A.
-        if (dr_apu_on && XPLMGetDataf(dr_apu_on) < 0.5f && cmd_apu_up) XPLMCommandOnce(cmd_apu_up);
-        if (dr_xfl) XPLMSetDataf(dr_xfl, 1.0f);
-        if (dr_xfr) XPLMSetDataf(dr_xfr, 1.0f);
-        if (dr_fuelpump) { int p[3] = {1, 1, 1}; XPLMSetDatavi(dr_fuelpump, p, 0, 3); }
-        if (dr_ign && XPLMGetDataf(dr_ign) < 0.5f && cmd_ign_up) XPLMCommandOnce(cmd_ign_up);
-        g_start_pos = 0;
-        g_start_state = ST_CRANK;
-        return 1.0f; // give the bleed a moment
-    }
-    case ST_CRANK: {
-        int eng = kStartOrder[g_start_pos];
-        XPLMCommandRef st = XPLMFindCommand(
-            eng == 0 ? "sim/starters/engage_starter_1" : "sim/starters/engage_starter_2");
-        if (st) XPLMCommandOnce(st);
-        g_start_timer = 0.f;
-        g_start_state = ST_LIGHT;
-        return 0.5f;
-    }
-    case ST_LIGHT: { // wait for the starter to motor N2 up, then introduce fuel
-        int eng = kStartOrder[g_start_pos];
-        g_start_timer += 0.5f;
-        if (N2_of(eng) > 20.0f) {
-            if (dr_mixt) { float one = 1.0f; XPLMSetDatavf(dr_mixt, &one, eng, 1); }
-            g_start_timer = 0.f;
-            g_start_state = ST_RUN_WAIT;
-        } else if (g_start_timer > 45.0f) {
-            AppendLog("STARTER", COL_AMBER, "Engine didn't spool, check bleed air. Start aborted.");
-            g_start_state = ST_FINISH;
-        }
-        return 0.5f;
-    }
-    case ST_RUN_WAIT: { // wait for it to reach idle, then the next engine
-        int eng = kStartOrder[g_start_pos];
-        g_start_timer += 0.5f;
-        if (N2_of(eng) > 50.0f || g_start_timer > 60.0f) {
-            g_start_pos++;
-            g_start_state = (g_start_pos < 2) ? ST_CRANK : ST_FINISH;
-        }
-        return 0.5f;
-    }
-    case ST_FINISH: {
-        if (dr_ign && cmd_ign_dwn) {
-            for (int i = 0; i < 4 && XPLMGetDataf(dr_ign) > 0.5f; ++i) XPLMCommandOnce(cmd_ign_dwn);
-        }
-        AppendLog("STARTER", COL_GREEN, "Engine start complete.");
-        g_start_state = ST_IDLE;
-        return 0.f;
-    }
-    }
-    return 0.f;
-}
-
-static int ReadStartCmd(void*) { return g_start_cmd; }
-static void WriteStartCmd(void*, int v) {
-    if (v != 0 && g_start_state == ST_IDLE) {
-        init_start_refs();
-        g_start_state = ST_PREP;
-        AppendLog("STARTER", COL_CYAN, "Starting engines, stand by.");
-        XPLMSetFlightLoopCallbackInterval(StartFlightLoop, 0.5f, 1, nullptr);
-    }
-    g_start_cmd = 0; // edge-triggered
-}
-
 // ---- panel ------------------------------------------------------------------
 
 // While the app is connected: 0/1 = resting ("CONNECTED" — with push-to-talk the
@@ -485,12 +364,6 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         "xcopilot/fms/load", xplmType_Int, 1,
         ReadFmsLoad, WriteFmsLoad, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-    g_start_cmd_dref = XPLMRegisterDataAccessor(
-        "xcopilot/cmd/start_engines", xplmType_Int, 1,
-        ReadStartCmd, WriteStartCmd, nullptr, nullptr, nullptr, nullptr,
-        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-    // Engine-start state machine, registered idle (interval 0); WriteStartCmd arms it.
-    XPLMRegisterFlightLoopCallback(StartFlightLoop, 0.0f, nullptr);
 
     // One shared font atlas for all ImgWindows (uses ImGui's default font).
     ImgWindow::sFontAtlas = std::make_shared<ImgFontAtlas>();
@@ -514,8 +387,6 @@ PLUGIN_API void XPluginStop(void) {
     if (g_menu) { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
     if (g_fms_load_dref) { XPLMUnregisterDataAccessor(g_fms_load_dref); g_fms_load_dref = nullptr; }
     if (g_fms_route_dref) { XPLMUnregisterDataAccessor(g_fms_route_dref); g_fms_route_dref = nullptr; }
-    XPLMUnregisterFlightLoopCallback(StartFlightLoop, nullptr);
-    if (g_start_cmd_dref) { XPLMUnregisterDataAccessor(g_start_cmd_dref); g_start_cmd_dref = nullptr; }
     if (g_aircraft_dref) { XPLMUnregisterDataAccessor(g_aircraft_dref); g_aircraft_dref = nullptr; }
     if (g_alert_dref) { XPLMUnregisterDataAccessor(g_alert_dref); g_alert_dref = nullptr; }
     if (g_action_dref) { XPLMUnregisterDataAccessor(g_action_dref); g_action_dref = nullptr; }
