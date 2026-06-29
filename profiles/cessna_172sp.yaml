@@ -84,6 +84,7 @@ vne_kts: 163.0
 # clean stall live above (the monitor uses them) and aren't repeated here.
 # Note: the manual lists Va 99; the real-world 172S POH lists 105 at gross.
 reference:
+  kind: single-engine aircraft
   vno_kts: 129.0           # max structural cruise
   va_kts: 99.0             # maneuvering (manual value)
   vx_kts: 62.0             # best angle of climb

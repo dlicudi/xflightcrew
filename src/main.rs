@@ -1792,13 +1792,19 @@ fn aircraft_info(profile: &aircraft::AircraftProfile, t: &str) -> Option<String>
     if !asks {
         return None;
     }
-    let mut line = format!("We're in the {}, a single-engine aircraft.", profile.display_name);
     let r = profile.reference.as_ref();
+    // The type descriptor comes from the profile (e.g. "twin-engine jet"); without
+    // one, just name the aircraft rather than assert an engine count.
+    let mut line = match r.and_then(|r| r.kind.as_deref()) {
+        Some(kind) => format!("We're in the {}, a {kind}.", profile.display_name),
+        None => format!("We're in the {}.", profile.display_name),
+    };
     if let Some(v) = r.and_then(|r| r.cruise_kts) {
         line.push_str(&format!(" Cruise about {v:.0} knots."));
     }
     if let Some(v) = profile.vne_kts {
-        line.push_str(&format!(" Vne {v:.0}."));
+        // Vne for piston singles, Vmo for jets — "max speed" reads right for both.
+        line.push_str(&format!(" Max speed {v:.0}."));
     }
     if let Some(v) = r.and_then(|r| r.service_ceiling_ft) {
         line.push_str(&format!(" Service ceiling {} feet.", with_commas(v)));
@@ -2778,6 +2784,10 @@ mod tests {
         assert!(c172.get("start_engine").is_some());
         // Reference card answers from the POM.
         assert!(super::reference_limits(&p, "service ceiling").unwrap().contains("37,000"));
+        // "What are we in" describes it as a twin-engine jet, not single-engine.
+        let info = super::aircraft_info(&p, "what aircraft are we in").unwrap();
+        assert!(info.contains("twin-engine jet"), "got: {info}");
+        assert!(!info.contains("single-engine"));
         // The MD-82 checklist parses.
         assert!(crate::checklist::load(&p).is_ok());
     }

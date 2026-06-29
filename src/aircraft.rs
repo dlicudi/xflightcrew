@@ -209,6 +209,7 @@ pub struct FlapDetent {
 /// the top level (the monitor uses them) and aren't duplicated here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReferenceProfile {
+    #[serde(default)] pub kind: Option<String>,            // e.g. "single-engine aircraft", "twin-engine jet"
     #[serde(default)] pub vno_kts: Option<f64>,            // max structural cruise
     #[serde(default)] pub va_kts: Option<f64>,             // maneuvering
     #[serde(default)] pub vx_kts: Option<f64>,             // best angle of climb
@@ -572,6 +573,7 @@ fn cessna_172sp() -> AircraftProfile {
         vne_kts: Some(163.0),
         // Reference figures from the X-Plane C172 Pilot's Operating Manual.
         reference: Some(ReferenceProfile {
+            kind: Some("single-engine aircraft".into()),
             vno_kts: Some(129.0),
             va_kts: Some(99.0),
             vx_kts: Some(62.0),
@@ -771,6 +773,7 @@ fn cirrus_sr22() -> AircraftProfile {
         // Reference figures from the X-Plane Cirrus SR22 Pilot's Operating Manual
         // (the modeled aircraft is the turbo TSIO-550-K, ceiling 25,000 ft).
         reference: Some(ReferenceProfile {
+            kind: Some("single-engine aircraft".into()),
             vno_kts: Some(178.0),
             va_kts: Some(133.0),
             vx_kts: Some(88.0),

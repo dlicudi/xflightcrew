@@ -78,6 +78,7 @@ vne_kts: 340.0
 # Static reference figures from the X-Plane MD-82 POM. Takeoff V-speeds (V1/Vr/V2)
 # are weight-dependent and computed per departure, so they're not carried here.
 reference:
+  kind: twin-engine jet
   approach_kts: 140.0          # final approach, full flap / gear down (133-140)
   cruise_kts: 439.0            # long-range cruise (KTAS); max level 500
   max_gross_lb: 140000.0       # MTOW
