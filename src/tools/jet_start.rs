@@ -22,6 +22,14 @@ const GEN_ON: &str = "sim/cockpit2/electrical/generator_on";
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 const XFEED_L: &str = "laminar/md82/bleedair/engineL_xfeed_lever";
 const XFEED_R: &str = "laminar/md82/bleedair/engineR_xfeed_lever";
+// Post-start: transfer to engine generators and shut the APU down (start-only).
+const APU_ON: &str = "laminar/md82/bleedair/APU_on";
+const CMD_APU_BLEED_OFF: &str = "laminar/md82cmd/bleedair/APU_up"; // "up" decrements 1 -> 0
+const XTIE_L: &str = "laminar/md82/electrical/cross_tie_APU_L";
+const XTIE_R: &str = "laminar/md82/electrical/cross_tie_APU_R";
+const CMD_XTIE_L: &str = "laminar/md82cmd/electrical/cross_tie_APU_L";
+const CMD_XTIE_R: &str = "laminar/md82cmd/electrical/cross_tie_APU_R";
+const APU_STARTER: &str = "sim/cockpit2/electrical/APU_starter_switch";
 
 const N2_LIGHT: f64 = 20.0; // introduce fuel above this
 const N2_IDLE: f64 = 50.0; // self-sustaining
@@ -135,6 +143,21 @@ async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<
     // Both cross-feeds open for normal ops.
     xp.set_float(XFEED_L, 1.0).await.ok();
     xp.set_float(XFEED_R, 1.0).await.ok();
+
+    // Transfer to the engine generators (on from the crank) and shut the APU down
+    // -- it's only needed to start. Bleed off, APU buses off, APU master off.
+    say(voice, status, "On engine generators, shutting the A P U down.");
+    if xp.get_float(APU_ON).await.unwrap_or(0.0) > 0.5 {
+        xp.run_command(CMD_APU_BLEED_OFF).await.ok();
+    }
+    if xp.get_float(XTIE_L).await.unwrap_or(0.0) > 0.5 {
+        xp.run_command(CMD_XTIE_L).await.ok();
+    }
+    if xp.get_float(XTIE_R).await.unwrap_or(0.0) > 0.5 {
+        xp.run_command(CMD_XTIE_R).await.ok();
+    }
+    xp.set_int(APU_STARTER, 0).await.ok();
+
     say(voice, status, "Both engines running, start complete.");
 }
 

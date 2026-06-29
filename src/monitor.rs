@@ -792,6 +792,13 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     if profile.pitch_trim {
         checks.push(Box::new(StabTrim));
     }
+    if let Some(flaps) = &profile.flaps {
+        let limits: Vec<(f64, f64)> =
+            flaps.detents.iter().filter_map(|d| d.vfe_kts.map(|v| (d.ratio, v))).collect();
+        if !limits.is_empty() {
+            checks.push(Box::new(FlapOverspeed { limits }));
+        }
+    }
     checks
 }
 
@@ -923,6 +930,42 @@ impl Check for GyroDrift {
         Some(format!(
             "Heading indicator's drifted about {approx:.0} degrees — recommend syncing the gyro."
         ))
+    }
+}
+
+/// Flaps extended above their speed limit (Vfe) — the per-detent limits from the
+/// profile. The applicable limit is the lowest Vfe of any detent at or below the
+/// current flap position (Vfe drops as the flaps extend further). Airborne only.
+struct FlapOverspeed {
+    /// (detent ratio, Vfe knots) for detents that carry a limit.
+    limits: Vec<(f64, f64)>,
+}
+impl Check for FlapOverspeed {
+    fn id(&self) -> &'static str {
+        "flap_overspeed"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Caution
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if s.on_ground || s.flap_ratio < 0.02 {
+            return None;
+        }
+        // Lowest Vfe among detents we've reached (ratio <= current, small tolerance).
+        let vfe = self
+            .limits
+            .iter()
+            .filter(|(r, _)| *r <= s.flap_ratio + 0.05)
+            .map(|(_, v)| *v)
+            .fold(f64::INFINITY, f64::min);
+        if vfe.is_finite() && s.ias_kts > vfe + 5.0 {
+            Some(format!("Flap overspeed, {:.0} knots over the {vfe:.0} flap limit. Slow down or bring the flaps up.", s.ias_kts))
+        } else {
+            None
+        }
+    }
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(2)
     }
 }
 
