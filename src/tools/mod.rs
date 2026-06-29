@@ -192,7 +192,9 @@ impl Registry {
 
         if profile.barometer {
             tools.push(Box::new(instruments::SetBarometer));
-            tools.push(Box::new(instruments::SetAltimeterCurrent));
+            tools.push(Box::new(instruments::SetAltimeterCurrent {
+                transition_altitude_ft: profile.transition_altitude_ft,
+            }));
         }
 
         if profile.directional_gyro {

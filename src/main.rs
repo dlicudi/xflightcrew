@@ -813,7 +813,9 @@ async fn run_session(
         // Other state reads ("what's our altitude/heading/airspeed") — deterministic
         // too, but only when it's a question, so "set heading 270" still commands.
         if looks_like_question(&command) {
-            if let Some(answer) = answer_state_query(&command, &xplane, Some(&live)).await {
+            // A turbine (jet) reports N1/N2/ITT, not the piston RPM/CHT metrics.
+            let turbine = !profile.engine && profile.throttle;
+            if let Some(answer) = answer_state_query(&command, &xplane, Some(&live), turbine).await {
                 say(&voice, &reporter, ui::LogKind::Readback, &answer);
                 continue;
             }
@@ -1476,6 +1478,8 @@ async fn read1(live: Option<&LiveState>, xp: &XPlaneClient, name: &str) -> Resul
 
 /// 100LL avgas ≈ 2.72 kg/gal (~6 lb/gal) — to report fuel in gallons.
 const AVGAS_KG_PER_GAL: f64 = 2.72;
+/// Pounds per kilogram — jet fuel flow/quantity is read in lb (airliner convention).
+const LB_PER_KG: f64 = 2.20462;
 
 /// Meters per second → knots.
 const MS_TO_KTS: f64 = 1.943_844;
@@ -2125,6 +2129,7 @@ async fn answer_state_query(
     cmd: &str,
     xp: &XPlaneClient,
     live: Option<&LiveState>,
+    turbine: bool,
 ) -> Option<String> {
     let t = cmd.to_ascii_lowercase();
     let mut parts: Vec<String> = Vec::new();
@@ -2211,11 +2216,32 @@ async fn answer_state_query(
     // General "how's the engine?" → a one-line health summary. Only when no
     // specific instrument is named (those are handled below, no double-up).
     if t.contains("engine")
-        && !["oil", "egt", "exhaust", "cht", "cylinder", "rpm", "fuel flow"].iter().any(|k| t.contains(k))
+        && !["oil", "egt", "exhaust", "itt", "cht", "cylinder", "rpm", "n1", "n2", "fuel flow"]
+            .iter()
+            .any(|k| t.contains(k))
     {
         let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running").await.is_some_and(|v| v > 0.5);
         if !running {
-            parts.push("engine off".to_string());
+            parts.push(if turbine { "engines off" } else { "engine off" }.to_string());
+        } else if turbine {
+            // Turbine summary: spool speeds (N1/N2), turbine temp (ITT), oil, burn.
+            let mut bits = vec!["engines running".to_string()];
+            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/N1_percent").await {
+                bits.push(format!("N 1 {v:.0} percent"));
+            }
+            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/N2_percent").await {
+                bits.push(format!("N 2 {v:.0} percent"));
+            }
+            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/ITT_deg_C").await {
+                bits.push(format!("I T T {v:.0} degrees"));
+            }
+            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_pressure_psi").await {
+                bits.push(format!("oil pressure {v:.0} pounds"));
+            }
+            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/fuel_flow_kg_sec").await {
+                bits.push(format!("fuel flow {:.0} pounds an hour", v * 3600.0 * LB_PER_KG));
+            }
+            parts.push(bits.join(", "));
         } else {
             let mut bits = vec!["engine running".to_string()];
             if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm").await {
@@ -2238,6 +2264,23 @@ async fn answer_state_query(
         }
     }
 
+    // Turbine spool speeds, asked directly ("what's the N1?").
+    if turbine && (t.contains("n1") || t.contains("n 1")) {
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/N1_percent").await {
+            parts.push(format!("N 1 {v:.0} percent"));
+        }
+    }
+    if turbine && (t.contains("n2") || t.contains("n 2")) {
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/N2_percent").await {
+            parts.push(format!("N 2 {v:.0} percent"));
+        }
+    }
+    if turbine && (t.contains("itt") || t.contains("turbine temp")) {
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/ITT_deg_C").await {
+            parts.push(format!("I T T {v:.0} degrees"));
+        }
+    }
+
     // Engine instruments (per-engine arrays → element 0). Temperatures spoken in
     // °F to match the 172's gauges and the POH. Names verified against the stock
     // 172's cockpitdecks mapping.
@@ -2253,26 +2296,47 @@ async fn answer_state_query(
             parts.push(format!("oil temperature {v:.0} degrees"));
         }
     }
-    if t.contains("egt") || t.contains("exhaust") {
-        // EGT_deg_cel is genuinely Celsius → convert to °F for the readout.
+    if !turbine && (t.contains("egt") || t.contains("exhaust")) {
+        // EGT_deg_cel is genuinely Celsius → convert to °F for the readout. (On a
+        // turbine the equivalent is ITT, handled by the n1/n2/itt block above; route
+        // "exhaust temp" there too so a jet doesn't fall through to nothing.)
         if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/EGT_deg_cel").await {
             parts.push(format!("exhaust gas temperature {:.0} degrees", c_to_f(v)));
         }
     }
+    if turbine && (t.contains("egt") || t.contains("exhaust")) {
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/ITT_deg_C").await {
+            parts.push(format!("I T T {v:.0} degrees"));
+        }
+    }
     if t.contains("cht") || t.contains("cylinder") {
-        // CHT_deg_C is misnamed — reads °F already.
-        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/CHT_deg_C").await {
+        if turbine {
+            parts.push("no cylinder head temp on a jet — that's a piston gauge".to_string());
+        } else if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/CHT_deg_C").await {
+            // CHT_deg_C is misnamed — reads °F already.
             parts.push(format!("cylinder head temperature {v:.0} degrees"));
         }
     }
     if t.contains("rpm") || t.contains("r p m") || t.contains("engine speed") {
-        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm").await {
+        if turbine {
+            // A jet's "engine speed" is the spool speeds, not prop RPM.
+            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/N1_percent").await {
+                parts.push(format!("N 1 {v:.0} percent"));
+            }
+            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/N2_percent").await {
+                parts.push(format!("N 2 {v:.0} percent"));
+            }
+        } else if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm").await {
             parts.push(format!("{v:.0} R P M"));
         }
     }
     if t.contains("fuel flow") || t.contains("flow") || t.contains("burning") {
         if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/fuel_flow_kg_sec").await {
-            parts.push(format!("fuel flow {:.1} gallons an hour", v * 3600.0 / AVGAS_KG_PER_GAL));
+            if turbine {
+                parts.push(format!("fuel flow {:.0} pounds an hour", v * 3600.0 * LB_PER_KG));
+            } else {
+                parts.push(format!("fuel flow {:.1} gallons an hour", v * 3600.0 / AVGAS_KG_PER_GAL));
+            }
         }
     }
     if t.contains("ammeter") || t.contains("amps") || t.contains("charging") {

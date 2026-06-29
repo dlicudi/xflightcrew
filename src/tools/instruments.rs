@@ -67,7 +67,15 @@ impl Tool for SetBarometer {
     }
 }
 
-pub struct SetAltimeterCurrent;
+/// Standard pressure (inHg) — what the altimeter is set to above the transition
+/// altitude (1013.25 hPa).
+const STANDARD_INHG: f64 = 29.92;
+
+pub struct SetAltimeterCurrent {
+    /// Transition altitude (ft MSL): at or above it the "correct" setting is
+    /// standard pressure, not local QNH.
+    pub transition_altitude_ft: f64,
+}
 
 #[async_trait]
 impl Tool for SetAltimeterCurrent {
@@ -76,12 +84,14 @@ impl Tool for SetAltimeterCurrent {
     }
 
     fn description(&self) -> &str {
-        "Set the altimeter to the CURRENT local pressure (QNH) automatically — no \
-         number needed; the correct value is read from the environment. Use when the \
-         pilot wants it right without stating a setting: 'set the altimeter', 'set \
-         altimeter to current', 'altimeter to field', 'give me the local altimeter', \
-         'correct the altimeter', 'set the local QNH', 'update the altimeter'. For an \
-         explicit value ('altimeter two niner niner two') use set_barometer instead."
+        "Set the altimeter to the CORRECT setting automatically — no number needed. \
+         Below the transition altitude that's the local pressure (QNH), read from \
+         the environment; at or above it that's standard pressure (29.92). Use when \
+         the pilot wants it right without stating a value: 'set the altimeter', 'set \
+         altimeter to current', 'altimeter to field', 'set the local QNH', 'set \
+         standard', 'altimeter standard', 'update the altimeter', 'correct the \
+         altimeter'. For an explicit value ('altimeter two niner niner two') use \
+         set_barometer instead."
     }
 
     fn parameters(&self) -> Value {
@@ -89,8 +99,21 @@ impl Tool for SetAltimeterCurrent {
     }
 
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
-        // The sim's ambient sea-level pressure (QNH) is the "correct" setting — with
-        // it dialled in, the altimeter reads true MSL/field elevation.
+        // Above the transition altitude everyone flies on standard (29.92), so the
+        // "correct" setting there is standard, not QNH — dialling QNH in the flight
+        // levels would be wrong. Below it, the sim's ambient sea-level pressure
+        // (QNH) is correct: with it set the altimeter reads true MSL / field
+        // elevation. Use indicated altitude to decide (it's what the pilot sees).
+        let alt = ctx.xplane.get_float(crate::datarefs::ALTITUDE_FT).await.unwrap_or(0.0);
+        if alt >= self.transition_altitude_ft {
+            ctx.xplane.set_float(BARO, STANDARD_INHG).await?;
+            let actual = ctx.xplane.get_float(BARO).await?;
+            let fl = (self.transition_altitude_ft / 100.0).round() as i64;
+            return Ok(format!(
+                "Roger, above the transition altitude — altimeter standard, {actual:.2}. \
+                 (Local QNH below flight level {fl}.)"
+            ));
+        }
         let pa = ctx.xplane.get_float(crate::datarefs::QNH_PASCALS).await?;
         let inhg = (pa / PA_PER_INHG).clamp(28.0, 31.5);
         ctx.xplane.set_float(BARO, inhg).await?;

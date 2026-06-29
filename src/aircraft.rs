@@ -135,6 +135,17 @@ pub struct AircraftProfile {
     #[serde(default)]
     #[allow(dead_code)]
     pub retractable_gear: bool,
+    /// Transition altitude (ft MSL): at or above it, "set the altimeter" dials in
+    /// standard pressure (29.92 inHg / 1013 hPa) instead of local QNH — that's the
+    /// rule above the transition altitude. Defaults to 18,000 ft (US FL180); lower
+    /// it per-profile for regions with a lower transition altitude.
+    #[serde(default = "default_transition_altitude")]
+    pub transition_altitude_ft: f64,
+}
+
+/// US transition altitude (FL180). See [`AircraftProfile::transition_altitude_ft`].
+fn default_transition_altitude() -> f64 {
+    18_000.0
 }
 
 /// Fuel-endurance alert thresholds (minutes of fuel remaining at the current
@@ -501,6 +512,7 @@ fn cessna_172sp() -> AircraftProfile {
         id: "cessna_172sp".into(),
         display_name: "Cessna 172SP Skyhawk".into(),
         retractable_gear: false,
+        transition_altitude_ft: 18_000.0,
         autopilot: true,
         engine: true,
         throttle: false,
@@ -677,6 +689,7 @@ fn cirrus_sr22() -> AircraftProfile {
         id: "cirrus_sr22".into(),
         display_name: "Cirrus SR22".into(),
         retractable_gear: false,
+        transition_altitude_ft: 18_000.0,
         // Universal-dataref tools — safe across airframes.
         autopilot: true,
         barometer: true,
