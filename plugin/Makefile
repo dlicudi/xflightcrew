@@ -14,6 +14,7 @@ ARCHS    := -arch arm64 -arch x86_64
 CXXFLAGS := -std=c++17 -fPIC -fvisibility=hidden -O2 -mmacosx-version-min=11.0 \
             -Wno-deprecated-declarations \
             -DAPL=1 -DIBM=0 -DLIN=0 -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 \
+            -DXPLM400=1 -DXPLM410=1 \
             -I$(SDK)/CHeaders/XPLM -Ithird_party/imgui -Ithird_party/ImgWindow
 LDFLAGS  := -dynamiclib -mmacosx-version-min=11.0 -F$(SDK)/Libraries/Mac \
             -framework XPLM -framework OpenGL -framework ApplicationServices \

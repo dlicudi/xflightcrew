@@ -162,16 +162,26 @@ static void WriteFmsRoute(void*, void* in, int offset, int len) {
 }
 
 static void load_fms_route() {
-    // Clear the existing flight plan (high to low so indices stay valid).
-    for (int i = XPLMCountFMSEntries() - 1; i >= 0; --i) {
-        XPLMClearFMSEntry(i);
-    }
     char buf[sizeof g_fms_route.buf];
     std::strncpy(buf, g_fms_route.buf, sizeof buf);
     buf[sizeof buf - 1] = '\0';
 
     const XPLMNavType kTypes = xplm_Nav_Fix | xplm_Nav_VOR | xplm_Nav_NDB |
                                xplm_Nav_DME | xplm_Nav_Airport;
+
+    // X-Plane keeps two separate route structures: the legacy GPS flight plan
+    // (XPLMSetFMSEntry*) that the GA Garmins read, and the X-Plane 12 native FMS
+    // *primary* flight plan (XPLMSetFMSFlightPlanEntry*, xplm_Fpl_Pilot_Primary)
+    // that study CDUs like the MD-82 read — and which carries the ORIGIN/DEST
+    // airport fields. Populate BOTH so every airframe sees the route. Clear each
+    // high-to-low so indices stay valid as entries drop.
+    for (int i = XPLMCountFMSEntries() - 1; i >= 0; --i) {
+        XPLMClearFMSEntry(i);
+    }
+    for (int i = XPLMCountFMSFlightPlanEntries(xplm_Fpl_Pilot_Primary) - 1; i >= 0; --i) {
+        XPLMClearFMSFlightPlanEntry(xplm_Fpl_Pilot_Primary, i);
+    }
+
     int idx = 0;
     char* save1 = nullptr;
     for (char* tok = strtok_r(buf, "|", &save1); tok; tok = strtok_r(nullptr, "|", &save1)) {
@@ -185,24 +195,37 @@ static void load_fms_route() {
         float lon = static_cast<float>(std::atof(slon));
         int alt = salt ? std::atoi(salt) : 0;
         // Prefer the named navaid near this position; fall back to a lat/lon point.
+        // Airports resolved here become the CDU's ORIGIN (entry 0) and DEST (last).
         XPLMNavRef ref = XPLM_NAV_NOT_FOUND;
         if (ident && ident[0]) {
             ref = XPLMFindNavAid(nullptr, ident, &lat, &lon, nullptr, kTypes);
         }
         if (ref != XPLM_NAV_NOT_FOUND) {
             XPLMSetFMSEntryInfo(idx, ref, alt);
+            XPLMSetFMSFlightPlanEntryInfo(xplm_Fpl_Pilot_Primary, idx, ref, alt);
         } else {
             XPLMSetFMSEntryLatLon(idx, lat, lon, alt);
+            // Keep the ident on the native entry so the CDU labels the waypoint.
+            if (ident && ident[0]) {
+                XPLMSetFMSFlightPlanEntryLatLonWithId(
+                    xplm_Fpl_Pilot_Primary, idx, lat, lon, alt, ident,
+                    static_cast<unsigned int>(std::strlen(ident)));
+            } else {
+                XPLMSetFMSFlightPlanEntryLatLon(xplm_Fpl_Pilot_Primary, idx, lat, lon, alt);
+            }
         }
         idx++;
     }
     // Active leg = the first fix *after* the origin (entry 1), so we fly forward up
-    // the route rather than back to the departure airport at entry 0. The GPS then
-    // sequences onward by itself. (With a single entry, just target it.)
+    // the route rather than back to the departure airport at entry 0. The FMS then
+    // sequences onward by itself. (With a single entry, just target it.) Set it on
+    // both plans.
     if (idx > 1) {
         XPLMSetDestinationFMSEntry(1);
+        XPLMSetDestinationFMSFlightPlanEntry(xplm_Fpl_Pilot_Primary, 1);
     } else if (idx == 1) {
         XPLMSetDestinationFMSEntry(0);
+        XPLMSetDestinationFMSFlightPlanEntry(xplm_Fpl_Pilot_Primary, 0);
     }
     char msg[96];
     std::snprintf(msg, sizeof msg, "x-copilot plugin: loaded %d FMS waypoints\n", idx);
