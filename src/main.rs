@@ -26,7 +26,6 @@ mod stt_eval;
 mod tts;
 #[cfg(feature = "onnx-tts")]
 mod tts_onnx;
-mod tts_sidecar;
 mod tools;
 mod ui;
 mod vad;
@@ -108,8 +107,7 @@ async fn main() -> Result<()> {
     }
 
     // `cargo run -- transcribe <audio-file>` prints the whisper transcript of a
-    // clip to stdout and exits. Used by `voice/voices.py` to auto-caption an
-    // imported voice sample (Spark needs the reference text to match the audio).
+    // clip to stdout and exits — a small standalone whisper utility.
     if std::env::args().nth(1).as_deref() == Some("transcribe") {
         let path = std::env::args()
             .nth(2)

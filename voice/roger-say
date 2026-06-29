@@ -1,5 +1,0 @@
-#!/bin/zsh
-# Speak text in the cloned Roger voice. Override the venv with ROGER_PY if needed.
-PY="${ROGER_PY:-/tmp/mlxtts/bin/python}"
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec "$PY" "$DIR/voice/roger_say.py" "$@"

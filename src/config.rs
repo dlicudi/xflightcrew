@@ -38,10 +38,11 @@ pub struct Config {
     /// captures only while this key is held — works while X-Plane has focus, so no
     /// wake word and ambient/ATC can't trigger it. Empty = use `listen_mode`.
     pub ptt_key: String,
-    /// Push-to-talk dataref (e.g. `xcopilot/ptt_active`, set by the bundled X-Plane
-    /// plugin). When set, the copilot captures only while this dataref reads nonzero
-    /// — a button bound inside X-Plane drives it, so no macOS permission and no radio
-    /// keying. Empty = use `ptt_key`/`listen_mode`. Takes precedence over `ptt_key`.
+    /// Push-to-talk dataref (`xcopilot/ptt_active`, set by the bundled X-Plane
+    /// plugin) — **the default**. The copilot captures only while this dataref reads
+    /// nonzero, driven by a button bound inside X-Plane, so no macOS mic permission
+    /// and no radio keying. Set to empty (`XCOPILOT_PTT_DATAREF=`) to fall back to
+    /// `ptt_key`/`listen_mode`. Takes precedence over `ptt_key`.
     pub ptt_dataref: String,
     /// VAD energy threshold (RMS, 0.0..1.0). Above this counts as speech.
     /// Raise it in a noisy room, lower it if quiet speech is missed.
@@ -60,8 +61,7 @@ pub struct Config {
     pub ui: String,
     /// TTS backend: `onnx` (the default — warm in-process ONNX voice via `ort`,
     /// native arm64, see [`crate::tts_onnx`]; falls back to `say` if the model
-    /// can't load), `say` (macOS built-in), `piper` (subprocess), or `sidecar`
-    /// (Spark voice-clone Python server, see `voice/spark_sidecar.py`).
+    /// can't load), `say` (macOS built-in), or `piper` (subprocess).
     pub tts_backend: String,
     /// macOS `say` voice name (used when `tts_backend = "say"`). Empty = system
     /// default. List options with `say -v '?'` (e.g. `Daniel`, `Samantha`, `Karen`).
@@ -78,27 +78,6 @@ pub struct Config {
     pub piper_binary: String,
     /// Path to a piper voice model (`.onnx`); the matching `.onnx.json` must sit beside it.
     pub piper_voice: String,
-    /// URL of the Spark TTS sidecar (`tts_backend = "sidecar"`): POST readback
-    /// text, get back `audio/wav` in the cloned voice.
-    pub tts_sidecar_url: String,
-    /// Launch and supervise the Spark sidecar ourselves (default). Set false to
-    /// talk to one you started by hand at `tts_sidecar_url`.
-    pub tts_sidecar_autospawn: bool,
-    /// Python interpreter for the auto-spawned sidecar. Empty = auto-discover an
-    /// mlx-audio venv (e.g. `/tmp/mlxtts/bin/python`).
-    pub tts_sidecar_python: String,
-    /// How long to wait for the auto-spawned sidecar to load its model before
-    /// giving up and falling back to `say`. Generous: a first run downloads it.
-    pub tts_sidecar_ready_secs: u64,
-    /// Spark sampling temperature (0.0..1.0). Higher = more prosodic variation
-    /// (livelier, less droning); lower = flatter, more monotone. Forwarded to the
-    /// sidecar. Default 0.7 — 0.6 sounded depressed, 0.8 drifted (reference leaked
-    /// into synthesis); 0.7 balances liveliness against drift.
-    pub tts_sidecar_temp: String,
-    /// Default cloned voice for the sidecar (a name under `voice/voices/`). Empty
-    /// = let the sidecar default (its `.active` file, set by `voice/voices.py use`,
-    /// else `roger`). Forwarded to the sidecar as its env default.
-    pub voice: String,
     /// Path to X-Plane's `earth_nav.dat` (for ILS lookup).
     pub nav_data_path: String,
     /// Active aircraft profile id (see [`crate::aircraft`]), e.g. `cessna_172sp`.
@@ -140,7 +119,7 @@ impl Config {
             whisper_gpu: env_or("XCOPILOT_WHISPER_GPU", "true") != "false",
             listen_mode: env_or("XCOPILOT_LISTEN", "continuous"),
             ptt_key: env_or("XCOPILOT_PTT_KEY", ""),
-            ptt_dataref: env_or("XCOPILOT_PTT_DATAREF", ""),
+            ptt_dataref: env_or("XCOPILOT_PTT_DATAREF", "xcopilot/ptt_active"),
             vad_threshold: env_or("XCOPILOT_VAD_RMS", "0.012").parse().unwrap_or(0.012),
             stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.35").parse().unwrap_or(0.35),
             end_silence_ms: env_or("XCOPILOT_END_SILENCE_MS", "900").parse().unwrap_or(900),
@@ -151,14 +130,6 @@ impl Config {
             chime_path: env_or("XCOPILOT_CHIME", ""),
             piper_binary: env_or("PIPER_BIN", "piper"),
             piper_voice: env_or("PIPER_VOICE", "models/en_US-amy-medium.onnx"),
-            tts_sidecar_url: env_or("XCOPILOT_TTS_SIDECAR_URL", "http://127.0.0.1:8765/synth"),
-            tts_sidecar_autospawn: env_or("XCOPILOT_TTS_SIDECAR_AUTOSPAWN", "true") != "false",
-            tts_sidecar_python: env_or("XCOPILOT_TTS_SIDECAR_PYTHON", ""),
-            tts_sidecar_ready_secs: env_or("XCOPILOT_TTS_SIDECAR_READY_SECS", "90")
-                .parse()
-                .unwrap_or(90),
-            tts_sidecar_temp: env_or("XCOPILOT_TTS_SIDECAR_TEMP", "0.6"),
-            voice: env_or("XCOPILOT_VOICE", ""),
             nav_data_path: env_or(
                 "XPLANE_NAV_DATA",
                 "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_nav.dat",

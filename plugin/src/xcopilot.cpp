@@ -305,32 +305,6 @@ static void load_fms_route() {
     char msg[96];
     std::snprintf(msg, sizeof msg, "x-copilot plugin: loaded %d FMS waypoints\n", idx);
     XPLMDebugString(msg);
-
-    // Diagnostic: read back the native primary plan's first (ORIGIN) and last
-    // (DEST) entries so we can see whether the airports actually landed in it and
-    // resolved as airport navaids (type 1) — the CDU's ORIGIN/DEST want airports.
-    {
-        int n = XPLMCountFMSFlightPlanEntries(xplm_Fpl_Pilot_Primary);
-        char dbg[256];
-        std::snprintf(dbg, sizeof dbg, "x-copilot plugin: native plan has %d entries\n", n);
-        XPLMDebugString(dbg);
-        int probes[2] = {0, n - 1};
-        for (int p = 0; p < 2; ++p) {
-            int i = probes[p];
-            if (i < 0) continue;
-            XPLMNavType ty = 0;
-            char id[256];
-            id[0] = '\0';
-            XPLMNavRef ref = XPLM_NAV_NOT_FOUND;
-            int al = 0;
-            float la = 0.f, lo = 0.f;
-            XPLMGetFMSFlightPlanEntryInfo(xplm_Fpl_Pilot_Primary, i, &ty, id, &ref, &al, &la, &lo);
-            std::snprintf(dbg, sizeof dbg,
-                          "x-copilot plugin: entry %d type=%d id=%s ref=%d lat=%.3f lon=%.3f\n",
-                          i, static_cast<int>(ty), id, static_cast<int>(ref), la, lo);
-            XPLMDebugString(dbg);
-        }
-    }
 }
 
 static int ReadFmsLoad(void*) { return g_fms_load; }
