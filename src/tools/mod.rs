@@ -137,6 +137,7 @@ impl Registry {
         // Turbine start sequence (jets) — distinct from the piston one-shot start.
         if profile.turbine_start {
             tools.push(Box::new(jet_start::StartEngines));
+            tools.push(Box::new(jet_start::StopEngines));
         }
         // Procedural electrical power-up (step-by-step with callouts).
         if profile.auto_prep {

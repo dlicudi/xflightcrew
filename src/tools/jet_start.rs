@@ -165,3 +165,46 @@ fn cap(s: &str) -> String {
     let mut c = s.chars();
     c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
 }
+
+const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
+
+/// Shut the jet engines down — cut both fuel levers. Gated hard against doing it
+/// in flight: an airborne "engines off" is a refusal, not an action. Without this
+/// tool the LLM has nothing to map "engines off" to on a jet and improvises a
+/// nonsensical multi-tool cascade, so the tool exists mainly to absorb the intent
+/// and answer it safely.
+pub struct StopEngines;
+
+#[async_trait]
+impl Tool for StopEngines {
+    fn name(&self) -> &str {
+        "stop_engines"
+    }
+    fn description(&self) -> &str {
+        "Shut the jet engines down (cut the fuel levers). Use for 'shut down the \
+         engines', 'engines off', 'shut the engines down', 'cut the engines', 'kill \
+         the engines', 'secure the engines'. Refused in flight."
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    fn confirm_prompt(&self, _args: &Value) -> Option<String> {
+        Some("shut both engines down".to_string())
+    }
+    async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        // Safety gate: never shut the engines down airborne. Default to airborne if
+        // the read fails, so an unknown state errs safe.
+        if ctx.xplane.get_float(ON_GROUND).await.unwrap_or(0.0) <= 0.5 {
+            return Ok("Negative, we're airborne. I will not shut the engines down in flight.".to_string());
+        }
+        if let Ok(r) = ctx.xplane.get_float_array(ENGN_RUNNING).await {
+            if r.len() >= 2 && r.iter().take(2).all(|&v| v < 0.5) {
+                return Ok("Engines are already shut down.".to_string());
+            }
+        }
+        // Cut both fuel levers (the start sequence raises these to 1 to run).
+        ctx.xplane.set_float_array_elem(MIXTURE, 0, 0.0).await.ok();
+        ctx.xplane.set_float_array_elem(MIXTURE, 1, 0.0).await.ok();
+        Ok("Fuel levers cut, both engines shutting down.".to_string())
+    }
+}
