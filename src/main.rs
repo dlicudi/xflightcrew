@@ -225,10 +225,19 @@ async fn main() -> Result<()> {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             rt.block_on(async move {
                 let xp = XPlaneClient::new(base);
+                // The last ICAO shown on the panel, so it's published once and on change.
+                let mut shown = String::new();
                 loop {
                     if let Ok(icao) = xp.aircraft_icao().await {
                         let icao = icao.trim().to_string();
                         if !icao.is_empty() {
+                            // Mirror the ICAO to the panel (beside the connection chip).
+                            if icao != shown {
+                                if let Some(s) = det_status.as_ref() {
+                                    s.aircraft(&icao);
+                                }
+                                shown = icao.clone();
+                            }
                             let id = icao_to_profile(&icao);
                             if id != live.id() {
                                 if let Some(p) = aircraft::load(&id) {

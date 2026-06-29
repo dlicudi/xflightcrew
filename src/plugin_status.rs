@@ -22,6 +22,7 @@ const DR_PHASE: &str = "xcopilot/status/phase";
 const DR_HEARD: &str = "xcopilot/status/heard";
 const DR_ACTION: &str = "xcopilot/status/action";
 const DR_ALERT: &str = "xcopilot/status/alert";
+const DR_AIRCRAFT: &str = "xcopilot/status/aircraft";
 
 /// Keep text within the plugin's fixed display buffer (512 bytes, NUL-terminated)
 /// — long enough for a full engine/weather summary readback.
@@ -37,6 +38,8 @@ enum Update {
     Action(String),
     /// A monitor callout or command-loop warning, with its severity.
     Alert(AlertLevel, String),
+    /// The active aircraft's ICAO code, shown beside the connection chip.
+    Aircraft(String),
 }
 
 /// Severity of a panel alert — drives the chip colour/label in the plugin.
@@ -88,6 +91,10 @@ impl StatusSink {
     pub fn alert(&self, level: AlertLevel, text: &str) {
         let _ = self.0.send(Update::Alert(level, clip(text)));
     }
+    /// The active aircraft's ICAO code (e.g. "MD82"), uppercased for the panel chip.
+    pub fn aircraft(&self, code: &str) {
+        let _ = self.0.send(Update::Aircraft(code.trim().to_uppercase()));
+    }
 }
 
 /// Scrub em/en dashes (the panel font can't render them) and trim to the plugin
@@ -120,6 +127,7 @@ fn run(base: String, rx: Receiver<Update>) {
     let heard_id = resolve_id(&http, &rest, DR_HEARD);
     let action_id = resolve_id(&http, &rest, DR_ACTION);
     let alert_id = resolve_id(&http, &rest, DR_ALERT);
+    let aircraft_id = resolve_id(&http, &rest, DR_AIRCRAFT);
     if phase_id.is_none() && heard_id.is_none() && action_id.is_none() {
         tracing::debug!("plugin_status: status datarefs not found (plugin not loaded?)");
     }
@@ -143,6 +151,7 @@ fn run(base: String, rx: Receiver<Update>) {
                 let payload = format!("{}{}", level.code(), text);
                 (alert_id, json!(STANDARD.encode(payload.as_bytes())))
             }
+            Ok(Update::Aircraft(code)) => (aircraft_id, json!(STANDARD.encode(code.as_bytes()))),
             Err(RecvTimeoutError::Timeout) => (phase_id, json!(last_phase)), // heartbeat
             Err(RecvTimeoutError::Disconnected) => break,
         };

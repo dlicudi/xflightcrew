@@ -67,11 +67,13 @@ static int g_phase = 0;
 static TextRef g_heard = {{0}, 0};
 static TextRef g_action = {{0}, 0};
 static TextRef g_alert = {{0}, 0};
+static TextRef g_aircraft = {{0}, 0};
 
 static XPLMDataRef g_phase_dref = nullptr;
 static XPLMDataRef g_heard_dref = nullptr;
 static XPLMDataRef g_action_dref = nullptr;
 static XPLMDataRef g_alert_dref = nullptr;
+static XPLMDataRef g_aircraft_dref = nullptr;
 
 // Transmission log shown in the panel.
 struct LogEntry { std::string tag; ImU32 color; std::string text; };
@@ -122,6 +124,10 @@ static void WriteHeard(void*, void* in, int offset, int len) {
 static void WriteAction(void*, void* in, int offset, int len) {
     StoreText(&g_action, in, offset, len);
     AppendLog("ROGER", COL_GREEN, g_action.buf);
+}
+// Active aircraft ICAO — shown beside the connection chip, not logged.
+static void WriteAircraft(void*, void* in, int offset, int len) {
+    StoreText(&g_aircraft, in, offset, len);
 }
 static void WriteAlert(void*, void* in, int offset, int len) {
     StoreText(&g_alert, in, offset, len);
@@ -272,6 +278,11 @@ protected:
         ImGui::SameLine();
         if (connected) {
             Chip(PhaseLabel(g_phase), PhaseColor(g_phase));
+            // Detected aircraft profile (ICAO), beside the connection chip.
+            if (g_aircraft.len > 0) {
+                ImGui::SameLine();
+                Chip(g_aircraft.buf, COL_CYAN);
+            }
         } else {
             Chip("NOT CONNECTED", COL_RED);
         }
@@ -341,6 +352,10 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         "xcopilot/status/alert", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteAlert, &g_alert, &g_alert);
+    g_aircraft_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/aircraft", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteAircraft, &g_aircraft, &g_aircraft);
     g_fms_route_dref = XPLMRegisterDataAccessor(
         "xcopilot/fms/route", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -372,6 +387,7 @@ PLUGIN_API void XPluginStop(void) {
     if (g_menu) { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
     if (g_fms_load_dref) { XPLMUnregisterDataAccessor(g_fms_load_dref); g_fms_load_dref = nullptr; }
     if (g_fms_route_dref) { XPLMUnregisterDataAccessor(g_fms_route_dref); g_fms_route_dref = nullptr; }
+    if (g_aircraft_dref) { XPLMUnregisterDataAccessor(g_aircraft_dref); g_aircraft_dref = nullptr; }
     if (g_alert_dref) { XPLMUnregisterDataAccessor(g_alert_dref); g_alert_dref = nullptr; }
     if (g_action_dref) { XPLMUnregisterDataAccessor(g_action_dref); g_action_dref = nullptr; }
     if (g_heard_dref) { XPLMUnregisterDataAccessor(g_heard_dref); g_heard_dref = nullptr; }
