@@ -66,11 +66,15 @@ impl OnnxTts {
             })
             .collect();
 
+        // VITS inference scales, from the voice's json but overridable by env so the
+        // voice can be tuned live without re-vendoring the model. `noise_scale` =
+        // timbre/pitch variation, `length_scale` = pace (lower is faster/peppier),
+        // `noise_w` = rhythm variation. Nudging a flat voice: length down, noise_w up.
         let inf = &cfg["inference"];
         let scales = [
-            inf["noise_scale"].as_f64().unwrap_or(0.667) as f32,
-            inf["length_scale"].as_f64().unwrap_or(1.0) as f32,
-            inf["noise_w"].as_f64().unwrap_or(0.8) as f32,
+            env_scale("XCOPILOT_TTS_NOISE", inf["noise_scale"].as_f64().unwrap_or(0.667)),
+            env_scale("XCOPILOT_TTS_LENGTH", inf["length_scale"].as_f64().unwrap_or(1.0)),
+            env_scale("XCOPILOT_TTS_NOISE_W", inf["noise_w"].as_f64().unwrap_or(0.8)),
         ];
 
         Ok(Self { session, phoneme_ids, sample_rate, scales })
@@ -124,6 +128,12 @@ impl OnnxTts {
         write_wav(&wav, &samples, self.sample_rate)?;
         crate::tts::play(&wav)
     }
+}
+
+/// A VITS scale: the env override (`name`) if set and parseable, else the voice's
+/// own value. Lets the voice be tuned from `.env` without editing the model json.
+fn env_scale(name: &str, default: f64) -> f32 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(default as f32)
 }
 
 /// Phonemize with espeak-ng (IPA) — the phonemizer piper itself uses.

@@ -117,6 +117,24 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `cargo run -- tts ["phrase"]` synthesizes one phrase with the configured ONNX
+    // voice (honouring the XCOPILOT_TTS_LENGTH/NOISE/NOISE_W scale overrides) and
+    // plays it — an audition tool for tuning the voice without launching the loop.
+    #[cfg(feature = "onnx-tts")]
+    if std::env::args().nth(1).as_deref() == Some("tts") {
+        let text = std::env::args().nth(2).unwrap_or_else(|| {
+            "Roger, flaps up. Gear down, three green. Caution, fuel endurance forty minutes.".into()
+        });
+        let mut engine = tts_onnx::OnnxTts::load(&config.piper_voice)?;
+        eprintln!("voice: {}  (length={} noise={} noise_w={})",
+            config.piper_voice,
+            std::env::var("XCOPILOT_TTS_LENGTH").unwrap_or_else(|_| "model".into()),
+            std::env::var("XCOPILOT_TTS_NOISE").unwrap_or_else(|_| "model".into()),
+            std::env::var("XCOPILOT_TTS_NOISE_W").unwrap_or_else(|_| "model".into()));
+        engine.speak(&text)?;
+        return Ok(());
+    }
+
     // `cargo run -- analyze` mines the logs for fast-path coverage and the
     // ranked LLM-fallback phrasings — the candidates to promote into the
     // deterministic grammar so coverage ratchets up over time.
