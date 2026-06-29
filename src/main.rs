@@ -117,6 +117,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `cargo run -- onnx-info <model>` dumps an ONNX model's input/output signature.
+    #[cfg(feature = "onnx-tts")]
+    if std::env::args().nth(1).as_deref() == Some("onnx-info") {
+        let path = std::env::args().nth(2).ok_or_else(|| anyhow!("usage: x-copilot onnx-info <model.onnx>"))?;
+        println!("{}", tts_onnx::inspect(&path)?);
+        return Ok(());
+    }
+
     // `cargo run -- tts ["phrase"]` synthesizes one phrase with the configured ONNX
     // voice (honouring the XCOPILOT_TTS_LENGTH/NOISE/NOISE_W scale overrides) and
     // plays it — an audition tool for tuning the voice without launching the loop.
@@ -125,13 +133,19 @@ async fn main() -> Result<()> {
         let text = std::env::args().nth(2).unwrap_or_else(|| {
             "Roger, flaps up. Gear down, three green. Caution, fuel endurance forty minutes.".into()
         });
-        let mut engine = tts_onnx::OnnxTts::load(&config.piper_voice)?;
-        eprintln!("voice: {}  (length={} noise={} noise_w={})",
-            config.piper_voice,
-            std::env::var("XCOPILOT_TTS_LENGTH").unwrap_or_else(|_| "model".into()),
-            std::env::var("XCOPILOT_TTS_NOISE").unwrap_or_else(|_| "model".into()),
-            std::env::var("XCOPILOT_TTS_NOISE_W").unwrap_or_else(|_| "model".into()));
-        engine.speak(&text)?;
+        // Kokoro model → Kokoro engine (voice via XCOPILOT_KOKORO_VOICE); else piper.
+        if config.piper_voice.contains("kokoro") {
+            let voice = std::env::var("XCOPILOT_KOKORO_VOICE").unwrap_or_else(|_| "am_michael".into());
+            eprintln!("kokoro: {} voice={}", config.piper_voice, voice);
+            tts_onnx::KokoroTts::load(&config.piper_voice, &voice)?.speak(&text)?;
+        } else {
+            eprintln!("voice: {}  (length={} noise={} noise_w={})",
+                config.piper_voice,
+                std::env::var("XCOPILOT_TTS_LENGTH").unwrap_or_else(|_| "model".into()),
+                std::env::var("XCOPILOT_TTS_NOISE").unwrap_or_else(|_| "model".into()),
+                std::env::var("XCOPILOT_TTS_NOISE_W").unwrap_or_else(|_| "model".into()));
+            tts_onnx::OnnxTts::load(&config.piper_voice)?.speak(&text)?;
+        }
         return Ok(());
     }
 

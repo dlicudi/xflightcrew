@@ -130,6 +130,117 @@ impl OnnxTts {
     }
 }
 
+/// Kokoro-82M TTS — a more natural/expressive voice than piper, in the same warm
+/// in-process ONNX session. Different I/O than piper VITS: it takes `tokens`
+/// (phoneme ids wrapped with 0), a 256-d `style` vector for the chosen voice, and
+/// a `speed` scalar, and emits 24 kHz audio. Phonemes come from the shared espeak
+/// path; ids map through Kokoro's own vocab (kokoro-config.json). The per-voice
+/// style table is pre-extracted to models/kokoro-voices/<voice>.bin ([510,256] f32,
+/// indexed by phoneme count — Kokoro picks the style row matching the token length).
+pub struct KokoroTts {
+    session: Session,
+    vocab: HashMap<char, i64>,
+    style_rows: Vec<f32>, // 510 * 256 f32 for the selected voice
+}
+
+const KOKORO_SR: u32 = 24_000;
+const KOKORO_STYLE_DIM: usize = 256;
+const KOKORO_MAX_ROWS: usize = 510;
+
+impl KokoroTts {
+    /// Load the Kokoro model, its vocab (sibling `kokoro-config.json`), and a
+    /// voice's style table (`models/kokoro-voices/<voice>.bin`).
+    pub fn load(model_path: &str, voice: &str) -> Result<Self> {
+        let session = Session::builder()
+            .map_err(|e| anyhow!("ort session builder: {e}"))?
+            .commit_from_file(model_path)
+            .map_err(|e| anyhow!("loading Kokoro {model_path}: {e}"))?;
+
+        let dir = Path::new(model_path).parent().unwrap_or_else(|| Path::new("."));
+        let cfg_path = dir.join("kokoro-config.json");
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&cfg_path).with_context(|| format!("reading {cfg_path:?}"))?,
+        )?;
+        let vocab = cfg["vocab"]
+            .as_object()
+            .ok_or_else(|| anyhow!("{cfg_path:?}: missing vocab"))?
+            .iter()
+            .filter_map(|(k, v)| {
+                let mut ch = k.chars();
+                match (ch.next(), ch.next()) {
+                    (Some(c), None) => v.as_i64().map(|id| (c, id)),
+                    _ => None, // skip any multi-char vocab keys
+                }
+            })
+            .collect();
+
+        let style_path = dir.join("kokoro-voices").join(format!("{voice}.bin"));
+        let bytes = std::fs::read(&style_path)
+            .with_context(|| format!("reading Kokoro voice {style_path:?} (pre-extracted f32)"))?;
+        let style_rows: Vec<f32> =
+            bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        if style_rows.len() < KOKORO_STYLE_DIM {
+            bail!("Kokoro voice {voice} style table too small ({} floats)", style_rows.len());
+        }
+
+        Ok(Self { session, vocab, style_rows })
+    }
+
+    /// Synthesize to mono 24 kHz `f32` samples.
+    pub fn synth(&mut self, text: &str) -> Result<Vec<f32>> {
+        let phonemes = phonemize(text)?;
+        let ids: Vec<i64> =
+            phonemes.chars().filter_map(|c| self.vocab.get(&c).copied()).collect();
+        if ids.is_empty() {
+            bail!("no Kokoro tokens for {text:?} (phonemized to {phonemes:?})");
+        }
+        // Style row is indexed by phoneme count (clamped to the table).
+        let row = ids.len().min(KOKORO_MAX_ROWS - 1);
+        let style = self.style_rows[row * KOKORO_STYLE_DIM..(row + 1) * KOKORO_STYLE_DIM].to_vec();
+
+        // tokens = 0, <phoneme ids>, 0
+        let mut tokens = Vec::with_capacity(ids.len() + 2);
+        tokens.push(0);
+        tokens.extend_from_slice(&ids);
+        tokens.push(0);
+        let n = tokens.len() as i64;
+
+        let outputs = self.session.run(ort::inputs![
+            "tokens" => Tensor::from_array(([1_i64, n], tokens))?,
+            "style" => Tensor::from_array(([1_i64, KOKORO_STYLE_DIM as i64], style))?,
+            "speed" => Tensor::from_array(([1_i64], vec![1.0_f32]))?,
+        ])?;
+        let (_shape, data) = outputs[0].try_extract_tensor::<f32>()?;
+        Ok(data.to_vec())
+    }
+
+    /// Synthesize and play. Session stays warm for the next call.
+    pub fn speak(&mut self, text: &str) -> Result<()> {
+        let samples = self.synth(text)?;
+        let wav = std::env::temp_dir().join("x-copilot-kokoro.wav");
+        write_wav(&wav, &samples, KOKORO_SR)?;
+        crate::tts::play(&wav)
+    }
+}
+
+/// Dump an ONNX model's input/output signature — used to wire up a new model
+/// (e.g. Kokoro, whose I/O differs from piper VITS). `cargo run -- onnx-info <m>`.
+pub fn inspect(model_path: &str) -> Result<String> {
+    let session = Session::builder()
+        .map_err(|e| anyhow!("ort session builder: {e}"))?
+        .commit_from_file(model_path)
+        .map_err(|e| anyhow!("loading {model_path}: {e}"))?;
+    let mut s = format!("model: {model_path}\nINPUTS:\n");
+    for i in session.inputs() {
+        s.push_str(&format!("  {:<12} {:?}\n", i.name(), i.dtype()));
+    }
+    s.push_str("OUTPUTS:\n");
+    for o in session.outputs() {
+        s.push_str(&format!("  {:<12} {:?}\n", o.name(), o.dtype()));
+    }
+    Ok(s)
+}
+
 /// A VITS scale: the env override (`name`) if set and parseable, else the voice's
 /// own value. Lets the voice be tuned from `.env` without editing the model json.
 fn env_scale(name: &str, default: f64) -> f32 {
@@ -139,8 +250,10 @@ fn env_scale(name: &str, default: f64) -> f32 {
 /// Spoken names for A–Z, so acronyms spelled letter-by-letter ("A P U", "C H T")
 /// are read as letters. espeak-ng otherwise reads a lone "A" as a schwa ("uh"),
 /// turning "A P U" into "uh-pee-you" (sounds like "P.U.").
+// Spellings chosen so espeak-ng pronounces each as the letter NAME: "eigh" → /eɪ/
+// (a plain "ay" comes out /aɪ/ = "I", and "eff" doubles to "ee-eff"), etc.
 const LETTER_NAMES: [&str; 26] = [
-    "ay", "bee", "see", "dee", "ee", "eff", "jee", "aitch", "eye", "jay", "kay", "el", "em", "en",
+    "eigh", "bee", "see", "dee", "ee", "ef", "jee", "aitch", "eye", "jay", "kay", "el", "em", "en",
     "oh", "pee", "cue", "ar", "ess", "tee", "you", "vee", "double you", "ex", "why", "zee",
 ];
 
