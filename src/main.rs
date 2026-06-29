@@ -2397,6 +2397,7 @@ fn undoable_drefs(tool: &str) -> &'static [Undoable] {
     match tool {
         "set_flaps" => &[("sim/cockpit2/controls/flap_ratio", "flaps", F)],
         "gear" => &[("sim/cockpit2/controls/gear_handle_down", "the gear", F)],
+        "speedbrake" => &[("sim/cockpit2/controls/speedbrake_ratio", "the speedbrakes", F)],
         "set_throttle" => &[("sim/cockpit2/engine/actuators/throttle_ratio_all", "throttle", F)],
         "set_mixture" | "lean_mixture" => &[("sim/cockpit2/engine/actuators/mixture_ratio_all", "mixture", F)],
         "set_pitch_trim" => &[("sim/cockpit2/controls/elevator_trim", "pitch trim", F)],
@@ -2475,6 +2476,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "ascend", "ascent", "speed",
     // airliner autoflight: AP speed select + autothrottle
     "airspeed", "autothrottle",
+    // speedbrakes / spoilers
+    "speedbrake", "speedbrakes", "spoiler", "spoilers",
     // lights
     "light", "lights", "beacon", "strobe", "strobes", "taxi", "landing", "nav",
     "navigation", "flood", "floods",

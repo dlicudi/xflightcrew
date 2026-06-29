@@ -111,6 +111,62 @@ impl Tool for SetPitchTrim {
     }
 }
 
+/// Speedbrake/spoiler lever: 1 = fully extended, 0 = stowed, -0.5 = armed (auto
+/// deploy on touchdown). The MD-82 uses this standard, writable dataref.
+const SPEEDBRAKE: &str = "sim/cockpit2/controls/speedbrake_ratio";
+
+pub struct SetSpeedbrake;
+
+#[derive(Deserialize)]
+struct SpeedbrakeArgs {
+    /// "extend", "retract", or "arm".
+    action: String,
+}
+
+#[async_trait]
+impl Tool for SetSpeedbrake {
+    fn name(&self) -> &str {
+        "speedbrake"
+    }
+
+    fn description(&self) -> &str {
+        "Extend, retract, or arm the speedbrakes (spoilers). Use for 'speedbrakes \
+         out', 'speedbrakes extend', 'deploy the speedbrakes', 'speedbrakes in', \
+         'speedbrakes retract', 'stow the speedbrakes', 'arm the speedbrakes', \
+         'speed brakes up', 'spoilers up'."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["extend", "retract", "arm"]}
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let a: SpeedbrakeArgs = serde_json::from_value(args.clone())?;
+        let (target, word) = match a.action.to_ascii_lowercase().as_str() {
+            "extend" | "deploy" | "out" | "up" => (1.0, "extended"),
+            "retract" | "stow" | "in" | "down" => (0.0, "retracted"),
+            "arm" => (-0.5, "armed"),
+            other => return Ok(format!("I can extend, retract, or arm the speedbrakes, not '{other}'.")),
+        };
+        ctx.xplane.set_float(SPEEDBRAKE, target).await?;
+        let actual = ctx.xplane.get_float(SPEEDBRAKE).await.unwrap_or(target);
+        let state = if actual > 0.05 {
+            "extended"
+        } else if actual < -0.05 {
+            "armed"
+        } else {
+            "retracted"
+        };
+        Ok(format!("Speedbrakes {state}.", state = if state == word { word } else { state }))
+    }
+}
+
 /// Spoken description of a trim position.
 fn describe_trim(t: f64) -> String {
     let pct = (t.abs() * 100.0).round();

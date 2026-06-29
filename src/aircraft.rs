@@ -71,6 +71,10 @@ pub struct AircraftProfile {
     /// `autothrottle` (engage/disengage). For jets with an autothrottle.
     #[serde(default)]
     pub autothrottle: bool,
+    /// Speedbrakes/spoilers (`speedbrake` extend/retract/arm). For aircraft that
+    /// have them (the GA singles don't).
+    #[serde(default)]
+    pub speedbrake: bool,
     /// Adjustable altimeter (`set_barometer`).
     #[serde(default)]
     pub barometer: bool,
@@ -498,6 +502,7 @@ fn cessna_172sp() -> AircraftProfile {
         turbine_start: false,
         auto_prep: false,
         autothrottle: false,
+        speedbrake: false,
         barometer: true,
         directional_gyro: true,
         com_radio: true,
@@ -684,6 +689,7 @@ fn cirrus_sr22() -> AircraftProfile {
         turbine_start: false,
         auto_prep: false,
         autothrottle: false,
+        speedbrake: false,
         // Dual battery/alternator + avionics — datarefs/commands verified against
         // the rustdecks SR22 deck.
         electrical: {

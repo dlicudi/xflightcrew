@@ -17,6 +17,7 @@ throttle: true         # set_throttle (thrust levers) — jet, so NO piston engi
 turbine_start: true    # start_engines (bleed/fuel/ignition/crank sequence)
 auto_prep: true        # power_up — "all electrical on" run as individual steps
 autothrottle: true     # set_speed (AP speed bug) + autothrottle on/off
+speedbrake: true       # speedbrake extend/retract/arm
 barometer: true        # set_barometer
 pitot_heat: true       # set_pitot_heat
 pitch_trim: true       # set_pitch_trim (the checklist sets elevator_trim)

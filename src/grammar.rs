@@ -239,6 +239,18 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("request_service", json!({})));
     }
 
+    // speedbrakes / spoilers: extend / retract / arm.
+    if t.contains("speedbrake") || t.contains("speed brake") || has(t, "spoiler") || has(t, "spoilers") {
+        let action = if has(t, "arm") {
+            "arm"
+        } else if has(t, "out") || t.contains("extend") || t.contains("deploy") || has(t, "up") {
+            "extend"
+        } else {
+            "retract" // in / retract / stow / down
+        };
+        return Some(call("speedbrake", json!({ "action": action })));
+    }
+
     // gear up / down (retractable-gear airframes; the tool itself gates on-ground).
     if has(t, "gear") {
         if has(t, "up") || t.contains("retract") || t.contains("raise") {

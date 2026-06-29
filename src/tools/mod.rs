@@ -178,6 +178,10 @@ impl Registry {
             tools.push(Box::new(controls::SetPitchTrim));
         }
 
+        if profile.speedbrake {
+            tools.push(Box::new(controls::SetSpeedbrake));
+        }
+
         if profile.pitot_heat {
             tools.push(Box::new(instruments::SetPitotHeat));
         }
