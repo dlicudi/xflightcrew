@@ -424,6 +424,18 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return None;
     }
 
+    // "power up" / "powering up" / "bring the electrical up" → bring everything up.
+    // No on/off token, so it'd otherwise miss the block below and fall to the LLM.
+    // The main loop remaps set_electrical:all to the step-by-step power_up tool on
+    // airframes that have it (auto_prep); on a GA single it just switches all on.
+    if t.contains("power up")
+        || t.contains("powering up")
+        || t.contains("power the aircraft")
+        || (has(t, "bring") && (has(t, "electrical") || has(t, "electrics")))
+    {
+        return Some(call("set_electrical", json!({ "system": "all", "on": true })));
+    }
+
     // <system> on/off
     if let Some(on) = onoff(t) {
         for (kw, key) in [
@@ -692,6 +704,10 @@ mod tests {
         assert_eq!(one("descend 500").unwrap().1, json!({"fpm":-500}));
         assert_eq!(one("climb 500").unwrap().1, json!({"fpm":500}));
         assert_eq!(one("avionics on").unwrap(), ("set_electrical".into(), json!({"system":"avionics","on":true})));
+        // "power up" has no on/off token but must still resolve deterministically
+        // (the main loop remaps set_electrical:all → power_up on auto_prep airframes).
+        assert_eq!(one("power up").unwrap(), ("set_electrical".into(), json!({"system":"all","on":true})));
+        assert_eq!(one("powering up the aircraft").unwrap().0, "set_electrical");
         assert_eq!(one("landing lights off").unwrap(), ("set_lights".into(), json!({"light":"landing","on":false})));
         assert_eq!(one("strobes off").unwrap().1, json!({"light":"strobe","on":false}));
         assert_eq!(one("start the engine").unwrap().0, "start_engine");
