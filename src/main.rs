@@ -1147,8 +1147,22 @@ async fn run_checklist(
                         say(voice, reporter, ui::LogKind::Readback, &format!("{line} Confirmed."))
                     }
                     Some(_) => {
-                        say(voice, reporter, ui::LogKind::Warn, &format!("{line} Not set — check it."));
-                        failed += 1;
+                        // Not in the desired state — go ahead and set it to the
+                        // checklist's own target value (it's the authored procedure,
+                        // not an arbitrary write), then confirm. If the write doesn't
+                        // take (a read-only/xlua dataref), fall back to flagging it.
+                        let target = cond.target();
+                        let wrote = match index {
+                            Some(i) => xplane.set_float_array_elem(dataref, *i, target).await.is_ok(),
+                            None => xplane.set_float(dataref, target).await.is_ok(),
+                        };
+                        let now = checklist::read_dataref(xplane, dataref, *index).await;
+                        if wrote && now.is_some_and(|v| cond.eval(v)) {
+                            say(voice, reporter, ui::LogKind::Readback, &format!("{line} Set."));
+                        } else {
+                            say(voice, reporter, ui::LogKind::Warn, &format!("{line} Couldn't set it — check it."));
+                            failed += 1;
+                        }
                     }
                     // Couldn't read it — just call it out, don't flag.
                     None => say(voice, reporter, ui::LogKind::Confirm, line),

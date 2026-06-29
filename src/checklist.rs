@@ -91,7 +91,7 @@ impl Cond {
 
     /// A representative value that satisfies the condition — used to derive a
     /// target when acting (e.g. a throttle range → its midpoint).
-    fn target(&self) -> f64 {
+    pub(crate) fn target(&self) -> f64 {
         match *self {
             Cond::Eq(n) | Cond::Ne(n) => n,
             Cond::Range(a, b) => (a + b) / 2.0,
@@ -125,7 +125,8 @@ pub enum Item {
     /// `confirm` is `Some(hazard)` for destructive steps (engine start/stop, the
     /// run-up) — the runner asks "Confirm, {hazard}?" and skips on a no.
     Act { say: String, tool: &'static str, args: Value, confirm: Option<&'static str> },
-    /// A dataref we don't actuate but can read: confirm or flag it.
+    /// A dataref outside our curated tools: read it, and if it's not in the
+    /// checklist's desired state, set it to the condition's target (then confirm).
     Verify { say: String, dataref: String, index: Option<usize>, cond: Cond },
 }
 
