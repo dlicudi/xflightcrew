@@ -239,6 +239,16 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("request_service", json!({})));
     }
 
+    // gear up / down (retractable-gear airframes; the tool itself gates on-ground).
+    if has(t, "gear") {
+        if has(t, "up") || t.contains("retract") || t.contains("raise") {
+            return Some(call("gear", json!({ "position": "up" })));
+        }
+        if has(t, "down") || t.contains("lower") || t.contains("extend") {
+            return Some(call("gear", json!({ "position": "down" })));
+        }
+    }
+
     // flaps up / ten / twenty / full
     if has(t, "flaps") || has(t, "flap") {
         let notch = if has(t, "up") {
@@ -583,6 +593,18 @@ mod tests {
         assert!(one("tell me the altitude").map(|c| c.0) != Some("set_reminder".into()));
         // A complaint must not arm a new reminder.
         assert!(one("you didn't remind me of the last waypoint").map(|c| c.0) != Some("set_reminder".into()));
+    }
+
+    #[test]
+    fn gear_resolves_deterministically() {
+        // The 172 has no gear tool, so use a retractable airframe (MD-82).
+        let prof = aircraft::load("md82").expect("md82");
+        let reg = Registry::for_aircraft(&prof);
+        let g = |t: &str| try_parse(t, &reg, &prof).map(|mut v| { let c = v.remove(0); (c.name, c.arguments) });
+        assert_eq!(g("gear up").unwrap(), ("gear".into(), json!({"position":"up"})));
+        assert_eq!(g("gear down").unwrap(), ("gear".into(), json!({"position":"down"})));
+        assert_eq!(g("positive rate, gear up").unwrap().1, json!({"position":"up"}));
+        assert_eq!(g("put the gear down for landing").unwrap().1, json!({"position":"down"}));
     }
 
     #[test]

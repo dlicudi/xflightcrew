@@ -16,6 +16,7 @@ pub mod controls;
 pub mod electrical;
 pub mod engine;
 pub mod flaps;
+pub mod gear;
 pub mod ground;
 pub mod instruments;
 pub mod lights;
@@ -105,6 +106,10 @@ impl Registry {
             tools.push(Box::new(flaps::SetFlaps::new(flaps.clone())));
         }
 
+        if profile.retractable_gear {
+            tools.push(Box::new(gear::Gear));
+        }
+
         if !profile.lights.is_empty() {
             tools.push(Box::new(lights::SetLights::new(profile.lights.clone())));
         }
@@ -123,8 +128,11 @@ impl Registry {
             tools.push(Box::new(autopilot::AutopilotOff));
         }
 
-        if profile.engine {
+        // Thrust levers: any piston engine, or a turbine that declares `throttle`.
+        if profile.engine || profile.throttle {
             tools.push(Box::new(engine::SetThrottle));
+        }
+        if profile.engine {
             tools.push(Box::new(engine::SetMixture));
             tools.push(Box::new(engine::LeanMixture));
             tools.push(Box::new(engine::StartEngine));
@@ -210,10 +218,6 @@ impl Registry {
         // interactively (narrate + act + verify + call out the pilot's items),
         // which needs the voice, so the main loop intercepts the pick. They're
         // interpreted from the airframe's XChecklist file (see [`crate::checklist`]).
-
-        // Future, gated the same way:
-        //   if profile.retractable_gear { tools.push(Box::new(gear::Gear::new())); }
-        //   fuel pump, pitot heat, COM2/NAV radios, transponder, …
 
         Self { tools }
     }

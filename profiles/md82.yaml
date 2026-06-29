@@ -1,0 +1,83 @@
+# Aircraft profile — X-Plane stock McDonnell Douglas MD-82.
+#
+# A twin turbofan airliner — a deliberate contrast to the GA singles. What's
+# different here: it's a JET (no mixture/magnetos/carb heat/fuel selector — it
+# declares `throttle` for thrust levers instead of the piston `engine` group), it
+# has RETRACTABLE GEAR (the first profile to expose the `gear` tool), and it uses
+# Vmo (max operating speed) rather than a fixed Vne. Figures are from the X-Plane
+# MD-82 Pilot Operating Manual; flap detents/limits are marked VERIFY (X-Plane's
+# flap_ratio mapping for the handle notches needs confirming in the sim).
+
+id: md82
+display_name: McDonnell Douglas MD-82
+
+# Capability flags.
+autopilot: true        # set_heading / set_altitude / set_vertical_speed
+throttle: true         # set_throttle (thrust levers) — jet, so NO piston engine group
+barometer: true        # set_barometer
+pitot_heat: true       # set_pitot_heat
+pitch_trim: true       # set_pitch_trim (the checklist sets elevator_trim)
+com_radio: true        # set_com1
+com2_radio: true       # set_com2 / swap_radio
+nav_radio: true        # set_nav1 / set_obs
+transponder: true      # set_transponder (squawk)
+ils: true              # prepare_ils
+parking_brake: true    # set_parking_brake
+retractable_gear: true # gear up/down (with on-ground safety gate)
+
+# Jet — none of the piston systems apply.
+engine: false
+magnetos: false
+carb_heat: false
+fuel_pump: false
+directional_gyro: false # IRS-aligned, no vacuum DG to sync
+# Electrical (AC/DC buses, two generators, APU, external power) is a flight-engineer
+# era panel — left out for now rather than wired with wrong datarefs.
+
+# Exterior lights (standard X-Plane switch datarefs).
+lights:
+  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on, command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
+  - { key: beacon,  spoken: beacon,            dataref: sim/cockpit2/switches/beacon_on,            command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
+  - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
+  - { key: landing, spoken: landing lights,    dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+  - { key: taxi,    spoken: taxi light,        dataref: sim/cockpit2/switches/taxi_light_on,        command_on: sim/lights/taxi_lights_on,    command_off: sim/lights/taxi_lights_off }
+
+# Never-exceed for the monitor = Vmo (max operating speed), 340 KIAS (Mmo 0.84).
+vne_kts: 340.0
+# No fixed clean-stall figure: a jet's stall speed varies strongly with weight and
+# config, so the fixed-value airspeed caution is left off (vs_clean_kts unset).
+
+# Static reference figures from the X-Plane MD-82 POM. Takeoff V-speeds (V1/Vr/V2)
+# are weight-dependent and computed per departure, so they're not carried here.
+reference:
+  approach_kts: 140.0          # final approach, full flap / gear down (133-140)
+  cruise_kts: 439.0            # long-range cruise (KTAS); max level 500
+  max_gross_lb: 140000.0       # MTOW
+  empty_weight_lb: 78500.0     # operating empty
+  useful_load_lb: 61500.0      # MTOW - OEW
+  service_ceiling_ft: 37000.0
+  fuel_capacity_gal: 5840.0    # ~48,500 lb Jet A-1
+  endurance_hours: 8.0         # ~48,500 lb / 6,000 lb per hour
+  takeoff_distance_ft: 7450.0
+  landing_distance_ft: 4850.0
+
+# Laminar's stock MD-82 XChecklist (by royaloak). The copilot reads each item,
+# performs the ones below, and calls out the rest (most MD-82 items use custom
+# laminar/md82/* datarefs or compound conditions, so they stay pilot call-outs).
+checklist: checklists/md82.txt
+checklist_map:
+  - { match: parkbrake,        action: parking_brake }
+  - { match: transponder_mode, action: transponder }
+  - { match: pitot_heat,       action: pitot_heat }
+  - { match: elevator_trim,    action: pitch_trim }
+  - { match: taxi_light,       action: !light taxi }
+
+# Flap handle detents 0 / 11 / 15 / 28 / 40 degrees (slats extend automatically).
+# Ratios and per-notch Vfe are best-effort from MD-80 placards — VERIFY in the sim.
+flaps:
+  detents:
+    - { label: up,   spoken: up,             ratio: 0.0 }
+    - { label: "11", spoken: eleven,         ratio: 0.275, vfe_kts: 280.0 } # VERIFY
+    - { label: "15", spoken: fifteen,        ratio: 0.375, vfe_kts: 240.0 } # VERIFY
+    - { label: "28", spoken: twenty eight,   ratio: 0.70,  vfe_kts: 220.0 } # VERIFY
+    - { label: "40", spoken: forty,          ratio: 1.0,   vfe_kts: 200.0 } # VERIFY

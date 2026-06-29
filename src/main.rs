@@ -1188,6 +1188,7 @@ fn icao_to_profile(icao: &str) -> String {
     match icao.to_uppercase().as_str() {
         "C172" => "cessna_172sp",
         "SR22" => "cirrus_sr22",
+        "MD82" | "MD80" | "MD83" | "MD88" => "md82",
         _ => "cessna_172sp",
     }
     .to_string()
@@ -2284,6 +2285,7 @@ const I: bool = true; // integer dataref
 fn undoable_drefs(tool: &str) -> &'static [Undoable] {
     match tool {
         "set_flaps" => &[("sim/cockpit2/controls/flap_ratio", "flaps", F)],
+        "gear" => &[("sim/cockpit2/controls/gear_handle_down", "the gear", F)],
         "set_throttle" => &[("sim/cockpit2/engine/actuators/throttle_ratio_all", "throttle", F)],
         "set_mixture" | "lean_mixture" => &[("sim/cockpit2/engine/actuators/mixture_ratio_all", "mixture", F)],
         "set_pitch_trim" => &[("sim/cockpit2/controls/elevator_trim", "pitch trim", F)],
@@ -2611,6 +2613,31 @@ mod tests {
         );
         // A non-limits utterance returns nothing.
         assert!(super::reference_limits(&p, "set flaps ten").is_none());
+
+        // The SR22 carries its own card — different numbers, same machinery.
+        let sr = super::aircraft::load("cirrus_sr22").expect("sr22 profile");
+        assert_eq!(super::reference_limits(&sr, "best glide").as_deref(), Some("best glide 88 knots."));
+        assert!(super::reference_limits(&sr, "never exceed").unwrap().contains("204"));
+        assert!(super::reference_limits(&sr, "max crosswind").unwrap().contains("21"));
+    }
+
+    #[test]
+    fn md82_is_a_jet_with_gear_no_piston_tools() {
+        let p = super::aircraft::load("md82").expect("md82 profile loads");
+        assert_eq!(p.id, "md82");
+        assert!(p.autopilot && p.throttle && p.retractable_gear);
+        assert!(!p.engine && !p.magnetos && !p.carb_heat, "jet has no piston systems");
+        assert_eq!(p.vne_kts, Some(340.0)); // Vmo
+        let reg = super::tools::Registry::for_aircraft(&p);
+        assert!(reg.get("gear").is_some(), "retractable gear -> gear tool");
+        assert!(reg.get("set_throttle").is_some(), "throttle flag -> thrust levers");
+        assert!(reg.get("set_mixture").is_none(), "no mixture on a jet");
+        assert!(reg.get("start_engine").is_none(), "no piston start on a jet");
+        assert!(reg.get("set_flaps").is_some());
+        // Reference card answers from the POM.
+        assert!(super::reference_limits(&p, "service ceiling").unwrap().contains("37,000"));
+        // The MD-82 checklist parses.
+        assert!(crate::checklist::load(&p).is_ok());
     }
 
     #[test]
