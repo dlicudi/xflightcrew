@@ -326,7 +326,14 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             }
         }
         if let Err(e) = speaker.speak(&utt.text) {
-            tracing::warn!("TTS failed: {e:#}");
+            // An interrupt (PTT / barge-in) kills `say`/piper with SIGTERM — that's
+            // an intentional cut-off, not a failure, so don't log it as a warning.
+            let msg = format!("{e:#}");
+            if msg.contains("SIGTERM") || msg.contains("signal: 15") {
+                tracing::debug!("TTS interrupted (barge-in): {msg}");
+            } else {
+                tracing::warn!("TTS failed: {msg}");
+            }
         }
         // Remember what we just said (it just finished playing) so the listener can
         // reject this audio if it bleeds back through the mic. Prune the old.

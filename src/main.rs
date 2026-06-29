@@ -2135,7 +2135,20 @@ async fn answer_state_query(
             parts.push(format!("mixture {:.0} percent", v * 100.0));
         }
     }
-    if t.contains("throttle") {
+    // "autothrottle" / "auto throttle" is the autoflight state, not the lever
+    // position — answer the engage state and don't let the bare-throttle branch
+    // below also fire ("autothrottle" contains "throttle").
+    let autothrottle_q = t.contains("autothrottle") || t.contains("auto throttle") || t.contains("auto-throttle");
+    if autothrottle_q {
+        if let Ok(v) = read1(live, xp, "sim/cockpit2/autopilot/autothrottle_enabled").await {
+            parts.push(match v {
+                v if v >= 1.5 => "autothrottle engaged".to_string(),
+                v if v >= 0.5 => "autothrottle armed".to_string(),
+                _ => "autothrottle off".to_string(),
+            });
+        }
+    }
+    if t.contains("throttle") && !autothrottle_q {
         if let Ok(v) = read1(live, xp, "sim/cockpit2/engine/actuators/throttle_ratio_all").await {
             parts.push(format!("throttle {:.0} percent", v * 100.0));
         }

@@ -24,7 +24,10 @@ use tokio::sync::Mutex;
 const HTTP_ATTEMPTS: usize = 3;
 const HTTP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(60);
 
-/// Run an idempotent Web API request, retrying a few times on failure.
+/// Run an idempotent Web API request, retrying a few times on failure. A 404 is
+/// *not* retried: it means the dataref id is stale (X-Plane reassigns ids across
+/// restarts and aircraft reloads), so re-issuing the same id just spams the log —
+/// the caller drops the cached id and re-resolves instead (see [`is_not_found`]).
 async fn with_retry<T, F, Fut>(op: F) -> Result<T>
 where
     F: Fn() -> Fut,
@@ -35,13 +38,23 @@ where
         attempt += 1;
         match op().await {
             Ok(v) => return Ok(v),
-            Err(e) if attempt < HTTP_ATTEMPTS => {
+            Err(e) if attempt < HTTP_ATTEMPTS && !is_not_found(&e) => {
                 tracing::warn!(attempt, "X-Plane request failed, retrying: {e:#}");
                 tokio::time::sleep(HTTP_RETRY_DELAY).await;
             }
             Err(e) => return Err(e),
         }
     }
+}
+
+/// True when an error is a Web API 404 (Not Found). The API 404s a dataref id
+/// that's gone stale — it reassigns numeric ids across X-Plane restarts and
+/// aircraft reloads — so a cached handle stops resolving until we drop it.
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        e.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status)
+            == Some(reqwest::StatusCode::NOT_FOUND)
+    })
 }
 
 /// The dataref/command surface a tool uses to talk to the simulator. Abstracting
@@ -66,8 +79,10 @@ pub trait XPlane: Send + Sync {
 pub struct XPlaneClient {
     http: reqwest::Client,
     base: String,
-    /// Resolved `dataref name -> numeric id`. Datarefs don't change id within a
-    /// session, so caching is safe and saves a round trip per read/write.
+    /// Resolved `dataref name -> numeric id`, to save a round trip per read/write.
+    /// Ids are stable within a session but X-Plane reassigns them across restarts
+    /// and aircraft reloads, so a value op that 404s evicts the entry here and
+    /// re-resolves by name (see `get_value` / `set_value`) — the cache self-heals.
     id_cache: Mutex<HashMap<String, i64>>,
     /// Resolved `command name -> numeric id` (commands live on the v2 API).
     command_cache: Mutex<HashMap<String, i64>>,
@@ -148,26 +163,44 @@ impl XPlaneClient {
         Ok(id)
     }
 
+    /// GET a dataref's `value`, re-resolving the id once if the cached one 404s.
+    /// X-Plane reassigns numeric ids across restarts and aircraft reloads, so a
+    /// cached handle eventually points at nothing; rather than spam 404s forever
+    /// (the poller hits this every frame), drop the stale id and resolve by name
+    /// again. `decoding` labels the JSON-decode step for error context.
+    async fn get_value(&self, name: &str, decoding: &'static str) -> Result<serde_json::Value> {
+        let mut refreshed = false;
+        loop {
+            let id = self.dataref_id(name).await?;
+            let url = format!("{}/api/v1/datarefs/{}/value", self.base, id);
+            let result: Result<ValueResponse> = with_retry(|| async {
+                self.http
+                    .get(&url)
+                    .send()
+                    .await
+                    .with_context(|| format!("GET {url}"))?
+                    .error_for_status()?
+                    .json()
+                    .await
+                    .context(decoding)
+            })
+            .await;
+            match result {
+                Ok(resp) => return Ok(resp.data),
+                Err(e) if !refreshed && is_not_found(&e) => {
+                    self.id_cache.lock().await.remove(name); // stale handle — re-resolve
+                    refreshed = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Read a scalar dataref as `f64`.
     pub async fn get_float(&self, name: &str) -> Result<f64> {
-        let id = self.dataref_id(name).await?;
-        let url = format!("{}/api/v1/datarefs/{}/value", self.base, id);
-        let resp: ValueResponse = with_retry(|| async {
-            self.http
-                .get(&url)
-                .send()
-                .await
-                .with_context(|| format!("GET {url}"))?
-                .error_for_status()?
-                .json()
-                .await
-                .context("decoding dataref value")
-        })
-        .await?;
-
-        resp.data
-            .as_f64()
-            .ok_or_else(|| anyhow!("dataref {name} is not a scalar number: {}", resp.data))
+        let data = self.get_value(name, "decoding dataref value").await?;
+        data.as_f64()
+            .ok_or_else(|| anyhow!("dataref {name} is not a scalar number: {data}"))
     }
 
     /// Write a scalar float dataref.
@@ -190,20 +223,31 @@ impl XPlaneClient {
 
     /// Write a raw JSON value to a dataref's `value` endpoint.
     async fn set_value(&self, name: &str, value: serde_json::Value) -> Result<()> {
-        let id = self.dataref_id(name).await?;
-        let url = format!("{}/api/v1/datarefs/{}/value", self.base, id);
         let body = json!({ "data": value });
-        with_retry(|| async {
-            self.http
-                .patch(&url)
-                .json(&body)
-                .send()
-                .await
-                .with_context(|| format!("PATCH {url}"))?
-                .error_for_status()?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
+        let mut refreshed = false;
+        loop {
+            let id = self.dataref_id(name).await?;
+            let url = format!("{}/api/v1/datarefs/{}/value", self.base, id);
+            let result = with_retry(|| async {
+                self.http
+                    .patch(&url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .with_context(|| format!("PATCH {url}"))?
+                    .error_for_status()?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) if !refreshed && is_not_found(&e) => {
+                    self.id_cache.lock().await.remove(name); // stale handle — re-resolve
+                    refreshed = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Resolve a command's numeric id (commands are on the v2 API). The v2
@@ -241,24 +285,10 @@ impl XPlaneClient {
     /// Read a `data`-typed dataref (returned base64-encoded) as a string,
     /// trimming the null padding X-Plane uses for fixed-width fields.
     pub async fn get_string(&self, name: &str) -> Result<String> {
-        let id = self.dataref_id(name).await?;
-        let url = format!("{}/api/v1/datarefs/{}/value", self.base, id);
-        let resp: ValueResponse = with_retry(|| async {
-            self.http
-                .get(&url)
-                .send()
-                .await
-                .with_context(|| format!("GET {url}"))?
-                .error_for_status()?
-                .json()
-                .await
-                .context("decoding string dataref")
-        })
-        .await?;
-        let b64 = resp
-            .data
+        let data = self.get_value(name, "decoding string dataref").await?;
+        let b64 = data
             .as_str()
-            .ok_or_else(|| anyhow!("dataref {name} is not a string value: {}", resp.data))?;
+            .ok_or_else(|| anyhow!("dataref {name} is not a string value: {data}"))?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64)
             .context("base64-decoding dataref")?;
@@ -298,24 +328,10 @@ impl XPlaneClient {
 
     /// Read an array-typed dataref (e.g. per-engine values) as `f64`s.
     pub async fn get_float_array(&self, name: &str) -> Result<Vec<f64>> {
-        let id = self.dataref_id(name).await?;
-        let url = format!("{}/api/v1/datarefs/{}/value", self.base, id);
-        let resp: ValueResponse = with_retry(|| async {
-            self.http
-                .get(&url)
-                .send()
-                .await
-                .with_context(|| format!("GET {url}"))?
-                .error_for_status()?
-                .json()
-                .await
-                .context("decoding array dataref")
-        })
-        .await?;
-        let arr = resp
-            .data
+        let data = self.get_value(name, "decoding array dataref").await?;
+        let arr = data
             .as_array()
-            .ok_or_else(|| anyhow!("dataref {name} is not an array: {}", resp.data))?;
+            .ok_or_else(|| anyhow!("dataref {name} is not an array: {data}"))?;
         Ok(arr.iter().filter_map(|v| v.as_f64()).collect())
     }
 
