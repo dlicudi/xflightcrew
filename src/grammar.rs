@@ -10,10 +10,12 @@
 //! command, so the caller must withhold questions from the fast-path (the LLM
 //! arbitrates act-vs-answer) before calling in.
 //!
-//! Every candidate is **validated against the live tool schema** before use, so a
-//! value this airframe doesn't support (e.g. a flap detent it lacks) fails closed
-//! to the LLM rather than executing something wrong. Extend the tables here as the
-//! logs surface new recurring phrasings (see `x-copilot analyze`).
+//! Every candidate is **validated against the live tool schema** (the tool exists
+//! and the arg keys are known). An out-of-range *value* for the airframe (e.g. a
+//! flap detent it lacks) is NOT rejected here — it's routed to the tool, which
+//! replies with the valid options ("I have up, approach, down"), far more useful
+//! than a bare "Say again?". Extend the tables here as the logs surface new
+//! recurring phrasings (see `x-copilot analyze`).
 
 use serde_json::{json, Value};
 
@@ -30,19 +32,73 @@ const RELATIVE: &[&str] = &[
 
 /// Resolve `transcript` to tool call(s) deterministically, or `None` to fall back
 /// to the LLM. Input is expected post-normalization (digits, not number words).
+/// Lowercase, strip trailing punctuation, and peel off conversational filler /
+/// politeness so natural phrasings reduce to the bare command or question the
+/// matchers know: "could you start the engines" → "start the engines", "okay now
+/// flaps ten please" → "flaps ten". Used by both the command grammar and (in the
+/// command loop) the question/state path, so politeness never causes a miss.
+pub fn normalize(transcript: &str) -> String {
+    // Leading wrappers, peeled repeatedly (longest first so "could you please"
+    // goes before "could you"). Conservative: only filler/politeness, never a
+    // command verb like "set"/"turn"/"give".
+    const LEAD: &[&str] = &[
+        "could you please", "can you please", "would you please", "would you mind",
+        "could you", "can you", "would you", "will you", "i would like you to",
+        "i'd like you to", "i would like to", "i'd like to", "i would like",
+        "i'd like", "i want you to", "i need you to", "i want to", "i need to",
+        "let's go ahead and", "go ahead and", "let's", "lets", "let us",
+        "please", "okay", "ok", "alright", "all right", "hey", "uh", "um", "er",
+        "well", "so", "now", "yeah", "yep", "yes", "gimme", "give me", "just",
+    ];
+    // Trailing politeness, peeled the same way.
+    const TRAIL: &[&str] = &["please", "for me", "now", "thanks", "thank you", "would you", "okay", "ok"];
+
+    let mut s = transcript.trim().trim_end_matches(['.', '!', '?', ',']).trim().to_lowercase();
+    loop {
+        let before = s.clone();
+        for w in LEAD {
+            if let Some(rest) = s.strip_prefix(w) {
+                if rest.is_empty() || rest.starts_with([' ', ',']) {
+                    s = rest.trim_start_matches([' ', ',']).to_string();
+                }
+            }
+        }
+        for w in TRAIL {
+            if let Some(head) = s.strip_suffix(w) {
+                if head.is_empty() || head.ends_with([' ', ',']) {
+                    s = head.trim_end_matches([' ', ',']).to_string();
+                }
+            }
+        }
+        if s == before {
+            break;
+        }
+    }
+    s
+}
+
 pub fn try_parse(
     transcript: &str,
     registry: &Registry,
     profile: &AircraftProfile,
 ) -> Option<Vec<ToolCall>> {
-    let t = transcript.trim().trim_end_matches(['.', '!', '?', ',']).to_lowercase();
+    let t = normalize(transcript);
     if t.is_empty() || is_compound(&t) {
         return None; // empty or a real multi-action compound -> LLM
     }
     if RELATIVE.iter().any(|w| t.contains(w)) {
         return None; // relative/contextual -> LLM
     }
-    let c = parse_one(&t)?;
+    let mut c = parse_one(&t)?;
+    // Engine start/stop come in a singular flavor (piston single: `start_engine`/
+    // `stop_engine`) and a plural one (twin/turboprop/jet: `start_engines`/
+    // `stop_engines`). The grammar emits the singular; swap to the plural when
+    // that's the tool this airframe actually registered.
+    for (singular, plural) in [("start_engine", "start_engines"), ("stop_engine", "stop_engines")] {
+        if c.name == singular && registry.get(singular).is_none() && registry.get(plural).is_some() {
+            c.name = plural.to_string();
+        }
+    }
     valid(&c, registry, profile).then_some(vec![c])
 }
 
@@ -261,12 +317,26 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         }
     }
 
-    // flaps up / ten / twenty / full
+    // flaps up / ten / twenty / full / approach / down / quarter / half. The
+    // detent token must match a label the airframe declares; an unmatched value
+    // (e.g. "flaps 10" on the King Air) still routes to set_flaps, which replies
+    // with the valid options rather than a bare "Say again?". Order matters:
+    // "three quarter" before "quarter", words before the bare number.
     if has(t, "flaps") || has(t, "flap") {
         let notch = if has(t, "up") {
             "up".to_string()
+        } else if t.contains("three quarter") || t.contains("three-quarter") {
+            "three-quarter".to_string()
         } else if has(t, "full") {
             "full".to_string()
+        } else if has(t, "approach") {
+            "approach".to_string()
+        } else if has(t, "down") {
+            "down".to_string()
+        } else if has(t, "half") {
+            "half".to_string()
+        } else if has(t, "quarter") {
+            "quarter".to_string()
         } else if let Some(n) = num {
             n.to_string()
         } else {
@@ -479,19 +549,27 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     }
 
     // fixed verbs
-    if (has(t, "start") && has(t, "engine"))
+    if (has(t, "start") && (has(t, "engine") || has(t, "engines")))
         || t.contains("engine on")
         || t.contains("engines on")
+        || t.contains("start up")
+        || t.contains("start her up")
+        || t.contains("fire up")
+        || t.contains("fire them up")
+        || t.contains("spool")
         || has(t, "crank")
     {
+        // Name is remapped to the airframe's actual start tool (singular piston
+        // vs plural twin/turboprop/jet) in `try_parse`.
         return Some(call("start_engine", json!({})));
     }
-    if (has(t, "stop") && has(t, "engine"))
+    if (has(t, "stop") && (has(t, "engine") || has(t, "engines")))
         || t.contains("engine off")
         || t.contains("engines off")
         || t.contains("shut down")
         || has(t, "shutdown")
-        || (has(t, "kill") && has(t, "engine"))
+        || t.contains("secure the engine")
+        || (has(t, "kill") && (has(t, "engine") || has(t, "engines")))
     {
         return Some(call("stop_engine", json!({})));
     }
@@ -580,8 +658,13 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     None
 }
 
-/// The tool exists, every arg key is in its schema, and any enum-typed string arg
-/// is a valid member of that airframe's schema. Fails closed → LLM fallback.
+/// The tool exists and every arg key is in its schema. We deliberately do NOT
+/// reject an out-of-range *enum value* here: every value-taking tool validates
+/// its own argument and replies with the valid options ("I have up, approach,
+/// down") — which is far more useful than a bare "Say again?". So a recognized
+/// command with a wrong value for this airframe (e.g. "flaps 10" on the King Air)
+/// is routed to the tool to teach the right one, not swallowed. Unknown tools and
+/// unknown arg keys still fail closed.
 fn valid(c: &ToolCall, registry: &Registry, _profile: &AircraftProfile) -> bool {
     let Some(tool) = registry.get(&c.name) else {
         return false;
@@ -591,17 +674,12 @@ fn valid(c: &ToolCall, registry: &Registry, _profile: &AircraftProfile) -> bool 
     let Some(args) = c.arguments.as_object() else {
         return true;
     };
-    for (k, v) in args {
+    for k in args.keys() {
         let Some(props) = props else {
             return false; // args given but the tool takes none
         };
-        let Some(pschema) = props.get(k) else {
+        if !props.contains_key(k) {
             return false; // unknown argument
-        };
-        if let (Some(en), Some(s)) = (pschema.get("enum").and_then(|e| e.as_array()), v.as_str()) {
-            if !en.iter().any(|e| e.as_str() == Some(s)) {
-                return false; // value not valid for this airframe
-            }
         }
     }
     true
@@ -711,6 +789,20 @@ mod tests {
         assert_eq!(one("landing lights off").unwrap(), ("set_lights".into(), json!({"light":"landing","on":false})));
         assert_eq!(one("strobes off").unwrap().1, json!({"light":"strobe","on":false}));
         assert_eq!(one("start the engine").unwrap().0, "start_engine");
+        // Politeness/filler stripped by the normalization layer (Cessna registry,
+        // so use systems it has — flaps/engine/lights).
+        assert_eq!(one("could you start the engines").unwrap().0, "start_engine");
+        assert_eq!(one("flaps up please").unwrap().1, json!({"notch":"up"}));
+        assert_eq!(one("okay now flaps ten").unwrap().0, "set_flaps");
+        assert_eq!(one("i'd like flaps full").unwrap().1, json!({"notch":"full"}));
+        assert_eq!(one("go ahead and turn on the nav lights").unwrap().0, "set_lights");
+        assert_eq!(normalize("Could you please set the heading to 270?"), "set the heading to 270");
+        assert_eq!(normalize("flaps up please"), "flaps up");
+        // Plural / natural start phrasings the King Air run surfaced as misses.
+        assert_eq!(one("start the engines").unwrap().0, "start_engine");
+        assert_eq!(one("start up").unwrap().0, "start_engine");
+        assert_eq!(one("fire them up").unwrap().0, "start_engine");
+        assert_eq!(one("stop the engines").unwrap().0, "stop_engine");
         assert_eq!(one("align gyro").unwrap().0, "align_gyro");
         assert_eq!(one("think gyro").unwrap().0, "align_gyro"); // mishear handled
         assert_eq!(one("level off").unwrap().0, "level_off");
@@ -825,8 +917,22 @@ mod tests {
     }
 
     #[test]
-    fn invalid_values_fall_back() {
-        // The Cessna 172 has no 25-degree detent — must not fabricate it.
-        assert_eq!(one("flaps 25"), None);
+    fn invalid_flap_value_routes_to_tool_for_a_helpful_reply() {
+        // The Cessna 172 has no 25-degree detent. We don't fabricate it, but we DO
+        // route to set_flaps so the tool can answer "I have up, 10, 20, full"
+        // rather than a bare "Say again?". (The tool rejects the value at runtime.)
+        assert_eq!(one("flaps 25").unwrap(), ("set_flaps".into(), json!({ "notch": "25" })));
+    }
+
+    #[test]
+    fn word_detents_parse() {
+        // Word-named detents (King Air approach/down, DC-3 quarter/half/three-
+        // quarter) must parse to their label, not miss. `valid()` lets them through
+        // even on the Cessna registry (the tool validates per-airframe at runtime).
+        assert_eq!(one("flaps approach").unwrap().1, json!({ "notch": "approach" }));
+        assert_eq!(one("flaps down").unwrap().1, json!({ "notch": "down" }));
+        assert_eq!(one("flaps half").unwrap().1, json!({ "notch": "half" }));
+        assert_eq!(one("flaps quarter").unwrap().1, json!({ "notch": "quarter" }));
+        assert_eq!(one("flaps three quarters").unwrap().1, json!({ "notch": "three-quarter" }));
     }
 }

@@ -18,11 +18,6 @@ use crate::ui::{LogKind, Reporter};
 /// The sample rate whisper.cpp models are trained on.
 pub const WHISPER_SAMPLE_RATE: u32 = 16_000;
 
-/// How long after the copilot stops speaking to keep ignoring the mic — covers
-/// audio still buffered in the input and room echo, so the tail of a readback or
-/// alert can't leak in as a phantom command.
-const MIC_GATE_TAIL: Duration = Duration::from_millis(400);
-
 /// A shared "the copilot is speaking — don't listen" flag. The speech arbiter
 /// raises it around every utterance; the [`Listener`] drops captured audio while
 /// it's raised (and briefly after) so the copilot never hears itself. Half-duplex
@@ -117,15 +112,21 @@ const PTT_PREROLL_MS: u32 = 300;
 /// dataref — via the `is_active` closure.
 pub struct PttMic {
     input: Input,
+    /// Raised while the copilot speaks; audio captured then (plus a tail) is
+    /// dropped — so holding PTT through a readback can't feed the copilot's own
+    /// voice (over speakers) back in. Same half-duplex guard the `Listener` uses.
+    gate: MicGate,
+    gate_tail: Duration,
 }
 
 impl PttMic {
     /// Open the default input and start streaming. The stream stays live for the
-    /// session; one `PttMic` serves every press.
-    pub fn start() -> Result<PttMic> {
+    /// session; one `PttMic` serves every press. `gate`/`gate_tail` mute the mic
+    /// while (and just after) the copilot speaks.
+    pub fn start(gate: MicGate, gate_tail: Duration) -> Result<PttMic> {
         let input = open_input()?;
         input.stream.play().context("starting input stream")?;
-        Ok(PttMic { input })
+        Ok(PttMic { input, gate, gate_tail })
     }
 
     /// Wait up to `idle_timeout` for `is_active` to go true (returning empty if it
@@ -149,10 +150,35 @@ impl PttMic {
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        // Pressed: the buffer already holds up to ~pre-roll of audio from just
-        // before the press — keep it, then accumulate until release.
+        // Pressed. Flush everything captured before this press down to ~pre-roll,
+        // ALWAYS — not just via the wait loop above. That loop's trim is skipped
+        // whenever PTT is already active on entry (the common case: pressing to
+        // give the next command), and during the *previous* readback the command
+        // loop was blocked in the blocking `speak()`/`afplay`, so `capture` wasn't
+        // running to drop anything — the mic stream quietly piled the whole
+        // readback into the buffer (the in-unit Studio-Display speaker→mic coupling
+        // makes it a clean copy). Without this flush that readback gets prepended
+        // to the new command and transcribed verbatim, feeding the copilot its own
+        // voice. The continuous `Listener` clears at the start of every utterance
+        // for the same reason; PttMic must too.
+        self.trim_to(preroll);
+
+        // Accumulate until release. As extra defence, while the copilot is speaking
+        // (or within the post-speech tail) drop what's captured, so holding PTT
+        // through a readback can't record its own voice either.
+        let mut spoke_until: Option<Instant> = None;
         while is_active() {
+            if self.gate.is_speaking() {
+                spoke_until = Some(Instant::now() + self.gate_tail);
+            }
+            if spoke_until.is_some_and(|t| Instant::now() < t) {
+                self.input.buffer.lock().unwrap().clear();
+            }
             std::thread::sleep(Duration::from_millis(5));
+        }
+        // If release landed inside the tail, the final buffer is still self-echo.
+        if spoke_until.is_some_and(|t| Instant::now() < t) {
+            self.input.buffer.lock().unwrap().clear();
         }
 
         let interleaved = std::mem::take(&mut *self.input.buffer.lock().unwrap());
@@ -221,6 +247,8 @@ pub struct Listener {
     reporter: Reporter,
     /// Raised while the copilot speaks; audio captured then is dropped.
     gate: MicGate,
+    /// How long after speech ends to keep dropping audio (output latency + echo).
+    gate_tail: Duration,
     /// Confirms a captured segment is speech before it's handed to whisper;
     /// rejects non-speech bursts (sim/engine audio, knocks) the energy gate let in.
     speech: crate::vad::SpeechFilter,
@@ -230,7 +258,7 @@ impl Listener {
     /// Start capturing, then calibrate the VAD to the room's noise floor so the
     /// speech threshold sits above ambient. `vad_floor` is a hard minimum (the
     /// configured `XCOPILOT_VAD_RMS`), so a quiet room can't drive it too low.
-    pub fn start(vad_floor: f32, end_silence_ms: u32, reporter: Reporter, gate: MicGate) -> Result<Self> {
+    pub fn start(vad_floor: f32, end_silence_ms: u32, reporter: Reporter, gate: MicGate, gate_tail: Duration) -> Result<Self> {
         let input = open_input()?;
         input.stream.play().context("starting input stream")?;
 
@@ -264,6 +292,7 @@ impl Listener {
             ),
             reporter,
             gate,
+            gate_tail,
             speech: crate::vad::SpeechFilter::new(),
         })
     }
@@ -293,7 +322,7 @@ impl Listener {
             // captured audio and hold the segmenter reset, so its own voice never
             // becomes an utterance.
             if self.gate.is_speaking() {
-                spoke_until = Some(Instant::now() + MIC_GATE_TAIL);
+                spoke_until = Some(Instant::now() + self.gate_tail);
             }
             if spoke_until.is_some_and(|t| Instant::now() < t) {
                 self.input.buffer.lock().unwrap().clear();

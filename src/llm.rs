@@ -34,11 +34,26 @@ set_heading(heading=280). You may be given the aircraft's current state; use it 
 ambiguous commands ('a bit more flaps' from 10 means flaps 20; 'level off' uses \
 the current altitude) and to pick sensible values — but never invent state you \
 weren't given. Do not answer in prose and do not invent tools. \
-If no tool fits the command, do not call any tool.";
+NEVER GUESS: act only on the system the pilot actually named. 'Closest value' \
+applies only WITHIN the correct tool, never across systems — never route a \
+request to a tool for a DIFFERENT system. In particular never map a trim command \
+to the throttle, and never map an altitude/heading/climb/descend request to the \
+altimeter or any non-autopilot tool. \
+If no tool fits the command — including when the named system has no tool on this \
+aircraft, or the value can't be expressed by the matching tool — do NOT call any \
+tool; never substitute a different one.";
 
 /// Unified prompt for [`Llm::act_or_answer`]: the model arbitrates between *doing*
 /// and *answering*, the way a human copilot would — so a polite "could you start
 /// the engines?" acts, while "what's our heading?" answers.
+///
+/// RETAINED BUT UNUSED. The copilot no longer lets the LLM actuate: all actions
+/// are deterministic (the grammar fast-path), and the LLM, when enabled, is
+/// answer-only ([`Llm::answer`] / [`ANSWER_PROMPT`]). This whole act-arbitration
+/// path (`UNIFIED_PROMPT`, [`Decision`], [`Llm::act_or_answer`], `decide_at`, and
+/// the text-tool-call recovery helpers) is kept for reference and tests; it can be
+/// deleted outright. `#[allow(dead_code)]` until then.
+#[allow(dead_code)]
 const UNIFIED_PROMPT: &str = "You are the copilot of an aircraft, working with the \
 pilot. Choose ONE of two responses. ACT: if the pilot wants something done, call \
 the matching tool(s) — one call per distinct action (a command naming two things, \
@@ -49,11 +64,13 @@ tool, do not just describe state. ANSWER: only when the pilot asks about the \
 flight and there is nothing to do, reply in ONE short spoken sentence, in ENGLISH \
 only, using digits for numbers — e.g. 'We're parked on the ground, engines off.' \
 or 'Heading 270, 3,300 feet, climbing.' Answer ONLY from the state you are given, \
-and answer the thing actually asked: if that specific reading isn't in the state, \
-say so plainly ('I don't have weather' / 'No reading for that') — do NOT substitute \
-an unrelated fact you do have (asked the weather with no weather in state, you say \
-you don't have it, you do NOT report heading or engine status instead). Never \
-invent numbers. Prefer ACT \
+and answer the thing actually asked. Name ONLY the subject the pilot actually \
+mentioned — NEVER volunteer a subject they didn't (do not mention weather, \
+heading, fuel, etc. unless they asked about it). If the specific reading they \
+asked for isn't in the state, say 'No reading for that' (do NOT substitute an \
+unrelated fact you do have). If the input is garbled, or it's neither a clear \
+command nor a clear question, reply EXACTLY 'Say again?' and nothing else — never \
+guess a subject, never fabricate a topic. Never invent numbers. Prefer ACT \
 whenever an action is possible, and never both act and answer. For tool arguments \
 pick the closest schema value (speech may be misheard — map 'beak' to 'beacon', \
 'probe' to 'strobe', 'blood lights' to flood lights). Numbers may be spoken as \
@@ -61,10 +78,39 @@ words. 'descend' is a negative vertical speed, 'climb' positive. A bare number o
 percent with no named system CONTINUES the last command's tool (after 'throttle \
 fifty percent', 'seventy percent' means set_throttle(percent=70)). Use the current \
 aircraft state, when given, to resolve relative commands ('a bit more flaps' from \
-10 means flaps 20). Do not invent tools.";
+10 means flaps 20). Do not invent tools. \
+NEVER GUESS and NEVER SUBSTITUTE: act only on the system(s) the pilot explicitly \
+named, and only with that system's own tool. 'Closest value' applies WITHIN the \
+right tool, never across systems — never map a trim command to the throttle, and \
+never map a climb/descend/altitude/heading request to the altimeter, throttle, or \
+trim. NEVER invent a multi-step procedure: one command yields only the action(s) \
+the pilot named, never a guessed sequence (e.g. 'climb to 4000' must NOT become \
+'throttle 100 + set altimeter + trim'). If the named system has no matching tool \
+on this aircraft — e.g. an altitude/heading/climb request with no autopilot tool \
+— then ANSWER that you can't do it ('I don't have an autopilot on this aircraft'), \
+and call NO tool. When unsure which tool matches, ANSWER that you didn't get it — \
+never act on a guess.";
+
+/// Answer-only prompt: the LLM is bounded to spoken Q&A and CANNOT actuate (it's
+/// called with no tools attached). Used as the fallback when the deterministic
+/// grammar doesn't recognize an utterance — a copilot must never act on a model's
+/// guess, so all actuation stays deterministic; the LLM only answers questions and
+/// otherwise says "Say again?".
+const ANSWER_PROMPT: &str = "You are the copilot of an aircraft. The pilot said \
+something the deterministic command handler did not recognize. You have NO tools \
+and CANNOT operate anything — do not claim to have done anything. Your only job: \
+if it is a genuine QUESTION about the flight, answer in ONE short spoken sentence, \
+in ENGLISH, using digits for numbers, drawing ONLY from the aircraft state you are \
+given. Name ONLY the subject the pilot mentioned; never volunteer another (no \
+weather/heading/fuel unless they asked). If that specific reading isn't in the \
+state, say 'No reading for that.' If it is NOT a clear question — a command, \
+garbled, or chatter — reply EXACTLY 'Say again?' and nothing else. Never invent \
+numbers, never describe or claim actions.";
 
 /// What to do with an utterance: perform action(s), or reply in prose to a
 /// question. `None` = the model produced neither (treated as "didn't catch").
+/// Retained but unused — see [`UNIFIED_PROMPT`] (LLM is answer-only now).
+#[allow(dead_code)]
 pub enum Decision {
     Act(Vec<ToolCall>),
     Reply(String),
@@ -126,6 +172,7 @@ fn sanitize_reply(s: &str) -> String {
 /// Extract balanced `{...}` JSON object substrings (with their byte offsets),
 /// ignoring braces inside quoted strings. Used to recover a tool call a small
 /// model wrote as prose instead of via the tool-call API.
+#[allow(dead_code)] // retained for the unused act path / tests — see UNIFIED_PROMPT
 fn json_objects(s: &str) -> Vec<(usize, String)> {
     let b = s.as_bytes();
     let mut out = Vec::new();
@@ -167,6 +214,7 @@ fn json_objects(s: &str) -> Vec<(usize, String)> {
 /// Recover tool call(s) from a model that emitted them as TEXT instead of using
 /// the tool-call API — small local models sometimes echo the prompt's
 /// `ACT: <tool> {json}` format as content. Best-effort; returns what it can parse.
+#[allow(dead_code)] // retained for the unused act path / tests — see UNIFIED_PROMPT
 fn recover_text_toolcalls(content: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
     let mut out = Vec::new();
     for (start, blob) in json_objects(content) {
@@ -194,6 +242,7 @@ fn recover_text_toolcalls(content: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
 /// Does the content look like a tool call the model wrote as prose (so it must
 /// never be spoken aloud)? True for a leading `ACT:` or a known tool name beside
 /// a brace.
+#[allow(dead_code)] // retained for the unused act path / tests — see UNIFIED_PROMPT
 fn looks_like_toolcall_echo(content: &str, tools: &[ToolSpec]) -> bool {
     if content.trim_start().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("act:")) {
         return true;
@@ -376,6 +425,10 @@ impl Llm {
     /// the copilot arbitrating like a human would — a polite "could you start the
     /// engines?" acts; "what's our heading?" answers. Deterministic first pass,
     /// then a light temperature retry only if the model produced neither.
+    ///
+    /// RETAINED BUT UNUSED — the live loop calls [`Llm::answer`] (answer-only); the
+    /// LLM never actuates now. See [`UNIFIED_PROMPT`].
+    #[allow(dead_code)]
     pub async fn act_or_answer(
         &self,
         transcript: &str,
@@ -402,7 +455,26 @@ impl Llm {
         Ok(Decision::None)
     }
 
-    /// One act-or-answer request at a given temperature.
+    /// Answer-only fallback: the LLM is called with NO tools, so it cannot emit a
+    /// tool call — it can only reply in prose. Used when the deterministic grammar
+    /// doesn't recognize an utterance and the LLM is enabled (option A). Returns
+    /// the spoken reply, or `None` if the model produced nothing usable (the caller
+    /// then says "Say again?"). A genuine question is answered; anything else the
+    /// prompt steers to "Say again?".
+    pub async fn answer(
+        &self,
+        transcript: &str,
+        history: &[(String, String)],
+        state: Option<&str>,
+    ) -> Result<Option<String>> {
+        // No tools attached → the model physically cannot actuate anything.
+        let msg = self.chat_call(ANSWER_PROMPT, transcript, &[], history, state, 0.0).await?;
+        let reply = sanitize_reply(&msg.content);
+        Ok((!reply.is_empty()).then_some(reply))
+    }
+
+    /// One act-or-answer request at a given temperature. Retained but unused.
+    #[allow(dead_code)]
     async fn decide_at(
         &self,
         transcript: &str,
@@ -637,6 +709,8 @@ mod tests {
             vad_threshold: 0.012,
             stt_min_confidence: 0.5,
             end_silence_ms: 900,
+            mic_gate_tail_ms: 900,
+            llm_enabled: true, // these tests exercise the (retained) LLM paths
             ui: "plain".into(),
             tts_backend: "say".into(),
             say_voice: String::new(),

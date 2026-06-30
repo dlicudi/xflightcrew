@@ -106,6 +106,12 @@ pub struct AircraftProfile {
     /// that the scalar-per-light `set_lights` can't express.
     #[serde(default)]
     pub flood_lights: bool,
+    /// Override dataref for the flood lights when the airframe's flood isn't the
+    /// universal pilot/copilot pair — a single on/off switch, optionally an array
+    /// element written `name[i]` (the King Air's overhead flood is
+    /// `sim/cockpit2/switches/generic_lights_switch[0]`). `None` → universal floods.
+    #[serde(default)]
+    pub flood_lights_dataref: Option<String>,
     /// Electric/auxiliary fuel pump (`set_fuel_pump`).
     #[serde(default)]
     pub fuel_pump: bool,
@@ -115,10 +121,43 @@ pub struct AircraftProfile {
     /// Carburetor / alternate-air heat (`set_carb_heat`).
     #[serde(default)]
     pub carb_heat: bool,
+    /// Number of engines — how many array elements the per-engine accessory
+    /// tools (carb heat, fuel pump, magnetos) write. Defaults to 1 (the GA
+    /// singles); a twin like the DC-3 sets 2 so both engines switch together.
+    #[serde(default = "default_engines")]
+    pub engines: usize,
+    /// Drive the magnetos via the per-engine `ignition_on` selector (off/R/L/
+    /// both) instead of the single `ignition_key` — for radials like the DC-3.
+    #[serde(default)]
+    pub magnetos_per_engine: bool,
     /// Fuel tank selector (`set_fuel_selector`), per-airframe positions.
     /// `None` → no selector tool.
     #[serde(default)]
     pub fuel_selector: Option<FuelSelectorProfile>,
+    /// DC power switch driven by up/down cycle commands (battery / off / ground
+    /// power) — the AWX DC-3 pattern. Gates `set_power`. `None` → no power tool.
+    #[serde(default)]
+    pub power_switch: Option<PowerSwitchProfile>,
+    /// Fuel selectors driven by up/down cycle commands, one per side (the DC-3
+    /// has two). Empty → no cycle fuel-selector tool. Distinct from
+    /// `fuel_selector` (the single direct-command selector on the GA singles).
+    #[serde(default)]
+    pub fuel_selectors: Vec<CycleSelectorProfile>,
+    /// Twin piston start/shutdown for cycle-switch airframes (mixture/fuel are
+    /// xlua-overridden). Gates `start_engines` / `stop_engines`. `None` → use the
+    /// generic `engine` group instead.
+    #[serde(default)]
+    pub piston_start: Option<PistonStartProfile>,
+    /// Notched mixture lever (xlua-overridden). Gates `set_mixture` for airframes
+    /// whose mixture is a detented lever rather than a continuous 0–100%. `None`
+    /// → no notched mixture tool.
+    #[serde(default)]
+    pub mixture_notch: Option<MixtureNotchProfile>,
+    /// Switch/condition-lever turboprop start (the Laminar King Air pattern).
+    /// Gates `start_engines` / `stop_engines`. Distinct from `turbine_start`
+    /// (the MD-82 jet sequence) and the piston `engine`/`piston_start` groups.
+    #[serde(default)]
+    pub turboprop_start: Option<TurbineStartProfile>,
     /// Pitot heat anti-ice (`set_pitot_heat`).
     #[serde(default)]
     pub pitot_heat: bool,
@@ -146,6 +185,12 @@ pub struct AircraftProfile {
 /// US transition altitude (FL180). See [`AircraftProfile::transition_altitude_ft`].
 fn default_transition_altitude() -> f64 {
     18_000.0
+}
+
+/// Engine count for the per-engine accessory tools — 1 (the GA singles) unless
+/// a profile says otherwise. See [`AircraftProfile::engines`].
+fn default_engines() -> usize {
+    1
 }
 
 /// Fuel-endurance alert thresholds (minutes of fuel remaining at the current
@@ -195,6 +240,155 @@ pub struct FuelPosition {
     /// value, so the command is trusted.
     #[serde(default)]
     pub value: Option<f64>,
+}
+
+/// A multi-position switch driven by up/down CYCLE commands rather than a
+/// direct "set to N" — the AWX DC-3 pattern (power switch, fuel selectors). To
+/// reach a target the tool reads `position`, then fires `up`/`down` the right
+/// number of times. (Writing the position dataref doesn't work on the DC-3: the
+/// add-on's dataref handlers are no-ops, so only the commands move the system.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CycleSwitch {
+    /// Integer-position dataref read to find the current detent.
+    pub position: String,
+    /// Command that increments the position by one.
+    pub up: String,
+    /// Command that decrements the position by one.
+    pub down: String,
+    /// Lowest detent value.
+    pub min: i64,
+    /// Highest detent value.
+    pub max: i64,
+    /// Whether the switch wraps `max`→`min` (the fuel selectors do; the power
+    /// switch is clamped at the ends).
+    #[serde(default)]
+    pub wrap: bool,
+}
+
+/// One named target position of a [`CycleSwitch`] (the token the LLM selects by,
+/// its spoken form, and the detent value to cycle to).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwitchState {
+    pub key: String,
+    pub spoken: String,
+    pub value: i64,
+}
+
+/// The DC power switch (battery / off / ground power) on a cycle switch. Gates
+/// the `set_power` tool. `None` = no power tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowerSwitchProfile {
+    pub switch: CycleSwitch,
+    /// Selectable named positions, in the order offered to the LLM.
+    pub states: Vec<SwitchState>,
+    /// Dataref read to confirm the battery is live (any element > 0). `None` =
+    /// trust the switch position.
+    #[serde(default)]
+    pub battery_readback: Option<String>,
+}
+
+/// One fuel selector on a cycle switch (the DC-3 has one per side). Gates the
+/// `set_fuel_selector` tool when any are present; also drives the start
+/// sequence's "fuel to a main tank" step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CycleSelectorProfile {
+    /// Token the LLM selects this selector by (e.g. `left`, `right`).
+    pub key: String,
+    /// Spoken form (e.g. `left fuel selector`).
+    pub spoken: String,
+    pub switch: CycleSwitch,
+    /// Engine index (0-based) this selector feeds — for the start sequence.
+    #[serde(default)]
+    pub engine: usize,
+    /// Position value to select for engine start (a main tank). `None` = leave
+    /// the selector where it is during start.
+    #[serde(default)]
+    pub start_value: Option<i64>,
+    /// Selectable positions, in the order offered to the LLM.
+    pub positions: Vec<SwitchState>,
+}
+
+/// Twin (or more) turboprop start, switch/condition-lever driven — the Laminar
+/// King Air pattern. Gates `start_engines` / `stop_engines` for turbines. The
+/// sequence per the verified C90B start: condition levers to low idle, then for
+/// each engine fire its start switch (crank), wait for N1 to reach idle, release
+/// the starter, bring that engine's generator online (so the bus can power the
+/// next start), and finally condition levers to the run position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurbineStartProfile {
+    /// Condition-lever (fuel) array dataref. Each engine's element is written.
+    pub condition_lever: String,
+    /// Condition value for starting (low idle) and for normal run (high idle).
+    pub condition_start: f64,
+    pub condition_run: f64,
+    /// Per-engine command that engages the starter (the ign/start switch UP).
+    pub start_up: Vec<String>,
+    /// Per-engine command that releases the starter (the switch back to centre).
+    pub start_dn: Vec<String>,
+    /// Per-engine generator-ON command, fired once that engine reaches idle.
+    #[serde(default)]
+    pub generators: Vec<String>,
+    /// N1 (%) at which the engine is lit and stable enough to cut the starter.
+    #[serde(default = "default_n1_idle")]
+    pub n1_idle: f64,
+    /// Max seconds to crank one engine before giving up.
+    #[serde(default = "default_turbine_crank_secs")]
+    pub crank_secs: f64,
+}
+
+fn default_n1_idle() -> f64 {
+    50.0
+}
+fn default_turbine_crank_secs() -> f64 {
+    30.0
+}
+
+/// A notched mixture lever (the AWX DC-3's xlua-overridden control: idle
+/// cutoff / auto-lean / auto-reach / max, written as 0..3). Gates `set_mixture`.
+/// Distinct from the GA singles' continuous 0–100% mixture (the `engine` group).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MixtureNotchProfile {
+    /// Lever dataref written to select a notch (drives `ENGN_mixt` via override).
+    pub lever: String,
+    /// Readback dataref to confirm the notch settled. `None` = trust the write.
+    #[serde(default)]
+    pub readback: Option<String>,
+    /// Selectable notches, lean → rich, in the order offered to the LLM.
+    pub notches: Vec<SwitchState>,
+}
+
+/// Twin piston start/shutdown for cycle-switch airframes whose mixture and fuel
+/// are xlua-overridden (so the generic piston `engine` group can't drive them).
+/// Gates `start_engines` / `stop_engines`. Universal datarefs (throttle, engine
+/// running, bus volts) stay in the tool; the per-airframe commands live here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PistonStartProfile {
+    /// Per-engine starter commands, held to crank.
+    pub starters: Vec<String>,
+    /// Command setting all magnetos to BOTH (start) and OFF (shutdown).
+    pub mags_both: String,
+    pub mags_off: String,
+    /// Notched mixture lever dataref (xlua-overridden); the rich notch used for
+    /// start and the cutoff notch used for shutdown.
+    pub mixture_lever: String,
+    pub mixture_start_notch: f64,
+    pub mixture_cutoff_notch: f64,
+    /// Seconds to hold each starter.
+    #[serde(default = "default_crank_secs")]
+    pub crank_secs: f64,
+    /// Throttle crack fraction (0..1) for the start.
+    #[serde(default = "default_throttle_crack")]
+    pub throttle_crack: f64,
+    /// Per-engine generator/alternator ON commands, fired once running.
+    #[serde(default)]
+    pub generators: Vec<String>,
+}
+
+fn default_crank_secs() -> f64 {
+    6.0
+}
+fn default_throttle_crack() -> f64 {
+    0.12
 }
 
 /// A flap system as an ordered list of detents, retracted → fully extended.
@@ -418,6 +612,108 @@ mod tests {
     }
 
     #[test]
+    fn dc3_yaml_loads_and_is_conservative() {
+        // YAML-only profile (no built-in). Deserialize the file directly so a
+        // malformed field fails loudly here rather than vanishing behind load()'s
+        // built-in fallback (which would return None for "dc3").
+        let text = std::fs::read_to_string("profiles/dc3.yaml").unwrap();
+        let p: AircraftProfile = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("dc3.yaml failed to parse: {e:#}"));
+        assert_eq!(p.id, "dc3");
+        // Twin radial: retractable gear with a VLO gate, throttle-only (the piston
+        // group stays off — mixture is xlua-overridden, start/ignition are custom).
+        assert!(p.retractable_gear);
+        assert_eq!(p.vlo_kts, Some(140.0));
+        assert!(p.throttle && !p.engine);
+        assert!(p.fuel_selector.is_none()); // uses the dual cycle selectors instead
+        // Twin per-engine accessories, verified live: magnetos (via ignition_on),
+        // carb heat, and the boost pumps, all written across both engines.
+        assert_eq!(p.engines, 2);
+        assert!(p.magnetos && p.magnetos_per_engine && p.carb_heat && p.fuel_pump);
+        // No functional X-Plane autopilot on this airframe (servos never latch,
+        // verified live), so autopilot + ILS are off; the rest of the universal
+        // tools stay on.
+        assert!(!p.autopilot && !p.ils);
+        assert!(p.barometer && p.transponder && p.pitch_trim);
+        // Flaps: up + 1/4, 1/2, 3/4, full with descending Vfe.
+        let flaps = p.flaps.expect("has flaps");
+        assert_eq!(flaps.detents.len(), 5);
+        assert_eq!(flaps.detents[0].label, "up");
+        assert_eq!(flaps.detents[4].label, "full");
+        assert_eq!(flaps.detents[1].vfe_kts, Some(130.0));
+        assert_eq!(flaps.detents[4].vfe_kts, Some(97.0));
+        assert_eq!(p.vne_kts, Some(178.0));
+        assert_eq!(p.vs_clean_kts, Some(65.0));
+        let r = p.reference.as_ref().expect("dc3 reference");
+        assert_eq!(r.vr_kts, Some(84.0));
+        assert_eq!(r.max_gross_lb, Some(25200.0));
+        // Custom cycle-switch systems wired from config: power switch, dual fuel
+        // selectors, and the twin piston start.
+        let power = p.power_switch.as_ref().expect("dc3 power switch");
+        assert_eq!(power.switch.up, "awx/c47/powersw_up");
+        assert!(!power.switch.wrap); // clamped at the ends
+        assert_eq!(power.states.first().map(|s| s.value), Some(0)); // battery first
+        assert_eq!(p.fuel_selectors.len(), 2);
+        let left = &p.fuel_selectors[0];
+        assert_eq!(left.key, "left");
+        assert_eq!(left.engine, 0);
+        assert_eq!(left.start_value, Some(2)); // left main
+        assert!(left.switch.wrap); // selectors wrap 0<->4
+        assert_eq!(p.fuel_selectors[1].start_value, Some(3)); // right main
+        let start = p.piston_start.as_ref().expect("dc3 piston start");
+        assert_eq!(start.starters.len(), 2);
+        assert_eq!(start.mixture_start_notch, 2.0);
+        assert_eq!(start.mixture_cutoff_notch, 0.0);
+        let mix = p.mixture_notch.as_ref().expect("dc3 mixture notch");
+        assert_eq!(mix.notches.len(), 4);
+        assert_eq!(mix.notches.first().map(|n| n.value), Some(0)); // cutoff
+        assert_eq!(mix.notches.last().map(|n| n.value), Some(3)); // full rich
+    }
+
+    #[test]
+    fn king_air_c90b_yaml_loads() {
+        // YAML-only profile. Deserialize directly so a malformed field fails here
+        // rather than silently falling back.
+        let text = std::fs::read_to_string("profiles/king_air_c90b.yaml").unwrap();
+        let p: AircraftProfile = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("king_air_c90b.yaml failed to parse: {e:#}"));
+        assert_eq!(p.id, "king_air_c90b");
+        // Twin turboprop: power-lever throttle (not the piston group), retractable
+        // gear, no piston/turbine-start/AP tools for v1.
+        assert!(p.throttle && !p.engine);
+        assert!(p.retractable_gear);
+        // Real AP, verified live (needs engines running); no piston/jet-start tools.
+        assert!(p.autopilot && p.ils);
+        assert!(!p.turbine_start && !p.magnetos && !p.carb_heat);
+        // PT6 turboprop start, verified live: two engines, condition lever +
+        // ign/start switch commands + per-engine generator.
+        // Electrical wired to parity with the other profiles: battery, dual
+        // generators (+ both), avionics.
+        let elec: Vec<&str> = p.electrical.iter().map(|e| e.key.as_str()).collect();
+        for k in ["battery", "generator1", "generator2", "generators", "avionics"] {
+            assert!(elec.contains(&k), "c90b electrical missing {k}");
+        }
+        assert!(p.flood_lights); // cockpit floods wired (universal datarefs)
+        let ts = p.turboprop_start.as_ref().expect("c90b turboprop start");
+        assert_eq!(ts.start_up.len(), 2);
+        assert_eq!(ts.start_dn.len(), 2);
+        assert_eq!(ts.generators.len(), 2);
+        assert_eq!(ts.condition_start, 0.5);
+        assert_eq!(ts.condition_run, 1.0);
+        // Modeled limits from the .acf.
+        assert_eq!(p.vne_kts, Some(226.0));
+        assert_eq!(p.vs_clean_kts, Some(100.0));
+        // Flaps up/approach/down.
+        let flaps = p.flaps.expect("has flaps");
+        assert_eq!(flaps.detents.len(), 3);
+        assert_eq!(flaps.detents[1].label, "approach");
+        assert_eq!(flaps.detents[2].label, "down");
+        let r = p.reference.as_ref().expect("c90b reference");
+        assert_eq!(r.max_gross_lb, Some(9650.0));
+        assert_eq!(r.vr_kts, Some(90.0));
+    }
+
+    #[test]
     fn unknown_profile_is_none() {
         // No YAML, no built-in → None (caller surfaces a clear error).
         assert!(load("does_not_exist").is_none());
@@ -511,6 +807,15 @@ fn cessna_172sp() -> AircraftProfile {
     AircraftProfile {
         id: "cessna_172sp".into(),
         display_name: "Cessna 172SP Skyhawk".into(),
+        engines: 1,
+        magnetos_per_engine: false,
+        flood_lights_dataref: None,
+        // Cycle-switch systems (the DC-3 pattern) — not used by the GA singles.
+        power_switch: None,
+        fuel_selectors: Vec::new(),
+        piston_start: None,
+        mixture_notch: None,
+        turboprop_start: None,
         retractable_gear: false,
         transition_altitude_ft: 18_000.0,
         autopilot: true,
@@ -688,6 +993,15 @@ fn cirrus_sr22() -> AircraftProfile {
     AircraftProfile {
         id: "cirrus_sr22".into(),
         display_name: "Cirrus SR22".into(),
+        engines: 1,
+        magnetos_per_engine: false,
+        flood_lights_dataref: None,
+        // Cycle-switch systems (the DC-3 pattern) — not used by the GA singles.
+        power_switch: None,
+        fuel_selectors: Vec::new(),
+        piston_start: None,
+        mixture_notch: None,
+        turboprop_start: None,
         retractable_gear: false,
         transition_altitude_ft: 18_000.0,
         // Universal-dataref tools — safe across airframes.

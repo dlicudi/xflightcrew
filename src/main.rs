@@ -39,7 +39,7 @@ use anyhow::{anyhow, Result};
 use audio::{Listener, PttMic};
 use config::Config;
 use livestate::LiveState;
-use llm::{Decision, Llm};
+use llm::Llm;
 use stt::Stt;
 use tools::{Registry, ToolCtx};
 use ui::Reporter;
@@ -199,7 +199,8 @@ async fn main() -> Result<()> {
         model = %config.model,
         aircraft = %profile.display_name,
         mode = %config.listen_mode,
-        "starting x-copilot (local LLM via Ollama)"
+        llm = if config.llm_enabled { "answer-only (Ollama)" } else { "off (deterministic)" },
+        "starting x-copilot"
     );
 
     // whisper model load is the one slow init — do it once, up front. Bias its
@@ -529,14 +530,18 @@ async fn run_session(
     let mut listener = if continuous {
         // Share the speech arbiter's mic gate so the listener mutes itself while
         // the copilot speaks (readbacks and monitor alerts alike).
-        Some(Listener::start(config.vad_threshold, config.end_silence_ms, reporter.clone(), voice.mic_gate())?)
+        Some(Listener::start(config.vad_threshold, config.end_silence_ms, reporter.clone(), voice.mic_gate(), std::time::Duration::from_millis(config.mic_gate_tail_ms))?)
     } else {
         None
     };
     // Warm push-to-talk mic: kept open across presses so the device warm-up never
     // clips the start of a command. Only one of `listener`/`ptt_mic` opens the
     // device — they're mutually exclusive (continuous vs PTT).
-    let ptt_mic = if ptt.is_some() { Some(PttMic::start()?) } else { None };
+    let ptt_mic = if ptt.is_some() {
+        Some(PttMic::start(voice.mic_gate(), std::time::Duration::from_millis(config.mic_gate_tail_ms))?)
+    } else {
+        None
+    };
 
     reporter.log(
         ui::LogKind::Info,
@@ -853,12 +858,26 @@ async fn run_session(
                 continue;
             }
         }
+        // Strip conversational filler/politeness once ("could you tell me the
+        // altitude" → "tell me the altitude", "okay flaps ten please" → "flaps
+        // ten") and match against this, so polite phrasings don't miss. The raw
+        // `command` is kept for logging/history.
+        let matchable = grammar::normalize(&command);
+
+        // Conversational glue (acks, "what can you do", "say again") — deterministic,
+        // takes no action. Checked before commands/questions so pleasantries don't
+        // fall through to "Say again?".
+        if let Some(reply) = conversational(&matchable, &registry) {
+            say(&voice, &reporter, ui::LogKind::Readback, &reply);
+            continue;
+        }
+
         // Other state reads ("what's our altitude/heading/airspeed") — deterministic
         // too, but only when it's a question, so "set heading 270" still commands.
-        if looks_like_question(&command) {
+        if looks_like_question(&matchable) {
             // A turbine (jet) reports N1/N2/ITT, not the piston RPM/CHT metrics.
             let turbine = !profile.engine && profile.throttle;
-            if let Some(answer) = answer_state_query(&command, &xplane, Some(&live), turbine).await {
+            if let Some(answer) = answer_state_query(&matchable, &xplane, Some(&live), turbine).await {
                 say(&voice, &reporter, ui::LogKind::Readback, &answer);
                 continue;
             }
@@ -873,47 +892,50 @@ async fn run_session(
         // the keyword+number shape of a command, so the grammar would *act* on it);
         // they go to the LLM, which arbitrates act-vs-answer. `path` is logged so
         // `x-copilot analyze` can mine the LLM-fallback tail for new phrasings.
-        let fast = if looks_like_question(&command) {
+        let fast = if looks_like_question(&matchable) {
             None
         } else {
-            grammar::try_parse(&command, &registry, &profile)
+            grammar::try_parse(&matchable, &registry, &profile)
         };
         let calls = if let Some(c) = fast {
             tracing::info!(path = "fast", tool = c.first().map(|x| x.name.as_str()).unwrap_or(""), "command path");
             c
-        } else {
-            // Fast-path missed — now the LLM needs live state.
+        } else if config.llm_enabled {
+            // Fast-path missed and the LLM is enabled: ANSWER-ONLY fallback. It is
+            // called with no tools and cannot actuate — only the deterministic
+            // grammar ever calls a tool. A genuine question gets a one-line spoken
+            // answer; anything else gets "Say again?". Never an action on a guess.
             let ts = Instant::now();
             let snap = state_snapshot(&xplane, &profile, Some(&live)).await;
             tracing::info!(ms = ts.elapsed().as_millis(), state = snap.as_deref().unwrap_or("(none)"), "state snapshot");
             let t = Instant::now();
-            let decision = llm.act_or_answer(&command, &specs, &ctx_history, snap.as_deref()).await;
-            tracing::info!(ms = t.elapsed().as_millis(), path = "llm", "command path");
-            state = snap; // reuse for the correction path if it confirms
-            match decision {
-                Ok(Decision::Act(calls)) => calls,
-                Ok(Decision::Reply(text)) => {
-                    say(&voice, &reporter, ui::LogKind::Readback, &text);
-                    continue;
-                }
-                Ok(Decision::None) => {
+            let answer = llm.answer(&command, &ctx_history, snap.as_deref()).await;
+            tracing::info!(ms = t.elapsed().as_millis(), path = "llm-answer", "command path");
+            match answer {
+                Ok(Some(text)) => say(&voice, &reporter, ui::LogKind::Readback, &text),
+                Ok(None) => {
                     if explicit {
-                        say(&voice, &reporter, ui::LogKind::Warn, readback::one_of(&[
-                            "Sorry, I didn't catch that.",
-                            "I can't action that one.",
-                            "Say again?",
-                        ]));
+                        say(&voice, &reporter, ui::LogKind::Warn, "Say again?");
                     } else {
                         reporter.log(ui::LogKind::Info, format!("no response: \"{command}\""));
                     }
-                    continue;
                 }
                 Err(e) => {
-                    tracing::error!("LLM act-or-answer failed: {e:#}");
+                    tracing::error!("LLM answer failed: {e:#}");
                     reporter.log(ui::LogKind::Warn, "LLM unreachable");
-                    continue;
                 }
             }
+            continue;
+        } else {
+            // Fully deterministic (LLM disabled, the default): nothing recognized it.
+            // Never guess — ask the pilot to repeat.
+            tracing::info!(path = "deterministic-miss", "command path");
+            if explicit {
+                say(&voice, &reporter, ui::LogKind::Warn, "Say again?");
+            } else {
+                reporter.log(ui::LogKind::Info, format!("unrecognized: \"{command}\""));
+            }
+            continue;
         };
 
         // Readbacks from this utterance's actions, recorded as the assistant
@@ -1178,7 +1200,7 @@ async fn run_checklist(
                         }
                     }
                 }
-                if checklist::run_step(tool, args, &cl.lights, &cl.flaps, &cl.electrical, &cl.fuel_selector, &ctx).await.is_ok() {
+                if checklist::run_step(tool, args, &cl.lights, &cl.flaps, &cl.electrical, &cl.fuel_selector, cl.engines, cl.magnetos_per_engine, &ctx).await.is_ok() {
                     say(voice, reporter, ui::LogKind::Readback, line);
                 } else {
                     say(voice, reporter, ui::LogKind::Warn, &format!("{line} Didn't take — check it."));
@@ -1363,6 +1385,8 @@ fn icao_to_profile(icao: &str) -> String {
         "C172" => "cessna_172sp",
         "SR22" => "cirrus_sr22",
         "MD82" | "MD80" | "MD83" | "MD88" => "md82",
+        "DC3" | "DC30" => "dc3",
+        "BE9L" | "BE9T" | "C90" | "C90B" => "king_air_c90b",
         _ => "cessna_172sp",
     }
     .to_string()
@@ -1489,12 +1513,88 @@ fn correction_text(reply: &str) -> Option<String> {
 /// at the call site, so it never touches LLM free-text answers, refusals, or
 /// prompts (an answer that happened to start with "Roger" would lose its first
 /// word otherwise).
+/// The last genuine readback/answer spoken — so "say again" can repeat it. Only
+/// real readbacks are stored (not warnings like "Say again?"), single-threaded
+/// session so a plain Mutex is fine.
+static LAST_READBACK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
     tracing::info!(spoke = %line, "spoke");
     reporter.status(ui::Phase::Speaking);
     reporter.log(kind, line);
     voice.say(Priority::Readback, line);
     reporter.status(ui::Phase::Listening);
+    if matches!(kind, ui::LogKind::Readback) {
+        if let Ok(mut last) = LAST_READBACK.lock() {
+            *last = Some(line.to_string());
+        }
+    }
+}
+
+/// Deterministic conversational glue — the cockpit chatter that isn't a command or
+/// a state question: "what can you do", "say again", and acknowledgments. Returns
+/// the spoken reply, or `None` to fall through to the normal command/question path.
+/// `t` is already normalized (filler stripped). Capabilities are read live from the
+/// registry, so the answer matches the actual aircraft.
+fn conversational(t: &str, registry: &Registry) -> Option<String> {
+    let has = |w: &str| {
+        t.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == w)
+    };
+    // "say again" / "repeat that" / "what did you say" → repeat the last readback.
+    if t.contains("say again") || t.contains("repeat") || t.contains("come again")
+        || t.contains("what did you say") || t.contains("didn't catch that")
+    {
+        return Some(match LAST_READBACK.lock().ok().and_then(|l| l.clone()) {
+            Some(prev) => prev,
+            None => "Nothing to repeat yet.".to_string(),
+        });
+    }
+    // "what can you do" / "help" / "what can I ask" → list live capabilities.
+    if t.contains("what can you do") || t.contains("what can i") || t.contains("what do you do")
+        || t.contains("what are you able") || t.contains("help me") || t == "help"
+        || t.contains("capabilities") || t.contains("what commands")
+    {
+        let mut caps: Vec<&str> = Vec::new();
+        let any = |names: &[&str]| names.iter().any(|n| registry.get(n).is_some());
+        if any(&["set_flaps"]) { caps.push("flaps"); }
+        if any(&["gear"]) { caps.push("gear"); }
+        if any(&["set_throttle"]) { caps.push("throttle"); }
+        if any(&["start_engines", "start_engine"]) { caps.push("engine start and shutdown"); }
+        if any(&["set_heading", "set_altitude"]) { caps.push("the autopilot"); }
+        if any(&["set_com1", "set_nav1"]) { caps.push("radios"); }
+        if any(&["set_transponder_mode"]) { caps.push("the transponder"); }
+        if any(&["set_lights", "set_flood_lights"]) { caps.push("lights"); }
+        if any(&["set_electrical", "set_power"]) { caps.push("electrical"); }
+        if any(&["set_fuel_selector"]) { caps.push("fuel selectors"); }
+        if any(&["set_barometer"]) { caps.push("the altimeter"); }
+        let list = match caps.len() {
+            0 => "the basics".to_string(),
+            1 => caps[0].to_string(),
+            _ => format!("{}, and {}", caps[..caps.len() - 1].join(", "), caps[caps.len() - 1]),
+        };
+        return Some(format!(
+            "I can work the {list}. I can also read back the altitude, heading, speed, fuel, and weather. Just say what you want."
+        ));
+    }
+    // Acknowledgments / pleasantries / presence — reply briefly, take no action.
+    if has("thanks") || t.contains("thank you") || t.contains("appreciate it") || t == "cheers" {
+        return Some("You're welcome.".to_string());
+    }
+    if has("roger") || has("copy") || has("wilco") || t.contains("copy that") {
+        return Some("Standing by.".to_string());
+    }
+    // Bare praise ("good", "nice", "perfect") only as a SHORT standalone ack — so a
+    // longer question like "is the weather good" isn't hijacked.
+    let words = t.split_whitespace().count();
+    if words <= 3 && (has("good") || has("nice") || has("great") || has("perfect") || t.contains("well done")) {
+        return Some("Standing by.".to_string());
+    }
+    if t.contains("you there") || t.contains("are you there") || t.contains("you with me")
+        || t == "hello" || t == "hi" || t.contains("you awake") || t.contains("you copy")
+    {
+        return Some("Standing by, go ahead.".to_string());
+    }
+    None
 }
 
 /// The datarefs the live-state cache subscribes to over the WebSocket — the

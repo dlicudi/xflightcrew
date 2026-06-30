@@ -24,6 +24,14 @@ pub struct Config {
     /// tool-pick battery (100% on the clean set, fastest of the perfect
     /// scorers); `llm.rs` auto-disables its thinking mode for low latency.
     pub model: String,
+    /// Whether the local LLM is used at all. When `false` (the default) the copilot
+    /// is fully deterministic: the grammar fast-path handles commands, the
+    /// state-query handler answers questions, and anything unrecognized gets "Say
+    /// again?" — Ollama is never contacted. The LLM only ever *answered* questions
+    /// the deterministic handler missed (it never actuates), so turning it off
+    /// loses only some free-form Q&A phrasings, never an action. `XCOPILOT_LLM=on`
+    /// re-enables that answer-only fallback.
+    pub llm_enabled: bool,
     /// Base URL of the X-Plane Web API, e.g. `http://127.0.0.1:8086`.
     pub xplane_base_url: String,
     /// Path to a whisper.cpp `.bin` model (e.g. `ggml-base.en.bin`).
@@ -55,6 +63,11 @@ pub struct Config {
     /// feels snappier but clips mid-command hesitations; raise it if a slight
     /// pause cuts you off. Default 900.
     pub end_silence_ms: u32,
+    /// How long after the copilot stops speaking to keep the mic muted (ms),
+    /// covering output latency and room echo so a readback over speakers can't
+    /// bleed back in as a phantom command. Raise it on loud/echoey speaker setups
+    /// (headphones can go lower). Default 900.
+    pub mic_gate_tail_ms: u64,
     /// UI mode: `tui` (terminal dashboard) or `plain` (stdout). Defaults to `tui`
     /// when attached to an interactive terminal, `plain` otherwise (piped output,
     /// CI) — the dashboard needs a real TTY to take over the screen and read keys.
@@ -114,6 +127,12 @@ impl Config {
             model: env_or("XCOPILOT_MODEL", "qwen3:8b"),
             llm_keepalive: env_or("XCOPILOT_LLM_KEEPALIVE", "60m"),
             llm_gpu_layers: env_or("XCOPILOT_LLM_GPU_LAYERS", ""),
+            // Off by default — fully deterministic. `on`/`true`/`1`/`yes` enables
+            // the answer-only LLM fallback.
+            llm_enabled: matches!(
+                env_or("XCOPILOT_LLM", "off").to_lowercase().as_str(),
+                "on" | "true" | "1" | "yes"
+            ),
             xplane_base_url: env_or("XPLANE_BASE_URL", "http://127.0.0.1:8086"),
             whisper_model_path: env_or("WHISPER_MODEL", "models/ggml-base.en.bin"),
             whisper_gpu: env_or("XCOPILOT_WHISPER_GPU", "true") != "false",
@@ -123,6 +142,7 @@ impl Config {
             vad_threshold: env_or("XCOPILOT_VAD_RMS", "0.012").parse().unwrap_or(0.012),
             stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.35").parse().unwrap_or(0.35),
             end_silence_ms: env_or("XCOPILOT_END_SILENCE_MS", "900").parse().unwrap_or(900),
+            mic_gate_tail_ms: env_or("XCOPILOT_MIC_GATE_TAIL_MS", "900").parse().unwrap_or(900),
             ui: env_or("XCOPILOT_UI", default_ui()),
             tts_backend: env_or("XCOPILOT_TTS", "onnx"),
             say_voice: env_or("XCOPILOT_SAY_VOICE", ""),

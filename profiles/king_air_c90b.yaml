@@ -1,0 +1,147 @@
+# Aircraft profile — stock Laminar Research Beechcraft King Air C90B (Tom Kyler/
+# Jim Gregory). Loaded when X-Plane reports acf_ICAO "BE9L"
+# (XCOPILOT_AIRCRAFT=auto).
+#
+# Twin TURBOPROP (2x P&W PT6A-21), retractable gear, pressurized. Unlike the AWX
+# DC-3, this is a Laminar aircraft: its systems use STANDARD X-Plane datarefs (the
+# many laminar/c90/* datarefs are switch-position/gauge mirrors for animation, not
+# system overrides), so the universal-dataref tools work directly. Turbine, so
+# there's no mixture/magnetos/carb-heat; power levers are the throttle.
+#
+# Verified live on this airframe: gear (retractable), flaps (2 detents:
+# approach/down), throttle, and the modeled limit speeds read from the .acf
+# (Vne 226, Vno 169, Vfe 190, Vs 100, Vso 90 KIAS).
+#
+# Verified since: the AP needs the ENGINES RUNNING for power — cold it leaves
+# autopilot_mode at 0, but with engines turning servos_on engages (mode 2) and
+# heading / alt-hold / VS all arm (status 2). So autopilot + ils are ON; if the
+# pilot tries them cold the tool just reports it didn't engage. The PT6 turboprop
+# start is wired (see turboprop_start). Still left as model-accurate / unverified:
+#   - Vle (gear limit) and the flaps-DOWN Vfe: not in the POM text or the .acf
+#     (acf gives a single Vfe 190). Left unset / model-accurate rather than
+#     guessing the real-world figures (~182 / ~146 KIAS) — verify and tighten.
+
+id: king_air_c90b
+display_name: Beechcraft King Air C90B
+
+# Universal-dataref tools — work on this Laminar airframe.
+throttle: true         # power levers (set_throttle -> throttle_ratio_all) — NOT piston
+barometer: true        # set_barometer
+com_radio: true        # set_com1 (G530)
+com2_radio: true       # set_com2 / swap_radio (G430)
+nav_radio: true        # set_nav1 / set_obs
+transponder: true      # set_transponder (squawk)
+parking_brake: true    # set_parking_brake
+pitot_heat: true       # set_pitot_heat
+pitch_trim: true       # set_pitch_trim (universal elevator_trim)
+
+# Retractable gear. VLE/VLO not in an authoritative source for this model, so no
+# speed gate yet (gear still works); set vlo_kts once verified (real C90B ~182).
+retractable_gear: true
+
+# Electrical — single battery + dual generators + avionics master (King Air
+# layout). The battery is the stock dataref (no custom command on this add-on);
+# the generators are the verified laminar/c90 switch commands (generatorN_up = on,
+# verified during the engine start when the bus jumped 19V→28V); avionics is the
+# universal command. "electrical systems on" turns the whole list on.
+electrical:
+  - key: battery
+    spoken: battery
+    on_commands:  [sim/electrical/battery_1_on]
+    off_commands: [sim/electrical/battery_1_off]
+    readback:     ["sim/cockpit2/electrical/battery_on[0]"]
+  - key: generator1
+    spoken: generator one
+    on_commands:  [laminar/c90/electrical/switch/generator1_up]
+    off_commands: [laminar/c90/electrical/switch/generator1_dn]
+    readback:     ["sim/cockpit/electrical/generator_on[0]"]
+  - key: generator2
+    spoken: generator two
+    on_commands:  [laminar/c90/electrical/switch/generator2_up]
+    off_commands: [laminar/c90/electrical/switch/generator2_dn]
+    readback:     ["sim/cockpit/electrical/generator_on[1]"]
+  - key: generators
+    spoken: both generators
+    on_commands:  [laminar/c90/electrical/switch/generator1_up, laminar/c90/electrical/switch/generator2_up]
+    off_commands: [laminar/c90/electrical/switch/generator1_dn, laminar/c90/electrical/switch/generator2_dn]
+    readback:     ["sim/cockpit/electrical/generator_on[0]", "sim/cockpit/electrical/generator_on[1]"]
+  - key: avionics
+    spoken: avionics master
+    on_commands:  [sim/systems/avionics_on]
+    off_commands: [sim/systems/avionics_off]
+    readback:     [sim/cockpit2/switches/avionics_power_on]
+
+# Turbine: no piston controls.
+engine: false
+magnetos: false
+carb_heat: false
+turbine_start: false   # not the MD-82 jet sequence; this airframe uses turboprop_start below
+autopilot: true        # real AP — verified live (heading/alt-hold/VS all arm). Needs
+ils: true              # engines running for power; cold it won't engage (tool says so).
+
+# PT6 turboprop start — verified live on this airframe. Per engine: condition
+# lever to low idle, fire the ignition/start switch UP (cranks + lights via the
+# model's engage_starter), wait for N1 to reach idle, switch DOWN (starter off),
+# generator ON (so the bus can power the next start — battery alone sags and
+# starves the start), then condition levers to run. L = engine 0, R = engine 1.
+turboprop_start:
+  condition_lever: sim/cockpit2/engine/actuators/mixture_ratio
+  condition_start: 0.5   # low idle for light-off
+  condition_run: 1.0     # high idle / run
+  n1_idle: 50.0          # cut the starter once N1 reaches idle
+  crank_secs: 30.0
+  start_up: [laminar/c90/powerplant/switch/ign_start_up_L, laminar/c90/powerplant/switch/ign_start_up_R]
+  start_dn: [laminar/c90/powerplant/switch/ign_start_dn_L, laminar/c90/powerplant/switch/ign_start_dn_R]
+  generators: [laminar/c90/electrical/switch/generator1_up, laminar/c90/electrical/switch/generator2_up]
+speedbrake: false      # no speedbrakes on the C90
+directional_gyro: false
+flood_lights: true     # set_flood_lights — overhead flood is generic_lights_switch[0]
+flood_lights_dataref: "sim/cockpit2/switches/generic_lights_switch[0]"  # verified live (the BRT/OFF overhead flood knob)
+
+# Fuel-endurance alerting. Twin PT6 burns ~500 lb/hr total cruise (~230 kg/hr).
+fuel:
+  reserve_caution_min: 45.0
+  reserve_warning_min: 30.0
+  cruise_burn_kg_hr: 230.0
+
+# Clean stall (KIAS) — drives the airspeed-low callout. Modeled acf_Vs.
+vs_clean_kts: 100.0
+# Vmo / never-exceed (KIAS) — drives the overspeed callout. Modeled acf_Vne.
+vne_kts: 226.0
+
+# Static reference figures recited on request. From the X-Plane C90B POM and the
+# modeled .acf limits. (Vne and clean stall live above for the monitor.)
+reference:
+  kind: twin-engine turboprop
+  vno_kts: 169.0           # max structural cruise (acf_Vno)
+  va_kts: 169.0            # turbulent-air penetration / maneuvering (POM)
+  vx_kts: 101.0            # best angle of climb, two engine (POM)
+  vy_kts: 118.0            # best rate of climb, two engine (POM)
+  vr_kts: 90.0             # rotate (POM "rotate at 90+ knots")
+  vs0_kts: 76.0            # stall, landing config (POM; acf models 90)
+  approach_kts: 110.0      # typical short-final
+  max_crosswind_kts: 25.0  # demonstrated (POM)
+  cruise_kts: 215.0        # 215 KTAS / 145 KIAS @ 20,000 ft (POM)
+  best_climb_fpm: 1955.0   # @ 9,650 lb (POM)
+  max_gross_lb: 9650.0     # MTOW (POM)
+  empty_weight_lb: 7000.0  # acf_m_empty 3175 kg
+  useful_load_lb: 2650.0
+  service_ceiling_ft: 28100.0
+  fuel_capacity_gal: 367.0 # acf_m_fuel_tot 1115 kg Jet-A
+
+# Flaps: UP / APPROACH / DOWN (acf reports 2 detents). flap_ratio is the universal
+# 0..1 handle. Vfe is the modeled single acf_Vfe (190) for both notches; the real
+# flaps-DOWN limit is lower — verify and split.
+flaps:
+  detents:
+    - { label: up,       spoken: up,       ratio: 0.0 }
+    - { label: approach, spoken: approach, ratio: 0.5, vfe_kts: 190.0 }
+    - { label: down,     spoken: down,     ratio: 1.0, vfe_kts: 190.0 }
+
+# Switchable lights (universal commands + cockpit2 switch readbacks).
+lights:
+  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on, command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
+  - { key: beacon,  spoken: beacon,            dataref: sim/cockpit2/switches/beacon_on,            command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
+  - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
+  - { key: landing, spoken: landing lights,    dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+  - { key: taxi,    spoken: taxi light,        dataref: sim/cockpit2/switches/taxi_light_on,        command_on: sim/lights/taxi_lights_on,    command_off: sim/lights/taxi_lights_off }

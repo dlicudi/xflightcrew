@@ -145,6 +145,8 @@ pub struct Checklist {
     pub flaps: Option<FlapProfile>,
     pub electrical: Vec<ElectricalSystem>,
     pub fuel_selector: Option<FuelSelectorProfile>,
+    pub engines: usize,
+    pub magnetos_per_engine: bool,
 }
 
 impl Checklist {
@@ -220,6 +222,8 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
                     flaps: flaps.clone(),
                     electrical: electrical.clone(),
                     fuel_selector: fuel_selector.clone(),
+                    engines: profile.engines,
+                    magnetos_per_engine: profile.magnetos_per_engine,
                 });
             }
             // Both narration directives: arm the run-up confirm when the file
@@ -472,6 +476,8 @@ pub async fn run_step(
     flaps: &Option<FlapProfile>,
     electrical: &[ElectricalSystem],
     fuel_selector: &Option<FuelSelectorProfile>,
+    engines: usize,
+    magnetos_per_engine: bool,
     ctx: &ToolCtx<'_>,
 ) -> Result<String> {
     match tool {
@@ -484,10 +490,10 @@ pub async fn run_step(
             Some(f) => SetFuelSelector::new(f.clone()).execute(args, ctx).await,
             None => bail!("no fuel selector on this airframe"),
         },
-        "set_magnetos" => SetMagnetos.execute(args, ctx).await,
+        "set_magnetos" => SetMagnetos { engines, per_engine: magnetos_per_engine }.execute(args, ctx).await,
         "set_pitot_heat" => SetPitotHeat.execute(args, ctx).await,
-        "set_carb_heat" => SetCarbHeat.execute(args, ctx).await,
-        "set_fuel_pump" => SetFuelPump.execute(args, ctx).await,
+        "set_carb_heat" => SetCarbHeat { engines }.execute(args, ctx).await,
+        "set_fuel_pump" => SetFuelPump { engines }.execute(args, ctx).await,
         "set_transponder_mode" => SetTransponderMode.execute(args, ctx).await,
         "autopilot_off" => AutopilotOff.execute(args, ctx).await,
         "start_engine" => StartEngine.execute(args, ctx).await,

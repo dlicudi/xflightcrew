@@ -13,6 +13,7 @@
 pub mod approach;
 pub mod autopilot;
 pub mod controls;
+pub mod cycle;
 pub mod electrical;
 pub mod engine;
 pub mod flaps;
@@ -117,7 +118,7 @@ impl Registry {
         }
 
         if profile.flood_lights {
-            tools.push(Box::new(lights::SetFloodLights));
+            tools.push(Box::new(lights::SetFloodLights::new(profile.flood_lights_dataref.clone())));
         }
 
         if profile.autopilot {
@@ -156,19 +157,47 @@ impl Registry {
         }
 
         if profile.fuel_pump {
-            tools.push(Box::new(engine::SetFuelPump));
+            tools.push(Box::new(engine::SetFuelPump { engines: profile.engines }));
         }
 
         if profile.magnetos {
-            tools.push(Box::new(engine::SetMagnetos));
+            tools.push(Box::new(engine::SetMagnetos {
+                engines: profile.engines,
+                per_engine: profile.magnetos_per_engine,
+            }));
         }
 
         if profile.carb_heat {
-            tools.push(Box::new(engine::SetCarbHeat));
+            tools.push(Box::new(engine::SetCarbHeat { engines: profile.engines }));
         }
 
         if let Some(fs) = &profile.fuel_selector {
             tools.push(Box::new(engine::SetFuelSelector::new(fs.clone())));
+        }
+
+        // Cycle-switch systems (the AWX DC-3): power switch, per-side fuel
+        // selectors, and the twin piston start/shutdown. These drive xlua-
+        // overridden systems via up/down cycle commands from the profile.
+        if let Some(ps) = &profile.power_switch {
+            tools.push(Box::new(cycle::SetPower::new(ps.clone())));
+        }
+        if !profile.fuel_selectors.is_empty() {
+            tools.push(Box::new(cycle::SetCycleFuelSelector::new(profile.fuel_selectors.clone())));
+        }
+        if let Some(start) = &profile.piston_start {
+            tools.push(Box::new(cycle::StartEngines::new(
+                start.clone(),
+                profile.fuel_selectors.clone(),
+                profile.power_switch.clone(),
+            )));
+            tools.push(Box::new(cycle::StopEngines::new(start.clone())));
+        }
+        if let Some(mix) = &profile.mixture_notch {
+            tools.push(Box::new(cycle::SetMixture::new(mix.clone())));
+        }
+        if let Some(ts) = &profile.turboprop_start {
+            tools.push(Box::new(cycle::StartTurbines::new(ts.clone())));
+            tools.push(Box::new(cycle::StopTurbines::new(ts.clone())));
         }
 
         if profile.parking_brake {

@@ -33,7 +33,20 @@ const GENERATOR: &str = "sim/cockpit/electrical/generator_on"; // array; [0] = a
 // Per-engine actuator arrays (the 172 is single-engine → element 0).
 const FUEL_PUMP: &str = "sim/cockpit2/engine/actuators/fuel_pump_on";
 const IGNITION_KEY: &str = "sim/cockpit2/engine/actuators/ignition_key"; // 0 off,1 R,2 L,3 both,4 start
+// Per-engine magneto selector (0 off,1 R,2 L,3 both) — for radials whose mags
+// aren't the single `ignition_key` (e.g. the DC-3, one selector per engine).
+const IGNITION_ON: &str = "sim/cockpit/engine/ignition_on";
 const CARB_HEAT: &str = "sim/cockpit2/engine/actuators/carb_heat_ratio"; // 0 cold .. 1 hot
+
+/// Write the same value to elements `0..engines` of an int array dataref — for
+/// per-engine accessories on a multi (carb heat, boost pump, magnetos). A single
+/// engine writes just element 0, exactly as before.
+async fn set_each_engine(ctx: &ToolCtx<'_>, dataref: &str, engines: usize, value: i64) -> Result<()> {
+    for i in 0..engines.max(1) {
+        ctx.xplane.set_int_array_elem(dataref, i, value).await?;
+    }
+    Ok(())
+}
 // Engine indicators (per-engine arrays; element 0). Names verified against the
 // stock 172's cockpitdecks mapping.
 const EGT_CEL: &str = "sim/cockpit2/engine/indicators/EGT_deg_cel";
@@ -427,7 +440,11 @@ impl Tool for StartEngine {
     }
 }
 
-pub struct SetFuelPump;
+/// Electric/auxiliary fuel pump(s). `engines` = how many to switch (a twin
+/// drives both boost pumps off one "fuel pump on" command).
+pub struct SetFuelPump {
+    pub engines: usize,
+}
 
 #[derive(Deserialize)]
 struct OnArg {
@@ -453,13 +470,16 @@ impl Tool for SetFuelPump {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: OnArg = serde_json::from_value(args.clone())?;
-        ctx.xplane.set_int_array_elem(FUEL_PUMP, 0, a.on as i64).await?;
+        set_each_engine(ctx, FUEL_PUMP, self.engines, a.on as i64).await?;
         let on = ctx.xplane.get_float_array(FUEL_PUMP).await?.first().copied().unwrap_or(0.0) > 0.5;
         Ok(format!("Roger, fuel pump {}.", if on { "on" } else { "off" }))
     }
 }
 
-pub struct SetCarbHeat;
+/// Carburetor (alternate air) heat. `engines` = how many to switch together.
+pub struct SetCarbHeat {
+    pub engines: usize,
+}
 
 #[async_trait]
 impl Tool for SetCarbHeat {
@@ -480,13 +500,19 @@ impl Tool for SetCarbHeat {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: OnArg = serde_json::from_value(args.clone())?;
-        ctx.xplane.set_int_array_elem(CARB_HEAT, 0, a.on as i64).await?;
+        set_each_engine(ctx, CARB_HEAT, self.engines, a.on as i64).await?;
         let on = ctx.xplane.get_float_array(CARB_HEAT).await?.first().copied().unwrap_or(0.0) > 0.5;
         Ok(format!("Roger, carb heat {}.", if on { "on" } else { "off" }))
     }
 }
 
-pub struct SetMagnetos;
+/// Magneto/ignition selector. `engines` = how many to set together; when
+/// `per_engine` the selector is the per-engine `ignition_on` array (the DC-3),
+/// otherwise the single `ignition_key` (the GA singles).
+pub struct SetMagnetos {
+    pub engines: usize,
+    pub per_engine: bool,
+}
 
 #[derive(Deserialize)]
 struct MagArgs {
@@ -524,8 +550,13 @@ impl Tool for SetMagnetos {
             "both" => 3,
             other => return Ok(format!("I didn't catch the magneto position '{other}'. Say off, left, right, or both.")),
         };
-        ctx.xplane.set_int_array_elem(IGNITION_KEY, 0, key).await?;
-        let actual = ctx.xplane.get_float_array(IGNITION_KEY).await?.first().copied().unwrap_or(-1.0).round() as i64;
+        let dref = if self.per_engine { IGNITION_ON } else { IGNITION_KEY };
+        if self.per_engine {
+            set_each_engine(ctx, IGNITION_ON, self.engines, key).await?;
+        } else {
+            ctx.xplane.set_int_array_elem(IGNITION_KEY, 0, key).await?;
+        }
+        let actual = ctx.xplane.get_float_array(dref).await?.first().copied().unwrap_or(-1.0).round() as i64;
         let name = match actual { 0 => "off", 1 => "right", 2 => "left", 3 => "both", 4 => "start", _ => "unknown" };
         Ok(format!("Roger, magnetos {name}."))
     }
