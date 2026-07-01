@@ -897,10 +897,29 @@ async fn run_session(
         } else {
             grammar::try_parse(&matchable, &registry, &profile)
         };
+        // A recognized command whose CAPABILITY this airframe lacks (an autopilot
+        // command on the AP-less DC-3) — decline honestly rather than fall through
+        // to "Say again?" or a vague LLM answer.
+        if fast.is_none() {
+            if let Some(msg) = grammar::declined(&matchable, &registry) {
+                tracing::info!(path = "declined", "command path");
+                say(&voice, &reporter, ui::LogKind::Readback, &msg);
+                continue;
+            }
+        }
+        // Whether the answer-only LLM fallback is live for THIS utterance. The
+        // plugin's panel button (dataref `xcopilot/llm_enabled`) overrides the
+        // startup default when set: 1 = on, 0 = off, and -1 / cache-miss (plugin
+        // untouched or not loaded) falls back to the XCOPILOT_LLM startup value.
+        let llm_enabled_now = match live.get(DR_LLM_ENABLED) {
+            Some(v) if v >= 0.5 => true,
+            Some(v) if v > -0.5 => false,
+            _ => config.llm_enabled,
+        };
         let calls = if let Some(c) = fast {
             tracing::info!(path = "fast", tool = c.first().map(|x| x.name.as_str()).unwrap_or(""), "command path");
             c
-        } else if config.llm_enabled {
+        } else if llm_enabled_now {
             // Fast-path missed and the LLM is enabled: ANSWER-ONLY fallback. It is
             // called with no tools and cannot actuate — only the deterministic
             // grammar ever calls a tool. A genuine question gets a one-line spoken
@@ -914,10 +933,12 @@ async fn run_session(
             match answer {
                 Ok(Some(text)) => say(&voice, &reporter, ui::LogKind::Readback, &text),
                 Ok(None) => {
+                    // Heard clearly, but the answer-only LLM had no useful reply
+                    // (not a question, or out of scope). Same as a grammar miss:
+                    // negative tone on PTT, no misleading spoken "Say again?".
+                    reporter.log(ui::LogKind::Warn, format!("no match: \"{command}\""));
                     if explicit {
-                        say(&voice, &reporter, ui::LogKind::Warn, "Say again?");
-                    } else {
-                        reporter.log(ui::LogKind::Info, format!("no response: \"{command}\""));
+                        voice.negative();
                     }
                 }
                 Err(e) => {
@@ -927,13 +948,15 @@ async fn run_session(
             }
             continue;
         } else {
-            // Fully deterministic (LLM disabled, the default): nothing recognized it.
-            // Never guess — ask the pilot to repeat.
+            // Fully deterministic (LLM disabled, the default): nothing recognized
+            // it. The transcript was clear (it passed the confidence gate), so a
+            // spoken "Say again?" would falsely imply a mishear and repeating won't
+            // help. Log the miss to the panel and, when addressed directly (PTT),
+            // acknowledge with the negative tone. Continuous mode stays silent.
             tracing::info!(path = "deterministic-miss", "command path");
+            reporter.log(ui::LogKind::Warn, format!("unrecognized: \"{command}\""));
             if explicit {
-                say(&voice, &reporter, ui::LogKind::Warn, "Say again?");
-            } else {
-                reporter.log(ui::LogKind::Info, format!("unrecognized: \"{command}\""));
+                voice.negative();
             }
             continue;
         };
@@ -1046,6 +1069,30 @@ async fn run_session(
             // undo should switch it back off (not leave it flying the reset dial).
             let ap_was_off = engages_autopilot(&call.name)
                 && matches!(xplane.get_float(datarefs::SERVOS_ON).await, Ok(v) if v <= 0.5);
+            // Snap the camera to the panel for this action, if the airframe has a
+            // saved view for it — so you watch the switch move instead of hunting for
+            // it. Remember the current view first (to restore after the glance), then
+            // select the 3D cockpit and write the saved head position, then settle a
+            // beat BEFORE the action so your eye lands on the panel as the switch
+            // moves (not while the camera is still travelling). All best-effort.
+            let restore_view: Option<[f64; 6]> = if let Some(v) = profile.view_map.get(&call.name) {
+                let mut cur = [0.0f64; 6];
+                let mut have_cur = true;
+                for (slot, dref) in cur.iter_mut().zip(HEAD_DREFS) {
+                    match xplane.get_float(dref).await {
+                        Ok(read) => *slot = read,
+                        Err(_) => have_cur = false,
+                    }
+                }
+                let _ = xplane.run_command("sim/view/3d_cockpit_cmnd_look").await;
+                for (dref, val) in HEAD_DREFS.into_iter().zip([v.x, v.y, v.z, v.psi, v.the, v.phi]) {
+                    let _ = xplane.set_float(dref, val).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                have_cur.then_some(cur)
+            } else {
+                None
+            };
             let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice), status: reporter.status_sink(), reminders: Some(&reminders) };
             // Execute, retrying once on error: a single transient blip (a dropped
             // Web API request, including the autopilot-engage commands the client
@@ -1078,6 +1125,13 @@ async fn run_session(
             // of the time, "Roger,"/"Copy," occasionally); the canonical readback
             // is what's recorded for history context.
             say(&voice, &reporter, ui::LogKind::Readback, &readback::vary_ack(&readback));
+            // Glance done — return the camera to where it was before the snap (the
+            // readback just played, so you've seen the switch move).
+            if let Some(head) = restore_view {
+                for (dref, val) in HEAD_DREFS.into_iter().zip(head) {
+                    let _ = xplane.set_float(dref, val).await;
+                }
+            }
             turn_readbacks.push(readback);
         }
 
@@ -1607,7 +1661,27 @@ const SNAPSHOT_DATAREFS: &[&str] = &[
     datarefs::WIND_SPEED_MSC, datarefs::OAT_DEG_C, datarefs::VISIBILITY_SM,
     datarefs::QNH_PASCALS, datarefs::SERVOS_ON, datarefs::APPROACH_STATUS,
     datarefs::NAV_STATUS, datarefs::HEADING_STATUS,
+    DR_LLM_ENABLED,
 ];
+
+/// The 3D-cockpit camera position (pilot's-head datarefs) — read to remember the
+/// current view before a snap-to-panel, and written to restore it after. Order is
+/// x, y, z (metres from CG), then psi, the, phi (view angles, degrees).
+const HEAD_DREFS: [&str; 6] = [
+    "sim/graphics/view/pilots_head_x",
+    "sim/graphics/view/pilots_head_y",
+    "sim/graphics/view/pilots_head_z",
+    "sim/graphics/view/pilots_head_psi",
+    "sim/graphics/view/pilots_head_the",
+    "sim/graphics/view/pilots_head_phi",
+];
+
+/// The plugin's runtime LLM-fallback toggle (see plugin/src/xcopilot.cpp). Polled
+/// live through the snapshot cache so the panel button takes effect on the next
+/// utterance. `-1` = untouched (follow the `XCOPILOT_LLM` startup default), `0` =
+/// forced off, `1` = forced on. Absent (plugin not loaded) reads as a cache miss,
+/// which also falls back to the startup default.
+const DR_LLM_ENABLED: &str = "xcopilot/llm_enabled";
 
 /// Read a dataref preferring the live-state cache (instant, no round-trip), with a
 /// REST read as the fallback on a cache miss — so it's never worse than polling
@@ -2770,9 +2844,12 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "throttle", "thrust", "power", "idle", "mixture", "rich", "lean", "engine",
     "engines", "start", "ignition", "shutdown", "magneto", "magnetos", "mags", "carb",
     "carburetor", "fuel", "pump", "boost", "primer", "selector",
+    // constant-speed props ("props", so len>=5 fuzzy also catches whisper's
+    // "prope"/"propp"; "rpm" for the explicit-RPM phrasing).
+    "prop", "props", "propeller", "propellers", "rpm", "feather",
     // electrical
     "battery", "alternator", "generator", "avionics", "electrical", "electric",
-    "electrics", "bus", "master",
+    "electrics", "bus", "master", "inverter", "inverters", "efis",
     // radios / transponder
     "com", "comm", "radio", "frequency", "tune", "squawk", "transponder",
     "ident", "barometer", "altimeter", "baro", "kollsman", "qnh", "vor",
@@ -2804,6 +2881,11 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "wake", "remind", "notify", "heads-up", "reminder", "reminders", "cancel",
     // emergency abort/undo of the last action
     "belay", "undo", "abort", "disregard", "scratch", "revert",
+    // camera / view control. (No "spot" — it collides with "spotlight" once the
+    // light-suffix strip runs; "spot view"/"spot camera" pass via view/camera.)
+    "view", "camera", "external", "outside", "chase", "orbit", "cockpit",
+    // emergency recovery / take-control + autoland handoff ("land"/"ground" already above)
+    "recover", "stabilize", "stabilise", "control", "controls", "autoland",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,

@@ -87,6 +87,11 @@ pub struct Config {
     /// default (macOS `Glass.aiff`). Point it at any sound you like, including one
     /// pulled from X-Plane's `Resources/sounds`. `XCOPILOT_CHIME`.
     pub chime_path: String,
+    /// Sound played when the copilot heard you clearly but the command wasn't
+    /// recognized (a short negative tone, so a miss is acknowledged without the
+    /// misleading spoken "Say again?"). A WAV/AIFF path; empty = a platform default
+    /// (macOS `Basso.aiff`). `XCOPILOT_NEGATIVE_TONE`.
+    pub negative_tone_path: String,
     /// The `piper` binary to shell out to (used when `tts_backend = "piper"`).
     pub piper_binary: String,
     /// Path to a piper voice model (`.onnx`); the matching `.onnx.json` must sit beside it.
@@ -148,6 +153,7 @@ impl Config {
             say_voice: env_or("XCOPILOT_SAY_VOICE", ""),
             say_rate: env_or("XCOPILOT_SAY_RATE", ""),
             chime_path: env_or("XCOPILOT_CHIME", ""),
+            negative_tone_path: env_or("XCOPILOT_NEGATIVE_TONE", ""),
             piper_binary: env_or("PIPER_BIN", "piper"),
             piper_voice: env_or("PIPER_VOICE", "models/en_US-amy-medium.onnx"),
             nav_data_path: env_or(

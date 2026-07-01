@@ -10,6 +10,9 @@
 //   xcopilot/status/heard  (text: last transcript)
 //   xcopilot/status/action (text: last readback)
 // rendered as a toolbar of status chips + a scrolling transmission log.
+// The toolbar also carries an LLM-fallback toggle button driving the readable
+// dataref `xcopilot/llm_enabled` (-1 auto / 0 off / 1 on), which the app polls
+// each utterance to enable/disable its answer-only LLM fallback live.
 // Toggle via Plugins → x-copilot.
 //
 // Build/install: see plugin/README.md.
@@ -65,6 +68,18 @@ static int PttCommandHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
     return 1;
 }
 static int ReadPttActive(void*) { return g_ptt_active; }
+
+// ---- LLM fallback toggle ----------------------------------------------------
+
+// A runtime switch the panel flips and the app reads live (each utterance), so
+// the answer-only LLM fallback can be turned on/off mid-flight without a restart.
+//   -1 = untouched → the app follows its own XCOPILOT_LLM startup default
+//    0 = forced off
+//    1 = forced on
+static int g_llm_enabled = -1;
+static XPLMDataRef g_llm_dref = nullptr;
+static int ReadLlmEnabled(void*) { return g_llm_enabled; }
+static void WriteLlmEnabled(void*, int v) { g_llm_enabled = v; }
 
 // ---- status datarefs --------------------------------------------------------
 
@@ -407,6 +422,17 @@ protected:
         } else {
             Chip("NOT CONNECTED", COL_RED);
         }
+        // LLM fallback toggle: flip the answer-only LLM on/off live (the app reads
+        // this dataref each utterance). AUTO until first click = follow the app's
+        // startup default; clicking commits it to a definite ON/OFF thereafter.
+        ImGui::SameLine();
+        const char* llmLbl = g_llm_enabled < 0 ? "LLM AUTO" : (g_llm_enabled ? "LLM ON" : "LLM OFF");
+        ImU32 llmCol = g_llm_enabled < 0 ? COL_CYAN : (g_llm_enabled ? COL_GREEN : COL_DIM);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(llmCol));
+        if (ImGui::SmallButton(llmLbl)) {
+            g_llm_enabled = (g_llm_enabled == 1) ? 0 : 1; // AUTO/OFF -> ON, ON -> OFF
+        }
+        ImGui::PopStyleColor();
         // Collapse / expand to just this toolbar row, to tuck the panel away.
         ImGui::SameLine();
         if (ImGui::SmallButton(mCollapsed ? "+" : "_")) {
@@ -507,6 +533,10 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         "xcopilot/fms/load", xplmType_Int, 1,
         ReadFmsLoad, WriteFmsLoad, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_llm_dref = XPLMRegisterDataAccessor(
+        "xcopilot/llm_enabled", xplmType_Int, 1,
+        ReadLlmEnabled, WriteLlmEnabled, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
 
     // One shared font atlas for all ImgWindows (uses ImGui's default font).
     ImgWindow::sFontAtlas = std::make_shared<ImgFontAtlas>();
@@ -534,6 +564,7 @@ PLUGIN_API void XPluginStop(void) {
     g_panel.reset();
     ImgWindow::sFontAtlas.reset();
     if (g_menu) { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
+    if (g_llm_dref) { XPLMUnregisterDataAccessor(g_llm_dref); g_llm_dref = nullptr; }
     if (g_fms_load_dref) { XPLMUnregisterDataAccessor(g_fms_load_dref); g_fms_load_dref = nullptr; }
     if (g_fms_route_dref) { XPLMUnregisterDataAccessor(g_fms_route_dref); g_fms_route_dref = nullptr; }
     if (g_aircraft_dref) { XPLMUnregisterDataAccessor(g_aircraft_dref); g_aircraft_dref = nullptr; }

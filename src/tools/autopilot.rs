@@ -91,9 +91,60 @@ const VS_CONFIRM_DESCENT_FPM: f64 = -1500.0;
 /// sensible rates execute directly — the unsafe-target gate is the real safety net.
 const CLIMB_CONFIRM_RATE_FPM: f64 = 1500.0;
 
+/// Per-airframe autopilot engagement prerequisites (from the profile's
+/// `autopilot_prep`). Empty/`false` for the GA singles, which just need servos-on.
+#[derive(Clone)]
+pub struct ApConfig {
+    /// Commands to raise the flight director before engaging the servos.
+    pub fd_commands: Vec<String>,
+    /// The AP is AC-powered (needs an inverter) — drives the honest failure hint.
+    pub ac_powered: bool,
+    /// Service ceiling (ft MSL) — altitude targets above it are refused. From the
+    /// airframe's reference figures; falls back to the GA default.
+    pub service_ceiling_ft: f64,
+}
+
+impl Default for ApConfig {
+    fn default() -> Self {
+        Self { fd_commands: Vec::new(), ac_powered: false, service_ceiling_ft: DEFAULT_SERVICE_CEILING_FT }
+    }
+}
+
+/// Standard X-Plane inverter status (array; any element > 0 = AC power available).
+const INVERTER_ON: &str = "sim/cockpit2/electrical/inverter_on";
+
 /// Read the servo status as a bool ("is the autopilot actually flying").
 async fn servos_engaged(ctx: &ToolCtx<'_>) -> Result<bool> {
     Ok(ctx.xplane.get_float(SERVOS_ON).await? > 0.5)
+}
+
+/// Raise the flight director (if this airframe needs it) then engage the servos.
+/// The C90's `fd_monitor` drops the servos unless the FD switch is up, so the FD
+/// commands must fire first.
+async fn engage_ap(ctx: &ToolCtx<'_>, cfg: &ApConfig) -> Result<()> {
+    for c in &cfg.fd_commands {
+        ctx.xplane.run_command(c).await?;
+    }
+    ctx.xplane.run_command(CMD_SERVOS_ON).await?;
+    Ok(())
+}
+
+/// The honest reason the servos didn't latch, for the failure readback. On an
+/// AC-powered AP with no inverter on, that's the real cause; otherwise fall back to
+/// the generic AP-master check.
+async fn no_engage_reason(ctx: &ToolCtx<'_>, cfg: &ApConfig) -> &'static str {
+    if cfg.ac_powered {
+        let any_inverter = ctx
+            .xplane
+            .get_float_array(INVERTER_ON)
+            .await
+            .map(|v| v.iter().any(|&x| x > 0.5))
+            .unwrap_or(false);
+        if !any_inverter {
+            return "the autopilot has no AC power, turn the inverter on";
+        }
+    }
+    "check the AP master"
 }
 
 /// Read a mode's 0/1-ish status dataref ("is this mode armed/engaged").
@@ -130,9 +181,10 @@ const MAX_DESCENT_FPM: f64 = 1000.0;
 const CLIMB_MIN_KTS: f64 = 60.0;
 /// How much to ease (or restore) the climb rate per check, fpm.
 const VS_TRIM_FPM: f64 = 100.0;
-/// Altitude targets above this (ft MSL) are refused — above the airframe's
-/// service ceiling it can't get there. (Per-airframe later; 172 ≈ 14,000.)
-const SERVICE_CEILING_FT: f64 = 14_000.0;
+/// Default service ceiling (ft MSL) when the airframe declares none — the 172's.
+/// Real airframes override it via their reference `service_ceiling_ft` (the C90B is
+/// 28,100), threaded in through [`ApConfig`].
+const DEFAULT_SERVICE_CEILING_FT: f64 = 14_000.0;
 /// Minimum height above the terrain below (ft) an altitude target may be. Replaces
 /// a fixed MSL floor, which is meaningless at a high-elevation airport.
 const MIN_TARGET_AGL_FT: f64 = 500.0;
@@ -170,11 +222,11 @@ fn terrain_floor_ft(current_msl: f64, agl_m: f64) -> f64 {
 /// Reject an altitude target that's above the ceiling or into the terrain. Returns
 /// `Some(refusal)` to speak back, or `None` if the target is safe to fly to. Fails
 /// safe: if the terrain read is unavailable, falls back to the fixed MSL floor.
-async fn reject_unsafe_target(ctx: &ToolCtx<'_>, target: f64) -> Option<String> {
-    if target > SERVICE_CEILING_FT {
+async fn reject_unsafe_target(ctx: &ToolCtx<'_>, target: f64, ceiling: f64) -> Option<String> {
+    if target > ceiling {
         return Some(format!(
             "Negative — {target:.0} feet is above this aircraft's service ceiling. \
-             Say something at or below {SERVICE_CEILING_FT:.0}."
+             Say something at or below {ceiling:.0}."
         ));
     }
     let agl = ctx.xplane.get_float(crate::datarefs::AGL_METERS).await.ok();
@@ -206,7 +258,12 @@ async fn reject_unsafe_target(ctx: &ToolCtx<'_>, target: f64) -> Option<String> 
 /// from current altitude. Returns ("Climbing to" | "Descending to" | "Holding at",
 /// commanded_fpm_magnitude, servos_engaged).
 /// `rate` is the magnitude in fpm; `None` auto-scales it to the altitude change.
-async fn fly_to(ctx: &ToolCtx<'_>, altitude: f64, rate: Option<f64>) -> Result<(&'static str, f64, bool)> {
+async fn fly_to(ctx: &ToolCtx<'_>, altitude: f64, rate: Option<f64>, cfg: &ApConfig) -> Result<(&'static str, f64, bool)> {
+    // Raise the flight director first (some airframes' AP won't hold without it);
+    // arm_altitude then engages the servos.
+    for c in &cfg.fd_commands {
+        ctx.xplane.run_command(c).await?;
+    }
     let (movement, signed, capture) = arm_altitude(ctx, altitude, rate).await?;
     // A climb/descent needs the watcher to level us off (and ease a climb throttle);
     // a hold is already done. The watcher calls out the level-off when it reaches
@@ -473,7 +530,9 @@ fn capture_at_altitude(
     });
 }
 
-pub struct SetHeading;
+pub struct SetHeading {
+    pub cfg: ApConfig,
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -521,7 +580,7 @@ impl Tool for SetHeading {
         // Engage the autopilot and mode FIRST, then write the bug LAST —
         // engaging a mode can snap the dial to a current value, so the target
         // must be the final write or it gets clobbered.
-        ctx.xplane.run_command(CMD_SERVOS_ON).await?;
+        engage_ap(ctx, &self.cfg).await?;
         engage_mode(ctx, HEADING_STATUS, CMD_HEADING_MODE).await?;
         ctx.xplane.set_float(HEADING_BUG, heading).await?;
 
@@ -531,14 +590,17 @@ impl Tool for SetHeading {
             Ok(format!("Roger — autopilot engaged, heading mode, bug to {:03.0}.", actual))
         } else {
             Ok(format!(
-                "Heading bug set to {:03.0}, but the autopilot didn't engage — check the AP master.",
-                actual
+                "Heading bug set to {:03.0}, but the autopilot didn't engage — {}.",
+                actual,
+                no_engage_reason(ctx, &self.cfg).await
             ))
         }
     }
 }
 
-pub struct Navigate;
+pub struct Navigate {
+    pub cfg: ApConfig,
+}
 
 #[async_trait]
 impl Tool for Navigate {
@@ -564,7 +626,7 @@ impl Tool for Navigate {
         // GPSS. Engage GPSS first; fall back to NAV for any AP that tracks the GPS
         // under NAV instead (keeps the simpler GA setups working).
         ctx.xplane.run_command(CMD_HSI_GPS).await?;
-        ctx.xplane.run_command(CMD_SERVOS_ON).await?;
+        engage_ap(ctx, &self.cfg).await?;
         engage_mode(ctx, GPSS_STATUS, CMD_GPSS).await?;
         let mut lnav = mode_engaged(ctx, GPSS_STATUS).await;
         if !lnav {
@@ -577,14 +639,17 @@ impl Tool for Navigate {
             (true, false) => {
                 Ok("GPS selected and servos on, but LNAV didn't engage — check the autopilot.".to_string())
             }
-            (false, _) => {
-                Ok("Set GPS nav, but the autopilot didn't engage, check the AP master.".to_string())
-            }
+            (false, _) => Ok(format!(
+                "Set GPS nav, but the autopilot didn't engage — {}.",
+                no_engage_reason(ctx, &self.cfg).await
+            )),
         }
     }
 }
 
-pub struct SetAltitude;
+pub struct SetAltitude {
+    pub cfg: ApConfig,
+}
 
 #[derive(Deserialize)]
 struct AltArgs {
@@ -637,22 +702,23 @@ impl Tool for SetAltitude {
         // Safety gate: refuse a target into the terrain or above the ceiling rather
         // than fly the aircraft toward the ground. "auto level" with no number lands
         // here as 0 feet — refused, and pointed at the right tool.
-        if let Some(refusal) = reject_unsafe_target(ctx, altitude).await {
+        if let Some(refusal) = reject_unsafe_target(ctx, altitude, self.cfg.service_ceiling_ft).await {
             return Ok(refusal);
         }
 
         // Fly to it: arm the altitude AND command a vertical speed (ALT hold alone
         // won't change altitude on this AP), at a rate scaled to the change, then
         // capture and level off.
-        let (movement, _fpm, engaged) = fly_to(ctx, altitude, None).await?;
+        let (movement, _fpm, engaged) = fly_to(ctx, altitude, None, &self.cfg).await?;
         // fly_to firewalls the throttle on a climb; say so.
         let power = if movement.starts_with("Climbing") { "full power, " } else { "" };
         if engaged {
             Ok(format!("Roger — {power}{} {altitude:.0} feet.", movement.to_lowercase()))
         } else {
             Ok(format!(
-                "Set to {} {altitude:.0} feet, but the autopilot didn't engage — check the AP master.",
-                movement.to_lowercase()
+                "Set to {} {altitude:.0} feet, but the autopilot didn't engage — {}.",
+                movement.to_lowercase(),
+                no_engage_reason(ctx, &self.cfg).await
             ))
         }
     }
@@ -661,7 +727,9 @@ impl Tool for SetAltitude {
 /// `level_off` — capture the current altitude, level the wings, and hold. The
 /// "auto level / straight and level" command, which has no target (it holds
 /// where you are now), so it can't be expressed as `set_altitude`.
-pub struct LevelOff;
+pub struct LevelOff {
+    pub cfg: ApConfig,
+}
 
 #[async_trait]
 impl Tool for LevelOff {
@@ -687,7 +755,7 @@ impl Tool for LevelOff {
         let current = ctx.xplane.get_float(CURRENT_ALT).await?;
         let target = (current / 100.0).round() * 100.0;
 
-        ctx.xplane.run_command(CMD_SERVOS_ON).await?;
+        engage_ap(ctx, &self.cfg).await?;
         ctx.xplane.run_command(CMD_WING_LEVELER).await?;
         engage_mode(ctx, ALT_HOLD_STATUS, CMD_ALT_HOLD).await?;
         ctx.xplane.set_float(ALT_DIAL, target).await?;
@@ -704,13 +772,16 @@ impl Tool for LevelOff {
             Ok(format!("Roger, wings level, cruise power, holding {target:.0} feet."))
         } else {
             Ok(format!(
-                "Set to hold {target:.0} feet, but the autopilot didn't engage — check the AP master."
+                "Set to hold {target:.0} feet, but the autopilot didn't engage — {}.",
+                no_engage_reason(ctx, &self.cfg).await
             ))
         }
     }
 }
 
-pub struct SetVerticalSpeed;
+pub struct SetVerticalSpeed {
+    pub cfg: ApConfig,
+}
 
 #[derive(Deserialize)]
 struct VsArgs {
@@ -770,7 +841,7 @@ impl Tool for SetVerticalSpeed {
         // what makes the aircraft fly the value we confirmed. The command is a
         // toggle, so guard it: a repeat VS command must not switch the mode back
         // off (which would leave the dial holding a value the AP isn't flying).
-        ctx.xplane.run_command(CMD_SERVOS_ON).await?;
+        engage_ap(ctx, &self.cfg).await?;
         engage_mode(ctx, VS_STATUS, CMD_VS_MODE).await?;
         ctx.xplane.set_float(VS_DIAL, fpm).await?;
 
@@ -781,7 +852,10 @@ impl Tool for SetVerticalSpeed {
         match (servos_engaged(ctx).await?, mode_engaged(ctx, VS_STATUS).await) {
             (true, true) => Ok(format!("Roger — autopilot engaged, vertical speed mode, {phrase}.")),
             (true, false) => Ok(format!("{phrase} dialed, but vertical speed mode didn't latch — check the AP.")),
-            (false, _) => Ok(format!("{phrase} set, but the autopilot didn't engage — check the AP master.")),
+            (false, _) => Ok(format!(
+                "{phrase} set, but the autopilot didn't engage — {}.",
+                no_engage_reason(ctx, &self.cfg).await
+            )),
         }
     }
 }
@@ -790,7 +864,9 @@ impl Tool for SetVerticalSpeed {
 /// level off. Sets the AP target altitude AND vertical speed and lets the
 /// autopilot capture the altitude (it levels off on its own — no copilot polling
 /// loop, no overshoot). Direction is inferred from target vs current altitude.
-pub struct SetClimb;
+pub struct SetClimb {
+    pub cfg: ApConfig,
+}
 
 #[derive(Deserialize)]
 struct ClimbArgs {
@@ -846,7 +922,7 @@ impl Tool for SetClimb {
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: ClimbArgs = serde_json::from_value(args.clone())?;
         let altitude = args.altitude.max(0.0);
-        if let Some(refusal) = reject_unsafe_target(ctx, altitude).await {
+        if let Some(refusal) = reject_unsafe_target(ctx, altitude, self.cfg.service_ceiling_ft).await {
             return Ok(refusal);
         }
         // A zero (or near-zero) rate would arm the target but command VS 0 and skip
@@ -854,7 +930,7 @@ impl Tool for SetClimb {
         // The schema permits fpm 0, so treat anything under 1 fpm as "unspecified"
         // and auto-scale the rate, the same as a plain set_altitude.
         let rate = (args.fpm.abs() >= 1.0).then(|| args.fpm.abs().min(2000.0));
-        let (movement, fpm, engaged) = fly_to(ctx, altitude, rate).await?;
+        let (movement, fpm, engaged) = fly_to(ctx, altitude, rate, &self.cfg).await?;
         let power = if movement.starts_with("Climbing") { "full power, " } else { "" };
         if engaged {
             Ok(format!(
@@ -863,8 +939,9 @@ impl Tool for SetClimb {
             ))
         } else {
             Ok(format!(
-                "Set to {} {altitude:.0} feet, but the autopilot didn't engage — check the AP master.",
-                movement.to_lowercase()
+                "Set to {} {altitude:.0} feet, but the autopilot didn't engage — {}.",
+                movement.to_lowercase(),
+                no_engage_reason(ctx, &self.cfg).await
             ))
         }
     }
@@ -890,6 +967,12 @@ impl Tool for AutopilotOff {
     }
 
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        // Also release an active emergency recovery — "my controls" hands the
+        // aircraft fully back to the pilot (controls and autopilot). If a recovery
+        // was actually flying, acknowledge *that* rather than the AP-off wording.
+        if crate::tools::recover::abort() {
+            return Ok("You have the aircraft.".to_string());
+        }
         if !servos_engaged(ctx).await? {
             return Ok("Autopilot's already off.".to_string());
         }
@@ -1112,17 +1195,17 @@ mod tests {
             (crate::datarefs::AGL_METERS, 1000.0 / METERS_TO_FEET),
         ]);
         let cfg = crate::config::Config::default();
-        let refusal = reject_unsafe_target(&ctx(&fake, &cfg), 3000.0).await;
+        let refusal = reject_unsafe_target(&ctx(&fake, &cfg), 3000.0, DEFAULT_SERVICE_CEILING_FT).await;
         assert!(refusal.is_some(), "target into terrain must be refused");
         // A target well above the floor is accepted.
-        assert!(reject_unsafe_target(&ctx(&fake, &cfg), 8000.0).await.is_none());
+        assert!(reject_unsafe_target(&ctx(&fake, &cfg), 8000.0, DEFAULT_SERVICE_CEILING_FT).await.is_none());
     }
 
     #[tokio::test]
     async fn reject_target_above_ceiling() {
         let fake = FakeXPlane::new();
         let cfg = crate::config::Config::default();
-        assert!(reject_unsafe_target(&ctx(&fake, &cfg), SERVICE_CEILING_FT + 1000.0).await.is_some());
+        assert!(reject_unsafe_target(&ctx(&fake, &cfg), DEFAULT_SERVICE_CEILING_FT + 1000.0, DEFAULT_SERVICE_CEILING_FT).await.is_some());
     }
 
     #[tokio::test]
@@ -1130,7 +1213,7 @@ mod tests {
         // No AGL preset → terrain read fails → fall back to the fixed MSL floor.
         let fake = FakeXPlane::with_reads(&[(CURRENT_ALT, 600.0)]);
         let cfg = crate::config::Config::default();
-        assert!(reject_unsafe_target(&ctx(&fake, &cfg), 300.0).await.is_some(), "below MSL floor");
-        assert!(reject_unsafe_target(&ctx(&fake, &cfg), 5000.0).await.is_none(), "above MSL floor");
+        assert!(reject_unsafe_target(&ctx(&fake, &cfg), 300.0, DEFAULT_SERVICE_CEILING_FT).await.is_some(), "below MSL floor");
+        assert!(reject_unsafe_target(&ctx(&fake, &cfg), 5000.0, DEFAULT_SERVICE_CEILING_FT).await.is_none(), "above MSL floor");
     }
 }

@@ -11,6 +11,7 @@
 //! LLM server expects.
 
 pub mod approach;
+pub mod autoland;
 pub mod autopilot;
 pub mod controls;
 pub mod cycle;
@@ -23,8 +24,11 @@ pub mod ground;
 pub mod instruments;
 pub mod lights;
 pub mod power;
+pub mod prop;
 pub mod radio;
+pub mod recover;
 pub mod reminder;
+pub mod view;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -105,6 +109,11 @@ impl Registry {
     pub fn for_aircraft(profile: &AircraftProfile) -> Self {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
 
+        // Camera/view control is airframe-independent — every aircraft has views.
+        tools.push(Box::new(view::SetView));
+        // Emergency autoland handoff (to the separate plugin) — airframe-independent.
+        tools.push(Box::new(autoland::Autoland));
+
         if let Some(flaps) = &profile.flaps {
             tools.push(Box::new(flaps::SetFlaps::new(flaps.clone())));
         }
@@ -122,18 +131,45 @@ impl Registry {
         }
 
         if profile.autopilot {
-            tools.push(Box::new(autopilot::SetHeading));
-            tools.push(Box::new(autopilot::Navigate));
-            tools.push(Box::new(autopilot::SetAltitude));
-            tools.push(Box::new(autopilot::SetVerticalSpeed));
-            tools.push(Box::new(autopilot::SetClimb));
-            tools.push(Box::new(autopilot::LevelOff));
+            // Per-airframe engagement prerequisites (FD switch, AC power) — the C90
+            // needs them; the GA singles leave this default (plain servos-on).
+            let prep = profile.autopilot_prep.clone().unwrap_or_default();
+            // Altitude gate uses the airframe's real service ceiling (the C90B is
+            // 28,100 ft) rather than the GA default, so a valid high climb isn't refused.
+            let ceiling = profile
+                .reference
+                .as_ref()
+                .and_then(|r| r.service_ceiling_ft)
+                .unwrap_or(autopilot::ApConfig::default().service_ceiling_ft);
+            let ap = autopilot::ApConfig {
+                fd_commands: prep.flight_director,
+                ac_powered: prep.ac_powered,
+                service_ceiling_ft: ceiling,
+            };
+            tools.push(Box::new(autopilot::SetHeading { cfg: ap.clone() }));
+            tools.push(Box::new(autopilot::Navigate { cfg: ap.clone() }));
+            tools.push(Box::new(autopilot::SetAltitude { cfg: ap.clone() }));
+            tools.push(Box::new(autopilot::SetVerticalSpeed { cfg: ap.clone() }));
+            tools.push(Box::new(autopilot::SetClimb { cfg: ap.clone() }));
+            tools.push(Box::new(autopilot::LevelOff { cfg: ap.clone() }));
             tools.push(Box::new(autopilot::AutopilotOff));
+            // Emergency upset/stall recovery — takes the controls, so it needs the
+            // autopilot (for the level-hold handoff) present. It also drives the
+            // props full forward for max power, and holds ≈1.3×Vs.
+            tools.push(Box::new(recover::Recover {
+                cfg: ap,
+                prop: profile.prop.clone(),
+                stall_speed_kts: profile.vs_clean_kts.unwrap_or(60.0),
+            }));
         }
 
         // Thrust levers: any piston engine, or a turbine that declares `throttle`.
         if profile.engine || profile.throttle {
             tools.push(Box::new(engine::SetThrottle));
+        }
+        // Constant-speed propeller levers, when the airframe declares them.
+        if let Some(prop) = &profile.prop {
+            tools.push(Box::new(prop::SetProp::new(prop.clone())));
         }
         // Turbine start sequence (jets) — distinct from the piston one-shot start.
         if profile.turbine_start {

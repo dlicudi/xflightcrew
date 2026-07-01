@@ -716,6 +716,7 @@ mod tests {
             say_voice: String::new(),
             say_rate: String::new(),
             chime_path: String::new(),
+            negative_tone_path: String::new(),
             piper_binary: String::new(),
             piper_voice: String::new(),
             aircraft: "cessna_172sp".into(),

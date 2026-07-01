@@ -26,6 +26,14 @@ display_name: Beechcraft King Air C90B
 
 # Universal-dataref tools — work on this Laminar airframe.
 throttle: true         # power levers (set_throttle -> throttle_ratio_all) — NOT piston
+# Constant-speed props (set_prop). Dataref verified live with scripts/xp_watch.py
+# (the blue levers move prop_rotation_speed_rad_sec_all). PT6A-21: 2200 RPM redline
+# / takeoff, ~1900 cruise, ~1600 aft governing. The tool works in RPM and converts.
+prop:
+  dataref: sim/cockpit2/engine/actuators/prop_rotation_speed_rad_sec_all
+  max_rpm: 2200
+  cruise_rpm: 1900
+  min_rpm: 1600
 barometer: true        # set_barometer
 com_radio: true        # set_com1 (G530)
 com2_radio: true       # set_com2 / swap_radio (G430)
@@ -71,6 +79,26 @@ electrical:
     on_commands:  [sim/systems/avionics_on]
     off_commands: [sim/systems/avionics_off]
     readback:     [sim/cockpit2/switches/avionics_power_on]
+  # EFIS power — a SEPARATE switch from the avionics master (POM "Before Taxi":
+  # Avionics Master ON, then EFIS Power ON). Off = the Collins EADI/EHSI go black
+  # even with the bus/inverter/avionics all live. up/dn commands clamp to on/off
+  # (verified live: EFIS_power_up drove switch_pos 0→1 and lit the displays).
+  - key: efis
+    spoken: EFIS power
+    on_commands:  [laminar/c90/avionics/switch/EFIS_power_up]
+    off_commands: [laminar/c90/avionics/switch/EFIS_power_dn]
+    readback:     ["laminar/c90/avionics/switch_pos/EFIS_power"]
+  # Inverter selector (-1 INV2 / 0 off / 1 INV1) — the ONLY source of AC power, so
+  # with it off the EFIS/EADI go black and the autopilot won't engage (verified in
+  # C90_sys10_electrical.lua: ac_volts = bus * inverter_on). The selector command
+  # steps and clamps to [-1,1] (see C90_sys.lua handler), so a fixed sequence lands
+  # deterministically: up,up → INV1 on (clamped at 1); up,up,dn → pos 0, off. Each
+  # step's handler sets inverter_on[], so the readback confirms.
+  - key: inverter
+    spoken: inverter
+    on_commands:  [laminar/c90/electrical/switch/inverter_selector_up, laminar/c90/electrical/switch/inverter_selector_up]
+    off_commands: [laminar/c90/electrical/switch/inverter_selector_up, laminar/c90/electrical/switch/inverter_selector_up, laminar/c90/electrical/switch/inverter_selector_dn]
+    readback:     ["sim/cockpit2/electrical/inverter_on[0]"]
 
 # Turbine: no piston controls.
 engine: false
@@ -79,6 +107,12 @@ carb_heat: false
 turbine_start: false   # not the MD-82 jet sequence; this airframe uses turboprop_start below
 autopilot: true        # real AP — verified live (heading/alt-hold/VS all arm). Needs
 ils: true              # engines running for power; cold it won't engage (tool says so).
+# AP prerequisites beyond servos-on: the flight director switch must be up (the AP's
+# fd_monitor drops the servos otherwise) and the AP is AC-powered, so with the
+# inverter off it can't engage at all (verified in C90_sys70/10 lua).
+autopilot_prep:
+  flight_director: [laminar/c90/avionics/switch/fd_up]
+  ac_powered: true
 
 # PT6 turboprop start — verified live on this airframe. Per engine: condition
 # lever to low idle, fire the ignition/start switch UP (cranks + lights via the
@@ -98,6 +132,37 @@ speedbrake: false      # no speedbrakes on the C90
 directional_gyro: false
 flood_lights: true     # set_flood_lights — overhead flood is generic_lights_switch[0]
 flood_lights_dataref: "sim/cockpit2/switches/generic_lights_switch[0]"  # verified live (the BRT/OFF overhead flood knob)
+
+# Snap-to-panel: when the copilot actuates a mapped tool, it first jumps the camera
+# to a saved 3D-cockpit position so you WATCH the switch move. Each entry is a
+# pilot's-head position (metres from the CG + view angles in degrees), captured
+# live from your own framing — you point the camera at the panel and the copilot
+# reads/stores the position here (no fiddly quick-look saving). Unlimited entries;
+# several actions can share a view. Key = tool name (gear, set_flaps, set_prop,
+# set_electrical, set_lights, set_fuel_pump, set_com1, set_transponder, ...).
+view_map:
+  # Collins APS-65 autopilot panel (pedestal) — captured live from the pilot's
+  # framing. Shared by every AP command via a YAML anchor.
+  set_heading:        &ap_panel {x: -0.025, y: 0.854, z: -0.578, psi: 359.59, the: -84.74, phi: -0.01}
+  set_altitude:       *ap_panel
+  set_vertical_speed: *ap_panel
+  set_climb:          *ap_panel
+  navigate:           *ap_panel
+  level_off:          *ap_panel
+  autopilot_off:      *ap_panel
+  # Power quadrant (pedestal) — throttles, prop levers, condition levers.
+  set_throttle:       &quadrant {x: -0.062, y: 0.993, z: -0.747, psi: 359.32, the: -72.43, phi: 0.05}
+  set_prop:           *quadrant
+  start_engines:      *quadrant
+  stop_engines:       *quadrant
+  # Fuel panel (boost pumps, transfer, crossfeed).
+  set_fuel_pump:      {x: -0.129, y: 0.917, z: -0.873, psi: 276.64, the: -41.70, phi: -0.00}
+  # Lower switch subpanel — BAT/GEN/INVERTER/AVIONICS, the LIGHTS bank, the landing
+  # gear handle, ignition/start, anti-ice. Covers electrical, gear, lights, pitot.
+  set_electrical:     &subpanel {x: -0.394, y: 0.711, z: -0.377, psi: 359.79, the: -22.51, phi: 0.00}
+  gear:               *subpanel
+  set_lights:         *subpanel
+  set_pitot_heat:     *subpanel
 
 # Fuel-endurance alerting. Twin PT6 burns ~500 lb/hr total cruise (~230 kg/hr).
 fuel:

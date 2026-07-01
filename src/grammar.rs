@@ -63,6 +63,26 @@ pub fn normalize(transcript: &str) -> String {
         .trim()
         .to_lowercase()
         .replace(['\'', '\u{2019}'], "");
+    // Whisper mishearings: fixed homophone slips it makes on short cockpit
+    // commands, corrected before matching. "electrics on" comes back as "electric
+    // zone(s)" (the "s on" glues into "zone(s)") — nobody commands "electric
+    // zones", so the rewrite is safe. Plural before singular.
+    // Multi-word homophone slips — distinctive enough for a plain replace.
+    for (heard, meant) in [
+        ("electric system zones", "electrics on"),
+        ("electric systems zones", "electrics on"),
+        ("electric zones", "electrics on"),
+        ("electric zone", "electrics on"),
+    ] {
+        s = s.replace(heard, meant);
+    }
+    // Whole-word single-token slips: "crops"/"crop" → "props"/"prop" (whisper
+    // hears the p as a hard c; seen live on "Crops, cruise"). Pad with spaces so
+    // only the standalone word is rewritten, never a substring.
+    {
+        let fixed = format!(" {s} ").replace(" crops ", " props ").replace(" crop ", " prop ");
+        s = fixed.trim().to_string();
+    }
     loop {
         let before = s.clone();
         for w in LEAD {
@@ -84,6 +104,33 @@ pub fn normalize(transcript: &str) -> String {
         }
     }
     s
+}
+
+/// If the utterance is a recognizable command whose CAPABILITY this airframe
+/// lacks, return an honest spoken decline — so the caller says that instead of a
+/// bare "Say again?". The classic case: an autopilot command ("climb to 4000",
+/// "heading 270", "autopilot on") on an aircraft with no AP (the AWX DC-3).
+/// `None` = nothing to decline; fall through to the normal miss handling.
+pub fn declined(transcript: &str, registry: &Registry) -> Option<String> {
+    let t = normalize(transcript);
+    if t.is_empty() {
+        return None;
+    }
+    // Autopilot family. Guard the ambiguous words ("heading"/"altitude" are also
+    // questions) — but questions are handled before this is reached.
+    let ap_intent = t.contains("autopilot")
+        || t.contains("auto pilot")
+        || t.contains("climb to")
+        || t.contains("descend to")
+        || t.contains("level off")
+        || t.contains("nav mode")
+        || t.contains("vertical speed")
+        || t.contains("heading")
+        || t.contains("altitude");
+    if ap_intent && registry.get("set_heading").is_none() && registry.get("set_altitude").is_none() {
+        return Some("I don't have an autopilot on this aircraft.".to_string());
+    }
+    None
 }
 
 pub fn try_parse(
@@ -373,6 +420,86 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         }
     }
 
+    // Constant-speed prop levers — before throttle/power (a prop request never
+    // means the throttle). "props full forward", "props up", "props to cruise",
+    // "prop rpm 1900", "props to 1600", "coarse pitch". Match any token STARTING
+    // with "prop" so whisper's "prope"/"propp"/"propeller" all land, without
+    // grabbing "appropriate" mid-word. Named modes are the primary interface
+    // (robust where an RPM value is transcription-fragile); an explicit RPM still
+    // works, and a bare "props" asks which setting rather than missing.
+    let is_prop = t
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|w| w.starts_with("prop"));
+    if is_prop {
+        if let Some(n) = num {
+            return Some(call("set_prop", json!({ "rpm": n })));
+        }
+        // Whole-word matching for the short detent tokens — substring checks
+        // misfire ("flow" ⊃ "low", "backup" ⊃ "back", both seen in the logs).
+        // "take off" = whisper splitting "takeoff".
+        if has(t, "full") || has(t, "forward") || has(t, "up") || has(t, "high")
+            || has(t, "max") || has(t, "fine") || t.contains("takeoff") || t.contains("take off")
+        {
+            return Some(call("set_prop", json!({ "setting": "full" })));
+        }
+        // "cruz" = whisper mishearing "cruise" (seen live).
+        if t.contains("cruise") || has(t, "cruz") || has(t, "climb") {
+            return Some(call("set_prop", json!({ "setting": "cruise" })));
+        }
+        if has(t, "low") || has(t, "back") || has(t, "down")
+            || t.contains("coarse") || has(t, "min") || has(t, "aft")
+        {
+            return Some(call("set_prop", json!({ "setting": "low" })));
+        }
+        // A prop command with no target ("set props") — let the tool ask which
+        // setting rather than falling through to a bare miss.
+        return Some(call("set_prop", json!({})));
+    }
+
+    // Camera / view control. Trigger words are distinctive (they don't overlap
+    // flight commands), so a match here is unambiguous. "quick look N" / "view N"
+    // select a saved preset; the named views map to X-Plane's view commands.
+    let view_intent = has(t, "view")
+        || has(t, "camera")
+        || t.contains("quick look")
+        || has(t, "external")
+        || has(t, "outside")
+        || has(t, "chase")
+        || has(t, "spot")
+        || has(t, "orbit")
+        || t.contains("look forward")
+        || t.contains("look outside");
+    if view_intent {
+        if t.contains("quick look") {
+            if let Some(n) = num {
+                return Some(call("set_view", json!({ "quick_look": n })));
+            }
+        }
+        if has(t, "external") || has(t, "outside") || has(t, "chase") {
+            return Some(call("set_view", json!({ "view": "external" })));
+        }
+        if has(t, "spot") {
+            return Some(call("set_view", json!({ "view": "spot" })));
+        }
+        if has(t, "orbit") || has(t, "circle") || has(t, "circling") {
+            return Some(call("set_view", json!({ "view": "orbit" })));
+        }
+        if has(t, "free") {
+            return Some(call("set_view", json!({ "view": "free" })));
+        }
+        if has(t, "forward") || has(t, "front") || has(t, "cockpit") {
+            return Some(call("set_view", json!({ "view": "forward" })));
+        }
+        // "view 3" (no "quick look") → the same saved presets.
+        if let Some(n) = num {
+            return Some(call("set_view", json!({ "quick_look": n })));
+        }
+        // Bare "view" / "camera" → look forward.
+        if has(t, "view") || has(t, "camera") {
+            return Some(call("set_view", json!({ "view": "forward" })));
+        }
+    }
+
     // throttle / power ("power" is a throttle synonym: "power thirty percent",
     // "40 percent power", "maximum/full throttle", "idle").
     if has(t, "throttle") || has(t, "power") {
@@ -538,15 +665,24 @@ fn parse_one(t: &str) -> Option<ToolCall> {
             ("alternator", "alternator"),
             ("generator", "generator"),
             ("master", "master"),
+            // The inverter powers the C90's AC bus (avionics/EFIS/autopilot); on
+            // airframes without one the tool just lists what it has.
+            ("inverter", "inverter"),
+            ("inverters", "inverter"),
+            // EFIS power switch (separate from avionics master) — lights the EADI/EHSI.
+            ("efis", "efis"),
         ] {
             if has(t, kw) {
                 return Some(call("set_electrical", json!({ "system": key, "on": on })));
             }
         }
-        if has(t, "electrical") || has(t, "electrics") {
+        if has(t, "electrical") || has(t, "electrics") || has(t, "electric") {
             return Some(call("set_electrical", json!({ "system": "all", "on": on })));
         }
-        if t.contains("fuel pump") {
+        // "fuel pump(s)" or "boost pump(s)" — the King Air's standby boost pumps
+        // are what clears an L/R FUEL PRESS annunciator, and pilots call them
+        // either way. "boost" alone counts (whisper often drops "pump").
+        if t.contains("fuel pump") || t.contains("boost pump") || has(t, "boost") {
             return Some(call("set_fuel_pump", json!({ "on": on })));
         }
         if has(t, "pitot") {
@@ -586,12 +722,49 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         // align/sync/set gyro — also catches mishears like "think/zinc gyro".
         return Some(call("align_gyro", json!({})));
     }
+    // EMERGENCY recovery — take the controls and fly out of an upset/stall. The
+    // explicit "take control / recover / stabilize / save it" phrases only; calm
+    // "level off" / "wings level" below stays the gentle AP-hold.
+    if t.contains("take control")
+        || t.contains("you have control")
+        || t.contains("you have the aircraft")
+        || t.contains("your controls")
+        || has(t, "recover")
+        || has(t, "stabilize")
+        || has(t, "stabilise")
+        || t.contains("save it")
+        || t.contains("save the aircraft")
+        || t.contains("save us")
+        || t.contains("help me")
+    {
+        return Some(call("recover", json!({})));
+    }
+    // Emergency autoland — hand off to the autoland plugin. Cancel first so
+    // "cancel/stop the autoland" doesn't match the arm phrases.
+    if t.contains("cancel autoland") || t.contains("cancel the autoland")
+        || t.contains("stop autoland") || t.contains("stop the autoland")
+        || t.contains("cancel the landing")
+    {
+        return Some(call("autoland", json!({ "cancel": true })));
+    }
+    if t.contains("land the aircraft") || t.contains("land the plane")
+        || t.contains("land us") || t.contains("get us down") || t.contains("get us on the ground")
+        || has(t, "autoland") || t.contains("auto land") || t.contains("emergency landing")
+    {
+        return Some(call("autoland", json!({})));
+    }
     if t.contains("level off") || t.contains("level out") || t.contains("level the aircraft")
         || t.contains("wings level")
     {
         return Some(call("level_off", json!({})));
     }
-    if t.contains("autopilot off") || t.contains("cancel autopilot") || has(t, "disengage") {
+    // "my controls" / "I have the aircraft" hands it fully back (disengages the AP
+    // and releases any active recovery).
+    if t.contains("autopilot off") || t.contains("cancel autopilot") || has(t, "disengage")
+        || t.contains("my controls") || t.contains("my aircraft") || t.contains("my airplane")
+        || t.contains("i have control") || t.contains("i have the aircraft")
+        || t.contains("i have the airplane")
+    {
         return Some(call("autopilot_off", json!({})));
     }
 
@@ -791,6 +964,20 @@ mod tests {
         assert_eq!(one("descend 500").unwrap().1, json!({"fpm":-500}));
         assert_eq!(one("climb 500").unwrap().1, json!({"fpm":500}));
         assert_eq!(one("avionics on").unwrap(), ("set_electrical".into(), json!({"system":"avionics","on":true})));
+        // Inverter (C90 AC power) — resolves like any other electrical system.
+        assert_eq!(one("inverter on").unwrap(), ("set_electrical".into(), json!({"system":"inverter","on":true})));
+        assert_eq!(one("inverter off").unwrap(), ("set_electrical".into(), json!({"system":"inverter","on":false})));
+        // EFIS power switch (C90 EADI/EHSI displays).
+        assert_eq!(one("efis power on").unwrap(), ("set_electrical".into(), json!({"system":"efis","on":true})));
+        assert_eq!(one("efis on").unwrap(), ("set_electrical".into(), json!({"system":"efis","on":true})));
+        // "electrics on" both spoken cleanly and via whisper's "electric zone(s)" /
+        // "electric system(s)" slips — all resolve to the whole-system power call.
+        let elec = ("set_electrical".to_string(), json!({"system":"all","on":true}));
+        assert_eq!(one("electrics on").unwrap(), elec);
+        assert_eq!(one("electric systems on").unwrap(), elec);
+        assert_eq!(one("electric zones").unwrap(), elec);
+        assert_eq!(one("electric zone").unwrap(), elec);
+        assert_eq!(one("electric system zones").unwrap(), elec);
         // "power up" has no on/off token but must still resolve deterministically
         // (the main loop remaps set_electrical:all → power_up on auto_prep airframes).
         assert_eq!(one("power up").unwrap(), ("set_electrical".into(), json!({"system":"all","on":true})));
@@ -938,6 +1125,24 @@ mod tests {
     }
 
     #[test]
+    fn declines_autopilot_when_the_airframe_has_none() {
+        // The AWX DC-3 has no autopilot — AP commands must decline honestly, not
+        // fall through to "Say again?".
+        let prof = aircraft::load("dc3").expect("dc3 profile");
+        let reg = Registry::for_aircraft(&prof);
+        assert!(declined("climb to four thousand feet", &reg).is_some());
+        assert!(declined("autopilot on", &reg).is_some());
+        assert!(declined("turn heading north", &reg).is_some());
+        assert!(declined("descend to 3000", &reg).is_some());
+        // The Cessna HAS an autopilot — no decline (it acts on these).
+        let (creg, _) = setup();
+        assert!(declined("climb to 4000", &creg).is_none());
+        assert!(declined("heading 270", &creg).is_none());
+        // A non-AP command never declines here (handled elsewhere).
+        assert!(declined("flaps up", &reg).is_none());
+    }
+
+    #[test]
     fn word_detents_parse() {
         // Word-named detents (King Air approach/down, DC-3 quarter/half/three-
         // quarter) must parse to their label, not miss. `valid()` lets them through
@@ -947,5 +1152,82 @@ mod tests {
         assert_eq!(one("flaps half").unwrap().1, json!({ "notch": "half" }));
         assert_eq!(one("flaps quarter").unwrap().1, json!({ "notch": "quarter" }));
         assert_eq!(one("flaps three quarters").unwrap().1, json!({ "notch": "three-quarter" }));
+    }
+
+    #[test]
+    fn emergency_recover_and_release_resolve() {
+        // Emergency phrases → recover; calm "level off" stays level_off.
+        assert_eq!(one("take control").unwrap().0, "recover");
+        assert_eq!(one("recover the aircraft").unwrap().0, "recover");
+        assert_eq!(one("stabilize").unwrap().0, "recover");
+        assert_eq!(one("you have control").unwrap().0, "recover");
+        assert_eq!(one("save it").unwrap().0, "recover");
+        assert_eq!(one("level off").unwrap().0, "level_off");
+        // Handing it back → autopilot_off (which also aborts an active recovery).
+        assert_eq!(one("my controls").unwrap().0, "autopilot_off");
+        assert_eq!(one("i have the aircraft").unwrap().0, "autopilot_off");
+    }
+
+    #[test]
+    fn autoland_arm_and_cancel_resolve() {
+        assert_eq!(one("land the aircraft").unwrap(), ("autoland".into(), json!({})));
+        assert_eq!(one("get us down").unwrap(), ("autoland".into(), json!({})));
+        assert_eq!(one("emergency landing").unwrap(), ("autoland".into(), json!({})));
+        assert_eq!(one("autoland").unwrap(), ("autoland".into(), json!({})));
+        assert_eq!(one("cancel the autoland").unwrap(), ("autoland".into(), json!({"cancel":true})));
+        assert_eq!(one("stop the autoland").unwrap(), ("autoland".into(), json!({"cancel":true})));
+    }
+
+    #[test]
+    fn camera_views_resolve() {
+        assert_eq!(one("external view").unwrap(), ("set_view".into(), json!({"view":"external"})));
+        assert_eq!(one("go outside").unwrap(), ("set_view".into(), json!({"view":"external"})));
+        assert_eq!(one("chase view").unwrap(), ("set_view".into(), json!({"view":"external"})));
+        assert_eq!(one("spot view").unwrap(), ("set_view".into(), json!({"view":"spot"})));
+        assert_eq!(one("orbit").unwrap(), ("set_view".into(), json!({"view":"orbit"})));
+        assert_eq!(one("forward view").unwrap(), ("set_view".into(), json!({"view":"forward"})));
+        assert_eq!(one("look forward").unwrap(), ("set_view".into(), json!({"view":"forward"})));
+        assert_eq!(one("free camera").unwrap(), ("set_view".into(), json!({"view":"free"})));
+        assert_eq!(one("quick look 3").unwrap(), ("set_view".into(), json!({"quick_look":3})));
+        assert_eq!(one("view 2").unwrap(), ("set_view".into(), json!({"quick_look":2})));
+        // A prop "forward" must NOT be hijacked by the view block (needs a view word).
+        let prof = aircraft::load("king_air_c90b").expect("c90b");
+        let reg = Registry::for_aircraft(&prof);
+        let g = |t: &str| try_parse(t, &reg, &prof).map(|mut v| v.remove(0).name);
+        assert_eq!(g("props full forward"), Some("set_prop".into()));
+    }
+
+    #[test]
+    fn prop_levers_resolve_on_the_king_air() {
+        let prof = aircraft::load("king_air_c90b").expect("c90b");
+        let reg = Registry::for_aircraft(&prof);
+        let g = |t: &str| try_parse(t, &reg, &prof).map(|mut v| { let c = v.remove(0); (c.name, c.arguments) });
+        // Named detents (the many spoken words fold to full/cruise/low).
+        assert_eq!(g("props full forward").unwrap(), ("set_prop".into(), json!({"setting":"full"})));
+        assert_eq!(g("props up").unwrap(), ("set_prop".into(), json!({"setting":"full"})));
+        assert_eq!(g("set the props to cruise").unwrap(), ("set_prop".into(), json!({"setting":"cruise"})));
+        assert_eq!(g("props low").unwrap(), ("set_prop".into(), json!({"setting":"low"})));
+        assert_eq!(g("coarse prop pitch").unwrap(), ("set_prop".into(), json!({"setting":"low"})));
+        // Explicit RPM wins over any word in the phrase.
+        assert_eq!(g("prop rpm 1900").unwrap(), ("set_prop".into(), json!({"rpm":1900})));
+        assert_eq!(g("props to 1600").unwrap(), ("set_prop".into(), json!({"rpm":1600})));
+        assert_eq!(g("set the props 2000").unwrap(), ("set_prop".into(), json!({"rpm":2000})));
+        // Whisper mishears "prop" as "prope"/"propp" — a token starting with "prop"
+        // still resolves (this was a live miss on "Prope RPM 1900").
+        assert_eq!(g("prope rpm 1900").unwrap(), ("set_prop".into(), json!({"rpm":1900})));
+        assert_eq!(g("propp full forward").unwrap(), ("set_prop".into(), json!({"setting":"full"})));
+        // A bare prop command with no target routes to the tool (which asks which
+        // setting) rather than falling through to a miss.
+        assert_eq!(g("set props").unwrap(), ("set_prop".into(), json!({})));
+        // "appropriate" must NOT be read as a prop command (prefix match is
+        // token-anchored, so mid-word "prop" doesn't count).
+        assert!(g("set an appropriate heading 270").map(|c| c.0) != Some("set_prop".into()));
+        // Live-log mishears: split "takeoff", "cruise"→"Cruz", "props"→"crops".
+        assert_eq!(g("props to take off").unwrap(), ("set_prop".into(), json!({"setting":"full"})));
+        assert_eq!(g("props to cruz").unwrap(), ("set_prop".into(), json!({"setting":"cruise"})));
+        assert_eq!(g("crops cruise").unwrap(), ("set_prop".into(), json!({"setting":"cruise"})));
+        // "prop flow" must NOT read as "prop low" (whole-word fixes the "flow"⊃"low"
+        // substring bug) — it asks which setting instead of guessing 1600.
+        assert_eq!(g("prop flow").unwrap(), ("set_prop".into(), json!({})));
     }
 }

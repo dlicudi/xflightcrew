@@ -108,6 +108,10 @@ pub struct Snapshot {
     pub low_vacuum: bool,
     /// Battery ammeter, amps. Positive = charging, negative = discharging.
     pub battery_amps: f64,
+    /// Cabin altitude, feet (`.../pressurization/indicators/cabin_altitude_ft`). On
+    /// an unpressurized airframe this tracks the actual altitude, which is exactly
+    /// what the hypoxia check wants; on a pressurized one it's the real cabin.
+    pub cabin_altitude_ft: f64,
     pub phase: Phase,
 }
 
@@ -224,6 +228,13 @@ impl Snapshot {
             .and_then(engine0)
             .unwrap_or(0.0);
 
+        // Cabin altitude for the hypoxia check. Best-effort; an unpressurized
+        // airframe reports its actual altitude here, which is what we want.
+        let cabin_altitude_ft = xp
+            .get_float("sim/cockpit2/pressurization/indicators/cabin_altitude_ft")
+            .await
+            .unwrap_or(0.0);
+
         let mut s = Snapshot {
             on_ground,
             groundspeed_kts,
@@ -249,6 +260,7 @@ impl Snapshot {
             rpm,
             low_vacuum,
             battery_amps,
+            cabin_altitude_ft,
             phase: Phase::Ground,
         };
         s.phase = estimate_phase(&s);
@@ -362,7 +374,11 @@ impl FireState {
         status: Option<&StatusSink>,
         now: Instant,
     ) {
-        if self.sustained(min_duration, now) && self.should_speak(sev, now) {
+        // While the copilot is flying the aircraft (an active recovery), stay quiet:
+        // the recovery announces its own actions, and pilot-directed advice ("lower
+        // the nose, add power") is backwards when the copilot is the one doing it.
+        let recovering = crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+        if !recovering && self.sustained(min_duration, now) && self.should_speak(sev, now) {
             // Mirror the callout to the in-sim panel (monitor speaks via Voice,
             // which otherwise bypasses the panel's Reporter), coloured by severity.
             if let Some(s) = status {
@@ -645,10 +661,13 @@ impl Check for LowVacuum {
 }
 
 /// Alternator not charging: the switch is on but the ammeter shows the battery
-/// discharging — a failed or declutched alternator the on/off check can't see.
-/// Pairs with [`AlternatorOffline`] (switch off). Caution: shed load before the
-/// battery dies.
-struct AlternatorNotCharging;
+/// discharging — a failed or declutched charging source the on/off check can't
+/// see. Pairs with [`AlternatorOffline`] (switch off). Caution: shed load before
+/// the battery dies. `noun` is the airframe's charging source ("alternator" on a
+/// piston, "generator" on a turbine — a King Air has no alternator).
+struct AlternatorNotCharging {
+    noun: &'static str,
+}
 
 impl Check for AlternatorNotCharging {
     fn id(&self) -> &'static str {
@@ -663,23 +682,85 @@ impl Check for AlternatorNotCharging {
         }
         (s.battery_amps < -5.0).then(|| {
             format!(
-                "Alternator's not charging — battery's draining at {:.0} amps. \
-                 Check the alternator and shed electrical load.",
-                s.battery_amps.abs()
+                "{noun}'s not charging — battery's draining at {amps:.0} amps. \
+                 Check the {lower} and shed electrical load.",
+                noun = self.noun,
+                lower = self.noun.to_lowercase(),
+                amps = s.battery_amps.abs()
             )
         })
     }
+    /// Same start-transient sustain as [`AlternatorOffline`]: a turbine start pulls
+    /// 200+ amps from the battery through the starter-generator (in *starter*
+    /// mode), which the 5-second window read as a failed alternator. Only warn once
+    /// the discharge persists past a normal start-to-generator-online window.
     fn min_duration(&self) -> Duration {
-        Duration::from_secs(5)
+        ALTERNATOR_SUSTAIN
+    }
+}
+
+/// Hypoxia guard: cabin altitude climbing toward the level where the pilot greys
+/// out (the blackout you get unpressurized/without oxygen up high). Banded so the
+/// caution and warning don't both fire — a caution as it passes ~10,000 ft, then a
+/// warning past 12,500 (the regulatory oxygen line, and X-Plane's own annunciator
+/// threshold). Airborne only; on an unpressurized airframe the cabin altitude just
+/// tracks the real altitude, so this covers the GA singles too.
+struct CabinAltitude {
+    id: &'static str,
+    severity: Severity,
+    /// [low, high) band, feet. `high = None` means "and above".
+    band_ft: (f64, Option<f64>),
+    message: &'static str,
+    min_dur: Duration,
+}
+
+impl Check for CabinAltitude {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn severity(&self) -> Severity {
+        self.severity
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        let (low, high) = self.band_ft;
+        let in_band = s.cabin_altitude_ft >= low && high.map_or(true, |h| s.cabin_altitude_ft < h);
+        (!s.on_ground && in_band).then(|| self.message.to_string())
+    }
+    fn min_duration(&self) -> Duration {
+        self.min_dur
     }
 }
 
 fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     let mut checks: Vec<Box<dyn Check>> = Vec::new();
+
+    // Hypoxia — applies to every airframe (cabin altitude tracks real altitude when
+    // unpressurized). Disjoint bands so only one fires at a time.
+    checks.push(Box::new(CabinAltitude {
+        id: "cabin_alt_caution",
+        severity: Severity::Caution,
+        band_ft: (10_000.0, Some(12_500.0)),
+        message: "Cabin altitude above ten thousand. Check the pressurization or get on oxygen.",
+        min_dur: Duration::from_secs(10),
+    }));
+    checks.push(Box::new(CabinAltitude {
+        id: "cabin_alt_warning",
+        severity: Severity::Warning,
+        band_ft: (12_500.0, None),
+        message: "Cabin altitude above twelve thousand five hundred. Oxygen now, or start down.",
+        min_dur: Duration::from_secs(4),
+    }));
     if !profile.electrical.is_empty() {
-        checks.push(Box::new(AlternatorOffline));
+        // Charging source is a "generator" on a turbine (King Air PT6), an
+        // "alternator" on a piston — a King Air has no alternator to reference.
+        let noun = if profile.turboprop_start.is_some() || profile.turbine_start {
+            "Generator"
+        } else {
+            "Alternator"
+        };
+        checks.push(Box::new(AlternatorOffline { noun }));
         // Switch-on-but-not-charging, caught via the ammeter.
-        checks.push(Box::new(AlternatorNotCharging));
+        checks.push(Box::new(AlternatorNotCharging { noun }));
     }
     if profile.directional_gyro {
         checks.push(Box::new(GyroDrift));
@@ -888,7 +969,9 @@ const ALTERNATOR_SUSTAIN: Duration = Duration::from_secs(60);
 
 /// Engine running but the alternator switch is off → the bus is being drained
 /// with nothing charging it. A classic config slip a human copilot catches.
-struct AlternatorOffline;
+struct AlternatorOffline {
+    noun: &'static str,
+}
 
 impl Check for AlternatorOffline {
     fn id(&self) -> &'static str {
@@ -899,7 +982,7 @@ impl Check for AlternatorOffline {
     }
     fn eval(&self, s: &Snapshot) -> Option<String> {
         (s.engine_running && !s.alternator_on)
-            .then(|| "Alternator's offline — we're running on the battery.".to_string())
+            .then(|| format!("{}'s offline — we're running on the battery.", self.noun))
     }
     fn min_duration(&self) -> Duration {
         ALTERNATOR_SUSTAIN
@@ -1102,6 +1185,7 @@ mod tests {
             rpm: 0.0,
             low_vacuum: false,
             battery_amps: 0.0,
+            cabin_altitude_ft: 0.0,
             phase: Phase::Ground,
         }
     }
@@ -1163,7 +1247,7 @@ mod tests {
         s.engine_running = false;
         assert!(v.eval(&s).is_none(), "engine off → no vacuum check");
 
-        let a = AlternatorNotCharging;
+        let a = AlternatorNotCharging { noun: "Alternator" };
         let mut s = snap(true, true); // alternator switch on
         s.battery_amps = 8.0; // charging
         assert!(a.eval(&s).is_none(), "charging → silent");
@@ -1232,8 +1316,34 @@ mod tests {
     }
 
     #[test]
+    fn cabin_altitude_bands_are_disjoint_and_airborne_only() {
+        let caution = CabinAltitude {
+            id: "c", severity: Severity::Caution, band_ft: (10_000.0, Some(12_500.0)),
+            message: "caution", min_dur: Duration::from_secs(10),
+        };
+        let warning = CabinAltitude {
+            id: "w", severity: Severity::Warning, band_ft: (12_500.0, None),
+            message: "warning", min_dur: Duration::from_secs(4),
+        };
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        // Below 10k: nothing.
+        s.cabin_altitude_ft = 8_000.0;
+        assert!(caution.eval(&s).is_none() && warning.eval(&s).is_none());
+        // 10k–12.5k: caution only (disjoint bands).
+        s.cabin_altitude_ft = 11_000.0;
+        assert!(caution.eval(&s).is_some() && warning.eval(&s).is_none());
+        // Above 12.5k: warning only.
+        s.cabin_altitude_ft = 14_000.0;
+        assert!(caution.eval(&s).is_none() && warning.eval(&s).is_some());
+        // On the ground it never fires, however high the reading.
+        s.on_ground = true;
+        assert!(caution.eval(&s).is_none() && warning.eval(&s).is_none());
+    }
+
+    #[test]
     fn alternator_fires_only_when_running_without_charge() {
-        let c = AlternatorOffline;
+        let c = AlternatorOffline { noun: "Alternator" };
         assert!(c.eval(&snap(true, false)).is_some()); // running, alt off → alert
         assert!(c.eval(&snap(true, true)).is_none()); // running, alt on → ok
         assert!(c.eval(&snap(false, false)).is_none()); // shut down → ok

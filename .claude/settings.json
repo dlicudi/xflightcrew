@@ -27,7 +27,17 @@
       "Bash(curl -s --max-time 4 -o /dev/null -w \"reach: HTTP %{http_code}\\\\n\" \"http://127.0.0.1:8086/api/v1/datarefs?filter%5Bname%5D=sim/aircraft/view/acf_ICAO\")",
       "Bash(cd /Users/duanelicudi/GitHub/x-copilot; echo \"=== looks_like_question ===\"; sed -n '/fn looks_like_question/,/^}/p' src/main.rs | head -40 | grep -nE \"'|contains|what|how|starts_with|apostrophe\" | head)",
       "Bash(python3 -c \"import websocket; print\\('websocket-client OK', websocket.__version__\\)\")",
-      "Bash(python3 -c \"import websockets; print\\('websockets OK'\\)\")"
+      "Bash(python3 -c \"import websockets; print\\('websockets OK'\\)\")",
+      "Bash(python3 -m py_compile scripts/xp_watch.py)",
+      "Bash(awk 'NR>=910 && NR<=950' C90_sys10_electrical.lua)",
+      "Bash(grep -rhА1 'fn name\\(&self\\)' src/tools/gear.rs)",
+      "Bash(python3 /tmp/capture_view.py autopilot)",
+      "Bash(python3 /tmp/capture_view.py fuel)",
+      "Bash(python3 /tmp/capture_view.py subpanel)",
+      "Bash(perl -0pi -e 's/reject_unsafe_target\\\\\\(ctx, altitude\\\\\\)\\\\.await/reject_unsafe_target\\(ctx, altitude, self.cfg.service_ceiling_ft\\).await/g' src/tools/autopilot.rs)",
+      "Bash(perl -0pi -e 's/reject_unsafe_target\\\\\\(&ctx\\\\\\(&fake, &cfg\\\\\\), \\(.+?\\)\\\\\\)\\\\.await/reject_unsafe_target\\(\\\\&ctx\\(\\\\&fake, \\\\&cfg\\), $1, DEFAULT_SERVICE_CEILING_FT\\).await/g' src/tools/autopilot.rs)",
+      "Bash(perl -0pi -e 's/SERVICE_CEILING_FT \\\\+ 1000\\\\.0, DEFAULT_SERVICE_CEILING_FT/DEFAULT_SERVICE_CEILING_FT + 1000.0, DEFAULT_SERVICE_CEILING_FT/g' src/tools/autopilot.rs)",
+      "Bash(python3 -m py_compile PI_landing_assist.py)"
     ],
     "additionalDirectories": [
       "/Users/duanelicudi/GitHub/x-copilot/src"

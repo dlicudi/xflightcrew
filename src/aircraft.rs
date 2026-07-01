@@ -54,6 +54,11 @@ pub struct AircraftProfile {
     /// Heading/altitude/VS autopilot. `false` means no autopilot tools.
     #[serde(default)]
     pub autopilot: bool,
+    /// Extra prerequisites for airframes whose AP needs more than servos-on to
+    /// engage (the C90 needs its flight director up and AC power from an inverter).
+    /// `None` → plain servos-on (the GA singles). See [`AutopilotPrep`].
+    #[serde(default)]
+    pub autopilot_prep: Option<AutopilotPrep>,
     /// Piston engine controls (throttle, mixture).
     #[serde(default)]
     pub engine: bool,
@@ -62,6 +67,10 @@ pub struct AircraftProfile {
     /// `engine` already implies a throttle, so it's only set for jets/turboprops.
     #[serde(default)]
     pub throttle: bool,
+    /// Constant-speed propeller lever (`set_prop`) — the blue levers that set the
+    /// governed prop RPM. `None` (fixed-pitch, e.g. the 172) → no prop tool.
+    #[serde(default)]
+    pub prop: Option<PropProfile>,
     /// Turbine start sequence (`start_engines`) — bleed/fuel/ignition/crank with N2
     /// monitoring, as opposed to the piston `engine` group's one-shot start.
     #[serde(default)]
@@ -180,6 +189,30 @@ pub struct AircraftProfile {
     /// it per-profile for regions with a lower transition altitude.
     #[serde(default = "default_transition_altitude")]
     pub transition_altitude_ft: f64,
+    /// Snap-to-panel: tool name → a saved 3D-cockpit camera position to jump to
+    /// just before that action runs, so you watch the switch move. Empty (default)
+    /// = no snapping. Positions are captured live from the pilot's own framing (the
+    /// copilot reads the head datarefs and stores them here), so no fiddly X-Plane
+    /// quick-look saving. E.g. `gear: {x: -0.35, y: 0.83, z: -0.44, psi: 12, the: -20}`.
+    #[serde(default)]
+    pub view_map: std::collections::HashMap<String, PanelView>,
+}
+
+/// A saved 3D-cockpit camera position — the pilot's-head datarefs
+/// (`sim/graphics/view/pilots_head_*`): position relative to the CG in metres and
+/// the view angles in degrees. Restored by writing them back after selecting the
+/// 3D cockpit view. `phi` (roll) defaults to 0 — rarely needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelView {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    /// Heading (yaw), degrees.
+    pub psi: f64,
+    /// Pitch, degrees.
+    pub the: f64,
+    #[serde(default)]
+    pub phi: f64,
 }
 
 /// US transition altitude (FL180). See [`AircraftProfile::transition_altitude_ft`].
@@ -191,6 +224,42 @@ fn default_transition_altitude() -> f64 {
 /// a profile says otherwise. See [`AircraftProfile::engines`].
 fn default_engines() -> usize {
     1
+}
+
+/// Autopilot engagement prerequisites beyond servos-on, for airframes that need
+/// them. The C90's AP won't hold without its **flight director** switch up (its
+/// `fd_monitor` drops the servos otherwise) and is **AC-powered**, so with the
+/// inverter off it has no power to engage at all — which lets the tool name the
+/// real cause ("no AC power, turn the inverter on") instead of a generic hint.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AutopilotPrep {
+    /// Commands to raise the flight director before engaging the servos. Empty =
+    /// none. C90: `laminar/c90/avionics/switch/fd_up`.
+    #[serde(default)]
+    pub flight_director: Vec<String>,
+    /// True if the AP is AC-powered (needs an inverter). Drives the honest
+    /// "no AC power" readback when it fails to engage.
+    #[serde(default)]
+    pub ac_powered: bool,
+}
+
+/// Constant-speed propeller control, per airframe. The blue levers command a
+/// *governed RPM*, not a raw position; X-Plane's actuator dataref carries it in
+/// radians/second (all engines), so the tool works in RPM (what the pilot says and
+/// the tach shows) and converts. Named detents map to the airframe's book settings;
+/// an explicit RPM is clamped to [`min_rpm`, `max_rpm`]. Verified live on the C90B
+/// with `scripts/xp_watch.py` (the lever moves `..._rad_sec_all`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropProfile {
+    /// Actuator dataref (rad/sec, all engines). C90B:
+    /// `sim/cockpit2/engine/actuators/prop_rotation_speed_rad_sec_all`.
+    pub dataref: String,
+    /// Full-forward / takeoff governed RPM ("props full", "props up").
+    pub max_rpm: f64,
+    /// Cruise detent RPM ("props to cruise").
+    pub cruise_rpm: f64,
+    /// Aft governing limit / low RPM ("props back", "props low").
+    pub min_rpm: f64,
 }
 
 /// Fuel-endurance alert thresholds (minutes of fuel remaining at the current
@@ -819,9 +888,12 @@ fn cessna_172sp() -> AircraftProfile {
         turboprop_start: None,
         retractable_gear: false,
         transition_altitude_ft: 18_000.0,
+        view_map: std::collections::HashMap::new(),
         autopilot: true,
+        autopilot_prep: None,
         engine: true,
         throttle: false,
+        prop: None,
         turbine_start: false,
         auto_prep: false,
         autothrottle: false,
@@ -1005,8 +1077,10 @@ fn cirrus_sr22() -> AircraftProfile {
         turboprop_start: None,
         retractable_gear: false,
         transition_altitude_ft: 18_000.0,
+        view_map: std::collections::HashMap::new(),
         // Universal-dataref tools — safe across airframes.
         autopilot: true,
+        autopilot_prep: None,
         barometer: true,
         com_radio: true,
         com2_radio: true,
@@ -1021,6 +1095,7 @@ fn cirrus_sr22() -> AircraftProfile {
         // the SR22's second battery/alternator need the dual-electrical tool.)
         engine: true,
         throttle: false,
+        prop: None,
         turbine_start: false,
         auto_prep: false,
         autothrottle: false,
