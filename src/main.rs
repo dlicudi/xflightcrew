@@ -1542,7 +1542,7 @@ fn conversational(t: &str, registry: &Registry) -> Option<String> {
     };
     // "say again" / "repeat that" / "what did you say" → repeat the last readback.
     if t.contains("say again") || t.contains("repeat") || t.contains("come again")
-        || t.contains("what did you say") || t.contains("didn't catch that")
+        || t.contains("what did you say") || t.contains("didnt catch that")
     {
         return Some(match LAST_READBACK.lock().ok().and_then(|l| l.clone()) {
             Some(prev) => prev,

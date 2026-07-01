@@ -23,7 +23,14 @@
       "Bash(curl -s --max-time 6 \"http://127.0.0.1:8086/api/v1/datarefs?filter%5Bname%5D=laminar/c90\")",
       "Bash(curl -s --max-time 8 \"http://127.0.0.1:8086/api/v1/datarefs\")",
       "Bash(sed -n '/pub struct SetFloodLights/,/^}$/p' src/tools/lights.rs)",
-      "Bash(awk '/impl Tool for SetFloodLights/,/^}$/' src/tools/lights.rs)"
+      "Bash(awk '/impl Tool for SetFloodLights/,/^}$/' src/tools/lights.rs)",
+      "Bash(curl -s --max-time 4 -o /dev/null -w \"reach: HTTP %{http_code}\\\\n\" \"http://127.0.0.1:8086/api/v1/datarefs?filter%5Bname%5D=sim/aircraft/view/acf_ICAO\")",
+      "Bash(cd /Users/duanelicudi/GitHub/x-copilot; echo \"=== looks_like_question ===\"; sed -n '/fn looks_like_question/,/^}/p' src/main.rs | head -40 | grep -nE \"'|contains|what|how|starts_with|apostrophe\" | head)",
+      "Bash(python3 -c \"import websocket; print\\('websocket-client OK', websocket.__version__\\)\")",
+      "Bash(python3 -c \"import websockets; print\\('websockets OK'\\)\")"
+    ],
+    "additionalDirectories": [
+      "/Users/duanelicudi/GitHub/x-copilot/src"
     ]
   }
 }

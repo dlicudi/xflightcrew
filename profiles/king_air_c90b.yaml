@@ -34,6 +34,7 @@ transponder: true      # set_transponder (squawk)
 parking_brake: true    # set_parking_brake
 pitot_heat: true       # set_pitot_heat
 pitch_trim: true       # set_pitch_trim (universal elevator_trim)
+fuel_pump: true        # standby boost pumps — fuel_pump_on[0,1], both engines (verified via fuel_pump_1_tog)
 
 # Retractable gear. VLE/VLO not in an authoritative source for this model, so no
 # speed gate yet (gear still works); set vlo_kts once verified (real C90B ~182).

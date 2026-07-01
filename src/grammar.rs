@@ -44,16 +44,25 @@ pub fn normalize(transcript: &str) -> String {
     const LEAD: &[&str] = &[
         "could you please", "can you please", "would you please", "would you mind",
         "could you", "can you", "would you", "will you", "i would like you to",
-        "i'd like you to", "i would like to", "i'd like to", "i would like",
-        "i'd like", "i want you to", "i need you to", "i want to", "i need to",
-        "let's go ahead and", "go ahead and", "let's", "lets", "let us",
+        "id like you to", "i would like to", "id like to", "i would like",
+        "id like", "i want you to", "i need you to", "i want to", "i need to",
+        "lets go ahead and", "go ahead and", "lets", "let us",
         "please", "okay", "ok", "alright", "all right", "hey", "uh", "um", "er",
         "well", "so", "now", "yeah", "yep", "yes", "gimme", "give me", "just",
     ];
     // Trailing politeness, peeled the same way.
     const TRAIL: &[&str] = &["please", "for me", "now", "thanks", "thank you", "would you", "okay", "ok"];
 
-    let mut s = transcript.trim().trim_end_matches(['.', '!', '?', ',']).trim().to_lowercase();
+    // Drop apostrophes: whisper spuriously fits them ("engine's on" for "engines
+    // on", "flap's" for "flaps"), which breaks substring matches like "engines
+    // on". Both the ASCII and curly forms. (Question detection already accepts the
+    // stripped forms — "whats"/"hows" are openers alongside "what's"/"how's".)
+    let mut s = transcript
+        .trim()
+        .trim_end_matches(['.', '!', '?', ','])
+        .trim()
+        .to_lowercase()
+        .replace(['\'', '\u{2019}'], "");
     loop {
         let before = s.clone();
         for w in LEAD {
@@ -225,7 +234,7 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     // unrecognized target falls through (e.g. "tell me the weather").
     // A complaint or past-tense reference ("you didn't remind me", "you never woke
     // me") is not a request to arm one.
-    let negated = t.contains("didn't") || t.contains("did not") || t.contains("never")
+    let negated = t.contains("didnt") || t.contains("did not") || t.contains("never")
         || t.contains("forgot") || t.contains("should have") || t.contains("supposed to");
     let reminder_verb = !negated
         && (has(t, "wake") || has(t, "remind") || has(t, "notify")
@@ -803,6 +812,10 @@ mod tests {
         assert_eq!(one("start up").unwrap().0, "start_engine");
         assert_eq!(one("fire them up").unwrap().0, "start_engine");
         assert_eq!(one("stop the engines").unwrap().0, "stop_engine");
+        // Whisper's spurious apostrophe ("engine's on" for "engines on") — the
+        // exact miss from the C90B panel. normalize() strips it.
+        assert_eq!(one("engine's on").unwrap().0, "start_engine");
+        assert_eq!(one("engines on").unwrap().0, "start_engine");
         assert_eq!(one("align gyro").unwrap().0, "align_gyro");
         assert_eq!(one("think gyro").unwrap().0, "align_gyro"); // mishear handled
         assert_eq!(one("level off").unwrap().0, "level_off");

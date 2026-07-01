@@ -693,7 +693,8 @@ mod tests {
         for k in ["battery", "generator1", "generator2", "generators", "avionics"] {
             assert!(elec.contains(&k), "c90b electrical missing {k}");
         }
-        assert!(p.flood_lights); // cockpit floods wired (universal datarefs)
+        assert!(p.flood_lights); // cockpit floods wired (generic_lights_switch[0])
+        assert!(p.fuel_pump); // standby boost pumps (verified)
         let ts = p.turboprop_start.as_ref().expect("c90b turboprop start");
         assert_eq!(ts.start_up.len(), 2);
         assert_eq!(ts.start_dn.len(), 2);
