@@ -732,14 +732,13 @@ async fn run_session(
                 .last()
                 .is_some_and(|(_, _, t)| t.elapsed() < FOLLOWUP_WINDOW);
             if !(in_followup && looks_like_followup(&command)) {
-                if explicit {
-                    say(&voice, &reporter, ui::LogKind::Warn, readback::one_of(&[
-                        "Sorry, that didn't sound like a command.",
-                        "That didn't sound like a command.",
-                        "Didn't catch a command there.",
-                    ]));
-                } else {
-                    reporter.log(ui::LogKind::Info, format!("not a command: \"{command}\""));
+                // Same treatment as a grammar miss — ONE consistent cue for every
+                // clearly-heard utterance we won't act on: log the miss, sound the
+                // negative tone. (Only genuinely low-confidence audio gets a spoken
+                // "Say again?", where repeating actually helps.)
+                reporter.log(ui::LogKind::Warn, format!("not a command: \"{command}\""));
+                if explicit && live.get(DR_OPT_TONE).map_or(true, |v| v > 0.5) {
+                    voice.negative();
                 }
                 continue;
             }
@@ -783,7 +782,9 @@ async fn run_session(
         // unreliable here (it had the fuel in its context and still said "I don't
         // have fuel information"). A fuel question reads the datarefs and is spoken
         // straight back.
-        if is_fuel_query(&command) {
+        if is_fuel_query(&command)
+            && grammar::try_parse(&command, &registry, &profile).is_none()
+        {
             let line = fuel_report(&xplane, &profile, Some(&live), is_endurance_query(&command)).await;
             say(&voice, &reporter, ui::LogKind::Readback, &line);
             continue;
@@ -934,9 +935,18 @@ async fn run_session(
             continue;
         }
 
+        // Whisper habitually APPENDS "?" to short spoken commands ("Fuel tank,
+        // right?"), which used to shunt them down the question path (seen live).
+        // Punctuation alone doesn't outrank a parseable command: it's a question
+        // only with an interrogative OPENER ("is/are/what/how...") or when the
+        // grammar can't parse it anyway.
+        let parsed = grammar::try_parse(&matchable, &registry, &profile);
+        let opener_q = looks_like_question(matchable.trim_end_matches(['?', '.', ' ']));
+        let is_question = looks_like_question(&matchable) && (opener_q || parsed.is_none());
+
         // Other state reads ("what's our altitude/heading/airspeed") — deterministic
         // too, but only when it's a question, so "set heading 270" still commands.
-        if looks_like_question(&matchable) {
+        if is_question {
             // A turbine (jet) reports N1/N2/ITT, not the piston RPM/CHT metrics.
             let turbine = !profile.engine && profile.throttle;
             if let Some(answer) = answer_state_query(&matchable, &xplane, Some(&live), turbine).await {
@@ -949,16 +959,9 @@ async fn run_session(
 
         // Deterministic fast-path: resolve the common, regular commands with no
         // LLM at all — no GPU burst, no latency, and it can't pick the wrong tool.
-        // Anything it can't confidently parse falls through to the LLM. Questions
-        // are held back from the fast-path entirely ("is our heading 270?" shares
-        // the keyword+number shape of a command, so the grammar would *act* on it);
-        // they go to the LLM, which arbitrates act-vs-answer. `path` is logged so
-        // `x-copilot analyze` can mine the LLM-fallback tail for new phrasings.
-        let fast = if looks_like_question(&matchable) {
-            None
-        } else {
-            grammar::try_parse(&matchable, &registry, &profile)
-        };
+        // Genuine questions are held back ("is our heading 270?" shares a command's
+        // keyword+number shape — the OPENER decides); they go to the answer path.
+        let fast = if is_question { None } else { parsed };
         // A recognized command whose CAPABILITY this airframe lacks (an autopilot
         // command on the AP-less DC-3) — decline honestly rather than fall through
         // to "Say again?" or a vague LLM answer.
@@ -1360,7 +1363,7 @@ async fn run_checklist(
                         }
                     }
                 }
-                if checklist::run_step(tool, args, &cl.lights, &cl.flaps, &cl.electrical, &cl.fuel_selector, cl.engines, cl.magnetos_per_engine, &ctx).await.is_ok() {
+                if checklist::run_step(tool, args, &cl.lights, &cl.flaps, &cl.electrical, &cl.fuel_selector, cl.engines, cl.magnetos_per_engine, cl.park_brake_valve_set, &ctx).await.is_ok() {
                     say(voice, reporter, ui::LogKind::Readback, line);
                 } else {
                     say(voice, reporter, ui::LogKind::Warn, &format!("{line} Didn't take — check it."));
@@ -2392,7 +2395,16 @@ fn is_fuel_query(text: &str) -> bool {
         || t.contains("primer")
         || t.contains("refuel")
         || t.contains("top off")
-        || t.contains("fill");
+        || t.contains("fill")
+        // Tank-SELECTOR commands ("switch tanks", "set fuel tank to left") — these
+        // hijacked the quantity report (seen live). A tank mention with an action
+        // verb or an explicit "to <side>" is a command; "how much fuel in the left
+        // tank" has neither and stays a query.
+        || (t.contains("tank")
+            && (t.contains("switch") || t.contains("swap") || t.contains("change")
+                || t.contains("alternate") || t.contains("rotate") || t.contains("select")
+                || t.contains("set") || t.contains("feed")
+                || t.contains("to left") || t.contains("to right") || t.contains("to off")));
     // "fuel flow" is an engine-instrument read, answered in answer_state_query.
     asks && !command && !t.contains("flow")
 }
@@ -3043,8 +3055,10 @@ fn looks_like_question(text: &str) -> bool {
     }
     const OPENERS: &[&str] = &[
         "what", "what's", "whats", "how", "how's", "hows", "how much", "how many",
-        "how far", "how high", "how fast", "are we", "are the", "is the", "is it",
-        "do we", "did we", "have we", "where", "when", "which", "why", "tell me",
+        "how far", "how high", "how fast", "where", "when", "which", "why", "tell me",
+        // Generic auxiliaries: no command starts with these, and they must beat the
+        // command grammar ("is our heading 270?" answers, never acts).
+        "is", "are", "am", "do", "does", "did", "have", "has",
     ];
     OPENERS.iter().any(|o| t == *o || t.starts_with(&format!("{o} ")))
 }

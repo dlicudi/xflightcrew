@@ -147,6 +147,9 @@ pub struct Checklist {
     pub fuel_selector: Option<FuelSelectorProfile>,
     pub engines: usize,
     pub magnetos_per_engine: bool,
+    /// Per-airframe park-brake valve sense for `set_parking_brake` (see
+    /// [`crate::aircraft::AircraftProfile::park_brake_valve_set`]).
+    pub park_brake_valve_set: Option<f64>,
 }
 
 impl Checklist {
@@ -224,6 +227,7 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
                     fuel_selector: fuel_selector.clone(),
                     engines: profile.engines,
                     magnetos_per_engine: profile.magnetos_per_engine,
+                    park_brake_valve_set: profile.park_brake_valve_set,
                 });
             }
             // Both narration directives: arm the run-up confirm when the file
@@ -478,10 +482,13 @@ pub async fn run_step(
     fuel_selector: &Option<FuelSelectorProfile>,
     engines: usize,
     magnetos_per_engine: bool,
+    park_brake_valve_set: Option<f64>,
     ctx: &ToolCtx<'_>,
 ) -> Result<String> {
     match tool {
-        "set_parking_brake" => SetParkingBrake.execute(args, ctx).await,
+        "set_parking_brake" => {
+            SetParkingBrake { valve_set: park_brake_valve_set }.execute(args, ctx).await
+        }
         "set_pitch_trim" => SetPitchTrim.execute(args, ctx).await,
         "set_electrical" => SetElectrical::new(electrical.to_vec()).execute(args, ctx).await,
         "set_mixture" => SetMixture.execute(args, ctx).await,

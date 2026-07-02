@@ -510,6 +510,16 @@ fn parse_one(t: &str) -> Option<ToolCall> {
             return Some(call("set_throttle", json!({ "percent": 0 })));
         }
         if let Some(n) = num {
+            // RELATIVE: "reduce throttle by ten percent" means minus ten from the
+            // current lever, NOT throttle to 10 (a power chop — seen live). A
+            // relative verb without "to" is a delta; with "to" it's the target.
+            let dec = has(t, "reduce") || has(t, "decrease") || has(t, "lower")
+                || has(t, "back") || has(t, "ease") || has(t, "pull");
+            let inc = has(t, "increase") || has(t, "add") || has(t, "raise")
+                || has(t, "advance") || has(t, "bump") || has(t, "push");
+            if (dec || inc) && !has(t, "to") {
+                return Some(call("set_throttle", json!({ "delta": if dec { -n } else { n } })));
+            }
             return Some(call("set_throttle", json!({ "percent": n })));
         }
         // "throttle to cruise" / "cruise power" with no number → a typical cruise
@@ -776,8 +786,10 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("set_parking_brake", json!({ "on": !release })));
     }
 
-    // fuel selector / tank
-    if t.contains("fuel selector") || t.contains("fuel tank") {
+    // fuel selector / tank. Explicit side wins; a swap verb with no side is the
+    // routine "switch tanks" (the SR22 has no BOTH, so it's said every half hour)
+    // — the tool reads the current tank and feeds from the other one.
+    if t.contains("fuel selector") || has(t, "tank") || has(t, "tanks") {
         let pos = if has(t, "both") {
             "both"
         } else if has(t, "left") {
@@ -786,6 +798,10 @@ fn parse_one(t: &str) -> Option<ToolCall> {
             "right"
         } else if has(t, "off") {
             "off"
+        } else if has(t, "switch") || has(t, "swap") || has(t, "change")
+            || has(t, "alternate") || has(t, "rotate")
+        {
+            "switch"
         } else {
             return None;
         };
@@ -983,6 +999,17 @@ mod tests {
         assert_eq!(one("power up").unwrap(), ("set_electrical".into(), json!({"system":"all","on":true})));
         assert_eq!(one("powering up the aircraft").unwrap().0, "set_electrical");
         assert_eq!(one("landing lights off").unwrap(), ("set_lights".into(), json!({"light":"landing","on":false})));
+        // RELATIVE throttle: "by N" adjusts, never sets the absolute value (a
+        // live power chop: "reduce throttle by ten percent" went to 10%).
+        assert_eq!(one("reduce throttle by ten percent").unwrap(), ("set_throttle".into(), json!({"delta":-10})));
+        assert_eq!(one("increase power by 20 percent").unwrap().1, json!({"delta":20}));
+        assert_eq!(one("reduce throttle to 20 percent").unwrap().1, json!({"percent":20}));
+        // Tank management: "switch tanks" feeds from the other wing (SR22 routine);
+        // an explicit side always wins over the swap verb.
+        assert_eq!(one("switch tanks").unwrap(), ("set_fuel_selector".into(), json!({"position":"switch"})));
+        assert_eq!(one("swap fuel tanks").unwrap().1, json!({"position":"switch"}));
+        assert_eq!(one("switch to the left tank").unwrap().1, json!({"position":"left"}));
+        assert_eq!(one("select the right tank").unwrap().1, json!({"position":"right"}));
         assert_eq!(one("strobes off").unwrap().1, json!({"light":"strobe","on":false}));
         assert_eq!(one("start the engine").unwrap().0, "start_engine");
         // Politeness/filler stripped by the normalization layer (Cessna registry,

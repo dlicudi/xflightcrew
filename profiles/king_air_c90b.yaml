@@ -40,6 +40,8 @@ com2_radio: true       # set_com2 / swap_radio (G430)
 nav_radio: true        # set_nav1 / set_obs
 transponder: true      # set_transponder (squawk)
 parking_brake: true    # set_parking_brake
+park_brake_valve_set: 0.0  # valve sense: 0 = SET on the C90 (verified live — the sim
+                           # pins the ratio to 1 while the valve is 0)
 pitot_heat: true       # set_pitot_heat
 pitch_trim: true       # set_pitch_trim (universal elevator_trim)
 fuel_pump: true        # standby boost pumps — fuel_pump_on[0,1], both engines (verified via fuel_pump_1_tog)

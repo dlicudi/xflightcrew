@@ -112,31 +112,52 @@ async fn ramp_actuator(ctx: &ToolCtx<'_>, dataref: &str, to: f64) -> Result<()> 
 
 pub struct SetThrottle;
 
+#[derive(Deserialize)]
+struct ThrottleArgs {
+    /// Absolute setting, 0-100.
+    #[serde(default)]
+    percent: Option<f64>,
+    /// RELATIVE change, e.g. -10 for "reduce throttle by ten percent" — applied
+    /// to the current lever. Wins over `percent` when both are present.
+    #[serde(default)]
+    delta: Option<f64>,
+}
+
 #[async_trait]
 impl Tool for SetThrottle {
     fn name(&self) -> &str {
         "set_throttle"
     }
     fn description(&self) -> &str {
-        "Set the throttle (engine power / thrust) as a percentage, 0 (idle) to \
-         100 (full power). Use for 'throttle 60 percent', 'full throttle', \
-         'maximum power', 'set thrust to 80 percent', 'throttle idle', \
-         'power up', 'power to 75', 'throttle back to 40', 'reduce power', \
-         'advance the throttle', 'firewall it', 'throttle back'."
+        "Set the throttle (engine power / thrust). Absolute: percent, 0 (idle) to \
+         100 (full) — 'throttle 60 percent', 'full throttle', 'power to 75'. \
+         RELATIVE: delta, signed — 'reduce throttle by ten percent' is delta -10, \
+         'add twenty percent power' is delta 20. Never map a 'by N' request to \
+         percent N."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "percent": {"type": "integer", "minimum": 0, "maximum": 100,
-                            "description": "0 = idle, 100 = full power"}
-            },
-            "required": ["percent"]
+                            "description": "absolute: 0 = idle, 100 = full power"},
+                "delta": {"type": "integer", "minimum": -100, "maximum": 100,
+                          "description": "relative change in percent (negative reduces)"}
+            }
         })
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
-        let p: PercentArg = serde_json::from_value(args.clone())?;
-        let ratio = (p.percent / 100.0).clamp(0.0, 1.0);
+        let a: ThrottleArgs = serde_json::from_value(args.clone())?;
+        // A relative request adjusts the CURRENT lever — "reduce by ten" from 45%
+        // goes to 35%, never to an absolute 10% (a power chop, seen live).
+        let target_pct = if let Some(d) = a.delta {
+            ctx.xplane.get_float(THROTTLE).await? * 100.0 + d
+        } else if let Some(p) = a.percent {
+            p
+        } else {
+            return Ok("Say a throttle setting — a percent, or by how much to change it.".to_string());
+        };
+        let ratio = (target_pct / 100.0).clamp(0.0, 1.0);
         // Ease the lever to the target instead of snapping it — feels like a real
         // hand on the throttle.
         ramp_actuator(ctx, THROTTLE, ratio).await?;
@@ -596,25 +617,56 @@ impl Tool for SetFuelSelector {
          'both tanks', 'feed from the right', 'fuel selector off'."
     }
     fn parameters(&self) -> Value {
-        let keys: Vec<&str> = self.profile.positions.iter().map(|p| p.key.as_str()).collect();
+        let mut keys: Vec<&str> = self.profile.positions.iter().map(|p| p.key.as_str()).collect();
+        keys.push("switch");
         let listing: Vec<String> =
             self.profile.positions.iter().map(|p| format!("{} ({})", p.key, p.spoken)).collect();
         json!({
             "type": "object",
             "properties": {
                 "position": {"type": "string", "enum": keys,
-                             "description": format!("Fuel tank selector position. Available: {}.", listing.join(", "))}
+                             "description": format!(
+                                 "Fuel tank selector position, or 'switch' for the OTHER wing tank. Available: {}.",
+                                 listing.join(", "))}
             },
             "required": ["position"]
         })
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: FuelSelArgs = serde_json::from_value(args.clone())?;
+        // "switch" = feed from the OTHER wing tank — the routine balance call (the
+        // SR22 has no BOTH, so this happens every half hour). Resolved from the
+        // current selector; from anything that isn't a wing tank, ask for a side.
+        let requested = a.position.to_ascii_lowercase();
+        let requested = if matches!(requested.as_str(), "switch" | "swap" | "other") {
+            let current = match &self.profile.readback {
+                Some(dref) => ctx.xplane.get_float(dref).await.ok().and_then(|actual| {
+                    self.profile
+                        .positions
+                        .iter()
+                        .find(|p| p.value.is_some_and(|v| (v - actual).abs() < 0.5))
+                        .map(|p| p.key.as_str())
+                }),
+                None => None,
+            };
+            match current {
+                Some("left") => "right".to_string(),
+                Some("right") => "left".to_string(),
+                _ => {
+                    return Ok(
+                        "I can't tell which tank we're feeding from — say left tank or right tank."
+                            .to_string(),
+                    )
+                }
+            }
+        } else {
+            requested
+        };
         let Some(pos) = self
             .profile
             .positions
             .iter()
-            .find(|p| p.key.eq_ignore_ascii_case(&a.position))
+            .find(|p| p.key.eq_ignore_ascii_case(&requested))
         else {
             let names: Vec<&str> = self.profile.positions.iter().map(|p| p.spoken.as_str()).collect();
             return Ok(format!(

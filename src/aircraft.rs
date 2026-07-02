@@ -106,6 +106,12 @@ pub struct AircraftProfile {
     /// Parking brake (`set_parking_brake`).
     #[serde(default)]
     pub parking_brake: bool,
+    /// The `park_brake_valve` value that means SET on this airframe, where the
+    /// valve is modeled. The sense is PER-AIRCRAFT (C90B: 0 = set, verified live;
+    /// SR22: 1 = set — the opposite, seen as an "inverted" handle). `None` = don't
+    /// touch the valve (ratio only), the safe default for unknown airframes.
+    #[serde(default)]
+    pub park_brake_valve_set: Option<f64>,
     /// Electrical systems the `set_electrical` tool exposes (per-airframe wiring).
     /// Empty means no electrical tool.
     #[serde(default)]
@@ -928,6 +934,7 @@ fn cessna_172sp() -> AircraftProfile {
         transponder: true,
         ils: true,
         parking_brake: true,
+        park_brake_valve_set: None,
         electrical: {
             let e = |key: &str, spoken: &str, on: &[&str], off: &[&str], rb: &[&str]| ElectricalSystem {
                 key: key.into(),
@@ -1113,6 +1120,7 @@ fn cirrus_sr22() -> AircraftProfile {
         transponder: true,
         ils: true,
         parking_brake: true,
+        park_brake_valve_set: None,
         pitot_heat: true,
         // Throttle/mixture/start write universal datarefs (throttle_ratio_all,
         // mixture_ratio_all, the starter command) — confirmed against the

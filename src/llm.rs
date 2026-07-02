@@ -470,7 +470,13 @@ impl Llm {
         // No tools attached → the model physically cannot actuate anything.
         let msg = self.chat_call(ANSWER_PROMPT, transcript, &[], history, state, 0.0).await?;
         let reply = sanitize_reply(&msg.content);
-        Ok((!reply.is_empty()).then_some(reply))
+        // The prompt steers non-questions to reply "Say again?" — that's the
+        // model's no-answer marker, NOT something to speak (the caller's miss
+        // handling gives the consistent unrecognized-log + tone instead).
+        let is_no_answer = reply
+            .trim_end_matches(['?', '.', '!'])
+            .eq_ignore_ascii_case("say again");
+        Ok((!reply.is_empty() && !is_no_answer).then_some(reply))
     }
 
     /// One act-or-answer request at a given temperature. Retained but unused.

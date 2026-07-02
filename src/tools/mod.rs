@@ -248,7 +248,9 @@ impl Registry {
         }
 
         if profile.parking_brake {
-            tools.push(Box::new(controls::SetParkingBrake));
+            tools.push(Box::new(controls::SetParkingBrake {
+                valve_set: profile.park_brake_valve_set,
+            }));
         }
 
         if profile.pitch_trim {

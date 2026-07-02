@@ -14,15 +14,18 @@ const TRIM_STEP: f64 = 0.10;
 /// Takeoff trim setting for the 172 — roughly neutral (the takeoff band).
 const TRIM_TAKEOFF: f64 = 0.0;
 
-/// Park-brake VALVE (X-Plane 12). Aircraft that model it (the C90B) animate their
-/// handle from this and it OVERRIDES the classic ratio: **0 = closed = brake held**
-/// (the sim pins `parking_brake_ratio` back to 1 within ~3 s), **1 = open =
-/// released**. Verified live — with the valve closed no ratio write sticks; open
-/// it and the aircraft rolls. Standard sim names, harmless where unmodeled.
+/// Park-brake VALVE (X-Plane 12). Aircraft that model it animate their handle
+/// from this, and its SENSE is per-aircraft: on the C90B 0 = set (and the sim
+/// pins `parking_brake_ratio` back to 1 while set); on the SR22 it's the
+/// opposite (1 = set, no ratio pinning). So the tool only drives the valve when
+/// the profile says which value means SET (`park_brake_valve_set`).
 const PARK_BRAKE_VALVE: &str = "sim/cockpit2/controls/park_brake_valve";
 const CMD_VALVE_TOGGLE: &str = "sim/flight_controls/park_brake_valve_toggle";
 
-pub struct SetParkingBrake;
+pub struct SetParkingBrake {
+    /// The valve value meaning SET on this airframe; `None` = leave the valve alone.
+    pub valve_set: Option<f64>,
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -37,9 +40,11 @@ impl Tool for SetParkingBrake {
     }
 
     fn description(&self) -> &str {
-        "Set or release the parking brake. Use for 'parking brake set', 'set the \
-         brakes', 'release parking brake', 'brakes off', 'park brake on', \
-         'hold the brakes', 'release the brakes', 'parking brake off'."
+        "Set or release the PARKING brake (the latching park-brake valve + handle) \
+         — NOT momentary wheel braking. Use only for 'parking brake set', 'park \
+         brake on', 'release the parking brake', 'parking brake off'. Do not use \
+         for 'hold the brakes' / 'brake' while rolling (that's regular braking, \
+         which has no tool)."
     }
 
     fn parameters(&self) -> Value {
@@ -54,15 +59,23 @@ impl Tool for SetParkingBrake {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: Args = serde_json::from_value(args.clone())?;
-        // The valve, where modeled, must agree or the ratio won't hold: closed (0)
-        // pins the ratio back to 1 within seconds, so a release can't stick; and a
-        // "set" with the valve open can be cleared by the pilot's handle alone.
-        let valve_open = ctx.xplane.get_float(PARK_BRAKE_VALVE).await.map(|v| v > 0.5);
+        // Where the profile declares the valve's SET value, the valve must agree
+        // with the request — on airframes that pin the ratio from it (C90B) a
+        // release can't stick otherwise, and the handle animates from it either
+        // way. The desired value depends on the per-aircraft sense.
+        let desired_valve = self.valve_set.map(|set| if args.on { set } else { 1.0 - set });
+        let valve_now = match desired_valve {
+            Some(_) => ctx.xplane.get_float(PARK_BRAKE_VALVE).await.ok(),
+            None => None,
+        };
 
         // If everything's already where you asked, say so instead of a "Roger" —
-        // but only when the valve (if readable) agrees too.
+        // but only when the valve (if driven) agrees too.
         let already = ctx.xplane.get_float(PARK_BRAKE).await? > 0.5;
-        let valve_aligned = valve_open.as_ref().map(|&open| open == !args.on).unwrap_or(true);
+        let valve_aligned = match (desired_valve, valve_now) {
+            (Some(want), Some(now)) => (now - want).abs() < 0.5,
+            _ => true,
+        };
         if already == args.on && valve_aligned {
             return Ok(format!(
                 "Parking brake is already {}.",
@@ -70,9 +83,9 @@ impl Tool for SetParkingBrake {
             ));
         }
 
-        // Valve first (set wants it closed, release wants it open), then the ratio.
-        if let Ok(open) = valve_open {
-            if open == args.on {
+        // Valve first (to the airframe's SET/RELEASED sense), then the ratio.
+        if let (Some(want), Some(now)) = (desired_valve, valve_now) {
+            if (now - want).abs() > 0.5 {
                 ctx.xplane.run_command(CMD_VALVE_TOGGLE).await?;
             }
         }
