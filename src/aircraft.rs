@@ -201,6 +201,12 @@ pub struct AircraftProfile {
     /// panel without zooming into it.
     #[serde(default = "default_view_blend")]
     pub view_blend: f64,
+    /// Cockpit geography: lowercase item name → spoken location ("on the left
+    /// subpanel, next to the avionics master"). Answers "where is the X?"
+    /// deterministically — the one thing PDF manuals can't carry (their location
+    /// diagrams don't survive text extraction). Grows per-airframe as verified.
+    #[serde(default)]
+    pub locations: std::collections::HashMap<String, String>,
     /// Snap-to-panel: tool name → a saved 3D-cockpit camera position to jump to
     /// just before that action runs, so you watch the switch move. Empty (default)
     /// = no snapping. Positions are captured live from the pilot's own framing (the
@@ -918,6 +924,7 @@ fn cessna_172sp() -> AircraftProfile {
         retractable_gear: false,
         transition_altitude_ft: 18_000.0,
         view_blend: 1.0,
+        locations: std::collections::HashMap::new(),
         view_map: std::collections::HashMap::new(),
         autopilot: true,
         autopilot_prep: None,
@@ -1109,6 +1116,7 @@ fn cirrus_sr22() -> AircraftProfile {
         retractable_gear: false,
         transition_altitude_ft: 18_000.0,
         view_blend: 1.0,
+        locations: std::collections::HashMap::new(),
         view_map: std::collections::HashMap::new(),
         // Universal-dataref tools — safe across airframes.
         autopilot: true,

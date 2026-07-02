@@ -103,7 +103,11 @@ if it is a genuine QUESTION about the flight, answer in ONE short spoken sentenc
 in ENGLISH, using digits for numbers, drawing ONLY from the aircraft state you are \
 given. Name ONLY the subject the pilot mentioned; never volunteer another (no \
 weather/heading/fuel unless they asked). If that specific reading isn't in the \
-state, say 'No reading for that.' If it is NOT a clear question — a command, \
+state, say 'No reading for that.' You may also be given MANUAL EXCERPTS from the \
+aircraft's operating manual: use them to answer procedure, limitation, and \
+systems questions ('how do I start the engines', 'what's the max crosswind'), in \
+one or two short spoken sentences; if the excerpts don't cover the question, say \
+you don't have that in the manual. If it is NOT a clear question — a command, \
 garbled, or chatter — reply EXACTLY 'Say again?' and nothing else. Never invent \
 numbers, never describe or claim actions.";
 
@@ -466,9 +470,19 @@ impl Llm {
         transcript: &str,
         history: &[(String, String)],
         state: Option<&str>,
+        manual: Option<&str>,
     ) -> Result<Option<String>> {
+        // Manual excerpts (retrieved from the aircraft's indexed POM) ride along
+        // with the live state so the answer is grounded in the book, not a guess.
+        let combined = match (state, manual) {
+            (Some(st), Some(m)) => Some(format!("{st}\n\nMANUAL EXCERPTS:\n{m}")),
+            (None, Some(m)) => Some(format!("MANUAL EXCERPTS:\n{m}")),
+            (st, None) => st.map(str::to_string),
+        };
         // No tools attached → the model physically cannot actuate anything.
-        let msg = self.chat_call(ANSWER_PROMPT, transcript, &[], history, state, 0.0).await?;
+        let msg = self
+            .chat_call(ANSWER_PROMPT, transcript, &[], history, combined.as_deref(), 0.0)
+            .await?;
         let reply = sanitize_reply(&msg.content);
         // The prompt steers non-questions to reply "Say again?" — that's the
         // model's no-answer marker, NOT something to speak (the caller's miss

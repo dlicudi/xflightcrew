@@ -308,7 +308,9 @@ pub fn run_autoland(
 
                 // Lateral: heading bug in MAGNETIC (guidance is TRUE → subtract var).
                 let mag_hdg = (g.target_heading_deg - var + 360.0) % 360.0;
-                let _ = xp.set_float(HDG_BUG, mag_hdg).await;
+                // Knob presses, not a raw write — registers on glass (G1000) too;
+                // per-tick deltas are a few degrees, so a few presses each pass.
+                let _ = crate::tools::autopilot::drive_heading_bug(&xp, mag_hdg).await;
                 if xp.get_float(HDG_STATUS).await.unwrap_or(0.0) <= 0.5 {
                     let _ = xp.run_command(CMD_HDG_MODE).await;
                 }

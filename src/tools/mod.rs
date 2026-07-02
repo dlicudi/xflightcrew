@@ -28,7 +28,6 @@ pub mod prop;
 pub mod radio;
 pub mod recover;
 pub mod reminder;
-pub mod view;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -108,9 +107,6 @@ impl Registry {
     /// system present on the airframe contributes its tool(s).
     pub fn for_aircraft(profile: &AircraftProfile) -> Self {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
-
-        // Camera/view control is airframe-independent — every aircraft has views.
-        tools.push(Box::new(view::SetView));
 
         if let Some(flaps) = &profile.flaps {
             tools.push(Box::new(flaps::SetFlaps::new(flaps.clone())));

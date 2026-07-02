@@ -229,3 +229,30 @@ lights:
   - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
   - { key: landing, spoken: landing lights,    dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
   - { key: taxi,    spoken: taxi light,        dataref: sim/cockpit2/switches/taxi_light_on,        command_on: sim/lights/taxi_lights_on,    command_off: sim/lights/taxi_lights_off }
+
+# Cockpit geography — answers "where is the X?" deterministically. Everything here
+# was verified during live sessions (subpanel photo, POM, switch archaeology).
+locations:
+  battery: "on the left subpanel below the pilot's yoke, far left of the switch rows"
+  generator switches: "on the left subpanel next to the battery switch. Three positions: down off, centre on, up is a momentary reset"
+  generators: "on the left subpanel next to the battery switch"
+  inverter: "on the left subpanel, top row, right of the avionics master. Up for inverter one, down for inverter two"
+  avionics master: "on the left subpanel, top row, between the mic switch and the inverter selector"
+  auto ignition: "top centre of the left subpanel, the ENG AUTO IGNITION pair, one per engine"
+  ignition switches: "bottom left of the subpanel, the IGNITION AND ENGINE START pair"
+  engine start switches: "bottom left of the subpanel, IGNITION AND ENGINE START, one per engine"
+  boost pumps: "on the fuel panel on the left sidewall, one switch per engine below the transfer pumps"
+  fuel panel: "on the left sidewall beside the pilot, with the quantity gauges and pump switches"
+  parking brake: "the pull handle at the bottom left of the subpanel, under the ignition switches"
+  landing lights: "in the LIGHTS group on the right side of the subpanel, left and right switches"
+  taxi light: "in the LIGHTS group on the right side of the subpanel"
+  gear handle: "on the right subpanel, the LDG GEAR CONTROL lever"
+  landing gear handle: "on the right subpanel, the LDG GEAR CONTROL lever"
+  autopilot panel: "the Collins APS-65 on the pedestal, below the EFIS control panel"
+  efis power: "top right of the pedestal control cluster, the EFIS toggle"
+  flight director: "bottom left of the pedestal autopilot cluster, the FLIGHT DIRECTOR toggle"
+  condition levers: "the two rightmost levers on the pedestal quadrant, with the friction lock behind"
+  prop levers: "the centre pair of levers on the pedestal quadrant, between power and condition levers"
+  power levers: "the left pair of levers on the pedestal quadrant"
+  pressurization: "the cabin controller on the right pedestal panel, CABIN ALT and RATE knobs"
+  transponder: "in the avionics stack, below the G430"

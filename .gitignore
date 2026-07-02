@@ -37,3 +37,6 @@ __pycache__/
 *.wav
 voice/voices/
 .venv-spk
+
+# Generated manual-retrieval indexes (x-copilot index) — rebuildable artifacts.
+indexes/

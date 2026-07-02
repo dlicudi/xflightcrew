@@ -324,7 +324,7 @@ fn run_recovery(
                 let _ = xp.run_command(CMD_HEADING_MODE).await;
             }
             let hdg = xp.get_float(CURRENT_HDG).await.unwrap_or(0.0);
-            let _ = xp.set_float(HEADING_BUG, hdg).await;
+            let _ = crate::tools::autopilot::drive_heading_bug(&xp, hdg).await;
             // Altitude hold at the current altitude.
             let alt = xp.get_float(CURRENT_ALT).await.unwrap_or(0.0);
             let hold = (alt / 100.0).round() * 100.0;

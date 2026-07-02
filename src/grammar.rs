@@ -456,50 +456,6 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("set_prop", json!({})));
     }
 
-    // Camera / view control. Trigger words are distinctive (they don't overlap
-    // flight commands), so a match here is unambiguous. "quick look N" / "view N"
-    // select a saved preset; the named views map to X-Plane's view commands.
-    let view_intent = has(t, "view")
-        || has(t, "camera")
-        || t.contains("quick look")
-        || has(t, "external")
-        || has(t, "outside")
-        || has(t, "chase")
-        || has(t, "spot")
-        || has(t, "orbit")
-        || t.contains("look forward")
-        || t.contains("look outside");
-    if view_intent {
-        if t.contains("quick look") {
-            if let Some(n) = num {
-                return Some(call("set_view", json!({ "quick_look": n })));
-            }
-        }
-        if has(t, "external") || has(t, "outside") || has(t, "chase") {
-            return Some(call("set_view", json!({ "view": "external" })));
-        }
-        if has(t, "spot") {
-            return Some(call("set_view", json!({ "view": "spot" })));
-        }
-        if has(t, "orbit") || has(t, "circle") || has(t, "circling") {
-            return Some(call("set_view", json!({ "view": "orbit" })));
-        }
-        if has(t, "free") {
-            return Some(call("set_view", json!({ "view": "free" })));
-        }
-        if has(t, "forward") || has(t, "front") || has(t, "cockpit") {
-            return Some(call("set_view", json!({ "view": "forward" })));
-        }
-        // "view 3" (no "quick look") → the same saved presets.
-        if let Some(n) = num {
-            return Some(call("set_view", json!({ "quick_look": n })));
-        }
-        // Bare "view" / "camera" → look forward.
-        if has(t, "view") || has(t, "camera") {
-            return Some(call("set_view", json!({ "view": "forward" })));
-        }
-    }
-
     // throttle / power ("power" is a throttle synonym: "power thirty percent",
     // "40 percent power", "maximum/full throttle", "idle").
     if has(t, "throttle") || has(t, "power") {
@@ -1203,25 +1159,6 @@ mod tests {
         assert_eq!(one("autoland").unwrap(), ("autoland".into(), json!({})));
         assert_eq!(one("cancel the autoland").unwrap(), ("autoland".into(), json!({"cancel":true})));
         assert_eq!(one("stop the autoland").unwrap(), ("autoland".into(), json!({"cancel":true})));
-    }
-
-    #[test]
-    fn camera_views_resolve() {
-        assert_eq!(one("external view").unwrap(), ("set_view".into(), json!({"view":"external"})));
-        assert_eq!(one("go outside").unwrap(), ("set_view".into(), json!({"view":"external"})));
-        assert_eq!(one("chase view").unwrap(), ("set_view".into(), json!({"view":"external"})));
-        assert_eq!(one("spot view").unwrap(), ("set_view".into(), json!({"view":"spot"})));
-        assert_eq!(one("orbit").unwrap(), ("set_view".into(), json!({"view":"orbit"})));
-        assert_eq!(one("forward view").unwrap(), ("set_view".into(), json!({"view":"forward"})));
-        assert_eq!(one("look forward").unwrap(), ("set_view".into(), json!({"view":"forward"})));
-        assert_eq!(one("free camera").unwrap(), ("set_view".into(), json!({"view":"free"})));
-        assert_eq!(one("quick look 3").unwrap(), ("set_view".into(), json!({"quick_look":3})));
-        assert_eq!(one("view 2").unwrap(), ("set_view".into(), json!({"quick_look":2})));
-        // A prop "forward" must NOT be hijacked by the view block (needs a view word).
-        let prof = aircraft::load("king_air_c90b").expect("c90b");
-        let reg = Registry::for_aircraft(&prof);
-        let g = |t: &str| try_parse(t, &reg, &prof).map(|mut v| v.remove(0).name);
-        assert_eq!(g("props full forward"), Some("set_prop".into()));
     }
 
     #[test]

@@ -113,6 +113,45 @@ impl Default for ApConfig {
 /// Standard X-Plane inverter status (array; any element > 0 = AC power available).
 const INVERTER_ON: &str = "sim/cockpit2/electrical/inverter_on";
 
+/// Command: turn the heading bug one degree (knob presses).
+const CMD_HDG_UP: &str = "sim/autopilot/heading_up";
+const CMD_HDG_DN: &str = "sim/autopilot/heading_down";
+
+/// Drive the heading BUG to `target` the way a human does — by turning the knob
+/// (`heading_up`/`heading_down` presses). Glass avionics that ignore raw dataref
+/// writes (the SR22's G1000) register the commands, and the knob animates. Falls
+/// back to a direct dataref write when the commands don't move the bug (checked a
+/// few presses in). Returns the bug's actual value afterwards.
+pub async fn drive_heading_bug(xp: &dyn crate::xplane::XPlane, target: f64) -> f64 {
+    let target = target.rem_euclid(360.0);
+    let Ok(start) = xp.get_float(HEADING_BUG).await else {
+        let _ = xp.set_float(HEADING_BUG, target).await;
+        return target;
+    };
+    let delta = ((target - start) % 360.0 + 540.0) % 360.0 - 180.0;
+    let presses = delta.round().abs() as i64;
+    let cmd = if delta >= 0.0 { CMD_HDG_UP } else { CMD_HDG_DN };
+    for i in 0..presses {
+        if xp.run_command(cmd).await.is_err() {
+            break;
+        }
+        // A few presses in, confirm the knob is actually bound on this airframe.
+        if i == 4 {
+            let now = xp.get_float(HEADING_BUG).await.unwrap_or(start);
+            if (now - start).abs() < 0.5 {
+                break;
+            }
+        }
+    }
+    let now = xp.get_float(HEADING_BUG).await.unwrap_or(start);
+    let err = (((target - now) % 360.0 + 540.0) % 360.0 - 180.0).abs();
+    if err > 1.5 {
+        // Knob path didn't get there — direct write as the fallback.
+        let _ = xp.set_float(HEADING_BUG, target).await;
+    }
+    xp.get_float(HEADING_BUG).await.unwrap_or(target)
+}
+
 /// Read the servo status as a bool ("is the autopilot actually flying").
 async fn servos_engaged(ctx: &ToolCtx<'_>) -> Result<bool> {
     Ok(ctx.xplane.get_float(SERVOS_ON).await? > 0.5)
@@ -582,10 +621,8 @@ impl Tool for SetHeading {
         // must be the final write or it gets clobbered.
         engage_ap(ctx, &self.cfg).await?;
         engage_mode(ctx, HEADING_STATUS, CMD_HEADING_MODE).await?;
-        ctx.xplane.set_float(HEADING_BUG, heading).await?;
-
-        // Confirm the actual state, not the intent.
-        let actual = ctx.xplane.get_float(HEADING_BUG).await?;
+        // Turn the bug like a human turns the knob (commands, dataref fallback).
+        let actual = drive_heading_bug(ctx.xplane, heading).await;
         if servos_engaged(ctx).await? {
             Ok(format!("Roger — autopilot engaged, heading mode, bug to {:03.0}.", actual))
         } else {

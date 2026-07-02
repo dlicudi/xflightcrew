@@ -11,6 +11,7 @@ mod aircraft;
 mod audio;
 mod autoland;
 mod blackbox;
+mod rag;
 mod checklist;
 mod config;
 mod datarefs;
@@ -156,6 +157,42 @@ async fn main() -> Result<()> {
     // deterministic grammar so coverage ratchets up over time.
     if std::env::args().nth(1).as_deref() == Some("analyze") {
         return analyze_commands();
+    }
+
+    // `x-copilot index <aircraft_id> <manual.pdf...>` — build the manual index the
+    // answer-only LLM grounds its answers in (see src/rag.rs).
+    if std::env::args().nth(1).as_deref() == Some("index") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let Some((id, pdfs)) = args.split_first() else {
+            eprintln!("usage: x-copilot index <aircraft_id> <manual.pdf> [more.pdf...]");
+            std::process::exit(2);
+        };
+        if pdfs.is_empty() {
+            eprintln!("usage: x-copilot index <aircraft_id> <manual.pdf> [more.pdf...]");
+            std::process::exit(2);
+        }
+        let cfg = config::Config::from_env()?;
+        return rag::build_index(&cfg.ollama_base_url, id, pdfs).await;
+    }
+
+    // `x-copilot ask <aircraft_id> <question...>` — retrieval smoke test: print the
+    // manual chunks a question would pull, without the voice loop or the LLM.
+    if std::env::args().nth(1).as_deref() == Some("ask") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let Some((id, q)) = args.split_first() else {
+            eprintln!("usage: x-copilot ask <aircraft_id> <question>");
+            std::process::exit(2);
+        };
+        let question = q.join(" ");
+        let cfg = config::Config::from_env()?;
+        match rag::Index::load(id) {
+            Some(index) => match index.retrieve(&cfg.ollama_base_url, &question, 4).await {
+                Some(hits) => println!("{hits}"),
+                None => println!("(no relevant excerpts above the score floor)"),
+            },
+            None => println!("no index for '{id}' — build one with: x-copilot index {id} <pdfs>"),
+        }
+        return Ok(());
     }
 
     // `cargo run -- stt-eval [manifest.yaml]` runs the offline speech-accuracy
@@ -544,6 +581,12 @@ async fn run_session(
         tracing::error!("checklist load failed: {e:#}; running without checklists");
         Vec::new()
     });
+    // The aircraft's manual index (built with `x-copilot index <id> <pdfs>`), for
+    // grounding the answer-only LLM in the POM. Absent = answers from state alone.
+    let mut manual_index = rag::Index::load(&profile.id);
+    if manual_index.is_some() {
+        tracing::info!(aircraft = %profile.id, "manual index loaded");
+    }
     stt.set_prompt(stt::build_prompt(&profile));
     // Tool specs for the LLM = curated tools + each checklist as a no-arg "tool"
     // the loop intercepts and runs interactively.
@@ -649,6 +692,7 @@ async fn run_session(
             profile = live_profile.get();
             registry = Registry::for_aircraft(&profile);
             checklists = checklist::load(&profile).unwrap_or_default();
+            manual_index = rag::Index::load(&profile.id);
             stt.set_prompt(stt::build_prompt(&profile));
             specs = registry.specs();
             specs.extend(checklists.iter().map(|c| c.spec()));
@@ -935,6 +979,14 @@ async fn run_session(
             continue;
         }
 
+        // Cockpit geography — "where is the inverter?" answered from the profile's
+        // verified `locations:` map: deterministic, instant, LLM-off. Runs before
+        // the generic question path so a known location beats a state-query miss.
+        if let Some(answer) = location_answer(&matchable, &profile) {
+            say(&voice, &reporter, ui::LogKind::Readback, &answer);
+            continue;
+        }
+
         // Whisper habitually APPENDS "?" to short spoken commands ("Fuel tank,
         // right?"), which used to shunt them down the question path (seen live).
         // Punctuation alone doesn't outrank a parseable command: it's a question
@@ -992,8 +1044,14 @@ async fn run_session(
             let ts = Instant::now();
             let snap = state_snapshot(&xplane, &profile, Some(&live)).await;
             tracing::info!(ms = ts.elapsed().as_millis(), state = snap.as_deref().unwrap_or("(none)"), "state snapshot");
+            // Ground the answer in the aircraft's manual, when indexed: the best
+            // POM excerpts for this question ride along with the live state.
+            let excerpts = match &manual_index {
+                Some(ix) => ix.retrieve(&config.ollama_base_url, &command, 4).await,
+                None => None,
+            };
             let t = Instant::now();
-            let answer = llm.answer(&command, &ctx_history, snap.as_deref()).await;
+            let answer = llm.answer(&command, &ctx_history, snap.as_deref(), excerpts.as_deref()).await;
             tracing::info!(ms = t.elapsed().as_millis(), path = "llm-answer", "command path");
             match answer {
                 Ok(Some(text)) => say(&voice, &reporter, ui::LogKind::Readback, &text),
@@ -1784,6 +1842,27 @@ const HEAD_DREFS: [&str; 6] = [
     "sim/graphics/view/pilots_head_the",
     "sim/graphics/view/pilots_head_phi",
 ];
+
+/// Deterministic "where is X" answers from the profile's `locations:` map — the
+/// spatial knowledge PDF manuals can't carry. Self-gated: only a where/location
+/// question, and only for an item the profile actually knows (longest key match
+/// wins, so "fuel selector" beats "fuel"). `None` falls through to normal handling.
+fn location_answer(command: &str, profile: &aircraft::AircraftProfile) -> Option<String> {
+    if profile.locations.is_empty() {
+        return None;
+    }
+    let t = grammar::normalize(command);
+    if !(t.contains("where") || t.contains("located") || t.contains("location")) {
+        return None;
+    }
+    let mut best: Option<(&String, &String)> = None;
+    for (key, desc) in &profile.locations {
+        if t.contains(key.as_str()) && best.is_none_or(|(bk, _)| key.len() > bk.len()) {
+            best = Some((key, desc));
+        }
+    }
+    best.map(|(key, desc)| format!("The {key} is {desc}."))
+}
 
 /// Interpolate between two headings/angles along the shortest arc, degrees.
 fn lerp_angle_deg(a: f64, b: f64, t: f64) -> f64 {
@@ -3037,9 +3116,6 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "wake", "remind", "notify", "heads-up", "reminder", "reminders", "cancel",
     // emergency abort/undo of the last action
     "belay", "undo", "abort", "disregard", "scratch", "revert",
-    // camera / view control. (No "spot" — it collides with "spotlight" once the
-    // light-suffix strip runs; "spot view"/"spot camera" pass via view/camera.)
-    "view", "camera", "external", "outside", "chase", "orbit", "cockpit",
     // emergency recovery / take-control + autoland handoff ("land"/"ground" already above)
     "recover", "stabilize", "stabilise", "control", "controls", "autoland",
 ];
@@ -3393,6 +3469,19 @@ mod tests {
         assert!(!has_number("switch it back to both"));
         // The rewrite a bare follow-up would produce:
         assert_eq!(format!("{} {}", command_subject("throttle eighty percent"), "sixty percent"), "throttle sixty percent");
+    }
+
+    #[test]
+    fn location_answers_from_the_profile() {
+        use super::location_answer;
+        let p = crate::aircraft::load("king_air_c90b").expect("c90b");
+        let a = location_answer("Where is the inverter?", &p).expect("known location");
+        assert!(a.to_lowercase().contains("subpanel"), "{a}");
+        // Aliased phrasing + longest-key preference.
+        assert!(super::location_answer("where are the boost pumps", &p).is_some());
+        // Unknown items and non-questions fall through.
+        assert!(super::location_answer("where is the flux capacitor", &p).is_none());
+        assert!(super::location_answer("inverter on", &p).is_none());
     }
 
     #[test]
