@@ -1137,8 +1137,10 @@ async fn run_session(
             // select the 3D cockpit and write the saved head position, then settle a
             // beat BEFORE the action so your eye lands on the panel as the switch
             // moves (not while the camera is still travelling). All best-effort.
-            // The panel's "camera snap" setting can turn the glance off live.
-            let snap_enabled = live.get(DR_OPT_SNAP).map_or(true, |v| v > 0.5);
+            // The panel's "camera snap" setting; OFF unless explicitly enabled —
+            // moving the pilot's view proved disorienting, so the callout toast
+            // carries the information and the glance is opt-in via Settings.
+            let snap_enabled = live.get(DR_OPT_SNAP).map_or(false, |v| v > 0.5);
             // Where the control sits relative to the final (blended) view — the
             // rotation REMAINDER — so the plugin can place the callout toast over
             // it on screen instead of dead-centre.

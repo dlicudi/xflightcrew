@@ -96,7 +96,10 @@ static void WriteRequest(void*, int v) { g_request = v; }
 
 // Settings-popup switches the app polls live. Ints so a missing plugin (dataref
 // unresolved) is distinguishable from "off"; defaults match the app's defaults.
-static int g_opt_camera_snap = 1;   // snap-to-panel camera on actions
+static int g_opt_camera_snap = 0;   // snap-to-panel camera on actions — OFF by
+                                    // default (moving the pilot's view proved
+                                    // disorienting; the callout toast carries the
+                                    // information). Re-enable via Settings.
 static int g_opt_negative_tone = 1; // negative tone on unrecognized command
 static int g_opt_monitor_mute = 0;  // silence the monitor's callouts
 static XPLMDataRef g_opt_snap_dref = nullptr;
