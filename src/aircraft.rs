@@ -767,7 +767,9 @@ mod tests {
         let ts = p.turboprop_start.as_ref().expect("c90b turboprop start");
         assert_eq!(ts.start_up.len(), 2);
         assert_eq!(ts.start_dn.len(), 2);
-        assert_eq!(ts.generators.len(), 2);
+        // dn+up per generator (the 3-pos GEN switch only latches ON on the
+        // dn→center transition), so 4 commands for the pair.
+        assert_eq!(ts.generators.len(), 4);
         assert_eq!(ts.condition_start, 0.5);
         assert_eq!(ts.condition_run, 1.0);
         // Modeled limits from the .acf.

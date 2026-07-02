@@ -43,6 +43,8 @@ parking_brake: true    # set_parking_brake
 pitot_heat: true       # set_pitot_heat
 pitch_trim: true       # set_pitch_trim (universal elevator_trim)
 fuel_pump: true        # standby boost pumps — fuel_pump_on[0,1], both engines (verified via fuel_pump_1_tog)
+engines: 2             # twin — per-engine accessory tools (boost pumps) write elements 0 AND 1;
+                       # without this the default 1 made "boost pumps on" drive the LEFT pump only
 
 # Retractable gear. VLE/VLO not in an authoritative source for this model, so no
 # speed gate yet (gear still works); set vlo_kts once verified (real C90B ~182).
@@ -59,19 +61,24 @@ electrical:
     on_commands:  [sim/electrical/battery_1_on]
     off_commands: [sim/electrical/battery_1_off]
     readback:     ["sim/cockpit2/electrical/battery_on[0]"]
+  # GEN switches are three-position (dn=OFF, center=ON, up=RESET momentary) and the
+  # lua only fires generator_N_on on the dn→center transition — a single "up" from
+  # center goes to RESET and latches nothing (verified live: gen2 stayed off until
+  # dn-then-up). So ON = [dn, up]: lands at center and fires generator_N_on from
+  # ANY starting position.
   - key: generator1
     spoken: generator one
-    on_commands:  [laminar/c90/electrical/switch/generator1_up]
+    on_commands:  [laminar/c90/electrical/switch/generator1_dn, laminar/c90/electrical/switch/generator1_up]
     off_commands: [laminar/c90/electrical/switch/generator1_dn]
     readback:     ["sim/cockpit/electrical/generator_on[0]"]
   - key: generator2
     spoken: generator two
-    on_commands:  [laminar/c90/electrical/switch/generator2_up]
+    on_commands:  [laminar/c90/electrical/switch/generator2_dn, laminar/c90/electrical/switch/generator2_up]
     off_commands: [laminar/c90/electrical/switch/generator2_dn]
     readback:     ["sim/cockpit/electrical/generator_on[1]"]
   - key: generators
     spoken: both generators
-    on_commands:  [laminar/c90/electrical/switch/generator1_up, laminar/c90/electrical/switch/generator2_up]
+    on_commands:  [laminar/c90/electrical/switch/generator1_dn, laminar/c90/electrical/switch/generator1_up, laminar/c90/electrical/switch/generator2_dn, laminar/c90/electrical/switch/generator2_up]
     off_commands: [laminar/c90/electrical/switch/generator1_dn, laminar/c90/electrical/switch/generator2_dn]
     readback:     ["sim/cockpit/electrical/generator_on[0]", "sim/cockpit/electrical/generator_on[1]"]
   - key: avionics
@@ -127,7 +134,9 @@ turboprop_start:
   crank_secs: 30.0
   start_up: [laminar/c90/powerplant/switch/ign_start_up_L, laminar/c90/powerplant/switch/ign_start_up_R]
   start_dn: [laminar/c90/powerplant/switch/ign_start_dn_L, laminar/c90/powerplant/switch/ign_start_dn_R]
-  generators: [laminar/c90/electrical/switch/generator1_up, laminar/c90/electrical/switch/generator2_up]
+  # dn-then-up per switch — from center a bare "up" is the momentary RESET and
+  # latches nothing (see the electrical section note).
+  generators: [laminar/c90/electrical/switch/generator1_dn, laminar/c90/electrical/switch/generator1_up, laminar/c90/electrical/switch/generator2_dn, laminar/c90/electrical/switch/generator2_up]
 speedbrake: false      # no speedbrakes on the C90
 directional_gyro: false
 flood_lights: true     # set_flood_lights — overhead flood is generic_lights_switch[0]

@@ -967,10 +967,11 @@ impl Tool for AutopilotOff {
     }
 
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
-        // Also release an active emergency recovery — "my controls" hands the
-        // aircraft fully back to the pilot (controls and autopilot). If a recovery
-        // was actually flying, acknowledge *that* rather than the AP-off wording.
-        if crate::tools::recover::abort() {
+        // Also release an active emergency recovery or autoland — "my controls"
+        // hands the aircraft fully back to the pilot. If one was actually flying,
+        // acknowledge *that* rather than the AP-off wording.
+        let was_flying = crate::tools::recover::abort() | crate::autoland::abort();
+        if was_flying {
             return Ok("You have the aircraft.".to_string());
         }
         if !servos_engaged(ctx).await? {

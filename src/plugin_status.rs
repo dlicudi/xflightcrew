@@ -23,6 +23,7 @@ const DR_HEARD: &str = "xcopilot/status/heard";
 const DR_ACTION: &str = "xcopilot/status/action";
 const DR_ALERT: &str = "xcopilot/status/alert";
 const DR_AIRCRAFT: &str = "xcopilot/status/aircraft";
+const DR_STRIP: &str = "xcopilot/status/strip";
 
 /// Keep text within the plugin's fixed display buffer (512 bytes, NUL-terminated)
 /// — long enough for a full engine/weather summary readback.
@@ -40,6 +41,9 @@ enum Update {
     Alert(AlertLevel, String),
     /// The active aircraft's ICAO code, shown beside the connection chip.
     Aircraft(String),
+    /// The live flight strip — one compact status row (emergency phase/runway,
+    /// cabin altitude, endurance), refreshed continuously. Empty hides it.
+    Strip(String),
 }
 
 /// Severity of a panel alert — drives the chip colour/label in the plugin.
@@ -95,6 +99,10 @@ impl StatusSink {
     pub fn aircraft(&self, code: &str) {
         let _ = self.0.send(Update::Aircraft(code.trim().to_uppercase()));
     }
+    /// Refresh the live flight strip. Empty text hides the row.
+    pub fn strip(&self, text: &str) {
+        let _ = self.0.send(Update::Strip(clip(text)));
+    }
 }
 
 /// Scrub em/en dashes (the panel font can't render them) and trim to the plugin
@@ -120,6 +128,7 @@ enum Slot {
     Action,
     Alert,
     Aircraft,
+    Strip,
 }
 
 /// The resolved numeric ids of the plugin's status datarefs. All `None` until a
@@ -131,6 +140,7 @@ struct Ids {
     action: Option<i64>,
     alert: Option<i64>,
     aircraft: Option<i64>,
+    strip: Option<i64>,
 }
 
 impl Ids {
@@ -141,6 +151,7 @@ impl Ids {
             Slot::Action => self.action,
             Slot::Alert => self.alert,
             Slot::Aircraft => self.aircraft,
+            Slot::Strip => self.strip,
         }
     }
     /// True once at least one dataref resolved (i.e. the plugin is present).
@@ -158,6 +169,7 @@ fn resolve_all(http: &reqwest::blocking::Client, rest: &str) -> Ids {
         action: resolve_id(http, rest, DR_ACTION),
         alert: resolve_id(http, rest, DR_ALERT),
         aircraft: resolve_id(http, rest, DR_AIRCRAFT),
+        strip: resolve_id(http, rest, DR_STRIP),
     }
 }
 
@@ -204,6 +216,7 @@ fn run(base: String, rx: Receiver<Update>) {
                 (Slot::Alert, json!(STANDARD.encode(payload.as_bytes())))
             }
             Ok(Update::Aircraft(code)) => (Slot::Aircraft, json!(STANDARD.encode(code.as_bytes()))),
+            Ok(Update::Strip(text)) => (Slot::Strip, json!(STANDARD.encode(text.as_bytes()))),
             Err(RecvTimeoutError::Timeout) => (Slot::Phase, json!(last_phase)), // heartbeat
             Err(RecvTimeoutError::Disconnected) => break,
         };
@@ -229,8 +242,9 @@ fn run(base: String, rx: Receiver<Update>) {
     }
 }
 
-/// Resolve a dataref name to its numeric id via REST, or `None`.
-fn resolve_id(http: &reqwest::blocking::Client, rest: &str, name: &str) -> Option<i64> {
+/// Resolve a dataref name to its numeric id via REST, or `None`. Shared with the
+/// panel-request poller in main.rs.
+pub(crate) fn resolve_id(http: &reqwest::blocking::Client, rest: &str, name: &str) -> Option<i64> {
     let body: serde_json::Value = http
         .get(format!("{rest}/datarefs"))
         .query(&[("filter[name]", name)])

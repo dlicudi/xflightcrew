@@ -108,6 +108,10 @@ pub struct Snapshot {
     pub low_vacuum: bool,
     /// Battery ammeter, amps. Positive = charging, negative = discharging.
     pub battery_amps: f64,
+    /// Parking-brake ratio (0 released .. 1 set) — for the rolling-with-the-brake
+    /// check. The C90 doesn't animate its handle from this, so the panel can look
+    /// released while the sim-level brake drags (seen live: 48 kt -> stopped).
+    pub park_brake: f64,
     /// Cabin altitude, feet (`.../pressurization/indicators/cabin_altitude_ft`). On
     /// an unpressurized airframe this tracks the actual altitude, which is exactly
     /// what the hypoxia check wants; on a pressurized one it's the real cabin.
@@ -228,6 +232,11 @@ impl Snapshot {
             .and_then(engine0)
             .unwrap_or(0.0);
 
+        // Parking brake for the rolling-with-brake check (best-effort).
+        let park_brake = xp
+            .get_float("sim/cockpit2/controls/parking_brake_ratio")
+            .await
+            .unwrap_or(0.0);
         // Cabin altitude for the hypoxia check. Best-effort; an unpressurized
         // airframe reports its actual altitude here, which is what we want.
         let cabin_altitude_ft = xp
@@ -260,6 +269,7 @@ impl Snapshot {
             rpm,
             low_vacuum,
             battery_amps,
+            park_brake,
             cabin_altitude_ft,
             phase: Phase::Ground,
         };
@@ -374,11 +384,14 @@ impl FireState {
         status: Option<&StatusSink>,
         now: Instant,
     ) {
-        // While the copilot is flying the aircraft (an active recovery), stay quiet:
-        // the recovery announces its own actions, and pilot-directed advice ("lower
-        // the nose, add power") is backwards when the copilot is the one doing it.
-        let recovering = crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
-        if !recovering && self.sustained(min_duration, now) && self.should_speak(sev, now) {
+        // While the copilot is flying the aircraft (an active recovery/autoland),
+        // stay quiet: it announces its own actions, and pilot-directed advice
+        // ("lower the nose, add power") is backwards when the copilot is the one
+        // doing it. The panel's "mute monitor" setting silences callouts too.
+        let flying = crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+            || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+            || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
+        if !flying && self.sustained(min_duration, now) && self.should_speak(sev, now) {
             // Mirror the callout to the in-sim panel (monitor speaks via Voice,
             // which otherwise bypasses the panel's Reporter), coloured by severity.
             if let Some(s) = status {
@@ -731,8 +744,33 @@ impl Check for CabinAltitude {
     }
 }
 
+/// Rolling with the parking brake set — dragging the brakes on a taxi/takeoff
+/// roll. Caught twice live on the C90B, where the 3D handle doesn't reflect the
+/// sim-level brake (a stray 'b' key sets it invisibly). Groundspeed floor keeps
+/// it quiet at a standstill and during brake-on run-ups.
+struct RollingOnParkBrake;
+
+impl Check for RollingOnParkBrake {
+    fn id(&self) -> &'static str {
+        "rolling_park_brake"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Caution
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        (s.on_ground && s.groundspeed_kts > 5.0 && s.park_brake > 0.5)
+            .then(|| "Parking brake is set and we're rolling — release it.".to_string())
+    }
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(2)
+    }
+}
+
 fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     let mut checks: Vec<Box<dyn Check>> = Vec::new();
+
+    // Universal: every airframe can roll with the brake set.
+    checks.push(Box::new(RollingOnParkBrake));
 
     // Hypoxia — applies to every airframe (cabin altitude tracks real altitude when
     // unpressurized). Disjoint bands so only one fires at a time.
@@ -885,6 +923,29 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
 
 /// Run the monitor loop until the process exits. Spawned on its own thread +
 /// runtime with its own X-Plane client; shares the [`Voice`] arbiter.
+/// The plugin panel's "mute monitor callouts" setting, refreshed each tick from
+/// its dataref. Checked by every callout alongside the copilot-is-flying gate.
+static PANEL_MUTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The live flight strip shown on the plugin panel: the active emergency line
+/// (if any), then cabin altitude airborne, then fuel endurance. " | " separators
+/// (ASCII-safe for the panel font). Empty hides the row.
+fn compose_strip(s: &Snapshot) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Ok(e) = crate::autoland::PANEL.lock() {
+        if !e.is_empty() {
+            parts.push(e.clone());
+        }
+    }
+    if !s.on_ground {
+        parts.push(format!("CABIN {:.0}ft", s.cabin_altitude_ft));
+    }
+    if let Some(m) = s.endurance_min {
+        parts.push(format!("FUEL {}h{:02}m", (m / 60.0) as i64, (m % 60.0) as i64));
+    }
+    parts.join(" | ")
+}
+
 pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice: Voice, status: Option<StatusSink>) {
     // Checks are built from the active profile and rebuilt when the aircraft
     // switches (the generation counter changes), so a jet doesn't keep a 172's
@@ -906,6 +967,8 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
     // it's called out on transitions here rather than as Checks.
     let mut prev_attached = false;
     let mut prev_pushing = false;
+    // Last strip pushed to the panel — only re-send on change.
+    let mut last_strip = String::new();
 
     loop {
         // Aircraft switched → rebuild the checks for the new airframe.
@@ -948,6 +1011,18 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
             }
             prev_ias = Some((snap.ias_kts, now));
             snap.ias_trend_kts_per_s = trend;
+
+            // Panel settings + the live flight strip. The mute switch comes from
+            // the plugin's settings popup; unresolvable (no plugin) = unmuted.
+            let mute = xp.get_float("xcopilot/opt/monitor_mute").await.map_or(false, |v| v > 0.5);
+            PANEL_MUTE.store(mute, std::sync::atomic::Ordering::Relaxed);
+            if let Some(s) = status.as_ref() {
+                let strip = compose_strip(&snap);
+                if strip != last_strip {
+                    s.strip(&strip);
+                    last_strip = strip;
+                }
+            }
 
             for check in &checks {
                 let state = states.get_mut(check.id()).expect("state per check");
@@ -1185,6 +1260,7 @@ mod tests {
             rpm: 0.0,
             low_vacuum: false,
             battery_amps: 0.0,
+            park_brake: 0.0,
             cabin_altitude_ft: 0.0,
             phase: Phase::Ground,
         }
@@ -1313,6 +1389,26 @@ mod tests {
     }
     fn fuel_warning() -> FuelEndurance {
         FuelEndurance { id: "fuel_warning", severity: Severity::Warning, at_or_below_min: 30.0, above_min: None }
+    }
+
+    #[test]
+    fn rolling_on_park_brake_fires_only_when_moving_on_ground() {
+        let c = RollingOnParkBrake;
+        let mut s = snap(true, true);
+        // Parked with the brake set (a run-up): silent.
+        s.park_brake = 1.0;
+        s.groundspeed_kts = 0.0;
+        assert!(c.eval(&s).is_none(), "stationary is fine");
+        // Rolling with it set: caution.
+        s.groundspeed_kts = 20.0;
+        assert!(c.eval(&s).is_some(), "rolling with the brake must fire");
+        // Rolling with it released: silent.
+        s.park_brake = 0.0;
+        assert!(c.eval(&s).is_none());
+        // Airborne (stale ratio): silent.
+        s.park_brake = 1.0;
+        s.on_ground = false;
+        assert!(c.eval(&s).is_none(), "not a thing in the air");
     }
 
     #[test]

@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <memory>
 #include <string>
 #include <vector>
@@ -81,6 +82,33 @@ static XPLMDataRef g_llm_dref = nullptr;
 static int ReadLlmEnabled(void*) { return g_llm_enabled; }
 static void WriteLlmEnabled(void*, int v) { g_llm_enabled = v; }
 
+// ---- panel requests (plugin → app) -------------------------------------------
+
+// The emergency buttons write a request code the app polls and consumes (same
+// direction as PTT): 0 = none, 1 = recover, 2 = autoland, 3 = my controls. The
+// app runs the matching voice command and writes 0 back.
+static int g_request = 0;
+static XPLMDataRef g_request_dref = nullptr;
+static int ReadRequest(void*) { return g_request; }
+static void WriteRequest(void*, int v) { g_request = v; }
+
+// ---- panel options (plugin → app) --------------------------------------------
+
+// Settings-popup switches the app polls live. Ints so a missing plugin (dataref
+// unresolved) is distinguishable from "off"; defaults match the app's defaults.
+static int g_opt_camera_snap = 1;   // snap-to-panel camera on actions
+static int g_opt_negative_tone = 1; // negative tone on unrecognized command
+static int g_opt_monitor_mute = 0;  // silence the monitor's callouts
+static XPLMDataRef g_opt_snap_dref = nullptr;
+static XPLMDataRef g_opt_tone_dref = nullptr;
+static XPLMDataRef g_opt_mute_dref = nullptr;
+static int ReadOptSnap(void*) { return g_opt_camera_snap; }
+static void WriteOptSnap(void*, int v) { g_opt_camera_snap = v; }
+static int ReadOptTone(void*) { return g_opt_negative_tone; }
+static void WriteOptTone(void*, int v) { g_opt_negative_tone = v; }
+static int ReadOptMute(void*) { return g_opt_monitor_mute; }
+static void WriteOptMute(void*, int v) { g_opt_monitor_mute = v; }
+
 // ---- status datarefs --------------------------------------------------------
 
 struct TextRef { char buf[512]; int len; };
@@ -90,23 +118,34 @@ static TextRef g_heard = {{0}, 0};
 static TextRef g_action = {{0}, 0};
 static TextRef g_alert = {{0}, 0};
 static TextRef g_aircraft = {{0}, 0};
+// Live flight strip — one compact status line the app refreshes (emergency
+// phase/runway, cabin altitude, fuel endurance). Empty = hidden.
+static TextRef g_strip = {{0}, 0};
 
 static XPLMDataRef g_phase_dref = nullptr;
 static XPLMDataRef g_heard_dref = nullptr;
 static XPLMDataRef g_action_dref = nullptr;
 static XPLMDataRef g_alert_dref = nullptr;
 static XPLMDataRef g_aircraft_dref = nullptr;
+static XPLMDataRef g_strip_dref = nullptr;
 
-// Transmission log shown in the panel.
-struct LogEntry { std::string tag; ImU32 color; std::string text; };
+// Transmission log shown in the panel, each entry stamped with wall-clock time
+// so a test flight can be reviewed afterwards.
+struct LogEntry { std::string time; std::string tag; ImU32 color; std::string text; };
 static std::vector<LogEntry> g_log;
 static bool g_log_scroll = false;
+static bool g_log_autoscroll = true;
 
 static void AppendLog(const char* tag, ImU32 color, const char* text) {
     if (text == nullptr || text[0] == '\0') return;
-    g_log.push_back({tag, color, text});
-    if (g_log.size() > 60) g_log.erase(g_log.begin());
-    g_log_scroll = true;
+    char ts[16] = {0};
+    time_t now = time(nullptr);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    strftime(ts, sizeof ts, "%H:%M:%S", &lt);
+    g_log.push_back({ts, tag, color, text});
+    if (g_log.size() > 200) g_log.erase(g_log.begin());
+    if (g_log_autoscroll) g_log_scroll = true;
 }
 
 // Last time the app wrote any status (sim seconds). The app heartbeats the phase
@@ -150,6 +189,10 @@ static void WriteAction(void*, void* in, int offset, int len) {
 // Active aircraft ICAO — shown beside the connection chip, not logged.
 static void WriteAircraft(void*, void* in, int offset, int len) {
     StoreText(&g_aircraft, in, offset, len);
+}
+// Live flight strip — a status row the app refreshes continuously, not logged.
+static void WriteStrip(void*, void* in, int offset, int len) {
+    StoreText(&g_strip, in, offset, len);
 }
 static void WriteAlert(void*, void* in, int offset, int len) {
     StoreText(&g_alert, in, offset, len);
@@ -422,17 +465,32 @@ protected:
         } else {
             Chip("NOT CONNECTED", COL_RED);
         }
-        // LLM fallback toggle: flip the answer-only LLM on/off live (the app reads
-        // this dataref each utterance). AUTO until first click = follow the app's
-        // startup default; clicking commits it to a definite ON/OFF thereafter.
+        // Settings popup — all the runtime switches in one place, so the toolbar
+        // stays chips-only as options grow. Each checkbox drives a dataref the app
+        // polls live; changes apply on the next utterance/tick, no restart.
         ImGui::SameLine();
-        const char* llmLbl = g_llm_enabled < 0 ? "LLM AUTO" : (g_llm_enabled ? "LLM ON" : "LLM OFF");
-        ImU32 llmCol = g_llm_enabled < 0 ? COL_CYAN : (g_llm_enabled ? COL_GREEN : COL_DIM);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(llmCol));
-        if (ImGui::SmallButton(llmLbl)) {
-            g_llm_enabled = (g_llm_enabled == 1) ? 0 : 1; // AUTO/OFF -> ON, ON -> OFF
+        if (ImGui::SmallButton("Settings")) {
+            ImGui::OpenPopup("xcp_settings");
         }
-        ImGui::PopStyleColor();
+        if (ImGui::BeginPopup("xcp_settings")) {
+            bool llm_on = (g_llm_enabled == 1);
+            if (ImGui::Checkbox("LLM fallback (answer questions)", &llm_on)) {
+                g_llm_enabled = llm_on ? 1 : 0;
+            }
+            bool snap = g_opt_camera_snap != 0;
+            if (ImGui::Checkbox("Camera snap-to-panel on actions", &snap)) {
+                g_opt_camera_snap = snap ? 1 : 0;
+            }
+            bool tone = g_opt_negative_tone != 0;
+            if (ImGui::Checkbox("Negative tone on unrecognized", &tone)) {
+                g_opt_negative_tone = tone ? 1 : 0;
+            }
+            bool mute = g_opt_monitor_mute != 0;
+            if (ImGui::Checkbox("Mute monitor callouts", &mute)) {
+                g_opt_monitor_mute = mute ? 1 : 0;
+            }
+            ImGui::EndPopup();
+        }
         // Collapse / expand to just this toolbar row, to tuck the panel away.
         ImGui::SameLine();
         if (ImGui::SmallButton(mCollapsed ? "+" : "_")) {
@@ -453,10 +511,43 @@ protected:
             return;
         }
 
-        // Transmission log — recent heard/action lines with coloured tags.
+        // Live flight strip — the app refreshes this with what the copilot sees
+        // (emergency phase/runway, cabin altitude, endurance). Hidden when empty.
+        if (connected && g_strip.len > 0) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_CYAN));
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(g_strip.buf);
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+        }
+
+        // Emergency buttons — the mouse fallback when voice fails mid-emergency.
+        // Each writes a request code the app polls and runs as the matching voice
+        // command ("take control" / "land the aircraft" / "my controls").
+        if (connected) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_RED));
+            if (ImGui::SmallButton("RECOVER")) g_request = 1;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("AUTOLAND")) g_request = 2;
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_GREEN));
+            if (ImGui::SmallButton("MY CONTROLS")) g_request = 3;
+            ImGui::PopStyleColor();
+            if (g_request != 0) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "sent...");
+            }
+            ImGui::Separator();
+        }
+
+        // Transmission log — recent heard/action lines with coloured tags, each
+        // stamped so a test can be reviewed afterwards.
         const float footer = ImGui::GetFrameHeightWithSpacing();
         ImGui::BeginChild("log", ImVec2(0, -footer), true);
         for (const LogEntry& e : g_log) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", e.time.c_str());
+            ImGui::SameLine();
             Chip(e.tag.c_str(), e.color);
             ImGui::SameLine();
             // Wrap long readbacks at the panel edge instead of running off it.
@@ -469,13 +560,24 @@ protected:
         if (g_log_scroll) { ImGui::SetScrollHereY(1.0f); g_log_scroll = false; }
         ImGui::EndChild();
 
-        // Footer: connection state + version.
+        // Footer: connection state + version on the left; log controls on the right.
         if (!connected) {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "Not connected. Start x-copilot.");
         } else if (g_log.empty()) {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_GREEN), "Connected to x-copilot v" XCOPILOT_VERSION ". Hold your PTT button and speak.");
         } else {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_GREEN), "Connected to x-copilot v" XCOPILOT_VERSION);
+        }
+        // Right-aligned: auto-scroll toggle + clear.
+        const char* clearLbl = "Clear";
+        float ctlW = ImGui::CalcTextSize("Clear").x + ImGui::CalcTextSize("follow").x
+            + ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 6.0f
+            + ImGui::GetStyle().ItemSpacing.x * 2.0f;
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - ctlW);
+        ImGui::Checkbox("follow", &g_log_autoscroll);
+        ImGui::SameLine();
+        if (ImGui::SmallButton(clearLbl)) {
+            g_log.clear();
         }
     }
 };
@@ -537,6 +639,26 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         "xcopilot/llm_enabled", xplmType_Int, 1,
         ReadLlmEnabled, WriteLlmEnabled, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_request_dref = XPLMRegisterDataAccessor(
+        "xcopilot/request", xplmType_Int, 1,
+        ReadRequest, WriteRequest, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_strip_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/strip", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteStrip, &g_strip, &g_strip);
+    g_opt_snap_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/camera_snap", xplmType_Int, 1,
+        ReadOptSnap, WriteOptSnap, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_opt_tone_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/negative_tone", xplmType_Int, 1,
+        ReadOptTone, WriteOptTone, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_opt_mute_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/monitor_mute", xplmType_Int, 1,
+        ReadOptMute, WriteOptMute, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
 
     // One shared font atlas for all ImgWindows (uses ImGui's default font).
     ImgWindow::sFontAtlas = std::make_shared<ImgFontAtlas>();
@@ -564,6 +686,11 @@ PLUGIN_API void XPluginStop(void) {
     g_panel.reset();
     ImgWindow::sFontAtlas.reset();
     if (g_menu) { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
+    if (g_opt_mute_dref) { XPLMUnregisterDataAccessor(g_opt_mute_dref); g_opt_mute_dref = nullptr; }
+    if (g_opt_tone_dref) { XPLMUnregisterDataAccessor(g_opt_tone_dref); g_opt_tone_dref = nullptr; }
+    if (g_opt_snap_dref) { XPLMUnregisterDataAccessor(g_opt_snap_dref); g_opt_snap_dref = nullptr; }
+    if (g_strip_dref) { XPLMUnregisterDataAccessor(g_strip_dref); g_strip_dref = nullptr; }
+    if (g_request_dref) { XPLMUnregisterDataAccessor(g_request_dref); g_request_dref = nullptr; }
     if (g_llm_dref) { XPLMUnregisterDataAccessor(g_llm_dref); g_llm_dref = nullptr; }
     if (g_fms_load_dref) { XPLMUnregisterDataAccessor(g_fms_load_dref); g_fms_load_dref = nullptr; }
     if (g_fms_route_dref) { XPLMUnregisterDataAccessor(g_fms_route_dref); g_fms_route_dref = nullptr; }

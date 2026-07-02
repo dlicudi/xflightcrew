@@ -14,6 +14,14 @@ const TRIM_STEP: f64 = 0.10;
 /// Takeoff trim setting for the 172 — roughly neutral (the takeoff band).
 const TRIM_TAKEOFF: f64 = 0.0;
 
+/// Park-brake VALVE (X-Plane 12). Aircraft that model it (the C90B) animate their
+/// handle from this and it OVERRIDES the classic ratio: **0 = closed = brake held**
+/// (the sim pins `parking_brake_ratio` back to 1 within ~3 s), **1 = open =
+/// released**. Verified live — with the valve closed no ratio write sticks; open
+/// it and the aircraft rolls. Standard sim names, harmless where unmodeled.
+const PARK_BRAKE_VALVE: &str = "sim/cockpit2/controls/park_brake_valve";
+const CMD_VALVE_TOGGLE: &str = "sim/flight_controls/park_brake_valve_toggle";
+
 pub struct SetParkingBrake;
 
 #[derive(Deserialize)]
@@ -46,16 +54,28 @@ impl Tool for SetParkingBrake {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: Args = serde_json::from_value(args.clone())?;
+        // The valve, where modeled, must agree or the ratio won't hold: closed (0)
+        // pins the ratio back to 1 within seconds, so a release can't stick; and a
+        // "set" with the valve open can be cleared by the pilot's handle alone.
+        let valve_open = ctx.xplane.get_float(PARK_BRAKE_VALVE).await.map(|v| v > 0.5);
 
-        // If it's already where you asked, say so instead of a redundant "Roger".
+        // If everything's already where you asked, say so instead of a "Roger" —
+        // but only when the valve (if readable) agrees too.
         let already = ctx.xplane.get_float(PARK_BRAKE).await? > 0.5;
-        if already == args.on {
+        let valve_aligned = valve_open.as_ref().map(|&open| open == !args.on).unwrap_or(true);
+        if already == args.on && valve_aligned {
             return Ok(format!(
                 "Parking brake is already {}.",
                 if already { "set" } else { "off" }
             ));
         }
 
+        // Valve first (set wants it closed, release wants it open), then the ratio.
+        if let Ok(open) = valve_open {
+            if open == args.on {
+                ctx.xplane.run_command(CMD_VALVE_TOGGLE).await?;
+            }
+        }
         ctx.xplane.set_float(PARK_BRAKE, if args.on { 1.0 } else { 0.0 }).await?;
         let set = ctx.xplane.get_float(PARK_BRAKE).await? > 0.5;
         Ok(format!("Roger, parking brake {}.", if set { "set" } else { "released" }))

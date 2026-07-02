@@ -9,6 +9,7 @@
 
 mod aircraft;
 mod audio;
+mod autoland;
 mod checklist;
 mod config;
 mod datarefs;
@@ -350,7 +351,9 @@ async fn main() -> Result<()> {
 
         // Typed-command channel: the dashboard (main thread) sends commands the
         // pilot types; the voice loop picks them up alongside spoken utterances.
+        // The plugin panel's emergency buttons feed the same channel.
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        spawn_panel_request_poller(config.xplane_base_url.clone(), cmd_tx.clone());
         let mut reporter = Reporter::tui(tx);
         if let Some(s) = status_sink.clone() {
             reporter = reporter.with_status(s);
@@ -372,8 +375,66 @@ async fn main() -> Result<()> {
         if let Some(s) = status_sink {
             reporter = reporter.with_status(s);
         }
-        run_session(config, stt, llm, live_profile, voice, continuous, explicit, ptt, reporter, None).await
+        // No typed input in plain mode, but the panel's emergency buttons still
+        // need a way in — same channel, same consumer.
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
+        spawn_panel_request_poller(config.xplane_base_url.clone(), cmd_tx);
+        run_session(config, stt, llm, live_profile, voice, continuous, explicit, ptt, reporter, Some(cmd_rx)).await
     }
+}
+
+/// Poll the plugin panel's request dataref (`xcopilot/request`) and turn button
+/// presses into commands on the typed-command channel: 1 = "take control",
+/// 2 = "land the aircraft", 3 = "my controls". The value is consumed (written
+/// back to 0) once injected, so a press fires exactly once. Best-effort like the
+/// status sink: no plugin / no X-Plane just means the buttons do nothing.
+fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::Sender<String>) {
+    std::thread::spawn(move || {
+        let Ok(http) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+        else {
+            return;
+        };
+        let rest = format!("{}/api/v1", base_url.trim_end_matches('/'));
+        let mut id: Option<i64> = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            if id.is_none() {
+                id = crate::plugin_status::resolve_id(&http, &rest, "xcopilot/request");
+                if id.is_none() {
+                    // Plugin not loaded / sim down — retry lazily.
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    continue;
+                }
+            }
+            let Some(dref) = id else { continue };
+            let url = format!("{rest}/datarefs/{dref}/value");
+            let value = http
+                .get(&url)
+                .send()
+                .ok()
+                .filter(|r| r.status().is_success())
+                .and_then(|r| r.json::<serde_json::Value>().ok())
+                .and_then(|b| b.get("data").and_then(|d| d.as_i64()));
+            let Some(v) = value else {
+                id = None; // stale id (sim restarted) — re-resolve
+                continue;
+            };
+            let cmd = match v {
+                1 => "take control",
+                2 => "land the aircraft",
+                3 => "my controls",
+                _ => continue,
+            };
+            tracing::info!(request = v, cmd, "panel button request");
+            // Consume first so a slow channel can't double-fire the request.
+            let _ = http.patch(&url).json(&serde_json::json!({ "data": 0 })).send();
+            if tx.send(cmd.to_string()).is_err() {
+                return; // session gone
+            }
+        }
+    });
 }
 
 /// The voice loop: listen → transcribe → pick a tool → confirm → execute → read
@@ -937,7 +998,7 @@ async fn run_session(
                     // (not a question, or out of scope). Same as a grammar miss:
                     // negative tone on PTT, no misleading spoken "Say again?".
                     reporter.log(ui::LogKind::Warn, format!("no match: \"{command}\""));
-                    if explicit {
+                    if explicit && live.get(DR_OPT_TONE).map_or(true, |v| v > 0.5) {
                         voice.negative();
                     }
                 }
@@ -955,7 +1016,7 @@ async fn run_session(
             // acknowledge with the negative tone. Continuous mode stays silent.
             tracing::info!(path = "deterministic-miss", "command path");
             reporter.log(ui::LogKind::Warn, format!("unrecognized: \"{command}\""));
-            if explicit {
+            if explicit && live.get(DR_OPT_TONE).map_or(true, |v| v > 0.5) {
                 voice.negative();
             }
             continue;
@@ -1075,7 +1136,11 @@ async fn run_session(
             // select the 3D cockpit and write the saved head position, then settle a
             // beat BEFORE the action so your eye lands on the panel as the switch
             // moves (not while the camera is still travelling). All best-effort.
-            let restore_view: Option<[f64; 6]> = if let Some(v) = profile.view_map.get(&call.name) {
+            // The panel's "camera snap" setting can turn the glance off live.
+            let snap_enabled = live.get(DR_OPT_SNAP).map_or(true, |v| v > 0.5);
+            let restore_view: Option<[f64; 6]> = if let Some(v) =
+                profile.view_map.get(&call.name).filter(|_| snap_enabled)
+            {
                 let mut cur = [0.0f64; 6];
                 let mut have_cur = true;
                 for (slot, dref) in cur.iter_mut().zip(HEAD_DREFS) {
@@ -1661,7 +1726,7 @@ const SNAPSHOT_DATAREFS: &[&str] = &[
     datarefs::WIND_SPEED_MSC, datarefs::OAT_DEG_C, datarefs::VISIBILITY_SM,
     datarefs::QNH_PASCALS, datarefs::SERVOS_ON, datarefs::APPROACH_STATUS,
     datarefs::NAV_STATUS, datarefs::HEADING_STATUS,
-    DR_LLM_ENABLED,
+    DR_LLM_ENABLED, DR_OPT_SNAP, DR_OPT_TONE,
 ];
 
 /// The 3D-cockpit camera position (pilot's-head datarefs) — read to remember the
@@ -1682,6 +1747,10 @@ const HEAD_DREFS: [&str; 6] = [
 /// forced off, `1` = forced on. Absent (plugin not loaded) reads as a cache miss,
 /// which also falls back to the startup default.
 const DR_LLM_ENABLED: &str = "xcopilot/llm_enabled";
+/// Panel settings-popup switches, polled the same way. Missing (no plugin) =
+/// the feature's default (both on).
+const DR_OPT_SNAP: &str = "xcopilot/opt/camera_snap";
+const DR_OPT_TONE: &str = "xcopilot/opt/negative_tone";
 
 /// Read a dataref preferring the live-state cache (instant, no round-trip), with a
 /// REST read as the fallback on a cache miss — so it's never worse than polling

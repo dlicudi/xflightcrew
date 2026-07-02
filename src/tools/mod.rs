@@ -111,8 +111,6 @@ impl Registry {
 
         // Camera/view control is airframe-independent — every aircraft has views.
         tools.push(Box::new(view::SetView));
-        // Emergency autoland handoff (to the separate plugin) — airframe-independent.
-        tools.push(Box::new(autoland::Autoland));
 
         if let Some(flaps) = &profile.flaps {
             tools.push(Box::new(flaps::SetFlaps::new(flaps.clone())));
@@ -156,10 +154,23 @@ impl Registry {
             // Emergency upset/stall recovery — takes the controls, so it needs the
             // autopilot (for the level-hold handoff) present. It also drives the
             // props full forward for max power, and holds ≈1.3×Vs.
+            let vs = profile.vs_clean_kts.unwrap_or(60.0);
             tools.push(Box::new(recover::Recover {
-                cfg: ap,
+                cfg: ap.clone(),
                 prop: profile.prop.clone(),
-                stall_speed_kts: profile.vs_clean_kts.unwrap_or(60.0),
+                stall_speed_kts: vs,
+            }));
+            // Native emergency autoland — needs the AP for approach guidance. Prefer
+            // the airframe's real approach speed; fall back to ~1.3×Vs.
+            let approach_ias = profile
+                .reference
+                .as_ref()
+                .and_then(|r| r.approach_kts)
+                .unwrap_or((vs * 1.3).max(70.0));
+            tools.push(Box::new(autoland::Autoland {
+                cfg: ap,
+                approach_ias,
+                prop: profile.prop.clone(),
             }));
         }
 

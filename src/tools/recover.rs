@@ -263,6 +263,7 @@ fn run_recovery(
                 };
                 if phase != last_phase {
                     last_phase = phase;
+                    crate::autoland::set_panel(&format!("RECOVERING: {}", phase.to_uppercase()));
                     let line = match phase {
                         "unstall" => "Breaking the stall, nose down, full power.",
                         "roll" => "Rolling wings level.",
@@ -298,6 +299,7 @@ fn run_recovery(
             let _ = xp.set_float(YOKE_ROLL, 0.0).await;
             let _ = xp.set_float(OVR_PITCH, 0.0).await;
             let _ = xp.set_float(OVR_ROLL, 0.0).await;
+            crate::autoland::set_panel("");
             ACTIVE.store(false, Ordering::SeqCst);
 
             // If the pilot took it back, don't grab it again via the AP.

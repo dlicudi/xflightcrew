@@ -1,13 +1,11 @@
-//! `autoland` — hand off to the Emergency Autoland plugin.
+//! `autoland` — native emergency autoland (no external plugin).
 //!
-//! x-copilot owns the *upset recovery* (`recover`); the actual approach-and-land
-//! is a separate, mature XPPython3 plugin (`~/GitHub/xplane-emergency-autoland`).
-//! This tool just arms it, by firing its toggle command over the Web API — so
-//! "land the aircraft" chains recovery → autoland → touchdown, all by voice.
-//!
-//! The plugin's master is a *toggle* with no readable armed state, so `cancel`
-//! fires the same command; the pilot drives which they mean. If the plugin isn't
-//! loaded the command won't resolve — we say so rather than fail the action.
+//! x-copilot owns the *upset recovery* (`recover`); this flies a full approach and
+//! landing to the nearest suitable runway, entirely in-process: it parses X-Plane's
+//! `apt.dat` for the runway ([`crate::autoland`]), then an AP-first control loop
+//! tracks the final approach course and 3° glidepath, lowers gear/flaps, and eases
+//! to idle in the flare. EXPERIMENTAL and untuned — arm it high, over an airport,
+//! hand ready; "my controls" / "cancel autoland" hands it back instantly.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -15,11 +13,26 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx};
+use crate::aircraft::PropProfile;
+use crate::tools::autopilot::ApConfig;
 
-/// The Emergency Autoland plugin's master toggle command.
-const CMD_AUTOLAND_TOGGLE: &str = "duanelicudi/landingassist/toggle";
+/// Where the Global Airports apt.dat lives — `XCOPILOT_APT_DAT` overrides the
+/// standard install path.
+pub fn apt_dat_path() -> String {
+    if let Ok(p) = std::env::var("XCOPILOT_APT_DAT") {
+        return p;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!("{home}/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat")
+}
 
-pub struct Autoland;
+pub struct Autoland {
+    pub cfg: ApConfig,
+    /// Approach speed (KIAS) — the loop holds this on final. From ~1.3×Vs.
+    pub approach_ias: f64,
+    #[allow(dead_code)]
+    pub prop: Option<PropProfile>,
+}
 
 #[derive(Deserialize, Default)]
 struct Args {
@@ -34,10 +47,10 @@ impl Tool for Autoland {
         "autoland"
     }
     fn description(&self) -> &str {
-        "Arm the emergency autoland to fly an approach and land at the nearest \
-         suitable runway (hands off to the Emergency Autoland plugin). Use for \
-         'land the aircraft', 'get us down', 'emergency landing', 'autoland', 'land \
-         us'. Pass cancel=true for 'cancel autoland' / 'stop the autoland'."
+        "Emergency autoland: fly a full approach and land at the nearest suitable \
+         runway. Use for 'land the aircraft', 'get us down', 'emergency landing', \
+         'autoland', 'land us'. Pass cancel=true for 'cancel autoland' / 'stop the \
+         autoland'. The pilot takes back control with 'my controls'."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -49,18 +62,24 @@ impl Tool for Autoland {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: Args = serde_json::from_value(args.clone()).unwrap_or_default();
-        match ctx.xplane.run_command(CMD_AUTOLAND_TOGGLE).await {
-            Ok(()) if a.cancel => Ok("Cancelling the autoland. You have the aircraft.".to_string()),
-            Ok(()) => Ok(
-                "Roger, emergency autoland armed. It'll fly the approach to the nearest \
-                 runway and land. Say 'cancel autoland' to stop."
-                    .to_string(),
-            ),
-            // The command didn't resolve — the autoland plugin isn't loaded.
-            Err(_) => Ok(
-                "I can't reach the autoland — check the Emergency Autoland plugin is installed and loaded."
-                    .to_string(),
-            ),
+        if a.cancel {
+            return Ok(if crate::autoland::abort() {
+                "Autoland cancelled. You have the aircraft.".to_string()
+            } else {
+                "No autoland running.".to_string()
+            });
         }
+        crate::autoland::ABORT.store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::autoland::run_autoland(
+            ctx.config.xplane_base_url.clone(),
+            apt_dat_path(),
+            self.cfg.clone(),
+            self.approach_ias,
+            ctx.voice.cloned(),
+            ctx.status.cloned(),
+        );
+        Ok("Roger, emergency autoland. Searching for the nearest runway, then flying \
+            the approach. Say 'my controls' to take it back."
+            .to_string())
     }
 }
