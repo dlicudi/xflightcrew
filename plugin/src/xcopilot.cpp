@@ -121,6 +121,10 @@ static TextRef g_aircraft = {{0}, 0};
 // Live flight strip — one compact status line the app refreshes (emergency
 // phase/runway, cabin altitude, fuel endurance). Empty = hidden.
 static TextRef g_strip = {{0}, 0};
+// On-screen callout — WHAT the copilot is changing ("FLAPS > 10"), flashed in a
+// floating toast over the sim for a couple of seconds after each action.
+static TextRef g_callout = {{0}, 0};
+static float g_callout_time = -1000.0f;
 
 static XPLMDataRef g_phase_dref = nullptr;
 static XPLMDataRef g_heard_dref = nullptr;
@@ -128,6 +132,7 @@ static XPLMDataRef g_action_dref = nullptr;
 static XPLMDataRef g_alert_dref = nullptr;
 static XPLMDataRef g_aircraft_dref = nullptr;
 static XPLMDataRef g_strip_dref = nullptr;
+static XPLMDataRef g_callout_dref = nullptr;
 
 // Transmission log shown in the panel, each entry stamped with wall-clock time
 // so a test flight can be reviewed afterwards.
@@ -168,8 +173,11 @@ static int ReadText(void* ref, void* out, int offset, int max) {
     return n;
 }
 
-// Store the whole value (the app PATCHes at offset 0), NUL-terminated.
+// Store the whole value (the app PATCHes at offset 0), NUL-terminated. Any text
+// write is proof the app is alive, so it refreshes the connection heartbeat too
+// (not just phase writes — a busy strip stream must not read as disconnected).
 static void StoreText(TextRef* t, void* in, int offset, int len) {
+    g_last_status_time = XPLMGetElapsedTime();
     if (offset != 0) return;
     if (len > 511) len = 511;
     if (len < 0) len = 0;
@@ -193,6 +201,25 @@ static void WriteAircraft(void*, void* in, int offset, int len) {
 // Live flight strip — a status row the app refreshes continuously, not logged.
 static void WriteStrip(void*, void* in, int offset, int len) {
     StoreText(&g_strip, in, offset, len);
+}
+// Callout — stamp the arrival time; the toast shows for a short window after.
+// An optional "nx,ny|" prefix (fractions of the half-screen from centre) aims
+// the toast toward the control the camera glanced at.
+static float g_callout_nx = 0.0f, g_callout_ny = 0.0f;
+static void WriteCallout(void*, void* in, int offset, int len) {
+    StoreText(&g_callout, in, offset, len);
+    g_callout_nx = 0.0f;
+    g_callout_ny = 0.0f;
+    char* bar = std::strchr(g_callout.buf, '|');
+    float nx = 0.0f, ny = 0.0f;
+    if (bar && std::sscanf(g_callout.buf, "%f,%f|", &nx, &ny) == 2) {
+        g_callout_nx = nx;
+        g_callout_ny = ny;
+        int rest = g_callout.len - static_cast<int>(bar + 1 - g_callout.buf);
+        std::memmove(g_callout.buf, bar + 1, static_cast<size_t>(rest) + 1);
+        g_callout.len = rest;
+    }
+    g_callout_time = XPLMGetElapsedTime();
 }
 static void WriteAlert(void*, void* in, int offset, int len) {
     StoreText(&g_alert, in, offset, len);
@@ -582,6 +609,50 @@ protected:
     }
 };
 
+// Floating callout toast: a borderless window upper-centre of the screen that
+// flashes the action label ("FLAPS > 10") while the camera glances at the panel
+// — the "what am I changing" graphic. Shown/hidden by a slow flight loop.
+class CalloutToast : public ImgWindow {
+public:
+    CalloutToast(int l, int t, int r, int b)
+        : ImgWindow(l, t, r, b, xplm_WindowDecorationNone, xplm_WindowLayerFloatingWindows) {
+        SetWindowTitle("x-copilot callout");
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+    }
+protected:
+    void buildInterface() override {
+        ImGui::SetWindowFontScale(1.8f);
+        ImVec2 ts = ImGui::CalcTextSize(g_callout.buf);
+        ImGui::SetCursorPos(ImVec2((ImGui::GetWindowWidth() - ts.x) * 0.5f,
+                                   (ImGui::GetWindowHeight() - ts.y) * 0.5f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_AMBER));
+        ImGui::TextUnformatted(g_callout.buf);
+        ImGui::PopStyleColor();
+        ImGui::SetWindowFontScale(1.0f);
+    }
+};
+static std::unique_ptr<CalloutToast> g_toast;
+
+// Show the toast for a beat after each callout write, then hide it again —
+// positioned toward the control (the "nx,ny|" offset) when the callout came
+// with a camera glance, centre-screen otherwise.
+static float ToastLoop(float, float, int, void*) {
+    if (g_toast) {
+        bool show = g_callout.len > 0 && (XPLMGetElapsedTime() - g_callout_time) < 2.5f;
+        if (show && !g_toast->GetVisible()) {
+            int sl, st, sr, sb;
+            XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
+            const int cw = 400, chh = 84;
+            int cx = (sl + sr) / 2 + static_cast<int>(g_callout_nx * (sr - sl) * 0.35f);
+            int cy = (st + sb) / 2 + static_cast<int>(g_callout_ny * (st - sb) * 0.35f);
+            g_toast->SetWindowGeometry(cx - cw / 2, cy + chh / 2, cx + cw / 2, cy - chh / 2);
+        }
+        if (g_toast->GetVisible() != show) g_toast->SetVisible(show);
+    }
+    return 0.2f;
+}
+
 static std::unique_ptr<XCopilotPanel> g_panel;
 static XPLMMenuID g_menu = nullptr;
 
@@ -659,6 +730,10 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         "xcopilot/opt/monitor_mute", xplmType_Int, 1,
         ReadOptMute, WriteOptMute, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_callout_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/callout", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteCallout, &g_callout, &g_callout);
 
     // One shared font atlas for all ImgWindows (uses ImGui's default font).
     ImgWindow::sFontAtlas = std::make_shared<ImgFontAtlas>();
@@ -667,6 +742,13 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
     XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
     int wl = sl + 50, wt = st - 50, wr = wl + 420, wb = wt - 300;
     g_panel = std::make_unique<XCopilotPanel>(wl, wt, wr, wb);
+    // Callout toast: upper-centre, borderless, hidden until a callout arrives.
+    int cw = 400, chh = 84;
+    int cl2 = (sl + sr) / 2 - cw / 2;
+    int ct2 = st - (st - sb) / 5;
+    g_toast = std::make_unique<CalloutToast>(cl2, ct2, cl2 + cw, ct2 - chh);
+    g_toast->SetVisible(false);
+    XPLMRegisterFlightLoopCallback(ToastLoop, 1.0f, nullptr);
 
     int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "X-COPILOT", nullptr, 0);
     g_menu = XPLMCreateMenu("X-COPILOT", XPLMFindPluginsMenu(), idx, MenuHandler, nullptr);
@@ -683,6 +765,9 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
 }
 
 PLUGIN_API void XPluginStop(void) {
+    XPLMUnregisterFlightLoopCallback(ToastLoop, nullptr);
+    g_toast.reset();
+    if (g_callout_dref) { XPLMUnregisterDataAccessor(g_callout_dref); g_callout_dref = nullptr; }
     g_panel.reset();
     ImgWindow::sFontAtlas.reset();
     if (g_menu) { XPLMDestroyMenu(g_menu); g_menu = nullptr; }

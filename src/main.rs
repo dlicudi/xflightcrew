@@ -10,6 +10,7 @@
 mod aircraft;
 mod audio;
 mod autoland;
+mod blackbox;
 mod checklist;
 mod config;
 mod datarefs;
@@ -1138,6 +1139,10 @@ async fn run_session(
             // moves (not while the camera is still travelling). All best-effort.
             // The panel's "camera snap" setting can turn the glance off live.
             let snap_enabled = live.get(DR_OPT_SNAP).map_or(true, |v| v > 0.5);
+            // Where the control sits relative to the final (blended) view — the
+            // rotation REMAINDER — so the plugin can place the callout toast over
+            // it on screen instead of dead-centre.
+            let mut callout_off: Option<(f64, f64)> = None;
             let restore_view: Option<[f64; 6]> = if let Some(v) =
                 profile.view_map.get(&call.name).filter(|_| snap_enabled)
             {
@@ -1150,14 +1155,48 @@ async fn run_session(
                     }
                 }
                 let _ = xplane.run_command("sim/view/3d_cockpit_cmnd_look").await;
-                for (dref, val) in HEAD_DREFS.into_iter().zip([v.x, v.y, v.z, v.psi, v.the, v.phi]) {
+                // Glance, don't teleport: move only `view_blend` of the way from the
+                // current pose toward the saved one (1.0 = the captured close-up,
+                // 0.5 = turn halfway toward the panel without zooming in).
+                let blend = profile.view_blend.clamp(0.0, 1.0);
+                let saved = [v.x, v.y, v.z, v.psi, v.the, v.phi];
+                let mut applied = saved;
+                if have_cur && blend < 1.0 {
+                    for i in 0..6 {
+                        applied[i] = if i < 3 {
+                            cur[i] + (saved[i] - cur[i]) * blend
+                        } else {
+                            lerp_angle_deg(cur[i], saved[i], blend)
+                        };
+                    }
+                }
+                for (dref, val) in HEAD_DREFS.into_iter().zip(applied) {
                     let _ = xplane.set_float(dref, val).await;
                 }
+                // + psi remainder = the control is right of centre; + the = above.
+                callout_off = Some((angle_delta_deg(applied[3], saved[3]), saved[4] - applied[4]));
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 have_cur.then_some(cur)
             } else {
                 None
             };
+            // On-screen callout: flash WHAT is being changed over the cockpit (the
+            // plugin draws it centered for a couple of seconds), synced with the
+            // camera glance so your eye lands on the right control.
+            if let Some(sink) = reporter.status_sink() {
+                let label = callout_label(&call.name, &call.arguments);
+                // "nx,ny|" aims the toast toward the control (fractions of the
+                // half-screen, from the glance remainder; ~30°/25° of view ≈ edge).
+                let text = match callout_off {
+                    Some((dpsi, dthe)) => format!(
+                        "{:.2},{:.2}|{label}",
+                        (dpsi / 30.0).clamp(-1.0, 1.0),
+                        (dthe / 25.0).clamp(-1.0, 1.0)
+                    ),
+                    None => label,
+                };
+                sink.callout(&text);
+            }
             let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice), status: reporter.status_sink(), reminders: Some(&reminders) };
             // Execute, retrying once on error: a single transient blip (a dropped
             // Web API request, including the autopilot-engage commands the client
@@ -1740,6 +1779,40 @@ const HEAD_DREFS: [&str; 6] = [
     "sim/graphics/view/pilots_head_the",
     "sim/graphics/view/pilots_head_phi",
 ];
+
+/// Interpolate between two headings/angles along the shortest arc, degrees.
+fn lerp_angle_deg(a: f64, b: f64, t: f64) -> f64 {
+    let d = ((b - a) % 360.0 + 540.0) % 360.0 - 180.0;
+    (a + d * t).rem_euclid(360.0)
+}
+
+/// Signed shortest difference b − a in degrees (−180..180).
+fn angle_delta_deg(a: f64, b: f64) -> f64 {
+    ((b - a) % 360.0 + 540.0) % 360.0 - 180.0
+}
+
+/// Human label for the on-screen callout: "FLAPS → 10", "GEAR → DOWN", "PROPS →
+/// CRUISE". Generic: the tool name minus set_, plus the argument values.
+fn callout_label(tool: &str, args: &serde_json::Value) -> String {
+    let name = tool.trim_start_matches("set_").replace('_', " ").to_uppercase();
+    let vals: Vec<String> = args
+        .as_object()
+        .map(|o| {
+            o.values()
+                .map(|v| match v {
+                    serde_json::Value::String(s) => s.to_uppercase(),
+                    serde_json::Value::Bool(b) => if *b { "ON".into() } else { "OFF".into() },
+                    other => other.to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if vals.is_empty() {
+        name
+    } else {
+        format!("{name} > {}", vals.join(" "))
+    }
+}
 
 /// The plugin's runtime LLM-fallback toggle (see plugin/src/xcopilot.cpp). Polled
 /// live through the snapshot cache so the panel button takes effect on the next

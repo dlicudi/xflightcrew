@@ -24,6 +24,7 @@ const DR_ACTION: &str = "xcopilot/status/action";
 const DR_ALERT: &str = "xcopilot/status/alert";
 const DR_AIRCRAFT: &str = "xcopilot/status/aircraft";
 const DR_STRIP: &str = "xcopilot/status/strip";
+const DR_CALLOUT: &str = "xcopilot/status/callout";
 
 /// Keep text within the plugin's fixed display buffer (512 bytes, NUL-terminated)
 /// — long enough for a full engine/weather summary readback.
@@ -44,6 +45,8 @@ enum Update {
     /// The live flight strip — one compact status row (emergency phase/runway,
     /// cabin altitude, endurance), refreshed continuously. Empty hides it.
     Strip(String),
+    /// A short "what's being changed" label the plugin flashes over the cockpit.
+    Callout(String),
 }
 
 /// Severity of a panel alert — drives the chip colour/label in the plugin.
@@ -103,6 +106,10 @@ impl StatusSink {
     pub fn strip(&self, text: &str) {
         let _ = self.0.send(Update::Strip(clip(text)));
     }
+    /// Flash a "what's being changed" callout over the cockpit (e.g. "FLAPS > 10").
+    pub fn callout(&self, text: &str) {
+        let _ = self.0.send(Update::Callout(clip(text)));
+    }
 }
 
 /// Scrub em/en dashes (the panel font can't render them) and trim to the plugin
@@ -129,6 +136,7 @@ enum Slot {
     Alert,
     Aircraft,
     Strip,
+    Callout,
 }
 
 /// The resolved numeric ids of the plugin's status datarefs. All `None` until a
@@ -141,6 +149,7 @@ struct Ids {
     alert: Option<i64>,
     aircraft: Option<i64>,
     strip: Option<i64>,
+    callout: Option<i64>,
 }
 
 impl Ids {
@@ -152,6 +161,7 @@ impl Ids {
             Slot::Alert => self.alert,
             Slot::Aircraft => self.aircraft,
             Slot::Strip => self.strip,
+            Slot::Callout => self.callout,
         }
     }
     /// True once at least one dataref resolved (i.e. the plugin is present).
@@ -170,6 +180,7 @@ fn resolve_all(http: &reqwest::blocking::Client, rest: &str) -> Ids {
         alert: resolve_id(http, rest, DR_ALERT),
         aircraft: resolve_id(http, rest, DR_AIRCRAFT),
         strip: resolve_id(http, rest, DR_STRIP),
+        callout: resolve_id(http, rest, DR_CALLOUT),
     }
 }
 
@@ -196,28 +207,34 @@ fn run(base: String, rx: Receiver<Update>) {
     let mut last_resolve = Instant::now();
     const RESOLVE_RETRY: Duration = Duration::from_secs(3);
 
-    // Re-send the phase on idle as a heartbeat, so the plugin can tell "app
-    // connected but idle" from "app not running" (and show NOT CONNECTED for the
-    // latter). When the app exits, the channel drops and the heartbeat stops.
+    // Keep the phase fresh as a heartbeat, so the plugin can tell "app connected
+    // but idle" from "app not running" (and show NOT CONNECTED for the latter).
+    // TIME-based, not idle-based: a steady update stream (the live strip changes
+    // most ticks) used to starve the recv_timeout heartbeat, so the phase went
+    // stale and the panel flickered NOT CONNECTED between utterances. When the
+    // app exits, the channel drops and the writer stops.
     use std::sync::mpsc::RecvTimeoutError;
     const HEARTBEAT: Duration = Duration::from_secs(1);
+
+    /// PATCH one slot; false = failed/unresolved (marks the link unhealthy).
+    fn patch(http: &reqwest::blocking::Client, rest: &str, ids: &Ids, slot: Slot, value: serde_json::Value) -> bool {
+        let Some(id) = ids.get(slot) else { return false };
+        let url = format!("{rest}/datarefs/{id}/value");
+        // A successful PATCH means our ids are still valid; any failure (X-Plane
+        // gone, stale id → 404) flags unhealthy so the loop re-resolves.
+        http.patch(&url)
+            .json(&json!({ "data": value }))
+            .send()
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
+
     let mut last_phase = 0u8;
+    let mut last_beat = Instant::now();
     loop {
-        let (slot, value) = match rx.recv_timeout(HEARTBEAT) {
-            Ok(Update::Phase(code)) => {
-                last_phase = code;
-                (Slot::Phase, json!(code))
-            }
-            Ok(Update::Heard(text)) => (Slot::Heard, json!(STANDARD.encode(text.as_bytes()))),
-            Ok(Update::Action(text)) => (Slot::Action, json!(STANDARD.encode(text.as_bytes()))),
-            Ok(Update::Alert(level, text)) => {
-                // Prefix a severity marker so the plugin can colour the chip.
-                let payload = format!("{}{}", level.code(), text);
-                (Slot::Alert, json!(STANDARD.encode(payload.as_bytes())))
-            }
-            Ok(Update::Aircraft(code)) => (Slot::Aircraft, json!(STANDARD.encode(code.as_bytes()))),
-            Ok(Update::Strip(text)) => (Slot::Strip, json!(STANDARD.encode(text.as_bytes()))),
-            Err(RecvTimeoutError::Timeout) => (Slot::Phase, json!(last_phase)), // heartbeat
+        let update = match rx.recv_timeout(HEARTBEAT) {
+            Ok(u) => Some(u),
+            Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
         };
         // Link down (or never up)? Re-resolve ids on a throttled retry — X-Plane
@@ -226,19 +243,32 @@ fn run(base: String, rx: Receiver<Update>) {
             ids = resolve_all(&http, &rest);
             last_resolve = Instant::now();
         }
-        let Some(id) = ids.get(slot) else {
-            healthy = false;
-            continue;
-        };
-        let url = format!("{rest}/datarefs/{id}/value");
-        // A successful PATCH means our ids are still valid; any failure (X-Plane
-        // gone, stale id → 404) marks us unhealthy so the next heartbeat retries.
-        healthy = http
-            .patch(&url)
-            .json(&json!({ "data": value }))
-            .send()
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
+        if let Some(update) = update {
+            let (slot, value) = match update {
+                Update::Phase(code) => {
+                    last_phase = code;
+                    last_beat = Instant::now();
+                    (Slot::Phase, json!(code))
+                }
+                Update::Heard(text) => (Slot::Heard, json!(STANDARD.encode(text.as_bytes()))),
+                Update::Action(text) => (Slot::Action, json!(STANDARD.encode(text.as_bytes()))),
+                Update::Alert(level, text) => {
+                    // Prefix a severity marker so the plugin can colour the chip.
+                    let payload = format!("{}{}", level.code(), text);
+                    (Slot::Alert, json!(STANDARD.encode(payload.as_bytes())))
+                }
+                Update::Aircraft(code) => (Slot::Aircraft, json!(STANDARD.encode(code.as_bytes()))),
+                Update::Strip(text) => (Slot::Strip, json!(STANDARD.encode(text.as_bytes()))),
+                Update::Callout(text) => (Slot::Callout, json!(STANDARD.encode(text.as_bytes()))),
+            };
+            healthy = patch(&http, &rest, &ids, slot, value);
+        }
+        // Heartbeat on wall clock, regardless of how busy the stream is.
+        if last_beat.elapsed() >= HEARTBEAT {
+            last_beat = Instant::now();
+            let beat_ok = patch(&http, &rest, &ids, Slot::Phase, json!(last_phase));
+            healthy = healthy && beat_ok;
+        }
     }
 }
 

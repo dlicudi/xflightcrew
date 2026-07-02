@@ -189,6 +189,12 @@ pub struct AircraftProfile {
     /// it per-profile for regions with a lower transition altitude.
     #[serde(default = "default_transition_altitude")]
     pub transition_altitude_ft: f64,
+    /// How far the snap-to-panel camera moves toward the saved pose: 1.0 = all the
+    /// way (the captured close-up), 0.5 = a half glance from wherever you're
+    /// looking — position and angles interpolated, so the view turns toward the
+    /// panel without zooming into it.
+    #[serde(default = "default_view_blend")]
+    pub view_blend: f64,
     /// Snap-to-panel: tool name → a saved 3D-cockpit camera position to jump to
     /// just before that action runs, so you watch the switch move. Empty (default)
     /// = no snapping. Positions are captured live from the pilot's own framing (the
@@ -218,6 +224,11 @@ pub struct PanelView {
 /// US transition altitude (FL180). See [`AircraftProfile::transition_altitude_ft`].
 fn default_transition_altitude() -> f64 {
     18_000.0
+}
+
+/// Full snap by default — profiles opt into a softer glance. See `view_blend`.
+fn default_view_blend() -> f64 {
+    1.0
 }
 
 /// Engine count for the per-engine accessory tools — 1 (the GA singles) unless
@@ -403,6 +414,16 @@ pub struct TurbineStartProfile {
     /// Max seconds to crank one engine before giving up.
     #[serde(default = "default_turbine_crank_secs")]
     pub crank_secs: f64,
+    /// Turn each engine's boost pump on before cranking it (the C90 POM's fuel
+    /// panel: the boost pump feeds the engine "before it starts" — the
+    /// engine-driven pump takes over once running). Written to the universal
+    /// `fuel_pump_on[i]`.
+    #[serde(default)]
+    pub boost_pumps: bool,
+    /// Per-engine auto-ignition ARM command, fired before cranking (POM: "Engine
+    /// Auto Ignition Arm – ON"). Empty = airframe has none.
+    #[serde(default)]
+    pub ignition_arm: Vec<String>,
 }
 
 fn default_n1_idle() -> f64 {
@@ -890,6 +911,7 @@ fn cessna_172sp() -> AircraftProfile {
         turboprop_start: None,
         retractable_gear: false,
         transition_altitude_ft: 18_000.0,
+        view_blend: 1.0,
         view_map: std::collections::HashMap::new(),
         autopilot: true,
         autopilot_prep: None,
@@ -1079,6 +1101,7 @@ fn cirrus_sr22() -> AircraftProfile {
         turboprop_start: None,
         retractable_gear: false,
         transition_altitude_ft: 18_000.0,
+        view_blend: 1.0,
         view_map: std::collections::HashMap::new(),
         // Universal-dataref tools — safe across airframes.
         autopilot: true,

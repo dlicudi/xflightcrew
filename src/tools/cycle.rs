@@ -24,6 +24,11 @@ use crate::aircraft::{
 const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 /// Per-engine "is running" flags.
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
+/// N1 at which the condition lever introduces fuel during a PT6 start (POM: crank
+/// first, fuel at 12% — fuel-before-crank gives no light-off, verified live).
+const FUEL_INTRO_N1: f64 = 12.0;
+/// Universal per-engine boost/aux pump switch array.
+const FUEL_PUMP_ON: &str = "sim/cockpit2/engine/actuators/fuel_pump_on";
 /// Electrical bus volts (any element) — enough to crank?
 const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
 /// The DC-3 is a 24V system whose healthy battery bus reads ~21.7–24V (it varies
@@ -482,11 +487,18 @@ impl Tool for StartTurbines {
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let n = self.start.start_up.len();
-        // Already turning? Don't re-crank a live engine.
+        // Start only the DEAD engines: a twin with one flamed out must relight just
+        // that one (this used to refuse outright if ANY engine was turning — seen
+        // live with the left dead and the right at 93%). Running engines are left
+        // completely alone, condition levers included.
+        let mut dead: Vec<usize> = Vec::new();
         for i in 0..n {
-            if engine_running(ctx, i).await {
-                return Ok("Engines are already running.".to_string());
+            if !engine_running(ctx, i).await {
+                dead.push(i);
             }
+        }
+        if dead.is_empty() {
+            return Ok("Engines are already running.".to_string());
         }
         // Need battery/bus power to crank (the generators come online as we go).
         let volts = ctx.xplane.get_float_array(BUS_VOLTS).await?.into_iter().fold(0.0_f64, f64::max);
@@ -496,21 +508,35 @@ impl Tool for StartTurbines {
             ));
         }
 
-        // Condition levers to low idle for the light-off.
-        for i in 0..n {
-            ctx.xplane.set_float_array_elem(&self.start.condition_lever, i, self.start.condition_start).await?;
-        }
-
         let mut started = 0usize;
-        for i in 0..n {
+        for &i in &dead {
+            // POM start items from the FUEL panel + checklist: this engine's boost
+            // pump feeds it until its engine-driven pump runs, and auto-ignition is
+            // armed before cranking.
+            if self.start.boost_pumps {
+                let _ = ctx.xplane.set_int_array_elem(FUEL_PUMP_ON, i, 1).await;
+            }
+            if let Some(arm) = self.start.ignition_arm.get(i) {
+                let _ = ctx.xplane.run_command(arm).await;
+            }
+            // POM ground-start order — verified live BOTH ways on the C90: fuel in
+            // before cranking = no light-off (ITT falls, N1 stalls ~24%); condition
+            // CUTOFF -> crank -> fuel (low idle) at 12% N1 -> lights every time.
+            ctx.xplane.set_float_array_elem(&self.start.condition_lever, i, 0.0).await?;
             ctx.xplane.run_command(&self.start.start_up[i]).await?; // starter on
-            // Wait for the engine to light and spool to idle, cutting the starter
-            // as soon as it's stable — like watching the N1/ITT on the gauges.
             let deadline = (self.start.crank_secs / 0.7) as u32;
+            let mut fuel_in = false;
             let mut lit = false;
             for _ in 0..deadline {
                 tokio::time::sleep(Duration::from_millis(700)).await;
-                if engine_running(ctx, i).await && n1_percent(ctx, i).await >= self.start.n1_idle {
+                let n1 = n1_percent(ctx, i).await;
+                if !fuel_in && n1 >= FUEL_INTRO_N1 {
+                    ctx.xplane
+                        .set_float_array_elem(&self.start.condition_lever, i, self.start.condition_start)
+                        .await?;
+                    fuel_in = true;
+                }
+                if fuel_in && n1 >= self.start.n1_idle && engine_running(ctx, i).await {
                     lit = true;
                     break;
                 }
@@ -518,25 +544,32 @@ impl Tool for StartTurbines {
             ctx.xplane.run_command(&self.start.start_dn[i]).await?; // starter off
             if lit {
                 started += 1;
-                // Generator online so the bus can power the next start.
-                if let Some(gen) = self.start.generators.get(i) {
-                    let _ = ctx.xplane.run_command(gen).await;
+                ctx.xplane.set_float_array_elem(&self.start.condition_lever, i, self.start.condition_run).await?;
+                // Generator online so the bus can power the next start. The list is
+                // per-engine GROUPS (the C90's 3-pos switches need a dn,up pair per
+                // engine), so fire this engine's slice, not a single command.
+                let per = (self.start.generators.len() / n.max(1)).max(1);
+                for cmd in self.start.generators.iter().skip(i * per).take(per) {
+                    let _ = ctx.xplane.run_command(cmd).await;
                 }
+            } else {
+                // Didn't catch — back to cutoff rather than leaving fuel flowing
+                // into a dead engine.
+                ctx.xplane.set_float_array_elem(&self.start.condition_lever, i, 0.0).await?;
             }
-        }
-
-        // Condition levers to the run position for whatever lit.
-        for i in 0..n {
-            ctx.xplane.set_float_array_elem(&self.start.condition_lever, i, self.start.condition_run).await?;
         }
 
         match started {
             0 => Ok("Cranking — nothing lit. Check the condition levers and bus power, then try again.".to_string()),
-            s if s == n => Ok(format!(
-                "Roger — condition levers idle, starters cut at idle, generators on. All {n} running."
+            s if s == dead.len() && dead.len() == n => Ok(format!(
+                "Roger — starters cut at idle, generators on. All {n} running."
+            )),
+            s if s == dead.len() => Ok(format!(
+                "Roger — relit {s}, all engines running."
             )),
             s => Ok(format!(
-                "Got {s} of {n} lit. The other didn't catch — check it and try again."
+                "Got {s} of {} lit. The other didn't catch — check it and try again.",
+                dead.len()
             )),
         }
     }

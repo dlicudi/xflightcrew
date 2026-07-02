@@ -281,6 +281,10 @@ fn run_recovery(
                     bank = s.bank_deg, pitch = s.pitch_deg, stall = s.stall_ratio,
                     ias = s.ias_kts, yoke_pitch = cmd.pitch, yoke_roll = cmd.roll, "recover"
                 );
+                crate::blackbox::record("recover", serde_json::json!({
+                    "bank": s.bank_deg, "pitch": s.pitch_deg, "stall": s.stall_ratio,
+                    "ias": s.ias_kts, "yoke_pitch": cmd.pitch, "yoke_roll": cmd.roll,
+                }));
                 // Require a few consecutive stable ticks so a momentary pass through
                 // level doesn't end the recovery prematurely.
                 if cmd.stable {

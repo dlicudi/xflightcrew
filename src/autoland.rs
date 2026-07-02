@@ -299,6 +299,12 @@ pub fn run_autoland(
                     hdg = g.target_heading_deg, ias, radio = radio_ft, phase = ?g.phase,
                     "autoland"
                 );
+                crate::blackbox::record("autoland", serde_json::json!({
+                    "rwy": format!("{} {}", rwy.icao, rwy.id), "dist": g.dist_nm,
+                    "alt": alt, "gp_alt": g.glidepath_alt_ft, "cmd_vs": g.target_vs_fpm,
+                    "cmd_hdg": g.target_heading_deg, "ias": ias, "radio": radio_ft,
+                    "phase": format!("{:?}", g.phase),
+                }));
 
                 // Lateral: heading bug in MAGNETIC (guidance is TRUE → subtract var).
                 let mag_hdg = (g.target_heading_deg - var + 360.0) % 360.0;
@@ -419,12 +425,31 @@ pub fn guidance(
     let dist_nm = haversine_nm(cur_lat, cur_lon, rwy.thr_lat, rwy.thr_lon);
     let recip = (rwy.course_deg + 180.0) % 360.0;
 
+    // 3° glidepath altitude at this distance (+ = we're above it).
+    let glidepath_alt_ft = rwy.elev_ft + dist_nm * GLIDEPATH_FT_PER_NM;
+    let alt_err = cur_alt_ft - glidepath_alt_ft;
+
+    // Above this much excess, we can't just dive onto the path — fly to the JOIN
+    // point instead: where a 3° descent (with 15% margin) meets our CURRENT
+    // altitude, out along the extended centreline. When we're inside it (armed
+    // high overhead — the failure seen live: 7,000 ft at 6 nm, VS pegged, never
+    // capturing) that means flying OUTBOUND first; the point walks back toward
+    // the FAP as altitude burns off (a teardrop join).
+    const CAPTURE_ABOVE_FT: f64 = 500.0;
+    let join_nm = ((cur_alt_ft - rwy.elev_ft) / GLIDEPATH_FT_PER_NM * 1.15)
+        .clamp(FAP_NM, 40.0);
+
     let (phase, target_heading) = if radio_alt_ft <= flare_radio_ft {
         (ApproachPhase::Flare, rwy.course_deg)
+    } else if alt_err > CAPTURE_ABOVE_FT {
+        // Too high for this distance — descend toward the join point.
+        let (jlat, jlon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, join_nm);
+        (ApproachPhase::Intercept, bearing_deg(cur_lat, cur_lon, jlat, jlon))
     } else if dist_nm > FAP_NM + 0.5 {
-        // Fly to the final approach point on the extended centreline.
-        let (fap_lat, fap_lon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, FAP_NM);
-        (ApproachPhase::Intercept, bearing_deg(cur_lat, cur_lon, fap_lat, fap_lon))
+        // On (or under) the path, outside the FAP: run the extended centreline in.
+        let xtk = cross_track_nm(cur_lat, cur_lon, rwy);
+        let corr = (xtk * 8.0).clamp(-30.0, 30.0);
+        (ApproachPhase::Intercept, (rwy.course_deg - corr + 360.0) % 360.0)
     } else {
         // On final: track the runway course, corrected for lateral offset.
         let xtk = cross_track_nm(cur_lat, cur_lon, rwy);
@@ -432,12 +457,9 @@ pub fn guidance(
         (ApproachPhase::Final, (rwy.course_deg - corr + 360.0) % 360.0)
     };
 
-    // 3° glidepath altitude at this distance; track it with a nominal descent for
-    // the current groundspeed plus an error correction. Don't dive if far above /
-    // not yet lined up — the alt-error term stays bounded.
-    let glidepath_alt_ft = rwy.elev_ft + dist_nm * GLIDEPATH_FT_PER_NM;
+    // Track the path with a nominal descent for the current groundspeed plus an
+    // error correction; bounded so it never dives.
     let nominal_vs = -(gs_kts / 60.0) * GLIDEPATH_FT_PER_NM;
-    let alt_err = cur_alt_ft - glidepath_alt_ft; // + = above the path
     let target_vs = match phase {
         ApproachPhase::Flare => -100.0, // arrest the descent near the ground
         // BELOW the glidepath (miles out it sits thousands of feet up): hold level
@@ -480,6 +502,22 @@ mod tests {
         assert!(g.target_vs_fpm < 0.0, "should descend, got {}", g.target_vs_fpm);
         // Roughly on the centreline → heading close to the runway course (north).
         assert!(heading_diff(g.target_heading_deg, 0.0) < 10.0, "hdg {}", g.target_heading_deg);
+    }
+
+    #[test]
+    fn armed_high_overhead_flies_outbound_to_a_join_point() {
+        // The live failure: 7,000 ft only 6 nm out (path altitude ~1,900) — the
+        // old guidance aimed at the FAP and could never capture. Now it must fly
+        // AWAY from the runway (toward the join point down the extended
+        // centreline) and descend.
+        let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 6.0); // 6 nm south
+        let g = guidance(lat, lon, 7000.0, 7000.0, 135.0, &rwy_north(), 110.0, 20.0);
+        assert_eq!(g.phase, ApproachPhase::Intercept);
+        // Runway is north (bearing ~0); the join point is further SOUTH — so the
+        // commanded heading must be southbound, not at the runway.
+        assert!(heading_diff(g.target_heading_deg, 180.0) < 30.0,
+            "should fly outbound, got hdg {}", g.target_heading_deg);
+        assert!(g.target_vs_fpm <= -1000.0, "and descend hard, got {}", g.target_vs_fpm);
     }
 
     #[test]

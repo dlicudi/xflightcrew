@@ -930,6 +930,11 @@ static PANEL_MUTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// The live flight strip shown on the plugin panel: the active emergency line
 /// (if any), then cabin altitude airborne, then fuel endurance. " | " separators
 /// (ASCII-safe for the panel font). Empty hides the row.
+/// Round to 0.1 for compact black-box records.
+fn r1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
+
 fn compose_strip(s: &Snapshot) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Ok(e) = crate::autoland::PANEL.lock() {
@@ -1011,6 +1016,22 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
             }
             prev_ias = Some((snap.ias_kts, now));
             snap.ias_trend_kts_per_s = trend;
+
+            // Black box: one state record per tick (position best-effort — worth
+            // the extra reads for post-flight reconstruction).
+            let lat = xp.get_float("sim/flightmodel/position/latitude").await.unwrap_or(0.0);
+            let lon = xp.get_float("sim/flightmodel/position/longitude").await.unwrap_or(0.0);
+            let hdg = xp.get_float("sim/flightmodel/position/psi").await.unwrap_or(0.0);
+            let alt = xp.get_float("sim/flightmodel/misc/h_ind").await.unwrap_or(0.0);
+            crate::blackbox::record("state", serde_json::json!({
+                "lat": lat, "lon": lon, "hdg": r1(hdg), "alt": r1(alt),
+                "ias": r1(snap.ias_kts), "gs": r1(snap.groundspeed_kts),
+                "vsi": r1(snap.vsi_fpm), "agl": r1(snap.agl_ft),
+                "ground": snap.on_ground, "flap": snap.flap_ratio,
+                "park": r1(snap.park_brake), "cabin": r1(snap.cabin_altitude_ft),
+                "fuel_kg": snap.fuel_kg, "eng": snap.engine_running,
+                "phase": format!("{:?}", snap.phase),
+            }));
 
             // Panel settings + the live flight strip. The mute switch comes from
             // the plugin's settings popup; unresolvable (no plugin) = unmuted.

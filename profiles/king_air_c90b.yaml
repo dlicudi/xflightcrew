@@ -127,6 +127,10 @@ autopilot_prep:
 # generator ON (so the bus can power the next start — battery alone sags and
 # starves the start), then condition levers to run. L = engine 0, R = engine 1.
 turboprop_start:
+  # POM fuel panel + checklist: boost pump feeds each engine before its
+  # engine-driven pump runs, and auto-ignition is armed before cranking.
+  boost_pumps: true
+  ignition_arm: [laminar/c90/electrical/switch/auto_ignition_L_up, laminar/c90/electrical/switch/auto_ignition_R_up]
   condition_lever: sim/cockpit2/engine/actuators/mixture_ratio
   condition_start: 0.5   # low idle for light-off
   condition_run: 1.0     # high idle / run
@@ -149,6 +153,9 @@ flood_lights_dataref: "sim/cockpit2/switches/generic_lights_switch[0]"  # verifi
 # reads/stores the position here (no fiddly quick-look saving). Unlimited entries;
 # several actions can share a view. Key = tool name (gear, set_flaps, set_prop,
 # set_electrical, set_lights, set_fuel_pump, set_com1, set_transponder, ...).
+# Half-glance: turn the camera toward the panel without the captured close-up
+# zoom (1.0 = full snap to the saved pose).
+view_blend: 0.5
 view_map:
   # Collins APS-65 autopilot panel (pedestal) — captured live from the pilot's
   # framing. Shared by every AP command via a YAML anchor.
