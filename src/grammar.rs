@@ -73,6 +73,21 @@ pub fn normalize(transcript: &str) -> String {
         ("electric systems zones", "electrics on"),
         ("electric zones", "electrics on"),
         ("electric zone", "electrics on"),
+        // "pitot" defeats whisper: all of these observed live for "pitot heat"
+        // (apostrophes are already stripped, so "Pito's" arrives as "pitos").
+        // Nobody says "pilot heat" or "it was heat" meaning anything else.
+        ("pitos heat", "pitot heat"),
+        ("pito heat", "pitot heat"),
+        ("pilot heat", "pitot heat"),
+        ("it was heat", "pitot heat"),
+        ("a bit of heat", "pitot heat"),
+        // "talk me down" garbles, both observed live back to back.
+        ("top me down", "talk me down"),
+        ("toadown", "talk me down"),
+        // "my throttle" (the speed-hold release) defeats whisper: both observed
+        // live while the pilot tried five times to take the lever back.
+        ("mic throttle", "my throttle"),
+        ("my throat", "my throttle"),
     ] {
         s = s.replace(heard, meant);
     }
@@ -80,7 +95,12 @@ pub fn normalize(transcript: &str) -> String {
     // hears the p as a hard c; seen live on "Crops, cruise"). Pad with spaces so
     // only the standalone word is rewritten, never a substring.
     {
-        let fixed = format!(" {s} ").replace(" crops ", " props ").replace(" crop ", " prop ");
+        // "powers" is whisper's plural slip on "power" ("increased powers of 60
+        // percent" heard live) — nobody commands "powers".
+        let fixed = format!(" {s} ")
+            .replace(" crops ", " props ")
+            .replace(" crop ", " prop ")
+            .replace(" powers ", " power ");
         s = fixed.trim().to_string();
     }
     loop {
@@ -171,6 +191,11 @@ fn number(t: &str) -> Option<i64> {
     // elsewhere is already a token separator, so removing it changes nothing.)
     let t = t.replace(',', "");
     let (mut total, mut cur, mut found) = (0i64, 0i64, false);
+    // "N to M" means M — "to" marks the target in command speech ("throttle to
+    // fifty", which whisper garbled live as "12 to 50 percent" and the first-run
+    // rule set 12% instead of 50). The pre-"to" value is kept as a fallback so
+    // "50 to, uh, taxi" still yields 50 rather than a miss.
+    let mut before_to: Option<i64> = None;
     for tok in t.split(|c: char| !c.is_ascii_alphanumeric()) {
         if tok.is_empty() {
             continue;
@@ -190,11 +215,14 @@ fn number(t: &str) -> Option<i64> {
             found = true;
         } else if tok == "and" && found {
             // spoken connector inside a number ("two hundred and forty")
+        } else if tok == "to" && found {
+            before_to = Some(total + cur);
+            (total, cur, found) = (0, 0, false);
         } else if found {
             break; // number run ended
         }
     }
-    found.then_some(total + cur)
+    found.then_some(total + cur).or(before_to)
 }
 
 /// True if `t` is a real multi-action compound ("taxi and nav lights on") — an
@@ -393,6 +421,10 @@ fn parse_one(t: &str) -> Option<ToolCall> {
             "half".to_string()
         } else if has(t, "quarter") {
             "quarter".to_string()
+        // "flaps for landing" / "landing flaps" — the tool resolves the alias to
+        // the airframe's last detent (and the Vfe gate still refuses if fast).
+        } else if has(t, "landing") || has(t, "land") {
+            "landing".to_string()
         } else if let Some(n) = num {
             n.to_string()
         } else {
@@ -406,6 +438,44 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         let on = !(has(t, "off") || t.contains("disconnect") || t.contains("disengage"));
         return Some(call("autothrottle", json!({ "on": on })));
     }
+    // Speed hold — the copilot works the throttle ("hold 70 knots", "maintain
+    // approach speed", "can you maintain an appropriate speed" — asked live with
+    // no tool to answer it). Verbs first, so it beats the AP speed-bug rule
+    // below on airframes that have this tool; the release phrasings first of
+    // all, so "stop holding speed" doesn't re-arm.
+    if t.contains("stop holding") || t.contains("my throttle") || t.contains("my power")
+        || t.contains("stop taxi") // covers "stop taxiing" too
+        || (has(t, "release") && (has(t, "throttle") || has(t, "speed")))
+    {
+        return Some(call("hold_speed", json!({ "off": true })));
+    }
+    // "hold short" — a zero-knot taxi hold: idle plus brakes until released.
+    if t.contains("hold short") || t.contains("holding short") {
+        return Some(call("hold_speed", json!({ "knots": 0 })));
+    }
+    // "taxi at 10 knots" / "taxi 12 knots" — the taxi governor (the tool picks
+    // taxi vs flight mode from being on the ground + the number). Requires the
+    // number so "taxi light on" (no knots) stays with the lights.
+    if has(t, "taxi") && (has(t, "knots") || has(t, "knot")) {
+        if let Some(n) = num {
+            return Some(call("hold_speed", json!({ "knots": n })));
+        }
+    }
+    let holdish = has(t, "hold") || has(t, "maintain") || has(t, "keep") || has(t, "manage");
+    if holdish
+        && (has(t, "speed") || has(t, "knots") || has(t, "airspeed"))
+        && !has(t, "vertical")
+        && !has(t, "ground")
+    {
+        if has(t, "approach") || has(t, "appropriate") || has(t, "landing") {
+            return Some(call("hold_speed", json!({ "preset": "approach" })));
+        }
+        return Some(match num {
+            Some(n) => call("hold_speed", json!({ "knots": n })),
+            None => call("hold_speed", json!({})), // hold what we're doing now
+        });
+    }
+
     // AP airspeed select: "set speed 250", "speed 280", "airspeed 250". Excludes
     // vertical/ground speed (handled elsewhere) and percent (that's throttle).
     if (has(t, "speed") || has(t, "airspeed"))
@@ -415,9 +485,29 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         && !has(t, "descend")
         && !t.contains("percent")
     {
+        // "speed for landing" / "approach speed" / "landing speed" — the tool
+        // pulls the profile's final-approach speed.
+        if has(t, "landing") || has(t, "land") || has(t, "approach") {
+            return Some(call("set_speed", json!({ "preset": "approach" })));
+        }
+        // Relative before the bare number: "reduce speed by 20" is minus twenty
+        // from the bug, not a 20-knot target. Default nudge is 20 knots.
+        if has(t, "reduce") || has(t, "decrease") || has(t, "lower") {
+            return Some(call("set_speed", json!({ "delta": -num.unwrap_or(20) })));
+        }
+        if has(t, "increase") || has(t, "raise") {
+            return Some(call("set_speed", json!({ "delta": num.unwrap_or(20) })));
+        }
         if let Some(n) = num {
             return Some(call("set_speed", json!({ "knots": n })));
         }
+    }
+    // "slow down" / "slow to 180" — no "speed" token, so it needs its own rule.
+    if has(t, "slow") && !has(t, "vertical") && !t.contains("percent") {
+        if let Some(n) = num {
+            return Some(call("set_speed", json!({ "knots": n })));
+        }
+        return Some(call("set_speed", json!({ "delta": -20 })));
     }
 
     // Constant-speed prop levers — before throttle/power (a prop request never
@@ -465,18 +555,28 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         if t.contains("minimum") || t.contains("min") || has(t, "idle") {
             return Some(call("set_throttle", json!({ "percent": 0 })));
         }
+        // Relative verbs: "reduce throttle by ten percent" means minus ten from
+        // the current lever, NOT throttle to 10 (a power chop — seen live). A
+        // relative verb without "to" is a delta; with "to" it's the target.
+        // Past-tense forms are whisper slips on the imperative ("increased
+        // powers of 60 percent" heard live), and "of" before the number is the
+        // same slip on "to" — target, not delta.
+        let dec = has(t, "reduce") || has(t, "reduced") || has(t, "decrease")
+            || has(t, "decreased") || has(t, "lower") || has(t, "lowered")
+            || has(t, "back") || has(t, "ease") || has(t, "pull");
+        let inc = has(t, "increase") || has(t, "increased") || has(t, "add")
+            || has(t, "raise") || has(t, "raised")
+            || has(t, "advance") || has(t, "bump") || has(t, "push");
         if let Some(n) = num {
-            // RELATIVE: "reduce throttle by ten percent" means minus ten from the
-            // current lever, NOT throttle to 10 (a power chop — seen live). A
-            // relative verb without "to" is a delta; with "to" it's the target.
-            let dec = has(t, "reduce") || has(t, "decrease") || has(t, "lower")
-                || has(t, "back") || has(t, "ease") || has(t, "pull");
-            let inc = has(t, "increase") || has(t, "add") || has(t, "raise")
-                || has(t, "advance") || has(t, "bump") || has(t, "push");
-            if (dec || inc) && !has(t, "to") {
+            if (dec || inc) && !has(t, "to") && !has(t, "of") {
                 return Some(call("set_throttle", json!({ "delta": if dec { -n } else { n } })));
             }
             return Some(call("set_throttle", json!({ "percent": n })));
+        }
+        // Bare "increase power" / "reduce throttle" — a nudge, ten percent
+        // (both went silent live; a copilot would just add a bit).
+        if dec || inc {
+            return Some(call("set_throttle", json!({ "delta": if dec { -10 } else { 10 } })));
         }
         // "throttle to cruise" / "cruise power" with no number → a typical cruise
         // setting rather than guessing via the LLM.
@@ -534,13 +634,48 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         }
     }
 
+    // ILS approach setup — was LLM-only, so every phrasing missed with the LLM
+    // off ("can we set up ILS for runway 28" heard live, twice). "ils" appears
+    // in no other command; the number (if any) is the runway. The tool answers
+    // honestly when the field has no ILS, which beats a silent miss.
+    if has(t, "ils") {
+        let runway = num.map(|n| n.to_string()).unwrap_or_default();
+        return Some(call("prepare_ils", json!({ "runway": runway })));
+    }
+
+    // Talk-down: spoken visual-approach guidance to any runway (the approach a
+    // procedure-less field like LERL will never have). Cancel words first so
+    // "stop the guidance" doesn't re-arm it.
+    let talkdown = t.contains("talk me down")
+        || t.contains("guide me in")
+        || t.contains("call the approach")
+        || t.contains("approach guidance")
+        || t.contains("guidance")
+        || (has(t, "visual") && has(t, "approach"))
+        // "I want to land at runway 28" (lead filler peels to "land at runway
+        // 28") — a landing-help request; the advisory talk-down is that help.
+        || (has(t, "land") && has(t, "runway"));
+    if talkdown {
+        if has(t, "stop") || has(t, "cancel") || has(t, "enough") || has(t, "quit") {
+            return Some(call("visual_approach", json!({ "cancel": true })));
+        }
+        let runway = num.map(|n| n.to_string()).unwrap_or_default();
+        return Some(call("visual_approach", json!({ "runway": runway })));
+    }
+
     // Couple the autopilot to the GPS flight plan (NAV mode). "nav" alone is the
-    // nav lights, so require navigate/follow/track + a route word, or "nav mode".
+    // nav lights, so require navigate/follow/track + a route word, "nav mode",
+    // or an explicit AP coupling ("set AP to nav", "set autopilot to navigation" —
+    // both missed live, twice, before "navigation mode" finally landed).
     if has(t, "navigate")
         || ((has(t, "follow") || has(t, "track") || has(t, "fly"))
             && (t.contains("flight plan") || t.contains("route") || t.contains("root")
                 || t.contains("road") || has(t, "plan")))
         || (has(t, "nav") && (t.contains("mode") || has(t, "engage")) && !t.contains("light"))
+        || ((has(t, "ap") || t.contains("autopilot"))
+            && (has(t, "nav") || t.contains("navigation"))
+            && !t.contains("light"))
+        || t.contains("navigation mode")
     {
         return Some(call("navigate", json!({})));
     }
@@ -639,6 +774,21 @@ fn parse_one(t: &str) -> Option<ToolCall> {
             ("efis", "efis"),
         ] {
             if has(t, kw) {
+                // Split systems: "alternator two", "battery 1" name one of a
+                // numbered pair (SR22 BAT 1/2, ALT 1/2). The tool resolves a
+                // bare noun to the pair, and strips the digit back off on
+                // airframes with a single unnumbered system.
+                let key = if matches!(key, "battery" | "alternator" | "generator") {
+                    if has(t, "two") || has(t, "2") {
+                        format!("{key}2")
+                    } else if has(t, "one") || has(t, "1") {
+                        format!("{key}1")
+                    } else {
+                        key.to_string()
+                    }
+                } else {
+                    key.to_string()
+                };
                 return Some(call("set_electrical", json!({ "system": key, "on": on })));
             }
         }
@@ -688,10 +838,29 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         // align/sync/set gyro — also catches mishears like "think/zinc gyro".
         return Some(call("align_gyro", json!({})));
     }
-    // EMERGENCY recovery — take the controls and fly out of an upset/stall. The
-    // explicit "take control / recover / stabilize / save it" phrases only; calm
-    // "level off" / "wings level" below stays the gentle AP-hold.
-    if t.contains("take control")
+    // EMERGENCY recovery — take the controls and fly out of an upset/stall.
+    // Whole-aircraft distress phrasings ONLY: "take control of the throttle"
+    // once engaged a full recovery on a calm approach (the copilot seized the
+    // aircraft and the pilot needed four phrasings to get it back), and "help
+    // me land ..." is a request for guidance, not a mayday. A named system
+    // after "take control of" means a system request — never recovery.
+    // Direction of transfer matters: "take control" is only a request for the
+    // COPILOT to take over when it isn't the pilot announcing they're taking it
+    // themselves. "Let me take controls" once engaged a full recovery against
+    // the pilot — the exact inversion of what was said.
+    let pilot_takes = t.contains("let me") || t.contains("i take") || t.contains("ill take")
+        || t.contains("i will take") || t.contains("im taking") || t.contains("i am taking")
+        || t.contains("can i take") || t.contains("i want");
+    let whole_aircraft_takeover = (t.contains("take control") || t.contains("take the controls"))
+        && !pilot_takes
+        && !["throttle", "power", "radio", "radios", "flaps", "speed", "heading", "lights"]
+            .iter()
+            .any(|sys| has(t, sys));
+    // The pilot taking over is a release: autopilot off, recovery dropped.
+    if pilot_takes && (t.contains("control") || t.contains("the aircraft") || t.contains("the plane")) {
+        return Some(call("autopilot_off", json!({})));
+    }
+    if whole_aircraft_takeover
         || t.contains("you have control")
         || t.contains("you have the aircraft")
         || t.contains("your controls")
@@ -701,7 +870,7 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         || t.contains("save it")
         || t.contains("save the aircraft")
         || t.contains("save us")
-        || t.contains("help me")
+        || t == "help" || t == "help me"
     {
         return Some(call("recover", json!({})));
     }
@@ -744,8 +913,15 @@ fn parse_one(t: &str) -> Option<ToolCall> {
 
     // fuel selector / tank. Explicit side wins; a swap verb with no side is the
     // routine "switch tanks" (the SR22 has no BOTH, so it's said every half hour)
-    // — the tool reads the current tank and feeds from the other one.
-    if t.contains("fuel selector") || has(t, "tank") || has(t, "tanks") {
+    // — the tool reads the current tank and feeds from the other one. Also match
+    // bare "fuel" with a swap verb or an explicit "to <side>" ("switch fuel to
+    // right", "set fuel to left") — seen live, five times in one session, routed
+    // to the quantity report instead. "fuel pump"/"boost" stays with the pump rule.
+    let swap_verb = has(t, "switch") || has(t, "swap") || has(t, "change")
+        || has(t, "alternate") || has(t, "rotate");
+    let fuel_to_side = has(t, "fuel") && !t.contains("pump") && !has(t, "boost")
+        && (swap_verb || t.contains("to left") || t.contains("to right") || t.contains("to off"));
+    if t.contains("fuel selector") || has(t, "tank") || has(t, "tanks") || fuel_to_side {
         let pos = if has(t, "both") {
             "both"
         } else if has(t, "left") {
@@ -754,9 +930,7 @@ fn parse_one(t: &str) -> Option<ToolCall> {
             "right"
         } else if has(t, "off") {
             "off"
-        } else if has(t, "switch") || has(t, "swap") || has(t, "change")
-            || has(t, "alternate") || has(t, "rotate")
-        {
+        } else if swap_verb {
             "switch"
         } else {
             return None;
@@ -881,6 +1055,17 @@ mod tests {
         assert_eq!(g("autothrottle off").unwrap().1, json!({"on":false}));
         // "vertical speed 1000" must still be a rate, not an airspeed select.
         assert_eq!(g("vertical speed 1000").unwrap().0, "set_vertical_speed");
+        // Landing setup phrases (born of an LEAL–LEMD arrival that got busy):
+        // approach preset, relative slow-downs, and the flap alias.
+        assert_eq!(g("set speed for landing").unwrap(), ("set_speed".into(), json!({"preset":"approach"})));
+        assert_eq!(g("approach speed").unwrap().1, json!({"preset":"approach"}));
+        assert_eq!(g("reduce speed by 20").unwrap().1, json!({"delta":-20}));
+        assert_eq!(g("reduce speed").unwrap().1, json!({"delta":-20}));
+        assert_eq!(g("slow down").unwrap().1, json!({"delta":-20}));
+        assert_eq!(g("slow to 180").unwrap().1, json!({"knots":180}));
+        assert_eq!(g("set flaps for landing").unwrap(), ("set_flaps".into(), json!({"notch":"landing"})));
+        // "reduce throttle by ten percent" must stay a throttle call, not a speed one.
+        assert_eq!(g("reduce throttle by ten percent").unwrap().0, "set_throttle");
     }
 
     #[test]
@@ -893,6 +1078,29 @@ mod tests {
         assert_eq!(g("gear down").unwrap(), ("gear".into(), json!({"position":"down"})));
         assert_eq!(g("positive rate, gear up").unwrap().1, json!({"position":"up"}));
         assert_eq!(g("put the gear down for landing").unwrap().1, json!({"position":"down"}));
+    }
+
+    #[test]
+    fn pitot_mishearings_resolve() {
+        // "pitot" defeats whisper — every one of these observed live (LEAL–LEMD,
+        // four failed attempts at 14,000 ft) must land on set_pitot_heat.
+        let on = ("set_pitot_heat".to_string(), json!({"on":true}));
+        assert_eq!(one("pitot heat on").unwrap(), on);
+        assert_eq!(one("pitos heat on").unwrap(), on); // "Pito's heat on."
+        assert_eq!(one("pito heat on").unwrap(), on);
+        assert_eq!(one("pilot heat on").unwrap(), on);
+        assert_eq!(one("it was heat on").unwrap(), on);
+        assert_eq!(one("a bit of heat on").unwrap(), on);
+        assert_eq!(one("pitot heat off").unwrap().1, json!({"on":false}));
+    }
+
+    #[test]
+    fn electrics_off_stays_off() {
+        // The whole-system OFF direction: the main loop must not remap this to
+        // power_up (it did once, powering the aircraft back up post-shutdown).
+        assert_eq!(one("electrics off").unwrap(), ("set_electrical".into(), json!({"system":"all","on":false})));
+        assert_eq!(one("switch off electrical systems").unwrap().1, json!({"system":"all","on":false}));
+        assert_eq!(one("electric systems off").unwrap().1, json!({"system":"all","on":false}));
     }
 
     #[test]
@@ -930,12 +1138,73 @@ mod tests {
         assert_eq!(one("navigate").unwrap().0, "navigate");
         assert_eq!(one("follow the flight plan").unwrap().0, "navigate");
         assert_eq!(one("engage nav").unwrap().0, "navigate");
+        // Direction of control transfer: the pilot ANNOUNCING a takeover is a
+        // release (autopilot off + recovery drop), never a recovery engage —
+        // "let me take controls" once flipped to the copilot seizing the plane.
+        assert_eq!(one("let me take controls").unwrap().0, "autopilot_off");
+        assert_eq!(one("ill take control").unwrap().0, "autopilot_off");
+        assert_eq!(one("im taking control").unwrap().0, "autopilot_off");
+        // ...while asking the COPILOT to take over still recovers.
+        assert_eq!(one("take control").unwrap().0, "recover");
+        assert_eq!(one("you have the aircraft").unwrap().0, "recover");
+        // Talk-down arm/cancel phrasings, including the live whisper garbles
+        // ("top me down", "toadown") and the natural landing-help ask.
+        assert_eq!(one("talk me down runway 28").unwrap(), ("visual_approach".into(), json!({"runway":"28"})));
+        assert_eq!(one("top me down runway 28").unwrap().1, json!({"runway":"28"}));
+        assert_eq!(one("toadown, runway 28").unwrap().1, json!({"runway":"28"}));
+        assert_eq!(one("i want to land at runway 28").unwrap().1, json!({"runway":"28"}));
+        assert_eq!(one("guide me in").unwrap().1, json!({"runway":""}));
+        assert_eq!(one("visual approach runway 10").unwrap().1, json!({"runway":"10"}));
+        assert_eq!(one("stop the guidance").unwrap().1, json!({"cancel":true}));
+        // Speed hold: copilot-managed power toward a target IAS.
+        assert_eq!(one("hold 70 knots").unwrap(), ("hold_speed".into(), json!({"knots":70})));
+        assert_eq!(one("maintain 65 knots").unwrap().1, json!({"knots":65}));
+        assert_eq!(one("keep the speed at 80").unwrap().1, json!({"knots":80}));
+        assert_eq!(one("can you maintain an appropriate speed").unwrap().1, json!({"preset":"approach"}));
+        assert_eq!(one("maintain approach speed").unwrap().1, json!({"preset":"approach"}));
+        assert_eq!(one("hold this speed").unwrap().1, json!({}));
+        assert_eq!(one("stop holding speed").unwrap().1, json!({"off":true}));
+        assert_eq!(one("my throttle").unwrap().1, json!({"off":true}));
+        // Release phrasings observed live while the pilot fought to let go.
+        assert_eq!(one("mic throttle").unwrap().1, json!({"off":true}));
+        assert_eq!(one("my throat").unwrap().1, json!({"off":true}));
+        assert_eq!(one("my power").unwrap().1, json!({"off":true}));
+        assert_eq!(one("stop taxiing").unwrap().1, json!({"off":true}));
+        // Taxi phrasings — the tool picks taxi mode from being on the ground.
+        assert_eq!(one("taxi at 10 knots").unwrap(), ("hold_speed".into(), json!({"knots":10})));
+        assert_eq!(one("taxi 12 knots").unwrap().1, json!({"knots":12}));
+        assert_eq!(one("hold short").unwrap().1, json!({"knots":0}));
+        // "taxi light on" must still be the lights, not a taxi hold.
+        assert_eq!(one("taxi light on").unwrap().0, "set_lights");
+        // ...but altitude/heading holds stay with the autopilot rules.
+        assert_eq!(one("climb and maintain 7000").unwrap().0, "set_altitude");
+        // Bare relative throttle nudges (both went silent live).
+        assert_eq!(one("increase power").unwrap().1, json!({"delta":10}));
+        assert_eq!(one("increase throttle").unwrap().1, json!({"delta":10}));
+        assert_eq!(one("reduce power").unwrap().1, json!({"delta":-10}));
+        // "increase power to 50 percent" is a target, not +50.
+        assert_eq!(one("increase power to 50 percent").unwrap().1, json!({"percent":50}));
+        // ILS setup, both live phrasings: with a runway and without.
+        assert_eq!(one("set up ils for runway 28").unwrap(), ("prepare_ils".into(), json!({"runway":"28"})));
+        assert_eq!(one("can we set up ils").unwrap().1, json!({"runway":""}));
+        assert_eq!(one("prepare the ils for runway 10").unwrap().1, json!({"runway":"10"}));
+        // AP-coupling phrasings, both missed live before "navigation mode" landed.
+        assert_eq!(one("set ap to nav").unwrap().0, "navigate");
+        assert_eq!(one("set autopilot to navigation").unwrap().0, "navigate");
+        assert_eq!(one("navigation mode").unwrap().0, "navigate");
+        // "nav lights on" must still be lights, not the autopilot.
+        assert_eq!(one("nav lights on").unwrap().0, "set_lights");
         assert_eq!(one("nav lights on").unwrap().0, "set_lights");
         assert_eq!(one("heading north west").unwrap().1, json!({"heading":315}));
         assert_eq!(one("fly heading southeast").unwrap().1, json!({"heading":135}));
         assert_eq!(one("descend 500").unwrap().1, json!({"fpm":-500}));
         assert_eq!(one("climb 500").unwrap().1, json!({"fpm":500}));
         assert_eq!(one("avionics on").unwrap(), ("set_electrical".into(), json!({"system":"avionics","on":true})));
+        // Numbered split systems (SR22 BAT 1/2, ALT 1/2); a bare noun stays
+        // unnumbered for the tool to resolve against the profile.
+        assert_eq!(one("alternator two on").unwrap(), ("set_electrical".into(), json!({"system":"alternator2","on":true})));
+        assert_eq!(one("battery 1 off").unwrap().1, json!({"system":"battery1","on":false}));
+        assert_eq!(one("alternator on").unwrap().1, json!({"system":"alternator","on":true}));
         // Inverter (C90 AC power) — resolves like any other electrical system.
         assert_eq!(one("inverter on").unwrap(), ("set_electrical".into(), json!({"system":"inverter","on":true})));
         assert_eq!(one("inverter off").unwrap(), ("set_electrical".into(), json!({"system":"inverter","on":false})));
@@ -958,6 +1227,16 @@ mod tests {
         // RELATIVE throttle: "by N" adjusts, never sets the absolute value (a
         // live power chop: "reduce throttle by ten percent" went to 10%).
         assert_eq!(one("reduce throttle by ten percent").unwrap(), ("set_throttle".into(), json!({"delta":-10})));
+        // Whisper's full garble heard live: plural "powers", past-tense
+        // "increased", and "of" for "to" — still a 60% target, not a +60 delta.
+        assert_eq!(one("increased powers of 60 percent").unwrap(), ("set_throttle".into(), json!({"percent":60})));
+        assert_eq!(one("increase power by 10 percent").unwrap().1, json!({"delta":10}));
+        // "N to M" means M: whisper garbled "throttle to fifty" as "12 to 50
+        // percent" live and the first-number rule chopped power to 12%.
+        assert_eq!(one("throttle 12 to 50 percent").unwrap().1, json!({"percent":50}));
+        assert_eq!(one("power 12 to 50 percent").unwrap().1, json!({"percent":50}));
+        // ...but a dangling "to" with no second number keeps the first.
+        assert_eq!(one("throttle 40 to, taxi").unwrap().1, json!({"percent":40}));
         assert_eq!(one("increase power by 20 percent").unwrap().1, json!({"delta":20}));
         assert_eq!(one("reduce throttle to 20 percent").unwrap().1, json!({"percent":20}));
         // Tank management: "switch tanks" feeds from the other wing (SR22 routine);
@@ -966,6 +1245,15 @@ mod tests {
         assert_eq!(one("swap fuel tanks").unwrap().1, json!({"position":"switch"}));
         assert_eq!(one("switch to the left tank").unwrap().1, json!({"position":"left"}));
         assert_eq!(one("select the right tank").unwrap().1, json!({"position":"right"}));
+        // Bare "fuel" phrasings, no "tank"/"selector" said (seen live: these read
+        // back the quantity report instead of moving the selector).
+        assert_eq!(one("switch fuel to right").unwrap(), ("set_fuel_selector".into(), json!({"position":"right"})));
+        assert_eq!(one("set fuel to left").unwrap().1, json!({"position":"left"}));
+        assert_eq!(one("switch fuel").unwrap().1, json!({"position":"switch"}));
+        // ...but the pump keeps its own tool, and a bare quantity mention parses
+        // as nothing here (stays a question for the fuel report).
+        assert_eq!(one("switch fuel pump on").unwrap().0, "set_fuel_pump");
+        assert!(one("how much fuel do we have").is_none());
         assert_eq!(one("strobes off").unwrap().1, json!({"light":"strobe","on":false}));
         assert_eq!(one("start the engine").unwrap().0, "start_engine");
         // Politeness/filler stripped by the normalization layer (Cessna registry,

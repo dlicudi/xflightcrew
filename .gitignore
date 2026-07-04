@@ -27,6 +27,10 @@ target
 # Run logs
 /logs/
 
+# The copilot's long-term memory (flight debriefs, carry-forward) — personal
+# per-pilot data written by src/debrief.rs, never shipped.
+/memory/
+
 # Python cache (voice/ tooling)
 __pycache__/
 *.pyc

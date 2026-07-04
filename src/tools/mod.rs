@@ -27,6 +27,7 @@ pub mod power;
 pub mod prop;
 pub mod radio;
 pub mod recover;
+pub mod speedhold;
 pub mod reminder;
 
 use anyhow::Result;
@@ -187,15 +188,30 @@ impl Registry {
         if profile.auto_prep {
             tools.push(Box::new(power::PowerUp));
         }
+        // Talk-down (spoken visual-approach guidance) — any airframe, any
+        // runway; needs nothing but a voice and apt.dat.
+        tools.push(Box::new(approach::VisualApproach));
+
+        // Speed hold (copilot works the throttle) — airframes with a throttle
+        // and no autothrottle; the MD-82 crowd sets the AP speed bug instead.
+        if (profile.engine || profile.throttle) && !profile.autothrottle {
+            let approach = profile.reference.as_ref().and_then(|r| r.approach_kts);
+            tools.push(Box::new(speedhold::HoldSpeed { approach_kts: approach }));
+        }
+
         // Airliner autoflight extras: AP speed select + autothrottle.
         if profile.autothrottle {
-            tools.push(Box::new(autopilot::SetSpeed));
+            let approach = profile.reference.as_ref().and_then(|r| r.approach_kts);
+            tools.push(Box::new(autopilot::SetSpeed::new(approach)));
             tools.push(Box::new(autopilot::Autothrottle));
         }
         if profile.engine {
             tools.push(Box::new(engine::SetMixture));
             tools.push(Box::new(engine::LeanMixture));
-            tools.push(Box::new(engine::StartEngine));
+            tools.push(Box::new(engine::StartEngine {
+                fuel_selector: profile.fuel_selector.clone(),
+                alternator_on_cmds: alternator_on_cmds(&profile.electrical),
+            }));
             tools.push(Box::new(engine::StopEngine));
         }
 
@@ -258,7 +274,9 @@ impl Registry {
         }
 
         if profile.pitot_heat {
-            tools.push(Box::new(instruments::SetPitotHeat));
+            tools.push(Box::new(instruments::SetPitotHeat {
+                override_dataref: profile.pitot_heat_dataref.clone(),
+            }));
         }
 
         if !profile.electrical.is_empty() {
@@ -337,6 +355,25 @@ impl Registry {
             })
             .collect()
     }
+}
+
+/// ON commands for every charging source in an electrical profile (keys
+/// starting "alternator"/"generator"), deduped — the pair entries ("alternators")
+/// repeat the singles' commands. Feeds `StartEngine`, so a dual-alternator
+/// airframe (SR22 ALT 1 + ALT 2) gets both online after a start.
+pub fn alternator_on_cmds(systems: &[crate::aircraft::ElectricalSystem]) -> Vec<String> {
+    let mut cmds: Vec<String> = Vec::new();
+    for s in systems {
+        let k = s.key.to_ascii_lowercase();
+        if k.starts_with("alternator") || k.starts_with("generator") {
+            for c in &s.on_commands {
+                if !cmds.contains(c) {
+                    cmds.push(c.clone());
+                }
+            }
+        }
+    }
+    cmds
 }
 
 /// A flattened, serializable view of a tool for the LLM layer to wrap.

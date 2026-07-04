@@ -122,7 +122,15 @@ impl Tool for SetAltimeterCurrent {
     }
 }
 
-pub struct SetPitotHeat;
+pub struct SetPitotHeat {
+    /// Airframe-specific switch when the stock pitot-heat command is a no-op
+    /// (the profile's `pitot_heat_dataref`). The Laminar MD-82's ice script
+    /// drives all pitot/stall heat from its overhead heat-selector knob
+    /// (`laminar/md82/ice/heatknob`, 0 = off, 1–9 = on) and overwrites the
+    /// stock datarefs every frame, so only the knob works. The stock mirror
+    /// dataref is still used for the readback — the script keeps it honest.
+    pub override_dataref: Option<String>,
+}
 
 #[derive(Deserialize)]
 struct PitotArgs {
@@ -151,10 +159,26 @@ impl Tool for SetPitotHeat {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: PitotArgs = serde_json::from_value(args.clone())?;
-        ctx.xplane
-            .run_command(if a.on { CMD_PITOT_HEAT_ON } else { CMD_PITOT_HEAT_OFF })
-            .await?;
+        match &self.override_dataref {
+            Some(dref) => {
+                ctx.xplane.set_float(dref, if a.on { 1.0 } else { 0.0 }).await?;
+            }
+            None => {
+                ctx.xplane
+                    .run_command(if a.on { CMD_PITOT_HEAT_ON } else { CMD_PITOT_HEAT_OFF })
+                    .await?;
+            }
+        }
+        // The mirror dataref updates a frame behind an overridden switch (the
+        // airframe's script copies switch → dataref in after_physics).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let on = ctx.xplane.get_float(PITOT_HEAT).await? > 0.5;
+        if on != a.on {
+            return Ok(format!(
+                "Tried, but pitot heat reads {}. Check the switch.",
+                if on { "on" } else { "off" }
+            ));
+        }
         Ok(format!("Roger, pitot heat {}.", if on { "on" } else { "off" }))
     }
 }

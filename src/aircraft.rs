@@ -48,6 +48,12 @@ pub struct AircraftProfile {
     /// means the copilot only verifies/calls out checklist items (never acts).
     #[serde(default)]
     pub checklist_map: Vec<ChecklistMapEntry>,
+    /// Phase-expectation advisor: switch states the airframe *should* be in per
+    /// flight phase; the monitor advises on the delta ("yaw damper's still off"
+    /// at climb). Declarative SOP knowledge — the deterministic version of a
+    /// human copilot's "aren't you forgetting something?".
+    #[serde(default)]
+    pub advisor: Vec<AdvisorItem>,
     /// Exterior/interior lights this airframe has. Empty means no `set_lights` tool.
     #[serde(default)]
     pub lights: Vec<LightProfile>,
@@ -127,6 +133,12 @@ pub struct AircraftProfile {
     /// `sim/cockpit2/switches/generic_lights_switch[0]`). `None` → universal floods.
     #[serde(default)]
     pub flood_lights_dataref: Option<String>,
+    /// Override switch for pitot heat when the stock command is a no-op — the
+    /// airframe's script drives the heat from its own control and overwrites the
+    /// stock datarefs every frame (MD-82: `laminar/md82/ice/heatknob`, 0 = off,
+    /// 1–9 = on; the tool writes 1/0). `None` → the stock pitot-heat command.
+    #[serde(default)]
+    pub pitot_heat_dataref: Option<String>,
     /// Electric/auxiliary fuel pump (`set_fuel_pump`).
     #[serde(default)]
     pub fuel_pump: bool,
@@ -416,7 +428,16 @@ pub struct TurbineStartProfile {
     /// Per-engine command that engages the starter (the ign/start switch UP).
     pub start_up: Vec<String>,
     /// Per-engine command that releases the starter (the switch back to centre).
+    /// May be empty when `starter_held` is set (nothing to release).
+    #[serde(default)]
     pub start_dn: Vec<String>,
+    /// The starter is a momentary press-and-hold control, not a latching switch:
+    /// `start_up` is *held* for up to `crank_secs` (the Web API's command
+    /// duration) instead of fired once, and `start_dn` is skipped. The Lancair
+    /// Evolution's ENGINE START button (`sim/starters/engage_starter_1`) works
+    /// this way; the C90's ign/start switch latches and stays `false`.
+    #[serde(default)]
+    pub starter_held: bool,
     /// Per-engine generator-ON command, fired once that engine reaches idle.
     #[serde(default)]
     pub generators: Vec<String>,
@@ -491,6 +512,26 @@ fn default_crank_secs() -> f64 {
 }
 fn default_throttle_crack() -> f64 {
     0.12
+}
+
+/// One phase-expectation rule: in the named phases, the dataref should read on
+/// (or off); otherwise the copilot speaks `say` once, as an Advisory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvisorItem {
+    /// Switch/annunciator to read (scalar float; > 0.5 = on).
+    pub dataref: String,
+    /// Expected state in the listed phases (default: on).
+    #[serde(default = "advisor_expect_on_default")]
+    pub expect_on: bool,
+    /// Phases where the expectation applies, lowercase (`ground`, `takeoff`,
+    /// `climb`, `cruise`, `approach`, `landing`).
+    pub phases: Vec<String>,
+    /// What the copilot says when the state doesn't match.
+    pub say: String,
+}
+
+fn advisor_expect_on_default() -> bool {
+    true
 }
 
 /// A flap system as an ordered list of detents, retracted → fully extended.
@@ -664,6 +705,9 @@ mod tests {
         assert!(p.autopilot && p.engine && p.barometer && p.com_radio);
         assert!(!p.retractable_gear);
         assert_eq!(p.lights.len(), 5);
+        // SOP advisor rows: strobes airborne, landing light for takeoff/arrival.
+        assert_eq!(p.advisor.len(), 2);
+        assert!(p.advisor.iter().all(|a| a.expect_on));
         let flaps = p.flaps.expect("has flaps");
         assert_eq!(flaps.detents.len(), 4);
         assert_eq!(flaps.detents[0].label, "up");
@@ -816,6 +860,68 @@ mod tests {
         let r = p.reference.as_ref().expect("c90b reference");
         assert_eq!(r.max_gross_lb, Some(9650.0));
         assert_eq!(r.vr_kts, Some(90.0));
+    }
+
+    #[test]
+    fn lancair_evolution_yaml_loads() {
+        // YAML-only profile. Deserialize directly so a malformed field fails here
+        // rather than silently falling back.
+        let text = std::fs::read_to_string("profiles/lancair_evolution.yaml").unwrap();
+        let p: AircraftProfile = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("lancair_evolution.yaml failed to parse: {e:#}"));
+        assert_eq!(p.id, "lancair_evolution");
+        // Single turboprop: power lever (not the piston group), retractable gear
+        // with the POM's 150 KIAS gear speed, standard autopilot.
+        assert!(p.throttle && !p.engine);
+        assert!(p.retractable_gear);
+        assert_eq!(p.vlo_kts, Some(150.0));
+        assert!(p.autopilot && p.ils);
+        assert!(!p.turbine_start && !p.magnetos && !p.carb_heat);
+        // PT6 start with the press-and-hold starter: one engine, no start_dn
+        // (the held button releases itself), igniter armed, boost pump fed.
+        let ts = p.turboprop_start.as_ref().expect("evolution turboprop start");
+        assert!(ts.starter_held);
+        assert_eq!(ts.start_up.len(), 1);
+        assert!(ts.start_dn.is_empty());
+        assert!(ts.boost_pumps);
+        assert_eq!(ts.ignition_arm.len(), 1);
+        assert_eq!(ts.condition_start, 0.5);
+        assert_eq!(ts.condition_run, 1.0);
+        // Dual battery + generator + standby alternator + DC power. No "both
+        // generators" pair (POM: GEN and ALT are not normally used together) and
+        // no avionics switch (the xlua forces avionics on at flight start).
+        let elec: Vec<&str> = p.electrical.iter().map(|e| e.key.as_str()).collect();
+        for k in ["battery1", "battery2", "batteries", "generator", "alternator", "dc_power"] {
+            assert!(elec.contains(&k), "evolution electrical missing {k}");
+        }
+        assert!(!elec.contains(&"avionics") && !elec.contains(&"generators"));
+        // After-start brings the GENERATOR + DC POWER online, not the alternator.
+        assert_eq!(ts.generators.len(), 2);
+        // The AP panel's own power switch is engaged before the servos.
+        let prep = p.autopilot_prep.as_ref().expect("evolution autopilot prep");
+        assert_eq!(prep.flight_director.len(), 1);
+        assert!(!prep.ac_powered);
+        // No beacon or taxi light on this airframe (POM) — only nav/strobe/landing.
+        let lights: Vec<&str> = p.lights.iter().map(|l| l.key.as_str()).collect();
+        assert_eq!(lights, ["nav", "strobe", "landing"]);
+        // POM / .acf limits.
+        assert_eq!(p.vne_kts, Some(256.0));
+        assert_eq!(p.vs_clean_kts, Some(76.0));
+        let flaps = p.flaps.expect("has flaps");
+        assert_eq!(flaps.detents.len(), 3);
+        assert_eq!(flaps.detents[1].vfe_kts, Some(160.0));
+        assert_eq!(flaps.detents[2].vfe_kts, Some(140.0));
+        // Fuel selector: off/left/right (the POH's engine-failure drills call
+        // for OFF; no "both" — the wing tanks don't interconnect).
+        let fsel = p.fuel_selector.as_ref().expect("evolution fuel selector");
+        let pos: Vec<&str> = fsel.positions.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(pos, ["off", "left", "right"]);
+        let r = p.reference.as_ref().expect("evolution reference");
+        assert_eq!(r.vr_kts, Some(77.0));
+        assert_eq!(r.max_gross_lb, Some(4300.0));
+        assert_eq!(r.cruise_kts, Some(300.0));
+        let prop = p.prop.as_ref().expect("evolution prop");
+        assert_eq!(prop.max_rpm, 2000.0);
     }
 
     #[test]
@@ -983,6 +1089,8 @@ fn cessna_172sp() -> AircraftProfile {
             ],
         }),
         pitot_heat: true,
+        pitot_heat_dataref: None,
+        advisor: vec![],
         pitch_trim: true,
         nav_radio: true,
         com2_radio: true,
@@ -1130,6 +1238,8 @@ fn cirrus_sr22() -> AircraftProfile {
         parking_brake: true,
         park_brake_valve_set: None,
         pitot_heat: true,
+        pitot_heat_dataref: None,
+        advisor: vec![],
         // Throttle/mixture/start write universal datarefs (throttle_ratio_all,
         // mixture_ratio_all, the starter command) — confirmed against the
         // rustdecks SR22 deck. (start_engine sets battery 1 + alternator 1 only;

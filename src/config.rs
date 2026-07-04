@@ -98,6 +98,9 @@ pub struct Config {
     pub piper_voice: String,
     /// Path to X-Plane's `earth_nav.dat` (for ILS lookup).
     pub nav_data_path: String,
+    /// Path to X-Plane's Global Airports `apt.dat` (for runway lookup — which
+    /// runways a field actually has, so runway advice is never invented).
+    pub apt_data_path: String,
     /// Active aircraft profile id (see [`crate::aircraft`]), e.g. `cessna_172sp`.
     /// Determines the available tools and their limits.
     pub aircraft: String,
@@ -156,9 +159,21 @@ impl Config {
             negative_tone_path: env_or("XCOPILOT_NEGATIVE_TONE", ""),
             piper_binary: env_or("PIPER_BIN", "piper"),
             piper_voice: env_or("PIPER_VOICE", "models/en_US-amy-medium.onnx"),
-            nav_data_path: env_or(
-                "XPLANE_NAV_DATA",
-                "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_nav.dat",
+            // Prefer Custom Data (Navigraph/updated AIRAC) when it exists — it's
+            // what X-Plane itself flies on; the stock file goes stale the moment
+            // a cycle is installed. Env override wins over both.
+            nav_data_path: {
+                let custom = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_nav.dat";
+                let fallback = if std::path::Path::new(custom).exists() {
+                    custom
+                } else {
+                    "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_nav.dat"
+                };
+                env_or("XPLANE_NAV_DATA", fallback)
+            },
+            apt_data_path: env_or(
+                "XPLANE_APT_DATA",
+                "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat",
             ),
             aircraft: env_or("XCOPILOT_AIRCRAFT", "auto"),
             confirm_critical: env_or("XCOPILOT_CONFIRM", "true") != "false",

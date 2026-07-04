@@ -326,10 +326,21 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         gate.set_speaking(true);
         // Tone-only: play the negative "unrecognized" cue and skip TTS entirely
         // (nothing to speak, nothing to add to the echo list).
+        // A killed player (SIGTERM) is an intentional barge-in cut-off, not a
+        // failure — same treatment as the main TTS path below, which the tone
+        // and chime never got (they warned on every interrupted beep).
+        let log_play_err = |what: &str, e: anyhow::Error| {
+            let msg = format!("{e:#}");
+            if msg.contains("SIGTERM") || msg.contains("signal: 15") {
+                tracing::debug!("{what} interrupted (barge-in): {msg}");
+            } else {
+                tracing::warn!("{what} failed: {msg}");
+            }
+        };
         if utt.negative {
             if let Some(path) = &negative_path {
                 if let Err(e) = crate::tts::play(path) {
-                    tracing::warn!("negative tone failed: {e:#}");
+                    log_play_err("negative tone", e);
                 }
             }
             if let Some(latch) = utt.done {
@@ -341,7 +352,7 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         if utt.chime {
             if let Some(path) = &chime_path {
                 if let Err(e) = crate::tts::play(path) {
-                    tracing::warn!("chime failed: {e:#}");
+                    log_play_err("chime", e);
                 }
             }
         }

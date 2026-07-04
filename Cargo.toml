@@ -56,6 +56,9 @@ hound = "3"
 ort = { version = "2.0.0-rc.12", optional = true }
 earshot = "1.1.0"
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 # Native in-process ONNX TTS is the default voice backend (arm64 onnxruntime via
 # `ort`, warm session — no Python sidecar, no x86 piper subprocess under Rosetta).

@@ -103,17 +103,28 @@ impl Tool for SetLights {
 
         // Prefer the command (it animates the panel switch); fall back to a raw
         // dataref write if the profile doesn't supply one. Either way, read the
-        // dataref back and confirm the *actual* state.
+        // dataref back and confirm the *actual* state. The dataref may be an
+        // array element (`landing_lights_switch[0]` on the SR22/Evolution) — the
+        // v1 lookup 404s on the bracketed name, so split it (seen live: "switch
+        // landing lights off" flipped the light, then the readback 404'd and the
+        // whole tool reported failure).
         let cmd = if args.on {
             light.command_on.as_deref()
         } else {
             light.command_off.as_deref()
         };
+        let (base, idx) = split_index(&light.dataref);
         match cmd {
             Some(c) => ctx.xplane.run_command(c).await?,
-            None => ctx.xplane.set_int(&light.dataref, args.on as i64).await?,
+            None => match idx {
+                Some(i) => ctx.xplane.set_int_array_elem(base, i, args.on as i64).await?,
+                None => ctx.xplane.set_int(base, args.on as i64).await?,
+            },
         }
-        let actual_on = ctx.xplane.get_float(&light.dataref).await? > 0.5;
+        let actual_on = match idx {
+            Some(i) => ctx.xplane.get_float_array(base).await?.get(i).copied().unwrap_or(0.0),
+            None => ctx.xplane.get_float(base).await?,
+        } > 0.5;
 
         Ok(format!(
             "Roger, {} {}.",

@@ -523,12 +523,22 @@ impl Tool for StartTurbines {
             // before cranking = no light-off (ITT falls, N1 stalls ~24%); condition
             // CUTOFF -> crank -> fuel (low idle) at 12% N1 -> lights every time.
             ctx.xplane.set_float_array_elem(&self.start.condition_lever, i, 0.0).await?;
-            ctx.xplane.run_command(&self.start.start_up[i]).await?; // starter on
+            // Held starters are re-armed every poll tick with a short duration
+            // (the Web API caps a single activation well under a PT6's crank
+            // time); once we stop re-arming, the button releases itself.
+            if self.start.starter_held {
+                ctx.xplane.run_command_for(&self.start.start_up[i], 2.0).await?;
+            } else {
+                ctx.xplane.run_command(&self.start.start_up[i]).await?; // starter on
+            }
             let deadline = (self.start.crank_secs / 0.7) as u32;
             let mut fuel_in = false;
             let mut lit = false;
             for _ in 0..deadline {
                 tokio::time::sleep(Duration::from_millis(700)).await;
+                if self.start.starter_held {
+                    let _ = ctx.xplane.run_command_for(&self.start.start_up[i], 2.0).await;
+                }
                 let n1 = n1_percent(ctx, i).await;
                 if !fuel_in && n1 >= FUEL_INTRO_N1 {
                     ctx.xplane
@@ -541,7 +551,9 @@ impl Tool for StartTurbines {
                     break;
                 }
             }
-            ctx.xplane.run_command(&self.start.start_dn[i]).await?; // starter off
+            if let Some(dn) = self.start.start_dn.get(i) {
+                ctx.xplane.run_command(dn).await?; // starter off (held starters release themselves)
+            }
             if lit {
                 started += 1;
                 ctx.xplane.set_float_array_elem(&self.start.condition_lever, i, self.start.condition_run).await?;

@@ -21,6 +21,10 @@ const TRIM_TAKEOFF: f64 = 0.0;
 /// the profile says which value means SET (`park_brake_valve_set`).
 const PARK_BRAKE_VALVE: &str = "sim/cockpit2/controls/park_brake_valve";
 const CMD_VALVE_TOGGLE: &str = "sim/flight_controls/park_brake_valve_toggle";
+/// The parking-brake toggle command — preferred over a raw dataref write:
+/// custom airframes intercept commands, while a written ratio can be ignored or
+/// overwritten by their systems scripts (the MD-82 pitot-heat lesson).
+const CMD_PARK_TOGGLE: &str = "sim/flight_controls/brakes_toggle_max";
 
 pub struct SetParkingBrake {
     /// The valve value meaning SET on this airframe; `None` = leave the valve alone.
@@ -83,14 +87,30 @@ impl Tool for SetParkingBrake {
             ));
         }
 
-        // Valve first (to the airframe's SET/RELEASED sense), then the ratio.
+        // Valve first (to the airframe's SET/RELEASED sense), then the brake —
+        // command-first, verified by readback, with the raw dataref write kept
+        // only as a fallback for models that ignore the toggle.
         if let (Some(want), Some(now)) = (desired_valve, valve_now) {
             if (now - want).abs() > 0.5 {
                 ctx.xplane.run_command(CMD_VALVE_TOGGLE).await?;
             }
         }
-        ctx.xplane.set_float(PARK_BRAKE, if args.on { 1.0 } else { 0.0 }).await?;
-        let set = ctx.xplane.get_float(PARK_BRAKE).await? > 0.5;
+        if already != args.on {
+            ctx.xplane.run_command(CMD_PARK_TOGGLE).await?;
+        }
+        // The command applies on the next sim frame — give it a beat.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let mut set = ctx.xplane.get_float(PARK_BRAKE).await? > 0.5;
+        if set != args.on {
+            ctx.xplane.set_float(PARK_BRAKE, if args.on { 1.0 } else { 0.0 }).await?;
+            set = ctx.xplane.get_float(PARK_BRAKE).await? > 0.5;
+        }
+        if set != args.on {
+            return Ok(format!(
+                "Tried, but the parking brake still reads {}. Check the handle.",
+                if set { "set" } else { "released" }
+            ));
+        }
         Ok(format!("Roger, parking brake {}.", if set { "set" } else { "released" }))
     }
 }

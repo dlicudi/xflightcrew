@@ -122,12 +122,78 @@ impl OnnxTts {
     }
 
     /// Synthesize and play the readback. The session stays warm for the next call.
+    /// Long texts are synthesized sentence by sentence (see [`speech_chunks`]) and
+    /// stitched with a short pause — one giant pass comes out rushed.
     pub fn speak(&mut self, text: &str) -> Result<()> {
-        let samples = self.synth(text)?;
+        let samples = self.synth_chunked(text)?;
         let wav = std::env::temp_dir().join("x-copilot-onnx.wav");
         write_wav(&wav, &samples, self.sample_rate)?;
         crate::tts::play(&wav)
     }
+
+    fn synth_chunked(&mut self, text: &str) -> Result<Vec<f32>> {
+        let gap = vec![0.0_f32; (self.sample_rate as f64 * SENTENCE_GAP_S) as usize];
+        let mut samples = Vec::new();
+        for chunk in speech_chunks(text) {
+            if !samples.is_empty() {
+                samples.extend_from_slice(&gap);
+            }
+            samples.extend(self.synth(&chunk)?);
+        }
+        Ok(samples)
+    }
+}
+
+/// Pause stitched between sentence chunks, seconds — about what a human reader
+/// leaves at a full stop.
+const SENTENCE_GAP_S: f64 = 0.22;
+
+/// Split text into sentence-sized chunks for synthesis. VITS-family models are
+/// trained on single sentences: a whole paragraph in one pass comes out rushed
+/// (the duration predictor compresses the pacing — a nine-sentence flight-plan
+/// brief was heard live at roughly double speed), and Kokoro's style table
+/// additionally clamps on long inputs. Sentences end at `.`/`?`/`!` followed by
+/// whitespace, so decimals ("altimeter 30.17") never split; a sentence still
+/// longer than ~220 chars splits again at comma boundaries.
+pub(crate) fn speech_chunks(text: &str) -> Vec<String> {
+    const MAX_CHARS: usize = 220;
+    let mut sentences: Vec<&str> = Vec::new();
+    let mut start = 0;
+    let mut prev: Option<(usize, char)> = None;
+    for (i, c) in text.char_indices() {
+        if let Some((pi, pc)) = prev {
+            if matches!(pc, '.' | '?' | '!') && c.is_whitespace() {
+                sentences.push(&text[start..=pi]);
+                start = i;
+            }
+        }
+        prev = Some((i, c));
+    }
+    sentences.push(&text[start..]);
+    let mut out = Vec::new();
+    for s in sentences {
+        let s = s.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if s.len() <= MAX_CHARS {
+            out.push(s.to_string());
+            continue;
+        }
+        // Overlong sentence: greedily pack comma-separated pieces up to MAX.
+        let mut cur = String::new();
+        for piece in s.split_inclusive(", ") {
+            if !cur.is_empty() && cur.len() + piece.len() > MAX_CHARS {
+                out.push(cur.trim().to_string());
+                cur = String::new();
+            }
+            cur.push_str(piece);
+        }
+        if !cur.trim().is_empty() {
+            out.push(cur.trim().to_string());
+        }
+    }
+    out
 }
 
 /// Kokoro-82M TTS — a more natural/expressive voice than piper, in the same warm
@@ -214,9 +280,18 @@ impl KokoroTts {
         Ok(data.to_vec())
     }
 
-    /// Synthesize and play. Session stays warm for the next call.
+    /// Synthesize and play. Session stays warm for the next call. Chunked like
+    /// the piper path — Kokoro also mis-paces long passages, and its style row
+    /// (indexed by phoneme count) clamps at the table edge on a paragraph.
     pub fn speak(&mut self, text: &str) -> Result<()> {
-        let samples = self.synth(text)?;
+        let gap = vec![0.0_f32; (KOKORO_SR as f64 * SENTENCE_GAP_S) as usize];
+        let mut samples = Vec::new();
+        for chunk in speech_chunks(text) {
+            if !samples.is_empty() {
+                samples.extend_from_slice(&gap);
+            }
+            samples.extend(self.synth(&chunk)?);
+        }
         let wav = std::env::temp_dir().join("x-copilot-kokoro.wav");
         write_wav(&wav, &samples, KOKORO_SR)?;
         crate::tts::play(&wav)
@@ -334,6 +409,29 @@ mod tests {
         "Gear is down, three green.",
         "Caution, fuel endurance forty minutes.",
     ];
+
+    #[test]
+    fn chunks_split_sentences_not_decimals() {
+        // The flight-plan brief that was heard at double speed, verbatim.
+        let brief = "Flight plan: C172, LEAL to LERL, alternate LEMD. Cruise 10000 feet, \
+                     202 nautical miles, about 1 hours 59 minutes enroute, wind 351 at 5. \
+                     Block fuel 38 gallons, 18 for the trip, 6 reserve. You're at 1945, \
+                     8055 to climb to cruise. Top of descent about 19 miles before LERL. \
+                     You have 27 aboard, but the plan needs 38; short about 10.";
+        let chunks = speech_chunks(brief);
+        assert_eq!(chunks.len(), 6, "{chunks:#?}");
+        assert!(chunks[0].ends_with("alternate LEMD."));
+        assert!(chunks.iter().all(|c| c.len() <= 220));
+
+        // Decimals and short readbacks must not split.
+        assert_eq!(speech_chunks("Roger, altimeter 30.17."), vec!["Roger, altimeter 30.17."]);
+        assert_eq!(speech_chunks("Flaps up."), vec!["Flaps up."]);
+        // Question marks end sentences too.
+        assert_eq!(speech_chunks("Say again? Flaps up.").len(), 2);
+        // An overlong single sentence falls back to comma packing.
+        let long = format!("one{}", ", and some more words here".repeat(20));
+        assert!(speech_chunks(&long).iter().all(|c| c.len() <= 220));
+    }
 
     // Needs the vendored model + espeak-ng, so off by default. Run with:
     //   cargo test --features onnx-tts -- --ignored --nocapture onnx

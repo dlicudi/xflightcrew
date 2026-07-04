@@ -230,6 +230,10 @@ fn run(base: String, rx: Receiver<Update>) {
     }
 
     let mut last_phase = 0u8;
+    // The aircraft code is written once per profile switch, but the plugin's
+    // buffers zero on a plugin reload — so re-send it with each heartbeat to
+    // repopulate the panel chip.
+    let mut last_aircraft: Option<String> = None;
     let mut last_beat = Instant::now();
     loop {
         let update = match rx.recv_timeout(HEARTBEAT) {
@@ -257,7 +261,10 @@ fn run(base: String, rx: Receiver<Update>) {
                     let payload = format!("{}{}", level.code(), text);
                     (Slot::Alert, json!(STANDARD.encode(payload.as_bytes())))
                 }
-                Update::Aircraft(code) => (Slot::Aircraft, json!(STANDARD.encode(code.as_bytes()))),
+                Update::Aircraft(code) => {
+                    last_aircraft = Some(code.clone());
+                    (Slot::Aircraft, json!(STANDARD.encode(code.as_bytes())))
+                }
                 Update::Strip(text) => (Slot::Strip, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Callout(text) => (Slot::Callout, json!(STANDARD.encode(text.as_bytes()))),
             };
@@ -268,6 +275,9 @@ fn run(base: String, rx: Receiver<Update>) {
             last_beat = Instant::now();
             let beat_ok = patch(&http, &rest, &ids, Slot::Phase, json!(last_phase));
             healthy = healthy && beat_ok;
+            if let Some(code) = &last_aircraft {
+                patch(&http, &rest, &ids, Slot::Aircraft, json!(STANDARD.encode(code.as_bytes())));
+            }
         }
     }
 }

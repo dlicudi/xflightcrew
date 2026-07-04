@@ -65,6 +65,10 @@ impl Tool for PrepareIls {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: Args = serde_json::from_value(args.clone())?;
+        // A bare "set up the ILS" names no runway — ask, don't guess one.
+        if args.runway.trim().is_empty() {
+            return Ok("Which runway? Say, set up the ILS for runway 28.".to_string());
+        }
         let lat = ctx.xplane.get_float(LAT).await?;
         let lon = ctx.xplane.get_float(LON).await?;
 
@@ -113,6 +117,115 @@ impl Tool for PrepareIls {
             ils.freq_mhz(),
             ils.course_mag,
             alt
+        ))
+    }
+}
+
+/// `visual_approach` — arm (or cancel) the talk-down: PAR-style spoken guidance
+/// down a synthesized 3° path to any runway, procedures or not. Advisory only —
+/// the pilot flies, the monitor's tick narrates (see [`crate::approach_guide`]).
+/// Born at LERL, whose nav data contains no approaches of any kind.
+pub struct VisualApproach;
+
+#[derive(serde::Deserialize)]
+struct VisArgs {
+    /// Runway designator ("28", "16L"); empty = best fit at the nearest field.
+    #[serde(default)]
+    runway: String,
+    /// true = stop the guidance.
+    #[serde(default)]
+    cancel: bool,
+}
+
+/// How far out a talk-down target may be: the destination you're arriving at,
+/// not a field a province away.
+const GUIDE_MAX_NM: f64 = 30.0;
+
+#[async_trait]
+impl Tool for VisualApproach {
+    fn name(&self) -> &str {
+        "visual_approach"
+    }
+
+    fn description(&self) -> &str {
+        "Arm spoken visual-approach guidance (a talk-down): deviation callouts \
+         down a 3-degree path to a runway, for fields with no published approach. \
+         Use for 'talk me down runway 28', 'guide me in', 'visual approach runway \
+         10', 'call the approach'. Cancel with 'stop the guidance'."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "runway": {"type": "string", "description": "Runway designator, e.g. '28'. Empty = nearest field, best-aligned runway."},
+                "cancel": {"type": "boolean", "description": "true = stop the guidance"}
+            }
+        })
+    }
+
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let args: VisArgs = serde_json::from_value(args.clone())?;
+        if args.cancel {
+            return Ok(if crate::approach_guide::cancel() {
+                "Guidance stopped.".to_string()
+            } else {
+                "No guidance running.".to_string()
+            });
+        }
+        let lat = ctx.xplane.get_float(LAT).await?;
+        let lon = ctx.xplane.get_float(LON).await?;
+        // Candidate runway ends near us, nearest first (the autoland Stage-1
+        // finder — its first live consumer).
+        let apt = ctx.config.apt_data_path.clone();
+        let cands = tokio::task::spawn_blocking(move || {
+            crate::autoland::nearby_runways(&apt, lat, lon, GUIDE_MAX_NM)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("runway scan: {e}"))?
+        .unwrap_or_default();
+        if cands.is_empty() {
+            return Ok("No runway within thirty miles.".to_string());
+        }
+        // Named runway: nearest end whose designator number matches. Unnamed:
+        // the end at the nearest field whose course best matches our track
+        // (you're usually already pointed at the runway you mean).
+        let want = nav::runway_number(&args.runway);
+        let pick = match want {
+            Some(n) => cands
+                .iter()
+                .find(|r| nav::runway_number(&r.id) == Some(n)),
+            None => {
+                let track = ctx
+                    .xplane
+                    .get_float("sim/flightmodel/position/hpath")
+                    .await
+                    .unwrap_or(0.0);
+                let field = cands.first().map(|r| r.icao.clone()).unwrap_or_default();
+                cands
+                    .iter()
+                    .filter(|r| r.icao == field)
+                    .min_by(|a, b| {
+                        let da = ((a.course_deg - track + 540.0).rem_euclid(360.0) - 180.0).abs();
+                        let db = ((b.course_deg - track + 540.0).rem_euclid(360.0) - 180.0).abs();
+                        da.total_cmp(&db)
+                    })
+            }
+        };
+        let Some(rw) = pick else {
+            return Ok(format!("I can't find runway {} nearby.", args.runway));
+        };
+        crate::approach_guide::arm(crate::approach_guide::ApproachPath {
+            icao: rw.icao.clone(),
+            runway_id: rw.id.clone(),
+            thr_lat: rw.thr_lat,
+            thr_lon: rw.thr_lon,
+            course_deg: rw.course_deg,
+            elev_ft: rw.elev_ft,
+        });
+        Ok(format!(
+            "Talk-down armed: runway {} at {}, field elevation {:.0}. Fly the needles in your ears — I'll call course and glidepath.",
+            rw.id, rw.icao, (rw.elev_ft / 50.0).round() * 50.0
         ))
     }
 }

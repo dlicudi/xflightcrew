@@ -44,7 +44,6 @@ const CMD_HEADING_MODE: &str = "sim/autopilot/heading";
 const CMD_ALT_HOLD: &str = "sim/autopilot/altitude_hold";
 const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 const CURRENT_ALT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot";
-const HEADING_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
 const CURRENT_HDG: &str = "sim/cockpit2/gauges/indicators/compass_heading_deg_magnetic";
 const HEADING_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
 const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";

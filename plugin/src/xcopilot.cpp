@@ -9,10 +9,10 @@
 //   xcopilot/status/phase  (int: 0 idle, 1 listening, 2 thinking, 3 speaking)
 //   xcopilot/status/heard  (text: last transcript)
 //   xcopilot/status/action (text: last readback)
-// rendered as a toolbar of status chips + a scrolling transmission log.
-// The toolbar also carries an LLM-fallback toggle button driving the readable
-// dataref `xcopilot/llm_enabled` (-1 auto / 0 off / 1 on), which the app polls
-// each utterance to enable/disable its answer-only LLM fallback live.
+// rendered as a toolbar of status chips over tabs: Log (scrolling transmission
+// record), Route (the pushed flight plan + a Send-to-FMS re-push), and Settings
+// (live switches, e.g. the LLM-fallback dataref `xcopilot/llm_enabled`, -1 auto
+// / 0 off / 1 on, which the app polls each utterance).
 // Toggle via Plugins → x-copilot.
 //
 // Build/install: see plugin/README.md.
@@ -143,6 +143,9 @@ struct LogEntry { std::string time; std::string tag; ImU32 color; std::string te
 static std::vector<LogEntry> g_log;
 static bool g_log_scroll = false;
 static bool g_log_autoscroll = true;
+// New entries arrived since the Log tab was last shown — drives an unread dot
+// on the tab so activity isn't missed while on Route/Settings.
+static bool g_log_unseen = false;
 
 static void AppendLog(const char* tag, ImU32 color, const char* text) {
     if (text == nullptr || text[0] == '\0') return;
@@ -154,6 +157,7 @@ static void AppendLog(const char* tag, ImU32 color, const char* text) {
     g_log.push_back({ts, tag, color, text});
     if (g_log.size() > 200) g_log.erase(g_log.begin());
     if (g_log_autoscroll) g_log_scroll = true;
+    g_log_unseen = true;
 }
 
 // Last time the app wrote any status (sim seconds). The app heartbeats the phase
@@ -252,10 +256,6 @@ static int g_fms_load = 0;
 static XPLMDataRef g_fms_route_dref = nullptr;
 static XPLMDataRef g_fms_load_dref = nullptr;
 
-static void WriteFmsRoute(void*, void* in, int offset, int len) {
-    StoreText(&g_fms_route, in, offset, len);
-}
-
 // One parsed route point from the app's "IDENT,lat,lon,alt|..." payload, with the
 // navaid it resolved to (if any) so we can pick the right .fms row type.
 struct RoutePoint {
@@ -265,6 +265,42 @@ struct RoutePoint {
     XPLMNavRef ref;     // XPLM_NAV_NOT_FOUND for a bare lat/lon point
     XPLMNavType type;   // the navaid's type (only meaningful when ref is set)
 };
+
+// Parse the app's payload into points, without navaid resolution — cheap enough
+// to run on every route write; the Route tab renders straight from this.
+static std::vector<RoutePoint> parse_route() {
+    char buf[sizeof g_fms_route.buf];
+    std::strncpy(buf, g_fms_route.buf, sizeof buf);
+    buf[sizeof buf - 1] = '\0';
+
+    std::vector<RoutePoint> pts;
+    char* save1 = nullptr;
+    for (char* tok = strtok_r(buf, "|", &save1); tok; tok = strtok_r(nullptr, "|", &save1)) {
+        char* save2 = nullptr;
+        char* ident = strtok_r(tok, ",", &save2);
+        char* slat = strtok_r(nullptr, ",", &save2);
+        char* slon = strtok_r(nullptr, ",", &save2);
+        char* salt = strtok_r(nullptr, ",", &save2);
+        if (!slat || !slon) continue;
+        RoutePoint p;
+        p.ident = ident ? ident : "";
+        p.lat = static_cast<float>(std::atof(slat));
+        p.lon = static_cast<float>(std::atof(slon));
+        p.alt = salt ? std::atoi(salt) : 0;
+        p.ref = XPLM_NAV_NOT_FOUND;
+        p.type = 0;
+        pts.push_back(p);
+    }
+    return pts;
+}
+
+// Display copy for the panel's Route tab, refreshed whenever the app writes.
+static std::vector<RoutePoint> g_route_pts;
+
+static void WriteFmsRoute(void*, void* in, int offset, int len) {
+    StoreText(&g_fms_route, in, offset, len);
+    g_route_pts = parse_route();
+}
 
 // X-Plane's loaded AIRAC cycle (e.g. "2406"), read once from the nav-data header
 // so the flight plans we generate carry the *matching* cycle — a mismatch pops
@@ -314,39 +350,19 @@ static int fms_row_type(const RoutePoint& p) {
 }
 
 static void load_fms_route() {
-    char buf[sizeof g_fms_route.buf];
-    std::strncpy(buf, g_fms_route.buf, sizeof buf);
-    buf[sizeof buf - 1] = '\0';
-
     const XPLMNavType kTypes = xplm_Nav_Fix | xplm_Nav_VOR | xplm_Nav_NDB |
                                xplm_Nav_DME | xplm_Nav_Airport;
 
     // Parse the payload into points, resolving each to a navaid near its position.
-    std::vector<RoutePoint> pts;
-    char* save1 = nullptr;
-    for (char* tok = strtok_r(buf, "|", &save1); tok; tok = strtok_r(nullptr, "|", &save1)) {
-        char* save2 = nullptr;
-        char* ident = strtok_r(tok, ",", &save2);
-        char* slat = strtok_r(nullptr, ",", &save2);
-        char* slon = strtok_r(nullptr, ",", &save2);
-        char* salt = strtok_r(nullptr, ",", &save2);
-        if (!slat || !slon) continue;
-        RoutePoint p;
-        p.ident = ident ? ident : "";
-        p.lat = static_cast<float>(std::atof(slat));
-        p.lon = static_cast<float>(std::atof(slon));
-        p.alt = salt ? std::atoi(salt) : 0;
-        p.ref = XPLM_NAV_NOT_FOUND;
-        p.type = 0;
-        if (!p.ident.empty()) {
-            float la = p.lat, lo = p.lon;
-            p.ref = XPLMFindNavAid(nullptr, p.ident.c_str(), &la, &lo, nullptr, kTypes);
-            if (p.ref != XPLM_NAV_NOT_FOUND) {
-                XPLMGetNavAidInfo(p.ref, &p.type, nullptr, nullptr, nullptr, nullptr, nullptr,
-                                  nullptr, nullptr, nullptr);
-            }
+    std::vector<RoutePoint> pts = parse_route();
+    for (RoutePoint& p : pts) {
+        if (p.ident.empty()) continue;
+        float la = p.lat, lo = p.lon;
+        p.ref = XPLMFindNavAid(nullptr, p.ident.c_str(), &la, &lo, nullptr, kTypes);
+        if (p.ref != XPLM_NAV_NOT_FOUND) {
+            XPLMGetNavAidInfo(p.ref, &p.type, nullptr, nullptr, nullptr, nullptr, nullptr,
+                              nullptr, nullptr, nullptr);
         }
-        pts.push_back(p);
     }
 
     // The CDU's ORIGIN/DEST airport fields are only set by *loading* a flight plan
@@ -442,7 +458,8 @@ public:
     XCopilotPanel(int l, int t, int r, int b)
         : ImgWindow(l, t, r, b, xplm_WindowDecorationRoundRectangle,
                     xplm_WindowLayerFloatingWindows) {
-        SetWindowTitle("X-COPILOT PLUGIN v" XCOPILOT_VERSION " (" XCOPILOT_BUILD ")");
+        // Keep the title clean; version + build id go to Log.txt on startup instead.
+        SetWindowTitle("X-COPILOT");
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
         ImGuiStyle& s = ImGui::GetStyle();
@@ -495,32 +512,6 @@ protected:
         } else {
             Chip("NOT CONNECTED", COL_RED);
         }
-        // Settings popup — all the runtime switches in one place, so the toolbar
-        // stays chips-only as options grow. Each checkbox drives a dataref the app
-        // polls live; changes apply on the next utterance/tick, no restart.
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Settings")) {
-            ImGui::OpenPopup("xcp_settings");
-        }
-        if (ImGui::BeginPopup("xcp_settings")) {
-            bool llm_on = (g_llm_enabled == 1);
-            if (ImGui::Checkbox("LLM fallback (answer questions)", &llm_on)) {
-                g_llm_enabled = llm_on ? 1 : 0;
-            }
-            bool snap = g_opt_camera_snap != 0;
-            if (ImGui::Checkbox("Camera snap-to-panel on actions", &snap)) {
-                g_opt_camera_snap = snap ? 1 : 0;
-            }
-            bool tone = g_opt_negative_tone != 0;
-            if (ImGui::Checkbox("Negative tone on unrecognized", &tone)) {
-                g_opt_negative_tone = tone ? 1 : 0;
-            }
-            bool mute = g_opt_monitor_mute != 0;
-            if (ImGui::Checkbox("Mute monitor callouts", &mute)) {
-                g_opt_monitor_mute = mute ? 1 : 0;
-            }
-            ImGui::EndPopup();
-        }
         // Collapse / expand to just this toolbar row, to tuck the panel away.
         ImGui::SameLine();
         if (ImGui::SmallButton(mCollapsed ? "+" : "_")) {
@@ -571,8 +562,34 @@ protected:
             ImGui::Separator();
         }
 
-        // Transmission log — recent heard/action lines with coloured tags, each
-        // stamped so a test can be reviewed afterwards.
+        // Body: tabbed. Log = the transmission record; Route = what the app pushed
+        // for the FMS; Settings = the live runtime switches. The safety-critical
+        // rows above (chips, strip, emergency buttons) stay visible on every tab.
+        if (ImGui::BeginTabBar("xcp_tabs")) {
+            // Unread dot on the Log tab while entries arrive unseen — cleared the
+            // moment the tab is shown, so it only lights up from other tabs.
+            ImGuiTabItemFlags logFlags =
+                g_log_unseen ? ImGuiTabItemFlags_UnsavedDocument : 0;
+            if (ImGui::BeginTabItem("Log", nullptr, logFlags)) {
+                g_log_unseen = false;
+                buildLogTab(connected);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Route")) {
+                buildRouteTab();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Settings")) {
+                buildSettingsTab();
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+    }
+
+    // Transmission log — recent heard/action lines with coloured tags, each
+    // stamped so a test can be reviewed afterwards.
+    void buildLogTab(bool connected) {
         const float footer = ImGui::GetFrameHeightWithSpacing();
         ImGui::BeginChild("log", ImVec2(0, -footer), true);
         for (const LogEntry& e : g_log) {
@@ -609,6 +626,83 @@ protected:
         if (ImGui::SmallButton(clearLbl)) {
             g_log.clear();
         }
+    }
+
+    // The route the app pushed (SimBrief import), visible before/after it lands
+    // in the FMS — plus a manual re-push for after an aircraft or plan reload.
+    void buildRouteTab() {
+        if (g_route_pts.empty()) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "No route loaded.");
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "Say \"load the flight plan\" to import from SimBrief.");
+            return;
+        }
+        const RoutePoint& dep = g_route_pts.front();
+        const RoutePoint& des = g_route_pts.back();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE),
+                           "%s  >  %s   (%d waypoints)", dep.ident.c_str(),
+                           des.ident.c_str(), static_cast<int>(g_route_pts.size()));
+        ImGui::SameLine();
+        // Re-push the plan into the GPS/FMS, e.g. after switching aircraft.
+        if (ImGui::SmallButton("Send to FMS")) {
+            load_fms_route();
+            AppendLog("ROGER", COL_GREEN, "Flight plan sent to the FMS.");
+        }
+        if (ImGui::BeginTable("route", 4,
+                              ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                              ImGuiTableFlags_BordersInnerV)) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 28.0f);
+            ImGui::TableSetupColumn("IDENT");
+            ImGui::TableSetupColumn("ALT", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            ImGui::TableSetupColumn("POSITION");
+            ImGui::TableHeadersRow();
+            for (size_t i = 0; i < g_route_pts.size(); ++i) {
+                const RoutePoint& p = g_route_pts[i];
+                bool endpoint = (i == 0 || i + 1 == g_route_pts.size());
+                ImU32 col = endpoint ? COL_CYAN : COL_WHITE;
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%d",
+                                   static_cast<int>(i + 1));
+                ImGui::TableNextColumn();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%s",
+                                   p.ident.empty() ? "(pos)" : p.ident.c_str());
+                ImGui::TableNextColumn();
+                if (p.alt > 0) {
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%d", p.alt);
+                }
+                ImGui::TableNextColumn();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                                   "%.4f, %.4f", p.lat, p.lon);
+            }
+            ImGui::EndTable();
+        }
+    }
+
+    // Live runtime switches. Each checkbox drives a dataref the app polls live;
+    // changes apply on the next utterance/tick, no restart.
+    void buildSettingsTab() {
+        bool llm_on = (g_llm_enabled == 1);
+        if (ImGui::Checkbox("LLM fallback (answer questions)", &llm_on)) {
+            g_llm_enabled = llm_on ? 1 : 0;
+        }
+        bool snap = g_opt_camera_snap != 0;
+        if (ImGui::Checkbox("Camera snap-to-panel on actions", &snap)) {
+            g_opt_camera_snap = snap ? 1 : 0;
+        }
+        bool tone = g_opt_negative_tone != 0;
+        if (ImGui::Checkbox("Negative tone on unrecognized", &tone)) {
+            g_opt_negative_tone = tone ? 1 : 0;
+        }
+        bool mute = g_opt_monitor_mute != 0;
+        if (ImGui::Checkbox("Mute monitor callouts", &mute)) {
+            g_opt_monitor_mute = mute ? 1 : 0;
+        }
+        ImGui::Spacing();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                           "Changes apply live; no restart needed.");
     }
 };
 
@@ -743,7 +837,8 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
 
     int sl, st, sr, sb;
     XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
-    int wl = sl + 50, wt = st - 50, wr = wl + 420, wb = wt - 300;
+    // Start well below the top edge so the panel clears the X-Plane menu bar.
+    int wl = sl + 50, wt = st - 150, wr = wl + 420, wb = wt - 300;
     g_panel = std::make_unique<XCopilotPanel>(wl, wt, wr, wb);
     // Callout toast: upper-centre, borderless, hidden until a callout arrives.
     int cw = 400, chh = 84;

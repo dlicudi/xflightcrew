@@ -1048,12 +1048,29 @@ const CMD_AT_TOGGLE: &str = "laminar/md82cmd/autopilot/autothrottle_switch";
 const CMD_EPR_CLIMB: &str = "laminar/md82cmd/autopilot/EPR_CL"; // select climb thrust rating
 const CMD_EPR_ENGAGE: &str = "laminar/md82cmd/autopilot/EPR_lim"; // engage EPR mode (clamp)
 
-pub struct SetSpeed;
+pub struct SetSpeed {
+    /// Final-approach speed from the profile's reference card (`approach_kts`),
+    /// for "set speed for landing" — `None` if the airframe doesn't declare one.
+    approach_kts: Option<f64>,
+}
+
+impl SetSpeed {
+    pub fn new(approach_kts: Option<f64>) -> Self {
+        Self { approach_kts }
+    }
+}
 
 #[derive(Deserialize)]
 struct SpeedArgs {
     /// Target indicated airspeed, knots.
-    knots: f64,
+    #[serde(default)]
+    knots: Option<f64>,
+    /// Change relative to the current bug, knots ("slow down 20" = -20).
+    #[serde(default)]
+    delta: Option<f64>,
+    /// Named target: "approach" = the profile's final-approach speed.
+    #[serde(default)]
+    preset: Option<String>,
 }
 
 #[async_trait]
@@ -1064,21 +1081,38 @@ impl Tool for SetSpeed {
     fn description(&self) -> &str {
         "Set the autopilot target airspeed (the speed bug). Use for 'set speed \
          250', 'speed 280', 'select 300 knots', 'set the bug to 240', 'airspeed \
-         250'."
+         250'. Relative: 'reduce speed by 20', 'slow down' (delta, negative = \
+         slower). 'Set speed for landing' / 'approach speed' = preset 'approach'."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "knots": {"type": "number", "description": "target IAS, knots"} },
-            "required": ["knots"]
+            "properties": {
+                "knots": {"type": "number", "description": "target IAS, knots"},
+                "delta": {"type": "number", "description": "change vs the current bug, knots (negative = slower)"},
+                "preset": {"type": "string", "enum": ["approach"], "description": "named target: the profile's final-approach speed"}
+            }
         })
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: SpeedArgs = serde_json::from_value(args.clone())?;
-        let kts = a.knots.clamp(80.0, 400.0);
+        let (kts, why) = if let Some(k) = a.knots {
+            (k, String::new())
+        } else if a.preset.as_deref() == Some("approach") {
+            match self.approach_kts {
+                Some(k) => (k, " for the approach".to_string()),
+                None => return Ok("No approach speed on file for this airframe — give me a number.".to_string()),
+            }
+        } else if let Some(d) = a.delta {
+            let current = ctx.xplane.get_float(AIRSPEED_DIAL).await?;
+            (current + d, String::new())
+        } else {
+            return Ok("Say a speed in knots, or 'speed for landing'.".to_string());
+        };
+        let kts = kts.clamp(80.0, 400.0);
         ctx.xplane.set_float(AIRSPEED_DIAL, kts).await?;
         let actual = ctx.xplane.get_float(AIRSPEED_DIAL).await.unwrap_or(kts);
-        Ok(format!("Speed bug {actual:.0} knots."))
+        Ok(format!("Speed bug {actual:.0} knots{why}."))
     }
 }
 

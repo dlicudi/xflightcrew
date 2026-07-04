@@ -8,9 +8,11 @@
 //! VAD-segmented) or `ptt` (push-to-talk).
 
 mod aircraft;
+mod approach_guide;
 mod audio;
 mod autoland;
 mod blackbox;
+mod debrief;
 mod rag;
 mod checklist;
 mod config;
@@ -55,6 +57,17 @@ use xplane::XPlaneClient;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     use tracing_subscriber::prelude::*;
+    // `--distill`: one-shot — distill the black box into memory and exit.
+    // The in-session debrief only fires on the airborne→parked edge, so a
+    // flight that ended before a restart (or a crash of the app) needs this
+    // to make it into memory.
+    if std::env::args().any(|a| a == "--distill") {
+        match debrief::remember(std::path::Path::new("logs/blackbox.jsonl"), &debrief::memory_dir()) {
+            Some(s) => println!("{}", s.spoken()),
+            None => println!("No completed flight in the black box."),
+        }
+        return Ok(());
+    }
     let config = Config::from_env()?;
     let tui = config.ui == "tui";
 
@@ -551,6 +564,17 @@ impl Ptt {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Should this call run the step-by-step power-up procedure instead of
+/// set_electrical's one-shot "all"? Only whole-system *on* qualifies: a missing
+/// "on" (LLM sometimes omits it for "power up") counts as on, but an explicit
+/// off must stay set_electrical — remapping it once turned "electrics off" into
+/// powering the aircraft back up.
+fn wants_procedural_power_up(name: &str, args: &serde_json::Value) -> bool {
+    name == "set_electrical"
+        && args.get("system").and_then(|s| s.as_str()) == Some("all")
+        && args.get("on").and_then(|v| v.as_bool()) != Some(false)
+}
+
 async fn run_session(
     config: Config,
     mut stt: Stt,
@@ -829,6 +853,13 @@ async fn run_session(
         if is_fuel_query(&command)
             && grammar::try_parse(&command, &registry, &profile).is_none()
         {
+            // The landing-fuel projection needs the destination, which is only
+            // populated by a plan fetch — after a restart it's empty until
+            // something asks. Prime it (cached, cheap) so "will we have enough
+            // fuel" projects instead of just reading the tanks.
+            if !config.simbrief_id.trim().is_empty() {
+                let _ = ensure_plan(&config, &mut fp_cache, false).await;
+            }
             let line = fuel_report(&xplane, &profile, Some(&live), is_endurance_query(&command)).await;
             say(&voice, &reporter, ui::LogKind::Readback, &line);
             continue;
@@ -838,6 +869,38 @@ async fn run_session(
         // routed here, not behind the question gate.
         {
             let tl = command.to_ascii_lowercase();
+            // FIRST, before anything else: while the copilot holds a control
+            // authority (speed/taxi hold, mixture manager), any release-shaped
+            // utterance lets go — even a garbled one. Whisper mangled "my
+            // throttle" seven ways in a row live while the governor kept
+            // taxiing; when we hold something, ambiguity resolves toward
+            // giving it back. Naming a lever releases just that one; a generic
+            // "my controls" / "let go" releases everything held.
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                let speed_held = tools::speedhold::ACTIVE.load(Relaxed);
+                let mix_held = tools::engine::MIX_MANAGED.load(Relaxed);
+                if (speed_held || mix_held) && release_intent(&tl) {
+                    let names_mix = tl.contains("mixture") || tl.contains("mix");
+                    let names_speed = tl.contains("throttle") || tl.contains("speed")
+                        || tl.contains("power") || tl.contains("taxi") || tl.contains("thr");
+                    let generic = !names_mix && !names_speed;
+                    let mut released: Vec<&str> = Vec::new();
+                    if speed_held && (names_speed || generic) {
+                        tools::speedhold::ACTIVE.store(false, Relaxed);
+                        released.push("speed hold off, your throttle");
+                    }
+                    if mix_held && (names_mix || generic) {
+                        tools::engine::MIX_MANAGED.store(false, Relaxed);
+                        released.push("mixture's yours");
+                    }
+                    if !released.is_empty() {
+                        let line = format!("Copy — {}.", released.join("; "));
+                        say(&voice, &reporter, ui::LogKind::Readback, &line);
+                        continue;
+                    }
+                }
+            }
             // Reminder memory: cancel or list what's armed ("cancel the reminders",
             // "do we have a reminder set?"). Checked before set_reminder so "cancel"
             // wins over arming.
@@ -876,8 +939,23 @@ async fn run_session(
             }
             if tl.contains("all systems") || tl.contains("systems check") || tl.contains("safe parameter")
                 || tl.contains("in the green") || tl.contains("status check")
+                // "Anything to check?" / "anything I should check?" — a systems
+                // check by intent; went completely unanswered live (no matcher,
+                // and the continuous-mode gate drops non-matches silently).
+                || (tl.contains("anything") && tl.contains("check"))
+                // "aircraft health check" / "check the aircraft" — same intent;
+                // two phrasings went silent live before a third one landed.
+                || (tl.contains("check") && (tl.contains("aircraft") || tl.contains("health")))
             {
-                let line = systems_check(&xplane).await;
+                let line = systems_check(&xplane, &profile).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
+            // Power-loss diagnosis ("why have we lost power?", "the engine quit") —
+            // went unrecognized live. Phrased as a question, but what it wants is
+            // the engine's fuel/ignition chain read and the culprit named.
+            if is_power_loss_query(&tl) {
+                let line = power_loss_diagnosis(&xplane, &profile).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
@@ -921,6 +999,77 @@ async fn run_session(
                     || tl.contains("how long") || tl.contains("estimat") || tl.contains("remaining"))
             {
                 let line = eta_to_destination(&config, &xplane, &mut fp_cache).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
+            // Destination field elevation — from the plan's destination record,
+            // never the LLM (which answered "9999 feet": our own cruise altitude).
+            if !is_reminder
+                && (tl.contains("destination") || tl.contains("arrival"))
+                && (tl.contains("altitude") || tl.contains("elevation") || tl.contains("height")
+                    || tl.contains("how high"))
+            {
+                if !config.simbrief_id.trim().is_empty() {
+                    let _ = ensure_plan(&config, &mut fp_cache, false).await;
+                }
+                let dest = monitor::DESTINATION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let line = match dest {
+                    Some(d) => format!(
+                        "Field elevation at the destination is about {:.0} feet.",
+                        (d.elev_ft / 50.0).round() * 50.0
+                    ),
+                    None => "No destination on file — load the flight plan first.".to_string(),
+                };
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
+            // Runway choice — answered from apt.dat + the wind, never the LLM
+            // (which once invented "runway 18" at a field that only has 10/28).
+            if !is_reminder
+                && tl.contains("runway")
+                && (tl.contains("which") || tl.contains("what") || tl.contains("should")
+                    || tl.contains("use") || tl.contains("best") || tl.contains("active")
+                    || tl.contains("recommend"))
+            {
+                reporter.status(ui::Phase::Thinking);
+                let line = runway_advice(&config, &xplane, &mut fp_cache).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
+            // "Are we good for landing?" — the landing-config check. Phrased as a
+            // question so "set flaps for landing" (a command) never lands here.
+            if !is_reminder
+                && (tl.contains("good for landing") || tl.contains("ready for landing")
+                    || tl.contains("ready to land") || tl.contains("good to land")
+                    || (tl.contains("landing") && tl.contains("are we")))
+            {
+                let line = landing_readiness(&xplane, &profile).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
+            // "Do we need any lights on?" / "are we configured?" — the SOP table
+            // answers. Guarded so light *commands* ("nav lights on") never match.
+            if !is_reminder
+                && (tl.contains("light") || tl.contains("configur"))
+                && (tl.contains("need") || tl.contains("should") || tl.contains("do we")
+                    || tl.contains("are we") || tl.contains("anything"))
+            {
+                let line = config_advice(&xplane, &profile).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
+            // "Any traffic around?" — the TCAS scan, spoken as clock positions.
+            if !is_reminder && tl.contains("traffic") {
+                let line = traffic_report(&xplane).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
+            // "Are we on course / on track?" — HSI deviation + waypoint, computed
+            // (the LLM once answered this with the single word "heading").
+            if !is_reminder
+                && (tl.contains("on course") || tl.contains("off course") || tl.contains("on track"))
+            {
+                let line = on_course_report(&xplane, Some(&live)).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
@@ -1096,9 +1245,10 @@ async fn run_session(
             // On aircraft with a procedural power-up, "all electrical on" must run the
             // step-by-step procedure, not set_electrical's one-shot "all" (which would
             // skip the APU start and the callouts). Remap it here so it's caught
-            // whether grammar or the LLM produced it.
-            if call.name == "set_electrical"
-                && call.arguments.get("system").and_then(|s| s.as_str()) == Some("all")
+            // whether grammar or the LLM produced it. Only the *on* direction: "electrics
+            // off" must stay set_electrical (the remap once turned it into power_up,
+            // powering the aircraft back up on a shutdown request).
+            if wants_procedural_power_up(&call.name, &call.arguments)
                 && registry.get("power_up").is_some()
             {
                 call.name = "power_up".to_string();
@@ -1421,7 +1571,7 @@ async fn run_checklist(
                         }
                     }
                 }
-                if checklist::run_step(tool, args, &cl.lights, &cl.flaps, &cl.electrical, &cl.fuel_selector, cl.engines, cl.magnetos_per_engine, cl.park_brake_valve_set, &ctx).await.is_ok() {
+                if checklist::run_step(tool, args, &cl.lights, &cl.flaps, &cl.electrical, &cl.fuel_selector, cl.engines, cl.magnetos_per_engine, cl.park_brake_valve_set, cl.pitot_heat_dataref.clone(), &ctx).await.is_ok() {
                     say(voice, reporter, ui::LogKind::Readback, line);
                 } else {
                     say(voice, reporter, ui::LogKind::Warn, &format!("{line} Didn't take — check it."));
@@ -1608,6 +1758,7 @@ fn icao_to_profile(icao: &str) -> String {
         "MD82" | "MD80" | "MD83" | "MD88" => "md82",
         "DC3" | "DC30" => "dc3",
         "BE9L" | "BE9T" | "C90" | "C90B" => "king_air_c90b",
+        "EVOT" | "EVOP" => "lancair_evolution",
         _ => "cessna_172sp",
     }
     .to_string()
@@ -1771,8 +1922,10 @@ fn conversational(t: &str, registry: &Registry) -> Option<String> {
         });
     }
     // "what can you do" / "help" / "what can I ask" → list live capabilities.
+    // Bare "help me" only: "help me land on runway 28" is a request for that
+    // specific help (the talk-down), not a menu (it got the menu, live).
     if t.contains("what can you do") || t.contains("what can i") || t.contains("what do you do")
-        || t.contains("what are you able") || t.contains("help me") || t == "help"
+        || t.contains("what are you able") || t == "help me" || t == "help"
         || t.contains("capabilities") || t.contains("what commands")
     {
         let mut caps: Vec<&str> = Vec::new();
@@ -1930,6 +2083,226 @@ const MS_TO_KTS: f64 = 1.943_844;
 /// The active GPS waypoint with distance and time/ETA to it — answers "ETA",
 /// "distance/time to next waypoint", "how far". Often phrased as a command, not a
 /// question, so it's dispatched unconditionally rather than via answer_state_query.
+/// "Are we good for landing?" — the landing-configuration check, concluded:
+/// gear (where it retracts), flap state, speed against the approach reference,
+/// and the landing-phase SOP rows (landing light). Went to "No reading for
+/// that" live; this is the one question a copilot must answer well.
+async fn landing_readiness(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> String {
+    let airborne = xp
+        .get_float("sim/flightmodel/failures/onground_any")
+        .await
+        .map(|v| v < 0.5)
+        .unwrap_or(true);
+    if !airborne {
+        return "We're already on the ground.".to_string();
+    }
+    let mut issues: Vec<String> = Vec::new();
+    let mut goods: Vec<String> = Vec::new();
+    if profile.retractable_gear {
+        let down = xp
+            .get_float("sim/cockpit/switches/gear_handle_status")
+            .await
+            .map(|v| v > 0.5)
+            .unwrap_or(false);
+        if down {
+            goods.push("gear's down".to_string());
+        } else {
+            issues.push("gear's still up".to_string());
+        }
+    }
+    if let Some(flaps) = &profile.flaps {
+        let ratio = xp
+            .get_float("sim/cockpit2/controls/flap_handle_deploy_ratio")
+            .await
+            .unwrap_or(0.0);
+        let nearest = flaps
+            .detents
+            .iter()
+            .min_by(|a, b| (a.ratio - ratio).abs().total_cmp(&(b.ratio - ratio).abs()));
+        if let Some(d) = nearest {
+            if d.ratio < 0.01 {
+                issues.push("no flap yet".to_string());
+            } else {
+                goods.push(format!("flaps {}", d.spoken));
+            }
+        }
+    }
+    let ias = xp
+        .get_float("sim/cockpit2/gauges/indicators/airspeed_kts_pilot")
+        .await
+        .unwrap_or(0.0);
+    if let Some(app) = profile.reference.as_ref().and_then(|r| r.approach_kts) {
+        if ias > app + 15.0 {
+            issues.push(format!("{ias:.0} knots is fast against the {app:.0} reference"));
+        } else {
+            goods.push(format!("{ias:.0} knots against a {app:.0} reference"));
+        }
+    } else {
+        goods.push(format!("{ias:.0} knots", ));
+    }
+    // Landing-phase SOP rows (landing light and friends).
+    for item in &profile.advisor {
+        if !item.phases.iter().any(|p| p == "landing") {
+            continue;
+        }
+        let Ok(v) = xp.get_float(&item.dataref).await else { continue };
+        if (v > 0.5) != item.expect_on {
+            issues.push(item.say.trim_end_matches('.').to_lowercase());
+        }
+    }
+    if issues.is_empty() {
+        format!("You're set: {}. Fly it in.", goods.join(", "))
+    } else {
+        let good_tail = if goods.is_empty() {
+            String::new()
+        } else {
+            format!(" Rest is good: {}.", goods.join(", "))
+        };
+        format!("Not yet — {}.{good_tail}", issues.join("; "))
+    }
+}
+
+/// "Do we need any lights on?" / "are we configured right?" — the profile's SOP
+/// advisor table crossed with the live switches, spoken as a conclusion. Went to
+/// "No reading for that" live: the table knew the answer, nothing asked it.
+async fn config_advice(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> String {
+    if profile.advisor.is_empty() {
+        return "No configuration table for this airframe yet.".to_string();
+    }
+    let airborne = xp
+        .get_float("sim/flightmodel/failures/onground_any")
+        .await
+        .map(|v| v < 0.5)
+        .unwrap_or(false);
+    let phase = if airborne { "cruise" } else { "ground" };
+    let mut wrong: Vec<String> = Vec::new();
+    let mut arrival_items = false;
+    for item in &profile.advisor {
+        let Ok(v) = xp.get_float(&item.dataref).await else { continue };
+        let satisfied = (v > 0.5) == item.expect_on;
+        if item.phases.iter().any(|p| p == phase) {
+            if !satisfied {
+                wrong.push(item.say.trim_end_matches('.').to_string());
+            }
+        } else if airborne
+            && !satisfied
+            && item.phases.iter().any(|p| p == "approach" || p == "landing")
+        {
+            arrival_items = true;
+        }
+    }
+    if wrong.is_empty() {
+        let tail = if arrival_items {
+            " One or two come back on for the arrival — I'll speak up."
+        } else {
+            ""
+        };
+        format!("You're set for {phase}; nothing needed right now.{tail}")
+    } else {
+        format!("Couple of things: {}.", wrong.join("; "))
+    }
+}
+
+/// "Any traffic around?" — the nearest TCAS targets as clock-position callouts
+/// ("11 o'clock, 3 miles, 500 feet above"), from the sim's TCAS arrays. Went
+/// unanswered live ("No reading for that"); a copilot's traffic scan is exactly
+/// the kind of question that must never be guessed.
+async fn traffic_report(xp: &XPlaneClient) -> String {
+    let (bear, dist, alt) = (
+        xp.get_float_array("sim/cockpit2/tcas/indicators/relative_bearing_degs").await,
+        xp.get_float_array("sim/cockpit2/tcas/indicators/relative_distance_mtrs").await,
+        xp.get_float_array("sim/cockpit2/tcas/indicators/relative_altitude_mtrs").await,
+    );
+    let (Ok(bear), Ok(dist), Ok(alt)) = (bear, dist, alt) else {
+        return "No traffic picture available.".to_string();
+    };
+    // Slot 0 is own ship; live targets have a real distance.
+    let all: Vec<(f64, f64, f64)> = dist
+        .iter()
+        .zip(&bear)
+        .zip(&alt)
+        .skip(1)
+        .filter(|((d, _), _)| **d > 1.0)
+        .map(|((d, b), a)| (*d, *b, *a))
+        .collect();
+    if all.is_empty() {
+        return "No traffic on the scope.".to_string();
+    }
+    // A copilot's scan reports *factors* — inside ~15 nm and ±3,000 ft — not the
+    // whole online-traffic feed (an airliner 24,000 ft overhead is scenery, and
+    // the first live scan recited three of them plus "60 more further out").
+    let mut targets: Vec<(f64, f64, f64)> = all
+        .iter()
+        .copied()
+        .filter(|(d, _, a)| *d < 15.0 * 1852.0 && a.abs() < 3000.0 / 3.28084)
+        .collect();
+    if targets.is_empty() {
+        let nearest = all.iter().min_by(|a, b| a.0.total_cmp(&b.0)).expect("non-empty");
+        return format!(
+            "No factor traffic. Nearest is {:.0} miles out, {:.0} feet {}.",
+            nearest.0 / 1852.0,
+            ((nearest.2 * 3.28084).abs() / 100.0).round() * 100.0,
+            if nearest.2 > 0.0 { "above" } else { "below" }
+        );
+    }
+    targets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let calls: Vec<String> = targets
+        .iter()
+        .take(3)
+        .map(|(d, b, a)| {
+            let nm = d / 1852.0;
+            let range = if nm < 1.0 { "under a mile".to_string() } else { format!("{nm:.0} miles") };
+            let clock = match (((b + 15.0).rem_euclid(360.0)) / 30.0) as i32 {
+                0 => 12,
+                c => c,
+            };
+            let ft = ((a * 3.28084) / 100.0).round() * 100.0;
+            let vert = if ft.abs() < 300.0 {
+                "same altitude".to_string()
+            } else if ft > 0.0 {
+                format!("{ft:.0} feet above")
+            } else {
+                format!("{:.0} feet below", ft.abs())
+            };
+            format!("{clock} oclock, {range}, {vert}")
+        })
+        .collect();
+    let more = targets.len().saturating_sub(3);
+    let tail = if more > 0 { format!(", and {more} more further out") } else { String::new() };
+    let noun = if targets.len() == 1 { "One target" } else { "Traffic" };
+    format!("{noun}: {}{tail}.", calls.join("; "))
+}
+
+/// "Are we on course?" — answered from the HSI course deviation plus the active
+/// waypoint, never the LLM (which once replied with the bare word "heading").
+/// Positive hdef = the course is to our right, i.e. we're left of it.
+async fn on_course_report(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
+    // Parked, the question has no meaning — and the naive answer was nonsense
+    // ("On course. 0 miles, 0 minutes." spoken live on the ramp).
+    let on_ground =
+        xp.get_float("sim/flightmodel/failures/onground_any").await.unwrap_or(0.0) > 0.5;
+    let gs = xp.get_float("sim/flightmodel/position/groundspeed").await.unwrap_or(0.0);
+    if on_ground && gs < 15.0 {
+        return "We're on the ground — course comes alive once we're flying the route.".to_string();
+    }
+    let progress = nav_progress(xp, live).await;
+    if progress.starts_with("No active GPS waypoint") {
+        return progress;
+    }
+    let dots = read1(live, xp, "sim/cockpit2/radios/indicators/hsi_hdef_dots_pilot").await.ok();
+    let verdict = match dots {
+        Some(d) if d.abs() <= 0.5 => "On course.".to_string(),
+        Some(d) => format!(
+            "{:.1} dots {} of course, correct {}.",
+            d.abs(),
+            if d > 0.0 { "left" } else { "right" },
+            if d > 0.0 { "right" } else { "left" },
+        ),
+        None => String::new(),
+    };
+    format!("{verdict} {progress}").trim().to_string()
+}
+
 async fn nav_progress(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
     let wp = xp.get_string("sim/cockpit2/radios/indicators/gps_nav_id").await.unwrap_or_default();
     let dist = read1(live, xp, "sim/cockpit2/radios/indicators/gps_dme_distance_nm").await.ok();
@@ -2068,6 +2441,79 @@ async fn eta_to_destination(
     format!("About {eta} to {dest_name}, {dist:.0} miles out at {gs_kts:.0} knots.")
 }
 
+/// Release-shaped speech: does this utterance plausibly mean "give me back the
+/// controls"? Deliberately generous — it is ONLY consulted while the copilot
+/// actually holds a control authority (speed hold etc.), where the cost of a
+/// false release is a lever going still and the cost of a missed release is a
+/// pilot fighting their own copilot. Seen live: "my throttle" came through as
+/// "my thruffles", "mic control", "my throat", "my problem" — seven phrasings
+/// in a row missed while the governor kept taxiing.
+fn release_intent(t: &str) -> bool {
+    const CUES: &[&str] = &[
+        "release", "let go", "let me go", "stop touching", "stop holding",
+        "stop taxi", "hands off", "leave the throttle", "leave it",
+        "give me command", "give me control", "give me the",
+        "my controls", "my control", "mic control", "my throttle", "my thr",
+        "my power", "my aircraft", "my plane", "my airplane", "my mixture", "my mix",
+        "i have control", "i have the", "im taking", "i am taking", "taking control",
+    ];
+    CUES.iter().any(|c| t.contains(c))
+}
+
+/// Which runway to use: the field's *actual* runways (apt.dat) crossed with the
+/// live wind — deterministic, so it can only name a runway that exists. On the
+/// ground it's the departure field, airborne it's the destination (using local
+/// wind as the approximation). Replaces the LLM answering this from wind alone,
+/// which once produced "runway 18" at a field that only has 10 and 28.
+async fn runway_advice(
+    config: &Config,
+    xp: &XPlaneClient,
+    cache: &mut Option<(Instant, simbrief::FlightPlan)>,
+) -> String {
+    if let Err(msg) = ensure_plan(config, cache, false).await {
+        return msg;
+    }
+    let Some((_, fp)) = cache.as_ref() else {
+        return "Couldn't fetch your SimBrief plan.".to_string();
+    };
+    let on_ground =
+        xp.get_float("sim/flightmodel/failures/onground_any").await.unwrap_or(1.0) > 0.5;
+    let icao = if on_ground { fp.origin.clone() } else { fp.destination.clone() };
+    // apt.dat is a ~400 MB streaming scan — off the async thread it goes.
+    let (path, icao2) = (config.apt_data_path.clone(), icao.clone());
+    let runways = tokio::task::spawn_blocking(move || nav::find_runways(&path, &icao2))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
+    if runways.is_empty() {
+        return format!("I don't have runway data for {icao}.");
+    }
+    let all: Vec<&str> = runways
+        .iter()
+        .flat_map(|r| [r.ident_a.as_str(), r.ident_b.as_str()])
+        .collect();
+    let wind_dir = xp.get_float(datarefs::WIND_DIR_DEG_TRUE).await.unwrap_or(0.0);
+    let wind_kts =
+        xp.get_float(datarefs::WIND_SPEED_MSC).await.unwrap_or(0.0) * MS_TO_KTS;
+    if wind_kts < 3.0 {
+        return format!("Wind's calm. Any runway works; {icao} has {}.", all.join(" and "));
+    }
+    let Some((ident, _, headwind)) = nav::best_runway_for_wind(&runways, wind_dir, wind_kts)
+    else {
+        return format!("I don't have runway data for {icao}.");
+    };
+    let component = if headwind >= 0.0 {
+        format!("{headwind:.0} knots of headwind")
+    } else {
+        format!("mind the {:.0} knots of tailwind", headwind.abs())
+    };
+    format!(
+        "Wind's {wind_dir:.0} at {wind_kts:.0}. Runway {ident}, {component}. {icao} has {}.",
+        all.join(" and ")
+    )
+}
+
 /// First element of a per-engine array dataref (engine 1), or `None` on a failed
 /// read. Engine indicators are arrays, so they bypass the scalar `read1`/cache.
 async fn read_engine0(xp: &XPlaneClient, name: &str) -> Option<f64> {
@@ -2079,7 +2525,7 @@ async fn read_engine0(xp: &XPlaneClient, name: &str) -> Option<f64> {
 /// the monitor uses, instead of reciting static POH numbers. (oil temp / CHT
 /// datarefs read °F despite their names.) The deterministic answer to "check all
 /// systems".
-async fn systems_check(xp: &XPlaneClient) -> String {
+async fn systems_check(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> String {
     let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running").await.is_some_and(|v| v > 0.5);
     if !running {
         return "Engine's not running, nothing to check.".to_string();
@@ -2087,26 +2533,160 @@ async fn systems_check(xp: &XPlaneClient) -> String {
     let mut ok: Vec<String> = Vec::new();
     let mut flags: Vec<String> = Vec::new();
     if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_pressure_psi").await {
-        if (20.0..=105.0).contains(&v) { ok.push(format!("oil pressure {v:.0}")); }
+        // Judge against the sim's own gauge red-lines, not a fixed piston band:
+        // the modeled PT6 sits ~127 PSI in normal cruise, which the old 20..=105
+        // flagged all flight (seen live on the Evolution). Fall back to the
+        // piston band when the .acf carries no sensible arc.
+        let (lo, hi) = match (
+            xp.get_float("sim/aircraft/limits/red_lo_oilP").await,
+            xp.get_float("sim/aircraft/limits/red_hi_oilP").await,
+        ) {
+            (Ok(lo), Ok(hi)) if hi > lo && hi > 0.0 => (lo, hi),
+            _ => (20.0, 105.0),
+        };
+        if (lo..=hi).contains(&v) { ok.push(format!("oil pressure {v:.0}")); }
         else { flags.push(format!("oil pressure {v:.0} pounds")); }
     }
     if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_temperature_deg_C").await {
         if v < 240.0 { ok.push(format!("oil temp {v:.0}")); } else { flags.push(format!("oil temp {v:.0} degrees")); }
     }
-    if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/CHT_deg_C").await {
-        if v < 450.0 { ok.push(format!("C H T {v:.0}")); } else { flags.push(format!("C H T {v:.0} degrees")); }
+    // CHT is a piston reading; a turbine profile (no piston `engine` group) has
+    // no cylinders to report.
+    if profile.engine {
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/CHT_deg_C").await {
+            if v < 450.0 { ok.push(format!("C H T {v:.0}")); } else { flags.push(format!("C H T {v:.0} degrees")); }
+        }
     }
-    if let Ok(v) = xp.get_float("sim/cockpit/misc/vacuum").await {
-        if v >= 4.0 { ok.push(format!("vacuum {v:.1}")); } else { flags.push(format!("low vacuum {v:.1}")); }
+    // Suction only matters where a vacuum gyro exists — a glass/turbine panel
+    // (Evolution, SR22) has none, and the stale reading spoke "low vacuum 3.8"
+    // on every check (seen live).
+    if profile.directional_gyro {
+        if let Ok(v) = xp.get_float("sim/cockpit/misc/vacuum").await {
+            if v >= 4.0 { ok.push(format!("vacuum {v:.1}")); } else { flags.push(format!("low vacuum {v:.1}")); }
+        }
     }
     if let Some(v) = read_engine0(xp, "sim/cockpit2/electrical/battery_amps").await {
         if v >= -5.0 { ok.push("charging".to_string()); } else { flags.push(format!("battery discharging {:.0} amps", v.abs())); }
     }
     if flags.is_empty() {
-        format!("All systems in the green. {}.", ok.join(", "))
+        // Verdict first, gauge recital never: a crew member concludes ("all in
+        // the green") and keeps the numbers in reserve — each one is a "say the
+        // oil pressure" away. Rotating openers so the answer doesn't sound like
+        // the same recording every time.
+        const VERDICTS: &[&str] = &[
+            "Checked it over: everything's in the green.",
+            "All in the green, engine's happy.",
+            "Looks good up here, nothing out of place.",
+        ];
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let i = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % VERDICTS.len();
+        let charging = ok.iter().any(|s| s == "charging");
+        format!(
+            "{}{}",
+            VERDICTS[i],
+            if charging { " Battery's charging fine." } else { "" }
+        )
     } else {
-        format!("Heads up, {}. Otherwise {}.", flags.join(", "), ok.join(", "))
+        // Something's off: the flags get the airtime, the rest gets one word.
+        format!("Mostly green, but watch this: {}. Everything else is normal.", flags.join(", "))
     }
+}
+
+/// True for "why have we lost power?" / "the engine quit" phrasings — a
+/// diagnosis request, not a throttle command. Adjacent "lost power" wording (not
+/// bare "power" + "lost") so "reduce power, we lost too much altitude" still
+/// commands; engine fail-words are past-tense so "stop the engine" still
+/// commands too.
+fn is_power_loss_query(t: &str) -> bool {
+    t.contains("lost power") || t.contains("losing power") || t.contains("lose power")
+        || t.contains("power loss") || t.contains("loss of power")
+        || (t.contains("engine")
+            && (t.contains("quit") || t.contains("stopped") || t.contains("died")
+                || t.contains("dead") || t.contains("failed") || t.contains("failure")
+                || t.contains("cut out") || t.contains("cutting out")
+                || (t.contains("why") && (t.contains("lost") || t.contains("lose")))))
+}
+
+/// Deterministic power-loss diagnosis ("why have we lost power?") — walk the
+/// engine's fuel and ignition chain and name the likely culprit, most common
+/// first, with the remedy in the same breath (the pilot asking this is about to
+/// be busy). Same trust model as `systems_check`: read the datarefs, never the
+/// LLM.
+async fn power_loss_diagnosis(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> String {
+    let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running").await.is_some_and(|v| v > 0.5);
+    let piston = profile.turboprop_start.is_none() && !profile.turbine_start;
+    let mut causes: Vec<String> = Vec::new();
+
+    // Fuel chain, most likely first. Selector OFF starves the engine within a
+    // minute (and an xlua plugin reload can snap it there behind your back).
+    let selector = xp.get_float("sim/cockpit2/fuel/fuel_tank_selector").await.ok();
+    if profile.fuel_selector.is_some() && selector.is_some_and(|s| s < 0.5) {
+        causes.push("the fuel selector is off, select a tank now".to_string());
+    }
+    let tanks = xp.get_float_array(datarefs::FUEL_PER_TANK_KG).await.unwrap_or_default();
+    let total_kg: f64 = tanks.iter().sum();
+    if !tanks.is_empty() && total_kg < 2.0 {
+        causes.push("the tanks are dry, we're out of fuel".to_string());
+    } else if tanks.len() == 2 {
+        // Feeding from a dry side while the other wing still has fuel
+        // (sim selector positions: 1 = left, 3 = right).
+        match selector.map(|s| s.round() as i64) {
+            Some(1) if tanks[0] < 1.0 && tanks[1] > 2.0 => {
+                causes.push("the left tank is dry, switch to the right".to_string());
+            }
+            Some(3) if tanks[1] < 1.0 && tanks[0] > 2.0 => {
+                causes.push("the right tank is dry, switch to the left".to_string());
+            }
+            _ => {}
+        }
+    }
+    if piston {
+        if read_engine0(xp, "sim/cockpit2/engine/actuators/mixture_ratio").await.is_some_and(|m| m < 0.15) {
+            causes.push("the mixture is at cutoff, push it rich".to_string());
+        }
+        if read_engine0(xp, "sim/cockpit2/engine/actuators/ignition_key").await.is_some_and(|k| k < 0.5) {
+            causes.push("the ignition is off, mags to both".to_string());
+        }
+    }
+    // Fuel not reaching the engine with everything above in order.
+    let flow_kg_s = xp
+        .get_float_array(datarefs::FUEL_FLOW_KG_SEC)
+        .await
+        .map(|f| f.iter().sum::<f64>())
+        .unwrap_or(0.0);
+    if causes.is_empty() && !running && flow_kg_s < 1e-5 && total_kg > 2.0 {
+        causes.push(
+            "no fuel flow with fuel on board, check the boost pump and fuel pressure".to_string(),
+        );
+    }
+    let throttle =
+        read_engine0(xp, "sim/cockpit2/engine/actuators/throttle_ratio").await.unwrap_or(0.0);
+    if running && causes.is_empty() && throttle < 0.05 {
+        causes.push("the throttle is closed".to_string());
+    }
+
+    if !causes.is_empty() {
+        let state = if running { "Engine's still turning" } else { "Engine's stopped" };
+        return format!("{state}. Likely cause: {}.", causes.join("; also "));
+    }
+    // Nothing conclusive: give the raw picture so the pilot can work the problem.
+    let rpm = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm").await.unwrap_or(0.0);
+    let gph = flow_kg_s * 3600.0 / AVGAS_KG_PER_GAL;
+    let mut line = if running {
+        format!(
+            "Nothing obviously wrong. Engine's running at {rpm:.0} RPM, fuel flow {gph:.0} gallons an hour, throttle {:.0} percent",
+            throttle * 100.0
+        )
+    } else {
+        format!(
+            "Engine's stopped and the fuel and ignition look set. Fuel flow {gph:.1}, throttle {:.0} percent",
+            throttle * 100.0
+        )
+    };
+    if profile.carb_heat {
+        line.push_str(". Could be carburettor ice, try carb heat");
+    }
+    format!("{line}.")
 }
 
 /// How long a fetched SimBrief plan is reused before re-fetching (it doesn't
@@ -2133,6 +2713,56 @@ async fn ensure_plan(
                     return Err("Couldn't fetch your SimBrief plan. Generate one first, or check the ID.".to_string());
                 }
             }
+        }
+    }
+    // Every path that yields a plan also hands the monitor's descent advisor
+    // its destination — the copilot volunteers TOD instead of waiting to be
+    // asked ("when is TOD" still works via time_to_tod).
+    if let Some((_, fp)) = cache.as_ref() {
+        if let Some(w) = fp.waypoints.last() {
+            let ring = if fp.tod_to_dest_nm > 0.0 {
+                fp.tod_to_dest_nm
+            } else {
+                fp.cruise_alt_ft / 1000.0 * TOD_NM_PER_1000FT
+            };
+            // Field elevation comes from apt.dat, the authoritative source — the
+            // plan's destination-waypoint altitude is a *crossing* altitude
+            // (spoken live as "4600 feet" for a 2,084 ft field, and it skews the
+            // descent advisor's profile math too). Cached per ICAO: the scan of
+            // the 400 MB file runs once per destination, not per TTL refresh.
+            static ELEV_CACHE: std::sync::Mutex<Option<(String, f64)>> =
+                std::sync::Mutex::new(None);
+            let cached = ELEV_CACHE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .filter(|(icao, _)| *icao == fp.destination);
+            let elev_ft = match cached {
+                Some((_, e)) => e,
+                None => {
+                    let (path, icao) = (config.apt_data_path.clone(), fp.destination.clone());
+                    let scanned = tokio::task::spawn_blocking(move || nav::find_airport(&path, &icao))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .flatten()
+                        .map(|a| a.elev_ft);
+                    // Fallback: the waypoint altitude when plausible, else sea
+                    // level (which only makes TOD earlier — the safe direction).
+                    let e = scanned
+                        .unwrap_or(if (0.0..12_000.0).contains(&w.alt) { w.alt } else { 0.0 });
+                    *ELEV_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((fp.destination.clone(), e));
+                    e
+                }
+            };
+            *monitor::DESTINATION.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(monitor::Destination {
+                    lat: w.lat,
+                    lon: w.lon,
+                    elev_ft,
+                    tod_ring_nm: ring,
+                });
         }
     }
     Ok(())
@@ -2475,15 +3105,18 @@ fn is_fuel_query(text: &str) -> bool {
         || t.contains("refuel")
         || t.contains("top off")
         || t.contains("fill")
-        // Tank-SELECTOR commands ("switch tanks", "set fuel tank to left") — these
-        // hijacked the quantity report (seen live). A tank mention with an action
-        // verb or an explicit "to <side>" is a command; "how much fuel in the left
-        // tank" has neither and stays a query.
+        // Tank-SELECTOR commands ("switch tanks", "switch fuel to right", "set
+        // fuel to left") — these hijacked the quantity report (seen live, with and
+        // without "tank" said). A swap verb or an explicit "to <side>" is a
+        // command; "how much fuel in the left tank" has neither and stays a query.
+        // "select"/"set"/"feed" alone stay tank-gated so phrasings like "what's
+        // the fuel setting" keep reading as questions.
+        || t.contains("switch") || t.contains("swap") || t.contains("alternate")
+        || t.contains("rotate")
+        || t.contains("to left") || t.contains("to right") || t.contains("to off")
         || (t.contains("tank")
-            && (t.contains("switch") || t.contains("swap") || t.contains("change")
-                || t.contains("alternate") || t.contains("rotate") || t.contains("select")
-                || t.contains("set") || t.contains("feed")
-                || t.contains("to left") || t.contains("to right") || t.contains("to off")));
+            && (t.contains("change") || t.contains("select") || t.contains("set")
+                || t.contains("feed")));
     // "fuel flow" is an engine-instrument read, answered in answer_state_query.
     asks && !command && !t.contains("flow")
 }
@@ -2564,6 +3197,45 @@ async fn fuel_report(
             line.push_str(&format!(". Left {l:.0}, right {r:.0}"));
             if (l - r).abs() >= 5.0 {
                 line.push_str(if l > r { " — favor the right" } else { " — favor the left" });
+            }
+        }
+    }
+    // The answer a copilot actually gives is not "what's in the tanks" but
+    // "what's left when we get there": project to the planned destination at the
+    // live burn and judge it against the airframe's reserve. Airborne with a
+    // known destination and real groundspeed only.
+    let dest = monitor::DESTINATION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(d) = dest {
+        if live_burn_kg_hr > 1.0 {
+            let (lat, lon, gs_ms) = (
+                xp.get_float("sim/flightmodel/position/latitude").await.unwrap_or(0.0),
+                xp.get_float("sim/flightmodel/position/longitude").await.unwrap_or(0.0),
+                xp.get_float("sim/flightmodel/position/groundspeed").await.unwrap_or(0.0),
+            );
+            let gs = gs_ms * MS_TO_KTS;
+            if gs > 40.0 {
+                let dist = haversine_nm(lat, lon, d.lat, d.lon);
+                let at_dest_kg = total_kg - live_burn_kg_hr * (dist / gs);
+                let mins_left = (at_dest_kg.max(0.0) / live_burn_kg_hr) * 60.0;
+                let reserve =
+                    profile.fuel.as_ref().map(|f| f.reserve_caution_min).unwrap_or(45.0);
+                let at_dest_gal = at_dest_kg / AVGAS_KG_PER_GAL;
+                let verdict = if at_dest_kg <= 0.0 {
+                    "that doesn't reach the destination — plan a fuel stop".to_string()
+                } else if mins_left >= reserve + 15.0 {
+                    format!("comfortably above your {reserve:.0}-minute reserve")
+                } else if mins_left >= reserve {
+                    format!("just above your {reserve:.0}-minute reserve, keep it leaned")
+                } else {
+                    format!("below your {reserve:.0}-minute reserve — think about a stop short")
+                };
+                if at_dest_kg > 0.0 {
+                    line.push_str(&format!(
+                        ". Should land with about {at_dest_gal:.0} gallons, {verdict}"
+                    ));
+                } else {
+                    line.push_str(&format!(". At this burn, {verdict}"));
+                }
             }
         }
     }
@@ -3356,9 +4028,21 @@ mod tests {
         assert!(reg.get("set_electrical").is_some());
         // "All electrical systems on" is the procedural power_up, not a one-shot key.
         assert!(reg.get("power_up").is_some());
+        // ...but only the ON direction remaps: "electrics off" must stay
+        // set_electrical (the remap once powered the aircraft back up on a
+        // shutdown request).
+        use serde_json::json;
+        assert!(super::wants_procedural_power_up("set_electrical", &json!({"system":"all","on":true})));
+        assert!(super::wants_procedural_power_up("set_electrical", &json!({"system":"all"})));
+        assert!(!super::wants_procedural_power_up("set_electrical", &json!({"system":"all","on":false})));
+        assert!(!super::wants_procedural_power_up("set_electrical", &json!({"system":"battery","on":true})));
         // Jet start sequence, not the piston one-shot.
         assert!(reg.get("start_engines").is_some());
         assert!(reg.get("start_engine").is_none());
+        // Pitot heat goes through the overhead heat knob (the stock command is a
+        // no-op on this airframe), and "speed for landing" has a figure to use.
+        assert_eq!(p.pitot_heat_dataref.as_deref(), Some("laminar/md82/ice/heatknob"));
+        assert_eq!(p.reference.as_ref().and_then(|r| r.approach_kts), Some(140.0));
         // ...and the piston 172 is the other way round.
         let c172 = super::tools::Registry::for_aircraft(&super::aircraft::load("cessna_172sp").unwrap());
         assert!(c172.get("start_engines").is_none());
@@ -3435,6 +4119,25 @@ mod tests {
             "Normal take-off checklist.", "starting engine checklist", "preflight checklist",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
+        }
+    }
+
+    #[test]
+    fn release_intent_catches_every_live_garble() {
+        // Every phrasing the pilot actually tried while fighting to take the
+        // throttle back from the taxi governor — all must release.
+        for t in [
+            "my throttle", "my thruffles", "mic control", "my throat",
+            "release immediately", "let me go. stop touching the throttle",
+            "give me command", "give me command now", "my power",
+            "stop holding speed", "i have control", "im taking control",
+        ] {
+            assert!(super::release_intent(t), "{t:?} must release");
+        }
+        // Ordinary commands must not trip it (it only runs while a hold is
+        // active, but even then these should pass through).
+        for t in ["taxi at 10 knots", "flaps ten", "hold 70 knots", "landing light on"] {
+            assert!(!super::release_intent(t), "{t:?} must not release");
         }
     }
 
@@ -3557,6 +4260,34 @@ mod tests {
         // "fuel flow" is an engine-instrument read (answer_state_query), not the
         // total-fuel report.
         assert!(!is_fuel_query("what's the fuel flow"));
+        // Selector commands without "tank"/"selector" said (seen live: answered
+        // with the quantity report five times in one session).
+        assert!(!is_fuel_query("switch fuel to right"));
+        assert!(!is_fuel_query("set fuel to left"));
+        assert!(!is_fuel_query("switch fuel"));
+        assert!(!is_fuel_query("switch tanks"));
+        // Quantity questions that mention a side or a tank stay questions.
+        assert!(is_fuel_query("how much fuel in the left tank"));
+        assert!(is_fuel_query("how much fuel do we have left"));
+    }
+
+    #[test]
+    fn power_loss_query_detects_diagnosis_not_commands() {
+        use super::is_power_loss_query;
+        // The live unrecognized phrasings, plus common variants.
+        assert!(is_power_loss_query("why we lost power?"));
+        assert!(is_power_loss_query("why have we lost power?"));
+        assert!(is_power_loss_query("we're losing power"));
+        assert!(is_power_loss_query("the engine quit"));
+        assert!(is_power_loss_query("engine failure"));
+        assert!(is_power_loss_query("why did the engine stopped")); // STT grammar drift
+        assert!(is_power_loss_query("engine cut out"));
+        // Commands and unrelated mentions must not be hijacked.
+        assert!(!is_power_loss_query("reduce power by ten percent"));
+        assert!(!is_power_loss_query("reduce power, we lost too much altitude"));
+        assert!(!is_power_loss_query("stop the engine"));
+        assert!(!is_power_loss_query("start the engine"));
+        assert!(!is_power_loss_query("full power"));
     }
 
     #[test]

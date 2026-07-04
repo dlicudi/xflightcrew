@@ -1,0 +1,404 @@
+//! `hold_speed` — the copilot works the throttle to hold a target airspeed.
+//!
+//! For airframes with no autothrottle (the 172): "hold 70 knots" arms a
+//! background governor that nudges `throttle_ratio_all` toward the target a
+//! few times a second-and-a-half. Deliberately gentle: small bounded steps
+//! with a deadband, so it trims toward the speed instead of chasing gusts —
+//! and it never touches pitch, so the pilot still owns the attitude (speed
+//! hold with power is the stable GA division of labour on approach).
+//!
+//! Release: "stop holding speed" / "my throttle" (`off`), and it stands down
+//! by itself the moment a recovery or autoland takes the aircraft, or on the
+//! ground below taxi speed.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+use anyhow::Result;
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use super::{Tool, ToolCtx};
+use crate::xplane::XPlaneClient;
+
+const IAS: &str = "sim/cockpit2/gauges/indicators/airspeed_kts_pilot";
+const THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
+const GS_MS: &str = "sim/flightmodel/position/groundspeed";
+const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
+const LEFT_BRAKE: &str = "sim/cockpit2/controls/left_brake_ratio";
+const RIGHT_BRAKE: &str = "sim/cockpit2/controls/right_brake_ratio";
+const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
+const MS_TO_KTS: f64 = 1.943_844;
+
+/// True while the governor loop runs. Public so other control loops could
+/// check it, mirroring `recover::ACTIVE` / `autoland::ACTIVE`.
+pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Target knots — updated live by a new `hold_speed` call, no restart.
+static TARGET_KTS: Mutex<f64> = Mutex::new(0.0);
+
+/// Which speed the governor chases. Flight = indicated airspeed with throttle
+/// only; Taxi = groundspeed with throttle *and brakes* (idle thrust still
+/// accelerates a 172 downhill — on the ground "less power" isn't enough).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    Flight,
+    Taxi,
+}
+static MODE: Mutex<Mode> = Mutex::new(Mode::Flight);
+
+/// One governor step: throttle change for a speed error and the airspeed
+/// trend, knots and knots/second → ratio. Human-like: many SMALL corrections
+/// on a fast tick (500 ms) instead of big slow shoves — and the derivative
+/// term reacts to a *decaying* airspeed before the error grows, which is the
+/// anti-stall reflex ("the needle's unwinding, power NOW" — not "we are now
+/// 10 knots slow"). The slow side gets extra authority: overspeed is a
+/// comfort problem, stall is not.
+pub fn throttle_adjust(err_kts: f64, trend_kts_s: f64) -> f64 {
+    if err_kts.abs() < 1.5 && trend_kts_s.abs() < 1.0 {
+        return 0.0; // in the groove and steady: hands off
+    }
+    let p = err_kts * 0.003;
+    let d = -trend_kts_s * 0.008; // decaying speed → positive (add power) early
+    let max_up = if err_kts > 10.0 || trend_kts_s < -3.0 { 0.04 } else { 0.015 };
+    (p + d).clamp(-0.015, max_up)
+}
+
+/// Sanity bounds for a spoken flight target — outside this it's a mishear.
+pub fn clamp_target(kts: f64) -> f64 {
+    kts.clamp(55.0, 250.0)
+}
+
+/// Sanity bounds for a taxi target. 0 is legitimate ("hold short" = stop).
+pub fn clamp_taxi_target(kts: f64) -> f64 {
+    kts.clamp(0.0, 25.0)
+}
+
+/// Above this spoken target on the ground, the pilot means a flight hold, not a
+/// taxi — and below it airborne, they don't (55-kt floor applies).
+const TAXI_MAX_KTS: f64 = 30.0;
+
+/// One taxi-governor step: `(new_throttle, brake_ratio)` for a target and
+/// current groundspeed. Throttle capped well below takeoff power; brakes come
+/// in only once the throttle is already closed; near-zero targets hold the
+/// aircraft on the brakes so idle thrust can't creep it forward.
+pub fn taxi_control(target_kts: f64, gs_kts: f64, throttle: f64) -> (Option<f64>, f64) {
+    if target_kts < 1.0 && gs_kts < 1.5 {
+        return (Some(0.0), 0.5); // holding position: idle + parked on the brakes
+    }
+    let err = target_kts - gs_kts;
+    if err > 1.0 {
+        // Too slow: a touch more power (never takeoff power), brakes off.
+        // Small steps on a fast tick — human feet, not a bang-bang thermostat.
+        (Some((throttle + (err * 0.003).min(0.01)).min(0.35)), 0.0)
+    } else if err < -1.0 {
+        // Too fast: close the throttle first; brake once it's already closed.
+        if throttle > 0.06 {
+            (Some((throttle - 0.012).max(0.0)), 0.0)
+        } else {
+            (Some(0.0), ((-err) * 0.08).clamp(0.1, 0.6))
+        }
+    } else {
+        (None, 0.0) // in the groove: hands off, brakes released
+    }
+}
+
+pub struct HoldSpeed {
+    /// The profile's final-approach speed, for "hold approach speed".
+    pub approach_kts: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct Args {
+    /// Target IAS, knots. Absent = hold the current speed.
+    #[serde(default)]
+    knots: Option<f64>,
+    /// Named target: "approach" = the profile's final-approach speed.
+    #[serde(default)]
+    preset: Option<String>,
+    /// true = release the throttle back to the pilot.
+    #[serde(default)]
+    off: bool,
+}
+
+#[async_trait]
+impl Tool for HoldSpeed {
+    fn name(&self) -> &str {
+        "hold_speed"
+    }
+
+    fn description(&self) -> &str {
+        "Hold a target speed by managing the throttle. Airborne: airspeed hold \
+         ('hold 70 knots', 'maintain approach speed') — power only, the pilot \
+         flies pitch. On the ground: taxi speed hold with throttle AND brakes \
+         ('taxi at 10 knots', 'hold short' = stop) — the pilot steers. Release \
+         with 'stop holding speed' or 'my throttle'."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "knots": {"type": "number", "description": "target IAS, knots; absent = hold current speed"},
+                "preset": {"type": "string", "enum": ["approach"], "description": "named target: the profile's final-approach speed"},
+                "off": {"type": "boolean", "description": "true = release the throttle"}
+            }
+        })
+    }
+
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let a: Args = serde_json::from_value(args.clone())?;
+        if a.off {
+            return Ok(if ACTIVE.swap(false, Ordering::Relaxed) {
+                "Speed hold off — your throttle.".to_string()
+            } else {
+                "I wasn't holding the speed.".to_string()
+            });
+        }
+        let on_ground = ctx.xplane.get_float(ON_GROUND).await.unwrap_or(0.0) > 0.5;
+        // Mode by context: a small number on the ground is a taxi; airborne (or
+        // a big number) is a flight hold. A big number on the ground is neither.
+        let taxi = on_ground && a.knots.map_or(a.preset.is_none(), |k| k <= TAXI_MAX_KTS);
+        if on_ground && !taxi {
+            return Ok("We're on the ground — say a taxi speed like 'taxi at 10 knots', or ask again airborne.".to_string());
+        }
+        if taxi && ctx.xplane.get_float(PARK_BRAKE).await.unwrap_or(0.0) > 0.5 {
+            return Ok("Parking brake's set — release it first.".to_string());
+        }
+        let target = if taxi {
+            match a.knots {
+                Some(k) => clamp_taxi_target(k),
+                // "Hold this speed" while rolling = keep the current pace.
+                None => clamp_taxi_target(ctx.xplane.get_float(GS_MS).await? * MS_TO_KTS),
+            }
+        } else if let Some(k) = a.knots {
+            clamp_target(k)
+        } else if a.preset.as_deref() == Some("approach") {
+            match self.approach_kts {
+                Some(k) => clamp_target(k),
+                None => {
+                    return Ok(
+                        "No approach speed on file for this airframe — give me a number.".to_string()
+                    )
+                }
+            }
+        } else {
+            // "Maintain this speed" — hold whatever we're doing right now.
+            clamp_target(ctx.xplane.get_float(IAS).await?)
+        };
+        *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner()) = target;
+        *MODE.lock().unwrap_or_else(|e| e.into_inner()) =
+            if taxi { Mode::Taxi } else { Mode::Flight };
+        // Already governing → just the new target/mode; otherwise start the
+        // loop — on its OWN thread with its own runtime, like recover and the
+        // monitor. The main runtime is current-thread and blocks on the mic
+        // between commands, so a tokio::spawn there starves: the first live
+        // governor sat unpolled for 23 seconds until the next voice command.
+        if !ACTIVE.swap(true, Ordering::Relaxed) {
+            let base = ctx.config.xplane_base_url.clone();
+            std::thread::spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build()
+                else {
+                    ACTIVE.store(false, Ordering::Relaxed);
+                    return;
+                };
+                rt.block_on(governor(XPlaneClient::new(base)));
+            });
+        }
+        Ok(if taxi {
+            if target < 1.0 {
+                "Holding short — brakes on. Say taxi at ten knots to roll again.".to_string()
+            } else {
+                format!(
+                    "Taxiing at {target:.0} knots — I have throttle and brakes, you steer. Say my throttle to take it back."
+                )
+            }
+        } else {
+            format!(
+                "I have the throttle, holding {target:.0} knots. Say stop holding speed to take it back."
+            )
+        })
+    }
+}
+
+/// Glide a lever dataref from wherever it is to `to` in 50 ms micro-steps —
+/// continuous motion like a hand, not a stepped jump (per-tick 1.5% snaps
+/// still read as jerky on the quadrant; this is the smoothing between ticks).
+async fn glide(xp: &XPlaneClient, dataref: &str, to: f64, over_ms: u64) {
+    let Ok(from) = xp.get_float(dataref).await else {
+        let _ = xp.set_float(dataref, to).await;
+        return;
+    };
+    let steps = (over_ms / 50).max(1);
+    for i in 1..=steps {
+        let v = from + (to - from) * (i as f64 / steps as f64);
+        let _ = xp.set_float(dataref, v).await;
+        if i < steps {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// The governor loop: gentle bounded nudges toward the target until released.
+/// Flight mode chases IAS with throttle only; taxi mode chases groundspeed with
+/// throttle and brakes on a faster cadence. Brakes are always released on the
+/// way out — never hand the pilot an aircraft with a hidden boot on the pedals.
+async fn governor(xp: XPlaneClient) {
+    tracing::info!("speed governor started");
+    let mut braking = false;
+    // The throttle position this loop last commanded. If the lever is later
+    // found far from where we put it, that's the PILOT's hand — yield
+    // immediately rather than fight them for the lever (a taxi hold once
+    // yanked the throttle back from a takeoff push; never again).
+    let mut last_cmd: Option<f64> = None;
+    // Last IAS sample, for the flight governor's trend (anticipation) term.
+    let mut prev_ias: Option<(f64, std::time::Instant)> = None;
+    loop {
+        if !ACTIVE.load(Ordering::Relaxed) {
+            break;
+        }
+        // Yield instantly to anything that takes the whole aircraft.
+        if super::recover::ACTIVE.load(Ordering::Relaxed)
+            || crate::autoland::ACTIVE.load(Ordering::Relaxed)
+        {
+            ACTIVE.store(false, Ordering::Relaxed);
+            break;
+        }
+        let target = *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mode = *MODE.lock().unwrap_or_else(|e| e.into_inner());
+        let on_ground = xp.get_float(ON_GROUND).await.unwrap_or(0.0) > 0.5;
+        match mode {
+            Mode::Flight => {
+                if let (Ok(ias), Ok(thr)) = (xp.get_float(IAS).await, xp.get_float(THROTTLE).await)
+                {
+                    if last_cmd.is_some_and(|lc| (thr - lc).abs() > 0.15) {
+                        tracing::info!("speed governor: pilot override, releasing");
+                        ACTIVE.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                    // Stand down when parked — holding 70 knots against the
+                    // brakes is not a thing anyone wants. (Never silent: this
+                    // exact path once ate three arm requests invisibly.)
+                    if on_ground && xp.get_float(GS_MS).await.unwrap_or(0.0) < 5.0 {
+                        tracing::info!("speed governor: parked, standing down");
+                        ACTIVE.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                    // IAS trend across ticks feeds the anticipation term.
+                    let now_t = std::time::Instant::now();
+                    let trend = match prev_ias {
+                        Some((last_ias, last_t)) => {
+                            let dt = now_t.duration_since(last_t).as_secs_f64();
+                            if (0.2..=2.0).contains(&dt) { (ias - last_ias) / dt } else { 0.0 }
+                        }
+                        None => 0.0,
+                    };
+                    prev_ias = Some((ias, now_t));
+                    let adj = throttle_adjust(target - ias, trend);
+                    if adj != 0.0 {
+                        let cmd = (thr + adj).clamp(0.0, 1.0);
+                        glide(&xp, THROTTLE, cmd, 200).await; // ~most of the tick
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    } else {
+                        // In the groove: don't spin the API at 20 Hz doing nothing.
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                    if adj != 0.0 {
+                        last_cmd = Some((thr + adj).clamp(0.0, 1.0));
+                    }
+                } else {
+                    // Reads failed (sim hiccup): back off, don't spin.
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                }
+            }
+            Mode::Taxi => {
+                // Airborne means the taxi is over — release everything, done.
+                if !on_ground {
+                    tracing::info!("speed governor: airborne, taxi hold released");
+                    ACTIVE.store(false, Ordering::Relaxed);
+                    break;
+                }
+                if let (Ok(gs_ms), Ok(thr)) =
+                    (xp.get_float(GS_MS).await, xp.get_float(THROTTLE).await)
+                {
+                    if last_cmd.is_some_and(|lc| (thr - lc).abs() > 0.15) {
+                        tracing::info!("speed governor: pilot override, releasing");
+                        ACTIVE.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                    let (new_thr, brake) = taxi_control(target, gs_ms * MS_TO_KTS, thr);
+                    let wrote = new_thr.is_some() || brake > 0.0 || braking;
+                    if let Some(t) = new_thr {
+                        glide(&xp, THROTTLE, t, 200).await;
+                        last_cmd = Some(t);
+                    }
+                    let _ = xp.set_float(LEFT_BRAKE, brake).await;
+                    let _ = xp.set_float(RIGHT_BRAKE, brake).await;
+                    braking = brake > 0.0;
+                    tokio::time::sleep(std::time::Duration::from_millis(if wrote { 100 } else { 300 })).await;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                }
+            }
+        }
+    }
+    tracing::info!("speed governor stopped");
+    // Whatever ended the loop: leave the pedals clean.
+    if braking {
+        let _ = xp.set_float(LEFT_BRAKE, 0.0).await;
+        let _ = xp.set_float(RIGHT_BRAKE, 0.0).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn governor_law_is_gentle_and_deadbanded() {
+        assert_eq!(throttle_adjust(1.0, 0.0), 0.0, "in the groove, steady → hands off");
+        assert_eq!(throttle_adjust(-1.2, 0.5), 0.0);
+        assert!(throttle_adjust(3.0, 0.0) > 0.0, "slow → more power");
+        assert!(throttle_adjust(-3.0, 0.0) < 0.0, "fast → less power");
+        // The anti-stall reflex: on speed but DECAYING fast → power comes in
+        // before the error exists at all.
+        assert!(throttle_adjust(0.0, -2.5) > 0.0, "unwinding needle → power now");
+        // And rising speed damps the correction rather than piling on.
+        assert!(throttle_adjust(3.0, 3.0) < throttle_adjust(3.0, 0.0));
+        // Authority is bounded, asymmetrically: overspeed is a comfort issue,
+        // stall is not — the slow side gets the bigger clamp.
+        assert_eq!(throttle_adjust(100.0, 0.0), 0.04);
+        assert_eq!(throttle_adjust(-100.0, 0.0), -0.015);
+        assert_eq!(throttle_adjust(0.0, -10.0), 0.04, "fast decay unlocks urgency");
+    }
+
+    #[test]
+    fn spoken_targets_are_sanity_bounded() {
+        assert_eq!(clamp_target(70.0), 70.0);
+        assert_eq!(clamp_target(7.0), 55.0, "mishear can't idle us into a stall");
+        assert_eq!(clamp_target(700.0), 250.0);
+        assert_eq!(clamp_taxi_target(10.0), 10.0);
+        assert_eq!(clamp_taxi_target(60.0), 25.0, "no takeoff-roll 'taxi'");
+        assert_eq!(clamp_taxi_target(0.0), 0.0, "hold short is a real target");
+    }
+
+    #[test]
+    fn taxi_law_throttle_then_brakes() {
+        // Too slow: power comes up, capped below anything takeoff-like.
+        let (thr, brake) = taxi_control(10.0, 4.0, 0.10);
+        assert!(thr.unwrap() > 0.10 && thr.unwrap() <= 0.35);
+        assert_eq!(brake, 0.0);
+        // Too fast with power in: close the throttle before touching brakes.
+        let (thr, brake) = taxi_control(10.0, 16.0, 0.20);
+        assert!(thr.unwrap() < 0.20);
+        assert_eq!(brake, 0.0, "no braking against thrust");
+        // Too fast at idle: now the brakes, proportionally, bounded.
+        let (thr, brake) = taxi_control(10.0, 18.0, 0.02);
+        assert_eq!(thr, Some(0.0));
+        assert!(brake > 0.0 && brake <= 0.6, "{brake}");
+        // In the groove: hands off everything, brakes released.
+        assert_eq!(taxi_control(10.0, 10.5, 0.15), (None, 0.0));
+        // Hold short: idle + parked on the brakes even when stopped.
+        assert_eq!(taxi_control(0.0, 0.2, 0.0), (Some(0.0), 0.5));
+    }
+}

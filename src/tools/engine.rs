@@ -211,6 +211,9 @@ impl Tool for SetMixture {
         {
             return Ok("Negative, I won't cut the mixture in flight.".to_string());
         }
+        // An explicit percentage is the pilot taking the lever — the continuous
+        // manager stands down rather than re-trimming over their setting.
+        MIX_MANAGED.store(false, std::sync::atomic::Ordering::Relaxed);
         let ratio = (p.percent / 100.0).clamp(0.0, 1.0);
         // Ease the mixture lever to the target instead of snapping it.
         ramp_actuator(ctx, MIXTURE, ratio).await?;
@@ -222,52 +225,203 @@ impl Tool for SetMixture {
 /// Draw the mixture leaner in a smooth, continuous creep from a rich start,
 /// sampling `metric` (EGT or RPM) as it goes, until it peaks (drops `drop_margin`
 /// below the best seen) or the lean floor is reached. Returns the mixture at the
-/// observed peak and the peak value. Approaching from the rich side means the
-/// metric rises to the peak then falls, which is what makes the peak detectable.
+/// observed peak and the peak value.
 ///
-/// Done the way a pilot does it: glide the lever a small amount, hold and watch
-/// the gauge, repeat — slow enough that the metric actually responds and the peak
-/// is real, not a reading that's lagging the lever. Each step eases smoothly
-/// (like the throttle), then holds long enough for the metric to settle before
-/// it's sampled. The long start hold lets the rich baseline settle so it can't
-/// masquerade as the peak.
+/// Done the way an experienced pilot does it — from wherever the lever already
+/// is, no full-rich reset ritual: coarse steps to *bracket* the peak (flipping
+/// direction once if the first step shows we started lean of it), then fine
+/// steps back through the bracket to pin it. Small quick motions with just
+/// enough settle for the gauge to respond: ~8–14 s instead of the old rich-
+/// reset sweep's 25–30.
 async fn seek_metric_peak(ctx: &ToolCtx<'_>, metric: &str, drop_margin: f64) -> Result<(f64, f64)> {
-    const STEP: f64 = 0.02;
-    const SETTLE_MS: u64 = 900; // hold to let the metric respond before reading
-    const START_SETTLE_MS: u64 = 1500;
-    // Lean a few steps past the rich start before a drop can end it (clears the
-    // rich plateau), then require the metric to stay down to confirm the peak.
-    const MIN_STEPS_BEFORE_STOP: u32 = 3;
-    const CONSEC_DROPS_TO_STOP: u32 = 2;
+    const COARSE: f64 = 0.05;
+    const FINE: f64 = 0.015;
+    const COARSE_SETTLE_MS: u64 = 450;
+    const FINE_SETTLE_MS: u64 = 600;
 
-    ramp_actuator(ctx, MIXTURE, 0.95).await?; // ease to the rich start
-    tokio::time::sleep(std::time::Duration::from_millis(START_SETTLE_MS)).await;
-
-    let mut mix = 0.95;
+    let mut mix = ctx.xplane.get_float(MIXTURE).await?.clamp(MIX_LEAN_FLOOR, 0.95);
+    tokio::time::sleep(std::time::Duration::from_millis(COARSE_SETTLE_MS)).await;
     let mut best_mix = mix;
     let mut best_val = engine0(ctx, metric, 0.0).await;
-    let mut steps = 0u32;
-    let mut drops = 0u32;
-    while mix > MIX_LEAN_FLOOR {
-        mix = (mix - STEP).max(MIX_LEAN_FLOOR);
-        ramp_actuator(ctx, MIXTURE, mix).await?; // smooth glide to the next step
-        tokio::time::sleep(std::time::Duration::from_millis(SETTLE_MS)).await; // watch the gauge
+
+    // Coarse bracket: lean first (the usual case is rich of peak). If the very
+    // first step drops the metric sharply, we started lean of the peak — flip
+    // once and climb the other way.
+    let mut dir = -1.0_f64;
+    let mut flipped = false;
+    let mut first = true;
+    loop {
+        let next = (mix + dir * COARSE).clamp(MIX_LEAN_FLOOR, 1.0);
+        if (next - mix).abs() < 1e-6 {
+            break; // pinned at a stop
+        }
+        mix = next;
+        ramp_actuator(ctx, MIXTURE, mix).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(COARSE_SETTLE_MS)).await;
         let val = engine0(ctx, metric, 0.0).await;
-        steps += 1;
         if val > best_val {
             best_val = val;
             best_mix = mix;
-            drops = 0;
+        } else if first && !flipped && best_val - val >= drop_margin / 2.0 {
+            dir = 1.0;
+            flipped = true;
         } else if best_val - val >= drop_margin {
-            drops += 1;
-            if steps > MIN_STEPS_BEFORE_STOP && drops >= CONSEC_DROPS_TO_STOP {
-                break; // confirmed past the peak
-            }
-        } else {
-            drops = 0;
+            break; // bracketed: clearly past the peak
+        }
+        first = false;
+    }
+
+    // Fine pass: from slightly rich of the bracket down through it.
+    let mut fine = (best_mix + COARSE).min(0.95);
+    let floor = (best_mix - COARSE).max(MIX_LEAN_FLOOR);
+    ramp_actuator(ctx, MIXTURE, fine).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(FINE_SETTLE_MS)).await;
+    while fine > floor {
+        fine = (fine - FINE).max(floor);
+        ramp_actuator(ctx, MIXTURE, fine).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(FINE_SETTLE_MS)).await;
+        let val = engine0(ctx, metric, 0.0).await;
+        if val > best_val {
+            best_val = val;
+            best_mix = fine;
+        } else if best_val - val >= drop_margin {
+            break;
         }
     }
     Ok((best_mix, best_val))
+}
+
+/// True while the continuous mixture manager runs — armed by `lean_mixture`,
+/// released by the pilot ("my mixture"), by an explicit `set_mixture`, or by
+/// touching the lever. Mirrors `speedhold::ACTIVE`.
+pub static MIX_MANAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Should the manager re-trim? Altitude or power moved enough that the last
+/// lean is stale — the same judgement a pilot makes ("we've climbed a bit,
+/// touch up the mixture").
+pub fn needs_retrim(alt_ft: f64, last_alt_ft: f64, throttle: f64, last_throttle: f64) -> bool {
+    (alt_ft - last_alt_ft).abs() > 400.0 || (throttle - last_throttle).abs() > 0.08
+}
+
+/// The continuous mixture manager: every couple of seconds, check whether the
+/// world moved (altitude, power) and quietly re-trim — full rich below the
+/// leaning floor, a short fine EGT seek around the current lever above it.
+/// Yields to recovery/autoland, and to the pilot's hand on the lever.
+async fn mixture_manager(xp: crate::xplane::XPlaneClient) {
+    use std::sync::atomic::Ordering;
+    tracing::info!("mixture manager started");
+    let mut last_alt = f64::MIN; // force an immediate first trim decision
+    let mut last_thr = f64::MIN;
+    let mut last_cmd: Option<f64> = None;
+    loop {
+        if !MIX_MANAGED.load(Ordering::Relaxed) {
+            break;
+        }
+        if super::recover::ACTIVE.load(Ordering::Relaxed)
+            || crate::autoland::ACTIVE.load(Ordering::Relaxed)
+        {
+            MIX_MANAGED.store(false, Ordering::Relaxed);
+            break;
+        }
+        let (Ok(alt), Ok(thr), Ok(mix)) = (
+            xp.get_float(ALT_FT).await,
+            xp.get_float(THROTTLE).await,
+            xp.get_float(MIXTURE).await,
+        ) else {
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+            continue;
+        };
+        // Pilot's hand on the lever → theirs, immediately.
+        if last_cmd.is_some_and(|lc| (mix - lc).abs() > 0.10) {
+            tracing::info!("mixture manager: pilot override, releasing");
+            MIX_MANAGED.store(false, Ordering::Relaxed);
+            break;
+        }
+        let running = xp
+            .get_float_array(ENGN_RUNNING)
+            .await
+            .ok()
+            .and_then(|v| v.first().copied())
+            .unwrap_or(0.0)
+            > 0.5;
+        if running && needs_retrim(alt, last_alt, thr, last_thr) {
+            if alt < LEAN_FLOOR_ALT_FT {
+                if mix < 0.98 {
+                    let _ = xp.set_float(MIXTURE, 1.0).await;
+                    last_cmd = Some(1.0);
+                    tracing::info!("mixture manager: below the floor, full rich");
+                }
+            } else {
+                // Short fine seek around the current lever: bracket ±0.05 in
+                // 0.015 steps, EGT judged after a short settle. Quiet and quick.
+                let mut best_mix = mix;
+                let mut best_egt = read_egt(&xp).await;
+                let top = (mix + 0.05).min(0.95);
+                let floor = (mix - 0.05).max(MIX_LEAN_FLOOR);
+                let mut m = top;
+                let _ = xp.set_float(MIXTURE, m).await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                while m > floor {
+                    m = (m - 0.015).max(floor);
+                    let _ = xp.set_float(MIXTURE, m).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let egt = read_egt(&xp).await;
+                    if egt > best_egt {
+                        best_egt = egt;
+                        best_mix = m;
+                    } else if best_egt - egt >= 12.0 {
+                        break;
+                    }
+                }
+                // Sit just rich of the peak, per the POH.
+                let set = (best_mix + 0.03).min(1.0);
+                glide_lever(&xp, MIXTURE, set).await;
+                last_cmd = Some(set);
+                tracing::info!(mix = %format!("{set:.2}"), "mixture manager: re-trimmed");
+            }
+            (last_alt, last_thr) = (alt, thr);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+    }
+    tracing::info!("mixture manager stopped");
+}
+
+/// Micro-step a lever smoothly (the manager's own small glide — 50 ms steps,
+/// same feel as `ramp_actuator` without needing a ToolCtx).
+async fn glide_lever(xp: &crate::xplane::XPlaneClient, dataref: &str, to: f64) {
+    let Ok(from) = xp.get_float(dataref).await else {
+        let _ = xp.set_float(dataref, to).await;
+        return;
+    };
+    let steps = ((to - from).abs() / 0.005).ceil().clamp(1.0, 6.0) as u32;
+    for i in 1..=steps {
+        let v = from + (to - from) * (i as f64 / steps as f64);
+        let _ = xp.set_float(dataref, v).await;
+        if i < steps {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+async fn read_egt(xp: &crate::xplane::XPlaneClient) -> f64 {
+    xp.get_float_array(EGT_CEL).await.ok().and_then(|v| v.first().copied()).unwrap_or(0.0)
+}
+
+/// Arm the continuous manager (idempotent): spawned on its own thread with its
+/// own runtime, like every background loop here — the main runtime blocks on
+/// the mic and starves tokio tasks (learned the hard way with the speed hold).
+pub fn arm_mixture_manager(base_url: String) {
+    use std::sync::atomic::Ordering;
+    if !MIX_MANAGED.swap(true, Ordering::Relaxed) {
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            else {
+                MIX_MANAGED.store(false, Ordering::Relaxed);
+                return;
+            };
+            rt.block_on(mixture_manager(crate::xplane::XPlaneClient::new(base_url)));
+        });
+    }
 }
 
 pub struct LeanMixture;
@@ -322,6 +476,9 @@ impl Tool for LeanMixture {
         match resolved {
             "rich" => {
                 ramp_actuator(ctx, MIXTURE, 1.0).await?;
+                // The manager makes the promise true: it leans by itself once
+                // we climb past the floor.
+                arm_mixture_manager(ctx.config.xplane_base_url.clone());
                 Ok(format!(
                     "Below {LEAN_FLOOR_ALT_FT:.0} feet, mixture full rich. I'll lean for cruise once we're higher."
                 ))
@@ -350,8 +507,11 @@ impl Tool for LeanMixture {
                 let pct = ctx.xplane.get_float(MIXTURE).await? * 100.0;
                 let gph = engine0(ctx, FUEL_FLOW_KG_S, 0.0).await * 3600.0 / AVGAS_KG_PER_GAL;
                 let egt_f = egt * 9.0 / 5.0 + 32.0; // dataref is °C
+                // From here it's continuous: the manager re-trims as altitude
+                // or power changes, until the pilot takes the lever back.
+                arm_mixture_manager(ctx.config.xplane_base_url.clone());
                 Ok(format!(
-                    "Leaned to peak EGT, mixture {pct:.0} percent, EGT {egt_f:.0} degrees, burning {gph:.1} gallons an hour."
+                    "Leaned to peak EGT, mixture {pct:.0} percent, EGT {egt_f:.0} degrees, burning {gph:.1} gallons an hour. I'll keep it trimmed as we climb or descend."
                 ))
             }
             _ => {
@@ -365,7 +525,15 @@ impl Tool for LeanMixture {
     }
 }
 
-pub struct StartEngine;
+pub struct StartEngine {
+    /// The airframe's fuel selector, when it has one. A start with the selector
+    /// OFF just cranks dry (seen live on the SR22 after an xlua plugin reload
+    /// reset it), so the sequence selects a tank first, like the checklist does.
+    pub fuel_selector: Option<FuelSelectorProfile>,
+    /// ON commands for every charging source in the electrical profile (the
+    /// SR22 has ALT 1 *and* ALT 2). Empty = fall back to generator 1 only.
+    pub alternator_on_cmds: Vec<String>,
+}
 
 #[async_trait]
 impl Tool for StartEngine {
@@ -406,6 +574,40 @@ impl Tool for StartEngine {
             ));
         }
 
+        // Fuel selector: cranking with it OFF never catches, so select a tank
+        // first, per the checklist — BOTH where the airframe has it, otherwise
+        // the fullest wing tank (the SR22 flow: "fuel selector, fullest tank").
+        let mut fuel_note = String::new();
+        if let Some(fs) = &self.fuel_selector {
+            let off = match &fs.readback {
+                Some(dref) => ctx.xplane.get_float(dref).await.ok().and_then(|actual| {
+                    fs.positions
+                        .iter()
+                        .find(|p| p.value.is_some_and(|v| (v - actual).abs() < 0.5))
+                        .map(|p| p.key.eq_ignore_ascii_case("off"))
+                }),
+                None => None,
+            };
+            if off == Some(true) {
+                let mut target =
+                    fs.positions.iter().find(|p| p.key.eq_ignore_ascii_case("both"));
+                if target.is_none() {
+                    let tanks = ctx
+                        .xplane
+                        .get_float_array(crate::datarefs::FUEL_PER_TANK_KG)
+                        .await
+                        .unwrap_or_default();
+                    let side =
+                        if tanks.len() >= 2 && tanks[1] > tanks[0] { "right" } else { "left" };
+                    target = fs.positions.iter().find(|p| p.key.eq_ignore_ascii_case(side));
+                }
+                if let Some(pos) = target {
+                    ctx.xplane.run_command(&pos.command).await?;
+                    fuel_note = format!("fuel selector was off, now {}, ", pos.spoken);
+                }
+            }
+        }
+
         // Pre-start configuration.
         ctx.xplane.set_float(MIXTURE, 1.0).await?; // full rich
         ctx.xplane.set_float(THROTTLE, 0.1).await?; // crack the throttle
@@ -416,7 +618,7 @@ impl Tool for StartEngine {
 
         // Give it a moment to fire, then confirm engine 1 is running.
         for _ in 0..6 {
-            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let running = ctx
                 .xplane
                 .get_float_array(ENGN_RUNNING)
@@ -426,18 +628,22 @@ impl Tool for StartEngine {
                 .map(|r| r > 0.5)
                 .unwrap_or(false);
             if running {
-                // Bring the alternator online now there's an engine to drive it,
-                // so we charge the bus instead of draining the battery (and so
-                // the monitor doesn't immediately call out an offline alternator).
-                ctx.xplane.run_command(CMD_ALTERNATOR_ON).await?;
-                let alt_on = ctx
-                    .xplane
-                    .get_float_array(GENERATOR)
-                    .await
-                    .ok()
-                    .and_then(|v| v.first().copied())
-                    .map(|g| g > 0.5)
-                    .unwrap_or(false);
+                // Bring the charging sources online now there's an engine to
+                // drive them — ALL of them (the SR22's ALT 2 sat off forever
+                // when this only fired generator 1), so we charge the bus
+                // instead of draining the battery (and so the monitor doesn't
+                // immediately call out an offline alternator).
+                let n_alts = if self.alternator_on_cmds.is_empty() {
+                    ctx.xplane.run_command(CMD_ALTERNATOR_ON).await?;
+                    1
+                } else {
+                    for c in &self.alternator_on_cmds {
+                        ctx.xplane.run_command(c).await?;
+                    }
+                    self.alternator_on_cmds.len()
+                };
+                let gens = ctx.xplane.get_float_array(GENERATOR).await.unwrap_or_default();
+                let alt_on = gens.len() >= n_alts && gens.iter().take(n_alts).all(|g| *g > 0.5);
                 // Bring the avionics master online now the engine's running and
                 // the alternator is charging — matches the STARTING ENGINE
                 // checklist (avionics OFF for the start, ON after) and closes the
@@ -449,15 +655,21 @@ impl Tool for StartEngine {
                 let avionics_on = ctx.xplane.run_command("sim/systems/avionics_on").await.is_ok();
                 // Narrate the start sequence so the pilot hears what was done on
                 // their behalf, not just the end state.
-                let alt = if alt_on { "alternator on" } else { "but the alternator didn't come on, check it" };
+                let alt = if alt_on {
+                    if n_alts > 1 { "alternators on" } else { "alternator on" }
+                } else {
+                    "but the alternator didn't come on, check it"
+                };
                 let avi = if avionics_on { ", avionics on" } else { "" };
                 return Ok(format!(
-                    "Roger — mixture rich, throttle cracked, mags both, cranking. \
+                    "Roger — {fuel_note}mixture rich, throttle cracked, mags both, cranking. \
                      Engine started, {alt}{avi}."
                 ));
             }
         }
-        Ok("Cranking — the engine hasn't caught. Check fuel and mixture, then try again.".to_string())
+        Ok(format!(
+            "Cranking — {fuel_note}the engine hasn't caught. Check fuel and mixture, then try again."
+        ))
     }
 }
 
@@ -743,5 +955,18 @@ impl Tool for StopEngine {
             }
         }
         Ok("Mixture to cutoff, engine winding down.".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retrim_triggers_on_altitude_or_power_change() {
+        assert!(!needs_retrim(10_000.0, 10_200.0, 0.65, 0.65), "small drift stays put");
+        assert!(needs_retrim(10_500.0, 10_000.0, 0.65, 0.65), "climbed 500 → re-lean");
+        assert!(needs_retrim(10_000.0, 10_000.0, 0.80, 0.65), "power change → re-lean");
+        assert!(needs_retrim(8_000.0, f64::MIN, 0.65, f64::MIN), "first pass always trims");
     }
 }
