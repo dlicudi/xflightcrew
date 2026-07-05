@@ -47,6 +47,21 @@ enum Mode {
 }
 static MODE: Mutex<Mode> = Mutex::new(Mode::Flight);
 
+/// One-line status for the dashboard's "managing" panel: what the governor is
+/// chasing, or `None` when it isn't running.
+pub fn status() -> Option<String> {
+    if !ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let kts = *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mode = *MODE.lock().unwrap_or_else(|e| e.into_inner());
+    Some(match mode {
+        Mode::Taxi if kts < 1.0 => "holding position".to_string(),
+        Mode::Taxi => format!("taxi {kts:.0} kt"),
+        Mode::Flight => format!("speed {kts:.0} kt"),
+    })
+}
+
 /// One governor step: throttle change for a speed error and the airspeed
 /// trend, knots and knots/second → ratio. Human-like: many SMALL corrections
 /// on a fast tick (500 ms) instead of big slow shoves — and the derivative

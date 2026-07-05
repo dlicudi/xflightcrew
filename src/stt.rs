@@ -189,6 +189,11 @@ pub fn build_prompt(p: &crate::aircraft::AircraftProfile) -> String {
     if p.parking_brake {
         terms.push("parking brake");
     }
+    // "pitot" defeats whisper without priming ("Pito's heat", "it was heat",
+    // "pilot heat" all seen live); name it when the airframe has the switch.
+    if p.pitot_heat {
+        terms.push("pitot heat");
+    }
     if !p.electrical.is_empty() {
         terms.push("battery and avionics");
     }

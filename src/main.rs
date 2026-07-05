@@ -17,6 +17,7 @@ mod rag;
 mod checklist;
 mod config;
 mod datarefs;
+mod failures;
 mod grammar;
 mod livestate;
 mod llm;
@@ -611,6 +612,14 @@ async fn run_session(
     if manual_index.is_some() {
         tracing::info!(aircraft = %profile.id, "manual index loaded");
     }
+    // The shared general-aviation index (the FAA handbooks: PHAK, AFH, IFH, and
+    // friends) rides alongside the POM for the questions no POM answers —
+    // airspace, weather theory, aerodynamics, procedures. Aircraft-independent,
+    // so it never reloads on an aircraft switch.
+    let general_index = rag::Index::load(rag::GENERAL_ID);
+    if general_index.is_some() {
+        tracing::info!("general aviation index loaded");
+    }
     stt.set_prompt(stt::build_prompt(&profile));
     // Tool specs for the LLM = curated tools + each checklist as a no-arg "tool"
     // the loop intercepts and runs interactively.
@@ -1193,12 +1202,21 @@ async fn run_session(
             let ts = Instant::now();
             let snap = state_snapshot(&xplane, &profile, Some(&live)).await;
             tracing::info!(ms = ts.elapsed().as_millis(), state = snap.as_deref().unwrap_or("(none)"), "state snapshot");
-            // Ground the answer in the aircraft's manual, when indexed: the best
-            // POM excerpts for this question ride along with the live state.
-            let excerpts = match &manual_index {
-                Some(ix) => ix.retrieve(&config.ollama_base_url, &command, 4).await,
-                None => None,
-            };
+            // Ground the answer in the manuals, when indexed: POM excerpts first
+            // (aircraft-specific beats general), then the shared FAA-handbook
+            // index for what no POM covers. Two small embedding calls, worst case.
+            let mut excerpt_parts: Vec<String> = Vec::new();
+            if let Some(ix) = &manual_index {
+                if let Some(e) = ix.retrieve(&config.ollama_base_url, &command, 4).await {
+                    excerpt_parts.push(e);
+                }
+            }
+            if let Some(ix) = &general_index {
+                if let Some(e) = ix.retrieve(&config.ollama_base_url, &command, 3).await {
+                    excerpt_parts.push(e);
+                }
+            }
+            let excerpts = (!excerpt_parts.is_empty()).then(|| excerpt_parts.join("\n---\n"));
             let t = Instant::now();
             let answer = llm.answer(&command, &ctx_history, snap.as_deref(), excerpts.as_deref()).await;
             tracing::info!(ms = t.elapsed().as_millis(), path = "llm-answer", "command path");
@@ -3249,6 +3267,18 @@ async fn fuel_report(
 /// for anything not a recognized state read, to fall through to the LLM for the
 /// open-ended questions ("do we have enough fuel to reach Bristol?"). Only call
 /// this for utterances that are questions, so "set heading 270" still commands.
+/// Is the battery voltage low (depleted state of charge)? System-class-aware, so
+/// it doesn't flag a healthy 12V-system battery as low the way a fixed 24V
+/// threshold would: ~24V-class systems sit near 24-28V (low below ~23), ~12V-class
+/// near 12-14V (low below ~11.5). The magnitude selects the class.
+fn battery_low(volts: f64) -> bool {
+    if volts >= 18.0 {
+        volts < 23.0 // 24V-class system
+    } else {
+        volts < 11.5 // 12V-class system
+    }
+}
+
 async fn answer_state_query(
     cmd: &str,
     xp: &XPlaneClient,
@@ -3257,6 +3287,24 @@ async fn answer_state_query(
 ) -> Option<String> {
     let t = cmd.to_ascii_lowercase();
     let mut parts: Vec<String> = Vec::new();
+
+    // System-wide failure check — reads the COMPLETE X-Plane failure set (see
+    // failures.rs), never a keyword subset, so a failure with an off-pattern name
+    // (a seized engine lives at rel_seize_0, no "engine" in it) can't hide. It's
+    // an early return because the scan is ~800 concurrent reads — a beat slower
+    // than a single value, so it only runs when the pilot actually asks.
+    let asks_failures = t.contains("what's wrong") || t.contains("whats wrong")
+        || t.contains("anything wrong") || t.contains("any failure") || t.contains("failures")
+        || t.contains("anything fail") || t.contains("anything broken") || t.contains("malfunction")
+        || t.contains("systems check") || t.contains("system status") || t.contains("systems status")
+        || t.contains("status check") || t.contains("all systems") || t.contains("everything ok");
+    if asks_failures {
+        return Some(match failures::scan(xp).await {
+            Ok(f) => failures::summary(&f)
+                .unwrap_or_else(|| "All systems normal, no active failures.".to_string()),
+            Err(_) => "I couldn't read the aircraft failure system.".to_string(),
+        });
+    }
 
     // Current control settings (e.g. "what's the mixture/throttle set to").
     if t.contains("mixture") {
@@ -3463,10 +3511,24 @@ async fn answer_state_query(
             }
         }
     }
-    if t.contains("ammeter") || t.contains("amps") || t.contains("charging") {
+    if t.contains("ammeter") || t.contains("amps") || t.contains("charging")
+        || t.contains("battery") || t.contains("voltage") || t.contains("volts")
+        || t.contains("state of charge")
+    {
+        // Report VOLTAGE and amps together. Amps alone is misleading: a dead-flat
+        // battery reads "+15 amps charging" while sitting at 20 volts, going
+        // nowhere (seen live). Voltage is the state-of-charge/health number; amps
+        // is only the direction of flow. The copilot used to read only amps.
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/electrical/battery_voltage_actual_volts").await {
+            let health = if battery_low(v) { " (low)" } else { "" };
+            parts.push(format!("battery {v:.1} volts{health}"));
+        }
+        if let Some(v) = read_engine0(xp, "sim/cockpit2/electrical/bus_volts").await {
+            parts.push(format!("bus {v:.1} volts"));
+        }
         if let Some(v) = read_engine0(xp, "sim/cockpit2/electrical/battery_amps").await {
             let state = if v > 1.0 { "charging" } else if v < -1.0 { "discharging" } else { "steady" };
-            parts.push(format!("ammeter {v:+.0} amps, {state}"));
+            parts.push(format!("{v:+.0} amps, {state}"));
         }
     }
     if t.contains("vacuum") || t.contains("suction") {
@@ -3590,7 +3652,36 @@ async fn poll_aircraft(xp: &XPlaneClient) -> Option<ui::Aircraft> {
         vsi: xp.get_float(datarefs::VVI_FPM).await.ok()?,
         flaps_pct: xp.get_float(datarefs::FLAP_RATIO).await.ok()? * 100.0,
         ap_mode: ap_mode(xp, None).await,
+        managing: active_managers(),
     })
+}
+
+/// What the copilot is actively managing right now — the continuous control
+/// loops that keep working between commands — one short line each, for the
+/// dashboard's "managing" panel. Ordered by priority: an emergency (autoland /
+/// recovery, both publish through [`autoland::PANEL`]) outranks the routine
+/// governors. Cheap atomic/mutex reads, safe to poll every tick.
+fn active_managers() -> Vec<String> {
+    let mut v = Vec::new();
+    if let Ok(p) = autoland::PANEL.lock() {
+        if !p.is_empty() {
+            v.push(p.clone());
+        }
+    }
+    // Recovery without a panel line yet (the watcher writes it a beat later).
+    if v.is_empty() && tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        v.push("recovery".to_string());
+    }
+    if let Some(a) = approach_guide::armed() {
+        v.push(format!("talk-down {} {}", a.icao, a.runway_id));
+    }
+    if let Some(s) = tools::speedhold::status() {
+        v.push(s);
+    }
+    if let Some(s) = tools::engine::mixture_status() {
+        v.push(s.to_string());
+    }
+    v
 }
 
 /// Summarize the active autopilot lateral mode for the panel. Reads prefer the
@@ -3794,8 +3885,13 @@ const COMMAND_KEYWORDS: &[&str] = &[
 
 /// True if the utterance is a question about the flight (answered from state,
 /// not actioned). Interrogative openers or a trailing "?". Kept conservative so
-/// it doesn't hijack commands — and misrouting is harmless anyway (answering is
-/// read-only). Command-ish openers like "can you set…" are deliberately excluded.
+/// it doesn't hijack commands, but NOT so conservative it misses a question that
+/// shares a command's keywords: "Where's the parking brake?" once SET the brake
+/// because the contraction "where's" wasn't an opener and "parking brake" parsed
+/// as a command (seen live). Every opener needs its contraction alongside, in
+/// both spellings, since one caller passes raw text and another passes the
+/// normalized form with apostrophes stripped. Command-ish openers like "can you
+/// set…" are deliberately excluded.
 fn looks_like_question(text: &str) -> bool {
     let t = text.trim().to_ascii_lowercase();
     if t.ends_with('?') {
@@ -3803,7 +3899,9 @@ fn looks_like_question(text: &str) -> bool {
     }
     const OPENERS: &[&str] = &[
         "what", "what's", "whats", "how", "how's", "hows", "how much", "how many",
-        "how far", "how high", "how fast", "where", "when", "which", "why", "tell me",
+        "how far", "how high", "how fast", "where", "where's", "wheres", "when",
+        "when's", "whens", "which", "why", "why's", "whys", "who", "who's", "whos",
+        "tell me",
         // Generic auxiliaries: no command starts with these, and they must beat the
         // command grammar ("is our heading 270?" answers, never acts).
         "is", "are", "am", "do", "does", "did", "have", "has",
@@ -4243,6 +4341,19 @@ mod tests {
         assert!(!is_bare_value("switch it back"));
     }
 
+    #[test]
+    fn battery_low_is_system_class_aware() {
+        use super::battery_low;
+        // 24V-class: the flat 20.5V we saw live is low; 27.5V charged is not.
+        assert!(battery_low(20.5));
+        assert!(!battery_low(27.5));
+        assert!(!battery_low(24.5));
+        // 12V-class must not be flagged low just for being under 23.
+        assert!(!battery_low(12.6));
+        assert!(!battery_low(13.8));
+        assert!(battery_low(10.9));
+    }
+
     use super::looks_like_question;
 
     #[test]
@@ -4308,6 +4419,11 @@ mod tests {
             // caught here and withheld from the grammar fast-path (which would
             // otherwise *act* on them) — see the fast-path gate in run_session.
             "is the heading 270?", "did we set flaps to ten?",
+            // Contraction openers, in raw and apostrophe-stripped forms: without
+            // them "Where's the parking brake?" parsed as a command and SET the
+            // brake (seen live). Never an action from a question shape.
+            "where's the parking brake", "wheres the parking brake",
+            "who's flying", "when's our descent",
         ] {
             assert!(looks_like_question(q), "{q:?} should be a question");
         }

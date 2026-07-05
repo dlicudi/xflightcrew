@@ -37,6 +37,9 @@ whisper-rs = { version = "0.12", features = ["whisper-cpp-tracing", "metal"] }
 
 # tooling glue
 async-trait = "0.1"
+# bounded-concurrency stream combinators for the failure scan (buffer_unordered
+# over ~800 failure-dataref reads with a borrowed client — see src/failures.rs)
+futures = "0.3"
 anyhow = "1"
 thiserror = "1"
 tracing = "0.1"

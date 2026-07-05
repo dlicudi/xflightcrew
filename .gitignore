@@ -44,3 +44,6 @@ voice/voices/
 
 # Generated manual-retrieval indexes (x-copilot index) — rebuildable artifacts.
 indexes/
+
+# Source PDFs for the indexes (FAA handbooks, POMs) — large, re-downloadable.
+/manuals/

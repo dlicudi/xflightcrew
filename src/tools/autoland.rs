@@ -69,6 +69,15 @@ impl Tool for Autoland {
                 "No autoland running.".to_string()
             });
         }
+        // Re-arming mid-approach is destructive: it kills the flying loop and
+        // spends ~6 s re-searching apt.dat with nobody on the controls (seen
+        // live at LERL: three "autoland" calls in three minutes on short final).
+        // An autoland already flying keeps flying.
+        if crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok("Autoland is already flying the approach. Say 'cancel autoland' \
+                       first if you want me to start over."
+                .to_string());
+        }
         crate::autoland::ABORT.store(false, std::sync::atomic::Ordering::SeqCst);
         crate::autoland::run_autoland(
             ctx.config.xplane_base_url.clone(),

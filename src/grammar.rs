@@ -88,6 +88,13 @@ pub fn normalize(transcript: &str) -> String {
         // live while the pilot tried five times to take the lever back.
         ("mic throttle", "my throttle"),
         ("my throat", "my throttle"),
+        // "idle" heard as "idol" after a power word ("Power Idol" seen live);
+        // guarded by the leading word so a genuine "idol" is never touched.
+        ("power idol", "power idle"),
+        ("throttle idol", "throttle idle"),
+        // "parking brake" split into "park and brake" (seen live: "Park and
+        // brake release."). Nobody commands "park and brake" otherwise.
+        ("park and brake", "parking brake"),
     ] {
         s = s.replace(heard, meant);
     }
@@ -201,7 +208,19 @@ fn number(t: &str) -> Option<i64> {
             continue;
         }
         if let Ok(d) = tok.parse::<i64>() {
-            cur = if cur == 0 { d } else { cur * 10 + d };
+            // A single digit after a bare tens value ADDS: whisper writes
+            // "twenty-eight" as "twenty 8", and the old concatenation made 208
+            // ("set flaps to twenty 8" → notch 208, seen live). Nobody speaks
+            // 208 that way (it would be "two zero eight" or "two hundred
+            // eight"), so 28 is the only sensible reading. Digit-group runs
+            // still concatenate ("2 7 0" → 270).
+            cur = if cur == 0 {
+                d
+            } else if (20..=90).contains(&cur) && cur % 10 == 0 && d <= 9 {
+                cur + d
+            } else {
+                cur * 10 + d
+            };
             found = true;
         } else if let Some((val, mult)) = word_value(tok) {
             if mult && val == 100 {
@@ -1092,6 +1111,17 @@ mod tests {
         assert_eq!(one("it was heat on").unwrap(), on);
         assert_eq!(one("a bit of heat on").unwrap(), on);
         assert_eq!(one("pitot heat off").unwrap().1, json!({"on":false}));
+    }
+
+    #[test]
+    fn tens_word_plus_digit_adds_not_concatenates() {
+        // Whisper writes "twenty-eight" as "twenty 8"; concatenation made 208
+        // (an impossible flap notch, seen live). It must ADD to 28.
+        assert_eq!(one("set flaps to twenty 8").unwrap(), ("set_flaps".into(), json!({"notch":"28"})));
+        assert_eq!(one("throttle to sixty 5 percent").unwrap().1, json!({"percent":65}));
+        // Digit-group runs still concatenate, and plain values are untouched.
+        assert_eq!(one("heading 2 7 0").unwrap().1, json!({"heading":270}));
+        assert_eq!(one("flaps thirty").unwrap().1, json!({"notch":"30"}));
     }
 
     #[test]

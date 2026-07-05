@@ -88,11 +88,14 @@ impl CarryForward {
         Ok(())
     }
 
-    /// The startup briefing for this airframe, or `None` on a first flight.
-    /// Recurring items (fired on 2+ flights, or 3+ times total) get named.
+    /// The startup briefing for this airframe: only the *recurring* things worth
+    /// watching today, or `None` when there's nothing notable. Deliberately silent
+    /// on a normal startup — it used to open every flight by reciting the last
+    /// flight's stats ("45 minutes airborne, 90 kilos burned…"), backward-looking
+    /// trivia that got old fast. Now it speaks only when a pattern has actually
+    /// recurred (a callout seen 3+ times), which is the one forward-looking thing
+    /// a pre-flight heads-up should carry.
     pub fn briefing(&self, aircraft: &str) -> Option<String> {
-        let last = self.last_flight.get(aircraft)?;
-        let mut s = format!("Last flight in this aircraft: {last}");
         let watch: Vec<&str> = self
             .tallies
             .get(aircraft)
@@ -102,10 +105,8 @@ impl CarryForward {
                 items.into_iter().take(2).map(|(id, _)| spoken_name(id)).collect()
             })
             .unwrap_or_default();
-        if !watch.is_empty() {
-            s.push_str(&format!(" I'll be watching {} today.", watch.join(" and ")));
-        }
-        Some(s)
+        (!watch.is_empty())
+            .then(|| format!("Heads up, this aircraft has a history of {}. I'll watch for it today.", watch.join(" and ")))
     }
 }
 
@@ -319,9 +320,21 @@ mod tests {
         cf.save(&mem).unwrap();
         let loaded = CarryForward::load(&mem);
         let brief = loaded.briefing("md82").expect("has a briefing");
-        assert!(brief.contains("rough one"));
+        // Only the forward-looking recurring watch — no last-flight recitation.
         assert!(brief.contains("sink rate"), "{brief}");
-        assert!(loaded.briefing("dc3").is_none(), "no memory of an airframe never flown");
+        assert!(!brief.contains("rough one"), "no backward-looking trivia: {brief}");
+        // Silent when there's no recurring pattern (and for an unflown airframe).
+        assert!(loaded.briefing("dc3").is_none(), "no recurring pattern → silent");
+    }
+
+    #[test]
+    fn startup_is_silent_without_a_recurring_pattern() {
+        // A one-off callout (only twice) must not trigger a startup briefing —
+        // startup stays quiet unless a pattern has actually recurred (3+).
+        let mut cf = CarryForward::default();
+        cf.last_flight.insert("c172".into(), "Debrief: uneventful.".into());
+        *cf.tallies.entry("c172".into()).or_default().entry("sink_rate".into()).or_insert(0) += 2;
+        assert!(cf.briefing("c172").is_none(), "2 occurrences is not a pattern");
     }
 
     #[test]

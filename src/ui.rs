@@ -45,6 +45,9 @@ pub struct Aircraft {
     pub vsi: f64,
     pub flaps_pct: f64,
     pub ap_mode: String,
+    /// The continuous control loops the copilot is running right now (speed
+    /// hold, mixture manager, autoland…), one short line each. Empty = hands off.
+    pub managing: Vec<String>,
 }
 
 /// One message from the voice loop (or poll thread) to the dashboard.
@@ -427,9 +430,13 @@ fn draw(f: &mut Frame, app: &App) {
         micarea,
     );
 
-    // right: aircraft (top) + commands (bottom)
-    let [acarea, cmdarea] =
-        Layout::vertical([Constraint::Length(9), Constraint::Min(3)]).areas(right);
+    // right: aircraft (top) + managing (middle) + commands (bottom)
+    let [acarea, mgarea, cmdarea] = Layout::vertical([
+        Constraint::Length(9),
+        Constraint::Length(5),
+        Constraint::Min(3),
+    ])
+    .areas(right);
 
     let a = &app.aircraft;
     let ac = vec![
@@ -443,6 +450,25 @@ fn draw(f: &mut Frame, app: &App) {
     f.render_widget(
         Paragraph::new(ac).block(Block::default().borders(Borders::ALL).title(" aircraft ")),
         acarea,
+    );
+
+    // What the copilot's continuous loops are working right now. Green when
+    // hands-on so an active governor is visible at a glance; dim when idle.
+    let mg: Vec<ListItem> = if app.aircraft.managing.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "hands off",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        app.aircraft
+            .managing
+            .iter()
+            .map(|m| ListItem::new(Span::styled(m.clone(), Style::default().fg(Color::Green))))
+            .collect()
+    };
+    f.render_widget(
+        List::new(mg).block(Block::default().borders(Borders::ALL).title(" managing ")),
+        mgarea,
     );
 
     // "say" example panel — scrollable (Up/Down in command mode) since the hint

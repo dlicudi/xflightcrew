@@ -20,6 +20,14 @@ pub fn embed_model() -> String {
     std::env::var("XCOPILOT_EMBED_MODEL").unwrap_or_else(|_| "nomic-embed-text".to_string())
 }
 
+/// The shared, aircraft-independent index: the public-domain FAA handbooks
+/// (PHAK, Airplane Flying Handbook, Instrument Flying/Procedures, Aviation
+/// Weather, Risk Management, Weight & Balance). Consulted alongside the active
+/// aircraft's POM index at question time, so "what is class B airspace" gets an
+/// answer even when no POM covers it. Built like any other index:
+/// `x-copilot index general_aviation manuals/faa/*.pdf`.
+pub const GENERAL_ID: &str = "general_aviation";
+
 /// Where an aircraft's index lives, relative to the working dir.
 pub fn index_path(aircraft_id: &str) -> String {
     format!("indexes/{aircraft_id}.json")

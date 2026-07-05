@@ -79,6 +79,16 @@ struct PercentArg {
     percent: f64,
 }
 
+/// Spoken query for an impossible percentage, or None if the value is sane.
+/// An out-of-range value is a mishear, not an intent ("Power two hundred
+/// percent" heard live), and the old clamp silently turned it into full power.
+/// A real copilot queries a nonsense number; it doesn't round it to the nearest
+/// lever stop and act.
+fn bad_percent_reply(system: &str, p: f64) -> Option<String> {
+    (!(0.0..=100.0).contains(&p))
+        .then(|| format!("Say again? I heard {system} {p:.0} percent, and it runs zero to one hundred."))
+}
+
 /// Drive a 0.0–1.0 actuator smoothly from its current value to `to`, like a hand
 /// easing a lever, rather than snapping it. The travel time scales with the size
 /// of the change (a small nudge is quick; a full idle→full sweep takes ~1.5s),
@@ -148,6 +158,16 @@ impl Tool for SetThrottle {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: ThrottleArgs = serde_json::from_value(args.clone())?;
+        if let Some(reply) = a.percent.and_then(|p| bad_percent_reply("throttle", p)) {
+            return Ok(reply);
+        }
+        // Same for a relative change: a garbled "by two hundred" would clamp to
+        // idle or full power, the worst possible readings of a mishear.
+        if let Some(d) = a.delta.filter(|d| d.abs() > 100.0) {
+            return Ok(format!(
+                "Say again? I heard a throttle change of {d:.0} percent, and that can't be right."
+            ));
+        }
         // A relative request adjusts the CURRENT lever — "reduce by ten" from 45%
         // goes to 35%, never to an absolute 10% (a power chop, seen live).
         let target_pct = if let Some(d) = a.delta {
@@ -203,6 +223,9 @@ impl Tool for SetMixture {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let p: PercentArg = serde_json::from_value(args.clone())?;
+        if let Some(reply) = bad_percent_reply("mixture", p.percent) {
+            return Ok(reply);
+        }
         // Safety gate: don't cut the mixture to idle cutoff in flight — that stops
         // the engine. (On the ground it's a normal shutdown, confirmed separately.)
         // Default to airborne if the read fails, so an unknown state errs safe.
@@ -295,6 +318,14 @@ async fn seek_metric_peak(ctx: &ToolCtx<'_>, metric: &str, drop_margin: f64) -> 
 /// released by the pilot ("my mixture"), by an explicit `set_mixture`, or by
 /// touching the lever. Mirrors `speedhold::ACTIVE`.
 pub static MIX_MANAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// One-line status for the dashboard's "managing" panel, when the continuous
+/// mixture manager is running.
+pub fn mixture_status() -> Option<&'static str> {
+    MIX_MANAGED
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then_some("mixture auto-lean")
+}
 
 /// Should the manager re-trim? Altitude or power moved enough that the last
 /// lean is stale — the same judgement a pilot makes ("we've climbed a bit,
@@ -961,6 +992,19 @@ impl Tool for StopEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn impossible_percent_is_queried_not_clamped() {
+        // "Power two hundred percent" (seen live) was silently clamped to full
+        // power. It must come back as a query, never an action.
+        let reply = bad_percent_reply("throttle", 200.0).expect("200% must be rejected");
+        assert!(reply.contains("200"), "reply names the heard value: {reply}");
+        assert!(bad_percent_reply("mixture", -5.0).is_some());
+        // Sane values pass through untouched, including the extremes.
+        assert!(bad_percent_reply("throttle", 0.0).is_none());
+        assert!(bad_percent_reply("throttle", 100.0).is_none());
+        assert!(bad_percent_reply("throttle", 65.0).is_none());
+    }
 
     #[test]
     fn retrim_triggers_on_altitude_or_power_change() {

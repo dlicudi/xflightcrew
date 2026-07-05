@@ -203,6 +203,54 @@ impl XPlaneClient {
             .ok_or_else(|| anyhow!("dataref {name} is not a scalar number: {data}"))
     }
 
+    /// List every dataref whose name starts with `prefix`, as `(name, id)` pairs.
+    /// The Web API's `filter[name]` is exact-match only, so this fetches the full
+    /// index once and filters locally — used to enumerate the *complete* failure
+    /// set (`sim/operation/failures/rel_*`, ~800 entries) without hardcoding names,
+    /// so the copilot can never be blind to a failure whose dataref it forgot.
+    pub async fn list_datarefs_by_prefix(&self, prefix: &str) -> Result<Vec<(String, i64)>> {
+        let url = format!("{}/api/v1/datarefs", self.base);
+        let index: DatarefIndex = with_retry(|| async {
+            self.http
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("GET {url} (Web API enabled?)"))?
+                .error_for_status()?
+                .json()
+                .await
+                .context("decoding dataref index")
+        })
+        .await?;
+        Ok(index
+            .data
+            .into_iter()
+            .filter(|d| d.name.starts_with(prefix))
+            .map(|d| (d.name, d.id))
+            .collect())
+    }
+
+    /// Read a dataref's `value` directly by numeric id, skipping name→id
+    /// resolution — for bulk reads of an already-enumerated set (the failure scan
+    /// reads hundreds at once). Returns the raw JSON so the caller decodes the
+    /// scalar-or-array shape.
+    pub async fn get_value_by_id(&self, id: i64) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v1/datarefs/{}/value", self.base, id);
+        let resp: ValueResponse = with_retry(|| async {
+            self.http
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("GET {url}"))?
+                .error_for_status()?
+                .json()
+                .await
+                .context("decoding dataref value")
+        })
+        .await?;
+        Ok(resp.data)
+    }
+
     /// Write a scalar float dataref.
     pub async fn set_float(&self, name: &str, value: f64) -> Result<()> {
         self.set_value(name, json!(value)).await

@@ -193,6 +193,7 @@ const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
+const VVI_FPM: &str = "sim/cockpit2/gauges/indicators/vvi_dial_fpm";
 // AP + controls (mirror of autopilot.rs / recover.rs).
 const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
@@ -271,6 +272,8 @@ pub fn run_autoland(
 
             let mut last_phase: Option<ApproachPhase> = None;
             let mut gear_down = false;
+            let mut last_flap: Option<f64> = None;
+            let mut vs_diverged: u32 = 0;
             loop {
                 if GEN.load(Ordering::SeqCst) != my_gen || ABORT.load(Ordering::SeqCst) {
                     break;
@@ -283,7 +286,7 @@ pub fn run_autoland(
                 let radio_ft = agl_m * M_TO_FT;
                 let gs_kts = gs_ms * MS_TO_KTS;
 
-                let g = guidance(lat, lon, alt, radio_ft, gs_kts, &rwy, approach_ias, 25.0);
+                let g = guidance(lat, lon, alt, radio_ft, gs_kts, ias, &rwy, approach_ias, 25.0);
                 let phase_word = match g.phase {
                     ApproachPhase::Intercept => "INTERCEPT",
                     ApproachPhase::Final => "FINAL",
@@ -320,22 +323,49 @@ pub fn run_autoland(
                 }
                 let _ = xp.set_float(VS_DIAL, g.target_vs_fpm).await;
 
-                // Speed: nudge the throttle toward the approach speed (idle in flare).
+                // Speed: nudge the throttle toward the approach speed (idle in
+                // flare). Ceiling is FULL power — the 0.9 cap plus full flaps
+                // left the LERL 172 pinned at 50-57 kt against a 65-kt target.
                 let thr_now = xp.get_float(THROTTLE_ALL).await.unwrap_or(0.5);
                 let thr = if g.phase == ApproachPhase::Flare {
                     0.0
                 } else {
-                    (thr_now + ((g.target_ias_kts - ias) * 0.004)).clamp(0.1, 0.9)
+                    (thr_now + ((g.target_ias_kts - ias) * 0.004)).clamp(0.1, 1.0)
                 };
                 let _ = xp.set_float(THROTTLE_ALL, thr).await;
 
-                // Config: gear down inside 6 nm; flaps scheduled by distance.
+                // Config: gear down inside 6 nm; flaps by distance AND vertical
+                // state (full only once on the path — see [`flap_schedule`]).
+                // Written only when the target changes, so the setting isn't
+                // re-asserted against the pilot every tick.
                 if !gear_down && g.dist_nm < 6.0 {
                     let _ = xp.set_float(GEAR_HANDLE, 1.0).await;
                     gear_down = true;
                 }
-                let flap = if g.dist_nm < 3.0 { 1.0 } else if g.dist_nm < 6.0 { 0.5 } else { 0.0 };
-                let _ = xp.set_float(FLAP_RATIO, flap).await;
+                let flap = flap_schedule(g.dist_nm, alt - g.glidepath_alt_ft);
+                if last_flap != Some(flap) {
+                    last_flap = Some(flap);
+                    let _ = xp.set_float(FLAP_RATIO, flap).await;
+                }
+
+                // Watchdog: the AP not FLYING the commanded vertical speed is how
+                // the LEMI approach dove 2,300 fpm into terrain with vs_cmd=0 and
+                // no callout. If actual VS diverges hard for ~5 s, re-arm the VS
+                // mode and tell the pilot — this is exactly when a hand on the
+                // yoke matters.
+                let vvi = xp.get_float(VVI_FPM).await.unwrap_or(g.target_vs_fpm);
+                if g.phase != ApproachPhase::Flare && (vvi - g.target_vs_fpm).abs() > 700.0 {
+                    vs_diverged += 1;
+                    if vs_diverged == 12 {
+                        let _ = xp.run_command(CMD_VS_MODE).await;
+                        announce(
+                            "Autopilot is not holding the descent. Watch the pitch — be ready to take it.".into(),
+                            Priority::Warning,
+                        );
+                    }
+                } else {
+                    vs_diverged = 0;
+                }
 
                 if last_phase != Some(g.phase) {
                     last_phase = Some(g.phase);
@@ -365,6 +395,31 @@ pub fn run_autoland(
 const GLIDEPATH_FT_PER_NM: f64 = 318.0;
 /// Final approach point: intercept the extended centreline this far out (nm).
 const FAP_NM: f64 = 5.0;
+/// Airspeed this far below the approach speed triggers speed protection (nose
+/// down to regain it), before the decay reaches a stall and disconnects the AP.
+/// Approach speed is already ~1.3×Vs, so this margin still stays well above stall.
+const SPEED_FLOOR_MARGIN_KTS: f64 = 7.0;
+
+/// Flare only inside this distance to the threshold — beyond it, a low radio
+/// altitude is terrain under the approach, not the runway. (25 ft on a 3° path
+/// is ~0.08 nm out; 0.35 leaves margin for displaced thresholds.)
+const FLARE_MAX_DIST_NM: f64 = 0.35;
+
+/// Flap setting for the approach: half inside 6 nm, full inside 3 nm — but full
+/// only once established ON the glidepath. While holding level BELOW the path
+/// waiting to capture (`alt_err` well negative), full flaps are an energy trap:
+/// the LERL 172 approach dragged along at 50–57 kt against a 65-kt target with
+/// the throttle governor already at its ceiling, and arrived at the flare with
+/// nothing left. Half flaps keep the drag survivable until the path is captured.
+pub fn flap_schedule(dist_nm: f64, alt_err_ft: f64) -> f64 {
+    if dist_nm < 3.0 && alt_err_ft > -150.0 {
+        1.0
+    } else if dist_nm < 6.0 {
+        0.5
+    } else {
+        0.0
+    }
+}
 
 /// A point `dist_nm` from (lat, lon) along true `bearing` (flat-earth good enough
 /// at approach ranges).
@@ -420,6 +475,7 @@ pub fn guidance(
     cur_alt_ft: f64,
     radio_alt_ft: f64,
     gs_kts: f64,
+    ias_kts: f64,
     rwy: &Runway,
     approach_ias: f64,
     flare_radio_ft: f64,
@@ -441,7 +497,11 @@ pub fn guidance(
     let join_nm = ((cur_alt_ft - rwy.elev_ft) / GLIDEPATH_FT_PER_NM * 1.15)
         .clamp(FAP_NM, 40.0);
 
-    let (phase, target_heading) = if radio_alt_ft <= flare_radio_ft {
+    let (phase, target_heading) = if radio_alt_ft <= flare_radio_ft && dist_nm <= FLARE_MAX_DIST_NM {
+        // Low radio altitude alone is NOT the flare cue — terrain rises to meet
+        // the approach path miles from the field (seen live: "flared" at 7 ft AGL
+        // 4.1 nm out at LEMI, power cut over open ground; and again into a dip
+        // 0.4 nm short at LERL). Flare only over the runway environment.
         (ApproachPhase::Flare, rwy.course_deg)
     } else if alt_err > CAPTURE_ABOVE_FT {
         // Too high for this distance — descend toward the join point.
@@ -462,13 +522,25 @@ pub fn guidance(
     // Track the path with a nominal descent for the current groundspeed plus an
     // error correction; bounded so it never dives.
     let nominal_vs = -(gs_kts / 60.0) * GLIDEPATH_FT_PER_NM;
-    let target_vs = match phase {
-        ApproachPhase::Flare => -100.0, // arrest the descent near the ground
-        // BELOW the glidepath (miles out it sits thousands of feet up): hold level
-        // and let it come down to us — do NOT climb to intercept, which bleeds speed
-        // toward a stall. Only ever descend; capture when the path reaches us.
-        _ if alt_err < -50.0 => 0.0,
-        _ => (nominal_vs - alt_err * 0.4).clamp(-1200.0, 0.0),
+    // SPEED PROTECTION overrides everything except the flare. Holding level below
+    // the glidepath to "wait for the path" bleeds airspeed just as surely as
+    // climbing does when the energy is marginal — that's the failure seen live:
+    // stuck below the path 13 nm out, IAS oscillating down to 53 kt in a level
+    // hold until the AP stalled off. A stall is fatal; being low is not. So when
+    // airspeed decays below the approach speed, lower the nose and trade a little
+    // altitude back for speed, proportional to how slow it is.
+    let speed_deficit = approach_ias - ias_kts;
+    let target_vs = if phase != ApproachPhase::Flare && speed_deficit > SPEED_FLOOR_MARGIN_KTS {
+        -(speed_deficit * 40.0).clamp(200.0, 700.0)
+    } else {
+        match phase {
+            ApproachPhase::Flare => -100.0, // arrest the descent near the ground
+            // On/above speed but below the glidepath: hold level and let the path
+            // descend to us — don't climb to intercept. Speed protection above has
+            // already handled the case where holding level would stall us.
+            _ if alt_err < -50.0 => 0.0,
+            _ => (nominal_vs - alt_err * 0.4).clamp(-1200.0, 0.0),
+        }
     };
 
     Guidance {
@@ -494,10 +566,28 @@ mod tests {
     }
 
     #[test]
+    fn speed_protection_lowers_the_nose_before_a_stall() {
+        // The live failure (XLE000N): stuck below the glidepath 13 nm out, holding
+        // level, IAS decaying to 53 kt until the AP stalled off. Below the path AND
+        // slow, the guidance must now command a DESCENT to regain speed, not a level
+        // hold. 5 nm south, well below the path, 55 kt against a 90 kt approach.
+        let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 5.0);
+        let g = guidance(lat, lon, 200.0, 200.0, 55.0, 55.0, &rwy_north(), 90.0, 20.0);
+        assert!(g.target_vs_fpm < -100.0, "slow + below path must descend, got {}", g.target_vs_fpm);
+        // On speed at the same spot, it holds level to wait for the path (no dive).
+        let g_ok = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 20.0);
+        assert_eq!(g_ok.target_vs_fpm, 0.0, "on speed below path → level hold");
+        // Speed protection never fights the flare (we WANT to slow down landing).
+        let g_flare = guidance(0.001, 0.0, 30.0, 15.0, 40.0, 40.0, &rwy_north(), 90.0, 20.0);
+        assert_eq!(g_flare.phase, ApproachPhase::Flare);
+        assert!(g_flare.target_vs_fpm > -200.0, "flare not overridden by speed floor");
+    }
+
+    #[test]
     fn glidepath_descends_toward_the_threshold() {
         // 5 nm south of the threshold at 2000 ft, 120 kt groundspeed, tracking north.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 5.0); // 5 nm south
-        let g = guidance(lat, lon, 2000.0, 2000.0, 120.0, &rwy_north(), 90.0, 20.0);
+        let g = guidance(lat, lon, 2000.0, 2000.0, 120.0, 90.0, &rwy_north(), 90.0, 20.0);
         assert!((g.dist_nm - 5.0).abs() < 0.2, "5 nm out, got {}", g.dist_nm);
         // Glidepath alt at 5 nm ≈ 1590 ft; we're above it → commanded to descend.
         assert!(g.glidepath_alt_ft > 1400.0 && g.glidepath_alt_ft < 1700.0);
@@ -513,7 +603,7 @@ mod tests {
         // AWAY from the runway (toward the join point down the extended
         // centreline) and descend.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 6.0); // 6 nm south
-        let g = guidance(lat, lon, 7000.0, 7000.0, 135.0, &rwy_north(), 110.0, 20.0);
+        let g = guidance(lat, lon, 7000.0, 7000.0, 135.0, 110.0, &rwy_north(), 110.0, 20.0);
         assert_eq!(g.phase, ApproachPhase::Intercept);
         // Runway is north (bearing ~0); the join point is further SOUTH — so the
         // commanded heading must be southbound, not at the runway.
@@ -524,10 +614,35 @@ mod tests {
 
     #[test]
     fn flare_near_the_ground_arrests_descent_and_tracks_runway() {
-        let g = guidance(0.001, 0.0, 30.0, 15.0, 100.0, &rwy_north(), 90.0, 20.0);
+        let g = guidance(0.001, 0.0, 30.0, 15.0, 100.0, 90.0, &rwy_north(), 90.0, 20.0);
         assert_eq!(g.phase, ApproachPhase::Flare);
         assert!(g.target_vs_fpm > -200.0, "flare eases the descent, got {}", g.target_vs_fpm);
         assert!(heading_diff(g.target_heading_deg, 0.0) < 1.0, "flare tracks the runway");
+    }
+
+    #[test]
+    fn low_radio_far_from_the_runway_is_terrain_not_a_flare() {
+        // The LEMI failure: 7 ft AGL over rising terrain 4.1 nm out — the old
+        // radio-only trigger "flared" (power to idle, vs -100) into open ground.
+        let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 4.1); // 4.1 nm south
+        let g = guidance(lat, lon, 900.0, 7.0, 130.0, 90.0, &rwy_north(), 90.0, 25.0);
+        assert_ne!(g.phase, ApproachPhase::Flare, "no flare 4 nm from the threshold");
+        // And the same low radio just short of the threshold IS the flare.
+        let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 0.1);
+        let g = guidance(lat, lon, 25.0, 15.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0);
+        assert_eq!(g.phase, ApproachPhase::Flare);
+    }
+
+    #[test]
+    fn full_flaps_wait_for_the_glidepath() {
+        // Established on the path inside 3 nm: full flaps.
+        assert_eq!(flap_schedule(2.0, 0.0), 1.0);
+        assert_eq!(flap_schedule(2.0, 100.0), 1.0);
+        // Dragging level BELOW the path (the LERL energy trap): stay at half.
+        assert_eq!(flap_schedule(2.0, -300.0), 0.5);
+        // Approach segment and clean segment unchanged.
+        assert_eq!(flap_schedule(4.5, -300.0), 0.5);
+        assert_eq!(flap_schedule(8.0, 0.0), 0.0);
     }
 
     #[test]

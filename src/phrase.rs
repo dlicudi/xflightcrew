@@ -207,36 +207,80 @@ pub fn fix_mishears(text: &str) -> String {
     // splits into tokens too far from "gyro" for the fuzzy gate to recover.
     let mut out = replace_ci(text, "j-rule", "gyro");
     out = replace_ci(&out, "j rule", "gyro");
-    // "throttle" is reliably heard as "total" when it leads a value-set
-    // ("total twenty percent" → "throttle ..."). Whisper drops the "thr-".
-    out = fix_total_throttle(&out);
+    for (garble, fix, leading_only) in VALUE_MISHEARS {
+        out = fix_value_mishear(&out, garble, fix, *leading_only);
+    }
     out
 }
 
-/// Rewrite a leading "total" to "throttle" when a throttle value follows — a
-/// number, percent, or full/idle/max. Guarded to a leading "total" + value so a
-/// genuine "total" ("total fuel", "what's the total") is never touched.
-fn fix_total_throttle(text: &str) -> String {
-    let trimmed = text.trim_start();
-    let starts_total = trimmed.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("total"))
-        && trimmed[5..].chars().next().is_none_or(|c| c.is_whitespace());
-    if !starts_total {
-        return text.to_string();
-    }
-    let low = trimmed.to_ascii_lowercase();
+/// Value-guarded keyword repairs: `(garble, replacement, leading_only)`. Every
+/// entry is a whole-keyword mishear SEEN LIVE in the flight logs, rewritten only
+/// when a settable value (number, percent, or lever/detent word) also appears in
+/// the utterance — so prose uses of the same word ("total fuel", "describe the
+/// fuel system") are never touched. `leading_only` restricts the rewrite to the
+/// utterance's first word, for garbles that are real words elsewhere in a
+/// sentence; a word that is meaningless anywhere in a cockpit repairs anywhere.
+const VALUE_MISHEARS: &[(&str, &str, bool)] = &[
+    ("total", "throttle", true),    // "Total twenty percent."
+    ("frontal", "throttle", true),  // "Frontal 70." (leading-only: frontal weather is real speech)
+    ("fraudal", "throttle", false), // "Fraudal twenty percent."
+    ("waffle", "throttle", false),  // "Reduce waffle to fifty percent."
+    ("laps", "flaps", true),        // "Laps eleven."
+    ("claps", "flaps", true),       // "Claps ten."
+    ("describe", "descend", true),  // "Describe five thousand feet."
+    ("clank", "climb", true),       // "Clank five thousand feet."
+];
+
+/// Apply one [`VALUE_MISHEARS`] entry: rewrite `garble` to `fix` when the
+/// utterance carries a value for it to set. Whole-word only, case-insensitive,
+/// original spacing and casing elsewhere preserved.
+fn fix_value_mishear(text: &str, garble: &str, fix: &str, leading_only: bool) -> String {
+    let low = text.to_ascii_lowercase();
     let has_value = low.contains("percent")
         || low.contains('%')
         || low.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| {
             !w.is_empty()
                 && (is_number_word(w)
                     || w.bytes().all(|b| b.is_ascii_digit())
-                    || matches!(w, "full" | "idle" | "max" | "maximum"))
+                    || matches!(w, "full" | "idle" | "max" | "maximum" | "up" | "down"))
         });
     if !has_value {
         return text.to_string();
     }
-    let lead = &text[..text.len() - trimmed.len()];
-    format!("{lead}throttle{}", &trimmed[5..])
+    if leading_only {
+        let trimmed = text.trim_start();
+        let leads = trimmed.len() >= garble.len()
+            && trimmed[..garble.len()].eq_ignore_ascii_case(garble)
+            && trimmed[garble.len()..].chars().next().is_none_or(|c| !c.is_ascii_alphanumeric());
+        if !leads {
+            return text.to_string();
+        }
+        let lead = &text[..text.len() - trimmed.len()];
+        format!("{lead}{fix}{}", &trimmed[garble.len()..])
+    } else {
+        replace_word_ci(text, garble, fix)
+    }
+}
+
+/// Replace every case-insensitive WHOLE-WORD occurrence of `needle` (given in
+/// lowercase) with `replacement` — an occurrence flanked by alphanumerics is
+/// part of a longer word and left alone ("waffles" keeps its "waffle").
+fn replace_word_ci(haystack: &str, needle: &str, replacement: &str) -> String {
+    let lower = haystack.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut out = String::with_capacity(haystack.len());
+    let mut i = 0;
+    while let Some(pos) = lower[i..].find(needle) {
+        let start = i + pos;
+        let end = start + needle.len();
+        let standalone = (start == 0 || !bytes[start - 1].is_ascii_alphanumeric())
+            && bytes.get(end).is_none_or(|b| !b.is_ascii_alphanumeric());
+        out.push_str(&haystack[i..start]);
+        out.push_str(if standalone { replacement } else { &haystack[start..end] });
+        i = end;
+    }
+    out.push_str(&haystack[i..]);
+    out
 }
 
 /// Join intra-word hyphens whisper inserts into compounds ("auto-pilot" →
@@ -320,6 +364,26 @@ mod tests {
         assert_eq!(fix_mishears("total fuel"), "total fuel");
         assert_eq!(fix_mishears("totally fine"), "totally fine");
         assert_eq!(fix_mishears("flaps ten"), "flaps ten");
+    }
+
+    #[test]
+    fn fixes_value_guarded_mishears_from_the_logs() {
+        // Every garble here was transcribed live (2026-07-02..04 logs) and fell
+        // through as a deterministic-miss. With a value present, it repairs.
+        assert_eq!(fix_mishears("Laps eleven."), "flaps eleven.");
+        assert_eq!(fix_mishears("Claps ten"), "flaps ten");
+        assert_eq!(fix_mishears("laps up"), "flaps up");
+        assert_eq!(fix_mishears("Frontal 70"), "throttle 70");
+        assert_eq!(fix_mishears("Fraudal twenty percent."), "throttle twenty percent.");
+        assert_eq!(fix_mishears("Reduce waffle to fifty percent."), "Reduce throttle to fifty percent.");
+        assert_eq!(fix_mishears("Describe five thousand feet."), "descend five thousand feet.");
+        assert_eq!(fix_mishears("Clank five thousand feet"), "climb five thousand feet");
+        // The value guard: the same words in prose stay untouched.
+        assert_eq!(fix_mishears("describe the fuel system"), "describe the fuel system");
+        assert_eq!(fix_mishears("a frontal system is passing"), "a frontal system is passing");
+        assert_eq!(fix_mishears("she claps"), "she claps");
+        // Whole-word only: no rewriting inside longer words.
+        assert_eq!(fix_mishears("waffles at 9"), "waffles at 9");
     }
 
     #[test]
