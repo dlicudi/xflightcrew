@@ -274,6 +274,10 @@ pub fn run_autoland(
             let mut gear_down = false;
             let mut last_flap: Option<f64> = None;
             let mut vs_diverged: u32 = 0;
+            // Airspeed history for the throttle governor's derivative term — the
+            // anti-stall reflex needs the TREND (kts/sec), not just the error.
+            let mut prev_ias: Option<f64> = None;
+            let mut prev_ias_t = std::time::Instant::now();
             loop {
                 if GEN.load(Ordering::SeqCst) != my_gen || ABORT.load(Ordering::SeqCst) {
                     break;
@@ -323,14 +327,25 @@ pub fn run_autoland(
                 }
                 let _ = xp.set_float(VS_DIAL, g.target_vs_fpm).await;
 
-                // Speed: nudge the throttle toward the approach speed (idle in
-                // flare). Ceiling is FULL power — the 0.9 cap plus full flaps
-                // left the LERL 172 pinned at 50-57 kt against a 65-kt target.
+                // Speed: hold the approach speed with the SAME governor the copilot
+                // uses for speed hold (speedhold::throttle_adjust) — a P+D law whose
+                // derivative term adds power while the airspeed is still UNWINDING,
+                // before the error grows, with extra authority on the slow side. The
+                // old loop here was P-only (0.004/kt, no trend), so it only reacted
+                // after speed was already gone and dribbled power in too slowly —
+                // the nose came up holding level, speed bled to a stall, the AP quit
+                // ("lose speed, lose AP", seen live at LERL/XLE000N). Idle in flare.
+                let now = std::time::Instant::now();
+                let dt_s = (now - prev_ias_t).as_secs_f64().clamp(0.1, 2.0);
+                let trend_kts_s = prev_ias.map_or(0.0, |p| (ias - p) / dt_s);
+                prev_ias = Some(ias);
+                prev_ias_t = now;
                 let thr_now = xp.get_float(THROTTLE_ALL).await.unwrap_or(0.5);
                 let thr = if g.phase == ApproachPhase::Flare {
                     0.0
                 } else {
-                    (thr_now + ((g.target_ias_kts - ias) * 0.004)).clamp(0.1, 1.0)
+                    let adj = crate::tools::speedhold::throttle_adjust(g.target_ias_kts - ias, trend_kts_s);
+                    (thr_now + adj).clamp(0.1, 1.0)
                 };
                 let _ = xp.set_float(THROTTLE_ALL, thr).await;
 
