@@ -508,10 +508,16 @@ pub fn guidance(
         let (jlat, jlon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, join_nm);
         (ApproachPhase::Intercept, bearing_deg(cur_lat, cur_lon, jlat, jlon))
     } else if dist_nm > FAP_NM + 0.5 {
-        // On (or under) the path, outside the FAP: run the extended centreline in.
-        let xtk = cross_track_nm(cur_lat, cur_lon, rwy);
-        let corr = (xtk * 8.0).clamp(-30.0, 30.0);
-        (ApproachPhase::Intercept, (rwy.course_deg - corr + 360.0) % 360.0)
+        // Outside the FAP: steer TO the Final Approach Point — a point FAP_NM out
+        // on the approach side of the threshold along the extended centreline —
+        // not the bare runway course. Tracking the raw course assumes we're
+        // already on the approach side flying inbound; when we're off to the side
+        // or PAST the threshold it flies us away from the field, the distance
+        // growing every tick (seen live: XLE000N, 12.6 -> 13.8 nm on a fixed
+        // heading, never intercepting). Aiming at the FAP always closes on the
+        // runway from the correct side, then the final branch tracks the centreline.
+        let (fap_lat, fap_lon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, FAP_NM);
+        (ApproachPhase::Intercept, bearing_deg(cur_lat, cur_lon, fap_lat, fap_lon))
     } else {
         // On final: track the runway course, corrected for lateral offset.
         let xtk = cross_track_nm(cur_lat, cur_lon, rwy);
@@ -563,6 +569,20 @@ mod tests {
             icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
             course_deg: 0.0, length_m: 3000.0, surface: 1, dist_nm: 0.0, elev_ft: 0.0,
         }
+    }
+
+    #[test]
+    fn intercept_steers_to_the_fap_not_away_from_the_field() {
+        // The live flee (XLE000N): outside the FAP the old law tracked the bare
+        // runway course, which flies AWAY when the aircraft is past the threshold.
+        // Place it 8 nm NORTH of a north-landing runway (past the field, departure
+        // side): the command must steer SOUTH toward the FAP, not north on course.
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 8.0); // 8 nm north, past the threshold
+        let g = guidance(lat, lon, 2000.0, 2000.0, 90.0, 90.0, &rwy_north(), 90.0, 20.0);
+        assert_eq!(g.phase, ApproachPhase::Intercept);
+        // FAP is 5 nm SOUTH of the threshold; from 8 nm north that's ~due south.
+        assert!(heading_diff(g.target_heading_deg, 180.0) < 20.0,
+            "must steer toward the FAP/field, got hdg {}", g.target_heading_deg);
     }
 
     #[test]
