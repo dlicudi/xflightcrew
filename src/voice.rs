@@ -291,18 +291,24 @@ impl Voice {
 /// Built lazily on the first station utterance, so a flight that never talks
 /// to ATC never pays for the extra session.
 enum StationVoice {
-    /// The warm session plus a transmission counter: each reply gets a fresh
-    /// radio-effect variant, because real squelch never sounds the same twice.
     #[cfg(feature = "onnx-tts")]
-    Onnx(Box<crate::tts_onnx::OnnxTts>, u32),
+    Onnx {
+        engine: Box<crate::tts_onnx::OnnxTts>,
+        /// Recorded squelch transient (VATSIM-style, e.g. the AFV click),
+        /// mono at the engine's rate. `None` = synthesized burst.
+        tail: Option<Vec<f32>>,
+        /// Counter so each reply gets a fresh radio-effect variant — real
+        /// squelch never sounds the same twice.
+        transmissions: u32,
+    },
     Say(Config),
 }
 
 impl StationVoice {
-    fn build(onnx_path: &str, say_voice: &str, say_rate: &str) -> Self {
+    fn build(config: &Config) -> Self {
         #[cfg(feature = "onnx-tts")]
-        if !onnx_path.is_empty() {
-            match crate::tts_onnx::OnnxTts::load(onnx_path) {
+        if !config.atc_piper_voice.is_empty() {
+            match crate::tts_onnx::OnnxTts::load(&config.atc_piper_voice) {
                 Ok(mut engine) => {
                     // Controller cadence: brisker pace and more rhythm variation
                     // than the voice's storybook defaults — alan-medium at stock
@@ -312,20 +318,40 @@ impl StationVoice {
                         Some(env_f32("XCOPILOT_ATC_TTS_LENGTH", 0.8)),
                         Some(env_f32("XCOPILOT_ATC_TTS_NOISE_W", 1.0)),
                     );
-                    tracing::info!(model = %onnx_path, "station voice: warm ONNX session + radio effect");
-                    return StationVoice::Onnx(Box::new(engine), 0);
+                    // Recorded squelch, resampled once to the voice's rate.
+                    // Missing/broken file degrades to the synthesized burst.
+                    let tail = (!config.atc_squelch_wav.is_empty())
+                        .then(|| {
+                            crate::radiofx::load_tail_wav(
+                                &config.atc_squelch_wav,
+                                engine.sample_rate(),
+                            )
+                        })
+                        .and_then(|r| match r {
+                            Ok(t) => Some(t),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "squelch wav unusable ({e:#}); synthesized tail instead"
+                                );
+                                None
+                            }
+                        });
+                    tracing::info!(
+                        model = %config.atc_piper_voice,
+                        squelch = if tail.is_some() { "recorded" } else { "synthesized" },
+                        "station voice: warm ONNX session + radio effect"
+                    );
+                    return StationVoice::Onnx { engine: Box::new(engine), tail, transmissions: 0 };
                 }
                 Err(e) => {
                     tracing::warn!("station voice load failed ({e:#}); falling back to `say`");
                 }
             }
         }
-        #[cfg(not(feature = "onnx-tts"))]
-        let _ = onnx_path;
         StationVoice::Say(Config {
             tts_backend: "say".into(),
-            say_voice: say_voice.to_string(),
-            say_rate: say_rate.to_string(),
+            say_voice: config.atc_voice.clone(),
+            say_rate: config.atc_rate.clone(),
             ..Config::default()
         })
     }
@@ -333,11 +359,13 @@ impl StationVoice {
     fn speak(&mut self, text: &str) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "onnx-tts")]
-            StationVoice::Onnx(engine, transmissions) => {
+            StationVoice::Onnx { engine, tail, transmissions } => {
                 *transmissions = transmissions.wrapping_add(1);
                 let variant = *transmissions;
-                engine.speak_with(text, move |s, r| {
-                    crate::radiofx::radioize_variant(s, r, variant)
+                let tail = tail.clone();
+                engine.speak_with(text, move |s, r| match &tail {
+                    Some(t) => crate::radiofx::radioize_with_tail(s, r, variant, t),
+                    None => crate::radiofx::radioize_variant(s, r, variant),
                 })
             }
             StationVoice::Say(config) => tts::speak(config, text),
@@ -401,11 +429,7 @@ impl Speaker {
 fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
     let chime_path = resolve_chime(&config.chime_path);
     let negative_path = resolve_negative(&config.negative_tone_path);
-    let station_cfg = (
-        config.atc_piper_voice.clone(),
-        config.atc_voice.clone(),
-        config.atc_rate.clone(),
-    );
+    let station_cfg = config.clone();
     let mut station: Option<StationVoice> = None; // lazy: first station utterance builds it
     let mut speaker = Speaker::build(config);
     loop {
@@ -469,9 +493,7 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if utt.station {
                 station
-                    .get_or_insert_with(|| {
-                        StationVoice::build(&station_cfg.0, &station_cfg.1, &station_cfg.2)
-                    })
+                    .get_or_insert_with(|| StationVoice::build(&station_cfg))
                     .speak(&utt.text)
             } else {
                 speaker.speak(&utt.text)
@@ -487,8 +509,8 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
                 tracing::error!("station voice panicked ({what}); demoting to `say` fallback");
                 station = Some(StationVoice::Say(Config {
                     tts_backend: "say".into(),
-                    say_voice: station_cfg.1.clone(),
-                    say_rate: station_cfg.2.clone(),
+                    say_voice: station_cfg.atc_voice.clone(),
+                    say_rate: station_cfg.atc_rate.clone(),
                     ..Config::default()
                 }));
             }

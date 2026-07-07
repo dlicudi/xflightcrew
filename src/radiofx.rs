@@ -20,6 +20,56 @@ pub fn radioize(samples: &mut Vec<f32>, sample_rate: u32) {
 /// behind Audio-for-VATSIM blending recorded, varying transients). Fully
 /// deterministic per variant, so tests stay exact.
 pub fn radioize_variant(samples: &mut Vec<f32>, sample_rate: u32, variant: u32) {
+    radioize_core(samples, sample_rate, variant, true);
+}
+
+/// The VATSIM-style version: the speech goes through the transmission chain,
+/// then a RECORDED squelch transient (e.g. AFV-Native's `Click_f32.wav`, the
+/// click every VATSIM pilot knows) is spliced onto the end, level- and
+/// gap-varied per transmission. The recording is appended *after* processing:
+/// the click is the receiver's own gate closing, not part of the transmitted
+/// audio, so it must not be band-passed or compressed with the speech.
+/// `tail` must already be mono at `sample_rate` (see [`load_tail_wav`]).
+pub fn radioize_with_tail(samples: &mut Vec<f32>, sample_rate: u32, variant: u32, tail: &[f32]) {
+    if samples.is_empty() {
+        return;
+    }
+    radioize_core(samples, sample_rate, variant, false);
+    let fs = sample_rate as f32;
+    let mut pick = Lcg::new(0x0000_7A11 ^ variant.wrapping_mul(0x9E37_79B9));
+    let mut range = |lo: f32, hi: f32| lo + (pick.next_f32() + 1.0) * 0.5 * (hi - lo);
+    let gap = (fs * range(0.04, 0.09)) as usize;
+    let gain = range(0.35, 0.55); // vs the peak-normalized speech
+    samples.resize(samples.len() + gap, 0.0);
+    samples.extend(tail.iter().map(|s| s * gain));
+}
+
+/// Read a squelch recording for [`radioize_with_tail`]: any WAV (float or
+/// int samples), downmixed to mono, resampled to `target_rate`, peak
+/// normalized so the per-transmission gain lands predictably.
+pub fn load_tail_wav(path: &str, target_rate: u32) -> anyhow::Result<Vec<f32>> {
+    use anyhow::Context as _;
+    let mut reader = hound::WavReader::open(path).with_context(|| format!("open {path}"))?;
+    let spec = reader.spec();
+    let raw: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(Result::ok).collect(),
+        hound::SampleFormat::Int => {
+            let scale = (1_i64 << (spec.bits_per_sample - 1)) as f32;
+            reader.samples::<i32>().filter_map(Result::ok).map(|s| s as f32 / scale).collect()
+        }
+    };
+    let mono = crate::mic::downmix(&raw, spec.channels as usize);
+    let mut out = crate::mic::resample_linear(&mono, spec.sample_rate, target_rate);
+    let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+    if peak > 0.0 {
+        for s in out.iter_mut() {
+            *s /= peak;
+        }
+    }
+    Ok(out)
+}
+
+fn radioize_core(samples: &mut Vec<f32>, sample_rate: u32, variant: u32, synth_tail: bool) {
     if samples.is_empty() {
         return;
     }
@@ -34,13 +84,17 @@ pub fn radioize_variant(samples: &mut Vec<f32>, sample_rate: u32, variant: u32) 
     // carrier stays up for a beat after the last word, then the receiver's
     // squelch closes with a smoothed hiss burst that cuts hard.
     let key_click = burst(&mut noise, (fs * range(0.008, 0.018)) as usize, range(0.07, 0.16));
-    let squelch = squelch_tail(
-        &mut noise,
-        fs,
-        range(0.05, 0.09),  // carrier hangs open this long after the last word
-        range(0.035, 0.07), // burst decay body
-        range(0.16, 0.28),  // burst level
-    );
+    let squelch = if synth_tail {
+        squelch_tail(
+            &mut noise,
+            fs,
+            range(0.05, 0.09),  // carrier hangs open this long after the last word
+            range(0.035, 0.07), // burst decay body
+            range(0.16, 0.28),  // burst level
+        )
+    } else {
+        Vec::new() // a recorded tail is spliced on after processing instead
+    };
     let mut buf = Vec::with_capacity(key_click.len() + samples.len() + squelch.len());
     buf.extend_from_slice(&key_click);
     buf.append(samples);
@@ -254,6 +308,25 @@ mod tests {
         for s in [&a, &b] {
             let peak = s.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
             assert!(peak <= 0.9 && peak > 0.5, "normalized: {peak}");
+        }
+    }
+
+    #[test]
+    fn recorded_tail_is_spliced_clean_after_the_gap() {
+        let fs = 22050;
+        let mut s = sine(1000.0, fs as f32, 0.3);
+        let tail: Vec<f32> = (0..800).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let mut plain = s.clone();
+        radioize_core(&mut plain, fs, 7, false);
+        radioize_with_tail(&mut s, fs, 7, &tail);
+        assert!(s.len() > plain.len() + tail.len(), "gap + tail appended");
+        // The tail is NOT band-passed or normalized with the speech: the last
+        // samples are exactly the recording at the per-variant gain.
+        let gain = s.last().unwrap() / tail.last().unwrap();
+        assert!((0.35..=0.55).contains(&gain.abs()), "tail gain in range: {gain}");
+        let spliced = &s[s.len() - tail.len()..];
+        for (a, b) in spliced.iter().zip(&tail) {
+            assert!((a - b * gain).abs() < 1e-6, "tail must be verbatim, scaled");
         }
     }
 

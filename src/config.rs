@@ -136,6 +136,11 @@ pub struct Config {
     /// session, distinct from the copilot's voice. Empty falls back to the
     /// `say` voice below. `XCOPILOT_ATC_PIPER_VOICE`.
     pub atc_piper_voice: String,
+    /// Recorded squelch transient spliced onto the end of every station
+    /// transmission (VATSIM-style; the default is AFV-Native's click, BSD-3,
+    /// see assets/afv/). Empty falls back to the synthesized burst.
+    /// `XCOPILOT_SQUELCH_WAV`.
+    pub atc_squelch_wav: String,
     /// macOS `say` voice for the ATC station, used when the ONNX station voice
     /// is empty or fails to load. `XCOPILOT_ATC_VOICE`.
     pub atc_voice: String,
@@ -204,6 +209,7 @@ impl Config {
             atc_airport: env_or("XCOPILOT_ATC_AIRPORT", "LXGB"),
             radio_ptt_dataref: env_or("XCOPILOT_RADIO_PTT_DATAREF", "xcopilot/radio_ptt_active"),
             atc_piper_voice: env_or("XCOPILOT_ATC_PIPER_VOICE", "models/en_GB-alba-medium.onnx"),
+            atc_squelch_wav: env_or("XCOPILOT_SQUELCH_WAV", "assets/afv/Click_f32.wav"),
             atc_voice: env_or("XCOPILOT_ATC_VOICE", "Daniel"),
             atc_rate: env_or("XCOPILOT_ATC_RATE", "165"),
         })

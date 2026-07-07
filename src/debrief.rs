@@ -52,7 +52,7 @@ impl FlightSummary {
             let total: u32 = self.callouts.values().sum();
             let mut ids: Vec<_> = self.callouts.iter().collect();
             ids.sort_by(|a, b| b.1.cmp(a.1));
-            let top: Vec<&str> = ids.iter().take(2).map(|(id, _)| spoken_name(id)).collect();
+            let top: Vec<String> = ids.iter().take(2).map(|(id, _)| spoken_name(id)).collect();
             s.push_str(&format!(" {total} callouts, mostly {}.", top.join(" and ")));
         }
         s
@@ -72,6 +72,12 @@ pub struct CarryForward {
     /// Airframe id → the last flight's spoken summary.
     #[serde(default)]
     pub last_flight: BTreeMap<String, String>,
+    /// Airframe id → epoch DAY (secs/86400) the briefing last played. A
+    /// session that restarts five times must not deliver the same heads-up
+    /// five times ("annoying", live 2026-07-07) — once a day is a briefing,
+    /// more is a nag.
+    #[serde(default)]
+    pub briefed_day: BTreeMap<String, u64>,
 }
 
 impl CarryForward {
@@ -96,11 +102,16 @@ impl CarryForward {
     /// recurred (a callout seen 3+ times), which is the one forward-looking thing
     /// a pre-flight heads-up should carry.
     pub fn briefing(&self, aircraft: &str) -> Option<String> {
-        let watch: Vec<&str> = self
+        let watch: Vec<String> = self
             .tallies
             .get(aircraft)
             .map(|t| {
-                let mut items: Vec<_> = t.iter().filter(|(_, &n)| n >= 3).collect();
+                let mut items: Vec<_> = t
+                    .iter()
+                    // Advisor items are profile-internal SOP nudges; their ids
+                    // are meaningless spoken ("advisor 0 cessna 172sp").
+                    .filter(|(id, &n)| n >= 3 && !id.starts_with("advisor_"))
+                    .collect();
                 items.sort_by(|a, b| b.1.cmp(a.1));
                 items.into_iter().take(2).map(|(id, _)| spoken_name(id)).collect()
             })
@@ -108,10 +119,31 @@ impl CarryForward {
         (!watch.is_empty())
             .then(|| format!("Heads up, this aircraft has a history of {}. I'll watch for it today.", watch.join(" and ")))
     }
+
+    /// [`briefing`](Self::briefing), at most once per day per airframe: checks
+    /// and records `briefed_day`, persisting on change. Restarting the copilot
+    /// mid-session stays silent.
+    pub fn briefing_once_today(dir: &Path, aircraft: &str) -> Option<String> {
+        let today = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() / 86_400)
+            .unwrap_or(0);
+        let mut cf = Self::load(dir);
+        if cf.briefed_day.get(aircraft) == Some(&today) {
+            return None;
+        }
+        let brief = cf.briefing(aircraft)?;
+        cf.briefed_day.insert(aircraft.to_string(), today);
+        if let Err(e) = cf.save(dir) {
+            tracing::warn!("carry-forward save failed: {e:#}");
+        }
+        Some(brief)
+    }
 }
 
-/// Check ids are code identifiers; speak them like a person.
-fn spoken_name(id: &str) -> &str {
+/// Check ids are code identifiers; speak them like a person. The fallback
+/// de-underscores, so an unmapped id degrades to words, never to "cht_warn".
+fn spoken_name(id: &str) -> String {
     match id {
         "sink_rate" => "sink rate",
         "altitude_bust" => "altitude capture",
@@ -119,8 +151,16 @@ fn spoken_name(id: &str) -> &str {
         "alt_not_charging" => "the charging system",
         "cabin_alt_caution" | "cabin_alt_warning" => "cabin altitude",
         "park_brake_rolling" => "the parking brake",
-        other => other,
+        "cht_caution" | "cht_warn" => "high cylinder head temps",
+        "oil_temp_caution" | "oil_temp_warn" => "high oil temperature",
+        "oil_press_low" => "low oil pressure",
+        "airspeed_caution" | "airspeed_warning" => "airspeed excursions",
+        "flap_overspeed" => "flap overspeeds",
+        "gyro_drift" => "gyro drift",
+        "carb_ice" => "carb ice",
+        other => return other.replace('_', " "),
     }
+    .to_string()
 }
 
 /// Minimal view of one black-box line — unknown kinds/fields ignored.

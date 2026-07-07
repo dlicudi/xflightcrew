@@ -80,6 +80,12 @@ impl OnnxTts {
         Ok(Self { session, phoneme_ids, sample_rate, scales })
     }
 
+    /// The voice's output sample rate (from its `.onnx.json`) — callers that
+    /// prepare audio to splice with this voice's output need it.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
     /// Override this voice's VITS scales after load — per-instance, unlike the
     /// `XCOPILOT_TTS_*` env knobs which apply to every voice in the process.
     /// `None` keeps the current value. noise = timbre variation, length = pace
@@ -532,12 +538,19 @@ mod station_voice_tests {
                       cleared for takeoff.";
         let out_dir = std::env::temp_dir().join("xc-audition");
         std::fs::create_dir_all(&out_dir).expect("mkdir");
-        for model in ["en_GB-alan-medium", "en_GB-northern_english_male-medium", "en_GB-alba-medium"] {
+        for (i, model) in ["en_GB-alan-medium", "en_GB-northern_english_male-medium", "en_GB-alba-medium"]
+            .iter()
+            .enumerate()
+        {
             let path = format!("models/{model}.onnx");
             let mut v = super::OnnxTts::load(&path).expect("load voice");
             v.override_scales(None, Some(0.8), Some(1.0)); // station cadence
             let mut s = v.synth(phrase).expect("synth");
-            crate::radiofx::radioize(&mut s, v.sample_rate);
+            // Production shape: the recorded AFV click when present.
+            match crate::radiofx::load_tail_wav("assets/afv/Click_f32.wav", v.sample_rate) {
+                Ok(tail) => crate::radiofx::radioize_with_tail(&mut s, v.sample_rate, i as u32 + 1, &tail),
+                Err(_) => crate::radiofx::radioize_variant(&mut s, v.sample_rate, i as u32 + 1),
+            }
             let wav = out_dir.join(format!("{model}.wav"));
             super::write_wav(&wav, &s, v.sample_rate).expect("write wav");
             println!("audition: {}", wav.display());

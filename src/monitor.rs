@@ -1390,7 +1390,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
     // Long-term memory: brief from the carry-forward on startup, and remember
     // the flight after shutdown. `was_airborne` arms the debrief on liftoff.
     let memory = crate::debrief::memory_dir();
-    if let Some(brief) = crate::debrief::CarryForward::load(&memory).briefing(&live.get().id) {
+    if let Some(brief) = crate::debrief::CarryForward::briefing_once_today(&memory, &live.get().id) {
         voice.alert(Priority::Advisory, brief);
     }
     let mut was_airborne = false;
@@ -1408,7 +1408,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
             states = checks.iter().map(|c| (c.id(), FireState::new())).collect();
             tracing::info!(checks = checks.len(), "monitor: reconfigured for new aircraft");
             crate::blackbox::record("flight_meta", serde_json::json!({ "aircraft": live.get().id }));
-            if let Some(brief) = crate::debrief::CarryForward::load(&memory).briefing(&live.get().id) {
+            if let Some(brief) = crate::debrief::CarryForward::briefing_once_today(&memory, &live.get().id) {
                 voice.alert(Priority::Advisory, brief);
             }
         }
