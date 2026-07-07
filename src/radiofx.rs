@@ -36,9 +36,11 @@ pub fn radioize(samples: &mut Vec<f32>, sample_rate: u32) {
         *s = lp.process(hp.process(*s));
     }
 
-    // Hot mic: drive into a soft clip, then normalize the peak.
+    // Hot mic: drive into a soft clip, then normalize the peak. Moderate
+    // drive — 2.2 flattened the voice's dynamics into a drone; 1.7 keeps the
+    // compression character without ironing the speech flat.
     for s in buf.iter_mut() {
-        *s = (*s * 2.2).tanh();
+        *s = (*s * 1.7).tanh();
     }
     let peak = buf.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
     if peak > 0.0 {

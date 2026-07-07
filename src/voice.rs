@@ -301,7 +301,15 @@ impl StationVoice {
         #[cfg(feature = "onnx-tts")]
         if !onnx_path.is_empty() {
             match crate::tts_onnx::OnnxTts::load(onnx_path) {
-                Ok(engine) => {
+                Ok(mut engine) => {
+                    // Controller cadence: brisker pace and more rhythm variation
+                    // than the voice's storybook defaults — alan-medium at stock
+                    // length_scale 1.0 was heard live as "drone like and slow".
+                    engine.override_scales(
+                        None,
+                        Some(env_f32("XCOPILOT_ATC_TTS_LENGTH", 0.8)),
+                        Some(env_f32("XCOPILOT_ATC_TTS_NOISE_W", 1.0)),
+                    );
                     tracing::info!(model = %onnx_path, "station voice: warm ONNX session + radio effect");
                     return StationVoice::Onnx(Box::new(engine));
                 }
@@ -501,6 +509,12 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             latch.cv.notify_all();
         }
     }
+}
+
+/// An env-tunable f32 with a default (station cadence knobs).
+#[cfg(feature = "onnx-tts")]
+fn env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
 /// Resolve the reminder chime to a playable file, or `None` to skip it. An

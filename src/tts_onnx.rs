@@ -80,6 +80,22 @@ impl OnnxTts {
         Ok(Self { session, phoneme_ids, sample_rate, scales })
     }
 
+    /// Override this voice's VITS scales after load — per-instance, unlike the
+    /// `XCOPILOT_TTS_*` env knobs which apply to every voice in the process.
+    /// `None` keeps the current value. noise = timbre variation, length = pace
+    /// (lower is faster), noise_w = rhythm variation.
+    pub fn override_scales(&mut self, noise: Option<f32>, length: Option<f32>, noise_w: Option<f32>) {
+        if let Some(v) = noise {
+            self.scales[0] = v;
+        }
+        if let Some(v) = length {
+            self.scales[1] = v;
+        }
+        if let Some(v) = noise_w {
+            self.scales[2] = v;
+        }
+    }
+
     fn ids_of(&self, key: &str) -> Vec<i64> {
         self.phoneme_ids.get(key).cloned().unwrap_or_default()
     }
@@ -504,23 +520,49 @@ fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
 
 #[cfg(test)]
 mod station_voice_tests {
-    /// Reproduces the live 2026-07-07 station-voice failure: the copilot's Ryan
-    /// session already warm, then Alan loaded as a SECOND session in the same
-    /// process and spoken through the radio effect — exactly what the speaker
-    /// thread does on the first tower transmission.
+    /// Dev tool, not an assertion: synthesize the same tower call through every
+    /// en_GB voice in models/ at the station's controller cadence, radio effect
+    /// applied, and write WAVs to `$TMPDIR/xc-audition/` for listening. Run:
+    /// `cargo test --lib audition_station_voices -- --ignored --nocapture`
+    #[test]
+    #[ignore = "writes audition WAVs from the real models; run manually"]
+    fn audition_station_voices() {
+        let phrase = "November one seven two Sierra Papa, Gibraltar Tower, \
+                      runway zero niner, wind zero niner zero degrees, three knots, \
+                      cleared for takeoff.";
+        let out_dir = std::env::temp_dir().join("xc-audition");
+        std::fs::create_dir_all(&out_dir).expect("mkdir");
+        for model in ["en_GB-alan-medium", "en_GB-northern_english_male-medium", "en_GB-alba-medium"] {
+            let path = format!("models/{model}.onnx");
+            let mut v = super::OnnxTts::load(&path).expect("load voice");
+            v.override_scales(None, Some(0.8), Some(1.0)); // station cadence
+            let mut s = v.synth(phrase).expect("synth");
+            crate::radiofx::radioize(&mut s, v.sample_rate);
+            let wav = out_dir.join(format!("{model}.wav"));
+            super::write_wav(&wav, &s, v.sample_rate).expect("write wav");
+            println!("audition: {}", wav.display());
+        }
+    }
+
+    /// Reproduces the live 2026-07-07 station-voice shape: the copilot's Ryan
+    /// session already warm, then the station voice (Alba, the shipping
+    /// default) loaded as a SECOND session in the same process and spoken
+    /// through the radio effect — exactly what the speaker thread does on the
+    /// first tower transmission.
     #[test]
     #[ignore = "loads the real voice models; run manually with --ignored"]
-    fn second_onnx_session_alan_with_radio_effect() {
+    fn second_onnx_session_station_voice_with_radio_effect() {
         let mut ryan = super::OnnxTts::load("models/en_US-ryan-high.onnx").expect("load ryan");
         let r = ryan.synth("Copy, flaps ten.").expect("ryan synth");
         assert!(!r.is_empty());
 
-        let mut alan = super::OnnxTts::load("models/en_GB-alan-medium.onnx").expect("load alan");
-        let mut a = alan
+        let mut alba = super::OnnxTts::load("models/en_GB-alba-medium.onnx").expect("load alba");
+        alba.override_scales(None, Some(0.8), Some(1.0));
+        let mut a = alba
             .synth("November one seven two, Gibraltar tower, reading you five.")
-            .expect("alan synth");
+            .expect("alba synth");
         assert!(!a.is_empty());
-        crate::radiofx::radioize(&mut a, alan.sample_rate);
+        crate::radiofx::radioize(&mut a, alba.sample_rate);
         assert!(!a.is_empty());
     }
 }
