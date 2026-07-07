@@ -132,8 +132,12 @@ pub struct Config {
     /// disables physical routing (content routing still applies).
     /// `XCOPILOT_RADIO_PTT_DATAREF`.
     pub radio_ptt_dataref: String,
-    /// macOS `say` voice for the ATC station — deliberately distinct from the
-    /// copilot's voice. `XCOPILOT_ATC_VOICE`.
+    /// Piper `.onnx` voice for the ATC station — a second warm in-process ONNX
+    /// session, distinct from the copilot's voice. Empty falls back to the
+    /// `say` voice below. `XCOPILOT_ATC_PIPER_VOICE`.
+    pub atc_piper_voice: String,
+    /// macOS `say` voice for the ATC station, used when the ONNX station voice
+    /// is empty or fails to load. `XCOPILOT_ATC_VOICE`.
     pub atc_voice: String,
     /// `say` rate (words per minute) for the ATC station. `XCOPILOT_ATC_RATE`.
     pub atc_rate: String,
@@ -199,6 +203,7 @@ impl Config {
             simbrief_id: env_or("XCOPILOT_SIMBRIEF_ID", ""),
             atc_airport: env_or("XCOPILOT_ATC_AIRPORT", "LXGB"),
             radio_ptt_dataref: env_or("XCOPILOT_RADIO_PTT_DATAREF", "xcopilot/radio_ptt_active"),
+            atc_piper_voice: env_or("XCOPILOT_ATC_PIPER_VOICE", "models/en_GB-alan-medium.onnx"),
             atc_voice: env_or("XCOPILOT_ATC_VOICE", "Daniel"),
             atc_rate: env_or("XCOPILOT_ATC_RATE", "165"),
         })

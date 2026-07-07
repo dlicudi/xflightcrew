@@ -18,6 +18,7 @@ mod audio;
 mod autoland;
 mod blackbox;
 mod debrief;
+mod radiofx;
 mod rag;
 mod checklist;
 mod config;
@@ -652,12 +653,7 @@ async fn run_session(
     let mut atc_station = if config.atc_airport.trim().is_empty() {
         None
     } else {
-        station::Station::load(
-            &config.apt_data_path,
-            &config.atc_airport.trim().to_uppercase(),
-            config.atc_voice.clone(),
-            config.atc_rate.clone(),
-        )
+        station::Station::load(&config.apt_data_path, &config.atc_airport.trim().to_uppercase())
     };
     // Radio-call vocabulary rides along in the whisper bias so "request taxi" /
     // "ready for departure" transcribe as reliably as cockpit commands.
@@ -836,7 +832,7 @@ async fn run_session(
                         if st.on_frequency(&xplane).await {
                             let line = "Station calling, say again.";
                             reporter.log(ui::LogKind::Readback, format!("TWR: {line}"));
-                            voice.say_as(Priority::Readback, &st.say_voice, &st.say_rate, line);
+                            voice.say_station(Priority::Readback, line);
                             continue;
                         }
                     }
@@ -866,7 +862,7 @@ async fn run_session(
                 if let Some(reply) = st.handle_transmission(&command.to_ascii_lowercase(), &xplane).await {
                     reporter.status(ui::Phase::Speaking);
                     reporter.log(ui::LogKind::Readback, format!("TWR: {reply}"));
-                    voice.say_as(Priority::Readback, &st.say_voice, &st.say_rate, &reply);
+                    voice.say_station(Priority::Readback, &reply);
                     reporter.status(ui::Phase::Listening);
                     continue;
                 }
@@ -996,7 +992,7 @@ async fn run_session(
                 if let Some(reply) = st.try_handle(&tl, &xplane).await {
                     reporter.status(ui::Phase::Speaking);
                     reporter.log(ui::LogKind::Readback, format!("TWR: {reply}"));
-                    voice.say_as(Priority::Readback, &st.say_voice, &st.say_rate, &reply);
+                    voice.say_station(Priority::Readback, &reply);
                     reporter.status(ui::Phase::Listening);
                     continue;
                 }

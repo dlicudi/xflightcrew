@@ -131,6 +131,16 @@ impl OnnxTts {
         crate::tts::play(&wav)
     }
 
+    /// Synthesize, run `fx` over the raw samples, then play — the seam the ATC
+    /// radio-transmission effect plugs into (see `radiofx`).
+    pub fn speak_with(&mut self, text: &str, fx: fn(&mut Vec<f32>, u32)) -> Result<()> {
+        let mut samples = self.synth_chunked(text)?;
+        fx(&mut samples, self.sample_rate);
+        let wav = std::env::temp_dir().join("x-copilot-onnx-fx.wav");
+        write_wav(&wav, &samples, self.sample_rate)?;
+        crate::tts::play(&wav)
+    }
+
     fn synth_chunked(&mut self, text: &str) -> Result<Vec<f32>> {
         let gap = vec![0.0_f32; (self.sample_rate as f64 * SENTENCE_GAP_S) as usize];
         let mut samples = Vec::new();

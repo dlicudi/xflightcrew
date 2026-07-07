@@ -64,11 +64,12 @@ struct Utterance {
     /// A tone-only utterance (empty `text`): play the negative tone and speak
     /// nothing. Used for the "heard you, didn't recognize it" acknowledgement.
     negative: bool,
-    /// Speak in an alternate macOS `say` voice `(voice, rate)` instead of the
-    /// copilot's own — the ATC station's voice. Going through the same queue
-    /// keeps the two voices arbitrated: they can never talk over each other,
-    /// and the mic stays gated across both.
-    alt_say: Option<(String, String)>,
+    /// Speak as the ATC station instead of the copilot: a second warm ONNX
+    /// voice (config `atc_piper_voice`) with the radio-transmission effect,
+    /// falling back to macOS `say`. Going through the same queue keeps the
+    /// two voices arbitrated: they can never talk over each other, and the
+    /// mic stays gated across both.
+    station: bool,
     /// Present for blocking callers; signalled once the utterance is spoken.
     done: Option<Arc<Latch>>,
 }
@@ -191,7 +192,7 @@ impl Voice {
         // No em/en dashes reach the TTS — they trip it up. One chokepoint for
         // every spoken utterance (readbacks, monitor callouts, prompts).
         let text = crate::phrase::scrub_dashes(&text);
-        self.push(Utterance { priority, seq: 0, text, chime, negative: false, alt_say: None, done });
+        self.push(Utterance { priority, seq: 0, text, chime, negative: false, station: false, done });
     }
 
     /// Push a fully-formed utterance onto the queue (stamping its FIFO seq under
@@ -220,7 +221,7 @@ impl Voice {
             text: String::new(),
             chime: false,
             negative: true,
-            alt_say: None,
+            station: false,
             done: Some(latch.clone()),
         });
         let mut spoken = latch.spoken.lock().unwrap();
@@ -255,11 +256,12 @@ impl Voice {
         }
     }
 
-    /// Queue an utterance in an alternate macOS `say` voice (the ATC station's)
-    /// and block until spoken. Same queue, same mic gate, same echo memory as
+    /// Queue an utterance as the ATC STATION and block until spoken: the
+    /// station's warm ONNX voice with the radio-transmission effect (falling
+    /// back to macOS `say`). Same queue, same mic gate, same echo memory as
     /// the copilot's own voice — the station can never talk over the copilot,
     /// and its audio bleeding back through the mic is rejected the same way.
-    pub fn say_as(&self, priority: Priority, say_voice: &str, say_rate: &str, text: impl Into<String>) {
+    pub fn say_station(&self, priority: Priority, text: impl Into<String>) {
         let latch = Arc::new(Latch {
             spoken: Mutex::new(false),
             cv: Condvar::new(),
@@ -271,12 +273,55 @@ impl Voice {
             text,
             chime: false,
             negative: false,
-            alt_say: Some((say_voice.to_string(), say_rate.to_string())),
+            station: true,
             done: Some(latch.clone()),
         });
         let mut spoken = latch.spoken.lock().unwrap();
         while !*spoken {
             spoken = latch.cv.wait(spoken).unwrap();
+        }
+    }
+}
+
+/// The ATC station's voice: a second warm ONNX session with the COM-radio
+/// transmission effect, or the `say` fallback when the model is unset/broken.
+/// Built lazily on the first station utterance, so a flight that never talks
+/// to ATC never pays for the extra session.
+enum StationVoice {
+    #[cfg(feature = "onnx-tts")]
+    Onnx(Box<crate::tts_onnx::OnnxTts>),
+    Say(Config),
+}
+
+impl StationVoice {
+    fn build(onnx_path: &str, say_voice: &str, say_rate: &str) -> Self {
+        #[cfg(feature = "onnx-tts")]
+        if !onnx_path.is_empty() {
+            match crate::tts_onnx::OnnxTts::load(onnx_path) {
+                Ok(engine) => {
+                    tracing::info!(model = %onnx_path, "station voice: warm ONNX session + radio effect");
+                    return StationVoice::Onnx(Box::new(engine));
+                }
+                Err(e) => {
+                    tracing::warn!("station voice load failed ({e:#}); falling back to `say`");
+                }
+            }
+        }
+        #[cfg(not(feature = "onnx-tts"))]
+        let _ = onnx_path;
+        StationVoice::Say(Config {
+            tts_backend: "say".into(),
+            say_voice: say_voice.to_string(),
+            say_rate: say_rate.to_string(),
+            ..Config::default()
+        })
+    }
+
+    fn speak(&mut self, text: &str) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "onnx-tts")]
+            StationVoice::Onnx(engine) => engine.speak_with(text, crate::radiofx::radioize),
+            StationVoice::Say(config) => tts::speak(config, text),
         }
     }
 }
@@ -337,6 +382,12 @@ impl Speaker {
 fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
     let chime_path = resolve_chime(&config.chime_path);
     let negative_path = resolve_negative(&config.negative_tone_path);
+    let station_cfg = (
+        config.atc_piper_voice.clone(),
+        config.atc_voice.clone(),
+        config.atc_rate.clone(),
+    );
+    let mut station: Option<StationVoice> = None; // lazy: first station utterance builds it
     let mut speaker = Speaker::build(config);
     loop {
         let mut q = inner.queue.lock().unwrap();
@@ -387,19 +438,16 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
                 }
             }
         }
-        // An alternate-voice utterance (the ATC station) bypasses the warm
-        // copilot voice and shells out to `say` with the station's voice.
-        let spoke = match &utt.alt_say {
-            Some((v, r)) => {
-                let station = Config {
-                    tts_backend: "say".into(),
-                    say_voice: v.clone(),
-                    say_rate: r.clone(),
-                    ..Config::default()
-                };
-                tts::speak(&station, &utt.text)
-            }
-            None => speaker.speak(&utt.text),
+        // A station utterance speaks through the ATC voice (warm ONNX + radio
+        // effect, built on first use) instead of the copilot's.
+        let spoke = if utt.station {
+            station
+                .get_or_insert_with(|| {
+                    StationVoice::build(&station_cfg.0, &station_cfg.1, &station_cfg.2)
+                })
+                .speak(&utt.text)
+        } else {
+            speaker.speak(&utt.text)
         };
         if let Err(e) = spoke {
             // An interrupt (PTT / barge-in) kills `say`/piper with SIGTERM — that's
@@ -462,7 +510,7 @@ mod tests {
     use super::*;
 
     fn utt(priority: Priority, seq: u64) -> Utterance {
-        Utterance { priority, seq, text: String::new(), chime: false, negative: false, alt_say: None, done: None }
+        Utterance { priority, seq, text: String::new(), chime: false, negative: false, station: false, done: None }
     }
 
     #[test]

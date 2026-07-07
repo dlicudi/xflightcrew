@@ -13,9 +13,6 @@ use crate::{atis, datarefs, nav, tower};
 pub struct Station {
     apt: nav::AirportInfo,
     tower_khz: i64,
-    /// The station's `say` voice and rate — distinct from the copilot's.
-    pub say_voice: String,
-    pub say_rate: String,
     twr: tower::Tower,
 }
 
@@ -23,7 +20,7 @@ impl Station {
     /// Load the station for `icao` from apt.dat. `None` (with a log line) when
     /// the field is missing or has no tower frequency — the copilot then runs
     /// exactly as before the merge.
-    pub fn load(apt_path: &str, icao: &str, say_voice: String, say_rate: String) -> Option<Station> {
+    pub fn load(apt_path: &str, icao: &str) -> Option<Station> {
         let apt = match nav::find_airport(apt_path, icao) {
             Ok(Some(a)) => a,
             Ok(None) => {
@@ -44,7 +41,7 @@ impl Station {
             mhz = twr_row.khz as f64 / 1000.0,
             "ATC station up: tower answers radio calls on this frequency"
         );
-        Some(Station { tower_khz: twr_row.khz, apt, say_voice, say_rate, twr: tower::Tower::new() })
+        Some(Station { tower_khz: twr_row.khz, apt, twr: tower::Tower::new() })
     }
 
     /// Content routing (shared PTT): if the utterance is a radio call AND COM1
@@ -192,8 +189,6 @@ mod tests {
                 ],
             },
             tower_khz: 131200,
-            say_voice: String::new(),
-            say_rate: String::new(),
             twr: tower::Tower::new(),
         }
     }
