@@ -15,10 +15,12 @@ pub fn radioize(samples: &mut Vec<f32>, sample_rate: u32) {
     let fs = sample_rate as f32;
     let mut noise = Lcg::new(0x5EED_CAFE);
 
-    // Key-down click and squelch tail: short noise bursts spliced around the
-    // speech, band-passed along with it so they sit in the same spectrum.
-    let key_click = burst(&mut noise, (fs * 0.02) as usize, 0.25);
-    let squelch = burst(&mut noise, (fs * 0.035) as usize, 0.35);
+    // Key-down click and squelch tail, band-passed along with the speech so
+    // they sit in the same spectrum. The tail is the signature sound: the
+    // carrier stays up for a beat after the last word, then the receiver's
+    // squelch closes with a smoothed hiss burst that cuts hard.
+    let key_click = burst(&mut noise, (fs * 0.012) as usize, 0.12);
+    let squelch = squelch_tail(&mut noise, fs);
     let mut buf = Vec::with_capacity(key_click.len() + samples.len() + squelch.len());
     buf.extend_from_slice(&key_click);
     buf.append(samples);
@@ -53,7 +55,7 @@ pub fn radioize(samples: &mut Vec<f32>, sample_rate: u32) {
     *samples = buf;
 }
 
-/// A fading noise burst (the squelch/key transient).
+/// A fading noise burst (the key-down transient).
 fn burst(noise: &mut Lcg, len: usize, amp: f32) -> Vec<f32> {
     (0..len)
         .map(|i| {
@@ -61,6 +63,32 @@ fn burst(noise: &mut Lcg, len: usize, amp: f32) -> Vec<f32> {
             noise.next_f32() * amp * fade
         })
         .collect()
+}
+
+/// The squelch closing after the transmission: ~70 ms of open carrier (just
+/// the hiss floor), then a smoothed noise burst — 3 ms attack, exponential
+/// decay over ~50 ms — ending in a hard cut. Smoothing the noise (one-pole
+/// average) turns a harsh crackle into the classic soft "psshht"; the abrupt
+/// end IS the squelch gate slamming shut, so no fade after it.
+fn squelch_tail(noise: &mut Lcg, fs: f32) -> Vec<f32> {
+    let carrier = (fs * 0.07) as usize;
+    let attack = (fs * 0.003) as usize;
+    let body = (fs * 0.05) as usize;
+    let mut out = Vec::with_capacity(carrier + attack + body);
+    // Open carrier: nothing but the floor (added globally later).
+    out.resize(carrier, 0.0);
+    // Smoothed hiss: fast ramp in, exponential decay, hard stop.
+    let mut smooth = 0.0_f32;
+    for i in 0..attack + body {
+        smooth = 0.55 * smooth + 0.45 * noise.next_f32();
+        let env = if i < attack {
+            i as f32 / attack.max(1) as f32
+        } else {
+            (-4.0 * (i - attack) as f32 / body.max(1) as f32).exp()
+        };
+        out.push(smooth * 0.22 * env);
+    }
+    out
 }
 
 /// Deterministic white-ish noise: a fixed-seed LCG, so tests are exact and no
@@ -186,8 +214,9 @@ mod tests {
         assert!(s.len() > before, "key click + squelch tail extend the audio");
         let peak = s.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
         assert!(peak <= 0.9 && peak > 0.5, "normalized hot but unclipped: {peak}");
-        // The squelch tail is audible noise, not silence.
-        let tail = &s[s.len() - (fs as usize * 25 / 1000)..];
+        // The squelch burst (last ~55 ms: attack + decay body) is audible
+        // noise, not silence.
+        let tail = &s[s.len() - (fs as usize * 55 / 1000)..];
         assert!(rms(tail) > 0.005, "squelch tail present, rms {}", rms(tail));
     }
 
