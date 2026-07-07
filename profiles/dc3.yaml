@@ -1,0 +1,186 @@
+# Aircraft profile — AWX DC-3 / C-47 (Todor Radonov), the awxdc3 add-on.
+# Loaded by src/aircraft.rs when X-Plane reports acf_ICAO "DC3"
+# (XCOPILOT_AIRCRAFT=auto). Capability flags gate which tools are exposed; the
+# tools own the standard X-Plane datarefs/commands, and per-airframe config
+# (flap detents, Vfe/Vne, lights, reference card) lives here.
+#
+# This is a twin-engine, retractable-gear, piston RADIAL — meaningfully bigger
+# than the GA singles. The add-on also drives several systems through custom
+# xlua scripts (plugins/xlua/scripts/) that OVERRIDE the stock datarefs:
+#   - mixture: a 4-notch lever (cutoff/auto-lean/auto-reach/max) on
+#     awx/c47/Cockpit/mixture_lever_{L,R,both}, with override_mixture=1 — so the
+#     generic set_mixture (which writes mixture_ratio_all) is ineffective here.
+#   - fuel: TWO selectors (awx/c47/cockpit/fuel_tank_selector_{left,right}),
+#     5-position (Off/LeftAux/LeftMain/RightMain/RightAux), driven by up/down
+#     CYCLE commands — doesn't fit the single-selector, direct-set tool model.
+#   - power/electrical: a 3-way power switch (awx/c47/cockpit/power_sw:
+#     batt / off / GPU) cycled up/down — no clean on/off command per system.
+#   - ignition: per-engine sim/cockpit/engine/ignition_on[0,1], not the single
+#     ignition_key the stock set_magnetos writes (handled via magnetos_per_engine).
+# The custom power, fuel selectors, notched mixture, and twin start are wired
+# through the cycle-switch / piston-start config below (see power_switch,
+# fuel_selectors, piston_start, mixture_notch). `throttle` (not `engine`) exposes
+# set_throttle alone — the generic piston group's mixture/magnetos/start would
+# write the wrong layer. The per-engine accessories (carb heat, boost pumps,
+# magnetos) use universal datarefs across both engines via `engines: 2`.
+
+id: dc3
+display_name: AWX DC-3
+
+# Universal-dataref tools — safe across airframes, verified to respond live.
+# NB: this airframe has NO functional X-Plane autopilot — servos_on/servos_toggle/
+# fdir_on never latch (autopilot_mode stays 0) even powered and airborne, and
+# there are no custom AWX AP datarefs. So autopilot is OFF (set_heading/altitude/
+# VS would always fail), and ILS too (prepare_ils flies the approach via the AP).
+autopilot: false
+ils: false
+throttle: true         # set_throttle only (throttle_ratio_all) — NOT the piston group
+barometer: true        # set_barometer
+com_radio: true        # set_com1
+com2_radio: true       # set_com2 / swap_radio
+nav_radio: true        # set_nav1 / set_obs
+transponder: true      # set_transponder (squawk)
+parking_brake: true    # set_parking_brake
+pitot_heat: true       # set_pitot_heat
+pitch_trim: true       # set_pitch_trim (universal elevator_trim)
+
+# Retractable gear (mains; the tailwheel is fixed). VLO/VLE 140 KIAS — the gear
+# tool refuses cycling above it.
+retractable_gear: true
+vlo_kts: 140.0
+
+# Twin (R-1830): per-engine accessory tools write both array elements.
+engines: 2
+
+# Per-engine systems, verified live (universal datarefs, both elements written):
+magnetos: true             # via ignition_on (off/R/L/both), not ignition_key — for the mag check
+magnetos_per_engine: true
+carb_heat: true            # carb_heat_ratio[0,1] — both engines together
+fuel_pump: true            # auxiliary boost pumps, fuel_pump_on[0,1]
+
+# Still off:
+engine: false          # the generic piston group; mixture is xlua-overridden, start is custom (see piston_start / mixture_notch)
+directional_gyro: false
+flood_lights: false
+speedbrake: false
+
+# --- Custom xlua systems, wired via the cycle-switch model (verified live) ---
+#
+# DC power switch: a 3-position rotary cycled by up/down commands (writing the
+# position dataref is a no-op on this add-on). Battery (0) gives a full 24V bus;
+# off (1); ground power (2). set_power drives it; the start sequence flips it to
+# battery first.
+power_switch:
+  switch: { position: awx/c47/cockpit/power_sw, up: awx/c47/powersw_up, down: awx/c47/powersw_dwn, min: 0, max: 2, wrap: false }
+  battery_readback: sim/cockpit2/electrical/battery_on
+  states:
+    - { key: battery,      spoken: battery on,    value: 0 }
+    - { key: "off",        spoken: power off,     value: 1 }
+    - { key: ground_power, spoken: ground power,  value: 2 }
+
+# Fuel selectors: one per side, each a 5-position rotary cycled up/down (wraps
+# 0<->4). Only the cycle command opens the fuel valve (has_fuel_flow_before_
+# mixture) — a dataref write doesn't — so this is REQUIRED for an engine start.
+# Engine 0 (left) feeds from its selector, engine 1 (right) from its; for start
+# each goes to its main tank (left main 2 / right main 3).
+fuel_selectors:
+  - key: left
+    spoken: left fuel selector
+    engine: 0
+    start_value: 2
+    switch: { position: awx/c47/cockpit/fuel_tank_selector_left, up: awx/c47/fuel_left_selector_up, down: awx/c47/fuel_left_selector_dwn, min: 0, max: 4, wrap: true }
+    positions:
+      - { key: "off",      spoken: off,        value: 0 }
+      - { key: left_aux,   spoken: left aux,   value: 1 }
+      - { key: left_main,  spoken: left main,  value: 2 }
+      - { key: right_main, spoken: right main, value: 3 }
+      - { key: right_aux,  spoken: right aux,  value: 4 }
+  - key: right
+    spoken: right fuel selector
+    engine: 1
+    start_value: 3
+    switch: { position: awx/c47/cockpit/fuel_tank_selector_right, up: awx/c47/fuel_right_selector_up, down: awx/c47/fuel_right_selector_dwn, min: 0, max: 4, wrap: true }
+    positions:
+      - { key: "off",      spoken: off,        value: 0 }
+      - { key: left_aux,   spoken: left aux,   value: 1 }
+      - { key: left_main,  spoken: left main,  value: 2 }
+      - { key: right_main, spoken: right main, value: 3 }
+      - { key: right_aux,  spoken: right aux,  value: 4 }
+
+# Twin piston start/shutdown. Mixture is the xlua-overridden notch lever
+# (awx/c47/Cockpit/mixture_lever_both: 0 cutoff .. 3 max); 2 = auto-reach (rich)
+# for start. Mags + starters + generators are stock X-Plane. crank_secs/
+# throttle_crack verified to catch a cold radial.
+piston_start:
+  starters: [sim/starters/engage_starter_1, sim/starters/engage_starter_2]
+  generators: [sim/electrical/generator_1_on, sim/electrical/generator_2_on]
+  mags_both: sim/magnetos/magnetos_both
+  mags_off: sim/magnetos/magnetos_off
+  mixture_lever: awx/c47/Cockpit/mixture_lever_both
+  mixture_start_notch: 2.0
+  mixture_cutoff_notch: 0.0
+  crank_secs: 6.0
+  throttle_crack: 0.12
+
+# Notched mixture lever (xlua-overridden, drives ENGN_mixt). Both engines move
+# together off the "both" lever; the readback is the lever itself, which holds
+# the selected notch (0..3) after a write. "rich" maps to auto-rich (the normal
+# running notch), "full rich"/"max" to 3.
+mixture_notch:
+  lever: awx/c47/Cockpit/mixture_lever_both
+  readback: awx/c47/Cockpit/mixture_lever_both
+  notches:
+    - { key: cutoff,    spoken: idle cutoff, value: 0 }
+    - { key: auto_lean, spoken: auto lean,   value: 1 }
+    - { key: auto_rich, spoken: auto rich,   value: 2 }
+    - { key: full_rich, spoken: full rich,   value: 3 }
+
+# Fuel-endurance alerting (minutes of fuel left at the current burn). Twin radials
+# are thirsty — ~100 USG/hr total in cruise (~270 kg/hr). Standard VFR reserves.
+fuel:
+  reserve_caution_min: 45.0
+  reserve_warning_min: 30.0
+  cruise_burn_kg_hr: 270.0
+
+# Clean (no-flap) stall speed, KIAS — drives the monitor's airspeed callouts.
+vs_clean_kts: 65.0
+
+# Never-exceed speed (Vne), KIAS — drives the monitor's overspeed callout.
+vne_kts: 178.0
+
+# Static reference figures recited on request ("what's Vr?", "approach speed?").
+# From the AWX C-47 release notes (Aug 2024) "Critical Speeds" + power tables and
+# the live acf weights. Vne and clean stall live above (the monitor uses them).
+reference:
+  kind: twin-engine aircraft
+  vy_kts: 105.0            # best rate of climb
+  vr_kts: 84.0             # rotate
+  vs0_kts: 58.0            # stall, full flaps
+  approach_kts: 85.0       # final approach (3/4 flaps)
+  cruise_kts: 140.0        # ~30" MP / 2050 RPM
+  best_climb_fpm: 750.0
+  max_gross_lb: 25200.0    # acf_m_max 11430 kg
+  empty_weight_lb: 17345.0 # acf_m_empty 7868 kg
+  useful_load_lb: 7855.0
+  service_ceiling_ft: 23200.0
+  fuel_capacity_gal: 822.0 # acf_m_fuel_tot 2245 kg
+  max_rpm: 2700.0          # take-off, 48" MP
+
+# Flap detents, retracted -> full. The DC-3's split flaps move continuously; the
+# add-on placards four positions (1/4, 1/2, 3/4, full) with per-notch Vfe (KIAS).
+# flap_ratio is the universal 0.0..1.0 handle dataref.
+flaps:
+  detents:
+    - { label: up,      spoken: up,             ratio: 0.0 }
+    - { label: quarter, spoken: one quarter,    ratio: 0.25, vfe_kts: 130.0 }
+    - { label: half,    spoken: half,           ratio: 0.5,  vfe_kts: 105.0 }
+    - { label: "three-quarter", spoken: three quarters, ratio: 0.75, vfe_kts: 99.0 }
+    - { label: full,    spoken: full,           ratio: 1.0,  vfe_kts: 97.0 }
+
+# Switchable lights. command_on/off drive the panel switch; dataref is read back
+# to confirm. (No strobes on the period airframe.)
+lights:
+  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit/electrical/nav_lights_on,    command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
+  - { key: beacon,  spoken: beacon,            dataref: sim/cockpit/electrical/beacon_lights_on, command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
+  - { key: landing, spoken: landing light,     dataref: sim/cockpit2/switches/landing_lights_on, command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+  - { key: taxi,    spoken: taxi light,        dataref: sim/cockpit2/switches/taxi_light_on,     command_on: sim/lights/taxi_lights_on,    command_off: sim/lights/taxi_lights_off }

@@ -145,6 +145,14 @@ pub struct Checklist {
     pub flaps: Option<FlapProfile>,
     pub electrical: Vec<ElectricalSystem>,
     pub fuel_selector: Option<FuelSelectorProfile>,
+    pub engines: usize,
+    pub magnetos_per_engine: bool,
+    /// Per-airframe park-brake valve sense for `set_parking_brake` (see
+    /// [`crate::aircraft::AircraftProfile::park_brake_valve_set`]).
+    pub park_brake_valve_set: Option<f64>,
+    /// Per-airframe pitot-heat switch override (see
+    /// [`crate::aircraft::AircraftProfile::pitot_heat_dataref`]).
+    pub pitot_heat_dataref: Option<String>,
 }
 
 impl Checklist {
@@ -220,6 +228,10 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
                     flaps: flaps.clone(),
                     electrical: electrical.clone(),
                     fuel_selector: fuel_selector.clone(),
+                    engines: profile.engines,
+                    magnetos_per_engine: profile.magnetos_per_engine,
+                    park_brake_valve_set: profile.park_brake_valve_set,
+                    pitot_heat_dataref: profile.pitot_heat_dataref.clone(),
                 });
             }
             // Both narration directives: arm the run-up confirm when the file
@@ -472,10 +484,16 @@ pub async fn run_step(
     flaps: &Option<FlapProfile>,
     electrical: &[ElectricalSystem],
     fuel_selector: &Option<FuelSelectorProfile>,
+    engines: usize,
+    magnetos_per_engine: bool,
+    park_brake_valve_set: Option<f64>,
+    pitot_heat_dataref: Option<String>,
     ctx: &ToolCtx<'_>,
 ) -> Result<String> {
     match tool {
-        "set_parking_brake" => SetParkingBrake.execute(args, ctx).await,
+        "set_parking_brake" => {
+            SetParkingBrake { valve_set: park_brake_valve_set }.execute(args, ctx).await
+        }
         "set_pitch_trim" => SetPitchTrim.execute(args, ctx).await,
         "set_electrical" => SetElectrical::new(electrical.to_vec()).execute(args, ctx).await,
         "set_mixture" => SetMixture.execute(args, ctx).await,
@@ -484,13 +502,20 @@ pub async fn run_step(
             Some(f) => SetFuelSelector::new(f.clone()).execute(args, ctx).await,
             None => bail!("no fuel selector on this airframe"),
         },
-        "set_magnetos" => SetMagnetos.execute(args, ctx).await,
-        "set_pitot_heat" => SetPitotHeat.execute(args, ctx).await,
-        "set_carb_heat" => SetCarbHeat.execute(args, ctx).await,
-        "set_fuel_pump" => SetFuelPump.execute(args, ctx).await,
+        "set_magnetos" => SetMagnetos { engines, per_engine: magnetos_per_engine }.execute(args, ctx).await,
+        "set_pitot_heat" => {
+            SetPitotHeat { override_dataref: pitot_heat_dataref }.execute(args, ctx).await
+        }
+        "set_carb_heat" => SetCarbHeat { engines }.execute(args, ctx).await,
+        "set_fuel_pump" => SetFuelPump { engines }.execute(args, ctx).await,
         "set_transponder_mode" => SetTransponderMode.execute(args, ctx).await,
         "autopilot_off" => AutopilotOff.execute(args, ctx).await,
-        "start_engine" => StartEngine.execute(args, ctx).await,
+        "start_engine" => StartEngine {
+            fuel_selector: fuel_selector.clone(),
+            alternator_on_cmds: crate::tools::alternator_on_cmds(electrical),
+        }
+        .execute(args, ctx)
+        .await,
         "stop_engine" => StopEngine.execute(args, ctx).await,
         "set_lights" => SetLights::new(lights.to_vec()).execute(args, ctx).await,
         "set_flaps" => match flaps {

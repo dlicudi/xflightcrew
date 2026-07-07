@@ -37,6 +37,9 @@ whisper-rs = { version = "0.12", features = ["whisper-cpp-tracing", "metal"] }
 
 # tooling glue
 async-trait = "0.1"
+# bounded-concurrency stream combinators for the failure scan (buffer_unordered
+# over ~800 failure-dataref reads with a borrowed client — see src/failures.rs)
+futures = "0.3"
 anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
@@ -55,6 +58,9 @@ hound = "3"
 # the default build stays light. `ort` wraps libonnxruntime.
 ort = { version = "2.0.0-rc.12", optional = true }
 earshot = "1.1.0"
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 # Native in-process ONNX TTS is the default voice backend (arm64 onnxruntime via

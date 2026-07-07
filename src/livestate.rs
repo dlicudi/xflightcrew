@@ -25,8 +25,15 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::Message;
 
 /// Read timeout on the socket so the loop wakes regularly to handle pings/close
-/// even when no values are changing.
-const WS_READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// even when no values are changing. Kept short because PTT press/release is read
+/// from this cache: a long timeout would delay the mic stopping on release and
+/// the barge-in firing on press. 20ms (~50Hz) is well under one X-Plane frame.
+const WS_READ_TIMEOUT: Duration = Duration::from_millis(20);
+
+/// How long to wait before re-connecting after the socket drops (X-Plane
+/// restart, network blip). Short enough to recover quickly, long enough not to
+/// hammer a down sim.
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 /// A cache of the latest pushed value per subscribed dataref name. Cloneable
 /// handle; the owning thread updates it in the background.
@@ -54,8 +61,12 @@ impl LiveState {
     }
 }
 
-/// The socket thread: resolve ids over REST, subscribe, then pump value updates
-/// into the cache until the socket drops (after which callers fall back to REST).
+/// The socket thread: (re)connect for the whole session. Each `connect_and_pump`
+/// runs until the socket drops; on drop we **clear the cache** — so a stale value
+/// can't linger (critical for PTT: a frozen "held" would keep the mic open with
+/// the button released; cleared, `get` returns `None` and the reader fails safe)
+/// — then retry. X-Plane reassigns dataref ids across restarts, so each attempt
+/// re-resolves them.
 fn run(base: String, names: Vec<String>, cache: Arc<Mutex<HashMap<String, f64>>>) {
     let Ok(http) = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -63,14 +74,33 @@ fn run(base: String, names: Vec<String>, cache: Arc<Mutex<HashMap<String, f64>>>
     else {
         return;
     };
-    let version = detect_version(&http, &base);
+    loop {
+        connect_and_pump(&http, &base, &names, &cache);
+        // Socket dropped or never connected — drop stale values so readers fall
+        // back (REST snapshot) or fail safe (PTT reads released), then retry.
+        if let Ok(mut c) = cache.lock() {
+            c.clear();
+        }
+        std::thread::sleep(RECONNECT_DELAY);
+    }
+}
+
+/// One connection lifecycle: resolve ids, subscribe, pump updates into the cache
+/// until the socket drops (then returns so the caller can reconnect).
+fn connect_and_pump(
+    http: &reqwest::blocking::Client,
+    base: &str,
+    names: &[String],
+    cache: &Arc<Mutex<HashMap<String, f64>>>,
+) {
+    let version = detect_version(http, base);
     let rest = format!("{base}/api/{version}");
 
     // Resolve each name to its numeric id, keeping the reverse map to label
     // incoming updates (which are keyed by id).
     let mut id_to_name: HashMap<i64, String> = HashMap::new();
-    for name in &names {
-        if let Some(id) = resolve_id(&http, &rest, name) {
+    for name in names {
+        if let Some(id) = resolve_id(http, &rest, name) {
             id_to_name.insert(id, name.clone());
         } else {
             tracing::debug!(dataref = %name, "livestate: could not resolve id (will REST-fallback)");
@@ -84,7 +114,7 @@ fn run(base: String, names: Vec<String>, cache: Arc<Mutex<HashMap<String, f64>>>
     // http -> ws, https -> wss.
     let ws_url = format!("{}/api/{version}", base.replacen("http", "ws", 1));
     let Ok((mut socket, _)) = tungstenite::connect(&ws_url) else {
-        tracing::warn!(url = %ws_url, "livestate: WebSocket connect failed; falling back to REST");
+        tracing::warn!(url = %ws_url, "livestate: WebSocket connect failed; will retry");
         return;
     };
     if let MaybeTlsStream::Plain(s) = socket.get_mut() {
@@ -114,7 +144,7 @@ fn run(base: String, names: Vec<String>, cache: Arc<Mutex<HashMap<String, f64>>>
             // Read timeout — normal; loop so we keep handling pings/close.
             Err(tungstenite::Error::Io(e))
                 if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(_) => return, // socket dropped — stop; callers REST-fallback
+            Err(_) => return, // socket dropped — return so run() reconnects
         }
     }
 }

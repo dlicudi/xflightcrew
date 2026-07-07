@@ -14,7 +14,22 @@ const TRIM_STEP: f64 = 0.10;
 /// Takeoff trim setting for the 172 — roughly neutral (the takeoff band).
 const TRIM_TAKEOFF: f64 = 0.0;
 
-pub struct SetParkingBrake;
+/// Park-brake VALVE (X-Plane 12). Aircraft that model it animate their handle
+/// from this, and its SENSE is per-aircraft: on the C90B 0 = set (and the sim
+/// pins `parking_brake_ratio` back to 1 while set); on the SR22 it's the
+/// opposite (1 = set, no ratio pinning). So the tool only drives the valve when
+/// the profile says which value means SET (`park_brake_valve_set`).
+const PARK_BRAKE_VALVE: &str = "sim/cockpit2/controls/park_brake_valve";
+const CMD_VALVE_TOGGLE: &str = "sim/flight_controls/park_brake_valve_toggle";
+/// The parking-brake toggle command — preferred over a raw dataref write:
+/// custom airframes intercept commands, while a written ratio can be ignored or
+/// overwritten by their systems scripts (the MD-82 pitot-heat lesson).
+const CMD_PARK_TOGGLE: &str = "sim/flight_controls/brakes_toggle_max";
+
+pub struct SetParkingBrake {
+    /// The valve value meaning SET on this airframe; `None` = leave the valve alone.
+    pub valve_set: Option<f64>,
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -29,9 +44,11 @@ impl Tool for SetParkingBrake {
     }
 
     fn description(&self) -> &str {
-        "Set or release the parking brake. Use for 'parking brake set', 'set the \
-         brakes', 'release parking brake', 'brakes off', 'park brake on', \
-         'hold the brakes', 'release the brakes', 'parking brake off'."
+        "Set or release the PARKING brake (the latching park-brake valve + handle) \
+         — NOT momentary wheel braking. Use only for 'parking brake set', 'park \
+         brake on', 'release the parking brake', 'parking brake off'. Do not use \
+         for 'hold the brakes' / 'brake' while rolling (that's regular braking, \
+         which has no tool)."
     }
 
     fn parameters(&self) -> Value {
@@ -46,18 +63,54 @@ impl Tool for SetParkingBrake {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: Args = serde_json::from_value(args.clone())?;
+        // Where the profile declares the valve's SET value, the valve must agree
+        // with the request — on airframes that pin the ratio from it (C90B) a
+        // release can't stick otherwise, and the handle animates from it either
+        // way. The desired value depends on the per-aircraft sense.
+        let desired_valve = self.valve_set.map(|set| if args.on { set } else { 1.0 - set });
+        let valve_now = match desired_valve {
+            Some(_) => ctx.xplane.get_float(PARK_BRAKE_VALVE).await.ok(),
+            None => None,
+        };
 
-        // If it's already where you asked, say so instead of a redundant "Roger".
+        // If everything's already where you asked, say so instead of a "Roger" —
+        // but only when the valve (if driven) agrees too.
         let already = ctx.xplane.get_float(PARK_BRAKE).await? > 0.5;
-        if already == args.on {
+        let valve_aligned = match (desired_valve, valve_now) {
+            (Some(want), Some(now)) => (now - want).abs() < 0.5,
+            _ => true,
+        };
+        if already == args.on && valve_aligned {
             return Ok(format!(
                 "Parking brake is already {}.",
                 if already { "set" } else { "off" }
             ));
         }
 
-        ctx.xplane.set_float(PARK_BRAKE, if args.on { 1.0 } else { 0.0 }).await?;
-        let set = ctx.xplane.get_float(PARK_BRAKE).await? > 0.5;
+        // Valve first (to the airframe's SET/RELEASED sense), then the brake —
+        // command-first, verified by readback, with the raw dataref write kept
+        // only as a fallback for models that ignore the toggle.
+        if let (Some(want), Some(now)) = (desired_valve, valve_now) {
+            if (now - want).abs() > 0.5 {
+                ctx.xplane.run_command(CMD_VALVE_TOGGLE).await?;
+            }
+        }
+        if already != args.on {
+            ctx.xplane.run_command(CMD_PARK_TOGGLE).await?;
+        }
+        // The command applies on the next sim frame — give it a beat.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let mut set = ctx.xplane.get_float(PARK_BRAKE).await? > 0.5;
+        if set != args.on {
+            ctx.xplane.set_float(PARK_BRAKE, if args.on { 1.0 } else { 0.0 }).await?;
+            set = ctx.xplane.get_float(PARK_BRAKE).await? > 0.5;
+        }
+        if set != args.on {
+            return Ok(format!(
+                "Tried, but the parking brake still reads {}. Check the handle.",
+                if set { "set" } else { "released" }
+            ));
+        }
         Ok(format!("Roger, parking brake {}.", if set { "set" } else { "released" }))
     }
 }

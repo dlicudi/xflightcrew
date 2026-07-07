@@ -61,6 +61,9 @@ struct Utterance {
     text: String,
     /// Play the attention chime just before speaking this one (reminders).
     chime: bool,
+    /// A tone-only utterance (empty `text`): play the negative tone and speak
+    /// nothing. Used for the "heard you, didn't recognize it" acknowledgement.
+    negative: bool,
     /// Present for blocking callers; signalled once the utterance is spoken.
     done: Option<Arc<Latch>>,
 }
@@ -183,18 +186,41 @@ impl Voice {
         // No em/en dashes reach the TTS — they trip it up. One chokepoint for
         // every spoken utterance (readbacks, monitor callouts, prompts).
         let text = crate::phrase::scrub_dashes(&text);
+        self.push(Utterance { priority, seq: 0, text, chime, negative: false, done });
+    }
+
+    /// Push a fully-formed utterance onto the queue (stamping its FIFO seq under
+    /// the lock). The single enqueue chokepoint for both speech and tones.
+    fn push(&self, mut utt: Utterance) {
         let mut q = self.inner.queue.lock().unwrap();
-        let seq = q.seq;
+        utt.seq = q.seq;
         q.seq += 1;
-        q.heap.push(Utterance {
-            priority,
-            seq,
-            text,
-            chime,
-            done,
-        });
+        q.heap.push(utt);
         drop(q);
         self.inner.cv.notify_one();
+    }
+
+    /// Play the negative tone (no speech) and block until it finishes — the
+    /// "heard you, but that isn't a command I recognize" acknowledgement. Blocks
+    /// like [`Voice::say`] so the mic stays gated over the tone and the loop
+    /// doesn't capture it before resuming.
+    pub fn negative(&self) {
+        let latch = Arc::new(Latch {
+            spoken: Mutex::new(false),
+            cv: Condvar::new(),
+        });
+        self.push(Utterance {
+            priority: Priority::Readback,
+            seq: 0,
+            text: String::new(),
+            chime: false,
+            negative: true,
+            done: Some(latch.clone()),
+        });
+        let mut spoken = latch.spoken.lock().unwrap();
+        while !*spoken {
+            spoken = latch.cv.wait(spoken).unwrap();
+        }
     }
 
     /// Queue an utterance and return immediately (monitor alerts).
@@ -279,6 +305,7 @@ impl Speaker {
 /// gap between them for the mic to slip through.
 fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
     let chime_path = resolve_chime(&config.chime_path);
+    let negative_path = resolve_negative(&config.negative_tone_path);
     let mut speaker = Speaker::build(config);
     loop {
         let mut q = inner.queue.lock().unwrap();
@@ -297,10 +324,35 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         drop(q); // release the queue while we speak (which is slow)
 
         gate.set_speaking(true);
+        // Tone-only: play the negative "unrecognized" cue and skip TTS entirely
+        // (nothing to speak, nothing to add to the echo list).
+        // A killed player (SIGTERM) is an intentional barge-in cut-off, not a
+        // failure — same treatment as the main TTS path below, which the tone
+        // and chime never got (they warned on every interrupted beep).
+        let log_play_err = |what: &str, e: anyhow::Error| {
+            let msg = format!("{e:#}");
+            if msg.contains("SIGTERM") || msg.contains("signal: 15") {
+                tracing::debug!("{what} interrupted (barge-in): {msg}");
+            } else {
+                tracing::warn!("{what} failed: {msg}");
+            }
+        };
+        if utt.negative {
+            if let Some(path) = &negative_path {
+                if let Err(e) = crate::tts::play(path) {
+                    log_play_err("negative tone", e);
+                }
+            }
+            if let Some(latch) = utt.done {
+                *latch.spoken.lock().unwrap() = true;
+                latch.cv.notify_all();
+            }
+            continue;
+        }
         if utt.chime {
             if let Some(path) = &chime_path {
                 if let Err(e) = crate::tts::play(path) {
-                    tracing::warn!("chime failed: {e:#}");
+                    log_play_err("chime", e);
                 }
             }
         }
@@ -344,12 +396,28 @@ fn resolve_chime(configured: &str) -> Option<std::path::PathBuf> {
     candidate.exists().then_some(candidate)
 }
 
+/// Resolve the "unrecognized command" negative tone to a playable file, or `None`
+/// to skip it. An explicit `XCOPILOT_NEGATIVE_TONE` wins; otherwise fall back to
+/// the macOS system error sound (a low bassoon thud — reads unmistakably as
+/// "no"). Only returns a path that exists, so a stale setting means "no tone"
+/// rather than a failed play on every miss.
+fn resolve_negative(configured: &str) -> Option<std::path::PathBuf> {
+    let candidate = if !configured.is_empty() {
+        std::path::PathBuf::from(configured)
+    } else if cfg!(target_os = "macos") {
+        std::path::PathBuf::from("/System/Library/Sounds/Basso.aiff")
+    } else {
+        return None;
+    };
+    candidate.exists().then_some(candidate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn utt(priority: Priority, seq: u64) -> Utterance {
-        Utterance { priority, seq, text: String::new(), chime: false, done: None }
+        Utterance { priority, seq, text: String::new(), chime: false, negative: false, done: None }
     }
 
     #[test]

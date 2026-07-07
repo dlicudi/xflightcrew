@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx};
-use crate::aircraft::FlapProfile;
+use crate::aircraft::{FlapDetent, FlapProfile};
 
 /// X-Plane flap handle position, 0.0 (up) .. 1.0 (full). Writable; the actual
 /// surfaces animate toward it. Reading it back gives the commanded notch.
@@ -76,12 +76,7 @@ impl Tool for SetFlaps {
 
         // Map the requested label to a known detent. Anything else is rejected —
         // the LLM can only command real detents, never an arbitrary ratio.
-        let target = match self
-            .flaps
-            .detents
-            .iter()
-            .find(|d| d.label.eq_ignore_ascii_case(&args.notch))
-        {
+        let target = match self.resolve(&args.notch) {
             Some(d) => d,
             None => {
                 let names: Vec<&str> = self.flaps.detents.iter().map(|d| d.spoken.as_str()).collect();
@@ -120,6 +115,22 @@ impl Tool for SetFlaps {
 }
 
 impl SetFlaps {
+    /// Resolve a requested notch to a detent. Exact label match first (a profile
+    /// may declare its own "full" or "down"); then the semantic aliases every
+    /// airframe understands — "landing"/"land"/"full"/"down" all mean the last
+    /// detent, whatever it's labelled (the MD-82's is "40", the 172's "full").
+    /// The per-notch Vfe gate still applies, so "flaps for landing" while fast
+    /// refuses rather than dumping full flap.
+    fn resolve(&self, notch: &str) -> Option<&FlapDetent> {
+        if let Some(d) = self.flaps.detents.iter().find(|d| d.label.eq_ignore_ascii_case(notch)) {
+            return Some(d);
+        }
+        if ["landing", "land", "full", "down"].iter().any(|a| notch.eq_ignore_ascii_case(a)) {
+            return self.flaps.detents.iter().max_by(|a, b| a.ratio.total_cmp(&b.ratio));
+        }
+        None
+    }
+
     /// Map an observed flap ratio to the nearest detent's spoken phrase.
     fn describe(&self, ratio: f64) -> &str {
         self.flaps
@@ -166,5 +177,17 @@ mod tests {
         let schema = SetFlaps::new(cessna_flaps()).parameters();
         let enum_vals = &schema["properties"]["notch"]["enum"];
         assert_eq!(enum_vals, &serde_json::json!(["up", "10", "20", "full"]));
+    }
+
+    #[test]
+    fn landing_alias_resolves_to_last_detent() {
+        let t = SetFlaps::new(cessna_flaps());
+        // Exact labels win; the aliases land on the highest-ratio detent.
+        assert_eq!(t.resolve("10").unwrap().label, "10");
+        assert_eq!(t.resolve("full").unwrap().label, "full"); // real label, not alias
+        for alias in ["landing", "land", "LANDING", "down"] {
+            assert_eq!(t.resolve(alias).unwrap().label, "full", "{alias}");
+        }
+        assert!(t.resolve("crazy").is_none());
     }
 }

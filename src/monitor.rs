@@ -39,6 +39,23 @@ const RENOTIFY_COOLDOWN: Duration = Duration::from_secs(30);
 /// deliberately tighter than this alert.)
 const GYRO_DRIFT_ADVISORY_DEG: f64 = 10.0;
 
+/// Where this flight is going — the context that turns the monitor from a
+/// systems watchdog into a copilot that can *anticipate*. Set by the main loop
+/// whenever a flight plan is fetched or loaded to the FMS; the descent advisor
+/// checks read it every tick. `None` = no plan known, advisors stay silent.
+#[derive(Debug, Clone)]
+pub struct Destination {
+    pub lat: f64,
+    pub lon: f64,
+    /// Field elevation, feet (the plan's destination waypoint altitude when
+    /// plausible, else 0 — a sea-level assumption only makes TOD *earlier*).
+    pub elev_ft: f64,
+    /// Planned top-of-descent distance from the destination, nm.
+    pub tod_ring_nm: f64,
+}
+
+pub static DESTINATION: std::sync::Mutex<Option<Destination>> = std::sync::Mutex::new(None);
+
 /// Coarse flight phase, estimated from motion and height. Used to arm/disarm
 /// checks (e.g. "flaps up on final" only matters on Approach).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -76,6 +93,12 @@ pub struct Snapshot {
     pub pushing_back: bool,
     pub engine_running: bool,
     pub alternator_on: bool,
+    /// Highest per-source charging output, amps (`generator_amps`, all sources).
+    /// Positive = at least one alternator/generator is demonstrably producing.
+    /// Multi-battery airframes (MD-82) idle with a small standing battery-bus
+    /// discharge even while both generators charge, so the battery ammeter alone
+    /// can't distinguish "generator failed" from "battery charger cycling".
+    pub generator_amps_max: f64,
     /// Directional-gyro precession vs the magnetic compass, degrees, folded into
     /// −180..180 (so a small *negative* drift reads as e.g. −4°, not 356°).
     pub gyro_drift_deg: f64,
@@ -108,13 +131,47 @@ pub struct Snapshot {
     pub low_vacuum: bool,
     /// Battery ammeter, amps. Positive = charging, negative = discharging.
     pub battery_amps: f64,
+    /// Parking-brake ratio (0 released .. 1 set) — for the rolling-with-the-brake
+    /// check. The C90 doesn't animate its handle from this, so the panel can look
+    /// released while the sim-level brake drags (seen live: 48 kt -> stopped).
+    pub park_brake: f64,
+    /// Cabin altitude, feet (`.../pressurization/indicators/cabin_altitude_ft`). On
+    /// an unpressurized airframe this tracks the actual altitude, which is exactly
+    /// what the hypoxia check wants; on a pressurized one it's the real cabin.
+    pub cabin_altitude_ft: f64,
+    /// Fuel tank selector position (`sim/cockpit2/fuel/fuel_tank_selector`,
+    /// 0 = OFF). `None` if the read failed.
+    pub fuel_selector: Option<f64>,
+    /// Indicated altitude, feet (`sim/flightmodel/misc/h_ind`).
+    pub alt_ft: f64,
+    /// Autopilot altitude preselector (the dial the pilot spins), feet.
+    /// `None` if the read failed. NOT `altitude_hold_ft`, which is the last
+    /// *captured* altitude and goes stale the moment a new target is dialed.
+    pub ap_alt_dial_ft: Option<f64>,
+    /// Autopilot servos engaged — someone (or something) is flying on the dial.
+    pub ap_servos_on: bool,
+    /// Gear handle down (fixed-gear airframes read permanently down).
+    pub gear_down: bool,
+    /// Values of the profile's advisor datarefs, index-aligned with
+    /// [`AircraftProfile::advisor`]. `None` = that read failed this tick.
+    pub advisor_values: Vec<Option<f64>>,
+    /// Position (`sim/flightmodel/position/latitude`/`longitude`).
+    pub lat: f64,
+    pub lon: f64,
+    /// Descent picture vs the planned destination, when one is known
+    /// ([`DESTINATION`]): great-circle distance to the field, its elevation,
+    /// and the planned TOD ring. All-or-nothing — `None` without a plan.
+    pub dest_dist_nm: Option<f64>,
+    pub dest_elev_ft: Option<f64>,
+    pub tod_ring_nm: Option<f64>,
     pub phase: Phase,
 }
 
 impl Snapshot {
     /// Read the snapshot from X-Plane. `None` if the sim is unreachable (the
-    /// caller just skips the tick and tries again).
-    async fn read(xp: &XPlaneClient) -> Option<Snapshot> {
+    /// caller just skips the tick and tries again). `advisor_drefs` are the
+    /// profile's phase-expectation switches, read best-effort per tick.
+    async fn read(xp: &XPlaneClient, advisor_drefs: &[String]) -> Option<Snapshot> {
         let on_ground = xp.get_float("sim/flightmodel/failures/onground_any").await.ok()? > 0.5;
         let groundspeed_kts =
             xp.get_float("sim/flightmodel/position/groundspeed").await.ok()? * MS_TO_KTS;
@@ -128,6 +185,31 @@ impl Snapshot {
             .get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot")
             .await
             .ok()?;
+        // Best-effort (a missing read must not kill the snapshot): the altitude
+        // picture for the bust/sink-rate guards.
+        let alt_ft = xp.get_float("sim/flightmodel/misc/h_ind").await.unwrap_or(0.0);
+        let ap_alt_dial_ft =
+            xp.get_float("sim/cockpit2/autopilot/altitude_dial_ft").await.ok();
+        let ap_servos_on =
+            xp.get_float("sim/cockpit2/autopilot/servos_on").await.unwrap_or(0.0) > 0.5;
+        let gear_down =
+            xp.get_float("sim/cockpit/switches/gear_handle_status").await.unwrap_or(1.0) > 0.5;
+        let mut advisor_values = Vec::with_capacity(advisor_drefs.len());
+        for dref in advisor_drefs {
+            advisor_values.push(xp.get_float(dref).await.ok());
+        }
+        // Position + the descent picture vs the planned destination (if any).
+        let lat = xp.get_float("sim/flightmodel/position/latitude").await.unwrap_or(0.0);
+        let lon = xp.get_float("sim/flightmodel/position/longitude").await.unwrap_or(0.0);
+        let dest = DESTINATION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (dest_dist_nm, dest_elev_ft, tod_ring_nm) = match dest {
+            Some(d) => (
+                Some(crate::haversine_nm(lat, lon, d.lat, d.lon)),
+                Some(d.elev_ft),
+                Some(d.tod_ring_nm),
+            ),
+            None => (None, None, None),
+        };
         // Best-effort (a missing read must not kill the snapshot): pushback state.
         let tug_attached =
             xp.get_float("sim/aircraft/overflow/pushback_attached").await.unwrap_or(0.0) > 0.5;
@@ -149,6 +231,14 @@ impl Snapshot {
             .copied()
             .unwrap_or(0.0)
             > 0.5;
+        // Best-effort (a missing read must not kill the snapshot): highest
+        // charging output across all sources, for the not-charging check.
+        let generator_amps_max = xp
+            .get_float_array("sim/cockpit2/electrical/generator_amps")
+            .await
+            .ok()
+            .and_then(|v| v.into_iter().reduce(f64::max))
+            .unwrap_or(0.0);
         // Best-effort: a missing/!unavailable drift dataref must not kill the
         // whole snapshot (which would silence every other check), so default to
         // 0.0 rather than propagating None. Fold into −180..180, same as the
@@ -224,6 +314,20 @@ impl Snapshot {
             .and_then(engine0)
             .unwrap_or(0.0);
 
+        // Parking brake for the rolling-with-brake check (best-effort).
+        let park_brake = xp
+            .get_float("sim/cockpit2/controls/parking_brake_ratio")
+            .await
+            .unwrap_or(0.0);
+        // Cabin altitude for the hypoxia check. Best-effort; an unpressurized
+        // airframe reports its actual altitude here, which is what we want.
+        let cabin_altitude_ft = xp
+            .get_float("sim/cockpit2/pressurization/indicators/cabin_altitude_ft")
+            .await
+            .unwrap_or(0.0);
+        // Fuel selector for the selector-off check (best-effort; None stays silent).
+        let fuel_selector = xp.get_float("sim/cockpit2/fuel/fuel_tank_selector").await.ok();
+
         let mut s = Snapshot {
             on_ground,
             groundspeed_kts,
@@ -237,6 +341,7 @@ impl Snapshot {
             pushing_back,
             engine_running,
             alternator_on,
+            generator_amps_max,
             gyro_drift_deg,
             endurance_min,
             fuel_kg,
@@ -249,6 +354,19 @@ impl Snapshot {
             rpm,
             low_vacuum,
             battery_amps,
+            park_brake,
+            cabin_altitude_ft,
+            fuel_selector,
+            alt_ft,
+            ap_alt_dial_ft,
+            ap_servos_on,
+            gear_down,
+            advisor_values,
+            lat,
+            lon,
+            dest_dist_nm,
+            dest_elev_ft,
+            tod_ring_nm,
             phase: Phase::Ground,
         };
         s.phase = estimate_phase(&s);
@@ -355,6 +473,7 @@ impl FireState {
     /// has held continuously for `min_duration`. Marks firing either way.
     fn active(
         &mut self,
+        id: &str,
         msg: String,
         sev: Severity,
         min_duration: Duration,
@@ -362,7 +481,14 @@ impl FireState {
         status: Option<&StatusSink>,
         now: Instant,
     ) {
-        if self.sustained(min_duration, now) && self.should_speak(sev, now) {
+        // While the copilot is flying the aircraft (an active recovery/autoland),
+        // stay quiet: it announces its own actions, and pilot-directed advice
+        // ("lower the nose, add power") is backwards when the copilot is the one
+        // doing it. The panel's "mute monitor" setting silences callouts too.
+        let flying = crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+            || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+            || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
+        if !flying && self.sustained(min_duration, now) && self.should_speak(sev, now) {
             // Mirror the callout to the in-sim panel (monitor speaks via Voice,
             // which otherwise bypasses the panel's Reporter), coloured by severity.
             if let Some(s) = status {
@@ -373,6 +499,13 @@ impl FireState {
                 };
                 s.alert(level, &msg);
             }
+            // Black box: the callout is part of the flight record (the LEAL–LEMD
+            // CFIT forensics had to be reconstructed without them), and it's what
+            // the post-flight distiller counts.
+            crate::blackbox::record(
+                "callout",
+                serde_json::json!({ "id": id, "sev": format!("{sev:?}"), "msg": &msg }),
+            );
             voice.alert(sev.into(), msg);
             self.last_spoken = Some(now);
         }
@@ -645,10 +778,13 @@ impl Check for LowVacuum {
 }
 
 /// Alternator not charging: the switch is on but the ammeter shows the battery
-/// discharging — a failed or declutched alternator the on/off check can't see.
-/// Pairs with [`AlternatorOffline`] (switch off). Caution: shed load before the
-/// battery dies.
-struct AlternatorNotCharging;
+/// discharging — a failed or declutched charging source the on/off check can't
+/// see. Pairs with [`AlternatorOffline`] (switch off). Caution: shed load before
+/// the battery dies. `noun` is the airframe's charging source ("alternator" on a
+/// piston, "generator" on a turbine — a King Air has no alternator).
+struct AlternatorNotCharging {
+    noun: &'static str,
+}
 
 impl Check for AlternatorNotCharging {
     fn id(&self) -> &'static str {
@@ -661,25 +797,408 @@ impl Check for AlternatorNotCharging {
         if !s.engine_running || !s.alternator_on {
             return None;
         }
+        // A visibly producing generator overrules the battery ammeter: on
+        // multi-battery airframes (MD-82) the battery bus idles at a small
+        // standing discharge (~-7 A, charger cycling) with both generators
+        // online, which the threshold alone reads as a failure. Verified live
+        // on the Laminar MD-82: generator_amps 39/16, battery_amps -7.
+        if s.generator_amps_max > 1.0 {
+            return None;
+        }
         (s.battery_amps < -5.0).then(|| {
             format!(
-                "Alternator's not charging — battery's draining at {:.0} amps. \
-                 Check the alternator and shed electrical load.",
-                s.battery_amps.abs()
+                "{noun}'s not charging — battery's draining at {amps:.0} amps. \
+                 Check the {lower} and shed electrical load.",
+                noun = self.noun,
+                lower = self.noun.to_lowercase(),
+                amps = s.battery_amps.abs()
             )
         })
+    }
+    /// Same start-transient sustain as [`AlternatorOffline`]: a turbine start pulls
+    /// 200+ amps from the battery through the starter-generator (in *starter*
+    /// mode), which the 5-second window read as a failed alternator. Only warn once
+    /// the discharge persists past a normal start-to-generator-online window.
+    fn min_duration(&self) -> Duration {
+        ALTERNATOR_SUSTAIN
+    }
+}
+
+/// Phase-expectation advisor: one profile-declared switch that should be on (or
+/// off) in the listed phases — the declarative SOP table, one check per row.
+/// Advisory severity: it's the copilot saying "aren't you forgetting something",
+/// not an alarm. The value is read into `Snapshot::advisor_values` by index.
+struct PhaseExpectation {
+    /// Leaked once per profile build — check ids must be `&'static str`.
+    id: &'static str,
+    index: usize,
+    expect_on: bool,
+    phases: Vec<Phase>,
+    say: String,
+}
+
+impl Check for PhaseExpectation {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn severity(&self) -> Severity {
+        Severity::Advisory
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if !self.phases.contains(&s.phase) {
+            return None;
+        }
+        let on = (*s.advisor_values.get(self.index)?)? > 0.5;
+        (on != self.expect_on).then(|| self.say.clone())
+    }
+    /// Generous sustain: SOP items get configured *around* phase changes, so
+    /// give the pilot half a minute before speaking up.
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+}
+
+/// Parse a profile's lowercase phase name. Unknown names are a profile bug —
+/// dropped with a log line rather than a panic.
+fn parse_phase(name: &str) -> Option<Phase> {
+    Some(match name {
+        "ground" => Phase::Ground,
+        "takeoff" => Phase::Takeoff,
+        "climb" => Phase::Climb,
+        "cruise" => Phase::Cruise,
+        "approach" => Phase::Approach,
+        "landing" => Phase::Landing,
+        _ => return None,
+    })
+}
+
+/// Descent advisor, part 1: top of descent coming up. The anticipatory version
+/// of the "when is TOD" question — the copilot volunteers it while there's
+/// still time to act, instead of answering after being asked. Fires once as
+/// the aircraft enters the 12-nm run-up to the planned TOD, level at altitude.
+struct TodAhead;
+
+impl Check for TodAhead {
+    fn id(&self) -> &'static str {
+        "tod_ahead"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Advisory
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if s.on_ground || s.vsi_fpm.abs() > 500.0 {
+            return None; // only when level — a climb/descent has its own plan
+        }
+        let (dist, elev, ring) = (s.dest_dist_nm?, s.dest_elev_ft?, s.tod_ring_nm?);
+        if s.alt_ft < elev + 6000.0 {
+            return None; // already low; TOD math is meaningless
+        }
+        let to_tod = dist - ring;
+        if !(0.0..=12.0).contains(&to_tod) {
+            return None;
+        }
+        let mins = (s.groundspeed_kts > 60.0).then(|| to_tod / s.groundspeed_kts * 60.0);
+        Some(match mins {
+            Some(m) => format!(
+                "Descent coming up. Top of descent in about {m:.0} minutes, {to_tod:.0} miles ahead."
+            ),
+            None => format!("Descent coming up. Top of descent {to_tod:.0} miles ahead."),
+        })
+    }
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(3)
+    }
+}
+
+/// Descent advisor, part 2: past the planned TOD and still level — the exact
+/// failure of the LEAL–LEMD flight (TOD slipped past unannounced; the descent
+/// started late, steep, and fast). Says what rate recovers the profile, so the
+/// fix is in the same breath as the problem.
+struct TodPassed;
+
+impl Check for TodPassed {
+    fn id(&self) -> &'static str {
+        "tod_passed"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Caution
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if s.on_ground || s.vsi_fpm < -400.0 {
+            return None; // descending → the message is moot
+        }
+        let (dist, elev, ring) = (s.dest_dist_nm?, s.dest_elev_ft?, s.tod_ring_nm?);
+        if s.alt_ft < elev + 4000.0 || dist >= ring - 1.0 || s.groundspeed_kts < 60.0 {
+            return None;
+        }
+        // Rate that reaches ~2,000 ft over the field with 5 nm to spare.
+        let height = s.alt_ft - (elev + 2000.0);
+        let mins = (dist - 5.0).max(2.0) / s.groundspeed_kts * 60.0;
+        let fpm = ((height / mins) / 100.0).round() * 100.0;
+        Some(format!(
+            "We're past the descent point. About {fpm:.0} feet a minute makes the profile."
+        ))
     }
     fn min_duration(&self) -> Duration {
         Duration::from_secs(5)
     }
 }
 
+/// Descent advisor, part 3: descending but above the slope. Uses a 300 ft/nm
+/// profile to a point 8 nm out (deceleration allowance) — deliberately a touch
+/// above the TOD ring's slope so a normal just-started descent never trips it,
+/// plus a 1,500 ft margin. High *and* fast is when the boards call gets added.
+struct HighOnProfile;
+
+impl Check for HighOnProfile {
+    fn id(&self) -> &'static str {
+        "high_on_profile"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Advisory
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if s.on_ground || s.vsi_fpm > -400.0 {
+            return None; // only mid-descent
+        }
+        let (dist, elev, ring) = (s.dest_dist_nm?, s.dest_elev_ft?, s.tod_ring_nm?);
+        if dist > ring + 5.0 || dist < 4.0 {
+            return None; // not on the arrival yet / inside the final where GPWS owns it
+        }
+        let profile_alt = elev + 2000.0 + (dist - 8.0).max(0.0) * 300.0;
+        let excess = s.alt_ft - profile_alt;
+        if excess < 1500.0 {
+            return None;
+        }
+        let rounded = (excess / 100.0).round() * 100.0;
+        Some(if s.ias_kts > 240.0 {
+            format!(
+                "High on the profile, about {rounded:.0} feet above the slope, and fast. Boards would help."
+            )
+        } else {
+            format!("High on the profile, about {rounded:.0} feet above the slope.")
+        })
+    }
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(8)
+    }
+}
+
+/// GPWS-style sink-rate guard (mode 1, simplified): excessive descent rate close
+/// to the ground. The allowance scales with height, so a normal 700-fpm final
+/// never trips it but a 2,000-fpm descent through 500 AGL does. Born of an
+/// LEAL–LEMD arrival that flew a 3,400-fpm dive into terrain with no callout:
+/// the threshold at 300 AGL is 1,800 fpm, which would have fired ~20 seconds out.
+struct SinkRate;
+
+impl Check for SinkRate {
+    fn id(&self) -> &'static str {
+        "sink_rate"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if s.on_ground || s.agl_ft > 2500.0 {
+            return None;
+        }
+        let limit = 1500.0 + s.agl_ft; // fpm of sink allowed at this height
+        (s.vsi_fpm < -limit).then(|| {
+            format!(
+                "Sink rate! {vsi:.0} feet a minute at {agl:.0} feet. Pull up.",
+                vsi = s.vsi_fpm.abs(),
+                agl = s.agl_ft
+            )
+        })
+    }
+    /// React fast — two ticks at 3 Hz, enough to skip a single glitched read.
+    fn min_duration(&self) -> Duration {
+        Duration::from_millis(600)
+    }
+}
+
+/// Altitude bust: the autopilot is flying *through* the dialed altitude instead
+/// of capturing it. On airframes whose AP never arms the preselector (the
+/// Laminar MD-82's dial is display-only to the sim AP), a dialed-in 5,000 simply
+/// doesn't level the descent — this is the check that turns that silent
+/// non-capture into a callout. Gated off in landing configuration (gear down or
+/// big flap): on final the dial legitimately holds the missed-approach altitude
+/// while the aircraft descends below it.
+struct AltitudeBust;
+
+impl Check for AltitudeBust {
+    fn id(&self) -> &'static str {
+        "altitude_bust"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        if s.on_ground || !s.ap_servos_on || s.gear_down || s.flap_ratio > 0.6 {
+            return None;
+        }
+        let dial = s.ap_alt_dial_ft?;
+        let diff = s.alt_ft - dial;
+        let busted = (s.vsi_fpm < -400.0 && diff < -200.0) // descending through it
+            || (s.vsi_fpm > 400.0 && diff > 200.0); // climbing through it
+        busted.then(|| {
+            format!(
+                "Through the selected altitude, {dial:.0} set, passing {alt:.0}. Check altitude capture.",
+                alt = s.alt_ft
+            )
+        })
+    }
+    /// A couple of seconds: enough to ride out the normal capture overshoot,
+    /// short enough to matter with terrain coming up.
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(3)
+    }
+}
+
+/// Hypoxia guard: cabin altitude climbing toward the level where the pilot greys
+/// out (the blackout you get unpressurized/without oxygen up high). Banded so the
+/// caution and warning don't both fire — a caution as it passes ~10,000 ft, then a
+/// warning past 12,500 (the regulatory oxygen line, and X-Plane's own annunciator
+/// threshold). Airborne only; on an unpressurized airframe the cabin altitude just
+/// tracks the real altitude, so this covers the GA singles too.
+struct CabinAltitude {
+    id: &'static str,
+    severity: Severity,
+    /// [low, high) band, feet. `high = None` means "and above".
+    band_ft: (f64, Option<f64>),
+    message: &'static str,
+    min_dur: Duration,
+}
+
+impl Check for CabinAltitude {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn severity(&self) -> Severity {
+        self.severity
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        let (low, high) = self.band_ft;
+        let in_band = s.cabin_altitude_ft >= low && high.map_or(true, |h| s.cabin_altitude_ft < h);
+        (!s.on_ground && in_band).then(|| self.message.to_string())
+    }
+    fn min_duration(&self) -> Duration {
+        self.min_dur
+    }
+}
+
+/// Rolling with the parking brake set — dragging the brakes on a taxi/takeoff
+/// roll. Caught twice live on the C90B, where the 3D handle doesn't reflect the
+/// sim-level brake (a stray 'b' key sets it invisibly). Groundspeed floor keeps
+/// it quiet at a standstill and during brake-on run-ups.
+struct RollingOnParkBrake;
+
+impl Check for RollingOnParkBrake {
+    fn id(&self) -> &'static str {
+        "rolling_park_brake"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Caution
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        (s.on_ground && s.groundspeed_kts > 5.0 && s.park_brake > 0.5)
+            .then(|| "Parking brake is set and we're rolling — release it.".to_string())
+    }
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(2)
+    }
+}
+
+/// Fuel selector OFF with the engine running — it's burning what's left in the
+/// lines. Seen live on the SR22 after a plugin reload (the xlua re-init snaps the
+/// selector to OFF mid-flight), and it's the forgotten-tank failure mode generally
+/// on selector-only airframes (the SR22 has no BOTH). Warning: minutes from a
+/// quiet engine.
+struct FuelSelectorOff;
+
+impl Check for FuelSelectorOff {
+    fn id(&self) -> &'static str {
+        "fuel_selector_off"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Warning
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        let sel = s.fuel_selector?;
+        (s.engine_running && sel < 0.5)
+            .then(|| "Fuel selector is off with the engine running — select a tank now.".to_string())
+    }
+    /// Short sustain so a selector transiting through OFF between tanks doesn't
+    /// trip it, but the callout still lands well before the lines run dry.
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(3)
+    }
+}
+
 fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     let mut checks: Vec<Box<dyn Check>> = Vec::new();
+
+    // Universal: every airframe can roll with the brake set.
+    checks.push(Box::new(RollingOnParkBrake));
+
+    // Universal terrain guard: any airframe can dive into the ground.
+    checks.push(Box::new(SinkRate));
+
+    // Descent advisor — armed only when a flight plan gave us a destination
+    // (the checks read `Snapshot::dest_*`, `None` without one).
+    checks.push(Box::new(TodAhead));
+    checks.push(Box::new(TodPassed));
+    checks.push(Box::new(HighOnProfile));
+
+    // Phase-expectation advisor rows from the profile's SOP table.
+    for (index, item) in profile.advisor.iter().enumerate() {
+        let phases: Vec<Phase> = item.phases.iter().filter_map(|p| parse_phase(p)).collect();
+        if phases.len() != item.phases.len() {
+            tracing::warn!(dataref = %item.dataref, "advisor item has unknown phase names; skipping");
+            continue;
+        }
+        checks.push(Box::new(PhaseExpectation {
+            // Leaked once per profile build (a handful of tiny strings) so the
+            // id can be `&'static str` like every other check's.
+            id: Box::leak(format!("advisor_{index}_{}", profile.id).into_boxed_str()),
+            index,
+            expect_on: item.expect_on,
+            phases,
+            say: item.say.clone(),
+        }));
+    }
+    // Altitude capture watchdog — needs an AP that flies a dialed altitude.
+    if profile.autopilot {
+        checks.push(Box::new(AltitudeBust));
+    }
+
+    // Hypoxia — applies to every airframe (cabin altitude tracks real altitude when
+    // unpressurized). Disjoint bands so only one fires at a time.
+    checks.push(Box::new(CabinAltitude {
+        id: "cabin_alt_caution",
+        severity: Severity::Caution,
+        band_ft: (10_000.0, Some(12_500.0)),
+        message: "Cabin altitude above ten thousand. Check the pressurization or get on oxygen.",
+        min_dur: Duration::from_secs(10),
+    }));
+    checks.push(Box::new(CabinAltitude {
+        id: "cabin_alt_warning",
+        severity: Severity::Warning,
+        band_ft: (12_500.0, None),
+        message: "Cabin altitude above twelve thousand five hundred. Oxygen now, or start down.",
+        min_dur: Duration::from_secs(4),
+    }));
     if !profile.electrical.is_empty() {
-        checks.push(Box::new(AlternatorOffline));
+        // Charging source is a "generator" on a turbine (King Air PT6), an
+        // "alternator" on a piston — a King Air has no alternator to reference.
+        let noun = if profile.turboprop_start.is_some() || profile.turbine_start {
+            "Generator"
+        } else {
+            "Alternator"
+        };
+        checks.push(Box::new(AlternatorOffline { noun }));
         // Switch-on-but-not-charging, caught via the ammeter.
-        checks.push(Box::new(AlternatorNotCharging));
+        checks.push(Box::new(AlternatorNotCharging { noun }));
     }
     if profile.directional_gyro {
         checks.push(Box::new(GyroDrift));
@@ -789,6 +1308,12 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             cruise_burn_kg_hr: fuel.cruise_burn_kg_hr,
         }));
     }
+    // Selector-equipped airframes only (the GA singles driving the sim's
+    // fuel_tank_selector) — a custom fuel system (cycle selectors, xlua-managed)
+    // can legitimately leave the sim selector at 0.
+    if profile.fuel_selector.is_some() {
+        checks.push(Box::new(FuelSelectorOff));
+    }
     if profile.pitch_trim {
         checks.push(Box::new(StabTrim));
     }
@@ -804,13 +1329,47 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
 
 /// Run the monitor loop until the process exits. Spawned on its own thread +
 /// runtime with its own X-Plane client; shares the [`Voice`] arbiter.
+/// The plugin panel's "mute monitor callouts" setting, refreshed each tick from
+/// its dataref. Checked by every callout alongside the copilot-is-flying gate.
+static PANEL_MUTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The live flight strip shown on the plugin panel: the active emergency line
+/// (if any), then cabin altitude airborne, then fuel endurance. " | " separators
+/// (ASCII-safe for the panel font). Empty hides the row.
+/// Round to 0.1 for compact black-box records.
+fn r1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
+
+fn compose_strip(s: &Snapshot) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Ok(e) = crate::autoland::PANEL.lock() {
+        if !e.is_empty() {
+            parts.push(e.clone());
+        }
+    }
+    if !s.on_ground {
+        parts.push(format!("CABIN {:.0}ft", s.cabin_altitude_ft));
+    }
+    if let Some(m) = s.endurance_min {
+        parts.push(format!("FUEL {}h{:02}m", (m / 60.0) as i64, (m % 60.0) as i64));
+    }
+    parts.join(" | ")
+}
+
 pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice: Voice, status: Option<StatusSink>) {
     // Checks are built from the active profile and rebuilt when the aircraft
     // switches (the generation counter changes), so a jet doesn't keep a 172's
     // stall/overspeed limits after a profile swap.
+    let advisor_drefs = |p: &AircraftProfile| -> Vec<String> {
+        p.advisor.iter().map(|a| a.dataref.clone()).collect()
+    };
     let mut gen = live.generation();
     let mut checks = build_checks(&live.get());
+    let mut drefs = advisor_drefs(&live.get());
     tracing::info!(checks = checks.len(), hz = config.monitor_hz, "monitor started");
+    // Stamp the record with the airframe so the distiller can key memory by it.
+    crate::blackbox::record("flight_meta", serde_json::json!({ "aircraft": live.get().id }));
 
     let xp = XPlaneClient::new(config.xplane_base_url.clone());
     let period = Duration::from_secs_f32(1.0 / config.monitor_hz.max(0.1));
@@ -825,16 +1384,35 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
     // it's called out on transitions here rather than as Checks.
     let mut prev_attached = false;
     let mut prev_pushing = false;
+    // Last strip pushed to the panel — only re-send on change.
+    let mut last_strip = String::new();
+
+    // Long-term memory: brief from the carry-forward on startup, and remember
+    // the flight after shutdown. `was_airborne` arms the debrief on liftoff.
+    let memory = crate::debrief::memory_dir();
+    if let Some(brief) = crate::debrief::CarryForward::load(&memory).briefing(&live.get().id) {
+        voice.alert(Priority::Advisory, brief);
+    }
+    let mut was_airborne = false;
+    // Talk-down pacing: when the last callout went out, and whether we've
+    // already handed over at the threshold (say it once, then shut up).
+    let mut guide_last: Option<Instant> = None;
+    let mut guide_handed_over = false;
 
     loop {
         // Aircraft switched → rebuild the checks for the new airframe.
         if live.generation() != gen {
             gen = live.generation();
             checks = build_checks(&live.get());
+            drefs = advisor_drefs(&live.get());
             states = checks.iter().map(|c| (c.id(), FireState::new())).collect();
             tracing::info!(checks = checks.len(), "monitor: reconfigured for new aircraft");
+            crate::blackbox::record("flight_meta", serde_json::json!({ "aircraft": live.get().id }));
+            if let Some(brief) = crate::debrief::CarryForward::load(&memory).briefing(&live.get().id) {
+                voice.alert(Priority::Advisory, brief);
+            }
         }
-        if let Some(mut snap) = Snapshot::read(&xp).await {
+        if let Some(mut snap) = Snapshot::read(&xp, &drefs).await {
             let now = Instant::now();
 
             // Pushback callouts (on the ground): tug hooks up → pushing → clear.
@@ -856,6 +1434,88 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
             }
             prev_attached = snap.tug_attached;
             prev_pushing = snap.pushing_back;
+
+            // Flight ended (was airborne, now parked with the engines off) →
+            // distill the black box into memory and speak the debrief. Once per
+            // flight: the arm resets only on the next liftoff.
+            if !snap.on_ground {
+                was_airborne = true;
+            } else if was_airborne && !snap.engine_running && snap.groundspeed_kts < 5.0 {
+                was_airborne = false;
+                let mem = memory.clone();
+                let done = tokio::task::spawn_blocking(move || {
+                    crate::debrief::remember(std::path::Path::new("logs/blackbox.jsonl"), &mem)
+                })
+                .await;
+                if let Ok(Some(summary)) = done {
+                    tracing::info!(aircraft = %summary.aircraft, "flight distilled to memory");
+                    if let Some(s) = status.as_ref() {
+                        s.alert(AlertLevel::Advisory, &summary.spoken());
+                    }
+                    voice.alert(Priority::Advisory, summary.spoken());
+                }
+            }
+
+            // Talk-down: PAR-style callouts down the synthesized approach path,
+            // armed by the visual_approach tool. Advisory narration only — the
+            // pilot flies. Muted while the copilot itself is flying (recover /
+            // autoland) or the panel mute is on, same as every other callout.
+            if let Some(path) = crate::approach_guide::armed() {
+                let quiet = crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                    || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                    || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
+                if snap.on_ground {
+                    // Touchdown completes the guidance — but only if we actually
+                    // guided in the air. Armed on the ground (pre-takeoff, or
+                    // testing on the ramp) it stays armed for the flight instead
+                    // of instantly "completing".
+                    if guide_last.is_some() || guide_handed_over {
+                        crate::approach_guide::cancel();
+                        if !quiet {
+                            voice.alert(Priority::Advisory, "Down. Guidance complete.".to_string());
+                        }
+                        (guide_last, guide_handed_over) = (None, false);
+                    }
+                } else {
+                    let d = crate::approach_guide::deviations(&path, snap.lat, snap.lon, snap.alt_ft);
+                    if d.dist_nm > 35.0 {
+                        crate::approach_guide::cancel();
+                        if !quiet {
+                            voice.alert(
+                                Priority::Advisory,
+                                "We've left the approach area, guidance dropped.".to_string(),
+                            );
+                        }
+                        (guide_last, guide_handed_over) = (None, false);
+                    } else if !quiet && !guide_handed_over {
+                        if let Some(line) = crate::approach_guide::callout(&d) {
+                            let due = guide_last.is_none_or(|t| {
+                                t.elapsed().as_secs_f64()
+                                    >= crate::approach_guide::cadence_secs(d.dist_nm)
+                            });
+                            if due {
+                                if line.starts_with("Over the threshold") {
+                                    guide_handed_over = true; // once — the flare is theirs
+                                }
+                                if let Some(s) = status.as_ref() {
+                                    s.alert(AlertLevel::Advisory, &line);
+                                }
+                                crate::blackbox::record(
+                                    "talkdown",
+                                    serde_json::json!({
+                                        "apt": path.icao, "rwy": path.runway_id, "dist": r1(d.dist_nm),
+                                        "xtk": r1(d.xtk_nm), "vdev": r1(d.vdev_ft), "msg": &line
+                                    }),
+                                );
+                                voice.alert(Priority::Advisory, line);
+                                guide_last = Some(now);
+                            }
+                        }
+                    }
+                }
+            } else if guide_last.is_some() || guide_handed_over {
+                (guide_last, guide_handed_over) = (None, false); // cancelled by voice
+            }
             if let Some((last, last_t)) = prev_ias {
                 let dt = now.duration_since(last_t).as_secs_f64();
                 // Ignore a stretched dt (a skipped/stalled tick) — the rate would
@@ -868,10 +1528,36 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
             prev_ias = Some((snap.ias_kts, now));
             snap.ias_trend_kts_per_s = trend;
 
+            // Black box: one state record per tick (position/altitude come from
+            // the snapshot; only the heading needs an extra read).
+            let (lat, lon, alt) = (snap.lat, snap.lon, snap.alt_ft);
+            let hdg = xp.get_float("sim/flightmodel/position/psi").await.unwrap_or(0.0);
+            crate::blackbox::record("state", serde_json::json!({
+                "lat": lat, "lon": lon, "hdg": r1(hdg), "alt": r1(alt),
+                "ias": r1(snap.ias_kts), "gs": r1(snap.groundspeed_kts),
+                "vsi": r1(snap.vsi_fpm), "agl": r1(snap.agl_ft),
+                "ground": snap.on_ground, "flap": snap.flap_ratio,
+                "park": r1(snap.park_brake), "cabin": r1(snap.cabin_altitude_ft),
+                "fuel_kg": snap.fuel_kg, "eng": snap.engine_running,
+                "phase": format!("{:?}", snap.phase),
+            }));
+
+            // Panel settings + the live flight strip. The mute switch comes from
+            // the plugin's settings popup; unresolvable (no plugin) = unmuted.
+            let mute = xp.get_float("xcopilot/opt/monitor_mute").await.map_or(false, |v| v > 0.5);
+            PANEL_MUTE.store(mute, std::sync::atomic::Ordering::Relaxed);
+            if let Some(s) = status.as_ref() {
+                let strip = compose_strip(&snap);
+                if strip != last_strip {
+                    s.strip(&strip);
+                    last_strip = strip;
+                }
+            }
+
             for check in &checks {
                 let state = states.get_mut(check.id()).expect("state per check");
                 match check.eval(&snap) {
-                    Some(msg) => state.active(msg, check.severity(), check.min_duration(), &voice, status.as_ref(), now),
+                    Some(msg) => state.active(check.id(), msg, check.severity(), check.min_duration(), &voice, status.as_ref(), now),
                     None => state.clear(),
                 }
             }
@@ -888,7 +1574,9 @@ const ALTERNATOR_SUSTAIN: Duration = Duration::from_secs(60);
 
 /// Engine running but the alternator switch is off → the bus is being drained
 /// with nothing charging it. A classic config slip a human copilot catches.
-struct AlternatorOffline;
+struct AlternatorOffline {
+    noun: &'static str,
+}
 
 impl Check for AlternatorOffline {
     fn id(&self) -> &'static str {
@@ -899,7 +1587,7 @@ impl Check for AlternatorOffline {
     }
     fn eval(&self, s: &Snapshot) -> Option<String> {
         (s.engine_running && !s.alternator_on)
-            .then(|| "Alternator's offline — we're running on the battery.".to_string())
+            .then(|| format!("{}'s offline — we're running on the battery.", self.noun))
     }
     fn min_duration(&self) -> Duration {
         ALTERNATOR_SUSTAIN
@@ -1090,6 +1778,7 @@ mod tests {
             pushing_back: false,
             engine_running,
             alternator_on,
+            generator_amps_max: 0.0,
             gyro_drift_deg: 0.0,
             endurance_min: None,
             fuel_kg: None,
@@ -1102,8 +1791,194 @@ mod tests {
             rpm: 0.0,
             low_vacuum: false,
             battery_amps: 0.0,
+            park_brake: 0.0,
+            cabin_altitude_ft: 0.0,
+            fuel_selector: None,
+            alt_ft: 0.0,
+            ap_alt_dial_ft: None,
+            ap_servos_on: false,
+            gear_down: false,
+            advisor_values: vec![],
+            lat: 0.0,
+            lon: 0.0,
+            dest_dist_nm: None,
+            dest_elev_ft: None,
+            tod_ring_nm: None,
             phase: Phase::Ground,
         }
+    }
+
+    /// Airborne at cruise with a known destination — the descent-advisor base.
+    /// Roughly today's LEAL–LEMD picture: 14,000 ft, Madrid at ~2,000 ft,
+    /// planned TOD ring 42 nm out.
+    fn cruise_with_dest(dist_nm: f64) -> Snapshot {
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        s.alt_ft = 14_000.0;
+        s.vsi_fpm = 0.0;
+        s.groundspeed_kts = 300.0;
+        s.ias_kts = 240.0;
+        s.dest_dist_nm = Some(dist_nm);
+        s.dest_elev_ft = Some(2_000.0);
+        s.tod_ring_nm = Some(42.0);
+        s
+    }
+
+    #[test]
+    fn tod_ahead_speaks_in_the_runup_band() {
+        let c = TodAhead;
+        assert!(c.eval(&cruise_with_dest(80.0)).is_none(), "far out → quiet");
+        let msg = c.eval(&cruise_with_dest(50.0)).expect("8 nm before TOD → advise");
+        assert!(msg.contains("Top of descent"), "{msg}");
+        assert!(c.eval(&cruise_with_dest(40.0)).is_none(), "past TOD → this check yields");
+        // No destination known → silent.
+        let mut s = cruise_with_dest(50.0);
+        s.dest_dist_nm = None;
+        assert!(c.eval(&s).is_none());
+    }
+
+    #[test]
+    fn tod_passed_names_the_recovery_rate() {
+        let c = TodPassed;
+        assert!(c.eval(&cruise_with_dest(45.0)).is_none(), "before TOD → quiet");
+        // Today's miss: level at 14,000, 38 nm out, TOD at 42. Height to lose
+        // 10,000 ft over (38-5)/300kt = 6.6 min → ~1,500 fpm.
+        let msg = c.eval(&cruise_with_dest(38.0)).expect("past TOD and level → caution");
+        assert!(msg.contains("1500 feet a minute"), "{msg}");
+        // Already descending → moot, quiet.
+        let mut s = cruise_with_dest(38.0);
+        s.vsi_fpm = -2000.0;
+        assert!(c.eval(&s).is_none());
+    }
+
+    #[test]
+    fn high_on_profile_advises_mid_descent() {
+        let c = HighOnProfile;
+        // On the slope: 30 nm out, profile ≈ 2000+2000+22*300 = 10,600.
+        let mut s = cruise_with_dest(30.0);
+        s.vsi_fpm = -1800.0;
+        s.alt_ft = 10_600.0;
+        assert!(c.eval(&s).is_none(), "on profile → quiet");
+        // 3,400 ft above it, fast → boards call.
+        s.alt_ft = 14_000.0;
+        s.ias_kts = 258.0;
+        let msg = c.eval(&s).expect("well above the slope");
+        assert!(msg.contains("Boards"), "{msg}");
+        // Level flight is TodPassed's problem, not this check's.
+        s.vsi_fpm = 0.0;
+        assert!(c.eval(&s).is_none());
+    }
+
+    #[test]
+    fn phase_expectation_advises_on_the_delta() {
+        let c = PhaseExpectation {
+            id: "advisor_test",
+            index: 0,
+            expect_on: true,
+            phases: vec![Phase::Climb, Phase::Cruise],
+            say: "Yaw damper's still off.".into(),
+        };
+        let mut s = snap(true, true);
+        // Wrong phase → silent even when the switch is off.
+        s.phase = Phase::Ground;
+        s.advisor_values = vec![Some(0.0)];
+        assert!(c.eval(&s).is_none());
+        // Right phase, switch off → advise.
+        s.phase = Phase::Cruise;
+        assert_eq!(c.eval(&s).as_deref(), Some("Yaw damper's still off."));
+        // Switch on → satisfied.
+        s.advisor_values = vec![Some(1.0)];
+        assert!(c.eval(&s).is_none());
+        // Failed read → silent, never advise off stale air.
+        s.advisor_values = vec![None];
+        assert!(c.eval(&s).is_none());
+    }
+
+    #[test]
+    fn advisor_rows_build_from_the_profile() {
+        let p = crate::aircraft::load("md82").expect("md82 profile");
+        assert!(!p.advisor.is_empty(), "md82 declares an SOP table");
+        let checks = build_checks(&p);
+        let advisors = checks.iter().filter(|c| c.id().starts_with("advisor_")).count();
+        assert_eq!(advisors, p.advisor.len());
+    }
+
+    #[test]
+    fn sink_rate_scales_with_height() {
+        let c = SinkRate;
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        // Normal 700-fpm final at 400 AGL: silent.
+        s.agl_ft = 400.0;
+        s.vsi_fpm = -700.0;
+        assert!(c.eval(&s).is_none());
+        // The LEAL-LEMD dive: ~1,960 fpm at 187 AGL → fires.
+        s.agl_ft = 187.0;
+        s.vsi_fpm = -1958.0;
+        assert!(c.eval(&s).is_some());
+        // Same rate up high is a normal descent.
+        s.agl_ft = 3000.0;
+        assert!(c.eval(&s).is_none());
+        s.on_ground = true;
+        s.agl_ft = 0.0;
+        assert!(c.eval(&s).is_none(), "on the ground → silent");
+    }
+
+    #[test]
+    fn altitude_bust_fires_through_the_dial_only() {
+        let c = AltitudeBust;
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        s.ap_servos_on = true;
+        s.ap_alt_dial_ft = Some(5000.0);
+        // Descending toward the dial from above: normal, silent.
+        s.alt_ft = 8000.0;
+        s.vsi_fpm = -2000.0;
+        assert!(c.eval(&s).is_none());
+        // Blown through it: fires.
+        s.alt_ft = 4500.0;
+        assert!(c.eval(&s).is_some());
+        // Landing configuration (gear down = dial holds the missed-approach
+        // altitude while descending below it): silent.
+        s.gear_down = true;
+        assert!(c.eval(&s).is_none());
+        s.gear_down = false;
+        // Hand-flying (servos off): the AP isn't going to capture anything.
+        s.ap_servos_on = false;
+        assert!(c.eval(&s).is_none());
+        s.ap_servos_on = true;
+        // Climbing through the dial fires too.
+        s.alt_ft = 5600.0;
+        s.vsi_fpm = 1500.0;
+        assert!(c.eval(&s).is_some());
+    }
+
+    #[test]
+    fn fuel_selector_off_gating() {
+        let c = FuelSelectorOff;
+        let mut s = snap(true, true);
+        assert!(c.eval(&s).is_none(), "no reading → silent");
+        s.fuel_selector = Some(0.0);
+        assert!(c.eval(&s).is_some(), "selector OFF, engine running → warn");
+        s.fuel_selector = Some(1.0);
+        assert!(c.eval(&s).is_none(), "tank selected → silent");
+        s.fuel_selector = Some(0.0);
+        s.engine_running = false;
+        assert!(c.eval(&s).is_none(), "engine off (parked) → silent");
+    }
+
+    #[test]
+    fn not_charging_trusts_a_producing_generator() {
+        let c = AlternatorNotCharging { noun: "Generator" };
+        let mut s = snap(true, true);
+        s.battery_amps = -7.0;
+        assert!(c.eval(&s).is_some(), "discharge, nothing producing → warn");
+        // MD-82 case: standing battery-bus discharge while both generators charge.
+        s.generator_amps_max = 39.0;
+        assert!(c.eval(&s).is_none(), "a producing generator overrules the ammeter");
+        s.generator_amps_max = 0.0;
+        s.engine_running = false;
+        assert!(c.eval(&s).is_none(), "engine off → silent");
     }
 
     #[test]
@@ -1163,7 +2038,7 @@ mod tests {
         s.engine_running = false;
         assert!(v.eval(&s).is_none(), "engine off → no vacuum check");
 
-        let a = AlternatorNotCharging;
+        let a = AlternatorNotCharging { noun: "Alternator" };
         let mut s = snap(true, true); // alternator switch on
         s.battery_amps = 8.0; // charging
         assert!(a.eval(&s).is_none(), "charging → silent");
@@ -1232,8 +2107,54 @@ mod tests {
     }
 
     #[test]
+    fn rolling_on_park_brake_fires_only_when_moving_on_ground() {
+        let c = RollingOnParkBrake;
+        let mut s = snap(true, true);
+        // Parked with the brake set (a run-up): silent.
+        s.park_brake = 1.0;
+        s.groundspeed_kts = 0.0;
+        assert!(c.eval(&s).is_none(), "stationary is fine");
+        // Rolling with it set: caution.
+        s.groundspeed_kts = 20.0;
+        assert!(c.eval(&s).is_some(), "rolling with the brake must fire");
+        // Rolling with it released: silent.
+        s.park_brake = 0.0;
+        assert!(c.eval(&s).is_none());
+        // Airborne (stale ratio): silent.
+        s.park_brake = 1.0;
+        s.on_ground = false;
+        assert!(c.eval(&s).is_none(), "not a thing in the air");
+    }
+
+    #[test]
+    fn cabin_altitude_bands_are_disjoint_and_airborne_only() {
+        let caution = CabinAltitude {
+            id: "c", severity: Severity::Caution, band_ft: (10_000.0, Some(12_500.0)),
+            message: "caution", min_dur: Duration::from_secs(10),
+        };
+        let warning = CabinAltitude {
+            id: "w", severity: Severity::Warning, band_ft: (12_500.0, None),
+            message: "warning", min_dur: Duration::from_secs(4),
+        };
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        // Below 10k: nothing.
+        s.cabin_altitude_ft = 8_000.0;
+        assert!(caution.eval(&s).is_none() && warning.eval(&s).is_none());
+        // 10k–12.5k: caution only (disjoint bands).
+        s.cabin_altitude_ft = 11_000.0;
+        assert!(caution.eval(&s).is_some() && warning.eval(&s).is_none());
+        // Above 12.5k: warning only.
+        s.cabin_altitude_ft = 14_000.0;
+        assert!(caution.eval(&s).is_none() && warning.eval(&s).is_some());
+        // On the ground it never fires, however high the reading.
+        s.on_ground = true;
+        assert!(caution.eval(&s).is_none() && warning.eval(&s).is_none());
+    }
+
+    #[test]
     fn alternator_fires_only_when_running_without_charge() {
-        let c = AlternatorOffline;
+        let c = AlternatorOffline { noun: "Alternator" };
         assert!(c.eval(&snap(true, false)).is_some()); // running, alt off → alert
         assert!(c.eval(&snap(true, true)).is_none()); // running, alt on → ok
         assert!(c.eval(&snap(false, false)).is_none()); // shut down → ok

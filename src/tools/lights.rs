@@ -103,17 +103,28 @@ impl Tool for SetLights {
 
         // Prefer the command (it animates the panel switch); fall back to a raw
         // dataref write if the profile doesn't supply one. Either way, read the
-        // dataref back and confirm the *actual* state.
+        // dataref back and confirm the *actual* state. The dataref may be an
+        // array element (`landing_lights_switch[0]` on the SR22/Evolution) — the
+        // v1 lookup 404s on the bracketed name, so split it (seen live: "switch
+        // landing lights off" flipped the light, then the readback 404'd and the
+        // whole tool reported failure).
         let cmd = if args.on {
             light.command_on.as_deref()
         } else {
             light.command_off.as_deref()
         };
+        let (base, idx) = split_index(&light.dataref);
         match cmd {
             Some(c) => ctx.xplane.run_command(c).await?,
-            None => ctx.xplane.set_int(&light.dataref, args.on as i64).await?,
+            None => match idx {
+                Some(i) => ctx.xplane.set_int_array_elem(base, i, args.on as i64).await?,
+                None => ctx.xplane.set_int(base, args.on as i64).await?,
+            },
         }
-        let actual_on = ctx.xplane.get_float(&light.dataref).await? > 0.5;
+        let actual_on = match idx {
+            Some(i) => ctx.xplane.get_float_array(base).await?.get(i).copied().unwrap_or(0.0),
+            None => ctx.xplane.get_float(base).await?,
+        } > 0.5;
 
         Ok(format!(
             "Roger, {} {}.",
@@ -131,7 +142,31 @@ const FLOOD_PILOT: &str = "sim/cockpit/electrical/cockpit_lights";
 const FLOOD_COPILOT: &str = "sim/cockpit2/switches/panel_brightness_ratio";
 const FLOOD_COPILOT_IDX: usize = 1;
 
-pub struct SetFloodLights;
+/// Cockpit flood lights. By default drives the universal pilot+copilot flood
+/// datarefs; a profile may override with a single on/off dataref (e.g. the
+/// Laminar King Air's `generic_lights_switch[0]` overhead flood), which may be an
+/// array element written as `name[i]`.
+pub struct SetFloodLights {
+    override_dataref: Option<String>,
+}
+
+impl SetFloodLights {
+    pub fn new(override_dataref: Option<String>) -> Self {
+        Self { override_dataref }
+    }
+}
+
+/// Split a `name[i]` dataref into base + index; `(name, None)` if unindexed.
+fn split_index(dr: &str) -> (&str, Option<usize>) {
+    if let Some(open) = dr.rfind('[') {
+        if let Some(inner) = dr.strip_suffix(']') {
+            if let Ok(i) = inner[open + 1..].parse::<usize>() {
+                return (&dr[..open], Some(i));
+            }
+        }
+    }
+    (dr, None)
+}
 
 #[derive(Deserialize)]
 struct FloodArgs {
@@ -175,6 +210,23 @@ impl Tool for SetFloodLights {
             (None, Some(false)) => 0.0,
             (None, None) => return Ok("I didn't catch a flood-light setting — say on, off, or a percentage.".to_string()),
         };
+
+        // Profile override: a single on/off switch (the King Air's overhead flood
+        // is `generic_lights_switch[0]`, a switch, not a rheostat — so it's on/off,
+        // not a brightness). Write the element (or scalar) and read it back.
+        if let Some(dr) = &self.override_dataref {
+            let on = level > 0.5;
+            let (base, idx) = split_index(dr);
+            match idx {
+                Some(i) => ctx.xplane.set_int_array_elem(base, i, on as i64).await?,
+                None => ctx.xplane.set_int(base, on as i64).await?,
+            }
+            let actual = match idx {
+                Some(i) => ctx.xplane.get_float_array(base).await?.get(i).copied().unwrap_or(0.0),
+                None => ctx.xplane.get_float(base).await?,
+            } > 0.5;
+            return Ok(format!("Roger, flood lights {}.", if actual { "on" } else { "off" }));
+        }
 
         // Pilot side: scalar brightness. Copilot side: one float array element.
         ctx.xplane.set_float(FLOOD_PILOT, level).await?;

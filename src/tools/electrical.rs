@@ -40,6 +40,33 @@ impl SetElectrical {
         }
     }
 
+    /// Resolve a requested system key against the profile, tolerantly: exact
+    /// match first; then a bare noun to its pair entry ("alternator" →
+    /// "alternators" on the SR22's split switches — switching both is what the
+    /// bare word means); then a unique prefix; then a numbered request back to
+    /// the unnumbered single ("battery one" where the only key is "battery").
+    fn find_system(&self, requested: &str) -> Option<&ElectricalSystem> {
+        let req = requested.to_ascii_lowercase();
+        if let Some(s) = self.systems.iter().find(|s| s.key.eq_ignore_ascii_case(&req)) {
+            return Some(s);
+        }
+        let plural = match req.strip_suffix('y') {
+            Some(stem) => format!("{stem}ies"),
+            None => format!("{req}s"),
+        };
+        if let Some(s) = self.systems.iter().find(|s| s.key.eq_ignore_ascii_case(&plural)) {
+            return Some(s);
+        }
+        let mut pref = self.systems.iter().filter(|s| s.key.to_ascii_lowercase().starts_with(&req));
+        if let (Some(one), None) = (pref.next(), pref.next()) {
+            return Some(one);
+        }
+        if let Some(stem) = req.strip_suffix(|c: char| c.is_ascii_digit()) {
+            return self.systems.iter().find(|s| s.key.eq_ignore_ascii_case(stem));
+        }
+        None
+    }
+
     /// Fire a system's commands and read its state back.
     async fn switch(&self, sys: &ElectricalSystem, on: bool, ctx: &ToolCtx<'_>) -> Result<String> {
         let cmds = if on { &sys.on_commands } else { &sys.off_commands };
@@ -115,10 +142,43 @@ impl Tool for SetElectrical {
             ));
         }
 
-        let Some(sys) = self.systems.iter().find(|s| s.key.eq_ignore_ascii_case(&args.system)) else {
+        let Some(sys) = self.find_system(&args.system) else {
             let names: Vec<&str> = self.systems.iter().map(|s| s.spoken.as_str()).collect();
             return Ok(format!("I didn't catch which system. I have {}.", names.join(", ")));
         };
         self.switch(sys, args.on, ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sys(key: &str) -> ElectricalSystem {
+        ElectricalSystem {
+            key: key.into(),
+            spoken: key.into(),
+            on_commands: vec![],
+            off_commands: vec![],
+            readback: vec![],
+        }
+    }
+
+    #[test]
+    fn find_system_resolves_split_and_single_airframes() {
+        // SR22-style split systems: bare noun -> the pair entry; numbered -> exact.
+        let sr22 = SetElectrical::new(vec![
+            sys("battery1"), sys("battery2"), sys("alternator1"), sys("alternator2"),
+            sys("batteries"), sys("alternators"), sys("avionics"),
+        ]);
+        assert_eq!(sr22.find_system("alternator").unwrap().key, "alternators");
+        assert_eq!(sr22.find_system("battery").unwrap().key, "batteries");
+        assert_eq!(sr22.find_system("alternator2").unwrap().key, "alternator2");
+        assert_eq!(sr22.find_system("avionics").unwrap().key, "avionics");
+        // Single-system airframe: a numbered request strips back to the single.
+        let single = SetElectrical::new(vec![sys("battery"), sys("alternator")]);
+        assert_eq!(single.find_system("battery1").unwrap().key, "battery");
+        assert_eq!(single.find_system("alternator").unwrap().key, "alternator");
+        assert!(single.find_system("inverter").is_none());
     }
 }

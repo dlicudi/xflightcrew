@@ -18,6 +18,8 @@ nav_radio: true        # set_nav1 / set_obs
 transponder: true      # set_transponder (universal transponder_mode)
 ils: true              # prepare_ils
 parking_brake: true    # set_parking_brake (universal parkbrake)
+park_brake_valve_set: 1.0  # valve sense: 1 = SET on the SR22 — OPPOSITE of the C90
+                           # (driving it C90-style read as an inverted handle)
 pitot_heat: true       # set_pitot_heat (universal pitot_heat_on)
 
 # Throttle/mixture/start write universal datarefs (throttle_ratio_all,
@@ -135,3 +137,15 @@ checklist_map:
   - { match: ignition_on,        action: ignition }     # mag test: 1=R, 2=L, 3=both
   - { match: elevator_trim,      action: pitch_trim }   # "set T/O" → centre (not ail_trim)
   - { match: fuel_tank_selector, action: fuel_selector } # 0=off/1=left/2=right
+
+# Cockpit geography — answers "where is the X?" deterministically. Seeded from the
+# POM's layout section (console items are POM-verified); grow as verified live.
+locations:
+  fuel selector: "on the centre console between the seats, behind the throttle"
+  parking brake: "the lever on the centre console. Pull toward you for on, push away for off"
+  alternate air: "on the centre console next to the parking brake lever"
+  switch panel: "the bolster panel on the pilot's left, below the instrument panel: starter key, batteries, alternators, avionics and lights"
+  battery switches: "on the left bolster switch panel: BAT 1 and BAT 2"
+  alternator switches: "on the left bolster switch panel, next to the battery switches"
+  starter key: "leftmost on the bolster switch panel, the rotary magneto and start key"
+  flaps: "the flap switch on the centre console, with UP, 50 percent and 100 percent detents"

@@ -1,0 +1,260 @@
+# Aircraft profile — stock Laminar Research Lancair Evolution (N844X). Loaded
+# when X-Plane reports acf_ICAO "EVOT" (XCOPILOT_AIRCRAFT=auto).
+#
+# Single TURBOPROP (P&W PT6A-42, 850 shp, MT prop), retractable gear,
+# pressurized, G1000 glass. Like the C90B this is a Laminar aircraft: the xlua
+# script is purely cosmetic (dome lights, sunvisors, gear locks, ELT, audio
+# annunciators) and every real system uses STANDARD X-Plane datarefs/commands —
+# verified by reading the cockpit object's manipulators — so the universal
+# tools work directly. Turbine: no mixture/magnetos/carb heat; the mixture
+# lever IS the condition lever.
+#
+# Sources: the modeled .acf limits (Vne 256, Vno 220, Vfe 160/140, Vs 76,
+# Vso 61, prop redline 2000), the X-Plane Evo POM (panel names, cold-and-dark
+# start), the REAL N844X POH by Austin Meyer (operating speeds, panel
+# geography, engine handling, emergency procedures — the sim models this
+# exact airframe, serial 030), and the cockpit manipulator command list.
+# NOT yet verified live — dataref/command senses below follow the standard
+# Laminar wiring; verify on the airframe and tighten (esp. the fuel selector
+# and the park-brake valve sense, both left conservative).
+
+id: lancair_evolution
+display_name: Lancair Evolution
+
+# Universal-dataref tools.
+throttle: true         # power lever (set_throttle -> throttle_ratio_all) — NOT piston
+# Constant-speed prop (set_prop). Redline / takeoff 2000 RPM (.acf), min
+# governing in flight 1000 (.acf). Cruise per the POH: "You can cruise at
+# 2000 RPM, but the KingAirs cruise at 1900, and the ride is much quieter at
+# 1700" — so "props to cruise" goes to the quiet setting.
+prop:
+  dataref: sim/cockpit2/engine/actuators/prop_rotation_speed_rad_sec_all
+  max_rpm: 2000
+  cruise_rpm: 1700
+  min_rpm: 1000
+barometer: true        # set_barometer (G1000 BARO knob dataref)
+com_radio: true        # set_com1 (G1000 PFD)
+com2_radio: true       # set_com2 / swap_radio (G1000 MFD)
+nav_radio: true        # set_nav1 / set_obs
+transponder: true      # set_transponder (squawk)
+parking_brake: true    # set_parking_brake
+# park_brake_valve IS modeled (the panel has valve open/close commands and the
+# xlua animates it), but the SET sense is per-aircraft (C90: 0 = set; SR22:
+# 1 = set) and hasn't been verified live here — left unset so the tool drives
+# the ratio only, the safe default.
+pitot_heat: true       # set_pitot_heat
+pitch_trim: true       # set_pitch_trim — NO trim wheel on this airframe (POM);
+                       # electric trim only, indicator on the MFD
+fuel_pump: true        # boost pump — fuel_pump_1 on the panel (POM: ON for start)
+
+# Retractable gear. The POH splits the limits: Vlo 150 (operating — the gate
+# that matters for cycling the gear) and Vle 165 (extended). The .acf models
+# 150. Hydraulic, no uplocks; emergency extension is the dump valve + free
+# fall below 140 KIAS (see locations).
+retractable_gear: true
+vlo_kts: 150.0
+
+# Electrical — the POM's "Battery and Electrical Panel": GND PWR / BAT 1 /
+# BAT 2 / ALT / GEN / DC PWR, all standard commands straight off the panel
+# manipulators. GEN is the engine-driven generator; ALT is a standby
+# alternator ("in the event of a generator failure — the generator and
+# alternator are not normally used together", POM), which is why there's no
+# "both generators" pair entry. GND PWR isn't listed either: "all electrical
+# on" fires every entry, and connecting a phantom GPU mid-flight would be
+# wrong — follow-up if a ground-power tool is wanted. There is NO avionics
+# master switch: the xlua forces avionics_power_on to 1 at flight start, even
+# cold and dark.
+electrical:
+  - key: battery1
+    spoken: battery one
+    on_commands:  [sim/electrical/battery_1_on]
+    off_commands: [sim/electrical/battery_1_off]
+    readback:     ["sim/cockpit2/electrical/battery_on[0]"]
+  - key: battery2
+    spoken: battery two
+    on_commands:  [sim/electrical/battery_2_on]
+    off_commands: [sim/electrical/battery_2_off]
+    readback:     ["sim/cockpit2/electrical/battery_on[1]"]
+  - key: batteries
+    spoken: both batteries
+    on_commands:  [sim/electrical/battery_1_on, sim/electrical/battery_2_on]
+    off_commands: [sim/electrical/battery_1_off, sim/electrical/battery_2_off]
+    readback:     ["sim/cockpit2/electrical/battery_on[0]", "sim/cockpit2/electrical/battery_on[1]"]
+  - key: generator
+    spoken: generator
+    on_commands:  [sim/electrical/generator_1_on]
+    off_commands: [sim/electrical/generator_1_off]
+    readback:     ["sim/cockpit2/electrical/generator_on[0]"]
+  - key: alternator
+    spoken: alternator
+    on_commands:  [sim/electrical/generator_2_on]
+    off_commands: [sim/electrical/generator_2_off]
+    readback:     ["sim/cockpit2/electrical/generator_on[1]"]
+  - key: dc_power
+    spoken: DC power
+    on_commands:  [sim/electrical/cross_tie_on]
+    off_commands: [sim/electrical/cross_tie_off]
+    readback:     [sim/cockpit2/electrical/cross_tie]
+
+# Turbine: no piston controls, and not the MD-82 jet sequence either.
+engine: false
+magnetos: false
+carb_heat: false
+turbine_start: false
+autopilot: true        # standard servos/heading/alt/VS (custom knob wraps them)
+ils: true              # panel NAV button arms NAV + approach
+# The AP panel has its own POWER switch (sim/autopilot/electric_master_on on
+# the panel manipulator) — engage it before the servos. The prep hook fires
+# these commands ahead of engagement; it isn't a flight director here.
+autopilot_prep:
+  flight_director: [sim/autopilot/electric_master_on]
+
+# PT6 turboprop start, per the POM's cold-and-dark checklist: fuel pump ON,
+# IGNITION (continuous igniter) ON, ENGINE START — PRESS AND HOLD, condition
+# lever to LOW IDLE at 13% Ng or greater, release the start when running, then
+# condition FULL FORWARD, GENERATOR ON, DC POWER ON. The starter is a
+# press-and-hold button (starter_held), not the C90's latching switch, so
+# there's no start_dn — the tool re-arms the button until light-off and it
+# releases itself. Still on the pilot per the POM, not automated here: bleed
+# air ON and door seals ON after start, igniter/fuel pump OFF once running.
+turboprop_start:
+  boost_pumps: true
+  ignition_arm: [sim/igniters/igniter_contin_on_1]
+  condition_lever: sim/cockpit2/engine/actuators/mixture_ratio
+  condition_start: 0.5   # middle / LOW IDLE
+  # The sim POM's checklist runs condition FULL FORWARD (high idle) after
+  # start, so that's what the tool does. Worth knowing: the real POH says the
+  # opposite — "full forward is high idle, which we do not use in this plane;
+  # middle is low idle, where we set that lever for flight".
+  condition_run: 1.0
+  n1_idle: 50.0
+  crank_secs: 30.0
+  start_up: [sim/starters/engage_starter_1]
+  starter_held: true
+  # POM after-start: GENERATOR ON, DC POWER ON. Not the alternator — that's
+  # the standby ("not normally used together with the generator").
+  generators: [sim/electrical/generator_1_on, sim/electrical/cross_tie_on]
+speedbrake: false      # no speedbrakes
+directional_gyro: false  # G1000 glass — no vacuum DG
+flood_lights: true     # same wiring as the C90: generic_lights_switch[0]
+flood_lights_dataref: "sim/cockpit2/switches/generic_lights_switch[0]"
+
+# Fuel-endurance alerting. POM cruise burn 39 gal/hr Jet-A (~118 kg/hr).
+fuel:
+  reserve_caution_min: 45.0
+  reserve_warning_min: 30.0
+  cruise_burn_kg_hr: 118.0
+
+# Clean stall (KIAS) — drives the airspeed-low callout. POM Vs / acf_Vs.
+vs_clean_kts: 76.0
+# Never-exceed (KIAS) — drives the overspeed callout. POM Vne / acf_Vne.
+vne_kts: 256.0
+
+# Static reference figures recited on request, from the X-Plane Evo POM's
+# operating-speeds table and specifications page. (POM empty weight 2,650 lb;
+# the .acf models 2,400 — the POM figure is quoted.)
+reference:
+  kind: single-engine turboprop
+  vno_kts: 220.0           # max structural cruise
+  va_kts: 190.0            # maneuvering
+  vx_kts: 85.0             # best angle of climb
+  vy_kts: 105.0            # best rate of climb
+  vr_kts: 77.0             # rotate (representative, per the POM)
+  best_glide_kts: 110.0
+  vs0_kts: 61.0            # stall, full flap / gear down
+  approach_kts: 90.0       # POM: "fly your approaches at 90 knots"
+  max_crosswind_kts: 25.0  # demonstrated
+  cruise_kts: 300.0        # max cruise, KTAS
+  best_climb_fpm: 5000.0   # POH: "climb at 110 KIAS... climb rate at nominal
+                           # load: 5,000 FPM" (the sim POM's spec page says 4,000)
+  max_gross_lb: 4300.0     # MTOW (max landing 4,200)
+  empty_weight_lb: 2650.0
+  useful_load_lb: 1900.0
+  service_ceiling_ft: 28000.0
+  fuel_capacity_gal: 168.0 # wet wing, Jet-A
+  endurance_hours: 4.3     # 168 gal at the 39 gal/hr book burn
+  takeoff_distance_ft: 2000.0 # "comfortable takeoff and landing distance of
+  landing_distance_ft: 2000.0 # about 2,000 feet" (POM introduction)
+  max_rpm: 2000.0          # prop redline
+  # Oil normal bands from the POH emergency checklists: below 75 PSI is the
+  # low-pressure drill, above 105 the high; temps 0..99 C (32..210 F).
+  oil_temp_min_f: 32.0
+  oil_temp_max_f: 210.0
+  oil_press_min_psi: 75.0
+  oil_press_max_psi: 105.0
+
+# Flaps: UP / 50% / 100% (acf models 2 detents, 20 and 45 degrees). Per-notch
+# Vfe from the POM: 160 KIAS to 50%, 140 KIAS to 100%.
+flaps:
+  detents:
+    - { label: up,   spoken: up,            ratio: 0.0 }
+    - { label: "50", spoken: fifty percent, ratio: 0.5, vfe_kts: 160.0 }
+    - { label: full, spoken: full,          ratio: 1.0, vfe_kts: 140.0 }
+
+# Switchable lights. NO beacon (POM: strobes are used in its place, FAA-legal)
+# and NO separate taxi light (the landing lights double for taxi) — so neither
+# is exposed. Landing lights use the panel's landing_01 command; the second
+# landing element is the gear-mounted light the xlua slaves to gear position.
+lights:
+  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on,     command_on: sim/lights/nav_lights_on,        command_off: sim/lights/nav_lights_off }
+  - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,         command_on: sim/lights/strobe_lights_on,     command_off: sim/lights/strobe_lights_off }
+  - { key: landing, spoken: landing lights,    dataref: "sim/cockpit2/switches/landing_lights_switch[0]", command_on: sim/lights/landing_01_light_on, command_off: sim/lights/landing_01_light_off }
+
+# Fuel selector: OFF / LEFT / RIGHT (wet wings, one tank per side, no
+# interconnect — the POH allows at most 10 gallons of left/right imbalance, so
+# the pilot switches tanks to balance). OFF is real and the POH's engine-fire
+# and engine-failure drills call for it. The panel lever steps with
+# lft_one/rgt_one; the universal direct commands below should land the same
+# positions — verify live.
+fuel_selector:
+  readback: sim/cockpit2/fuel/fuel_tank_selector
+  positions:
+    - { key: "off", spoken: "off", command: sim/fuel/fuel_selector_none, value: 0.0 }
+    - { key: left,  spoken: left,  command: sim/fuel/fuel_selector_lft,  value: 1.0 }
+    - { key: right, spoken: right, command: sim/fuel/fuel_selector_rgt,  value: 3.0 }
+
+# Cockpit geography — panel names from the sim POM's "Tour of the Cockpit",
+# left/bottom/right geography from the POH's panel-layout section ("switches
+# for generators and batteries are all grouped on the left; switches for
+# starting, lights, and environmental control run left to right across the
+# bottom of the panel, in the order they are used; de-ice controls on the far
+# right"). No live panel session yet.
+locations:
+  ground power: "the GND PWR switch on the battery and electrical panel, grouped on the left"
+  battery: "BAT 1 and BAT 2 on the battery and electrical panel, grouped on the left"
+  battery one: "the BAT 1 switch on the battery and electrical panel, on the left"
+  battery two: "the BAT 2 switch on the battery and electrical panel, on the left"
+  generator: "the GEN switch on the battery and electrical panel, on the left"
+  alternator: "the ALT switch on the battery and electrical panel, on the left. It's the backup for a generator failure; generator and alternator are never run together"
+  dc power: "the DC PWR switch on the battery and electrical panel, on the left"
+  door seals: "the DOOR SEALS switch on the systems panel, along the bottom switch row. Inflatable seals the cabin needs to hold pressure"
+  ignition: "the IGN switch on the systems panel, along the bottom switch row. A high energy capacitor for engine start"
+  igniter: "the IGN switch on the systems panel, along the bottom switch row"
+  engine start: "on the bottom switch row with the other start switches. Press and hold; it needs thirteen percent compressor speed before fuel goes in"
+  fuel pump: "the FUEL PUMP switch on the systems panel, along the bottom switch row. Primes the fuel system for start and near-ground operations"
+  nav lights: "the NAV LTS switch on the systems panel, along the bottom switch row"
+  landing lights: "the LAND LTS switch on the systems panel, along the bottom switch row"
+  strobe lights: "the STRB LTS switch on the systems panel, along the bottom switch row"
+  bleed air: "the BLEED AIR switch on the systems panel, along the bottom switch row. Opens the bleed air valve that pressurizes the cabin"
+  cabin dump: "the CBN DUMP switch on the systems panel, along the bottom switch row. Depressurizes the cabin in an emergency; max differential is six point five PSI"
+  particle separator: "the PART SEP switch on the ice and particle defence panel, far right. Use it on the ground too if dust or sand is about"
+  pitot heat: "the PITOT HEAT switch on the ice and particle defence panel, far right. The pitot tube itself is under the port wing"
+  prop heat: "the PROP HEAT switch on the ice and particle defence panel, far right. Never run it on the ground with the prop stopped"
+  inlet heat: "the INLET HEAT switch on the ice and particle defence panel, far right. Never leave it on on the ground"
+  parking brake: "on the right: pull to set, push to release. It won't hold the aircraft above idle power"
+  gear handle: "on the cabin lighting and landing gear panel. Green LEDs mean down and locked, yellow means in transit"
+  landing gear handle: "on the cabin lighting and landing gear panel, with the green and yellow gear LEDs"
+  emergency gear extension: "the hydraulic dump valve in front of the pilot's seat. Below one forty knots, rotate it and the gear free falls; sideslip each way to lock the mains"
+  flood light: "the left dimmer rheostat on the cabin lighting and landing gear panel"
+  autopilot panel: "the dedicated autopilot control panel: TRK, ALT, NAV, SEL, VNAV and GPSS buttons, the AP power switch and the altitude track rotary"
+  pressurization: "automatic once bleed air is on. The cabin pressurization display shows cabin altitude and differential, limit six point five PSI"
+  elt: "the ELT panel. ARM for normal operations, ON to activate manually"
+  angle of attack indicator: "mounted on the glareshield, front and center. On speed when the yellow bars sit on the center donut"
+  power lever: "the left lever of the three on the throttle quadrant"
+  prop lever: "the middle lever on the throttle quadrant"
+  propeller lever: "the middle lever on the throttle quadrant"
+  condition lever: "the right lever of the three on the throttle quadrant. Full forward for flight, middle for low idle, aft for fuel cutoff"
+  trim wheel: "there is no trim wheel on this aircraft. Electric trim only, with the indicator on the MFD"
+  elevator trim: "electric trim only, no trim wheel. The trim indicator is on the MFD"
+  beacon: "this aircraft has no beacon light. The strobes are used in its place"
+  taxi light: "no separate taxi light. The landing lights double for taxi"

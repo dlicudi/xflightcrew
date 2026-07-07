@@ -20,6 +20,11 @@ autothrottle: true     # set_speed (AP speed bug) + autothrottle on/off
 speedbrake: true       # speedbrake extend/retract/arm
 barometer: true        # set_barometer
 pitot_heat: true       # set_pitot_heat
+# The MD-82's ice script drives ALL pitot/stall heat from the overhead heat
+# selector knob and overwrites the stock datarefs every frame, so the stock
+# pitot-heat command is a no-op here. 0 = off, any of 1-9 = heaters on (verified
+# live: knob 1 lit the pitot annunciators and cleared the master caution driver).
+pitot_heat_dataref: laminar/md82/ice/heatknob
 pitch_trim: true       # set_pitch_trim (the checklist sets elevator_trim)
 com_radio: true        # set_com1
 com2_radio: true       # set_com2 / swap_radio
@@ -105,6 +110,24 @@ checklist_map:
   - { match: electrical/generator_on,   action: !electrical generators }
   - { match: electrical/battery_on,     action: !electrical battery }
   - { match: electrical/avionics_on,    action: !electrical avionics }
+
+# Phase-expectation advisor: the SOP table. In the listed phases the switch
+# should read as `expect_on`; otherwise the copilot advises once ("aren't you
+# forgetting something?"). Born of an LEAL-LEMD flight flown gate to field with
+# the yaw damper off and the pitot heat cold, master caution lit the whole way.
+advisor:
+  - dataref: sim/cockpit2/switches/yaw_damper_on
+    phases: [climb, cruise, approach]
+    say: Yaw damper's still off.
+  - dataref: sim/cockpit2/ice/ice_pitot_heat_on_pilot
+    phases: [takeoff, climb, cruise, approach, landing]
+    say: Pitot heat's off.
+  - dataref: sim/cockpit/electrical/landing_lights_on
+    phases: [takeoff, approach, landing]
+    say: Landing lights are off.
+  - dataref: sim/cockpit2/switches/fasten_seat_belts
+    phases: [takeoff, climb, approach, landing]
+    say: Seat belt signs are off.
 
 # Flap handle detents 0 / 11 / 15 / 28 / 40 degrees (slats extend automatically).
 # Ratios and per-notch Vfe are best-effort from MD-80 placards — VERIFY in the sim.

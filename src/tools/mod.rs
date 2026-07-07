@@ -11,8 +11,10 @@
 //! LLM server expects.
 
 pub mod approach;
+pub mod autoland;
 pub mod autopilot;
 pub mod controls;
+pub mod cycle;
 pub mod electrical;
 pub mod engine;
 pub mod flaps;
@@ -22,7 +24,10 @@ pub mod ground;
 pub mod instruments;
 pub mod lights;
 pub mod power;
+pub mod prop;
 pub mod radio;
+pub mod recover;
+pub mod speedhold;
 pub mod reminder;
 
 use anyhow::Result;
@@ -117,22 +122,62 @@ impl Registry {
         }
 
         if profile.flood_lights {
-            tools.push(Box::new(lights::SetFloodLights));
+            tools.push(Box::new(lights::SetFloodLights::new(profile.flood_lights_dataref.clone())));
         }
 
         if profile.autopilot {
-            tools.push(Box::new(autopilot::SetHeading));
-            tools.push(Box::new(autopilot::Navigate));
-            tools.push(Box::new(autopilot::SetAltitude));
-            tools.push(Box::new(autopilot::SetVerticalSpeed));
-            tools.push(Box::new(autopilot::SetClimb));
-            tools.push(Box::new(autopilot::LevelOff));
+            // Per-airframe engagement prerequisites (FD switch, AC power) — the C90
+            // needs them; the GA singles leave this default (plain servos-on).
+            let prep = profile.autopilot_prep.clone().unwrap_or_default();
+            // Altitude gate uses the airframe's real service ceiling (the C90B is
+            // 28,100 ft) rather than the GA default, so a valid high climb isn't refused.
+            let ceiling = profile
+                .reference
+                .as_ref()
+                .and_then(|r| r.service_ceiling_ft)
+                .unwrap_or(autopilot::ApConfig::default().service_ceiling_ft);
+            let ap = autopilot::ApConfig {
+                fd_commands: prep.flight_director,
+                ac_powered: prep.ac_powered,
+                service_ceiling_ft: ceiling,
+            };
+            tools.push(Box::new(autopilot::SetHeading { cfg: ap.clone() }));
+            tools.push(Box::new(autopilot::Navigate { cfg: ap.clone() }));
+            tools.push(Box::new(autopilot::SetAltitude { cfg: ap.clone() }));
+            tools.push(Box::new(autopilot::SetVerticalSpeed { cfg: ap.clone() }));
+            tools.push(Box::new(autopilot::SetClimb { cfg: ap.clone() }));
+            tools.push(Box::new(autopilot::LevelOff { cfg: ap.clone() }));
             tools.push(Box::new(autopilot::AutopilotOff));
+            // Emergency upset/stall recovery — takes the controls, so it needs the
+            // autopilot (for the level-hold handoff) present. It also drives the
+            // props full forward for max power, and holds ≈1.3×Vs.
+            let vs = profile.vs_clean_kts.unwrap_or(60.0);
+            tools.push(Box::new(recover::Recover {
+                cfg: ap.clone(),
+                prop: profile.prop.clone(),
+                stall_speed_kts: vs,
+            }));
+            // Native emergency autoland — needs the AP for approach guidance. Prefer
+            // the airframe's real approach speed; fall back to ~1.3×Vs.
+            let approach_ias = profile
+                .reference
+                .as_ref()
+                .and_then(|r| r.approach_kts)
+                .unwrap_or((vs * 1.3).max(70.0));
+            tools.push(Box::new(autoland::Autoland {
+                cfg: ap,
+                approach_ias,
+                prop: profile.prop.clone(),
+            }));
         }
 
         // Thrust levers: any piston engine, or a turbine that declares `throttle`.
         if profile.engine || profile.throttle {
             tools.push(Box::new(engine::SetThrottle));
+        }
+        // Constant-speed propeller levers, when the airframe declares them.
+        if let Some(prop) = &profile.prop {
+            tools.push(Box::new(prop::SetProp::new(prop.clone())));
         }
         // Turbine start sequence (jets) — distinct from the piston one-shot start.
         if profile.turbine_start {
@@ -143,36 +188,81 @@ impl Registry {
         if profile.auto_prep {
             tools.push(Box::new(power::PowerUp));
         }
+        // Talk-down (spoken visual-approach guidance) — any airframe, any
+        // runway; needs nothing but a voice and apt.dat.
+        tools.push(Box::new(approach::VisualApproach));
+
+        // Speed hold (copilot works the throttle) — airframes with a throttle
+        // and no autothrottle; the MD-82 crowd sets the AP speed bug instead.
+        if (profile.engine || profile.throttle) && !profile.autothrottle {
+            let approach = profile.reference.as_ref().and_then(|r| r.approach_kts);
+            tools.push(Box::new(speedhold::HoldSpeed { approach_kts: approach }));
+        }
+
         // Airliner autoflight extras: AP speed select + autothrottle.
         if profile.autothrottle {
-            tools.push(Box::new(autopilot::SetSpeed));
+            let approach = profile.reference.as_ref().and_then(|r| r.approach_kts);
+            tools.push(Box::new(autopilot::SetSpeed::new(approach)));
             tools.push(Box::new(autopilot::Autothrottle));
         }
         if profile.engine {
             tools.push(Box::new(engine::SetMixture));
             tools.push(Box::new(engine::LeanMixture));
-            tools.push(Box::new(engine::StartEngine));
+            tools.push(Box::new(engine::StartEngine {
+                fuel_selector: profile.fuel_selector.clone(),
+                alternator_on_cmds: alternator_on_cmds(&profile.electrical),
+            }));
             tools.push(Box::new(engine::StopEngine));
         }
 
         if profile.fuel_pump {
-            tools.push(Box::new(engine::SetFuelPump));
+            tools.push(Box::new(engine::SetFuelPump { engines: profile.engines }));
         }
 
         if profile.magnetos {
-            tools.push(Box::new(engine::SetMagnetos));
+            tools.push(Box::new(engine::SetMagnetos {
+                engines: profile.engines,
+                per_engine: profile.magnetos_per_engine,
+            }));
         }
 
         if profile.carb_heat {
-            tools.push(Box::new(engine::SetCarbHeat));
+            tools.push(Box::new(engine::SetCarbHeat { engines: profile.engines }));
         }
 
         if let Some(fs) = &profile.fuel_selector {
             tools.push(Box::new(engine::SetFuelSelector::new(fs.clone())));
         }
 
+        // Cycle-switch systems (the AWX DC-3): power switch, per-side fuel
+        // selectors, and the twin piston start/shutdown. These drive xlua-
+        // overridden systems via up/down cycle commands from the profile.
+        if let Some(ps) = &profile.power_switch {
+            tools.push(Box::new(cycle::SetPower::new(ps.clone())));
+        }
+        if !profile.fuel_selectors.is_empty() {
+            tools.push(Box::new(cycle::SetCycleFuelSelector::new(profile.fuel_selectors.clone())));
+        }
+        if let Some(start) = &profile.piston_start {
+            tools.push(Box::new(cycle::StartEngines::new(
+                start.clone(),
+                profile.fuel_selectors.clone(),
+                profile.power_switch.clone(),
+            )));
+            tools.push(Box::new(cycle::StopEngines::new(start.clone())));
+        }
+        if let Some(mix) = &profile.mixture_notch {
+            tools.push(Box::new(cycle::SetMixture::new(mix.clone())));
+        }
+        if let Some(ts) = &profile.turboprop_start {
+            tools.push(Box::new(cycle::StartTurbines::new(ts.clone())));
+            tools.push(Box::new(cycle::StopTurbines::new(ts.clone())));
+        }
+
         if profile.parking_brake {
-            tools.push(Box::new(controls::SetParkingBrake));
+            tools.push(Box::new(controls::SetParkingBrake {
+                valve_set: profile.park_brake_valve_set,
+            }));
         }
 
         if profile.pitch_trim {
@@ -184,7 +274,9 @@ impl Registry {
         }
 
         if profile.pitot_heat {
-            tools.push(Box::new(instruments::SetPitotHeat));
+            tools.push(Box::new(instruments::SetPitotHeat {
+                override_dataref: profile.pitot_heat_dataref.clone(),
+            }));
         }
 
         if !profile.electrical.is_empty() {
@@ -263,6 +355,25 @@ impl Registry {
             })
             .collect()
     }
+}
+
+/// ON commands for every charging source in an electrical profile (keys
+/// starting "alternator"/"generator"), deduped — the pair entries ("alternators")
+/// repeat the singles' commands. Feeds `StartEngine`, so a dual-alternator
+/// airframe (SR22 ALT 1 + ALT 2) gets both online after a start.
+pub fn alternator_on_cmds(systems: &[crate::aircraft::ElectricalSystem]) -> Vec<String> {
+    let mut cmds: Vec<String> = Vec::new();
+    for s in systems {
+        let k = s.key.to_ascii_lowercase();
+        if k.starts_with("alternator") || k.starts_with("generator") {
+            for c in &s.on_commands {
+                if !cmds.contains(c) {
+                    cmds.push(c.clone());
+                }
+            }
+        }
+    }
+    cmds
 }
 
 /// A flattened, serializable view of a tool for the LLM layer to wrap.
