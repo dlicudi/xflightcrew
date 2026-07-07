@@ -66,6 +66,21 @@ fallback, and the active aircraft is **auto-detected** from `acf_ICAO`
 (`XCOPILOT_AIRCRAFT=auto`). Datarefs/commands stay in the Rust tools; the YAML
 carries per-airframe config (flap detents, lights, capability flags).
 
+## ATC is a separate process (the world, not the crew)
+
+The `atc` binary ([src/bin/atc.rs](src/bin/atc.rs)) is a second process, split
+from the copilot **by trust model**: the copilot is crew and writes datarefs;
+ATC is the world and is structurally read-only (its `SimView` wrapper exposes
+no writes). They share code through the lib target ([src/lib.rs](src/lib.rs) —
+the leaf modules, compiled into both trees), never state: both watch the sim
+over the Web API, and **the tuned COM1 frequency decides who answers**, so no
+IPC exists between them. Frequencies come from the airport's apt.dat comm rows
+(parsed in [src/nav.rs](src/nav.rs)), not hardcoding. First slice: ATIS from
+live sim weather at LXGB, in its own voice. Next: a deterministic tower FSM
+(clearances keyed off phase + position), then live-traffic observation via the
+TCAS target datarefs — ATC only ever *controls the player* and *narrates*
+other traffic.
+
 ## Core design rule: curated tool surface, not raw dataref access
 
 **Never let the LLM write arbitrary datarefs.** Expose a small, explicit set of

@@ -38,6 +38,17 @@ pub const VISIBILITY_SM: &str = "sim/weather/aircraft/visibility_reported_sm";
 /// Sea-level pressure in Pascals (1 inHg = 3386.389 Pa).
 pub const QNH_PASCALS: &str = "sim/weather/aircraft/qnh_pas";
 
+// --- Time ---
+/// Sim UTC, seconds since midnight zulu.
+#[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)
+pub const ZULU_TIME_SEC: &str = "sim/time/zulu_time_sec";
+
+// --- Radios ---
+/// COM1 active frequency. Despite the `hz` in the name, the value is in kHz
+/// (118325 = 118.325 MHz); supports 8.33 kHz channel spacing.
+#[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)
+pub const COM1_FREQ_KHZ: &str = "sim/cockpit2/radios/actuators/com1_frequency_hz_833";
+
 // --- Autopilot status (read-only; > 0 = engaged/armed) ---
 pub const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";
 pub const APPROACH_STATUS: &str = "sim/cockpit2/autopilot/approach_status";

@@ -126,14 +126,58 @@ impl Runway {
     }
 }
 
+/// One communication frequency row from apt.dat (legacy row codes 50-56, or
+/// 1050-1056 for 8.33 kHz channels). `kind` is the normalized service code
+/// (row code mod 1000): see the `FREQ_*` constants. `khz` is the frequency in
+/// kHz (118325 = 118.325 MHz); legacy rows carry 10 kHz units in the file and
+/// are converted on parse.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AtcFreq {
+    pub kind: u32,
+    pub khz: i64,
+    /// The row's label, e.g. "Tower Freq" — display only, not phraseology.
+    pub name: String,
+}
+
+// The comm-frequency surface is consumed by the atc binary's tree; the copilot
+// binary compiles this module too but doesn't reach it (yet), hence the allows.
+#[allow(dead_code)]
+pub const FREQ_ATIS: u32 = 50;
+#[allow(dead_code)]
+pub const FREQ_UNICOM: u32 = 51;
+#[allow(dead_code)]
+pub const FREQ_CLEARANCE: u32 = 52;
+#[allow(dead_code)]
+pub const FREQ_GROUND: u32 = 53;
+#[allow(dead_code)]
+pub const FREQ_TOWER: u32 = 54;
+#[allow(dead_code)]
+pub const FREQ_APPROACH: u32 = 55;
+#[allow(dead_code)]
+pub const FREQ_DEPARTURE: u32 = 56;
+
 /// An airport as apt.dat knows it: the header's field elevation plus runways.
 #[derive(Debug, Clone)]
 pub struct AirportInfo {
+    /// Name from the header row (e.g. "Gibraltar") — the spoken station name.
+    #[allow(dead_code)] // atc-binary tree only (yet)
+    pub name: String,
     /// Field elevation, feet MSL — the authoritative figure (a flight plan's
     /// destination-waypoint altitude is a *crossing* altitude, seen live 2,500 ft
     /// high over LERL).
     pub elev_ft: f64,
     pub runways: Vec<Runway>,
+    /// Communication frequencies, in file order (empty for untowered fields).
+    #[allow(dead_code)] // atc-binary tree only (yet)
+    pub freqs: Vec<AtcFreq>,
+}
+
+impl AirportInfo {
+    /// The first frequency of the given service `kind` (`FREQ_TOWER`, ...).
+    #[allow(dead_code)] // atc-binary tree only (yet)
+    pub fn freq(&self, kind: u32) -> Option<&AtcFreq> {
+        self.freqs.iter().find(|f| f.kind == kind)
+    }
 }
 
 /// The runways `icao` actually has, from X-Plane's Global Airports `apt.dat`.
@@ -150,18 +194,22 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
     let file = std::fs::File::open(path).with_context(|| format!("open {path}"))?;
     let mut reader = BufReader::with_capacity(1 << 20, file);
     let mut runways = Vec::new();
+    let mut freqs = Vec::new();
+    let mut name = String::new();
     let mut in_airport = false;
     let mut elev_ft = 0.0_f64;
     // Reused byte buffer + a cheap prefix test before any splitting: the file is
     // ~400 MB and 13M lines, and a String-per-line scan is unusable in a debug
-    // build. Only `1 `/`16 `/`17 ` (headers) and `100 ` (runways) lines matter.
+    // build. Only `1 `/`16 `/`17 ` (headers), `100 ` (runways), and the comm
+    // rows (`1050`-`1056`, legacy `50`-`56`) matter.
     let mut buf = Vec::with_capacity(256);
     loop {
         buf.clear();
         if reader.read_until(b'\n', &mut buf).unwrap_or(0) == 0 {
             break;
         }
-        let interesting = matches!(buf.first(), Some(b'1')); // covers 1, 16, 17, 100
+        // b'1' covers 1, 16, 17, 100, 1050-1056; b'5' covers legacy 50-56.
+        let interesting = matches!(buf.first(), Some(b'1') | Some(b'5'));
         if !interesting {
             continue;
         }
@@ -177,6 +225,7 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
                 in_airport = f.nth(2) == Some(icao); // skip the two deprecated fields
                 if in_airport {
                     elev_ft = elev.unwrap_or(0.0);
+                    name = f.collect::<Vec<_>>().join(" ");
                 }
             }
             Some("100") if in_airport => {
@@ -196,6 +245,22 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
                     }
                 }
             }
+            // Comm rows: `<code> <freq> <label...>`. Legacy codes store 10 kHz
+            // units (12210 = 122.10 MHz); 1050+ codes store kHz (118325).
+            Some(code) if in_airport => {
+                if let Ok(c) = code.parse::<u32>() {
+                    if matches!(c, 50..=56 | 1050..=1056) {
+                        if let Some(raw) = f.next().and_then(|v| v.parse::<i64>().ok()) {
+                            let khz = if c >= 1000 { raw } else { raw * 10 };
+                            freqs.push(AtcFreq {
+                                kind: c % 1000,
+                                khz,
+                                name: f.collect::<Vec<_>>().join(" "),
+                            });
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -205,7 +270,7 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
     if !in_airport && runways.is_empty() {
         return Ok(None);
     }
-    Ok(Some(AirportInfo { elev_ft, runways }))
+    Ok(Some(AirportInfo { name, elev_ft, runways, freqs }))
 }
 
 /// Pick the runway end best aligned into the wind. Returns the end's ident,
@@ -297,13 +362,24 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "1    142 0 0 LEAL Alicante").unwrap();
         writeln!(f, "100 45.33 27 727 0.10 1 3 0  10 38.2845188 -0.5750054 0 0 3 3 0 2 28 38.2797989 -0.5412058 0 0 3 3 0 2").unwrap();
+        // Comm rows: an 8.33-style row (kHz) and a legacy row (10 kHz units).
+        writeln!(f, "1054 118250 Tower Freq").unwrap();
+        writeln!(f, "50 12210 ATIS").unwrap();
         writeln!(f, "1   1027 0 0 0MU1 Sunderland").unwrap();
         writeln!(f, "100 22.86 3 0 0.25 0 0 0  09 37.2471001 -94.1770610 0 0 1 0 0 0 27 37.2469784 -94.1700162 0 0 1 0 0 0").unwrap();
+        writeln!(f, "1054 122800 Sunderland Tower").unwrap();
         f.flush().unwrap();
 
-        // Field elevation comes off the header row (LEAL sits at 142 ft).
+        // Field elevation and name come off the header row (LEAL sits at 142 ft).
         let apt = find_airport(path.to_str().unwrap(), "LEAL").unwrap().expect("found");
         assert_eq!(apt.elev_ft, 142.0);
+        assert_eq!(apt.name, "Alicante");
+        // Frequencies: only LEAL's, decoded to kHz whatever the row era.
+        assert_eq!(apt.freqs.len(), 2, "LEAL's two comm rows, not Sunderland's");
+        let twr = apt.freq(FREQ_TOWER).expect("tower row");
+        assert_eq!((twr.khz, twr.name.as_str()), (118250, "Tower Freq"));
+        assert_eq!(apt.freq(FREQ_ATIS).expect("atis row").khz, 122100, "legacy 10 kHz units");
+        assert!(apt.freq(FREQ_GROUND).is_none());
         let rw = find_runways(path.to_str().unwrap(), "LEAL").unwrap();
         assert_eq!(rw.len(), 1, "one physical runway, not Sunderland's");
         assert_eq!((rw[0].ident_a.as_str(), rw[0].ident_b.as_str()), ("10", "28"));
