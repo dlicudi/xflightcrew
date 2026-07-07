@@ -291,8 +291,10 @@ impl Voice {
 /// Built lazily on the first station utterance, so a flight that never talks
 /// to ATC never pays for the extra session.
 enum StationVoice {
+    /// The warm session plus a transmission counter: each reply gets a fresh
+    /// radio-effect variant, because real squelch never sounds the same twice.
     #[cfg(feature = "onnx-tts")]
-    Onnx(Box<crate::tts_onnx::OnnxTts>),
+    Onnx(Box<crate::tts_onnx::OnnxTts>, u32),
     Say(Config),
 }
 
@@ -311,7 +313,7 @@ impl StationVoice {
                         Some(env_f32("XCOPILOT_ATC_TTS_NOISE_W", 1.0)),
                     );
                     tracing::info!(model = %onnx_path, "station voice: warm ONNX session + radio effect");
-                    return StationVoice::Onnx(Box::new(engine));
+                    return StationVoice::Onnx(Box::new(engine), 0);
                 }
                 Err(e) => {
                     tracing::warn!("station voice load failed ({e:#}); falling back to `say`");
@@ -331,7 +333,13 @@ impl StationVoice {
     fn speak(&mut self, text: &str) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "onnx-tts")]
-            StationVoice::Onnx(engine) => engine.speak_with(text, crate::radiofx::radioize),
+            StationVoice::Onnx(engine, transmissions) => {
+                *transmissions = transmissions.wrapping_add(1);
+                let variant = *transmissions;
+                engine.speak_with(text, move |s, r| {
+                    crate::radiofx::radioize_variant(s, r, variant)
+                })
+            }
             StationVoice::Say(config) => tts::speak(config, text),
         }
     }

@@ -8,19 +8,39 @@
 
 /// Apply the full transmission chain in place: key clicks, band-pass
 /// 300-3000 Hz, soft compression, noise floor, peak normalize.
+#[allow(dead_code)] // the copilot always varies per transmission; kept for the lib/tests
 pub fn radioize(samples: &mut Vec<f32>, sample_rate: u32) {
+    radioize_variant(samples, sample_rate, 0);
+}
+
+/// [`radioize`] with a transmission `variant`: it picks this transmission's
+/// random character — carrier gap, burst length and level, click strength,
+/// noise seed. Real squelch never sounds the same twice, and an identical
+/// tail on every reply is the loudest "this is fake" tell (the same lesson
+/// behind Audio-for-VATSIM blending recorded, varying transients). Fully
+/// deterministic per variant, so tests stay exact.
+pub fn radioize_variant(samples: &mut Vec<f32>, sample_rate: u32, variant: u32) {
     if samples.is_empty() {
         return;
     }
     let fs = sample_rate as f32;
-    let mut noise = Lcg::new(0x5EED_CAFE);
+    let mut pick = Lcg::new(0x000A_11CE ^ variant.wrapping_mul(0x9E37_79B9));
+    let mut noise = Lcg::new(0x5EED_CAFE ^ variant.wrapping_mul(0x85EB_CA6B));
+    // Uniform in [lo, hi] off the picker stream.
+    let mut range = |lo: f32, hi: f32| lo + (pick.next_f32() + 1.0) * 0.5 * (hi - lo);
 
     // Key-down click and squelch tail, band-passed along with the speech so
     // they sit in the same spectrum. The tail is the signature sound: the
     // carrier stays up for a beat after the last word, then the receiver's
     // squelch closes with a smoothed hiss burst that cuts hard.
-    let key_click = burst(&mut noise, (fs * 0.012) as usize, 0.12);
-    let squelch = squelch_tail(&mut noise, fs);
+    let key_click = burst(&mut noise, (fs * range(0.008, 0.018)) as usize, range(0.07, 0.16));
+    let squelch = squelch_tail(
+        &mut noise,
+        fs,
+        range(0.05, 0.09),  // carrier hangs open this long after the last word
+        range(0.035, 0.07), // burst decay body
+        range(0.16, 0.28),  // burst level
+    );
     let mut buf = Vec::with_capacity(key_click.len() + samples.len() + squelch.len());
     buf.extend_from_slice(&key_click);
     buf.append(samples);
@@ -65,15 +85,16 @@ fn burst(noise: &mut Lcg, len: usize, amp: f32) -> Vec<f32> {
         .collect()
 }
 
-/// The squelch closing after the transmission: ~70 ms of open carrier (just
-/// the hiss floor), then a smoothed noise burst — 3 ms attack, exponential
-/// decay over ~50 ms — ending in a hard cut. Smoothing the noise (one-pole
-/// average) turns a harsh crackle into the classic soft "psshht"; the abrupt
-/// end IS the squelch gate slamming shut, so no fade after it.
-fn squelch_tail(noise: &mut Lcg, fs: f32) -> Vec<f32> {
-    let carrier = (fs * 0.07) as usize;
+/// The squelch closing after the transmission: `carrier_s` of open carrier
+/// (just the hiss floor), then a smoothed noise burst — 3 ms attack,
+/// exponential decay over `body_s` — ending in a hard cut. Smoothing the
+/// noise (one-pole average) turns a harsh crackle into the classic soft
+/// "psshht"; the abrupt end IS the squelch gate slamming shut, so no fade
+/// after it.
+fn squelch_tail(noise: &mut Lcg, fs: f32, carrier_s: f32, body_s: f32, amp: f32) -> Vec<f32> {
+    let carrier = (fs * carrier_s) as usize;
     let attack = (fs * 0.003) as usize;
-    let body = (fs * 0.05) as usize;
+    let body = (fs * body_s) as usize;
     let mut out = Vec::with_capacity(carrier + attack + body);
     // Open carrier: nothing but the floor (added globally later).
     out.resize(carrier, 0.0);
@@ -86,7 +107,7 @@ fn squelch_tail(noise: &mut Lcg, fs: f32) -> Vec<f32> {
         } else {
             (-4.0 * (i - attack) as f32 / body.max(1) as f32).exp()
         };
-        out.push(smooth * 0.22 * env);
+        out.push(smooth * amp * env);
     }
     out
 }
@@ -218,6 +239,22 @@ mod tests {
         // noise, not silence.
         let tail = &s[s.len() - (fs as usize * 55 / 1000)..];
         assert!(rms(tail) > 0.005, "squelch tail present, rms {}", rms(tail));
+    }
+
+    #[test]
+    fn transmissions_never_sound_identical() {
+        let fs = 22050;
+        let base = sine(1000.0, fs as f32, 0.3);
+        let (mut a, mut b) = (base.clone(), base.clone());
+        radioize_variant(&mut a, fs, 1);
+        radioize_variant(&mut b, fs, 2);
+        // Different variants pick different gaps/bodies, so even the lengths
+        // differ; both still normalize into range.
+        assert_ne!(a.len(), b.len(), "two transmissions with identical tails");
+        for s in [&a, &b] {
+            let peak = s.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
+            assert!(peak <= 0.9 && peak > 0.5, "normalized: {peak}");
+        }
     }
 
     #[test]
