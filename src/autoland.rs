@@ -383,8 +383,13 @@ pub fn run_autoland(
                 }
 
                 if last_phase != Some(g.phase) {
+                    let prev = last_phase;
                     last_phase = Some(g.phase);
                     let line = match g.phase {
+                        // Dropping back to Intercept from Final is a go-around, not
+                        // a fresh intercept — say so.
+                        ApproachPhase::Intercept if prev == Some(ApproachPhase::Final) =>
+                            "Overflew the runway. Going around, climbing to re-intercept.",
                         ApproachPhase::Intercept => "Intercepting the final approach.",
                         ApproachPhase::Final => "Established on final, gear and flaps down.",
                         ApproachPhase::Flare => "Over the threshold, flaring, power to idle.",
@@ -415,6 +420,33 @@ const FAP_NM: f64 = 5.0;
 /// Approach speed is already ~1.3×Vs, so this margin still stays well above stall.
 const SPEED_FLOOR_MARGIN_KTS: f64 = 7.0;
 
+/// Past the threshold by more than this (nm along the centreline, departure side)
+/// with no landing = an overflight. Go around: fly back to the FAP instead of
+/// tracking the runway heading straight out. Seen live 2026-07-06: overflew the
+/// numbers at 167 ft, then departed the far end on a fixed course to 5.4 nm at
+/// 60 kt, never turning back. The margin ignores a normal float/rollout past the
+/// threshold (the flare branch, checked first, still owns the touchdown).
+const OVERFLIGHT_GO_AROUND_NM: f64 = 0.15;
+
+/// Terrain floor (ft AGL): below this and outside the flare zone, low radio
+/// altitude is rising terrain under the flight path, not the runway — climb away
+/// from it rather than hold level into it. Seen live 2026-07-06: held level at
+/// ~50 ft AGL 5 nm out over rising ground, no climb authority anywhere in the loop.
+const TERRAIN_FLOOR_AGL_FT: f64 = 500.0;
+/// Don't enforce the terrain floor inside this range — here a low radio altitude
+/// IS the approach (short final), not terrain to climb over.
+const FLOOR_ENFORCE_MIN_DIST_NM: f64 = 1.0;
+/// Only climb with this much surplus over the approach speed. Climbing slow in a
+/// marginal airframe bleeds energy to a stall (the reason this loop was
+/// descent-only) — so a low-and-slow aircraft holds level and lets the throttle
+/// governor rebuild speed FIRST, then the climb engages once the surplus exists.
+const CLIMB_SPEED_MARGIN_KTS: f64 = 5.0;
+/// Ceiling on the safe-altitude climb (fpm) — gentle and energy-preserving.
+const MAX_CLIMB_FPM: f64 = 500.0;
+/// While below the terrain floor, command the throttle governor to this much over
+/// the approach speed, so it builds the surplus the climb gate needs.
+const CLIMB_ENERGY_BONUS_KTS: f64 = 12.0;
+
 /// Flare only inside this distance to the threshold — beyond it, a low radio
 /// altitude is terrain under the approach, not the runway. (25 ft on a 3° path
 /// is ~0.08 nm out; 0.35 leaves margin for displaced thresholds.)
@@ -444,6 +476,21 @@ pub fn project_latlon(lat: f64, lon: f64, bearing: f64, dist_nm: f64) -> (f64, f
     let dlat = d * b.cos();
     let dlon = d * b.sin() / lat.to_radians().cos().max(1e-6);
     (lat + dlat, lon + dlon)
+}
+
+/// Signed distance (nm) along the runway centreline: positive = on the approach
+/// side (short of the threshold, still to fly), negative = past the threshold
+/// (departure side). Detects an overflight so the guidance goes around instead of
+/// tracking the runway heading straight out the far end.
+pub fn along_track_nm(lat: f64, lon: f64, rwy: &Runway) -> f64 {
+    let brg_from_thr = bearing_deg(rwy.thr_lat, rwy.thr_lon, lat, lon);
+    let dist = haversine_nm(rwy.thr_lat, rwy.thr_lon, lat, lon);
+    let recip = (rwy.course_deg + 180.0) % 360.0;
+    // Project threshold→aircraft onto the INBOUND (recip) direction: on the
+    // approach side the aircraft bears ~recip from the threshold (cos ≈ +1),
+    // past it the aircraft bears ~course_deg (cos ≈ -1).
+    let ang = ((brg_from_thr - recip + 540.0) % 360.0 - 180.0).to_radians();
+    dist * ang.cos()
 }
 
 /// Signed cross-track distance (nm) from the runway's extended centreline —
@@ -512,12 +559,26 @@ pub fn guidance(
     let join_nm = ((cur_alt_ft - rwy.elev_ft) / GLIDEPATH_FT_PER_NM * 1.15)
         .clamp(FAP_NM, 40.0);
 
+    // Are we past the threshold, on the departure side, still airborne? (The flare
+    // branch below, checked first, owns a normal float/rollout across the numbers.)
+    let past_threshold = along_track_nm(cur_lat, cur_lon, rwy) < -OVERFLIGHT_GO_AROUND_NM;
+
     let (phase, target_heading) = if radio_alt_ft <= flare_radio_ft && dist_nm <= FLARE_MAX_DIST_NM {
         // Low radio altitude alone is NOT the flare cue — terrain rises to meet
         // the approach path miles from the field (seen live: "flared" at 7 ft AGL
         // 4.1 nm out at LEMI, power cut over open ground; and again into a dip
         // 0.4 nm short at LERL). Flare only over the runway environment.
         (ApproachPhase::Flare, rwy.course_deg)
+    } else if past_threshold {
+        // Overflew the runway without landing (too high/fast at the numbers). Go
+        // around: steer BACK to the Final Approach Point, never track the runway
+        // course outbound — that departs the field forever (seen live 2026-07-06:
+        // over the numbers at 167 ft, then straight out to 5.4 nm at 60 kt, never
+        // turning back). The vertical law climbs to a safe altitude on the way, if
+        // energy allows. Takes priority over the join/FAP/final branches so a
+        // go-around always turns toward the field regardless of altitude.
+        let (fap_lat, fap_lon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, FAP_NM);
+        (ApproachPhase::Intercept, bearing_deg(cur_lat, cur_lon, fap_lat, fap_lon))
     } else if alt_err > CAPTURE_ABOVE_FT {
         // Too high for this distance — descend toward the join point.
         let (jlat, jlon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, join_nm);
@@ -550,9 +611,22 @@ pub fn guidance(
     // hold until the AP stalled off. A stall is fatal; being low is not. So when
     // airspeed decays below the approach speed, lower the nose and trade a little
     // altitude back for speed, proportional to how slow it is.
+    // SAFE-ALTITUDE CLIMB: below the terrain floor and outside the flare zone, the
+    // low radio altitude is rising terrain under the flight path — climb away from
+    // it. But ONLY with surplus airspeed: climbing slow bleeds energy to a stall
+    // (why this loop was descent-only). Low + slow falls through to speed
+    // protection / level hold, and the raised throttle target below rebuilds the
+    // surplus so the climb can engage on a later tick.
+    let below_terrain_floor =
+        phase != ApproachPhase::Flare && radio_alt_ft < TERRAIN_FLOOR_AGL_FT && dist_nm > FLOOR_ENFORCE_MIN_DIST_NM;
+    let has_climb_energy = ias_kts > approach_ias + CLIMB_SPEED_MARGIN_KTS;
+
     let speed_deficit = approach_ias - ias_kts;
     let target_vs = if phase != ApproachPhase::Flare && speed_deficit > SPEED_FLOOR_MARGIN_KTS {
         -(speed_deficit * 40.0).clamp(200.0, 700.0)
+    } else if below_terrain_floor && has_climb_energy {
+        // Bounded climb toward the floor, steeper the deeper below it we are.
+        ((TERRAIN_FLOOR_AGL_FT - radio_alt_ft) * 2.0).clamp(100.0, MAX_CLIMB_FPM)
     } else {
         match phase {
             ApproachPhase::Flare => -100.0, // arrest the descent near the ground
@@ -564,10 +638,14 @@ pub fn guidance(
         }
     };
 
+    // Below the terrain floor, ask the throttle governor for extra speed so it
+    // builds the surplus the climb gate needs; otherwise hold the approach speed.
+    let target_ias = if below_terrain_floor { approach_ias + CLIMB_ENERGY_BONUS_KTS } else { approach_ias };
+
     Guidance {
         target_heading_deg: target_heading,
         target_vs_fpm: target_vs,
-        target_ias_kts: approach_ias,
+        target_ias_kts: target_ias,
         dist_nm,
         glidepath_alt_ft,
         phase,
@@ -616,6 +694,55 @@ mod tests {
         let g_flare = guidance(0.001, 0.0, 30.0, 15.0, 40.0, 40.0, &rwy_north(), 90.0, 20.0);
         assert_eq!(g_flare.phase, ApproachPhase::Flare);
         assert!(g_flare.target_vs_fpm > -200.0, "flare not overridden by speed floor");
+    }
+
+    #[test]
+    fn overflight_past_the_threshold_goes_around_to_the_fap() {
+        // The live failure (2026-07-06): overflew the numbers, then tracked the
+        // runway course straight out the departure end to 5.4 nm, never turning
+        // back. Place the aircraft 0.5 nm PAST a north-landing threshold (0.5 nm
+        // north, departure side) at 200 ft, on speed — inside the old "Final"
+        // distance so the bug applied. It must now go around: phase Intercept,
+        // steering SOUTH back toward the FAP, not north on the runway course.
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.5); // 0.5 nm north, past the threshold
+        let g = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0);
+        assert_eq!(g.phase, ApproachPhase::Intercept, "past the threshold → go around");
+        assert!(heading_diff(g.target_heading_deg, 180.0) < 25.0,
+            "must turn back toward the FAP, got hdg {}", g.target_heading_deg);
+        // Sanity: a mirror point 0.5 nm SHORT of the threshold (approach side) is a
+        // normal final, not a go-around.
+        let (slat, slon) = project_latlon(0.0, 0.0, 180.0, 0.5);
+        let g_final = guidance(slat, slon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0);
+        assert_ne!(g_final.phase, ApproachPhase::Intercept, "short of the threshold is not a go-around");
+    }
+
+    #[test]
+    fn climbs_off_the_terrain_floor_only_with_energy() {
+        // The live failure (2026-07-06): level at ~50 ft AGL 5 nm out over rising
+        // terrain, no climb anywhere in the loop. 3 nm out, 200 ft AGL (below the
+        // 500 ft floor), on the approach side.
+        let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 3.0);
+        // FAST (approach + 10): surplus energy → bounded climb away from terrain.
+        let g_fast = guidance(lat, lon, 200.0, 200.0, 100.0, 100.0, &rwy_north(), 90.0, 25.0);
+        assert!(g_fast.target_vs_fpm > 0.0, "below the floor + fast → climb, got {}", g_fast.target_vs_fpm);
+        assert!(g_fast.target_vs_fpm <= MAX_CLIMB_FPM, "climb is bounded, got {}", g_fast.target_vs_fpm);
+        // And it asks the throttle for extra speed to sustain the climb.
+        assert!(g_fast.target_ias_kts > 90.0, "climb raises the speed target, got {}", g_fast.target_ias_kts);
+        // ON SPEED (no surplus): must NOT climb — hold level and let the governor
+        // rebuild speed first (climbing slow would stall).
+        let g_slow = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0);
+        assert_eq!(g_slow.target_vs_fpm, 0.0, "below the floor but no surplus → level, got {}", g_slow.target_vs_fpm);
+    }
+
+    #[test]
+    fn terrain_floor_is_not_enforced_on_short_final() {
+        // Low AGL close in is the approach, not terrain — don't climb away from it.
+        // 0.5 nm short of the threshold, 200 ft AGL, fast: no climb (inside the
+        // floor-enforcement range).
+        let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 0.5);
+        let g = guidance(lat, lon, 200.0, 200.0, 100.0, 100.0, &rwy_north(), 90.0, 25.0);
+        assert!(g.target_vs_fpm <= 0.0, "no climb on short final, got {}", g.target_vs_fpm);
+        assert_eq!(g.target_ias_kts, 90.0, "no climb-energy bonus on short final");
     }
 
     #[test]
