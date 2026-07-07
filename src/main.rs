@@ -9,6 +9,11 @@
 
 mod aircraft;
 mod approach_guide;
+// ATIS phrasing helpers (spoken digits, NATO, runway designators) — the tower
+// dialogue uses a few of them; the full broadcast surface serves the
+// standalone `atc` binary (lib tree), hence the module-level allow.
+#[allow(dead_code)]
+mod atis;
 mod audio;
 mod autoland;
 mod blackbox;
@@ -28,8 +33,10 @@ mod phrase;
 mod plugin_status;
 mod readback;
 mod simbrief;
+mod station;
 mod stt;
 mod stt_eval;
+mod tower;
 mod tts;
 #[cfg(feature = "onnx-tts")]
 mod tts_onnx;
@@ -621,7 +628,23 @@ async fn run_session(
     if general_index.is_some() {
         tracing::info!("general aviation index loaded");
     }
-    stt.set_prompt(stt::build_prompt(&profile));
+    // The ATC station (tower dialogue), merged from the standalone atc binary:
+    // it answers when COM1 is tuned to its tower frequency and the words parse
+    // as a radio call. Read-only toward the sim; speaks in its own voice
+    // through the same arbiter. None = no station, copilot behaves as before.
+    let mut atc_station = if config.atc_airport.trim().is_empty() {
+        None
+    } else {
+        station::Station::load(
+            &config.apt_data_path,
+            &config.atc_airport.trim().to_uppercase(),
+            config.atc_voice.clone(),
+            config.atc_rate.clone(),
+        )
+    };
+    // Radio-call vocabulary rides along in the whisper bias so "request taxi" /
+    // "ready for departure" transcribe as reliably as cockpit commands.
+    stt.set_prompt(format!("{} {}", stt::build_prompt(&profile), tower::STT_PROMPT));
     // Tool specs for the LLM = curated tools + each checklist as a no-arg "tool"
     // the loop intercepts and runs interactively.
     let mut specs = registry.specs();
@@ -727,7 +750,7 @@ async fn run_session(
             registry = Registry::for_aircraft(&profile);
             checklists = checklist::load(&profile).unwrap_or_default();
             manual_index = rag::Index::load(&profile.id);
-            stt.set_prompt(stt::build_prompt(&profile));
+            stt.set_prompt(format!("{} {}", stt::build_prompt(&profile), tower::STT_PROMPT));
             specs = registry.specs();
             specs.extend(checklists.iter().map(|c| c.spec()));
             tracing::info!(aircraft = %profile.display_name, "reconfigured for new aircraft");
@@ -909,6 +932,20 @@ async fn run_session(
                         say(&voice, &reporter, ui::LogKind::Readback, &line);
                         continue;
                     }
+                }
+            }
+            // ATC station: a radio call answered by the tower when COM1 is tuned
+            // to it. After the release guard above (handing controls back always
+            // wins), before everything else — "request taxi" is a call to the
+            // world, not a cockpit command. Falls through untouched when not
+            // tuned or not a radio call.
+            if let Some(st) = atc_station.as_mut() {
+                if let Some(reply) = st.try_handle(&tl, &xplane).await {
+                    reporter.status(ui::Phase::Speaking);
+                    reporter.log(ui::LogKind::Readback, format!("TWR: {reply}"));
+                    voice.say_as(Priority::Readback, &st.say_voice, &st.say_rate, &reply);
+                    reporter.status(ui::Phase::Listening);
+                    continue;
                 }
             }
             // Reminder memory: cancel or list what's armed ("cancel the reminders",
@@ -3823,6 +3860,9 @@ fn join_and(items: &[String]) -> String {
 /// ("Nautilapuku") before it reaches the LLM, which would otherwise force-match
 /// it to the nearest tool. Whole-word, case-insensitive.
 const COMMAND_KEYWORDS: &[&str] = &[
+    // radio calls to the ATC station ("request taxi"/"radio"/"takeoff"/
+    // "departure" are already covered below; these two aren't)
+    "clearance", "tower",
     // flaps / gear / trim
     "flap", "flaps", "gear", "trim",
     // autopilot / vertical nav

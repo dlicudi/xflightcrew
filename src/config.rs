@@ -121,6 +121,15 @@ pub struct Config {
     /// X-Plane plugin's in-sim panel. On by default; best-effort — a no-op if the
     /// plugin isn't installed. Set `XCOPILOT_PLUGIN_STATUS=false` to disable.
     pub plugin_status: bool,
+    /// ICAO of the airport whose ATC station the copilot process hosts (tower
+    /// dialogue answered when COM1 is tuned to its frequency). Empty disables
+    /// ATC entirely. `XCOPILOT_ATC_AIRPORT`.
+    pub atc_airport: String,
+    /// macOS `say` voice for the ATC station — deliberately distinct from the
+    /// copilot's voice. `XCOPILOT_ATC_VOICE`.
+    pub atc_voice: String,
+    /// `say` rate (words per minute) for the ATC station. `XCOPILOT_ATC_RATE`.
+    pub atc_rate: String,
 }
 
 impl Config {
@@ -181,6 +190,9 @@ impl Config {
             monitor_hz: env_or("XCOPILOT_MONITOR_HZ", "3").parse().unwrap_or(3.0),
             plugin_status: env_or("XCOPILOT_PLUGIN_STATUS", "true") != "false",
             simbrief_id: env_or("XCOPILOT_SIMBRIEF_ID", ""),
+            atc_airport: env_or("XCOPILOT_ATC_AIRPORT", "LXGB"),
+            atc_voice: env_or("XCOPILOT_ATC_VOICE", "Daniel"),
+            atc_rate: env_or("XCOPILOT_ATC_RATE", "165"),
         })
     }
 }

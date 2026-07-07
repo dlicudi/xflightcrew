@@ -66,7 +66,10 @@ pub fn parse_intent(transcript: &str) -> Intent {
     if t.contains("clearance") {
         return Intent::RequestClearance;
     }
-    if t.contains("taxi") {
+    // "taxi light on" / "taxi hold" are COCKPIT commands that happen to contain
+    // "taxi" — in the merged binary this parser sees every utterance, so a taxi
+    // request must be a request, not any sentence with the word in it.
+    if t.contains("taxi") && !t.contains("light") && !t.contains("hold") {
         return Intent::RequestTaxi;
     }
     Intent::Unknown
@@ -166,6 +169,10 @@ mod tests {
         assert_eq!(parse_intent("good morning"), Intent::Unknown);
         // "taxi" inside a takeoff call must not read as a taxi request.
         assert_eq!(parse_intent("holding point taxi complete, ready for departure"), Intent::RequestTakeoff);
+        // Cockpit commands containing "taxi" are NOT radio calls — in the
+        // merged binary this parser sees every utterance the pilot speaks.
+        assert_eq!(parse_intent("taxi light on"), Intent::Unknown);
+        assert_eq!(parse_intent("release the taxi hold"), Intent::Unknown);
     }
 
     #[test]

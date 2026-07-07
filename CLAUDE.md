@@ -66,20 +66,30 @@ fallback, and the active aircraft is **auto-detected** from `acf_ICAO`
 (`XCOPILOT_AIRCRAFT=auto`). Datarefs/commands stay in the Rust tools; the YAML
 carries per-airframe config (flap detents, lights, capability flags).
 
-## ATC is a separate process (the world, not the crew)
+## ATC lives inside the copilot binary (the world, not the crew)
 
-The `atc` binary ([src/bin/atc.rs](src/bin/atc.rs)) is a second process, split
-from the copilot **by trust model**: the copilot is crew and writes datarefs;
-ATC is the world and is structurally read-only (its `SimView` wrapper exposes
-no writes). They share code through the lib target ([src/lib.rs](src/lib.rs) —
-the leaf modules, compiled into both trees), never state: both watch the sim
-over the Web API, and **the tuned COM1 frequency decides who answers**, so no
-IPC exists between them. Frequencies come from the airport's apt.dat comm rows
-(parsed in [src/nav.rs](src/nav.rs)), not hardcoding. First slice: ATIS from
-live sim weather at LXGB, in its own voice. Next: a deterministic tower FSM
-(clearances keyed off phase + position), then live-traffic observation via the
-TCAS target datarefs — ATC only ever *controls the player* and *narrates*
-other traffic.
+ATC (tower dialogue) runs **in the copilot process**, as a frequency-routed
+station ([src/station.rs](src/station.rs)): one mic, one PTT, one speech
+arbiter. After the normal capture/confidence/echo gates, an utterance goes to
+the tower iff COM1 is tuned to the station's frequency AND the words parse as
+a radio call ([src/tower.rs](src/tower.rs) — deterministic FSM, keyword
+intents, "say again" over guessed clearances); everything else falls through
+to the copilot unchanged. The station speaks in its own voice (`say`/Daniel)
+through the same arbiter via `Voice::say_as`, so the two voices can never
+overlap. Trust boundary is the module boundary: the station only reads the
+sim and returns text — it can never actuate. Frequencies come from apt.dat
+comm rows (parsed in [src/nav.rs](src/nav.rs)), not hardcoding; config via
+`XCOPILOT_ATC_AIRPORT` (default LXGB), `XCOPILOT_ATC_VOICE`, `XCOPILOT_ATC_RATE`.
+
+History: ATC started as a separate binary ([src/bin/atc.rs](src/bin/atc.rs),
+still buildable — tower + ATIS glue around the same lib modules) on the "the
+world is a different process" theory. Flying it proved the split premature:
+mic/PTT/voice are single shared resources and the second terminal was
+unusable in the cockpit. Keep the pure modules split-ready; don't re-split
+until there's a product reason. Next: ATIS in-process, live-traffic
+observation via TCAS datarefs (ATC only ever *controls the player* and
+*narrates* other traffic), a radio-PTT plugin dataref if content routing ever
+collides.
 
 ## Core design rule: curated tool surface, not raw dataref access
 

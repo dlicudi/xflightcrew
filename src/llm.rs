@@ -742,6 +742,9 @@ mod tests {
             piper_voice: String::new(),
             aircraft: "cessna_172sp".into(),
             confirm_critical: true,
+            atc_airport: String::new(),
+            atc_voice: String::new(),
+            atc_rate: String::new(),
             monitor_enabled: false,
             monitor_hz: 3.0,
         }

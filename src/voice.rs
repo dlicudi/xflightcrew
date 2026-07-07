@@ -64,6 +64,11 @@ struct Utterance {
     /// A tone-only utterance (empty `text`): play the negative tone and speak
     /// nothing. Used for the "heard you, didn't recognize it" acknowledgement.
     negative: bool,
+    /// Speak in an alternate macOS `say` voice `(voice, rate)` instead of the
+    /// copilot's own — the ATC station's voice. Going through the same queue
+    /// keeps the two voices arbitrated: they can never talk over each other,
+    /// and the mic stays gated across both.
+    alt_say: Option<(String, String)>,
     /// Present for blocking callers; signalled once the utterance is spoken.
     done: Option<Arc<Latch>>,
 }
@@ -186,7 +191,7 @@ impl Voice {
         // No em/en dashes reach the TTS — they trip it up. One chokepoint for
         // every spoken utterance (readbacks, monitor callouts, prompts).
         let text = crate::phrase::scrub_dashes(&text);
-        self.push(Utterance { priority, seq: 0, text, chime, negative: false, done });
+        self.push(Utterance { priority, seq: 0, text, chime, negative: false, alt_say: None, done });
     }
 
     /// Push a fully-formed utterance onto the queue (stamping its FIFO seq under
@@ -215,6 +220,7 @@ impl Voice {
             text: String::new(),
             chime: false,
             negative: true,
+            alt_say: None,
             done: Some(latch.clone()),
         });
         let mut spoken = latch.spoken.lock().unwrap();
@@ -243,6 +249,31 @@ impl Voice {
             cv: Condvar::new(),
         });
         self.enqueue(priority, text.into(), Some(latch.clone()), false);
+        let mut spoken = latch.spoken.lock().unwrap();
+        while !*spoken {
+            spoken = latch.cv.wait(spoken).unwrap();
+        }
+    }
+
+    /// Queue an utterance in an alternate macOS `say` voice (the ATC station's)
+    /// and block until spoken. Same queue, same mic gate, same echo memory as
+    /// the copilot's own voice — the station can never talk over the copilot,
+    /// and its audio bleeding back through the mic is rejected the same way.
+    pub fn say_as(&self, priority: Priority, say_voice: &str, say_rate: &str, text: impl Into<String>) {
+        let latch = Arc::new(Latch {
+            spoken: Mutex::new(false),
+            cv: Condvar::new(),
+        });
+        let text = crate::phrase::scrub_dashes(&text.into());
+        self.push(Utterance {
+            priority,
+            seq: 0,
+            text,
+            chime: false,
+            negative: false,
+            alt_say: Some((say_voice.to_string(), say_rate.to_string())),
+            done: Some(latch.clone()),
+        });
         let mut spoken = latch.spoken.lock().unwrap();
         while !*spoken {
             spoken = latch.cv.wait(spoken).unwrap();
@@ -356,7 +387,21 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
                 }
             }
         }
-        if let Err(e) = speaker.speak(&utt.text) {
+        // An alternate-voice utterance (the ATC station) bypasses the warm
+        // copilot voice and shells out to `say` with the station's voice.
+        let spoke = match &utt.alt_say {
+            Some((v, r)) => {
+                let station = Config {
+                    tts_backend: "say".into(),
+                    say_voice: v.clone(),
+                    say_rate: r.clone(),
+                    ..Config::default()
+                };
+                tts::speak(&station, &utt.text)
+            }
+            None => speaker.speak(&utt.text),
+        };
+        if let Err(e) = spoke {
             // An interrupt (PTT / barge-in) kills `say`/piper with SIGTERM — that's
             // an intentional cut-off, not a failure, so don't log it as a warning.
             let msg = format!("{e:#}");
@@ -417,7 +462,7 @@ mod tests {
     use super::*;
 
     fn utt(priority: Priority, seq: u64) -> Utterance {
-        Utterance { priority, seq, text: String::new(), chime: false, negative: false, done: None }
+        Utterance { priority, seq, text: String::new(), chime: false, negative: false, alt_say: None, done: None }
     }
 
     #[test]
