@@ -276,11 +276,21 @@ async fn main() -> Result<()> {
     // ambient/ATC can't trigger it. A sim dataref (the bundled X-Plane plugin)
     // takes precedence over a global key — it needs no OS permission.
     let ptt = if !config.ptt_dataref.is_empty() {
-        // Leak the name to 'static for the dedicated subscription (lives for the
-        // whole run); a one-time leak of one config string.
+        // Leak the names to 'static for the dedicated subscription (lives for
+        // the whole run); a one-time leak of two config strings. The radio PTT
+        // dataref rides in the same subscription — if the plugin predates it,
+        // LiveState just never resolves that name and it reads as not-pressed.
         let name: &'static str = Box::leak(config.ptt_dataref.clone().into_boxed_str());
-        let live = std::sync::Arc::new(LiveState::start(&config.xplane_base_url, &[name]));
-        Some(Ptt::Dataref { live, name: config.ptt_dataref.clone() })
+        let mut names = vec![name];
+        if !config.radio_ptt_dataref.is_empty() {
+            names.push(Box::leak(config.radio_ptt_dataref.clone().into_boxed_str()));
+        }
+        let live = std::sync::Arc::new(LiveState::start(&config.xplane_base_url, &names));
+        Some(Ptt::Dataref {
+            live,
+            name: config.ptt_dataref.clone(),
+            radio: config.radio_ptt_dataref.clone(),
+        })
     } else if !config.ptt_key.is_empty() {
         match audio::parse_ptt_key(&config.ptt_key) {
             Some(k) => Some(Ptt::Key(k)),
@@ -518,8 +528,11 @@ enum Ptt {
     /// has focus. Needs macOS Input-Monitoring permission.
     Key(device_query::Keycode),
     /// A sim dataref goes nonzero while a bound button is held (the bundled
-    /// X-Plane plugin's `xcopilot/ptt_active`). No OS permission, no radio keying.
-    Dataref { live: std::sync::Arc<LiveState>, name: String },
+    /// X-Plane plugin's `xcopilot/ptt_active`). No OS permission. `radio` is
+    /// the transmit-switch dataref (`xcopilot/radio_ptt_active`): held = the
+    /// utterance is a radio transmission for the tuned ATC station, not a
+    /// copilot command. Empty = no radio PTT bound.
+    Dataref { live: std::sync::Arc<LiveState>, name: String, radio: String },
 }
 
 /// The active aircraft profile, shared between the command loop, the monitor, and
@@ -560,14 +573,18 @@ impl Ptt {
         live.get(name).unwrap_or(0.0) > 0.5
     }
 
-    /// True while PTT is held, whichever source — for the barge-in watcher.
+    /// True while PTT is held, whichever source (intercom OR radio) — for the
+    /// barge-in watcher: keying either button silences whoever is talking.
     fn is_pressed(&self) -> bool {
         match self {
             Ptt::Key(key) => {
                 use device_query::DeviceQuery;
                 device_query::DeviceState::new().get_keys().contains(key)
             }
-            Ptt::Dataref { live, name } => Ptt::dataref_active(live, name),
+            Ptt::Dataref { live, name, radio } => {
+                Ptt::dataref_active(live, name)
+                    || (!radio.is_empty() && Ptt::dataref_active(live, radio))
+            }
         }
     }
 }
@@ -723,6 +740,9 @@ async fn run_session(
         // Confidence of a spoken utterance, applied *after* the abort check so a
         // panic word lands even if whisper wasn't sure. `None` for typed input.
         let mut spoken_confidence: Option<f32> = None;
+        // True when the RADIO PTT carried this utterance: it was TRANSMITTED,
+        // so it belongs to whatever station COM1 is tuned to, never the copilot.
+        let mut from_radio = false;
         let (mut command, from_text) = match next_input(&mut listener, &ptt_mic, &stt, &ptt, typed.as_ref()) {
             None => continue,
             Some(Input::Typed(text)) => {
@@ -730,10 +750,11 @@ async fn run_session(
                 reporter.log(ui::LogKind::Heard, format!("⌨  \"{text}\""));
                 (text, true)
             }
-            Some(Input::Spoken(heard)) => {
-                tracing::info!(transcript = %heard.text, confidence = heard.confidence, "heard utterance");
+            Some(Input::Spoken(heard, radio)) => {
+                tracing::info!(transcript = %heard.text, confidence = heard.confidence, radio, "heard utterance");
                 reporter.heard(&heard.text, heard.confidence);
                 spoken_confidence = Some(heard.confidence);
+                from_radio = radio;
                 // Continuous mode acts on the transcript directly — the downstream
                 // domain gate (`looks_like_command`) filters non-commands.
                 (heard.text, false)
@@ -808,6 +829,20 @@ async fn run_session(
         // re-trigger itself. Both bypassed for typed input.
         if let Some(confidence) = spoken_confidence {
             if confidence < config.stt_min_confidence {
+                // A garbled TRANSMISSION gets the tower's "say again" (a real
+                // controller answers garble; the crew never heard it at all).
+                if from_radio {
+                    if let Some(st) = atc_station.as_mut() {
+                        if st.on_frequency(&xplane).await {
+                            let line = "Station calling, say again.";
+                            reporter.log(ui::LogKind::Readback, format!("TWR: {line}"));
+                            voice.say_as(Priority::Readback, &st.say_voice, &st.say_rate, line);
+                            continue;
+                        }
+                    }
+                    reporter.log(ui::LogKind::Info, "garbled transmission, nobody on frequency");
+                    continue;
+                }
                 if explicit {
                     say(&voice, &reporter, ui::LogKind::Info,
                         readback::one_of(&["Say again?", "Didn't catch that.", "One more time?"]));
@@ -820,6 +855,24 @@ async fn run_session(
                 reporter.log(ui::LogKind::Info, "ignored self-echo (own readback)");
                 continue;
             }
+        }
+
+        // RADIO PTT: the utterance was transmitted, so it goes to the tuned
+        // station or into the void — never to the copilot, and never through
+        // the cockpit-command gates below. Physical routing beats content
+        // routing whenever the transmit button is bound.
+        if from_radio {
+            if let Some(st) = atc_station.as_mut() {
+                if let Some(reply) = st.handle_transmission(&command.to_ascii_lowercase(), &xplane).await {
+                    reporter.status(ui::Phase::Speaking);
+                    reporter.log(ui::LogKind::Readback, format!("TWR: {reply}"));
+                    voice.say_as(Priority::Readback, &st.say_voice, &st.say_rate, &reply);
+                    reporter.status(ui::Phase::Listening);
+                    continue;
+                }
+            }
+            reporter.log(ui::LogKind::Info, "transmitted, nobody on this frequency");
+            continue;
         }
 
         // Domain gate, follow-up, and bare-value rewrite apply to SPOKEN input
@@ -1370,7 +1423,7 @@ async fn run_session(
 
                 say(&voice, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
                 reporter.status(ui::Phase::Listening);
-                let Some(reply) = listen_once(&mut listener, &ptt_mic, &stt, &ptt, None) else {
+                let Some((reply, _)) = listen_once(&mut listener, &ptt_mic, &stt, &ptt, None) else {
                     say(&voice, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
                     break 'confirm false;
                 };
@@ -1642,7 +1695,7 @@ async fn run_checklist(
                     let hazard = confirm.expect("ask implies a confirm hazard");
                     say(voice, reporter, ui::LogKind::Confirm, &format!("Confirm, {hazard}?"));
                     reporter.status(ui::Phase::Listening);
-                    let reply = listen_once(listener, ptt_mic, stt, ptt, None);
+                    let reply = listen_once(listener, ptt_mic, stt, ptt, None).map(|(r, _)| r);
                     match reply {
                         Some(r) if is_affirmative(&r.text) => {} // proceed
                         Some(r) if is_abort(&r.text) => {
@@ -1849,14 +1902,17 @@ fn icao_to_profile(icao: &str) -> String {
 }
 
 /// Capture one utterance (continuous VAD or push-to-talk) and transcribe it.
-/// Returns `None` on silence/noise or a capture error.
+/// Returns `None` on silence/noise or a capture error. The bool is true when
+/// the RADIO PTT was held during capture — the utterance was transmitted (for
+/// the tuned ATC station), not spoken to the copilot.
 fn listen_once(
     listener: &mut Option<Listener>,
     ptt_mic: &Option<PttMic>,
     stt: &Stt,
     ptt: &Option<Ptt>,
     idle_timeout: Option<Duration>,
-) -> Option<stt::Transcription> {
+) -> Option<(stt::Transcription, bool)> {
+    let mut from_radio = false;
     let audio = match (ptt, ptt_mic, listener) {
         // Hold-a-key push-to-talk (works while X-Plane has focus), warm mic.
         (Some(Ptt::Key(key)), Some(mic), _) => {
@@ -1865,9 +1921,27 @@ fn listen_once(
             let key = *key;
             mic.capture(|| dev.get_keys().contains(&key), idle_timeout).ok()?
         }
-        // Sim-dataref push-to-talk (the X-Plane plugin's bound button), warm mic.
-        (Some(Ptt::Dataref { live, name }), Some(mic), _) => {
-            mic.capture(|| Ptt::dataref_active(live, name), idle_timeout).ok()?
+        // Sim-dataref push-to-talk (the X-Plane plugin's bound buttons), warm
+        // mic. Either button captures; the radio one tags the utterance as a
+        // transmission. Sampled through the whole hold, so a radio press can't
+        // be missed between polls.
+        (Some(Ptt::Dataref { live, name, radio }), Some(mic), _) => {
+            let radio_seen = std::sync::atomic::AtomicBool::new(false);
+            let audio = mic
+                .capture(
+                    || {
+                        let intercom = Ptt::dataref_active(live, name);
+                        let tx = !radio.is_empty() && Ptt::dataref_active(live, radio);
+                        if tx {
+                            radio_seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        intercom || tx
+                    },
+                    idle_timeout,
+                )
+                .ok()?;
+            from_radio = radio_seen.load(std::sync::atomic::Ordering::Relaxed);
+            audio
         }
         // Continuous, VAD-segmented.
         (None, _, Some(l)) => l.next_utterance(idle_timeout).ok()?,
@@ -1881,14 +1955,15 @@ fn listen_once(
         return None; // idle timeout (continuous) or empty capture
     }
     match stt.transcribe(&audio) {
-        Ok(t) if !t.text.is_empty() => Some(t),
+        Ok(t) if !t.text.is_empty() => Some((t, from_radio)),
         _ => None,
     }
 }
 
-/// One pilot input — spoken (a transcript) or typed in the TUI.
+/// One pilot input — spoken (a transcript, with whether the RADIO PTT carried
+/// it) or typed in the TUI.
 enum Input {
-    Spoken(stt::Transcription),
+    Spoken(stt::Transcription, bool),
     Typed(String),
 }
 
@@ -1903,7 +1978,7 @@ fn next_input(
     typed: Option<&std::sync::mpsc::Receiver<String>>,
 ) -> Option<Input> {
     let Some(typed) = typed else {
-        return listen_once(listener, ptt_mic, stt, ptt, None).map(Input::Spoken);
+        return listen_once(listener, ptt_mic, stt, ptt, None).map(|(t, tx)| Input::Spoken(t, tx));
     };
     loop {
         if let Ok(t) = typed.try_recv() {
@@ -1912,8 +1987,8 @@ fn next_input(
                 return Some(Input::Typed(t));
             }
         }
-        if let Some(t) = listen_once(listener, ptt_mic, stt, ptt, Some(Duration::from_millis(150))) {
-            return Some(Input::Spoken(t));
+        if let Some((t, tx)) = listen_once(listener, ptt_mic, stt, ptt, Some(Duration::from_millis(150))) {
+            return Some(Input::Spoken(t, tx));
         }
         // Timed out idle (or a discarded blip) — loop to re-check the typed channel.
     }

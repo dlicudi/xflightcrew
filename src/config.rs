@@ -125,6 +125,13 @@ pub struct Config {
     /// dialogue answered when COM1 is tuned to its frequency). Empty disables
     /// ATC entirely. `XCOPILOT_ATC_AIRPORT`.
     pub atc_airport: String,
+    /// Radio (transmit) push-to-talk dataref, set by the bundled plugin's
+    /// `xcopilot/radio_ptt` command — the transmit switch, as distinct from the
+    /// intercom PTT above. An utterance captured while THIS is held goes to
+    /// the tuned ATC station unconditionally, never to the copilot. Empty
+    /// disables physical routing (content routing still applies).
+    /// `XCOPILOT_RADIO_PTT_DATAREF`.
+    pub radio_ptt_dataref: String,
     /// macOS `say` voice for the ATC station — deliberately distinct from the
     /// copilot's voice. `XCOPILOT_ATC_VOICE`.
     pub atc_voice: String,
@@ -191,6 +198,7 @@ impl Config {
             plugin_status: env_or("XCOPILOT_PLUGIN_STATUS", "true") != "false",
             simbrief_id: env_or("XCOPILOT_SIMBRIEF_ID", ""),
             atc_airport: env_or("XCOPILOT_ATC_AIRPORT", "LXGB"),
+            radio_ptt_dataref: env_or("XCOPILOT_RADIO_PTT_DATAREF", "xcopilot/radio_ptt_active"),
             atc_voice: env_or("XCOPILOT_ATC_VOICE", "Daniel"),
             atc_rate: env_or("XCOPILOT_ATC_RATE", "165"),
         })

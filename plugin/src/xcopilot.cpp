@@ -70,6 +70,21 @@ static int PttCommandHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
 }
 static int ReadPttActive(void*) { return g_ptt_active; }
 
+// Radio PTT: the transmit switch, as distinct from the intercom above. While
+// held, the app routes the utterance to whatever ATC station COM1 is tuned to
+// (never to the copilot). Command `xcopilot/radio_ptt` drives the readable
+// dataref `xcopilot/radio_ptt_active`, mirroring the intercom pair exactly.
+static int g_radio_ptt_active = 0;
+static XPLMCommandRef g_radio_ptt_cmd = nullptr;
+static XPLMDataRef g_radio_ptt_dref = nullptr;
+
+static int RadioPttCommandHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
+    if (phase == xplm_CommandBegin) g_radio_ptt_active = 1;
+    else if (phase == xplm_CommandEnd) g_radio_ptt_active = 0;
+    return 1;
+}
+static int ReadRadioPttActive(void*) { return g_radio_ptt_active; }
+
 // ---- LLM fallback toggle ----------------------------------------------------
 
 // A runtime switch the panel flips and the app reads live (each utterance), so
@@ -502,6 +517,9 @@ protected:
         bool connected = (XPLMGetElapsedTime() - g_last_status_time) < 3.0f;
         Chip("PTT", g_ptt_active ? COL_GREEN : COL_DIM);
         ImGui::SameLine();
+        // TX = the radio (ATC) push-to-talk, distinct from the intercom PTT.
+        Chip("TX", g_radio_ptt_active ? COL_AMBER : COL_DIM);
+        ImGui::SameLine();
         if (connected) {
             Chip(PhaseLabel(g_phase), PhaseColor(g_phase));
             // Detected aircraft profile (ICAO), beside the connection chip.
@@ -775,6 +793,15 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         "xcopilot/ptt_active", xplmType_Int, 0,
         ReadPttActive, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+    g_radio_ptt_cmd =
+        XPLMCreateCommand("xcopilot/radio_ptt", "x-copilot: hold to transmit (radio/ATC)");
+    XPLMRegisterCommandHandler(g_radio_ptt_cmd, RadioPttCommandHandler, 1, nullptr);
+
+    g_radio_ptt_dref = XPLMRegisterDataAccessor(
+        "xcopilot/radio_ptt_active", xplmType_Int, 0,
+        ReadRadioPttActive, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     g_phase_dref = XPLMRegisterDataAccessor(
         "xcopilot/status/phase", xplmType_Int, 1,
         ReadPhase, WritePhase, nullptr, nullptr, nullptr, nullptr,
@@ -884,6 +911,8 @@ PLUGIN_API void XPluginStop(void) {
     if (g_phase_dref) { XPLMUnregisterDataAccessor(g_phase_dref); g_phase_dref = nullptr; }
     if (g_ptt_dref) { XPLMUnregisterDataAccessor(g_ptt_dref); g_ptt_dref = nullptr; }
     if (g_ptt_cmd) { XPLMUnregisterCommandHandler(g_ptt_cmd, PttCommandHandler, 1, nullptr); g_ptt_cmd = nullptr; }
+    if (g_radio_ptt_dref) { XPLMUnregisterDataAccessor(g_radio_ptt_dref); g_radio_ptt_dref = nullptr; }
+    if (g_radio_ptt_cmd) { XPLMUnregisterCommandHandler(g_radio_ptt_cmd, RadioPttCommandHandler, 1, nullptr); g_radio_ptt_cmd = nullptr; }
 }
 
 PLUGIN_API int XPluginEnable(void) { return 1; }

@@ -743,6 +743,7 @@ mod tests {
             aircraft: "cessna_172sp".into(),
             confirm_critical: true,
             atc_airport: String::new(),
+            radio_ptt_dataref: String::new(),
             atc_voice: String::new(),
             atc_rate: String::new(),
             monitor_enabled: false,

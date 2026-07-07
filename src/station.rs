@@ -47,22 +47,44 @@ impl Station {
         Some(Station { tower_khz: twr_row.khz, apt, say_voice, say_rate, twr: tower::Tower::new() })
     }
 
-    /// If the utterance is a radio call AND COM1 is on this station's tower
-    /// frequency, answer it; `None` falls through to the copilot untouched.
-    /// Intent is checked before any dataref read, so the common case (a
-    /// cockpit command) costs nothing.
+    /// Content routing (shared PTT): if the utterance is a radio call AND COM1
+    /// is on this station's tower frequency, answer it; `None` falls through
+    /// to the copilot untouched. Intent is checked before any dataref read,
+    /// so the common case (a cockpit command) costs nothing.
     pub async fn try_handle(&mut self, transcript: &str, xp: &XPlaneClient) -> Option<String> {
         let intent = tower::parse_intent(transcript);
         if intent == tower::Intent::Unknown {
             return None;
         }
-        let com1 = xp.get_float(datarefs::COM1_FREQ_KHZ).await.ok()?.round() as i64;
-        // 8.33 channel names can sit 5 kHz off the carrier; adjacent channels
-        // are 8 kHz apart, so 5 can't cross into one.
-        if (com1 - self.tower_khz).abs() > 5 {
+        if !self.on_frequency(xp).await {
             return None;
         }
+        Some(self.respond(intent, xp).await)
+    }
 
+    /// Physical routing (the radio PTT was keyed): the utterance was
+    /// TRANSMITTED, so it goes to the tuned station or nowhere — never to the
+    /// copilot. On frequency, even an unparsed call gets the tower's "say
+    /// again" (a real controller answers garble; your crew doesn't). `None`
+    /// means nobody was listening on that frequency.
+    pub async fn handle_transmission(&mut self, transcript: &str, xp: &XPlaneClient) -> Option<String> {
+        if !self.on_frequency(xp).await {
+            return None;
+        }
+        Some(self.respond(tower::parse_intent(transcript), xp).await)
+    }
+
+    /// Is COM1 tuned to this station's tower? 8.33 channel names can sit 5 kHz
+    /// off the carrier; adjacent channels are 8 kHz apart, so 5 can't cross.
+    pub async fn on_frequency(&self, xp: &XPlaneClient) -> bool {
+        match xp.get_float(datarefs::COM1_FREQ_KHZ).await {
+            Ok(v) => (v.round() as i64 - self.tower_khz).abs() <= 5,
+            Err(_) => false,
+        }
+    }
+
+    /// Build the live context and let the tower answer.
+    async fn respond(&mut self, intent: tower::Intent, xp: &XPlaneClient) -> String {
         // Live numbers for the clearance. Best-effort: a failed read falls
         // back to silence on that item rather than a wrong number.
         let wind_from = xp.get_float(datarefs::WIND_DIR_DEG_TRUE).await.unwrap_or(0.0);
@@ -90,7 +112,7 @@ impl Station {
             wind: spoken_wind(wind_from, wind_kts),
             holding_point: "Alpha".to_string(),
         };
-        Some(self.twr.handle(intent, &ctx))
+        self.twr.handle(intent, &ctx)
     }
 }
 
