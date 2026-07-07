@@ -947,6 +947,34 @@ async fn run_session(
                     reporter.status(ui::Phase::Listening);
                     continue;
                 }
+                // Named-station tuning ("tune the tower", "contact approach") —
+                // a COPILOT action: resolve the name against the station's
+                // apt.dat frequencies, write COM1, confirm what's actually set.
+                match st.tune_request(&tl) {
+                    Some(station::Tune::Found { label, khz }) => {
+                        let line = match xplane.set_int(datarefs::COM1_FREQ_KHZ, khz).await {
+                            Ok(()) => {
+                                let mhz = xplane
+                                    .get_float(datarefs::COM1_FREQ_KHZ)
+                                    .await
+                                    .map(|v| v / 1000.0)
+                                    .unwrap_or(khz as f64 / 1000.0);
+                                format!("Roger, com one {mhz:.3} for {label}.")
+                            }
+                            Err(e) => {
+                                tracing::warn!("COM1 write failed: {e:#}");
+                                "Couldn't set the radio.".to_string()
+                            }
+                        };
+                        say(&voice, &reporter, ui::LogKind::Readback, &line);
+                        continue;
+                    }
+                    Some(station::Tune::Missing(msg)) => {
+                        say(&voice, &reporter, ui::LogKind::Readback, &msg);
+                        continue;
+                    }
+                    None => {}
+                }
             }
             // Reminder memory: cancel or list what's armed ("cancel the reminders",
             // "do we have a reminder set?"). Checked before set_reminder so "cancel"

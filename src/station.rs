@@ -94,6 +94,52 @@ impl Station {
     }
 }
 
+/// Outcome of a named-station tuning request ("tune the tower").
+pub enum Tune {
+    /// Set COM1 to this kHz; `label` is spoken in the readback.
+    Found { label: String, khz: i64 },
+    /// The airport has no such frequency — decline by name, don't guess.
+    Missing(String),
+}
+
+impl Station {
+    /// Deterministic named-station tuning: "tune/select/switch to/contact the
+    /// tower|atis|ground|approach|departure" (or generic "atc"/"station" =
+    /// tower) resolved against this airport's apt.dat frequencies. Requires a
+    /// tuning verb, so radio chatter that merely mentions a station never
+    /// re-tunes the radio. `None` = not a tuning request at all.
+    pub fn tune_request(&self, t: &str) -> Option<Tune> {
+        let verb = t.contains("tune") || t.contains("switch to") || t.contains("select")
+            || t.contains("contact") || (t.contains("set") && t.contains("com"));
+        if !verb {
+            return None;
+        }
+        let kinds: &[(&str, u32)] = &[
+            ("tower", nav::FREQ_TOWER),
+            ("atis", nav::FREQ_ATIS),
+            ("ground", nav::FREQ_GROUND),
+            ("approach", nav::FREQ_APPROACH),
+            ("departure", nav::FREQ_DEPARTURE),
+            ("unicom", nav::FREQ_UNICOM),
+            ("clearance", nav::FREQ_CLEARANCE),
+        ];
+        let named = kinds.iter().find(|(w, _)| t.contains(w));
+        // Generic "tune atc" / "tune the station" means the tower.
+        let (word, kind) = match named {
+            Some((w, k)) => (*w, *k),
+            None if t.contains("atc") || t.contains("station") => ("tower", nav::FREQ_TOWER),
+            None => return None,
+        };
+        Some(match self.apt.freq(kind) {
+            Some(f) => Tune::Found {
+                label: format!("{} {}", self.apt.name, word),
+                khz: f.khz,
+            },
+            None => Tune::Missing(format!("{} has no {} frequency.", self.apt.name, word)),
+        })
+    }
+}
+
 /// Wind spoken tower-style ("zero niner zero degrees, three knots" / "calm").
 fn spoken_wind(from_deg: f64, kts: f64) -> String {
     if kts < 3.0 {
@@ -106,4 +152,52 @@ fn spoken_wind(from_deg: f64, kts: f64) -> String {
         atis::spoken_digits(&format!("{dir:03}")),
         atis::spoken_digits(&format!("{kts:.0}"))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lxgb() -> Station {
+        Station {
+            apt: nav::AirportInfo {
+                name: "Gibraltar".into(),
+                elev_ft: 11.0,
+                runways: Vec::new(),
+                freqs: vec![
+                    nav::AtcFreq { kind: nav::FREQ_TOWER, khz: 131200, name: "Tower Freq".into() },
+                    nav::AtcFreq { kind: nav::FREQ_APPROACH, khz: 122800, name: "Approach".into() },
+                ],
+            },
+            tower_khz: 131200,
+            say_voice: String::new(),
+            say_rate: String::new(),
+            twr: tower::Tower::new(),
+        }
+    }
+
+    #[test]
+    fn named_station_tuning_resolves_from_apt_dat() {
+        let st = lxgb();
+        match st.tune_request("tune the tower") {
+            Some(Tune::Found { label, khz }) => {
+                assert_eq!(khz, 131200);
+                assert_eq!(label, "Gibraltar tower");
+            }
+            other => panic!("expected tower: {:?}", other.is_some()),
+        }
+        // Generic "atc"/"station" means the tower.
+        assert!(matches!(st.tune_request("tune to atc"), Some(Tune::Found { khz: 131200, .. })));
+        assert!(matches!(st.tune_request("contact approach"), Some(Tune::Found { khz: 122800, .. })));
+        // A named station the field doesn't have declines by name, no guessing.
+        match st.tune_request("tune the atis") {
+            Some(Tune::Missing(msg)) => assert!(msg.contains("no atis"), "{msg}"),
+            other => panic!("expected Missing: {:?}", other.is_some()),
+        }
+        // No tuning verb → not a tuning request, even if a station is named
+        // ("gibraltar tower request taxi" must reach the tower, not the tuner).
+        assert!(st.tune_request("gibraltar tower request taxi").is_none());
+        // A verb without any station name is someone else's command.
+        assert!(st.tune_request("tune com one to one one eight decimal five").is_none());
+    }
 }
