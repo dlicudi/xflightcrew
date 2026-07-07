@@ -48,6 +48,15 @@ pub const ZULU_TIME_SEC: &str = "sim/time/zulu_time_sec";
 /// (118325 = 118.325 MHz); supports 8.33 kHz channel spacing.
 #[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)
 pub const COM1_FREQ_KHZ: &str = "sim/cockpit2/radios/actuators/com1_frequency_hz_833";
+/// Audio panel: COM1 monitor selected (nonzero = COM1 is audible in the
+/// cockpit). The ATC broadcast respects this so it can be muted like a radio.
+#[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)
+pub const AUDIO_SELECTION_COM1: &str = "sim/cockpit2/radios/actuators/audio_selection_com1";
+
+// --- Identity ---
+/// Tail number string ("N172SP") — the spoken callsign.
+#[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)
+pub const TAILNUM: &str = "sim/aircraft/view/acf_tailnum";
 
 // --- Autopilot status (read-only; > 0 = engaged/armed) ---
 pub const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";

@@ -10,11 +10,15 @@
 //! the copilot binary's own tree). That's deliberate scaffolding, not an
 //! accident: the two processes share code, not state.
 
+pub mod aircraft;
 pub mod atis;
 pub mod config;
 pub mod datarefs;
+pub mod mic;
 pub mod nav;
 pub mod phrase;
+pub mod stt;
+pub mod tower;
 pub mod tts;
 #[cfg(feature = "onnx-tts")]
 pub mod tts_onnx;

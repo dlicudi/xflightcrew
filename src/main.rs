@@ -21,6 +21,7 @@ mod failures;
 mod grammar;
 mod livestate;
 mod llm;
+mod mic;
 mod monitor;
 mod nav;
 mod phrase;

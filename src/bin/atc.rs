@@ -6,28 +6,52 @@
 //! [`SimView`], which exposes no writes. The copilot is crew and acts on the
 //! aircraft; ATC is the world and never touches it.
 //!
-//! Milestone zero is ATIS only: tune COM1 to the ATIS frequency and a looping
-//! broadcast built from live sim weather plays in its own voice. No STT, no
-//! dialogue yet. Frequencies come from the airport's apt.dat comm rows, not
-//! hardcoding; the tower frequency stands in when the data has no ATIS row
-//! (true at LXGB), until the tower service exists.
+//! Services, each on its own apt.dat frequency:
+//!   - Tower (row 1054): two-way. Key the mic (Enter in this terminal to key,
+//!     Enter again to transmit), speak a request, get a clearance back from
+//!     the deterministic state machine in [`x_copilot::tower`].
+//!   - ATIS (row 1050, or XCOPILOT_ATIS_FREQ): a looping broadcast built from
+//!     live sim weather. Only exists where the data (or the env) says so —
+//!     it never squats on the tower frequency, and it respects the audio
+//!     panel's COM1 monitor switch so it can be muted like a real radio.
 //!
 //! Environment:
 //!   XCOPILOT_ATC_AIRPORT  ICAO of the field to serve (default LXGB)
-//!   XCOPILOT_ATIS_FREQ    override frequency, MHz ("131.2") or kHz ("131200")
-//!   XCOPILOT_ATC_VOICE    macOS `say` voice for the broadcast (default Daniel)
+//!   XCOPILOT_ATIS_FREQ    ATIS frequency, MHz ("131.2") or kHz ("131200")
+//!   XCOPILOT_ATC_VOICE    macOS `say` voice for the station (default Daniel)
 //!   XCOPILOT_ATC_RATE     `say` words-per-minute (default 165, a read pace)
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::{anyhow, Context, Result};
-use x_copilot::{atis, config::Config, datarefs, nav, phrase, tts, xplane::XPlaneClient};
+use x_copilot::{
+    atis, config::Config, datarefs, mic, nav, phrase, stt, tower, tts,
+    xplane::XPlaneClient,
+};
 
 /// Read-only view of the simulator. ATC observes and speaks; it must never
-/// actuate anything, so only reads are reachable through this type.
-struct SimView(XPlaneClient);
+/// actuate anything, so only reads are reachable through this type. Sync
+/// wrappers (this binary has no other async work worth a runtime's ceremony).
+struct SimView {
+    client: XPlaneClient,
+    rt: tokio::runtime::Runtime,
+}
 
 impl SimView {
-    async fn get_float(&self, name: &str) -> Result<f64> {
-        self.0.get_float(name).await
+    fn new(base: String) -> Result<Self> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("building tokio runtime")?;
+        Ok(SimView { client: XPlaneClient::new(base), rt })
+    }
+    fn get_float(&self, name: &str) -> Result<f64> {
+        self.rt.block_on(self.client.get_float(name))
+    }
+    fn get_string(&self, name: &str) -> Result<String> {
+        self.rt.block_on(self.client.get_string(name))
     }
 }
 
@@ -46,10 +70,16 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_string())
 }
 
+/// 8.33 channel names can sit 5 kHz off the actual carrier (118.330 names
+/// 118.325); adjacent 8.33 channels are 8 kHz apart so 5 cannot cross over.
+fn tuned(com1_khz: i64, station_khz: i64) -> bool {
+    (com1_khz - station_khz).abs() <= 5
+}
+
 /// One weather snapshot off the sim, plus the wind-preferred runway.
-async fn read_snapshot(sim: &SimView, apt: &nav::AirportInfo) -> Result<atis::Snapshot> {
-    let wind_from_deg = sim.get_float(datarefs::WIND_DIR_DEG_TRUE).await?;
-    let wind_kts = sim.get_float(datarefs::WIND_SPEED_MSC).await? * 1.943844;
+fn read_snapshot(sim: &SimView, apt: &nav::AirportInfo) -> Result<atis::Snapshot> {
+    let wind_from_deg = sim.get_float(datarefs::WIND_DIR_DEG_TRUE)?;
+    let wind_kts = sim.get_float(datarefs::WIND_SPEED_MSC)? * 1.943844;
     // Wind and runway headings are both degrees true, so the pick is consistent
     // even though the spoken direction skips the (tiny, ~1 degree at LXGB)
     // magnetic conversion for now.
@@ -58,18 +88,50 @@ async fn read_snapshot(sim: &SimView, apt: &nav::AirportInfo) -> Result<atis::Sn
         .unwrap_or_default();
     Ok(atis::Snapshot {
         airport: apt.name.clone(),
-        zulu_sec: sim.get_float(datarefs::ZULU_TIME_SEC).await?,
+        zulu_sec: sim.get_float(datarefs::ZULU_TIME_SEC)?,
         runway,
         wind_from_deg,
         wind_kts,
-        visibility_sm: sim.get_float(datarefs::VISIBILITY_SM).await?,
-        qnh_hpa: sim.get_float(datarefs::QNH_PASCALS).await? / 100.0,
-        oat_c: sim.get_float(datarefs::OAT_DEG_C).await?,
+        visibility_sm: sim.get_float(datarefs::VISIBILITY_SM)?,
+        qnh_hpa: sim.get_float(datarefs::QNH_PASCALS)? / 100.0,
+        oat_c: sim.get_float(datarefs::OAT_DEG_C)?,
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Wind spoken tower-style off a snapshot ("zero niner zero degrees, three
+/// knots", or "calm").
+fn spoken_wind(s: &atis::Snapshot) -> String {
+    if s.wind_kts < 3.0 {
+        return "calm".to_string();
+    }
+    let dir = ((s.wind_from_deg / 10.0).round() as i64 * 10).rem_euclid(360);
+    let dir = if dir == 0 { 360 } else { dir };
+    format!(
+        "{} degrees, {} knots",
+        atis::spoken_digits(&format!("{dir:03}")),
+        atis::spoken_digits(&format!("{:.0}", s.wind_kts))
+    )
+}
+
+/// Speak as the station, raising the mic gate so the PTT capture can't hear
+/// our own voice over the speakers.
+fn transmit(voice: &Config, gate: &mic::MicGate, text: &str) {
+    let text = phrase::scrub_dashes(text);
+    tracing::info!(%text, "transmitting");
+    gate.set_speaking(true);
+    if let Err(e) = tts::speak(voice, &text) {
+        tracing::warn!("tts failed: {e:#}");
+    }
+    gate.set_speaking(false);
+}
+
+/// Is COM1 audible on the audio panel? Unknown (dataref missing on some
+/// airframes) counts as audible — better to speak than to go silently deaf.
+fn com1_audible(sim: &SimView) -> bool {
+    sim.get_float(datarefs::AUDIO_SELECTION_COM1).map(|v| v > 0.5).unwrap_or(true)
+}
+
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -87,33 +149,31 @@ async fn main() -> Result<()> {
         tracing::info!(kind = f.kind, mhz = f.khz as f64 / 1000.0, name = %f.name, "comm row");
     }
 
-    let atis_khz = match std::env::var("XCOPILOT_ATIS_FREQ").ok().filter(|v| !v.is_empty()) {
-        Some(v) => parse_freq_khz(&v)?,
-        None => match apt.freq(nav::FREQ_ATIS) {
-            Some(f) => f.khz,
-            None => {
-                let twr = apt.freq(nav::FREQ_TOWER).ok_or_else(|| {
-                    anyhow!(
-                        "{icao} has no ATIS or tower row in apt.dat; set XCOPILOT_ATIS_FREQ"
-                    )
-                })?;
-                tracing::info!(
-                    mhz = twr.khz as f64 / 1000.0,
-                    "no ATIS row for {icao}; serving ATIS on the tower frequency until \
-                     the tower service exists (XCOPILOT_ATIS_FREQ overrides)"
-                );
-                twr.khz
-            }
-        },
+    let tower_khz = apt.freq(nav::FREQ_TOWER).map(|f| f.khz);
+    // ATIS only where the data or the env says so — never on the tower.
+    let mut atis_khz = match std::env::var("XCOPILOT_ATIS_FREQ").ok().filter(|v| !v.is_empty()) {
+        Some(v) => Some(parse_freq_khz(&v)?),
+        None => apt.freq(nav::FREQ_ATIS).map(|f| f.khz),
     };
-    tracing::info!(
-        airport = %apt.name,
-        mhz = atis_khz as f64 / 1000.0,
-        "ATIS ready; tune COM1 to hear it"
-    );
+    if atis_khz.is_some() && atis_khz == tower_khz {
+        tracing::warn!("ATIS frequency equals the tower frequency; tower wins, ATIS disabled");
+        atis_khz = None;
+    }
+    if tower_khz.is_none() && atis_khz.is_none() {
+        return Err(anyhow!(
+            "{icao} has no tower or ATIS frequency; set XCOPILOT_ATIS_FREQ or pick another field"
+        ));
+    }
+    match tower_khz {
+        Some(k) => tracing::info!(mhz = k as f64 / 1000.0, "{} Tower on frequency", apt.name),
+        None => tracing::info!("no tower row for {icao}; tower service off"),
+    }
+    match atis_khz {
+        Some(k) => tracing::info!(mhz = k as f64 / 1000.0, "ATIS on frequency"),
+        None => tracing::info!("no ATIS row for {icao}; ATIS off (XCOPILOT_ATIS_FREQ enables it)"),
+    }
 
-    // The broadcast voice: deliberately not the copilot's. The `say` backend
-    // needs nothing installed; a cloned radio voice can slot in later.
+    // The station voice: deliberately not the copilot's.
     let voice = Config {
         tts_backend: "say".into(),
         say_voice: env_or("XCOPILOT_ATC_VOICE", "Daniel"),
@@ -121,19 +181,51 @@ async fn main() -> Result<()> {
         ..Config::default()
     };
 
-    let sim = SimView(XPlaneClient::new(config.xplane_base_url.clone()));
+    let sim = SimView::new(config.xplane_base_url.clone())?;
+
+    // Radio PTT: Enter in this terminal keys the mic, Enter again transmits.
+    // (A held key or a plugin dataref can replace this later; the capture only
+    // sees a closure.) The stdin thread just toggles the flag per line.
+    let ptt = Arc::new(AtomicBool::new(false));
+    {
+        let ptt = ptt.clone();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if std::io::stdin().read_line(&mut line).is_err() {
+                    return;
+                }
+                let keyed = !ptt.load(Ordering::Relaxed);
+                ptt.store(keyed, Ordering::Relaxed);
+                eprintln!(
+                    "{}",
+                    if keyed { "[mic keyed - speak, then press Enter]" } else { "[transmitting]" }
+                );
+            }
+        });
+    }
+
+    let gate = mic::MicGate::new();
+    let (ptt_mic, whisper) = if tower_khz.is_some() {
+        tracing::info!(model = %config.whisper_model_path, "loading whisper for the tower");
+        let mut w = stt::Stt::load(&config.whisper_model_path, config.whisper_gpu)?;
+        w.set_prompt(tower::STT_PROMPT.to_string());
+        let m = mic::PttMic::start(gate.clone(), Duration::from_millis(700))
+            .context("opening the mic (tower needs one; is a mic connected?)")?;
+        tracing::info!("tower ready — tune COM1, press Enter to key the mic, Enter again to transmit");
+        (Some(m), Some(w))
+    } else {
+        (None, None)
+    };
+
+    let mut twr = tower::Tower::new();
     let mut letter = 'A';
-    // The snapshot that cut the current edition; the letter advances only when
-    // the weather moves a real threshold away from IT (hysteresis, so jitter
-    // around any point can't burn through the alphabet).
     let mut edition: Option<atis::Snapshot> = None;
     let mut sim_down = false;
 
     loop {
-        // Who is tuned in? 8.33 channel names can sit 5 kHz off the actual
-        // carrier (118.330 names 118.325), hence the small tolerance; adjacent
-        // 8.33 channels are 8 kHz apart so 5 cannot cross into one.
-        let com1 = match sim.get_float(datarefs::COM1_FREQ_KHZ).await {
+        let com1 = match sim.get_float(datarefs::COM1_FREQ_KHZ) {
             Ok(v) => {
                 if sim_down {
                     tracing::info!("simulator is back");
@@ -146,43 +238,88 @@ async fn main() -> Result<()> {
                     tracing::warn!("simulator unreachable, waiting: {e:#}");
                 }
                 sim_down = true;
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                std::thread::sleep(Duration::from_secs(5));
                 continue;
             }
         };
-        if (com1 - atis_khz).abs() > 5 {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            continue;
-        }
 
-        let snap = match read_snapshot(&sim, &apt).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("weather read failed, retrying: {e:#}");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // --- Tower: wait (briefly) for a transmission, answer it ---
+        if let (Some(twr_khz), Some(ptt_mic), Some(whisper)) = (tower_khz, &ptt_mic, &whisper) {
+            if tuned(com1, twr_khz) {
+                // Blocks up to 1 s waiting for a key-down, then until key-up —
+                // the 1 s timeout doubles as the COM1 re-poll cadence.
+                let audio =
+                    ptt_mic.capture(|| ptt.load(Ordering::Relaxed), Some(Duration::from_secs(1)))?;
+                if audio.len() < mic::WHISPER_SAMPLE_RATE as usize / 4 {
+                    continue; // nothing (or a sub-quarter-second blip)
+                }
+                let heard = whisper.transcribe(&audio)?;
+                if heard.text.is_empty() {
+                    continue;
+                }
+                tracing::info!(text = %heard.text, confidence = heard.confidence, "received");
+
+                let snap = match read_snapshot(&sim, &apt) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("weather read failed: {e:#}");
+                        continue;
+                    }
+                };
+                let callsign = sim
+                    .get_string(datarefs::TAILNUM)
+                    .ok()
+                    .map(|t| tower::spoken_callsign(&t))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "aircraft calling".to_string());
+                let ctx = tower::Ctx {
+                    callsign,
+                    airport: apt.name.clone(),
+                    runway: atis::spoken_runway(&snap.runway),
+                    qnh: atis::spoken_digits(&format!("{:.0}", snap.qnh_hpa)),
+                    wind: spoken_wind(&snap),
+                    holding_point: "Alpha".to_string(),
+                };
+                let intent = if heard.confidence < config.stt_min_confidence {
+                    tower::Intent::Unknown // garbled call → "say again", never a guessed clearance
+                } else {
+                    tower::parse_intent(&heard.text)
+                };
+                let reply = twr.handle(intent, &ctx);
+                transmit(&voice, &gate, &reply);
                 continue;
             }
-        };
-        match &edition {
-            Some(e) if atis::new_edition(e, &snap) => {
-                letter = atis::next_letter(letter);
-                edition = Some(snap.clone());
-            }
-            None => edition = Some(snap.clone()),
-            Some(_) => {} // same edition: speak the letter it was cut as
         }
 
-        let text = phrase::scrub_dashes(&atis::report(&snap, letter));
-        tracing::info!(%text, "broadcasting");
-        // Blocking speech is fine here: broadcasting is this process's only
-        // job, and the frequency is re-checked between repeats. Off the async
-        // worker so tokio's timers stay live while `say` runs.
-        let v = voice.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || tts::speak(&v, &text)).await? {
-            tracing::warn!("tts failed: {e:#}");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        // --- ATIS: loop the broadcast while tuned and audible ---
+        if let Some(atis_khz) = atis_khz {
+            if tuned(com1, atis_khz) {
+                if !com1_audible(&sim) {
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue; // COM1 deselected on the audio panel — muted
+                }
+                let snap = match read_snapshot(&sim, &apt) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("weather read failed, retrying: {e:#}");
+                        std::thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                };
+                match &edition {
+                    Some(e) if atis::new_edition(e, &snap) => {
+                        letter = atis::next_letter(letter);
+                        edition = Some(snap.clone());
+                    }
+                    None => edition = Some(snap.clone()),
+                    Some(_) => {} // same edition: speak the letter it was cut as
+                }
+                transmit(&voice, &gate, &atis::report(&snap, letter));
+                std::thread::sleep(Duration::from_millis(1500));
+                continue;
+            }
         }
-        // The gap between loops of a real ATIS tape.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
