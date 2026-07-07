@@ -267,6 +267,9 @@ impl Voice {
             cv: Condvar::new(),
         });
         let text = crate::phrase::scrub_dashes(&text.into());
+        // To the FILE log, not just the TUI: the 2026-07-07 hang was blind
+        // because tower speech only reached the dashboard.
+        tracing::info!(transmitting = %text, "station");
         self.push(Utterance {
             priority,
             seq: 0,
@@ -440,15 +443,41 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         }
         // A station utterance speaks through the ATC voice (warm ONNX + radio
         // effect, built on first use) instead of the copilot's.
-        let spoke = if utt.station {
-            station
-                .get_or_insert_with(|| {
-                    StationVoice::build(&station_cfg.0, &station_cfg.1, &station_cfg.2)
-                })
-                .speak(&utt.text)
-        } else {
-            speaker.speak(&utt.text)
-        };
+        //
+        // catch_unwind: a panic ANYWHERE in a TTS engine must not kill this
+        // thread — blocking callers wait on latches only this thread signals,
+        // so a dead speaker deadlocks the whole app (seen live 2026-07-07: the
+        // first station utterance panicked, the main loop hung unkillable, and
+        // the backtrace sprayed over the raw-mode TUI). A panicking station
+        // voice is demoted to the `say` fallback for the rest of the session.
+        let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if utt.station {
+                station
+                    .get_or_insert_with(|| {
+                        StationVoice::build(&station_cfg.0, &station_cfg.1, &station_cfg.2)
+                    })
+                    .speak(&utt.text)
+            } else {
+                speaker.speak(&utt.text)
+            }
+        }))
+        .unwrap_or_else(|panic| {
+            let what = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic".into());
+            if utt.station {
+                tracing::error!("station voice panicked ({what}); demoting to `say` fallback");
+                station = Some(StationVoice::Say(Config {
+                    tts_backend: "say".into(),
+                    say_voice: station_cfg.1.clone(),
+                    say_rate: station_cfg.2.clone(),
+                    ..Config::default()
+                }));
+            }
+            Err(anyhow::anyhow!("TTS panicked: {what}"))
+        });
         if let Err(e) = spoke {
             // An interrupt (PTT / barge-in) kills `say`/piper with SIGTERM — that's
             // an intentional cut-off, not a failure, so don't log it as a warning.

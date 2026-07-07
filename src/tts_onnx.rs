@@ -501,3 +501,26 @@ fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
     w.finalize().context("finalizing wav")?;
     Ok(())
 }
+
+#[cfg(test)]
+mod station_voice_tests {
+    /// Reproduces the live 2026-07-07 station-voice failure: the copilot's Ryan
+    /// session already warm, then Alan loaded as a SECOND session in the same
+    /// process and spoken through the radio effect — exactly what the speaker
+    /// thread does on the first tower transmission.
+    #[test]
+    #[ignore = "loads the real voice models; run manually with --ignored"]
+    fn second_onnx_session_alan_with_radio_effect() {
+        let mut ryan = super::OnnxTts::load("models/en_US-ryan-high.onnx").expect("load ryan");
+        let r = ryan.synth("Copy, flaps ten.").expect("ryan synth");
+        assert!(!r.is_empty());
+
+        let mut alan = super::OnnxTts::load("models/en_GB-alan-medium.onnx").expect("load alan");
+        let mut a = alan
+            .synth("November one seven two, Gibraltar tower, reading you five.")
+            .expect("alan synth");
+        assert!(!a.is_empty());
+        crate::radiofx::radioize(&mut a, alan.sample_rate);
+        assert!(!a.is_empty());
+    }
+}

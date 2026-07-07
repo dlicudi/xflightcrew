@@ -25,6 +25,30 @@ pub fn speak(config: &Config, text: &str) -> Result<()> {
     }
 }
 
+/// Ceiling on any speech subprocess. A `say`/`afplay` that never exits would
+/// otherwise block the speaker thread forever — with the mic gate raised, so
+/// the app goes deaf too (seen live 2026-07-07: one hung `say` froze the whole
+/// loop, unkillable). Generous: the longest legitimate utterance (a full ATIS)
+/// is well under a minute.
+const SPEECH_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Wait for a speech child process, killing it if it overruns the watchdog.
+fn wait_with_watchdog(mut child: std::process::Child, what: &str) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait().with_context(|| format!("polling {what}"))? {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => bail!("{what} exited with {status}"),
+            None if start.elapsed() > SPEECH_WATCHDOG => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("{what} hung past {}s; killed it", SPEECH_WATCHDOG.as_secs());
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+}
+
 /// macOS built-in speech synthesizer. Reads the text directly — no WAV step.
 /// `XCOPILOT_SAY_VOICE` picks the voice (`say -v '?'` lists them); empty = the
 /// system default. `XCOPILOT_SAY_RATE` sets words-per-minute (empty = default).
@@ -36,14 +60,11 @@ fn speak_say(config: &Config, text: &str) -> Result<()> {
     if !config.say_rate.is_empty() {
         cmd.arg("-r").arg(&config.say_rate);
     }
-    let status = cmd
+    let child = cmd
         .arg(text)
-        .status()
+        .spawn()
         .context("spawning `say` (macOS only)")?;
-    if !status.success() {
-        bail!("say exited with {status}");
-    }
-    Ok(())
+    wait_with_watchdog(child, "say")
 }
 
 /// Pipe `text` to piper to synthesize a WAV, then play it.
@@ -93,25 +114,13 @@ pub fn stop_playback() {
 /// in-process ONNX backend ([`crate::tts_onnx`]) can reuse it.
 #[cfg(target_os = "macos")]
 pub(crate) fn play(path: &std::path::Path) -> Result<()> {
-    let status = Command::new("afplay")
-        .arg(path)
-        .status()
-        .context("spawning afplay")?;
-    if !status.success() {
-        bail!("afplay exited with {status}");
-    }
-    Ok(())
+    let child = Command::new("afplay").arg(path).spawn().context("spawning afplay")?;
+    wait_with_watchdog(child, "afplay")
 }
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn play(path: &std::path::Path) -> Result<()> {
     // Linux fallback: aplay ships with alsa-utils.
-    let status = Command::new("aplay")
-        .arg(path)
-        .status()
-        .context("spawning aplay")?;
-    if !status.success() {
-        bail!("aplay exited with {status}");
-    }
-    Ok(())
+    let child = Command::new("aplay").arg(path).spawn().context("spawning aplay")?;
+    wait_with_watchdog(child, "aplay")
 }
