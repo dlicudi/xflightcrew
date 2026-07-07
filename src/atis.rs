@@ -24,18 +24,37 @@ pub struct Snapshot {
     pub oat_c: f64,
 }
 
-/// The fields that make an ATIS *edition*, rounded the way the broadcast
-/// rounds them. When this changes between cycles, the information letter
-/// advances; comparing rounded values keeps sensor jitter from burning
-/// through the alphabet.
-pub fn fingerprint(s: &Snapshot) -> (String, i64, i64, i64, i64) {
-    (
-        s.runway.clone(),
-        s.qnh_hpa.round() as i64,
-        (s.wind_from_deg / 20.0).round() as i64,
-        (s.wind_kts / 5.0).round() as i64,
-        (s.oat_c / 2.0).round() as i64,
-    )
+/// Below this, the wind direction is meaningless for edition purposes (a
+/// METAR would call it variable) — a light breeze wanders tens of degrees.
+const VARIABLE_WIND_KTS: f64 = 6.0;
+
+/// Does `cur` differ enough from the snapshot that cut the current edition to
+/// deserve a new information letter? Thresholds against the *edition's*
+/// values, not fixed rounding buckets: buckets flap when the value sits on an
+/// edge (seen live at LXGB 2026-07-07, a 3 kt wind wobbling 92-107 degrees
+/// burned a letter per broadcast). With hysteresis the reference only moves
+/// when an edition is actually cut, so wobble around any point is absorbed.
+pub fn new_edition(edition: &Snapshot, cur: &Snapshot) -> bool {
+    if cur.runway != edition.runway {
+        return true;
+    }
+    if (cur.qnh_hpa.round() - edition.qnh_hpa.round()).abs() >= 1.0 {
+        return true;
+    }
+    if (cur.oat_c - edition.oat_c).abs() >= 2.0 {
+        return true;
+    }
+    if (cur.wind_kts - edition.wind_kts).abs() >= 5.0 {
+        return true;
+    }
+    // Direction only matters when there's enough wind for it to mean anything.
+    if cur.wind_kts.max(edition.wind_kts) >= VARIABLE_WIND_KTS {
+        let d = (cur.wind_from_deg - edition.wind_from_deg + 540.0).rem_euclid(360.0) - 180.0;
+        if d.abs() >= 30.0 {
+            return true;
+        }
+    }
+    false
 }
 
 /// The next information letter, wrapping Z back to A.
@@ -198,20 +217,46 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_ignores_jitter_but_not_changes() {
-        let a = snap();
-        let mut b = snap();
-        b.wind_from_deg = 254.0; // sensor wobble within the rounding buckets:
-        b.wind_kts = 11.0; // same edition (a wobble ACROSS a bucket edge is
-                           // allowed to advance the letter — harmless)
-        b.zulu_sec += 600.0; // time never makes a new edition
-        assert_eq!(fingerprint(&a), fingerprint(&b));
-        let mut c = snap();
-        c.qnh_hpa = 1016.0;
-        assert_ne!(fingerprint(&a), fingerprint(&c), "pressure change is a new edition");
-        let mut d = snap();
-        d.runway = "09".into();
-        assert_ne!(fingerprint(&a), fingerprint(&d), "runway change is a new edition");
+    fn light_wind_wobble_is_not_a_new_edition() {
+        // The live failure (LXGB 2026-07-07): a 3 kt wind wandering 92-107
+        // degrees advanced the letter every broadcast. Direction is ignored
+        // below the variable-wind threshold.
+        let mut edition = snap();
+        edition.wind_from_deg = 92.0;
+        edition.wind_kts = 3.2;
+        for dir in [107.0, 100.0, 75.0, 92.0] {
+            let mut cur = edition.clone();
+            cur.wind_from_deg = dir;
+            cur.zulu_sec += 600.0; // time never makes a new edition
+            assert!(!new_edition(&edition, &cur), "3 kt wobble to {dir} cut an edition");
+        }
+    }
+
+    #[test]
+    fn real_changes_cut_a_new_edition() {
+        let edition = snap(); // wind 251 at 12
+        let mut wind_swing = snap();
+        wind_swing.wind_from_deg = 285.0;
+        assert!(new_edition(&edition, &wind_swing), "30+ degree swing at 12 kt");
+        let mut wind_north = snap();
+        wind_north.wind_from_deg = 5.0; // circular diff vs 251 is ~114, not ~246
+        assert!(new_edition(&edition, &wind_north));
+        let mut qnh = snap();
+        qnh.qnh_hpa = 1016.0;
+        assert!(new_edition(&edition, &qnh), "pressure change");
+        let mut rwy = snap();
+        rwy.runway = "09".into();
+        assert!(new_edition(&edition, &rwy), "runway change");
+        let mut speed = snap();
+        speed.wind_kts = 18.0;
+        assert!(new_edition(&edition, &speed), "5+ kt speed change");
+        // Hysteresis: wobble around the edition's own values stays put.
+        let mut wobble = snap();
+        wobble.wind_from_deg = 262.0;
+        wobble.wind_kts = 14.0;
+        wobble.oat_c = 25.0;
+        wobble.qnh_hpa = 1018.2;
+        assert!(!new_edition(&edition, &wobble), "within-threshold drift");
     }
 
     #[test]

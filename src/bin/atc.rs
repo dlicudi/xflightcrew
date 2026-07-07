@@ -123,7 +123,10 @@ async fn main() -> Result<()> {
 
     let sim = SimView(XPlaneClient::new(config.xplane_base_url.clone()));
     let mut letter = 'A';
-    let mut last_fp: Option<(String, i64, i64, i64, i64)> = None;
+    // The snapshot that cut the current edition; the letter advances only when
+    // the weather moves a real threshold away from IT (hysteresis, so jitter
+    // around any point can't burn through the alphabet).
+    let mut edition: Option<atis::Snapshot> = None;
     let mut sim_down = false;
 
     loop {
@@ -160,12 +163,13 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-        let fp = atis::fingerprint(&snap);
-        if last_fp.as_ref() != Some(&fp) {
-            if last_fp.is_some() {
+        match &edition {
+            Some(e) if atis::new_edition(e, &snap) => {
                 letter = atis::next_letter(letter);
+                edition = Some(snap.clone());
             }
-            last_fp = Some(fp);
+            None => edition = Some(snap.clone()),
+            Some(_) => {} // same edition: speak the letter it was cut as
         }
 
         let text = phrase::scrub_dashes(&atis::report(&snap, letter));
