@@ -2,6 +2,8 @@
 name = "x-copilot"
 version = "0.1.0"
 edition = "2021"
+# Plain `cargo run` means the copilot; the atc binary is opt-in (--bin atc).
+default-run = "x-copilot"
 description = "A voice-commanded copilot for X-Plane (working name; product name: Roger)"
 license = "LicenseRef-proprietary"
 publish = false
