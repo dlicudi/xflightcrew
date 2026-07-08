@@ -210,11 +210,22 @@ static void StoreText(TextRef* t, void* in, int offset, int len) {
 
 static void WriteHeard(void*, void* in, int offset, int len) {
     StoreText(&g_heard, in, offset, len);
-    AppendLog("HEARD", COL_DIM, g_heard.buf);
+    // The pilot's own words, named as the speaker they are: the log reads as a
+    // three-voice transcript (PILOT / COPILOT / ATC), white because it's the
+    // pilot's half of the dialogue.
+    AppendLog("PILOT", COL_WHITE, g_heard.buf);
 }
 static void WriteAction(void*, void* in, int offset, int len) {
     StoreText(&g_action, in, offset, len);
-    AppendLog("ROGER", COL_GREEN, g_action.buf);
+    // "TWR: " prefix = station speech (attribution, not content): strip it and
+    // tag the row ATC in amber; everything else is the crew, tagged COPILOT.
+    if (std::strncmp(g_action.buf, "TWR: ", 5) == 0) {
+        std::memmove(g_action.buf, g_action.buf + 5, static_cast<size_t>(g_action.len - 5 + 1));
+        g_action.len -= 5;
+        AppendLog("ATC", COL_AMBER, g_action.buf);
+    } else {
+        AppendLog("COPILOT", COL_GREEN, g_action.buf);
+    }
 }
 // Active aircraft ICAO — shown beside the connection chip, not logged.
 static void WriteAircraft(void*, void* in, int offset, int len) {
@@ -442,6 +453,7 @@ static void WriteFmsLoad(void*, int v) {
 // DrawPanel) shows NOT CONNECTED instead.
 static const char* PhaseLabel(int p) {
     switch (p) {
+        case 1: return "LISTENING";
         case 2: return "THINKING";
         case 3: return "SPEAKING";
         default: return "CONNECTED";
@@ -449,6 +461,7 @@ static const char* PhaseLabel(int p) {
 }
 static ImU32 PhaseColor(int p) {
     switch (p) {
+        case 1: return COL_WHITE; // mic open — the brightest state on the strip
         case 2: return COL_AMBER;
         case 3: return COL_CYAN;
         default: return COL_GREEN;
@@ -468,6 +481,21 @@ static void Chip(const char* label, ImU32 col) {
     ImGui::Dummy(size);
 }
 
+// Log speaker tag: a fixed-width filled pill so every row's text starts at the
+// same column — the log reads as a transcript, not a ragged debug feed. Fill
+// is the tag's own hue at low alpha; the label carries the color.
+static void TagChip(const char* label, ImU32 col, float width) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImVec2 ts = ImGui::CalcTextSize(label);
+    const float pady = 2.0f;
+    ImVec2 size(width, ts.y + pady * 2);
+    ImU32 fill = (col & 0x00FFFFFFu) | 0x2E000000u;
+    dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), fill, 3.0f);
+    dl->AddText(ImVec2(p.x + (width - ts.x) * 0.5f, p.y + pady), col, label);
+    ImGui::Dummy(size);
+}
+
 class XCopilotPanel : public ImgWindow {
 public:
     XCopilotPanel(int l, int t, int r, int b)
@@ -477,14 +505,49 @@ public:
         SetWindowTitle("X-COPILOT");
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
+        // One visual system: dark slate instrument, grey controls, color used
+        // ONLY as signal (green ok, amber ATC/caution, cyan info, red danger).
+        // Everything blue that ImGui ships by default is restyled — a cockpit
+        // panel shouldn't look like a debug tool.
         ImGuiStyle& s = ImGui::GetStyle();
         s.WindowRounding = 8.0f;
         s.ChildRounding = 6.0f;
         s.FrameRounding = 4.0f;
+        s.TabRounding = 4.0f;
+        s.GrabRounding = 4.0f;
         s.ItemSpacing = ImVec2(8, 6);
-        s.Colors[ImGuiCol_WindowBg] = ImVec4(0.13f, 0.14f, 0.16f, 0.94f);
-        s.Colors[ImGuiCol_ChildBg]  = ImVec4(0.10f, 0.11f, 0.13f, 0.85f);
-        s.Colors[ImGuiCol_Border]   = ImVec4(0.30f, 0.32f, 0.36f, 0.60f);
+        s.FramePadding = ImVec2(8, 3);
+        const ImVec4 slate0(0.09f, 0.10f, 0.12f, 0.96f);  // window
+        const ImVec4 slate1(0.12f, 0.13f, 0.15f, 1.00f);  // wells
+        const ImVec4 slate2(0.17f, 0.19f, 0.22f, 1.00f);  // controls
+        const ImVec4 slate3(0.23f, 0.25f, 0.29f, 1.00f);  // hover
+        const ImVec4 slate4(0.28f, 0.31f, 0.36f, 1.00f);  // active
+        s.Colors[ImGuiCol_WindowBg]         = slate0;
+        s.Colors[ImGuiCol_ChildBg]          = slate1;
+        s.Colors[ImGuiCol_Border]           = ImVec4(0.26f, 0.28f, 0.32f, 0.55f);
+        s.Colors[ImGuiCol_FrameBg]          = slate2;
+        s.Colors[ImGuiCol_FrameBgHovered]   = slate3;
+        s.Colors[ImGuiCol_FrameBgActive]    = slate4;
+        s.Colors[ImGuiCol_Button]           = slate2;
+        s.Colors[ImGuiCol_ButtonHovered]    = slate3;
+        s.Colors[ImGuiCol_ButtonActive]     = slate4;
+        s.Colors[ImGuiCol_Tab]              = slate1;
+        s.Colors[ImGuiCol_TabHovered]       = slate3;
+        s.Colors[ImGuiCol_TabActive]        = slate2;
+        s.Colors[ImGuiCol_TabUnfocused]     = slate1;
+        s.Colors[ImGuiCol_TabUnfocusedActive] = slate2;
+        s.Colors[ImGuiCol_CheckMark]        = ImVec4(0.47f, 0.88f, 0.55f, 1.0f);
+        s.Colors[ImGuiCol_ScrollbarBg]      = slate1;
+        s.Colors[ImGuiCol_ScrollbarGrab]    = slate2;
+        s.Colors[ImGuiCol_ScrollbarGrabHovered] = slate3;
+        s.Colors[ImGuiCol_ScrollbarGrabActive]  = slate4;
+        s.Colors[ImGuiCol_TitleBg]          = slate0;
+        s.Colors[ImGuiCol_TitleBgActive]    = slate0;
+        s.Colors[ImGuiCol_Separator]        = ImVec4(0.26f, 0.28f, 0.32f, 0.55f);
+        s.Colors[ImGuiCol_HeaderHovered]    = slate3;
+        s.Colors[ImGuiCol_HeaderActive]     = slate4;
+        s.Colors[ImGuiCol_TableRowBg]       = slate1;
+        s.Colors[ImGuiCol_TableRowBgAlt]    = ImVec4(0.14f, 0.15f, 0.18f, 1.0f);
         // Allow shrinking down to the toolbar row (collapsed view).
         SetWindowResizingLimits(260, kCollapsedH, 1400, 1400);
     }
@@ -510,19 +573,22 @@ private:
         }
     }
 
+public:
+    // Launch state: a slim status strip, not a window over the scenery. The
+    // panel earns its full size when the pilot asks for it ("+"), instead of
+    // greeting every flight as a splash screen.
+    void startCollapsed() {
+        if (!mCollapsed) toggleCollapse();
+    }
+
 protected:
     void buildInterface() override {
-        // Toolbar: PTT light + connection/phase, as chips. The app heartbeats the
-        // phase ~1/s, so a stale timestamp means it isn't running.
+        // Toolbar, most important first: state of the crew, then the aircraft,
+        // then the two talk lights. The app heartbeats the phase ~1/s, so a
+        // stale timestamp means it isn't running.
         bool connected = (XPLMGetElapsedTime() - g_last_status_time) < 3.0f;
-        Chip("PTT", g_ptt_active ? COL_GREEN : COL_DIM);
-        ImGui::SameLine();
-        // TX = the radio (ATC) push-to-talk, distinct from the intercom PTT.
-        Chip("TX", g_radio_ptt_active ? COL_AMBER : COL_DIM);
-        ImGui::SameLine();
         if (connected) {
             Chip(PhaseLabel(g_phase), PhaseColor(g_phase));
-            // Detected aircraft profile (ICAO), beside the connection chip.
             if (g_aircraft.len > 0) {
                 ImGui::SameLine();
                 Chip(g_aircraft.buf, COL_CYAN);
@@ -530,19 +596,19 @@ protected:
         } else {
             Chip("NOT CONNECTED", COL_RED);
         }
-        // Collapse / expand to just this toolbar row, to tuck the panel away.
         ImGui::SameLine();
-        if (ImGui::SmallButton(mCollapsed ? "+" : "_")) {
+        Chip("PTT", g_ptt_active ? COL_GREEN : COL_DIM);
+        ImGui::SameLine();
+        // TX = the radio (ATC) push-to-talk, distinct from the intercom PTT.
+        Chip("TX", g_radio_ptt_active ? COL_AMBER : COL_DIM);
+        // Collapse / expand to just this toolbar row — right-aligned, the only
+        // window control up here. (Reload lives in Settings: it's a dev tool.)
+        const char* collapseLbl = mCollapsed ? "+" : "-";
+        float collapseW = ImGui::CalcTextSize(collapseLbl).x
+            + ImGui::GetStyle().FramePadding.x * 2.0f;
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - collapseW);
+        if (ImGui::SmallButton(collapseLbl)) {
             toggleCollapse();
-        }
-        // One-click reload after a rebuild — right-aligned and set apart from the
-        // other buttons so it can't be fat-fingered (it bounces ALL plugins; the
-        // SDK can't reload just one).
-        const char* reloadLbl = "Reload";
-        float reloadW = ImGui::CalcTextSize(reloadLbl).x + ImGui::GetStyle().FramePadding.x * 2.0f;
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - reloadW);
-        if (ImGui::SmallButton(reloadLbl)) {
-            XPLMReloadPlugins();
         }
         ImGui::Separator();
         // Collapsed: stop here — just the toolbar shows under the title bar.
@@ -561,18 +627,27 @@ protected:
         }
 
         // Emergency buttons — the mouse fallback when voice fails mid-emergency.
-        // Each writes a request code the app polls and runs as the matching voice
-        // command ("take control" / "land the aircraft" / "my controls").
+        // Guarded-switch styling: the two that take the aircraft are filled dark
+        // red, the one that gives it back dark green. Each writes a request code
+        // the app polls and runs as the matching voice command.
         if (connected) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_RED));
+            const ImVec4 redBg(0.42f, 0.13f, 0.11f, 1.0f), redHov(0.55f, 0.17f, 0.14f, 1.0f);
+            const ImVec4 greenBg(0.11f, 0.32f, 0.16f, 1.0f), greenHov(0.14f, 0.42f, 0.21f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button, redBg);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, redHov);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, redHov);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_WHITE));
             if (ImGui::SmallButton("RECOVER")) g_request = 1;
             ImGui::SameLine();
             if (ImGui::SmallButton("AUTOLAND")) g_request = 2;
-            ImGui::PopStyleColor();
+            ImGui::PopStyleColor(4);
             ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_GREEN));
+            ImGui::PushStyleColor(ImGuiCol_Button, greenBg);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, greenHov);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, greenHov);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_WHITE));
             if (ImGui::SmallButton("MY CONTROLS")) g_request = 3;
-            ImGui::PopStyleColor();
+            ImGui::PopStyleColor(4);
             if (g_request != 0) {
                 ImGui::SameLine();
                 ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "sent...");
@@ -610,11 +685,25 @@ protected:
     void buildLogTab(bool connected) {
         const float footer = ImGui::GetFrameHeightWithSpacing();
         ImGui::BeginChild("log", ImVec2(0, -footer), true);
+        // Columns measured from the actual font (time | speaker | text) so
+        // nothing ever clips and every message starts at the same x — the log
+        // reads as a transcript, not a ragged debug feed.
+        const float pad = 8.0f;
+        const float kTimeW = ImGui::CalcTextSize("88:88:88").x + pad;
+        const float kTagW = ImGui::CalcTextSize("ADVISORY").x + 14.0f; // widest tag
+        if (g_log.empty()) {
+            // Empty state, centred in the well — not a footer mumble.
+            const char* hint = connected ? "Hold PTT and speak." : "Start x-copilot to connect.";
+            ImVec2 ts = ImGui::CalcTextSize(hint);
+            ImGui::SetCursorPos(ImVec2((ImGui::GetWindowWidth() - ts.x) * 0.5f,
+                                       (ImGui::GetWindowHeight() - ts.y) * 0.5f));
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", hint);
+        }
         for (const LogEntry& e : g_log) {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", e.time.c_str());
-            ImGui::SameLine();
-            Chip(e.tag.c_str(), e.color);
-            ImGui::SameLine();
+            ImGui::SameLine(kTimeW + pad);
+            TagChip(e.tag.c_str(), e.color, kTagW);
+            ImGui::SameLine(kTimeW + kTagW + pad * 2);
             // Wrap long readbacks at the panel edge instead of running off it.
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(e.color));
             ImGui::PushTextWrapPos(0.0f);
@@ -625,14 +714,9 @@ protected:
         if (g_log_scroll) { ImGui::SetScrollHereY(1.0f); g_log_scroll = false; }
         ImGui::EndChild();
 
-        // Footer: connection state + version on the left; log controls on the right.
-        if (!connected) {
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "Not connected. Start x-copilot.");
-        } else if (g_log.empty()) {
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_GREEN), "Connected to x-copilot v" XCOPILOT_VERSION ". Hold your PTT button and speak.");
-        } else {
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_GREEN), "Connected to x-copilot v" XCOPILOT_VERSION);
-        }
+        // Footer: just the log controls — state lives in the chips, version in
+        // Settings. An empty left cell keeps the controls on this row.
+        ImGui::Dummy(ImVec2(1, 1));
         // Right-aligned: auto-scroll toggle + clear.
         const char* clearLbl = "Clear";
         float ctlW = ImGui::CalcTextSize("Clear").x + ImGui::CalcTextSize("follow").x
@@ -665,7 +749,7 @@ protected:
         // Re-push the plan into the GPS/FMS, e.g. after switching aircraft.
         if (ImGui::SmallButton("Send to FMS")) {
             load_fms_route();
-            AppendLog("ROGER", COL_GREEN, "Flight plan sent to the FMS.");
+            AppendLog("COPILOT", COL_GREEN, "Flight plan sent to the FMS.");
         }
         if (ImGui::BeginTable("route", 4,
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
@@ -721,6 +805,15 @@ protected:
         ImGui::Spacing();
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
                            "Changes apply live; no restart needed.");
+        ImGui::Separator();
+        // Dev corner: the plugin reload (bounces ALL plugins — the SDK can't
+        // reload just one) and the build identity, out of the pilot's way.
+        if (ImGui::SmallButton("Reload plugins")) {
+            XPLMReloadPlugins();
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                           "after a rebuild · v" XCOPILOT_VERSION " · " XCOPILOT_BUILD);
     }
 };
 
@@ -773,6 +866,16 @@ static XPLMMenuID g_menu = nullptr;
 
 static void MenuHandler(void*, void*) {
     if (g_panel) g_panel->SetVisible(!g_panel->GetVisible());
+}
+
+// Bindable panel toggle (xcopilot/toggle_panel) — a joystick button or key
+// beats reaching for the plugins menu mid-flight.
+static XPLMCommandRef g_toggle_cmd = nullptr;
+static int TogglePanelHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
+    if (phase == xplm_CommandBegin && g_panel) {
+        g_panel->SetVisible(!g_panel->GetVisible());
+    }
+    return 0;
 }
 
 // ---- lifecycle --------------------------------------------------------------
@@ -867,6 +970,10 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
     // Start well below the top edge so the panel clears the X-Plane menu bar.
     int wl = sl + 50, wt = st - 150, wr = wl + 420, wb = wt - 300;
     g_panel = std::make_unique<XCopilotPanel>(wl, wt, wr, wb);
+    // Launch as a slim status strip (chips only) — expand is one click away.
+    g_panel->startCollapsed();
+    g_toggle_cmd = XPLMCreateCommand("xcopilot/toggle_panel", "x-copilot: toggle the status panel");
+    XPLMRegisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr);
     // Callout toast: upper-centre, borderless, hidden until a callout arrives.
     int cw = 400, chh = 84;
     int cl2 = (sl + sr) / 2 - cw / 2;
@@ -890,6 +997,7 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
 }
 
 PLUGIN_API void XPluginStop(void) {
+    if (g_toggle_cmd) { XPLMUnregisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr); g_toggle_cmd = nullptr; }
     XPLMUnregisterFlightLoopCallback(ToastLoop, nullptr);
     g_toast.reset();
     if (g_callout_dref) { XPLMUnregisterDataAccessor(g_callout_dref); g_callout_dref = nullptr; }
