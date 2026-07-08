@@ -758,6 +758,10 @@ async fn run_session(
     let mut last_subject: Option<String> = None;
     // Cached SimBrief plan (it doesn't change mid-flight); re-fetched on TTL or "refresh".
     let mut fp_cache: Option<(Instant, simbrief::FlightPlan)> = None;
+    // Last time the crew read the full comm plan after a dead-air transmission.
+    // The 2026-07-08 night flight called Malaga, Jerez and Cadiz in a row and got
+    // the whole Gibraltar briefing every time — once is help, thrice is butting in.
+    let mut last_void_brief: Option<Instant> = None;
     // Memory of armed reminders, so the copilot can recall and cancel them.
     let reminders = tools::reminder::Reminders::default();
     // Recovery for recent utterances (a stack), so "belay that" can walk back the
@@ -982,7 +986,23 @@ async fn run_session(
                 // air is realistic but unhelpful (the 2026-07-08 flight called
                 // twice into silence, lost) — so the CREW, not ATC, chimes in
                 // with the comm plan: which frequencies exist, where COM1 is.
-                let line = format!("No answer there. {}", st.freq_briefing(&xplane).await);
+                // Full briefing at most every few minutes; repeats get a short
+                // "no answer" (working down a list of foreign towers, the crew
+                // reciting the whole plan each call reads as butting in).
+                let line = if last_void_brief
+                    .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(300))
+                {
+                    last_void_brief = Some(Instant::now());
+                    format!("No answer there. {}", st.freq_briefing(&xplane).await)
+                } else {
+                    match xplane.get_float(datarefs::COM1_FREQ_KHZ).await {
+                        Ok(v) => format!(
+                            "No answer on {}.",
+                            atis::spoken_mhz(v.round() as i64)
+                        ),
+                        Err(_) => "No answer there.".to_string(),
+                    }
+                };
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }

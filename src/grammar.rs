@@ -398,6 +398,50 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("request_service", json!({})));
     }
 
+    // Radio tuning by number: "tune radio to 122.8", "com one 118.5", "set com
+    // two to 121.9", "nav one 109.5". Was LLM-only, so with the LLM off every
+    // phrasing missed (six in a row on the 2026-07-08 night flight, stranding
+    // the pilot off-frequency). Requires a radio word AND a decimal in the
+    // right band, so headings ("heading 122") and altimeter settings never
+    // match. Whisper glues the radio index into the number ("com 1 122.8" →
+    // "com 1122.8"), so 1xxx.x/2xxx.x recover com1/com2 + the frequency.
+    if has(t, "com") || has(t, "radio") || has(t, "frequency") || has(t, "freq")
+        || has(t, "nav") || has(t, "tune")
+    {
+        let com_band = 118.0..=136.975;
+        let nav_band = 108.0..=117.95;
+        // Spoken decimals survive as words ("one two two decimal eight");
+        // rejoin them so the band check sees one number.
+        let spelled = t.replace(" decimal ", ".").replace(" point ", ".");
+        let com2_named =
+            spelled.contains("com two") || spelled.contains("com 2") || has(t, "com2");
+        let mut found: Option<(&str, f64)> = None;
+        for w in spelled.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
+            let Ok(v) = w.parse::<f64>() else { continue };
+            if !w.contains('.') && v < 1000.0 {
+                continue; // integers below the glue range: headings, squawks
+            }
+            found = if nav_band.contains(&v) && has(t, "nav") {
+                Some(("set_nav1", v))
+            } else if com_band.contains(&v) && !has(t, "nav") {
+                Some((if com2_named { "set_com2" } else { "set_com1" }, v))
+            } else if com_band.contains(&(v - 1000.0)) {
+                // "com 1122.8" glue; re-round to kHz (float subtraction dust).
+                Some(("set_com1", ((v - 1000.0) * 1000.0).round() / 1000.0))
+            } else if com_band.contains(&(v - 2000.0)) {
+                Some(("set_com2", ((v - 2000.0) * 1000.0).round() / 1000.0))
+            } else {
+                None
+            };
+            if found.is_some() {
+                break;
+            }
+        }
+        if let Some((tool, mhz)) = found {
+            return Some(call(tool, json!({ "mhz": mhz })));
+        }
+    }
+
     // speedbrakes / spoilers: extend / retract / arm.
     if t.contains("speedbrake") || t.contains("speed brake") || has(t, "spoiler") || has(t, "spoilers") {
         let action = if has(t, "arm") {
@@ -1049,6 +1093,42 @@ mod tests {
             let c = v.remove(0);
             (c.name, c.arguments)
         })
+    }
+
+    #[test]
+    fn com_tuning_parses_deterministically() {
+        // The 2026-07-08 night flight: six tuning phrasings in a row missed
+        // (LLM off), stranding the pilot off-frequency. All deterministic now.
+        assert_eq!(
+            one("tune radio to 122.8").unwrap(),
+            ("set_com1".into(), json!({ "mhz": 122.8 }))
+        );
+        assert_eq!(
+            one("com one 118.5").unwrap(),
+            ("set_com1".into(), json!({ "mhz": 118.5 }))
+        );
+        // Whisper glues the radio index into the number ("com 1 122.8").
+        assert_eq!(
+            one("switch to com 1122.8").unwrap(),
+            ("set_com1".into(), json!({ "mhz": 122.8 }))
+        );
+        assert_eq!(
+            one("set com two to 121.9").unwrap(),
+            ("set_com2".into(), json!({ "mhz": 121.9 }))
+        );
+        assert_eq!(
+            one("nav one 109.5").unwrap(),
+            ("set_nav1".into(), json!({ "mhz": 109.5 }))
+        );
+        assert_eq!(
+            one("set frequency to 131.2").unwrap(),
+            ("set_com1".into(), json!({ "mhz": 131.2 }))
+        );
+        // No frequency spoken → not a radio command here (the tuner or LLM's
+        // job), and non-band numbers never match.
+        assert!(one("change com 1 frequency").is_none());
+        assert!(one("heading 122").map(|c| c.0) != Some("set_com1".into()));
+        assert!(one("set altimeter 29.92").map(|c| c.0) != Some("set_com1".into()));
     }
 
     #[test]

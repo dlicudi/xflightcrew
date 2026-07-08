@@ -757,13 +757,21 @@ impl Station {
     /// tuning verb, so radio chatter that merely mentions a station never
     /// re-tunes the radio. `None` = not a tuning request at all.
     pub fn tune_request(&self, t: &str) -> Option<Tune> {
+        // Flight-parameter talk that happens to name a station ("change to
+        // approach speed", "select approach flaps") is never a tuning request.
+        if t.contains("speed") || t.contains("knots") || t.contains("flaps")
+            || t.contains("heading") || t.contains("altitude")
+        {
+            return None;
+        }
         let verb = t.contains("tune")
             || t.contains("switch to")
             || t.contains("select")
             || t.contains("contact")
+            || t.contains("change to")
             || (t.contains("set") && t.contains("com"))
             // "change frequency to the tower" — but only when the sentence is
-            // about the radio: "change approach speed" must not retune COM1.
+            // about the radio: a bare "change" is too promiscuous a verb.
             || (t.contains("change")
                 && (t.contains("freq") || t.contains("com") || t.contains("radio")));
         if !verb {
@@ -951,6 +959,15 @@ mod tests {
         ));
         // "change" without radio context must not retune.
         assert!(st.tune_request("change approach speed to seventy").is_none());
+        // "change to approach" tunes (2026-07-08 night flight: answered with
+        // "approach around 65 knots" instead) — but flight-parameter talk
+        // naming a station never does.
+        assert!(matches!(
+            st.tune_request("change to approach"),
+            Some(Tune::Found { khz: 122800, .. })
+        ));
+        assert!(st.tune_request("change to approach speed").is_none());
+        assert!(st.tune_request("select approach flaps").is_none());
     }
 
     #[test]
