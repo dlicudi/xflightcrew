@@ -25,6 +25,7 @@ const DR_ALERT: &str = "xcopilot/status/alert";
 const DR_AIRCRAFT: &str = "xcopilot/status/aircraft";
 const DR_STRIP: &str = "xcopilot/status/strip";
 const DR_CALLOUT: &str = "xcopilot/status/callout";
+const DR_RADIO: &str = "xcopilot/status/radio";
 
 /// Keep text within the plugin's fixed display buffer (512 bytes, NUL-terminated)
 /// — long enough for a full engine/weather summary readback.
@@ -45,6 +46,9 @@ enum Update {
     /// The live flight strip — one compact status row (emergency phase/runway,
     /// cabin altitude, endurance), refreshed continuously. Empty hides it.
     Strip(String),
+    /// The radio row — the ATC field's comm plan plus live COM1, refreshed
+    /// continuously ("GIBRALTAR | >TWR 131.200 | APP 122.800"). Empty hides it.
+    Radio(String),
     /// A short "what's being changed" label the plugin flashes over the cockpit.
     Callout(String),
 }
@@ -106,6 +110,10 @@ impl StatusSink {
     pub fn strip(&self, text: &str) {
         let _ = self.0.send(Update::Strip(clip(text)));
     }
+    /// Refresh the radio row (comm plan + live COM1). Empty text hides it.
+    pub fn radio(&self, text: &str) {
+        let _ = self.0.send(Update::Radio(clip(text)));
+    }
     /// Flash a "what's being changed" callout over the cockpit (e.g. "FLAPS > 10").
     pub fn callout(&self, text: &str) {
         let _ = self.0.send(Update::Callout(clip(text)));
@@ -137,6 +145,7 @@ enum Slot {
     Aircraft,
     Strip,
     Callout,
+    Radio,
 }
 
 /// The resolved numeric ids of the plugin's status datarefs. All `None` until a
@@ -150,6 +159,7 @@ struct Ids {
     aircraft: Option<i64>,
     strip: Option<i64>,
     callout: Option<i64>,
+    radio: Option<i64>,
 }
 
 impl Ids {
@@ -162,6 +172,7 @@ impl Ids {
             Slot::Aircraft => self.aircraft,
             Slot::Strip => self.strip,
             Slot::Callout => self.callout,
+            Slot::Radio => self.radio,
         }
     }
     /// True once at least one dataref resolved (i.e. the plugin is present).
@@ -181,6 +192,7 @@ fn resolve_all(http: &reqwest::blocking::Client, rest: &str) -> Ids {
         aircraft: resolve_id(http, rest, DR_AIRCRAFT),
         strip: resolve_id(http, rest, DR_STRIP),
         callout: resolve_id(http, rest, DR_CALLOUT),
+        radio: resolve_id(http, rest, DR_RADIO),
     }
 }
 
@@ -266,6 +278,7 @@ fn run(base: String, rx: Receiver<Update>) {
                     (Slot::Aircraft, json!(STANDARD.encode(code.as_bytes())))
                 }
                 Update::Strip(text) => (Slot::Strip, json!(STANDARD.encode(text.as_bytes()))),
+                Update::Radio(text) => (Slot::Radio, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Callout(text) => (Slot::Callout, json!(STANDARD.encode(text.as_bytes()))),
             };
             healthy = patch(&http, &rest, &ids, slot, value);

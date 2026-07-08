@@ -326,6 +326,40 @@ async fn main() -> Result<()> {
         .plugin_status
         .then(|| plugin_status::StatusSink::start(&config.xplane_base_url));
 
+    // Radio row for the in-sim panel: the ATC field's comm plan plus live COM1,
+    // refreshed ~1/s through the status sink. Its own small poller (not the
+    // TUI's) so the radios show in the cockpit in every UI mode — the panel is
+    // the instrument, the terminal is just a dev view.
+    if let Some(sink) = status_sink.clone() {
+        let base = config.xplane_base_url.clone();
+        let (apt_path, atc_icao) =
+            (config.apt_data_path.clone(), config.atc_airport.trim().to_uppercase());
+        if !atc_icao.is_empty() {
+            std::thread::spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+                rt.block_on(async move {
+                    // ATC off or the field missing just means no radio row —
+                    // the station's own load path logs the warning.
+                    let Some(apt) = nav::find_airport(&apt_path, &atc_icao).ok().flatten() else { return };
+                    let services = station::services(&apt);
+                    if services.is_empty() {
+                        return;
+                    }
+                    let xp = XPlaneClient::new(base);
+                    loop {
+                        let com1 = xp
+                            .get_float(datarefs::COM1_FREQ_KHZ)
+                            .await
+                            .ok()
+                            .map(|v| v.round() as i64);
+                        sink.radio(&radio_panel_line(&apt.name, &services, com1));
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                });
+            });
+        }
+    }
+
     // The active profile, shared so the aircraft can be switched live. Seeded with
     // the startup detection; the poller below corrects it if the sim's aircraft
     // differs or changes (or if X-Plane wasn't up yet at launch).
@@ -4265,6 +4299,48 @@ fn matches_keyword(w: &str) -> bool {
 
 /// Short label for the whisper model from its path, for the status bar:
 /// `models/ggml-base.en.bin` → `base.en`, `…/ggml-large-v3-turbo.bin` → `large-v3-turbo`.
+/// The radio row pushed to the in-sim panel: airport, then each published
+/// service as "TWR 131.200" segments split on " | ", with '>' marking the one
+/// COM1 is tuned to (same 5 kHz tolerance as the station). Off every service,
+/// the raw COM1 value gets its own trailing segment — the panel always shows
+/// where the radio actually is.
+fn radio_panel_line(
+    airport: &str,
+    services: &[(String, i64)],
+    com1_khz: Option<i64>,
+) -> String {
+    fn label(word: &str) -> &str {
+        match word {
+            "atis" => "ATIS",
+            "clearance" => "CLR",
+            "ground" => "GND",
+            "tower" => "TWR",
+            "approach" => "APP",
+            "departure" => "DEP",
+            "unicom" => "UNICOM",
+            other => other,
+        }
+    }
+    let tuned = |khz: i64| com1_khz.is_some_and(|c| (c - khz).abs() <= 5);
+    let mut parts = vec![airport.to_uppercase()];
+    let mut matched = false;
+    for (word, khz) in services {
+        let mark = if tuned(*khz) {
+            matched = true;
+            ">"
+        } else {
+            ""
+        };
+        parts.push(format!("{mark}{} {:.3}", label(word), *khz as f64 / 1000.0));
+    }
+    if !matched {
+        if let Some(c) = com1_khz {
+            parts.push(format!(">COM1 {:.3}", c as f64 / 1000.0));
+        }
+    }
+    parts.join(" | ")
+}
+
 fn whisper_model_label(path: &str) -> String {
     let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let stem = file.strip_suffix(".bin").unwrap_or(file);
@@ -4299,7 +4375,30 @@ fn command_hints() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_abort, is_affirmative, is_undo, join_and, undoable_drefs};
+    use super::{
+        is_abort, is_affirmative, is_undo, join_and, radio_panel_line, undoable_drefs,
+    };
+
+    #[test]
+    fn radio_row_marks_the_tuned_service() {
+        let services = vec![
+            ("tower".to_string(), 131200_i64),
+            ("approach".to_string(), 122800),
+            ("departure".to_string(), 130400),
+        ];
+        // Tuned to the tower (8.33 name can sit 5 kHz off the carrier).
+        let line = radio_panel_line("Gibraltar", &services, Some(131205));
+        assert_eq!(
+            line,
+            "GIBRALTAR | >TWR 131.200 | APP 122.800 | DEP 130.400"
+        );
+        // Off every service: the raw COM1 value shows as its own segment.
+        let line = radio_panel_line("Gibraltar", &services, Some(124730));
+        assert!(line.ends_with("DEP 130.400 | >COM1 124.730"), "{line}");
+        // COM1 unreadable: the plan still shows, nothing marked.
+        let line = radio_panel_line("Gibraltar", &services, None);
+        assert!(!line.contains('>'), "{line}");
+    }
 
     #[test]
     fn undo_recognizes_emergency_phrasings() {

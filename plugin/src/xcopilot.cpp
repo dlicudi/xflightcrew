@@ -9,6 +9,7 @@
 //   xcopilot/status/phase  (int: 0 idle, 1 listening, 2 thinking, 3 speaking)
 //   xcopilot/status/heard  (text: last transcript)
 //   xcopilot/status/action (text: last readback)
+//   xcopilot/status/radio  (text: comm plan + live COM1, '>' = tuned service)
 // rendered as a toolbar of status chips over tabs: Log (scrolling transmission
 // record), Route (the pushed flight plan + a Send-to-FMS re-push), and Settings
 // (live switches, e.g. the LLM-fallback dataref `xcopilot/llm_enabled`, -1 auto
@@ -143,6 +144,9 @@ static TextRef g_strip = {{0}, 0};
 // floating toast over the sim for a couple of seconds after each action.
 static TextRef g_callout = {{0}, 0};
 static float g_callout_time = -1000.0f;
+// Radio row — the ATC field's comm plan plus live COM1, refreshed by the app
+// ("GIBRALTAR | >TWR 131.200 | APP 122.800"). '>' marks the tuned service.
+static TextRef g_radio = {{0}, 0};
 
 static XPLMDataRef g_phase_dref = nullptr;
 static XPLMDataRef g_heard_dref = nullptr;
@@ -151,6 +155,7 @@ static XPLMDataRef g_alert_dref = nullptr;
 static XPLMDataRef g_aircraft_dref = nullptr;
 static XPLMDataRef g_strip_dref = nullptr;
 static XPLMDataRef g_callout_dref = nullptr;
+static XPLMDataRef g_radio_dref = nullptr;
 
 // Transmission log shown in the panel, each entry stamped with wall-clock time
 // so a test flight can be reviewed afterwards.
@@ -234,6 +239,10 @@ static void WriteAircraft(void*, void* in, int offset, int len) {
 // Live flight strip — a status row the app refreshes continuously, not logged.
 static void WriteStrip(void*, void* in, int offset, int len) {
     StoreText(&g_strip, in, offset, len);
+}
+// Radio row — refreshed continuously like the strip, not logged.
+static void WriteRadio(void*, void* in, int offset, int len) {
+    StoreText(&g_radio, in, offset, len);
 }
 // Callout — stamp the arrival time; the toast shows for a short window after.
 // An optional "nx,ny|" prefix (fractions of the half-screen from centre) aims
@@ -626,6 +635,26 @@ protected:
             ImGui::PopStyleColor();
         }
 
+        // Radio row — the field's comm plan as chips, the tuned one lit amber
+        // ('>' prefix from the app). An instrument row, not a log line: it
+        // reads like the radio stack, at a glance. Hidden when empty.
+        if (connected && g_radio.len > 0) {
+            char row[512];
+            std::memcpy(row, g_radio.buf, sizeof row);
+            char* seg = row;
+            bool first = true;
+            while (seg != nullptr) {
+                char* bar = std::strstr(seg, " | ");
+                if (bar != nullptr) *bar = '\0';
+                bool lit = (seg[0] == '>');
+                if (lit) seg++;
+                if (!first) ImGui::SameLine();
+                Chip(seg, lit ? COL_AMBER : COL_DIM);
+                first = false;
+                seg = (bar != nullptr) ? bar + 3 : nullptr;
+            }
+        }
+
         // Emergency buttons — the mouse fallback when voice fails mid-emergency.
         // Guarded-switch styling: the two that take the aircraft are filled dark
         // red, the one that gives it back dark green. Each writes a request code
@@ -961,6 +990,10 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         "xcopilot/status/callout", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteCallout, &g_callout, &g_callout);
+    g_radio_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/radio", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteRadio, &g_radio, &g_radio);
 
     // One shared font atlas for all ImgWindows (uses ImGui's default font).
     ImgWindow::sFontAtlas = std::make_shared<ImgFontAtlas>();
@@ -1000,6 +1033,7 @@ PLUGIN_API void XPluginStop(void) {
     if (g_toggle_cmd) { XPLMUnregisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr); g_toggle_cmd = nullptr; }
     XPLMUnregisterFlightLoopCallback(ToastLoop, nullptr);
     g_toast.reset();
+    if (g_radio_dref) { XPLMUnregisterDataAccessor(g_radio_dref); g_radio_dref = nullptr; }
     if (g_callout_dref) { XPLMUnregisterDataAccessor(g_callout_dref); g_callout_dref = nullptr; }
     g_panel.reset();
     ImgWindow::sFontAtlas.reset();
