@@ -158,6 +158,12 @@ pub struct Snapshot {
     /// Position (`sim/flightmodel/position/latitude`/`longitude`).
     pub lat: f64,
     pub lon: f64,
+    /// Ground track, degrees true (`sim/flightmodel/position/hpath`). `None` =
+    /// the read failed; consumers treat it as "track unknown", never 0.
+    pub track_deg: Option<f64>,
+    /// Sim frame rate (`sim/time/framerate_period`, inverted). `None` = read
+    /// failed or the sim is paused (period 0). Feeds the fps-dip watchdog.
+    pub fps: Option<f64>,
     /// Descent picture vs the planned destination, when one is known
     /// ([`DESTINATION`]): great-circle distance to the field, its elevation,
     /// and the planned TOD ring. All-or-nothing — `None` without a plan.
@@ -201,6 +207,13 @@ impl Snapshot {
         // Position + the descent picture vs the planned destination (if any).
         let lat = xp.get_float("sim/flightmodel/position/latitude").await.unwrap_or(0.0);
         let lon = xp.get_float("sim/flightmodel/position/longitude").await.unwrap_or(0.0);
+        let track_deg = xp.get_float("sim/flightmodel/position/hpath").await.ok();
+        let fps = xp
+            .get_float("sim/time/framerate_period")
+            .await
+            .ok()
+            .filter(|p| *p > 0.0)
+            .map(|p| 1.0 / p);
         let dest = DESTINATION.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let (dest_dist_nm, dest_elev_ft, tod_ring_nm) = match dest {
             Some(d) => (
@@ -364,6 +377,8 @@ impl Snapshot {
             advisor_values,
             lat,
             lon,
+            track_deg,
+            fps,
             dest_dist_nm,
             dest_elev_ft,
             tod_ring_nm,
@@ -1398,6 +1413,14 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
     // already handed over at the threshold (say it once, then shut up).
     let mut guide_last: Option<Instant> = None;
     let mut guide_handed_over = false;
+    // Fps-dip watchdog: rolling window of recent fps so a dip is judged
+    // against THIS flight's own baseline (60 locked vs 35 in weather), and a
+    // rate limit so a sustained slump logs one event, not one per tick.
+    let mut fps_window: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
+    let mut fps_dip_last: Option<Instant> = None;
+    // Approach traffic advisories while being vectored, rate-limited: a real
+    // controller calls a factor once and moves on, not every sweep.
+    let mut traffic_last: Option<Instant> = None;
 
     loop {
         // Aircraft switched → rebuild the checks for the new airframe.
@@ -1414,6 +1437,33 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
         }
         if let Some(mut snap) = Snapshot::read(&xp, &drefs).await {
             let now = Instant::now();
+
+            // Fps-dip watchdog: pure diagnosis, no callout. A dip well below
+            // the rolling median lands in the flight log + blackbox with a
+            // timestamp, so it correlates against what else was happening
+            // (llm answer, tts synth, station transmission — all logged).
+            if let Some(fps) = snap.fps {
+                let median = {
+                    let mut v: Vec<f64> = fps_window.iter().copied().collect();
+                    v.sort_by(|a, b| a.total_cmp(b));
+                    v.get(v.len() / 2).copied()
+                };
+                if let Some(median) = median.filter(|m| fps_window.len() >= 30 && *m >= 20.0) {
+                    let rate_ok = fps_dip_last.is_none_or(|t| now.duration_since(t).as_secs() >= 10);
+                    if fps < median * 0.7 && rate_ok {
+                        fps_dip_last = Some(now);
+                        tracing::warn!(fps = fps.round(), median = median.round(), "fps dip");
+                        crate::blackbox::record(
+                            "fps_dip",
+                            serde_json::json!({ "fps": r1(fps), "median": r1(median) }),
+                        );
+                    }
+                }
+                fps_window.push_back(fps);
+                if fps_window.len() > 90 {
+                    fps_window.pop_front();
+                }
+            }
 
             // Pushback callouts (on the ground): tug hooks up → pushing → clear.
             if snap.on_ground {
@@ -1456,14 +1506,77 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 }
             }
 
+            // Approach vectors: armed by the ATC station when the pilot requests
+            // vectors on the approach frequency. Advisory narration only; muted
+            // under the same gates as the visual-approach talk-down.
+            let quiet = crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
+            if !quiet {
+                if let Some(line) = crate::station::vector_tick(
+                    snap.lat,
+                    snap.lon,
+                    snap.alt_ft,
+                    snap.track_deg,
+                    snap.on_ground,
+                    std::time::Instant::now(),
+                ) {
+                    if let Some(s) = status.as_ref() {
+                        // "TWR: " marks the row as ATC speech on the panel.
+                        s.action(&format!("TWR: {line}"));
+                    }
+                    crate::blackbox::record(
+                        "vectors",
+                        serde_json::json!({
+                            "lat": r1(snap.lat), "lon": r1(snap.lon),
+                            "alt": r1(snap.alt_ft), "msg": &line
+                        }),
+                    );
+                    voice.alert_station(Priority::Advisory, line);
+                }
+                // Traffic advisories while under approach control: the
+                // controller narrates the nearest factor off the TCAS picture
+                // (LiveTraffic or AI aircraft), at most one call per 45 s.
+                // Narration only — separation stays the pilot's job.
+                let vectored = crate::station::VECTORS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|p| p.callsign.clone());
+                if let Some(callsign) = vectored {
+                    let due = traffic_last
+                        .is_none_or(|t| now.duration_since(t).as_secs() >= 45);
+                    if due {
+                        if let Some(call) = crate::station::traffic_advisory(&xp).await {
+                            traffic_last = Some(now);
+                            let line = format!("{callsign}, {call}");
+                            if let Some(s) = status.as_ref() {
+                                s.action(&format!("TWR: {line}"));
+                            }
+                            crate::blackbox::record(
+                                "traffic_advisory",
+                                serde_json::json!({ "msg": &line }),
+                            );
+                            voice.alert_station(Priority::Advisory, line);
+                        }
+                    }
+                }
+            } else if snap.on_ground {
+                let _ = crate::station::vector_tick(
+                    snap.lat,
+                    snap.lon,
+                    snap.alt_ft,
+                    snap.track_deg,
+                    snap.on_ground,
+                    std::time::Instant::now(),
+                );
+            }
+
             // Talk-down: PAR-style callouts down the synthesized approach path,
             // armed by the visual_approach tool. Advisory narration only — the
             // pilot flies. Muted while the copilot itself is flying (recover /
             // autoland) or the panel mute is on, same as every other callout.
             if let Some(path) = crate::approach_guide::armed() {
-                let quiet = crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-                    || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-                    || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
                 if snap.on_ground {
                     // Touchdown completes the guidance — but only if we actually
                     // guided in the air. Armed on the ground (pre-takeoff, or
@@ -1801,6 +1914,8 @@ mod tests {
             advisor_values: vec![],
             lat: 0.0,
             lon: 0.0,
+            track_deg: None,
+            fps: None,
             dest_dist_nm: None,
             dest_elev_ft: None,
             tod_ring_nm: None,

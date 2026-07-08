@@ -37,6 +37,8 @@ impl OnnxTts {
         // temporary builder so no `mut` binding is needed.
         let session = Session::builder()
             .map_err(|e| anyhow!("ort session builder: {e}"))?
+            .with_intra_threads(session_threads())
+            .map_err(|e| anyhow!("ort session threads: {e}"))?
             .commit_from_file(model_path)
             .map_err(|e| anyhow!("loading ONNX voice {model_path}: {e}"))?;
 
@@ -164,6 +166,9 @@ impl OnnxTts {
     }
 
     fn synth_chunked(&mut self, text: &str) -> Result<Vec<f32>> {
+        // Timed like `stt ms=` — synthesis shares the machine with the sim, so
+        // its cost per utterance must be visible in the flight log.
+        let t = std::time::Instant::now();
         let gap = vec![0.0_f32; (self.sample_rate as f64 * SENTENCE_GAP_S) as usize];
         let mut samples = Vec::new();
         for chunk in speech_chunks(text) {
@@ -172,6 +177,11 @@ impl OnnxTts {
             }
             samples.extend(self.synth(&chunk)?);
         }
+        tracing::info!(
+            ms = t.elapsed().as_millis() as u64,
+            chars = text.len(),
+            "tts synth"
+        );
         Ok(samples)
     }
 }
@@ -251,6 +261,8 @@ impl KokoroTts {
     pub fn load(model_path: &str, voice: &str) -> Result<Self> {
         let session = Session::builder()
             .map_err(|e| anyhow!("ort session builder: {e}"))?
+            .with_intra_threads(session_threads())
+            .map_err(|e| anyhow!("ort session threads: {e}"))?
             .commit_from_file(model_path)
             .map_err(|e| anyhow!("loading Kokoro {model_path}: {e}"))?;
 
@@ -316,6 +328,7 @@ impl KokoroTts {
     /// the piper path — Kokoro also mis-paces long passages, and its style row
     /// (indexed by phoneme count) clamps at the table edge on a paragraph.
     pub fn speak(&mut self, text: &str) -> Result<()> {
+        let t = std::time::Instant::now();
         let gap = vec![0.0_f32; (KOKORO_SR as f64 * SENTENCE_GAP_S) as usize];
         let mut samples = Vec::new();
         for chunk in speech_chunks(text) {
@@ -324,6 +337,11 @@ impl KokoroTts {
             }
             samples.extend(self.synth(&chunk)?);
         }
+        tracing::info!(
+            ms = t.elapsed().as_millis() as u64,
+            chars = text.len(),
+            "tts synth"
+        );
         let wav = std::env::temp_dir().join("x-copilot-kokoro.wav");
         write_wav(&wav, &samples, KOKORO_SR)?;
         crate::tts::play(&wav)
@@ -346,6 +364,19 @@ pub fn inspect(model_path: &str) -> Result<String> {
         s.push_str(&format!("  {:<12} {:?}\n", o.name(), o.dtype()));
     }
     Ok(s)
+}
+
+/// Intra-op thread count for the TTS sessions. onnxruntime's default is every
+/// physical core with spin-waiting workers — on the machine that is also
+/// rendering X-Plane, each readback's synthesis burst was reported live
+/// (2026-07-08) as a sim frame-rate dip. Synthesis stays comfortably faster
+/// than realtime on a few cores; `XCOPILOT_TTS_THREADS` overrides.
+fn session_threads() -> usize {
+    std::env::var("XCOPILOT_TTS_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(4)
 }
 
 /// A VITS scale: the env override (`name`) if set and parseable, else the voice's

@@ -50,12 +50,25 @@ pub struct Aircraft {
     pub managing: Vec<String>,
 }
 
+/// The ATC field's comm plan for the radio panel: every service it publishes,
+/// plus what COM1 is tuned to right now.
+#[derive(Clone, Default, PartialEq)]
+pub struct Radio {
+    /// Airport display name ("Gibraltar").
+    pub airport: String,
+    /// (service, kHz) rows in briefing order, e.g. ("tower", 131200).
+    pub services: Vec<(String, i64)>,
+    /// Live COM1 in kHz. `None` = the read failed this tick.
+    pub com1_khz: Option<i64>,
+}
+
 /// One message from the voice loop (or poll thread) to the dashboard.
 pub enum Report {
     Log { kind: LogKind, text: String },
     Status(Phase),
     Mic(f32),
     Aircraft(Aircraft),
+    Radio(Radio),
 }
 
 /// Where log/status output goes: plain stdout or the TUI channel.
@@ -91,6 +104,13 @@ impl Reporter {
     /// capture watcher's later level-off announcement).
     pub fn status_sink(&self) -> Option<&crate::plugin_status::StatusSink> {
         self.status.as_ref()
+    }
+
+    /// Log to the desktop dashboard ONLY — no in-sim panel mirror. For
+    /// plumbing lines ("not a command: ...") that read as debug noise on the
+    /// cockpit panel but still belong in the desktop transcript.
+    pub fn log_quiet(&self, kind: LogKind, text: impl Into<String>) {
+        self.send(Report::Log { kind, text: text.into() });
     }
 
     pub fn log(&self, kind: LogKind, text: impl Into<String>) {
@@ -195,6 +215,8 @@ struct App {
     /// startup (the OS default doesn't change mid-session for our purposes).
     mic_name: Option<String>,
     aircraft: Aircraft,
+    /// ATC comm plan + live COM1; empty services = no station, panel hidden.
+    radio: Radio,
     commands: Vec<String>,
     /// Typed-command line (you can type a command instead of speaking it).
     input: String,
@@ -236,6 +258,7 @@ pub fn run_dashboard(
         mic: 0.0,
         mic_name: crate::audio::default_input_name(),
         aircraft: Aircraft::default(),
+        radio: Radio::default(),
         commands,
         input: String::new(),
         editing: false,
@@ -278,6 +301,12 @@ pub fn run_dashboard(
                 Report::Aircraft(a) => {
                     if app.aircraft != a {
                         app.aircraft = a;
+                        dirty = true;
+                    }
+                }
+                Report::Radio(r) => {
+                    if app.radio != r {
+                        app.radio = r;
                         dirty = true;
                     }
                 }
@@ -430,13 +459,62 @@ fn draw(f: &mut Frame, app: &App) {
         micarea,
     );
 
-    // right: aircraft (top) + managing (middle) + commands (bottom)
-    let [acarea, mgarea, cmdarea] = Layout::vertical([
+    // right: aircraft + radio + managing + commands
+    // The radio panel: the ATC field's comm plan with the tuned service
+    // highlighted — so "which frequency do I call" is answered on screen, not
+    // by memorizing apt.dat. An amber com1 row appears when the radio is on
+    // none of them (the "why is nobody answering" case).
+    let tuned_ok = |khz: i64| app.radio.com1_khz.is_some_and(|c| (c - khz).abs() <= 5);
+    let mut radio_lines: Vec<Line> = app
+        .radio
+        .services
+        .iter()
+        .map(|(name, khz)| {
+            let mhz = format!("{:.3}", *khz as f64 / 1000.0);
+            if tuned_ok(*khz) {
+                let on = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+                Line::from(vec![
+                    Span::styled("▸ ", on),
+                    Span::styled(format!("{name:<10}"), on),
+                    Span::styled(mhz, on),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{name:<10}"), Style::default().fg(Color::DarkGray)),
+                    Span::styled(mhz, Style::default().fg(Color::White)),
+                ])
+            }
+        })
+        .collect();
+    if !radio_lines.is_empty() {
+        if let Some(c) = app.radio.com1_khz.filter(|_| !app.radio.services.iter().any(|(_, k)| tuned_ok(*k))) {
+            let off = Style::default().fg(Color::Yellow);
+            radio_lines.push(Line::from(vec![
+                Span::styled("▸ ", off),
+                Span::styled(format!("{:<10}", "com1"), off),
+                Span::styled(format!("{:.3}", c as f64 / 1000.0), off),
+            ]));
+        }
+    }
+    let radio_h = if radio_lines.is_empty() { 0 } else { radio_lines.len() as u16 + 2 };
+    let [acarea, radioarea, mgarea, cmdarea] = Layout::vertical([
         Constraint::Length(9),
+        Constraint::Length(radio_h),
         Constraint::Length(5),
         Constraint::Min(3),
     ])
     .areas(right);
+    if radio_h > 0 {
+        f.render_widget(
+            Paragraph::new(radio_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" radio · {} ", app.radio.airport)),
+            ),
+            radioarea,
+        );
+    }
 
     let a = &app.aircraft;
     let ac = vec![

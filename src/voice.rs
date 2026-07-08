@@ -195,6 +195,12 @@ impl Voice {
         self.push(Utterance { priority, seq: 0, text, chime, negative: false, station: false, done });
     }
 
+    fn enqueue_station(&self, priority: Priority, text: String, done: Option<Arc<Latch>>) {
+        let text = crate::phrase::scrub_dashes(&text);
+        tracing::info!(transmitting = %text, "station");
+        self.push(Utterance { priority, seq: 0, text, chime: false, negative: false, station: true, done });
+    }
+
     /// Push a fully-formed utterance onto the queue (stamping its FIFO seq under
     /// the lock). The single enqueue chokepoint for both speech and tones.
     fn push(&self, mut utt: Utterance) {
@@ -236,6 +242,13 @@ impl Voice {
         self.enqueue(priority, text.into(), None, false);
     }
 
+    /// Queue an ATC-station utterance and return immediately. Used by background
+    /// controller callouts (vectors) so they keep the station voice/radio effect
+    /// without blocking the monitor loop.
+    pub fn alert_station(&self, priority: Priority, text: impl Into<String>) {
+        self.enqueue_station(priority, text.into(), None);
+    }
+
     /// Queue an utterance preceded by the attention chime, and return immediately.
     /// Used by reminders: a short beep, then the heads-up.
     pub fn chime(&self, priority: Priority, text: impl Into<String>) {
@@ -269,16 +282,7 @@ impl Voice {
         let text = crate::phrase::scrub_dashes(&text.into());
         // To the FILE log, not just the TUI: the 2026-07-07 hang was blind
         // because tower speech only reached the dashboard.
-        tracing::info!(transmitting = %text, "station");
-        self.push(Utterance {
-            priority,
-            seq: 0,
-            text,
-            chime: false,
-            negative: false,
-            station: true,
-            done: Some(latch.clone()),
-        });
+        self.enqueue_station(priority, text, Some(latch.clone()));
         let mut spoken = latch.spoken.lock().unwrap();
         while !*spoken {
             spoken = latch.cv.wait(spoken).unwrap();

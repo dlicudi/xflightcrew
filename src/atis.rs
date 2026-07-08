@@ -100,6 +100,20 @@ pub fn spoken_digits(s: &str) -> String {
         .join(" ")
 }
 
+/// A radio frequency in kHz spoken as MHz: 131200 -> "one three one decimal two".
+pub fn spoken_mhz(khz: i64) -> String {
+    let mhz = khz / 1000;
+    let frac = (khz % 1000).abs();
+    let frac = if frac % 100 == 0 {
+        format!("{}", frac / 100)
+    } else if frac % 10 == 0 {
+        format!("{:02}", frac / 10)
+    } else {
+        format!("{frac:03}")
+    };
+    spoken_digits(&format!("{mhz}.{frac}"))
+}
+
 /// A runway designator spoken out: "27" -> "two seven", "16L" -> "one six left".
 pub fn spoken_runway(id: &str) -> String {
     let mut words: Vec<&str> = Vec::new();
@@ -180,6 +194,18 @@ mod tests {
             qnh_hpa: 1018.4,
             oat_c: 24.3,
         }
+    }
+
+    #[test]
+    fn frequencies_speak_as_mhz() {
+        // LXGB's real apt.dat rows: tower, approach, departure.
+        assert_eq!(spoken_mhz(131200), "one three one decimal two");
+        assert_eq!(spoken_mhz(122800), "one two two decimal eight");
+        assert_eq!(spoken_mhz(130400), "one three zero decimal four");
+        // An 8.33 channel keeps all three decimals; guard keeps its zero.
+        assert_eq!(spoken_mhz(118325), "one one eight decimal three two five");
+        assert_eq!(spoken_mhz(121500), "one two one decimal five");
+        assert_eq!(spoken_mhz(118050), "one one eight decimal zero five");
     }
 
     #[test]

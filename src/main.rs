@@ -269,6 +269,13 @@ async fn main() -> Result<()> {
     // decoding toward the active aircraft's actual systems and phraseology.
     let stt = Stt::load(&config.whisper_model_path, config.whisper_gpu)?;
     let llm = Llm::new(&config);
+    if config.llm_enabled {
+        // Prefill the answer-path KV cache now, on the ground — not on the
+        // first question at altitude (cold prefill measured at ~10 s of GPU
+        // time, and the sim's frame rate tanks for all of it).
+        let warm = llm.clone();
+        tokio::spawn(async move { warm.warmup().await });
+    }
     // The tool registry, STT prompt, and checklists are all derived from the
     // profile inside run_session — and rebuilt there when the aircraft switches.
 
@@ -405,15 +412,36 @@ async fn main() -> Result<()> {
 
         let tx_poll = tx.clone();
         let poll_base = config.xplane_base_url.clone();
+        let (apt_path, atc_icao) =
+            (config.apt_data_path.clone(), config.atc_airport.trim().to_uppercase());
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             rt.block_on(async move {
                 let xp = XPlaneClient::new(poll_base);
+                // The ATC field's comm plan for the radio panel, scanned once.
+                // ATC off or the field missing just means no panel — the
+                // station's own load path already logs the warning.
+                let comm = (!atc_icao.is_empty())
+                    .then(|| nav::find_airport(&apt_path, &atc_icao).ok().flatten())
+                    .flatten()
+                    .map(|apt| (apt.name.clone(), station::services(&apt)));
                 loop {
                     if let Some(ac) = poll_aircraft(&xp).await {
                         if tx_poll.send(ui::Report::Aircraft(ac)).is_err() {
                             break; // dashboard gone
                         }
+                    }
+                    if let Some((airport, services)) = &comm {
+                        let com1 = xp
+                            .get_float(datarefs::COM1_FREQ_KHZ)
+                            .await
+                            .ok()
+                            .map(|v| v.round() as i64);
+                        let _ = tx_poll.send(ui::Report::Radio(ui::Radio {
+                            airport: airport.clone(),
+                            services: services.clone(),
+                            com1_khz: com1,
+                        }));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 }
@@ -623,6 +651,31 @@ async fn run_session(
     // REST until (or unless) the subscription warms up.
     let live = LiveState::start(&config.xplane_base_url, SNAPSHOT_DATAREFS);
 
+    // The panel button can enable the LLM mid-flight; warm the answer-path KV
+    // cache on the off-to-on edge so the first question never pays cold
+    // prefill (~10 s of GPU steal, measured 2026-07-08). Startup-enabled runs
+    // are warmed from main already.
+    {
+        let warm = llm.clone();
+        let live = live.clone();
+        let mut warmed = config.llm_enabled;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                match live.get(DR_LLM_ENABLED) {
+                    Some(v) if v >= 0.5 && !warmed => {
+                        warmed = true;
+                        warm.warmup().await;
+                    }
+                    // Explicit off: re-warm on the next enable (the cache may
+                    // have been evicted while the LLM sat unused).
+                    Some(v) if (-0.5..0.5).contains(&v) => warmed = false,
+                    _ => {}
+                }
+            }
+        });
+    }
+
     // Profile-derived state, rebuilt whenever the aircraft switches (see the
     // generation check at the top of the loop). Seeded from the live profile.
     let mut active_gen = live_profile.generation();
@@ -728,8 +781,27 @@ async fn run_session(
         },
     );
 
+    // Whether the STT prompt currently carries the tower vocabulary. Prompt
+    // tokens are prefilled on EVERY decode — the always-on tower prompt took
+    // GPU decode from ~450 ms to ~1,090 ms (measured 2026-07-08) — so the
+    // radio phrasing rides along only while COM1 is actually on the station.
+    let mut stt_radio_bias = true;
     loop {
         reporter.status(ui::Phase::Listening);
+        if let Some(st) = atc_station.as_ref() {
+            let on_freq = live
+                .get(datarefs::COM1_FREQ_KHZ)
+                .is_some_and(|v| st.covers_khz(v.round() as i64));
+            if on_freq != stt_radio_bias {
+                stt_radio_bias = on_freq;
+                let base = stt::build_prompt(&live_profile.get());
+                stt.set_prompt(if on_freq {
+                    format!("{base} {}", tower::STT_PROMPT)
+                } else {
+                    base
+                });
+            }
+        }
         // Input is spoken (gated like before) or typed in the TUI. A typed
         // command is deliberate, so it skips the confidence/wake/domain gates and
         // goes straight to the model.
@@ -860,12 +932,25 @@ async fn run_session(
         if from_radio {
             if let Some(st) = atc_station.as_mut() {
                 if let Some(reply) = st.handle_transmission(&command.to_ascii_lowercase(), &xplane).await {
+                    // Empty reply = a readback the controller accepted; a real
+                    // frequency stays quiet, so we do too.
+                    if reply.is_empty() {
+                        reporter.log(ui::LogKind::Info, "readback acknowledged (frequency quiet)");
+                        continue;
+                    }
                     reporter.status(ui::Phase::Speaking);
                     reporter.log(ui::LogKind::Readback, format!("TWR: {reply}"));
                     voice.say_station(Priority::Readback, &reply);
                     reporter.status(ui::Phase::Listening);
                     continue;
                 }
+                // Transmitted into the void: nobody is on this frequency. Dead
+                // air is realistic but unhelpful (the 2026-07-08 flight called
+                // twice into silence, lost) — so the CREW, not ATC, chimes in
+                // with the comm plan: which frequencies exist, where COM1 is.
+                let line = format!("No answer there. {}", st.freq_briefing(&xplane).await);
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
             }
             reporter.log(ui::LogKind::Info, "transmitted, nobody on this frequency");
             continue;
@@ -886,7 +971,9 @@ async fn run_session(
                 // clearly-heard utterance we won't act on: log the miss, sound the
                 // negative tone. (Only genuinely low-confidence audio gets a spoken
                 // "Say again?", where repeating actually helps.)
-                reporter.log(ui::LogKind::Warn, format!("not a command: \"{command}\""));
+                // Desktop-only: on the cockpit panel this reads as debug noise
+                // shouting CAUTION at the pilot for thinking out loud.
+                reporter.log_quiet(ui::LogKind::Warn, format!("not a command: \"{command}\""));
                 if explicit && live.get(DR_OPT_TONE).map_or(true, |v| v > 0.5) {
                     voice.negative();
                 }
@@ -1023,6 +1110,14 @@ async fn run_session(
                         continue;
                     }
                     None => {}
+                }
+                // Frequency briefing ("what frequencies are here", "who can I
+                // talk to") — crew knowledge answered from the loaded apt.dat
+                // rows plus live COM1, after the tuning verbs so those win.
+                if station::freq_query(&tl) {
+                    let line = st.freq_briefing(&xplane).await;
+                    say(&voice, &reporter, ui::LogKind::Readback, &line);
+                    continue;
                 }
             }
             // Reminder memory: cancel or list what's armed ("cancel the reminders",
@@ -2135,7 +2230,7 @@ const SNAPSHOT_DATAREFS: &[&str] = &[
     datarefs::ON_GROUND_ANY, datarefs::FUEL_TOTAL_KG, datarefs::WIND_DIR_DEG_TRUE,
     datarefs::WIND_SPEED_MSC, datarefs::OAT_DEG_C, datarefs::VISIBILITY_SM,
     datarefs::QNH_PASCALS, datarefs::SERVOS_ON, datarefs::APPROACH_STATUS,
-    datarefs::NAV_STATUS, datarefs::HEADING_STATUS,
+    datarefs::NAV_STATUS, datarefs::HEADING_STATUS, datarefs::COM1_FREQ_KHZ,
     DR_LLM_ENABLED, DR_OPT_SNAP, DR_OPT_TONE,
 ];
 

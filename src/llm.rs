@@ -305,6 +305,7 @@ fn dedup_calls(calls: Vec<ToolCall>) -> Vec<ToolCall> {
 }
 
 /// Thin client over a local Ollama server.
+#[derive(Clone)]
 pub struct Llm {
     http: reqwest::Client,
     base: String,
@@ -457,6 +458,26 @@ impl Llm {
             }
         }
         Ok(Decision::None)
+    }
+
+    /// Prefill the answer-path KV cache off the critical path. The first real
+    /// question otherwise pays cold prefill of the whole system prompt on the
+    /// GPU X-Plane is rendering with — measured live 2026-07-08 as a 9,975 ms
+    /// answer (and a sim frame-rate tank for its whole duration) against
+    /// 1,526–2,676 ms once warm. Called once at startup, result discarded;
+    /// any error just means the warmup didn't happen.
+    pub async fn warmup(&self) {
+        let t = Instant::now();
+        match self
+            .chat_call(ANSWER_PROMPT, "radio check", &[], &[], None, 0.0)
+            .await
+        {
+            Ok(_) => tracing::info!(
+                ms = t.elapsed().as_millis(),
+                "llm warmup: answer-path KV cache prefilled"
+            ),
+            Err(e) => tracing::info!("llm warmup skipped ({e:#})"),
+        }
     }
 
     /// Answer-only fallback: the LLM is called with NO tools, so it cannot emit a

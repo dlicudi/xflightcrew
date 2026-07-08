@@ -37,6 +37,7 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 /// A cache of the latest pushed value per subscribed dataref name. Cloneable
 /// handle; the owning thread updates it in the background.
+#[derive(Clone)]
 pub struct LiveState {
     cache: Arc<Mutex<HashMap<String, f64>>>,
 }

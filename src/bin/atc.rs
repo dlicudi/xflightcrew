@@ -279,6 +279,7 @@ fn main() -> Result<()> {
                     qnh: atis::spoken_digits(&format!("{:.0}", snap.qnh_hpa)),
                     wind: spoken_wind(&snap),
                     holding_point: "Alpha".to_string(),
+                    approach: apt.freq(nav::FREQ_APPROACH).map(|f| atis::spoken_mhz(f.khz)),
                 };
                 let intent = if heard.confidence < config.stt_min_confidence {
                     tower::Intent::Unknown // garbled call → "say again", never a guessed clearance
