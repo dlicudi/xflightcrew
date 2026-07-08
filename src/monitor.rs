@@ -1513,6 +1513,19 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
                 || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
             if !quiet {
+                // After-takeoff handoff: armed by the tower's takeoff
+                // clearance, spoken once airborne and climbing ("contact
+                // Gibraltar Departure on one three zero decimal four").
+                if let Some(line) = crate::station::handoff_tick(snap.alt_ft, snap.on_ground) {
+                    if let Some(s) = status.as_ref() {
+                        s.action(&format!("TWR: {line}"));
+                    }
+                    crate::blackbox::record(
+                        "atc_handoff",
+                        serde_json::json!({ "alt": r1(snap.alt_ft), "msg": &line }),
+                    );
+                    voice.alert_station(Priority::Advisory, line);
+                }
                 if let Some(line) = crate::station::vector_tick(
                     snap.lat,
                     snap.lon,

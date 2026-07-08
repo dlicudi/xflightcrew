@@ -38,6 +38,12 @@ pub enum Intent {
     ReportFinal,
     /// "say wind" / "wind check" / "say QNH".
     WindCheck,
+    /// "what's my squawk" / "say transponder" — the pilot asking for the code
+    /// again. Asked four times across the 2026-07-08 flights; each got "say
+    /// again", which reads as a controller refusing to repeat a number.
+    SquawkCheck,
+    /// "taxi to parking" — an arrival leaving the runway, not a departure.
+    RequestTaxiIn,
     /// "request vectors" — the tower redirects to the approach frequency.
     RequestVectors,
     Unknown,
@@ -79,11 +85,19 @@ pub fn parse_intent(transcript: &str) -> Intent {
     {
         return Intent::WindCheck;
     }
+    // "what's my squawk" / "what about my transponder code" — question-shaped,
+    // but a controller repeats a code without blinking. Must sit above the
+    // question guard, like radio check and wind check.
+    if (word("squawk") || word("transponder"))
+        && (word("what") || word("say") || t.contains("confirm") || word("my"))
+    {
+        return Intent::SquawkCheck;
+    }
     // Questions are crew talk, not transmissions. "What runway shall I take
     // off from?" must reach the copilot (or get "say again" on a keyed radio),
     // never parse as a takeoff request — the 2026-07-08 flight was CLEARED FOR
-    // TAKEOFF for asking it. Radio check and wind check stay above this guard:
-    // those are the two question-shaped calls a tower genuinely answers.
+    // TAKEOFF for asking it. Radio check, wind check and squawk check stay
+    // above this guard: the question-shaped calls a tower genuinely answers.
     if word("what") || word("which") || word("how") || word("where") || word("when")
         || word("why") || word("shall") || word("should") || word("can") || word("could")
     {
@@ -124,6 +138,11 @@ pub fn parse_intent(transcript: &str) -> Intent {
     // "taxi" — in the merged binary this parser sees every utterance, so a taxi
     // request must be a request, not any sentence with the word in it.
     if t.contains("taxi") && !t.contains("light") && !t.contains("hold") {
+        // "taxi to parking/the ramp/the stand" is an arrival call — it must
+        // never earn a fresh departure taxi to the holding point.
+        if word("parking") || word("ramp") || word("apron") || word("stand") || word("gate") {
+            return Intent::RequestTaxiIn;
+        }
         return Intent::RequestTaxi;
     }
     Intent::Unknown
@@ -177,6 +196,18 @@ impl Tower {
                  QNH {}, squawk seven zero zero zero.",
                 ctx.callsign, ctx.airport, ctx.qnh
             ),
+            // An arrival taxiing in — by request wording, or because the last
+            // clearance was a landing one (a generic "request taxi" right
+            // after "cleared to land" is someone leaving the runway, not a
+            // fresh departure wanting the holding point).
+            Intent::RequestTaxiIn => {
+                self.state = State::Parked;
+                format!("{}, taxi to parking, this frequency.", ctx.callsign)
+            }
+            Intent::RequestTaxi if self.state == State::ClearedToLand => {
+                self.state = State::Parked;
+                format!("{}, taxi to parking, this frequency.", ctx.callsign)
+            }
             Intent::RequestTaxi => {
                 self.state = State::TaxiCleared;
                 format!(
@@ -229,6 +260,11 @@ impl Tower {
             }
             Intent::WindCheck => {
                 format!("{}, wind {}, QNH {}.", ctx.callsign, ctx.wind, ctx.qnh)
+            }
+            // VFR conspicuity — the only code this tower ever assigns, so
+            // repeating it is always safe.
+            Intent::SquawkCheck => {
+                format!("{}, squawk seven zero zero zero.", ctx.callsign)
             }
             Intent::RequestVectors => match &ctx.approach {
                 Some(freq) => format!(
@@ -352,9 +388,52 @@ mod tests {
             Intent::Unknown
         );
         assert_eq!(parse_intent("can we land at gibraltar"), Intent::Unknown);
-        // The two question-shaped calls a tower genuinely answers survive.
+        // The question-shaped calls a tower genuinely answers survive.
         assert_eq!(parse_intent("how do you read"), Intent::RadioCheck);
         assert_eq!(parse_intent("what's the wind"), Intent::WindCheck);
+        // Squawk questions get the code repeated, not "say again" — asked four
+        // times on the 2026-07-08 flights, stonewalled every time.
+        assert_eq!(
+            parse_intent("What about my transponder code?"),
+            Intent::SquawkCheck
+        );
+        assert_eq!(parse_intent("say squawk"), Intent::SquawkCheck);
+        assert_eq!(parse_intent("what's my squawk"), Intent::SquawkCheck);
+        // A readback of the code is still a readback, not a question.
+        assert_eq!(parse_intent("squawk seven zero zero zero"), Intent::Unknown);
+        assert!(is_readback("squawk seven zero zero zero"));
+        // Arrivals taxi IN — never a fresh departure taxi.
+        assert_eq!(parse_intent("request taxi to parking"), Intent::RequestTaxiIn);
+        assert_eq!(parse_intent("taxi to the ramp"), Intent::RequestTaxiIn);
+    }
+
+    #[test]
+    fn squawk_question_repeats_the_code() {
+        let mut twr = Tower::new();
+        let r = twr.handle(parse_intent("what about my transponder code?"), &ctx());
+        assert!(r.contains("squawk seven zero zero zero"), "{r}");
+    }
+
+    #[test]
+    fn arrivals_taxi_to_parking_not_the_holding_point() {
+        // By wording, from any state.
+        let mut twr = Tower::new();
+        let r = twr.handle(parse_intent("request taxi to parking"), &ctx());
+        assert!(r.contains("taxi to parking"), "{r}");
+        assert!(!r.contains("holding point"), "{r}");
+        assert_eq!(twr.state, State::Parked);
+        // By state: a generic taxi request right after a landing clearance is
+        // the arrival leaving the runway.
+        let mut twr = Tower::new();
+        twr.handle(parse_intent("inbound for landing"), &ctx());
+        twr.handle(parse_intent("final"), &ctx());
+        let r = twr.handle(parse_intent("request taxi"), &ctx());
+        assert!(r.contains("taxi to parking"), "{r}");
+        assert_eq!(twr.state, State::Parked);
+        // A departure from the stand still gets the holding point.
+        let mut twr = Tower::new();
+        let r = twr.handle(parse_intent("request taxi"), &ctx());
+        assert!(r.contains("holding point"), "{r}");
     }
 
     #[test]
