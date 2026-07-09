@@ -222,15 +222,22 @@ static void WriteHeard(void*, void* in, int offset, int len) {
 }
 static void WriteAction(void*, void* in, int offset, int len) {
     StoreText(&g_action, in, offset, len);
-    // "TWR: " prefix = station speech (attribution, not content): strip it and
-    // tag the row ATC in amber; everything else is the crew, tagged COPILOT.
-    if (std::strncmp(g_action.buf, "TWR: ", 5) == 0) {
-        std::memmove(g_action.buf, g_action.buf + 5, static_cast<size_t>(g_action.len - 5 + 1));
-        g_action.len -= 5;
-        AppendLog("ATC", COL_AMBER, g_action.buf);
-    } else {
-        AppendLog("COPILOT", COL_GREEN, g_action.buf);
+    // A station prefix ("TWR: " / "APP: " / "DEP: " / "ATIS: ") is attribution,
+    // not content: strip it and tag the row with the SPECIFIC position, so the
+    // transcript names which controller spoke. Everything else is the crew.
+    static const struct { const char* prefix; const char* tag; } kStations[] = {
+        {"TWR: ", "TOWER"}, {"APP: ", "APP"}, {"DEP: ", "DEP"}, {"ATIS: ", "ATIS"},
+    };
+    for (const auto& s : kStations) {
+        int n = static_cast<int>(std::strlen(s.prefix));
+        if (g_action.len > n && std::strncmp(g_action.buf, s.prefix, n) == 0) {
+            std::memmove(g_action.buf, g_action.buf + n, static_cast<size_t>(g_action.len - n + 1));
+            g_action.len -= n;
+            AppendLog(s.tag, COL_AMBER, g_action.buf);
+            return;
+        }
     }
+    AppendLog("COPILOT", COL_GREEN, g_action.buf);
 }
 // Active aircraft ICAO — shown beside the connection chip, not logged.
 static void WriteAircraft(void*, void* in, int offset, int len) {
@@ -566,6 +573,9 @@ private:
     // panel can tuck out of the way without closing. Remembers the expanded size.
     static constexpr int kCollapsedH = 46;
     bool mCollapsed = false;
+    // Selected tab (0 = Log, 1 = Route, 2 = Settings) — content renders after
+    // the shared context rows, so the tab bar itself sits at the very top.
+    int mTab = 0;
     int mExpW = 420, mExpH = 300;
 
     void toggleCollapse() {
@@ -591,11 +601,11 @@ public:
     }
 
 protected:
-    void buildInterface() override {
-        // Toolbar, most important first: state of the crew, then the aircraft,
-        // then the two talk lights. The app heartbeats the phase ~1/s, so a
-        // stale timestamp means it isn't running.
-        bool connected = (XPLMGetElapsedTime() - g_last_status_time) < 3.0f;
+    // The status strip: crew state, aircraft, and the two talk lights, with
+    // the collapse/expand control right-aligned. Lives at the BOTTOM of the
+    // expanded panel (instrument-style: controls above, annunciators below),
+    // and is the only row shown when collapsed.
+    void drawStatusBar(bool connected) {
         if (connected) {
             Chip(PhaseLabel(g_phase), PhaseColor(g_phase));
             if (g_aircraft.len > 0) {
@@ -610,8 +620,6 @@ protected:
         ImGui::SameLine();
         // TX = the radio (ATC) push-to-talk, distinct from the intercom PTT.
         Chip("TX", g_radio_ptt_active ? COL_AMBER : COL_DIM);
-        // Collapse / expand to just this toolbar row — right-aligned, the only
-        // window control up here. (Reload lives in Settings: it's a dev tool.)
         const char* collapseLbl = mCollapsed ? "+" : "-";
         float collapseW = ImGui::CalcTextSize(collapseLbl).x
             + ImGui::GetStyle().FramePadding.x * 2.0f;
@@ -619,10 +627,39 @@ protected:
         if (ImGui::SmallButton(collapseLbl)) {
             toggleCollapse();
         }
-        ImGui::Separator();
-        // Collapsed: stop here — just the toolbar shows under the title bar.
+    }
+
+    void buildInterface() override {
+        // The app heartbeats the phase ~1/s; a stale timestamp = not running.
+        bool connected = (XPLMGetElapsedTime() - g_last_status_time) < 3.0f;
+        // Collapsed: just the status strip under the title bar.
         if (mCollapsed) {
+            drawStatusBar(connected);
             return;
+        }
+
+        // Tabs at the very top: what you're looking AT comes first; state
+        // annunciators live in the bottom status bar. Content renders after
+        // the shared context rows, so those stay visible on every tab.
+        if (ImGui::BeginTabBar("xcp_tabs")) {
+            // Unread dot on the Log tab while entries arrive unseen — cleared
+            // the moment the tab is shown, so it only lights up from others.
+            ImGuiTabItemFlags logFlags =
+                g_log_unseen ? ImGuiTabItemFlags_UnsavedDocument : 0;
+            if (ImGui::BeginTabItem("Log", nullptr, logFlags)) {
+                g_log_unseen = false;
+                mTab = 0;
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Route")) {
+                mTab = 1;
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Settings")) {
+                mTab = 2;
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
         }
 
         // Live flight strip — the app refreshes this with what the copilot sees
@@ -684,35 +721,28 @@ protected:
             ImGui::Separator();
         }
 
-        // Body: tabbed. Log = the transmission record; Route = what the app pushed
-        // for the FMS; Settings = the live runtime switches. The safety-critical
-        // rows above (chips, strip, emergency buttons) stay visible on every tab.
-        if (ImGui::BeginTabBar("xcp_tabs")) {
-            // Unread dot on the Log tab while entries arrive unseen — cleared the
-            // moment the tab is shown, so it only lights up from other tabs.
-            ImGuiTabItemFlags logFlags =
-                g_log_unseen ? ImGuiTabItemFlags_UnsavedDocument : 0;
-            if (ImGui::BeginTabItem("Log", nullptr, logFlags)) {
-                g_log_unseen = false;
-                buildLogTab(connected);
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Route")) {
-                buildRouteTab();
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Settings")) {
-                buildSettingsTab();
-                ImGui::EndTabItem();
-            }
-            ImGui::EndTabBar();
+        // Body: the selected tab's content. Log = the transmission record;
+        // Route = what the app pushed for the FMS; Settings = the runtime
+        // switches.
+        switch (mTab) {
+            case 0: buildLogTab(connected); break;
+            case 1: buildRouteTab(); break;
+            default: buildSettingsTab(); break;
         }
+
+        // Bottom status bar — annunciators live under the content, like a
+        // panel's lamp row.
+        ImGui::Separator();
+        drawStatusBar(connected);
     }
 
     // Transmission log — recent heard/action lines with coloured tags, each
     // stamped so a test can be reviewed afterwards.
     void buildLogTab(bool connected) {
-        const float footer = ImGui::GetFrameHeightWithSpacing();
+        // Two reserved rows below the well: the log controls and the bottom
+        // status bar (drawn by buildInterface after the tab content).
+        const float footer = ImGui::GetFrameHeightWithSpacing() * 2.0f
+            + ImGui::GetStyle().ItemSpacing.y;
         ImGui::BeginChild("log", ImVec2(0, -footer), true);
         // Columns measured from the actual font (time | speaker | text) so
         // nothing ever clips and every message starts at the same x — the log

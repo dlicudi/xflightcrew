@@ -425,6 +425,11 @@ impl Station {
             },
             // A mayday on the departure frequency: departure keeps the flight
             // (an emergency is never told to go retune) and vectors it home.
+            // On the ground there is nothing to vector — send the trucks.
+            tower::Intent::Mayday if ctx.on_ground => format!(
+                "{}, roger mayday. Emergency services on their way to you — hold position if able.",
+                ctx.callsign
+            ),
             tower::Intent::Mayday => {
                 self.twr.expect_touch_and_go(false);
                 let vectors = self.arm_vectors(ctx, wx);
@@ -500,7 +505,12 @@ impl Station {
                 self.arm_vectors(ctx, wx)
             }
             // A mayday to approach: keep the flight, vector it home with
-            // priority — an emergency is never told to go retune.
+            // priority — an emergency is never told to go retune. On the
+            // ground there is nothing to vector — send the trucks.
+            tower::Intent::Mayday if ctx.on_ground => format!(
+                "{}, roger mayday. Emergency services on their way to you — hold position if able.",
+                ctx.callsign
+            ),
             tower::Intent::Mayday => {
                 self.twr.expect_touch_and_go(false);
                 let vectors = self.arm_vectors(ctx, wx);
@@ -610,12 +620,13 @@ impl Station {
             .map(|t| tower::spoken_callsign(&t))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "aircraft calling".to_string());
-        (self.make_ctx(wx, qnh, callsign), wx)
+        let on_ground = xp.get_float(datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) > 0.5;
+        (self.make_ctx(wx, qnh, callsign, on_ground), wx)
     }
 
     /// The pure half of [`Station::build_ctx`] — everything after the sim
     /// reads, so tests phrase clearances from scripted weather.
-    fn make_ctx(&mut self, wx: Wx, qnh: String, callsign: String) -> tower::Ctx {
+    fn make_ctx(&mut self, wx: Wx, qnh: String, callsign: String, on_ground: bool) -> tower::Ctx {
         let runway = self.pick_runway(wx.wind_from_deg, wx.wind_kts);
         // "With information X" matching the current broadcast: the clearance
         // skips the QNH — having the numbers is the whole point of an ATIS.
@@ -633,6 +644,7 @@ impl Station {
             wind: spoken_wind(wx.wind_from_deg, wx.wind_kts),
             holding_point: "Alpha".to_string(),
             approach: self.approach_khz.map(atis::spoken_mhz),
+            on_ground,
         }
     }
 }
@@ -860,16 +872,27 @@ pub fn load_region(apt_path: &str) {
     }
 }
 
+/// A due station switch: what to say and who says it. Airborne it's a real
+/// controller handoff; on the ground it's the CREW noting the local tower
+/// (you didn't fly here under radar — you loaded the flight at a new field,
+/// and "radar services terminated" from a parked aircraft would be theatre).
+pub struct RegionSwitch {
+    pub line: String,
+    /// True = the copilot's voice (ground relocation); false = the controller.
+    pub crew: bool,
+}
+
+/// You're AT a field (parked/taxiing) when it's within this — the ground
+/// relocation case ("I started at LERL and Gibraltar answered", 2026-07-09).
+const AT_FIELD_NM: f64 = 4.0;
+
 /// One tick of the enroute watch: when another towered field is decisively
-/// nearer than the active one, arm the station swap and return the handoff
-/// line ("radar services terminated, contact Malaga Tower on ..."). The main
-/// loop consumes [`PENDING_STATION`] on its next pass; until then this stays
-/// quiet. Ground and pattern work never switch (`on_ground` or below the
-/// margin), and a cooldown keeps back-to-back fields from ping-ponging.
-pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<String> {
-    if on_ground {
-        return None;
-    }
+/// nearer than the active one, arm the station swap and return what to speak.
+/// Airborne: the handoff ("radar services terminated, contact Malaga Tower on
+/// ..."). On the ground: a silent relocation with a crew note, but only when
+/// physically AT the new field. The main loop consumes [`PENDING_STATION`] on
+/// its next pass; a cooldown keeps back-to-back fields from ping-ponging.
+pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<RegionSwitch> {
     if PENDING_STATION
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -891,7 +914,13 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
         .iter()
         .map(|a| (crate::haversine_nm(lat, lon, a.lat, a.lon), a))
         .min_by(|x, y| x.0.total_cmp(&y.0))?;
-    if best.apt.name == active_name || d_best > SWITCH_MAX_NM {
+    if best.apt.name == active_name {
+        return None;
+    }
+    // Ground: only a relocation TO a field you're actually at. Airborne: the
+    // enroute handoff, bounded so cruising over nowhere keeps the last
+    // controller.
+    if (on_ground && d_best > AT_FIELD_NM) || (!on_ground && d_best > SWITCH_MAX_NM) {
         return None;
     }
     let d_active = crate::haversine_nm(lat, lon, a_lat, a_lon);
@@ -899,15 +928,29 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
         return None;
     }
     let khz = best.apt.freq(nav::FREQ_TOWER)?.khz;
-    let line = format!(
-        "Radar services terminated. Contact {} Tower on {}.",
-        best.apt.name,
-        atis::spoken_mhz(khz)
-    );
-    tracing::info!(from = %active_name, to = %best.apt.name, "enroute handoff");
+    let sw = if on_ground {
+        RegionSwitch {
+            line: format!(
+                "We're at {} — tower here is on {}.",
+                best.apt.name,
+                atis::spoken_mhz(khz)
+            ),
+            crew: true,
+        }
+    } else {
+        RegionSwitch {
+            line: format!(
+                "Radar services terminated. Contact {} Tower on {}.",
+                best.apt.name,
+                atis::spoken_mhz(khz)
+            ),
+            crew: false,
+        }
+    };
+    tracing::info!(from = %active_name, to = %best.apt.name, ground = on_ground, "region switch");
     *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = Some(best.apt.clone());
     *LAST_REGION_SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
-    Some(line)
+    Some(sw)
 }
 
 /// The active station's controller frequencies (kHz → speaking position),
@@ -1476,20 +1519,32 @@ mod tests {
         *PENDING_STATION.lock().unwrap() = None;
         *LAST_REGION_SWITCH.lock().unwrap() = None;
         let t0 = Instant::now();
-        // On the ground at Gibraltar: never.
+        // On the ground at Gibraltar (the active field): never.
         assert!(region_tick(36.15, -5.35, true, t0).is_none());
         // Just airborne, Gibraltar still much nearer: quiet.
         assert!(region_tick(36.2, -5.3, false, t0).is_none());
         // Near the midpoint, Malaga slightly nearer but inside the margin:
         // still quiet — hysteresis, no flapping between two fields.
         assert!(region_tick(36.42, -4.92, false, t0).is_none());
-        // Decisively closer to Malaga: the handoff, once.
-        let line = region_tick(36.6, -4.6, false, t0).expect("handoff");
-        assert!(line.contains("Contact Malaga Tower"), "{line}");
-        assert!(line.contains("one one eight decimal one"), "{line}");
+        // On the GROUND near the midpoint (not AT any field): also quiet —
+        // a ground relocation needs you physically at the new field.
+        assert!(region_tick(36.42, -4.92, true, t0).is_none());
+        // Decisively closer to Malaga, airborne: the controller handoff, once.
+        let sw = region_tick(36.6, -4.6, false, t0).expect("handoff");
+        assert!(!sw.crew, "airborne switch is the controller's");
+        assert!(sw.line.contains("Contact Malaga Tower"), "{}", sw.line);
+        assert!(sw.line.contains("one one eight decimal one"), "{}", sw.line);
         assert!(PENDING_STATION.lock().unwrap().is_some(), "swap armed for the main loop");
         // While the swap waits to be consumed: silence, no re-arm.
         assert!(region_tick(36.6, -4.6, false, t0).is_none());
+        // Ground relocation: parked AT Malaga with Gibraltar still active
+        // (the "started at LERL, Gibraltar answered" case) — the CREW notes
+        // the local tower, no radar theatre.
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        let sw = region_tick(36.67, -4.50, true, t0).expect("ground relocation");
+        assert!(sw.crew, "ground switch is the crew's note");
+        assert!(sw.line.contains("We're at Malaga"), "{}", sw.line);
         *REGION.lock().unwrap() = Vec::new();
         *ACTIVE_FIELD.lock().unwrap() = None;
         *PENDING_STATION.lock().unwrap() = None;
@@ -1549,19 +1604,19 @@ mod tests {
         let mut st = lxgb();
         let ctx = {
             st.note_information("gibraltar tower, with information alpha, request taxi");
-            st.make_ctx(w, "one zero one eight".into(), "November".into())
+            st.make_ctx(w, "one zero one eight".into(), "November".into(), true)
         };
         let reply = st.twr.handle(tower::parse_intent("request taxi"), &ctx);
         assert!(!reply.contains("QNH"), "{reply}");
         // A STALE letter keeps the numbers — safety over brevity.
         let mut st = lxgb();
         st.note_information("with information zulu, request taxi");
-        let ctx = st.make_ctx(w, "one zero one eight".into(), "November".into());
+        let ctx = st.make_ctx(w, "one zero one eight".into(), "November".into(), true);
         let reply = st.twr.handle(tower::parse_intent("request taxi"), &ctx);
         assert!(reply.contains("QNH one zero one eight"), "{reply}");
         // No letter at all: numbers as always.
         let mut st = lxgb();
-        let ctx = st.make_ctx(w, "one zero one eight".into(), "November".into());
+        let ctx = st.make_ctx(w, "one zero one eight".into(), "November".into(), true);
         let reply = st.twr.handle(tower::parse_intent("request taxi"), &ctx);
         assert!(reply.contains("QNH one zero one eight"), "{reply}");
         *ATIS.lock().unwrap() = None;
@@ -1678,6 +1733,7 @@ mod tests {
             wx,
             "one zero one seven".into(),
             "November one seven two Sierra Papa".into(),
+            false, // airborne default; only the mayday answer reads it
         )
     }
 
@@ -1913,6 +1969,7 @@ mod tests {
             wind: "calm".into(),
             holding_point: "Alpha".into(),
             approach: Some(atis::spoken_mhz(122800)),
+            on_ground: false,
         };
         // Walk the tower to a takeoff clearance and arm, exactly as respond()
         // does around twr.handle().
@@ -2183,6 +2240,7 @@ mod tests {
                 wind: "calm".into(),
                 holding_point: "Alpha".into(),
                 approach: Some(atis::spoken_mhz(122800)),
+                on_ground: false,
             },
         );
         assert!(clear.contains("cleared to land"), "{clear}");

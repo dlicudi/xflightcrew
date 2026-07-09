@@ -967,7 +967,7 @@ async fn run_session(
                                 }),
                             );
                             let line = "Station calling, say again.";
-                            reporter.log(ui::LogKind::Readback, format!("TWR: {line}"));
+                            reporter.log(ui::LogKind::Readback, format!("{}: {line}", who.tag()));
                             voice.say_station(Priority::Readback, who, line);
                             continue;
                         }
@@ -1003,7 +1003,7 @@ async fn run_session(
                         continue;
                     }
                     reporter.status(ui::Phase::Speaking);
-                    reporter.log(ui::LogKind::Readback, format!("TWR: {reply}"));
+                    reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
                     voice.say_station(Priority::Readback, who, &reply);
                     reporter.status(ui::Phase::Listening);
                     continue;
@@ -1184,7 +1184,7 @@ async fn run_session(
             if let Some(st) = atc_station.as_mut() {
                 if let Some((reply, who)) = st.try_handle(&tl, &xplane).await {
                     reporter.status(ui::Phase::Speaking);
-                    reporter.log(ui::LogKind::Readback, format!("TWR: {reply}"));
+                    reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
                     voice.say_station(Priority::Readback, who, &reply);
                     reporter.status(ui::Phase::Listening);
                     continue;

@@ -81,6 +81,10 @@ pub struct Ctx {
     /// Approach frequency, spoken ("one two two decimal eight") — for the
     /// vectors redirect. `None` = the field has no approach service.
     pub approach: Option<String>,
+    /// The aircraft is on the ground — shapes the mayday answer (a parked
+    /// emergency gets the trucks, not a landing clearance; seen live
+    /// 2026-07-09: mayday from the stand was "cleared to land").
+    pub on_ground: bool,
 }
 
 /// The ", QNH ..." clause of a clearance — empty when the pilot has the
@@ -418,7 +422,15 @@ impl Tower {
                 )
             }
             // Priority handling — the ONE clearance spoken without a final
-            // report. An emergency outranks the sequence.
+            // report. An emergency outranks the sequence. On the GROUND there
+            // is nothing to clear: send the trucks, hold the traffic.
+            Intent::Mayday if ctx.on_ground => {
+                format!(
+                    "{}, roger mayday. Emergency services on their way to you — \
+                     hold position if able.",
+                    ctx.callsign
+                )
+            }
             Intent::Mayday => {
                 self.state = State::ClearedToLand;
                 self.touch_and_go = false;
@@ -483,6 +495,7 @@ mod tests {
             wind: "zero niner zero degrees, three knots".into(),
             holding_point: "Alpha".into(),
             approach: Some("one two two decimal eight".into()),
+            on_ground: false,
         }
     }
 
@@ -752,6 +765,17 @@ mod tests {
             assert!(r.contains("Emergency services"), "{start:?}: {r}");
             assert_eq!(twr.state, State::ClearedToLand);
         }
+        // On the GROUND there is nothing to clear: the trucks come to you,
+        // the sequence doesn't move, and no landing clearance is spoken
+        // (a parked mayday was "cleared to land" live, 2026-07-09).
+        let mut ground = ctx();
+        ground.on_ground = true;
+        let mut twr = Tower::new();
+        let r = twr.handle(Intent::Mayday, &ground);
+        assert!(r.contains("roger mayday"), "{r}");
+        assert!(r.contains("Emergency services"), "{r}");
+        assert!(!r.contains("cleared to land"), "{r}");
+        assert_eq!(twr.state, State::Parked);
         // But a lone "emergency" without land/descend/declare context is NOT
         // a mayday — "emergency fuel pump on" is a cockpit command.
         assert_eq!(parse_intent("emergency fuel pump on"), Intent::Unknown);

@@ -280,6 +280,8 @@ fn main() -> Result<()> {
                     wind: spoken_wind(&snap),
                     holding_point: "Alpha".to_string(),
                     approach: apt.freq(nav::FREQ_APPROACH).map(|f| atis::spoken_mhz(f.khz)),
+                    // The standalone binary predates the ground-aware mayday.
+                    on_ground: false,
                 };
                 let intent = if heard.confidence < config.stt_min_confidence {
                     tower::Intent::Unknown // garbled call → "say again", never a guessed clearance

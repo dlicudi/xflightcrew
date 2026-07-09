@@ -94,6 +94,18 @@ impl StationSpeaker {
             StationSpeaker::Atis => 3,
         }
     }
+
+    /// The log/panel tag for this position ("TWR: ..." rows). The plugin maps
+    /// each prefix to its own chip, so the transcript names WHICH controller
+    /// spoke, not a generic "ATC".
+    pub fn tag(self) -> &'static str {
+        match self {
+            StationSpeaker::Tower => "TWR",
+            StationSpeaker::Approach => "APP",
+            StationSpeaker::Departure => "DEP",
+            StationSpeaker::Atis => "ATIS",
+        }
+    }
 }
 
 struct Utterance {

@@ -1635,7 +1635,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                             crate::station::atis_tick(com1, &wx, std::time::Instant::now())
                         {
                             if let Some(s) = status.as_ref() {
-                                s.action("ATIS broadcast");
+                                s.action(&format!("ATIS: {report}"));
                             }
                             crate::blackbox::record(
                                 "atis",
@@ -1662,24 +1662,35 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                     );
                     voice.alert_station(Priority::Advisory, crate::voice::StationSpeaker::Tower, line);
                 }
-                // Enroute handoff: when another towered field is decisively
-                // nearer, the controller passes the flight along and the main
-                // loop rebuilds the station around the new airport.
-                if let Some(line) =
+                // Region switch: airborne it's a controller handoff; on the
+                // ground (loaded the flight at a new field) it's the copilot
+                // noting the local tower. Either way the main loop rebuilds
+                // the station around the new airport.
+                if let Some(sw) =
                     crate::station::region_tick(snap.lat, snap.lon, snap.on_ground, now)
                 {
-                    if let Some(s) = status.as_ref() {
-                        s.action(&format!("TWR: {line}"));
-                    }
                     crate::blackbox::record(
                         "atc_region",
-                        serde_json::json!({ "lat": r1(snap.lat), "lon": r1(snap.lon), "msg": &line }),
+                        serde_json::json!({
+                            "lat": r1(snap.lat), "lon": r1(snap.lon),
+                            "crew": sw.crew, "msg": &sw.line
+                        }),
                     );
-                    voice.alert_station(
-                        Priority::Advisory,
-                        crate::voice::StationSpeaker::Departure,
-                        line,
-                    );
+                    if sw.crew {
+                        if let Some(s) = status.as_ref() {
+                            s.action(&sw.line);
+                        }
+                        voice.alert(Priority::Advisory, sw.line);
+                    } else {
+                        if let Some(s) = status.as_ref() {
+                            s.action(&format!("DEP: {}", sw.line));
+                        }
+                        voice.alert_station(
+                            Priority::Advisory,
+                            crate::voice::StationSpeaker::Departure,
+                            sw.line,
+                        );
+                    }
                 }
                 if let Some(line) = crate::station::vector_tick(
                     snap.lat,
@@ -1690,8 +1701,8 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                     std::time::Instant::now(),
                 ) {
                     if let Some(s) = status.as_ref() {
-                        // "TWR: " marks the row as ATC speech on the panel.
-                        s.action(&format!("TWR: {line}"));
+                        // The prefix names the speaking position on the panel.
+                        s.action(&format!("APP: {line}"));
                     }
                     crate::blackbox::record(
                         "vectors",
@@ -1740,7 +1751,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                             };
                             let line = format!("{callsign}, {call}");
                             if let Some(s) = status.as_ref() {
-                                s.action(&format!("TWR: {line}"));
+                                s.action(&format!("{}: {line}", speaker.tag()));
                             }
                             crate::blackbox::record(
                                 "traffic_advisory",
