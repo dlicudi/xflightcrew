@@ -31,6 +31,24 @@ impl Service {
             Service::Departure => StationSpeaker::Departure,
         }
     }
+
+    /// The position's name for the blackbox trace.
+    fn name(self) -> &'static str {
+        match self {
+            Service::Tower => "tower",
+            Service::Approach => "approach",
+            Service::Departure => "departure",
+        }
+    }
+}
+
+/// Live wind for one exchange, read once by the async wrappers so the routing
+/// layer below them is pure (transcript in, reply out — it battle-tests dry,
+/// with no simulator on the other end).
+#[derive(Debug, Clone, Copy)]
+pub struct Wx {
+    pub wind_from_deg: f64,
+    pub wind_kts: f64,
 }
 
 pub struct Station {
@@ -67,10 +85,19 @@ impl Station {
                 return None;
             }
         };
-        let Some(twr_row) = apt.freq(nav::FREQ_TOWER) else {
+        if apt.freq(nav::FREQ_TOWER).is_none() {
             tracing::warn!(%icao, "ATC station: no tower frequency in apt.dat; ATC off");
             return None;
-        };
+        }
+        Self::from_airport(apt)
+    }
+
+    /// Build the station from an already-parsed airport. `None` without a
+    /// tower frequency. Split from [`Station::load`] so offline sweeps (the
+    /// cross-airport battle test) can drive one apt.dat pass through every
+    /// field instead of rescanning the 400 MB file per airport.
+    pub fn from_airport(apt: nav::AirportInfo) -> Option<Station> {
+        let twr_row = apt.freq(nav::FREQ_TOWER)?;
         tracing::info!(
             airport = %apt.name,
             mhz = twr_row.khz as f64 / 1000.0,
@@ -112,6 +139,59 @@ impl Station {
         transcript: &str,
         xp: &XPlaneClient,
     ) -> Option<(String, StationSpeaker)> {
+        // Cheap word gates before any dataref read — the common case is a
+        // cockpit command, and it must cost nothing. route_unkeyed re-applies
+        // the same gates; only the trace differs per exit.
+        if !is_radio_call(transcript, &self.apt.name.to_lowercase()) {
+            return None;
+        }
+        let intent = tower::parse_intent(transcript);
+        if intent == tower::Intent::Unknown {
+            // Radio-shaped words that didn't parse — exactly the utterances
+            // corpus mining wants to see after a flight.
+            crate::blackbox::record(
+                "atc",
+                serde_json::json!({
+                    "route": "unkeyed", "outcome": "fallthrough",
+                    "transcript": transcript,
+                }),
+            );
+            return None;
+        }
+        let Some(service) = self.tuned_service(xp).await else {
+            crate::blackbox::record(
+                "atc",
+                serde_json::json!({
+                    "route": "unkeyed", "outcome": "off_frequency",
+                    "transcript": transcript, "intent": format!("{intent:?}"),
+                }),
+            );
+            return None;
+        };
+        let (ctx, wx) = self.build_ctx(xp).await;
+        let before = self.twr.state;
+        let reply = self.route_unkeyed(transcript, service, &ctx, wx)?;
+        crate::blackbox::record(
+            "atc",
+            serde_json::json!({
+                "route": "unkeyed", "outcome": "reply", "service": service.name(),
+                "transcript": transcript, "intent": format!("{intent:?}"),
+                "state": format!("{before:?}>{:?}", self.twr.state), "reply": reply,
+            }),
+        );
+        Some((reply, service.speaker()))
+    }
+
+    /// The pure half of [`Station::try_handle`]: the unkeyed gates plus the
+    /// tuned service's answer, no simulator anywhere. `None` falls through to
+    /// the copilot.
+    fn route_unkeyed(
+        &mut self,
+        transcript: &str,
+        service: Service,
+        ctx: &tower::Ctx,
+        wx: Wx,
+    ) -> Option<String> {
         if !is_radio_call(transcript, &self.apt.name.to_lowercase()) {
             return None;
         }
@@ -119,8 +199,7 @@ impl Station {
         if intent == tower::Intent::Unknown {
             return None;
         }
-        let service = self.tuned_service(xp).await?;
-        Some((self.respond(service, intent, xp).await, service.speaker()))
+        Some(self.respond(service, intent, ctx, wx))
     }
 
     /// Physical routing (the radio PTT was keyed): the utterance was
@@ -133,25 +212,65 @@ impl Station {
         transcript: &str,
         xp: &XPlaneClient,
     ) -> Option<(String, StationSpeaker)> {
-        let service = self.tuned_service(xp).await?;
+        let Some(service) = self.tuned_service(xp).await else {
+            crate::blackbox::record(
+                "atc",
+                serde_json::json!({
+                    "route": "keyed", "outcome": "void", "transcript": transcript,
+                }),
+            );
+            return None;
+        };
+        let (ctx, wx) = self.build_ctx(xp).await;
+        let before = self.twr.state;
+        let reply = self.route_keyed(transcript, service, &ctx, wx);
+        crate::blackbox::record(
+            "atc",
+            serde_json::json!({
+                "route": "keyed",
+                "outcome": if reply.is_empty() { "silence" } else { "reply" },
+                "service": service.name(), "transcript": transcript,
+                "intent": format!("{:?}", tower::parse_intent(transcript)),
+                "state": format!("{before:?}>{:?}", self.twr.state), "reply": reply,
+            }),
+        );
+        Some((reply, service.speaker()))
+    }
+
+    /// The pure half of [`Station::handle_transmission`]: everything after
+    /// "somebody is listening on this frequency". Empty string = a readback
+    /// the controller accepted (the frequency stays quiet).
+    fn route_keyed(
+        &mut self,
+        transcript: &str,
+        service: Service,
+        ctx: &tower::Ctx,
+        wx: Wx,
+    ) -> String {
         let intent = tower::parse_intent(transcript);
         // A pilot readback earns SILENCE, like a real frequency: the
-        // controller only speaks up to correct a wrong one. Empty string =
-        // "heard, no reply due" (distinct from None = nobody listening).
+        // controller only speaks up to correct a wrong one.
         // Exception: the first call to DEPARTURE is a check-in ("passing one
         // thousand five hundred climbing"), and a check-in gets radar contact.
-        if intent == tower::Intent::Unknown && tower::is_readback(transcript) {
+        //
+        // "Cleared ..." can only be an echo of a clearance — a pilot ASKING
+        // says "request clearance", never "cleared". Without this, reading
+        // back "cleared to land runway two seven" re-parsed as a landing
+        // REQUEST: the tower answered "join final" again and the sequence
+        // walked backwards from ClearedToLand to Inbound.
+        let echoes_clearance = transcript
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| w == "cleared");
+        if echoes_clearance || (intent == tower::Intent::Unknown && tower::is_readback(transcript))
+        {
             if service == Service::Departure && !self.dep_checked_in {
                 self.dep_checked_in = true;
-                let ctx = self.build_ctx(xp).await;
-                return Some((
-                    format!("{}, {} Departure, radar contact.", ctx.callsign, ctx.airport),
-                    service.speaker(),
-                ));
+                return format!("{}, {} Departure, radar contact.", ctx.callsign, ctx.airport);
             }
-            return Some((String::new(), service.speaker()));
+            return String::new();
         }
-        Some((self.respond(service, intent, xp).await, service.speaker()))
+        self.respond(service, intent, ctx, wx)
     }
 
     /// The voice of whichever of this station's positions COM1 is tuned to.
@@ -184,18 +303,19 @@ impl Station {
         None
     }
 
-    /// Answer one transmission on whichever service is tuned.
-    async fn respond(
+    /// Answer one transmission on whichever service is tuned. Pure: the
+    /// context and wind were read before the words reached the controller.
+    fn respond(
         &mut self,
         service: Service,
         intent: tower::Intent,
-        xp: &XPlaneClient,
+        ctx: &tower::Ctx,
+        wx: Wx,
     ) -> String {
-        let ctx = self.build_ctx(xp).await;
         match service {
             Service::Tower => {
                 let was = self.twr.state;
-                let reply = self.twr.handle(intent, &ctx);
+                let reply = self.twr.handle(intent, ctx);
                 // A fresh takeoff clearance arms the after-departure handoff:
                 // once airborne and climbing, the tower sends the flight to
                 // departure (or approach) — the frequency chain, not a tower
@@ -203,24 +323,19 @@ impl Station {
                 if self.twr.state == tower::State::TakeoffCleared
                     && was != tower::State::TakeoffCleared
                 {
-                    self.arm_departure_handoff(&ctx);
+                    self.arm_departure_handoff(ctx);
                 }
                 reply
             }
-            Service::Approach => self.respond_approach(intent, &ctx, xp).await,
-            Service::Departure => self.respond_departure(intent, &ctx, xp).await,
+            Service::Approach => self.respond_approach(intent, ctx, wx),
+            Service::Departure => self.respond_departure(intent, ctx, wx),
         }
     }
 
     /// The departure controller: takes the handoff after takeoff, then sends
     /// arrivals to approach (vectors) and everything runway-shaped back to the
     /// tower.
-    async fn respond_departure(
-        &mut self,
-        intent: tower::Intent,
-        ctx: &tower::Ctx,
-        xp: &XPlaneClient,
-    ) -> String {
+    fn respond_departure(&mut self, intent: tower::Intent, ctx: &tower::Ctx, wx: Wx) -> String {
         match intent {
             tower::Intent::RadioCheck => {
                 format!(
@@ -241,7 +356,7 @@ impl Station {
                     "{}, contact {} Approach on {} for vectors.",
                     ctx.callsign, ctx.airport, freq
                 ),
-                None => self.arm_vectors(ctx, xp).await,
+                None => self.arm_vectors(ctx, wx),
             },
             tower::Intent::RequestLanding { touch_and_go } => match &ctx.approach {
                 Some(freq) => {
@@ -253,7 +368,7 @@ impl Station {
                 }
                 None => {
                     self.twr.expect_touch_and_go(touch_and_go);
-                    self.arm_vectors(ctx, xp).await
+                    self.arm_vectors(ctx, wx)
                 }
             },
             // Runway-shaped business belongs to the tower.
@@ -300,12 +415,7 @@ impl Station {
 
     /// The approach controller: vectors to final, or a redirect to the tower
     /// for anything that belongs there.
-    async fn respond_approach(
-        &mut self,
-        intent: tower::Intent,
-        ctx: &tower::Ctx,
-        xp: &XPlaneClient,
-    ) -> String {
+    fn respond_approach(&mut self, intent: tower::Intent, ctx: &tower::Ctx, wx: Wx) -> String {
         match intent {
             tower::Intent::RadioCheck => {
                 format!(
@@ -319,12 +429,12 @@ impl Station {
             tower::Intent::SquawkCheck => {
                 format!("{}, squawk seven zero zero zero.", ctx.callsign)
             }
-            tower::Intent::RequestVectors => self.arm_vectors(ctx, xp).await,
+            tower::Intent::RequestVectors => self.arm_vectors(ctx, wx),
             tower::Intent::RequestLanding { touch_and_go } => {
                 // The option request rides through the vectors: the tower's
                 // eventual clearance must say "touch and go", not "land".
                 self.twr.expect_touch_and_go(touch_and_go);
-                self.arm_vectors(ctx, xp).await
+                self.arm_vectors(ctx, wx)
             }
             // Final reports and everything runway-shaped belong to the tower.
             tower::Intent::ReportFinal
@@ -345,16 +455,11 @@ impl Station {
 
     /// Arm the vectors-to-final plan and speak the opening instruction. The
     /// monitor's tick ([`vector_tick`]) takes it from here.
-    async fn arm_vectors(&mut self, ctx: &tower::Ctx, xp: &XPlaneClient) -> String {
+    fn arm_vectors(&mut self, ctx: &tower::Ctx, wx: Wx) -> String {
         // The runway END in use: its threshold is the aim point, its heading
         // the final approach course. Same held pick as every clearance, so
         // vectors and the tower always agree on the runway.
-        let wind_from = xp
-            .get_float(datarefs::WIND_DIR_DEG_TRUE)
-            .await
-            .unwrap_or(0.0);
-        let wind_kts = xp.get_float(datarefs::WIND_SPEED_MSC).await.unwrap_or(0.0) * 1.943844;
-        let ident = self.pick_runway(wind_from, wind_kts);
+        let ident = self.pick_runway(wx.wind_from_deg, wx.wind_kts);
         if ident.is_empty() {
             return format!("{}, unable, no runway data.", ctx.callsign);
         }
@@ -409,19 +514,21 @@ impl Station {
         self.runway_in_use.clone().unwrap_or_default()
     }
 
-    /// Build the live context for a reply. Best-effort: a failed read falls
-    /// back to silence on that item rather than a wrong number.
-    async fn build_ctx(&mut self, xp: &XPlaneClient) -> tower::Ctx {
-        let wind_from = xp
-            .get_float(datarefs::WIND_DIR_DEG_TRUE)
-            .await
-            .unwrap_or(0.0);
-        let wind_kts = xp.get_float(datarefs::WIND_SPEED_MSC).await.unwrap_or(0.0) * 1.943844;
+    /// Read the sim once and build the live context for a reply. Best-effort:
+    /// a failed read falls back to silence on that item rather than a wrong
+    /// number.
+    async fn build_ctx(&mut self, xp: &XPlaneClient) -> (tower::Ctx, Wx) {
+        let wx = Wx {
+            wind_from_deg: xp
+                .get_float(datarefs::WIND_DIR_DEG_TRUE)
+                .await
+                .unwrap_or(0.0),
+            wind_kts: xp.get_float(datarefs::WIND_SPEED_MSC).await.unwrap_or(0.0) * 1.943844,
+        };
         let qnh = match xp.get_float(datarefs::QNH_PASCALS).await {
             Ok(pa) => atis::spoken_digits(&format!("{:.0}", pa / 100.0)),
             Err(_) => String::new(),
         };
-        let runway = self.pick_runway(wind_from, wind_kts);
         let callsign = xp
             .get_string(datarefs::TAILNUM)
             .await
@@ -429,12 +536,19 @@ impl Station {
             .map(|t| tower::spoken_callsign(&t))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "aircraft calling".to_string());
+        (self.make_ctx(wx, qnh, callsign), wx)
+    }
+
+    /// The pure half of [`Station::build_ctx`] — everything after the sim
+    /// reads, so tests phrase clearances from scripted weather.
+    fn make_ctx(&mut self, wx: Wx, qnh: String, callsign: String) -> tower::Ctx {
+        let runway = self.pick_runway(wx.wind_from_deg, wx.wind_kts);
         tower::Ctx {
             callsign,
             airport: self.apt.name.clone(),
             runway: atis::spoken_runway(&runway),
             qnh,
-            wind: spoken_wind(wind_from, wind_kts),
+            wind: spoken_wind(wx.wind_from_deg, wx.wind_kts),
             holding_point: "Alpha".to_string(),
             approach: self.approach_khz.map(atis::spoken_mhz),
         }
@@ -741,13 +855,24 @@ impl Station {
         };
         if let Some(com1) = com1_khz {
             // Same 5 kHz tolerance as tuned_service: 8.33 channel names can
-            // sit 5 kHz off the carrier.
-            let tuned = SERVICES.iter().find_map(|(word, kind)| {
-                self.apt
-                    .freq(*kind)
-                    .filter(|f| (f.khz - com1).abs() <= 5)
-                    .map(|_| *word)
-            });
+            // sit 5 kHz off the carrier. Some fields publish ground and tower
+            // on the SAME frequency (8 in the 2026-07 apt.dat, military
+            // mostly) — name the service that would actually answer, in
+            // tuned_service's precedence, not the first row in briefing order.
+            let matches: Vec<&str> = SERVICES
+                .iter()
+                .filter_map(|(word, kind)| {
+                    self.apt
+                        .freq(*kind)
+                        .filter(|f| (f.khz - com1).abs() <= 5)
+                        .map(|_| *word)
+                })
+                .collect();
+            let tuned = matches
+                .iter()
+                .find(|w| matches!(**w, "tower" | "approach" | "departure"))
+                .or_else(|| matches.first())
+                .copied();
             line.push_str(&match tuned {
                 Some(w) => format!(" Com one is on the {w}."),
                 None => format!(" Com one is on {}.", atis::spoken_mhz(com1)),
@@ -786,9 +911,10 @@ impl Station {
             || t.contains("contact")
             || t.contains("change to")
             || (t.contains("set") && t.contains("com"))
-            // "change frequency to the tower" — but only when the sentence is
-            // about the radio: a bare "change" is too promiscuous a verb.
-            || (t.contains("change")
+            // "change/switch frequency to the tower" — but only when the
+            // sentence is about the radio: bare "change"/"switch" are too
+            // promiscuous ("switch the landing light").
+            || ((t.contains("change") || t.contains("switch"))
                 && (t.contains("freq") || t.contains("com") || t.contains("radio")));
         if !verb {
             return None;
@@ -898,8 +1024,299 @@ mod tests {
         assert_eq!(st.pick_runway(90.0, 10.0), "09");
     }
 
+    /// `HANDOFF` is a process-wide static: every test that arms or drains it
+    /// holds this lock, or parallel tests clobber each other's plan.
+    static HANDOFF_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The adversarial corpus (`bench/atc_corpus.yaml`): real whisper output
+    /// mined from the flight logs plus hand-written paraphrases, homophone
+    /// mangles, and crew-talk near-misses. Every case judges up to three
+    /// parsers — intent, the unkeyed radio-call gate, the readback detector —
+    /// and failures collect so one run reports every drift at once.
+    #[test]
+    fn transcript_corpus_parses_safely() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            text: String,
+            intent: String,
+            #[serde(default)]
+            radio: Option<bool>,
+            #[serde(default)]
+            readback: Option<bool>,
+        }
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/atc_corpus.yaml");
+        let cases: Vec<Case> =
+            serde_yaml::from_str(&std::fs::read_to_string(path).expect("corpus file"))
+                .expect("corpus yaml");
+        assert!(cases.len() >= 100, "corpus shrank to {} cases", cases.len());
+        let mut fails = Vec::new();
+        for c in &cases {
+            let t = c.text.to_lowercase();
+            let Some(want) = tower::intent_from_label(&c.intent) else {
+                panic!("{:?}: unknown intent label {:?}", c.text, c.intent);
+            };
+            let got = tower::parse_intent(&t);
+            if got != want {
+                fails.push(format!("{:?}: parsed {got:?}, wanted {want:?}", c.text));
+            }
+            if let Some(radio) = c.radio {
+                if is_radio_call(&t, "gibraltar") != radio {
+                    fails.push(format!("{:?}: is_radio_call should be {radio}", c.text));
+                }
+            }
+            if let Some(rb) = c.readback {
+                if tower::is_readback(&t) != rb {
+                    fails.push(format!("{:?}: is_readback should be {rb}", c.text));
+                }
+            }
+        }
+        assert!(
+            fails.is_empty(),
+            "{} of {} corpus cases drifted:\n{}",
+            fails.len(),
+            cases.len(),
+            fails.join("\n")
+        );
+    }
+
+    fn calm() -> Wx {
+        Wx {
+            wind_from_deg: 0.0,
+            wind_kts: 0.0,
+        }
+    }
+
+    /// The live context exactly as `build_ctx` would assemble it, minus the
+    /// simulator: scripted wind, fixed QNH and tail number.
+    fn scripted_ctx(st: &mut Station, wx: Wx) -> tower::Ctx {
+        st.make_ctx(
+            wx,
+            "one zero one seven".into(),
+            "November one seven two Sierra Papa".into(),
+        )
+    }
+
+    /// Whole sorties driven through the pure routing layer — the dialogue
+    /// sequences that live between the tower FSM (unit-tested above it) and
+    /// the mic (untestable): out-of-order calls, questions on a keyed radio,
+    /// readbacks, wrong-service redirects, the departure check-in. Every
+    /// scene asserts the reply AND that the clearance sequence only moves
+    /// when it should.
+    #[test]
+    fn sortie_dialogues_battle_test_the_routing() {
+        let _guard = HANDOFF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = lxgb_apt_file();
+        let wx = Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+        };
+
+        // Scene 1: the departure happy path, keyed on the tower frequency.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let ctx = scripted_ctx(&mut st, wx);
+        let r = st.route_keyed("gibraltar tower, radio check", Service::Tower, &ctx, wx);
+        assert!(r.contains("reading you five"), "{r}");
+        assert_eq!(st.twr.state, tower::State::Parked, "a radio check moves nothing");
+
+        let r = st.route_keyed("request clearance for taxi", Service::Tower, &ctx, wx);
+        assert!(r.contains("taxi to holding point Alpha runway two seven"), "{r}");
+        assert_eq!(st.twr.state, tower::State::TaxiCleared);
+
+        // A readback earns silence; garble earns "say again"; neither moves
+        // the sequence.
+        let r = st.route_keyed("roger, holding point alpha", Service::Tower, &ctx, wx);
+        assert_eq!(r, "", "a readback keeps the frequency quiet: {r}");
+        let r = st.route_keyed("uhh gibraltar something something", Service::Tower, &ctx, wx);
+        assert!(r.contains("say again"), "{r}");
+        assert_eq!(st.twr.state, tower::State::TaxiCleared);
+
+        // A question keyed by mistake gets "say again", never a clearance —
+        // the 2026-07-08 regression, now at the routing layer.
+        let r = st.route_keyed("what runway shall i take off from", Service::Tower, &ctx, wx);
+        assert!(r.contains("say again"), "{r}");
+        let r = st.route_keyed("takeoff checklist", Service::Tower, &ctx, wx);
+        assert!(r.contains("say again"), "{r}");
+        assert_eq!(st.twr.state, tower::State::TaxiCleared, "questions moved the sequence");
+
+        let r = st.route_keyed("ready for departure", Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        assert_eq!(st.twr.state, tower::State::TakeoffCleared);
+
+        // The takeoff clearance armed the handoff; airborne through 700 ft it
+        // fires exactly once, to the departure frequency.
+        assert!(handoff_tick(300.0, false).is_none(), "still low");
+        let line = handoff_tick(900.0, false).expect("handoff due");
+        assert!(line.contains("Departure on one three zero decimal four"), "{line}");
+        assert!(handoff_tick(1500.0, false).is_none(), "spoken once");
+
+        // Scene 2: the departure controller. First readback is the check-in
+        // and gets radar contact; later readbacks earn silence.
+        let r = st.route_keyed(
+            "passing one thousand five hundred climbing",
+            Service::Departure,
+            &ctx,
+            wx,
+        );
+        assert!(r.contains("Departure, radar contact"), "{r}");
+        let r = st.route_keyed("maintaining two thousand", Service::Departure, &ctx, wx);
+        assert_eq!(r, "", "post-check-in readbacks stay quiet: {r}");
+
+        // Runway-shaped business on the wrong frequency redirects to the
+        // tower and must not advance the tower's sequence.
+        let was = st.twr.state;
+        let r = st.route_keyed("request taxi", Service::Approach, &ctx, wx);
+        assert!(r.contains("contact Gibraltar Tower on one three one decimal two"), "{r}");
+        let r = st.route_keyed("ready for departure", Service::Departure, &ctx, wx);
+        assert!(r.contains("contact Gibraltar Tower"), "{r}");
+        assert_eq!(st.twr.state, was, "a redirect must not move the sequence");
+
+        // Coming back in: departure sends arrivals to approach when the field
+        // has one, and the touch-and-go option survives the redirect.
+        let r = st.route_keyed("request touch and go", Service::Departure, &ctx, wx);
+        assert!(r.contains("contact Gibraltar Approach on one two two decimal eight"), "{r}");
+        let clear = st.route_keyed("november one seven two, final", Service::Tower, &ctx, wx);
+        assert!(clear.contains("cleared touch and go"), "{clear}");
+
+        // Scene 3: the arrival, keyed on the tower — inbound, final, then off
+        // the runway. Calm wind must hold the westerly runway pick.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let ctx = scripted_ctx(&mut st, wx);
+        let r = st.route_keyed("gibraltar tower, inbound for landing", Service::Tower, &ctx, wx);
+        assert!(r.contains("join final runway two seven"), "{r}");
+        let calm_ctx = scripted_ctx(&mut st, calm());
+        assert!(calm_ctx.runway.contains("two seven"), "calm flipped the runway");
+        let r = st.route_keyed("final", Service::Tower, &calm_ctx, calm());
+        assert!(r.contains("cleared to land"), "{r}");
+        // Reading the clearance back must earn silence and hold the state —
+        // it used to re-parse as a landing request and walk the sequence
+        // backwards to Inbound.
+        let r = st.route_keyed(
+            "cleared to land runway two seven, november one seven two sierra papa",
+            Service::Tower,
+            &calm_ctx,
+            calm(),
+        );
+        assert_eq!(r, "", "a clearance echo keeps the frequency quiet: {r}");
+        assert_eq!(st.twr.state, tower::State::ClearedToLand, "echo moved the sequence");
+        let r = st.route_keyed("request taxi", Service::Tower, &calm_ctx, calm());
+        assert!(r.contains("taxi to parking"), "{r}");
+        assert_eq!(st.twr.state, tower::State::Parked);
+        let r = st.route_keyed("i've just landed", Service::Tower, &calm_ctx, calm());
+        assert!(r.contains("taxi to parking"), "{r}");
+
+        // Scene 4: content routing (no PTT). Crew talk falls through even
+        // when it contains clearance words; radio-shaped calls route.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        let ctx = scripted_ctx(&mut st, wx);
+        for crew in [
+            "anything else we need to do before takeoff",
+            "land the aircraft",
+            "flaps set for takeoff",
+            "after landing checklist",
+            "hello tower",
+            "gibraltar is somewhere ahead",
+        ] {
+            assert!(
+                st.route_unkeyed(crew, Service::Tower, &ctx, wx).is_none(),
+                "crew talk routed to ATC: {crew}"
+            );
+        }
+        assert_eq!(st.twr.state, tower::State::Parked, "crew talk moved the sequence");
+        let r = st
+            .route_unkeyed("gibraltar tower, request taxi", Service::Tower, &ctx, wx)
+            .expect("a proper call routes");
+        assert!(r.contains("holding point"), "{r}");
+
+        // Any leftover handoff from this sortie must not leak into the next
+        // test holding the lock.
+        *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The world sweep: EVERY towered airport in the real Global Airports
+    /// file stands up a station, briefs its frequencies, and flies the
+    /// departure happy path — the shakeout for apt.dat shapes LXGB never
+    /// showed us. Opt-in because the file ships with X-Plane, not the repo:
+    ///
+    ///   cargo test --release --bin x-copilot -- --ignored atc_world_sweep
+    ///
+    /// Override the file with XCOPILOT_APT_DAT.
+    #[test]
+    #[ignore = "needs X-Plane's Global Airports apt.dat; run with -- --ignored"]
+    fn atc_world_sweep_every_towered_field_stands_up() {
+        let _guard = HANDOFF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::var("XCOPILOT_APT_DAT").unwrap_or_else(|_| {
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat"
+                .to_string()
+        });
+        let wx = Wx {
+            wind_from_deg: 250.0,
+            wind_kts: 12.0,
+        };
+        let (mut total, mut towered, mut no_runways) = (0u32, 0u32, 0u32);
+        let mut fails: Vec<String> = Vec::new();
+        nav::scan_airports(&path, |icao, apt| {
+            total += 1;
+            let Some(mut st) = Station::from_airport(apt) else { return };
+            towered += 1;
+            let mut check = |cond: bool, what: &str| {
+                if !cond && fails.len() < 40 {
+                    fails.push(format!("{icao}: {what}"));
+                }
+            };
+            check(st.covers_khz(st.tower_khz), "tower frequency not covered");
+
+            // The briefing must read every published service, and name the
+            // tower when COM1 sits on it.
+            let brief = st.briefing_text(Some(st.tower_khz));
+            check(brief.contains("tower"), &format!("no tower in briefing: {brief}"));
+            check(
+                brief.ends_with("Com one is on the tower."),
+                &format!("tuned service unnamed: {brief}"),
+            );
+
+            // The departure happy path, spoken with live-shaped context.
+            let ctx = scripted_ctx(&mut st, wx);
+            if ctx.runway.is_empty() {
+                no_runways += 1; // towered heliports/seaplane bases: no 100 rows
+            }
+            let r = st.route_keyed("radio check", Service::Tower, &ctx, wx);
+            check(r.contains("reading you five"), &format!("radio check: {r}"));
+            let r = st.route_keyed("request taxi", Service::Tower, &ctx, wx);
+            check(r.contains("taxi to holding point"), &format!("taxi: {r}"));
+            let r = st.route_keyed("ready for departure", Service::Tower, &ctx, wx);
+            check(r.contains("cleared for takeoff"), &format!("takeoff: {r}"));
+            if !ctx.runway.is_empty() {
+                check(
+                    r.contains(&ctx.runway),
+                    &format!("clearance names the wrong runway: {r}"),
+                );
+            }
+
+            // Vectors exercise the runway geometry math per field.
+            let r = st.route_keyed("request vectors", Service::Approach, &ctx, wx);
+            check(!r.is_empty(), "vectors: empty reply");
+
+            // Statics must not leak between airports (or into other tests).
+            *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        })
+        .expect("apt.dat scan");
+        println!(
+            "swept {total} airports, {towered} towered ({no_runways} with no runway rows)"
+        );
+        assert!(towered > 100, "suspiciously few towered fields: {towered}");
+        assert!(
+            fails.is_empty(),
+            "{} fields failed (first {}):\n{}",
+            fails.len(),
+            fails.len().min(40),
+            fails.join("\n")
+        );
+    }
+
     #[test]
     fn takeoff_clearance_arms_the_departure_handoff() {
+        let _guard = HANDOFF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = lxgb_apt_file();
         let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
         assert_eq!(st.departure_khz, Some(130400), "departure row wired");
@@ -973,8 +1390,15 @@ mod tests {
             st.tune_request("change frequency to tower"),
             Some(Tune::Found { khz: 131200, .. })
         ));
-        // "change" without radio context must not retune.
+        // "switch frequency to tower." (2026-07-09 flight, missed: "switch"
+        // only counted when followed directly by "to").
+        assert!(matches!(
+            st.tune_request("switch frequency to tower."),
+            Some(Tune::Found { khz: 131200, .. })
+        ));
+        // "change"/"switch" without radio context must not retune.
         assert!(st.tune_request("change approach speed to seventy").is_none());
+        assert!(st.tune_request("switch the landing light on").is_none());
         // "change to approach" tunes (2026-07-08 night flight: answered with
         // "approach around 65 knots" instead) — but flight-parameter talk
         // naming a station never does.
@@ -1021,6 +1445,17 @@ mod tests {
         // A failed COM1 read drops that sentence, never a wrong number.
         let b = st.briefing_text(None);
         assert!(b.ends_with("decimal four."), "{b}");
+        // Ground and tower on the SAME frequency (8 real fields in the
+        // 2026-07 apt.dat): the briefing names the service that answers —
+        // the tower — not the first row in briefing order.
+        let mut st = lxgb();
+        st.apt.freqs.push(nav::AtcFreq {
+            kind: nav::FREQ_GROUND,
+            khz: 131200,
+            name: "Ground".into(),
+        });
+        let b = st.briefing_text(Some(131200));
+        assert!(b.ends_with("Com one is on the tower."), "{b}");
     }
 
     /// A fixture apt.dat with LXGB's rows verbatim from the Global Airports

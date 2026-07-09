@@ -73,15 +73,33 @@ pub struct Ctx {
 pub fn parse_intent(transcript: &str) -> Intent {
     let t = transcript.to_lowercase();
     let word = |w: &str| t.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == w);
-    if t.contains("radio check") || t.contains("how do you read") {
+    // A checklist call-out is cockpit ritual, never a radio call: "takeoff
+    // checklist" on a keyed radio must get "say again", not a clearance.
+    if word("checklist") {
+        return Intent::Unknown;
+    }
+    // "do you read/copy/hear me" / "are you there" are how pilots actually ask
+    // for a radio check (five times across the 2026-07 flights, all
+    // stonewalled with "say again").
+    if t.contains("radio check")
+        || t.contains("do you read")
+        || t.contains("do you copy")
+        || t.contains("do you hear")
+        || t.contains("are you there")
+    {
         return Intent::RadioCheck;
     }
-    if t.contains("vector") {
+    // "request vectors for taxi to parking" (real 2026-07-09 call) wants the
+    // taxi, not the vectoring service — ground words beat the vector keyword.
+    if t.contains("vector") && !t.contains("taxi") && !word("parking") {
         return Intent::RequestVectors;
     }
-    // "say wind" / "wind check" / "say QNH" — a report, not a clearance.
+    // "say wind" / "wind check" / "how's the wind" — a report, not a clearance.
+    // "win" is whisper's favourite spelling of "wind" ("win check", measured
+    // in the stt-eval).
     if word("qnh") && (word("say") || t.contains("check") || t.contains("what"))
-        || (word("wind") && (word("say") || t.contains("check") || t.contains("what")))
+        || ((word("wind") || word("win"))
+            && (word("say") || t.contains("check") || t.contains("what") || t.contains("how")))
     {
         return Intent::WindCheck;
     }
@@ -89,7 +107,7 @@ pub fn parse_intent(transcript: &str) -> Intent {
     // but a controller repeats a code without blinking. Must sit above the
     // question guard, like radio check and wind check.
     if (word("squawk") || word("transponder"))
-        && (word("what") || word("say") || t.contains("confirm") || word("my"))
+        && (word("what") || word("say") || t.contains("confirm") || word("my") || word("code"))
     {
         return Intent::SquawkCheck;
     }
@@ -109,14 +127,24 @@ pub fn parse_intent(transcript: &str) -> Intent {
     if word("final") && !t.contains("what") && !t.contains("how") && !t.contains("speed") {
         return Intent::ReportFinal;
     }
-    if t.contains("touch and go") {
+    // "the option" is real phraseology for a touch and go, and also what
+    // whisper writes when it garbles "touch and" ("request option go",
+    // measured in the stt-eval).
+    if t.contains("touch and go") || (word("option") && (t.contains("request") || word("go"))) {
         return Intent::RequestLanding { touch_and_go: true };
     }
-    // "landing light on" / "landing gear down" are cockpit commands, not
-    // arrival calls — same discipline as the taxi guard below.
+    // "I've just landed" — an arrival already on the runway. Taxi in, never a
+    // fresh join clearance (a real 2026-07 call, answered with "say again").
+    if word("landed") {
+        return Intent::RequestTaxiIn;
+    }
+    // "landing light on" / "landing gear down" / "flaps set for landing" are
+    // cockpit commands, not arrival calls — same discipline as the taxi guard
+    // below.
     if (t.contains("inbound") || word("landing") || word("land") || t.contains("full stop"))
         && !t.contains("light")
         && !t.contains("gear")
+        && !t.contains("flaps")
     {
         return Intent::RequestLanding {
             touch_and_go: false,
@@ -131,13 +159,19 @@ pub fn parse_intent(transcript: &str) -> Intent {
     {
         return Intent::RequestTakeoff;
     }
-    if t.contains("clearance") {
-        return Intent::RequestClearance;
-    }
     // "taxi light on" / "taxi hold" are COCKPIT commands that happen to contain
     // "taxi" — in the merged binary this parser sees every utterance, so a taxi
-    // request must be a request, not any sentence with the word in it.
-    if t.contains("taxi") && !t.contains("light") && !t.contains("hold") {
+    // request must be a request, not any sentence with the word in it. Checked
+    // before the clearance keyword: "request clearance for taxi" (the way the
+    // 2026-07-08 pilot asked, three times) wants the taxi, not the zone
+    // departure clearance.
+    // The "hold" exclusion protects the copilot's taxi-hold governor
+    // ("release the taxi hold"), but "taxi to holding point alpha" is the most
+    // standard taxi phraseology there is — "holding point" survives it.
+    if t.contains("taxi")
+        && !t.contains("light")
+        && (!t.contains("hold") || t.contains("holding point"))
+    {
         // "taxi to parking/the ramp/the stand" is an arrival call — it must
         // never earn a fresh departure taxi to the holding point.
         if word("parking") || word("ramp") || word("apron") || word("stand") || word("gate") {
@@ -145,7 +179,31 @@ pub fn parse_intent(transcript: &str) -> Intent {
         }
         return Intent::RequestTaxi;
     }
+    if t.contains("clearance") {
+        return Intent::RequestClearance;
+    }
     Intent::Unknown
+}
+
+/// Parse a corpus label ("request_taxi") into the intent it names — the shared
+/// vocabulary of the battle-test manifests (`bench/atc_corpus.yaml`, the ATC
+/// cases in the stt-eval manifest). `None` for a label no intent carries.
+pub fn intent_from_label(label: &str) -> Option<Intent> {
+    Some(match label {
+        "radio_check" => Intent::RadioCheck,
+        "request_taxi" => Intent::RequestTaxi,
+        "request_clearance" => Intent::RequestClearance,
+        "request_takeoff" => Intent::RequestTakeoff,
+        "request_landing" => Intent::RequestLanding { touch_and_go: false },
+        "request_touch_and_go" => Intent::RequestLanding { touch_and_go: true },
+        "report_final" => Intent::ReportFinal,
+        "wind_check" => Intent::WindCheck,
+        "squawk_check" => Intent::SquawkCheck,
+        "request_taxi_in" => Intent::RequestTaxiIn,
+        "request_vectors" => Intent::RequestVectors,
+        "unknown" => Intent::Unknown,
+        _ => return None,
+    })
 }
 
 /// Is this transmission a pilot READBACK of an instruction ("descending to one
@@ -157,7 +215,7 @@ pub fn parse_intent(transcript: &str) -> Intent {
 pub fn is_readback(transcript: &str) -> bool {
     let t = transcript.to_lowercase();
     let word = |w: &str| t.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == w);
-    ["descending", "descend", "maintaining", "maintain", "climbing", "climb",
+    ["descending", "descend", "maintaining", "maintain", "climbing", "climb", "passing",
      "heading", "cleared", "roger", "wilco", "squawk", "squawking", "copy", "copied"]
         .iter()
         .any(|w| word(w))
@@ -405,6 +463,140 @@ mod tests {
         // Arrivals taxi IN — never a fresh departure taxi.
         assert_eq!(parse_intent("request taxi to parking"), Intent::RequestTaxiIn);
         assert_eq!(parse_intent("taxi to the ramp"), Intent::RequestTaxiIn);
+        // "I've just landed" is an arrival on the runway, not "say again".
+        assert_eq!(parse_intent("i've just landed"), Intent::RequestTaxiIn);
+        assert_eq!(parse_intent("we have landed"), Intent::RequestTaxiIn);
+        // "request clearance for taxi" wants the taxi, not the zone clearance
+        // (asked three times on 2026-07-08; each got "cleared to leave the
+        // zone" while parked at the stand).
+        assert_eq!(
+            parse_intent("request clearance for taxi"),
+            Intent::RequestTaxi
+        );
+        assert_eq!(
+            parse_intent("requesting clearance for taxi"),
+            Intent::RequestTaxi
+        );
+        assert_eq!(
+            parse_intent("request departure clearance"),
+            Intent::RequestClearance,
+            "clearance without taxi words is still the zone clearance"
+        );
+        // "do you copy/read/hear me" / "are you there" are radio checks — five
+        // real calls across the 2026-07 flights, all stonewalled.
+        assert_eq!(parse_intent("gibraltar tower, do you copy"), Intent::RadioCheck);
+        assert_eq!(parse_intent("malaga tower, do you hear me?"), Intent::RadioCheck);
+        assert_eq!(parse_intent("chipotle tower, are you there?"), Intent::RadioCheck);
+        assert_eq!(parse_intent("how's the wind looking"), Intent::WindCheck);
+        // Checklist call-outs are cockpit ritual, never radio calls.
+        assert_eq!(parse_intent("takeoff checklist"), Intent::Unknown);
+        assert_eq!(parse_intent("after landing checklist"), Intent::Unknown);
+        assert_eq!(parse_intent("flaps set for landing"), Intent::Unknown);
+        // "holding point" survives the taxi-hold guard; the governor commands
+        // still don't.
+        assert_eq!(
+            parse_intent("request taxi to holding point alpha"),
+            Intent::RequestTaxi
+        );
+        assert_eq!(parse_intent("release the taxi hold"), Intent::Unknown);
+        // "transponder code" alone deserves the code (real 2026-07-08 call).
+        assert_eq!(parse_intent("transponder code"), Intent::SquawkCheck);
+    }
+
+    /// Every (state, intent) cell of the FSM, exhaustively: the exact end
+    /// state, plus the invariants a tower must never break anywhere in the
+    /// grid. The named tests above cover the flown paths; this covers the
+    /// cells nobody has flown yet.
+    #[test]
+    fn state_intent_matrix_holds_the_invariants() {
+        use Intent::*;
+        use State::*;
+        let states = [Parked, TaxiCleared, TakeoffCleared, Inbound, ClearedToLand];
+        let intents = [
+            RadioCheck,
+            RequestTaxi,
+            RequestClearance,
+            RequestTakeoff,
+            RequestLanding { touch_and_go: false },
+            RequestLanding { touch_and_go: true },
+            ReportFinal,
+            WindCheck,
+            SquawkCheck,
+            RequestTaxiIn,
+            RequestVectors,
+            Unknown,
+        ];
+        let c = ctx();
+        for &start in &states {
+            for &intent in &intents {
+                let mut twr = Tower::new();
+                twr.state = start;
+                let reply = twr.handle(intent, &c);
+                let end = twr.state;
+                let cell = format!("{start:?} + {intent:?}");
+
+                // A controller always answers, and always by callsign.
+                assert!(!reply.is_empty(), "{cell}: silent");
+                assert!(reply.contains(&c.callsign), "{cell}: no callsign in {reply:?}");
+
+                // A takeoff clearance is only ever spoken to an aircraft that
+                // asked for one FROM the holding-point states — never handed
+                // out by any other cell of the grid.
+                if reply.contains("cleared for takeoff") {
+                    assert_eq!(intent, RequestTakeoff, "{cell}: unasked takeoff clearance");
+                    assert!(
+                        matches!(start, TaxiCleared | TakeoffCleared),
+                        "{cell}: takeoff clearance from the wrong state"
+                    );
+                    assert!(reply.contains(&c.runway), "{cell}: clearance without runway");
+                    assert!(reply.contains(&c.wind), "{cell}: clearance without wind");
+                }
+                // A landing clearance only ever answers a final report.
+                if reply.contains("cleared to land") || reply.contains("cleared touch and go") {
+                    assert_eq!(intent, ReportFinal, "{cell}: unasked landing clearance");
+                    assert!(reply.contains(&c.runway), "{cell}: clearance without runway");
+                    assert!(reply.contains(&c.wind), "{cell}: clearance without wind");
+                }
+
+                // The full transition table — any change here must be a
+                // deliberate edit to this test, not a surprise.
+                let want = match intent {
+                    RadioCheck | WindCheck | SquawkCheck | Unknown | RequestClearance => start,
+                    // ctx() has an approach frequency, so vectors redirect
+                    // without touching the sequence.
+                    RequestVectors => start,
+                    RequestTaxiIn => Parked,
+                    RequestTaxi => {
+                        if start == ClearedToLand {
+                            Parked
+                        } else {
+                            TaxiCleared
+                        }
+                    }
+                    RequestTakeoff => {
+                        if matches!(start, TaxiCleared | TakeoffCleared) {
+                            TakeoffCleared
+                        } else {
+                            TaxiCleared
+                        }
+                    }
+                    RequestLanding { .. } => Inbound,
+                    ReportFinal => ClearedToLand,
+                };
+                assert_eq!(end, want, "{cell}: wrong transition");
+            }
+        }
+
+        // With no approach service, a vectors request joins the pattern
+        // instead — from every state.
+        let mut no_app = ctx();
+        no_app.approach = None;
+        for &start in &states {
+            let mut twr = Tower::new();
+            twr.state = start;
+            twr.handle(RequestVectors, &no_app);
+            assert_eq!(twr.state, Inbound, "{start:?}: no-approach vectors must join");
+        }
     }
 
     #[test]

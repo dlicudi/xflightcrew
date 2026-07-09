@@ -42,6 +42,13 @@ struct Case {
     /// Optional expected arguments, subset-matched against the resolved call.
     #[serde(default)]
     args: Option<Value>,
+    /// Optional expected ATC intent by label ("request_taxi", "unknown" — see
+    /// [`crate::tower::intent_from_label`]). The case then decodes with the
+    /// tower's STT prompt and is judged on [`crate::tower::parse_intent`]
+    /// instead of the command fast-path: did the SPOKEN call still reach the
+    /// right clearance?
+    #[serde(default)]
+    intent: Option<String>,
 }
 
 pub fn run(model_path: &str, profile: &AircraftProfile, manifest: &str) -> Result<()> {
@@ -62,11 +69,19 @@ pub fn run(model_path: &str, profile: &AircraftProfile, manifest: &str) -> Resul
 
     let mut wer_sum = 0.0;
     let (mut cmd_ok, mut cmd_total) = (0u32, 0u32);
+    let (mut int_ok, mut int_total) = (0u32, 0u32);
     for case in &cases {
         let samples = match &case.audio {
             Some(p) => load_16k(Path::new(p))?,
             None => synth(&case.say)?,
         };
+        // ATC cases decode with the tower's prompt, exactly as the live loop
+        // does with COM1 on the station; command cases get the profile prompt.
+        if case.intent.is_some() {
+            stt.set_prompt(crate::tower::STT_PROMPT.to_string());
+        } else {
+            stt.set_prompt(stt::build_prompt(profile));
+        }
         let heard = stt.transcribe(&samples)?.text.trim().to_lowercase();
         let reference = phrase::normalize_numbers(&case.say.to_lowercase());
         let wer = word_error_rate(&reference, &heard);
@@ -75,9 +90,9 @@ pub fn run(model_path: &str, profile: &AircraftProfile, manifest: &str) -> Resul
         // Resolve the transcript through the deterministic fast-path, exactly as
         // the command loop would.
         let resolved = grammar::try_parse(&heard, &registry, profile);
-        let verdict = match &case.tool {
-            None => String::new(), // transcription-only case
-            Some(want) => {
+        let verdict = match (&case.tool, &case.intent) {
+            (None, None) => String::new(), // transcription-only case
+            (Some(want), _) => {
                 cmd_total += 1;
                 let got = resolved.as_ref().and_then(|c| c.first());
                 match got {
@@ -89,8 +104,21 @@ pub fn run(model_path: &str, profile: &AircraftProfile, manifest: &str) -> Resul
                     None => "cmd:LLM-fallback".to_string(),
                 }
             }
+            (None, Some(label)) => {
+                let want = crate::tower::intent_from_label(label)
+                    .ok_or_else(|| anyhow!("{}: unknown intent label {label:?}", case.say))?;
+                int_total += 1;
+                let got = crate::tower::parse_intent(&heard);
+                if got == want {
+                    int_ok += 1;
+                    format!("atc:{label} OK")
+                } else {
+                    format!("atc:WRONG got {got:?}")
+                }
+            }
         };
-        let mark = if case.tool.is_some() && !verdict.ends_with("OK") { "✗" } else { "✓" };
+        let judged = case.tool.is_some() || case.intent.is_some();
+        let mark = if judged && !verdict.ends_with("OK") { "✗" } else { "✓" };
         println!("{mark} {:<28} heard {:<30} wer {:.2}  {verdict}", quote(&case.say), quote(&heard), wer);
     }
 
@@ -99,6 +127,10 @@ pub fn run(model_path: &str, profile: &AircraftProfile, manifest: &str) -> Resul
     if cmd_total > 0 {
         let pct = 100.0 * cmd_ok as f64 / cmd_total as f64;
         print!(" · command accuracy {cmd_ok}/{cmd_total} ({pct:.1}%)");
+    }
+    if int_total > 0 {
+        let pct = 100.0 * int_ok as f64 / int_total as f64;
+        print!(" · ATC intent accuracy {int_ok}/{int_total} ({pct:.1}%)");
     }
     println!();
     Ok(())
@@ -144,16 +176,23 @@ fn word_error_rate(reference: &str, hypothesis: &str) -> f64 {
 }
 
 /// Synthesize `text` to 16 kHz mono via macOS `say`. A floor, not human speech.
+/// Retried: the speech daemon intermittently drops a request when called
+/// back-to-back over a long manifest.
 fn synth(text: &str) -> Result<Vec<f32>> {
     let aiff = std::env::temp_dir().join("x-copilot-stt-eval.aiff");
-    let status = Command::new("say")
-        .args(["-o", aiff.to_str().unwrap(), text])
-        .status()
-        .map_err(|e| anyhow!("spawning say: {e}"))?;
-    if !status.success() {
-        return Err(anyhow!("say failed for {text:?}"));
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        let status = Command::new("say")
+            .args(["-o", aiff.to_str().unwrap(), text])
+            .status()
+            .map_err(|e| anyhow!("spawning say: {e}"))?;
+        if status.success() {
+            return load_16k(&aiff);
+        }
     }
-    load_16k(&aiff)
+    Err(anyhow!("say failed for {text:?} (3 attempts)"))
 }
 
 /// Decode any `afconvert`-readable file to 16 kHz mono f32 (what whisper wants).

@@ -229,36 +229,13 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
                 }
             }
             Some("100") if in_airport => {
-                let f: Vec<&str> = f.collect(); // fields after the row code
-                if f.len() >= 19 {
-                    if let (Ok(lat_a), Ok(lon_a), Ok(lat_b), Ok(lon_b)) =
-                        (f[8].parse(), f[9].parse(), f[17].parse(), f[18].parse())
-                    {
-                        runways.push(Runway {
-                            ident_a: f[7].to_string(),
-                            ident_b: f[16].to_string(),
-                            lat_a,
-                            lon_a,
-                            lat_b,
-                            lon_b,
-                        });
-                    }
+                if let Some(r) = parse_runway_row(f) {
+                    runways.push(r);
                 }
             }
-            // Comm rows: `<code> <freq> <label...>`. Legacy codes store 10 kHz
-            // units (12210 = 122.10 MHz); 1050+ codes store kHz (118325).
             Some(code) if in_airport => {
-                if let Ok(c) = code.parse::<u32>() {
-                    if matches!(c, 50..=56 | 1050..=1056) {
-                        if let Some(raw) = f.next().and_then(|v| v.parse::<i64>().ok()) {
-                            let khz = if c >= 1000 { raw } else { raw * 10 };
-                            freqs.push(AtcFreq {
-                                kind: c % 1000,
-                                khz,
-                                name: f.collect::<Vec<_>>().join(" "),
-                            });
-                        }
-                    }
+                if let Some(fr) = parse_comm_row(code, f) {
+                    freqs.push(fr);
                 }
             }
             _ => {}
@@ -271,6 +248,105 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
         return Ok(None);
     }
     Ok(Some(AirportInfo { name, elev_ft, runways, freqs }))
+}
+
+/// A land-runway row (code 100): 8 header fields, then a 9-field block per
+/// end, ident/lat/lon leading each block. `fields` starts after the row code.
+fn parse_runway_row<'a>(fields: impl Iterator<Item = &'a str>) -> Option<Runway> {
+    let f: Vec<&str> = fields.collect();
+    if f.len() < 19 {
+        return None;
+    }
+    match (f[8].parse(), f[9].parse(), f[17].parse(), f[18].parse()) {
+        (Ok(lat_a), Ok(lon_a), Ok(lat_b), Ok(lon_b)) => Some(Runway {
+            ident_a: f[7].to_string(),
+            ident_b: f[16].to_string(),
+            lat_a,
+            lon_a,
+            lat_b,
+            lon_b,
+        }),
+        _ => None,
+    }
+}
+
+/// A comm row: `<code> <freq> <label...>`. Legacy codes (50-56) store 10 kHz
+/// units (12210 = 122.10 MHz); 1050+ codes store kHz (118325).
+fn parse_comm_row<'a>(code: &str, mut fields: impl Iterator<Item = &'a str>) -> Option<AtcFreq> {
+    let c: u32 = code.parse().ok()?;
+    if !matches!(c, 50..=56 | 1050..=1056) {
+        return None;
+    }
+    let raw: i64 = fields.next()?.parse().ok()?;
+    Some(AtcFreq {
+        kind: c % 1000,
+        khz: if c >= 1000 { raw } else { raw * 10 },
+        name: fields.collect::<Vec<_>>().join(" "),
+    })
+}
+
+/// Stream EVERY airport in apt.dat through `f` (icao, parsed info) — one pass
+/// over the ~400 MB file, the same row parsing as [`find_airport`]. Built for
+/// offline sweeps (the ATC cross-airport battle test), where a per-airport
+/// [`find_airport`] rescan would be quadratic.
+pub fn scan_airports(path: &str, mut f: impl FnMut(&str, AirportInfo)) -> Result<()> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {path}"))?;
+    let mut reader = BufReader::with_capacity(1 << 20, file);
+    let mut cur: Option<(String, AirportInfo)> = None;
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf).unwrap_or(0) == 0 {
+            break;
+        }
+        // Same cheap prefix filter as find_airport: only headers, runways and
+        // comm rows matter, and a String per line is unusable at 13M lines.
+        if !matches!(buf.first(), Some(b'1') | Some(b'5')) {
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else { continue };
+        let mut fields = line.split_whitespace();
+        match fields.next() {
+            Some("1") | Some("16") | Some("17") => {
+                if let Some((icao, apt)) = cur.take() {
+                    f(&icao, apt);
+                }
+                let elev: Option<f64> = fields.next().and_then(|e| e.parse().ok());
+                if let Some(icao) = fields.nth(2) {
+                    let icao = icao.to_string();
+                    let name = fields.collect::<Vec<_>>().join(" ");
+                    cur = Some((
+                        icao,
+                        AirportInfo {
+                            name,
+                            elev_ft: elev.unwrap_or(0.0),
+                            runways: Vec::new(),
+                            freqs: Vec::new(),
+                        },
+                    ));
+                }
+            }
+            Some("100") => {
+                if let Some((_, apt)) = cur.as_mut() {
+                    if let Some(r) = parse_runway_row(fields) {
+                        apt.runways.push(r);
+                    }
+                }
+            }
+            Some(code) => {
+                if let Some((_, apt)) = cur.as_mut() {
+                    if let Some(fr) = parse_comm_row(code, fields) {
+                        apt.freqs.push(fr);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((icao, apt)) = cur.take() {
+        f(&icao, apt);
+    }
+    Ok(())
 }
 
 /// Pick the runway end best aligned into the wind. Returns the end's ident,

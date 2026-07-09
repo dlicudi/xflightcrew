@@ -81,6 +81,19 @@ sim and returns text — it can never actuate. Frequencies come from apt.dat
 comm rows (parsed in [src/nav.rs](src/nav.rs)), not hardcoding; config via
 `XCOPILOT_ATC_AIRPORT` (default LXGB), `XCOPILOT_ATC_VOICE`, `XCOPILOT_ATC_RATE`.
 
+Battle-test surface (all deterministic, in `cargo test` unless noted): the
+state-by-intent matrix test in [src/tower.rs](src/tower.rs); the adversarial
+transcript corpus [bench/atc_corpus.yaml](bench/atc_corpus.yaml) (real whisper
+output mined from flight logs — add every new wart here); scripted sortie
+dialogues over the pure routing layer (`route_keyed`/`route_unkeyed`) in
+[src/station.rs](src/station.rs); the spoken-call eval judged on intent
+accuracy (`cargo run -- stt-eval bench/atc_stt_cases.yaml`); the cross-airport
+world sweep (`cargo test --release -- --ignored atc_world_sweep`, needs the
+sim's apt.dat); and the in-sim soak checklist
+[docs/atc-chaos-card.md](docs/atc-chaos-card.md). Every routing decision is
+blackboxed as a `"kind":"atc"` event — mine `logs/blackbox.jsonl` after each
+flight. Safety property: a mishear may earn "say again", never a clearance.
+
 History: ATC started as a separate binary ([src/bin/atc.rs](src/bin/atc.rs),
 still buildable — tower + ATIS glue around the same lib modules) on the "the
 world is a different process" theory. Flying it proved the split premature:

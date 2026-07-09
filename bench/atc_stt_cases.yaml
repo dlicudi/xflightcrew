@@ -1,0 +1,43 @@
+# Spoken radio calls, end to end: say-synthesized (or real recordings via
+# `audio:`) -> whisper with the tower's STT prompt -> tower::parse_intent.
+# The metric that matters is intent accuracy, not WER: a mangled transcript
+# that still reaches the right clearance is a pass.
+#
+#   cargo run -- stt-eval bench/atc_stt_cases.yaml
+#
+# Synthesized speech is a floor, not cockpit audio (see src/stt_eval.rs) —
+# drop real PTT recordings into `audio:` for numbers that mean something.
+
+# Departures
+- {say: "Gibraltar tower, November one seven two Sierra Papa, request taxi", intent: request_taxi}
+- {say: "request clearance for taxi", intent: request_taxi}
+- {say: "request taxi to holding point alpha", intent: request_taxi}
+- {say: "holding point alpha, ready for departure", intent: request_takeoff}
+- {say: "Gibraltar tower, ready for departure runway two seven", intent: request_takeoff}
+- {say: "request takeoff", intent: request_takeoff}
+- {say: "request departure clearance", intent: request_clearance}
+
+# Arrivals
+- {say: "Gibraltar tower, November one seven two Sierra Papa, inbound for landing", intent: request_landing}
+- {say: "requesting permission to land", intent: request_landing}
+- {say: "request touch and go", intent: request_touch_and_go}
+- {say: "November one seven two Sierra Papa, final", intent: report_final}
+- {say: "short final runway two seven", intent: report_final}
+- {say: "request vectors for the approach", intent: request_vectors}
+- {say: "request taxi to parking", intent: request_taxi_in}
+- {say: "we have landed", intent: request_taxi_in}
+
+# Reports and checks
+- {say: "Gibraltar tower, radio check", intent: radio_check}
+- {say: "Gibraltar tower, do you copy", intent: radio_check}
+- {say: "say wind", intent: wind_check}
+- {say: "wind check", intent: wind_check}
+- {say: "what is my squawk", intent: squawk_check}
+- {say: "confirm transponder code", intent: squawk_check}
+
+# Crew talk that must NOT parse as a call, even through whisper's ear
+- {say: "landing gear down", intent: unknown}
+- {say: "landing light on", intent: unknown}
+- {say: "takeoff checklist", intent: unknown}
+- {say: "what runway shall I take off from", intent: unknown}
+- {say: "should we request takeoff now", intent: unknown}

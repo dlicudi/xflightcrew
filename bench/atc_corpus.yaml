@@ -1,0 +1,215 @@
+# The ATC battle-test corpus: what pilots actually said, what whisper actually
+# wrote, and the near-misses that must never earn a clearance.
+#
+# Sources: real transmissions mined from logs/x-copilot.log.* (2026-06/07
+# flights, kept verbatim including whisper's mangling), plus hand-written
+# paraphrases and corruptions in whisper's real failure modes (homophones,
+# dropped words, merged words). Run by `transcript_corpus_parses_safely` in
+# src/station.rs on every `cargo test`.
+#
+# Fields per case:
+#   text      what whisper handed the router (case-insensitive)
+#   intent    expected tower::parse_intent, by label (see tower::intent_from_label)
+#   radio     expected station::is_radio_call for UNKEYED routing (optional).
+#             false means the utterance falls through to the copilot untouched;
+#             it can still reach the tower when the radio PTT is keyed.
+#   readback  expected tower::is_readback (optional)
+#
+# The safety property throughout: a mishear may degrade to "say again"
+# (intent: unknown), but must never degrade INTO a clearance-earning intent.
+
+# --- Taxi requests: real calls -----------------------------------------------
+- {text: "Gibraltar Tower, November 172SP, request taxi", intent: request_taxi, radio: true}
+- {text: "Request clearance for taxi.", intent: request_taxi, radio: true}
+- {text: "Requesting clearance for taxi.", intent: request_taxi, radio: true}
+- {text: "You request clearance for taxi.", intent: request_taxi, radio: true}
+- {text: "Am I clear to taxi?", intent: request_taxi, radio: false}
+- {text: "I am now taxiing.", intent: request_taxi, radio: false}
+
+# --- Taxi requests: paraphrases and mangles ----------------------------------
+- {text: "gibraltar power, request taxi", intent: request_taxi, radio: true}
+- {text: "give router tower, request taxi", intent: request_taxi, radio: true}
+- {text: "request taxi to holding point alpha", intent: request_taxi, radio: true}
+- {text: "brakes set, ready to taxi", intent: request_taxi, radio: false}
+- {text: "tower, november one seven two, taxi for departure", intent: request_taxi, radio: true}
+- {text: "request taxes", intent: unknown, radio: true}
+- {text: "gibraltar tower, request tax you", intent: unknown, radio: true}
+
+# --- Takeoff requests: real calls --------------------------------------------
+- {text: "Request clearance for takeoff.", intent: request_takeoff, radio: true}
+- {text: "requesting clearance for takeoff.", intent: request_takeoff, radio: true}
+- {text: "Let's get request for clearance for takeoff.", intent: request_takeoff, radio: true}
+- {text: "Keep out the tower, requesting clearance for takeoff.", intent: request_takeoff, radio: true}
+- {text: "Number 2, requesting clearance or takeoff.", intent: request_takeoff, radio: true}
+- {text: "Requesting clearance or takeoff?", intent: request_takeoff, radio: true}
+- {text: "Hello tower, I would like clearance for takeoff.", intent: request_takeoff, radio: true}
+- {text: "Chipotle tower and I'm ready for takeoff.", intent: request_takeoff, radio: true}
+- {text: "Ready for departure.", intent: request_takeoff, radio: true}
+- {text: "Ready for departure?", intent: request_takeoff, radio: true}
+- {text: "for takeoff.", intent: request_takeoff, radio: false}
+- {text: "holding point taxi complete, ready for departure", intent: request_takeoff, radio: true}
+
+# --- Takeoff requests: paraphrases and mangles -------------------------------
+- {text: "requesting the clarence for takeoff", intent: request_takeoff, radio: true}
+- {text: "clarence for takeoff", intent: request_takeoff, radio: false}
+- {text: "finally ready for departure", intent: request_takeoff, radio: true}
+- {text: "ready for the parcher", intent: unknown, radio: false}
+- {text: "tower, one seven two sierra papa, holding short, request takeoff", intent: request_takeoff, radio: true}
+
+# --- Departure clearance (the zone clearance, not taxi/takeoff) --------------
+- {text: "This is N100WA requesting flight clearance.", intent: request_clearance, radio: true}
+- {text: "Requesting clearance.", intent: request_clearance, radio: true}
+- {text: "request departure clearance", intent: request_clearance, radio: true}
+- {text: "Do we have clearance?", intent: request_clearance, radio: false}
+
+# --- Landing and arrival calls: real -----------------------------------------
+- {text: "requesting permission to land.", intent: request_landing, radio: true}
+- {text: "requesting clearance for landing.", intent: request_landing, radio: true}
+- {text: "Request and clearance for landing.", intent: request_landing, radio: true}
+- {text: "Request clearance for landing.", intent: request_landing, radio: true}
+- {text: "Gevolta tower requesting clearance for landing.", intent: request_landing, radio: true}
+- {text: "Gebolto tower, request impact please for landing.", intent: request_landing, radio: true}
+- {text: "Tupil to tower, requesting clearance for landing.", intent: request_landing, radio: true}
+- {text: "And they're requesting, um, clearance for landing.", intent: request_landing, radio: true}
+- {text: "inbound for landing", intent: request_landing, radio: true}
+- {text: "I've just landed.", intent: request_taxi_in, radio: false}
+
+# --- Landing and arrival: paraphrases and mangles ----------------------------
+- {text: "gibraltar tower, november one seven two, inbound with information alpha", intent: request_landing, radio: true}
+- {text: "in bound for landing", intent: request_landing, radio: false}
+- {text: "full stop landing please", intent: request_landing, radio: false}
+- {text: "we have landed", intent: request_taxi_in, radio: false}
+- {text: "request touch and go", intent: request_touch_and_go, radio: true}
+- {text: "tower, touch and go", intent: request_touch_and_go, radio: true}
+- {text: "touch and go please", intent: request_touch_and_go, radio: false}
+- {text: "request taxi to parking", intent: request_taxi_in, radio: true}
+- {text: "taxi to the ramp", intent: request_taxi_in, radio: false}
+- {text: "taxi to the gate", intent: request_taxi_in, radio: false}
+- {text: "request taxi to the apron", intent: request_taxi_in, radio: true}
+
+# --- Final reports ------------------------------------------------------------
+- {text: "november one seven two, final", intent: report_final, radio: true}
+- {text: "turning final", intent: report_final, radio: true}
+- {text: "short final runway two seven", intent: report_final, radio: true}
+- {text: "final for the touch and go", intent: report_final, radio: true}
+- {text: "on final", intent: report_final, radio: true}
+
+# --- Radio checks: real (including every mangled station name) ---------------
+- {text: "radio check", intent: radio_check, radio: true}
+- {text: "Gibraltar Tower, requesting radio check.", intent: radio_check, radio: true}
+- {text: "Chipotle tower, radio check.", intent: radio_check, radio: true}
+- {text: "Je brought to tower, radio check.", intent: radio_check, radio: true}
+- {text: "To tower, radio check.", intent: radio_check, radio: true}
+- {text: "how do you read", intent: radio_check, radio: false}
+- {text: "Malaga Tower, do you hear me?", intent: radio_check, radio: true}
+- {text: "Chipotle tower, are you there?", intent: radio_check, radio: true}
+- {text: "Chief Walter Tower, are you there?", intent: radio_check, radio: true}
+- {text: "Hello Cadiz, do you copy?", intent: radio_check, radio: false}
+- {text: "Do you copy?", intent: radio_check, radio: false}
+- {text: "ATC, are you there?", intent: radio_check, radio: false}
+- {text: "She protested Howard, do you hear me?", intent: radio_check, radio: false}
+
+# --- Wind, QNH, squawk questions ----------------------------------------------
+- {text: "say wind", intent: wind_check}
+- {text: "wind check", intent: wind_check}
+- {text: "what's the wind", intent: wind_check}
+- {text: "how's the wind looking", intent: wind_check}
+- {text: "say qnh", intent: wind_check}
+- {text: "what's the qnh", intent: wind_check}
+- {text: "What about my transponder code?", intent: squawk_check}
+- {text: "what's my squawk", intent: squawk_check}
+- {text: "say squawk", intent: squawk_check}
+- {text: "Transponder code.", intent: squawk_check}
+- {text: "confirm squawk seven thousand", intent: squawk_check}
+- {text: "What transpond the code?", intent: unknown}
+
+# --- Vectors -------------------------------------------------------------------
+- {text: "Request vectors for approach.", intent: request_vectors, radio: true}
+- {text: "requesting vectors for approach.", intent: request_vectors, radio: true}
+- {text: "Request vectors for arrival.", intent: request_vectors, radio: true}
+- {text: "request vectors to final", intent: request_vectors, radio: true}
+
+# --- Readbacks: silence, never "say again" ------------------------------------
+- {text: "Descending to one thousand five hundred feet.", intent: unknown, readback: true}
+- {text: "climbing to two thousand", intent: unknown, readback: true}
+- {text: "maintaining two thousand feet", intent: unknown, readback: true}
+- {text: "heading three four zero, one seven two sierra papa", intent: unknown, readback: true}
+- {text: "roger, wilco", intent: unknown, readback: true}
+- {text: "wilco", intent: unknown, readback: true}
+- {text: "squawk seven zero zero zero", intent: unknown, readback: true}
+- {text: "squawking seven thousand", intent: unknown, readback: true}
+- {text: "with you passing one thousand five hundred", intent: unknown, readback: true}
+- {text: "Headace, do copy.", intent: unknown, readback: true}
+- {text: "roger, holding point alpha", intent: unknown, readback: true}
+# Clearance echoes parse as their intents but route_keyed silences any
+# transmission containing "cleared" (see the sortie test) — a pilot asking
+# says "request clearance", never "cleared".
+- {text: "cleared to land runway two seven, november one seven two", intent: request_landing, readback: true}
+- {text: "cleared for takeoff runway two seven", intent: request_takeoff, readback: true}
+- {text: "cleared touch and go, one seven two sierra papa", intent: request_touch_and_go, readback: true}
+
+# --- Questions: crew talk, never transmissions --------------------------------
+- {text: "What runway shall I take off from?", intent: unknown}
+- {text: "What runway?", intent: unknown}
+- {text: "should we request takeoff now", intent: unknown, radio: true}
+- {text: "can we land at gibraltar", intent: unknown, radio: true}
+- {text: "can you request taxi for me", intent: unknown, radio: true}
+- {text: "when do we turn final", intent: unknown}
+- {text: "what is our final approach speed", intent: unknown}
+- {text: "why is the tower not answering", intent: unknown, radio: true}
+- {text: "how high are we", intent: unknown, radio: false}
+
+# --- Cockpit commands that contain radio words: must fall through -------------
+- {text: "taxi light on", intent: unknown, radio: false}
+- {text: "landing light on", intent: unknown, radio: false}
+- {text: "landing gear down", intent: unknown, radio: false}
+- {text: "gear down for landing", intent: unknown, radio: false}
+- {text: "flaps set for landing", intent: unknown, radio: false}
+- {text: "landing light off and taxi light on", intent: unknown, radio: false}
+- {text: "release the taxi hold", intent: unknown, radio: false}
+- {text: "engage the taxi hold at ten knots", intent: unknown, radio: false}
+- {text: "takeoff checklist", intent: unknown, radio: false}
+- {text: "after landing checklist", intent: unknown, radio: false}
+- {text: "before takeoff checklist complete", intent: unknown, radio: false}
+# These two still parse as intents (they ARE clearance words) — the unkeyed
+# radio gate is what keeps them away from the tower. Keyed, they'd route:
+# that's the documented cost of keying the transmit button.
+- {text: "land the aircraft", intent: request_landing, radio: false}
+- {text: "set flaps for takeoff", intent: request_takeoff, radio: false}
+- {text: "anything else we need to do before takeoff", intent: request_takeoff, radio: false}
+
+# --- Garble, dead air, and things nobody can route -----------------------------
+- {text: "Hello, hello, hello.", intent: unknown, radio: false}
+- {text: "Hello, here is Stella from Terra.", intent: unknown, radio: false}
+- {text: "Good morning, Tower.", intent: unknown, radio: true}
+- {text: "Hello tower.", intent: unknown, radio: true}
+- {text: "The Gibraltar tower, weather.", intent: unknown, radio: true}
+- {text: "Weather reports.", intent: unknown, radio: false}
+- {text: "On my flight plan.", intent: unknown, radio: false}
+- {text: "Okay. The question is like following.", intent: unknown, radio: false}
+- {text: "uhh gibraltar something something", intent: unknown, radio: true, readback: false}
+- {text: "Radio calls to the tower.", intent: unknown, radio: true}
+
+# --- Unsupported-but-real requests: "say again" is the right answer (today) ---
+# Flight following came up four times across the 2026-07 flights; downwind and
+# go-around reports will matter once the pattern intents exist. Documented so
+# adding them is a deliberate corpus edit, not a drift.
+- {text: "request flight following", intent: unknown, radio: true, readback: false}
+- {text: "requesting flight following.", intent: unknown, radio: true}
+- {text: "Jabal top tower request flight following.", intent: unknown, radio: true}
+- {text: "Request following, cable to tower.", intent: unknown, radio: true}
+- {text: "november one seven two, downwind", intent: unknown, radio: false}
+- {text: "going around", intent: unknown, radio: false}
+
+# --- Cockpit commands spoken with the radio PTT keyed (real mistakes) ---------
+- {text: "set power to 90.", intent: unknown, radio: false}
+- {text: "Set power to ninety percent.", intent: unknown, radio: false}
+- {text: "Set power to 80%.", intent: unknown, radio: false}
+- {text: "flaps ten", intent: unknown, radio: false}
+
+# --- Whisper misses caught by the spoken eval (bench/atc_stt_cases.yaml) ------
+- {text: "request option go.", intent: request_touch_and_go, radio: true}
+- {text: "request the option", intent: request_touch_and_go, radio: true}
+- {text: "win check.", intent: wind_check}
+- {text: "Request vectors for taxi to parking.", intent: request_taxi_in, radio: true}
+- {text: "I've landed here.", intent: request_taxi_in, radio: false}
