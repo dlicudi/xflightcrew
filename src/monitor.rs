@@ -1429,6 +1429,9 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
     // Gyro auto-sync cooldown (drift resets to ~0 on sync, so this only guards
     // against a sim-side write failing silently and re-triggering every tick).
     let mut gyro_sync_last: Option<Instant> = None;
+    // Runway-incursion shout cadence: it repeats while the conflict persists
+    // (a safety shout may nag), but not every tick.
+    let mut incursion_last: Option<Instant> = None;
 
     loop {
         // Aircraft switched → rebuild the checks for the new airframe.
@@ -1521,6 +1524,69 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
                 || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
             if !quiet {
+                // One COM1 read serves the incursion shout, the ATIS loop and
+                // the traffic advisories below.
+                let com1: Option<i64> = xp
+                    .get_float(crate::datarefs::COM1_FREQ_KHZ)
+                    .await
+                    .ok()
+                    .map(|v| v.round() as i64);
+                // Runway incursion: sitting (or slow-taxiing) ON a runway with
+                // live traffic low and inside 3 nm — the one conflict geometry
+                // where seconds matter. Repeats every 15 s while it persists;
+                // escalates inside 1.5 nm. The tower shouts when the pilot is
+                // on its frequency, the copilot calls it as crew otherwise —
+                // a safety net must not depend on the radio being tuned.
+                // Rolling above ~30 kt is a departing aircraft, not an
+                // incursion. LiveTraffic / AI aircraft feed the TCAS picture.
+                if snap.on_ground && snap.groundspeed_kts < 30.0 {
+                    if let Some(rwy) = crate::station::on_active_runway(snap.lat, snap.lon) {
+                        let due = incursion_last
+                            .is_none_or(|t| now.duration_since(t).as_secs() >= 15);
+                        if due {
+                            if let Some(nm) = crate::station::inbound_traffic_close(&xp).await {
+                                incursion_last = Some(now);
+                                let urgent = nm < 1.5;
+                                crate::blackbox::record(
+                                    "runway_incursion",
+                                    serde_json::json!({ "runway": &rwy, "traffic_nm": r1(nm) }),
+                                );
+                                let tower_has_us = com1
+                                    .and_then(crate::station::tuned_controller)
+                                    .is_some();
+                                if tower_has_us {
+                                    let line = if urgent {
+                                        "Traffic on short final — exit the runway immediately.".to_string()
+                                    } else {
+                                        format!(
+                                            "Traffic on {nm:.0} mile final — exit the runway, expedite."
+                                        )
+                                    };
+                                    if let Some(s) = status.as_ref() {
+                                        s.action(&format!("TWR: {line}"));
+                                    }
+                                    voice.alert_station(
+                                        Priority::Warning,
+                                        crate::voice::StationSpeaker::Tower,
+                                        line,
+                                    );
+                                } else {
+                                    let line = if urgent {
+                                        "Traffic short final and we're on the runway — clear the runway NOW.".to_string()
+                                    } else {
+                                        format!(
+                                            "Traffic on {nm:.0} mile final and we're still on the runway — expedite."
+                                        )
+                                    };
+                                    if let Some(s) = status.as_ref() {
+                                        s.alert(AlertLevel::Warning, &line);
+                                    }
+                                    voice.alert(Priority::Warning, line);
+                                }
+                            }
+                        }
+                    }
+                }
                 // Gyro auto-sync: a drifted DG gets re-aligned by the copilot's
                 // own hand, then announced — not a "recommend syncing" nag
                 // (pilot feedback, 2026-07-09). Airborne only (on the ground
@@ -1543,19 +1609,12 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                         voice.alert(Priority::Advisory, line);
                     }
                 }
-                // One COM1 read serves the ATIS loop and the traffic
-                // advisories below.
-                let com1: Option<i64> = xp
-                    .get_float(crate::datarefs::COM1_FREQ_KHZ)
-                    .await
-                    .ok()
-                    .map(|v| v.round() as i64);
                 // The ATIS loop: while COM1 sits on the ATIS frequency the
                 // broadcast repeats, cutting a new information letter when the
-                // weather genuinely moves. Cheap gate first, so flights tuned
-                // anywhere else pay nothing extra.
+                // weather genuinely moves. Cheap gate first — tuned AND due —
+                // so the weather set is read once per broadcast, not per tick.
                 if let Some(com1) = com1 {
-                    if crate::station::atis_tuned(com1) {
+                    if crate::station::atis_due(com1, std::time::Instant::now()) {
                         let wx = crate::station::AtisWx {
                             zulu_sec: xp.get_float(crate::datarefs::ZULU_TIME_SEC).await.unwrap_or(0.0),
                             wind_from_deg: xp

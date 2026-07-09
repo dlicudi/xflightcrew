@@ -148,6 +148,7 @@ impl Station {
             freqs.push((k, StationSpeaker::Departure));
         }
         *CONTROLLER_FREQS.lock().unwrap_or_else(|e| e.into_inner()) = freqs;
+        *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = self.apt.runways.clone();
         *ATIS.lock().unwrap_or_else(|e| e.into_inner()) =
             self.apt.freq(nav::FREQ_ATIS).map(|f| {
                 tracing::info!(mhz = f.khz as f64 / 1000.0, "ATIS broadcasting on frequency");
@@ -723,13 +724,20 @@ pub struct AtisWx {
     pub oat_c: f64,
 }
 
-/// True when an ATIS exists and COM1 is on it — the monitor's cheap gate
-/// before reading the full weather set.
-pub fn atis_tuned(com1_khz: i64) -> bool {
-    ATIS.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|a| (com1_khz - a.khz).abs() <= 5)
+/// The monitor's cheap gate: true when an ATIS exists, COM1 is on it, AND a
+/// broadcast is due — only then is the full weather set worth reading (six
+/// REST GETs; reading them every tick while parked on the frequency was
+/// measurable main-thread load on the sim). Off frequency it also rewinds the
+/// loop so a retune starts the broadcast from the top.
+pub fn atis_due(com1_khz: i64, now: Instant) -> bool {
+    let mut guard = ATIS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(st) = guard.as_mut() else { return false };
+    if (com1_khz - st.khz).abs() > 5 {
+        st.last_spoken = None;
+        return false;
+    }
+    st.last_spoken
+        .is_none_or(|t| now.duration_since(t).as_secs_f64() >= ATIS_REPEAT_SECS)
 }
 
 /// One tick of the ATIS broadcast: the full report when tuned and due (first
@@ -905,6 +913,62 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
 /// The active station's controller frequencies (kHz → speaking position),
 /// published by [`Station::install`] for the monitor's traffic advisories.
 static CONTROLLER_FREQS: Mutex<Vec<(i64, StationSpeaker)>> = Mutex::new(Vec::new());
+
+/// The active field's runway geometry, published by [`Station::install`] for
+/// the runway-incursion watch.
+static ACTIVE_RUNWAYS: Mutex<Vec<nav::Runway>> = Mutex::new(Vec::new());
+
+/// Lateral capture around a runway centerline. apt.dat 100-rows carry a width
+/// we don't parse yet; 40 m covers everything up to a wide-body runway
+/// (60 m ÷ 2 + slack) without capturing a parallel taxiway.
+const RUNWAY_HALF_WIDTH_M: f64 = 40.0;
+
+/// Is this position ON one of the active field's runways? Point-to-segment in
+/// a local flat-earth projection (exact enough over a 3 km runway). Returns
+/// the spoken ident of the nearer end, for the blackbox and the call.
+pub fn on_active_runway(lat: f64, lon: f64) -> Option<String> {
+    let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let m_per_deg_lat = 111_320.0;
+    let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
+    for r in runways.iter() {
+        let (px, py) = ((lon - r.lon_a) * m_per_deg_lon, (lat - r.lat_a) * m_per_deg_lat);
+        let (bx, by) = ((r.lon_b - r.lon_a) * m_per_deg_lon, (r.lat_b - r.lat_a) * m_per_deg_lat);
+        let len2 = bx * bx + by * by;
+        if len2 < 1.0 {
+            continue; // degenerate row
+        }
+        let t = (px * bx + py * by) / len2;
+        let cross_m = (px * by - py * bx).abs() / len2.sqrt();
+        // Slightly past the thresholds still counts (displaced/overrun).
+        if (-0.02..=1.02).contains(&t) && cross_m <= RUNWAY_HALF_WIDTH_M {
+            let ident = if t < 0.5 { &r.ident_a } else { &r.ident_b };
+            return Some(ident.clone());
+        }
+    }
+    None
+}
+
+/// The nearest airborne traffic that could be landing on top of us: a TCAS
+/// target inside 3 nm, LOW (15-450 m above own ship — an arrival on a 2-mile
+/// final is ~100 m up; ground traffic and overflying cruisers are excluded).
+/// Returns its range in nm. Same picture the advisories read; any source that
+/// feeds the TCAS arrays works (LiveTraffic's real-world feed, AI aircraft).
+pub async fn inbound_traffic_close(xp: &XPlaneClient) -> Option<f64> {
+    let dist = xp
+        .get_float_array("sim/cockpit2/tcas/indicators/relative_distance_mtrs")
+        .await
+        .ok()?;
+    let alt = xp
+        .get_float_array("sim/cockpit2/tcas/indicators/relative_altitude_mtrs")
+        .await
+        .ok()?;
+    dist.iter()
+        .zip(&alt)
+        .skip(1) // slot 0 is own ship
+        .filter(|(d, a)| **d > 1.0 && **d < 3.0 * 1852.0 && (15.0..450.0).contains(*a))
+        .map(|(d, _)| d / 1852.0)
+        .min_by(|x, y| x.total_cmp(y))
+}
 
 /// Which controller COM1 is on, if any — the voice that narrates traffic.
 pub fn tuned_controller(com1_khz: i64) -> Option<StationSpeaker> {
@@ -1430,6 +1494,31 @@ mod tests {
         *ACTIVE_FIELD.lock().unwrap() = None;
         *PENDING_STATION.lock().unwrap() = None;
         *LAST_REGION_SWITCH.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn runway_occupancy_is_a_tight_rectangle() {
+        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // LXGB 09/27, real-ish geometry: ~1.7 km east-west at 36.151N.
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+            ident_a: "09".into(),
+            ident_b: "27".into(),
+            lat_a: 36.1512,
+            lon_a: -5.3554,
+            lat_b: 36.1517,
+            lon_b: -5.3366,
+        }];
+        // On the centerline past midfield: on the runway, named by the nearer end.
+        assert_eq!(on_active_runway(36.15155, -5.342).as_deref(), Some("27"));
+        // Near the 09 threshold: still on, named 09.
+        assert_eq!(on_active_runway(36.1512, -5.3550).as_deref(), Some("09"));
+        // 100 m abeam the centerline (a parallel taxiway): NOT on the runway.
+        assert!(on_active_runway(36.1503, -5.346).is_none());
+        // A mile away at the parking: no.
+        assert!(on_active_runway(36.16, -5.35).is_none());
+        // Past the far threshold by more than the overrun margin: no.
+        assert!(on_active_runway(36.152, -5.330).is_none());
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     }
 
     #[test]
