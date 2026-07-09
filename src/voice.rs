@@ -48,6 +48,17 @@ pub enum Priority {
     Warning,
 }
 
+/// A stable per-airport voice seed (FNV-1a over the name), never 0 — seed 0
+/// is reserved for the configured home field's curated voices.
+pub fn station_voice_seed(airport_name: &str) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in airport_name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    ((h as usize) | 1).max(1)
+}
+
 /// One-shot latch a blocking caller waits on until its utterance is spoken.
 struct Latch {
     spoken: Mutex<bool>,
@@ -66,9 +77,26 @@ pub enum StationSpeaker {
 }
 
 impl StationSpeaker {
-    /// The configured Piper model for this position. Approach/departure fall
-    /// back to the tower's voice when unset, never to silence.
-    fn model<'a>(self, config: &'a Config) -> &'a str {
+    /// The Piper model for this position. Seed 0 (the configured home field)
+    /// uses the curated per-position voices; any other seed draws a stable
+    /// per-airport crew from `atc_voice_pool`, offset per position so the
+    /// controllers at one field are distinct people. An empty pool always
+    /// falls back to the curated voices.
+    fn model(self, config: &Config, seed: usize) -> String {
+        if seed != 0 {
+            let pool: Vec<&str> = config
+                .atc_voice_pool
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .collect();
+            if !pool.is_empty() {
+                // Per-position step sized so all four slots land on distinct
+                // entries whenever the pool has at least four voices.
+                let step = (pool.len() / 4).max(1);
+                return pool[(seed + self.slot() * step) % pool.len()].to_string();
+            }
+        }
         let fallback = config.atc_piper_voice.as_str();
         match self {
             StationSpeaker::Tower => fallback,
@@ -85,6 +113,7 @@ impl StationSpeaker {
                 if v.is_empty() { fallback } else { v }
             }
         }
+        .to_string()
     }
     fn slot(self) -> usize {
         match self {
@@ -159,6 +188,12 @@ struct Inner {
     queue: Mutex<Queue>,
     /// Signalled when work is queued (or on shutdown) to wake the speaker.
     cv: Condvar,
+    /// Voice seed for the ACTIVE airport's controllers: 0 = the configured
+    /// per-position voices (the curated home field); anything else indexes the
+    /// voice pool per position, so each airport gets its own stable crew of
+    /// controllers ("we need a different voice for Ciudad Real", 2026-07-09).
+    /// Changing it drops the warm station sessions on the next utterance.
+    station_seed: std::sync::atomic::AtomicUsize,
     /// What the copilot has spoken recently, with when it finished. The listener
     /// checks heard transcripts against this to reject its own voice coming back
     /// over the speakers (echo) rather than acting on it.
@@ -184,6 +219,7 @@ impl Voice {
                 shutdown: false,
             }),
             cv: Condvar::new(),
+            station_seed: std::sync::atomic::AtomicUsize::new(0),
             spoken: Mutex::new(Vec::new()),
         });
         let gate = MicGate::new();
@@ -194,6 +230,16 @@ impl Voice {
             .spawn(move || speaker_loop(&speaker, config, speaker_gate))
             .expect("spawn voice speaker thread");
         Voice { inner, gate }
+    }
+
+    /// Set the station voice seed for the active airport: 0 = the configured
+    /// per-position voices (the curated home field); any other value picks a
+    /// stable per-airport crew from the voice pool. The warm sessions rebuild
+    /// on the next station utterance.
+    pub fn set_station_seed(&self, seed: usize) {
+        self.inner
+            .station_seed
+            .store(seed, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The mic gate this arbiter raises while speaking — hand it to the listener
@@ -505,8 +551,11 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
     let negative_path = resolve_negative(&config.negative_tone_path);
     let station_cfg = config.clone();
     // One lazy warm voice per controller position (tower/approach/departure):
-    // a position that never speaks never loads its model.
+    // a position that never speaks never loads its model. The seed names the
+    // active airport's crew; when it changes (a region switch), the warm
+    // sessions drop and the next utterance builds the new field's voices.
     let mut stations: [Option<StationVoice>; 4] = [None, None, None, None];
+    let mut stations_seed: usize = 0;
     let mut speaker = Speaker::build(config);
     loop {
         let mut q = inner.queue.lock().unwrap();
@@ -566,10 +615,19 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         // first station utterance panicked, the main loop hung unkillable, and
         // the backtrace sprayed over the raw-mode TUI). A panicking station
         // voice is demoted to the `say` fallback for the rest of the session.
+        let seed = inner
+            .station_seed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if utt.station.is_some() && seed != stations_seed {
+            stations = [None, None, None, None];
+            stations_seed = seed;
+        }
         let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(who) = utt.station {
                 stations[who.slot()]
-                    .get_or_insert_with(|| StationVoice::build(&station_cfg, who.model(&station_cfg)))
+                    .get_or_insert_with(|| {
+                        StationVoice::build(&station_cfg, &who.model(&station_cfg, seed))
+                    })
                     .speak(&utt.text)
             } else {
                 speaker.speak(&utt.text)
@@ -660,6 +718,41 @@ mod tests {
 
     fn utt(priority: Priority, seq: u64) -> Utterance {
         Utterance { priority, seq, text: String::new(), chime: false, negative: false, station: None, done: None }
+    }
+
+    #[test]
+    fn airport_voice_crews_are_stable_distinct_and_never_home() {
+        // Stable per name, never 0 (0 = the home field's curated voices).
+        assert_eq!(station_voice_seed("Ciudad Real"), station_voice_seed("Ciudad Real"));
+        assert_ne!(station_voice_seed("Ciudad Real"), 0);
+        assert_ne!(station_voice_seed("Ciudad Real"), station_voice_seed("Malaga"));
+        // With a pool, a seeded airport picks from it — and the four positions
+        // land on distinct voices when the pool has at least four entries.
+        let cfg = Config {
+            atc_piper_voice: "tower.onnx".into(),
+            atc_voice_pool: "a.onnx, b.onnx, c.onnx, d.onnx, e.onnx, f.onnx, g.onnx, h.onnx"
+                .into(),
+            ..Config::default()
+        };
+        let seed = station_voice_seed("Ciudad Real");
+        let crew: Vec<String> = [
+            StationSpeaker::Tower,
+            StationSpeaker::Approach,
+            StationSpeaker::Departure,
+            StationSpeaker::Atis,
+        ]
+        .iter()
+        .map(|s| s.model(&cfg, seed))
+        .collect();
+        let mut unique = crew.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 4, "positions must be distinct people: {crew:?}");
+        // Seed 0 = the curated home voices, pool or not.
+        assert_eq!(StationSpeaker::Tower.model(&cfg, 0), "tower.onnx");
+        // No pool → curated voices even for a seeded airport.
+        let bare = Config { atc_piper_voice: "tower.onnx".into(), ..Config::default() };
+        assert_eq!(StationSpeaker::Tower.model(&bare, seed), "tower.onnx");
     }
 
     #[test]

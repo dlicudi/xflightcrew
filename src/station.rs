@@ -127,6 +127,12 @@ impl Station {
         })
     }
 
+    /// The active field's spoken name ("Gibraltar") — the per-airport voice
+    /// seed and the home-field check key off it.
+    pub fn airport_name(&self) -> &str {
+        &self.apt.name
+    }
+
     /// Publish this station's process-wide side state — the ATIS broadcast
     /// and the enroute switch identity the monitor's ticks read. Called by
     /// the OWNER once a station goes live (startup and each region handoff),

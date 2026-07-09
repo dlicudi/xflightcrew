@@ -743,9 +743,14 @@ async fn run_session(
         station::Station::load(&config.apt_data_path, &config.atc_airport.trim().to_uppercase())
     };
     // Publish the live station's side state (ATIS broadcast, enroute switch
-    // identity) for the monitor's ticks.
+    // identity) for the monitor's ticks. The startup airport is the HOME
+    // field: its controllers keep the curated per-position voices (seed 0);
+    // every other field the region hands us to gets its own crew from the
+    // voice pool.
+    let home_airport_name = atc_station.as_ref().map(|s| s.airport_name().to_string());
     if let Some(st) = &atc_station {
         st.install();
+        voice.set_station_seed(0);
     }
     // Enroute region: index every towered field (a full apt.dat pass, so a
     // background thread) so the flight can outgrow its departure airport —
@@ -853,6 +858,14 @@ async fn run_session(
                 Some(st) => {
                     reporter.log(ui::LogKind::Info, format!("ATC region: now working {name}"));
                     st.install();
+                    // A new field, a new crew: per-airport voices from the
+                    // pool — unless we're back home, where the curated
+                    // voices belong.
+                    voice.set_station_seed(if home_airport_name.as_deref() == Some(&name) {
+                        0
+                    } else {
+                        crate::voice::station_voice_seed(&name)
+                    });
                     atc_station = Some(st);
                 }
                 None => tracing::warn!(%name, "region handoff to a field without a tower; keeping the old station"),

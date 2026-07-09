@@ -150,6 +150,12 @@ pub struct Config {
     /// Piper voice for the ATIS broadcast. Empty falls back to the tower's
     /// voice. `XCOPILOT_ATC_ATIS_PIPER_VOICE`.
     pub atc_atis_piper_voice: String,
+    /// Comma-separated Piper models the OTHER airports' controllers draw from
+    /// (the configured home airport keeps the curated per-position voices
+    /// above). Seeded by airport name, so Ciudad Real's tower is a different,
+    /// stable person from Gibraltar's. Empty = every airport uses the curated
+    /// voices. `XCOPILOT_ATC_VOICE_POOL`.
+    pub atc_voice_pool: String,
     /// Recorded squelch transient spliced onto the end of every station
     /// transmission (VATSIM-style; the default is AFV-Native's click, BSD-3,
     /// see assets/afv/). Empty falls back to the synthesized burst.
@@ -238,6 +244,15 @@ impl Config {
             // Empty = the tower's voice; ATIS on a real field is often the
             // same controller reading onto the loop anyway.
             atc_atis_piper_voice: env_or("XCOPILOT_ATC_ATIS_PIPER_VOICE", ""),
+            // The es_* models speak Spanish-accented ENGLISH (en-us phonemes)
+            // — right for the Iberian fields around the LXGB home base.
+            atc_voice_pool: env_or(
+                "XCOPILOT_ATC_VOICE_POOL",
+                "models/es_ES-davefx-medium.onnx,models/es_MX-claude-high.onnx,\
+                 models/es_MX-ald-medium.onnx,models/en_GB-alba-medium.onnx,\
+                 models/en_US-joe-medium.onnx,models/en_US-amy-medium.onnx,\
+                 models/en_GB-northern_english_male-medium.onnx,models/en_US-bryce-medium.onnx",
+            ),
             atc_squelch_wav: env_or("XCOPILOT_SQUELCH_WAV", "assets/afv/Click_f32.wav"),
             atc_voice: env_or("XCOPILOT_ATC_VOICE", "Daniel"),
             atc_rate: env_or("XCOPILOT_ATC_RATE", "165"),
