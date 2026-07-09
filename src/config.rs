@@ -245,13 +245,17 @@ impl Config {
             // same controller reading onto the loop anyway.
             atc_atis_piper_voice: env_or("XCOPILOT_ATC_ATIS_PIPER_VOICE", ""),
             // The es_* models speak Spanish-accented ENGLISH (en-us phonemes)
-            // — right for the Iberian fields around the LXGB home base.
+            // — right for the Iberian fields around the LXGB home base. The
+            // home field's curated voices (alba, ryan, northern male) are
+            // deliberately NOT in the pool: another airport must never answer
+            // in the home tower's voice ("still the scottish lady",
+            // 2026-07-09).
             atc_voice_pool: env_or(
                 "XCOPILOT_ATC_VOICE_POOL",
                 "models/es_ES-davefx-medium.onnx,models/es_MX-claude-high.onnx,\
-                 models/es_MX-ald-medium.onnx,models/en_GB-alba-medium.onnx,\
-                 models/en_US-joe-medium.onnx,models/en_US-amy-medium.onnx,\
-                 models/en_GB-northern_english_male-medium.onnx,models/en_US-bryce-medium.onnx",
+                 models/es_MX-ald-medium.onnx,models/en_US-joe-medium.onnx,\
+                 models/en_US-amy-medium.onnx,models/en_US-bryce-medium.onnx,\
+                 models/en_US-john-medium.onnx,models/en_US-norman-medium.onnx",
             ),
             atc_squelch_wav: env_or("XCOPILOT_SQUELCH_WAV", "assets/afv/Click_f32.wav"),
             atc_voice: env_or("XCOPILOT_ATC_VOICE", "Daniel"),

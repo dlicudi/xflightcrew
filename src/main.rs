@@ -844,33 +844,6 @@ async fn run_session(
 
     loop {
         reporter.status(ui::Phase::Listening);
-        // An enroute handoff armed by the monitor: rebuild the station around
-        // the new field (the handoff line was already spoken). Consumed here
-        // because this loop owns the Station; the next call works the new
-        // tower, and "tune the tower" now means the new one.
-        if let Some(apt) = station::PENDING_STATION
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            let name = apt.name.clone();
-            match station::Station::from_airport(apt) {
-                Some(st) => {
-                    reporter.log(ui::LogKind::Info, format!("ATC region: now working {name}"));
-                    st.install();
-                    // A new field, a new crew: per-airport voices from the
-                    // pool — unless we're back home, where the curated
-                    // voices belong.
-                    voice.set_station_seed(if home_airport_name.as_deref() == Some(&name) {
-                        0
-                    } else {
-                        crate::voice::station_voice_seed(&name)
-                    });
-                    atc_station = Some(st);
-                }
-                None => tracing::warn!(%name, "region handoff to a field without a tower; keeping the old station"),
-            }
-        }
         // Input is spoken (gated like before) or typed in the TUI. A typed
         // command is deliberate, so it skips the confidence/wake/domain gates and
         // goes straight to the model.
@@ -897,6 +870,34 @@ async fn run_session(
                 (heard.text, false)
             }
         };
+
+        // A region switch armed by the monitor: rebuild the station BEFORE this
+        // utterance is routed — consumed at the loop top it lagged one call
+        // behind, and "Ready for takeoff?" at Ciudad Real was answered by
+        // Gibraltar's dead-air briefing (seen live 2026-07-09).
+        if let Some(apt) = station::PENDING_STATION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let name = apt.name.clone();
+            match station::Station::from_airport(apt) {
+                Some(st) => {
+                    reporter.log(ui::LogKind::Info, format!("ATC region: now working {name}"));
+                    st.install();
+                    // A new field, a new crew: per-airport voices from the
+                    // pool — unless we're back home, where the curated
+                    // voices belong.
+                    voice.set_station_seed(if home_airport_name.as_deref() == Some(&name) {
+                        0
+                    } else {
+                        crate::voice::station_voice_seed(&name)
+                    });
+                    atc_station = Some(st);
+                }
+                None => tracing::warn!(%name, "region handoff to a field without a tower; keeping the old station"),
+            }
+        }
 
         // Aircraft switched? Rebuild everything profile-derived before acting on this
         // command, so the tools, limits, prompt, and checklists match what's actually
