@@ -939,10 +939,10 @@ async fn run_session(
                 // controller answers garble; the crew never heard it at all).
                 if from_radio {
                     if let Some(st) = atc_station.as_mut() {
-                        if st.on_frequency(&xplane).await {
+                        if let Some(who) = st.tuned_speaker(&xplane).await {
                             let line = "Station calling, say again.";
                             reporter.log(ui::LogKind::Readback, format!("TWR: {line}"));
-                            voice.say_station(Priority::Readback, line);
+                            voice.say_station(Priority::Readback, who, line);
                             continue;
                         }
                     }
@@ -969,7 +969,7 @@ async fn run_session(
         // routing whenever the transmit button is bound.
         if from_radio {
             if let Some(st) = atc_station.as_mut() {
-                if let Some(reply) = st.handle_transmission(&command.to_ascii_lowercase(), &xplane).await {
+                if let Some((reply, who)) = st.handle_transmission(&command.to_ascii_lowercase(), &xplane).await {
                     // Empty reply = a readback the controller accepted; a real
                     // frequency stays quiet, so we do too.
                     if reply.is_empty() {
@@ -978,7 +978,7 @@ async fn run_session(
                     }
                     reporter.status(ui::Phase::Speaking);
                     reporter.log(ui::LogKind::Readback, format!("TWR: {reply}"));
-                    voice.say_station(Priority::Readback, &reply);
+                    voice.say_station(Priority::Readback, who, &reply);
                     reporter.status(ui::Phase::Listening);
                     continue;
                 }
@@ -1130,10 +1130,10 @@ async fn run_session(
             // world, not a cockpit command. Falls through untouched when not
             // tuned or not a radio call.
             if let Some(st) = atc_station.as_mut() {
-                if let Some(reply) = st.try_handle(&tl, &xplane).await {
+                if let Some((reply, who)) = st.try_handle(&tl, &xplane).await {
                     reporter.status(ui::Phase::Speaking);
                     reporter.log(ui::LogKind::Readback, format!("TWR: {reply}"));
-                    voice.say_station(Priority::Readback, &reply);
+                    voice.say_station(Priority::Readback, who, &reply);
                     reporter.status(ui::Phase::Listening);
                     continue;
                 }

@@ -1524,7 +1524,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                         "atc_handoff",
                         serde_json::json!({ "alt": r1(snap.alt_ft), "msg": &line }),
                     );
-                    voice.alert_station(Priority::Advisory, line);
+                    voice.alert_station(Priority::Advisory, crate::voice::StationSpeaker::Tower, line);
                 }
                 if let Some(line) = crate::station::vector_tick(
                     snap.lat,
@@ -1545,7 +1545,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                             "alt": r1(snap.alt_ft), "msg": &line
                         }),
                     );
-                    voice.alert_station(Priority::Advisory, line);
+                    voice.alert_station(Priority::Advisory, crate::voice::StationSpeaker::Approach, line);
                 }
                 // Traffic advisories while under approach control: the
                 // controller narrates the nearest factor off the TCAS picture
@@ -1570,7 +1570,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                                 "traffic_advisory",
                                 serde_json::json!({ "msg": &line }),
                             );
-                            voice.alert_station(Priority::Advisory, line);
+                            voice.alert_station(Priority::Advisory, crate::voice::StationSpeaker::Approach, line);
                         }
                     }
                 }

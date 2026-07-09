@@ -10,6 +10,7 @@
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::voice::StationSpeaker;
 use crate::xplane::XPlaneClient;
 use crate::{atis, datarefs, nav, tower};
 
@@ -19,6 +20,17 @@ enum Service {
     Tower,
     Approach,
     Departure,
+}
+
+impl Service {
+    /// The voice this position speaks with — a different controller each.
+    fn speaker(self) -> StationSpeaker {
+        match self {
+            Service::Tower => StationSpeaker::Tower,
+            Service::Approach => StationSpeaker::Approach,
+            Service::Departure => StationSpeaker::Departure,
+        }
+    }
 }
 
 pub struct Station {
@@ -95,7 +107,11 @@ impl Station {
     /// 2026-07-08 flight because "takeoff" alone parsed as a request; the
     /// panel's "land the aircraft" button was hijacked into a join clearance
     /// the same way.
-    pub async fn try_handle(&mut self, transcript: &str, xp: &XPlaneClient) -> Option<String> {
+    pub async fn try_handle(
+        &mut self,
+        transcript: &str,
+        xp: &XPlaneClient,
+    ) -> Option<(String, StationSpeaker)> {
         if !is_radio_call(transcript, &self.apt.name.to_lowercase()) {
             return None;
         }
@@ -104,7 +120,7 @@ impl Station {
             return None;
         }
         let service = self.tuned_service(xp).await?;
-        Some(self.respond(service, intent, xp).await)
+        Some((self.respond(service, intent, xp).await, service.speaker()))
     }
 
     /// Physical routing (the radio PTT was keyed): the utterance was
@@ -116,7 +132,7 @@ impl Station {
         &mut self,
         transcript: &str,
         xp: &XPlaneClient,
-    ) -> Option<String> {
+    ) -> Option<(String, StationSpeaker)> {
         let service = self.tuned_service(xp).await?;
         let intent = tower::parse_intent(transcript);
         // A pilot readback earns SILENCE, like a real frequency: the
@@ -128,19 +144,19 @@ impl Station {
             if service == Service::Departure && !self.dep_checked_in {
                 self.dep_checked_in = true;
                 let ctx = self.build_ctx(xp).await;
-                return Some(format!(
-                    "{}, {} Departure, radar contact.",
-                    ctx.callsign, ctx.airport
+                return Some((
+                    format!("{}, {} Departure, radar contact.", ctx.callsign, ctx.airport),
+                    service.speaker(),
                 ));
             }
-            return Some(String::new());
+            return Some((String::new(), service.speaker()));
         }
-        Some(self.respond(service, intent, xp).await)
+        Some((self.respond(service, intent, xp).await, service.speaker()))
     }
 
-    /// Is COM1 tuned to any of this station's frequencies?
-    pub async fn on_frequency(&self, xp: &XPlaneClient) -> bool {
-        self.tuned_service(xp).await.is_some()
+    /// The voice of whichever of this station's positions COM1 is tuned to.
+    pub async fn tuned_speaker(&self, xp: &XPlaneClient) -> Option<StationSpeaker> {
+        self.tuned_service(xp).await.map(Service::speaker)
     }
 
     /// Does this frequency (kHz) belong to one of the station's services?

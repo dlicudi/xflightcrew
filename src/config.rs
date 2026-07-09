@@ -132,10 +132,16 @@ pub struct Config {
     /// disables physical routing (content routing still applies).
     /// `XCOPILOT_RADIO_PTT_DATAREF`.
     pub radio_ptt_dataref: String,
-    /// Piper `.onnx` voice for the ATC station — a second warm in-process ONNX
+    /// Piper `.onnx` voice for the ATC TOWER — a second warm in-process ONNX
     /// session, distinct from the copilot's voice. Empty falls back to the
     /// `say` voice below. `XCOPILOT_ATC_PIPER_VOICE`.
     pub atc_piper_voice: String,
+    /// Piper voice for APPROACH — a different controller, a different person.
+    /// Empty falls back to the tower's voice. `XCOPILOT_ATC_APPROACH_PIPER_VOICE`.
+    pub atc_approach_piper_voice: String,
+    /// Piper voice for DEPARTURE. Empty falls back to the tower's voice.
+    /// `XCOPILOT_ATC_DEPARTURE_PIPER_VOICE`.
+    pub atc_departure_piper_voice: String,
     /// Recorded squelch transient spliced onto the end of every station
     /// transmission (VATSIM-style; the default is AFV-Native's click, BSD-3,
     /// see assets/afv/). Empty falls back to the synthesized burst.
@@ -209,6 +215,14 @@ impl Config {
             atc_airport: env_or("XCOPILOT_ATC_AIRPORT", "LXGB"),
             radio_ptt_dataref: env_or("XCOPILOT_RADIO_PTT_DATAREF", "xcopilot/radio_ptt_active"),
             atc_piper_voice: env_or("XCOPILOT_ATC_PIPER_VOICE", "models/en_GB-alba-medium.onnx"),
+            atc_approach_piper_voice: env_or(
+                "XCOPILOT_ATC_APPROACH_PIPER_VOICE",
+                "models/en_GB-alan-medium.onnx",
+            ),
+            atc_departure_piper_voice: env_or(
+                "XCOPILOT_ATC_DEPARTURE_PIPER_VOICE",
+                "models/en_GB-northern_english_male-medium.onnx",
+            ),
             atc_squelch_wav: env_or("XCOPILOT_SQUELCH_WAV", "assets/afv/Click_f32.wav"),
             atc_voice: env_or("XCOPILOT_ATC_VOICE", "Daniel"),
             atc_rate: env_or("XCOPILOT_ATC_RATE", "165"),

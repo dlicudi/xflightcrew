@@ -766,6 +766,8 @@ mod tests {
             atc_airport: String::new(),
             radio_ptt_dataref: String::new(),
             atc_piper_voice: String::new(),
+            atc_approach_piper_voice: String::new(),
+            atc_departure_piper_voice: String::new(),
             atc_squelch_wav: String::new(),
             atc_voice: String::new(),
             atc_rate: String::new(),
