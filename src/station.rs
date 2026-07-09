@@ -115,20 +115,6 @@ impl Station {
         if let Some(k) = departure_khz {
             tracing::info!(mhz = k as f64 / 1000.0, "departure on frequency (handoff after takeoff)");
         }
-        // ATIS broadcasts in-process when the field publishes a frequency:
-        // the monitor's tick loops the report while COM1 is tuned there.
-        *ATIS.lock().unwrap_or_else(|e| e.into_inner()) =
-            apt.freq(nav::FREQ_ATIS).map(|f| {
-                tracing::info!(mhz = f.khz as f64 / 1000.0, "ATIS broadcasting on frequency");
-                AtisState {
-                    khz: f.khz,
-                    airport: apt.name.clone(),
-                    runways: apt.runways.clone(),
-                    letter: 'A',
-                    edition: None,
-                    last_spoken: None,
-                }
-            });
         Some(Station {
             tower_khz: twr_row.khz,
             approach_khz,
@@ -139,6 +125,30 @@ impl Station {
             dep_checked_in: false,
             pilot_info: None,
         })
+    }
+
+    /// Publish this station's process-wide side state — the ATIS broadcast
+    /// and the enroute switch identity the monitor's ticks read. Called by
+    /// the OWNER once a station goes live (startup and each region handoff),
+    /// never by `from_airport` itself, so offline sweeps and tests stay
+    /// side-effect free.
+    pub fn install(&self) {
+        *ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()) = self
+            .apt
+            .position()
+            .map(|(lat, lon)| (self.apt.name.clone(), lat, lon));
+        *ATIS.lock().unwrap_or_else(|e| e.into_inner()) =
+            self.apt.freq(nav::FREQ_ATIS).map(|f| {
+                tracing::info!(mhz = f.khz as f64 / 1000.0, "ATIS broadcasting on frequency");
+                AtisState {
+                    khz: f.khz,
+                    airport: self.apt.name.clone(),
+                    runways: self.apt.runways.clone(),
+                    letter: 'A',
+                    edition: None,
+                    last_spoken: None,
+                }
+            });
     }
 
     /// Content routing (shared PTT): if the utterance is a radio call AND COM1
@@ -777,6 +787,110 @@ pub fn atis_current_letter() -> Option<char> {
         .map(|a| a.letter)
 }
 
+/// The enroute region: every towered field from apt.dat, indexed once on a
+/// background thread at startup, so the flight can outgrow its departure
+/// airport. When another tower becomes decisively nearer, the current
+/// controller hands the flight off by name and frequency, and the station
+/// rebuilds itself around the new field — Gibraltar stops following you to
+/// Malaga.
+pub struct RegionApt {
+    pub apt: nav::AirportInfo,
+    lat: f64,
+    lon: f64,
+}
+
+pub static REGION: Mutex<Vec<RegionApt>> = Mutex::new(Vec::new());
+
+/// The active station's identity + position, for the switch decision. Set by
+/// [`Station::from_airport`].
+static ACTIVE_FIELD: Mutex<Option<(String, f64, f64)>> = Mutex::new(None);
+
+/// A station swap the main loop must consume (it owns the `Station`): the new
+/// field, armed by [`region_tick`] after the handoff line is spoken.
+pub static PENDING_STATION: Mutex<Option<nav::AirportInfo>> = Mutex::new(None);
+
+static LAST_REGION_SWITCH: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// The new field must be this much nearer than the active one before a
+/// handoff — hysteresis, so the midpoint between two fields can't flap.
+const SWITCH_MARGIN_NM: f64 = 5.0;
+/// No handoff to a field further than this — enroute over nowhere keeps the
+/// last controller (a lightweight "radar" continuity).
+const SWITCH_MAX_NM: f64 = 60.0;
+/// Minimum quiet time between handoffs.
+const SWITCH_COOLDOWN_SECS: f64 = 180.0;
+
+/// Index every towered field once (a full apt.dat pass, seconds — run it on a
+/// background thread). Without it [`region_tick`] never fires and the station
+/// stays single-airport, exactly the pre-region behavior.
+pub fn load_region(apt_path: &str) {
+    let mut v: Vec<RegionApt> = Vec::new();
+    let res = nav::scan_airports(apt_path, |_icao, apt| {
+        if apt.freq(nav::FREQ_TOWER).is_some() {
+            if let Some((lat, lon)) = apt.position() {
+                v.push(RegionApt { apt, lat, lon });
+            }
+        }
+    });
+    match res {
+        Ok(()) => {
+            tracing::info!(towered_fields = v.len(), "enroute region indexed");
+            *REGION.lock().unwrap_or_else(|e| e.into_inner()) = v;
+        }
+        Err(e) => tracing::warn!("region index failed ({e:#}); staying single-airport"),
+    }
+}
+
+/// One tick of the enroute watch: when another towered field is decisively
+/// nearer than the active one, arm the station swap and return the handoff
+/// line ("radar services terminated, contact Malaga Tower on ..."). The main
+/// loop consumes [`PENDING_STATION`] on its next pass; until then this stays
+/// quiet. Ground and pattern work never switch (`on_ground` or below the
+/// margin), and a cooldown keeps back-to-back fields from ping-ponging.
+pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<String> {
+    if on_ground {
+        return None;
+    }
+    if PENDING_STATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+    {
+        return None; // a switch is already waiting to be consumed
+    }
+    if LAST_REGION_SWITCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|t| now.duration_since(t).as_secs_f64() < SWITCH_COOLDOWN_SECS)
+    {
+        return None;
+    }
+    let (active_name, a_lat, a_lon) =
+        ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+    let region = REGION.lock().unwrap_or_else(|e| e.into_inner());
+    let (d_best, best) = region
+        .iter()
+        .map(|a| (crate::haversine_nm(lat, lon, a.lat, a.lon), a))
+        .min_by(|x, y| x.0.total_cmp(&y.0))?;
+    if best.apt.name == active_name || d_best > SWITCH_MAX_NM {
+        return None;
+    }
+    let d_active = crate::haversine_nm(lat, lon, a_lat, a_lon);
+    if d_best + SWITCH_MARGIN_NM > d_active {
+        return None;
+    }
+    let khz = best.apt.freq(nav::FREQ_TOWER)?.khz;
+    let line = format!(
+        "Radar services terminated. Contact {} Tower on {}.",
+        best.apt.name,
+        atis::spoken_mhz(khz)
+    );
+    tracing::info!(from = %active_name, to = %best.apt.name, "enroute handoff");
+    *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = Some(best.apt.clone());
+    *LAST_REGION_SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+    Some(line)
+}
+
 /// The information letter in a call ("with information Alpha", "we have
 /// information bravo", or just "information B").
 pub fn heard_information(t: &str) -> Option<char> {
@@ -1238,6 +1352,59 @@ mod tests {
         assert!(r.contains("information Bravo"), "{r}");
         assert_eq!(atis_current_letter(), Some('B'));
         *ATIS.lock().unwrap() = None;
+    }
+
+    /// `REGION`/`ACTIVE_FIELD`/`PENDING_STATION` are process statics — one
+    /// lock for every region test.
+    static REGION_LOCK: Mutex<()> = Mutex::new(());
+
+    fn region_apt(name: &str, lat: f64, lon: f64) -> RegionApt {
+        RegionApt {
+            apt: nav::AirportInfo {
+                name: name.into(),
+                elev_ft: 0.0,
+                runways: Vec::new(),
+                freqs: vec![nav::AtcFreq {
+                    kind: nav::FREQ_TOWER,
+                    khz: 118100,
+                    name: "Tower".into(),
+                }],
+            },
+            lat,
+            lon,
+        }
+    }
+
+    #[test]
+    fn region_hands_off_to_the_decisively_nearer_tower() {
+        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Gibraltar-ish and Malaga-ish, ~50 nm apart along a degree of longitude.
+        *REGION.lock().unwrap() = vec![
+            region_apt("Gibraltar", 36.15, -5.35),
+            region_apt("Malaga", 36.67, -4.50),
+        ];
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.15, -5.35));
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        let t0 = Instant::now();
+        // On the ground at Gibraltar: never.
+        assert!(region_tick(36.15, -5.35, true, t0).is_none());
+        // Just airborne, Gibraltar still much nearer: quiet.
+        assert!(region_tick(36.2, -5.3, false, t0).is_none());
+        // Near the midpoint, Malaga slightly nearer but inside the margin:
+        // still quiet — hysteresis, no flapping between two fields.
+        assert!(region_tick(36.42, -4.92, false, t0).is_none());
+        // Decisively closer to Malaga: the handoff, once.
+        let line = region_tick(36.6, -4.6, false, t0).expect("handoff");
+        assert!(line.contains("Contact Malaga Tower"), "{line}");
+        assert!(line.contains("one one eight decimal one"), "{line}");
+        assert!(PENDING_STATION.lock().unwrap().is_some(), "swap armed for the main loop");
+        // While the swap waits to be consumed: silence, no re-arm.
+        assert!(region_tick(36.6, -4.6, false, t0).is_none());
+        *REGION.lock().unwrap() = Vec::new();
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
     }
 
     #[test]

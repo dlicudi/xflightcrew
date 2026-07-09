@@ -1567,6 +1567,25 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                     );
                     voice.alert_station(Priority::Advisory, crate::voice::StationSpeaker::Tower, line);
                 }
+                // Enroute handoff: when another towered field is decisively
+                // nearer, the controller passes the flight along and the main
+                // loop rebuilds the station around the new airport.
+                if let Some(line) =
+                    crate::station::region_tick(snap.lat, snap.lon, snap.on_ground, now)
+                {
+                    if let Some(s) = status.as_ref() {
+                        s.action(&format!("TWR: {line}"));
+                    }
+                    crate::blackbox::record(
+                        "atc_region",
+                        serde_json::json!({ "lat": r1(snap.lat), "lon": r1(snap.lon), "msg": &line }),
+                    );
+                    voice.alert_station(
+                        Priority::Advisory,
+                        crate::voice::StationSpeaker::Departure,
+                        line,
+                    );
+                }
                 if let Some(line) = crate::station::vector_tick(
                     snap.lat,
                     snap.lon,

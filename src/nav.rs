@@ -173,6 +173,15 @@ pub struct AirportInfo {
 }
 
 impl AirportInfo {
+    /// The field's reference position — the first runway threshold (apt.dat
+    /// has no single airport lat/lon row; a threshold is within a mile of any
+    /// sane answer). `None` for a field with no runway rows.
+    pub fn position(&self) -> Option<(f64, f64)> {
+        self.runways.first().map(|r| (r.lat_a, r.lon_a))
+    }
+}
+
+impl AirportInfo {
     /// The first frequency of the given service `kind` (`FREQ_TOWER`, ...).
     #[allow(dead_code)] // atc-binary tree only (yet)
     pub fn freq(&self, kind: u32) -> Option<&AtcFreq> {

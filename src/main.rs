@@ -742,6 +742,21 @@ async fn run_session(
     } else {
         station::Station::load(&config.apt_data_path, &config.atc_airport.trim().to_uppercase())
     };
+    // Publish the live station's side state (ATIS broadcast, enroute switch
+    // identity) for the monitor's ticks.
+    if let Some(st) = &atc_station {
+        st.install();
+    }
+    // Enroute region: index every towered field (a full apt.dat pass, so a
+    // background thread) so the flight can outgrow its departure airport —
+    // the monitor's region_tick hands off to whichever tower is nearest.
+    if atc_station.is_some() && config.atc_region.trim() != "off" {
+        let path = config.apt_data_path.clone();
+        std::thread::Builder::new()
+            .name("region-index".into())
+            .spawn(move || station::load_region(&path))
+            .ok();
+    }
     // Radio-call vocabulary rides along in the whisper bias so "request taxi" /
     // "ready for departure" transcribe as reliably as cockpit commands.
     stt.set_prompt(format!("{} {}", stt::build_prompt(&profile), tower::STT_PROMPT));
@@ -826,6 +841,25 @@ async fn run_session(
     let mut stt_radio_bias = true;
     loop {
         reporter.status(ui::Phase::Listening);
+        // An enroute handoff armed by the monitor: rebuild the station around
+        // the new field (the handoff line was already spoken). Consumed here
+        // because this loop owns the Station; the next call works the new
+        // tower, and "tune the tower" now means the new one.
+        if let Some(apt) = station::PENDING_STATION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let name = apt.name.clone();
+            match station::Station::from_airport(apt) {
+                Some(st) => {
+                    reporter.log(ui::LogKind::Info, format!("ATC region: now working {name}"));
+                    st.install();
+                    atc_station = Some(st);
+                }
+                None => tracing::warn!(%name, "region handoff to a field without a tower; keeping the old station"),
+            }
+        }
         if let Some(st) = atc_station.as_ref() {
             let on_freq = live
                 .get(datarefs::COM1_FREQ_KHZ)

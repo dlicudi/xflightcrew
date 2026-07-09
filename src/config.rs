@@ -125,6 +125,11 @@ pub struct Config {
     /// dialogue answered when COM1 is tuned to its frequency). Empty disables
     /// ATC entirely. `XCOPILOT_ATC_AIRPORT`.
     pub atc_airport: String,
+    /// Enroute region behavior: "auto" (default) indexes every towered field
+    /// from apt.dat and hands the flight off to whichever tower becomes
+    /// nearest; "off" keeps the single configured airport forever.
+    /// `XCOPILOT_ATC_REGION`.
+    pub atc_region: String,
     /// Radio (transmit) push-to-talk dataref, set by the bundled plugin's
     /// `xcopilot/radio_ptt` command — the transmit switch, as distinct from the
     /// intercom PTT above. An utterance captured while THIS is held goes to
@@ -216,6 +221,7 @@ impl Config {
             plugin_status: env_or("XCOPILOT_PLUGIN_STATUS", "true") != "false",
             simbrief_id: env_or("XCOPILOT_SIMBRIEF_ID", ""),
             atc_airport: env_or("XCOPILOT_ATC_AIRPORT", "LXGB"),
+            atc_region: env_or("XCOPILOT_ATC_REGION", "auto"),
             radio_ptt_dataref: env_or("XCOPILOT_RADIO_PTT_DATAREF", "xcopilot/radio_ptt_active"),
             atc_piper_voice: env_or("XCOPILOT_ATC_PIPER_VOICE", "models/en_GB-alba-medium.onnx"),
             // ryan-high: the only high-quality model in the folder, and clearly
