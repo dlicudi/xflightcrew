@@ -371,8 +371,19 @@ impl Station {
                     self.arm_vectors(ctx, wx)
                 }
             },
+            // A mayday on the departure frequency: departure keeps the flight
+            // (an emergency is never told to go retune) and vectors it home.
+            tower::Intent::Mayday => {
+                self.twr.expect_touch_and_go(false);
+                let vectors = self.arm_vectors(ctx, wx);
+                format!("Roger mayday. {vectors}")
+            }
             // Runway-shaped business belongs to the tower.
             tower::Intent::ReportFinal
+            | tower::Intent::ReportDownwind
+            | tower::Intent::ReportBase
+            | tower::Intent::ReportCrosswind
+            | tower::Intent::GoAround
             | tower::Intent::RequestTakeoff
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
@@ -436,8 +447,19 @@ impl Station {
                 self.twr.expect_touch_and_go(touch_and_go);
                 self.arm_vectors(ctx, wx)
             }
+            // A mayday to approach: keep the flight, vector it home with
+            // priority — an emergency is never told to go retune.
+            tower::Intent::Mayday => {
+                self.twr.expect_touch_and_go(false);
+                let vectors = self.arm_vectors(ctx, wx);
+                format!("Roger mayday. {vectors}")
+            }
             // Final reports and everything runway-shaped belong to the tower.
             tower::Intent::ReportFinal
+            | tower::Intent::ReportDownwind
+            | tower::Intent::ReportBase
+            | tower::Intent::ReportCrosswind
+            | tower::Intent::GoAround
             | tower::Intent::RequestTakeoff
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
@@ -569,6 +591,22 @@ pub fn is_radio_call(t: &str, airport_lc: &str) -> bool {
         || t.contains("inbound")
         || t.contains("radio check")
         || word("final")
+        // Distress and pattern calls are radio speech by nature — nobody
+        // tells their copilot "mayday" or reports "downwind" to the cockpit.
+        || word("mayday")
+        || t.contains("may day")
+        || t.contains("pan pan")
+        || word("declaring")
+        || word("declare")
+        || t.contains("going around")
+        || t.contains("missed approach")
+        || word("downwind")
+        || word("crosswind")
+        || word("upwind")
+        || t.contains("turning base")
+        || t.contains("left base")
+        || t.contains("right base")
+        || t.contains("base leg")
 }
 
 /// The tower's after-takeoff handoff, armed by a takeoff clearance and spoken

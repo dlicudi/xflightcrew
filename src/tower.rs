@@ -9,8 +9,8 @@
 /// Whisper decoding bias for radio calls (see [`crate::stt::Stt::set_prompt`]).
 pub const STT_PROMPT: &str = "Radio calls to the tower: request taxi, request \
 departure clearance, ready for departure, request takeoff, radio check, \
-holding point, runway zero niner, runway two seven. Numbers are spoken digit \
-by digit.";
+holding point, runway zero niner, runway two seven, mayday, pan pan, going \
+around, downwind, turning base. Numbers are spoken digit by digit.";
 
 /// Where the aircraft is in the clearance sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +36,19 @@ pub enum Intent {
     },
     /// "final" — position report on final approach.
     ReportFinal,
+    /// "downwind" — pattern position report; earns the base call.
+    ReportDownwind,
+    /// "turning base" / "base leg" — earns "report final".
+    ReportBase,
+    /// "crosswind" / "upwind" — early pattern legs; earns "report downwind".
+    ReportCrosswind,
+    /// "going around" / "missed approach" — a balked landing rejoining the
+    /// pattern. The landing clearance is void; the tower re-sequences.
+    GoAround,
+    /// "mayday" / "pan pan" / "declaring an emergency" — priority handling.
+    /// The ONE intent that earns a landing clearance without a final report:
+    /// an emergency outranks the sequence, never the other way round.
+    Mayday,
     /// "say wind" / "wind check" / "say QNH".
     WindCheck,
     /// "what's my squawk" / "say transponder" — the pilot asking for the code
@@ -77,6 +90,21 @@ pub fn parse_intent(transcript: &str) -> Intent {
     // checklist" on a keyed radio must get "say again", not a clearance.
     if word("checklist") {
         return Intent::Unknown;
+    }
+    // Emergency first — a mayday outranks every other reading of the words,
+    // including the question guard ("mayday, can you hear me" is still a
+    // mayday). Strict keywords on purpose: this is the one intent that earns
+    // a clearance without the normal sequence, so it must never be reachable
+    // by a garble. The real 2026-07-09 mayday ("mayday, mayday" then
+    // "requesting emergency landing") got "say again" twice before the word
+    // "landing" happened to carry it.
+    if word("mayday")
+        || t.contains("may day") // whisper splits the word
+        || t.contains("pan pan")
+        || ((word("declare") || word("declaring")) && word("emergency"))
+        || (word("emergency") && (word("landing") || word("land") || word("descent")))
+    {
+        return Intent::Mayday;
     }
     // "do you read/copy/hear me" / "are you there" are how pilots actually ask
     // for a radio check (five times across the 2026-07 flights, all
@@ -126,6 +154,30 @@ pub fn parse_intent(transcript: &str) -> Intent {
     // when it's a cockpit question ("what's our final approach speed").
     if word("final") && !t.contains("what") && !t.contains("how") && !t.contains("speed") {
         return Intent::ReportFinal;
+    }
+    // A balked landing rejoining the pattern — before the landing request so
+    // "going around for another landing" reads as the go-around.
+    if t.contains("going around")
+        || t.contains("go around")
+        || t.contains("go-around")
+        || t.contains("missed approach")
+    {
+        return Intent::GoAround;
+    }
+    // Pattern position reports, before the landing request so "downwind for
+    // landing" reads as the report. "base" alone is too common a word — it
+    // needs pattern context ("turning base", "base leg", "on base", "left/
+    // right base").
+    if word("downwind") {
+        return Intent::ReportDownwind;
+    }
+    if word("base")
+        && (word("turning") || word("leg") || word("on") || word("left") || word("right"))
+    {
+        return Intent::ReportBase;
+    }
+    if word("crosswind") || word("upwind") {
+        return Intent::ReportCrosswind;
     }
     // "the option" is real phraseology for a touch and go, and also what
     // whisper writes when it garbles "touch and" ("request option go",
@@ -197,6 +249,11 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "request_landing" => Intent::RequestLanding { touch_and_go: false },
         "request_touch_and_go" => Intent::RequestLanding { touch_and_go: true },
         "report_final" => Intent::ReportFinal,
+        "report_downwind" => Intent::ReportDownwind,
+        "report_base" => Intent::ReportBase,
+        "report_crosswind" => Intent::ReportCrosswind,
+        "go_around" => Intent::GoAround,
+        "mayday" => Intent::Mayday,
         "wind_check" => Intent::WindCheck,
         "squawk_check" => Intent::SquawkCheck,
         "request_taxi_in" => Intent::RequestTaxiIn,
@@ -314,6 +371,40 @@ impl Tower {
                 format!(
                     "{}, runway {}, wind {}, {}.",
                     ctx.callsign, ctx.runway, ctx.wind, clearance
+                )
+            }
+            // Pattern position reports: the tower sequences the circuit leg by
+            // leg. All land in Inbound — "in the pattern, awaiting final".
+            Intent::ReportDownwind => {
+                self.state = State::Inbound;
+                format!("{}, number one, report base.", ctx.callsign)
+            }
+            Intent::ReportBase => {
+                self.state = State::Inbound;
+                format!("{}, roger, report final.", ctx.callsign)
+            }
+            Intent::ReportCrosswind => {
+                self.state = State::Inbound;
+                format!("{}, roger, report downwind.", ctx.callsign)
+            }
+            // A balked landing: the clearance is void, rejoin the pattern.
+            Intent::GoAround => {
+                self.state = State::Inbound;
+                format!(
+                    "{}, roger, go around. Climb to circuit altitude, runway heading, \
+                     report downwind.",
+                    ctx.callsign
+                )
+            }
+            // Priority handling — the ONE clearance spoken without a final
+            // report. An emergency outranks the sequence.
+            Intent::Mayday => {
+                self.state = State::ClearedToLand;
+                self.touch_and_go = false;
+                format!(
+                    "{}, roger mayday, cleared to land runway {}, or any runway you \
+                     need. Wind {}. Emergency services standing by.",
+                    ctx.callsign, ctx.runway, ctx.wind
                 )
             }
             Intent::WindCheck => {
@@ -520,6 +611,11 @@ mod tests {
             RequestLanding { touch_and_go: false },
             RequestLanding { touch_and_go: true },
             ReportFinal,
+            ReportDownwind,
+            ReportBase,
+            ReportCrosswind,
+            GoAround,
+            Mayday,
             WindCheck,
             SquawkCheck,
             RequestTaxiIn,
@@ -551,9 +647,14 @@ mod tests {
                     assert!(reply.contains(&c.runway), "{cell}: clearance without runway");
                     assert!(reply.contains(&c.wind), "{cell}: clearance without wind");
                 }
-                // A landing clearance only ever answers a final report.
+                // A landing clearance only ever answers a final report — or a
+                // MAYDAY, the one deliberate exception: an emergency outranks
+                // the sequence (priority handling is the point of the call).
                 if reply.contains("cleared to land") || reply.contains("cleared touch and go") {
-                    assert_eq!(intent, ReportFinal, "{cell}: unasked landing clearance");
+                    assert!(
+                        matches!(intent, ReportFinal | Mayday),
+                        "{cell}: unasked landing clearance"
+                    );
                     assert!(reply.contains(&c.runway), "{cell}: clearance without runway");
                     assert!(reply.contains(&c.wind), "{cell}: clearance without wind");
                 }
@@ -582,6 +683,10 @@ mod tests {
                     }
                     RequestLanding { .. } => Inbound,
                     ReportFinal => ClearedToLand,
+                    // Pattern legs and a go-around all land in "in the
+                    // pattern, awaiting final"; a mayday is cleared at once.
+                    ReportDownwind | ReportBase | ReportCrosswind | GoAround => Inbound,
+                    Mayday => ClearedToLand,
                 };
                 assert_eq!(end, want, "{cell}: wrong transition");
             }
@@ -597,6 +702,79 @@ mod tests {
             twr.handle(RequestVectors, &no_app);
             assert_eq!(twr.state, Inbound, "{start:?}: no-approach vectors must join");
         }
+    }
+
+    #[test]
+    fn mayday_gets_priority_from_any_state() {
+        // The real 2026-07-09 sequence: "mayday, mayday" got "say again",
+        // twice, and only "requesting emergency landing" happened to carry it
+        // via the word "landing". Never again: a mayday is answered with a
+        // clearance and emergency services, from anywhere in the sequence.
+        for call in [
+            "mayday, mayday, mayday",
+            "mayday, engine failure",
+            "pan pan, pan pan",
+            "declaring an emergency",
+            "requesting emergency landing",
+            "emergency descent",
+            "mayday, can you hear me", // the question guard must not eat it
+        ] {
+            assert_eq!(parse_intent(call), Intent::Mayday, "{call}");
+        }
+        use State::*;
+        for start in [Parked, TaxiCleared, TakeoffCleared, Inbound, ClearedToLand] {
+            let mut twr = Tower::new();
+            twr.state = start;
+            let r = twr.handle(Intent::Mayday, &ctx());
+            assert!(r.contains("roger mayday"), "{start:?}: {r}");
+            assert!(r.contains("cleared to land"), "{start:?}: {r}");
+            assert!(r.contains("Emergency services"), "{start:?}: {r}");
+            assert_eq!(twr.state, State::ClearedToLand);
+        }
+        // But a lone "emergency" without land/descend/declare context is NOT
+        // a mayday — "emergency fuel pump on" is a cockpit command.
+        assert_eq!(parse_intent("emergency fuel pump on"), Intent::Unknown);
+        // And the emergency CHECKLIST is cockpit ritual, not a distress call.
+        assert_eq!(parse_intent("emergency landing checklist"), Intent::Unknown);
+    }
+
+    #[test]
+    fn go_around_voids_the_clearance_and_rejoins() {
+        let mut twr = Tower::new();
+        let c = ctx();
+        twr.handle(parse_intent("inbound for landing"), &c);
+        twr.handle(parse_intent("final"), &c);
+        assert_eq!(twr.state, State::ClearedToLand);
+        let r = twr.handle(parse_intent("november 172SP, going around"), &c);
+        assert!(r.contains("go around"), "{r}");
+        assert!(r.contains("report downwind"), "{r}");
+        assert_eq!(twr.state, State::Inbound, "back in the pattern");
+        // The circuit then re-earns the clearance leg by leg.
+        let r = twr.handle(parse_intent("downwind"), &c);
+        assert!(r.contains("report base"), "{r}");
+        let r = twr.handle(parse_intent("turning base"), &c);
+        assert!(r.contains("report final"), "{r}");
+        let r = twr.handle(parse_intent("final"), &c);
+        assert!(r.contains("cleared to land"), "{r}");
+        // "missed approach" is the same call in IFR words.
+        assert_eq!(parse_intent("missed approach"), Intent::GoAround);
+    }
+
+    #[test]
+    fn pattern_reports_sequence_the_circuit() {
+        assert_eq!(parse_intent("downwind runway 09"), Intent::ReportDownwind);
+        assert_eq!(parse_intent("downwind for landing"), Intent::ReportDownwind);
+        assert_eq!(parse_intent("turning base"), Intent::ReportBase);
+        assert_eq!(parse_intent("left base runway two seven"), Intent::ReportBase);
+        assert_eq!(parse_intent("crosswind"), Intent::ReportCrosswind);
+        assert_eq!(parse_intent("upwind, november 172SP"), Intent::ReportCrosswind);
+        // "base" without pattern context is not a report.
+        assert_eq!(parse_intent("base"), Intent::Unknown);
+        // A crosswind QUESTION is crew talk, not a position report.
+        assert_eq!(parse_intent("what's the max crosswind"), Intent::Unknown);
+        let mut twr = Tower::new();
+        let r = twr.handle(Intent::ReportCrosswind, &ctx());
+        assert!(r.contains("report downwind"), "{r}");
     }
 
     #[test]

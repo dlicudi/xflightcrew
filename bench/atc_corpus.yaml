@@ -191,15 +191,40 @@
 - {text: "Radio calls to the tower.", intent: unknown, radio: true}
 
 # --- Unsupported-but-real requests: "say again" is the right answer (today) ---
-# Flight following came up four times across the 2026-07 flights; downwind and
-# go-around reports will matter once the pattern intents exist. Documented so
-# adding them is a deliberate corpus edit, not a drift.
+# Flight following came up four times across the 2026-07 flights. Documented so
+# adding it is a deliberate corpus edit, not a drift.
 - {text: "request flight following", intent: unknown, radio: true, readback: false}
 - {text: "requesting flight following.", intent: unknown, radio: true}
 - {text: "Jabal top tower request flight following.", intent: unknown, radio: true}
 - {text: "Request following, cable to tower.", intent: unknown, radio: true}
-- {text: "november one seven two, downwind", intent: unknown, radio: false}
-- {text: "going around", intent: unknown, radio: false}
+
+# --- Pattern reports and go-arounds (intents added 2026-07-09) ----------------
+- {text: "november one seven two, downwind", intent: report_downwind, radio: true}
+- {text: "downwind runway zero niner", intent: report_downwind, radio: true}
+- {text: "downwind for landing", intent: report_downwind, radio: true}
+- {text: "turning base", intent: report_base, radio: true}
+- {text: "left base runway two seven", intent: report_base, radio: true}
+- {text: "crosswind, november 172SP", intent: report_crosswind, radio: true}
+- {text: "going around", intent: go_around, radio: true}
+- {text: "november 172SP going around", intent: go_around, radio: true}
+- {text: "missed approach, november 172SP", intent: go_around, radio: true}
+# "base" without pattern context stays unparsed — too common a word.
+- {text: "base", intent: unknown, radio: false}
+
+# --- Mayday / pan pan (real 2026-07-09 calls; intent added the same day) ------
+# THE safety exception: the one intent that earns a clearance without the
+# normal sequence. Strict keywords so no garble can reach it.
+- {text: "Mayday, mayday.", intent: mayday, radio: true}
+- {text: "May day, may day, may day.", intent: mayday, radio: true}
+- {text: "Requesting emergency landing.", intent: mayday, radio: true}
+- {text: "She brought requesting emergency landing.", intent: mayday, radio: true}
+- {text: "declaring an emergency", intent: mayday, radio: true}
+- {text: "pan pan, pan pan, pan pan", intent: mayday, radio: true}
+- {text: "mayday, engine failure, november 172SP", intent: mayday, radio: true}
+# Not maydays: cockpit sentences that merely contain the vocabulary.
+- {text: "emergency fuel pump on", intent: unknown, radio: false}
+- {text: "emergency landing checklist", intent: unknown, radio: false}
+- {text: "run the emergency descent checklist", intent: unknown, radio: false}
 
 # --- Cockpit commands spoken with the radio PTT keyed (real mistakes) ---------
 - {text: "set power to 90.", intent: unknown, radio: false}

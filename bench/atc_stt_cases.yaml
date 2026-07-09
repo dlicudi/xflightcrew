@@ -17,6 +17,15 @@
 - {say: "request takeoff", intent: request_takeoff}
 - {say: "request departure clearance", intent: request_clearance}
 
+# Emergencies and the pattern (intents added 2026-07-09)
+- {say: "mayday, mayday, mayday", intent: mayday}
+- {say: "mayday, engine failure, november one seven two Sierra Papa", intent: mayday}
+- {say: "pan pan, pan pan, pan pan", intent: mayday}
+- {say: "requesting emergency landing", intent: mayday}
+- {say: "going around", intent: go_around}
+- {say: "november one seven two Sierra Papa, downwind", intent: report_downwind}
+- {say: "turning base runway zero niner", intent: report_base}
+
 # Arrivals
 - {say: "Gibraltar tower, November one seven two Sierra Papa, inbound for landing", intent: request_landing}
 - {say: "requesting permission to land", intent: request_landing}
