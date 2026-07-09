@@ -770,7 +770,11 @@ impl Check for CarbIce {
 
 /// Low vacuum: the engine-driven pump spins the attitude and heading gyros; if
 /// suction drops those instruments lie. Uses the sim's low-vacuum annunciator.
-/// Caution — critical in IMC, a cross-check reminder in VMC.
+/// AIRBORNE ONLY: at ground idle the pump legitimately makes too little
+/// suction and the light is normal (the POH checks vacuum at run-up RPM) —
+/// cautioning about it while taxiing is noise ("pointless", the pilot said,
+/// 2026-07-09). In flight the RPM is up, so a lit annunciator is a real
+/// failure — critical in IMC, a cross-check reminder in VMC.
 struct LowVacuum;
 
 impl Check for LowVacuum {
@@ -781,14 +785,14 @@ impl Check for LowVacuum {
         Severity::Caution
     }
     fn eval(&self, s: &Snapshot) -> Option<String> {
-        (s.engine_running && s.low_vacuum).then(|| {
+        (s.engine_running && s.low_vacuum && !s.on_ground).then(|| {
             "Low vacuum — the attitude and heading indicators may be unreliable. \
              Cross-check the compass and turn coordinator."
                 .to_string()
         })
     }
     fn min_duration(&self) -> Duration {
-        Duration::from_secs(3)
+        Duration::from_secs(5)
     }
 }
 
@@ -1216,8 +1220,9 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         checks.push(Box::new(AlternatorNotCharging { noun }));
     }
     if profile.directional_gyro {
-        checks.push(Box::new(GyroDrift));
-        // The vacuum system drives the DG/AI, so an airframe with a gyro has one.
+        // The vacuum system drives the DG/AI, so an airframe with a gyro has
+        // one. (Gyro DRIFT is no longer a check: the monitor loop syncs the
+        // DG itself and announces it — a copilot's hand, not a nag.)
         checks.push(Box::new(LowVacuum));
     }
     if profile.carb_heat {
@@ -1421,6 +1426,9 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
     // Approach traffic advisories while being vectored, rate-limited: a real
     // controller calls a factor once and moves on, not every sweep.
     let mut traffic_last: Option<Instant> = None;
+    // Gyro auto-sync cooldown (drift resets to ~0 on sync, so this only guards
+    // against a sim-side write failing silently and re-triggering every tick).
+    let mut gyro_sync_last: Option<Instant> = None;
 
     loop {
         // Aircraft switched → rebuild the checks for the new airframe.
@@ -1513,6 +1521,28 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
                 || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
             if !quiet {
+                // Gyro auto-sync: a drifted DG gets re-aligned by the copilot's
+                // own hand, then announced — not a "recommend syncing" nag
+                // (pilot feedback, 2026-07-09). Airborne only (on the ground
+                // you align at the run-up); vacuum-DG airframes only.
+                if live.get().directional_gyro
+                    && !snap.on_ground
+                    && snap.gyro_drift_deg.abs() >= GYRO_DRIFT_ADVISORY_DEG
+                    && gyro_sync_last.is_none_or(|t| now.duration_since(t).as_secs() >= 120)
+                {
+                    gyro_sync_last = Some(now);
+                    if xp.run_command("sim/instruments/DG_sync_mag").await.is_ok() {
+                        let line = gyro_sync_line(snap.gyro_drift_deg);
+                        if let Some(s) = status.as_ref() {
+                            s.action(&line);
+                        }
+                        crate::blackbox::record(
+                            "gyro_sync",
+                            serde_json::json!({ "drift_deg": r1(snap.gyro_drift_deg) }),
+                        );
+                        voice.alert(Priority::Advisory, line);
+                    }
+                }
                 // One COM1 read serves the ATIS loop and the traffic
                 // advisories below.
                 let com1: Option<i64> = xp
@@ -1808,30 +1838,15 @@ impl Check for AlternatorOffline {
 }
 
 /// The directional gyro has precessed away from the magnetic compass. Vacuum DGs
-/// drift slowly, and on a long leg it's easy to forget to realign — a right-seat
-/// pilot catches it. Advisory only: the wet compass is still valid, so this is a
-/// flat advisory ("recommend syncing the gyro"), spoken once per occurrence, not a nag.
-/// Airborne-only — on the ground you just align during the run-up.
-struct GyroDrift;
-
-impl Check for GyroDrift {
-    fn id(&self) -> &'static str {
-        "gyro_drift"
-    }
-    fn severity(&self) -> Severity {
-        Severity::Advisory
-    }
-    fn eval(&self, s: &Snapshot) -> Option<String> {
-        if s.on_ground || s.gyro_drift_deg.abs() < GYRO_DRIFT_ADVISORY_DEG {
-            return None;
-        }
-        // Round to the nearest 5° so the spoken figure sounds like an estimate
-        // ("about ten degrees"), not false precision.
-        let approx = (s.gyro_drift_deg.abs() / 5.0).round() * 5.0;
-        Some(format!(
-            "Heading indicator's drifted about {approx:.0} degrees — recommend syncing the gyro."
-        ))
-    }
+/// drift slowly, and on a long leg it's easy to forget to realign — but a
+/// right-seat pilot doesn't nag about it, they reach over and fix it ("the
+/// copilot should adjust it and say so", 2026-07-09). The monitor loop performs
+/// the sync itself (the same DG_sync_mag command as the align_gyro tool) and
+/// announces it with this line. Pure so it unit-tests; rounds to 5° so the
+/// figure sounds like an estimate, not false precision.
+fn gyro_sync_line(drift_deg: f64) -> String {
+    let approx = (drift_deg.abs() / 5.0).round() * 5.0;
+    format!("Heading indicator had drifted about {approx:.0} degrees — re-synced to the compass.")
 }
 
 /// Flaps extended above their speed limit (Vfe) — the per-detent limits from the
@@ -2247,9 +2262,15 @@ mod tests {
     fn low_vacuum_and_alternator_ammeter() {
         let v = LowVacuum;
         let mut s = snap(true, true);
+        s.on_ground = false;
         assert!(v.eval(&s).is_none(), "vacuum ok → silent");
         s.low_vacuum = true;
-        assert!(v.eval(&s).is_some(), "low vacuum → warn unreliable gyros");
+        assert!(v.eval(&s).is_some(), "low vacuum airborne → warn unreliable gyros");
+        // On the ground the light is NORMAL at idle RPM (POH checks vacuum at
+        // run-up power) — cautioning during taxi is noise, never spoken.
+        s.on_ground = true;
+        assert!(v.eval(&s).is_none(), "on the ground → silent");
+        s.on_ground = false;
         s.engine_running = false;
         assert!(v.eval(&s).is_none(), "engine off → no vacuum check");
 
@@ -2457,35 +2478,13 @@ mod tests {
     }
 
     #[test]
-    fn gyro_drift_fires_only_airborne_past_threshold() {
-        let c = GyroDrift;
-        let mut s = snap(true, true);
-
-        // On the ground: never fires, even with big drift (sync at run-up).
-        s.on_ground = true;
-        s.gyro_drift_deg = 20.0;
-        assert!(c.eval(&s).is_none());
-
-        // Airborne, small precession: under threshold, stays quiet.
-        s.on_ground = false;
-        s.gyro_drift_deg = 6.0;
-        assert!(c.eval(&s).is_none());
-
-        // Airborne, drifted past threshold: fires (either sign).
-        s.gyro_drift_deg = 12.0;
-        assert!(c.eval(&s).is_some());
-        s.gyro_drift_deg = -14.0;
-        assert!(c.eval(&s).is_some());
-    }
-
-    #[test]
-    fn gyro_drift_callout_rounds_to_nearest_five() {
-        let c = GyroDrift;
-        let mut s = snap(true, true);
-        s.on_ground = false;
-        s.gyro_drift_deg = -13.0; // |13| → "about 15 degrees"
-        let msg = c.eval(&s).expect("should fire");
-        assert!(msg.contains("15 degrees"), "got: {msg}");
+    fn gyro_sync_line_rounds_to_nearest_five() {
+        // The monitor now SYNCS the DG itself and announces it; the spoken
+        // figure sounds like an estimate (either drift sign).
+        let msg = gyro_sync_line(-13.0);
+        assert!(msg.contains("about 15 degrees"), "got: {msg}");
+        assert!(msg.contains("re-synced"), "got: {msg}");
+        assert!(gyro_sync_line(11.0).contains("about 10 degrees"));
     }
 
     #[test]
