@@ -940,6 +940,13 @@ async fn run_session(
                 if from_radio {
                     if let Some(st) = atc_station.as_mut() {
                         if let Some(who) = st.tuned_speaker(&xplane).await {
+                            blackbox::record(
+                                "atc",
+                                serde_json::json!({
+                                    "route": "keyed", "outcome": "garbled",
+                                    "transcript": command, "confidence": confidence,
+                                }),
+                            );
                             let line = "Station calling, say again.";
                             reporter.log(ui::LogKind::Readback, format!("TWR: {line}"));
                             voice.say_station(Priority::Readback, who, line);
@@ -1008,6 +1015,23 @@ async fn run_session(
             }
             reporter.log(ui::LogKind::Info, "transmitted, nobody on this frequency");
             continue;
+        }
+
+        // "I said eighty percent" — a spoken correction of the value the last
+        // command set. Whisper heard "8" for "80" live, executed 8%, and the
+        // pilot's fix dead-ended; a correction re-anchors on the last subject
+        // immediately, before any gate can drop it.
+        if !from_text {
+            let recent = history
+                .last()
+                .is_some_and(|(_, _, t)| t.elapsed() < FOLLOWUP_WINDOW);
+            if recent {
+                if let (Some(rest), Some(subj)) = (correction_value(&command), &last_subject) {
+                    let rewritten = format!("{subj} {rest}");
+                    reporter.log(ui::LogKind::Info, format!("correction → \"{rewritten}\""));
+                    command = rewritten;
+                }
+            }
         }
 
         // Domain gate, follow-up, and bare-value rewrite apply to SPOKEN input
@@ -4284,6 +4308,39 @@ fn is_bare_value(text: &str) -> bool {
     any_token && any_number
 }
 
+/// "I said eighty percent" / "no, two five zero" / "make it forty" — the pilot
+/// correcting the VALUE of the last command (whisper heard "8" for "80" and the
+/// wrong value already executed; the fix must not dead-end). Returns the bare
+/// value remainder when the utterance is a correction prefix plus nothing but a
+/// value — the caller re-anchors it on the last command's subject, exactly like
+/// a bare-value follow-up. "No, flaps up" returns None (a full command, not a
+/// bare value), and so does a lone "no".
+fn correction_value(text: &str) -> Option<String> {
+    const PREFIXES: &[&[&str]] = &[
+        &["no", "i", "said"],
+        &["no", "i", "meant"],
+        &["i", "said"],
+        &["i", "meant"],
+        &["make", "it"],
+        &["make", "that"],
+        // "How about eighty percent?" — the pilot renegotiating the value
+        // (heard live 2026-07-09 after "Power 8 percent" executed a mishear).
+        &["how", "about"],
+        &["correction"],
+        &["no"],
+    ];
+    let lower = text.to_ascii_lowercase();
+    let toks: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let rest = PREFIXES
+        .iter()
+        .find_map(|p| toks.as_slice().strip_prefix(*p))?
+        .join(" ");
+    (!rest.is_empty() && is_bare_value(&rest)).then_some(rest)
+}
+
 /// The leading non-numeric words of a command — its "subject" — used to
 /// re-anchor a bare-value follow-up onto the same system. "throttle eighty
 /// percent" → "throttle"; "set heading 270" → "set heading". Empty if the
@@ -4593,7 +4650,30 @@ mod tests {
         }
     }
 
+    use super::correction_value;
     use super::looks_like_followup;
+
+    #[test]
+    fn corrections_yield_the_bare_value() {
+        // The live case: "Power 8 percent" executed, then the fix dead-ended.
+        assert_eq!(correction_value("I said 80 percent."), Some("80 percent".into()));
+        assert_eq!(correction_value("no, two five zero"), Some("two five zero".into()));
+        assert_eq!(correction_value("No, I said forty"), Some("forty".into()));
+        assert_eq!(correction_value("make it sixty percent"), Some("sixty percent".into()));
+        assert_eq!(correction_value("correction, one thousand five hundred"),
+                   Some("one thousand five hundred".into()));
+        assert_eq!(correction_value("How about eighty percent?"), Some("eighty percent".into()));
+        // "how about" with a full command is a question for the copilot, not a
+        // value correction.
+        assert_eq!(correction_value("how about we start the descent"), None);
+        // Full commands and non-values are NOT corrections — they take the
+        // normal path ("no, flaps up" must not become "throttle flaps up").
+        assert_eq!(correction_value("no, flaps up"), None);
+        assert_eq!(correction_value("no"), None);
+        assert_eq!(correction_value("I said start the engines"), None);
+        assert_eq!(correction_value("north"), None, "no prefix, no correction");
+        assert_eq!(correction_value("flaps ten"), None);
+    }
 
     #[test]
     fn followups_are_recognized_but_plain_chatter_is_not() {

@@ -49,6 +49,11 @@ pub fn normalize(transcript: &str) -> String {
         "lets go ahead and", "go ahead and", "lets", "let us",
         "please", "okay", "ok", "alright", "all right", "hey", "uh", "um", "er",
         "well", "so", "now", "yeah", "yep", "yes", "gimme", "give me", "just",
+        // Narrative connectives whisper keeps from the pilot thinking aloud
+        // ("And then, fly heading 120." missed live twice on 2026-07-09). A
+        // leading "and" is never load-bearing; mid-sentence "and" is untouched
+        // (compound detection runs after peeling).
+        "and then", "and", "then",
     ];
     // Trailing politeness, peeled the same way.
     const TRAIL: &[&str] = &["please", "for me", "now", "thanks", "thank you", "would you", "okay", "ok"];
@@ -181,6 +186,19 @@ pub fn try_parse(
         if c.name == singular && registry.get(singular).is_none() && registry.get(plural).is_some() {
             c.name = plural.to_string();
         }
+    }
+    // "set speed 60" / "change speed to 60 knots" resolves to the AP airspeed
+    // select — which a C172-class panel doesn't register. The pilot still
+    // means "fly this speed": hand the target to the speed-hold governor when
+    // that's the tool this airframe has. Ten consecutive dead ends on the
+    // 2026-07-09 final approach. Only the absolute forms map (knots/preset);
+    // a relative "reduce by 20" needs the AP bug and stays unmapped.
+    if c.name == "set_speed"
+        && registry.get("set_speed").is_none()
+        && registry.get("hold_speed").is_some()
+        && (c.arguments.get("knots").is_some() || c.arguments.get("preset").is_some())
+    {
+        c.name = "hold_speed".to_string();
     }
     valid(&c, registry, profile).then_some(vec![c])
 }
@@ -594,7 +612,11 @@ fn parse_one(t: &str) -> Option<ToolCall> {
 
     // AP airspeed select: "set speed 250", "speed 280", "airspeed 250". Excludes
     // vertical/ground speed (handled elsewhere) and percent (that's throttle).
-    if (has(t, "speed") || has(t, "airspeed"))
+    // A bare knots unit qualifies too ("reduced to 60 knots", seen dead-ending
+    // live) — but never wind talk ("wind is ten knots" is weather, not a bug).
+    if (has(t, "speed")
+        || has(t, "airspeed")
+        || ((has(t, "knots") || has(t, "knot")) && !has(t, "wind")))
         && !has(t, "vertical")
         && !has(t, "ground")
         && !has(t, "climb")
@@ -608,10 +630,22 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         }
         // Relative before the bare number: "reduce speed by 20" is minus twenty
         // from the bug, not a 20-knot target. Default nudge is 20 knots.
+        // "reduce speed TO 180" is a target, not a decrement — "to" marks it,
+        // same as everywhere else in command speech.
         if has(t, "reduce") || has(t, "decrease") || has(t, "lower") {
+            if has(t, "to") {
+                if let Some(n) = num {
+                    return Some(call("set_speed", json!({ "knots": n })));
+                }
+            }
             return Some(call("set_speed", json!({ "delta": -num.unwrap_or(20) })));
         }
         if has(t, "increase") || has(t, "raise") {
+            if has(t, "to") {
+                if let Some(n) = num {
+                    return Some(call("set_speed", json!({ "knots": n })));
+                }
+            }
             return Some(call("set_speed", json!({ "delta": num.unwrap_or(20) })));
         }
         if let Some(n) = num {
@@ -1149,6 +1183,35 @@ mod tests {
     }
 
     #[test]
+    fn speed_targets_reach_the_governor_on_a_c172() {
+        // Ten consecutive dead ends on the 2026-07-09 final: every "set/change
+        // speed" phrasing resolved to set_speed (the AP airspeed select, which
+        // the 172 doesn't register) and died. They remap to the speed-hold
+        // governor, the tool this airframe actually has.
+        for say in [
+            "change speed to 60 knots",
+            "Change speed to 60.",
+            "set airspeed to 60 knots",
+            "Speed to 60 knots.",
+            "60 knots speed.",
+            "Reduced to 60 knots.",
+        ] {
+            assert_eq!(
+                one(say).unwrap(),
+                ("hold_speed".into(), json!({"knots": 60})),
+                "{say}"
+            );
+        }
+        // "reduce speed TO 180" is a target; "reduce speed BY 20" a decrement.
+        assert_eq!(
+            one("reduce speed to 40 knots").unwrap(),
+            ("hold_speed".into(), json!({"knots": 40}))
+        );
+        // Weather talk must never become a speed command.
+        assert_eq!(one("the wind is 10 knots"), None);
+    }
+
+    #[test]
     fn com_tuning_parses_deterministically() {
         // The 2026-07-08 night flight: six tuning phrasings in a row missed
         // (LLM off), stranding the pilot off-frequency. All deterministic now.
@@ -1320,6 +1383,18 @@ mod tests {
         assert_eq!(one("heading 270").unwrap().1, json!({"heading":270}));
         assert_eq!(one("turn heading south").unwrap().1, json!({"heading":180}));
         assert_eq!(one("change heading to northeast").unwrap().1, json!({"heading":45}));
+        // A leading "and then"/"and" is pilot narration, not a compound
+        // ("And then, fly heading 120." missed live twice on 2026-07-09).
+        assert_eq!(one("and then, fly heading 120").unwrap().1, json!({"heading":120}));
+        assert_eq!(one("and maintain heading 090").unwrap().1, json!({"heading":90}));
+        // The garbled repeat still parses, so the execute-side range guard can
+        // answer "say again" instead of a dead miss beep.
+        assert_eq!(
+            one("and then, fly heading 2700, fly heading 2700").unwrap().1,
+            json!({"heading":2700})
+        );
+        // A mid-sentence "and" joining two actions is still a compound.
+        assert!(one("taxi and nav lights on and flaps ten").is_none());
         // navigate (couple AP to GPS) vs nav lights
         assert_eq!(one("navigate").unwrap().0, "navigate");
         assert_eq!(one("follow the flight plan").unwrap().0, "navigate");

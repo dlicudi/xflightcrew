@@ -207,11 +207,125 @@ pub fn fix_mishears(text: &str) -> String {
     // splits into tokens too far from "gyro" for the fuzzy gate to recover.
     let mut out = replace_ci(text, "j-rule", "gyro");
     out = replace_ci(&out, "j rule", "gyro");
+    for (garble, fix) in PHRASE_MISHEARS {
+        out = replace_word_ci(&out, garble, fix);
+    }
     for (garble, fix, leading_only) in VALUE_MISHEARS {
         out = fix_value_mishear(&out, garble, fix, *leading_only);
     }
-    out
+    fix_trailing_of(&out)
 }
+
+/// Whisper drops the final consonant of a trailing "off": "Engines of",
+/// "electrical systems of" (four dead ends in one 2026-07-09 flight). An
+/// utterance-final "of" is never real speech — "of" is a preposition and
+/// needs an object — so the final word alone repairs; an "of" mid-sentence
+/// ("state of charge") is untouched.
+fn fix_trailing_of(text: &str) -> String {
+    let trimmed = text.trim_end().trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+    if trimmed.len() >= 2
+        && trimmed[trimmed.len() - 2..].eq_ignore_ascii_case("of")
+        && !trimmed[..trimmed.len() - 2]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && !trimmed[..trimmed.len() - 2].trim_end().is_empty()
+    {
+        let head = &text[..trimmed.len() - 2];
+        let tail = &text[trimmed.len()..];
+        format!("{head}off{tail}")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Unconditional whole-phrase repairs. Every entry is a whisper spelling SEEN
+/// LIVE in the flight logs whose garble is meaningless in a cockpit (or only
+/// meaningful as the repaired phrase), so no value guard is needed. Multi-word
+/// needles match with word boundaries at both ends; case-insensitive.
+const PHRASE_MISHEARS: &[(&str, &str)] = &[
+    // Transponder VFR: whisper's favourite victim (8 dead ends in 4 days).
+    ("vfa", "vfr"),                       // "Transponder VFA."
+    ("vfo", "vfr"),                       // "Transponder VFO."
+    ("via file", "vfr"),                  // "Transponder via file."
+    ("responder", "transponder"),         // "Responder VFA."
+    ("coq", "squawk"),                    // "Set coq to VFR."
+    // Strobes. Bare "probe"/"robe"/"show" are real words, so only the paired
+    // "... light(s)" forms repair.
+    ("strokes on", "strobes on"),         // "Strokes on." (0.998 confidence!)
+    ("strokes off", "strobes off"),
+    ("shrobe", "strobe"),                 // "Shrobe lights on."
+    ("shrove", "strobe"),                 // "Shrove lights off."
+    ("robe light", "strobe light"),       // "Robe light on."
+    ("robe lights", "strobe lights"),
+    ("probe light", "strobe light"),      // "Probe lights on." (pitot probes
+    ("probe lights", "strobe lights"),    //  exist; probe LIGHTS don't)
+    ("show lights on", "strobe lights on"),
+    // Vertical speed.
+    ("vertigo speed", "vertical speed"),  // "Vertigo speed 0."
+    ("medical speed", "vertical speed"),  // "Medical speed 0."
+    // Headings: garbled verb before a bare cardinal, and the bare "turn
+    // <direction>" phrasing pilots keep using (repaired live by re-saying
+    // "turn heading east").
+    ("adding north", "heading north"),    // "Adding north."
+    ("adding south", "heading south"),
+    ("adding east", "heading east"),
+    ("adding west", "heading west"),
+    ("bearing north", "heading north"),   // "Bearing south."
+    ("bearing south", "heading south"),
+    ("bearing east", "heading east"),
+    ("bearing west", "heading west"),
+    ("turn north", "turn heading north"),
+    ("turn south", "turn heading south"),
+    ("turn east", "turn heading east"),   // still dead-ending on 2026-07-09
+    ("turn west", "turn heading west"),
+    // Flap detents garbled on the value side.
+    ("flaps fall", "flaps full"),         // "Flaps fall."
+    ("flaps fold", "flaps full"),         // "Flaps fold."
+    ("flaps cool", "flaps full"),         // "Flaps cool."
+    ("flaps voting", "flaps forty"),      // "Flaps voting."
+    ("full flash", "full flaps"),         // "Full flash."
+    // Parking brake.
+    ("backing brake", "parking brake"),   // "And set, backing brake."
+    ("sparking brake", "parking brake"),  // "Really? Sparking brake?"
+    ("spoken brake", "parking brake"),    // "Release spoken brake."
+    ("park and brake", "parking brake"),  // "Park and brake off."
+    ("back and break", "parking brake"),  // "Set back and break."
+    ("rock and break", "parking brake"),  // "Drop, rock and break off."
+    // Engines.
+    ("engine zone", "engines on"),        // "engine zone." (three flights)
+    ("star engine", "start engine"),      // "Star engines."
+    ("star engines", "start engines"),
+    // Climb / descend.
+    ("they send to", "descend to"),       // "They send to five thousand."
+    // Props.
+    ("props to cruz", "props to cruise"), // "Props to Cruz."
+    ("full prompts", "full props"),       // "Full prompts?"
+    // Controls and autopilot.
+    ("mic controls", "my controls"),      // "Mic controls."
+    ("nine controls", "my controls"),     // "9 controls."
+    ("9 controls", "my controls"),
+    ("my control", "my controls"),        // "My control." ("my controls" is
+                                          //  boundary-safe: the s blocks it)
+    ("autopilot dog", "autopilot off"),   // "Autopilot dog."
+    ("go to pilot off", "autopilot off"), // "Go to pilot off."
+    ("all to pilot off", "autopilot off"), // "All to pilot off."
+    ("flap school", "flaps full"),        // "I flap school."
+    ("electrical systems down", "electrical systems off"),
+    ("i like tricks off", "electrics off"), // "I like tricks off."
+    ("said pounds of", "set power to"),   // "said pounds of 5 percent."
+    // Undo: whisper renders it "I'm due" / "undue" ("100% undue." then "I'm
+    // due." twice while the pilot fought to undo a throttle command). Neither
+    // is cockpit speech; "undue stress" isn't said over PTT.
+    ("i'm due", "undo"),
+    ("undue", "undo"),
+    // QNH.
+    ("q&a", "qnh"),                       // "Q&A to 1017."
+    // Fuel selector.
+    ("view selector", "fuel selector"),   // "View selector right."
+    ("queue selector", "fuel selector"),  // "Queue selector left."
+    ("power idol", "power idle"),         // "Power Idol."
+];
 
 /// Value-guarded keyword repairs: `(garble, replacement, leading_only)`. Every
 /// entry is a whole-keyword mishear SEEN LIVE in the flight logs, rewritten only
@@ -224,11 +338,29 @@ const VALUE_MISHEARS: &[(&str, &str, bool)] = &[
     ("total", "throttle", true),    // "Total twenty percent."
     ("frontal", "throttle", true),  // "Frontal 70." (leading-only: frontal weather is real speech)
     ("fraudal", "throttle", false), // "Fraudal twenty percent."
+    ("fraudful", "throttle", false), // "Fraudful 30%"
+    ("flopful", "throttle", false), // "Flopful 0."
+    ("flottle", "throttle", false), // "Flottle sixty percent."
+    ("frottle", "throttle", false),
+    ("thruffling", "throttle", false), // "maximum thruffling."
+    ("commodal", "throttle", false), // "Commodal twenty percent?"
+    ("approval", "throttle", true), // "Approval 50 percent."
+    ("for all", "throttle", true),  // "For all, twenty percent."
+    ("for also", "throttle", true), // "For also twenty percent?"
+    ("travel", "throttle", true),   // "Travel ten percent." (leading-only: travel is real speech)
     ("waffle", "throttle", false),  // "Reduce waffle to fifty percent."
     ("laps", "flaps", true),        // "Laps eleven."
     ("claps", "flaps", true),       // "Claps ten."
+    ("taps", "flaps", true),        // "Taps twenty."
+    ("map's", "flaps", true),       // "Map's up."
+    ("maps", "flaps", true),
+    ("collapse", "flaps", true),    // "collapse ten."
+    ("flash", "flaps", true),       // "Flash full."
+    ("crops", "props", true),       // "Crops, cruise."
     ("describe", "descend", true),  // "Describe five thousand feet."
+    ("descends", "descend", false), // "Descends to one thousand five hundred."
     ("clank", "climb", true),       // "Clank five thousand feet."
+    ("client", "climb", true),      // "Client five thousand feet."
 ];
 
 /// Apply one [`VALUE_MISHEARS`] entry: rewrite `garble` to `fix` when the
@@ -242,7 +374,7 @@ fn fix_value_mishear(text: &str, garble: &str, fix: &str, leading_only: bool) ->
             !w.is_empty()
                 && (is_number_word(w)
                     || w.bytes().all(|b| b.is_ascii_digit())
-                    || matches!(w, "full" | "idle" | "max" | "maximum" | "up" | "down"))
+                    || matches!(w, "full" | "idle" | "max" | "maximum" | "up" | "down" | "cruise"))
         });
     if !has_value {
         return text.to_string();
@@ -351,6 +483,128 @@ mod tests {
         assert_eq!(fix_mishears("you think the j rule?"), "you think the gyro?");
         // Unrelated text is untouched.
         assert_eq!(fix_mishears("align the gyro"), "align the gyro");
+    }
+
+    /// Every whisper spelling in the mishear tables, exercised with the exact
+    /// transcript from the flight log that put it there. `(garbled, repaired)`
+    /// pairs; the repaired form is what the grammar must see.
+    #[test]
+    fn fixes_logged_whisper_garbles() {
+        for (heard, want) in [
+            // Transponder VFR (the biggest dead-end cluster).
+            ("Transponder VFA.", "Transponder vfr."),
+            ("Transponder VFO.", "Transponder vfr."),
+            ("Transponder via file.", "Transponder vfr."),
+            ("Responder VFA.", "transponder vfr."),
+            ("Set coq to VFR.", "Set squawk to VFR."),
+            // Strobes.
+            ("Shrobe lights on.", "strobe lights on."),
+            ("Shrove lights off.", "strobe lights off."),
+            ("Robe light on.", "strobe light on."),
+            ("Probe lights on.", "strobe lights on."),
+            ("Show lights on.", "strobe lights on."),
+            // Vertical speed.
+            ("Vertigo speed 0.", "vertical speed 0."),
+            ("Medical speed 0.", "vertical speed 0."),
+            // Headings.
+            ("Adding north.", "heading north."),
+            ("Bearing south.", "heading south."),
+            ("Turn east.", "turn heading east."),
+            ("Turn west.", "turn heading west."),
+            // Throttle family.
+            ("Fraudful 30%", "throttle 30%"),
+            ("Flottle sixty percent.", "throttle sixty percent."),
+            ("maximum thruffling.", "maximum throttle."),
+            ("Commodal twenty percent?", "throttle twenty percent?"),
+            ("Approval 50 percent.", "throttle 50 percent."),
+            ("For all, twenty percent.", "throttle, twenty percent."),
+            ("For also twenty percent?", "throttle twenty percent?"),
+            ("Travel ten percent.", "throttle ten percent."),
+            ("Power Idol.", "power idle."),
+            // Flaps.
+            ("Taps twenty.", "flaps twenty."),
+            ("Map's up.", "flaps up."),
+            ("collapse ten.", "flaps ten."),
+            ("Flash full.", "flaps full."),
+            ("Full flash.", "full flaps."),
+            ("Flaps fall.", "flaps full."),
+            ("Flaps cool.", "flaps full."),
+            ("Flaps voting.", "flaps forty."),
+            // Parking brake.
+            ("And set, backing brake.", "And set, parking brake."),
+            ("Really? Sparking brake?", "Really? parking brake?"),
+            ("Release spoken brake.", "Release parking brake."),
+            ("Park and brake off.", "parking brake off."),
+            // Engines.
+            ("engine zone.", "engines on."),
+            ("Star engines.", "start engines."),
+            // Climb / descend.
+            ("They send to five thousand.", "descend to five thousand."),
+            ("Client five thousand feet.", "climb five thousand feet."),
+            // Props.
+            ("Props to Cruz.", "props to cruise."),
+            ("Full prompts?", "full props?"),
+            ("Crops, cruise.", "props, cruise."),
+            // Controls.
+            ("Mic controls.", "my controls."),
+            ("9 controls.", "my controls."),
+            ("My control.", "my controls."),
+            ("Autopilot dog.", "autopilot off."),
+            // QNH.
+            ("Q&A to 1017.", "qnh to 1017."),
+            // Fuel selector.
+            ("View selector right.", "fuel selector right."),
+            ("Queue selector left.", "fuel selector left."),
+            // 2026-07-09 second flight.
+            ("Go to pilot off.", "autopilot off."),
+            ("All to pilot off.", "autopilot off."),
+            ("I flap school.", "I flaps full."),
+            ("electrical systems down.", "electrical systems off."),
+            ("Flopful 0.", "throttle 0."),
+            // A trailing "off" losing its second f.
+            ("Engines of", "Engines off"),
+            ("electrical systems of", "electrical systems off"),
+            ("Electrical systems of.", "Electrical systems off."),
+            // 2026-07-09 afternoon flight.
+            ("Strokes on.", "strobes on."),
+            ("Set back and break.", "Set parking brake."),
+            ("Drop, rock and break off.", "Drop, parking brake off."),
+            ("I like tricks off.", "electrics off."),
+            ("said pounds of 5 percent.", "set power to 5 percent."),
+            ("I'm due.", "undo."),
+            ("100% undue.", "100% undo."),
+            ("Descends to one thousand five hundred.", "descend to one thousand five hundred."),
+        ] {
+            assert_eq!(fix_mishears(heard), want, "garble {heard:?}");
+        }
+        // Mid-sentence "of" is real speech and survives.
+        assert_eq!(fix_mishears("state of charge"), "state of charge");
+        assert_eq!(fix_mishears("of"), "of", "a lone 'of' has nothing to repair");
+    }
+
+    /// Real words that share letters with the garbles must survive untouched:
+    /// the repairs only fire on whole words/phrases, and the value-guarded
+    /// ones only with a settable value present.
+    #[test]
+    fn mishear_fixes_leave_real_speech_alone() {
+        for s in [
+            "the pitot probe heats up",
+            "show me the lights",
+            "my controls",
+            "what's the bearing to the field",
+            "turn to the east side of the bay",
+            "we travel a lot",
+            "how long is the flight",
+            "return east after departure",
+            "strobe lights on",
+            "what's our total fuel",
+            "flash of lightning ahead",
+            "the client is happy",
+            "the aircraft descends smoothly",
+            "keep your strokes smooth on the yoke",
+        ] {
+            assert_eq!(fix_mishears(s), s, "{s:?} must not be rewritten");
+        }
     }
 
     #[test]

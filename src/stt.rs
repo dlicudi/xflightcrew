@@ -79,6 +79,15 @@ impl Stt {
         if t.text.is_empty() {
             return Ok(t);
         }
+        // On near-silence whisper sometimes hallucinates its own bias prompt
+        // back ("Numbers are spoken digit by digit.", seen live with the tower
+        // prompt installed). Only a transcript that IS a whole prompt sentence
+        // drops — word-level containment would eat real calls like "ready for
+        // departure", whose every word appears in the prompt vocabulary.
+        if is_prompt_echo(&t.text, &self.prompt) {
+            tracing::info!(text = %t.text, "dropped prompt echo (whisper hallucinated its bias prompt)");
+            return Ok(Transcription { text: String::new(), ..t });
+        }
         // Clean the transcript for the gate and grammar: join hyphenated compounds
         // ("auto-pilot" → "autopilot"), repair whole-word mishears the bias prompt
         // can't prevent ("gyro" → "J-Rule"), then normalize spoken digit runs
@@ -231,10 +240,56 @@ fn is_hallucination(text: &str) -> bool {
         || CAPTION_MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// True when the transcript is a whole SENTENCE of the bias prompt, which
+/// whisper hallucinates back on near-silence ("Numbers are spoken digit by
+/// digit.", seen live with the tower prompt installed). Sentence-exact on
+/// purpose: the prompt is a vocabulary list, so word-level matching would eat
+/// genuine calls built from the same words ("ready for departure").
+fn is_prompt_echo(text: &str, prompt: &str) -> bool {
+    fn canon(s: &str) -> String {
+        s.to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    let heard = canon(text);
+    if heard.split(' ').count() < 3 {
+        return false; // too short to be a prompt sentence
+    }
+    prompt
+        .split(['.', ':'])
+        .map(canon)
+        .any(|sentence| !sentence.is_empty() && sentence == heard)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn prompt_echoes_drop_but_real_calls_survive() {
+        // The live hallucination: whisper reading its bias prompt back.
+        assert!(is_prompt_echo(
+            "Numbers are spoken digit by digit.",
+            crate::tower::STT_PROMPT
+        ));
+        // Real calls made of prompt vocabulary must NOT be eaten.
+        for call in [
+            "ready for departure",
+            "request taxi",
+            "radio check",
+            "request departure clearance",
+            "runway zero niner",
+        ] {
+            assert!(!is_prompt_echo(call, crate::tower::STT_PROMPT), "{call}");
+        }
+        // The profile prompt's tail sentence, as build_prompt writes it.
+        let p = build_prompt(&crate::aircraft::builtin("cessna_172sp").unwrap());
+        assert!(is_prompt_echo("Numbers are spoken digit by digit", &p));
+        assert!(!is_prompt_echo("flaps ten", &p));
+    }
 
     /// Verify the real whisper model transcribes a cockpit command. We don't
     /// have a mic in CI, so we synthesize speech with macOS `say`, downsample to

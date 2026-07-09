@@ -613,6 +613,15 @@ impl Tool for SetHeading {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: Args = serde_json::from_value(args.clone())?;
+        // A heading well past 360 is a mishear, not a wrap: "turn heading
+        // 1018" (QNH bleeding into the phrase, seen live) silently flew 298.
+        // Refuse it; only a small overshoot ("370") wraps.
+        if args.heading > 400.0 {
+            return Ok(format!(
+                "Say again? I heard heading {:.0}, and headings run zero to three sixty.",
+                args.heading
+            ));
+        }
         // Normalize into 0..360 (so "370" → 10, "-10" → 350).
         let heading = args.heading.rem_euclid(360.0);
 
