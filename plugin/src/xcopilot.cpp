@@ -846,49 +846,11 @@ protected:
     }
 };
 
-// Floating callout toast: a borderless window upper-centre of the screen that
-// flashes the action label ("FLAPS > 10") while the camera glances at the panel
-// — the "what am I changing" graphic. Shown/hidden by a slow flight loop.
-class CalloutToast : public ImgWindow {
-public:
-    CalloutToast(int l, int t, int r, int b)
-        : ImgWindow(l, t, r, b, xplm_WindowDecorationNone, xplm_WindowLayerFloatingWindows) {
-        SetWindowTitle("x-copilot callout");
-        ImGuiIO& io = ImGui::GetIO();
-        io.IniFilename = nullptr;
-    }
-protected:
-    void buildInterface() override {
-        ImGui::SetWindowFontScale(1.8f);
-        ImVec2 ts = ImGui::CalcTextSize(g_callout.buf);
-        ImGui::SetCursorPos(ImVec2((ImGui::GetWindowWidth() - ts.x) * 0.5f,
-                                   (ImGui::GetWindowHeight() - ts.y) * 0.5f));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_AMBER));
-        ImGui::TextUnformatted(g_callout.buf);
-        ImGui::PopStyleColor();
-        ImGui::SetWindowFontScale(1.0f);
-    }
-};
-static std::unique_ptr<CalloutToast> g_toast;
-
-// Show the toast for a beat after each callout write, then hide it again —
-// positioned toward the control (the "nx,ny|" offset) when the callout came
-// with a camera glance, centre-screen otherwise.
-static float ToastLoop(float, float, int, void*) {
-    if (g_toast) {
-        bool show = g_callout.len > 0 && (XPLMGetElapsedTime() - g_callout_time) < 2.5f;
-        if (show && !g_toast->GetVisible()) {
-            int sl, st, sr, sb;
-            XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
-            const int cw = 400, chh = 84;
-            int cx = (sl + sr) / 2 + static_cast<int>(g_callout_nx * (sr - sl) * 0.35f);
-            int cy = (st + sb) / 2 + static_cast<int>(g_callout_ny * (st - sb) * 0.35f);
-            g_toast->SetWindowGeometry(cx - cw / 2, cy + chh / 2, cx + cw / 2, cy - chh / 2);
-        }
-        if (g_toast->GetVisible() != show) g_toast->SetVisible(show);
-    }
-    return 0.2f;
-}
+// The floating callout toast is gone: a notification splashed over the scenery
+// after every action proved to be noise — the voice readback confirms the
+// action, and the panel log keeps the written record. The callout dataref
+// stays registered below so the app's writes keep succeeding; the plugin just
+// no longer draws them.
 
 static std::unique_ptr<XCopilotPanel> g_panel;
 static XPLMMenuID g_menu = nullptr;
@@ -1007,13 +969,6 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
     g_panel->startCollapsed();
     g_toggle_cmd = XPLMCreateCommand("xcopilot/toggle_panel", "x-copilot: toggle the status panel");
     XPLMRegisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr);
-    // Callout toast: upper-centre, borderless, hidden until a callout arrives.
-    int cw = 400, chh = 84;
-    int cl2 = (sl + sr) / 2 - cw / 2;
-    int ct2 = st - (st - sb) / 5;
-    g_toast = std::make_unique<CalloutToast>(cl2, ct2, cl2 + cw, ct2 - chh);
-    g_toast->SetVisible(false);
-    XPLMRegisterFlightLoopCallback(ToastLoop, 1.0f, nullptr);
 
     int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "X-COPILOT", nullptr, 0);
     g_menu = XPLMCreateMenu("X-COPILOT", XPLMFindPluginsMenu(), idx, MenuHandler, nullptr);
@@ -1031,8 +986,6 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
 
 PLUGIN_API void XPluginStop(void) {
     if (g_toggle_cmd) { XPLMUnregisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr); g_toggle_cmd = nullptr; }
-    XPLMUnregisterFlightLoopCallback(ToastLoop, nullptr);
-    g_toast.reset();
     if (g_radio_dref) { XPLMUnregisterDataAccessor(g_radio_dref); g_radio_dref = nullptr; }
     if (g_callout_dref) { XPLMUnregisterDataAccessor(g_callout_dref); g_callout_dref = nullptr; }
     g_panel.reset();
