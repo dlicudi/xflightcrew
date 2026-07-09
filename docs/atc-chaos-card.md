@@ -80,6 +80,38 @@ Work through these in one or two flights. Tick, and note anything odd.
 | Set a strong opposite wind between two calls | The runway changes, and the clearance says so |
 | "Wind check" / "say QNH" / "how's the wind" | Wind and QNH, read from the sim, never invented |
 
+### Emergencies and the pattern (added 2026-07-09)
+
+| Do this | Expect |
+|---|---|
+| "Mayday, mayday" from any phase | "Roger mayday", cleared to land, emergency services — never "say again" |
+| "Pan pan" / "declaring an emergency" | Same priority handling |
+| Mayday to APPROACH or DEPARTURE | "Roger mayday" + vectors home, never "contact tower" |
+| "Emergency landing checklist" (cockpit, unkeyed) | The copilot's checklist, NOT a mayday |
+| Land, then "going around" mid-flare | Clearance voided, "report downwind", pattern re-sequences |
+| "Downwind" then "turning base" then "final" | "Report base" / "report final" / cleared to land, in order |
+| "Base" alone with no pattern context | Say again (too common a word to trust bare) |
+
+### ATIS (added 2026-07-09)
+
+| Do this | Expect |
+|---|---|
+| Tune the ATIS frequency | The broadcast within a tick, then a repeat ~45 s later |
+| Stay tuned through a big QNH change | The letter advances (Bravo), numbers update |
+| Sit through calm-wind wobble | The letter does NOT advance per broadcast |
+| Call tower "with information <current>" | Clearances drop the QNH clause |
+| Call with a STALE letter | Clearances keep the QNH (safety over brevity) |
+
+### Enroute and traffic (added 2026-07-09)
+
+| Do this | Expect |
+|---|---|
+| Fly toward another towered field 20+ nm away | One handoff ("radar services terminated, contact ... Tower on ..."), then the new tower answers calls |
+| Orbit the midpoint between two fields | NO ping-pong handoffs (5 nm hysteresis + cooldown) |
+| Stay on the runway/ground | Never a region handoff |
+| With AI traffic on, fly near another aircraft while tuned to any controller | "Traffic, x o'clock, y miles" in that controller's voice, at most one per 45 s |
+| Same but tuned off-frequency | Silence — nobody is watching |
+
 ## Post-flight
 
 Pull the trace apart. Every command below reads `logs/blackbox.jsonl`.
@@ -120,4 +152,5 @@ intent it SHOULD have parsed to (or `unknown` if "say again" was right), run
 the logs beat invented ones; that is the whole point of the trace.
 
 Known gaps, documented in the corpus as `unknown` until the intents exist:
-flight following, downwind/base position reports, go-around calls.
+flight following. (Downwind/base reports, go-arounds and mayday landed
+2026-07-09.)

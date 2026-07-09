@@ -81,6 +81,21 @@ sim and returns text — it can never actuate. Frequencies come from apt.dat
 comm rows (parsed in [src/nav.rs](src/nav.rs)), not hardcoding; config via
 `XCOPILOT_ATC_AIRPORT` (default LXGB), `XCOPILOT_ATC_VOICE`, `XCOPILOT_ATC_RATE`.
 
+Depth (added 2026-07-09): **Mayday/pan-pan** is the one intent that earns a
+landing clearance without a final report (strict keywords, checked before the
+question guard; approach/departure keep an emergency and vector it home);
+**go-arounds** void the clearance and rejoin; **pattern reports**
+(downwind/base/crosswind) sequence the circuit; **ATIS broadcasts in-process**
+on its own frequency ("with information X" then drops the QNH from
+clearances; `XCOPILOT_ATC_ATIS_PIPER_VOICE`); an **enroute region**
+(`XCOPILOT_ATC_REGION=off` to disable) indexes every towered field at startup
+and hands the flight to whichever tower becomes decisively nearer (monitor
+`region_tick` speaks, main loop consumes `PENDING_STATION`); and **traffic
+advisories** narrate the TCAS picture whenever any controller is tuned, not
+just under vectors. Station side state (ATIS/region/controller freqs) is
+published by `Station::install()`, called by the owner — never by
+`from_airport`, so sweeps and tests stay side-effect free.
+
 Battle-test surface (all deterministic, in `cargo test` unless noted): the
 state-by-intent matrix test in [src/tower.rs](src/tower.rs); the adversarial
 transcript corpus [bench/atc_corpus.yaml](bench/atc_corpus.yaml) (real whisper
