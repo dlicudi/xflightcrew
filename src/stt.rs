@@ -50,6 +50,14 @@ pub struct Stt {
     /// Decoding bias prompt (whisper `initial_prompt`). Defaults to the generic
     /// cockpit vocab; [`set_prompt`](Self::set_prompt) swaps in a profile-aware one.
     prompt: String,
+    /// Bias prompt for RADIO-KEYED captures (base + tower phraseology). Kept
+    /// separate because prompt prefill runs on the Metal GPU per decode — the
+    /// tower vocabulary more than doubles decode time (483 ms → 1,047 ms
+    /// median, measured across the 2026-07-09 flights) and X-Plane's frames
+    /// pay for it. The transmit key is known before transcription, so only
+    /// transmissions carry the expensive prompt; cockpit commands never do.
+    /// Empty = radio captures use the base prompt too.
+    radio_prompt: String,
 }
 
 impl Stt {
@@ -61,7 +69,7 @@ impl Stt {
         params.use_gpu(use_gpu);
         let ctx = WhisperContext::new_with_params(model_path, params)
             .with_context(|| format!("loading whisper model: {model_path}"))?;
-        Ok(Self { ctx, prompt: VOCAB_PROMPT.to_string() })
+        Ok(Self { ctx, prompt: VOCAB_PROMPT.to_string(), radio_prompt: String::new() })
     }
 
     /// Replace the decoding bias prompt — used to install the per-aircraft vocab
@@ -70,12 +78,31 @@ impl Stt {
         self.prompt = prompt;
     }
 
+    /// Install the radio-keyed prompt (base + tower phraseology). See the
+    /// field docs: this one is expensive, so it only rides on transmissions.
+    pub fn set_radio_prompt(&mut self, prompt: String) {
+        self.radio_prompt = prompt;
+    }
+
     /// Transcribe 16 kHz mono f32 audio to text plus a confidence score, applying
     /// the command-loop domain fixes (mishear repair + digit-run normalization) so
     /// the real keyword/number reaches the gate. Use [`transcribe_verbatim`] for
     /// callers that need the literal words (e.g. voice-clone captioning).
     pub fn transcribe(&self, audio: &[f32]) -> Result<Transcription> {
-        let t = self.transcribe_verbatim(audio)?;
+        self.transcribe_gated(audio, false)
+    }
+
+    /// Like [`transcribe`](Self::transcribe), with `radio = true` selecting the
+    /// radio-keyed prompt (tower phraseology) — the caller knows the transmit
+    /// key's state before decoding, and only transmissions pay for the bigger
+    /// prompt's GPU prefill.
+    pub fn transcribe_gated(&self, audio: &[f32], radio: bool) -> Result<Transcription> {
+        let prompt = if radio && !self.radio_prompt.is_empty() {
+            self.radio_prompt.as_str()
+        } else {
+            self.prompt.as_str()
+        };
+        let t = self.run(audio, prompt)?;
         if t.text.is_empty() {
             return Ok(t);
         }
@@ -84,7 +111,7 @@ impl Stt {
         // prompt installed). Only a transcript that IS a whole prompt sentence
         // drops — word-level containment would eat real calls like "ready for
         // departure", whose every word appears in the prompt vocabulary.
-        if is_prompt_echo(&t.text, &self.prompt) {
+        if is_prompt_echo(&t.text, prompt) {
             tracing::info!(text = %t.text, "dropped prompt echo (whisper hallucinated its bias prompt)");
             return Ok(Transcription { text: String::new(), ..t });
         }
@@ -103,6 +130,11 @@ impl Stt {
     /// The captioning path needs this: a voice-clone reference text must match the
     /// audio's actual phonemes, so "two seven zero" must stay words, not "270".
     pub fn transcribe_verbatim(&self, audio: &[f32]) -> Result<Transcription> {
+        self.run(audio, &self.prompt)
+    }
+
+    /// The decode itself, with the chosen bias prompt.
+    fn run(&self, audio: &[f32], prompt: &str) -> Result<Transcription> {
         let started = std::time::Instant::now();
         let mut state = self.ctx.create_state().context("creating whisper state")?;
 
@@ -116,7 +148,7 @@ impl Stt {
         params.set_print_realtime(false);
         params.set_language(Some("en"));
         // Bias decoding toward the cockpit vocabulary (profile-aware if set).
-        params.set_initial_prompt(&self.prompt);
+        params.set_initial_prompt(prompt);
         // Reduce hallucination on non-speech: suppress non-speech tokens and
         // leading blanks, and don't carry context between segments (so one ghost
         // can't seed the next).

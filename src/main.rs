@@ -757,9 +757,12 @@ async fn run_session(
             .spawn(move || station::load_region(&path))
             .ok();
     }
-    // Radio-call vocabulary rides along in the whisper bias so "request taxi" /
-    // "ready for departure" transcribe as reliably as cockpit commands.
-    stt.set_prompt(format!("{} {}", stt::build_prompt(&profile), tower::STT_PROMPT));
+    // Radio-call vocabulary rides in a SEPARATE whisper bias prompt applied
+    // only to radio-keyed captures: prompt prefill is GPU work per decode, and
+    // the tower phrasing more than doubles it (483 → 1,047 ms median, felt as
+    // sim fps dips) — cockpit commands must never pay for it.
+    stt.set_prompt(stt::build_prompt(&profile));
+    stt.set_radio_prompt(format!("{} {}", stt::build_prompt(&profile), tower::STT_PROMPT));
     // Tool specs for the LLM = curated tools + each checklist as a no-arg "tool"
     // the loop intercepts and runs interactively.
     let mut specs = registry.specs();
@@ -834,11 +837,6 @@ async fn run_session(
         },
     );
 
-    // Whether the STT prompt currently carries the tower vocabulary. Prompt
-    // tokens are prefilled on EVERY decode — the always-on tower prompt took
-    // GPU decode from ~450 ms to ~1,090 ms (measured 2026-07-08) — so the
-    // radio phrasing rides along only while COM1 is actually on the station.
-    let mut stt_radio_bias = true;
     loop {
         reporter.status(ui::Phase::Listening);
         // An enroute handoff armed by the monitor: rebuild the station around
@@ -858,20 +856,6 @@ async fn run_session(
                     atc_station = Some(st);
                 }
                 None => tracing::warn!(%name, "region handoff to a field without a tower; keeping the old station"),
-            }
-        }
-        if let Some(st) = atc_station.as_ref() {
-            let on_freq = live
-                .get(datarefs::COM1_FREQ_KHZ)
-                .is_some_and(|v| st.covers_khz(v.round() as i64));
-            if on_freq != stt_radio_bias {
-                stt_radio_bias = on_freq;
-                let base = stt::build_prompt(&live_profile.get());
-                stt.set_prompt(if on_freq {
-                    format!("{base} {}", tower::STT_PROMPT)
-                } else {
-                    base
-                });
             }
         }
         // Input is spoken (gated like before) or typed in the TUI. A typed
@@ -911,7 +895,8 @@ async fn run_session(
             registry = Registry::for_aircraft(&profile);
             checklists = checklist::load(&profile).unwrap_or_default();
             manual_index = rag::Index::load(&profile.id);
-            stt.set_prompt(format!("{} {}", stt::build_prompt(&profile), tower::STT_PROMPT));
+            stt.set_prompt(stt::build_prompt(&profile));
+            stt.set_radio_prompt(format!("{} {}", stt::build_prompt(&profile), tower::STT_PROMPT));
             specs = registry.specs();
             specs.extend(checklists.iter().map(|c| c.spec()));
             tracing::info!(aircraft = %profile.display_name, "reconfigured for new aircraft");
@@ -2170,7 +2155,9 @@ fn listen_once(
     if audio.is_empty() {
         return None; // idle timeout (continuous) or empty capture
     }
-    match stt.transcribe(&audio) {
+    // The transmit key's state is known BEFORE decoding: only a keyed
+    // transmission carries the (GPU-expensive) tower prompt.
+    match stt.transcribe_gated(&audio, from_radio) {
         Ok(t) if !t.text.is_empty() => Some((t, from_radio)),
         _ => None,
     }
