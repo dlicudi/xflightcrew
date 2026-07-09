@@ -472,10 +472,12 @@ impl StationVoice {
                     // Controller cadence: brisker pace and more rhythm variation
                     // than the voice's storybook defaults — alan-medium at stock
                     // length_scale 1.0 was heard live as "drone like and slow".
-                    // ACCENTED voices keep a near-natural pace instead: davefx
-                    // at the brisk 0.8 was "a bit fast" live (2026-07-09) — an
-                    // accent needs the extra beat to stay intelligible.
-                    let pace = if model.contains("/es_") { 0.95 } else { 0.8 };
+                    // ACCENTED voices run SLOWER than natural instead: davefx
+                    // was "a bit fast" at the brisk 0.8 and still fast at a
+                    // natural-ish 0.95 (both heard live 2026-07-09) — through
+                    // a radio effect, an accent needs a measured pace to stay
+                    // intelligible.
+                    let pace = if model.contains("/es_") { 1.1 } else { 0.8 };
                     engine.override_scales(
                         None,
                         Some(env_f32("XCOPILOT_ATC_TTS_LENGTH", pace)),
