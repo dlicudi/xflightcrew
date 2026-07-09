@@ -750,7 +750,7 @@ async fn run_session(
     let home_airport_name = atc_station.as_ref().map(|s| s.airport_name().to_string());
     if let Some(st) = &atc_station {
         st.install();
-        voice.set_station_seed(0);
+        voice.set_station_cast(0, None);
     }
     // Enroute region: index every towered field (a full apt.dat pass, so a
     // background thread) so the flight can outgrow its departure airport —
@@ -875,7 +875,7 @@ async fn run_session(
         // utterance is routed — consumed at the loop top it lagged one call
         // behind, and "Ready for takeoff?" at Ciudad Real was answered by
         // Gibraltar's dead-air briefing (seen live 2026-07-09).
-        if let Some(apt) = station::PENDING_STATION
+        if let Some((icao, apt)) = station::PENDING_STATION
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
@@ -886,13 +886,17 @@ async fn run_session(
                     reporter.log(ui::LogKind::Info, format!("ATC region: now working {name}"));
                     st.install();
                     // A new field, a new crew: per-airport voices from the
-                    // pool — unless we're back home, where the curated
-                    // voices belong.
-                    voice.set_station_seed(if home_airport_name.as_deref() == Some(&name) {
-                        0
+                    // pool, with the country's own accent (by ICAO prefix)
+                    // manning the tower and the ATIS — unless we're back
+                    // home, where the curated voices belong.
+                    if home_airport_name.as_deref() == Some(&name) {
+                        voice.set_station_cast(0, None);
                     } else {
-                        crate::voice::station_voice_seed(&name)
-                    });
+                        voice.set_station_cast(
+                            crate::voice::station_voice_seed(&name),
+                            crate::voice::local_accent_for(&icao).map(str::to_string),
+                        );
+                    }
                     atc_station = Some(st);
                 }
                 None => tracing::warn!(%name, "region handoff to a field without a tower; keeping the old station"),

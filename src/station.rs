@@ -831,6 +831,7 @@ pub fn atis_current_letter() -> Option<char> {
 /// rebuilds itself around the new field — Gibraltar stops following you to
 /// Malaga.
 pub struct RegionApt {
+    pub icao: String,
     pub apt: nav::AirportInfo,
     lat: f64,
     lon: f64,
@@ -843,8 +844,9 @@ pub static REGION: Mutex<Vec<RegionApt>> = Mutex::new(Vec::new());
 static ACTIVE_FIELD: Mutex<Option<(String, f64, f64)>> = Mutex::new(None);
 
 /// A station swap the main loop must consume (it owns the `Station`): the new
-/// field, armed by [`region_tick`] after the handoff line is spoken.
-pub static PENDING_STATION: Mutex<Option<nav::AirportInfo>> = Mutex::new(None);
+/// field's ICAO (for the voice casting) and airport, armed by [`region_tick`]
+/// after the handoff line is spoken.
+pub static PENDING_STATION: Mutex<Option<(String, nav::AirportInfo)>> = Mutex::new(None);
 
 static LAST_REGION_SWITCH: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -862,10 +864,10 @@ const SWITCH_COOLDOWN_SECS: f64 = 180.0;
 /// stays single-airport, exactly the pre-region behavior.
 pub fn load_region(apt_path: &str) {
     let mut v: Vec<RegionApt> = Vec::new();
-    let res = nav::scan_airports(apt_path, |_icao, apt| {
+    let res = nav::scan_airports(apt_path, |icao, apt| {
         if apt.freq(nav::FREQ_TOWER).is_some() {
             if let Some((lat, lon)) = apt.position() {
-                v.push(RegionApt { apt, lat, lon });
+                v.push(RegionApt { icao: icao.to_string(), apt, lat, lon });
             }
         }
     });
@@ -954,7 +956,8 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
         }
     };
     tracing::info!(from = %active_name, to = %best.apt.name, ground = on_ground, "region switch");
-    *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = Some(best.apt.clone());
+    *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((best.icao.clone(), best.apt.clone()));
     *LAST_REGION_SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
     Some(sw)
 }
@@ -1498,6 +1501,7 @@ mod tests {
 
     fn region_apt(name: &str, lat: f64, lon: f64) -> RegionApt {
         RegionApt {
+            icao: name.get(0..4).unwrap_or("XXXX").to_uppercase(),
             apt: nav::AirportInfo {
                 name: name.into(),
                 elev_ft: 0.0,

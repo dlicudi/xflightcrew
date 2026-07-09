@@ -48,6 +48,27 @@ pub enum Priority {
     Warning,
 }
 
+/// The LOCAL accent for a country, by ICAO prefix — the voice its towers and
+/// ATIS speak English with. Deliberately strict about geography: Spain (LE)
+/// and the Canaries (GC) get the Castilian es_ES voice, and the es_MX voices
+/// serve only Spanish-speaking Latin America — a Madrid tower must not sound
+/// like Mexico City ("no mexicans in Spain", 2026-07-09). Fields with no
+/// mapping cast entirely from the neutral pool.
+pub fn local_accent_for(icao: &str) -> Option<&'static str> {
+    let p2 = icao.get(0..2).unwrap_or("");
+    match p2 {
+        // Spain + Canaries: Castilian-accented English.
+        "LE" | "GC" => Some("models/es_ES-davefx-medium.onnx"),
+        // Spanish-speaking Latin America (Mexico, Colombia, Ecuador, Peru,
+        // Chile, Argentina/Uruguay/Paraguay/Bolivia share the SA/S* prefixes
+        // loosely — Brazil (SB/SD/SN/SS/SW) is Portuguese and stays neutral).
+        "MM" | "SK" | "SE" | "SP" | "SC" | "SA" | "SU" | "SG" | "SL" | "SV" => {
+            Some("models/es_MX-claude-high.onnx")
+        }
+        _ => None,
+    }
+}
+
 /// A stable per-airport voice seed (FNV-1a over the name), never 0 — seed 0
 /// is reserved for the configured home field's curated voices.
 pub fn station_voice_seed(airport_name: &str) -> usize {
@@ -82,8 +103,16 @@ impl StationSpeaker {
     /// per-airport crew from `atc_voice_pool`, offset per position so the
     /// controllers at one field are distinct people. An empty pool always
     /// falls back to the curated voices.
-    fn model(self, config: &Config, seed: usize) -> String {
+    fn model(self, config: &Config, seed: usize, local: Option<&str>) -> String {
         if seed != 0 {
+            // The country's own accent mans the tower and reads the ATIS
+            // (one recording voice per field is exactly how ATIS sounds);
+            // approach/departure fill from the neutral pool.
+            if let Some(local) = local {
+                if matches!(self, StationSpeaker::Tower | StationSpeaker::Atis) {
+                    return local.to_string();
+                }
+            }
             let pool: Vec<&str> = config
                 .atc_voice_pool
                 .split(',')
@@ -194,6 +223,9 @@ struct Inner {
     /// controllers ("we need a different voice for Ciudad Real", 2026-07-09).
     /// Changing it drops the warm station sessions on the next utterance.
     station_seed: std::sync::atomic::AtomicUsize,
+    /// The active airport's LOCAL accent voice, when its country has one
+    /// (see [`local_accent_for`]): cast as the tower and the ATIS reader.
+    station_local: Mutex<Option<String>>,
     /// What the copilot has spoken recently, with when it finished. The listener
     /// checks heard transcripts against this to reject its own voice coming back
     /// over the speakers (echo) rather than acting on it.
@@ -220,6 +252,7 @@ impl Voice {
             }),
             cv: Condvar::new(),
             station_seed: std::sync::atomic::AtomicUsize::new(0),
+            station_local: Mutex::new(None),
             spoken: Mutex::new(Vec::new()),
         });
         let gate = MicGate::new();
@@ -232,11 +265,17 @@ impl Voice {
         Voice { inner, gate }
     }
 
-    /// Set the station voice seed for the active airport: 0 = the configured
-    /// per-position voices (the curated home field); any other value picks a
-    /// stable per-airport crew from the voice pool. The warm sessions rebuild
-    /// on the next station utterance.
-    pub fn set_station_seed(&self, seed: usize) {
+    /// Cast the active airport's controllers: seed 0 = the configured
+    /// per-position voices (the curated home field); any other seed picks a
+    /// stable per-airport crew from the voice pool, with `local` (the
+    /// country's accent, when it has one) seated as the tower and the ATIS
+    /// reader. The warm sessions rebuild on the next station utterance.
+    pub fn set_station_cast(&self, seed: usize, local: Option<String>) {
+        *self
+            .inner
+            .station_local
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = local;
         self.inner
             .station_seed
             .store(seed, std::sync::atomic::Ordering::Relaxed);
@@ -622,11 +661,21 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             stations = [None, None, None, None];
             stations_seed = seed;
         }
+        let local = utt.station.and_then(|_| {
+            inner
+                .station_local
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        });
         let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(who) = utt.station {
                 stations[who.slot()]
                     .get_or_insert_with(|| {
-                        StationVoice::build(&station_cfg, &who.model(&station_cfg, seed))
+                        StationVoice::build(
+                            &station_cfg,
+                            &who.model(&station_cfg, seed, local.as_deref()),
+                        )
                     })
                     .speak(&utt.text)
             } else {
@@ -742,17 +791,31 @@ mod tests {
             StationSpeaker::Atis,
         ]
         .iter()
-        .map(|s| s.model(&cfg, seed))
+        .map(|s| s.model(&cfg, seed, None))
         .collect();
         let mut unique = crew.clone();
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), 4, "positions must be distinct people: {crew:?}");
         // Seed 0 = the curated home voices, pool or not.
-        assert_eq!(StationSpeaker::Tower.model(&cfg, 0), "tower.onnx");
+        assert_eq!(StationSpeaker::Tower.model(&cfg, 0, None), "tower.onnx");
         // No pool → curated voices even for a seeded airport.
         let bare = Config { atc_piper_voice: "tower.onnx".into(), ..Config::default() };
-        assert_eq!(StationSpeaker::Tower.model(&bare, seed), "tower.onnx");
+        assert_eq!(StationSpeaker::Tower.model(&bare, seed, None), "tower.onnx");
+        // Country casting: the local accent mans the tower and reads the
+        // ATIS; approach/departure stay neutral (from the pool).
+        let local = Some("es.onnx");
+        assert_eq!(StationSpeaker::Tower.model(&cfg, seed, local), "es.onnx");
+        assert_eq!(StationSpeaker::Atis.model(&cfg, seed, local), "es.onnx");
+        assert_ne!(StationSpeaker::Approach.model(&cfg, seed, local), "es.onnx");
+        // Geography: Castilian in Spain and the Canaries, es_MX only in
+        // Spanish Latin America, neutral elsewhere (and NEVER es_MX in Spain).
+        assert_eq!(local_accent_for("LEMD"), Some("models/es_ES-davefx-medium.onnx"));
+        assert_eq!(local_accent_for("GCXO"), Some("models/es_ES-davefx-medium.onnx"));
+        assert_eq!(local_accent_for("MMMX"), Some("models/es_MX-claude-high.onnx"));
+        assert_eq!(local_accent_for("SBGR"), None, "Brazil speaks Portuguese, stays neutral");
+        assert_eq!(local_accent_for("EGLL"), None);
+        assert_eq!(local_accent_for("LXGB"), None, "home field keeps its curated cast anyway");
     }
 
     #[test]
