@@ -142,6 +142,9 @@ pub struct Config {
     /// Piper voice for DEPARTURE. Empty falls back to the tower's voice.
     /// `XCOPILOT_ATC_DEPARTURE_PIPER_VOICE`.
     pub atc_departure_piper_voice: String,
+    /// Piper voice for the ATIS broadcast. Empty falls back to the tower's
+    /// voice. `XCOPILOT_ATC_ATIS_PIPER_VOICE`.
+    pub atc_atis_piper_voice: String,
     /// Recorded squelch transient spliced onto the end of every station
     /// transmission (VATSIM-style; the default is AFV-Native's click, BSD-3,
     /// see assets/afv/). Empty falls back to the synthesized burst.
@@ -226,6 +229,9 @@ impl Config {
                 "XCOPILOT_ATC_DEPARTURE_PIPER_VOICE",
                 "models/en_GB-northern_english_male-medium.onnx",
             ),
+            // Empty = the tower's voice; ATIS on a real field is often the
+            // same controller reading onto the loop anyway.
+            atc_atis_piper_voice: env_or("XCOPILOT_ATC_ATIS_PIPER_VOICE", ""),
             atc_squelch_wav: env_or("XCOPILOT_SQUELCH_WAV", "assets/afv/Click_f32.wav"),
             atc_voice: env_or("XCOPILOT_ATC_VOICE", "Daniel"),
             atc_rate: env_or("XCOPILOT_ATC_RATE", "165"),

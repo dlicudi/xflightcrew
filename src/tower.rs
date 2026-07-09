@@ -83,6 +83,17 @@ pub struct Ctx {
     pub approach: Option<String>,
 }
 
+/// The ", QNH ..." clause of a clearance — empty when the pilot has the
+/// current ATIS information (the station blanks `ctx.qnh`), so the clearance
+/// skips the numbers the broadcast already gave them.
+fn qnh_clause(ctx: &Ctx) -> String {
+    if ctx.qnh.is_empty() {
+        String::new()
+    } else {
+        format!(", QNH {}", ctx.qnh)
+    }
+}
+
 pub fn parse_intent(transcript: &str) -> Intent {
     let t = transcript.to_lowercase();
     let word = |w: &str| t.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == w);
@@ -307,9 +318,11 @@ impl Tower {
                 format!("{}, {} Tower, reading you five.", ctx.callsign, ctx.airport)
             }
             Intent::RequestClearance => format!(
-                "{}, cleared to leave the {} zone, not above two thousand feet, \
-                 QNH {}, squawk seven zero zero zero.",
-                ctx.callsign, ctx.airport, ctx.qnh
+                "{}, cleared to leave the {} zone, not above two thousand feet{}, \
+                 squawk seven zero zero zero.",
+                ctx.callsign,
+                ctx.airport,
+                qnh_clause(ctx)
             ),
             // An arrival taxiing in — by request wording, or because the last
             // clearance was a landing one (a generic "request taxi" right
@@ -326,9 +339,12 @@ impl Tower {
             Intent::RequestTaxi => {
                 self.state = State::TaxiCleared;
                 format!(
-                    "{}, taxi to holding point {} runway {}, QNH {}. \
+                    "{}, taxi to holding point {} runway {}{}. \
                      Report ready for departure.",
-                    ctx.callsign, ctx.holding_point, ctx.runway, ctx.qnh
+                    ctx.callsign,
+                    ctx.holding_point,
+                    ctx.runway,
+                    qnh_clause(ctx)
                 )
             }
             Intent::RequestTakeoff => match self.state {
@@ -344,9 +360,12 @@ impl Tower {
                 _ => {
                     self.state = State::TaxiCleared;
                     format!(
-                        "{}, taxi to holding point {} runway {} first, QNH {}. \
+                        "{}, taxi to holding point {} runway {} first{}. \
                          Report ready for departure.",
-                        ctx.callsign, ctx.holding_point, ctx.runway, ctx.qnh
+                        ctx.callsign,
+                        ctx.holding_point,
+                        ctx.runway,
+                        qnh_clause(ctx)
                     )
                 }
             },
@@ -354,8 +373,10 @@ impl Tower {
                 self.state = State::Inbound;
                 self.touch_and_go = touch_and_go;
                 format!(
-                    "{}, join final runway {}, QNH {}. Report final.",
-                    ctx.callsign, ctx.runway, ctx.qnh
+                    "{}, join final runway {}{}. Report final.",
+                    ctx.callsign,
+                    ctx.runway,
+                    qnh_clause(ctx)
                 )
             }
             // A final report earns the clearance from ANY state: a vectored

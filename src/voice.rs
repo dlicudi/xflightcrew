@@ -61,6 +61,8 @@ pub enum StationSpeaker {
     Tower,
     Approach,
     Departure,
+    /// The ATIS broadcast — the looped recording on its own frequency.
+    Atis,
 }
 
 impl StationSpeaker {
@@ -78,6 +80,10 @@ impl StationSpeaker {
                 let v = config.atc_departure_piper_voice.as_str();
                 if v.is_empty() { fallback } else { v }
             }
+            StationSpeaker::Atis => {
+                let v = config.atc_atis_piper_voice.as_str();
+                if v.is_empty() { fallback } else { v }
+            }
         }
     }
     fn slot(self) -> usize {
@@ -85,6 +91,7 @@ impl StationSpeaker {
             StationSpeaker::Tower => 0,
             StationSpeaker::Approach => 1,
             StationSpeaker::Departure => 2,
+            StationSpeaker::Atis => 3,
         }
     }
 }
@@ -487,7 +494,7 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
     let station_cfg = config.clone();
     // One lazy warm voice per controller position (tower/approach/departure):
     // a position that never speaks never loads its model.
-    let mut stations: [Option<StationVoice>; 3] = [None, None, None];
+    let mut stations: [Option<StationVoice>; 4] = [None, None, None, None];
     let mut speaker = Speaker::build(config);
     loop {
         let mut q = inner.queue.lock().unwrap();

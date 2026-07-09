@@ -67,6 +67,10 @@ pub struct Station {
     runway_in_use: Option<String>,
     /// The departure controller has said "radar contact" to this flight.
     dep_checked_in: bool,
+    /// The ATIS information letter the pilot last reported having ("with
+    /// information Alpha"). When it matches the current broadcast, clearances
+    /// skip the QNH — the whole point of an ATIS.
+    pilot_info: Option<char>,
 }
 
 impl Station {
@@ -111,6 +115,20 @@ impl Station {
         if let Some(k) = departure_khz {
             tracing::info!(mhz = k as f64 / 1000.0, "departure on frequency (handoff after takeoff)");
         }
+        // ATIS broadcasts in-process when the field publishes a frequency:
+        // the monitor's tick loops the report while COM1 is tuned there.
+        *ATIS.lock().unwrap_or_else(|e| e.into_inner()) =
+            apt.freq(nav::FREQ_ATIS).map(|f| {
+                tracing::info!(mhz = f.khz as f64 / 1000.0, "ATIS broadcasting on frequency");
+                AtisState {
+                    khz: f.khz,
+                    airport: apt.name.clone(),
+                    runways: apt.runways.clone(),
+                    letter: 'A',
+                    edition: None,
+                    last_spoken: None,
+                }
+            });
         Some(Station {
             tower_khz: twr_row.khz,
             approach_khz,
@@ -119,6 +137,7 @@ impl Station {
             twr: tower::Tower::new(),
             runway_in_use: None,
             dep_checked_in: false,
+            pilot_info: None,
         })
     }
 
@@ -195,11 +214,21 @@ impl Station {
         if !is_radio_call(transcript, &self.apt.name.to_lowercase()) {
             return None;
         }
+        self.note_information(transcript);
         let intent = tower::parse_intent(transcript);
         if intent == tower::Intent::Unknown {
             return None;
         }
         Some(self.respond(service, intent, ctx, wx))
+    }
+
+    /// Remember "with information X" from any call — the next clearance skips
+    /// the QNH when the letter matches the current broadcast.
+    fn note_information(&mut self, transcript: &str) {
+        if let Some(l) = heard_information(&transcript.to_lowercase()) {
+            tracing::info!(letter = %l, "pilot reports having the information");
+            self.pilot_info = Some(l);
+        }
     }
 
     /// Physical routing (the radio PTT was keyed): the utterance was
@@ -247,6 +276,7 @@ impl Station {
         ctx: &tower::Ctx,
         wx: Wx,
     ) -> String {
+        self.note_information(transcript);
         let intent = tower::parse_intent(transcript);
         // A pilot readback earns SILENCE, like a real frequency: the
         // controller only speaks up to correct a wrong one.
@@ -565,6 +595,14 @@ impl Station {
     /// reads, so tests phrase clearances from scripted weather.
     fn make_ctx(&mut self, wx: Wx, qnh: String, callsign: String) -> tower::Ctx {
         let runway = self.pick_runway(wx.wind_from_deg, wx.wind_kts);
+        // "With information X" matching the current broadcast: the clearance
+        // skips the QNH — having the numbers is the whole point of an ATIS.
+        // A stale or absent letter keeps them (safety over brevity).
+        let qnh = if self.pilot_info.is_some() && self.pilot_info == atis_current_letter() {
+            String::new()
+        } else {
+            qnh
+        };
         tower::Ctx {
             callsign,
             airport: self.apt.name.clone(),
@@ -632,6 +670,139 @@ pub fn handoff_tick(alt_ft: f64, on_ground: bool) -> Option<String> {
     let line = plan.line.clone();
     *guard = None;
     Some(line)
+}
+
+/// The in-process ATIS: one broadcast state per station, driven by the
+/// monitor's tick while COM1 sits on the ATIS frequency. Editions cut and the
+/// letter advances exactly as the standalone binary did (`atis::new_edition`
+/// hysteresis included); the report always reads the FROZEN edition, so the
+/// numbers can't drift mid-cycle.
+pub struct AtisState {
+    pub khz: i64,
+    airport: String,
+    runways: Vec<nav::Runway>,
+    letter: char,
+    edition: Option<atis::Snapshot>,
+    last_spoken: Option<Instant>,
+}
+
+pub static ATIS: Mutex<Option<AtisState>> = Mutex::new(None);
+
+/// Re-broadcast cadence while the pilot stays tuned — a real ATIS loops.
+const ATIS_REPEAT_SECS: f64 = 45.0;
+
+/// The live weather one ATIS cycle is cut from (read by the monitor).
+#[derive(Debug, Clone, Copy)]
+pub struct AtisWx {
+    pub zulu_sec: f64,
+    pub wind_from_deg: f64,
+    pub wind_kts: f64,
+    pub visibility_sm: f64,
+    pub qnh_hpa: f64,
+    pub oat_c: f64,
+}
+
+/// True when an ATIS exists and COM1 is on it — the monitor's cheap gate
+/// before reading the full weather set.
+pub fn atis_tuned(com1_khz: i64) -> bool {
+    ATIS.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|a| (com1_khz - a.khz).abs() <= 5)
+}
+
+/// One tick of the ATIS broadcast: the full report when tuned and due (first
+/// tune-in speaks immediately, then the loop repeats), silence otherwise.
+/// Cuts a new edition — advancing the letter — when the weather has genuinely
+/// moved (see `atis::new_edition`).
+pub fn atis_tick(com1_khz: i64, wx: &AtisWx, now: Instant) -> Option<String> {
+    let mut guard = ATIS.lock().unwrap_or_else(|e| e.into_inner());
+    let st = guard.as_mut()?;
+    if (com1_khz - st.khz).abs() > 5 {
+        st.last_spoken = None; // retuning restarts the loop from the top
+        return None;
+    }
+    if st
+        .last_spoken
+        .is_some_and(|t| now.duration_since(t).as_secs_f64() < ATIS_REPEAT_SECS)
+    {
+        return None;
+    }
+    // Runway from the wind — but in calm keep the edition's pick, or the
+    // coin-toss flip would cut a fresh edition per broadcast.
+    let runway = if wx.wind_kts < 5.0 {
+        st.edition.as_ref().map(|e| e.runway.clone())
+    } else {
+        None
+    }
+    .or_else(|| {
+        nav::best_runway_for_wind(&st.runways, wx.wind_from_deg, wx.wind_kts).map(|(id, _, _)| id)
+    })
+    .unwrap_or_default();
+    let snap = atis::Snapshot {
+        airport: st.airport.clone(),
+        zulu_sec: wx.zulu_sec,
+        runway,
+        wind_from_deg: wx.wind_from_deg,
+        wind_kts: wx.wind_kts,
+        visibility_sm: wx.visibility_sm,
+        qnh_hpa: wx.qnh_hpa,
+        oat_c: wx.oat_c,
+    };
+    match &st.edition {
+        None => st.edition = Some(snap),
+        Some(e) if atis::new_edition(e, &snap) => {
+            st.letter = atis::next_letter(st.letter);
+            st.edition = Some(snap);
+        }
+        // Same edition: time still moves in the report (a frozen clock reads
+        // as a dead station), everything else stays the edition's numbers.
+        Some(_) => {
+            if let Some(e) = st.edition.as_mut() {
+                e.zulu_sec = wx.zulu_sec;
+            }
+        }
+    }
+    st.last_spoken = Some(now);
+    Some(atis::report(st.edition.as_ref()?, st.letter))
+}
+
+/// The information letter currently on the broadcast — `None` until the first
+/// edition is cut (a pilot can't "have information" that never aired).
+pub fn atis_current_letter() -> Option<char> {
+    ATIS.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|a| a.edition.is_some())
+        .map(|a| a.letter)
+}
+
+/// The information letter in a call ("with information Alpha", "we have
+/// information bravo", or just "information B").
+pub fn heard_information(t: &str) -> Option<char> {
+    let mut toks = t
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty());
+    while let Some(tok) = toks.next() {
+        if tok != "information" {
+            continue;
+        }
+        let next = toks.next()?;
+        // A NATO word ("alpha") or a bare letter ("b").
+        if next.len() == 1 {
+            let c = next.chars().next()?.to_ascii_uppercase();
+            if c.is_ascii_uppercase() {
+                return Some(c);
+            }
+        }
+        for letter in 'A'..='Z' {
+            if atis::nato(letter).to_ascii_lowercase() == next {
+                return Some(letter);
+            }
+        }
+        return None;
+    }
+    None
 }
 
 /// An armed vectors-to-final plan — the approach controller's worksheet. Set
@@ -1017,7 +1188,102 @@ mod tests {
             twr: tower::Tower::new(),
             runway_in_use: None,
             dep_checked_in: false,
+            pilot_info: None,
         }
+    }
+
+    /// `ATIS` is a process-wide static, same discipline as `HANDOFF_LOCK`.
+    static ATIS_LOCK: Mutex<()> = Mutex::new(());
+
+    fn wx(wind_deg: f64, wind_kts: f64, qnh: f64) -> AtisWx {
+        AtisWx {
+            zulu_sec: 12.0 * 3600.0,
+            wind_from_deg: wind_deg,
+            wind_kts,
+            visibility_sm: 10.0,
+            qnh_hpa: qnh,
+            oat_c: 22.0,
+        }
+    }
+
+    #[test]
+    fn atis_loops_while_tuned_and_cuts_editions_on_real_change() {
+        let _guard = ATIS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ATIS.lock().unwrap() = Some(AtisState {
+            khz: 118500,
+            airport: "Gibraltar".into(),
+            runways: Vec::new(),
+            letter: 'A',
+            edition: None,
+            last_spoken: None,
+        });
+        let t0 = Instant::now();
+        // Off frequency: silence, no edition.
+        assert!(atis_tick(131200, &wx(250.0, 12.0, 1018.0), t0).is_none());
+        assert_eq!(atis_current_letter(), None, "nothing aired yet");
+        // Tuned: the broadcast, information Alpha.
+        let r = atis_tick(118500, &wx(250.0, 12.0, 1018.0), t0).expect("broadcast");
+        assert!(r.contains("information Alpha"), "{r}");
+        assert!(r.contains("QNH one zero one eight"), "{r}");
+        assert_eq!(atis_current_letter(), Some('A'));
+        // Still tuned, seconds later: the loop is between repeats — silence.
+        assert!(atis_tick(118500, &wx(250.0, 12.0, 1018.0), t0 + std::time::Duration::from_secs(10)).is_none());
+        // Repeat due, weather unchanged: SAME letter.
+        let r = atis_tick(118500, &wx(251.0, 13.0, 1018.2), t0 + std::time::Duration::from_secs(50))
+            .expect("repeat");
+        assert!(r.contains("information Alpha"), "wobble must not burn a letter: {r}");
+        // A real pressure change cuts information Bravo.
+        let r = atis_tick(118500, &wx(250.0, 12.0, 1021.0), t0 + std::time::Duration::from_secs(100))
+            .expect("new edition");
+        assert!(r.contains("information Bravo"), "{r}");
+        assert_eq!(atis_current_letter(), Some('B'));
+        *ATIS.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn information_letters_parse_from_calls() {
+        assert_eq!(heard_information("with information alpha"), Some('A'));
+        assert_eq!(heard_information("we have information bravo, request taxi"), Some('B'));
+        // "x-ray" splits at the hyphen; the bare "x" carries the letter anyway.
+        assert_eq!(heard_information("information x-ray"), Some('X'));
+        assert_eq!(heard_information("information b"), Some('B'));
+        assert_eq!(heard_information("request taxi"), None);
+        assert_eq!(heard_information("for your information the flaps are stuck"), None);
+    }
+
+    #[test]
+    fn having_the_current_information_skips_the_qnh() {
+        let _guard = ATIS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ATIS.lock().unwrap() = Some(AtisState {
+            khz: 118500,
+            airport: "Gibraltar".into(),
+            runways: Vec::new(),
+            letter: 'A',
+            edition: None,
+            last_spoken: None,
+        });
+        let _ = atis_tick(118500, &wx(250.0, 12.0, 1018.0), Instant::now()); // airs Alpha
+        let w = Wx { wind_from_deg: 250.0, wind_kts: 12.0 };
+        // With the current letter: the taxi clearance drops the QNH clause.
+        let mut st = lxgb();
+        let ctx = {
+            st.note_information("gibraltar tower, with information alpha, request taxi");
+            st.make_ctx(w, "one zero one eight".into(), "November".into())
+        };
+        let reply = st.twr.handle(tower::parse_intent("request taxi"), &ctx);
+        assert!(!reply.contains("QNH"), "{reply}");
+        // A STALE letter keeps the numbers — safety over brevity.
+        let mut st = lxgb();
+        st.note_information("with information zulu, request taxi");
+        let ctx = st.make_ctx(w, "one zero one eight".into(), "November".into());
+        let reply = st.twr.handle(tower::parse_intent("request taxi"), &ctx);
+        assert!(reply.contains("QNH one zero one eight"), "{reply}");
+        // No letter at all: numbers as always.
+        let mut st = lxgb();
+        let ctx = st.make_ctx(w, "one zero one eight".into(), "November".into());
+        let reply = st.twr.handle(tower::parse_intent("request taxi"), &ctx);
+        assert!(reply.contains("QNH one zero one eight"), "{reply}");
+        *ATIS.lock().unwrap() = None;
     }
 
     #[test]

@@ -1513,6 +1513,47 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
                 || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
             if !quiet {
+                // The ATIS loop: while COM1 sits on the ATIS frequency the
+                // broadcast repeats, cutting a new information letter when the
+                // weather genuinely moves. Cheap gate first — one COM1 read —
+                // so flights tuned anywhere else pay nothing extra.
+                if let Ok(com1) = xp.get_float(crate::datarefs::COM1_FREQ_KHZ).await {
+                    let com1 = com1.round() as i64;
+                    if crate::station::atis_tuned(com1) {
+                        let wx = crate::station::AtisWx {
+                            zulu_sec: xp.get_float(crate::datarefs::ZULU_TIME_SEC).await.unwrap_or(0.0),
+                            wind_from_deg: xp
+                                .get_float(crate::datarefs::WIND_DIR_DEG_TRUE)
+                                .await
+                                .unwrap_or(0.0),
+                            wind_kts: xp.get_float(crate::datarefs::WIND_SPEED_MSC).await.unwrap_or(0.0)
+                                * 1.943844,
+                            visibility_sm: xp
+                                .get_float(crate::datarefs::VISIBILITY_SM)
+                                .await
+                                .unwrap_or(10.0),
+                            qnh_hpa: xp.get_float(crate::datarefs::QNH_PASCALS).await.unwrap_or(101300.0)
+                                / 100.0,
+                            oat_c: xp.get_float(crate::datarefs::OAT_DEG_C).await.unwrap_or(15.0),
+                        };
+                        if let Some(report) =
+                            crate::station::atis_tick(com1, &wx, std::time::Instant::now())
+                        {
+                            if let Some(s) = status.as_ref() {
+                                s.action("ATIS broadcast");
+                            }
+                            crate::blackbox::record(
+                                "atis",
+                                serde_json::json!({ "msg": &report }),
+                            );
+                            voice.alert_station(
+                                Priority::Advisory,
+                                crate::voice::StationSpeaker::Atis,
+                                report,
+                            );
+                        }
+                    }
+                }
                 // After-takeoff handoff: armed by the tower's takeoff
                 // clearance, spoken once airborne and climbing ("contact
                 // Gibraltar Departure on one three zero decimal four").
