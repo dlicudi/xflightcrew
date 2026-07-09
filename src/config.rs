@@ -215,9 +215,12 @@ impl Config {
             atc_airport: env_or("XCOPILOT_ATC_AIRPORT", "LXGB"),
             radio_ptt_dataref: env_or("XCOPILOT_RADIO_PTT_DATAREF", "xcopilot/radio_ptt_active"),
             atc_piper_voice: env_or("XCOPILOT_ATC_PIPER_VOICE", "models/en_GB-alba-medium.onnx"),
+            // ryan-high: the only high-quality model in the folder, and clearly
+            // a different person from the tower (alba) and departure (northern
+            // male). alan-medium read flat and got voted off (2026-07-09).
             atc_approach_piper_voice: env_or(
                 "XCOPILOT_ATC_APPROACH_PIPER_VOICE",
-                "models/en_GB-alan-medium.onnx",
+                "models/en_US-ryan-high.onnx",
             ),
             atc_departure_piper_voice: env_or(
                 "XCOPILOT_ATC_DEPARTURE_PIPER_VOICE",
