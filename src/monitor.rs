@@ -1513,12 +1513,18 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
                 || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
             if !quiet {
+                // One COM1 read serves the ATIS loop and the traffic
+                // advisories below.
+                let com1: Option<i64> = xp
+                    .get_float(crate::datarefs::COM1_FREQ_KHZ)
+                    .await
+                    .ok()
+                    .map(|v| v.round() as i64);
                 // The ATIS loop: while COM1 sits on the ATIS frequency the
                 // broadcast repeats, cutting a new information letter when the
-                // weather genuinely moves. Cheap gate first — one COM1 read —
-                // so flights tuned anywhere else pay nothing extra.
-                if let Ok(com1) = xp.get_float(crate::datarefs::COM1_FREQ_KHZ).await {
-                    let com1 = com1.round() as i64;
+                // weather genuinely moves. Cheap gate first, so flights tuned
+                // anywhere else pay nothing extra.
+                if let Some(com1) = com1 {
                     if crate::station::atis_tuned(com1) {
                         let wx = crate::station::AtisWx {
                             zulu_sec: xp.get_float(crate::datarefs::ZULU_TIME_SEC).await.unwrap_or(0.0),
@@ -1607,21 +1613,42 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                     );
                     voice.alert_station(Priority::Advisory, crate::voice::StationSpeaker::Approach, line);
                 }
-                // Traffic advisories while under approach control: the
-                // controller narrates the nearest factor off the TCAS picture
-                // (LiveTraffic or AI aircraft), at most one call per 45 s.
-                // Narration only — separation stays the pilot's job.
+                // Traffic advisories: the controller narrates the nearest
+                // factor off the TCAS picture (LiveTraffic or AI aircraft)
+                // whenever one is watching — vectored to final, or simply on
+                // any of the station's frequencies while airborne. At most
+                // one call per 45 s. Narration only — separation stays the
+                // pilot's job.
                 let vectored = crate::station::VECTORS
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .as_ref()
                     .map(|p| p.callsign.clone());
-                if let Some(callsign) = vectored {
+                let controller = if vectored.is_some() {
+                    Some(crate::voice::StationSpeaker::Approach)
+                } else if !snap.on_ground {
+                    com1.and_then(crate::station::tuned_controller)
+                } else {
+                    None
+                };
+                if let Some(speaker) = controller {
                     let due = traffic_last
                         .is_none_or(|t| now.duration_since(t).as_secs() >= 45);
                     if due {
                         if let Some(call) = crate::station::traffic_advisory(&xp).await {
                             traffic_last = Some(now);
+                            // Address the flight when vectoring gave us the
+                            // callsign; otherwise read the tail number.
+                            let callsign = match &vectored {
+                                Some(c) => c.clone(),
+                                None => xp
+                                    .get_string(crate::datarefs::TAILNUM)
+                                    .await
+                                    .ok()
+                                    .map(|t| crate::tower::spoken_callsign(&t))
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or_else(|| "traffic alert".to_string()),
+                            };
                             let line = format!("{callsign}, {call}");
                             if let Some(s) = status.as_ref() {
                                 s.action(&format!("TWR: {line}"));
@@ -1630,7 +1657,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                                 "traffic_advisory",
                                 serde_json::json!({ "msg": &line }),
                             );
-                            voice.alert_station(Priority::Advisory, crate::voice::StationSpeaker::Approach, line);
+                            voice.alert_station(Priority::Advisory, speaker, line);
                         }
                     }
                 }

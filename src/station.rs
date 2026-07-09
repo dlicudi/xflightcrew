@@ -137,6 +137,17 @@ impl Station {
             .apt
             .position()
             .map(|(lat, lon)| (self.apt.name.clone(), lat, lon));
+        // Controller frequencies, for the monitor's traffic advisories: a
+        // controller narrates traffic whenever the pilot is on frequency,
+        // not only while being vectored.
+        let mut freqs = vec![(self.tower_khz, StationSpeaker::Tower)];
+        if let Some(k) = self.approach_khz {
+            freqs.push((k, StationSpeaker::Approach));
+        }
+        if let Some(k) = self.departure_khz {
+            freqs.push((k, StationSpeaker::Departure));
+        }
+        *CONTROLLER_FREQS.lock().unwrap_or_else(|e| e.into_inner()) = freqs;
         *ATIS.lock().unwrap_or_else(|e| e.into_inner()) =
             self.apt.freq(nav::FREQ_ATIS).map(|f| {
                 tracing::info!(mhz = f.khz as f64 / 1000.0, "ATIS broadcasting on frequency");
@@ -889,6 +900,20 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = Some(best.apt.clone());
     *LAST_REGION_SWITCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
     Some(line)
+}
+
+/// The active station's controller frequencies (kHz → speaking position),
+/// published by [`Station::install`] for the monitor's traffic advisories.
+static CONTROLLER_FREQS: Mutex<Vec<(i64, StationSpeaker)>> = Mutex::new(Vec::new());
+
+/// Which controller COM1 is on, if any — the voice that narrates traffic.
+pub fn tuned_controller(com1_khz: i64) -> Option<StationSpeaker> {
+    CONTROLLER_FREQS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(k, _)| (com1_khz - k).abs() <= 5)
+        .map(|(_, s)| *s)
 }
 
 /// The information letter in a call ("with information Alpha", "we have
