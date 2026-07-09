@@ -1127,11 +1127,13 @@ async fn run_session(
                 use std::sync::atomic::Ordering::Relaxed;
                 let speed_held = tools::speedhold::ACTIVE.load(Relaxed);
                 let mix_held = tools::engine::MIX_MANAGED.load(Relaxed);
-                if (speed_held || mix_held) && release_intent(&tl) {
+                let reverse_in = tools::reverse::ACTIVE.load(Relaxed);
+                if (speed_held || mix_held || reverse_in) && release_intent(&tl) {
                     let names_mix = tl.contains("mixture") || tl.contains("mix");
                     let names_speed = tl.contains("throttle") || tl.contains("speed")
                         || tl.contains("power") || tl.contains("taxi") || tl.contains("thr");
-                    let generic = !names_mix && !names_speed;
+                    let names_reverse = tl.contains("reverse");
+                    let generic = !names_mix && !names_speed && !names_reverse;
                     let mut released: Vec<&str> = Vec::new();
                     if speed_held && (names_speed || generic) {
                         tools::speedhold::ACTIVE.store(false, Relaxed);
@@ -1140,6 +1142,13 @@ async fn run_session(
                     if mix_held && (names_mix || generic) {
                         tools::engine::MIX_MANAGED.store(false, Relaxed);
                         released.push("mixture's yours");
+                    }
+                    // Reverse rides the same levers as the speed hold — any
+                    // lever-shaped release stows it (the watcher glides the
+                    // levers back to idle on its way out).
+                    if reverse_in && (names_reverse || names_speed || generic) {
+                        tools::reverse::ACTIVE.store(false, Relaxed);
+                        released.push("stowing reverse");
                     }
                     if !released.is_empty() {
                         let line = format!("Copy — {}.", released.join("; "));
@@ -3987,6 +3996,9 @@ fn active_managers() -> Vec<String> {
         v.push(format!("talk-down {} {}", a.icao, a.runway_id));
     }
     if let Some(s) = tools::speedhold::status() {
+        v.push(s);
+    }
+    if let Some(s) = tools::reverse::status() {
         v.push(s);
     }
     if let Some(s) = tools::engine::mixture_status() {

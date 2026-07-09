@@ -94,6 +94,11 @@ pub struct AircraftProfile {
     /// have them (the GA singles don't).
     #[serde(default)]
     pub speedbrake: bool,
+    /// Reverse thrust (`reverse_thrust`) — rollout-only, self-stowing below
+    /// taxi speed. For turboprops/jets whose model has a usable beta/reverse
+    /// range on `throttle_beta_rev_ratio` (the Twin Otter).
+    #[serde(default)]
+    pub reverse_thrust: bool,
     /// Adjustable altimeter (`set_barometer`).
     #[serde(default)]
     pub barometer: bool,
@@ -983,6 +988,9 @@ mod tests {
         assert!(!ts.boost_pumps);
         assert_eq!(ts.ignition_arm.len(), 2);
         assert_eq!(ts.generators.len(), 2);
+        // Reverse thrust: rollout tool, gated + self-stowing (STOL bushplane —
+        // reverse is core to its short landings).
+        assert!(p.reverse_thrust);
         // Modeled .acf limits: flaps 0/10/20/30/40, Vfe 105/95, Vne 202, Vs 60.
         let flaps = p.flaps.expect("has flaps");
         assert_eq!(flaps.detents.len(), 5);
@@ -1152,6 +1160,7 @@ fn cessna_172sp() -> AircraftProfile {
         flood_lights: true,
         fuel_pump: true,
         fuel_pump_commands: None,
+        reverse_thrust: false,
         magnetos: true,
         carb_heat: true,
         // The 172 selector is LEFT/BOTH/RIGHT (OFF is a separate shutoff valve,
@@ -1369,6 +1378,7 @@ fn cirrus_sr22() -> AircraftProfile {
         // (not laminar/sr22/switch/boost_pump, which an earlier scaffold guessed).
         fuel_pump: true,
         fuel_pump_commands: None,
+        reverse_thrust: false,
         // OFF / LEFT / RIGHT — no "both" (low-wing twin tanks, fed one at a
         // time). Selector commands verified against the rustdecks deck. The
         // standard sim/cockpit2/fuel/fuel_tank_selector (0=off/1=left/2=right) is

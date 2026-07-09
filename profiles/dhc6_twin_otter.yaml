@@ -131,6 +131,11 @@ turboprop_start:
   generators: [Twin_Otter/generators/left_on, Twin_Otter/generators/right_on]
 speedbrake: false
 directional_gyro: false  # HSI, no vacuum DG to sync
+# Reverse thrust on the rollout — the model runs the full beta/reverse lever
+# range (throttle_beta_rev_ratio spans -2 full reverse to +1 full forward on
+# its own quadrant animation). Ground + rolling + engines running only;
+# auto-stows below 25 knots or on a bounce. To verify in flight.
+reverse_thrust: true
 
 # Fuel-endurance alerting. Twin PT6A-27 burns ~600 lb/hr total in cruise
 # (~270 kg/hr).

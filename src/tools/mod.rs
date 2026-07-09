@@ -27,6 +27,7 @@ pub mod power;
 pub mod prop;
 pub mod radio;
 pub mod recover;
+pub mod reverse;
 pub mod speedhold;
 pub mod reminder;
 
@@ -213,6 +214,12 @@ impl Registry {
                 alternator_on_cmds: alternator_on_cmds(&profile.electrical),
             }));
             tools.push(Box::new(engine::StopEngine));
+        }
+
+        // Reverse thrust (rollout only, self-stowing) — turboprops/jets whose
+        // profile says the model has a usable beta/reverse range.
+        if profile.reverse_thrust {
+            tools.push(Box::new(reverse::ReverseThrust { engines: profile.engines }));
         }
 
         if profile.fuel_pump || profile.fuel_pump_commands.is_some() {

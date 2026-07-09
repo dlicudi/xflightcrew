@@ -962,6 +962,17 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         }
     }
 
+    // Reverse thrust (landing rollout) — the levers, not a direction:
+    // "reverse heading/course" and "reverse the turn" are navigation talk and
+    // must fall through untouched.
+    if (has(t, "reverse") || has(t, "reversers"))
+        && !(has(t, "heading") || has(t, "course") || has(t, "turn"))
+    {
+        let stow = has(t, "stow") || has(t, "cancel") || has(t, "off")
+            || t.contains("out of") || has(t, "end");
+        return Some(call("reverse_thrust", json!({ "on": !stow })));
+    }
+
     // fixed verbs
     if (has(t, "start") && (has(t, "engine") || has(t, "engines")))
         || t.contains("engine on")
@@ -1183,6 +1194,34 @@ mod tests {
             let c = v.remove(0);
             (c.name, c.arguments)
         })
+    }
+
+    /// Like [`one`] but on a named profile's registry — for tools only some
+    /// airframes expose (reverse thrust on the Twin Otter).
+    fn one_on(profile_id: &str, t: &str) -> Option<(String, Value)> {
+        let prof = aircraft::load(profile_id).expect("profile");
+        let reg = Registry::for_aircraft(&prof);
+        try_parse(t, &reg, &prof).map(|mut v| {
+            let c = v.remove(0);
+            (c.name, c.arguments)
+        })
+    }
+
+    #[test]
+    fn reverse_thrust_is_levers_not_navigation() {
+        let rev = |t: &str| one_on("dhc6_twin_otter", t);
+        // The levers, on an airframe that has them...
+        assert_eq!(rev("reverse thrust").unwrap(), ("reverse_thrust".into(), json!({"on":true})));
+        assert_eq!(rev("full reverse").unwrap().1, json!({"on":true}));
+        assert_eq!(rev("reversers").unwrap().1, json!({"on":true}));
+        assert_eq!(rev("stow reverse").unwrap().1, json!({"on":false}));
+        assert_eq!(rev("cancel reverse").unwrap().1, json!({"on":false}));
+        assert_eq!(rev("out of reverse").unwrap().1, json!({"on":false}));
+        assert_eq!(rev("reverse thrust off").unwrap().1, json!({"on":false}));
+        // ...but "reverse" as a direction is navigation talk, never the levers.
+        assert_ne!(rev("reverse heading").map(|c| c.0), Some("reverse_thrust".into()));
+        assert_ne!(rev("reverse course").map(|c| c.0), Some("reverse_thrust".into()));
+        assert_ne!(rev("reverse the turn").map(|c| c.0), Some("reverse_thrust".into()));
     }
 
     #[test]
@@ -1478,6 +1517,9 @@ mod tests {
         // Bleed air (Twin Otter pneumatics) — routes like any electrical key.
         assert_eq!(one("bleed air on").unwrap(), ("set_electrical".into(), json!({"system":"bleed","on":true})));
         assert_eq!(one("bleed air off").unwrap(), ("set_electrical".into(), json!({"system":"bleed","on":false})));
+        // Reverse thrust needs the airframe to HAVE it: on the 172 the phrase
+        // stays a miss (capability gate), never a phantom lever.
+        assert!(one("reverse thrust").is_none());
         // "electrics on" both spoken cleanly and via whisper's "electric zone(s)" /
         // "electric system(s)" slips — all resolve to the whole-system power call.
         let elec = ("set_electrical".to_string(), json!({"system":"all","on":true}));
