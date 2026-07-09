@@ -1252,6 +1252,9 @@ async fn run_session(
                 // "aircraft health check" / "check the aircraft" — same intent;
                 // two phrasings went silent live before a third one landed.
                 || (tl.contains("check") && (tl.contains("aircraft") || tl.contains("health")))
+                // "How's the aircraft health?" / "How's the aircraft doing?" —
+                // no "check" at all; both dead-ended on the Twotter flight.
+                || (tl.contains("aircraft") && (tl.contains("health") || tl.contains("doing")))
             {
                 let line = systems_check(&xplane, &profile).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
@@ -4161,6 +4164,12 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "airspeed", "autothrottle",
     // speedbrakes / spoilers
     "speedbrake", "speedbrakes", "spoiler", "spoilers",
+    // reverse thrust: "thrust" is above, but the bare rollout call is
+    // "Reverse thrusters!" — and "thrusters" is 3 edits from "thrust", so the
+    // fuzzy match never saves it. Ate the pilot's actual landing-rollout call
+    // on the Twotter's first reverse flight (2026-07-09) while the wordier
+    // "set reverse power" phrasings sailed through on "power".
+    "reverse", "reversers", "thrusters", "stow",
     // lights
     "light", "lights", "beacon", "strobe", "strobes", "taxi", "landing", "nav",
     "navigation", "flood", "floods",
@@ -4339,6 +4348,10 @@ fn correction_value(text: &str) -> Option<String> {
         // "How about eighty percent?" — the pilot renegotiating the value
         // (heard live 2026-07-09 after "Power 8 percent" executed a mishear).
         &["how", "about"],
+        // ...and whisper dropping the "how": "About 40 percent?" (same flight,
+        // same renegotiation, dead-ended). Safe alone: the remainder must
+        // still be a bare value, inside the follow-up window.
+        &["about"],
         &["correction"],
         &["no"],
     ];
@@ -4639,6 +4652,9 @@ mod tests {
             "secure the aircraft", "secure", "full shutdown",
             // "checklist" carries any phase past the gate, even hyphenated STT.
             "Normal take-off checklist.", "starting engine checklist", "preflight checklist",
+            // The bare rollout call — silently gated on the Twotter's first
+            // reverse flight ("thrusters" is too far from "thrust" for fuzzy).
+            "Reverse thrusters.", "reversers", "stow reverse", "cancel reverse",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
         }
@@ -4676,6 +4692,9 @@ mod tests {
         assert_eq!(correction_value("correction, one thousand five hundred"),
                    Some("one thousand five hundred".into()));
         assert_eq!(correction_value("How about eighty percent?"), Some("eighty percent".into()));
+        // Whisper dropping the "how" (heard live on the Twotter flight).
+        assert_eq!(correction_value("About 40 percent?"), Some("40 percent".into()));
+        assert_eq!(correction_value("about we start the descent"), None);
         // "how about" with a full command is a question for the copilot, not a
         // value correction.
         assert_eq!(correction_value("how about we start the descent"), None);

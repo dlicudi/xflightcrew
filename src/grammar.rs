@@ -547,6 +547,12 @@ fn parse_one(t: &str) -> Option<ToolCall> {
             "three-quarter".to_string()
         } else if has(t, "full") {
             "full".to_string()
+        // Whisper garbles of "full" heard live on the Twotter approach
+        // (2026-07-09): "Flaps, ooh." / "Flaps, cool." / "Flaps, pull." —
+        // four dead ends in a row for the same lever. "up" wins above, so
+        // "pull the flaps up" is untouched.
+        } else if has(t, "ooh") || has(t, "cool") || has(t, "pull") {
+            "full".to_string()
         } else if has(t, "approach") {
             "approach".to_string()
         } else if has(t, "down") {
@@ -1222,6 +1228,9 @@ mod tests {
         assert_ne!(rev("reverse heading").map(|c| c.0), Some("reverse_thrust".into()));
         assert_ne!(rev("reverse course").map(|c| c.0), Some("reverse_thrust".into()));
         assert_ne!(rev("reverse the turn").map(|c| c.0), Some("reverse_thrust".into()));
+        // "Max Pross?" → props full ("pross" repaired upstream; needs a
+        // constant-speed airframe — the C172 registry has no prop tool).
+        assert_eq!(rev("max props").unwrap(), ("set_prop".into(), json!({"setting":"full"})));
     }
 
     #[test]
@@ -1399,6 +1408,13 @@ mod tests {
         assert_eq!(one("flaps ten").unwrap().0, "set_flaps");
         assert_eq!(one("flaps up").unwrap().1, json!({"notch":"up"}));
         assert_eq!(one("flaps full").unwrap().1, json!({"notch":"full"}));
+        // Whisper's "full" garbles, comma'd so the phrase-level repair can't
+        // span them — four dead ends in a row live (Twotter, 2026-07-09).
+        assert_eq!(one("flaps, ooh").unwrap().1, json!({"notch":"full"}));
+        assert_eq!(one("flaps, cool").unwrap().1, json!({"notch":"full"}));
+        assert_eq!(one("flaps, pull").unwrap().1, json!({"notch":"full"}));
+        // ...while "up" still wins over "pull" in the same sentence.
+        assert_eq!(one("pull the flaps up").unwrap().1, json!({"notch":"up"}));
         assert_eq!(one("throttle eighty percent"), Some(("set_throttle".into(), json!({"percent":80}))));
         assert_eq!(one("maximum power").unwrap().1, json!({"percent":100}));
         // "power" is a throttle synonym, and "maximum throttle"/"% power" forms.

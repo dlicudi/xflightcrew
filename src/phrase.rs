@@ -298,8 +298,10 @@ const PHRASE_MISHEARS: &[(&str, &str)] = &[
     ("star engines", "start engines"),
     // Climb / descend.
     ("they send to", "descend to"),       // "They send to five thousand."
+    ("claim to", "climb to"),             // "Claim to 8,000 feet." (Twotter, 2026-07-09)
     // Props.
     ("props to cruz", "props to cruise"), // "Props to Cruz."
+    ("pross", "props"),                   // "Max Pross?" (Twotter, 2026-07-09)
     ("full prompts", "full props"),       // "Full prompts?"
     // Controls and autopilot.
     ("mic controls", "my controls"),      // "Mic controls."
@@ -574,6 +576,9 @@ mod tests {
             ("I'm due.", "undo."),
             ("100% undue.", "100% undo."),
             ("Descends to one thousand five hundred.", "descend to one thousand five hundred."),
+            // 2026-07-09 Twin Otter flights.
+            ("Claim to 8,000 feet.", "climb to 8,000 feet."),
+            ("Max Pross?", "Max props?"),
         ] {
             assert_eq!(fix_mishears(heard), want, "garble {heard:?}");
         }
