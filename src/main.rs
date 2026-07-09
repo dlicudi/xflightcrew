@@ -2065,6 +2065,7 @@ fn icao_to_profile(icao: &str) -> String {
         "DC3" | "DC30" => "dc3",
         "BE9L" | "BE9T" | "C90" | "C90B" => "king_air_c90b",
         "EVOT" | "EVOP" => "lancair_evolution",
+        "DHC6" => "dhc6_twin_otter",
         _ => "cessna_172sp",
     }
     .to_string()

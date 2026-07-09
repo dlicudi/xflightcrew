@@ -215,8 +215,11 @@ impl Registry {
             tools.push(Box::new(engine::StopEngine));
         }
 
-        if profile.fuel_pump {
-            tools.push(Box::new(engine::SetFuelPump { engines: profile.engines }));
+        if profile.fuel_pump || profile.fuel_pump_commands.is_some() {
+            tools.push(Box::new(engine::SetFuelPump {
+                engines: profile.engines,
+                commands: profile.fuel_pump_commands.clone(),
+            }));
         }
 
         if profile.magnetos {

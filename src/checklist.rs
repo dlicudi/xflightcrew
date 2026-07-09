@@ -507,7 +507,9 @@ pub async fn run_step(
             SetPitotHeat { override_dataref: pitot_heat_dataref }.execute(args, ctx).await
         }
         "set_carb_heat" => SetCarbHeat { engines }.execute(args, ctx).await,
-        "set_fuel_pump" => SetFuelPump { engines }.execute(args, ctx).await,
+        // Universal-array pumps only: checklist-mapped airframes (172/SR22)
+        // don't use the command override.
+        "set_fuel_pump" => SetFuelPump { engines, commands: None }.execute(args, ctx).await,
         "set_transponder_mode" => SetTransponderMode.execute(args, ctx).await,
         "autopilot_off" => AutopilotOff.execute(args, ctx).await,
         "start_engine" => StartEngine {

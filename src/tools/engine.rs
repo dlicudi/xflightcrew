@@ -705,9 +705,23 @@ impl Tool for StartEngine {
 }
 
 /// Electric/auxiliary fuel pump(s). `engines` = how many to switch (a twin
-/// drives both boost pumps off one "fuel pump on" command).
+/// drives both boost pumps off one "fuel pump on" command). `commands`
+/// overrides the universal array with the airframe's own on/off commands (the
+/// RWDesigns Twin Otter — its pumps ignore `fuel_pump_on` entirely).
 pub struct SetFuelPump {
     pub engines: usize,
+    pub commands: Option<crate::aircraft::PumpCommands>,
+}
+
+/// Read a readback dataref (`name` or `name[i]`) as a 0/1-ish float.
+async fn read_switch(ctx: &ToolCtx<'_>, dref: &str) -> Option<f64> {
+    if let Some(open) = dref.find('[') {
+        let base = &dref[..open];
+        let idx: usize = dref[open + 1..dref.find(']')?].parse().ok()?;
+        ctx.xplane.get_float_array(base).await.ok()?.get(idx).copied()
+    } else {
+        ctx.xplane.get_float(dref).await.ok()
+    }
 }
 
 #[derive(Deserialize)]
@@ -734,6 +748,28 @@ impl Tool for SetFuelPump {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: OnArg = serde_json::from_value(args.clone())?;
+        // Command-driven pumps (profile override): fire the airframe's own
+        // switches and confirm from its readbacks, not the universal array.
+        if let Some(pc) = &self.commands {
+            let cmds = if a.on { &pc.on_commands } else { &pc.off_commands };
+            for c in cmds {
+                ctx.xplane.run_command(c).await?;
+            }
+            let mut states = Vec::new();
+            for d in &pc.readback {
+                if let Some(v) = read_switch(ctx, d).await {
+                    states.push(v > 0.5);
+                }
+            }
+            let word = if a.on { "on" } else { "off" };
+            return Ok(if states.is_empty() || states.iter().all(|&s| s == a.on) {
+                format!("Roger, boost pumps {word}.")
+            } else {
+                // Mixed — report rather than lie (one pump didn't move).
+                let n = states.iter().filter(|&&s| s).count();
+                format!("Boost pumps: {n} of {} on — check the panel.", states.len())
+            });
+        }
         set_each_engine(ctx, FUEL_PUMP, self.engines, a.on as i64).await?;
         let on = ctx.xplane.get_float_array(FUEL_PUMP).await?.first().copied().unwrap_or(0.0) > 0.5;
         Ok(format!("Roger, fuel pump {}.", if on { "on" } else { "off" }))

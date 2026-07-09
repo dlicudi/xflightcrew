@@ -922,6 +922,9 @@ fn parse_one(t: &str) -> Option<ToolCall> {
             ("inverters", "inverter"),
             // EFIS power switch (separate from avionics master) — lights the EADI/EHSI.
             ("efis", "efis"),
+            // Bleed air valves (Twin Otter pneumatics: heat, anti-ice, and the
+            // AP run off them) — a profile key like any other switchable system.
+            ("bleed", "bleed"),
         ] {
             if has(t, kw) {
                 // Split systems: "alternator two", "battery 1" name one of a
@@ -1472,6 +1475,9 @@ mod tests {
         // EFIS power switch (C90 EADI/EHSI displays).
         assert_eq!(one("efis power on").unwrap(), ("set_electrical".into(), json!({"system":"efis","on":true})));
         assert_eq!(one("efis on").unwrap(), ("set_electrical".into(), json!({"system":"efis","on":true})));
+        // Bleed air (Twin Otter pneumatics) — routes like any electrical key.
+        assert_eq!(one("bleed air on").unwrap(), ("set_electrical".into(), json!({"system":"bleed","on":true})));
+        assert_eq!(one("bleed air off").unwrap(), ("set_electrical".into(), json!({"system":"bleed","on":false})));
         // "electrics on" both spoken cleanly and via whisper's "electric zone(s)" /
         // "electric system(s)" slips — all resolve to the whole-system power call.
         let elec = ("set_electrical".to_string(), json!({"system":"all","on":true}));

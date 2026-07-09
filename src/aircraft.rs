@@ -142,6 +142,14 @@ pub struct AircraftProfile {
     /// Electric/auxiliary fuel pump (`set_fuel_pump`).
     #[serde(default)]
     pub fuel_pump: bool,
+    /// Override for airframes whose boost pumps are custom commands rather than
+    /// the universal `fuel_pump_on` array (the RWDesigns Twin Otter's FWD/AFT
+    /// pumps live behind SASL commands; writing the stock array is a no-op).
+    /// When set, `set_fuel_pump` fires these and confirms from `readback`
+    /// (entries may be `name[i]`). Exposes the tool even when `fuel_pump` is
+    /// false.
+    #[serde(default)]
+    pub fuel_pump_commands: Option<PumpCommands>,
     /// Magneto/ignition selector (`set_magnetos`) — for the run-up mag check.
     #[serde(default)]
     pub magnetos: bool,
@@ -627,6 +635,20 @@ pub struct ElectricalSystem {
     pub readback: Vec<String>,
 }
 
+/// Custom on/off commands for the electric boost pumps, for airframes where the
+/// universal `fuel_pump_on` array is a no-op (see
+/// [`AircraftProfile::fuel_pump_commands`]). All `on_commands` fire for "pump
+/// on" and all `off_commands` for "pump off" — a multi-pump aircraft (the Twin
+/// Otter's FWD + AFT) switches them together, matching how the checklist says
+/// "boost pumps ON". `readback` datarefs (each may be `name[i]`) confirm.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpCommands {
+    pub on_commands: Vec<String>,
+    pub off_commands: Vec<String>,
+    #[serde(default)]
+    pub readback: Vec<String>,
+}
+
 /// One entry of the checklist action map: a dataref *substring* and the curated
 /// action it drives. When the interpreter ([`crate::checklist`]) meets a file
 /// item whose dataref contains `match_`, it runs that action — so *which*
@@ -925,6 +947,60 @@ mod tests {
     }
 
     #[test]
+    fn dhc6_twin_otter_yaml_loads() {
+        // YAML-only profile (RWDesigns add-on). Deserialize directly so a
+        // malformed field fails loudly here rather than silently falling back.
+        let text = std::fs::read_to_string("profiles/dhc6_twin_otter.yaml").unwrap();
+        let p: AircraftProfile = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("dhc6_twin_otter.yaml failed to parse: {e:#}"));
+        assert_eq!(p.id, "dhc6_twin_otter");
+        // Twin turboprop: power levers (not the piston group), FIXED gear.
+        assert!(p.throttle && !p.engine);
+        assert!(!p.retractable_gear);
+        assert_eq!(p.engines, 2);
+        assert!(!p.magnetos && !p.carb_heat && !p.turbine_start);
+        // Stock-driven AP (the panel buttons fire sim/autopilot commands).
+        assert!(p.autopilot && p.ils);
+        assert!(p.autopilot_prep.is_none());
+        // Boost pumps are COMMAND-driven (the universal array is a no-op on
+        // this add-on): fuel_pump off, the override wired for both pumps.
+        assert!(!p.fuel_pump);
+        let pc = p.fuel_pump_commands.as_ref().expect("twotter pump commands");
+        assert_eq!(pc.on_commands.len(), 2);
+        assert_eq!(pc.off_commands.len(), 2);
+        assert_eq!(pc.readback.len(), 2);
+        // Electrical: battery + DC master + generators (each/both) + bleed air.
+        let elec: Vec<&str> = p.electrical.iter().map(|e| e.key.as_str()).collect();
+        for k in ["battery", "master", "generator1", "generator2", "generators", "bleed"] {
+            assert!(elec.contains(&k), "twotter electrical missing {k}");
+        }
+        // PT6 start with the fire-once starter: no start_dn (the model latches
+        // its own 16 s starter run), boost pumps fed per engine via ignition_arm.
+        let ts = p.turboprop_start.as_ref().expect("twotter turboprop start");
+        assert_eq!(ts.start_up.len(), 2);
+        assert!(ts.start_dn.is_empty());
+        assert!(!ts.starter_held);
+        assert!(!ts.boost_pumps);
+        assert_eq!(ts.ignition_arm.len(), 2);
+        assert_eq!(ts.generators.len(), 2);
+        // Modeled .acf limits: flaps 0/10/20/30/40, Vfe 105/95, Vne 202, Vs 60.
+        let flaps = p.flaps.expect("has flaps");
+        assert_eq!(flaps.detents.len(), 5);
+        assert_eq!(flaps.detents[0].label, "up");
+        assert_eq!(flaps.detents[4].label, "full");
+        assert_eq!(flaps.detents[1].vfe_kts, Some(105.0));
+        assert_eq!(flaps.detents[4].vfe_kts, Some(95.0));
+        assert_eq!(p.vne_kts, Some(202.0));
+        assert_eq!(p.vs_clean_kts, Some(60.0));
+        let prop = p.prop.as_ref().expect("twotter prop");
+        assert_eq!(prop.max_rpm, 2200.0);
+        let r = p.reference.as_ref().expect("twotter reference");
+        assert_eq!(r.max_gross_lb, Some(12500.0));
+        assert_eq!(r.vr_kts, Some(75.0));
+        assert_eq!(p.lights.len(), 5);
+    }
+
+    #[test]
     fn unknown_profile_is_none() {
         // No YAML, no built-in → None (caller surfaces a clear error).
         assert!(load("does_not_exist").is_none());
@@ -1075,6 +1151,7 @@ fn cessna_172sp() -> AircraftProfile {
         },
         flood_lights: true,
         fuel_pump: true,
+        fuel_pump_commands: None,
         magnetos: true,
         carb_heat: true,
         // The 172 selector is LEFT/BOTH/RIGHT (OFF is a separate shutoff valve,
@@ -1291,6 +1368,7 @@ fn cirrus_sr22() -> AircraftProfile {
         // fuel_pump_on[0] — the dataref the rustdecks deck drives for BOOST
         // (not laminar/sr22/switch/boost_pump, which an earlier scaffold guessed).
         fuel_pump: true,
+        fuel_pump_commands: None,
         // OFF / LEFT / RIGHT — no "both" (low-wing twin tanks, fed one at a
         // time). Selector commands verified against the rustdecks deck. The
         // standard sim/cockpit2/fuel/fuel_tank_selector (0=off/1=left/2=right) is

@@ -1,0 +1,213 @@
+# Aircraft profile — RWDesigns DHC-6-300 Twin Otter V2. Loaded when X-Plane
+# reports acf_ICAO "DHC6" (XCOPILOT_AIRCRAFT=auto). Covers the wheel variant
+# (DHC6.acf); the float/ski/tundra .acf files report the same ICAO and share
+# the systems, so this profile serves them all (no gear tool either way — the
+# wheel variant is fixed-gear).
+#
+# Twin TURBOPROP (2x P&W PT6A-27), fixed gear, unpressurized STOL bushplane.
+# SASL add-on: the exterior LIGHT switches and the flap lever manipulate STOCK
+# datarefs (verified in DHC6_cockpit.obj — landing/beacon/nav/strobe/taxi all
+# toggle sim/cockpit2/switches/*), so the universal lights/flaps tools work.
+# The ELECTRICAL and FUEL systems are the opposite: the stock datarefs are
+# frame-synced FROM custom TO/overhead/* switch datarefs (master.lua), so
+# those tools must fire the add-on's Twin_Otter/* commands — all of which are
+# wired below and verified present over the Web API with the aircraft loaded.
+#
+# Not exposed (deliberately): external power (the EXT battery position and the
+# menu-driven ground power), the engine fuel selectors (NORM / BOTH ON AFT /
+# BOTH ON FWD live on a dataref with no commands — leave them at NORM), prop
+# feather, and the de-ice boot panel. Add if flying shows a need.
+#
+# To verify in flight: which panel unit (G530 vs KX155 #1) displays COM1, and
+# whether the AP's stock VS mode works despite the panel lacking a VS button
+# (vertical modes on the panel are ALT and IAS only).
+
+id: dhc6_twin_otter
+display_name: Twin Otter DHC-6
+
+# Universal-dataref tools — verified to be stock on this add-on.
+throttle: true         # power levers (throttle_beta_rev_ratio is read by the model) — NOT piston
+# Constant-speed props. Arc from the .acf: redline 2200 (takeoff), green
+# 1600-2000. The model mirrors prop_rotation_speed_rad_sec per engine for its
+# gauges; the _all actuator drives both levers.
+prop:
+  dataref: sim/cockpit2/engine/actuators/prop_rotation_speed_rad_sec_all
+  max_rpm: 2200
+  cruise_rpm: 2000
+  min_rpm: 1600
+barometer: true        # set_barometer
+com_radio: true        # set_com1
+com2_radio: true       # set_com2 / swap_radio (two KX155A units + the G530)
+nav_radio: true        # set_nav1 / set_obs
+transponder: true      # set_transponder (KT70)
+parking_brake: true    # stock parking_brake_ratio (the model reads it for its handle)
+pitot_heat: true       # stock pitot_heat_on — the model mirrors it to both sides + static + AOA
+pitch_trim: true       # set_pitch_trim (universal elevator_trim)
+engines: 2             # twin — per-engine accessory writes cover both
+
+# Fixed gear (wheel variant) — no gear tool, no VLE gate.
+retractable_gear: false
+
+# Boost pumps: the universal fuel_pump_on array is a NO-OP here (master.lua
+# drives fuel_tank_pump_on from its own FWD/AFT switches). "boost pumps on"
+# fires the add-on's commands for BOTH pumps — the checklist item is plural —
+# and the 0/1 switch datarefs confirm.
+fuel_pump: false
+fuel_pump_commands:
+  on_commands:  [Twin_Otter/fuel/aft_boost_on, Twin_Otter/fuel/forward_boost_on]
+  off_commands: [Twin_Otter/fuel/aft_boost_off, Twin_Otter/fuel/forward_boost_off]
+  readback:     ["TO/FUEL/AFT_BOOST", "TO/FUEL/FWD_BOOST"]
+
+# Electrical — battery (3-pos: EXT/OFF/BATTERY), DC master, dual generators,
+# bleed air. All custom commands (raw stock writes get overwritten every frame
+# by the switch sync); stock datarefs used as readbacks where the model syncs
+# them, the 0/1 switch datarefs otherwise. No avionics master on this airframe
+# (each radio has its own power knob).
+electrical:
+  - key: battery
+    spoken: battery
+    on_commands:  [Twin_Otter/battery/power_to_battery]
+    off_commands: [Twin_Otter/battery/power_to_off]
+    readback:     ["sim/cockpit2/electrical/battery_on[0]"]
+  - key: master
+    spoken: DC master
+    on_commands:  [Twin_Otter/dc_master/master_on]
+    off_commands: [Twin_Otter/dc_master/master_off]
+    readback:     ["TO/overhead/DC_MASTER_SWITCH"]
+  - key: generator1
+    spoken: left generator
+    on_commands:  [Twin_Otter/generators/left_on]
+    off_commands: [Twin_Otter/generators/left_off]
+    readback:     ["sim/cockpit2/electrical/generator_on[0]"]
+  - key: generator2
+    spoken: right generator
+    on_commands:  [Twin_Otter/generators/right_on]
+    off_commands: [Twin_Otter/generators/right_off]
+    readback:     ["sim/cockpit2/electrical/generator_on[1]"]
+  - key: generators
+    spoken: both generators
+    on_commands:  [Twin_Otter/generators/left_on, Twin_Otter/generators/right_on]
+    off_commands: [Twin_Otter/generators/left_off, Twin_Otter/generators/right_off]
+    readback:     ["sim/cockpit2/electrical/generator_on[0]", "sim/cockpit2/electrical/generator_on[1]"]
+  # Bleed air valves, both sides together (AOM: pneumatics feed cabin heat,
+  # anti-ice AND the autopilot). Not electrical strictly, but it is a named
+  # on/off system and "bleed air on" routes here.
+  - key: bleed
+    spoken: bleed air
+    on_commands:  [Twin_Otter/bleed_air/left_on, Twin_Otter/bleed_air/right_on]
+    off_commands: [Twin_Otter/bleed_air/left_off, Twin_Otter/bleed_air/right_off]
+    readback:     ["TO/overhead/BLEED_AIR_L_SWITCH", "TO/overhead/BLEED_AIR_R_SWITCH"]
+
+# Turbine: no piston controls.
+engine: false
+magnetos: false
+carb_heat: false
+turbine_start: false   # not the MD-82 jet sequence
+# Simple retrofit AP (AOM): HDG/NAV/APPR/BC lateral, ALT/IAS vertical, driven
+# through the STOCK autopilot (the panel buttons fire sim/autopilot commands
+# and the annunciators mirror the stock statuses), so the universal AP tools
+# work. No flight director on this airframe; no special prep.
+autopilot: true
+ils: true              # APPR mode arms localizer + glideslope
+
+# PT6 turboprop start. The starter is FIRE-ONCE: one command press latches the
+# model's own 16-second starter run (master.lua holds engage_starter itself),
+# so there is no start_dn and no held re-arming. The tool's sequence still
+# fits: condition (fuel) lever cutoff, crank, fuel in at light-off N1, wait
+# for idle, generator on. ignition_arm doubles as the per-engine boost pump —
+# the AOM's fuel panel feeds the LEFT engine from the AFT tank and the RIGHT
+# from the FWD (fired per engine before its crank, exactly when the checklist
+# wants the pump).
+turboprop_start:
+  boost_pumps: false   # universal array is a no-op on this add-on (see above)
+  ignition_arm: [Twin_Otter/fuel/aft_boost_on, Twin_Otter/fuel/forward_boost_on]
+  condition_lever: sim/cockpit2/engine/actuators/mixture_ratio
+  condition_start: 0.5   # low idle for light-off
+  condition_run: 1.0     # full increase
+  n1_idle: 50.0          # PT6A-27 idle Ng
+  crank_secs: 18.0       # the model's starter quits at 16 s — no point waiting longer
+  start_up: [Twin_Otter/engine/starter_switch_left, Twin_Otter/engine/starter_switch_right]
+  start_dn: []           # fire-once starter releases itself
+  generators: [Twin_Otter/generators/left_on, Twin_Otter/generators/right_on]
+speedbrake: false
+directional_gyro: false  # HSI, no vacuum DG to sync
+
+# Fuel-endurance alerting. Twin PT6A-27 burns ~600 lb/hr total in cruise
+# (~270 kg/hr).
+fuel:
+  reserve_caution_min: 45.0
+  reserve_warning_min: 30.0
+  cruise_burn_kg_hr: 270.0
+
+# Clean stall (KIAS) — modeled acf_Vs.
+vs_clean_kts: 60.0
+# Modeled acf_Vne (the real -300's Vmo is 170 KIAS at MTOW; the model allows
+# 202, and the monitor should match what the sim enforces).
+vne_kts: 202.0
+
+# Static reference figures recited on request. Modeled .acf limits where they
+# exist; the rest from public DHC-6-300 figures. Empty weight matches the
+# add-on's own W&B page (3363 kg).
+reference:
+  kind: twin-engine turboprop
+  vno_kts: 160.0           # max structural cruise (acf_Vno)
+  vx_kts: 87.0             # best angle of climb
+  vy_kts: 100.0            # best rate of climb
+  vr_kts: 75.0             # rotate
+  vs0_kts: 54.0            # stall, landing config (acf_Vso)
+  approach_kts: 80.0       # typical short final, flaps down
+  cruise_kts: 160.0        # max cruise TAS at 10,000 ft
+  max_gross_lb: 12500.0    # MTOW (acf_m_max)
+  empty_weight_lb: 7415.0  # 3363 kg per the add-on's W&B manager
+  useful_load_lb: 5085.0
+  service_ceiling_ft: 26700.0
+  fuel_capacity_gal: 378.0 # FWD + AFT belly tanks
+  max_rpm: 2200.0          # prop redline (acf RSC_redline)
+
+# Flaps: the lever drives the stock flap handle (the cockpit selector just
+# follows flap1_deploy_ratio for animation). Modeled detents 0/10/20/30/40
+# degrees; Vfe 105 KIAS for the first notch (acf_Vfe1), 95 beyond (acf_Vfem).
+flaps:
+  detents:
+    - { label: up,   spoken: up,             ratio: 0.0 }
+    - { label: "10", spoken: ten degrees,    ratio: 0.25, vfe_kts: 105.0 }
+    - { label: "20", spoken: twenty degrees, ratio: 0.5,  vfe_kts: 95.0 }
+    - { label: "30", spoken: thirty degrees, ratio: 0.75, vfe_kts: 95.0 }
+    - { label: full, spoken: full,           ratio: 1.0,  vfe_kts: 95.0 }
+
+# Switchable lights — the overhead switches toggle the STOCK datarefs directly
+# (verified in the cockpit obj), so universal commands + readbacks work.
+lights:
+  - { key: nav,     spoken: position lights, dataref: sim/cockpit2/switches/navigation_lights_on, command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
+  - { key: beacon,  spoken: anti-collision light, dataref: sim/cockpit2/switches/beacon_on,       command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
+  - { key: strobe,  spoken: strobe lights,   dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
+  - { key: landing, spoken: landing lights,  dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+  - { key: taxi,    spoken: taxi light,      dataref: sim/cockpit2/switches/taxi_light_on,        command_on: sim/lights/taxi_lights_on,    command_off: sim/lights/taxi_lights_off }
+
+# SOP advisor: strobes airborne, landing lights for departure and arrival.
+advisor:
+  - dataref: sim/cockpit2/switches/strobe_lights_on
+    phases: [takeoff, climb, cruise, approach, landing]
+    say: "Strobes are still off — want them on for the flight?"
+  - dataref: sim/cockpit2/switches/landing_lights_on
+    phases: [takeoff, landing]
+    say: "Landing lights are off."
+
+# Cockpit geography — from the AOM's panel diagrams. Grows as flying verifies.
+locations:
+  battery: "on the overhead panel, the three-position switch: external, off, battery"
+  dc master: "on the overhead panel, next to the battery switch"
+  generator switches: "on the overhead panel, one per side. Three positions: off, on, and a momentary reset"
+  generators: "on the overhead panel, one switch per side"
+  bleed air: "on the overhead panel, one switch per side"
+  starter switches: "on the overhead panel, hold left or right to crank"
+  boost pumps: "on the centre panel above the fuel quantity gauges, forward and aft"
+  fuel selector: "on the centre panel between the fuel gauges: normal, both on aft, both on forward"
+  fire pull handles: "top of the centre panel, one per engine, with the fuel emergency switches"
+  autopilot: "right side of the captain's panel, the mode selector with the altitude set above"
+  power levers: "the centre pair on the pedestal, with prop levers right and fuel levers far right"
+  prop levers: "on the pedestal between the power and fuel levers"
+  fuel levers: "the rightmost pair on the pedestal, cutoff to full increase"
+  flap lever: "on the pedestal, the big lever aft of the power quadrant"
+  transponder: "bottom of the radio stack, the KT70"
+  parking brake: "the pull handle low on the captain's subpanel"
