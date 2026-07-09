@@ -299,6 +299,12 @@ const PHRASE_MISHEARS: &[(&str, &str)] = &[
     // Climb / descend.
     ("they send to", "descend to"),       // "They send to five thousand."
     ("claim to", "climb to"),             // "Claim to 8,000 feet." (Twotter, 2026-07-09)
+    // Top of descent: whisper garbled it five ways in one evening flight
+    // (2026-07-09) — each a dead-end retry of the same question.
+    ("top of the dissent", "top of descent"),
+    ("top of dissent", "top of descent"),
+    ("top of the center", "top of descent"),
+    ("top of this end", "top of descent"),
     // Props.
     ("props to cruz", "props to cruise"), // "Props to Cruz."
     ("pross", "props"),                   // "Max Pross?" (Twotter, 2026-07-09)
@@ -579,6 +585,11 @@ mod tests {
             // 2026-07-09 Twin Otter flights.
             ("Claim to 8,000 feet.", "climb to 8,000 feet."),
             ("Max Pross?", "Max props?"),
+            // 2026-07-09 evening cruise: "top of descent" in five disguises.
+            ("How much for top of the dissent?", "How much for top of descent?"),
+            ("How much for top of the center?", "How much for top of descent?"),
+            ("Can you remind me when we reach top of this end?", "Can you remind me when we reach top of descent?"),
+            ("Can you remind me when we reach top of the center?", "Can you remind me when we reach top of descent?"),
         ] {
             assert_eq!(fix_mishears(heard), want, "garble {heard:?}");
         }
