@@ -27,6 +27,7 @@ const DR_STRIP: &str = "xcopilot/status/strip";
 const DR_CALLOUT: &str = "xcopilot/status/callout";
 const DR_RADIO: &str = "xcopilot/status/radio";
 const DR_ATC: &str = "xcopilot/status/atc";
+const DR_COACH: &str = "xcopilot/status/coach";
 
 /// Keep text within the plugin's fixed display buffer (512 bytes, NUL-terminated)
 /// — long enough for a full engine/weather summary readback.
@@ -54,6 +55,9 @@ enum Update {
     /// "NAME,dist,SVC khz,...|NAME,..." ('*' marks the active station).
     /// Empty means nothing in range.
     Atc(String),
+    /// The Calls tab's live "say now" line — the coach's suggested next
+    /// radio call for the current tower state. Empty hides it.
+    Coach(String),
     /// A short "what's being changed" label the plugin flashes over the cockpit.
     Callout(String),
 }
@@ -123,6 +127,10 @@ impl StatusSink {
     pub fn atc(&self, text: &str) {
         let _ = self.0.send(Update::Atc(clip(text)));
     }
+    /// Refresh the Calls tab's suggested next call. Empty hides it.
+    pub fn coach(&self, text: &str) {
+        let _ = self.0.send(Update::Coach(clip(text)));
+    }
     /// Flash a "what's being changed" callout over the cockpit (e.g. "FLAPS > 10").
     pub fn callout(&self, text: &str) {
         let _ = self.0.send(Update::Callout(clip(text)));
@@ -156,6 +164,7 @@ enum Slot {
     Callout,
     Radio,
     Atc,
+    Coach,
 }
 
 /// The resolved numeric ids of the plugin's status datarefs. All `None` until a
@@ -171,6 +180,7 @@ struct Ids {
     callout: Option<i64>,
     radio: Option<i64>,
     atc: Option<i64>,
+    coach: Option<i64>,
 }
 
 impl Ids {
@@ -185,6 +195,7 @@ impl Ids {
             Slot::Callout => self.callout,
             Slot::Radio => self.radio,
             Slot::Atc => self.atc,
+            Slot::Coach => self.coach,
         }
     }
     /// True once at least one dataref resolved (i.e. the plugin is present).
@@ -206,6 +217,7 @@ fn resolve_all(http: &reqwest::blocking::Client, rest: &str) -> Ids {
         callout: resolve_id(http, rest, DR_CALLOUT),
         radio: resolve_id(http, rest, DR_RADIO),
         atc: resolve_id(http, rest, DR_ATC),
+        coach: resolve_id(http, rest, DR_COACH),
     }
 }
 
@@ -293,6 +305,7 @@ fn run(base: String, rx: Receiver<Update>) {
                 Update::Strip(text) => (Slot::Strip, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Radio(text) => (Slot::Radio, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Atc(text) => (Slot::Atc, json!(STANDARD.encode(text.as_bytes()))),
+                Update::Coach(text) => (Slot::Coach, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Callout(text) => (Slot::Callout, json!(STANDARD.encode(text.as_bytes()))),
             };
             healthy = patch(&http, &rest, &ids, slot, value);

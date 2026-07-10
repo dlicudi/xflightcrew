@@ -96,6 +96,24 @@ just under vectors. Station side state (ATIS/region/controller freqs) is
 published by `Station::install()`, called by the owner — never by
 `from_airport`, so sweeps and tests stay side-effect free.
 
+Depth (added 2026-07-11): the FSM grew **readback enforcement** (ICAO's
+runway-critical items only — takeoff/landing/line-up/hold; a correct echo
+earns silence, the wrong RUNWAY gets "negative" + repeat, anything else two
+challenges then the gate lets go; physics staleness voids a takeoff readback
+once airborne; `XCOPILOT_ATC_READBACK=false` keeps the coach suggestions and
+drops the challenges); a **LinedUp state** ("line up and wait", the
+conditional "behind the landing <telephony>, line up behind" against exactly
+ONE arrival ≥1.5 nm out, and cancel-takeoff now lands here so the release
+watch owes the re-clearance); **wake turbulence** (a 2-minute clock started
+by an airline-prefixed ghost lifting off our strip — TCAS carries no type,
+so airline callsign = medium-or-heavier — which turns "cleared for takeoff"
+into LUAW and blocks the hold release); and **named taxi routes** (apt.dat
+1201/1202 network, background-loaded per station in `TAXI_NET`, Dijkstra
+with runway edges ×25 → "taxi to holding point Alpha one runway two seven
+right via Bravo, Link two seven", crossings called out, off-route nudges
+from the compliance watch via `TAXI_ROUTE`). The coach's first suggestion is
+always the readback owed (`ClearanceSnap.pending_readback`).
+
 Battle-test surface (all deterministic, in `cargo test` unless noted): the
 state-by-intent matrix test in [src/tower.rs](src/tower.rs); the adversarial
 transcript corpus [bench/atc_corpus.yaml](bench/atc_corpus.yaml) (real whisper

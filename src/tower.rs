@@ -10,13 +10,19 @@
 pub const STT_PROMPT: &str = "Radio calls to the tower: request taxi, request \
 departure clearance, ready for departure, request takeoff, radio check, \
 holding point, runway zero niner, runway two seven, mayday, pan pan, going \
-around, downwind, turning base. Numbers are spoken digit by digit.";
+around, downwind, turning base, line up and wait, lining up, holding \
+position, wake turbulence, taxi via alpha bravo. Numbers are spoken digit by \
+digit.";
 
 /// Where the aircraft is in the clearance sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Parked,
     TaxiCleared,
+    /// Authorized onto the runway, NOT to fly: "line up and wait" (plain or
+    /// conditional), or a cancelled takeoff clearance — the aircraft may be
+    /// on the pavement, so the release watch owes it a clearance or a vacate.
+    LinedUp,
     TakeoffCleared,
     /// Told to join final; waiting on the "final" report.
     Inbound,
@@ -68,6 +74,12 @@ pub enum Intent {
     /// approach when the field has one, or says honestly that it has no
     /// radar; approach/departure grant it.
     RequestFlightFollowing,
+    /// "request frequency change" / "switching to approach" — radio
+    /// housekeeping, never an arrival. "London" garbles to "land on", and a
+    /// keyed "change to London Heathrow approach frequency" earned a JOIN
+    /// CLEARANCE (2026-07-10) — the exact mishear-to-clearance failure the
+    /// corpus exists to prevent.
+    RequestFrequencyChange,
     Unknown,
 }
 
@@ -98,6 +110,27 @@ pub struct Ctx {
     /// the ctx was built. `Some` makes the tower sequence around it: takeoff
     /// clearances hold, downwind joins go number two. `None` = final clear.
     pub final_traffic_nm: Option<f64>,
+    /// The spoken callsign of that traffic ("Speedbird three zero six"), when
+    /// the TCAS picture carries one — names the condition in a conditional
+    /// line-up clearance.
+    pub final_traffic_callsign: Option<String>,
+    /// How many arrivals are in the corridor. A conditional clearance is only
+    /// legal with ONE intervening aircraft ("behind the landing traffic" is
+    /// ambiguous against a stream).
+    pub final_traffic_count: usize,
+    /// A ghost is ON our strip (on the ground): nobody lines up onto an
+    /// occupied runway.
+    pub runway_occupied: bool,
+    /// Wake-turbulence delay still to run behind the last departure from our
+    /// strip, seconds. `Some` turns "cleared for takeoff" into "line up and
+    /// wait, wake turbulence".
+    pub wake_secs_left: Option<u64>,
+    /// The taxi route to the holding point, as spoken taxiway names
+    /// ("Alpha", "Bravo two"). Empty = no taxi network for this field; the
+    /// clearance stays route-less, exactly as before.
+    pub taxi_via: Vec<String>,
+    /// Runways the taxi route crosses, spoken ("zero niner left").
+    pub taxi_crossings: Vec<String>,
     /// The aircraft is on the ground — shapes the mayday answer (a parked
     /// emergency gets the trucks, not a landing clearance; seen live
     /// 2026-07-09: mayday from the stand was "cleared to land").
@@ -112,6 +145,24 @@ fn spoken_final(nm: f64) -> String {
     } else {
         format!("{:.0} mile final", nm.max(1.0))
     }
+}
+
+/// The " via Alpha, Bravo" clause of a taxi clearance — empty when the field
+/// has no parsed taxi network, so route-less fields phrase exactly as before.
+fn via_clause(ctx: &Ctx) -> String {
+    if ctx.taxi_via.is_empty() {
+        String::new()
+    } else {
+        format!(" via {}", ctx.taxi_via.join(", "))
+    }
+}
+
+/// The ", cross runway ..." clause when the taxi route crosses one.
+fn crossing_clause(ctx: &Ctx) -> String {
+    ctx.taxi_crossings
+        .iter()
+        .map(|r| format!(", cross runway {r}"))
+        .collect()
 }
 
 /// The ", QNH ..." clause of a clearance — empty when the pilot has the
@@ -159,6 +210,19 @@ pub fn parse_intent(transcript: &str) -> Intent {
     {
         return Intent::RadioCheck;
     }
+    // "say again ..." is the pilot asking for a repeat — it must never parse
+    // as whatever noun follows ("say again the clearance" read as a zone
+    // clearance request, corpus 2026-07-11). The gate answers it by
+    // repeating an outstanding instruction; otherwise it's "say again" back.
+    if t.contains("say again") {
+        return Intent::Unknown;
+    }
+    // A line-up phrase is a READBACK of "line up and wait", never a request —
+    // and "behind the landing traffic, lining up" must not read the word
+    // "landing" as an arrival call (corpus 2026-07-11).
+    if t.contains("line up") || t.contains("lining up") || t.contains("line-up") {
+        return Intent::Unknown;
+    }
     // "request vectors for taxi to parking" (real 2026-07-09 call) wants the
     // taxi, not the vectoring service — ground words beat the vector keyword.
     if t.contains("vector") && !t.contains("taxi") && !word("parking") {
@@ -188,6 +252,15 @@ pub fn parse_intent(transcript: &str) -> Intent {
     if t.contains("flight following") || t.contains("flight follow") {
         return Intent::RequestFlightFollowing;
     }
+    // Frequency housekeeping, before anything can read "land on" (garbled
+    // "London") as a landing: any sentence about changing/switching a
+    // frequency is that request and nothing else.
+    if t.contains("frequenc")
+        && (word("switch") || word("change") || word("changing") || word("tune")
+            || word("request"))
+    {
+        return Intent::RequestFrequencyChange;
+    }
     // Questions are crew talk, not transmissions. "What runway shall I take
     // off from?" must reach the copilot (or get "say again" on a keyed radio),
     // never parse as a takeoff request — the 2026-07-08 flight was CLEARED FOR
@@ -195,6 +268,7 @@ pub fn parse_intent(transcript: &str) -> Intent {
     // above this guard: the question-shaped calls a tower genuinely answers.
     if word("what") || word("which") || word("how") || word("where") || word("when")
         || word("why") || word("shall") || word("should") || word("can") || word("could")
+        || word("confirm")
     {
         return Intent::Unknown;
     }
@@ -323,6 +397,7 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "request_vectors" => Intent::RequestVectors,
         "greeting" => Intent::Greeting,
         "flight_following" => Intent::RequestFlightFollowing,
+        "frequency_change" => Intent::RequestFrequencyChange,
         "unknown" => Intent::Unknown,
         _ => return None,
     })
@@ -337,17 +412,212 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
 pub fn is_readback(transcript: &str) -> bool {
     let t = transcript.to_lowercase();
     let word = |w: &str| t.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == w);
+    // A confirm-question or a repeat request WANTS an answer — silence would
+    // read as ATC ignoring it.
+    if word("confirm") || t.contains("say again") {
+        return false;
+    }
+    // "transponder set to 4503" is the squawk readback in cockpit words
+    // (real 2026-07-10 call, answered "say again" while the watch was
+    // already confirming the code).
     ["descending", "descend", "maintaining", "maintain", "climbing", "climb", "passing",
-     "heading", "cleared", "roger", "wilco", "squawk", "squawking", "copy", "copied"]
+     "heading", "cleared", "roger", "wilco", "squawk", "squawking", "transponder", "copy",
+     "copied", "holding", "lining"]
         .iter()
         .any(|w| word(w))
+        || t.contains("line up")
 }
+
+/// The runway-critical instructions whose readback is MANDATORY (ICAO Doc
+/// 4444 keeps the list short: clearances to enter, cross, take off from or
+/// land on a runway, plus hold instructions). Kept to exactly those on
+/// purpose — enforcing taxi/QNH echoes against whisper's transcription would
+/// be a nag, not realism.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Awaited {
+    /// "hold position" — any holding words satisfy it.
+    HoldPosition,
+    /// "line up and wait" — lining-up words; a CONDITIONAL clearance
+    /// ("behind the landing traffic ... behind") must echo the condition.
+    LineUp { runway: String, behind: bool },
+    Takeoff { runway: String },
+    Landing { runway: String, touch_and_go: bool },
+}
+
+/// A clearance awaiting its readback: what must be echoed, the instruction
+/// sentence to repeat on a challenge, and how many challenges have been
+/// spent — two, then the tower lets it go. A garbled radio must never
+/// deadlock the FSM; the safety property is "a mishear never EARNS a
+/// clearance", not "a mishear traps you at the holding point".
+#[derive(Debug, Clone)]
+pub struct PendingReadback {
+    pub awaited: Awaited,
+    /// The instruction sentence, re-spoken when challenging.
+    pub instruction: String,
+    pub nudges: u8,
+}
+
+/// What a transmission is, measured against an awaited readback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadbackCheck {
+    Correct,
+    /// The echo names a DIFFERENT runway — the dangerous readback error, and
+    /// the whole reason controllers listen to readbacks.
+    WrongRunway { heard: String },
+    NotAReadback,
+}
+
+/// Parse a runway designator at the START of a token slice: spelled digits
+/// ("two seven"), literal digits ("27", "09R"), an optional side word.
+fn designator_at(toks: &[String]) -> Option<String> {
+    let digit = |tok: &str| match tok {
+        "zero" | "0" => Some('0'),
+        "one" | "1" => Some('1'),
+        "two" | "2" => Some('2'),
+        "three" | "3" => Some('3'),
+        "four" | "4" => Some('4'),
+        "five" | "5" => Some('5'),
+        "six" | "6" => Some('6'),
+        "seven" | "7" => Some('7'),
+        "eight" | "8" => Some('8'),
+        "nine" | "niner" | "9" => Some('9'),
+        _ => None,
+    };
+    let mut digits = String::new();
+    let mut side: Option<char> = None;
+    let mut j = 0;
+    // "27" / "09R" as one token.
+    if let Some(first) = toks.first() {
+        if first.len() <= 3 && first.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            for c in first.chars() {
+                match c {
+                    '0'..='9' if digits.len() < 2 => digits.push(c),
+                    'l' => side = Some('L'),
+                    'r' => side = Some('R'),
+                    'c' => side = Some('C'),
+                    _ => {}
+                }
+            }
+            j = 1;
+        }
+    }
+    // Spelled out, digit by digit.
+    while side.is_none() && digits.len() < 2 {
+        match toks.get(j).and_then(|t| digit(t)) {
+            Some(d) => {
+                digits.push(d);
+                j += 1;
+            }
+            None => break,
+        }
+    }
+    if digits.is_empty() {
+        return None;
+    }
+    if side.is_none() {
+        side = toks.get(j).and_then(|s| match s.as_str() {
+            "left" => Some('L'),
+            "right" => Some('R'),
+            "center" | "centre" => Some('C'),
+            _ => None,
+        });
+    }
+    let trimmed = digits.trim_start_matches('0');
+    let mut out = if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() };
+    if let Some(s) = side {
+        out.push(s);
+    }
+    Some(out)
+}
+
+fn lower_tokens(t: &str) -> Vec<String> {
+    t.split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+/// Canonical designator from a bare runway string ("zero niner right",
+/// "27R") — for the EXPECTED side of a comparison, where the whole string is
+/// the designator.
+fn canon_runway(t: &str) -> Option<String> {
+    let toks = lower_tokens(t);
+    (0..toks.len()).find_map(|i| designator_at(&toks[i..]))
+}
+
+/// The designator a TRANSMISSION names — only after the word "runway", so a
+/// callsign's digits ("november one seven two...") can never read as one.
+fn runway_after_keyword(t: &str) -> Option<String> {
+    let toks = lower_tokens(t);
+    let pos = toks.iter().position(|w| w == "runway")?;
+    designator_at(&toks[pos + 1..])
+}
+
+/// Measure a transmission against the awaited readback. Deterministic
+/// keyword checks, same discipline as [`parse_intent`]: lenient on filler
+/// (whisper drops words), strict on contradiction (a WRONG runway is always
+/// caught, never waved through).
+pub fn check_readback(transcript: &str, awaited: &Awaited) -> ReadbackCheck {
+    let t = transcript.to_lowercase();
+    let word = |w: &str| t.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == w);
+    // A fresh request, a readiness call, or a confirm-question is never the
+    // echo — those get the challenge (which repeats the instruction, so
+    // "confirm cleared for takeoff?" is answered by the repeat).
+    if word("request") || word("requesting") || word("ready") || word("confirm")
+        || t.contains("say again")
+    {
+        return ReadbackCheck::NotAReadback;
+    }
+    let verb_ok = match awaited {
+        Awaited::HoldPosition => word("hold") || word("holding"),
+        Awaited::LineUp { behind, .. } => {
+            let lining =
+                t.contains("line up") || t.contains("lining up") || t.contains("line-up")
+                    || word("lineup");
+            // The condition is part of the clearance: it must come back.
+            lining && (!behind || word("behind"))
+        }
+        Awaited::Takeoff { .. } => {
+            t.contains("takeoff") || t.contains("take off") || t.contains("take-off")
+        }
+        Awaited::Landing { touch_and_go, .. } => {
+            if *touch_and_go {
+                t.contains("touch and go") || word("option") || word("cleared")
+            } else {
+                word("land") || word("landing") || word("cleared")
+            }
+        }
+    };
+    if !verb_ok {
+        return ReadbackCheck::NotAReadback;
+    }
+    // The echo carries a runway: it must be OUR runway. No runway spoken is
+    // accepted (whisper eats numbers); the wrong one never is.
+    let expect = match awaited {
+        Awaited::LineUp { runway, .. }
+        | Awaited::Takeoff { runway }
+        | Awaited::Landing { runway, .. } => canon_runway(runway),
+        Awaited::HoldPosition => None,
+    };
+    if let (Some(e), Some(h)) = (expect, runway_after_keyword(&t)) {
+        if e != h {
+            return ReadbackCheck::WrongRunway { heard: h };
+        }
+    }
+    ReadbackCheck::Correct
+}
+
+/// A conditional line-up needs the arrival far enough out that the pilot can
+/// actually get behind it — inside this, "hold position" is the honest call.
+const CONDITIONAL_MIN_NM: f64 = 1.5;
 
 /// The tower's side of the dialogue: one aircraft (the player), one runway.
 pub struct Tower {
     pub state: State,
     /// The arrival asked for a touch and go; shapes the landing clearance.
     touch_and_go: bool,
+    /// A runway-critical clearance awaiting its mandatory readback.
+    pending: Option<PendingReadback>,
 }
 
 impl Tower {
@@ -355,6 +625,7 @@ impl Tower {
         Tower {
             state: State::Parked,
             touch_and_go: false,
+            pending: None,
         }
     }
 
@@ -365,8 +636,126 @@ impl Tower {
         self.touch_and_go = touch_and_go;
     }
 
+    /// The clearance still awaiting its readback, if any. Consumed by the
+    /// battle tests; the binary reads it via [`Tower::suggested_readback`].
+    #[allow(dead_code)]
+    pub fn pending(&self) -> Option<&PendingReadback> {
+        self.pending.as_ref()
+    }
+
+    /// Arm the takeoff readback for a clearance the MONITOR spoke (the held-
+    /// clearance release) — the FSM must expect the echo exactly as if the
+    /// clearance had been issued on the reply path.
+    pub fn arm_takeoff_readback(&mut self, runway: String, instruction: String) {
+        self.pending = Some(PendingReadback {
+            awaited: Awaited::Takeoff { runway },
+            instruction,
+            nudges: 0,
+        });
+    }
+
+    fn arm(&mut self, awaited: Awaited, instruction: &str) {
+        self.pending = Some(PendingReadback {
+            awaited,
+            instruction: instruction.to_string(),
+            nudges: 0,
+        });
+    }
+
+    /// The exact readback the pilot owes, phrased — the coach's line, and the
+    /// Calls tab's SAY NOW row.
+    pub fn suggested_readback(&self, callsign: &str) -> Option<String> {
+        Some(match &self.pending.as_ref()?.awaited {
+            Awaited::HoldPosition => format!("Holding position, {callsign}."),
+            Awaited::LineUp { runway, behind: false } => {
+                format!("Lining up runway {runway}, {callsign}.")
+            }
+            Awaited::LineUp { runway, behind: true } => format!(
+                "Behind the landing traffic, lining up runway {runway} behind, {callsign}."
+            ),
+            Awaited::Takeoff { runway } => {
+                format!("Cleared for takeoff runway {runway}, {callsign}.")
+            }
+            Awaited::Landing { runway, touch_and_go: false } => {
+                format!("Cleared to land runway {runway}, {callsign}.")
+            }
+            Awaited::Landing { runway, touch_and_go: true } => {
+                format!("Cleared touch and go runway {runway}, {callsign}.")
+            }
+        })
+    }
+
+    /// The readback gate, run on a KEYED transmission before normal routing.
+    /// `Some(reply)` means the gate consumed the transmission: empty = a
+    /// correct readback (the frequency stays silent), otherwise the
+    /// challenge or correction to speak. `None` = route normally.
+    pub fn gate(&mut self, transcript: &str, intent: Intent, ctx: &Ctx) -> Option<String> {
+        let pending = self.pending.as_ref()?;
+        // Physics consumed the instruction: demanding the echo of a takeoff
+        // clearance from an aircraft already flying (or of a landing
+        // clearance from one already down) is theater. Drop it silently.
+        let stale = match pending.awaited {
+            Awaited::Landing { .. } => ctx.on_ground,
+            _ => !ctx.on_ground,
+        };
+        if stale {
+            self.pending = None;
+            return None;
+        }
+        // Safety outranks discipline: an emergency or a go-around is never
+        // answered with "read back".
+        if matches!(intent, Intent::Mayday | Intent::GoAround) {
+            self.pending = None;
+            return None;
+        }
+        match check_readback(transcript, &pending.awaited) {
+            ReadbackCheck::Correct => {
+                self.pending = None;
+                Some(String::new())
+            }
+            ReadbackCheck::WrongRunway { .. } => {
+                let instruction = pending.instruction.clone();
+                Some(format!("{}, negative. I say again: {instruction}", ctx.callsign))
+            }
+            ReadbackCheck::NotAReadback => {
+                // The question-shaped calls a controller answers regardless.
+                if matches!(
+                    intent,
+                    Intent::RadioCheck | Intent::WindCheck | Intent::SquawkCheck | Intent::Greeting
+                ) {
+                    return None;
+                }
+                let p = self.pending.as_mut().unwrap();
+                if p.nudges >= 2 {
+                    // Two challenges spent: let the call through — the tower
+                    // must never trap a garbled radio in a readback loop.
+                    self.pending = None;
+                    return None;
+                }
+                p.nudges += 1;
+                let instruction = p.instruction.clone();
+                Some(format!("{}, read back: {instruction}", ctx.callsign))
+            }
+        }
+    }
+
     /// Answer one transmission, advancing the clearance state.
     pub fn handle(&mut self, intent: Intent, ctx: &Ctx) -> String {
+        // Any new REQUEST voids an outstanding readback demand — the gate
+        // already had its chance to challenge; processing the call means the
+        // dialogue has moved on. The answer-only intents leave it armed.
+        if !matches!(
+            intent,
+            Intent::RadioCheck
+                | Intent::WindCheck
+                | Intent::SquawkCheck
+                | Intent::Greeting
+                | Intent::RequestFlightFollowing
+                | Intent::RequestFrequencyChange
+                | Intent::Unknown
+        ) {
+            self.pending = None;
+        }
         match intent {
             Intent::RadioCheck => {
                 format!("{}, {} Tower, reading you five.", ctx.callsign, ctx.airport)
@@ -394,43 +783,125 @@ impl Tower {
             Intent::RequestTaxi => {
                 self.state = State::TaxiCleared;
                 format!(
-                    "{}, taxi to holding point {} runway {}{}. \
+                    "{}, taxi to holding point {} runway {}{}{}{}. \
                      Report ready for departure.",
                     ctx.callsign,
                     ctx.holding_point,
                     ctx.runway,
+                    via_clause(ctx),
+                    crossing_clause(ctx),
                     qnh_clause(ctx)
                 )
             }
             Intent::RequestTakeoff => match self.state {
-                // Landing traffic owns the runway: a fresh clearance is
-                // withheld, and the state doesn't move — ask again when the
-                // final is clear (or after the arrival, as instructed).
-                State::TaxiCleared if ctx.final_traffic_nm.is_some() => {
+                // Already cleared, but traffic has since appeared on final:
+                // the clearance is CANCELLED, not repeated — the 2026-07-10
+                // tape has a takeoff clearance and a landing clearance on the
+                // same runway eight seconds apart. The aircraft may already
+                // be on the pavement, so it lands in LinedUp: the release
+                // watch owes it the re-clearance.
+                State::TakeoffCleared if ctx.final_traffic_nm.is_some() => {
+                    self.state = State::LinedUp;
                     let on_final = spoken_final(ctx.final_traffic_nm.unwrap_or(0.0));
-                    format!(
+                    let line = format!(
+                        "{}, cancel takeoff clearance, hold position, traffic on \
+                         {on_final}.",
+                        ctx.callsign
+                    );
+                    self.arm(Awaited::HoldPosition, &line);
+                    line
+                }
+                // Landing traffic owns the runway. Exactly ONE arrival, far
+                // enough out: a CONDITIONAL line-up puts the departure on the
+                // pavement the moment the lander is past — real towers fill
+                // this gap instead of parking you. Closer, more than one, or
+                // already lined up: hold, honestly.
+                State::TaxiCleared
+                    if ctx.final_traffic_nm.is_some()
+                        && ctx.final_traffic_count <= 1
+                        && ctx.final_traffic_nm.unwrap_or(0.0) >= CONDITIONAL_MIN_NM =>
+                {
+                    self.state = State::LinedUp;
+                    let traffic = ctx
+                        .final_traffic_callsign
+                        .clone()
+                        .unwrap_or_else(|| "traffic".to_string());
+                    let line = format!(
+                        "{}, behind the landing {traffic}, line up runway {} behind.",
+                        ctx.callsign, ctx.runway
+                    );
+                    self.arm(
+                        Awaited::LineUp { runway: ctx.runway.clone(), behind: true },
+                        &line,
+                    );
+                    line
+                }
+                State::TaxiCleared | State::LinedUp if ctx.final_traffic_nm.is_some() => {
+                    let on_final = spoken_final(ctx.final_traffic_nm.unwrap_or(0.0));
+                    let line = format!(
                         "{}, hold position, traffic on {on_final}. Expect clearance \
                          after the landing traffic.",
                         ctx.callsign
-                    )
+                    );
+                    self.arm(Awaited::HoldPosition, &line);
+                    line
                 }
-                State::TaxiCleared | State::TakeoffCleared => {
+                // Wake turbulence: the last departure off our strip was
+                // heavier than us and its two minutes haven't run. Line up
+                // and wait IS the classic use — on the runway, ready, while
+                // the clock runs; the release watch clears you when it has.
+                State::TaxiCleared if ctx.wake_secs_left.is_some() && !ctx.runway_occupied => {
+                    self.state = State::LinedUp;
+                    let line = format!(
+                        "{}, line up and wait runway {}, wake turbulence, two minutes \
+                         behind the departing traffic.",
+                        ctx.callsign, ctx.runway
+                    );
+                    self.arm(
+                        Awaited::LineUp { runway: ctx.runway.clone(), behind: false },
+                        &line,
+                    );
+                    line
+                }
+                State::LinedUp if ctx.wake_secs_left.is_some() => {
+                    let line = format!(
+                        "{}, hold position, wake turbulence. Expect clearance shortly.",
+                        ctx.callsign
+                    );
+                    self.arm(Awaited::HoldPosition, &line);
+                    line
+                }
+                // A ghost is ON the strip: nobody lines up onto an occupied
+                // runway.
+                State::TaxiCleared | State::LinedUp if ctx.runway_occupied => {
+                    let line = format!(
+                        "{}, hold position, traffic on the runway.",
+                        ctx.callsign
+                    );
+                    self.arm(Awaited::HoldPosition, &line);
+                    line
+                }
+                State::TaxiCleared | State::LinedUp | State::TakeoffCleared => {
                     self.state = State::TakeoffCleared;
-                    format!(
+                    let line = format!(
                         "{}, runway {}, wind {}, cleared for takeoff.",
                         ctx.callsign, ctx.runway, ctx.wind
-                    )
+                    );
+                    self.arm(Awaited::Takeoff { runway: ctx.runway.clone() }, &line);
+                    line
                 }
                 // A takeoff request from anywhere else gets the taxi first —
                 // the tower never clears a takeoff from a parking stand.
                 _ => {
                     self.state = State::TaxiCleared;
                     format!(
-                        "{}, taxi to holding point {} runway {} first{}. \
+                        "{}, taxi to holding point {} runway {} first{}{}{}. \
                          Report ready for departure.",
                         ctx.callsign,
                         ctx.holding_point,
                         ctx.runway,
+                        via_clause(ctx),
+                        crossing_clause(ctx),
                         qnh_clause(ctx)
                     )
                 }
@@ -455,10 +926,18 @@ impl Tower {
                 } else {
                     "cleared to land"
                 };
-                format!(
+                let line = format!(
                     "{}, runway {}, wind {}, {}.",
                     ctx.callsign, ctx.runway, ctx.wind, clearance
-                )
+                );
+                self.arm(
+                    Awaited::Landing {
+                        runway: ctx.runway.clone(),
+                        touch_and_go: self.touch_and_go,
+                    },
+                    &line,
+                );
+                line
             }
             // Pattern position reports: the tower sequences the circuit leg by
             // leg. All land in Inbound — "in the pattern, awaiting final".
@@ -538,6 +1017,10 @@ impl Tower {
             Intent::Greeting => {
                 format!("{}, {} Tower, pass your message.", ctx.callsign, ctx.airport)
             }
+            // Radio housekeeping: approve and let them go. No state change.
+            Intent::RequestFrequencyChange => {
+                format!("{}, frequency change approved.", ctx.callsign)
+            }
             // Flight following is a radar service: approach's job when the
             // field has one; a tower without a scope says so and keeps the
             // aircraft on the VFR conspicuity code. No state change.
@@ -587,7 +1070,23 @@ mod tests {
             approach: Some("one two two decimal eight".into()),
             squawk: "seven zero zero zero".into(),
             final_traffic_nm: None,
+            final_traffic_callsign: None,
+            final_traffic_count: 0,
+            runway_occupied: false,
+            wake_secs_left: None,
+            taxi_via: Vec::new(),
+            taxi_crossings: Vec::new(),
             on_ground: false,
+        }
+    }
+
+    /// ctx() with one arrival on final at `nm`.
+    fn busy(nm: f64) -> Ctx {
+        Ctx {
+            final_traffic_nm: Some(nm),
+            final_traffic_callsign: Some("Speedbird three zero six".into()),
+            final_traffic_count: 1,
+            ..ctx()
         }
     }
 
@@ -743,7 +1242,7 @@ mod tests {
     fn state_intent_matrix_holds_the_invariants() {
         use Intent::*;
         use State::*;
-        let states = [Parked, TaxiCleared, TakeoffCleared, Inbound, ClearedToLand];
+        let states = [Parked, TaxiCleared, LinedUp, TakeoffCleared, Inbound, ClearedToLand];
         let intents = [
             RadioCheck,
             RequestTaxi,
@@ -763,6 +1262,7 @@ mod tests {
             RequestVectors,
             Greeting,
             RequestFlightFollowing,
+            RequestFrequencyChange,
             Unknown,
         ];
         let c = ctx();
@@ -784,7 +1284,7 @@ mod tests {
                 if reply.contains("cleared for takeoff") {
                     assert_eq!(intent, RequestTakeoff, "{cell}: unasked takeoff clearance");
                     assert!(
-                        matches!(start, TaxiCleared | TakeoffCleared),
+                        matches!(start, TaxiCleared | LinedUp | TakeoffCleared),
                         "{cell}: takeoff clearance from the wrong state"
                     );
                     assert!(reply.contains(&c.runway), "{cell}: clearance without runway");
@@ -806,9 +1306,9 @@ mod tests {
                 // deliberate edit to this test, not a surprise.
                 let want = match intent {
                     RadioCheck | WindCheck | SquawkCheck | Unknown | RequestClearance => start,
-                    // A hail and a flight-following request are answered
-                    // without touching the sequence.
-                    Greeting | RequestFlightFollowing => start,
+                    // A hail, flight following, and radio housekeeping are
+                    // answered without touching the sequence.
+                    Greeting | RequestFlightFollowing | RequestFrequencyChange => start,
                     // ctx() has an approach frequency, so vectors redirect
                     // without touching the sequence.
                     RequestVectors => start,
@@ -821,7 +1321,7 @@ mod tests {
                         }
                     }
                     RequestTakeoff => {
-                        if matches!(start, TaxiCleared | TakeoffCleared) {
+                        if matches!(start, TaxiCleared | LinedUp | TakeoffCleared) {
                             TakeoffCleared
                         } else {
                             TaxiCleared
@@ -868,7 +1368,7 @@ mod tests {
             assert_eq!(parse_intent(call), Intent::Mayday, "{call}");
         }
         use State::*;
-        for start in [Parked, TaxiCleared, TakeoffCleared, Inbound, ClearedToLand] {
+        for start in [Parked, TaxiCleared, LinedUp, TakeoffCleared, Inbound, ClearedToLand] {
             let mut twr = Tower::new();
             twr.state = start;
             let r = twr.handle(Intent::Mayday, &ctx());
@@ -942,16 +1442,31 @@ mod tests {
     }
 
     #[test]
-    fn final_traffic_gates_takeoff_and_sequences_downwind() {
-        // Traffic on final: the takeoff clearance is withheld and the state
-        // doesn't move — live traffic owns the runway.
-        let mut busy = ctx();
-        busy.final_traffic_nm = Some(2.4);
+    fn takeoff_clearance_is_cancelled_when_traffic_appears_on_final() {
+        // Cleared with a clear final; traffic appears; the re-ask CANCELS
+        // (the 2026-07-10 tape had a takeoff and a landing clearance on the
+        // same runway eight seconds apart). The aircraft may already be on
+        // the pavement, so cancellation lands in LinedUp — the release
+        // watch owes it the re-clearance.
         let mut twr = Tower::new();
         twr.state = State::TaxiCleared;
-        let r = twr.handle(Intent::RequestTakeoff, &busy);
+        let r = twr.handle(Intent::RequestTakeoff, &ctx());
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        let r = twr.handle(Intent::RequestTakeoff, &busy(1.8));
+        assert!(r.contains("cancel takeoff clearance"), "{r}");
         assert!(r.contains("hold position"), "{r}");
-        assert!(r.contains("2 mile final"), "{r}");
+        assert_eq!(twr.state, State::LinedUp, "clearance withdrawn, still on the pavement");
+    }
+
+    #[test]
+    fn final_traffic_gates_takeoff_and_sequences_downwind() {
+        // Traffic on SHORT final: too close for a conditional — hold, and the
+        // state doesn't move.
+        let mut twr = Tower::new();
+        twr.state = State::TaxiCleared;
+        let r = twr.handle(Intent::RequestTakeoff, &busy(0.9));
+        assert!(r.contains("hold position"), "{r}");
+        assert!(r.contains("short final"), "{r}");
         assert_eq!(twr.state, State::TaxiCleared, "clearance withheld");
         // Final clears on the next ask: the clearance comes.
         let r = twr.handle(Intent::RequestTakeoff, &ctx());
@@ -959,15 +1474,230 @@ mod tests {
         assert_eq!(twr.state, State::TakeoffCleared);
 
         // Downwind with traffic on short final: number two, follow it.
-        busy.final_traffic_nm = Some(0.9);
         let mut twr = Tower::new();
         twr.state = State::Inbound;
-        let r = twr.handle(Intent::ReportDownwind, &busy);
+        let r = twr.handle(Intent::ReportDownwind, &busy(0.9));
         assert!(r.contains("number two"), "{r}");
         assert!(r.contains("short final"), "{r}");
         // Empty final: number one, as before.
         let r = twr.handle(Intent::ReportDownwind, &ctx());
         assert!(r.contains("number one"), "{r}");
+    }
+
+    #[test]
+    fn one_arrival_far_enough_earns_a_conditional_line_up() {
+        // Exactly one arrival, far enough out: "behind the landing traffic,
+        // line up behind" — the departure is staged, not parked.
+        let mut twr = Tower::new();
+        twr.state = State::TaxiCleared;
+        let r = twr.handle(Intent::RequestTakeoff, &busy(2.4));
+        assert!(r.contains("behind the landing Speedbird three zero six"), "{r}");
+        assert!(r.contains("line up runway zero niner behind"), "{r}");
+        assert!(!r.contains("cleared for takeoff"), "{r}");
+        assert_eq!(twr.state, State::LinedUp);
+        // The condition must be read back — echoing the line-up without
+        // "behind" is challenged, with the condition echoed it's silence.
+        let p = twr.pending().expect("conditional awaits its readback");
+        assert_eq!(
+            check_readback("lining up runway zero niner, november 172SP", &p.awaited),
+            ReadbackCheck::NotAReadback,
+            "the condition is part of the clearance"
+        );
+        assert_eq!(
+            check_readback(
+                "behind the landing traffic, lining up runway zero niner behind, november 172SP",
+                &p.awaited
+            ),
+            ReadbackCheck::Correct
+        );
+        // A STREAM on final never gets a conditional — ambiguous condition.
+        let mut stream = busy(3.0);
+        stream.final_traffic_count = 2;
+        let mut twr = Tower::new();
+        twr.state = State::TaxiCleared;
+        let r = twr.handle(Intent::RequestTakeoff, &stream);
+        assert!(r.contains("hold position"), "{r}");
+        assert_eq!(twr.state, State::TaxiCleared);
+        // Re-asking while lined up with traffic still on final: hold, no
+        // takeoff clearance, still lined up.
+        let mut twr = Tower::new();
+        twr.state = State::LinedUp;
+        let r = twr.handle(Intent::RequestTakeoff, &busy(2.0));
+        assert!(r.contains("hold position"), "{r}");
+        assert!(!r.contains("line up"), "{r}");
+        assert_eq!(twr.state, State::LinedUp);
+        // Final clear: the lined-up aircraft gets the clearance.
+        let r = twr.handle(Intent::RequestTakeoff, &ctx());
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        assert_eq!(twr.state, State::TakeoffCleared);
+    }
+
+    #[test]
+    fn wake_turbulence_lines_up_and_waits() {
+        // A heavier departure just rolled: line up and wait while the two
+        // minutes run — the classic use of LUAW.
+        let mut wake = ctx();
+        wake.wake_secs_left = Some(95);
+        let mut twr = Tower::new();
+        twr.state = State::TaxiCleared;
+        let r = twr.handle(Intent::RequestTakeoff, &wake);
+        assert!(r.contains("line up and wait runway zero niner"), "{r}");
+        assert!(r.contains("wake turbulence"), "{r}");
+        assert!(!r.contains("cleared for takeoff"), "{r}");
+        assert_eq!(twr.state, State::LinedUp);
+        // Impatience while the clock runs: hold, still no clearance.
+        let r = twr.handle(Intent::RequestTakeoff, &wake);
+        assert!(r.contains("hold position"), "{r}");
+        assert!(r.contains("wake turbulence"), "{r}");
+        assert_eq!(twr.state, State::LinedUp);
+        // Clock expired: cleared.
+        let r = twr.handle(Intent::RequestTakeoff, &ctx());
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        // An occupied runway blocks the line-up — nobody lines up onto a
+        // runway with traffic on it, wake clock or not.
+        let mut occupied = ctx();
+        occupied.wake_secs_left = Some(60);
+        occupied.runway_occupied = true;
+        let mut twr = Tower::new();
+        twr.state = State::TaxiCleared;
+        let r = twr.handle(Intent::RequestTakeoff, &occupied);
+        assert!(r.contains("hold position"), "{r}");
+        assert_eq!(twr.state, State::TaxiCleared);
+    }
+
+    #[test]
+    fn readback_gate_holds_the_runway_items() {
+        // Takeoff scenarios play out ON the ground — the gate voids a
+        // takeoff readback the moment physics says airborne.
+        let mut c = ctx();
+        c.on_ground = true;
+        let mut twr = Tower::new();
+        twr.state = State::TaxiCleared;
+        let clearance = twr.handle(Intent::RequestTakeoff, &c);
+        assert!(clearance.contains("cleared for takeoff"), "{clearance}");
+        // A correct readback earns silence and clears the debt.
+        let mut t2 = Tower::new();
+        t2.state = State::TaxiCleared;
+        t2.handle(Intent::RequestTakeoff, &c);
+        let g = t2.gate("cleared for takeoff runway zero niner, november 172SP",
+                        parse_intent("cleared for takeoff runway zero niner, november 172SP"), &c);
+        assert_eq!(g, Some(String::new()), "correct readback = silence");
+        assert!(t2.pending().is_none());
+        // The WRONG runway is corrected, never waved through.
+        let mut t3 = Tower::new();
+        t3.state = State::TaxiCleared;
+        t3.handle(Intent::RequestTakeoff, &c);
+        let g = t3.gate("cleared for takeoff runway two seven, november 172SP",
+                        Intent::Unknown, &c).expect("gate speaks");
+        assert!(g.contains("negative"), "{g}");
+        assert!(g.contains("I say again"), "{g}");
+        assert!(t3.pending().is_some(), "debt stands until the right echo");
+        // The callsign's own digits never read as a runway.
+        let p = t3.pending().unwrap();
+        assert_eq!(
+            check_readback("november one seven two sierra papa, cleared for takeoff", &p.awaited),
+            ReadbackCheck::Correct,
+            "no runway named at all is accepted; callsign digits are not a runway"
+        );
+        // Anything that isn't the echo gets ONE instruction repeat...
+        let mut t4 = Tower::new();
+        t4.state = State::TaxiCleared;
+        t4.handle(Intent::RequestTakeoff, &c);
+        let g = t4.gate("uhh what was that", Intent::Unknown, &c).expect("challenge");
+        assert!(g.contains("read back"), "{g}");
+        assert!(g.contains("cleared for takeoff"), "the challenge repeats the instruction: {g}");
+        // ...the question-shaped calls a tower answers pass straight through...
+        assert_eq!(t4.gate("say wind", Intent::WindCheck, &c), None);
+        assert!(t4.pending().is_some(), "an answered question keeps the debt");
+        // ...and two spent challenges release the gate — a garbled radio must
+        // never deadlock the FSM.
+        t4.gate("garble garble", Intent::Unknown, &c);
+        assert_eq!(t4.gate("garble again", Intent::Unknown, &c), None, "gate lets go");
+        assert!(t4.pending().is_none());
+        // A mayday is NEVER answered with "read back".
+        let mut t5 = Tower::new();
+        t5.state = State::TaxiCleared;
+        t5.handle(Intent::RequestTakeoff, &c);
+        assert_eq!(t5.gate("mayday, mayday", Intent::Mayday, &c), None);
+        assert!(t5.pending().is_none());
+        // Physics consumes the debt: airborne, the takeoff echo is moot.
+        let mut t6 = Tower::new();
+        t6.state = State::TaxiCleared;
+        let mut ground = c.clone();
+        ground.on_ground = true;
+        t6.handle(Intent::RequestTakeoff, &ground);
+        assert!(t6.pending().is_some());
+        let flying = ctx(); // on_ground: false
+        assert_eq!(t6.gate("some new call downwind", Intent::ReportDownwind, &flying), None);
+        assert!(t6.pending().is_none(), "airborne voids the takeoff readback");
+    }
+
+    #[test]
+    fn landing_clearance_awaits_its_readback() {
+        let c = ctx();
+        let mut twr = Tower::new();
+        twr.handle(parse_intent("inbound for landing"), &c);
+        twr.handle(parse_intent("final"), &c);
+        let p = twr.pending().expect("landing clearance awaits the echo");
+        assert_eq!(
+            p.awaited,
+            Awaited::Landing { runway: "zero niner".into(), touch_and_go: false }
+        );
+        assert_eq!(
+            check_readback("cleared to land runway zero niner, november 172SP", &p.awaited),
+            ReadbackCheck::Correct
+        );
+        assert_eq!(
+            check_readback("cleared to land runway two seven right", &p.awaited),
+            ReadbackCheck::WrongRunway { heard: "27R".into() }
+        );
+        // The coach knows the exact line owed.
+        let s = twr.suggested_readback("November 172SP").expect("a suggestion");
+        assert!(s.contains("Cleared to land runway zero niner"), "{s}");
+        // A go-around clears the debt along with the clearance.
+        twr.handle(Intent::GoAround, &c);
+        assert!(twr.pending().is_none());
+    }
+
+    #[test]
+    fn canon_runway_normalizes_all_spellings() {
+        for (raw, want) in [
+            ("zero niner", "9"),
+            ("two seven right", "27R"),
+            ("27R", "27R"),
+            ("27 right", "27R"),
+            ("09L", "9L"),
+            ("three one", "31"),
+        ] {
+            assert_eq!(canon_runway(raw).as_deref(), Some(want), "{raw}");
+        }
+        assert_eq!(canon_runway("alpha"), None);
+        // Transcript extraction only trusts digits after the word "runway".
+        assert_eq!(
+            runway_after_keyword("november one seven two, cleared for takeoff runway two seven"),
+            Some("27".into())
+        );
+        assert_eq!(
+            runway_after_keyword("november one seven two, cleared for takeoff"),
+            None,
+            "callsign digits are not a runway"
+        );
+    }
+
+    #[test]
+    fn taxi_clearance_speaks_the_route() {
+        let mut c = ctx();
+        c.taxi_via = vec!["Alpha".into(), "Bravo two".into()];
+        c.taxi_crossings = vec!["two three".into()];
+        let mut twr = Tower::new();
+        let r = twr.handle(Intent::RequestTaxi, &c);
+        assert!(r.contains("via Alpha, Bravo two"), "{r}");
+        assert!(r.contains("cross runway two three"), "{r}");
+        // No network: the clearance phrases exactly as before.
+        let mut twr = Tower::new();
+        let r = twr.handle(Intent::RequestTaxi, &ctx());
+        assert!(!r.contains(" via "), "{r}");
+        assert!(!r.contains("cross runway"), "{r}");
     }
 
     #[test]

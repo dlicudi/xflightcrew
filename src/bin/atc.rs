@@ -281,9 +281,17 @@ fn main() -> Result<()> {
                     holding_point: "Alpha".to_string(),
                     approach: apt.freq(nav::FREQ_APPROACH).map(|f| atis::spoken_mhz(f.khz)),
                     // The standalone binary predates the ground-aware mayday
-                    // and the assigned-squawk state: conspicuity only.
+                    // and the assigned-squawk state: conspicuity only. Same
+                    // for the traffic/wake/taxi-route context — no TCAS or
+                    // taxi network here.
                     squawk: "seven zero zero zero".to_string(),
                     final_traffic_nm: None,
+                    final_traffic_callsign: None,
+                    final_traffic_count: 0,
+                    runway_occupied: false,
+                    wake_secs_left: None,
+                    taxi_via: Vec::new(),
+                    taxi_crossings: Vec::new(),
                     on_ground: false,
                 };
                 let intent = if heard.confidence < config.stt_min_confidence {

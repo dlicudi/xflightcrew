@@ -303,6 +303,10 @@ const PHRASE_MISHEARS: &[(&str, &str)] = &[
     ("claim to", "climb to"),             // "Claim to 8,000 feet." (Twotter, 2026-07-09)
     // Top of descent: whisper garbled it five ways in one evening flight
     // (2026-07-09) — each a dead-end retry of the same question.
+    // Station names: whisper mangles "Heathrow" hard (2026-07-10 flight).
+    ("hifra", "heathrow"),                // "switch to hifra approach"
+    ("heat flow approach", "heathrow approach"),
+    ("land on heat flow", "london heathrow"),
     ("top of the dissent", "top of descent"),
     ("top of dissent", "top of descent"),
     ("top of the center", "top of descent"),

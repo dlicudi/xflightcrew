@@ -1432,6 +1432,9 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
     // Party-line cadence, and whether an advisory is waiting on its "clear of
     // traffic" closure.
     let mut chatter_last: Option<Instant> = None;
+    // The last ATIS edition logged to the panel ("London Heathrow information
+    // Alpha") — the loop speaks every repeat, the transcript records once.
+    let mut atis_logged: Option<String> = None;
     let mut traffic_open = false;
     // Runway-incursion shout cadence: it repeats while the conflict persists
     // (a safety shout may nag), but not every tick.
@@ -1559,11 +1562,24 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                                     .and_then(crate::station::tuned_controller)
                                     .is_some();
                                 if tower_has_us {
+                                    // Addressed by callsign, like every other
+                                    // controller call — an unaddressed "exit
+                                    // the runway" reads as talking to nobody
+                                    // (pilot feedback, 2026-07-10).
+                                    let callsign = xp
+                                        .get_string(crate::datarefs::TAILNUM)
+                                        .await
+                                        .ok()
+                                        .map(|t| crate::tower::spoken_callsign(&t))
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or_else(|| "aircraft on the runway".to_string());
                                     let line = if urgent {
-                                        "Traffic on short final — exit the runway immediately.".to_string()
+                                        format!(
+                                            "{callsign}, traffic on short final — exit the runway immediately."
+                                        )
                                     } else {
                                         format!(
-                                            "Traffic on {nm:.0} mile final — exit the runway, expedite."
+                                            "{callsign}, traffic on {nm:.0} mile final — exit the runway, expedite."
                                         )
                                     };
                                     if let Some(s) = status.as_ref() {
@@ -1618,6 +1634,10 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 // weather genuinely moves. Cheap gate first — tuned AND due —
                 // so the weather set is read once per broadcast, not per tick.
                 if let Some(com1) = com1 {
+                    // The ATC tab tunes ANY in-range field's frequencies:
+                    // follow COM1 to that field's ATIS instead of staying
+                    // silent because it wasn't the active station's.
+                    crate::station::atis_retune(com1, snap.lat, snap.lon, snap.alt_ft);
                     if crate::station::atis_due(com1, std::time::Instant::now()) {
                         let wx = crate::station::AtisWx {
                             zulu_sec: xp.get_float(crate::datarefs::ZULU_TIME_SEC).await.unwrap_or(0.0),
@@ -1638,13 +1658,21 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                         if let Some(report) =
                             crate::station::atis_tick(com1, &wx, std::time::Instant::now())
                         {
-                            if let Some(s) = status.as_ref() {
-                                s.action(&format!("ATIS: {report}"));
+                            // The broadcast LOOPS on the radio, but the log
+                            // is a transcript: one entry per edition (field
+                            // or letter change), not one per repetition —
+                            // the loop was flooding the panel (2026-07-10).
+                            let edition = report.split('.').next().unwrap_or("").to_string();
+                            if atis_logged.as_deref() != Some(edition.as_str()) {
+                                atis_logged = Some(edition);
+                                if let Some(s) = status.as_ref() {
+                                    s.action(&format!("ATIS: {report}"));
+                                }
+                                crate::blackbox::record(
+                                    "atis",
+                                    serde_json::json!({ "msg": &report }),
+                                );
                             }
-                            crate::blackbox::record(
-                                "atis",
-                                serde_json::json!({ "msg": &report }),
-                            );
                             voice.alert_station(
                                 Priority::Advisory,
                                 crate::voice::StationSpeaker::Atis,
@@ -1669,8 +1697,11 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 // Radar watch on an assigned squawk: "radar contact" once the
                 // sim shows the code replying, "confirm squawk" nudges while
                 // it doesn't. Transponder reads gated on an armed watch, so
-                // flights without a radar service cost nothing.
-                if crate::station::squawk_watch_active() {
+                // flights without a radar service cost nothing. AIRBORNE
+                // only: a departure code is set on the ground with the
+                // transponder correctly in standby — nudging there is wrong,
+                // and "radar contact" belongs after liftoff.
+                if !snap.on_ground && crate::station::squawk_watch_active() {
                     let code = xp
                         .get_float(crate::datarefs::TRANSPONDER_CODE)
                         .await
@@ -1758,9 +1789,15 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                         .unwrap_or_else(|e| e.into_inner())
                         .is_some();
                     let chatter_on = config.atc_chatter && tower_tuned;
+                    // The wake watch needs the TCAS picture while the pilot
+                    // is on the tower frequency on the ground — a heavy
+                    // rotating ahead of you starts a clock whether or not
+                    // the party line is narrating it.
+                    let wake_watch = tower_tuned && snap.on_ground;
                     if let Some((_, flat, flon, felev)) = crate::station::active_field() {
-                        if chatter_on || hold_armed || cleared_to_land {
+                        if chatter_on || hold_armed || cleared_to_land || wake_watch {
                             let targets = crate::station::read_tcas_targets(&xp).await;
+                            crate::station::wake_note_targets(&targets, now);
                             // Safety outranks flavor: the go-around order first.
                             if let Some(call) = crate::station::go_around_tick(
                                 &targets,
@@ -1792,16 +1829,8 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                                     );
                                 }
                             } else if hold_armed {
-                                let runway_occupied = targets.iter().any(|t| {
-                                    t.on_ground
-                                        && crate::station::on_active_runway(t.lat, t.lon).is_some()
-                                });
-                                let final_traffic =
-                                    crate::station::inbound_traffic_close(&xp).await;
                                 if let Some(line) = crate::station::takeoff_hold_tick(
-                                    final_traffic,
-                                    runway_occupied,
-                                    now,
+                                    &targets, felev, now,
                                 ) {
                                     crate::blackbox::record(
                                         "atc",
@@ -1825,8 +1854,17 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                                 let fname = crate::station::active_field()
                                     .map(|(n, _, _, _)| n)
                                     .unwrap_or_default();
+                                // The strip the PLAYER occupies: a ghost
+                                // landing it gets "continue", not a narrated
+                                // clearance over the player's head.
+                                let blocked = if snap.on_ground {
+                                    crate::station::on_active_runway(snap.lat, snap.lon)
+                                } else {
+                                    None
+                                };
                                 if let Some(exchange) = crate::station::chatter_tick(
-                                    &targets, &fname, flat, flon, felev, now,
+                                    &targets, &fname, flat, flon, felev,
+                                    blocked.as_deref(), now,
                                 ) {
                                     chatter_last = Some(now);
                                     let transcript: Vec<&str> = exchange

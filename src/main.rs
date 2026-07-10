@@ -357,6 +357,26 @@ async fn main() -> Result<()> {
                             sink.atc(&atc_panel_payload(&station::fields_in_range(
                                 lat, lon, alt_ft, 8,
                             )));
+                            // The Calls tab's live "say now" line: the coach's
+                            // suggested next call for the current tower state.
+                            let on_ground = xp
+                                .get_float(datarefs::ON_GROUND_ANY)
+                                .await
+                                .map(|v| v > 0.5)
+                                .unwrap_or(true);
+                            let callsign = xp
+                                .get_string(datarefs::TAILNUM)
+                                .await
+                                .ok()
+                                .map(|t| tower::spoken_callsign(&t))
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| "your callsign".to_string());
+                            let dist = station::active_field()
+                                .map(|(_, flat, flon, _)| haversine_nm(lat, lon, flat, flon));
+                            sink.coach(
+                                &station::suggest_call(&callsign, on_ground, dist)
+                                    .unwrap_or_default(),
+                            );
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
@@ -388,12 +408,24 @@ async fn main() -> Result<()> {
                     if let Ok(icao) = xp.aircraft_icao().await {
                         let icao = icao.trim().to_string();
                         if !icao.is_empty() {
-                            // Mirror the ICAO to the panel (beside the connection chip).
-                            if icao != shown {
+                            // Mirror type + callsign to the panel chip
+                            // ("C172 N172SP") — the callsign is what ATC
+                            // addresses, so the pilot should see it too.
+                            let tail = xp
+                                .get_string(datarefs::TAILNUM)
+                                .await
+                                .ok()
+                                .map(|t| t.trim().to_uppercase())
+                                .filter(|t| !t.is_empty());
+                            let chip = match &tail {
+                                Some(t) => format!("{icao} {t}"),
+                                None => icao.clone(),
+                            };
+                            if chip != shown {
                                 if let Some(s) = det_status.as_ref() {
-                                    s.aircraft(&icao);
+                                    s.aircraft(&chip);
                                 }
-                                shown = icao.clone();
+                                shown = chip;
                             }
                             let id = icao_to_profile(&icao);
                             if id != live.id() {
@@ -685,6 +717,22 @@ async fn run_session(
     // (main for plain, the voice thread for TUI) — a reqwest client's I/O is
     // bound to the runtime it's used on.
     let xplane = XPlaneClient::new(config.xplane_base_url.clone());
+    // X-Plane's own radio voice (built-in ATC + its ATIS) speaks on the same
+    // frequencies as our stations — heard live as two ATIS voices at once
+    // (2026-07-10). While our ATC is on, Roger owns the radio soundscape:
+    // the sim's "Radios" volume goes to zero (this also silences nav-aid
+    // morse idents; XCOPILOT_MUTE_XP_RADIO=false keeps the sim's audio).
+    if config.mute_xp_radio && !config.atc_airport.trim().is_empty() {
+        match xplane
+            .set_float("sim/operation/sound/radio_volume_ratio", 0.0)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                "muted X-Plane's radio voice (XCOPILOT_MUTE_XP_RADIO=false to keep it)"
+            ),
+            Err(e) => tracing::debug!("could not mute X-Plane radio audio: {e:#}"),
+        }
+    }
     // Subscribe to the continuously-read state over the WebSocket so snapshots are
     // instant cache reads instead of a REST burst. Best-effort: reads fall back to
     // REST until (or unless) the subscription warms up.
@@ -753,9 +801,16 @@ async fn run_session(
     // every other field the region hands us to gets its own crew from the
     // voice pool.
     let home_airport_name = atc_station.as_ref().map(|s| s.airport_name().to_string());
-    if let Some(st) = &atc_station {
+    if let Some(st) = &mut atc_station {
+        st.set_enforce_readback(config.atc_readback);
         st.install();
         voice.set_station_cast(0, None);
+        // Taxi network for named taxi routes — a second apt.dat scan, so a
+        // background thread; clearances are route-less until it lands.
+        station::spawn_taxi_net_load(
+            config.apt_data_path.clone(),
+            config.atc_airport.trim().to_uppercase(),
+        );
     }
     // Enroute region: index every towered field (a full apt.dat pass, so a
     // background thread) so the flight can outgrow its departure airport —
@@ -811,9 +866,19 @@ async fn run_session(
                 let mut was_pressed = false;
                 loop {
                     let pressed = ptt.is_pressed();
-                    if pressed && !was_pressed && wv.is_speaking() {
-                        wv.shutup();
-                        wi.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if pressed && !was_pressed {
+                        // Key down: kill whatever is playing AND hold the
+                        // whole queue — copilot, controllers, ghosts. Nobody
+                        // talks over the pilot's transmission (the party
+                        // line yakked through PTT, 2026-07-10).
+                        if wv.is_speaking() {
+                            wv.shutup();
+                            wi.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        wv.set_hold(true);
+                    }
+                    if !pressed && was_pressed {
+                        wv.set_hold(false); // release: the backlog may speak
                     }
                     was_pressed = pressed;
                     std::thread::sleep(Duration::from_millis(30));
@@ -892,9 +957,12 @@ async fn run_session(
         {
             let name = apt.name.clone();
             match station::Station::from_airport(apt) {
-                Some(st) => {
+                Some(mut st) => {
                     reporter.log(ui::LogKind::Info, format!("ATC region: now working {name}"));
+                    st.set_enforce_readback(config.atc_readback);
                     st.install();
+                    // The new field's taxi network, in the background.
+                    station::spawn_taxi_net_load(config.apt_data_path.clone(), icao.clone());
                     // A new field, a new crew: per-airport voices from the
                     // pool, with the country's own accent (by ICAO prefix)
                     // manning the tower and the ATIS — unless we're back
@@ -1283,6 +1351,36 @@ async fn run_session(
                 // rows plus live COM1, after the tuning verbs so those win.
                 if station::freq_query(&tl) {
                     let line = st.freq_briefing(&xplane).await;
+                    say(&voice, &reporter, ui::LogKind::Readback, &line);
+                    continue;
+                }
+                // Radio coach ("what do I say?"): the copilot reads the
+                // tower's own state machine and hands the pilot the exact
+                // next call — deterministic, and always a call the parser
+                // routes. A learning tool, not an LLM guess.
+                if station::coach_query(&tl) {
+                    let on_ground = xplane
+                        .get_float(datarefs::ON_GROUND_ANY)
+                        .await
+                        .map(|v| v > 0.5)
+                        .unwrap_or(true);
+                    let callsign = xplane
+                        .get_string(datarefs::TAILNUM)
+                        .await
+                        .ok()
+                        .map(|t| tower::spoken_callsign(&t))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "your callsign".to_string());
+                    let dist = match (position(&xplane).await, station::active_field()) {
+                        (Some((lat, lon, _)), Some((_, flat, flon, _))) => {
+                            Some(haversine_nm(lat, lon, flat, flon))
+                        }
+                        _ => None,
+                    };
+                    let line = match station::suggest_call(&callsign, on_ground, dist) {
+                        Some(call) => format!("Key the radio and say: {call}"),
+                        None => "No station on frequency to call.".to_string(),
+                    };
                     say(&voice, &reporter, ui::LogKind::Readback, &line);
                     continue;
                 }

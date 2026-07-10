@@ -140,6 +140,26 @@ Work through these in one or two flights. Tick, and note anything odd.
 | Hold position for landing traffic, wait | ~15 s after the final truly clears: "traffic clear, runway ..., cleared for takeoff" unprompted — and the FSM/handoff arm as if asked |
 | After a traffic advisory, let the target diverge | "clear of traffic" — the loop closes |
 
+### Readbacks, line-up, wake, taxi routes (added 2026-07-11)
+
+| Do this | Expect |
+|---|---|
+| Get cleared for takeoff, read it back with the runway | Silence — a correct readback is a quiet frequency |
+| Get cleared for takeoff, say something else | "Read back: ... cleared for takeoff", the instruction repeated; twice at most, then the tower lets it go |
+| Read back the WRONG runway ("cleared for takeoff runway 27" when given 09) | "Negative. I say again: ..." — never waved through |
+| Get cleared to land, skip the readback, land anyway | The debt dies silently at touchdown (physics consumed it); no nagging on the rollout |
+| Ask for takeoff with ONE arrival ≥1.5 nm final | "Behind the landing <telephony>, line up runway ... behind" — then the clearance comes unprompted once the lander vacates |
+| Echo the conditional WITHOUT "behind" | Challenged — the condition is part of the clearance |
+| Ask for takeoff with a STREAM on final (2+) | "Hold position" — a conditional is only legal against exactly one |
+| Ask for takeoff right after an airliner ghost rotates off your strip | "Line up and wait ..., wake turbulence, two minutes behind the departing traffic"; cleared when the clock AND the final allow |
+| Same, but the ghost was a GA tail | No wake clock — no airline prefix, no assumed weight class |
+| Ask for taxi at a field with a taxi network (Heathrow) | "Taxi to holding point <name> runway ... via <Alpha, Bravo>", crossings called out ("cross runway ...") |
+| Wander 60+ m off the cleared taxi route while rolling | "You appear to be off the cleared taxi route, taxi via ..." — a nudge each 45 s, not a violation |
+| Line up as told, sit on the runway | NO occupancy shout — LinedUp is the tower's own instruction |
+| Say "confirm cleared for takeoff?" | The instruction repeated (the challenge doubles as the answer), never a fresh clearance |
+| `XCOPILOT_ATC_READBACK=false` | Challenges off; the coach still shows the owed readback |
+| Ask "what do I say?" while a readback is owed | The exact readback line, before anything else |
+
 ## Post-flight
 
 Pull the trace apart. Every command below reads `logs/blackbox.jsonl`.

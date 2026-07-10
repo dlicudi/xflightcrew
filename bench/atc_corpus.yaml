@@ -258,3 +258,52 @@
 # "When request vectors" — whisper's "then/when" prefix garble.
 - {text: "When request vectors for approach.", intent: request_vectors, radio: true}
 - {text: "Tower requesting clearance.", intent: request_clearance, radio: true}
+
+# --- Frequency changes (added 2026-07-10, London session) ---------------------
+# "London" garbles to "land on": a keyed tune request was answered with a JOIN
+# CLEARANCE — the exact mishear-to-clearance failure this corpus polices. Any
+# sentence about changing a frequency is that request and nothing else.
+- {text: "request frequency change.", intent: frequency_change, radio: true}
+- {text: "switch to hifra approach frequency.", intent: frequency_change, radio: true}
+- {text: "switch to land on neutral approach frequency.", intent: frequency_change, radio: true}
+- {text: "change to land on heat flow approach frequency.", intent: frequency_change, radio: true}
+# More real calls from the London tape.
+- {text: "requesting clearance to taxi.", intent: request_taxi, radio: true}
+- {text: "do you have any chance to takeoff?", intent: request_takeoff, radio: false}
+- {text: "will you let me know when i can go?", intent: unknown, radio: false}
+- {text: "reporting hold.", intent: unknown, radio: false}
+- {text: "i don't have a call sign.", intent: unknown, radio: false}
+
+# --- Readbacks of the runway-critical clearances (added 2026-07-11) -----------
+# The readback gate (tower::check_readback) verifies these against the
+# awaited clearance; here the corpus only polices the parser layer: they
+# must read as READBACKS (silence-worthy), never as fresh requests that
+# could move the state a second time. "lining up" and "holding position"
+# joined is_readback with the LUAW work.
+- {text: "lining up runway zero niner, november one seven two sierra papa", intent: unknown, radio: false, readback: true}
+- {text: "behind the landing traffic, lining up runway two seven behind", intent: unknown, radio: false, readback: true}
+- {text: "holding position, november one seven two sierra papa", intent: unknown, radio: false, readback: true}
+- {text: "holding position", intent: unknown, radio: false, readback: true}
+- {text: "cleared for takeoff runway zero niner, november one seven two sierra papa", intent: request_takeoff, readback: true}
+- {text: "cleared to land runway zero niner, november one seven two sierra papa", intent: request_landing, readback: true}
+# Confirm-questions are NOT readbacks — the gate answers them by repeating
+# the instruction, and the question guard keeps them off the state machine.
+- {text: "confirm cleared for takeoff?", intent: unknown, radio: false, readback: false}
+- {text: "say again the clearance", intent: unknown, radio: false, readback: false}
+
+# --- Line up and wait / wake turbulence phrasing (added 2026-07-11) -----------
+# Pilot-side asks around the new tower arms. None of these may earn a
+# clearance by parsing; "ready for immediate departure" is the coach's
+# nudge from LinedUp and must route as the plain takeoff re-ask.
+- {text: "ready for immediate departure", intent: request_takeoff, radio: true}
+- {text: "november one seven two sierra papa, ready for immediate departure", intent: request_takeoff, radio: true}
+- {text: "line up and wait", intent: unknown, radio: false, readback: true}
+
+# --- 2026-07-10 night session (Heathrow, new-binary shakedown) -----------------
+# The squawk readback in cockpit words: answered "say again" live while the
+# watch was already confirming the very same code.
+- {text: "transponder set to 4503.", intent: unknown, radio: false, readback: true}
+- {text: "london heathrow tower, november 172 siagrapapa request departure clearance.", intent: request_clearance, radio: true}
+- {text: "november 172 seattle papa holding point alpha, ready for departure.", intent: request_takeoff, radio: true}
+- {text: "request clearance to takeoff.", intent: request_takeoff, radio: true}
+- {text: "mayday, mayday, airplane crashed.", intent: mayday, radio: true}

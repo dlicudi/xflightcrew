@@ -252,6 +252,10 @@ struct Inner {
     /// The active airport's LOCAL accent voice, when its country has one
     /// (see [`local_accent_for`]): cast as the tower and the ATIS reader.
     station_local: Mutex<Option<String>>,
+    /// PTT is held: EVERY voice stays quiet — copilot, controllers, ghosts.
+    /// You don't talk over the pilot's transmission; the queue holds and
+    /// resumes on release (2026-07-10: the party line yakked through PTT).
+    hold: std::sync::atomic::AtomicBool,
     /// What the copilot has spoken recently, with when it finished. The listener
     /// checks heard transcripts against this to reject its own voice coming back
     /// over the speakers (echo) rather than acting on it.
@@ -279,6 +283,7 @@ impl Voice {
             cv: Condvar::new(),
             station_seed: std::sync::atomic::AtomicUsize::new(0),
             station_local: Mutex::new(None),
+            hold: std::sync::atomic::AtomicBool::new(false),
             spoken: Mutex::new(Vec::new()),
         });
         let gate = MicGate::new();
@@ -322,6 +327,18 @@ impl Voice {
     /// Barge-in: stop talking *now*. Drop everything queued (unblocking any caller
     /// waiting on a blocking `say`) and kill the audio currently playing. Used when
     /// the pilot keys PTT or interrupts — the copilot must yield, not talk over them.
+    /// Hold or release ALL speech (copilot, controllers, ghosts) — raised
+    /// while the pilot's PTT is down: nobody talks over a transmission.
+    /// Held utterances stay queued and play on release.
+    pub fn set_hold(&self, held: bool) {
+        self.inner
+            .hold
+            .store(held, std::sync::atomic::Ordering::Relaxed);
+        if !held {
+            self.inner.cv.notify_one(); // wake the speaker to drain the backlog
+        }
+    }
+
     pub fn shutup(&self) {
         {
             let mut q = self.inner.queue.lock().unwrap();
@@ -635,8 +652,12 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
                 gate.set_speaking(false);
                 return;
             }
-            if let Some(u) = q.heap.pop() {
-                break u;
+            // PTT held: nobody speaks — the queue waits for the release
+            // (the wait below re-checks on the timeout).
+            if !inner.hold.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(u) = q.heap.pop() {
+                    break u;
+                }
             }
             // Nothing to say — we're done speaking; let the mic listen again.
             gate.set_speaking(false);

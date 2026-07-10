@@ -369,6 +369,231 @@ pub fn scan_airports(path: &str, mut f: impl FnMut(&str, AirportInfo)) -> Result
     Ok(())
 }
 
+// --- Taxiway network (apt.dat 1201/1202 rows) --------------------------------
+
+/// One taxi-network edge. Runway edges are routable — crossing a runway is a
+/// real taxi instruction — but heavily penalized so a route never taxis
+/// ALONG one when a taxiway exists.
+#[derive(Debug, Clone)]
+pub struct TaxiEdge {
+    pub a: i64,
+    pub b: i64,
+    /// apt.dat "oneway": traversable a→b only.
+    pub oneway: bool,
+    pub runway: bool,
+    /// Taxiway name ("A", "B2"); runway edges carry the designator pair
+    /// ("09L/27R"). May be empty (unnamed links).
+    pub name: String,
+}
+
+/// The taxi routing network of one airport.
+#[derive(Debug, Clone, Default)]
+pub struct TaxiNet {
+    pub nodes: std::collections::HashMap<i64, (f64, f64)>,
+    pub edges: Vec<TaxiEdge>,
+}
+
+/// A planned taxi route, ready to phrase: ordered taxiway names, runways
+/// crossed, the holding-point name, and the node polyline for the
+/// off-route compliance watch. Names are RAW apt.dat strings — the station
+/// speaks them.
+#[derive(Debug, Clone)]
+pub struct TaxiRoutePlan {
+    pub via: Vec<String>,
+    pub crossings: Vec<String>,
+    pub holding_point: String,
+    pub path: Vec<(f64, f64)>,
+}
+
+/// Parse `icao`'s taxi network from apt.dat — same streaming block scan as
+/// [`find_airport`], collecting 1201 (node) and 1202 (edge) rows. `None`
+/// when the field has no network (small strips mostly don't).
+pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {path}"))?;
+    let mut reader = BufReader::with_capacity(1 << 20, file);
+    let mut net = TaxiNet::default();
+    let mut in_airport = false;
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf).unwrap_or(0) == 0 {
+            break;
+        }
+        if buf.first() != Some(&b'1') {
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else { continue };
+        let mut f = line.split_whitespace();
+        match f.next() {
+            Some("1") | Some("16") | Some("17") => {
+                if in_airport {
+                    break;
+                }
+                in_airport = f.nth(3) == Some(icao);
+            }
+            Some("1201") if in_airport => {
+                // lat lon usage id [name...]
+                let (lat, lon) = match (
+                    f.next().and_then(|s| s.parse::<f64>().ok()),
+                    f.next().and_then(|s| s.parse::<f64>().ok()),
+                ) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => continue,
+                };
+                let _usage = f.next();
+                if let Some(id) = f.next().and_then(|s| s.parse::<i64>().ok()) {
+                    net.nodes.insert(id, (lat, lon));
+                }
+            }
+            Some("1202") if in_airport => {
+                // a b twoway|oneway runway|taxiway [name...]
+                let (a, b) = match (
+                    f.next().and_then(|s| s.parse::<i64>().ok()),
+                    f.next().and_then(|s| s.parse::<i64>().ok()),
+                ) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => continue,
+                };
+                let oneway = f.next() == Some("oneway");
+                let kind = f.next().unwrap_or("");
+                net.edges.push(TaxiEdge {
+                    a,
+                    b,
+                    oneway,
+                    runway: kind == "runway",
+                    name: f.collect::<Vec<_>>().join(" ").trim().to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok((!net.edges.is_empty()).then_some(net))
+}
+
+impl TaxiNet {
+    /// Route from a position to a position (a stand to a runway threshold)
+    /// and extract the phrasable plan. `None` when either end doesn't snap
+    /// to the network (within 3 km) or no path exists.
+    pub fn plan(
+        &self,
+        from_lat: f64,
+        from_lon: f64,
+        to_lat: f64,
+        to_lon: f64,
+    ) -> Option<TaxiRoutePlan> {
+        let m_per_deg_lat = 111_320.0;
+        let m_per_deg_lon = 111_320.0 * from_lat.to_radians().cos();
+        let dist_m = |a: (f64, f64), b: (f64, f64)| -> f64 {
+            let dx = (a.1 - b.1) * m_per_deg_lon;
+            let dy = (a.0 - b.0) * m_per_deg_lat;
+            (dx * dx + dy * dy).sqrt()
+        };
+        // Snap both ends to the nearest node that touches a TAXIWAY edge —
+        // never a runway-only node (the aircraft taxis on taxiways).
+        let mut taxiway_nodes: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for e in self.edges.iter().filter(|e| !e.runway) {
+            taxiway_nodes.insert(e.a);
+            taxiway_nodes.insert(e.b);
+        }
+        let snap = |lat: f64, lon: f64| -> Option<i64> {
+            taxiway_nodes
+                .iter()
+                .filter_map(|id| self.nodes.get(id).map(|&p| (*id, dist_m((lat, lon), p))))
+                .min_by(|x, y| x.1.total_cmp(&y.1))
+                .filter(|(_, d)| *d < 3000.0)
+                .map(|(id, _)| id)
+        };
+        let start = snap(from_lat, from_lon)?;
+        let goal = snap(to_lat, to_lon)?;
+        if start == goal {
+            return None;
+        }
+        // Dijkstra; runway edges cost ×25 so a route only touches one to
+        // CROSS it, never to taxi along it.
+        let mut adj: std::collections::HashMap<i64, Vec<usize>> = std::collections::HashMap::new();
+        for (i, e) in self.edges.iter().enumerate() {
+            adj.entry(e.a).or_default().push(i);
+            if !e.oneway {
+                adj.entry(e.b).or_default().push(i);
+            }
+        }
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut best: std::collections::HashMap<i64, (f64, Option<usize>)> =
+            std::collections::HashMap::new();
+        let mut heap: BinaryHeap<(Reverse<u64>, i64)> = BinaryHeap::new();
+        best.insert(start, (0.0, None));
+        heap.push((Reverse(0), start));
+        while let Some((Reverse(cost_mm), node)) = heap.pop() {
+            let cost = cost_mm as f64 / 1000.0;
+            if node == goal {
+                break;
+            }
+            if best.get(&node).is_none_or(|(c, _)| cost > *c + 0.5) {
+                continue; // stale heap entry
+            }
+            for &ei in adj.get(&node).map(|v| v.as_slice()).unwrap_or(&[]) {
+                let e = &self.edges[ei];
+                let next = if e.a == node { e.b } else { e.a };
+                let (Some(&pa), Some(&pb)) = (self.nodes.get(&e.a), self.nodes.get(&e.b)) else {
+                    continue;
+                };
+                let mut w = dist_m(pa, pb);
+                if e.runway {
+                    w *= 25.0;
+                }
+                let nc = cost + w;
+                if best.get(&next).is_none_or(|(c, _)| nc < *c) {
+                    best.insert(next, (nc, Some(ei)));
+                    heap.push((Reverse((nc * 1000.0) as u64), next));
+                }
+            }
+        }
+        // Walk back goal→start collecting edges, then flip.
+        let mut edges_rev: Vec<usize> = Vec::new();
+        let mut node = goal;
+        let mut hops = 0;
+        while node != start {
+            let (_, Some(ei)) = *best.get(&node)? else { return None };
+            edges_rev.push(ei);
+            let e = &self.edges[ei];
+            node = if e.a == node { e.b } else { e.a };
+            hops += 1;
+            if hops > 10_000 {
+                return None; // cycle guard
+            }
+        }
+        edges_rev.reverse();
+        let mut via: Vec<String> = Vec::new();
+        let mut crossings: Vec<String> = Vec::new();
+        let mut holding_point = String::new();
+        let mut path: Vec<(f64, f64)> = Vec::new();
+        let mut walk = start;
+        path.extend(self.nodes.get(&walk).copied());
+        for &ei in &edges_rev {
+            let e = &self.edges[ei];
+            walk = if e.a == walk { e.b } else { e.a };
+            path.extend(self.nodes.get(&walk).copied());
+            if e.name.is_empty() {
+                continue;
+            }
+            if e.runway {
+                if !crossings.contains(&e.name) {
+                    crossings.push(e.name.clone());
+                }
+            } else {
+                if via.last() != Some(&e.name) {
+                    via.push(e.name.clone());
+                }
+                holding_point = e.name.clone();
+            }
+        }
+        via.dedup();
+        via.truncate(6);
+        Some(TaxiRoutePlan { via, crossings, holding_point, path })
+    }
+}
+
 /// Pick the runway end best aligned into the wind. Returns the end's ident,
 /// its true heading, and the headwind component (negative = tailwind).
 /// Deterministic by construction: it can only name a runway the field has.
@@ -493,6 +718,75 @@ mod tests {
         let none = find_runways(path.to_str().unwrap(), "LEMD").unwrap();
         assert!(none.is_empty());
         assert!(best_runway_for_wind(&none, 157.0, 6.0).is_none());
+    }
+
+    #[test]
+    fn taxi_net_parses_routes_and_names_the_crossings() {
+        // A toy field: runway 09/27 east-west, a stand north of it, taxiway
+        // A south from the stand, a short runway-flagged segment (the 14/32
+        // crossing), then taxiway B west to the 09 holding point.
+        //
+        //   stand(1)
+        //     | A
+        //    (2)
+        //     | 14/32  <- crossing
+        //    (3)
+        //     \___ B ___ (4)   [near the 09 threshold]
+        //
+        let path = std::env::temp_dir().join("xc-taxi-test.dat");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "1    50 0 0 LTST Testfield").unwrap();
+        writeln!(f, "100 45.33 27 727 0.10 1 3 0  09 36.0000000 -5.0100000 0 0 3 3 0 2 27 36.0000000 -5.0000000 0 0 3 3 0 2").unwrap();
+        writeln!(f, "1054 118250 Testfield Tower").unwrap();
+        writeln!(f, "1201 36.0030000 -5.0050000 both 1 stand").unwrap();
+        writeln!(f, "1201 36.0020000 -5.0050000 both 2 A").unwrap();
+        writeln!(f, "1201 36.0010000 -5.0050000 both 3 junction").unwrap();
+        writeln!(f, "1201 36.0004000 -5.0095000 both 4 B").unwrap();
+        writeln!(f, "1202 1 2 twoway taxiway A").unwrap();
+        writeln!(f, "1202 2 3 twoway runway 14/32").unwrap();
+        writeln!(f, "1202 3 4 twoway taxiway B").unwrap();
+        writeln!(f, "1 1027 0 0 0MU1 Sunderland").unwrap();
+        writeln!(f, "1202 5 6 twoway taxiway Z").unwrap();
+        f.flush().unwrap();
+
+        let net = find_taxi_net(path.to_str().unwrap(), "LTST")
+            .unwrap()
+            .expect("network found");
+        assert_eq!(net.nodes.len(), 4);
+        assert_eq!(net.edges.len(), 3, "only LTST's edges, not Sunderland's");
+
+        // From the stand to the 09 threshold: via A and B, crossing 14/32,
+        // holding point named for the last taxiway before the runway.
+        let plan = net
+            .plan(36.0031, -5.0050, 36.0000, -5.0100)
+            .expect("a route exists");
+        assert_eq!(plan.via, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(plan.crossings, vec!["14/32".to_string()]);
+        assert_eq!(plan.holding_point, "B");
+        assert!(plan.path.len() >= 4, "polyline for the compliance watch");
+
+        // Nowhere near the network: no snap, no plan — never a wild route.
+        assert!(net.plan(37.0, -6.0, 36.0, -5.01).is_none());
+        // A field without 1201/1202 rows has no network at all.
+        assert!(find_taxi_net(path.to_str().unwrap(), "0MU1").unwrap().is_some());
+        assert!(find_taxi_net(path.to_str().unwrap(), "LXXX").unwrap().is_none());
+    }
+
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn live_heathrow_taxi_route_plans() {
+        let path = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let t = std::time::Instant::now();
+        let net = find_taxi_net(path, "EGLL").unwrap().expect("EGLL has a network");
+        eprintln!("EGLL taxi net: {} nodes, {} edges in {:?}", net.nodes.len(), net.edges.len(), t.elapsed());
+        assert!(net.nodes.len() > 500 && net.edges.len() > 300);
+        // From T2 stands (51.4700, -0.4520) to the 27R threshold
+        // (51.4775, -0.4325): a real route with named taxiways.
+        let t = std::time::Instant::now();
+        let plan = net.plan(51.4700, -0.4520, 51.4775, -0.4325).expect("a route");
+        eprintln!("plan in {:?}: via {:?}, cross {:?}, hp {:?}", t.elapsed(), plan.via, plan.crossings, plan.holding_point);
+        assert!(!plan.via.is_empty(), "named taxiways expected at Heathrow");
+        assert!(t.elapsed().as_millis() < 200, "planning must not stall a reply");
     }
 
     #[test]

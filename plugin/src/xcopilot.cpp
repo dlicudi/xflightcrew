@@ -152,6 +152,9 @@ static TextRef g_radio = {{0}, 0};
 // ATC tab — every station in VHF range, nearest first, refreshed by the app
 // as "NAME,dist_nm,SVC khz,...|NAME,..." ('*' prefix = the active station).
 static TextRef g_atc = {{0}, 0};
+// Calls tab — the radio coach's suggested next call for the current tower
+// state, refreshed continuously by the app. Empty = no station.
+static TextRef g_coach = {{0}, 0};
 
 static XPLMDataRef g_phase_dref = nullptr;
 static XPLMDataRef g_heard_dref = nullptr;
@@ -162,6 +165,7 @@ static XPLMDataRef g_strip_dref = nullptr;
 static XPLMDataRef g_callout_dref = nullptr;
 static XPLMDataRef g_radio_dref = nullptr;
 static XPLMDataRef g_atc_dref = nullptr;
+static XPLMDataRef g_coach_dref = nullptr;
 // COM1 active frequency (integer kHz despite the sim's `hz` name) — read for
 // the ATC tab's tuned highlight, written by its click-to-tune.
 static XPLMDataRef g_com1_dref = nullptr;
@@ -236,8 +240,9 @@ static void WriteAction(void*, void* in, int offset, int len) {
     // transcript names which controller spoke. Everything else is the crew.
     static const struct { const char* prefix; const char* tag; } kStations[] = {
         {"TWR: ", "TOWER"}, {"APP: ", "APP"}, {"DEP: ", "DEP"}, {"ATIS: ", "ATIS"},
-        // Party-line traffic: the ghost pilots' side of the frequency.
-        {"TFC: ", "TFC"},
+        // Party-line traffic: the ghost pilots' side of the frequency. Spelled
+        // out on the panel (every other tag is a plain speaker name).
+        {"TFC: ", "TRAFFIC"},
     };
     for (const auto& s : kStations) {
         int n = static_cast<int>(std::strlen(s.prefix));
@@ -305,6 +310,11 @@ static void WriteAtc(void*, void* in, int offset, int len) {
     StoreText(&g_atc, in, offset, len);
     g_atc_fields = parse_atc();
 }
+
+// Coach line — refreshed continuously like the radio row, not logged.
+static void WriteCoach(void*, void* in, int offset, int len) {
+    StoreText(&g_coach, in, offset, len);
+}
 // Callout — stamp the arrival time; the toast shows for a short window after.
 // An optional "nx,ny|" prefix (fractions of the half-screen from centre) aims
 // the toast toward the control the camera glanced at.
@@ -326,20 +336,20 @@ static void WriteCallout(void*, void* in, int offset, int len) {
 }
 static void WriteAlert(void*, void* in, int offset, int len) {
     StoreText(&g_alert, in, offset, len);
-    // First char is a severity marker ('1' advisory, '2' caution, '3' warning) —
-    // the standard annunciator hierarchy. Strip it and pick the chip accordingly.
+    // First char is a severity marker ('1' advisory, '2' caution, '3' warning).
+    // The tag names the SPEAKER — every alert is the copilot's voice, so the
+    // transcript reads as who said it; severity survives as the row colour.
     const char* text = g_alert.buf;
-    const char* tag = "CAUTION";
     ImU32 col = COL_AMBER;
     if (g_alert.len >= 1) {
         switch (g_alert.buf[0]) {
-            case '1': tag = "ADVISORY"; col = COL_CYAN; text++; break;
-            case '2': tag = "CAUTION";  col = COL_AMBER; text++; break;
-            case '3': tag = "WARNING";  col = COL_RED;  text++; break;
-            default: break;  // no marker (legacy) — treat as caution
+            case '1': col = COL_CYAN;  text++; break;
+            case '2': col = COL_AMBER; text++; break;
+            case '3': col = COL_RED;   text++; break;
+            default: break;  // no marker (legacy) — amber
         }
     }
-    AppendLog(tag, col, text);
+    AppendLog("COPILOT", col, text);
 }
 
 // ---- FMS route loading ------------------------------------------------------
@@ -627,7 +637,7 @@ private:
     // panel can tuck out of the way without closing. Remembers the expanded size.
     static constexpr int kCollapsedH = 46;
     bool mCollapsed = false;
-    // Selected tab (0 = Log, 1 = Route, 2 = ATC, 3 = Settings) — content renders after
+    // Selected tab (0 = Log, 1 = Route, 2 = ATC, 3 = Calls, 4 = Settings) — content renders after
     // the shared context rows, so the tab bar itself sits at the very top.
     int mTab = 0;
     int mExpW = 420, mExpH = 300;
@@ -713,8 +723,12 @@ protected:
                 mTab = 2;
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Settings")) {
+            if (ImGui::BeginTabItem("Calls")) {
                 mTab = 3;
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Settings")) {
+                mTab = 4;
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -786,6 +800,7 @@ protected:
             case 0: buildLogTab(connected); break;
             case 1: buildRouteTab(); break;
             case 2: buildAtcTab(connected); break;
+            case 3: buildCallsTab(connected); break;
             default: buildSettingsTab(); break;
         }
 
@@ -808,7 +823,7 @@ protected:
         // reads as a transcript, not a ragged debug feed.
         const float pad = 8.0f;
         const float kTimeW = ImGui::CalcTextSize("88:88:88").x + pad;
-        const float kTagW = ImGui::CalcTextSize("ADVISORY").x + 14.0f; // widest tag
+        const float kTagW = ImGui::CalcTextSize("COPILOT").x + 14.0f; // widest tag
         if (g_log.empty()) {
             // Empty state, centred in the well — not a footer mumble.
             const char* hint = connected ? "Hold PTT and speak." : "Start x-copilot to connect.";
@@ -933,13 +948,26 @@ protected:
                 ImGui::SameLine();
                 ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%d nm%s",
                                    f.dist_nm, f.active ? "  (active)" : "");
+                // Frequency chips flow left-to-right and WRAP at the panel
+                // edge — Heathrow publishes six services, and clipped
+                // buttons can't be clicked.
+                const float wrap_x =
+                    ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
                 for (size_t j = 0; j < f.freqs.size(); ++j) {
                     const AtcService& s = f.freqs[j];
                     bool tuned = std::abs(com1 - s.khz) <= 5;
                     char label[32];
                     std::snprintf(label, sizeof label, "%s %.3f", s.label.c_str(),
                                   s.khz / 1000.0);
-                    if (j > 0) ImGui::SameLine();
+                    if (j > 0) {
+                        const ImGuiStyle& st = ImGui::GetStyle();
+                        float next_w =
+                            ImGui::CalcTextSize(label).x + st.FramePadding.x * 2.0f;
+                        if (ImGui::GetItemRectMax().x + st.ItemSpacing.x + next_w
+                            < wrap_x) {
+                            ImGui::SameLine();
+                        }
+                    }
                     ImGui::PushID(static_cast<int>(j));
                     ImU32 col = tuned ? COL_AMBER : COL_DIM;
                     ImGui::PushStyleColor(ImGuiCol_Text,
@@ -957,6 +985,80 @@ protected:
         ImGui::EndChild();
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
                            "Click a frequency to tune COM1.");
+    }
+
+    // The radio coach: what to SAY NOW (live, from the tower's state machine,
+    // pushed by the app) over a phraseology reference — the learning tool.
+    // Ask the copilot "what do I say?" for the same line by voice.
+    void buildCallsTab(bool connected) {
+        if (connected && g_coach.len > 0) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "SAY NOW");
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_CYAN));
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(g_coach.buf);
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+            ImGui::Separator();
+        }
+        // One reserved row below the well: the bottom status bar.
+        const float footer = ImGui::GetFrameHeightWithSpacing()
+            + ImGui::GetStyle().ItemSpacing.y;
+        if (ImGui::BeginChild("calls_well", ImVec2(0, -footer))) {
+            struct Phrase { const char* say; const char* gets; };
+            struct Group { const char* title; const Phrase* items; int n; };
+            static const Phrase dep[] = {
+                {"<Station> Tower, <callsign>, with information <letter>, request departure clearance", "zone clearance + squawk"},
+                {"Request taxi", "taxi route via named taxiways"},
+                {"Holding point <name>, ready for departure", "takeoff clearance, or line up and wait"},
+                {"Lining up runway <number>, <callsign>", "readback of line up and wait"},
+                {"Cleared for takeoff runway <number>, <callsign>", "readback: runway clearances must be read back"},
+            };
+            static const Phrase arr[] = {
+                {"<Station> Tower, <callsign>, 10 miles out, inbound with information <letter>", "join instruction"},
+                {"Request touch and go", "circuit join, option to land"},
+                {"Crosswind / Downwind / Turning base / Final", "sequenced around the circuit"},
+                {"Cleared to land runway <number>, <callsign>", "readback of the landing clearance"},
+                {"Going around", "climb-out and rejoin"},
+                {"Runway vacated, request taxi to parking", "taxi in"},
+            };
+            static const Phrase misc[] = {
+                {"Radio check", "reading you five"},
+                {"Say wind / Say QNH", "current numbers"},
+                {"What's my squawk", "your assigned code"},
+                {"Request flight following", "radar advisories"},
+                {"Request vectors", "headings to final"},
+                {"Request frequency change", "change approved"},
+            };
+            static const Phrase emer[] = {
+                {"Mayday, mayday, mayday, <callsign>, <problem>", "priority + cleared any runway"},
+                {"Pan pan, pan pan, pan pan, <callsign>, <problem>", "urgency handling"},
+            };
+            static const Group groups[] = {
+                {"DEPARTURE", dep, 5}, {"ARRIVAL AND CIRCUIT", arr, 6},
+                {"ANY TIME", misc, 6}, {"EMERGENCY", emer, 2},
+            };
+            for (const Group& g : groups) {
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", g.title);
+                for (int i = 0; i < g.n; ++i) {
+                    ImGui::Bullet();
+                    ImGui::SameLine();
+                    ImGui::PushTextWrapPos(0.0f);
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE), "%s", g.items[i].say);
+                    ImGui::PopTextWrapPos();
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_DIM));
+                    ImGui::Indent(18.0f);
+                    ImGui::PushTextWrapPos(0.0f);
+                    ImGui::TextUnformatted(g.items[i].gets);
+                    ImGui::PopTextWrapPos();
+                    ImGui::Unindent(18.0f);
+                    ImGui::PopStyleColor();
+                }
+                ImGui::Spacing();
+            }
+        }
+        ImGui::EndChild();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                           "Or ask the copilot: what do I say?");
     }
 
     // Live runtime switches. Each checkbox drives a dataref the app polls live;
@@ -1107,6 +1209,10 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         "xcopilot/status/atc", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteAtc, &g_atc, &g_atc);
+    g_coach_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/coach", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteCoach, &g_coach, &g_coach);
     g_com1_dref = XPLMFindDataRef("sim/cockpit2/radios/actuators/com1_frequency_hz_833");
 
     // One shared font atlas for all ImgWindows (uses ImGui's default font).
@@ -1138,6 +1244,7 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
 
 PLUGIN_API void XPluginStop(void) {
     if (g_toggle_cmd) { XPLMUnregisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr); g_toggle_cmd = nullptr; }
+    if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }
     if (g_atc_dref) { XPLMUnregisterDataAccessor(g_atc_dref); g_atc_dref = nullptr; }
     if (g_radio_dref) { XPLMUnregisterDataAccessor(g_radio_dref); g_radio_dref = nullptr; }
     if (g_callout_dref) { XPLMUnregisterDataAccessor(g_callout_dref); g_callout_dref = nullptr; }
