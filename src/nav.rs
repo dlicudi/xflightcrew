@@ -187,6 +187,17 @@ impl AirportInfo {
     pub fn freq(&self, kind: u32) -> Option<&AtcFreq> {
         self.freqs.iter().find(|f| f.kind == kind)
     }
+
+    /// A tower row that names a real facility. The scenery Gateway fills some
+    /// fields' comm rows with the literal "unnamed entity" — seen on LEMY,
+    /// an ultralight strip whose air-to-air frequency is typed as TWR — and a
+    /// row like that is a frequency, not a controller. Nobody should be
+    /// handed off to it or told it's the nearest station.
+    #[allow(dead_code)] // atc-binary tree only (yet)
+    pub fn staffed_tower(&self) -> Option<&AtcFreq> {
+        self.freq(FREQ_TOWER)
+            .filter(|f| !f.name.trim().eq_ignore_ascii_case("unnamed entity"))
+    }
 }
 
 /// The runways `icao` actually has, from X-Plane's Global Airports `apt.dat`.

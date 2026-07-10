@@ -130,6 +130,11 @@ pub struct Config {
     /// nearest; "off" keeps the single configured airport forever.
     /// `XCOPILOT_ATC_REGION`.
     pub atc_region: String,
+    /// Party-line chatter: the tower narrates clearances for live traffic
+    /// (LiveTraffic/AI ghosts) while COM1 is on its frequency. On by
+    /// default; `XCOPILOT_ATC_CHATTER=false` silences the flavor calls
+    /// (the go-around/held-clearance safety watches stay on regardless).
+    pub atc_chatter: bool,
     /// Radio (transmit) push-to-talk dataref, set by the bundled plugin's
     /// `xcopilot/radio_ptt` command — the transmit switch, as distinct from the
     /// intercom PTT above. An utterance captured while THIS is held goes to
@@ -228,6 +233,7 @@ impl Config {
             simbrief_id: env_or("XCOPILOT_SIMBRIEF_ID", ""),
             atc_airport: env_or("XCOPILOT_ATC_AIRPORT", "LXGB"),
             atc_region: env_or("XCOPILOT_ATC_REGION", "auto"),
+            atc_chatter: env_or("XCOPILOT_ATC_CHATTER", "true") != "false",
             radio_ptt_dataref: env_or("XCOPILOT_RADIO_PTT_DATAREF", "xcopilot/radio_ptt_active"),
             atc_piper_voice: env_or("XCOPILOT_ATC_PIPER_VOICE", "models/en_GB-alba-medium.onnx"),
             // ryan-high: the only high-quality model in the folder, and clearly

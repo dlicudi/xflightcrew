@@ -178,11 +178,14 @@
 - {text: "set flaps for takeoff", intent: request_takeoff, radio: false}
 - {text: "anything else we need to do before takeoff", intent: request_takeoff, radio: false}
 
+# --- Hails: an initial call earns "pass your message" (since 2026-07-10) —
+# --- safe even for garbled ones: an invitation, never a clearance -------------
+- {text: "Hello, hello, hello.", intent: greeting, radio: false}
+- {text: "Hello, here is Stella from Terra.", intent: greeting, radio: false}
+- {text: "Good morning, Tower.", intent: greeting, radio: true}
+- {text: "Hello tower.", intent: greeting, radio: true}
+
 # --- Garble, dead air, and things nobody can route -----------------------------
-- {text: "Hello, hello, hello.", intent: unknown, radio: false}
-- {text: "Hello, here is Stella from Terra.", intent: unknown, radio: false}
-- {text: "Good morning, Tower.", intent: unknown, radio: true}
-- {text: "Hello tower.", intent: unknown, radio: true}
 - {text: "The Gibraltar tower, weather.", intent: unknown, radio: true}
 - {text: "Weather reports.", intent: unknown, radio: false}
 - {text: "On my flight plan.", intent: unknown, radio: false}
@@ -190,12 +193,13 @@
 - {text: "uhh gibraltar something something", intent: unknown, radio: true, readback: false}
 - {text: "Radio calls to the tower.", intent: unknown, radio: true}
 
-# --- Unsupported-but-real requests: "say again" is the right answer (today) ---
-# Flight following came up four times across the 2026-07 flights. Documented so
-# adding it is a deliberate corpus edit, not a drift.
-- {text: "request flight following", intent: unknown, radio: true, readback: false}
-- {text: "requesting flight following.", intent: unknown, radio: true}
-- {text: "Jabal top tower request flight following.", intent: unknown, radio: true}
+# --- Flight following: supported since 2026-07-10 (the deliberate corpus edit
+# --- the old note here asked for). Tower redirects to approach or declines
+# --- honestly; approach/departure grant it. Never a clearance.
+- {text: "request flight following", intent: flight_following, radio: true, readback: false}
+- {text: "requesting flight following.", intent: flight_following, radio: true}
+- {text: "Jabal top tower request flight following.", intent: flight_following, radio: true}
+# "flight following" with both words garbled away stays unroutable.
 - {text: "Request following, cable to tower.", intent: unknown, radio: true}
 
 # --- Pattern reports and go-arounds (intents added 2026-07-09) ----------------
@@ -238,3 +242,19 @@
 - {text: "win check.", intent: wind_check}
 - {text: "Request vectors for taxi to parking.", intent: request_taxi_in, radio: true}
 - {text: "I've landed here.", intent: request_taxi_in, radio: false}
+
+# --- 2026-07-10 flight (Extremadura): greetings, flight following, garbles ----
+# Initial hails: a greeting earns "pass your message", never "say again".
+- {text: "Good evening, Merida.", intent: greeting, radio: false}
+- {text: "hello, banahos.", intent: greeting, radio: false}
+- {text: "Checking in, radio check.", intent: radio_check, radio: true}
+# Flight following, straight and as whisper mangled it ("but a host tower" =
+# Badajoz Tower). A service request, answered honestly — never a clearance.
+- {text: "Request flight following.", intent: flight_following, radio: true}
+- {text: "But a host tower requesting flight following.", intent: flight_following, radio: true}
+# Real emergency phrasing (conf 0.66) — "requesting emergency landing" is a
+# mayday; the pilot was airborne and the clearance was correct.
+- {text: "Radio calls to the tower, requesting emergency landing.", intent: mayday, radio: true}
+# "When request vectors" — whisper's "then/when" prefix garble.
+- {text: "When request vectors for approach.", intent: request_vectors, radio: true}
+- {text: "Tower requesting clearance.", intent: request_clearance, radio: true}

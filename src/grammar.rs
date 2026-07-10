@@ -1116,6 +1116,21 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         if has(t, "ident") {
             return Some(call("set_transponder_mode", json!({ "mode": "ident" })));
         }
+        // Mode words before on/off: "mode C on" and "squawk altitude" are the
+        // altitude mode, not a bare "on". The 2026-07-10 pilot said
+        // "transponder on" ten ways and every one missed to the LLM — only
+        // standby/ident/vfr/codes were covered.
+        if has(t, "altitude") || has(t, "alt") || has(t, "charlie")
+            || (has(t, "mode") && has(t, "c"))
+        {
+            return Some(call("set_transponder_mode", json!({ "mode": "altitude" })));
+        }
+        if has(t, "off") {
+            return Some(call("set_transponder_mode", json!({ "mode": "off" })));
+        }
+        if has(t, "on") || has(t, "activate") || has(t, "enable") {
+            return Some(call("set_transponder_mode", json!({ "mode": "on" })));
+        }
         if has(t, "vfr") {
             return Some(call("set_transponder", json!({ "code": 1200 })));
         }
@@ -1422,6 +1437,21 @@ mod tests {
         assert_eq!(one("40 percent power").unwrap().1, json!({"percent":40}));
         assert_eq!(one("maximum throttle").unwrap().1, json!({"percent":100}));
         assert_eq!(one("throttle to cruise").unwrap(), ("set_throttle".into(), json!({"percent":65})));
+        // Transponder modes — the 2026-07-10 pilot said "transponder on" ten
+        // ways and every one missed to the LLM; only standby/ident/vfr/codes
+        // were covered. Mode words beat on/off ("mode C on" is altitude).
+        assert_eq!(one("transponder on").unwrap(), ("set_transponder_mode".into(), json!({"mode":"on"})));
+        assert_eq!(one("transponder off").unwrap().1, json!({"mode":"off"}));
+        assert_eq!(one("activate transponder").unwrap().1, json!({"mode":"on"}));
+        assert_eq!(one("set transponder mode on").unwrap().1, json!({"mode":"on"}));
+        assert_eq!(one("mode on for transponder").unwrap().1, json!({"mode":"on"}));
+        assert_eq!(one("transponder standby").unwrap().1, json!({"mode":"standby"}));
+        assert_eq!(one("squawk altitude").unwrap().1, json!({"mode":"altitude"}));
+        assert_eq!(one("transponder alt mode").unwrap().1, json!({"mode":"altitude"}));
+        assert_eq!(one("mode c on").is_none(), true); // no transponder word — not ours
+        assert_eq!(one("transponder mode c on").unwrap().1, json!({"mode":"altitude"}));
+        assert_eq!(one("squawk vfr").unwrap(), ("set_transponder".into(), json!({"code":1200})));
+        assert_eq!(one("squawk 4521").unwrap().1, json!({"code":4521}));
         assert_eq!(one("mixture 70 percent").unwrap().0, "set_mixture");
         assert_eq!(one("maximum mixture").unwrap(), ("set_mixture".into(), json!({"percent":100})));
         assert_eq!(one("mixture full rich").unwrap().1, json!({"percent":100}));

@@ -250,6 +250,7 @@ const PHRASE_MISHEARS: &[(&str, &str)] = &[
     ("via file", "vfr"),                  // "Transponder via file."
     ("responder", "transponder"),         // "Responder VFA."
     ("coq", "squawk"),                    // "Set coq to VFR."
+    ("transponder out mode", "transponder alt mode"), // "alt" heard as "out" (twice, 2026-07-10)
     // Strobes. Bare "probe"/"robe"/"show" are real words, so only the paired
     // "... light(s)" forms repair.
     ("strokes on", "strobes on"),         // "Strokes on." (0.998 confidence!)
@@ -294,6 +295,7 @@ const PHRASE_MISHEARS: &[(&str, &str)] = &[
     ("rock and break", "parking brake"),  // "Drop, rock and break off."
     // Engines.
     ("engine zone", "engines on"),        // "engine zone." (three flights)
+    ("jeans on", "engines on"),           // "And jeans on?" (2026-07-10)
     ("star engine", "start engine"),      // "Star engines."
     ("star engines", "start engines"),
     // Climb / descend.
@@ -545,6 +547,7 @@ mod tests {
             ("Park and brake off.", "parking brake off."),
             // Engines.
             ("engine zone.", "engines on."),
+            ("And jeans on?", "And engines on?"),
             ("Star engines.", "start engines."),
             // Climb / descend.
             ("They send to five thousand.", "descend to five thousand."),

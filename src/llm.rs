@@ -771,6 +771,7 @@ mod tests {
             atc_atis_piper_voice: String::new(),
             atc_voice_pool: String::new(),
             atc_region: String::new(),
+            atc_chatter: true,
             atc_squelch_wav: String::new(),
             atc_voice: String::new(),
             atc_rate: String::new(),

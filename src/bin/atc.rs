@@ -280,7 +280,10 @@ fn main() -> Result<()> {
                     wind: spoken_wind(&snap),
                     holding_point: "Alpha".to_string(),
                     approach: apt.freq(nav::FREQ_APPROACH).map(|f| atis::spoken_mhz(f.khz)),
-                    // The standalone binary predates the ground-aware mayday.
+                    // The standalone binary predates the ground-aware mayday
+                    // and the assigned-squawk state: conspicuity only.
+                    squawk: "seven zero zero zero".to_string(),
+                    final_traffic_nm: None,
                     on_ground: false,
                 };
                 let intent = if heard.confidence < config.stt_min_confidence {

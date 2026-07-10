@@ -326,25 +326,19 @@ async fn main() -> Result<()> {
         .plugin_status
         .then(|| plugin_status::StatusSink::start(&config.xplane_base_url));
 
-    // Radio row for the in-sim panel: the ATC field's comm plan plus live COM1,
-    // refreshed ~1/s through the status sink. Its own small poller (not the
-    // TUI's) so the radios show in the cockpit in every UI mode — the panel is
-    // the instrument, the terminal is just a dev view.
+    // Radio row + ATC tab for the in-sim panel, refreshed ~1/s through the
+    // status sink. Position-driven from the station's published side state,
+    // so the row follows region handoffs and shows the active station's comm
+    // plan ONLY while it's inside VHF range — a tower you can't raise isn't a
+    // radio row. The ATC tab gets every field in range, nearest first. Its
+    // own small poller (not the TUI's) so the radios show in the cockpit in
+    // every UI mode — the panel is the instrument, the terminal is a dev view.
     if let Some(sink) = status_sink.clone() {
         let base = config.xplane_base_url.clone();
-        let (apt_path, atc_icao) =
-            (config.apt_data_path.clone(), config.atc_airport.trim().to_uppercase());
-        if !atc_icao.is_empty() {
+        if !config.atc_airport.trim().is_empty() {
             std::thread::spawn(move || {
                 let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
                 rt.block_on(async move {
-                    // ATC off or the field missing just means no radio row —
-                    // the station's own load path logs the warning.
-                    let Some(apt) = nav::find_airport(&apt_path, &atc_icao).ok().flatten() else { return };
-                    let services = station::services(&apt);
-                    if services.is_empty() {
-                        return;
-                    }
                     let xp = XPlaneClient::new(base);
                     loop {
                         let com1 = xp
@@ -352,7 +346,18 @@ async fn main() -> Result<()> {
                             .await
                             .ok()
                             .map(|v| v.round() as i64);
-                        sink.radio(&radio_panel_line(&apt.name, &services, com1));
+                        if let Some((lat, lon, alt_ft)) = position(&xp).await {
+                            let row = match station::active_station_in_range(lat, lon, alt_ft) {
+                                Some((airport, services)) => radio_panel_line(&airport, &services, com1),
+                                // Out of range (or no station yet): the row keeps
+                                // showing where the radio actually is, nothing more.
+                                None => radio_panel_line("", &[], com1),
+                            };
+                            sink.radio(&row);
+                            sink.atc(&atc_panel_payload(&station::fields_in_range(
+                                lat, lon, alt_ft, 8,
+                            )));
+                        }
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                 });
@@ -446,36 +451,36 @@ async fn main() -> Result<()> {
 
         let tx_poll = tx.clone();
         let poll_base = config.xplane_base_url.clone();
-        let (apt_path, atc_icao) =
-            (config.apt_data_path.clone(), config.atc_airport.trim().to_uppercase());
+        let atc_on = !config.atc_airport.trim().is_empty();
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             rt.block_on(async move {
                 let xp = XPlaneClient::new(poll_base);
-                // The ATC field's comm plan for the radio panel, scanned once.
-                // ATC off or the field missing just means no panel — the
-                // station's own load path already logs the warning.
-                let comm = (!atc_icao.is_empty())
-                    .then(|| nav::find_airport(&apt_path, &atc_icao).ok().flatten())
-                    .flatten()
-                    .map(|apt| (apt.name.clone(), station::services(&apt)));
                 loop {
                     if let Some(ac) = poll_aircraft(&xp).await {
                         if tx_poll.send(ui::Report::Aircraft(ac)).is_err() {
                             break; // dashboard gone
                         }
                     }
-                    if let Some((airport, services)) = &comm {
+                    // The radio panel mirrors the in-sim one: the ACTIVE
+                    // station's comm plan, only while it's in VHF range —
+                    // empty (panel hidden) otherwise.
+                    if atc_on {
                         let com1 = xp
                             .get_float(datarefs::COM1_FREQ_KHZ)
                             .await
                             .ok()
                             .map(|v| v.round() as i64);
-                        let _ = tx_poll.send(ui::Report::Radio(ui::Radio {
-                            airport: airport.clone(),
-                            services: services.clone(),
-                            com1_khz: com1,
-                        }));
+                        if let Some((lat, lon, alt_ft)) = position(&xp).await {
+                            let (airport, services) =
+                                station::active_station_in_range(lat, lon, alt_ft)
+                                    .unwrap_or_default();
+                            let _ = tx_poll.send(ui::Report::Radio(ui::Radio {
+                                airport,
+                                services,
+                                com1_khz: com1,
+                            }));
+                        }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 }
@@ -853,28 +858,33 @@ async fn run_session(
         // True when the RADIO PTT carried this utterance: it was TRANSMITTED,
         // so it belongs to whatever station COM1 is tuned to, never the copilot.
         let mut from_radio = false;
-        let (mut command, from_text) = match next_input(&mut listener, &ptt_mic, &stt, &ptt, typed.as_ref()) {
-            None => continue,
-            Some(Input::Typed(text)) => {
-                tracing::info!(typed = %text, "typed command");
-                reporter.log(ui::LogKind::Heard, format!("⌨  \"{text}\""));
-                (text, true)
-            }
-            Some(Input::Spoken(heard, radio)) => {
-                tracing::info!(transcript = %heard.text, confidence = heard.confidence, radio, "heard utterance");
-                reporter.heard(&heard.text, heard.confidence);
-                spoken_confidence = Some(heard.confidence);
-                from_radio = radio;
-                // Continuous mode acts on the transcript directly — the downstream
-                // domain gate (`looks_like_command`) filters non-commands.
-                (heard.text, false)
-            }
-        };
+        let input = next_input(&mut listener, &ptt_mic, &stt, &ptt, typed.as_ref());
 
-        // A region switch armed by the monitor: rebuild the station BEFORE this
-        // utterance is routed — consumed at the loop top it lagged one call
-        // behind, and "Ready for takeoff?" at Ciudad Real was answered by
-        // Gibraltar's dead-air briefing (seen live 2026-07-09).
+        // You call it, you get it: a keyed transmission on a frequency the
+        // active station doesn't cover, but another in-range field does, arms
+        // the swap so THAT field answers this very call — the ATC tab lets the
+        // pilot tune any in-range field, and calling Badajoz on 122.100 must
+        // not be answered by dead air and a note about Gibraltar (2026-07-10).
+        // BEFORE the pending-station consumption below, so the swap lands for
+        // this very utterance.
+        if matches!(input, Some(Input::Spoken(_, true))) {
+            if let Ok(v) = xplane.get_float(datarefs::COM1_FREQ_KHZ).await {
+                let com1 = v.round() as i64;
+                let covered = atc_station.as_ref().is_some_and(|st| st.covers_khz(com1));
+                if !covered {
+                    if let Some((lat, lon, alt_ft)) = position(&xplane).await {
+                        station::arm_station_for_freq(com1, lat, lon, alt_ft, Instant::now());
+                    }
+                }
+            }
+        }
+
+        // A region switch armed by the monitor: rebuild the station BEFORE
+        // this utterance is routed (consumed at the loop top it lagged one
+        // call behind, seen live 2026-07-09) — and on the IDLE tick too:
+        // input is already captured, and a silent cockpit must still swap
+        // (the Heathrow handoff sat unconsumed for minutes, 2026-07-10, and
+        // the party line waited on it).
         if let Some((icao, apt)) = station::PENDING_STATION
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -902,6 +912,39 @@ async fn run_session(
                 None => tracing::warn!(%name, "region handoff to a field without a tower; keeping the old station"),
             }
         }
+
+        // A held takeoff clearance the monitor released once the final
+        // cleared: sync the tower FSM (state + departure handoff) with what
+        // was already said on frequency.
+        if std::mem::take(
+            &mut *station::PENDING_TAKEOFF_CLEARANCE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        ) {
+            if let Some(st) = atc_station.as_mut() {
+                st.apply_monitor_takeoff_clearance(&xplane).await;
+                reporter.log(ui::LogKind::Info, "tower: held takeoff clearance released");
+            }
+        }
+
+        // Station work consumed — an idle tick carries no utterance to route.
+        let (mut command, from_text) = match input {
+            None => continue,
+            Some(Input::Typed(text)) => {
+                tracing::info!(typed = %text, "typed command");
+                reporter.log(ui::LogKind::Heard, format!("⌨  \"{text}\""));
+                (text, true)
+            }
+            Some(Input::Spoken(heard, radio)) => {
+                tracing::info!(transcript = %heard.text, confidence = heard.confidence, radio, "heard utterance");
+                reporter.heard(&heard.text, heard.confidence);
+                spoken_confidence = Some(heard.confidence);
+                from_radio = radio;
+                // Continuous mode acts on the transcript directly — the downstream
+                // domain gate (`looks_like_command`) filters non-commands.
+                (heard.text, false)
+            }
+        };
 
         // Aircraft switched? Rebuild everything profile-derived before acting on this
         // command, so the tools, limits, prompt, and checklists match what's actually
@@ -1037,7 +1080,7 @@ async fn run_session(
                     .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(300))
                 {
                     last_void_brief = Some(Instant::now());
-                    format!("No answer there. {}", st.freq_briefing(&xplane).await)
+                    format!("No answer there. {}", void_briefing(&xplane, st).await)
                 } else {
                     match xplane.get_float(datarefs::COM1_FREQ_KHZ).await {
                         Ok(v) => format!(
@@ -2201,6 +2244,11 @@ fn next_input(
     let Some(typed) = typed else {
         return listen_once(listener, ptt_mic, stt, ptt, None).map(|(t, tx)| Input::Spoken(t, tx));
     };
+    // Surface an idle tick every couple of seconds instead of blocking
+    // forever: the main loop has station work to consume even when nobody
+    // speaks (a region handoff armed by the monitor sat unconsumed through a
+    // silent Heathrow session, 2026-07-10 — no swap, no party line).
+    let idle_deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
         if let Ok(t) = typed.try_recv() {
             let t = t.trim().to_string();
@@ -2211,7 +2259,11 @@ fn next_input(
         if let Some((t, tx)) = listen_once(listener, ptt_mic, stt, ptt, Some(Duration::from_millis(150))) {
             return Some(Input::Spoken(t, tx));
         }
-        // Timed out idle (or a discarded blip) — loop to re-check the typed channel.
+        // Timed out idle (or a discarded blip) — re-check the typed channel,
+        // or hand the loop an idle tick.
+        if std::time::Instant::now() >= idle_deadline {
+            return None;
+        }
     }
 }
 
@@ -4441,46 +4493,121 @@ fn matches_keyword(w: &str) -> bool {
 
 /// Short label for the whisper model from its path, for the status bar:
 /// `models/ggml-base.en.bin` → `base.en`, `…/ggml-large-v3-turbo.bin` → `large-v3-turbo`.
-/// The radio row pushed to the in-sim panel: airport, then each published
-/// service as "TWR 131.200" segments split on " | ", with '>' marking the one
-/// COM1 is tuned to (same 5 kHz tolerance as the station). Off every service,
-/// the raw COM1 value gets its own trailing segment — the panel always shows
-/// where the radio actually is.
+/// Short chip label for a published service, shared by the radio row and the
+/// ATC tab payload.
+fn service_label(word: &str) -> &str {
+    match word {
+        "atis" => "ATIS",
+        "clearance" => "CLR",
+        "ground" => "GND",
+        "tower" => "TWR",
+        "approach" => "APP",
+        "departure" => "DEP",
+        "unicom" => "UNICOM",
+        other => other,
+    }
+}
+
+/// The crew's comm note after a transmission into dead air. The active
+/// station's full plan is only worth reciting while that station is in VHF
+/// range — parked 200 nm out, "Gibraltar: tower one three one decimal two"
+/// reads as if Gibraltar could answer (2026-07-10). Out of range, name what
+/// IS reachable instead, or say honestly that nothing is.
+async fn void_briefing(xp: &XPlaneClient, st: &station::Station) -> String {
+    let Some((lat, lon, alt_ft)) = position(xp).await else {
+        // Can't place the aircraft — the plain briefing beats silence.
+        return st.freq_briefing(xp).await;
+    };
+    if station::active_station_in_range(lat, lon, alt_ft).is_some() {
+        return st.freq_briefing(xp).await;
+    }
+    let near = station::fields_in_range(lat, lon, alt_ft, 1);
+    match near.first().and_then(|f| {
+        f.services
+            .iter()
+            .find(|(w, _)| w.as_str() == "tower")
+            .map(|(_, khz)| (f, *khz))
+    }) {
+        Some((f, khz)) => format!(
+            "{} is out of radio range. Nearest station is {}, {} miles away, tower on {}.",
+            station::spoken_airport(st.airport_name()),
+            station::spoken_airport(&f.name),
+            f.dist_nm.round() as i64,
+            atis::spoken_mhz(khz)
+        ),
+        None => format!(
+            "{} is out of radio range, and nothing else is in reach from here.",
+            station::spoken_airport(st.airport_name())
+        ),
+    }
+}
+
+/// The aircraft's position for the VHF range checks: lat, lon, true altitude
+/// in feet MSL. `None` when the sim isn't answering.
+async fn position(xp: &XPlaneClient) -> Option<(f64, f64, f64)> {
+    let lat = xp.get_float(datarefs::LATITUDE).await.ok()?;
+    let lon = xp.get_float(datarefs::LONGITUDE).await.ok()?;
+    let elev_m = xp.get_float(datarefs::ELEVATION_M).await.ok()?;
+    Some((lat, lon, elev_m * 3.28084))
+}
+
+/// The radio row pushed to the in-sim panel: the active station's name and
+/// where COM1 actually is — the TUNED service by name (">TWR 118.505", same
+/// 5 kHz tolerance as the station) or the raw value when off every service.
+/// Just those two chips: the full comm plan lives in the ATC tab now
+/// (2026-07-10), and repeating every frequency here was noise. An empty
+/// airport (active station out of VHF range) leaves only the COM1 chip.
 fn radio_panel_line(
     airport: &str,
     services: &[(String, i64)],
     com1_khz: Option<i64>,
 ) -> String {
-    fn label(word: &str) -> &str {
-        match word {
-            "atis" => "ATIS",
-            "clearance" => "CLR",
-            "ground" => "GND",
-            "tower" => "TWR",
-            "approach" => "APP",
-            "departure" => "DEP",
-            "unicom" => "UNICOM",
-            other => other,
-        }
+    let mut parts = Vec::new();
+    if !airport.is_empty() {
+        parts.push(airport.to_uppercase());
     }
-    let tuned = |khz: i64| com1_khz.is_some_and(|c| (c - khz).abs() <= 5);
-    let mut parts = vec![airport.to_uppercase()];
-    let mut matched = false;
-    for (word, khz) in services {
-        let mark = if tuned(*khz) {
-            matched = true;
-            ">"
-        } else {
-            ""
-        };
-        parts.push(format!("{mark}{} {:.3}", label(word), *khz as f64 / 1000.0));
-    }
-    if !matched {
-        if let Some(c) = com1_khz {
-            parts.push(format!(">COM1 {:.3}", c as f64 / 1000.0));
-        }
+    let tuned = com1_khz
+        .and_then(|c| services.iter().find(|(_, khz)| (c - khz).abs() <= 5));
+    match (tuned, com1_khz) {
+        (Some((word, khz)), _) => parts.push(format!(
+            ">{} {:.3}",
+            service_label(word),
+            *khz as f64 / 1000.0
+        )),
+        (None, Some(c)) => parts.push(format!(">COM1 {:.3}", c as f64 / 1000.0)),
+        (None, None) => {}
     }
     parts.join(" | ")
+}
+
+/// The ATC tab's payload for the in-sim panel: every in-range field as
+/// "NAME,dist_nm,SVC khz,...", fields joined with '|', '*' prefixing the
+/// active station. Frequencies stay integer kHz — the plugin compares them
+/// straight against COM1 for the tuned highlight and writes them back on a
+/// click-to-tune. Trailing fields drop rather than overflow the plugin's
+/// 500-byte text buffer.
+fn atc_panel_payload(fields: &[station::RangedField]) -> String {
+    let mut out = String::new();
+    for f in fields {
+        let mut seg = String::new();
+        if f.active {
+            seg.push('*');
+        }
+        // The separators are structural — scrub them from free-text names.
+        let name = f.name.replace(['|', ','], " ");
+        seg.push_str(&format!("{},{}", name.trim().to_uppercase(), f.dist_nm.round() as i64));
+        for (word, khz) in &f.services {
+            seg.push_str(&format!(",{} {khz}", service_label(word)));
+        }
+        if out.len() + seg.len() + 1 > plugin_status::TEXT_MAX {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('|');
+        }
+        out.push_str(&seg);
+    }
+    out
 }
 
 fn whisper_model_label(path: &str) -> String {
@@ -4522,24 +4649,50 @@ mod tests {
     };
 
     #[test]
-    fn radio_row_marks_the_tuned_service() {
+    fn radio_row_shows_the_station_and_the_tuned_service_only() {
         let services = vec![
             ("tower".to_string(), 131200_i64),
             ("approach".to_string(), 122800),
             ("departure".to_string(), 130400),
         ];
-        // Tuned to the tower (8.33 name can sit 5 kHz off the carrier).
+        // Tuned to the tower (8.33 name can sit 5 kHz off the carrier):
+        // station + that ONE chip — the full plan is the ATC tab's job.
         let line = radio_panel_line("Gibraltar", &services, Some(131205));
-        assert_eq!(
-            line,
-            "GIBRALTAR | >TWR 131.200 | APP 122.800 | DEP 130.400"
-        );
-        // Off every service: the raw COM1 value shows as its own segment.
+        assert_eq!(line, "GIBRALTAR | >TWR 131.200");
+        // Off every service: the raw COM1 value as the second chip.
         let line = radio_panel_line("Gibraltar", &services, Some(124730));
-        assert!(line.ends_with("DEP 130.400 | >COM1 124.730"), "{line}");
-        // COM1 unreadable: the plan still shows, nothing marked.
-        let line = radio_panel_line("Gibraltar", &services, None);
-        assert!(!line.contains('>'), "{line}");
+        assert_eq!(line, "GIBRALTAR | >COM1 124.730");
+        // COM1 unreadable: just the station.
+        assert_eq!(radio_panel_line("Gibraltar", &services, None), "GIBRALTAR");
+        // Active station out of VHF range (empty airport): only live COM1.
+        let line = radio_panel_line("", &[], Some(123500));
+        assert_eq!(line, ">COM1 123.500");
+        assert_eq!(radio_panel_line("", &[], None), "");
+    }
+
+    #[test]
+    fn atc_payload_marks_active_and_fits_the_plugin_buffer() {
+        let f = |name: &str, dist: f64, active: bool| crate::station::RangedField {
+            name: name.to_string(),
+            dist_nm: dist,
+            active,
+            services: vec![("tower".to_string(), 118325_i64), ("atis".to_string(), 121800)],
+        };
+        let payload = super::atc_panel_payload(&[f("Badajoz", 21.7, false), f("Gibraltar", 2.1, true)]);
+        assert_eq!(
+            payload,
+            "BADAJOZ,22,TWR 118325,ATIS 121800|*GIBRALTAR,2,TWR 118325,ATIS 121800"
+        );
+        // Separators are structural — a name containing them can't corrupt
+        // neighbouring fields.
+        let payload = super::atc_panel_payload(&[f("El Molinillo, Almendralejo|x", 3.0, false)]);
+        assert!(payload.starts_with("EL MOLINILLO  ALMENDRALEJO X,3,"), "{payload}");
+        // Too many fields: trailing ones drop instead of overflowing the
+        // plugin's 500-byte text buffer.
+        let many: Vec<_> = (0..40).map(|i| f(&format!("Field Number {i:02}"), i as f64, false)).collect();
+        let payload = super::atc_panel_payload(&many);
+        assert!(payload.len() <= crate::plugin_status::TEXT_MAX);
+        assert!(payload.contains("FIELD NUMBER 00"));
     }
 
     #[test]

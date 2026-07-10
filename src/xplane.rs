@@ -330,6 +330,19 @@ impl XPlaneClient {
         Ok(id)
     }
 
+    /// Read a byte-array dataref RAW (e.g. the TCAS flight_id table: 8 bytes
+    /// per target, NUL-padded) — interior NULs and slot alignment preserved,
+    /// unlike [`XPlaneClient::get_string`] which is for single values.
+    pub async fn get_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        let data = self.get_value(name, "decoding byte-array dataref").await?;
+        let b64 = data
+            .as_str()
+            .ok_or_else(|| anyhow!("dataref {name} is not a data value: {data}"))?;
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .context("base64-decoding dataref")
+    }
+
     /// Read a `data`-typed dataref (returned base64-encoded) as a string,
     /// trimming the null padding X-Plane uses for fixed-width fields.
     pub async fn get_string(&self, name: &str) -> Result<String> {

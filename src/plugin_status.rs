@@ -26,10 +26,11 @@ const DR_AIRCRAFT: &str = "xcopilot/status/aircraft";
 const DR_STRIP: &str = "xcopilot/status/strip";
 const DR_CALLOUT: &str = "xcopilot/status/callout";
 const DR_RADIO: &str = "xcopilot/status/radio";
+const DR_ATC: &str = "xcopilot/status/atc";
 
 /// Keep text within the plugin's fixed display buffer (512 bytes, NUL-terminated)
 /// — long enough for a full engine/weather summary readback.
-const TEXT_MAX: usize = 500;
+pub(crate) const TEXT_MAX: usize = 500;
 
 /// One status change to mirror into the sim.
 enum Update {
@@ -49,6 +50,10 @@ enum Update {
     /// The radio row — the ATC field's comm plan plus live COM1, refreshed
     /// continuously ("GIBRALTAR | >TWR 131.200 | APP 122.800"). Empty hides it.
     Radio(String),
+    /// The ATC tab — every field in VHF range, nearest first, as
+    /// "NAME,dist,SVC khz,...|NAME,..." ('*' marks the active station).
+    /// Empty means nothing in range.
+    Atc(String),
     /// A short "what's being changed" label the plugin flashes over the cockpit.
     Callout(String),
 }
@@ -114,6 +119,10 @@ impl StatusSink {
     pub fn radio(&self, text: &str) {
         let _ = self.0.send(Update::Radio(clip(text)));
     }
+    /// Refresh the ATC tab's in-range station list. Empty = nothing in range.
+    pub fn atc(&self, text: &str) {
+        let _ = self.0.send(Update::Atc(clip(text)));
+    }
     /// Flash a "what's being changed" callout over the cockpit (e.g. "FLAPS > 10").
     pub fn callout(&self, text: &str) {
         let _ = self.0.send(Update::Callout(clip(text)));
@@ -146,6 +155,7 @@ enum Slot {
     Strip,
     Callout,
     Radio,
+    Atc,
 }
 
 /// The resolved numeric ids of the plugin's status datarefs. All `None` until a
@@ -160,6 +170,7 @@ struct Ids {
     strip: Option<i64>,
     callout: Option<i64>,
     radio: Option<i64>,
+    atc: Option<i64>,
 }
 
 impl Ids {
@@ -173,6 +184,7 @@ impl Ids {
             Slot::Strip => self.strip,
             Slot::Callout => self.callout,
             Slot::Radio => self.radio,
+            Slot::Atc => self.atc,
         }
     }
     /// True once at least one dataref resolved (i.e. the plugin is present).
@@ -193,6 +205,7 @@ fn resolve_all(http: &reqwest::blocking::Client, rest: &str) -> Ids {
         strip: resolve_id(http, rest, DR_STRIP),
         callout: resolve_id(http, rest, DR_CALLOUT),
         radio: resolve_id(http, rest, DR_RADIO),
+        atc: resolve_id(http, rest, DR_ATC),
     }
 }
 
@@ -279,6 +292,7 @@ fn run(base: String, rx: Receiver<Update>) {
                 }
                 Update::Strip(text) => (Slot::Strip, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Radio(text) => (Slot::Radio, json!(STANDARD.encode(text.as_bytes()))),
+                Update::Atc(text) => (Slot::Atc, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Callout(text) => (Slot::Callout, json!(STANDARD.encode(text.as_bytes()))),
             };
             healthy = patch(&http, &rest, &ids, slot, value);

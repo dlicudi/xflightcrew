@@ -112,6 +112,34 @@ Work through these in one or two flights. Tick, and note anything odd.
 | With AI traffic on, fly near another aircraft while tuned to any controller | "Traffic, x o'clock, y miles" in that controller's voice, at most one per 45 s |
 | Same but tuned off-frequency | Silence — nobody is watching |
 
+### Squawks and compliance (added 2026-07-10)
+
+| Do this | Expect |
+|---|---|
+| Request flight following (or vectors) | A discrete 45xx code assigned, "radar contact" ONLY after you actually set it (mode ON/ALT) |
+| Ignore the assigned code for 20+ s | "Confirm squawk ...", twice at most, then the controller gives up |
+| Ask "say my squawk" after an assignment | The ASSIGNED code, not seven thousand; before any assignment, seven thousand |
+| Taxi onto the runway with only a taxi clearance | "You are on runway ... without clearance, exit immediately"; repeats each minute while you squat |
+| Take off without a takeoff clearance (after calling in) | "You were not cleared for takeoff", once |
+| Land without a landing clearance | "Taxi to parking, I have a number for you to copy", once |
+| Land legally, roll out, vacate slowly | NO occupancy shout for ~2 min (vacate grace) |
+| Fly through the zone (< 5 nm, < 3,000 AGL) without ever calling | Tuned: the controller challenges. Untuned: the COPILOT flags it with the tower frequency |
+| Overfly the field above 3,000 AGL, radios cold | Silence — overflight is not an incursion |
+| Request takeoff with AI traffic on final | "Hold position, traffic on x mile final", state unmoved; cleared on re-ask once final is clear |
+| Report downwind with traffic on final | "Number two, follow the traffic on final" |
+
+### Party line and traffic protection (added 2026-07-10)
+
+| Do this | Expect |
+|---|---|
+| Sit tuned to the tower with LiveTraffic arriving | "Speedbird three zero six, runway ..., cleared to land" narrated BEFORE the ghost lands; each ghost's call once, ≥45 s apart |
+| Watch a ghost depart | "..., cleared for takeoff" at rotation |
+| `XCOPILOT_ATC_CHATTER=false` | Party line silent; go-around/hold watches still on |
+| Tune off the tower frequency | No party line (it's what you hear ON frequency) |
+| Get cleared to land, then a ghost taxis onto the runway | "Go around, traffic on the runway" (tuned) / crew "go around" (not tuned), repeats each 30 s while the conflict holds |
+| Hold position for landing traffic, wait | ~15 s after the final truly clears: "traffic clear, runway ..., cleared for takeoff" unprompted — and the FSM/handoff arm as if asked |
+| After a traffic advisory, let the target diverge | "clear of traffic" — the loop closes |
+
 ## Post-flight
 
 Pull the trace apart. Every command below reads `logs/blackbox.jsonl`.
@@ -152,5 +180,5 @@ intent it SHOULD have parsed to (or `unknown` if "say again" was right), run
 the logs beat invented ones; that is the whole point of the trace.
 
 Known gaps, documented in the corpus as `unknown` until the intents exist:
-flight following. (Downwind/base reports, go-arounds and mayday landed
-2026-07-09.)
+(none currently — downwind/base reports, go-arounds and mayday landed
+2026-07-09; greetings and flight following landed 2026-07-10.)

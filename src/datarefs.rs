@@ -18,6 +18,11 @@ pub const GEAR_HANDLE_DOWN: &str = "sim/cockpit2/controls/gear_handle_down";
 pub const ON_GROUND_ANY: &str = "sim/flightmodel/failures/onground_any";
 /// Height above the terrain directly below, in METERS (× 3.28084 for feet).
 pub const AGL_METERS: &str = "sim/flightmodel/position/y_agl";
+pub const LATITUDE: &str = "sim/flightmodel/position/latitude";
+pub const LONGITUDE: &str = "sim/flightmodel/position/longitude";
+/// True altitude MSL, METERS (× 3.28084 for feet) — for the VHF range check,
+/// which wants height above a station's field elevation, not the baro gauge.
+pub const ELEVATION_M: &str = "sim/flightmodel/position/elevation";
 /// Total fuel mass. X-Plane reports this in kilograms regardless of airframe.
 pub const FUEL_TOTAL_KG: &str = "sim/flightmodel/weight/m_fuel_total";
 /// Per-tank fuel mass (kg), one element per tank. For a 2-tank single it's
@@ -48,6 +53,24 @@ pub const ZULU_TIME_SEC: &str = "sim/time/zulu_time_sec";
 /// (118325 = 118.325 MHz); supports 8.33 kHz channel spacing.
 #[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)
 pub const COM1_FREQ_KHZ: &str = "sim/cockpit2/radios/actuators/com1_frequency_hz_833";
+/// Transponder code as squawked (e.g. 4521) — read by the radar watch to
+/// verify an assigned code is actually set (the write side stays in the
+/// transponder tool, per the tool-surface rule).
+pub const TRANSPONDER_CODE: &str = "sim/cockpit2/radios/actuators/transponder_code";
+/// Transponder mode: 0 off, 1 standby, 2 on, 3 alt. Replying means >= 2.
+pub const TRANSPONDER_MODE: &str = "sim/cockpit2/radios/actuators/transponder_mode";
+// --- TCAS targets (XP 11.50+ TCAS system; LiveTraffic/AI populate these) ---
+/// Absolute target positions, one element per target (slot 0 = own ship).
+pub const TCAS_LAT: &str = "sim/cockpit2/tcas/targets/position/lat";
+pub const TCAS_LON: &str = "sim/cockpit2/tcas/targets/position/lon";
+/// Target elevation, METERS MSL.
+pub const TCAS_ELE_M: &str = "sim/cockpit2/tcas/targets/position/ele";
+/// Weight on wheels per target (nonzero = on the ground).
+pub const TCAS_WOW: &str = "sim/cockpit2/tcas/targets/position/weight_on_wheels";
+/// Flight IDs, 8 NUL-padded bytes per target — read via `get_bytes` so slot
+/// alignment survives.
+pub const TCAS_FLIGHT_ID: &str = "sim/cockpit2/tcas/targets/flight_id";
+
 /// Audio panel: COM1 monitor selected (nonzero = COM1 is audible in the
 /// cockpit). The ATC broadcast respects this so it can be muted like a radio.
 #[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)

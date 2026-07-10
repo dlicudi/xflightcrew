@@ -1429,6 +1429,10 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
     // Gyro auto-sync cooldown (drift resets to ~0 on sync, so this only guards
     // against a sim-side write failing silently and re-triggering every tick).
     let mut gyro_sync_last: Option<Instant> = None;
+    // Party-line cadence, and whether an advisory is waiting on its "clear of
+    // traffic" closure.
+    let mut chatter_last: Option<Instant> = None;
+    let mut traffic_open = false;
     // Runway-incursion shout cadence: it repeats while the conflict persists
     // (a safety shout may nag), but not every tick.
     let mut incursion_last: Option<Instant> = None;
@@ -1662,6 +1666,202 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                     );
                     voice.alert_station(Priority::Advisory, crate::voice::StationSpeaker::Tower, line);
                 }
+                // Radar watch on an assigned squawk: "radar contact" once the
+                // sim shows the code replying, "confirm squawk" nudges while
+                // it doesn't. Transponder reads gated on an armed watch, so
+                // flights without a radar service cost nothing.
+                if crate::station::squawk_watch_active() {
+                    let code = xp
+                        .get_float(crate::datarefs::TRANSPONDER_CODE)
+                        .await
+                        .ok()
+                        .map(|v| v.round() as i64);
+                    let replying = xp
+                        .get_float(crate::datarefs::TRANSPONDER_MODE)
+                        .await
+                        .is_ok_and(|v| v >= 2.0);
+                    if let Some((line, who)) =
+                        crate::station::squawk_tick(code, replying, now)
+                    {
+                        if let Some(s) = status.as_ref() {
+                            s.action(&format!("{}: {line}", who.tag()));
+                        }
+                        crate::blackbox::record(
+                            "atc",
+                            serde_json::json!({
+                                "route": "squawk_watch", "code": code, "replying": replying,
+                                "reply": &line,
+                            }),
+                        );
+                        voice.alert_station(Priority::Advisory, who, line);
+                    }
+                }
+                // Compliance watch: the tower holds the pilot to the
+                // clearances it actually issued (uncleared runway entry,
+                // takeoff, landing), and challenges zone traffic it has
+                // never talked to. Tuned to the station the controller
+                // speaks; otherwise the copilot flags it as crew — a
+                // controller can't berate a radio that isn't listening.
+                {
+                    let tuned = com1.and_then(crate::station::tuned_controller).is_some();
+                    if let Some(call) = crate::station::compliance_tick(
+                        snap.lat,
+                        snap.lon,
+                        snap.alt_ft,
+                        snap.on_ground,
+                        snap.groundspeed_kts,
+                        tuned,
+                        now,
+                    ) {
+                        crate::blackbox::record(
+                            "atc",
+                            serde_json::json!({
+                                "route": "compliance", "crew": call.crew, "reply": &call.line,
+                            }),
+                        );
+                        if call.crew {
+                            if let Some(s) = status.as_ref() {
+                                s.alert(AlertLevel::Caution, &call.line);
+                            }
+                            voice.alert(Priority::Caution, call.line);
+                        } else {
+                            if let Some(s) = status.as_ref() {
+                                s.action(&format!("TWR: {}", call.line));
+                            }
+                            voice.alert_station(
+                                Priority::Warning,
+                                crate::voice::StationSpeaker::Tower,
+                                call.line,
+                            );
+                        }
+                    }
+                }
+                // Live-traffic watches off one TCAS target read: the
+                // go-around order (cancel the landing clearance a ghost on
+                // the runway is about to contradict), the held takeoff
+                // clearance release, and the party line (clearances narrated
+                // for the ghosts themselves — LiveTraffic replays real
+                // flights, so the tower "clears" what reality is about to do
+                // anyway). Reads gated: nothing armed and chatter off means
+                // no dataref traffic.
+                {
+                    let tuned_speaker = com1.and_then(crate::station::tuned_controller);
+                    let tower_tuned =
+                        matches!(tuned_speaker, Some(crate::voice::StationSpeaker::Tower));
+                    let cleared_to_land = crate::station::CLEARANCE
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .is_some_and(|c| c.state == crate::tower::State::ClearedToLand);
+                    let hold_armed = crate::station::TAKEOFF_HOLD
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some();
+                    let chatter_on = config.atc_chatter && tower_tuned;
+                    if let Some((_, flat, flon, felev)) = crate::station::active_field() {
+                        if chatter_on || hold_armed || cleared_to_land {
+                            let targets = crate::station::read_tcas_targets(&xp).await;
+                            // Safety outranks flavor: the go-around order first.
+                            if let Some(call) = crate::station::go_around_tick(
+                                &targets,
+                                snap.agl_ft,
+                                snap.on_ground,
+                                tuned_speaker.is_some(),
+                                now,
+                            ) {
+                                crate::blackbox::record(
+                                    "atc",
+                                    serde_json::json!({
+                                        "route": "go_around_order", "crew": call.crew,
+                                        "reply": &call.line,
+                                    }),
+                                );
+                                if call.crew {
+                                    if let Some(s) = status.as_ref() {
+                                        s.alert(AlertLevel::Warning, &call.line);
+                                    }
+                                    voice.alert(Priority::Warning, call.line);
+                                } else {
+                                    if let Some(s) = status.as_ref() {
+                                        s.action(&format!("TWR: {}", call.line));
+                                    }
+                                    voice.alert_station(
+                                        Priority::Warning,
+                                        crate::voice::StationSpeaker::Tower,
+                                        call.line,
+                                    );
+                                }
+                            } else if hold_armed {
+                                let runway_occupied = targets.iter().any(|t| {
+                                    t.on_ground
+                                        && crate::station::on_active_runway(t.lat, t.lon).is_some()
+                                });
+                                let final_traffic =
+                                    crate::station::inbound_traffic_close(&xp).await;
+                                if let Some(line) = crate::station::takeoff_hold_tick(
+                                    final_traffic,
+                                    runway_occupied,
+                                    now,
+                                ) {
+                                    crate::blackbox::record(
+                                        "atc",
+                                        serde_json::json!({
+                                            "route": "hold_release", "reply": &line,
+                                        }),
+                                    );
+                                    if let Some(s) = status.as_ref() {
+                                        s.action(&format!("TWR: {line}"));
+                                    }
+                                    voice.alert_station(
+                                        Priority::Advisory,
+                                        crate::voice::StationSpeaker::Tower,
+                                        line,
+                                    );
+                                }
+                            } else if chatter_on
+                                && chatter_last
+                                    .is_none_or(|t| now.duration_since(t).as_secs() >= 45)
+                            {
+                                let fname = crate::station::active_field()
+                                    .map(|(n, _, _, _)| n)
+                                    .unwrap_or_default();
+                                if let Some(exchange) = crate::station::chatter_tick(
+                                    &targets, &fname, flat, flon, felev, now,
+                                ) {
+                                    chatter_last = Some(now);
+                                    let transcript: Vec<&str> = exchange
+                                        .lines
+                                        .iter()
+                                        .map(|l| l.text.as_str())
+                                        .collect();
+                                    crate::blackbox::record(
+                                        "atc",
+                                        serde_json::json!({
+                                            "route": "party_line",
+                                            "reply": transcript.join(" / "),
+                                        }),
+                                    );
+                                    // Pilot and tower lines queue in order
+                                    // through the one arbiter — the exchange
+                                    // plays as a dialogue, two voices.
+                                    for l in exchange.lines {
+                                        let who = if l.ghost {
+                                            crate::voice::StationSpeaker::Ghost {
+                                                seed: exchange.ghost_seed,
+                                            }
+                                        } else {
+                                            crate::voice::StationSpeaker::Tower
+                                        };
+                                        if let Some(s) = status.as_ref() {
+                                            s.action(&format!("{}: {}", who.tag(), l.text));
+                                        }
+                                        voice.alert_station(Priority::Advisory, who, l.text);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // Region switch: airborne it's a controller handoff; on the
                 // ground (loaded the flight at a new field) it's the copilot
                 // noting the local tower. Either way the main loop rebuilds
@@ -1735,7 +1935,19 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                     let due = traffic_last
                         .is_none_or(|t| now.duration_since(t).as_secs() >= 45);
                     if due {
-                        if let Some(call) = crate::station::traffic_advisory(&xp).await {
+                        let advisory = crate::station::traffic_advisory(&xp).await;
+                        // Close the loop: the last factor is gone.
+                        if advisory.is_none() && traffic_open {
+                            traffic_open = false;
+                            traffic_last = Some(now);
+                            let line = "clear of traffic.".to_string();
+                            if let Some(s) = status.as_ref() {
+                                s.action(&format!("{}: {line}", speaker.tag()));
+                            }
+                            voice.alert_station(Priority::Advisory, speaker, line);
+                        }
+                        if let Some(call) = advisory {
+                            traffic_open = true;
                             traffic_last = Some(now);
                             // Address the flight when vectoring gave us the
                             // callsign; otherwise read the tail number.

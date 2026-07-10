@@ -10,9 +10,11 @@
 //   xcopilot/status/heard  (text: last transcript)
 //   xcopilot/status/action (text: last readback)
 //   xcopilot/status/radio  (text: comm plan + live COM1, '>' = tuned service)
+//   xcopilot/status/atc    (text: in-range stations, "NAME,nm,SVC khz,...|...")
 // rendered as a toolbar of status chips over tabs: Log (scrolling transmission
-// record), Route (the pushed flight plan + a Send-to-FMS re-push), and Settings
-// (live switches, e.g. the LLM-fallback dataref `xcopilot/llm_enabled`, -1 auto
+// record), Route (the pushed flight plan + a Send-to-FMS re-push), ATC (every
+// station in VHF range, click a frequency to tune COM1), and Settings (live
+// switches, e.g. the LLM-fallback dataref `xcopilot/llm_enabled`, -1 auto
 // / 0 off / 1 on, which the app polls each utterance).
 // Toggle via Plugins → x-copilot.
 //
@@ -147,6 +149,9 @@ static float g_callout_time = -1000.0f;
 // Radio row — the ATC field's comm plan plus live COM1, refreshed by the app
 // ("GIBRALTAR | >TWR 131.200 | APP 122.800"). '>' marks the tuned service.
 static TextRef g_radio = {{0}, 0};
+// ATC tab — every station in VHF range, nearest first, refreshed by the app
+// as "NAME,dist_nm,SVC khz,...|NAME,..." ('*' prefix = the active station).
+static TextRef g_atc = {{0}, 0};
 
 static XPLMDataRef g_phase_dref = nullptr;
 static XPLMDataRef g_heard_dref = nullptr;
@@ -156,6 +161,10 @@ static XPLMDataRef g_aircraft_dref = nullptr;
 static XPLMDataRef g_strip_dref = nullptr;
 static XPLMDataRef g_callout_dref = nullptr;
 static XPLMDataRef g_radio_dref = nullptr;
+static XPLMDataRef g_atc_dref = nullptr;
+// COM1 active frequency (integer kHz despite the sim's `hz` name) — read for
+// the ATC tab's tuned highlight, written by its click-to-tune.
+static XPLMDataRef g_com1_dref = nullptr;
 
 // Transmission log shown in the panel, each entry stamped with wall-clock time
 // so a test flight can be reviewed afterwards.
@@ -227,6 +236,8 @@ static void WriteAction(void*, void* in, int offset, int len) {
     // transcript names which controller spoke. Everything else is the crew.
     static const struct { const char* prefix; const char* tag; } kStations[] = {
         {"TWR: ", "TOWER"}, {"APP: ", "APP"}, {"DEP: ", "DEP"}, {"ATIS: ", "ATIS"},
+        // Party-line traffic: the ghost pilots' side of the frequency.
+        {"TFC: ", "TFC"},
     };
     for (const auto& s : kStations) {
         int n = static_cast<int>(std::strlen(s.prefix));
@@ -250,6 +261,49 @@ static void WriteStrip(void*, void* in, int offset, int len) {
 // Radio row — refreshed continuously like the strip, not logged.
 static void WriteRadio(void*, void* in, int offset, int len) {
     StoreText(&g_radio, in, offset, len);
+}
+
+// One in-range station for the ATC tab, parsed from the app's payload.
+struct AtcService { std::string label; int khz; };
+struct AtcField {
+    std::string name;
+    bool active;    // the station that answers radio calls ('*' prefix)
+    int dist_nm;
+    std::vector<AtcService> freqs;
+};
+static std::vector<AtcField> g_atc_fields;
+
+// Parse "NAME,dist,SVC khz,...|NAME,..." into fields — cheap enough to run on
+// every write; the ATC tab renders straight from this.
+static std::vector<AtcField> parse_atc() {
+    char buf[sizeof g_atc.buf];
+    std::memcpy(buf, g_atc.buf, sizeof buf);
+
+    std::vector<AtcField> fields;
+    char* save1 = nullptr;
+    for (char* tok = strtok_r(buf, "|", &save1); tok; tok = strtok_r(nullptr, "|", &save1)) {
+        char* save2 = nullptr;
+        char* name = strtok_r(tok, ",", &save2);
+        char* dist = strtok_r(nullptr, ",", &save2);
+        if (!name || !dist) continue;
+        AtcField f;
+        f.active = (name[0] == '*');
+        f.name = f.active ? name + 1 : name;
+        f.dist_nm = std::atoi(dist);
+        for (char* svc = strtok_r(nullptr, ",", &save2); svc; svc = strtok_r(nullptr, ",", &save2)) {
+            char* sp = std::strchr(svc, ' ');
+            if (!sp) continue;
+            *sp = '\0';
+            f.freqs.push_back({svc, std::atoi(sp + 1)});
+        }
+        fields.push_back(std::move(f));
+    }
+    return fields;
+}
+
+static void WriteAtc(void*, void* in, int offset, int len) {
+    StoreText(&g_atc, in, offset, len);
+    g_atc_fields = parse_atc();
 }
 // Callout — stamp the arrival time; the toast shows for a short window after.
 // An optional "nx,ny|" prefix (fractions of the half-screen from centre) aims
@@ -573,7 +627,7 @@ private:
     // panel can tuck out of the way without closing. Remembers the expanded size.
     static constexpr int kCollapsedH = 46;
     bool mCollapsed = false;
-    // Selected tab (0 = Log, 1 = Route, 2 = Settings) — content renders after
+    // Selected tab (0 = Log, 1 = Route, 2 = ATC, 3 = Settings) — content renders after
     // the shared context rows, so the tab bar itself sits at the very top.
     int mTab = 0;
     int mExpW = 420, mExpH = 300;
@@ -655,8 +709,12 @@ protected:
                 mTab = 1;
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Settings")) {
+            if (ImGui::BeginTabItem("ATC")) {
                 mTab = 2;
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Settings")) {
+                mTab = 3;
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -727,6 +785,7 @@ protected:
         switch (mTab) {
             case 0: buildLogTab(connected); break;
             case 1: buildRouteTab(); break;
+            case 2: buildAtcTab(connected); break;
             default: buildSettingsTab(); break;
         }
 
@@ -840,6 +899,64 @@ protected:
             }
             ImGui::EndTable();
         }
+    }
+
+    // Every station in VHF range, nearest first, pushed by the app. The tab is
+    // an instrument, not a listing: each frequency is a button — click to tune
+    // COM1 — and the tuned one is lit amber. The active station (the one that
+    // answers radio calls) is named in green.
+    void buildAtcTab(bool connected) {
+        if (!connected) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "Waiting for the app.");
+            return;
+        }
+        if (g_atc_fields.empty()) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "No stations in VHF range.");
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "Range grows with altitude.");
+            return;
+        }
+        int com1 = g_com1_dref ? XPLMGetDatai(g_com1_dref) : 0;
+        // Two reserved rows below the well: the tune hint and the bottom
+        // status bar (drawn by buildInterface after the tab content).
+        const float footer = ImGui::GetFrameHeightWithSpacing() * 2.0f
+            + ImGui::GetStyle().ItemSpacing.y;
+        if (ImGui::BeginChild("atc_well", ImVec2(0, -footer))) {
+            for (size_t i = 0; i < g_atc_fields.size(); ++i) {
+                const AtcField& f = g_atc_fields[i];
+                ImGui::PushID(static_cast<int>(i));
+                ImU32 nameCol = f.active ? COL_GREEN : COL_WHITE;
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(nameCol), "%s",
+                                   f.name.c_str());
+                ImGui::SameLine();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%d nm%s",
+                                   f.dist_nm, f.active ? "  (active)" : "");
+                for (size_t j = 0; j < f.freqs.size(); ++j) {
+                    const AtcService& s = f.freqs[j];
+                    bool tuned = std::abs(com1 - s.khz) <= 5;
+                    char label[32];
+                    std::snprintf(label, sizeof label, "%s %.3f", s.label.c_str(),
+                                  s.khz / 1000.0);
+                    if (j > 0) ImGui::SameLine();
+                    ImGui::PushID(static_cast<int>(j));
+                    ImU32 col = tuned ? COL_AMBER : COL_DIM;
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                                          ImGui::ColorConvertU32ToFloat4(col));
+                    if (ImGui::SmallButton(label) && g_com1_dref) {
+                        XPLMSetDatai(g_com1_dref, s.khz);
+                    }
+                    ImGui::PopStyleColor();
+                    ImGui::PopID();
+                }
+                if (i + 1 < g_atc_fields.size()) ImGui::Separator();
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndChild();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                           "Click a frequency to tune COM1.");
     }
 
     // Live runtime switches. Each checkbox drives a dataref the app polls live;
@@ -986,6 +1103,11 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         "xcopilot/status/radio", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteRadio, &g_radio, &g_radio);
+    g_atc_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/atc", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteAtc, &g_atc, &g_atc);
+    g_com1_dref = XPLMFindDataRef("sim/cockpit2/radios/actuators/com1_frequency_hz_833");
 
     // One shared font atlas for all ImgWindows (uses ImGui's default font).
     ImgWindow::sFontAtlas = std::make_shared<ImgFontAtlas>();
@@ -1016,6 +1138,7 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
 
 PLUGIN_API void XPluginStop(void) {
     if (g_toggle_cmd) { XPLMUnregisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr); g_toggle_cmd = nullptr; }
+    if (g_atc_dref) { XPLMUnregisterDataAccessor(g_atc_dref); g_atc_dref = nullptr; }
     if (g_radio_dref) { XPLMUnregisterDataAccessor(g_radio_dref); g_radio_dref = nullptr; }
     if (g_callout_dref) { XPLMUnregisterDataAccessor(g_callout_dref); g_callout_dref = nullptr; }
     g_panel.reset();

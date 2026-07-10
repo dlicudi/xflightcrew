@@ -95,6 +95,10 @@ pub enum StationSpeaker {
     Departure,
     /// The ATIS broadcast — the looped recording on its own frequency.
     Atis,
+    /// A GHOST pilot on the party line — live traffic given a voice. The
+    /// seed (hash of its callsign) picks a stable person from the pool, so
+    /// Speedbird 306 sounds like the same pilot on every call.
+    Ghost { seed: usize },
 }
 
 impl StationSpeaker {
@@ -104,6 +108,21 @@ impl StationSpeaker {
     /// controllers at one field are distinct people. An empty pool always
     /// falls back to the curated voices.
     fn model(self, config: &Config, seed: usize, local: Option<&str>) -> String {
+        // A ghost pilot's voice comes from ITS OWN seed (per callsign), not
+        // the airport's cast — pilots are from everywhere, and the same
+        // flight keeps the same voice across calls.
+        if let StationSpeaker::Ghost { seed: ghost } = self {
+            let pool: Vec<&str> = config
+                .atc_voice_pool
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .collect();
+            if !pool.is_empty() {
+                return pool[ghost % pool.len()].to_string();
+            }
+            return config.atc_piper_voice.clone();
+        }
         if seed != 0 {
             // The country's own accent mans the tower and reads the ATIS
             // (one recording voice per field is exactly how ATIS sounds);
@@ -128,6 +147,9 @@ impl StationSpeaker {
         }
         let fallback = config.atc_piper_voice.as_str();
         match self {
+            // Handled above (own-seed pool pick); reachable only with an
+            // empty pool, where everyone shares the curated station voice.
+            StationSpeaker::Ghost { .. } => fallback,
             StationSpeaker::Tower => fallback,
             StationSpeaker::Approach => {
                 let v = config.atc_approach_piper_voice.as_str();
@@ -150,6 +172,9 @@ impl StationSpeaker {
             StationSpeaker::Approach => 1,
             StationSpeaker::Departure => 2,
             StationSpeaker::Atis => 3,
+            // One warm slot for whichever ghost spoke last: the cache is
+            // keyed by model name, so a different ghost voice rebuilds it.
+            StationSpeaker::Ghost { .. } => 4,
         }
     }
 
@@ -162,6 +187,7 @@ impl StationSpeaker {
             StationSpeaker::Approach => "APP",
             StationSpeaker::Departure => "DEP",
             StationSpeaker::Atis => "ATIS",
+            StationSpeaker::Ghost { .. } => "TFC",
         }
     }
 }
@@ -595,11 +621,11 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
     let chime_path = resolve_chime(&config.chime_path);
     let negative_path = resolve_negative(&config.negative_tone_path);
     let station_cfg = config.clone();
-    // One lazy warm voice per controller position (tower/approach/departure):
-    // a position that never speaks never loads its model. The seed names the
-    // active airport's crew; when it changes (a region switch), the warm
-    // sessions drop and the next utterance builds the new field's voices.
-    let mut stations: [Option<StationVoice>; 4] = [None, None, None, None];
+    // One lazy warm voice per position (tower/approach/departure/ATIS, plus
+    // one slot for whichever GHOST pilot spoke last), keyed by model name so
+    // a cast change — or a different ghost — rebuilds only that slot. A
+    // position that never speaks never loads its model.
+    let mut stations: [Option<(String, StationVoice)>; 5] = [None, None, None, None, None];
     let mut stations_seed: usize = 0;
     let mut speaker = Speaker::build(config);
     loop {
@@ -664,7 +690,7 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             .station_seed
             .load(std::sync::atomic::Ordering::Relaxed);
         if utt.station.is_some() && seed != stations_seed {
-            stations = [None, None, None, None];
+            stations = [None, None, None, None, None];
             stations_seed = seed;
         }
         let local = utt.station.and_then(|_| {
@@ -674,16 +700,16 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
         });
+        let station_model = utt
+            .station
+            .map(|who| who.model(&station_cfg, seed, local.as_deref()));
         let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Some(who) = utt.station {
-                stations[who.slot()]
-                    .get_or_insert_with(|| {
-                        StationVoice::build(
-                            &station_cfg,
-                            &who.model(&station_cfg, seed, local.as_deref()),
-                        )
-                    })
-                    .speak(&utt.text)
+            if let (Some(who), Some(model)) = (utt.station, &station_model) {
+                let slot = &mut stations[who.slot()];
+                if slot.as_ref().map(|(m, _)| m.as_str()) != Some(model.as_str()) {
+                    *slot = Some((model.clone(), StationVoice::build(&station_cfg, model)));
+                }
+                slot.as_mut().expect("just built").1.speak(&utt.text)
             } else {
                 speaker.speak(&utt.text)
             }
@@ -694,14 +720,17 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
                 .map(|s| s.to_string())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "non-string panic".into());
-            if let Some(who) = utt.station {
+            if let (Some(who), Some(model)) = (utt.station, &station_model) {
                 tracing::error!("station voice panicked ({what}); demoting to `say` fallback");
-                stations[who.slot()] = Some(StationVoice::Say(Config {
-                    tts_backend: "say".into(),
-                    say_voice: station_cfg.atc_voice.clone(),
-                    say_rate: station_cfg.atc_rate.clone(),
-                    ..Config::default()
-                }));
+                stations[who.slot()] = Some((
+                    model.clone(),
+                    StationVoice::Say(Config {
+                        tts_backend: "say".into(),
+                        say_voice: station_cfg.atc_voice.clone(),
+                        say_rate: station_cfg.atc_rate.clone(),
+                        ..Config::default()
+                    }),
+                ));
             }
             Err(anyhow::anyhow!("TTS panicked: {what}"))
         });

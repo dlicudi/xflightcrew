@@ -59,6 +59,15 @@ pub enum Intent {
     RequestTaxiIn,
     /// "request vectors" — the tower redirects to the approach frequency.
     RequestVectors,
+    /// "good evening, Merida" / "hello tower" — an initial hail carrying no
+    /// request yet. A real controller invites the message ("pass your
+    /// message"); "say again" reads as a controller who wasn't listening.
+    Greeting,
+    /// "request flight following" — VFR radar advisories. Asked twice on
+    /// 2026-07-10, both stonewalled with "say again". A tower hands it to
+    /// approach when the field has one, or says honestly that it has no
+    /// radar; approach/departure grant it.
+    RequestFlightFollowing,
     Unknown,
 }
 
@@ -81,10 +90,28 @@ pub struct Ctx {
     /// Approach frequency, spoken ("one two two decimal eight") — for the
     /// vectors redirect. `None` = the field has no approach service.
     pub approach: Option<String>,
+    /// The squawk to state when asked: this flight's ASSIGNED discrete code
+    /// once a radar service has issued one, else the European VFR
+    /// conspicuity "seven zero zero zero". Spoken digits.
+    pub squawk: String,
+    /// Nearest live traffic on final (nm), off the TCAS picture, read when
+    /// the ctx was built. `Some` makes the tower sequence around it: takeoff
+    /// clearances hold, downwind joins go number two. `None` = final clear.
+    pub final_traffic_nm: Option<f64>,
     /// The aircraft is on the ground — shapes the mayday answer (a parked
     /// emergency gets the trucks, not a landing clearance; seen live
     /// 2026-07-09: mayday from the stand was "cleared to land").
     pub on_ground: bool,
+}
+
+/// Spoken position of traffic on final: "short final" inside 1.5 nm, else
+/// "N mile final".
+fn spoken_final(nm: f64) -> String {
+    if nm < 1.5 {
+        "short final".to_string()
+    } else {
+        format!("{:.0} mile final", nm.max(1.0))
+    }
 }
 
 /// The ", QNH ..." clause of a clearance — empty when the pilot has the
@@ -153,6 +180,13 @@ pub fn parse_intent(transcript: &str) -> Intent {
         && (word("what") || word("say") || t.contains("confirm") || word("my") || word("code"))
     {
         return Intent::SquawkCheck;
+    }
+    // "request flight following" — a service request, and one whisper mangles
+    // hard ("but a host tower requesting flight following" = Badajoz Tower,
+    // 2026-07-10). Above the question guard: "can I get flight following" is
+    // still the request.
+    if t.contains("flight following") || t.contains("flight follow") {
+        return Intent::RequestFlightFollowing;
     }
     // Questions are crew talk, not transmissions. "What runway shall I take
     // off from?" must reach the copilot (or get "say again" on a keyed radio),
@@ -249,6 +283,20 @@ pub fn parse_intent(transcript: &str) -> Intent {
     if t.contains("clearance") {
         return Intent::RequestClearance;
     }
+    // A bare hail — greeting words with no request. LAST, so any real request
+    // above already claimed the words ("good morning, request taxi" is the
+    // taxi). "Checking in" is the same speech act ("checking in, radio check"
+    // parses as the radio check first).
+    if word("hello")
+        || word("greetings")
+        || t.contains("good morning")
+        || t.contains("good evening")
+        || t.contains("good afternoon")
+        || t.contains("good day")
+        || t.contains("checking in")
+    {
+        return Intent::Greeting;
+    }
     Intent::Unknown
 }
 
@@ -273,6 +321,8 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "squawk_check" => Intent::SquawkCheck,
         "request_taxi_in" => Intent::RequestTaxiIn,
         "request_vectors" => Intent::RequestVectors,
+        "greeting" => Intent::Greeting,
+        "flight_following" => Intent::RequestFlightFollowing,
         "unknown" => Intent::Unknown,
         _ => return None,
     })
@@ -323,10 +373,11 @@ impl Tower {
             }
             Intent::RequestClearance => format!(
                 "{}, cleared to leave the {} zone, not above two thousand feet{}, \
-                 squawk seven zero zero zero.",
+                 squawk {}.",
                 ctx.callsign,
                 ctx.airport,
-                qnh_clause(ctx)
+                qnh_clause(ctx),
+                ctx.squawk
             ),
             // An arrival taxiing in — by request wording, or because the last
             // clearance was a landing one (a generic "request taxi" right
@@ -352,6 +403,17 @@ impl Tower {
                 )
             }
             Intent::RequestTakeoff => match self.state {
+                // Landing traffic owns the runway: a fresh clearance is
+                // withheld, and the state doesn't move — ask again when the
+                // final is clear (or after the arrival, as instructed).
+                State::TaxiCleared if ctx.final_traffic_nm.is_some() => {
+                    let on_final = spoken_final(ctx.final_traffic_nm.unwrap_or(0.0));
+                    format!(
+                        "{}, hold position, traffic on {on_final}. Expect clearance \
+                         after the landing traffic.",
+                        ctx.callsign
+                    )
+                }
                 State::TaxiCleared | State::TakeoffCleared => {
                     self.state = State::TakeoffCleared;
                     format!(
@@ -400,9 +462,18 @@ impl Tower {
             }
             // Pattern position reports: the tower sequences the circuit leg by
             // leg. All land in Inbound — "in the pattern, awaiting final".
+            // Live traffic on final makes the downwind join number two, off
+            // the same TCAS picture the advisories narrate.
             Intent::ReportDownwind => {
                 self.state = State::Inbound;
-                format!("{}, number one, report base.", ctx.callsign)
+                match ctx.final_traffic_nm {
+                    Some(nm) => format!(
+                        "{}, number two, follow the traffic on {}, report base.",
+                        ctx.callsign,
+                        spoken_final(nm)
+                    ),
+                    None => format!("{}, number one, report base.", ctx.callsign),
+                }
             }
             Intent::ReportBase => {
                 self.state = State::Inbound;
@@ -443,10 +514,11 @@ impl Tower {
             Intent::WindCheck => {
                 format!("{}, wind {}, QNH {}.", ctx.callsign, ctx.wind, ctx.qnh)
             }
-            // VFR conspicuity — the only code this tower ever assigns, so
-            // repeating it is always safe.
+            // Repeats the ASSIGNED code when a radar service issued one, the
+            // VFR conspicuity otherwise — a controller repeats YOUR code, not
+            // the default (always 7000 until 2026-07-10).
             Intent::SquawkCheck => {
-                format!("{}, squawk seven zero zero zero.", ctx.callsign)
+                format!("{}, squawk {}.", ctx.callsign, ctx.squawk)
             }
             Intent::RequestVectors => match &ctx.approach {
                 Some(freq) => format!(
@@ -460,6 +532,24 @@ impl Tower {
                         ctx.callsign, ctx.airport, ctx.runway
                     )
                 }
+            },
+            // An initial hail: invite the message. No state change — the
+            // request that follows does the driving.
+            Intent::Greeting => {
+                format!("{}, {} Tower, pass your message.", ctx.callsign, ctx.airport)
+            }
+            // Flight following is a radar service: approach's job when the
+            // field has one; a tower without a scope says so and keeps the
+            // aircraft on the VFR conspicuity code. No state change.
+            Intent::RequestFlightFollowing => match &ctx.approach {
+                Some(freq) => format!(
+                    "{}, for flight following contact {} Approach on {}.",
+                    ctx.callsign, ctx.airport, freq
+                ),
+                None => format!(
+                    "{}, no radar service at {}. Squawk {} and remain with me.",
+                    ctx.callsign, ctx.airport, ctx.squawk
+                ),
             },
             Intent::Unknown => {
                 format!("{}, {} Tower, say again.", ctx.callsign, ctx.airport)
@@ -495,6 +585,8 @@ mod tests {
             wind: "zero niner zero degrees, three knots".into(),
             holding_point: "Alpha".into(),
             approach: Some("one two two decimal eight".into()),
+            squawk: "seven zero zero zero".into(),
+            final_traffic_nm: None,
             on_ground: false,
         }
     }
@@ -515,7 +607,22 @@ mod tests {
             Intent::RequestClearance
         );
         assert_eq!(parse_intent("radio check"), Intent::RadioCheck);
-        assert_eq!(parse_intent("good morning"), Intent::Unknown);
+        // A bare hail is an initial call, answered "pass your message" —
+        // not "say again" (2026-07-10: "Good evening, Merida").
+        assert_eq!(parse_intent("good morning"), Intent::Greeting);
+        assert_eq!(parse_intent("good evening, merida"), Intent::Greeting);
+        assert_eq!(parse_intent("hello, banahos"), Intent::Greeting);
+        // Greeting words never outrank a real request in the same breath.
+        assert_eq!(parse_intent("good morning, request taxi"), Intent::RequestTaxi);
+        // Flight following, straight and through whisper's mangle.
+        assert_eq!(
+            parse_intent("request flight following"),
+            Intent::RequestFlightFollowing
+        );
+        assert_eq!(
+            parse_intent("but a host tower requesting flight following"),
+            Intent::RequestFlightFollowing
+        );
         // "taxi" inside a takeoff call must not read as a taxi request.
         assert_eq!(
             parse_intent("holding point taxi complete, ready for departure"),
@@ -654,6 +761,8 @@ mod tests {
             SquawkCheck,
             RequestTaxiIn,
             RequestVectors,
+            Greeting,
+            RequestFlightFollowing,
             Unknown,
         ];
         let c = ctx();
@@ -697,6 +806,9 @@ mod tests {
                 // deliberate edit to this test, not a surprise.
                 let want = match intent {
                     RadioCheck | WindCheck | SquawkCheck | Unknown | RequestClearance => start,
+                    // A hail and a flight-following request are answered
+                    // without touching the sequence.
+                    Greeting | RequestFlightFollowing => start,
                     // ctx() has an approach frequency, so vectors redirect
                     // without touching the sequence.
                     RequestVectors => start,
@@ -827,6 +939,35 @@ mod tests {
         let mut twr = Tower::new();
         let r = twr.handle(parse_intent("what about my transponder code?"), &ctx());
         assert!(r.contains("squawk seven zero zero zero"), "{r}");
+    }
+
+    #[test]
+    fn final_traffic_gates_takeoff_and_sequences_downwind() {
+        // Traffic on final: the takeoff clearance is withheld and the state
+        // doesn't move — live traffic owns the runway.
+        let mut busy = ctx();
+        busy.final_traffic_nm = Some(2.4);
+        let mut twr = Tower::new();
+        twr.state = State::TaxiCleared;
+        let r = twr.handle(Intent::RequestTakeoff, &busy);
+        assert!(r.contains("hold position"), "{r}");
+        assert!(r.contains("2 mile final"), "{r}");
+        assert_eq!(twr.state, State::TaxiCleared, "clearance withheld");
+        // Final clears on the next ask: the clearance comes.
+        let r = twr.handle(Intent::RequestTakeoff, &ctx());
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        assert_eq!(twr.state, State::TakeoffCleared);
+
+        // Downwind with traffic on short final: number two, follow it.
+        busy.final_traffic_nm = Some(0.9);
+        let mut twr = Tower::new();
+        twr.state = State::Inbound;
+        let r = twr.handle(Intent::ReportDownwind, &busy);
+        assert!(r.contains("number two"), "{r}");
+        assert!(r.contains("short final"), "{r}");
+        // Empty final: number one, as before.
+        let r = twr.handle(Intent::ReportDownwind, &ctx());
+        assert!(r.contains("number one"), "{r}");
     }
 
     #[test]
