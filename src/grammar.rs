@@ -585,15 +585,48 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     // no tool to answer it). Verbs first, so it beats the AP speed-bug rule
     // below on airframes that have this tool; the release phrasings first of
     // all, so "stop holding speed" doesn't re-arm.
+    // STOP — brakes to a halt and hold. The bare word only as the whole
+    // utterance ("stop", "stop stop stop"), so "stop holding speed" below
+    // keeps its meaning; "stop taxiing" means stop the AIRCRAFT, not drop
+    // the hold and coast (asked for live, 2026-07-11). "go around" never
+    // lands here: these are cockpit words, and around isn't in the set.
+    {
+        let words: Vec<&str> = t
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\''))
+            .filter(|w| !w.is_empty())
+            .collect();
+        let bare_stop =
+            !words.is_empty() && words.len() <= 3 && words.iter().all(|w| *w == "stop");
+        if bare_stop
+            || t.contains("stop here")
+            || t.contains("stop the aircraft")
+            || t.contains("stop taxi") // covers "stop taxiing" too
+            || t.contains("hold position")
+            || t.contains("hold short")
+            || t.contains("holding short")
+        {
+            return Some(call("hold_speed", json!({ "knots": 0 })));
+        }
+        // GO — resume the last held taxi speed after a stop. Bare "go" only
+        // as the whole utterance; the phrases must name the roll.
+        let bare_go = matches!(
+            words.as_slice(),
+            ["go"] | ["go", "go"] | ["go", "go", "go"] | ["lets", "go"] | ["let's", "go"]
+        );
+        if bare_go
+            || t.contains("continue taxi")
+            || t.contains("resume taxi")
+            || t.contains("keep going")
+            || t.contains("carry on")
+        {
+            return Some(call("hold_speed", json!({ "resume": true })));
+        }
+    }
     if t.contains("stop holding") || t.contains("my throttle") || t.contains("my power")
-        || t.contains("stop taxi") // covers "stop taxiing" too
         || (has(t, "release") && (has(t, "throttle") || has(t, "speed")))
     {
         return Some(call("hold_speed", json!({ "off": true })));
-    }
-    // "hold short" — a zero-knot taxi hold: idle plus brakes until released.
-    if t.contains("hold short") || t.contains("holding short") {
-        return Some(call("hold_speed", json!({ "knots": 0 })));
     }
     // "taxi at 10 knots" / "taxi 12 knots" — the taxi governor (the tool picks
     // taxi vs flight mode from being on the ground + the number). Requires the
@@ -1520,11 +1553,23 @@ mod tests {
         assert_eq!(one("mic throttle").unwrap().1, json!({"off":true}));
         assert_eq!(one("my throat").unwrap().1, json!({"off":true}));
         assert_eq!(one("my power").unwrap().1, json!({"off":true}));
-        assert_eq!(one("stop taxiing").unwrap().1, json!({"off":true}));
         // Taxi phrasings — the tool picks taxi mode from being on the ground.
         assert_eq!(one("taxi at 10 knots").unwrap(), ("hold_speed".into(), json!({"knots":10})));
         assert_eq!(one("taxi 12 knots").unwrap().1, json!({"knots":12}));
         assert_eq!(one("hold short").unwrap().1, json!({"knots":0}));
+        // STOP brakes to a halt and holds; "stop taxiing" means stop the
+        // AIRCRAFT, not drop the hold and coast (2026-07-11).
+        assert_eq!(one("stop taxiing").unwrap().1, json!({"knots":0}));
+        assert_eq!(one("Stop!").unwrap().1, json!({"knots":0}));
+        assert_eq!(one("stop stop stop").unwrap().1, json!({"knots":0}));
+        assert_eq!(one("hold position").unwrap().1, json!({"knots":0}));
+        assert_eq!(one("stop here").unwrap().1, json!({"knots":0}));
+        // GO resumes the remembered pace; bare only as the whole utterance,
+        // and "go around" is the tower's word, never a taxi resume.
+        assert_eq!(one("go").unwrap().1, json!({"resume":true}));
+        assert_eq!(one("let's go").unwrap().1, json!({"resume":true}));
+        assert_eq!(one("continue taxi").unwrap().1, json!({"resume":true}));
+        assert!(one("go around").is_none_or(|(tool, _)| tool != "hold_speed"));
         // "taxi light on" must still be the lights, not a taxi hold.
         assert_eq!(one("taxi light on").unwrap().0, "set_lights");
         // ...but altitude/heading holds stay with the autopilot rules.

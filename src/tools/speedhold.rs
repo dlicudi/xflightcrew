@@ -50,6 +50,9 @@ pub fn taxi_hold_active() -> bool {
 }
 /// Target knots — updated live by a new `hold_speed` call, no restart.
 static TARGET_KTS: Mutex<f64> = Mutex::new(0.0);
+/// The last rolling taxi target, so "go" after a "stop" resumes the same
+/// pace. 0.0 = never taxied this session.
+static LAST_TAXI_KTS: Mutex<f64> = Mutex::new(0.0);
 
 /// Which speed the governor chases. Flight = indicated airspeed with throttle
 /// only; Taxi = groundspeed with throttle *and brakes* (idle thrust still
@@ -155,6 +158,9 @@ struct Args {
     /// true = release the throttle back to the pilot.
     #[serde(default)]
     off: bool,
+    /// true = "go": resume the last rolling taxi speed after a stop.
+    #[serde(default)]
+    resume: bool,
 }
 
 #[async_trait]
@@ -167,8 +173,10 @@ impl Tool for HoldSpeed {
         "Hold a target speed by managing the throttle. Airborne: airspeed hold \
          ('hold 70 knots', 'maintain approach speed') — power only, the pilot \
          flies pitch. On the ground: taxi speed hold with throttle AND brakes \
-         ('taxi at 10 knots', 'hold short' = stop) — the pilot steers. Release \
-         with 'stop holding speed' or 'my throttle'."
+         ('taxi at 10 knots'; 'stop' / 'hold short' / 'hold position' = knots 0, \
+         brake to a halt and hold; 'go' / 'continue taxi' = resume the last taxi \
+         speed) — the pilot steers. Release with 'stop holding speed' or 'my \
+         throttle'."
     }
 
     fn parameters(&self) -> Value {
@@ -177,13 +185,14 @@ impl Tool for HoldSpeed {
             "properties": {
                 "knots": {"type": "number", "description": "target IAS, knots; absent = hold current speed"},
                 "preset": {"type": "string", "enum": ["approach"], "description": "named target: the profile's final-approach speed"},
-                "off": {"type": "boolean", "description": "true = release the throttle"}
+                "off": {"type": "boolean", "description": "true = release the throttle"},
+                "resume": {"type": "boolean", "description": "true = resume the last taxi speed after a stop ('go')"}
             }
         })
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
-        let a: Args = serde_json::from_value(args.clone())?;
+        let mut a: Args = serde_json::from_value(args.clone())?;
         if a.off {
             return Ok(if ACTIVE.swap(false, Ordering::Relaxed) {
                 "Speed hold off — your throttle.".to_string()
@@ -192,6 +201,22 @@ impl Tool for HoldSpeed {
             });
         }
         let on_ground = ctx.xplane.get_float(ON_GROUND).await.unwrap_or(0.0) > 0.5;
+        // "Go" — resume the pace we were taxiing at before the stop.
+        if a.resume {
+            if !on_ground {
+                return Ok("We're airborne — nothing to resume down there.".to_string());
+            }
+            let last = *LAST_TAXI_KTS.lock().unwrap_or_else(|e| e.into_inner());
+            if last < 1.0 {
+                return Ok("We weren't taxiing — say a speed, like taxi at ten knots.".to_string());
+            }
+            a.knots = Some(last);
+        }
+        // A spoken "stop" in the air is a mishear or a panic; either way the
+        // flight hold's 55-knot floor must not be the answer to it.
+        if !on_ground && a.knots.is_some_and(|k| k < 1.0) {
+            return Ok("We're airborne — I can't stop the aircraft. Say a speed to hold.".to_string());
+        }
         // Mode by context: a small number on the ground is a taxi; airborne (or
         // a big number) is a flight hold. A big number on the ground is neither.
         let taxi = on_ground && a.knots.map_or(a.preset.is_none(), |k| k <= TAXI_MAX_KTS);
@@ -241,6 +266,9 @@ impl Tool for HoldSpeed {
             // "Maintain this speed" — hold whatever we're doing right now.
             clamp_target(ctx.xplane.get_float(IAS).await?)
         };
+        if taxi && target >= 1.0 {
+            *LAST_TAXI_KTS.lock().unwrap_or_else(|e| e.into_inner()) = target;
+        }
         *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner()) = target;
         *MODE.lock().unwrap_or_else(|e| e.into_inner()) =
             if taxi { Mode::Taxi } else { Mode::Flight };
@@ -263,7 +291,9 @@ impl Tool for HoldSpeed {
         Ok(if taxi {
             let brake_note = if brake_released { "Parking brake off. " } else { "" };
             if target < 1.0 {
-                "Holding short — brakes on. Say taxi at ten knots to roll again.".to_string()
+                "Stopping — brakes on. Say go to roll again.".to_string()
+            } else if a.resume {
+                format!("{brake_note}Rolling — back to {target:.0} knots.")
             } else {
                 format!(
                     "{brake_note}Taxiing at {target:.0} knots — I have throttle and brakes, you steer. Say my throttle to take it back."
