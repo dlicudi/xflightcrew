@@ -78,6 +78,8 @@ pub fn normalize(transcript: &str) -> String {
         ("electric systems zones", "electrics on"),
         ("electric zones", "electrics on"),
         ("electric zone", "electrics on"),
+        // ...and the same glue heard as a word: "Electric song?" (live 2026-07-11).
+        ("electric song", "electrics on"),
         // "pitot" defeats whisper: all of these observed live for "pitot heat"
         // (apostrophes are already stripped, so "Pito's" arrives as "pitos").
         // Nobody says "pilot heat" or "it was heat" meaning anything else.
@@ -1574,6 +1576,8 @@ mod tests {
         assert_eq!(one("electric zones").unwrap(), elec);
         assert_eq!(one("electric zone").unwrap(), elec);
         assert_eq!(one("electric system zones").unwrap(), elec);
+        // "Electric song?" — the same "s on" glue heard as a word (live 2026-07-11).
+        assert_eq!(one("Electric song?").unwrap(), elec);
         // "power up" has no on/off token but must still resolve deterministically
         // (the main loop remaps set_electrical:all → power_up on auto_prep airframes).
         assert_eq!(one("power up").unwrap(), ("set_electrical".into(), json!({"system":"all","on":true})));

@@ -24,7 +24,7 @@ const CMD_VALVE_TOGGLE: &str = "sim/flight_controls/park_brake_valve_toggle";
 /// The parking-brake toggle command — preferred over a raw dataref write:
 /// custom airframes intercept commands, while a written ratio can be ignored or
 /// overwritten by their systems scripts (the MD-82 pitot-heat lesson).
-const CMD_PARK_TOGGLE: &str = "sim/flight_controls/brakes_toggle_max";
+pub(crate) const CMD_PARK_TOGGLE: &str = "sim/flight_controls/brakes_toggle_max";
 
 pub struct SetParkingBrake {
     /// The valve value meaning SET on this airframe; `None` = leave the valve alone.
@@ -63,6 +63,11 @@ impl Tool for SetParkingBrake {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: Args = serde_json::from_value(args.clone())?;
+        // Setting the brake while the copilot is taxiing = the pilot is
+        // stopping: the governor sees the brake within a tick and closes the
+        // throttle itself — read the flag BEFORE the write so the readback
+        // can say so (the governor may already be standing down after it).
+        let taxi_hold = args.on && super::speedhold::taxi_hold_active();
         // Where the profile declares the valve's SET value, the valve must agree
         // with the request — on airframes that pin the ratio from it (C90B) a
         // release can't stick otherwise, and the handle animates from it either
@@ -111,7 +116,11 @@ impl Tool for SetParkingBrake {
                 if set { "set" } else { "released" }
             ));
         }
-        Ok(format!("Roger, parking brake {}.", if set { "set" } else { "released" }))
+        Ok(format!(
+            "Roger, parking brake {}.{}",
+            if set { "set" } else { "released" },
+            if set && taxi_hold { " Throttle's coming to idle — taxi hold released." } else { "" }
+        ))
     }
 }
 

@@ -34,6 +34,14 @@ const MS_TO_KTS: f64 = 1.943_844;
 /// True while the governor loop runs. Public so other control loops could
 /// check it, mirroring `recover::ACTIVE` / `autoland::ACTIVE`.
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// True while the governor is actively TAXIING (not a flight hold) — the
+/// parking-brake tool uses this to tell the pilot the throttle is coming to
+/// idle with the brake.
+pub fn taxi_hold_active() -> bool {
+    ACTIVE.load(Ordering::Relaxed)
+        && *MODE.lock().unwrap_or_else(|e| e.into_inner()) == Mode::Taxi
+}
 /// Target knots — updated live by a new `hold_speed` call, no restart.
 static TARGET_KTS: Mutex<f64> = Mutex::new(0.0);
 
@@ -177,8 +185,30 @@ impl Tool for HoldSpeed {
         if on_ground && !taxi {
             return Ok("We're on the ground — say a taxi speed like 'taxi at 10 knots', or ask again airborne.".to_string());
         }
+        // A commanded taxi carries the intent to ROLL: release the parking
+        // brake ourselves and say so — "release it first" sent the pilot to
+        // do the copilot's job. Command-first like the parking-brake tool;
+        // airframes that pin the ratio from a set valve (C90B) won't release
+        // from here, and then the pilot keeps the handle. A stop target with
+        // the brake set needs no governor at all.
+        let mut brake_released = false;
         if taxi && ctx.xplane.get_float(PARK_BRAKE).await.unwrap_or(0.0) > 0.5 {
-            return Ok("Parking brake's set — release it first.".to_string());
+            if a.knots.is_some_and(|k| k < 1.0) {
+                return Ok("Parking brake's set — we're staying put.".to_string());
+            }
+            let _ = ctx.xplane.run_command(super::controls::CMD_PARK_TOGGLE).await;
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            brake_released = ctx.xplane.get_float(PARK_BRAKE).await.unwrap_or(1.0) < 0.5;
+            if !brake_released {
+                let _ = ctx.xplane.set_float(PARK_BRAKE, 0.0).await;
+                brake_released = ctx.xplane.get_float(PARK_BRAKE).await.unwrap_or(1.0) < 0.5;
+            }
+            if !brake_released {
+                return Ok(
+                    "Parking brake's set and it won't release from here — check the handle."
+                        .to_string(),
+                );
+            }
         }
         let target = if taxi {
             match a.knots {
@@ -221,11 +251,12 @@ impl Tool for HoldSpeed {
             });
         }
         Ok(if taxi {
+            let brake_note = if brake_released { "Parking brake off. " } else { "" };
             if target < 1.0 {
                 "Holding short — brakes on. Say taxi at ten knots to roll again.".to_string()
             } else {
                 format!(
-                    "Taxiing at {target:.0} knots — I have throttle and brakes, you steer. Say my throttle to take it back."
+                    "{brake_note}Taxiing at {target:.0} knots — I have throttle and brakes, you steer. Say my throttle to take it back."
                 )
             }
         } else {
@@ -330,6 +361,17 @@ async fn governor(xp: XPlaneClient) {
                 // Airborne means the taxi is over — release everything, done.
                 if !on_ground {
                     tracing::info!("speed governor: airborne, taxi hold released");
+                    ACTIVE.store(false, Ordering::Relaxed);
+                    break;
+                }
+                // Parking brake set mid-roll is the pilot STOPPING: close the
+                // throttle and hand the aircraft back — never chase the
+                // target against the brake at taxi power.
+                if xp.get_float(PARK_BRAKE).await.unwrap_or(0.0) > 0.5 {
+                    tracing::info!(
+                        "speed governor: parking brake set, closing throttle, standing down"
+                    );
+                    glide(&xp, THROTTLE, 0.0, 400).await;
                     ACTIVE.store(false, Ordering::Relaxed);
                     break;
                 }
