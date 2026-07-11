@@ -31,6 +31,36 @@ pub struct SetParkingBrake {
     pub valve_set: Option<f64>,
 }
 
+/// Drive the parking brake to `on`, valve-aware — THE one way any tool moves
+/// it. Valve first (per the airframe's SET sense), then the brake, command
+/// before raw write, verified by readback. The taxi hold's auto-release once
+/// skipped the valve and told an SR22 pilot "parking brake off" while the
+/// valve held the wheels (2026-07-11). Returns whether the brake now agrees.
+pub(crate) async fn drive_park_brake(
+    xp: &dyn crate::xplane::XPlane,
+    on: bool,
+    valve_set: Option<f64>,
+) -> Result<bool> {
+    if let Some(want) = valve_set.map(|set| if on { set } else { 1.0 - set }) {
+        if let Ok(now) = xp.get_float(PARK_BRAKE_VALVE).await {
+            if (now - want).abs() > 0.5 {
+                xp.run_command(CMD_VALVE_TOGGLE).await?;
+            }
+        }
+    }
+    if (xp.get_float(PARK_BRAKE).await? > 0.5) != on {
+        xp.run_command(CMD_PARK_TOGGLE).await?;
+    }
+    // Commands apply on the next sim frame — give it a beat.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let mut set = xp.get_float(PARK_BRAKE).await? > 0.5;
+    if set != on {
+        xp.set_float(PARK_BRAKE, if on { 1.0 } else { 0.0 }).await?;
+        set = xp.get_float(PARK_BRAKE).await? > 0.5;
+    }
+    Ok(set == on)
+}
+
 #[derive(Deserialize)]
 struct Args {
     /// true = set the parking brake, false = release it.
@@ -92,34 +122,16 @@ impl Tool for SetParkingBrake {
             ));
         }
 
-        // Valve first (to the airframe's SET/RELEASED sense), then the brake —
-        // command-first, verified by readback, with the raw dataref write kept
-        // only as a fallback for models that ignore the toggle.
-        if let (Some(want), Some(now)) = (desired_valve, valve_now) {
-            if (now - want).abs() > 0.5 {
-                ctx.xplane.run_command(CMD_VALVE_TOGGLE).await?;
-            }
-        }
-        if already != args.on {
-            ctx.xplane.run_command(CMD_PARK_TOGGLE).await?;
-        }
-        // The command applies on the next sim frame — give it a beat.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let mut set = ctx.xplane.get_float(PARK_BRAKE).await? > 0.5;
-        if set != args.on {
-            ctx.xplane.set_float(PARK_BRAKE, if args.on { 1.0 } else { 0.0 }).await?;
-            set = ctx.xplane.get_float(PARK_BRAKE).await? > 0.5;
-        }
-        if set != args.on {
+        if !drive_park_brake(ctx.xplane, args.on, self.valve_set).await? {
             return Ok(format!(
                 "Tried, but the parking brake still reads {}. Check the handle.",
-                if set { "set" } else { "released" }
+                if args.on { "released" } else { "set" }
             ));
         }
         Ok(format!(
             "Roger, parking brake {}.{}",
-            if set { "set" } else { "released" },
-            if set && taxi_hold { " Throttle's coming to idle — taxi hold released." } else { "" }
+            if args.on { "set" } else { "released" },
+            if args.on && taxi_hold { " Throttle's coming to idle — taxi hold released." } else { "" }
         ))
     }
 }

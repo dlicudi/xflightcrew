@@ -197,7 +197,10 @@ impl Registry {
         // and no autothrottle; the MD-82 crowd sets the AP speed bug instead.
         if (profile.engine || profile.throttle) && !profile.autothrottle {
             let approach = profile.reference.as_ref().and_then(|r| r.approach_kts);
-            tools.push(Box::new(speedhold::HoldSpeed { approach_kts: approach }));
+            tools.push(Box::new(speedhold::HoldSpeed {
+                approach_kts: approach,
+                park_brake_valve_set: profile.park_brake_valve_set,
+            }));
         }
 
         // Airliner autoflight extras: AP speed select + autothrottle.

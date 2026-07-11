@@ -129,6 +129,8 @@ pub fn taxi_control(target_kts: f64, gs_kts: f64, throttle: f64) -> (Option<f64>
 pub struct HoldSpeed {
     /// The profile's final-approach speed, for "hold approach speed".
     pub approach_kts: Option<f64>,
+    /// The airframe's park-brake valve SET sense, for the taxi auto-release.
+    pub park_brake_valve_set: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -187,22 +189,19 @@ impl Tool for HoldSpeed {
         }
         // A commanded taxi carries the intent to ROLL: release the parking
         // brake ourselves and say so — "release it first" sent the pilot to
-        // do the copilot's job. Command-first like the parking-brake tool;
-        // airframes that pin the ratio from a set valve (C90B) won't release
-        // from here, and then the pilot keeps the handle. A stop target with
-        // the brake set needs no governor at all.
+        // do the copilot's job. Through the ONE valve-aware routine the
+        // parking-brake tool uses: the ratio-only shortcut said "parking
+        // brake off" on the SR22 while the valve held the wheels
+        // (2026-07-11). A stop target with the brake set needs no governor.
         let mut brake_released = false;
         if taxi && ctx.xplane.get_float(PARK_BRAKE).await.unwrap_or(0.0) > 0.5 {
             if a.knots.is_some_and(|k| k < 1.0) {
                 return Ok("Parking brake's set — we're staying put.".to_string());
             }
-            let _ = ctx.xplane.run_command(super::controls::CMD_PARK_TOGGLE).await;
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            brake_released = ctx.xplane.get_float(PARK_BRAKE).await.unwrap_or(1.0) < 0.5;
-            if !brake_released {
-                let _ = ctx.xplane.set_float(PARK_BRAKE, 0.0).await;
-                brake_released = ctx.xplane.get_float(PARK_BRAKE).await.unwrap_or(1.0) < 0.5;
-            }
+            brake_released =
+                super::controls::drive_park_brake(ctx.xplane, false, self.park_brake_valve_set)
+                    .await
+                    .unwrap_or(false);
             if !brake_released {
                 return Ok(
                     "Parking brake's set and it won't release from here — check the handle."
