@@ -37,6 +37,7 @@ mod simbrief;
 mod station;
 mod stt;
 mod stt_eval;
+mod taxi_guide;
 mod tower;
 mod tts;
 #[cfg(feature = "onnx-tts")]
@@ -803,13 +804,21 @@ async fn run_session(
     let home_airport_name = atc_station.as_ref().map(|s| s.airport_name().to_string());
     if let Some(st) = &mut atc_station {
         st.set_enforce_readback(config.atc_readback);
+        let home_icao = config.atc_airport.trim().to_uppercase();
+        // Phraseology follows geography, like the voices: CAP 413 grammar in
+        // the UK, FAA grammar at a K/P/C field.
+        st.set_dialect(station::dialect_for(&home_icao));
         st.install();
         voice.set_station_cast(0, None);
         // Taxi network for named taxi routes — a second apt.dat scan, so a
         // background thread; clearances are route-less until it lands.
-        station::spawn_taxi_net_load(
-            config.apt_data_path.clone(),
-            config.atc_airport.trim().to_uppercase(),
+        station::spawn_taxi_net_load(config.apt_data_path.clone(), home_icao.clone());
+        // ILS + real approach platforms (earth_nav.dat + CIFP scans, also
+        // backgrounded): vectors offer the ILS once this lands.
+        station::spawn_ils_load(
+            config.nav_data_path.clone(),
+            config.cifp_dir.clone(),
+            home_icao,
         );
     }
     // Enroute region: index every towered field (a full apt.dat pass, so a
@@ -870,7 +879,9 @@ async fn run_session(
                         // Key down: kill whatever is playing AND hold the
                         // whole queue — copilot, controllers, ghosts. Nobody
                         // talks over the pilot's transmission (the party
-                        // line yakked through PTT, 2026-07-10).
+                        // line yakked through PTT, 2026-07-10). A station
+                        // transmission isn't erased, though: it's STEPPED ON
+                        // (half-duplex radio) and keeps running silently.
                         if wv.is_speaking() {
                             wv.shutup();
                             wi.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -878,7 +889,10 @@ async fn run_session(
                         wv.set_hold(true);
                     }
                     if !pressed && was_pressed {
-                        wv.set_hold(false); // release: the backlog may speak
+                        // Release: the stepped-on transmission's remainder (if
+                        // real time hasn't outrun it) plays from mid-word, like
+                        // rejoining a real frequency, then the held backlog.
+                        wv.set_hold(false);
                     }
                     was_pressed = pressed;
                     std::thread::sleep(Duration::from_millis(30));
@@ -960,9 +974,16 @@ async fn run_session(
                 Some(mut st) => {
                     reporter.log(ui::LogKind::Info, format!("ATC region: now working {name}"));
                     st.set_enforce_readback(config.atc_readback);
+                    st.set_dialect(station::dialect_for(&icao));
                     st.install();
                     // The new field's taxi network, in the background.
                     station::spawn_taxi_net_load(config.apt_data_path.clone(), icao.clone());
+                    // And its ILS chart data, same deal.
+                    station::spawn_ils_load(
+                        config.nav_data_path.clone(),
+                        config.cifp_dir.clone(),
+                        icao.clone(),
+                    );
                     // A new field, a new crew: per-airport voices from the
                     // pool, with the country's own accent (by ICAO prefix)
                     // manning the tower and the ATIS — unless we're back
@@ -1256,6 +1277,40 @@ async fn run_session(
                 let _ = ensure_plan(&config, &mut fp_cache, false).await;
             }
             let line = fuel_report(&xplane, &profile, Some(&live), is_endurance_query(&command)).await;
+            say(&voice, &reporter, ui::LogKind::Readback, &line);
+            continue;
+        }
+        // Ground navigation questions ("which way?", "say the taxi route")
+        // answered deterministically off the published taxi route — the FO
+        // reading the airport diagram, never the LLM. Position reads happen
+        // BEFORE the route lock: no guard held across an await.
+        if is_taxi_query(&command)
+            && grammar::try_parse(&command, &registry, &profile).is_none()
+        {
+            let pos = match (
+                xplane.get_float(datarefs::LATITUDE).await,
+                xplane.get_float(datarefs::LONGITUDE).await,
+            ) {
+                (Ok(lat), Ok(lon)) => Some((lat, lon)),
+                _ => None,
+            };
+            let line = {
+                let route = station::TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+                match (route.as_ref(), pos) {
+                    (Some(w), Some((lat, lon))) => taxi_guide::describe(w, lat, lon),
+                    (Some(w), None) if !w.via.is_empty() => {
+                        format!("The cleared route is via {}.", w.via)
+                    }
+                    (Some(_), None) => {
+                        "We have a taxi clearance, but I can't read our position right now."
+                            .to_string()
+                    }
+                    (None, _) => {
+                        "We don't have a taxi clearance yet. Call the tower and request taxi."
+                            .to_string()
+                    }
+                }
+            };
             say(&voice, &reporter, ui::LogKind::Readback, &line);
             continue;
         }
@@ -3649,6 +3704,27 @@ fn is_fuel_query(text: &str) -> bool {
                 || t.contains("feed")));
     // "fuel flow" is an engine-instrument read, answered in answer_state_query.
     asks && !command && !t.contains("flow")
+}
+
+/// True if the utterance is asking for taxi directions — the on-demand side
+/// of the taxi guide ("which way?", "say the taxi route", "where's the
+/// holding point"). Deliberately question-shaped: a taxi READBACK ("taxi to
+/// holding point Alpha via Whiskey...") contains the same nouns but none of
+/// the question markers, and must fall through to the radio path untouched.
+fn is_taxi_query(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    let way = t.contains("which way")
+        || t.contains("where do i go")
+        || t.contains("where do we go")
+        || t.contains("where are we going")
+        || t.contains("where to now")
+        || t.contains("which taxiway");
+    let hp = t.contains("holding point")
+        && (t.contains("where") || t.contains("which") || t.contains("how far"));
+    let route = (t.contains("taxi") || t.contains(" route"))
+        && (t.contains("what") || t.contains("which") || t.contains("where")
+            || t.contains("say") || t.contains("repeat") || t.contains("remind"));
+    way || hp || route
 }
 
 /// True when the fuel question is about *time* remaining ("how long will the fuel

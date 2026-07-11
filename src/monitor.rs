@@ -1439,6 +1439,9 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
     // Runway-incursion shout cadence: it repeats while the conflict persists
     // (a safety shout may nag), but not every tick.
     let mut incursion_last: Option<Instant> = None;
+    // The copilot's progressive taxi guide, rebuilt per published clearance
+    // route: the pilot monitoring with the airport diagram out.
+    let mut taxi_guide: Option<crate::taxi_guide::Guide> = None;
 
     loop {
         // Aircraft switched → rebuild the checks for the new airframe.
@@ -1765,6 +1768,52 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                                 call.line,
                             );
                         }
+                    }
+                }
+                // The copilot's progressive taxi guide — the crew half of
+                // the taxi clearance. The tower said the route once; the
+                // pilot monitoring calls the turns just-in-time ("next
+                // left, onto Whiskey"), the runway crossings, and the
+                // holding point, in the copilot's own voice at Advisory.
+                // Off-route it goes quiet: the compliance watch above owns
+                // that conversation, and two voices saying it would nag.
+                if config.taxi_guide && snap.on_ground {
+                    let taxiing = crate::station::CLEARANCE
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .is_some_and(|c| c.state == crate::tower::State::TaxiCleared);
+                    if taxiing {
+                        {
+                            let route = crate::station::TAXI_ROUTE
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            match route.as_ref() {
+                                Some(watch)
+                                    if !taxi_guide
+                                        .as_ref()
+                                        .is_some_and(|g| g.is_for(&watch.path)) =>
+                                {
+                                    taxi_guide = crate::taxi_guide::Guide::build(watch);
+                                }
+                                Some(_) => {}
+                                None => taxi_guide = None,
+                            }
+                        }
+                        if let Some(cue) = taxi_guide.as_mut().and_then(|g| {
+                            g.tick(snap.lat, snap.lon, snap.groundspeed_kts, now)
+                        }) {
+                            if let Some(s) = status.as_ref() {
+                                s.action(&format!("Taxi guide: {cue}"));
+                            }
+                            crate::blackbox::record(
+                                "taxi_guide",
+                                serde_json::json!({ "cue": &cue }),
+                            );
+                            voice.alert(Priority::Advisory, cue);
+                        }
+                    } else {
+                        taxi_guide = None;
                     }
                 }
                 // Live-traffic watches off one TCAS target read: the

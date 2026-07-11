@@ -98,6 +98,9 @@ pub struct Config {
     pub piper_voice: String,
     /// Path to X-Plane's `earth_nav.dat` (for ILS lookup).
     pub nav_data_path: String,
+    /// Directory of per-airport CIFP procedure files (`<ICAO>.dat`, ARINC
+    /// 424) — real approach platform altitudes. `XPLANE_CIFP_DIR`.
+    pub cifp_dir: String,
     /// Path to X-Plane's Global Airports `apt.dat` (for runway lookup — which
     /// runways a field actually has, so runway advice is never invented).
     pub apt_data_path: String,
@@ -146,6 +149,12 @@ pub struct Config {
     /// `XCOPILOT_ATC_READBACK=false` keeps the coach suggestions but drops
     /// the challenges.
     pub atc_readback: bool,
+    /// The copilot's progressive taxi guide: just-in-time turn/crossing/
+    /// holding-point callouts along the cleared taxi route (the crew half of
+    /// the clearance the tower spoke). On by default;
+    /// `XCOPILOT_TAXI_GUIDE=false` for pilots who want the diagram to
+    /// themselves.
+    pub taxi_guide: bool,
     /// Radio (transmit) push-to-talk dataref, set by the bundled plugin's
     /// `xcopilot/radio_ptt` command — the transmit switch, as distinct from the
     /// intercom PTT above. An utterance captured while THIS is held goes to
@@ -232,6 +241,19 @@ impl Config {
                 };
                 env_or("XPLANE_NAV_DATA", fallback)
             },
+            // Real approach procedures (ARINC 424 legs, one file per airport).
+            // Same Custom-Data-first rule as the nav data: a Navigraph cycle
+            // outranks the stock one. Feeds the approach controller's ILS
+            // platform altitudes; missing dir just means geometric fallbacks.
+            cifp_dir: {
+                let custom = "/Users/duanelicudi/X-Plane 12/Custom Data/CIFP";
+                let fallback = if std::path::Path::new(custom).exists() {
+                    custom
+                } else {
+                    "/Users/duanelicudi/X-Plane 12/Resources/default data/CIFP"
+                };
+                env_or("XPLANE_CIFP_DIR", fallback)
+            },
             apt_data_path: env_or(
                 "XPLANE_APT_DATA",
                 "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat",
@@ -247,6 +269,7 @@ impl Config {
             atc_chatter: env_or("XCOPILOT_ATC_CHATTER", "true") != "false",
             mute_xp_radio: env_or("XCOPILOT_MUTE_XP_RADIO", "true") != "false",
             atc_readback: env_or("XCOPILOT_ATC_READBACK", "true") != "false",
+            taxi_guide: env_or("XCOPILOT_TAXI_GUIDE", "true") != "false",
             radio_ptt_dataref: env_or("XCOPILOT_RADIO_PTT_DATAREF", "xcopilot/radio_ptt_active"),
             atc_piper_voice: env_or("XCOPILOT_ATC_PIPER_VOICE", "models/en_GB-alba-medium.onnx"),
             // ryan-high: the only high-quality model in the folder, and clearly

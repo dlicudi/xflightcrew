@@ -8,9 +8,9 @@ the action back aloud.
 🎙️  "Flaps up"   →  STT  →  LLM picks a tool  →  write dataref  →  TTS "Flaps up!"
 ```
 
-`x-copilot` is the **working name** (scaffolding). The intended product name is
-**Roger** — it encodes the whole thesis: you speak, it acts, it confirms ("Roger,
-flaps up"). Rename before going public.
+`x-copilot` is the **working name** (scaffolding). Naming is **parked**
+(2026-07-11); the leading candidate is **Roger** — it encodes the whole thesis:
+you speak, it acts, it confirms ("Roger, flaps up"). Rename before going public.
 
 ## Relationship to Horizon
 
@@ -90,7 +90,12 @@ on its own frequency ("with information X" then drops the QNH from
 clearances; `XCOPILOT_ATC_ATIS_PIPER_VOICE`); an **enroute region**
 (`XCOPILOT_ATC_REGION=off` to disable) indexes every towered field at startup
 and hands the flight to whichever tower becomes decisively nearer (monitor
-`region_tick` speaks, main loop consumes `PENDING_STATION`); and **traffic
+`region_tick` speaks, main loop consumes `PENDING_STATION`) — airborne
+"nearest" is service-weighted (`SERVICE_BIAS_NM`), so a real airport outranks
+a strip that borrowed its frequencies (Trebujena's rows name "Jerez Tower";
+raw distance vectored a Jerez arrival onto its 800 m runway, 2026-07-11), and
+a fresh boot with no contact on record gets a crew note, never "radar
+services terminated" from a controller that never worked you; and **traffic
 advisories** narrate the TCAS picture whenever any controller is tuned, not
 just under vectors. Station side state (ATIS/region/controller freqs) is
 published by `Station::install()`, called by the owner — never by
@@ -112,7 +117,53 @@ into LUAW and blocks the hold release); and **named taxi routes** (apt.dat
 with runway edges ×25 → "taxi to holding point Alpha one runway two seven
 right via Bravo, Link two seven", crossings called out, off-route nudges
 from the compliance watch via `TAXI_ROUTE`). The coach's first suggestion is
-always the readback owed (`ClearanceSnap.pending_readback`).
+always the readback owed (`ClearanceSnap.pending_readback`). PTT is
+half-duplex done honestly ([src/voice.rs](src/voice.rs) `SteppedOn`): keying
+up cuts the audio, but a stepped-on *station* transmission keeps running
+silently and its remainder plays from the real-time position on release
+(mid-word, like rejoining a real frequency; fully elapsed = lost, and
+recovery stays procedural: "say again" / readback enforcement, never an
+auto-repeat). Copilot speech stays killed: interrupting your own crew is a
+decision, not physics.
+
+Depth (added 2026-07-11, evening): **ILS approaches from real chart data**,
+and **region-accurate phraseology**. `spawn_ils_load` (like the taxi net, a
+background scan per station) reads the field's localizers/glideslopes from
+earth_nav.dat and the per-runway platform (glideslope-intercept) altitude
+from the CIFP approach legs ([src/nav.rs](src/nav.rs) `airport_ils` /
+`ils_platform_alt_ft` — the FAF leg's crossing altitude, desc-code 4th char
+`F`). When the runway in use has an ILS, "request vectors" arms an ILS plan
+instead of the visual: descend to the REAL platform, the clearance rides
+the intercept turn ("cleared ILS approach runway two seven right, report
+established"), and "established" (which parses as the final report —
+[bench/atc_corpus.yaml](bench/atc_corpus.yaml) pins the question-form
+safety) earns the tower handoff from approach or the landing clearance from
+tower. Phraseology follows geography like the voices do (`Dialect` in
+[src/station.rs](src/station.rs), K/P/C prefixes = FAA grammar, everywhere
+else ICAO/CAP 413: "descend to altitude ... feet" + "degrees" vs "descend
+and maintain" + the FAA PTAC clearance) — currently applied to the
+approach/vector phrases; rolling it through the tower's strings is future
+work, as is speaking "altimeter" in inHg at FAA fields. The copilot's
+existing `visual_approach` talk-down and NAV1 ILS auto-tune compose with
+all of this. Real-install smoke test:
+`cargo test -- --ignored real_install_ils`.
+
+Depth (added 2026-07-11, crew side): the **progressive taxi guide**
+([src/taxi_guide.rs](src/taxi_guide.rs)) is the copilot's half of the taxi
+clearance — the pilot monitoring with the airport diagram out. The tower's
+route publication (`TaxiWatch`, now carrying per-segment names + runway
+flags from the planner) feeds pure geometry that speaks just-in-time cues
+in the copilot's voice at Advisory: "next left, onto Sierra five Whiskey",
+the runway-crossing check, "straight ahead onto..." after it, and the
+holding point. Division of labor: the guide gives the gentle EARLY cue and
+goes quiet past the same 60 m where the compliance watch's ATC challenge
+takes over — never two voices on one mistake. On-demand: "which way?" /
+"say the taxi route" answers deterministically off the same route
+(`is_taxi_query` in main.rs, question-shaped so a taxi READBACK never
+triggers it). `XCOPILOT_TAXI_GUIDE=false` to disable. All of it battle-
+tests as plain `cargo test` (synthetic routes in
+[src/taxi_guide.rs](src/taxi_guide.rs)); cues blackbox as
+`"kind":"taxi_guide"`.
 
 Battle-test surface (all deterministic, in `cargo test` unless noted): the
 state-by-intent matrix test in [src/tower.rs](src/tower.rs); the adversarial
@@ -156,7 +207,11 @@ is just more tools. Don't over-build the framework before that loop works.
 
 ## Licensing
 
-Currently proprietary (no open-source LICENSE = all rights reserved). It's a
-maybe-commercial product, so keep it closed until there's a reason to open it —
-you can open later, never un-open. *If* it's ever opened: dual `MIT OR Apache-2.0`
-per Rust convention (Apache's patent grant matters more than MIT for a product).
+Direction decided, exact license **parked** (2026-07-11): this will be **open
+source, not commercial** — the earlier maybe-commercial framing is dead. No
+LICENSE file yet (repo is private, so the interim all-rights-reserved default is
+harmless). The parked choice is between dual `MIT OR Apache-2.0` (Rust
+convention, Apache patent grant, maximum adoption) and `GPL-3.0-or-later`
+(copyleft — stops payware bundling without giving back; matches Welly's ATC).
+Sole-author means relicensing stays free until outside contributions are
+accepted — decide before merging any.

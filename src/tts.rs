@@ -110,6 +110,27 @@ pub fn stop_playback() {
     let _ = Command::new("pkill").args(["-x", "aplay"]).status();
 }
 
+/// Play mono f32 PCM through the platform player (write a temp WAV, play it).
+/// Lives here rather than in `tts_onnx` so the speech arbiter's barge-in tail
+/// path (replaying a sliced sample buffer) builds without the onnx feature.
+#[allow(dead_code)] // consumed by the copilot binary's tree (voice.rs), not the lib's
+pub(crate) fn play_pcm(samples: &[f32], sample_rate: u32) -> Result<()> {
+    let path = std::env::temp_dir().join("x-copilot-pcm.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(&path, spec)
+        .with_context(|| format!("creating {}", path.display()))?;
+    for &s in samples {
+        w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+    }
+    w.finalize().context("finalizing wav")?;
+    play(&path)
+}
+
 /// Play a WAV file using the platform's default CLI player. `pub(crate)` so the
 /// in-process ONNX backend ([`crate::tts_onnx`]) can reuse it.
 #[cfg(target_os = "macos")]

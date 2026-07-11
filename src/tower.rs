@@ -11,8 +11,8 @@ pub const STT_PROMPT: &str = "Radio calls to the tower: request taxi, request \
 departure clearance, ready for departure, request takeoff, radio check, \
 holding point, runway zero niner, runway two seven, mayday, pan pan, going \
 around, downwind, turning base, line up and wait, lining up, holding \
-position, wake turbulence, taxi via alpha bravo. Numbers are spoken digit by \
-digit.";
+position, wake turbulence, taxi via alpha bravo, request vectors, established \
+on the localizer, established ILS. Numbers are spoken digit by digit.";
 
 /// Where the aircraft is in the clearance sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,7 +275,14 @@ pub fn parse_intent(transcript: &str) -> Intent {
     // "final" is a position report; checked before the landing request so
     // "final for landing" reads as the report (it earns the clearance). Not
     // when it's a cockpit question ("what's our final approach speed").
-    if word("final") && !t.contains("what") && !t.contains("how") && !t.contains("speed") {
+    // "Established" (ILS/localizer) is the same report by other words: to
+    // the tower it earns the landing clearance, to approach it earns the
+    // tower handoff — both exactly what the final report does.
+    if (word("final") || t.contains("establish"))
+        && !t.contains("what")
+        && !t.contains("how")
+        && !t.contains("speed")
+    {
         return Intent::ReportFinal;
     }
     // A balked landing rejoining the pattern — before the landing request so
@@ -1152,6 +1159,19 @@ mod tests {
         assert_eq!(
             parse_intent("november one seven two, final"),
             Intent::ReportFinal
+        );
+        // "Established" is the final report by other words — the ILS
+        // arrival's version of it, to tower (clearance) and approach
+        // (handoff) alike. Whisper often splits the acronym.
+        assert_eq!(
+            parse_intent("november one seven two, established i l s runway zero niner"),
+            Intent::ReportFinal
+        );
+        assert_eq!(parse_intent("localizer established"), Intent::ReportFinal);
+        // But a cockpit question about it stays crew talk.
+        assert_eq!(
+            parse_intent("how do I know when we're established"),
+            Intent::Unknown
         );
         assert_eq!(
             parse_intent("request vectors for the approach"),

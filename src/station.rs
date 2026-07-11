@@ -83,6 +83,30 @@ pub struct Station {
     /// off — the coach teaches the readback either way; only the challenges
     /// are gated.
     enforce_readback: bool,
+    /// Phraseology dialect for this field's controllers (set by the owner
+    /// from the ICAO prefix, like the voice casting). Defaults to ICAO.
+    dialect: Dialect,
+}
+
+/// Radio phraseology dialect. ICAO/CAP 413 style ("descend to altitude two
+/// thousand five hundred feet, QNH one zero two zero") serves most of the
+/// world; FAA style ("descend and maintain two thousand five hundred") for
+/// North America. Same lever as geography-accurate voice casting: a Heathrow
+/// controller must not sound like Chicago Center, in accent OR in grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Icao,
+    Faa,
+}
+
+/// The dialect for a field, by ICAO prefix: K (CONUS), P (US Pacific/Alaska)
+/// and C (Canada) speak FAA-style; everywhere else speaks ICAO. Coarse on
+/// purpose — refine per-region as fields get flown.
+pub fn dialect_for(icao: &str) -> Dialect {
+    match icao.chars().next() {
+        Some('K') | Some('P') | Some('C') => Dialect::Faa,
+        _ => Dialect::Icao,
+    }
 }
 
 impl Station {
@@ -139,12 +163,19 @@ impl Station {
             assigned_squawk: None,
             planned_route: None,
             enforce_readback: true,
+            dialect: Dialect::Icao,
         })
     }
 
     /// Gate the readback challenges on config (`XCOPILOT_ATC_READBACK`).
     pub fn set_enforce_readback(&mut self, on: bool) {
         self.enforce_readback = on;
+    }
+
+    /// Set the phraseology dialect (the owner resolves it from the ICAO
+    /// prefix via [`dialect_for`] — the station never sees its own ICAO).
+    pub fn set_dialect(&mut self, d: Dialect) {
+        self.dialect = d;
     }
 
     /// The active field's spoken name ("Gibraltar") — the per-airport voice
@@ -486,6 +517,8 @@ impl Station {
                 self.planned_route.as_ref().filter(|r| r.path.len() >= 2).map(|r| TaxiWatch {
                     path: r.path.clone(),
                     via: r.via.iter().map(|n| spoken_taxiway(n)).collect::<Vec<_>>().join(", "),
+                    seg: r.seg.clone(),
+                    holding_point: r.holding_point.clone(),
                 });
         }
         // A takeoff request answered with anything SHORT of the clearance —
@@ -730,6 +763,21 @@ impl Station {
                 let vectors = self.arm_vectors(ctx, wx);
                 format!("Roger mayday. {vectors}")
             }
+            // "Established ILS two seven right" (parses as the final report)
+            // while being vectored: approach's job is done — acknowledge,
+            // hand the flight to the tower, drop the plan so the tick stops
+            // steering a pilot who's already on the localizer.
+            tower::Intent::ReportFinal
+                if VECTORS.lock().unwrap_or_else(|e| e.into_inner()).is_some() =>
+            {
+                *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                format!(
+                    "{}, roger. Contact {} Tower on {}.",
+                    ctx.callsign,
+                    ctx.airport,
+                    atis::spoken_mhz(self.tower_khz)
+                )
+            }
             // Final reports and everything runway-shaped belong to the tower.
             tower::Intent::ReportFinal
             | tower::Intent::ReportDownwind
@@ -787,8 +835,32 @@ impl Station {
         }) else {
             return format!("{}, unable, no runway data.", ctx.callsign);
         };
-        // Intercept altitude: 1,500 ft above the field, rounded to the hundred.
-        let target_alt_ft = ((self.apt.elev_ft + 1500.0) / 100.0).round() * 100.0;
+        // ILS when the runway has one (background load may still be running:
+        // then it's a visual, exactly as before — honest about what's known).
+        let facts = ILS_FACTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let ils_rec = facts
+            .as_ref()
+            .and_then(|f| f.ils.iter().find(|i| i.runway == ident).cloned());
+        let ils = ils_rec.is_some();
+        // Intercept altitude: the CIFP's real platform (glideslope-intercept)
+        // when the procedure is on disk; otherwise a geometric one — 2,500 ft
+        // above the field for an ILS (≈3° from 8 nm), 1,500 for the visual.
+        let target_alt_ft = facts
+            .as_ref()
+            .filter(|_| ils)
+            .and_then(|f| f.platform_ft.get(&ident).copied())
+            .unwrap_or_else(|| {
+                let aal = if ils { 2500.0 } else { 1500.0 };
+                ((self.apt.elev_ft + aal) / 100.0).round() * 100.0
+            });
+        // The ILS join sits where the real slope (charted angle when we have
+        // it) is still above the platform — intercept from below, always.
+        let join_nm = match &ils_rec {
+            Some(rec) => {
+                ils_join_nm(target_alt_ft - self.apt.elev_ft, rec.gs_deg.unwrap_or(3.0))
+            }
+            None => JOIN_FINAL_NM,
+        };
         let runway_spoken = atis::spoken_runway(&ident);
         *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = Some(VectorPlan {
             callsign: ctx.callsign.clone(),
@@ -798,6 +870,10 @@ impl Station {
             runway_spoken: runway_spoken.clone(),
             tower_spoken: Some(atis::spoken_mhz(self.tower_khz)),
             target_alt_ft,
+            ils,
+            join_nm,
+            cleared: false,
+            dialect: self.dialect,
             last_tx: None,
             last_heading: None,
         });
@@ -805,16 +881,35 @@ impl Station {
         // spoken by the watch tick once the code actually shows on the
         // scope, not on faith (it used to be instant theatre).
         let squawk = self.assign_squawk(&ctx.callsign, StationSpeaker::Approach);
-        tracing::info!(runway = %ident, alt = target_alt_ft, "vectors armed");
+        tracing::info!(runway = %ident, alt = target_alt_ft, ils, "vectors armed");
+        let plan_phrase = match (ils, self.dialect) {
+            // CAP 413 / ICAO: "vectoring ILS approach", altitudes are "to
+            // altitude ... feet" with the QNH attached.
+            (true, Dialect::Icao) => format!(
+                "Vectoring ILS approach runway {}. Descend to altitude {} feet, QNH {}.",
+                runway_spoken,
+                spoken_alt(target_alt_ft),
+                ctx.qnh
+            ),
+            // FAA: "expect vectors ILS runway ... approach", "descend and
+            // maintain". (Altimeter would be inches here — QNH until the wx
+            // plumbing carries inHg.)
+            (true, Dialect::Faa) => format!(
+                "Expect vectors ILS runway {} approach. Descend and maintain {}. QNH {}.",
+                runway_spoken,
+                spoken_alt(target_alt_ft),
+                ctx.qnh
+            ),
+            (false, _) => format!(
+                "Expect vectors, visual approach runway {}. Descend and maintain {}, QNH {}.",
+                runway_spoken,
+                spoken_alt(target_alt_ft),
+                ctx.qnh
+            ),
+        };
         format!(
-            "{}, {} Approach, squawk {}. Expect vectors, visual approach runway {}. \
-             Descend and maintain {}, QNH {}.",
-            ctx.callsign,
-            ctx.airport,
-            squawk,
-            runway_spoken,
-            spoken_alt(target_alt_ft),
-            ctx.qnh
+            "{}, {} Approach, squawk {}. {}",
+            ctx.callsign, ctx.airport, squawk, plan_phrase
         )
     }
 
@@ -980,6 +1075,9 @@ pub fn is_radio_call(t: &str, airport_lc: &str) -> bool {
         || t.contains("inbound")
         || t.contains("radio check")
         || word("final")
+        // "Established (ILS/localizer)" is the vectored arrival's final
+        // report — radio speech by nature, like the pattern calls below.
+        || t.contains("establish")
         // Distress and pattern calls are radio speech by nature — nobody
         // tells their copilot "mayday" or reports "downwind" to the cockpit.
         || word("mayday")
@@ -1115,6 +1213,11 @@ pub struct ComplianceCall {
 /// The compliance watch's memory between ticks.
 struct ComplianceState {
     prev_on_ground: Option<bool>,
+    /// Continuously airborne since — a landing accusation needs a FLIGHT
+    /// first. A one-sample unstick during the takeoff roll (0.3 ft AGL for
+    /// one tick at 83 knots, Jerez 2026-07-11) read as air-then-ground and
+    /// earned "you landed without clearance" mid-departure.
+    airborne_since: Option<Instant>,
     /// Last violation call of any kind — one thing at a time on frequency.
     last_call: Option<Instant>,
     /// When the tower state was last seen at ClearedToLand — grace for the
@@ -1132,6 +1235,7 @@ struct ComplianceState {
 impl ComplianceState {
     const NEW: ComplianceState = ComplianceState {
         prev_on_ground: None,
+        airborne_since: None,
         last_call: None,
         cleared_to_land_seen: None,
         takeoff_berated: false,
@@ -1153,6 +1257,9 @@ const VACATE_GRACE_SECS: f64 = 120.0;
 const ZONE_RADIUS_NM: f64 = 5.0;
 const ZONE_HEIGHT_FT: f64 = 3000.0;
 const ZONE_COOLDOWN_SECS: f64 = 120.0;
+/// Continuous air time before ground contact can be called a LANDING —
+/// shorter is a skip on the takeoff roll or a bounce, not an arrival.
+const MIN_FLIGHT_SECS: f64 = 30.0;
 
 /// One tick of the compliance watch: the tower holds the pilot to the
 /// clearances it actually issued, and challenges zone traffic it has never
@@ -1182,6 +1289,15 @@ pub fn compliance_tick(
 
     let mut w = COMPLIANCE.lock().unwrap_or_else(|e| e.into_inner());
     let prev_ground = w.prev_on_ground.replace(on_ground);
+    // How long the flight before THIS ground contact lasted (0.0 while the
+    // wheels never left) — read before the touchdown resets the clock.
+    let airborne_secs =
+        w.airborne_since.map_or(0.0, |t| now.duration_since(t).as_secs_f64());
+    if on_ground {
+        w.airborne_since = None;
+    } else if w.airborne_since.is_none() {
+        w.airborne_since = Some(now);
+    }
     if clr.as_ref().is_some_and(|(s, _)| *s == tower::State::ClearedToLand) {
         w.cleared_to_land_seen = Some(now);
     }
@@ -1198,6 +1314,7 @@ pub fn compliance_tick(
         // with a phone number, exactly once.
         if prev_ground == Some(false)
             && on_ground
+            && airborne_secs >= MIN_FLIGHT_SECS
             && !w.landing_berated
             && *state != tower::State::ClearedToLand
         {
@@ -1629,6 +1746,27 @@ const AT_FIELD_NM: f64 = 4.0;
 /// ..."). On the ground: a silent relocation with a crew note, but only when
 /// physically AT the new field. The main loop consumes [`PENDING_STATION`] on
 /// its next pass; a cooldown keeps back-to-back fields from ping-ponging.
+/// How much STATION a field is, for the enroute handoff choice: its distinct
+/// published services beyond the tower itself. A primary airport scores 3-5;
+/// a strip whose apt.dat rows just point at the primary's controllers scores
+/// 0-1, so it never wins the sky it doesn't control.
+fn region_services(apt: &nav::AirportInfo) -> usize {
+    [
+        nav::FREQ_ATIS,
+        nav::FREQ_CLEARANCE,
+        nav::FREQ_GROUND,
+        nav::FREQ_APPROACH,
+        nav::FREQ_DEPARTURE,
+    ]
+    .iter()
+    .filter(|k| apt.freq(**k).is_some())
+    .count()
+}
+
+/// Nautical miles of pull each published service adds to a field in the
+/// airborne handoff choice (see [`region_services`]).
+const SERVICE_BIAS_NM: f64 = 3.0;
+
 pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<RegionSwitch> {
     if PENDING_STATION
         .lock()
@@ -1647,10 +1785,27 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     let (active_name, a_lat, a_lon) =
         ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
     let region = REGION.lock().unwrap_or_else(|e| e.into_inner());
-    let (d_best, best) = region
+    // Airborne, "nearest" is service-weighted: a real airport (ATIS, ground,
+    // its own approach) outranks a strip a few miles nearer that merely
+    // BORROWED the big field's frequencies — Trebujena's apt.dat rows name
+    // "Jerez Tower"/"Seville Approach", and picking it by raw distance had
+    // approach faithfully vectoring the Jerez arrival onto Trebujena's 800 m
+    // grass runway two six (flown 2026-07-11). On the ground, raw nearest:
+    // a relocation goes to the field you are physically at, however small.
+    let score = |d: f64, apt: &nav::AirportInfo| {
+        if on_ground {
+            d
+        } else {
+            d - SERVICE_BIAS_NM * region_services(apt) as f64
+        }
+    };
+    let (d_best, s_best, best) = region
         .iter()
-        .map(|a| (crate::haversine_nm(lat, lon, a.lat, a.lon), a))
-        .min_by(|x, y| x.0.total_cmp(&y.0))?;
+        .map(|a| {
+            let d = crate::haversine_nm(lat, lon, a.lat, a.lon);
+            (d, score(d, &a.apt), a)
+        })
+        .min_by(|x, y| x.1.total_cmp(&y.1))?;
     if best.apt.name == active_name {
         return None;
     }
@@ -1660,15 +1815,39 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     if (on_ground && d_best > AT_FIELD_NM) || (!on_ground && d_best > SWITCH_MAX_NM) {
         return None;
     }
-    let d_active = crate::haversine_nm(lat, lon, a_lat, a_lon);
-    if d_best + SWITCH_MARGIN_NM > d_active {
+    // Hysteresis on the same scale the pick was made on.
+    let s_active = region
+        .iter()
+        .find(|a| a.apt.name == active_name)
+        .map(|a| score(crate::haversine_nm(lat, lon, a.lat, a.lon), &a.apt))
+        .unwrap_or_else(|| crate::haversine_nm(lat, lon, a_lat, a_lon));
+    if s_best + SWITCH_MARGIN_NM > s_active {
         return None;
     }
     let khz = best.apt.freq(nav::FREQ_TOWER)?.khz;
+    // Whether ANY controller of the active station has actually worked this
+    // flight in this session: two-way contact publishes a clearance state,
+    // a radar service arms the squawk watch. Without either there is no
+    // service to hand off — a fresh mid-flight boot must not open with a
+    // controller terminating a service it never provided (heard live
+    // 2026-07-11: app start near Sevilla answered by "radar services
+    // terminated" from a departure position never called).
+    let had_contact = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        || SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()).is_some();
     let sw = if on_ground {
         RegionSwitch {
             line: format!(
                 "We're at {} — tower here is on {}.",
+                spoken_airport(&best.apt.name),
+                atis::spoken_mhz(khz)
+            ),
+            crew: true,
+        }
+    } else if !had_contact {
+        // First fix of the session: the copilot orients, no radar theatre.
+        RegionSwitch {
+            line: format!(
+                "Closest field is {} — tower is on {}.",
                 spoken_airport(&best.apt.name),
                 atis::spoken_mhz(khz)
             ),
@@ -1846,10 +2025,15 @@ pub fn active_station_in_range(lat: f64, lon: f64, alt_msl_ft: f64) -> Option<(S
 /// the runway-incursion watch.
 static ACTIVE_RUNWAYS: Mutex<Vec<nav::Runway>> = Mutex::new(Vec::new());
 
-/// Lateral capture around a runway centerline. apt.dat 100-rows carry a width
-/// we don't parse yet; 40 m covers everything up to a wide-body runway
-/// (60 m ÷ 2 + slack) without capturing a parallel taxiway.
+/// Lateral capture around a runway centerline when the 100-row carried no
+/// width: 40 m covers everything up to a wide-body runway (60 m ÷ 2 + slack)
+/// without capturing a parallel taxiway.
 const RUNWAY_HALF_WIDTH_M: f64 = 40.0;
+/// Slack past the real pavement edge: edge lines, a mainwheel over the
+/// threshold stripe — not the holding point. Jerez's E1 sits 40 m off the
+/// 45 m runway's centerline; the blanket 40 m capture accused a pilot
+/// holding SHORT of runway 20 of being ON it (2026-07-11).
+const RUNWAY_EDGE_SLACK_M: f64 = 10.0;
 
 /// Is this position ON one of the active field's runways? Point-to-segment in
 /// a local flat-earth projection (exact enough over a 3 km runway). Returns
@@ -1873,8 +2057,13 @@ fn on_runway(r: &nav::Runway, lat: f64, lon: f64) -> Option<String> {
     }
     let t = (px * bx + py * by) / len2;
     let cross_m = (px * by - py * bx).abs() / len2.sqrt();
+    let half_width = if r.width_m > 1.0 {
+        r.width_m / 2.0 + RUNWAY_EDGE_SLACK_M
+    } else {
+        RUNWAY_HALF_WIDTH_M
+    };
     // Slightly past the thresholds still counts (displaced/overrun).
-    if (-0.02..=1.02).contains(&t) && cross_m <= RUNWAY_HALF_WIDTH_M {
+    if (-0.02..=1.02).contains(&t) && cross_m <= half_width {
         let ident = if t < 0.5 { &r.ident_a } else { &r.ident_b };
         return Some(ident.clone());
     }
@@ -2732,15 +2921,63 @@ pub fn wake_remaining(runway_ident: &str, now: Instant) -> Option<u64> {
 static TAXI_NET: Mutex<Option<std::sync::Arc<nav::TaxiNet>>> = Mutex::new(None);
 
 /// The taxi route the pilot is CLEARED on — published by the reply path
-/// when a taxi clearance is issued, consumed by the compliance watch.
+/// when a taxi clearance is issued, consumed by the compliance watch (ATC's
+/// off-route challenge) and the copilot's progressive taxi guide (the crew
+/// side: "next left onto Whiskey").
 pub struct TaxiWatch {
     /// Node polyline of the cleared route.
     pub path: Vec<(f64, f64)>,
     /// The spoken via line, for the challenge ("taxi via Alpha, Bravo").
     pub via: String,
+    /// Per-segment RAW (name, is_runway) aligned with `path` segments
+    /// (`seg[i]` = the leg `path[i] -> path[i+1]`); phrase with
+    /// [`spoken_taxiway`] / [`atis::spoken_runway`] at speak time.
+    pub seg: Vec<(String, bool)>,
+    /// RAW holding-point taxiway name ("A13"), the route's destination.
+    pub holding_point: String,
 }
 
 pub static TAXI_ROUTE: Mutex<Option<TaxiWatch>> = Mutex::new(None);
+
+/// The active field's ILS facilities (earth_nav.dat) and per-runway platform
+/// altitudes (CIFP approach legs), background-loaded per station — both are
+/// full-file scans that must never stall the reply path. `None` while loading
+/// or when the field has no ILS; vectors then fly the visual profile.
+pub struct IlsFacts {
+    pub ils: Vec<nav::AirportIls>,
+    /// Glideslope-intercept ("descend to X until established") altitude per
+    /// runway ident, ft MSL, where the CIFP has the approach.
+    pub platform_ft: std::collections::HashMap<String, f64>,
+}
+
+static ILS_FACTS: Mutex<Option<std::sync::Arc<IlsFacts>>> = Mutex::new(None);
+
+/// Kick off the background ILS + procedures load for the active airport.
+/// Called by the station's owner at install time, like the taxi network.
+pub fn spawn_ils_load(nav_path: String, cifp_dir: String, icao: String) {
+    *ILS_FACTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    std::thread::spawn(move || match nav::airport_ils(&nav_path, &icao) {
+        Ok(list) if !list.is_empty() => {
+            let platform_ft: std::collections::HashMap<String, f64> = list
+                .iter()
+                .filter_map(|i| {
+                    nav::ils_platform_alt_ft(&cifp_dir, &icao, &i.runway)
+                        .map(|a| (i.runway.clone(), a))
+                })
+                .collect();
+            tracing::info!(
+                %icao,
+                ils = list.len(),
+                platforms = platform_ft.len(),
+                "ILS data loaded: vectors can offer the ILS approach"
+            );
+            *ILS_FACTS.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(std::sync::Arc::new(IlsFacts { ils: list, platform_ft }));
+        }
+        Ok(_) => tracing::info!(%icao, "no ILS at this field; visual vectors only"),
+        Err(e) => tracing::warn!(%icao, "ILS scan failed: {e:#}"),
+    });
+}
 
 /// Kick off the background taxi-network load for the active airport.
 /// Called by the station's owner at install time.
@@ -2790,7 +3027,7 @@ pub fn spoken_taxiway(name: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     for tok in name.split_whitespace() {
         let mut run = String::new();
-        let mut flush = |run: &mut String, out: &mut Vec<String>| {
+        let flush = |run: &mut String, out: &mut Vec<String>| {
             if run.is_empty() {
                 return;
             }
@@ -2824,8 +3061,9 @@ pub fn spoken_taxiway(name: &str) -> String {
 }
 
 /// The first designator of a runway-edge name ("09L/27R" → "09L") — the
-/// end a crossing instruction names.
-fn first_designator(name: &str) -> &str {
+/// end a crossing instruction names. `pub` for the copilot's taxi guide,
+/// which phrases the same runway-edge names.
+pub fn first_designator(name: &str) -> &str {
     name.split('/').next().unwrap_or(name).trim()
 }
 
@@ -2902,14 +3140,36 @@ pub struct VectorPlan {
     pub tower_spoken: Option<String>,
     /// Intercept altitude, ft MSL.
     pub target_alt_ft: f64,
+    /// ILS mode: the runway has a localizer, so the vectors end in "cleared
+    /// ILS approach, report established" instead of the visual clearance.
+    pub ils: bool,
+    /// Where the vectors aim the final join, nm from the threshold. Visual:
+    /// the stock 6. ILS: far enough out that the glideslope is still ABOVE
+    /// the platform altitude there — intercepting from below is the whole
+    /// discipline; a fixed 6 nm join under Heathrow's 2,500 ft platform
+    /// delivered the aircraft on top of the slope.
+    join_nm: f64,
+    /// The ILS clearance has been spoken (it rides the intercept turn, once).
+    cleared: bool,
+    /// Phraseology dialect, carried from the station that armed the plan.
+    dialect: Dialect,
     last_tx: Option<Instant>,
     last_heading: Option<i64>,
 }
 
 pub static VECTORS: Mutex<Option<VectorPlan>> = Mutex::new(None);
 
-/// How far out the vectors aim you onto final (the join point).
+/// How far out the vectors aim you onto final (the join point) for a VISUAL
+/// approach; an ILS join is computed from its platform instead.
 const JOIN_FINAL_NM: f64 = 6.0;
+
+/// The ILS join distance: where a `gs_deg` slope reaches `platform_agl_ft`
+/// above the field, plus a mile of level flight to capture from below —
+/// never inside the visual join. Pure, so the geometry unit-tests.
+fn ils_join_nm(platform_agl_ft: f64, gs_deg: f64) -> f64 {
+    let slope_nm = platform_agl_ft.max(0.0) / (6076.12 * gs_deg.max(1.0).to_radians().tan());
+    (slope_nm + 1.0).max(JOIN_FINAL_NM)
+}
 
 /// One tick of the approach controller, ~monitor rate. Returns an instruction
 /// when one is due: a fresh heading when the required course has moved, the
@@ -2939,19 +3199,41 @@ pub fn vector_tick(
     // track read doesn't block the clearance (best-effort, like every read).
     let off_course = angle_diff_deg(brg_thr, plan.course_deg).abs();
     let aligned = track_deg.is_none_or(|t| angle_diff_deg(t, plan.course_deg).abs() <= 30.0);
-    if (1.0..=JOIN_FINAL_NM + 2.0).contains(&dist_thr) && off_course <= 15.0 && aligned {
+    if (1.0..=plan.join_nm + 2.0).contains(&dist_thr) && off_course <= 15.0 && aligned {
         let handoff = plan
             .tower_spoken
             .as_ref()
             .map(|f| format!(" Contact Tower {f}."))
             .unwrap_or_default();
-        let msg = format!(
-            "{}, {} miles from touchdown. Cleared visual approach runway {}.{}",
-            plan.callsign,
-            dist_thr.round() as i64,
-            plan.runway_spoken,
-            handoff
-        );
+        let msg = if plan.ils && plan.cleared {
+            // Cleared on the intercept, now seen established: hand off. (If
+            // the pilot reports established first, respond_approach does
+            // this and the plan is already gone.)
+            format!(
+                "{}, {} miles from touchdown.{}",
+                plan.callsign,
+                dist_thr.round() as i64,
+                handoff
+            )
+        } else if plan.ils {
+            // Straight-in that never needed an intercept turn: clearance and
+            // handoff together.
+            format!(
+                "{}, {} miles from touchdown. Cleared ILS approach runway {}.{}",
+                plan.callsign,
+                dist_thr.round() as i64,
+                plan.runway_spoken,
+                handoff
+            )
+        } else {
+            format!(
+                "{}, {} miles from touchdown. Cleared visual approach runway {}.{}",
+                plan.callsign,
+                dist_thr.round() as i64,
+                plan.runway_spoken,
+                handoff
+            )
+        };
         *guard = None; // approach's job is done
         return Some(msg);
     }
@@ -2964,12 +3246,13 @@ pub fn vector_tick(
     // point 6 nm out, which is the downwind/base leg for free.
     let along_nm = dist_thr * off_course.to_radians().cos(); // + = approach side
     let xtk_nm = dist_thr * angle_diff_deg(brg_thr, plan.course_deg).to_radians().sin();
-    let desired = if along_nm >= 2.0 && xtk_nm.abs() <= 2.5 {
+    let capturing = along_nm >= 2.0 && xtk_nm.abs() <= 2.5;
+    let desired = if capturing {
         (plan.course_deg + (xtk_nm * 20.0).clamp(-45.0, 45.0)).rem_euclid(360.0)
     } else {
         let recip = (plan.course_deg + 180.0).rem_euclid(360.0);
         let (join_lat, join_lon) =
-            crate::autoland::project_latlon(plan.thr_lat, plan.thr_lon, recip, JOIN_FINAL_NM);
+            crate::autoland::project_latlon(plan.thr_lat, plan.thr_lon, recip, plan.join_nm);
         crate::autoland::bearing_deg(lat, lon, join_lat, join_lon)
     };
     let heading10 = {
@@ -3002,17 +3285,39 @@ pub fn vector_tick(
     plan.last_heading = Some(heading10);
 
     let mut msg = format!(
-        "{}, fly heading {}",
+        "{}, fly heading {}{}",
         plan.callsign,
-        atis::spoken_digits(&format!("{heading10:03}"))
+        atis::spoken_digits(&format!("{heading10:03}")),
+        // CAP 413 headings carry the unit; FAA's don't.
+        if plan.dialect == Dialect::Icao { " degrees" } else { "" }
     );
     if alt_ft > plan.target_alt_ft + 400.0 {
-        msg.push_str(&format!(
-            ", descend and maintain {}",
-            spoken_alt(plan.target_alt_ft)
-        ));
+        msg.push_str(&match plan.dialect {
+            Dialect::Icao => {
+                format!(", descend to altitude {} feet", spoken_alt(plan.target_alt_ft))
+            }
+            Dialect::Faa => format!(", descend and maintain {}", spoken_alt(plan.target_alt_ft)),
+        });
     }
     msg.push('.');
+    // The ILS clearance rides the intercept turn, once — the heading that
+    // captures the localizer is the one that comes with "cleared ILS".
+    if plan.ils && !plan.cleared && capturing {
+        plan.cleared = true;
+        msg.push_str(&match plan.dialect {
+            Dialect::Icao => format!(
+                " Cleared ILS approach runway {}, report established.",
+                plan.runway_spoken
+            ),
+            // The FAA PTAC: position was the vector, this is turn-altitude-
+            // clearance in one breath.
+            Dialect::Faa => format!(
+                " Maintain {} until established, cleared ILS runway {} approach.",
+                spoken_alt(plan.target_alt_ft),
+                plan.runway_spoken
+            ),
+        });
+    }
     Some(msg)
 }
 
@@ -3265,7 +3570,7 @@ mod tests {
 
     #[test]
     fn squawk_watch_calls_radar_contact_only_when_the_code_shows() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut st = lxgb();
         let spoken = st.assign_squawk("November one seven two Sierra Papa", StationSpeaker::Approach);
         let code = st.assigned_squawk.expect("code issued");
@@ -3298,7 +3603,7 @@ mod tests {
 
     #[test]
     fn departure_clearance_assigns_a_discrete_code_at_radar_fields() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *SQUAWK_WATCH.lock().unwrap() = None;
         let wx = Wx { wind_from_deg: 90.0, wind_kts: 8.0 };
         // LXGB has an approach service: the zone clearance carries the code.
@@ -3325,7 +3630,7 @@ mod tests {
 
     #[test]
     fn squawk_check_repeats_the_assigned_code() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let wx = Wx { wind_from_deg: 90.0, wind_kts: 8.0 };
         let mut st = lxgb();
         // Before any radar service: the VFR conspicuity.
@@ -3348,12 +3653,12 @@ mod tests {
 
     #[test]
     fn compliance_watch_holds_the_pilot_to_clearances() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Gibraltar-ish: field reference + the real-ish 09/27 geometry.
         *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.1512, -5.3554));
         *ACTIVE_PANEL.lock().unwrap() =
             Some(("Gibraltar".into(), 11.0, vec![("tower".to_string(), 131200_i64)]));
-        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway { width_m: 0.0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -3433,6 +3738,65 @@ mod tests {
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
     }
 
+    /// The Jerez sortie, 2026-07-11: holding at E1 (40 m off the 45 m
+    /// runway's centerline) earned "exit the runway immediately", and a
+    /// one-tick unstick on the takeoff roll earned "you landed without
+    /// clearance" mid-departure. Real width + a real flight fix both.
+    #[test]
+    fn a_holding_point_is_not_the_runway_and_a_skip_is_not_a_landing() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Jerez".into(), 36.7446, -6.0601));
+        // The real LEJR 02/20 100-row: 45 m wide.
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+            width_m: 45.0,
+            ident_a: "02".into(),
+            ident_b: "20".into(),
+            lat_a: 36.7349761,
+            lon_a: -6.0648168,
+            lat_b: 36.7542941,
+            lon_b: -6.0553835,
+        }];
+        // Geometry first: E1 is beside the pavement, the centerline is on it.
+        assert_eq!(on_active_runway(36.753995, -6.056011), None, "holding point captured");
+        assert_eq!(on_active_runway(36.7523623, -6.0563268).as_deref(), Some("20"));
+
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::TaxiCleared,
+            callsign: "November five five zero Charlie Romeo".into(),
+            runway_ident: "20".into(),
+            pending_readback: None,
+        });
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        let t0 = Instant::now();
+        let sec = std::time::Duration::from_secs;
+        // Holding short at E1 with only a taxi clearance: no occupancy call.
+        assert!(
+            compliance_tick(36.753995, -6.056011, 40.0, true, 1.0, true, t0).is_none(),
+            "holding SHORT is not ON the runway"
+        );
+
+        // Cleared for takeoff, rolling; one-sample unstick, wheels back on.
+        CLEARANCE.lock().unwrap().as_mut().unwrap().state = tower::State::TakeoffCleared;
+        assert!(compliance_tick(36.7504305, -6.0572701, 40.0, true, 60.0, true, t0 + sec(10)).is_none());
+        assert!(compliance_tick(36.7513, -6.0568, 40.0, false, 83.0, true, t0 + sec(11)).is_none());
+        assert!(
+            compliance_tick(36.7523623, -6.0563268, 40.0, true, 86.0, true, t0 + sec(12)).is_none(),
+            "a takeoff-roll skip is not a landing"
+        );
+
+        // Airborne for real, then back on the strip a minute later with no
+        // landing clearance: THAT is the phone number.
+        assert!(compliance_tick(36.7450, -6.0601, 500.0, false, 100.0, true, t0 + sec(15)).is_none());
+        let call = compliance_tick(36.7523623, -6.0563268, 40.0, true, 40.0, true, t0 + sec(75))
+            .expect("a real uncleared landing still fires");
+        assert!(call.line.contains("number for you to copy"), "{}", call.line);
+
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *CLEARANCE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    }
+
     #[test]
     fn ghosts_speak_airline_telephony_or_nato() {
         assert_eq!(spoken_ghost("IBE3421"), "Iberia three four two one");
@@ -3454,9 +3818,9 @@ mod tests {
 
     #[test]
     fn party_line_narrates_each_ghost_once() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *GHOSTS.lock().unwrap() = None;
-        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway { width_m: 0.0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -3549,8 +3913,8 @@ mod tests {
 
     #[test]
     fn go_around_ordered_when_a_ghost_takes_the_runway() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway { width_m: 0.0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -3593,7 +3957,7 @@ mod tests {
         CLEARANCE.lock().unwrap().as_mut().unwrap().state = tower::State::ClearedToLand;
         assert!(go_around_tick(std::slice::from_ref(&ghost_on_runway), 2000.0, false, true, t0).is_none());
         // A ghost on the PARALLEL strip is not our conflict: no cancel.
-        ACTIVE_RUNWAYS.lock().unwrap().push(nav::Runway {
+        ACTIVE_RUNWAYS.lock().unwrap().push(nav::Runway { width_m: 0.0,
             ident_a: "09L".into(),
             ident_b: "27R".into(),
             lat_a: 36.1692,
@@ -3621,7 +3985,7 @@ mod tests {
 
     #[test]
     fn held_takeoff_clearance_releases_when_the_final_stays_clear() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *TAKEOFF_HOLD.lock().unwrap() = Some(TakeoffHold {
             callsign: "November one seven two Sierra Papa".into(),
             runway: "zero niner".into(),
@@ -3636,7 +4000,7 @@ mod tests {
             pending_readback: None,
         });
         // Our strip: 09/27. The watches only care about THIS pavement.
-        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway { width_m: 0.0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -3695,7 +4059,7 @@ mod tests {
 
     #[test]
     fn the_coach_suggests_the_parsers_happy_path() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *ACTIVE_PANEL.lock().unwrap() =
             Some(("Gibraltar".into(), 11.0, vec![("tower".to_string(), 131200_i64)]));
         *CLEARANCE.lock().unwrap() = None;
@@ -3714,7 +4078,7 @@ mod tests {
         assert_eq!(tower::parse_intent(&s), tower::Intent::RequestLanding { touch_and_go: false });
 
         // Walk the departure states.
-        let mut set = |state: tower::State| {
+        let set = |state: tower::State| {
             *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
                 state,
                 callsign: cs.into(),
@@ -3820,11 +4184,18 @@ mod tests {
             assigned_squawk: None,
             planned_route: None,
             enforce_readback: true,
+            dialect: Dialect::Icao,
         }
     }
 
-    /// `ATIS` is a process-wide static, same discipline as `HANDOFF_LOCK`.
-    static ATIS_LOCK: Mutex<()> = Mutex::new(());
+    /// `ATIS` is a process-wide static, same discipline as `SIDE_STATE_LOCK`.
+    /// Station side state (`CLEARANCE`/`HANDOFF`/`ATIS`/`REGION`/
+    /// `TAKEOFF_HOLD`/`TAXI_ROUTE`/...) is process statics, and the reply
+    /// path writes them on EVERY call — so every test that drives a station
+    /// or asserts on the statics holds this ONE lock. Three finer locks
+    /// (ATIS/REGION/HANDOFF) raced each other through `CLEARANCE`: the coach
+    /// test nulled it mid-flight under the readback test (2026-07-11).
+    static SIDE_STATE_LOCK: Mutex<()> = Mutex::new(());
 
     fn wx(wind_deg: f64, wind_kts: f64, qnh: f64) -> AtisWx {
         AtisWx {
@@ -3839,7 +4210,7 @@ mod tests {
 
     #[test]
     fn atis_loops_while_tuned_and_cuts_editions_on_real_change() {
-        let _guard = ATIS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *ATIS.lock().unwrap() = Some(AtisState {
             khz: 118500,
             airport: "Gibraltar".into(),
@@ -3871,10 +4242,6 @@ mod tests {
         *ATIS.lock().unwrap() = None;
     }
 
-    /// `REGION`/`ACTIVE_FIELD`/`PENDING_STATION` are process statics — one
-    /// lock for every region test.
-    static REGION_LOCK: Mutex<()> = Mutex::new(());
-
     fn region_apt(name: &str, lat: f64, lon: f64) -> RegionApt {
         RegionApt {
             icao: name.get(0..4).unwrap_or("XXXX").to_uppercase(),
@@ -3895,7 +4262,7 @@ mod tests {
 
     #[test]
     fn transmission_on_another_fields_freq_arms_the_swap() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut badajoz = region_apt("Badajoz", 38.89, -6.82);
         badajoz.apt.freqs[0].khz = 122100;
         *REGION.lock().unwrap() = vec![region_apt("Gibraltar", 36.15, -5.35), badajoz];
@@ -3959,7 +4326,7 @@ mod tests {
 
     #[test]
     fn region_hands_off_to_the_decisively_nearer_tower() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Gibraltar-ish and Malaga-ish, ~50 nm apart along a degree of longitude.
         *REGION.lock().unwrap() = vec![
             region_apt("Gibraltar", 36.15, -5.35),
@@ -3968,6 +4335,10 @@ mod tests {
         *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.15, -5.35));
         *PENDING_STATION.lock().unwrap() = None;
         *LAST_REGION_SWITCH.lock().unwrap() = None;
+        // The fresh-boot branch reads the contact state: start from none,
+        // whatever an earlier test left behind.
+        *CLEARANCE.lock().unwrap() = None;
+        *SQUAWK_WATCH.lock().unwrap() = None;
         let t0 = Instant::now();
         // On the ground at Gibraltar (the active field): never.
         assert!(region_tick(36.15, -5.35, true, t0).is_none());
@@ -3979,14 +4350,32 @@ mod tests {
         // On the GROUND near the midpoint (not AT any field): also quiet —
         // a ground relocation needs you physically at the new field.
         assert!(region_tick(36.42, -4.92, true, t0).is_none());
-        // Decisively closer to Malaga, airborne: the controller handoff, once.
-        let sw = region_tick(36.6, -4.6, false, t0).expect("handoff");
-        assert!(!sw.crew, "airborne switch is the controller's");
-        assert!(sw.line.contains("Contact Malaga Tower"), "{}", sw.line);
-        assert!(sw.line.contains("one one eight decimal one"), "{}", sw.line);
+        // Decisively closer to Malaga, airborne — but NOBODY here has talked
+        // to Gibraltar this session (fresh boot mid-flight): the crew
+        // orients, no controller terminating a service it never gave.
+        let sw = region_tick(36.6, -4.6, false, t0).expect("fresh-boot fix");
+        assert!(sw.crew, "no contact yet: the crew speaks, not a controller");
+        assert!(sw.line.contains("Closest field is Malaga"), "{}", sw.line);
+        assert!(!sw.line.contains("Radar services"), "{}", sw.line);
         assert!(PENDING_STATION.lock().unwrap().is_some(), "swap armed for the main loop");
         // While the swap waits to be consumed: silence, no re-arm.
         assert!(region_tick(36.6, -4.6, false, t0).is_none());
+        // Same geometry WITH two-way contact on record: the controller's
+        // proper handoff.
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.15, -5.35));
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::TaxiCleared,
+            callsign: "November one seven two Sierra Papa".into(),
+            runway_ident: "09".into(),
+            pending_readback: None,
+        });
+        let sw = region_tick(36.6, -4.6, false, t0).expect("handoff");
+        assert!(!sw.crew, "with a service on record the controller hands off");
+        assert!(sw.line.contains("Contact Malaga Tower"), "{}", sw.line);
+        assert!(sw.line.contains("one one eight decimal one"), "{}", sw.line);
+        *CLEARANCE.lock().unwrap() = None;
         // Ground relocation: parked AT Malaga with Gibraltar still active
         // (the "started at LERL, Gibraltar answered" case) — the CREW notes
         // the local tower, no radar theatre.
@@ -3995,17 +4384,61 @@ mod tests {
         let sw = region_tick(36.67, -4.50, true, t0).expect("ground relocation");
         assert!(sw.crew, "ground switch is the crew's note");
         assert!(sw.line.contains("We're at Malaga"), "{}", sw.line);
+        run_borrowing_strip_case(); // same SIDE_STATE_LOCK scope, statics owned here
         *REGION.lock().unwrap() = Vec::new();
         *ACTIVE_FIELD.lock().unwrap() = None;
         *PENDING_STATION.lock().unwrap() = None;
         *LAST_REGION_SWITCH.lock().unwrap() = None;
     }
 
+    /// The Trebujena trap (flown 2026-07-11), run inside the region test's
+    /// lock scope: a tower-only grass strip 12 nm off the nose whose apt.dat
+    /// rows borrow "Jerez Tower" / "Seville Approach", with the actual
+    /// destination (ATIS, ground, its own approach) 16 nm out. Raw-distance
+    /// nearest picked the strip, and its controller then vectored the Jerez
+    /// arrival onto Trebujena's 800 m runway two six.
+    fn run_borrowing_strip_case() {
+        let mut jerez = region_apt("Jerez", 36.7446, -6.0601);
+        jerez.apt.freqs.push(nav::AtcFreq {
+            kind: nav::FREQ_ATIS,
+            khz: 125655,
+            name: "ATIS".into(),
+        });
+        jerez.apt.freqs.push(nav::AtcFreq {
+            kind: nav::FREQ_GROUND,
+            khz: 133280,
+            name: "GND".into(),
+        });
+        jerez.apt.freqs.push(nav::AtcFreq {
+            kind: nav::FREQ_APPROACH,
+            khz: 128500,
+            name: "Seville Approach".into(),
+        });
+        *REGION.lock().unwrap() = vec![region_apt("Trebujena", 36.8587, -6.1413), jerez];
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Sevilla San Pablo".into(), 37.418, -5.893));
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+        *SQUAWK_WATCH.lock().unwrap() = None;
+        // Airborne between the two, at the flight's real 13:09 position:
+        // the REAL airport wins the handoff despite being farther.
+        let sw = region_tick(36.98726, -5.94432, false, Instant::now()).expect("switch");
+        assert!(sw.line.contains("Jerez"), "{}", sw.line);
+        let pending = PENDING_STATION.lock().unwrap().take().expect("swap armed");
+        assert_eq!(pending.1.name, "Jerez", "vector the arrival to the destination");
+        // Parked AT the strip, though: you're at the field you're at — the
+        // ground relocation stays raw-nearest, however small the strip.
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Jerez".into(), 36.7446, -6.0601));
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        let sw = region_tick(36.8587, -6.1413, true, Instant::now()).expect("ground relocation");
+        assert!(sw.line.contains("Trebujena"), "{}", sw.line);
+    }
+
     #[test]
     fn runway_occupancy_is_a_tight_rectangle() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // LXGB 09/27, real-ish geometry: ~1.7 km east-west at 36.151N.
-        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway { width_m: 0.0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1512,
@@ -4039,7 +4472,7 @@ mod tests {
 
     #[test]
     fn having_the_current_information_skips_the_qnh() {
-        let _guard = ATIS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *ATIS.lock().unwrap() = Some(AtisState {
             khz: 118500,
             airport: "Gibraltar".into(),
@@ -4113,10 +4546,6 @@ mod tests {
         // Actual wind changes the runway like a real controller would.
         assert_eq!(st.pick_runway(90.0, 10.0), "09");
     }
-
-    /// `HANDOFF` is a process-wide static: every test that arms or drains it
-    /// holds this lock, or parallel tests clobber each other's plan.
-    static HANDOFF_LOCK: Mutex<()> = Mutex::new(());
 
     /// The adversarial corpus (`bench/atc_corpus.yaml`): real whisper output
     /// mined from the flight logs plus hand-written paraphrases, homophone
@@ -4198,7 +4627,7 @@ mod tests {
     /// when it should.
     #[test]
     fn sortie_dialogues_battle_test_the_routing() {
-        let _guard = HANDOFF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = lxgb_apt_file();
         let wx = Wx {
             wind_from_deg: 250.0,
@@ -4333,7 +4762,7 @@ mod tests {
 
     #[test]
     fn readback_discipline_runs_through_the_keyed_route() {
-        let _guard = HANDOFF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = lxgb_apt_file();
         let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
         let wx = Wx { wind_from_deg: 90.0, wind_kts: 8.0 }; // runway 09
@@ -4397,7 +4826,7 @@ mod tests {
 
     #[test]
     fn conditional_line_up_arms_the_release_watch() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = lxgb_apt_file();
         let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
         let wx = Wx { wind_from_deg: 90.0, wind_kts: 8.0 };
@@ -4422,7 +4851,7 @@ mod tests {
         // The lander is down and gone: the watch releases the clearance
         // after the clear window, and the FSM sync is queued for the main
         // loop exactly like a plain hold.
-        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway { width_m: 0.0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1508156,
@@ -4446,10 +4875,10 @@ mod tests {
 
     #[test]
     fn wake_clock_starts_on_an_airline_liftoff_and_blocks_the_release() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.1512, -5.3554));
         *ACTIVE_PANEL.lock().unwrap() = Some(("Gibraltar".into(), 11.0, Vec::new()));
-        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway { width_m: 0.0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1508156,
@@ -4502,11 +4931,11 @@ mod tests {
 
     #[test]
     fn off_route_taxiing_gets_a_nudge_with_the_via_line() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.1512, -5.3554));
         *ACTIVE_PANEL.lock().unwrap() =
             Some(("Gibraltar".into(), 11.0, vec![("tower".to_string(), 131200_i64)]));
-        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway { width_m: 0.0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1508156,
@@ -4526,6 +4955,8 @@ mod tests {
         *TAXI_ROUTE.lock().unwrap() = Some(TaxiWatch {
             path: vec![(36.1600, -5.3600), (36.1600, -5.3500)],
             via: "Alpha, Bravo".into(),
+            seg: vec![("A".into(), false)],
+            holding_point: "A1".into(),
         });
         let t0 = Instant::now();
         let sec = std::time::Duration::from_secs;
@@ -4550,7 +4981,7 @@ mod tests {
 
     #[test]
     fn coach_owes_the_readback_first_and_teaches_the_line_up() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *ACTIVE_PANEL.lock().unwrap() = Some(("Gibraltar".into(), 11.0, Vec::new()));
         let cs = "November one seven two Sierra Papa";
         // A readback owed IS the next call — it outranks the state grid.
@@ -4576,8 +5007,8 @@ mod tests {
 
     #[test]
     fn narrated_takeoff_names_the_departure_end_not_the_nearest() {
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway { width_m: 0.0,
             ident_a: "09".into(),
             ident_b: "27".into(),
             lat_a: 36.1508156,
@@ -4625,8 +5056,7 @@ mod tests {
         // zone watch must give the pilot the cooldown window to actually
         // call, not challenge them as an intruder two seconds later
         // (2026-07-10 tape).
-        let _atis = ATIS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = REGION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         lxgb().install();
         assert!(
             COMPLIANCE.lock().unwrap().zone_last.is_some(),
@@ -4664,7 +5094,7 @@ mod tests {
     #[test]
     #[ignore = "needs X-Plane's Global Airports apt.dat; run with -- --ignored"]
     fn atc_world_sweep_every_towered_field_stands_up() {
-        let _guard = HANDOFF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = std::env::var("XCOPILOT_APT_DAT").unwrap_or_else(|_| {
             "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat"
                 .to_string()
@@ -4737,7 +5167,7 @@ mod tests {
 
     #[test]
     fn takeoff_clearance_arms_the_departure_handoff() {
-        let _guard = HANDOFF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = lxgb_apt_file();
         let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
         assert_eq!(st.departure_khz, Some(130400), "departure row wired");
@@ -4960,6 +5390,10 @@ mod tests {
             runway_spoken: "zero niner".into(),
             tower_spoken: Some(atis::spoken_mhz(st.tower_khz)),
             target_alt_ft,
+            ils: false,
+            join_nm: 6.0,
+            cleared: false,
+            dialect: Dialect::Icao,
             last_tx: None,
             last_heading: None,
         });
@@ -5002,10 +5436,13 @@ mod tests {
 
         let first = first.expect("an opening vector");
         assert!(first.contains("fly heading"), "{first}");
+        // Gibraltar speaks ICAO/CAP 413: altitudes are "descend to altitude
+        // ... feet", and headings carry "degrees".
         assert!(
-            first.contains("descend and maintain one thousand five hundred"),
+            first.contains("descend to altitude one thousand five hundred feet"),
             "{first}"
         );
+        assert!(first.contains("degrees"), "{first}");
         let cleared = cleared.expect("never established on final in 40 sim-minutes");
         assert!(cleared.contains("runway zero niner"), "{cleared}");
         assert!(
@@ -5050,10 +5487,166 @@ mod tests {
             runway_spoken: String::new(),
             tower_spoken: None,
             target_alt_ft,
+            ils: false,
+            join_nm: 6.0,
+            cleared: false,
+            dialect: Dialect::Icao,
             last_tx: None,
             last_heading: None,
         });
         assert!(vector_tick(thr_lat, thr_lon, 15.0, None, true, t0).is_none());
         assert!(VECTORS.lock().unwrap().is_none(), "on-ground tick clears the plan");
+
+        // --- The same arrival flown as an ILS. The clearance rides the
+        // intercept turn ("cleared ILS approach..., report established"),
+        // headings carry "degrees" (ICAO dialect), and the established
+        // wedge hands off WITHOUT re-clearing.
+        *VECTORS.lock().unwrap() = Some(VectorPlan {
+            callsign: "November one seven two Sierra Papa".into(),
+            thr_lat,
+            thr_lon,
+            course_deg: course,
+            runway_spoken: "zero niner".into(),
+            tower_spoken: Some(atis::spoken_mhz(st.tower_khz)),
+            target_alt_ft,
+            ils: true,
+            join_nm: 6.0,
+            cleared: false,
+            dialect: Dialect::Icao,
+            last_tx: None,
+            last_heading: None,
+        });
+        let (mut lat, mut lon) = crate::autoland::project_latlon(thr_lat, thr_lon, 0.0, 10.0);
+        let mut alt = 3000.0_f64;
+        let mut hdg = 180.0_f64;
+        let mut cleared_ils: Option<String> = None;
+        let mut handoff: Option<String> = None;
+        for step in 0..240u64 {
+            let now = t0 + Duration::from_secs(7200 + step * 10);
+            if let Some(msg) = vector_tick(lat, lon, alt, Some(hdg), false, now) {
+                if msg.contains("fly heading") {
+                    assert!(msg.contains("degrees"), "ICAO headings carry the unit: {msg}");
+                }
+                if msg.contains("Cleared ILS approach") {
+                    cleared_ils.get_or_insert(msg.clone());
+                }
+                if msg.contains("Contact Tower") {
+                    handoff = Some(msg);
+                    break;
+                }
+            }
+            if let Some(h) = VECTORS.lock().unwrap().as_ref().and_then(|p| p.last_heading) {
+                hdg = h as f64;
+            }
+            let (nlat, nlon) =
+                crate::autoland::project_latlon(lat, lon, hdg, 100.0 * 10.0 / 3600.0);
+            (lat, lon) = (nlat, nlon);
+            alt = (alt - 80.0).max(target_alt_ft);
+        }
+        let cleared_ils = cleared_ils.expect("ILS clearance never issued");
+        assert!(
+            cleared_ils.contains("report established"),
+            "the intercept clearance asks for the report: {cleared_ils}"
+        );
+        let handoff = handoff.expect("no handoff after establishing");
+        assert!(
+            !handoff.contains("Cleared"),
+            "already cleared on the intercept, don't re-clear: {handoff}"
+        );
+        assert!(VECTORS.lock().unwrap().is_none(), "ILS plan wiped after handoff");
+
+        // --- The pilot who reports "established" earns the handoff from the
+        // approach controller directly, and the plan dies with it.
+        let ctx2 = tower::Ctx {
+            callsign: "November one seven two Sierra Papa".into(),
+            airport: "Gibraltar".into(),
+            runway: "zero niner".into(),
+            qnh: "one zero one seven".into(),
+            wind: "calm".into(),
+            holding_point: "Alpha".into(),
+            approach: Some(atis::spoken_mhz(122800)),
+            squawk: "seven zero zero zero".into(),
+            final_traffic_nm: None,
+            final_traffic_callsign: None,
+            final_traffic_count: 0,
+            runway_occupied: false,
+            wake_secs_left: None,
+            taxi_via: Vec::new(),
+            taxi_crossings: Vec::new(),
+            on_ground: false,
+        };
+        let wx2 = Wx { wind_from_deg: 90.0, wind_kts: 8.0 };
+        *VECTORS.lock().unwrap() = Some(VectorPlan {
+            callsign: "November one seven two Sierra Papa".into(),
+            thr_lat,
+            thr_lon,
+            course_deg: course,
+            runway_spoken: "zero niner".into(),
+            tower_spoken: Some(atis::spoken_mhz(st.tower_khz)),
+            target_alt_ft,
+            ils: true,
+            join_nm: 6.0,
+            cleared: true,
+            dialect: Dialect::Icao,
+            last_tx: None,
+            last_heading: None,
+        });
+        let r = st.route_keyed(
+            "gibraltar approach, established i l s runway zero niner",
+            Service::Approach,
+            &ctx2,
+            wx2,
+        );
+        assert!(r.contains("Contact Gibraltar Tower"), "established → handoff: {r}");
+        assert!(VECTORS.lock().unwrap().is_none(), "report kills the plan");
+
+        // --- Arm phrasing per dialect, with real chart data on file: the
+        // CIFP platform (2,000 ft here) outranks the geometric default.
+        *ILS_FACTS.lock().unwrap() = Some(std::sync::Arc::new(IlsFacts {
+            ils: vec![nav::AirportIls {
+                runway: "09".into(),
+                freq_10khz: 11030,
+                course_mag: 90.0,
+                gs_deg: Some(3.0),
+            }],
+            platform_ft: [("09".to_string(), 2000.0)].into_iter().collect(),
+        }));
+        let r = st.route_keyed("request vectors", Service::Approach, &ctx2, wx2);
+        assert!(r.contains("Vectoring ILS approach runway zero niner"), "{r}");
+        assert!(r.contains("Descend to altitude two thousand feet"), "CIFP platform: {r}");
+        st.set_dialect(Dialect::Faa);
+        let r = st.route_keyed("request vectors", Service::Approach, &ctx2, wx2);
+        assert!(r.contains("Expect vectors ILS runway zero niner approach"), "{r}");
+        assert!(r.contains("Descend and maintain two thousand"), "{r}");
+
+        // Statics must not leak into other tests.
+        *VECTORS.lock().unwrap() = None;
+        *ILS_FACTS.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn ils_join_sits_under_the_glideslope() {
+        // Heathrow: 2,500 ft platform over an 83 ft field, 3° slope — the
+        // slope reaches ~2,417 AAL at ~7.6 nm, so the join must be past it.
+        let join = ils_join_nm(2417.0, 3.0);
+        assert!((8.0..10.0).contains(&join), "{join}");
+        // At the join, the slope is ABOVE the platform: intercept from below.
+        let slope_at_join_ft = (join - 1.0) * 6076.12 * 3.0_f64.to_radians().tan();
+        assert!(slope_at_join_ft >= 2417.0 - 1.0, "{slope_at_join_ft}");
+        // A low platform never pulls the join inside the visual's 6 nm.
+        assert_eq!(ils_join_nm(800.0, 3.0), 6.0);
+        // A degenerate slope angle can't divide toward infinity.
+        assert!(ils_join_nm(2000.0, 0.0).is_finite());
+    }
+
+    #[test]
+    fn phraseology_follows_geography() {
+        assert_eq!(dialect_for("EGLL"), Dialect::Icao);
+        assert_eq!(dialect_for("LXGB"), Dialect::Icao);
+        assert_eq!(dialect_for("LEMD"), Dialect::Icao);
+        assert_eq!(dialect_for("KORD"), Dialect::Faa);
+        assert_eq!(dialect_for("PHNL"), Dialect::Faa);
+        assert_eq!(dialect_for("CYYZ"), Dialect::Faa);
     }
 }

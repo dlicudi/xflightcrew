@@ -93,6 +93,15 @@
 - {text: "short final runway two seven", intent: report_final, radio: true}
 - {text: "final for the touch and go", intent: report_final, radio: true}
 - {text: "on final", intent: report_final, radio: true}
+# "Established" is the ILS arrival's final report (earns the clearance from
+# the tower, the handoff from approach). Whisper splits the acronym.
+- {text: "established i l s runway zero niner", intent: report_final, radio: true}
+- {text: "established on the localizer", intent: report_final, radio: true}
+- {text: "localiser established, november one seven two", intent: report_final, radio: true}
+# But asking ABOUT being established parses unknown — the question guard
+# keeps it off the tower (unkeyed it falls to the copilot; keyed earns a
+# "say again", never a clearance).
+- {text: "how do we know when we're established", intent: unknown, radio: true}
 
 # --- Radio checks: real (including every mangled station name) ---------------
 - {text: "radio check", intent: radio_check, radio: true}

@@ -97,6 +97,115 @@ pub fn nearest_ils_airport(path: &str, lat: f64, lon: f64) -> Result<Option<(Str
     Ok(best)
 }
 
+/// One ILS/LOC facility at a known airport — the approach controller's chart
+/// data. Course keeps the same `bearing / 360` magnetic decode as [`find_ils`];
+/// the glideslope angle comes from the matching row-6 record (its bearing
+/// field is `angle × 100_000 + true course`: 300089.709 → 3.00°).
+#[derive(Debug, Clone)]
+pub struct AirportIls {
+    pub runway: String,
+    /// Frequency and course ride along for the copilot's "set up the ILS"
+    /// composition (auto-tuning NAV1 off the clearance) — the approach
+    /// controller itself only needs to know the ILS exists.
+    #[allow(dead_code)]
+    pub freq_10khz: i64,
+    #[allow(dead_code)]
+    pub course_mag: f64,
+    /// Glideslope angle, degrees — sets how far out the vectors join final
+    /// (the platform must sit under the slope there).
+    pub gs_deg: Option<f64>,
+}
+
+/// Every ILS (row 4) and standalone localizer (row 5) at `icao`, glideslope
+/// angles merged in. One linear scan; call it from a background load, not the
+/// reply path — earth_nav.dat is tens of MB.
+pub fn airport_ils(path: &str, icao: &str) -> Result<Vec<AirportIls>> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening nav data: {path}"))?;
+    let reader = BufReader::new(file);
+    let mut out: Vec<AirportIls> = Vec::new();
+    let mut slopes: Vec<(String, f64)> = Vec::new(); // (runway, gs_deg)
+    for line in reader.lines() {
+        let line = line?;
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 11 || f[8] != icao {
+            continue;
+        }
+        match f[0] {
+            "4" | "5" => out.push(AirportIls {
+                runway: f[10].to_string(),
+                freq_10khz: f[4].parse().unwrap_or(0),
+                course_mag: (f[6].parse::<f64>().unwrap_or(0.0) / 360.0).rem_euclid(360.0),
+                gs_deg: None,
+            }),
+            "6" => {
+                if let Ok(enc) = f[6].parse::<f64>() {
+                    slopes.push((f[10].to_string(), (enc / 1000.0).floor() / 100.0));
+                }
+            }
+            _ => {}
+        }
+    }
+    for ils in &mut out {
+        ils.gs_deg = slopes.iter().find(|(r, _)| *r == ils.runway).map(|(_, a)| *a);
+    }
+    Ok(out)
+}
+
+/// The ILS platform altitude for `runway` (ft MSL) from the airport's CIFP
+/// approach — the "descend to X until established" number, read off the real
+/// procedure instead of invented. Final-segment legs only (route type `I` of
+/// approach `I<runway>`); the FAF leg's crossing altitude (desc-code 4th char
+/// `F`) wins, then the IF leg's glideslope-intercept altitude (alt-desc `I`,
+/// second altitude), then the highest altitude on the segment. `None` = no
+/// CIFP file, no ILS approach in it, or no parsable altitude — the caller
+/// falls back to a geometric platform.
+pub fn ils_platform_alt_ft(cifp_dir: &str, icao: &str, runway: &str) -> Option<f64> {
+    let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
+    let file = std::fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    // Approach idents may carry a variant suffix ("I20-Y"/"I20-Z" at Jerez):
+    // accept them all — the first FAF found wins, and sibling variants of
+    // the same ILS share the platform in practice.
+    let want = format!("I{runway}");
+    let want_pfx = format!("{want}-");
+    let mut faf: Option<f64> = None;
+    let mut gs_intercept: Option<f64> = None;
+    let mut highest: Option<f64> = None;
+    let alt_ft = |s: &str| -> Option<f64> {
+        let s = s.trim();
+        if let Some(fl) = s.strip_prefix("FL") {
+            return fl.parse::<f64>().ok().map(|f| f * 100.0);
+        }
+        s.parse::<f64>().ok().filter(|a| *a > 0.0)
+    };
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if !line.starts_with("APPCH:") {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        if f.len() < 25 || f[1] != "I" || (f[2] != want && !f[2].starts_with(&want_pfx)) {
+            continue;
+        }
+        let a1 = alt_ft(f[23]);
+        if f[8].chars().nth(3) == Some('F') {
+            faf = faf.or(a1);
+        }
+        if f[22].trim() == "I" {
+            gs_intercept = gs_intercept.or_else(|| alt_ft(f[24]));
+        }
+        if let Some(a) = a1 {
+            // Missed-approach legs (after the runway fix) climb ABOVE the
+            // platform; guard by only keeping altitudes at or below the
+            // glideslope-intercept when one is known.
+            if highest.is_none_or(|h| a > h) && gs_intercept.is_none_or(|g| a <= g) {
+                highest = Some(a);
+            }
+        }
+    }
+    faf.or(gs_intercept).or(highest)
+}
+
 /// Leading digits of a runway designator ("28L" → 28, "07" → 7).
 pub fn runway_number(s: &str) -> Option<u32> {
     let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -114,6 +223,8 @@ pub struct Runway {
     pub lon_a: f64,
     pub lat_b: f64,
     pub lon_b: f64,
+    /// Pavement width from the 100-row, metres; 0.0 = unknown.
+    pub width_m: f64,
 }
 
 impl Runway {
@@ -285,6 +396,7 @@ fn parse_runway_row<'a>(fields: impl Iterator<Item = &'a str>) -> Option<Runway>
             lon_a,
             lat_b,
             lon_b,
+            width_m: f[0].parse().unwrap_or(0.0),
         }),
         _ => None,
     }
@@ -403,6 +515,11 @@ pub struct TaxiRoutePlan {
     pub crossings: Vec<String>,
     pub holding_point: String,
     pub path: Vec<(f64, f64)>,
+    /// Per-segment (name, is_runway) aligned with `path`: `seg[i]` describes
+    /// the leg `path[i] -> path[i+1]` (so `seg.len() == path.len() - 1`).
+    /// This is what lets the copilot's taxi guide say "left onto Bravo"
+    /// instead of just "left": the planner knew the names all along.
+    pub seg: Vec<(String, bool)>,
 }
 
 /// Parse `icao`'s taxi network from apt.dat — same streaming block scan as
@@ -568,12 +685,20 @@ impl TaxiNet {
         let mut crossings: Vec<String> = Vec::new();
         let mut holding_point = String::new();
         let mut path: Vec<(f64, f64)> = Vec::new();
+        let mut seg: Vec<(String, bool)> = Vec::new();
         let mut walk = start;
         path.extend(self.nodes.get(&walk).copied());
         for &ei in &edges_rev {
             let e = &self.edges[ei];
             walk = if e.a == walk { e.b } else { e.a };
-            path.extend(self.nodes.get(&walk).copied());
+            // Keep `seg` aligned with `path` segments: a seg entry only when
+            // this edge actually appends a point after an existing one.
+            if let Some(&p) = self.nodes.get(&walk) {
+                if !path.is_empty() {
+                    seg.push((e.name.clone(), e.runway));
+                }
+                path.push(p);
+            }
             if e.name.is_empty() {
                 continue;
             }
@@ -590,7 +715,7 @@ impl TaxiNet {
         }
         via.dedup();
         via.truncate(6);
-        Some(TaxiRoutePlan { via, crossings, holding_point, path })
+        Some(TaxiRoutePlan { via, crossings, holding_point, path, seg })
     }
 }
 
@@ -801,6 +926,83 @@ mod tests {
         // A voice answer stalls past a few seconds — even a debug build must fit.
         assert!(elapsed.as_secs_f64() < 5.0, "scan took {elapsed:?}");
         eprintln!("LEAL scan: {elapsed:?}");
+    }
+
+    #[test]
+    fn airport_ils_reads_locs_and_merges_glideslopes() {
+        // Real EGLL rows (Custom Data cycle): loc row 4, GS row 6, plus a
+        // different airport's loc that must not leak in.
+        let path = std::env::temp_dir().join("xc-nav-ils.dat");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "I").unwrap();
+        writeln!(f, "1150 Version - data cycle").unwrap();
+        writeln!(f, " 4  51.477697222   -0.426961111       79    11030    18  31769.709  IAA EGLL EG 09L ILS-cat-III").unwrap();
+        writeln!(f, " 6  51.478750000   -0.480675000       79    11030    18 300089.709  IAA EGLL EG 09L GS").unwrap();
+        writeln!(f, " 4  51.464969444   -0.428230556       75    10950    18  31769.717  IBB EGLL EG 09R ILS-cat-III").unwrap();
+        writeln!(f, " 4  40.472222222   -3.560833333     2000    11010    18  50400.000  MAA LEMD LE 32L ILS-cat-I").unwrap();
+        writeln!(f, "99").unwrap();
+        f.flush().unwrap();
+        let ils = airport_ils(path.to_str().unwrap(), "EGLL").unwrap();
+        assert_eq!(ils.len(), 2, "{ils:?}");
+        let l = ils.iter().find(|i| i.runway == "09L").expect("09L");
+        assert_eq!(l.freq_10khz, 11030);
+        assert!((l.course_mag - 31769.709 / 360.0).abs() < 0.01, "{}", l.course_mag);
+        assert_eq!(l.gs_deg, Some(3.0), "row-6 encoding: angle×100000 + course");
+        let r = ils.iter().find(|i| i.runway == "09R").expect("09R");
+        assert_eq!(r.gs_deg, None, "no GS row for 09R in this sample");
+    }
+
+    #[test]
+    fn cifp_platform_altitude_reads_the_faf_crossing() {
+        // Real EGLL ILS 27R final legs: IF at 3000 (GS intercept 2500), FAF
+        // crossing 2500, runway fix, and a missed-approach climb that must
+        // NOT win. Expected platform: the FAF's 2500.
+        let dir = std::env::temp_dir().join("xc-cifp-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("EGLL.dat"),
+            "APPCH:010,I,I27R, ,CF27R,EG,P,C,E  I, ,   ,IF, ,IRR,EG,P,I,      ,0887,0123,    ,    ,I,03000,02500,     , ,   ,    ,   , , , , , ,0,D,S;\n\
+             APPCH:020,I,I27R, ,FF27R,EG,P,C,E  F, ,   ,CF, ,IRR,EG,P,I,      ,0887,0098,2680,0025,G,02500,02500,     , ,   ,-300,   ,EGLL,EG,P,A, ,0,D,S;\n\
+             APPCH:030,I,I27R, ,RW27R,EG,P,G,G  M, ,   ,CF, ,IRR,EG,P,I,      ,0887,0023,2680,0075, ,00136,     ,     , ,   ,-300,   , , , , , ,0,D,S;\n\
+             APPCH:050,I,I27R, , , , , , E  , ,   ,CA, , , , , ,      ,    ,    ,3150,    ,+,03000,     ,     , ,   ,    ,   , , , , , ,0,D,S;\n\
+             APPCH:010,A,I27R,BIG,BIG,EG,D, ,V  C, ,   ,IF, , , , , ,      ,    ,    ,    ,    ,-,220,    ,   , , , , , ,0,D,S;\n",
+        )
+        .unwrap();
+        let dir = dir.to_str().unwrap().to_string();
+        assert_eq!(ils_platform_alt_ft(&dir, "EGLL", "27R"), Some(2500.0));
+        // No such approach / airport: honest None, callers fall back.
+        assert_eq!(ils_platform_alt_ft(&dir, "EGLL", "09L"), None);
+        assert_eq!(ils_platform_alt_ft(&dir, "EGKK", "26L"), None);
+        // Variant-suffixed idents (Jerez has I20-Y/I20-Z, no bare I20): the
+        // suffixed approach's FAF must still resolve. Real LEJR rows.
+        std::fs::write(
+            std::path::Path::new(&dir).join("LEJR.dat"),
+            "APPCH:010,I,I20-Y, ,CF20Y,LE,P,C,E  I, ,   ,IF, ,IJR,LE,P,I,      ,0224,0104,    ,    ,J,02600,01800,     , ,   ,    ,   , , , , , ,0,D,S;\n\
+             APPCH:020,I,I20-Y, ,JER,LE,D,B,E  F, ,   ,CF, ,IJR,LE,P,I,      ,0224,0066,2020,0038,H,01800,01800,     ,-,160,-300,   ,JER,LE,D,B, ,0,D,S;\n\
+             APPCH:030,I,I20-Y, ,RW20,LE,P,G,G  M, ,   ,CF, ,IJR,LE,P,I,      ,0224,0014,2020,0052, ,00145,     ,     , ,   ,-300,   , , , , , ,0,D,S;\n",
+        )
+        .unwrap();
+        assert_eq!(ils_platform_alt_ft(&dir, "LEJR", "20"), Some(1800.0));
+    }
+
+    /// Real-install smoke test (needs the sim's nav data + CIFP on disk):
+    /// `cargo test -- --ignored real_install_ils`. Heathrow must resolve all
+    /// four ILS runways and the 27R platform from the actual AIRAC files.
+    #[test]
+    #[ignore]
+    fn real_install_ils_chart_data_reads() {
+        let config = crate::config::Config::from_env().expect("config");
+        let ils = airport_ils(&config.nav_data_path, "EGLL").expect("nav scan");
+        for rwy in ["09L", "09R", "27L", "27R"] {
+            let hit = ils.iter().find(|i| i.runway == rwy);
+            assert!(hit.is_some(), "EGLL {rwy} ILS missing: {ils:?}");
+            assert_eq!(hit.unwrap().gs_deg, Some(3.0), "{rwy}");
+        }
+        assert_eq!(
+            ils_platform_alt_ft(&config.cifp_dir, "EGLL", "27R"),
+            Some(2500.0),
+            "27R platform from the CIFP FAF"
+        );
     }
 
     #[test]

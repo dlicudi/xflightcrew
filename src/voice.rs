@@ -192,6 +192,48 @@ impl StationSpeaker {
     }
 }
 
+/// A station transmission the pilot keyed over, with everything needed to let
+/// it keep "running" silently while PTT is down. Half-duplex radio done
+/// honestly: transmitting blocks your own receiver, it does not pause the
+/// controller. On release the remainder plays from wherever real time has
+/// reached (mid-word, like rejoining a real frequency); fully elapsed means
+/// it is simply gone, and recovery stays procedural ("say again", readback
+/// enforcement), never an automatic repeat. Copilot speech is exempt by
+/// design: interrupting your crew is a decision, not physics, and a barged-in
+/// readback is stale the moment you key up.
+struct SteppedOn {
+    /// The full processed sample buffer (radio effect and squelch included).
+    samples: Vec<f32>,
+    rate: u32,
+    /// When the ORIGINAL playback started: the transmission's real-time clock,
+    /// preserved across re-presses so a second interruption resumes further in.
+    started: Instant,
+    speaker: StationSpeaker,
+    text: String,
+    /// Original queue position, so the requeued tail sorts ahead of everything
+    /// enqueued while PTT was held (it was in-flight; it owns that slot).
+    priority: Priority,
+    seq: u64,
+}
+
+/// Where a stepped-on transmission's real-time clock has reached, as a sample
+/// offset into its buffer. `None` once it has (nearly) fully elapsed: under
+/// 50 ms left is just the squelch stub, not worth keying the speakers for.
+/// Pure, so the barge-in math is testable without audio.
+fn tail_offset(elapsed_s: f32, len: usize, rate: u32) -> Option<usize> {
+    let offset = (elapsed_s.max(0.0) as f64 * rate as f64) as usize;
+    (offset + rate as usize / 20 < len).then_some(offset)
+}
+
+/// Short linear ramp (~10 ms) so a mid-word entry opens like squelch breaking,
+/// not a click.
+fn fade_in(samples: &mut [f32], rate: u32) {
+    let n = (rate as usize / 100).clamp(1, samples.len());
+    for (i, s) in samples[..n].iter_mut().enumerate() {
+        *s *= i as f32 / n as f32;
+    }
+}
+
 struct Utterance {
     priority: Priority,
     /// Monotonic enqueue order, for FIFO tie-breaking within a priority.
@@ -208,6 +250,9 @@ struct Utterance {
     /// every voice arbitrated: they can never talk over each other, and the
     /// mic stays gated across all of them.
     station: Option<StationSpeaker>,
+    /// A stepped-on transmission rejoining the air: pre-rendered samples played
+    /// from the real-time position instead of synthesizing `text` again.
+    tail: Option<Arc<SteppedOn>>,
     /// Present for blocking callers; signalled once the utterance is spoken.
     done: Option<Arc<Latch>>,
 }
@@ -256,6 +301,13 @@ struct Inner {
     /// You don't talk over the pilot's transmission; the queue holds and
     /// resumes on release (2026-07-10: the party line yakked through PTT).
     hold: std::sync::atomic::AtomicBool,
+    /// The station transmission currently on the air, published just before
+    /// playback starts and cleared when it ends. `shutup()` steals it so a
+    /// PTT press "steps on" the transmission instead of erasing it.
+    now_playing: Mutex<Option<Arc<SteppedOn>>>,
+    /// The transmission the last PTT press stepped on, consumed at release:
+    /// its remainder requeues if real time hasn't outrun it (see [`SteppedOn`]).
+    stepped_on: Mutex<Option<Arc<SteppedOn>>>,
     /// What the copilot has spoken recently, with when it finished. The listener
     /// checks heard transcripts against this to reject its own voice coming back
     /// over the speakers (echo) rather than acting on it.
@@ -284,6 +336,8 @@ impl Voice {
             station_seed: std::sync::atomic::AtomicUsize::new(0),
             station_local: Mutex::new(None),
             hold: std::sync::atomic::AtomicBool::new(false),
+            now_playing: Mutex::new(None),
+            stepped_on: Mutex::new(None),
             spoken: Mutex::new(Vec::new()),
         });
         let gate = MicGate::new();
@@ -335,11 +389,52 @@ impl Voice {
             .hold
             .store(held, std::sync::atomic::Ordering::Relaxed);
         if !held {
+            // A transmission the press stepped on kept "running" silently. If
+            // real time hasn't outrun it, requeue its remainder with the
+            // ORIGINAL seq: it was in-flight, so it still sorts ahead of
+            // everything enqueued during the hold. Expired = gone, like a
+            // real stepped-on call; "say again" is the recovery.
+            let stepped = self
+                .inner
+                .stepped_on
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(t) = stepped {
+                if tail_offset(t.started.elapsed().as_secs_f32(), t.samples.len(), t.rate)
+                    .is_some()
+                {
+                    let mut q = self.inner.queue.lock().unwrap();
+                    q.heap.push(Utterance {
+                        priority: t.priority,
+                        seq: t.seq,
+                        text: t.text.clone(),
+                        chime: false,
+                        negative: false,
+                        station: Some(t.speaker),
+                        tail: Some(t),
+                        done: None,
+                    });
+                }
+            }
             self.inner.cv.notify_one(); // wake the speaker to drain the backlog
         }
     }
 
     pub fn shutup(&self) {
+        // Steal the on-air station transmission (if any) before killing its
+        // audio: the pilot stepped on it, they didn't erase it. Its clock
+        // (`started`) keeps running while PTT is down.
+        *self
+            .inner
+            .stepped_on
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = self
+            .inner
+            .now_playing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         {
             let mut q = self.inner.queue.lock().unwrap();
             for utt in q.heap.drain() {
@@ -374,7 +469,7 @@ impl Voice {
         // No em/en dashes reach the TTS — they trip it up. One chokepoint for
         // every spoken utterance (readbacks, monitor callouts, prompts).
         let text = crate::phrase::scrub_dashes(&text);
-        self.push(Utterance { priority, seq: 0, text, chime, negative: false, station: None, done });
+        self.push(Utterance { priority, seq: 0, text, chime, negative: false, station: None, tail: None, done });
     }
 
     fn enqueue_station(
@@ -386,7 +481,7 @@ impl Voice {
     ) {
         let text = crate::phrase::scrub_dashes(&text);
         tracing::info!(transmitting = %text, "station");
-        self.push(Utterance { priority, seq: 0, text, chime: false, negative: false, station: Some(speaker), done });
+        self.push(Utterance { priority, seq: 0, text, chime: false, negative: false, station: Some(speaker), tail: None, done });
     }
 
     /// Push a fully-formed utterance onto the queue (stamping its FIFO seq under
@@ -416,6 +511,7 @@ impl Voice {
             chime: false,
             negative: true,
             station: None,
+            tail: None,
             done: Some(latch.clone()),
         });
         let mut spoken = latch.spoken.lock().unwrap();
@@ -564,19 +660,29 @@ impl StationVoice {
         })
     }
 
-    fn speak(&mut self, text: &str) -> anyhow::Result<()> {
+    /// Speak `text` as this station. `on_start` fires with the fully processed
+    /// sample buffer just before playback begins: the arbiter publishes it as
+    /// the on-air transmission so a PTT press can step on it and the release
+    /// can play the remainder (ONNX only; the `say` fallback has no buffer to
+    /// resume, so a stepped-on call there is simply lost, as before).
+    fn speak(&mut self, text: &str, on_start: impl FnOnce(&[f32], u32)) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "onnx-tts")]
             StationVoice::Onnx { engine, tail, transmissions } => {
                 *transmissions = transmissions.wrapping_add(1);
                 let variant = *transmissions;
                 let tail = tail.clone();
-                engine.speak_with(text, move |s, r| match &tail {
+                let samples = engine.render_with(text, move |s, r| match &tail {
                     Some(t) => crate::radiofx::radioize_with_tail(s, r, variant, t),
                     None => crate::radiofx::radioize_variant(s, r, variant),
-                })
+                })?;
+                on_start(&samples, engine.sample_rate());
+                tts::play_pcm(&samples, engine.sample_rate())
             }
-            StationVoice::Say(config) => tts::speak(config, text),
+            StationVoice::Say(config) => {
+                let _ = on_start;
+                tts::speak(config, text)
+            }
         }
     }
 }
@@ -679,6 +785,39 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
                 tracing::warn!("{what} failed: {msg}");
             }
         };
+        // A stepped-on station transmission rejoining the air: play whatever
+        // remains from the REAL-TIME position (it kept running while the pilot
+        // transmitted). Queue delay may have outrun it by now; then it's
+        // silently gone, exactly like the real thing. Republished as on-air
+        // with its ORIGINAL clock, so a second press resumes further along.
+        if let Some(tail) = utt.tail {
+            if let Some(offset) =
+                tail_offset(tail.started.elapsed().as_secs_f32(), tail.samples.len(), tail.rate)
+            {
+                let mut rest = tail.samples[offset..].to_vec();
+                fade_in(&mut rest, tail.rate);
+                *inner.now_playing.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(tail.clone());
+                if let Err(e) = crate::tts::play_pcm(&rest, tail.rate) {
+                    log_play_err("stepped-on tail", e);
+                }
+                inner
+                    .now_playing
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                // Refresh the echo memory: this audio just left the speakers
+                // again, and the mic may catch it.
+                let mut said = inner.spoken.lock().unwrap();
+                said.push((Instant::now(), tail.text.clone()));
+                said.retain(|(t, _)| t.elapsed() < ECHO_MEMORY);
+            }
+            if let Some(latch) = utt.done {
+                *latch.spoken.lock().unwrap() = true;
+                latch.cv.notify_all();
+            }
+            continue;
+        }
         if utt.negative {
             if let Some(path) = &negative_path {
                 if let Err(e) = crate::tts::play(path) {
@@ -730,7 +869,22 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
                 if slot.as_ref().map(|(m, _)| m.as_str()) != Some(model.as_str()) {
                     *slot = Some((model.clone(), StationVoice::build(&station_cfg, model)));
                 }
-                slot.as_mut().expect("just built").1.speak(&utt.text)
+                // Publish the transmission as on-air just before playback, so
+                // a PTT press steps on it (steals it with its clock running)
+                // instead of erasing it. Copilot speech is deliberately never
+                // published: barging in on your own crew drops their line.
+                slot.as_mut().expect("just built").1.speak(&utt.text, |samples, rate| {
+                    *inner.now_playing.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(Arc::new(SteppedOn {
+                            samples: samples.to_vec(),
+                            rate,
+                            started: Instant::now(),
+                            speaker: who,
+                            text: utt.text.clone(),
+                            priority: utt.priority,
+                            seq: utt.seq,
+                        }));
+                })
             } else {
                 speaker.speak(&utt.text)
             }
@@ -765,6 +919,13 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
                 tracing::warn!("TTS failed: {msg}");
             }
         }
+        // Off the air, either way: finished playback clears its own slot; a
+        // barge-in already stole it (this take then finds None, harmlessly).
+        inner
+            .now_playing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         // Remember what we just said (it just finished playing) so the listener can
         // reject this audio if it bleeds back through the mic. Prune the old.
         {
@@ -822,7 +983,7 @@ mod tests {
     use super::*;
 
     fn utt(priority: Priority, seq: u64) -> Utterance {
-        Utterance { priority, seq, text: String::new(), chime: false, negative: false, station: None, done: None }
+        Utterance { priority, seq, text: String::new(), chime: false, negative: false, station: None, tail: None, done: None }
     }
 
     #[test]
@@ -883,6 +1044,48 @@ mod tests {
         assert_eq!(h.pop().unwrap().priority, Priority::Warning);
         assert_eq!(h.pop().unwrap().priority, Priority::Readback);
         assert_eq!(h.pop().unwrap().priority, Priority::Advisory);
+    }
+
+    #[test]
+    fn stepped_on_tail_tracks_real_time() {
+        let rate = 22_050;
+        let len = 3 * rate as usize; // a 3-second transmission
+        // One second into the call: the tail starts one second of samples in.
+        assert_eq!(tail_offset(1.0, len, rate), Some(rate as usize));
+        // The press outlived the transmission: nothing left to hear.
+        assert_eq!(tail_offset(3.0, len, rate), None);
+        assert_eq!(tail_offset(10.0, len, rate), None);
+        // Under 50 ms remaining is just the squelch stub: skip it.
+        assert_eq!(tail_offset(2.99, len, rate), None);
+        // A clock skew below zero clamps to the start rather than panicking.
+        assert_eq!(tail_offset(-0.5, len, rate), Some(0));
+    }
+
+    #[test]
+    fn tail_fades_in_from_silence() {
+        let rate = 22_050;
+        let mut s = vec![1.0_f32; rate as usize];
+        fade_in(&mut s, rate);
+        assert_eq!(s[0], 0.0, "mid-word entry must open from silence");
+        assert!(s[rate as usize / 100] > 0.99, "ramp is over within ~10 ms");
+        // Degenerate buffers (shorter than the ramp) must not panic.
+        let mut tiny = vec![1.0_f32; 3];
+        fade_in(&mut tiny, rate);
+    }
+
+    #[test]
+    fn requeued_tail_keeps_its_place_in_line() {
+        // The stepped-on transmission requeues with its ORIGINAL seq, so it
+        // pops ahead of everything enqueued while PTT was held.
+        let mut h = BinaryHeap::new();
+        h.push(utt(Priority::Readback, 7)); // held backlog, queued during the press
+        h.push(utt(Priority::Readback, 8));
+        h.push(utt(Priority::Readback, 3)); // the tail, preserved seq
+        assert_eq!(h.pop().unwrap().seq, 3);
+        // But a higher priority still outranks it: a Warning does not wait
+        // behind a resumed transmission.
+        h.push(utt(Priority::Warning, 9));
+        assert_eq!(h.pop().unwrap().priority, Priority::Warning);
     }
 
     #[test]
