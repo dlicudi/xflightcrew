@@ -1778,28 +1778,20 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 // Off-route it goes quiet: the compliance watch above owns
                 // that conversation, and two voices saying it would nag.
                 if config.taxi_guide && snap.on_ground {
-                    let taxiing = crate::station::CLEARANCE
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                        .is_some_and(|c| c.state == crate::tower::State::TaxiCleared);
+                    let taxiing = crate::party_line::clearance_state()
+                        == Some(crate::tower::State::TaxiCleared);
                     if taxiing {
-                        {
-                            let route = crate::station::TAXI_ROUTE
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            match route.as_ref() {
-                                Some(watch)
-                                    if !taxi_guide
-                                        .as_ref()
-                                        .is_some_and(|g| g.is_for(&watch.path)) =>
-                                {
-                                    taxi_guide = crate::taxi_guide::Guide::build(watch);
-                                }
-                                Some(_) => {}
-                                None => taxi_guide = None,
+                        crate::party_line::with_taxi_route(|route| match route {
+                            Some(watch)
+                                if !taxi_guide
+                                    .as_ref()
+                                    .is_some_and(|g| g.is_for(&watch.path)) =>
+                            {
+                                taxi_guide = crate::taxi_guide::Guide::build(watch);
                             }
-                        }
+                            Some(_) => {}
+                            None => taxi_guide = None,
+                        });
                         if let Some(cue) = taxi_guide.as_mut().and_then(|g| {
                             g.tick(snap.lat, snap.lon, snap.groundspeed_kts, now)
                         }) {
@@ -1828,15 +1820,9 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                     let tuned_speaker = com1.and_then(crate::station::tuned_controller);
                     let tower_tuned =
                         matches!(tuned_speaker, Some(crate::voice::StationSpeaker::Tower));
-                    let cleared_to_land = crate::station::CLEARANCE
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                        .is_some_and(|c| c.state == crate::tower::State::ClearedToLand);
-                    let hold_armed = crate::station::TAKEOFF_HOLD
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_some();
+                    let cleared_to_land = crate::party_line::clearance_state()
+                        == Some(crate::tower::State::ClearedToLand);
+                    let hold_armed = crate::party_line::takeoff_hold_armed();
                     let chatter_on = config.atc_chatter && tower_tuned;
                     // The wake watch needs the TCAS picture while the pilot
                     // is on the tower frequency on the ground — a heavy
@@ -2006,11 +1992,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 // any of the station's frequencies while airborne. At most
                 // one call per 45 s. Narration only — separation stays the
                 // pilot's job.
-                let vectored = crate::station::VECTORS
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_ref()
-                    .map(|p| p.callsign.clone());
+                let vectored = crate::party_line::vectored_callsign();
                 let controller = if vectored.is_some() {
                     Some(crate::voice::StationSpeaker::Approach)
                 } else if !snap.on_ground {

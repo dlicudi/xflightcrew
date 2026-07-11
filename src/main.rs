@@ -30,6 +30,7 @@ mod llm;
 mod mic;
 mod monitor;
 mod nav;
+mod party_line;
 mod phrase;
 mod plugin_status;
 mod readback;
@@ -964,11 +965,7 @@ async fn run_session(
         // input is already captured, and a silent cockpit must still swap
         // (the Heathrow handoff sat unconsumed for minutes, 2026-07-10, and
         // the party line waited on it).
-        if let Some((icao, apt)) = station::PENDING_STATION
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+        if let Some((icao, apt)) = party_line::take_pending_station() {
             let name = apt.name.clone();
             match station::Station::from_airport(apt) {
                 Some(mut st) => {
@@ -1005,11 +1002,7 @@ async fn run_session(
         // A held takeoff clearance the monitor released once the final
         // cleared: sync the tower FSM (state + departure handoff) with what
         // was already said on frequency.
-        if std::mem::take(
-            &mut *station::PENDING_TAKEOFF_CLEARANCE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        ) {
+        if party_line::take_pending_takeoff_clearance() {
             if let Some(st) = atc_station.as_mut() {
                 st.apply_monitor_takeoff_clearance(&xplane).await;
                 reporter.log(ui::LogKind::Info, "tower: held takeoff clearance released");
@@ -1294,9 +1287,8 @@ async fn run_session(
                 (Ok(lat), Ok(lon)) => Some((lat, lon)),
                 _ => None,
             };
-            let line = {
-                let route = station::TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner());
-                match (route.as_ref(), pos) {
+            let line = party_line::with_taxi_route(|route| {
+                match (route, pos) {
                     (Some(w), Some((lat, lon))) => taxi_guide::describe(w, lat, lon),
                     (Some(w), None) if !w.via.is_empty() => {
                         format!("The cleared route is via {}.", w.via)
@@ -1310,7 +1302,7 @@ async fn run_session(
                             .to_string()
                     }
                 }
-            };
+            });
             say(&voice, &reporter, ui::LogKind::Readback, &line);
             continue;
         }

@@ -4,7 +4,8 @@
 //! ATC says the route once; a real crew then navigates it together: "next
 //! left is Whiskey", "approaching zero niner left, that's our crossing",
 //! "holding point ahead". This module is the crew half of the taxi story:
-//! it CONSUMES the route the tower published to [`crate::station::TAXI_ROUTE`]
+//! it CONSUMES the route the tower published to the party line
+//! ([`crate::party_line::with_taxi_route`])
 //! and speaks just-in-time cues in the copilot's own voice. Read-only by
 //! construction (route + position in, text out) — it never actuates, and it
 //! never invents route: no published clearance, no guidance.

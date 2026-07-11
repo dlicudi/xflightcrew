@@ -14,6 +14,14 @@ use crate::voice::StationSpeaker;
 use crate::xplane::XPlaneClient;
 use crate::{atis, datarefs, nav, tower};
 
+// The state this module publishes for the crew lives on the party line —
+// one audited page. `pub(crate)` re-export so the world side (this module
+// and its tests) writes them by their bare names; the crew side reads via
+// `party_line`'s accessors, never these statics.
+pub(crate) use crate::party_line::{
+    CLEARANCE, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, TAKEOFF_HOLD, TAXI_ROUTE, VECTORS,
+};
+
 /// Which of the station's frequencies COM1 is tuned to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Service {
@@ -1122,7 +1130,7 @@ pub struct SquawkWatch {
     nudges: u32,
 }
 
-pub static SQUAWK_WATCH: Mutex<Option<SquawkWatch>> = Mutex::new(None);
+static SQUAWK_WATCH: Mutex<Option<SquawkWatch>> = Mutex::new(None);
 
 /// Knob-spinning time before the first nudge.
 const SQUAWK_GRACE_SECS: f64 = 20.0;
@@ -1199,8 +1207,6 @@ pub struct ClearanceSnap {
     /// first suggestion. `None` = no readback outstanding.
     pub pending_readback: Option<String>,
 }
-
-pub static CLEARANCE: Mutex<Option<ClearanceSnap>> = Mutex::new(None);
 
 /// A compliance or zone call: what to say, and whether the COPILOT says it
 /// (not tuned to the station — a controller can't berate a radio that isn't
@@ -1502,7 +1508,7 @@ pub struct Handoff {
     pub min_alt_ft: f64,
 }
 
-pub static HANDOFF: Mutex<Option<Handoff>> = Mutex::new(None);
+static HANDOFF: Mutex<Option<Handoff>> = Mutex::new(None);
 
 /// One tick of the after-takeoff handoff, ~monitor rate: silence until the
 /// flight is airborne and through the arming altitude, then the handoff
@@ -1532,7 +1538,7 @@ pub struct AtisState {
     last_spoken: Option<Instant>,
 }
 
-pub static ATIS: Mutex<Option<AtisState>> = Mutex::new(None);
+static ATIS: Mutex<Option<AtisState>> = Mutex::new(None);
 
 /// Re-broadcast cadence while the pilot stays tuned — a real ATIS loops.
 const ATIS_REPEAT_SECS: f64 = 45.0;
@@ -1680,16 +1686,11 @@ pub struct RegionApt {
     lon: f64,
 }
 
-pub static REGION: Mutex<Vec<RegionApt>> = Mutex::new(Vec::new());
+static REGION: Mutex<Vec<RegionApt>> = Mutex::new(Vec::new());
 
 /// The active station's identity + position, for the switch decision. Set by
 /// [`Station::from_airport`].
 static ACTIVE_FIELD: Mutex<Option<(String, f64, f64)>> = Mutex::new(None);
-
-/// A station swap the main loop must consume (it owns the `Station`): the new
-/// field's ICAO (for the voice casting) and airport, armed by [`region_tick`]
-/// after the handoff line is spoken.
-pub static PENDING_STATION: Mutex<Option<(String, nav::AirportInfo)>> = Mutex::new(None);
 
 static LAST_REGION_SWITCH: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -2768,13 +2769,6 @@ pub struct TakeoffHold {
     clear_since: Option<Instant>,
 }
 
-pub static TAKEOFF_HOLD: Mutex<Option<TakeoffHold>> = Mutex::new(None);
-
-/// Set when the monitor speaks the released clearance; the main loop
-/// consumes it and syncs the tower FSM (state + departure handoff) to match
-/// what was said on frequency.
-pub static PENDING_TAKEOFF_CLEARANCE: Mutex<bool> = Mutex::new(false);
-
 /// The final must stay clear this long before the held clearance releases —
 /// an arrival crossing the fence vanishes from the airborne band while still
 /// rolling out, and "cleared for takeoff" over a lander is a contradiction.
@@ -2848,7 +2842,7 @@ pub struct Wake {
     pub runway_ident: String,
 }
 
-pub static WAKE: Mutex<Option<Wake>> = Mutex::new(None);
+static WAKE: Mutex<Option<Wake>> = Mutex::new(None);
 
 /// ICAO's two minutes for a light departing behind a medium/heavy from the
 /// same position.
@@ -2936,8 +2930,6 @@ pub struct TaxiWatch {
     /// RAW holding-point taxiway name ("A13"), the route's destination.
     pub holding_point: String,
 }
-
-pub static TAXI_ROUTE: Mutex<Option<TaxiWatch>> = Mutex::new(None);
 
 /// The active field's ILS facilities (earth_nav.dat) and per-runway platform
 /// altitudes (CIFP approach legs), background-loaded per station — both are
@@ -3156,8 +3148,6 @@ pub struct VectorPlan {
     last_tx: Option<Instant>,
     last_heading: Option<i64>,
 }
-
-pub static VECTORS: Mutex<Option<VectorPlan>> = Mutex::new(None);
 
 /// How far out the vectors aim you onto final (the join point) for a VISUAL
 /// approach; an ILS join is computed from its platform instead.
@@ -5375,6 +5365,7 @@ mod tests {
     fn lxgb_vectored_arrival_flies_to_a_landing_clearance() {
         use std::time::Duration;
 
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = lxgb_apt_file();
         let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
         let rw = st.apt.runways[0].clone();

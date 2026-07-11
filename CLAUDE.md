@@ -101,6 +101,19 @@ just under vectors. Station side state (ATIS/region/controller freqs) is
 published by `Station::install()`, called by the owner — never by
 `from_airport`, so sweeps and tests stay side-effect free.
 
+**The crew/world boundary is one page** (2026-07-11): everything ATC
+publishes for the copilot lives in [src/party_line.rs](src/party_line.rs) —
+six statics, read only through its narrow accessors (`clearance_state`,
+`with_taxi_route`, `takeoff_hold_armed`, `vectored_callsign`, plus two
+`take_*` queue consumers for the main loop). The world side (station/tower)
+writes them; the crew side (main, the monitor's crew watches, taxi_guide)
+never does. Every other station static is private. This is convention until
+a workspace split makes it compiler-checked; when the crew needs a new fact
+it gets a new accessor there, never a new `pub static`. Station tests that
+touch ANY process-wide static must hold `SIDE_STATE_LOCK` — `respond()`
+publishes on every reply, so one unguarded test races every guarded one
+(the vectored-arrival test stomped five others, 2026-07-11).
+
 Depth (added 2026-07-11): the FSM grew **readback enforcement** (ICAO's
 runway-critical items only — takeoff/landing/line-up/hold; a correct echo
 earns silence, the wrong RUNWAY gets "negative" + repeat, anything else two
