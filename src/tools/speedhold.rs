@@ -28,6 +28,12 @@ const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const LEFT_BRAKE: &str = "sim/cockpit2/controls/left_brake_ratio";
 const RIGHT_BRAKE: &str = "sim/cockpit2/controls/right_brake_ratio";
+/// While set, X-Plane stops re-driving the toe-brake ratios from the pilot's
+/// hardware every frame. Without it the governor's braking loses the fight
+/// against assigned pedal axes — an SR22 blew through its taxi target with
+/// the copilot "braking" the whole time (2026-07-11). Held ONLY while the
+/// governor actually wants brake, so the pedals stay the pilot's otherwise.
+const OVERRIDE_TOEBRAKES: &str = "sim/operation/override/override_toebrakes";
 const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 const MS_TO_KTS: f64 = 1.943_844;
 
@@ -114,10 +120,15 @@ pub fn taxi_control(target_kts: f64, gs_kts: f64, throttle: f64) -> (Option<f64>
         // Too slow: a touch more power (never takeoff power), brakes off.
         // Small steps on a fast tick — human feet, not a bang-bang thermostat.
         (Some((throttle + (err * 0.003).min(0.01)).min(0.35)), 0.0)
+    } else if err < -3.0 {
+        // WELL past the target: idle now and brake in proportion, together —
+        // the polite step-down let an SR22 run a 10-knot taxi through 20
+        // (2026-07-11). Overspeed deep enough is a stop, not a trim.
+        (Some(0.0), ((-err) * 0.08).clamp(0.2, 0.6))
     } else if err < -1.0 {
-        // Too fast: close the throttle first; brake once it's already closed.
+        // A little fast: close the throttle first; brake once it's closed.
         if throttle > 0.06 {
-            (Some((throttle - 0.012).max(0.0)), 0.0)
+            (Some((throttle - 0.04).max(0.0)), 0.0)
         } else {
             (Some(0.0), ((-err) * 0.08).clamp(0.1, 0.6))
         }
@@ -388,8 +399,14 @@ async fn governor(xp: XPlaneClient) {
                         glide(&xp, THROTTLE, t, 200).await;
                         last_cmd = Some(t);
                     }
+                    if brake > 0.0 && !braking {
+                        let _ = xp.set_float(OVERRIDE_TOEBRAKES, 1.0).await;
+                    }
                     let _ = xp.set_float(LEFT_BRAKE, brake).await;
                     let _ = xp.set_float(RIGHT_BRAKE, brake).await;
+                    if brake <= 0.0 && braking {
+                        let _ = xp.set_float(OVERRIDE_TOEBRAKES, 0.0).await;
+                    }
                     braking = brake > 0.0;
                     tokio::time::sleep(std::time::Duration::from_millis(if wrote { 100 } else { 300 })).await;
                 } else {
@@ -403,6 +420,7 @@ async fn governor(xp: XPlaneClient) {
     if braking {
         let _ = xp.set_float(LEFT_BRAKE, 0.0).await;
         let _ = xp.set_float(RIGHT_BRAKE, 0.0).await;
+        let _ = xp.set_float(OVERRIDE_TOEBRAKES, 0.0).await;
     }
 }
 
@@ -444,11 +462,16 @@ mod tests {
         let (thr, brake) = taxi_control(10.0, 4.0, 0.10);
         assert!(thr.unwrap() > 0.10 && thr.unwrap() <= 0.35);
         assert_eq!(brake, 0.0);
-        // Too fast with power in: close the throttle before touching brakes.
-        let (thr, brake) = taxi_control(10.0, 16.0, 0.20);
+        // A little fast with power in: close the throttle before the brakes.
+        let (thr, brake) = taxi_control(10.0, 12.0, 0.20);
         assert!(thr.unwrap() < 0.20);
         assert_eq!(brake, 0.0, "no braking against thrust");
-        // Too fast at idle: now the brakes, proportionally, bounded.
+        // WELL past the target: idle now AND brake — the polite step-down
+        // let an SR22 run a 10-knot taxi through 20 (2026-07-11).
+        let (thr, brake) = taxi_control(10.0, 16.0, 0.20);
+        assert_eq!(thr, Some(0.0), "deep overspeed cuts to idle immediately");
+        assert!(brake > 0.0 && brake <= 0.6, "{brake}");
+        // Too fast at idle: brakes, proportionally, bounded.
         let (thr, brake) = taxi_control(10.0, 18.0, 0.02);
         assert_eq!(thr, Some(0.0));
         assert!(brake > 0.0 && brake <= 0.6, "{brake}");
