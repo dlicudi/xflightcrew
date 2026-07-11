@@ -21,10 +21,14 @@ const TRIM_TAKEOFF: f64 = 0.0;
 /// the profile says which value means SET (`park_brake_valve_set`).
 const PARK_BRAKE_VALVE: &str = "sim/cockpit2/controls/park_brake_valve";
 const CMD_VALVE_TOGGLE: &str = "sim/flight_controls/park_brake_valve_toggle";
-/// The parking-brake toggle command — preferred over a raw dataref write:
-/// custom airframes intercept commands, while a written ratio can be ignored or
+/// The parking-brake commands — preferred over a raw dataref write: custom
+/// airframes intercept commands, while a written ratio can be ignored or
 /// overwritten by their systems scripts (the MD-82 pitot-heat lesson).
-pub(crate) const CMD_PARK_TOGGLE: &str = "sim/flight_controls/brakes_toggle_max";
+/// Deterministic set/release, not `brakes_toggle_max`: a toggle flips the
+/// wrong way off a stale state read; these are idempotent (pilot's find,
+/// 2026-07-11).
+const CMD_PARK_SET: &str = "sim/flight_controls/park_brake_set";
+const CMD_PARK_RELEASE: &str = "sim/flight_controls/park_brake_release";
 
 pub struct SetParkingBrake {
     /// The valve value meaning SET on this airframe; `None` = leave the valve alone.
@@ -48,9 +52,7 @@ pub(crate) async fn drive_park_brake(
             }
         }
     }
-    if (xp.get_float(PARK_BRAKE).await? > 0.5) != on {
-        xp.run_command(CMD_PARK_TOGGLE).await?;
-    }
+    xp.run_command(if on { CMD_PARK_SET } else { CMD_PARK_RELEASE }).await?;
     // Commands apply on the next sim frame — give it a beat.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let mut set = xp.get_float(PARK_BRAKE).await? > 0.5;

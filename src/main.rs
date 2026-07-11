@@ -1328,7 +1328,13 @@ async fn run_session(
                     let names_speed = tl.contains("throttle") || tl.contains("speed")
                         || tl.contains("power") || tl.contains("taxi") || tl.contains("thr");
                     let names_reverse = tl.contains("reverse");
-                    let generic = !names_mix && !names_speed && !names_reverse;
+                    // "Release parking brake" names a lever NOBODY here holds:
+                    // it's for the brake tool, so it must not count as a
+                    // generic release — that dropped the speed hold instead
+                    // and left the throttle up with the brake still set
+                    // (SR22, 2026-07-11).
+                    let generic = !names_mix && !names_speed && !names_reverse
+                        && !tl.contains("brake");
                     let mut released: Vec<&str> = Vec::new();
                     if speed_held && (names_speed || generic) {
                         tools::speedhold::ACTIVE.store(false, Relaxed);
