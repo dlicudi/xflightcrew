@@ -36,12 +36,37 @@ const CALL_GAP_S: f64 = 5.0;
 /// Once this far past a decision point uncalled, drop the cue silently — a
 /// stale "next left" after the turn is worse than nothing.
 const PASSED_M: f64 = 8.0;
+/// Bends at least this sharp are called "sharp" — the pilot should slow for
+/// them, and "next left" undersells a near-reversal.
+const SHARP_DEG: f64 = 100.0;
+/// Bends below this (but at/above [`TURN_DEG`]) are a "bear left", not a turn.
+const BEAR_DEG: f64 = 45.0;
+/// A named turn at the end of a straight run at least this long earns an
+/// early PREP call ("coming up: ...") as well as the execute cue — on a long
+/// leg the pilot has tuned out by the time the junction arrives.
+const PREP_MIN_RUN_M: f64 = 300.0;
+/// How far before the turn the prep call is anchored.
+const PREP_LEAD_M: f64 = 180.0;
+/// Lateral drift at which a just-passed turn reads as MISSED (below it is
+/// normal turning slop); the missed-turn nudge lives between here and
+/// [`OFF_ROUTE_M`], where the controller takes over.
+const NUDGE_MIN_LAT_M: f64 = 20.0;
+/// How far past a turn's decision point the missed-turn nudge still applies.
+const NUDGE_WINDOW_M: f64 = 90.0;
+/// Stopped at least this long → re-orient the pilot when the wheels roll
+/// again ("we're on Bravo, next is the left onto...").
+const STOP_REORIENT_S: f64 = 20.0;
+/// Above this groundspeed a sharp turn cue gets an "easy now" in front.
+const EASY_KTS: f64 = 15.0;
 
 /// What a cue is about — sets how far out it fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CueKind {
     /// A bend to call with direction ("next left, onto Whiskey").
     Turn,
+    /// The early heads-up before a turn at the end of a long straight
+    /// ("coming up: left onto Whiskey") — the execute cue still follows.
+    Prep,
     /// Same direction, new taxiway name ("straight ahead onto Romeo").
     NameChange,
     /// The route enters a runway edge — the safety call.
@@ -61,7 +86,9 @@ impl CueKind {
     fn lookahead_m(self, gs_kts: f64) -> f64 {
         let gs_mps = gs_kts * 0.514;
         match self {
-            CueKind::Turn | CueKind::NameChange => (gs_mps * 15.0).clamp(80.0, 220.0),
+            CueKind::Turn | CueKind::Prep | CueKind::NameChange => {
+                (gs_mps * 15.0).clamp(80.0, 220.0)
+            }
             CueKind::RunwayAhead | CueKind::HoldingPoint => (gs_mps * 20.0).clamp(120.0, 280.0),
         }
     }
@@ -73,6 +100,12 @@ struct Cue {
     at_m: f64,
     kind: CueKind,
     line: String,
+    /// Terse ASCII form for the panel strip ("left onto G11").
+    short: String,
+    /// Turn direction, for the missed-turn nudge.
+    dir: Option<&'static str>,
+    /// A sharp bend — slow-down territory.
+    sharp: bool,
 }
 
 /// The per-clearance guide: cues precomputed from the published route, each
@@ -82,7 +115,19 @@ pub struct Guide {
     path: Vec<(f64, f64)>,
     cues: Vec<Cue>,
     called: Vec<bool>,
+    /// Missed-turn nudge spoken, per cue — once each, like the cues.
+    nudged: Vec<bool>,
+    /// Along-route name spans for re-orientation: the spoken taxiway name in
+    /// effect up to each cumulative distance.
+    names: Vec<(f64, String)>,
     last_call: Option<Instant>,
+    /// Last (progress, lateral) fix — the missed-turn nudge needs the drift
+    /// TREND, not one noisy read.
+    prev_fix: Option<(f64, f64)>,
+    /// When the aircraft stopped rolling (gs below taxi), if it has.
+    stopped_at: Option<Instant>,
+    /// A long stop just ended — re-orient on the next taxiing tick.
+    reorient_armed: bool,
 }
 
 impl Guide {
@@ -126,6 +171,9 @@ impl Guide {
                     } else {
                         format!("Runway {rwy} ahead on our route. Check it's clear, then cross.")
                     },
+                    short: format!("cross rwy {}", first_designator(&leg_name)),
+                    dir: None,
+                    sharp: false,
                 });
                 continue;
             }
@@ -140,14 +188,29 @@ impl Guide {
             let spoken = spoken_taxiway(&leg_name);
             if delta.abs() >= TURN_DEG {
                 let dir = if delta < 0.0 { "left" } else { "right" };
+                let sharp = delta.abs() >= SHARP_DEG;
+                let named = new_name && !spoken.is_empty();
+                // Sharpness in the words: "next left" undersells a
+                // near-reversal, and a 30-45 degree drift isn't a turn at all
+                // to the eye — it's a bear.
+                let line = match (named, sharp, delta.abs() < BEAR_DEG) {
+                    (true, true, _) => format!("Sharp {dir} next, onto {spoken}."),
+                    (true, _, true) => format!("Bear {dir}, onto {spoken}."),
+                    (true, _, _) => format!("Next {dir}, onto {spoken}."),
+                    (false, true, _) => format!("Follow it sharply around to the {dir}."),
+                    (false, ..) => format!("Follow it around to the {dir}."),
+                };
                 cues.push(Cue {
                     at_m: cum[i],
                     kind: CueKind::Turn,
-                    line: if new_name && !spoken.is_empty() {
-                        format!("Next {dir}, onto {spoken}.")
+                    line,
+                    short: if leg_name.is_empty() {
+                        format!("{dir} turn")
                     } else {
-                        format!("Follow it around to the {dir}.")
+                        format!("{dir} onto {leg_name}")
                     },
+                    dir: Some(if delta < 0.0 { "left" } else { "right" }),
+                    sharp,
                 });
             } else if new_name && !spoken.is_empty() {
                 // Crossing exits fold into this naturally: the leg after a
@@ -157,6 +220,9 @@ impl Guide {
                     at_m: cum[i],
                     kind: CueKind::NameChange,
                     line: format!("Straight ahead onto {spoken}."),
+                    short: format!("onto {leg_name}"),
+                    dir: None,
+                    sharp: false,
                 });
             }
         }
@@ -169,9 +235,69 @@ impl Guide {
             } else {
                 format!("Holding point {hp} ahead. That's us.")
             },
+            short: if watch.holding_point.is_empty() {
+                "holding point".into()
+            } else {
+                format!("hold {}", watch.holding_point)
+            },
+            dir: None,
+            sharp: false,
         });
+        // Prep calls: a NAMED turn at the end of a long straight gets an
+        // early heads-up as well — on a 400 m leg the pilot has tuned out by
+        // the junction (and a single perishable cue can die in a busy-radio
+        // window; the prep gives the turn two chances to be heard).
+        let mut preps: Vec<Cue> = Vec::new();
+        let mut prev_at = 0.0_f64;
+        for cue in &cues {
+            if cue.kind == CueKind::Turn && cue.at_m - prev_at >= PREP_MIN_RUN_M {
+                if let Some(dir) = cue.dir {
+                    let sharp = if cue.sharp { "sharp " } else { "" };
+                    let onto = cue
+                        .short
+                        .strip_prefix(&format!("{dir} onto "))
+                        .map(spoken_taxiway)
+                        .filter(|s| !s.is_empty());
+                    preps.push(Cue {
+                        at_m: cue.at_m - PREP_LEAD_M,
+                        kind: CueKind::Prep,
+                        line: match onto {
+                            Some(name) => format!("Coming up: {sharp}{dir} onto {name}."),
+                            None => format!("Coming up: a {sharp}{dir} turn."),
+                        },
+                        short: cue.short.clone(),
+                        dir: cue.dir,
+                        sharp: cue.sharp,
+                    });
+                }
+            }
+            prev_at = cue.at_m;
+        }
+        cues.extend(preps);
+        cues.sort_by(|a, b| a.at_m.total_cmp(&b.at_m));
+        // Name spans for the post-stop re-orientation: the spoken name in
+        // effect up to each leg's end, unnamed links bridging like the cues.
+        let mut names: Vec<(f64, String)> = Vec::new();
+        for i in 0..pts.len() - 1 {
+            let name = named_before(i).map(spoken_taxiway).unwrap_or_default();
+            match names.last_mut() {
+                Some((end, n)) if *n == name => *end = cum[i + 1],
+                _ => names.push((cum[i + 1], name)),
+            }
+        }
         let called = vec![false; cues.len()];
-        Some(Guide { path: watch.path.clone(), cues, called, last_call: None })
+        let nudged = vec![false; cues.len()];
+        Some(Guide {
+            path: watch.path.clone(),
+            cues,
+            called,
+            nudged,
+            names,
+            last_call: None,
+            prev_fix: None,
+            stopped_at: None,
+            reorient_armed: false,
+        })
     }
 
     /// True if this guide was built for `path` — the monitor rebuilds when a
@@ -185,10 +311,21 @@ impl Guide {
     /// watch owns that conversation), one cue at a time on a cooldown, each
     /// spoken once. A cue overrun before it could speak drops silently.
     pub fn tick(&mut self, lat: f64, lon: f64, gs_kts: f64, now: Instant) -> Option<String> {
+        // Stop bookkeeping runs below the speed gate: a 20 s+ stop (holding
+        // for traffic, a checklist) earns a re-orientation when rolling
+        // resumes — the pilot has lost the thread by then.
+        if gs_kts < 2.0 {
+            self.stopped_at.get_or_insert(now);
+        } else if let Some(t) = self.stopped_at.take() {
+            if now.duration_since(t).as_secs_f64() >= STOP_REORIENT_S {
+                self.reorient_armed = true;
+            }
+        }
         if !(2.0..40.0).contains(&gs_kts) {
             return None;
         }
         let (progress, lateral) = project(&self.path, lat, lon)?;
+        let prev = self.prev_fix.replace((progress, lateral));
         if lateral > OFF_ROUTE_M {
             return None;
         }
@@ -197,6 +334,53 @@ impl Guide {
             .is_some_and(|t| now.duration_since(t).as_secs_f64() < CALL_GAP_S)
         {
             return None;
+        }
+        // Missed turn: drifting AWAY (lateral above turning slop and rising)
+        // right after a turn's decision point. This is the guide's half of
+        // the 0-60 m dead zone — past 60 m the controller challenges, and
+        // between the two somebody must say it plainly and immediately (the
+        // G11 miss ran 3.5 minutes before anyone did, 2026-07-13).
+        if lateral >= NUDGE_MIN_LAT_M && prev.is_some_and(|(_, pl)| lateral > pl + 0.5) {
+            for i in 0..self.cues.len() {
+                let cue = &self.cues[i];
+                if cue.kind != CueKind::Turn || self.nudged[i] {
+                    continue;
+                }
+                let Some(dir) = cue.dir else { continue };
+                if (cue.at_m - 15.0..cue.at_m + NUDGE_WINDOW_M).contains(&progress) {
+                    self.nudged[i] = true;
+                    self.called[i] = true; // the moment has passed either way
+                    self.last_call = Some(now);
+                    return Some(format!(
+                        "We've missed our {dir} back there. Let's get back on the route."
+                    ));
+                }
+            }
+        }
+        // Rolling again after a long stop: say where we are and what's next,
+        // without consuming the next cue — it still gets its own call at the
+        // decision point.
+        if self.reorient_armed {
+            self.reorient_armed = false;
+            self.last_call = Some(now);
+            let name = self
+                .names
+                .iter()
+                .find(|(end, _)| *end >= progress - 1.0)
+                .map(|(_, n)| n.as_str())
+                .filter(|n| !n.is_empty());
+            let next = self
+                .cues
+                .iter()
+                .zip(&self.called)
+                .find(|(c, called)| !**called && c.at_m - progress > PASSED_M)
+                .map(|(c, _)| c.line.clone());
+            return Some(match (name, next) {
+                (Some(n), Some(line)) => format!("Rolling again. We're on {n}. {line}"),
+                (Some(n), None) => format!("Rolling again. We're on {n}."),
+                (None, Some(line)) => format!("Rolling again. {line}"),
+                (None, None) => "Rolling again.".to_string(),
+            });
         }
         let mut speak: Option<usize> = None;
         for (i, cue) in self.cues.iter().enumerate() {
@@ -215,7 +399,28 @@ impl Guide {
         let i = speak?;
         self.called[i] = true;
         self.last_call = Some(now);
-        Some(self.cues[i].line.clone())
+        let cue = &self.cues[i];
+        // Fast into a sharp bend: the words carry the speed advice too.
+        if cue.kind == CueKind::Turn && cue.sharp && gs_kts > EASY_KTS {
+            return Some(format!("Easy now. {}", cue.line));
+        }
+        Some(cue.line.clone())
+    }
+
+    /// The glanceable next-decision-point line for the plugin panel strip —
+    /// by GEOMETRY, not spoken state (announced or not, the panel shows what
+    /// pavement comes next). ASCII-only; the panel font is picky.
+    pub fn strip_hint(&self, lat: f64, lon: f64) -> Option<String> {
+        let (progress, lateral) = project(&self.path, lat, lon)?;
+        if lateral > OFF_ROUTE_M {
+            return Some("TAXI: off route".into());
+        }
+        let cue = self
+            .cues
+            .iter()
+            .find(|c| c.kind != CueKind::Prep && c.at_m - progress > -PASSED_M)?;
+        let d = (cue.at_m - progress).max(0.0);
+        Some(format!("NEXT {d:.0}m: {}", cue.short))
     }
 }
 
@@ -238,10 +443,13 @@ pub fn describe(watch: &TaxiWatch, lat: f64, lon: f64) -> String {
             )
         };
     }
-    // The next steering cue ahead of us, phrased with its distance.
+    // The next steering cue ahead of us, phrased with its distance. Prep
+    // heads-ups are the spoken guide's pacing device, not a decision point —
+    // "which way?" answers with the turn itself.
     let next = Guide::build(watch).and_then(|g| {
         g.cues
             .into_iter()
+            .filter(|c| c.kind != CueKind::Prep)
             .find(|c| c.at_m - progress > PASSED_M)
             .map(|c| (c.at_m - progress, c.line))
     });
@@ -513,6 +721,121 @@ mod tests {
         let d = describe(&w, lat, lon);
         assert!(d.contains("off the cleared route"), "{d}");
         assert!(d.contains("Whiskey"), "{d}");
+    }
+
+    #[test]
+    fn a_missed_turn_gets_an_immediate_nudge_once() {
+        let mut g = Guide::build(&route()).expect("guide");
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        // The turn cue speaks on approach...
+        let (lat, lon) = ll(130.0, 0.0);
+        assert!(g.tick(lat, lon, 10.0, t0).is_some());
+        // ...the pilot sails straight past the corner instead. 15 m past is
+        // still turning slop (no nudge; the runway call in range speaks).
+        let (lat, lon) = ll(215.0, 0.0);
+        let cue = g.tick(lat, lon, 10.0, t0 + s(6)).expect("runway call");
+        assert!(cue.contains("Runway"), "{cue}");
+        // 25 m out and growing: the nudge, plainly and immediately — this is
+        // the 20-60 m dead zone where nobody spoke for 3.5 minutes at Malaga
+        // (2026-07-13). Past 60 m the controller takes over.
+        let (lat, lon) = ll(225.0, 0.0);
+        let cue = g.tick(lat, lon, 10.0, t0 + s(12)).expect("nudge");
+        assert!(cue.contains("missed our left"), "{cue}");
+        // Once: drifting further gets silence (the controller's zone next).
+        let (lat, lon) = ll(235.0, 0.0);
+        assert_eq!(g.tick(lat, lon, 10.0, t0 + s(18)), None);
+    }
+
+    #[test]
+    fn sharp_turns_are_called_sharp_and_fast_approaches_get_easy() {
+        // East 200 m, then a 135-degree left back to the northwest.
+        let w = TaxiWatch {
+            path: vec![ll(0.0, 0.0), ll(200.0, 0.0), ll(150.0, 50.0)],
+            via: "Whiskey, Sierra".into(),
+            seg: vec![("W".into(), false), ("S".into(), false)],
+            holding_point: "S".into(),
+        };
+        let t0 = Instant::now();
+        // At speed: the words carry the speed advice.
+        let mut g = Guide::build(&w).expect("guide");
+        let (lat, lon) = ll(80.0, 0.0);
+        let cue = g.tick(lat, lon, 18.0, t0).expect("sharp cue at speed");
+        assert_eq!(cue, "Easy now. Sharp left next, onto Sierra.");
+        // Slow: same turn, no nagging.
+        let mut g = Guide::build(&w).expect("guide");
+        let (lat, lon) = ll(130.0, 0.0);
+        let cue = g.tick(lat, lon, 10.0, t0).expect("sharp cue slow");
+        assert_eq!(cue, "Sharp left next, onto Sierra.");
+    }
+
+    #[test]
+    fn a_turn_after_a_long_straight_gets_a_prep_call() {
+        // 400 m straight run, then left onto B: prep at 220, execute at 400.
+        let w = TaxiWatch {
+            path: vec![ll(0.0, 0.0), ll(400.0, 0.0), ll(400.0, 100.0)],
+            via: "Alpha, Bravo".into(),
+            seg: vec![("A".into(), false), ("B".into(), false)],
+            holding_point: "B".into(),
+        };
+        let mut g = Guide::build(&w).expect("guide");
+        let preps: Vec<&Cue> = g.cues.iter().filter(|c| c.kind == CueKind::Prep).collect();
+        assert_eq!(preps.len(), 1, "{:?}", g.cues);
+        assert_eq!(preps[0].line, "Coming up: left onto Bravo.");
+        // It fires on the straight, well before the execute cue...
+        let t0 = Instant::now();
+        let (lat, lon) = ll(150.0, 0.0);
+        let cue = g.tick(lat, lon, 10.0, t0).expect("prep");
+        assert!(cue.starts_with("Coming up"), "{cue}");
+        // ...and the execute cue still gets its own call at the junction.
+        let (lat, lon) = ll(330.0, 0.0);
+        let cue = g.tick(lat, lon, 10.0, t0 + Duration::from_secs(20)).expect("execute");
+        assert!(cue.contains("Next left, onto Bravo"), "{cue}");
+        // The short route() straights earn no prep — it's for the long legs.
+        let g = Guide::build(&route()).expect("guide");
+        assert!(g.cues.iter().all(|c| c.kind != CueKind::Prep));
+    }
+
+    #[test]
+    fn a_long_stop_earns_a_reorientation_when_rolling_resumes() {
+        let mut g = Guide::build(&route()).expect("guide");
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let (lat, lon) = ll(60.0, 0.0);
+        // Holding position for 25 s (traffic, a checklist)...
+        assert_eq!(g.tick(lat, lon, 0.0, t0), None);
+        assert_eq!(g.tick(lat, lon, 0.0, t0 + s(25)), None);
+        // ...rolling again: where we are and what's next, without consuming
+        // the turn cue.
+        let (lat, lon) = ll(80.0, 0.0);
+        let cue = g.tick(lat, lon, 8.0, t0 + s(30)).expect("reorientation");
+        assert!(cue.starts_with("Rolling again. We're on Whiskey."), "{cue}");
+        assert!(cue.contains("Next left, onto Sierra five Whiskey"), "{cue}");
+        // The turn cue itself still speaks at the decision point.
+        let (lat, lon) = ll(130.0, 0.0);
+        let cue = g.tick(lat, lon, 10.0, t0 + s(40)).expect("turn cue");
+        assert!(cue.contains("Next left"), "{cue}");
+        // A SHORT stop (a brake check) earns nothing.
+        let mut g = Guide::build(&route()).expect("guide");
+        let (lat, lon) = ll(60.0, 0.0);
+        assert_eq!(g.tick(lat, lon, 0.0, t0), None);
+        assert_eq!(g.tick(lat, lon, 0.0, t0 + s(5)), None);
+        assert_eq!(g.tick(lat, lon, 8.0, t0 + s(10)), None, "short stop: no speech");
+    }
+
+    #[test]
+    fn strip_hint_shows_the_next_decision_by_geometry() {
+        let g = Guide::build(&route()).expect("guide");
+        let (lat, lon) = ll(100.0, 0.0);
+        let hint = g.strip_hint(lat, lon).expect("hint");
+        assert_eq!(hint, "NEXT 100m: left onto S5W");
+        // Off route: the strip owns up instead of pointing at stale pavement.
+        let (lat, lon) = ll(100.0, -200.0);
+        assert_eq!(g.strip_hint(lat, lon).as_deref(), Some("TAXI: off route"));
+        // Past the turn, the runway crossing is next.
+        let (lat, lon) = ll(200.0, 30.0);
+        let hint = g.strip_hint(lat, lon).expect("hint");
+        assert!(hint.contains("cross rwy 09L"), "{hint}");
     }
 
     #[test]

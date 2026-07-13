@@ -270,6 +270,11 @@ struct Utterance {
     /// every voice arbitrated: they can never talk over each other, and the
     /// mic stays gated across all of them.
     station: Option<StationSpeaker>,
+    /// Speak by this instant or not at all: time-critical speech (taxi cues)
+    /// is worse than silence once its moment has passed — a "next left"
+    /// queued behind a party-line exchange spoke 17 s late at Malaga, 130 m
+    /// past the junction (2026-07-13). Checked at dequeue; `None` = evergreen.
+    stale_by: Option<Instant>,
     /// Present for blocking callers; signalled once the utterance is spoken.
     done: Option<Arc<Latch>>,
 }
@@ -595,7 +600,7 @@ impl Voice {
         // No em/en dashes reach the TTS — they trip it up. One chokepoint for
         // every spoken utterance (readbacks, monitor callouts, prompts).
         let text = crate::phrase::scrub_dashes(&text);
-        self.push(Utterance { priority, seq: 0, text, chime, negative: false, station: None, done });
+        self.push(Utterance { priority, seq: 0, text, chime, negative: false, station: None, stale_by: None, done });
     }
 
     fn enqueue_station(
@@ -607,7 +612,7 @@ impl Voice {
     ) {
         let text = crate::phrase::scrub_dashes(&text);
         tracing::info!(transmitting = %text, "station");
-        self.push(Utterance { priority, seq: 0, text, chime: false, negative: false, station: Some(speaker), done });
+        self.push(Utterance { priority, seq: 0, text, chime: false, negative: false, station: Some(speaker), stale_by: None, done });
     }
 
     /// Push a fully-formed utterance onto the queue (stamping its FIFO seq under
@@ -637,6 +642,7 @@ impl Voice {
             chime: false,
             negative: true,
             station: None,
+            stale_by: None,
             done: Some(latch.clone()),
         });
         let mut spoken = latch.spoken.lock().unwrap();
@@ -649,6 +655,23 @@ impl Voice {
     #[allow(dead_code)] // used by the monitor (next milestone)
     pub fn alert(&self, priority: Priority, text: impl Into<String>) {
         self.enqueue(priority, text.into(), None, false);
+    }
+
+    /// Queue a PERISHABLE utterance: speak it by `stale_by` or drop it at
+    /// dequeue. For time-critical guidance (taxi cues) where late is worse
+    /// than never.
+    pub fn alert_stale_by(&self, priority: Priority, text: impl Into<String>, stale_by: Instant) {
+        let text = crate::phrase::scrub_dashes(&text.into());
+        self.push(Utterance {
+            priority,
+            seq: 0,
+            text,
+            chime: false,
+            negative: false,
+            station: None,
+            stale_by: Some(stale_by),
+            done: None,
+        });
     }
 
     /// Queue an ATC-station utterance and return immediately. Used by background
@@ -905,7 +928,10 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         // before `set_speaking` so a dropped transmission doesn't even gate
         // the mic, and the done latch still fires so a blocking
         // `say_station` caller is released, never deadlocked.
-        if station_unhearable(inner, utt.station) {
+        // Perishable speech that missed its window is dropped the same way:
+        // spoken late it's disinformation, not guidance.
+        let stale = utt.stale_by.is_some_and(|t| Instant::now() > t);
+        if stale || station_unhearable(inner, utt.station) {
             if let Some(latch) = utt.done {
                 *latch.spoken.lock().unwrap() = true;
                 latch.cv.notify_all();
@@ -1093,7 +1119,7 @@ mod tests {
     use super::*;
 
     fn utt(priority: Priority, seq: u64) -> Utterance {
-        Utterance { priority, seq, text: String::new(), chime: false, negative: false, station: None, done: None }
+        Utterance { priority, seq, text: String::new(), chime: false, negative: false, station: None, stale_by: None, done: None }
     }
 
     #[test]

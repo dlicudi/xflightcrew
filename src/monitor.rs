@@ -1941,7 +1941,17 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                                 "taxi_guide",
                                 serde_json::json!({ "cue": &cue }),
                             );
-                            voice.alert(Priority::Advisory, cue);
+                            // PERISHABLE: a cue that can't speak within ~8 s
+                            // (60 m of taxi) is disinformation — the G11
+                            // "next left" queued behind a party-line exchange
+                            // and played 17 s late, 130 m past the junction
+                            // (2026-07-13). Dropped cues are covered by the
+                            // guide's missed-turn nudge and the panel strip.
+                            voice.alert_stale_by(
+                                Priority::Advisory,
+                                cue,
+                                now + std::time::Duration::from_secs(8),
+                            );
                         }
                     } else {
                         taxi_guide = None;
@@ -1961,7 +1971,13 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                     let cleared_to_land = crate::party_line::clearance_state()
                         == Some(crate::tower::State::ClearedToLand);
                     let hold_armed = crate::party_line::takeoff_hold_armed();
-                    let chatter_on = config.atc_chatter && tower_tuned;
+                    // Party-line flavor stands down while the taxi guide is
+                    // working: its cues are perishable, and a three-line
+                    // Ryanair landing exchange cost the pilot the G11 turn
+                    // (cue spoken 17 s late, 2026-07-13). Calls addressed to
+                    // US (compliance, hold releases) are unaffected.
+                    let chatter_on =
+                        config.atc_chatter && tower_tuned && taxi_guide.is_none();
                     // The wake watch needs the TCAS picture while the pilot
                     // is on the tower frequency on the ground — a heavy
                     // rotating ahead of you starts a clock whether or not
@@ -2359,7 +2375,20 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
             let mute = xp.get_float("xcopilot/opt/monitor_mute").await.map_or(false, |v| v > 0.5);
             PANEL_MUTE.store(mute, std::sync::atomic::Ordering::Relaxed);
             if let Some(s) = status.as_ref() {
-                let strip = compose_strip(&snap);
+                let mut strip = compose_strip(&snap);
+                // The glanceable next-turn line: on a busy frequency the
+                // spoken cue can be late or dropped (perishable) — the strip
+                // is the fallback the pilot can always read.
+                if let Some(hint) = taxi_guide
+                    .as_ref()
+                    .and_then(|g| g.strip_hint(snap.lat, snap.lon))
+                {
+                    if strip.is_empty() {
+                        strip = hint;
+                    } else {
+                        strip = format!("{strip} | {hint}");
+                    }
+                }
                 if strip != last_strip {
                     s.strip(&strip);
                     last_strip = strip;
