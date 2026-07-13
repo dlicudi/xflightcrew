@@ -154,7 +154,7 @@ static TextRef g_radio = {{0}, 0};
 static TextRef g_atc = {{0}, 0};
 // The radio coach's suggested next call for the current tower state,
 // refreshed continuously by the app. Empty = no station. Rendered twice:
-// the Calls tab's SAY NOW header, and the Log tab's ghost "next" entry.
+// the Calls tab's SAY NOW header, and the Log tab's pinned footer strip.
 static TextRef g_coach = {{0}, 0};
 
 static XPLMDataRef g_phase_dref = nullptr;
@@ -835,19 +835,31 @@ protected:
     // Transmission log — recent heard/action lines with coloured tags, each
     // stamped so a test can be reviewed afterwards.
     void buildLogTab(bool connected) {
-        // Two reserved rows below the well: the log controls and the bottom
-        // status bar (drawn by buildInterface after the tab content).
-        const float footer = ImGui::GetFrameHeightWithSpacing() * 2.0f
-            + ImGui::GetStyle().ItemSpacing.y;
-        ImGui::BeginChild("log", ImVec2(0, -footer), true);
         // Columns measured from the actual font (time | speaker | text) so
         // nothing ever clips and every message starts at the same x — the log
         // reads as a transcript, not a ragged debug feed.
         const float pad = 8.0f;
         const float kTimeW = ImGui::CalcTextSize("88:88:88").x + pad;
         const float kTagW = ImGui::CalcTextSize("COPILOT").x + 14.0f; // widest tag
-        const bool ghost = connected && g_coach.len > 0;
-        if (g_log.empty() && !ghost) {
+        // The coach's suggested next call pins BELOW the well, a footer strip
+        // that never scrolls away with the transcript (it lived as a ghost
+        // row inside the log until 2026-07-13, where a busy frequency kept
+        // pushing it around). Height measured up front so the well only
+        // shrinks while there is a call to show.
+        const bool coach = connected && g_coach.len > 0;
+        float coach_h = 0.0f;
+        if (coach) {
+            float wrap_w = ImGui::GetContentRegionAvail().x - (kTagW + pad * 2.0f);
+            if (wrap_w < 60.0f) wrap_w = 60.0f;
+            coach_h = ImGui::CalcTextSize(g_coach.buf, nullptr, false, wrap_w).y
+                + ImGui::GetStyle().ItemSpacing.y * 2.0f;
+        }
+        // Two reserved rows below the well (the log controls and the bottom
+        // status bar drawn by buildInterface), plus the coach strip.
+        const float footer = ImGui::GetFrameHeightWithSpacing() * 2.0f
+            + ImGui::GetStyle().ItemSpacing.y + coach_h;
+        ImGui::BeginChild("log", ImVec2(0, -footer), true);
+        if (g_log.empty()) {
             // Empty state, centred in the well — not a footer mumble.
             const char* hint = connected ? "Hold PTT and speak." : "Start x-copilot to connect.";
             ImVec2 ts = ImGui::CalcTextSize(hint);
@@ -867,19 +879,17 @@ protected:
             ImGui::PopTextWrapPos();
             ImGui::PopStyleColor();
         }
-        // The coach's suggested next call, as a GHOST entry where the next
-        // transmission will land: the transcript shows the conversation so
-        // far, and this row is its expected next line. Live state, never
-        // stored — it refreshes with the tower's state machine and vanishes
-        // once the call is made. Dim when it's a hint; amber with an OWED
-        // tag when a readback is due, because that row isn't a suggestion,
-        // it's a debt.
-        if (ghost) {
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "next");
-            ImGui::SameLine(kTimeW + pad);
+        if (g_log_scroll) { ImGui::SetScrollHereY(1.0f); g_log_scroll = false; }
+        ImGui::EndChild();
+
+        // The coach strip: the suggested next call, live state never stored —
+        // it refreshes with the tower's state machine and vanishes once the
+        // call is made. Dim when it's a hint; amber with an OWED tag when a
+        // readback is due, because that line isn't a suggestion, it's a debt.
+        if (coach) {
             TagChip(g_coach_urgent ? "OWED" : "SAY",
                     g_coach_urgent ? COL_AMBER : COL_CYAN, kTagW);
-            ImGui::SameLine(kTimeW + kTagW + pad * 2);
+            ImGui::SameLine(kTagW + pad * 2);
             ImGui::PushStyleColor(
                 ImGuiCol_Text,
                 ImGui::ColorConvertU32ToFloat4(g_coach_urgent ? COL_AMBER : COL_DIM));
@@ -888,8 +898,6 @@ protected:
             ImGui::PopTextWrapPos();
             ImGui::PopStyleColor();
         }
-        if (g_log_scroll) { ImGui::SetScrollHereY(1.0f); g_log_scroll = false; }
-        ImGui::EndChild();
 
         // Footer: just the log controls — state lives in the chips, version in
         // Settings. An empty left cell keeps the controls on this row.
