@@ -540,7 +540,7 @@ impl Station {
             *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) =
                 self.planned_route.as_ref().filter(|r| r.path.len() >= 2).map(|r| TaxiWatch {
                     path: r.path.clone(),
-                    via: r.via.iter().map(|n| spoken_taxiway(n)).collect::<Vec<_>>().join(", "),
+                    via: spoken_via(&r.via).join(", "),
                     seg: r.seg.clone(),
                     holding_point: r.holding_point.clone(),
                 });
@@ -678,6 +678,7 @@ impl Station {
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
             | tower::Intent::RequestStartup
+            | tower::Intent::RequestShutdown
             | tower::Intent::RequestClearance => format!(
                 "{}, contact {} Tower on {}.",
                 ctx.callsign,
@@ -813,6 +814,7 @@ impl Station {
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
             | tower::Intent::RequestStartup
+            | tower::Intent::RequestShutdown
             | tower::Intent::RequestClearance => format!(
                 "{}, contact {} Tower on {}.",
                 ctx.callsign,
@@ -1063,9 +1065,7 @@ impl Station {
             final_traffic_count: final_traffic.as_ref().map(|f| f.count).unwrap_or(0),
             runway_occupied,
             wake_secs_left,
-            taxi_via: route
-                .map(|r| r.via.iter().map(|n| spoken_taxiway(n)).collect())
-                .unwrap_or_default(),
+            taxi_via: route.map(|r| spoken_via(&r.via)).unwrap_or_default(),
             taxi_crossings: route
                 .map(|r| {
                     r.crossings
@@ -1205,14 +1205,20 @@ pub fn squawk_tick(
     }
     w.last_nudge = Some(now);
     w.nudges += 1;
-    Some((
+    // Two different problems, two different nudges: the code dialed right
+    // with the transponder in standby got "confirm squawk 4503" (Gatwick,
+    // 2026-07-13) — a nag that reads as "your digits are wrong" when the
+    // digits are the one thing that's right.
+    let line = if actual == Some(w.code) {
+        format!("{}, negative radar contact, recycle transponder.", w.callsign)
+    } else {
         format!(
             "{}, confirm squawk {}.",
             w.callsign,
             atis::spoken_digits(&w.code.to_string())
-        ),
-        w.speaker,
-    ))
+        )
+    };
+    Some((line, w.speaker))
 }
 
 /// Two-way contact plus the clearance picture, published by the reply path
@@ -1438,12 +1444,7 @@ pub fn compliance_tick(
                     net.plan(lat, lon, glat, glon).filter(|r| r.path.len() >= 2)
                 });
                 let line = if let Some(r) = fresh {
-                    let via = r
-                        .via
-                        .iter()
-                        .map(|n| spoken_taxiway(n))
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let via = spoken_via(&r.via).join(", ");
                     let hp = spoken_taxiway(&r.holding_point);
                     *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(TaxiWatch {
@@ -2957,10 +2958,20 @@ const HOLD_CLEAR_SECS: f64 = 15.0;
 pub fn takeoff_hold_tick(
     targets: &[TcasTarget],
     field_elev_ft: f64,
+    player_on_ground: bool,
     now: Instant,
 ) -> Option<String> {
     let mut guard = TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner());
     let hold = guard.as_mut()?;
+    // Airborne, the hold is moot: either the pilot departed through the
+    // cancel (the compliance watch owns that conversation) or the whole
+    // thing is stale. "Traffic clear, cleared for takeoff" spoken to an
+    // aircraft two minutes into its climb (Gatwick, 2026-07-13) helps
+    // nobody — void it, silently.
+    if !player_on_ground {
+        *guard = None;
+        return None;
+    }
     // Our strip, cloned out so the runway lock isn't held across the checks.
     let rwy = {
         let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
@@ -3226,6 +3237,56 @@ pub fn spoken_taxiway(name: &str) -> String {
         flush(&mut run, &mut out);
     }
     out.join(" ")
+}
+
+/// The designator-and-number split of a taxiway name ("M3" → ("M", 3)) —
+/// `None` when the name doesn't end in digits or doesn't start with them.
+fn stem_num(name: &str) -> Option<(&str, i64)> {
+    let idx = name.find(|c: char| c.is_ascii_digit())?;
+    let (stem, num) = name.split_at(idx);
+    if stem.is_empty() {
+        return None;
+    }
+    Some((stem, num.parse().ok()?))
+}
+
+/// A via list spoken like a controller reads it: a run of three or more
+/// same-designator, consecutively numbered segments collapses to its ends —
+/// "C1, M1, M2, M3, M4, M5" becomes "Charlie one, Mike one to Mike five".
+/// The apt.dat network names every stretch of pavement; a clearance reads
+/// like a controller, not like the database (Madrid, 2026-07-13).
+pub fn spoken_via(names: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < names.len() {
+        let mut j = i + 1;
+        if let Some((stem, first)) = stem_num(&names[i]) {
+            let mut prev = first;
+            let mut step = 0i64;
+            while j < names.len() {
+                let Some((s, n)) = stem_num(&names[j]) else { break };
+                let d = n - prev;
+                if s != stem || d.abs() != 1 || (step != 0 && d != step) {
+                    break;
+                }
+                step = d;
+                prev = n;
+                j += 1;
+            }
+            if j - i >= 3 {
+                out.push(format!(
+                    "{} to {}",
+                    spoken_taxiway(&names[i]),
+                    spoken_taxiway(&names[j - 1])
+                ));
+                i = j;
+                continue;
+            }
+        }
+        out.push(spoken_taxiway(&names[i]));
+        i += 1;
+    }
+    out
 }
 
 /// The first designator of a runway-edge name ("09L/27R" → "09L") — the
@@ -3896,10 +3957,13 @@ mod tests {
         assert!(matches!(who, StationSpeaker::Approach));
         // Immediately again: quiet (nudge cooldown).
         assert!(squawk_tick(Some(7000), true, late).is_none());
-        // Right code but transponder on standby: not replying, no contact.
+        // Right code but transponder on standby: not replying, no contact —
+        // and the nudge names the REAL problem, never "confirm squawk" (the
+        // digits are the one thing that's right; Gatwick 2026-07-13).
         let later = late + std::time::Duration::from_secs(50);
-        let r = squawk_tick(Some(code), false, later);
-        assert!(r.is_none_or(|(l, _)| !l.contains("radar contact")));
+        let (line, _) = squawk_tick(Some(code), false, later).expect("standby nudge");
+        assert!(line.contains("negative radar contact, recycle transponder"), "{line}");
+        assert!(!line.contains("confirm squawk"), "{line}");
         // Code set and replying: "radar contact", exactly once.
         let (line, _) = squawk_tick(Some(code), true, later + std::time::Duration::from_secs(50))
             .expect("radar contact");
@@ -4498,16 +4562,16 @@ mod tests {
         let t0 = Instant::now();
         let sec = std::time::Duration::from_secs;
         // Traffic on OUR final: nothing, and the clear-timer resets.
-        assert!(takeoff_hold_tick(std::slice::from_ref(&ours), elev, t0).is_none());
+        assert!(takeoff_hold_tick(std::slice::from_ref(&ours), elev, true, t0).is_none());
         // Only the PARALLEL runway's arrival: not our traffic — the timer
         // runs (the runway-blind check held a Heathrow 09R departure forever).
-        assert!(takeoff_hold_tick(std::slice::from_ref(&parallel), elev, t0 + sec(1)).is_none());
+        assert!(takeoff_hold_tick(std::slice::from_ref(&parallel), elev, true, t0 + sec(1)).is_none());
         // A ghost sitting on our strip resets it again.
-        assert!(takeoff_hold_tick(std::slice::from_ref(&squatter), elev, t0 + sec(5)).is_none());
-        assert!(takeoff_hold_tick(std::slice::from_ref(&parallel), elev, t0 + sec(6)).is_none());
+        assert!(takeoff_hold_tick(std::slice::from_ref(&squatter), elev, true, t0 + sec(5)).is_none());
+        assert!(takeoff_hold_tick(std::slice::from_ref(&parallel), elev, true, t0 + sec(6)).is_none());
         // Our runway clear and stayed clear (parallel stream still landing):
         // the tower comes back unprompted.
-        let line = takeoff_hold_tick(std::slice::from_ref(&parallel), elev, t0 + sec(25))
+        let line = takeoff_hold_tick(std::slice::from_ref(&parallel), elev, true, t0 + sec(25))
             .expect("release");
         assert!(line.contains("traffic clear"), "{line}");
         assert!(line.contains("Runway zero niner, cleared for takeoff"), "{line}");
@@ -4518,7 +4582,25 @@ mod tests {
         );
         assert!(*PENDING_TAKEOFF_CLEARANCE.lock().unwrap());
         // One shot: the hold is consumed.
-        assert!(takeoff_hold_tick(&[], elev, t0 + sec(60)).is_none());
+        assert!(takeoff_hold_tick(&[], elev, true, t0 + sec(60)).is_none());
+
+        // Airborne, a held clearance is VOID, not released: the pilot who
+        // departed through the cancel got "traffic clear, cleared for
+        // takeoff" two minutes into the climb (Gatwick, 2026-07-13).
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
+        *TAKEOFF_HOLD.lock().unwrap() = Some(TakeoffHold {
+            callsign: "November one seven two Sierra Papa".into(),
+            runway: "zero niner".into(),
+            runway_ident: "09".into(),
+            clear_since: Some(t0),
+        });
+        assert!(takeoff_hold_tick(&[], elev, false, t0 + sec(120)).is_none());
+        assert!(TAKEOFF_HOLD.lock().unwrap().is_none(), "airborne must void the hold");
+        assert!(
+            takeoff_hold_tick(&[], elev, true, t0 + sec(180)).is_none(),
+            "a voided hold never releases, even back on the ground"
+        );
+        assert!(!*PENDING_TAKEOFF_CLEARANCE.lock().unwrap());
 
         *CLEARANCE.lock().unwrap() = None;
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
@@ -5550,8 +5632,8 @@ mod tests {
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
         let t0 = Instant::now();
         let sec = std::time::Duration::from_secs;
-        assert!(takeoff_hold_tick(&[], 11.0, t0).is_none(), "clear window starts");
-        let line = takeoff_hold_tick(&[], 11.0, t0 + sec(16)).expect("release");
+        assert!(takeoff_hold_tick(&[], 11.0, true, t0).is_none(), "clear window starts");
+        let line = takeoff_hold_tick(&[], 11.0, true, t0 + sec(16)).expect("release");
         assert!(line.contains("cleared for takeoff"), "{line}");
         assert!(*PENDING_TAKEOFF_CLEARANCE.lock().unwrap());
 
@@ -5779,6 +5861,37 @@ mod tests {
         assert_eq!(spoken_taxiway("Inner"), "Inner");
         assert_eq!(first_designator("09L/27R"), "09L");
         assert_eq!(first_designator("14"), "14");
+    }
+
+    #[test]
+    fn via_lists_collapse_numbered_runs() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Madrid's real 2026-07-13 clearance: "Charlie one, Mike one, Mike
+        // two, Mike three, Mike four, Mike five" reads like the database.
+        assert_eq!(
+            spoken_via(&names(&["C1", "M1", "M2", "M3", "M4", "M5"])),
+            vec!["Charlie one", "Mike one to Mike five"]
+        );
+        // Descending runs collapse the same way (taxiing the other way).
+        assert_eq!(
+            spoken_via(&names(&["M5", "M4", "M3", "B"])),
+            vec!["Mike five to Mike three", "Bravo"]
+        );
+        // Two in a row is not a run — say both.
+        assert_eq!(
+            spoken_via(&names(&["M1", "M2", "A"])),
+            vec!["Mike one", "Mike two", "Alpha"]
+        );
+        // A gap breaks the run; a different designator breaks the run.
+        assert_eq!(
+            spoken_via(&names(&["M1", "M3", "M4", "N1"])),
+            vec!["Mike one", "Mike three", "Mike four", "November one"]
+        );
+        // Unnumbered names pass straight through.
+        assert_eq!(
+            spoken_via(&names(&["L", "B", "G11", "A", "HN1"])),
+            vec!["Lima", "Bravo", "Golf one one", "Alpha", "Hotel November one"]
+        );
     }
 
     /// The world sweep: EVERY towered airport in the real Global Airports

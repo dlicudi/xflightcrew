@@ -41,6 +41,11 @@ pub enum Intent {
     /// "start-up approved", never "cleared to leave the zone" (a Malaga gate
     /// got the zone clearance plus a squawk for it, 2026-07-12).
     RequestStartup,
+    /// "request shutdown" / "clearance to switch engines off" — the arrival
+    /// bookend of start-up. Approval, not a clearance: a parked arrival
+    /// asking got "cleared to leave the zone" plus a squawk, twice
+    /// (Gibraltar, 2026-07-13).
+    RequestShutdown,
     RequestTakeoff,
     /// Arriving traffic ("inbound for landing", "request touch and go").
     RequestLanding {
@@ -272,6 +277,24 @@ pub fn parse_intent(transcript: &str) -> Intent {
     {
         return Intent::RequestFrequencyChange;
     }
+    // Parking is an arrival's business: "request clearance to parking",
+    // "where shall we park?" — above the question guard (a tower genuinely
+    // answers it) and above the "clearance" catch-all, which swallowed it and
+    // answered a parked arrival with the ZONE clearance plus a squawk, twice
+    // ("no, i said i want to park the aircraft", Gibraltar 2026-07-13).
+    // "brake" keeps "set the parking brake" a cockpit command; landing and
+    // takeoff context keeps "full stop, then parking" runway business, which
+    // the blocks below own.
+    if (word("park") || word("parking") || word("ramp") || word("apron"))
+        && !t.contains("brake")
+        && !t.contains("inbound")
+        && !word("landing")
+        && !word("land")
+        && !t.contains("takeoff")
+        && !t.contains("take off")
+    {
+        return Intent::RequestTaxiIn;
+    }
     // Questions are crew talk, not transmissions. "What runway shall I take
     // off from?" must reach the copilot (or get "say again" on a keyed radio),
     // never parse as a takeoff request — the 2026-07-08 flight was CLEARED FOR
@@ -385,6 +408,16 @@ pub fn parse_intent(transcript: &str) -> Intent {
     {
         return Intent::RequestStartup;
     }
+    // The other bookend: "request shutdown" / "requesting clearance to switch
+    // engines off". Approval, not a clearance — the catch-all below answered
+    // it with "cleared to leave the zone" (Gibraltar, 2026-07-13).
+    if t.contains("shut down")
+        || t.contains("shut-down")
+        || word("shutdown")
+        || ((word("engine") || word("engines")) && word("off"))
+    {
+        return Intent::RequestShutdown;
+    }
     if t.contains("clearance") {
         return Intent::RequestClearance;
     }
@@ -414,6 +447,7 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "request_taxi" => Intent::RequestTaxi,
         "request_clearance" => Intent::RequestClearance,
         "request_startup" => Intent::RequestStartup,
+        "request_shutdown" => Intent::RequestShutdown,
         "request_takeoff" => Intent::RequestTakeoff,
         "request_landing" => Intent::RequestLanding { touch_and_go: false },
         "request_touch_and_go" => Intent::RequestLanding { touch_and_go: true },
@@ -784,6 +818,7 @@ impl Tower {
                 | Intent::Greeting
                 | Intent::RequestFlightFollowing
                 | Intent::RequestFrequencyChange
+                | Intent::RequestShutdown
                 | Intent::Unknown
         ) {
             self.pending = None;
@@ -804,6 +839,10 @@ impl Tower {
             // no state change — the zone/taxi/takeoff chain still follows.
             Intent::RequestStartup => {
                 format!("{}, start-up approved{}.", ctx.callsign, qnh_clause(ctx))
+            }
+            // The arrival bookend: nothing to clear, nowhere to go.
+            Intent::RequestShutdown => {
+                format!("{}, shutdown approved. Good day.", ctx.callsign)
             }
             // An arrival taxiing in — by request wording, or because the last
             // clearance was a landing one (a generic "request taxi" right
@@ -1276,6 +1315,30 @@ mod tests {
             parse_intent("malaga tower, november five five zero charlie romeo, request start up"),
             Intent::RequestStartup
         );
+        // ...and it must not swallow a PARKED arrival either — all four are
+        // real 2026-07-13 Gibraltar calls; the first two were answered
+        // "cleared to leave the zone" plus a squawk, ending in "no, no, no,
+        // no" from the pilot.
+        assert_eq!(
+            parse_intent("request clearance to parking."),
+            Intent::RequestTaxiIn
+        );
+        assert_eq!(
+            parse_intent("requesting clearance to switch engines off."),
+            Intent::RequestShutdown
+        );
+        assert_eq!(
+            parse_intent("where shall i park at?"),
+            Intent::RequestTaxiIn,
+            "a parking question is one the tower genuinely answers"
+        );
+        assert_eq!(
+            parse_intent("no, i said i want to park the aircraft."),
+            Intent::RequestTaxiIn
+        );
+        assert_eq!(parse_intent("request shutdown"), Intent::RequestShutdown);
+        // The parking-brake checklist item stays a cockpit command.
+        assert_eq!(parse_intent("set the parking brake"), Intent::Unknown);
         // "do you copy/read/hear me" / "are you there" are radio checks — five
         // real calls across the 2026-07 flights, all stonewalled.
         assert_eq!(parse_intent("gibraltar tower, do you copy"), Intent::RadioCheck);
@@ -1311,6 +1374,7 @@ mod tests {
             RequestTaxi,
             RequestClearance,
             RequestStartup,
+            RequestShutdown,
             RequestTakeoff,
             RequestLanding { touch_and_go: false },
             RequestLanding { touch_and_go: true },
@@ -1370,7 +1434,7 @@ mod tests {
                 // deliberate edit to this test, not a surprise.
                 let want = match intent {
                     RadioCheck | WindCheck | SquawkCheck | Unknown | RequestClearance
-                    | RequestStartup => start,
+                    | RequestStartup | RequestShutdown => start,
                     // A hail, flight following, and radio housekeeping are
                     // answered without touching the sequence.
                     Greeting | RequestFlightFollowing | RequestFrequencyChange => start,

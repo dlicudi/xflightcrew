@@ -333,13 +333,18 @@
 # --- 2026-07-13 Gibraltar/Malaga sorties -------------------------------------
 # Whisper's day: "flight following" came out mangled twice (both recovered on
 # the retry — say-again is the correct degradation), "I have the visual"
-# became "visions" on short final, and the post-landing parking conversation
-# never found an intent. None of these may parse INTO a clearance.
+# became "visions" on short final ("visions" must NOT guess its way to a
+# final report — say-again is right), and the post-landing parking
+# conversation never found an intent (it does now: parking talk is the
+# arrival's taxi-in, "clearance" notwithstanding). None of these may parse
+# INTO a clearance.
 - {text: "requesting faith following.", intent: unknown}
 - {text: "request like following.", intent: unknown}
 - {text: "i have visions.", intent: unknown, radio: false}
-- {text: "where shall i park at?", intent: unknown, radio: false}
-- {text: "no, i said i want to park the aircraft.", intent: unknown, radio: false}
+- {text: "where shall i park at?", intent: request_taxi_in, radio: false}
+- {text: "no, i said i want to park the aircraft.", intent: request_taxi_in, radio: false}
+- {text: "request clearance to parking.", intent: request_taxi_in, radio: true}
+- {text: "requesting clearance to switch engines off.", intent: request_shutdown, radio: true}
 - {text: "okay, i've just landed, requesting taxi to parking.", intent: request_taxi_in, radio: true}
 - {text: "changing to gyro to tower frequency,", intent: frequency_change, radio: true}
 # Readbacks that must stay silence-worthy: the assigned vector, the squawk,

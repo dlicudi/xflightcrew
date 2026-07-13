@@ -2026,7 +2026,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                                 }
                             } else if hold_armed {
                                 if let Some(line) = crate::station::takeoff_hold_tick(
-                                    &targets, felev, now,
+                                    &targets, felev, snap.on_ground, now,
                                 ) {
                                     crate::blackbox::record(
                                         "atc",
