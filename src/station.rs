@@ -3379,39 +3379,47 @@ pub fn vector_tick(
     // track read doesn't block the clearance (best-effort, like every read).
     let off_course = angle_diff_deg(brg_thr, plan.course_deg).abs();
     let aligned = track_deg.is_none_or(|t| angle_diff_deg(t, plan.course_deg).abs() <= 30.0);
-    if (1.0..=plan.join_nm + 2.0).contains(&dist_thr) && off_course <= 15.0 && aligned {
+    // Established, two regimes. Beyond a mile: the position wedge — on the
+    // approach side, near the extended centerline, inside the join, flying
+    // the course. Inside a mile the threshold bearing is too twitchy for a
+    // 15-degree wedge, and a tight base that rolls out on final at 0.9 nm
+    // never satisfied the old 1.0 nm floor — the plan vectored a short-final
+    // Cessna AWAY ("fly heading zero niner zero" at 272 feet, toward the
+    // join point behind it) and touchdown then discarded the plan with no
+    // clearance ever spoken, handing a compliant pilot the landing berate
+    // (Gibraltar, 2026-07-13). Inside the mile the test is landing intent:
+    // below the vector altitude, pointed down the runway, threshold still
+    // broadly ahead.
+    let established = if dist_thr >= 1.0 {
+        dist_thr <= plan.join_nm + 2.0 && off_course <= 15.0 && aligned
+    } else {
+        alt_ft < plan.target_alt_ft && off_course <= 45.0 && aligned
+    };
+    if established {
         let handoff = plan
             .tower_spoken
             .as_ref()
             .map(|f| format!(" Contact Tower {f}."))
             .unwrap_or_default();
+        // A short-final clearance rounds to "1 mile", never "0 miles".
+        let miles = (dist_thr.round() as i64).max(1);
+        let miles = format!("{miles} mile{}", if miles == 1 { "" } else { "s" });
         let msg = if plan.ils && plan.cleared {
             // Cleared on the intercept, now seen established: hand off. (If
             // the pilot reports established first, respond_approach does
             // this and the plan is already gone.)
-            format!(
-                "{}, {} miles from touchdown.{}",
-                plan.callsign,
-                dist_thr.round() as i64,
-                handoff
-            )
+            format!("{}, {miles} from touchdown.{handoff}", plan.callsign)
         } else if plan.ils {
             // Straight-in that never needed an intercept turn: clearance and
             // handoff together.
             format!(
-                "{}, {} miles from touchdown. Cleared ILS approach runway {}.{}",
-                plan.callsign,
-                dist_thr.round() as i64,
-                plan.runway_spoken,
-                handoff
+                "{}, {miles} from touchdown. Cleared ILS approach runway {}.{handoff}",
+                plan.callsign, plan.runway_spoken
             )
         } else {
             format!(
-                "{}, {} miles from touchdown. Cleared visual approach runway {}.{}",
-                plan.callsign,
-                dist_thr.round() as i64,
-                plan.runway_spoken,
-                handoff
+                "{}, {miles} from touchdown. Cleared visual approach runway {}.{handoff}",
+                plan.callsign, plan.runway_spoken
             )
         };
         // Handed to the tower with an APPROACH clearance — the pilot still owes
@@ -3425,6 +3433,14 @@ pub fn vector_tick(
         }
         *guard = None; // approach's job is done
         return Some(msg);
+    }
+
+    // Inside a mile and not (yet) landing: no heading. Any vector from here
+    // aims at a join point BEHIND the aircraft — a reversal at circuit
+    // height. Stay quiet and let the geometry develop; if they blow through
+    // final, steering resumes beyond the mile.
+    if dist_thr < 1.0 {
+        return None;
     }
 
     // Steering, two regimes. Near the extended centerline on the approach
@@ -6302,6 +6318,61 @@ mod tests {
         }
         done.expect("close-in arrival never handed off");
         assert!(VECTORS.lock().unwrap().is_none());
+
+        // --- The tight base (Gibraltar 2026-07-13): the pilot rolls out on
+        // final at 0.86 nm, below the vector altitude, pointed down the
+        // runway. The old 1.0 nm wedge floor never saw it — the plan
+        // vectored the short-final aircraft away and touchdown discarded it
+        // with no clearance ever spoken, earning a compliant pilot the
+        // landing berate. Inside a mile, landing intent IS established.
+        let arm_short_final = || {
+            *VECTORS.lock().unwrap() = Some(VectorPlan {
+                callsign: "November one seven two Sierra Papa".into(),
+                thr_lat,
+                thr_lon,
+                course_deg: course,
+                runway_spoken: "zero niner".into(),
+                tower_spoken: Some(atis::spoken_mhz(st.tower_khz)),
+                target_alt_ft,
+                ils: false,
+                join_nm: 6.0,
+                cleared: false,
+                dialect: Dialect::Icao,
+                last_tx: None,
+                last_heading: None,
+            });
+        };
+        arm_short_final();
+        let (sf_lat, sf_lon) =
+            crate::autoland::project_latlon(thr_lat, thr_lon, recip + 3.0, 0.86);
+        let short_final =
+            vector_tick(sf_lat, sf_lon, target_alt_ft - 950.0, Some(course + 12.0), false, t0)
+                .expect("short final earns the clearance, not a vector away");
+        assert!(
+            short_final.contains("Cleared visual approach runway zero niner"),
+            "{short_final}"
+        );
+        assert!(short_final.contains("1 mile from touchdown"), "{short_final}");
+        assert!(short_final.contains("Contact Tower"), "{short_final}");
+        assert!(VECTORS.lock().unwrap().is_none(), "plan done after the clearance");
+
+        // Inside a mile but NOT landing — crossing final perpendicular, and a
+        // flyover at altitude — gets silence, never a reversal heading, and
+        // the plan survives for when the geometry recovers.
+        arm_short_final();
+        let (x_lat, x_lon) = crate::autoland::project_latlon(thr_lat, thr_lon, recip, 0.5);
+        let crossing_track = (course + 90.0).rem_euclid(360.0);
+        assert!(
+            vector_tick(x_lat, x_lon, target_alt_ft - 950.0, Some(crossing_track), false, t0)
+                .is_none(),
+            "no vector inside a mile"
+        );
+        assert!(
+            vector_tick(x_lat, x_lon, target_alt_ft + 500.0, Some(course), false, t0).is_none(),
+            "a flyover at altitude is not established"
+        );
+        assert!(VECTORS.lock().unwrap().is_some(), "plan survives the blow-through");
+        *VECTORS.lock().unwrap() = None;
 
         // --- The pilot who reports "established" earns the handoff from the
         // approach controller directly, and the plan dies with it.

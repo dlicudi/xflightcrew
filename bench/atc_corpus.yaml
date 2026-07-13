@@ -329,3 +329,21 @@
 - {text: "november 172 seattle papa holding point alpha, ready for departure.", intent: request_takeoff, radio: true}
 - {text: "request clearance to takeoff.", intent: request_takeoff, radio: true}
 - {text: "mayday, mayday, airplane crashed.", intent: mayday, radio: true}
+
+# --- 2026-07-13 Gibraltar/Malaga sorties -------------------------------------
+# Whisper's day: "flight following" came out mangled twice (both recovered on
+# the retry — say-again is the correct degradation), "I have the visual"
+# became "visions" on short final, and the post-landing parking conversation
+# never found an intent. None of these may parse INTO a clearance.
+- {text: "requesting faith following.", intent: unknown}
+- {text: "request like following.", intent: unknown}
+- {text: "i have visions.", intent: unknown, radio: false}
+- {text: "where shall i park at?", intent: unknown, radio: false}
+- {text: "no, i said i want to park the aircraft.", intent: unknown, radio: false}
+- {text: "okay, i've just landed, requesting taxi to parking.", intent: request_taxi_in, radio: true}
+- {text: "changing to gyro to tower frequency,", intent: frequency_change, radio: true}
+# Readbacks that must stay silence-worthy: the assigned vector, the squawk,
+# and the takeoff clearance echo with whisper's "map" stuck on the front.
+- {text: "copy flying heading 270 degrees.", intent: unknown, radio: false, readback: true}
+- {text: "number 272 sierra papa, squawk, change to 4503.", intent: unknown, radio: false, readback: true}
+- {text: "map cleared for takeoff, runway 27, november 172, sierra papa.", intent: request_takeoff, readback: true}
