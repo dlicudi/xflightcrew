@@ -51,12 +51,18 @@ enum CueKind {
 }
 
 impl CueKind {
-    /// How far before the decision point the cue speaks, meters. Safety
-    /// calls fire earlier than steering ones.
-    fn lookahead_m(self) -> f64 {
+    /// How far before the decision point the cue speaks, meters. TIME-based
+    /// with a distance floor: a fixed 80 m felt "almost exactly at the turn"
+    /// at real taxi speeds (pilot feedback, 2026-07-12) — 80 m at 18 kts is
+    /// under 9 s, and TTS synthesis plus the speech arbiter eat the front of
+    /// that. So the cue leads by seconds of taxi, not meters of pavement,
+    /// and the floor only carries creep-speed taxiing. Safety calls lead
+    /// longer than steering ones.
+    fn lookahead_m(self, gs_kts: f64) -> f64 {
+        let gs_mps = gs_kts * 0.514;
         match self {
-            CueKind::Turn | CueKind::NameChange => 80.0,
-            CueKind::RunwayAhead | CueKind::HoldingPoint => 120.0,
+            CueKind::Turn | CueKind::NameChange => (gs_mps * 15.0).clamp(80.0, 220.0),
+            CueKind::RunwayAhead | CueKind::HoldingPoint => (gs_mps * 20.0).clamp(120.0, 280.0),
         }
     }
 }
@@ -200,7 +206,7 @@ impl Guide {
             let remaining = cue.at_m - progress;
             if remaining < -PASSED_M {
                 self.called[i] = true; // sailed past unspoken — stale, drop it
-            } else if remaining <= cue.kind.lookahead_m()
+            } else if remaining <= cue.kind.lookahead_m(gs_kts)
                 && speak.is_none_or(|s| cue.at_m < self.cues[s].at_m)
             {
                 speak = Some(i);
@@ -441,6 +447,24 @@ mod tests {
         assert!(cue.contains("Holding point"), "{cue}");
         // Done: quiet forever after.
         assert_eq!(g.tick(lat, lon, 10.0, t0 + s(60)), None);
+    }
+
+    #[test]
+    fn cues_lead_by_time_not_meters() {
+        // At 18 kts the turn cue fires ~139 m out (15 s of taxi), not at the
+        // old 80 m floor that landed "almost exactly at the turn" (pilot
+        // feedback, 2026-07-12). The same spot at creep speed stays quiet —
+        // the floor only carries slow taxiing.
+        let t0 = Instant::now();
+        let (lat, lon) = ll(70.0, 0.0); // 130 m before the turn at x=200
+        let mut g = Guide::build(&route()).expect("guide");
+        assert_eq!(g.tick(lat, lon, 4.0, t0), None, "creep speed: not yet");
+        let cue = g.tick(lat, lon, 18.0, t0).expect("early cue at speed");
+        assert!(cue.contains("left"), "{cue}");
+        // The floor still fires close-in at walking pace.
+        let mut g = Guide::build(&route()).expect("guide");
+        let (lat, lon) = ll(130.0, 0.0); // 70 m out
+        assert!(g.tick(lat, lon, 4.0, t0).is_some(), "floor carries slow taxi");
     }
 
     #[test]
