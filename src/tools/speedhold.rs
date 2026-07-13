@@ -385,7 +385,11 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
         }
         let target = *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner());
         let mode = *MODE.lock().unwrap_or_else(|e| e.into_inner());
-        let on_ground = xp.get_float(ON_GROUND).await.unwrap_or(0.0) > 0.5;
+        // Three-valued on purpose: a FAILED read is a sim hiccup, not an
+        // answer — it must never impersonate "airborne" (the Web API blinked
+        // during a plugin reload and the taxi governor dropped a braking
+        // stop as 'airborne, released' at 10 knots, 2026-07-13).
+        let on_ground = xp.get_float(ON_GROUND).await.ok().map(|v| v > 0.5);
         match mode {
             Mode::Flight => {
                 if let (Ok(ias), Ok(thr)) = (xp.get_float(IAS).await, xp.get_float(THROTTLE).await)
@@ -398,7 +402,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     // Stand down when parked — holding 70 knots against the
                     // brakes is not a thing anyone wants. (Never silent: this
                     // exact path once ate three arm requests invisibly.)
-                    if on_ground && xp.get_float(GS_MS).await.unwrap_or(0.0) < 5.0 {
+                    if on_ground == Some(true) && xp.get_float(GS_MS).await.unwrap_or(0.0) < 5.0 {
                         tracing::info!("speed governor: parked, standing down");
                         ACTIVE.store(false, Ordering::Relaxed);
                         break;
@@ -431,8 +435,16 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                 }
             }
             Mode::Taxi => {
+                // Can't read the squat switch: hold everything exactly as it
+                // is (the brake ratios persist in the sim under the override)
+                // and retry — the one wrong move is releasing a stop we may
+                // be mid-way through.
+                if on_ground.is_none() {
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                    continue;
+                }
                 // Airborne means the taxi is over — release everything, done.
-                if !on_ground {
+                if on_ground == Some(false) {
                     tracing::info!("speed governor: airborne, taxi hold released");
                     ACTIVE.store(false, Ordering::Relaxed);
                     break;
