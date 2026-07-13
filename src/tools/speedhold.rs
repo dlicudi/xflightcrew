@@ -34,17 +34,27 @@ const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const LEFT_BRAKE: &str = "sim/cockpit2/controls/left_brake_ratio";
 const RIGHT_BRAKE: &str = "sim/cockpit2/controls/right_brake_ratio";
-/// While set, X-Plane stops re-driving the toe-brake ratios from the pilot's
-/// hardware every frame. Without it the governor's braking loses the fight
-/// against assigned pedal axes — an SR22 blew through its taxi target with
-/// the copilot "braking" the whole time (2026-07-11). Held ONLY while the
-/// governor actually wants brake, so the pedals stay the pilot's otherwise.
-const OVERRIDE_TOEBRAKES: &str = "sim/operation/override/override_toebrakes";
+/// The input-layer held-brake command — the same path as the pilot's brake
+/// key, which is the braking that demonstrably works. The previous design
+/// wrote the toe-brake RATIOS under an override that turned out NOT TO
+/// EXIST (`override_toebrakes`; the real dataref is `override_toe_brakes`,
+/// and the engage error was silently swallowed), so the sim re-drove the
+/// ratios from the pilot's hardware every frame and REST-rate writes lost
+/// the fight — "stop" never reliably stopped (flaky since 2026-07-11,
+/// pinned 2026-07-13). A command can't be stomped and can't stick: braking
+/// is this command re-activated every tick, and releasing is simply not
+/// renewing it.
+const BRAKES_REGULAR: &str = "sim/flight_controls/brakes_regular";
+/// How long each activation holds the brakes. Comfortably longer than a
+/// braking tick (~100 ms) so the hold is continuous while renewed — and any
+/// end of the governor (release, crash, kill -9) frees the brakes within
+/// this long, by expiry. A boot that can never be left on.
+const BRAKE_HOLD_SECS: f64 = 1.0;
 const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 const MS_TO_KTS: f64 = 1.943_844;
 /// Toe-brake ratio above which the pilot is deliberately braking — enough to
-/// clear pedal rest/noise, well below a firm press. When we read this the
-/// governor isn't braking (override off), so the ratio IS the pilot's pedal.
+/// clear pedal rest/noise, well below a firm press. Only read once our own
+/// held-brake command has expired, so the ratio IS the pilot's pedal.
 const PILOT_BRAKE_YIELD: f64 = 0.1;
 /// Both pedals back below this = fully released, the brake-pause is over and
 /// the taxi hold rolls again. Lower than the yield threshold on purpose —
@@ -362,6 +372,9 @@ async fn glide(xp: &XPlaneClient, dataref: &str, to: f64, over_ms: u64) {
 async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
     tracing::info!("speed governor started");
     let mut braking = false;
+    // When the held-brake command was last renewed: until it expires, the
+    // pedal ratios can be our own braking, not the pilot's feet.
+    let mut last_brake_cmd: Option<std::time::Instant> = None;
     // Brake-paused: the pilot pressed both pedals mid-taxi, the throttle went
     // to idle, and the hold is waiting for the pedals to come fully off.
     let mut paused = false;
@@ -493,10 +506,13 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                 // down for good, and every brake press cost a "go" to get the
                 // taxi back — resume-on-release asked for 2026-07-13). A
                 // single pedal is differential steering (turning the
-                // aircraft), which the hold must ride through. Read before we
-                // touch the ratios this tick: with override off (we're not
-                // braking) the ratio is the pilot's hardware.
-                if !braking {
+                // aircraft), which the hold must ride through. Only read the
+                // pedals once OUR held-brake command has expired — while it
+                // is (or was just) active, the ratios can be our own braking
+                // wearing the pilot's shoes.
+                let ours_expired = last_brake_cmd
+                    .is_none_or(|t| t.elapsed().as_secs_f64() > BRAKE_HOLD_SECS + 0.2);
+                if !braking && ours_expired {
                     let lb = xp.get_float(LEFT_BRAKE).await.unwrap_or(0.0);
                     let rb = xp.get_float(RIGHT_BRAKE).await.unwrap_or(0.0);
                     if pilot_took_the_brakes(lb, rb, braking) {
@@ -527,13 +543,18 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                         glide(&xp, THROTTLE, t, 200).await;
                         last_cmd = Some(t);
                     }
-                    if brake > 0.0 && !braking {
-                        let _ = xp.set_float(OVERRIDE_TOEBRAKES, 1.0).await;
-                    }
-                    let _ = xp.set_float(LEFT_BRAKE, brake).await;
-                    let _ = xp.set_float(RIGHT_BRAKE, brake).await;
-                    if brake <= 0.0 && braking {
-                        let _ = xp.set_float(OVERRIDE_TOEBRAKES, 0.0).await;
+                    // Braking is the held INPUT command, renewed every tick
+                    // while the law wants brake — the same firm application
+                    // as the pilot's own brake key. Never silent on failure:
+                    // a swallowed brake error hid the broken override for
+                    // days of flights.
+                    if brake > 0.0 {
+                        match xp.run_command_for(BRAKES_REGULAR, BRAKE_HOLD_SECS).await {
+                            Ok(()) => last_brake_cmd = Some(std::time::Instant::now()),
+                            Err(e) => {
+                                tracing::warn!("speed governor: brake command failed: {e:#}")
+                            }
+                        }
                     }
                     braking = brake > 0.0;
                     tokio::time::sleep(std::time::Duration::from_millis(if wrote { 100 } else { 300 })).await;
@@ -544,12 +565,8 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
         }
     }
     tracing::info!("speed governor stopped");
-    // Whatever ended the loop: leave the pedals clean.
-    if braking {
-        let _ = xp.set_float(LEFT_BRAKE, 0.0).await;
-        let _ = xp.set_float(RIGHT_BRAKE, 0.0).await;
-        let _ = xp.set_float(OVERRIDE_TOEBRAKES, 0.0).await;
-    }
+    // Nothing to clean on the way out: the held brake command expires by
+    // itself within BRAKE_HOLD_SECS, however this loop ended.
 }
 
 #[cfg(test)]
