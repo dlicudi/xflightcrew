@@ -27,11 +27,30 @@ pub struct OnnxTts {
     sample_rate: u32,
     /// `[noise_scale, length_scale, noise_w]` — the VITS inference scales.
     scales: [f32; 3],
+    /// Speaker id for MULTI-speaker voices (`Some` only when the model hosts
+    /// more than one): one .onnx file, several distinct people. Selected by
+    /// the `#N` suffix on the voice spec ("es_ES-sharvard-medium.onnx#1").
+    speaker: Option<i64>,
+}
+
+/// Split a voice spec into (model path, speaker id): `model.onnx#1` selects
+/// speaker 1 of a multi-speaker voice; a bare path means speaker 0. A `#`
+/// that isn't followed by a number is treated as part of the path.
+pub fn split_speaker(spec: &str) -> (&str, i64) {
+    match spec.rsplit_once('#') {
+        Some((path, id)) => match id.parse::<i64>() {
+            Ok(n) => (path, n),
+            Err(_) => (spec, 0),
+        },
+        None => (spec, 0),
+    }
 }
 
 impl OnnxTts {
-    /// Load a piper `.onnx` voice and its sibling `.onnx.json` once.
-    pub fn load(model_path: &str) -> Result<Self> {
+    /// Load a piper `.onnx` voice and its sibling `.onnx.json` once. The spec
+    /// may carry a `#N` speaker suffix for multi-speaker models.
+    pub fn load(spec: &str) -> Result<Self> {
+        let (model_path, sid) = split_speaker(spec);
         // ort's builder error carries the (non-Send) builder back, so it can't go
         // through `?` into anyhow directly — map via Display first. Chained on the
         // temporary builder so no `mut` binding is needed.
@@ -79,7 +98,12 @@ impl OnnxTts {
             env_scale("XCOPILOT_TTS_NOISE_W", inf["noise_w"].as_f64().unwrap_or(0.8)),
         ];
 
-        Ok(Self { session, phoneme_ids, sample_rate, scales })
+        // Multi-speaker voices take a `sid` input; single-speaker models
+        // reject it, so only pass one when the model actually hosts a crowd.
+        let num_speakers = cfg["num_speakers"].as_i64().unwrap_or(1);
+        let speaker = (num_speakers > 1).then_some(sid.clamp(0, num_speakers - 1));
+
+        Ok(Self { session, phoneme_ids, sample_rate, scales, speaker })
     }
 
     /// The voice's output sample rate (from its `.onnx.json`) — callers that
@@ -135,11 +159,22 @@ impl OnnxTts {
         let lengths = Tensor::from_array(([1_i64], vec![n]))?;
         let scales = Tensor::from_array(([3_i64], self.scales.to_vec()))?;
 
-        let outputs = self.session.run(ort::inputs![
-            "input" => input,
-            "input_lengths" => lengths,
-            "scales" => scales,
-        ])?;
+        let outputs = match self.speaker {
+            Some(sid) => {
+                let sid = Tensor::from_array(([1_i64], vec![sid]))?;
+                self.session.run(ort::inputs![
+                    "input" => input,
+                    "input_lengths" => lengths,
+                    "scales" => scales,
+                    "sid" => sid,
+                ])?
+            }
+            None => self.session.run(ort::inputs![
+                "input" => input,
+                "input_lengths" => lengths,
+                "scales" => scales,
+            ])?,
+        };
 
         let (_shape, data) = outputs[0].try_extract_tensor::<f32>()?;
         Ok(data.to_vec())
@@ -570,7 +605,10 @@ mod station_voice_tests {
                       cleared for takeoff.";
         let out_dir = std::env::temp_dir().join("xc-audition");
         std::fs::create_dir_all(&out_dir).expect("mkdir");
-        for (i, model) in ["en_GB-alan-medium", "en_GB-northern_english_male-medium", "en_GB-alba-medium"]
+        // alan-medium is gone: voted off 2026-07-09 ("read flat"), veto
+        // confirmed 2026-07-12 ("NOT THIS GUY"). alba (tower) and northern
+        // male (departure) re-confirmed GOOD the same day.
+        for (i, model) in ["en_GB-northern_english_male-medium", "en_GB-alba-medium"]
             .iter()
             .enumerate()
         {
@@ -587,6 +625,55 @@ mod station_voice_tests {
             super::write_wav(&wav, &s, v.sample_rate).expect("write wav");
             println!("audition: {}", wav.display());
         }
+    }
+
+    /// The Spanish-accent roster, exactly as the caster would use it (station
+    /// cadence for accents = slower, radio effect applied). One WAV per
+    /// candidate in `$TMPDIR/xc-audition/` — listen, then curate
+    /// `voice::local_accents_for` by deleting what doesn't survive. Run:
+    /// `cargo test --lib audition_spanish_voices -- --ignored --nocapture`
+    #[test]
+    #[ignore = "writes audition WAVs from the real models; run manually"]
+    fn audition_spanish_voices() {
+        let phrase = "November one seven two Sierra Papa, Jerez Tower, \
+                      runway two zero, wind two one zero degrees, eight knots, \
+                      cleared to land.";
+        let out_dir = std::env::temp_dir().join("xc-audition");
+        std::fs::create_dir_all(&out_dir).expect("mkdir");
+        // The 2026-07-12 audition graveyard: davefx, sharvard #0 and #1,
+        // es_MX-ald, es_MX-claude — ALL vetoed by ear (the entire Piper
+        // Spanish catalogue above low quality). The harness stays for the
+        // next candidates; seat survivors in `voice::local_accents_for`.
+        let specs: [(&str, &str); 0] = [];
+        for (i, (spec, label)) in specs.iter().enumerate() {
+            let mut v = match super::OnnxTts::load(spec) {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("skip {label}: {e:#}");
+                    continue;
+                }
+            };
+            // Accented voices run SLOWER than the brisk 0.8 (heard live
+            // 2026-07-09) — same 1.1 the station caster applies.
+            v.override_scales(None, Some(1.1), Some(1.0));
+            let mut s = v.synth(phrase).expect("synth");
+            match crate::radiofx::load_tail_wav("assets/afv/Click_f32.wav", v.sample_rate) {
+                Ok(tail) => crate::radiofx::radioize_with_tail(&mut s, v.sample_rate, i as u32 + 1, &tail),
+                Err(_) => crate::radiofx::radioize_variant(&mut s, v.sample_rate, i as u32 + 1),
+            }
+            let wav = out_dir.join(format!("{label}.wav"));
+            super::write_wav(&wav, &s, v.sample_rate).expect("write wav");
+            println!("audition: {}", wav.display());
+        }
+    }
+
+    #[test]
+    fn speaker_specs_split_cleanly() {
+        assert_eq!(super::split_speaker("models/v.onnx"), ("models/v.onnx", 0));
+        assert_eq!(super::split_speaker("models/v.onnx#1"), ("models/v.onnx", 1));
+        assert_eq!(super::split_speaker("models/v.onnx#0"), ("models/v.onnx", 0));
+        // A '#' that isn't a speaker id stays part of the path.
+        assert_eq!(super::split_speaker("models/v#a.onnx"), ("models/v#a.onnx", 0));
     }
 
     /// Reproduces the live 2026-07-07 station-voice shape: the copilot's Ryan
