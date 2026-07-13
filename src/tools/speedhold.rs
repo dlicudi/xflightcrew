@@ -36,6 +36,24 @@ const RIGHT_BRAKE: &str = "sim/cockpit2/controls/right_brake_ratio";
 const OVERRIDE_TOEBRAKES: &str = "sim/operation/override/override_toebrakes";
 const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 const MS_TO_KTS: f64 = 1.943_844;
+/// Toe-brake ratio above which the pilot is deliberately braking — enough to
+/// clear pedal rest/noise, well below a firm press. When we read this the
+/// governor isn't braking (override off), so the ratio IS the pilot's pedal.
+const PILOT_BRAKE_YIELD: f64 = 0.1;
+
+/// The pilot has taken the brakes to SLOW: they're pressing BOTH toe brakes
+/// while the governor isn't (so the ratio reflects hardware, not our own
+/// command). The copilot must hand back rather than throttle up against the
+/// pedals — the same yield it gives a throttle-lever nudge or the parking brake.
+///
+/// Deliberately `min`, not `max`: a single pedal is DIFFERENTIAL braking, which
+/// is how you steer a taxiing aircraft — and on a castoring-nosewheel type (the
+/// SR22) it's the ONLY low-speed steering. Standing down on one pedal made the
+/// taxi hold cut throttle to 0 every time the pilot turned (2026-07-12). Only
+/// both pedals together reads as "I'm slowing us," not "I'm turning."
+fn pilot_took_the_brakes(left: f64, right: f64, governor_braking: bool) -> bool {
+    !governor_braking && left.min(right) > PILOT_BRAKE_YIELD
+}
 
 /// True while the governor loop runs. Public so other control loops could
 /// check it, mirroring `recover::ACTIVE` / `autoland::ACTIVE`.
@@ -415,6 +433,22 @@ async fn governor(xp: XPlaneClient) {
                     ACTIVE.store(false, Ordering::Relaxed);
                     break;
                 }
+                // The pilot on BOTH toe brakes is taking speed control — yield,
+                // don't throttle up against the pedals. A single pedal is
+                // differential steering (turning the aircraft), which the hold
+                // must ride through, not stand down on. Read before we touch the
+                // ratios this tick: with override off (we're not braking) the
+                // ratio is the pilot's hardware.
+                if !braking {
+                    let lb = xp.get_float(LEFT_BRAKE).await.unwrap_or(0.0);
+                    let rb = xp.get_float(RIGHT_BRAKE).await.unwrap_or(0.0);
+                    if pilot_took_the_brakes(lb, rb, braking) {
+                        tracing::info!(brake = lb.max(rb), "speed governor: pilot braking, standing down");
+                        glide(&xp, THROTTLE, 0.0, 300).await;
+                        ACTIVE.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                }
                 if let (Ok(gs_ms), Ok(thr)) =
                     (xp.get_float(GS_MS).await, xp.get_float(THROTTLE).await)
                 {
@@ -509,5 +543,25 @@ mod tests {
         assert_eq!(taxi_control(10.0, 10.5, 0.15), (None, 0.0));
         // Hold short: idle + parked on the brakes even when stopped.
         assert_eq!(taxi_control(0.0, 0.2, 0.0), (Some(0.0), 0.5));
+    }
+
+    #[test]
+    fn manual_toe_brakes_make_the_governor_yield() {
+        // BOTH pedals down while we're NOT braking (override off → the ratios
+        // are the pilot's pedals): the pilot is slowing us, yield.
+        assert!(pilot_took_the_brakes(0.2, 0.2, false), "both pedals = slowing");
+        assert!(pilot_took_the_brakes(0.5, 0.2, false), "both engaged, uneven, still slowing");
+        // A SINGLE pedal is differential braking = steering a turn (the only
+        // low-speed steering on a castoring nosewheel). The hold must ride
+        // through it, not cut throttle to 0 the moment the pilot turns.
+        assert!(!pilot_took_the_brakes(0.4, 0.0, false), "left pedal = steering, ride through");
+        assert!(!pilot_took_the_brakes(0.0, 0.4, false), "right pedal = steering, ride through");
+        // Pedal rest / sensor noise below the threshold is NOT a takeover.
+        assert!(!pilot_took_the_brakes(0.05, 0.03, false));
+        assert!(!pilot_took_the_brakes(0.0, 0.0, false));
+        // While the governor is braking (override on) the ratios are OUR own
+        // command, not the pilot's — never read them as a takeover, or we'd
+        // stand ourselves down the instant we touched the brakes.
+        assert!(!pilot_took_the_brakes(0.6, 0.6, true), "that's our brake, not theirs");
     }
 }

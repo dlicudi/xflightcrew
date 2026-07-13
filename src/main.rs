@@ -1200,6 +1200,46 @@ async fn run_session(
         // only — phonetic nonsense and STT follow-ups are voice problems. A typed
         // command is taken as-is. Questions are let through too (the LLM decides
         // act-vs-answer), so they aren't rejected as "not a command".
+        // While the taxi governor is driving, stop/go words act BEFORE the
+        // domain gate — which knows nothing of "go, go, go" or a mangled
+        // "stop the aircraft" ("stop the echo", both heard live 2026-07-12,
+        // both silently dropped while the copilot held the brakes). Same
+        // philosophy as the release path: when we hold a control, ambiguity
+        // resolves toward the pilot's authority over it — and on the ground,
+        // stopping is always the safe reading.
+        if tools::speedhold::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            let tl = command.to_ascii_lowercase();
+            let words: Vec<&str> = tl
+                .split_whitespace()
+                .map(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\''))
+                .filter(|w| !w.is_empty())
+                .collect();
+            let stopish = words.contains(&"stop")
+                && !tl.contains("holding")
+                && !tl.contains("my throttle")
+                && !tl.contains("my power");
+            let goish = matches!(
+                words.as_slice(),
+                ["go"] | ["go", "go"] | ["go", "go", "go"] | ["lets", "go"] | ["let's", "go"]
+            ) || tl.contains("keep going")
+                || tl.contains("carry on");
+            if stopish || goish {
+                if let Some(tool) = registry.get("hold_speed") {
+                    let args = if stopish {
+                        serde_json::json!({ "knots": 0 })
+                    } else {
+                        serde_json::json!({ "resume": true })
+                    };
+                    tracing::info!(stop = stopish, "governor stop/go word, pre-gate");
+                    let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice), status: reporter.status_sink(), reminders: Some(&reminders) };
+                    match tool.execute(&args, &ctx).await {
+                        Ok(line) => say(&voice, &reporter, ui::LogKind::Readback, &line),
+                        Err(e) => say(&voice, &reporter, ui::LogKind::Warn, &format!("Tried, but: {e:#}")),
+                    }
+                    continue;
+                }
+            }
+        }
         if !from_text && !looks_like_command(&command) && !looks_like_question(&command) {
             // A conversational follow-up shortly after a command is let through
             // even without a keyword. Outside the window, the strict gate holds.
