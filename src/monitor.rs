@@ -451,7 +451,14 @@ pub trait Check: Send {
 
 /// Per-check firing state: enforces edge-triggering and Warning repeats.
 struct FireState {
-    firing: bool,
+    /// The CURRENT episode of the condition has already been announced. Set
+    /// only when the callout actually speaks — never on the sustain-wait
+    /// ticks before it — and reset by [`clear`](Self::clear). (The old
+    /// every-tick "firing" flag consumed the rising edge while `min_duration`
+    /// was still counting, so a recurred Caution could never speak twice in
+    /// one flight: a stalling 172's second "getting slow" was eaten exactly
+    /// there, four minutes before terrain, 2026-07-13.)
+    spoke_this_episode: bool,
     last_spoken: Option<Instant>,
     /// When the condition most recently became true (rising edge). Used to
     /// enforce a check's `min_duration` sustain before the first callout.
@@ -460,7 +467,7 @@ struct FireState {
 
 impl FireState {
     fn new() -> Self {
-        FireState { firing: false, last_spoken: None, since: None }
+        FireState { spoke_this_episode: false, last_spoken: None, since: None }
     }
 
     /// Should we speak right now? Never more than once per `RENOTIFY_COOLDOWN` —
@@ -475,7 +482,7 @@ impl FireState {
                 if now.duration_since(t) < RENOTIFY_COOLDOWN {
                     return false; // within cooldown — stay quiet
                 }
-                !self.firing || sev == Severity::Warning
+                !self.spoke_this_episode || sev == Severity::Warning
             }
         }
     }
@@ -528,15 +535,16 @@ impl FireState {
             );
             voice.alert(sev.into(), msg);
             self.last_spoken = Some(now);
+            self.spoke_this_episode = true;
         }
-        self.firing = true;
     }
 
     /// Condition cleared. Keep `last_spoken` so a quick recurrence is still
-    /// inside the cooldown and won't re-nag; drop the firing flag and reset the
-    /// sustain timer so the next occurrence must hold for `min_duration` again.
+    /// inside the cooldown and won't re-nag; drop the episode flag and reset
+    /// the sustain timer so the next occurrence must hold for `min_duration`
+    /// again.
     fn clear(&mut self) {
-        self.firing = false;
+        self.spoke_this_episode = false;
         self.since = None;
     }
 }
@@ -3049,7 +3057,7 @@ mod tests {
         let mut st = FireState::new();
         let t0 = Instant::now();
         assert!(st.should_speak(Severity::Warning, t0)); // rising edge
-        st.firing = true;
+        st.spoke_this_episode = true;
         st.last_spoken = Some(t0);
         assert!(!st.should_speak(Severity::Warning, t0 + Duration::from_secs(1))); // too soon
         assert!(st.should_speak(Severity::Warning, t0 + RENOTIFY_COOLDOWN + Duration::from_secs(1))); // due
@@ -3060,7 +3068,7 @@ mod tests {
         let mut st = FireState::new();
         let t0 = Instant::now();
         assert!(st.should_speak(Severity::Advisory, t0)); // rising edge
-        st.firing = true;
+        st.spoke_this_episode = true;
         st.last_spoken = Some(t0);
         // Even long after, a still-firing Advisory doesn't nag.
         assert!(!st.should_speak(Severity::Advisory, t0 + RENOTIFY_COOLDOWN * 3));
@@ -3072,15 +3080,42 @@ mod tests {
         let t0 = Instant::now();
         // First occurrence speaks.
         assert!(st.should_speak(Severity::Warning, t0));
-        st.firing = true;
+        st.spoke_this_episode = true;
         st.last_spoken = Some(t0);
         // Pilot fixes it.
         st.clear();
-        assert!(!st.firing);
+        assert!(!st.spoke_this_episode);
         // Recurs almost immediately → suppressed (still within cooldown).
         assert!(!st.should_speak(Severity::Warning, t0 + Duration::from_secs(3)));
         // Recurs well after the cooldown → speaks again.
         assert!(st.should_speak(Severity::Warning, t0 + RENOTIFY_COOLDOWN + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn sustained_caution_respeaks_on_a_fresh_episode() {
+        // The exact call pattern active() runs: on every bad tick, sustained()
+        // first (arming the rising edge), should_speak() only once the sustain
+        // has elapsed. A recurred Caution must survive that wait — the old
+        // every-tick firing flag consumed the edge during it, so a stalling
+        // 172's second "getting slow" was never spoken (2026-07-13).
+        let mut st = FireState::new();
+        let d = Duration::from_millis(700);
+        let t0 = Instant::now();
+        let tick = Duration::from_secs(1);
+        // Episode 1: sustain tick, then the speak tick.
+        assert!(!st.sustained(d, t0));
+        assert!(st.sustained(d, t0 + tick) && st.should_speak(Severity::Caution, t0 + tick));
+        st.last_spoken = Some(t0 + tick);
+        st.spoke_this_episode = true;
+        // Condition clears (speed recovered).
+        st.clear();
+        // Episode 2, minutes later: same pattern, and it MUST speak again.
+        let t1 = t0 + Duration::from_secs(500);
+        assert!(!st.sustained(d, t1));
+        assert!(
+            st.sustained(d, t1 + tick) && st.should_speak(Severity::Caution, t1 + tick),
+            "a fresh episode past the cooldown must speak even after the sustain wait"
+        );
     }
 
     #[test]
