@@ -152,8 +152,9 @@ static TextRef g_radio = {{0}, 0};
 // ATC tab — every station in VHF range, nearest first, refreshed by the app
 // as "NAME,dist_nm,SVC khz,...|NAME,..." ('*' prefix = the active station).
 static TextRef g_atc = {{0}, 0};
-// Calls tab — the radio coach's suggested next call for the current tower
-// state, refreshed continuously by the app. Empty = no station.
+// The radio coach's suggested next call for the current tower state,
+// refreshed continuously by the app. Empty = no station. Rendered twice:
+// the Calls tab's SAY NOW header, and the Log tab's ghost "next" entry.
 static TextRef g_coach = {{0}, 0};
 
 static XPLMDataRef g_phase_dref = nullptr;
@@ -845,7 +846,8 @@ protected:
         const float pad = 8.0f;
         const float kTimeW = ImGui::CalcTextSize("88:88:88").x + pad;
         const float kTagW = ImGui::CalcTextSize("COPILOT").x + 14.0f; // widest tag
-        if (g_log.empty()) {
+        const bool ghost = connected && g_coach.len > 0;
+        if (g_log.empty() && !ghost) {
             // Empty state, centred in the well — not a footer mumble.
             const char* hint = connected ? "Hold PTT and speak." : "Start x-copilot to connect.";
             ImVec2 ts = ImGui::CalcTextSize(hint);
@@ -862,6 +864,27 @@ protected:
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(e.color));
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextUnformatted(e.text.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+        }
+        // The coach's suggested next call, as a GHOST entry where the next
+        // transmission will land: the transcript shows the conversation so
+        // far, and this row is its expected next line. Live state, never
+        // stored — it refreshes with the tower's state machine and vanishes
+        // once the call is made. Dim when it's a hint; amber with an OWED
+        // tag when a readback is due, because that row isn't a suggestion,
+        // it's a debt.
+        if (ghost) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "next");
+            ImGui::SameLine(kTimeW + pad);
+            TagChip(g_coach_urgent ? "OWED" : "SAY",
+                    g_coach_urgent ? COL_AMBER : COL_CYAN, kTagW);
+            ImGui::SameLine(kTimeW + kTagW + pad * 2);
+            ImGui::PushStyleColor(
+                ImGuiCol_Text,
+                ImGui::ColorConvertU32ToFloat4(g_coach_urgent ? COL_AMBER : COL_DIM));
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(g_coach.buf);
             ImGui::PopTextWrapPos();
             ImGui::PopStyleColor();
         }
