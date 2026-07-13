@@ -375,10 +375,17 @@ async fn main() -> Result<()> {
                                 .unwrap_or_else(|| "your callsign".to_string());
                             let dist = station::active_field()
                                 .map(|(_, flat, flon, _)| haversine_nm(lat, lon, flat, flon));
-                            sink.coach(
-                                &station::suggest_call(&callsign, on_ground, dist)
-                                    .unwrap_or_default(),
-                            );
+                            match station::suggest_call(&callsign, on_ground, dist, com1) {
+                                Some(s) => {
+                                    let text = [s.first.as_deref(), s.call.as_deref()]
+                                        .into_iter()
+                                        .flatten()
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    sink.coach(s.urgent, s.arrival, &text);
+                                }
+                                None => sink.coach(false, false, ""),
+                            }
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
@@ -1541,8 +1548,20 @@ async fn run_session(
                         }
                         _ => None,
                     };
-                    let line = match station::suggest_call(&callsign, on_ground, dist) {
-                        Some(call) => format!("Key the radio and say: {call}"),
+                    let com1 = xplane
+                        .get_float(datarefs::COM1_FREQ_KHZ)
+                        .await
+                        .ok()
+                        .map(|v| v.round() as i64);
+                    let line = match station::suggest_call(&callsign, on_ground, dist, com1) {
+                        Some(s) => match (s.first, s.call) {
+                            (Some(f), Some(c)) => {
+                                format!("{f} Then key the radio and say: {c}")
+                            }
+                            (Some(f), None) => f,
+                            (None, Some(c)) => format!("Key the radio and say: {c}"),
+                            (None, None) => "No station on frequency to call.".to_string(),
+                        },
                         None => "No station on frequency to call.".to_string(),
                     };
                     say(&voice, &reporter, ui::LogKind::Readback, &line);

@@ -127,9 +127,23 @@ impl StatusSink {
     pub fn atc(&self, text: &str) {
         let _ = self.0.send(Update::Atc(clip(text)));
     }
-    /// Refresh the Calls tab's suggested next call. Empty hides it.
-    pub fn coach(&self, text: &str) {
-        let _ = self.0.send(Update::Coach(clip(text)));
+    /// Refresh the Calls tab's suggested next call. Empty hides it. Two
+    /// marker bytes lead the payload (mirroring the alert severity scheme):
+    /// urgency ('2' = an owed readback, rendered amber with a tab dot;
+    /// '1' = a hint) and phase group ('A' arrival / 'D' departure, driving
+    /// the phraseology reference highlight).
+    pub fn coach(&self, urgent: bool, arrival: bool, text: &str) {
+        let payload = if text.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{}{}{}",
+                if urgent { '2' } else { '1' },
+                if arrival { 'A' } else { 'D' },
+                clip(text)
+            )
+        };
+        let _ = self.0.send(Update::Coach(payload));
     }
     /// Flash a "what's being changed" callout over the cockpit (e.g. "FLAPS > 10").
     pub fn callout(&self, text: &str) {

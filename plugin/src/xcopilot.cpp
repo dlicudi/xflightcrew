@@ -311,9 +311,26 @@ static void WriteAtc(void*, void* in, int offset, int len) {
     g_atc_fields = parse_atc();
 }
 
-// Coach line — refreshed continuously like the radio row, not logged.
+// Coach line — refreshed continuously like the radio row, not logged. The app
+// leads the payload with two marker bytes (the alert severity scheme):
+// urgency ('1' hint, '2' an OWED readback — amber text + a dot on the Calls
+// tab) and phase group ('D' departure / 'A' arrival — highlights the matching
+// phraseology reference group). Parsed off here; markerless text renders as a
+// plain hint (legacy).
+static bool g_coach_urgent = false;
+static char g_coach_group = 0;
 static void WriteCoach(void*, void* in, int offset, int len) {
     StoreText(&g_coach, in, offset, len);
+    g_coach_urgent = false;
+    g_coach_group = 0;
+    if (g_coach.len >= 2 && (g_coach.buf[0] == '1' || g_coach.buf[0] == '2')
+        && (g_coach.buf[1] == 'D' || g_coach.buf[1] == 'A')) {
+        g_coach_urgent = (g_coach.buf[0] == '2');
+        g_coach_group = g_coach.buf[1];
+        std::memmove(g_coach.buf, g_coach.buf + 2,
+                     static_cast<size_t>(g_coach.len - 2) + 1);
+        g_coach.len -= 2;
+    }
 }
 // Callout — stamp the arrival time; the toast shows for a short window after.
 // An optional "nx,ny|" prefix (fractions of the half-screen from centre) aims
@@ -723,7 +740,11 @@ protected:
                 mTab = 2;
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Calls")) {
+            // A dot on Calls while a readback is OWED — a live condition,
+            // not an unread counter: it stays lit until the readback is paid.
+            ImGuiTabItemFlags callsFlags =
+                g_coach_urgent ? ImGuiTabItemFlags_UnsavedDocument : 0;
+            if (ImGui::BeginTabItem("Calls", nullptr, callsFlags)) {
                 mTab = 3;
                 ImGui::EndTabItem();
             }
@@ -992,8 +1013,13 @@ protected:
     // Ask the copilot "what do I say?" for the same line by voice.
     void buildCallsTab(bool connected) {
         if (connected && g_coach.len > 0) {
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "SAY NOW");
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_CYAN));
+            // An owed readback is not a suggestion — amber, and named for
+            // what it is. Everything else stays the calm cyan hint.
+            ImU32 col = g_coach_urgent ? COL_AMBER : COL_CYAN;
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(
+                                   g_coach_urgent ? COL_AMBER : COL_DIM),
+                               g_coach_urgent ? "READBACK OWED" : "SAY NOW");
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(col));
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextUnformatted(g_coach.buf);
             ImGui::PopTextWrapPos();
@@ -1005,7 +1031,7 @@ protected:
             + ImGui::GetStyle().ItemSpacing.y;
         if (ImGui::BeginChild("calls_well", ImVec2(0, -footer))) {
             struct Phrase { const char* say; const char* gets; };
-            struct Group { const char* title; const Phrase* items; int n; };
+            struct Group { const char* title; char key; const Phrase* items; int n; };
             static const Phrase dep[] = {
                 {"<Station> Tower, <callsign>, with information <letter>, request departure clearance", "zone clearance + squawk"},
                 {"Request taxi", "taxi route via named taxiways"},
@@ -1034,11 +1060,17 @@ protected:
                 {"Pan pan, pan pan, pan pan, <callsign>, <problem>", "urgency handling"},
             };
             static const Group groups[] = {
-                {"DEPARTURE", dep, 5}, {"ARRIVAL AND CIRCUIT", arr, 6},
-                {"ANY TIME", misc, 6}, {"EMERGENCY", emer, 2},
+                {"DEPARTURE", 'D', dep, 5}, {"ARRIVAL AND CIRCUIT", 'A', arr, 6},
+                {"ANY TIME", 0, misc, 6}, {"EMERGENCY", 0, emer, 2},
             };
+            // The group matching the live flight phase (the coach payload's
+            // group marker) reads "you are here"; the rest stay dim.
+            char active = (connected && g_coach.len > 0) ? g_coach_group : 0;
             for (const Group& g : groups) {
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", g.title);
+                bool here = g.key != 0 && g.key == active;
+                ImGui::TextColored(
+                    ImGui::ColorConvertU32ToFloat4(here ? COL_CYAN : COL_DIM),
+                    here ? "%s  <" : "%s", g.title);
                 for (int i = 0; i < g.n; ++i) {
                     ImGui::Bullet();
                     ImGui::SameLine();

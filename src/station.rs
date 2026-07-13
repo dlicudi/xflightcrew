@@ -2485,43 +2485,125 @@ pub fn coach_query(t: &str) -> bool {
         || (t.contains("help") && t.contains("radio"))
 }
 
+/// One coached hint from [`suggest_call`]: an optional prerequisite/status
+/// line and the transmission itself. At least one is always present.
+pub struct Suggestion {
+    /// Spoken/shown BEFORE the call — a prerequisite ("First tune tower, one
+    /// three one decimal two.", "First copy the ATIS on ...") or a status
+    /// ("Under radar vectors. No call owed."). Never itself a transmission.
+    pub first: Option<String>,
+    /// The transmission to key — always a line the intent parser routes.
+    pub call: Option<String>,
+    /// The call is an OWED readback (runway-critical): say it now.
+    pub urgent: bool,
+    /// The flight is on the arrival side — drives the panel's phrase-group
+    /// highlight (false = departure side).
+    pub arrival: bool,
+}
+
 /// The call the pilot SHOULD make next, derived from the tower's own state
 /// machine — the copilot as radio coach, and the panel's Calls tab. The
 /// suggestions are deliberately the parser's happy path: following the
-/// coach always routes. `None` = no station to talk to.
-pub fn suggest_call(callsign: &str, on_ground: bool, dist_nm: Option<f64>) -> Option<String> {
-    let station = ACTIVE_PANEL
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .map(|(n, _, _)| spoken_airport(n).to_string())?;
-    // A readback owed outranks everything: it IS the next call.
-    if let Some(rb) = CLEARANCE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .and_then(|c| c.pending_readback.clone())
-    {
-        return Some(rb);
-    }
+/// coach always routes. `com1_khz` is the live radio: a suggestion the
+/// station can't hear gets a "first tune ..." line ahead of it. `None` =
+/// no station to talk to.
+pub fn suggest_call(
+    callsign: &str,
+    on_ground: bool,
+    dist_nm: Option<f64>,
+    com1_khz: Option<i64>,
+) -> Option<Suggestion> {
+    let (station, services) = {
+        let p = ACTIVE_PANEL.lock().unwrap_or_else(|e| e.into_inner());
+        let (name, _, svcs) = p.as_ref()?;
+        (spoken_airport(name).to_string(), svcs.clone())
+    };
     let clr = CLEARANCE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .map(|c| (c.state, c.runway_ident.clone()));
+        .map(|c| (c.state, c.runway_ident.clone(), c.pending_readback.clone()));
+    let state = clr.as_ref().map(|(s, _, _)| *s);
+    let arrival = !on_ground
+        || matches!(state, Some(tower::State::Inbound | tower::State::ClearedToLand));
+    // A readback owed outranks everything: it IS the next call — and it was
+    // just received, so the radio is by definition on the right frequency.
+    if let Some(rb) = clr.as_ref().and_then(|(_, _, rb)| rb.clone()) {
+        return Some(Suggestion { first: None, call: Some(rb), urgent: true, arrival });
+    }
+    // "First tune <service> ..." when the suggested call goes to a
+    // frequency COM1 isn't on — a perfect call the station can't hear is
+    // the coach's own failure mode. Skipped when another `first` already
+    // leads (ATIS, vectors status): one prerequisite at a time.
+    let tune_first = |svc: &str| -> Option<String> {
+        let com1 = com1_khz?;
+        let (_, khz) = services.iter().find(|(w, _)| w == svc)?;
+        ((com1 - khz).abs() > 5).then(|| format!("First tune {svc}, {}.", atis::spoken_mhz(*khz)))
+    };
+    // Approach's side of the picture, airborne only (a plan on the ground is
+    // stale — vector_tick clears it on touchdown).
+    if !on_ground {
+        // Handed to the tower with an APPROACH clearance: the "final" report
+        // is owed before any landing clearance — the same fact the monitor's
+        // voice coach reads.
+        if let Some(rwy) = LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return Some(Suggestion {
+                first: tune_first("tower"),
+                call: Some(format!("{station} Tower, {callsign}, final runway {rwy}.")),
+                urgent: false,
+                arrival: true,
+            });
+        }
+        if let Some((ils_cleared, rwy)) = VECTORS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|p| (p.ils && p.cleared, p.runway_spoken.clone()))
+        {
+            // Cleared for the ILS on the intercept: the one call approach
+            // waits on is "established". Before that, radar vectors are a
+            // listening game — coach the silence, not an invented call.
+            return Some(if ils_cleared {
+                Suggestion {
+                    first: Some("Report when established on the localizer.".to_string()),
+                    call: Some(format!("{callsign}, established, runway {rwy}.")),
+                    urgent: false,
+                    arrival: true,
+                }
+            } else {
+                Suggestion {
+                    first: Some(
+                        "Under radar vectors. No call owed; follow the headings.".to_string(),
+                    ),
+                    call: None,
+                    urgent: false,
+                    arrival: true,
+                }
+            });
+        }
+    }
     let info = atis_current_letter()
         .map(|l| format!(", with information {}", atis::nato(l)))
         .unwrap_or_default();
+    // An ATIS that has never cut an edition is an ATIS nobody has listened
+    // to (editions cut while COM1 sits on its frequency) — before the first
+    // call to a fresh station, the better first move is to go copy it.
+    let atis_first = || {
+        let a = ATIS.lock().unwrap_or_else(|e| e.into_inner());
+        a.as_ref()
+            .filter(|a| a.edition.is_none())
+            .map(|a| format!("First copy the ATIS on {}.", atis::spoken_mhz(a.khz)))
+    };
     let rwy = clr
         .as_ref()
-        .map(|(_, id)| id.as_str())
+        .map(|(_, id, _)| id.as_str())
         .filter(|s| !s.is_empty())
         .map(atis::spoken_runway);
     let pos = dist_nm
         .filter(|d| *d >= 2.0)
         .map(|d| format!("{:.0} miles out, ", d))
         .unwrap_or_default();
-    Some(match (clr.map(|(s, _)| s), on_ground) {
+    let call = match (state, on_ground) {
         // Never talked to this station: the full initial call.
         (None, true) => {
             format!("{station} Tower, {callsign}{info}, request departure clearance.")
@@ -2530,8 +2612,21 @@ pub fn suggest_call(callsign: &str, on_ground: bool, dist_nm: Option<f64>) -> Op
             format!("{station} Tower, {callsign}, {pos}inbound{info}, request join.")
         }
         (Some(tower::State::Parked), true) => format!("{callsign}, request taxi."),
+        // Taxi clearance in hand: report ready at the REAL holding point —
+        // the cleared route's destination, when the taxi network knows it.
         (Some(tower::State::TaxiCleared), true) => {
-            format!("{callsign}, holding point Alpha, ready for departure.")
+            let hp = TAXI_ROUTE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|r| spoken_taxiway(&r.holding_point));
+            match (hp, &rwy) {
+                (Some(h), Some(r)) => {
+                    format!("{callsign}, holding point {h}, runway {r}, ready for departure.")
+                }
+                (Some(h), None) => format!("{callsign}, holding point {h}, ready for departure."),
+                _ => format!("{callsign}, ready for departure."),
+            }
         }
         // Lined up (readback already paid): the clearance comes to you —
         // a nudge routes as a fresh ask if you want it.
@@ -2561,7 +2656,15 @@ pub fn suggest_call(callsign: &str, on_ground: bool, dist_nm: Option<f64>) -> Op
         (Some(tower::State::ClearedToLand), true) | (Some(tower::State::Inbound), true) => {
             format!("{callsign}, runway vacated, request taxi to parking.")
         }
-    })
+    };
+    // One prerequisite at a time: the first-ever call prefers the ATIS (the
+    // chronological next action — once in contact the tower's own QNH
+    // covers you), everything else the frequency check.
+    let first = match state {
+        None => atis_first().or_else(|| tune_first("tower")),
+        _ => tune_first("tower"),
+    };
+    Some(Suggestion { first, call: Some(call), urgent: false, arrival })
 }
 
 /// The active field for the traffic watches: spoken name, lat, lon, field
@@ -4473,14 +4576,20 @@ mod tests {
         *ACTIVE_PANEL.lock().unwrap() =
             Some(("Gibraltar".into(), 11.0, vec![("tower".to_string(), 131200_i64)]));
         *CLEARANCE.lock().unwrap() = None;
+        *ATIS.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *VECTORS.lock().unwrap() = None;
+        *LANDING_HANDOFF.lock().unwrap() = None;
         let cs = "November one seven two Sierra Papa";
+        // The transmission itself, for the parse checks below.
+        let call = |s: Suggestion| s.call.expect("a call");
 
         // Cold on the ground: the full initial call.
-        let s = suggest_call(cs, true, Some(0.5)).unwrap();
+        let s = call(suggest_call(cs, true, Some(0.5), None).unwrap());
         assert!(s.starts_with("Gibraltar Tower"), "{s}");
         assert!(s.contains("request departure clearance"), "{s}");
         // Cold in the air: the inbound call, with position.
-        let s = suggest_call(cs, false, Some(8.0)).unwrap();
+        let s = call(suggest_call(cs, false, Some(8.0), None).unwrap());
         assert!(s.contains("8 miles out"), "{s}");
         assert!(s.contains("inbound"), "{s}");
         // Every suggestion must parse to a routable intent — the coach IS
@@ -4497,30 +4606,48 @@ mod tests {
             });
         };
         set(tower::State::Parked);
-        let s = suggest_call(cs, true, Some(0.5)).unwrap();
+        let sug = suggest_call(cs, true, Some(0.5), None).unwrap();
+        assert!(!sug.arrival, "parked = departure side");
+        let s = call(sug);
         assert!(s.contains("request taxi"), "{s}");
         assert_eq!(tower::parse_intent(&s), tower::Intent::RequestTaxi);
         set(tower::State::TaxiCleared);
-        let s = suggest_call(cs, true, Some(0.5)).unwrap();
+        // No taxi network: no invented holding point name.
+        let s = call(suggest_call(cs, true, Some(0.5), None).unwrap());
         assert!(s.contains("ready for departure"), "{s}");
+        assert!(!s.contains("holding point"), "no route, no invented name: {s}");
         assert_eq!(tower::parse_intent(&s), tower::Intent::RequestTakeoff);
+        // With the cleared route published: the REAL holding point + runway.
+        *TAXI_ROUTE.lock().unwrap() = Some(TaxiWatch {
+            path: vec![(36.16, -5.36), (36.16, -5.35)],
+            via: "Alpha".into(),
+            seg: vec![("A".into(), false)],
+            holding_point: "A1".into(),
+        });
+        let s = call(suggest_call(cs, true, Some(0.5), None).unwrap());
+        assert!(s.contains("holding point Alpha one"), "{s}");
+        assert!(s.contains("runway zero niner"), "{s}");
+        assert_eq!(tower::parse_intent(&s), tower::Intent::RequestTakeoff);
+        *TAXI_ROUTE.lock().unwrap() = None;
         set(tower::State::TakeoffCleared);
-        let s = suggest_call(cs, true, Some(0.5)).unwrap();
+        let s = call(suggest_call(cs, true, Some(0.5), None).unwrap());
         assert!(s.contains("Cleared for takeoff runway zero niner"), "{s}");
         assert!(tower::is_readback(&s.to_lowercase()), "readback: {s}");
         // Arrival side.
         set(tower::State::Inbound);
-        let s = suggest_call(cs, false, Some(2.0)).unwrap();
+        let sug = suggest_call(cs, false, Some(2.0), None).unwrap();
+        assert!(sug.arrival);
+        let s = call(sug);
         assert!(s.contains("final runway zero niner"), "{s}");
         assert_eq!(tower::parse_intent(&s), tower::Intent::ReportFinal);
         set(tower::State::ClearedToLand);
-        let s = suggest_call(cs, true, Some(0.2)).unwrap();
+        let s = call(suggest_call(cs, true, Some(0.2), None).unwrap());
         assert!(s.contains("taxi to parking"), "{s}");
         assert_eq!(tower::parse_intent(&s), tower::Intent::RequestTaxiIn);
 
         // No station: nothing to suggest.
         *ACTIVE_PANEL.lock().unwrap() = None;
-        assert!(suggest_call(cs, true, None).is_none());
+        assert!(suggest_call(cs, true, None, None).is_none());
         *CLEARANCE.lock().unwrap() = None;
 
         // The question forms that summon the coach.
@@ -4535,6 +4662,115 @@ mod tests {
         }
         assert!(!coach_query("flaps ten"));
         assert!(!coach_query("what frequencies are here"));
+    }
+
+    #[test]
+    fn the_coach_leads_with_the_prerequisite() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_PANEL.lock().unwrap() =
+            Some(("Gibraltar".into(), 11.0, vec![("tower".to_string(), 131200_i64)]));
+        *CLEARANCE.lock().unwrap() = None;
+        *ATIS.lock().unwrap() = None;
+        *VECTORS.lock().unwrap() = None;
+        *LANDING_HANDOFF.lock().unwrap() = None;
+        let cs = "November one seven two Sierra Papa";
+
+        // COM1 parked on another frequency: the call can't be heard — tune
+        // first. On frequency (or unknown): no nag.
+        let s = suggest_call(cs, true, Some(0.5), Some(122800)).unwrap();
+        assert_eq!(
+            s.first.as_deref(),
+            Some("First tune tower, one three one decimal two."),
+            "{:?}",
+            s.first
+        );
+        assert!(s.call.is_some());
+        let s = suggest_call(cs, true, Some(0.5), Some(131200)).unwrap();
+        assert!(s.first.is_none(), "{:?}", s.first);
+
+        // An ATIS that never cut an edition = nobody listened: copy it
+        // before the first call, and it outranks the tune nag (it IS the
+        // next tuning action).
+        *ATIS.lock().unwrap() = Some(AtisState {
+            khz: 118500,
+            airport: "Gibraltar".into(),
+            runways: Vec::new(),
+            letter: 'A',
+            edition: None,
+            last_spoken: None,
+        });
+        let s = suggest_call(cs, true, Some(0.5), Some(122800)).unwrap();
+        assert_eq!(
+            s.first.as_deref(),
+            Some("First copy the ATIS on one one eight decimal five."),
+            "{:?}",
+            s.first
+        );
+        // Once in contact the tower's QNH covers you: no more ATIS nag.
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::Parked,
+            callsign: cs.into(),
+            runway_ident: String::new(),
+            pending_readback: None,
+        });
+        let s = suggest_call(cs, true, Some(0.5), Some(131200)).unwrap();
+        assert!(s.first.is_none(), "{:?}", s.first);
+
+        *ATIS.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+        *ACTIVE_PANEL.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn the_coach_covers_the_approach_phase() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_PANEL.lock().unwrap() =
+            Some(("Gibraltar".into(), 11.0, vec![("tower".to_string(), 131200_i64)]));
+        *CLEARANCE.lock().unwrap() = None;
+        *ATIS.lock().unwrap() = None;
+        *LANDING_HANDOFF.lock().unwrap() = None;
+        let cs = "November one seven two Sierra Papa";
+        let plan = |ils: bool, cleared: bool| VectorPlan {
+            callsign: cs.into(),
+            thr_lat: 36.15,
+            thr_lon: -5.35,
+            course_deg: 90.0,
+            runway_spoken: "zero niner".into(),
+            tower_spoken: Some("one three one decimal two".into()),
+            target_alt_ft: 2000.0,
+            ils,
+            join_nm: 6.0,
+            cleared,
+            dialect: Dialect::Icao,
+            last_tx: None,
+            last_heading: None,
+        };
+
+        // Under vectors, nothing owed: coach the silence, not a fake call.
+        *VECTORS.lock().unwrap() = Some(plan(true, false));
+        let s = suggest_call(cs, false, Some(12.0), None).unwrap();
+        assert!(s.first.as_deref().unwrap().contains("No call owed"), "{:?}", s.first);
+        assert!(s.call.is_none());
+        assert!(s.arrival);
+        // Cleared for the ILS on the intercept: the "established" report is
+        // the one call approach waits on — and it parses as the final report.
+        *VECTORS.lock().unwrap() = Some(plan(true, true));
+        let s = suggest_call(cs, false, Some(10.0), None).unwrap();
+        assert!(s.first.as_deref().unwrap().contains("established"), "{:?}", s.first);
+        let c = s.call.expect("a call");
+        assert!(c.contains("established"), "{c}");
+        assert_eq!(tower::parse_intent(&c), tower::Intent::ReportFinal);
+        *VECTORS.lock().unwrap() = None;
+
+        // Handed to the tower with an approach clearance: the "final" report
+        // is owed — same fact the monitor's voice coach reads.
+        *LANDING_HANDOFF.lock().unwrap() = Some("zero niner".into());
+        let s = suggest_call(cs, false, Some(6.0), None).unwrap();
+        let c = s.call.expect("a call");
+        assert!(c.contains("final runway zero niner"), "{c}");
+        assert_eq!(tower::parse_intent(&c), tower::Intent::ReportFinal);
+        *LANDING_HANDOFF.lock().unwrap() = None;
+        *ACTIVE_PANEL.lock().unwrap() = None;
     }
 
     #[test]
@@ -5429,8 +5665,13 @@ mod tests {
             runway_ident: "09".into(),
             pending_readback: Some(format!("Cleared for takeoff runway zero niner, {cs}.")),
         });
-        let s = suggest_call(cs, true, None).expect("a suggestion");
-        assert_eq!(s, format!("Cleared for takeoff runway zero niner, {cs}."));
+        let s = suggest_call(cs, true, None, None).expect("a suggestion");
+        assert_eq!(
+            s.call.as_deref(),
+            Some(format!("Cleared for takeoff runway zero niner, {cs}.").as_str())
+        );
+        assert!(s.urgent, "an owed readback is urgent");
+        assert!(s.first.is_none(), "the readback needs no prerequisite");
         // Lined up with the readback paid: the nudge parses as a fresh ask.
         *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
             state: tower::State::LinedUp,
@@ -5438,8 +5679,10 @@ mod tests {
             runway_ident: "09".into(),
             pending_readback: None,
         });
-        let s = suggest_call(cs, true, None).expect("a suggestion");
-        assert_eq!(tower::parse_intent(&s), tower::Intent::RequestTakeoff, "{s}");
+        let s = suggest_call(cs, true, None, None).expect("a suggestion");
+        assert!(!s.urgent);
+        let c = s.call.expect("a call");
+        assert_eq!(tower::parse_intent(&c), tower::Intent::RequestTakeoff, "{c}");
         *CLEARANCE.lock().unwrap() = None;
     }
 

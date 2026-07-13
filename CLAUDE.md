@@ -132,7 +132,17 @@ into LUAW and blocks the hold release); and **named taxi routes** (apt.dat
 with runway edges ×25 → "taxi to holding point Alpha one runway two seven
 right via Bravo, Link two seven", crossings called out, off-route nudges
 from the compliance watch via `TAXI_ROUTE`). The coach's first suggestion is
-always the readback owed (`ClearanceSnap.pending_readback`). PTT has TWO
+always the readback owed (`ClearanceSnap.pending_readback`); `suggest_call`
+(one source for the voice coach AND the panel's Calls tab, 2026-07-13)
+returns a structured `Suggestion` — a prerequisite line when one exists
+(mistuned COM1 → "first tune tower ...", an ATIS nobody has listened to →
+"first copy the ATIS ..."), the call itself (the REAL holding point + runway
+read from `TAXI_ROUTE`, never an invented "Alpha"), and approach-phase
+coverage (under vectors → "no call owed", ILS clearance ridden → the
+"established" report, tower handoff → the owed "final") — and the panel
+payload leads with two marker bytes: urgency (an owed readback renders amber
+with a dot on the Calls tab) and phase group (departure/arrival, lighting
+the matching phraseology-reference section). PTT has TWO
 channels for CONTENT (the **radio PTT**, `xcopilot/radio_ptt_active`, is
 transmit to ATC; the **intercom PTT** — keyboard PTT or
 `xcopilot/ptt_active` — is talking to the copilot), and when the radio key
