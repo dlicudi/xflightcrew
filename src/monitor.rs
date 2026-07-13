@@ -1564,12 +1564,33 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 }
             }
 
+            // The wreck flag: X-Plane raises has_crashed the instant the
+            // airframe is destroyed; a flight reset drops it, and the world
+            // resumes. Published to the arbiter (receive + transmit gates) —
+            // the avionics bus stays hot on the crash screen, so the power
+            // gate alone let a mayday from the wreck raise the tower
+            // (2026-07-13). Fail open: a failed read changes nothing.
+            if let Ok(v) = xp.get_float(crate::datarefs::HAS_CRASHED).await {
+                let is_crashed = v > 0.5;
+                if is_crashed && !voice.crashed() {
+                    crate::blackbox::record(
+                        "crash",
+                        serde_json::json!({
+                            "lat": snap.lat, "lon": snap.lon, "alt": r1(snap.alt_ft),
+                        }),
+                    );
+                }
+                voice.set_crashed(is_crashed);
+            }
             // Approach vectors: armed by the ATC station when the pilot requests
             // vectors on the approach frequency. Advisory narration only; muted
-            // under the same gates as the visual-approach talk-down.
+            // under the same gates as the visual-approach talk-down. A crashed
+            // airframe silences the whole world block: no controller works a
+            // wreck, and the frozen flight model reads as garbage anyway.
             let quiet = crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
                 || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-                || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
+                || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed)
+                || voice.crashed();
             if !quiet {
                 // One COM1 read serves the incursion shout, the ATIS loop and
                 // the traffic advisories below.
@@ -2345,11 +2366,17 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 }
             }
 
-            for check in &checks {
-                let state = states.get_mut(check.id()).expect("state per check");
-                match check.eval(&snap) {
-                    Some(msg) => state.active(check.id(), msg, check.severity(), check.min_duration(), &voice, status.as_ref(), now),
-                    None => state.clear(),
+            // A wreck gets no advice: the flight model freezes at the impact
+            // values (the 2026-07-13 crash read 106 kts and -1,463 fpm
+            // forever), so the checks would evaluate a flight that already
+            // ended. They stand down until the flight resets.
+            if !voice.crashed() {
+                for check in &checks {
+                    let state = states.get_mut(check.id()).expect("state per check");
+                    match check.eval(&snap) {
+                        Some(msg) => state.active(check.id(), msg, check.severity(), check.min_duration(), &voice, status.as_ref(), now),
+                        None => state.clear(),
+                    }
                 }
             }
         }

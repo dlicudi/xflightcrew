@@ -19,6 +19,9 @@ pub const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
 // --- Airframe state ---
 pub const GEAR_HANDLE_DOWN: &str = "sim/cockpit2/controls/gear_handle_down";
 pub const ON_GROUND_ANY: &str = "sim/flightmodel/failures/onground_any";
+/// 1 while X-Plane considers the airframe crashed (the crash screen); a
+/// flight reset drops it back to 0.
+pub const HAS_CRASHED: &str = "sim/flightmodel2/misc/has_crashed";
 /// Height above the terrain directly below, in METERS (× 3.28084 for feet).
 pub const AGL_METERS: &str = "sim/flightmodel/position/y_agl";
 pub const LATITUDE: &str = "sim/flightmodel/position/latitude";

@@ -241,6 +241,9 @@ fn audible_now(tuned: Option<StationSpeaker>, speaker: StationSpeaker) -> bool {
 /// a setup with no monitor tick must never go mysteriously silent.
 fn station_unhearable(inner: &Inner, station: Option<StationSpeaker>) -> bool {
     let Some(who) = station else { return false };
+    if inner.crashed.load(std::sync::atomic::Ordering::Relaxed) {
+        return true; // wreckage receives nothing
+    }
     if !inner.radio_powered.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
@@ -341,6 +344,15 @@ struct Inner {
     /// this false only on a CONFIDENT avionics-off read, so a study-level
     /// airframe we can't read never goes mysteriously silent.
     radio_powered: std::sync::atomic::AtomicBool,
+    /// The airframe is WRECKAGE (X-Plane's has_crashed): no station audio in,
+    /// no transmission out — a working avionics bus on the crash screen kept
+    /// the radio alive, and a mayday from the wreck was answered with "hold
+    /// position if able" (2026-07-13). The copilot's intercom still plays:
+    /// the crew is in the wreck with you, and someone has to say why the
+    /// radio's dead. Published by the monitor from the live dataref, so a
+    /// flight reset (has_crashed back to 0) restores the world. Fail open:
+    /// defaults false, and a failed read never sets it.
+    crashed: std::sync::atomic::AtomicBool,
     /// What the copilot has spoken recently, with when it finished. The listener
     /// checks heard transcripts against this to reject its own voice coming back
     /// over the speakers (echo) rather than acting on it.
@@ -373,6 +385,7 @@ impl Voice {
             tuned_station: Mutex::new(None),
             com1_known: std::sync::atomic::AtomicBool::new(false),
             radio_powered: std::sync::atomic::AtomicBool::new(true),
+            crashed: std::sync::atomic::AtomicBool::new(false),
             spoken: Mutex::new(Vec::new()),
         });
         let gate = MicGate::new();
@@ -464,6 +477,32 @@ impl Voice {
         self.inner
             .radio_powered
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Publish whether the airframe is crashed (see `Inner::crashed`). Going
+    /// crashed cuts a live station transmission mid-word, same as a power
+    /// loss — the receiver just became wreckage.
+    pub fn set_crashed(&self, crashed: bool) {
+        self.inner
+            .crashed
+            .store(crashed, std::sync::atomic::Ordering::Relaxed);
+        if crashed
+            && self
+                .inner
+                .now_playing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .is_some()
+        {
+            crate::tts::stop_playback();
+        }
+    }
+
+    /// Whether the airframe is crashed. The command loop checks it before
+    /// routing a transmission to the world: wreckage doesn't transmit.
+    pub fn crashed(&self) -> bool {
+        self.inner.crashed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn set_com1(&self, com1_khz: Option<i64>, tuned: Option<StationSpeaker>) {
@@ -1162,6 +1201,7 @@ mod tests {
             tuned_station: Mutex::new(None),
             com1_known: std::sync::atomic::AtomicBool::new(false),
             radio_powered: std::sync::atomic::AtomicBool::new(true),
+            crashed: std::sync::atomic::AtomicBool::new(false),
             spoken: Mutex::new(Vec::new()),
         }
     }
@@ -1178,6 +1218,12 @@ mod tests {
         assert!(!station_unhearable(&inner, None));
         assert!(station_unhearable(&inner, Some(Tower)));
         inner.radio_powered.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Crashed: wreckage receives nothing, powered bus or not — but the
+        // copilot's intercom still plays (someone has to say why it's quiet).
+        inner.crashed.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(station_unhearable(&inner, Some(Tower)));
+        assert!(!station_unhearable(&inner, None));
+        inner.crashed.store(false, std::sync::atomic::Ordering::Relaxed);
         // Once tuning is published, only the tuned position (and its ghosts)
         // is hearable; a real read that's off every frequency silences all.
         inner.com1_known.store(true, std::sync::atomic::Ordering::Relaxed);

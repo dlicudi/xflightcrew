@@ -1128,6 +1128,17 @@ async fn run_session(
             continue;
         }
 
+        // Wreckage transmits nothing: the avionics bus stays hot on the crash
+        // screen, so the power gate below can't catch it — a mayday from the
+        // crashed airframe was answered with "hold position if able"
+        // (2026-07-13). The copilot is in the wreck too; they answer on the
+        // intercom, and the world stays silent until the flight resets.
+        if from_radio && voice.crashed() {
+            say(&voice, &reporter, ui::LogKind::Warn,
+                "Nobody's reading us. The airplane's wrecked, that radio is gone.");
+            continue;
+        }
+
         // Dead transmitter: a keyed transmission needs a powered radio — with
         // the avionics master off the panel can't transmit any more than it can
         // receive, so the tower never hears you (a cold-and-dark SR22 raised
@@ -1458,10 +1469,11 @@ async fn run_session(
             // (dual_ptt) this utterance came over the INTERCOM, and physical
             // routing beats content routing in both directions ("requesting
             // clearance" to the copilot was answered by the tower, 2026-07-12).
-            // And either way the radio must be powered — a dead panel can't
-            // transmit (fail open, like the receive gate).
+            // And either way the radio must be powered and the airframe not
+            // wreckage — a dead panel can't transmit (fail open, like the
+            // receive gate).
             if let Some(st) = atc_station.as_mut() {
-                if !dual_ptt && voice.radio_powered() {
+                if !dual_ptt && voice.radio_powered() && !voice.crashed() {
                     if let Some((reply, who)) = st.try_handle(&tl, &xplane).await {
                         reporter.status(ui::Phase::Speaking);
                         reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
