@@ -73,6 +73,10 @@ pub const TCAS_WOW: &str = "sim/cockpit2/tcas/targets/position/weight_on_wheels"
 /// Flight IDs, 8 NUL-padded bytes per target — read via `get_bytes` so slot
 /// alignment survives.
 pub const TCAS_FLIGHT_ID: &str = "sim/cockpit2/tcas/targets/flight_id";
+/// Per-target vertical speed, ft/min — the one signal that tells an arrival
+/// descending the final apart from a departure climbing through the same
+/// corridor. Optional: a feed that doesn't populate it reads as level.
+pub const TCAS_VS_FPM: &str = "sim/cockpit2/tcas/targets/position/vertical_speed";
 
 /// Audio panel: COM1 monitor selected (nonzero = COM1 is audible in the
 /// cockpit). The ATC broadcast respects this so it can be muted like a radio.

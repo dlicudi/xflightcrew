@@ -60,6 +60,14 @@ impl LiveState {
     pub fn get(&self, name: &str) -> Option<f64> {
         self.cache.lock().ok()?.get(name).copied()
     }
+
+    /// A pre-filled state with no socket — for tests that exercise consumers
+    /// (PTT source routing, governors) against fixed dataref values.
+    #[cfg(test)]
+    pub fn from_pairs(pairs: &[(&str, f64)]) -> LiveState {
+        let cache = pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        LiveState { cache: Arc::new(Mutex::new(cache)) }
+    }
 }
 
 /// The socket thread: (re)connect for the whole session. Each `connect_and_pump`

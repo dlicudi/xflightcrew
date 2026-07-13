@@ -35,6 +35,12 @@ pub enum Intent {
     RadioCheck,
     RequestTaxi,
     RequestClearance,
+    /// "request start-up" / "request clearance to start engines" — asking to
+    /// turn the engines, NOT asking for the departure clearance. Distinct on
+    /// purpose: a parked, engines-off aircraft asking to start must hear
+    /// "start-up approved", never "cleared to leave the zone" (a Malaga gate
+    /// got the zone clearance plus a squawk for it, 2026-07-12).
+    RequestStartup,
     RequestTakeoff,
     /// Arriving traffic ("inbound for landing", "request touch and go").
     RequestLanding {
@@ -93,7 +99,9 @@ pub struct Ctx {
     pub airport: String,
     /// Runway in use, spoken ("zero niner").
     pub runway: String,
-    /// QNH, spoken digits ("one zero one seven").
+    /// Spoken pressure phrase in the field's own dialect and units — "QNH
+    /// one zero one seven" (hPa, ICAO) or "altimeter two niner niner two"
+    /// (inHg, FAA). Blank = the pilot has the current ATIS information.
     pub qnh: String,
     /// Wind, spoken ("zero niner zero degrees, three knots" or "calm").
     pub wind: String,
@@ -165,14 +173,17 @@ fn crossing_clause(ctx: &Ctx) -> String {
         .collect()
 }
 
-/// The ", QNH ..." clause of a clearance — empty when the pilot has the
-/// current ATIS information (the station blanks `ctx.qnh`), so the clearance
-/// skips the numbers the broadcast already gave them.
-fn qnh_clause(ctx: &Ctx) -> String {
+/// The pressure clause of a clearance (", QNH one zero two zero" or
+/// ", altimeter two niner niner two" — `ctx.qnh` carries the whole phrase in
+/// the field's own dialect and units). Empty when the pilot has the current
+/// ATIS information (the station blanks `ctx.qnh`), so the clearance skips
+/// the numbers the broadcast already gave them. `pub(crate)`: the approach
+/// controller's vector phrases attach the same clause.
+pub(crate) fn qnh_clause(ctx: &Ctx) -> String {
     if ctx.qnh.is_empty() {
         String::new()
     } else {
-        format!(", QNH {}", ctx.qnh)
+        format!(", {}", ctx.qnh)
     }
 }
 
@@ -361,6 +372,19 @@ pub fn parse_intent(transcript: &str) -> Intent {
         }
         return Intent::RequestTaxi;
     }
+    // Engine start, before the clearance keyword can swallow it: "request
+    // clearance to start engines" wants the start-up approval, not the zone
+    // departure clearance (parsed as RequestClearance at a Malaga gate,
+    // engines off, park brake set, 2026-07-12). Bare "start the engines" has
+    // no request word and stays a cockpit command via is_radio_call.
+    if t.contains("start up")
+        || t.contains("start-up")
+        || word("startup")
+        || t.contains("request start")
+        || (word("start") && (word("engine") || word("engines")))
+    {
+        return Intent::RequestStartup;
+    }
     if t.contains("clearance") {
         return Intent::RequestClearance;
     }
@@ -389,6 +413,7 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "radio_check" => Intent::RadioCheck,
         "request_taxi" => Intent::RequestTaxi,
         "request_clearance" => Intent::RequestClearance,
+        "request_startup" => Intent::RequestStartup,
         "request_takeoff" => Intent::RequestTakeoff,
         "request_landing" => Intent::RequestLanding { touch_and_go: false },
         "request_touch_and_go" => Intent::RequestLanding { touch_and_go: true },
@@ -775,6 +800,11 @@ impl Tower {
                 qnh_clause(ctx),
                 ctx.squawk
             ),
+            // Start-up approval is not a clearance to go anywhere: no squawk,
+            // no state change — the zone/taxi/takeoff chain still follows.
+            Intent::RequestStartup => {
+                format!("{}, start-up approved{}.", ctx.callsign, qnh_clause(ctx))
+            }
             // An arrival taxiing in — by request wording, or because the last
             // clearance was a landing one (a generic "request taxi" right
             // after "cleared to land" is someone leaving the runway, not a
@@ -998,7 +1028,7 @@ impl Tower {
                 )
             }
             Intent::WindCheck => {
-                format!("{}, wind {}, QNH {}.", ctx.callsign, ctx.wind, ctx.qnh)
+                format!("{}, wind {}{}.", ctx.callsign, ctx.wind, qnh_clause(ctx))
             }
             // Repeats the ASSIGNED code when a radar service issued one, the
             // VFR conspicuity otherwise — a controller repeats YOUR code, not
@@ -1071,7 +1101,7 @@ mod tests {
             callsign: "November one seven two Sierra Papa".into(),
             airport: "Gibraltar".into(),
             runway: "zero niner".into(),
-            qnh: "one zero one seven".into(),
+            qnh: "QNH one zero one seven".into(),
             wind: "zero niner zero degrees, three knots".into(),
             holding_point: "Alpha".into(),
             approach: Some("one two two decimal eight".into()),
@@ -1233,6 +1263,19 @@ mod tests {
             Intent::RequestClearance,
             "clearance without taxi words is still the zone clearance"
         );
+        // The word "clearance" must not swallow an engine-start request
+        // (real 2026-07-12 call, answered with the zone clearance while
+        // parked, engines off).
+        assert_eq!(
+            parse_intent("request clearance to start engines."),
+            Intent::RequestStartup
+        );
+        assert_eq!(parse_intent("requesting startup"), Intent::RequestStartup);
+        assert_eq!(parse_intent("request start-up"), Intent::RequestStartup);
+        assert_eq!(
+            parse_intent("malaga tower, november five five zero charlie romeo, request start up"),
+            Intent::RequestStartup
+        );
         // "do you copy/read/hear me" / "are you there" are radio checks — five
         // real calls across the 2026-07 flights, all stonewalled.
         assert_eq!(parse_intent("gibraltar tower, do you copy"), Intent::RadioCheck);
@@ -1267,6 +1310,7 @@ mod tests {
             RadioCheck,
             RequestTaxi,
             RequestClearance,
+            RequestStartup,
             RequestTakeoff,
             RequestLanding { touch_and_go: false },
             RequestLanding { touch_and_go: true },
@@ -1325,7 +1369,8 @@ mod tests {
                 // The full transition table — any change here must be a
                 // deliberate edit to this test, not a surprise.
                 let want = match intent {
-                    RadioCheck | WindCheck | SquawkCheck | Unknown | RequestClearance => start,
+                    RadioCheck | WindCheck | SquawkCheck | Unknown | RequestClearance
+                    | RequestStartup => start,
                     // A hail, flight following, and radio housekeeping are
                     // answered without touching the sequence.
                     Greeting | RequestFlightFollowing | RequestFrequencyChange => start,

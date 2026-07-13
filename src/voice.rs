@@ -48,25 +48,47 @@ pub enum Priority {
     Warning,
 }
 
-/// The LOCAL accent for a country, by ICAO prefix — the voice its towers and
-/// ATIS speak English with. Deliberately strict about geography: Spain (LE)
-/// and the Canaries (GC) get the Castilian es_ES voice, and the es_MX voices
-/// serve only Spanish-speaking Latin America — a Madrid tower must not sound
-/// like Mexico City ("no mexicans in Spain", 2026-07-09). Fields with no
-/// mapping cast entirely from the neutral pool.
-pub fn local_accent_for(icao: &str) -> Option<&'static str> {
+/// The LOCAL accent voices for a country, by ICAO prefix — the voices its
+/// towers and ATIS speak English with. Deliberately strict about geography:
+/// Spain (LE) and the Canaries (GC) get the Castilian es_ES voices, and the
+/// es_MX voices serve only Spanish-speaking Latin America — a Madrid tower
+/// must not sound like Mexico City ("no mexicans in Spain", 2026-07-09).
+/// Fields with no mapping cast entirely from the neutral pool. A LIST per
+/// country so a field's tower and ATIS can be different people ("main thing
+/// is that we actually have different voices", 2026-07-12); `#N` picks a
+/// speaker inside a multi-speaker model. Curation is by deletion: a voice
+/// that doesn't survive the audition gets removed here (or its file deleted
+/// — [`local_voices_on_disk`] quietly drops specs whose model is missing).
+fn local_accents_for(icao: &str) -> &'static [&'static str] {
     let p2 = icao.get(0..2).unwrap_or("");
     match p2 {
-        // Spain + Canaries: Castilian-accented English.
-        "LE" | "GC" => Some("models/es_ES-davefx-medium.onnx"),
-        // Spanish-speaking Latin America (Mexico, Colombia, Ecuador, Peru,
-        // Chile, Argentina/Uruguay/Paraguay/Bolivia share the SA/S* prefixes
-        // loosely — Brazil (SB/SD/SN/SS/SW) is Portuguese and stays neutral).
-        "MM" | "SK" | "SE" | "SP" | "SC" | "SA" | "SU" | "SG" | "SL" | "SV" => {
-            Some("models/es_MX-claude-high.onnx")
-        }
-        _ => None,
+        // Spain + Canaries: EMPTY — every Castilian candidate failed the
+        // 2026-07-12 audition (davefx, both sharvard speakers; the rest of
+        // Piper's es_ES catalogue is low quality). Quality beats accent:
+        // Spanish fields draw from the neutral pool until a Castilian voice
+        // worth having exists. Candidates go through
+        // `audition_spanish_voices` before they're seated here.
+        "LE" | "GC" => &[],
+        // Spanish-speaking Latin America: ALSO empty since 2026-07-12 —
+        // ald-medium and even claude-high (the only high-quality Spanish
+        // Piper voice) failed the same audition. The whole Piper Spanish
+        // catalogue is below the bar; accent casting resumes when a voice
+        // worth having exists (likely a cloned one, not a Piper pick).
+        _ => &[],
     }
+}
+
+/// The local voices for `icao` whose model files actually exist — what the
+/// caster gets. Deleting a model file is how a voice leaves the roster.
+pub fn local_voices_on_disk(icao: &str) -> Vec<String> {
+    local_accents_for(icao)
+        .iter()
+        .filter(|spec| {
+            let path = spec.split('#').next().unwrap_or(spec);
+            std::path::Path::new(path).exists()
+        })
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// A stable per-airport voice seed (FNV-1a over the name), never 0 — seed 0
@@ -107,7 +129,7 @@ impl StationSpeaker {
     /// per-airport crew from `atc_voice_pool`, offset per position so the
     /// controllers at one field are distinct people. An empty pool always
     /// falls back to the curated voices.
-    fn model(self, config: &Config, seed: usize, local: Option<&str>) -> String {
+    fn model(self, config: &Config, seed: usize, locals: &[String]) -> String {
         // A ghost pilot's voice comes from ITS OWN seed (per callsign), not
         // the airport's cast — pilots are from everywhere, and the same
         // flight keeps the same voice across calls.
@@ -124,13 +146,16 @@ impl StationSpeaker {
             return config.atc_piper_voice.clone();
         }
         if seed != 0 {
-            // The country's own accent mans the tower and reads the ATIS
-            // (one recording voice per field is exactly how ATIS sounds);
-            // approach/departure fill from the neutral pool.
-            if let Some(local) = local {
-                if matches!(self, StationSpeaker::Tower | StationSpeaker::Atis) {
-                    return local.to_string();
-                }
+            // The country's own accents man the tower and read the ATIS;
+            // approach/departure fill from the neutral pool. With two or
+            // more locals on the roster, the tower and the ATIS reader are
+            // DIFFERENT people at every field (offset picks), stable per
+            // airport via the seed.
+            if !locals.is_empty()
+                && matches!(self, StationSpeaker::Tower | StationSpeaker::Atis)
+            {
+                let offset = if matches!(self, StationSpeaker::Atis) { 1 } else { 0 };
+                return locals[(seed + offset) % locals.len()].clone();
             }
             let pool: Vec<&str> = config
                 .atc_voice_pool
@@ -192,45 +217,19 @@ impl StationSpeaker {
     }
 }
 
-/// A station transmission the pilot keyed over, with everything needed to let
-/// it keep "running" silently while PTT is down. Half-duplex radio done
-/// honestly: transmitting blocks your own receiver, it does not pause the
-/// controller. On release the remainder plays from wherever real time has
-/// reached (mid-word, like rejoining a real frequency); fully elapsed means
-/// it is simply gone, and recovery stays procedural ("say again", readback
-/// enforcement), never an automatic repeat. Copilot speech is exempt by
-/// design: interrupting your crew is a decision, not physics, and a barged-in
-/// readback is stale the moment you key up.
-struct SteppedOn {
-    /// The full processed sample buffer (radio effect and squelch included).
-    samples: Vec<f32>,
-    rate: u32,
-    /// When the ORIGINAL playback started: the transmission's real-time clock,
-    /// preserved across re-presses so a second interruption resumes further in.
-    started: Instant,
-    speaker: StationSpeaker,
-    text: String,
-    /// Original queue position, so the requeued tail sorts ahead of everything
-    /// enqueued while PTT was held (it was in-flight; it owns that slot).
-    priority: Priority,
-    seq: u64,
-}
-
-/// Where a stepped-on transmission's real-time clock has reached, as a sample
-/// offset into its buffer. `None` once it has (nearly) fully elapsed: under
-/// 50 ms left is just the squelch stub, not worth keying the speakers for.
-/// Pure, so the barge-in math is testable without audio.
-fn tail_offset(elapsed_s: f32, len: usize, rate: u32) -> Option<usize> {
-    let offset = (elapsed_s.max(0.0) as f64 * rate as f64) as usize;
-    (offset + rate as usize / 20 < len).then_some(offset)
-}
-
-/// Short linear ramp (~10 ms) so a mid-word entry opens like squelch breaking,
-/// not a click.
-fn fade_in(samples: &mut [f32], rate: u32) {
-    let n = (rate as usize / 100).clamp(1, samples.len());
-    for (i, s) in samples[..n].iter_mut().enumerate() {
-        *s *= i as f32 / n as f32;
+/// Whether `speaker` is audible on the currently-tuned station RIGHT NOW.
+/// Ghost pilots ride the tower's party line, so they're heard iff the tower
+/// is tuned; every other speaker matches its own position. `None` means
+/// definitively OFF all station frequencies (the caller resolved a real
+/// COM1 read to no station) — nothing station is audible. Used to cut live
+/// audio the instant the pilot tunes away.
+fn audible_now(tuned: Option<StationSpeaker>, speaker: StationSpeaker) -> bool {
+    match tuned {
+        None => false,
+        Some(StationSpeaker::Tower) => {
+            matches!(speaker, StationSpeaker::Tower | StationSpeaker::Ghost { .. })
+        }
+        Some(t) => t == speaker,
     }
 }
 
@@ -250,9 +249,6 @@ struct Utterance {
     /// every voice arbitrated: they can never talk over each other, and the
     /// mic stays gated across all of them.
     station: Option<StationSpeaker>,
-    /// A stepped-on transmission rejoining the air: pre-rendered samples played
-    /// from the real-time position instead of synthesizing `text` again.
-    tail: Option<Arc<SteppedOn>>,
     /// Present for blocking callers; signalled once the utterance is spoken.
     done: Option<Arc<Latch>>,
 }
@@ -295,19 +291,31 @@ struct Inner {
     /// Changing it drops the warm station sessions on the next utterance.
     station_seed: std::sync::atomic::AtomicUsize,
     /// The active airport's LOCAL accent voice, when its country has one
-    /// (see [`local_accent_for`]): cast as the tower and the ATIS reader.
-    station_local: Mutex<Option<String>>,
-    /// PTT is held: EVERY voice stays quiet — copilot, controllers, ghosts.
-    /// You don't talk over the pilot's transmission; the queue holds and
-    /// resumes on release (2026-07-10: the party line yakked through PTT).
+    /// (see [`local_voices_on_disk`]): cast as the tower and the ATIS reader,
+    /// different entries per position when the roster has two or more.
+    station_local: Mutex<Vec<String>>,
+    /// RADIO PTT is held: EVERY voice stays quiet — copilot, controllers,
+    /// ghosts. Transmitting is half-duplex; you can't hear the frequency, and
+    /// you don't talk over your own call. The queue holds and resumes on
+    /// release (2026-07-10: the party line yakked through PTT).
     hold: std::sync::atomic::AtomicBool,
-    /// The station transmission currently on the air, published just before
-    /// playback starts and cleared when it ends. `shutup()` steals it so a
-    /// PTT press "steps on" the transmission instead of erasing it.
-    now_playing: Mutex<Option<Arc<SteppedOn>>>,
-    /// The transmission the last PTT press stepped on, consumed at release:
-    /// its remainder requeues if real time hasn't outrun it (see [`SteppedOn`]).
-    stepped_on: Mutex<Option<Arc<SteppedOn>>>,
+    /// Which station voice is on the air right now (published just before
+    /// playback starts, cleared when it ends): used to CUT it (no resume) the
+    /// instant the pilot tunes off its frequency or keys any PTT.
+    now_playing: Mutex<Option<StationSpeaker>>,
+    /// Which station position COM1 currently hears (published by the monitor
+    /// each tick; `None` = untuned or unknown). A stepped-on tail is radio
+    /// audio: retune away from its station during the press and the
+    /// remainder is gone with the frequency, not carried to the new one.
+    tuned_station: Mutex<Option<StationSpeaker>>,
+    /// Whether the aircraft's radio RECEIVER is powered (avionics master on).
+    /// Station audio (controllers, ATIS, party-line traffic) is radio: with
+    /// the avionics off you can't hear it, so it's dropped, not queued —
+    /// missed radio is gone, like real life. The COPILOT's own voice is
+    /// intercom, not radio, and always plays. FAIL OPEN: the monitor sets
+    /// this false only on a CONFIDENT avionics-off read, so a study-level
+    /// airframe we can't read never goes mysteriously silent.
+    radio_powered: std::sync::atomic::AtomicBool,
     /// What the copilot has spoken recently, with when it finished. The listener
     /// checks heard transcripts against this to reject its own voice coming back
     /// over the speakers (echo) rather than acting on it.
@@ -334,10 +342,11 @@ impl Voice {
             }),
             cv: Condvar::new(),
             station_seed: std::sync::atomic::AtomicUsize::new(0),
-            station_local: Mutex::new(None),
+            station_local: Mutex::new(Vec::new()),
             hold: std::sync::atomic::AtomicBool::new(false),
             now_playing: Mutex::new(None),
-            stepped_on: Mutex::new(None),
+            tuned_station: Mutex::new(None),
+            radio_powered: std::sync::atomic::AtomicBool::new(true),
             spoken: Mutex::new(Vec::new()),
         });
         let gate = MicGate::new();
@@ -352,15 +361,16 @@ impl Voice {
 
     /// Cast the active airport's controllers: seed 0 = the configured
     /// per-position voices (the curated home field); any other seed picks a
-    /// stable per-airport crew from the voice pool, with `local` (the
-    /// country's accent, when it has one) seated as the tower and the ATIS
-    /// reader. The warm sessions rebuild on the next station utterance.
-    pub fn set_station_cast(&self, seed: usize, local: Option<String>) {
+    /// stable per-airport crew from the voice pool, with `locals` (the
+    /// country's accent voices, when it has any) seated as the tower and the
+    /// ATIS reader — different people when the roster allows. The warm
+    /// sessions rebuild on the next station utterance.
+    pub fn set_station_cast(&self, seed: usize, locals: Vec<String>) {
         *self
             .inner
             .station_local
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = local;
+            .unwrap_or_else(|e| e.into_inner()) = locals;
         self.inner
             .station_seed
             .store(seed, std::sync::atomic::Ordering::Relaxed);
@@ -384,57 +394,86 @@ impl Voice {
     /// Hold or release ALL speech (copilot, controllers, ghosts) — raised
     /// while the pilot's PTT is down: nobody talks over a transmission.
     /// Held utterances stay queued and play on release.
+    /// Publish COM1's state each monitor tick: `com1_khz` = the raw frequency
+    /// (`None` only when the sim read FAILED), `tuned` = the station it
+    /// resolves to (controllers or ATIS), `None` = a good read that's off all
+    /// station frequencies. Besides feeding the tail-resume decision, this
+    /// CUTS a live station transmission the instant the pilot tunes off its
+    /// frequency — a real radio goes silent mid-word when you leave the
+    /// frequency, no fade, no "let it finish" ("switch frequency and the
+    /// current speech is not cut off", 2026-07-12). No resume, unlike a PTT
+    /// step-on: you left, it's gone; "say again" on the new controller.
+    /// Publish whether the radio receiver is powered (avionics master on).
+    /// `false` suppresses station audio (radio); the copilot's intercom voice
+    /// is unaffected. The monitor passes `false` only on a confident read.
+    pub fn set_radio_powered(&self, on: bool) {
+        self.inner
+            .radio_powered
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the radio receiver/transmitter has power (see
+    /// [`Voice::set_radio_powered`]). The command loop checks it before routing
+    /// a transmission to the world: a dead panel can't transmit any more than
+    /// it can receive. Same fail-open contract — defaults true, false only on
+    /// a confident avionics-off read.
+    pub fn radio_powered(&self) -> bool {
+        self.inner
+            .radio_powered
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_com1(&self, com1_khz: Option<i64>, tuned: Option<StationSpeaker>) {
+        // A failed read is no information — never cut a live transmission on
+        // a fluke, and don't poison the stored tuning.
+        if com1_khz.is_none() {
+            return;
+        }
+        *self
+            .inner
+            .tuned_station
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = tuned;
+        // Is a station on the air, and have we tuned off its frequency?
+        let cut = self
+            .inner
+            .now_playing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|&s| !audible_now(tuned, s));
+        if cut {
+            // Drop it (no resume) and kill the audio.
+            *self
+                .inner
+                .now_playing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            crate::tts::stop_playback();
+        }
+    }
+
     pub fn set_hold(&self, held: bool) {
         self.inner
             .hold
             .store(held, std::sync::atomic::Ordering::Relaxed);
         if !held {
-            // A transmission the press stepped on kept "running" silently. If
-            // real time hasn't outrun it, requeue its remainder with the
-            // ORIGINAL seq: it was in-flight, so it still sorts ahead of
-            // everything enqueued during the hold. Expired = gone, like a
-            // real stepped-on call; "say again" is the recovery.
-            let stepped = self
-                .inner
-                .stepped_on
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
-            if let Some(t) = stepped {
-                if tail_offset(t.started.elapsed().as_secs_f32(), t.samples.len(), t.rate)
-                    .is_some()
-                {
-                    let mut q = self.inner.queue.lock().unwrap();
-                    q.heap.push(Utterance {
-                        priority: t.priority,
-                        seq: t.seq,
-                        text: t.text.clone(),
-                        chime: false,
-                        negative: false,
-                        station: Some(t.speaker),
-                        tail: Some(t),
-                        done: None,
-                    });
-                }
-            }
-            self.inner.cv.notify_one(); // wake the speaker to drain the backlog
+            // Release: whatever was muted during the hold is simply gone — no
+            // mid-word replay of a stepped-on transmission. Like a real
+            // walkie-talkie: you key up, the frequency's silent to you; you let
+            // go, you hear what's happening NOW. Recovery stays procedural
+            // ("say again"). Just wake the speaker to drain the held backlog.
+            self.inner.cv.notify_one();
         }
     }
 
     pub fn shutup(&self) {
-        // Steal the on-air station transmission (if any) before killing its
-        // audio: the pilot stepped on it, they didn't erase it. Its clock
-        // (`started`) keeps running while PTT is down.
+        // Drop the on-air station transmission (no resume) and drain the queue.
         *self
-            .inner
-            .stepped_on
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = self
             .inner
             .now_playing
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+            .unwrap_or_else(|e| e.into_inner()) = None;
         {
             let mut q = self.inner.queue.lock().unwrap();
             for utt in q.heap.drain() {
@@ -469,7 +508,7 @@ impl Voice {
         // No em/en dashes reach the TTS — they trip it up. One chokepoint for
         // every spoken utterance (readbacks, monitor callouts, prompts).
         let text = crate::phrase::scrub_dashes(&text);
-        self.push(Utterance { priority, seq: 0, text, chime, negative: false, station: None, tail: None, done });
+        self.push(Utterance { priority, seq: 0, text, chime, negative: false, station: None, done });
     }
 
     fn enqueue_station(
@@ -481,7 +520,7 @@ impl Voice {
     ) {
         let text = crate::phrase::scrub_dashes(&text);
         tracing::info!(transmitting = %text, "station");
-        self.push(Utterance { priority, seq: 0, text, chime: false, negative: false, station: Some(speaker), tail: None, done });
+        self.push(Utterance { priority, seq: 0, text, chime: false, negative: false, station: Some(speaker), done });
     }
 
     /// Push a fully-formed utterance onto the queue (stamping its FIFO seq under
@@ -511,7 +550,6 @@ impl Voice {
             chime: false,
             negative: true,
             station: None,
-            tail: None,
             done: Some(latch.clone()),
         });
         let mut spoken = latch.spoken.lock().unwrap();
@@ -758,8 +796,7 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
                 gate.set_speaking(false);
                 return;
             }
-            // PTT held: nobody speaks — the queue waits for the release
-            // (the wait below re-checks on the timeout).
+            // Any PTT held: nobody speaks — the queue waits for release.
             if !inner.hold.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(u) = q.heap.pop() {
                     break u;
@@ -770,6 +807,21 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             q = inner.cv.wait(q).unwrap();
         };
         drop(q); // release the queue while we speak (which is slow)
+
+        // Dead receiver: station audio (controllers, ATIS, party-line
+        // traffic) is radio, and with the avionics master off you can't hear
+        // it — drop it, don't queue (missed radio is gone, like real life).
+        // The copilot's own voice is intercom, never gated. Checked before
+        // `set_speaking` so a dropped transmission doesn't even gate the mic.
+        if utt.station.is_some()
+            && !inner.radio_powered.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(latch) = utt.done {
+                *latch.spoken.lock().unwrap() = true;
+                latch.cv.notify_all();
+            }
+            continue;
+        }
 
         gate.set_speaking(true);
         // Tone-only: play the negative "unrecognized" cue and skip TTS entirely
@@ -785,39 +837,6 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
                 tracing::warn!("{what} failed: {msg}");
             }
         };
-        // A stepped-on station transmission rejoining the air: play whatever
-        // remains from the REAL-TIME position (it kept running while the pilot
-        // transmitted). Queue delay may have outrun it by now; then it's
-        // silently gone, exactly like the real thing. Republished as on-air
-        // with its ORIGINAL clock, so a second press resumes further along.
-        if let Some(tail) = utt.tail {
-            if let Some(offset) =
-                tail_offset(tail.started.elapsed().as_secs_f32(), tail.samples.len(), tail.rate)
-            {
-                let mut rest = tail.samples[offset..].to_vec();
-                fade_in(&mut rest, tail.rate);
-                *inner.now_playing.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(tail.clone());
-                if let Err(e) = crate::tts::play_pcm(&rest, tail.rate) {
-                    log_play_err("stepped-on tail", e);
-                }
-                inner
-                    .now_playing
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take();
-                // Refresh the echo memory: this audio just left the speakers
-                // again, and the mic may catch it.
-                let mut said = inner.spoken.lock().unwrap();
-                said.push((Instant::now(), tail.text.clone()));
-                said.retain(|(t, _)| t.elapsed() < ECHO_MEMORY);
-            }
-            if let Some(latch) = utt.done {
-                *latch.spoken.lock().unwrap() = true;
-                latch.cv.notify_all();
-            }
-            continue;
-        }
         if utt.negative {
             if let Some(path) = &negative_path {
                 if let Err(e) = crate::tts::play(path) {
@@ -853,37 +872,29 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             stations = [None, None, None, None, None];
             stations_seed = seed;
         }
-        let local = utt.station.and_then(|_| {
+        let locals: Vec<String> = if utt.station.is_some() {
             inner
                 .station_local
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
-        });
+        } else {
+            Vec::new()
+        };
         let station_model = utt
             .station
-            .map(|who| who.model(&station_cfg, seed, local.as_deref()));
+            .map(|who| who.model(&station_cfg, seed, &locals));
         let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let (Some(who), Some(model)) = (utt.station, &station_model) {
                 let slot = &mut stations[who.slot()];
                 if slot.as_ref().map(|(m, _)| m.as_str()) != Some(model.as_str()) {
                     *slot = Some((model.clone(), StationVoice::build(&station_cfg, model)));
                 }
-                // Publish the transmission as on-air just before playback, so
-                // a PTT press steps on it (steals it with its clock running)
-                // instead of erasing it. Copilot speech is deliberately never
-                // published: barging in on your own crew drops their line.
-                slot.as_mut().expect("just built").1.speak(&utt.text, |samples, rate| {
-                    *inner.now_playing.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(Arc::new(SteppedOn {
-                            samples: samples.to_vec(),
-                            rate,
-                            started: Instant::now(),
-                            speaker: who,
-                            text: utt.text.clone(),
-                            priority: utt.priority,
-                            seq: utt.seq,
-                        }));
+                // Publish the transmission as on-air just before playback, so a
+                // PTT press or a retune can CUT it (no resume). Copilot speech
+                // is deliberately never published: it's intercom, not radio.
+                slot.as_mut().expect("just built").1.speak(&utt.text, |_samples, _rate| {
+                    *inner.now_playing.lock().unwrap_or_else(|e| e.into_inner()) = Some(who);
                 })
             } else {
                 speaker.speak(&utt.text)
@@ -983,7 +994,7 @@ mod tests {
     use super::*;
 
     fn utt(priority: Priority, seq: u64) -> Utterance {
-        Utterance { priority, seq, text: String::new(), chime: false, negative: false, station: None, tail: None, done: None }
+        Utterance { priority, seq, text: String::new(), chime: false, negative: false, station: None, done: None }
     }
 
     #[test]
@@ -1008,31 +1019,44 @@ mod tests {
             StationSpeaker::Atis,
         ]
         .iter()
-        .map(|s| s.model(&cfg, seed, None))
+        .map(|s| s.model(&cfg, seed, &[]))
         .collect();
         let mut unique = crew.clone();
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), 4, "positions must be distinct people: {crew:?}");
         // Seed 0 = the curated home voices, pool or not.
-        assert_eq!(StationSpeaker::Tower.model(&cfg, 0, None), "tower.onnx");
+        assert_eq!(StationSpeaker::Tower.model(&cfg, 0, &[]), "tower.onnx");
         // No pool → curated voices even for a seeded airport.
         let bare = Config { atc_piper_voice: "tower.onnx".into(), ..Config::default() };
-        assert_eq!(StationSpeaker::Tower.model(&bare, seed, None), "tower.onnx");
-        // Country casting: the local accent mans the tower and reads the
-        // ATIS; approach/departure stay neutral (from the pool).
-        let local = Some("es.onnx");
-        assert_eq!(StationSpeaker::Tower.model(&cfg, seed, local), "es.onnx");
-        assert_eq!(StationSpeaker::Atis.model(&cfg, seed, local), "es.onnx");
-        assert_ne!(StationSpeaker::Approach.model(&cfg, seed, local), "es.onnx");
-        // Geography: Castilian in Spain and the Canaries, es_MX only in
-        // Spanish Latin America, neutral elsewhere (and NEVER es_MX in Spain).
-        assert_eq!(local_accent_for("LEMD"), Some("models/es_ES-davefx-medium.onnx"));
-        assert_eq!(local_accent_for("GCXO"), Some("models/es_ES-davefx-medium.onnx"));
-        assert_eq!(local_accent_for("MMMX"), Some("models/es_MX-claude-high.onnx"));
-        assert_eq!(local_accent_for("SBGR"), None, "Brazil speaks Portuguese, stays neutral");
-        assert_eq!(local_accent_for("EGLL"), None);
-        assert_eq!(local_accent_for("LXGB"), None, "home field keeps its curated cast anyway");
+        assert_eq!(StationSpeaker::Tower.model(&bare, seed, &[]), "tower.onnx");
+        // Country casting: the local accents man the tower and read the
+        // ATIS — DIFFERENT people when the roster has two or more ("main
+        // thing is that we actually have different voices", 2026-07-12);
+        // approach/departure stay neutral (from the pool).
+        let locals = vec!["es1.onnx".to_string(), "es2.onnx".to_string()];
+        let twr = StationSpeaker::Tower.model(&cfg, seed, &locals);
+        let atis = StationSpeaker::Atis.model(&cfg, seed, &locals);
+        assert!(locals.contains(&twr), "{twr}");
+        assert!(locals.contains(&atis), "{atis}");
+        assert_ne!(twr, atis, "tower and ATIS must be different people");
+        assert!(!locals.contains(&StationSpeaker::Approach.model(&cfg, seed, &locals)));
+        // A one-voice roster still casts it (tower and ATIS then share).
+        let solo = vec!["es1.onnx".to_string()];
+        assert_eq!(StationSpeaker::Tower.model(&cfg, seed, &solo), "es1.onnx");
+        assert_eq!(StationSpeaker::Atis.model(&cfg, seed, &solo), "es1.onnx");
+        // Geography: Castilian in Spain and the Canaries (with real variety
+        // on the roster), es_MX only in Spanish Latin America, neutral
+        // elsewhere (and NEVER es_MX in Spain).
+        // Spain is deliberately EMPTY since the 2026-07-12 audition (every
+        // Castilian model failed the ear; quality beats accent) — but if a
+        // voice ever returns, it must be es_ES, never es_MX.
+        assert!(local_accents_for("LEMD").iter().all(|m| m.contains("es_ES")));
+        assert!(local_accents_for("GCXO").iter().all(|m| m.contains("es_ES")));
+        assert!(local_accents_for("MMMX").iter().all(|m| m.contains("es_MX")));
+        assert!(local_accents_for("SBGR").is_empty(), "Brazil speaks Portuguese, stays neutral");
+        assert!(local_accents_for("EGLL").is_empty());
+        assert!(local_accents_for("LXGB").is_empty(), "home field keeps its curated cast anyway");
     }
 
     #[test]
@@ -1047,43 +1071,31 @@ mod tests {
     }
 
     #[test]
-    fn stepped_on_tail_tracks_real_time() {
-        let rate = 22_050;
-        let len = 3 * rate as usize; // a 3-second transmission
-        // One second into the call: the tail starts one second of samples in.
-        assert_eq!(tail_offset(1.0, len, rate), Some(rate as usize));
-        // The press outlived the transmission: nothing left to hear.
-        assert_eq!(tail_offset(3.0, len, rate), None);
-        assert_eq!(tail_offset(10.0, len, rate), None);
-        // Under 50 ms remaining is just the squelch stub: skip it.
-        assert_eq!(tail_offset(2.99, len, rate), None);
-        // A clock skew below zero clamps to the start rather than panicking.
-        assert_eq!(tail_offset(-0.5, len, rate), Some(0));
+    fn live_audio_cuts_the_instant_you_tune_off_frequency() {
+        use StationSpeaker::*;
+        // On the frequency (or its party line): audible, keep playing.
+        assert!(audible_now(Some(Approach), Approach));
+        assert!(audible_now(Some(Tower), Tower));
+        assert!(audible_now(Some(Tower), Ghost { seed: 3 }));
+        assert!(audible_now(Some(Atis), Atis));
+        // A GOOD read that's off every station frequency (None) → nothing
+        // station is audible, so the live transmission is cut.
+        assert!(!audible_now(None, Tower));
+        assert!(!audible_now(None, Atis));
+        assert!(!audible_now(None, Ghost { seed: 3 }));
+        // Tuned to a DIFFERENT station: the old one is gone mid-word.
+        assert!(!audible_now(Some(Tower), Approach));
+        assert!(!audible_now(Some(Approach), Atis));
+        assert!(!audible_now(Some(Atis), Tower));
+        // A ghost is heard ONLY while the tower is tuned, not on approach.
+        assert!(!audible_now(Some(Approach), Ghost { seed: 3 }));
     }
 
     #[test]
-    fn tail_fades_in_from_silence() {
-        let rate = 22_050;
-        let mut s = vec![1.0_f32; rate as usize];
-        fade_in(&mut s, rate);
-        assert_eq!(s[0], 0.0, "mid-word entry must open from silence");
-        assert!(s[rate as usize / 100] > 0.99, "ramp is over within ~10 ms");
-        // Degenerate buffers (shorter than the ramp) must not panic.
-        let mut tiny = vec![1.0_f32; 3];
-        fade_in(&mut tiny, rate);
-    }
-
-    #[test]
-    fn requeued_tail_keeps_its_place_in_line() {
-        // The stepped-on transmission requeues with its ORIGINAL seq, so it
-        // pops ahead of everything enqueued while PTT was held.
+    fn higher_priority_outranks_fifo() {
+        // A Warning jumps ahead of an earlier-queued Readback.
         let mut h = BinaryHeap::new();
-        h.push(utt(Priority::Readback, 7)); // held backlog, queued during the press
-        h.push(utt(Priority::Readback, 8));
-        h.push(utt(Priority::Readback, 3)); // the tail, preserved seq
-        assert_eq!(h.pop().unwrap().seq, 3);
-        // But a higher priority still outranks it: a Warning does not wait
-        // behind a resumed transmission.
+        h.push(utt(Priority::Readback, 3));
         h.push(utt(Priority::Warning, 9));
         assert_eq!(h.pop().unwrap().priority, Priority::Warning);
     }

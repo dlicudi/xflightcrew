@@ -103,9 +103,11 @@ published by `Station::install()`, called by the owner — never by
 
 **The crew/world boundary is one page** (2026-07-11): everything ATC
 publishes for the copilot lives in [src/party_line.rs](src/party_line.rs) —
-six statics, read only through its narrow accessors (`clearance_state`,
-`with_taxi_route`, `takeoff_hold_armed`, `vectored_callsign`, plus two
-`take_*` queue consumers for the main loop). The world side (station/tower)
+seven statics, read only through its narrow accessors (`clearance_state`,
+`with_taxi_route`, `takeoff_hold_armed`, `vectored_callsign`,
+`landing_handoff_runway` — the approach→tower handoff that still owes the
+tower a "final" report, feeding the crew's landing-clearance coach — plus
+two `take_*` queue consumers for the main loop). The world side (station/tower)
 writes them; the crew side (main, the monitor's crew watches, taxi_guide)
 never does. Every other station static is private. This is convention until
 a workspace split makes it compiler-checked; when the crew needs a new fact
@@ -130,14 +132,44 @@ into LUAW and blocks the hold release); and **named taxi routes** (apt.dat
 with runway edges ×25 → "taxi to holding point Alpha one runway two seven
 right via Bravo, Link two seven", crossings called out, off-route nudges
 from the compliance watch via `TAXI_ROUTE`). The coach's first suggestion is
-always the readback owed (`ClearanceSnap.pending_readback`). PTT is
-half-duplex done honestly ([src/voice.rs](src/voice.rs) `SteppedOn`): keying
-up cuts the audio, but a stepped-on *station* transmission keeps running
-silently and its remainder plays from the real-time position on release
-(mid-word, like rejoining a real frequency; fully elapsed = lost, and
-recovery stays procedural: "say again" / readback enforcement, never an
-auto-repeat). Copilot speech stays killed: interrupting your own crew is a
-decision, not physics.
+always the readback owed (`ClearanceSnap.pending_readback`). PTT has TWO
+channels for CONTENT (the **radio PTT**, `xcopilot/radio_ptt_active`, is
+transmit to ATC; the **intercom PTT** — keyboard PTT or
+`xcopilot/ptt_active` — is talking to the copilot), and when the radio key
+is bound, **physical routing beats content routing in BOTH directions**
+(`Ptt::has_radio_channel`): radio-keyed speech never reaches the copilot,
+and intercom speech never content-routes to ATC ("requesting clearance"
+said to the copilot was answered by the tower, 2026-07-12). Content routing
+survives only for setups with no radio key (keyboard PTT, continuous),
+where it's the sole path to ATC. For AUDIO the channels are ONE: **any PTT
+mutes everything while held** (`set_hold`; copilot, controllers, ATIS,
+ghosts), and release rejoins LIVE audio — whatever was said during the
+press is simply gone, walkie-talkie style, no replay (the earlier
+stepped-on/resume machinery is deliberately REMOVED, 2026-07-12: the pilot
+flies on speakers and headset interchangeably, and a muted-everything press
+keeps the mic clean on both). Recovery stays procedural: "say again" /
+readback enforcement, never an auto-repeat. The barge-in cut kills by
+REGISTERED pid + a cut generation ([src/tts.rs](src/tts.rs) `run_audible`),
+not `pkill` by name — a press landing in the spawn window used to be missed
+entirely and the whole transmission talked over the pilot. The radio needs
+POWER in both directions: with the avionics master OFF, *station* audio
+(controllers, ATIS, party-line traffic) is dropped, never queued — the
+arbiter's `radio_powered` flag, published by the monitor off the airframe's
+`avionics` readback ([src/monitor.rs](src/monitor.rs)
+`avionics_readback_dref`) — and a keyed TRANSMISSION goes nowhere: the
+tower never hears it, the FSM never moves, and the copilot (crew on the
+intercom, no radio needed) says "radios are dead" (a cold-dark SR22 raised
+Gibraltar and got a squawk, 2026-07-12). FAIL OPEN by design, both
+directions: an airframe with no avionics system, or a read that fails,
+keeps the radio powered — a mysteriously dead radio is worse than one that
+works with the panel dark. And ONE frequency at a time: monitor-side
+controller calls (compliance berates, incursion shouts, go-around orders)
+speak as the controller COM1 is actually tuned to (`tuned_speaker` in
+[src/monitor.rs](src/monitor.rs)), and tower-frequency traffic (the
+after-takeoff handoff, the held-clearance release) goes silently into the
+void when tuned elsewhere — a berate hardcoded to the tower's voice while
+the pilot sat on the approach frequency put two controllers on one radio
+(2026-07-12).
 
 Depth (added 2026-07-11, evening): **ILS approaches from real chart data**,
 and **region-accurate phraseology**. `spawn_ils_load` (like the taxi net, a
@@ -154,9 +186,13 @@ safety) earns the tower handoff from approach or the landing clearance from
 tower. Phraseology follows geography like the voices do (`Dialect` in
 [src/station.rs](src/station.rs), K/P/C prefixes = FAA grammar, everywhere
 else ICAO/CAP 413: "descend to altitude ... feet" + "degrees" vs "descend
-and maintain" + the FAA PTAC clearance) — currently applied to the
-approach/vector phrases; rolling it through the tower's strings is future
-work, as is speaking "altimeter" in inHg at FAA fields. The copilot's
+and maintain" + the FAA PTAC clearance) — applied to the approach/vector
+phrases AND the pressure clause everywhere (`spoken_pressure`: `ctx.qnh`
+carries the whole dialect-correct phrase, so FAA fields hear "altimeter two
+niner niner two" in inches and `tower::qnh_clause` is the one seam);
+rolling the full dialect through the tower's remaining strings (and the
+ATIS broadcast, which still reads hPa QNH everywhere) is future work. The
+copilot's
 existing `visual_approach` talk-down and NAV1 ILS auto-tune compose with
 all of this. Real-install smoke test:
 `cargo test -- --ignored real_install_ils`.

@@ -676,17 +676,49 @@ impl Ptt {
     }
 
     /// True while PTT is held, whichever source (intercom OR radio) — for the
-    /// barge-in watcher: keying either button silences whoever is talking.
+    /// mic capture and content routing: keying either button starts a capture.
     fn is_pressed(&self) -> bool {
+        self.intercom_pressed() || self.radio_pressed()
+    }
+
+    /// The INTERCOM PTT: talking to the copilot (crew). On a real audio panel
+    /// this is the PILOT/COPLT intercom loop — separate from radio receive, so
+    /// keying it cuts only the copilot's own voice, never ATC. The keyboard
+    /// PTT is the intercom key (there's no separate radio key).
+    fn intercom_pressed(&self) -> bool {
         match self {
             Ptt::Key(key) => {
                 use device_query::DeviceQuery;
                 device_query::DeviceState::new().get_keys().contains(key)
             }
-            Ptt::Dataref { live, name, radio } => {
-                Ptt::dataref_active(live, name)
-                    || (!radio.is_empty() && Ptt::dataref_active(live, radio))
+            Ptt::Dataref { live, name, .. } => Ptt::dataref_active(live, name),
+        }
+    }
+
+    /// The RADIO (transmit) PTT: keying the mic to talk to ATC. Half-duplex —
+    /// while it's held you can't hear the frequency, so station audio is
+    /// stepped on. Dataref-only (`xcopilot/radio_ptt_active`); a keyboard PTT
+    /// is never the radio.
+    fn radio_pressed(&self) -> bool {
+        match self {
+            Ptt::Key(_) => false,
+            Ptt::Dataref { live, radio, .. } => {
+                !radio.is_empty() && Ptt::dataref_active(live, radio)
             }
+        }
+    }
+
+    /// A dedicated radio (transmit) key is BOUND — the pilot has two channels,
+    /// like a real audio panel. Then physical routing beats content routing in
+    /// BOTH directions: radio-keyed speech never reaches the copilot, and
+    /// intercom-keyed speech never reaches ATC ("requesting clearance" said to
+    /// the COPILOT was answered by the tower, 2026-07-12). Without a radio key
+    /// (keyboard PTT, continuous mode) content routing is the only way to
+    /// reach ATC at all, so it stays.
+    fn has_radio_channel(&self) -> bool {
+        match self {
+            Ptt::Key(_) => false,
+            Ptt::Dataref { radio, .. } => !radio.is_empty(),
         }
     }
 }
@@ -719,6 +751,9 @@ async fn run_session(
     // (main for plain, the voice thread for TUI) — a reqwest client's I/O is
     // bound to the runtime it's used on.
     let xplane = XPlaneClient::new(config.xplane_base_url.clone());
+    // Two PTT channels bound (intercom + radio): physical routing is complete,
+    // so intercom speech never content-routes to ATC (see Ptt::has_radio_channel).
+    let dual_ptt = ptt.as_ref().is_some_and(Ptt::has_radio_channel);
     // X-Plane's own radio voice (built-in ATC + its ATIS) speaks on the same
     // frequencies as our stations — heard live as two ATIS voices at once
     // (2026-07-10). While our ATC is on, Roger owns the radio soundscape:
@@ -810,7 +845,7 @@ async fn run_session(
         // the UK, FAA grammar at a K/P/C field.
         st.set_dialect(station::dialect_for(&home_icao));
         st.install();
-        voice.set_station_cast(0, None);
+        voice.set_station_cast(0, Vec::new());
         // Taxi network for named taxi routes — a second apt.dat scan, so a
         // background thread; clearances are route-less until it lands.
         station::spawn_taxi_net_load(config.apt_data_path.clone(), home_icao.clone());
@@ -873,29 +908,31 @@ async fn run_session(
         std::thread::Builder::new()
             .name("barge-in".into())
             .spawn(move || {
-                let mut was_pressed = false;
+                let mut was_ptt = false;
                 loop {
-                    let pressed = ptt.is_pressed();
-                    if pressed && !was_pressed {
-                        // Key down: kill whatever is playing AND hold the
-                        // whole queue — copilot, controllers, ghosts. Nobody
-                        // talks over the pilot's transmission (the party
-                        // line yakked through PTT, 2026-07-10). A station
-                        // transmission isn't erased, though: it's STEPPED ON
-                        // (half-duplex radio) and keeps running silently.
+                    // ANY PTT down — radio transmit OR intercom to the copilot —
+                    // mutes the whole cockpit while held: you don't talk over the
+                    // frequency, and (the reason this matters on speakers) the mic
+                    // can't re-hear ATC over the speakers while you give a command.
+                    // Half-duplex: a station transmission isn't erased, it's
+                    // STEPPED ON and its remainder resumes on release. Radio and
+                    // intercom still route CONTENT differently (transmit to ATC vs
+                    // command the copilot); only the audio hold is shared here.
+                    let ptt_down = ptt.is_pressed();
+                    if ptt_down && !was_ptt {
                         if wv.is_speaking() {
                             wv.shutup();
                             wi.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         wv.set_hold(true);
                     }
-                    if !pressed && was_pressed {
+                    if !ptt_down && was_ptt {
                         // Release: the stepped-on transmission's remainder (if
-                        // real time hasn't outrun it) plays from mid-word, like
-                        // rejoining a real frequency, then the held backlog.
+                        // real time hasn't outrun it) plays from mid-word, then
+                        // the held backlog.
                         wv.set_hold(false);
                     }
-                    was_pressed = pressed;
+                    was_ptt = ptt_down;
                     std::thread::sleep(Duration::from_millis(30));
                 }
             })
@@ -986,11 +1023,11 @@ async fn run_session(
                     // manning the tower and the ATIS — unless we're back
                     // home, where the curated voices belong.
                     if home_airport_name.as_deref() == Some(&name) {
-                        voice.set_station_cast(0, None);
+                        voice.set_station_cast(0, Vec::new());
                     } else {
                         voice.set_station_cast(
                             crate::voice::station_voice_seed(&name),
-                            crate::voice::local_accent_for(&icao).map(str::to_string),
+                            crate::voice::local_voices_on_disk(&icao),
                         );
                     }
                     atc_station = Some(st);
@@ -1088,6 +1125,20 @@ async fn run_session(
                     say(&voice, &reporter, ui::LogKind::Warn, &line);
                 }
             }
+            continue;
+        }
+
+        // Dead transmitter: a keyed transmission needs a powered radio — with
+        // the avionics master off the panel can't transmit any more than it can
+        // receive, so the tower never hears you (a cold-and-dark SR22 raised
+        // Gibraltar and got a squawk, 2026-07-12). The COPILOT is crew on the
+        // intercom, not radio, so they're the one who tells you why it's quiet.
+        // Fail open like the receive gate: `radio_powered` is false only on a
+        // confident avionics-off read. Before the confidence gate, so a garbled
+        // dead-radio press can't earn the tower's "say again" either.
+        if from_radio && !voice.radio_powered() {
+            say(&voice, &reporter, ui::LogKind::Warn,
+                "Radios are dead — we're not transmitting. Check the avionics master.");
             continue;
         }
 
@@ -1402,14 +1453,22 @@ async fn run_session(
             // to it. After the release guard above (handing controls back always
             // wins), before everything else — "request taxi" is a call to the
             // world, not a cockpit command. Falls through untouched when not
-            // tuned or not a radio call.
+            // tuned or not a radio call. CONTENT routing only exists for setups
+            // with no radio key: with a dedicated transmit button bound
+            // (dual_ptt) this utterance came over the INTERCOM, and physical
+            // routing beats content routing in both directions ("requesting
+            // clearance" to the copilot was answered by the tower, 2026-07-12).
+            // And either way the radio must be powered — a dead panel can't
+            // transmit (fail open, like the receive gate).
             if let Some(st) = atc_station.as_mut() {
-                if let Some((reply, who)) = st.try_handle(&tl, &xplane).await {
-                    reporter.status(ui::Phase::Speaking);
-                    reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
-                    voice.say_station(Priority::Readback, who, &reply);
-                    reporter.status(ui::Phase::Listening);
-                    continue;
+                if !dual_ptt && voice.radio_powered() {
+                    if let Some((reply, who)) = st.try_handle(&tl, &xplane).await {
+                        reporter.status(ui::Phase::Speaking);
+                        reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
+                        voice.say_station(Priority::Readback, who, &reply);
+                        reporter.status(ui::Phase::Listening);
+                        continue;
+                    }
                 }
                 // Named-station tuning ("tune the tower", "contact approach") —
                 // a COPILOT action: resolve the name against the station's
@@ -4857,8 +4916,48 @@ fn command_hints() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_abort, is_affirmative, is_undo, join_and, radio_panel_line, undoable_drefs,
+        is_abort, is_affirmative, is_undo, join_and, radio_panel_line, undoable_drefs, Ptt,
     };
+
+    #[test]
+    fn ptt_routes_intercom_and_radio_to_separate_channels() {
+        use std::sync::Arc;
+        let intercom_dref = "xcopilot/ptt_active";
+        let radio_dref = "xcopilot/radio_ptt_active";
+        let mk = |icom: f64, radio: f64| Ptt::Dataref {
+            live: Arc::new(crate::livestate::LiveState::from_pairs(&[
+                (intercom_dref, icom),
+                (radio_dref, radio),
+            ])),
+            name: intercom_dref.to_string(),
+            radio: radio_dref.to_string(),
+        };
+        // Intercom key alone: talking to the copilot, NOT the radio.
+        let p = mk(1.0, 0.0);
+        assert!(p.intercom_pressed() && !p.radio_pressed());
+        // Radio key alone: transmitting, NOT the intercom.
+        let p = mk(0.0, 1.0);
+        assert!(p.radio_pressed() && !p.intercom_pressed());
+        // Neither.
+        let p = mk(0.0, 0.0);
+        assert!(!p.intercom_pressed() && !p.radio_pressed() && !p.is_pressed());
+        // Either one starts a capture (is_pressed for the mic/routing).
+        assert!(mk(1.0, 0.0).is_pressed() && mk(0.0, 1.0).is_pressed());
+        // No radio dataref bound → radio is never pressed; intercom still works.
+        let p = Ptt::Dataref {
+            live: Arc::new(crate::livestate::LiveState::from_pairs(&[(intercom_dref, 1.0)])),
+            name: intercom_dref.to_string(),
+            radio: String::new(),
+        };
+        assert!(p.intercom_pressed() && !p.radio_pressed());
+        // Channel completeness: with a radio key BOUND (regardless of pressed
+        // state), physical routing is complete and intercom speech must never
+        // content-route to ATC; without one, content routing is the only path
+        // to the tower and stays. A keyboard PTT is never a radio.
+        assert!(mk(0.0, 0.0).has_radio_channel(), "bound radio key, even unpressed");
+        assert!(!p.has_radio_channel(), "no radio dataref bound");
+        assert!(!Ptt::Key(device_query::Keycode::F13).has_radio_channel());
+    }
 
     #[test]
     fn radio_row_shows_the_station_and_the_tuned_service_only() {

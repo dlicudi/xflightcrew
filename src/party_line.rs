@@ -49,6 +49,14 @@ pub(crate) static PENDING_STATION: Mutex<Option<(String, nav::AirportInfo)>> = M
 /// loop consumes it and syncs the tower FSM to what was said on frequency.
 pub(crate) static PENDING_TAKEOFF_CLEARANCE: Mutex<bool> = Mutex::new(false);
 
+/// The runway the APPROACH controller cleared you toward and handed to the
+/// tower ("cleared visual/ILS approach runway X, contact Tower"). You still
+/// owe the tower a "final" report before you're cleared to LAND — an approach
+/// clearance is not a landing clearance. The crew's landing-clearance coach
+/// reads it; the world clears it on the landing clearance and on touchdown, so
+/// it never lingers into the next circuit.
+pub(crate) static LANDING_HANDOFF: Mutex<Option<String>> = Mutex::new(None);
+
 fn lock<T>(m: &'static Mutex<T>) -> MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -74,6 +82,13 @@ pub fn takeoff_hold_armed() -> bool {
 /// The callsign under approach vectors, if a plan is armed.
 pub fn vectored_callsign() -> Option<String> {
     lock(&VECTORS).as_ref().map(|p| p.callsign.clone())
+}
+
+/// The runway the approach handed you toward while you still owe the tower a
+/// "final" report — i.e. cleared for the APPROACH but not to LAND. `None` once
+/// the tower clears the landing or the wheels are down.
+pub fn landing_handoff_runway() -> Option<String> {
+    lock(&LANDING_HANDOFF).clone()
 }
 
 /// Consume the armed station swap. Main loop only — it owns the `Station`.

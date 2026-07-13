@@ -32,6 +32,36 @@ pub fn speak(config: &Config, text: &str) -> Result<()> {
 /// is well under a minute.
 const SPEECH_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Barge-in bookkeeping: the audible child's pid, plus a cut generation the
+/// killer bumps. Killing by REGISTERED PID (not `pkill` by name) means the
+/// cut can't touch unrelated processes — and the generation closes the spawn
+/// race: a PTT press landing in the few ms between "about to spawn" and
+/// "spawned" used to be missed entirely, letting the whole transmission talk
+/// over the pilot and then replay as a stepped-on tail.
+static PLAYER_PID: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+static CUT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Spawn-to-exit wrapper for every AUDIBLE child (`say`, `afplay`, `aplay`):
+/// registers the pid for [`stop_playback`], detects a cut that landed while
+/// the process was spawning, and rides the hang watchdog. Only the speaker
+/// thread plays audio, so one slot is the whole story.
+fn run_audible(mut cmd: Command, what: &str) -> Result<()> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let gen = CUT_GEN.load(SeqCst);
+    let child = cmd.spawn().with_context(|| format!("spawning {what}"))?;
+    *PLAYER_PID.lock().unwrap_or_else(|e| e.into_inner()) = Some(child.id());
+    if CUT_GEN.load(SeqCst) != gen {
+        kill_pid(child.id()); // the press won the race; honor it
+    }
+    let res = wait_with_watchdog(child, what);
+    *PLAYER_PID.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    res
+}
+
+fn kill_pid(pid: u32) {
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+}
+
 /// Wait for a speech child process, killing it if it overruns the watchdog.
 fn wait_with_watchdog(mut child: std::process::Child, what: &str) -> Result<()> {
     let start = std::time::Instant::now();
@@ -60,11 +90,8 @@ fn speak_say(config: &Config, text: &str) -> Result<()> {
     if !config.say_rate.is_empty() {
         cmd.arg("-r").arg(&config.say_rate);
     }
-    let child = cmd
-        .arg(text)
-        .spawn()
-        .context("spawning `say` (macOS only)")?;
-    wait_with_watchdog(child, "say")
+    cmd.arg(text);
+    run_audible(cmd, "say")
 }
 
 /// Pipe `text` to piper to synthesize a WAV, then play it.
@@ -96,18 +123,15 @@ fn speak_piper(config: &Config, text: &str) -> Result<()> {
     play(&wav_path)
 }
 
-/// Kill any in-progress playback (and `say`) right now — the barge-in path. Every
-/// backend ends up at `afplay` (or `say`), so terminating those stops the audio
-/// whatever the TTS engine. Best-effort: errors (nothing playing) are ignored.
-#[cfg(target_os = "macos")]
+/// Kill the in-progress playback right now — the barge-in path. Bumps the cut
+/// generation first, so even a child mid-spawn (registered a moment later)
+/// dies immediately; then kills the registered pid. Best-effort: nothing
+/// playing means nothing to do.
 pub fn stop_playback() {
-    let _ = Command::new("pkill").args(["-x", "afplay"]).status();
-    let _ = Command::new("pkill").args(["-x", "say"]).status();
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn stop_playback() {
-    let _ = Command::new("pkill").args(["-x", "aplay"]).status();
+    CUT_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Some(pid) = *PLAYER_PID.lock().unwrap_or_else(|e| e.into_inner()) {
+        kill_pid(pid);
+    }
 }
 
 /// Play mono f32 PCM through the platform player (write a temp WAV, play it).
@@ -135,13 +159,15 @@ pub(crate) fn play_pcm(samples: &[f32], sample_rate: u32) -> Result<()> {
 /// in-process ONNX backend ([`crate::tts_onnx`]) can reuse it.
 #[cfg(target_os = "macos")]
 pub(crate) fn play(path: &std::path::Path) -> Result<()> {
-    let child = Command::new("afplay").arg(path).spawn().context("spawning afplay")?;
-    wait_with_watchdog(child, "afplay")
+    let mut cmd = Command::new("afplay");
+    cmd.arg(path);
+    run_audible(cmd, "afplay")
 }
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn play(path: &std::path::Path) -> Result<()> {
     // Linux fallback: aplay ships with alsa-utils.
-    let child = Command::new("aplay").arg(path).spawn().context("spawning aplay")?;
-    wait_with_watchdog(child, "aplay")
+    let mut cmd = Command::new("aplay");
+    cmd.arg(path);
+    run_audible(cmd, "aplay")
 }

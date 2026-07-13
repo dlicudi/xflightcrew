@@ -62,6 +62,19 @@
 - {text: "request departure clearance", intent: request_clearance, radio: true}
 - {text: "Do we have clearance?", intent: request_clearance, radio: false}
 
+# --- Start-up requests (NOT the zone clearance) -------------------------------
+# Real 2026-07-12 call: a parked, engines-off Malaga gate said the first line
+# and got "cleared to leave the zone" plus a squawk. The word "clearance" must
+# not swallow an engine-start request.
+- {text: "request clearance to start engines.", intent: request_startup, radio: true}
+- {text: "requesting startup.", intent: request_startup, radio: true}
+- {text: "request start-up", intent: request_startup, radio: true}
+- {text: "malaga tower, november five five zero charlie romeo, request start up", intent: request_startup, radio: true}
+# Cockpit commands to the copilot: no request word, so unkeyed they stay off
+# the radio and reach the start_engine tool.
+- {text: "start the engines", intent: request_startup, radio: false}
+- {text: "fire her up", intent: unknown, radio: false}
+
 # --- Landing and arrival calls: real -----------------------------------------
 - {text: "requesting permission to land.", intent: request_landing, radio: true}
 - {text: "requesting clearance for landing.", intent: request_landing, radio: true}
