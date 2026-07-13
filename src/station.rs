@@ -1411,37 +1411,63 @@ pub fn compliance_tick(
                 .is_some_and(|t| now.duration_since(t).as_secs_f64() < 45.0)
             && on_active_runway(lat, lon).is_none()
         {
-            let off = TAXI_ROUTE
+            let stray = TAXI_ROUTE
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
                 .and_then(|r| {
                     let d = dist_to_polyline_m(&r.path, lat, lon)?;
-                    (d > 60.0).then(|| r.via.clone())
+                    (d > 60.0).then(|| (r.via.clone(), r.path.last().copied()))
                 });
-            if let Some(via) = off {
+            if let Some((via, goal)) = stray {
                 w.off_route_last = Some(now);
-                return Some(if tuned {
-                    ComplianceCall {
-                        line: if via.is_empty() {
-                            format!(
-                                "{callsign}, you appear to be off the cleared taxi route. \
-                                 Continue with caution to the holding point."
-                            )
-                        } else {
-                            format!(
-                                "{callsign}, you appear to be off the cleared taxi route. \
-                                 Taxi via {via}."
-                            )
-                        },
-                        crew: false,
-                    }
-                } else {
-                    ComplianceCall {
+                if !tuned {
+                    return Some(ComplianceCall {
                         line: "We're off the cleared taxi route.".to_string(),
                         crew: true,
-                    }
+                    });
+                }
+                // A stray gets redirected from PRESENT POSITION: replan to
+                // the same holding point and re-clear, instead of repeating
+                // a via line for pavement the pilot left behind (the same
+                // stale via spoken seven times across one Malaga taxi while
+                // the pilot was 680 m off it, 2026-07-13). The republished
+                // route also re-aims the taxi guide.
+                let fresh = goal.and_then(|(glat, glon)| {
+                    let net = TAXI_NET.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+                    net.plan(lat, lon, glat, glon).filter(|r| r.path.len() >= 2)
                 });
+                let line = if let Some(r) = fresh {
+                    let via = r
+                        .via
+                        .iter()
+                        .map(|n| spoken_taxiway(n))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let hp = spoken_taxiway(&r.holding_point);
+                    *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(TaxiWatch {
+                            path: r.path.clone(),
+                            via: via.clone(),
+                            seg: r.seg.clone(),
+                            holding_point: r.holding_point.clone(),
+                        });
+                    format!(
+                        "{callsign}, you appear to be off the cleared taxi route. \
+                         Taxi to holding point {hp} via {via}."
+                    )
+                } else if via.is_empty() {
+                    format!(
+                        "{callsign}, you appear to be off the cleared taxi route. \
+                         Continue with caution to the holding point."
+                    )
+                } else {
+                    format!(
+                        "{callsign}, you appear to be off the cleared taxi route. \
+                         Taxi via {via}."
+                    )
+                };
+                return Some(ComplianceCall { line, crew: false });
             }
         }
         // On the active runway without any clearance to be there: not rolling
@@ -3922,6 +3948,83 @@ mod tests {
 
         *ACTIVE_FIELD.lock().unwrap() = None;
         *ACTIVE_PANEL.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *CLEARANCE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    }
+
+    #[test]
+    fn off_route_stray_gets_a_fresh_route_from_present_position() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Testfield".into(), 36.0, -5.0));
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::TaxiCleared,
+            callsign: "November one seven two Sierra Papa".into(),
+            runway_ident: "09".into(),
+            pending_readback: None,
+        });
+        // A tiny network: taxiway A east along 36.0000, then H1 north to the
+        // holding point. The cleared route rides all of it.
+        let mut nodes = std::collections::HashMap::new();
+        nodes.insert(1, (36.0000, -5.0000));
+        nodes.insert(2, (36.0000, -4.9990));
+        nodes.insert(3, (36.0000, -4.9980));
+        nodes.insert(4, (36.0010, -4.9980));
+        let edge = |a: i64, b: i64, name: &str| nav::TaxiEdge {
+            a,
+            b,
+            oneway: false,
+            runway: false,
+            name: name.into(),
+        };
+        *TAXI_NET.lock().unwrap() = Some(std::sync::Arc::new(nav::TaxiNet {
+            nodes,
+            edges: vec![edge(1, 2, "A"), edge(2, 3, "A"), edge(3, 4, "H1")],
+        }));
+        *TAXI_ROUTE.lock().unwrap() = Some(TaxiWatch {
+            path: vec![
+                (36.0000, -5.0000),
+                (36.0000, -4.9990),
+                (36.0000, -4.9980),
+                (36.0010, -4.9980),
+            ],
+            via: "Alpha, Hotel one".into(),
+            seg: vec![("A".into(), false), ("A".into(), false), ("H1".into(), false)],
+            holding_point: "H1".into(),
+        });
+        let t0 = Instant::now();
+
+        // 100 m north of the route at taxi speed: the challenge carries a
+        // FRESH route from where the aircraft IS, not the stale original via
+        // (the same via line was spoken seven times at Malaga, 2026-07-13).
+        let call = compliance_tick(36.0009, -5.0000, 15.0, true, 15.0, true, t0).expect("stray");
+        assert!(!call.crew);
+        assert!(call.line.contains("off the cleared taxi route"), "{}", call.line);
+        assert!(
+            call.line.contains("Taxi to holding point Hotel one via Alpha"),
+            "{}",
+            call.line
+        );
+        // The fresh route is republished (the guide rebuilds from it), and
+        // it starts AT the aircraft — the walk back to the network is now
+        // on-route, so the berate cannot repeat while the pilot complies.
+        {
+            let g = TAXI_ROUTE.lock().unwrap();
+            let r = g.as_ref().expect("route republished");
+            assert_eq!(r.path[0], (36.0009, -5.0000));
+            assert_eq!(r.holding_point, "H1");
+        }
+        assert!(
+            compliance_tick(36.0009, -5.0000, 15.0, true, 15.0, true, t0 + std::time::Duration::from_secs(50))
+                .is_none(),
+            "same spot is ON the fresh route"
+        );
+
+        *TAXI_NET.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *ACTIVE_FIELD.lock().unwrap() = None;
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
         *CLEARANCE.lock().unwrap() = None;
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;

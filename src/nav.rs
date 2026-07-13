@@ -715,6 +715,18 @@ impl TaxiNet {
         }
         via.dedup();
         via.truncate(6);
+        // The route starts where the AIRCRAFT is, not at the node it snapped
+        // to: the apron leg from the stand to the network is part of the
+        // cleared route, so the off-route watch and the taxi guide measure
+        // from brake release (a Malaga stand exit was berated as off-route
+        // 2 s after rolling, 100 m from a route it had no way to be on yet,
+        // 2026-07-13).
+        if let Some(&first) = path.first() {
+            if dist_m((from_lat, from_lon), first) > 1.0 {
+                path.insert(0, (from_lat, from_lon));
+                seg.insert(0, (String::new(), false));
+            }
+        }
         Some(TaxiRoutePlan { via, crossings, holding_point, path, seg })
     }
 }
@@ -889,6 +901,11 @@ mod tests {
         assert_eq!(plan.crossings, vec!["14/32".to_string()]);
         assert_eq!(plan.holding_point, "B");
         assert!(plan.path.len() >= 4, "polyline for the compliance watch");
+        // The polyline starts AT the aircraft — the apron leg from the stand
+        // to the snapped node is part of the cleared route.
+        assert_eq!(plan.path[0], (36.0031, -5.0050));
+        assert_eq!(plan.seg.len(), plan.path.len() - 1, "seg stays aligned");
+        assert_eq!(plan.seg[0], (String::new(), false));
 
         // Nowhere near the network: no snap, no plan — never a wild route.
         assert!(net.plan(37.0, -6.0, 36.0, -5.01).is_none());
