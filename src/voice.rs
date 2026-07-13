@@ -233,6 +233,24 @@ fn audible_now(tuned: Option<StationSpeaker>, speaker: StationSpeaker) -> bool {
     }
 }
 
+/// Whether a station utterance can't be heard RIGHT NOW: the radio receiver
+/// is unpowered, or COM1 is confidently tuned off the speaker's frequency.
+/// Copilot speech (`station == None`) is intercom and always hearable. FAIL
+/// OPEN twice over: `radio_powered` defaults true, and the tuning check only
+/// applies once a monitor has actually published COM1 state (`com1_known`) —
+/// a setup with no monitor tick must never go mysteriously silent.
+fn station_unhearable(inner: &Inner, station: Option<StationSpeaker>) -> bool {
+    let Some(who) = station else { return false };
+    if !inner.radio_powered.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    inner.com1_known.load(std::sync::atomic::Ordering::Relaxed)
+        && !audible_now(
+            *inner.tuned_station.lock().unwrap_or_else(|e| e.into_inner()),
+            who,
+        )
+}
+
 struct Utterance {
     priority: Priority,
     /// Monotonic enqueue order, for FIFO tie-breaking within a priority.
@@ -303,11 +321,18 @@ struct Inner {
     /// playback starts, cleared when it ends): used to CUT it (no resume) the
     /// instant the pilot tunes off its frequency or keys any PTT.
     now_playing: Mutex<Option<StationSpeaker>>,
-    /// Which station position COM1 currently hears (published by the monitor
-    /// each tick; `None` = untuned or unknown). A stepped-on tail is radio
-    /// audio: retune away from its station during the press and the
-    /// remainder is gone with the frequency, not carried to the new one.
+    /// Which station position COM1 currently hears, as of the monitor's last
+    /// good read (`None` = a real read that's off every station frequency).
+    /// Read at dequeue time so a station utterance queued behind another
+    /// voice (or a PTT hold) is dropped, not played onto whatever frequency
+    /// the pilot tuned to meanwhile. Meaningful only once `com1_known` is
+    /// set; before the first publish the speaker fails OPEN and plays.
     tuned_station: Mutex<Option<StationSpeaker>>,
+    /// Whether COM1 tuning has EVER been published (a monitor is running and
+    /// got a good read). Setups with no monitor tick — the standalone atc
+    /// binary, tests — never publish, and their station audio must not go
+    /// mysteriously silent: same fail-open contract as `radio_powered`.
+    com1_known: std::sync::atomic::AtomicBool,
     /// Whether the aircraft's radio RECEIVER is powered (avionics master on).
     /// Station audio (controllers, ATIS, party-line traffic) is radio: with
     /// the avionics off you can't hear it, so it's dropped, not queued —
@@ -346,6 +371,7 @@ impl Voice {
             hold: std::sync::atomic::AtomicBool::new(false),
             now_playing: Mutex::new(None),
             tuned_station: Mutex::new(None),
+            com1_known: std::sync::atomic::AtomicBool::new(false),
             radio_powered: std::sync::atomic::AtomicBool::new(true),
             spoken: Mutex::new(Vec::new()),
         });
@@ -404,12 +430,29 @@ impl Voice {
     /// current speech is not cut off", 2026-07-12). No resume, unlike a PTT
     /// step-on: you left, it's gone; "say again" on the new controller.
     /// Publish whether the radio receiver is powered (avionics master on).
-    /// `false` suppresses station audio (radio); the copilot's intercom voice
-    /// is unaffected. The monitor passes `false` only on a confident read.
+    /// `false` suppresses station audio (radio) — cutting a live transmission
+    /// mid-word and gating queued ones; the copilot's intercom voice is
+    /// unaffected. The monitor passes `false` only on a confident read.
     pub fn set_radio_powered(&self, on: bool) {
         self.inner
             .radio_powered
             .store(on, std::sync::atomic::Ordering::Relaxed);
+        // The receiver dies NOW, mid-word — same as the retune cut in
+        // `set_com1`, not just a gate on future dequeues. Only station audio
+        // is ever published to `now_playing`, so the copilot's intercom
+        // voice keeps talking with the panel dark. Idempotent under the
+        // monitor's per-tick republish: the first cut leaves it empty.
+        if !on
+            && self
+                .inner
+                .now_playing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .is_some()
+        {
+            crate::tts::stop_playback();
+        }
     }
 
     /// Whether the radio receiver/transmitter has power (see
@@ -434,6 +477,11 @@ impl Voice {
             .tuned_station
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = tuned;
+        // A monitor is publishing: from here on the speaker may trust the
+        // stored tuning to drop queued station audio (fail-open until now).
+        self.inner
+            .com1_known
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         // Is a station on the air, and have we tuned off its frequency?
         let cut = self
             .inner
@@ -808,14 +856,17 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         };
         drop(q); // release the queue while we speak (which is slow)
 
-        // Dead receiver: station audio (controllers, ATIS, party-line
-        // traffic) is radio, and with the avionics master off you can't hear
-        // it — drop it, don't queue (missed radio is gone, like real life).
-        // The copilot's own voice is intercom, never gated. Checked before
-        // `set_speaking` so a dropped transmission doesn't even gate the mic.
-        if utt.station.is_some()
-            && !inner.radio_powered.load(std::sync::atomic::Ordering::Relaxed)
-        {
+        // Dead receiver or tuned away: station audio (controllers, ATIS,
+        // party-line traffic) is radio — with the avionics master off you
+        // can't hear it, and a transmission still queued behind another
+        // voice (or a PTT hold) died with the frequency the moment the
+        // pilot retuned (`set_com1` cuts LIVE audio; this catches the
+        // queued). Drop it, don't hold it — missed radio is gone, like real
+        // life. The copilot's own voice is intercom, never gated. Checked
+        // before `set_speaking` so a dropped transmission doesn't even gate
+        // the mic, and the done latch still fires so a blocking
+        // `say_station` caller is released, never deadlocked.
+        if station_unhearable(inner, utt.station) {
             if let Some(latch) = utt.done {
                 *latch.spoken.lock().unwrap() = true;
                 latch.cv.notify_all();
@@ -893,8 +944,17 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
                 // Publish the transmission as on-air just before playback, so a
                 // PTT press or a retune can CUT it (no resume). Copilot speech
                 // is deliberately never published: it's intercom, not radio.
+                // Then re-check hearability: a retune or power-off landing
+                // during SYNTHESIS falls between the dequeue check and this
+                // publish, so `set_com1`/`set_radio_powered` found nothing
+                // on the air to cut. The cut generation in
+                // `tts::stop_playback` kills even a player that hasn't
+                // registered its pid yet.
                 slot.as_mut().expect("just built").1.speak(&utt.text, |_samples, _rate| {
                     *inner.now_playing.lock().unwrap_or_else(|e| e.into_inner()) = Some(who);
+                    if station_unhearable(inner, Some(who)) {
+                        crate::tts::stop_playback();
+                    }
                 })
             } else {
                 speaker.speak(&utt.text)
@@ -1089,6 +1149,62 @@ mod tests {
         assert!(!audible_now(Some(Atis), Tower));
         // A ghost is heard ONLY while the tower is tuned, not on approach.
         assert!(!audible_now(Some(Approach), Ghost { seed: 3 }));
+    }
+
+    fn bare_inner() -> Inner {
+        Inner {
+            queue: Mutex::new(Queue { heap: BinaryHeap::new(), seq: 0, shutdown: false }),
+            cv: Condvar::new(),
+            station_seed: std::sync::atomic::AtomicUsize::new(0),
+            station_local: Mutex::new(Vec::new()),
+            hold: std::sync::atomic::AtomicBool::new(false),
+            now_playing: Mutex::new(None),
+            tuned_station: Mutex::new(None),
+            com1_known: std::sync::atomic::AtomicBool::new(false),
+            radio_powered: std::sync::atomic::AtomicBool::new(true),
+            spoken: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn station_unhearable_gates_power_and_tuning_but_fails_open() {
+        use StationSpeaker::*;
+        let inner = bare_inner();
+        // Fail open: no monitor has published COM1 yet (tuned_station is
+        // None but com1_known is false) — station audio must play.
+        assert!(!station_unhearable(&inner, Some(Tower)));
+        // Copilot speech is intercom: hearable even with the radio dead.
+        inner.radio_powered.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!station_unhearable(&inner, None));
+        assert!(station_unhearable(&inner, Some(Tower)));
+        inner.radio_powered.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Once tuning is published, only the tuned position (and its ghosts)
+        // is hearable; a real read that's off every frequency silences all.
+        inner.com1_known.store(true, std::sync::atomic::Ordering::Relaxed);
+        *inner.tuned_station.lock().unwrap() = Some(Approach);
+        assert!(!station_unhearable(&inner, Some(Approach)));
+        assert!(station_unhearable(&inner, Some(Tower)));
+        assert!(station_unhearable(&inner, Some(Ghost { seed: 3 })));
+        assert!(!station_unhearable(&inner, None));
+        *inner.tuned_station.lock().unwrap() = None;
+        assert!(station_unhearable(&inner, Some(Tower)));
+        assert!(!station_unhearable(&inner, None));
+    }
+
+    #[test]
+    fn dropped_station_audio_releases_blocking_callers() {
+        // The drop paths must fire the done latch or a blocking `say_station`
+        // caller (the tower's replies) deadlocks the app. Both gates: dead
+        // receiver, then tuned off the frequency while queued.
+        let voice = Voice::new(Config::default());
+        voice.set_radio_powered(false);
+        voice.say_station(Priority::Readback, StationSpeaker::Tower, "cleared to land");
+        voice.set_radio_powered(true);
+        voice.set_com1(Some(121_500), Some(StationSpeaker::Approach));
+        voice.say_station(Priority::Readback, StationSpeaker::Tower, "line up and wait");
+        // Dropped means dropped: neither transmission was actually spoken
+        // (finished speech always lands in the echo memory).
+        assert!(voice.inner.spoken.lock().unwrap().is_empty());
     }
 
     #[test]
