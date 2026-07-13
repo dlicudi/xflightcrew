@@ -173,22 +173,34 @@ static XPLMDataRef g_com1_dref = nullptr;
 
 // Transmission log shown in the panel, each entry stamped with wall-clock time
 // so a test flight can be reviewed afterwards.
-struct LogEntry { std::string time; std::string tag; ImU32 color; std::string text; };
+struct LogEntry {
+    std::string time;
+    std::string tag;
+    ImU32 color;
+    std::string text;
+    // Overheard, not addressed to this aircraft (the party line's ghost
+    // exchanges) — rendered dim so calls with our name on them stay bright.
+    bool ambient;
+};
 static std::vector<LogEntry> g_log;
 static bool g_log_scroll = false;
 static bool g_log_autoscroll = true;
+// Live view filter: 0 = all, 1 = crew (intercom), 2 = radio. Never stored —
+// a declutter for a busy frequency, not a mode.
+static int g_log_filter = 0;
 // New entries arrived since the Log tab was last shown — drives an unread dot
 // on the tab so activity isn't missed while on Route/Settings.
 static bool g_log_unseen = false;
 
-static void AppendLog(const char* tag, ImU32 color, const char* text) {
+static void AppendLog(const char* tag, ImU32 color, const char* text,
+                      bool ambient = false) {
     if (text == nullptr || text[0] == '\0') return;
     char ts[16] = {0};
     time_t now = time(nullptr);
     struct tm lt;
     localtime_r(&now, &lt);
     strftime(ts, sizeof ts, "%H:%M:%S", &lt);
-    g_log.push_back({ts, tag, color, text});
+    g_log.push_back({ts, tag, color, text, ambient});
     if (g_log.size() > 200) g_log.erase(g_log.begin());
     if (g_log_autoscroll) g_log_scroll = true;
     g_log_unseen = true;
@@ -236,6 +248,15 @@ static void WriteHeard(void*, void* in, int offset, int len) {
 }
 static void WriteAction(void*, void* in, int offset, int len) {
     StoreText(&g_action, in, offset, len);
+    // A leading '~' marks AMBIENCE — the party line's overheard exchanges,
+    // not a call addressed to this aircraft. Strip it, remember it: the row
+    // keeps its speaker tag but renders dim.
+    bool ambient = false;
+    if (g_action.len > 0 && g_action.buf[0] == '~') {
+        std::memmove(g_action.buf, g_action.buf + 1, static_cast<size_t>(g_action.len));
+        g_action.len -= 1;
+        ambient = true;
+    }
     // A station prefix ("TWR: " / "APP: " / "DEP: " / "ATIS: ") is attribution,
     // not content: strip it and tag the row with the SPECIFIC position, so the
     // transcript names which controller spoke. Everything else is the crew.
@@ -250,11 +271,11 @@ static void WriteAction(void*, void* in, int offset, int len) {
         if (g_action.len > n && std::strncmp(g_action.buf, s.prefix, n) == 0) {
             std::memmove(g_action.buf, g_action.buf + n, static_cast<size_t>(g_action.len - n + 1));
             g_action.len -= n;
-            AppendLog(s.tag, COL_AMBER, g_action.buf);
+            AppendLog(s.tag, COL_AMBER, g_action.buf, ambient);
             return;
         }
     }
-    AppendLog("COPILOT", COL_GREEN, g_action.buf);
+    AppendLog("COPILOT", COL_GREEN, g_action.buf, ambient);
 }
 // Active aircraft ICAO — shown beside the connection chip, not logged.
 static void WriteAircraft(void*, void* in, int offset, int len) {
@@ -868,12 +889,21 @@ protected:
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", hint);
         }
         for (const LogEntry& e : g_log) {
+            // The live filter: crew is the intercom (pilot + copilot), radio
+            // is everything on a frequency (pilot included — their words are
+            // half of both conversations).
+            const bool crew_row = e.tag == "PILOT" || e.tag == "COPILOT";
+            if (g_log_filter == 1 && !crew_row) continue;
+            if (g_log_filter == 2 && e.tag == "COPILOT") continue;
+            // Ambience (overheard party-line exchanges) dims, chip and all —
+            // calls with our name on them stay bright.
+            const ImU32 col = e.ambient ? COL_DIM : e.color;
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", e.time.c_str());
             ImGui::SameLine(kTimeW + pad);
-            TagChip(e.tag.c_str(), e.color, kTagW);
+            TagChip(e.tag.c_str(), col, kTagW);
             ImGui::SameLine(kTimeW + kTagW + pad * 2);
             // Wrap long readbacks at the panel edge instead of running off it.
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(e.color));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(col));
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextUnformatted(e.text.c_str());
             ImGui::PopTextWrapPos();
@@ -899,9 +929,13 @@ protected:
             ImGui::PopStyleColor();
         }
 
-        // Footer: just the log controls — state lives in the chips, version in
-        // Settings. An empty left cell keeps the controls on this row.
-        ImGui::Dummy(ImVec2(1, 1));
+        // Footer: the view filter on the left, log controls on the right —
+        // state lives in the chips, version in Settings.
+        ImGui::RadioButton("all", &g_log_filter, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("crew", &g_log_filter, 1);
+        ImGui::SameLine();
+        ImGui::RadioButton("radio", &g_log_filter, 2);
         // Right-aligned: auto-scroll toggle + clear.
         const char* clearLbl = "Clear";
         float ctlW = ImGui::CalcTextSize("Clear").x + ImGui::CalcTextSize("follow").x

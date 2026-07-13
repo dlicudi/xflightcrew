@@ -2084,7 +2084,11 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                                     );
                                     // Pilot and tower lines queue in order
                                     // through the one arbiter — the exchange
-                                    // plays as a dialogue, two voices.
+                                    // plays as a dialogue, two voices. The
+                                    // '~' marks AMBIENCE for the panel: an
+                                    // overheard exchange, not a call to this
+                                    // aircraft — the log dims it so calls
+                                    // with our name on them stay bright.
                                     for l in exchange.lines {
                                         let who = if l.ghost {
                                             crate::voice::StationSpeaker::Ghost {
@@ -2094,7 +2098,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                                             crate::voice::StationSpeaker::Tower
                                         };
                                         if let Some(s) = status.as_ref() {
-                                            s.action(&format!("{}: {}", who.tag(), l.text));
+                                            s.action(&format!("~{}: {}", who.tag(), l.text));
                                         }
                                         voice.alert_station(Priority::Advisory, who, l.text);
                                     }
