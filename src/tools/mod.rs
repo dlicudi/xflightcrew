@@ -303,9 +303,15 @@ impl Registry {
             }));
         }
 
-        if profile.directional_gyro {
-            tools.push(Box::new(instruments::AlignGyro));
-        }
+        // Always registered, NOT gated on `profile.directional_gyro`: X-Plane
+        // keeps a syncable (and drifting!) DG under airframes the profile
+        // calls glass — the SR22 flew 166° off its indicated heading while
+        // "auto sync the gyro" earned a miss beep (2026-07-12). Syncing a
+        // zero-drift gyro is a harmless no-op with an honest readback;
+        // refusing the ask while the pilot's heading reference is wrong is
+        // the worst outcome. The profile flag still gates the vacuum reads
+        // and the drift nag, where a glass panel genuinely has nothing.
+        tools.push(Box::new(instruments::AlignGyro));
 
         if profile.com_radio {
             tools.push(Box::new(radio::SetCom1));

@@ -1613,9 +1613,12 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 // Gyro auto-sync: a drifted DG gets re-aligned by the copilot's
                 // own hand, then announced — not a "recommend syncing" nag
                 // (pilot feedback, 2026-07-09). Airborne only (on the ground
-                // you align at the run-up); vacuum-DG airframes only.
-                if live.get().directional_gyro
-                    && !snap.on_ground
+                // you align at the run-up). Gated on MEASURED drift, not the
+                // profile's directional_gyro flag: the sim drifts a DG under
+                // "glass" airframes too (the SR22 flew 166° off while the
+                // profile swore there was nothing to sync, 2026-07-12) — and
+                // a true glass panel reads ~0 here, so it never fires there.
+                if !snap.on_ground
                     && snap.gyro_drift_deg.abs() >= GYRO_DRIFT_ADVISORY_DEG
                     && gyro_sync_last.is_none_or(|t| now.duration_since(t).as_secs() >= 120)
                 {

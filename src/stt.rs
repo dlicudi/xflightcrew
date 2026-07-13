@@ -10,8 +10,9 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 const VOCAB_PROMPT: &str = "Cessna cockpit commands: flaps up, flaps ten, flaps \
 twenty, flaps full. Landing light, taxi light, beacon, strobe lights, navigation \
 lights on or off. Autopilot heading, altitude, vertical speed, climb, descend. \
-Throttle, mixture, magnetos, parking brake, start the engine. Set altimeter, \
-tune com one. Knots, feet, degrees, percent.";
+Keep current heading. Sync the gyro. Stop the aircraft. Throttle, mixture, \
+magnetos, parking brake, start the engine. Set altimeter, tune com one. Knots, \
+feet, degrees, percent.";
 
 /// A transcription plus a confidence score (mean per-token probability,
 /// 0.0–1.0). Low confidence means the model wasn't sure — likely noise or a

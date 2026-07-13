@@ -496,6 +496,11 @@ impl FakeXPlane {
     pub fn ran(&self, command: &str) -> bool {
         self.commands.lock().unwrap().iter().any(|c| c == command)
     }
+
+    /// Index of the first time `command` ran, for ordering assertions.
+    pub fn command_index(&self, command: &str) -> Option<usize> {
+        self.commands.lock().unwrap().iter().position(|c| c == command)
+    }
 }
 
 #[cfg(test)]

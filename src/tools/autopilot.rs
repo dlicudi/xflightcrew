@@ -575,8 +575,11 @@ pub struct SetHeading {
 
 #[derive(Deserialize)]
 struct Args {
-    /// Target magnetic heading in degrees.
-    heading: f64,
+    /// Target magnetic heading in degrees. Omitted = hold the current one.
+    heading: Option<f64>,
+    /// "Keep current heading": bug whatever we're flying right now.
+    #[serde(default)]
+    current: bool,
 }
 
 #[async_trait]
@@ -602,9 +605,12 @@ impl Tool for SetHeading {
                     "minimum": 0,
                     "maximum": 360,
                     "description": "Magnetic heading in degrees (0-359)."
+                },
+                "current": {
+                    "type": "boolean",
+                    "description": "Hold the CURRENT heading ('keep current heading') — no heading number needed."
                 }
-            },
-            "required": ["heading"]
+            }
         })
     }
 
@@ -613,35 +619,64 @@ impl Tool for SetHeading {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: Args = serde_json::from_value(args.clone())?;
-        // A heading well past 360 is a mishear, not a wrap: "turn heading
-        // 1018" (QNH bleeding into the phrase, seen live) silently flew 298.
-        // Refuse it; only a small overshoot ("370") wraps.
-        if args.heading > 400.0 {
-            return Ok(format!(
-                "Say again? I heard heading {:.0}, and headings run zero to three sixty.",
-                args.heading
-            ));
-        }
-        // Normalize into 0..360 (so "370" → 10, "-10" → 350).
-        let heading = args.heading.rem_euclid(360.0);
+        let heading = match args.heading {
+            Some(h) => {
+                // A heading well past 360 is a mishear, not a wrap: "turn heading
+                // 1018" (QNH bleeding into the phrase, seen live) silently flew 298.
+                // Refuse it; only a small overshoot ("370") wraps.
+                if h > 400.0 {
+                    return Ok(format!(
+                        "Say again? I heard heading {h:.0}, and headings run zero to three sixty."
+                    ));
+                }
+                // Normalize into 0..360 (so "370" → 10, "-10" → 350).
+                h.rem_euclid(360.0)
+            }
+            // "Keep current heading" (beeped live, 2026-07-12): bug what
+            // we're flying right now — no number to hear, nothing to mishear.
+            None if args.current => ctx
+                .xplane
+                .get_float(crate::datarefs::MAG_PSI)
+                .await?
+                .rem_euclid(360.0),
+            None => return Ok("Say again? Which heading?".to_string()),
+        };
 
-        // Engage the autopilot and mode FIRST, then write the bug LAST —
-        // engaging a mode can snap the dial to a current value, so the target
-        // must be the final write or it gets clobbered.
-        engage_ap(ctx, &self.cfg).await?;
+        // Engage the servos LAST, once the bug already sits on the target — so
+        // the autopilot flies to a STATIONARY bug. The old order (servos on,
+        // then walk the bug one knob-press per degree over several seconds) left
+        // the AP chasing a crawling bug: on any large turn the SR22 "just kept
+        // turning," following the bug around as it moved, and only small turns
+        // (a press or two, sub-second) captured cleanly (live, 2026-07-12).
+        // Order within the pre-engage steps still matters: the FD prep leads
+        // (the C90's servos drop unless the FD is up first), and HDG mode is
+        // armed before the bug so a mode-engage dial-snap can't clobber the
+        // target. Then drive the bug (knob presses, dataref fallback), servos
+        // on, and confirm.
+        for c in &self.cfg.fd_commands {
+            ctx.xplane.run_command(c).await?;
+        }
         engage_mode(ctx, HEADING_STATUS, CMD_HEADING_MODE).await?;
-        // Turn the bug like a human turns the knob (commands, dataref fallback).
         let actual = drive_heading_bug(ctx.xplane, heading).await;
+        ctx.xplane.run_command(CMD_SERVOS_ON).await?;
         if servos_engaged(ctx).await? {
-            Ok(format!("Roger — autopilot engaged, heading mode, bug to {:03.0}.", actual))
+            Ok(format!("Roger — autopilot engaged, heading mode, bug to {}.", spoken_heading(actual)))
         } else {
             Ok(format!(
-                "Heading bug set to {:03.0}, but the autopilot didn't engage — {}.",
-                actual,
+                "Heading bug set to {}, but the autopilot didn't engage — {}.",
+                spoken_heading(actual),
                 no_engage_reason(ctx, &self.cfg).await
             ))
         }
     }
+}
+
+/// Format a heading for readback: rounded to the degree, three digits, and
+/// NORTH spoken as 360 — a heading bug reads "three six zero", never
+/// "zero zero zero" ("turn heading north" read back "bug to 000", 2026-07-12).
+fn spoken_heading(deg: f64) -> String {
+    let d = (deg.round() as i64).rem_euclid(360);
+    format!("{:03}", if d == 0 { 360 } else { d })
 }
 
 pub struct Navigate {
@@ -1194,6 +1229,20 @@ mod tests {
     }
 
     #[test]
+    fn north_reads_back_as_360_never_000() {
+        // "turn heading north" (0°) read back "bug to 000", 2026-07-12 — a
+        // heading bug is spoken "three six zero", never "zero zero zero".
+        assert_eq!(spoken_heading(0.0), "360");
+        assert_eq!(spoken_heading(360.0), "360");
+        assert_eq!(spoken_heading(0.3), "360"); // rounds to north
+        assert_eq!(spoken_heading(359.7), "360");
+        // Everything else is just three-digit degrees.
+        assert_eq!(spoken_heading(90.0), "090");
+        assert_eq!(spoken_heading(270.0), "270");
+        assert_eq!(spoken_heading(5.0), "005");
+    }
+
+    #[test]
     fn terrain_floor_is_ground_relative() {
         // At a sea-level field (current 0, agl 0) the floor is just the margin.
         assert_eq!(terrain_floor_ft(0.0, 0.0), MIN_TARGET_AGL_FT);
@@ -1223,6 +1272,32 @@ mod tests {
 
     fn ctx<'a>(fake: &'a FakeXPlane, cfg: &'a crate::config::Config) -> ToolCtx<'a> {
         ToolCtx { xplane: fake, config: cfg, voice: None, status: None, reminders: None }
+    }
+
+    #[tokio::test]
+    async fn set_heading_engages_servos_after_the_bug_is_on_target() {
+        // The "kept turning" fix: the servos must come on LAST, once the bug
+        // already sits on the target, so the AP flies to a STATIONARY bug
+        // instead of chasing it around as it crawls one knob-press per degree.
+        // Bug starts 20 deg off the target so the knob actually turns.
+        let fake = FakeXPlane::with_reads(&[
+            (HEADING_STATUS, 0.0), // HDG off → engage_mode presses it
+            (HEADING_BUG, 250.0),  // 20 deg from the 270 target
+            (SERVOS_ON, 1.0),      // engaged when the readback checks
+        ]);
+        let cfg = crate::config::Config::default();
+        let out = SetHeading { cfg: ApConfig::default() }
+            .execute(&serde_json::json!({ "heading": 270 }), &ctx(&fake, &cfg))
+            .await
+            .unwrap();
+        assert!(out.contains("engaged"), "reports engaged: {out:?}");
+
+        let servos = fake.command_index(CMD_SERVOS_ON).expect("servos engaged");
+        let mode = fake.command_index(CMD_HEADING_MODE).expect("HDG mode pressed");
+        let bug = fake.command_index(CMD_HDG_UP).expect("bug knob turned");
+        assert!(mode < bug, "HDG mode is armed before the bug is driven");
+        assert!(servos > bug, "servos engage AFTER the bug reaches the target, not before");
+        assert!(servos > mode, "servos engage last");
     }
 
     #[tokio::test]

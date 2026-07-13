@@ -102,6 +102,13 @@ pub fn normalize(transcript: &str) -> String {
         // "parking brake" split into "park and brake" (seen live: "Park and
         // brake release."). Nobody commands "park and brake" otherwise.
         ("park and brake", "parking brake"),
+        // Spoken "Q-N-H" (cue-en-aitch): whisper hears the "en" as "and"/"&", so
+        // "set QNH 1013" arrives as "set q and h 1013" or "set q&h 1013" (both
+        // seen live 2026-07-12) and the "qnh" whole-word check never fires. Also
+        // the letter-by-letter spelling. Nobody says any of these otherwise.
+        ("q and h", "qnh"),
+        ("q&h", "qnh"),
+        ("q n h", "qnh"),
     ] {
         s = s.replace(heard, meant);
     }
@@ -794,10 +801,20 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         }
     }
 
-    // heading 270 / heading north
+    // heading 270 / heading north. Whisper wraps a bare "heading north" in a
+    // false first-person opener ("So I'm heading north" for a turn command,
+    // 2026-07-12) — those ARE commands here, so no narration guard: a genuine
+    // question ("is that heading north?") is withheld upstream by its
+    // interrogative opener, not by refusing to parse it. (The earlier
+    // "narration re-bugged the heading" scare was really the drifted gyro.)
     if has(t, "heading") {
         if let Some(n) = num {
             return Some(call("set_heading", json!({ "heading": n })));
+        }
+        // "keep/hold/maintain current heading", "hold this heading" — bug
+        // what we're flying now ("keep current heading" beeped, 2026-07-12).
+        if has(t, "current") || has(t, "present") || t.contains("this heading") {
+            return Some(call("set_heading", json!({ "current": true })));
         }
         // Intercardinals first (so "northeast"/"north east" aren't shadowed by the
         // cardinal checks), each in one-word and two-word spellings.
@@ -1506,6 +1523,21 @@ mod tests {
         assert_eq!(one("heading 270").unwrap().1, json!({"heading":270}));
         assert_eq!(one("turn heading south").unwrap().1, json!({"heading":180}));
         assert_eq!(one("change heading to northeast").unwrap().1, json!({"heading":45}));
+        // Whisper's false first-person opener is a QUIRK, not narration: the
+        // pilot meant a turn ("So I'm heading north" for "turn heading
+        // north", 2026-07-12). These parse as commands; the real question
+        // form ("is that heading north?") is caught upstream by its opener.
+        assert_eq!(one("so i'm heading south").unwrap().1, json!({"heading": 180}));
+        assert_eq!(one("we're heading east now").unwrap().1, json!({"heading": 90}));
+        assert_eq!(one("i am heading 270").unwrap().1, json!({"heading": 270}));
+        // "Keep current heading" holds what we're flying — it beeped live
+        // (2026-07-12) with no way to say it.
+        assert_eq!(one("keep current heading").unwrap().1, json!({"current": true}));
+        assert_eq!(one("hold this heading").unwrap().1, json!({"current": true}));
+        assert_eq!(one("maintain present heading").unwrap().1, json!({"current": true}));
+        // Whisper writes "sync" as "sink" — the gyro word alone carries it.
+        assert_eq!(one("sink gyro").unwrap().0, "align_gyro");
+        assert_eq!(one("auto sync the gyro").unwrap().0, "align_gyro");
         // A leading "and then"/"and" is pilot narration, not a compound
         // ("And then, fly heading 120." missed live twice on 2026-07-09).
         assert_eq!(one("and then, fly heading 120").unwrap().1, json!({"heading":120}));
@@ -1698,6 +1730,11 @@ mod tests {
         assert!((inhg("altimeter 29.92") - 29.92).abs() < 0.005); // explicit decimal
         assert!((inhg("set baro 3010") - 30.10).abs() < 0.005); // 4-digit inHg×100
         assert!((inhg("set qnh 1013") - 29.91).abs() < 0.02); // hPa/QNH → inHg
+        // Whisper's spelling of spoken "Q-N-H": the "en" comes back as "and"/"&"
+        // (both seen live 2026-07-12). normalize() rewrites them to "qnh".
+        assert!((inhg("set q and h 1013") - 29.91).abs() < 0.02);
+        assert!((inhg("q&h 1013") - 29.91).abs() < 0.02);
+        assert!((inhg("set q n h 1013") - 29.91).abs() < 0.02);
         // A bare integer outside both the inHg and hPa ranges isn't a setting —
         // fall back to the LLM rather than write garbage (and not the auto-setter).
         assert!(one("set altimeter 50").is_none());
