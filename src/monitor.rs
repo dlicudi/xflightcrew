@@ -1972,12 +1972,18 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                         == Some(crate::tower::State::ClearedToLand);
                     let hold_armed = crate::party_line::takeoff_hold_armed();
                     // Party-line flavor stands down while the taxi guide is
-                    // working: its cues are perishable, and a three-line
-                    // Ryanair landing exchange cost the pilot the G11 turn
-                    // (cue spoken 17 s late, 2026-07-13). Calls addressed to
-                    // US (compliance, hold releases) are unaffected.
-                    let chatter_on =
-                        config.atc_chatter && tower_tuned && taxi_guide.is_none();
+                    // working AND the aircraft is rolling: its cues are
+                    // perishable, and a three-line Ryanair landing exchange
+                    // cost the pilot the G11 turn (cue spoken 17 s late,
+                    // 2026-07-13). But guide-active is NOT rolling — the
+                    // guide rides the whole taxi clearance, and gating on it
+                    // alone killed the party line for a 20-minute Gatwick
+                    // taxi, most of it stationary (same day). Stopped, no cue
+                    // is imminent; chatter is welcome. Calls addressed to US
+                    // (compliance, hold releases) are unaffected either way.
+                    let chatter_on = config.atc_chatter
+                        && tower_tuned
+                        && (taxi_guide.is_none() || snap.groundspeed_kts < 3.0);
                     // The wake watch needs the TCAS picture while the pilot
                     // is on the tower frequency on the ground — a heavy
                     // rotating ahead of you starts a clock whether or not
