@@ -10,6 +10,12 @@
 //! Release: "stop holding speed" / "my throttle" (`off`), and it stands down
 //! by itself the moment a recovery or autoland takes the aircraft, or on the
 //! ground below taxi speed.
+//!
+//! Taxiing, the pilot's BRAKES are a pause, not a release: both pedals down
+//! brings the throttle to idle and the governor sits on its hands; pedals
+//! fully off rolls back up to the held target ("resume when I release the
+//! brakes", 2026-07-13). The full stops stay explicit — parking brake or a
+//! throttle push releases the hold entirely.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -40,6 +46,11 @@ const MS_TO_KTS: f64 = 1.943_844;
 /// clear pedal rest/noise, well below a firm press. When we read this the
 /// governor isn't braking (override off), so the ratio IS the pilot's pedal.
 const PILOT_BRAKE_YIELD: f64 = 0.1;
+/// Both pedals back below this = fully released, the brake-pause is over and
+/// the taxi hold rolls again. Lower than the yield threshold on purpose —
+/// hysteresis, so a pedal hovering at the yield point can't flap the hold
+/// between paused and rolling.
+const PILOT_BRAKE_RESUME: f64 = 0.05;
 
 /// The pilot has taken the brakes to SLOW: they're pressing BOTH toe brakes
 /// while the governor isn't (so the ratio reflects hardware, not our own
@@ -297,13 +308,14 @@ impl Tool for HoldSpeed {
         // governor sat unpolled for 23 seconds until the next voice command.
         if !ACTIVE.swap(true, Ordering::Relaxed) {
             let base = ctx.config.xplane_base_url.clone();
+            let voice = ctx.voice.cloned();
             std::thread::spawn(move || {
                 let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build()
                 else {
                     ACTIVE.store(false, Ordering::Relaxed);
                     return;
                 };
-                rt.block_on(governor(XPlaneClient::new(base)));
+                rt.block_on(governor(XPlaneClient::new(base), voice));
             });
         }
         Ok(if taxi {
@@ -347,9 +359,12 @@ async fn glide(xp: &XPlaneClient, dataref: &str, to: f64, over_ms: u64) {
 /// Flight mode chases IAS with throttle only; taxi mode chases groundspeed with
 /// throttle and brakes on a faster cadence. Brakes are always released on the
 /// way out — never hand the pilot an aircraft with a hidden boot on the pedals.
-async fn governor(xp: XPlaneClient) {
+async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
     tracing::info!("speed governor started");
     let mut braking = false;
+    // Brake-paused: the pilot pressed both pedals mid-taxi, the throttle went
+    // to idle, and the hold is waiting for the pedals to come fully off.
+    let mut paused = false;
     // The throttle position this loop last commanded. If the lever is later
     // found far from where we put it, that's the PILOT's hand — yield
     // immediately rather than fight them for the lever (a taxi hold once
@@ -433,20 +448,57 @@ async fn governor(xp: XPlaneClient) {
                     ACTIVE.store(false, Ordering::Relaxed);
                     break;
                 }
-                // The pilot on BOTH toe brakes is taking speed control — yield,
-                // don't throttle up against the pedals. A single pedal is
-                // differential steering (turning the aircraft), which the hold
-                // must ride through, not stand down on. Read before we touch the
-                // ratios this tick: with override off (we're not braking) the
-                // ratio is the pilot's hardware.
+                // Brake-paused: idle throttle, hands off, waiting on the
+                // pedals. Fully released rolls the taxi again; a hand
+                // advancing the throttle meanwhile is the pilot taking the
+                // aircraft — release for good.
+                if paused {
+                    let lb = xp.get_float(LEFT_BRAKE).await.unwrap_or(0.0);
+                    let rb = xp.get_float(RIGHT_BRAKE).await.unwrap_or(0.0);
+                    if lb.max(rb) > PILOT_BRAKE_RESUME {
+                        if xp.get_float(THROTTLE).await.is_ok_and(|t| t > 0.15) {
+                            tracing::info!(
+                                "speed governor: throttle advanced while brake-paused, releasing"
+                            );
+                            ACTIVE.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    paused = false;
+                    last_cmd = None;
+                    tracing::info!("speed governor: brakes released, resuming taxi");
+                    if let Some(v) = &voice {
+                        v.say(
+                            crate::voice::Priority::Advisory,
+                            format!("Rolling again, {target:.0} knots."),
+                        );
+                    }
+                }
+                // The pilot on BOTH toe brakes is a PAUSE, not a hand-back:
+                // throttle to idle and wait for the pedals (it used to stand
+                // down for good, and every brake press cost a "go" to get the
+                // taxi back — resume-on-release asked for 2026-07-13). A
+                // single pedal is differential steering (turning the
+                // aircraft), which the hold must ride through. Read before we
+                // touch the ratios this tick: with override off (we're not
+                // braking) the ratio is the pilot's hardware.
                 if !braking {
                     let lb = xp.get_float(LEFT_BRAKE).await.unwrap_or(0.0);
                     let rb = xp.get_float(RIGHT_BRAKE).await.unwrap_or(0.0);
                     if pilot_took_the_brakes(lb, rb, braking) {
-                        tracing::info!(brake = lb.max(rb), "speed governor: pilot braking, standing down");
+                        tracing::info!(brake = lb.max(rb), "speed governor: pilot braking, throttle idle, paused");
                         glide(&xp, THROTTLE, 0.0, 300).await;
-                        ACTIVE.store(false, Ordering::Relaxed);
-                        break;
+                        last_cmd = Some(0.0);
+                        paused = true;
+                        if let Some(v) = &voice {
+                            v.say(
+                                crate::voice::Priority::Advisory,
+                                "Brakes yours, throttle's idle. I'll roll again when you're off them.",
+                            );
+                        }
+                        continue;
                     }
                 }
                 if let (Ok(gs_ms), Ok(thr)) =
