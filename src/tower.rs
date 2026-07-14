@@ -720,6 +720,15 @@ impl Tower {
         });
     }
 
+    /// The MONITOR ordered a go-around (traffic on the runway): the landing
+    /// clearance is void and the flight is back in the pattern, exactly as
+    /// if the pilot had called the go-around on the reply path. Any owed
+    /// readback dies with the clearance it echoed.
+    pub fn apply_go_around(&mut self) {
+        self.state = State::Inbound;
+        self.pending = None;
+    }
+
     fn arm(&mut self, awaited: Awaited, instruction: &str) {
         self.pending = Some(PendingReadback {
             awaited,
@@ -1786,6 +1795,21 @@ mod tests {
         // A go-around clears the debt along with the clearance.
         twr.handle(Intent::GoAround, &c);
         assert!(twr.pending().is_none());
+    }
+
+    #[test]
+    fn a_monitor_go_around_voids_the_landing_clearance() {
+        // The tower cancelled the clearance itself (traffic on the runway):
+        // same outcome as the pilot calling it — Inbound, no readback owed.
+        let c = ctx();
+        let mut twr = Tower::new();
+        twr.handle(parse_intent("inbound for landing"), &c);
+        twr.handle(parse_intent("final"), &c);
+        assert_eq!(twr.state, State::ClearedToLand);
+        assert!(twr.pending().is_some());
+        twr.apply_go_around();
+        assert_eq!(twr.state, State::Inbound);
+        assert!(twr.pending().is_none(), "the dead clearance's echo is not owed");
     }
 
     #[test]

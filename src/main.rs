@@ -1053,6 +1053,18 @@ async fn run_session(
             }
         }
 
+        // A go-around the monitor ordered (traffic on the runway): the
+        // landing clearance is void in the FSM too, so the coach's next
+        // line is the go-around acknowledgment, never the dead clearance's
+        // readback (seen live 2026-07-14: SAY kept "cleared to land" while
+        // the tower shouted go around, and the pilot dutifully read it back).
+        if party_line::take_pending_go_around() {
+            if let Some(st) = atc_station.as_mut() {
+                st.apply_monitor_go_around();
+                reporter.log(ui::LogKind::Info, "tower: go-around ordered, landing clearance void");
+            }
+        }
+
         // Station work consumed — an idle tick carries no utterance to route.
         let (mut command, from_text) = match input {
             None => continue,

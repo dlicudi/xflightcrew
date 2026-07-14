@@ -49,6 +49,11 @@ pub(crate) static PENDING_STATION: Mutex<Option<(String, nav::AirportInfo)>> = M
 /// loop consumes it and syncs the tower FSM to what was said on frequency.
 pub(crate) static PENDING_TAKEOFF_CLEARANCE: Mutex<bool> = Mutex::new(false);
 
+/// Set when the monitor orders a go-around (traffic on the runway); the main
+/// loop consumes it and voids the landing clearance in the tower FSM, so the
+/// coach can never keep suggesting the readback of a cancelled clearance.
+pub(crate) static PENDING_GO_AROUND: Mutex<bool> = Mutex::new(false);
+
 /// The runway the APPROACH controller cleared you toward and handed to the
 /// tower ("cleared visual/ILS approach runway X, contact Tower"). You still
 /// owe the tower a "final" report before you're cleared to LAND — an approach
@@ -99,4 +104,9 @@ pub fn take_pending_station() -> Option<(String, nav::AirportInfo)> {
 /// Consume the released-takeoff-clearance flag. Main loop only.
 pub fn take_pending_takeoff_clearance() -> bool {
     std::mem::take(&mut *lock(&PENDING_TAKEOFF_CLEARANCE))
+}
+
+/// Consume the go-around-ordered flag. Main loop only.
+pub fn take_pending_go_around() -> bool {
+    std::mem::take(&mut *lock(&PENDING_GO_AROUND))
 }

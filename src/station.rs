@@ -19,8 +19,8 @@ use crate::{atis, datarefs, nav, tower};
 // and its tests) writes them by their bare names; the crew side reads via
 // `party_line`'s accessors, never these statics.
 pub(crate) use crate::party_line::{
-    CLEARANCE, LANDING_HANDOFF, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, TAKEOFF_HOLD,
-    TAXI_ROUTE, VECTORS,
+    CLEARANCE, LANDING_HANDOFF, PENDING_GO_AROUND, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE,
+    TAKEOFF_HOLD, TAXI_ROUTE, VECTORS,
 };
 
 /// Which of the station's frequencies COM1 is tuned to.
@@ -244,6 +244,7 @@ impl Station {
         };
         *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *GO_AROUND_LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *GHOSTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -588,6 +589,19 @@ impl Station {
             c.pending_readback = self.twr.suggested_readback(&ctx.callsign);
         }
         self.arm_departure_handoff(&ctx);
+    }
+
+    /// Sync the tower FSM with the go-around order the MONITOR spoke (see
+    /// [`go_around_tick`]): the landing clearance is void and the flight is
+    /// back in the pattern, exactly as if the pilot had called it. The
+    /// coach's next line becomes the acknowledgment the order deserves,
+    /// never the readback of the clearance that just died.
+    pub fn apply_monitor_go_around(&mut self) {
+        self.twr.apply_go_around();
+        if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            c.state = tower::State::Inbound;
+            c.pending_readback = Some(format!("Going around, {}.", c.callsign));
+        }
     }
 
     fn respond_inner(
@@ -2919,6 +2933,11 @@ pub fn go_around_tick(
         return None;
     }
     *last = Some(now);
+    // The order voids the clearance in the FSM too, or the coach keeps
+    // suggesting "cleared to land ..." as the readback owed while the tower
+    // is shouting go around (seen live, 2026-07-14). The sync is handed to
+    // the main loop, which owns the `Station`, same as the hold release.
+    *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = true;
     Some(if tuned {
         ComplianceCall {
             line: format!(
@@ -4451,6 +4470,7 @@ mod tests {
             lon_b: -5.3366,
         }];
         *GO_AROUND_LAST.lock().unwrap() = None;
+        *PENDING_GO_AROUND.lock().unwrap() = false;
         *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
             state: tower::State::ClearedToLand,
             callsign: "November one seven two Sierra Papa".into(),
@@ -4471,13 +4491,19 @@ mod tests {
             .expect("go-around order");
         assert!(!call.crew);
         assert!(call.line.contains("go around, traffic on the runway"), "{}", call.line);
+        // The order hands the FSM sync to the main loop, like the hold release.
+        assert!(*PENDING_GO_AROUND.lock().unwrap(), "order must arm the FSM sync");
+        *PENDING_GO_AROUND.lock().unwrap() = false;
         // Cooldown: not machine-gunned.
         assert!(go_around_tick(std::slice::from_ref(&ghost_on_runway), 350.0, false, true, t0).is_none());
-        // Not tuned: the CREW calls it.
+        assert!(!*PENDING_GO_AROUND.lock().unwrap(), "a swallowed repeat must not re-arm");
+        // Not tuned: the CREW calls it — and the tower's cancel is just as real.
         *GO_AROUND_LAST.lock().unwrap() = None;
         let call = go_around_tick(std::slice::from_ref(&ghost_on_runway), 400.0, false, false, t0)
             .expect("crew go-around");
         assert!(call.crew);
+        assert!(*PENDING_GO_AROUND.lock().unwrap(), "crew-voiced order still voids the clearance");
+        *PENDING_GO_AROUND.lock().unwrap() = false;
         // No landing clearance in effect: not the tower's call to cancel.
         *GO_AROUND_LAST.lock().unwrap() = None;
         CLEARANCE.lock().unwrap().as_mut().unwrap().state = tower::State::Inbound;
@@ -4511,6 +4537,48 @@ mod tests {
         *CLEARANCE.lock().unwrap() = None;
         *GO_AROUND_LAST.lock().unwrap() = None;
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+    }
+
+    #[test]
+    fn a_monitor_go_around_voids_the_clearance_and_flips_the_coach() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_PANEL.lock().unwrap() =
+            Some(("Gibraltar".into(), 11.0, vec![("tower".to_string(), 131200_i64)]));
+        *ATIS.lock().unwrap() = None;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *VECTORS.lock().unwrap() = None;
+        *LANDING_HANDOFF.lock().unwrap() = None;
+        let cs = "November one seven two Sierra Papa";
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::ClearedToLand,
+            callsign: cs.into(),
+            runway_ident: "27".into(),
+            pending_readback: Some(format!("Cleared to land runway two seven, {cs}.")),
+        });
+        let mut st = lxgb();
+        st.twr.state = tower::State::ClearedToLand;
+        // Before the sync: the coach suggests the landing readback — the
+        // exact contradiction from the 2026-07-14 tape.
+        let s = suggest_call(cs, false, Some(1.0), None).unwrap();
+        assert!(s.call.as_deref().unwrap().contains("Cleared to land"), "{:?}", s.call);
+
+        st.apply_monitor_go_around();
+
+        assert_eq!(st.twr.state, tower::State::Inbound, "clearance void in the FSM");
+        assert!(st.twr.pending().is_none(), "the owed readback dies with it");
+        assert_eq!(
+            CLEARANCE.lock().unwrap().as_ref().unwrap().state,
+            tower::State::Inbound
+        );
+        // The coach's next line is the acknowledgment, urgent, and it parses.
+        let s = suggest_call(cs, false, Some(1.0), None).unwrap();
+        let call = s.call.expect("a call");
+        assert!(call.contains("Going around"), "{call}");
+        assert!(s.urgent, "the go-around ack is the say-now line");
+        assert_eq!(tower::parse_intent(&call), tower::Intent::GoAround);
+
+        *CLEARANCE.lock().unwrap() = None;
+        *ACTIVE_PANEL.lock().unwrap() = None;
     }
 
     #[test]
