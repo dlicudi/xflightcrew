@@ -11,8 +11,9 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::speaker::StationSpeaker;
-use crate::xplane::XPlaneClient;
-use crate::{atis, datarefs, nav, tower};
+use sim::xplane::XPlaneClient;
+use crate::{atis, nav, tower};
+use sim::datarefs;
 
 // The state this module publishes for the crew lives on the party line —
 // one audited page. `pub(crate)` re-export so the world side (this module
@@ -294,7 +295,7 @@ impl Station {
         if intent == tower::Intent::Unknown {
             // Radio-shaped words that didn't parse — exactly the utterances
             // corpus mining wants to see after a flight.
-            crate::blackbox::record(
+            sim::blackbox::record(
                 "atc",
                 serde_json::json!({
                     "route": "unkeyed", "outcome": "fallthrough",
@@ -304,7 +305,7 @@ impl Station {
             return None;
         }
         let Some(service) = self.tuned_service(xp).await else {
-            crate::blackbox::record(
+            sim::blackbox::record(
                 "atc",
                 serde_json::json!({
                     "route": "unkeyed", "outcome": "off_frequency",
@@ -316,7 +317,7 @@ impl Station {
         let (ctx, wx) = self.build_ctx(xp).await;
         let before = self.twr.state;
         let reply = self.route_unkeyed(transcript, service, &ctx, wx)?;
-        crate::blackbox::record(
+        sim::blackbox::record(
             "atc",
             serde_json::json!({
                 "route": "unkeyed", "outcome": "reply", "service": service.name(),
@@ -374,7 +375,7 @@ impl Station {
         xp: &XPlaneClient,
     ) -> Option<(String, StationSpeaker)> {
         let Some(service) = self.tuned_service(xp).await else {
-            crate::blackbox::record(
+            sim::blackbox::record(
                 "atc",
                 serde_json::json!({
                     "route": "keyed", "outcome": "void", "transcript": transcript,
@@ -385,7 +386,7 @@ impl Station {
         let (ctx, wx) = self.build_ctx(xp).await;
         let before = self.twr.state;
         let reply = self.route_keyed(transcript, service, &ctx, wx);
-        crate::blackbox::record(
+        sim::blackbox::record(
             "atc",
             serde_json::json!({
                 "route": "keyed",
@@ -2125,7 +2126,7 @@ pub fn active_station_in_range(lat: f64, lon: f64, alt_msl_ft: f64) -> Option<(S
 }
 
 /// Range to the ACTIVE station's field, for the radio's signal-quality model
-/// ([`crate::radiofx::signal_quality`]) — published to the speech arbiter by
+/// (`radiofx::signal_quality` in the crew crate) — published to the speech arbiter by
 /// the monitor each tick. `None` = no active station installed; ground
 /// distance, not slant (the altitude term is noise at the ranges where
 /// quality changes).
@@ -6192,7 +6193,7 @@ mod tests {
     /// departure happy path — the shakeout for apt.dat shapes LXGB never
     /// showed us. Opt-in because the file ships with X-Plane, not the repo:
     ///
-    ///   cargo test --release --bin x-copilot -- --ignored atc_world_sweep
+    ///   cargo test --release -p atc -- --ignored atc_world_sweep
     ///
     /// Override the file with XCOPILOT_APT_DAT.
     #[test]

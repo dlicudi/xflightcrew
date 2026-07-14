@@ -22,13 +22,11 @@ mod livestate;
 mod llm;
 mod mic;
 mod monitor;
-mod party_line;
 mod phrase;
 mod plugin_status;
 mod prefs;
 mod readback;
 mod simbrief;
-mod station;
 mod stt;
 mod stt_eval;
 mod taxi_guide;
@@ -43,7 +41,7 @@ mod voice;
 // The world side (ATC) and the simulator plumbing now live in their own
 // crates; these shims keep every existing `crate::station::...` /
 // `crate::xplane::...` path in the module tree resolving unchanged.
-pub(crate) use ::atc::{atis, nav, speaker, tower};
+pub(crate) use ::atc::{atis, nav, party_line, speaker, station, tower};
 pub(crate) use sim::{blackbox, datarefs, xplane};
 
 use std::time::{Duration, Instant};
