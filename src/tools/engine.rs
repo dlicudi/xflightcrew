@@ -235,8 +235,10 @@ impl Tool for SetMixture {
             return Ok("Negative, I won't cut the mixture in flight.".to_string());
         }
         // An explicit percentage is the pilot taking the lever — the continuous
-        // manager stands down rather than re-trimming over their setting.
+        // manager stands down rather than re-trimming over their setting, and
+        // a lean seek mid-hunt lets go the same way.
         MIX_MANAGED.store(false, std::sync::atomic::Ordering::Relaxed);
+        LEAN_SEEKING.store(false, std::sync::atomic::Ordering::Relaxed);
         let ratio = (p.percent / 100.0).clamp(0.0, 1.0);
         // Ease the mixture lever to the target instead of snapping it.
         ramp_actuator(ctx, MIXTURE, ratio).await?;
@@ -256,7 +258,14 @@ impl Tool for SetMixture {
 /// steps back through the bracket to pin it. Small quick motions with just
 /// enough settle for the gauge to respond: ~8–14 s instead of the old rich-
 /// reset sweep's 25–30.
-async fn seek_metric_peak(ctx: &ToolCtx<'_>, metric: &str, drop_margin: f64) -> Result<(f64, f64)> {
+/// Returns `Ok(None)` when the seek was released mid-hunt — the pilot took
+/// the mixture back, or a recovery/autoland owns the levers now. Whoever
+/// released it already spoke; the seek just stops moving the lever.
+async fn seek_metric_peak(
+    ctx: &ToolCtx<'_>,
+    metric: &str,
+    drop_margin: f64,
+) -> Result<Option<(f64, f64)>> {
     const COARSE: f64 = 0.05;
     const FINE: f64 = 0.015;
     const COARSE_SETTLE_MS: u64 = 450;
@@ -274,6 +283,9 @@ async fn seek_metric_peak(ctx: &ToolCtx<'_>, metric: &str, drop_margin: f64) -> 
     let mut flipped = false;
     let mut first = true;
     loop {
+        if lean_seek_cancelled() {
+            return Ok(None);
+        }
         let next = (mix + dir * COARSE).clamp(MIX_LEAN_FLOOR, 1.0);
         if (next - mix).abs() < 1e-6 {
             break; // pinned at a stop
@@ -300,6 +312,9 @@ async fn seek_metric_peak(ctx: &ToolCtx<'_>, metric: &str, drop_margin: f64) -> 
     ramp_actuator(ctx, MIXTURE, fine).await?;
     tokio::time::sleep(std::time::Duration::from_millis(FINE_SETTLE_MS)).await;
     while fine > floor {
+        if lean_seek_cancelled() {
+            return Ok(None);
+        }
         fine = (fine - FINE).max(floor);
         ramp_actuator(ctx, MIXTURE, fine).await?;
         tokio::time::sleep(std::time::Duration::from_millis(FINE_SETTLE_MS)).await;
@@ -311,7 +326,7 @@ async fn seek_metric_peak(ctx: &ToolCtx<'_>, metric: &str, drop_margin: f64) -> 
             break;
         }
     }
-    Ok((best_mix, best_val))
+    Ok(Some((best_mix, best_val)))
 }
 
 /// True while the continuous mixture manager runs — armed by `lean_mixture`,
@@ -319,12 +334,28 @@ async fn seek_metric_peak(ctx: &ToolCtx<'_>, metric: &str, drop_margin: f64) -> 
 /// touching the lever. Mirrors `speedhold::ACTIVE`.
 pub static MIX_MANAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// One-line status for the dashboard's "managing" panel, when the continuous
-/// mixture manager is running.
+/// True while a `lean_mixture` seek is hunting the peak in the background —
+/// guards re-entry, and clearing it (pilot "my mixture", an explicit
+/// `set_mixture`) stops the hunt mid-step.
+pub static LEAN_SEEKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when a background lean seek must stand down: the pilot took the
+/// mixture back, or a recovery/autoland owns the levers now.
+fn lean_seek_cancelled() -> bool {
+    use std::sync::atomic::Ordering;
+    !LEAN_SEEKING.load(Ordering::Relaxed)
+        || super::recover::ACTIVE.load(Ordering::Relaxed)
+        || crate::autoland::ACTIVE.load(Ordering::Relaxed)
+}
+
+/// One-line status for the dashboard's "managing" panel, when a lean seek is
+/// hunting or the continuous mixture manager is running.
 pub fn mixture_status() -> Option<&'static str> {
-    MIX_MANAGED
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .then_some("mixture auto-lean")
+    use std::sync::atomic::Ordering;
+    if LEAN_SEEKING.load(Ordering::Relaxed) {
+        return Some("mixture lean in progress");
+    }
+    MIX_MANAGED.load(Ordering::Relaxed).then_some("mixture auto-lean")
 }
 
 /// Should the manager re-trim? Altitude or power moved enough that the last
@@ -524,33 +555,116 @@ impl Tool for LeanMixture {
                             .to_string(),
                     );
                 }
-                // Lean to peak EGT, then enrich slightly so EGT sits just rich of
-                // peak — the safe side the POH calls for ("slightly below the peak
-                // observed EGT").
-                let (best, egt) = seek_metric_peak(ctx, EGT_CEL, 12.0).await?;
-                if best > 0.92 {
-                    // Never saw EGT climb — low power, or the engine isn't loaded
-                    // enough to lean. Leave it rich rather than report a bogus value.
-                    ramp_actuator(ctx, MIXTURE, 1.0).await?;
-                    return Ok("Couldn't find a clear EGT peak, leaving the mixture rich. Try leaning at cruise power.".to_string());
+                if LEAN_SEEKING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    return Ok("Already working the mixture, stand by.".to_string());
                 }
-                ramp_actuator(ctx, MIXTURE, (best + 0.03).min(1.0)).await?;
-                let pct = ctx.xplane.get_float(MIXTURE).await? * 100.0;
+                spawn_lean_seek(ctx, true);
+                Ok("Roger, leaning to peak EGT. Give me ten seconds or so.".to_string())
+            }
+            _ => {
+                // power: lean for max RPM (the high-DA takeoff / climb procedure).
+                if LEAN_SEEKING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    return Ok("Already working the mixture, stand by.".to_string());
+                }
+                spawn_lean_seek(ctx, false);
+                Ok("Roger, leaning for max power. Stand by.".to_string())
+            }
+        }
+    }
+}
+
+/// The slow half of `lean_mixture`, run OFF the voice loop. The ack goes out
+/// the moment the command lands and the RESULT is read back once it's
+/// measured — the old inline seek was silent for its whole 10-15 seconds
+/// ("did it register at all?", 2026-07-14) and, worse, blocked the voice
+/// loop, so the copilot was deaf the whole time too. Own thread + runtime
+/// like every background loop here (the main runtime blocks on the mic).
+fn spawn_lean_seek(ctx: &ToolCtx<'_>, economy: bool) {
+    use std::sync::atomic::Ordering;
+    let config = ctx.config.clone();
+    let voice = ctx.voice.cloned();
+    let status = ctx.status.cloned();
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            LEAN_SEEKING.store(false, Ordering::Relaxed);
+            return;
+        };
+        rt.block_on(async move {
+            let xp = crate::xplane::XPlaneClient::new(config.xplane_base_url.clone());
+            let ctx = ToolCtx {
+                xplane: &xp,
+                config: &config,
+                voice: voice.as_ref(),
+                status: status.as_ref(),
+                reminders: None,
+            };
+            let line = lean_seek(&ctx, economy).await;
+            LEAN_SEEKING.store(false, Ordering::Relaxed);
+            // Released mid-hunt (None): whoever took the mixture back already
+            // spoke, the seek just stops moving the lever.
+            if let Some(line) = line {
+                if let Some(s) = &status {
+                    s.alert(crate::plugin_status::AlertLevel::Advisory, &line);
+                }
+                if let Some(v) = &voice {
+                    v.alert(crate::voice::Priority::Advisory, line);
+                }
+            }
+        });
+    });
+}
+
+/// The seek itself: hunt the peak, set the lever, and return the line to read
+/// back — or `None` when the seek was released mid-hunt. Failures speak too:
+/// a silent brake error hid a broken override for days, and a silent lean
+/// would strand the lever wherever the hunt died.
+async fn lean_seek(ctx: &ToolCtx<'_>, economy: bool) -> Option<String> {
+    if economy {
+        // Lean to peak EGT, then enrich slightly so EGT sits just rich of
+        // peak — the safe side the POH calls for ("slightly below the peak
+        // observed EGT").
+        match seek_metric_peak(ctx, EGT_CEL, 12.0).await {
+            Ok(None) => None,
+            Ok(Some((best, _))) if best > 0.92 => {
+                // Never saw EGT climb — low power, or the engine isn't loaded
+                // enough to lean. Leave it rich rather than report a bogus value.
+                let _ = ramp_actuator(ctx, MIXTURE, 1.0).await;
+                Some("Couldn't find a clear EGT peak, leaving the mixture rich. Try leaning at cruise power.".to_string())
+            }
+            Ok(Some((best, egt))) => {
+                if let Err(e) = ramp_actuator(ctx, MIXTURE, (best + 0.03).min(1.0)).await {
+                    tracing::warn!("lean seek: setting the peak failed: {e:#}");
+                    return Some("Couldn't finish the lean, mixture's where I left it.".to_string());
+                }
+                let pct = ctx.xplane.get_float(MIXTURE).await.unwrap_or(best + 0.03) * 100.0;
                 let gph = engine0(ctx, FUEL_FLOW_KG_S, 0.0).await * 3600.0 / AVGAS_KG_PER_GAL;
                 let egt_f = egt * 9.0 / 5.0 + 32.0; // dataref is °C
                 // From here it's continuous: the manager re-trims as altitude
                 // or power changes, until the pilot takes the lever back.
                 arm_mixture_manager(ctx.config.xplane_base_url.clone());
-                Ok(format!(
+                Some(format!(
                     "Leaned to peak EGT, mixture {pct:.0} percent, EGT {egt_f:.0} degrees, burning {gph:.1} gallons an hour. I'll keep it trimmed as we climb or descend."
                 ))
             }
-            _ => {
-                // power: lean for max RPM (the high-DA takeoff / climb procedure).
-                let (best, rpm) = seek_metric_peak(ctx, PROP_RPM, 25.0).await?;
-                ramp_actuator(ctx, MIXTURE, best).await?;
-                let pct = ctx.xplane.get_float(MIXTURE).await? * 100.0;
-                Ok(format!("Leaned for max power — {rpm:.0} RPM at mixture {pct:.0} percent."))
+            Err(e) => {
+                tracing::warn!("lean seek: EGT hunt failed: {e:#}");
+                Some("Couldn't finish the lean, mixture's where I left it.".to_string())
+            }
+        }
+    } else {
+        match seek_metric_peak(ctx, PROP_RPM, 25.0).await {
+            Ok(None) => None,
+            Ok(Some((best, rpm))) => {
+                if let Err(e) = ramp_actuator(ctx, MIXTURE, best).await {
+                    tracing::warn!("lean seek: setting max power failed: {e:#}");
+                    return Some("Couldn't finish the lean, mixture's where I left it.".to_string());
+                }
+                let pct = ctx.xplane.get_float(MIXTURE).await.unwrap_or(best) * 100.0;
+                Some(format!("Leaned for max power — {rpm:.0} RPM at mixture {pct:.0} percent."))
+            }
+            Err(e) => {
+                tracing::warn!("lean seek: RPM hunt failed: {e:#}");
+                Some("Couldn't finish the lean, mixture's where I left it.".to_string())
             }
         }
     }
@@ -1040,6 +1154,27 @@ mod tests {
         assert!(bad_percent_reply("throttle", 0.0).is_none());
         assert!(bad_percent_reply("throttle", 100.0).is_none());
         assert!(bad_percent_reply("throttle", 65.0).is_none());
+    }
+
+    #[test]
+    fn released_seek_stops_without_touching_the_lever() {
+        // "My mixture" (or an explicit set_mixture) clears LEAN_SEEKING while
+        // the background hunt runs; the hunt must stand down at the next step
+        // and leave the lever alone. LEAN_SEEKING is false here — the
+        // released state — so the seek returns None having written nothing.
+        let fake = crate::xplane::FakeXPlane::with_reads(&[(MIXTURE, 0.8)]);
+        let config = crate::config::Config::default();
+        let ctx = ToolCtx {
+            xplane: &fake,
+            config: &config,
+            voice: None,
+            status: None,
+            reminders: None,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let out = rt.block_on(seek_metric_peak(&ctx, EGT_CEL, 12.0)).unwrap();
+        assert!(out.is_none(), "released seek must not report a peak");
+        assert!(!fake.wrote(MIXTURE), "released seek must not move the lever");
     }
 
     #[test]

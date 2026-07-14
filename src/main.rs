@@ -1442,7 +1442,10 @@ async fn run_session(
             {
                 use std::sync::atomic::Ordering::Relaxed;
                 let speed_held = tools::speedhold::ACTIVE.load(Relaxed);
-                let mix_held = tools::engine::MIX_MANAGED.load(Relaxed);
+                // Holding the mixture is the continuous manager OR a lean
+                // seek still hunting the peak — "my mixture" stops either.
+                let mix_held = tools::engine::MIX_MANAGED.load(Relaxed)
+                    || tools::engine::LEAN_SEEKING.load(Relaxed);
                 let reverse_in = tools::reverse::ACTIVE.load(Relaxed);
                 if (speed_held || mix_held || reverse_in) && release_intent(&tl) {
                     let names_mix = tl.contains("mixture") || tl.contains("mix");
@@ -1463,6 +1466,7 @@ async fn run_session(
                     }
                     if mix_held && (names_mix || generic) {
                         tools::engine::MIX_MANAGED.store(false, Relaxed);
+                        tools::engine::LEAN_SEEKING.store(false, Relaxed);
                         released.push("mixture's yours");
                     }
                     // Reverse rides the same levers as the speed hold — any
