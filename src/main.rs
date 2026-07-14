@@ -36,6 +36,7 @@ mod plugin_status;
 mod prefs;
 mod readback;
 mod simbrief;
+mod speaker;
 mod station;
 mod stt;
 mod stt_eval;
@@ -382,7 +383,7 @@ async fn main() -> Result<()> {
                                 .filter(|s| !s.is_empty())
                                 .unwrap_or_else(|| "your callsign".to_string());
                             let dist = station::active_field()
-                                .map(|(_, flat, flon, _)| haversine_nm(lat, lon, flat, flon));
+                                .map(|(_, flat, flon, _)| nav::haversine_nm(lat, lon, flat, flon));
                             match station::suggest_call(&callsign, on_ground, dist, com1) {
                                 Some(s) => {
                                     let text = [s.first.as_deref(), s.call.as_deref()]
@@ -1701,7 +1702,7 @@ async fn run_session(
                         .unwrap_or_else(|| "your callsign".to_string());
                     let dist = match (position(&xplane).await, station::active_field()) {
                         (Some((lat, lon, _)), Some((_, flat, flon, _))) => {
-                            Some(haversine_nm(lat, lon, flat, flon))
+                            Some(nav::haversine_nm(lat, lon, flat, flon))
                         }
                         _ => None,
                     };
@@ -3270,7 +3271,7 @@ async fn time_to_tod(
         (Ok(a), Ok(b)) => (a, b),
         _ => return "I can't read our position right now.".to_string(),
     };
-    let to_tod = haversine_nm(lat, lon, dest.lat, dest.lon) - ring_nm;
+    let to_tod = nav::haversine_nm(lat, lon, dest.lat, dest.lon) - ring_nm;
     tod_phrase(to_tod, xp).await
 }
 
@@ -3290,16 +3291,6 @@ async fn tod_phrase(dist_nm: f64, xp: &XPlaneClient) -> String {
         format!("{mins} minutes")
     };
     format!("About {time} to top of descent, {dist_nm:.0} miles ahead.")
-}
-
-/// Great-circle distance in nautical miles between two lat/lon points (haversine).
-pub(crate) fn haversine_nm(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const EARTH_RADIUS_NM: f64 = 3440.065;
-    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
-    let dlat = (lat2 - lat1).to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-    let a = (dlat / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlon / 2.0).sin().powi(2);
-    2.0 * EARTH_RADIUS_NM * a.sqrt().asin()
 }
 
 /// Estimated time to the destination ("time before we land", "when do we get in"):
@@ -3329,7 +3320,7 @@ async fn eta_to_destination(
         (Ok(a), Ok(b), Ok(c)) => (a, b, c),
         _ => return "I can't read our position right now.".to_string(),
     };
-    let dist = haversine_nm(lat, lon, dest.lat, dest.lon);
+    let dist = nav::haversine_nm(lat, lon, dest.lat, dest.lon);
     let gs_kts = gs_ms * MS_TO_KTS;
     if gs_kts < 30.0 {
         return format!(
@@ -4136,7 +4127,7 @@ async fn fuel_report(
             );
             let gs = gs_ms * MS_TO_KTS;
             if gs > 40.0 {
-                let dist = haversine_nm(lat, lon, d.lat, d.lon);
+                let dist = nav::haversine_nm(lat, lon, d.lat, d.lon);
                 let at_dest_kg = total_kg - live_burn_kg_hr * (dist / gs);
                 let mins_left = (at_dest_kg.max(0.0) / live_burn_kg_hr) * 60.0;
                 let reserve =

@@ -10,7 +10,7 @@
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::voice::StationSpeaker;
+use crate::speaker::StationSpeaker;
 use crate::xplane::XPlaneClient;
 use crate::{atis, datarefs, nav, tower};
 
@@ -1330,7 +1330,7 @@ pub fn compliance_tick(
         let (_, la, lo) = f.as_ref()?;
         (*la, *lo)
     };
-    let dist_nm = crate::haversine_nm(lat, lon, field_lat, field_lon);
+    let dist_nm = crate::nav::haversine_nm(lat, lon, field_lat, field_lon);
     let clr: Option<(tower::State, String)> = CLEARANCE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1688,7 +1688,7 @@ pub fn atis_retune(com1_khz: i64, lat: f64, lon: f64, alt_msl_ft: f64) {
         a.apt
             .freq(nav::FREQ_ATIS)
             .is_some_and(|f| (f.khz - com1_khz).abs() <= 5)
-            && crate::haversine_nm(lat, lon, a.lat, a.lon)
+            && crate::nav::haversine_nm(lat, lon, a.lat, a.lon)
                 <= vhf_range_nm(alt_msl_ft - a.apt.elev_ft)
     });
     if let Some(a) = hit {
@@ -1905,7 +1905,7 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     let (d_best, s_best, best) = region
         .iter()
         .map(|a| {
-            let d = crate::haversine_nm(lat, lon, a.lat, a.lon);
+            let d = crate::nav::haversine_nm(lat, lon, a.lat, a.lon);
             (d, score(d, &a.apt), a)
         })
         .min_by(|x, y| x.1.total_cmp(&y.1))?;
@@ -1922,8 +1922,8 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     let s_active = region
         .iter()
         .find(|a| a.apt.name == active_name)
-        .map(|a| score(crate::haversine_nm(lat, lon, a.lat, a.lon), &a.apt))
-        .unwrap_or_else(|| crate::haversine_nm(lat, lon, a_lat, a_lon));
+        .map(|a| score(crate::nav::haversine_nm(lat, lon, a.lat, a.lon), &a.apt))
+        .unwrap_or_else(|| crate::nav::haversine_nm(lat, lon, a_lat, a_lon));
     if s_best + SWITCH_MARGIN_NM > s_active {
         return None;
     }
@@ -2030,7 +2030,7 @@ pub fn fields_in_range(lat: f64, lon: f64, alt_msl_ft: f64, limit: usize) -> Vec
     let mut v: Vec<RangedField> = region
         .iter()
         .filter_map(|a| {
-            let d = crate::haversine_nm(lat, lon, a.lat, a.lon);
+            let d = crate::nav::haversine_nm(lat, lon, a.lat, a.lon);
             (d <= vhf_range_nm(alt_msl_ft - a.apt.elev_ft)).then(|| RangedField {
                 name: a.apt.name.clone(),
                 dist_nm: d,
@@ -2049,7 +2049,7 @@ pub fn fields_in_range(lat: f64, lon: f64, alt_msl_ft: f64, limit: usize) -> Vec
                 .unwrap_or_default();
             v.push(RangedField {
                 name,
-                dist_nm: crate::haversine_nm(lat, lon, alat, alon),
+                dist_nm: crate::nav::haversine_nm(lat, lon, alat, alon),
                 active: true,
                 services: svcs,
             });
@@ -2091,7 +2091,7 @@ pub fn arm_station_for_freq(com1_khz: i64, lat: f64, lon: f64, alt_msl_ft: f64, 
                 .iter()
                 .any(|(word, khz)| word != "unicom" && (khz - com1_khz).abs() <= 5)
         })
-        .map(|a| (crate::haversine_nm(lat, lon, a.lat, a.lon), a))
+        .map(|a| (crate::nav::haversine_nm(lat, lon, a.lat, a.lon), a))
         .filter(|(d, a)| *d <= vhf_range_nm(alt_msl_ft - a.apt.elev_ft))
         .min_by(|x, y| x.0.total_cmp(&y.0));
     if let Some((d, a)) = hit {
@@ -2120,7 +2120,7 @@ pub fn active_station_in_range(lat: f64, lon: f64, alt_msl_ft: f64) -> Option<(S
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()?;
-    let d = crate::haversine_nm(lat, lon, alat, alon);
+    let d = crate::nav::haversine_nm(lat, lon, alat, alon);
     (d <= vhf_range_nm(alt_msl_ft - elev_ft)).then_some((name, svcs))
 }
 
@@ -2134,7 +2134,7 @@ pub fn active_station_range_nm(lat: f64, lon: f64) -> Option<f64> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()?;
-    Some(crate::haversine_nm(lat, lon, alat, alon))
+    Some(crate::nav::haversine_nm(lat, lon, alat, alon))
 }
 
 /// The active field's runway geometry, published by [`Station::install`] for
@@ -2499,10 +2499,10 @@ fn departure_runway_ident(lat: f64, lon: f64, prev_lat: f64, prev_lon: f64) -> O
     let track = dx.atan2(dy).to_degrees().rem_euclid(360.0);
     let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
     let r = runways.iter().min_by(|a, b| {
-        let da = crate::haversine_nm(lat, lon, a.lat_a, a.lon_a)
-            .min(crate::haversine_nm(lat, lon, a.lat_b, a.lon_b));
-        let db = crate::haversine_nm(lat, lon, b.lat_a, b.lon_a)
-            .min(crate::haversine_nm(lat, lon, b.lat_b, b.lon_b));
+        let da = crate::nav::haversine_nm(lat, lon, a.lat_a, a.lon_a)
+            .min(crate::nav::haversine_nm(lat, lon, a.lat_b, a.lon_b));
+        let db = crate::nav::haversine_nm(lat, lon, b.lat_a, b.lon_a)
+            .min(crate::nav::haversine_nm(lat, lon, b.lat_b, b.lon_b));
         da.total_cmp(&db)
     })?;
     let da = angle_diff_deg(track, r.heading_a_deg()).abs();
@@ -2522,7 +2522,7 @@ fn nearest_runway_ident(lat: f64, lon: f64) -> Option<String> {
                 (r.ident_b.clone(), r.lat_b, r.lon_b),
             ]
         })
-        .map(|(id, la, lo)| (crate::haversine_nm(lat, lon, la, lo), id))
+        .map(|(id, la, lo)| (crate::nav::haversine_nm(lat, lon, la, lo), id))
         .min_by(|x, y| x.0.total_cmp(&y.0))
         .map(|(_, id)| id)
 }
@@ -2802,7 +2802,7 @@ pub fn chatter_tick(
     mem.retain(|_, m| now.duration_since(m.last_seen).as_secs() < 180);
     let mut exchange = None;
     for t in targets {
-        let dist = crate::haversine_nm(t.lat, t.lon, field_lat, field_lon);
+        let dist = crate::nav::haversine_nm(t.lat, t.lon, field_lat, field_lon);
         if dist > 8.0 {
             continue; // beyond this tower's world
         }
@@ -2862,7 +2862,7 @@ pub fn chatter_tick(
                                 ),
                             },
                         ],
-                        ghost_seed: crate::voice::station_voice_seed(&t.callsign),
+                        ghost_seed: crate::speaker::station_voice_seed(&t.callsign),
                     });
                 }
                 m.last_seen = now;
@@ -2899,7 +2899,7 @@ pub fn chatter_tick(
             };
             exchange = Some(PartyExchange {
                 lines,
-                ghost_seed: crate::voice::station_voice_seed(&t.callsign),
+                ghost_seed: crate::speaker::station_voice_seed(&t.callsign),
             });
         }
         if exchange.is_none() && was_ground && !t.on_ground && !m.announced_takeoff && dist < 3.0
@@ -2924,7 +2924,7 @@ pub fn chatter_tick(
                     PartyLine { ghost: false, text: clearance },
                     PartyLine { ghost: true, text: format!("Cleared for takeoff, {cs}.") },
                 ],
-                ghost_seed: crate::voice::station_voice_seed(&t.callsign),
+                ghost_seed: crate::speaker::station_voice_seed(&t.callsign),
             });
         }
         m.last_seen = now;
@@ -3123,7 +3123,7 @@ pub fn wake_note_targets(targets: &[TcasTarget], now: Instant) {
     let mem = guard.get_or_insert_with(std::collections::HashMap::new);
     mem.retain(|_, (_, seen)| now.duration_since(*seen).as_secs() < 300);
     for t in targets {
-        if crate::haversine_nm(t.lat, t.lon, flat, flon) > 3.0 {
+        if crate::nav::haversine_nm(t.lat, t.lon, flat, flon) > 3.0 {
             continue;
         }
         let e = mem.entry(t.callsign.clone()).or_insert((t.on_ground, now));
@@ -3278,7 +3278,7 @@ fn backfill_unnamed_crossings(plan: &mut nav::TaxiRoutePlan, runways: &[nav::Run
         // Sample the leg every ~20 m (its midpoint alone can miss a strip
         // the leg only clips): first sampled point on a runway names it.
         let (a, b) = (plan.path[i], plan.path[i + 1]);
-        let len_m = crate::haversine_nm(a.0, a.1, b.0, b.1) * 1852.0;
+        let len_m = crate::nav::haversine_nm(a.0, a.1, b.0, b.1) * 1852.0;
         let steps = ((len_m / 20.0).ceil() as usize).max(1);
         let hit = (0..=steps).find_map(|k| {
             let t = k as f64 / steps as f64;
@@ -3573,8 +3573,8 @@ pub fn vector_tick(
         return None;
     }
 
-    let dist_thr = crate::haversine_nm(lat, lon, plan.thr_lat, plan.thr_lon);
-    let brg_thr = crate::autoland::bearing_deg(lat, lon, plan.thr_lat, plan.thr_lon);
+    let dist_thr = crate::nav::haversine_nm(lat, lon, plan.thr_lat, plan.thr_lon);
+    let brg_thr = crate::nav::bearing_deg(lat, lon, plan.thr_lat, plan.thr_lon);
     // Established: on the approach side, on the extended centerline, inside the
     // join distance, AND actually flying the final course — the position wedge
     // alone would clear an aircraft crossing final at ninety degrees. A failed
@@ -3680,13 +3680,13 @@ pub fn vector_tick(
         // capture band at the bottom, and the re-vector back to a join now
         // BEHIND the aircraft is the other half of the Jerez orbit.
         let recip = (plan.course_deg + 180.0).rem_euclid(360.0);
-        let (join_lat, join_lon) = crate::autoland::project_latlon(
+        let (join_lat, join_lon) = crate::nav::project_latlon(
             plan.thr_lat,
             plan.thr_lon,
             recip,
             plan.join_nm + 2.0,
         );
-        crate::autoland::bearing_deg(lat, lon, join_lat, join_lon)
+        crate::nav::bearing_deg(lat, lon, join_lat, join_lon)
     };
     let heading10 = {
         let h = ((desired / 10.0).round() as i64 * 10).rem_euclid(360);
@@ -4625,7 +4625,7 @@ mod tests {
         assert!(ex.lines[1].text.contains("runway zero niner, cleared to land"), "{}", ex.lines[1].text);
         assert!(ex.lines[2].ghost);
         assert!(ex.lines[2].text.starts_with("Cleared to land"), "{}", ex.lines[2].text);
-        assert_eq!(ex.ghost_seed, crate::voice::station_voice_seed("IBE3421"));
+        assert_eq!(ex.ghost_seed, crate::speaker::station_voice_seed("IBE3421"));
         // Once per ghost — the rest of the approach stays quiet.
         assert!(chatter_tick(&[approach(500.0, 0.02)], "Gibraltar", flat, flon, felev, None, t0 + sec(10)).is_none());
 
@@ -6506,7 +6506,7 @@ mod tests {
         // Regression: crossing final perpendicular inside the wedge must NOT
         // be "established" — position said cleared, the track says crossing.
         let t0 = std::time::Instant::now();
-        let (x_lat, x_lon) = crate::autoland::project_latlon(thr_lat, thr_lon, course + 180.0, 4.0);
+        let (x_lat, x_lon) = crate::nav::project_latlon(thr_lat, thr_lon, course + 180.0, 4.0);
         let crossing = vector_tick(x_lat, x_lon, 1600.0, Some(0.0), false, t0);
         if let Some(msg) = &crossing {
             assert!(!msg.contains("Cleared"), "cleared while crossing final: {msg}");
@@ -6517,7 +6517,7 @@ mod tests {
         // the assigned altitude — a pilot doing exactly as told, nothing more.
         VECTORS.lock().unwrap().as_mut().unwrap().last_tx = None;
         VECTORS.lock().unwrap().as_mut().unwrap().last_heading = None;
-        let (mut lat, mut lon) = crate::autoland::project_latlon(thr_lat, thr_lon, 0.0, 10.0);
+        let (mut lat, mut lon) = crate::nav::project_latlon(thr_lat, thr_lon, 0.0, 10.0);
         let mut alt = 3000.0_f64;
         let mut hdg = 180.0_f64;
         let mut first: Option<String> = None;
@@ -6534,7 +6534,7 @@ mod tests {
             if let Some(h) = VECTORS.lock().unwrap().as_ref().and_then(|p| p.last_heading) {
                 hdg = h as f64; // instant turn: worst case for the capture curve
             }
-            let (nlat, nlon) = crate::autoland::project_latlon(lat, lon, hdg, 100.0 * 10.0 / 3600.0);
+            let (nlat, nlon) = crate::nav::project_latlon(lat, lon, hdg, 100.0 * 10.0 / 3600.0);
             (lat, lon) = (nlat, nlon);
             alt = (alt - 80.0).max(target_alt_ft);
         }
@@ -6621,7 +6621,7 @@ mod tests {
             last_tx: None,
             last_heading: None,
         });
-        let (mut lat, mut lon) = crate::autoland::project_latlon(thr_lat, thr_lon, 0.0, 10.0);
+        let (mut lat, mut lon) = crate::nav::project_latlon(thr_lat, thr_lon, 0.0, 10.0);
         let mut alt = 3000.0_f64;
         let mut hdg = 180.0_f64;
         let mut cleared_ils: Option<String> = None;
@@ -6655,7 +6655,7 @@ mod tests {
                 hdg = h as f64;
             }
             let (nlat, nlon) =
-                crate::autoland::project_latlon(lat, lon, hdg, 100.0 * 10.0 / 3600.0);
+                crate::nav::project_latlon(lat, lon, hdg, 100.0 * 10.0 / 3600.0);
             (lat, lon) = (nlat, nlon);
             alt = (alt - 80.0).max(target_alt_ft);
         }
@@ -6692,8 +6692,8 @@ mod tests {
         });
         let recip = (course + 180.0).rem_euclid(360.0);
         let (mut lat, mut lon) = {
-            let (a, b) = crate::autoland::project_latlon(thr_lat, thr_lon, recip, 4.0);
-            crate::autoland::project_latlon(a, b, (recip + 90.0).rem_euclid(360.0), 1.0)
+            let (a, b) = crate::nav::project_latlon(thr_lat, thr_lon, recip, 4.0);
+            crate::nav::project_latlon(a, b, (recip + 90.0).rem_euclid(360.0), 1.0)
         };
         let mut hdg = course;
         let mut alt = target_alt_ft;
@@ -6718,7 +6718,7 @@ mod tests {
                 hdg = h as f64;
             }
             let (nlat, nlon) =
-                crate::autoland::project_latlon(lat, lon, hdg, 100.0 * 10.0 / 3600.0);
+                crate::nav::project_latlon(lat, lon, hdg, 100.0 * 10.0 / 3600.0);
             (lat, lon) = (nlat, nlon);
             alt = (alt - 80.0).max(target_alt_ft);
         }
@@ -6750,7 +6750,7 @@ mod tests {
         };
         arm_short_final();
         let (sf_lat, sf_lon) =
-            crate::autoland::project_latlon(thr_lat, thr_lon, recip + 3.0, 0.86);
+            crate::nav::project_latlon(thr_lat, thr_lon, recip + 3.0, 0.86);
         let short_final =
             vector_tick(sf_lat, sf_lon, target_alt_ft - 950.0, Some(course + 12.0), false, t0)
                 .expect("short final earns the clearance, not a vector away");
@@ -6766,7 +6766,7 @@ mod tests {
         // flyover at altitude — gets silence, never a reversal heading, and
         // the plan survives for when the geometry recovers.
         arm_short_final();
-        let (x_lat, x_lon) = crate::autoland::project_latlon(thr_lat, thr_lon, recip, 0.5);
+        let (x_lat, x_lon) = crate::nav::project_latlon(thr_lat, thr_lon, recip, 0.5);
         let crossing_track = (course + 90.0).rem_euclid(360.0);
         assert!(
             vector_tick(x_lat, x_lon, target_alt_ft - 950.0, Some(crossing_track), false, t0)

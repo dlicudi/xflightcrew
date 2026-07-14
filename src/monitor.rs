@@ -222,7 +222,7 @@ impl Snapshot {
         let dest = DESTINATION.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let (dest_dist_nm, dest_elev_ft, tod_ring_nm) = match dest {
             Some(d) => (
-                Some(crate::haversine_nm(lat, lon, d.lat, d.lon)),
+                Some(crate::nav::haversine_nm(lat, lon, d.lat, d.lon)),
                 Some(d.elev_ft),
                 Some(d.tod_ring_nm),
             ),

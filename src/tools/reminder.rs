@@ -303,7 +303,7 @@ async fn dist_to_tod(xp: &XPlaneClient, ring: Option<(f64, f64, f64)>) -> Option
     }
     let (dlat, dlon, ring_nm) = ring?;
     let (lat, lon) = (xp.get_float(LAT).await.ok()?, xp.get_float(LON).await.ok()?);
-    Some(crate::haversine_nm(lat, lon, dlat, dlon) - ring_nm)
+    Some(crate::nav::haversine_nm(lat, lon, dlat, dlon) - ring_nm)
 }
 
 fn arm_tod(base: String, ring: Option<(f64, f64, f64)>, life: Life, voice: Option<Voice>, status: Option<StatusSink>) {

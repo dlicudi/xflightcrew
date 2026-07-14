@@ -56,7 +56,7 @@ pub struct Deviations {
 }
 
 pub fn deviations(path: &ApproachPath, lat: f64, lon: f64, alt_ft: f64) -> Deviations {
-    let dist_nm = crate::haversine_nm(lat, lon, path.thr_lat, path.thr_lon);
+    let dist_nm = crate::nav::haversine_nm(lat, lon, path.thr_lat, path.thr_lon);
     // Bearing aircraft → threshold vs the final-approach course. On centerline
     // they're equal; if the threshold bears RIGHT of course the aircraft sits
     // LEFT of the extended centerline.

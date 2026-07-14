@@ -143,16 +143,9 @@ fn station_person(model: &str, slot: usize, seed: usize) -> u64 {
     h
 }
 
-/// A stable per-airport voice seed (FNV-1a over the name), never 0 — seed 0
-/// is reserved for the configured home field's curated voices.
-pub fn station_voice_seed(airport_name: &str) -> usize {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in airport_name.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    ((h as usize) | 1).max(1)
-}
+// Speaker identity lives with the world side; the arbiter re-exports it so
+// crew callers keep their `voice::StationSpeaker` paths.
+pub use crate::speaker::{station_voice_seed, StationSpeaker};
 
 /// One-shot latch a blocking caller waits on until its utterance is spoken.
 struct Latch {
@@ -160,113 +153,71 @@ struct Latch {
     cv: Condvar,
 }
 
-/// Which controller position is speaking — each gets its own warm ONNX voice
-/// (different person, different frequency), all through the one speech arbiter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StationSpeaker {
-    Tower,
-    Approach,
-    Departure,
-    /// The ATIS broadcast — the looped recording on its own frequency.
-    Atis,
-    /// A GHOST pilot on the party line — live traffic given a voice. The
-    /// seed (hash of its callsign) picks a stable person from the pool, so
-    /// Speedbird 306 sounds like the same pilot on every call.
-    Ghost { seed: usize },
-}
-
-impl StationSpeaker {
-    /// The Piper model for this position. Seed 0 (the configured home field)
-    /// uses the curated per-position voices; any other seed draws a stable
-    /// per-airport crew from `atc_voice_pool`, offset per position so the
-    /// controllers at one field are distinct people. An empty pool always
-    /// falls back to the curated voices.
-    fn model(self, config: &Config, seed: usize, locals: &[String]) -> String {
-        // A ghost pilot's voice comes from ITS OWN seed (per callsign), not
-        // the airport's cast — pilots are from everywhere, and the same
-        // flight keeps the same voice across calls.
-        if let StationSpeaker::Ghost { seed: ghost } = self {
-            let pool: Vec<&str> = config
-                .atc_voice_pool
-                .split(',')
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .collect();
-            if !pool.is_empty() {
-                return pool[ghost % pool.len()].to_string();
-            }
-            return config.atc_piper_voice.clone();
+/// The Piper model for this position. Seed 0 (the configured home field)
+/// uses the curated per-position voices; any other seed draws a stable
+/// per-airport crew from `atc_voice_pool`, offset per position so the
+/// controllers at one field are distinct people. An empty pool always
+/// falls back to the curated voices. Voice casting is the copilot's
+/// business — the world side only carries the [`StationSpeaker`] identity.
+fn station_model(who: StationSpeaker, config: &Config, seed: usize, locals: &[String]) -> String {
+    // A ghost pilot's voice comes from ITS OWN seed (per callsign), not
+    // the airport's cast — pilots are from everywhere, and the same
+    // flight keeps the same voice across calls.
+    if let StationSpeaker::Ghost { seed: ghost } = who {
+        let pool: Vec<&str> = config
+            .atc_voice_pool
+            .split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .collect();
+        if !pool.is_empty() {
+            return pool[ghost % pool.len()].to_string();
         }
-        if seed != 0 {
-            // The country's own accents man the tower and read the ATIS;
-            // approach/departure fill from the neutral pool. With two or
-            // more locals on the roster, the tower and the ATIS reader are
-            // DIFFERENT people at every field (offset picks), stable per
-            // airport via the seed.
-            if !locals.is_empty()
-                && matches!(self, StationSpeaker::Tower | StationSpeaker::Atis)
-            {
-                let offset = if matches!(self, StationSpeaker::Atis) { 1 } else { 0 };
-                return locals[(seed + offset) % locals.len()].clone();
-            }
-            let pool: Vec<&str> = config
-                .atc_voice_pool
-                .split(',')
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .collect();
-            if !pool.is_empty() {
-                // Per-position step sized so all four slots land on distinct
-                // entries whenever the pool has at least four voices.
-                let step = (pool.len() / 4).max(1);
-                return pool[(seed + self.slot() * step) % pool.len()].to_string();
-            }
-        }
-        let fallback = config.atc_piper_voice.as_str();
-        match self {
-            // Handled above (own-seed pool pick); reachable only with an
-            // empty pool, where everyone shares the curated station voice.
-            StationSpeaker::Ghost { .. } => fallback,
-            StationSpeaker::Tower => fallback,
-            StationSpeaker::Approach => {
-                let v = config.atc_approach_piper_voice.as_str();
-                if v.is_empty() { fallback } else { v }
-            }
-            StationSpeaker::Departure => {
-                let v = config.atc_departure_piper_voice.as_str();
-                if v.is_empty() { fallback } else { v }
-            }
-            StationSpeaker::Atis => {
-                let v = config.atc_atis_piper_voice.as_str();
-                if v.is_empty() { fallback } else { v }
-            }
-        }
-        .to_string()
+        return config.atc_piper_voice.clone();
     }
-    fn slot(self) -> usize {
-        match self {
-            StationSpeaker::Tower => 0,
-            StationSpeaker::Approach => 1,
-            StationSpeaker::Departure => 2,
-            StationSpeaker::Atis => 3,
-            // One warm slot for whichever ghost spoke last: the cache is
-            // keyed by model name, so a different ghost voice rebuilds it.
-            StationSpeaker::Ghost { .. } => 4,
+    if seed != 0 {
+        // The country's own accents man the tower and read the ATIS;
+        // approach/departure fill from the neutral pool. With two or
+        // more locals on the roster, the tower and the ATIS reader are
+        // DIFFERENT people at every field (offset picks), stable per
+        // airport via the seed.
+        if !locals.is_empty() && matches!(who, StationSpeaker::Tower | StationSpeaker::Atis) {
+            let offset = if matches!(who, StationSpeaker::Atis) { 1 } else { 0 };
+            return locals[(seed + offset) % locals.len()].clone();
+        }
+        let pool: Vec<&str> = config
+            .atc_voice_pool
+            .split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .collect();
+        if !pool.is_empty() {
+            // Per-position step sized so all four slots land on distinct
+            // entries whenever the pool has at least four voices.
+            let step = (pool.len() / 4).max(1);
+            return pool[(seed + who.slot() * step) % pool.len()].to_string();
         }
     }
-
-    /// The log/panel tag for this position ("TWR: ..." rows). The plugin maps
-    /// each prefix to its own chip, so the transcript names WHICH controller
-    /// spoke, not a generic "ATC".
-    pub fn tag(self) -> &'static str {
-        match self {
-            StationSpeaker::Tower => "TWR",
-            StationSpeaker::Approach => "APP",
-            StationSpeaker::Departure => "DEP",
-            StationSpeaker::Atis => "ATIS",
-            StationSpeaker::Ghost { .. } => "TFC",
+    let fallback = config.atc_piper_voice.as_str();
+    match who {
+        // Handled above (own-seed pool pick); reachable only with an
+        // empty pool, where everyone shares the curated station voice.
+        StationSpeaker::Ghost { .. } => fallback,
+        StationSpeaker::Tower => fallback,
+        StationSpeaker::Approach => {
+            let v = config.atc_approach_piper_voice.as_str();
+            if v.is_empty() { fallback } else { v }
+        }
+        StationSpeaker::Departure => {
+            let v = config.atc_departure_piper_voice.as_str();
+            if v.is_empty() { fallback } else { v }
+        }
+        StationSpeaker::Atis => {
+            let v = config.atc_atis_piper_voice.as_str();
+            if v.is_empty() { fallback } else { v }
         }
     }
+    .to_string()
 }
 
 /// Whether `speaker` is audible on the currently-tuned station RIGHT NOW.
@@ -1336,7 +1287,7 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let who = utt.station.expect("radio queue only holds station utterances");
-        let model = who.model(&station_cfg, seed, &locals);
+        let model = station_model(who, &station_cfg, seed, &locals);
         // Signal quality from the CURRENT range to the station, read per
         // transmission — the same tower fades in as you close on the field.
         // Ghost pilots ride the same value: they're on this field's frequency
@@ -1472,32 +1423,32 @@ mod tests {
             StationSpeaker::Atis,
         ]
         .iter()
-        .map(|s| s.model(&cfg, seed, &[]))
+        .map(|s| station_model(*s, &cfg, seed, &[]))
         .collect();
         let mut unique = crew.clone();
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), 4, "positions must be distinct people: {crew:?}");
         // Seed 0 = the curated home voices, pool or not.
-        assert_eq!(StationSpeaker::Tower.model(&cfg, 0, &[]), "tower.onnx");
+        assert_eq!(station_model(StationSpeaker::Tower, &cfg, 0, &[]), "tower.onnx");
         // No pool → curated voices even for a seeded airport.
         let bare = Config { atc_piper_voice: "tower.onnx".into(), ..Config::default() };
-        assert_eq!(StationSpeaker::Tower.model(&bare, seed, &[]), "tower.onnx");
+        assert_eq!(station_model(StationSpeaker::Tower, &bare, seed, &[]), "tower.onnx");
         // Country casting: the local accents man the tower and read the
         // ATIS — DIFFERENT people when the roster has two or more ("main
         // thing is that we actually have different voices", 2026-07-12);
         // approach/departure stay neutral (from the pool).
         let locals = vec!["es1.onnx".to_string(), "es2.onnx".to_string()];
-        let twr = StationSpeaker::Tower.model(&cfg, seed, &locals);
-        let atis = StationSpeaker::Atis.model(&cfg, seed, &locals);
+        let twr = station_model(StationSpeaker::Tower, &cfg, seed, &locals);
+        let atis = station_model(StationSpeaker::Atis, &cfg, seed, &locals);
         assert!(locals.contains(&twr), "{twr}");
         assert!(locals.contains(&atis), "{atis}");
         assert_ne!(twr, atis, "tower and ATIS must be different people");
-        assert!(!locals.contains(&StationSpeaker::Approach.model(&cfg, seed, &locals)));
+        assert!(!locals.contains(&station_model(StationSpeaker::Approach, &cfg, seed, &locals)));
         // A one-voice roster still casts it (tower and ATIS then share).
         let solo = vec!["es1.onnx".to_string()];
-        assert_eq!(StationSpeaker::Tower.model(&cfg, seed, &solo), "es1.onnx");
-        assert_eq!(StationSpeaker::Atis.model(&cfg, seed, &solo), "es1.onnx");
+        assert_eq!(station_model(StationSpeaker::Tower, &cfg, seed, &solo), "es1.onnx");
+        assert_eq!(station_model(StationSpeaker::Atis, &cfg, seed, &solo), "es1.onnx");
         // Geography: Castilian in Spain and the Canaries (with real variety
         // on the roster), es_MX only in Spanish Latin America, neutral
         // elsewhere (and NEVER es_MX in Spain).

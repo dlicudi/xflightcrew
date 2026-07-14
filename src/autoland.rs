@@ -13,7 +13,7 @@
 
 use std::io::{BufRead, BufReader};
 
-use crate::haversine_nm;
+pub(crate) use crate::nav::{bearing_deg, haversine_nm, project_latlon};
 
 const M_PER_NM: f64 = 1852.0;
 /// apt.dat surface codes that are hard (asphalt=1, concrete=2) — preferred.
@@ -42,15 +42,6 @@ impl Runway {
     fn hard(&self) -> bool {
         HARD_SURFACES.contains(&self.surface)
     }
-}
-
-/// True course (degrees, 0-360) from point 1 to point 2 along the great circle.
-pub fn bearing_deg(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
-    let dlon = (lon2 - lon1).to_radians();
-    let y = dlon.sin() * p2.cos();
-    let x = p1.cos() * p2.sin() - p1.sin() * p2.cos() * dlon.cos();
-    (y.atan2(x).to_degrees() + 360.0) % 360.0
 }
 
 /// Smallest absolute difference between two headings, degrees (0-180).
@@ -526,16 +517,6 @@ pub fn flap_schedule(dist_nm: f64, alt_err_ft: f64) -> f64 {
 /// whole cross-track cut vanished and the final tracked 0.4 nm left, parallel.
 pub fn true_to_mag(true_deg: f64, xp_variation_deg: f64) -> f64 {
     (true_deg + xp_variation_deg).rem_euclid(360.0)
-}
-
-/// A point `dist_nm` from (lat, lon) along true `bearing` (flat-earth good enough
-/// at approach ranges).
-pub fn project_latlon(lat: f64, lon: f64, bearing: f64, dist_nm: f64) -> (f64, f64) {
-    let d = dist_nm / 60.0; // nm → degrees of latitude
-    let b = bearing.to_radians();
-    let dlat = d * b.cos();
-    let dlon = d * b.sin() / lat.to_radians().cos().max(1e-6);
-    (lat + dlat, lon + dlon)
 }
 
 /// Signed distance (nm) along the runway centreline: positive = on the approach
