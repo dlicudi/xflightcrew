@@ -17,6 +17,7 @@ pub mod datarefs;
 pub mod mic;
 pub mod nav;
 pub mod phrase;
+pub mod prefs;
 pub mod radiofx;
 pub mod stt;
 pub mod tower;

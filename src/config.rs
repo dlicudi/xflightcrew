@@ -238,7 +238,12 @@ impl Config {
             chime_path: env_or("XCOPILOT_CHIME", ""),
             negative_tone_path: env_or("XCOPILOT_NEGATIVE_TONE", ""),
             piper_binary: env_or("PIPER_BIN", "piper"),
-            piper_voice: env_or("PIPER_VOICE", "models/en_US-amy-medium.onnx"),
+            // Explicit env beats the panel-saved pick beats the default (see
+            // crate::prefs — the Settings tab's voice picker persists there).
+            piper_voice: std::env::var("PIPER_VOICE")
+                .ok()
+                .or_else(crate::prefs::pilot_voice)
+                .unwrap_or_else(|| "models/en_US-amy-medium.onnx".into()),
             // Prefer Custom Data (Navigraph/updated AIRAC) when it exists — it's
             // what X-Plane itself flies on; the stock file goes stale the moment
             // a cycle is installed. Env override wins over both.

@@ -130,6 +130,36 @@ static void WriteOptTone(void*, int v) { g_opt_negative_tone = v; }
 static int ReadOptMute(void*) { return g_opt_monitor_mute; }
 static void WriteOptMute(void*, int v) { g_opt_monitor_mute = v; }
 
+// Copilot voice picker. The app publishes the roster of piper models on disk
+// (newline-separated display names) into `voice_list` and the active voice's
+// index into `voice`; the Settings combo writes the pilot's pick back, the app
+// polls it and swaps the voice live. -1 = untouched (follow the app's voice),
+// which is also how the app detects a plugin reload wiped this state and
+// re-publishes. Own buffer type: the roster outgrows TextRef's 512 as voices
+// are added.
+static int g_opt_voice = -1;
+static XPLMDataRef g_opt_voice_dref = nullptr;
+static int ReadOptVoice(void*) { return g_opt_voice; }
+static void WriteOptVoice(void*, int v) { g_opt_voice = v; }
+static struct { char buf[4096]; int len; } g_voice_list = {{0}, 0};
+static XPLMDataRef g_voice_list_dref = nullptr;
+static int ReadVoiceList(void*, void* out, int offset, int max) {
+    if (out == nullptr) return g_voice_list.len;
+    if (offset >= g_voice_list.len) return 0;
+    int n = g_voice_list.len - offset;
+    if (n > max) n = max;
+    std::memcpy(out, g_voice_list.buf + offset, static_cast<size_t>(n));
+    return n;
+}
+static void WriteVoiceList(void*, void* in, int offset, int len) {
+    if (offset != 0) return;
+    if (len > static_cast<int>(sizeof g_voice_list.buf) - 1) len = sizeof g_voice_list.buf - 1;
+    if (len < 0) len = 0;
+    std::memset(g_voice_list.buf, 0, sizeof g_voice_list.buf);
+    std::memcpy(g_voice_list.buf, in, static_cast<size_t>(len));
+    g_voice_list.len = len;
+}
+
 // ---- status datarefs --------------------------------------------------------
 
 struct TextRef { char buf[512]; int len; };
@@ -1230,6 +1260,35 @@ protected:
         if (ImGui::Checkbox("Mute monitor callouts", &mute)) {
             g_opt_monitor_mute = mute ? 1 : 0;
         }
+        // Copilot voice: the roster the app published, one combo row. A pick
+        // writes the index back; the app polls it, swaps the voice live, and
+        // confirms in the new voice. Hidden until the app publishes (no app,
+        // no models, or the `say` backend where piper voices don't apply).
+        if (g_voice_list.len > 0) {
+            std::vector<std::string> names;
+            {
+                const char* p = g_voice_list.buf;
+                const char* end = p + g_voice_list.len;
+                while (p < end) {
+                    const char* nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p)));
+                    size_t n = nl ? static_cast<size_t>(nl - p) : static_cast<size_t>(end - p);
+                    if (n > 0) names.emplace_back(p, n);
+                    p += n + 1;
+                }
+            }
+            const bool picked = g_opt_voice >= 0 && g_opt_voice < static_cast<int>(names.size());
+            const char* preview = picked ? names[static_cast<size_t>(g_opt_voice)].c_str() : "(default)";
+            if (ImGui::BeginCombo("Copilot voice", preview)) {
+                for (int i = 0; i < static_cast<int>(names.size()); ++i) {
+                    bool selected = (i == g_opt_voice);
+                    if (ImGui::Selectable(names[static_cast<size_t>(i)].c_str(), selected)) {
+                        g_opt_voice = i;
+                    }
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+        }
         ImGui::Spacing();
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
                            "Changes apply live; no restart needed.");
@@ -1347,6 +1406,14 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         "xcopilot/opt/monitor_mute", xplmType_Int, 1,
         ReadOptMute, WriteOptMute, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_opt_voice_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/voice", xplmType_Int, 1,
+        ReadOptVoice, WriteOptVoice, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_voice_list_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/voice_list", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadVoiceList, WriteVoiceList, nullptr, nullptr);
     g_callout_dref = XPLMRegisterDataAccessor(
         "xcopilot/status/callout", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -1420,6 +1487,8 @@ PLUGIN_API void XPluginStop(void) {
     g_panel.reset();
     ImgWindow::sFontAtlas.reset();
     if (g_menu) { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
+    if (g_voice_list_dref) { XPLMUnregisterDataAccessor(g_voice_list_dref); g_voice_list_dref = nullptr; }
+    if (g_opt_voice_dref) { XPLMUnregisterDataAccessor(g_opt_voice_dref); g_opt_voice_dref = nullptr; }
     if (g_opt_mute_dref) { XPLMUnregisterDataAccessor(g_opt_mute_dref); g_opt_mute_dref = nullptr; }
     if (g_opt_tone_dref) { XPLMUnregisterDataAccessor(g_opt_tone_dref); g_opt_tone_dref = nullptr; }
     if (g_opt_snap_dref) { XPLMUnregisterDataAccessor(g_opt_snap_dref); g_opt_snap_dref = nullptr; }

@@ -33,6 +33,7 @@ mod nav;
 mod party_line;
 mod phrase;
 mod plugin_status;
+mod prefs;
 mod readback;
 mod simbrief;
 mod station;
@@ -321,6 +322,13 @@ async fn main() -> Result<()> {
     // The speech arbiter is shared by the command loop and the monitor, so it's
     // created here (above both) and handed to each.
     let voice = Voice::new(config.clone());
+
+    // The panel's copilot-voice picker: publish the roster, poll for picks,
+    // swap live. Only where the pick can matter — the `say` backend ignores
+    // piper models entirely.
+    if config.tts_backend != "say" {
+        spawn_voice_picker(config.xplane_base_url.clone(), voice.clone(), config.piper_voice.clone());
+    }
 
     // In-sim status panel (the bundled plugin): mirror phase/heard/action into its
     // datarefs. Best-effort — a no-op if the plugin isn't loaded.
@@ -612,6 +620,117 @@ fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::Sender<Stri
             if tx.send(cmd.to_string()).is_err() {
                 return; // session gone
             }
+        }
+    });
+}
+
+/// The panel's copilot-voice picker (see plugin/src/xcopilot.cpp): the app
+/// publishes the roster + current index, the Settings combo writes a pick back.
+const DR_OPT_VOICE: &str = "xcopilot/opt/voice";
+const DR_OPT_VOICE_LIST: &str = "xcopilot/opt/voice_list";
+
+/// Publish the pilot-voice roster (every piper model on disk) to the plugin's
+/// Settings picker, then poll for picks. A pick swaps the copilot's voice live
+/// ([`Voice::set_pilot_voice`]), confirms with a short line spoken in the NEW
+/// voice, and persists to `prefs.json` so the next session boots with it (env
+/// `PIPER_VOICE` still beats the saved pick — see [`config`]). Best-effort like
+/// the status sink: no plugin, no X-Plane, or no models just means the picker
+/// stays empty. The roster re-publishes whenever the index reads -1 with a pick
+/// on record — that's the plugin's freshly-registered default, i.e. a plugin
+/// reload or sim restart wiped the panel's state.
+fn spawn_voice_picker(base_url: String, voice: Voice, current_spec: String) {
+    std::thread::spawn(move || {
+        use base64::Engine;
+        let choices = voice::pilot_voice_choices();
+        if choices.is_empty() {
+            return;
+        }
+        // Display names are the model file stems ("en_US-amy-medium") —
+        // unambiguous, and quality variants (ryan-high vs ryan-medium) stay
+        // distinct. Newline-separated for the plugin's combo.
+        let roster: String = choices
+            .iter()
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.clone())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let roster_b64 = base64::engine::general_purpose::STANDARD.encode(roster.as_bytes());
+        let Ok(http) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+        else {
+            return;
+        };
+        let rest = format!("{}/api/v1", base_url.trim_end_matches('/'));
+        // The index the panel should show right now: the active voice's spot in
+        // the roster, or -1 when it isn't a roster entry (custom env path).
+        let mut applied: i64 = choices
+            .iter()
+            .position(|c| *c == current_spec)
+            .map_or(-1, |i| i as i64);
+        let mut ids: Option<(i64, i64)> = None; // (list, index)
+
+        let patch = |id: i64, value: serde_json::Value| -> bool {
+            http.patch(format!("{rest}/datarefs/{id}/value"))
+                .json(&serde_json::json!({ "data": value }))
+                .send()
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+        };
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if ids.is_none() {
+                ids = crate::plugin_status::resolve_id(&http, &rest, DR_OPT_VOICE_LIST)
+                    .zip(crate::plugin_status::resolve_id(&http, &rest, DR_OPT_VOICE));
+                let Some((list_id, idx_id)) = ids else {
+                    // Plugin not loaded / sim down — retry lazily.
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    continue;
+                };
+                if !patch(list_id, serde_json::json!(roster_b64))
+                    || !patch(idx_id, serde_json::json!(applied))
+                {
+                    ids = None;
+                    continue;
+                }
+            }
+            let Some((list_id, idx_id)) = ids else { continue };
+            let picked = http
+                .get(format!("{rest}/datarefs/{idx_id}/value"))
+                .send()
+                .ok()
+                .filter(|r| r.status().is_success())
+                .and_then(|r| r.json::<serde_json::Value>().ok())
+                .and_then(|b| b.get("data").and_then(|d| d.as_i64()));
+            let Some(v) = picked else {
+                ids = None; // stale ids (sim restarted) — re-resolve
+                continue;
+            };
+            if v < 0 {
+                // The plugin's registered default: its state was wiped (plugin
+                // reload) while our ids stayed valid — repopulate the picker.
+                if applied >= 0 && (!patch(list_id, serde_json::json!(roster_b64))
+                    || !patch(idx_id, serde_json::json!(applied)))
+                {
+                    ids = None;
+                }
+                continue;
+            }
+            if v == applied || v as usize >= choices.len() {
+                continue;
+            }
+            applied = v;
+            let spec = choices[v as usize].clone();
+            tracing::info!(model = %spec, "panel voice pick");
+            voice.set_pilot_voice(spec.clone());
+            prefs::save_pilot_voice(&spec);
+            // Confirmed in the new voice itself: the swap applies before the
+            // next intercom utterance, which is exactly this line.
+            voice.say(voice::Priority::Advisory, "New voice, checked in.");
         }
     });
 }

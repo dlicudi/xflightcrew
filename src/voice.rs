@@ -103,6 +103,27 @@ pub fn local_voices_on_disk(icao: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every piper voice on disk — what the panel's Settings picker offers for
+/// the copilot's own voice. A model qualifies by having its `.onnx.json`
+/// sidecar beside it (which also excludes non-piper models like Kokoro, whose
+/// config lives elsewhere). Sorted so the panel index is stable across runs;
+/// entries are full model paths, display names are the file stems.
+pub fn pilot_voice_choices() -> Vec<String> {
+    let mut voices: Vec<String> = std::fs::read_dir("models")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let is_onnx = path.extension().is_some_and(|e| e == "onnx");
+            let has_sidecar = std::path::Path::new(&format!("{}.json", path.display())).exists();
+            (is_onnx && has_sidecar).then(|| path.to_string_lossy().into_owned())
+        })
+        .collect();
+    voices.sort();
+    voices
+}
+
 /// A stable per-airport voice seed (FNV-1a over the name), never 0 — seed 0
 /// is reserved for the configured home field's curated voices.
 pub fn station_voice_seed(airport_name: &str) -> usize {
@@ -401,6 +422,12 @@ struct Inner {
     /// checks heard transcripts against this to reject its own voice coming back
     /// over the speakers (echo) rather than acting on it.
     spoken: Mutex<Vec<(Instant, String)>>,
+    /// A pending pilot-voice swap (a piper model path) from the panel's
+    /// Settings picker. The intercom speaker thread consumes it before the
+    /// next utterance — the swap happens on the thread that owns the warm
+    /// engine, never mid-word. Station voices are cast separately (see
+    /// [`StationSpeaker`]) and unaffected.
+    pilot_swap: Mutex<Option<String>>,
 }
 
 /// Handle to the speech arbiter. Cheap to clone — hand one to every thread that
@@ -440,6 +467,7 @@ impl Voice {
             replay: std::sync::atomic::AtomicBool::new(false),
             paused: std::sync::atomic::AtomicBool::new(false),
             spoken: Mutex::new(Vec::new()),
+            pilot_swap: Mutex::new(None),
         });
         // Independent channel volumes (a real audio panel's COM vs intercom
         // knobs). Applied in tts::play per thread channel.
@@ -476,6 +504,18 @@ impl Voice {
         self.inner
             .station_seed
             .store(seed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Swap the copilot's own voice live (the panel's Settings picker writes
+    /// an index, main resolves it to a model path and calls this). Takes
+    /// effect before the next intercom utterance; a failed model load keeps
+    /// the current voice (see [`Speaker::set_voice`]).
+    pub fn set_pilot_voice(&self, spec: impl Into<String>) {
+        *self
+            .inner
+            .pilot_swap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(spec.into());
     }
 
     /// The mic gate this arbiter raises while speaking — hand it to the listener
@@ -989,6 +1029,30 @@ impl Speaker {
             Speaker::Onnx(engine) => engine.speak(text),
         }
     }
+
+    /// Swap to a different voice model (the panel picker's live change). The
+    /// warm ONNX path loads the new model FIRST and keeps the current engine
+    /// if the load fails — a bad pick must cost nothing, never drop the
+    /// copilot to the `say` fallback mid-flight. The subprocess paths read
+    /// the model path per utterance, so a config update is the whole swap.
+    fn set_voice(&mut self, spec: String) {
+        match self {
+            Speaker::Subprocess(config) => {
+                tracing::info!(model = %spec, "TTS: pilot voice swapped (subprocess)");
+                config.piper_voice = spec;
+            }
+            #[cfg(feature = "onnx-tts")]
+            Speaker::Onnx(engine) => match crate::tts_onnx::OnnxTts::load(&spec) {
+                Ok(fresh) => {
+                    tracing::info!(model = %spec, "TTS: pilot voice swapped (warm ONNX)");
+                    **engine = fresh;
+                }
+                Err(e) => {
+                    tracing::error!("pilot voice swap to {spec} failed ({e:#}); keeping the current voice");
+                }
+            },
+        }
+    }
 }
 
 /// Crew discipline: whether the intercom may START `top` while the radio is
@@ -1093,6 +1157,19 @@ fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             q = inner.cv.wait(q).unwrap();
         };
         drop(q); // release the queue while we speak (which is slow)
+
+        // A pending pilot-voice swap applies here, between utterances — so a
+        // test line queued right after the pick already speaks in the new
+        // voice. The model load blocks this thread briefly; that's the point
+        // (the swap must never race the engine mid-word).
+        if let Some(spec) = inner
+            .pilot_swap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            speaker.set_voice(spec);
+        }
 
         // Perishable speech that missed its window (including waiting out a
         // radio transmission) is dropped: spoken late it's disinformation,
@@ -1418,6 +1495,7 @@ mod tests {
             replay: std::sync::atomic::AtomicBool::new(false),
             paused: std::sync::atomic::AtomicBool::new(false),
             spoken: Mutex::new(Vec::new()),
+            pilot_swap: Mutex::new(None),
         }
     }
 
