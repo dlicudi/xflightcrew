@@ -4410,6 +4410,9 @@ fn active_managers() -> Vec<String> {
     if let Some(s) = tools::speedhold::status() {
         v.push(s);
     }
+    if tools::controls::brakes_held() {
+        v.push("holding brakes".to_string());
+    }
     if let Some(s) = tools::reverse::status() {
         v.push(s);
     }

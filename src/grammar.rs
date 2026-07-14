@@ -1133,6 +1133,22 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("set_parking_brake", json!({ "on": !release })));
     }
 
+    // regular brakes, crew-held: "brakes on" / "hold the brakes" / "brakes
+    // off" / "release the brakes". After the parking-brake rule so "parking
+    // brake off" keeps its lever (speedbrakes matched far above); a verb is
+    // required, bare "brakes" alone is ambiguous and falls through. Same
+    // "break" mishear as the parking brake.
+    if (has(t, "brakes") || has(t, "brake") || has(t, "breaks") || has(t, "break"))
+        && !t.contains("speed")
+    {
+        if has(t, "off") || has(t, "release") || has(t, "released") {
+            return Some(call("hold_brakes", json!({ "on": false })));
+        }
+        if has(t, "on") || has(t, "hold") || has(t, "holding") || has(t, "set") {
+            return Some(call("hold_brakes", json!({ "on": true })));
+        }
+    }
+
     // fuel selector / tank. Explicit side wins; a swap verb with no side is the
     // routine "switch tanks" (the SR22 has no BOTH, so it's said every half hour)
     // — the tool reads the current tank and feeds from the other one. Also match
@@ -1768,6 +1784,25 @@ mod tests {
         assert_eq!(one("turn the floodlights on").unwrap().1, json!({"on":true}));
         assert_eq!(one("parking break off").unwrap(), ("set_parking_brake".into(), json!({"on":false})));
         assert_eq!(one("parking break set").unwrap().1, json!({"on":true}));
+    }
+
+    #[test]
+    fn regular_brakes_resolve_and_never_steal_other_levers() {
+        assert_eq!(one("brakes on").unwrap(), ("hold_brakes".into(), json!({"on":true})));
+        assert_eq!(one("hold the brakes").unwrap().1, json!({"on":true}));
+        assert_eq!(one("brakes off").unwrap(), ("hold_brakes".into(), json!({"on":false})));
+        assert_eq!(one("release the brakes").unwrap().1, json!({"on":false}));
+        // The same "break" mishear the parking brake gets.
+        assert_eq!(one("breaks on").unwrap().0, "hold_brakes");
+        assert_eq!(one("break off").unwrap().1, json!({"on":false}));
+        // The word "parking" keeps its own lever; speedbrakes keep theirs
+        // (on the 172 registry the speedbrake tool doesn't exist, so the
+        // phrase parses to it and filters to None — the point is it never
+        // falls through to hold_brakes).
+        assert_eq!(one("parking brake off").unwrap().0, "set_parking_brake");
+        assert!(one("speed brakes out").is_none_or(|(n, _)| n == "speedbrake"));
+        // Bare "brakes" with no verb is ambiguous: fall through, never guess.
+        assert!(one("brakes").is_none());
     }
 
     #[test]

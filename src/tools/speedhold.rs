@@ -312,6 +312,11 @@ impl Tool for HoldSpeed {
                 );
             }
         }
+        // A crew-held "brakes on" yields to a commanded taxi the same way the
+        // parking brake does: rolling was just asked for. A stop target hands
+        // over silently, the governor parks on its own boot before the held
+        // command expires.
+        let crew_brakes_released = taxi && super::controls::release_held_brakes();
         let target = if taxi {
             match a.knots {
                 Some(k) => clamp_taxi_target(k),
@@ -357,7 +362,12 @@ impl Tool for HoldSpeed {
             });
         }
         Ok(if taxi {
-            let brake_note = if brake_released { "Parking brake off. " } else { "" };
+            let brake_note = match (brake_released, crew_brakes_released && target >= 1.0) {
+                (true, true) => "Parking brake off, my brakes too. ",
+                (true, false) => "Parking brake off. ",
+                (false, true) => "My brakes are off. ",
+                (false, false) => "",
+            };
             if target < 1.0 {
                 "Stopping — brakes on. Say go to roll again.".to_string()
             } else if a.resume {

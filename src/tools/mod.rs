@@ -290,6 +290,11 @@ impl Registry {
             }));
         }
 
+        // Regular (crew-held) wheel brakes, "brakes on" / "brakes off". Every
+        // airframe has wheel brakes, so not profile-gated the way the latch
+        // above is.
+        tools.push(Box::new(controls::HoldBrakes));
+
         if profile.pitch_trim {
             tools.push(Box::new(controls::SetPitchTrim));
         }
