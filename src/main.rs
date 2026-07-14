@@ -1161,7 +1161,7 @@ async fn run_session(
         // was already said on frequency.
         if party_line::take_pending_takeoff_clearance() {
             if let Some(st) = atc_station.as_mut() {
-                st.apply_monitor_takeoff_clearance(&xplane).await;
+                st.apply_monitor_takeoff_clearance(xplane.view()).await;
                 reporter.log(ui::LogKind::Info, "tower: held takeoff clearance released");
             }
         }
@@ -1315,7 +1315,7 @@ async fn run_session(
                 // controller answers garble; the crew never heard it at all).
                 if from_radio {
                     if let Some(st) = atc_station.as_mut() {
-                        if let Some(who) = st.tuned_speaker(&xplane).await {
+                        if let Some(who) = st.tuned_speaker(xplane.view()).await {
                             blackbox::record(
                                 "atc",
                                 serde_json::json!({
@@ -1352,7 +1352,7 @@ async fn run_session(
         // routing whenever the transmit button is bound.
         if from_radio {
             if let Some(st) = atc_station.as_mut() {
-                if let Some((reply, who)) = st.handle_transmission(&command.to_ascii_lowercase(), &xplane).await {
+                if let Some((reply, who)) = st.handle_transmission(&command.to_ascii_lowercase(), xplane.view()).await {
                     // Empty reply = a readback the controller accepted; a real
                     // frequency stays quiet, so we do too.
                     if reply.is_empty() {
@@ -1632,7 +1632,7 @@ async fn run_session(
                 if !dual_ptt && voice.radio_powered() && !voice.crashed() && !voice.replay()
                     && !voice.paused()
                 {
-                    if let Some((reply, who)) = st.try_handle(&tl, &xplane).await {
+                    if let Some((reply, who)) = st.try_handle(&tl, xplane.view()).await {
                         reporter.status(ui::Phase::Speaking);
                         reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
                         voice.say_station(Priority::Readback, who, &reply);
@@ -1672,7 +1672,7 @@ async fn run_session(
                 // talk to") — crew knowledge answered from the loaded apt.dat
                 // rows plus live COM1, after the tuning verbs so those win.
                 if station::freq_query(&tl) {
-                    let line = st.freq_briefing(&xplane).await;
+                    let line = st.freq_briefing(xplane.view()).await;
                     say(&voice, &reporter, ui::LogKind::Readback, &line);
                     continue;
                 }
@@ -4993,10 +4993,10 @@ fn service_label(word: &str) -> &str {
 async fn void_briefing(xp: &XPlaneClient, st: &station::Station) -> String {
     let Some((lat, lon, alt_ft)) = position(xp).await else {
         // Can't place the aircraft — the plain briefing beats silence.
-        return st.freq_briefing(xp).await;
+        return st.freq_briefing(xp.view()).await;
     };
     if station::active_station_in_range(lat, lon, alt_ft).is_some() {
-        return st.freq_briefing(xp).await;
+        return st.freq_briefing(xp.view()).await;
     }
     let near = station::fields_in_range(lat, lon, alt_ft, 1);
     match near.first().and_then(|f| {

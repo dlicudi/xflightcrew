@@ -1692,7 +1692,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                             .is_none_or(|t| now.duration_since(t).as_secs() >= 15);
                         if due {
                             if let Some(nm) =
-                                crate::station::inbound_traffic_for_strip(&xp, &rwy).await
+                                crate::station::inbound_traffic_for_strip(xp.view(), &rwy).await
                             {
                                 incursion_last = Some(now);
                                 let urgent = nm < 1.5;
@@ -2036,7 +2036,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                     let wake_watch = tower_tuned && snap.on_ground;
                     if let Some((_, flat, flon, felev)) = crate::station::active_field() {
                         if chatter_on || hold_armed || cleared_to_land || wake_watch {
-                            let targets = crate::station::read_tcas_targets(&xp).await;
+                            let targets = crate::station::read_tcas_targets(xp.view()).await;
                             crate::station::wake_note_targets(&targets, now);
                             // Safety outranks flavor: the go-around order first.
                             if let Some(call) = crate::station::go_around_tick(
@@ -2234,7 +2234,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                         .is_none_or(|t| now.duration_since(t).as_secs() >= 15);
                     if due {
                         if let Some(f) =
-                            crate::station::nearest_traffic_factor(&xp).await.filter(crate::station::is_near_miss)
+                            crate::station::nearest_traffic_factor(xp.view()).await.filter(crate::station::is_near_miss)
                         {
                             near_miss_last = Some(now);
                             crate::blackbox::record(
@@ -2293,7 +2293,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                         && near_miss_last
                             .is_none_or(|t| now.duration_since(t).as_secs() >= 45);
                     if due {
-                        let advisory = crate::station::traffic_advisory(&xp).await;
+                        let advisory = crate::station::traffic_advisory(xp.view()).await;
                         // Close the loop: the last factor is gone.
                         if advisory.is_none() && traffic_open {
                             traffic_open = false;

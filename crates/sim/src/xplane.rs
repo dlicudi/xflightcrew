@@ -431,6 +431,34 @@ impl XPlaneClient {
         arr[index] = value;
         self.set_value(name, json!(arr)).await
     }
+
+    /// The world side's handle on the simulator: reads only. ATC observes and
+    /// returns text — this view exposes no `set_*`/`run_command`, so the
+    /// compiler enforces the "the world never actuates" trust boundary.
+    pub fn view(&self) -> SimView<'_> {
+        SimView(self)
+    }
+}
+
+/// Read-only view over [`XPlaneClient`] — see [`XPlaneClient::view`]. Exposes
+/// exactly the reads the ATC world needs; add methods only for reads, never
+/// writes or commands.
+#[derive(Clone, Copy)]
+pub struct SimView<'a>(&'a XPlaneClient);
+
+impl SimView<'_> {
+    pub async fn get_float(&self, name: &str) -> Result<f64> {
+        self.0.get_float(name).await
+    }
+    pub async fn get_string(&self, name: &str) -> Result<String> {
+        self.0.get_string(name).await
+    }
+    pub async fn get_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        self.0.get_bytes(name).await
+    }
+    pub async fn get_float_array(&self, name: &str) -> Result<Vec<f64>> {
+        self.0.get_float_array(name).await
+    }
 }
 
 // The trait just forwards to the inherent methods above (which stay the canonical

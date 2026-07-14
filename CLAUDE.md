@@ -333,8 +333,10 @@ boundary, not a second process**: the world lives in the `atc` workspace crate
 (`crates/atc` — station, tower, nav, atis, party_line, speaker identity), both
 sides stand on `crates/sim` (Web API client, dataref names, blackbox), and the
 copilot embeds the world as a library — still one process, one mic, one PTT.
-The atc crate returns `(text, StationSpeaker)` and never speaks or actuates;
-its dep tree must stay free of whisper/cpal/ort (`cargo tree -p atc` is the
+The atc crate returns `(text, StationSpeaker)` and never speaks or actuates —
+its sim handle is `sim::xplane::SimView`, a read-only view with no writes on
+it, so "the world never touches the controls" is a type, not a promise; its
+dep tree must stay free of whisper/cpal/ort (`cargo tree -p atc` is the
 standalone-product health check, and a future ATC-only product is a repo
 extraction away). Next: live-traffic
 observation via TCAS datarefs (ATC only ever *controls the player* and

@@ -6,12 +6,14 @@
 //! Trust boundary: this module only ever *reads* the simulator (frequency,
 //! weather, tail number) and returns text. It has no access to the tool
 //! registry and can never actuate anything — ATC is the world, not the crew.
+//! Compiler-enforced: the sim handle here is `SimView`, a read-only view
+//! with no `set_*`/`run_command` on it at all.
 
 use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::speaker::StationSpeaker;
-use sim::xplane::XPlaneClient;
+use sim::xplane::SimView;
 use crate::{atis, nav, tower};
 use sim::datarefs;
 
@@ -283,7 +285,7 @@ impl Station {
     pub async fn try_handle(
         &mut self,
         transcript: &str,
-        xp: &XPlaneClient,
+        xp: SimView<'_>,
     ) -> Option<(String, StationSpeaker)> {
         // Cheap word gates before any dataref read — the common case is a
         // cockpit command, and it must cost nothing. route_unkeyed re-applies
@@ -372,7 +374,7 @@ impl Station {
     pub async fn handle_transmission(
         &mut self,
         transcript: &str,
-        xp: &XPlaneClient,
+        xp: SimView<'_>,
     ) -> Option<(String, StationSpeaker)> {
         let Some(service) = self.tuned_service(xp).await else {
             sim::blackbox::record(
@@ -461,7 +463,7 @@ impl Station {
     }
 
     /// The voice of whichever of this station's positions COM1 is tuned to.
-    pub async fn tuned_speaker(&self, xp: &XPlaneClient) -> Option<StationSpeaker> {
+    pub async fn tuned_speaker(&self, xp: SimView<'_>) -> Option<StationSpeaker> {
         self.tuned_service(xp).await.map(Service::speaker)
     }
 
@@ -476,7 +478,7 @@ impl Station {
 
     /// Which service COM1 is tuned to. 8.33 channel names can sit 5 kHz off
     /// the carrier; adjacent channels are 8 kHz apart, so 5 can't cross.
-    async fn tuned_service(&self, xp: &XPlaneClient) -> Option<Service> {
+    async fn tuned_service(&self, xp: SimView<'_>) -> Option<Service> {
         let com1 = xp.get_float(datarefs::COM1_FREQ_KHZ).await.ok()?.round() as i64;
         if (com1 - self.tower_khz).abs() <= 5 {
             return Some(Service::Tower);
@@ -577,7 +579,7 @@ impl Station {
     /// once the final cleared (see [`takeoff_hold_tick`]): the state moves to
     /// TakeoffCleared and the departure handoff arms, exactly as if the
     /// clearance had been issued on the reply path.
-    pub async fn apply_monitor_takeoff_clearance(&mut self, xp: &XPlaneClient) {
+    pub async fn apply_monitor_takeoff_clearance(&mut self, xp: SimView<'_>) {
         let (ctx, _wx) = self.build_ctx(xp).await;
         self.twr.state = tower::State::TakeoffCleared;
         // The released clearance owes its readback exactly like one issued
@@ -979,7 +981,7 @@ impl Station {
     /// Read the sim once and build the live context for a reply. Best-effort:
     /// a failed read falls back to silence on that item rather than a wrong
     /// number.
-    async fn build_ctx(&mut self, xp: &XPlaneClient) -> (tower::Ctx, Wx) {
+    async fn build_ctx(&mut self, xp: SimView<'_>) -> (tower::Ctx, Wx) {
         let wx = Wx {
             wind_from_deg: xp
                 .get_float(datarefs::WIND_DIR_DEG_TRUE)
@@ -2271,7 +2273,7 @@ pub fn final_traffic_for(
 /// runway, expedite" for the parallel runway 31 arrival stream (2026-07-12).
 /// A parallel runway's stream is not your traffic — the same Heathrow lesson
 /// `final_traffic_for` already encodes for the release watch.
-pub async fn inbound_traffic_for_strip(xp: &XPlaneClient, ident: &str) -> Option<f64> {
+pub async fn inbound_traffic_for_strip(xp: SimView<'_>, ident: &str) -> Option<f64> {
     let targets = read_tcas_targets(xp).await;
     inbound_final_for_strip(&targets, ident)
 }
@@ -2311,7 +2313,7 @@ pub struct TcasTarget {
 /// Read the TCAS target table (slot 0 = own ship, skipped). Targets without
 /// a flight id are dropped — a tower can't address an aircraft it can't
 /// name. Any missing array (older sim, no traffic feed) = empty.
-pub async fn read_tcas_targets(xp: &XPlaneClient) -> Vec<TcasTarget> {
+pub async fn read_tcas_targets(xp: SimView<'_>) -> Vec<TcasTarget> {
     let (Ok(lat), Ok(lon), Ok(ele), Ok(wow), Ok(ids)) = (
         xp.get_float_array(datarefs::TCAS_LAT).await,
         xp.get_float_array(datarefs::TCAS_LON).await,
@@ -3773,7 +3775,7 @@ pub struct TrafficFactor {
 /// The nearest TCAS target inside 6 nm and ±1,500 ft; `None` = no factor.
 /// Reads the sim's TCAS arrays, which any traffic source (LiveTraffic,
 /// default AI aircraft) populates — ATC narrates traffic, never controls it.
-pub async fn nearest_traffic_factor(xp: &XPlaneClient) -> Option<TrafficFactor> {
+pub async fn nearest_traffic_factor(xp: SimView<'_>) -> Option<TrafficFactor> {
     let bear = xp
         .get_float_array("sim/cockpit2/tcas/indicators/relative_bearing_degs")
         .await
@@ -3821,7 +3823,7 @@ fn vert_phrase(ft: f64) -> String {
 /// Factor traffic near the vectored arrival, spoken as a controller advisory
 /// ("traffic, two o'clock, three miles, five hundred feet above").
 /// `None` = no factor, frequency stays quiet.
-pub async fn traffic_advisory(xp: &XPlaneClient) -> Option<String> {
+pub async fn traffic_advisory(xp: SimView<'_>) -> Option<String> {
     let f = nearest_traffic_factor(xp).await?;
     let range =
         if f.nm < 1.0 { "under a mile".to_string() } else { format!("{:.0} miles", f.nm) };
@@ -3991,7 +3993,7 @@ impl Station {
 
     /// [`Station::briefing_text`] with COM1 read live. A failed read just
     /// drops the "com one is on" sentence — the list still answers.
-    pub async fn freq_briefing(&self, xp: &XPlaneClient) -> String {
+    pub async fn freq_briefing(&self, xp: SimView<'_>) -> String {
         let com1 = xp
             .get_float(datarefs::COM1_FREQ_KHZ)
             .await
