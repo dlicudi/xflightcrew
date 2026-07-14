@@ -16,13 +16,11 @@ mod approach_guide;
 mod atis;
 mod audio;
 mod autoland;
-mod blackbox;
 mod debrief;
 mod radiofx;
 mod rag;
 mod checklist;
 mod config;
-mod datarefs;
 mod failures;
 mod grammar;
 mod livestate;
@@ -49,7 +47,10 @@ mod tools;
 mod ui;
 mod vad;
 mod voice;
-mod xplane;
+
+// Simulator plumbing now lives in the `sim` crate; these shims keep every
+// existing `crate::xplane::...` path in the module tree resolving unchanged.
+pub(crate) use sim::{blackbox, datarefs, xplane};
 
 use std::time::{Duration, Instant};
 

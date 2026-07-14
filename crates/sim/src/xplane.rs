@@ -466,8 +466,8 @@ impl XPlane for XPlaneClient {
 /// Recording fake for tests: reads come from a preset table, writes and commands
 /// are recorded for assertions. A read with no preset value errors (so a test
 /// fails loudly if the code under test reads a dataref it didn't set up).
-#[cfg(test)]
-pub(crate) struct FakeXPlane {
+/// Compiled unconditionally so downstream crates' test suites can use it.
+pub struct FakeXPlane {
     reads: std::sync::Mutex<HashMap<String, f64>>,
     /// Every set_float/set_int, in order, as (dataref, value).
     writes: std::sync::Mutex<Vec<(String, f64)>>,
@@ -475,7 +475,6 @@ pub(crate) struct FakeXPlane {
     commands: std::sync::Mutex<Vec<String>>,
 }
 
-#[cfg(test)]
 impl FakeXPlane {
     pub fn new() -> Self {
         Self {
@@ -517,7 +516,6 @@ impl FakeXPlane {
     }
 }
 
-#[cfg(test)]
 #[async_trait]
 impl XPlane for FakeXPlane {
     async fn get_float(&self, name: &str) -> Result<f64> {

@@ -1,3 +1,21 @@
+# Workspace: the crew (this root package) embeds the world (crates/atc) as a
+# library; both stand on crates/sim. One process at runtime — the split is a
+# compile-time boundary, not the failed second-terminal experiment.
+[workspace]
+members = ["crates/sim"]
+
+# One version of each shared dep across the workspace, so the crates never drift.
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+base64 = "0.22"
+async-trait = "0.1"
+anyhow = "1"
+tracing = "0.1"
+
 [package]
 name = "x-copilot"
 version = "0.1.0"
@@ -20,9 +38,12 @@ name = "atc"
 path = "src/bin/atc.rs"
 
 [dependencies]
+# shared simulator plumbing (Web API client, dataref names, blackbox)
+sim = { path = "crates/sim" }
+
 # async runtime + HTTP
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+tokio = { workspace = true }
+reqwest = { workspace = true }
 # WebSocket for the live-state subscription cache (see src/livestate.rs); sync,
 # matching the rustdecks X-Plane client it's ported from.
 tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
@@ -31,10 +52,10 @@ tungstenite = { version = "0.21", default-features = false, features = ["handsha
 device_query = "2"
 
 # serde
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-base64 = "0.22"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+base64 = { workspace = true }
 
 # audio capture + speech-to-text
 cpal = "0.15"
@@ -45,13 +66,13 @@ cpal = "0.15"
 whisper-rs = { version = "0.12", features = ["whisper-cpp-tracing", "metal"] }
 
 # tooling glue
-async-trait = "0.1"
+async-trait = { workspace = true }
 # bounded-concurrency stream combinators for the failure scan (buffer_unordered
 # over ~800 failure-dataref reads with a borrowed client — see src/failures.rs)
 futures = "0.3"
-anyhow = "1"
+anyhow = { workspace = true }
 thiserror = "1"
-tracing = "0.1"
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
