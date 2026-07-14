@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{Tool, ToolCtx};
+use super::{Tool, ToolCtx, BRAKES_REGULAR, BRAKE_HOLD_SECS};
 use crate::xplane::XPlaneClient;
 
 const IAS: &str = "sim/cockpit2/gauges/indicators/airspeed_kts_pilot";
@@ -34,22 +34,21 @@ const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const LEFT_BRAKE: &str = "sim/cockpit2/controls/left_brake_ratio";
 const RIGHT_BRAKE: &str = "sim/cockpit2/controls/right_brake_ratio";
-/// The input-layer held-brake command — the same path as the pilot's brake
-/// key, which is the braking that demonstrably works. The previous design
-/// wrote the toe-brake RATIOS under an override that turned out NOT TO
-/// EXIST (`override_toebrakes`; the real dataref is `override_toe_brakes`,
-/// and the engage error was silently swallowed), so the sim re-drove the
-/// ratios from the pilot's hardware every frame and REST-rate writes lost
-/// the fight — "stop" never reliably stopped (flaky since 2026-07-11,
-/// pinned 2026-07-13). A command can't be stomped and can't stick: braking
-/// is this command re-activated every tick, and releasing is simply not
-/// renewing it.
-const BRAKES_REGULAR: &str = "sim/flight_controls/brakes_regular";
-/// How long each activation holds the brakes. Comfortably longer than a
-/// braking tick (~100 ms) so the hold is continuous while renewed — and any
-/// end of the governor (release, crash, kill -9) frees the brakes within
-/// this long, by expiry. A boot that can never be left on.
-const BRAKE_HOLD_SECS: f64 = 1.0;
+// The held-brake command and its expiry (`BRAKES_REGULAR`/`BRAKE_HOLD_SECS`)
+// live in `super` now: `hold_brakes` shares the same brake key. The history
+// of WHY it's a command, not ratio writes (the override that never existed,
+// the re-drive fight REST-rate writes lost) is pinned on the consts there.
+/// Proportional taxi brake, served by the bundled plugin: it drives the
+/// toe-brake ratios from this value every FRAME (override_toe_brakes held
+/// only while braking — per-frame writes win the re-drive fight that
+/// REST-rate writes lost), and expires it within a second of writes
+/// stopping, ratios zeroed and override dropped — the same can't-be-left-on
+/// property as the held command, but it keeps the law's magnitude. Speed
+/// TRIMS go here (regular effort is right for "stop", wrong for shaving two
+/// knots); stops keep the firm held command. Missing (plugin absent or old)
+/// falls back to the held command — harsher but braking, never silent
+/// nothing.
+const TAXI_BRAKE: &str = "xcopilot/taxi_brake";
 const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 const MS_TO_KTS: f64 = 1.943_844;
 /// Toe-brake ratio above which the pilot is deliberately braking — enough to
@@ -149,30 +148,59 @@ pub fn clamp_taxi_target(kts: f64) -> f64 {
 /// taxi — and below it airborne, they don't (55-kt floor applies).
 const TAXI_MAX_KTS: f64 = 30.0;
 
-/// One taxi-governor step: `(new_throttle, brake_ratio)` for a target and
-/// current groundspeed. Throttle capped well below takeoff power; brakes come
-/// in only once the throttle is already closed; near-zero targets hold the
-/// aircraft on the brakes so idle thrust can't creep it forward.
-pub fn taxi_control(target_kts: f64, gs_kts: f64, throttle: f64) -> (Option<f64>, f64) {
+/// One taxi-governor step: `(new_throttle, brake_ratio)` for a target,
+/// current groundspeed, and the speed TREND (knots/second). Throttle capped
+/// well below takeoff power; brakes are for deep overspeed and stops only,
+/// never speed trims; near-zero targets hold the aircraft on the brakes so
+/// idle thrust can't creep it forward.
+///
+/// The trend term is the same anticipation the flight law has, and it's the
+/// fix for the taxi limit cycle: a 10-knot taxi sawtoothed 6.6 to 11.9 knots
+/// forever (blackbox, 2026-07-14) because power only came back once the
+/// error was already big, seconds into the idle-throttle decel, and braking
+/// at one knot over turned every crest into a stab. Leading the error by the
+/// trend acts on where the speed is GOING. The 2.5 s lead matches the engine
+/// spool the correction has to ride through; the caller must hand in a
+/// SMOOTHED trend (the governor EMAs it) — raw tick-to-tick differences of a
+/// noisy groundspeed read turn the lead into phantom brake stabs.
+pub fn taxi_control(
+    target_kts: f64,
+    gs_kts: f64,
+    throttle: f64,
+    trend_kts_s: f64,
+) -> (Option<f64>, f64) {
     if target_kts < 1.0 && gs_kts < 1.5 {
         return (Some(0.0), 0.5); // holding position: idle + parked on the brakes
     }
-    let err = target_kts - gs_kts;
-    if err > 1.0 {
-        // Too slow: a touch more power (never takeoff power), brakes off.
-        // Small steps on a fast tick — human feet, not a bang-bang thermostat.
-        (Some((throttle + (err * 0.003).min(0.01)).min(0.35)), 0.0)
-    } else if err < -3.0 {
+    // Where we'll be once a lever change has worked through the spool.
+    let eff = (target_kts - gs_kts) - trend_kts_s * 2.5;
+    if eff > 1.0 {
+        // Too slow, or decaying toward it: a touch more power (never takeoff
+        // power), brakes off. Small steps on a fast tick, human feet, not a
+        // bang-bang thermostat; well behind the pace the step doubles so the
+        // rebuild from idle doesn't undershoot for ten seconds.
+        let step = (eff * 0.003).min(if eff > 3.0 { 0.02 } else { 0.01 });
+        (Some((throttle + step).min(0.35)), 0.0)
+    } else if eff < -3.0 {
         // WELL past the target: idle now and brake in proportion, together —
         // the polite step-down let an SR22 run a 10-knot taxi through 20
-        // (2026-07-11). Overspeed deep enough is a stop, not a trim.
-        (Some(0.0), ((-err) * 0.08).clamp(0.2, 0.6))
-    } else if err < -1.0 {
-        // A little fast: close the throttle first; brake once it's closed.
-        if throttle > 0.06 {
-            (Some((throttle - 0.04).max(0.0)), 0.0)
+        // (2026-07-11). Ramped from the boundary: the old flat 0.2 minimum
+        // stabbed the pedals the instant this branch was crossed.
+        (Some(0.0), ((-eff - 3.0) * 0.12 + 0.1).clamp(0.1, 0.6))
+    } else if eff < -1.0 {
+        // A little fast: power off is the whole correction for a rolling
+        // taxi — idle thrust won't hold it fast on the flat, and braking to
+        // shave one knot is how the ride turns into a rodeo. Gently: the
+        // old 0.04 dump slammed the lever shut in half a second and bought
+        // the deep undershoot on the other side. A STOP keeps braking to
+        // the halt once the throttle's closed: idle creep never finishes a
+        // stop on its own.
+        if throttle > 0.03 {
+            (Some((throttle - 0.01).max(0.0)), 0.0)
+        } else if target_kts < 1.0 {
+            (Some(0.0), ((-eff) * 0.08).clamp(0.1, 0.6))
         } else {
-            (Some(0.0), ((-err) * 0.08).clamp(0.1, 0.6))
+            (Some(0.0), 0.0)
         }
     } else {
         (None, 0.0) // in the groove: hands off, brakes released
@@ -373,8 +401,13 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
     tracing::info!("speed governor started");
     let mut braking = false;
     // When the held-brake command was last renewed: until it expires, the
-    // pedal ratios can be our own braking, not the pilot's feet.
+    // pedal ratios can be our own braking, not the pilot's feet. (Only the
+    // held COMMAND pollutes the pedals — the proportional channel is
+    // additive and leaves them alone.)
     let mut last_brake_cmd: Option<std::time::Instant> = None;
+    // The proportional channel failed once (plugin absent or old): warned,
+    // trims fall back to the held command for the rest of this governor.
+    let mut trim_fallback = false;
     // Brake-paused: the pilot pressed both pedals mid-taxi, the throttle went
     // to idle, and the hold is waiting for the pedals to come fully off.
     let mut paused = false;
@@ -385,6 +418,11 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
     let mut last_cmd: Option<f64> = None;
     // Last IAS sample, for the flight governor's trend (anticipation) term.
     let mut prev_ias: Option<(f64, std::time::Instant)> = None;
+    // Last groundspeed sample and the EMA-smoothed trend for the taxi law's
+    // anticipation term. Smoothed on purpose: the 2.5 s lead amplifies any
+    // read noise 25x if fed raw tick-to-tick differences.
+    let mut prev_gs: Option<(f64, std::time::Instant)> = None;
+    let mut gs_trend = 0.0_f64;
     loop {
         if !ACTIVE.load(Ordering::Relaxed) {
             break;
@@ -537,23 +575,59 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                         ACTIVE.store(false, Ordering::Relaxed);
                         break;
                     }
-                    let (new_thr, brake) = taxi_control(target, gs_ms * MS_TO_KTS, thr);
+                    let gs_kts = gs_ms * MS_TO_KTS;
+                    let now_t = std::time::Instant::now();
+                    let raw_trend = match prev_gs {
+                        Some((last_gs, last_t)) => {
+                            let dt = now_t.duration_since(last_t).as_secs_f64();
+                            if (0.05..=2.0).contains(&dt) { (gs_kts - last_gs) / dt } else { 0.0 }
+                        }
+                        None => 0.0,
+                    };
+                    prev_gs = Some((gs_kts, now_t));
+                    gs_trend = gs_trend * 0.7 + raw_trend * 0.3;
+                    let (new_thr, brake) = taxi_control(target, gs_kts, thr, gs_trend);
                     let wrote = new_thr.is_some() || brake > 0.0 || braking;
                     if let Some(t) = new_thr {
                         glide(&xp, THROTTLE, t, 200).await;
                         last_cmd = Some(t);
                     }
-                    // Braking is the held INPUT command, renewed every tick
-                    // while the law wants brake — the same firm application
-                    // as the pilot's own brake key. Never silent on failure:
-                    // a swallowed brake error hid the broken override for
-                    // days of flights.
+                    // Two brake channels, by intent. A STOP (target zero) is
+                    // the held INPUT command renewed every tick — the pilot's
+                    // own brake key, regular effort, which demonstrably
+                    // stops. A speed TRIM is feathered: the law's magnitude
+                    // through the plugin's proportional channel, so shaving
+                    // two knots doesn't get the same stab as a full stop.
+                    // Never silent on failure: a swallowed brake error hid
+                    // the broken override for days of flights.
                     if brake > 0.0 {
-                        match xp.run_command_for(BRAKES_REGULAR, BRAKE_HOLD_SECS).await {
-                            Ok(()) => last_brake_cmd = Some(std::time::Instant::now()),
-                            Err(e) => {
-                                tracing::warn!("speed governor: brake command failed: {e:#}")
+                        let mut trimmed = false;
+                        if target >= 1.0 && !trim_fallback {
+                            match xp.set_float(TAXI_BRAKE, brake).await {
+                                Ok(()) => trimmed = true,
+                                Err(e) => {
+                                    trim_fallback = true;
+                                    tracing::warn!(
+                                        "speed governor: proportional brake unavailable \
+                                         ({e:#}), falling back to the brake key"
+                                    );
+                                }
                             }
+                        }
+                        if !trimmed {
+                            match xp.run_command_for(BRAKES_REGULAR, BRAKE_HOLD_SECS).await {
+                                Ok(()) => last_brake_cmd = Some(std::time::Instant::now()),
+                                Err(e) => {
+                                    tracing::warn!("speed governor: brake command failed: {e:#}")
+                                }
+                            }
+                        }
+                    } else if braking && !trim_fallback {
+                        // Release the trim channel promptly instead of riding
+                        // out its expiry; a failure here is covered by that
+                        // same expiry, so it's only worth a debug line.
+                        if let Err(e) = xp.set_float(TAXI_BRAKE, 0.0).await {
+                            tracing::debug!("speed governor: brake release write failed: {e:#}");
                         }
                     }
                     braking = brake > 0.0;
@@ -604,26 +678,67 @@ mod tests {
     #[test]
     fn taxi_law_throttle_then_brakes() {
         // Too slow: power comes up, capped below anything takeoff-like.
-        let (thr, brake) = taxi_control(10.0, 4.0, 0.10);
+        let (thr, brake) = taxi_control(10.0, 4.0, 0.10, 0.0);
         assert!(thr.unwrap() > 0.10 && thr.unwrap() <= 0.35);
         assert_eq!(brake, 0.0);
         // A little fast with power in: close the throttle before the brakes.
-        let (thr, brake) = taxi_control(10.0, 12.0, 0.20);
+        let (thr, brake) = taxi_control(10.0, 12.0, 0.20, 0.0);
         assert!(thr.unwrap() < 0.20);
         assert_eq!(brake, 0.0, "no braking against thrust");
         // WELL past the target: idle now AND brake — the polite step-down
         // let an SR22 run a 10-knot taxi through 20 (2026-07-11).
-        let (thr, brake) = taxi_control(10.0, 16.0, 0.20);
+        let (thr, brake) = taxi_control(10.0, 16.0, 0.20, 0.0);
         assert_eq!(thr, Some(0.0), "deep overspeed cuts to idle immediately");
         assert!(brake > 0.0 && brake <= 0.6, "{brake}");
-        // Too fast at idle: brakes, proportionally, bounded.
-        let (thr, brake) = taxi_control(10.0, 18.0, 0.02);
+        // Too fast at idle, deep: brakes, proportionally, bounded.
+        let (thr, brake) = taxi_control(10.0, 18.0, 0.02, 0.0);
         assert_eq!(thr, Some(0.0));
         assert!(brake > 0.0 && brake <= 0.6, "{brake}");
         // In the groove: hands off everything, brakes released.
-        assert_eq!(taxi_control(10.0, 10.5, 0.15), (None, 0.0));
+        assert_eq!(taxi_control(10.0, 10.5, 0.15, 0.0), (None, 0.0));
         // Hold short: idle + parked on the brakes even when stopped.
-        assert_eq!(taxi_control(0.0, 0.2, 0.0), (Some(0.0), 0.5));
+        assert_eq!(taxi_control(0.0, 0.2, 0.0, 0.0), (Some(0.0), 0.5));
+    }
+
+    #[test]
+    fn taxi_law_never_brakes_a_speed_trim() {
+        // The limit-cycle fix (6.6 ↔ 11.9 kt sawtooth, 2026-07-14): one or
+        // two knots over at idle is NOT a braking problem — coast it off.
+        let (thr, brake) = taxi_control(10.0, 11.8, 0.02, 0.0);
+        assert_eq!(brake, 0.0, "no brake stab to shave two knots");
+        assert_eq!(thr, Some(0.0));
+        // But a STOP still brakes all the way to the halt once the
+        // throttle's closed — idle creep never finishes a stop.
+        let (thr, brake) = taxi_control(0.0, 2.5, 0.0, 0.0);
+        assert_eq!(thr, Some(0.0));
+        assert!(brake > 0.0, "a stop stays on the brakes to the halt");
+        // And the deep brake ramps from the boundary instead of stabbing at
+        // 0.2 the instant the branch is crossed.
+        let (_, just_over) = taxi_control(10.0, 13.2, 0.0, 0.0);
+        assert!(just_over < 0.2, "gentle at the boundary: {just_over}");
+        let (_, way_over) = taxi_control(10.0, 18.0, 0.0, 0.0);
+        assert!(way_over > just_over, "deeper overspeed brakes harder");
+    }
+
+    #[test]
+    fn taxi_law_anticipates_the_trend() {
+        // Decaying toward the target at idle: power comes back BEFORE the
+        // speed falls through it — the other half of the limit-cycle fix.
+        let steady = taxi_control(10.0, 9.7, 0.05, 0.0);
+        assert_eq!(steady, (None, 0.0), "on pace and steady: hands off");
+        let (thr, brake) = taxi_control(10.0, 9.7, 0.05, -1.5);
+        assert!(thr.unwrap() > 0.05, "decaying through target: power early");
+        assert_eq!(brake, 0.0);
+        // Accelerating gently through the target with power in: trim it
+        // early too, still no brakes.
+        let (thr, brake) = taxi_control(10.0, 10.5, 0.20, 0.8);
+        assert!(thr.unwrap() < 0.20, "building through target: power off early");
+        assert_eq!(brake, 0.0);
+        // A genuine SURGE (downhill, +1.5 kt/s) reads as deep overspeed
+        // before the speed gets there: idle and brakes, by design.
+        let (thr, brake) = taxi_control(10.0, 10.5, 0.20, 1.5);
+        assert_eq!(thr, Some(0.0));
+        assert!(brake > 0.0, "a surge earns the brakes early");
     }
 
     #[test]

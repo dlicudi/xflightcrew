@@ -170,6 +170,23 @@ static XPLMDataRef g_coach_dref = nullptr;
 // COM1 active frequency (integer kHz despite the sim's `hz` name) — read for
 // the ATC tab's tuned highlight, written by its click-to-tune.
 static XPLMDataRef g_com1_dref = nullptr;
+// Proportional taxi brake. The app writes xcopilot/taxi_brake (0..1) and the
+// flight loop drives the toe-brake ratios from it every frame, holding
+// override_toe_brakes only while a fresh value wants brake; writes stopping
+// for any reason (release, crash, kill -9) expire it within a second, ratios
+// zeroed and the override dropped — the dataref equivalent of a held
+// command, a boot that can't be left on. Per-frame is the part the app
+// process can't provide: REST-rate ratio writes lose the re-drive fight
+// (and l_brake_add, the no-override channel, is stomped by XP12 every
+// frame — tested live 2026-07-14, writes read back -0.0 immediately).
+static XPLMDataRef g_taxi_brake_dref = nullptr;
+static XPLMDataRef g_l_brake_ratio = nullptr;
+static XPLMDataRef g_r_brake_ratio = nullptr;
+static XPLMDataRef g_override_toe_brakes = nullptr;
+static float g_taxi_brake = 0.0f;
+static float g_taxi_brake_stamp = -1.0f;
+static bool g_taxi_brake_applied = false;
+static const float kTaxiBrakeFreshSecs = 1.0f;
 
 // Transmission log shown in the panel, each entry stamped with wall-clock time
 // so a test flight can be reviewed afterwards.
@@ -284,6 +301,33 @@ static void WriteAction(void*, void* in, int offset, int len) {
 // Active aircraft ICAO — shown beside the connection chip, not logged.
 static void WriteAircraft(void*, void* in, int offset, int len) {
     StoreText(&g_aircraft, in, offset, len);
+}
+// The taxi-speed governor renews this every braking tick; the stamp is what
+// makes the value expire instead of stick.
+static float ReadTaxiBrake(void*) { return g_taxi_brake; }
+static void WriteTaxiBrake(void*, float v) {
+    g_taxi_brake = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    g_taxi_brake_stamp = XPLMGetElapsedTime();
+}
+static float TaxiBrakeLoop(float, float, int, void*) {
+    const bool fresh = g_taxi_brake_stamp >= 0.0f
+        && XPLMGetElapsedTime() - g_taxi_brake_stamp <= kTaxiBrakeFreshSecs;
+    if (fresh && g_taxi_brake > 0.0f) {
+        // The override holds ONLY while we're actively braking, so the
+        // pedals are the pilot's the rest of the time.
+        if (g_override_toe_brakes) XPLMSetDatai(g_override_toe_brakes, 1);
+        if (g_l_brake_ratio) XPLMSetDataf(g_l_brake_ratio, g_taxi_brake);
+        if (g_r_brake_ratio) XPLMSetDataf(g_r_brake_ratio, g_taxi_brake);
+        g_taxi_brake_applied = true;
+    } else if (g_taxi_brake_applied) {
+        if (g_l_brake_ratio) XPLMSetDataf(g_l_brake_ratio, 0.0f);
+        if (g_r_brake_ratio) XPLMSetDataf(g_r_brake_ratio, 0.0f);
+        // Dropped last: the sim re-drives the ratios from the pilot's
+        // hardware the very next frame.
+        if (g_override_toe_brakes) XPLMSetDatai(g_override_toe_brakes, 0);
+        g_taxi_brake_applied = false;
+    }
+    return -1.0f; // every frame: braking rides the physics rate, not REST rate
 }
 // Live flight strip — a status row the app refreshes continuously, not logged.
 static void WriteStrip(void*, void* in, int offset, int len) {
@@ -1320,6 +1364,14 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteCoach, &g_coach, &g_coach);
     g_com1_dref = XPLMFindDataRef("sim/cockpit2/radios/actuators/com1_frequency_hz_833");
+    g_taxi_brake_dref = XPLMRegisterDataAccessor(
+        "xcopilot/taxi_brake", xplmType_Float, 1,
+        nullptr, nullptr, ReadTaxiBrake, WriteTaxiBrake, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_l_brake_ratio = XPLMFindDataRef("sim/cockpit2/controls/left_brake_ratio");
+    g_r_brake_ratio = XPLMFindDataRef("sim/cockpit2/controls/right_brake_ratio");
+    g_override_toe_brakes = XPLMFindDataRef("sim/operation/override/override_toe_brakes");
+    XPLMRegisterFlightLoopCallback(TaxiBrakeLoop, -1.0f, nullptr);
 
     // One shared font atlas for all ImgWindows (uses ImGui's default font).
     ImgWindow::sFontAtlas = std::make_shared<ImgFontAtlas>();
@@ -1349,6 +1401,17 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
 }
 
 PLUGIN_API void XPluginStop(void) {
+    XPLMUnregisterFlightLoopCallback(TaxiBrakeLoop, nullptr);
+    // Leave no brake behind: if the loop was mid-apply, release the ratios
+    // and drop the override ourselves — nobody else will after the callback
+    // is gone.
+    if (g_taxi_brake_applied) {
+        if (g_l_brake_ratio) XPLMSetDataf(g_l_brake_ratio, 0.0f);
+        if (g_r_brake_ratio) XPLMSetDataf(g_r_brake_ratio, 0.0f);
+        if (g_override_toe_brakes) XPLMSetDatai(g_override_toe_brakes, 0);
+        g_taxi_brake_applied = false;
+    }
+    if (g_taxi_brake_dref) { XPLMUnregisterDataAccessor(g_taxi_brake_dref); g_taxi_brake_dref = nullptr; }
     if (g_toggle_cmd) { XPLMUnregisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr); g_toggle_cmd = nullptr; }
     if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }
     if (g_atc_dref) { XPLMUnregisterDataAccessor(g_atc_dref); g_atc_dref = nullptr; }

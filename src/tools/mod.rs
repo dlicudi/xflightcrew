@@ -47,6 +47,18 @@ use crate::xplane::XPlane;
 /// Parking-brake ratio dataref (0 = off, 1 = set). Written by `set_parking_brake`
 /// and read by `stop_engine`'s pre-shutdown check.
 pub(crate) const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
+/// The input-layer held-brake command, the pilot's own brake key. Held by the
+/// taxi governor's stop channel AND by `hold_brakes` ("brakes on"). Command,
+/// not ratio writes, on purpose: the sim re-drives the toe-brake ratios from
+/// the pilot's hardware every frame, and REST-rate ratio writes lost that
+/// fight (flaky "stop" since 2026-07-11, pinned 2026-07-13). A command can't
+/// be stomped and can't stick.
+pub(crate) const BRAKES_REGULAR: &str = "sim/flight_controls/brakes_regular";
+/// How long each activation holds the brakes. Comfortably longer than a
+/// renewal tick, so the hold is continuous while renewed, and any end of the
+/// holder (release, crash, kill -9) frees the brakes within this long, by
+/// expiry. A boot that can never be left on.
+pub(crate) const BRAKE_HOLD_SECS: f64 = 1.0;
 /// Command: engage the autopilot servos. Pressed by the AP-mode tools
 /// (`set_heading`/`set_altitude`/…) and by the ILS setup in `approach`.
 pub(crate) const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
