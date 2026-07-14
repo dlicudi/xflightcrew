@@ -44,6 +44,36 @@ pub fn radioize_with_tail(samples: &mut Vec<f32>, sample_rate: u32, variant: u32
     samples.extend(tail.iter().map(|s| s * gain));
 }
 
+/// Per-person voice shift: resample the raw speech by `factor` so it plays
+/// back pitch- AND pace-shifted together (>1.0 = higher and quicker), like a
+/// different larynx reading the same script. A few percent is enough to break
+/// "same speaker" perception while keeping the voice natural — the point is
+/// that a station never plays a TTS model at its native pitch, so the copilot
+/// can share a model with any controller without sounding like them
+/// (ryan-high was both the copilot and the approach controller, 2026-07-14).
+/// Applied BEFORE [`radioize_variant`] so the key click, noise floor, and
+/// squelch tail stay at their natural pitch — they're the receiver's sound,
+/// not the speaker's.
+pub fn voice_shift(samples: &mut Vec<f32>, sample_rate: u32, factor: f32) {
+    // Unity or out-of-band factors are a no-op: never degrade the audio for
+    // an effect nobody would hear (or a corrupt factor nobody wants).
+    if samples.is_empty() || !(0.5..=2.0).contains(&factor) || (factor - 1.0).abs() < 0.005 {
+        return;
+    }
+    let out_rate = (sample_rate as f32 / factor).round() as u32;
+    *samples = crate::mic::resample_linear(samples, sample_rate, out_rate);
+}
+
+/// The deterministic shift factor for a cast identity (see
+/// `voice::station_person`): binned so every person lands a clearly nonzero
+/// offset — unity is deliberately not in the table, because "no shift" is the
+/// copilot's signature. Small enough that intelligibility through the
+/// 300-3 kHz bandpass never suffers.
+pub fn shift_factor(person: u64) -> f32 {
+    const BINS: [f32; 6] = [0.92, 0.95, 0.97, 1.03, 1.06, 1.09];
+    BINS[(person % BINS.len() as u64) as usize]
+}
+
 /// Read a squelch recording for [`radioize_with_tail`]: any WAV (float or
 /// int samples), downmixed to mono, resampled to `target_rate`, peak
 /// normalized so the per-transmission gain lands predictably.
@@ -278,6 +308,55 @@ mod tests {
         assert!(voice > 0.25, "1 kHz should pass, rms {voice}");
         assert!(rumble < voice * 0.1, "60 Hz should die: {rumble} vs {voice}");
         assert!(hiss < voice * 0.2, "8 kHz should die: {hiss} vs {voice}");
+    }
+
+    #[test]
+    fn voice_shift_scales_duration_and_pitch_together() {
+        let fs = 22050;
+        // Factor 1.09: the same second of speech plays ~8% shorter (and
+        // therefore ~9% higher) — duration is the observable proxy for pitch
+        // in a pure resample.
+        let mut s = sine(440.0, fs as f32, 1.0);
+        let before = s.len();
+        voice_shift(&mut s, fs, 1.09);
+        let ratio = s.len() as f32 / before as f32;
+        assert!((ratio - 1.0 / 1.09).abs() < 0.01, "len ratio {ratio}");
+        // Down-shift lengthens instead.
+        let mut s = sine(440.0, fs as f32, 1.0);
+        voice_shift(&mut s, fs, 0.92);
+        let ratio = s.len() as f32 / before as f32;
+        assert!((ratio - 1.0 / 0.92).abs() < 0.01, "len ratio {ratio}");
+        // Linear interpolation must not add energy.
+        let peak = s.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
+        assert!(peak <= 0.51, "resample must not exceed the source peak: {peak}");
+    }
+
+    #[test]
+    fn voice_shift_noops_on_unity_and_garbage() {
+        let fs = 22050;
+        let orig = sine(440.0, fs as f32, 0.2);
+        for factor in [1.0, 1.004, 0.3, 2.5, f32::NAN] {
+            let mut s = orig.clone();
+            voice_shift(&mut s, fs, factor);
+            assert_eq!(s.len(), orig.len(), "factor {factor} must be a no-op");
+        }
+        let mut empty: Vec<f32> = Vec::new();
+        voice_shift(&mut empty, fs, 1.09);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn shift_factor_is_never_unity_and_stays_intelligible() {
+        for person in 0..64_u64 {
+            let f = shift_factor(person);
+            assert!((f - 1.0).abs() >= 0.02, "person {person} got a shift nobody would hear: {f}");
+            assert!((0.9..=1.1).contains(&f), "person {person} shifted past intelligibility: {f}");
+            // Stable: the same person always speaks at the same pitch.
+            assert_eq!(f, shift_factor(person));
+        }
+        // The bins actually spread people out (both directions represented).
+        let factors: Vec<f32> = (0..6).map(shift_factor).collect();
+        assert!(factors.iter().any(|f| *f < 1.0) && factors.iter().any(|f| *f > 1.0));
     }
 
     #[test]

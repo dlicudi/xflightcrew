@@ -189,6 +189,12 @@ pub struct Config {
     /// stable person from Gibraltar's. Empty = every airport uses the curated
     /// voices. `XCOPILOT_ATC_VOICE_POOL`.
     pub atc_voice_pool: String,
+    /// Deterministic per-controller pitch/pace offset (a few percent, keyed to
+    /// the cast identity) applied to station voices before the radio effect —
+    /// a station never plays a TTS model at its native pitch, so the copilot
+    /// can share a model with any controller without sounding like the same
+    /// person. `XCOPILOT_ATC_VOICE_SHIFT=false` disables.
+    pub atc_voice_shift: bool,
     /// Recorded squelch transient spliced onto the end of every station
     /// transmission (VATSIM-style; the default is AFV-Native's click, BSD-3,
     /// see assets/afv/). Empty falls back to the synthesized burst.
@@ -316,6 +322,7 @@ impl Config {
                  models/en_US-lessac-medium.onnx,models/en_US-hfc_male-medium.onnx,\
                  models/en_US-hfc_female-medium.onnx",
             ),
+            atc_voice_shift: env_or("XCOPILOT_ATC_VOICE_SHIFT", "true") != "false",
             atc_squelch_wav: env_or("XCOPILOT_SQUELCH_WAV", "assets/afv/Click_f32.wav"),
             atc_voice: env_or("XCOPILOT_ATC_VOICE", "Daniel"),
             atc_rate: env_or("XCOPILOT_ATC_RATE", "165"),

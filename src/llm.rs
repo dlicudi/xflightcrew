@@ -773,6 +773,7 @@ mod tests {
             atc_departure_piper_voice: String::new(),
             atc_atis_piper_voice: String::new(),
             atc_voice_pool: String::new(),
+            atc_voice_shift: false,
             atc_region: String::new(),
             atc_chatter: true,
             mute_xp_radio: false,

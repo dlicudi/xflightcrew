@@ -124,6 +124,25 @@ pub fn pilot_voice_choices() -> Vec<String> {
     voices
 }
 
+/// The cast identity a station voice speaks AS — what keys its pitch/pace
+/// shift ([`crate::radiofx::shift_factor`]). Model + position + airport seed,
+/// so the same pool model is a different person at a different field or in a
+/// different chair, and stays the same person all flight (rebuilds of the
+/// warm session recompute the same value).
+fn station_person(model: &str, slot: usize, seed: usize) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in model
+        .as_bytes()
+        .iter()
+        .chain(&[slot as u8])
+        .chain(&seed.to_le_bytes())
+    {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h
+}
+
 /// A stable per-airport voice seed (FNV-1a over the name), never 0 — seed 0
 /// is reserved for the configured home field's curated voices.
 pub fn station_voice_seed(airport_name: &str) -> usize {
@@ -895,12 +914,15 @@ enum StationVoice {
         /// Counter so each reply gets a fresh radio-effect variant — real
         /// squelch never sounds the same twice.
         transmissions: u32,
+        /// This person's pitch/pace factor (see [`crate::radiofx::voice_shift`]);
+        /// 1.0 = disabled.
+        shift: f32,
     },
     Say(Config),
 }
 
 impl StationVoice {
-    fn build(config: &Config, model: &str) -> Self {
+    fn build(config: &Config, model: &str, person: u64) -> Self {
         #[cfg(feature = "onnx-tts")]
         if !model.is_empty() {
             match crate::tts_onnx::OnnxTts::load(model) {
@@ -937,12 +959,18 @@ impl StationVoice {
                                 None
                             }
                         });
+                    let shift = if config.atc_voice_shift {
+                        crate::radiofx::shift_factor(person)
+                    } else {
+                        1.0
+                    };
                     tracing::info!(
                         model = %model,
                         squelch = if tail.is_some() { "recorded" } else { "synthesized" },
+                        shift,
                         "station voice: warm ONNX session + radio effect"
                     );
-                    return StationVoice::Onnx { engine: Box::new(engine), tail, transmissions: 0 };
+                    return StationVoice::Onnx { engine: Box::new(engine), tail, transmissions: 0, shift };
                 }
                 Err(e) => {
                     tracing::warn!("station voice load failed ({e:#}); falling back to `say`");
@@ -965,13 +993,19 @@ impl StationVoice {
     fn speak(&mut self, text: &str, on_start: impl FnOnce(&[f32], u32)) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "onnx-tts")]
-            StationVoice::Onnx { engine, tail, transmissions } => {
+            StationVoice::Onnx { engine, tail, transmissions, shift } => {
                 *transmissions = transmissions.wrapping_add(1);
                 let variant = *transmissions;
                 let tail = tail.clone();
-                let samples = engine.render_with(text, move |s, r| match &tail {
-                    Some(t) => crate::radiofx::radioize_with_tail(s, r, variant, t),
-                    None => crate::radiofx::radioize_variant(s, r, variant),
+                let shift = *shift;
+                let samples = engine.render_with(text, move |s, r| {
+                    // The person's voice shifts; the receiver's clicks, noise
+                    // floor, and squelch stay natural — so shift first.
+                    crate::radiofx::voice_shift(s, r, shift);
+                    match &tail {
+                        Some(t) => crate::radiofx::radioize_with_tail(s, r, variant, t),
+                        None => crate::radiofx::radioize_variant(s, r, variant),
+                    }
                 })?;
                 on_start(&samples, engine.sample_rate());
                 tts::play_pcm(&samples, engine.sample_rate())
@@ -1284,7 +1318,8 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let slot = &mut stations[who.slot()];
             if slot.as_ref().map(|(m, _)| m.as_str()) != Some(model.as_str()) {
-                *slot = Some((model.clone(), StationVoice::build(&station_cfg, &model)));
+                let person = station_person(&model, who.slot(), seed);
+                *slot = Some((model.clone(), StationVoice::build(&station_cfg, &model, person)));
             }
             // Publish the transmission as on-air just before playback, so a
             // PTT press or a retune can CUT it (no resume). Copilot speech
