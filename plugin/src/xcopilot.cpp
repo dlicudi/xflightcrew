@@ -185,9 +185,13 @@ struct LogEntry {
 static std::vector<LogEntry> g_log;
 static bool g_log_scroll = false;
 static bool g_log_autoscroll = true;
-// Live view filter: 0 = all, 1 = crew (intercom), 2 = radio. Never stored —
-// a declutter for a busy frequency, not a mode.
-static int g_log_filter = 0;
+// Live view filter: PILOT rows always show (it's the pilot's own transcript),
+// the boxes toggle the other participants. copilot = the intercom, atc =
+// calls with our name on them, others = the overheard party line. All ticked
+// by default and never stored: a declutter for a busy frequency, not a mode.
+static bool g_flt_copilot = true;
+static bool g_flt_atc = true;
+static bool g_flt_others = true;
 // New entries arrived since the Log tab was last shown — drives an unread dot
 // on the tab so activity isn't missed while on Route/Settings.
 static bool g_log_unseen = false;
@@ -889,12 +893,17 @@ protected:
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", hint);
         }
         for (const LogEntry& e : g_log) {
-            // The live filter: crew is the intercom (pilot + copilot), radio
-            // is everything on a frequency (pilot included — their words are
-            // half of both conversations).
-            const bool crew_row = e.tag == "PILOT" || e.tag == "COPILOT";
-            if (g_log_filter == 1 && !crew_row) continue;
-            if (g_log_filter == 2 && e.tag == "COPILOT") continue;
+            // The live filter. PILOT rows never filter: a row doesn't record
+            // which channel the pilot's words went out on, and their side of
+            // the transcript is the anchor either way. Ghost pilots (TRAFFIC)
+            // count as the party line even if a row arrived undimmed.
+            if (e.tag != "PILOT") {
+                const bool others = e.ambient || e.tag == "TRAFFIC";
+                const bool show = e.tag == "COPILOT" ? g_flt_copilot
+                                  : others           ? g_flt_others
+                                                     : g_flt_atc;
+                if (!show) continue;
+            }
             // Ambience (overheard party-line exchanges) dims, chip and all —
             // calls with our name on them stay bright.
             const ImU32 col = e.ambient ? COL_DIM : e.color;
@@ -931,11 +940,11 @@ protected:
 
         // Footer: the view filter on the left, log controls on the right —
         // state lives in the chips, version in Settings.
-        ImGui::RadioButton("all", &g_log_filter, 0);
+        ImGui::Checkbox("copilot", &g_flt_copilot);
         ImGui::SameLine();
-        ImGui::RadioButton("crew", &g_log_filter, 1);
+        ImGui::Checkbox("atc", &g_flt_atc);
         ImGui::SameLine();
-        ImGui::RadioButton("radio", &g_log_filter, 2);
+        ImGui::Checkbox("others", &g_flt_others);
         // Right-aligned: auto-scroll toggle + clear.
         const char* clearLbl = "Clear";
         float ctlW = ImGui::CalcTextSize("Clear").x + ImGui::CalcTextSize("follow").x
