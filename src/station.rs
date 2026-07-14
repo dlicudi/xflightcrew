@@ -1503,6 +1503,38 @@ pub fn compliance_tick(
             )
         {
             if let Some(rwy) = on_active_runway(lat, lon) {
+                // The tower's OWN taxi route may cross (or backtrack) a
+                // runway — apt.dat networks do it all the time, and the
+                // clearance speaks the crossing ("cross runway two seven").
+                // On a runway-flagged leg of the cleared route the occupancy
+                // is LEGAL: silence while it keeps moving, and a stopped
+                // crossing earns "expedite" — never the berate (the tower
+                // shouted "you are on runway two seven without clearance" at
+                // a pilot following its own route, 2026-07-14).
+                if *state == tower::State::TaxiCleared
+                    && on_cleared_runway_crossing(lat, lon)
+                {
+                    if gs_kts < 3.0 {
+                        w.last_call = Some(now);
+                        let rwy = atis::spoken_runway(&rwy);
+                        return Some(if tuned {
+                            ComplianceCall {
+                                line: format!(
+                                    "{callsign}, expedite crossing runway {rwy}."
+                                ),
+                                crew: false,
+                            }
+                        } else {
+                            ComplianceCall {
+                                line: format!(
+                                    "We've stopped on runway {rwy}. Keep it moving across."
+                                ),
+                                crew: true,
+                            }
+                        });
+                    }
+                    return None;
+                }
                 w.last_call = Some(now);
                 let rwy = atis::spoken_runway(&rwy);
                 return Some(if tuned {
@@ -3213,7 +3245,40 @@ fn plan_taxi_route_to(
     } else {
         (r.lat_b, r.lon_b)
     };
-    net.plan(lat, lon, tlat, tlon)
+    let mut plan = net.plan(lat, lon, tlat, tlon)?;
+    backfill_unnamed_crossings(&mut plan, runways);
+    Some(plan)
+}
+
+/// Name the crossings the planner couldn't: apt.dat authors often leave
+/// runway network edges UNNAMED, so the planner's crossings list (named
+/// edges only) missed them and the clearance never said "cross runway ..."
+/// — the pilot's first hint was the (former) incursion berate mid-crossing
+/// (2026-07-14). A runway-flagged leg with no name is matched to whichever
+/// physical strip its midpoint sits on, and that strip's designator joins
+/// the crossings list.
+fn backfill_unnamed_crossings(plan: &mut nav::TaxiRoutePlan, runways: &[nav::Runway]) {
+    for (i, (name, is_runway)) in plan.seg.iter().enumerate() {
+        if !*is_runway || !name.is_empty() {
+            continue;
+        }
+        // Sample the leg every ~20 m (its midpoint alone can miss a strip
+        // the leg only clips): first sampled point on a runway names it.
+        let (a, b) = (plan.path[i], plan.path[i + 1]);
+        let len_m = crate::haversine_nm(a.0, a.1, b.0, b.1) * 1852.0;
+        let steps = ((len_m / 20.0).ceil() as usize).max(1);
+        let hit = (0..=steps).find_map(|k| {
+            let t = k as f64 / steps as f64;
+            let (plat, plon) = (a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1));
+            runways.iter().find(|r| on_runway(r, plat, plon).is_some())
+        });
+        if let Some(r) = hit {
+            let full = format!("{}/{}", r.ident_a, r.ident_b);
+            if !plan.crossings.contains(&full) {
+                plan.crossings.push(full);
+            }
+        }
+    }
 }
 
 /// A taxiway name spoken like a controller says it: designator letters go
@@ -3316,6 +3381,50 @@ pub fn first_designator(name: &str) -> &str {
 }
 
 /// Distance from a point to a polyline, meters — the off-route check.
+/// Whether the pilot stands where the cleared taxi route itself runs over a
+/// runway — a crossing or backtrack the tower put in the clearance ("cross
+/// runway two seven"). Geometry, not the apt.dat runway flag: authors leave
+/// crossing edges unnamed and sometimes unflagged, and the flag adds nothing
+/// the pavement test doesn't. The pilot must be within the off-route corridor
+/// of the route AND the route's nearest point must itself be ON a runway —
+/// so nosing past a hold-short point onto a runway the route only ends
+/// NEAR still reads as an incursion (the route's nearest point there is the
+/// holding point, off the pavement).
+fn on_cleared_runway_crossing(lat: f64, lon: f64) -> bool {
+    const CORRIDOR_M: f64 = 60.0;
+    let nearest = {
+        let route = TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(r) = route.as_ref() else { return false };
+        nearest_on_polyline(&r.path, lat, lon)
+    };
+    // Route lock dropped before taking the runway lock — no nesting.
+    nearest.is_some_and(|(p, d)| d <= CORRIDOR_M && on_active_runway(p.0, p.1).is_some())
+}
+
+/// The closest point of a polyline to (lat, lon), with its distance in
+/// meters. Flat-earth at taxi scales, like [`dist_to_polyline_m`].
+fn nearest_on_polyline(path: &[(f64, f64)], lat: f64, lon: f64) -> Option<((f64, f64), f64)> {
+    let m_per_deg_lat = 111_320.0;
+    let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
+    path.windows(2)
+        .map(|w| {
+            let (ax, ay) = ((w[0].1 - lon) * m_per_deg_lon, (w[0].0 - lat) * m_per_deg_lat);
+            let (bx, by) = ((w[1].1 - lon) * m_per_deg_lon, (w[1].0 - lat) * m_per_deg_lat);
+            let (dx, dy) = (bx - ax, by - ay);
+            let len2 = dx * dx + dy * dy;
+            let t = if len2 < 1.0 {
+                0.0
+            } else {
+                (-(ax * dx + ay * dy) / len2).clamp(0.0, 1.0)
+            };
+            let (cx, cy) = (ax + t * dx, ay + t * dy);
+            let plat = w[0].0 + t * (w[1].0 - w[0].0);
+            let plon = w[0].1 + t * (w[1].1 - w[0].1);
+            ((plat, plon), (cx * cx + cy * cy).sqrt())
+        })
+        .min_by(|x, y| x.1.total_cmp(&y.1))
+}
+
 fn dist_to_polyline_m(path: &[(f64, f64)], lat: f64, lon: f64) -> Option<f64> {
     let m_per_deg_lat = 111_320.0;
     let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
@@ -4153,6 +4262,109 @@ mod tests {
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
         *CLEARANCE.lock().unwrap() = None;
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    }
+
+    #[test]
+    fn a_cleared_route_crossing_is_not_an_incursion() {
+        // The live fault (2026-07-14): the tower's own taxi route crossed a
+        // runway, then the compliance watch berated the pilot for being "on
+        // the runway without clearance" mid-crossing. A runway-flagged leg of
+        // the cleared route makes the occupancy legal: silence while moving,
+        // "expedite" when stopped — and the berate still fires when the route
+        // has no business on that runway.
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.1512, -5.3554));
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway { width_m: 0.0,
+            ident_a: "09".into(),
+            ident_b: "27".into(),
+            lat_a: 36.1512,
+            lon_a: -5.3554,
+            lat_b: 36.1517,
+            lon_b: -5.3366,
+        }];
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::TaxiCleared,
+            callsign: "November one seven two Sierra Papa".into(),
+            runway_ident: "09".into(),
+            pending_readback: None,
+        });
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        // The cleared route: south to north straight across the runway at
+        // lon -5.342, the crossing leg flagged as runway pavement.
+        *TAXI_ROUTE.lock().unwrap() = Some(TaxiWatch {
+            path: vec![(36.1490, -5.3420), (36.1530, -5.3420), (36.1540, -5.3420)],
+            via: "Alpha".into(),
+            seg: vec![("09/27".into(), true), ("A".into(), false)],
+            holding_point: "A1".into(),
+        });
+        let t0 = Instant::now();
+        let sec = std::time::Duration::from_secs;
+        // Settle the air/ground edge off the runway first.
+        assert!(compliance_tick(36.1490, -5.3420, 15.0, true, 10.0, true, t0).is_none());
+        // Mid-crossing at taxi speed, on the cleared runway leg: silence.
+        assert!(
+            compliance_tick(36.15155, -5.342, 15.0, true, 10.0, true, t0 + sec(2)).is_none(),
+            "a cleared crossing must not be berated"
+        );
+        // Stopped dead mid-crossing: "expedite", never "without clearance".
+        let call = compliance_tick(36.15155, -5.342, 15.0, true, 0.0, true, t0 + sec(4))
+            .expect("a stopped crossing earns a call");
+        assert!(call.line.contains("expedite crossing runway"), "{}", call.line);
+        assert!(!call.line.contains("without clearance"), "{}", call.line);
+        // Same spot, but the route STOPS at the hold-short point (it only
+        // ends NEAR the runway, never crosses): nosing onto the pavement is
+        // still an incursion — the berate stands.
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        TAXI_ROUTE.lock().unwrap().as_mut().unwrap().path =
+            vec![(36.1490, -5.3420), (36.1505, -5.3420)];
+        assert!(compliance_tick(36.1490, -5.3420, 15.0, true, 10.0, true, t0 + sec(70)).is_none());
+        let call = compliance_tick(36.15155, -5.342, 15.0, true, 10.0, true, t0 + sec(72))
+            .expect("an uncleared runway entry is still an incursion");
+        assert!(call.line.contains("without clearance"), "{}", call.line);
+
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *CLEARANCE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        *TAXI_ROUTE.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn unnamed_runway_edges_still_name_the_crossing() {
+        // apt.dat authors often leave runway network edges unnamed: the
+        // planner's crossings list (named edges only) came out empty and the
+        // clearance never said "cross runway ..." (the KPDK taxi, 2026-07-14).
+        // Geometry backfills the designator from the physical strip.
+        let runways = vec![nav::Runway { width_m: 0.0,
+            ident_a: "09".into(),
+            ident_b: "27".into(),
+            lat_a: 36.1512,
+            lon_a: -5.3554,
+            lat_b: 36.1517,
+            lon_b: -5.3366,
+        }];
+        let mut plan = nav::TaxiRoutePlan {
+            via: vec!["A".into()],
+            crossings: Vec::new(),
+            holding_point: "A1".into(),
+            path: vec![(36.1490, -5.3420), (36.1530, -5.3420), (36.1540, -5.3420)],
+            seg: vec![(String::new(), true), ("A".into(), false)],
+        };
+        backfill_unnamed_crossings(&mut plan, &runways);
+        assert_eq!(plan.crossings, vec!["09/27".to_string()]);
+        // Idempotent: a second pass (or an already-named edge) doesn't dupe.
+        backfill_unnamed_crossings(&mut plan, &runways);
+        assert_eq!(plan.crossings.len(), 1);
+        // A route that never touches the pavement names nothing.
+        let mut clear = nav::TaxiRoutePlan {
+            via: vec!["A".into()],
+            crossings: Vec::new(),
+            holding_point: "A1".into(),
+            path: vec![(36.1490, -5.3420), (36.1505, -5.3420)],
+            seg: vec![(String::new(), false)],
+        };
+        backfill_unnamed_crossings(&mut clear, &runways);
+        assert!(clear.crossings.is_empty());
     }
 
     #[test]

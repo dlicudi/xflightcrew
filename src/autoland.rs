@@ -188,7 +188,12 @@ pub fn set_panel(text: &str) {
 // State reads.
 const LAT: &str = "sim/flightmodel/position/latitude";
 const LON: &str = "sim/flightmodel/position/longitude";
-const ALT_FT: &str = "sim/flightmodel/misc/h_ind";
+/// TRUE altitude (meters MSL), not the baro-indicated `h_ind`: the glidepath
+/// aims at the runway's TRUE elevation from apt.dat, so a misset altimeter
+/// displaces the whole path by the baro error. Seen live 2026-07-14 (LXGB 09):
+/// h_ind read 0.5 ft with 47 ft of radio altitude over the bay — the vertical
+/// law flew the final against an altitude ~46 ft low.
+const ELEV_M: &str = "sim/flightmodel/position/elevation";
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
@@ -271,6 +276,7 @@ pub fn run_autoland(
             let _ = xp.run_command(CMD_SERVOS_ON).await;
 
             let mut last_phase: Option<ApproachPhase> = None;
+            let mut go_around = GoAroundLatch::new();
             let mut gear_down = false;
             let mut last_flap: Option<f64> = None;
             let mut vs_diverged: u32 = 0;
@@ -282,15 +288,35 @@ pub fn run_autoland(
                 if GEN.load(Ordering::SeqCst) != my_gen || ABORT.load(Ordering::SeqCst) {
                     break;
                 }
-                let (Ok(lat), Ok(lon), Ok(alt), Ok(agl_m), Ok(gs_ms), Ok(var), Ok(ias)) = (
-                    xp.get_float(LAT).await, xp.get_float(LON).await, xp.get_float(ALT_FT).await,
+                // Frozen sim (replay or pause): a replay's positions are a
+                // recording and not ours to fly; a pause is real but frozen,
+                // and ticking the throttle governor against a frozen airspeed
+                // walks the lever to its clamp for a surge on unpause. Freeze
+                // (no writes, no state, no blackbox) and resume when it's live.
+                if crate::xplane::sim_frozen(&xp).await {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    continue;
+                }
+                let (Ok(lat), Ok(lon), Ok(elev_m), Ok(agl_m), Ok(gs_ms), Ok(var), Ok(ias)) = (
+                    xp.get_float(LAT).await, xp.get_float(LON).await, xp.get_float(ELEV_M).await,
                     xp.get_float(AGL_M).await, xp.get_float(GS_MS).await, xp.get_float(MAG_VAR).await,
                     xp.get_float(IAS).await,
                 ) else { tokio::time::sleep(std::time::Duration::from_millis(300)).await; continue };
+                let alt = elev_m * M_TO_FT;
                 let radio_ft = agl_m * M_TO_FT;
                 let gs_kts = gs_ms * MS_TO_KTS;
 
-                let g = guidance(lat, lon, alt, radio_ft, gs_kts, ias, &rwy, approach_ias, 25.0);
+                let raw = guidance(lat, lon, alt, radio_ft, gs_kts, ias, &rwy, approach_ias, 25.0);
+                // A missed approach called low is flown by the latch (full power,
+                // straight ahead) until clear of the ground — the raw intercept
+                // guidance turns back to the FAP immediately, which is a killer
+                // at 50 ft (see [`GoAroundLatch`]).
+                let ga = go_around.update(last_phase, raw.phase, radio_ft);
+                let g = if ga {
+                    go_around_guidance(&rwy, raw.dist_nm, raw.glidepath_alt_ft, ias, approach_ias)
+                } else {
+                    raw
+                };
                 let phase_word = match g.phase {
                     ApproachPhase::Intercept => "INTERCEPT",
                     ApproachPhase::Final => "FINAL",
@@ -310,14 +336,18 @@ pub fn run_autoland(
                     "rwy": format!("{} {}", rwy.icao, rwy.id), "dist": g.dist_nm,
                     "alt": alt, "gp_alt": g.glidepath_alt_ft, "cmd_vs": g.target_vs_fpm,
                     "cmd_hdg": g.target_heading_deg, "ias": ias, "radio": radio_ft,
-                    "phase": format!("{:?}", g.phase),
+                    "phase": format!("{:?}", g.phase), "ga": ga,
                 }));
 
-                // Lateral: heading bug in MAGNETIC (guidance is TRUE → subtract var).
-                let mag_hdg = (g.target_heading_deg - var + 360.0) % 360.0;
-                // Knob presses, not a raw write — registers on glass (G1000) too;
-                // per-tick deltas are a few degrees, so a few presses each pass.
-                let _ = crate::tools::autopilot::drive_heading_bug(&xp, mag_hdg).await;
+                // Lateral: heading bug in MAGNETIC (guidance is TRUE — see
+                // [`true_to_mag`] for the variation sign trap).
+                let mag_hdg = true_to_mag(g.target_heading_deg, var);
+                // Knob presses, not a raw write — registers on glass (G1000) too.
+                // Slew-capped: each press is an HTTP round trip, and the LXGB go-
+                // around's 178° flip stalled this loop ~5 s per tick (2026-07-14) —
+                // no VS/throttle updates the whole time. 30°/tick keeps a full
+                // reversal turning while the loop stays live.
+                let _ = crate::tools::autopilot::drive_heading_bug_step(&xp, mag_hdg, 30.0).await;
                 if xp.get_float(HDG_STATUS).await.unwrap_or(0.0) <= 0.5 {
                     let _ = xp.run_command(CMD_HDG_MODE).await;
                 }
@@ -341,7 +371,12 @@ pub fn run_autoland(
                 prev_ias = Some(ias);
                 prev_ias_t = now;
                 let thr_now = xp.get_float(THROTTLE_ALL).await.unwrap_or(0.5);
-                let thr = if g.phase == ApproachPhase::Flare {
+                let thr = if ga {
+                    // Go-around is firewall, not a governor holding approach
+                    // speed — the LXGB miss flew its last 20 seconds at the
+                    // governor's idea of "on speed" with the ground coming up.
+                    1.0
+                } else if g.phase == ApproachPhase::Flare {
                     0.0
                 } else {
                     let adj = crate::tools::speedhold::throttle_adjust(g.target_ias_kts - ias, trend_kts_s);
@@ -357,7 +392,9 @@ pub fn run_autoland(
                     let _ = xp.set_float(GEAR_HANDLE, 1.0).await;
                     gear_down = true;
                 }
-                let flap = flap_schedule(g.dist_nm, alt - g.glidepath_alt_ft);
+                // Go-around flap: half, whatever the schedule says — full flap
+                // won't climb, and clean this low gives the sink away.
+                let flap = if ga { 0.5 } else { flap_schedule(g.dist_nm, alt - g.glidepath_alt_ft) };
                 if last_flap != Some(flap) {
                     last_flap = Some(flap);
                     let _ = xp.set_float(FLAP_RATIO, flap).await;
@@ -386,10 +423,19 @@ pub fn run_autoland(
                     let prev = last_phase;
                     last_phase = Some(g.phase);
                     let line = match g.phase {
-                        // Dropping back to Intercept from Final is a go-around, not
-                        // a fresh intercept — say so.
-                        ApproachPhase::Intercept if prev == Some(ApproachPhase::Final) =>
-                            "Overflew the runway. Going around, climbing to re-intercept.",
+                        // Dropping back to Intercept from Final/Flare is a
+                        // go-around, not a fresh intercept — say so. Low it's
+                        // the latch flying (straight ahead); high it's the
+                        // normal turn back to re-intercept.
+                        ApproachPhase::Intercept
+                            if matches!(prev, Some(ApproachPhase::Final | ApproachPhase::Flare)) =>
+                        {
+                            if ga {
+                                "Going around. Full power, climbing straight ahead."
+                            } else {
+                                "Overflew the runway. Going around, climbing to re-intercept."
+                            }
+                        }
                         ApproachPhase::Intercept => "Intercepting the final approach.",
                         ApproachPhase::Final => "Established on final, gear and flaps down.",
                         ApproachPhase::Flare => "Over the threshold, flaring, power to idle.",
@@ -433,8 +479,13 @@ const OVERFLIGHT_GO_AROUND_NM: f64 = 0.15;
 /// from it rather than hold level into it. Seen live 2026-07-06: held level at
 /// ~50 ft AGL 5 nm out over rising ground, no climb authority anywhere in the loop.
 const TERRAIN_FLOOR_AGL_FT: f64 = 500.0;
-/// Don't enforce the terrain floor inside this range — here a low radio altitude
-/// IS the approach (short final), not terrain to climb over.
+/// Don't enforce the terrain floor inside this range ON FINAL — here a low
+/// radio altitude IS the approach (short final), not terrain to climb over.
+/// The gate applies to Final only: in Intercept the aircraft is repositioning,
+/// not landing, so proximity to the threshold means nothing — the KPDK 16
+/// rejoin (2026-07-14) armed 0.75 nm out at 300 AGL, the gate held the floor
+/// off, and the vertical law tracked the (distance-symmetric) glidepath into
+/// the ground 0.35 nm short of the runway.
 const FLOOR_ENFORCE_MIN_DIST_NM: f64 = 1.0;
 /// Only climb with this much surplus over the approach speed. Climbing slow in a
 /// marginal airframe bleeds energy to a stall (the reason this loop was
@@ -466,6 +517,15 @@ pub fn flap_schedule(dist_nm: f64, alt_err_ft: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+/// TRUE heading → MAGNETIC, using X-Plane's `magnetic_variation` dataref, whose
+/// sign is positive-WEST: `magpsi = psi + variation`. Verified live at KPDK
+/// (2026-07-14): psi 191.3 true, magpsi 196.8, variation +5.65. Subtracting
+/// instead flew every autoland heading 2*var off (11 degrees at Atlanta) — the
+/// whole cross-track cut vanished and the final tracked 0.4 nm left, parallel.
+pub fn true_to_mag(true_deg: f64, xp_variation_deg: f64) -> f64 {
+    (true_deg + xp_variation_deg).rem_euclid(360.0)
 }
 
 /// A point `dist_nm` from (lat, lon) along true `bearing` (flat-earth good enough
@@ -502,6 +562,69 @@ pub fn cross_track_nm(lat: f64, lon: f64, rwy: &Runway) -> f64 {
     // relative to the INBOUND landing course (the direction of flight on final).
     let ang = ((brg_from_thr - rwy.course_deg + 540.0) % 360.0 - 180.0).to_radians();
     dist * ang.sin()
+}
+
+/// Latched low go-around: a missed approach called BELOW the terrain floor is
+/// flown wings-level STRAIGHT AHEAD at full power until clear of the ground —
+/// never the immediate turn-back the intercept guidance commands. Seen live
+/// 2026-07-14 (LXGB 09): overflew the numbers at ~57 ft, the guidance flipped
+/// the heading command 178° toward the FAP, the flare branch re-fired 0.3 nm
+/// PAST the threshold (`dist_nm` is unsigned, so the flare gate re-arms on the
+/// departure side) and pulled the power, then speed protection commanded
+/// -590 fpm at ground level — impact 200 m south of the strip. The latch owns
+/// the whole low go-around: it arms when Final/Flare degrades to Intercept
+/// below [`TERRAIN_FLOOR_AGL_FT`], holds through every phase flicker the raw
+/// guidance produces down there, and releases at the floor, where the normal
+/// intercept guidance takes over the turn back to the FAP.
+#[derive(Debug, Default)]
+pub struct GoAroundLatch {
+    active: bool,
+}
+
+impl GoAroundLatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Advance the latch one tick: `prev`/`now` are the raw guidance phases,
+    /// `radio_ft` the radio altitude. Returns whether the latch is flying.
+    pub fn update(&mut self, prev: Option<ApproachPhase>, now: ApproachPhase, radio_ft: f64) -> bool {
+        if self.active {
+            // Clear of the ground — hand the turn back to the intercept guidance.
+            if radio_ft >= TERRAIN_FLOOR_AGL_FT {
+                self.active = false;
+            }
+        } else if now == ApproachPhase::Intercept
+            && matches!(prev, Some(ApproachPhase::Final | ApproachPhase::Flare))
+            && radio_ft < TERRAIN_FLOOR_AGL_FT
+        {
+            self.active = true;
+        }
+        self.active
+    }
+}
+
+/// The command a latched go-around flies: runway heading (straight ahead, no
+/// turn near the ground), a bounded climb once the speed is there — level
+/// acceleration first, because climbing slow bleeds energy to a stall — and a
+/// raised speed target for the throttle (the loop firewall it anyway while
+/// latched; the target keeps the governor sane on the release tick).
+pub fn go_around_guidance(
+    rwy: &Runway,
+    dist_nm: f64,
+    glidepath_alt_ft: f64,
+    ias_kts: f64,
+    approach_ias: f64,
+) -> Guidance {
+    let target_vs = if approach_ias - ias_kts > SPEED_FLOOR_MARGIN_KTS { 0.0 } else { MAX_CLIMB_FPM };
+    Guidance {
+        target_heading_deg: rwy.course_deg,
+        target_vs_fpm: target_vs,
+        target_ias_kts: approach_ias + CLIMB_ENERGY_BONUS_KTS,
+        dist_nm,
+        glidepath_alt_ft,
+        phase: ApproachPhase::Intercept,
+    }
 }
 
 /// Where the autoland is in the approach.
@@ -595,9 +718,13 @@ pub fn guidance(
         let (fap_lat, fap_lon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, FAP_NM);
         (ApproachPhase::Intercept, bearing_deg(cur_lat, cur_lon, fap_lat, fap_lon))
     } else {
-        // On final: track the runway course, corrected for lateral offset.
+        // On final: track the runway course, corrected for lateral offset. The
+        // gain is per-nm of cross-track: at 8 the LXGB final entered 0.45 nm
+        // off and commanded all of 3.6° of cut — it crossed the threshold still
+        // ~120 m off the centreline (2026-07-14). 40°/nm reaches the 30° clamp
+        // at 0.75 nm out and still decays to a gentle 2-4° inside 0.1 nm.
         let xtk = cross_track_nm(cur_lat, cur_lon, rwy);
-        let corr = (xtk * 8.0).clamp(-30.0, 30.0); // deg toward the centreline
+        let corr = (xtk * 40.0).clamp(-30.0, 30.0); // deg toward the centreline
         (ApproachPhase::Final, (rwy.course_deg - corr + 360.0) % 360.0)
     };
 
@@ -617,8 +744,17 @@ pub fn guidance(
     // (why this loop was descent-only). Low + slow falls through to speed
     // protection / level hold, and the raised throttle target below rebuilds the
     // surplus so the climb can engage on a later tick.
-    let below_terrain_floor =
-        phase != ApproachPhase::Flare && radio_alt_ft < TERRAIN_FLOOR_AGL_FT && dist_nm > FLOOR_ENFORCE_MIN_DIST_NM;
+    let below_terrain_floor = match phase {
+        ApproachPhase::Flare => false,
+        // Final owns the descent to the runway — the floor stands down inside
+        // short-final range where low radio altitude IS the approach.
+        ApproachPhase::Final => {
+            radio_alt_ft < TERRAIN_FLOOR_AGL_FT && dist_nm > FLOOR_ENFORCE_MIN_DIST_NM
+        }
+        // Intercept is repositioning, not landing: the floor holds at ANY
+        // distance (see FLOOR_ENFORCE_MIN_DIST_NM for the KPDK 16 accident).
+        ApproachPhase::Intercept => radio_alt_ft < TERRAIN_FLOOR_AGL_FT,
+    };
     let has_climb_energy = ias_kts > approach_ias + CLIMB_SPEED_MARGIN_KTS;
 
     let speed_deficit = approach_ias - ias_kts;
@@ -630,6 +766,11 @@ pub fn guidance(
     } else {
         match phase {
             ApproachPhase::Flare => -100.0, // arrest the descent near the ground
+            // Below the floor without the surplus to climb: hold level while the
+            // throttle bonus rebuilds it — NEVER track the glidepath down. The
+            // glidepath altitude is distance-symmetric, so a rejoin on the wrong
+            // side of the threshold reads "on path" and descends (KPDK 16).
+            _ if below_terrain_floor => 0.0,
             // On/above speed but below the glidepath: hold level and let the path
             // descend to us — don't climb to intercept. Speed protection above has
             // already handled the case where holding level would stall us.
@@ -662,6 +803,19 @@ mod tests {
             icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
             course_deg: 0.0, length_m: 3000.0, surface: 1, dist_nm: 0.0, elev_ft: 0.0,
         }
+    }
+
+    #[test]
+    fn true_to_mag_adds_xplane_variation() {
+        // The live KPDK final (2026-07-14): variation dataref +5.65 (positive-
+        // west), psi 191.3 true read back as magpsi 196.8. The bug must be dialed
+        // ABOVE the true command here; the old subtraction flew 11 degrees left
+        // of every commanded heading and crossed the threshold 0.4 nm off.
+        assert!((true_to_mag(191.3, 5.65) - 196.95).abs() < 0.01);
+        // Runway course 20.4 true at KPDK -> 26.05 mag, never 14.75.
+        assert!((true_to_mag(20.4, 5.65) - 26.05).abs() < 0.01);
+        // Wraps: east-variation field (negative dataref) just below north.
+        assert!((true_to_mag(2.0, -5.0) - 357.0).abs() < 0.01);
     }
 
     #[test]
@@ -743,6 +897,83 @@ mod tests {
         let g = guidance(lat, lon, 200.0, 200.0, 100.0, 100.0, &rwy_north(), 90.0, 25.0);
         assert!(g.target_vs_fpm <= 0.0, "no climb on short final, got {}", g.target_vs_fpm);
         assert_eq!(g.target_ias_kts, 90.0, "no climb-energy bonus on short final");
+    }
+
+    #[test]
+    fn intercept_holds_the_floor_even_close_to_the_threshold() {
+        // The KPDK 16 rejoin (2026-07-14): armed 0.75 nm out on the WRONG side
+        // of the threshold at ~300 AGL. Distance is symmetric, so the glidepath
+        // read "on path at 0.7 nm" and the vertical law descended a repositioning
+        // aircraft into the ground 0.35 nm short. In Intercept the floor must
+        // hold at ANY distance: climb with surplus energy, level without — never
+        // a glidepath descent.
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.7); // 0.7 nm PAST a north-landing threshold
+        let g_fast = guidance(lat, lon, 300.0, 300.0, 100.0, 100.0, &rwy_north(), 90.0, 25.0);
+        assert_eq!(g_fast.phase, ApproachPhase::Intercept);
+        assert!(g_fast.target_vs_fpm > 0.0, "repositioning low + fast → climb, got {}", g_fast.target_vs_fpm);
+        let g_slow = guidance(lat, lon, 300.0, 300.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0);
+        assert_eq!(g_slow.phase, ApproachPhase::Intercept);
+        assert_eq!(g_slow.target_vs_fpm, 0.0, "repositioning low + no surplus → level, got {}", g_slow.target_vs_fpm);
+    }
+
+    #[test]
+    fn low_go_around_latches_straight_ahead_until_the_floor() {
+        // The LXGB 09 crash (2026-07-14): overflew the numbers at ~57 ft, the
+        // intercept guidance flipped the heading 178° toward the FAP, the flare
+        // re-fired past the threshold and pulled the power, and the aircraft
+        // hit 200 m south of the strip. Low, the latch must own the go-around.
+        use ApproachPhase::*;
+        let mut latch = GoAroundLatch::new();
+        // Final ticking along at 60 ft: not a go-around.
+        assert!(!latch.update(Some(Final), Final, 60.0));
+        // Overflight: Final degrades to Intercept at 57 ft → latch.
+        assert!(latch.update(Some(Final), Intercept, 57.0));
+        // The raw guidance flickering (Intercept → Flare past the threshold →
+        // Intercept) must not shake it loose while still low.
+        assert!(latch.update(Some(Intercept), Flare, 22.0));
+        assert!(latch.update(Some(Flare), Intercept, 35.0));
+        // Clear of the ground: release — the normal intercept turn is safe now.
+        assert!(!latch.update(Some(Intercept), Intercept, 520.0));
+        // A HIGH overflight never latches: the immediate turn back is fine.
+        let mut high = GoAroundLatch::new();
+        assert!(!high.update(Some(Final), Intercept, 800.0));
+    }
+
+    #[test]
+    fn go_around_guidance_climbs_straight_ahead_on_speed() {
+        let rwy = rwy_north();
+        // On speed: full climb, straight down the runway heading.
+        let g = go_around_guidance(&rwy, 0.3, 100.0, 92.0, 90.0);
+        assert_eq!(g.phase, ApproachPhase::Intercept);
+        assert!(heading_diff(g.target_heading_deg, rwy.course_deg) < 0.1, "straight ahead");
+        assert!(g.target_vs_fpm > 0.0 && g.target_vs_fpm <= MAX_CLIMB_FPM);
+        // Slow (deficit beyond the floor margin): level acceleration first —
+        // climbing slow at full flap is how a go-around stalls.
+        let g_slow = go_around_guidance(&rwy, 0.3, 100.0, 75.0, 90.0);
+        assert_eq!(g_slow.target_vs_fpm, 0.0, "build speed before climbing");
+        assert!(heading_diff(g_slow.target_heading_deg, rwy.course_deg) < 0.1);
+    }
+
+    #[test]
+    fn final_cuts_hard_enough_to_capture_the_centreline() {
+        // The LXGB final (2026-07-14) entered 0.45 nm off the centreline and
+        // the old 8°/nm gain commanded 3.6° of cut — it crossed the threshold
+        // still ~120 m off ("coming in at an angle"). A meaningful offset must
+        // earn a real intercept angle, decaying near the centreline.
+        let rwy = rwy_north();
+        // 3 nm south (on final), 0.45 nm EAST (right) of the centreline.
+        let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 3.0);
+        let east = lon + 0.45 / 60.0;
+        let g = guidance(lat, east, 900.0, 900.0, 90.0, 90.0, &rwy, 90.0, 20.0);
+        assert_eq!(g.phase, ApproachPhase::Final);
+        // Right of course → cut LEFT (west of north): 0.45 × 40 clamps to 30.
+        let cut = ((rwy.course_deg - g.target_heading_deg + 540.0) % 360.0) - 180.0;
+        assert!(cut > 15.0, "0.45 nm off must earn a real cut, got {cut}");
+        // Nearly on the centreline: gentle.
+        let near = lon + 0.03 / 60.0;
+        let g2 = guidance(lat, near, 900.0, 900.0, 90.0, 90.0, &rwy, 90.0, 20.0);
+        let cut2 = ((rwy.course_deg - g2.target_heading_deg + 540.0) % 360.0) - 180.0;
+        assert!(cut2.abs() < 5.0, "small offset stays gentle, got {cut2}");
     }
 
     #[test]

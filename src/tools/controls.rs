@@ -202,6 +202,8 @@ async fn brake_holder(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
         }
         if let Err(e) = xp.run_command_for(super::BRAKES_REGULAR, BRAKE_HOLD_SECS).await {
             tracing::warn!("brake hold: command failed: {e:#}");
+        } else {
+            super::note_brake_cmd();
         }
         if !power_warned && xp.get_float(THROTTLE).await.is_ok_and(|t| t > 0.7) {
             power_warned = true;

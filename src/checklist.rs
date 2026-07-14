@@ -174,6 +174,110 @@ pub fn load(profile: &AircraftProfile) -> Result<Vec<Checklist>> {
     Ok(parse(&text, profile))
 }
 
+/// Does the utterance ask for a checklist at all? One place for the whisper
+/// wart where the compound splits ("check list"), so the caller's decline
+/// logic and [`match_request`] can never disagree on what counts.
+pub fn mentions_checklist(transcript: &str) -> bool {
+    let t = transcript.to_lowercase();
+    t.contains("checklist") || t.contains("check list")
+}
+
+/// Deterministic voice match: resolve "run the before takeoff checklist" (in
+/// any polite wrapping, whisper warts included) to one of this airframe's
+/// checklists. The word "checklist" is REQUIRED, so a bare "climb" or
+/// "descent" can never trigger a whole phase by accident. Title words match
+/// with prefix tolerance ("start" ~ "starting"), candidates are scored by how
+/// much of the title went unmatched, and a tie prefers the "before" section
+/// (a bare "takeoff checklist" means BEFORE takeoff, not the roll callouts;
+/// same for "landing"). Ambiguity that survives all of that returns `None`,
+/// never a guess - the caller declines and names the options.
+pub fn match_request<'a>(transcript: &str, checklists: &'a [Checklist]) -> Option<&'a Checklist> {
+    let query = request_words(transcript);
+    if query.is_empty() {
+        return None;
+    }
+    // (unmatched title words, checklist) for every checklist whose title
+    // accounts for EVERY query word - a stray word excludes the candidate.
+    let mut scored: Vec<(usize, &Checklist)> = checklists
+        .iter()
+        .filter_map(|c| {
+            let title: Vec<&str> = c.id.split('_').collect();
+            let matched = |q: &String| title.iter().any(|t| word_match(q, t));
+            query.iter().all(matched).then(|| {
+                let hit = title.iter().filter(|t| query.iter().any(|q| word_match(q, t))).count();
+                (title.len() - hit, c)
+            })
+        })
+        .collect();
+    scored.sort_by_key(|(s, _)| *s);
+    match scored.as_slice() {
+        [] => None,
+        [(_, one)] => Some(one),
+        [(a, best), (b, _), ..] if a < b => Some(best),
+        tied => {
+            // Joint best score: take the "before" section if exactly one of the
+            // tied leaders has one, otherwise refuse to guess.
+            let top = tied.iter().take_while(|(s, _)| *s == tied[0].0);
+            let mut before = top.filter(|(_, c)| c.id.starts_with("before_"));
+            match (before.next(), before.next()) {
+                (Some((_, one)), None) => Some(one),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// The utterance reduced to the words that could name a checklist: lowercase,
+/// whisper-split compounds rejoined ("check list", "take off", "pre flight",
+/// "shut down"), and the filler of a spoken request stripped. Empty when the
+/// utterance never says "checklist" - the required trigger word.
+fn request_words(transcript: &str) -> Vec<String> {
+    let text = transcript.to_lowercase();
+    // Single letters are apostrophe shrapnel ("let's" splits to "let", "s"),
+    // never part of a section name - drop them with the empties.
+    let mut words: Vec<String> = text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| w.len() > 1)
+        .map(str::to_string)
+        .collect();
+    let mut i = 0;
+    while i + 1 < words.len() {
+        let joined = match (words[i].as_str(), words[i + 1].as_str()) {
+            ("check", "list" | "lists") => Some("checklist"),
+            ("take", "off") => Some("takeoff"),
+            ("pre", "flight") => Some("preflight"),
+            ("shut", "down") => Some("shutdown"),
+            _ => None,
+        };
+        if let Some(j) = joined {
+            words[i] = j.to_string();
+            words.remove(i + 1);
+        }
+        i += 1;
+    }
+    if !words.iter().any(|w| w == "checklist" || w == "checklists") {
+        return Vec::new();
+    }
+    const FILLER: &[&str] = &[
+        "checklist", "checklists", "run", "running", "do", "read", "give", "perform",
+        "complete", "execute", "begin", "go", "through", "over", "the", "a", "an", "my",
+        "me", "us", "please", "let", "lets", "now", "for", "to", "and", "then", "okay",
+        "ok", "roger", "it", "its", "is", "time", "ready", "with", "you", "your", "we",
+        "can", "could",
+    ];
+    words.retain(|w| !FILLER.contains(&w.as_str()));
+    words
+}
+
+/// A query word matches a title word exactly, or by prefix when the shorter of
+/// the two carries at least four letters - "start" reaches "starting",
+/// "engine" reaches "engines", but "off" can't reach "takeoff".
+fn word_match(q: &str, t: &str) -> bool {
+    q == t
+        || (q.len() >= 4 && t.starts_with(q))
+        || (t.len() >= 4 && q.starts_with(t))
+}
+
 /// Parse XChecklist text against an airframe profile (its `checklist_map` drives
 /// which datarefs become actions). Tolerant: unknown directives and malformed
 /// lines are skipped rather than failing the whole file.
@@ -746,6 +850,44 @@ mod tests {
         assert_eq!(slug("*** CESSNA 172SP ***"), "cessna_172sp");
         assert_eq!(split_index("sim/.../mixture_ratio[0]"), ("sim/.../mixture_ratio".into(), Some(0)));
         assert_eq!(split_index("sim/.../parkbrake"), ("sim/.../parkbrake".into(), None));
+    }
+
+    #[test]
+    fn voice_request_resolves_by_title() {
+        let cls = load(&p172()).expect("172 checklist loads");
+        let hit = |t: &str| match_request(t, &cls).map(|c| c.id.as_str());
+
+        // The live miss (2026-07-14, G1000 172): whisper's exact output.
+        assert_eq!(hit("before takeoff checklist"), Some("before_takeoff"));
+        // Polite wrappings, split compounds, and whisper's trailing period/"?"
+        // arrive as separator noise - all resolve to the same section.
+        assert_eq!(hit("run the before take off check list"), Some("before_takeoff"));
+        assert_eq!(hit("let's do the pre-flight checklist, please"), Some("preflight"));
+        assert_eq!(hit("checklist before taxi"), Some("before_taxi"));
+        assert_eq!(hit("shut down checklist"), Some("engine_shutdown"));
+        assert_eq!(hit("cruise checklist"), Some("cruise"));
+        assert_eq!(hit("after landing checklist"), Some("after_landing"));
+        // A bare phase prefers the "before" section - that's what pilots mean.
+        assert_eq!(hit("takeoff checklist"), Some("before_takeoff"));
+        assert_eq!(hit("landing checklist"), Some("before_landing"));
+        // Prefix tolerance: "start" reaches "starting", and the exact-title
+        // candidate beats the longer "before starting engine".
+        assert_eq!(hit("engine start checklist"), Some("starting_engine"));
+        assert_eq!(hit("before start checklist"), Some("before_starting_engine"));
+
+        // Never a guess: ambiguous or unknown asks return None (the caller
+        // declines and names the options), and without the trigger word
+        // nothing matches at all - "climb" alone must stay a climb command.
+        assert_eq!(hit("engine checklist"), None);
+        assert_eq!(hit("run the checklist"), None);
+        assert_eq!(hit("securing aircraft checklist"), None);
+        assert_eq!(hit("climb"), None);
+        assert_eq!(hit("before takeoff"), None);
+        assert_eq!(hit("flaps up"), None);
+
+        assert!(mentions_checklist("run the check list"));
+        assert!(mentions_checklist("before takeoff checklist"));
+        assert!(!mentions_checklist("check the flaps"));
     }
 
     #[test]

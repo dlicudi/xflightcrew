@@ -22,6 +22,16 @@ pub const ON_GROUND_ANY: &str = "sim/flightmodel/failures/onground_any";
 /// 1 while X-Plane considers the airframe crashed (the crash screen); a
 /// flight reset drops it back to 0.
 pub const HAS_CRASHED: &str = "sim/flightmodel2/misc/has_crashed";
+/// 1 while the sim is playing a REPLAY: every flight-model read is a recording,
+/// not the aircraft flying now, so nothing may react to it — no ATC watches, no
+/// callouts, no crash record, no control loop writes. A replayed crash landing
+/// earned "you landed on runway two seven without clearance" (2026-07-14).
+pub const IS_IN_REPLAY: &str = "sim/time/is_in_replay";
+/// 1 while the sim is PAUSED: the flight is real (unlike a replay) but frozen —
+/// control loops must not integrate against it (a throttle governor winds to
+/// its clamp against a frozen airspeed and surges on unpause), and the crew /
+/// world watches have nothing to react to. See `xplane::sim_frozen`.
+pub const PAUSED: &str = "sim/time/paused";
 /// Height above the terrain directly below, in METERS (× 3.28084 for feet).
 pub const AGL_METERS: &str = "sim/flightmodel/position/y_agl";
 pub const LATITUDE: &str = "sim/flightmodel/position/latitude";

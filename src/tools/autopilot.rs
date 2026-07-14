@@ -123,12 +123,29 @@ const CMD_HDG_DN: &str = "sim/autopilot/heading_down";
 /// back to a direct dataref write when the commands don't move the bug (checked a
 /// few presses in). Returns the bug's actual value afterwards.
 pub async fn drive_heading_bug(xp: &dyn crate::xplane::XPlane, target: f64) -> f64 {
+    drive_heading_bug_step(xp, target, 360.0).await
+}
+
+/// Like [`drive_heading_bug`] but turns the knob at most `max_step_deg` toward
+/// the target per call — for control loops that drive the bug every tick. Each
+/// press is an HTTP round trip, so an unbounded slew stalls the caller: the
+/// LXGB go-around's 178° reversal froze the autoland loop ~5 s per tick with
+/// no VS or throttle updates the whole time (2026-07-14). A capped call gets
+/// there over successive ticks; the direct-write fallback (knob unbound) still
+/// jumps straight to the full target.
+pub async fn drive_heading_bug_step(
+    xp: &dyn crate::xplane::XPlane,
+    target: f64,
+    max_step_deg: f64,
+) -> f64 {
     let target = target.rem_euclid(360.0);
     let Ok(start) = xp.get_float(HEADING_BUG).await else {
         let _ = xp.set_float(HEADING_BUG, target).await;
         return target;
     };
-    let delta = ((target - start) % 360.0 + 540.0) % 360.0 - 180.0;
+    let full = ((target - start) % 360.0 + 540.0) % 360.0 - 180.0;
+    let delta = full.clamp(-max_step_deg.abs(), max_step_deg.abs());
+    let leg = (start + delta).rem_euclid(360.0);
     let presses = delta.round().abs() as i64;
     let cmd = if delta >= 0.0 { CMD_HDG_UP } else { CMD_HDG_DN };
     for i in 0..presses {
@@ -144,9 +161,10 @@ pub async fn drive_heading_bug(xp: &dyn crate::xplane::XPlane, target: f64) -> f
         }
     }
     let now = xp.get_float(HEADING_BUG).await.unwrap_or(start);
-    let err = (((target - now) % 360.0 + 540.0) % 360.0 - 180.0).abs();
+    let err = (((leg - now) % 360.0 + 540.0) % 360.0 - 180.0).abs();
     if err > 1.5 {
-        // Knob path didn't get there — direct write as the fallback.
+        // Knob path didn't get there — direct write as the fallback (straight
+        // to the FULL target: a dataref write is one round trip, no cap needed).
         let _ = xp.set_float(HEADING_BUG, target).await;
     }
     xp.get_float(HEADING_BUG).await.unwrap_or(target)

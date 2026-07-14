@@ -756,6 +756,8 @@ mod tests {
             llm_enabled: true, // these tests exercise the (retained) LLM paths
             ui: "plain".into(),
             tts_backend: "say".into(),
+            voice_volume: 1.0,
+            atc_volume: 1.0,
             say_voice: String::new(),
             say_rate: String::new(),
             chime_path: String::new(),

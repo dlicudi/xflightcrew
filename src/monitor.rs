@@ -1478,6 +1478,9 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
     // The copilot's progressive taxi guide, rebuilt per published clearance
     // route: the pilot monitoring with the airport diagram out.
     let mut taxi_guide: Option<crate::taxi_guide::Guide> = None;
+    // Whether the last tick saw the sim in replay / paused, for transition logging.
+    let mut was_replay = false;
+    let mut was_paused = false;
 
     loop {
         // Aircraft switched → rebuild the checks for the new airframe.
@@ -1492,6 +1495,42 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
             if let Some(brief) = crate::debrief::CarryForward::briefing_once_today(&memory, &live.get().id) {
                 voice.alert(Priority::Advisory, brief);
             }
+        }
+        // Replay or pause: neither is the aircraft flying NOW — a replay is a
+        // recording, a pause is real but frozen — so nothing here may react.
+        // One gate covers the whole reactive tick: checks and callouts, the
+        // ATC compliance / incursion / region watches, crash recording, the
+        // flight-ended debrief. A replayed crash landing earned "you landed on
+        // runway two seven without clearance" and a second crash event
+        // (2026-07-14). Fail open: a failed read means live. State
+        // (FireStates, was_airborne) simply freezes and resumes on live.
+        let in_replay = xp
+            .get_float(crate::datarefs::IS_IN_REPLAY)
+            .await
+            .is_ok_and(|v| v > 0.5);
+        let paused = xp
+            .get_float(crate::datarefs::PAUSED)
+            .await
+            .is_ok_and(|v| v > 0.5);
+        if in_replay != was_replay {
+            was_replay = in_replay;
+            tracing::info!(in_replay, "monitor: replay mode changed");
+            crate::blackbox::record("replay", serde_json::json!({ "active": in_replay }));
+        }
+        if paused != was_paused {
+            was_paused = paused;
+            tracing::info!(paused, "monitor: pause changed");
+            crate::blackbox::record("pause", serde_json::json!({ "active": paused }));
+        }
+        // Published to the arbiter and the command loop's transmit gates.
+        // Replay drops station audio (cutting a live transmission — the film
+        // has no radio); pause only blocks NEW radio traffic, so a controller
+        // caught mid-word finishes the sentence.
+        voice.set_replay(in_replay);
+        voice.set_paused(paused);
+        if in_replay || paused {
+            tokio::time::sleep(period).await;
+            continue;
         }
         if let Some(mut snap) = Snapshot::read(&xp, &drefs).await {
             let now = Instant::now();

@@ -220,7 +220,7 @@ fn run_recovery(
                 let _ = xp.set_float(&p.dataref, p.max_rpm / RAD_PER_SEC_TO_RPM).await;
             }
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+            let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
             let mut stable_ticks = 0;
             let mut last_phase = ""; // announce ANNOUNCE-mode actions on phase change
             loop {
@@ -230,6 +230,15 @@ fn run_recovery(
                     || std::time::Instant::now() >= deadline
                 {
                     break;
+                }
+                // Frozen sim (paused or replay): nothing to read, nothing to
+                // write — and the wall-clock deadline must not burn while the
+                // aircraft isn't moving, or a mid-recovery pause hands back a
+                // half-recovered upset. Slide it by the frozen time.
+                if crate::xplane::sim_frozen(&xp).await {
+                    deadline += std::time::Duration::from_millis(250);
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
                 }
                 let Some(s) = read_state(&xp, min_safe_ias).await else {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

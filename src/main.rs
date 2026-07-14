@@ -1158,6 +1158,26 @@ async fn run_session(
             continue;
         }
 
+        // A replay transmits nothing: the world on screen is a recording, so a
+        // keyed call can't reach a controller — the FSM must not move off
+        // replayed positions (a replayed crash landing earned a compliance
+        // berate, 2026-07-14). The copilot is still on the intercom.
+        if from_radio && voice.replay() {
+            say(&voice, &reporter, ui::LogKind::Warn,
+                "We're in replay, nobody's on the air. Go back to live and I'll key it.");
+            continue;
+        }
+
+        // Paused: the flight is real but the world isn't turning — a call
+        // keyed into a frozen sim must not move the tower FSM (the reply
+        // would land on positions that aren't advancing). The copilot is
+        // crew on the intercom and still answers.
+        if from_radio && voice.paused() {
+            say(&voice, &reporter, ui::LogKind::Warn,
+                "Sim's paused, the radio call can wait. Unpause and I'll key it.");
+            continue;
+        }
+
         // Dead transmitter: a keyed transmission needs a powered radio — with
         // the avionics master off the panel can't transmit any more than it can
         // receive, so the tower never hears you (a cold-and-dark SR22 raised
@@ -1496,7 +1516,9 @@ async fn run_session(
             // wreckage — a dead panel can't transmit (fail open, like the
             // receive gate).
             if let Some(st) = atc_station.as_mut() {
-                if !dual_ptt && voice.radio_powered() && !voice.crashed() {
+                if !dual_ptt && voice.radio_powered() && !voice.crashed() && !voice.replay()
+                    && !voice.paused()
+                {
                     if let Some((reply, who)) = st.try_handle(&tl, &xplane).await {
                         reporter.status(ui::Phase::Speaking);
                         reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
@@ -1827,7 +1849,16 @@ async fn run_session(
         // Punctuation alone doesn't outrank a parseable command: it's a question
         // only with an interrogative OPENER ("is/are/what/how...") or when the
         // grammar can't parse it anyway.
-        let parsed = grammar::try_parse(&matchable, &registry, &profile);
+        // Checklists resolve deterministically by title ("before takeoff
+        // checklist"). Their specs still ride to the LLM, but the answer-only
+        // fallback can never call a tool - so without this, a grammar miss was
+        // the end of the road and every checklist was voice-unreachable (seen
+        // live in the G1000 172, 2026-07-14). Joined into `parsed` so whisper's
+        // habitual trailing "?" doesn't shunt a match down the question path.
+        let parsed = grammar::try_parse(&matchable, &registry, &profile).or_else(|| {
+            checklist::match_request(&matchable, &checklists)
+                .map(|cl| vec![llm::ToolCall { name: cl.id.clone(), arguments: serde_json::json!({}) }])
+        });
         let opener_q = looks_like_question(matchable.trim_end_matches(['?', '.', ' ']));
         let is_question = looks_like_question(&matchable) && (opener_q || parsed.is_none());
 
@@ -1855,6 +1886,28 @@ async fn run_session(
         if fast.is_none() {
             if let Some(msg) = grammar::declined(&matchable, &registry) {
                 tracing::info!(path = "declined", "command path");
+                say(&voice, &reporter, ui::LogKind::Readback, &msg);
+                continue;
+            }
+            // "Checklist" was heard but no section resolved (a bare "run the
+            // checklist", an ambiguous "engine checklist", a section this file
+            // doesn't have) - name the options instead of the unrecognized
+            // tone. Question-shaped asks ("what checklists do you have?") land
+            // here too, and the list is the honest answer either way.
+            if checklist::mentions_checklist(&matchable)
+                && checklist::match_request(&matchable, &checklists).is_none()
+            {
+                tracing::info!(path = "checklist-decline", "command path");
+                let msg = if checklists.is_empty() {
+                    "I have no checklists for this aircraft.".to_string()
+                } else {
+                    let names = checklists
+                        .iter()
+                        .map(|c| c.title.to_lowercase())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("Which checklist? I have: {names}.")
+                };
                 say(&voice, &reporter, ui::LogKind::Readback, &msg);
                 continue;
             }

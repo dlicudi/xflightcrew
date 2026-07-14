@@ -1,15 +1,27 @@
-//! Speech arbiter — the single owner of the TTS voice.
+//! Speech arbiter — the owner of BOTH voices: the copilot's intercom and the
+//! station radio.
 //!
-//! Both the command loop (readbacks) and, later, the monitor (alerts) need to
-//! speak, from different threads. If they each called [`tts::speak`] directly
-//! they'd talk over each other. So all speech goes through one [`Voice`]: a
-//! dedicated speaker thread draining a priority queue, so utterances are
-//! serialized and never overlap.
+//! Two independent half-duplex channels (2026-07-14), like a real audio panel:
 //!
-//! Priority orders the *queue*, not interruption: a higher-priority utterance
+//!   - **Intercom** — the copilot's voice. One queue, one speaker thread;
+//!     copilot utterances are serialized and never overlap each other.
+//!   - **Radio** — every station voice (controllers, ATIS, ghost pilots).
+//!     Its own queue and speaker thread; station utterances are serialized
+//!     among themselves.
+//!
+//! The two channels CAN overlap — a controller transmitting while the copilot
+//! talks is how a real cockpit sounds. Realism priority is crew discipline,
+//! not audio ducking: the intercom defers *starting* a routine line (anything
+//! below `Warning`) while the radio is on the air, and the perishable
+//! `stale_by` machinery drops what expired waiting. Urgent callouts (stall,
+//! terrain — `Warning`) break through immediately: a real copilot talks over
+//! the radio when you're about to die. The one thing that silences BOTH
+//! channels is a PTT press (`set_hold` / the barge-in `shutup`) — mic
+//! hygiene: on speakers, any voice still playing bleeds into the capture.
+//!
+//! Priority orders each *queue*, not interruption: a higher-priority utterance
 //! jumps ahead of whatever is still waiting, but never cuts off speech already
-//! playing (`say`/piper aren't cheaply interruptible — true cut-off is a later
-//! iteration). Within a priority, order is FIFO.
+//! playing on its own channel. Within a priority, order is FIFO.
 //!
 //! Two ways to speak:
 //!   - [`Voice::say`]   — blocking. The command loop must not resume listening
@@ -244,6 +256,9 @@ fn station_unhearable(inner: &Inner, station: Option<StationSpeaker>) -> bool {
     if inner.crashed.load(std::sync::atomic::Ordering::Relaxed) {
         return true; // wreckage receives nothing
     }
+    if inner.replay.load(std::sync::atomic::Ordering::Relaxed) {
+        return true; // a replay is a recording — the world isn't on the air
+    }
     if !inner.radio_powered.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
@@ -307,9 +322,19 @@ struct Queue {
 }
 
 struct Inner {
+    /// The INTERCOM queue — the copilot's own voice.
     queue: Mutex<Queue>,
-    /// Signalled when work is queued (or on shutdown) to wake the speaker.
+    /// Signalled when intercom work is queued, on hold release, or when the
+    /// radio goes quiet (a deferred routine line may now start).
     cv: Condvar,
+    /// The RADIO queue — every station voice (controllers, ATIS, ghosts).
+    radio_queue: Mutex<Queue>,
+    /// Signalled when radio work is queued or on hold release.
+    radio_cv: Condvar,
+    /// Which channels are speaking right now (intercom, radio). The mic gate
+    /// is the OR of the two; the intercom's crew discipline reads the radio
+    /// flag to defer routine lines while a station is on the air.
+    speaking: Mutex<(bool, bool)>,
     /// Voice seed for the ACTIVE airport's controllers: 0 = the configured
     /// per-position voices (the curated home field); anything else indexes the
     /// voice pool per position, so each airport gets its own stable crew of
@@ -358,6 +383,20 @@ struct Inner {
     /// flight reset (has_crashed back to 0) restores the world. Fail open:
     /// defaults false, and a failed read never sets it.
     crashed: std::sync::atomic::AtomicBool,
+    /// The sim is playing a REPLAY (X-Plane's is_in_replay): the world on
+    /// screen is a recording, so no station audio in and no transmission out —
+    /// nothing that happens in a replay is happening NOW. The copilot's
+    /// intercom still plays (the crew can answer questions about what you're
+    /// watching). Published by the monitor from the live dataref; fail open:
+    /// defaults false, and a failed read never sets it.
+    replay: std::sync::atomic::AtomicBool,
+    /// The sim is PAUSED (X-Plane's sim/time/paused): the flight is real but
+    /// frozen. Unlike `replay` this does NOT drop station audio — a
+    /// controller caught mid-word finishes the sentence, and the monitor's
+    /// tick-skip means nothing new gets queued — it only gates the command
+    /// loop's transmit paths (the world isn't turning; the FSM must not move).
+    /// Published by the monitor; fail open like the others.
+    paused: std::sync::atomic::AtomicBool,
     /// What the copilot has spoken recently, with when it finished. The listener
     /// checks heard transcripts against this to reject its own voice coming back
     /// over the speakers (echo) rather than acting on it.
@@ -383,6 +422,13 @@ impl Voice {
                 shutdown: false,
             }),
             cv: Condvar::new(),
+            radio_queue: Mutex::new(Queue {
+                heap: BinaryHeap::new(),
+                seq: 0,
+                shutdown: false,
+            }),
+            radio_cv: Condvar::new(),
+            speaking: Mutex::new((false, false)),
             station_seed: std::sync::atomic::AtomicUsize::new(0),
             station_local: Mutex::new(Vec::new()),
             hold: std::sync::atomic::AtomicBool::new(false),
@@ -391,15 +437,27 @@ impl Voice {
             com1_known: std::sync::atomic::AtomicBool::new(false),
             radio_powered: std::sync::atomic::AtomicBool::new(true),
             crashed: std::sync::atomic::AtomicBool::new(false),
+            replay: std::sync::atomic::AtomicBool::new(false),
+            paused: std::sync::atomic::AtomicBool::new(false),
             spoken: Mutex::new(Vec::new()),
         });
+        // Independent channel volumes (a real audio panel's COM vs intercom
+        // knobs). Applied in tts::play per thread channel.
+        tts::set_volumes(config.voice_volume, config.atc_volume);
         let gate = MicGate::new();
-        let speaker = inner.clone();
-        let speaker_gate = gate.clone();
+        let intercom = inner.clone();
+        let intercom_gate = gate.clone();
+        let intercom_cfg = config.clone();
         std::thread::Builder::new()
-            .name("voice-speaker".into())
-            .spawn(move || speaker_loop(&speaker, config, speaker_gate))
-            .expect("spawn voice speaker thread");
+            .name("voice-intercom".into())
+            .spawn(move || intercom_loop(&intercom, intercom_cfg, intercom_gate))
+            .expect("spawn intercom speaker thread");
+        let radio = inner.clone();
+        let radio_gate = gate.clone();
+        std::thread::Builder::new()
+            .name("voice-radio".into())
+            .spawn(move || radio_loop(&radio, config, radio_gate))
+            .expect("spawn radio speaker thread");
         Voice { inner, gate }
     }
 
@@ -426,8 +484,9 @@ impl Voice {
         self.gate.clone()
     }
 
-    /// True while the copilot is speaking — the barge-in watcher only interrupts
-    /// when there's actually audio to cut.
+    /// True while EITHER channel is speaking (the mic gate is the OR of the
+    /// intercom and the radio) — the barge-in watcher only interrupts when
+    /// there's actually audio to cut.
     pub fn is_speaking(&self) -> bool {
         self.gate.is_speaking()
     }
@@ -469,7 +528,7 @@ impl Voice {
                 .take()
                 .is_some()
         {
-            crate::tts::stop_playback();
+            crate::tts::stop_channel(crate::tts::Channel::Radio);
         }
     }
 
@@ -500,7 +559,7 @@ impl Voice {
                 .take()
                 .is_some()
         {
-            crate::tts::stop_playback();
+            crate::tts::stop_channel(crate::tts::Channel::Radio);
         }
     }
 
@@ -508,6 +567,47 @@ impl Voice {
     /// routing a transmission to the world: wreckage doesn't transmit.
     pub fn crashed(&self) -> bool {
         self.inner.crashed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Publish whether the sim is in replay (see `Inner::replay`). Entering a
+    /// replay cuts a live station transmission mid-word — the pilot just froze
+    /// the world; the controller's voice belongs to the flight, not the film.
+    pub fn set_replay(&self, replay: bool) {
+        self.inner
+            .replay
+            .store(replay, std::sync::atomic::Ordering::Relaxed);
+        if replay
+            && self
+                .inner
+                .now_playing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .is_some()
+        {
+            crate::tts::stop_channel(crate::tts::Channel::Radio);
+        }
+    }
+
+    /// Whether the sim is in replay. The command loop checks it before routing
+    /// a transmission to the world: you can't call a tower from a recording.
+    pub fn replay(&self) -> bool {
+        self.inner.replay.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Publish whether the sim is paused (see `Inner::paused`). No audio cut:
+    /// a transmission already on the air finishes its sentence.
+    pub fn set_paused(&self, paused: bool) {
+        self.inner
+            .paused
+            .store(paused, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the sim is paused. The command loop checks it before routing a
+    /// transmission to the world: the world isn't turning, so the FSM must
+    /// not move off a frozen flight.
+    pub fn paused(&self) -> bool {
+        self.inner.paused.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn set_com1(&self, com1_khz: Option<i64>, tuned: Option<StationSpeaker>) {
@@ -541,7 +641,7 @@ impl Voice {
                 .now_playing
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = None;
-            crate::tts::stop_playback();
+            crate::tts::stop_channel(crate::tts::Channel::Radio);
         }
     }
 
@@ -554,20 +654,22 @@ impl Voice {
             // mid-word replay of a stepped-on transmission. Like a real
             // walkie-talkie: you key up, the frequency's silent to you; you let
             // go, you hear what's happening NOW. Recovery stays procedural
-            // ("say again"). Just wake the speaker to drain the held backlog.
+            // ("say again"). Wake both speakers to drain the held backlogs.
             self.inner.cv.notify_one();
+            self.inner.radio_cv.notify_one();
         }
     }
 
     pub fn shutup(&self) {
-        // Drop the on-air station transmission (no resume) and drain the queue.
+        // Drop the on-air station transmission (no resume) and drain BOTH
+        // queues — a PTT press silences the whole cockpit (mic hygiene).
         *self
             .inner
             .now_playing
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
-        {
-            let mut q = self.inner.queue.lock().unwrap();
+        for queue in [&self.inner.queue, &self.inner.radio_queue] {
+            let mut q = queue.lock().unwrap();
             for utt in q.heap.drain() {
                 if let Some(latch) = utt.done {
                     *latch.spoken.lock().unwrap() = true;
@@ -575,8 +677,9 @@ impl Voice {
                 }
             }
         }
-        // The in-flight utterance (already popped by the speaker) ends when its
-        // audio is killed: speak() returns and the speaker signals its latch.
+        // The in-flight utterances (already popped by their speakers) end when
+        // their audio is killed: speak() returns and each speaker signals its
+        // latch and clears its own speaking flag.
         crate::tts::stop_playback();
         self.gate.set_speaking(false);
     }
@@ -615,15 +718,21 @@ impl Voice {
         self.push(Utterance { priority, seq: 0, text, chime: false, negative: false, station: Some(speaker), stale_by: None, done });
     }
 
-    /// Push a fully-formed utterance onto the queue (stamping its FIFO seq under
-    /// the lock). The single enqueue chokepoint for both speech and tones.
+    /// Push a fully-formed utterance onto its channel's queue (stamping the
+    /// FIFO seq under the lock): station utterances go to the radio, everything
+    /// else to the intercom. The single enqueue chokepoint for speech and tones.
     fn push(&self, mut utt: Utterance) {
-        let mut q = self.inner.queue.lock().unwrap();
+        let (queue, cv) = if utt.station.is_some() {
+            (&self.inner.radio_queue, &self.inner.radio_cv)
+        } else {
+            (&self.inner.queue, &self.inner.cv)
+        };
+        let mut q = queue.lock().unwrap();
         utt.seq = q.seq;
         q.seq += 1;
         q.heap.push(utt);
         drop(q);
-        self.inner.cv.notify_one();
+        cv.notify_one();
     }
 
     /// Play the negative tone (no speech) and block until it finishes — the
@@ -882,39 +991,182 @@ impl Speaker {
     }
 }
 
-/// The speaker thread: pop the highest-priority utterance (blocking until one is
-/// available), speak it to completion, signal any blocked caller, repeat.
+/// Crew discipline: whether the intercom may START `top` while the radio is
+/// (or isn't) on the air. Routine lines — advisories, readbacks, cautions —
+/// wait for the frequency to go quiet, like a crew member pausing for a
+/// transmission; `Warning` (stall, terrain, airspeed) breaks through
+/// immediately, because a real copilot talks over the radio when you're
+/// about to die. Speech already playing is never cut by this — it only gates
+/// what STARTS.
+fn intercom_may_start(top: Priority, radio_on_air: bool) -> bool {
+    !radio_on_air || top >= Priority::Warning
+}
+
+/// Flip one channel's speaking flag and recompute the mic gate (the OR of the
+/// two channels — the mic must stay muted while ANY voice is on the speakers).
+/// Lowering the RADIO flag also wakes the intercom: a deferred routine line
+/// may start now that the frequency is quiet.
+fn set_channel_speaking(inner: &Inner, gate: &MicGate, radio: bool, on: bool) {
+    let mut s = inner.speaking.lock().unwrap_or_else(|e| e.into_inner());
+    if radio {
+        s.1 = on;
+    } else {
+        s.0 = on;
+    }
+    gate.set_speaking(s.0 || s.1);
+    drop(s);
+    if radio && !on {
+        inner.cv.notify_one();
+    }
+}
+
+fn radio_is_on_air(inner: &Inner) -> bool {
+    inner.speaking.lock().unwrap_or_else(|e| e.into_inner()).1
+}
+
+/// Signal a blocking caller's latch (dropped utterances must fire it too, or
+/// a blocking `say`/`say_station` caller deadlocks).
+fn fire_latch(latch: Option<Arc<Latch>>) {
+    if let Some(latch) = latch {
+        *latch.spoken.lock().unwrap() = true;
+        latch.cv.notify_all();
+    }
+}
+
+/// Remember what just finished playing so the listener can reject this audio
+/// if it bleeds back through the mic (both channels feed the same echo
+/// memory: the tower's voice coming back must not parse as a pilot command
+/// any more than the copilot's). Prunes the old.
+fn remember_spoken(inner: &Inner, text: &str) {
+    let mut said = inner.spoken.lock().unwrap();
+    said.push((Instant::now(), text.to_string()));
+    said.retain(|(t, _)| t.elapsed() < ECHO_MEMORY);
+}
+
+/// A killed player (SIGTERM) is an intentional barge-in cut-off, not a
+/// failure — log it quietly.
+fn log_tts_err(what: &str, e: anyhow::Error) {
+    let msg = format!("{e:#}");
+    if msg.contains("SIGTERM") || msg.contains("signal: 15") {
+        tracing::debug!("{what} interrupted (barge-in): {msg}");
+    } else {
+        tracing::warn!("{what} failed: {msg}");
+    }
+}
+
+/// The INTERCOM speaker thread: the copilot's own voice, plus the chime and
+/// negative tones. Pops the highest-priority utterance (blocking until one is
+/// available AND crew discipline allows it — see [`intercom_may_start`]),
+/// speaks it to completion, signals any blocked caller, repeats.
 ///
-/// `gate` is raised for the whole speaking run and only lowered once the queue
-/// drains — so a burst of utterances stays gated end to end, with no momentary
-/// gap between them for the mic to slip through.
-fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
+/// The channel's speaking flag is raised for the whole run and only lowered
+/// once the queue drains — so a burst of utterances keeps the mic gated end
+/// to end, with no momentary gap for it to slip through.
+fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
     let chime_path = resolve_chime(&config.chime_path);
     let negative_path = resolve_negative(&config.negative_tone_path);
-    let station_cfg = config.clone();
+    let mut speaker = Speaker::build(config);
+    loop {
+        let mut q = inner.queue.lock().unwrap();
+        let utt = loop {
+            if q.shutdown {
+                set_channel_speaking(inner, &gate, false, false);
+                return;
+            }
+            // Any PTT held: nobody speaks (mic hygiene). Otherwise start the
+            // top utterance only when discipline allows: routine lines wait
+            // out a station transmission; a Warning goes now. Peeking the top
+            // is sound because the heap's max IS the most urgent thing here.
+            if !inner.hold.load(std::sync::atomic::Ordering::Relaxed) {
+                let may_start = q
+                    .heap
+                    .peek()
+                    .is_some_and(|top| intercom_may_start(top.priority, radio_is_on_air(inner)));
+                if may_start {
+                    break q.heap.pop().expect("peeked");
+                }
+            }
+            // Nothing sayable — we're done speaking; let the mic listen again
+            // (unless the radio holds the gate). Woken by a push, a hold
+            // release, or the radio going quiet.
+            set_channel_speaking(inner, &gate, false, false);
+            q = inner.cv.wait(q).unwrap();
+        };
+        drop(q); // release the queue while we speak (which is slow)
+
+        // Perishable speech that missed its window (including waiting out a
+        // radio transmission) is dropped: spoken late it's disinformation,
+        // not guidance. The latch still fires — see `fire_latch`.
+        if utt.stale_by.is_some_and(|t| Instant::now() > t) {
+            fire_latch(utt.done);
+            continue;
+        }
+
+        set_channel_speaking(inner, &gate, false, true);
+        // Tone-only: play the negative "unrecognized" cue and skip TTS entirely
+        // (nothing to speak, nothing to add to the echo list).
+        if utt.negative {
+            if let Some(path) = &negative_path {
+                if let Err(e) = crate::tts::play(path) {
+                    log_tts_err("negative tone", e);
+                }
+            }
+            fire_latch(utt.done);
+            continue;
+        }
+        if utt.chime {
+            if let Some(path) = &chime_path {
+                if let Err(e) = crate::tts::play(path) {
+                    log_tts_err("chime", e);
+                }
+            }
+        }
+        // catch_unwind: a panic ANYWHERE in a TTS engine must not kill this
+        // thread — blocking callers wait on latches only this thread signals,
+        // so a dead speaker deadlocks the whole app (seen live 2026-07-07: the
+        // first station utterance panicked, the main loop hung unkillable, and
+        // the backtrace sprayed over the raw-mode TUI).
+        let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            speaker.speak(&utt.text)
+        }))
+        .unwrap_or_else(|panic| Err(anyhow::anyhow!("TTS panicked: {}", panic_text(panic))));
+        if let Err(e) = spoke {
+            log_tts_err("TTS", e);
+        }
+        remember_spoken(inner, &utt.text);
+        fire_latch(utt.done);
+    }
+}
+
+/// The RADIO speaker thread: every station voice (controllers, ATIS, ghost
+/// pilots), serialized among themselves — one frequency, one transmission at
+/// a time — but free to overlap the copilot's intercom, like a real audio
+/// panel. Tags its playback as the Radio channel so the radio-only cuts
+/// (retune, avionics off, crash, replay) never touch the copilot's audio.
+fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
+    crate::tts::set_thread_channel(crate::tts::Channel::Radio);
+    let station_cfg = config;
     // One lazy warm voice per position (tower/approach/departure/ATIS, plus
     // one slot for whichever GHOST pilot spoke last), keyed by model name so
     // a cast change — or a different ghost — rebuilds only that slot. A
     // position that never speaks never loads its model.
     let mut stations: [Option<(String, StationVoice)>; 5] = [None, None, None, None, None];
     let mut stations_seed: usize = 0;
-    let mut speaker = Speaker::build(config);
     loop {
-        let mut q = inner.queue.lock().unwrap();
+        let mut q = inner.radio_queue.lock().unwrap();
         let utt = loop {
             if q.shutdown {
-                gate.set_speaking(false);
+                set_channel_speaking(inner, &gate, true, false);
                 return;
             }
-            // Any PTT held: nobody speaks — the queue waits for release.
+            // Any PTT held: the frequency is silent to you while transmitting.
             if !inner.hold.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(u) = q.heap.pop() {
                     break u;
                 }
             }
-            // Nothing to say — we're done speaking; let the mic listen again.
-            gate.set_speaking(false);
-            q = inner.cv.wait(q).unwrap();
+            set_channel_speaking(inner, &gate, true, false);
+            q = inner.radio_cv.wait(q).unwrap();
         };
         drop(q); // release the queue while we speak (which is slow)
 
@@ -924,136 +1176,70 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         // voice (or a PTT hold) died with the frequency the moment the
         // pilot retuned (`set_com1` cuts LIVE audio; this catches the
         // queued). Drop it, don't hold it — missed radio is gone, like real
-        // life. The copilot's own voice is intercom, never gated. Checked
-        // before `set_speaking` so a dropped transmission doesn't even gate
-        // the mic, and the done latch still fires so a blocking
-        // `say_station` caller is released, never deadlocked.
-        // Perishable speech that missed its window is dropped the same way:
-        // spoken late it's disinformation, not guidance.
+        // life. Checked before the speaking flag is raised so a dropped
+        // transmission doesn't even gate the mic, and the done latch still
+        // fires so a blocking `say_station` caller is released, never
+        // deadlocked. Perishable speech that missed its window drops the
+        // same way.
         let stale = utt.stale_by.is_some_and(|t| Instant::now() > t);
         if stale || station_unhearable(inner, utt.station) {
-            if let Some(latch) = utt.done {
-                *latch.spoken.lock().unwrap() = true;
-                latch.cv.notify_all();
-            }
+            fire_latch(utt.done);
             continue;
         }
 
-        gate.set_speaking(true);
-        // Tone-only: play the negative "unrecognized" cue and skip TTS entirely
-        // (nothing to speak, nothing to add to the echo list).
-        // A killed player (SIGTERM) is an intentional barge-in cut-off, not a
-        // failure — same treatment as the main TTS path below, which the tone
-        // and chime never got (they warned on every interrupted beep).
-        let log_play_err = |what: &str, e: anyhow::Error| {
-            let msg = format!("{e:#}");
-            if msg.contains("SIGTERM") || msg.contains("signal: 15") {
-                tracing::debug!("{what} interrupted (barge-in): {msg}");
-            } else {
-                tracing::warn!("{what} failed: {msg}");
-            }
-        };
-        if utt.negative {
-            if let Some(path) = &negative_path {
-                if let Err(e) = crate::tts::play(path) {
-                    log_play_err("negative tone", e);
-                }
-            }
-            if let Some(latch) = utt.done {
-                *latch.spoken.lock().unwrap() = true;
-                latch.cv.notify_all();
-            }
-            continue;
-        }
-        if utt.chime {
-            if let Some(path) = &chime_path {
-                if let Err(e) = crate::tts::play(path) {
-                    log_play_err("chime", e);
-                }
-            }
-        }
-        // A station utterance speaks through the ATC voice (warm ONNX + radio
-        // effect, built on first use) instead of the copilot's.
-        //
-        // catch_unwind: a panic ANYWHERE in a TTS engine must not kill this
-        // thread — blocking callers wait on latches only this thread signals,
-        // so a dead speaker deadlocks the whole app (seen live 2026-07-07: the
-        // first station utterance panicked, the main loop hung unkillable, and
-        // the backtrace sprayed over the raw-mode TUI). A panicking station
-        // voice is demoted to the `say` fallback for the rest of the session.
+        set_channel_speaking(inner, &gate, true, true);
+        // A panicking station voice is demoted to the `say` fallback for the
+        // rest of the session (same catch_unwind rationale as the intercom).
         let seed = inner
             .station_seed
             .load(std::sync::atomic::Ordering::Relaxed);
-        if utt.station.is_some() && seed != stations_seed {
+        if seed != stations_seed {
             stations = [None, None, None, None, None];
             stations_seed = seed;
         }
-        let locals: Vec<String> = if utt.station.is_some() {
-            inner
-                .station_local
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-        } else {
-            Vec::new()
-        };
-        let station_model = utt
-            .station
-            .map(|who| who.model(&station_cfg, seed, &locals));
+        let locals: Vec<String> = inner
+            .station_local
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let who = utt.station.expect("radio queue only holds station utterances");
+        let model = who.model(&station_cfg, seed, &locals);
         let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let (Some(who), Some(model)) = (utt.station, &station_model) {
-                let slot = &mut stations[who.slot()];
-                if slot.as_ref().map(|(m, _)| m.as_str()) != Some(model.as_str()) {
-                    *slot = Some((model.clone(), StationVoice::build(&station_cfg, model)));
-                }
-                // Publish the transmission as on-air just before playback, so a
-                // PTT press or a retune can CUT it (no resume). Copilot speech
-                // is deliberately never published: it's intercom, not radio.
-                // Then re-check hearability: a retune or power-off landing
-                // during SYNTHESIS falls between the dequeue check and this
-                // publish, so `set_com1`/`set_radio_powered` found nothing
-                // on the air to cut. The cut generation in
-                // `tts::stop_playback` kills even a player that hasn't
-                // registered its pid yet.
-                slot.as_mut().expect("just built").1.speak(&utt.text, |_samples, _rate| {
-                    *inner.now_playing.lock().unwrap_or_else(|e| e.into_inner()) = Some(who);
-                    if station_unhearable(inner, Some(who)) {
-                        crate::tts::stop_playback();
-                    }
-                })
-            } else {
-                speaker.speak(&utt.text)
+            let slot = &mut stations[who.slot()];
+            if slot.as_ref().map(|(m, _)| m.as_str()) != Some(model.as_str()) {
+                *slot = Some((model.clone(), StationVoice::build(&station_cfg, &model)));
             }
+            // Publish the transmission as on-air just before playback, so a
+            // PTT press or a retune can CUT it (no resume). Copilot speech
+            // is deliberately never published: it's intercom, not radio.
+            // Then re-check hearability: a retune or power-off landing
+            // during SYNTHESIS falls between the dequeue check and this
+            // publish, so `set_com1`/`set_radio_powered` found nothing
+            // on the air to cut. The cut generation in `tts::stop_channel`
+            // kills even a player that hasn't registered its pid yet.
+            slot.as_mut().expect("just built").1.speak(&utt.text, |_samples, _rate| {
+                *inner.now_playing.lock().unwrap_or_else(|e| e.into_inner()) = Some(who);
+                if station_unhearable(inner, Some(who)) {
+                    crate::tts::stop_channel(crate::tts::Channel::Radio);
+                }
+            })
         }))
         .unwrap_or_else(|panic| {
-            let what = panic
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic".into());
-            if let (Some(who), Some(model)) = (utt.station, &station_model) {
-                tracing::error!("station voice panicked ({what}); demoting to `say` fallback");
-                stations[who.slot()] = Some((
-                    model.clone(),
-                    StationVoice::Say(Config {
-                        tts_backend: "say".into(),
-                        say_voice: station_cfg.atc_voice.clone(),
-                        say_rate: station_cfg.atc_rate.clone(),
-                        ..Config::default()
-                    }),
-                ));
-            }
+            let what = panic_text(panic);
+            tracing::error!("station voice panicked ({what}); demoting to `say` fallback");
+            stations[who.slot()] = Some((
+                model.clone(),
+                StationVoice::Say(Config {
+                    tts_backend: "say".into(),
+                    say_voice: station_cfg.atc_voice.clone(),
+                    say_rate: station_cfg.atc_rate.clone(),
+                    ..Config::default()
+                }),
+            ));
             Err(anyhow::anyhow!("TTS panicked: {what}"))
         });
         if let Err(e) = spoke {
-            // An interrupt (PTT / barge-in) kills `say`/piper with SIGTERM — that's
-            // an intentional cut-off, not a failure, so don't log it as a warning.
-            let msg = format!("{e:#}");
-            if msg.contains("SIGTERM") || msg.contains("signal: 15") {
-                tracing::debug!("TTS interrupted (barge-in): {msg}");
-            } else {
-                tracing::warn!("TTS failed: {msg}");
-            }
+            log_tts_err("TTS", e);
         }
         // Off the air, either way: finished playback clears its own slot; a
         // barge-in already stole it (this take then finds None, harmlessly).
@@ -1062,19 +1248,17 @@ fn speaker_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        // Remember what we just said (it just finished playing) so the listener can
-        // reject this audio if it bleeds back through the mic. Prune the old.
-        {
-            let mut said = inner.spoken.lock().unwrap();
-            said.push((Instant::now(), utt.text.clone()));
-            said.retain(|(t, _)| t.elapsed() < ECHO_MEMORY);
-        }
-
-        if let Some(latch) = utt.done {
-            *latch.spoken.lock().unwrap() = true;
-            latch.cv.notify_all();
-        }
+        remember_spoken(inner, &utt.text);
+        fire_latch(utt.done);
     }
+}
+
+fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic".into())
 }
 
 /// An env-tunable f32 with a default (station cadence knobs).
@@ -1220,6 +1404,9 @@ mod tests {
         Inner {
             queue: Mutex::new(Queue { heap: BinaryHeap::new(), seq: 0, shutdown: false }),
             cv: Condvar::new(),
+            radio_queue: Mutex::new(Queue { heap: BinaryHeap::new(), seq: 0, shutdown: false }),
+            radio_cv: Condvar::new(),
+            speaking: Mutex::new((false, false)),
             station_seed: std::sync::atomic::AtomicUsize::new(0),
             station_local: Mutex::new(Vec::new()),
             hold: std::sync::atomic::AtomicBool::new(false),
@@ -1228,6 +1415,8 @@ mod tests {
             com1_known: std::sync::atomic::AtomicBool::new(false),
             radio_powered: std::sync::atomic::AtomicBool::new(true),
             crashed: std::sync::atomic::AtomicBool::new(false),
+            replay: std::sync::atomic::AtomicBool::new(false),
+            paused: std::sync::atomic::AtomicBool::new(false),
             spoken: Mutex::new(Vec::new()),
         }
     }
@@ -1250,6 +1439,18 @@ mod tests {
         assert!(station_unhearable(&inner, Some(Tower)));
         assert!(!station_unhearable(&inner, None));
         inner.crashed.store(false, std::sync::atomic::Ordering::Relaxed);
+        // Replay: the world is a recording — no station audio, but the
+        // copilot's intercom still answers.
+        inner.replay.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(station_unhearable(&inner, Some(Tower)));
+        assert!(!station_unhearable(&inner, None));
+        inner.replay.store(false, std::sync::atomic::Ordering::Relaxed);
+        // Paused is NOT replay: a transmission already on the air finishes
+        // its sentence (the monitor's tick-skip stops anything new; only the
+        // transmit paths gate on paused).
+        inner.paused.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(!station_unhearable(&inner, Some(Tower)));
+        inner.paused.store(false, std::sync::atomic::Ordering::Relaxed);
         // Once tuning is published, only the tuned position (and its ghosts)
         // is hearable; a real read that's off every frequency silences all.
         inner.com1_known.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1277,6 +1478,62 @@ mod tests {
         // Dropped means dropped: neither transmission was actually spoken
         // (finished speech always lands in the echo memory).
         assert!(voice.inner.spoken.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn station_and_copilot_speech_route_to_their_own_channels() {
+        // Independent channels (2026-07-14): station utterances must land in
+        // the radio queue, copilot speech in the intercom queue — so the two
+        // can play concurrently and a radio-only cut never kills the copilot.
+        let voice = Voice::new(Config::default());
+        voice.alert(Priority::Advisory, "flaps look good");
+        voice.alert_station(Priority::Readback, StationSpeaker::Tower, "cleared to land");
+        // The speaker threads race us for the queues; assert on what was
+        // ENQUEUED by holding the locks straight away and checking whichever
+        // items haven't been popped yet still carry the right tag — and that
+        // neither queue ever saw the other channel's utterance.
+        let q = voice.inner.queue.lock().unwrap();
+        assert!(q.heap.iter().all(|u| u.station.is_none()));
+        drop(q);
+        let rq = voice.inner.radio_queue.lock().unwrap();
+        assert!(rq.heap.iter().all(|u| u.station.is_some()));
+    }
+
+    #[test]
+    fn crew_discipline_defers_routine_lines_but_not_warnings() {
+        // While a station is on the air the copilot holds routine speech
+        // (advisories, readbacks, cautions) — a crew member doesn't talk over
+        // ATC. A Warning (stall, terrain) breaks through immediately.
+        for p in [Priority::Advisory, Priority::Readback, Priority::Caution] {
+            assert!(!intercom_may_start(p, true), "{p:?} must wait for the frequency");
+            assert!(intercom_may_start(p, false), "{p:?} speaks on a quiet frequency");
+        }
+        assert!(intercom_may_start(Priority::Warning, true), "a Warning talks over the radio");
+        assert!(intercom_may_start(Priority::Warning, false));
+    }
+
+    #[test]
+    fn radio_going_quiet_wakes_a_deferred_intercom_line() {
+        // The intercom defers a routine line while the radio speaks; when the
+        // radio's speaking flag clears, the intercom must be woken (via its
+        // condvar) or the deferred line sleeps forever. Exercised end to end:
+        // a blocking say() enqueued while the radio flag is up must complete
+        // once the radio goes quiet.
+        let voice = Voice::new(Config::default());
+        let gate = voice.mic_gate();
+        // Let the radio thread's startup pass park in its condvar wait first —
+        // its initial "not speaking" clear would otherwise race this set. (In
+        // production only the radio loop itself touches the flag.)
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        set_channel_speaking(&voice.inner, &gate, true, true);
+        let v2 = voice.clone();
+        let t = std::thread::spawn(move || {
+            v2.say(Priority::Readback, ""); // deferred while the radio is up
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!t.is_finished(), "routine line must wait for the radio");
+        set_channel_speaking(&voice.inner, &gate, true, false);
+        t.join().unwrap();
     }
 
     #[test]

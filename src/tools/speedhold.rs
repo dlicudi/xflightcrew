@@ -11,11 +11,14 @@
 //! by itself the moment a recovery or autoland takes the aircraft, or on the
 //! ground below taxi speed.
 //!
-//! Taxiing, the pilot's BRAKES are a pause, not a release: both pedals down
-//! brings the throttle to idle and the governor sits on its hands; pedals
-//! fully off rolls back up to the held target ("resume when I release the
-//! brakes", 2026-07-13). The full stops stay explicit — parking brake or a
-//! throttle push releases the hold entirely.
+//! Taxiing, the pilot's BRAKES are a pause, not a release: both pedals down —
+//! or the keyboard/joystick brake TOGGLE, which never moves the pedals and
+//! instead latches the parking-brake ratio at regular effort (~0.36, measured
+//! live 2026-07-14) — brings the throttle to idle and the governor sits on
+//! its hands; brakes fully off rolls back up to the held target ("resume when
+//! I release the brakes", 2026-07-13; "ease off the throttle when I toggle
+//! the brakes", 2026-07-14). The full stops stay explicit — the park handle
+//! (ratio past 0.5) or a throttle push releases the hold entirely.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -61,18 +64,30 @@ const PILOT_BRAKE_YIELD: f64 = 0.1;
 /// between paused and rolling.
 const PILOT_BRAKE_RESUME: f64 = 0.05;
 
-/// The pilot has taken the brakes to SLOW: they're pressing BOTH toe brakes
-/// while the governor isn't (so the ratio reflects hardware, not our own
-/// command). The copilot must hand back rather than throttle up against the
-/// pedals — the same yield it gives a throttle-lever nudge or the parking brake.
+/// The pilot has taken the brakes to SLOW, on either input path, while the
+/// governor isn't braking (so the reads reflect hardware, not our own
+/// command). The copilot must ease the throttle off rather than power up
+/// against the brakes — the same yield it gives a throttle-lever nudge.
 ///
-/// Deliberately `min`, not `max`: a single pedal is DIFFERENTIAL braking, which
-/// is how you steer a taxiing aircraft — and on a castoring-nosewheel type (the
-/// SR22) it's the ONLY low-speed steering. Standing down on one pedal made the
-/// taxi hold cut throttle to 0 every time the pilot turned (2026-07-12). Only
-/// both pedals together reads as "I'm slowing us," not "I'm turning."
-fn pilot_took_the_brakes(left: f64, right: f64, governor_braking: bool) -> bool {
-    !governor_braking && left.min(right) > PILOT_BRAKE_YIELD
+/// Two paths because X-Plane has two (both measured live, 2026-07-14):
+/// - TOE PEDALS drive the left/right ratios. Deliberately `min`, not `max`:
+///   a single pedal is DIFFERENTIAL braking, which is how you steer a
+///   taxiing aircraft — and on a castoring-nosewheel type (the SR22) it's
+///   the ONLY low-speed steering. Standing down on one pedal made the taxi
+///   hold cut throttle to 0 every time the pilot turned (2026-07-12). Only
+///   both pedals together reads as "I'm slowing us," not "I'm turning."
+/// - The brake TOGGLE (keyboard "b" / a joystick button) never moves the
+///   pedals: it latches the PARKING-BRAKE ratio at regular effort (~0.36).
+///   That sat below the park-handle stand-down (> 0.5), above nothing — the
+///   governor throttled against toggled brakes and never saw them
+///   (2026-07-14). Anything past pedal-noise on that ratio is the pilot
+///   braking; past 0.5 is the park handle, which the caller turns into a
+///   full stand-down before this is ever consulted.
+///
+/// The caller must only trust these reads once `tools::brake_cmd_quiet()` —
+/// our own held stop command rides the same parking-brake ratio while active.
+fn pilot_took_the_brakes(left: f64, right: f64, parkbrake: f64, governor_braking: bool) -> bool {
+    !governor_braking && (left.min(right) > PILOT_BRAKE_YIELD || parkbrake > PILOT_BRAKE_YIELD)
 }
 
 /// True while the governor loop runs. Public so other control loops could
@@ -290,14 +305,26 @@ impl Tool for HoldSpeed {
         if on_ground && !taxi {
             return Ok("We're on the ground — say a taxi speed like 'taxi at 10 knots', or ask again airborne.".to_string());
         }
-        // A commanded taxi carries the intent to ROLL: release the parking
-        // brake ourselves and say so — "release it first" sent the pilot to
-        // do the copilot's job. Through the ONE valve-aware routine the
-        // parking-brake tool uses: the ratio-only shortcut said "parking
+        // A crew-held "brakes on" yields to a commanded taxi the same way the
+        // parking brake does: rolling was just asked for. A stop target hands
+        // over silently, the governor parks on its own boot before the held
+        // command expires. Released FIRST: the held command rides the
+        // parking-brake ratio, so with the hold still on the check below
+        // would read our own braking as the pilot's brake toggle.
+        let crew_brakes_released = taxi && super::controls::release_held_brakes();
+        // A commanded taxi carries the intent to ROLL: release the brakes
+        // ourselves and say so — "release it first" sent the pilot to do the
+        // copilot's job. Past 0.5 the ratio is the park HANDLE; the band
+        // between pedal-noise and 0.5 is the keyboard/joystick brake TOGGLE's
+        // regular-effort latch (~0.36, measured 2026-07-14) — unless a crew
+        // hold was JUST dropped above, whose decaying command sits in that
+        // same band and needs no release. Through the ONE valve-aware routine
+        // the parking-brake tool uses: the ratio-only shortcut said "parking
         // brake off" on the SR22 while the valve held the wheels
         // (2026-07-11). A stop target with the brake set needs no governor.
         let mut brake_released = false;
-        if taxi && ctx.xplane.get_float(PARK_BRAKE).await.unwrap_or(0.0) > 0.5 {
+        let pb = ctx.xplane.get_float(PARK_BRAKE).await.unwrap_or(0.0);
+        if taxi && (pb > 0.5 || (pb > PILOT_BRAKE_YIELD && !crew_brakes_released)) {
             if a.knots.is_some_and(|k| k < 1.0) {
                 return Ok("Parking brake's set — we're staying put.".to_string());
             }
@@ -312,11 +339,6 @@ impl Tool for HoldSpeed {
                 );
             }
         }
-        // A crew-held "brakes on" yields to a commanded taxi the same way the
-        // parking brake does: rolling was just asked for. A stop target hands
-        // over silently, the governor parks on its own boot before the held
-        // command expires.
-        let crew_brakes_released = taxi && super::controls::release_held_brakes();
         let target = if taxi {
             match a.knots {
                 Some(k) => clamp_taxi_target(k),
@@ -410,11 +432,11 @@ async fn glide(xp: &XPlaneClient, dataref: &str, to: f64, over_ms: u64) {
 async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
     tracing::info!("speed governor started");
     let mut braking = false;
-    // When the held-brake command was last renewed: until it expires, the
-    // pedal ratios can be our own braking, not the pilot's feet. (Only the
-    // held COMMAND pollutes the pedals — the proportional channel is
-    // additive and leaves them alone.)
-    let mut last_brake_cmd: Option<std::time::Instant> = None;
+    // Our own brake pollution, by channel: the proportional channel drives
+    // the PEDAL ratios (gated by `braking`), and the held stop command rides
+    // the PARKING-BRAKE ratio (gated by the shared `brake_cmd_quiet` clock,
+    // which also covers the crew's `hold_brakes` holder). Both gates must
+    // pass before a brake read is believed to be the pilot's.
     // The proportional channel failed once (plugin absent or old): warned,
     // trims fall back to the held command for the rest of this governor.
     let mut trim_fallback = false;
@@ -443,6 +465,15 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
         {
             ACTIVE.store(false, Ordering::Relaxed);
             break;
+        }
+        // Frozen sim (paused or replay): both laws are P+D against a state
+        // that isn't moving — the error never changes, so the throttle (or
+        // brake) command walks to its clamp and springs on unfreeze. Hold
+        // everything exactly as it is and wait for live. The trend windows
+        // (0.2–2 s) discard the stale sample on resume.
+        if crate::xplane::sim_frozen(&xp).await {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
         }
         let target = *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner());
         let mode = *MODE.lock().unwrap_or_else(|e| e.into_inner());
@@ -510,10 +541,14 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     ACTIVE.store(false, Ordering::Relaxed);
                     break;
                 }
-                // Parking brake set mid-roll is the pilot STOPPING: close the
-                // throttle and hand the aircraft back — never chase the
-                // target against the brake at taxi power.
-                if xp.get_float(PARK_BRAKE).await.unwrap_or(0.0) > 0.5 {
+                // The parking-brake ratio, read every tick: the park HANDLE
+                // (past 0.5) set mid-roll is the pilot STOPPING — close the
+                // throttle and hand the aircraft back, never chase the target
+                // against the brake at taxi power. Below that, the ratio can
+                // be the pilot's brake TOGGLE (regular effort ~0.36), which
+                // feeds the pause logic further down.
+                let pb = xp.get_float(PARK_BRAKE).await.unwrap_or(0.0);
+                if pb > 0.5 {
                     tracing::info!(
                         "speed governor: parking brake set, closing throttle, standing down"
                     );
@@ -522,13 +557,14 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     break;
                 }
                 // Brake-paused: idle throttle, hands off, waiting on the
-                // pedals. Fully released rolls the taxi again; a hand
-                // advancing the throttle meanwhile is the pilot taking the
-                // aircraft — release for good.
+                // brakes — pedals AND the toggle latch, whichever the pilot
+                // used. Fully released rolls the taxi again; a hand advancing
+                // the throttle meanwhile is the pilot taking the aircraft —
+                // release for good.
                 if paused {
                     let lb = xp.get_float(LEFT_BRAKE).await.unwrap_or(0.0);
                     let rb = xp.get_float(RIGHT_BRAKE).await.unwrap_or(0.0);
-                    if lb.max(rb) > PILOT_BRAKE_RESUME {
+                    if lb.max(rb).max(pb) > PILOT_BRAKE_RESUME {
                         if xp.get_float(THROTTLE).await.is_ok_and(|t| t > 0.15) {
                             tracing::info!(
                                 "speed governor: throttle advanced while brake-paused, releasing"
@@ -549,22 +585,21 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                         );
                     }
                 }
-                // The pilot on BOTH toe brakes is a PAUSE, not a hand-back:
-                // throttle to idle and wait for the pedals (it used to stand
+                // The pilot on the brakes — BOTH toe pedals, or the brake
+                // toggle's parking-brake latch — is a PAUSE, not a hand-back:
+                // throttle to idle and wait for the brakes (it used to stand
                 // down for good, and every brake press cost a "go" to get the
-                // taxi back — resume-on-release asked for 2026-07-13). A
-                // single pedal is differential steering (turning the
-                // aircraft), which the hold must ride through. Only read the
-                // pedals once OUR held-brake command has expired — while it
-                // is (or was just) active, the ratios can be our own braking
-                // wearing the pilot's shoes.
-                let ours_expired = last_brake_cmd
-                    .is_none_or(|t| t.elapsed().as_secs_f64() > BRAKE_HOLD_SECS + 0.2);
-                if !braking && ours_expired {
+                // taxi back — resume-on-release asked for 2026-07-13; the
+                // toggle went entirely unseen and got throttled against,
+                // 2026-07-14). A single pedal is differential steering
+                // (turning the aircraft), which the hold must ride through.
+                // Only believed once every crew brake command is quiet — the
+                // held stop rides the same parking-brake ratio while active.
+                if !braking && super::brake_cmd_quiet() {
                     let lb = xp.get_float(LEFT_BRAKE).await.unwrap_or(0.0);
                     let rb = xp.get_float(RIGHT_BRAKE).await.unwrap_or(0.0);
-                    if pilot_took_the_brakes(lb, rb, braking) {
-                        tracing::info!(brake = lb.max(rb), "speed governor: pilot braking, throttle idle, paused");
+                    if pilot_took_the_brakes(lb, rb, pb, braking) {
+                        tracing::info!(brake = lb.max(rb).max(pb), "speed governor: pilot braking, throttle idle, paused");
                         glide(&xp, THROTTLE, 0.0, 300).await;
                         last_cmd = Some(0.0);
                         paused = true;
@@ -626,7 +661,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                         }
                         if !trimmed {
                             match xp.run_command_for(BRAKES_REGULAR, BRAKE_HOLD_SECS).await {
-                                Ok(()) => last_brake_cmd = Some(std::time::Instant::now()),
+                                Ok(()) => super::note_brake_cmd(),
                                 Err(e) => {
                                     tracing::warn!("speed governor: brake command failed: {e:#}")
                                 }
@@ -755,19 +790,37 @@ mod tests {
     fn manual_toe_brakes_make_the_governor_yield() {
         // BOTH pedals down while we're NOT braking (override off → the ratios
         // are the pilot's pedals): the pilot is slowing us, yield.
-        assert!(pilot_took_the_brakes(0.2, 0.2, false), "both pedals = slowing");
-        assert!(pilot_took_the_brakes(0.5, 0.2, false), "both engaged, uneven, still slowing");
+        assert!(pilot_took_the_brakes(0.2, 0.2, 0.0, false), "both pedals = slowing");
+        assert!(pilot_took_the_brakes(0.5, 0.2, 0.0, false), "both engaged, uneven, still slowing");
         // A SINGLE pedal is differential braking = steering a turn (the only
         // low-speed steering on a castoring nosewheel). The hold must ride
         // through it, not cut throttle to 0 the moment the pilot turns.
-        assert!(!pilot_took_the_brakes(0.4, 0.0, false), "left pedal = steering, ride through");
-        assert!(!pilot_took_the_brakes(0.0, 0.4, false), "right pedal = steering, ride through");
+        assert!(!pilot_took_the_brakes(0.4, 0.0, 0.0, false), "left pedal = steering, ride through");
+        assert!(!pilot_took_the_brakes(0.0, 0.4, 0.0, false), "right pedal = steering, ride through");
         // Pedal rest / sensor noise below the threshold is NOT a takeover.
-        assert!(!pilot_took_the_brakes(0.05, 0.03, false));
-        assert!(!pilot_took_the_brakes(0.0, 0.0, false));
+        assert!(!pilot_took_the_brakes(0.05, 0.03, 0.0, false));
+        assert!(!pilot_took_the_brakes(0.0, 0.0, 0.02, false));
         // While the governor is braking (override on) the ratios are OUR own
         // command, not the pilot's — never read them as a takeover, or we'd
         // stand ourselves down the instant we touched the brakes.
-        assert!(!pilot_took_the_brakes(0.6, 0.6, true), "that's our brake, not theirs");
+        assert!(!pilot_took_the_brakes(0.6, 0.6, 0.0, true), "that's our brake, not theirs");
+    }
+
+    #[test]
+    fn brake_toggle_latch_makes_the_governor_yield() {
+        // The keyboard/joystick brake TOGGLE never moves the pedals: it
+        // latches the parking-brake ratio at regular effort (~0.36 measured
+        // live, 2026-07-14). That must read as the pilot braking — the
+        // governor throttled straight against it before.
+        assert!(pilot_took_the_brakes(0.0, 0.0, 0.36, false), "toggle latch = slowing");
+        // A partially-set park handle below the stand-down threshold is
+        // braking all the same.
+        assert!(pilot_took_the_brakes(0.0, 0.0, 0.3, false));
+        // The decay tail after our own held command expires (~0.02 within a
+        // second) is noise, not a takeover — and the fresher, higher tail is
+        // excluded by the shared brake_cmd_quiet clock, not this threshold.
+        assert!(!pilot_took_the_brakes(0.0, 0.0, 0.02, false), "decay tail is not the pilot");
+        // While the governor itself is braking, nothing reads as the pilot.
+        assert!(!pilot_took_the_brakes(0.0, 0.0, 0.36, true), "our stop, not their toggle");
     }
 }

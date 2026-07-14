@@ -63,6 +63,34 @@ pub(crate) const BRAKE_HOLD_SECS: f64 = 1.0;
 /// (`set_heading`/`set_altitude`/…) and by the ILS setup in `approach`.
 pub(crate) const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 
+/// When [`BRAKES_REGULAR`] was last (re)issued, by ANY crew loop - the
+/// `hold_brakes` holder or the taxi governor's stop channel. One clock for
+/// both, because the taxi governor reads the PARKING-BRAKE ratio to detect
+/// the pilot's brake toggle, and the held command rides that very dataref
+/// while active (not the toe pedals - measured live, 2026-07-14: the sim
+/// ramps parkbrake to regular effort ~0.36 and decays it ~0.8 s after
+/// expiry). Until this clock is quiet, an elevated parkbrake can be our own
+/// braking wearing the pilot's shoes.
+static LAST_BRAKE_CMD: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Record a [`BRAKES_REGULAR`] activation. Call alongside every issue of the
+/// held command, or `brake_cmd_quiet` tells lies.
+pub(crate) fn note_brake_cmd() {
+    *LAST_BRAKE_CMD.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+}
+
+/// The held-brake command, its expiry, and the parkbrake decay tail are all
+/// behind us: the parking-brake ratio now reads as the PILOT's input. The
+/// 1.0 s tail margin is the measured decay (~0.8 s to noise) plus slack -
+/// thinner and the governor pauses itself on its own expiring stop command.
+pub(crate) fn brake_cmd_quiet() -> bool {
+    !controls::brakes_held()
+        && LAST_BRAKE_CMD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none_or(|t| t.elapsed().as_secs_f64() > BRAKE_HOLD_SECS + 1.0)
+}
+
 /// Shared context handed to every tool invocation.
 pub struct ToolCtx<'a> {
     pub xplane: &'a dyn XPlane,

@@ -76,6 +76,14 @@ pub struct Config {
     /// native arm64, see [`crate::tts_onnx`]; falls back to `say` if the model
     /// can't load), `say` (macOS built-in), or `piper` (subprocess).
     pub tts_backend: String,
+    /// Playback volume for the copilot's intercom voice (0.0-2.0, 1.0 = unity).
+    /// Applied on the WAV-playing paths (`afplay -v`); the `say` fallback has no
+    /// volume knob. `XCOPILOT_VOICE_VOL`.
+    pub voice_volume: f32,
+    /// Playback volume for every station voice — controllers, ATIS, party-line
+    /// traffic (0.0-2.0, 1.0 = unity). Lets the radio sit louder or quieter than
+    /// the copilot, like the COM knob on a real audio panel. `XCOPILOT_ATC_VOL`.
+    pub atc_volume: f32,
     /// macOS `say` voice name (used when `tts_backend = "say"`). Empty = system
     /// default. List options with `say -v '?'` (e.g. `Daniel`, `Samantha`, `Karen`).
     pub say_voice: String,
@@ -223,6 +231,8 @@ impl Config {
             mic_gate_tail_ms: env_or("XCOPILOT_MIC_GATE_TAIL_MS", "900").parse().unwrap_or(900),
             ui: env_or("XCOPILOT_UI", default_ui()),
             tts_backend: env_or("XCOPILOT_TTS", "onnx"),
+            voice_volume: env_or("XCOPILOT_VOICE_VOL", "1.0").parse().unwrap_or(1.0),
+            atc_volume: env_or("XCOPILOT_ATC_VOL", "1.0").parse().unwrap_or(1.0),
             say_voice: env_or("XCOPILOT_SAY_VOICE", ""),
             say_rate: env_or("XCOPILOT_SAY_RATE", ""),
             chime_path: env_or("XCOPILOT_CHIME", ""),

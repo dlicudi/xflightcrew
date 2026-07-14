@@ -75,6 +75,20 @@ pub trait XPlane: Send + Sync {
     async fn set_float_array_elem(&self, name: &str, index: usize, value: f64) -> Result<()>;
 }
 
+/// True when what the sim shows is not the aircraft flying NOW: paused, or
+/// playing a replay. Control loops freeze on it — no writes, no integration
+/// (a P+D throttle law ticking against a frozen airspeed walks the lever to
+/// its clamp and surges on unpause), no blackbox — and the monitor skips its
+/// reactive tick. Fail open: a failed read means live.
+pub async fn sim_frozen(xp: &dyn XPlane) -> bool {
+    for dref in [crate::datarefs::IS_IN_REPLAY, crate::datarefs::PAUSED] {
+        if xp.get_float(dref).await.is_ok_and(|v| v > 0.5) {
+            return true;
+        }
+    }
+    false
+}
+
 /// HTTP client for one running X-Plane instance.
 pub struct XPlaneClient {
     http: reqwest::Client,

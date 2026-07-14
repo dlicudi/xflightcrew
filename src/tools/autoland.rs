@@ -69,6 +69,19 @@ impl Tool for Autoland {
                 "No autoland running.".to_string()
             });
         }
+        // A replay can't be flown: the position it would arm against is a
+        // recording, and the runway search + engaged AP would spring on the
+        // pilot the moment the sim goes live. (The running loop pauses itself
+        // on the same dataref.)
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::IS_IN_REPLAY)
+            .await
+            .is_ok_and(|v| v > 0.5)
+        {
+            return Ok("We're in replay, nothing to fly. Go back to live and ask again."
+                .to_string());
+        }
         // Re-arming mid-approach is destructive: it kills the flying loop and
         // spends ~6 s re-searching apt.dat with nobody on the controls (seen
         // live at LERL: three "autoland" calls in three minutes on short final).

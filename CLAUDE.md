@@ -26,6 +26,20 @@ Horizon is Python; x-copilot is Rust, so code isn't lifted directly — but two
 patterns port over conceptually: its X-Plane Web API client (~30 lines of HTTP)
 and its "shell out to the `piper` binary" TTS trick.
 
+## Sibling reference: rustdecks
+
+`~/GitHub/rustdecks` (a Loupedeck Live controller for X-Plane) is the other
+half of a two-way dataref/command exchange — when hunting a dataref or command
+name, check there before the sim's DataRefs.txt. Its `src/sim.rs` is the
+proven Web API client [src/livestate.rs](src/livestate.rs) was ported from;
+its `examples/*.yaml` profiles (and the `~/GitHub/cockpitdecks` /
+`~/GitHub/cockpitdecks-configs` clones it references) carry per-airframe
+dataref/command names verified against real panels (SR22 AP, radios,
+transponder, engine gauges). The flow runs both ways: datarefs/commands
+proven here (datarefs.rs, the tool layer, aircraft profiles, xlua
+study-level tricks) are worth mining for rustdecks pages, and vice versa —
+its CLAUDE.md carries the mirror of this note.
+
 ## Stack (decided)
 
 Rust, because this is a latency- and audio-sensitive real-time loop — where Rust
@@ -47,10 +61,18 @@ is a local model served by Ollama. The tool schema is kept backend-neutral (just
 swapped (Ollama → llama.cpp server, a different model) without touching the tool
 layer — not as a hook for a cloud option.
 
-**X-Plane access: REST first.** Start with the Web API over HTTP (separate
-process, same API Horizon polls). A native X-Plane plugin via the C SDK (`xplm`
-crate) is the lower-latency endgame — keep it in the back pocket, don't start there.
-Note: read Laminar's X-Plane SDK license before distributing a plugin.
+**X-Plane access: REST + a native companion plugin.** The app talks to the sim
+over the Web API (separate process, same API Horizon polls) — every stock
+dataref read/write goes that way. But some things only a plugin can do, so a
+small C++ plugin ([plugin/src/xcopilot.cpp](plugin/src/xcopilot.cpp), Dear ImGui
+panel, `make install` from [plugin/](plugin/)) lives inside the sim and
+*extends the dataref surface* rather than replacing the REST channel: it
+registers `xcopilot/*` datarefs (PTT command + `ptt_active`/`radio_ptt_active`,
+panel state like phase/heard/action/coach/strip, and mailboxes like
+`xcopilot/fms/*`) that the app reads and writes over the same Web API. So the
+architecture is REST for transport, plugin for capability — the app never links
+the SDK itself. Note: read Laminar's X-Plane SDK license before distributing
+the plugin.
 
 ## Aircraft profiles drive the tool surface
 
@@ -66,6 +88,36 @@ fallback, and the active aircraft is **auto-detected** from `acf_ICAO`
 (`XCOPILOT_AIRCRAFT=auto`). Datarefs/commands stay in the Rust tools; the YAML
 carries per-airframe config (flap detents, lights, capability flags).
 
+## SimBrief: fetch over HTTP, inject via the plugin's FMS mailbox
+
+The copilot can brief and load the user's SimBrief flight plan
+([src/simbrief.rs](src/simbrief.rs), `XCOPILOT_SIMBRIEF_ID`). The fetch is the
+**one outbound network call besides X-Plane**: on demand (never in the realtime
+loop) it pulls the latest OFP as JSON, distils it to the briefed essentials
+(route, cruise, ETE, fuel in gallons, TOD distance) plus up to 14 named
+waypoints, and answers deterministically — no LLM.
+
+Loading the route into the GPS/FMS is a three-hop path, because the FMS is
+unreachable through datarefs — only a plugin can touch it:
+
+1. The app serialises waypoints as `IDENT,lat,lon,alt|...` and writes two
+   plugin mailbox datarefs over REST: `xcopilot/fms/route` (payload) then
+   `xcopilot/fms/load` (edge-triggered).
+2. The plugin resolves each ident to a navaid (`XPLMFindNavAid` near the
+   SimBrief lat/lon, for the right .fms row type; lat/lon row as fallback) and
+   composes an X-Plane 11 format flight plan **in memory** — nothing is written
+   to `Output/FMS plans/`. The AIRAC cycle is read from `earth_nav.dat`'s
+   header and stamped in so the loader doesn't warn about a cycle mismatch.
+3. `XPLMLoadFMSFlightPlan` ingests the buffer, then the active leg is set to
+   entry 1 (first fix after the origin) on both the legacy GPS and native FMS
+   plans. Load-a-whole-plan, not the per-entry API, is deliberate: only a plan
+   *load* makes X-Plane parse ADEP/ADES and fill the CDU's ORIGIN/DEST fields —
+   per-entry writes leave them blank even with an airport at entry 0.
+
+The plan also feeds [src/monitor.rs](src/monitor.rs)'s `DESTINATION` (TOD ring
+against the real field elevation) and the fuel check briefs against what's
+actually in the tanks.
+
 ## ATC lives inside the copilot binary (the world, not the crew)
 
 ATC (tower dialogue) runs **in the copilot process**, as a frequency-routed
@@ -74,9 +126,17 @@ arbiter. After the normal capture/confidence/echo gates, an utterance goes to
 the tower iff COM1 is tuned to the station's frequency AND the words parse as
 a radio call ([src/tower.rs](src/tower.rs) — deterministic FSM, keyword
 intents, "say again" over guessed clearances); everything else falls through
-to the copilot unchanged. The station speaks in its own voice (`say`/Daniel)
-through the same arbiter via `Voice::say_as`, so the two voices can never
-overlap. Trust boundary is the module boundary: the station only reads the
+to the copilot unchanged. The station speaks in its own voice through the
+same arbiter (`Voice::say_station`), which since 2026-07-14 runs TWO
+independent half-duplex channels like a real audio panel — the copilot's
+INTERCOM and the station RADIO, each with its own queue, speaker thread, and
+volume (`XCOPILOT_VOICE_VOL` / `XCOPILOT_ATC_VOL`, WAV paths only). The
+channels may overlap; realism priority is crew discipline, not ducking: the
+intercom defers STARTING anything below Warning while the radio is on the
+air (perishable cues drop if they expire waiting), and a Warning (stall,
+terrain) talks straight over the radio. Radio-only cuts (retune, avionics
+off, crash, replay) kill station audio without touching the copilot's voice
+(`tts::stop_channel`). Trust boundary is the module boundary: the station only reads the
 sim and returns text — it can never actuate. Frequencies come from apt.dat
 comm rows (parsed in [src/nav.rs](src/nav.rs)), not hardcoding; config via
 `XCOPILOT_ATC_AIRPORT` (default LXGB), `XCOPILOT_ATC_VOICE`, `XCOPILOT_ATC_RATE`.
@@ -130,7 +190,11 @@ so airline callsign = medium-or-heavier — which turns "cleared for takeoff"
 into LUAW and blocks the hold release); and **named taxi routes** (apt.dat
 1201/1202 network, background-loaded per station in `TAXI_NET`, Dijkstra
 with runway edges ×25 → "taxi to holding point Alpha one runway two seven
-right via Bravo, Link two seven", crossings called out, off-route nudges
+right via Bravo, Link two seven", crossings called out — named from strip
+GEOMETRY when the apt.dat edge is unnamed, and a crossing on the cleared
+route is never berated as an incursion: silence while moving, "expedite"
+when stopped (the tower shouted "on runway two seven without clearance" at
+a pilot following its own route, 2026-07-14) — off-route nudges
 from the compliance watch via `TAXI_ROUTE`). The coach's first suggestion is
 always the readback owed (`ClearanceSnap.pending_readback`); `suggest_call`
 (one source for the voice coach AND the panel's Calls tab, 2026-07-13)
@@ -151,17 +215,20 @@ is bound, **physical routing beats content routing in BOTH directions**
 and intercom speech never content-routes to ATC ("requesting clearance"
 said to the copilot was answered by the tower, 2026-07-12). Content routing
 survives only for setups with no radio key (keyboard PTT, continuous),
-where it's the sole path to ATC. For AUDIO the channels are ONE: **any PTT
-mutes everything while held** (`set_hold`; copilot, controllers, ATIS,
-ghosts), and release rejoins LIVE audio — whatever was said during the
-press is simply gone, walkie-talkie style, no replay (the earlier
-stepped-on/resume machinery is deliberately REMOVED, 2026-07-12: the pilot
-flies on speakers and headset interchangeably, and a muted-everything press
-keeps the mic clean on both). Recovery stays procedural: "say again" /
-readback enforcement, never an auto-repeat. The barge-in cut kills by
-REGISTERED pid + a cut generation ([src/tts.rs](src/tts.rs) `run_audible`),
-not `pkill` by name — a press landing in the spawn window used to be missed
-entirely and the whole transmission talked over the pilot. The radio needs
+where it's the sole path to ATC. For AUDIO the intercom and radio channels
+play independently (2026-07-14) — EXCEPT under PTT: **any PTT mutes
+everything while held** (`set_hold`; copilot, controllers, ATIS, ghosts) —
+that rule is about MIC HYGIENE, not channel symmetry: on speakers, any voice
+still playing bleeds into the capture — and release rejoins LIVE audio;
+whatever was said during the press is simply gone, walkie-talkie style, no
+replay (the earlier stepped-on/resume machinery is deliberately REMOVED,
+2026-07-12: the pilot flies on speakers and headset interchangeably, and a
+muted-everything press keeps the mic clean on both). Recovery stays
+procedural: "say again" / readback enforcement, never an auto-repeat. The
+barge-in cut kills by REGISTERED pid + a PER-CHANNEL cut generation
+([src/tts.rs](src/tts.rs) `run_audible`), not `pkill` by name — a press
+landing in the spawn window used to be missed entirely and the whole
+transmission talked over the pilot. The radio needs
 POWER in both directions: with the avionics master OFF, *station* audio
 (controllers, ATIS, party-line traffic) is dropped, never queued — the
 arbiter's `radio_powered` flag, published by the monitor off the airframe's
@@ -179,7 +246,24 @@ speak as the controller COM1 is actually tuned to (`tuned_speaker` in
 after-takeoff handoff, the held-clearance release) goes silently into the
 void when tuned elsewhere — a berate hardcoded to the tower's voice while
 the pilot sat on the approach frequency put two controllers on one radio
-(2026-07-12).
+(2026-07-12). And a REPLAY is nobody's flight (2026-07-14):
+`sim/time/is_in_replay`, read each monitor tick and published via
+`voice.set_replay`, gates the whole reactive surface — the monitor skips
+its tick (ATC compliance/incursion/region watches, crash recording, the
+flight-ended debrief, callouts), the arbiter drops station audio (the crew
+intercom still answers), keyed and content-routed transmissions are refused
+with a crew line, and the autoland loop pauses and won't arm. A replayed
+crash landing had earned "you landed on runway two seven without clearance"
+plus a second blackbox crash event. Fail open: a failed read means live.
+PAUSE (`sim/time/paused`) shares the freeze but not the audio drop: the
+flight is real, so a controller mid-word finishes the sentence and station
+audio is NOT cut — but the monitor tick, the transmit paths, and every
+control loop still freeze (`xplane::sim_frozen` covers both flags: the
+speed-hold / autoland P+D throttle laws would walk the lever to its clamp
+against a frozen airspeed and surge on unpause, and the recover watcher
+slides its 25 s deadline instead of burning it). Arming autoland WHILE
+paused is allowed on purpose (real position, flies on unpause); arming in
+replay is refused.
 
 Depth (added 2026-07-11, evening): **ILS approaches from real chart data**,
 and **region-accurate phraseology**. `spawn_ils_load` (like the taxi net, a
