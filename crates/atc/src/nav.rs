@@ -1019,15 +1019,31 @@ mod tests {
     #[test]
     #[ignore]
     fn real_install_ils_chart_data_reads() {
-        let config = crate::config::Config::from_env().expect("config");
-        let ils = airport_ils(&config.nav_data_path, "EGLL").expect("nav scan");
+        // Same Custom-Data-first rule as Config::from_env (which lives with
+        // the crew crate): a Navigraph cycle outranks the stock files.
+        fn env_or_first_existing(var: &str, custom: &str, stock: &str) -> String {
+            std::env::var(var).unwrap_or_else(|_| {
+                if std::path::Path::new(custom).exists() { custom } else { stock }.to_string()
+            })
+        }
+        let nav_data_path = env_or_first_existing(
+            "XPLANE_NAV_DATA",
+            "/Users/duanelicudi/X-Plane 12/Custom Data/earth_nav.dat",
+            "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_nav.dat",
+        );
+        let cifp_dir = env_or_first_existing(
+            "XPLANE_CIFP_DIR",
+            "/Users/duanelicudi/X-Plane 12/Custom Data/CIFP",
+            "/Users/duanelicudi/X-Plane 12/Resources/default data/CIFP",
+        );
+        let ils = airport_ils(&nav_data_path, "EGLL").expect("nav scan");
         for rwy in ["09L", "09R", "27L", "27R"] {
             let hit = ils.iter().find(|i| i.runway == rwy);
             assert!(hit.is_some(), "EGLL {rwy} ILS missing: {ils:?}");
             assert_eq!(hit.unwrap().gs_deg, Some(3.0), "{rwy}");
         }
         assert_eq!(
-            ils_platform_alt_ft(&config.cifp_dir, "EGLL", "27R"),
+            ils_platform_alt_ft(&cifp_dir, "EGLL", "27R"),
             Some(2500.0),
             "27R platform from the CIFP FAF"
         );

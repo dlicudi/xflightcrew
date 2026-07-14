@@ -2,7 +2,7 @@
 # library; both stand on crates/sim. One process at runtime — the split is a
 # compile-time boundary, not the failed second-terminal experiment.
 [workspace]
-members = ["crates/sim"]
+members = ["crates/atc", "crates/sim"]
 
 # One version of each shared dep across the workspace, so the crates never drift.
 [workspace.dependencies]
@@ -38,6 +38,8 @@ name = "atc"
 path = "src/bin/atc.rs"
 
 [dependencies]
+# the world side: ATC as a library (station, tower FSM, nav, atis)
+atc = { path = "crates/atc" }
 # shared simulator plumbing (Web API client, dataref names, blackbox)
 sim = { path = "crates/sim" }
 

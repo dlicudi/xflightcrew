@@ -6,7 +6,7 @@
 //! are keyword-matched, not LLM-picked, in line with the deterministic-first
 //! rule: a misheard call gets "say again", never a guessed clearance.
 
-/// Whisper decoding bias for radio calls (see [`crate::stt::Stt::set_prompt`]).
+/// Whisper decoding bias for radio calls (see `Stt::set_prompt` in the crew stt module).
 pub const STT_PROMPT: &str = "Radio calls to the tower: request taxi, request \
 departure clearance, ready for departure, request takeoff, radio check, \
 holding point, runway zero niner, runway two seven, mayday, pan pan, going \
@@ -184,7 +184,7 @@ fn crossing_clause(ctx: &Ctx) -> String {
 /// ATIS information (the station blanks `ctx.qnh`), so the clearance skips
 /// the numbers the broadcast already gave them. `pub(crate)`: the approach
 /// controller's vector phrases attach the same clause.
-pub(crate) fn qnh_clause(ctx: &Ctx) -> String {
+pub fn qnh_clause(ctx: &Ctx) -> String {
     if ctx.qnh.is_empty() {
         String::new()
     } else {

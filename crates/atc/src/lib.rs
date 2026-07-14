@@ -1,0 +1,19 @@
+//! The world side: ATC as a library.
+//!
+//! Everything here observes the sim and RETURNS text tagged with a
+//! [`speaker::StationSpeaker`] — it never actuates the aircraft and never
+//! speaks. The embedder owns the mouth: the copilot's voice arbiter casts
+//! and plays the lines; a standalone binary would bring its own TTS. That
+//! return-value seam is deliberate — do not add a speech callback/trait
+//! here; if a feature ever genuinely needs world-initiated audio, inject a
+//! narrow trait into that feature alone.
+//!
+//! Crew↔world state crosses ONLY through `party_line` accessors (its statics
+//! stay crate-private — the compiler now enforces what used to be
+//! convention). This crate must stay lean: no whisper, no cpal, no ort —
+//! `cargo tree -p atc` is the standalone-product health check.
+
+pub mod atis;
+pub mod nav;
+pub mod speaker;
+pub mod tower;

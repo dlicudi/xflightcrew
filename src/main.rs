@@ -9,11 +9,6 @@
 
 mod aircraft;
 mod approach_guide;
-// ATIS phrasing helpers (spoken digits, NATO, runway designators) — the tower
-// dialogue uses a few of them; the full broadcast surface serves the
-// standalone `atc` binary (lib tree), hence the module-level allow.
-#[allow(dead_code)]
-mod atis;
 mod audio;
 mod autoland;
 mod debrief;
@@ -27,19 +22,16 @@ mod livestate;
 mod llm;
 mod mic;
 mod monitor;
-mod nav;
 mod party_line;
 mod phrase;
 mod plugin_status;
 mod prefs;
 mod readback;
 mod simbrief;
-mod speaker;
 mod station;
 mod stt;
 mod stt_eval;
 mod taxi_guide;
-mod tower;
 mod tts;
 #[cfg(feature = "onnx-tts")]
 mod tts_onnx;
@@ -48,8 +40,10 @@ mod ui;
 mod vad;
 mod voice;
 
-// Simulator plumbing now lives in the `sim` crate; these shims keep every
-// existing `crate::xplane::...` path in the module tree resolving unchanged.
+// The world side (ATC) and the simulator plumbing now live in their own
+// crates; these shims keep every existing `crate::station::...` /
+// `crate::xplane::...` path in the module tree resolving unchanged.
+pub(crate) use ::atc::{atis, nav, speaker, tower};
 pub(crate) use sim::{blackbox, datarefs, xplane};
 
 use std::time::{Duration, Instant};
