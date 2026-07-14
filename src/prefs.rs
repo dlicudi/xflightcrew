@@ -18,6 +18,10 @@ struct Prefs {
     /// picked from the panel's Settings tab. `None` = never chosen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pilot_voice: Option<String>,
+    /// The app mode ("both" | "copilot" | "atc") — the panel's last pick,
+    /// honored at the next boot unless `XCOPILOT_MODE` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
 }
 
 fn load() -> Prefs {
@@ -39,6 +43,23 @@ pub fn pilot_voice() -> Option<String> {
 pub fn save_pilot_voice(spec: &str) {
     let mut prefs = load();
     prefs.pilot_voice = Some(spec.to_string());
+    store(prefs);
+}
+
+/// The saved app mode, if any ("both" | "copilot" | "atc").
+pub fn mode() -> Option<String> {
+    load().mode
+}
+
+/// Persist a new app-mode pick (the panel toggle). Best-effort, like the
+/// voice: a failed write costs the persistence, never the live switch.
+pub fn save_mode(mode: &str) {
+    let mut prefs = load();
+    prefs.mode = Some(mode.to_string());
+    store(prefs);
+}
+
+fn store(prefs: Prefs) {
     match serde_json::to_string_pretty(&prefs) {
         Ok(json) => {
             if let Err(e) = std::fs::write(PREFS_PATH, json) {

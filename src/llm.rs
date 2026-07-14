@@ -480,6 +480,30 @@ impl Llm {
         }
     }
 
+    /// Evict the model from Ollama's memory (`keep_alive: 0` with no
+    /// messages). Used when the app leaves a copilot-capable mode: the model
+    /// otherwise stays resident for the configured keepalive and keeps its
+    /// GPU claim — the whole point of switching to ATC-only is getting those
+    /// frames back. Best-effort; a failure just means the keepalive expires
+    /// it later.
+    pub async fn evict(&self) {
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [],
+            "keep_alive": 0,
+        });
+        match self
+            .http
+            .post(format!("{}/api/chat", self.base))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(_) => tracing::info!(model = %self.model, "llm evicted from ollama"),
+            Err(e) => tracing::info!("llm evict skipped ({e:#})"),
+        }
+    }
+
     /// Answer-only fallback: the LLM is called with NO tools, so it cannot emit a
     /// tool call — it can only reply in prose. Used when the deterministic grammar
     /// doesn't recognize an utterance and the LLM is enabled (option A). Returns
@@ -734,6 +758,7 @@ mod tests {
     /// XCOPILOT_MODEL so we can compare models from the command line.
     fn test_config() -> Config {
         Config {
+            mode: String::new(),
             ollama_base_url: "http://127.0.0.1:11434".into(),
             model: std::env::var("XCOPILOT_MODEL").unwrap_or_else(|_| "qwen3:8b".into()),
             llm_keepalive: "60m".into(),

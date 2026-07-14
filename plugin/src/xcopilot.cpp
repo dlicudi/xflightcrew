@@ -130,6 +130,16 @@ static void WriteOptTone(void*, int v) { g_opt_negative_tone = v; }
 static int ReadOptMute(void*) { return g_opt_monitor_mute; }
 static void WriteOptMute(void*, int v) { g_opt_monitor_mute = v; }
 
+// App mode (Both / Copilot only / ATC only). The app publishes the live mode
+// (0/1/2, mode.rs panel_index) and polls for the pilot's pick; a pick applies
+// within ~2 s and persists to prefs.json as the next boot's default. -1 =
+// untouched, which is also how the app detects a plugin reload wiped this
+// state and re-publishes.
+static int g_opt_mode = -1;
+static XPLMDataRef g_opt_mode_dref = nullptr;
+static int ReadOptMode(void*) { return g_opt_mode; }
+static void WriteOptMode(void*, int v) { g_opt_mode = v; }
+
 // Copilot voice picker. The app publishes the roster of piper models on disk
 // (newline-separated display names) into `voice_list` and the active voice's
 // index into `voice`; the Settings combo writes the pilot's pick back, the app
@@ -1244,6 +1254,25 @@ protected:
     // Live runtime switches. Each checkbox drives a dataref the app polls live;
     // changes apply on the next utterance/tick, no restart.
     void buildSettingsTab() {
+        // App mode: which half of the product is on. -1 = the app hasn't
+        // published yet (no app connected) — hide the control rather than
+        // show radio buttons that would silently do nothing.
+        if (g_opt_mode >= 0) {
+            ImGui::TextUnformatted("Mode");
+            ImGui::RadioButton("Copilot + ATC", &g_opt_mode, 0);
+            ImGui::RadioButton("Copilot only (real/external ATC has the radio)", &g_opt_mode, 1);
+            ImGui::RadioButton("ATC only (no copilot, no LLM)", &g_opt_mode, 2);
+            ImGui::Spacing();
+            ImGui::Separator();
+        }
+        // In ATC-only mode the copilot's settings would be dead switches
+        // (this ImGui predates BeginDisabled, so hide rather than grey).
+        const bool crew_off = (g_opt_mode == 2);
+        if (crew_off) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "Copilot settings hidden in ATC-only mode.");
+        }
+        if (!crew_off) {
         bool llm_on = (g_llm_enabled == 1);
         if (ImGui::Checkbox("LLM fallback (answer questions)", &llm_on)) {
             g_llm_enabled = llm_on ? 1 : 0;
@@ -1288,6 +1317,7 @@ protected:
                 }
                 ImGui::EndCombo();
             }
+        }
         }
         ImGui::Spacing();
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
@@ -1410,6 +1440,10 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
         "xcopilot/opt/voice", xplmType_Int, 1,
         ReadOptVoice, WriteOptVoice, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_opt_mode_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/mode", xplmType_Int, 1,
+        ReadOptMode, WriteOptMode, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     g_voice_list_dref = XPLMRegisterDataAccessor(
         "xcopilot/opt/voice_list", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -1488,6 +1522,7 @@ PLUGIN_API void XPluginStop(void) {
     ImgWindow::sFontAtlas.reset();
     if (g_menu) { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
     if (g_voice_list_dref) { XPLMUnregisterDataAccessor(g_voice_list_dref); g_voice_list_dref = nullptr; }
+    if (g_opt_mode_dref) { XPLMUnregisterDataAccessor(g_opt_mode_dref); g_opt_mode_dref = nullptr; }
     if (g_opt_voice_dref) { XPLMUnregisterDataAccessor(g_opt_voice_dref); g_opt_voice_dref = nullptr; }
     if (g_opt_mute_dref) { XPLMUnregisterDataAccessor(g_opt_mute_dref); g_opt_mute_dref = nullptr; }
     if (g_opt_tone_dref) { XPLMUnregisterDataAccessor(g_opt_tone_dref); g_opt_tone_dref = nullptr; }

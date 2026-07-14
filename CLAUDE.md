@@ -343,6 +343,34 @@ observation via TCAS datarefs (ATC only ever *controls the player* and
 *narrates* other traffic), a radio-PTT plugin dataref if content routing ever
 collides.
 
+## App modes: Both / Copilot only / ATC only (runtime-toggleable)
+
+The two halves sell separately (2026-07-14): `mode.rs` holds one process-wide
+mode — **both** (default), **copilot** (no simulated ATC: no station ever
+loads, radio-keyed speech is IGNORED because real/external ATC owns the
+frequency — no void briefing talking over a VATSIM controller), and **atc**
+(the world without the crew: deterministic tower/ATIS answer the radio, no
+intercom persona, no tools, and the LLM is never touched — an ATC-only boot
+needs no Ollama at all). Chosen from the plugin's Settings tab
+(`xcopilot/opt/mode`, radio buttons; `spawn_mode_poller` syncs it), persisted
+via prefs.json; `XCOPILOT_MODE` env sets only the BOOT value (env > saved pref
+> both), a panel flip wins from that moment and applies live within ~2 s (the
+main loop's idle tick reconciles). Live transitions: ATC off =
+`Station::uninstall()` (retires ALL published world state — party line + side
+state, the same page install() writes) + radio-channel cut; ATC on = the same
+`install_home_station` path boot uses (background scans guard against paying
+boot costs twice — `region_loaded()`); copilot off = intercom cut + Ollama
+evict (`Llm::evict`, keep_alive 0 — reclaims the GPU frames); copilot on =
+re-warmup off the critical path. Monitor watches split along the same seam:
+crew watches (callouts, debrief speech, taxi guide, landing coach, talk-down)
+gate on `mode::copilot_enabled()`; world ticks are inert once uninstall clears
+their state, except `region_tick` which gates explicitly (its airport index
+survives for cheap re-enable). In ATC-only, content routing still reaches the
+station when no radio key is bound (it's the only path to ATC there), and the
+crew speaks exactly one line ("copilot is off") on the first intercom attempt.
+The atc crate itself never reads the mode — the world stays mode-blind and is
+simply not driven when off.
+
 ## Core design rule: curated tool surface, not raw dataref access
 
 **Never let the LLM write arbitrary datarefs.** Expose a small, explicit set of

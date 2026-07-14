@@ -270,6 +270,38 @@ impl Station {
             });
     }
 
+    /// The inverse of [`Station::install`]: retire the world entirely. Clears
+    /// every published static — the party line AND the monitor-tick side
+    /// state — so the crew's coaches, panel, and watches see "no ATC" the
+    /// same instant the owner drops the station. Called by the OWNER when
+    /// the app leaves an ATC-capable mode; the region index and background
+    /// caches (taxi net, ILS facts) survive so re-enabling is cheap.
+    pub fn uninstall() {
+        *ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *CONTROLLER_FREQS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+        *ACTIVE_PANEL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+        *ATIS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *COMPLIANCE.lock().unwrap_or_else(|e| e.into_inner()) = ComplianceState::NEW;
+        *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *GHOSTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *WAKE_PREV.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *GO_AROUND_LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // The party line: no clearance, no route, no vectors, no pending
+        // anything — a re-enable starts from a cold contact, like a fresh
+        // boot.
+        *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    }
+
     /// Content routing (shared PTT): if the utterance is a radio call AND COM1
     /// is on one of this station's frequencies, answer it; `None` falls
     /// through to the copilot untouched. Words are checked before any dataref
@@ -1811,6 +1843,13 @@ const SWITCH_COOLDOWN_SECS: f64 = 180.0;
 /// Index every towered field once (a full apt.dat pass, seconds — run it on a
 /// background thread). Without it [`region_tick`] never fires and the station
 /// stays single-airport, exactly the pre-region behavior.
+/// Whether the enroute region index has been loaded — the owner checks this
+/// before spawning another full apt.dat scan (a live mode re-enable must not
+/// pay the boot cost twice).
+pub fn region_loaded() -> bool {
+    !REGION.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
 pub fn load_region(apt_path: &str) {
     let mut v: Vec<RegionApt> = Vec::new();
     let res = nav::scan_airports(apt_path, |icao, apt| {
@@ -6144,6 +6183,31 @@ mod tests {
         *ACTIVE_FIELD.lock().unwrap() = None;
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
         *CONTROLLER_FREQS.lock().unwrap() = Vec::new();
+    }
+
+    #[test]
+    fn uninstall_retires_the_whole_world() {
+        // Leaving ATC mode mid-flight must clear everything the crew can
+        // see — a stale clearance or taxi route would keep coaching the
+        // pilot toward a tower that no longer exists.
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lxgb().install();
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::TakeoffCleared,
+            callsign: "November one two three alpha bravo".into(),
+            runway_ident: "27".into(),
+            pending_readback: None,
+        });
+        *LANDING_HANDOFF.lock().unwrap() = Some("27".into());
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = true;
+        Station::uninstall();
+        assert!(crate::party_line::clearance_state().is_none(), "clearance cleared");
+        assert!(crate::party_line::landing_handoff_runway().is_none(), "handoff cleared");
+        assert!(!crate::party_line::take_pending_takeoff_clearance(), "pending drained");
+        assert!(ACTIVE_FIELD.lock().unwrap().is_none(), "field retired");
+        assert!(ACTIVE_PANEL.lock().unwrap().is_none(), "panel retired");
+        assert!(ATIS.lock().unwrap().is_none(), "ATIS off the air");
+        assert!(CONTROLLER_FREQS.lock().unwrap().is_empty(), "no controllers");
     }
 
     #[test]

@@ -1562,8 +1562,15 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 }
             }
 
+            // Crew-side watches stand down entirely in ATC-only mode: no
+            // copilot, no callouts, no debrief — the pilot kept the world
+            // and sent the crew home. World ticks are inert without the
+            // station's published state, so most need no gate of their own;
+            // region_tick is the exception (its index cache survives).
+            let crew_on = crate::mode::copilot_enabled();
+
             // Pushback callouts (on the ground): tug hooks up → pushing → clear.
-            if snap.on_ground {
+            if crew_on && snap.on_ground {
                 let say = |line: &str| {
                     if let Some(s) = status.as_ref() {
                         s.alert(AlertLevel::Advisory, line);
@@ -1596,10 +1603,14 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 .await;
                 if let Ok(Some(summary)) = done {
                     tracing::info!(aircraft = %summary.aircraft, "flight distilled to memory");
-                    if let Some(s) = status.as_ref() {
-                        s.alert(AlertLevel::Advisory, &summary.spoken());
+                    // The memory is written in every mode; the spoken debrief
+                    // is the copilot's — ATC-only keeps the record, not the talk.
+                    if crew_on {
+                        if let Some(s) = status.as_ref() {
+                            s.alert(AlertLevel::Advisory, &summary.spoken());
+                        }
+                        voice.alert(Priority::Advisory, summary.spoken());
                     }
-                    voice.alert(Priority::Advisory, summary.spoken());
                 }
             }
 
@@ -1931,7 +1942,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 // flying, nudge the pilot to report final. The world clears
                 // the handoff on the landing clearance or touchdown, which
                 // resets the latch here; a prompt reporter is never nagged.
-                match crate::party_line::landing_handoff_runway() {
+                match crate::party_line::landing_handoff_runway().filter(|_| crew_on) {
                     Some(rwy) if !snap.on_ground => {
                         let seen = *landing_coach_seen.get_or_insert(now);
                         if !landing_coach_spoken
@@ -1961,7 +1972,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 // holding point, in the copilot's own voice at Advisory.
                 // Off-route it goes quiet: the compliance watch above owns
                 // that conversation, and two voices saying it would nag.
-                if config.taxi_guide && snap.on_ground {
+                if crew_on && config.taxi_guide && snap.on_ground {
                     let taxiing = crate::party_line::clearance_state()
                         == Some(crate::tower::State::TaxiCleared);
                     if taxiing {
@@ -2155,9 +2166,13 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 // Region switch: airborne it's a controller handoff; on the
                 // ground (loaded the flight at a new field) it's the copilot
                 // noting the local tower. Either way the main loop rebuilds
-                // the station around the new airport.
-                if let Some(sw) =
-                    crate::station::region_tick(snap.lat, snap.lon, snap.on_ground, now)
+                // the station around the new airport. Gated by mode — the
+                // region index survives an ATC-off toggle (cheap re-enable),
+                // so this is the one world tick that would otherwise keep
+                // running against a torn-down station.
+                if let Some(sw) = (crate::mode::atc_enabled())
+                    .then(|| crate::station::region_tick(snap.lat, snap.lon, snap.on_ground, now))
+                    .flatten()
                 {
                     crate::blackbox::record(
                         "atc_region",
@@ -2346,7 +2361,8 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
             // armed by the visual_approach tool. Advisory narration only — the
             // pilot flies. Muted while the copilot itself is flying (recover /
             // autoland) or the panel mute is on, same as every other callout.
-            if let Some(path) = crate::approach_guide::armed() {
+            // Crew-gated: the guide IS the copilot talking.
+            if let Some(path) = crate::approach_guide::armed().filter(|_| crew_on) {
                 if snap.on_ground {
                     // Touchdown completes the guidance — but only if we actually
                     // guided in the air. Armed on the ground (pre-takeoff, or
@@ -2453,8 +2469,9 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
             // A wreck gets no advice: the flight model freezes at the impact
             // values (the 2026-07-13 crash read 106 kts and -1,463 fpm
             // forever), so the checks would evaluate a flight that already
-            // ended. They stand down until the flight resets.
-            if !voice.crashed() {
+            // ended. They stand down until the flight resets. And with no
+            // crew aboard (ATC-only mode) there is nobody to speak them.
+            if crew_on && !voice.crashed() {
                 for check in &checks {
                     let state = states.get_mut(check.id()).expect("state per check");
                     match check.eval(&snap) {

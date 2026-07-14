@@ -21,6 +21,7 @@ mod grammar;
 mod livestate;
 mod llm;
 mod mic;
+mod mode;
 mod monitor;
 mod phrase;
 mod plugin_status;
@@ -99,6 +100,14 @@ async fn main() -> Result<()> {
         build = env!("XCOPILOT_BUILD"),
         "x-copilot starting"
     );
+
+    // Initial app mode: explicit env > the panel's saved pick > both. The
+    // panel's Settings tab can change it live from here on (mode.rs).
+    let initial_mode = mode::Mode::parse(&config.mode)
+        .or_else(|| prefs::mode().as_deref().and_then(mode::Mode::parse))
+        .unwrap_or(mode::Mode::Both);
+    mode::set(initial_mode);
+    tracing::info!(mode = initial_mode.as_str(), "app mode");
 
     // Route whisper/ggml C logging through tracing so its model-load chatter
     // goes to the log file, not onto the terminal (which would corrupt the TUI).
@@ -266,7 +275,7 @@ async fn main() -> Result<()> {
     // decoding toward the active aircraft's actual systems and phraseology.
     let stt = Stt::load(&config.whisper_model_path, config.whisper_gpu)?;
     let llm = Llm::new(&config);
-    if config.llm_enabled {
+    if config.llm_enabled && mode::copilot_enabled() {
         // Prefill the answer-path KV cache now, on the ground — not on the
         // first question at altitude (cold prefill measured at ~10 s of GPU
         // time, and the sim's frame rate tanks for all of it).
@@ -323,6 +332,10 @@ async fn main() -> Result<()> {
     if config.tts_backend != "say" {
         spawn_voice_picker(config.xplane_base_url.clone(), voice.clone(), config.piper_voice.clone());
     }
+
+    // The panel's mode radio buttons (Both / Copilot only / ATC only):
+    // publish the current mode, apply picks live, persist to prefs.
+    spawn_mode_poller(config.xplane_base_url.clone());
 
     // In-sim status panel (the bundled plugin): mirror phase/heard/action into its
     // datarefs. Best-effort — a no-op if the plugin isn't loaded.
@@ -622,6 +635,9 @@ fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::Sender<Stri
 /// publishes the roster + current index, the Settings combo writes a pick back.
 const DR_OPT_VOICE: &str = "xcopilot/opt/voice";
 const DR_OPT_VOICE_LIST: &str = "xcopilot/opt/voice_list";
+/// The panel's app-mode radio buttons (Both / Copilot only / ATC only) —
+/// values are `mode::Mode::panel_index`, `-1` = plugin default (unpublished).
+const DR_OPT_MODE: &str = "xcopilot/opt/mode";
 
 /// Publish the pilot-voice roster (every piper model on disk) to the plugin's
 /// Settings picker, then poll for picks. A pick swaps the copilot's voice live
@@ -725,6 +741,76 @@ fn spawn_voice_picker(base_url: String, voice: Voice, current_spec: String) {
             // Confirmed in the new voice itself: the swap applies before the
             // next intercom utterance, which is exactly this line.
             voice.say(voice::Priority::Advisory, "New voice, checked in.");
+        }
+    });
+}
+
+/// Sync the app mode with the plugin's Settings tab (`xcopilot/opt/mode`):
+/// publish the current mode so the radio buttons show the truth, and apply
+/// a panel pick the moment it lands (the main loop's reconciliation block
+/// notices `mode::get()` changed within ~2 s). The pick persists to
+/// prefs.json as the next boot's default. Same lifecycle discipline as the
+/// voice picker: `-1` means the plugin reloaded and lost its state, so the
+/// current mode is re-published rather than read back as a pick.
+fn spawn_mode_poller(base_url: String) {
+    std::thread::spawn(move || {
+        let Ok(http) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+        else {
+            return;
+        };
+        let rest = format!("{}/api/v1", base_url.trim_end_matches('/'));
+        let mut id: Option<i64> = None;
+        let patch = |id: i64, value: i64| -> bool {
+            http.patch(format!("{rest}/datarefs/{id}/value"))
+                .json(&serde_json::json!({ "data": value }))
+                .send()
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+        };
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let applied = mode::get();
+            if id.is_none() {
+                id = crate::plugin_status::resolve_id(&http, &rest, DR_OPT_MODE);
+                let Some(mode_id) = id else {
+                    // Plugin not loaded / sim down — retry lazily.
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    continue;
+                };
+                if !patch(mode_id, applied.panel_index()) {
+                    id = None;
+                    continue;
+                }
+            }
+            let Some(mode_id) = id else { continue };
+            let read = http
+                .get(format!("{rest}/datarefs/{mode_id}/value"))
+                .send()
+                .ok()
+                .filter(|r| r.status().is_success())
+                .and_then(|r| r.json::<serde_json::Value>().ok())
+                .and_then(|b| b.get("data").and_then(|d| d.as_i64()));
+            let Some(v) = read else {
+                id = None; // stale id (sim restarted) — re-resolve
+                continue;
+            };
+            if v < 0 {
+                // Plugin reloaded and lost its state — re-publish the truth.
+                if !patch(mode_id, applied.panel_index()) {
+                    id = None;
+                }
+                continue;
+            }
+            match mode::Mode::from_panel_index(v) {
+                Some(m) if m != applied => {
+                    tracing::info!(mode = m.as_str(), "panel mode pick");
+                    mode::set(m);
+                    prefs::save_mode(m.as_str());
+                }
+                _ => {}
+            }
         }
     });
 }
@@ -946,47 +1032,19 @@ async fn run_session(
     // The ATC station (tower dialogue), merged from the standalone atc binary:
     // it answers when COM1 is tuned to its tower frequency and the words parse
     // as a radio call. Read-only toward the sim; speaks in its own voice
-    // through the same arbiter. None = no station, copilot behaves as before.
-    let mut atc_station = if config.atc_airport.trim().is_empty() {
-        None
+    // through the same arbiter. None = no station, copilot behaves as before —
+    // and copilot-only mode never loads one (the radio belongs to external ATC).
+    let mut atc_station = if mode::atc_enabled() {
+        install_home_station(&config, &voice)
     } else {
-        station::Station::load(&config.apt_data_path, &config.atc_airport.trim().to_uppercase())
+        None
     };
-    // Publish the live station's side state (ATIS broadcast, enroute switch
-    // identity) for the monitor's ticks. The startup airport is the HOME
-    // field: its controllers keep the curated per-position voices (seed 0);
-    // every other field the region hands us to gets its own crew from the
-    // voice pool.
     let home_airport_name = atc_station.as_ref().map(|s| s.airport_name().to_string());
-    if let Some(st) = &mut atc_station {
-        st.set_enforce_readback(config.atc_readback);
-        let home_icao = config.atc_airport.trim().to_uppercase();
-        // Phraseology follows geography, like the voices: CAP 413 grammar in
-        // the UK, FAA grammar at a K/P/C field.
-        st.set_dialect(station::dialect_for(&home_icao));
-        st.install();
-        voice.set_station_cast(0, Vec::new());
-        // Taxi network for named taxi routes — a second apt.dat scan, so a
-        // background thread; clearances are route-less until it lands.
-        station::spawn_taxi_net_load(config.apt_data_path.clone(), home_icao.clone());
-        // ILS + real approach platforms (earth_nav.dat + CIFP scans, also
-        // backgrounded): vectors offer the ILS once this lands.
-        station::spawn_ils_load(
-            config.nav_data_path.clone(),
-            config.cifp_dir.clone(),
-            home_icao,
-        );
-    }
-    // Enroute region: index every towered field (a full apt.dat pass, so a
-    // background thread) so the flight can outgrow its departure airport —
-    // the monitor's region_tick hands off to whichever tower is nearest.
-    if atc_station.is_some() && config.atc_region.trim() != "off" {
-        let path = config.apt_data_path.clone();
-        std::thread::Builder::new()
-            .name("region-index".into())
-            .spawn(move || station::load_region(&path))
-            .ok();
-    }
+    // The mode the loop has already applied — a panel/env change is noticed
+    // at the top of the next iteration (≤2 s: idle ticks) and reconciled.
+    let mut applied_mode = mode::get();
+    // ATC-only: the crew note "copilot is off" is spoken once, not per utterance.
+    let mut atc_only_noted = false;
     // Radio-call vocabulary rides in a SEPARATE whisper bias prompt applied
     // only to radio-keyed captures: prompt prefill is GPU work per decode, and
     // the tower phrasing more than doubles it (483 → 1,047 ms median, felt as
@@ -1097,6 +1155,57 @@ async fn run_session(
         let mut from_radio = false;
         let input = next_input(&mut listener, &ptt_mic, &stt, &ptt, typed.as_ref());
 
+        // Reconcile a mode change (panel toggle or the poller's pick) — on
+        // the idle tick too, so a flip lands within ~2 s of the click even
+        // in a silent cockpit. The world side is torn down/brought up here;
+        // the monitor's ticks and the routing gates below read mode::* live.
+        let now_mode = mode::get();
+        if now_mode != applied_mode {
+            tracing::info!(from = applied_mode.as_str(), to = now_mode.as_str(), "mode change");
+            blackbox::record(
+                "mode",
+                serde_json::json!({ "from": applied_mode.as_str(), "to": now_mode.as_str() }),
+            );
+            // World side.
+            if mode::atc_enabled() && atc_station.is_none() {
+                atc_station = install_home_station(&config, &voice);
+                let line = match atc_station.as_ref() {
+                    Some(st) => format!("ATC is on. {} is up.", station::spoken_airport(st.airport_name())),
+                    None => "ATC is on, no station configured.".to_string(),
+                };
+                reporter.log(ui::LogKind::Info, line.clone());
+                voice.alert(Priority::Advisory, line);
+            } else if !mode::atc_enabled() && atc_station.is_some() {
+                atc_station = None;
+                // Retire every published fact (party line + monitor side
+                // state) and cut whatever the station was saying mid-word.
+                station::Station::uninstall();
+                tts::stop_channel(tts::Channel::Radio);
+                reporter.log(ui::LogKind::Info, "ATC off; the radio belongs to the real world now".to_string());
+                voice.alert(Priority::Advisory, "ATC is off. Radio is all yours.".to_string());
+            }
+            // Crew side (edges only: AtcOnly is the one mode without a crew).
+            if applied_mode == mode::Mode::AtcOnly && now_mode != mode::Mode::AtcOnly {
+                // Coming back from ATC-only: re-warm the LLM off the critical
+                // path so the first question doesn't pay cold prefill.
+                if config.llm_enabled {
+                    let warm = llm.clone();
+                    tokio::spawn(async move { warm.warmup().await });
+                }
+                atc_only_noted = false;
+                voice.alert(Priority::Advisory, "Copilot back with you.".to_string());
+            } else if now_mode == mode::Mode::AtcOnly && applied_mode != mode::Mode::AtcOnly {
+                // Leaving the crew behind: cut any copilot speech and evict
+                // the model so the GPU goes back to the sim.
+                tts::stop_channel(tts::Channel::Intercom);
+                if config.llm_enabled {
+                    let ev = llm.clone();
+                    tokio::spawn(async move { ev.evict().await });
+                }
+            }
+            applied_mode = now_mode;
+        }
+
         // You call it, you get it: a keyed transmission on a frequency the
         // active station doesn't cover, but another in-range field does, arms
         // the swap so THAT field answers this very call — the ATC tab lets the
@@ -1104,7 +1213,7 @@ async fn run_session(
         // not be answered by dead air and a note about Gibraltar (2026-07-10).
         // BEFORE the pending-station consumption below, so the swap lands for
         // this very utterance.
-        if matches!(input, Some(Input::Spoken(_, true))) {
+        if mode::atc_enabled() && matches!(input, Some(Input::Spoken(_, true))) {
             if let Ok(v) = xplane.get_float(datarefs::COM1_FREQ_KHZ).await {
                 let com1 = v.round() as i64;
                 let covered = atc_station.as_ref().is_some_and(|st| st.covers_khz(com1));
@@ -1122,7 +1231,7 @@ async fn run_session(
         // input is already captured, and a silent cockpit must still swap
         // (the Heathrow handoff sat unconsumed for minutes, 2026-07-10, and
         // the party line waited on it).
-        if let Some((icao, apt)) = party_line::take_pending_station() {
+        if let Some((icao, apt)) = party_line::take_pending_station().filter(|_| mode::atc_enabled()) {
             let name = apt.name.clone();
             match station::Station::from_airport(apt) {
                 Some(mut st) => {
@@ -1351,6 +1460,14 @@ async fn run_session(
         // the cockpit-command gates below. Physical routing beats content
         // routing whenever the transmit button is bound.
         if from_radio {
+            // Copilot-only mode: the pilot is talking to REAL external ATC
+            // (VATSIM, SayIntentions, stock). Their transmission is none of
+            // our business — no simulated reply, no void briefing, nothing
+            // to step on the real controller's answer.
+            if !mode::atc_enabled() {
+                reporter.log(ui::LogKind::Info, "transmitted; external ATC has the radio");
+                continue;
+            }
             if let Some(st) = atc_station.as_mut() {
                 if let Some((reply, who)) = st.handle_transmission(&command.to_ascii_lowercase(), xplane.view()).await {
                     // Empty reply = a readback the controller accepted; a real
@@ -1390,6 +1507,43 @@ async fn run_session(
                 continue;
             }
             reporter.log(ui::LogKind::Info, "transmitted, nobody on this frequency");
+            continue;
+        }
+
+        // Everything below is the COPILOT's business — intercom commands,
+        // corrections, tools, questions. In ATC-only mode there is no crew,
+        // but content routing must survive: with no radio key bound it is
+        // the ONLY path to the station, and killing it would strand
+        // keyboard-PTT and continuous setups off the air entirely.
+        if !mode::copilot_enabled() {
+            if let Some(st) = atc_station.as_mut() {
+                let tl = command.to_lowercase();
+                if !dual_ptt && voice.radio_powered() && !voice.crashed() && !voice.replay()
+                    && !voice.paused()
+                {
+                    if let Some((reply, who)) = st.try_handle(&tl, xplane.view()).await {
+                        reporter.status(ui::Phase::Speaking);
+                        reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
+                        voice.say_station(Priority::Readback, who, &reply);
+                        reporter.status(ui::Phase::Listening);
+                        continue;
+                    }
+                }
+            }
+            // Not a radio call: one honest note the first time, silence
+            // after (mirrors the "radios are dead" pattern — discoverable,
+            // never naggy).
+            if !atc_only_noted {
+                atc_only_noted = true;
+                say(
+                    &voice,
+                    &reporter,
+                    ui::LogKind::Readback,
+                    "Copilot is off. ATC only. Flip the mode in Settings to bring me back.",
+                );
+            } else {
+                reporter.log(ui::LogKind::Info, "intercom ignored (ATC-only mode)");
+            }
             continue;
         }
 
@@ -4983,6 +5137,45 @@ fn service_label(word: &str) -> &str {
         "unicom" => "UNICOM",
         other => other,
     }
+}
+
+/// Load, configure, and install the HOME station — the boot path AND the
+/// live "ATC back on" toggle share this. The home field's controllers keep
+/// the curated per-position voices (seed 0); every other field the region
+/// hands us to gets its own crew from the voice pool. Also spawns the
+/// background scans (taxi net, ILS, region index) — each guarded so a
+/// mid-flight re-enable doesn't pay a boot cost twice.
+fn install_home_station(config: &Config, voice: &voice::Voice) -> Option<station::Station> {
+    if config.atc_airport.trim().is_empty() {
+        return None;
+    }
+    let home_icao = config.atc_airport.trim().to_uppercase();
+    let mut st = station::Station::load(&config.apt_data_path, &home_icao)?;
+    st.set_enforce_readback(config.atc_readback);
+    // Phraseology follows geography, like the voices: CAP 413 grammar in
+    // the UK, FAA grammar at a K/P/C field.
+    st.set_dialect(station::dialect_for(&home_icao));
+    // Publish the live station's side state (ATIS broadcast, enroute switch
+    // identity) for the monitor's ticks.
+    st.install();
+    voice.set_station_cast(0, Vec::new());
+    // Taxi network for named taxi routes — a second apt.dat scan, so a
+    // background thread; clearances are route-less until it lands.
+    station::spawn_taxi_net_load(config.apt_data_path.clone(), home_icao.clone());
+    // ILS + real approach platforms (earth_nav.dat + CIFP scans, also
+    // backgrounded): vectors offer the ILS once this lands.
+    station::spawn_ils_load(config.nav_data_path.clone(), config.cifp_dir.clone(), home_icao);
+    // Enroute region: index every towered field (a full apt.dat pass, so a
+    // background thread) so the flight can outgrow its departure airport —
+    // the monitor's region_tick hands off to whichever tower is nearest.
+    if config.atc_region.trim() != "off" && !station::region_loaded() {
+        let path = config.apt_data_path.clone();
+        std::thread::Builder::new()
+            .name("region-index".into())
+            .spawn(move || station::load_region(&path))
+            .ok();
+    }
+    Some(st)
 }
 
 /// The crew's comm note after a transmission into dead air. The active

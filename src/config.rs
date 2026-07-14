@@ -132,6 +132,12 @@ pub struct Config {
     /// X-Plane plugin's in-sim panel. On by default; best-effort — a no-op if the
     /// plugin isn't installed. Set `XCOPILOT_PLUGIN_STATUS=false` to disable.
     pub plugin_status: bool,
+    /// Initial app mode: "both" (default), "copilot" (no simulated ATC — the
+    /// radio belongs to external ATC), or "atc" (world only, no LLM/tools/
+    /// intercom persona). `XCOPILOT_MODE`; empty = fall back to the panel's
+    /// saved pick in prefs.json, then "both". Runtime-toggleable from the
+    /// plugin's Settings tab afterwards — this is only the boot value.
+    pub mode: String,
     /// ICAO of the airport whose ATC station the copilot process hosts (tower
     /// dialogue answered when COM1 is tuned to its frequency). Empty disables
     /// ATC entirely. `XCOPILOT_ATC_AIRPORT`.
@@ -285,6 +291,7 @@ impl Config {
             monitor_hz: env_or("XCOPILOT_MONITOR_HZ", "3").parse().unwrap_or(3.0),
             plugin_status: env_or("XCOPILOT_PLUGIN_STATUS", "true") != "false",
             simbrief_id: env_or("XCOPILOT_SIMBRIEF_ID", ""),
+            mode: env_or("XCOPILOT_MODE", ""),
             atc_airport: env_or("XCOPILOT_ATC_AIRPORT", "LXGB"),
             atc_region: env_or("XCOPILOT_ATC_REGION", "auto"),
             atc_chatter: env_or("XCOPILOT_ATC_CHATTER", "true") != "false",
