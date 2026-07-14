@@ -12,7 +12,7 @@ valid call is a wart. An invented clearance is a bug.
 Every routing decision is recorded to `logs/blackbox.jsonl` as a `"kind":"atc"`
 event (transcript, gate outcome, intent, state transition, reply), so each
 sortie leaves a reviewable trace. Warts found here become cases in
-`bench/atc_corpus.yaml`, which `cargo test` then enforces forever.
+`crates/atc/bench/atc_corpus.yaml`, which `cargo test` then enforces forever.
 
 ## Preflight
 
@@ -194,7 +194,7 @@ jq -c 'select(.kind=="atc" and (.outcome=="off_frequency" or .outcome=="void"))'
 
 ## Closing the loop
 
-For each wart: add the exact transcript to `bench/atc_corpus.yaml` with the
+For each wart: add the exact transcript to `crates/atc/bench/atc_corpus.yaml` with the
 intent it SHOULD have parsed to (or `unknown` if "say again" was right), run
 `cargo test`, and fix the parser until the corpus passes. Real mishears from
 the logs beat invented ones; that is the whole point of the trace.

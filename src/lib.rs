@@ -1,14 +1,9 @@
 //! Library surface for the sibling binaries under `src/bin/` (currently
-//! `atc`, the ATC process). The main copilot binary keeps its own module tree
-//! rooted at `src/main.rs`; this exposes only the leaf modules a second
-//! process needs, all of which are self-contained (no `crate::` reach into
-//! the copilot loop). The proper workspace split (a shared core crate + two
-//! thin binaries) can happen once the ATC process proves out; this is the
-//! cheap version that gets a separate process today.
-//!
-//! Note the modules here are compiled twice (once for this lib, once inside
-//! the copilot binary's own tree). That's deliberate scaffolding, not an
-//! accident: the two processes share code, not state.
+//! `atc`, the old standalone-ATC dev skeleton). The world side (station,
+//! tower, nav, atis) lives in the `atc` workspace crate and the sim plumbing
+//! in `sim`; this lib re-exports them alongside the crew-owned leaf modules
+//! (mic, stt, tts, config) a second binary needs. Nothing is compiled twice
+//! anymore — the workspace crates build once and everyone links them.
 
 pub use ::atc::{atis, nav, tower};
 pub use sim::{datarefs, xplane};

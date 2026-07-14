@@ -121,10 +121,10 @@ actually in the tanks.
 ## ATC lives inside the copilot binary (the world, not the crew)
 
 ATC (tower dialogue) runs **in the copilot process**, as a frequency-routed
-station ([src/station.rs](src/station.rs)): one mic, one PTT, one speech
+station ([crates/atc/src/station.rs](crates/atc/src/station.rs)): one mic, one PTT, one speech
 arbiter. After the normal capture/confidence/echo gates, an utterance goes to
 the tower iff COM1 is tuned to the station's frequency AND the words parse as
-a radio call ([src/tower.rs](src/tower.rs) — deterministic FSM, keyword
+a radio call ([crates/atc/src/tower.rs](crates/atc/src/tower.rs) — deterministic FSM, keyword
 intents, "say again" over guessed clearances); everything else falls through
 to the copilot unchanged. The station speaks in its own voice through the
 same arbiter (`Voice::say_station`), which since 2026-07-14 runs TWO
@@ -138,7 +138,7 @@ terrain) talks straight over the radio. Radio-only cuts (retune, avionics
 off, crash, replay) kill station audio without touching the copilot's voice
 (`tts::stop_channel`). Trust boundary is the module boundary: the station only reads the
 sim and returns text — it can never actuate. Frequencies come from apt.dat
-comm rows (parsed in [src/nav.rs](src/nav.rs)), not hardcoding; config via
+comm rows (parsed in [crates/atc/src/nav.rs](crates/atc/src/nav.rs)), not hardcoding; config via
 `XCOPILOT_ATC_AIRPORT` (default LXGB), `XCOPILOT_ATC_VOICE`, `XCOPILOT_ATC_RATE`.
 
 Depth (added 2026-07-09): **Mayday/pan-pan** is the one intent that earns a
@@ -162,16 +162,18 @@ published by `Station::install()`, called by the owner — never by
 `from_airport`, so sweeps and tests stay side-effect free.
 
 **The crew/world boundary is one page** (2026-07-11): everything ATC
-publishes for the copilot lives in [src/party_line.rs](src/party_line.rs) —
+publishes for the copilot lives in [crates/atc/src/party_line.rs](crates/atc/src/party_line.rs) —
 seven statics, read only through its narrow accessors (`clearance_state`,
 `with_taxi_route`, `takeoff_hold_armed`, `vectored_callsign`,
 `landing_handoff_runway` — the approach→tower handoff that still owes the
 tower a "final" report, feeding the crew's landing-clearance coach — plus
 two `take_*` queue consumers for the main loop). The world side (station/tower)
 writes them; the crew side (main, the monitor's crew watches, taxi_guide)
-never does. Every other station static is private. This is convention until
-a workspace split makes it compiler-checked; when the crew needs a new fact
-it gets a new accessor there, never a new `pub static`. Station tests that
+never does. Every other station static is private. Since the workspace split
+(2026-07-14) this is compiler-checked, not convention: the statics are
+crate-private to `crates/atc`, so a crew-side write is an E0603, not a review
+comment. When the crew needs a new fact it gets a new accessor there, never
+a new `pub static`. Station tests that
 touch ANY process-wide static must hold `SIDE_STATE_LOCK` — `respond()`
 publishes on every reply, so one unguarded test races every guarded one
 (the vectored-arrival test stomped five others, 2026-07-11).
@@ -269,16 +271,16 @@ Depth (added 2026-07-11, evening): **ILS approaches from real chart data**,
 and **region-accurate phraseology**. `spawn_ils_load` (like the taxi net, a
 background scan per station) reads the field's localizers/glideslopes from
 earth_nav.dat and the per-runway platform (glideslope-intercept) altitude
-from the CIFP approach legs ([src/nav.rs](src/nav.rs) `airport_ils` /
+from the CIFP approach legs ([crates/atc/src/nav.rs](crates/atc/src/nav.rs) `airport_ils` /
 `ils_platform_alt_ft` — the FAF leg's crossing altitude, desc-code 4th char
 `F`). When the runway in use has an ILS, "request vectors" arms an ILS plan
 instead of the visual: descend to the REAL platform, the clearance rides
 the intercept turn ("cleared ILS approach runway two seven right, report
 established"), and "established" (which parses as the final report —
-[bench/atc_corpus.yaml](bench/atc_corpus.yaml) pins the question-form
+[crates/atc/bench/atc_corpus.yaml](crates/atc/bench/atc_corpus.yaml) pins the question-form
 safety) earns the tower handoff from approach or the landing clearance from
 tower. Phraseology follows geography like the voices do (`Dialect` in
-[src/station.rs](src/station.rs), K/P/C prefixes = FAA grammar, everywhere
+[crates/atc/src/station.rs](crates/atc/src/station.rs), K/P/C prefixes = FAA grammar, everywhere
 else ICAO/CAP 413: "descend to altitude ... feet" + "degrees" vs "descend
 and maintain" + the FAA PTAC clearance) — applied to the approach/vector
 phrases AND the pressure clause everywhere (`spoken_pressure`: `ctx.qnh`
@@ -308,15 +310,16 @@ tests as plain `cargo test` (synthetic routes in
 [src/taxi_guide.rs](src/taxi_guide.rs)); cues blackbox as
 `"kind":"taxi_guide"`.
 
-Battle-test surface (all deterministic, in `cargo test` unless noted): the
-state-by-intent matrix test in [src/tower.rs](src/tower.rs); the adversarial
-transcript corpus [bench/atc_corpus.yaml](bench/atc_corpus.yaml) (real whisper
+Battle-test surface (all deterministic, in `cargo test --workspace` unless
+noted — plain `cargo test` at the root only runs the crew package now): the
+state-by-intent matrix test in [crates/atc/src/tower.rs](crates/atc/src/tower.rs); the adversarial
+transcript corpus [crates/atc/bench/atc_corpus.yaml](crates/atc/bench/atc_corpus.yaml) (real whisper
 output mined from flight logs — add every new wart here); scripted sortie
 dialogues over the pure routing layer (`route_keyed`/`route_unkeyed`) in
-[src/station.rs](src/station.rs); the spoken-call eval judged on intent
+[crates/atc/src/station.rs](crates/atc/src/station.rs); the spoken-call eval judged on intent
 accuracy (`cargo run -- stt-eval bench/atc_stt_cases.yaml`); the cross-airport
-world sweep (`cargo test --release -- --ignored atc_world_sweep`, needs the
-sim's apt.dat); and the in-sim soak checklist
+world sweep (`cargo test --release -p atc -- --ignored atc_world_sweep`, needs
+the sim's apt.dat); and the in-sim soak checklist
 [docs/atc-chaos-card.md](docs/atc-chaos-card.md). Every routing decision is
 blackboxed as a `"kind":"atc"` event — mine `logs/blackbox.jsonl` after each
 flight. Safety property: a mishear may earn "say again", never a clearance.
@@ -325,8 +328,15 @@ History: ATC started as a separate binary ([src/bin/atc.rs](src/bin/atc.rs),
 still buildable — tower + ATIS glue around the same lib modules) on the "the
 world is a different process" theory. Flying it proved the split premature:
 mic/PTT/voice are single shared resources and the second terminal was
-unusable in the cockpit. Keep the pure modules split-ready; don't re-split
-until there's a product reason. Next: ATIS in-process, live-traffic
+unusable in the cockpit. The right split landed 2026-07-14 as a **compile-time
+boundary, not a second process**: the world lives in the `atc` workspace crate
+(`crates/atc` — station, tower, nav, atis, party_line, speaker identity), both
+sides stand on `crates/sim` (Web API client, dataref names, blackbox), and the
+copilot embeds the world as a library — still one process, one mic, one PTT.
+The atc crate returns `(text, StationSpeaker)` and never speaks or actuates;
+its dep tree must stay free of whisper/cpal/ort (`cargo tree -p atc` is the
+standalone-product health check, and a future ATC-only product is a repo
+extraction away). Next: live-traffic
 observation via TCAS datarefs (ATC only ever *controls the player* and
 *narrates* other traffic), a radio-PTT plugin dataref if content routing ever
 collides.

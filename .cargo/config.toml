@@ -1,0 +1,4 @@
+# Muscle-memory guard: plain `cargo test` at the root only tests the crew
+# package since the workspace split — `cargo t` covers all three crates.
+[alias]
+t = "test --workspace"

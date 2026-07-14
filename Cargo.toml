@@ -30,9 +30,9 @@ publish = false
 name = "x-copilot"
 path = "src/main.rs"
 
-# The ATC process (src/bin/atc.rs): a separate, structurally read-only binary.
-# It shares code with the copilot through the lib target (src/lib.rs), never
-# state — the two meet only inside the simulator.
+# The old standalone-ATC dev skeleton: tower FSM + ATIS glue over the atc
+# crate's modules (via src/lib.rs re-exports), with its own simple TTS. The
+# real standalone product gets its own thin binary at repo-extraction time.
 [[bin]]
 name = "atc"
 path = "src/bin/atc.rs"
