@@ -2124,6 +2124,19 @@ pub fn active_station_in_range(lat: f64, lon: f64, alt_msl_ft: f64) -> Option<(S
     (d <= vhf_range_nm(alt_msl_ft - elev_ft)).then_some((name, svcs))
 }
 
+/// Range to the ACTIVE station's field, for the radio's signal-quality model
+/// ([`crate::radiofx::signal_quality`]) — published to the speech arbiter by
+/// the monitor each tick. `None` = no active station installed; ground
+/// distance, not slant (the altitude term is noise at the ranges where
+/// quality changes).
+pub fn active_station_range_nm(lat: f64, lon: f64) -> Option<f64> {
+    let (_, alat, alon) = ACTIVE_FIELD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    Some(crate::haversine_nm(lat, lon, alat, alon))
+}
+
 /// The active field's runway geometry, published by [`Station::install`] for
 /// the runway-incursion watch.
 static ACTIVE_RUNWAYS: Mutex<Vec<nav::Runway>> = Mutex::new(Vec::new());

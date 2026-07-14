@@ -20,7 +20,17 @@ pub fn radioize(samples: &mut Vec<f32>, sample_rate: u32) {
 /// behind Audio-for-VATSIM blending recorded, varying transients). Fully
 /// deterministic per variant, so tests stay exact.
 pub fn radioize_variant(samples: &mut Vec<f32>, sample_rate: u32, variant: u32) {
-    radioize_core(samples, sample_rate, variant, true);
+    radioize_core(samples, sample_rate, variant, true, 1.0);
+}
+
+/// [`radioize_variant`] with received signal `quality` (see
+/// [`signal_quality`]): 1.0 is byte-identical to the plain call; below it the
+/// noise floor rises and a slow scintillation wobble creeps in — a distant
+/// station reads weak and hissy, the way VHF actually dies with range. AGC is
+/// deliberately modeled (the level stays normalized, only the SNR drops):
+/// a real receiver holds volume while readability goes.
+pub fn radioize_variant_q(samples: &mut Vec<f32>, sample_rate: u32, variant: u32, quality: f32) {
+    radioize_core(samples, sample_rate, variant, true, quality);
 }
 
 /// The VATSIM-style version: the speech goes through the transmission chain,
@@ -31,10 +41,23 @@ pub fn radioize_variant(samples: &mut Vec<f32>, sample_rate: u32, variant: u32) 
 /// audio, so it must not be band-passed or compressed with the speech.
 /// `tail` must already be mono at `sample_rate` (see [`load_tail_wav`]).
 pub fn radioize_with_tail(samples: &mut Vec<f32>, sample_rate: u32, variant: u32, tail: &[f32]) {
+    radioize_with_tail_q(samples, sample_rate, variant, tail, 1.0);
+}
+
+/// [`radioize_with_tail`] with received signal `quality` — the degradation
+/// covers the transmission only; the spliced squelch recording is the
+/// receiver's own gate closing and stays clean at any range.
+pub fn radioize_with_tail_q(
+    samples: &mut Vec<f32>,
+    sample_rate: u32,
+    variant: u32,
+    tail: &[f32],
+    quality: f32,
+) {
     if samples.is_empty() {
         return;
     }
-    radioize_core(samples, sample_rate, variant, false);
+    radioize_core(samples, sample_rate, variant, false, quality);
     let fs = sample_rate as f32;
     let mut pick = Lcg::new(0x0000_7A11 ^ variant.wrapping_mul(0x9E37_79B9));
     let mut range = |lo: f32, hi: f32| lo + (pick.next_f32() + 1.0) * 0.5 * (hi - lo);
@@ -99,10 +122,11 @@ pub fn load_tail_wav(path: &str, target_rate: u32) -> anyhow::Result<Vec<f32>> {
     Ok(out)
 }
 
-fn radioize_core(samples: &mut Vec<f32>, sample_rate: u32, variant: u32, synth_tail: bool) {
+fn radioize_core(samples: &mut Vec<f32>, sample_rate: u32, variant: u32, synth_tail: bool, quality: f32) {
     if samples.is_empty() {
         return;
     }
+    let quality = if quality.is_finite() { quality.clamp(0.0, 1.0) } else { 1.0 };
     let fs = sample_rate as f32;
     let mut pick = Lcg::new(0x000A_11CE ^ variant.wrapping_mul(0x9E37_79B9));
     let mut noise = Lcg::new(0x5EED_CAFE ^ variant.wrapping_mul(0x85EB_CA6B));
@@ -130,9 +154,12 @@ fn radioize_core(samples: &mut Vec<f32>, sample_rate: u32, variant: u32, synth_t
     buf.append(samples);
     buf.extend_from_slice(&squelch);
 
-    // Noise floor under everything (the open carrier hiss).
+    // Noise floor under everything (the open carrier hiss). A weak signal is
+    // MORE hiss, not less voice: quality 1.0 keeps the legacy floor exactly,
+    // and the worst signal the mapping allows still stays readable.
+    let noise_amp = 0.008 + (1.0 - quality) * 0.045;
     for s in buf.iter_mut() {
-        *s += noise.next_f32() * 0.008;
+        *s += noise.next_f32() * noise_amp;
     }
 
     // Narrowband: high-pass at 300 Hz, low-pass at 3 kHz (RBJ biquads).
@@ -156,7 +183,36 @@ fn radioize_core(samples: &mut Vec<f32>, sample_rate: u32, variant: u32, synth_t
         }
     }
 
+    // Weak-signal scintillation: a slow amplitude wobble on top of the raised
+    // noise floor, the multipath shimmer of a station near the radio horizon.
+    // Only fades, never boosts (no clipping risk), and quality ≥ 0.7 skips it
+    // entirely — a solid signal has no business flickering. Drawn AFTER every
+    // other pick so the strong-signal output stays byte-identical per variant.
+    if quality < 0.7 {
+        let depth = (0.7 - quality) * 0.55;
+        let rate_hz = range(2.0, 4.5);
+        let w = 2.0 * std::f32::consts::PI * rate_hz / fs;
+        for (i, s) in buf.iter_mut().enumerate() {
+            *s *= 1.0 - depth * (0.5 + 0.5 * (w * i as f32).sin());
+        }
+    }
+
     *samples = buf;
+}
+
+/// Map range to the transmitting station into received signal quality for
+/// [`radioize_variant_q`]: full quieting inside 8 nm, then a linear fade to a
+/// 0.35 floor at 70 nm — degraded is atmosphere, unreadable is a bug, so the
+/// floor keeps every transmission intelligible. Unknown range (`None`, or a
+/// non-finite value) is a perfect signal: fail open, like the rest of the
+/// radio (a mysteriously hissy tower is worse than a clean one).
+pub fn signal_quality(range_nm: Option<f64>) -> f32 {
+    let Some(r) = range_nm else { return 1.0 };
+    if !r.is_finite() || r < 0.0 {
+        return 1.0;
+    }
+    let r = r as f32;
+    (1.0 - (r - 8.0).max(0.0) / 62.0 * 0.65).max(0.35)
 }
 
 /// A fading noise burst (the key-down transient).
@@ -360,6 +416,59 @@ mod tests {
     }
 
     #[test]
+    fn signal_quality_maps_range_sanely() {
+        // Close in: full quieting. Unknown or garbage: fail open to perfect.
+        for r in [None, Some(0.0), Some(5.0), Some(8.0), Some(f64::NAN), Some(-3.0)] {
+            assert_eq!(signal_quality(r), 1.0, "range {r:?}");
+        }
+        // Fades monotonically with range, and bottoms out readable.
+        let (q20, q40, q65) = (
+            signal_quality(Some(20.0)),
+            signal_quality(Some(40.0)),
+            signal_quality(Some(65.0)),
+        );
+        assert!(q20 < 1.0 && q40 < q20 && q65 < q40, "{q20} {q40} {q65}");
+        assert!((signal_quality(Some(70.0)) - 0.35).abs() < 1e-4);
+        assert_eq!(signal_quality(Some(500.0)), 0.35, "floor: degraded, never unreadable");
+    }
+
+    #[test]
+    fn full_quality_is_byte_identical_to_legacy() {
+        let fs = 22050;
+        let mut legacy = sine(1000.0, fs as f32, 0.3);
+        let mut q1 = legacy.clone();
+        radioize_variant(&mut legacy, fs, 7);
+        radioize_variant_q(&mut q1, fs, 7, 1.0);
+        assert_eq!(legacy, q1, "quality 1.0 must not change the strong-signal sound");
+    }
+
+    #[test]
+    fn weak_signal_raises_the_noise_floor() {
+        let fs = 22050usize;
+        // Half sine, half silence: the silent span isolates the noise floor
+        // (same variant → the key click has the same length in both runs, so
+        // sample positions align; the empty recorded tail keeps the synth
+        // squelch burst out of the measurement).
+        let sine_n = fs * 3 / 10;
+        let mut src = sine(1000.0, fs as f32, 0.3);
+        src.extend(std::iter::repeat(0.0).take(sine_n));
+        let (mut strong, mut weak) = (src.clone(), src);
+        radioize_with_tail_q(&mut strong, fs as u32, 3, &[], 1.0);
+        radioize_with_tail_q(&mut weak, fs as u32, 3, &[], 0.35);
+        // A window comfortably inside the silent span, past the longest
+        // possible key click (~0.018 s ≈ 400 samples).
+        let window = |s: &[f32]| rms(&s[sine_n + 2000..sine_n * 2 - 2000]);
+        let (floor_strong, floor_weak) = (window(&strong), window(&weak));
+        assert!(
+            floor_weak > floor_strong * 2.0,
+            "weak signal should hiss: {floor_weak} vs {floor_strong}"
+        );
+        // AGC: the voice itself stays at a comparable level — SNR drops, not volume.
+        let peak_weak = weak.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
+        assert!(peak_weak > 0.6, "weak signal must stay audible: {peak_weak}");
+    }
+
+    #[test]
     fn radioize_adds_squelch_and_stays_in_range() {
         let fs = 22050;
         let mut s = sine(1000.0, fs as f32, 0.3);
@@ -396,7 +505,7 @@ mod tests {
         let mut s = sine(1000.0, fs as f32, 0.3);
         let tail: Vec<f32> = (0..800).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
         let mut plain = s.clone();
-        radioize_core(&mut plain, fs, 7, false);
+        radioize_core(&mut plain, fs, 7, false, 1.0);
         radioize_with_tail(&mut s, fs, 7, &tail);
         assert!(s.len() > plain.len() + tail.len(), "gap + tail appended");
         // The tail is NOT band-passed or normalized with the speech: the last

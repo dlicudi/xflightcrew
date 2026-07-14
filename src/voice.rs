@@ -447,6 +447,11 @@ struct Inner {
     /// engine, never mid-word. Station voices are cast separately (see
     /// [`StationSpeaker`]) and unaffected.
     pilot_swap: Mutex<Option<String>>,
+    /// Range to the active station in nm (f32 bits; NaN = unknown), published
+    /// by the monitor each tick and read per transmission — the radio's
+    /// signal-quality model ([`crate::radiofx::signal_quality`]). Fail open:
+    /// unknown reads as a perfect signal.
+    station_range_nm: std::sync::atomic::AtomicU32,
 }
 
 /// Handle to the speech arbiter. Cheap to clone — hand one to every thread that
@@ -487,6 +492,7 @@ impl Voice {
             paused: std::sync::atomic::AtomicBool::new(false),
             spoken: Mutex::new(Vec::new()),
             pilot_swap: Mutex::new(None),
+            station_range_nm: std::sync::atomic::AtomicU32::new(f32::NAN.to_bits()),
         });
         // Independent channel volumes (a real audio panel's COM vs intercom
         // knobs). Applied in tts::play per thread channel.
@@ -523,6 +529,15 @@ impl Voice {
         self.inner
             .station_seed
             .store(seed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Publish the range to the active station (monitor tick). `None` =
+    /// unknown, which plays as a perfect signal — fail open, like radio power.
+    pub fn set_station_range(&self, nm: Option<f64>) {
+        let bits = nm.map_or(f32::NAN, |v| v as f32).to_bits();
+        self.inner
+            .station_range_nm
+            .store(bits, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Swap the copilot's own voice live (the panel's Settings picker writes
@@ -985,12 +1000,19 @@ impl StationVoice {
         })
     }
 
-    /// Speak `text` as this station. `on_start` fires with the fully processed
-    /// sample buffer just before playback begins: the arbiter publishes it as
-    /// the on-air transmission so a PTT press can step on it and the release
-    /// can play the remainder (ONNX only; the `say` fallback has no buffer to
-    /// resume, so a stepped-on call there is simply lost, as before).
-    fn speak(&mut self, text: &str, on_start: impl FnOnce(&[f32], u32)) -> anyhow::Result<()> {
+    /// Speak `text` as this station at received signal `quality` (see
+    /// [`crate::radiofx::signal_quality`]; 1.0 = full quieting). `on_start`
+    /// fires with the fully processed sample buffer just before playback
+    /// begins: the arbiter publishes it as the on-air transmission so a PTT
+    /// press can step on it and the release can play the remainder (ONNX
+    /// only; the `say` fallback has no buffer to resume, so a stepped-on call
+    /// there is simply lost, as before).
+    fn speak(
+        &mut self,
+        text: &str,
+        quality: f32,
+        on_start: impl FnOnce(&[f32], u32),
+    ) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "onnx-tts")]
             StationVoice::Onnx { engine, tail, transmissions, shift } => {
@@ -1003,15 +1025,15 @@ impl StationVoice {
                     // floor, and squelch stay natural — so shift first.
                     crate::radiofx::voice_shift(s, r, shift);
                     match &tail {
-                        Some(t) => crate::radiofx::radioize_with_tail(s, r, variant, t),
-                        None => crate::radiofx::radioize_variant(s, r, variant),
+                        Some(t) => crate::radiofx::radioize_with_tail_q(s, r, variant, t, quality),
+                        None => crate::radiofx::radioize_variant_q(s, r, variant, quality),
                     }
                 })?;
                 on_start(&samples, engine.sample_rate());
                 tts::play_pcm(&samples, engine.sample_rate())
             }
             StationVoice::Say(config) => {
-                let _ = on_start;
+                let _ = (on_start, quality);
                 tts::speak(config, text)
             }
         }
@@ -1315,6 +1337,16 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             .clone();
         let who = utt.station.expect("radio queue only holds station utterances");
         let model = who.model(&station_cfg, seed, &locals);
+        // Signal quality from the CURRENT range to the station, read per
+        // transmission — the same tower fades in as you close on the field.
+        // Ghost pilots ride the same value: they're on this field's frequency
+        // and pattern, so its range is an honest proxy.
+        let range = f32::from_bits(
+            inner
+                .station_range_nm
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let quality = crate::radiofx::signal_quality(range.is_finite().then_some(range as f64));
         let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let slot = &mut stations[who.slot()];
             if slot.as_ref().map(|(m, _)| m.as_str()) != Some(model.as_str()) {
@@ -1329,7 +1361,7 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             // publish, so `set_com1`/`set_radio_powered` found nothing
             // on the air to cut. The cut generation in `tts::stop_channel`
             // kills even a player that hasn't registered its pid yet.
-            slot.as_mut().expect("just built").1.speak(&utt.text, |_samples, _rate| {
+            slot.as_mut().expect("just built").1.speak(&utt.text, quality, |_samples, _rate| {
                 *inner.now_playing.lock().unwrap_or_else(|e| e.into_inner()) = Some(who);
                 if station_unhearable(inner, Some(who)) {
                     crate::tts::stop_channel(crate::tts::Channel::Radio);
@@ -1531,6 +1563,7 @@ mod tests {
             paused: std::sync::atomic::AtomicBool::new(false),
             spoken: Mutex::new(Vec::new()),
             pilot_swap: Mutex::new(None),
+            station_range_nm: std::sync::atomic::AtomicU32::new(f32::NAN.to_bits()),
         }
     }
 

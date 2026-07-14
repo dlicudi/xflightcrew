@@ -1644,6 +1644,12 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 // tail die with a retune instead of following us to the new
                 // frequency.
                 voice.set_com1(com1, com1.and_then(crate::station::tuned_station));
+                // ...and how FAR that station is: the radio's signal-quality
+                // model fades a distant tower into hiss instead of playing
+                // every transmission studio-clean at 60 nm.
+                voice.set_station_range(crate::station::active_station_range_nm(
+                    snap.lat, snap.lon,
+                ));
                 // Which CONTROLLER the radio actually hears, resolved once per
                 // tick: every controller call below speaks in THIS voice (or
                 // falls to the crew when None). A berate hardcoded to the
