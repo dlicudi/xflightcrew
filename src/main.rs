@@ -965,7 +965,11 @@ async fn run_session(
     // (2026-07-10). While our ATC is on, Roger owns the radio soundscape:
     // the sim's "Radios" volume goes to zero (this also silences nav-aid
     // morse idents; XCOPILOT_MUTE_XP_RADIO=false keeps the sim's audio).
-    if config.mute_xp_radio && !config.atc_airport.trim().is_empty() {
+    // Mode-aware, boot AND live toggles: copilot-only means the radio — and
+    // its soundscape — belongs to whatever external ATC the pilot uses, so
+    // leaving OUR world gives X-Plane its voice back.
+    let xp_radio_muted = config.mute_xp_radio && !config.atc_airport.trim().is_empty();
+    if xp_radio_muted && mode::atc_enabled() {
         match xplane
             .set_float("sim/operation/sound/radio_volume_ratio", 0.0)
             .await
@@ -1169,6 +1173,12 @@ async fn run_session(
             // World side.
             if mode::atc_enabled() && atc_station.is_none() {
                 atc_station = install_home_station(&config, &voice);
+                // Reclaim the radio soundscape from X-Plane's own ATC voice.
+                if xp_radio_muted {
+                    let _ = xplane
+                        .set_float("sim/operation/sound/radio_volume_ratio", 0.0)
+                        .await;
+                }
                 let line = match atc_station.as_ref() {
                     Some(st) => format!("ATC is on. {} is up.", station::spoken_airport(st.airport_name())),
                     None => "ATC is on, no station configured.".to_string(),
@@ -1181,6 +1191,14 @@ async fn run_session(
                 // state) and cut whatever the station was saying mid-word.
                 station::Station::uninstall();
                 tts::stop_channel(tts::Channel::Radio);
+                // And give X-Plane its radio voice back — the pilot may be
+                // switching to the sim's OWN ATC, whose controllers we muted
+                // at boot so two ATISes wouldn't share one frequency.
+                if xp_radio_muted {
+                    let _ = xplane
+                        .set_float("sim/operation/sound/radio_volume_ratio", 1.0)
+                        .await;
+                }
                 reporter.log(ui::LogKind::Info, "ATC off; the radio belongs to the real world now".to_string());
                 voice.alert(Priority::Advisory, "ATC is off. Radio is all yours.".to_string());
             }
