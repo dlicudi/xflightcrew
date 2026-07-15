@@ -397,8 +397,12 @@ business). Calls are answered deterministically (keyword intents, "say again"
 over guessing — the tower's safety property), always preceded by the
 interphone chime, in their own voice (`XCOPILOT_CABIN_VOICE`, lazily loaded so
 crewless flights never pay for the model). The crew exists per-airframe
-(profile `cabin_crew: true` — the MD-82 only, so far); `XCOPILOT_CABIN_CREW`
-overrides to staff any airframe for testing (yes, a 172). Behavior: "prepare
+(profile `cabin_crew: true` — the MD-82 only, so far); staffing is a panel
+setting like the app mode (Settings tab radios Auto/Aboard/Off →
+`xcopilot/opt/cabin_crew`, synced by the settings poller, persisted via
+prefs.json, applied live at the routing sites — staff a 172 mid-flight);
+`XCOPILOT_CABIN_CREW` sets only the BOOT value (env > saved pref > auto).
+Behavior: "prepare
 for departure/landing" is acknowledged then owes a delayed "cabin secure"
 report (spoken by the monitor's cabin watch — a SAFETY report, exempt from
 sterile cockpit); the seatbelt-sign watch (the annunciator dataref, so auto

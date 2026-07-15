@@ -110,6 +110,14 @@ async fn main() -> Result<()> {
     mode::set(initial_mode);
     tracing::info!(mode = initial_mode.as_str(), "app mode");
 
+    // Cabin crew staffing, same precedence: explicit env > the panel's saved
+    // pick > auto (the airframe profile decides). Panel-toggleable live.
+    let initial_staffing = cabin::Staffing::parse(&config.cabin_crew)
+        .or_else(|| prefs::cabin_crew().as_deref().and_then(cabin::Staffing::parse))
+        .unwrap_or(cabin::Staffing::Auto);
+    cabin::set_staffing(initial_staffing);
+    tracing::info!(cabin_crew = initial_staffing.as_str(), "cabin staffing");
+
     // Route whisper/ggml C logging through tracing so its model-load chatter
     // goes to the log file, not onto the terminal (which would corrupt the TUI).
     whisper_rs::install_whisper_tracing_trampoline();
@@ -334,9 +342,9 @@ async fn main() -> Result<()> {
         spawn_voice_picker(config.xplane_base_url.clone(), voice.clone(), config.piper_voice.clone());
     }
 
-    // The panel's mode radio buttons (Both / Copilot only / ATC only):
-    // publish the current mode, apply picks live, persist to prefs.
-    spawn_mode_poller(config.xplane_base_url.clone());
+    // The panel's Settings-tab toggles (app mode, cabin-crew staffing):
+    // publish the current values, apply picks live, persist to prefs.
+    spawn_settings_poller(config.xplane_base_url.clone());
 
     // In-sim status panel (the bundled plugin): mirror phase/heard/action into its
     // datarefs. Best-effort — a no-op if the plugin isn't loaded.
@@ -646,6 +654,9 @@ const DR_OPT_VOICE_LIST: &str = "xcopilot/opt/voice_list";
 /// The panel's app-mode radio buttons (Both / Copilot only / ATC only) —
 /// values are `mode::Mode::panel_index`, `-1` = plugin default (unpublished).
 const DR_OPT_MODE: &str = "xcopilot/opt/mode";
+/// The panel's cabin-crew radio buttons (Auto / Aboard / Off) — values are
+/// `cabin::Staffing::panel_index`, `-1` = plugin default (unpublished).
+const DR_OPT_CABIN: &str = "xcopilot/opt/cabin_crew";
 
 /// Publish the pilot-voice roster (every piper model on disk) to the plugin's
 /// Settings picker, then poll for picks. A pick swaps the copilot's voice live
@@ -753,14 +764,49 @@ fn spawn_voice_picker(base_url: String, voice: Voice, current_spec: String) {
     });
 }
 
-/// Sync the app mode with the plugin's Settings tab (`xcopilot/opt/mode`):
-/// publish the current mode so the radio buttons show the truth, and apply
-/// a panel pick the moment it lands (the main loop's reconciliation block
-/// notices `mode::get()` changed within ~2 s). The pick persists to
-/// prefs.json as the next boot's default. Same lifecycle discipline as the
-/// voice picker: `-1` means the plugin reloaded and lost its state, so the
-/// current mode is re-published rather than read back as a pick.
-fn spawn_mode_poller(base_url: String) {
+/// Sync the app's Settings-tab toggles with the plugin: the app mode
+/// (`xcopilot/opt/mode`) and cabin-crew staffing (`xcopilot/opt/cabin_crew`).
+/// Publish the current values so the radio buttons show the truth, and apply
+/// a panel pick the moment it lands (mode: the main loop's reconciliation
+/// block notices within ~2 s; staffing: read live at the routing sites).
+/// Picks persist to prefs.json as the next boot's default. Same lifecycle
+/// discipline as the voice picker: `-1` means the plugin reloaded and lost
+/// its state, so the truth is re-published rather than read back as a pick.
+fn spawn_settings_poller(base_url: String) {
+    /// One panel toggle: its dataref, what the app currently holds, and how
+    /// to apply a pick (an unknown index is ignored).
+    struct PanelSetting {
+        dref: &'static str,
+        id: Option<i64>,
+        current: fn() -> i64,
+        apply: fn(i64),
+    }
+    let mut settings = [
+        PanelSetting {
+            dref: DR_OPT_MODE,
+            id: None,
+            current: || mode::get().panel_index(),
+            apply: |v| {
+                if let Some(m) = mode::Mode::from_panel_index(v) {
+                    tracing::info!(mode = m.as_str(), "panel mode pick");
+                    mode::set(m);
+                    prefs::save_mode(m.as_str());
+                }
+            },
+        },
+        PanelSetting {
+            dref: DR_OPT_CABIN,
+            id: None,
+            current: || cabin::staffing().panel_index(),
+            apply: |v| {
+                if let Some(s) = cabin::Staffing::from_panel_index(v) {
+                    tracing::info!(cabin_crew = s.as_str(), "panel cabin staffing pick");
+                    cabin::set_staffing(s);
+                    prefs::save_cabin_crew(s.as_str());
+                }
+            },
+        },
+    ];
     std::thread::spawn(move || {
         let Ok(http) = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
@@ -769,7 +815,6 @@ fn spawn_mode_poller(base_url: String) {
             return;
         };
         let rest = format!("{}/api/v1", base_url.trim_end_matches('/'));
-        let mut id: Option<i64> = None;
         let patch = |id: i64, value: i64| -> bool {
             http.patch(format!("{rest}/datarefs/{id}/value"))
                 .json(&serde_json::json!({ "data": value }))
@@ -779,45 +824,42 @@ fn spawn_mode_poller(base_url: String) {
         };
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
-            let applied = mode::get();
-            if id.is_none() {
-                id = crate::plugin_status::resolve_id(&http, &rest, DR_OPT_MODE);
-                let Some(mode_id) = id else {
-                    // Plugin not loaded / sim down — retry lazily.
-                    std::thread::sleep(std::time::Duration::from_secs(3));
+            for s in settings.iter_mut() {
+                let applied = (s.current)();
+                if s.id.is_none() {
+                    s.id = crate::plugin_status::resolve_id(&http, &rest, s.dref);
+                    let Some(id) = s.id else {
+                        // Plugin not loaded / sim down — retry lazily.
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        continue;
+                    };
+                    if !patch(id, applied) {
+                        s.id = None;
+                        continue;
+                    }
+                }
+                let Some(id) = s.id else { continue };
+                let read = http
+                    .get(format!("{rest}/datarefs/{id}/value"))
+                    .send()
+                    .ok()
+                    .filter(|r| r.status().is_success())
+                    .and_then(|r| r.json::<serde_json::Value>().ok())
+                    .and_then(|b| b.get("data").and_then(|d| d.as_i64()));
+                let Some(v) = read else {
+                    s.id = None; // stale id (sim restarted) — re-resolve
                     continue;
                 };
-                if !patch(mode_id, applied.panel_index()) {
-                    id = None;
+                if v < 0 {
+                    // Plugin reloaded and lost its state — re-publish the truth.
+                    if !patch(id, applied) {
+                        s.id = None;
+                    }
                     continue;
                 }
-            }
-            let Some(mode_id) = id else { continue };
-            let read = http
-                .get(format!("{rest}/datarefs/{mode_id}/value"))
-                .send()
-                .ok()
-                .filter(|r| r.status().is_success())
-                .and_then(|r| r.json::<serde_json::Value>().ok())
-                .and_then(|b| b.get("data").and_then(|d| d.as_i64()));
-            let Some(v) = read else {
-                id = None; // stale id (sim restarted) — re-resolve
-                continue;
-            };
-            if v < 0 {
-                // Plugin reloaded and lost its state — re-publish the truth.
-                if !patch(mode_id, applied.panel_index()) {
-                    id = None;
+                if v != applied {
+                    (s.apply)(v);
                 }
-                continue;
-            }
-            match mode::Mode::from_panel_index(v) {
-                Some(m) if m != applied => {
-                    tracing::info!(mode = m.as_str(), "panel mode pick");
-                    mode::set(m);
-                    prefs::save_mode(m.as_str());
-                }
-                _ => {}
             }
         }
     });
@@ -1722,7 +1764,7 @@ async fn run_session(
         // airframe with no cabin crew the copilot answers honestly instead
         // of letting the model improvise a flight attendant.
         if let Some(rest) = cabin::Cabin::addressed(&command) {
-            if cabin::enabled(&config.cabin_crew, profile.cabin_crew) {
+            if cabin::aboard(profile.cabin_crew) {
                 let reply = cabin_state
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())

@@ -22,6 +22,10 @@ struct Prefs {
     /// honored at the next boot unless `XCOPILOT_MODE` overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
+    /// Cabin crew staffing ("auto" | "aboard" | "off") — the panel's last
+    /// pick, honored at the next boot unless `XCOPILOT_CABIN_CREW` overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cabin_crew: Option<String>,
 }
 
 fn load() -> Prefs {
@@ -56,6 +60,19 @@ pub fn mode() -> Option<String> {
 pub fn save_mode(mode: &str) {
     let mut prefs = load();
     prefs.mode = Some(mode.to_string());
+    store(prefs);
+}
+
+/// The saved cabin-crew staffing, if any ("auto" | "aboard" | "off").
+pub fn cabin_crew() -> Option<String> {
+    load().cabin_crew
+}
+
+/// Persist a new cabin-crew staffing pick (the panel toggle). Best-effort,
+/// like the others: a failed write costs the persistence, never the switch.
+pub fn save_cabin_crew(staffing: &str) {
+    let mut prefs = load();
+    prefs.cabin_crew = Some(staffing.to_string());
     store(prefs);
 }
 

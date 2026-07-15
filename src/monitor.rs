@@ -1432,9 +1432,10 @@ pub async fn run(
     let mut checks = build_checks(&live.get());
     let mut drefs = advisor_drefs(&live.get());
     let mut avionics_readback = avionics_readback_dref(&live.get());
-    // Cabin crew aboard this airframe? Profile capability with the env
-    // override; recomputed on aircraft switch like everything profile-derived.
-    let mut cabin_aboard = crate::cabin::enabled(&config.cabin_crew, live.get().cabin_crew);
+    // Whether THIS airframe carries a crew, rebuilt on aircraft switch; the
+    // live staffing setting is read at the watch itself (cabin::aboard), so
+    // a panel flip applies mid-flight without a profile swap.
+    let mut cabin_capable = live.get().cabin_crew;
     tracing::info!(checks = checks.len(), hz = config.monitor_hz, "monitor started");
     // Stamp the record with the airframe so the distiller can key memory by it.
     crate::blackbox::record("flight_meta", serde_json::json!({ "aircraft": live.get().id }));
@@ -1510,7 +1511,7 @@ pub async fn run(
             checks = build_checks(&live.get());
             drefs = advisor_drefs(&live.get());
             avionics_readback = avionics_readback_dref(&live.get());
-            cabin_aboard = crate::cabin::enabled(&config.cabin_crew, live.get().cabin_crew);
+            cabin_capable = live.get().cabin_crew;
             states = checks.iter().map(|c| (c.id(), FireState::new())).collect();
             tracing::info!(checks = checks.len(), "monitor: reconfigured for new aircraft");
             crate::blackbox::record("flight_meta", serde_json::json!({ "aircraft": live.get().id }));
@@ -2043,7 +2044,7 @@ pub async fn run(
                 // prepare call, and the seatbelt-sign interphone call. The
                 // sterile-cockpit rule lives in the cabin module — safety
                 // reports come through, flavor stays above 10,000 ft.
-                if crew_on && cabin_aboard {
+                if crew_on && crate::cabin::aboard(cabin_capable) {
                     let (belt_line, tick_line) = {
                         let mut cab = cabin.lock().unwrap_or_else(|e| e.into_inner());
                         (

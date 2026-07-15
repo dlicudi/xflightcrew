@@ -74,6 +74,8 @@ int opt_monitor_mute();
 void set_opt_monitor_mute(int v);
 int opt_mode();
 void set_opt_mode(int v);
+int opt_cabin();
+void set_opt_cabin(int v);
 int opt_voice();
 void set_opt_voice(int v);
 const char* voice_list();

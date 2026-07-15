@@ -14,9 +14,12 @@
 //! monitor ticks the owed reports (`tick`) and the seatbelt-sign watch
 //! (`seatbelt`) and speaks them via `Voice::alert_cabin`. The persona exists
 //! only on airframes whose profile says so (`cabin_crew: true` — a 172 has
-//! no galley), overridable with `XCOPILOT_CABIN_CREW=true|false` so any
-//! airframe can be crewed for testing.
+//! no galley), overridable from the panel's Settings tab
+//! (`xcopilot/opt/cabin_crew`, persisted via [`crate::prefs`]) so any
+//! airframe can be crewed for testing; `XCOPILOT_CABIN_CREW` sets only the
+//! boot value, same precedence discipline as the app mode.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 /// Sterile cockpit floor: below this the cabin initiates nothing but safety
@@ -45,14 +48,76 @@ impl Phase {
     }
 }
 
-/// Is the cabin crew aboard? Profile capability, with an env override so the
-/// persona can be tested on any airframe ("what if I want cabin crew on a
-/// 172?" — set `XCOPILOT_CABIN_CREW=true` and she's aboard).
-pub fn enabled(config_flag: &str, profile_has_cabin_crew: bool) -> bool {
-    match config_flag.trim().to_ascii_lowercase().as_str() {
-        "true" | "on" | "1" | "yes" => true,
-        "false" | "off" | "0" | "no" => false,
-        _ => profile_has_cabin_crew,
+/// Who staffs the back — the runtime setting behind [`aboard`]. `Auto`
+/// defers to the airframe profile (`cabin_crew: true`); `Aboard`/`Off`
+/// override it either way ("what if I want cabin crew on a 172?" — pick
+/// Aboard on the Settings tab and she's aboard). Same lifecycle as
+/// [`crate::mode`]: one process-wide atomic, panel-toggleable, persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Staffing {
+    Auto,
+    Aboard,
+    Off,
+}
+
+impl Staffing {
+    /// Parse a config/prefs value. Accepts the canonical names plus the
+    /// legacy env spellings (`true`/`false`); `None` for anything else.
+    pub fn parse(s: &str) -> Option<Staffing> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "profile" | "airframe" => Some(Staffing::Auto),
+            "aboard" | "true" | "on" | "1" | "yes" => Some(Staffing::Aboard),
+            "off" | "false" | "0" | "no" => Some(Staffing::Off),
+            _ => None,
+        }
+    }
+
+    /// Canonical name — what prefs.json stores.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Staffing::Auto => "auto",
+            Staffing::Aboard => "aboard",
+            Staffing::Off => "off",
+        }
+    }
+
+    /// The panel's radio-button index (`xcopilot/opt/cabin_crew` value).
+    pub fn panel_index(self) -> i64 {
+        match self {
+            Staffing::Auto => 0,
+            Staffing::Aboard => 1,
+            Staffing::Off => 2,
+        }
+    }
+
+    pub fn from_panel_index(v: i64) -> Option<Staffing> {
+        match v {
+            0 => Some(Staffing::Auto),
+            1 => Some(Staffing::Aboard),
+            2 => Some(Staffing::Off),
+            _ => None,
+        }
+    }
+}
+
+static STAFFING: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_staffing(s: Staffing) {
+    STAFFING.store(s.panel_index() as u8, Ordering::Relaxed);
+}
+
+pub fn staffing() -> Staffing {
+    Staffing::from_panel_index(STAFFING.load(Ordering::Relaxed) as i64).unwrap_or(Staffing::Auto)
+}
+
+/// Is the cabin crew aboard THIS airframe, per the live setting? Read at
+/// the point of use (routing, watches) so a panel flip applies to the very
+/// next call — no restart, no aircraft swap needed.
+pub fn aboard(profile_has_cabin_crew: bool) -> bool {
+    match staffing() {
+        Staffing::Auto => profile_has_cabin_crew,
+        Staffing::Aboard => true,
+        Staffing::Off => false,
     }
 }
 
@@ -343,11 +408,30 @@ mod tests {
     }
 
     #[test]
-    fn enablement_is_profile_with_env_override() {
-        assert!(!enabled("auto", false)); // a 172 has no cabin crew
-        assert!(enabled("auto", true)); // the MD-82 does
-        assert!(enabled("true", false)); // ...unless you staff one for testing
-        assert!(!enabled("false", true)); // ...or send them home
+    fn staffing_is_profile_with_panel_override() {
+        // Sets process-wide state: same discipline as mode-setting tests.
+        let _guard = crate::mode::TEST_LOCK.lock().unwrap();
+        set_staffing(Staffing::Auto);
+        assert!(!aboard(false)); // a 172 has no cabin crew
+        assert!(aboard(true)); // the MD-82 does
+        set_staffing(Staffing::Aboard);
+        assert!(aboard(false)); // ...unless you staff one for testing
+        set_staffing(Staffing::Off);
+        assert!(!aboard(true)); // ...or send them home
+        set_staffing(Staffing::Auto);
+    }
+
+    #[test]
+    fn staffing_parses_and_roundtrips() {
+        for s in [Staffing::Auto, Staffing::Aboard, Staffing::Off] {
+            assert_eq!(Staffing::parse(s.as_str()), Some(s));
+            assert_eq!(Staffing::from_panel_index(s.panel_index()), Some(s));
+        }
+        // Legacy env spellings still land somewhere sensible.
+        assert_eq!(Staffing::parse("true"), Some(Staffing::Aboard));
+        assert_eq!(Staffing::parse("false"), Some(Staffing::Off));
+        assert_eq!(Staffing::parse("banana"), None);
+        assert_eq!(Staffing::from_panel_index(-1), None);
     }
 
     #[test]

@@ -95,6 +95,14 @@ static XPLMDataRef g_opt_mode_dref = nullptr;
 static int ReadOptMode(void*) { return g_opt_mode; }
 static void WriteOptMode(void*, int v) { g_opt_mode = v; }
 
+// Cabin-crew staffing (Auto / Aboard / Off). Same protocol as the mode: the
+// app publishes the live pick (0/1/2, cabin.rs panel_index), polls for the
+// pilot's change, applies it live and persists it. -1 = untouched/wiped.
+static int g_opt_cabin = -1;
+static XPLMDataRef g_opt_cabin_dref = nullptr;
+static int ReadOptCabin(void*) { return g_opt_cabin; }
+static void WriteOptCabin(void*, int v) { g_opt_cabin = v; }
+
 // Copilot voice picker. The app publishes the roster of piper models on disk
 // (newline-separated display names) into `voice_list` and the active voice's
 // index into `voice`; the Settings combo writes the pilot's pick back, the app
@@ -459,6 +467,10 @@ void start() {
         "xcopilot/opt/mode", xplmType_Int, 1,
         ReadOptMode, WriteOptMode, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_opt_cabin_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/cabin_crew", xplmType_Int, 1,
+        ReadOptCabin, WriteOptCabin, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     g_voice_list_dref = XPLMRegisterDataAccessor(
         "xcopilot/opt/voice_list", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -510,6 +522,7 @@ void stop_first() {
 
 void stop_rest() {
     if (g_voice_list_dref) { XPLMUnregisterDataAccessor(g_voice_list_dref); g_voice_list_dref = nullptr; }
+    if (g_opt_cabin_dref) { XPLMUnregisterDataAccessor(g_opt_cabin_dref); g_opt_cabin_dref = nullptr; }
     if (g_opt_mode_dref) { XPLMUnregisterDataAccessor(g_opt_mode_dref); g_opt_mode_dref = nullptr; }
     if (g_opt_voice_dref) { XPLMUnregisterDataAccessor(g_opt_voice_dref); g_opt_voice_dref = nullptr; }
     if (g_opt_mute_dref) { XPLMUnregisterDataAccessor(g_opt_mute_dref); g_opt_mute_dref = nullptr; }
@@ -562,6 +575,8 @@ int opt_monitor_mute() { return g_opt_monitor_mute; }
 void set_opt_monitor_mute(int v) { g_opt_monitor_mute = v; }
 int opt_mode() { return g_opt_mode; }
 void set_opt_mode(int v) { g_opt_mode = v; }
+int opt_cabin() { return g_opt_cabin; }
+void set_opt_cabin(int v) { g_opt_cabin = v; }
 int opt_voice() { return g_opt_voice; }
 void set_opt_voice(int v) { g_opt_voice = v; }
 const char* voice_list() { return g_voice_list.buf; }

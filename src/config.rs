@@ -109,7 +109,9 @@ pub struct Config {
     pub cabin_piper_voice: String,
     /// Whether the cabin crew persona is aboard: `auto` (the aircraft
     /// profile's `cabin_crew` flag decides — a 172 has none, an MD-82 does),
-    /// `true`/`false` to override for testing. `XCOPILOT_CABIN_CREW`.
+    /// `aboard`/`off` (or `true`/`false`) to override. `XCOPILOT_CABIN_CREW`
+    /// sets only the BOOT value; empty = fall back to the panel's saved pick
+    /// (the Settings tab toggles it live from there — see `cabin::Staffing`).
     pub cabin_crew: String,
     /// Path to X-Plane's `earth_nav.dat` (for ILS lookup).
     pub nav_data_path: String,
@@ -264,7 +266,7 @@ impl Config {
                 .or_else(crate::prefs::pilot_voice)
                 .unwrap_or_else(|| "models/en_US-amy-medium.onnx".into()),
             cabin_piper_voice: env_or("XCOPILOT_CABIN_VOICE", "models/en_US-hfc_female-medium.onnx"),
-            cabin_crew: env_or("XCOPILOT_CABIN_CREW", "auto"),
+            cabin_crew: env_or("XCOPILOT_CABIN_CREW", ""),
             // Prefer Custom Data (Navigraph/updated AIRAC) when it exists — it's
             // what X-Plane itself flies on; the stock file goes stale the moment
             // a cycle is installed. Env override wins over both.

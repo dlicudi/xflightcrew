@@ -709,6 +709,19 @@ protected:
         if (ImGui::Checkbox("Mute monitor callouts", &mute)) {
             drefs::set_opt_monitor_mute(mute ? 1 : 0);
         }
+        // Cabin crew staffing: Auto defers to the airframe profile (the
+        // MD-82 has a crew, a 172 doesn't); Aboard/Off override it either
+        // way. Same publish/pick protocol as the mode radios: -1 = the app
+        // hasn't published yet, hide the control.
+        int cabin = drefs::opt_cabin();
+        if (cabin >= 0) {
+            ImGui::Spacing();
+            ImGui::TextUnformatted("Cabin crew");
+            ImGui::RadioButton("Auto (airframe decides)", &cabin, 0);
+            ImGui::RadioButton("Aboard (staff any airframe)", &cabin, 1);
+            ImGui::RadioButton("Off (no cabin crew)", &cabin, 2);
+            if (cabin != drefs::opt_cabin()) drefs::set_opt_cabin(cabin);
+        }
         // Copilot voice: the roster the app published, one combo row. A pick
         // writes the index back; the app polls it, swaps the voice live, and
         // confirms in the new voice. Hidden until the app publishes (no app,
