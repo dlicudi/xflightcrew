@@ -23,14 +23,15 @@ LDFLAGS  := -dynamiclib -mmacosx-version-min=11.0 -F$(SDK)/Libraries/Mac \
             -framework XPLM -framework OpenGL -framework ApplicationServices \
             -framework CoreFoundation
 
-SRCS := src/$(PLUGIN).cpp \
+SRCS := src/$(PLUGIN).cpp src/drefs.cpp src/panel.cpp src/fms.cpp \
         third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp \
         third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp \
         third_party/ImgWindow/ImgWindow.cpp third_party/ImgWindow/ImgFontAtlas.cpp
+HDRS := $(wildcard src/*.h)
 
 OUT := build/mac_x64/$(PLUGIN).xpl
 
-$(OUT): $(SRCS)
+$(OUT): $(SRCS) $(HDRS)
 	@mkdir -p build/mac_x64
 	$(CXX) $(ARCHS) $(CXXFLAGS) $(LDFLAGS) -o $@ $(SRCS)
 	@echo "built $@"

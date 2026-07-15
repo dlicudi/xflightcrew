@@ -1,0 +1,570 @@
+// Dataref/command storage and registration. The accessor callbacks live here;
+// rows that belong in the panel's transmission log are forwarded to
+// panel::append_log as they arrive.
+
+#include "drefs.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include "XPLMDataAccess.h"
+#include "XPLMProcessing.h"
+#include "XPLMUtilities.h"
+
+#include "fms.h"
+#include "panel.h"
+
+// ---- PTT --------------------------------------------------------------------
+
+static int g_ptt_active = 0;
+static XPLMCommandRef g_ptt_cmd = nullptr;
+static XPLMDataRef g_ptt_dref = nullptr;
+
+static int PttCommandHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
+    if (phase == xplm_CommandBegin) g_ptt_active = 1;
+    else if (phase == xplm_CommandEnd) g_ptt_active = 0;
+    return 1;
+}
+static int ReadPttActive(void*) { return g_ptt_active; }
+
+// Radio PTT: the transmit switch, as distinct from the intercom above. While
+// held, the app routes the utterance to whatever ATC station COM1 is tuned to
+// (never to the copilot). Command `xcopilot/radio_ptt` drives the readable
+// dataref `xcopilot/radio_ptt_active`, mirroring the intercom pair exactly.
+static int g_radio_ptt_active = 0;
+static XPLMCommandRef g_radio_ptt_cmd = nullptr;
+static XPLMDataRef g_radio_ptt_dref = nullptr;
+
+static int RadioPttCommandHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
+    if (phase == xplm_CommandBegin) g_radio_ptt_active = 1;
+    else if (phase == xplm_CommandEnd) g_radio_ptt_active = 0;
+    return 1;
+}
+static int ReadRadioPttActive(void*) { return g_radio_ptt_active; }
+
+// ---- LLM fallback toggle ----------------------------------------------------
+
+// A runtime switch the panel flips and the app reads live (each utterance), so
+// the answer-only LLM fallback can be turned on/off mid-flight without a restart.
+//   -1 = untouched → the app follows its own XCOPILOT_LLM startup default
+//    0 = forced off
+//    1 = forced on
+static int g_llm_enabled = -1;
+static XPLMDataRef g_llm_dref = nullptr;
+static int ReadLlmEnabled(void*) { return g_llm_enabled; }
+static void WriteLlmEnabled(void*, int v) { g_llm_enabled = v; }
+
+// ---- panel requests (plugin → app) -------------------------------------------
+
+// The emergency buttons write a request code the app polls and consumes (same
+// direction as PTT): 0 = none, 1 = recover, 2 = autoland, 3 = my controls. The
+// app runs the matching voice command and writes 0 back.
+static int g_request = 0;
+static XPLMDataRef g_request_dref = nullptr;
+static int ReadRequest(void*) { return g_request; }
+static void WriteRequest(void*, int v) { g_request = v; }
+
+// ---- panel options (plugin → app) --------------------------------------------
+
+// Settings-popup switches the app polls live. Ints so a missing plugin (dataref
+// unresolved) is distinguishable from "off"; defaults match the app's defaults.
+static int g_opt_camera_snap = 0;   // snap-to-panel camera on actions — OFF by
+                                    // default (moving the pilot's view proved
+                                    // disorienting; the callout toast carries the
+                                    // information). Re-enable via Settings.
+static int g_opt_negative_tone = 1; // negative tone on unrecognized command
+static int g_opt_monitor_mute = 0;  // silence the monitor's callouts
+static XPLMDataRef g_opt_snap_dref = nullptr;
+static XPLMDataRef g_opt_tone_dref = nullptr;
+static XPLMDataRef g_opt_mute_dref = nullptr;
+static int ReadOptSnap(void*) { return g_opt_camera_snap; }
+static void WriteOptSnap(void*, int v) { g_opt_camera_snap = v; }
+static int ReadOptTone(void*) { return g_opt_negative_tone; }
+static void WriteOptTone(void*, int v) { g_opt_negative_tone = v; }
+static int ReadOptMute(void*) { return g_opt_monitor_mute; }
+static void WriteOptMute(void*, int v) { g_opt_monitor_mute = v; }
+
+// App mode (Both / Copilot only / ATC only). The app publishes the live mode
+// (0/1/2, mode.rs panel_index) and polls for the pilot's pick; a pick applies
+// within ~2 s and persists to prefs.json as the next boot's default. -1 =
+// untouched, which is also how the app detects a plugin reload wiped this
+// state and re-publishes.
+static int g_opt_mode = -1;
+static XPLMDataRef g_opt_mode_dref = nullptr;
+static int ReadOptMode(void*) { return g_opt_mode; }
+static void WriteOptMode(void*, int v) { g_opt_mode = v; }
+
+// Copilot voice picker. The app publishes the roster of piper models on disk
+// (newline-separated display names) into `voice_list` and the active voice's
+// index into `voice`; the Settings combo writes the pilot's pick back, the app
+// polls it and swaps the voice live. -1 = untouched (follow the app's voice),
+// which is also how the app detects a plugin reload wiped this state and
+// re-publishes. Own buffer type: the roster outgrows TextRef's 512 as voices
+// are added.
+static int g_opt_voice = -1;
+static XPLMDataRef g_opt_voice_dref = nullptr;
+static int ReadOptVoice(void*) { return g_opt_voice; }
+static void WriteOptVoice(void*, int v) { g_opt_voice = v; }
+static struct { char buf[4096]; int len; } g_voice_list = {{0}, 0};
+static XPLMDataRef g_voice_list_dref = nullptr;
+static int ReadVoiceList(void*, void* out, int offset, int max) {
+    if (out == nullptr) return g_voice_list.len;
+    if (offset >= g_voice_list.len) return 0;
+    int n = g_voice_list.len - offset;
+    if (n > max) n = max;
+    std::memcpy(out, g_voice_list.buf + offset, static_cast<size_t>(n));
+    return n;
+}
+static void WriteVoiceList(void*, void* in, int offset, int len) {
+    if (offset != 0) return;
+    if (len > static_cast<int>(sizeof g_voice_list.buf) - 1) len = sizeof g_voice_list.buf - 1;
+    if (len < 0) len = 0;
+    std::memset(g_voice_list.buf, 0, sizeof g_voice_list.buf);
+    std::memcpy(g_voice_list.buf, in, static_cast<size_t>(len));
+    g_voice_list.len = len;
+}
+
+// ---- status datarefs --------------------------------------------------------
+
+static int g_phase = 0;
+static TextRef g_heard = {{0}, 0};
+static TextRef g_action = {{0}, 0};
+static TextRef g_alert = {{0}, 0};
+static TextRef g_aircraft = {{0}, 0};
+// Live flight strip — one compact status line the app refreshes (emergency
+// phase/runway, cabin altitude, fuel endurance). Empty = hidden.
+static TextRef g_strip = {{0}, 0};
+// On-screen callout — WHAT the copilot is changing ("FLAPS > 10"), flashed in a
+// floating toast over the sim for a couple of seconds after each action.
+static TextRef g_callout = {{0}, 0};
+static float g_callout_time = -1000.0f;
+// Radio row — the ATC field's comm plan plus live COM1, refreshed by the app
+// ("GIBRALTAR | >TWR 131.200 | APP 122.800"). '>' marks the tuned service.
+static TextRef g_radio = {{0}, 0};
+// ATC tab — every station in VHF range, nearest first, refreshed by the app
+// as "NAME,dist_nm,SVC khz,...|NAME,..." ('*' prefix = the active station).
+static TextRef g_atc = {{0}, 0};
+// The radio coach's suggested next call for the current tower state,
+// refreshed continuously by the app. Empty = no station. Rendered twice:
+// the Calls tab's SAY NOW header, and the Log tab's pinned footer strip.
+static TextRef g_coach = {{0}, 0};
+
+static XPLMDataRef g_phase_dref = nullptr;
+static XPLMDataRef g_heard_dref = nullptr;
+static XPLMDataRef g_action_dref = nullptr;
+static XPLMDataRef g_alert_dref = nullptr;
+static XPLMDataRef g_aircraft_dref = nullptr;
+static XPLMDataRef g_strip_dref = nullptr;
+static XPLMDataRef g_callout_dref = nullptr;
+static XPLMDataRef g_radio_dref = nullptr;
+static XPLMDataRef g_atc_dref = nullptr;
+static XPLMDataRef g_coach_dref = nullptr;
+// COM1 active frequency (integer kHz despite the sim's `hz` name) — read for
+// the ATC tab's tuned highlight, written by its click-to-tune.
+static XPLMDataRef g_com1_dref = nullptr;
+// Proportional taxi brake. The app writes xcopilot/taxi_brake (0..1) and the
+// flight loop drives the toe-brake ratios from it every frame, holding
+// override_toe_brakes only while a fresh value wants brake; writes stopping
+// for any reason (release, crash, kill -9) expire it within a second, ratios
+// zeroed and the override dropped — the dataref equivalent of a held
+// command, a boot that can't be left on. Per-frame is the part the app
+// process can't provide: REST-rate ratio writes lose the re-drive fight
+// (and l_brake_add, the no-override channel, is stomped by XP12 every
+// frame — tested live 2026-07-14, writes read back -0.0 immediately).
+static XPLMDataRef g_taxi_brake_dref = nullptr;
+static XPLMDataRef g_l_brake_ratio = nullptr;
+static XPLMDataRef g_r_brake_ratio = nullptr;
+static XPLMDataRef g_override_toe_brakes = nullptr;
+static float g_taxi_brake = 0.0f;
+static float g_taxi_brake_stamp = -1.0f;
+static bool g_taxi_brake_applied = false;
+static const float kTaxiBrakeFreshSecs = 1.0f;
+
+// Last time the app wrote any status (sim seconds). The app heartbeats the phase
+// ~1/s, so a stale value means it isn't running → NOT CONNECTED. Starts stale.
+static float g_last_status_time = -1000.0f;
+
+static int ReadPhase(void*) { return g_phase; }
+static void WritePhase(void*, int v) {
+    g_phase = v;
+    g_last_status_time = XPLMGetElapsedTime();
+}
+
+int ReadText(void* ref, void* out, int offset, int max) {
+    TextRef* t = static_cast<TextRef*>(ref);
+    if (out == nullptr) return t->len;
+    if (offset >= t->len) return 0;
+    int n = t->len - offset;
+    if (n > max) n = max;
+    std::memcpy(out, t->buf + offset, static_cast<size_t>(n));
+    return n;
+}
+
+// Store the whole value (the app PATCHes at offset 0), NUL-terminated. Any text
+// write is proof the app is alive, so it refreshes the connection heartbeat too
+// (not just phase writes — a busy strip stream must not read as disconnected).
+void StoreText(TextRef* t, void* in, int offset, int len) {
+    g_last_status_time = XPLMGetElapsedTime();
+    if (offset != 0) return;
+    if (len > 511) len = 511;
+    if (len < 0) len = 0;
+    std::memset(t->buf, 0, sizeof t->buf);
+    std::memcpy(t->buf, in, static_cast<size_t>(len));
+    t->len = len;
+}
+
+static void WriteHeard(void*, void* in, int offset, int len) {
+    StoreText(&g_heard, in, offset, len);
+    // The pilot's own words, named as the speaker they are: the log reads as a
+    // three-voice transcript (PILOT / COPILOT / ATC), white because it's the
+    // pilot's half of the dialogue.
+    panel::append_log("PILOT", COL_WHITE, g_heard.buf);
+}
+static void WriteAction(void*, void* in, int offset, int len) {
+    StoreText(&g_action, in, offset, len);
+    // A leading '~' marks AMBIENCE — the party line's overheard exchanges,
+    // not a call addressed to this aircraft. Strip it, remember it: the row
+    // keeps its speaker tag but renders dim.
+    bool ambient = false;
+    if (g_action.len > 0 && g_action.buf[0] == '~') {
+        std::memmove(g_action.buf, g_action.buf + 1, static_cast<size_t>(g_action.len));
+        g_action.len -= 1;
+        ambient = true;
+    }
+    // A station prefix ("TWR: " / "APP: " / "DEP: " / "ATIS: ") is attribution,
+    // not content: strip it and tag the row with the SPECIFIC position, so the
+    // transcript names which controller spoke. Everything else is the crew.
+    static const struct { const char* prefix; const char* tag; } kStations[] = {
+        {"TWR: ", "TOWER"}, {"APP: ", "APP"}, {"DEP: ", "DEP"}, {"ATIS: ", "ATIS"},
+        // Party-line traffic: the ghost pilots' side of the frequency. Spelled
+        // out on the panel (every other tag is a plain speaker name).
+        {"TFC: ", "TRAFFIC"},
+    };
+    for (const auto& s : kStations) {
+        int n = static_cast<int>(std::strlen(s.prefix));
+        if (g_action.len > n && std::strncmp(g_action.buf, s.prefix, n) == 0) {
+            std::memmove(g_action.buf, g_action.buf + n, static_cast<size_t>(g_action.len - n + 1));
+            g_action.len -= n;
+            panel::append_log(s.tag, COL_AMBER, g_action.buf, ambient);
+            return;
+        }
+    }
+    panel::append_log("COPILOT", COL_GREEN, g_action.buf, ambient);
+}
+// Active aircraft ICAO — shown beside the connection chip, not logged.
+static void WriteAircraft(void*, void* in, int offset, int len) {
+    StoreText(&g_aircraft, in, offset, len);
+}
+// The taxi-speed governor renews this every braking tick; the stamp is what
+// makes the value expire instead of stick.
+static float ReadTaxiBrake(void*) { return g_taxi_brake; }
+static void WriteTaxiBrake(void*, float v) {
+    g_taxi_brake = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    g_taxi_brake_stamp = XPLMGetElapsedTime();
+}
+static float TaxiBrakeLoop(float, float, int, void*) {
+    const bool fresh = g_taxi_brake_stamp >= 0.0f
+        && XPLMGetElapsedTime() - g_taxi_brake_stamp <= kTaxiBrakeFreshSecs;
+    if (fresh && g_taxi_brake > 0.0f) {
+        // The override holds ONLY while we're actively braking, so the
+        // pedals are the pilot's the rest of the time.
+        if (g_override_toe_brakes) XPLMSetDatai(g_override_toe_brakes, 1);
+        if (g_l_brake_ratio) XPLMSetDataf(g_l_brake_ratio, g_taxi_brake);
+        if (g_r_brake_ratio) XPLMSetDataf(g_r_brake_ratio, g_taxi_brake);
+        g_taxi_brake_applied = true;
+    } else if (g_taxi_brake_applied) {
+        if (g_l_brake_ratio) XPLMSetDataf(g_l_brake_ratio, 0.0f);
+        if (g_r_brake_ratio) XPLMSetDataf(g_r_brake_ratio, 0.0f);
+        // Dropped last: the sim re-drives the ratios from the pilot's
+        // hardware the very next frame.
+        if (g_override_toe_brakes) XPLMSetDatai(g_override_toe_brakes, 0);
+        g_taxi_brake_applied = false;
+    }
+    return -1.0f; // every frame: braking rides the physics rate, not REST rate
+}
+// Live flight strip — a status row the app refreshes continuously, not logged.
+static void WriteStrip(void*, void* in, int offset, int len) {
+    StoreText(&g_strip, in, offset, len);
+}
+// Radio row — refreshed continuously like the strip, not logged.
+static void WriteRadio(void*, void* in, int offset, int len) {
+    StoreText(&g_radio, in, offset, len);
+}
+
+static std::vector<AtcField> g_atc_fields;
+
+// Parse "NAME,dist,SVC khz,...|NAME,..." into fields — cheap enough to run on
+// every write; the ATC tab renders straight from this.
+static std::vector<AtcField> parse_atc() {
+    char buf[sizeof g_atc.buf];
+    std::memcpy(buf, g_atc.buf, sizeof buf);
+
+    std::vector<AtcField> fields;
+    char* save1 = nullptr;
+    for (char* tok = strtok_r(buf, "|", &save1); tok; tok = strtok_r(nullptr, "|", &save1)) {
+        char* save2 = nullptr;
+        char* name = strtok_r(tok, ",", &save2);
+        char* dist = strtok_r(nullptr, ",", &save2);
+        if (!name || !dist) continue;
+        AtcField f;
+        f.active = (name[0] == '*');
+        f.name = f.active ? name + 1 : name;
+        f.dist_nm = std::atoi(dist);
+        for (char* svc = strtok_r(nullptr, ",", &save2); svc; svc = strtok_r(nullptr, ",", &save2)) {
+            char* sp = std::strchr(svc, ' ');
+            if (!sp) continue;
+            *sp = '\0';
+            f.freqs.push_back({svc, std::atoi(sp + 1)});
+        }
+        fields.push_back(std::move(f));
+    }
+    return fields;
+}
+
+static void WriteAtc(void*, void* in, int offset, int len) {
+    StoreText(&g_atc, in, offset, len);
+    g_atc_fields = parse_atc();
+}
+
+// Coach line — refreshed continuously like the radio row, not logged. The app
+// leads the payload with two marker bytes (the alert severity scheme):
+// urgency ('1' hint, '2' an OWED readback — amber text + a dot on the Calls
+// tab) and phase group ('D' departure / 'A' arrival — highlights the matching
+// phraseology reference group). Parsed off here; markerless text renders as a
+// plain hint (legacy).
+static bool g_coach_urgent = false;
+static char g_coach_group = 0;
+static void WriteCoach(void*, void* in, int offset, int len) {
+    StoreText(&g_coach, in, offset, len);
+    g_coach_urgent = false;
+    g_coach_group = 0;
+    if (g_coach.len >= 2 && (g_coach.buf[0] == '1' || g_coach.buf[0] == '2')
+        && (g_coach.buf[1] == 'D' || g_coach.buf[1] == 'A')) {
+        g_coach_urgent = (g_coach.buf[0] == '2');
+        g_coach_group = g_coach.buf[1];
+        std::memmove(g_coach.buf, g_coach.buf + 2,
+                     static_cast<size_t>(g_coach.len - 2) + 1);
+        g_coach.len -= 2;
+    }
+}
+// Callout — stamp the arrival time; the toast shows for a short window after.
+// An optional "nx,ny|" prefix (fractions of the half-screen from centre) aims
+// the toast toward the control the camera glanced at.
+static float g_callout_nx = 0.0f, g_callout_ny = 0.0f;
+static void WriteCallout(void*, void* in, int offset, int len) {
+    StoreText(&g_callout, in, offset, len);
+    g_callout_nx = 0.0f;
+    g_callout_ny = 0.0f;
+    char* bar = std::strchr(g_callout.buf, '|');
+    float nx = 0.0f, ny = 0.0f;
+    if (bar && std::sscanf(g_callout.buf, "%f,%f|", &nx, &ny) == 2) {
+        g_callout_nx = nx;
+        g_callout_ny = ny;
+        int rest = g_callout.len - static_cast<int>(bar + 1 - g_callout.buf);
+        std::memmove(g_callout.buf, bar + 1, static_cast<size_t>(rest) + 1);
+        g_callout.len = rest;
+    }
+    g_callout_time = XPLMGetElapsedTime();
+}
+static void WriteAlert(void*, void* in, int offset, int len) {
+    StoreText(&g_alert, in, offset, len);
+    // First char is a severity marker ('1' advisory, '2' caution, '3' warning).
+    // The tag names the SPEAKER — every alert is the copilot's voice, so the
+    // transcript reads as who said it; severity survives as the row colour.
+    const char* text = g_alert.buf;
+    ImU32 col = COL_AMBER;
+    if (g_alert.len >= 1) {
+        switch (g_alert.buf[0]) {
+            case '1': col = COL_CYAN;  text++; break;
+            case '2': col = COL_AMBER; text++; break;
+            case '3': col = COL_RED;   text++; break;
+            default: break;  // no marker (legacy) — amber
+        }
+    }
+    panel::append_log("COPILOT", col, text);
+}
+
+// ---- registration and accessors ----------------------------------------------
+
+namespace drefs {
+
+void start() {
+    g_ptt_cmd = XPLMCreateCommand("xcopilot/ptt", "x-copilot: hold to talk");
+    XPLMRegisterCommandHandler(g_ptt_cmd, PttCommandHandler, 1, nullptr);
+
+    g_ptt_dref = XPLMRegisterDataAccessor(
+        "xcopilot/ptt_active", xplmType_Int, 0,
+        ReadPttActive, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+    g_radio_ptt_cmd =
+        XPLMCreateCommand("xcopilot/radio_ptt", "x-copilot: hold to transmit (radio/ATC)");
+    XPLMRegisterCommandHandler(g_radio_ptt_cmd, RadioPttCommandHandler, 1, nullptr);
+
+    g_radio_ptt_dref = XPLMRegisterDataAccessor(
+        "xcopilot/radio_ptt_active", xplmType_Int, 0,
+        ReadRadioPttActive, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_phase_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/phase", xplmType_Int, 1,
+        ReadPhase, WritePhase, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_heard_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/heard", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteHeard, &g_heard, &g_heard);
+    g_action_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/action", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteAction, &g_action, &g_action);
+    g_alert_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/alert", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteAlert, &g_alert, &g_alert);
+    g_aircraft_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/aircraft", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteAircraft, &g_aircraft, &g_aircraft);
+    fms::register_datarefs();
+    g_llm_dref = XPLMRegisterDataAccessor(
+        "xcopilot/llm_enabled", xplmType_Int, 1,
+        ReadLlmEnabled, WriteLlmEnabled, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_request_dref = XPLMRegisterDataAccessor(
+        "xcopilot/request", xplmType_Int, 1,
+        ReadRequest, WriteRequest, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_strip_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/strip", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteStrip, &g_strip, &g_strip);
+    g_opt_snap_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/camera_snap", xplmType_Int, 1,
+        ReadOptSnap, WriteOptSnap, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_opt_tone_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/negative_tone", xplmType_Int, 1,
+        ReadOptTone, WriteOptTone, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_opt_mute_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/monitor_mute", xplmType_Int, 1,
+        ReadOptMute, WriteOptMute, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_opt_voice_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/voice", xplmType_Int, 1,
+        ReadOptVoice, WriteOptVoice, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_opt_mode_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/mode", xplmType_Int, 1,
+        ReadOptMode, WriteOptMode, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_voice_list_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/voice_list", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadVoiceList, WriteVoiceList, nullptr, nullptr);
+    g_callout_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/callout", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteCallout, &g_callout, &g_callout);
+    g_radio_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/radio", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteRadio, &g_radio, &g_radio);
+    g_atc_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/atc", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteAtc, &g_atc, &g_atc);
+    g_coach_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/coach", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteCoach, &g_coach, &g_coach);
+    g_com1_dref = XPLMFindDataRef("sim/cockpit2/radios/actuators/com1_frequency_hz_833");
+    g_taxi_brake_dref = XPLMRegisterDataAccessor(
+        "xcopilot/taxi_brake", xplmType_Float, 1,
+        nullptr, nullptr, ReadTaxiBrake, WriteTaxiBrake, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_l_brake_ratio = XPLMFindDataRef("sim/cockpit2/controls/left_brake_ratio");
+    g_r_brake_ratio = XPLMFindDataRef("sim/cockpit2/controls/right_brake_ratio");
+    g_override_toe_brakes = XPLMFindDataRef("sim/operation/override/override_toe_brakes");
+    XPLMRegisterFlightLoopCallback(TaxiBrakeLoop, -1.0f, nullptr);
+}
+
+void stop_first() {
+    XPLMUnregisterFlightLoopCallback(TaxiBrakeLoop, nullptr);
+    // Leave no brake behind: if the loop was mid-apply, release the ratios
+    // and drop the override ourselves — nobody else will after the callback
+    // is gone.
+    if (g_taxi_brake_applied) {
+        if (g_l_brake_ratio) XPLMSetDataf(g_l_brake_ratio, 0.0f);
+        if (g_r_brake_ratio) XPLMSetDataf(g_r_brake_ratio, 0.0f);
+        if (g_override_toe_brakes) XPLMSetDatai(g_override_toe_brakes, 0);
+        g_taxi_brake_applied = false;
+    }
+    if (g_taxi_brake_dref) { XPLMUnregisterDataAccessor(g_taxi_brake_dref); g_taxi_brake_dref = nullptr; }
+    if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }
+    if (g_atc_dref) { XPLMUnregisterDataAccessor(g_atc_dref); g_atc_dref = nullptr; }
+    if (g_radio_dref) { XPLMUnregisterDataAccessor(g_radio_dref); g_radio_dref = nullptr; }
+    if (g_callout_dref) { XPLMUnregisterDataAccessor(g_callout_dref); g_callout_dref = nullptr; }
+}
+
+void stop_rest() {
+    if (g_voice_list_dref) { XPLMUnregisterDataAccessor(g_voice_list_dref); g_voice_list_dref = nullptr; }
+    if (g_opt_mode_dref) { XPLMUnregisterDataAccessor(g_opt_mode_dref); g_opt_mode_dref = nullptr; }
+    if (g_opt_voice_dref) { XPLMUnregisterDataAccessor(g_opt_voice_dref); g_opt_voice_dref = nullptr; }
+    if (g_opt_mute_dref) { XPLMUnregisterDataAccessor(g_opt_mute_dref); g_opt_mute_dref = nullptr; }
+    if (g_opt_tone_dref) { XPLMUnregisterDataAccessor(g_opt_tone_dref); g_opt_tone_dref = nullptr; }
+    if (g_opt_snap_dref) { XPLMUnregisterDataAccessor(g_opt_snap_dref); g_opt_snap_dref = nullptr; }
+    if (g_strip_dref) { XPLMUnregisterDataAccessor(g_strip_dref); g_strip_dref = nullptr; }
+    if (g_request_dref) { XPLMUnregisterDataAccessor(g_request_dref); g_request_dref = nullptr; }
+    if (g_llm_dref) { XPLMUnregisterDataAccessor(g_llm_dref); g_llm_dref = nullptr; }
+    fms::unregister_datarefs();
+    if (g_aircraft_dref) { XPLMUnregisterDataAccessor(g_aircraft_dref); g_aircraft_dref = nullptr; }
+    if (g_alert_dref) { XPLMUnregisterDataAccessor(g_alert_dref); g_alert_dref = nullptr; }
+    if (g_action_dref) { XPLMUnregisterDataAccessor(g_action_dref); g_action_dref = nullptr; }
+    if (g_heard_dref) { XPLMUnregisterDataAccessor(g_heard_dref); g_heard_dref = nullptr; }
+    if (g_phase_dref) { XPLMUnregisterDataAccessor(g_phase_dref); g_phase_dref = nullptr; }
+    if (g_ptt_dref) { XPLMUnregisterDataAccessor(g_ptt_dref); g_ptt_dref = nullptr; }
+    if (g_ptt_cmd) { XPLMUnregisterCommandHandler(g_ptt_cmd, PttCommandHandler, 1, nullptr); g_ptt_cmd = nullptr; }
+    if (g_radio_ptt_dref) { XPLMUnregisterDataAccessor(g_radio_ptt_dref); g_radio_ptt_dref = nullptr; }
+    if (g_radio_ptt_cmd) { XPLMUnregisterCommandHandler(g_radio_ptt_cmd, RadioPttCommandHandler, 1, nullptr); g_radio_ptt_cmd = nullptr; }
+}
+
+bool app_connected() {
+    // The app heartbeats the phase ~1/s; a stale timestamp = not running.
+    return (XPLMGetElapsedTime() - g_last_status_time) < 3.0f;
+}
+
+int phase() { return g_phase; }
+bool ptt_active() { return g_ptt_active != 0; }
+bool radio_ptt_active() { return g_radio_ptt_active != 0; }
+const TextRef& aircraft() { return g_aircraft; }
+const TextRef& strip() { return g_strip; }
+const TextRef& radio_row() { return g_radio; }
+const TextRef& coach() { return g_coach; }
+bool coach_urgent() { return g_coach_urgent; }
+char coach_group() { return g_coach_group; }
+const std::vector<AtcField>& atc_fields() { return g_atc_fields; }
+
+int com1_khz() { return g_com1_dref ? XPLMGetDatai(g_com1_dref) : 0; }
+void tune_com1(int khz) { if (g_com1_dref) XPLMSetDatai(g_com1_dref, khz); }
+
+int request() { return g_request; }
+void set_request(int v) { g_request = v; }
+
+int llm_enabled() { return g_llm_enabled; }
+void set_llm_enabled(int v) { g_llm_enabled = v; }
+int opt_camera_snap() { return g_opt_camera_snap; }
+void set_opt_camera_snap(int v) { g_opt_camera_snap = v; }
+int opt_negative_tone() { return g_opt_negative_tone; }
+void set_opt_negative_tone(int v) { g_opt_negative_tone = v; }
+int opt_monitor_mute() { return g_opt_monitor_mute; }
+void set_opt_monitor_mute(int v) { g_opt_monitor_mute = v; }
+int opt_mode() { return g_opt_mode; }
+void set_opt_mode(int v) { g_opt_mode = v; }
+int opt_voice() { return g_opt_voice; }
+void set_opt_voice(int v) { g_opt_voice = v; }
+const char* voice_list() { return g_voice_list.buf; }
+int voice_list_len() { return g_voice_list.len; }
+
+} // namespace drefs

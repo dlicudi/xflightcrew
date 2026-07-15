@@ -64,8 +64,11 @@ layer — not as a hook for a cloud option.
 **X-Plane access: REST + a native companion plugin.** The app talks to the sim
 over the Web API (separate process, same API Horizon polls) — every stock
 dataref read/write goes that way. But some things only a plugin can do, so a
-small C++ plugin ([plugin/src/xcopilot.cpp](plugin/src/xcopilot.cpp), Dear ImGui
-panel, `make install` from [plugin/](plugin/)) lives inside the sim and
+small C++ plugin ([plugin/src/](plugin/src/) — since the 2026-07-15 tidy-up,
+`xcopilot.cpp` is a thin lifecycle entry over `drefs.cpp` (dataref/command
+registration + accessors), `panel.cpp` (the Dear ImGui window and tabs), and
+`fms.cpp` (the FMS mailbox and flight-plan composer); `make install` from
+[plugin/](plugin/)) lives inside the sim and
 *extends the dataref surface* rather than replacing the REST channel: it
 registers `xcopilot/*` datarefs (PTT command + `ptt_active`/`radio_ptt_active`,
 panel state like phase/heard/action/coach/strip, and mailboxes like
