@@ -374,6 +374,44 @@ crew speaks exactly one line ("copilot is off") on the first intercom attempt.
 The atc crate itself never reads the mode — the world stays mode-blind and is
 simply not driven when off.
 
+Depth (added 2026-07-15): the "no crew in ATC-only" rule moved from scattered
+per-site gates into the arbiter itself — `Voice::alert` / `alert_stale_by` /
+`chime` (and the cabin paths) drop at the one enqueue door when
+`copilot_enabled()` is false, so no background watch can forget the gate (the
+void-transmission "No answer there" brief, the carry-forward brief, gyro sync,
+and the crew branches of the world watches all leaked before). Blocking `say`
+is NOT gated there: the main loop mode-routes it, and the one-line "copilot is
+off" note must speak. The gyro auto-sync ACTION (not just its line) also
+stands down: no crew, no hands on the panel. Tests that set the process-wide
+mode hold `mode::TEST_LOCK`.
+
+## Cabin crew: the second intercom persona (2026-07-15)
+
+Channels are physics, personas are tenants: the intercom now carries TWO
+voices — the copilot and the cabin crew ([src/cabin.rs](src/cabin.rs)), with
+no third PTT and no third audio channel. The address IS the routing ("cabin
+crew, prepare for landing" — an explicit "cabin crew"/"flight attendants"
+prefix always routes; bare "cabin" routes only with an unmistakable crew word,
+because cabin lights/pressure/the Lancair's cabin dump switch are copilot
+business). Calls are answered deterministically (keyword intents, "say again"
+over guessing — the tower's safety property), always preceded by the
+interphone chime, in their own voice (`XCOPILOT_CABIN_VOICE`, lazily loaded so
+crewless flights never pay for the model). The crew exists per-airframe
+(profile `cabin_crew: true` — the MD-82 only, so far); `XCOPILOT_CABIN_CREW`
+overrides to staff any airframe for testing (yes, a 172). Behavior: "prepare
+for departure/landing" is acknowledged then owes a delayed "cabin secure"
+report (spoken by the monitor's cabin watch — a SAFETY report, exempt from
+sterile cockpit); the seatbelt-sign watch (the annunciator dataref, so auto
+modes count) calls up only when the sign interrupts a running service AND
+above the sterile floor (10,000 ft AGL, `STERILE_FLOOR_AGL_FT`); climbing
+through the floor releases the crew to the service. Cabin speech rides the
+intercom queue, so it inherits crew discipline, PTT mic hygiene, and the
+ATC-only mode gate for free. On a crewless airframe an addressed call gets the
+copilot's honest "no cabin crew on this airframe", never an LLM improvising a
+flight attendant. Everything blackboxes as `"kind":"cabin"`. Parked: a
+physical mic-selector dataref (selector-beats-content precedence, same rule as
+the radio key), PA announcements, and folding the mode enum into a tenant set.
+
 ## Core design rule: curated tool surface, not raw dataref access
 
 **Never let the LLM write arbitrary datarefs.** Expose a small, explicit set of

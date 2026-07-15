@@ -276,6 +276,10 @@ struct Utterance {
     /// every voice arbitrated: they can never talk over each other, and the
     /// mic stays gated across all of them.
     station: Option<StationSpeaker>,
+    /// Speak as the CABIN CREW: the second intercom persona (interphone, not
+    /// radio — same channel and discipline as the copilot, different voice).
+    /// Meaningless when `station` is set.
+    cabin: bool,
     /// Speak by this instant or not at all: time-critical speech (taxi cues)
     /// is worse than silence once its moment has passed — a "next left"
     /// queued behind a party-line exchange spoke 17 s late at Malaga, 130 m
@@ -709,6 +713,20 @@ impl Voice {
         self.gate.set_speaking(false);
     }
 
+    /// Dismiss only the crew side: queued copilot/cabin lines are dropped and
+    /// current intercom playback is cut, while any radio transmission remains
+    /// owned by the station channel. Used when switching into ATC-only mode.
+    pub fn dismiss_crew(&self) {
+        {
+            let mut q = self.inner.queue.lock().unwrap();
+            for utt in q.heap.drain() {
+                fire_latch(utt.done);
+            }
+        }
+        crate::tts::stop_channel(crate::tts::Channel::Intercom);
+        set_channel_speaking(&self.inner, &self.gate, false, false);
+    }
+
     /// True if `heard` closely matches something the copilot said in the last few
     /// seconds — i.e. its own readback bleeding back through the speakers. The
     /// command loop drops such transcripts instead of acting on them.
@@ -728,7 +746,7 @@ impl Voice {
         // No em/en dashes reach the TTS — they trip it up. One chokepoint for
         // every spoken utterance (readbacks, monitor callouts, prompts).
         let text = crate::phrase::scrub_dashes(&text);
-        self.push(Utterance { priority, seq: 0, text, chime, negative: false, station: None, stale_by: None, done });
+        self.push(Utterance { priority, seq: 0, text, chime, negative: false, station: None, cabin: false, stale_by: None, done });
     }
 
     fn enqueue_station(
@@ -740,7 +758,7 @@ impl Voice {
     ) {
         let text = crate::phrase::scrub_dashes(&text);
         tracing::info!(transmitting = %text, "station");
-        self.push(Utterance { priority, seq: 0, text, chime: false, negative: false, station: Some(speaker), stale_by: None, done });
+        self.push(Utterance { priority, seq: 0, text, chime: false, negative: false, station: Some(speaker), cabin: false, stale_by: None, done });
     }
 
     /// Push a fully-formed utterance onto its channel's queue (stamping the
@@ -776,6 +794,7 @@ impl Voice {
             chime: false,
             negative: true,
             station: None,
+            cabin: false,
             stale_by: None,
             done: Some(latch.clone()),
         });
@@ -786,15 +805,28 @@ impl Voice {
     }
 
     /// Queue an utterance and return immediately (monitor alerts).
+    ///
+    /// No crew, no intercom: in ATC-only mode every fire-and-forget alert is
+    /// the copilot's voice (carry-forward briefs, gyro sync, the crew branch
+    /// of the world watches), and the copilot went home — dropped here, at
+    /// the one door they all walk through, so no watch can forget the gate.
+    /// Deliberate blocking replies (`say`) are NOT gated: the main loop
+    /// mode-routes those itself, and the "copilot is off" note must speak.
     #[allow(dead_code)] // used by the monitor (next milestone)
     pub fn alert(&self, priority: Priority, text: impl Into<String>) {
+        if !crate::mode::copilot_enabled() {
+            return;
+        }
         self.enqueue(priority, text.into(), None, false);
     }
 
     /// Queue a PERISHABLE utterance: speak it by `stale_by` or drop it at
     /// dequeue. For time-critical guidance (taxi cues) where late is worse
-    /// than never.
+    /// than never. Crew voice — gated like `alert`.
     pub fn alert_stale_by(&self, priority: Priority, text: impl Into<String>, stale_by: Instant) {
+        if !crate::mode::copilot_enabled() {
+            return;
+        }
         let text = crate::phrase::scrub_dashes(&text.into());
         self.push(Utterance {
             priority,
@@ -803,7 +835,61 @@ impl Voice {
             chime: false,
             negative: false,
             station: None,
+            cabin: false,
             stale_by: Some(stale_by),
+            done: None,
+        });
+    }
+
+    /// Queue a CABIN CREW utterance and block until spoken (interphone
+    /// replies to an addressed call — the loop must not listen over the
+    /// answer). Always chimed: on a real interphone the call tone comes
+    /// before the voice, and the chime is also what tells the pilot this
+    /// voice is from the back, not the right seat. Crew-side: gated like
+    /// `alert` (no crew in ATC-only, cabin included).
+    pub fn say_cabin(&self, priority: Priority, text: impl Into<String>) {
+        if !crate::mode::copilot_enabled() {
+            return;
+        }
+        let latch = Arc::new(Latch {
+            spoken: Mutex::new(false),
+            cv: Condvar::new(),
+        });
+        let text = crate::phrase::scrub_dashes(&text.into());
+        self.push(Utterance {
+            priority,
+            seq: 0,
+            text,
+            chime: true,
+            negative: false,
+            station: None,
+            cabin: true,
+            stale_by: None,
+            done: Some(latch.clone()),
+        });
+        let mut spoken = latch.spoken.lock().unwrap();
+        while !*spoken {
+            spoken = latch.cv.wait(spoken).unwrap();
+        }
+    }
+
+    /// Queue a CABIN CREW utterance and return immediately (the monitor's
+    /// cabin watches: owed secure reports, the seatbelt-sign call). Chimed
+    /// and gated like [`Voice::say_cabin`].
+    pub fn alert_cabin(&self, priority: Priority, text: impl Into<String>) {
+        if !crate::mode::copilot_enabled() {
+            return;
+        }
+        let text = crate::phrase::scrub_dashes(&text.into());
+        self.push(Utterance {
+            priority,
+            seq: 0,
+            text,
+            chime: true,
+            negative: false,
+            station: None,
+            cabin: true,
+            stale_by: None,
             done: None,
         });
     }
@@ -821,8 +907,12 @@ impl Voice {
     }
 
     /// Queue an utterance preceded by the attention chime, and return immediately.
-    /// Used by reminders: a short beep, then the heads-up.
+    /// Used by reminders: a short beep, then the heads-up. Crew voice — a
+    /// reminder set before the pilot flipped to ATC-only stays unspoken.
     pub fn chime(&self, priority: Priority, text: impl Into<String>) {
+        if !crate::mode::copilot_enabled() {
+            return;
+        }
         self.enqueue(priority, text.into(), None, true);
     }
 
@@ -1136,6 +1226,15 @@ fn log_tts_err(what: &str, e: anyhow::Error) {
 fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
     let chime_path = resolve_chime(&config.chime_path);
     let negative_path = resolve_negative(&config.negative_tone_path);
+    // The cabin crew's voice: same channel, different person. Built LAZILY on
+    // the first cabin utterance — most flights (and every airframe without a
+    // cabin_crew profile flag) never pay the model load.
+    let cabin_config = {
+        let mut c = config.clone();
+        c.piper_voice = c.cabin_piper_voice.clone();
+        c
+    };
+    let mut cabin_speaker: Option<Speaker> = None;
     let mut speaker = Speaker::build(config);
     loop {
         let mut q = inner.queue.lock().unwrap();
@@ -1210,8 +1309,13 @@ fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         // so a dead speaker deadlocks the whole app (seen live 2026-07-07: the
         // first station utterance panicked, the main loop hung unkillable, and
         // the backtrace sprayed over the raw-mode TUI).
+        let who: &mut Speaker = if utt.cabin {
+            cabin_speaker.get_or_insert_with(|| Speaker::build(cabin_config.clone()))
+        } else {
+            &mut speaker
+        };
         let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            speaker.speak(&utt.text)
+            who.speak(&utt.text)
         }))
         .unwrap_or_else(|panic| Err(anyhow::anyhow!("TTS panicked: {}", panic_text(panic))));
         if let Err(e) = spoke {
@@ -1398,7 +1502,7 @@ mod tests {
     use super::*;
 
     fn utt(priority: Priority, seq: u64) -> Utterance {
-        Utterance { priority, seq, text: String::new(), chime: false, negative: false, station: None, stale_by: None, done: None }
+        Utterance { priority, seq, text: String::new(), chime: false, negative: false, station: None, cabin: false, stale_by: None, done: None }
     }
 
     #[test]
@@ -1594,6 +1698,50 @@ mod tests {
         drop(q);
         let rq = voice.inner.radio_queue.lock().unwrap();
         assert!(rq.heap.iter().all(|u| u.station.is_some()));
+    }
+
+    #[test]
+    fn atc_only_drops_every_fire_and_forget_crew_line() {
+        // The 2026-07-15 leak: with the copilot flipped off, background
+        // alerts (world-watch crew branches, briefs, taxi cues, reminders)
+        // still spoke in the copilot's voice. The gate lives in the arbiter,
+        // at the one door they all use — nothing may reach the intercom
+        // queue or the echo memory in ATC-only.
+        let _guard = crate::mode::TEST_LOCK.lock().unwrap();
+        crate::mode::set(crate::mode::Mode::AtcOnly);
+        let voice = Voice::new(Config::default());
+        voice.alert(Priority::Warning, "traffic short final and we're on the runway");
+        voice.chime(Priority::Advisory, "reminder: carb heat");
+        voice.alert_stale_by(
+            Priority::Advisory,
+            "next left, onto Alpha",
+            Instant::now() + std::time::Duration::from_secs(8),
+        );
+        assert!(voice.inner.queue.lock().unwrap().heap.is_empty());
+        assert!(voice.inner.spoken.lock().unwrap().is_empty());
+        crate::mode::set(crate::mode::Mode::Both);
+    }
+
+    #[test]
+    fn dismiss_crew_drains_intercom_without_touching_radio() {
+        let _guard = crate::mode::TEST_LOCK.lock().unwrap();
+        crate::mode::set(crate::mode::Mode::Both);
+        let voice = Voice::new(Config::default());
+        voice.set_hold(true);
+        voice.alert(Priority::Advisory, "copilot line still queued");
+        voice.alert_cabin(Priority::Advisory, "cabin line still queued");
+        voice.alert_station(
+            Priority::Advisory,
+            StationSpeaker::Tower,
+            "station line still queued",
+        );
+
+        voice.dismiss_crew();
+
+        assert!(voice.inner.queue.lock().unwrap().heap.is_empty());
+        assert_eq!(voice.inner.radio_queue.lock().unwrap().heap.len(), 1);
+        voice.set_hold(false);
+        crate::mode::set(crate::mode::Mode::Both);
     }
 
     #[test]

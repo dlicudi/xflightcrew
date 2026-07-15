@@ -104,6 +104,13 @@ pub struct Config {
     pub piper_binary: String,
     /// Path to a piper voice model (`.onnx`); the matching `.onnx.json` must sit beside it.
     pub piper_voice: String,
+    /// The cabin crew's voice model — the second intercom persona, so it must
+    /// not be the pilot voice. `XCOPILOT_CABIN_VOICE`.
+    pub cabin_piper_voice: String,
+    /// Whether the cabin crew persona is aboard: `auto` (the aircraft
+    /// profile's `cabin_crew` flag decides — a 172 has none, an MD-82 does),
+    /// `true`/`false` to override for testing. `XCOPILOT_CABIN_CREW`.
+    pub cabin_crew: String,
     /// Path to X-Plane's `earth_nav.dat` (for ILS lookup).
     pub nav_data_path: String,
     /// Directory of per-airport CIFP procedure files (`<ICAO>.dat`, ARINC
@@ -256,6 +263,8 @@ impl Config {
                 .ok()
                 .or_else(crate::prefs::pilot_voice)
                 .unwrap_or_else(|| "models/en_US-amy-medium.onnx".into()),
+            cabin_piper_voice: env_or("XCOPILOT_CABIN_VOICE", "models/en_US-hfc_female-medium.onnx"),
+            cabin_crew: env_or("XCOPILOT_CABIN_CREW", "auto"),
             // Prefer Custom Data (Navigraph/updated AIRAC) when it exists — it's
             // what X-Plane itself flies on; the stock file goes stale the moment
             // a cycle is installed. Env override wins over both.

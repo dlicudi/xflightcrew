@@ -773,6 +773,8 @@ mod tests {
             ptt_key: String::new(),
             ptt_dataref: String::new(),
             plugin_status: false,
+            cabin_piper_voice: String::new(),
+            cabin_crew: "auto".into(),
             simbrief_id: String::new(),
             vad_threshold: 0.012,
             stt_min_confidence: 0.5,

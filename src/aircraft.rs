@@ -117,6 +117,11 @@ pub struct AircraftProfile {
     /// Parking brake (`set_parking_brake`).
     #[serde(default)]
     pub parking_brake: bool,
+    /// Cabin crew aboard (the interphone persona — see [`crate::cabin`]).
+    /// Airliner-class airframes only; `XCOPILOT_CABIN_CREW` overrides for
+    /// testing on anything.
+    #[serde(default)]
+    pub cabin_crew: bool,
     /// The `park_brake_valve` value that means SET on this airframe, where the
     /// valve is modeled. The sense is PER-AIRCRAFT (C90B: 0 = set, verified live;
     /// SR22: 1 = set — the opposite, seen as an "inverted" handle). `None` = don't
@@ -1131,6 +1136,7 @@ fn cessna_172sp() -> AircraftProfile {
         transponder: true,
         ils: true,
         parking_brake: true,
+        cabin_crew: false,
         park_brake_valve_set: None,
         electrical: {
             let e = |key: &str, spoken: &str, on: &[&str], off: &[&str], rb: &[&str]| ElectricalSystem {
@@ -1322,6 +1328,7 @@ fn cirrus_sr22() -> AircraftProfile {
         transponder: true,
         ils: true,
         parking_brake: true,
+        cabin_crew: false,
         park_brake_valve_set: None,
         pitot_heat: true,
         pitot_heat_dataref: None,

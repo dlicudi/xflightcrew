@@ -84,6 +84,12 @@ pub fn copilot_enabled() -> bool {
     get() != Mode::AtcOnly
 }
 
+/// Tests that SET the process-wide mode must hold this, or they stomp each
+/// other's assertions across modules (same discipline as the atc crate's
+/// SIDE_STATE_LOCK). Set the mode back to `Both` before releasing.
+#[cfg(test)]
+pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +109,7 @@ mod tests {
 
     #[test]
     fn enablement_follows_mode() {
+        let _guard = TEST_LOCK.lock().unwrap();
         set(Mode::AtcOnly);
         assert!(atc_enabled() && !copilot_enabled());
         set(Mode::CopilotOnly);

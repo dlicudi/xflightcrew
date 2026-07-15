@@ -33,6 +33,7 @@ transponder: true      # set_transponder (squawk)
 ils: true              # prepare_ils
 parking_brake: true    # set_parking_brake
 retractable_gear: true # gear up/down (with on-ground safety gate)
+cabin_crew: true       # interphone persona ("cabin crew, prepare for landing")
 
 # Jet — none of the piston systems apply.
 engine: false

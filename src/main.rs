@@ -11,6 +11,7 @@ mod aircraft;
 mod approach_guide;
 mod audio;
 mod autoland;
+mod cabin;
 mod debrief;
 mod radiofx;
 mod rag;
@@ -471,6 +472,12 @@ async fn main() -> Result<()> {
         });
     }
 
+    // The cabin crew's state, shared between the command loop (interphone
+    // replies to addressed calls) and the monitor (owed secure reports, the
+    // seatbelt-sign watch). Exists regardless of airframe; whether anyone is
+    // actually aboard is checked at the call sites (profile flag/env).
+    let cabin_state = std::sync::Arc::new(std::sync::Mutex::new(cabin::Cabin::new()));
+
     // Background monitor: watches for problems and speaks up. Its own thread +
     // runtime + X-Plane client, sharing the speech arbiter. Runs in both UIs.
     // Reads the live profile so its limits switch with the aircraft.
@@ -479,9 +486,10 @@ async fn main() -> Result<()> {
         let mon_config = config.clone();
         let mon_live = live_profile.clone();
         let mon_status = status_sink.clone();
+        let mon_cabin = cabin_state.clone();
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
-            rt.block_on(monitor::run(mon_config, mon_live, mon_voice, mon_status));
+            rt.block_on(monitor::run(mon_config, mon_live, mon_voice, mon_status, mon_cabin));
         });
     }
 
@@ -555,7 +563,7 @@ async fn main() -> Result<()> {
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
             if let Err(e) = rt.block_on(run_session(
-                config, stt, llm, live_profile, voice, continuous, explicit, ptt, reporter, Some(cmd_rx),
+                config, stt, llm, live_profile, voice, continuous, explicit, ptt, reporter, Some(cmd_rx), cabin_state,
             )) {
                 tracing::error!("voice loop ended: {e:#}");
             }
@@ -573,7 +581,7 @@ async fn main() -> Result<()> {
         // need a way in — same channel, same consumer.
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
         spawn_panel_request_poller(config.xplane_base_url.clone(), cmd_tx);
-        run_session(config, stt, llm, live_profile, voice, continuous, explicit, ptt, reporter, Some(cmd_rx)).await
+        run_session(config, stt, llm, live_profile, voice, continuous, explicit, ptt, reporter, Some(cmd_rx), cabin_state).await
     }
 }
 
@@ -952,6 +960,7 @@ async fn run_session(
     ptt: Option<Ptt>,
     reporter: Reporter,
     typed: Option<std::sync::mpsc::Receiver<String>>,
+    cabin_state: std::sync::Arc<std::sync::Mutex<cabin::Cabin>>,
 ) -> Result<()> {
     // Build the X-Plane client here, on whatever runtime this session runs on
     // (main for plain, the voice thread for TUI) — a reqwest client's I/O is
@@ -1214,8 +1223,9 @@ async fn run_session(
                 voice.alert(Priority::Advisory, "Copilot back with you.".to_string());
             } else if now_mode == mode::Mode::AtcOnly && applied_mode != mode::Mode::AtcOnly {
                 // Leaving the crew behind: cut any copilot speech and evict
-                // the model so the GPU goes back to the sim.
-                tts::stop_channel(tts::Channel::Intercom);
+                // queued crew lines too, then evict the model so the GPU goes
+                // back to the sim. Radio traffic stays on the air.
+                voice.dismiss_crew();
                 if config.llm_enabled {
                     let ev = llm.clone();
                     tokio::spawn(async move { ev.evict().await });
@@ -1459,7 +1469,7 @@ async fn run_session(
                     reporter.log(ui::LogKind::Info, "garbled transmission, nobody on frequency");
                     continue;
                 }
-                if explicit {
+                if explicit && mode::copilot_enabled() {
                     say(&voice, &reporter, ui::LogKind::Info,
                         readback::one_of(&["Say again?", "Didn't catch that.", "One more time?"]));
                 } else {
@@ -1507,6 +1517,13 @@ async fn run_session(
                 // Full briefing at most every few minutes; repeats get a short
                 // "no answer" (working down a list of foreign towers, the crew
                 // reciting the whole plan each call reads as butting in).
+                // In ATC-only mode there is no crew to butt in — dead air is
+                // the honest answer (the copilot's "No answer there" was the
+                // one voice still heard after flipping the crew off, 2026-07-15).
+                if !mode::copilot_enabled() {
+                    reporter.log(ui::LogKind::Info, "transmitted, nobody on this frequency");
+                    continue;
+                }
                 let line = if last_void_brief
                     .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(300))
                 {
@@ -1536,16 +1553,8 @@ async fn run_session(
         if !mode::copilot_enabled() {
             if let Some(st) = atc_station.as_mut() {
                 let tl = command.to_lowercase();
-                if !dual_ptt && voice.radio_powered() && !voice.crashed() && !voice.replay()
-                    && !voice.paused()
-                {
-                    if let Some((reply, who)) = st.try_handle(&tl, xplane.view()).await {
-                        reporter.status(ui::Phase::Speaking);
-                        reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
-                        voice.say_station(Priority::Readback, who, &reply);
-                        reporter.status(ui::Phase::Listening);
-                        continue;
-                    }
+                if try_route_content_atc(st, &tl, dual_ptt, &voice, &reporter, &xplane).await {
+                    continue;
                 }
             }
             // Not a radio call: one honest note the first time, silence
@@ -1626,7 +1635,14 @@ async fn run_session(
                 }
             }
         }
-        if !from_text && !looks_like_command(&command) && !looks_like_question(&command) {
+        if !from_text
+            && !looks_like_command(&command)
+            && !looks_like_question(&command)
+            // An addressed interphone call is in-domain by construction
+            // ("cabin crew, doors to manual" carries no cockpit keyword) —
+            // the cabin handler below answers it deterministically.
+            && cabin::Cabin::addressed(&command).is_none()
+        {
             // A conversational follow-up shortly after a command is let through
             // even without a keyword. Outside the window, the strict gate holds.
             let in_followup = history
@@ -1697,6 +1713,32 @@ async fn run_session(
             }
             let line = fuel_report(&xplane, &profile, Some(&live), is_endurance_query(&command)).await;
             say(&voice, &reporter, ui::LogKind::Readback, &line);
+            continue;
+        }
+        // Interphone: an utterance ADDRESSED to the cabin ("cabin crew,
+        // prepare for landing") is theirs, answered deterministically —
+        // cabin calls are rare and formulaic, so the LLM never sees them.
+        // The address is the routing (no third PTT; see crate::cabin). On an
+        // airframe with no cabin crew the copilot answers honestly instead
+        // of letting the model improvise a flight attendant.
+        if let Some(rest) = cabin::Cabin::addressed(&command) {
+            if cabin::enabled(&config.cabin_crew, profile.cabin_crew) {
+                let reply = cabin_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .handle(&rest, Instant::now());
+                blackbox::record(
+                    "cabin",
+                    serde_json::json!({ "route": "call", "call": &command, "reply": &reply }),
+                );
+                reporter.status(ui::Phase::Speaking);
+                reporter.log(ui::LogKind::Readback, format!("CAB: {reply}"));
+                voice.say_cabin(Priority::Readback, &reply);
+                reporter.status(ui::Phase::Listening);
+            } else {
+                say(&voice, &reporter, ui::LogKind::Readback,
+                    "No cabin crew on this airframe. It's just us up front.");
+            }
             continue;
         }
         // Ground navigation questions ("which way?", "say the taxi route")
@@ -1801,16 +1843,8 @@ async fn run_session(
             // wreckage — a dead panel can't transmit (fail open, like the
             // receive gate).
             if let Some(st) = atc_station.as_mut() {
-                if !dual_ptt && voice.radio_powered() && !voice.crashed() && !voice.replay()
-                    && !voice.paused()
-                {
-                    if let Some((reply, who)) = st.try_handle(&tl, xplane.view()).await {
-                        reporter.status(ui::Phase::Speaking);
-                        reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
-                        voice.say_station(Priority::Readback, who, &reply);
-                        reporter.status(ui::Phase::Listening);
-                        continue;
-                    }
+                if try_route_content_atc(st, &tl, dual_ptt, &voice, &reporter, &xplane).await {
+                    continue;
                 }
                 // Named-station tuning ("tune the tower", "contact approach") —
                 // a COPILOT action: resolve the name against the station's
@@ -5194,6 +5228,30 @@ fn install_home_station(config: &Config, voice: &voice::Voice) -> Option<station
             .ok();
     }
     Some(st)
+}
+
+/// Content-based ATC routing for setups without a dedicated radio PTT. Physical
+/// radio PTT is handled earlier; this is the one fallback door for keyboard PTT
+/// and continuous mode, shared by normal crew mode and ATC-only mode.
+async fn try_route_content_atc(
+    st: &mut station::Station,
+    tl: &str,
+    dual_ptt: bool,
+    voice: &Voice,
+    reporter: &Reporter,
+    xplane: &XPlaneClient,
+) -> bool {
+    if dual_ptt || !voice.radio_powered() || voice.crashed() || voice.replay() || voice.paused() {
+        return false;
+    }
+    let Some((reply, who)) = st.try_handle(tl, xplane.view()).await else {
+        return false;
+    };
+    reporter.status(ui::Phase::Speaking);
+    reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
+    voice.say_station(Priority::Readback, who, &reply);
+    reporter.status(ui::Phase::Listening);
+    true
 }
 
 /// The crew's comm note after a transmission into dead air. The active

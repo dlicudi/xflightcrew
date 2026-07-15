@@ -92,6 +92,10 @@ pub struct Snapshot {
     /// Elevator/stabilizer trim, -1 (full nose down) .. +1 (full nose up). Used to
     /// catch trim pinned at a limit (out of authority / possible runaway).
     pub elevator_trim: f64,
+    /// Seatbelt sign lit (`sim/cockpit2/annunciators/fasten_seatbelt` — the
+    /// annunciator, not the switch, so auto modes count). `None` = read
+    /// failed; the cabin watch invents no edge from a gap.
+    pub seatbelt_sign: Option<bool>,
     /// Pushback tug attached (`sim/aircraft/overflow/pushback_attached`).
     pub tug_attached: bool,
     /// Pushback/tow actively underway (`sim/flightmodel2/misc/tow_in_progress`).
@@ -228,6 +232,13 @@ impl Snapshot {
             ),
             None => (None, None, None),
         };
+        // Best-effort (a missing read must not kill the snapshot): the
+        // seatbelt sign, for the cabin crew's watch.
+        let seatbelt_sign = xp
+            .get_float("sim/cockpit2/annunciators/fasten_seatbelt")
+            .await
+            .ok()
+            .map(|v| v > 0.5);
         // Best-effort (a missing read must not kill the snapshot): pushback state.
         let tug_attached =
             xp.get_float("sim/aircraft/overflow/pushback_attached").await.unwrap_or(0.0) > 0.5;
@@ -355,6 +366,7 @@ impl Snapshot {
             agl_ft,
             vsi_fpm,
             elevator_trim,
+            seatbelt_sign,
             tug_attached,
             pushing_back,
             engine_running,
@@ -1403,7 +1415,13 @@ fn compose_strip(s: &Snapshot) -> String {
     parts.join(" | ")
 }
 
-pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice: Voice, status: Option<StatusSink>) {
+pub async fn run(
+    config: Config,
+    live: std::sync::Arc<crate::LiveProfile>,
+    voice: Voice,
+    status: Option<StatusSink>,
+    cabin: std::sync::Arc<std::sync::Mutex<crate::cabin::Cabin>>,
+) {
     // Checks are built from the active profile and rebuilt when the aircraft
     // switches (the generation counter changes), so a jet doesn't keep a 172's
     // stall/overspeed limits after a profile swap.
@@ -1414,6 +1432,9 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
     let mut checks = build_checks(&live.get());
     let mut drefs = advisor_drefs(&live.get());
     let mut avionics_readback = avionics_readback_dref(&live.get());
+    // Cabin crew aboard this airframe? Profile capability with the env
+    // override; recomputed on aircraft switch like everything profile-derived.
+    let mut cabin_aboard = crate::cabin::enabled(&config.cabin_crew, live.get().cabin_crew);
     tracing::info!(checks = checks.len(), hz = config.monitor_hz, "monitor started");
     // Stamp the record with the airframe so the distiller can key memory by it.
     crate::blackbox::record("flight_meta", serde_json::json!({ "aircraft": live.get().id }));
@@ -1489,6 +1510,7 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
             checks = build_checks(&live.get());
             drefs = advisor_drefs(&live.get());
             avionics_readback = avionics_readback_dref(&live.get());
+            cabin_aboard = crate::cabin::enabled(&config.cabin_crew, live.get().cabin_crew);
             states = checks.iter().map(|c| (c.id(), FireState::new())).collect();
             tracing::info!(checks = checks.len(), "monitor: reconfigured for new aircraft");
             crate::blackbox::record("flight_meta", serde_json::json!({ "aircraft": live.get().id }));
@@ -1761,7 +1783,10 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                 // "glass" airframes too (the SR22 flew 166° off while the
                 // profile swore there was nothing to sync, 2026-07-12) — and
                 // a true glass panel reads ~0 here, so it never fires there.
-                if !snap.on_ground
+                // Crew-gated: this is the copilot's HAND on the panel, not
+                // just its voice — in ATC-only nobody re-aligns your DG.
+                if crew_on
+                    && !snap.on_ground
                     && snap.gyro_drift_deg.abs() >= GYRO_DRIFT_ADVISORY_DEG
                     && gyro_sync_last.is_none_or(|t| now.duration_since(t).as_secs() >= 120)
                 {
@@ -2011,6 +2036,31 @@ pub async fn run(config: Config, live: std::sync::Arc<crate::LiveProfile>, voice
                         }
                     } else {
                         taxi_guide = None;
+                    }
+                }
+                // Cabin crew watches (crew-side, airframes with a cabin crew
+                // only): the owed "cabin secure" report after an acknowledged
+                // prepare call, and the seatbelt-sign interphone call. The
+                // sterile-cockpit rule lives in the cabin module — safety
+                // reports come through, flavor stays above 10,000 ft.
+                if crew_on && cabin_aboard {
+                    let (belt_line, tick_line) = {
+                        let mut cab = cabin.lock().unwrap_or_else(|e| e.into_inner());
+                        (
+                            snap.seatbelt_sign
+                                .and_then(|on| cab.seatbelt(on, snap.agl_ft)),
+                            cab.tick(now, snap.agl_ft, snap.on_ground),
+                        )
+                    };
+                    for line in [belt_line, tick_line].into_iter().flatten() {
+                        if let Some(s) = status.as_ref() {
+                            s.action(&format!("CAB: {line}"));
+                        }
+                        crate::blackbox::record(
+                            "cabin",
+                            serde_json::json!({ "route": "watch", "line": &line }),
+                        );
+                        voice.alert_cabin(Priority::Advisory, line);
                     }
                 }
                 // Live-traffic watches off one TCAS target read: the
@@ -2695,6 +2745,7 @@ mod tests {
             agl_ft: 0.0,
             vsi_fpm: 0.0,
             elevator_trim: 0.0,
+            seatbelt_sign: None,
             tug_attached: false,
             pushing_back: false,
             engine_running,
