@@ -275,7 +275,9 @@ pub(crate) const LINE_UP_MAX_LATERAL_M: f64 = 150.0;
 const LINE_UP_MIN_REMAINING_M: f64 = 400.0;
 /// The drive continues this far down the centreline past the entry point,
 /// so the nose is pointing down the runway when it stops, not across it.
-const LINE_UP_ALIGN_M: f64 = 60.0;
+/// The arrival check is distance-based, so this leg is what buys the
+/// alignment — 60 m left the nose 11 degrees off at the stop (2026-07-20).
+const LINE_UP_ALIGN_M: f64 = 80.0;
 
 /// The synthetic route of a line-up: from where the aircraft sits, onto the
 /// centreline ahead, and down it far enough to finish aligned. `None` when

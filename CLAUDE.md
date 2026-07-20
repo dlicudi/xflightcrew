@@ -437,7 +437,16 @@ P-factor demands (pure P settled at a standing 18° error, then the old
 authority taper starved it to 0.21 of deflection and the aircraft ran 86 m
 off the centreline and rotated from the grass 39° off heading; the trim
 holds rudder with the nose straight, authority floor 0.65, cap 0.85,
-slew-limited). Rotation additionally waits for a roughly straight nose
+slew-limited). Sortie three flipped the low-speed picture: under takeoff
+power PROP WASH makes the tail hyper-effective at a standstill — a 0.85
+command at brake release (fixing the 14° the line-up left) spot-turned
+the aircraft at 25 deg/s into a runway pirouette — so the deflection cap
+is now tiny parked (0.12) growing to full by 15 kt, the trim integrator
+is frozen below 10 kt, the stagnation reject watches GROUNDSPEED (the
+172's ASI reads zero below ~20 kt and the reject fired against a dead
+instrument), and the line-up's alignment leg grew to 80 m (its arrival
+is distance-based; 60 m stopped 11° off). Rotation additionally waits
+for a roughly straight nose
 (`rotate_ok`, unless the runway is running out), and the airborne latch
 needs 8 ft AGL so a ground-effect bounce can't stop the steering at speed.
 Related trap fixed the same day: `looks_like_command` (the continuous-mode

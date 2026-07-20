@@ -75,8 +75,11 @@ const REJECT_REMAINING_M: f64 = 250.0;
 /// No meaningful acceleration this long after brakes-off is a reject —
 /// something is holding the aircraft (brakes, mixture, a dead engine).
 /// Long enough that the throttle ramp isn't counted against the roll.
+/// GROUNDSPEED, not IAS: the 172's airspeed indicator reads zero until
+/// ~20 knots, and sortie three's reject fired against an instrument that
+/// hadn't started reading yet.
 const STAGNANT_SECS: f64 = 12.0;
-const STAGNANT_IAS_KTS: f64 = 15.0;
+const STAGNANT_GS_KTS: f64 = 18.0;
 /// Full P deflection at this much heading error on the roll — much tighter
 /// than the taxi law's 30°: at roll speeds a runway is held with degrees.
 const ROLL_FULL_DEG: f64 = 12.0;
@@ -102,6 +105,20 @@ const STEER_TRIM_MAX: f64 = 0.4;
 /// Speed-authority floor. The old 0.3 floor times the 0.7 cap left 0.21 of
 /// deflection at rotate speed — not even close to holding P-factor.
 const STEER_AUTH_FLOOR: f64 = 0.65;
+/// Deflection cap at a standstill, ramping to [`MAX_ROLL_STEER`] by
+/// [`LOW_SPEED_FULL_KTS`]. Under takeoff power the prop wash makes the
+/// rudder and nosewheel HYPER-effective at low speed — the third sortie
+/// commanded 0.85 at brake release to fix a 14 degree error and the
+/// aircraft spot-turned 70 degrees through the target at 25 deg/s,
+/// pirouetting on the runway until the stagnation guard rejected. Small
+/// corrections parked; the full cap arrives with the roll.
+const LOW_SPEED_STEER_CAP: f64 = 0.12;
+const LOW_SPEED_FULL_KTS: f64 = 15.0;
+/// The trim integrator only learns above this groundspeed: it exists for
+/// the P-factor moment on the ROLL, and letting it wind up during a
+/// low-speed swing doubles every overshoot (sortie three hit its cap in
+/// both directions inside the pirouette).
+const TRIM_MIN_GS_KTS: f64 = 10.0;
 /// Throttle advances to full over this long — slamming it at a standstill
 /// is the maximum yaw moment at the exact moment steering authority is
 /// highest and airflow over the rudder is zero.
@@ -224,13 +241,23 @@ impl RollSteer {
         self.prev_err = Some(err_deg);
         let auth = 1.0 - (1.0 - STEER_AUTH_FLOOR) * ((gs_kts - 15.0) / 35.0).clamp(0.0, 1.0);
         let pd = ((err_deg + STEER_LEAD_S * rate) / ROLL_FULL_DEG).clamp(-1.0, 1.0) * auth;
-        let want = (pd + self.trim).clamp(-MAX_ROLL_STEER, MAX_ROLL_STEER);
-        // The trim integrates unconditionally: its own small cap bounds any
-        // wind-up (a gated version never learned at all — a saturated
-        // command with a persisting error is exactly when the standing
-        // rudder must build, so that P can relax as the nose comes straight).
-        self.trim =
-            (self.trim + err_deg * dt * STEER_TRIM_RATE).clamp(-STEER_TRIM_MAX, STEER_TRIM_MAX);
+        // Prop wash makes the tail HYPER-effective under power at low
+        // speed: the cap is tiny parked and grows with the roll, so an
+        // engage-time misalignment is walked out over the first hundred
+        // meters instead of spot-turned through (the sortie-three pirouette).
+        let cap = LOW_SPEED_STEER_CAP
+            + (MAX_ROLL_STEER - LOW_SPEED_STEER_CAP)
+                * (gs_kts / LOW_SPEED_FULL_KTS).clamp(0.0, 1.0);
+        let want = (pd + self.trim).clamp(-cap, cap);
+        // The trim integrates unconditionally ON THE ROLL — its own small
+        // cap bounds wind-up, and a saturated command with a persisting
+        // error is exactly when the standing rudder must build. Below
+        // taxi pace it stays frozen: it exists for P-factor at speed, not
+        // for doubling every low-speed overshoot.
+        if gs_kts > TRIM_MIN_GS_KTS {
+            self.trim = (self.trim + err_deg * dt * STEER_TRIM_RATE)
+                .clamp(-STEER_TRIM_MAX, STEER_TRIM_MAX);
+        }
         self.out = slew(self.out, want, STEER_SLEW_PER_TICK);
         self.out
     }
@@ -484,7 +511,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
 
         if !airborne {
             // Not accelerating: something is holding the aircraft.
-            if elapsed > STAGNANT_SECS && ias < STAGNANT_IAS_KTS {
+            if elapsed > STAGNANT_SECS && gs_kts < STAGNANT_GS_KTS {
                 reject(&xp, &voice, "We're not accelerating. Rejecting takeoff. Your aircraft.", "stagnant")
                     .await;
                 return;
@@ -712,6 +739,29 @@ mod tests {
         let s = (0..3).map(|_| slow.step(10.0, 0.15, 10.0)).last().unwrap();
         let f = (0..3).map(|_| fast.step(10.0, 0.15, 50.0)).last().unwrap();
         assert!(f >= s * STEER_AUTH_FLOOR - 1e-9, "floor holds: {f} vs {s}");
+    }
+
+    #[test]
+    fn parked_under_power_the_wheel_barely_moves() {
+        // Sortie three: 0.85 of deflection at brake release spot-turned
+        // the aircraft at 25 deg/s (prop wash makes the tail hyper-
+        // effective under power at low speed). At a standstill even a
+        // huge error commands only the low-speed cap, and the trim stays
+        // frozen so the swing can't wind it up.
+        let mut law = RollSteer::default();
+        let mut out = 0.0;
+        for _ in 0..10 {
+            out = law.step(-60.0, 0.15, 0.0);
+        }
+        assert!(out.abs() <= LOW_SPEED_STEER_CAP + 1e-9, "{out}");
+        assert_eq!(law.trim(), 0.0, "no trim learning parked");
+        // The cap grows with the roll: by 15 knots the full range is back.
+        let mut rolling = RollSteer::default();
+        let mut r = 0.0;
+        for _ in 0..10 {
+            r = rolling.step(-60.0, 0.15, 20.0);
+        }
+        assert!(r.abs() > 0.5, "full authority once rolling, got {r}");
     }
 
     #[test]
