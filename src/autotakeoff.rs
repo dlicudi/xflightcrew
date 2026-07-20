@@ -119,6 +119,15 @@ const LOW_SPEED_FULL_KTS: f64 = 15.0;
 /// low-speed swing doubles every overshoot (sortie three hit its cap in
 /// both directions inside the pirouette).
 const TRIM_MIN_GS_KTS: f64 = 10.0;
+/// Power feed-forward: right rudder led IN WITH the throttle, the way a
+/// pilot's foot moves with the hand — the yaw moment is proportional to
+/// power, so the compensation rides the ramp instead of waiting for an
+/// error to react to. Fades partially with speed (the moment weakens as
+/// airflow straightens); the trim integrator learns the residual.
+/// Sign assumes a clockwise prop (yaw left, lead right) — every current
+/// profile; a counter-clockwise airframe will need this in the profile.
+const POWER_LEAD_MAX: f64 = 0.25;
+const POWER_LEAD_FADE_KTS: f64 = 40.0;
 /// Throttle advances to full over this long — slamming it at a standstill
 /// is the maximum yaw moment at the exact moment steering authority is
 /// highest and airflow over the rudder is zero.
@@ -232,10 +241,17 @@ pub struct RollSteer {
     out: f64,
 }
 
+/// The rudder led in WITH the power: proportional to the throttle
+/// actually commanded, fading partially as airflow builds.
+pub fn power_lead(thr: f64, gs_kts: f64) -> f64 {
+    POWER_LEAD_MAX * thr * (1.0 - 0.6 * (gs_kts / POWER_LEAD_FADE_KTS).clamp(0.0, 1.0))
+}
+
 impl RollSteer {
     /// One control tick: heading error (deg, right positive), the time
-    /// since the last tick, and groundspeed. Returns the deflection.
-    pub fn step(&mut self, err_deg: f64, dt_s: f64, gs_kts: f64) -> f64 {
+    /// since the last tick, groundspeed, and the throttle being
+    /// commanded (for the power feed-forward). Returns the deflection.
+    pub fn step(&mut self, err_deg: f64, dt_s: f64, gs_kts: f64, thr: f64) -> f64 {
         let dt = dt_s.clamp(0.05, 1.0);
         let rate = self.prev_err.map_or(0.0, |p| (err_deg - p) / dt);
         self.prev_err = Some(err_deg);
@@ -248,7 +264,7 @@ impl RollSteer {
         let cap = LOW_SPEED_STEER_CAP
             + (MAX_ROLL_STEER - LOW_SPEED_STEER_CAP)
                 * (gs_kts / LOW_SPEED_FULL_KTS).clamp(0.0, 1.0);
-        let want = (pd + self.trim).clamp(-cap, cap);
+        let want = (pd + self.trim + power_lead(thr, gs_kts)).clamp(-cap, cap);
         // The trim integrates unconditionally ON THE ROLL — its own small
         // cap bounds wind-up, and a saturated command with a persisting
         // error is exactly when the standing rudder must build. Below
@@ -280,6 +296,27 @@ pub fn rotate_ok(err_deg: f64, remaining_m: f64) -> bool {
 /// roll starts, the yaw stays small), full power over the ramp.
 pub fn throttle_ramp(elapsed_s: f64) -> f64 {
     (0.3 + 0.7 * (elapsed_s / THROTTLE_RAMP_S)).clamp(0.3, 1.0)
+}
+
+/// Nose this far off at low speed holds the power back — full power on a
+/// swinging nose is the maximum P-factor kick at the worst moment (the
+/// time-only ramp reached 100% while sortie three was still pirouetting
+/// nearly stationary). The hold releases with the nose straight, and it
+/// only applies below [`THROTTLE_HOLD_MAX_GS_KTS`]: chopping power over a
+/// gust-yaw at 40 knots mid-roll would be its own emergency.
+const THROTTLE_HOLD_ERR_DEG: f64 = 10.0;
+const THROTTLE_HOLD_RATIO: f64 = 0.5;
+const THROTTLE_HOLD_MAX_GS_KTS: f64 = 20.0;
+
+/// The commanded throttle this tick: the time ramp, held at half power
+/// while the nose is still swinging at low speed.
+pub fn throttle_cmd(elapsed_s: f64, err_deg: f64, gs_kts: f64) -> f64 {
+    let ramp = throttle_ramp(elapsed_s);
+    if gs_kts < THROTTLE_HOLD_MAX_GS_KTS && err_deg.abs() > THROTTLE_HOLD_ERR_DEG {
+        ramp.min(THROTTLE_HOLD_RATIO)
+    } else {
+        ramp
+    }
 }
 
 /// The commanded climb rate: the profile's best rate, backed off while the
@@ -430,6 +467,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut thr_challenged = false;
     let mut last_vs_cmd: Option<f64> = None;
     let mut last_thr_cmd = 0.3_f64;
+    // The roll section's heading error, one tick stale, for the throttle's
+    // swinging-nose hold (throttle is commanded before position is read).
+    let mut last_err = 0.0_f64;
     let mut steer_law = RollSteer::default();
     let mut last_tick: Option<std::time::Instant> = None;
     let roll_start = std::time::Instant::now();
@@ -487,13 +527,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             return;
         }
 
-        // Throttle: ramped to full (a slammed lever at a standstill is the
-        // maximum yaw kick at maximum steering authority), with the pilot's
+        // Throttle: ramped to full, held at half power while the nose is
+        // still swinging at low speed (full power on a swinging nose is
+        // the maximum yaw kick at the worst moment), with the pilot's
         // hand honored. A read well below the last COMMAND is challenged
         // ONCE (a hardware axis the sim re-drives jitters; a hand keeps
         // winning), then it's a pilot reject — hands off everything.
         let elapsed = roll_start.elapsed().as_secs_f64() - frozen_secs;
-        let thr_cmd = if airborne { 1.0 } else { throttle_ramp(elapsed) };
+        let thr_cmd = if airborne { 1.0 } else { throttle_cmd(elapsed, last_err, gs_kts) };
         let thr_now = xp.get_float(THROTTLE_ALL).await.unwrap_or(thr_cmd);
         if thr_now < last_thr_cmd - 0.25 && elapsed > 2.0 {
             if thr_challenged {
@@ -531,7 +572,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let now_t = std::time::Instant::now();
             let dt = last_tick.map_or(0.15, |t| (now_t - t).as_secs_f64());
             last_tick = Some(now_t);
-            let steer = steer_law.step(err, dt, gs_kts);
+            last_err = err;
+            let steer = steer_law.step(err, dt, gs_kts, thr_cmd);
             if xp.set_float(TAXI_STEER, steer).await.is_err() {
                 reject(&xp, &voice, "I've lost the steering. Rejecting takeoff. Your aircraft.", "steer_lost")
                     .await;
@@ -699,16 +741,16 @@ mod tests {
         // though P alone has plateaued — the rudder that finally straightens
         // the nose.
         let mut law = RollSteer::default();
-        let first = law.step(18.0, 0.15, 25.0);
+        let first = law.step(18.0, 0.15, 25.0, 0.0);
         let mut last = first;
         for _ in 0..40 {
-            last = law.step(18.0, 0.15, 25.0);
+            last = law.step(18.0, 0.15, 25.0, 0.0);
         }
         assert!(last > first, "trim accumulates: {first} -> {last}");
         assert!(law.trim() > 0.2, "learned standing rudder, got {}", law.trim());
         // And with the error finally at zero the trim STILL holds rudder —
         // the whole point: straight nose, rudder in.
-        let centered = law.step(0.0, 0.15, 40.0);
+        let centered = law.step(0.0, 0.15, 40.0, 0.0);
         assert!(centered > 0.15, "rudder held with the nose straight: {centered}");
     }
 
@@ -718,26 +760,26 @@ mod tests {
         // A swing home (error collapsing fast) commands LESS than the same
         // error steady — the lead term kills the counter-steer oscillation.
         let mut steady = RollSteer::default();
-        steady.step(12.0, 0.15, 20.0);
-        let steady_out = steady.step(12.0, 0.15, 20.0);
-        law.step(20.0, 0.15, 20.0);
-        let collapsing = law.step(12.0, 0.15, 20.0);
+        steady.step(12.0, 0.15, 20.0, 0.0);
+        let steady_out = steady.step(12.0, 0.15, 20.0, 0.0);
+        law.step(20.0, 0.15, 20.0, 0.0);
+        let collapsing = law.step(12.0, 0.15, 20.0, 0.0);
         assert!(collapsing < steady_out, "{collapsing} vs {steady_out}");
         // From rest, a huge demanded deflection arrives in slew steps.
         let mut fresh = RollSteer::default();
-        assert!(fresh.step(90.0, 0.15, 5.0).abs() <= STEER_SLEW_PER_TICK + 1e-9);
+        assert!(fresh.step(90.0, 0.15, 5.0, 0.0).abs() <= STEER_SLEW_PER_TICK + 1e-9);
         // Output is always inside the cap.
         let mut sat = RollSteer::default();
         for _ in 0..30 {
-            assert!(sat.step(90.0, 0.15, 5.0).abs() <= MAX_ROLL_STEER + 1e-9);
+            assert!(sat.step(90.0, 0.15, 5.0, 0.0).abs() <= MAX_ROLL_STEER + 1e-9);
         }
         // Authority at speed keeps a real floor: the same error at 50 kt
         // still commands most of what it does at 15 kt (the 0.21 starvation
         // was the second sortie's runway excursion).
         let mut slow = RollSteer::default();
         let mut fast = RollSteer::default();
-        let s = (0..3).map(|_| slow.step(10.0, 0.15, 10.0)).last().unwrap();
-        let f = (0..3).map(|_| fast.step(10.0, 0.15, 50.0)).last().unwrap();
+        let s = (0..3).map(|_| slow.step(10.0, 0.15, 10.0, 0.0)).last().unwrap();
+        let f = (0..3).map(|_| fast.step(10.0, 0.15, 50.0, 0.0)).last().unwrap();
         assert!(f >= s * STEER_AUTH_FLOOR - 1e-9, "floor holds: {f} vs {s}");
     }
 
@@ -751,7 +793,7 @@ mod tests {
         let mut law = RollSteer::default();
         let mut out = 0.0;
         for _ in 0..10 {
-            out = law.step(-60.0, 0.15, 0.0);
+            out = law.step(-60.0, 0.15, 0.0, 0.0);
         }
         assert!(out.abs() <= LOW_SPEED_STEER_CAP + 1e-9, "{out}");
         assert_eq!(law.trim(), 0.0, "no trim learning parked");
@@ -759,9 +801,32 @@ mod tests {
         let mut rolling = RollSteer::default();
         let mut r = 0.0;
         for _ in 0..10 {
-            r = rolling.step(-60.0, 0.15, 20.0);
+            r = rolling.step(-60.0, 0.15, 20.0, 0.0);
         }
         assert!(r.abs() > 0.5, "full authority once rolling, got {r}");
+    }
+
+    #[test]
+    fn rudder_leads_in_with_the_power_and_throttle_waits_for_a_straight_nose() {
+        // Zero error, power coming up: the foot moves with the hand — the
+        // law holds right rudder proportional to throttle, no error needed.
+        let mut law = RollSteer::default();
+        let with_power = (0..5).map(|_| law.step(0.0, 0.15, 5.0, 1.0)).last().unwrap();
+        assert!(with_power > 0.1, "lead rides the throttle, got {with_power}");
+        let mut idle = RollSteer::default();
+        let no_power = (0..5).map(|_| idle.step(0.0, 0.15, 5.0, 0.0)).last().unwrap();
+        assert!(no_power.abs() < 0.01, "no power, no lead: {no_power}");
+        // The lead fades as airflow straightens the moment out.
+        assert!(power_lead(1.0, 40.0) < power_lead(1.0, 0.0));
+        assert!(power_lead(1.0, 40.0) > 0.05, "never fades to nothing on the roll");
+        // Throttle: swinging nose at low speed holds half power...
+        assert_eq!(throttle_cmd(10.0, 14.0, 8.0), THROTTLE_HOLD_RATIO);
+        // ...straight nose rides the ramp to full...
+        assert_eq!(throttle_cmd(10.0, 2.0, 8.0), 1.0);
+        // ...and at speed a gust yaw never chops the power.
+        assert_eq!(throttle_cmd(10.0, 14.0, 40.0), 1.0);
+        // The ramp itself still applies early with the nose straight.
+        assert!(throttle_cmd(0.0, 0.0, 0.0) < 0.4);
     }
 
     #[test]

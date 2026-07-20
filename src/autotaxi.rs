@@ -235,6 +235,15 @@ pub fn steer_authority(gs_kts: f64) -> f64 {
     0.35 + 0.65 * (gs_kts / 3.0).clamp(0.0, 1.0)
 }
 
+/// Straighten the nosewheel as a stop closes: braking shifts weight onto
+/// the nosewheel, and a deflected one carves under it — every stop at a
+/// bendy route end turned into a swerve-and-lurch ("when you brake, the
+/// aircraft steers", 2026-07-20). Full steering beyond 8 m to go, faded
+/// to none across the last meters; the aircraft stops straight.
+pub fn stop_straighten(steer: f64, remaining_m: f64) -> f64 {
+    steer * ((remaining_m - 1.0) / 7.0).clamp(0.0, 1.0)
+}
+
 /// The lateral allowance for an engage at `lateral` meters off the route
 /// with `err_deg` of heading error: zero for an on-route, along-route start
 /// (the tight established guard applies from the first tick), otherwise the
@@ -548,8 +557,13 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // Steering: aim at the route ahead, command the error down, with
         // the lock tapered by groundspeed so a standstill can break away.
         // From a backwards or off-route start this is the whole join —
-        // the deflection tightens as the roll builds.
-        let steer = steer_cmd(err) * steer_authority(gs_kts);
+        // the deflection tightens as the roll builds. Approaching the stop
+        // (route end, or a spoken "stop" bleeding speed off) the wheel
+        // straightens so the brakes never bite onto a deflected nosewheel.
+        let mut steer = stop_straighten(steer_cmd(err) * steer_authority(gs_kts), remaining);
+        if ext_stopped {
+            steer *= (gs_kts / 3.0).clamp(0.0, 1.0);
+        }
         if xp.set_float(TAXI_STEER, steer).await.is_err() {
             // The channel vanished (plugin reload): no steering, no drive.
             tracing::warn!("auto taxi: steer channel lost, stopping");
@@ -749,6 +763,17 @@ mod tests {
         // Aligned rejoins ride at bend speed, not the sharp crawl.
         assert_eq!(join_cap_kts(20.0), TURN_KTS);
         assert_eq!(join_cap_kts(-170.0), SHARP_KTS);
+    }
+
+    #[test]
+    fn the_wheel_straightens_into_the_stop() {
+        // Well out: steering untouched. Closing on the stop: faded. At the
+        // stop line: straight, so the brakes never bite a deflected wheel.
+        assert_eq!(stop_straighten(0.8, 50.0), 0.8);
+        let close = stop_straighten(0.8, 4.0);
+        assert!(close > 0.0 && close < 0.5, "{close}");
+        assert_eq!(stop_straighten(0.8, 1.0), 0.0);
+        assert_eq!(stop_straighten(-0.8, 0.5), 0.0, "both directions");
     }
 
     #[test]

@@ -240,6 +240,17 @@ pub fn taxi_control(
     }
 }
 
+/// Smooth the proportional brake toward the law's demand: pedals SQUEEZE
+/// on, they don't stab ("braking is TOO jerky", 2026-07-20 — every full
+/// stop was the binary brake key at regular effort in one frame, and trim
+/// steps hit the channel raw). Asymmetric on purpose: releasing quickly is
+/// not a jerk, applying quickly is.
+pub fn brake_slew(prev: f64, want: f64, dt_s: f64) -> f64 {
+    let dt = dt_s.clamp(0.02, 1.0);
+    let step = if want > prev { 0.5 * dt } else { 1.5 * dt };
+    prev + (want - prev).clamp(-step, step)
+}
+
 pub struct HoldSpeed {
     /// The profile's final-approach speed, for "hold approach speed".
     pub approach_kts: Option<f64>,
@@ -458,6 +469,9 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
     // The proportional channel failed once (plugin absent or old): warned,
     // trims fall back to the held command for the rest of this governor.
     let mut trim_fallback = false;
+    // The slewed brake actually written (the squeeze), and its clock.
+    let mut brake_out = 0.0_f64;
+    let mut last_brake_t: Option<std::time::Instant> = None;
     // Brake-paused: the pilot pressed both pedals mid-taxi, the throttle went
     // to idle, and the hold is waiting for the pedals to come fully off.
     let mut paused = false;
@@ -680,19 +694,26 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                         glide(&xp, THROTTLE, t, 200).await;
                         last_cmd = Some(t);
                     }
-                    // Two brake channels, by intent. A STOP (target zero) is
-                    // the held INPUT command renewed every tick — the pilot's
-                    // own brake key, regular effort, which demonstrably
-                    // stops. A speed TRIM is feathered: the law's magnitude
-                    // through the plugin's proportional channel, so shaving
-                    // two knots doesn't get the same stab as a full stop.
-                    // Never silent on failure: a swallowed brake error hid
-                    // the broken override for days of flights.
-                    if brake > 0.0 {
-                        let mut trimmed = false;
-                        if target >= 1.0 && !trim_fallback {
-                            match xp.set_float(TAXI_BRAKE, brake).await {
-                                Ok(()) => trimmed = true,
+                    // Brakes go through the plugin's proportional channel —
+                    // BOTH toe ratios, equally, every frame — with the demand
+                    // slewed so pedals squeeze instead of stab ("braking is
+                    // TOO jerky", 2026-07-20: every stop was the binary key
+                    // at regular effort in one frame). Stops and trims share
+                    // the smooth channel now; the binary brake key survives
+                    // only as the fallback for a missing/old plugin. Never
+                    // silent on failure: a swallowed brake error hid the
+                    // broken override for days of flights.
+                    let now_bt = std::time::Instant::now();
+                    let brake_dt = last_brake_t.map_or(0.1, |t: std::time::Instant| {
+                        now_bt.duration_since(t).as_secs_f64()
+                    });
+                    last_brake_t = Some(now_bt);
+                    brake_out = brake_slew(brake_out, brake, brake_dt);
+                    if brake_out > 0.005 {
+                        let mut smoothed = false;
+                        if !trim_fallback {
+                            match xp.set_float(TAXI_BRAKE, brake_out).await {
+                                Ok(()) => smoothed = true,
                                 Err(e) => {
                                     trim_fallback = true;
                                     tracing::warn!(
@@ -702,7 +723,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                                 }
                             }
                         }
-                        if !trimmed {
+                        if !smoothed && brake > 0.0 {
                             match xp.run_command_for(BRAKES_REGULAR, BRAKE_HOLD_SECS).await {
                                 Ok(()) => super::note_brake_cmd(),
                                 Err(e) => {
@@ -717,8 +738,9 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                         if let Err(e) = xp.set_float(TAXI_BRAKE, 0.0).await {
                             tracing::debug!("speed governor: brake release write failed: {e:#}");
                         }
+                        brake_out = 0.0;
                     }
-                    braking = brake > 0.0;
+                    braking = brake_out > 0.005;
                     tokio::time::sleep(std::time::Duration::from_millis(if wrote { 100 } else { 300 })).await;
                 } else {
                     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
@@ -734,6 +756,26 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brakes_squeeze_on_and_let_go_quickly() {
+        // A demanded 0.5 park from nothing arrives over ~a second of
+        // squeeze, never in one frame (the head-nod at every stop).
+        let first = brake_slew(0.0, 0.5, 0.1);
+        assert!(first <= 0.06, "first tick is a touch, got {first}");
+        let mut b = 0.0;
+        let mut ticks = 0;
+        while b < 0.49 && ticks < 50 {
+            b = brake_slew(b, 0.5, 0.1);
+            ticks += 1;
+        }
+        assert!((8..=14).contains(&ticks), "~1 s to full park, took {ticks} ticks");
+        // Release is quick — letting go is not a jerk.
+        let released = brake_slew(0.5, 0.0, 0.1);
+        assert!(released < 0.4, "{released}");
+        // Small trims pass through unslewed.
+        assert_eq!(brake_slew(0.2, 0.22, 0.1), 0.22);
+    }
 
     #[test]
     fn governor_law_is_gentle_and_deadbanded() {

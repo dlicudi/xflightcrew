@@ -445,7 +445,18 @@ is now tiny parked (0.12) growing to full by 15 kt, the trim integrator
 is frozen below 10 kt, the stagnation reject watches GROUNDSPEED (the
 172's ASI reads zero below ~20 kt and the reject fired against a dead
 instrument), and the line-up's alignment leg grew to 80 m (its arrival
-is distance-based; 60 m stopped 11° off). Rotation additionally waits
+is distance-based; 60 m stopped 11° off). Power and rudder move together
+like a pilot's hand and foot: the ramp HOLDS at half power while the
+nose is swinging >10° at low speed (`throttle_cmd`), and `power_lead`
+feeds right rudder in proportional to the throttle actually commanded
+(fading with speed, integrator learns the residual; sign assumes a
+clockwise prop). Ground-loop comfort, same day: the taxi governor's
+brakes go through the plugin's proportional channel for stops AND trims,
+slewed (`brake_slew` — squeeze on, quick release; the binary brake key
+survives only as fallback), and the taxi/line-up steering straightens the
+nosewheel over the last meters of any stop (`stop_straighten` — braking
+shifts weight onto a deflected nosewheel and the aircraft carved at
+every stop). Rotation additionally waits
 for a roughly straight nose
 (`rotate_ok`, unless the runway is running out), and the airborne latch
 needs 8 ft AGL so a ground-effect bounce can't stop the steering at speed.
