@@ -5,11 +5,13 @@
 //! parser, fitted to where the aircraft is actually pointing), the roll is
 //! steered down the centreline through the plugin's `xcopilot/taxi_steer`
 //! channel (rudder + nosewheel under `override_joystick_heading`, expiring
-//! within a second of writes stopping), and the climb-out is AP-first like
-//! autoland: heading bug on runway heading, VS mode holding a speed-protected
-//! climb, full throttle throughout. At the handoff height the copilot says
-//! "your aircraft" and leaves the autopilot flying, exactly the state a real
-//! crew hands over in.
+//! within a second of writes stopping), rotation and the initial climb are
+//! ELEVATOR through the plugin's `xcopilot/pitch` channel (the AP's VS mode
+//! syncs to the current rate at engage — zero on the runway — so it can
+//! never rotate), and the AP takes the ESTABLISHED climb: heading bug on
+//! runway heading, VS mode holding a speed-protected climb, full throttle
+//! throughout. At the handoff height the copilot says "your aircraft" and
+//! leaves the autopilot flying, exactly the state a real crew hands over in.
 //!
 //! Handback, every path instant:
 //! - "Abort takeoff" / "reject" is a REJECT: throttle to idle, one expiring
@@ -54,6 +56,10 @@ const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
 const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
 const STEER_YIELD: &str = "xcopilot/steer_yield";
+const TAKEOFF_PITCH: &str = "xcopilot/pitch";
+const PITCH_YIELD: &str = "xcopilot/pitch_yield";
+const THETA: &str = "sim/flightmodel/position/true_theta";
+const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 
 const M_TO_FT: f64 = 3.280_84;
 const MS_TO_KTS: f64 = 1.943_844;
@@ -149,8 +155,26 @@ const THROTTLE_RAMP_S: f64 = 2.5;
 /// Centreline correction: degrees of cut per meter of offset, clamped.
 const XTK_GAIN_DEG_PER_M: f64 = 0.4;
 const XTK_MAX_DEG: f64 = 8.0;
-/// Initial rotation command, before the climb law takes over airborne.
-const ROTATE_VS_FPM: f64 = 500.0;
+/// Rotation pitch attitude, degrees nose up — the elevator flies the nose
+/// here and HOLDS it through the initial climb; at full power in a light
+/// single that settles near Vy. Rotation is ELEVATOR, not the autopilot:
+/// the AP's VS mode syncs to the CURRENT vertical speed at engage — zero
+/// on the runway, whatever the dial was pre-set to — so sortie five called
+/// rotate at 55 knots, the AP held the nose down, and the aircraft
+/// levitated off at 98 with 250 m of runway left.
+const ROTATE_PITCH_DEG: f64 = 8.0;
+/// Integrating pitch law: deflection per degree-second of attitude error,
+/// a lead on the pitch rate for damping, and caps. Integrating, so it
+/// holds whatever standing elevator the trim state demands with the
+/// attitude ON target — the same reason the roll law grew its trim.
+const PITCH_GAIN_PER_DEG_S: f64 = 0.05;
+const PITCH_LEAD_S: f64 = 0.5;
+const PITCH_MAX: f64 = 0.65;
+const PITCH_MIN: f64 = -0.10;
+/// Hand the established climb to the autopilot this high — clear of ground
+/// effect, wings level, speed building; the VS dial is written AFTER the
+/// mode engages, because engage syncs the dial to the current rate.
+const AP_ENGAGE_AGL_FT: f64 = 300.0;
 /// Hand the aircraft back this high above the field.
 const HANDOFF_AGL_FT: f64 = 1000.0;
 /// Raise the gear (when there is one) above this, climbing.
@@ -307,6 +331,27 @@ pub fn rotate_ok(err_deg: f64, remaining_m: f64) -> bool {
     err_deg.abs() < 15.0 || remaining_m < 400.0
 }
 
+/// The rotation elevator: an integrating law on pitch attitude, damped on
+/// the pitch rate. Pulls the nose to [`ROTATE_PITCH_DEG`] and holds it
+/// there through the initial climb, until the AP takes the established
+/// climb at [`AP_ENGAGE_AGL_FT`].
+#[derive(Default)]
+pub struct RotatePitch {
+    out: f64,
+    prev_theta: Option<f64>,
+}
+
+impl RotatePitch {
+    pub fn step(&mut self, theta_deg: f64, dt_s: f64) -> f64 {
+        let dt = dt_s.clamp(0.05, 1.0);
+        let rate = self.prev_theta.map_or(0.0, |p| (theta_deg - p) / dt);
+        self.prev_theta = Some(theta_deg);
+        let err = ROTATE_PITCH_DEG - theta_deg - PITCH_LEAD_S * rate;
+        self.out = (self.out + err * PITCH_GAIN_PER_DEG_S * dt).clamp(PITCH_MIN, PITCH_MAX);
+        self.out
+    }
+}
+
 /// Throttle schedule on the roll: 30% immediately (the engine spools, the
 /// roll starts, the yaw stays small), full power over the ramp.
 pub fn throttle_ramp(elapsed_s: f64) -> f64 {
@@ -461,6 +506,11 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // tick; the moment of free-wheeling is the throttle ramp's first beat.
     crate::tools::speedhold::ACTIVE.store(false, Ordering::Relaxed);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // The line-up ends "brakes set" — the parking-brake ratio latched. It
+    // is OURS to release: sortie five's first engage sat at full power,
+    // groundspeed zero, for twelve seconds against the parked brake and
+    // rejected as stagnant.
+    let _ = xp.set_float(PARK_BRAKE, 0.0).await;
     tracing::info!(
         icao = %rwy.icao, id = %rwy.id, remaining_m, vr = p.vr_kts, "auto takeoff: rolling"
     );
@@ -474,13 +524,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     alert(
         &voice,
         Priority::Advisory,
-        &format!("My takeoff. Rolling, runway {}.", crate::atis::spoken_runway(&rwy.id)),
+        &format!("Brakes released. Rolling, runway {}.", crate::atis::spoken_runway(&rwy.id)),
     );
 
-    // Pre-set the flight director, heading bug and VS dial NOW, parked: the
-    // bug slews by knob presses (one HTTP round trip per degree), and doing
-    // that at rotation would stall the loop while the steer channel expires
-    // mid-roll. At Vr only the modes and servos are engaged — cheap calls.
+    // Pre-set the flight director and heading bug NOW, parked: the bug
+    // slews by knob presses (one HTTP round trip per degree), and doing
+    // that later would stall the loop while the steer channel expires
+    // mid-roll. No VS dial preset — VS-mode engage syncs the dial to the
+    // current rate anyway, so it's written after the engage instead.
     for c in &p.cfg.fd_commands {
         let _ = xp.run_command(c).await;
     }
@@ -488,13 +539,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let _ =
         crate::tools::autopilot::drive_heading_bug_step(&xp, true_to_mag(rwy.course_deg, var), 360.0)
             .await;
-    let _ = xp.set_float(VS_DIAL, ROTATE_VS_FPM).await;
 
     let mut airborne = false;
     let mut rotated = false;
+    let mut ap_engaged = false;
     let mut gear_raised = !p.retract_gear;
     let mut positive_called = false;
     let mut thr_challenged = false;
+    let mut pitch_law = RotatePitch::default();
     let mut last_vs_cmd: Option<f64> = None;
     let mut last_thr_cmd = 0.3_f64;
     // The roll section's heading error, one tick stale, for the throttle's
@@ -538,7 +590,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // took ~350 ms and dragged the control tick to half a second — the
         // lag behind the fourth sortie's weave. Joined, the tick runs at
         // the sleep rate.
-        let (lat, lon, psi, gs_ms, ias, agl_m, on_ground, steer_yield, thr_read) = tokio::join!(
+        let (lat, lon, psi, gs_ms, ias, agl_m, on_ground, steer_yield, thr_read, theta, pitch_yield) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
             xp.get_float(PSI_TRUE),
@@ -548,6 +600,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             xp.get_float(ON_GROUND),
             xp.get_float(STEER_YIELD),
             xp.get_float(THROTTLE_ALL),
+            xp.get_float(THETA),
+            xp.get_float(PITCH_YIELD),
         );
         let (Ok(lat), Ok(lon), Ok(psi), Ok(gs_ms), Ok(ias), Ok(agl_m), Ok(on_ground)) =
             (lat, lon, psi, gs_ms, ias, agl_m, on_ground)
@@ -557,6 +611,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         };
         let gs_kts = gs_ms * MS_TO_KTS;
         let agl_ft = agl_m * M_TO_FT;
+        let theta_deg = theta.unwrap_or(0.0);
         let now_t = std::time::Instant::now();
         let dt = last_tick.map_or(0.15, |t| (now_t - t).as_secs_f64()).clamp(0.05, 1.0);
         last_tick = Some(now_t);
@@ -566,6 +621,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         if !airborne && steer_yield.is_ok_and(|v| v > 0.5) {
             alert(&voice, Priority::Caution, "Your aircraft. Power is set.");
             crate::blackbox::record("autotakeoff", serde_json::json!({"event": "pedal_yield"}));
+            return;
+        }
+        // The pilot's hands took the yoke during rotation or the hand-flown
+        // climb (the plugin dropped the pitch override already): theirs.
+        if rotated && !ap_engaged && pitch_yield.is_ok_and(|v| v > 0.5) {
+            alert(&voice, Priority::Caution, "Your aircraft. Power is set.");
+            crate::blackbox::record("autotakeoff", serde_json::json!({"event": "yoke_yield"}));
             return;
         }
 
@@ -628,10 +690,12 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     "thr": thr_cmd, "remaining_m": remaining, "dt": dt,
                 }),
             );
-            // Rotate: engage the AP to fly the nose off — heading bug on
-            // runway heading, VS mode to the initial rate. Only with the
-            // nose roughly straight (or the runway running out): rotating
-            // yawed launches the aircraft sideways off the strip.
+            // Rotate: ELEVATOR, through the plugin's pitch channel — the AP
+            // can't do this (its VS mode syncs to the current rate at
+            // engage: zero, nose held down, sortie five levitated off at 98
+            // knots with 250 m left). Only with the nose roughly straight
+            // (or the runway running out): rotating yawed launches the
+            // aircraft sideways off the strip.
             if !rotated && ias >= p.vr_kts && rotate_ok(err, remaining) {
                 rotated = true;
                 alert(&voice, Priority::Advisory, "Rotate.");
@@ -639,14 +703,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     "autotakeoff",
                     serde_json::json!({"event": "rotate", "ias": ias, "remaining_m": remaining}),
                 );
-                let _ = xp.run_command(CMD_SERVOS_ON).await;
-                if xp.get_float(HDG_STATUS).await.unwrap_or(0.0) <= 0.5 {
-                    let _ = xp.run_command(CMD_HDG_MODE).await;
+            }
+            if rotated {
+                let pitch = pitch_law.step(theta_deg, dt);
+                if xp.set_float(TAKEOFF_PITCH, pitch).await.is_err() {
+                    reject(&xp, &voice, "I've lost the elevator. Rejecting takeoff. Your aircraft.", "pitch_lost")
+                        .await;
+                    return;
                 }
-                if xp.get_float(VS_STATUS).await.unwrap_or(0.0) <= 0.5 {
-                    let _ = xp.run_command(CMD_VS_MODE).await;
-                }
-                last_vs_cmd = Some(ROTATE_VS_FPM);
             }
             // Airborne only once clearly clear of the surface: a ground-
             // effect bounce (on_ground false at 2 ft, back down a tick
@@ -664,7 +728,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             continue;
         }
 
-        // Airborne: speed-protected climb on the AP, gear up, hand off.
+        // Airborne: pitch attitude by hand until established, then the AP.
         if !positive_called && agl_ft > 50.0 {
             positive_called = true;
             alert(&voice, Priority::Advisory, "Positive rate.");
@@ -674,13 +738,60 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let _ = xp.set_float(GEAR_HANDLE, 0.0).await;
             alert(&voice, Priority::Advisory, "Gear up.");
         }
+        if !ap_engaged {
+            if agl_ft < AP_ENGAGE_AGL_FT {
+                // Still hand-flying: hold the rotation attitude while speed
+                // builds and ground effect falls away.
+                let pitch = pitch_law.step(theta_deg, dt);
+                if xp.set_float(TAKEOFF_PITCH, pitch).await.is_err() {
+                    alert(&voice, Priority::Warning, "I've lost the elevator. Your aircraft.");
+                    crate::blackbox::record(
+                        "autotakeoff",
+                        serde_json::json!({"event": "pitch_lost_airborne"}),
+                    );
+                    return;
+                }
+                crate::blackbox::record(
+                    "autotakeoff",
+                    serde_json::json!({
+                        "event": "climb_manual", "ias": ias, "agl": agl_ft,
+                        "theta": theta_deg, "pitch": pitch,
+                    }),
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                continue;
+            }
+            // Established in the climb: the AP takes it. Servos + HDG + VS,
+            // and the VS dial written AFTER the mode engages — engage syncs
+            // the dial to the CURRENT rate, stomping any preset (the sync
+            // that made VS-mode rotation impossible in the first place).
+            // The pitch channel simply expires; the servo owns the elevator.
+            ap_engaged = true;
+            let _ = xp.run_command(CMD_SERVOS_ON).await;
+            if xp.get_float(HDG_STATUS).await.unwrap_or(0.0) <= 0.5 {
+                let _ = xp.run_command(CMD_HDG_MODE).await;
+            }
+            if xp.get_float(VS_STATUS).await.unwrap_or(0.0) <= 0.5 {
+                let _ = xp.run_command(CMD_VS_MODE).await;
+            }
+            let vs = climb_vs_fpm(ias, p.vy_kts, p.climb_fpm);
+            let _ = xp.set_float(VS_DIAL, vs).await;
+            last_vs_cmd = Some(vs);
+            crate::blackbox::record(
+                "autotakeoff",
+                serde_json::json!({"event": "ap_engaged", "ias": ias, "agl": agl_ft, "cmd_vs": vs}),
+            );
+        }
         let vs = climb_vs_fpm(ias, p.vy_kts, p.climb_fpm);
         if last_vs_cmd.is_none_or(|v| (v - vs).abs() > 40.0) {
             let _ = xp.set_float(VS_DIAL, vs).await;
             last_vs_cmd = Some(vs);
         }
         if xp.get_float(VS_STATUS).await.unwrap_or(1.0) <= 0.5 {
+            // Someone (or a mode change) dropped VS: re-engage, and force a
+            // dial rewrite next tick — the engage just synced it away.
             let _ = xp.run_command(CMD_VS_MODE).await;
+            last_vs_cmd = None;
         }
         crate::blackbox::record(
             "autotakeoff",
@@ -913,6 +1024,46 @@ mod tests {
         assert!(rotate_ok(3.0, 900.0), "straight and long: rotate");
         assert!(!rotate_ok(25.0, 900.0), "yawed with room: keep straightening");
         assert!(rotate_ok(25.0, 300.0), "yawed but running out: fly");
+    }
+
+    #[test]
+    fn rotation_is_an_elevator_pull_that_holds_the_attitude() {
+        // Sortie five: rotate called at 55 knots, the AP's VS mode held the
+        // nose down (engage syncs to the current rate: zero), and the
+        // aircraft levitated off at 98 with 250 m left. The rotation law is
+        // an integrating elevator pull to the target attitude.
+        let mut law = RotatePitch::default();
+        let first = law.step(0.0, 0.15);
+        assert!(first > 0.0, "nose on the ground, pull back: {first}");
+        let mut out = first;
+        for _ in 0..40 {
+            out = law.step(0.0, 0.15);
+        }
+        assert!(out > 0.3, "an unresponsive nose earns more pull: {out}");
+        assert!(out <= PITCH_MAX + 1e-9, "capped: {out}");
+        // Integrating: on target and steady, the standing pull HOLDS — the
+        // elevator the trim state demands at this speed.
+        let mut settled = RotatePitch::default();
+        for _ in 0..10 {
+            settled.step(ROTATE_PITCH_DEG - 1.0, 0.15);
+        }
+        settled.step(ROTATE_PITCH_DEG, 0.15);
+        let a = settled.step(ROTATE_PITCH_DEG, 0.15);
+        let b = settled.step(ROTATE_PITCH_DEG, 0.15);
+        assert!(a > 0.0 && (a - b).abs() < 1e-6, "holds at target: {a} vs {b}");
+        // A nose rising fast toward the target backs the pull off (the
+        // rate lead), so the rotation doesn't slingshot past the attitude.
+        let mut rising = RotatePitch::default();
+        let before = rising.step(2.0, 0.15);
+        let after = rising.step(6.0, 0.15);
+        assert!(after < before, "fast rise backs off: {before} -> {after}");
+        // And the nose-down authority is a fraction of the pull: this law
+        // rotates, it never bunts.
+        let mut over = RotatePitch::default();
+        for _ in 0..100 {
+            over.step(30.0, 0.15);
+        }
+        assert!(over.out >= PITCH_MIN - 1e-9, "floor holds: {}", over.out);
     }
 
     #[test]

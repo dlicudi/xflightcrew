@@ -476,6 +476,24 @@ ADVANCES are slewed (`throttle_slew` — the swinging-nose hold's release
 jumped half-to-full in one tick and kicked 19° of yaw at 12 kt; releases
 stay instant). Roll events carry `dt` now — check it stayed near 0.15
 before touching gains again.
+Sortie five (same day) proved the loop fix (±2.7° all roll) and convicted
+the ROTATION: the AP's VS mode syncs its dial to the CURRENT vertical
+speed at engage — zero on the runway, whatever was pre-set — so "Rotate"
+at 55 kt left the nose held down and the aircraft levitated off at 98 kt
+with 250 m left; and the first engage sat 12 s at full power against the
+parking brake the line-up's "brakes set" had latched (stagnant reject).
+Rotation is ELEVATOR now: a new plugin channel `xcopilot/pitch`
+(yoke_pitch_ratio under override_joystick_pitch, the taxi_steer pattern
+exactly — 1 s expiry, `xcopilot/pitch_yield` latches on real pitch-axis
+deflection and the yoke is the pilot's that frame) driven by `RotatePitch`,
+an integrating attitude law (8° target, rate-lead damped, caps 0.65/-0.10)
+from Vr through the hand-flown initial climb; the AP takes the ESTABLISHED
+climb at 300 ft AGL — servos + HDG + VS engaged there, the VS dial written
+AFTER the mode (engage syncs it away; the climb block also rewrites it
+after any VS re-engage), then the pitch channel just expires. The takeoff
+releases the parking brake itself ("Brakes released. Rolling"), and the
+tool probes the pitch channel at arm time (an old plugin would roll fine
+and sail off the far end unrotated).
 Related trap fixed the same day: `looks_like_command` (the continuous-mode
 domain gate) matched per-token keywords only, so the split compounds
 "take off ..." and "line us up" were swallowed with no miss chime —

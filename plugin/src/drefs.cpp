@@ -216,8 +216,34 @@ static int g_yaw_axis = -1;
 static float g_yaw_axis_baseline = 0.5f;
 static int g_steer_engage_frames = 0;
 static int g_yaw_deflect_frames = 0;
-// Axis-assignment code for yaw in sim/joystick/joystick_axis_assignments.
+// Rotation pitch, the takeoff's elevator — same shape as the steer channel:
+// the app writes xcopilot/pitch (-1..1, positive = aft yoke, nose up) and the
+// flight loop drives yoke_pitch_ratio from it every frame under
+// override_joystick_pitch, expiring within a second of writes stopping. The
+// AP's VS mode syncs to the CURRENT vertical speed at engage — zero on the
+// runway — so no dataref preset can make it rotate; rotation is elevator,
+// and only a plugin can hold the elevator against the joystick re-drive.
+// The pilot's HANDS win like the feet do: real pitch-axis deflection from
+// the engage baseline latches xcopilot/pitch_yield and drops the override
+// that frame.
+static XPLMDataRef g_pitch_dref = nullptr;
+static XPLMDataRef g_pitch_yield_dref = nullptr;
+static XPLMDataRef g_yoke_pitch = nullptr;
+static XPLMDataRef g_override_pitch = nullptr;
+static float g_pitch = 0.0f;
+static float g_pitch_stamp = -1.0f;
+static bool g_pitch_applied = false;
+static int g_pitch_yield = 0;
+static int g_pitch_axis = -1;
+static float g_pitch_axis_baseline = 0.5f;
+static int g_pitch_engage_frames = 0;
+static int g_pitch_deflect_frames = 0;
+
+// Axis-assignment codes in sim/joystick/joystick_axis_assignments.
+static const int kAxisPitch = 1;
 static const int kAxisYaw = 3;
+// Deflection from the baseline that reads as the pilot's hands on the yoke.
+static const float kPitchYieldDelta = 0.25f;
 // Deflection from the baseline that reads as the pilot's feet.
 static const float kYawYieldDelta = 0.25f;
 // The yield only ARMS this many frames (~0.5 s) after engage, with the
@@ -319,12 +345,26 @@ static void WriteTaxiSteer(void*, float v) {
     g_taxi_steer_stamp = XPLMGetElapsedTime();
 }
 static int ReadSteerYield(void*) { return g_steer_yield; }
+static float ReadPitch(void*) { return g_pitch; }
+static void WritePitch(void*, float v) {
+    g_pitch = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
+    g_pitch_stamp = XPLMGetElapsedTime();
+}
+static int ReadPitchYield(void*) { return g_pitch_yield; }
 
 // The hardware yaw axis's current value, or -1 if none is assigned.
 static float yaw_axis_value() {
     if (g_yaw_axis < 0 || !g_joy_axis_values) return -1.0f;
     float v = 0.0f;
     XPLMGetDatavf(g_joy_axis_values, &v, g_yaw_axis, 1);
+    return v;
+}
+
+// The hardware pitch axis's current value, or -1 if none is assigned.
+static float pitch_axis_value() {
+    if (g_pitch_axis < 0 || !g_joy_axis_values) return -1.0f;
+    float v = 0.0f;
+    XPLMGetDatavf(g_joy_axis_values, &v, g_pitch_axis, 1);
     return v;
 }
 
@@ -391,6 +431,48 @@ static float TaxiAssistLoop(float, float, int, void*) {
     }
     // Writes stopped (the app saw the latch, or died): re-arm for next time.
     if (!steer_fresh) g_steer_yield = 0;
+
+    // The pitch channel: same freshness, same yield discipline, the yoke
+    // instead of the pedals.
+    const bool pitch_fresh = g_pitch_stamp >= 0.0f
+        && XPLMGetElapsedTime() - g_pitch_stamp <= kTaxiBrakeFreshSecs;
+    if (pitch_fresh && !g_pitch_yield) {
+        if (!g_pitch_applied) {
+            g_pitch_axis = -1;
+            if (g_joy_axis_assignments) {
+                int assign[500];
+                const int n = XPLMGetDatavi(g_joy_axis_assignments, assign, 0, 500);
+                for (int i = 0; i < n; ++i) {
+                    if (assign[i] == kAxisPitch) { g_pitch_axis = i; break; }
+                }
+            }
+            g_pitch_engage_frames = 0;
+            g_pitch_deflect_frames = 0;
+            g_pitch_applied = true;
+        }
+        const float ax = pitch_axis_value();
+        if (g_pitch_engage_frames < kYieldArmFrames) {
+            ++g_pitch_engage_frames;
+            g_pitch_axis_baseline = ax;
+        } else if (g_pitch_axis >= 0 && ax >= 0.0f
+                   && std::fabs(ax - g_pitch_axis_baseline) > kPitchYieldDelta) {
+            if (++g_pitch_deflect_frames >= kYieldHoldFrames) g_pitch_yield = 1;
+        } else {
+            g_pitch_deflect_frames = 0;
+        }
+        if (!g_pitch_yield) {
+            if (g_override_pitch) XPLMSetDatai(g_override_pitch, 1);
+            if (g_yoke_pitch) XPLMSetDataf(g_yoke_pitch, g_pitch);
+        }
+    }
+    if ((!pitch_fresh || g_pitch_yield) && g_pitch_applied) {
+        if (g_yoke_pitch) XPLMSetDataf(g_yoke_pitch, 0.0f);
+        // Dropped last: the pilot's pitch hardware (or the engaged AP servo)
+        // owns the elevator the very next frame.
+        if (g_override_pitch) XPLMSetDatai(g_override_pitch, 0);
+        g_pitch_applied = false;
+    }
+    if (!pitch_fresh) g_pitch_yield = 0;
     return -1.0f; // every frame: braking rides the physics rate, not REST rate
 }
 // Live flight strip — a status row the app refreshes continuously, not logged.
@@ -609,6 +691,16 @@ void start() {
         "xcopilot/steer_yield", xplmType_Int, 0,
         ReadSteerYield, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_pitch_dref = XPLMRegisterDataAccessor(
+        "xcopilot/pitch", xplmType_Float, 1,
+        nullptr, nullptr, ReadPitch, WritePitch, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_pitch_yield_dref = XPLMRegisterDataAccessor(
+        "xcopilot/pitch_yield", xplmType_Int, 0,
+        ReadPitchYield, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_yoke_pitch = XPLMFindDataRef("sim/cockpit2/controls/yoke_pitch_ratio");
+    g_override_pitch = XPLMFindDataRef("sim/operation/override/override_joystick_pitch");
     g_yoke_heading = XPLMFindDataRef("sim/cockpit2/controls/yoke_heading_ratio");
     g_override_heading = XPLMFindDataRef("sim/operation/override/override_joystick_heading");
     g_joy_axis_values = XPLMFindDataRef("sim/joystick/joystick_axis_values");
@@ -633,8 +725,16 @@ void stop_first() {
         if (g_override_heading) XPLMSetDatai(g_override_heading, 0);
         g_taxi_steer_applied = false;
     }
+    // And no elevator.
+    if (g_pitch_applied) {
+        if (g_yoke_pitch) XPLMSetDataf(g_yoke_pitch, 0.0f);
+        if (g_override_pitch) XPLMSetDatai(g_override_pitch, 0);
+        g_pitch_applied = false;
+    }
     if (g_taxi_steer_dref) { XPLMUnregisterDataAccessor(g_taxi_steer_dref); g_taxi_steer_dref = nullptr; }
     if (g_steer_yield_dref) { XPLMUnregisterDataAccessor(g_steer_yield_dref); g_steer_yield_dref = nullptr; }
+    if (g_pitch_dref) { XPLMUnregisterDataAccessor(g_pitch_dref); g_pitch_dref = nullptr; }
+    if (g_pitch_yield_dref) { XPLMUnregisterDataAccessor(g_pitch_yield_dref); g_pitch_yield_dref = nullptr; }
     if (g_taxi_brake_dref) { XPLMUnregisterDataAccessor(g_taxi_brake_dref); g_taxi_brake_dref = nullptr; }
     if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }
     if (g_atc_dref) { XPLMUnregisterDataAccessor(g_atc_dref); g_atc_dref = nullptr; }
