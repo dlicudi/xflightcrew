@@ -1,0 +1,158 @@
+//! `auto_takeoff` — the copilot flies the takeoff roll and initial climb.
+//!
+//! The arming end of [`crate::autotakeoff`]: quick gates here (replay, on
+//! the ground, not already rolling, the ATC clearance when a tower is
+//! running, the steer channel), then the background loop re-validates the
+//! runway itself — the apt.dat scan is seconds, too slow for this reply —
+//! and speaks its own "Rolling" or refusal. Distinct from `autoland` on
+//! purpose: that one is an emergency; this is a normal crew duty, so it
+//! REFUSES without a takeoff clearance instead of assuming one.
+
+use anyhow::Result;
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use super::{Tool, ToolCtx};
+use crate::autotakeoff;
+use crate::party_line;
+use crate::tools::autopilot::ApConfig;
+use crate::tower;
+
+pub struct AutoTakeoff {
+    pub cfg: ApConfig,
+    pub vr_kts: f64,
+    pub vy_kts: f64,
+    pub climb_fpm: f64,
+    pub retract_gear: bool,
+    /// POH takeoff ground roll, meters, when the profile knows it.
+    pub takeoff_roll_m: Option<f64>,
+}
+
+#[derive(Deserialize, Default)]
+struct Args {
+    /// true = abort/reject the takeoff.
+    #[serde(default)]
+    off: bool,
+}
+
+#[async_trait]
+impl Tool for AutoTakeoff {
+    fn name(&self) -> &str {
+        "auto_takeoff"
+    }
+
+    fn description(&self) -> &str {
+        "The copilot flies the takeoff: full power, steers the centreline, \
+         rotates at Vr, climbs out on the autopilot and hands back at a \
+         thousand feet. Use ONLY when the pilot asks the copilot to fly the \
+         takeoff itself: 'take off for me', 'you have the takeoff', 'your \
+         takeoff', 'auto takeoff'. off=true for 'abort takeoff' / 'reject \
+         takeoff' / 'cancel the takeoff'. (A readback like 'cleared for \
+         takeoff runway 27' is the pilot talking to ATC, never this.)"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "off": {"type": "boolean", "description": "true = abort/reject the takeoff"}
+            }
+        })
+    }
+
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let a: Args = serde_json::from_value(args.clone()).unwrap_or_default();
+        if a.off {
+            return Ok(if autotakeoff::ACTIVE.load(Relaxed) {
+                // The loop does the arresting (throttle, brakes) and speaks
+                // the state; this reply is just the acknowledgment.
+                autotakeoff::REJECT.store(true, Relaxed);
+                "Aborting.".to_string()
+            } else {
+                "I wasn't flying the takeoff.".to_string()
+            });
+        }
+        if autotakeoff::ACTIVE.load(Relaxed) {
+            return Ok("I already have the takeoff.".to_string());
+        }
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::IS_IN_REPLAY)
+            .await
+            .is_ok_and(|v| v > 0.5)
+        {
+            return Ok("We're in replay. Go back to live and ask again.".to_string());
+        }
+        if ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(1.0) < 0.5 {
+            return Ok("We're already flying.".to_string());
+        }
+        // A drive in progress (line-up, auto taxi) is NOT killed by asking
+        // for the takeoff — the second sortie's ask mid-line-up stood the
+        // governor down, the takeoff then refused, and the aircraft coasted
+        // uncontrolled for half a minute (LXGB, 2026-07-20). Let the drive
+        // finish; it announces when it's done.
+        if crate::autotaxi::ACTIVE.load(Relaxed) {
+            return Ok(
+                "I'm still driving us. When I call us lined up, ask for the takeoff again."
+                    .to_string(),
+            );
+        }
+        // A takeoff starts from a standstill: the roll law owns the whole
+        // acceleration, and engaging on a moving, swinging aircraft is how
+        // the second sortie left the pavement.
+        let gs_kts = ctx
+            .xplane
+            .get_float("sim/flightmodel/position/groundspeed")
+            .await
+            .unwrap_or(0.0)
+            * 1.943_844;
+        if gs_kts > 5.0 {
+            return Ok("We're still moving. Let us come to a stop, then ask again.".to_string());
+        }
+        // The clearance gate: when a tower is running, a takeoff needs its
+        // clearance — this is a normal duty, not an emergency (autoland
+        // deliberately skips this). No station (copilot-only mode, real
+        // ATC on the radio) means the pilot owns the clearance question.
+        match party_line::clearance_state() {
+            None | Some(tower::State::TakeoffCleared) => {}
+            Some(tower::State::LinedUp) => {
+                return Ok(if party_line::takeoff_hold_armed() {
+                    "The tower is holding us for traffic. When the clearance comes through, ask me again."
+                        .to_string()
+                } else {
+                    "We're only cleared to line up and wait. No takeoff clearance yet.".to_string()
+                });
+            }
+            Some(_) => {
+                return Ok(
+                    "We don't have a takeoff clearance. Call the tower, then I'll fly it."
+                        .to_string(),
+                );
+            }
+        }
+        if !crate::autotaxi::steer_channel_ok(ctx.xplane).await {
+            return Ok(
+                "I can't steer. The x-copilot plugin needs updating, so this takeoff is yours."
+                    .to_string(),
+            );
+        }
+        autotakeoff::start(
+            ctx.config.xplane_base_url.clone(),
+            ctx.voice.cloned(),
+            autotakeoff::Params {
+                apt_dat: super::autoland::apt_dat_path(),
+                cfg: self.cfg.clone(),
+                vr_kts: self.vr_kts,
+                vy_kts: self.vy_kts,
+                climb_fpm: self.climb_fpm,
+                retract_gear: self.retract_gear,
+                cleared_runway: party_line::clearance_runway(),
+                needed_m: self.takeoff_roll_m.map_or(500.0, |m| m * 1.4),
+            },
+        );
+        Ok("My takeoff. Checking the runway. Say abort takeoff or my controls any time."
+            .to_string())
+    }
+}

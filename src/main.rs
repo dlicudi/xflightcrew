@@ -11,6 +11,7 @@ mod aircraft;
 mod approach_guide;
 mod audio;
 mod autoland;
+mod autotakeoff;
 mod autotaxi;
 mod cabin;
 mod debrief;
@@ -1838,7 +1839,10 @@ async fn run_session(
                     || tools::engine::LEAN_SEEKING.load(Relaxed);
                 let reverse_in = tools::reverse::ACTIVE.load(Relaxed);
                 let taxi_driving = autotaxi::ACTIVE.load(Relaxed);
-                if (speed_held || mix_held || reverse_in || taxi_driving) && release_intent(&tl) {
+                let takeoff_flying = autotakeoff::ACTIVE.load(Relaxed);
+                if (speed_held || mix_held || reverse_in || taxi_driving || takeoff_flying)
+                    && release_intent(&tl)
+                {
                     let names_mix = tl.contains("mixture") || tl.contains("mix");
                     let names_speed = tl.contains("throttle") || tl.contains("speed")
                         || tl.contains("power") || tl.contains("taxi") || tl.contains("thr");
@@ -1856,6 +1860,14 @@ async fn run_session(
                     let generic = !names_mix && !names_speed && !names_reverse
                         && !names_steer && !tl.contains("brake");
                     let mut released: Vec<&str> = Vec::new();
+                    // A takeoff in progress: "my controls" is a HANDOVER, not
+                    // a reject — the loop stands down silently, steering
+                    // expires, and the power stays set for the pilot now
+                    // flying it ("abort takeoff" is the arresting path).
+                    if takeoff_flying && (names_speed || names_steer || generic) {
+                        autotakeoff::ACTIVE.store(false, Relaxed);
+                        released.push("your takeoff, power is set");
+                    }
                     if taxi_driving && (names_speed || names_steer || generic) {
                         autotaxi::ACTIVE.store(false, Relaxed);
                         if names_steer && !names_speed && !generic {
@@ -4827,6 +4839,9 @@ fn active_managers() -> Vec<String> {
     if let Some(a) = approach_guide::armed() {
         v.push(format!("talk-down {} {}", a.icao, a.runway_id));
     }
+    if let Some(s) = autotakeoff::status() {
+        v.push(s);
+    }
     if let Some(s) = autotaxi::status() {
         v.push(s);
     }
@@ -5083,6 +5098,16 @@ fn looks_like_question(text: &str) -> bool {
 /// keyword). Phonetic garbage that happens to transcribe confidently shares no
 /// vocabulary with the domain and is rejected here.
 fn looks_like_command(text: &str) -> bool {
+    // Two-word compounds whisper splits: keyword matching is per-token, so
+    // neither half clears the gate alone — "take off for me" (vs the fused
+    // keyword "takeoff") and "line us up" were both swallowed WITHOUT EVEN
+    // A MISS CHIME, live 2026-07-20. Checked on the raw text first.
+    let t = text.to_ascii_lowercase();
+    if t.contains("take off") || t.contains("line up") || t.contains("line us up")
+        || t.contains("line me up") || t.contains("lined up")
+    {
+        return true;
+    }
     text.split(|c: char| !c.is_ascii_alphabetic())
         .filter(|w| !w.is_empty())
         .any(|w| {
@@ -5315,18 +5340,30 @@ async fn try_route_content_atc(
     true
 }
 
-/// The crew's comm note after a transmission into dead air. The active
-/// station's full plan is only worth reciting while that station is in VHF
-/// range — parked 200 nm out, "Gibraltar: tower one three one decimal two"
-/// reads as if Gibraltar could answer (2026-07-10). Out of range, name what
-/// IS reachable instead, or say honestly that nothing is.
+/// The crew's comm note after a transmission into dead air. In range, the
+/// short answer: who WILL answer, not the field's whole comm directory (six
+/// frequencies recited after one void call on ground read as noise,
+/// 2026-07-20 — the full list still answers the spoken "what frequencies"
+/// QUESTION via `freq_briefing`). The station is only worth pointing at
+/// while it's in VHF range — parked 200 nm out, "Gibraltar: tower one three
+/// one decimal two" reads as if Gibraltar could answer (2026-07-10). Out of
+/// range, name what IS reachable instead, or say honestly that nothing is.
 async fn void_briefing(xp: &XPlaneClient, st: &station::Station) -> String {
+    let com1 = xp
+        .get_float(datarefs::COM1_FREQ_KHZ)
+        .await
+        .ok()
+        .map(|v| v.round() as i64);
+    let airborne = xp
+        .get_float(datarefs::ON_GROUND_ANY)
+        .await
+        .is_ok_and(|v| v < 0.5);
     let Some((lat, lon, alt_ft)) = position(xp).await else {
-        // Can't place the aircraft — the plain briefing beats silence.
-        return st.freq_briefing(xp.view()).await;
+        // Can't place the aircraft — pointing at the station beats silence.
+        return st.void_note(com1, airborne);
     };
     if station::active_station_in_range(lat, lon, alt_ft).is_some() {
-        return st.freq_briefing(xp.view()).await;
+        return st.void_note(com1, airborne);
     }
     let near = station::fields_in_range(lat, lon, alt_ft, 1);
     match near.first().and_then(|f| {
@@ -5694,6 +5731,9 @@ mod tests {
             // The bare rollout call — silently gated on the Twotter's first
             // reverse flight ("thrusters" is too far from "thrust" for fuzzy).
             "Reverse thrusters.", "reversers", "stow reverse", "cancel reverse",
+            // Split compounds — swallowed with no miss chime, live 2026-07-20.
+            "Take off for me.", "Let's take off.", "You have to take off.",
+            "Line us up.", "line me up", "Get us lined up.",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
         }

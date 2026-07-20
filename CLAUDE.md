@@ -350,11 +350,27 @@ and drops the override that frame — the app loop then stands down to
 "you steer, I have the throttle". Handbacks: "my steering"/pedals release
 steering only, "my controls" everything; the governor standing down for ANY
 reason takes steering with it (speed authority gone = nobody stopping it);
->25 m off route = stop + release, never a driven recovery on uncleared
-pavement. Spoken "stop"/"go"/"taxi at N" fold into the schedule as external
-retargets (`LAST_TAXI_KTS` untouched by schedule writes, so "go" resumes
-the pilot's pace). Refuses in replay, airborne, facing >100° against the
-route, off it, or with no published clearance. The governor evaporating
+established, >25 m off route = stop + release, never a driven recovery on
+uncleared pavement. But an engage that STARTS off the route or facing
+against it is a JOIN, not a refusal (2026-07-20 — "turn us around first"
+and "get us onto it and ask again" both bounced live requests): the loop
+engages anyway, pure-pursuits toward the route at bend pace (sharp-corner
+speed while the nose is >60° off), and the off-route guard widens to the
+engage distance plus 40 m of turning room until captured (<15 m and
+aligned), when the tight guard resumes. Steering authority tapers with
+groundspeed (`steer_authority`: 0.35 parked, full by 3 kt) — full nosewheel
+lock at a standstill is a chock the governor's 0.35 throttle cap can't
+break away against (a 69°-off join sat static at Gatwick, 2026-07-20) — a join can never end farther from
+the route than it started, and >150 m off (`MAX_JOIN_M`, where the
+projection stops meaning anything) still refuses. Request-shaped asks with
+a destination attached arm it too ("let's taxi to holding point" —
+apostrophes stripped, so `lets taxi`; "taxi us ..."): a readback never
+opens first-person plural, so the readback trap only excludes bare "taxi
+to holding point ..." shapes (both phrasings went unanswered live,
+2026-07-20). Spoken "stop"/"go"/"taxi at N" fold into the schedule as
+external retargets (`LAST_TAXI_KTS` untouched by schedule writes, so "go"
+resumes the pilot's pace). Refuses in replay, airborne, way off the route,
+or with no published clearance. The governor evaporating
 mid-drive is ARRESTED, never silent: the throttle-override check can't
 tell a pilot's hand from a hardware-axis bump the sim re-drives, and the
 first Gatwick sortie (2026-07-20) ran 10 to 50 kt through the grass at
@@ -374,6 +390,77 @@ narrating over it — one voice, the copilot calling its own turns. Laws
 battle-test as plain `cargo test`; events blackbox as `"kind":"autotaxi"`.
 Steering on a castoring nosewheel (SR22) is untested — yoke_heading does
 little there at low speed; differential-brake steering is future work.
+
+Depth (added 2026-07-20, same day): **auto takeoff** — "take off for me" /
+"your takeoff" / bare "take off" (first/second-person shapes ONLY; the
+readback "cleared for takeoff runway two seven" and the call "ready for
+takeoff" carry none of them, same trap discipline as auto taxi).
+[src/autotakeoff.rs](src/autotakeoff.rs) + the `auto_takeoff` tool
+([src/tools/takeoff.rs](src/tools/takeoff.rs), registered with the AP
+tools) composes the existing parts: the runway comes from apt.dat
+(autoland's parser, `runway_fit` — aligned within 20°, within 40 m of the
+centreline, enough length ahead vs the POH roll ×1.4), the roll steers the
+centreline through the same plugin steer channel with authority TAPERING as
+speed builds (the inverse of the taxi taper — full rudder at 50 kt is a
+swerve), and the climb-out is AP-first like autoland: bug and VS dial are
+PRE-SET parked (the knob slew is one HTTP press per degree — doing it at
+rotation stalls the loop while the steer channel expires), servos + HDG +
+VS engage at Vr, then a speed-protected climb law (rate backs off while
+below Vy, floored positive) to the 1000 ft AGL handoff — "your aircraft,
+the autopilot is holding runway heading and the climb". Being a normal duty
+and not an emergency, it REFUSES without a takeoff clearance when a tower
+is running (LinedUp explains the hold; `party_line::clearance_runway` is
+the new accessor feeding a line-up crosscheck — lined up on 09 with a
+27 clearance is a refusal, the backwards-line-up trap); no station
+(copilot-only mode, real ATC) leaves the clearance question to the pilot.
+In-loop guards, not just arm-time: not accelerating in 10 s = reject,
+runway remaining under 250 m below 0.9 Vr = reject (throttle idle, one
+expiring brake pulse, "your aircraft"); "abort takeoff"/bare "abort" is
+the arresting reject path, "my controls" is a silent HANDOVER (power stays
+set — a pilot taking over mid-roll wants it); pedal yield hands over with
+"power is set"; a throttle pull is challenged once (axis jitter) then
+honored as a pilot reject. Vr/Vy/climb rate come from the profile's
+reference figures with stall-speed fallbacks. Laws battle-test as plain
+`cargo test`; events blackbox as `"kind":"autotakeoff"` (per-tick `roll`
+events carry gs/ias/err/steer/trim/xtk — mine them to tune). Two sorties
+(LXGB 27, 2026-07-20) hardened it: throttle RAMPS to full over 2.5 s
+(slammed at a standstill is maximum P-factor yaw at zero rudder airflow);
+the taxi governor is stood down INSIDE the loop only after every refusal
+gate passes (standing it down in the tool armed both failure modes: sortie
+one it braked against the roll — it was still holding a manual taxi — and
+sortie two a refusal mid-line-up left the aircraft coasting uncontrolled
+for half a minute); the tool refuses while an auto drive is ACTIVE and
+above 5 kt groundspeed (engaging on a moving, swinging aircraft is how
+sortie two left the pavement); and the roll law is `RollSteer` — P+lead
+damping PLUS a slow capped INTEGRATOR that learns the standing rudder
+P-factor demands (pure P settled at a standing 18° error, then the old
+authority taper starved it to 0.21 of deflection and the aircraft ran 86 m
+off the centreline and rotated from the grass 39° off heading; the trim
+holds rudder with the nose straight, authority floor 0.65, cap 0.85,
+slew-limited). Rotation additionally waits for a roughly straight nose
+(`rotate_ok`, unless the runway is running out), and the airborne latch
+needs 8 ft AGL so a ground-effect bounce can't stop the steering at speed.
+Related trap fixed the same day: `looks_like_command` (the continuous-mode
+domain gate) matched per-token keywords only, so the split compounds
+"take off ..." and "line us up" were swallowed with no miss chime —
+bigrams are checked on the raw text now.
+
+**Line up** (same day) bridges the two: "line us up" / "line me up" /
+bare "line up" (the LUAW readback always carries "wait", "lining up" is
+the short echo — both excluded) drives from the hold-short position onto
+the runway and stops aligned on the centreline. `line_up_path` /
+`pick_line_up` in [src/autotaxi.rs](src/autotaxi.rs) build a synthetic
+three-point route (entry ahead of abeam by the lateral offset, then 60 m
+down the centreline to finish pointing down the strip), picked against
+`party_line::clearance_runway` so a "line up and wait runway two seven"
+can never be driven onto the 09 end, and refused with less than 400 m
+remaining past the stop (the wrong-end trap). The drive IS an auto taxi:
+same governor front door (parking-brake gates apply), same steering loop,
+same handbacks — only the arrival line differs (`Route.done_line`:
+"Lined up runway two seven. Holding position."). Gated on
+LinedUp/TakeoffCleared when a tower is running; TaxiCleared is refused
+with why. An auto-takeoff asked from the hold now answers "say line us
+up, then give me the takeoff" when the line-up is in reach.
 
 Battle-test surface (all deterministic, in `cargo test --workspace` unless
 noted — plain `cargo test` at the root only runs the crew package now): the

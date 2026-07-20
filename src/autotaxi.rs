@@ -27,9 +27,14 @@
 //!   airborne, release words) takes the steering with it: speed authority
 //!   gone means nobody is stopping the aircraft, so steering alone must not
 //!   keep driving it.
-//! - Off the route past [`OFF_ROUTE_STOP_M`] the loop STOPS the aircraft and
-//!   releases steering — never "recovers" by driving pavement it wasn't
-//!   cleared on. The pilot sorts it out with the tower.
+//! - An engage that starts off the route or facing against it is a JOIN, not
+//!   a fault: the law turns toward the route at bend speed and the off-route
+//!   guard is widened to the engage distance plus [`JOIN_GROW_M`] until the
+//!   aircraft is captured (close and aligned) — then the tight guard resumes.
+//!   Once ESTABLISHED, drifting past [`OFF_ROUTE_STOP_M`] still STOPS the
+//!   aircraft and releases steering: a law that held meters for a while and
+//!   then walked off means something is broken, and a driven "recovery" on
+//!   pavement it was never near is nobody's clearance.
 //!
 //! Everything here is pure geometry over the published polyline; the laws
 //! battle-test as plain `cargo test`, no sim.
@@ -55,6 +60,7 @@ const TAXI_STEER: &str = "xcopilot/taxi_steer";
 /// The plugin's pilot-feet latch: 1 = the yaw axis moved, override dropped.
 const STEER_YIELD: &str = "xcopilot/steer_yield";
 const MS_TO_KTS: f64 = 1.943_844;
+const M_PER_NM: f64 = 1852.0;
 
 /// Stop this many meters short of the route's end. The planner already ends
 /// the route at the hold-short standoff (40 m back from a runway-junction
@@ -64,10 +70,26 @@ const MS_TO_KTS: f64 = 1.943_844;
 /// (2026-07-20): the standoff belongs to the planner, not this margin.
 const STOP_SHORT_M: f64 = 5.0;
 /// Lateral drift at which the loop stops the aircraft and gives steering
-/// back. Deliberately much tighter than the guide/compliance 60 m: the law
-/// holds a couple of meters in normal work, so 25 m off means something is
-/// wrong (bad fix, blocked nosewheel, a route the geometry can't follow).
+/// back, once ESTABLISHED on the route. Deliberately much tighter than the
+/// guide/compliance 60 m: the law holds a couple of meters in normal work,
+/// so 25 m off means something is wrong (bad fix, blocked nosewheel, a
+/// route the geometry can't follow).
 pub(crate) const OFF_ROUTE_STOP_M: f64 = 25.0;
+/// Farther off than this at engage is a refusal: the projection onto the
+/// route stops meaning anything, and a blind cross-country drive to it
+/// isn't a join, it's a new route the tower never gave us.
+pub(crate) const MAX_JOIN_M: f64 = 150.0;
+/// Extra lateral allowance granted while joining, on top of the engage
+/// distance: room for the turning circle of a turn-around without ever
+/// letting a broken law wander further from the route than it started.
+const JOIN_GROW_M: f64 = 40.0;
+/// Joined when inside this lateral AND aligned within [`JOIN_DONE_ERR_DEG`]:
+/// the tight established guard takes over from there.
+const JOIN_DONE_LAT_M: f64 = 15.0;
+const JOIN_DONE_ERR_DEG: f64 = 45.0;
+/// While joining with the nose still this far off the aim, hold the
+/// sharp-turn pace; better aligned joins ride at ordinary bend speed.
+const JOIN_ERR_SLOW_DEG: f64 = 60.0;
 /// Full steering deflection at this much heading error.
 const STEER_FULL_DEG: f64 = 30.0;
 /// Route bends at/above this (smoothed like the guide's cues) slow the
@@ -104,6 +126,9 @@ pub struct Route {
     bends: Vec<(f64, f64)>,
     /// Spoken holding point ("November five Whiskey"), may be empty.
     pub holding_point: String,
+    /// Overrides the arrival line when set — a LINE-UP drive ends with
+    /// "Lined up runway two seven", not "Holding point".
+    pub done_line: Option<String>,
 }
 
 impl Route {
@@ -147,6 +172,7 @@ impl Route {
             total,
             bends,
             holding_point: crate::station::spoken_taxiway(&watch.holding_point),
+            done_line: None,
         })
     }
 
@@ -196,6 +222,111 @@ impl Route {
 /// speed is heavily damped already, and the tick is fast.
 pub fn steer_cmd(err_deg: f64) -> f64 {
     (err_deg / STEER_FULL_DEG).clamp(-1.0, 1.0)
+}
+
+/// Steering authority vs groundspeed: a fully deflected nosewheel at a
+/// standstill is a chock, not a turn — the tire scrubs sideways and the
+/// taxi governor's throttle cap (well below takeoff power on purpose)
+/// can't break the aircraft away against it. A 69°-off join at Gatwick
+/// sat static at full lock exactly this way (2026-07-20). Partial lock
+/// parked lets the roll start; full authority arrives by 3 knots, when
+/// the wheel is actually steering.
+pub fn steer_authority(gs_kts: f64) -> f64 {
+    0.35 + 0.65 * (gs_kts / 3.0).clamp(0.0, 1.0)
+}
+
+/// The lateral allowance for an engage at `lateral` meters off the route
+/// with `err_deg` of heading error: zero for an on-route, along-route start
+/// (the tight established guard applies from the first tick), otherwise the
+/// engage distance plus turning-circle room. The guard while joining is
+/// [`OFF_ROUTE_STOP_M`] plus this.
+pub fn join_allowance_m(lateral: f64, err_deg: f64) -> f64 {
+    if lateral > OFF_ROUTE_STOP_M || err_deg.abs() > JOIN_DONE_ERR_DEG {
+        lateral.max(OFF_ROUTE_STOP_M) + JOIN_GROW_M
+    } else {
+        0.0
+    }
+}
+
+/// True when a join has captured the route: close in and pointed along it.
+pub fn join_done(lateral: f64, err_deg: f64) -> bool {
+    lateral < JOIN_DONE_LAT_M && err_deg.abs() < JOIN_DONE_ERR_DEG
+}
+
+/// The speed cap while joining: a turn-around happens at the sharp-corner
+/// pace, an aligned rejoin at ordinary bend speed. Never the open-taxiway
+/// pace — the aircraft is off the pavement it was cleared on.
+pub fn join_cap_kts(err_deg: f64) -> f64 {
+    if err_deg.abs() > JOIN_ERR_SLOW_DEG {
+        SHARP_KTS
+    } else {
+        TURN_KTS
+    }
+}
+
+// ---- Line-up: from the hold-short position onto the runway centreline ----
+
+/// Farther than this from the centreline is not a hold-short position —
+/// the same reasoning as [`MAX_JOIN_M`]: the geometry stops meaning
+/// "line up" and starts meaning "drive somewhere".
+pub(crate) const LINE_UP_MAX_LATERAL_M: f64 = 150.0;
+/// Runway that must remain beyond the alignment stop — lined up with less
+/// than this ahead is a line-up onto the wrong end.
+const LINE_UP_MIN_REMAINING_M: f64 = 400.0;
+/// The drive continues this far down the centreline past the entry point,
+/// so the nose is pointing down the runway when it stops, not across it.
+const LINE_UP_ALIGN_M: f64 = 60.0;
+
+/// The synthetic route of a line-up: from where the aircraft sits, onto the
+/// centreline ahead, and down it far enough to finish aligned. `None` when
+/// the geometry refuses (too far off, or not enough runway past the stop).
+pub fn line_up_path(rwy: &crate::autoland::Runway, lat: f64, lon: f64) -> Option<Vec<(f64, f64)>> {
+    use crate::autoland::{along_track_nm, cross_track_nm, project_latlon};
+    let lateral = (cross_track_nm(lat, lon, rwy) * M_PER_NM).abs();
+    if lateral > LINE_UP_MAX_LATERAL_M {
+        return None;
+    }
+    // Distance already past the threshold, floored at the numbers — an
+    // entry from a midfield hold lines up midfield, one abeam the numbers
+    // lines up at the numbers.
+    let past_m = (-along_track_nm(lat, lon, rwy) * M_PER_NM).max(0.0);
+    // Enter ahead of abeam by about the lateral offset (a ~45 degree
+    // swing), never less than one turn's worth — and capped: a far-set
+    // holding point (LXGB's Echo sits ~90 m off the strip) doesn't need a
+    // 90 m lead, it needs a sharper swing the taxi law already handles.
+    let entry_m = past_m + lateral.clamp(30.0, 60.0);
+    let stop_m = entry_m + LINE_UP_ALIGN_M;
+    if rwy.length_m - stop_m < LINE_UP_MIN_REMAINING_M {
+        return None;
+    }
+    let e = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, entry_m / M_PER_NM);
+    let b = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, stop_m / M_PER_NM);
+    Some(vec![(lat, lon), e, b])
+}
+
+/// Pick the runway end to line up on: feasible geometry, matching the
+/// cleared runway when the tower named one (lining up on 09 with a 27
+/// clearance is the backwards trap, refused upstream by returning the
+/// match only). Nearest threshold among the feasible wins.
+pub fn pick_line_up(
+    cands: &[crate::autoland::Runway],
+    lat: f64,
+    lon: f64,
+    cleared: Option<&str>,
+) -> Option<(crate::autoland::Runway, Vec<(f64, f64)>)> {
+    let mut best: Option<(crate::autoland::Runway, Vec<(f64, f64)>, f64)> = None;
+    for r in cands {
+        if let Some(c) = cleared {
+            if !crate::autotakeoff::runway_matches(&r.id, c) {
+                continue;
+            }
+        }
+        let Some(path) = line_up_path(r, lat, lon) else { continue };
+        if best.as_ref().is_none_or(|(_, _, d)| r.dist_nm < *d) {
+            best = Some((r.clone(), path, r.dist_nm));
+        }
+    }
+    best.map(|(r, p, _)| (r, p))
 }
 
 /// Pure-pursuit lookahead: seconds of taxi ahead, floored so creep-speed
@@ -273,6 +404,10 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     // External stop ("stop" / both pedals park the target at 0): the
     // schedule stands aside until a "go" restores a rolling target.
     let mut ext_stopped = false;
+    // Seeded at the first fix: >0 means we engaged off the route or facing
+    // against it and are JOINING — widened guard, bend-speed cap — until
+    // captured, when it drops to 0 and the established guard takes over.
+    let mut join_allow: Option<f64> = None;
     loop {
         if !ACTIVE.load(Ordering::Relaxed) {
             break;
@@ -350,9 +485,29 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             continue;
         };
+        // Steering error first: the join state and the guard both need it.
+        let err = route.heading_err_deg(lat, lon, psi, progress, lookahead_m(gs_kts));
+        let allow = *join_allow.get_or_insert_with(|| {
+            let a = join_allowance_m(lateral, err);
+            if a > 0.0 {
+                tracing::info!(lateral, err, "auto taxi: joining the route");
+                crate::blackbox::record(
+                    "autotaxi",
+                    serde_json::json!({"event": "join", "lateral_m": lateral, "err_deg": err}),
+                );
+            }
+            a
+        });
+        if allow > 0.0 && join_done(lateral, err) {
+            tracing::info!(lateral, "auto taxi: joined the route");
+            crate::blackbox::record("autotaxi", serde_json::json!({"event": "joined"}));
+            join_allow = Some(0.0);
+        }
         // Too far off the pavement we were cleared on: stop, hand steering
-        // back, and say so. Never drive an uncleared recovery.
-        if lateral > OFF_ROUTE_STOP_M {
+        // back, and say so. Established that's the tight guard; a join gets
+        // its engage distance plus turning room, never more — the one drive
+        // this loop makes is TOWARD the route.
+        if lateral > OFF_ROUTE_STOP_M + join_allow.unwrap_or(0.0) {
             tracing::warn!(lateral, "auto taxi: off route, stopping");
             crate::blackbox::record(
                 "autotaxi",
@@ -377,7 +532,9 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             crate::blackbox::record("autotaxi", serde_json::json!({"event": "holding_point"}));
             speedhold::set_taxi_target(0.0);
             let _ = xp.set_float(TAXI_STEER, 0.0).await;
-            let line = if route.holding_point.is_empty() {
+            let line = if let Some(done) = &route.done_line {
+                done.clone()
+            } else if route.holding_point.is_empty() {
                 "Holding point. Holding position, brakes set.".to_string()
             } else {
                 format!("Holding point {}. Holding position, brakes set.", route.holding_point)
@@ -386,9 +543,12 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             ACTIVE.store(false, Ordering::Relaxed);
             break;
         }
-        // Steering: aim at the route ahead, command the error down.
-        let err = route.heading_err_deg(lat, lon, psi, progress, lookahead_m(gs_kts));
-        if xp.set_float(TAXI_STEER, steer_cmd(err)).await.is_err() {
+        // Steering: aim at the route ahead, command the error down, with
+        // the lock tapered by groundspeed so a standstill can break away.
+        // From a backwards or off-route start this is the whole join —
+        // the deflection tightens as the roll builds.
+        let steer = steer_cmd(err) * steer_authority(gs_kts);
+        if xp.set_float(TAXI_STEER, steer).await.is_err() {
             // The channel vanished (plugin reload): no steering, no drive.
             tracing::warn!("auto taxi: steer channel lost, stopping");
             speedhold::set_taxi_target(0.0);
@@ -417,7 +577,10 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             _ => {}
         }
         if !ext_stopped {
-            let sched = schedule_kts(base, &route, progress, gs_kts);
+            let mut sched = schedule_kts(base, &route, progress, gs_kts);
+            if join_allow.unwrap_or(0.0) > 0.0 {
+                sched = sched.min(join_cap_kts(err));
+            }
             if (sched - last_sched).abs() > 0.01 {
                 speedhold::set_taxi_target(sched);
                 last_sched = sched;
@@ -531,6 +694,110 @@ mod tests {
         assert_eq!(lookahead_m(0.0), 12.0);
         assert!(lookahead_m(10.0) > 12.0 && lookahead_m(10.0) < 50.0);
         assert_eq!(lookahead_m(60.0), 50.0);
+    }
+
+    #[test]
+    fn steering_authority_tapers_with_speed_so_a_standstill_breaks_away() {
+        assert!(steer_authority(0.0) < 0.4, "parked lock must stay partial");
+        assert!(steer_authority(0.0) > 0.2, "but enough to actually turn");
+        assert!(steer_authority(1.5) > steer_authority(0.5), "authority builds with the roll");
+        assert_eq!(steer_authority(3.0), 1.0, "full lock once rolling");
+        assert_eq!(steer_authority(20.0), 1.0);
+    }
+
+    #[test]
+    fn a_backwards_start_is_a_join_and_steers_hard_around() {
+        let r = Route::build(&watch()).expect("route");
+        // On the first leg, ON the centreline, but facing WEST against an
+        // eastbound route: near-180 error, full deflection, join granted.
+        let (lat, lon) = ll(50.0, 0.0);
+        let (progress, lateral) = r.fix(lat, lon).expect("fix");
+        let err = r.heading_err_deg(lat, lon, 270.0, progress, lookahead_m(3.0));
+        assert!(err.abs() > 150.0, "backwards means a big error, got {err}");
+        assert_eq!(steer_cmd(err).abs(), 1.0, "turn-around wants full deflection");
+        assert!(join_allowance_m(lateral, err) > 0.0, "wrong-facing start must join");
+        assert_eq!(join_cap_kts(err), SHARP_KTS, "turn-arounds happen at the sharp pace");
+    }
+
+    #[test]
+    fn an_off_route_start_is_a_join_and_aims_back_at_the_route() {
+        let r = Route::build(&watch()).expect("route");
+        // 60 m LEFT of the first leg, heading east (parallel to it): the aim
+        // point on the route pulls strongly RIGHT, back toward the pavement.
+        let (lat, lon) = ll(50.0, 60.0);
+        let (progress, lateral) = r.fix(lat, lon).expect("fix");
+        assert!((lateral - 60.0).abs() < 2.0, "{lateral}");
+        let err = r.heading_err_deg(lat, lon, 90.0, progress, lookahead_m(5.0));
+        assert!(err > 20.0, "must aim back at the route, got {err}");
+        let allow = join_allowance_m(lateral, err);
+        assert!(allow >= lateral + JOIN_GROW_M - 1.0, "guard covers the engage distance: {allow}");
+    }
+
+    #[test]
+    fn join_state_machine_grants_and_captures() {
+        // On route, aligned: no join, the tight guard from tick one.
+        assert_eq!(join_allowance_m(2.0, 5.0), 0.0);
+        // Off route or backwards: joined with turning room.
+        assert!(join_allowance_m(40.0, 0.0) > 40.0);
+        assert!(join_allowance_m(2.0, 170.0) > OFF_ROUTE_STOP_M);
+        // Captured only when close AND aligned.
+        assert!(join_done(5.0, 10.0));
+        assert!(!join_done(5.0, 90.0), "close but still turning is not joined");
+        assert!(!join_done(20.0, 10.0), "aligned but wide is not joined");
+        // Aligned rejoins ride at bend speed, not the sharp crawl.
+        assert_eq!(join_cap_kts(20.0), TURN_KTS);
+        assert_eq!(join_cap_kts(-170.0), SHARP_KTS);
+    }
+
+    #[test]
+    fn line_up_enters_ahead_and_finishes_down_the_centreline() {
+        use crate::autoland::{along_track_nm, cross_track_nm, Runway};
+        // A 2,000 m runway taking off due north from (0,0); hold-short spot
+        // 40 m EAST of the centreline, abeam the numbers.
+        let rwy = Runway {
+            icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
+            course_deg: 0.0, length_m: 2000.0, surface: 1, dist_nm: 0.02, elev_ft: 0.0,
+        };
+        let (hlat, hlon) = crate::autoland::project_latlon(0.0, 0.0, 90.0, 40.0 / 1852.0);
+        let path = line_up_path(&rwy, hlat, hlon).expect("feasible");
+        assert_eq!(path.len(), 3);
+        // The entry point is ON the centreline, ahead of abeam.
+        let (elat, elon) = path[1];
+        assert!((cross_track_nm(elat, elon, &rwy) * 1852.0).abs() < 2.0, "entry on centreline");
+        let entry_past = -along_track_nm(elat, elon, &rwy) * 1852.0;
+        assert!(entry_past > 20.0 && entry_past < 120.0, "ahead of abeam: {entry_past}");
+        // The stop point is further down, still leaving plenty of runway.
+        let (blat, blon) = path[2];
+        let stop_past = -along_track_nm(blat, blon, &rwy) * 1852.0;
+        assert!(stop_past > entry_past + 40.0, "finishes aligned: {stop_past}");
+        // Too far off the strip is not a line-up.
+        let (flat, flon) = crate::autoland::project_latlon(0.0, 0.0, 90.0, 300.0 / 1852.0);
+        assert!(line_up_path(&rwy, flat, flon).is_none());
+        // Near the far end there is no runway left to line up onto.
+        let (nlat, nlon) = crate::autoland::project_latlon(0.0, 0.0, 0.0, 1800.0 / 1852.0);
+        let (nlat, nlon) = crate::autoland::project_latlon(nlat, nlon, 90.0, 40.0 / 1852.0);
+        assert!(line_up_path(&rwy, nlat, nlon).is_none());
+    }
+
+    #[test]
+    fn line_up_pick_honors_the_cleared_runway() {
+        use crate::autoland::Runway;
+        let mk = |id: &str, course: f64, thr: (f64, f64), dist: f64| Runway {
+            icao: "TEST".into(), id: id.into(), thr_lat: thr.0, thr_lon: thr.1,
+            course_deg: course, length_m: 2000.0, surface: 1, dist_nm: dist, elev_ft: 0.0,
+        };
+        // Both ends of one strip: 36 at the near threshold, 18 at the far.
+        let far = crate::autoland::project_latlon(0.0, 0.0, 0.0, 2000.0 / 1852.0);
+        let cands = vec![mk("36", 0.0, (0.0, 0.0), 0.02), mk("18", 180.0, far, 1.05)];
+        let (hlat, hlon) = crate::autoland::project_latlon(0.0, 0.0, 90.0, 40.0 / 1852.0);
+        // No clearance on record: geometry picks the near end.
+        let (r, _) = pick_line_up(&cands, hlat, hlon, None).expect("pick");
+        assert_eq!(r.id, "36");
+        // The tower cleared 36: same answer, crosschecked.
+        assert_eq!(pick_line_up(&cands, hlat, hlon, Some("36")).unwrap().0.id, "36");
+        // The tower cleared 18 and we're at the 36 end: nothing safe to
+        // drive onto — the far end is a taxi clearance, not a line-up.
+        assert!(pick_line_up(&cands, hlat, hlon, Some("18")).is_none());
     }
 
     #[test]

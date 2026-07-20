@@ -29,6 +29,7 @@ pub mod radio;
 pub mod recover;
 pub mod reverse;
 pub mod speedhold;
+pub mod takeoff;
 pub mod taxi;
 pub mod reminder;
 
@@ -207,9 +208,40 @@ impl Registry {
                 .and_then(|r| r.approach_kts)
                 .unwrap_or((vs * 1.3).max(70.0));
             tools.push(Box::new(autoland::Autoland {
-                cfg: ap,
+                cfg: ap.clone(),
                 approach_ias,
                 prop: profile.prop.clone(),
+            }));
+            // Auto takeoff — the departure sibling: the roll steers through
+            // the plugin's channel, the climb-out rides this same AP. Speeds
+            // from the airframe's reference figures, conservative fallbacks
+            // off stall speed when a profile carries none.
+            let vr = profile
+                .reference
+                .as_ref()
+                .and_then(|r| r.vr_kts)
+                .unwrap_or((vs * 1.15).max(55.0));
+            let vy = profile
+                .reference
+                .as_ref()
+                .and_then(|r| r.vy_kts)
+                .unwrap_or(vr + 15.0);
+            let climb = profile
+                .reference
+                .as_ref()
+                .and_then(|r| r.best_climb_fpm)
+                .map_or(500.0, |c| (c * 0.8).clamp(400.0, 1500.0));
+            tools.push(Box::new(takeoff::AutoTakeoff {
+                cfg: ap,
+                vr_kts: vr,
+                vy_kts: vy,
+                climb_fpm: climb,
+                retract_gear: profile.retractable_gear,
+                takeoff_roll_m: profile
+                    .reference
+                    .as_ref()
+                    .and_then(|r| r.takeoff_distance_ft)
+                    .map(|f| f * 0.3048),
             }));
         }
 
@@ -242,8 +274,12 @@ impl Registry {
                 approach_kts: approach,
                 park_brake_valve_set: profile.park_brake_valve_set,
             }));
-            // Auto taxi stands on the same governor, so it ships with it.
+            // Auto taxi stands on the same governor, so it ships with it —
+            // and the line-up (hold-short onto the centreline) with both.
             tools.push(Box::new(taxi::AutoTaxi {
+                park_brake_valve_set: profile.park_brake_valve_set,
+            }));
+            tools.push(Box::new(taxi::LineUp {
                 park_brake_valve_set: profile.park_brake_valve_set,
             }));
         }

@@ -73,6 +73,16 @@ pub fn clearance_state() -> Option<tower::State> {
     lock(&CLEARANCE).as_ref().map(|c| c.state)
 }
 
+/// The runway END of the standing clearance ("09R"), if one is known —
+/// the auto-takeoff line-up crosscheck reads it against the strip the
+/// aircraft is actually pointing down.
+pub fn clearance_runway() -> Option<String> {
+    lock(&CLEARANCE)
+        .as_ref()
+        .map(|c| c.runway_ident.clone())
+        .filter(|r| !r.is_empty())
+}
+
 /// Read the cleared taxi route under its lock. Closure-scoped so a guard
 /// can never be held across an await.
 pub fn with_taxi_route<R>(f: impl FnOnce(Option<&TaxiWatch>) -> R) -> R {

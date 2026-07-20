@@ -4078,6 +4078,38 @@ impl Station {
         self.briefing_text(com1)
     }
 
+    /// The crew's note after a keyed call nobody answered while this station
+    /// is in range. The full directory ([`Station::briefing_text`]) answers
+    /// the QUESTION "what frequencies are there" — after dead air the only
+    /// useful fact is who WILL answer (all six services recited after one
+    /// void call on ground read as noise, 2026-07-20). Only tower, approach
+    /// and departure are ever manned here; a COM1 sitting on a published but
+    /// unmanned row (ground, clearance, ATIS, unicom) gets told so by name.
+    /// Pure — the caller reads COM1 and the air/ground state.
+    pub fn void_note(&self, com1_khz: Option<i64>, airborne: bool) -> String {
+        let (word, khz) = match self.approach_khz.filter(|_| airborne) {
+            Some(k) => ("approach", k),
+            None => ("tower", self.tower_khz),
+        };
+        let apt = spoken_airport(&self.apt.name);
+        let tuned = com1_khz.and_then(|c| {
+            SERVICES.iter().find_map(|(w, kind)| {
+                self.apt.freq(*kind).filter(|f| (f.khz - c).abs() <= 5).map(|_| *w)
+            })
+        });
+        match tuned {
+            Some("atis") => format!(
+                "That's the ATIS, it only broadcasts. Call {apt} {word}, {}.",
+                atis::spoken_mhz(khz)
+            ),
+            Some(w) if w != word => format!(
+                "Nobody's manning {w} here. Call {apt} {word}, {}.",
+                atis::spoken_mhz(khz)
+            ),
+            _ => format!("Try {apt} {word} on {}.", atis::spoken_mhz(khz)),
+        }
+    }
+
     /// Deterministic named-station tuning: "tune/select/switch to/contact the
     /// tower|atis|ground|approach|departure" (or generic "atc"/"station" =
     /// tower) resolved against this airport's apt.dat frequencies. Requires a
@@ -6552,6 +6584,39 @@ mod tests {
         });
         let b = st.briefing_text(Some(131200));
         assert!(b.ends_with("Com one is on the tower."), "{b}");
+    }
+
+    #[test]
+    fn void_note_points_at_who_answers_not_the_directory() {
+        let mut st = lxgb();
+        st.apt.freqs.push(nav::AtcFreq {
+            kind: nav::FREQ_GROUND,
+            khz: 121800,
+            name: "Ground".into(),
+        });
+        st.apt.freqs.push(nav::AtcFreq {
+            kind: nav::FREQ_ATIS,
+            khz: 136525,
+            name: "ATIS".into(),
+        });
+        // On the ground tuned to the published but unmanned ground row:
+        // name it and point at the tower — never the whole directory.
+        let n = st.void_note(Some(121800), false);
+        assert!(n.contains("Nobody's manning ground"), "{n}");
+        assert!(n.contains("tower, one three one decimal two"), "{n}");
+        assert!(!n.contains("departure") && !n.contains("clearance"), "{n}");
+        // Transmitting on the ATIS: it's a broadcast, say so.
+        let n = st.void_note(Some(136525), false);
+        assert!(n.contains("only broadcasts"), "{n}");
+        // Off every published row: just the pointer.
+        let n = st.void_note(Some(118000), false);
+        assert!(n.starts_with("Try Gibraltar tower on"), "{n}");
+        // Airborne with an approach published, approach is the one to call.
+        let n = st.void_note(Some(118000), true);
+        assert!(n.contains("approach"), "{n}");
+        // A failed COM1 read still points somewhere useful.
+        let n = st.void_note(None, false);
+        assert!(n.contains("tower"), "{n}");
     }
 
     /// A fixture apt.dat with LXGB's rows verbatim from the Global Airports

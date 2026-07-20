@@ -17,12 +17,10 @@ use serde_json::{json, Value};
 use super::{speedhold, Tool, ToolCtx};
 use crate::autotaxi;
 use crate::party_line;
+use crate::tower;
 
 /// Default pace when the pilot doesn't name one — a brisk GA taxi.
 const DEFAULT_KTS: f64 = 10.0;
-/// Facing more than this off the route's direction of travel at engage is a
-/// refusal: pure pursuit from a backwards start is a pirouette, not a taxi.
-const MAX_ENGAGE_ERR_DEG: f64 = 100.0;
 
 pub struct AutoTaxi {
     /// The airframe's park-brake valve SET sense, passed through to the
@@ -121,21 +119,21 @@ impl Tool for AutoTaxi {
         let Some((progress, lateral)) = route.fix(lat, lon) else {
             return Ok("I can't make out the taxi route from here.".to_string());
         };
-        if lateral > autotaxi::OFF_ROUTE_STOP_M {
+        // Way off the route the projection stops meaning anything — that's a
+        // refusal. Merely off it, or facing the wrong way, is a JOIN: the
+        // loop turns toward the cleared pavement at bend speed and picks the
+        // route up where the projection says.
+        if lateral > autotaxi::MAX_JOIN_M {
             return Ok(format!(
-                "We're about {} meters off the cleared route. Get us onto it and ask again.",
+                "We're about {} meters off the cleared route. Get us near it and ask again.",
                 (lateral / 10.0).round() as i64 * 10
             ));
         }
         if route.remaining(progress) <= 1.0 {
             return Ok("We're already at the holding point.".to_string());
         }
-        if route.heading_err_deg(lat, lon, psi, progress, 20.0).abs() > MAX_ENGAGE_ERR_DEG {
-            return Ok(
-                "We're facing against the route. Turn us around first, then I'll take it."
-                    .to_string(),
-            );
-        }
+        let err = route.heading_err_deg(lat, lon, psi, progress, 20.0);
+        let joining = autotaxi::join_allowance_m(lateral, err) > 0.0;
         // No steering channel (plugin missing or old) — offer what still works.
         if !autotaxi::steer_channel_ok(ctx.xplane).await {
             return Ok(
@@ -169,9 +167,145 @@ impl Tool for AutoTaxi {
         } else {
             format!("holding point {hp}")
         };
+        Ok(if joining {
+            format!(
+                "My taxi. I'll get us onto the route first, then {dest} via {}. Your pedals or my controls take it back any time.",
+                watch.via
+            )
+        } else {
+            format!(
+                "My taxi. {dest} via {}, {base:.0} knots. Your pedals or my controls take it back any time.",
+                watch.via
+            )
+        })
+    }
+}
+
+/// `line_up` — the copilot drives from the hold-short position onto the
+/// runway and stops aligned on the centreline: the missing middle between
+/// auto taxi (ends at the hold line) and auto takeoff (needs the aircraft
+/// already pointing down the strip). Same governor front door, same
+/// steering loop — the route is synthetic ([`autotaxi::line_up_path`]),
+/// picked against the CLEARED runway so a "line up and wait runway two
+/// seven" can never be driven onto the 09 end.
+pub struct LineUp {
+    pub park_brake_valve_set: Option<f64>,
+}
+
+/// Line-up pace: a runway entry is a sharp-corner maneuver end to end.
+const LINE_UP_KTS: f64 = 6.0;
+
+#[async_trait]
+impl Tool for LineUp {
+    fn name(&self) -> &str {
+        "line_up"
+    }
+
+    fn description(&self) -> &str {
+        "The copilot drives the aircraft from the hold-short position onto \
+         the runway and stops lined up on the centreline. Use ONLY when the \
+         pilot asks the copilot to do it: 'line us up', 'get us lined up', \
+         'take us onto the runway'. (The pilot READING BACK 'line up and \
+         wait runway 27' is talking to ATC, never this. Stopping it is 'my \
+         controls' / 'stop'.)"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if autotaxi::ACTIVE.load(Relaxed) {
+            return Ok("I'm already driving. Let me finish, then ask again.".to_string());
+        }
+        if crate::autotakeoff::ACTIVE.load(Relaxed) {
+            return Ok("I'm flying the takeoff already.".to_string());
+        }
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::IS_IN_REPLAY)
+            .await
+            .is_ok_and(|v| v > 0.5)
+        {
+            return Ok("We're in replay. Go back to live and ask again.".to_string());
+        }
+        if ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) < 0.5 {
+            return Ok("We're airborne.".to_string());
+        }
+        // Driving onto a runway needs the tower's word for it when a tower
+        // is running: "line up and wait" or the takeoff clearance itself.
+        // No station (copilot-only mode, real ATC) leaves it to the pilot.
+        match party_line::clearance_state() {
+            None | Some(tower::State::LinedUp) | Some(tower::State::TakeoffCleared) => {}
+            Some(tower::State::TaxiCleared) => {
+                return Ok(
+                    "We're only cleared to taxi. Get the line-up or takeoff clearance first, then I'll put us on."
+                        .to_string(),
+                );
+            }
+            Some(_) => {
+                return Ok("We're not cleared onto the runway.".to_string());
+            }
+        }
+        let (Ok(lat), Ok(lon)) = (
+            ctx.xplane.get_float(autotaxi::LAT).await,
+            ctx.xplane.get_float(autotaxi::LON).await,
+        ) else {
+            return Ok("I can't read our position right now.".to_string());
+        };
+        if !autotaxi::steer_channel_ok(ctx.xplane).await {
+            return Ok(
+                "I can't steer. The x-copilot plugin needs updating, so the line-up is yours."
+                    .to_string(),
+            );
+        }
+        // The apt.dat scan is seconds of file streaming — off the executor.
+        let apt = super::autoland::apt_dat_path();
+        let cands = tokio::task::spawn_blocking(move || {
+            crate::autoland::nearby_runways(&apt, lat, lon, 1.0)
+        })
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
+        let cleared = party_line::clearance_runway();
+        let Some((rwy, path)) = autotaxi::pick_line_up(&cands, lat, lon, cleared.as_deref())
+        else {
+            return Ok(match cleared {
+                Some(c) => format!(
+                    "I can't find runway {} next to us. Taxi us closer and ask again.",
+                    crate::atis::spoken_runway(&c)
+                ),
+                None => "We're not next to a runway I can line up on.".to_string(),
+            });
+        };
+        let watch = crate::station::TaxiWatch {
+            path,
+            via: String::new(),
+            seg: Vec::new(),
+            holding_point: String::new(),
+        };
+        let Some(mut route) = autotaxi::Route::build(&watch) else {
+            return Ok("We're basically on the runway already. Roll forward a touch and we're lined up."
+                .to_string());
+        };
+        let spoken = crate::atis::spoken_runway(&rwy.id);
+        route.done_line = Some(format!("Lined up runway {spoken}. Holding position."));
+        // Governor through the front door: parking-brake and held-brake
+        // gates apply to a line-up unchanged.
+        let arm_line = speedhold::HoldSpeed {
+            approach_kts: None,
+            park_brake_valve_set: self.park_brake_valve_set,
+        }
+        .execute(&json!({ "knots": LINE_UP_KTS }), ctx)
+        .await?;
+        if !speedhold::taxi_hold_active() {
+            return Ok(arm_line);
+        }
+        autotaxi::start(ctx.config.xplane_base_url.clone(), ctx.voice.cloned(), route, LINE_UP_KTS);
         Ok(format!(
-            "My taxi. {dest} via {}, {base:.0} knots. Your pedals or my controls take it back any time.",
-            watch.via
+            "Lining us up, runway {spoken}. Your pedals or my controls take it back any time."
         ))
     }
 }

@@ -587,6 +587,50 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         let on = !(has(t, "off") || t.contains("disconnect") || t.contains("disengage"));
         return Some(call("autothrottle", json!({ "on": on })));
     }
+    // Auto takeoff — the copilot flies the roll and initial climb. Only
+    // first/second-person shapes: a READBACK ("cleared for takeoff runway
+    // two seven") and a call to the tower ("ready for takeoff") carry none
+    // of these, so neither can ever arm it — the same trap the auto-taxi
+    // rules dodge. Abort shapes first, so "abort the takeoff" never re-arms.
+    {
+        let takeoff_word = t.contains("takeoff") || t.contains("take off") || t.contains("take us off");
+        if takeoff_word
+            && (has(t, "abort") || has(t, "reject") || has(t, "cancel") || has(t, "stop"))
+        {
+            return Some(call("auto_takeoff", json!({ "off": true })));
+        }
+        if t == "abort" || t == "abort abort" || t == "abort abort abort" {
+            return Some(call("auto_takeoff", json!({ "off": true })));
+        }
+        // The normalizer peels trailing politeness, so "take off for me"
+        // arrives as the bare words — and like bare "taxi", nobody says
+        // them to a copilot meaning anything else (a readback always
+        // carries "cleared for" plus the runway, so it stays longer).
+        if t == "takeoff" || t == "take off"
+            || t.contains("auto takeoff") || t.contains("auto take off")
+            || t.contains("take off for me") || t.contains("takeoff for me")
+            || t.contains("take off for us") || t.contains("takeoff for us")
+            || t.contains("take us off") || t.contains("take off when ready")
+            || t.contains("you have the takeoff") || t.contains("you have the take off")
+            || t.contains("your takeoff") || t.contains("your take off")
+            || t.contains("you fly the takeoff") || t.contains("fly the takeoff")
+        {
+            return Some(call("auto_takeoff", json!({})));
+        }
+    }
+    // Line up — the copilot drives from the hold-short position onto the
+    // runway centreline. The pilot's READBACK "line up and wait ..." always
+    // carries "wait" (and "lining up" is the short echo), so both are
+    // excluded; the command shapes are first/second-person. Trailing "for
+    // me" peels, so bare "line up" as the whole utterance is the command
+    // ("can you line me up to the runway" went unanswered live, 2026-07-20).
+    if !has(t, "wait") && !t.contains("lining")
+        && (t == "line up" || t == "line up to the runway" || t == "line up on the runway"
+            || t.contains("line us up") || t.contains("line me up")
+            || t.contains("get us lined up") || t.contains("take us onto the runway"))
+    {
+        return Some(call("line_up", json!({})));
+    }
     // Auto taxi — the copilot steers the cleared route to the holding point.
     // Before every speed-hold rule, so "taxi for me at 12 knots" doesn't fall
     // into plain hold_speed. Deliberately NOT matching "taxi to holding point
@@ -604,10 +648,17 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     // Bare "taxi" as the whole utterance lands here too: the normalizer
     // peels trailing politeness, so "taxi for me" arrives as just "taxi" —
     // and nobody says the bare word to a copilot meaning anything else.
-    if t == "taxi" || t.contains("taxi for me") || t.contains("taxi for us")
+    // The exact "taxi to (the) holding point" with NO specifics is a
+    // request too: "let's taxi to holding point" peels its leading "lets"
+    // and arrived here as exactly that, then fell into the readback trap
+    // and went unanswered (live, 2026-07-20). A real readback always
+    // carries the specifics being echoed (the point name, runway, or
+    // "via ..."), so anything longer still never arms the drive.
+    if t == "taxi" || t == "taxi to holding point" || t == "taxi to the holding point"
+        || t.contains("taxi for me") || t.contains("taxi for us")
         || t.contains("you have the taxi") || t.contains("you take the taxi")
         || t.contains("you taxi") || t.contains("take us to the holding")
-        || t.contains("taxi us to the holding")
+        || t.contains("taxi us")
     {
         return Some(match num {
             Some(n) => call("auto_taxi", json!({ "knots": n })),
@@ -1656,9 +1707,48 @@ mod tests {
         assert_eq!(one("auto taxi").unwrap().1, json!({}));
         assert_eq!(one("cancel auto taxi").unwrap().1, json!({"off":true}));
         assert_eq!(one("stop the auto taxi").unwrap().1, json!({"off":true}));
+        // "let's taxi ..." peels its leading "lets", so these arrive as the
+        // bare destination form — a request, not a readback, because no
+        // specifics are being echoed (both went unanswered live).
+        assert_eq!(one("let's taxi to holding point").unwrap().0, "auto_taxi");
+        assert_eq!(one("let's taxi to the holding point").unwrap().0, "auto_taxi");
+        assert_eq!(one("lets taxi").unwrap().0, "auto_taxi");
+        assert_eq!(one("taxi us to the holding point").unwrap().0, "auto_taxi");
         // The pilot's taxi READBACK to the tower must never arm the drive.
         assert!(one("taxi to holding point alpha one runway two seven via bravo")
             .is_none_or(|(tool, _)| tool != "auto_taxi"));
+        // Auto takeoff — first/second-person shapes only.
+        assert_eq!(one("take off for me").unwrap(), ("auto_takeoff".into(), json!({})));
+        assert_eq!(one("you have the takeoff").unwrap().0, "auto_takeoff");
+        assert_eq!(one("your takeoff").unwrap().0, "auto_takeoff");
+        assert_eq!(one("auto takeoff").unwrap().1, json!({}));
+        assert_eq!(one("take us off").unwrap().0, "auto_takeoff");
+        assert_eq!(one("fly the takeoff").unwrap().0, "auto_takeoff");
+        assert_eq!(one("abort takeoff").unwrap().1, json!({"off":true}));
+        assert_eq!(one("reject the takeoff").unwrap().1, json!({"off":true}));
+        assert_eq!(one("cancel the takeoff").unwrap().1, json!({"off":true}));
+        assert_eq!(one("abort").unwrap().1, json!({"off":true}));
+        assert_eq!(one("abort abort abort").unwrap().1, json!({"off":true}));
+        // Line up — the maneuver between the hold and the takeoff.
+        assert_eq!(one("line us up").unwrap(), ("line_up".into(), json!({})));
+        assert_eq!(one("can you line me up to the runway").unwrap().0, "line_up");
+        assert_eq!(one("line up for me").unwrap().0, "line_up");
+        assert_eq!(one("get us lined up").unwrap().0, "line_up");
+        assert_eq!(one("take us onto the runway").unwrap().0, "line_up");
+        // The LUAW readback and its short echo must never drive us on.
+        assert!(one("line up and wait runway two seven")
+            .is_none_or(|(tool, _)| tool != "line_up"));
+        assert!(one("lining up runway two seven").is_none_or(|(tool, _)| tool != "line_up"));
+        // The READBACK and the call to the tower must never arm it.
+        assert!(one("cleared for takeoff runway two seven")
+            .is_none_or(|(tool, _)| tool != "auto_takeoff"));
+        assert!(one("ready for takeoff").is_none_or(|(tool, _)| tool != "auto_takeoff"));
+        assert!(one("ready for departure").is_none_or(|(tool, _)| tool != "auto_takeoff"));
+        // ...and prop/flap takeoff settings stay with their levers (the
+        // prop phrasing resolves to set_prop on airframes that carry one —
+        // pinned by prop_lever tests — and must never arm the takeoff).
+        assert!(one("props to take off").is_none_or(|(tool, _)| tool != "auto_takeoff"));
+        assert!(one("flaps to takeoff").is_none_or(|(tool, _)| tool != "auto_takeoff"));
         // ...but altitude/heading holds stay with the autopilot rules.
         assert_eq!(one("climb and maintain 7000").unwrap().0, "set_altitude");
         // Bare relative throttle nudges (both went silent live).
