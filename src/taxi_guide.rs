@@ -500,40 +500,42 @@ fn round_m(d: f64) -> i64 {
 // --- Flat-earth geometry over the route's own neighborhood -----------------
 
 /// Meters-per-degree scales at the route's latitude — the same flat-earth
-/// approximation the planner and the compliance watch use.
-struct Geo {
+/// approximation the planner and the compliance watch use. `pub(crate)` with
+/// the polyline helpers below: the auto-taxi steering law works in the same
+/// local frame over the same published route.
+pub(crate) struct Geo {
     m_per_deg_lat: f64,
     m_per_deg_lon: f64,
 }
 
 impl Geo {
-    fn new(lat: f64) -> Geo {
+    pub(crate) fn new(lat: f64) -> Geo {
         Geo { m_per_deg_lat: 111_320.0, m_per_deg_lon: 111_320.0 * lat.to_radians().cos() }
     }
     /// (lat, lon) to meters (x east, y north) relative to `origin`.
-    fn to_m(&self, origin: (f64, f64), p: (f64, f64)) -> (f64, f64) {
+    pub(crate) fn to_m(&self, origin: (f64, f64), p: (f64, f64)) -> (f64, f64) {
         ((p.1 - origin.1) * self.m_per_deg_lon, (p.0 - origin.0) * self.m_per_deg_lat)
     }
 }
 
-fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
+pub(crate) fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     (dx * dx + dy * dy).sqrt()
 }
 
 /// Compass bearing a→b, degrees 0..360 (x east, y north).
-fn bearing(a: (f64, f64), b: (f64, f64)) -> f64 {
+pub(crate) fn bearing(a: (f64, f64), b: (f64, f64)) -> f64 {
     (b.0 - a.0).atan2(b.1 - a.1).to_degrees().rem_euclid(360.0)
 }
 
 /// Smallest signed angle a−b, degrees, in −180..180. Positive = `a` is
 /// clockwise of `b` (a right turn when in/out bearings are compared).
-fn angle_diff(a: f64, b: f64) -> f64 {
+pub(crate) fn angle_diff(a: f64, b: f64) -> f64 {
     (a - b + 540.0).rem_euclid(360.0) - 180.0
 }
 
 /// The point `s` meters along the polyline (clamped to its ends).
-fn point_at(pts: &[(f64, f64)], cum: &[f64], s: f64) -> (f64, f64) {
+pub(crate) fn point_at(pts: &[(f64, f64)], cum: &[f64], s: f64) -> (f64, f64) {
     let s = s.clamp(0.0, *cum.last().unwrap());
     for i in 1..pts.len() {
         if s <= cum[i] {
@@ -548,7 +550,7 @@ fn point_at(pts: &[(f64, f64)], cum: &[f64], s: f64) -> (f64, f64) {
 
 /// Project a position onto the route: (along-route progress m, lateral m).
 /// `None` on a degenerate path.
-fn project(path: &[(f64, f64)], lat: f64, lon: f64) -> Option<(f64, f64)> {
+pub(crate) fn project(path: &[(f64, f64)], lat: f64, lon: f64) -> Option<(f64, f64)> {
     if path.len() < 2 {
         return None;
     }

@@ -587,6 +587,33 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         let on = !(has(t, "off") || t.contains("disconnect") || t.contains("disengage"));
         return Some(call("autothrottle", json!({ "on": on })));
     }
+    // Auto taxi — the copilot steers the cleared route to the holding point.
+    // Before every speed-hold rule, so "taxi for me at 12 knots" doesn't fall
+    // into plain hold_speed. Deliberately NOT matching "taxi to holding point
+    // ..." — that's the pilot's taxi READBACK to the tower, never a request
+    // to drive (the same trap is_taxi_query dodges by being question-shaped).
+    if t.contains("auto taxi") || t.contains("autotaxi") {
+        return Some(if has(t, "stop") || has(t, "cancel") || has(t, "off") {
+            call("auto_taxi", json!({ "off": true }))
+        } else if let Some(n) = num {
+            call("auto_taxi", json!({ "knots": n }))
+        } else {
+            call("auto_taxi", json!({}))
+        });
+    }
+    // Bare "taxi" as the whole utterance lands here too: the normalizer
+    // peels trailing politeness, so "taxi for me" arrives as just "taxi" —
+    // and nobody says the bare word to a copilot meaning anything else.
+    if t == "taxi" || t.contains("taxi for me") || t.contains("taxi for us")
+        || t.contains("you have the taxi") || t.contains("you take the taxi")
+        || t.contains("you taxi") || t.contains("take us to the holding")
+        || t.contains("taxi us to the holding")
+    {
+        return Some(match num {
+            Some(n) => call("auto_taxi", json!({ "knots": n })),
+            None => call("auto_taxi", json!({})),
+        });
+    }
     // Speed hold — the copilot works the throttle ("hold 70 knots", "maintain
     // approach speed", "can you maintain an appropriate speed" — asked live with
     // no tool to answer it). Verbs first, so it beats the AP speed-bug rule
@@ -1620,6 +1647,18 @@ mod tests {
         assert!(one("go around").is_none_or(|(tool, _)| tool != "hold_speed"));
         // "taxi light on" must still be the lights, not a taxi hold.
         assert_eq!(one("taxi light on").unwrap().0, "set_lights");
+        // Auto taxi — the copilot steering is a different tool, and a pace
+        // in the phrase rides along instead of falling into hold_speed.
+        assert_eq!(one("taxi for me").unwrap(), ("auto_taxi".into(), json!({})));
+        assert_eq!(one("you have the taxi").unwrap().0, "auto_taxi");
+        assert_eq!(one("take us to the holding point").unwrap().0, "auto_taxi");
+        assert_eq!(one("taxi for me at 12 knots").unwrap().1, json!({"knots":12}));
+        assert_eq!(one("auto taxi").unwrap().1, json!({}));
+        assert_eq!(one("cancel auto taxi").unwrap().1, json!({"off":true}));
+        assert_eq!(one("stop the auto taxi").unwrap().1, json!({"off":true}));
+        // The pilot's taxi READBACK to the tower must never arm the drive.
+        assert!(one("taxi to holding point alpha one runway two seven via bravo")
+            .is_none_or(|(tool, _)| tool != "auto_taxi"));
         // ...but altitude/heading holds stay with the autopilot rules.
         assert_eq!(one("climb and maintain 7000").unwrap().0, "set_altitude");
         // Bare relative throttle nudges (both went silent live).

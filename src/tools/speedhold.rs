@@ -101,6 +101,24 @@ pub fn taxi_hold_active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
         && *MODE.lock().unwrap_or_else(|e| e.into_inner()) == Mode::Taxi
 }
+
+/// The running taxi hold's target, or `None` when the governor isn't taxiing.
+/// The auto-taxi loop reads this to spot an EXTERNAL retarget (a spoken
+/// "stop" / "go" / "taxi at 12") and fold it into its own speed schedule.
+pub fn taxi_target() -> Option<f64> {
+    taxi_hold_active().then(|| *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Retarget a RUNNING taxi hold — the auto-taxi speed schedule's knob (slow
+/// for a bend, ramp down to the holding point). No-op unless the governor is
+/// actively taxiing: this must never convert a flight hold into a taxi.
+/// Deliberately does NOT touch `LAST_TAXI_KTS`, so a schedule write of 0 at
+/// the hold-short line doesn't eat the pace a spoken "go" would resume.
+pub fn set_taxi_target(kts: f64) {
+    if taxi_hold_active() {
+        *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner()) = clamp_taxi_target(kts);
+    }
+}
 /// Target knots — updated live by a new `hold_speed` call, no restart.
 static TARGET_KTS: Mutex<f64> = Mutex::new(0.0);
 /// The last rolling taxi target, so "go" after a "stop" resumes the same
@@ -445,9 +463,18 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
     let mut paused = false;
     // The throttle position this loop last commanded. If the lever is later
     // found far from where we put it, that's the PILOT's hand — yield
-    // immediately rather than fight them for the lever (a taxi hold once
-    // yanked the throttle back from a takeoff push; never again).
+    // rather than fight them for the lever (a taxi hold once yanked the
+    // throttle back from a takeoff push; never again).
     let mut last_cmd: Option<f64> = None;
+    // One deviated read is NOT yet a hand: a hardware-axis micro-bump
+    // re-drives the dataref to wherever the physical lever RESTS (the jump
+    // size says nothing about the movement size), and that killed an auto
+    // taxi into a silent runaway (Gatwick, 2026-07-20). So the first
+    // deviation is challenged — re-command ours once and look again next
+    // tick. A hand keeps re-driving over the re-command and wins on the
+    // second read (~a tick of contest, imperceptible); a bump doesn't and
+    // the hold rides on.
+    let mut override_pending = false;
     // Last IAS sample, for the flight governor's trend (anticipation) term.
     let mut prev_ias: Option<(f64, std::time::Instant)> = None;
     // Last groundspeed sample and the EMA-smoothed trend for the taxi law's
@@ -486,11 +513,19 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
             Mode::Flight => {
                 if let (Ok(ias), Ok(thr)) = (xp.get_float(IAS).await, xp.get_float(THROTTLE).await)
                 {
-                    if last_cmd.is_some_and(|lc| (thr - lc).abs() > 0.15) {
-                        tracing::info!("speed governor: pilot override, releasing");
-                        ACTIVE.store(false, Ordering::Relaxed);
-                        break;
+                    if let Some(lc) = last_cmd.filter(|lc| (thr - lc).abs() > 0.15) {
+                        if override_pending {
+                            tracing::info!(thr, lc, "speed governor: pilot override, releasing");
+                            ACTIVE.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                        override_pending = true;
+                        tracing::info!(thr, lc, "speed governor: throttle deviated, challenging once");
+                        let _ = xp.set_float(THROTTLE, lc).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
                     }
+                    override_pending = false;
                     // Stand down when parked — holding 70 knots against the
                     // brakes is not a thing anyone wants. (Never silent: this
                     // exact path once ate three arm requests invisibly.)
@@ -615,11 +650,19 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                 if let (Ok(gs_ms), Ok(thr)) =
                     (xp.get_float(GS_MS).await, xp.get_float(THROTTLE).await)
                 {
-                    if last_cmd.is_some_and(|lc| (thr - lc).abs() > 0.15) {
-                        tracing::info!("speed governor: pilot override, releasing");
-                        ACTIVE.store(false, Ordering::Relaxed);
-                        break;
+                    if let Some(lc) = last_cmd.filter(|lc| (thr - lc).abs() > 0.15) {
+                        if override_pending {
+                            tracing::info!(thr, lc, "speed governor: pilot override, releasing");
+                            ACTIVE.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                        override_pending = true;
+                        tracing::info!(thr, lc, "speed governor: throttle deviated, challenging once");
+                        let _ = xp.set_float(THROTTLE, lc).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
                     }
+                    override_pending = false;
                     let gs_kts = gs_ms * MS_TO_KTS;
                     let now_t = std::time::Instant::now();
                     let raw_trend = match prev_gs {

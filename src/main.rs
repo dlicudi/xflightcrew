@@ -11,6 +11,7 @@ mod aircraft;
 mod approach_guide;
 mod audio;
 mod autoland;
+mod autotaxi;
 mod cabin;
 mod debrief;
 mod radiofx;
@@ -1836,10 +1837,16 @@ async fn run_session(
                 let mix_held = tools::engine::MIX_MANAGED.load(Relaxed)
                     || tools::engine::LEAN_SEEKING.load(Relaxed);
                 let reverse_in = tools::reverse::ACTIVE.load(Relaxed);
-                if (speed_held || mix_held || reverse_in) && release_intent(&tl) {
+                let taxi_driving = autotaxi::ACTIVE.load(Relaxed);
+                if (speed_held || mix_held || reverse_in || taxi_driving) && release_intent(&tl) {
                     let names_mix = tl.contains("mixture") || tl.contains("mix");
                     let names_speed = tl.contains("throttle") || tl.contains("speed")
                         || tl.contains("power") || tl.contains("taxi") || tl.contains("thr");
+                    // The steering half of an auto taxi, releasable on its
+                    // own: "my steering" keeps the speed hold — the
+                    // pre-existing "you steer, I have the throttle" split.
+                    let names_steer = tl.contains("steer") || tl.contains("pedal")
+                        || tl.contains("rudder") || tl.contains("nosewheel");
                     let names_reverse = tl.contains("reverse");
                     // "Release parking brake" names a lever NOBODY here holds:
                     // it's for the brake tool, so it must not count as a
@@ -1847,9 +1854,17 @@ async fn run_session(
                     // and left the throttle up with the brake still set
                     // (SR22, 2026-07-11).
                     let generic = !names_mix && !names_speed && !names_reverse
-                        && !tl.contains("brake");
+                        && !names_steer && !tl.contains("brake");
                     let mut released: Vec<&str> = Vec::new();
-                    if speed_held && (names_speed || generic) {
+                    if taxi_driving && (names_speed || names_steer || generic) {
+                        autotaxi::ACTIVE.store(false, Relaxed);
+                        if names_steer && !names_speed && !generic {
+                            released.push("steering's yours, I still have the speed");
+                        } else {
+                            tools::speedhold::ACTIVE.store(false, Relaxed);
+                            released.push("auto taxi off, your aircraft");
+                        }
+                    } else if speed_held && (names_speed || generic) {
                         tools::speedhold::ACTIVE.store(false, Relaxed);
                         released.push("speed hold off, your throttle");
                     }
@@ -3585,6 +3600,7 @@ fn release_intent(t: &str) -> bool {
     const CUES: &[&str] = &[
         "release", "let go", "let me go", "stop touching", "stop holding",
         "stop taxi", "hands off", "leave the throttle", "leave it",
+        "stop steering", "my steering", "my pedals", "my rudder",
         "give me command", "give me control", "give me the",
         "my controls", "my control", "mic control", "my throttle", "my thr",
         "my power", "my aircraft", "my plane", "my airplane", "my mixture", "my mix",
@@ -4810,6 +4826,9 @@ fn active_managers() -> Vec<String> {
     }
     if let Some(a) = approach_guide::armed() {
         v.push(format!("talk-down {} {}", a.icao, a.runway_id));
+    }
+    if let Some(s) = autotaxi::status() {
+        v.push(s);
     }
     if let Some(s) = tools::speedhold::status() {
         v.push(s);

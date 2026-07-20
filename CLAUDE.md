@@ -195,8 +195,14 @@ so airline callsign = medium-or-heavier — which turns "cleared for takeoff"
 into LUAW and blocks the hold release); and **named taxi routes** (apt.dat
 1201/1202 network, background-loaded per station in `TAXI_NET`, Dijkstra
 with runway edges ×25 → "taxi to holding point Alpha one runway two seven
-right via Bravo, Link two seven", crossings called out — named from strip
-GEOMETRY when the apt.dat edge is unnamed, and a crossing on the cleared
+right via Bravo, Link two seven", crossings called out — detected from
+strip GEOMETRY, never the network flags (`mark_runway_crossings`: authors
+leave runway edges unnamed AND draw crossing links as plain taxiway edges
+across the strip — EGLL's N7 crossed an active 09R with no clause, no
+guide call, 2026-07-20; any leg sampling onto a physical strip is renamed
+to the designator pair and runway-flagged, feeding the clause, the
+guide's crossing cue, and the cleared-crossing exemption; the post-trim
+final leg is exempt) — and a crossing on the cleared
 route is never berated as an incursion: silence while moving, "expedite"
 when stopped (the tower shouted "on runway two seven without clearance" at
 a pilot following its own route, 2026-07-14) — off-route nudges
@@ -312,6 +318,62 @@ triggers it). `XCOPILOT_TAXI_GUIDE=false` to disable. All of it battle-
 tests as plain `cargo test` (synthetic routes in
 [src/taxi_guide.rs](src/taxi_guide.rs)); cues blackbox as
 `"kind":"taxi_guide"`.
+
+Depth (added 2026-07-20): **auto taxi** — "taxi for me" / "you have the
+taxi" / bare "taxi" (grammar-deterministic; a "taxi to holding point ..."
+READBACK never arms it, same trap `is_taxi_query` dodges) and the copilot
+drives the cleared route to the holding point.
+[src/autotaxi.rs](src/autotaxi.rs) + the `auto_taxi` tool
+([src/tools/taxi.rs](src/tools/taxi.rs)) compose the two existing halves:
+speed is the SAME taxi governor, armed through `hold_speed`'s front door
+(every parking-brake/held-brake gate applies) and retargeted live via
+`speedhold::set_taxi_target` (6/4 kt caps into bends, a √(2·a·d) ramp to a
+stop at the hold-short point, "Holding position, brakes set" — the ROUTE
+ends there, best data first: apt.dat 1204 ACTIVE-ZONE rows (parsed onto
+`TaxiEdge.zone_of`; `ils` rows skipped until LVP ops exist) mark which
+network edges sit inside each runway's protected zone, and `plan` drops
+the trailing zone edges for the destination runway so the route ends at
+the authored per-stub holding point (EGLL marks every entry); fields
+without zones fall back to a geometric trim of the runway-junction tail,
+class-scaled in `plan_taxi_route_to` — ILS on the strip = 100 m (the GA
+40 m parked a Heathrow taxi on the 09L entry stub past the CAT line,
+2026-07-20), else width-scaled, floor 40. Untrimmed routes ended ON the
+centreline junction and parked the nose across the hold line, same day);
+steering
+is pure pursuit over the party-line polyline, written through the plugin's
+`xcopilot/taxi_steer` channel (the taxi_brake pattern exactly: per-frame
+`yoke_heading_ratio` under `override_joystick_heading`, 1 s expiry, so any
+death of the writer frees the pedals by silence). The pilot's feet win
+IN-PLUGIN: real yaw-axis deflection (baseline captured at engage, so an
+off-centre resting axis can't false-trigger) latches `xcopilot/steer_yield`
+and drops the override that frame — the app loop then stands down to
+"you steer, I have the throttle". Handbacks: "my steering"/pedals release
+steering only, "my controls" everything; the governor standing down for ANY
+reason takes steering with it (speed authority gone = nobody stopping it);
+>25 m off route = stop + release, never a driven recovery on uncleared
+pavement. Spoken "stop"/"go"/"taxi at N" fold into the schedule as external
+retargets (`LAST_TAXI_KTS` untouched by schedule writes, so "go" resumes
+the pilot's pace). Refuses in replay, airborne, facing >100° against the
+route, off it, or with no published clearance. The governor evaporating
+mid-drive is ARRESTED, never silent: the throttle-override check can't
+tell a pilot's hand from a hardware-axis bump the sim re-drives, and the
+first Gatwick sortie (2026-07-20) ran 10 to 50 kt through the grass at
+taxi power with nobody on the throttle and no voice line — now hold-gone
+on the ground closes the throttle, fires one expiring brake pulse (the
+pilot's own brake key, frees itself in a second), and says "your
+aircraft" at Caution; airborne it touches nothing. Both override
+detectors are debounced against no-touch hardware noise (same sortie,
+pilot's hands in his lap): the governor CHALLENGES the first deviated
+throttle read (re-command once, look again — a hand keeps re-driving and
+wins the second read, a pot-jitter re-drive to the quadrant's resting
+position doesn't), and the plugin's pedal yield arms 0.5 s after engage
+with the baseline following the axis until then (the probe-time baseline
+read feet coming OFF as a press) plus a 4-frame sustained-deflection
+requirement. The taxi guide keeps
+narrating over it — one voice, the copilot calling its own turns. Laws
+battle-test as plain `cargo test`; events blackbox as `"kind":"autotaxi"`.
+Steering on a castoring nosewheel (SR22) is untested — yoke_heading does
+little there at low speed; differential-brake steering is future work.
 
 Battle-test surface (all deterministic, in `cargo test --workspace` unless
 noted — plain `cargo test` at the root only runs the crew package now): the

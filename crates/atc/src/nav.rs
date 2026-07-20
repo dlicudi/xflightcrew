@@ -496,6 +496,12 @@ pub struct TaxiEdge {
     /// Taxiway name ("A", "B2"); runway edges carry the designator pair
     /// ("09L/27R"). May be empty (unnamed links).
     pub name: String,
+    /// Runway ends whose ACTIVE ZONE this edge lies inside (apt.dat 1204
+    /// arrival/departure rows) — the authored equivalent of the hold-short
+    /// lines: the zone boundary is where an aircraft holds. `ils` rows
+    /// (the CAT/LVP holds, further out) are deliberately not collected
+    /// until low-visibility ops exist.
+    pub zone_of: Vec<String>,
 }
 
 /// The taxi routing network of one airport.
@@ -504,6 +510,12 @@ pub struct TaxiNet {
     pub nodes: std::collections::HashMap<i64, (f64, f64)>,
     pub edges: Vec<TaxiEdge>,
 }
+
+/// The default hold-short standoff: how far back from the runway-junction
+/// node a planned route ends. Clears the painted line at GA fields
+/// (30-50 m from the centreline); callers pass more for instrument
+/// runways, whose holding positions sit ~100 m out.
+pub const HOLD_SHORT_STANDOFF_M: f64 = 40.0;
 
 /// A planned taxi route, ready to phrase: ordered taxiway names, runways
 /// crossed, the holding-point name, and the node polyline for the
@@ -579,7 +591,23 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
                     oneway,
                     runway: kind == "runway",
                     name: f.collect::<Vec<_>>().join(" ").trim().to_string(),
+                    zone_of: Vec::new(),
                 });
+            }
+            Some("1204") if in_airport => {
+                // classification runway-list — attaches to the 1202 row
+                // above it. arrival/departure/both zones bound the runway
+                // holding points; `ils` zones are the LVP holds, skipped.
+                let class = f.next().unwrap_or("");
+                if class == "arrival" || class == "departure" || class == "both" {
+                    if let (Some(list), Some(e)) = (f.next(), net.edges.last_mut()) {
+                        for ident in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                            if !e.zone_of.iter().any(|z| z == ident) {
+                                e.zone_of.push(ident.to_string());
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -591,12 +619,23 @@ impl TaxiNet {
     /// Route from a position to a position (a stand to a runway threshold)
     /// and extract the phrasable plan. `None` when either end doesn't snap
     /// to the network (within 3 km) or no path exists.
+    ///
+    /// The tail is ended at the destination runway's HOLD-SHORT position,
+    /// best data first: `hold_zone` names the runway ends whose authored
+    /// active zone (apt.dat 1204 rows) the route must stop at the edge of —
+    /// the per-stub truth when the airport carries it. Without zone data,
+    /// `hold_short_m` is the geometric fallback: how far back from a
+    /// runway-junction tail the route ends ([`HOLD_SHORT_STANDOFF_M`]
+    /// unless the caller knows the runway's class says otherwise —
+    /// instrument holds sit further out).
     pub fn plan(
         &self,
         from_lat: f64,
         from_lon: f64,
         to_lat: f64,
         to_lon: f64,
+        hold_short_m: f64,
+        hold_zone: &[String],
     ) -> Option<TaxiRoutePlan> {
         let m_per_deg_lat = 111_320.0;
         let m_per_deg_lon = 111_320.0 * from_lat.to_radians().cos();
@@ -715,6 +754,65 @@ impl TaxiNet {
         }
         via.dedup();
         via.truncate(6);
+        // End the route at the destination's hold-short position — the goal
+        // node is usually the taxiway/runway JUNCTION (apt.dat networks
+        // join taxiways to the runway centreline), and a route ending there
+        // put the auto-taxi stop (and the guide's "holding point ahead,
+        // that's us") across the hold line (2026-07-20).
+        //
+        // Best data first: when the airport authors ACTIVE ZONES (1204
+        // rows) for the destination runway, drop the trailing edges inside
+        // its zone — the boundary node IS the authored holding point,
+        // per stub (EGLL carries these for every entry; the geometric 100 m
+        // guess was still wrong stub-to-stub).
+        let zone_edges = if hold_zone.is_empty() {
+            0
+        } else {
+            edges_rev
+                .iter()
+                .rev()
+                .take_while(|&&ei| self.edges[ei].zone_of.iter().any(|z| hold_zone.contains(z)))
+                .count()
+                .min(path.len().saturating_sub(2))
+        };
+        if zone_edges > 0 {
+            path.truncate(path.len() - zone_edges);
+            seg.truncate(seg.len() - zone_edges);
+        }
+        // Geometric fallback: when the last node touches a runway edge,
+        // pull the tail back by a hold-short standoff so the route ends
+        // where an aircraft should STOP. A network whose tail ends at a
+        // genuine holding-point node off the runway keeps its geometry.
+        // The distance is the caller's to judge (instrument runways paint
+        // their lines much further out than GA fields) — an approximation
+        // either way, which is why authored zones win above.
+        let ends_on_runway =
+            self.edges.iter().any(|e| e.runway && (e.a == goal || e.b == goal));
+        let total: f64 = path.windows(2).map(|w| dist_m(w[0], w[1])).sum();
+        if zone_edges == 0 && ends_on_runway && total > hold_short_m + 30.0 {
+            let mut cut = 0.0;
+            while path.len() >= 3 {
+                let n = path.len();
+                let leg = dist_m(path[n - 2], path[n - 1]);
+                if cut + leg > hold_short_m {
+                    // The stop point lands inside this leg: move the end
+                    // node back along it (or drop it when only a sliver
+                    // would remain).
+                    let keep = 1.0 - (hold_short_m - cut) / leg;
+                    if keep > 0.05 {
+                        let (a, b) = (path[n - 2], path[n - 1]);
+                        path[n - 1] = (a.0 + (b.0 - a.0) * keep, a.1 + (b.1 - a.1) * keep);
+                    } else {
+                        path.pop();
+                        seg.pop();
+                    }
+                    break;
+                }
+                cut += leg;
+                path.pop();
+                seg.pop();
+            }
+        }
         // The route starts where the AIRCRAFT is, not at the node it snapped
         // to: the apron leg from the stand to the network is part of the
         // cleared route, so the off-route watch and the taxi guide measure
@@ -890,9 +988,23 @@ mod tests {
         writeln!(f, "1201 36.0020000 -5.0050000 both 2 A").unwrap();
         writeln!(f, "1201 36.0010000 -5.0050000 both 3 junction").unwrap();
         writeln!(f, "1201 36.0004000 -5.0095000 both 4 B").unwrap();
+        // A tail the way real Gateway networks build it: taxiway C on to the
+        // node where it meets the runway CENTRELINE (7), which also anchors
+        // a runway edge — the hold-short trim case.
+        writeln!(f, "1201 36.0004000 -5.0140000 both 7 hp").unwrap();
+        writeln!(f, "1201 36.0010000 -5.0140000 both 8 rwy").unwrap();
         writeln!(f, "1202 1 2 twoway taxiway A").unwrap();
         writeln!(f, "1202 2 3 twoway runway 14/32").unwrap();
         writeln!(f, "1202 3 4 twoway taxiway B").unwrap();
+        // An `ils` zone row on B: the LVP hold, which the parser must SKIP —
+        // were it collected, the zone tail below would swallow B too.
+        writeln!(f, "1204 ils 09,27").unwrap();
+        writeln!(f, "1202 4 7 twoway taxiway C").unwrap();
+        // C lies inside 09/27's active zone: node 4 is the authored holding
+        // point, the way EGLL marks every runway entry.
+        writeln!(f, "1204 departure 09,27").unwrap();
+        writeln!(f, "1204 arrival 09,27").unwrap();
+        writeln!(f, "1202 7 8 twoway runway 09/27").unwrap();
         writeln!(f, "1 1027 0 0 0MU1 Sunderland").unwrap();
         writeln!(f, "1202 5 6 twoway taxiway Z").unwrap();
         f.flush().unwrap();
@@ -900,13 +1012,13 @@ mod tests {
         let net = find_taxi_net(path.to_str().unwrap(), "LTST")
             .unwrap()
             .expect("network found");
-        assert_eq!(net.nodes.len(), 4);
-        assert_eq!(net.edges.len(), 3, "only LTST's edges, not Sunderland's");
+        assert_eq!(net.nodes.len(), 6);
+        assert_eq!(net.edges.len(), 5, "only LTST's edges, not Sunderland's");
 
         // From the stand to the 09 threshold: via A and B, crossing 14/32,
         // holding point named for the last taxiway before the runway.
         let plan = net
-            .plan(36.0031, -5.0050, 36.0000, -5.0100)
+            .plan(36.0031, -5.0050, 36.0000, -5.0100, HOLD_SHORT_STANDOFF_M, &[])
             .expect("a route exists");
         assert_eq!(plan.via, vec!["A".to_string(), "B".to_string()]);
         assert_eq!(plan.crossings, vec!["14/32".to_string()]);
@@ -918,8 +1030,42 @@ mod tests {
         assert_eq!(plan.seg.len(), plan.path.len() - 1, "seg stays aligned");
         assert_eq!(plan.seg[0], (String::new(), false));
 
+        // To a threshold whose route ends at the runway-junction node (7):
+        // the tail is pulled back by the hold-short standoff, so the route
+        // ends where an aircraft STOPS, never on the runway (an untrimmed
+        // route parked the auto taxi's nose across the hold line,
+        // 2026-07-20). Node 4's route above stays untrimmed — it never
+        // touches a runway edge.
+        let plan2 = net.plan(36.0031, -5.0050, 36.0004, -5.0141, HOLD_SHORT_STANDOFF_M, &[]).expect("a route exists");
+        assert_eq!(plan2.holding_point, "C");
+        let &(llat, llon) = plan2.path.last().unwrap();
+        let dx = (llon - (-5.0140)) * 111_320.0 * 36.0_f64.to_radians().cos();
+        let dy = (llat - 36.0004) * 111_320.0;
+        let d = (dx * dx + dy * dy).sqrt();
+        assert!((35.0..=45.0).contains(&d), "stops ~40 m short of the junction: {d}");
+        assert_eq!(plan2.seg.len(), plan2.path.len() - 1, "seg stays aligned after the trim");
+        // An instrument-scale standoff trims further back along the same
+        // route (Heathrow's CAT holds sit ~100 m out; 40 m parked a taxi on
+        // the entry stub past the line, 2026-07-20).
+        let cat = net.plan(36.0031, -5.0050, 36.0004, -5.0141, 100.0, &[]).expect("a route exists");
+        let &(clat, clon) = cat.path.last().unwrap();
+        let dx = (clon - (-5.0140)) * 111_320.0 * 36.0_f64.to_radians().cos();
+        let dy = (clat - 36.0004) * 111_320.0;
+        let d = (dx * dx + dy * dy).sqrt();
+        assert!((95.0..=105.0).contains(&d), "instrument standoff honoured: {d}");
+        // AUTHORED active zones beat both guesses: with the destination
+        // runway named, the route ends at the zone boundary node — the
+        // per-stub holding point as the airport author placed it. The `ils`
+        // row on B must NOT extend the zone (LVP holds are future work).
+        let zone: Vec<String> = vec!["09".into(), "27".into()];
+        let zoned = net
+            .plan(36.0031, -5.0050, 36.0004, -5.0141, HOLD_SHORT_STANDOFF_M, &zone)
+            .expect("a route exists");
+        assert_eq!(*zoned.path.last().unwrap(), (36.0004, -5.0095), "ends at node 4, the zone edge");
+        assert_eq!(zoned.seg.len(), zoned.path.len() - 1, "seg aligned after the zone trim");
+
         // Nowhere near the network: no snap, no plan — never a wild route.
-        assert!(net.plan(37.0, -6.0, 36.0, -5.01).is_none());
+        assert!(net.plan(37.0, -6.0, 36.0, -5.01, HOLD_SHORT_STANDOFF_M, &[]).is_none());
         // A field without 1201/1202 rows has no network at all.
         assert!(find_taxi_net(path.to_str().unwrap(), "0MU1").unwrap().is_some());
         assert!(find_taxi_net(path.to_str().unwrap(), "LXXX").unwrap().is_none());
@@ -936,7 +1082,7 @@ mod tests {
         // From T2 stands (51.4700, -0.4520) to the 27R threshold
         // (51.4775, -0.4325): a real route with named taxiways.
         let t = std::time::Instant::now();
-        let plan = net.plan(51.4700, -0.4520, 51.4775, -0.4325).expect("a route");
+        let plan = net.plan(51.4700, -0.4520, 51.4775, -0.4325, HOLD_SHORT_STANDOFF_M, &[]).expect("a route");
         eprintln!("plan in {:?}: via {:?}, cross {:?}, hp {:?}", t.elapsed(), plan.via, plan.crossings, plan.holding_point);
         assert!(!plan.via.is_empty(), "named taxiways expected at Heathrow");
         assert!(t.elapsed().as_millis() < 200, "planning must not stall a reply");

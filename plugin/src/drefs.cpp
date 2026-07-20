@@ -4,6 +4,7 @@
 
 #include "drefs.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -189,6 +190,47 @@ static float g_taxi_brake_stamp = -1.0f;
 static bool g_taxi_brake_applied = false;
 static const float kTaxiBrakeFreshSecs = 1.0f;
 
+// Proportional taxi steering, same shape as the brake channel: the app writes
+// xcopilot/taxi_steer (-1..1) and the flight loop drives yoke_heading_ratio
+// from it every frame under override_joystick_heading, expiring within a
+// second of writes stopping — override dropped, ratio zeroed, the pedals the
+// pilot's again whatever killed the writer.
+//
+// The pilot's feet always win, in-plugin, zero latency: while steering we
+// watch the hardware yaw axis (found by scanning the axis assignments;
+// baseline captured at engage so an off-centre resting axis can't false-
+// trigger), and any real deflection latches xcopilot/steer_yield, drops the
+// override THAT frame, and ignores further steer writes until the channel
+// goes stale. The app polls the latch and stands its steering loop down.
+static XPLMDataRef g_taxi_steer_dref = nullptr;
+static XPLMDataRef g_steer_yield_dref = nullptr;
+static XPLMDataRef g_yoke_heading = nullptr;
+static XPLMDataRef g_override_heading = nullptr;
+static XPLMDataRef g_joy_axis_values = nullptr;
+static XPLMDataRef g_joy_axis_assignments = nullptr;
+static float g_taxi_steer = 0.0f;
+static float g_taxi_steer_stamp = -1.0f;
+static bool g_taxi_steer_applied = false;
+static int g_steer_yield = 0;
+static int g_yaw_axis = -1;
+static float g_yaw_axis_baseline = 0.5f;
+static int g_steer_engage_frames = 0;
+static int g_yaw_deflect_frames = 0;
+// Axis-assignment code for yaw in sim/joystick/joystick_axis_assignments.
+static const int kAxisYaw = 3;
+// Deflection from the baseline that reads as the pilot's feet.
+static const float kYawYieldDelta = 0.25f;
+// The yield only ARMS this many frames (~0.5 s) after engage, with the
+// baseline following the axis until then: the app probes the channel while
+// the pilot may still be centring the pedals from hand-steering, and a
+// baseline frozen at that instant read the feet coming OFF as a press —
+// the first Gatwick engage yielded 0.6 s in with nobody on the pedals
+// (2026-07-20).
+static const int kYieldArmFrames = 30;
+// And it needs this many CONSECUTIVE deflected frames — a press, not one
+// jittery read.
+static const int kYieldHoldFrames = 4;
+
 // Last time the app wrote any status (sim seconds). The app heartbeats the phase
 // ~1/s, so a stale value means it isn't running → NOT CONNECTED. Starts stale.
 static float g_last_status_time = -1000.0f;
@@ -271,7 +313,22 @@ static void WriteTaxiBrake(void*, float v) {
     g_taxi_brake = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
     g_taxi_brake_stamp = XPLMGetElapsedTime();
 }
-static float TaxiBrakeLoop(float, float, int, void*) {
+static float ReadTaxiSteer(void*) { return g_taxi_steer; }
+static void WriteTaxiSteer(void*, float v) {
+    g_taxi_steer = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
+    g_taxi_steer_stamp = XPLMGetElapsedTime();
+}
+static int ReadSteerYield(void*) { return g_steer_yield; }
+
+// The hardware yaw axis's current value, or -1 if none is assigned.
+static float yaw_axis_value() {
+    if (g_yaw_axis < 0 || !g_joy_axis_values) return -1.0f;
+    float v = 0.0f;
+    XPLMGetDatavf(g_joy_axis_values, &v, g_yaw_axis, 1);
+    return v;
+}
+
+static float TaxiAssistLoop(float, float, int, void*) {
     const bool fresh = g_taxi_brake_stamp >= 0.0f
         && XPLMGetElapsedTime() - g_taxi_brake_stamp <= kTaxiBrakeFreshSecs;
     if (fresh && g_taxi_brake > 0.0f) {
@@ -289,6 +346,51 @@ static float TaxiBrakeLoop(float, float, int, void*) {
         if (g_override_toe_brakes) XPLMSetDatai(g_override_toe_brakes, 0);
         g_taxi_brake_applied = false;
     }
+
+    const bool steer_fresh = g_taxi_steer_stamp >= 0.0f
+        && XPLMGetElapsedTime() - g_taxi_steer_stamp <= kTaxiBrakeFreshSecs;
+    if (steer_fresh && !g_steer_yield) {
+        if (!g_taxi_steer_applied) {
+            // Engage edge: find the yaw axis so the yield can watch the
+            // pilot's actual hardware.
+            g_yaw_axis = -1;
+            if (g_joy_axis_assignments) {
+                int assign[500];
+                const int n = XPLMGetDatavi(g_joy_axis_assignments, assign, 0, 500);
+                for (int i = 0; i < n; ++i) {
+                    if (assign[i] == kAxisYaw) { g_yaw_axis = i; break; }
+                }
+            }
+            g_steer_engage_frames = 0;
+            g_yaw_deflect_frames = 0;
+            g_taxi_steer_applied = true;
+        }
+        const float yaw = yaw_axis_value();
+        if (g_steer_engage_frames < kYieldArmFrames) {
+            // Not armed yet: the baseline keeps following the axis, so the
+            // pedals settling after engage become the neutral, not a press.
+            ++g_steer_engage_frames;
+            g_yaw_axis_baseline = yaw;
+        } else if (g_yaw_axis >= 0 && yaw >= 0.0f
+                   && std::fabs(yaw - g_yaw_axis_baseline) > kYawYieldDelta) {
+            if (++g_yaw_deflect_frames >= kYieldHoldFrames) g_steer_yield = 1;
+        } else {
+            g_yaw_deflect_frames = 0;
+        }
+        if (!g_steer_yield) {
+            if (g_override_heading) XPLMSetDatai(g_override_heading, 1);
+            if (g_yoke_heading) XPLMSetDataf(g_yoke_heading, g_taxi_steer);
+        }
+    }
+    if ((!steer_fresh || g_steer_yield) && g_taxi_steer_applied) {
+        if (g_yoke_heading) XPLMSetDataf(g_yoke_heading, 0.0f);
+        // Dropped last, like the brake: the pilot's yaw hardware re-drives
+        // the ratio the very next frame.
+        if (g_override_heading) XPLMSetDatai(g_override_heading, 0);
+        g_taxi_steer_applied = false;
+    }
+    // Writes stopped (the app saw the latch, or died): re-arm for next time.
+    if (!steer_fresh) g_steer_yield = 0;
     return -1.0f; // every frame: braking rides the physics rate, not REST rate
 }
 // Live flight strip — a status row the app refreshes continuously, not logged.
@@ -499,11 +601,23 @@ void start() {
     g_l_brake_ratio = XPLMFindDataRef("sim/cockpit2/controls/left_brake_ratio");
     g_r_brake_ratio = XPLMFindDataRef("sim/cockpit2/controls/right_brake_ratio");
     g_override_toe_brakes = XPLMFindDataRef("sim/operation/override/override_toe_brakes");
-    XPLMRegisterFlightLoopCallback(TaxiBrakeLoop, -1.0f, nullptr);
+    g_taxi_steer_dref = XPLMRegisterDataAccessor(
+        "xcopilot/taxi_steer", xplmType_Float, 1,
+        nullptr, nullptr, ReadTaxiSteer, WriteTaxiSteer, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_steer_yield_dref = XPLMRegisterDataAccessor(
+        "xcopilot/steer_yield", xplmType_Int, 0,
+        ReadSteerYield, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_yoke_heading = XPLMFindDataRef("sim/cockpit2/controls/yoke_heading_ratio");
+    g_override_heading = XPLMFindDataRef("sim/operation/override/override_joystick_heading");
+    g_joy_axis_values = XPLMFindDataRef("sim/joystick/joystick_axis_values");
+    g_joy_axis_assignments = XPLMFindDataRef("sim/joystick/joystick_axis_assignments");
+    XPLMRegisterFlightLoopCallback(TaxiAssistLoop, -1.0f, nullptr);
 }
 
 void stop_first() {
-    XPLMUnregisterFlightLoopCallback(TaxiBrakeLoop, nullptr);
+    XPLMUnregisterFlightLoopCallback(TaxiAssistLoop, nullptr);
     // Leave no brake behind: if the loop was mid-apply, release the ratios
     // and drop the override ourselves — nobody else will after the callback
     // is gone.
@@ -513,6 +627,14 @@ void stop_first() {
         if (g_override_toe_brakes) XPLMSetDatai(g_override_toe_brakes, 0);
         g_taxi_brake_applied = false;
     }
+    // And no steering: same cleanup, same reason.
+    if (g_taxi_steer_applied) {
+        if (g_yoke_heading) XPLMSetDataf(g_yoke_heading, 0.0f);
+        if (g_override_heading) XPLMSetDatai(g_override_heading, 0);
+        g_taxi_steer_applied = false;
+    }
+    if (g_taxi_steer_dref) { XPLMUnregisterDataAccessor(g_taxi_steer_dref); g_taxi_steer_dref = nullptr; }
+    if (g_steer_yield_dref) { XPLMUnregisterDataAccessor(g_steer_yield_dref); g_steer_yield_dref = nullptr; }
     if (g_taxi_brake_dref) { XPLMUnregisterDataAccessor(g_taxi_brake_dref); g_taxi_brake_dref = nullptr; }
     if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }
     if (g_atc_dref) { XPLMUnregisterDataAccessor(g_atc_dref); g_atc_dref = nullptr; }

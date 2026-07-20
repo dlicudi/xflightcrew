@@ -1490,7 +1490,11 @@ pub fn compliance_tick(
                 // route also re-aims the taxi guide.
                 let fresh = goal.and_then(|(glat, glon)| {
                     let net = TAXI_NET.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
-                    net.plan(lat, lon, glat, glon).filter(|r| r.path.len() >= 2)
+                    // The goal is the standing route's (already-trimmed)
+                    // endpoint, never a runway junction — the standoff is
+                    // moot, so the default rides.
+                    net.plan(lat, lon, glat, glon, nav::HOLD_SHORT_STANDOFF_M, &[])
+                        .filter(|r| r.path.len() >= 2)
                 });
                 let line = if let Some(r) = fresh {
                     let via = spoken_via(&r.via).join(", ");
@@ -3211,6 +3215,7 @@ static TAXI_NET: Mutex<Option<std::sync::Arc<nav::TaxiNet>>> = Mutex::new(None);
 /// when a taxi clearance is issued, consumed by the compliance watch (ATC's
 /// off-route challenge) and the copilot's progressive taxi guide (the crew
 /// side: "next left onto Whiskey").
+#[derive(Clone)]
 pub struct TaxiWatch {
     /// Node polyline of the cleared route.
     pub path: Vec<(f64, f64)>,
@@ -3300,22 +3305,53 @@ fn plan_taxi_route_to(
     } else {
         (r.lat_b, r.lon_b)
     };
-    let mut plan = net.plan(lat, lon, tlat, tlon)?;
-    backfill_unnamed_crossings(&mut plan, runways);
+    // The hold-short standoff scales with the runway's class: instrument
+    // runways paint their holding positions much further out than the GA
+    // default (Heathrow's CAT holds sit ~100 m from the centreline — the
+    // 40 m stop parked a taxi on the 09L entry stub past the line,
+    // visually ON the runway, 2026-07-20). ILS on either end of the strip
+    // = instrument holds; otherwise width-scaled, floored at the default.
+    // ILS facts still loading falls back to the GA figure — early over
+    // absent.
+    let instrument = ILS_FACTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|f| f.ils.iter().any(|i| i.runway == r.ident_a || i.runway == r.ident_b));
+    let standoff = if instrument {
+        100.0
+    } else {
+        (r.width_m / 2.0 + 30.0).max(nav::HOLD_SHORT_STANDOFF_M)
+    };
+    let zone = [r.ident_a.clone(), r.ident_b.clone()];
+    let mut plan = net.plan(lat, lon, tlat, tlon, standoff, &zone)?;
+    mark_runway_crossings(&mut plan, runways);
     Some(plan)
 }
 
-/// Name the crossings the planner couldn't: apt.dat authors often leave
-/// runway network edges UNNAMED, so the planner's crossings list (named
-/// edges only) missed them and the clearance never said "cross runway ..."
-/// — the pilot's first hint was the (former) incursion berate mid-crossing
-/// (2026-07-14). A runway-flagged leg with no name is matched to whichever
-/// physical strip its midpoint sits on, and that strip's designator joins
-/// the crossings list.
-fn backfill_unnamed_crossings(plan: &mut nav::TaxiRoutePlan, runways: &[nav::Runway]) {
-    for (i, (name, is_runway)) in plan.seg.iter().enumerate() {
-        if !*is_runway || !name.is_empty() {
-            continue;
+/// Name the crossings the planner couldn't — geometry is the authority,
+/// never the network flags, because apt.dat authors get crossings wrong two
+/// ways: runway edges left UNNAMED (the planner's crossings list is named
+/// edges only — the KPDK clearance never said "cross runway ...",
+/// 2026-07-14), and crossing links drawn as plain TAXIWAY edges straight
+/// across the strip (EGLL's N7: the route crossed an active 09R with no
+/// crossing clause, no guide call, and no hold, 2026-07-20). Any leg whose
+/// sampled points sit on a physical strip is renamed to the strip's
+/// designator pair and runway-flagged — which feeds the clearance's "cross
+/// runway ..." clause, the guide's "check it's clear, then cross" cue, AND
+/// the cleared-crossing exemption in the incursion watch, all keyed on that
+/// flag. The FINAL leg is exempt when taxiway-flagged: post-trim it ends at
+/// the hold-short point NEAR the destination strip, which must not read as
+/// crossing it.
+fn mark_runway_crossings(plan: &mut nav::TaxiRoutePlan, runways: &[nav::Runway]) {
+    let last = plan.seg.len().saturating_sub(1);
+    for i in 0..plan.seg.len() {
+        let (name, is_runway) = plan.seg[i].clone();
+        if is_runway && !name.is_empty() {
+            continue; // the planner already counted this one
+        }
+        if !is_runway && i == last {
+            continue; // ends short of the destination runway, not across it
         }
         // Sample the leg every ~20 m (its midpoint alone can miss a strip
         // the leg only clips): first sampled point on a runway names it.
@@ -3329,6 +3365,7 @@ fn backfill_unnamed_crossings(plan: &mut nav::TaxiRoutePlan, runways: &[nav::Run
         });
         if let Some(r) = hit {
             let full = format!("{}/{}", r.ident_a, r.ident_b);
+            plan.seg[i] = (full.clone(), true);
             if !plan.crossings.contains(&full) {
                 plan.crossings.push(full);
             }
@@ -4405,11 +4442,38 @@ mod tests {
             path: vec![(36.1490, -5.3420), (36.1530, -5.3420), (36.1540, -5.3420)],
             seg: vec![(String::new(), true), ("A".into(), false)],
         };
-        backfill_unnamed_crossings(&mut plan, &runways);
+        mark_runway_crossings(&mut plan, &runways);
         assert_eq!(plan.crossings, vec!["09/27".to_string()]);
+        // The leg is renamed and flagged too — the guide's crossing cue and
+        // the incursion watch's cleared-crossing exemption key on the flag.
+        assert_eq!(plan.seg[0], ("09/27".to_string(), true));
         // Idempotent: a second pass (or an already-named edge) doesn't dupe.
-        backfill_unnamed_crossings(&mut plan, &runways);
+        mark_runway_crossings(&mut plan, &runways);
         assert_eq!(plan.crossings.len(), 1);
+        // A crossing link authored as a plain TAXIWAY edge across the strip
+        // (EGLL's N7, 2026-07-20: no crossing clause, no guide call): the
+        // geometry names and flags it all the same.
+        let mut taxiway_authored = nav::TaxiRoutePlan {
+            via: vec!["N7".into()],
+            crossings: Vec::new(),
+            holding_point: "A1".into(),
+            path: vec![(36.1490, -5.3420), (36.1530, -5.3420), (36.1540, -5.3420)],
+            seg: vec![("N7".into(), false), ("A".into(), false)],
+        };
+        mark_runway_crossings(&mut taxiway_authored, &runways);
+        assert_eq!(taxiway_authored.crossings, vec!["09/27".to_string()]);
+        assert_eq!(taxiway_authored.seg[0], ("09/27".to_string(), true));
+        // The FINAL leg ends at the hold-short point NEAR the destination
+        // strip — that proximity is never a crossing.
+        let mut final_leg = nav::TaxiRoutePlan {
+            via: vec!["A".into()],
+            crossings: Vec::new(),
+            holding_point: "A1".into(),
+            path: vec![(36.1490, -5.3420), (36.1512, -5.3420)],
+            seg: vec![("A".into(), false)],
+        };
+        mark_runway_crossings(&mut final_leg, &runways);
+        assert!(final_leg.crossings.is_empty(), "{:?}", final_leg.crossings);
         // A route that never touches the pavement names nothing.
         let mut clear = nav::TaxiRoutePlan {
             via: vec!["A".into()],
@@ -4418,7 +4482,7 @@ mod tests {
             path: vec![(36.1490, -5.3420), (36.1505, -5.3420)],
             seg: vec![(String::new(), false)],
         };
-        backfill_unnamed_crossings(&mut clear, &runways);
+        mark_runway_crossings(&mut clear, &runways);
         assert!(clear.crossings.is_empty());
     }
 
@@ -4447,6 +4511,7 @@ mod tests {
             oneway: false,
             runway: false,
             name: name.into(),
+            zone_of: Vec::new(),
         };
         *TAXI_NET.lock().unwrap() = Some(std::sync::Arc::new(nav::TaxiNet {
             nodes,

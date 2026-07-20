@@ -29,6 +29,7 @@ pub mod radio;
 pub mod recover;
 pub mod reverse;
 pub mod speedhold;
+pub mod taxi;
 pub mod reminder;
 
 use anyhow::Result;
@@ -239,6 +240,10 @@ impl Registry {
             let approach = profile.reference.as_ref().and_then(|r| r.approach_kts);
             tools.push(Box::new(speedhold::HoldSpeed {
                 approach_kts: approach,
+                park_brake_valve_set: profile.park_brake_valve_set,
+            }));
+            // Auto taxi stands on the same governor, so it ships with it.
+            tools.push(Box::new(taxi::AutoTaxi {
                 park_brake_valve_set: profile.park_brake_valve_set,
             }));
         }
