@@ -90,9 +90,14 @@ const MAX_ROLL_STEER: f64 = 0.85;
 /// error is GOING, which is what kills the counter-steer oscillation when
 /// each observation arrives a network round trip stale.
 const STEER_LEAD_S: f64 = 0.4;
-/// Max steering change per 150 ms tick — a slew limit, so a noisy tick can
-/// never slam the wheel across.
-const STEER_SLEW_PER_TICK: f64 = 0.25;
+/// Max steering sweep rate, PER SECOND — dt-scaled, so the real tick rate
+/// never sets the actuator speed. The old per-tick limit (0.25) at the
+/// measured half-second tick swept 0.5/s: the rudder lagged the error by
+/// over a second, and that lag WAS the left-right weave — sortie four's
+/// telemetry shows the steer chasing in exact 0.25 steps the whole roll,
+/// a textbook slew-induced limit cycle. 1.5/s crosses the full range in
+/// just over a second; the low-speed cap still owns the parked case.
+const STEER_SLEW_PER_S: f64 = 1.5;
 /// Integrator gain (deflection per degree-second) and cap: the standing
 /// rudder the yaw moment demands. Second sortie: pure P+D settled at a
 /// STANDING 18 degrees of error against full-power P-factor — the error a
@@ -101,10 +106,19 @@ const STEER_SLEW_PER_TICK: f64 = 0.25;
 /// degrees off. The integrator learns that trim so the error can go to
 /// zero with the rudder still held.
 const STEER_TRIM_RATE: f64 = 0.01;
-const STEER_TRIM_MAX: f64 = 0.4;
-/// Speed-authority floor. The old 0.3 floor times the 0.7 cap left 0.21 of
-/// deflection at rotate speed — not even close to holding P-factor.
-const STEER_AUTH_FLOOR: f64 = 0.65;
+const STEER_TRIM_MAX: f64 = 0.3;
+/// The error is clamped to this in the trim update: the integrator learns
+/// a STANDING offset, slowly — sortie four's 39 degree transient wound the
+/// trim at 0.4/s to its cap in two seconds, and the stale trim then fueled
+/// the opposite overshoot. Clamped, the learn rate tops out at 0.06/s.
+const STEER_TRIM_ERR_CLAMP_DEG: f64 = 6.0;
+/// Speed-authority floor. Sortie two's 0.3 floor starved the STANDING
+/// P-factor rudder — but that job belongs to the trim integrator now,
+/// which adds OUTSIDE this taper. So the P term can shrink properly with
+/// speed again: at 60-80 knots the rudder is powerful, and sortie four's
+/// 0.65 floor swung 0.6 of deflection over 8 degree errors — the muscle
+/// behind the weave.
+const STEER_AUTH_FLOOR: f64 = 0.35;
 /// Deflection cap at a standstill, ramping to [`MAX_ROLL_STEER`] by
 /// [`LOW_SPEED_FULL_KTS`]. Under takeoff power the prop wash makes the
 /// rudder and nosewheel HYPER-effective at low speed — the third sortie
@@ -271,10 +285,11 @@ impl RollSteer {
         // taxi pace it stays frozen: it exists for P-factor at speed, not
         // for doubling every low-speed overshoot.
         if gs_kts > TRIM_MIN_GS_KTS {
-            self.trim = (self.trim + err_deg * dt * STEER_TRIM_RATE)
-                .clamp(-STEER_TRIM_MAX, STEER_TRIM_MAX);
+            let e = err_deg.clamp(-STEER_TRIM_ERR_CLAMP_DEG, STEER_TRIM_ERR_CLAMP_DEG);
+            self.trim =
+                (self.trim + e * dt * STEER_TRIM_RATE).clamp(-STEER_TRIM_MAX, STEER_TRIM_MAX);
         }
-        self.out = slew(self.out, want, STEER_SLEW_PER_TICK);
+        self.out = slew(self.out, want, STEER_SLEW_PER_S * dt);
         self.out
     }
 
@@ -316,6 +331,21 @@ pub fn throttle_cmd(elapsed_s: f64, err_deg: f64, gs_kts: f64) -> f64 {
         ramp.min(THROTTLE_HOLD_RATIO)
     } else {
         ramp
+    }
+}
+
+/// Throttle advances are ALWAYS gradual, releases instant: when the
+/// swinging-nose hold lets go, the lever walks up at the ramp's own rate
+/// instead of jumping half-to-full in one tick — sortie four's release
+/// kicked 19 degrees of yaw at 12 knots, exactly the swing the hold
+/// existed to prevent. The power feed-forward rides the commanded value,
+/// so the rudder walks up with it.
+const THROTTLE_UP_PER_S: f64 = 0.28;
+pub fn throttle_slew(prev: f64, want: f64, dt_s: f64) -> f64 {
+    if want <= prev {
+        want
+    } else {
+        (prev + THROTTLE_UP_PER_S * dt_s.clamp(0.02, 1.0)).min(want)
     }
 }
 
@@ -504,24 +534,36 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             frozen_secs += 0.4;
             continue;
         }
-        let (Ok(lat), Ok(lon), Ok(psi), Ok(gs_ms), Ok(ias), Ok(agl_m), Ok(on_ground)) = (
-            xp.get_float(LAT).await,
-            xp.get_float(LON).await,
-            xp.get_float(PSI_TRUE).await,
-            xp.get_float(GS_MS).await,
-            xp.get_float(IAS).await,
-            xp.get_float(AGL_M).await,
-            xp.get_float(ON_GROUND).await,
-        ) else {
+        // One concurrent read burst: sequentially these eleven round trips
+        // took ~350 ms and dragged the control tick to half a second — the
+        // lag behind the fourth sortie's weave. Joined, the tick runs at
+        // the sleep rate.
+        let (lat, lon, psi, gs_ms, ias, agl_m, on_ground, steer_yield, thr_read) = tokio::join!(
+            xp.get_float(LAT),
+            xp.get_float(LON),
+            xp.get_float(PSI_TRUE),
+            xp.get_float(GS_MS),
+            xp.get_float(IAS),
+            xp.get_float(AGL_M),
+            xp.get_float(ON_GROUND),
+            xp.get_float(STEER_YIELD),
+            xp.get_float(THROTTLE_ALL),
+        );
+        let (Ok(lat), Ok(lon), Ok(psi), Ok(gs_ms), Ok(ias), Ok(agl_m), Ok(on_ground)) =
+            (lat, lon, psi, gs_ms, ias, agl_m, on_ground)
+        else {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         };
         let gs_kts = gs_ms * MS_TO_KTS;
         let agl_ft = agl_m * M_TO_FT;
+        let now_t = std::time::Instant::now();
+        let dt = last_tick.map_or(0.15, |t| (now_t - t).as_secs_f64()).clamp(0.05, 1.0);
+        last_tick = Some(now_t);
 
         // The pilot's feet took the pedals (the plugin dropped the override
         // already): the takeoff continues as a manual one, power set.
-        if !airborne && xp.get_float(STEER_YIELD).await.is_ok_and(|v| v > 0.5) {
+        if !airborne && steer_yield.is_ok_and(|v| v > 0.5) {
             alert(&voice, Priority::Caution, "Your aircraft. Power is set.");
             crate::blackbox::record("autotakeoff", serde_json::json!({"event": "pedal_yield"}));
             return;
@@ -529,13 +571,15 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
 
         // Throttle: ramped to full, held at half power while the nose is
         // still swinging at low speed (full power on a swinging nose is
-        // the maximum yaw kick at the worst moment), with the pilot's
-        // hand honored. A read well below the last COMMAND is challenged
-        // ONCE (a hardware axis the sim re-drives jitters; a hand keeps
-        // winning), then it's a pilot reject — hands off everything.
+        // the maximum yaw kick at the worst moment), advances always
+        // slewed, with the pilot's hand honored. A read well below the
+        // last COMMAND is challenged ONCE (a hardware axis the sim
+        // re-drives jitters; a hand keeps winning), then it's a pilot
+        // reject — hands off everything.
         let elapsed = roll_start.elapsed().as_secs_f64() - frozen_secs;
-        let thr_cmd = if airborne { 1.0 } else { throttle_cmd(elapsed, last_err, gs_kts) };
-        let thr_now = xp.get_float(THROTTLE_ALL).await.unwrap_or(thr_cmd);
+        let thr_want = if airborne { 1.0 } else { throttle_cmd(elapsed, last_err, gs_kts) };
+        let thr_cmd = throttle_slew(last_thr_cmd, thr_want, dt);
+        let thr_now = thr_read.unwrap_or(thr_cmd);
         if thr_now < last_thr_cmd - 0.25 && elapsed > 2.0 {
             if thr_challenged {
                 alert(&voice, Priority::Warning, "Your throttle. Your aircraft.");
@@ -569,9 +613,6 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let xtk_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
             let target = roll_target_heading(rwy.course_deg, xtk_m);
             let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
-            let now_t = std::time::Instant::now();
-            let dt = last_tick.map_or(0.15, |t| (now_t - t).as_secs_f64());
-            last_tick = Some(now_t);
             last_err = err;
             let steer = steer_law.step(err, dt, gs_kts, thr_cmd);
             if xp.set_float(TAXI_STEER, steer).await.is_err() {
@@ -584,7 +625,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 serde_json::json!({
                     "event": "roll", "gs": gs_kts, "ias": ias, "err": err,
                     "steer": steer, "trim": steer_law.trim(), "xtk_m": xtk_m,
-                    "thr": thr_cmd, "remaining_m": remaining,
+                    "thr": thr_cmd, "remaining_m": remaining, "dt": dt,
                 }),
             );
             // Rotate: engage the AP to fly the nose off — heading bug on
@@ -755,6 +796,38 @@ mod tests {
     }
 
     #[test]
+    fn a_transient_swing_cannot_wind_the_trim() {
+        // Sortie four: a 39 degree recovery overshoot wound the trim to its
+        // cap in two seconds, and the stale trim fueled the NEXT overshoot.
+        // The error is clamped in the update: a huge swing learns no faster
+        // than a modest standing error.
+        let mut big = RollSteer::default();
+        let mut small = RollSteer::default();
+        for _ in 0..10 {
+            big.step(39.0, 0.15, 30.0, 0.0);
+            small.step(STEER_TRIM_ERR_CLAMP_DEG, 0.15, 30.0, 0.0);
+        }
+        assert!((big.trim() - small.trim()).abs() < 1e-9, "{} vs {}", big.trim(), small.trim());
+        assert!(big.trim() < 0.1, "two seconds of swing stays a nudge: {}", big.trim());
+    }
+
+    #[test]
+    fn throttle_advances_gradually_and_releases_instantly() {
+        // The swinging-nose hold letting go must WALK the lever up, not jump
+        // half-to-full in a tick (sortie four's release kicked 19 degrees of
+        // yaw at 12 knots).
+        let stepped = throttle_slew(0.5, 1.0, 0.15);
+        assert!(stepped < 0.55, "one tick walks, never jumps: {stepped}");
+        let mut thr = 0.5;
+        for _ in 0..20 {
+            thr = throttle_slew(thr, 1.0, 0.15);
+        }
+        assert!((thr - 1.0).abs() < 1e-9, "full power arrives: {thr}");
+        // A pull-back (the hold re-engaging, a pilot hand) is honored NOW.
+        assert_eq!(throttle_slew(1.0, 0.5, 0.15), 0.5);
+    }
+
+    #[test]
     fn roll_law_damps_and_never_slams() {
         let mut law = RollSteer::default();
         // A swing home (error collapsing fast) commands LESS than the same
@@ -765,9 +838,15 @@ mod tests {
         law.step(20.0, 0.15, 20.0, 0.0);
         let collapsing = law.step(12.0, 0.15, 20.0, 0.0);
         assert!(collapsing < steady_out, "{collapsing} vs {steady_out}");
-        // From rest, a huge demanded deflection arrives in slew steps.
+        // From rest, a huge demanded deflection arrives in slew steps —
+        // dt-scaled, so a slow tick sweeps proportionally more, never a
+        // fixed per-tick crumb (the fixed 0.25 at half-second ticks WAS
+        // sortie four's weave).
         let mut fresh = RollSteer::default();
-        assert!(fresh.step(90.0, 0.15, 5.0, 0.0).abs() <= STEER_SLEW_PER_TICK + 1e-9);
+        assert!(fresh.step(90.0, 0.15, 5.0, 0.0).abs() <= STEER_SLEW_PER_S * 0.15 + 1e-9);
+        let mut slow_tick = RollSteer::default();
+        let one = slow_tick.step(90.0, 0.5, 20.0, 0.0).abs();
+        assert!(one > 0.5, "a half-second tick sweeps half the range: {one}");
         // Output is always inside the cap.
         let mut sat = RollSteer::default();
         for _ in 0..30 {

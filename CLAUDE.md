@@ -460,6 +460,22 @@ every stop). Rotation additionally waits
 for a roughly straight nose
 (`rotate_ok`, unless the runway is running out), and the airborne latch
 needs 8 ft AGL so a ground-effect bounce can't stop the steering at speed.
+Sortie four (2026-07-21) reached the 1000 ft handoff but wove ±8° the
+whole roll, and the telemetry convicted the LOOP, not the gains: eleven
+sequential HTTP reads dragged the 150 ms tick to half a second, and the
+0.25-per-tick steer slew (sortie three's anti-jerk) swept only 0.5/s —
+the rudder chased the error in exact 0.25 steps a second-plus behind, a
+textbook slew-induced limit cycle. The reads are now one `tokio::join!`
+burst, the slew is per-SECOND and dt-scaled (`STEER_SLEW_PER_S` 1.5; the
+low-speed cap owns the parked case), the authority floor dropped back to
+0.35 (the trim integrator adds OUTSIDE the taper now, so lowering P at
+speed can't re-create sortie two's starvation), the trim clamps the error
+it learns from (±6° — a 39° transient wound it to the cap in 2 s and the
+stale trim fueled the next overshoot; cap 0.3), and the throttle
+ADVANCES are slewed (`throttle_slew` — the swinging-nose hold's release
+jumped half-to-full in one tick and kicked 19° of yaw at 12 kt; releases
+stay instant). Roll events carry `dt` now — check it stayed near 0.15
+before touching gains again.
 Related trap fixed the same day: `looks_like_command` (the continuous-mode
 domain gate) matched per-token keywords only, so the split compounds
 "take off ..." and "line us up" were swallowed with no miss chime —
