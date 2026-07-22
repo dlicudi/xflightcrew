@@ -58,7 +58,10 @@ const TAXI_STEER: &str = "xcopilot/taxi_steer";
 const STEER_YIELD: &str = "xcopilot/steer_yield";
 const TAKEOFF_PITCH: &str = "xcopilot/pitch";
 const PITCH_YIELD: &str = "xcopilot/pitch_yield";
+const TAKEOFF_ROLL: &str = "xcopilot/roll";
+const ROLL_YIELD: &str = "xcopilot/roll_yield";
 const THETA: &str = "sim/flightmodel/position/true_theta";
+const PHI: &str = "sim/flightmodel/position/true_phi";
 const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 
 const M_TO_FT: f64 = 3.280_84;
@@ -175,6 +178,17 @@ const PITCH_MIN: f64 = -0.10;
 /// effect, wings level, speed building; the VS dial is written AFTER the
 /// mode engages, because engage syncs the dial to the current rate.
 const AP_ENGAGE_AGL_FT: f64 = 300.0;
+/// The hand-flown climb holds the WINGS too — between liftoff and the AP
+/// engage, full-power torque rolls a light single left with nobody on the
+/// ailerons. Bank leans toward runway heading, capped shallow.
+const CLIMB_BANK_MAX_DEG: f64 = 8.0;
+const BANK_PER_HDG_ERR: f64 = 1.0;
+/// Aileron law: P on bank error (aileron commands roll RATE, so
+/// proportional converges without an integrator), rate-lead damped.
+const AIL_FULL_BANK_DEG: f64 = 15.0;
+const AIL_LEAD_S: f64 = 0.3;
+const AIL_MAX: f64 = 0.5;
+const AIL_SLEW_PER_S: f64 = 2.0;
 /// Hand the aircraft back this high above the field.
 const HANDOFF_AGL_FT: f64 = 1000.0;
 /// Raise the gear (when there is one) above this, climbing.
@@ -348,6 +362,33 @@ impl RotatePitch {
         self.prev_theta = Some(theta_deg);
         let err = ROTATE_PITCH_DEG - theta_deg - PITCH_LEAD_S * rate;
         self.out = (self.out + err * PITCH_GAIN_PER_DEG_S * dt).clamp(PITCH_MIN, PITCH_MAX);
+        self.out
+    }
+}
+
+/// The bank the climb-out flies: toward runway heading, capped shallow —
+/// this is track-keeping on departure, not a turn.
+pub fn climb_bank_target(hdg_err_deg: f64) -> f64 {
+    (hdg_err_deg * BANK_PER_HDG_ERR).clamp(-CLIMB_BANK_MAX_DEG, CLIMB_BANK_MAX_DEG)
+}
+
+/// The climb-out ailerons: P on bank error with a rate lead, slew-limited.
+/// Bank positive = right wing down; aileron positive = roll right — the
+/// same convention, so the error maps straight through.
+#[derive(Default)]
+pub struct WingsLevel {
+    out: f64,
+    prev_bank: Option<f64>,
+}
+
+impl WingsLevel {
+    pub fn step(&mut self, bank_deg: f64, target_deg: f64, dt_s: f64) -> f64 {
+        let dt = dt_s.clamp(0.05, 1.0);
+        let rate = self.prev_bank.map_or(0.0, |p| (bank_deg - p) / dt);
+        self.prev_bank = Some(bank_deg);
+        let err = target_deg - bank_deg - AIL_LEAD_S * rate;
+        let want = (err / AIL_FULL_BANK_DEG).clamp(-1.0, 1.0) * AIL_MAX;
+        self.out = slew(self.out, want, AIL_SLEW_PER_S * dt);
         self.out
     }
 }
@@ -547,6 +588,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut positive_called = false;
     let mut thr_challenged = false;
     let mut pitch_law = RotatePitch::default();
+    let mut wings = WingsLevel::default();
     let mut last_vs_cmd: Option<f64> = None;
     let mut last_thr_cmd = 0.3_f64;
     // The roll section's heading error, one tick stale, for the throttle's
@@ -590,7 +632,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // took ~350 ms and dragged the control tick to half a second — the
         // lag behind the fourth sortie's weave. Joined, the tick runs at
         // the sleep rate.
-        let (lat, lon, psi, gs_ms, ias, agl_m, on_ground, steer_yield, thr_read, theta, pitch_yield) = tokio::join!(
+        let (lat, lon, psi, gs_ms, ias, agl_m, on_ground, steer_yield, thr_read, theta, phi, pitch_yield, roll_yield) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
             xp.get_float(PSI_TRUE),
@@ -601,7 +643,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             xp.get_float(STEER_YIELD),
             xp.get_float(THROTTLE_ALL),
             xp.get_float(THETA),
+            xp.get_float(PHI),
             xp.get_float(PITCH_YIELD),
+            xp.get_float(ROLL_YIELD),
         );
         let (Ok(lat), Ok(lon), Ok(psi), Ok(gs_ms), Ok(ias), Ok(agl_m), Ok(on_ground)) =
             (lat, lon, psi, gs_ms, ias, agl_m, on_ground)
@@ -612,6 +656,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         let gs_kts = gs_ms * MS_TO_KTS;
         let agl_ft = agl_m * M_TO_FT;
         let theta_deg = theta.unwrap_or(0.0);
+        let phi_deg = phi.unwrap_or(0.0);
         let now_t = std::time::Instant::now();
         let dt = last_tick.map_or(0.15, |t| (now_t - t).as_secs_f64()).clamp(0.05, 1.0);
         last_tick = Some(now_t);
@@ -624,8 +669,12 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             return;
         }
         // The pilot's hands took the yoke during rotation or the hand-flown
-        // climb (the plugin dropped the pitch override already): theirs.
-        if rotated && !ap_engaged && pitch_yield.is_ok_and(|v| v > 0.5) {
+        // climb (the plugin dropped the override already): theirs — either
+        // axis is the whole yoke.
+        if rotated
+            && !ap_engaged
+            && (pitch_yield.is_ok_and(|v| v > 0.5) || roll_yield.is_ok_and(|v| v > 0.5))
+        {
             alert(&voice, Priority::Caution, "Your aircraft. Power is set.");
             crate::blackbox::record("autotakeoff", serde_json::json!({"event": "yoke_yield"}));
             return;
@@ -705,8 +754,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 );
             }
             if rotated {
+                // Wings held level through the pull — the rudder steering
+                // still owns the heading until liftoff.
                 let pitch = pitch_law.step(theta_deg, dt);
-                if xp.set_float(TAKEOFF_PITCH, pitch).await.is_err() {
+                let ail = wings.step(phi_deg, 0.0, dt);
+                let (wp, wr) =
+                    tokio::join!(xp.set_float(TAKEOFF_PITCH, pitch), xp.set_float(TAKEOFF_ROLL, ail));
+                if wp.is_err() || wr.is_err() {
                     reject(&xp, &voice, "I've lost the elevator. Rejecting takeoff. Your aircraft.", "pitch_lost")
                         .await;
                     return;
@@ -741,9 +795,15 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         if !ap_engaged {
             if agl_ft < AP_ENGAGE_AGL_FT {
                 // Still hand-flying: hold the rotation attitude while speed
-                // builds and ground effect falls away.
+                // builds, and the wings against full-power torque — banked
+                // gently toward runway heading, since the rudder steering
+                // ended at liftoff.
+                let hdg_err = ((rwy.course_deg - psi + 540.0).rem_euclid(360.0)) - 180.0;
                 let pitch = pitch_law.step(theta_deg, dt);
-                if xp.set_float(TAKEOFF_PITCH, pitch).await.is_err() {
+                let ail = wings.step(phi_deg, climb_bank_target(hdg_err), dt);
+                let (wp, wr) =
+                    tokio::join!(xp.set_float(TAKEOFF_PITCH, pitch), xp.set_float(TAKEOFF_ROLL, ail));
+                if wp.is_err() || wr.is_err() {
                     alert(&voice, Priority::Warning, "I've lost the elevator. Your aircraft.");
                     crate::blackbox::record(
                         "autotakeoff",
@@ -756,6 +816,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     serde_json::json!({
                         "event": "climb_manual", "ias": ias, "agl": agl_ft,
                         "theta": theta_deg, "pitch": pitch,
+                        "phi": phi_deg, "ail": ail, "hdg_err": hdg_err,
                     }),
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;

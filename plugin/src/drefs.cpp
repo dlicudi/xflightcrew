@@ -239,8 +239,25 @@ static float g_pitch_axis_baseline = 0.5f;
 static int g_pitch_engage_frames = 0;
 static int g_pitch_deflect_frames = 0;
 
+// And the ailerons (xcopilot/roll → yoke_roll_ratio under
+// override_joystick_roll): between liftoff and the AP taking the climb,
+// nobody else holds the wings against full-power torque.
+static XPLMDataRef g_roll_dref = nullptr;
+static XPLMDataRef g_roll_yield_dref = nullptr;
+static XPLMDataRef g_yoke_roll = nullptr;
+static XPLMDataRef g_override_roll = nullptr;
+static float g_roll = 0.0f;
+static float g_roll_stamp = -1.0f;
+static bool g_roll_applied = false;
+static int g_roll_yield = 0;
+static int g_roll_axis = -1;
+static float g_roll_axis_baseline = 0.5f;
+static int g_roll_engage_frames = 0;
+static int g_roll_deflect_frames = 0;
+
 // Axis-assignment codes in sim/joystick/joystick_axis_assignments.
 static const int kAxisPitch = 1;
+static const int kAxisRoll = 2;
 static const int kAxisYaw = 3;
 // Deflection from the baseline that reads as the pilot's hands on the yoke.
 static const float kPitchYieldDelta = 0.25f;
@@ -351,6 +368,12 @@ static void WritePitch(void*, float v) {
     g_pitch_stamp = XPLMGetElapsedTime();
 }
 static int ReadPitchYield(void*) { return g_pitch_yield; }
+static float ReadRoll(void*) { return g_roll; }
+static void WriteRoll(void*, float v) {
+    g_roll = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
+    g_roll_stamp = XPLMGetElapsedTime();
+}
+static int ReadRollYield(void*) { return g_roll_yield; }
 
 // The hardware yaw axis's current value, or -1 if none is assigned.
 static float yaw_axis_value() {
@@ -365,6 +388,14 @@ static float pitch_axis_value() {
     if (g_pitch_axis < 0 || !g_joy_axis_values) return -1.0f;
     float v = 0.0f;
     XPLMGetDatavf(g_joy_axis_values, &v, g_pitch_axis, 1);
+    return v;
+}
+
+// The hardware roll axis's current value, or -1 if none is assigned.
+static float roll_axis_value() {
+    if (g_roll_axis < 0 || !g_joy_axis_values) return -1.0f;
+    float v = 0.0f;
+    XPLMGetDatavf(g_joy_axis_values, &v, g_roll_axis, 1);
     return v;
 }
 
@@ -473,6 +504,45 @@ static float TaxiAssistLoop(float, float, int, void*) {
         g_pitch_applied = false;
     }
     if (!pitch_fresh) g_pitch_yield = 0;
+
+    // The roll channel: identical discipline, the other yoke axis.
+    const bool roll_fresh = g_roll_stamp >= 0.0f
+        && XPLMGetElapsedTime() - g_roll_stamp <= kTaxiBrakeFreshSecs;
+    if (roll_fresh && !g_roll_yield) {
+        if (!g_roll_applied) {
+            g_roll_axis = -1;
+            if (g_joy_axis_assignments) {
+                int assign[500];
+                const int n = XPLMGetDatavi(g_joy_axis_assignments, assign, 0, 500);
+                for (int i = 0; i < n; ++i) {
+                    if (assign[i] == kAxisRoll) { g_roll_axis = i; break; }
+                }
+            }
+            g_roll_engage_frames = 0;
+            g_roll_deflect_frames = 0;
+            g_roll_applied = true;
+        }
+        const float ax = roll_axis_value();
+        if (g_roll_engage_frames < kYieldArmFrames) {
+            ++g_roll_engage_frames;
+            g_roll_axis_baseline = ax;
+        } else if (g_roll_axis >= 0 && ax >= 0.0f
+                   && std::fabs(ax - g_roll_axis_baseline) > kPitchYieldDelta) {
+            if (++g_roll_deflect_frames >= kYieldHoldFrames) g_roll_yield = 1;
+        } else {
+            g_roll_deflect_frames = 0;
+        }
+        if (!g_roll_yield) {
+            if (g_override_roll) XPLMSetDatai(g_override_roll, 1);
+            if (g_yoke_roll) XPLMSetDataf(g_yoke_roll, g_roll);
+        }
+    }
+    if ((!roll_fresh || g_roll_yield) && g_roll_applied) {
+        if (g_yoke_roll) XPLMSetDataf(g_yoke_roll, 0.0f);
+        if (g_override_roll) XPLMSetDatai(g_override_roll, 0);
+        g_roll_applied = false;
+    }
+    if (!roll_fresh) g_roll_yield = 0;
     return -1.0f; // every frame: braking rides the physics rate, not REST rate
 }
 // Live flight strip — a status row the app refreshes continuously, not logged.
@@ -701,6 +771,16 @@ void start() {
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     g_yoke_pitch = XPLMFindDataRef("sim/cockpit2/controls/yoke_pitch_ratio");
     g_override_pitch = XPLMFindDataRef("sim/operation/override/override_joystick_pitch");
+    g_roll_dref = XPLMRegisterDataAccessor(
+        "xcopilot/roll", xplmType_Float, 1,
+        nullptr, nullptr, ReadRoll, WriteRoll, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_roll_yield_dref = XPLMRegisterDataAccessor(
+        "xcopilot/roll_yield", xplmType_Int, 0,
+        ReadRollYield, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_yoke_roll = XPLMFindDataRef("sim/cockpit2/controls/yoke_roll_ratio");
+    g_override_roll = XPLMFindDataRef("sim/operation/override/override_joystick_roll");
     g_yoke_heading = XPLMFindDataRef("sim/cockpit2/controls/yoke_heading_ratio");
     g_override_heading = XPLMFindDataRef("sim/operation/override/override_joystick_heading");
     g_joy_axis_values = XPLMFindDataRef("sim/joystick/joystick_axis_values");
@@ -725,16 +805,23 @@ void stop_first() {
         if (g_override_heading) XPLMSetDatai(g_override_heading, 0);
         g_taxi_steer_applied = false;
     }
-    // And no elevator.
+    // And no elevator or aileron.
     if (g_pitch_applied) {
         if (g_yoke_pitch) XPLMSetDataf(g_yoke_pitch, 0.0f);
         if (g_override_pitch) XPLMSetDatai(g_override_pitch, 0);
         g_pitch_applied = false;
     }
+    if (g_roll_applied) {
+        if (g_yoke_roll) XPLMSetDataf(g_yoke_roll, 0.0f);
+        if (g_override_roll) XPLMSetDatai(g_override_roll, 0);
+        g_roll_applied = false;
+    }
     if (g_taxi_steer_dref) { XPLMUnregisterDataAccessor(g_taxi_steer_dref); g_taxi_steer_dref = nullptr; }
     if (g_steer_yield_dref) { XPLMUnregisterDataAccessor(g_steer_yield_dref); g_steer_yield_dref = nullptr; }
     if (g_pitch_dref) { XPLMUnregisterDataAccessor(g_pitch_dref); g_pitch_dref = nullptr; }
     if (g_pitch_yield_dref) { XPLMUnregisterDataAccessor(g_pitch_yield_dref); g_pitch_yield_dref = nullptr; }
+    if (g_roll_dref) { XPLMUnregisterDataAccessor(g_roll_dref); g_roll_dref = nullptr; }
+    if (g_roll_yield_dref) { XPLMUnregisterDataAccessor(g_roll_yield_dref); g_roll_yield_dref = nullptr; }
     if (g_taxi_brake_dref) { XPLMUnregisterDataAccessor(g_taxi_brake_dref); g_taxi_brake_dref = nullptr; }
     if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }
     if (g_atc_dref) { XPLMUnregisterDataAccessor(g_atc_dref); g_atc_dref = nullptr; }

@@ -138,13 +138,17 @@ impl Tool for AutoTakeoff {
                     .to_string(),
             );
         }
-        // The rotation flies the ELEVATOR through the plugin's pitch
-        // channel; a plugin that predates it would roll fine and then sail
-        // off the far end unrotated. Probe it now (a neutral write that
-        // expires in a second, parked).
-        if ctx.xplane.set_float("xcopilot/pitch", 0.0).await.is_err() {
+        // The rotation flies the ELEVATOR and AILERONS through the plugin's
+        // pitch/roll channels; a plugin that predates either would roll fine
+        // and then reject (or sail off the far end) at rotation. Probe both
+        // now (neutral writes that expire in a second, parked).
+        let (pp, pr) = tokio::join!(
+            ctx.xplane.set_float("xcopilot/pitch", 0.0),
+            ctx.xplane.set_float("xcopilot/roll", 0.0)
+        );
+        if pp.is_err() || pr.is_err() {
             return Ok(
-                "I can't reach the elevator. The x-copilot plugin needs updating, so this takeoff is yours."
+                "I can't reach the yoke. The x-copilot plugin needs updating, so this takeoff is yours."
                     .to_string(),
             );
         }
