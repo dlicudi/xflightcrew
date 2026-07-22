@@ -190,6 +190,11 @@ impl Tool for AutoTaxi {
 /// seven" can never be driven onto the 09 end.
 pub struct LineUp {
     pub park_brake_valve_set: Option<f64>,
+    /// POH ground roll, meters — the full-length check: a line-up that
+    /// leaves less than 1.4× this ahead backtracks to the threshold
+    /// instead (LXGB's taxiways only reach the east half; holding point
+    /// Charlie left an SR22 580 m for a 09 departure, 2026-07-22).
+    pub takeoff_roll_m: Option<f64>,
 }
 
 /// Line-up pace: a runway entry is a sharp-corner maneuver end to end.
@@ -203,18 +208,22 @@ impl Tool for LineUp {
 
     fn description(&self) -> &str {
         "The copilot drives the aircraft from the hold-short position onto \
-         the runway and stops lined up on the centreline. Use ONLY when the \
-         pilot asks the copilot to do it: 'line us up', 'get us lined up', \
-         'take us onto the runway'. (The pilot READING BACK 'line up and \
-         wait runway 27' is talking to ATC, never this. Stopping it is 'my \
-         controls' / 'stop'.)"
+         the runway and stops lined up on the centreline — backtracking to \
+         the threshold first when the entry leaves too little runway (or \
+         when asked: 'backtrack runway 09'). Use ONLY when the pilot asks \
+         the copilot to do it: 'line us up', 'get us lined up', 'take us \
+         onto the runway', 'backtrack'. (The pilot READING BACK 'line up \
+         and wait runway 27' is talking to ATC, never this. Stopping it is \
+         'my controls' / 'stop'.)"
     }
 
     fn parameters(&self) -> Value {
-        json!({ "type": "object", "properties": {} })
+        json!({ "type": "object", "properties": {
+            "backtrack": {"type": "boolean", "description": "true = the pilot explicitly asked to backtrack for the full length"}
+        } })
     }
 
-    async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+    async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         use std::sync::atomic::Ordering::Relaxed;
         if autotaxi::ACTIVE.load(Relaxed) {
             return Ok("I'm already driving. Let me finish, then ask again.".to_string());
@@ -270,8 +279,18 @@ impl Tool for LineUp {
         .and_then(|r| r.ok())
         .unwrap_or_default();
         let cleared = party_line::clearance_runway();
-        let Some((rwy, path)) = autotaxi::pick_line_up(&cands, lat, lon, cleared.as_deref())
-        else {
+        let force_backtrack = args.get("backtrack").and_then(Value::as_bool).unwrap_or(false);
+        // Full-length check: the POH roll with the takeoff tool's 1.4
+        // margin, floored at the plain line-up's own minimum.
+        let needed_m = self.takeoff_roll_m.map_or(400.0, |m| (m * 1.4).max(400.0));
+        let Some((rwy, plan)) = autotaxi::pick_line_up_plan(
+            &cands,
+            lat,
+            lon,
+            cleared.as_deref(),
+            needed_m,
+            force_backtrack,
+        ) else {
             return Ok(match cleared {
                 Some(c) => format!(
                     "I can't find runway {} next to us. Taxi us closer and ask again.",
@@ -279,6 +298,11 @@ impl Tool for LineUp {
                 ),
                 None => "We're not next to a runway I can line up on.".to_string(),
             });
+        };
+        let spoken = crate::atis::spoken_runway(&rwy.id);
+        let (path, backtracking) = match plan {
+            autotaxi::LineUpPlan::Plain(p) => (p, false),
+            autotaxi::LineUpPlan::Backtrack(p) => (p, true),
         };
         let watch = crate::station::TaxiWatch {
             path,
@@ -290,8 +314,11 @@ impl Tool for LineUp {
             return Ok("We're basically on the runway already. Roll forward a touch and we're lined up."
                 .to_string());
         };
-        let spoken = crate::atis::spoken_runway(&rwy.id);
-        route.done_line = Some(format!("Lined up runway {spoken}. Holding position."));
+        route.done_line = Some(if backtracking {
+            "At the numbers. Coming around.".to_string()
+        } else {
+            format!("Lined up runway {spoken}. Holding position.")
+        });
         // Governor through the front door: parking-brake and held-brake
         // gates apply to a line-up unchanged.
         let arm_line = speedhold::HoldSpeed {
@@ -302,6 +329,18 @@ impl Tool for LineUp {
         .await?;
         if !speedhold::taxi_hold_active() {
             return Ok(arm_line);
+        }
+        if backtracking {
+            autotaxi::start_backtrack(
+                ctx.config.xplane_base_url.clone(),
+                ctx.voice.cloned(),
+                route,
+                rwy.clone(),
+                LINE_UP_KTS,
+            );
+            return Ok(format!(
+                "Backtracking runway {spoken} for the full length. Your pedals or my controls take it back any time."
+            ));
         }
         autotaxi::start(ctx.config.xplane_base_url.clone(), ctx.voice.cloned(), route, LINE_UP_KTS);
         Ok(format!(

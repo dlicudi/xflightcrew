@@ -281,6 +281,11 @@ impl Registry {
             }));
             tools.push(Box::new(taxi::LineUp {
                 park_brake_valve_set: profile.park_brake_valve_set,
+                takeoff_roll_m: profile
+                    .reference
+                    .as_ref()
+                    .and_then(|r| r.takeoff_distance_ft)
+                    .map(|f| f * 0.3048),
             }));
         }
 

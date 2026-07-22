@@ -203,7 +203,12 @@ pub fn taxi_control(
     trend_kts_s: f64,
 ) -> (Option<f64>, f64) {
     if target_kts < 1.0 && gs_kts < 1.5 {
-        return (Some(0.0), 0.5); // holding position: idle + parked on the brakes
+        // Finish the roll on light pressure; parked effort only once the
+        // wheels are still — half brakes arriving at walking pace snapped
+        // the aircraft to a halt nose-first ("jerks forward as it brakes",
+        // 2026-07-22). The slew carries the squeeze between the two.
+        let brake = if gs_kts > 0.3 { 0.18 } else { 0.5 };
+        return (Some(0.0), brake); // holding position: idle + brakes
     }
     // Where we'll be once a lever change has worked through the spool.
     let eff = (target_kts - gs_kts) - trend_kts_s * 2.5;
@@ -218,8 +223,12 @@ pub fn taxi_control(
         // WELL past the target: idle now and brake in proportion, together —
         // the polite step-down let an SR22 run a 10-knot taxi through 20
         // (2026-07-11). Ramped from the boundary: the old flat 0.2 minimum
-        // stabbed the pedals the instant this branch was crossed.
-        (Some(0.0), ((-eff - 3.0) * 0.12 + 0.1).clamp(0.1, 0.6))
+        // stabbed the pedals the instant this branch was crossed. Rolling
+        // TRIMS (a bend slow-down, target still moving) cap well below a
+        // stop's effort: a 12→6 kt bend target braked at 0.45 and threw
+        // everyone forward ("still very abrupt", SR22 2026-07-22).
+        let cap = if target_kts < 1.0 { 0.6 } else { 0.3 };
+        (Some(0.0), ((-eff - 3.0) * 0.12 + 0.1).clamp(0.1, cap))
     } else if eff < -1.0 {
         // A little fast: power off is the whole correction for a rolling
         // taxi — idle thrust won't hold it fast on the flat, and braking to
@@ -247,7 +256,9 @@ pub fn taxi_control(
 /// not a jerk, applying quickly is.
 pub fn brake_slew(prev: f64, want: f64, dt_s: f64) -> f64 {
     let dt = dt_s.clamp(0.02, 1.0);
-    let step = if want > prev { 0.5 * dt } else { 1.5 * dt };
+    // 0.35/s apply: the 0.5/s squeeze still read as a stab on the SR22's
+    // effective brakes ("still very abrupt", 2026-07-22).
+    let step = if want > prev { 0.35 * dt } else { 1.5 * dt };
     prev + (want - prev).clamp(-step, step)
 }
 
@@ -769,7 +780,7 @@ mod tests {
             b = brake_slew(b, 0.5, 0.1);
             ticks += 1;
         }
-        assert!((8..=14).contains(&ticks), "~1 s to full park, took {ticks} ticks");
+        assert!((10..=18).contains(&ticks), "~1.5 s to full park, took {ticks} ticks");
         // Release is quick — letting go is not a jerk.
         let released = brake_slew(0.5, 0.0, 0.1);
         assert!(released < 0.4, "{released}");
@@ -828,6 +839,11 @@ mod tests {
         assert_eq!(taxi_control(10.0, 10.5, 0.15, 0.0), (None, 0.0));
         // Hold short: idle + parked on the brakes even when stopped.
         assert_eq!(taxi_control(0.0, 0.2, 0.0, 0.0), (Some(0.0), 0.5));
+        // Still rolling into the stop: light pressure finishes the roll —
+        // parked effort at walking pace is the nose-first jerk.
+        let (thr, brake) = taxi_control(0.0, 1.0, 0.0, 0.0);
+        assert_eq!(thr, Some(0.0));
+        assert!(brake > 0.0 && brake < 0.25, "gentle finish: {brake}");
     }
 
     #[test]

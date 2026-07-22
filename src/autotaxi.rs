@@ -106,6 +106,11 @@ const WINDOW_M: f64 = 15.0;
 /// `autoland::ACTIVE`. Cleared by the loop itself, the release path in
 /// main, or the `auto_taxi` tool's off switch.
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Whether the LAST drive ended by ARRIVING at its stop (vs a handback,
+/// arrest, or off-route stand-down). The backtrack supervisor reads this to
+/// decide whether leg two may begin — any other ending already spoke and
+/// must not be driven over.
+pub static LAST_ARRIVED: AtomicBool = AtomicBool::new(false);
 
 /// One-line status for the dashboard's "managing" panel.
 pub fn status() -> Option<String> {
@@ -218,10 +223,23 @@ impl Route {
 }
 
 /// Steering command for a heading error: proportional, full deflection at
-/// [`STEER_FULL_DEG`]. No derivative term — the nosewheel plant at taxi
-/// speed is heavily damped already, and the tick is fast.
+/// [`STEER_FULL_DEG`]. The plant decides whether raw P is enough: a linked
+/// nosewheel (172) is self-damped, a castoring one is not — feed this
+/// [`damped_err_deg`], never the raw error.
 pub fn steer_cmd(err_deg: f64) -> f64 {
     (err_deg / STEER_FULL_DEG).clamp(-1.0, 1.0)
+}
+
+/// Lead the heading error by the yaw rate. On a castoring nosewheel (SR22)
+/// the steer channel is effectively RUDDER-only — a lagged, integrating
+/// plant that pure P sent into a ±40° snake at three knots (heading swung
+/// 137°→213°→138° on successive state ticks, 2026-07-22). Leading by where
+/// the nose will be in [`STEER_RATE_LEAD_S`] checks the swing before the
+/// crest. On a linked nosewheel taxi yaw rates are small and the term is
+/// nearly inert, so the 172 keeps its proven feel.
+pub const STEER_RATE_LEAD_S: f64 = 0.6;
+pub fn damped_err_deg(err_deg: f64, yaw_rate_dps: f64) -> f64 {
+    err_deg - yaw_rate_dps * STEER_RATE_LEAD_S
 }
 
 /// Steering authority vs groundspeed: a fully deflected nosewheel at a
@@ -292,7 +310,21 @@ const LINE_UP_ALIGN_M: f64 = 80.0;
 /// centreline ahead, and down it far enough to finish aligned. `None` when
 /// the geometry refuses (too far off, or not enough runway past the stop).
 pub fn line_up_path(rwy: &crate::autoland::Runway, lat: f64, lon: f64) -> Option<Vec<(f64, f64)>> {
-    use crate::autoland::{along_track_nm, cross_track_nm, project_latlon};
+    use crate::autoland::project_latlon;
+    let (entry_m, stop_m) = line_up_stops_m(rwy, lat, lon)?;
+    if rwy.length_m - stop_m < LINE_UP_MIN_REMAINING_M {
+        return None;
+    }
+    let e = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, entry_m / M_PER_NM);
+    let b = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, stop_m / M_PER_NM);
+    Some(vec![(lat, lon), e, b])
+}
+
+/// Where a plain line-up from this position would enter and stop (meters
+/// past the threshold), or `None` when the position isn't a hold-short
+/// geometry at all. Shared by the path builder and the full-length check.
+pub fn line_up_stops_m(rwy: &crate::autoland::Runway, lat: f64, lon: f64) -> Option<(f64, f64)> {
+    use crate::autoland::{along_track_nm, cross_track_nm};
     let lateral = (cross_track_nm(lat, lon, rwy) * M_PER_NM).abs();
     if lateral > LINE_UP_MAX_LATERAL_M {
         return None;
@@ -306,13 +338,101 @@ pub fn line_up_path(rwy: &crate::autoland::Runway, lat: f64, lon: f64) -> Option
     // holding point (LXGB's Echo sits ~90 m off the strip) doesn't need a
     // 90 m lead, it needs a sharper swing the taxi law already handles.
     let entry_m = past_m + lateral.clamp(30.0, 60.0);
-    let stop_m = entry_m + LINE_UP_ALIGN_M;
-    if rwy.length_m - stop_m < LINE_UP_MIN_REMAINING_M {
+    Some((entry_m, entry_m + LINE_UP_ALIGN_M))
+}
+
+/// A backtrack pocket sits this far past the threshold along the runway —
+/// room for the turnaround to finish at the numbers.
+const BACKTRACK_TURN_START_M: f64 = 60.0;
+/// ...and this far off the centreline (right of the backtrack direction),
+/// so the 180 is a teardrop with turning room, never a pivot on the spot.
+const BACKTRACK_POCKET_OFFSET_M: f64 = 12.0;
+/// Closer to the threshold than this, a backtrack is pointless — the plain
+/// line-up already stops within a couple of plane-lengths of the numbers.
+const BACKTRACK_MIN_M: f64 = 150.0;
+
+/// Leg one of a backtrack: from the hold, onto the centreline heading TOWARD
+/// the departure threshold, down the strip, ending in a turn pocket beside
+/// the numbers. Leg two is a plain [`line_up_path`] from the pocket — the
+/// join machinery already handles "facing the wrong way", and splitting the
+/// maneuver keeps each route free of overlapping legs (a single out-and-back
+/// polyline is ambiguous to project onto). Real Gibraltar: the taxiways only
+/// reach the east half, so a full-length 09 departure backtracks ~1.2 km
+/// (2026-07-22, held at Charlie with 580 m ahead).
+pub fn backtrack_pocket_path(
+    rwy: &crate::autoland::Runway,
+    lat: f64,
+    lon: f64,
+) -> Option<Vec<(f64, f64)>> {
+    use crate::autoland::{along_track_nm, cross_track_nm, project_latlon};
+    let lateral = (cross_track_nm(lat, lon, rwy) * M_PER_NM).abs();
+    if lateral > LINE_UP_MAX_LATERAL_M {
         return None;
     }
-    let e = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, entry_m / M_PER_NM);
-    let b = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, stop_m / M_PER_NM);
-    Some(vec![(lat, lon), e, b])
+    let past_m = (-along_track_nm(lat, lon, rwy) * M_PER_NM).max(0.0);
+    if past_m < BACKTRACK_MIN_M {
+        return None;
+    }
+    let c = |d_m: f64| project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, d_m / M_PER_NM);
+    // Enter the runway swinging toward the threshold (the mirror of the
+    // line-up's entry lead), never inside the turn pocket itself.
+    let entry_m = (past_m - lateral.clamp(30.0, 60.0)).max(BACKTRACK_TURN_START_M + 30.0);
+    let entry = c(entry_m);
+    let turn_start = c(BACKTRACK_TURN_START_M);
+    // The pocket: beside the numbers, right of the direction of travel.
+    let mid = c(BACKTRACK_TURN_START_M / 2.0);
+    let pocket = project_latlon(
+        mid.0,
+        mid.1,
+        rwy.course_deg - 90.0,
+        BACKTRACK_POCKET_OFFSET_M / M_PER_NM,
+    );
+    Some(vec![(lat, lon), entry, turn_start, pocket])
+}
+
+/// How a line-up will be driven: straight on, or the full-length backtrack.
+pub enum LineUpPlan {
+    Plain(Vec<(f64, f64)>),
+    Backtrack(Vec<(f64, f64)>),
+}
+
+/// Pick the runway AND the maneuver: a plain line-up when the runway ahead
+/// of its stop covers `needed_m`, otherwise a backtrack to the threshold
+/// when the geometry offers one (`force_backtrack` skips straight to it —
+/// the pilot asked for the full length in so many words).
+pub fn pick_line_up_plan(
+    cands: &[crate::autoland::Runway],
+    lat: f64,
+    lon: f64,
+    cleared: Option<&str>,
+    needed_m: f64,
+    force_backtrack: bool,
+) -> Option<(crate::autoland::Runway, LineUpPlan)> {
+    let mut best: Option<(crate::autoland::Runway, LineUpPlan, f64)> = None;
+    for r in cands {
+        if let Some(c) = cleared {
+            if !crate::autotakeoff::runway_matches(&r.id, c) {
+                continue;
+            }
+        }
+        let plain = line_up_path(r, lat, lon);
+        let ahead = line_up_stops_m(r, lat, lon).map(|(_, stop)| r.length_m - stop);
+        let wants_backtrack =
+            force_backtrack || ahead.is_none_or(|a| a < needed_m) || plain.is_none();
+        let plan = if wants_backtrack {
+            match backtrack_pocket_path(r, lat, lon) {
+                Some(p) => Some(LineUpPlan::Backtrack(p)),
+                None => plain.map(LineUpPlan::Plain),
+            }
+        } else {
+            plain.map(LineUpPlan::Plain)
+        };
+        let Some(plan) = plan else { continue };
+        if best.as_ref().is_none_or(|(_, _, d)| r.dist_nm < *d) {
+            best = Some((r.clone(), plan, r.dist_nm));
+        }
+    }
+    best.map(|(r, p, _)| (r, p))
 }
 
 /// Pick the runway end to line up on: feasible geometry, matching the
@@ -342,9 +462,12 @@ pub fn pick_line_up(
 
 /// Pure-pursuit lookahead: seconds of taxi ahead, floored so creep-speed
 /// taxiing still aims somewhere and capped so the aim point can't cut a
-/// corner two junctions away.
+/// corner two junctions away. 5 s, not 3.5: at 14 m of lookahead a 3 m
+/// centreline offset read as 12° of error and half-lock steer — the SR22
+/// S-weaved ±4 m for whole legs even with the rate lead (2026-07-22).
+/// Longer aim turns the same offset into ~8° and a quarter-lock nudge.
 pub fn lookahead_m(gs_kts: f64) -> f64 {
-    (gs_kts * 0.514 * 3.5).clamp(12.0, 50.0)
+    (gs_kts * 0.514 * 5.0).clamp(16.0, 50.0)
 }
 
 /// The braking-distance speed cap approaching the stop point: v = √(2·a·d)
@@ -380,12 +503,84 @@ pub fn start(base_url: String, voice: Option<Voice>, route: Route, base_kts: f64
     if ACTIVE.swap(true, Ordering::Relaxed) {
         return; // already driving — the tool retargets instead
     }
+    LAST_ARRIVED.store(false, Ordering::Relaxed);
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
             ACTIVE.store(false, Ordering::Relaxed);
             return;
         };
         rt.block_on(drive(XPlaneClient::new(base_url), voice, route, base_kts));
+    });
+}
+
+/// Drive a backtrack: leg one (down the strip to the turn pocket) now, and
+/// when it ARRIVES, leg two — a plain line-up from wherever the aircraft
+/// actually stopped, which the join machinery turns into the 180. Any other
+/// ending of leg one (pedals, "my controls", park handle, off-route) stands
+/// the whole maneuver down: those paths already spoke, and the pilot who
+/// took over mid-backtrack does not want a second drive starting itself.
+pub fn start_backtrack(
+    base_url: String,
+    voice: Option<Voice>,
+    route: Route,
+    rwy: crate::autoland::Runway,
+    base_kts: f64,
+) {
+    start(base_url.clone(), voice.clone(), route, base_kts);
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+            return;
+        };
+        rt.block_on(async move {
+            // Wait out leg one — bounded, so a stuck drive can't leak this
+            // thread forever.
+            for _ in 0..2400 {
+                if !ACTIVE.load(Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            if ACTIVE.load(Ordering::Relaxed) || !LAST_ARRIVED.load(Ordering::Relaxed) {
+                return; // taken over, arrested, or still (impossibly) driving
+            }
+            if !crate::tools::speedhold::taxi_hold_active() {
+                return; // speed authority gone with leg one — nobody drives
+            }
+            let xp = XPlaneClient::new(base_url.clone());
+            let (Ok(lat), Ok(lon)) = (xp.get_float(LAT).await, xp.get_float(LON).await) else {
+                return;
+            };
+            let Some(path) = line_up_path(&rwy, lat, lon) else {
+                alert(
+                    &voice,
+                    Priority::Caution,
+                    "I couldn't set up the turn. The line-up is yours.",
+                );
+                return;
+            };
+            let watch = crate::station::TaxiWatch {
+                path,
+                via: String::new(),
+                seg: Vec::new(),
+                holding_point: String::new(),
+            };
+            let Some(mut route2) = Route::build(&watch) else {
+                alert(
+                    &voice,
+                    Priority::Caution,
+                    "I couldn't set up the turn. The line-up is yours.",
+                );
+                return;
+            };
+            let spoken = crate::atis::spoken_runway(&rwy.id);
+            route2.done_line = Some(format!("Lined up runway {spoken}. Holding position."));
+            crate::blackbox::record(
+                "autotaxi",
+                serde_json::json!({"event": "backtrack_turn", "rwy": rwy.id}),
+            );
+            crate::tools::speedhold::set_taxi_target(base_kts);
+            start(base_url, voice, route2, base_kts);
+        });
     });
 }
 
@@ -419,6 +614,10 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     // against it and are JOINING — widened guard, bend-speed cap — until
     // captured, when it drops to 0 and the established guard takes over.
     let mut join_allow: Option<f64> = None;
+    // Yaw rate for the steering lead, EMA-smoothed: raw tick-to-tick heading
+    // differences of an HTTP read are noise the lead would amplify.
+    let mut prev_psi: Option<(f64, std::time::Instant)> = None;
+    let mut yaw_rate = 0.0f64;
     loop {
         if !ACTIVE.load(Ordering::Relaxed) {
             break;
@@ -467,10 +666,20 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         }
+        // One read burst, not a chain: sequential HTTP awaits stretched the
+        // takeoff tick to half a second and bought a slew-limit weave
+        // (sortie four) — the same medicine here keeps the steer tick honest.
+        let (yield_r, lat_r, lon_r, psi_r, gs_r) = tokio::join!(
+            xp.get_float(STEER_YIELD),
+            xp.get_float(LAT),
+            xp.get_float(LON),
+            xp.get_float(PSI_TRUE),
+            xp.get_float(GS_MS),
+        );
         // The pilot's feet moved the yaw axis: the plugin already dropped
         // the override — stand the loop down and keep the speed hold, which
         // is the pre-existing "you steer, I have the throttle" division.
-        if xp.get_float(STEER_YIELD).await.is_ok_and(|v| v > 0.5) {
+        if yield_r.is_ok_and(|v| v > 0.5) {
             tracing::info!("auto taxi: pilot on the pedals, steering released");
             crate::blackbox::record("autotaxi", serde_json::json!({"event": "pedal_yield"}));
             alert(
@@ -481,12 +690,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             ACTIVE.store(false, Ordering::Relaxed);
             break;
         }
-        let (Ok(lat), Ok(lon), Ok(psi), Ok(gs_ms)) = (
-            xp.get_float(LAT).await,
-            xp.get_float(LON).await,
-            xp.get_float(PSI_TRUE).await,
-            xp.get_float(GS_MS).await,
-        ) else {
+        let (Ok(lat), Ok(lon), Ok(psi), Ok(gs_ms)) = (lat_r, lon_r, psi_r, gs_r) else {
             // Sim hiccup: no writes, the channel expires, retry.
             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             continue;
@@ -540,6 +744,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // "go" past this point is the pilot's call (a crossing clearance).
         if remaining <= 1.0 && gs_kts < 1.5 {
             tracing::info!("auto taxi: holding point, done");
+            LAST_ARRIVED.store(true, Ordering::Relaxed);
             crate::blackbox::record("autotaxi", serde_json::json!({"event": "holding_point"}));
             speedhold::set_taxi_target(0.0);
             let _ = xp.set_float(TAXI_STEER, 0.0).await;
@@ -554,16 +759,39 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             ACTIVE.store(false, Ordering::Relaxed);
             break;
         }
-        // Steering: aim at the route ahead, command the error down, with
-        // the lock tapered by groundspeed so a standstill can break away.
-        // From a backwards or off-route start this is the whole join —
-        // the deflection tightens as the roll builds. Approaching the stop
-        // (route end, or a spoken "stop" bleeding speed off) the wheel
-        // straightens so the brakes never bite onto a deflected nosewheel.
-        let mut steer = stop_straighten(steer_cmd(err) * steer_authority(gs_kts), remaining);
+        // Steering: aim at the route ahead, command the error down — led by
+        // the yaw rate so a laggy plant (castoring nosewheel steering by
+        // rudder) can't snake — with the lock tapered by groundspeed so a
+        // standstill can break away. From a backwards or off-route start
+        // this is the whole join — the deflection tightens as the roll
+        // builds. Approaching the stop (route end, or a spoken "stop"
+        // bleeding speed off) the wheel straightens so the brakes never
+        // bite onto a deflected nosewheel.
+        let now = std::time::Instant::now();
+        let raw_rate = prev_psi.map_or(0.0, |(p, t0)| {
+            let dt = now.duration_since(t0).as_secs_f64();
+            if (0.05..=1.0).contains(&dt) {
+                (((psi - p + 540.0).rem_euclid(360.0)) - 180.0) / dt
+            } else {
+                0.0
+            }
+        });
+        prev_psi = Some((psi, now));
+        yaw_rate = yaw_rate * 0.5 + raw_rate.clamp(-90.0, 90.0) * 0.5;
+        let mut steer = stop_straighten(
+            steer_cmd(damped_err_deg(err, yaw_rate)) * steer_authority(gs_kts),
+            remaining,
+        );
         if ext_stopped {
             steer *= (gs_kts / 3.0).clamp(0.0, 1.0);
         }
+        crate::blackbox::record(
+            "autotaxi",
+            serde_json::json!({
+                "event": "drive", "gs": gs_kts, "err": err, "yaw_dps": yaw_rate,
+                "steer": steer, "lat_m": lateral, "remaining_m": remaining,
+            }),
+        );
         if xp.set_float(TAXI_STEER, steer).await.is_err() {
             // The channel vanished (plugin reload): no steering, no drive.
             tracing::warn!("auto taxi: steer channel lost, stopping");
@@ -706,9 +934,20 @@ mod tests {
     }
 
     #[test]
+    fn rate_lead_checks_the_swing() {
+        // Nose swinging hard through a small error: the lead commands
+        // countersteer before the crest — this is the SR22 snake killer.
+        assert!(damped_err_deg(5.0, 40.0) < 0.0);
+        // Steady nose: pure P unchanged, the 172 keeps its proven feel.
+        assert_eq!(damped_err_deg(10.0, 0.0), 10.0);
+        // A gentle commanded bend (~8 deg/s) keeps most of its steer.
+        assert!(damped_err_deg(15.0, 8.0) > 9.0);
+    }
+
+    #[test]
     fn lookahead_scales_with_speed_within_bounds() {
-        assert_eq!(lookahead_m(0.0), 12.0);
-        assert!(lookahead_m(10.0) > 12.0 && lookahead_m(10.0) < 50.0);
+        assert_eq!(lookahead_m(0.0), 16.0);
+        assert!(lookahead_m(10.0) > 16.0 && lookahead_m(10.0) < 50.0);
         assert_eq!(lookahead_m(60.0), 50.0);
     }
 
@@ -825,6 +1064,74 @@ mod tests {
         // The tower cleared 18 and we're at the 36 end: nothing safe to
         // drive onto — the far end is a taxi clearance, not a line-up.
         assert!(pick_line_up(&cands, hlat, hlon, Some("18")).is_none());
+    }
+
+    #[test]
+    fn backtrack_drives_to_a_pocket_beside_the_numbers() {
+        use crate::autoland::{along_track_nm, cross_track_nm, Runway};
+        // The LXGB shape: a 1,712 m runway, hold-short stub 1,170 m down it
+        // (holding point Charlie left 580 m ahead for a 09 departure,
+        // 2026-07-22). Runway 36 from (0,0) for test geometry.
+        let rwy = Runway {
+            icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
+            course_deg: 0.0, length_m: 1712.0, surface: 1, dist_nm: 0.6, elev_ft: 0.0,
+        };
+        let mid = crate::autoland::project_latlon(0.0, 0.0, 0.0, 1170.0 / 1852.0);
+        let (hlat, hlon) = crate::autoland::project_latlon(mid.0, mid.1, 90.0, 40.0 / 1852.0);
+        let path = backtrack_pocket_path(&rwy, hlat, hlon).expect("feasible");
+        // The route heads TOWARD the threshold: each point's along-track
+        // shrinks, and the pocket ends up beside the numbers, off the
+        // centreline (turning room, never a pivot).
+        let along: Vec<f64> =
+            path.iter().map(|&(a, b)| -along_track_nm(a, b, &rwy) * 1852.0).collect();
+        assert!(along.windows(2).all(|w| w[1] < w[0] + 1.0), "monotonic toward the numbers: {along:?}");
+        let (plat, plon) = *path.last().unwrap();
+        let pocket_along = -along_track_nm(plat, plon, &rwy) * 1852.0;
+        let pocket_off = (cross_track_nm(plat, plon, &rwy) * 1852.0).abs();
+        assert!(pocket_along < 60.0, "pocket beside the numbers: {pocket_along}");
+        assert!(pocket_off > 8.0 && pocket_off < 20.0, "turning room: {pocket_off}");
+        // A line-up FROM the pocket is feasible — that's leg two, the 180.
+        assert!(line_up_path(&rwy, plat, plon).is_some(), "leg two must exist");
+        // Near the numbers already: no backtrack, the plain line-up owns it.
+        let near = crate::autoland::project_latlon(0.0, 0.0, 0.0, 60.0 / 1852.0);
+        let (nlat, nlon) = crate::autoland::project_latlon(near.0, near.1, 90.0, 40.0 / 1852.0);
+        assert!(backtrack_pocket_path(&rwy, nlat, nlon).is_none());
+    }
+
+    #[test]
+    fn line_up_plan_backtracks_only_when_short() {
+        use crate::autoland::Runway;
+        let rwy = Runway {
+            icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
+            course_deg: 0.0, length_m: 1712.0, surface: 1, dist_nm: 0.6, elev_ft: 0.0,
+        };
+        let cands = vec![rwy];
+        // 1,170 m down the strip: a plain line-up leaves ~460 m — enough for
+        // a 172 (needs 400), a backtrack for an SR22 (needs 700).
+        let mid = crate::autoland::project_latlon(0.0, 0.0, 0.0, 1170.0 / 1852.0);
+        let (hlat, hlon) = crate::autoland::project_latlon(mid.0, mid.1, 90.0, 40.0 / 1852.0);
+        assert!(matches!(
+            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, false),
+            Some((_, LineUpPlan::Plain(_)))
+        ));
+        assert!(matches!(
+            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 700.0, false),
+            Some((_, LineUpPlan::Backtrack(_)))
+        ));
+        // The pilot asked for the full length in so many words: backtrack
+        // even though the plain remaining would do.
+        assert!(matches!(
+            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, true),
+            Some((_, LineUpPlan::Backtrack(_)))
+        ));
+        // Abeam the numbers a backtrack is impossible — the ask still gets
+        // the plain line-up, never a refusal.
+        let near = crate::autoland::project_latlon(0.0, 0.0, 0.0, 60.0 / 1852.0);
+        let (nlat, nlon) = crate::autoland::project_latlon(near.0, near.1, 90.0, 40.0 / 1852.0);
+        assert!(matches!(
+            pick_line_up_plan(&cands, nlat, nlon, Some("36"), 700.0, true),
+            Some((_, LineUpPlan::Plain(_)))
+        ));
     }
 
     #[test]
