@@ -352,3 +352,21 @@
 - {text: "copy flying heading 270 degrees.", intent: unknown, radio: false, readback: true}
 - {text: "number 272 sierra papa, squawk, change to 4503.", intent: unknown, radio: false, readback: true}
 - {text: "map cleared for takeoff, runway 27, november 172, sierra papa.", intent: request_takeoff, readback: true}
+
+# --- 2026-07-20/22 sorties: airport-name mangles and callsign mangles --------
+# Whisper butchered "Gibraltar Tower" three ways in one day; the intent
+# keywords carried every one. Pinned so a router change never starts
+# requiring a clean station name.
+- {text: "dr. gibraltar town, november 172, sierra papa request departure clearance.", intent: request_clearance, radio: true}
+- {text: "chipotle tower, request departure clearance.", intent: request_clearance, radio: true}
+- {text: "she brought to tower, november 172, sierra papa, request departure clearance.", intent: request_clearance, radio: true}
+- {text: "november 1720, proper request taxi.", intent: request_taxi, radio: true}
+# Hold-position readbacks with the callsign mangled: silence is correct,
+# and neither may ever parse INTO a clearance-earning intent.
+- {text: "hold in position, november 1720 pop.", intent: unknown}
+- {text: "holding position, november 17 to sierra papa.", intent: unknown}
+# The LUAW conditional readback ("behind the landing traffic, lining up...")
+# earns silence, never a fresh clearance.
+- {text: "behind the landing traffic, lining up runway 08 right, behind november 172 sierra papa.", intent: unknown}
+- {text: "it's requesting transponder code.", intent: squawk_check, radio: true}
+- {text: "requesting taxi to parking?", intent: request_taxi_in, radio: true}

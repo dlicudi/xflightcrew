@@ -109,6 +109,20 @@ pub fn normalize(transcript: &str) -> String {
         ("q and h", "qnh"),
         ("q&h", "qnh"),
         ("q n h", "qnh"),
+        // Whisper's renderings of "taxi for me" ("Tax you for me?" at 0.99
+        // confidence, "Okay. Taxi foamy?" — both live 2026-07-20). Nobody
+        // says either otherwise.
+        ("tax you for me", "taxi for me"),
+        ("taxi foamy", "taxi for me"),
+        // Whisper splits the compound; nobody says "back track" otherwise.
+        ("back track", "backtrack"),
+        // "engines on" heard with a ghost copula ("Engine is on." live
+        // 2026-07-22 — said as the start command, missed as a statement).
+        ("engine is on", "engines on"),
+        // "electrical systems on" mangles (live 2026-07-20/22): the noun
+        // slips to "electronics", the trailing "on" to "zone".
+        ("electronics systems", "electrical systems"),
+        ("electrical system zone", "electrical systems on"),
     ] {
         s = s.replace(heard, meant);
     }
@@ -432,8 +446,17 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     // right band, so headings ("heading 122") and altimeter settings never
     // match. Whisper glues the radio index into the number ("com 1 122.8" →
     // "com 1122.8"), so 1xxx.x/2xxx.x recover com1/com2 + the frequency.
+    // A change/switch verb with a decimal is a tuning request even without a
+    // radio word — "change to 125.655" missed live (2026-07-20) while
+    // "change to frequency 125.655" matched. The band check below is the
+    // real guard; the subject exclusions keep fractional non-radio values
+    // ("change heading 122.5") out of the block entirely.
+    let change_with_decimal = (has(t, "change") || has(t, "switch"))
+        && t.contains('.')
+        && !(has(t, "heading") || has(t, "course") || has(t, "altitude")
+            || has(t, "qnh") || has(t, "altimeter") || has(t, "barometer") || has(t, "baro"));
     if has(t, "com") || has(t, "radio") || has(t, "frequency") || has(t, "freq")
-        || has(t, "nav") || has(t, "tune")
+        || has(t, "nav") || has(t, "tune") || change_with_decimal
     {
         let com_band = 118.0..=136.975;
         let nav_band = 108.0..=117.95;
@@ -614,6 +637,14 @@ fn parse_one(t: &str) -> Option<ToolCall> {
             || t.contains("you have the takeoff") || t.contains("you have the take off")
             || t.contains("your takeoff") || t.contains("your take off")
             || t.contains("you fly the takeoff") || t.contains("fly the takeoff")
+            // Whisper's renderings of the shapes above (live 2026-07-20):
+            // "you have the takeoff" → "you have to take off", "your
+            // takeoff" → "you'll take off" (apostrophe already stripped),
+            // "you handle the takeoff" → "use handle to take off". All
+            // still second-person; no readback or tower call carries them.
+            || t.contains("you have to take off") || t.contains("youll take off")
+            || t.contains("you handle the takeoff") || t.contains("handle the takeoff")
+            || t.contains("handle to take off")
         {
             return Some(call("auto_takeoff", json!({})));
         }
@@ -627,9 +658,25 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     if !has(t, "wait") && !t.contains("lining")
         && (t == "line up" || t == "line up to the runway" || t == "line up on the runway"
             || t.contains("line us up") || t.contains("line me up")
-            || t.contains("get us lined up") || t.contains("take us onto the runway"))
+            || t.contains("get us lined up") || t.contains("take us onto the runway")
+            // "let's line up with the runway" peels its "lets" and arrives
+            // as this shape (three phrasings went unanswered live,
+            // 2026-07-20). The wait/lining guards above still exclude the
+            // LUAW readback and the short echo.
+            || (t.starts_with("line up") && has(t, "runway")))
     {
         return Some(call("line_up", json!({})));
+    }
+    // Backtrack — the full-length line-up (drive to the threshold, turn
+    // around). Whole-word "backtrack" so the -ing echo never matches, and
+    // the "wait" guard mirrors the LUAW readback trap. The normalizer folds
+    // whisper's split "back track".
+    if has(t, "backtrack") && !has(t, "wait") && !t.contains("lining")
+        && (t == "backtrack" || t.contains("backtrack for me") || t.contains("backtrack for us")
+            || t.contains("backtrack us") || t.contains("backtrack the runway")
+            || t.contains("backtrack runway"))
+    {
+        return Some(call("line_up", json!({ "backtrack": true })));
     }
     // Auto taxi — the copilot steers the cleared route to the holding point.
     // Before every speed-hold rule, so "taxi for me at 12 knots" doesn't fall
@@ -658,7 +705,7 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         || t.contains("taxi for me") || t.contains("taxi for us")
         || t.contains("you have the taxi") || t.contains("you take the taxi")
         || t.contains("you taxi") || t.contains("take us to the holding")
-        || t.contains("taxi us")
+        || t.contains("take us to holding") || t.contains("taxi us")
     {
         return Some(match num {
             Some(n) => call("auto_taxi", json!({ "knots": n })),
@@ -1029,6 +1076,18 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("set_electrical", json!({ "system": "all", "on": true })));
     }
 
+    // Bare electrical shapes with NO state word: whisper hears the trailing
+    // "on" as "are" ("Electrical systems are", live 2026-07-22). The ask is
+    // obviously ON — cold-dark that's the only thing it can mean, and if
+    // they're already on the tool's readback says so, which beats a silent
+    // miss. Exact shapes only, so longer sentences (and question forms,
+    // which the question gate catches first anyway) never land here.
+    if t == "electrical systems are" || t == "electrical systems"
+        || t == "electrical system" || t == "electrics"
+    {
+        return Some(call("set_electrical", json!({ "system": "all", "on": true })));
+    }
+
     // <system> on/off
     if let Some(on) = onoff(t) {
         for (kw, key) in [
@@ -1195,7 +1254,11 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     }
     // "my controls" / "I have the aircraft" hands it fully back (disengages the AP
     // and releases any active recovery).
-    if t.contains("autopilot off") || t.contains("cancel autopilot") || has(t, "disengage")
+    // Bare "disengage" means the AP only when no other subject is named:
+    // "disengage brakes" rode this into autopilot_off (live 2026-07-20).
+    if t.contains("autopilot off") || t.contains("cancel autopilot")
+        || (has(t, "disengage")
+            && !(has(t, "brake") || has(t, "brakes") || has(t, "break") || has(t, "breaks")))
         || t.contains("my controls") || t.contains("my aircraft") || t.contains("my airplane")
         || t.contains("i have control") || t.contains("i have the aircraft")
         || t.contains("i have the airplane")
@@ -1219,7 +1282,7 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     if (has(t, "brakes") || has(t, "brake") || has(t, "breaks") || has(t, "break"))
         && !t.contains("speed")
     {
-        if has(t, "off") || has(t, "release") || has(t, "released") {
+        if has(t, "off") || has(t, "release") || has(t, "released") || has(t, "disengage") {
             return Some(call("hold_brakes", json!({ "on": false })));
         }
         if has(t, "on") || has(t, "hold") || has(t, "holding") || has(t, "set") {
@@ -1717,6 +1780,11 @@ mod tests {
         // The pilot's taxi READBACK to the tower must never arm the drive.
         assert!(one("taxi to holding point alpha one runway two seven via bravo")
             .is_none_or(|(tool, _)| tool != "auto_taxi"));
+        // Live warts (2026-07-20/22): "the"-less destination, and whisper's
+        // renderings of "taxi for me".
+        assert_eq!(one("take us to holding point").unwrap().0, "auto_taxi");
+        assert_eq!(one("tax you for me").unwrap().0, "auto_taxi");
+        assert_eq!(one("okay taxi foamy").unwrap().0, "auto_taxi");
         // Auto takeoff — first/second-person shapes only.
         assert_eq!(one("take off for me").unwrap(), ("auto_takeoff".into(), json!({})));
         assert_eq!(one("you have the takeoff").unwrap().0, "auto_takeoff");
@@ -1724,6 +1792,10 @@ mod tests {
         assert_eq!(one("auto takeoff").unwrap().1, json!({}));
         assert_eq!(one("take us off").unwrap().0, "auto_takeoff");
         assert_eq!(one("fly the takeoff").unwrap().0, "auto_takeoff");
+        // Whisper's live renderings of the second-person shapes (2026-07-20).
+        assert_eq!(one("you have to take off").unwrap().0, "auto_takeoff");
+        assert_eq!(one("you'll take off").unwrap().0, "auto_takeoff");
+        assert_eq!(one("use handle to take off").unwrap().0, "auto_takeoff");
         assert_eq!(one("abort takeoff").unwrap().1, json!({"off":true}));
         assert_eq!(one("reject the takeoff").unwrap().1, json!({"off":true}));
         assert_eq!(one("cancel the takeoff").unwrap().1, json!({"off":true}));
@@ -1735,10 +1807,42 @@ mod tests {
         assert_eq!(one("line up for me").unwrap().0, "line_up");
         assert_eq!(one("get us lined up").unwrap().0, "line_up");
         assert_eq!(one("take us onto the runway").unwrap().0, "line_up");
+        // "let's line up with/to the runway" peels its "lets" and lands on
+        // the runway-suffixed shape (three phrasings missed live, 2026-07-20).
+        assert_eq!(one("lets line up with the runway").unwrap().0, "line_up");
+        assert_eq!(one("line up with the runway").unwrap().0, "line_up");
         // The LUAW readback and its short echo must never drive us on.
         assert!(one("line up and wait runway two seven")
             .is_none_or(|(tool, _)| tool != "line_up"));
         assert!(one("lining up runway two seven").is_none_or(|(tool, _)| tool != "line_up"));
+        // Backtrack: the full-length line-up (LXGB 09 needs it, 2026-07-22).
+        assert_eq!(one("backtrack").unwrap(), ("line_up".into(), json!({"backtrack": true})));
+        assert_eq!(one("backtrack runway zero nine").unwrap().1, json!({"backtrack": true}));
+        assert_eq!(one("back track for me").unwrap().0, "line_up");
+        // The -ing echo and a wait-carrying readback never arm it.
+        assert!(one("backtracking runway zero nine").is_none_or(|(tool, _)| tool != "line_up"));
+        assert!(one("backtrack runway zero nine and wait").is_none_or(|(tool, _)| tool != "line_up"));
+        // "disengage brakes" rode the bare-"disengage" AP rule into
+        // autopilot_off (live 2026-07-20); the named subject wins now.
+        assert_eq!(one("disengage brakes").unwrap(), ("hold_brakes".into(), json!({"on": false})));
+        assert_eq!(one("release breaks").unwrap().1, json!({"on": false}));
+        assert_eq!(one("disengage").unwrap().0, "autopilot_off");
+        // Bare "qnh <hpa>" (the gate ate "q and h 1014" live; the grammar
+        // must hold up its half once it gets through).
+        assert_eq!(one("q and h 1014").unwrap().0, "set_barometer");
+        // A change verb with a com-band decimal needs no radio word...
+        assert_eq!(one("change to 125.655").unwrap(), ("set_com1".into(), json!({"mhz": 125.655})));
+        // ...but named non-radio subjects stay out of the tuner.
+        assert!(one("change heading to 122.5").is_none_or(|(tool, _)| tool != "set_com1"));
+        // Electrical/engine mangles (live 2026-07-20/22).
+        assert_eq!(one("electronics systems on").unwrap().0, "set_electrical");
+        assert_eq!(one("electrical system zone").unwrap().0, "set_electrical");
+        assert_eq!(one("engine is on").unwrap().0, "start_engine");
+        // Truncated trailing "on" heard as "are", and the bare noun: default ON.
+        assert_eq!(one("electrical systems are").unwrap().1, json!({"system": "all", "on": true}));
+        assert_eq!(one("electrical systems").unwrap().1, json!({"system": "all", "on": true}));
+        // ...but an explicit OFF still wins over the default.
+        assert_eq!(one("electrical systems off").unwrap().1, json!({"system": "all", "on": false}));
         // The READBACK and the call to the tower must never arm it.
         assert!(one("cleared for takeoff runway two seven")
             .is_none_or(|(tool, _)| tool != "auto_takeoff"));

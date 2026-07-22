@@ -4116,6 +4116,13 @@ impl Station {
     /// tuning verb, so radio chatter that merely mentions a station never
     /// re-tunes the radio. `None` = not a tuning request at all.
     pub fn tune_request(&self, t: &str) -> Option<Tune> {
+        // STT warts for station names (all live 2026-07-20): ATIS spelled
+        // letter-by-letter or heard as "atheist", tower heard as "tau".
+        // Nobody asks for any of these otherwise.
+        let t = &t
+            .replace("a t i s", "atis")
+            .replace("atheist", "atis")
+            .replace("tau frequency", "tower frequency");
         // Flight-parameter talk that happens to name a station ("change to
         // approach speed", "select approach flaps") is never a tuning request.
         if t.contains("speed") || t.contains("knots") || t.contains("flaps")
@@ -4134,7 +4141,12 @@ impl Station {
             // promiscuous ("switch the landing light").
             || ((t.contains("change") || t.contains("switch"))
                 && (t.contains("freq") || t.contains("com") || t.contains("radio")));
-        if !verb {
+        // A short bare "<station> frequency" is a tuning request even with
+        // the verb clipped by STT ("To tower frequency." lost its "change",
+        // live 2026-07-20). Short only: a real readback quoting a frequency
+        // carries digits and runs longer.
+        let bare = t.contains("frequency") && t.split_whitespace().count() <= 4;
+        if !verb && !bare {
             return None;
         }
         let named = SERVICES.iter().find(|(w, _)| t.contains(w));
@@ -6536,6 +6548,29 @@ mod tests {
         ));
         assert!(st.tune_request("change to approach speed").is_none());
         assert!(st.tune_request("select approach flaps").is_none());
+        // STT warts, all live 2026-07-20: ATIS spelled out or heard as
+        // "atheist", tower as "tau", and the verb clipped to a short bare
+        // "<station> frequency".
+        match st.tune_request("change to a t i s frequency.") {
+            Some(Tune::Missing(msg)) => assert!(msg.contains("no atis"), "{msg}"),
+            other => panic!("spelled-out atis should resolve: {:?}", other.is_some()),
+        }
+        match st.tune_request("can the vibrator change to atheist frequency") {
+            Some(Tune::Missing(msg)) => assert!(msg.contains("no atis"), "{msg}"),
+            other => panic!("'atheist' should resolve to atis: {:?}", other.is_some()),
+        }
+        assert!(matches!(
+            st.tune_request("change to tau frequency."),
+            Some(Tune::Found { khz: 131200, .. })
+        ));
+        assert!(matches!(
+            st.tune_request("to tower frequency."),
+            Some(Tune::Found { khz: 131200, .. })
+        ));
+        // Long frequency-quoting readbacks still never retune bare.
+        assert!(st
+            .tune_request("holding point echo one runway two seven frequency copied")
+            .is_none());
     }
 
     #[test]

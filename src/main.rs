@@ -5036,8 +5036,9 @@ const COMMAND_KEYWORDS: &[&str] = &[
     // radios / transponder
     "com", "comm", "radio", "frequency", "tune", "squawk", "transponder",
     "ident", "barometer", "altimeter", "baro", "kollsman", "qnh", "vor",
-    // instruments / misc controls
-    "gyro", "pitot", "brake", "brakes", "parking", "heat",
+    // instruments / misc controls ("break(s)" = the STT homophone the
+    // grammar already tolerates; "release breaks" was gate-swallowed)
+    "gyro", "pitot", "brake", "brakes", "break", "breaks", "parking", "heat",
     // ramp / ground-ops: chocks, ground power, pushback, services
     "chocks", "chock", "pushback", "push", "tug", "gpu", "ground", "refuel",
     "service", "services",
@@ -5066,6 +5067,8 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "belay", "undo", "abort", "disregard", "scratch", "revert",
     // emergency recovery / take-control + autoland handoff ("land"/"ground" already above)
     "recover", "stabilize", "stabilise", "control", "controls", "autoland",
+    // the full-length line-up ("backtrack runway 09")
+    "backtrack",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,
@@ -5108,24 +5111,31 @@ fn looks_like_command(text: &str) -> bool {
     {
         return true;
     }
-    text.split(|c: char| !c.is_ascii_alphabetic())
-        .filter(|w| !w.is_empty())
-        .any(|w| {
-            let w = w.to_ascii_lowercase();
-            if matches_keyword(&w) {
-                return true;
-            }
-            // Whisper sometimes glues a spoken two-word compound into one token
-            // ("flood lights" → "floodlights", "landing light" → "landinglight"),
-            // which then matches no standalone keyword. Re-check the stem after
-            // dropping a trailing light/lights so the compound still reaches the
-            // LLM. The stem goes through the same fuzzy check, so the mishear
-            // "bloodlights" also passes (blood ~ flood, one edit).
-            if let Some(stem) = w.strip_suffix("lights").or_else(|| w.strip_suffix("light")) {
-                return !stem.is_empty() && matches_keyword(stem);
-            }
-            false
-        })
+    let token_pass = |s: &str| {
+        s.split(|c: char| !c.is_ascii_alphabetic())
+            .filter(|w| !w.is_empty())
+            .any(|w| {
+                let w = w.to_ascii_lowercase();
+                if matches_keyword(&w) {
+                    return true;
+                }
+                // Whisper sometimes glues a spoken two-word compound into one token
+                // ("flood lights" → "floodlights", "landing light" → "landinglight"),
+                // which then matches no standalone keyword. Re-check the stem after
+                // dropping a trailing light/lights so the compound still reaches the
+                // LLM. The stem goes through the same fuzzy check, so the mishear
+                // "bloodlights" also passes (blood ~ flood, one edit).
+                if let Some(stem) = w.strip_suffix("lights").or_else(|| w.strip_suffix("light")) {
+                    return !stem.is_empty() && matches_keyword(stem);
+                }
+                false
+            })
+    };
+    // Raw text first, then the normalized form: the alias table is what
+    // folds "q and h 1014" into "qnh 1014" — checked only raw, four QNH
+    // settings in a row were swallowed without even a miss chime (live
+    // 2026-07-20, the same failure mode as the split compounds above).
+    token_pass(text) || token_pass(&grammar::normalize(text))
 }
 
 /// True if an utterance looks like a *continuation* of the previous command, so
@@ -5843,6 +5853,17 @@ mod tests {
         // Whisper drops/swaps a letter; these should still reach the LLM.
         for c in ["trust 80 percent", "descent 500", "altitude 3000"] {
             assert!(looks_like_command(c), "{c:?} should pass via near-miss");
+        }
+    }
+
+    #[test]
+    fn alias_folded_commands_pass_the_gate() {
+        // The normalizer's alias table is part of the gate now: "q and h
+        // 1014" (four QNH settings swallowed live, 2026-07-20) only becomes
+        // the "qnh" keyword after folding, and the brake homophone rides
+        // its own keywords.
+        for c in ["Q and H 1014.", "Change Q and H to 1014.", "Release breaks.", "Q&H 1013"] {
+            assert!(looks_like_command(c), "{c:?} should pass the domain gate");
         }
     }
 
