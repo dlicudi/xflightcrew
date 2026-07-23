@@ -345,6 +345,12 @@ struct Inner {
     /// you don't talk over your own call. The queue holds and resumes on
     /// release (2026-07-10: the party line yakked through PTT).
     hold: std::sync::atomic::AtomicBool,
+    /// The panel transcript sink, so EVERY spoken line — including the ones the
+    /// background flight loops (circuit, full auto, autoland) speak through
+    /// `alert` — shows on the panel, not just the ones the main loop routes
+    /// through the reporter (the auto-flight narration was audible but absent
+    /// from the transcript, 2026-07-23). `None` until the main loop wires it.
+    status: Mutex<Option<crate::plugin_status::StatusSink>>,
     /// Which station voice is on the air right now (published just before
     /// playback starts, cleared when it ends): used to CUT it (no resume) the
     /// instant the pilot tunes off its frequency or keys any PTT.
@@ -448,6 +454,7 @@ impl Voice {
             spoken: Mutex::new(Vec::new()),
             pilot_swap: Mutex::new(None),
             station_range_nm: std::sync::atomic::AtomicU32::new(f32::NAN.to_bits()),
+            status: Mutex::new(None),
         });
         // Independent channel volumes (a real audio panel's COM vs intercom
         // knobs). Applied in tts::play per thread channel.
@@ -817,7 +824,22 @@ impl Voice {
         if !crate::mode::copilot_enabled() {
             return;
         }
-        self.enqueue(priority, text.into(), None, false);
+        let text = text.into();
+        self.mirror_to_panel(&text);
+        self.enqueue(priority, text, None, false);
+    }
+
+    /// Wire the panel transcript sink, so background-loop speech shows there.
+    pub fn set_status(&self, sink: crate::plugin_status::StatusSink) {
+        *self.inner.status.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    }
+
+    /// Mirror a spoken line onto the panel's action/transcript field. Cheap and
+    /// non-blocking; a no-op when the sink isn't wired.
+    fn mirror_to_panel(&self, text: &str) {
+        if let Some(s) = self.inner.status.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            s.action(text);
+        }
     }
 
     /// Queue a PERISHABLE utterance: speak it by `stale_by` or drop it at
@@ -946,8 +968,9 @@ impl Voice {
             cv: Condvar::new(),
         });
         let text = crate::phrase::scrub_dashes(&text.into());
-        // To the FILE log, not just the TUI: the 2026-07-07 hang was blind
-        // because tower speech only reached the dashboard.
+        // NOTE: no mirror_to_panel here — station lines routed through the main
+        // loop already reporter.log to the panel; mirroring here double-wrote
+        // the tower's reply to the transcript (2026-07-23).
         self.enqueue_station(priority, text, Some(latch.clone()), speaker);
         let mut spoken = latch.spoken.lock().unwrap();
         while !*spoken {
@@ -1606,6 +1629,7 @@ mod tests {
             radio_queue: Mutex::new(Queue { heap: BinaryHeap::new(), seq: 0, shutdown: false }),
             radio_cv: Condvar::new(),
             speaking: Mutex::new((false, false)),
+            status: Mutex::new(None),
             station_seed: std::sync::atomic::AtomicUsize::new(0),
             station_local: Mutex::new(Vec::new()),
             hold: std::sync::atomic::AtomicBool::new(false),

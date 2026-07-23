@@ -194,6 +194,17 @@ pub fn try_parse(
     profile: &AircraftProfile,
 ) -> Option<Vec<ToolCall>> {
     let t = normalize(transcript);
+    // Full auto (the whole flight from cold) and the circuit are each ONE
+    // intent even though their phrasings carry "and" ("start up and fly", "take
+    // off and land") — checked on the raw text BEFORE the compound gate would
+    // split them. Full auto first: "start up and fly a circuit" contains
+    // "circuit" and must not fall to the circuit rule.
+    if let Some(c) = full_auto_call(&t) {
+        return Some(vec![c]);
+    }
+    if let Some(c) = circuit_call(&t) {
+        return Some(vec![c]);
+    }
     if t.is_empty() || is_compound(&t) {
         return None; // empty or a real multi-action compound -> LLM
     }
@@ -347,6 +358,63 @@ fn altimeter_inhg(t: &str) -> Option<f64> {
 /// Whole-word membership (so "on" doesn't match inside "engine").
 fn has(t: &str, word: &str) -> bool {
     t.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == word)
+}
+
+/// The `full_auto` intent — the entire flight from cold (power up, engine,
+/// taxi, line up, circuit). Request-shaped only; recognised before the compound
+/// gate because "start up and fly" carries "and". `None` when it isn't one.
+fn full_auto_call(t: &str) -> Option<ToolCall> {
+    let is_full_auto = t.contains("full auto")
+        || t.contains("fully automated")
+        || t.contains("full automatic")
+        || t == "do everything"
+        || t.contains("do everything")
+        || t.contains("do it all")
+        || t.contains("start up and fly")
+        || t.contains("start up and do")
+        || t.contains("startup and fly")
+        || t.contains("take us up from cold")
+        || t.contains("cold start and fly")
+        || t.contains("fly from cold");
+    if !is_full_auto {
+        return None;
+    }
+    if has(t, "cancel") || has(t, "stop") || has(t, "abort") {
+        return Some(call("full_auto", json!({ "off": true })));
+    }
+    let right = has(t, "right") && (t.contains("circuit") || t.contains("pattern") || t.contains("traffic"));
+    Some(call("full_auto", json!({ "right": right })))
+}
+
+/// The `circuit` intent — the whole traffic pattern in one command. Recognised
+/// on the normalized text before the compound gate, because its natural
+/// phrasings carry "and" ("take off and land"). Request-shaped only, so no ATC
+/// readback ("cleared for takeoff runway two seven") can reach it. `None` when
+/// the utterance isn't a circuit ask.
+fn circuit_call(t: &str) -> Option<ToolCall> {
+    let circuit_word = t.contains("circuit") || t.contains("the pattern")
+        || t.contains("traffic pattern") || t.contains("circuits and bumps");
+    let toff = t.contains("take off") || t.contains("takeoff");
+    // "take off AND ..." — the compound shapes that mean a full circuit, not a
+    // bare departure. Bare takeoffs (no landing/return words) are NOT caught
+    // here; they fall through to the auto_takeoff rule.
+    let takeoff_and_land = toff
+        && (has(t, "land") || t.contains("come back") || t.contains("back around")
+            || t.contains("bring us back"));
+    if !circuit_word && !takeoff_and_land {
+        return None;
+    }
+    // "do a circuit" means the WHOLE flight to the pilot — from wherever the
+    // aircraft is. So it routes to the full-auto orchestrator, which starts the
+    // engine / taxis / lines up as needed and skips straight to the airborne
+    // circuit when already on the runway. (The `circuit` tool still exists;
+    // full-auto drives it internally for the airborne part.)
+    if has(t, "abort") || has(t, "cancel") || has(t, "stop") || (has(t, "off") && circuit_word) {
+        return Some(call("full_auto", json!({ "off": true })));
+    }
+    let right =
+        has(t, "right") && (t.contains("circuit") || t.contains("pattern") || t.contains("traffic"));
+    Some(call("full_auto", json!({ "right": right })))
 }
 
 /// on/off (+ synonyms) as a whole word; `None` if neither is present.
@@ -1801,6 +1869,25 @@ mod tests {
         assert_eq!(one("cancel the takeoff").unwrap().1, json!({"off":true}));
         assert_eq!(one("abort").unwrap().1, json!({"off":true}));
         assert_eq!(one("abort abort abort").unwrap().1, json!({"off":true}));
+        // Auto circuit — the whole pattern in one word. Request shapes route;
+        // a compound "take off and ..." goes here, not to a bare takeoff.
+        assert_eq!(one("do a circuit").unwrap(), ("full_auto".into(), json!({"right": false})));
+        assert_eq!(one("fly a circuit").unwrap().0, "full_auto");
+        assert_eq!(one("fly the pattern").unwrap().0, "full_auto");
+        assert_eq!(one("take off and land").unwrap().0, "full_auto");
+        assert_eq!(one("take off and come back around").unwrap().0, "full_auto");
+        assert_eq!(one("circuits and bumps").unwrap().0, "full_auto");
+        assert_eq!(one("make a right circuit").unwrap(), ("full_auto".into(), json!({"right": true})));
+        assert_eq!(one("cancel the circuit").unwrap(), ("full_auto".into(), json!({"off": true})));
+        assert_eq!(one("stop the circuit").unwrap().0, "full_auto");
+        // A plain takeoff must NOT be swallowed by the circuit rule.
+        assert_eq!(one("take off for me").unwrap().0, "auto_takeoff");
+        // Full auto — the whole flight from cold. "start up and fly a circuit"
+        // must route here, not to the circuit rule.
+        assert_eq!(one("full auto").unwrap(), ("full_auto".into(), json!({"right": false})));
+        assert_eq!(one("do everything").unwrap().0, "full_auto");
+        assert_eq!(one("start up and fly a circuit").unwrap().0, "full_auto");
+        assert_eq!(one("cancel full auto").unwrap().1, json!({"off": true}));
         // Line up — the maneuver between the hold and the takeoff.
         assert_eq!(one("line us up").unwrap(), ("line_up".into(), json!({})));
         assert_eq!(one("can you line me up to the runway").unwrap().0, "line_up");

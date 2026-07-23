@@ -261,9 +261,12 @@ impl Config {
             piper_binary: env_or("PIPER_BIN", "piper"),
             // Explicit env beats the panel-saved pick beats the default (see
             // crate::prefs — the Settings tab's voice picker persists there).
-            piper_voice: std::env::var("PIPER_VOICE")
-                .ok()
-                .or_else(crate::prefs::pilot_voice)
+            // The panel voice picker is the user's explicit, persisted choice,
+            // so it WINS over the PIPER_VOICE env default — otherwise a
+            // PIPER_VOICE line in .env silently reverted every pick on the next
+            // boot ("always end up back with ryan", 2026-07-23).
+            piper_voice: crate::prefs::pilot_voice()
+                .or_else(|| std::env::var("PIPER_VOICE").ok())
                 .unwrap_or_else(|| "models/en_US-amy-medium.onnx".into()),
             cabin_piper_voice: env_or("XCOPILOT_CABIN_VOICE", "models/en_US-hfc_female-medium.onnx"),
             cabin_crew: env_or("XCOPILOT_CABIN_CREW", ""),

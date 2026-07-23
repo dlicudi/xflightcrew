@@ -189,8 +189,9 @@ const AIL_FULL_BANK_DEG: f64 = 15.0;
 const AIL_LEAD_S: f64 = 0.3;
 const AIL_MAX: f64 = 0.5;
 const AIL_SLEW_PER_S: f64 = 2.0;
-/// Hand the aircraft back this high above the field.
-const HANDOFF_AGL_FT: f64 = 1000.0;
+/// Default hand-back height above the field, feet (a normal departure); a
+/// circuit overrides it lower via `Params::handoff_agl_ft`.
+pub const DEFAULT_HANDOFF_AGL_FT: f64 = 1000.0;
 /// Raise the gear (when there is one) above this, climbing.
 const GEAR_UP_AGL_FT: f64 = 200.0;
 
@@ -222,6 +223,10 @@ pub struct Params {
     pub cleared_runway: Option<String>,
     /// Runway needed for the roll, meters (POH distance with margin).
     pub needed_m: f64,
+    /// Height AGL to hand back at, feet. 1000 for a normal departure; a circuit
+    /// hands off LOWER (~500) so it turns crosswind while still climbing,
+    /// instead of running four kilometres straight ahead to reach 1000 first.
+    pub handoff_agl_ft: f64,
 }
 
 /// Fit the aircraft's position and heading to a runway end: which strip are
@@ -468,6 +473,7 @@ pub fn start(base_url: String, voice: Option<Voice>, p: Params) {
 }
 
 fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
+    tracing::info!(target: "x_copilot::autotakeoff", spoke = %line, "copilot");
     if let Some(v) = voice {
         v.alert(priority, line);
     }
@@ -510,7 +516,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let Some((rwy, remaining_m)) = runway_fit(&cands, lat, lon, psi, p.needed_m) else {
         // At the hold with a line-up in reach, point at the maneuver that
         // exists for exactly this — otherwise the honest refusal.
-        let line = if crate::autotaxi::pick_line_up(&cands, lat, lon, p.cleared_runway.as_deref())
+        let line = if crate::autotaxi::pick_line_up(&cands, lat, lon, p.cleared_runway.as_deref(), None)
             .is_some()
         {
             "We're not on the runway yet. Say line us up, then give me the takeoff."
@@ -858,7 +864,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             "autotakeoff",
             serde_json::json!({"event": "climb", "ias": ias, "agl": agl_ft, "cmd_vs": vs}),
         );
-        if agl_ft >= HANDOFF_AGL_FT {
+        if agl_ft >= p.handoff_agl_ft.max(AP_ENGAGE_AGL_FT + 50.0) {
             alert(
                 &voice,
                 Priority::Caution,
@@ -1164,5 +1170,214 @@ mod tests {
         assert!(!must_reject(200.0, 52.0, 55.0));
         // Plenty of runway, any speed: no reject.
         assert!(!must_reject(900.0, 20.0, 55.0));
+    }
+
+    // --- End-to-end sortie ---------------------------------------------------
+    //
+    // The law tests above each pin one function. This one CLOSES THE LOOP: a
+    // coarse airframe model, driven tick-by-tick by the SAME control laws the
+    // `fly` loop calls, with reads and control writes routed through a
+    // `FakeXPlane` under the real dataref names. It is the automated stand-in
+    // for a hand-flown takeoff — nothing else proves the laws COMPOSE into a
+    // takeoff that tracks the centreline, rotates, and reaches the AP handoff.
+    //
+    // What it does NOT cover (by construction): the `fly` orchestration itself
+    // (its gates, yields, and reject paths have their own unit tests above),
+    // the lat/lon -> cross-track geodesy (autoland's tests own that — the model
+    // holds cross-track directly), and real X-Plane physics (the model is a
+    // deliberately crude Newtonian sketch). Its ONE job is to fail loudly if a
+    // change to the laws stops the aircraft holding the runway — e.g. flipping
+    // the `power_lead` sign, or breaking the trim integrator, lets the modelled
+    // P-factor walk it off the strip and the cross-track assertion fires.
+
+    /// A deliberately crude single-engine airframe, in a runway-local frame:
+    /// heading and cross-track are relative to a course of 0 degrees, right
+    /// positive. Not X-Plane — just enough coupling (thrust, a speed-tapered
+    /// yaw authority, a left-yawing P-factor moment under power, a first-order
+    /// pitch response, and lift past Vr) for the real laws to fly against.
+    struct Airframe {
+        gs_ms: f64,   // groundspeed
+        along_m: f64, // distance rolled from the threshold
+        xtk_m: f64,   // cross-track, right positive
+        psi_deg: f64, // heading, right of course positive
+        theta_deg: f64,
+        agl_ft: f64,
+    }
+
+    impl Airframe {
+        fn lined_up_nose_right() -> Self {
+            // A realistic line-up: on the centreline but the nose 6 deg right,
+            // the kind of small misalignment the roll law walks out.
+            Self { gs_ms: 0.0, along_m: 0.0, xtk_m: 0.0, psi_deg: 6.0, theta_deg: 0.0, agl_ft: 0.0 }
+        }
+        fn ias_kts(&self) -> f64 {
+            self.gs_ms * MS_TO_KTS // calm air: IAS == groundspeed
+        }
+        fn on_ground(&self) -> bool {
+            self.agl_ft < 1.0
+        }
+        /// Advance one tick from the commanded controls (all as written to the
+        /// plugin channels): throttle 0..1, steer -1..1 (right positive), pitch
+        /// -1..1 (nose-up positive).
+        fn step(&mut self, dt: f64, thr: f64, steer: f64, pitch: f64) {
+            let gs_kts = self.gs_ms * MS_TO_KTS;
+            // Thrust minus a little drag; never below a standstill.
+            self.gs_ms = (self.gs_ms + (3.0 * thr - 0.01 * self.gs_ms) * dt).max(0.0);
+            // Yaw: steering authority grows with airflow; P-factor yaws left
+            // under power and fades as the airflow straightens. The rudder
+            // feed-forward and trim integrator in the roll law exist to cancel
+            // exactly this — get their sign wrong and the model diverges.
+            let steer_yaw = steer * 30.0;
+            let pfac = -7.0 * thr * (1.0 - 0.5 * (gs_kts / 60.0).clamp(0.0, 1.0));
+            self.psi_deg += (steer_yaw + pfac) * dt;
+            let psi_rad = self.psi_deg.to_radians();
+            self.xtk_m += self.gs_ms * psi_rad.sin() * dt;
+            self.along_m += self.gs_ms * psi_rad.cos() * dt;
+            // Pitch: first-order lag toward the attitude the elevator commands.
+            let cmd_theta = pitch * 15.0;
+            self.theta_deg += (cmd_theta - self.theta_deg) * 2.0 * dt;
+            // Lift builds once the nose is up and we're at flying speed — the
+            // aircraft leaves the ground on its own, which is what lets the
+            // liftoff latch (AGL > 8 ft) ever fire.
+            let vs_fpm = if self.theta_deg > 2.0 && self.ias_kts() >= 52.0 {
+                (self.theta_deg - 2.0) * 120.0 * (self.ias_kts() / 55.0).min(1.5)
+            } else {
+                0.0
+            };
+            self.agl_ft = (self.agl_ft + vs_fpm / 60.0 * dt).max(0.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn sortie_flies_the_roll_rotates_and_reaches_the_ap_handoff() {
+        use crate::xplane::FakeXPlane;
+        use sim::xplane::XPlane;
+
+        let sim = FakeXPlane::new();
+        let course_deg = 0.0;
+        let length_m = 2000.0;
+        let vr_kts = 55.0;
+        let dt = 0.15; // fly's nominal tick
+
+        let mut af = Airframe::lined_up_nose_right();
+        let mut steer_law = RollSteer::default();
+        let mut pitch_law = RotatePitch::default();
+
+        // Loop state mirrored from `fly`.
+        let mut rotated = false;
+        let mut airborne = false;
+        let mut last_thr_cmd = 0.0_f64;
+        let mut last_err = 0.0_f64;
+
+        // What we assert on.
+        let mut max_abs_xtk = 0.0_f64;
+        let mut max_abs_xtk_after_capture = 0.0_f64;
+        let mut rotate_snapshot: Option<(f64, f64, f64)> = None; // (ias, remaining, err)
+        let mut hit_full_throttle = false;
+        let mut ticks = 0;
+
+        loop {
+            ticks += 1;
+            assert!(ticks < 1200, "takeoff never converged (ran {ticks} ticks)");
+            let elapsed = ticks as f64 * dt;
+
+            // Publish the world exactly where `fly` reads it, under the real
+            // dataref names, then read the flight state back through the trait.
+            sim.set_read(GS_MS, af.gs_ms);
+            sim.set_read(IAS, af.ias_kts());
+            sim.set_read(AGL_M, af.agl_ft / M_TO_FT);
+            sim.set_read(PSI_TRUE, af.psi_deg.rem_euclid(360.0));
+            sim.set_read(THETA, af.theta_deg);
+            sim.set_read(ON_GROUND, if af.on_ground() { 1.0 } else { 0.0 });
+            let (gs_ms, ias, agl_m, psi) = tokio::join!(
+                sim.get_float(GS_MS),
+                sim.get_float(IAS),
+                sim.get_float(AGL_M),
+                sim.get_float(PSI_TRUE),
+            );
+            let (gs_ms, ias, agl_ft, psi) =
+                (gs_ms.unwrap(), ias.unwrap(), agl_m.unwrap() * M_TO_FT, psi.unwrap());
+            let gs_kts = gs_ms * MS_TO_KTS;
+
+            // Throttle (mirrors `fly`: computed from the PREVIOUS tick's error).
+            let thr_want = if airborne { 1.0 } else { throttle_cmd(elapsed, last_err, gs_kts) };
+            let thr_cmd = throttle_slew(last_thr_cmd, thr_want, dt);
+            sim.set_float(THROTTLE_ALL, thr_cmd).await.unwrap();
+            last_thr_cmd = thr_cmd;
+            hit_full_throttle |= thr_cmd >= 0.99;
+
+            let remaining = length_m - af.along_m;
+            if !airborne {
+                assert!(remaining > 0.0, "rolled off the end without flying");
+                assert!(!must_reject(remaining, ias, vr_kts), "the loop would have rejected here");
+            }
+
+            // Steer the centreline (cross-track held by the model, not geodesy).
+            let target = roll_target_heading(course_deg, af.xtk_m);
+            let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+            last_err = err;
+            let steer = steer_law.step(err, dt, gs_kts, thr_cmd);
+            assert!(steer.abs() <= MAX_ROLL_STEER + 1e-9, "steer out of bounds: {steer}");
+            sim.set_float(TAXI_STEER, steer).await.unwrap();
+
+            // Rotate, then hold the attitude with the elevator channel.
+            if !rotated && ias >= vr_kts && rotate_ok(err, remaining) {
+                rotated = true;
+                rotate_snapshot = Some((ias, remaining, err));
+            }
+            let mut pitch = 0.0;
+            if rotated {
+                pitch = pitch_law.step(af.theta_deg, dt);
+                sim.set_float(TAKEOFF_PITCH, pitch).await.unwrap();
+            }
+
+            // Liftoff latch, same gate as `fly`.
+            if !airborne && !af.on_ground() && ias > vr_kts * 0.8 && agl_ft > 8.0 {
+                airborne = true;
+            }
+
+            max_abs_xtk = max_abs_xtk.max(af.xtk_m.abs());
+            if af.along_m > 200.0 {
+                max_abs_xtk_after_capture = max_abs_xtk_after_capture.max(af.xtk_m.abs());
+            }
+
+            // The AP would take the established climb here; the sortie is done.
+            if agl_ft >= AP_ENGAGE_AGL_FT {
+                break;
+            }
+
+            // Advance the world from what we actually wrote to the channels.
+            let steer_a = sim.last_write(TAXI_STEER).unwrap();
+            let thr_a = sim.last_write(THROTTLE_ALL).unwrap();
+            let pitch_a = if rotated { sim.last_write(TAKEOFF_PITCH).unwrap() } else { 0.0 };
+            let _ = pitch;
+            af.step(dt, thr_a, steer_a, pitch_a);
+        }
+
+        // It rotated, at or past Vr, with runway to spare and a straight nose.
+        let (r_ias, r_rem, r_err) = rotate_snapshot.expect("never rotated");
+        assert!(r_ias >= vr_kts, "rotated below Vr: {r_ias}");
+        assert!(r_rem > 300.0, "rotated with the runway almost gone: {r_rem} m");
+        assert!(r_err.abs() < 15.0, "rotated with the nose {r_err} deg off");
+
+        // It held the centreline the whole roll and tracked runway heading to
+        // the handoff — no weave, no departure off the strip.
+        assert!(max_abs_xtk < 15.0, "wandered {max_abs_xtk:.1} m off the centreline");
+        assert!(
+            max_abs_xtk_after_capture < 6.0,
+            "did not settle on the centreline: {max_abs_xtk_after_capture:.1} m after capture"
+        );
+        assert!(
+            (af.psi_deg - course_deg).abs() < 8.0,
+            "handed off {:.1} deg off runway heading",
+            af.psi_deg - course_deg
+        );
+        assert!(hit_full_throttle, "never reached full power on the roll");
+
+        // The trim integrator learned a right-rudder standing offset — the
+        // proof it recognised and cancelled the modelled P-factor rather than
+        // just chasing it. Flip `power_lead`'s sign and this (and the
+        // cross-track bound) go red.
+        assert!(steer_law.trim() > 0.0, "trim never learned the P-factor: {}", steer_law.trim());
     }
 }

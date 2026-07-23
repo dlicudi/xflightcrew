@@ -13,6 +13,8 @@
 pub mod approach;
 pub mod autoland;
 pub mod autopilot;
+pub mod circuit;
+pub mod full_auto;
 pub mod controls;
 pub mod cycle;
 pub mod electrical;
@@ -231,18 +233,52 @@ impl Registry {
                 .as_ref()
                 .and_then(|r| r.best_climb_fpm)
                 .map_or(500.0, |c| (c * 0.8).clamp(400.0, 1500.0));
+            let takeoff_roll_m = profile
+                .reference
+                .as_ref()
+                .and_then(|r| r.takeoff_distance_ft)
+                .map(|f| f * 0.3048);
             tools.push(Box::new(takeoff::AutoTakeoff {
-                cfg: ap,
+                cfg: ap.clone(),
                 vr_kts: vr,
                 vy_kts: vy,
                 climb_fpm: climb,
                 retract_gear: profile.retractable_gear,
-                takeoff_roll_m: profile
-                    .reference
-                    .as_ref()
-                    .and_then(|r| r.takeoff_distance_ft)
-                    .map(|f| f * 0.3048),
+                takeoff_roll_m,
             }));
+            // Auto circuit — one command that flies takeoff + pattern + landing
+            // by orchestrating the takeoff loop, the AP, and autoland. Shares
+            // the takeoff speeds and the autoland approach speed above.
+            tools.push(Box::new(circuit::Circuit {
+                cfg: ap.clone(),
+                vr_kts: vr,
+                vy_kts: vy,
+                climb_fpm: climb,
+                retract_gear: profile.retractable_gear,
+                takeoff_roll_m,
+                approach_ias,
+            }));
+            // Full auto — the whole flight from cold: power up, start engine,
+            // request taxi, drive to the runway, line up, and fly the circuit.
+            // Only where the airframe can do all of it (an autopilot airframe
+            // with an engine to start).
+            if profile.engine || profile.throttle {
+                tools.push(Box::new(full_auto::FullAuto {
+                    fuel_selector: profile.fuel_selector.clone(),
+                    alternator_on_cmds: alternator_on_cmds(&profile.electrical),
+                    park_brake_valve_set: profile.park_brake_valve_set,
+                    takeoff_roll_m,
+                    cfg: ap,
+                    vr_kts: vr,
+                    vy_kts: vy,
+                    climb_fpm: climb,
+                    retract_gear: profile.retractable_gear,
+                    approach_ias,
+                    // Turbines need the APU/electrical bring-up first; a piston
+                    // 172 does not (its start_engine powers its own bus).
+                    power_up_first: profile.turbine_start || profile.throttle,
+                }));
+            }
         }
 
         // Thrust levers: any piston engine, or a turbine that declares `throttle`.

@@ -69,6 +69,12 @@ fn lock<T>(m: &'static Mutex<T>) -> MutexGuard<'static, T> {
 // ---- crew-side accessors ----
 
 /// The tower FSM state of the standing clearance, if any.
+/// The active tower's frequency (kHz), so the crew can tune COM1 to it before
+/// calling — the full-auto orchestrator does this before requesting taxi.
+pub fn home_tower_khz() -> Option<i64> {
+    crate::station::active_tower_khz()
+}
+
 pub fn clearance_state() -> Option<tower::State> {
     lock(&CLEARANCE).as_ref().map(|c| c.state)
 }

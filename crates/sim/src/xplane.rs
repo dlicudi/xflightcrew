@@ -515,12 +515,19 @@ impl FakeXPlane {
     /// Preset the values reads will return.
     pub fn with_reads(pairs: &[(&str, f64)]) -> Self {
         let me = Self::new();
-        let mut r = me.reads.lock().unwrap();
         for (k, v) in pairs {
-            r.insert((*k).to_string(), *v);
+            me.set_read(k, *v);
         }
-        drop(r);
         me
+    }
+
+    /// Update (or insert) the value a read will return. This is the scripted-
+    /// timeline primitive: a test that advances a simulated world calls this
+    /// each tick to move the aircraft, so the code under test reads a changing
+    /// dataref exactly as it would against a live sim. `with_reads` sets a
+    /// static table; `set_read` makes it a timeline.
+    pub fn set_read(&self, name: &str, value: f64) {
+        self.reads.lock().unwrap().insert(name.to_string(), value);
     }
 
     /// The most recent value written to `name`, if any.

@@ -13,6 +13,8 @@ mod audio;
 mod autoland;
 mod autotakeoff;
 mod autotaxi;
+mod circuit;
+mod full_auto;
 mod cabin;
 mod debrief;
 mod radiofx;
@@ -353,6 +355,12 @@ async fn main() -> Result<()> {
     let status_sink = config
         .plugin_status
         .then(|| plugin_status::StatusSink::start(&config.xplane_base_url));
+    // Mirror EVERY spoken line onto the panel transcript, so the background
+    // flight loops' narration + ATC calls show there, not just the main loop's
+    // (the auto-flight was audible but had no transcript, 2026-07-23).
+    if let Some(sink) = &status_sink {
+        voice.set_status(sink.clone());
+    }
 
     // Radio row + ATC tab for the in-sim panel, refreshed ~1/s through the
     // status sink. Position-driven from the station's published side state,
@@ -1359,6 +1367,38 @@ async fn run_session(
             }
         }
 
+        // Radio calls the copilot makes during an auto circuit (position
+        // reports; the tower answers and, on the final call, clears us to
+        // land). Crew -> world: the copilot transmits exactly as if the pilot
+        // keyed the radio. Drained every tick (idle included) so a report made
+        // while the cockpit is silent still goes out. In copilot-only mode or
+        // with no station, the calls are discarded — external ATC owns the
+        // radio then, the same rule a keyed transmission follows below.
+        {
+            let calls = circuit::take_crew_radio();
+            if !calls.is_empty() && mode::atc_enabled() && voice.radio_powered() {
+                if let Some(st) = atc_station.as_mut() {
+                    for call in calls {
+                        // The copilot transmits (its own voice), then the tower.
+                        // Both sides logged so the full ATC transcript shows in
+                        // the log, not just the panel.
+                        tracing::info!(target: "x_copilot::radio", copilot = %call, "tx");
+                        say(&voice, &reporter, ui::LogKind::Readback, &format!("{call}."));
+                        if let Some((reply, who)) = st
+                            .handle_transmission(&call.to_ascii_lowercase(), xplane.view())
+                            .await
+                        {
+                            if !reply.is_empty() {
+                                tracing::info!(target: "x_copilot::radio", station = %who.tag(), reply = %reply, "rx");
+                                reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
+                                voice.say_station(Priority::Readback, who, &reply);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Station work consumed — an idle tick carries no utterance to route.
         let (mut command, from_text) = match input {
             None => continue,
@@ -1840,7 +1880,10 @@ async fn run_session(
                 let reverse_in = tools::reverse::ACTIVE.load(Relaxed);
                 let taxi_driving = autotaxi::ACTIVE.load(Relaxed);
                 let takeoff_flying = autotakeoff::ACTIVE.load(Relaxed);
-                if (speed_held || mix_held || reverse_in || taxi_driving || takeoff_flying)
+                let circuit_flying = circuit::ACTIVE.load(Relaxed);
+                let full_auto_running = full_auto::ACTIVE.load(Relaxed);
+                if (speed_held || mix_held || reverse_in || taxi_driving || takeoff_flying
+                    || circuit_flying || full_auto_running)
                     && release_intent(&tl)
                 {
                     let names_mix = tl.contains("mixture") || tl.contains("mix");
@@ -1860,15 +1903,30 @@ async fn run_session(
                     let generic = !names_mix && !names_speed && !names_reverse
                         && !names_steer && !tl.contains("brake");
                     let mut released: Vec<&str> = Vec::new();
+                    // Full auto owns the entire chain (engine, taxi, line-up,
+                    // circuit); cancelling it stands them all down and wins the
+                    // release, so the per-loop branches below are skipped.
+                    if full_auto_running && (names_speed || names_steer || generic) {
+                        full_auto::abort();
+                        released.push("full auto off, your aircraft");
+                    }
+                    // A circuit in progress owns whichever sub-loop is flying
+                    // (takeoff or autoland); aborting it stands them ALL down,
+                    // so it wins the generic release and the per-loop branches
+                    // below are skipped (they'd double up on its sub-loops).
+                    if !full_auto_running && circuit_flying && (names_speed || names_steer || generic) {
+                        circuit::abort();
+                        released.push("circuit off, your aircraft");
+                    }
                     // A takeoff in progress: "my controls" is a HANDOVER, not
                     // a reject — the loop stands down silently, steering
                     // expires, and the power stays set for the pilot now
                     // flying it ("abort takeoff" is the arresting path).
-                    if takeoff_flying && (names_speed || names_steer || generic) {
+                    if !circuit_flying && !full_auto_running && takeoff_flying && (names_speed || names_steer || generic) {
                         autotakeoff::ACTIVE.store(false, Relaxed);
                         released.push("your takeoff, power is set");
                     }
-                    if taxi_driving && (names_speed || names_steer || generic) {
+                    if !circuit_flying && !full_auto_running && taxi_driving && (names_speed || names_steer || generic) {
                         autotaxi::ACTIVE.store(false, Relaxed);
                         if names_steer && !names_speed && !generic {
                             released.push("steering's yours, I still have the speed");
@@ -4839,6 +4897,12 @@ fn active_managers() -> Vec<String> {
     if let Some(a) = approach_guide::armed() {
         v.push(format!("talk-down {} {}", a.icao, a.runway_id));
     }
+    if let Some(s) = full_auto::status() {
+        v.push(s);
+    }
+    if let Some(s) = circuit::status() {
+        v.push(s);
+    }
     if let Some(s) = autotakeoff::status() {
         v.push(s);
     }
@@ -5069,6 +5133,14 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "recover", "stabilize", "stabilise", "control", "controls", "autoland",
     // the full-length line-up ("backtrack runway 09")
     "backtrack",
+    // auto circuit — the whole traffic pattern ("do a circuit", "fly the
+    // pattern", "circuits and bumps"). Without these the domain gate dropped
+    // "do a circuit" as not-a-command, before the grammar ever saw it
+    // (2026-07-23). "takeoff"/"land" already cover "take off and land".
+    "circuit", "circuits", "pattern", "traffic",
+    // full auto — the whole flight from cold ("full auto", "do everything",
+    // "start up and fly", "fly from cold").
+    "auto", "automated", "everything", "cold", "fly",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,
@@ -5092,9 +5164,23 @@ fn looks_like_question(text: &str) -> bool {
         "tell me",
         // Generic auxiliaries: no command starts with these, and they must beat the
         // command grammar ("is our heading 270?" answers, never acts).
-        "is", "are", "am", "do", "does", "did", "have", "has",
+        "is", "are", "am", "have", "has",
     ];
-    OPENERS.iter().any(|o| t == *o || t.starts_with(&format!("{o} ")))
+    if OPENERS.iter().any(|o| t == *o || t.starts_with(&format!("{o} "))) {
+        return true;
+    }
+    // do-support ("do/does/did") is a question ONLY with a subject pronoun after
+    // it — "do we have fuel?", "does it hold?". Followed by anything else it's an
+    // imperative: "do a circuit", "do a touch and go", "do a go-around" are
+    // COMMANDS, and treating the "do" opener as a question swallowed them before
+    // the fast path ever ran (the circuit command missed live, 2026-07-23).
+    const DO_SUBJECTS: &[&str] = &["you", "we", "i", "it", "they", "he", "she", "this", "that"];
+    for aux in ["do", "does", "did"] {
+        if let Some(rest) = t.strip_prefix(&format!("{aux} ")) {
+            return DO_SUBJECTS.iter().any(|s| rest == *s || rest.starts_with(&format!("{s} ")));
+        }
+    }
+    false
 }
 
 /// True if the utterance plausibly is an aircraft command (contains at least one
@@ -5744,8 +5830,41 @@ mod tests {
             // Split compounds — swallowed with no miss chime, live 2026-07-20.
             "Take off for me.", "Let's take off.", "You have to take off.",
             "Line us up.", "line me up", "Get us lined up.",
+            // Auto circuit — the whole pattern. "Do a circuit" was dropped as
+            // not-a-command (circuit vocabulary missing from the gate), live
+            // 2026-07-23.
+            "Do a circuit.", "fly a circuit", "fly the pattern",
+            "circuits and bumps", "make a right circuit", "take off and land",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
+        }
+    }
+
+    #[test]
+    fn circuit_command_survives_every_gate_for_the_172() {
+        // The regression shipped 2026-07-23: "do a circuit" was GREEN in the
+        // grammar unit test yet dead in the running app, because two main-loop
+        // gates UPSTREAM of the parser rejected it first — the domain gate
+        // (circuit not a keyword) and the question guard ("do" was a blanket
+        // opener). Unit-testing the parser in isolation missed both. This runs
+        // the WHOLE gate sequence a spoken command actually passes through, on
+        // the real 172 registry, so the next such gap fails here.
+        let prof = crate::aircraft::load("cessna_172sp").expect("172 profile");
+        let reg = crate::tools::Registry::for_aircraft(&prof);
+        assert!(reg.get("circuit").is_some(), "the 172 registers the circuit tool");
+        assert!(reg.get("full_auto").is_some(), "the 172 registers the full_auto tool");
+        // "do a circuit" is the whole flight to the pilot, so it routes to the
+        // full-auto orchestrator (which flies the airborne circuit itself once
+        // on the runway).
+        for cmd in [
+            "do a circuit", "fly a circuit", "take off and land",
+            "circuits and bumps", "make a right circuit",
+        ] {
+            assert!(looks_like_command(cmd), "{cmd:?} must pass the domain gate");
+            assert!(!super::looks_like_question(cmd), "{cmd:?} must not be withheld as a question");
+            let parsed = super::grammar::try_parse(cmd, &reg, &prof)
+                .unwrap_or_else(|| panic!("{cmd:?} must parse to a command"));
+            assert_eq!(parsed[0].name, "full_auto", "{cmd:?} must route to full_auto");
         }
     }
 
@@ -5996,6 +6115,10 @@ mod tests {
         for c in [
             "flaps ten", "gear up", "set heading 270", "throttle 60 percent",
             "landing light on", "start the engine",
+            // do-support imperatives: "do <article/noun>" is a COMMAND, not a
+            // question. "Do a circuit" missed live because "do" was a blanket
+            // question opener and swallowed the parsed command (2026-07-23).
+            "do a circuit", "do a touch and go", "do a go around", "do another circuit",
         ] {
             assert!(!looks_like_question(c), "{c:?} should not be a question");
         }

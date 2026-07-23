@@ -2034,6 +2034,18 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
 /// published by [`Station::install`] for the monitor's traffic advisories.
 static CONTROLLER_FREQS: Mutex<Vec<(i64, StationSpeaker)>> = Mutex::new(Vec::new());
 
+/// The active tower's frequency (kHz), for the crew side — the full-auto
+/// orchestrator tunes COM1 to it before requesting taxi. `None` when no station
+/// is installed.
+pub(crate) fn active_tower_khz() -> Option<i64> {
+    CONTROLLER_FREQS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(_, s)| matches!(s, StationSpeaker::Tower))
+        .map(|(k, _)| *k)
+}
+
 /// The active station's panel identity — name, field elevation, published
 /// services — for the radio row and the ATC tab. Published by
 /// [`Station::install`], like the rest of the side state.

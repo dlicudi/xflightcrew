@@ -309,9 +309,14 @@ const LINE_UP_ALIGN_M: f64 = 80.0;
 /// The synthetic route of a line-up: from where the aircraft sits, onto the
 /// centreline ahead, and down it far enough to finish aligned. `None` when
 /// the geometry refuses (too far off, or not enough runway past the stop).
-pub fn line_up_path(rwy: &crate::autoland::Runway, lat: f64, lon: f64) -> Option<Vec<(f64, f64)>> {
+pub fn line_up_path(
+    rwy: &crate::autoland::Runway,
+    lat: f64,
+    lon: f64,
+    heading_deg: Option<f64>,
+) -> Option<Vec<(f64, f64)>> {
     use crate::autoland::project_latlon;
-    let (entry_m, stop_m) = line_up_stops_m(rwy, lat, lon)?;
+    let (entry_m, stop_m) = line_up_stops_m(rwy, lat, lon, heading_deg)?;
     if rwy.length_m - stop_m < LINE_UP_MIN_REMAINING_M {
         return None;
     }
@@ -323,22 +328,52 @@ pub fn line_up_path(rwy: &crate::autoland::Runway, lat: f64, lon: f64) -> Option
 /// Where a plain line-up from this position would enter and stop (meters
 /// past the threshold), or `None` when the position isn't a hold-short
 /// geometry at all. Shared by the path builder and the full-length check.
-pub fn line_up_stops_m(rwy: &crate::autoland::Runway, lat: f64, lon: f64) -> Option<(f64, f64)> {
+/// `heading_deg` (the aircraft's current heading) makes leg one roll STRAIGHT
+/// FORWARD along the taxiway lead-on onto the centreline instead of cutting a
+/// diagonal across to it (the "beeline" the pilot saw, 2026-07-23); `None`
+/// keeps the old diagonal (backtrack leg two, tests).
+pub fn line_up_stops_m(
+    rwy: &crate::autoland::Runway,
+    lat: f64,
+    lon: f64,
+    heading_deg: Option<f64>,
+) -> Option<(f64, f64)> {
     use crate::autoland::{along_track_nm, cross_track_nm};
-    let lateral = (cross_track_nm(lat, lon, rwy) * M_PER_NM).abs();
+    let x0 = cross_track_nm(lat, lon, rwy) * M_PER_NM; // signed, right of course +
+    let lateral = x0.abs();
     if lateral > LINE_UP_MAX_LATERAL_M {
         return None;
     }
-    // Distance already past the threshold, floored at the numbers — an
-    // entry from a midfield hold lines up midfield, one abeam the numbers
-    // lines up at the numbers.
-    let past_m = (-along_track_nm(lat, lon, rwy) * M_PER_NM).max(0.0);
-    // Enter ahead of abeam by about the lateral offset (a ~45 degree
-    // swing), never less than one turn's worth — and capped: a far-set
-    // holding point (LXGB's Echo sits ~90 m off the strip) doesn't need a
-    // 90 m lead, it needs a sharper swing the taxi law already handles.
-    let entry_m = past_m + lateral.clamp(30.0, 60.0);
+    // Signed distance past the threshold (positive = down the runway).
+    let a0 = -along_track_nm(lat, lon, rwy) * M_PER_NM;
+    // Roll straight forward along the current heading onto the centreline —
+    // the taxiway lead-on line — when the heading gives a clean crossing.
+    // Otherwise the old fallback: enter ahead of abeam by ~the lateral offset
+    // (a ~45 degree swing), floored at one turn's worth and capped so a far-set
+    // hold (LXGB's Echo ~90 m off the strip) gets a sharper swing, not a 90 m lead.
+    let entry_m = roll_forward_entry_m(rwy.course_deg, a0, x0, heading_deg)
+        .unwrap_or_else(|| a0.max(0.0) + lateral.clamp(30.0, 60.0));
     Some((entry_m, entry_m + LINE_UP_ALIGN_M))
+}
+
+/// Distance past the threshold where the aircraft's heading, rolled straight
+/// forward, crosses the centreline — following the taxiway lead-on onto the
+/// runway. `None` (use the diagonal fallback) when the heading is within ~15
+/// degrees of the runway (no clean crossing), points away from the centreline,
+/// crosses behind the threshold, or would run implausibly far.
+fn roll_forward_entry_m(course_deg: f64, a0: f64, x0: f64, heading_deg: Option<f64>) -> Option<f64> {
+    let psi = heading_deg?;
+    let rel = ((psi - course_deg + 540.0).rem_euclid(360.0) - 180.0).to_radians();
+    let s = rel.sin();
+    if s.abs() < 0.26 {
+        return None; // within ~15 degrees of the runway: no clean forward crossing
+    }
+    let fwd = -x0 / s; // meters forward to reach cross-track zero
+    if fwd <= 0.0 || fwd > 150.0 {
+        return None; // heading away from the centreline, or too shallow / far
+    }
+    let entry = a0 + fwd * rel.cos();
+    (entry >= 0.0).then_some(entry)
 }
 
 /// A backtrack pocket sits this far past the threshold along the runway —
@@ -400,6 +435,7 @@ pub enum LineUpPlan {
 /// of its stop covers `needed_m`, otherwise a backtrack to the threshold
 /// when the geometry offers one (`force_backtrack` skips straight to it —
 /// the pilot asked for the full length in so many words).
+#[allow(clippy::too_many_arguments)]
 pub fn pick_line_up_plan(
     cands: &[crate::autoland::Runway],
     lat: f64,
@@ -407,6 +443,7 @@ pub fn pick_line_up_plan(
     cleared: Option<&str>,
     needed_m: f64,
     force_backtrack: bool,
+    heading_deg: Option<f64>,
 ) -> Option<(crate::autoland::Runway, LineUpPlan)> {
     let mut best: Option<(crate::autoland::Runway, LineUpPlan, f64)> = None;
     for r in cands {
@@ -415,8 +452,8 @@ pub fn pick_line_up_plan(
                 continue;
             }
         }
-        let plain = line_up_path(r, lat, lon);
-        let ahead = line_up_stops_m(r, lat, lon).map(|(_, stop)| r.length_m - stop);
+        let plain = line_up_path(r, lat, lon, heading_deg);
+        let ahead = line_up_stops_m(r, lat, lon, heading_deg).map(|(_, stop)| r.length_m - stop);
         let wants_backtrack =
             force_backtrack || ahead.is_none_or(|a| a < needed_m) || plain.is_none();
         let plan = if wants_backtrack {
@@ -444,6 +481,7 @@ pub fn pick_line_up(
     lat: f64,
     lon: f64,
     cleared: Option<&str>,
+    heading_deg: Option<f64>,
 ) -> Option<(crate::autoland::Runway, Vec<(f64, f64)>)> {
     let mut best: Option<(crate::autoland::Runway, Vec<(f64, f64)>, f64)> = None;
     for r in cands {
@@ -452,7 +490,7 @@ pub fn pick_line_up(
                 continue;
             }
         }
-        let Some(path) = line_up_path(r, lat, lon) else { continue };
+        let Some(path) = line_up_path(r, lat, lon, heading_deg) else { continue };
         if best.as_ref().is_none_or(|(_, _, d)| r.dist_nm < *d) {
             best = Some((r.clone(), path, r.dist_nm));
         }
@@ -550,7 +588,10 @@ pub fn start_backtrack(
             let (Ok(lat), Ok(lon)) = (xp.get_float(LAT).await, xp.get_float(LON).await) else {
                 return;
             };
-            let Some(path) = line_up_path(&rwy, lat, lon) else {
+            // Leg two of a backtrack: the aircraft has turned around and is
+            // already aligned down the strip, so the diagonal fallback (None)
+            // is correct — there is no lead-on to follow here.
+            let Some(path) = line_up_path(&rwy, lat, lon, None) else {
                 alert(
                     &voice,
                     Priority::Caution,
@@ -1025,7 +1066,7 @@ mod tests {
             course_deg: 0.0, length_m: 2000.0, surface: 1, dist_nm: 0.02, elev_ft: 0.0,
         };
         let (hlat, hlon) = crate::autoland::project_latlon(0.0, 0.0, 90.0, 40.0 / 1852.0);
-        let path = line_up_path(&rwy, hlat, hlon).expect("feasible");
+        let path = line_up_path(&rwy, hlat, hlon, None).expect("feasible");
         assert_eq!(path.len(), 3);
         // The entry point is ON the centreline, ahead of abeam.
         let (elat, elon) = path[1];
@@ -1038,11 +1079,39 @@ mod tests {
         assert!(stop_past > entry_past + 40.0, "finishes aligned: {stop_past}");
         // Too far off the strip is not a line-up.
         let (flat, flon) = crate::autoland::project_latlon(0.0, 0.0, 90.0, 300.0 / 1852.0);
-        assert!(line_up_path(&rwy, flat, flon).is_none());
+        assert!(line_up_path(&rwy, flat, flon, None).is_none());
         // Near the far end there is no runway left to line up onto.
         let (nlat, nlon) = crate::autoland::project_latlon(0.0, 0.0, 0.0, 1800.0 / 1852.0);
         let (nlat, nlon) = crate::autoland::project_latlon(nlat, nlon, 90.0, 40.0 / 1852.0);
-        assert!(line_up_path(&rwy, nlat, nlon).is_none());
+        assert!(line_up_path(&rwy, nlat, nlon, None).is_none());
+    }
+
+    #[test]
+    fn line_up_rolls_forward_along_the_heading_not_a_diagonal() {
+        use crate::autoland::{bearing_deg, cross_track_nm, Runway};
+        // Runway 36 (course 0, due north) from (0,0). Hold-short 40 m EAST of
+        // the centreline, abeam the numbers.
+        let rwy = Runway {
+            icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
+            course_deg: 0.0, length_m: 2000.0, surface: 1, dist_nm: 0.02, elev_ft: 0.0,
+        };
+        let (hlat, hlon) = crate::autoland::project_latlon(0.0, 0.0, 90.0, 40.0 / 1852.0);
+        // Nose pointed due WEST — straight at the runway. Leg one should follow
+        // that heading onto the centreline (the taxiway lead-on), NOT cut a
+        // ~45 degree diagonal ahead. Bearing of leg one ≈ 270.
+        let path = line_up_path(&rwy, hlat, hlon, Some(270.0)).expect("feasible");
+        let brg = bearing_deg(path[0].0, path[0].1, path[1].0, path[1].1);
+        let off = ((brg - 270.0 + 540.0).rem_euclid(360.0) - 180.0).abs();
+        assert!(off < 12.0, "leg one follows the nose (270), got {brg}");
+        assert!((cross_track_nm(path[1].0, path[1].1, &rwy) * 1852.0).abs() < 3.0, "entry on centreline");
+
+        // Nose nearly aligned with the runway (5 degrees): no clean forward
+        // crossing, so it falls back to the diagonal swing — clearly off the
+        // near-aligned heading.
+        let path2 = line_up_path(&rwy, hlat, hlon, Some(5.0)).expect("feasible");
+        let brg2 = bearing_deg(path2[0].0, path2[0].1, path2[1].0, path2[1].1);
+        let off2 = ((brg2 - 5.0 + 540.0).rem_euclid(360.0) - 180.0).abs();
+        assert!(off2 > 20.0, "near-aligned nose falls back to the diagonal, got {brg2}");
     }
 
     #[test]
@@ -1057,13 +1126,13 @@ mod tests {
         let cands = vec![mk("36", 0.0, (0.0, 0.0), 0.02), mk("18", 180.0, far, 1.05)];
         let (hlat, hlon) = crate::autoland::project_latlon(0.0, 0.0, 90.0, 40.0 / 1852.0);
         // No clearance on record: geometry picks the near end.
-        let (r, _) = pick_line_up(&cands, hlat, hlon, None).expect("pick");
+        let (r, _) = pick_line_up(&cands, hlat, hlon, None, None).expect("pick");
         assert_eq!(r.id, "36");
         // The tower cleared 36: same answer, crosschecked.
-        assert_eq!(pick_line_up(&cands, hlat, hlon, Some("36")).unwrap().0.id, "36");
+        assert_eq!(pick_line_up(&cands, hlat, hlon, Some("36"), None).unwrap().0.id, "36");
         // The tower cleared 18 and we're at the 36 end: nothing safe to
         // drive onto — the far end is a taxi clearance, not a line-up.
-        assert!(pick_line_up(&cands, hlat, hlon, Some("18")).is_none());
+        assert!(pick_line_up(&cands, hlat, hlon, Some("18"), None).is_none());
     }
 
     #[test]
@@ -1091,7 +1160,7 @@ mod tests {
         assert!(pocket_along < 60.0, "pocket beside the numbers: {pocket_along}");
         assert!(pocket_off > 8.0 && pocket_off < 20.0, "turning room: {pocket_off}");
         // A line-up FROM the pocket is feasible — that's leg two, the 180.
-        assert!(line_up_path(&rwy, plat, plon).is_some(), "leg two must exist");
+        assert!(line_up_path(&rwy, plat, plon, None).is_some(), "leg two must exist");
         // Near the numbers already: no backtrack, the plain line-up owns it.
         let near = crate::autoland::project_latlon(0.0, 0.0, 0.0, 60.0 / 1852.0);
         let (nlat, nlon) = crate::autoland::project_latlon(near.0, near.1, 90.0, 40.0 / 1852.0);
@@ -1111,17 +1180,17 @@ mod tests {
         let mid = crate::autoland::project_latlon(0.0, 0.0, 0.0, 1170.0 / 1852.0);
         let (hlat, hlon) = crate::autoland::project_latlon(mid.0, mid.1, 90.0, 40.0 / 1852.0);
         assert!(matches!(
-            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, false),
+            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, false, None),
             Some((_, LineUpPlan::Plain(_)))
         ));
         assert!(matches!(
-            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 700.0, false),
+            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 700.0, false, None),
             Some((_, LineUpPlan::Backtrack(_)))
         ));
         // The pilot asked for the full length in so many words: backtrack
         // even though the plain remaining would do.
         assert!(matches!(
-            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, true),
+            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, true, None),
             Some((_, LineUpPlan::Backtrack(_)))
         ));
         // Abeam the numbers a backtrack is impossible — the ask still gets
@@ -1129,7 +1198,7 @@ mod tests {
         let near = crate::autoland::project_latlon(0.0, 0.0, 0.0, 60.0 / 1852.0);
         let (nlat, nlon) = crate::autoland::project_latlon(near.0, near.1, 90.0, 40.0 / 1852.0);
         assert!(matches!(
-            pick_line_up_plan(&cands, nlat, nlon, Some("36"), 700.0, true),
+            pick_line_up_plan(&cands, nlat, nlon, Some("36"), 700.0, true, None),
             Some((_, LineUpPlan::Plain(_)))
         ));
     }

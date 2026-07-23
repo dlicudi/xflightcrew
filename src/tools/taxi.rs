@@ -263,6 +263,9 @@ impl Tool for LineUp {
         ) else {
             return Ok("I can't read our position right now.".to_string());
         };
+        // The current heading makes leg one roll forward along the taxiway
+        // lead-on onto the centreline instead of cutting a diagonal to it.
+        let heading = ctx.xplane.get_float(autotaxi::PSI_TRUE).await.ok();
         if !autotaxi::steer_channel_ok(ctx.xplane).await {
             return Ok(
                 "I can't steer. The x-copilot plugin needs updating, so the line-up is yours."
@@ -290,6 +293,7 @@ impl Tool for LineUp {
             cleared.as_deref(),
             needed_m,
             force_backtrack,
+            heading,
         ) else {
             return Ok(match cleared {
                 Some(c) => format!(

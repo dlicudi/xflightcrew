@@ -205,6 +205,13 @@ const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
 const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
+// Rollout: nose steering + proportional wheel brakes through the plugin, the
+// same channels the taxi governor drives.
+const TAXI_STEER: &str = "xcopilot/taxi_steer";
+const TAXI_BRAKE: &str = "xcopilot/taxi_brake";
+/// Brake application on the rollout, and the gentler hold once stopped.
+const ROLLOUT_BRAKE: f64 = 0.45;
+const ROLLOUT_BRAKE_HOLD: f64 = 0.5;
 const M_TO_FT: f64 = 3.280_84;
 const MS_TO_KTS: f64 = 1.943_84;
 
@@ -235,6 +242,7 @@ pub fn run_autoland(
             let xp = XPlaneClient::new(base);
             ACTIVE.store(true, Ordering::SeqCst);
             let announce = |line: String, sev: Priority| {
+                tracing::info!(target: "x_copilot::autoland", spoke = %line, "copilot");
                 if let Some(s) = &status { s.action(&line); }
                 if let Some(v) = &voice { v.alert(sev, line); }
             };
@@ -279,6 +287,11 @@ pub fn run_autoland(
             // anti-stall reflex needs the TREND (kts/sec), not just the error.
             let mut prev_ias: Option<f64> = None;
             let mut prev_ias_t = std::time::Instant::now();
+            // Rollout: latched at touchdown, then brakes to a full stop. The
+            // takeoff roll law (P + trim, tested) holds the centreline through
+            // the plugin steer channel while it brakes.
+            let mut rolling_out = false;
+            let mut roll_law = crate::autotakeoff::RollSteer::default();
             loop {
                 if GEN.load(Ordering::SeqCst) != my_gen || ABORT.load(Ordering::SeqCst) {
                     break;
@@ -305,6 +318,38 @@ pub fn run_autoland(
                 let alt = elev_m * M_TO_FT;
                 let radio_ft = agl_m * M_TO_FT;
                 let gs_kts = gs_ms * MS_TO_KTS;
+
+                // ROLLOUT TO A STOP. Once on the ground and slow, cut the power
+                // and brake to a halt before handing off — the old touchdown
+                // path just idled the throttle at 40 kt and said "you have the
+                // aircraft", leaving it coasting down the runway with nobody on
+                // the brakes (the circuit's landings rolled on unmanaged,
+                // 2026-07-23). Latched, so the approach guidance below never
+                // re-fires once we're down. The nose is held to the centreline
+                // through the plugin steer channel with the takeoff roll law.
+                if rolling_out || (radio_ft < 5.0 && gs_kts < 45.0) {
+                    rolling_out = true;
+                    let xtk_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
+                    let target = crate::autotakeoff::roll_target_heading(rwy.course_deg, xtk_m);
+                    let psi = psi_r.as_ref().copied().unwrap_or(rwy.course_deg);
+                    let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+                    let steer = roll_law.step(err, 0.4, gs_kts, 0.0);
+                    let (_, _) = tokio::join!(
+                        xp.set_float(THROTTLE_ALL, 0.0),
+                        xp.set_float(TAXI_STEER, steer),
+                    );
+                    if gs_kts > 2.0 {
+                        let _ = xp.set_float(TAXI_BRAKE, ROLLOUT_BRAKE).await;
+                        set_panel(&format!("AUTOLAND {} {} ROLLOUT", rwy.icao, rwy.id));
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        continue;
+                    }
+                    // Stopped: hold the brakes, free the nosewheel, hand off.
+                    let _ = xp.set_float(TAXI_BRAKE, ROLLOUT_BRAKE_HOLD).await;
+                    let _ = xp.set_float(TAXI_STEER, 0.0).await;
+                    announce("Down and stopped. Brakes on, your aircraft.".into(), Priority::Warning);
+                    break;
+                }
                 // Wind crab, from the reference recipe (heading vs ground track):
                 // command a heading whose TRACK aligns with the runway, not the
                 // heading itself. P-only tracking left a standing 0.10 nm
@@ -462,12 +507,8 @@ pub fn run_autoland(
                     announce(line.into(), Priority::Caution);
                 }
 
-                // Touchdown: on the ground and slowing → done.
-                if radio_ft < 5.0 && gs_kts < 40.0 {
-                    let _ = xp.set_float(THROTTLE_ALL, 0.0).await;
-                    announce("Down. You have the aircraft.".into(), Priority::Warning);
-                    break;
-                }
+                // (Touchdown + rollout-to-stop is handled at the top of the loop,
+                // latched by `rolling_out`, before the approach guidance.)
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             }
             set_panel("");

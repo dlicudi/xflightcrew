@@ -164,6 +164,7 @@ impl Tool for AutoTakeoff {
                 retract_gear: self.retract_gear,
                 cleared_runway: party_line::clearance_runway(),
                 needed_m: self.takeoff_roll_m.map_or(500.0, |m| m * 1.4),
+                handoff_agl_ft: autotakeoff::DEFAULT_HANDOFF_AGL_FT,
             },
         );
         Ok("My takeoff. Checking the runway. Say abort takeoff or my controls any time."
