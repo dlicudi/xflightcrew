@@ -115,6 +115,12 @@ pub struct Config {
     pub cabin_crew: String,
     /// Path to X-Plane's `earth_nav.dat` (for ILS lookup).
     pub nav_data_path: String,
+    /// Path to X-Plane's `earth_fix.dat` (enroute/terminal waypoints) — resolves
+    /// the named fixes in a SID/STAR/approach to positions. `XPLANE_FIX_DATA`.
+    pub fix_data_path: String,
+    /// Path to X-Plane's OpenAir airspace file (the polygons the G1000 draws) —
+    /// the circuit's restricted/prohibited/danger avoidance. `XPLANE_AIRSPACE`.
+    pub airspace_path: String,
     /// Directory of per-airport CIFP procedure files (`<ICAO>.dat`, ARINC
     /// 424) — real approach platform altitudes. `XPLANE_CIFP_DIR`.
     pub cifp_dir: String,
@@ -281,6 +287,24 @@ impl Config {
                     "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_nav.dat"
                 };
                 env_or("XPLANE_NAV_DATA", fallback)
+            },
+            fix_data_path: {
+                let custom = "/Users/duanelicudi/X-Plane 12/Custom Data/earth_fix.dat";
+                let fallback = if std::path::Path::new(custom).exists() {
+                    custom
+                } else {
+                    "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_fix.dat"
+                };
+                env_or("XPLANE_FIX_DATA", fallback)
+            },
+            airspace_path: {
+                let custom = "/Users/duanelicudi/X-Plane 12/Custom Data/airspaces/airspace.txt";
+                let fallback = if std::path::Path::new(custom).exists() {
+                    custom
+                } else {
+                    "/Users/duanelicudi/X-Plane 12/Resources/default data/airspaces/airspace.txt"
+                };
+                env_or("XPLANE_AIRSPACE", fallback)
             },
             // Real approach procedures (ARINC 424 legs, one file per airport).
             // Same Custom-Data-first rule as the nav data: a Navigraph cycle

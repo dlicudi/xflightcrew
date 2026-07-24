@@ -31,6 +31,8 @@ mod monitor;
 mod phrase;
 mod plugin_status;
 mod prefs;
+mod procedure;
+mod terrain;
 mod readback;
 mod simbrief;
 mod stt;
@@ -47,7 +49,7 @@ mod voice;
 // The world side (ATC) and the simulator plumbing now live in their own
 // crates; these shims keep every existing `crate::station::...` /
 // `crate::xplane::...` path in the module tree resolving unchanged.
-pub(crate) use ::atc::{atis, nav, party_line, speaker, station, tower};
+pub(crate) use ::atc::{airspace, atis, nav, party_line, speaker, station, tower};
 pub(crate) use sim::{blackbox, datarefs, xplane};
 
 use std::time::{Duration, Instant};
@@ -1881,9 +1883,10 @@ async fn run_session(
                 let taxi_driving = autotaxi::ACTIVE.load(Relaxed);
                 let takeoff_flying = autotakeoff::ACTIVE.load(Relaxed);
                 let circuit_flying = circuit::ACTIVE.load(Relaxed);
+                let procedure_flying = procedure::ACTIVE.load(Relaxed);
                 let full_auto_running = full_auto::ACTIVE.load(Relaxed);
                 if (speed_held || mix_held || reverse_in || taxi_driving || takeoff_flying
-                    || circuit_flying || full_auto_running)
+                    || circuit_flying || procedure_flying || full_auto_running)
                     && release_intent(&tl)
                 {
                     let names_mix = tl.contains("mixture") || tl.contains("mix");
@@ -1917,6 +1920,13 @@ async fn run_session(
                     if !full_auto_running && circuit_flying && (names_speed || names_steer || generic) {
                         circuit::abort();
                         released.push("circuit off, your aircraft");
+                    }
+                    // A published-procedure follower is airborne on the AP (it
+                    // aborts its autoland handoff too); a lever-shaped or generic
+                    // release hands it back.
+                    if !full_auto_running && !circuit_flying && procedure_flying && (names_speed || generic) {
+                        procedure::abort();
+                        released.push("procedure off, your aircraft");
                     }
                     // A takeoff in progress: "my controls" is a HANDOVER, not
                     // a reject — the loop stands down silently, steering
@@ -2252,9 +2262,13 @@ async fn run_session(
                 continue;
             }
             // SimBrief flight plan (cached fetch) + advice. Route, full brief, or
-            // refresh. Not when the intent is to *fly* it ("follow/navigate/track"),
-            // which is the navigate tool (handled via the grammar/LLM path below).
-            let nav_intent = tl.contains("navigate") || tl.contains("follow") || tl.contains("track");
+            // refresh. Not when the intent is to *fly* it ("follow/navigate/track"
+            // is the navigate tool; the word "fly" is the full-auto SimBrief
+            // mission — both handled via the grammar/LLM path below).
+            let nav_intent = tl.contains("navigate")
+                || tl.contains("follow")
+                || tl.contains("track")
+                || tl.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "fly");
             let is_plan = !nav_intent
                 && (tl.contains("flight plan") || tl.contains("simbrief") || tl.contains("fetch the plan")
                     || tl.contains("where are we going") || tl.contains("where are we headed")
@@ -4903,6 +4917,9 @@ fn active_managers() -> Vec<String> {
     if let Some(s) = circuit::status() {
         v.push(s);
     }
+    if let Some(s) = procedure::status() {
+        v.push(s);
+    }
     if let Some(s) = autotakeoff::status() {
         v.push(s);
     }
@@ -5141,6 +5158,9 @@ const COMMAND_KEYWORDS: &[&str] = &[
     // full auto — the whole flight from cold ("full auto", "do everything",
     // "start up and fly", "fly from cold").
     "auto", "automated", "everything", "cold", "fly",
+    // fly_procedure — real published SID/approach ("fly the ILS", "shoot the
+    // approach", "fly the SID/arrival/departure").
+    "approach", "ils", "rnav", "sid", "departure", "arrival", "shoot",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,

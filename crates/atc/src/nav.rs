@@ -532,6 +532,13 @@ pub struct TaxiRoutePlan {
     /// This is what lets the copilot's taxi guide say "left onto Bravo"
     /// instead of just "left": the planner knew the names all along.
     pub seg: Vec<(String, bool)>,
+    /// The tail the hold-short trim REMOVED: the authored lead-on from the
+    /// route's end (the holding point) onto the runway-centreline junction —
+    /// the painted yellow line from the hold onto the strip. Empty when the
+    /// route wasn't trimmed (it ends at a genuine off-runway node). The
+    /// line-up drives THIS instead of inventing a diagonal (the aircraft cut
+    /// the Echo stub's curve and stopped crooked, LXGB 2026-07-24).
+    pub lead_on: Vec<(f64, f64)>,
 }
 
 /// Parse `icao`'s taxi network from apt.dat — same streaming block scan as
@@ -765,6 +772,10 @@ impl TaxiNet {
         // its zone — the boundary node IS the authored holding point,
         // per stub (EGLL carries these for every entry; the geometric 100 m
         // guess was still wrong stub-to-stub).
+        // The untrimmed path, kept so the trimmed tail — the authored lead-on
+        // from the holding point onto the runway centreline — survives on the
+        // plan for the line-up to drive.
+        let full = path.clone();
         let zone_edges = if hold_zone.is_empty() {
             0
         } else {
@@ -813,6 +824,14 @@ impl TaxiNet {
                 seg.pop();
             }
         }
+        // The lead-on: whatever the trims removed, from the (possibly moved)
+        // hold point out to the runway-junction node. Longest common prefix of
+        // the untrimmed path vs the trimmed one; the trimmed path carries at
+        // most one point past it (a mid-leg interpolated end), then the
+        // original tail follows. Empty when nothing was trimmed.
+        let prefix = full.iter().zip(path.iter()).take_while(|(a, b)| a == b).count();
+        let mut lead_on: Vec<(f64, f64)> = path[prefix..].to_vec();
+        lead_on.extend_from_slice(&full[prefix..]);
         // The route starts where the AIRCRAFT is, not at the node it snapped
         // to: the apron leg from the stand to the network is part of the
         // cleared route, so the off-route watch and the taxi guide measure
@@ -825,7 +844,7 @@ impl TaxiNet {
                 seg.insert(0, (String::new(), false));
             }
         }
-        Some(TaxiRoutePlan { via, crossings, holding_point, path, seg })
+        Some(TaxiRoutePlan { via, crossings, holding_point, path, seg, lead_on })
     }
 }
 
@@ -884,6 +903,475 @@ pub fn project_latlon(lat: f64, lon: f64, bearing: f64, dist_nm: f64) -> (f64, f
     let dlat = d * b.cos();
     let dlon = d * b.sin() / lat.to_radians().cos().max(1e-6);
     (lat + dlat, lon + dlon)
+}
+
+// ===========================================================================
+// Terminal procedures (SID / STAR / approach) from X-Plane's CIFP.
+//
+// Each `CIFP/<ICAO>.dat` holds ARINC-424 procedure records, one leg per line:
+//   SID:seq,rtype,IDENT,TRANS,FIX,rgn,sec,sub,desc,...,PT,turn,recnav,...,
+//        theta,rho,COURSE,DIST, altdesc,alt1,alt2, ...
+// Comma-split field indices, verified against real EGLL/LEMG records (and the
+// same 22/23/24 altitude columns `ils_platform_alt_ft` already relies on):
+//   [0]  record type + sequence ("APPCH:020")
+//   [2]  procedure ident       (approach "I27R"/"R27R", SID/STAR name "BLN4L")
+//   [3]  transition ident      ("RW30" runway transition, a fix for an enroute
+//                               transition, or BLANK for the common/final part)
+//   [4]  fix ident             ("MG930", "RW27R", "" for the to-altitude legs)
+//   [5]  fix ICAO region       ("LE", "EG") — disambiguates duplicate idents
+//   [8]  description code      (4th char 'F' = final approach fix)
+//   [11] path & terminator     (IF/TF/CF/DF/RF fix legs; CA/VA/FA to-altitude;
+//                               FM/VM manual; HM/HA/HF holds)
+//   [12] turn direction        (L/R)
+//   [20] magnetic course ×10   (2680 → 268.0°) — set on course/heading legs
+//   [21] distance ×10, nm      (0025 → 2.5)
+//   [22] altitude descriptor   (+ at-or-above, - at-or-below, blank/@ at, B/G/I ..)
+//   [23] altitude 1, ft (or FLxxx)
+//   [24] altitude 2, ft
+// Speed limits live further right at an index that shifts between record shapes,
+// so they are deliberately NOT parsed — the follower flies a fixed profile speed.
+// ===========================================================================
+
+/// Which family of terminal procedure — the CIFP record prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcKind {
+    /// Standard Instrument Departure.
+    Sid,
+    /// Standard Terminal Arrival Route.
+    Star,
+    /// Instrument approach.
+    Appch,
+}
+
+impl ProcKind {
+    fn prefix(self) -> &'static str {
+        match self {
+            ProcKind::Sid => "SID:",
+            ProcKind::Star => "STAR:",
+            ProcKind::Appch => "APPCH:",
+        }
+    }
+}
+
+/// A navigation fix resolved to a position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fix {
+    pub ident: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// One leg of a terminal procedure, parsed from a CIFP record. `fix` is `None`
+/// until [`resolve_proc_fixes`] fills it (and stays `None` for to-altitude legs
+/// that have no fix at all).
+#[derive(Debug, Clone)]
+pub struct ProcLeg {
+    pub seq: u32,
+    /// Transition/runway this leg belongs to (field 3): "RW30", a transition
+    /// fix name, or empty for the common/final portion.
+    pub transition: String,
+    /// Path & terminator (field 11): IF, TF, CF, DF, CA, VA, FM, RF, HM, ...
+    pub leg_type: String,
+    /// Fix ident (field 4): a waypoint/navaid, "RW27R" for the threshold, or
+    /// empty on a to-altitude leg.
+    pub fix_ident: String,
+    /// Fix ICAO region (field 5) — narrows duplicate idents at resolve time.
+    pub fix_region: String,
+    pub fix: Option<Fix>,
+    /// Magnetic course for course/heading legs (field 20), degrees; `None` on
+    /// pure track/direct legs.
+    pub course_mag: Option<f64>,
+    /// Leg distance in nm (field 21), where the record carries one.
+    pub dist_nm: Option<f64>,
+    pub turn: Option<char>,
+    /// Altitude descriptor (field 22): '+' at-or-above, '-' at-or-below, else at.
+    pub alt_desc: char,
+    pub alt1_ft: Option<f64>,
+    pub alt2_ft: Option<f64>,
+    /// True when this leg's fix is the final approach fix.
+    pub is_faf: bool,
+}
+
+impl ProcLeg {
+    /// Does this leg terminate at a fixed point (vs. climb/descend to an
+    /// altitude on a heading)? Fix legs are the ones the follower can sequence
+    /// laterally; to-altitude legs (CA/VA/FA) it flies as heading-holds.
+    pub fn has_fix_target(&self) -> bool {
+        self.fix.is_some()
+    }
+}
+
+fn cifp_field<'a>(f: &[&'a str], i: usize) -> &'a str {
+    f.get(i).map(|s| s.trim()).unwrap_or("")
+}
+
+/// ARINC altitude cell → feet MSL. Handles "FLxxx" and zero-padded numbers;
+/// blank / zero → `None`.
+fn arinc_alt_ft(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if let Some(fl) = s.strip_prefix("FL") {
+        return fl.parse::<f64>().ok().map(|f| f * 100.0);
+    }
+    s.parse::<f64>().ok().filter(|a| *a > 0.0)
+}
+
+/// A CIFP "×10" cell (course, distance) → its real value; blank → `None`.
+fn arinc_tenths(s: &str) -> Option<f64> {
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.parse::<f64>().ok()).flatten().map(|v| v / 10.0)
+}
+
+/// Parse the legs of one procedure from CIFP lines. `transition` selects which
+/// legs to keep: `None` keeps only the common/final portion (blank field 3) —
+/// the right choice for an approach's final segment; `Some(t)` also keeps legs
+/// whose transition is `t` — e.g. `Some("RW30")` for a SID off runway 30.
+/// Legs come back transition-first, then common, each ordered by sequence.
+pub fn parse_proc_legs<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    kind: ProcKind,
+    ident: &str,
+    transition: Option<&str>,
+) -> Vec<ProcLeg> {
+    let prefix = kind.prefix();
+    let mut out: Vec<ProcLeg> = Vec::new();
+    for line in lines {
+        if !line.starts_with(prefix) {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        if f.len() < 12 || cifp_field(&f, 2) != ident {
+            continue;
+        }
+        let tr = cifp_field(&f, 3).to_string();
+        match transition {
+            None if !tr.is_empty() => continue,
+            Some(want) if !tr.is_empty() && tr != want => continue,
+            _ => {}
+        }
+        let seq = f[0].split(':').nth(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        out.push(ProcLeg {
+            seq,
+            transition: tr,
+            leg_type: cifp_field(&f, 11).to_string(),
+            fix_ident: cifp_field(&f, 4).to_string(),
+            fix_region: cifp_field(&f, 5).to_string(),
+            fix: None,
+            course_mag: arinc_tenths(cifp_field(&f, 20)),
+            dist_nm: arinc_tenths(cifp_field(&f, 21)),
+            turn: cifp_field(&f, 12).chars().next().filter(|c| *c == 'L' || *c == 'R'),
+            alt_desc: cifp_field(&f, 22).chars().next().unwrap_or(' '),
+            alt1_ft: arinc_alt_ft(cifp_field(&f, 23)),
+            alt2_ft: arinc_alt_ft(cifp_field(&f, 24)),
+            is_faf: cifp_field(&f, 8).chars().nth(3) == Some('F'),
+        });
+    }
+    // Transition (runway) legs first, then the common portion, each by sequence.
+    out.sort_by_key(|l| (l.transition.is_empty(), l.seq));
+    out
+}
+
+/// Read one procedure's legs from `CIFP/<ICAO>.dat`. See [`parse_proc_legs`]
+/// for `transition` semantics. Empty vec = no such file/procedure.
+pub fn load_proc_legs(
+    cifp_dir: &str,
+    icao: &str,
+    kind: ProcKind,
+    ident: &str,
+    transition: Option<&str>,
+) -> Vec<ProcLeg> {
+    let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    parse_proc_legs(text.lines(), kind, ident, transition)
+}
+
+/// Every distinct procedure ident of `kind` at `icao`, in first-seen order.
+pub fn list_procedures(cifp_dir: &str, icao: &str, kind: ProcKind) -> Vec<String> {
+    let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let prefix = kind.prefix();
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if !line.starts_with(prefix) {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        let id = cifp_field(&f, 2);
+        if !id.is_empty() && !out.iter().any(|s| s == id) {
+            out.push(id.to_string());
+        }
+    }
+    out
+}
+
+/// The runway an approach ident serves: strip the leading type letter(s) and any
+/// "-Y"/"-Z" variant suffix. "I27R" → "27R", "R27R-Z" → "27R", "I20-Y" → "20".
+/// `None` if there are no runway digits.
+pub fn approach_runway(ident: &str) -> Option<String> {
+    let body: String = ident.chars().skip_while(|c| c.is_ascii_alphabetic()).collect();
+    let body = body.split('-').next().unwrap_or("");
+    let digits: String = body.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let suffix: String =
+        body.chars().skip_while(|c| c.is_ascii_digit()).take(1).filter(|c| matches!(c, 'L' | 'R' | 'C')).collect();
+    Some(format!("{digits}{suffix}"))
+}
+
+/// Whether an approach/runway designator matches `runway` (e.g. "27R"): same
+/// leading number, and same L/R/C side when both name one.
+fn runway_matches(a: &str, b: &str) -> bool {
+    if runway_number(a) != runway_number(b) {
+        return false;
+    }
+    let side = |s: &str| s.chars().find(|c| matches!(c, 'L' | 'R' | 'C' | 'l' | 'r' | 'c'));
+    match (side(a), side(b)) {
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(&y),
+        _ => true, // one side unspecified → the number match is enough
+    }
+}
+
+/// The best instrument approach ident for `runway` at `icao`: prefer ILS ('I'),
+/// then RNAV/GPS ('R'/'X'/'Q'), then LOC ('L'), then anything else. `None` if the
+/// field publishes no approach to that runway.
+pub fn best_approach(cifp_dir: &str, icao: &str, runway: &str) -> Option<String> {
+    let rank = |id: &str| match id.chars().next() {
+        Some('I') => 0,
+        Some('X') | Some('R') | Some('Q') => 1,
+        Some('L') => 2,
+        Some('D') | Some('S') | Some('V') => 3,
+        _ => 4,
+    };
+    list_procedures(cifp_dir, icao, ProcKind::Appch)
+        .into_iter()
+        .filter(|id| approach_runway(id).is_some_and(|r| runway_matches(&r, runway)))
+        .min_by_key(|id| rank(id))
+}
+
+/// A SID that departs `runway` at `icao` — the first ident with a leg whose
+/// transition is `RW<runway>`. `None` if the field publishes no SID for it.
+pub fn sid_for_runway(cifp_dir: &str, icao: &str, runway: &str) -> Option<String> {
+    let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
+    let text = std::fs::read_to_string(path).ok()?;
+    let want = format!("RW{runway}");
+    for line in text.lines() {
+        if !line.starts_with("SID:") {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        let tr = cifp_field(&f, 3);
+        if tr == want || (runway_matches(tr.strip_prefix("RW").unwrap_or(tr), runway) && tr.starts_with("RW")) {
+            let id = cifp_field(&f, 2);
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve every fix in `legs` to a position, in place. Runway ("RW..") and the
+/// airport ident come from `airport`; all other idents are looked up in
+/// `earth_fix.dat` (waypoints) then `earth_nav.dat` (VOR/NDB/DME), matching
+/// ident + ICAO region, choosing the candidate nearest `(near_lat, near_lon)`.
+/// One scan of each data file regardless of leg count — call it off the realtime
+/// loop. Legs whose fix can't be resolved keep `fix: None`.
+pub fn resolve_proc_fixes(
+    fix_path: &str,
+    nav_path: &str,
+    airport: &AirportInfo,
+    icao: &str,
+    legs: &mut [ProcLeg],
+    near_lat: f64,
+    near_lon: f64,
+) {
+    use std::collections::HashSet;
+
+    // 1. Runway thresholds + the airport reference point resolve locally.
+    for leg in legs.iter_mut() {
+        if leg.fix_ident.is_empty() {
+            continue;
+        }
+        if let Some(rw) = leg.fix_ident.strip_prefix("RW") {
+            if let Some((lat, lon)) = runway_threshold(airport, rw) {
+                leg.fix = Some(Fix { ident: leg.fix_ident.clone(), lat, lon });
+            }
+        } else if leg.fix_ident == icao {
+            if let Some((lat, lon)) = airport.position() {
+                leg.fix = Some(Fix { ident: leg.fix_ident.clone(), lat, lon });
+            }
+        }
+    }
+
+    // 2. Everything still unresolved: one scan each of the two nav files.
+    let wanted: HashSet<(String, String)> = legs
+        .iter()
+        .filter(|l| l.fix.is_none() && !l.fix_ident.is_empty())
+        .map(|l| (l.fix_ident.clone(), l.fix_region.clone()))
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+    let mut found: std::collections::HashMap<(String, String), (f64, f64, f64)> = Default::default();
+    let mut consider = |ident: &str, region: &str, lat: f64, lon: f64| {
+        let key = (ident.to_string(), region.to_string());
+        if !wanted.contains(&key) {
+            return;
+        }
+        let d = haversine_nm(near_lat, near_lon, lat, lon);
+        found
+            .entry(key)
+            .and_modify(|best| {
+                if d < best.2 {
+                    *best = (lat, lon, d);
+                }
+            })
+            .or_insert((lat, lon, d));
+    };
+
+    // earth_fix.dat: `lat lon IDENT area REGION ...`
+    if let Ok(file) = std::fs::File::open(fix_path) {
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 5 {
+                continue;
+            }
+            if let (Ok(lat), Ok(lon)) = (f[0].parse::<f64>(), f[1].parse::<f64>()) {
+                consider(f[2], f[4], lat, lon);
+            }
+        }
+    }
+    // earth_nav.dat: `code lat lon elev freq range var IDENT area REGION name`
+    if let Ok(file) = std::fs::File::open(nav_path) {
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 10 {
+                continue;
+            }
+            // Row codes 2 (NDB), 3 (VOR), 12/13 (DME) carry a named ident.
+            if !matches!(f[0], "2" | "3" | "12" | "13") {
+                continue;
+            }
+            if let (Ok(lat), Ok(lon)) = (f[1].parse::<f64>(), f[2].parse::<f64>()) {
+                consider(f[7], f[9], lat, lon);
+            }
+        }
+    }
+
+    for leg in legs.iter_mut() {
+        if leg.fix.is_some() || leg.fix_ident.is_empty() {
+            continue;
+        }
+        if let Some(&(lat, lon, _)) = found.get(&(leg.fix_ident.clone(), leg.fix_region.clone())) {
+            leg.fix = Some(Fix { ident: leg.fix_ident.clone(), lat, lon });
+        }
+    }
+}
+
+/// Reconstruct a straight-in approach for `runway` from the airport's published
+/// DME fixes when the CIFP carries no APPCH records — the way a pilot flies the
+/// DME/TACAN approach off the chart. X-Plane ships terminal fixes named
+/// `<runway>D<dme>` (e.g. `27D10`, `27D06`, `27D05` at Gibraltar: the 10/6/5 DME
+/// points on the runway-27 final, stepping in over the water) even where the
+/// procedure records are missing. Ordered farthest-DME first, a 3° descent
+/// profile synthesised from each fix's distance to the threshold, the innermost
+/// flagged as the FAF, then the threshold itself. Fixes are read straight from
+/// `earth_fix.dat` (already positioned). Empty = no such fixes to chain.
+///
+/// Terrain safety comes from the fixes: they trace the real published final,
+/// which the authority routed clear of high ground. Getting TO the first fix is
+/// the follower's job — do it at approach altitude (the outer fix is ~3,000 ft),
+/// which clears terrain a low pattern would hit.
+pub fn reconstruct_approach(
+    fix_path: &str,
+    airport: &AirportInfo,
+    icao: &str,
+    runway: &str,
+) -> Vec<ProcLeg> {
+    /// 3° glidepath, feet per nm (tan 3° × 6076).
+    const GLIDE_FT_PER_NM: f64 = 318.0;
+    let Some((thr_lat, thr_lon)) = runway_threshold(airport, runway) else {
+        return Vec::new();
+    };
+    // Collect the `<runway>D<dme>` fixes for this field: (dme, ident, lat, lon).
+    let mut dfix: Vec<(u32, String, f64, f64)> = Vec::new();
+    if let Ok(file) = std::fs::File::open(fix_path) {
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 5 || f[3] != icao {
+                continue;
+            }
+            // ident = "<runway>D<digits>", e.g. "27D05".
+            let Some(rest) = f[2].strip_prefix(runway).and_then(|s| s.strip_prefix('D')) else {
+                continue;
+            };
+            let Ok(dme) = rest.parse::<u32>() else { continue };
+            if let (Ok(lat), Ok(lon)) = (f[0].parse::<f64>(), f[1].parse::<f64>()) {
+                dfix.push((dme, f[2].to_string(), lat, lon));
+            }
+        }
+    }
+    if dfix.is_empty() {
+        return Vec::new();
+    }
+    // Farthest DME first (fly inbound); the innermost is the FAF.
+    dfix.sort_by(|a, b| b.0.cmp(&a.0));
+    let elev = airport.elev_ft;
+    let mut legs: Vec<ProcLeg> = Vec::new();
+    let last = dfix.len() - 1;
+    for (i, (_dme, ident, lat, lon)) in dfix.iter().enumerate() {
+        let dist_nm = haversine_nm(*lat, *lon, thr_lat, thr_lon);
+        legs.push(ProcLeg {
+            seq: (i as u32 + 1) * 10,
+            transition: String::new(),
+            leg_type: "TF".to_string(),
+            fix_ident: ident.clone(),
+            fix_region: String::new(),
+            fix: Some(Fix { ident: ident.clone(), lat: *lat, lon: *lon }),
+            course_mag: None,
+            dist_nm: Some(dist_nm),
+            turn: None,
+            alt_desc: ' ',
+            alt1_ft: Some((elev + dist_nm * GLIDE_FT_PER_NM).round()),
+            alt2_ft: None,
+            is_faf: i == last, // the innermost DME fix
+        });
+    }
+    // The threshold itself, so the follower has a fix to fly to after the FAF
+    // (it hands to autoland at the FAF regardless).
+    legs.push(ProcLeg {
+        seq: (dfix.len() as u32 + 1) * 10,
+        transition: String::new(),
+        leg_type: "TF".to_string(),
+        fix_ident: format!("RW{runway}"),
+        fix_region: String::new(),
+        fix: Some(Fix { ident: format!("RW{runway}"), lat: thr_lat, lon: thr_lon }),
+        course_mag: None,
+        dist_nm: Some(0.0),
+        turn: None,
+        alt_desc: ' ',
+        alt1_ft: Some(elev),
+        alt2_ft: None,
+        is_faf: false,
+    });
+    legs
+}
+
+/// The threshold position of runway `id` at `airport`, matching either end.
+fn runway_threshold(airport: &AirportInfo, id: &str) -> Option<(f64, f64)> {
+    airport.runways.iter().find_map(|r| {
+        if runway_matches(&r.ident_a, id) {
+            Some((r.lat_a, r.lon_a))
+        } else if runway_matches(&r.ident_b, id) {
+            Some((r.lat_b, r.lon_b))
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1044,6 +1532,13 @@ mod tests {
         let d = (dx * dx + dy * dy).sqrt();
         assert!((35.0..=45.0).contains(&d), "stops ~40 m short of the junction: {d}");
         assert_eq!(plan2.seg.len(), plan2.path.len() - 1, "seg stays aligned after the trim");
+        // The trimmed tail SURVIVES as the lead-on: from the hold-short point
+        // to the runway-junction node — the painted line the line-up drives.
+        assert!(!plan2.lead_on.is_empty(), "geometric trim keeps its tail");
+        assert_eq!(*plan2.lead_on.first().unwrap(), *plan2.path.last().unwrap(), "starts at the hold");
+        assert_eq!(*plan2.lead_on.last().unwrap(), (36.0004, -5.0140), "ends at the junction");
+        // An untrimmed route (node 4, never touches a runway edge) has none.
+        assert!(plan.lead_on.is_empty(), "no trim, no lead-on");
         // An instrument-scale standoff trims further back along the same
         // route (Heathrow's CAT holds sit ~100 m out; 40 m parked a taxi on
         // the entry stub past the line, 2026-07-20).
@@ -1193,6 +1688,228 @@ mod tests {
             Some(2500.0),
             "27R platform from the CIFP FAF"
         );
+    }
+
+    // --- Terminal procedure parsing (real EGLL/LEMG CIFP records) ---
+
+    // The ILS 27R final segment at Heathrow: initial fix, FAF, runway, missed.
+    const EGLL_I27R: &str = "\
+APPCH:010,I,I27R, ,CF27R,EG,P,C,E  I, ,   ,IF, ,IRR,EG,P,I,      ,0887,0123,    ,    ,I,03000,02500,     , ,   ,    ,   , , , , , ,0,D,S;
+APPCH:020,I,I27R, ,FF27R,EG,P,C,E  F, ,   ,CF, ,IRR,EG,P,I,      ,0887,0098,2680,0025,G,02500,02500,     , ,   ,-300,   ,EGLL,EG,P,A, ,0,D,S;
+APPCH:030,I,I27R, ,RW27R,EG,P,G,G  M, ,   ,CF, ,IRR,EG,P,I,      ,0887,0023,2680,0075, ,00136,     ,     , ,   ,-300,   , , , , , ,0,D,S;
+APPCH:050,I,I27R, , , , , , E  , ,   ,CA, , , , , ,      ,    ,    ,3150,    ,+,03000,     ,     , ,   ,    ,   , , , , , ,0,D,S;
+APPCH:010,A,I27R,BIG,BIG,EG,D, ,V  C, ,   ,IF, , , , , ,      ,    ,    ,    ,    ,-,220,    ,   , , , , , ,0,D,S;";
+
+    #[test]
+    fn appch_final_segment_parses_the_legs_in_order() {
+        // transition=None keeps only the common/final portion (blank field 3),
+        // NOT the BIG transition.
+        let legs = parse_proc_legs(EGLL_I27R.lines(), ProcKind::Appch, "I27R", None);
+        let types: Vec<&str> = legs.iter().map(|l| l.leg_type.as_str()).collect();
+        assert_eq!(types, vec!["IF", "CF", "CF", "CA"], "final segment, BIG excluded");
+
+        // The FAF leg: FF27R, flagged, magnetic course 268, platform 2500.
+        let faf = &legs[1];
+        assert_eq!(faf.fix_ident, "FF27R");
+        assert!(faf.is_faf);
+        assert_eq!(faf.course_mag, Some(268.0));
+        assert_eq!(faf.alt1_ft, Some(2500.0));
+
+        // The runway leg: threshold at 136 ft.
+        assert_eq!(legs[2].fix_ident, "RW27R");
+        assert_eq!(legs[2].alt1_ft, Some(136.0));
+
+        // The missed leg climbs on a heading to 3000 with no fix.
+        let miss = &legs[3];
+        assert_eq!(miss.leg_type, "CA");
+        assert!(miss.fix_ident.is_empty());
+        assert_eq!(miss.alt_desc, '+');
+        assert_eq!(miss.alt1_ft, Some(3000.0));
+        assert_eq!(miss.course_mag, Some(315.0));
+    }
+
+    #[test]
+    fn appch_transition_is_included_when_named() {
+        let legs = parse_proc_legs(EGLL_I27R.lines(), ProcKind::Appch, "I27R", Some("BIG"));
+        assert!(legs.iter().any(|l| l.fix_ident == "BIG"), "BIG transition kept");
+        assert!(legs.iter().any(|l| l.fix_ident == "RW27R"), "common part still kept");
+    }
+
+    // A Malaga SID off runway 30 (BLN4L): course-to-fix then track-to-fix legs.
+    const LEMG_BLN4L: &str = "\
+SID:005,5,BLN4L,RW30,MG930,LE,P,C,E   , ,   ,CF, ,MLG,LE,D, ,      ,3172,0061,3120,0050, ,     ,     ,13000,-,210,    ,   , , , , , , , , ;
+SID:010,5,BLN4L,RW30,MG901,LE,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     ,-,210,    ,   , , , , , , , , ;
+SID:020,5,BLN4L,RW30,MG902,LE,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    ,+,07500,     ,     ,-,230,    ,   , , , , , , , , ;
+SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,    ,+,10000,     ,     , ,   ,    ,   , , , , , , , , ;";
+
+    #[test]
+    fn sid_runway_transition_parses() {
+        let legs = parse_proc_legs(LEMG_BLN4L.lines(), ProcKind::Sid, "BLN4L", Some("RW30"));
+        let fixes: Vec<&str> = legs.iter().map(|l| l.fix_ident.as_str()).collect();
+        assert_eq!(fixes, vec!["MG930", "MG901", "MG902", "BLN"]);
+        // First leg is course-to-fix 312 heading; last leg climbs to at-or-above
+        // 10,000.
+        assert_eq!(legs[0].leg_type, "CF");
+        assert_eq!(legs[0].course_mag, Some(312.0));
+        assert_eq!(legs[3].alt_desc, '+');
+        assert_eq!(legs[3].alt1_ft, Some(10000.0));
+    }
+
+    #[test]
+    fn approach_runway_strips_type_and_variant() {
+        assert_eq!(approach_runway("I27R").as_deref(), Some("27R"));
+        assert_eq!(approach_runway("R27R-Z").as_deref(), Some("27R"));
+        assert_eq!(approach_runway("I20-Y").as_deref(), Some("20"));
+        assert_eq!(approach_runway("D07").as_deref(), Some("07"));
+        assert_eq!(approach_runway("RNAV"), None); // no runway digits at all
+    }
+
+    #[test]
+    fn reconstructs_the_gibraltar_dme_approach_from_fixes() {
+        // LXGB: no CIFP approach, but earth_fix.dat carries the runway-27 DME
+        // fixes. Reconstruct the straight-in from them (the real Gibraltar case).
+        let apt = std::env::temp_dir().join("xc-lxgb-apt.dat");
+        let mut f = std::fs::File::create(&apt).unwrap();
+        writeln!(f, "1 11 0 0 LXGB Gibraltar").unwrap();
+        // Runway 09/27: 27 threshold at the east end (~-5.341), 09 at the west.
+        writeln!(f, "100 46 0 0 0 0 0 0 09 36.1509000 -5.3581000 0 0 0 0 0 0 27 36.1515000 -5.3412000 0 0 0 0 0 0").unwrap();
+        f.flush().unwrap();
+        let fix = std::env::temp_dir().join("xc-lxgb-fix.dat");
+        let mut f = std::fs::File::create(&fix).unwrap();
+        // The real LXGB fixes (earth_fix.dat), plus an unrelated field's fix.
+        writeln!(f, "36.157361111 -5.240083333 27D05 LXGB LX 5906505 RWY27 D05").unwrap();
+        writeln!(f, "36.158305556 -5.219500000 27D06 LXGB LX 5906505 RWY27 D06").unwrap();
+        writeln!(f, "36.162027778 -5.137250000 27D10 LXGB LX 5906505 RWY27 D10").unwrap();
+        writeln!(f, "36.104666667 -5.405333333 09D05 LXGB LX 5906505 RWY09 D05").unwrap();
+        writeln!(f, "40.000000000 -3.000000000 27D05 LEMD LE 0 other field").unwrap();
+        f.flush().unwrap();
+
+        let airport = find_airport(apt.to_str().unwrap(), "LXGB").unwrap().unwrap();
+        let legs = reconstruct_approach(fix.to_str().unwrap(), &airport, "LXGB", "27");
+        // Three DME fixes (27D10/06/05) + the threshold, farthest first.
+        let idents: Vec<&str> = legs.iter().map(|l| l.fix_ident.as_str()).collect();
+        assert_eq!(idents, vec!["27D10", "27D06", "27D05", "RW27"]);
+        // Descending altitude on a 3° path — outer fix highest.
+        assert!(legs[0].alt1_ft.unwrap() > legs[2].alt1_ft.unwrap());
+        assert!(legs[0].alt1_ft.unwrap() > 2500.0, "10 DME ~ 3000 ft: {:?}", legs[0].alt1_ft);
+        // The innermost DME fix (27D05) is the FAF; the threshold is not.
+        assert!(legs[2].is_faf, "27D05 is the FAF");
+        assert!(!legs[3].is_faf);
+        // The 09 fixes stay out of the 27 reconstruction.
+        assert!(!idents.contains(&"09D05"));
+        // A runway with no DME fixes → nothing to reconstruct.
+        assert!(reconstruct_approach(fix.to_str().unwrap(), &airport, "LXGB", "18").is_empty());
+    }
+
+    #[test]
+    fn resolver_fills_runway_and_navaid_fixes() {
+        // A tiny airport with runway 30/12, plus a nav-data file holding the
+        // MG930 waypoint and the BLN VOR — the resolver must place both.
+        let apt = std::env::temp_dir().join("xc-proc-apt.dat");
+        let mut f = std::fs::File::create(&apt).unwrap();
+        writeln!(f, "1 16 0 0 LEMG Malaga").unwrap();
+        // Runway 30/12: end A "30" near (36.67,-4.50), end B "12".
+        writeln!(f, "100 45 0 0 0 0 0 0 30 36.6700000 -4.5000000 0 0 0 0 0 0 12 36.6600000 -4.4800000 0 0 0 0 0 0").unwrap();
+        f.flush().unwrap();
+        let fix = std::env::temp_dir().join("xc-proc-fix.dat");
+        let mut f = std::fs::File::create(&fix).unwrap();
+        writeln!(f, "36.7535555 -4.5927222 MG930 LEMG LE 4464727 MG930").unwrap();
+        f.flush().unwrap();
+        let nav = std::env::temp_dir().join("xc-proc-nav.dat");
+        let mut f = std::fs::File::create(&nav).unwrap();
+        writeln!(f, "3 38.1525555 -3.6247222 1772 11620 130 1.000 BLN ENRT LE BAILEN VOR/DME").unwrap();
+        f.flush().unwrap();
+
+        let airport = find_airport(apt.to_str().unwrap(), "LEMG").unwrap().unwrap();
+        let mut legs = parse_proc_legs(
+            "SID:005,5,X,RW30,MG930,LE,P,C,E   , ,   ,CF, ,MLG,LE,D, ,      ,0,0,3120,0050, ,     ,     ,     , ,   ,    ,   ;\n\
+             SID:010,5,X,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     ;\n\
+             SID:020,5,X,RW30,RW30,LE,P,G,G  M, ,   ,CF, , , , , ,      ,0,0,3120,0050, ,     ,     ,     ;"
+                .lines(),
+            ProcKind::Sid,
+            "X",
+            Some("RW30"),
+        );
+        resolve_proc_fixes(
+            fix.to_str().unwrap(),
+            nav.to_str().unwrap(),
+            &airport,
+            "LEMG",
+            &mut legs,
+            36.67,
+            -4.5,
+        );
+        // MG930 waypoint from earth_fix.dat.
+        assert_eq!(legs[0].fix.as_ref().unwrap().ident, "MG930");
+        assert!((legs[0].fix.as_ref().unwrap().lat - 36.7535555).abs() < 1e-4);
+        // BLN VOR from earth_nav.dat.
+        assert!((legs[1].fix.as_ref().unwrap().lat - 38.1525555).abs() < 1e-4);
+        // RW30 threshold from apt.dat.
+        assert!((legs[2].fix.as_ref().unwrap().lat - 36.67).abs() < 1e-6);
+    }
+
+    /// Real-install smoke test: Malaga publishes procedures; parse + resolve the
+    /// ILS to a runway and one of its SIDs end to end.
+    /// `cargo test -p atc -- --ignored real_install_procedures`
+    #[test]
+    #[ignore]
+    fn real_install_procedures() {
+        fn first_existing(custom: &str, stock: &str) -> String {
+            if std::path::Path::new(custom).exists() { custom } else { stock }.to_string()
+        }
+        let cifp = first_existing(
+            "/Users/duanelicudi/X-Plane 12/Custom Data/CIFP",
+            "/Users/duanelicudi/X-Plane 12/Resources/default data/CIFP",
+        );
+        let fix_path = first_existing(
+            "/Users/duanelicudi/X-Plane 12/Custom Data/earth_fix.dat",
+            "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_fix.dat",
+        );
+        let nav_path = first_existing(
+            "/Users/duanelicudi/X-Plane 12/Custom Data/earth_nav.dat",
+            "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_nav.dat",
+        );
+        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let airport = find_airport(apt, "LEMG").unwrap().expect("LEMG in apt.dat");
+        let (near_lat, near_lon) = airport.position().unwrap();
+
+        // Pick the ILS approach for 12 or 30 and resolve every leg's fix.
+        for rwy in ["12", "30", "13", "31"] {
+            if let Some(appch) = best_approach(&cifp, "LEMG", rwy) {
+                let mut legs = load_proc_legs(&cifp, "LEMG", ProcKind::Appch, &appch, None);
+                assert!(!legs.is_empty(), "{appch} has legs");
+                resolve_proc_fixes(&fix_path, &nav_path, &airport, "LEMG", &mut legs, near_lat, near_lon);
+                let named: Vec<_> = legs.iter().filter(|l| !l.fix_ident.is_empty()).collect();
+                let resolved = named.iter().filter(|l| l.fix.is_some()).count();
+                assert!(
+                    resolved >= named.len().saturating_sub(1),
+                    "{appch}: resolved {resolved}/{} fixes",
+                    named.len()
+                );
+                println!("LEMG {rwy}: approach {appch}, {} legs", legs.len());
+            }
+        }
+        // At least one SID resolves too.
+        let sid = sid_for_runway(&cifp, "LEMG", "30").or_else(|| sid_for_runway(&cifp, "LEMG", "12"));
+        let sid = sid.expect("LEMG has a SID for 30/12");
+        let mut legs = load_proc_legs(&cifp, "LEMG", ProcKind::Sid, &sid, Some("RW30"));
+        if legs.is_empty() {
+            legs = load_proc_legs(&cifp, "LEMG", ProcKind::Sid, &sid, Some("RW12"));
+        }
+        resolve_proc_fixes(&fix_path, &nav_path, &airport, "LEMG", &mut legs, near_lat, near_lon);
+        assert!(legs.iter().any(|l| l.fix.is_some()), "SID {sid} resolved a fix");
+
+        // Gibraltar: no coded approach, but the DME fixes reconstruct the
+        // straight-in (the whole reason this exists). Runway 27's fixes must
+        // chain farthest-first to the threshold, over the water.
+        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        if let Ok(Some(lxgb)) = find_airport(apt, "LXGB") {
+            assert!(list_procedures(&cifp, "LXGB", ProcKind::Appch).is_empty(), "LXGB has no coded approach");
+            let recon = reconstruct_approach(&fix_path, &lxgb, "LXGB", "27");
+            assert!(recon.len() >= 3, "reconstructed 27 straight-in from DME fixes: {recon:?}");
+            assert!(recon.last().unwrap().fix_ident.starts_with("RW"), "ends at the threshold");
+            assert!(recon.iter().any(|l| l.is_faf), "an FAF is flagged");
+        }
     }
 
     #[test]

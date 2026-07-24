@@ -516,6 +516,44 @@ LinedUp/TakeoffCleared when a tower is running; TaxiCleared is refused
 with why. An auto-takeoff asked from the hold now answers "say line us
 up, then give me the takeoff" when the line-up is in reach.
 
+Depth (added 2026-07-23/24): **the autoflight layer** — three orchestrators
+over the proven loops, no new flight laws. [src/circuit.rs](src/circuit.rs)
+("do a circuit") flies takeoff, a POSITION-triggered rectangle scaled to the
+AP's real turn radius (timed legs and fixed widths degenerated into loops;
+the heading bug is SLEWED short-way, never jumped across the 0/360 seam),
+terrain+airspace side/height pick (`choose_pattern` — probes both downwinds
+via the plugin terrain channel and the OpenAir file, switches sides off the
+Rock, raises TPA when boxed in), then hands the final to autoland or, when
+positioned for it, the published approach. [src/procedure.rs](src/procedure.rs)
+("fly the ILS/SID") follows CIFP legs — great-circle to each fix,
+wind-crabbed, VS law to constraints, FAF handoff to autoland; refuses
+honestly at fields with no coded procedure (falls back to an approach
+reconstructed from the runway's DME fixes — Gibraltar). [src/full_auto.rs](src/full_auto.rs)
+("full auto") chains it all from cold: power (turbine only), engine start,
+request-taxi over the crew radio, auto taxi, departure call, line up
+CLEARANCE-AWARE (waits out traffic holds; verifies the runway fit before
+ever arming the airborne phase), then the MISSION — a circuit, or
+(flight=true, "fly my flight plan" / "fly the simbrief flight") the pilot's
+actual SimBrief plan: `procedure::enroute_legs` distils the OFP waypoints
+to direct-to legs at the plan's own crossing altitudes (climb fixes command
+cruise directly so the departure never stair-steps; the post-TOD numbers
+fly the descent), the follower flies them under `EndAction::Enroute` (quiet
+completion — the orchestrator owns what's next), and the arrival prefers
+the destination's published approach (runway picked by arrival bearing —
+no wind data enroute; autoland re-picks on the visual fallback), tuning
+COM1 to whoever owns the destination (the enroute region watch has been
+handing the flight down the airway) with "inbound for landing" then the
+final report at the autoland handoff — the call that earns the landing
+clearance. The arming tool fetches the OFP on demand, refuses without a
+plan or when the plan departs a field we aren't at, and best-effort loads
+the route into the GPS via the FMS mailbox. Cruise POWER is untouched
+(the climb-out throttle rides through cruise — a real cruise-power pull
+is future work). Everything blackboxes as `"kind":"full_auto"` /
+`"circuit"` / `"procedure"`. Related trap (2026-07-24): `Voice::alert` now
+mirrors spoken lines to the panel transcript itself — any watch that ALSO
+posts `s.action(same line)` double-writes the chat (the Jerez relocation
+note; gyro-sync and autoland hit it first). Mirror OR action, never both.
+
 Battle-test surface (all deterministic, in `cargo test --workspace` unless
 noted — plain `cargo test` at the root only runs the crew package now): the
 state-by-intent matrix test in [crates/atc/src/tower.rs](crates/atc/src/tower.rs); the adversarial

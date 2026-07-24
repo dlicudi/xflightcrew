@@ -13,6 +13,7 @@
 //! convention). This crate must stay lean: no whisper, no cpal, no ort —
 //! `cargo tree -p atc` is the standalone-product health check.
 
+pub mod airspace;
 pub mod atis;
 pub mod nav;
 pub mod party_line;

@@ -233,7 +233,9 @@ pub fn run_autoland(
     cfg: ApConfig,
     approach_ias: f64,
     voice: Option<Voice>,
-    status: Option<crate::plugin_status::StatusSink>,
+    // The chat mirror now rides `voice.alert`; an explicit `s.action` here too
+    // double-wrote every autoland line to the transcript (2026-07-24).
+    _status: Option<crate::plugin_status::StatusSink>,
 ) {
     let my_gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
@@ -243,7 +245,6 @@ pub fn run_autoland(
             ACTIVE.store(true, Ordering::SeqCst);
             let announce = |line: String, sev: Priority| {
                 tracing::info!(target: "x_copilot::autoland", spoke = %line, "copilot");
-                if let Some(s) = &status { s.action(&line); }
                 if let Some(v) = &voice { v.alert(sev, line); }
             };
 
@@ -287,6 +288,9 @@ pub fn run_autoland(
             // anti-stall reflex needs the TREND (kts/sec), not just the error.
             let mut prev_ias: Option<f64> = None;
             let mut prev_ias_t = std::time::Instant::now();
+            // Cross-track history for the intercept damping term.
+            let mut prev_xtk: Option<(f64, std::time::Instant)> = None;
+            let mut xtk_rate: f64 = 0.0;
             // Rollout: latched at touchdown, then brakes to a full stop. The
             // takeoff roll law (P + trim, tested) holds the centreline through
             // the plugin steer channel while it brakes.
@@ -362,7 +366,21 @@ pub fn run_autoland(
                     _ => 0.0,
                 };
 
-                let raw = guidance(lat, lon, alt, radio_ft, gs_kts, ias, &rwy, approach_ias, 25.0);
+                // Cross-track closure rate (nm/min, positive = drifting right),
+                // low-pass filtered — the damping term that turns the P-only
+                // centreline chase into a crisp intercept-and-rollout. P alone
+                // converged asymptotically (the banana join) and S-ed under
+                // wind (2026-07-24).
+                let xtk_now = cross_track_nm(lat, lon, &rwy);
+                let t_now = std::time::Instant::now();
+                let raw_rate = prev_xtk.map_or(0.0, |(x0, t0)| {
+                    let dt = t_now.duration_since(t0).as_secs_f64();
+                    if (0.1..=3.0).contains(&dt) { (xtk_now - x0) / dt * 60.0 } else { 0.0 }
+                });
+                prev_xtk = Some((xtk_now, t_now));
+                xtk_rate = xtk_rate * 0.5 + raw_rate.clamp(-3.0, 3.0) * 0.5;
+
+                let raw = guidance(lat, lon, alt, radio_ft, gs_kts, ias, &rwy, approach_ias, 25.0, xtk_rate);
                 // A missed approach called low is flown by the latch (full power,
                 // straight ahead) until clear of the ground — the raw intercept
                 // guidance turns back to the FAP immediately, which is a killer
@@ -519,6 +537,15 @@ pub fn run_autoland(
 
 /// Feet of altitude per nm along a 3° glidepath (tan 3° × 6076 ft/nm ≈ 318).
 const GLIDEPATH_FT_PER_NM: f64 = 318.0;
+/// Aim the glidepath at a touchdown point ~300 m (≈1,000 ft) PAST the threshold,
+/// so the path crosses the numbers at a standard ~50 ft threshold-crossing
+/// height and touches in the touchdown zone — not planted on the leading edge.
+/// The aim point was the threshold itself, so the 3° path targeted the runway
+/// EDGE at zero height (2026-07-24). Lateral tracking still anchors on the
+/// threshold — it's the same centreline, just a farther aim along it — and the
+/// flare still triggers off actual radio height, so it simply engages a little
+/// farther in, over the touchdown zone.
+const TOUCHDOWN_AIM_NM: f64 = 300.0 / M_PER_NM;
 /// Final approach point: intercept the extended centreline this far out (nm).
 const FAP_NM: f64 = 5.0;
 /// Airspeed this far below the approach speed triggers speed protection (nose
@@ -738,6 +765,8 @@ pub struct Guidance {
 /// Compute the approach guidance: steer to the final approach point then track the
 /// centreline, and descend the 3° glidepath. Pure — the control loop applies it via
 /// the autopilot. `flare_radio_ft` is the height above the runway to start the flare.
+/// `xtk_rate_nm_min` is the cross-track closure rate (positive = drifting right),
+/// 0.0 when unknown — the damping term on the final's centreline correction.
 #[allow(clippy::too_many_arguments)]
 pub fn guidance(
     cur_lat: f64,
@@ -749,12 +778,14 @@ pub fn guidance(
     rwy: &Runway,
     approach_ias: f64,
     flare_radio_ft: f64,
+    xtk_rate_nm_min: f64,
 ) -> Guidance {
     let dist_nm = haversine_nm(cur_lat, cur_lon, rwy.thr_lat, rwy.thr_lon);
     let recip = (rwy.course_deg + 180.0) % 360.0;
 
-    // 3° glidepath altitude at this distance (+ = we're above it).
-    let glidepath_alt_ft = rwy.elev_ft + dist_nm * GLIDEPATH_FT_PER_NM;
+    // 3° glidepath altitude at this distance (+ = we're above it). Aimed at the
+    // touchdown zone, so it crosses the threshold at ~50 ft, not zero.
+    let glidepath_alt_ft = rwy.elev_ft + (dist_nm + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
     let alt_err = cur_alt_ft - glidepath_alt_ft;
 
     // Above this much excess, we can't just dive onto the path — fly to the JOIN
@@ -788,8 +819,9 @@ pub fn guidance(
         } else {
             // Keep steering through the flare — locking the bare runway course
             // froze whatever offset the final still carried. Gentler clamp:
-            // no big heading swings a few feet off the ground.
-            let corr = (xtk * 80.0).clamp(-8.0, 8.0);
+            // no big heading swings a few feet off the ground. Rate-damped
+            // like the final, so a closing drift isn't chased into an S.
+            let corr = ((xtk + 0.2 * xtk_rate_nm_min) * 80.0).clamp(-8.0, 8.0);
             (ApproachPhase::Flare, (rwy.course_deg - corr + 360.0) % 360.0)
         }
     } else if past_threshold {
@@ -818,21 +850,36 @@ pub fn guidance(
         let (fap_lat, fap_lon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, FAP_NM);
         (ApproachPhase::Intercept, bearing_deg(cur_lat, cur_lon, fap_lat, fap_lon))
     } else {
-        // On final: track the runway course, corrected for lateral offset. The
-        // gain is per-nm of cross-track: at 8 the LXGB final entered 0.45 nm
-        // off and commanded all of 3.6° of cut — it crossed the threshold still
-        // ~120 m off the centreline (2026-07-14). 40°/nm was still a ~57 s
-        // decay constant: a final that joined 0.75 nm off arrived at the balk
-        // gate still 55 m right (2026-07-22). 80°/nm halves the decay to ~28 s
-        // and still commands only 1.6° at the 0.02 nm gate width.
-        let corr = (xtk * 80.0).clamp(-30.0, 30.0); // deg toward the centreline
+        // On final: PURSUE a point ON the centreline halfway to the threshold
+        // instead of P-correcting the offset. Offset-proportional gains kept
+        // failing by geometry: 80°/nm commanded all of 7° of cut at 0.09 nm
+        // off — mathematically unable to centre in the distance remaining,
+        // and the aircraft crossed 150 ft still 145 m left (2026-07-24; same
+        // family as the 120 m/2026-07-14 and 55 m/2026-07-22 misses at lower
+        // gains). Aiming at the centreline point makes the cut DISTANCE-
+        // aware: atan(offset / distance-to-aim) — gentle far out, up to a
+        // 35° intercept when close and offset, rolling out on the line as
+        // the pursuit point recedes.
+        // Inside ~550 m the halfway aim point would fall BEHIND the aircraft
+        // (the 0.25 nm floor exceeded the distance) and the bearing flipped
+        // the cut ±35° at 100 ft over the numbers (2026-07-24). Short final
+        // uses small course-referenced corrections only — offsets there are
+        // either small or the balk gate's problem.
+        let cut = if dist_nm > 0.30 {
+            let aim_nm = (dist_nm * 0.5).clamp(0.15, 2.0);
+            let (alat, alon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, aim_nm);
+            let brg = bearing_deg(cur_lat, cur_lon, alat, alon);
+            ((brg - rwy.course_deg + 540.0).rem_euclid(360.0) - 180.0).clamp(-35.0, 35.0)
+        } else {
+            (-xtk * 80.0).clamp(-8.0, 8.0)
+        };
         if radio_alt_ft < 100.0 && dist_nm < 0.6 && xtk.abs() > FLARE_MAX_XTK_NM {
             // Not going to make the pavement: balk NOW, with height to work
             // with. The 22 ft flare-gate balk arrested nothing — the aircraft
             // still skimmed the ground at 91 kt before climbing (2026-07-22).
             (ApproachPhase::Intercept, rwy.course_deg)
         } else {
-            (ApproachPhase::Final, (rwy.course_deg - corr + 360.0) % 360.0)
+            (ApproachPhase::Final, (rwy.course_deg + cut).rem_euclid(360.0))
         }
     };
 
@@ -953,7 +1000,7 @@ mod tests {
         // Place it 8 nm NORTH of a north-landing runway (past the field, departure
         // side): the command must steer SOUTH toward the FAP, not north on course.
         let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 8.0); // 8 nm north, past the threshold
-        let g = guidance(lat, lon, 2000.0, 2000.0, 90.0, 90.0, &rwy_north(), 90.0, 20.0);
+        let g = guidance(lat, lon, 2000.0, 2000.0, 90.0, 90.0, &rwy_north(), 90.0, 20.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Intercept);
         // FAP is 5 nm SOUTH of the threshold; from 8 nm north that's ~due south.
         assert!(heading_diff(g.target_heading_deg, 180.0) < 20.0,
@@ -967,13 +1014,13 @@ mod tests {
         // slow, the guidance must now command a DESCENT to regain speed, not a level
         // hold. 5 nm south, well below the path, 55 kt against a 90 kt approach.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 5.0);
-        let g = guidance(lat, lon, 200.0, 200.0, 55.0, 55.0, &rwy_north(), 90.0, 20.0);
+        let g = guidance(lat, lon, 200.0, 200.0, 55.0, 55.0, &rwy_north(), 90.0, 20.0, 0.0);
         assert!(g.target_vs_fpm < -100.0, "slow + below path must descend, got {}", g.target_vs_fpm);
         // On speed at the same spot, it holds level to wait for the path (no dive).
-        let g_ok = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 20.0);
+        let g_ok = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 20.0, 0.0);
         assert_eq!(g_ok.target_vs_fpm, 0.0, "on speed below path → level hold");
         // Speed protection never fights the flare (we WANT to slow down landing).
-        let g_flare = guidance(0.001, 0.0, 30.0, 15.0, 40.0, 40.0, &rwy_north(), 90.0, 20.0);
+        let g_flare = guidance(0.001, 0.0, 30.0, 15.0, 40.0, 40.0, &rwy_north(), 90.0, 20.0, 0.0);
         assert_eq!(g_flare.phase, ApproachPhase::Flare);
         assert!(g_flare.target_vs_fpm > -200.0, "flare not overridden by speed floor");
     }
@@ -987,14 +1034,14 @@ mod tests {
         // distance so the bug applied. It must now go around: phase Intercept,
         // steering SOUTH back toward the FAP, not north on the runway course.
         let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.5); // 0.5 nm north, past the threshold
-        let g = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0);
+        let g = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Intercept, "past the threshold → go around");
         assert!(heading_diff(g.target_heading_deg, 180.0) < 25.0,
             "must turn back toward the FAP, got hdg {}", g.target_heading_deg);
         // Sanity: a mirror point 0.5 nm SHORT of the threshold (approach side) is a
         // normal final, not a go-around.
         let (slat, slon) = project_latlon(0.0, 0.0, 180.0, 0.5);
-        let g_final = guidance(slat, slon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0);
+        let g_final = guidance(slat, slon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert_ne!(g_final.phase, ApproachPhase::Intercept, "short of the threshold is not a go-around");
     }
 
@@ -1005,14 +1052,14 @@ mod tests {
         // 500 ft floor), on the approach side.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 3.0);
         // FAST (approach + 10): surplus energy → bounded climb away from terrain.
-        let g_fast = guidance(lat, lon, 200.0, 200.0, 100.0, 100.0, &rwy_north(), 90.0, 25.0);
+        let g_fast = guidance(lat, lon, 200.0, 200.0, 100.0, 100.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert!(g_fast.target_vs_fpm > 0.0, "below the floor + fast → climb, got {}", g_fast.target_vs_fpm);
         assert!(g_fast.target_vs_fpm <= MAX_CLIMB_FPM, "climb is bounded, got {}", g_fast.target_vs_fpm);
         // And it asks the throttle for extra speed to sustain the climb.
         assert!(g_fast.target_ias_kts > 90.0, "climb raises the speed target, got {}", g_fast.target_ias_kts);
         // ON SPEED (no surplus): must NOT climb — hold level and let the governor
         // rebuild speed first (climbing slow would stall).
-        let g_slow = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0);
+        let g_slow = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert_eq!(g_slow.target_vs_fpm, 0.0, "below the floor but no surplus → level, got {}", g_slow.target_vs_fpm);
     }
 
@@ -1022,7 +1069,7 @@ mod tests {
         // 0.5 nm short of the threshold, 200 ft AGL, fast: no climb (inside the
         // floor-enforcement range).
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 0.5);
-        let g = guidance(lat, lon, 200.0, 200.0, 100.0, 100.0, &rwy_north(), 90.0, 25.0);
+        let g = guidance(lat, lon, 200.0, 200.0, 100.0, 100.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert!(g.target_vs_fpm <= 0.0, "no climb on short final, got {}", g.target_vs_fpm);
         assert_eq!(g.target_ias_kts, 90.0, "no climb-energy bonus on short final");
     }
@@ -1035,13 +1082,14 @@ mod tests {
         // at the numbers, guaranteed go-around at every flat field. On path
         // with low radio IS the approach: keep descending, no speed bonus.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 1.3);
-        let on_path = 1.3 * GLIDEPATH_FT_PER_NM; // ~413 ft — below the 500 floor
-        let g = guidance(lat, lon, on_path, on_path, 90.0, 90.0, &rwy_north(), 90.0, 25.0);
+        // On the TDZ-aimed path at 1.3 nm (~465 ft) — still below the 500 floor.
+        let on_path = (1.3 + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
+        let g = guidance(lat, lon, on_path, on_path, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Final);
         assert!(g.target_vs_fpm < -300.0, "on path must keep descending, got {}", g.target_vs_fpm);
         assert_eq!(g.target_ias_kts, 90.0, "no climb-energy bonus on an on-path final");
         // Deeply below the path at the same distance: the floor still stands.
-        let g_low = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0);
+        let g_low = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert_eq!(g_low.target_vs_fpm, 0.0, "dragged-in-low keeps the floor, got {}", g_low.target_vs_fpm);
     }
 
@@ -1054,18 +1102,18 @@ mod tests {
         // straight ahead), never a touchdown.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 0.15);
         let off = lon + 0.10 / 60.0; // 0.10 nm right of the centreline
-        let g = guidance(lat, off, 20.0, 20.0, 80.0, 80.0, &rwy_north(), 90.0, 25.0);
+        let g = guidance(lat, off, 20.0, 20.0, 80.0, 80.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Intercept, "off the pavement at 20 ft = balk");
         // ...and the balk fires EARLY, from final at 80 ft — the 22 ft balk
         // still skimmed the ground at 91 kt (2026-07-22).
         let (hlat, hlon) = project_latlon(0.0, 0.0, 180.0, 0.4);
         let hoff = hlon + 0.05 / 60.0;
-        let g_early = guidance(hlat, hoff, 80.0, 80.0, 85.0, 85.0, &rwy_north(), 90.0, 25.0);
+        let g_early = guidance(hlat, hoff, 80.0, 80.0, 85.0, 85.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert_eq!(g_early.phase, ApproachPhase::Intercept, "off-centreline at 80 ft = balk");
         // On the centreline the flare still fires, and a small offset keeps a
         // gentle correction instead of locking the bare course.
         let near = lon + 0.01 / 60.0;
-        let g_ok = guidance(lat, near, 20.0, 20.0, 80.0, 80.0, &rwy_north(), 90.0, 25.0);
+        let g_ok = guidance(lat, near, 20.0, 20.0, 80.0, 80.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert_eq!(g_ok.phase, ApproachPhase::Flare);
         let cut = ((rwy_north().course_deg - g_ok.target_heading_deg + 540.0) % 360.0) - 180.0;
         assert!(cut > 0.1 && cut <= 8.0, "flare keeps a bounded correction, got {cut}");
@@ -1080,10 +1128,10 @@ mod tests {
         // hold at ANY distance: climb with surplus energy, level without — never
         // a glidepath descent.
         let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.7); // 0.7 nm PAST a north-landing threshold
-        let g_fast = guidance(lat, lon, 300.0, 300.0, 100.0, 100.0, &rwy_north(), 90.0, 25.0);
+        let g_fast = guidance(lat, lon, 300.0, 300.0, 100.0, 100.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert_eq!(g_fast.phase, ApproachPhase::Intercept);
         assert!(g_fast.target_vs_fpm > 0.0, "repositioning low + fast → climb, got {}", g_fast.target_vs_fpm);
-        let g_slow = guidance(lat, lon, 300.0, 300.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0);
+        let g_slow = guidance(lat, lon, 300.0, 300.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert_eq!(g_slow.phase, ApproachPhase::Intercept);
         assert_eq!(g_slow.target_vs_fpm, 0.0, "repositioning low + no surplus → level, got {}", g_slow.target_vs_fpm);
     }
@@ -1139,14 +1187,14 @@ mod tests {
         // 3 nm south (on final), 0.45 nm EAST (right) of the centreline.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 3.0);
         let east = lon + 0.45 / 60.0;
-        let g = guidance(lat, east, 900.0, 900.0, 90.0, 90.0, &rwy, 90.0, 20.0);
+        let g = guidance(lat, east, 900.0, 900.0, 90.0, 90.0, &rwy, 90.0, 20.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Final);
         // Right of course → cut LEFT (west of north): 0.45 × 40 clamps to 30.
         let cut = ((rwy.course_deg - g.target_heading_deg + 540.0) % 360.0) - 180.0;
         assert!(cut > 15.0, "0.45 nm off must earn a real cut, got {cut}");
         // Nearly on the centreline: gentle.
         let near = lon + 0.03 / 60.0;
-        let g2 = guidance(lat, near, 900.0, 900.0, 90.0, 90.0, &rwy, 90.0, 20.0);
+        let g2 = guidance(lat, near, 900.0, 900.0, 90.0, 90.0, &rwy, 90.0, 20.0, 0.0);
         let cut2 = ((rwy.course_deg - g2.target_heading_deg + 540.0) % 360.0) - 180.0;
         assert!(cut2.abs() < 5.0, "small offset stays gentle, got {cut2}");
     }
@@ -1155,7 +1203,7 @@ mod tests {
     fn glidepath_descends_toward_the_threshold() {
         // 5 nm south of the threshold at 2000 ft, 120 kt groundspeed, tracking north.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 5.0); // 5 nm south
-        let g = guidance(lat, lon, 2000.0, 2000.0, 120.0, 90.0, &rwy_north(), 90.0, 20.0);
+        let g = guidance(lat, lon, 2000.0, 2000.0, 120.0, 90.0, &rwy_north(), 90.0, 20.0, 0.0);
         assert!((g.dist_nm - 5.0).abs() < 0.2, "5 nm out, got {}", g.dist_nm);
         // Glidepath alt at 5 nm ≈ 1590 ft; we're above it → commanded to descend.
         assert!(g.glidepath_alt_ft > 1400.0 && g.glidepath_alt_ft < 1700.0);
@@ -1171,7 +1219,7 @@ mod tests {
         // AWAY from the runway (toward the join point down the extended
         // centreline) and descend.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 6.0); // 6 nm south
-        let g = guidance(lat, lon, 7000.0, 7000.0, 135.0, 110.0, &rwy_north(), 110.0, 20.0);
+        let g = guidance(lat, lon, 7000.0, 7000.0, 135.0, 110.0, &rwy_north(), 110.0, 20.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Intercept);
         // Runway is north (bearing ~0); the join point is further SOUTH — so the
         // commanded heading must be southbound, not at the runway.
@@ -1182,7 +1230,7 @@ mod tests {
 
     #[test]
     fn flare_near_the_ground_arrests_descent_and_tracks_runway() {
-        let g = guidance(0.001, 0.0, 30.0, 15.0, 100.0, 90.0, &rwy_north(), 90.0, 20.0);
+        let g = guidance(0.001, 0.0, 30.0, 15.0, 100.0, 90.0, &rwy_north(), 90.0, 20.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Flare);
         assert!(g.target_vs_fpm > -200.0, "flare eases the descent, got {}", g.target_vs_fpm);
         assert!(heading_diff(g.target_heading_deg, 0.0) < 1.0, "flare tracks the runway");
@@ -1193,12 +1241,64 @@ mod tests {
         // The LEMI failure: 7 ft AGL over rising terrain 4.1 nm out — the old
         // radio-only trigger "flared" (power to idle, vs -100) into open ground.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 4.1); // 4.1 nm south
-        let g = guidance(lat, lon, 900.0, 7.0, 130.0, 90.0, &rwy_north(), 90.0, 25.0);
+        let g = guidance(lat, lon, 900.0, 7.0, 130.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert_ne!(g.phase, ApproachPhase::Flare, "no flare 4 nm from the threshold");
         // And the same low radio just short of the threshold IS the flare.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 0.1);
-        let g = guidance(lat, lon, 25.0, 15.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0);
+        let g = guidance(lat, lon, 25.0, 15.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Flare);
+    }
+
+    #[test]
+    fn final_pursuit_cut_scales_with_distance_remaining() {
+        // 0.2 nm RIGHT of the centreline. The cut toward the line must be
+        // DISTANCE-aware: modest 3 nm out, aggressive at 0.8 nm — the fixed
+        // per-nm gain commanded 7° at 150 ft with 145 m to close and the
+        // aircraft crossed short final diagonal (2026-07-24).
+        let cut = |g: &Guidance| ((g.target_heading_deg - 0.0 + 540.0).rem_euclid(360.0)) - 180.0;
+        let at = |d_nm: f64| {
+            let (lat, lon) = project_latlon(0.0, 0.0, 180.0, d_nm);
+            let east = (lat, lon + 0.2 / 60.0);
+            let on_path = (d_nm + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
+            guidance(east.0, east.1, on_path, on_path, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0)
+        };
+        let far = at(3.0);
+        let close = at(0.8);
+        // Offset RIGHT of a north course → cut LEFT (negative).
+        assert!(cut(&far) < -2.0, "far cut leftward: {:.1}", cut(&far));
+        assert!(cut(&close) < cut(&far) - 8.0,
+            "close-in cut much harder: far {:.1} vs close {:.1}", cut(&far), cut(&close));
+        // And clamped — never a base-turn-sized swing on final.
+        assert!(cut(&close) >= -35.5);
+        // On the centreline: no cut either distance.
+        let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 1.5);
+        let on_path = (1.5 + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
+        let g = guidance(lat, lon, on_path, on_path, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
+        assert!(cut(&g).abs() < 1.5, "centred: {:.1}", cut(&g));
+        // SHORT final (inside the 0.3 nm pursuit floor), small offset (a big
+        // one is the balk gate's problem): tiny corrections only — the
+        // halfway aim fell BEHIND the aircraft at 0.06 nm and the command
+        // thrashed ±35° at 100 ft over the numbers (2026-07-24).
+        let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 0.06);
+        let near = (lat, lon + 0.015 / 60.0); // ~28 m right
+        let on_path = (0.06 + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
+        let over = guidance(near.0, near.1, on_path, on_path, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
+        assert!(cut(&over).abs() <= 8.5, "no thrash over the numbers: {:.1}", cut(&over));
+        assert!(cut(&over) < -0.5, "still corrects toward the centreline: {:.1}", cut(&over));
+    }
+
+    #[test]
+    fn glidepath_aims_at_the_touchdown_zone_not_the_threshold_edge() {
+        // On the extended centreline 3 nm out, established: the commanded
+        // glidepath altitude must be the 3° path aimed ~300 m PAST the threshold,
+        // so it crosses the numbers at ~50 ft, not zero.
+        let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 3.0); // 3 nm south of thr
+        let g = guidance(lat, lon, 1000.0, 1000.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
+        let expected = (3.0 + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
+        assert!((g.glidepath_alt_ft - expected).abs() < 1.0, "gp {} vs {expected}", g.glidepath_alt_ft);
+        // Threshold-crossing height ~50 ft (the aim offset × slope), not 0.
+        let tch = TOUCHDOWN_AIM_NM * GLIDEPATH_FT_PER_NM;
+        assert!((45.0..=55.0).contains(&tch), "TCH ~50 ft, was {tch}");
     }
 
     #[test]

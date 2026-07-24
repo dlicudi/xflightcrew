@@ -579,6 +579,7 @@ impl Station {
                     via: spoken_via(&r.via).join(", "),
                     seg: r.seg.clone(),
                     holding_point: r.holding_point.clone(),
+                    lead_on: r.lead_on.clone(),
                 });
         }
         // A takeoff request answered with anything SHORT of the clearance —
@@ -1505,6 +1506,7 @@ pub fn compliance_tick(
                             via: via.clone(),
                             seg: r.seg.clone(),
                             holding_point: r.holding_point.clone(),
+                            lead_on: r.lead_on.clone(),
                         });
                     format!(
                         "{callsign}, you appear to be off the cleared taxi route. \
@@ -3239,6 +3241,11 @@ pub struct TaxiWatch {
     pub seg: Vec<(String, bool)>,
     /// RAW holding-point taxiway name ("A13"), the route's destination.
     pub holding_point: String,
+    /// The authored lead-on the hold-short trim removed: the painted line from
+    /// the holding point onto the runway centreline. The crew's line-up drives
+    /// it instead of a synthetic diagonal. Empty when the route ends at a
+    /// genuine off-runway node.
+    pub lead_on: Vec<(f64, f64)>,
 }
 
 /// The active field's ILS facilities (earth_nav.dat) and per-runway platform
@@ -3876,14 +3883,24 @@ pub async fn nearest_traffic_factor(xp: SimView<'_>) -> Option<TrafficFactor> {
         .get_float_array("sim/cockpit2/tcas/indicators/relative_altitude_mtrs")
         .await
         .ok()?;
-    // Slot 0 is own ship; live targets have a real distance.
-    let (d, b, a) = dist
-        .iter()
-        .zip(&bear)
-        .zip(&alt)
-        .skip(1)
-        .filter(|((d, _), _)| **d > 1.0)
-        .map(|((d, b), a)| (*d, *b, *a))
+    // Weight-on-wheels, same slot indexing as the indicator arrays: used to drop
+    // ground traffic. Optional — an empty read fails open (announce), since the
+    // ±1,500 ft gate already excludes ground targets when we're up at altitude.
+    let wow = xp.get_float_array(datarefs::TCAS_WOW).await.unwrap_or_default();
+    select_traffic_factor(&dist, &bear, &alt, &wow)
+}
+
+/// Pick the nearest airborne factor from the parallel TCAS indicator arrays.
+/// Slot 0 is own ship. A target with weight on wheels is SKIPPED — a parked or
+/// taxiing aircraft at the field sits within 6 nm and (from pattern height)
+/// ±1,500 ft, and was being called "traffic, three o'clock, same altitude" on
+/// the ramp (2026-07-24). Pure, so the ground filter is unit-tested.
+fn select_traffic_factor(dist: &[f64], bear: &[f64], alt: &[f64], wow: &[f64]) -> Option<TrafficFactor> {
+    let (d, b, a) = (1..dist.len())
+        .filter(|&i| dist[i] > 1.0)
+        // On the ground = not an airborne factor. Fail open when unfed.
+        .filter(|&i| wow.get(i).is_none_or(|w| *w < 0.5))
+        .map(|i| (dist[i], *bear.get(i).unwrap_or(&0.0), *alt.get(i).unwrap_or(&0.0)))
         .filter(|(d, _, a)| *d < 6.0 * 1852.0 && a.abs() < 1500.0 / 3.28084)
         .min_by(|x, y| x.0.total_cmp(&y.0))?;
     let clock = match (((b + 15.0).rem_euclid(360.0)) / 30.0) as i32 {
@@ -4201,6 +4218,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn traffic_advisory_skips_ground_targets() {
+        // Slot 0 = own ship. Two targets both 2 nm off at same altitude: slot 1
+        // is on the ground (weight on wheels), slot 2 airborne and slightly
+        // farther. The advisory must factor the AIRBORNE one, never the parked
+        // aircraft on the ramp (the 2026-07-24 bug).
+        let two_nm = 2.0 * 1852.0;
+        let dist = vec![0.0, two_nm, two_nm + 200.0];
+        let bear = vec![0.0, 90.0, 180.0];
+        let alt = vec![0.0, 0.0, 0.0];
+        let wow = vec![0.0, 1.0, 0.0]; // slot 1 on the ground
+        let f = select_traffic_factor(&dist, &bear, &alt, &wow).expect("an airborne factor");
+        assert_eq!(f.clock, 6, "the airborne target at 180°, not the ground one at 90°");
+
+        // ONLY a ground target in range → no advisory at all.
+        let f = select_traffic_factor(&[0.0, two_nm], &[0.0, 90.0], &[0.0, 0.0], &[0.0, 1.0]);
+        assert!(f.is_none(), "a lone ground target is not a factor");
+
+        // No WOW feed → fail open (announce), so traffic isn't silently lost.
+        let f = select_traffic_factor(&[0.0, two_nm], &[0.0, 90.0], &[0.0, 0.0], &[]);
+        assert!(f.is_some(), "unfed WOW announces rather than suppressing");
+    }
+
+    #[test]
     fn discrete_squawks_are_valid_and_deterministic() {
         for cs in ["November one seven two Sierra Papa", "G-ABCD", "x"] {
             let code = discrete_squawk(cs);
@@ -4444,6 +4484,7 @@ mod tests {
             via: "Alpha".into(),
             seg: vec![("09/27".into(), true), ("A".into(), false)],
             holding_point: "A1".into(),
+            lead_on: vec![],
         });
         let t0 = Instant::now();
         let sec = std::time::Duration::from_secs;
@@ -4497,6 +4538,7 @@ mod tests {
             holding_point: "A1".into(),
             path: vec![(36.1490, -5.3420), (36.1530, -5.3420), (36.1540, -5.3420)],
             seg: vec![(String::new(), true), ("A".into(), false)],
+            lead_on: vec![],
         };
         mark_runway_crossings(&mut plan, &runways);
         assert_eq!(plan.crossings, vec!["09/27".to_string()]);
@@ -4515,6 +4557,7 @@ mod tests {
             holding_point: "A1".into(),
             path: vec![(36.1490, -5.3420), (36.1530, -5.3420), (36.1540, -5.3420)],
             seg: vec![("N7".into(), false), ("A".into(), false)],
+            lead_on: vec![],
         };
         mark_runway_crossings(&mut taxiway_authored, &runways);
         assert_eq!(taxiway_authored.crossings, vec!["09/27".to_string()]);
@@ -4527,6 +4570,7 @@ mod tests {
             holding_point: "A1".into(),
             path: vec![(36.1490, -5.3420), (36.1512, -5.3420)],
             seg: vec![("A".into(), false)],
+            lead_on: vec![],
         };
         mark_runway_crossings(&mut final_leg, &runways);
         assert!(final_leg.crossings.is_empty(), "{:?}", final_leg.crossings);
@@ -4537,6 +4581,7 @@ mod tests {
             holding_point: "A1".into(),
             path: vec![(36.1490, -5.3420), (36.1505, -5.3420)],
             seg: vec![(String::new(), false)],
+            lead_on: vec![],
         };
         mark_runway_crossings(&mut clear, &runways);
         assert!(clear.crossings.is_empty());
@@ -4583,6 +4628,7 @@ mod tests {
             via: "Alpha, Hotel one".into(),
             seg: vec![("A".into(), false), ("A".into(), false), ("H1".into(), false)],
             holding_point: "H1".into(),
+            lead_on: vec![],
         });
         let t0 = Instant::now();
 
@@ -5177,6 +5223,7 @@ mod tests {
             via: "Alpha".into(),
             seg: vec![("A".into(), false)],
             holding_point: "A1".into(),
+            lead_on: vec![],
         });
         let s = call(suggest_call(cs, true, Some(0.5), None).unwrap());
         assert!(s.contains("holding point Alpha one"), "{s}");
@@ -6185,6 +6232,7 @@ mod tests {
             via: "Alpha, Bravo".into(),
             seg: vec![("A".into(), false)],
             holding_point: "A1".into(),
+            lead_on: vec![],
         });
         let t0 = Instant::now();
         let sec = std::time::Duration::from_secs;

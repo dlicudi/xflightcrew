@@ -286,6 +286,11 @@ impl Tool for LineUp {
         // Full-length check: the POH roll with the takeoff tool's 1.4
         // margin, floored at the plain line-up's own minimum.
         let needed_m = self.takeoff_roll_m.map_or(400.0, |m| (m * 1.4).max(400.0));
+        // The cleared route's trimmed tail — the authored yellow lead-on from
+        // the hold onto the centreline. The line-up drives it when it's ours.
+        let lead_on = party_line::with_taxi_route(|r| {
+            r.map(|w| w.lead_on.clone()).unwrap_or_default()
+        });
         let Some((rwy, plan)) = autotaxi::pick_line_up_plan(
             &cands,
             lat,
@@ -294,6 +299,7 @@ impl Tool for LineUp {
             needed_m,
             force_backtrack,
             heading,
+            (!lead_on.is_empty()).then_some(&lead_on[..]),
         ) else {
             return Ok(match cleared {
                 Some(c) => format!(
@@ -308,11 +314,24 @@ impl Tool for LineUp {
             autotaxi::LineUpPlan::Plain(p) => (p, false),
             autotaxi::LineUpPlan::Backtrack(p) => (p, true),
         };
+        // Which maneuver got built, in the blackbox — a synthetic diagonal is
+        // 3 points, a lead-on ride with its fillet arc is 7+; the "not
+        // following the yellow line" reports were undiagnosable without this
+        // (2026-07-24).
+        crate::blackbox::record(
+            "autotaxi",
+            serde_json::json!({
+                "event": "line_up_path", "pts": path.len(),
+                "lead_on_pts": lead_on.len(), "backtracking": backtracking,
+                "runway": rwy.id,
+            }),
+        );
         let watch = crate::station::TaxiWatch {
             path,
             via: String::new(),
             seg: Vec::new(),
             holding_point: String::new(),
+            lead_on: Vec::new(),
         };
         let Some(mut route) = autotaxi::Route::build(&watch) else {
             return Ok("We're basically on the runway already. Roll forward a touch and we're lined up."

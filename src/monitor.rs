@@ -1794,13 +1794,13 @@ pub async fn run(
                     gyro_sync_last = Some(now);
                     if xp.run_command("sim/instruments/DG_sync_mag").await.is_ok() {
                         let line = gyro_sync_line(snap.gyro_drift_deg);
-                        if let Some(s) = status.as_ref() {
-                            s.action(&line);
-                        }
                         crate::blackbox::record(
                             "gyro_sync",
                             serde_json::json!({ "drift_deg": r1(snap.gyro_drift_deg) }),
                         );
+                        // `voice.alert` mirrors to the panel; an explicit
+                        // `s.action(&line)` here too double-wrote the line to the
+                        // chat (2026-07-24).
                         voice.alert(Priority::Advisory, line);
                     }
                 }
@@ -2233,9 +2233,9 @@ pub async fn run(
                         }),
                     );
                     if sw.crew {
-                        if let Some(s) = status.as_ref() {
-                            s.action(&sw.line);
-                        }
+                        // `voice.alert` mirrors to the panel; an explicit
+                        // `s.action(&sw.line)` here too double-wrote the line
+                        // to the chat (the Jerez relocation note, 2026-07-24).
                         voice.alert(Priority::Advisory, sw.line);
                     } else {
                         if let Some(s) = status.as_ref() {

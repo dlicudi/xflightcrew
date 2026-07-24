@@ -10,7 +10,9 @@
 #include <cstring>
 
 #include "XPLMDataAccess.h"
+#include "XPLMGraphics.h"
 #include "XPLMProcessing.h"
+#include "XPLMScenery.h"
 #include "XPLMUtilities.h"
 
 #include "fms.h"
@@ -239,6 +241,27 @@ static float g_pitch_axis_baseline = 0.5f;
 static int g_pitch_engage_frames = 0;
 static int g_pitch_deflect_frames = 0;
 
+// Terrain probe mailbox — the app's terrain eyes, and the generic answer to
+// "how does the copilot know where the Rock is": it asks the sim. The app
+// writes "lat,lon|lat,lon|..." to xcopilot/terrain/query; the next flight
+// loop probes each point (XPLMProbeTerrainXYZ) and publishes ground
+// elevations, meters MSL, in xcopilot/terrain/elev_m, bumping
+// xcopilot/terrain/gen so the app knows the answer is fresh. Query capacity
+// is one TextRef (511 bytes ≈ 24 points) — enough for a full pattern
+// polyline per query. Only the app writes the query; probing runs in the
+// flight loop, never in the accessor (the Web API thread must not touch
+// scenery).
+static XPLMDataRef g_terrain_query_dref = nullptr;
+static XPLMDataRef g_terrain_elev_dref = nullptr;
+static XPLMDataRef g_terrain_gen_dref = nullptr;
+static TextRef g_terrain_query;
+static const int kTerrainMaxPts = 32;
+static float g_terrain_elev[kTerrainMaxPts];
+static int g_terrain_n = 0;
+static int g_terrain_gen = 0;
+static bool g_terrain_pending = false;
+static XPLMProbeRef g_terrain_probe = nullptr;
+
 // And the ailerons (xcopilot/roll → yoke_roll_ratio under
 // override_joystick_roll): between liftoff and the AP taking the climb,
 // nobody else holds the wings against full-power torque.
@@ -362,6 +385,21 @@ static void WriteTaxiSteer(void*, float v) {
     g_taxi_steer_stamp = XPLMGetElapsedTime();
 }
 static int ReadSteerYield(void*) { return g_steer_yield; }
+// Terrain mailbox accessors: the write only stores + flags; the probing
+// itself happens in the flight loop.
+static void WriteTerrainQuery(void*, void* in, int offset, int len) {
+    StoreText(&g_terrain_query, in, offset, len);
+    g_terrain_pending = g_terrain_query.len > 0;
+}
+static int ReadTerrainElev(void*, float* out, int offset, int max) {
+    if (!out) return g_terrain_n;
+    if (offset >= g_terrain_n) return 0;
+    int n = g_terrain_n - offset;
+    if (n > max) n = max;
+    std::memcpy(out, g_terrain_elev + offset, static_cast<size_t>(n) * sizeof(float));
+    return n;
+}
+static int ReadTerrainGen(void*) { return g_terrain_gen; }
 static float ReadPitch(void*) { return g_pitch; }
 static void WritePitch(void*, float v) {
     g_pitch = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
@@ -400,6 +438,41 @@ static float roll_axis_value() {
 }
 
 static float TaxiAssistLoop(float, float, int, void*) {
+    // A pending terrain query: probe every point this frame and publish.
+    // Scenery access is flight-loop-only, which is why the accessor merely
+    // flagged it. Points a pattern-radius from the aircraft are always inside
+    // the loaded scenery region; a probe miss publishes 0 (sea level).
+    if (g_terrain_pending) {
+        g_terrain_pending = false;
+        if (g_terrain_probe == nullptr) g_terrain_probe = XPLMCreateProbe(xplm_ProbeY);
+        char buf[sizeof g_terrain_query.buf];
+        std::memcpy(buf, g_terrain_query.buf, sizeof buf);
+        int n = 0;
+        char* save = nullptr;
+        for (char* tok = strtok_r(buf, "|", &save); tok && n < kTerrainMaxPts;
+             tok = strtok_r(nullptr, "|", &save)) {
+            double lat = 0.0, lon = 0.0;
+            if (std::sscanf(tok, "%lf,%lf", &lat, &lon) != 2) continue;
+            double x = 0.0, y = 0.0, z = 0.0;
+            XPLMWorldToLocal(lat, lon, 0.0, &x, &y, &z);
+            XPLMProbeInfo_t info;
+            info.structSize = sizeof info;
+            float elev_m = 0.0f;
+            if (g_terrain_probe
+                && XPLMProbeTerrainXYZ(g_terrain_probe, static_cast<float>(x),
+                                       static_cast<float>(y), static_cast<float>(z),
+                                       &info) == xplm_ProbeHitTerrain) {
+                double plat = 0.0, plon = 0.0, palt = 0.0;
+                XPLMLocalToWorld(info.locationX, info.locationY, info.locationZ,
+                                 &plat, &plon, &palt);
+                elev_m = static_cast<float>(palt);
+            }
+            g_terrain_elev[n++] = elev_m;
+        }
+        g_terrain_n = n;
+        g_terrain_gen++;
+    }
+
     const bool fresh = g_taxi_brake_stamp >= 0.0f
         && XPLMGetElapsedTime() - g_taxi_brake_stamp <= kTaxiBrakeFreshSecs;
     if (fresh && g_taxi_brake > 0.0f) {
@@ -771,6 +844,19 @@ void start() {
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     g_yoke_pitch = XPLMFindDataRef("sim/cockpit2/controls/yoke_pitch_ratio");
     g_override_pitch = XPLMFindDataRef("sim/operation/override/override_joystick_pitch");
+    g_terrain_query_dref = XPLMRegisterDataAccessor(
+        "xcopilot/terrain/query", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteTerrainQuery,
+        &g_terrain_query, &g_terrain_query);
+    g_terrain_elev_dref = XPLMRegisterDataAccessor(
+        "xcopilot/terrain/elev_m", xplmType_FloatArray, 0,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, ReadTerrainElev, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_terrain_gen_dref = XPLMRegisterDataAccessor(
+        "xcopilot/terrain/gen", xplmType_Int, 0,
+        ReadTerrainGen, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     g_roll_dref = XPLMRegisterDataAccessor(
         "xcopilot/roll", xplmType_Float, 1,
         nullptr, nullptr, ReadRoll, WriteRoll, nullptr, nullptr,
@@ -820,6 +906,10 @@ void stop_first() {
     if (g_steer_yield_dref) { XPLMUnregisterDataAccessor(g_steer_yield_dref); g_steer_yield_dref = nullptr; }
     if (g_pitch_dref) { XPLMUnregisterDataAccessor(g_pitch_dref); g_pitch_dref = nullptr; }
     if (g_pitch_yield_dref) { XPLMUnregisterDataAccessor(g_pitch_yield_dref); g_pitch_yield_dref = nullptr; }
+    if (g_terrain_query_dref) { XPLMUnregisterDataAccessor(g_terrain_query_dref); g_terrain_query_dref = nullptr; }
+    if (g_terrain_elev_dref) { XPLMUnregisterDataAccessor(g_terrain_elev_dref); g_terrain_elev_dref = nullptr; }
+    if (g_terrain_gen_dref) { XPLMUnregisterDataAccessor(g_terrain_gen_dref); g_terrain_gen_dref = nullptr; }
+    if (g_terrain_probe) { XPLMDestroyProbe(g_terrain_probe); g_terrain_probe = nullptr; }
     if (g_roll_dref) { XPLMUnregisterDataAccessor(g_roll_dref); g_roll_dref = nullptr; }
     if (g_roll_yield_dref) { XPLMUnregisterDataAccessor(g_roll_yield_dref); g_roll_yield_dref = nullptr; }
     if (g_taxi_brake_dref) { XPLMUnregisterDataAccessor(g_taxi_brake_dref); g_taxi_brake_dref = nullptr; }

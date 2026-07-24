@@ -26,6 +26,7 @@ pub mod ground;
 pub mod instruments;
 pub mod lights;
 pub mod power;
+pub mod procedure;
 pub mod prop;
 pub mod radio;
 pub mod recover;
@@ -257,6 +258,14 @@ impl Registry {
                 retract_gear: profile.retractable_gear,
                 takeoff_roll_m,
                 approach_ias,
+            }));
+            // Fly a REAL published SID / instrument approach from the sim's CIFP —
+            // the terrain-safe path where the circuit only guessed. Shares the AP
+            // and the autoland approach speed; hands the final to autoland.
+            tools.push(Box::new(procedure::FlyProcedure {
+                cfg: ap.clone(),
+                approach_ias,
+                vy_kts: vy,
             }));
             // Full auto — the whole flight from cold: power up, start engine,
             // request taxi, drive to the runway, line up, and fly the circuit.

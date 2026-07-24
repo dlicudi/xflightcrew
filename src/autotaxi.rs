@@ -376,6 +376,91 @@ fn roll_forward_entry_m(course_deg: f64, a0: f64, x0: f64, heading_deg: Option<f
     (entry >= 0.0).then_some(entry)
 }
 
+/// A line-up riding the AUTHORED lead-on: the trimmed tail of the cleared taxi
+/// route — the painted yellow line from the holding point onto the runway
+/// centreline — instead of a synthetic diagonal (the aircraft cut the Echo
+/// stub's curve and stopped crooked, LXGB 2026-07-24). Returns the path and
+/// its centreline stop (m past the threshold). `None` when the lead-on isn't
+/// THIS hold or THIS runway: it must start near the aircraft and end on the
+/// centreline with runway enough beyond the stop.
+pub fn line_up_path_from_lead_on(
+    rwy: &crate::autoland::Runway,
+    lat: f64,
+    lon: f64,
+    lead_on: &[(f64, f64)],
+) -> Option<(Vec<(f64, f64)>, f64)> {
+    use crate::autoland::{along_track_nm, cross_track_nm, haversine_nm, project_latlon};
+    let dist_m = |a: (f64, f64), b: (f64, f64)| haversine_nm(a.0, a.1, b.0, b.1) * M_PER_NM;
+    let (&first, &last) = (lead_on.first()?, lead_on.last()?);
+    // OURS, not another stub's: compare ALONG-TRACK positions, not straight-
+    // line distance — the stub runs perpendicular to the runway, so a legit
+    // hold sits ~90 m from its own junction (LXGB Echo: 92 m; the old 80 m
+    // straight-line guard silently rejected it and the diagonal came back,
+    // 2026-07-24, probed). A foreign stub is displaced ALONG the runway.
+    let a_air = -along_track_nm(lat, lon, rwy) * M_PER_NM;
+    let a_first = -along_track_nm(first.0, first.1, rwy) * M_PER_NM;
+    if (a_first - a_air).abs() > 80.0 {
+        return None;
+    }
+    // ...and ends ON this runway's centreline (the junction node).
+    if (cross_track_nm(last.0, last.1, rwy) * M_PER_NM).abs() > 20.0 {
+        return None;
+    }
+    let junction_a = -along_track_nm(last.0, last.1, rwy) * M_PER_NM;
+    if junction_a < 0.0 {
+        return None;
+    }
+    let stop_m = junction_a + LINE_UP_ALIGN_M;
+    if rwy.length_m - stop_m < LINE_UP_MIN_REMAINING_M {
+        return None;
+    }
+    // Aircraft, then the authored points (skipping any we're already on top
+    // of), then a FILLET ARC around the junction corner onto the centreline,
+    // then the alignment stop. The network models the entry as a right angle;
+    // the paint curves — a sampled arc where the sharp corner was is what the
+    // pursuit can actually follow (it chorded the raw corner, probed
+    // 2026-07-24).
+    let mut path = vec![(lat, lon)];
+    path.extend(lead_on.iter().copied().filter(|p| dist_m((lat, lon), *p) > 5.0));
+    let stop = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, stop_m / M_PER_NM);
+    let corner = path.pop()?; // the junction (or the aircraft itself — refused below)
+    if path.is_empty() {
+        return None;
+    }
+    path.extend(fillet_corner(*path.last()?, corner, stop, 18.0));
+    path.push(stop);
+    (path.len() >= 3).then_some((path, stop_m))
+}
+
+/// A sampled quadratic-Bezier fillet replacing the sharp vertex at `corner`:
+/// starts `r_m` back along the inbound leg, ends `r_m` down the outbound leg,
+/// bulging toward the corner — the painted lead-on curve the taxi networks
+/// don't model. Radii clamp to half of each leg so short legs stay sane.
+fn fillet_corner(prev: (f64, f64), corner: (f64, f64), next: (f64, f64), r_m: f64) -> Vec<(f64, f64)> {
+    let seg = |a: (f64, f64), b: (f64, f64), t: f64| {
+        (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
+    };
+    let len = |a: (f64, f64), b: (f64, f64)| {
+        crate::autoland::haversine_nm(a.0, a.1, b.0, b.1) * M_PER_NM
+    };
+    let l_in = len(prev, corner);
+    let l_out = len(corner, next);
+    if l_in < 1.0 || l_out < 1.0 {
+        return vec![corner];
+    }
+    let a = seg(corner, prev, (r_m.min(l_in * 0.5)) / l_in); // arc entry, on the inbound leg
+    let b = seg(corner, next, (r_m.min(l_out * 0.5)) / l_out); // arc exit, on the outbound leg
+    // Quadratic Bezier a -> corner(control) -> b, sampled.
+    let bez = |t: f64| {
+        let u = 1.0 - t;
+        (
+            u * u * a.0 + 2.0 * u * t * corner.0 + t * t * b.0,
+            u * u * a.1 + 2.0 * u * t * corner.1 + t * t * b.1,
+        )
+    };
+    vec![a, bez(0.25), bez(0.5), bez(0.75), b]
+}
+
 /// A backtrack pocket sits this far past the threshold along the runway —
 /// room for the turnaround to finish at the numbers.
 const BACKTRACK_TURN_START_M: f64 = 60.0;
@@ -444,6 +529,7 @@ pub fn pick_line_up_plan(
     needed_m: f64,
     force_backtrack: bool,
     heading_deg: Option<f64>,
+    lead_on: Option<&[(f64, f64)]>,
 ) -> Option<(crate::autoland::Runway, LineUpPlan)> {
     let mut best: Option<(crate::autoland::Runway, LineUpPlan, f64)> = None;
     for r in cands {
@@ -452,8 +538,22 @@ pub fn pick_line_up_plan(
                 continue;
             }
         }
-        let plain = line_up_path(r, lat, lon, heading_deg);
-        let ahead = line_up_stops_m(r, lat, lon, heading_deg).map(|(_, stop)| r.length_m - stop);
+        // The authored lead-on wins when it belongs to this runway and this
+        // hold — the painted line IS the maneuver. Synthetic geometry is the
+        // fallback (no published route, wrong stub, backtracks).
+        let via_lead = if force_backtrack {
+            None
+        } else {
+            lead_on.and_then(|lo| line_up_path_from_lead_on(r, lat, lon, lo))
+        };
+        let (plain, stop_m) = match via_lead {
+            Some((p, s)) => (Some(p), Some(s)),
+            None => (
+                line_up_path(r, lat, lon, heading_deg),
+                line_up_stops_m(r, lat, lon, heading_deg).map(|(_, stop)| stop),
+            ),
+        };
+        let ahead = stop_m.map(|s| r.length_m - s);
         let wants_backtrack =
             force_backtrack || ahead.is_none_or(|a| a < needed_m) || plain.is_none();
         let plan = if wants_backtrack {
@@ -604,6 +704,7 @@ pub fn start_backtrack(
                 via: String::new(),
                 seg: Vec::new(),
                 holding_point: String::new(),
+                lead_on: Vec::new(),
             };
             let Some(mut route2) = Route::build(&watch) else {
                 alert(
@@ -659,6 +760,8 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     // differences of an HTTP read are noise the lead would amplify.
     let mut prev_psi: Option<(f64, std::time::Instant)> = None;
     let mut yaw_rate = 0.0f64;
+    // Stagnation watch: commanding motion but not moving (see below).
+    let mut stalled_since: Option<std::time::Instant> = None;
     loop {
         if !ACTIVE.load(Ordering::Relaxed) {
             break;
@@ -704,6 +807,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // Paused or replay: stop writing — the steer channel expires and the
         // pedals are the pilot's until the sim is live again.
         if crate::xplane::sim_frozen(&xp).await {
+            stalled_since = None; // a pause is not a stall
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         }
@@ -741,8 +845,17 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             continue;
         };
+        let remaining = route.remaining(progress);
         // Steering error first: the join state and the guard both need it.
-        let err = route.heading_err_deg(lat, lon, psi, progress, lookahead_m(gs_kts));
+        // The aim is capped by what's LEFT of the route: near the stop the
+        // pursuit point must walk the path through the final corner, not
+        // chord across it — the 16 m minimum aim against a corner ~20 m
+        // before the hold parked the aircraft off the paint, and
+        // stop_straighten then froze the leftover angle (LXGB Echo,
+        // 2026-07-24, twice). Only bites close-in, where the stop ramp has
+        // already slowed us below weave speeds.
+        let look = lookahead_m(gs_kts).min((remaining * 0.6).max(6.0));
+        let err = route.heading_err_deg(lat, lon, psi, progress, look);
         let allow = *join_allow.get_or_insert_with(|| {
             let a = join_allowance_m(lateral, err);
             if a > 0.0 {
@@ -779,7 +892,6 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             ACTIVE.store(false, Ordering::Relaxed);
             break;
         }
-        let remaining = route.remaining(progress);
         // Arrived: stopped at the hold-short line. The governor stays,
         // holding position on the brakes, exactly as a spoken "stop" —
         // "go" past this point is the pilot's call (a crossing clearance).
@@ -799,6 +911,36 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             alert(&voice, Priority::Advisory, &line);
             ACTIVE.store(false, Ordering::Relaxed);
             break;
+        }
+        // A drive that commands motion but never MOVES is stuck. A backwards
+        // join's near-full nosewheel lock is a chock the governor's gentle
+        // taxi throttle can't break away against: a 169°-off engage at a
+        // Jerez stand crept at millimetres per second for half a minute, no
+        // voice line, until the pilot's pedals rescued it (16:48Z,
+        // 2026-07-24). Twenty seconds of commanded-but-stationary says so out
+        // loud and hands back, instead of pirouetting in place.
+        if !ext_stopped && gs_kts < 0.7 {
+            let t0 = *stalled_since.get_or_insert_with(std::time::Instant::now);
+            if t0.elapsed().as_secs_f64() > 20.0 {
+                tracing::warn!(err, "auto taxi: stagnant, standing down");
+                crate::blackbox::record(
+                    "autotaxi",
+                    serde_json::json!({"event": "stagnant", "err_deg": err, "remaining_m": remaining}),
+                );
+                speedhold::set_taxi_target(0.0);
+                let _ = xp.set_float(TAXI_STEER, 0.0).await;
+                let line = if err.abs() > JOIN_ERR_SLOW_DEG {
+                    "I can't get us moving, the nose is pointing away from the taxiway. \
+                     Turn us toward it, then ask me to taxi again."
+                } else {
+                    "I can't get us moving. Standing down. Your aircraft."
+                };
+                alert(&voice, Priority::Caution, line);
+                ACTIVE.store(false, Ordering::Relaxed);
+                break;
+            }
+        } else {
+            stalled_since = None;
         }
         // Steering: aim at the route ahead, command the error down — led by
         // the yaw rate so a laggy plant (castoring nosewheel steering by
@@ -899,7 +1041,39 @@ mod tests {
             via: "Whiskey, November".into(),
             seg: vec![("W".into(), false), ("N".into(), false)],
             holding_point: "N1".into(),
+            lead_on: Vec::new(),
         }
+    }
+
+    #[test]
+    fn capped_aim_drives_the_final_corner_instead_of_chording_it() {
+        // A short L: 60 m east, then a left corner, 18 m north to the stop —
+        // the hold-short-after-a-corner shape (LXGB Echo). Aircraft 5 m
+        // before the corner, heading east along the paint.
+        let watch = TaxiWatch {
+            path: vec![ll(0.0, 0.0), ll(60.0, 0.0), ll(60.0, 18.0)],
+            via: String::new(),
+            seg: vec![(String::new(), false), (String::new(), false)],
+            holding_point: String::new(),
+            lead_on: Vec::new(),
+        };
+        let r = Route::build(&watch).expect("route");
+        let (lat, lon) = ll(55.0, 0.0);
+        let (progress, lateral) = r.fix(lat, lon).expect("on the route");
+        assert!(lateral < 1.0);
+        // The old 16 m minimum aim reaches PAST the corner: the aim point is
+        // on the northbound leg, so the error commands an early cut inside
+        // the paint. The capped aim (remaining*0.6 min 6) stays on the
+        // eastbound leg: drive straight to the corner first.
+        let err_chord = r.heading_err_deg(lat, lon, 90.0, progress, 16.0);
+        let remaining = r.remaining(progress);
+        let capped = lookahead_m(3.0).min((remaining * 0.6).max(6.0));
+        assert!(capped < 16.0, "the cap engages near the stop: {capped}");
+        let err_capped = r.heading_err_deg(lat, lon, 90.0, progress, capped);
+        assert!(
+            err_capped.abs() < err_chord.abs() - 5.0,
+            "capped aim hugs the paint: capped {err_capped:.1} vs chord {err_chord:.1}"
+        );
     }
 
     #[test]
@@ -1114,6 +1288,105 @@ mod tests {
         assert!(off2 > 20.0, "near-aligned nose falls back to the diagonal, got {brg2}");
     }
 
+    /// Real-install probe: what does the LXGB planner actually hand the
+    /// line-up at the runway 27 hold? Prints the route tail, the lead-on,
+    /// and the drive path the picker would build — evidence, not theory.
+    /// `cargo test -- --ignored live_lxgb_line_up --nocapture`
+    #[test]
+    #[ignore]
+    fn live_lxgb_line_up_lead_on() {
+        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let net = crate::nav::find_taxi_net(apt, "LXGB").unwrap().expect("LXGB network");
+        let zones: Vec<String> = vec!["27".into(), "09".into()];
+        // Apron, mid-field north side -> the 27 end.
+        let plan = net
+            .plan(36.1535, -5.3495, 36.1515, -5.3412, crate::nav::HOLD_SHORT_STANDOFF_M, &zones)
+            .expect("a route");
+        println!("holding_point: {} via {:?}", plan.holding_point, plan.via);
+        let m = |p: (f64, f64)| {
+            let dx = (p.1 + 5.3412) * 111_320.0 * 36.15_f64.to_radians().cos();
+            let dy = (p.0 - 36.1515) * 111_320.0;
+            (dx.round(), dy.round())
+        };
+        println!("route tail (m from 27 thr, x=E y=N):");
+        for p in plan.path.iter().rev().take(4).rev() {
+            println!("  {:?}", m(*p));
+        }
+        println!("lead_on ({} pts):", plan.lead_on.len());
+        for p in &plan.lead_on {
+            println!("  {:?}", m(*p));
+        }
+        assert!(!plan.lead_on.is_empty(), "zone-trimmed route must keep its lead-on");
+        // Now the picker, from the route's actual end (where the taxi stops).
+        let &(hlat, hlon) = plan.path.last().unwrap();
+        let cands = crate::autoland::nearby_runways(apt, hlat, hlon, 1.0).unwrap();
+        let picked = pick_line_up_plan(&cands, hlat, hlon, Some("27"), 400.0, false, None, Some(&plan.lead_on));
+        let (rwy, lp) = picked.expect("a line-up plan");
+        println!("picked runway {}", rwy.id);
+        match lp {
+            LineUpPlan::Plain(p) => {
+                println!("drive path ({} pts):", p.len());
+                for q in &p {
+                    println!("  {:?}", m(*q));
+                }
+                assert!(p.len() > 3, "authored points present, not a 3-point diagonal: {}", p.len());
+            }
+            LineUpPlan::Backtrack(_) => println!("backtrack picked"),
+        }
+    }
+
+    #[test]
+    fn line_up_drives_the_authored_lead_on_when_it_is_ours() {
+        use crate::autoland::{project_latlon, Runway};
+        // Runway 36 from (0,0); hold 40 m east of the centreline, abeam 100 m.
+        let rwy = Runway {
+            icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
+            course_deg: 0.0, length_m: 2000.0, surface: 1, dist_nm: 0.02, elev_ft: 0.0,
+        };
+        let at = |a_m: f64, x_m: f64| {
+            let (la, lo) = project_latlon(0.0, 0.0, 0.0, a_m / 1852.0);
+            project_latlon(la, lo, 90.0, x_m / 1852.0)
+        };
+        let (hlat, hlon) = at(100.0, 40.0);
+        // The authored yellow line: from the hold, curving onto the centreline
+        // at 160 m past the threshold (two intermediate points shape the curve).
+        let lead_on = vec![at(105.0, 38.0), at(125.0, 25.0), at(150.0, 8.0), at(160.0, 0.0)];
+        let (path, stop) =
+            line_up_path_from_lead_on(&rwy, hlat, hlon, &lead_on).expect("drives the lead-on");
+        // The authored points lead the drive path in order; the sharp junction
+        // corner is replaced by a sampled fillet arc, then the stop continues
+        // down the centreline.
+        assert!(path.len() >= 8, "aircraft + authored + arc + stop: {}", path.len());
+        assert_eq!(path[1], lead_on[0]);
+        assert_eq!(path[2], lead_on[1]);
+        assert_eq!(path[3], lead_on[2]);
+        assert!((stop - 240.0).abs() < 1.0, "junction 160 + align 80: {stop}");
+        // The arc stays between the two legs: every sampled point is on the
+        // hold side of the centreline and short of the stop.
+        for p in &path[4..path.len() - 1] {
+            let x = crate::autoland::cross_track_nm(p.0, p.1, &rwy) * 1852.0;
+            assert!((-1.0..=40.0).contains(&x), "arc point off the corner: x={x}");
+        }
+        // A lead-on from ANOTHER stub (300 m away) is refused — never drive
+        // someone else's painted line.
+        let foreign = vec![at(400.0, 38.0), at(460.0, 0.0)];
+        assert!(line_up_path_from_lead_on(&rwy, hlat, hlon, &foreign).is_none());
+        // A lead-on ending far OFF the centreline is not a runway entry.
+        let sideways = vec![at(105.0, 38.0), at(160.0, 60.0)];
+        assert!(line_up_path_from_lead_on(&rwy, hlat, hlon, &sideways).is_none());
+        // And the picker prefers it over the synthetic diagonal for the same
+        // runway.
+        let cands = vec![rwy.clone()];
+        let (r, plan) =
+            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, false, Some(270.0), Some(&lead_on))
+                .expect("picked");
+        assert_eq!(r.id, "36");
+        match plan {
+            LineUpPlan::Plain(p) => assert_eq!(p[1], lead_on[0], "authored path won"),
+            LineUpPlan::Backtrack(_) => panic!("no backtrack expected"),
+        }
+    }
+
     #[test]
     fn line_up_pick_honors_the_cleared_runway() {
         use crate::autoland::Runway;
@@ -1180,17 +1453,17 @@ mod tests {
         let mid = crate::autoland::project_latlon(0.0, 0.0, 0.0, 1170.0 / 1852.0);
         let (hlat, hlon) = crate::autoland::project_latlon(mid.0, mid.1, 90.0, 40.0 / 1852.0);
         assert!(matches!(
-            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, false, None),
+            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, false, None, None),
             Some((_, LineUpPlan::Plain(_)))
         ));
         assert!(matches!(
-            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 700.0, false, None),
+            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 700.0, false, None, None),
             Some((_, LineUpPlan::Backtrack(_)))
         ));
         // The pilot asked for the full length in so many words: backtrack
         // even though the plain remaining would do.
         assert!(matches!(
-            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, true, None),
+            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, true, None, None),
             Some((_, LineUpPlan::Backtrack(_)))
         ));
         // Abeam the numbers a backtrack is impossible — the ask still gets
@@ -1198,7 +1471,7 @@ mod tests {
         let near = crate::autoland::project_latlon(0.0, 0.0, 0.0, 60.0 / 1852.0);
         let (nlat, nlon) = crate::autoland::project_latlon(near.0, near.1, 90.0, 40.0 / 1852.0);
         assert!(matches!(
-            pick_line_up_plan(&cands, nlat, nlon, Some("36"), 700.0, true, None),
+            pick_line_up_plan(&cands, nlat, nlon, Some("36"), 700.0, true, None, None),
             Some((_, LineUpPlan::Plain(_)))
         ));
     }
@@ -1210,6 +1483,7 @@ mod tests {
             via: "A".into(),
             seg: vec![("A".into(), false)],
             holding_point: "A1".into(),
+            lead_on: Vec::new(),
         };
         assert!(Route::build(&w).is_none(), "nothing to drive on 15 m");
     }

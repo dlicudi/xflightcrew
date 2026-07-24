@@ -166,47 +166,18 @@ public:
         s.Colors[ImGuiCol_HeaderActive]     = slate4;
         s.Colors[ImGuiCol_TableRowBg]       = slate1;
         s.Colors[ImGuiCol_TableRowBgAlt]    = ImVec4(0.14f, 0.15f, 0.18f, 1.0f);
-        // Allow shrinking down to the toolbar row (collapsed view).
-        SetWindowResizingLimits(260, kCollapsedH, 1400, 1400);
+        SetWindowResizingLimits(260, 160, 1400, 1400);
     }
 
 private:
-    // Collapse to just the toolbar row (status chips under the title bar), so the
-    // panel can tuck out of the way without closing. Remembers the expanded size.
-    static constexpr int kCollapsedH = 46;
-    bool mCollapsed = false;
     // Selected tab (0 = Log, 1 = Route, 2 = ATC, 3 = Calls, 4 = Settings) — content renders after
     // the shared context rows, so the tab bar itself sits at the very top.
     int mTab = 0;
-    int mExpW = 420, mExpH = 300;
-
-    void toggleCollapse() {
-        int l, t, r, b;
-        GetWindowGeometry(l, t, r, b);
-        if (!mCollapsed) {
-            mExpW = r - l;
-            mExpH = t - b;
-            SetWindowGeometry(l, t, r, t - kCollapsedH); // keep position, shrink height
-            mCollapsed = true;
-        } else {
-            SetWindowGeometry(l, t, l + mExpW, t - mExpH); // restore size at current spot
-            mCollapsed = false;
-        }
-    }
-
-public:
-    // Launch state: a slim status strip, not a window over the scenery. The
-    // panel earns its full size when the pilot asks for it ("+"), instead of
-    // greeting every flight as a splash screen.
-    void startCollapsed() {
-        if (!mCollapsed) toggleCollapse();
-    }
 
 protected:
-    // The status strip: crew state, aircraft, and the two talk lights, with
-    // the collapse/expand control right-aligned. Lives at the BOTTOM of the
-    // expanded panel (instrument-style: controls above, annunciators below),
-    // and is the only row shown when collapsed.
+    // The status strip: crew state, aircraft, and the two talk lights. Lives
+    // at the BOTTOM of the panel (instrument-style: controls above,
+    // annunciators below).
     void drawStatusBar(bool connected) {
         if (connected) {
             Chip(PhaseLabel(drefs::phase()), PhaseColor(drefs::phase()));
@@ -223,23 +194,11 @@ protected:
         ImGui::SameLine();
         // TX = the radio (ATC) push-to-talk, distinct from the intercom PTT.
         Chip("TX", drefs::radio_ptt_active() ? COL_AMBER : COL_DIM);
-        const char* collapseLbl = mCollapsed ? "+" : "-";
-        float collapseW = ImGui::CalcTextSize(collapseLbl).x
-            + ImGui::GetStyle().FramePadding.x * 2.0f;
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - collapseW);
-        if (ImGui::SmallButton(collapseLbl)) {
-            toggleCollapse();
-        }
     }
 
     void buildInterface() override {
         // The app heartbeats the phase ~1/s; a stale timestamp = not running.
         bool connected = drefs::app_connected();
-        // Collapsed: just the status strip under the title bar.
-        if (mCollapsed) {
-            drawStatusBar(connected);
-            return;
-        }
 
         // Tabs at the very top: what you're looking AT comes first; state
         // annunciators live in the bottom status bar. Content renders after
@@ -802,8 +761,6 @@ void create() {
     // Start well below the top edge so the panel clears the X-Plane menu bar.
     int wl = sl + 50, wt = st - 150, wr = wl + 420, wb = wt - 300;
     g_panel = std::make_unique<XCopilotPanel>(wl, wt, wr, wb);
-    // Launch as a slim status strip (chips only) — expand is one click away.
-    g_panel->startCollapsed();
     g_toggle_cmd = XPLMCreateCommand("xcopilot/toggle_panel", "x-copilot: toggle the status panel");
     XPLMRegisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr);
 

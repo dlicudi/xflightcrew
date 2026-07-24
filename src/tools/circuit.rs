@@ -142,6 +142,10 @@ impl Tool for Circuit {
             ctx.voice.cloned(),
             circuit::Params {
                 apt_dat: super::autoland::apt_dat_path(),
+                cifp_dir: ctx.config.cifp_dir.clone(),
+                fix_data_path: ctx.config.fix_data_path.clone(),
+                nav_data_path: ctx.config.nav_data_path.clone(),
+                airspace_path: ctx.config.airspace_path.clone(),
                 cfg: self.cfg.clone(),
                 takeoff: autotakeoff::Params {
                     apt_dat: super::autoland::apt_dat_path(),

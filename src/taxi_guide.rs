@@ -607,6 +607,7 @@ mod tests {
                 ("N5W".into(), false),
             ],
             holding_point: "N5W".into(),
+            lead_on: Vec::new(),
         }
     }
 
@@ -757,6 +758,7 @@ mod tests {
             via: "Whiskey, Sierra".into(),
             seg: vec![("W".into(), false), ("S".into(), false)],
             holding_point: "S".into(),
+            lead_on: Vec::new(),
         };
         let t0 = Instant::now();
         // At speed: the words carry the speed advice.
@@ -779,6 +781,7 @@ mod tests {
             via: "Alpha, Bravo".into(),
             seg: vec![("A".into(), false), ("B".into(), false)],
             holding_point: "B".into(),
+            lead_on: Vec::new(),
         };
         let mut g = Guide::build(&w).expect("guide");
         let preps: Vec<&Cue> = g.cues.iter().filter(|c| c.kind == CueKind::Prep).collect();
@@ -853,6 +856,7 @@ mod tests {
             via: "Alpha".into(),
             seg: vec![("A".into(), false); 4],
             holding_point: "A1".into(),
+            lead_on: Vec::new(),
         };
         let g = Guide::build(&w).expect("guide");
         assert!(

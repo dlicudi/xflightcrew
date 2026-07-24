@@ -765,6 +765,8 @@ mod tests {
             llm_gpu_layers: String::new(),
             xplane_base_url: "http://127.0.0.1:8086".into(),
             nav_data_path: String::new(),
+            fix_data_path: String::new(),
+            airspace_path: String::new(),
             cifp_dir: String::new(),
             apt_data_path: String::new(),
             whisper_model_path: String::new(),

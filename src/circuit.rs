@@ -39,14 +39,19 @@ const LON: &str = "sim/flightmodel/position/longitude";
 const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 const HPATH: &str = "sim/flightmodel/position/hpath";
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
+const ELEV_M: &str = "sim/flightmodel/position/elevation";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
-// AP surface (mirror of autopilot.rs / autoland.rs).
+// AP surface (mirror of autotakeoff.rs — the recipe PROVEN to climb and
+// steer; `sim/autopilot/altitude_hold` is deliberately absent: it holds the
+// CURRENT altitude, not the dial, and locked every pattern at handoff height
+// (2026-07-24)).
 const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
-const CMD_ALT_HOLD: &str = "sim/autopilot/altitude_hold";
+const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
+const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
-const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
+const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
 
 const M_TO_FT: f64 = 3.280_84;
 const M_PER_NM: f64 = 1852.0;
@@ -58,22 +63,70 @@ const M_PER_NM: f64 = 1852.0;
 // with no straight segment spiralled it (LXGB, 2026-07-23). Position triggers
 // don't care how slow a turn is: each leg flies until the aircraft REACHES
 // the geometric point, so the pattern is a rectangle whatever the turn rate.
-/// Climb past the departure end by this before turning crosswind.
-const UPWIND_PAST_M: f64 = 300.0;
-/// Downwind spacing abeam the runway (~0.5 nm) — how far out the pattern sits.
-const PATTERN_WIDTH_M: f64 = 900.0;
-/// Fly the downwind until this far PAST the landing threshold (on the approach
-/// side), so the base-to-final turn leaves a normal final.
-const DOWNWIND_PAST_M: f64 = 1200.0;
-/// Turn final once base has brought us back within this of the extended
-/// centreline.
-const FINAL_CAPTURE_M: f64 = 250.0;
+//
+// And the geometry must be SCALED TO THE TURN RADIUS, not fixed: the AP banks
+// gently (~14°), so at ~80 kt the radius is ~700-900 m — against the old fixed
+// 900 m width, every leg trigger fired while the aircraft was still banked from
+// the previous turn and the rectangle degenerated into continuous circles (the
+// LXGB loops, 2026-07-24). All distances now derive from the radius, and legs
+// advance EARLY by a turn-anticipation lead so the rollout lands ON the target
+// line instead of overshooting it by a full radius.
+
+/// The bank the AP actually flies in a heading capture, conservative (shallower
+/// = wider radius = wider pattern — over-estimating the radius is safe).
+const AP_BANK_DEG: f64 = 14.0;
+/// Max heading-bug movement per 500 ms tick, degrees — see [`slew_bug`].
+const BUG_SLEW_PER_TICK: f64 = 40.0;
+
+/// Coordinated-turn radius at `gs_mps`, meters: v²/(g·tan φ). Clamped to sane
+/// pattern bounds so a bad speed read can't produce a degenerate geometry.
+pub fn turn_radius_m(gs_mps: f64) -> f64 {
+    (gs_mps * gs_mps / (9.81 * AP_BANK_DEG.to_radians().tan())).clamp(250.0, 2500.0)
+}
+
+/// The pattern's dimensions, all derived from one turn radius.
+#[derive(Debug, Clone, Copy)]
+pub struct Geometry {
+    /// Climb past the departure end by this before turning crosswind.
+    pub upwind_past_m: f64,
+    /// Downwind spacing abeam the runway — how far out the pattern sits.
+    pub width_m: f64,
+    /// Fly the downwind until this far PAST the landing threshold (approach
+    /// side), so the two 90° turns still leave a normal final.
+    pub downwind_past_m: f64,
+    /// Turn final once base is within this of the extended centreline — one
+    /// radius, so the 90° turn rolls out ON the centreline.
+    pub final_capture_m: f64,
+    /// Turn anticipation: crosswind/downwind advance this EARLY, so the slow
+    /// AP turn carries the aircraft TO the line, not a radius past it.
+    pub lead_m: f64,
+}
+
+impl Geometry {
+    pub fn for_radius(r: f64) -> Geometry {
+        Geometry {
+            upwind_past_m: (0.5 * r).max(300.0),
+            width_m: (2.2 * r).max(900.0),
+            downwind_past_m: (2.0 * r + 1200.0).max(2000.0),
+            // 1.3 radii, not one: the estimate is a still-air radius, and a
+            // base leg ridden by a tailwind turns wider — one radius rolled
+            // out south of the centreline (the overshoot, 2026-07-24).
+            // Rolling out slightly EARLY is free; autoland tracks in.
+            final_capture_m: (1.3 * r).max(250.0),
+            lead_m: 0.9 * r,
+        }
+    }
+}
+
 /// Height above the field to hand to autoland on base, feet — low enough that
 /// autoland intercepts a sane final, high enough to have turned final safely.
 const HANDOFF_AGL_FT: f64 = 700.0;
 /// An airborne AGL below this after the takeoff loop exits means it REJECTED
 /// (never flew) — the circuit is off, not into the pattern.
 const AIRBORNE_MIN_AGL_FT: f64 = 300.0;
+/// Terrain clearance a pattern side must have at TPA to be flyable; below it
+/// the circuit switches sides, and with BOTH sides fouled it raises the TPA.
+const TERRAIN_CLEAR_FT: f64 = 600.0;
 
 /// True while the circuit orchestrator runs.
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -149,8 +202,9 @@ pub fn spell_runway(id: &str) -> String {
 pub fn abort() -> bool {
     ABORT.store(true, Ordering::SeqCst);
     // Stand down whatever phase is live. The takeoff hands off silently (power
-    // stays set); the autoland aborts to the pilot.
+    // stays set); the procedure/autoland arrival aborts to the pilot.
     autotakeoff::ACTIVE.store(false, Ordering::SeqCst);
+    crate::procedure::abort();
     crate::autoland::abort();
     ACTIVE.swap(false, Ordering::SeqCst)
 }
@@ -158,6 +212,16 @@ pub fn abort() -> bool {
 /// Everything the orchestrator needs, resolved by the arming tool.
 pub struct Params {
     pub apt_dat: String,
+    /// Nav-data paths for the published-approach arrival (the terrain-safe
+    /// alternative to a naive base-to-final): CIFP procedure dir, `earth_fix.dat`,
+    /// `earth_nav.dat`. Empty-string-safe — a missing file just means the
+    /// approach isn't found and the arrival falls back to autoland.
+    pub cifp_dir: String,
+    pub fix_data_path: String,
+    pub nav_data_path: String,
+    /// OpenAir airspace file — the pattern's restricted/prohibited/danger
+    /// avoidance. Empty/missing file = no airspace data, no avoidance.
+    pub airspace_path: String,
     pub cfg: ApConfig,
     /// A fully-built takeoff config — the circuit arms the same takeoff loop.
     pub takeoff: autotakeoff::Params,
@@ -194,6 +258,19 @@ pub fn leg_heading(rwy_course_deg: f64, leg: Leg, left: bool) -> f64 {
     (rwy_course_deg + turn * n).rem_euclid(360.0)
 }
 
+/// Move the heading bug toward `target` by at most `max_step` degrees, the
+/// SHORT way around, returning the new dial value. A single 90-degree write
+/// across the 0/360 seam (271 -> 2 for the right pattern's crosswind) reads
+/// to the sim's AP as a 270-degree counterclockwise dial spin, and it turned
+/// the LONG way — the 1.8 km loop south over the bay with an AGL dip to
+/// 126 ft (LXGB, 2026-07-24). Stepping the dial keeps every write's turn
+/// direction unambiguous; at 40 degrees per 500 ms tick a 90-degree leg
+/// change completes in ~1.5 s, faster than the AP banks anyway.
+pub fn slew_bug(current: f64, target: f64, max_step: f64) -> f64 {
+    let d = (target - current + 540.0).rem_euclid(360.0) - 180.0;
+    (current + d.clamp(-max_step, max_step)).rem_euclid(360.0)
+}
+
 /// The next leg in sequence, or `None` past Final.
 pub fn next_leg(leg: Leg) -> Option<Leg> {
     match leg {
@@ -210,37 +287,128 @@ pub fn next_leg(leg: Leg) -> Option<Leg> {
 /// `a_m` is distance along the takeoff direction from the departure threshold
 /// (negative = on the approach side, before the threshold); `x_m` is cross-
 /// track, right of the takeoff course positive. `left` selects the pattern
-/// side. Each leg advances when the aircraft REACHES the geometric point, not
-/// after a timer.
-#[allow(clippy::too_many_arguments)]
-pub fn pattern_advance(
-    leg: Leg,
-    a_m: f64,
-    x_m: f64,
-    agl_ft: f64,
-    tpa_agl_ft: f64,
-    runway_len_m: f64,
-    left: bool,
-) -> bool {
+/// side. Each leg advances when the aircraft reaches the geometric point LESS
+/// the turn-anticipation lead, so the slow AP turn rolls out on the line.
+pub fn pattern_advance(leg: Leg, a_m: f64, x_m: f64, g: &Geometry, runway_len_m: f64, left: bool) -> bool {
     // The pattern sits on the LEFT (negative cross-track) for a standard
     // circuit; `side * x_m` is then "distance out to the pattern side", always
     // positive as we fly away from the runway on crosswind.
-    let _ = (agl_ft, tpa_agl_ft);
     let side = if left { -1.0 } else { 1.0 };
     match leg {
         // Past the departure end — turn crosswind while still climbing to
         // pattern altitude (a real pattern climbs on the crosswind/downwind,
         // not four kilometres straight ahead waiting to reach TPA first).
-        Leg::Upwind => a_m >= runway_len_m + UPWIND_PAST_M,
-        // Reached the downwind spacing out to the pattern side.
-        Leg::Crosswind => side * x_m >= PATTERN_WIDTH_M,
+        Leg::Upwind => a_m >= runway_len_m + g.upwind_past_m,
+        // Reaching the downwind spacing — led, so the rollout lands AT it.
+        Leg::Crosswind => side * x_m >= g.width_m - g.lead_m,
         // Flown back down the downwind until past the landing threshold by
-        // enough to build a normal final.
-        Leg::Downwind => a_m <= -DOWNWIND_PAST_M,
-        // Base has brought us back to (near) the extended centreline.
-        Leg::Base => side * x_m <= FINAL_CAPTURE_M,
+        // enough to build a normal final — led for the base turn.
+        Leg::Downwind => a_m <= -(g.downwind_past_m - g.lead_m),
+        // Base has brought us back within one turn radius of the extended
+        // centreline: the 90° turn to final rolls out on it.
+        Leg::Base => side * x_m <= g.final_capture_m,
         Leg::Final => false,
     }
+}
+
+/// What a candidate pattern side knows about the world under and around it:
+/// the highest sampled terrain (`None` = no probe data) and the first no-go
+/// airspace (prohibited/restricted/danger) its polyline enters at pattern
+/// height (`None` = clear or no data).
+#[derive(Debug, Clone, Default)]
+pub struct SideFacts {
+    pub terrain_max_ft: Option<f64>,
+    pub airspace: Option<String>,
+}
+
+/// Decide the pattern side and altitude — the generic rule, no per-airport
+/// exceptions: fly the side clear of BOTH terrain and no-go airspace; switch
+/// sides when only the other one is; when neither is clean, prefer the side
+/// without an airspace block, raised over its terrain; and when airspace is
+/// unavoidable, fall back to terrain-safety alone (terrain kills, paper
+/// doesn't) and say so. Missing data degrades gracefully: `None` terrain =
+/// assume clear (the old behavior), `None` airspace = clear.
+/// Returns (left, tpa_msl_ft, why).
+pub fn choose_pattern(
+    default_left: bool,
+    l: &SideFacts,
+    r: &SideFacts,
+    field_elev_ft: f64,
+    tpa_agl_ft: f64,
+) -> (bool, f64, &'static str) {
+    let tpa = field_elev_ft + tpa_agl_ft;
+    let terrain_ok = |f: &SideFacts| f.terrain_max_ft.is_none_or(|m| tpa - m >= TERRAIN_CLEAR_FT);
+    let clean = |f: &SideFacts| terrain_ok(f) && f.airspace.is_none();
+    let raise = |f: &SideFacts| {
+        (f.terrain_max_ft.unwrap_or(field_elev_ft) + tpa_agl_ft).max(tpa)
+    };
+    let (df, of) = if default_left { (l, r) } else { (r, l) };
+    if clean(df) {
+        return (default_left, tpa, "default_side_clear");
+    }
+    if clean(of) {
+        let why = if df.airspace.is_some() {
+            "switched_side_for_airspace"
+        } else {
+            "switched_side_for_terrain"
+        };
+        return (!default_left, tpa, why);
+    }
+    // Neither side is clean. Airspace can't be out-climbed at pattern heights
+    // (R-164 runs to 30,000), so prefer the side WITHOUT a block, raised over
+    // its terrain when needed.
+    match (df.airspace.is_some(), of.airspace.is_some()) {
+        (true, false) => (!default_left, raise(of), "raised_for_terrain"),
+        (false, true) => (default_left, raise(df), "raised_for_terrain"),
+        _ => {
+            // Both blocked (or both merely terrain-fouled): terrain safety
+            // alone picks — the LOWER side, high enough to clear it.
+            let (side_left, facts) =
+                if l.terrain_max_ft.unwrap_or(0.0) <= r.terrain_max_ft.unwrap_or(0.0) {
+                    (true, l)
+                } else {
+                    (false, r)
+                };
+            let why = if facts.airspace.is_some() { "airspace_unavoidable" } else { "raised_for_terrain" };
+            (side_left, raise(facts), why)
+        }
+    }
+}
+
+/// A point in the runway frame (`a_m` along the takeoff course from the
+/// departure threshold, `x_m` right of it) → lat/lon.
+fn frame_to_latlon(rwy: &crate::autoland::Runway, a_m: f64, x_m: f64) -> (f64, f64) {
+    let (lat, lon) =
+        crate::nav::project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, a_m / M_PER_NM);
+    crate::nav::project_latlon(lat, lon, (rwy.course_deg + 90.0).rem_euclid(360.0), x_m / M_PER_NM)
+}
+
+/// The sampling polyline for one pattern side: points along upwind-extension,
+/// crosswind, downwind, base, and final, in the runway frame. ~20 points —
+/// inside the plugin probe channel's per-query cap.
+fn pattern_polyline(rwy: &crate::autoland::Runway, g: &Geometry, runway_len_m: f64, left: bool) -> Vec<(f64, f64)> {
+    let side = if left { -1.0 } else { 1.0 };
+    let x_out = side * g.width_m;
+    let a_up = runway_len_m + g.upwind_past_m;
+    let a_dn = -g.downwind_past_m;
+    let mut pts = Vec::with_capacity(20);
+    // Crosswind line (includes the upwind end at x=0).
+    for i in 0..4 {
+        pts.push((a_up, x_out * i as f64 / 3.0));
+    }
+    // Downwind line.
+    for i in 1..=8 {
+        pts.push((a_up + (a_dn - a_up) * i as f64 / 8.0, x_out));
+    }
+    // Base line back to the centreline.
+    for i in 1..=3 {
+        pts.push((a_dn, x_out * (3 - i) as f64 / 3.0));
+    }
+    // Final, back toward the threshold.
+    for i in 1..=4 {
+        pts.push((a_dn + (0.0 - a_dn) * i as f64 / 4.0, 0.0));
+    }
+    pts.into_iter().map(|(a, x)| frame_to_latlon(rwy, a, x)).collect()
 }
 
 /// Spawn the circuit orchestrator on its own thread + runtime + client, the
@@ -287,14 +455,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     let (Ok(lat), Ok(lon), Ok(psi)) =
         (xp.get_float(LAT).await, xp.get_float(LON).await, xp.get_float(PSI_TRUE).await)
     else {
-        stand_down(&voice, "I can't read our position. The circuit is off — your aircraft.", "no_position");
+        stand_down(&voice, "I can't read our position. The circuit is off, your aircraft.", "no_position");
         return;
     };
     let cands = nearby_runways(&p.apt_dat, lat, lon, 3.0).unwrap_or_default();
     let Some((rwy, _)) = autotakeoff::runway_fit(&cands, lat, lon, psi, p.takeoff.needed_m) else {
         stand_down(
             &voice,
-            "We're not on a runway yet — I can only fly the circuit from the runway itself. \
+            "We're not on a runway yet. I can only fly the circuit from the runway itself. \
              Taxi us over and line us up first, then say do a circuit.",
             "not_lined_up",
         );
@@ -304,15 +472,96 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     let rwy_id = rwy.id.clone();
     let callsign = crew_callsign(&xp).await;
     let field_elev_ft = rwy.elev_ft;
-    let tpa_msl_ft = field_elev_ft + p.tpa_agl_ft;
+
+    // Geometry scaled to the AP's real turn radius at pattern speed (~Vy plus
+    // a bit) — fixed constants smaller than the turn diameter degenerated the
+    // rectangle into loops (LXGB, 2026-07-24).
+    let gs_est_mps = p.takeoff.vy_kts.max(60.0) * 0.514_444 * 1.1;
+    let geom = Geometry::for_radius(turn_radius_m(gs_est_mps));
+
+    // The world under BOTH candidate patterns: terrain probed from the sim
+    // itself, and the no-go airspace polygons the G1000 draws (OpenAir file).
+    // One generic rule picks the side and height; missing data degrades to
+    // the old behavior, never to a guess.
+    let poly_l = pattern_polyline(&rwy, &geom, rwy.length_m, true);
+    let poly_r = pattern_polyline(&rwy, &geom, rwy.length_m, false);
+    let l_max = crate::terrain::max_elevation_ft(&xp, &poly_l).await;
+    let r_max = crate::terrain::max_elevation_ft(&xp, &poly_r).await;
+    let spaces = {
+        let path = p.airspace_path.clone();
+        tokio::task::spawn_blocking(move || crate::airspace::load_near(&path, lat, lon, 0.5))
+            .await
+            .unwrap_or_default()
+    };
+    let tpa_probe_ft = field_elev_ft + p.tpa_agl_ft;
+    let l_facts = SideFacts {
+        terrain_max_ft: l_max,
+        airspace: crate::airspace::first_conflict(&spaces, &poly_l, tpa_probe_ft)
+            .map(|a| a.spoken_name()),
+    };
+    let r_facts = SideFacts {
+        terrain_max_ft: r_max,
+        airspace: crate::airspace::first_conflict(&spaces, &poly_r, tpa_probe_ft)
+            .map(|a| a.spoken_name()),
+    };
+    let (left, tpa_msl_ft, side_pick) =
+        choose_pattern(p.left_pattern, &l_facts, &r_facts, field_elev_ft, p.tpa_agl_ft);
     crate::blackbox::record(
         "circuit",
         serde_json::json!({
             "event": "armed", "runway": rwy.id, "icao": rwy.icao,
             "course": rwy_course, "field_elev_ft": field_elev_ft,
-            "tpa_msl_ft": tpa_msl_ft, "left": p.left_pattern,
+            "tpa_msl_ft": tpa_msl_ft, "left": left, "side_pick": side_pick,
+            "left_max_ft": l_max, "right_max_ft": r_max,
+            "left_airspace": l_facts.airspace, "right_airspace": r_facts.airspace,
+            "airspaces_near": spaces.len(),
+            "radius_m": geom.final_capture_m, "width_m": geom.width_m,
+            "downwind_past_m": geom.downwind_past_m,
         }),
     );
+    let side_word = |l: bool| if l { "left" } else { "right" };
+    match side_pick {
+        "switched_side_for_terrain" => alert(
+            &voice,
+            Priority::Caution,
+            &format!(
+                "Terrain on the {} side, flying a {}-hand circuit instead.",
+                side_word(p.left_pattern),
+                side_word(left)
+            ),
+        ),
+        "switched_side_for_airspace" => {
+            let name = if p.left_pattern { &l_facts.airspace } else { &r_facts.airspace };
+            alert(
+                &voice,
+                Priority::Caution,
+                &format!(
+                    "The {} side runs into {}, flying a {}-hand circuit instead.",
+                    side_word(p.left_pattern),
+                    name.as_deref().unwrap_or("restricted airspace"),
+                    side_word(left)
+                ),
+            );
+        }
+        "raised_for_terrain" => alert(
+            &voice,
+            Priority::Caution,
+            &format!("Terrain in the pattern, flying it at {tpa_msl_ft:.0} feet."),
+        ),
+        "airspace_unavoidable" => {
+            let name = if left { &l_facts.airspace } else { &r_facts.airspace };
+            alert(
+                &voice,
+                Priority::Caution,
+                &format!(
+                    "No pattern side stays clear of {} here, flying the {} side on terrain alone.",
+                    name.as_deref().unwrap_or("restricted airspace"),
+                    side_word(left)
+                ),
+            );
+        }
+        _ => {}
+    }
     alert(&voice, Priority::Advisory, "Flying a full circuit. My takeoff first.");
 
     // --- Phase 1: the takeoff (the proven loop). Arm it, then wait for it to
@@ -337,20 +586,36 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     crate::blackbox::record("circuit", serde_json::json!({"event": "takeoff_handoff", "agl_ft": agl_ft}));
     alert(&voice, Priority::Advisory, "Airborne. Flying the pattern.");
 
-    // --- Phase 2: the pattern on the autopilot. Take the AP the takeoff left
-    // engaged, level it at pattern altitude, and walk the legs on the heading
-    // bug. Upwind is the current runway heading.
-    let _ = xp.run_command(CMD_SERVOS_ON).await;
-    if xp.get_float(HDG_STATUS).await.unwrap_or(0.0) <= 0.5 {
-        let _ = xp.run_command(CMD_HDG_MODE).await;
-    }
+    // --- Phase 2: the pattern rides the AP EXACTLY as the takeoff left it —
+    // servos + HDG + VS engaged, VS dial at the climb rate. NOTHING is
+    // re-pressed wholesale here: the old pattern-start recipe (servos_on +
+    // HDG press + ALT_HOLD) stomped those working modes — X-Plane's
+    // `altitude_hold` holds the CURRENT altitude, which locked every pattern
+    // at the ~520 ft handoff height instead of climbing to TPA, left the
+    // terrain guard's "climb" a NO-OP, and the aircraft flew straight through
+    // its commanded crosswind turn into terrain SW of LXGB (2026-07-24,
+    // blackboxed: flat AGL all flights, 6 s of no-turn on crosswind).
+    // Vertical is VS-mode + dial (the takeoff's proven recipe); modes are
+    // re-engaged ONLY when their status reads off, like the takeoff's guard.
     let mag_var = xp.get_float(MAG_VAR).await.unwrap_or(0.0);
-    let _ = xp.set_float(ALT_DIAL, tpa_msl_ft).await;
-    let _ = xp.run_command(CMD_ALT_HOLD).await;
 
     let mut leg = Leg::Upwind;
-    let set_bug_for = |leg: Leg| leg_heading(rwy_course, leg, p.left_pattern);
-    let _ = xp.set_float(HDG_BUG, true_to_mag(set_bug_for(Leg::Upwind), mag_var)).await;
+    // The dial's CURRENT value seeds the slew (the takeoff left it near the
+    // runway heading); every subsequent write moves it the short way only.
+    let mut bug_mag = match xp.get_float(HDG_BUG).await {
+        Ok(v) => v,
+        Err(_) => true_to_mag(rwy_course, mag_var),
+    };
+    bug_mag = slew_bug(bug_mag, true_to_mag(leg_heading(rwy_course, Leg::Upwind, left), mag_var), BUG_SLEW_PER_TICK);
+    let _ = xp.set_float(HDG_BUG, bug_mag).await;
+    // Forward terrain guard cadence + throttle; a fired guard raises the
+    // vertical target floor for a while instead of pressing dead buttons.
+    let mut tick: u32 = 0;
+    let mut guard_warned: Option<std::time::Instant> = None;
+    let mut guard_floor_ft: Option<(f64, std::time::Instant)> = None;
+    // VS-dial bookkeeping (the takeoff's recipe: engage syncs the dial away,
+    // so rewrite after any re-engage; skip no-op writes otherwise).
+    let mut last_vs_cmd: Option<f64> = None;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -363,15 +628,20 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             continue;
         }
 
-        let (lat, lon, agl_m, psi_r, hpath_r) = tokio::join!(
+        let (lat, lon, agl_m, elev_m, psi_r, hpath_r, hdg_st, vs_st) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
             xp.get_float(AGL_M),
+            xp.get_float(ELEV_M),
             xp.get_float(PSI_TRUE),
             xp.get_float(HPATH),
+            xp.get_float(HDG_STATUS),
+            xp.get_float(VS_STATUS),
         );
         let (Ok(lat), Ok(lon)) = (lat, lon) else { continue };
         let agl_ft = agl_m.unwrap_or(0.0) * M_TO_FT;
+        let alt_msl_ft = elev_m.map(|m| m * M_TO_FT).unwrap_or(f64::NAN);
+        let (hdg_on, vs_on) = (hdg_st.unwrap_or(1.0) > 0.5, vs_st.unwrap_or(1.0) > 0.5);
         // Position in the departure-runway frame: along the takeoff direction
         // (negative on the approach side) and cross-track (right positive).
         let a_m = -along_track_nm(lat, lon, &rwy) * M_PER_NM;
@@ -381,22 +651,92 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // AP holds the ground track. Without this a 12 kt crosswind blew the
         // downwind 900 m back into the field (the teardrop, 2026-07-23).
         // crab = heading - track; command heading = leg heading + crab.
-        let crab = match (psi_r, hpath_r) {
-            (Ok(psi), Ok(hp)) => (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0),
+        let (psi_v, hp_v) = (psi_r.ok(), hpath_r.ok());
+        let crab = match (psi_v, hp_v) {
+            (Some(psi), Some(hp)) => (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0),
             _ => 0.0,
         };
-        let want_hdg = leg_heading(rwy_course, leg, p.left_pattern) + crab;
-        let _ = xp.set_float(HDG_BUG, true_to_mag(want_hdg, mag_var)).await;
+        let want_hdg = leg_heading(rwy_course, leg, left) + crab;
+        let target_mag = true_to_mag(want_hdg, mag_var);
+        bug_mag = slew_bug(bug_mag, target_mag, BUG_SLEW_PER_TICK);
+        let _ = xp.set_float(HDG_BUG, bug_mag).await;
+        // The lateral mode must actually be ON for the bug to mean anything —
+        // re-engage like the takeoff's VS guard, never press blind.
+        if !hdg_on {
+            let _ = xp.run_command(CMD_SERVOS_ON).await;
+            let _ = xp.run_command(CMD_HDG_MODE).await;
+        }
+
+        // Forward terrain guard — generic TAWS-lite, every ~2 s: probe the
+        // ground 1.2 nm ahead along the ground track; a hit raises the
+        // vertical target floor (flown by the VS law below) for a minute.
+        // Silently inactive without the plugin probe (the old behavior).
+        tick = tick.wrapping_add(1);
+        if tick % 4 == 0 && alt_msl_ft.is_finite() {
+            if let Some(hp) = hp_v {
+                let (glat, glon) = crate::nav::project_latlon(lat, lon, hp, 1.2);
+                if let Some(e) = crate::terrain::max_elevation_ft(&xp, &[(glat, glon)]).await {
+                    if alt_msl_ft - e < 400.0 {
+                        guard_floor_ft = Some((e + 800.0, std::time::Instant::now()));
+                        if guard_warned.is_none_or(|t| t.elapsed().as_secs() >= 30) {
+                            guard_warned = Some(std::time::Instant::now());
+                            crate::blackbox::record(
+                                "circuit",
+                                serde_json::json!({"event": "terrain_guard_climb", "elev_ft": e, "to_ft": e + 800.0}),
+                            );
+                            alert(&voice, Priority::Warning, "Terrain ahead. Climbing.");
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Vertical: the takeoff's proven VS recipe, never ALT_HOLD. The
+        // target is the leg's altitude (TPA; the handoff height from base),
+        // floored by an active terrain-guard demand. The dial is written on
+        // change; a dropped VS mode is re-engaged and the dial rewritten
+        // (engage syncs it away — the takeoff's lesson).
+        guard_floor_ft = guard_floor_ft.filter(|(_, t)| t.elapsed().as_secs() < 60);
+        let leg_target = match leg {
+            Leg::Base | Leg::Final => field_elev_ft + HANDOFF_AGL_FT,
+            _ => tpa_msl_ft,
+        };
+        // The guard floor never applies on base/final: descending toward the
+        // runway is the POINT there, and autoland brings its own terrain
+        // floor. A ridge-probe floor that lingered into base handed autoland
+        // the approach 190 ft high and it balked over the numbers
+        // (2026-07-24).
+        let target_alt = if matches!(leg, Leg::Base | Leg::Final) {
+            leg_target
+        } else {
+            guard_floor_ft.map_or(leg_target, |(f, _)| leg_target.max(f))
+        };
+        let vs_cmd = if alt_msl_ft.is_finite() {
+            ((target_alt - alt_msl_ft) * 3.0).clamp(-500.0, 700.0)
+        } else {
+            0.0
+        };
+        if !vs_on {
+            let _ = xp.run_command(CMD_VS_MODE).await;
+            last_vs_cmd = None; // engage synced the dial; force a rewrite
+        }
+        if last_vs_cmd.is_none_or(|v| (v - vs_cmd).abs() > 40.0) {
+            let _ = xp.set_float(VS_DIAL, vs_cmd).await;
+            last_vs_cmd = Some(vs_cmd);
+        }
 
         crate::blackbox::record(
             "circuit",
             serde_json::json!({
                 "event": "leg", "leg": format!("{leg:?}"), "agl_ft": agl_ft,
                 "a_m": a_m, "x_m": x_m, "crab": crab,
+                "bug": bug_mag, "tgt": target_mag, "psi": psi_v,
+                "hdg_on": hdg_on, "vs_on": vs_on, "cmd_vs": vs_cmd,
+                "alt_msl": alt_msl_ft, "target_alt": target_alt,
             }),
         );
 
-        if !pattern_advance(leg, a_m, x_m, agl_ft, p.tpa_agl_ft, rwy.length_m, p.left_pattern) {
+        if !pattern_advance(leg, a_m, x_m, &geom, rwy.length_m, left) {
             continue;
         }
         let Some(nxt) = next_leg(leg) else { continue };
@@ -414,19 +754,36 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 transmit(radio_call(&callsign, &format!("downwind runway {}", spell_runway(&rwy_id))));
             }
             Leg::Base => {
-                // Turn base and start down: lower the altitude bug to the
-                // autoland handoff height; ALT hold flies it down.
-                let _ = xp.set_float(ALT_DIAL, field_elev_ft + HANDOFF_AGL_FT).await;
-                let _ = xp.run_command(CMD_ALT_HOLD).await;
+                // Turn base and start down — the VS law above flies the
+                // descent once the leg target drops to the handoff height.
                 alert(&voice, Priority::Advisory, "Base. Descending.");
                 transmit(radio_call(&callsign, "turning base"));
             }
             Leg::Final => {
-                crate::blackbox::record("circuit", serde_json::json!({"event": "handoff_autoland", "agl_ft": agl_ft}));
-                crate::blackbox::record("circuit", serde_json::json!({"event": "handoff_autoland", "agl_ft": agl_ft}));
                 alert(&voice, Priority::Advisory, "Turning final. Landing us.");
                 // The final report — this is what earns the landing clearance.
                 transmit(radio_call(&callsign, &format!("final runway {}", spell_runway(&rwy_id))));
+                // Prefer the airport's PUBLISHED approach when we're actually
+                // positioned to fly it (a wide/arrival pattern outside and above
+                // the FAF) — that's the terrain-safe path. A tight circuit sits
+                // inside the FAF below platform, so this declines and autoland
+                // takes the short final, unchanged.
+                let alt_msl = field_elev_ft + agl_ft;
+                // Pass individual fields — `p.takeoff` was already moved into the
+                // takeoff loop, so `&p` can't be borrowed whole here.
+                let arr = ArrivalCtx {
+                    apt_dat: &p.apt_dat,
+                    cifp_dir: &p.cifp_dir,
+                    fix_data_path: &p.fix_data_path,
+                    nav_data_path: &p.nav_data_path,
+                    cfg: &p.cfg,
+                    approach_ias: p.approach_ias,
+                };
+                if try_published_arrival(arr, &rwy.icao, &rwy_id, &base_url, &voice, lat, lon, alt_msl).await {
+                    ACTIVE.store(false, Ordering::SeqCst);
+                    return;
+                }
+                crate::blackbox::record("circuit", serde_json::json!({"event": "handoff_autoland", "agl_ft": agl_ft}));
                 crate::autoland::ABORT.store(false, Ordering::SeqCst);
                 crate::autoland::run_autoland(
                     // A fresh client for autoland's own thread.
@@ -444,6 +801,68 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             Leg::Upwind => {}
         }
     }
+}
+
+/// The arrival-relevant slice of [`Params`] — passed as fields because by the
+/// time the arrival runs, `p.takeoff` has been moved into the takeoff loop and
+/// `&p` can no longer be borrowed whole.
+struct ArrivalCtx<'a> {
+    apt_dat: &'a str,
+    cifp_dir: &'a str,
+    fix_data_path: &'a str,
+    nav_data_path: &'a str,
+    cfg: &'a ApConfig,
+    approach_ias: f64,
+}
+
+/// Try to hand the arrival to the airport's PUBLISHED approach (the terrain-safe
+/// path) instead of a raw autoland. Builds the approach plan off the realtime
+/// loop, and only takes it when [`crate::procedure::approach_flyable_from`] says
+/// we're positioned to fly it — outside and above the FAF. Returns whether the
+/// procedure follower took over. A tight circuit (inside the FAF, at pattern
+/// height) always returns false, so autoland flies the short final unchanged.
+#[allow(clippy::too_many_arguments)]
+async fn try_published_arrival(
+    arr: ArrivalCtx<'_>,
+    icao: &str,
+    rwy_id: &str,
+    base_url: &str,
+    voice: &Option<Voice>,
+    lat: f64,
+    lon: f64,
+    alt_msl: f64,
+) -> bool {
+    if arr.cifp_dir.is_empty() {
+        return false;
+    }
+    let (apt_dat, cifp, fixp, navp) = (
+        arr.apt_dat.to_string(),
+        arr.cifp_dir.to_string(),
+        arr.fix_data_path.to_string(),
+        arr.nav_data_path.to_string(),
+    );
+    let (icao, rwy_id, cfg, ias) = (icao.to_string(), rwy_id.to_string(), arr.cfg.clone(), arr.approach_ias);
+    // find_airport + procedure load/resolve read big files — off the reactor.
+    let plan = tokio::task::spawn_blocking(move || {
+        let airport = crate::nav::find_airport(&apt_dat, &icao).ok().flatten()?;
+        let end = crate::procedure::EndAction::Approach { apt_dat: apt_dat.clone(), cfg, approach_ias: ias };
+        crate::procedure::approach_plan_for(&cifp, &fixp, &navp, &airport, &icao, &rwy_id, lat, lon, end).ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(plan) = plan else {
+        return false;
+    };
+    if !crate::procedure::approach_flyable_from(&plan, lat, lon, alt_msl) {
+        crate::blackbox::record("circuit", serde_json::json!({"event": "approach_declined", "reason": "inside_or_below_faf"}));
+        return false;
+    }
+    crate::blackbox::record("circuit", serde_json::json!({"event": "handoff_procedure", "name": plan.name}));
+    alert(voice, Priority::Advisory, &format!("Joining {}.", plan.name));
+    crate::procedure::ABORT.store(false, Ordering::SeqCst);
+    crate::procedure::start(base_url.to_string(), voice.clone(), plan);
+    true
 }
 
 #[cfg(test)]
@@ -479,46 +898,195 @@ mod tests {
         }
     }
 
-    // Position-based sequencing. A left pattern on a 1500 m runway, tpa 1000 ft.
+    // Position-based sequencing. A left pattern on a 1500 m runway.
     // In the runway frame: a_m along the takeoff direction, x_m right-positive;
     // a left pattern sits at NEGATIVE x_m.
     const L: f64 = 1500.0;
 
-    #[test]
-    fn upwind_turns_crosswind_past_the_end_while_climbing() {
-        // Not yet past the departure end: hold, whatever the altitude.
-        assert!(!pattern_advance(Leg::Upwind, L - 100.0, 0.0, 950.0, 1000.0, L, true));
-        // Past the end + margin: turn crosswind, even still climbing (600 ft) —
-        // a real pattern climbs to TPA on the crosswind/downwind, not straight
-        // ahead for kilometres.
-        assert!(pattern_advance(Leg::Upwind, L + UPWIND_PAST_M + 1.0, 0.0, 600.0, 1000.0, L, true));
+    /// A 172-ish geometry: ~80 kt pattern speed.
+    fn g() -> Geometry {
+        Geometry::for_radius(turn_radius_m(41.0))
     }
 
     #[test]
-    fn crosswind_turns_downwind_at_the_pattern_width() {
-        // Left pattern: still inside the spacing (x only slightly left) -> hold.
-        assert!(!pattern_advance(Leg::Crosswind, L, -300.0, 1000.0, 1000.0, L, true));
-        // Reached the downwind line out to the left -> turn downwind.
-        assert!(pattern_advance(Leg::Crosswind, L, -(PATTERN_WIDTH_M + 1.0), 1000.0, 1000.0, L, true));
+    fn the_bug_slews_the_short_way_across_the_north_seam() {
+        // The killer case: right pattern's crosswind, dial 271.5 -> target 2.6.
+        // Every step must move CLOCKWISE (increasing, mod 360) — the single
+        // jump read as a counterclockwise spin and the AP turned 270° the
+        // wrong way (2026-07-24).
+        let mut bug = 271.5;
+        let mut steps = 0;
+        while (slew_bug(bug, 2.6, 40.0) - 2.6).abs() > 1e-9 || (bug - 2.6).abs() > 1e-9 {
+            let next = slew_bug(bug, 2.6, 40.0);
+            let d = (next - bug + 540.0).rem_euclid(360.0) - 180.0;
+            assert!(d > 0.0, "always clockwise: {bug} -> {next}");
+            assert!(d <= 40.0 + 1e-9, "never more than a step");
+            bug = next;
+            steps += 1;
+            assert!(steps < 10, "converges");
+        }
+        // Counterclockwise across the seam works too: 2.6 -> 330 is a 32.6°
+        // short-way step, done in one write; a farther target clamps.
+        assert!((slew_bug(2.6, 330.0, 40.0) - 330.0).abs() < 1e-9);
+        assert!((slew_bug(2.6, 280.0, 40.0) - 322.6).abs() < 1e-9, "clamped first step");
+        // Small deltas go direct.
+        assert!((slew_bug(100.0, 110.0, 40.0) - 110.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn geometry_scales_from_the_turn_radius() {
+        // ~80 kt (41 m/s) at 14° bank → radius ~700 m.
+        let r = turn_radius_m(41.0);
+        assert!((550.0..900.0).contains(&r), "radius {r}");
+        let geom = Geometry::for_radius(r);
+        // The width must exceed the turn DIAMETER — legs shorter than the
+        // diameter are what degenerated the rectangle into loops.
+        assert!(geom.width_m > 2.0 * r, "width {} vs diameter {}", geom.width_m, 2.0 * r);
+        assert!(geom.downwind_past_m > geom.width_m, "room for base + final");
+        assert!(geom.lead_m < r, "lead is less than the radius itself");
+        // A bad speed read can't produce a degenerate pattern.
+        assert!(turn_radius_m(0.0) >= 250.0);
+        assert!(turn_radius_m(500.0) <= 2500.0);
+    }
+
+    #[test]
+    fn upwind_turns_crosswind_past_the_end_while_climbing() {
+        // Not yet past the departure end: hold, whatever the altitude.
+        assert!(!pattern_advance(Leg::Upwind, L - 100.0, 0.0, &g(), L, true));
+        // Past the end + margin: turn crosswind (the altitude no longer gates —
+        // a real pattern climbs to TPA on the crosswind/downwind).
+        assert!(pattern_advance(Leg::Upwind, L + g().upwind_past_m + 1.0, 0.0, &g(), L, true));
+    }
+
+    #[test]
+    fn crosswind_turns_downwind_with_turn_anticipation() {
+        let geom = g();
+        // Still inside the led trigger -> hold.
+        let before = geom.width_m - geom.lead_m - 50.0;
+        assert!(!pattern_advance(Leg::Crosswind, L, -before, &geom, L, true));
+        // Reached width - lead -> turn NOW, so the rollout lands on the line.
+        let at = geom.width_m - geom.lead_m + 1.0;
+        assert!(pattern_advance(Leg::Crosswind, L, -at, &geom, L, true));
         // Right pattern mirrors: the spacing is to the RIGHT (positive x).
-        assert!(pattern_advance(Leg::Crosswind, L, PATTERN_WIDTH_M + 1.0, 1000.0, 1000.0, L, false));
-        assert!(!pattern_advance(Leg::Crosswind, L, -(PATTERN_WIDTH_M + 1.0), 1000.0, 1000.0, L, false));
+        assert!(pattern_advance(Leg::Crosswind, L, at, &geom, L, false));
+        assert!(!pattern_advance(Leg::Crosswind, L, -at, &geom, L, false));
     }
 
     #[test]
     fn downwind_turns_base_past_the_landing_threshold() {
+        let geom = g();
         // Still abeam / not far enough back -> hold.
-        assert!(!pattern_advance(Leg::Downwind, 200.0, -900.0, 1000.0, 1000.0, L, true));
-        // Flown back past the threshold by the final margin -> turn base.
-        assert!(pattern_advance(Leg::Downwind, -(DOWNWIND_PAST_M + 1.0), -900.0, 900.0, 1000.0, L, true));
+        assert!(!pattern_advance(Leg::Downwind, 200.0, -geom.width_m, &geom, L, true));
+        // Past the threshold by the led base distance -> turn base.
+        let at = geom.downwind_past_m - geom.lead_m + 1.0;
+        assert!(pattern_advance(Leg::Downwind, -at, -geom.width_m, &geom, L, true));
     }
 
     #[test]
-    fn base_turns_final_near_the_centreline() {
-        // Left pattern, still well left of centreline -> hold.
-        assert!(!pattern_advance(Leg::Base, -1200.0, -600.0, 800.0, 1000.0, L, true));
-        // Crossed back to near the extended centreline -> turn final.
-        assert!(pattern_advance(Leg::Base, -1200.0, -(FINAL_CAPTURE_M - 50.0), 800.0, 1000.0, L, true));
+    fn base_turns_final_one_radius_from_the_centreline() {
+        let geom = g();
+        // Still well left of the capture line -> hold.
+        assert!(!pattern_advance(Leg::Base, -geom.downwind_past_m, -(geom.final_capture_m + 200.0), &geom, L, true));
+        // Within one radius: the 90° turn rolls out on the centreline.
+        assert!(pattern_advance(Leg::Base, -geom.downwind_past_m, -(geom.final_capture_m - 50.0), &geom, L, true));
+    }
+
+    fn facts(terrain: Option<f64>, air: Option<&str>) -> SideFacts {
+        SideFacts { terrain_max_ft: terrain, airspace: air.map(|s| s.to_string()) }
+    }
+
+    #[test]
+    fn terrain_pick_switches_sides_and_raises_when_boxed_in() {
+        // The Gibraltar case: left downwind crosses the Rock (1,400 ft), right
+        // side is the flat bay — a default-left ask switches right at TPA.
+        let (left, tpa, why) =
+            choose_pattern(true, &facts(Some(1400.0), None), &facts(Some(50.0), None), 11.0, 1000.0);
+        assert!(!left, "switched off the Rock side");
+        assert!((tpa - 1011.0).abs() < 1.0);
+        assert_eq!(why, "switched_side_for_terrain");
+        // Clear both sides: the asked-for side stands.
+        let (left, _, why) =
+            choose_pattern(true, &facts(Some(30.0), None), &facts(Some(20.0), None), 11.0, 1000.0);
+        assert!(left);
+        assert_eq!(why, "default_side_clear");
+        // Boxed in (a valley field): fly the LOWER side, high enough to clear.
+        let (left, tpa, why) =
+            choose_pattern(true, &facts(Some(2000.0), None), &facts(Some(1500.0), None), 500.0, 1000.0);
+        assert!(!left, "the lower side");
+        assert!((tpa - 2500.0).abs() < 1.0, "raised to terrain + pattern height: {tpa}");
+        assert_eq!(why, "raised_for_terrain");
+        // No probe data: default side, default height — the old behavior.
+        let (left, tpa, why) = choose_pattern(true, &facts(None, None), &facts(None, None), 11.0, 1000.0);
+        assert!(left);
+        assert!((tpa - 1011.0).abs() < 1.0);
+        assert_eq!(why, "default_side_clear");
+    }
+
+    #[test]
+    fn airspace_fouls_a_side_like_terrain_does() {
+        // Default side flat but inside R-164: switch to the other flat side.
+        let (left, tpa, why) = choose_pattern(
+            true,
+            &facts(Some(20.0), Some("restricted area R 164")),
+            &facts(Some(30.0), None),
+            11.0,
+            1000.0,
+        );
+        assert!(!left, "switched away from the restricted side");
+        assert!((tpa - 1011.0).abs() < 1.0);
+        assert_eq!(why, "switched_side_for_airspace");
+        // Other side blocked by airspace, default side merely high terrain:
+        // stay on the default side, raised over its terrain.
+        let (left, tpa, why) = choose_pattern(
+            true,
+            &facts(Some(1400.0), None),
+            &facts(Some(20.0), Some("restricted area R 164")),
+            11.0,
+            1000.0,
+        );
+        assert!(left, "the airspace-free side, even with terrain");
+        assert!((tpa - 2400.0).abs() < 1.0, "raised over the Rock: {tpa}");
+        assert_eq!(why, "raised_for_terrain");
+        // Both sides inside restricted airspace: terrain safety alone picks
+        // the lower side, honestly labeled.
+        let (left, _, why) = choose_pattern(
+            true,
+            &facts(Some(1400.0), Some("restricted area R 164")),
+            &facts(Some(50.0), Some("restricted area R 164")),
+            11.0,
+            1000.0,
+        );
+        assert!(!left, "the lower-terrain side");
+        assert_eq!(why, "airspace_unavoidable");
+    }
+
+    /// Real-install dry run of the LXGB 27 side pick against the actual
+    /// airspace file (terrain unknown — the probe needs the sim):
+    /// `cargo test -- --ignored real_install_lxgb_side_pick --nocapture`
+    #[test]
+    #[ignore]
+    fn real_install_lxgb_side_pick() {
+        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let air = "/Users/duanelicudi/X-Plane 12/Custom Data/airspaces/airspace.txt";
+        let cands = nearby_runways(apt, 36.1515, -5.3412, 2.0).expect("apt.dat");
+        let rwy = cands.iter().find(|r| r.id == "27").expect("LXGB 27").clone();
+        let geom = Geometry::for_radius(turn_radius_m(41.0));
+        let poly_l = pattern_polyline(&rwy, &geom, rwy.length_m, true);
+        let poly_r = pattern_polyline(&rwy, &geom, rwy.length_m, false);
+        let spaces = crate::airspace::load_near(air, 36.1515, -5.3412, 0.5);
+        println!("no-go volumes near LXGB: {}", spaces.len());
+        let tpa = 11.0 + 1000.0;
+        let l_air = crate::airspace::first_conflict(&spaces, &poly_l, tpa).map(|a| a.spoken_name());
+        let r_air = crate::airspace::first_conflict(&spaces, &poly_r, tpa).map(|a| a.spoken_name());
+        println!("left (south, Rock side) airspace: {l_air:?}");
+        println!("right (north, bay side) airspace: {r_air:?}");
+        // Terrain from the real probe values seen live: Rock ~1,400 under the
+        // southern downwind, flat under the northern.
+        let l = SideFacts { terrain_max_ft: Some(1400.0), airspace: l_air };
+        let r = SideFacts { terrain_max_ft: Some(60.0), airspace: r_air };
+        let (left, tpa_msl, why) = choose_pattern(true, &l, &r, 11.0, 1000.0);
+        println!("DECISION: left={left} tpa={tpa_msl:.0} why={why}");
+        assert!(!left || tpa_msl > 1900.0, "never a 1,000 ft pattern over the Rock");
     }
 
     #[test]
@@ -550,6 +1118,6 @@ mod tests {
         assert_eq!(next_leg(Leg::Base), Some(Leg::Final));
         assert_eq!(next_leg(Leg::Final), None);
         // Final never self-advances (autoland owns it), whatever the position.
-        assert!(!pattern_advance(Leg::Final, -800.0, 0.0, 700.0, 1000.0, L, true));
+        assert!(!pattern_advance(Leg::Final, -800.0, 0.0, &g(), L, true));
     }
 }

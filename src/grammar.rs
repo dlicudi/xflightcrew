@@ -199,10 +199,19 @@ pub fn try_parse(
     // off and land") — checked on the raw text BEFORE the compound gate would
     // split them. Full auto first: "start up and fly a circuit" contains
     // "circuit" and must not fall to the circuit rule.
+    if let Some(c) = flight_plan_call(&t) {
+        return Some(vec![c]);
+    }
     if let Some(c) = full_auto_call(&t) {
         return Some(vec![c]);
     }
     if let Some(c) = circuit_call(&t) {
+        return Some(vec![c]);
+    }
+    // Fly a real published procedure ("fly the ILS", "shoot the approach", "fly
+    // the SID") — request-shaped, checked before the compound gate and never on
+    // an ATC readback ("cleared ILS approach ...").
+    if let Some(c) = procedure_call(&t) {
         return Some(vec![c]);
     }
     if t.is_empty() || is_compound(&t) {
@@ -360,6 +369,34 @@ fn has(t: &str, word: &str) -> bool {
     t.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == word)
 }
 
+/// The SimBrief-flight intent — full auto with the pilot's actual flight plan
+/// as the mission ("fly my flight plan", "fly the simbrief flight"). Checked
+/// BEFORE `full_auto_call` so "full auto, fly the flight plan" carries the
+/// flight flag. Request-shaped: the verb "fly" (or a full-auto phrase) is
+/// required, so "load the flight plan" (the GPS load) and "brief the flight
+/// plan" (the deterministic brief, handled upstream in main) never land here.
+fn flight_plan_call(t: &str) -> Option<ToolCall> {
+    let plan_words = t.contains("flight plan")
+        || t.contains("simbrief")
+        || t.contains("sim brief")
+        || t.contains("the plan");
+    if !plan_words {
+        return None;
+    }
+    let fly_shaped = has(t, "fly") || has(t, "flying") || t.contains("full auto");
+    if !fly_shaped {
+        return None;
+    }
+    // Never on a load/brief/read ask, even if "fly" appears somewhere.
+    if has(t, "load") || has(t, "program") || has(t, "brief") || has(t, "read") || has(t, "what") {
+        return None;
+    }
+    if has(t, "cancel") || has(t, "stop") || has(t, "abort") {
+        return Some(call("full_auto", json!({ "off": true })));
+    }
+    Some(call("full_auto", json!({ "flight": true })))
+}
+
 /// The `full_auto` intent — the entire flight from cold (power up, engine,
 /// taxi, line up, circuit). Request-shaped only; recognised before the compound
 /// gate because "start up and fly" carries "and". `None` when it isn't one.
@@ -415,6 +452,49 @@ fn circuit_call(t: &str) -> Option<ToolCall> {
     let right =
         has(t, "right") && (t.contains("circuit") || t.contains("pattern") || t.contains("traffic"));
     Some(call("full_auto", json!({ "right": right })))
+}
+
+/// The `fly_procedure` intent — fly a real published SID or approach from the
+/// CIFP. Request-shaped ("fly the ILS", "shoot the approach", "fly the SID");
+/// deliberately NOT triggered by an ATC readback ("cleared ILS approach runway
+/// two seven, report established"), which carries the clearance verbs. `None`
+/// when the utterance isn't a fly-the-procedure ask.
+fn procedure_call(t: &str) -> Option<ToolCall> {
+    // ATC readback shapes carry these — never route them to an actuator.
+    if t.contains("cleared") || t.contains("report") || t.contains("established") {
+        return None;
+    }
+    // The circuit/pattern words are the circuit orchestrator's, handled earlier.
+    if t.contains("circuit") || t.contains("pattern") {
+        return None;
+    }
+    let departure = t.contains("the departure") || t.contains("the sid") || t.contains("a sid");
+    let approach = t.contains("the approach") || t.contains("an approach") || t.contains("the ils")
+        || t.contains("the r nav") || t.contains("the rnav") || t.contains("the arrival")
+        || t.contains("me in") || t.contains("us in") || t.contains("me down");
+    let cancel = has(t, "cancel") || has(t, "stop") || has(t, "abort");
+    // Arming needs a fly-shaped verb; cancelling ("cancel the approach") needs
+    // only the cancel word plus a procedure word, no verb.
+    let verb = t.contains("fly") || t.contains("shoot") || t.starts_with("take us")
+        || t.contains("bring us in") || t.contains("bring us down");
+    if !verb && !cancel {
+        return None;
+    }
+    if departure {
+        return Some(if cancel {
+            call("fly_procedure", json!({ "off": true }))
+        } else {
+            call("fly_procedure", json!({ "kind": "departure" }))
+        });
+    }
+    if approach {
+        return Some(if cancel {
+            call("fly_procedure", json!({ "off": true }))
+        } else {
+            call("fly_procedure", json!({ "kind": "approach" }))
+        });
+    }
+    None
 }
 
 /// on/off (+ synonyms) as a whole word; `None` if neither is present.
@@ -1888,6 +1968,36 @@ mod tests {
         assert_eq!(one("do everything").unwrap().0, "full_auto");
         assert_eq!(one("start up and fly a circuit").unwrap().0, "full_auto");
         assert_eq!(one("cancel full auto").unwrap().1, json!({"off": true}));
+        // The SimBrief flight-plan mission — full auto with the plan as the
+        // mission. Request-shaped: "fly ..." arms it, load/brief never do.
+        assert_eq!(one("fly my flight plan").unwrap(), ("full_auto".into(), json!({"flight": true})));
+        assert_eq!(one("fly the flight plan").unwrap().1, json!({"flight": true}));
+        assert_eq!(one("fly the simbrief flight").unwrap().1, json!({"flight": true}));
+        assert_eq!(one("fly my simbrief plan").unwrap().1, json!({"flight": true}));
+        assert_eq!(one("full auto fly the flight plan").unwrap().1, json!({"flight": true}));
+        assert_eq!(one("cancel the flight plan flying").unwrap().1, json!({"off": true}));
+        // Load and brief shapes never arm the flight (upstream deterministic
+        // paths own them; the grammar must not steal them either).
+        assert!(one("load the flight plan").is_none_or(|(tool, args)| tool != "full_auto" || args != json!({"flight": true})));
+        assert!(one("what is our flight plan").is_none_or(|(tool, args)| tool != "full_auto" || args != json!({"flight": true})));
+        // A bare "full auto" stays a circuit, never silently a cross-country.
+        assert_eq!(one("full auto").unwrap().1, json!({"right": false}));
+        // Fly a real published procedure — approach and departure.
+        assert_eq!(one("fly the approach").unwrap(), ("fly_procedure".into(), json!({"kind": "approach"})));
+        assert_eq!(one("fly the ILS").unwrap().0, "fly_procedure");
+        assert_eq!(one("shoot the approach").unwrap().0, "fly_procedure");
+        assert_eq!(one("fly me in").unwrap().0, "fly_procedure");
+        assert_eq!(one("fly the arrival").unwrap().1, json!({"kind": "approach"}));
+        assert_eq!(one("fly the departure").unwrap(), ("fly_procedure".into(), json!({"kind": "departure"})));
+        assert_eq!(one("fly the SID").unwrap().1, json!({"kind": "departure"}));
+        assert_eq!(one("cancel the approach").unwrap(), ("fly_procedure".into(), json!({"off": true})));
+        // The ATC clearance readback carries "cleared ILS approach ... report
+        // established" — it must NEVER arm the follower (the safety trap).
+        assert!(one("cleared ILS approach runway two seven report established")
+            .is_none_or(|(tool, _)| tool != "fly_procedure"));
+        assert!(one("established on the ILS").is_none_or(|(tool, _)| tool != "fly_procedure"));
+        // A circuit ask stays with the circuit orchestrator, not the procedure.
+        assert_eq!(one("fly a circuit").unwrap().0, "full_auto");
         // Line up — the maneuver between the hold and the takeoff.
         assert_eq!(one("line us up").unwrap(), ("line_up".into(), json!({})));
         assert_eq!(one("can you line me up to the runway").unwrap().0, "line_up");
