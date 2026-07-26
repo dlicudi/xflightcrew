@@ -1530,6 +1530,16 @@ async fn run_session(
                 reporter.heard(&heard.text, heard.confidence);
                 spoken_confidence = Some(heard.confidence);
                 from_radio = radio;
+                // Blackbox every spoken capture with its confidence, so the drop /
+                // confirm / act thresholds can be tuned against the real distribution
+                // after a flight (none was logged before, so the bands are set blind).
+                blackbox::record(
+                    "heard",
+                    serde_json::json!({
+                        "transcript": &heard.text, "confidence": heard.confidence,
+                        "radio": radio, "explicit": explicit,
+                    }),
+                );
                 // Continuous mode acts on the transcript directly — the downstream
                 // domain gate (`looks_like_command`) filters non-commands.
                 (heard.text, false)
@@ -1675,6 +1685,11 @@ async fn run_session(
             continue;
         }
 
+        // Set when a marginal-confidence command is let through to be read back
+        // for a yes/no instead of dropped (the confirm loop below honours it).
+        // Fresh each utterance.
+        let mut force_confirm_low = false;
+
         // Confidence + echo gates (spoken input only) — now that abort has had its
         // chance. Confidence: drop what whisper wasn't sure of. Echo: drop the
         // copilot's own readback bleeding back through the speakers, so it can't
@@ -1705,17 +1720,54 @@ async fn run_session(
                     );
                     continue;
                 }
-                if explicit && mode::copilot_enabled() {
-                    say(
-                        &voice,
-                        &reporter,
-                        ui::LogKind::Info,
-                        readback::one_of(&["Say again?", "Didn't catch that.", "One more time?"]),
-                    );
-                } else {
-                    reporter.log(ui::LogKind::Info, "low confidence, ignored");
+                // Non-radio: classify the marginal capture. "Deliberate" means a
+                // PTT/wake command with the crew actually active (ATC-only has no
+                // crew to answer). The grammar match (not the LLM) is required so a
+                // marginal reading is never fed to the model to guess at.
+                let maps = grammar::try_parse(&grammar::normalize(&command), &registry, &profile)
+                    .is_some();
+                let deliberate = explicit && mode::copilot_enabled();
+                match classify_confidence(
+                    confidence,
+                    config.stt_min_confidence,
+                    config.stt_confirm_floor,
+                    deliberate,
+                    maps,
+                ) {
+                    // Marginal but a recognised, deliberate command: read it back for
+                    // a yes/no (the confirm loop below) rather than dropping it — a
+                    // shaky capture costs one word, not the whole command again.
+                    ConfidenceAction::Confirm => {
+                        force_confirm_low = true;
+                        reporter.log(
+                            ui::LogKind::Info,
+                            format!(
+                                "marginal confidence {confidence:.2}, will confirm before acting"
+                            ),
+                        );
+                        // fall through to dispatch
+                    }
+                    ConfidenceAction::SayAgain => {
+                        say(
+                            &voice,
+                            &reporter,
+                            ui::LogKind::Info,
+                            readback::one_of(&[
+                                "Say again?",
+                                "Didn't catch that.",
+                                "One more time?",
+                            ]),
+                        );
+                        continue;
+                    }
+                    // Not deliberate (continuous-mode ambient audio): ignore silently.
+                    ConfidenceAction::Ignore => {
+                        reporter.log(ui::LogKind::Info, "low confidence, ignored");
+                        continue;
+                    }
+                    // Unreachable inside `confidence < min`, but total for clarity.
+                    ConfidenceAction::Act => {}
                 }
-                continue;
             }
             if voice.is_self_echo(&command) {
                 reporter.log(ui::LogKind::Info, "ignored self-echo (own readback)");
@@ -2779,6 +2831,12 @@ async fn run_session(
                 } else {
                     None
                 };
+                // A command heard at marginal confidence is read back for a yes/no
+                // even when the tool isn't safety-critical — this reuses the gate to
+                // recover a shaky capture ("Confirm, I heard gear up?") rather than
+                // making the pilot repeat the whole thing.
+                let intent =
+                    intent.or_else(|| force_confirm_low.then(|| format!("I heard {command}")));
                 let Some(intent) = intent else {
                     break 'confirm true;
                 };
@@ -2824,6 +2882,10 @@ async fn run_session(
                         {
                             Ok(mut cs) if !cs.is_empty() => {
                                 call = cs.remove(0);
+                                // The correction WAS the pilot's clear intent, so the
+                                // re-picked tool no longer needs the marginal read-back
+                                // (a safety-critical one still self-confirms).
+                                force_confirm_low = false;
                                 reporter.log(
                                     ui::LogKind::Tool,
                                     format!("{} {}", call.name, call.arguments),
@@ -3522,6 +3584,46 @@ const NEGATIONS: &[&str] = &[
     "wrong",
     "no",
 ];
+
+/// What to do with a spoken (non-radio) command given its STT confidence — the
+/// three-band model that replaces a hard act/drop cutoff.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfidenceAction {
+    /// Confident enough — act on it outright.
+    Act,
+    /// Marginal, but a deliberate command the grammar recognises — read it back
+    /// for a yes/no before acting, rather than dropping a recoverable capture.
+    Confirm,
+    /// A deliberate command we couldn't make out — ask for it again.
+    SayAgain,
+    /// Not deliberate (continuous-mode ambient, or crew off) — ignore silently.
+    Ignore,
+}
+
+/// Classify a spoken command by confidence. `deliberate` = a PTT/wake command
+/// with the crew active (so there's someone to answer). `grammar_maps` = the
+/// deterministic grammar recognised it (we never hand a marginal reading to the
+/// LLM). The middle `[floor, min)` band is where a recognised deliberate command
+/// earns a read-back-and-confirm instead of being dropped.
+fn classify_confidence(
+    confidence: f32,
+    min: f32,
+    floor: f32,
+    deliberate: bool,
+    grammar_maps: bool,
+) -> ConfidenceAction {
+    if confidence >= min {
+        return ConfidenceAction::Act;
+    }
+    if !deliberate {
+        return ConfidenceAction::Ignore;
+    }
+    if confidence >= floor && grammar_maps {
+        ConfidenceAction::Confirm
+    } else {
+        ConfidenceAction::SayAgain
+    }
+}
 
 /// Is a spoken reply an affirmative confirmation? Defaults to `false` (safe) —
 /// only an explicit yes proceeds; an explicit no, or anything unclear, cancels.
@@ -6689,8 +6791,33 @@ fn command_hints() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_abort, is_affirmative, is_undo, join_and, radio_panel_line, undoable_drefs, Ptt,
+        classify_confidence, is_abort, is_affirmative, is_undo, join_and, radio_panel_line,
+        undoable_drefs, ConfidenceAction, Ptt,
     };
+
+    #[test]
+    fn confidence_bands_act_confirm_sayagain_ignore() {
+        use ConfidenceAction::*;
+        let (min, floor) = (0.35, 0.22);
+        // Above the act threshold: always act, grammar/deliberate irrelevant.
+        assert_eq!(classify_confidence(0.40, min, floor, true, true), Act);
+        assert_eq!(classify_confidence(0.40, min, floor, false, false), Act);
+        // Marginal band + deliberate + grammar recognises it → confirm.
+        assert_eq!(classify_confidence(0.30, min, floor, true, true), Confirm);
+        // Marginal but only the LLM could resolve it → don't guess, say again.
+        assert_eq!(classify_confidence(0.30, min, floor, true, false), SayAgain);
+        // Below the floor, even a recognised command is too garbled → say again.
+        assert_eq!(classify_confidence(0.15, min, floor, true, true), SayAgain);
+        // Not deliberate (continuous ambient / crew off): ignore, never speak.
+        assert_eq!(classify_confidence(0.30, min, floor, false, true), Ignore);
+        assert_eq!(classify_confidence(0.15, min, floor, false, false), Ignore);
+        // Floor is inclusive; just under it is not a confirm.
+        assert_eq!(classify_confidence(floor, min, floor, true, true), Confirm);
+        assert_eq!(
+            classify_confidence(floor - 0.01, min, floor, true, true),
+            SayAgain
+        );
+    }
 
     #[test]
     fn ptt_routes_intercom_and_radio_to_separate_channels() {

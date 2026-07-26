@@ -56,9 +56,17 @@ pub struct Config {
     /// Raise it in a noisy room, lower it if quiet speech is missed.
     pub vad_threshold: f32,
     /// Minimum STT confidence (mean token probability, 0.0..1.0) to act on an
-    /// utterance. Below this, the copilot asks you to say it again instead of
-    /// guessing. Raise to be stricter; lower if clear commands get rejected.
+    /// utterance outright. Below this, the copilot asks you to say it again or
+    /// (in the confirm band below) reads back what it heard for a yes/no instead
+    /// of guessing. Raise to be stricter; lower if clear commands get rejected.
     pub stt_min_confidence: f32,
+    /// Floor of the "confirm, don't drop" band. A PTT/wake command heard between
+    /// this and `stt_min_confidence` isn't discarded — the copilot reads back
+    /// what it heard ("Confirm, I heard gear up?") and acts on a yes, so a
+    /// marginal capture costs one word, not the whole command again. Below this
+    /// floor the audio is too garbled to guess at and gets the "say again". Set
+    /// equal to `stt_min_confidence` to disable the band entirely.
+    pub stt_confirm_floor: f32,
     /// Trailing silence (ms) that ends an utterance in continuous mode. Lower
     /// feels snappier but clips mid-command hesitations; raise it if a slight
     /// pause cuts you off. Default 900.
@@ -254,6 +262,7 @@ impl Config {
             ptt_dataref: env_or("XCOPILOT_PTT_DATAREF", "xcopilot/ptt_active"),
             vad_threshold: env_or("XCOPILOT_VAD_RMS", "0.012").parse().unwrap_or(0.012),
             stt_min_confidence: env_or("XCOPILOT_STT_MIN_CONFIDENCE", "0.35").parse().unwrap_or(0.35),
+            stt_confirm_floor: env_or("XCOPILOT_STT_CONFIRM_FLOOR", "0.22").parse().unwrap_or(0.22),
             end_silence_ms: env_or("XCOPILOT_END_SILENCE_MS", "900").parse().unwrap_or(900),
             mic_gate_tail_ms: env_or("XCOPILOT_MIC_GATE_TAIL_MS", "900").parse().unwrap_or(900),
             ui: env_or("XCOPILOT_UI", default_ui()),

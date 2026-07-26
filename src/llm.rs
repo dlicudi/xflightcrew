@@ -875,6 +875,7 @@ mod tests {
             simbrief_id: String::new(),
             vad_threshold: 0.012,
             stt_min_confidence: 0.5,
+            stt_confirm_floor: 0.22,
             end_silence_ms: 900,
             mic_gate_tail_ms: 900,
             llm_enabled: true, // these tests exercise the (retained) LLM paths
