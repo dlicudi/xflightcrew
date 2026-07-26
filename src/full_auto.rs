@@ -638,6 +638,31 @@ async fn fly_route(
         crate::circuit::transmit(crate::circuit::radio_call(callsign, &call));
         event("final_call", json!({ "runway": landing_rwy }));
     }
+
+    // Gate to gate: once autoland is down and stopped (it goes inactive after
+    // "down and stopped, your aircraft"), taxi to PARKING on our own — request
+    // the taxi-in and drive to the stand, the arrival mirror of the departure
+    // taxi we ran at the start. Bounded so a balk/abort can't hang here, and
+    // skipped unless we actually got the aircraft down on the ground (autoland
+    // also goes inactive on a go-around, climbing away).
+    if crate::autoland::ACTIVE.load(Relaxed) && !ABORT.load(SeqCst) {
+        let landed = wait_until(1800.0, 1000, || async {
+            !crate::autoland::ACTIVE.load(Relaxed)
+        })
+        .await;
+        let on_ground = xp.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) > 0.5;
+        if landed && on_ground && !ABORT.load(SeqCst) {
+            announce(voice, Priority::Advisory, "Down. I'll taxi us to parking.");
+            event("taxi_in", json!({}));
+            crate::taxi_in::start(
+                config.xplane_base_url.clone(),
+                config.clone(),
+                voice.clone(),
+                tools.taxi.park_brake_valve_set,
+                tools.taxi.prop.clone(),
+            );
+        }
+    }
     event("arrival_owns", json!({}));
     ACTIVE.store(false, SeqCst);
 }
