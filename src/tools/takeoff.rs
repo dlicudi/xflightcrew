@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx};
+use crate::aircraft::PropProfile;
 use crate::autotakeoff;
 use crate::party_line;
 use crate::tools::autopilot::ApConfig;
@@ -27,6 +28,9 @@ pub struct AutoTakeoff {
     pub retract_gear: bool,
     /// POH takeoff ground roll, meters, when the profile knows it.
     pub takeoff_roll_m: Option<f64>,
+    /// Constant-speed prop levers, advanced to full-forward before the roll.
+    /// A feathered turboprop makes no thrust at any power (`None` on pistons).
+    pub prop: Option<PropProfile>,
 }
 
 #[derive(Deserialize, Default)]
@@ -152,6 +156,9 @@ impl Tool for AutoTakeoff {
                     .to_string(),
             );
         }
+        // Props full forward before the throttle ramps — feathered blades make
+        // no thrust and the roll would stall against the stagnation reject.
+        super::prop::advance_for_ground_roll(ctx.xplane, &self.prop).await;
         autotakeoff::start(
             ctx.config.xplane_base_url.clone(),
             ctx.voice.cloned(),

@@ -52,6 +52,8 @@ const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
 const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
 const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
+const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
+const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 
 const M_TO_FT: f64 = 3.280_84;
 const M_PER_NM: f64 = 1852.0;
@@ -375,6 +377,17 @@ pub fn choose_pattern(
     }
 }
 
+/// Which pattern side keeps the downwind SOUTH (over the sea, around the Rock)
+/// for a runway of the given true course — returns `left` (true = left-hand).
+/// At Gibraltar south is the only flyable side (north is Spain); the runway
+/// sets the turn: departing 09 (east) the sea is to the RIGHT → right-hand
+/// (clockwise); departing 27 (west) it's to the LEFT → left-hand.
+pub fn sea_side_is_left(course_deg: f64) -> bool {
+    let right_normal = (course_deg + 90.0).rem_euclid(360.0);
+    // Right of course points south (bearing 90..270) → fly right-hand (not left).
+    !(90.0..270.0).contains(&right_normal)
+}
+
 /// A point in the runway frame (`a_m` along the takeoff course from the
 /// departure threshold, `x_m` right of it) → lat/lon.
 fn frame_to_latlon(rwy: &crate::autoland::Runway, a_m: f64, x_m: f64) -> (f64, f64) {
@@ -409,6 +422,203 @@ fn pattern_polyline(rwy: &crate::autoland::Runway, g: &Geometry, runway_len_m: f
         pts.push((a_dn + (0.0 - a_dn) * i as f64 / 4.0, 0.0));
     }
     pts.into_iter().map(|(a, x)| frame_to_latlon(rwy, a, x)).collect()
+}
+
+/// How close (metres) to an authored waypoint counts as reaching it. Generous,
+/// so the slow AP turn rolls through the corner instead of circling the point.
+const AUTHORED_CAPTURE_M: f64 = 350.0;
+
+/// One authored circuit waypoint, in the departure-runway frame (see
+/// `frame_to_latlon`): `a_m` along the takeoff course from the threshold, `x_m`
+/// right of it, and the target altitude (MSL) to be at approaching it.
+#[derive(Debug, Clone, Copy)]
+struct AuthoredWpt {
+    a_m: f64,
+    x_m: f64,
+    alt_msl_ft: f64,
+}
+
+/// A hand-authored circuit for a field where the parametric rectangle can't be
+/// flown clear — Gibraltar (LXGB), where R-164 (Spanish restricted, GND-FL300)
+/// blankets both sides of any standard pattern (`choose_pattern` returns
+/// `airspace_unavoidable`). The airspace can't be dodged — nothing at LXGB can,
+/// it's the real political geometry — but the ROCK'S TERRAIN can, and a tight,
+/// sane track over the bay beats flying the rectangle through the granite. The
+/// route stays on the low-terrain side `choose_pattern` picked, holds the
+/// downwind WIDE to carry the ground track around the Rock's flank, and rejoins
+/// a straight final where autoland takes it. Scaled to the same geometry, so
+/// the pattern speed-hold keeps it this size (at climb power it balloons back
+/// over the Rock). `None` at every other field. DRAFT coordinates — the caller
+/// validates every waypoint against the live terrain probe before flying it.
+fn authored_circuit(
+    rwy: &crate::autoland::Runway,
+    geom: &Geometry,
+    field_elev_ft: f64,
+    tpa_msl_ft: f64,
+    left: bool,
+) -> Option<Vec<AuthoredWpt>> {
+    if rwy.icao != "LXGB" {
+        return None;
+    }
+    let side = if left { -1.0 } else { 1.0 };
+    let handoff = field_elev_ft + HANDOFF_AGL_FT;
+    let w = geom.width_m;
+    let up = rwy.length_m + geom.upwind_past_m;
+    let dn = geom.downwind_past_m;
+    Some(vec![
+        // Climb out on the runway heading.
+        AuthoredWpt { a_m: up, x_m: 0.0, alt_msl_ft: tpa_msl_ft },
+        // Turn to the bay side; downwind held wide to clear the Rock's flank.
+        AuthoredWpt { a_m: up, x_m: side * w * 1.3, alt_msl_ft: tpa_msl_ft },
+        AuthoredWpt { a_m: 0.0, x_m: side * w * 1.3, alt_msl_ft: tpa_msl_ft },
+        AuthoredWpt { a_m: -dn, x_m: side * w * 1.3, alt_msl_ft: tpa_msl_ft },
+        // Base back over the water, descending to the handoff height.
+        AuthoredWpt { a_m: -dn * 1.15, x_m: side * w * 0.6, alt_msl_ft: handoff },
+        // Rejoin the centreline on short final — autoland takes it here.
+        AuthoredWpt { a_m: -dn * 0.5, x_m: 0.0, alt_msl_ft: handoff },
+    ])
+}
+
+/// Probe an authored route against the terrain it's flown at: every waypoint
+/// must clear the ground by [`TERRAIN_CLEAR_FT`]. A missing probe (no plugin)
+/// reads as clear — the old fail-open behavior. Returns false if any sampled
+/// point is too low, so the caller falls back to the rectangle rather than fly
+/// hand-authored coordinates into a hill.
+async fn authored_route_clears_terrain(
+    xp: &XPlaneClient,
+    rwy: &crate::autoland::Runway,
+    route: &[AuthoredWpt],
+) -> bool {
+    for wp in route {
+        let (lat, lon) = frame_to_latlon(rwy, wp.a_m, wp.x_m);
+        if let Some(e) = crate::terrain::max_elevation_ft(xp, &[(lat, lon)]).await {
+            if wp.alt_msl_ft - e < TERRAIN_CLEAR_FT {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Fly an authored waypoint route (the LXGB Rock circuit), then hand the final
+/// to autoland. Same control surface as the rectangle loop — HDG bug + VS + the
+/// pattern speed-hold — but steering great-circle to each waypoint instead of
+/// the leg geometry. The last waypoint sits on short final.
+#[allow(clippy::too_many_arguments)]
+async fn fly_authored_route(
+    xp: XPlaneClient,
+    base_url: String,
+    voice: Option<Voice>,
+    route: Vec<AuthoredWpt>,
+    rwy: crate::autoland::Runway,
+    mag_var: f64,
+    pattern_kts: f64,
+    callsign: Option<String>,
+    apt_dat: String,
+    cfg: crate::tools::autopilot::ApConfig,
+    approach_ias: f64,
+) {
+    let rwy_id = rwy.id.clone();
+    let mut bug_mag = xp.get_float(HDG_BUG).await.unwrap_or(rwy.course_deg);
+    let mut last_vs_cmd: Option<f64> = None;
+    let mut prev_ias: Option<(f64, std::time::Instant)> = None;
+    let mut ias_trend = 0.0_f64;
+    let mut wpt_idx = 0usize;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if ABORT.load(Ordering::SeqCst) {
+            stand_down(&voice, "Circuit cancelled. Your aircraft.", "abort_authored");
+            return;
+        }
+        if crate::xplane::sim_frozen(&xp).await {
+            continue;
+        }
+        let (lat_r, lon_r, elev_r, psi_r, hp_r, hdg_st, vs_st, ias_r, thr_r) = tokio::join!(
+            xp.get_float(LAT),
+            xp.get_float(LON),
+            xp.get_float(ELEV_M),
+            xp.get_float(PSI_TRUE),
+            xp.get_float(HPATH),
+            xp.get_float(HDG_STATUS),
+            xp.get_float(VS_STATUS),
+            xp.get_float(IAS),
+            xp.get_float(THROTTLE_ALL),
+        );
+        let (Ok(lat), Ok(lon)) = (lat_r, lon_r) else { continue };
+        let alt_msl_ft = elev_r.map(|m| m * M_TO_FT).unwrap_or(f64::NAN);
+        let (hdg_on, vs_on) = (hdg_st.unwrap_or(1.0) > 0.5, vs_st.unwrap_or(1.0) > 0.5);
+
+        let wp = route[wpt_idx];
+        let (wlat, wlon) = frame_to_latlon(&rwy, wp.a_m, wp.x_m);
+        // Crab so the AP holds the ground TRACK to the waypoint, like the legs.
+        let crab = match (psi_r, hp_r) {
+            (Ok(psi), Ok(hp)) => {
+                (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0)
+            }
+            _ => 0.0,
+        };
+        let want_hdg = crate::nav::bearing_deg(lat, lon, wlat, wlon) + crab;
+        bug_mag = slew_bug(bug_mag, true_to_mag(want_hdg, mag_var), BUG_SLEW_PER_TICK);
+        let _ = xp.set_float(HDG_BUG, bug_mag).await;
+        if !hdg_on {
+            let _ = xp.run_command(CMD_SERVOS_ON).await;
+            let _ = xp.run_command(CMD_HDG_MODE).await;
+        }
+
+        // Vertical: VS toward the waypoint altitude (the takeoff's proven recipe).
+        let vs_cmd = if alt_msl_ft.is_finite() {
+            ((wp.alt_msl_ft - alt_msl_ft) * 3.0).clamp(-500.0, 700.0)
+        } else {
+            0.0
+        };
+        if !vs_on {
+            let _ = xp.run_command(CMD_VS_MODE).await;
+            last_vs_cmd = None;
+        }
+        if last_vs_cmd.is_none_or(|v| (v - vs_cmd).abs() > 40.0) {
+            let _ = xp.set_float(VS_DIAL, vs_cmd).await;
+            last_vs_cmd = Some(vs_cmd);
+        }
+
+        // Power holds the pattern speed — the same law the rectangle loop uses.
+        if let (Ok(ias), Ok(thr)) = (ias_r, thr_r) {
+            let t_now = std::time::Instant::now();
+            if let Some((prev, t_prev)) = prev_ias {
+                let dt = t_now.duration_since(t_prev).as_secs_f64();
+                if (0.1..=2.0).contains(&dt) {
+                    ias_trend = 0.6 * ias_trend + 0.4 * (ias - prev) / dt;
+                }
+            }
+            prev_ias = Some((ias, t_now));
+            let delta = crate::tools::speedhold::throttle_adjust(pattern_kts - ias, ias_trend);
+            if delta != 0.0 {
+                let _ = xp.set_float(THROTTLE_ALL, (thr + delta).clamp(0.0, 1.0)).await;
+            }
+        }
+
+        let d_m = crate::nav::haversine_nm(lat, lon, wlat, wlon) * M_PER_NM;
+        crate::blackbox::record(
+            "circuit",
+            serde_json::json!({
+                "event": "authored_leg", "wpt": wpt_idx, "d_m": d_m, "bug": bug_mag,
+                "alt_msl": alt_msl_ft, "tgt_alt": wp.alt_msl_ft, "cmd_vs": vs_cmd,
+            }),
+        );
+
+        if d_m < AUTHORED_CAPTURE_M {
+            wpt_idx += 1;
+            if wpt_idx >= route.len() {
+                break;
+            }
+        }
+    }
+    // The last waypoint sits on short final — hand the landing to autoland.
+    alert(&voice, Priority::Advisory, "Turning final. Landing us.");
+    transmit(radio_call(&callsign, &format!("final runway {}", spell_runway(&rwy_id))));
+    crate::blackbox::record("circuit", serde_json::json!({"event": "handoff_autoland_authored"}));
+    crate::autoland::ABORT.store(false, Ordering::SeqCst);
+    crate::autoland::run_autoland(base_url, apt_dat, cfg, approach_ias, voice, None, None);
+    ACTIVE.store(false, Ordering::SeqCst);
 }
 
 /// Spawn the circuit orchestrator on its own thread + runtime + client, the
@@ -478,6 +688,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // rectangle into loops (LXGB, 2026-07-24).
     let gs_est_mps = p.takeoff.vy_kts.max(60.0) * 0.514_444 * 1.1;
     let geom = Geometry::for_radius(turn_radius_m(gs_est_mps));
+    // The pattern SPEED the throttle holds in the loop (~Vy), so the flown turn
+    // radius matches the geometry above — a pattern flown at climb power runs
+    // away to Vne and balloons ~3x wider (LXGB, 2026-07-26). Captured here,
+    // before `p.takeoff` is moved into the takeoff loop.
+    let pattern_kts = p.takeoff.vy_kts.max(60.0);
 
     // The world under BOTH candidate patterns: terrain probed from the sim
     // itself, and the no-go airspace polygons the G1000 draws (OpenAir file).
@@ -506,6 +721,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     };
     let (left, tpa_msl_ft, side_pick) =
         choose_pattern(p.left_pattern, &l_facts, &r_facts, field_elev_ft, p.tpa_agl_ft);
+    // Gibraltar: the ONLY safe side is SOUTH — over the sea, looping around the
+    // Rock. NORTH is Spain (restricted, foreign soil). choose_pattern picks the
+    // LOWER-TERRAIN side, which at LXGB is the flat isthmus to the north, and it
+    // flew the pattern straight into Spanish airspace (2026-07-26). Override to
+    // the sea side; the runway sets the turn direction — 09 loops right
+    // (clockwise), 27 loops left (anticlockwise), both staying over the water.
+    let (left, side_pick) = if rwy.icao == "LXGB" {
+        (sea_side_is_left(rwy_course), "lxgb_south_over_the_sea")
+    } else {
+        (left, side_pick)
+    };
     crate::blackbox::record(
         "circuit",
         serde_json::json!({
@@ -584,6 +810,45 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         return;
     }
     crate::blackbox::record("circuit", serde_json::json!({"event": "takeoff_handoff", "agl_ft": agl_ft}));
+
+    // --- Phase 2a: an AUTHORED track, where the parametric rectangle can't be
+    // flown clear (LXGB — R-164 blankets both sides, so the rectangle flies
+    // through Spanish airspace AND the Rock). The airspace is unavoidable here,
+    // but the route keeps the ground track over the bay and around the Rock's
+    // terrain. Validated against the live terrain probe first; if any waypoint
+    // isn't clear (a wrong hand-authored point, an off-nominal start), fall
+    // back to the standard pattern rather than fly it into a hill.
+    if let Some(route) = authored_circuit(&rwy, &geom, field_elev_ft, tpa_msl_ft, left) {
+        if authored_route_clears_terrain(&xp, &rwy, &route).await {
+            crate::blackbox::record(
+                "circuit",
+                serde_json::json!({"event": "authored_route", "wpts": route.len()}),
+            );
+            alert(&voice, Priority::Advisory, "Airborne. Flying the bay circuit, around the Rock.");
+            let mag_var = xp.get_float(MAG_VAR).await.unwrap_or(0.0);
+            fly_authored_route(
+                XPlaneClient::new(base_url.clone()),
+                base_url.clone(),
+                voice.clone(),
+                route,
+                rwy.clone(),
+                mag_var,
+                pattern_kts,
+                callsign.clone(),
+                p.apt_dat.clone(),
+                p.cfg.clone(),
+                p.approach_ias,
+            )
+            .await;
+            return;
+        }
+        crate::blackbox::record("circuit", serde_json::json!({"event": "authored_route_unsafe"}));
+        alert(
+            &voice,
+            Priority::Caution,
+            "The Rock circuit isn't clear from here. Flying the standard pattern.",
+        );
+    }
     alert(&voice, Priority::Advisory, "Airborne. Flying the pattern.");
 
     // --- Phase 2: the pattern rides the AP EXACTLY as the takeoff left it —
@@ -616,6 +881,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // VS-dial bookkeeping (the takeoff's recipe: engage syncs the dial away,
     // so rewrite after any re-engage; skip no-op writes otherwise).
     let mut last_vs_cmd: Option<f64> = None;
+    // Speed-hold bookkeeping: power works the throttle to hold `pattern_kts`,
+    // leading on the airspeed trend EMA'd tick to tick (the flight law's input).
+    let mut prev_ias: Option<(f64, std::time::Instant)> = None;
+    let mut ias_trend = 0.0_f64;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -638,6 +907,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             xp.get_float(HDG_STATUS),
             xp.get_float(VS_STATUS),
         );
+        let (ias_r, thr_r) = tokio::join!(xp.get_float(IAS), xp.get_float(THROTTLE_ALL));
         let (Ok(lat), Ok(lon)) = (lat, lon) else { continue };
         let agl_ft = agl_m.unwrap_or(0.0) * M_TO_FT;
         let alt_msl_ft = elev_m.map(|m| m * M_TO_FT).unwrap_or(f64::NAN);
@@ -725,6 +995,29 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             last_vs_cmd = Some(vs_cmd);
         }
 
+        // --- Power for speed: the throttle holds the pattern speed (~Vy) while
+        // the VS law above flies altitude. Left at climb power the Twin Otter
+        // ran the whole pattern up to Vne (202 KIAS), ~3x the planned turn
+        // radius, straight through the Spanish airspace choose_pattern had tried
+        // to avoid (LXGB, 2026-07-26). The flight speed-hold law, folded into
+        // this tick; autoland re-takes the throttle at the handoff below.
+        let mut ias_now = f64::NAN;
+        if let (Ok(ias), Ok(thr)) = (ias_r, thr_r) {
+            ias_now = ias;
+            let t_now = std::time::Instant::now();
+            if let Some((prev, t_prev)) = prev_ias {
+                let dt = t_now.duration_since(t_prev).as_secs_f64();
+                if (0.1..=2.0).contains(&dt) {
+                    ias_trend = 0.6 * ias_trend + 0.4 * (ias - prev) / dt;
+                }
+            }
+            prev_ias = Some((ias, t_now));
+            let delta = crate::tools::speedhold::throttle_adjust(pattern_kts - ias, ias_trend);
+            if delta != 0.0 {
+                let _ = xp.set_float(THROTTLE_ALL, (thr + delta).clamp(0.0, 1.0)).await;
+            }
+        }
+
         crate::blackbox::record(
             "circuit",
             serde_json::json!({
@@ -733,6 +1026,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 "bug": bug_mag, "tgt": target_mag, "psi": psi_v,
                 "hdg_on": hdg_on, "vs_on": vs_on, "cmd_vs": vs_cmd,
                 "alt_msl": alt_msl_ft, "target_alt": target_alt,
+                "ias": ias_now, "pat_kts": pattern_kts,
             }),
         );
 
@@ -792,6 +1086,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                     p.cfg.clone(),
                     p.approach_ias,
                     voice.clone(),
+                    None,
                     None,
                 );
                 // The circuit's job is done; autoland owns the aircraft now.
@@ -1119,5 +1414,53 @@ mod tests {
         assert_eq!(next_leg(Leg::Final), None);
         // Final never self-advances (autoland owns it), whatever the position.
         assert!(!pattern_advance(Leg::Final, -800.0, 0.0, &g(), L, true));
+    }
+
+    fn lxgb_rwy() -> crate::autoland::Runway {
+        crate::autoland::Runway {
+            icao: "LXGB".into(), id: "27".into(), thr_lat: 36.1508, thr_lon: -5.3385,
+            course_deg: 267.5, length_m: 1680.0, surface: 1, dist_nm: 0.0, elev_ft: 11.0,
+        }
+    }
+
+    #[test]
+    fn gibraltar_loops_south_over_the_sea_by_runway() {
+        // 09 (east): sea is to the right → right-hand (clockwise), left = false.
+        assert!(!sea_side_is_left(87.5));
+        assert!(!sea_side_is_left(90.0));
+        // 27 (west): sea is to the left → left-hand (anticlockwise), left = true.
+        assert!(sea_side_is_left(267.5));
+        assert!(sea_side_is_left(270.0));
+    }
+
+    #[test]
+    fn authored_circuit_only_at_lxgb() {
+        let mut r = lxgb_rwy();
+        assert!(authored_circuit(&r, &g(), 11.0, 1074.0, true).is_some());
+        r.icao = "EGLL".into();
+        assert!(authored_circuit(&r, &g(), 11.0, 1074.0, true).is_none());
+    }
+
+    #[test]
+    fn authored_circuit_stays_on_the_bay_side_and_ends_on_the_centreline() {
+        let route = authored_circuit(&lxgb_rwy(), &g(), 11.0, 1074.0, true).unwrap();
+        // Left pattern → every offset is on the left (x_m <= 0), never crossing
+        // to the Rock side.
+        assert!(route.iter().all(|w| w.x_m <= 0.1), "all waypoints on the picked side");
+        // Upwind starts on the centreline, the last waypoint returns to it for
+        // the autoland handoff.
+        assert!((route.first().unwrap().x_m).abs() < 0.1);
+        assert!((route.last().unwrap().x_m).abs() < 0.1);
+        // The downwind is held wider than the base — the "around the Rock" bulge.
+        let max_out = route.iter().map(|w| w.x_m.abs()).fold(0.0, f64::max);
+        assert!(max_out > g().width_m, "downwind carried wide, {max_out} vs {}", g().width_m);
+        // Descends from TPA to the handoff height by the end.
+        assert!(route.first().unwrap().alt_msl_ft > route.last().unwrap().alt_msl_ft);
+    }
+
+    #[test]
+    fn authored_circuit_mirrors_for_a_right_pattern() {
+        let route = authored_circuit(&lxgb_rwy(), &g(), 11.0, 1074.0, false).unwrap();
+        assert!(route.iter().all(|w| w.x_m >= -0.1), "right pattern → offsets to the right");
     }
 }

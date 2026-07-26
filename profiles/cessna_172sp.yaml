@@ -144,13 +144,17 @@ checklist_map:
 
 # Phase-expectation advisor: standard VFR lighting discipline. Strobes on
 # whenever airborne; landing light for the takeoff and the arrival.
+# The copilot ACTS on these (fires `command`) rather than only advising —
+# strobes for the flight, landing light for departure and arrival.
 advisor:
   - dataref: sim/cockpit2/switches/strobe_lights_on
     phases: [takeoff, climb, cruise, approach, landing]
-    say: Strobes are off.
+    say: Strobes on.
+    command: sim/lights/strobe_lights_on
   - dataref: sim/cockpit2/switches/landing_lights_on
     phases: [takeoff, approach, landing]
-    say: Landing light's off.
+    say: Landing light on.
+    command: sim/lights/landing_lights_on
 
 # Flap detents, retracted → full. Vfe is the max IAS (kts) to extend to each.
 flaps:

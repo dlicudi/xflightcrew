@@ -149,6 +149,23 @@ pub fn best_landing_runway(
     Ok(best)
 }
 
+/// The specific hard runway END matching `id` at the nearest field within
+/// `max_nm` — used when the arrival has ALREADY chosen the runway (by wind) and
+/// autoland must honour that end instead of re-picking by track. `None` if no
+/// such end is in range (the caller falls back to [`best_landing_runway`]).
+pub fn runway_by_id(
+    apt_dat: &str,
+    lat: f64,
+    lon: f64,
+    id: &str,
+    max_nm: f64,
+) -> std::io::Result<Option<Runway>> {
+    let want = id.trim();
+    // nearby_runways is already nearest-threshold-first.
+    let cands = nearby_runways(apt_dat, lat, lon, max_nm)?;
+    Ok(cands.into_iter().find(|r| r.hard() && r.id.trim() == want))
+}
+
 // ---- Stage 3: the control loop (AP-first, like the reference plugin) ----------
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -236,6 +253,9 @@ pub fn run_autoland(
     // The chat mirror now rides `voice.alert`; an explicit `s.action` here too
     // double-wrote every autoland line to the transcript (2026-07-24).
     _status: Option<crate::plugin_status::StatusSink>,
+    // The arrival's already-chosen landing runway (by wind). `Some` forces that
+    // end; `None` self-picks by track — the emergency/manual path, unchanged.
+    forced_rwy: Option<String>,
 ) {
     let my_gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
@@ -255,7 +275,17 @@ pub fn run_autoland(
             ) else { ACTIVE.store(false, Ordering::SeqCst); return };
             let _ = track0;
             let hdg0 = xp.get_float("sim/flightmodel/position/psi").await.unwrap_or(0.0);
-            let rwy = match best_landing_runway(&apt_dat, lat0, lon0, hdg0, 40.0, 1200.0) {
+            // A forced end (arrival chose by wind) is honoured when it's at the
+            // field; a stale/unfound id falls back to the track-based search
+            // rather than bailing on the landing.
+            let picked = match forced_rwy.as_deref() {
+                Some(id) => match runway_by_id(&apt_dat, lat0, lon0, id, 40.0) {
+                    Ok(None) => best_landing_runway(&apt_dat, lat0, lon0, hdg0, 40.0, 1200.0),
+                    found => found,
+                },
+                None => best_landing_runway(&apt_dat, lat0, lon0, hdg0, 40.0, 1200.0),
+            };
+            let rwy = match picked {
                 Ok(Some(r)) => r,
                 other => {
                     tracing::warn!(target: "x_copilot::autoland", ?other, from=?(lat0, lon0), "no runway found");
@@ -331,7 +361,19 @@ pub fn run_autoland(
                 // 2026-07-23). Latched, so the approach guidance below never
                 // re-fires once we're down. The nose is held to the centreline
                 // through the plugin steer channel with the takeoff roll law.
-                if rolling_out || (radio_ft < 5.0 && gs_kts < 45.0) {
+                //
+                // Commit on GROUNDSPEED *or* airspeed-below-approach: the bare
+                // gs < 45 gate is a 172 number, and a heavier airframe landing
+                // into a TAILWIND touches down well above it — a Twin Otter
+                // planted at 70 kt gs (56 KIAS, 6 kt tailwind on 27) never
+                // latched, so nothing steered the centreline OR braked; the
+                // approach guidance floated past the aimpoint, flipped
+                // Flare->Intercept, and the go-around latch firewalled it off
+                // the end into the bay (LXGB, 2026-07-26). Airspeed below the
+                // approach speed means we're on the wheels and committed,
+                // whatever the wind is doing to the groundspeed — never go
+                // around from there, especially on a short runway.
+                if rolling_out || (radio_ft < 5.0 && (gs_kts < 45.0 || ias < approach_ias)) {
                     rolling_out = true;
                     let xtk_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
                     let target = crate::autotakeoff::roll_target_heading(rwy.course_deg, xtk_m);
@@ -1379,5 +1421,35 @@ mod tests {
         assert_eq!(best.icao, "KSEA");
         assert!(best.length_m > 2000.0, "KSEA runways are long");
         assert!(best.dist_nm < 5.0, "should be right at the field");
+    }
+
+    // runway_by_id honours the arrival's already-chosen end: matches by ident,
+    // skips soft surfaces, and returns None for an ident not at the field (the
+    // caller then falls back to the track-based pick).
+    #[test]
+    fn runway_by_id_matches_the_named_hard_end() {
+        let dir = std::env::temp_dir().join(format!("xcopilot_rwyid_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("apt.dat");
+        // A hard runway 09/27 and a grass 05/23, both at ~test coords.
+        std::fs::write(
+            &path,
+            "1 20 0 0 TEST Test Field\n\
+             100 30 1 0 0.25 0 0 0 09 36.150 -5.360 0 0 1 0 0 0 27 36.150 -5.330 0 0 1 0 0 0\n\
+             100 30 3 0 0.25 0 0 0 05 36.140 -5.350 0 0 1 0 0 0 23 36.160 -5.350 0 0 1 0 0 0\n",
+        )
+        .unwrap();
+        let p = path.to_str().unwrap();
+        // The into-wind end the arrival chose (27) resolves to the hard runway.
+        let r = runway_by_id(p, 36.15, -5.34, "27", 40.0).unwrap().expect("27 is at the field");
+        assert_eq!(r.id, "27");
+        assert!(r.hard(), "27 is asphalt");
+        // Its reciprocal is equally resolvable.
+        assert_eq!(runway_by_id(p, 36.15, -5.34, "09", 40.0).unwrap().unwrap().id, "09");
+        // The grass end is filtered out (not a landing runway for autoland).
+        assert!(runway_by_id(p, 36.15, -5.34, "05", 40.0).unwrap().is_none(), "grass is skipped");
+        // An ident that isn't here → None (caller falls back to track pick).
+        assert!(runway_by_id(p, 36.15, -5.34, "18", 40.0).unwrap().is_none(), "no 18 here");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

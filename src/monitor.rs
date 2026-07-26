@@ -459,6 +459,13 @@ pub trait Check: Send {
     fn min_duration(&self) -> Duration {
         Duration::ZERO
     }
+    /// A command the copilot should FIRE (not just advise) to bring the state to
+    /// what the SOP expects — e.g. the strobe/landing-light switches. Fired once
+    /// per episode, the moment the advisory speaks, so the copilot *acts* instead
+    /// of nagging. `None` (the default) = advisory only, the pilot's switch.
+    fn fix_action(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Per-check firing state: enforces edge-triggering and Warning repeats.
@@ -510,6 +517,8 @@ impl FireState {
 
     /// Condition is currently bad. Speak per [`should_speak`], but only once it
     /// has held continuously for `min_duration`. Marks firing either way.
+    /// Returns whether it SPOKE this call — the caller fires any `fix_action`
+    /// command on that rising edge, so the copilot acts exactly once per episode.
     fn active(
         &mut self,
         id: &str,
@@ -519,7 +528,7 @@ impl FireState {
         voice: &Voice,
         status: Option<&StatusSink>,
         now: Instant,
-    ) {
+    ) -> bool {
         // While the copilot is flying the aircraft (an active recovery/autoland),
         // stay quiet: it announces its own actions, and pilot-directed advice
         // ("lower the nose, add power") is backwards when the copilot is the one
@@ -548,7 +557,9 @@ impl FireState {
             voice.alert(sev.into(), msg);
             self.last_spoken = Some(now);
             self.spoke_this_episode = true;
+            return true;
         }
+        false
     }
 
     /// Condition cleared. Keep `last_spoken` so a quick recurrence is still
@@ -879,6 +890,10 @@ struct PhaseExpectation {
     expect_on: bool,
     phases: Vec<Phase>,
     say: String,
+    /// When set, the copilot FIRES this command to fix the state itself rather
+    /// than advising — the strobe/landing-light SOP rows the pilot wants done,
+    /// not asked about.
+    command: Option<String>,
 }
 
 impl Check for PhaseExpectation {
@@ -894,6 +909,9 @@ impl Check for PhaseExpectation {
         }
         let on = (*s.advisor_values.get(self.index)?)? > 0.5;
         (on != self.expect_on).then(|| self.say.clone())
+    }
+    fn fix_action(&self) -> Option<&str> {
+        self.command.as_deref()
     }
     /// Generous sustain: SOP items get configured *around* phase changes, so
     /// give the pilot half a minute before speaking up.
@@ -1209,6 +1227,7 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             expect_on: item.expect_on,
             phases,
             say: item.say.clone(),
+            command: item.command.clone(),
         }));
     }
     // Altitude capture watchdog — needs an AP that flies a dialed altitude.
@@ -1594,10 +1613,11 @@ pub async fn run(
 
             // Pushback callouts (on the ground): tug hooks up → pushing → clear.
             if crew_on && snap.on_ground {
+                // Mirror OR action, never both: `voice.alert` already mirrors the
+                // spoken line to the panel transcript (2026-07-24), so an extra
+                // `s.alert` here wrote every callout twice — a green mirror line
+                // AND a blue Advisory line, same timestamp (2026-07-26).
                 let say = |line: &str| {
-                    if let Some(s) = status.as_ref() {
-                        s.alert(AlertLevel::Advisory, line);
-                    }
                     voice.alert(Priority::Advisory, line.to_string());
                 };
                 if snap.tug_attached && !prev_attached && !snap.pushing_back {
@@ -1629,9 +1649,6 @@ pub async fn run(
                     // The memory is written in every mode; the spoken debrief
                     // is the copilot's — ATC-only keeps the record, not the talk.
                     if crew_on {
-                        if let Some(s) = status.as_ref() {
-                            s.alert(AlertLevel::Advisory, &summary.spoken());
-                        }
                         voice.alert(Priority::Advisory, summary.spoken());
                     }
                 }
@@ -1767,9 +1784,6 @@ pub async fn run(
                                             "Traffic on {nm:.0} mile final and we're still on the runway — expedite."
                                         )
                                     };
-                                    if let Some(s) = status.as_ref() {
-                                        s.alert(AlertLevel::Warning, &line);
-                                    }
                                     voice.alert(Priority::Warning, line);
                                 }
                             }
@@ -1942,9 +1956,6 @@ pub async fn run(
                             }),
                         );
                         if call.crew {
-                            if let Some(s) = status.as_ref() {
-                                s.alert(AlertLevel::Caution, &call.line);
-                            }
                             voice.alert(Priority::Caution, call.line);
                         } else {
                             // The controller you're actually TUNED to delivers
@@ -1980,9 +1991,6 @@ pub async fn run(
                                  Call the tower and report final, runway {rwy} — \
                                  or we touch down uncleared."
                             );
-                            if let Some(s) = status.as_ref() {
-                                s.alert(AlertLevel::Advisory, &line);
-                            }
                             voice.alert(Priority::Advisory, line);
                         }
                     }
@@ -2116,9 +2124,6 @@ pub async fn run(
                                     }),
                                 );
                                 if call.crew {
-                                    if let Some(s) = status.as_ref() {
-                                        s.alert(AlertLevel::Warning, &call.line);
-                                    }
                                     voice.alert(Priority::Warning, call.line);
                                 } else {
                                     // Whoever you're tuned to gives the order —
@@ -2328,9 +2333,6 @@ pub async fn run(
                                 voice.alert_station(Priority::Warning, who, line);
                             } else {
                                 let line = crate::station::near_miss_line(&f, true);
-                                if let Some(s) = status.as_ref() {
-                                    s.alert(AlertLevel::Warning, &line);
-                                }
                                 voice.alert(Priority::Warning, line);
                             }
                         }
@@ -2447,9 +2449,6 @@ pub async fn run(
                                 if line.starts_with("Over the threshold") {
                                     guide_handed_over = true; // once — the flare is theirs
                                 }
-                                if let Some(s) = status.as_ref() {
-                                    s.alert(AlertLevel::Advisory, &line);
-                                }
                                 crate::blackbox::record(
                                     "talkdown",
                                     serde_json::json!({
@@ -2526,7 +2525,20 @@ pub async fn run(
                 for check in &checks {
                     let state = states.get_mut(check.id()).expect("state per check");
                     match check.eval(&snap) {
-                        Some(msg) => state.active(check.id(), msg, check.severity(), check.min_duration(), &voice, status.as_ref(), now),
+                        Some(msg) => {
+                            let spoke = state.active(check.id(), msg, check.severity(), check.min_duration(), &voice, status.as_ref(), now);
+                            // On the rising edge, the copilot ACTS on SOP rows that
+                            // carry a fix (strobes, landing lights) instead of only
+                            // advising — crew business, so it's already behind the
+                            // `crew_on` gate above, and the tick never runs in
+                            // replay/pause. Fire-and-forget: the switch flips and
+                            // the check clears next tick.
+                            if spoke {
+                                if let Some(cmd) = check.fix_action() {
+                                    let _ = xp.run_command(cmd).await;
+                                }
+                            }
+                        }
                         None => state.clear(),
                     }
                 }
@@ -2852,6 +2864,7 @@ mod tests {
             expect_on: true,
             phases: vec![Phase::Climb, Phase::Cruise],
             say: "Yaw damper's still off.".into(),
+            command: None,
         };
         let mut s = snap(true, true);
         // Wrong phase → silent even when the switch is off.

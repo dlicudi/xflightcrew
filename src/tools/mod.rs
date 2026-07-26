@@ -246,6 +246,7 @@ impl Registry {
                 climb_fpm: climb,
                 retract_gear: profile.retractable_gear,
                 takeoff_roll_m,
+                prop: profile.prop.clone(),
             }));
             // Auto circuit — one command that flies takeoff + pattern + landing
             // by orchestrating the takeoff loop, the AP, and autoland. Shares
@@ -258,6 +259,7 @@ impl Registry {
                 retract_gear: profile.retractable_gear,
                 takeoff_roll_m,
                 approach_ias,
+                prop: profile.prop.clone(),
             }));
             // Fly a REAL published SID / instrument approach from the sim's CIFP —
             // the terrain-safe path where the circuit only guessed. Shares the AP
@@ -275,17 +277,24 @@ impl Registry {
                 tools.push(Box::new(full_auto::FullAuto {
                     fuel_selector: profile.fuel_selector.clone(),
                     alternator_on_cmds: alternator_on_cmds(&profile.electrical),
+                    bus_power_on_cmds: bus_power_on_cmds(&profile.electrical),
                     park_brake_valve_set: profile.park_brake_valve_set,
                     takeoff_roll_m,
+                    prop: profile.prop.clone(),
                     cfg: ap,
                     vr_kts: vr,
                     vy_kts: vy,
                     climb_fpm: climb,
                     retract_gear: profile.retractable_gear,
                     approach_ias,
-                    // Turbines need the APU/electrical bring-up first; a piston
-                    // 172 does not (its start_engine powers its own bus).
-                    power_up_first: profile.turbine_start || profile.throttle,
+                    // The APU/electrical bring-up is the MD-82 sequence (APU
+                    // start, cross-ties, bleed) — it belongs ONLY to a jet with
+                    // an APU (`turbine_start`). A turboprop has no APU: running
+                    // it on the Twin Otter narrated "starting the APU / the APU
+                    // didn't come up" and waited 75 s on an APU that will never
+                    // spin (2026-07-26). Turboprops power their bus at the start
+                    // instead (StartEngine's profile battery/master commands).
+                    power_up_first: profile.turbine_start,
                 }));
             }
         }
@@ -323,6 +332,7 @@ impl Registry {
             // and the line-up (hold-short onto the centreline) with both.
             tools.push(Box::new(taxi::AutoTaxi {
                 park_brake_valve_set: profile.park_brake_valve_set,
+                prop: profile.prop.clone(),
             }));
             tools.push(Box::new(taxi::LineUp {
                 park_brake_valve_set: profile.park_brake_valve_set,
@@ -331,6 +341,7 @@ impl Registry {
                     .as_ref()
                     .and_then(|r| r.takeoff_distance_ft)
                     .map(|f| f * 0.3048),
+                prop: profile.prop.clone(),
             }));
         }
 
@@ -346,6 +357,7 @@ impl Registry {
             tools.push(Box::new(engine::StartEngine {
                 fuel_selector: profile.fuel_selector.clone(),
                 alternator_on_cmds: alternator_on_cmds(&profile.electrical),
+                bus_power_on_cmds: bus_power_on_cmds(&profile.electrical),
             }));
             tools.push(Box::new(engine::StopEngine));
         }
@@ -531,9 +543,81 @@ pub fn alternator_on_cmds(systems: &[crate::aircraft::ElectricalSystem]) -> Vec<
     cmds
 }
 
+/// ON commands that bring the DC bus alive for an engine start — the battery and
+/// (where the airframe has one) the DC master, in profile order. On airframes
+/// whose stock `battery_on` dataref is frame-synced FROM a custom switch (the
+/// Twin Otter: master.lua overwrites it every frame), a stock write reads back
+/// 0 V and the starter never sees voltage — firing these profile commands is the
+/// only way the bus comes up. Empty on airframes with no custom electrical (the
+/// pistons), where the stock write `StartEngine` falls back to works.
+pub fn bus_power_on_cmds(systems: &[crate::aircraft::ElectricalSystem]) -> Vec<String> {
+    let mut cmds: Vec<String> = Vec::new();
+    for s in systems {
+        let k = s.key.to_ascii_lowercase();
+        if k.starts_with("batt") || k.starts_with("master") || k.starts_with("dc_master") {
+            for c in &s.on_commands {
+                if !cmds.contains(c) {
+                    cmds.push(c.clone());
+                }
+            }
+        }
+    }
+    cmds
+}
+
 /// A flattened, serializable view of a tool for the LLM layer to wrap.
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+}
+
+#[cfg(test)]
+mod power_cmd_tests {
+    use super::*;
+    use crate::aircraft::ElectricalSystem;
+
+    fn sys(key: &str, on: &[&str]) -> ElectricalSystem {
+        ElectricalSystem {
+            key: key.into(),
+            spoken: key.into(),
+            on_commands: on.iter().map(|s| s.to_string()).collect(),
+            off_commands: vec![],
+            readback: vec![],
+        }
+    }
+
+    #[test]
+    fn bus_power_takes_battery_and_master_not_generators() {
+        // The Twin Otter's electrical: battery + DC master bring the bus alive;
+        // the generators come on AFTER the start (that's alternator_on_cmds).
+        let elec = vec![
+            sys("battery", &["Twin_Otter/battery/power_to_battery"]),
+            sys("master", &["Twin_Otter/dc_master/master_on"]),
+            sys("generator1", &["Twin_Otter/generators/left_on"]),
+            sys("generators", &["Twin_Otter/generators/left_on", "Twin_Otter/generators/right_on"]),
+            sys("bleed", &["Twin_Otter/bleed_air/left_on"]),
+        ];
+        assert_eq!(
+            bus_power_on_cmds(&elec),
+            vec![
+                "Twin_Otter/battery/power_to_battery".to_string(),
+                "Twin_Otter/dc_master/master_on".to_string(),
+            ]
+        );
+        // And the generators are what alternator_on_cmds picks up, deduped.
+        assert_eq!(
+            alternator_on_cmds(&elec),
+            vec![
+                "Twin_Otter/generators/left_on".to_string(),
+                "Twin_Otter/generators/right_on".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn bus_power_is_empty_for_a_piston_with_no_custom_electrical() {
+        // Nothing to fire → StartEngine keeps its stock battery_on write.
+        assert!(bus_power_on_cmds(&[]).is_empty());
+    }
 }

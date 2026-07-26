@@ -678,6 +678,11 @@ pub struct StartEngine {
     /// ON commands for every charging source in the electrical profile (the
     /// SR22 has ALT 1 *and* ALT 2). Empty = fall back to generator 1 only.
     pub alternator_on_cmds: Vec<String>,
+    /// ON commands to bring the DC bus alive before the start (battery + DC
+    /// master), for airframes whose stock `battery_on` is overwritten every
+    /// frame by a custom switch sync (the Twin Otter). Empty = the stock write
+    /// below is enough (the pistons).
+    pub bus_power_on_cmds: Vec<String>,
 }
 
 #[async_trait]
@@ -711,7 +716,22 @@ impl Tool for StartEngine {
 
         // Battery check: the battery must be on, and with enough voltage to crank.
         // Cranking a flat battery just drains it further without catching.
-        ctx.xplane.set_int(BATTERY, 1).await?;
+        //
+        // Turn the bus on the way THIS airframe does it. On the pistons the stock
+        // `battery_on` write is enough; on an add-on that frame-syncs that dataref
+        // FROM a custom switch (the Twin Otter — master.lua overwrites it every
+        // frame), the stock write is a no-op and the bus reads 0 V, so we fire the
+        // profile's battery + DC-master commands and give the sync a frame to
+        // energize the bus before reading it (a cold-dark Twin Otter otherwise
+        // failed every full-auto start on "only 0 volts", 2026-07-26).
+        if self.bus_power_on_cmds.is_empty() {
+            ctx.xplane.set_int(BATTERY, 1).await?;
+        } else {
+            for cmd in &self.bus_power_on_cmds {
+                ctx.xplane.run_command(cmd).await?;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
         let volts = ctx.xplane.get_float_array(BUS_VOLTS).await?.first().copied().unwrap_or(0.0);
         if volts < MIN_START_VOLTS {
             return Ok(format!(

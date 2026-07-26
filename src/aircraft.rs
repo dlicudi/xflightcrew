@@ -546,6 +546,11 @@ pub struct AdvisorItem {
     pub phases: Vec<String>,
     /// What the copilot says when the state doesn't match.
     pub say: String,
+    /// A command the copilot FIRES to fix the state itself, rather than only
+    /// advising — the strobe/landing-light SOP rows the pilot wants actioned,
+    /// not asked about. `None` = advisory only (the pilot's switch to flip).
+    #[serde(default)]
+    pub command: Option<String>,
 }
 
 fn advisor_expect_on_default() -> bool {

@@ -539,8 +539,12 @@ to direct-to legs at the plan's own crossing altitudes (climb fixes command
 cruise directly so the departure never stair-steps; the post-TOD numbers
 fly the descent), the follower flies them under `EndAction::Enroute` (quiet
 completion — the orchestrator owns what's next), and the arrival prefers
-the destination's published approach (runway picked by arrival bearing —
-no wind data enroute; autoland re-picks on the visual fallback), tuning
+the destination's published approach (runway picked by the field's surface
+wind — `nav::best_runway_for_wind` when it's `>= WIND_DECISIVE_KTS`, else the
+end most aligned with the arrival bearing; the visual autoland fallback is
+FORCED onto the same end via `run_autoland`'s `forced_rwy`, so a tailwind
+can't be re-picked back in by track — a 17 kt tailwind put the arrival on
+Gibraltar's 09 while the tower worked 27, 2026-07-24), tuning
 COM1 to whoever owns the destination (the enroute region watch has been
 handing the flight down the airway) with "inbound for landing" then the
 final report at the autoland handoff — the call that earns the landing

@@ -100,6 +100,35 @@ fn round_to(v: f64, step: f64) -> i64 {
     ((v / step).round() * step) as i64
 }
 
+/// Advance constant-speed props to full-forward (max governed RPM), taking them
+/// OUT of feather so the engine can make thrust. A no-op on airframes with no
+/// prop levers (the pistons — `prop` is `None`). Returns the commanded RPM when
+/// it acted.
+///
+/// Why every auto ground roll needs this: the taxi governor and the takeoff
+/// roll only ever command the THROTTLE. On a piston that's enough. On a
+/// turboprop with the props sitting in feather (a cold-and-dark start, or after
+/// shutdown) full power makes ZERO thrust and the aircraft never moves — the
+/// Twin Otter sat static through a full-auto taxi, groundspeed ~0, then hit the
+/// stagnation reject (2026-07-26). Feathered blades are a flat wall no power
+/// lever can push through, so the taxi, line-up, takeoff and circuit arms all
+/// unfeather first. Idempotent and cheap; safe to call even if the props are
+/// already forward.
+pub async fn advance_for_ground_roll(
+    xp: &dyn crate::xplane::XPlane,
+    prop: &Option<PropProfile>,
+) -> Option<f64> {
+    let prop = prop.as_ref()?;
+    let _ = xp
+        .set_float(&prop.dataref, prop.max_rpm / RAD_PER_SEC_TO_RPM)
+        .await;
+    crate::blackbox::record(
+        "prop",
+        json!({ "event": "unfeather", "rpm": prop.max_rpm }),
+    );
+    Some(prop.max_rpm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

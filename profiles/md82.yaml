@@ -125,7 +125,8 @@ advisor:
     say: Pitot heat's off.
   - dataref: sim/cockpit/electrical/landing_lights_on
     phases: [takeoff, approach, landing]
-    say: Landing lights are off.
+    say: Landing lights on.
+    command: sim/lights/landing_lights_on
   - dataref: sim/cockpit2/switches/fasten_seat_belts
     phases: [takeoff, climb, approach, landing]
     say: Seat belt signs are off.

@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx};
+use crate::aircraft::PropProfile;
 use crate::tools::autopilot::ApConfig;
 use crate::{autotakeoff, circuit, party_line, tower};
 
@@ -25,6 +26,9 @@ pub struct Circuit {
     pub takeoff_roll_m: Option<f64>,
     /// Approach speed handed to autoland on final (KIAS).
     pub approach_ias: f64,
+    /// Constant-speed prop levers, advanced out of feather before the circuit's
+    /// takeoff roll. `None` on the pistons.
+    pub prop: Option<PropProfile>,
 }
 
 /// Default pattern altitude above the field, feet (a standard light-aircraft
@@ -137,6 +141,8 @@ impl Tool for Circuit {
                     .to_string(),
             );
         }
+        // Props full forward before the circuit's takeoff roll begins.
+        super::prop::advance_for_ground_roll(ctx.xplane, &self.prop).await;
         circuit::start(
             ctx.config.xplane_base_url.clone(),
             ctx.voice.cloned(),

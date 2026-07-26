@@ -99,6 +99,7 @@ impl Tool for Autoland {
             self.approach_ias,
             ctx.voice.cloned(),
             ctx.status.cloned(),
+            None,
         );
         Ok("Roger, emergency autoland. Searching for the nearest runway, then flying \
             the approach. Say 'my controls' to take it back."

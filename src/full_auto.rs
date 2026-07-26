@@ -404,6 +404,13 @@ const LON: &str = "sim/flightmodel/position/longitude";
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const ELEV_M: &str = "sim/flightmodel/position/elevation";
 const M_TO_FT: f64 = 3.280_84;
+const MS_TO_KTS: f64 = 1.943_844;
+/// Below this surface wind the arrival picks its runway by geometry (the end
+/// most aligned with our bearing to the field), not wind: a light or variable
+/// wind isn't worth a big turn onto final. At or above it the wind decides —
+/// landing INTO it — because a real tailwind is what put the arrival on
+/// Gibraltar's 09 into 17 kt while the tower worked 27 (2026-07-24).
+const WIND_DECISIVE_KTS: f64 = 4.0;
 
 /// An airborne AGL below this after the takeoff loop exits means it REJECTED
 /// (never flew) — same reading the circuit uses.
@@ -500,6 +507,15 @@ async fn fly_route(
         return;
     };
     let alt_msl_ft = xp.get_float(ELEV_M).await.unwrap_or(0.0) * M_TO_FT;
+    // The surface wind near the field (the aircraft-wind datarefs, same source
+    // ATIS and the tower read) chooses the landing runway — see build_arrival.
+    let wind = match (
+        xp.get_float(crate::datarefs::WIND_DIR_DEG_TRUE).await,
+        xp.get_float(crate::datarefs::WIND_SPEED_MSC).await,
+    ) {
+        (Ok(dir), Ok(spd_ms)) => Some((dir, spd_ms * MS_TO_KTS)),
+        _ => None,
+    };
     let built = {
         let (apt_dat, cifp, fixp, navp) = (
             crate::tools::autoland::apt_dat_path(),
@@ -510,9 +526,9 @@ async fn fly_route(
         let dest = route.dest_icao.clone();
         let cfg = tools.circuit.cfg.clone();
         let ias = tools.circuit.approach_ias;
-        tokio::task::spawn_blocking(move || build_arrival(&apt_dat, &cifp, &fixp, &navp, &dest, lat, lon, cfg, ias))
+        tokio::task::spawn_blocking(move || build_arrival(&apt_dat, &cifp, &fixp, &navp, &dest, lat, lon, cfg, ias, wind))
             .await
-            .unwrap_or(Arrival { plan: None, tower_khz: None })
+            .unwrap_or(Arrival { plan: None, rwy_id: None, tower_khz: None })
     };
     // The radio: tune the DESTINATION'S tower from its own apt.dat comm row —
     // never `home_tower_khz`, which is whoever the enroute region last handed
@@ -527,16 +543,19 @@ async fn fly_route(
         crate::circuit::transmit(crate::circuit::radio_call(callsign, "inbound for landing"));
         event("inbound_call", json!({ "khz": khz }));
     }
-    let landing_rwy = match built.plan {
-        Some((plan, rwy_id)) if crate::procedure::approach_flyable_from(&plan, lat, lon, alt_msl_ft) => {
-            event("arrival_procedure", json!({ "name": plan.name, "runway": rwy_id }));
+    // The wind-chosen end (build_arrival) drives BOTH the published-approach
+    // branch and the visual fallback — the visual autoland is forced onto the
+    // same runway so a tailwind can't be re-picked back in by track.
+    let landing_rwy = built.rwy_id.clone();
+    match built.plan {
+        Some(plan) if crate::procedure::approach_flyable_from(&plan, lat, lon, alt_msl_ft) => {
+            event("arrival_procedure", json!({ "name": plan.name, "runway": landing_rwy }));
             announce(voice, Priority::Advisory, &format!("Setting up {}.", plan.name));
             crate::procedure::ABORT.store(false, SeqCst);
             crate::procedure::start(config.xplane_base_url.clone(), voice.clone(), plan);
-            Some(rwy_id)
         }
         _ => {
-            event("arrival_autoland", json!({}));
+            event("arrival_autoland", json!({ "runway": landing_rwy }));
             announce(
                 voice,
                 Priority::Advisory,
@@ -550,8 +569,8 @@ async fn fly_route(
                 tools.circuit.approach_ias,
                 voice.clone(),
                 None,
+                landing_rwy.clone(),
             );
-            None
         }
     };
 
@@ -584,15 +603,21 @@ async fn fly_route(
 /// What the blocking arrival builder found: the approach plan + runway when
 /// one could be built, and the destination's own tower frequency either way.
 struct Arrival {
-    plan: Option<(crate::procedure::Plan, String)>,
+    /// The published/reconstructed approach for `rwy_id`, when one is flyable.
+    plan: Option<crate::procedure::Plan>,
+    /// The chosen landing runway — set whenever the field was found, whether or
+    /// not a plan came with it (the visual fallback and the final call need it).
+    rwy_id: Option<String>,
     tower_khz: Option<i64>,
 }
 
-/// Blocking arrival builder: destination airport + the runway end whose landing
-/// direction best matches our bearing to the field (no wind data enroute — and
-/// the autoland fallback re-picks by position anyway), then the published-
-/// approach plan for it. The tower frequency comes back even when no plan
-/// does — the radio still needs the right station for the visual fallback.
+/// Blocking arrival builder: destination airport + the landing runway, then the
+/// published-approach plan for it. The runway is the end that best faces INTO
+/// the surface wind when the wind is decisive (`WIND_DECISIVE_KTS`); in a light
+/// or variable wind it's the end whose landing direction best matches our
+/// bearing to the field (no big turn onto final for a wind that doesn't matter).
+/// The tower frequency comes back even when no plan does — the radio still needs
+/// the right station for the visual fallback. `wind` is (from_deg true, kts).
 #[allow(clippy::too_many_arguments)]
 fn build_arrival(
     apt_dat: &str,
@@ -604,40 +629,49 @@ fn build_arrival(
     lon: f64,
     cfg: crate::tools::autopilot::ApConfig,
     approach_ias: f64,
+    wind: Option<(f64, f64)>,
 ) -> Arrival {
     let Some(airport) = crate::nav::find_airport(apt_dat, dest).ok().flatten() else {
-        return Arrival { plan: None, tower_khz: None };
+        return Arrival { plan: None, rwy_id: None, tower_khz: None };
     };
     let tower_khz = airport.freq(crate::nav::FREQ_TOWER).map(|f| f.khz);
-    let diff = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs();
-    let (mut best_id, mut best_score) = (None::<String>, f64::MAX);
-    for r in &airport.runways {
-        let hdg_a = crate::nav::bearing_deg(r.lat_a, r.lon_a, r.lat_b, r.lon_b);
-        let hdg_b = (hdg_a + 180.0).rem_euclid(360.0);
-        for (id, thr_lat, thr_lon, hdg) in [
-            (&r.ident_a, r.lat_a, r.lon_a, hdg_a),
-            (&r.ident_b, r.lat_b, r.lon_b, hdg_b),
-        ] {
-            let arrival_brg = crate::nav::bearing_deg(lat, lon, thr_lat, thr_lon);
-            let score = diff(arrival_brg, hdg);
-            if score < best_score {
-                best_score = score;
-                best_id = Some(id.clone());
+    // Into the wind when it's strong enough to matter...
+    let by_wind = wind
+        .filter(|(_, kts)| *kts >= WIND_DECISIVE_KTS)
+        .and_then(|(dir, kts)| crate::nav::best_runway_for_wind(&airport.runways, dir, kts))
+        .map(|(id, _, _)| id);
+    // ...otherwise the end most aligned with our arrival bearing.
+    let rwy_id = by_wind.or_else(|| {
+        let diff = |a: f64, b: f64| ((a - b + 540.0).rem_euclid(360.0) - 180.0).abs();
+        let (mut best_id, mut best_score) = (None::<String>, f64::MAX);
+        for r in &airport.runways {
+            let hdg_a = crate::nav::bearing_deg(r.lat_a, r.lon_a, r.lat_b, r.lon_b);
+            let hdg_b = (hdg_a + 180.0).rem_euclid(360.0);
+            for (id, thr_lat, thr_lon, hdg) in [
+                (&r.ident_a, r.lat_a, r.lon_a, hdg_a),
+                (&r.ident_b, r.lat_b, r.lon_b, hdg_b),
+            ] {
+                let arrival_brg = crate::nav::bearing_deg(lat, lon, thr_lat, thr_lon);
+                let score = diff(arrival_brg, hdg);
+                if score < best_score {
+                    best_score = score;
+                    best_id = Some(id.clone());
+                }
             }
         }
-    }
-    let Some(rwy_id) = best_id else {
-        return Arrival { plan: None, tower_khz };
+        best_id
+    });
+    let Some(rwy_id) = rwy_id else {
+        return Arrival { plan: None, rwy_id: None, tower_khz };
     };
     let end = crate::procedure::EndAction::Approach {
         apt_dat: apt_dat.to_string(),
         cfg,
         approach_ias,
     };
-    let plan = crate::procedure::approach_plan_for(cifp, fixp, navp, &airport, dest, &rwy_id, lat, lon, end)
-        .ok()
-        .map(|p| (p, rwy_id));
-    Arrival { plan, tower_khz }
+    let plan =
+        crate::procedure::approach_plan_for(cifp, fixp, navp, &airport, dest, &rwy_id, lat, lon, end).ok();
+    Arrival { plan, rwy_id: Some(rwy_id), tower_khz }
 }
 
 /// Call the tower for departure and wait for it to move us to a departure

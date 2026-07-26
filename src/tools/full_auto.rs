@@ -24,9 +24,15 @@ pub struct FullAuto {
     // engine start
     pub fuel_selector: Option<FuelSelectorProfile>,
     pub alternator_on_cmds: Vec<String>,
+    /// DC-bus power-on commands (battery + master) for airframes whose stock
+    /// battery dataref is overwritten by a custom switch sync (the Twin Otter).
+    pub bus_power_on_cmds: Vec<String>,
     // taxi / line-up
     pub park_brake_valve_set: Option<f64>,
     pub takeoff_roll_m: Option<f64>,
+    /// Constant-speed prop levers, threaded into every ground-roll sub-tool so
+    /// they unfeather before taxi/line-up/takeoff. `None` on the pistons.
+    pub prop: Option<crate::aircraft::PropProfile>,
     // circuit / climb-out
     pub cfg: ApConfig,
     pub vr_kts: f64,
@@ -112,11 +118,16 @@ impl Tool for FullAuto {
             start_engine: crate::tools::engine::StartEngine {
                 fuel_selector: self.fuel_selector.clone(),
                 alternator_on_cmds: self.alternator_on_cmds.clone(),
+                bus_power_on_cmds: self.bus_power_on_cmds.clone(),
             },
-            taxi: crate::tools::taxi::AutoTaxi { park_brake_valve_set: self.park_brake_valve_set },
+            taxi: crate::tools::taxi::AutoTaxi {
+                park_brake_valve_set: self.park_brake_valve_set,
+                prop: self.prop.clone(),
+            },
             line_up: crate::tools::taxi::LineUp {
                 park_brake_valve_set: self.park_brake_valve_set,
                 takeoff_roll_m: self.takeoff_roll_m,
+                prop: self.prop.clone(),
             },
             circuit: crate::tools::circuit::Circuit {
                 cfg: self.cfg.clone(),
@@ -126,6 +137,7 @@ impl Tool for FullAuto {
                 retract_gear: self.retract_gear,
                 takeoff_roll_m: self.takeoff_roll_m,
                 approach_ias: self.approach_ias,
+                prop: self.prop.clone(),
             },
             takeoff: crate::tools::takeoff::AutoTakeoff {
                 cfg: self.cfg.clone(),
@@ -134,6 +146,7 @@ impl Tool for FullAuto {
                 climb_fpm: self.climb_fpm,
                 retract_gear: self.retract_gear,
                 takeoff_roll_m: self.takeoff_roll_m,
+                prop: self.prop.clone(),
             },
             mission,
             power_up_first: self.power_up_first,

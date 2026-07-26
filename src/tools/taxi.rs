@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{speedhold, Tool, ToolCtx};
+use crate::aircraft::PropProfile;
 use crate::autotaxi;
 use crate::party_line;
 use crate::tower;
@@ -26,6 +27,10 @@ pub struct AutoTaxi {
     /// The airframe's park-brake valve SET sense, passed through to the
     /// inner `hold_speed` arm so its release gates work unchanged.
     pub park_brake_valve_set: Option<f64>,
+    /// Constant-speed prop levers, when the airframe has them. Advanced out of
+    /// feather at arm time — a turboprop makes no taxi thrust with feathered
+    /// blades however far the power lever comes up. `None` on the pistons.
+    pub prop: Option<PropProfile>,
 }
 
 #[derive(Deserialize, Default)]
@@ -155,6 +160,9 @@ impl Tool for AutoTaxi {
             // says why, and it's ours too.
             return Ok(arm_line);
         }
+        // Props out of feather before the governor opens the throttle — a
+        // turboprop with feathered blades makes no thrust and never rolls.
+        super::prop::advance_for_ground_roll(ctx.xplane, &self.prop).await;
         autotaxi::start(
             ctx.config.xplane_base_url.clone(),
             ctx.voice.cloned(),
@@ -195,6 +203,10 @@ pub struct LineUp {
     /// instead (LXGB's taxiways only reach the east half; holding point
     /// Charlie left an SR22 580 m for a 09 departure, 2026-07-22).
     pub takeoff_roll_m: Option<f64>,
+    /// Constant-speed prop levers, advanced out of feather before the drive
+    /// (a line-up is an auto taxi — same feathered-blade wall). `None` on
+    /// the pistons.
+    pub prop: Option<PropProfile>,
 }
 
 /// Line-up pace: a runway entry is a sharp-corner maneuver end to end.
@@ -353,6 +365,8 @@ impl Tool for LineUp {
         if !speedhold::taxi_hold_active() {
             return Ok(arm_line);
         }
+        // Props out of feather before the drive rolls (same wall as auto taxi).
+        super::prop::advance_for_ground_roll(ctx.xplane, &self.prop).await;
         if backtracking {
             autotaxi::start_backtrack(
                 ctx.config.xplane_base_url.clone(),

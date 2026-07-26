@@ -619,6 +619,7 @@ pub async fn run_step(
         "start_engine" => StartEngine {
             fuel_selector: fuel_selector.clone(),
             alternator_on_cmds: crate::tools::alternator_on_cmds(electrical),
+            bus_power_on_cmds: crate::tools::bus_power_on_cmds(electrical),
         }
         .execute(args, ctx)
         .await,

@@ -502,6 +502,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     *approach_ias,
                     voice.clone(),
                     None,
+                    None,
                 );
                 ACTIVE.store(false, Ordering::SeqCst);
                 return;

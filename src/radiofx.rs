@@ -40,6 +40,7 @@ pub fn radioize_variant_q(samples: &mut Vec<f32>, sample_rate: u32, variant: u32
 /// the click is the receiver's own gate closing, not part of the transmitted
 /// audio, so it must not be band-passed or compressed with the speech.
 /// `tail` must already be mono at `sample_rate` (see [`load_tail_wav`]).
+#[allow(dead_code)] // production varies quality via `_q`; kept for the lib/tests
 pub fn radioize_with_tail(samples: &mut Vec<f32>, sample_rate: u32, variant: u32, tail: &[f32]) {
     radioize_with_tail_q(samples, sample_rate, variant, tail, 1.0);
 }
