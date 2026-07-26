@@ -68,6 +68,12 @@ pub(crate) static PENDING_GO_AROUND: Mutex<bool> = Mutex::new(false);
 /// it never lingers into the next circuit.
 pub(crate) static LANDING_HANDOFF: Mutex<Option<String>> = Mutex::new(None);
 
+/// The discrete transponder code the controller assigned with the clearance,
+/// so the crew can dial it into the transponder — the full-auto orchestrator
+/// reads it after requesting clearance. Published by the tower on assignment,
+/// cleared on `Station::uninstall`.
+pub(crate) static ASSIGNED_SQUAWK: Mutex<Option<i64>> = Mutex::new(None);
+
 fn lock<T>(m: &'static Mutex<T>) -> MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -105,6 +111,12 @@ pub fn with_taxi_route<R>(f: impl FnOnce(Option<&TaxiWatch>) -> R) -> R {
 /// calls the destination a "stand", not a "holding point".
 pub fn taxi_to_stand() -> bool {
     *lock(&TAXI_TO_STAND)
+}
+
+/// The discrete squawk the controller assigned, if one has been — the crew dials
+/// it into the transponder after the clearance.
+pub fn assigned_squawk() -> Option<i64> {
+    *lock(&ASSIGNED_SQUAWK)
 }
 
 /// A takeoff clearance is currently being withheld for traffic.

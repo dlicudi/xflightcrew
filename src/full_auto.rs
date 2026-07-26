@@ -296,6 +296,46 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     // --- Stage 3: onto the runway ---------------------------------------------
     // Already lined up (the pilot put us on)? Skip straight to the circuit.
     if !lined_up(&xp, &tools, &config).await {
+        // Clearance first — the real order is clearance, THEN taxi. Only with a
+        // simulated tower to answer (real/external ATC and copilot-only leave the
+        // clearance to the pilot), and only if we don't already hold a squawk.
+        if crate::mode::atc_enabled() && crate::party_line::assigned_squawk().is_none() {
+            if let Some(khz) = crate::party_line::home_tower_khz() {
+                let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+            }
+            announce(
+                &voice,
+                Priority::Advisory,
+                crate::readback::one_of(&[
+                    "Requesting clearance.",
+                    "Getting our clearance.",
+                    "Calling for our clearance.",
+                ]),
+            );
+            crate::circuit::transmit(crate::circuit::radio_call(&callsign, "request clearance"));
+            event("request_clearance", json!({}));
+            // The tower answers with a discrete squawk; wait for it, then dial it
+            // into the transponder and read it back — the crew's clearance copy.
+            wait_until(30.0, 500, || async {
+                crate::party_line::assigned_squawk().is_some()
+            })
+            .await;
+            if let Some(code) = crate::party_line::assigned_squawk() {
+                let _ = crate::tools::radio::SetTransponder
+                    .execute(&json!({ "code": code }), &ctx)
+                    .await;
+                announce(
+                    &voice,
+                    Priority::Advisory,
+                    &format!(
+                        "Squawk {}, set.",
+                        crate::atis::spoken_digits(&format!("{code:04}"))
+                    ),
+                );
+                event("squawk_set", json!({ "code": code }));
+            }
+            bail_if_abort!();
+        }
         // The taxi route is the tower's. Ask for it if we don't already hold one.
         if crate::party_line::with_taxi_route(|r| r.is_none()) {
             // Tune COM1 to the tower first — the request goes nowhere if we're

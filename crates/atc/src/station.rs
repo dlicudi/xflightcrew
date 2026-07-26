@@ -22,8 +22,8 @@ use sim::xplane::SimView;
 // and its tests) writes them by their bare names; the crew side reads via
 // `party_line`'s accessors, never these statics.
 pub(crate) use crate::party_line::{
-    CLEARANCE, LANDING_HANDOFF, PENDING_GO_AROUND, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE,
-    TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS,
+    ASSIGNED_SQUAWK, CLEARANCE, LANDING_HANDOFF, PENDING_GO_AROUND, PENDING_STATION,
+    PENDING_TAKEOFF_CLEARANCE, TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS,
 };
 
 /// Which of the station's frequencies COM1 is tuned to.
@@ -244,6 +244,7 @@ impl Station {
         // A new station means the old radar service (and its code) is void,
         // and the new tower has never talked to you — or to its ghosts.
         *SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // Zone-watch grace on a fresh station: a region handoff says
         // "contact <name> Tower" and the pilot deserves the cooldown window
@@ -816,6 +817,8 @@ impl Station {
         let code = *self
             .assigned_squawk
             .get_or_insert_with(|| discrete_squawk(callsign));
+        // Publish it for the crew (the transponder gets dialled to this).
+        *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
         let mut w = SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner());
         if w.as_ref().map(|w| w.code) != Some(code) {
             *w = Some(SquawkWatch {
@@ -4621,6 +4624,7 @@ mod tests {
     fn departure_clearance_assigns_a_discrete_code_at_radar_fields() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *SQUAWK_WATCH.lock().unwrap() = None;
+        *ASSIGNED_SQUAWK.lock().unwrap() = None;
         let wx = Wx {
             wind_from_deg: 90.0,
             wind_kts: 8.0,
@@ -4643,8 +4647,15 @@ mod tests {
         assert!(r.contains(&spoken), "{r}");
         assert!(!r.contains("seven zero zero zero"), "{r}");
         assert!(SQUAWK_WATCH.lock().unwrap().is_some(), "radar watch armed");
-        // A tower-only strip stays on the VFR conspicuity.
+        // ...and published for the crew to dial into the transponder.
+        assert_eq!(
+            *ASSIGNED_SQUAWK.lock().unwrap(),
+            Some(code),
+            "assigned code published to the party line"
+        );
+        // A tower-only strip stays on the VFR conspicuity and publishes nothing.
         *SQUAWK_WATCH.lock().unwrap() = None;
+        *ASSIGNED_SQUAWK.lock().unwrap() = None;
         let mut st = lxgb();
         st.approach_khz = None;
         st.departure_khz = None;
@@ -4662,7 +4673,12 @@ mod tests {
         assert!(r.contains("seven zero zero zero"), "{r}");
         assert!(st.assigned_squawk.is_none());
         assert!(SQUAWK_WATCH.lock().unwrap().is_none());
+        assert!(
+            ASSIGNED_SQUAWK.lock().unwrap().is_none(),
+            "no discrete code, nothing published"
+        );
         *CLEARANCE.lock().unwrap() = None;
+        *ASSIGNED_SQUAWK.lock().unwrap() = None;
     }
 
     #[test]
