@@ -19,6 +19,7 @@ use crate::xplane::XPlaneClient;
 
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
+const XPDR_MODE: &str = "sim/cockpit2/radios/actuators/transponder_mode"; // 1 = standby
 
 /// Spawn the arrival taxi on its own thread + runtime + client.
 pub fn start(
@@ -123,6 +124,63 @@ async fn fly(
     };
     match auto_taxi.execute(&json!({}), &ctx).await {
         Ok(line) => announce(&voice, Priority::Advisory, &line),
-        Err(_) => announce(&voice, Priority::Caution, "I couldn't start the taxi in."),
+        Err(_) => {
+            announce(&voice, Priority::Caution, "I couldn't start the taxi in.");
+            return;
+        }
     }
+
+    // Wait for the drive to reach the stand, then SECURE — the arrival mirror of
+    // the departure's start-up. `LAST_ARRIVED` distinguishes a real arrival from
+    // a hand-back/abort mid-taxi (pilot took the pedals): only secure when we
+    // actually parked. Give the drive a beat to arm before watching `ACTIVE`.
+    use std::sync::atomic::Ordering::Relaxed;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20 * 60);
+    while crate::autotaxi::ACTIVE.load(Relaxed) {
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    if crate::autotaxi::LAST_ARRIVED.load(Relaxed) {
+        secure(&xp, &voice).await;
+    }
+}
+
+/// Arrival securing at the stand. STOCK-safe items only — they work on every
+/// airframe with no profile: park brake set, transponder to standby, and the
+/// exterior lights you don't want on at the gate (strobes, taxi and landing).
+/// The beacon and nav lights stay for the ground crew, and ENGINE SHUTDOWN is
+/// deliberately left to the pilot for now — it's airframe-specific (a piston's
+/// mixture cutoff vs a turboprop's condition levers) and wants sim validation
+/// before the copilot cuts an engine on its own.
+async fn secure(xp: &XPlaneClient, voice: &Option<Voice>) {
+    announce(
+        voice,
+        Priority::Advisory,
+        crate::readback::one_of(&[
+            "On the stand. Securing.",
+            "At the gate. Tidying up.",
+            "Parked. Securing the aircraft.",
+        ]),
+    );
+    // Park brake firmly set (the taxi already set it — belt and braces).
+    let _ = xp.set_float(PARK_BRAKE, 1.0).await;
+    // Transponder to standby now we're off the movement area.
+    let _ = xp.set_int(XPDR_MODE, 1).await;
+    // Exterior lights not wanted at the stand (stock commands).
+    for cmd in [
+        "sim/lights/strobe_lights_off",
+        "sim/lights/taxi_lights_off",
+        "sim/lights/landing_lights_off",
+    ] {
+        let _ = xp.run_command(cmd).await;
+    }
+    crate::blackbox::record("taxi_in", json!({ "event": "secured" }));
+    announce(
+        voice,
+        Priority::Advisory,
+        "Parking items done. Shut down when you're ready. Your aircraft.",
+    );
 }

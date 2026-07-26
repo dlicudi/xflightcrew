@@ -48,6 +48,7 @@ const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
+const XPDR_MODE: &str = "sim/cockpit2/radios/actuators/transponder_mode"; // 0 off,1 stby,2 on,3 alt
 const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
@@ -861,6 +862,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             if on_ground < 0.5 && ias > p.vr_kts * 0.8 && agl_ft > 8.0 {
                 airborne = true;
                 let _ = xp.set_float(TAXI_STEER, 0.0).await;
+                // Transponder to ALT (mode C) now we're flying — real ops squawk
+                // altitude on departure. Stock dataref; a no-op on an airframe
+                // with no transponder, so no profile gate needed.
+                let _ = xp.set_int(XPDR_MODE, 3).await;
                 crate::blackbox::record(
                     "autotakeoff",
                     serde_json::json!({"event": "liftoff", "ias": ias}),

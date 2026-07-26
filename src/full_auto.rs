@@ -29,6 +29,8 @@ const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
+const BARO_KNOB: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot";
+const PA_PER_INHG: f64 = 3386.389;
 
 /// True while the full-auto orchestrator runs.
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -292,6 +294,28 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
 
     // --- Stage 2: brakes off --------------------------------------------------
     let _ = xp.set_float(PARK_BRAKE, 0.0).await;
+
+    // Set the altimeter to field QNH before departure — a misset altimeter is
+    // the classic level-bust. Autoland aims at the runway's true elevation so it
+    // doesn't depend on this, but a real crew sets it, and everything MSL between
+    // here and there reads right once it's set.
+    if let Ok(pa) = xp.get_float(crate::datarefs::QNH_PASCALS).await {
+        if pa > 0.0 {
+            let inhg = pa / PA_PER_INHG;
+            let _ = xp.set_float(BARO_KNOB, inhg).await;
+            let spoken = crate::atis::spoken_digits(&format!("{inhg:.2}").replace('.', ""));
+            announce(
+                &voice,
+                Priority::Advisory,
+                &format!("Altimeter set, {spoken}."),
+            );
+            event(
+                "altimeter_set",
+                json!({ "inhg": (inhg * 100.0).round() / 100.0 }),
+            );
+        }
+    }
+    bail_if_abort!();
 
     // --- Stage 3: onto the runway ---------------------------------------------
     // Already lined up (the pilot put us on)? Skip straight to the circuit.
