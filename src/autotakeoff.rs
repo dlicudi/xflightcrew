@@ -204,7 +204,9 @@ pub static REJECT: AtomicBool = AtomicBool::new(false);
 
 /// One-line status for the dashboard's "managing" panel.
 pub fn status() -> Option<String> {
-    ACTIVE.load(Ordering::Relaxed).then(|| "auto takeoff".to_string())
+    ACTIVE
+        .load(Ordering::Relaxed)
+        .then(|| "auto takeoff".to_string())
 }
 
 /// Everything the loop needs, resolved by the arming tool from the profile.
@@ -232,7 +234,13 @@ pub struct Params {
 /// Fit the aircraft's position and heading to a runway end: which strip are
 /// we lined up on, and how much of it is left ahead of the nose. `None`
 /// when nothing fits — not on a runway, not aligned, or not enough left.
-pub fn runway_fit(cands: &[Runway], lat: f64, lon: f64, psi_true: f64, needed_m: f64) -> Option<(Runway, f64)> {
+pub fn runway_fit(
+    cands: &[Runway],
+    lat: f64,
+    lon: f64,
+    psi_true: f64,
+    needed_m: f64,
+) -> Option<(Runway, f64)> {
     let mut best: Option<(Runway, f64, f64)> = None;
     for r in cands {
         let err = heading_diff(psi_true, r.course_deg);
@@ -463,7 +471,10 @@ pub fn start(base_url: String, voice: Option<Voice>, p: Params) {
     }
     REJECT.store(false, Ordering::Relaxed);
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             ACTIVE.store(false, Ordering::Relaxed);
             return;
         };
@@ -491,7 +502,10 @@ async fn reject(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &s
     }
     let _ = xp.set_float(TAXI_STEER, 0.0).await;
     alert(voice, Priority::Warning, line);
-    crate::blackbox::record("autotakeoff", serde_json::json!({"event": "reject", "reason": reason}));
+    crate::blackbox::record(
+        "autotakeoff",
+        serde_json::json!({"event": "reject", "reason": reason}),
+    );
 }
 
 async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
@@ -502,27 +516,36 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         xp.get_float(LON).await,
         xp.get_float(PSI_TRUE).await,
     ) else {
-        alert(&voice, Priority::Caution, "I can't read our position. Your takeoff.");
+        alert(
+            &voice,
+            Priority::Caution,
+            "I can't read our position. Your takeoff.",
+        );
         return;
     };
     let cands = match crate::autoland::nearby_runways(&p.apt_dat, lat, lon, 2.0) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(?e, "auto takeoff: apt.dat unreadable");
-            alert(&voice, Priority::Caution, "I can't read the runway data. Your takeoff.");
+            alert(
+                &voice,
+                Priority::Caution,
+                "I can't read the runway data. Your takeoff.",
+            );
             return;
         }
     };
     let Some((rwy, remaining_m)) = runway_fit(&cands, lat, lon, psi, p.needed_m) else {
         // At the hold with a line-up in reach, point at the maneuver that
         // exists for exactly this — otherwise the honest refusal.
-        let line = if crate::autotaxi::pick_line_up(&cands, lat, lon, p.cleared_runway.as_deref(), None)
-            .is_some()
-        {
-            "We're not on the runway yet. Say line us up, then give me the takeoff."
-        } else {
-            "We're not lined up on a runway I can use. Line us up and ask me again."
-        };
+        let line =
+            if crate::autotaxi::pick_line_up(&cands, lat, lon, p.cleared_runway.as_deref(), None)
+                .is_some()
+            {
+                "We're not on the runway yet. Say line us up, then give me the takeoff."
+            } else {
+                "We're not lined up on a runway I can use. Line us up and ask me again."
+            };
         alert(&voice, Priority::Caution, line);
         return;
     };
@@ -571,7 +594,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     alert(
         &voice,
         Priority::Advisory,
-        &format!("Brakes released. Rolling, runway {}.", crate::atis::spoken_runway(&rwy.id)),
+        &format!(
+            "Brakes released. Rolling, runway {}.",
+            crate::atis::spoken_runway(&rwy.id)
+        ),
     );
 
     // Pre-set the flight director and heading bug NOW, parked: the bug
@@ -583,9 +609,12 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         let _ = xp.run_command(c).await;
     }
     let var = xp.get_float(MAG_VAR).await.unwrap_or(0.0);
-    let _ =
-        crate::tools::autopilot::drive_heading_bug_step(&xp, true_to_mag(rwy.course_deg, var), 360.0)
-            .await;
+    let _ = crate::tools::autopilot::drive_heading_bug_step(
+        &xp,
+        true_to_mag(rwy.course_deg, var),
+        360.0,
+    )
+    .await;
 
     let mut airborne = false;
     let mut rotated = false;
@@ -620,10 +649,18 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     Priority::Caution,
                     "We're already flying. Your aircraft. The autopilot is holding the climb.",
                 );
-                crate::blackbox::record("autotakeoff", serde_json::json!({"event": "handoff_airborne_abort"}));
+                crate::blackbox::record(
+                    "autotakeoff",
+                    serde_json::json!({"event": "handoff_airborne_abort"}),
+                );
             } else {
-                reject(&xp, &voice, "Rejecting takeoff. Throttle is idle, brakes on. Your aircraft.", "pilot_abort")
-                    .await;
+                reject(
+                    &xp,
+                    &voice,
+                    "Rejecting takeoff. Throttle is idle, brakes on. Your aircraft.",
+                    "pilot_abort",
+                )
+                .await;
             }
             return;
         }
@@ -638,7 +675,21 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // took ~350 ms and dragged the control tick to half a second — the
         // lag behind the fourth sortie's weave. Joined, the tick runs at
         // the sleep rate.
-        let (lat, lon, psi, gs_ms, ias, agl_m, on_ground, steer_yield, thr_read, theta, phi, pitch_yield, roll_yield) = tokio::join!(
+        let (
+            lat,
+            lon,
+            psi,
+            gs_ms,
+            ias,
+            agl_m,
+            on_ground,
+            steer_yield,
+            thr_read,
+            theta,
+            phi,
+            pitch_yield,
+            roll_yield,
+        ) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
             xp.get_float(PSI_TRUE),
@@ -664,7 +715,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         let theta_deg = theta.unwrap_or(0.0);
         let phi_deg = phi.unwrap_or(0.0);
         let now_t = std::time::Instant::now();
-        let dt = last_tick.map_or(0.15, |t| (now_t - t).as_secs_f64()).clamp(0.05, 1.0);
+        let dt = last_tick
+            .map_or(0.15, |t| (now_t - t).as_secs_f64())
+            .clamp(0.05, 1.0);
         last_tick = Some(now_t);
 
         // The pilot's feet took the pedals (the plugin dropped the override
@@ -694,13 +747,20 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // re-drives jitters; a hand keeps winning), then it's a pilot
         // reject — hands off everything.
         let elapsed = roll_start.elapsed().as_secs_f64() - frozen_secs;
-        let thr_want = if airborne { 1.0 } else { throttle_cmd(elapsed, last_err, gs_kts) };
+        let thr_want = if airborne {
+            1.0
+        } else {
+            throttle_cmd(elapsed, last_err, gs_kts)
+        };
         let thr_cmd = throttle_slew(last_thr_cmd, thr_want, dt);
         let thr_now = thr_read.unwrap_or(thr_cmd);
         if thr_now < last_thr_cmd - 0.25 && elapsed > 2.0 {
             if thr_challenged {
                 alert(&voice, Priority::Warning, "Your throttle. Your aircraft.");
-                crate::blackbox::record("autotakeoff", serde_json::json!({"event": "throttle_yield"}));
+                crate::blackbox::record(
+                    "autotakeoff",
+                    serde_json::json!({"event": "throttle_yield"}),
+                );
                 let _ = xp.set_float(TAXI_STEER, 0.0).await;
                 return;
             }
@@ -714,15 +774,25 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         if !airborne {
             // Not accelerating: something is holding the aircraft.
             if elapsed > STAGNANT_SECS && gs_kts < STAGNANT_GS_KTS {
-                reject(&xp, &voice, "We're not accelerating. Rejecting takeoff. Your aircraft.", "stagnant")
-                    .await;
+                reject(
+                    &xp,
+                    &voice,
+                    "We're not accelerating. Rejecting takeoff. Your aircraft.",
+                    "stagnant",
+                )
+                .await;
                 return;
             }
             let along_m = along_track_nm(lat, lon, &rwy) * M_PER_NM;
             let remaining = rwy.length_m - (-along_m).max(0.0);
             if !rotated && must_reject(remaining, ias, p.vr_kts) {
-                reject(&xp, &voice, "Runway is running out. Rejecting takeoff. Your aircraft.", "runway_end")
-                    .await;
+                reject(
+                    &xp,
+                    &voice,
+                    "Runway is running out. Rejecting takeoff. Your aircraft.",
+                    "runway_end",
+                )
+                .await;
                 return;
             }
             // Steer the centreline: PD plus the learned P-factor trim,
@@ -733,8 +803,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             last_err = err;
             let steer = steer_law.step(err, dt, gs_kts, thr_cmd);
             if xp.set_float(TAXI_STEER, steer).await.is_err() {
-                reject(&xp, &voice, "I've lost the steering. Rejecting takeoff. Your aircraft.", "steer_lost")
-                    .await;
+                reject(
+                    &xp,
+                    &voice,
+                    "I've lost the steering. Rejecting takeoff. Your aircraft.",
+                    "steer_lost",
+                )
+                .await;
                 return;
             }
             crate::blackbox::record(
@@ -764,11 +839,18 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 // still owns the heading until liftoff.
                 let pitch = pitch_law.step(theta_deg, dt);
                 let ail = wings.step(phi_deg, 0.0, dt);
-                let (wp, wr) =
-                    tokio::join!(xp.set_float(TAKEOFF_PITCH, pitch), xp.set_float(TAKEOFF_ROLL, ail));
+                let (wp, wr) = tokio::join!(
+                    xp.set_float(TAKEOFF_PITCH, pitch),
+                    xp.set_float(TAKEOFF_ROLL, ail)
+                );
                 if wp.is_err() || wr.is_err() {
-                    reject(&xp, &voice, "I've lost the elevator. Rejecting takeoff. Your aircraft.", "pitch_lost")
-                        .await;
+                    reject(
+                        &xp,
+                        &voice,
+                        "I've lost the elevator. Rejecting takeoff. Your aircraft.",
+                        "pitch_lost",
+                    )
+                    .await;
                     return;
                 }
             }
@@ -807,10 +889,16 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 let hdg_err = ((rwy.course_deg - psi + 540.0).rem_euclid(360.0)) - 180.0;
                 let pitch = pitch_law.step(theta_deg, dt);
                 let ail = wings.step(phi_deg, climb_bank_target(hdg_err), dt);
-                let (wp, wr) =
-                    tokio::join!(xp.set_float(TAKEOFF_PITCH, pitch), xp.set_float(TAKEOFF_ROLL, ail));
+                let (wp, wr) = tokio::join!(
+                    xp.set_float(TAKEOFF_PITCH, pitch),
+                    xp.set_float(TAKEOFF_ROLL, ail)
+                );
                 if wp.is_err() || wr.is_err() {
-                    alert(&voice, Priority::Warning, "I've lost the elevator. Your aircraft.");
+                    alert(
+                        &voice,
+                        Priority::Warning,
+                        "I've lost the elevator. Your aircraft.",
+                    );
                     crate::blackbox::record(
                         "autotakeoff",
                         serde_json::json!({"event": "pitch_lost_airborne"}),
@@ -936,9 +1024,18 @@ mod tests {
         assert!(runway_matches("09R", "09R"));
         assert!(runway_matches("9", "09"));
         assert!(runway_matches("27l", "27L"));
-        assert!(runway_matches("", "27"), "no fitted ident is not a mismatch");
-        assert!(runway_matches("27", ""), "no cleared ident is not a mismatch");
-        assert!(!runway_matches("27", "09"), "the backwards line-up must be caught");
+        assert!(
+            runway_matches("", "27"),
+            "no fitted ident is not a mismatch"
+        );
+        assert!(
+            runway_matches("27", ""),
+            "no cleared ident is not a mismatch"
+        );
+        assert!(
+            !runway_matches("27", "09"),
+            "the backwards line-up must be caught"
+        );
         assert!(!runway_matches("27L", "27R"));
     }
 
@@ -966,11 +1063,18 @@ mod tests {
             last = law.step(18.0, 0.15, 25.0, 0.0);
         }
         assert!(last > first, "trim accumulates: {first} -> {last}");
-        assert!(law.trim() > 0.2, "learned standing rudder, got {}", law.trim());
+        assert!(
+            law.trim() > 0.2,
+            "learned standing rudder, got {}",
+            law.trim()
+        );
         // And with the error finally at zero the trim STILL holds rudder —
         // the whole point: straight nose, rudder in.
         let centered = law.step(0.0, 0.15, 40.0, 0.0);
-        assert!(centered > 0.15, "rudder held with the nose straight: {centered}");
+        assert!(
+            centered > 0.15,
+            "rudder held with the nose straight: {centered}"
+        );
     }
 
     #[test]
@@ -985,8 +1089,17 @@ mod tests {
             big.step(39.0, 0.15, 30.0, 0.0);
             small.step(STEER_TRIM_ERR_CLAMP_DEG, 0.15, 30.0, 0.0);
         }
-        assert!((big.trim() - small.trim()).abs() < 1e-9, "{} vs {}", big.trim(), small.trim());
-        assert!(big.trim() < 0.1, "two seconds of swing stays a nudge: {}", big.trim());
+        assert!(
+            (big.trim() - small.trim()).abs() < 1e-9,
+            "{} vs {}",
+            big.trim(),
+            small.trim()
+        );
+        assert!(
+            big.trim() < 0.1,
+            "two seconds of swing stays a nudge: {}",
+            big.trim()
+        );
     }
 
     #[test]
@@ -1035,8 +1148,14 @@ mod tests {
         // was the second sortie's runway excursion).
         let mut slow = RollSteer::default();
         let mut fast = RollSteer::default();
-        let s = (0..3).map(|_| slow.step(10.0, 0.15, 10.0, 0.0)).last().unwrap();
-        let f = (0..3).map(|_| fast.step(10.0, 0.15, 50.0, 0.0)).last().unwrap();
+        let s = (0..3)
+            .map(|_| slow.step(10.0, 0.15, 10.0, 0.0))
+            .last()
+            .unwrap();
+        let f = (0..3)
+            .map(|_| fast.step(10.0, 0.15, 50.0, 0.0))
+            .last()
+            .unwrap();
         assert!(f >= s * STEER_AUTH_FLOOR - 1e-9, "floor holds: {f} vs {s}");
     }
 
@@ -1068,14 +1187,26 @@ mod tests {
         // Zero error, power coming up: the foot moves with the hand — the
         // law holds right rudder proportional to throttle, no error needed.
         let mut law = RollSteer::default();
-        let with_power = (0..5).map(|_| law.step(0.0, 0.15, 5.0, 1.0)).last().unwrap();
-        assert!(with_power > 0.1, "lead rides the throttle, got {with_power}");
+        let with_power = (0..5)
+            .map(|_| law.step(0.0, 0.15, 5.0, 1.0))
+            .last()
+            .unwrap();
+        assert!(
+            with_power > 0.1,
+            "lead rides the throttle, got {with_power}"
+        );
         let mut idle = RollSteer::default();
-        let no_power = (0..5).map(|_| idle.step(0.0, 0.15, 5.0, 0.0)).last().unwrap();
+        let no_power = (0..5)
+            .map(|_| idle.step(0.0, 0.15, 5.0, 0.0))
+            .last()
+            .unwrap();
         assert!(no_power.abs() < 0.01, "no power, no lead: {no_power}");
         // The lead fades as airflow straightens the moment out.
         assert!(power_lead(1.0, 40.0) < power_lead(1.0, 0.0));
-        assert!(power_lead(1.0, 40.0) > 0.05, "never fades to nothing on the roll");
+        assert!(
+            power_lead(1.0, 40.0) > 0.05,
+            "never fades to nothing on the roll"
+        );
         // Throttle: swinging nose at low speed holds half power...
         assert_eq!(throttle_cmd(10.0, 14.0, 8.0), THROTTLE_HOLD_RATIO);
         // ...straight nose rides the ramp to full...
@@ -1089,7 +1220,10 @@ mod tests {
     #[test]
     fn rotation_waits_for_a_straight_nose_unless_the_runway_ends() {
         assert!(rotate_ok(3.0, 900.0), "straight and long: rotate");
-        assert!(!rotate_ok(25.0, 900.0), "yawed with room: keep straightening");
+        assert!(
+            !rotate_ok(25.0, 900.0),
+            "yawed with room: keep straightening"
+        );
         assert!(rotate_ok(25.0, 300.0), "yawed but running out: fly");
     }
 
@@ -1117,7 +1251,10 @@ mod tests {
         settled.step(ROTATE_PITCH_DEG, 0.15);
         let a = settled.step(ROTATE_PITCH_DEG, 0.15);
         let b = settled.step(ROTATE_PITCH_DEG, 0.15);
-        assert!(a > 0.0 && (a - b).abs() < 1e-6, "holds at target: {a} vs {b}");
+        assert!(
+            a > 0.0 && (a - b).abs() < 1e-6,
+            "holds at target: {a} vs {b}"
+        );
         // A nose rising fast toward the target backs the pull off (the
         // rate lead), so the rotation doesn't slingshot past the attitude.
         let mut rising = RotatePitch::default();
@@ -1139,7 +1276,10 @@ mod tests {
         assert_eq!(slew(0.0, 0.7, 0.25), 0.25);
         assert_eq!(slew(0.25, 0.7, 0.25), 0.5);
         assert_eq!(slew(0.5, 0.55, 0.25), 0.55, "small changes pass through");
-        assert!((slew(0.2, -0.7, 0.25) + 0.05).abs() < 1e-9, "both directions");
+        assert!(
+            (slew(0.2, -0.7, 0.25) + 0.05).abs() < 1e-9,
+            "both directions"
+        );
         // Throttle: rolling at 30% immediately, full by the ramp's end,
         // never over.
         assert_eq!(throttle_ramp(0.0), 0.3);
@@ -1208,7 +1348,14 @@ mod tests {
         fn lined_up_nose_right() -> Self {
             // A realistic line-up: on the centreline but the nose 6 deg right,
             // the kind of small misalignment the roll law walks out.
-            Self { gs_ms: 0.0, along_m: 0.0, xtk_m: 0.0, psi_deg: 6.0, theta_deg: 0.0, agl_ft: 0.0 }
+            Self {
+                gs_ms: 0.0,
+                along_m: 0.0,
+                xtk_m: 0.0,
+                psi_deg: 6.0,
+                theta_deg: 0.0,
+                agl_ft: 0.0,
+            }
         }
         fn ias_kts(&self) -> f64 {
             self.gs_ms * MS_TO_KTS // calm air: IAS == groundspeed
@@ -1295,12 +1442,20 @@ mod tests {
                 sim.get_float(AGL_M),
                 sim.get_float(PSI_TRUE),
             );
-            let (gs_ms, ias, agl_ft, psi) =
-                (gs_ms.unwrap(), ias.unwrap(), agl_m.unwrap() * M_TO_FT, psi.unwrap());
+            let (gs_ms, ias, agl_ft, psi) = (
+                gs_ms.unwrap(),
+                ias.unwrap(),
+                agl_m.unwrap() * M_TO_FT,
+                psi.unwrap(),
+            );
             let gs_kts = gs_ms * MS_TO_KTS;
 
             // Throttle (mirrors `fly`: computed from the PREVIOUS tick's error).
-            let thr_want = if airborne { 1.0 } else { throttle_cmd(elapsed, last_err, gs_kts) };
+            let thr_want = if airborne {
+                1.0
+            } else {
+                throttle_cmd(elapsed, last_err, gs_kts)
+            };
             let thr_cmd = throttle_slew(last_thr_cmd, thr_want, dt);
             sim.set_float(THROTTLE_ALL, thr_cmd).await.unwrap();
             last_thr_cmd = thr_cmd;
@@ -1309,7 +1464,10 @@ mod tests {
             let remaining = length_m - af.along_m;
             if !airborne {
                 assert!(remaining > 0.0, "rolled off the end without flying");
-                assert!(!must_reject(remaining, ias, vr_kts), "the loop would have rejected here");
+                assert!(
+                    !must_reject(remaining, ias, vr_kts),
+                    "the loop would have rejected here"
+                );
             }
 
             // Steer the centreline (cross-track held by the model, not geodesy).
@@ -1317,7 +1475,10 @@ mod tests {
             let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
             last_err = err;
             let steer = steer_law.step(err, dt, gs_kts, thr_cmd);
-            assert!(steer.abs() <= MAX_ROLL_STEER + 1e-9, "steer out of bounds: {steer}");
+            assert!(
+                steer.abs() <= MAX_ROLL_STEER + 1e-9,
+                "steer out of bounds: {steer}"
+            );
             sim.set_float(TAXI_STEER, steer).await.unwrap();
 
             // Rotate, then hold the attitude with the elevator channel.
@@ -1349,7 +1510,11 @@ mod tests {
             // Advance the world from what we actually wrote to the channels.
             let steer_a = sim.last_write(TAXI_STEER).unwrap();
             let thr_a = sim.last_write(THROTTLE_ALL).unwrap();
-            let pitch_a = if rotated { sim.last_write(TAKEOFF_PITCH).unwrap() } else { 0.0 };
+            let pitch_a = if rotated {
+                sim.last_write(TAKEOFF_PITCH).unwrap()
+            } else {
+                0.0
+            };
             let _ = pitch;
             af.step(dt, thr_a, steer_a, pitch_a);
         }
@@ -1357,12 +1522,18 @@ mod tests {
         // It rotated, at or past Vr, with runway to spare and a straight nose.
         let (r_ias, r_rem, r_err) = rotate_snapshot.expect("never rotated");
         assert!(r_ias >= vr_kts, "rotated below Vr: {r_ias}");
-        assert!(r_rem > 300.0, "rotated with the runway almost gone: {r_rem} m");
+        assert!(
+            r_rem > 300.0,
+            "rotated with the runway almost gone: {r_rem} m"
+        );
         assert!(r_err.abs() < 15.0, "rotated with the nose {r_err} deg off");
 
         // It held the centreline the whole roll and tracked runway heading to
         // the handoff — no weave, no departure off the strip.
-        assert!(max_abs_xtk < 15.0, "wandered {max_abs_xtk:.1} m off the centreline");
+        assert!(
+            max_abs_xtk < 15.0,
+            "wandered {max_abs_xtk:.1} m off the centreline"
+        );
         assert!(
             max_abs_xtk_after_capture < 6.0,
             "did not settle on the centreline: {max_abs_xtk_after_capture:.1} m after capture"
@@ -1378,6 +1549,10 @@ mod tests {
         // proof it recognised and cancelled the modelled P-factor rather than
         // just chasing it. Flip `power_lead`'s sign and this (and the
         // cross-track bound) go red.
-        assert!(steer_law.trim() > 0.0, "trim never learned the P-factor: {}", steer_law.trim());
+        assert!(
+            steer_law.trim() > 0.0,
+            "trim never learned the P-factor: {}",
+            steer_law.trim()
+        );
     }
 }

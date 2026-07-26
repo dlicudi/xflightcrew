@@ -74,11 +74,24 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
     }
 
     // Fuel values are in the plan's unit (lbs by default, sometimes kgs).
-    let unit = v.pointer("/params/units").and_then(Value::as_str).unwrap_or("lbs").to_ascii_lowercase();
+    let unit = v
+        .pointer("/params/units")
+        .and_then(Value::as_str)
+        .unwrap_or("lbs")
+        .to_ascii_lowercase();
     let to_gal = move |raw: f64| {
-        if unit.starts_with("kg") { raw / AVGAS_KG_PER_GAL } else { raw / AVGAS_LB_PER_GAL }
+        if unit.starts_with("kg") {
+            raw / AVGAS_KG_PER_GAL
+        } else {
+            raw / AVGAS_LB_PER_GAL
+        }
     };
-    let s = |path: &str| v.pointer(path).and_then(Value::as_str).unwrap_or("").to_string();
+    let s = |path: &str| {
+        v.pointer(path)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
     let n = |path: &str| v.pointer(path).and_then(num_of).unwrap_or(0.0);
 
     let route_dist = n("/general/route_distance");
@@ -93,7 +106,15 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
     let o_lat = n("/origin/pos_lat");
     let o_lon = n("/origin/pos_long");
     if !origin.is_empty() && (o_lat != 0.0 || o_lon != 0.0) {
-        waypoints.insert(0, Waypoint { ident: origin.clone(), lat: o_lat, lon: o_lon, alt: 0.0 });
+        waypoints.insert(
+            0,
+            Waypoint {
+                ident: origin.clone(),
+                lat: o_lat,
+                lon: o_lon,
+                alt: 0.0,
+            },
+        );
     }
     let d_lat = n("/destination/pos_lat");
     let d_lon = n("/destination/pos_long");
@@ -101,7 +122,12 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
         && waypoints.last().map(|w| w.ident.as_str()) != Some(destination.as_str())
         && (d_lat != 0.0 || d_lon != 0.0)
     {
-        waypoints.push(Waypoint { ident: destination.clone(), lat: d_lat, lon: d_lon, alt: 0.0 });
+        waypoints.push(Waypoint {
+            ident: destination.clone(),
+            lat: d_lat,
+            lon: d_lon,
+            alt: 0.0,
+        });
     }
 
     Ok(FlightPlan {
@@ -110,7 +136,11 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
         alternate: s("/alternate/icao_code"),
         aircraft: s("/aircraft/icaocode"),
         cruise_alt_ft: n("/general/initial_altitude"),
-        distance_nm: if route_dist > 0.0 { route_dist } else { n("/general/air_distance") },
+        distance_nm: if route_dist > 0.0 {
+            route_dist
+        } else {
+            n("/general/air_distance")
+        },
         ete_min: n("/times/est_time_enroute") / 60.0,
         block_fuel_gal: to_gal(n("/fuel/plan_ramp")),
         trip_fuel_gal: to_gal(n("/fuel/enroute_burn")),
@@ -134,7 +164,11 @@ impl FlightPlan {
         } else {
             format!(", alternate {}", self.alternate)
         };
-        let acft = if self.aircraft.is_empty() { String::new() } else { format!("{}, ", self.aircraft) };
+        let acft = if self.aircraft.is_empty() {
+            String::new()
+        } else {
+            format!("{}, ", self.aircraft)
+        };
         format!(
             "Flight plan: {}{} to {}{}. Cruise {:.0} feet, {:.0} nautical miles, about {} hours {} minutes enroute{}. \
              Block fuel {:.0} gallons, {:.0} for the trip, {:.0} reserve.",
@@ -155,7 +189,10 @@ impl FlightPlan {
         } else {
             String::new()
         };
-        format!(", wind {:03.0} at {:.0}{}", self.wind_dir, self.wind_spd_kts, comp)
+        format!(
+            ", wind {:03.0} at {:.0}{}",
+            self.wind_dir, self.wind_spd_kts, comp
+        )
     }
 }
 
@@ -173,9 +210,10 @@ fn parse_waypoints(v: &Value) -> Vec<Waypoint> {
         if ident.is_empty() || ident == "TOC" || ident == "TOD" {
             continue;
         }
-        let (Some(lat), Some(lon)) =
-            (f.get("pos_lat").and_then(num_of), f.get("pos_long").and_then(num_of))
-        else {
+        let (Some(lat), Some(lon)) = (
+            f.get("pos_lat").and_then(num_of),
+            f.get("pos_long").and_then(num_of),
+        ) else {
             continue;
         };
         out.push(Waypoint {
@@ -212,5 +250,6 @@ fn navlog_tod_to_dest(v: &Value) -> f64 {
 /// A JSON value as `f64`, whether a number or a numeric string (SimBrief sends
 /// most figures as strings).
 fn num_of(v: &Value) -> Option<f64> {
-    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }

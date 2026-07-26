@@ -43,7 +43,14 @@ const HALLUCINATIONS: &[&str] = &[
 /// for more information"). Catches the whole family without enumerating each
 /// phrase — a cockpit command never contains a URL or a "for more information"
 /// tail, so these are safe to treat as non-speech.
-const CAPTION_MARKERS: &[&str] = &["www.", "http", ".com", ".org", ".net", "for more information"];
+const CAPTION_MARKERS: &[&str] = &[
+    "www.",
+    "http",
+    ".com",
+    ".org",
+    ".net",
+    "for more information",
+];
 
 /// A loaded whisper model, reusable across utterances.
 pub struct Stt {
@@ -70,7 +77,11 @@ impl Stt {
         params.use_gpu(use_gpu);
         let ctx = WhisperContext::new_with_params(model_path, params)
             .with_context(|| format!("loading whisper model: {model_path}"))?;
-        Ok(Self { ctx, prompt: VOCAB_PROMPT.to_string(), radio_prompt: String::new() })
+        Ok(Self {
+            ctx,
+            prompt: VOCAB_PROMPT.to_string(),
+            radio_prompt: String::new(),
+        })
     }
 
     /// Replace the decoding bias prompt — used to install the per-aircraft vocab
@@ -114,7 +125,10 @@ impl Stt {
         // departure", whose every word appears in the prompt vocabulary.
         if is_prompt_echo(&t.text, prompt) {
             tracing::info!(text = %t.text, "dropped prompt echo (whisper hallucinated its bias prompt)");
-            return Ok(Transcription { text: String::new(), ..t });
+            return Ok(Transcription {
+                text: String::new(),
+                ..t
+            });
         }
         // Clean the transcript for the gate and grammar: join hyphenated compounds
         // ("auto-pilot" → "autopilot"), repair whole-word mishears the bias prompt
@@ -157,7 +171,9 @@ impl Stt {
         params.set_suppress_blank(true);
         params.set_no_context(true);
 
-        state.full(params, audio).context("running whisper inference")?;
+        state
+            .full(params, audio)
+            .context("running whisper inference")?;
 
         let segments = state
             .full_n_segments()
@@ -176,13 +192,20 @@ impl Stt {
                 }
             }
         }
-        let confidence = if prob_n > 0 { prob_sum / prob_n as f32 } else { 0.0 };
+        let confidence = if prob_n > 0 {
+            prob_sum / prob_n as f32
+        } else {
+            0.0
+        };
         let text = text.trim().to_string();
 
         // Drop known whisper hallucinations (they come through high-confidence).
         if is_hallucination(&text) {
             tracing::debug!(transcript = %text, "dropped whisper hallucination");
-            return Ok(Transcription { text: String::new(), confidence: 0.0 });
+            return Ok(Transcription {
+                text: String::new(),
+                confidence: 0.0,
+            });
         }
 
         tracing::info!(
@@ -352,14 +375,20 @@ mod tests {
             .map(|s| s.unwrap() as f32 / i16::MAX as f32)
             .collect();
 
-        let model = std::env::var("WHISPER_MODEL")
-            .unwrap_or_else(|_| "models/ggml-base.en.bin".into());
+        let model =
+            std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "models/ggml-base.en.bin".into());
         let stt = Stt::load(&model, true).expect("loading model");
         let result = stt.transcribe(&samples).expect("transcribing");
         let text = result.text.to_lowercase();
 
-        println!("  said: {phrase:?}\n  heard: {text:?} (confidence {:.2})", result.confidence);
-        assert!(text.contains("flap"), "expected 'flap' in transcript {text:?}");
+        println!(
+            "  said: {phrase:?}\n  heard: {text:?} (confidence {:.2})",
+            result.confidence
+        );
+        assert!(
+            text.contains("flap"),
+            "expected 'flap' in transcript {text:?}"
+        );
         assert!(result.confidence > 0.0, "confidence should be populated");
     }
 
@@ -371,7 +400,9 @@ mod tests {
         assert!(is_hallucination("Thanks for watching!"));
         // Caption-style ghost seen live — caught by the structural markers, not
         // by an enumerated phrase.
-        assert!(is_hallucination("Go to www.cessna.com for more information."));
+        assert!(is_hallucination(
+            "Go to www.cessna.com for more information."
+        ));
         assert!(is_hallucination("Visit http://example.org now"));
         assert!(!is_hallucination("flaps ten degrees"));
         assert!(!is_hallucination("autopilot heading 270"));

@@ -66,7 +66,9 @@ impl LiveState {
     #[cfg(test)]
     pub fn from_pairs(pairs: &[(&str, f64)]) -> LiveState {
         let cache = pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-        LiveState { cache: Arc::new(Mutex::new(cache)) }
+        LiveState {
+            cache: Arc::new(Mutex::new(cache)),
+        }
     }
 }
 
@@ -132,7 +134,10 @@ fn connect_and_pump(
     if socket.send(Message::Text(subscribe_msg(&ids, 1))).is_err() {
         return;
     }
-    tracing::info!(datarefs = id_to_name.len(), "livestate: subscribed over WebSocket");
+    tracing::info!(
+        datarefs = id_to_name.len(),
+        "livestate: subscribed over WebSocket"
+    );
 
     loop {
         match socket.read() {

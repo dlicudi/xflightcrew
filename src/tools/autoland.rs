@@ -79,17 +79,20 @@ impl Tool for Autoland {
             .await
             .is_ok_and(|v| v > 0.5)
         {
-            return Ok("We're in replay, nothing to fly. Go back to live and ask again."
-                .to_string());
+            return Ok(
+                "We're in replay, nothing to fly. Go back to live and ask again.".to_string(),
+            );
         }
         // Re-arming mid-approach is destructive: it kills the flying loop and
         // spends ~6 s re-searching apt.dat with nobody on the controls (seen
         // live at LERL: three "autoland" calls in three minutes on short final).
         // An autoland already flying keeps flying.
         if crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok("Autoland is already flying the approach. Say 'cancel autoland' \
+            return Ok(
+                "Autoland is already flying the approach. Say 'cancel autoland' \
                        first if you want me to start over."
-                .to_string());
+                    .to_string(),
+            );
         }
         crate::autoland::ABORT.store(false, std::sync::atomic::Ordering::SeqCst);
         crate::autoland::run_autoland(
@@ -101,8 +104,10 @@ impl Tool for Autoland {
             ctx.status.cloned(),
             None,
         );
-        Ok("Roger, emergency autoland. Searching for the nearest runway, then flying \
+        Ok(
+            "Roger, emergency autoland. Searching for the nearest runway, then flying \
             the approach. Say 'my controls' to take it back."
-            .to_string())
+                .to_string(),
+        )
     }
 }

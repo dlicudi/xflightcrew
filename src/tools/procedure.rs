@@ -82,21 +82,39 @@ impl Tool for FlyProcedure {
             });
         }
         if procedure::ACTIVE.load(SeqCst) {
-            return Ok("I'm already flying a procedure. Say cancel first to start over.".to_string());
+            return Ok(
+                "I'm already flying a procedure. Say cancel first to start over.".to_string(),
+            );
         }
-        if ctx.xplane.get_float(crate::datarefs::IS_IN_REPLAY).await.is_ok_and(|v| v > 0.5) {
-            return Ok("We're in replay, nothing to fly. Go back to live and ask again.".to_string());
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::IS_IN_REPLAY)
+            .await
+            .is_ok_and(|v| v > 0.5)
+        {
+            return Ok(
+                "We're in replay, nothing to fly. Go back to live and ask again.".to_string(),
+            );
         }
 
         let (Ok(lat), Ok(lon)) = (
-            ctx.xplane.get_float("sim/flightmodel/position/latitude").await,
-            ctx.xplane.get_float("sim/flightmodel/position/longitude").await,
+            ctx.xplane
+                .get_float("sim/flightmodel/position/latitude")
+                .await,
+            ctx.xplane
+                .get_float("sim/flightmodel/position/longitude")
+                .await,
         ) else {
             return Ok("I can't read our position, so I can't set up a procedure.".to_string());
         };
-        let track = ctx.xplane.get_float("sim/flightmodel/position/psi").await.unwrap_or(0.0);
+        let track = ctx
+            .xplane
+            .get_float("sim/flightmodel/position/psi")
+            .await
+            .unwrap_or(0.0);
 
-        let departure = a.kind.eq_ignore_ascii_case("departure") || a.kind.eq_ignore_ascii_case("sid");
+        let departure =
+            a.kind.eq_ignore_ascii_case("departure") || a.kind.eq_ignore_ascii_case("sid");
         let apt_dat = ctx.config.apt_data_path.clone();
         let cifp = ctx.config.cifp_dir.clone();
         let fix_path = ctx.config.fix_data_path.clone();
@@ -108,10 +126,25 @@ impl Tool for FlyProcedure {
 
         // Everything below reads big data files — off the async loop.
         let built = tokio::task::spawn_blocking(move || {
-            build_plan(&apt_dat, &cifp, &fix_path, &nav_path, lat, lon, track, departure, forced_rwy, cfg, approach_ias, vy_kts)
+            build_plan(
+                &apt_dat,
+                &cifp,
+                &fix_path,
+                &nav_path,
+                lat,
+                lon,
+                track,
+                departure,
+                forced_rwy,
+                cfg,
+                approach_ias,
+                vy_kts,
+            )
         })
         .await
-        .unwrap_or(Err("Something went wrong reading the chart data.".to_string()));
+        .unwrap_or(Err(
+            "Something went wrong reading the chart data.".to_string()
+        ));
 
         let (plan, ack) = match built {
             Ok(v) => v,
@@ -144,9 +177,15 @@ fn build_plan(
         let cands = crate::autoland::nearby_runways(apt_dat, lat, lon, 3.0).unwrap_or_default();
         crate::autotakeoff::runway_fit(&cands, lat, lon, track, 0.0)
             .map(|(r, _)| r)
-            .or_else(|| crate::autoland::best_landing_runway(apt_dat, lat, lon, track, 5.0, 0.0).ok().flatten())
+            .or_else(|| {
+                crate::autoland::best_landing_runway(apt_dat, lat, lon, track, 5.0, 0.0)
+                    .ok()
+                    .flatten()
+            })
     } else {
-        crate::autoland::best_landing_runway(apt_dat, lat, lon, track, 40.0, 0.0).ok().flatten()
+        crate::autoland::best_landing_runway(apt_dat, lat, lon, track, 40.0, 0.0)
+            .ok()
+            .flatten()
     };
     let Some(mut rwy) = rwy else {
         return Err("I can't find a runway near us to build a procedure for.".to_string());
@@ -175,12 +214,20 @@ fn build_plan(
                  procedure for me to fly. You'll have to hand-fly the climb-out."
             ));
         };
-        let mut legs = nav::load_proc_legs(cifp, &icao, ProcKind::Sid, &sid, Some(&format!("RW{rwy_id}")));
+        let mut legs = nav::load_proc_legs(
+            cifp,
+            &icao,
+            ProcKind::Sid,
+            &sid,
+            Some(&format!("RW{rwy_id}")),
+        );
         if legs.is_empty() {
             legs = nav::load_proc_legs(cifp, &icao, ProcKind::Sid, &sid, None);
         }
         if legs.is_empty() {
-            return Err(format!("I found the {sid} departure but couldn't read its legs."));
+            return Err(format!(
+                "I found the {sid} departure but couldn't read its legs."
+            ));
         }
         nav::resolve_proc_fixes(fix_path, nav_path, &airport, &icao, &mut legs, lat, lon);
         let name = format!("the {} departure runway {spoken_rwy}", spell_ident(&sid));
@@ -188,24 +235,38 @@ fn build_plan(
             "Flying {name}. I'll take the autopilot through the departure and level at the top. \
              Say cancel or my controls any time."
         );
-        return Ok((Plan { name, legs, end: EndAction::Level, vy_kts }, ack));
+        return Ok((
+            Plan {
+                name,
+                legs,
+                end: EndAction::Level,
+                vy_kts,
+            },
+            ack,
+        ));
     }
 
     // Approach — the shared builder the circuit's arrival uses too. On refusal,
     // offer the visual autoland.
-    let end = EndAction::Approach { apt_dat: apt_dat.to_string(), cfg, approach_ias };
-    let plan = procedure::approach_plan_for(cifp, fix_path, nav_path, &airport, &icao, &rwy_id, lat, lon, end)
-        .map(|mut p| {
-            // A climb leg inside an approach transition gets the protection too.
-            p.vy_kts = vy_kts;
-            p
-        })
-        .map_err(|why| {
-            format!(
-                "{why} I can't fly a procedure here. If it's clear I can try a visual autoland \
+    let end = EndAction::Approach {
+        apt_dat: apt_dat.to_string(),
+        cfg,
+        approach_ias,
+    };
+    let plan = procedure::approach_plan_for(
+        cifp, fix_path, nav_path, &airport, &icao, &rwy_id, lat, lon, end,
+    )
+    .map(|mut p| {
+        // A climb leg inside an approach transition gets the protection too.
+        p.vy_kts = vy_kts;
+        p
+    })
+    .map_err(|why| {
+        format!(
+            "{why} I can't fly a procedure here. If it's clear I can try a visual autoland \
                  instead. Say 'land us'."
-            )
-        })?;
+        )
+    })?;
     let ack = format!(
         "Flying {}. I'll take the autopilot down the procedure and hand the final to \
          autoland at the fix. Say cancel or my controls any time.",

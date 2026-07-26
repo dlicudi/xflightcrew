@@ -138,7 +138,11 @@ impl Guide {
             return None;
         }
         let geo = Geo::new(watch.path[0].0);
-        let pts: Vec<(f64, f64)> = watch.path.iter().map(|&p| geo.to_m(watch.path[0], p)).collect();
+        let pts: Vec<(f64, f64)> = watch
+            .path
+            .iter()
+            .map(|&p| geo.to_m(watch.path[0], p))
+            .collect();
         let mut cum = vec![0.0_f64];
         for w in pts.windows(2) {
             cum.push(cum.last().unwrap() + dist(w[0], w[1]));
@@ -159,7 +163,9 @@ impl Guide {
         };
         let mut cues: Vec<Cue> = Vec::new();
         for i in 1..pts.len() - 1 {
-            let Some((leg_name, leg_runway)) = seg_name(i).cloned() else { continue };
+            let Some((leg_name, leg_runway)) = seg_name(i).cloned() else {
+                continue;
+            };
             // The safety call: this vertex enters a runway edge.
             if leg_runway && !seg_name(i - 1).is_some_and(|(_, r)| *r) {
                 let rwy = crate::atis::spoken_runway(first_designator(&leg_name));
@@ -232,7 +238,9 @@ impl Guide {
         let (line, short) = if crate::party_line::taxi_to_stand() {
             let s = crate::station::spoken_stand(&watch.holding_point);
             let mut c = s.chars();
-            let spoken = c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect());
+            let spoken = c
+                .next()
+                .map_or(String::new(), |f| f.to_uppercase().chain(c).collect());
             (
                 if spoken.is_empty() {
                     "Parking ahead. That's us.".into()
@@ -460,7 +468,10 @@ pub fn describe(watch: &TaxiWatch, lat: f64, lon: f64) -> String {
     if lateral > OFF_ROUTE_M {
         let via = &watch.via;
         return if via.is_empty() {
-            format!("We're about {} meters off the cleared route. Let's rejoin it.", round_m(lateral))
+            format!(
+                "We're about {} meters off the cleared route. Let's rejoin it.",
+                round_m(lateral)
+            )
         } else {
             format!(
                 "We're about {} meters off the cleared route. Rejoin and taxi via {via}.",
@@ -481,7 +492,11 @@ pub fn describe(watch: &TaxiWatch, lat: f64, lon: f64) -> String {
     // The taxiway names still to come, from the leg we're on outward.
     let mut coming: Vec<String> = Vec::new();
     let geo = Geo::new(watch.path[0].0);
-    let pts: Vec<(f64, f64)> = watch.path.iter().map(|&p| geo.to_m(watch.path[0], p)).collect();
+    let pts: Vec<(f64, f64)> = watch
+        .path
+        .iter()
+        .map(|&p| geo.to_m(watch.path[0], p))
+        .collect();
     let mut cum = 0.0;
     for (i, w) in pts.windows(2).enumerate() {
         let end = cum + dist(w[0], w[1]);
@@ -535,11 +550,17 @@ pub(crate) struct Geo {
 
 impl Geo {
     pub(crate) fn new(lat: f64) -> Geo {
-        Geo { m_per_deg_lat: 111_320.0, m_per_deg_lon: 111_320.0 * lat.to_radians().cos() }
+        Geo {
+            m_per_deg_lat: 111_320.0,
+            m_per_deg_lon: 111_320.0 * lat.to_radians().cos(),
+        }
     }
     /// (lat, lon) to meters (x east, y north) relative to `origin`.
     pub(crate) fn to_m(&self, origin: (f64, f64), p: (f64, f64)) -> (f64, f64) {
-        ((p.1 - origin.1) * self.m_per_deg_lon, (p.0 - origin.0) * self.m_per_deg_lat)
+        (
+            (p.1 - origin.1) * self.m_per_deg_lon,
+            (p.0 - origin.0) * self.m_per_deg_lat,
+        )
     }
 }
 
@@ -565,7 +586,11 @@ pub(crate) fn point_at(pts: &[(f64, f64)], cum: &[f64], s: f64) -> (f64, f64) {
     for i in 1..pts.len() {
         if s <= cum[i] {
             let seg = cum[i] - cum[i - 1];
-            let t = if seg < 1e-6 { 0.0 } else { (s - cum[i - 1]) / seg };
+            let t = if seg < 1e-6 {
+                0.0
+            } else {
+                (s - cum[i - 1]) / seg
+            };
             let (a, b) = (pts[i - 1], pts[i]);
             return (a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1));
         }
@@ -623,7 +648,13 @@ mod tests {
     /// continue north on N5W to the holding point N5W.
     fn route() -> TaxiWatch {
         TaxiWatch {
-            path: vec![ll(0.0, 0.0), ll(200.0, 0.0), ll(200.0, 60.0), ll(200.0, 120.0), ll(200.0, 300.0)],
+            path: vec![
+                ll(0.0, 0.0),
+                ll(200.0, 0.0),
+                ll(200.0, 60.0),
+                ll(200.0, 120.0),
+                ll(200.0, 300.0),
+            ],
             via: "Whiskey, Sierra five Whiskey, November five Whiskey".into(),
             seg: vec![
                 ("W".into(), false),
@@ -700,7 +731,10 @@ mod tests {
         // The floor still fires close-in at walking pace.
         let mut g = Guide::build(&route()).expect("guide");
         let (lat, lon) = ll(130.0, 0.0); // 70 m out
-        assert!(g.tick(lat, lon, 4.0, t0).is_some(), "floor carries slow taxi");
+        assert!(
+            g.tick(lat, lon, 4.0, t0).is_some(),
+            "floor carries slow taxi"
+        );
     }
 
     #[test]
@@ -819,7 +853,9 @@ mod tests {
         assert!(cue.starts_with("Coming up"), "{cue}");
         // ...and the execute cue still gets its own call at the junction.
         let (lat, lon) = ll(330.0, 0.0);
-        let cue = g.tick(lat, lon, 10.0, t0 + Duration::from_secs(20)).expect("execute");
+        let cue = g
+            .tick(lat, lon, 10.0, t0 + Duration::from_secs(20))
+            .expect("execute");
         assert!(cue.contains("Next left, onto Bravo"), "{cue}");
         // The short route() straights earn no prep — it's for the long legs.
         let g = Guide::build(&route()).expect("guide");
@@ -850,7 +886,11 @@ mod tests {
         let (lat, lon) = ll(60.0, 0.0);
         assert_eq!(g.tick(lat, lon, 0.0, t0), None);
         assert_eq!(g.tick(lat, lon, 0.0, t0 + s(5)), None);
-        assert_eq!(g.tick(lat, lon, 8.0, t0 + s(10)), None, "short stop: no speech");
+        assert_eq!(
+            g.tick(lat, lon, 8.0, t0 + s(10)),
+            None,
+            "short stop: no speech"
+        );
     }
 
     #[test]

@@ -75,7 +75,10 @@ impl Tool for PrepareIls {
         let ils = match nav::find_ils(&ctx.config.nav_data_path, &args.runway, lat, lon, MAX_NM) {
             Ok(Some(i)) => i,
             Ok(None) => {
-                return Ok(format!("I can't find an ILS for runway {} nearby.", args.runway))
+                return Ok(format!(
+                    "I can't find an ILS for runway {} nearby.",
+                    args.runway
+                ))
             }
             Err(e) => {
                 tracing::error!("nav lookup failed: {e:#}");
@@ -86,7 +89,9 @@ impl Tool for PrepareIls {
         // Airport sanity check: if we're sitting at an ILS-equipped field but the
         // matched runway belongs to a *different*, farther field, that's almost
         // certainly not what the pilot meant — don't silently tune it.
-        if let Ok(Some((near_icao, near_nm))) = nav::nearest_ils_airport(&ctx.config.nav_data_path, lat, lon) {
+        if let Ok(Some((near_icao, near_nm))) =
+            nav::nearest_ils_airport(&ctx.config.nav_data_path, lat, lon)
+        {
             if near_nm <= AT_FIELD_NM && ils.airport != near_icao {
                 return Ok(format!(
                     "{} has no ILS for runway {}. The nearest one is {} runway {}, {:.0} miles away — say again if that's the one you want.",
@@ -192,9 +197,7 @@ impl Tool for VisualApproach {
         // (you're usually already pointed at the runway you mean).
         let want = nav::runway_number(&args.runway);
         let pick = match want {
-            Some(n) => cands
-                .iter()
-                .find(|r| nav::runway_number(&r.id) == Some(n)),
+            Some(n) => cands.iter().find(|r| nav::runway_number(&r.id) == Some(n)),
             None => {
                 let track = ctx
                     .xplane
@@ -202,14 +205,11 @@ impl Tool for VisualApproach {
                     .await
                     .unwrap_or(0.0);
                 let field = cands.first().map(|r| r.icao.clone()).unwrap_or_default();
-                cands
-                    .iter()
-                    .filter(|r| r.icao == field)
-                    .min_by(|a, b| {
-                        let da = ((a.course_deg - track + 540.0).rem_euclid(360.0) - 180.0).abs();
-                        let db = ((b.course_deg - track + 540.0).rem_euclid(360.0) - 180.0).abs();
-                        da.total_cmp(&db)
-                    })
+                cands.iter().filter(|r| r.icao == field).min_by(|a, b| {
+                    let da = ((a.course_deg - track + 540.0).rem_euclid(360.0) - 180.0).abs();
+                    let db = ((b.course_deg - track + 540.0).rem_euclid(360.0) - 180.0).abs();
+                    da.total_cmp(&db)
+                })
             }
         };
         let Some(rw) = pick else {

@@ -43,7 +43,9 @@ pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// One-line status for the dashboard's "managing" panel.
 pub fn status() -> Option<String> {
-    ACTIVE.load(Ordering::Relaxed).then(|| "reverse thrust".to_string())
+    ACTIVE
+        .load(Ordering::Relaxed)
+        .then(|| "reverse thrust".to_string())
 }
 
 /// The stow decision, pure for tests: stow when the speed has decayed to taxi
@@ -104,10 +106,14 @@ impl Tool for ReverseThrust {
         // The gates, in the order a refusal is most useful.
         if ctx.xplane.get_float(ON_GROUND).await.unwrap_or(0.0) < 0.5 {
             return Ok(
-                "Negative — reverse stays stowed in the air. Ask again on the rollout.".to_string()
+                "Negative — reverse stays stowed in the air. Ask again on the rollout.".to_string(),
             );
         }
-        let running = ctx.xplane.get_float_array(ENGN_RUNNING).await.unwrap_or_default();
+        let running = ctx
+            .xplane
+            .get_float_array(ENGN_RUNNING)
+            .await
+            .unwrap_or_default();
         if !running.iter().take(self.engines.max(1)).any(|&r| r > 0.5) {
             return Ok("Engines aren't running.".to_string());
         }
@@ -126,7 +132,9 @@ impl Tool for ReverseThrust {
         if !ACTIVE.swap(true, Ordering::Relaxed) {
             let base = ctx.config.xplane_base_url.clone();
             std::thread::spawn(move || {
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build()
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
                 else {
                     ACTIVE.store(false, Ordering::Relaxed);
                     return;

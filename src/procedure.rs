@@ -67,7 +67,9 @@ pub static ABORT: AtomicBool = AtomicBool::new(false);
 
 /// One-line status for the dashboard's "managing" panel.
 pub fn status() -> Option<String> {
-    ACTIVE.load(Ordering::Relaxed).then(|| "flying a procedure".to_string())
+    ACTIVE
+        .load(Ordering::Relaxed)
+        .then(|| "flying a procedure".to_string())
 }
 
 /// Cancel an active procedure and stand down whatever sub-loop is flying;
@@ -116,7 +118,9 @@ pub struct Plan {
 /// leg (no fix to steer at). Pure — the lateral-steering decision, testable
 /// without a sim.
 pub fn bearing_to_fix(lat: f64, lon: f64, leg: &ProcLeg) -> Option<f64> {
-    leg.fix.as_ref().map(|f| crate::nav::bearing_deg(lat, lon, f.lat, f.lon))
+    leg.fix
+        .as_ref()
+        .map(|f| crate::nav::bearing_deg(lat, lon, f.lat, f.lon))
 }
 
 /// Has the current leg been flown? A fix leg completes inside [`CAPTURE_NM`]; a
@@ -201,9 +205,13 @@ pub fn approach_plan_for(
     // when there's no coded procedure — Gibraltar's whole story).
     let (legs, name) = match crate::nav::best_approach(cifp, icao, rwy_id) {
         Some(appch) => {
-            let mut legs = crate::nav::load_proc_legs(cifp, icao, crate::nav::ProcKind::Appch, &appch, None);
+            let mut legs =
+                crate::nav::load_proc_legs(cifp, icao, crate::nav::ProcKind::Appch, &appch, None);
             crate::nav::resolve_proc_fixes(fix_path, nav_path, airport, icao, &mut legs, lat, lon);
-            (legs, format!("the {} approach runway {spoken}", approach_kind(&appch)))
+            (
+                legs,
+                format!("the {} approach runway {spoken}", approach_kind(&appch)),
+            )
         }
         None => (Vec::new(), String::new()),
     };
@@ -221,7 +229,12 @@ pub fn approach_plan_for(
     };
     // Approaches descend; the climb protection reference stays off unless the
     // caller sets one (e.g. the enroute follower).
-    Ok(Plan { name, legs, end, vy_kts: 0.0 })
+    Ok(Plan {
+        name,
+        legs,
+        end,
+        vy_kts: 0.0,
+    })
 }
 
 /// Build the ENROUTE legs of a SimBrief plan: direct-to legs over the named
@@ -256,7 +269,13 @@ pub fn enroute_legs(
     let plausible = |alt: f64| (500.0..=60_000.0).contains(&alt);
     let raw: Vec<f64> = mid
         .iter()
-        .map(|w| if plausible(w.alt) { w.alt } else { cruise_alt_ft })
+        .map(|w| {
+            if plausible(w.alt) {
+                w.alt
+            } else {
+                cruise_alt_ft
+            }
+        })
         .collect();
     let peak = raw.iter().copied().fold(cruise_alt_ft, f64::max);
     let first_at_peak = raw.iter().position(|a| *a >= peak - 100.0).unwrap_or(0);
@@ -269,7 +288,11 @@ pub fn enroute_legs(
             leg_type: "TF".to_string(),
             fix_ident: w.ident.clone(),
             fix_region: String::new(),
-            fix: Some(crate::nav::Fix { ident: w.ident.clone(), lat: w.lat, lon: w.lon }),
+            fix: Some(crate::nav::Fix {
+                ident: w.ident.clone(),
+                lat: w.lat,
+                lon: w.lon,
+            }),
             course_mag: None,
             dist_nm: None,
             turn: None,
@@ -307,11 +330,19 @@ pub fn start(base_url: String, voice: Option<Voice>, plan: Plan) {
     }
     ABORT.store(false, Ordering::SeqCst);
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             ACTIVE.store(false, Ordering::SeqCst);
             return;
         };
-        rt.block_on(fly(XPlaneClient::new(base_url.clone()), base_url, voice, plan));
+        rt.block_on(fly(
+            XPlaneClient::new(base_url.clone()),
+            base_url,
+            voice,
+            plan,
+        ));
         ACTIVE.store(false, Ordering::SeqCst);
     });
 }
@@ -325,12 +356,20 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 
 fn stand_down(voice: &Option<Voice>, line: &str, reason: &str) {
     ACTIVE.store(false, Ordering::SeqCst);
-    crate::blackbox::record("procedure", serde_json::json!({"event": "stand_down", "reason": reason}));
+    crate::blackbox::record(
+        "procedure",
+        serde_json::json!({"event": "stand_down", "reason": reason}),
+    );
     alert(voice, Priority::Caution, line);
 }
 
 async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Plan) {
-    let Plan { name, legs, end, vy_kts } = plan;
+    let Plan {
+        name,
+        legs,
+        end,
+        vy_kts,
+    } = plan;
     let handoff = handoff_index(&legs);
     crate::blackbox::record(
         "procedure",
@@ -393,7 +432,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             xp.get_float(HDG_STATUS),
             xp.get_float(IAS),
         );
-        let (Ok(lat), Ok(lon)) = (lat, lon) else { continue };
+        let (Ok(lat), Ok(lon)) = (lat, lon) else {
+            continue;
+        };
         let alt_ft = elev_m.unwrap_or(0.0) * M_TO_FT;
         let agl_ft = agl_m.unwrap_or(0.0) * M_TO_FT;
 
@@ -415,7 +456,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // to-altitude leg holds its own magnetic course.
         let psi_v = psi_r.ok();
         let crab = match (psi_v, hpath_r.ok()) {
-            (Some(psi), Some(hp)) => (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0),
+            (Some(psi), Some(hp)) => {
+                (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0)
+            }
             _ => 0.0,
         };
         let dist_nm = bearing_to_fix(lat, lon, leg).map(|_| {
@@ -490,9 +533,20 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         );
 
         // --- Approach handoff: at the FAF leg, once captured, autoland owns it.
-        if let (EndAction::Approach { apt_dat, cfg, approach_ias }, Some(hi)) = (&end, handoff) {
+        if let (
+            EndAction::Approach {
+                apt_dat,
+                cfg,
+                approach_ias,
+            },
+            Some(hi),
+        ) = (&end, handoff)
+        {
             if idx >= hi && leg_captured(leg, dist_nm, alt_ft) {
-                crate::blackbox::record("procedure", serde_json::json!({"event": "handoff_autoland", "idx": idx, "agl_ft": agl_ft}));
+                crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({"event": "handoff_autoland", "idx": idx, "agl_ft": agl_ft}),
+                );
                 alert(&voice, Priority::Advisory, "Established. Landing us.");
                 crate::autoland::ABORT.store(false, Ordering::SeqCst);
                 crate::autoland::run_autoland(
@@ -527,16 +581,30 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     match end {
         EndAction::Level => {
             crate::blackbox::record("procedure", serde_json::json!({"event": "complete_level"}));
-            alert(&voice, Priority::Advisory, "Procedure complete. Level, the autopilot is holding. Your aircraft.");
+            alert(
+                &voice,
+                Priority::Advisory,
+                "Procedure complete. Level, the autopilot is holding. Your aircraft.",
+            );
         }
         EndAction::Enroute => {
             // The flight orchestrator is polling ACTIVE; it announces the
             // arrival itself. The AP keeps holding heading + altitude.
-            crate::blackbox::record("procedure", serde_json::json!({"event": "complete_enroute"}));
+            crate::blackbox::record(
+                "procedure",
+                serde_json::json!({"event": "complete_enroute"}),
+            );
         }
         EndAction::Approach { .. } => {
-            crate::blackbox::record("procedure", serde_json::json!({"event": "complete_no_handoff"}));
-            alert(&voice, Priority::Caution, "Ran out of approach legs without a handoff. Your aircraft.");
+            crate::blackbox::record(
+                "procedure",
+                serde_json::json!({"event": "complete_no_handoff"}),
+            );
+            alert(
+                &voice,
+                Priority::Caution,
+                "Ran out of approach legs without a handoff. Your aircraft.",
+            );
         }
     }
     ACTIVE.store(false, Ordering::SeqCst);
@@ -554,7 +622,11 @@ mod tests {
             leg_type: "TF".to_string(),
             fix_ident: fix_ident.to_string(),
             fix_region: "LE".to_string(),
-            fix: Some(Fix { ident: fix_ident.to_string(), lat, lon }),
+            fix: Some(Fix {
+                ident: fix_ident.to_string(),
+                lat,
+                lon,
+            }),
             course_mag: None,
             dist_nm: None,
             turn: None,
@@ -597,7 +669,10 @@ mod tests {
     fn a_fix_leg_captures_inside_the_radius() {
         let l = leg("F", 36.0, -5.0);
         assert!(!leg_captured(&l, Some(1.5), 2000.0), "far: not captured");
-        assert!(leg_captured(&l, Some(CAPTURE_NM - 0.1), 2000.0), "inside: captured");
+        assert!(
+            leg_captured(&l, Some(CAPTURE_NM - 0.1), 2000.0),
+            "inside: captured"
+        );
     }
 
     #[test]
@@ -628,7 +703,11 @@ mod tests {
 
     #[test]
     fn handoff_is_the_faf_when_flagged() {
-        let mut legs = vec![leg("IF", 36.0, -5.0), leg("FAF", 36.1, -5.0), leg("RW27", 36.2, -5.0)];
+        let mut legs = vec![
+            leg("IF", 36.0, -5.0),
+            leg("FAF", 36.1, -5.0),
+            leg("RW27", 36.2, -5.0),
+        ];
         legs[1].is_faf = true;
         assert_eq!(handoff_index(&legs), Some(1));
     }
@@ -636,13 +715,22 @@ mod tests {
     #[test]
     fn handoff_falls_back_to_the_leg_before_the_runway() {
         // No FAF flag: hand off the leg before the RW threshold.
-        let legs = vec![leg("IF", 36.0, -5.0), leg("STEP", 36.1, -5.0), leg("RW27", 36.2, -5.0)];
+        let legs = vec![
+            leg("IF", 36.0, -5.0),
+            leg("STEP", 36.1, -5.0),
+            leg("RW27", 36.2, -5.0),
+        ];
         assert_eq!(handoff_index(&legs), Some(1));
         assert_eq!(handoff_index(&[]), None);
     }
 
     fn wp(ident: &str, lat: f64, lon: f64, alt: f64) -> crate::simbrief::Waypoint {
-        crate::simbrief::Waypoint { ident: ident.to_string(), lat, lon, alt }
+        crate::simbrief::Waypoint {
+            ident: ident.to_string(),
+            lat,
+            lon,
+            alt,
+        }
     }
 
     #[test]
@@ -686,7 +774,10 @@ mod tests {
 
     #[test]
     fn a_plan_of_just_airports_yields_no_enroute_legs() {
-        let wps = vec![wp("LEJR", 36.74, -6.06, 0.0), wp("LXGB", 36.15, -5.35, 2500.0)];
+        let wps = vec![
+            wp("LEJR", 36.74, -6.06, 0.0),
+            wp("LXGB", 36.15, -5.35, 2500.0),
+        ];
         assert!(enroute_legs(&wps, "LEJR", "LXGB", 5000.0).is_empty());
     }
 

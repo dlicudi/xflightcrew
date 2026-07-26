@@ -65,8 +65,18 @@ fn parse_runway_100(line: &str) -> Option<(RunwayEnd, RunwayEnd, f64, i32)> {
     let lat2: f64 = f[18].parse().ok()?;
     let lon2: f64 = f[19].parse().ok()?;
     let length_m = haversine_nm(lat1, lon1, lat2, lon2) * M_PER_NM;
-    let end1 = RunwayEnd { id: f[8].to_string(), lat: lat1, lon: lon1, course: bearing_deg(lat1, lon1, lat2, lon2) };
-    let end2 = RunwayEnd { id: f[17].to_string(), lat: lat2, lon: lon2, course: bearing_deg(lat2, lon2, lat1, lon1) };
+    let end1 = RunwayEnd {
+        id: f[8].to_string(),
+        lat: lat1,
+        lon: lon1,
+        course: bearing_deg(lat1, lon1, lat2, lon2),
+    };
+    let end2 = RunwayEnd {
+        id: f[17].to_string(),
+        lat: lat2,
+        lon: lon2,
+        course: bearing_deg(lat2, lon2, lat1, lon1),
+    };
     Some((end1, end2, length_m, surface))
 }
 
@@ -80,7 +90,12 @@ struct RunwayEnd {
 /// Candidate landing runways within `max_nm` of (lat, lon), nearest threshold
 /// first. Streams the whole apt.dat once (cheap per line; ~a second on 363 MB — an
 /// emergency arms this once). Later stages filter by suitability and plan the approach.
-pub fn nearby_runways(apt_dat: &str, lat: f64, lon: f64, max_nm: f64) -> std::io::Result<Vec<Runway>> {
+pub fn nearby_runways(
+    apt_dat: &str,
+    lat: f64,
+    lon: f64,
+    max_nm: f64,
+) -> std::io::Result<Vec<Runway>> {
     let rdr = BufReader::new(std::fs::File::open(apt_dat)?);
     let mut out: Vec<Runway> = Vec::new();
     let mut icao = String::new();
@@ -97,7 +112,9 @@ pub fn nearby_runways(apt_dat: &str, lat: f64, lon: f64, max_nm: f64) -> std::io
                 icao = line.split_whitespace().nth(4).unwrap_or("").to_string();
             }
             "100" => {
-                let Some((e1, e2, length_m, surface)) = parse_runway_100(&line) else { continue };
+                let Some((e1, e2, length_m, surface)) = parse_runway_100(&line) else {
+                    continue;
+                };
                 for e in [e1, e2] {
                     let dist_nm = haversine_nm(lat, lon, e.lat, e.lon);
                     if dist_nm <= max_nm {
@@ -118,7 +135,11 @@ pub fn nearby_runways(apt_dat: &str, lat: f64, lon: f64, max_nm: f64) -> std::io
             _ => {}
         }
     }
-    out.sort_by(|a, b| a.dist_nm.partial_cmp(&b.dist_nm).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        a.dist_nm
+            .partial_cmp(&b.dist_nm)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(out)
 }
 
@@ -144,7 +165,9 @@ pub fn best_landing_runway(
             let brg = bearing_deg(lat, lon, r.thr_lat, r.thr_lon);
             r.dist_nm + heading_diff(track_deg, brg) / 30.0
         };
-        score(a).partial_cmp(&score(b)).unwrap_or(std::cmp::Ordering::Equal)
+        score(a)
+            .partial_cmp(&score(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(best)
 }
@@ -259,7 +282,12 @@ pub fn run_autoland(
 ) {
     let my_gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
         rt.block_on(async move {
             let xp = XPlaneClient::new(base);
             ACTIVE.store(true, Ordering::SeqCst);
@@ -770,7 +798,12 @@ impl GoAroundLatch {
 
     /// Advance the latch one tick: `prev`/`now` are the raw guidance phases,
     /// `radio_ft` the radio altitude. Returns whether the latch is flying.
-    pub fn update(&mut self, prev: Option<ApproachPhase>, now: ApproachPhase, radio_ft: f64) -> bool {
+    pub fn update(
+        &mut self,
+        prev: Option<ApproachPhase>,
+        now: ApproachPhase,
+        radio_ft: f64,
+    ) -> bool {
         if self.active {
             // Clear of the ground — hand the turn back to the intercept
             // guidance. 800 ft, not the 500 ft terrain floor: the turn back
@@ -805,7 +838,11 @@ pub fn go_around_guidance(
     ias_kts: f64,
     approach_ias: f64,
 ) -> Guidance {
-    let target_vs = if approach_ias - ias_kts > SPEED_FLOOR_MARGIN_KTS { 0.0 } else { MAX_CLIMB_FPM };
+    let target_vs = if approach_ias - ias_kts > SPEED_FLOOR_MARGIN_KTS {
+        0.0
+    } else {
+        MAX_CLIMB_FPM
+    };
     Guidance {
         target_heading_deg: rwy.course_deg,
         target_vs_fpm: target_vs,
@@ -872,15 +909,15 @@ pub fn guidance(
     // capturing) that means flying OUTBOUND first; the point walks back toward
     // the FAP as altitude burns off (a teardrop join).
     const CAPTURE_ABOVE_FT: f64 = 500.0;
-    let join_nm = ((cur_alt_ft - rwy.elev_ft) / GLIDEPATH_FT_PER_NM * 1.15)
-        .clamp(FAP_NM, 40.0);
+    let join_nm = ((cur_alt_ft - rwy.elev_ft) / GLIDEPATH_FT_PER_NM * 1.15).clamp(FAP_NM, 40.0);
 
     // Are we past the threshold, on the departure side, still airborne? (The flare
     // branch below, checked first, owns a normal float/rollout across the numbers.)
     let past_threshold = along_track_nm(cur_lat, cur_lon, rwy) < -OVERFLIGHT_GO_AROUND_NM;
 
     let xtk = cross_track_nm(cur_lat, cur_lon, rwy);
-    let (phase, target_heading) = if radio_alt_ft <= flare_radio_ft && dist_nm <= FLARE_MAX_DIST_NM {
+    let (phase, target_heading) = if radio_alt_ft <= flare_radio_ft && dist_nm <= FLARE_MAX_DIST_NM
+    {
         // Low radio altitude alone is NOT the flare cue — terrain rises to meet
         // the approach path miles from the field (seen live: "flared" at 7 ft AGL
         // 4.1 nm out at LEMI, power cut over open ground; and again into a dip
@@ -899,7 +936,10 @@ pub fn guidance(
             // no big heading swings a few feet off the ground. Rate-damped
             // like the final, so a closing drift isn't chased into an S.
             let corr = ((xtk + 0.2 * xtk_rate_nm_min) * 80.0).clamp(-8.0, 8.0);
-            (ApproachPhase::Flare, (rwy.course_deg - corr + 360.0) % 360.0)
+            (
+                ApproachPhase::Flare,
+                (rwy.course_deg - corr + 360.0) % 360.0,
+            )
         }
     } else if past_threshold {
         // Overflew the runway without landing (too high/fast at the numbers). Go
@@ -910,11 +950,17 @@ pub fn guidance(
         // energy allows. Takes priority over the join/FAP/final branches so a
         // go-around always turns toward the field regardless of altitude.
         let (fap_lat, fap_lon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, FAP_NM);
-        (ApproachPhase::Intercept, bearing_deg(cur_lat, cur_lon, fap_lat, fap_lon))
+        (
+            ApproachPhase::Intercept,
+            bearing_deg(cur_lat, cur_lon, fap_lat, fap_lon),
+        )
     } else if alt_err > CAPTURE_ABOVE_FT {
         // Too high for this distance — descend toward the join point.
         let (jlat, jlon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, join_nm);
-        (ApproachPhase::Intercept, bearing_deg(cur_lat, cur_lon, jlat, jlon))
+        (
+            ApproachPhase::Intercept,
+            bearing_deg(cur_lat, cur_lon, jlat, jlon),
+        )
     } else if dist_nm > FAP_NM + 0.5 {
         // Outside the FAP: steer TO the Final Approach Point — a point FAP_NM out
         // on the approach side of the threshold along the extended centreline —
@@ -925,7 +971,10 @@ pub fn guidance(
         // heading, never intercepting). Aiming at the FAP always closes on the
         // runway from the correct side, then the final branch tracks the centreline.
         let (fap_lat, fap_lon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, FAP_NM);
-        (ApproachPhase::Intercept, bearing_deg(cur_lat, cur_lon, fap_lat, fap_lon))
+        (
+            ApproachPhase::Intercept,
+            bearing_deg(cur_lat, cur_lon, fap_lat, fap_lon),
+        )
     } else {
         // On final: PURSUE a point ON the centreline halfway to the threshold
         // instead of P-correcting the offset. Offset-proportional gains kept
@@ -956,7 +1005,10 @@ pub fn guidance(
             // still skimmed the ground at 91 kt before climbing (2026-07-22).
             (ApproachPhase::Intercept, rwy.course_deg)
         } else {
-            (ApproachPhase::Final, (rwy.course_deg + cut).rem_euclid(360.0))
+            (
+                ApproachPhase::Final,
+                (rwy.course_deg + cut).rem_euclid(360.0),
+            )
         }
     };
 
@@ -1033,7 +1085,11 @@ pub fn guidance(
 
     // Below the terrain floor, ask the throttle governor for extra speed so it
     // builds the surplus the climb gate needs; otherwise hold the approach speed.
-    let target_ias = if below_terrain_floor { approach_ias + CLIMB_ENERGY_BONUS_KTS } else { approach_ias };
+    let target_ias = if below_terrain_floor {
+        approach_ias + CLIMB_ENERGY_BONUS_KTS
+    } else {
+        approach_ias
+    };
 
     Guidance {
         target_heading_deg: target_heading,
@@ -1052,8 +1108,15 @@ mod tests {
     fn rwy_north() -> Runway {
         // A runway at the equator, landing due north (course 0), threshold at 0,0.
         Runway {
-            icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
-            course_deg: 0.0, length_m: 3000.0, surface: 1, dist_nm: 0.0, elev_ft: 0.0,
+            icao: "TEST".into(),
+            id: "36".into(),
+            thr_lat: 0.0,
+            thr_lon: 0.0,
+            course_deg: 0.0,
+            length_m: 3000.0,
+            surface: 1,
+            dist_nm: 0.0,
+            elev_ft: 0.0,
         }
     }
 
@@ -1077,11 +1140,25 @@ mod tests {
         // Place it 8 nm NORTH of a north-landing runway (past the field, departure
         // side): the command must steer SOUTH toward the FAP, not north on course.
         let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 8.0); // 8 nm north, past the threshold
-        let g = guidance(lat, lon, 2000.0, 2000.0, 90.0, 90.0, &rwy_north(), 90.0, 20.0, 0.0);
+        let g = guidance(
+            lat,
+            lon,
+            2000.0,
+            2000.0,
+            90.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            20.0,
+            0.0,
+        );
         assert_eq!(g.phase, ApproachPhase::Intercept);
         // FAP is 5 nm SOUTH of the threshold; from 8 nm north that's ~due south.
-        assert!(heading_diff(g.target_heading_deg, 180.0) < 20.0,
-            "must steer toward the FAP/field, got hdg {}", g.target_heading_deg);
+        assert!(
+            heading_diff(g.target_heading_deg, 180.0) < 20.0,
+            "must steer toward the FAP/field, got hdg {}",
+            g.target_heading_deg
+        );
     }
 
     #[test]
@@ -1091,15 +1168,55 @@ mod tests {
         // slow, the guidance must now command a DESCENT to regain speed, not a level
         // hold. 5 nm south, well below the path, 55 kt against a 90 kt approach.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 5.0);
-        let g = guidance(lat, lon, 200.0, 200.0, 55.0, 55.0, &rwy_north(), 90.0, 20.0, 0.0);
-        assert!(g.target_vs_fpm < -100.0, "slow + below path must descend, got {}", g.target_vs_fpm);
+        let g = guidance(
+            lat,
+            lon,
+            200.0,
+            200.0,
+            55.0,
+            55.0,
+            &rwy_north(),
+            90.0,
+            20.0,
+            0.0,
+        );
+        assert!(
+            g.target_vs_fpm < -100.0,
+            "slow + below path must descend, got {}",
+            g.target_vs_fpm
+        );
         // On speed at the same spot, it holds level to wait for the path (no dive).
-        let g_ok = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 20.0, 0.0);
+        let g_ok = guidance(
+            lat,
+            lon,
+            200.0,
+            200.0,
+            90.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            20.0,
+            0.0,
+        );
         assert_eq!(g_ok.target_vs_fpm, 0.0, "on speed below path → level hold");
         // Speed protection never fights the flare (we WANT to slow down landing).
-        let g_flare = guidance(0.001, 0.0, 30.0, 15.0, 40.0, 40.0, &rwy_north(), 90.0, 20.0, 0.0);
+        let g_flare = guidance(
+            0.001,
+            0.0,
+            30.0,
+            15.0,
+            40.0,
+            40.0,
+            &rwy_north(),
+            90.0,
+            20.0,
+            0.0,
+        );
         assert_eq!(g_flare.phase, ApproachPhase::Flare);
-        assert!(g_flare.target_vs_fpm > -200.0, "flare not overridden by speed floor");
+        assert!(
+            g_flare.target_vs_fpm > -200.0,
+            "flare not overridden by speed floor"
+        );
     }
 
     #[test]
@@ -1111,15 +1228,48 @@ mod tests {
         // distance so the bug applied. It must now go around: phase Intercept,
         // steering SOUTH back toward the FAP, not north on the runway course.
         let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.5); // 0.5 nm north, past the threshold
-        let g = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
-        assert_eq!(g.phase, ApproachPhase::Intercept, "past the threshold → go around");
-        assert!(heading_diff(g.target_heading_deg, 180.0) < 25.0,
-            "must turn back toward the FAP, got hdg {}", g.target_heading_deg);
+        let g = guidance(
+            lat,
+            lon,
+            200.0,
+            200.0,
+            90.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
+        assert_eq!(
+            g.phase,
+            ApproachPhase::Intercept,
+            "past the threshold → go around"
+        );
+        assert!(
+            heading_diff(g.target_heading_deg, 180.0) < 25.0,
+            "must turn back toward the FAP, got hdg {}",
+            g.target_heading_deg
+        );
         // Sanity: a mirror point 0.5 nm SHORT of the threshold (approach side) is a
         // normal final, not a go-around.
         let (slat, slon) = project_latlon(0.0, 0.0, 180.0, 0.5);
-        let g_final = guidance(slat, slon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
-        assert_ne!(g_final.phase, ApproachPhase::Intercept, "short of the threshold is not a go-around");
+        let g_final = guidance(
+            slat,
+            slon,
+            200.0,
+            200.0,
+            90.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
+        assert_ne!(
+            g_final.phase,
+            ApproachPhase::Intercept,
+            "short of the threshold is not a go-around"
+        );
     }
 
     #[test]
@@ -1129,15 +1279,53 @@ mod tests {
         // 500 ft floor), on the approach side.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 3.0);
         // FAST (approach + 10): surplus energy → bounded climb away from terrain.
-        let g_fast = guidance(lat, lon, 200.0, 200.0, 100.0, 100.0, &rwy_north(), 90.0, 25.0, 0.0);
-        assert!(g_fast.target_vs_fpm > 0.0, "below the floor + fast → climb, got {}", g_fast.target_vs_fpm);
-        assert!(g_fast.target_vs_fpm <= MAX_CLIMB_FPM, "climb is bounded, got {}", g_fast.target_vs_fpm);
+        let g_fast = guidance(
+            lat,
+            lon,
+            200.0,
+            200.0,
+            100.0,
+            100.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
+        assert!(
+            g_fast.target_vs_fpm > 0.0,
+            "below the floor + fast → climb, got {}",
+            g_fast.target_vs_fpm
+        );
+        assert!(
+            g_fast.target_vs_fpm <= MAX_CLIMB_FPM,
+            "climb is bounded, got {}",
+            g_fast.target_vs_fpm
+        );
         // And it asks the throttle for extra speed to sustain the climb.
-        assert!(g_fast.target_ias_kts > 90.0, "climb raises the speed target, got {}", g_fast.target_ias_kts);
+        assert!(
+            g_fast.target_ias_kts > 90.0,
+            "climb raises the speed target, got {}",
+            g_fast.target_ias_kts
+        );
         // ON SPEED (no surplus): must NOT climb — hold level and let the governor
         // rebuild speed first (climbing slow would stall).
-        let g_slow = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
-        assert_eq!(g_slow.target_vs_fpm, 0.0, "below the floor but no surplus → level, got {}", g_slow.target_vs_fpm);
+        let g_slow = guidance(
+            lat,
+            lon,
+            200.0,
+            200.0,
+            90.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
+        assert_eq!(
+            g_slow.target_vs_fpm, 0.0,
+            "below the floor but no surplus → level, got {}",
+            g_slow.target_vs_fpm
+        );
     }
 
     #[test]
@@ -1146,9 +1334,27 @@ mod tests {
         // 0.5 nm short of the threshold, 200 ft AGL, fast: no climb (inside the
         // floor-enforcement range).
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 0.5);
-        let g = guidance(lat, lon, 200.0, 200.0, 100.0, 100.0, &rwy_north(), 90.0, 25.0, 0.0);
-        assert!(g.target_vs_fpm <= 0.0, "no climb on short final, got {}", g.target_vs_fpm);
-        assert_eq!(g.target_ias_kts, 90.0, "no climb-energy bonus on short final");
+        let g = guidance(
+            lat,
+            lon,
+            200.0,
+            200.0,
+            100.0,
+            100.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
+        assert!(
+            g.target_vs_fpm <= 0.0,
+            "no climb on short final, got {}",
+            g.target_vs_fpm
+        );
+        assert_eq!(
+            g.target_ias_kts, 90.0,
+            "no climb-energy bonus on short final"
+        );
     }
 
     #[test]
@@ -1161,13 +1367,46 @@ mod tests {
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 1.3);
         // On the TDZ-aimed path at 1.3 nm (~465 ft) — still below the 500 floor.
         let on_path = (1.3 + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
-        let g = guidance(lat, lon, on_path, on_path, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
+        let g = guidance(
+            lat,
+            lon,
+            on_path,
+            on_path,
+            90.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
         assert_eq!(g.phase, ApproachPhase::Final);
-        assert!(g.target_vs_fpm < -300.0, "on path must keep descending, got {}", g.target_vs_fpm);
-        assert_eq!(g.target_ias_kts, 90.0, "no climb-energy bonus on an on-path final");
+        assert!(
+            g.target_vs_fpm < -300.0,
+            "on path must keep descending, got {}",
+            g.target_vs_fpm
+        );
+        assert_eq!(
+            g.target_ias_kts, 90.0,
+            "no climb-energy bonus on an on-path final"
+        );
         // Deeply below the path at the same distance: the floor still stands.
-        let g_low = guidance(lat, lon, 200.0, 200.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
-        assert_eq!(g_low.target_vs_fpm, 0.0, "dragged-in-low keeps the floor, got {}", g_low.target_vs_fpm);
+        let g_low = guidance(
+            lat,
+            lon,
+            200.0,
+            200.0,
+            90.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
+        assert_eq!(
+            g_low.target_vs_fpm, 0.0,
+            "dragged-in-low keeps the floor, got {}",
+            g_low.target_vs_fpm
+        );
     }
 
     #[test]
@@ -1179,21 +1418,65 @@ mod tests {
         // straight ahead), never a touchdown.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 0.15);
         let off = lon + 0.10 / 60.0; // 0.10 nm right of the centreline
-        let g = guidance(lat, off, 20.0, 20.0, 80.0, 80.0, &rwy_north(), 90.0, 25.0, 0.0);
-        assert_eq!(g.phase, ApproachPhase::Intercept, "off the pavement at 20 ft = balk");
+        let g = guidance(
+            lat,
+            off,
+            20.0,
+            20.0,
+            80.0,
+            80.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
+        assert_eq!(
+            g.phase,
+            ApproachPhase::Intercept,
+            "off the pavement at 20 ft = balk"
+        );
         // ...and the balk fires EARLY, from final at 80 ft — the 22 ft balk
         // still skimmed the ground at 91 kt (2026-07-22).
         let (hlat, hlon) = project_latlon(0.0, 0.0, 180.0, 0.4);
         let hoff = hlon + 0.05 / 60.0;
-        let g_early = guidance(hlat, hoff, 80.0, 80.0, 85.0, 85.0, &rwy_north(), 90.0, 25.0, 0.0);
-        assert_eq!(g_early.phase, ApproachPhase::Intercept, "off-centreline at 80 ft = balk");
+        let g_early = guidance(
+            hlat,
+            hoff,
+            80.0,
+            80.0,
+            85.0,
+            85.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
+        assert_eq!(
+            g_early.phase,
+            ApproachPhase::Intercept,
+            "off-centreline at 80 ft = balk"
+        );
         // On the centreline the flare still fires, and a small offset keeps a
         // gentle correction instead of locking the bare course.
         let near = lon + 0.01 / 60.0;
-        let g_ok = guidance(lat, near, 20.0, 20.0, 80.0, 80.0, &rwy_north(), 90.0, 25.0, 0.0);
+        let g_ok = guidance(
+            lat,
+            near,
+            20.0,
+            20.0,
+            80.0,
+            80.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
         assert_eq!(g_ok.phase, ApproachPhase::Flare);
         let cut = ((rwy_north().course_deg - g_ok.target_heading_deg + 540.0) % 360.0) - 180.0;
-        assert!(cut > 0.1 && cut <= 8.0, "flare keeps a bounded correction, got {cut}");
+        assert!(
+            cut > 0.1 && cut <= 8.0,
+            "flare keeps a bounded correction, got {cut}"
+        );
     }
 
     #[test]
@@ -1205,12 +1488,42 @@ mod tests {
         // hold at ANY distance: climb with surplus energy, level without — never
         // a glidepath descent.
         let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.7); // 0.7 nm PAST a north-landing threshold
-        let g_fast = guidance(lat, lon, 300.0, 300.0, 100.0, 100.0, &rwy_north(), 90.0, 25.0, 0.0);
+        let g_fast = guidance(
+            lat,
+            lon,
+            300.0,
+            300.0,
+            100.0,
+            100.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
         assert_eq!(g_fast.phase, ApproachPhase::Intercept);
-        assert!(g_fast.target_vs_fpm > 0.0, "repositioning low + fast → climb, got {}", g_fast.target_vs_fpm);
-        let g_slow = guidance(lat, lon, 300.0, 300.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
+        assert!(
+            g_fast.target_vs_fpm > 0.0,
+            "repositioning low + fast → climb, got {}",
+            g_fast.target_vs_fpm
+        );
+        let g_slow = guidance(
+            lat,
+            lon,
+            300.0,
+            300.0,
+            90.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
         assert_eq!(g_slow.phase, ApproachPhase::Intercept);
-        assert_eq!(g_slow.target_vs_fpm, 0.0, "repositioning low + no surplus → level, got {}", g_slow.target_vs_fpm);
+        assert_eq!(
+            g_slow.target_vs_fpm, 0.0,
+            "repositioning low + no surplus → level, got {}",
+            g_slow.target_vs_fpm
+        );
     }
 
     #[test]
@@ -1249,8 +1562,14 @@ mod tests {
         for n in 1..=3 {
             assert!(l.update(Some(Final), Intercept, 50.0), "latched low");
             assert_eq!(l.attempts(), n, "counted");
-            assert!(l.update(Some(Intercept), Intercept, 50.0), "stays latched climbing");
-            assert!(!l.update(Some(Intercept), Intercept, 900.0), "released above 800 ft");
+            assert!(
+                l.update(Some(Intercept), Intercept, 50.0),
+                "stays latched climbing"
+            );
+            assert!(
+                !l.update(Some(Intercept), Intercept, 900.0),
+                "released above 800 ft"
+            );
         }
         // The loop gives up once attempts EXCEED the cap.
         assert!(l.attempts() > MAX_GO_AROUNDS);
@@ -1262,7 +1581,10 @@ mod tests {
         // On speed: full climb, straight down the runway heading.
         let g = go_around_guidance(&rwy, 0.3, 100.0, 92.0, 90.0);
         assert_eq!(g.phase, ApproachPhase::Intercept);
-        assert!(heading_diff(g.target_heading_deg, rwy.course_deg) < 0.1, "straight ahead");
+        assert!(
+            heading_diff(g.target_heading_deg, rwy.course_deg) < 0.1,
+            "straight ahead"
+        );
         assert!(g.target_vs_fpm > 0.0 && g.target_vs_fpm <= MAX_CLIMB_FPM);
         // Slow (deficit beyond the floor margin): level acceleration first —
         // climbing slow at full flap is how a go-around stalls.
@@ -1297,13 +1619,32 @@ mod tests {
     fn glidepath_descends_toward_the_threshold() {
         // 5 nm south of the threshold at 2000 ft, 120 kt groundspeed, tracking north.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 5.0); // 5 nm south
-        let g = guidance(lat, lon, 2000.0, 2000.0, 120.0, 90.0, &rwy_north(), 90.0, 20.0, 0.0);
+        let g = guidance(
+            lat,
+            lon,
+            2000.0,
+            2000.0,
+            120.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            20.0,
+            0.0,
+        );
         assert!((g.dist_nm - 5.0).abs() < 0.2, "5 nm out, got {}", g.dist_nm);
         // Glidepath alt at 5 nm ≈ 1590 ft; we're above it → commanded to descend.
         assert!(g.glidepath_alt_ft > 1400.0 && g.glidepath_alt_ft < 1700.0);
-        assert!(g.target_vs_fpm < 0.0, "should descend, got {}", g.target_vs_fpm);
+        assert!(
+            g.target_vs_fpm < 0.0,
+            "should descend, got {}",
+            g.target_vs_fpm
+        );
         // Roughly on the centreline → heading close to the runway course (north).
-        assert!(heading_diff(g.target_heading_deg, 0.0) < 10.0, "hdg {}", g.target_heading_deg);
+        assert!(
+            heading_diff(g.target_heading_deg, 0.0) < 10.0,
+            "hdg {}",
+            g.target_heading_deg
+        );
     }
 
     #[test]
@@ -1313,21 +1654,57 @@ mod tests {
         // AWAY from the runway (toward the join point down the extended
         // centreline) and descend.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 6.0); // 6 nm south
-        let g = guidance(lat, lon, 7000.0, 7000.0, 135.0, 110.0, &rwy_north(), 110.0, 20.0, 0.0);
+        let g = guidance(
+            lat,
+            lon,
+            7000.0,
+            7000.0,
+            135.0,
+            110.0,
+            &rwy_north(),
+            110.0,
+            20.0,
+            0.0,
+        );
         assert_eq!(g.phase, ApproachPhase::Intercept);
         // Runway is north (bearing ~0); the join point is further SOUTH — so the
         // commanded heading must be southbound, not at the runway.
-        assert!(heading_diff(g.target_heading_deg, 180.0) < 30.0,
-            "should fly outbound, got hdg {}", g.target_heading_deg);
-        assert!(g.target_vs_fpm <= -1000.0, "and descend hard, got {}", g.target_vs_fpm);
+        assert!(
+            heading_diff(g.target_heading_deg, 180.0) < 30.0,
+            "should fly outbound, got hdg {}",
+            g.target_heading_deg
+        );
+        assert!(
+            g.target_vs_fpm <= -1000.0,
+            "and descend hard, got {}",
+            g.target_vs_fpm
+        );
     }
 
     #[test]
     fn flare_near_the_ground_arrests_descent_and_tracks_runway() {
-        let g = guidance(0.001, 0.0, 30.0, 15.0, 100.0, 90.0, &rwy_north(), 90.0, 20.0, 0.0);
+        let g = guidance(
+            0.001,
+            0.0,
+            30.0,
+            15.0,
+            100.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            20.0,
+            0.0,
+        );
         assert_eq!(g.phase, ApproachPhase::Flare);
-        assert!(g.target_vs_fpm > -200.0, "flare eases the descent, got {}", g.target_vs_fpm);
-        assert!(heading_diff(g.target_heading_deg, 0.0) < 1.0, "flare tracks the runway");
+        assert!(
+            g.target_vs_fpm > -200.0,
+            "flare eases the descent, got {}",
+            g.target_vs_fpm
+        );
+        assert!(
+            heading_diff(g.target_heading_deg, 0.0) < 1.0,
+            "flare tracks the runway"
+        );
     }
 
     #[test]
@@ -1335,11 +1712,37 @@ mod tests {
         // The LEMI failure: 7 ft AGL over rising terrain 4.1 nm out — the old
         // radio-only trigger "flared" (power to idle, vs -100) into open ground.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 4.1); // 4.1 nm south
-        let g = guidance(lat, lon, 900.0, 7.0, 130.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
-        assert_ne!(g.phase, ApproachPhase::Flare, "no flare 4 nm from the threshold");
+        let g = guidance(
+            lat,
+            lon,
+            900.0,
+            7.0,
+            130.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
+        assert_ne!(
+            g.phase,
+            ApproachPhase::Flare,
+            "no flare 4 nm from the threshold"
+        );
         // And the same low radio just short of the threshold IS the flare.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 0.1);
-        let g = guidance(lat, lon, 25.0, 15.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
+        let g = guidance(
+            lat,
+            lon,
+            25.0,
+            15.0,
+            90.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
         assert_eq!(g.phase, ApproachPhase::Flare);
     }
 
@@ -1354,20 +1757,46 @@ mod tests {
             let (lat, lon) = project_latlon(0.0, 0.0, 180.0, d_nm);
             let east = (lat, lon + 0.2 / 60.0);
             let on_path = (d_nm + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
-            guidance(east.0, east.1, on_path, on_path, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0)
+            guidance(
+                east.0,
+                east.1,
+                on_path,
+                on_path,
+                90.0,
+                90.0,
+                &rwy_north(),
+                90.0,
+                25.0,
+                0.0,
+            )
         };
         let far = at(3.0);
         let close = at(0.8);
         // Offset RIGHT of a north course → cut LEFT (negative).
         assert!(cut(&far) < -2.0, "far cut leftward: {:.1}", cut(&far));
-        assert!(cut(&close) < cut(&far) - 8.0,
-            "close-in cut much harder: far {:.1} vs close {:.1}", cut(&far), cut(&close));
+        assert!(
+            cut(&close) < cut(&far) - 8.0,
+            "close-in cut much harder: far {:.1} vs close {:.1}",
+            cut(&far),
+            cut(&close)
+        );
         // And clamped — never a base-turn-sized swing on final.
         assert!(cut(&close) >= -35.5);
         // On the centreline: no cut either distance.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 1.5);
         let on_path = (1.5 + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
-        let g = guidance(lat, lon, on_path, on_path, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
+        let g = guidance(
+            lat,
+            lon,
+            on_path,
+            on_path,
+            90.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
         assert!(cut(&g).abs() < 1.5, "centred: {:.1}", cut(&g));
         // SHORT final (inside the 0.3 nm pursuit floor), small offset (a big
         // one is the balk gate's problem): tiny corrections only — the
@@ -1376,9 +1805,28 @@ mod tests {
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 0.06);
         let near = (lat, lon + 0.015 / 60.0); // ~28 m right
         let on_path = (0.06 + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
-        let over = guidance(near.0, near.1, on_path, on_path, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
-        assert!(cut(&over).abs() <= 8.5, "no thrash over the numbers: {:.1}", cut(&over));
-        assert!(cut(&over) < -0.5, "still corrects toward the centreline: {:.1}", cut(&over));
+        let over = guidance(
+            near.0,
+            near.1,
+            on_path,
+            on_path,
+            90.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
+        assert!(
+            cut(&over).abs() <= 8.5,
+            "no thrash over the numbers: {:.1}",
+            cut(&over)
+        );
+        assert!(
+            cut(&over) < -0.5,
+            "still corrects toward the centreline: {:.1}",
+            cut(&over)
+        );
     }
 
     #[test]
@@ -1387,9 +1835,24 @@ mod tests {
         // glidepath altitude must be the 3° path aimed ~300 m PAST the threshold,
         // so it crosses the numbers at ~50 ft, not zero.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 3.0); // 3 nm south of thr
-        let g = guidance(lat, lon, 1000.0, 1000.0, 90.0, 90.0, &rwy_north(), 90.0, 25.0, 0.0);
+        let g = guidance(
+            lat,
+            lon,
+            1000.0,
+            1000.0,
+            90.0,
+            90.0,
+            &rwy_north(),
+            90.0,
+            25.0,
+            0.0,
+        );
         let expected = (3.0 + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
-        assert!((g.glidepath_alt_ft - expected).abs() < 1.0, "gp {} vs {expected}", g.glidepath_alt_ft);
+        assert!(
+            (g.glidepath_alt_ft - expected).abs() < 1.0,
+            "gp {} vs {expected}",
+            g.glidepath_alt_ft
+        );
         // Threshold-crossing height ~50 ft (the aim offset × slope), not 0.
         let tch = TOUCHDOWN_AIM_NM * GLIDEPATH_FT_PER_NM;
         assert!((45.0..=55.0).contains(&tch), "TCH ~50 ft, was {tch}");
@@ -1412,9 +1875,15 @@ mod tests {
         // Aircraft to the EAST of a north-landing runway's extended centreline (which
         // runs south of the threshold) → right of the inbound course → positive.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 3.0); // 3 nm south, on centreline
-        assert!(cross_track_nm(lat, lon, &rwy_north()).abs() < 0.05, "on centreline ~0");
+        assert!(
+            cross_track_nm(lat, lon, &rwy_north()).abs() < 0.05,
+            "on centreline ~0"
+        );
         let east = (lat, lon + 0.02);
-        assert!(cross_track_nm(east.0, east.1, &rwy_north()) > 0.0, "east = right = positive");
+        assert!(
+            cross_track_nm(east.0, east.1, &rwy_north()) > 0.0,
+            "east = right = positive"
+        );
     }
 
     #[test]
@@ -1422,8 +1891,14 @@ mod tests {
         // Due north / east / south / west from the equator.
         assert!((bearing_deg(0.0, 0.0, 1.0, 0.0) - 0.0).abs() < 0.5, "north");
         assert!((bearing_deg(0.0, 0.0, 0.0, 1.0) - 90.0).abs() < 0.5, "east");
-        assert!((bearing_deg(0.0, 0.0, -1.0, 0.0) - 180.0).abs() < 0.5, "south");
-        assert!((bearing_deg(0.0, 0.0, 0.0, -1.0) - 270.0).abs() < 0.5, "west");
+        assert!(
+            (bearing_deg(0.0, 0.0, -1.0, 0.0) - 180.0).abs() < 0.5,
+            "south"
+        );
+        assert!(
+            (bearing_deg(0.0, 0.0, 0.0, -1.0) - 270.0).abs() < 0.5,
+            "west"
+        );
     }
 
     #[test]
@@ -1445,7 +1920,10 @@ mod tests {
         // The two ends are the same runway → reciprocal courses (~180 apart).
         assert!((heading_diff(e1.course, e2.course) - 180.0).abs() < 2.0);
         // ~510 m strip; sanity-bound the length.
-        assert!(length_m > 300.0 && length_m < 800.0, "length was {length_m}");
+        assert!(
+            length_m > 300.0 && length_m < 800.0,
+            "length was {length_m}"
+        );
     }
 
     #[test]
@@ -1468,8 +1946,10 @@ mod tests {
         let best = best_landing_runway(&apt, 47.449, -122.309, 160.0, 30.0, 1500.0)
             .expect("read apt.dat")
             .expect("a suitable runway near KSEA");
-        println!("selected: {} rwy {} @ {:.0} nm, {:.0} m, course {:.0}",
-            best.icao, best.id, best.dist_nm, best.length_m, best.course_deg);
+        println!(
+            "selected: {} rwy {} @ {:.0} nm, {:.0} m, course {:.0}",
+            best.icao, best.id, best.dist_nm, best.length_m, best.course_deg
+        );
         assert_eq!(best.icao, "KSEA");
         assert!(best.length_m > 2000.0, "KSEA runways are long");
         assert!(best.dist_nm < 5.0, "should be right at the field");
@@ -1493,15 +1973,29 @@ mod tests {
         .unwrap();
         let p = path.to_str().unwrap();
         // The into-wind end the arrival chose (27) resolves to the hard runway.
-        let r = runway_by_id(p, 36.15, -5.34, "27", 40.0).unwrap().expect("27 is at the field");
+        let r = runway_by_id(p, 36.15, -5.34, "27", 40.0)
+            .unwrap()
+            .expect("27 is at the field");
         assert_eq!(r.id, "27");
         assert!(r.hard(), "27 is asphalt");
         // Its reciprocal is equally resolvable.
-        assert_eq!(runway_by_id(p, 36.15, -5.34, "09", 40.0).unwrap().unwrap().id, "09");
+        assert_eq!(
+            runway_by_id(p, 36.15, -5.34, "09", 40.0)
+                .unwrap()
+                .unwrap()
+                .id,
+            "09"
+        );
         // The grass end is filtered out (not a landing runway for autoland).
-        assert!(runway_by_id(p, 36.15, -5.34, "05", 40.0).unwrap().is_none(), "grass is skipped");
+        assert!(
+            runway_by_id(p, 36.15, -5.34, "05", 40.0).unwrap().is_none(),
+            "grass is skipped"
+        );
         // An ident that isn't here → None (caller falls back to track pick).
-        assert!(runway_by_id(p, 36.15, -5.34, "18", 40.0).unwrap().is_none(), "no 18 here");
+        assert!(
+            runway_by_id(p, 36.15, -5.34, "18", 40.0).unwrap().is_none(),
+            "no 18 here"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

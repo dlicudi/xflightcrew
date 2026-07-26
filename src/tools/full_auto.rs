@@ -104,7 +104,12 @@ impl Tool for FullAuto {
         if crate::full_auto::ACTIVE.load(SeqCst) {
             return Ok("I'm already running the full sequence. Say cancel to stop.".to_string());
         }
-        if ctx.xplane.get_float(crate::datarefs::IS_IN_REPLAY).await.is_ok_and(|v| v > 0.5) {
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::IS_IN_REPLAY)
+            .await
+            .is_ok_and(|v| v > 0.5)
+        {
             return Ok("We're in replay. Go back to live and ask again.".to_string());
         }
 
@@ -180,24 +185,37 @@ impl FullAuto {
     /// Fetch the SimBrief OFP and distil it to a flyable [`Mission::Flight`] —
     /// or an honest spoken refusal (no plan, no waypoints, or a plan that
     /// departs somewhere we aren't).
-    async fn build_flight_mission(&self, ctx: &ToolCtx<'_>) -> std::result::Result<(Mission, String), String> {
+    async fn build_flight_mission(
+        &self,
+        ctx: &ToolCtx<'_>,
+    ) -> std::result::Result<(Mission, String), String> {
         if ctx.config.simbrief_id.trim().is_empty() {
             return Err(
-                "No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can fly your plan.".to_string()
+                "No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can fly your plan.".to_string(),
             );
         }
-        let fp = crate::simbrief::fetch(&ctx.config.simbrief_id).await.map_err(|e| {
-            tracing::warn!("simbrief fetch failed: {e:#}");
-            "Couldn't fetch your SimBrief plan. Generate one first, or check the ID.".to_string()
-        })?;
+        let fp = crate::simbrief::fetch(&ctx.config.simbrief_id)
+            .await
+            .map_err(|e| {
+                tracing::warn!("simbrief fetch failed: {e:#}");
+                "Couldn't fetch your SimBrief plan. Generate one first, or check the ID."
+                    .to_string()
+            })?;
 
         // The plan must depart from where we're parked — flying LEJR's route
         // out of some other field would thread the wrong corridor entirely.
         let (Ok(lat), Ok(lon)) = (
-            ctx.xplane.get_float("sim/flightmodel/position/latitude").await,
-            ctx.xplane.get_float("sim/flightmodel/position/longitude").await,
+            ctx.xplane
+                .get_float("sim/flightmodel/position/latitude")
+                .await,
+            ctx.xplane
+                .get_float("sim/flightmodel/position/longitude")
+                .await,
         ) else {
-            return Err("I can't read our position, so I can't line the plan up with where we are.".to_string());
+            return Err(
+                "I can't read our position, so I can't line the plan up with where we are."
+                    .to_string(),
+            );
         };
         let apt_dat = super::autoland::apt_dat_path();
         let here = crate::autoland::nearby_runways(&apt_dat, lat, lon, 4.0)
@@ -212,7 +230,12 @@ impl FullAuto {
             ));
         }
 
-        let legs = crate::procedure::enroute_legs(&fp.waypoints, &fp.origin, &fp.destination, fp.cruise_alt_ft);
+        let legs = crate::procedure::enroute_legs(
+            &fp.waypoints,
+            &fp.origin,
+            &fp.destination,
+            fp.cruise_alt_ft,
+        );
         if legs.is_empty() {
             return Err(format!(
                 "Your plan to {} has no enroute waypoints I can fly. Generate it with a route.",
@@ -254,7 +277,12 @@ impl FullAuto {
             dest_name,
         );
         Ok((
-            Mission::Flight(Route { dest_icao: fp.destination.clone(), dest_name, legs, fms_payload }),
+            Mission::Flight(Route {
+                dest_icao: fp.destination.clone(),
+                dest_name,
+                legs,
+                fms_payload,
+            }),
             ack,
         ))
     }

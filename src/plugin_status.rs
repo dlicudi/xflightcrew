@@ -249,7 +249,9 @@ fn run(base: String, rx: Receiver<Update>) {
 
     let mut ids = resolve_all(&http, &rest);
     if !ids.any() {
-        tracing::debug!("plugin_status: status datarefs not found (plugin not loaded, or X-Plane down)");
+        tracing::debug!(
+            "plugin_status: status datarefs not found (plugin not loaded, or X-Plane down)"
+        );
     }
     // `healthy` tracks whether our cached ids are landing. A failed PATCH (or
     // ids that won't resolve) flips it false; while unhealthy we re-resolve on a
@@ -268,8 +270,16 @@ fn run(base: String, rx: Receiver<Update>) {
     const HEARTBEAT: Duration = Duration::from_secs(1);
 
     /// PATCH one slot; false = failed/unresolved (marks the link unhealthy).
-    fn patch(http: &reqwest::blocking::Client, rest: &str, ids: &Ids, slot: Slot, value: serde_json::Value) -> bool {
-        let Some(id) = ids.get(slot) else { return false };
+    fn patch(
+        http: &reqwest::blocking::Client,
+        rest: &str,
+        ids: &Ids,
+        slot: Slot,
+        value: serde_json::Value,
+    ) -> bool {
+        let Some(id) = ids.get(slot) else {
+            return false;
+        };
         let url = format!("{rest}/datarefs/{id}/value");
         // A successful PATCH means our ids are still valid; any failure (X-Plane
         // gone, stale id → 404) flags unhealthy so the loop re-resolves.
@@ -330,7 +340,13 @@ fn run(base: String, rx: Receiver<Update>) {
             let beat_ok = patch(&http, &rest, &ids, Slot::Phase, json!(last_phase));
             healthy = healthy && beat_ok;
             if let Some(code) = &last_aircraft {
-                patch(&http, &rest, &ids, Slot::Aircraft, json!(STANDARD.encode(code.as_bytes())));
+                patch(
+                    &http,
+                    &rest,
+                    &ids,
+                    Slot::Aircraft,
+                    json!(STANDARD.encode(code.as_bytes())),
+                );
             }
         }
     }

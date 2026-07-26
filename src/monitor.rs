@@ -187,14 +187,24 @@ impl Snapshot {
     /// caller just skips the tick and tries again). `advisor_drefs` are the
     /// profile's phase-expectation switches, read best-effort per tick.
     async fn read(xp: &XPlaneClient, advisor_drefs: &[String]) -> Option<Snapshot> {
-        let on_ground = xp.get_float("sim/flightmodel/failures/onground_any").await.ok()? > 0.5;
-        let groundspeed_kts =
-            xp.get_float("sim/flightmodel/position/groundspeed").await.ok()? * MS_TO_KTS;
+        let on_ground = xp
+            .get_float("sim/flightmodel/failures/onground_any")
+            .await
+            .ok()?
+            > 0.5;
+        let groundspeed_kts = xp
+            .get_float("sim/flightmodel/position/groundspeed")
+            .await
+            .ok()?
+            * MS_TO_KTS;
         let ias_kts = xp
             .get_float("sim/cockpit2/gauges/indicators/airspeed_kts_pilot")
             .await
             .ok()?;
-        let flap_ratio = xp.get_float("sim/cockpit2/controls/flap_ratio").await.unwrap_or(0.0);
+        let flap_ratio = xp
+            .get_float("sim/cockpit2/controls/flap_ratio")
+            .await
+            .unwrap_or(0.0);
         let agl_ft = xp.get_float("sim/flightmodel/position/y_agl").await.ok()? * M_TO_FT;
         let vsi_fpm = xp
             .get_float("sim/cockpit2/gauges/indicators/vvi_fpm_pilot")
@@ -202,20 +212,37 @@ impl Snapshot {
             .ok()?;
         // Best-effort (a missing read must not kill the snapshot): the altitude
         // picture for the bust/sink-rate guards.
-        let alt_ft = xp.get_float("sim/flightmodel/misc/h_ind").await.unwrap_or(0.0);
-        let ap_alt_dial_ft =
-            xp.get_float("sim/cockpit2/autopilot/altitude_dial_ft").await.ok();
-        let ap_servos_on =
-            xp.get_float("sim/cockpit2/autopilot/servos_on").await.unwrap_or(0.0) > 0.5;
-        let gear_down =
-            xp.get_float("sim/cockpit/switches/gear_handle_status").await.unwrap_or(1.0) > 0.5;
+        let alt_ft = xp
+            .get_float("sim/flightmodel/misc/h_ind")
+            .await
+            .unwrap_or(0.0);
+        let ap_alt_dial_ft = xp
+            .get_float("sim/cockpit2/autopilot/altitude_dial_ft")
+            .await
+            .ok();
+        let ap_servos_on = xp
+            .get_float("sim/cockpit2/autopilot/servos_on")
+            .await
+            .unwrap_or(0.0)
+            > 0.5;
+        let gear_down = xp
+            .get_float("sim/cockpit/switches/gear_handle_status")
+            .await
+            .unwrap_or(1.0)
+            > 0.5;
         let mut advisor_values = Vec::with_capacity(advisor_drefs.len());
         for dref in advisor_drefs {
             advisor_values.push(xp.get_float(dref).await.ok());
         }
         // Position + the descent picture vs the planned destination (if any).
-        let lat = xp.get_float("sim/flightmodel/position/latitude").await.unwrap_or(0.0);
-        let lon = xp.get_float("sim/flightmodel/position/longitude").await.unwrap_or(0.0);
+        let lat = xp
+            .get_float("sim/flightmodel/position/latitude")
+            .await
+            .unwrap_or(0.0);
+        let lon = xp
+            .get_float("sim/flightmodel/position/longitude")
+            .await
+            .unwrap_or(0.0);
         let track_deg = xp.get_float("sim/flightmodel/position/hpath").await.ok();
         let fps = xp
             .get_float("sim/time/framerate_period")
@@ -223,7 +250,10 @@ impl Snapshot {
             .ok()
             .filter(|p| *p > 0.0)
             .map(|p| 1.0 / p);
-        let dest = DESTINATION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let dest = DESTINATION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let (dest_dist_nm, dest_elev_ft, tod_ring_nm) = match dest {
             Some(d) => (
                 Some(crate::nav::haversine_nm(lat, lon, d.lat, d.lon)),
@@ -240,10 +270,16 @@ impl Snapshot {
             .ok()
             .map(|v| v > 0.5);
         // Best-effort (a missing read must not kill the snapshot): pushback state.
-        let tug_attached =
-            xp.get_float("sim/aircraft/overflow/pushback_attached").await.unwrap_or(0.0) > 0.5;
-        let pushing_back =
-            xp.get_float("sim/flightmodel2/misc/tow_in_progress").await.unwrap_or(0.0) > 0.5;
+        let tug_attached = xp
+            .get_float("sim/aircraft/overflow/pushback_attached")
+            .await
+            .unwrap_or(0.0)
+            > 0.5;
+        let pushing_back = xp
+            .get_float("sim/flightmodel2/misc/tow_in_progress")
+            .await
+            .unwrap_or(0.0)
+            > 0.5;
         let engine_running = xp
             .get_float_array("sim/flightmodel/engine/ENGN_running")
             .await
@@ -272,14 +308,20 @@ impl Snapshot {
         // whole snapshot (which would silence every other check), so default to
         // 0.0 rather than propagating None. Fold into −180..180, same as the
         // `align_gyro` tool, so a small negative drift doesn't read as ~360.
-        let gyro_drift_raw = xp.get_float("sim/cockpit/gyros/dg_drift_vac_deg").await.unwrap_or(0.0);
+        let gyro_drift_raw = xp
+            .get_float("sim/cockpit/gyros/dg_drift_vac_deg")
+            .await
+            .unwrap_or(0.0);
         let gyro_drift_deg = (gyro_drift_raw + 180.0).rem_euclid(360.0) - 180.0;
 
         // Fuel endurance = total fuel ÷ current burn. Both best-effort (a missing
         // read must not kill the snapshot); endurance is None when either is
         // absent or the burn is ~0 (idle/shutdown), where "minutes remaining"
         // is meaningless or infinite.
-        let fuel_kg = xp.get_float("sim/flightmodel/weight/m_fuel_total").await.ok();
+        let fuel_kg = xp
+            .get_float("sim/flightmodel/weight/m_fuel_total")
+            .await
+            .ok();
         let fuel_flow_kg_sec = xp
             .get_float_array("sim/cockpit2/engine/indicators/fuel_flow_kg_sec")
             .await
@@ -314,7 +356,10 @@ impl Snapshot {
 
         // Carb-ice / vacuum / electrical inputs, best-effort. Defaults chosen so a
         // failed read can't raise a false advisory (mild OAT, dry, no discharge).
-        let oat_c = xp.get_float("sim/cockpit2/temperature/outside_air_temp_degc").await.unwrap_or(15.0);
+        let oat_c = xp
+            .get_float("sim/cockpit2/temperature/outside_air_temp_degc")
+            .await
+            .unwrap_or(15.0);
         let dewpoint_c = xp
             .get_float_array("sim/weather/aircraft/dewpoint_deg_c")
             .await
@@ -334,8 +379,15 @@ impl Snapshot {
             .ok()
             .and_then(engine0)
             .unwrap_or(0.0);
-        let elevator_trim = xp.get_float("sim/cockpit2/controls/elevator_trim").await.unwrap_or(0.0);
-        let low_vacuum = xp.get_float("sim/cockpit/warnings/annunciators/low_vacuum").await.unwrap_or(0.0) > 0.5;
+        let elevator_trim = xp
+            .get_float("sim/cockpit2/controls/elevator_trim")
+            .await
+            .unwrap_or(0.0);
+        let low_vacuum = xp
+            .get_float("sim/cockpit/warnings/annunciators/low_vacuum")
+            .await
+            .unwrap_or(0.0)
+            > 0.5;
         let battery_amps = xp
             .get_float_array("sim/cockpit2/electrical/battery_amps")
             .await
@@ -355,7 +407,10 @@ impl Snapshot {
             .await
             .unwrap_or(0.0);
         // Fuel selector for the selector-off check (best-effort; None stays silent).
-        let fuel_selector = xp.get_float("sim/cockpit2/fuel/fuel_tank_selector").await.ok();
+        let fuel_selector = xp
+            .get_float("sim/cockpit2/fuel/fuel_tank_selector")
+            .await
+            .ok();
 
         let mut s = Snapshot {
             on_ground,
@@ -486,7 +541,11 @@ struct FireState {
 
 impl FireState {
     fn new() -> Self {
-        FireState { spoke_this_episode: false, last_spoken: None, since: None }
+        FireState {
+            spoke_this_episode: false,
+            last_spoken: None,
+            since: None,
+        }
     }
 
     /// Should we speak right now? Never more than once per `RENOTIFY_COOLDOWN` —
@@ -679,7 +738,9 @@ impl Check for Overspeed {
         // projected speed, so it can't mask a falling-back-to-safe reading.
         let projected = s.ias_kts + s.ias_trend_kts_per_s.max(0.0) * OVERSPEED_LOOKAHEAD_S;
         let in_band = projected >= self.at_or_above_factor * self.vne_kts
-            && self.below_factor.is_none_or(|b| projected < b * self.vne_kts);
+            && self
+                .below_factor
+                .is_none_or(|b| projected < b * self.vne_kts);
         if !in_band {
             return None;
         }
@@ -1182,8 +1243,9 @@ impl Check for FuelSelectorOff {
     }
     fn eval(&self, s: &Snapshot) -> Option<String> {
         let sel = s.fuel_selector?;
-        (s.engine_running && sel < 0.5)
-            .then(|| "Fuel selector is off with the engine running — select a tank now.".to_string())
+        (s.engine_running && sel < 0.5).then(|| {
+            "Fuel selector is off with the engine running — select a tank now.".to_string()
+        })
     }
     /// Short sustain so a selector transiting through OFF between tanks doesn't
     /// trip it, but the callout still lands well before the lines run dry.
@@ -1277,34 +1339,69 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         // band, so only the genuinely-dangerous extremes alarm — below the 20 PSI
         // redline (warning), and above the ~115 PSI redline (caution then warning).
         checks.push(Box::new(EngineHealth {
-            id: "oil_press_low", severity: Severity::Warning, param: EngineParam::OilPressure,
-            low_side: true, trip: 20.0, clear: None, min_dur: secs(4),
+            id: "oil_press_low",
+            severity: Severity::Warning,
+            param: EngineParam::OilPressure,
+            low_side: true,
+            trip: 20.0,
+            clear: None,
+            min_dur: secs(4),
         }));
         checks.push(Box::new(EngineHealth {
-            id: "oil_press_high_caution", severity: Severity::Caution, param: EngineParam::OilPressure,
-            low_side: false, trip: 105.0, clear: Some(115.0), min_dur: secs(4),
+            id: "oil_press_high_caution",
+            severity: Severity::Caution,
+            param: EngineParam::OilPressure,
+            low_side: false,
+            trip: 105.0,
+            clear: Some(115.0),
+            min_dur: secs(4),
         }));
         checks.push(Box::new(EngineHealth {
-            id: "oil_press_high_warn", severity: Severity::Warning, param: EngineParam::OilPressure,
-            low_side: false, trip: 115.0, clear: None, min_dur: secs(3),
+            id: "oil_press_high_warn",
+            severity: Severity::Warning,
+            param: EngineParam::OilPressure,
+            low_side: false,
+            trip: 115.0,
+            clear: None,
+            min_dur: secs(3),
         }));
         // Oil temperature (°F): caution band 240–245°F, warning at/over the 245°F redline.
         checks.push(Box::new(EngineHealth {
-            id: "oil_temp_caution", severity: Severity::Caution, param: EngineParam::OilTemp,
-            low_side: false, trip: 240.0, clear: Some(245.0), min_dur: secs(5),
+            id: "oil_temp_caution",
+            severity: Severity::Caution,
+            param: EngineParam::OilTemp,
+            low_side: false,
+            trip: 240.0,
+            clear: Some(245.0),
+            min_dur: secs(5),
         }));
         checks.push(Box::new(EngineHealth {
-            id: "oil_temp_warn", severity: Severity::Warning, param: EngineParam::OilTemp,
-            low_side: false, trip: 245.0, clear: None, min_dur: secs(3),
+            id: "oil_temp_warn",
+            severity: Severity::Warning,
+            param: EngineParam::OilTemp,
+            low_side: false,
+            trip: 245.0,
+            clear: None,
+            min_dur: secs(3),
         }));
         // CHT (°F): caution from ~450°F, warning at the 500°F redline.
         checks.push(Box::new(EngineHealth {
-            id: "cht_caution", severity: Severity::Caution, param: EngineParam::Cht,
-            low_side: false, trip: 450.0, clear: Some(500.0), min_dur: secs(5),
+            id: "cht_caution",
+            severity: Severity::Caution,
+            param: EngineParam::Cht,
+            low_side: false,
+            trip: 450.0,
+            clear: Some(500.0),
+            min_dur: secs(5),
         }));
         checks.push(Box::new(EngineHealth {
-            id: "cht_warn", severity: Severity::Warning, param: EngineParam::Cht,
-            low_side: false, trip: 500.0, clear: None, min_dur: secs(3),
+            id: "cht_warn",
+            severity: Severity::Warning,
+            param: EngineParam::Cht,
+            low_side: false,
+            trip: 500.0,
+            clear: None,
+            min_dur: secs(3),
         }));
     }
     if let Some(vs) = profile.vs_clean_kts {
@@ -1377,8 +1474,11 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         checks.push(Box::new(StabTrim));
     }
     if let Some(flaps) = &profile.flaps {
-        let limits: Vec<(f64, f64)> =
-            flaps.detents.iter().filter_map(|d| d.vfe_kts.map(|v| (d.ratio, v))).collect();
+        let limits: Vec<(f64, f64)> = flaps
+            .detents
+            .iter()
+            .filter_map(|d| d.vfe_kts.map(|v| (d.ratio, v)))
+            .collect();
         if !limits.is_empty() {
             checks.push(Box::new(FlapOverspeed { limits }));
         }
@@ -1424,7 +1524,11 @@ fn compose_strip(s: &Snapshot) -> String {
         parts.push(format!("CABIN {:.0}ft", s.cabin_altitude_ft));
     }
     if let Some(m) = s.endurance_min {
-        parts.push(format!("FUEL {}h{:02}m", (m / 60.0) as i64, (m % 60.0) as i64));
+        parts.push(format!(
+            "FUEL {}h{:02}m",
+            (m / 60.0) as i64,
+            (m % 60.0) as i64
+        ));
     }
     parts.join(" | ")
 }
@@ -1450,9 +1554,16 @@ pub async fn run(
     // live staffing setting is read at the watch itself (cabin::aboard), so
     // a panel flip applies mid-flight without a profile swap.
     let mut cabin_capable = live.get().cabin_crew;
-    tracing::info!(checks = checks.len(), hz = config.monitor_hz, "monitor started");
+    tracing::info!(
+        checks = checks.len(),
+        hz = config.monitor_hz,
+        "monitor started"
+    );
     // Stamp the record with the airframe so the distiller can key memory by it.
-    crate::blackbox::record("flight_meta", serde_json::json!({ "aircraft": live.get().id }));
+    crate::blackbox::record(
+        "flight_meta",
+        serde_json::json!({ "aircraft": live.get().id }),
+    );
 
     let xp = XPlaneClient::new(config.xplane_base_url.clone());
     let period = Duration::from_secs_f32(1.0 / config.monitor_hz.max(0.1));
@@ -1520,8 +1631,14 @@ pub async fn run(
             avionics_readback = avionics_readback_dref(&live.get());
             cabin_capable = live.get().cabin_crew;
             states = checks.iter().map(|c| (c.id(), FireState::new())).collect();
-            tracing::info!(checks = checks.len(), "monitor: reconfigured for new aircraft");
-            crate::blackbox::record("flight_meta", serde_json::json!({ "aircraft": live.get().id }));
+            tracing::info!(
+                checks = checks.len(),
+                "monitor: reconfigured for new aircraft"
+            );
+            crate::blackbox::record(
+                "flight_meta",
+                serde_json::json!({ "aircraft": live.get().id }),
+            );
         }
         // Replay or pause: neither is the aircraft flying NOW — a replay is a
         // recording, a pause is real but frozen — so nothing here may react.
@@ -1573,7 +1690,8 @@ pub async fn run(
                     v.get(v.len() / 2).copied()
                 };
                 if let Some(median) = median.filter(|m| fps_window.len() >= 30 && *m >= 20.0) {
-                    let rate_ok = fps_dip_last.is_none_or(|t| now.duration_since(t).as_secs() >= 10);
+                    let rate_ok =
+                        fps_dip_last.is_none_or(|t| now.duration_since(t).as_secs() >= 10);
                     if fps < median * 0.7 && rate_ok {
                         fps_dip_last = Some(now);
                         tracing::warn!(fps = fps.round(), median = median.round(), "fps dip");
@@ -1675,9 +1793,8 @@ pub async fn run(
                 // ...and how FAR that station is: the radio's signal-quality
                 // model fades a distant tower into hiss instead of playing
                 // every transmission studio-clean at 60 nm.
-                voice.set_station_range(crate::station::active_station_range_nm(
-                    snap.lat, snap.lon,
-                ));
+                voice
+                    .set_station_range(crate::station::active_station_range_nm(snap.lat, snap.lon));
                 // Which CONTROLLER the radio actually hears, resolved once per
                 // tick: every controller call below speaks in THIS voice (or
                 // falls to the crew when None). A berate hardcoded to the
@@ -1716,8 +1833,8 @@ pub async fn run(
                 );
                 if snap.on_ground && snap.groundspeed_kts < 30.0 && !runway_is_ours {
                     if let Some(rwy) = crate::station::on_active_runway(snap.lat, snap.lon) {
-                        let due = incursion_last
-                            .is_none_or(|t| now.duration_since(t).as_secs() >= 15);
+                        let due =
+                            incursion_last.is_none_or(|t| now.duration_since(t).as_secs() >= 15);
                         if due {
                             if let Some(nm) =
                                 crate::station::inbound_traffic_for_strip(xp.view(), &rwy).await
@@ -1806,20 +1923,32 @@ pub async fn run(
                     crate::station::atis_retune(com1, snap.lat, snap.lon, snap.alt_ft);
                     if crate::station::atis_due(com1, std::time::Instant::now()) {
                         let wx = crate::station::AtisWx {
-                            zulu_sec: xp.get_float(crate::datarefs::ZULU_TIME_SEC).await.unwrap_or(0.0),
+                            zulu_sec: xp
+                                .get_float(crate::datarefs::ZULU_TIME_SEC)
+                                .await
+                                .unwrap_or(0.0),
                             wind_from_deg: xp
                                 .get_float(crate::datarefs::WIND_DIR_DEG_TRUE)
                                 .await
                                 .unwrap_or(0.0),
-                            wind_kts: xp.get_float(crate::datarefs::WIND_SPEED_MSC).await.unwrap_or(0.0)
+                            wind_kts: xp
+                                .get_float(crate::datarefs::WIND_SPEED_MSC)
+                                .await
+                                .unwrap_or(0.0)
                                 * 1.943844,
                             visibility_sm: xp
                                 .get_float(crate::datarefs::VISIBILITY_SM)
                                 .await
                                 .unwrap_or(10.0),
-                            qnh_hpa: xp.get_float(crate::datarefs::QNH_PASCALS).await.unwrap_or(101300.0)
+                            qnh_hpa: xp
+                                .get_float(crate::datarefs::QNH_PASCALS)
+                                .await
+                                .unwrap_or(101300.0)
                                 / 100.0,
-                            oat_c: xp.get_float(crate::datarefs::OAT_DEG_C).await.unwrap_or(15.0),
+                            oat_c: xp
+                                .get_float(crate::datarefs::OAT_DEG_C)
+                                .await
+                                .unwrap_or(15.0),
                         };
                         if let Some(report) =
                             crate::station::atis_tick(com1, &wx, std::time::Instant::now())
@@ -1863,7 +1992,11 @@ pub async fn run(
                         if let Some(s) = status.as_ref() {
                             s.action(&format!("TWR: {line}"));
                         }
-                        voice.alert_station(Priority::Advisory, crate::voice::StationSpeaker::Tower, line);
+                        voice.alert_station(
+                            Priority::Advisory,
+                            crate::voice::StationSpeaker::Tower,
+                            line,
+                        );
                     }
                 }
                 // Radar watch on an assigned squawk: "radar contact" once the
@@ -1939,8 +2072,7 @@ pub async fn run(
                             // it (approach relays a deviation and the phone
                             // number exactly like the real thing) — never the
                             // tower's voice on someone else's frequency.
-                            let who = tuned_speaker
-                                .unwrap_or(crate::voice::StationSpeaker::Tower);
+                            let who = tuned_speaker.unwrap_or(crate::voice::StationSpeaker::Tower);
                             if let Some(s) = status.as_ref() {
                                 s.action(&format!("{}: {}", who.tag(), call.line));
                             }
@@ -1989,18 +2121,17 @@ pub async fn run(
                     if taxiing {
                         crate::party_line::with_taxi_route(|route| match route {
                             Some(watch)
-                                if !taxi_guide
-                                    .as_ref()
-                                    .is_some_and(|g| g.is_for(&watch.path)) =>
+                                if !taxi_guide.as_ref().is_some_and(|g| g.is_for(&watch.path)) =>
                             {
                                 taxi_guide = crate::taxi_guide::Guide::build(watch);
                             }
                             Some(_) => {}
                             None => taxi_guide = None,
                         });
-                        if let Some(cue) = taxi_guide.as_mut().and_then(|g| {
-                            g.tick(snap.lat, snap.lon, snap.groundspeed_kts, now)
-                        }) {
+                        if let Some(cue) = taxi_guide
+                            .as_mut()
+                            .and_then(|g| g.tick(snap.lat, snap.lon, snap.groundspeed_kts, now))
+                        {
                             if let Some(s) = status.as_ref() {
                                 s.action(&format!("Taxi guide: {cue}"));
                             }
@@ -2115,7 +2246,10 @@ pub async fn run(
                                 }
                             } else if hold_armed {
                                 if let Some(line) = crate::station::takeoff_hold_tick(
-                                    &targets, felev, snap.on_ground, now,
+                                    &targets,
+                                    felev,
+                                    snap.on_ground,
+                                    now,
                                 ) {
                                     crate::blackbox::record(
                                         "atc",
@@ -2155,15 +2289,17 @@ pub async fn run(
                                     None
                                 };
                                 if let Some(exchange) = crate::station::chatter_tick(
-                                    &targets, &fname, flat, flon, felev,
-                                    blocked.as_deref(), now,
+                                    &targets,
+                                    &fname,
+                                    flat,
+                                    flon,
+                                    felev,
+                                    blocked.as_deref(),
+                                    now,
                                 ) {
                                     chatter_last = Some(now);
-                                    let transcript: Vec<&str> = exchange
-                                        .lines
-                                        .iter()
-                                        .map(|l| l.text.as_str())
-                                        .collect();
+                                    let transcript: Vec<&str> =
+                                        exchange.lines.iter().map(|l| l.text.as_str()).collect();
                                     crate::blackbox::record(
                                         "atc",
                                         serde_json::json!({
@@ -2278,11 +2414,11 @@ pub async fn run(
                 // would false-fire. Words only — the copilot never maneuvers
                 // uncommanded.
                 if !snap.on_ground && snap.agl_ft > 500.0 {
-                    let due = near_miss_last
-                        .is_none_or(|t| now.duration_since(t).as_secs() >= 15);
+                    let due = near_miss_last.is_none_or(|t| now.duration_since(t).as_secs() >= 15);
                     if due {
-                        if let Some(f) =
-                            crate::station::nearest_traffic_factor(xp.view()).await.filter(crate::station::is_near_miss)
+                        if let Some(f) = crate::station::nearest_traffic_factor(xp.view())
+                            .await
+                            .filter(crate::station::is_near_miss)
                         {
                             near_miss_last = Some(now);
                             crate::blackbox::record(
@@ -2333,10 +2469,8 @@ pub async fn run(
                     // Never two voices on one conflict: while the near-miss
                     // alert is speaking (15 s cadence), the calm narration of
                     // the same target stands down.
-                    let due = traffic_last
-                        .is_none_or(|t| now.duration_since(t).as_secs() >= 45)
-                        && near_miss_last
-                            .is_none_or(|t| now.duration_since(t).as_secs() >= 45);
+                    let due = traffic_last.is_none_or(|t| now.duration_since(t).as_secs() >= 45)
+                        && near_miss_last.is_none_or(|t| now.duration_since(t).as_secs() >= 45);
                     if due {
                         let advisory = crate::station::traffic_advisory(xp.view()).await;
                         // Close the loop: the last factor is gone.
@@ -2406,7 +2540,8 @@ pub async fn run(
                         (guide_last, guide_handed_over) = (None, false);
                     }
                 } else {
-                    let d = crate::approach_guide::deviations(&path, snap.lat, snap.lon, snap.alt_ft);
+                    let d =
+                        crate::approach_guide::deviations(&path, snap.lat, snap.lon, snap.alt_ft);
                     if d.dist_nm > 35.0 {
                         crate::approach_guide::cancel();
                         if !quiet {
@@ -2457,20 +2592,29 @@ pub async fn run(
             // Black box: one state record per tick (position/altitude come from
             // the snapshot; only the heading needs an extra read).
             let (lat, lon, alt) = (snap.lat, snap.lon, snap.alt_ft);
-            let hdg = xp.get_float("sim/flightmodel/position/psi").await.unwrap_or(0.0);
-            crate::blackbox::record("state", serde_json::json!({
-                "lat": lat, "lon": lon, "hdg": r1(hdg), "alt": r1(alt),
-                "ias": r1(snap.ias_kts), "gs": r1(snap.groundspeed_kts),
-                "vsi": r1(snap.vsi_fpm), "agl": r1(snap.agl_ft),
-                "ground": snap.on_ground, "flap": snap.flap_ratio,
-                "park": r1(snap.park_brake), "cabin": r1(snap.cabin_altitude_ft),
-                "fuel_kg": snap.fuel_kg, "eng": snap.engine_running,
-                "phase": format!("{:?}", snap.phase),
-            }));
+            let hdg = xp
+                .get_float("sim/flightmodel/position/psi")
+                .await
+                .unwrap_or(0.0);
+            crate::blackbox::record(
+                "state",
+                serde_json::json!({
+                    "lat": lat, "lon": lon, "hdg": r1(hdg), "alt": r1(alt),
+                    "ias": r1(snap.ias_kts), "gs": r1(snap.groundspeed_kts),
+                    "vsi": r1(snap.vsi_fpm), "agl": r1(snap.agl_ft),
+                    "ground": snap.on_ground, "flap": snap.flap_ratio,
+                    "park": r1(snap.park_brake), "cabin": r1(snap.cabin_altitude_ft),
+                    "fuel_kg": snap.fuel_kg, "eng": snap.engine_running,
+                    "phase": format!("{:?}", snap.phase),
+                }),
+            );
 
             // Panel settings + the live flight strip. The mute switch comes from
             // the plugin's settings popup; unresolvable (no plugin) = unmuted.
-            let mute = xp.get_float("xcopilot/opt/monitor_mute").await.map_or(false, |v| v > 0.5);
+            let mute = xp
+                .get_float("xcopilot/opt/monitor_mute")
+                .await
+                .map_or(false, |v| v > 0.5);
             PANEL_MUTE.store(mute, std::sync::atomic::Ordering::Relaxed);
             if let Some(s) = status.as_ref() {
                 let mut strip = compose_strip(&snap);
@@ -2503,7 +2647,15 @@ pub async fn run(
                     let state = states.get_mut(check.id()).expect("state per check");
                     match check.eval(&snap) {
                         Some(msg) => {
-                            let spoke = state.active(check.id(), msg, check.severity(), check.min_duration(), &voice, status.as_ref(), now);
+                            let spoke = state.active(
+                                check.id(),
+                                msg,
+                                check.severity(),
+                                check.min_duration(),
+                                &voice,
+                                status.as_ref(),
+                                now,
+                            );
                             // On the rising edge, the copilot ACTS on SOP rows that
                             // carry a fix (strobes, landing lights) instead of only
                             // advising — crew business, so it's already behind the
@@ -2619,8 +2771,14 @@ impl Check for StabTrim {
         if s.on_ground || s.elevator_trim.abs() < TRIM_LIMIT {
             return None;
         }
-        let dir = if s.elevator_trim < 0.0 { "nose down" } else { "nose up" };
-        Some(format!("Stabilizer trim's at the {dir} limit, check the trim."))
+        let dir = if s.elevator_trim < 0.0 {
+            "nose down"
+        } else {
+            "nose up"
+        };
+        Some(format!(
+            "Stabilizer trim's at the {dir} limit, check the trim."
+        ))
     }
     fn min_duration(&self) -> Duration {
         Duration::from_secs(5)
@@ -2792,9 +2950,14 @@ mod tests {
     fn tod_ahead_speaks_in_the_runup_band() {
         let c = TodAhead;
         assert!(c.eval(&cruise_with_dest(80.0)).is_none(), "far out → quiet");
-        let msg = c.eval(&cruise_with_dest(50.0)).expect("8 nm before TOD → advise");
+        let msg = c
+            .eval(&cruise_with_dest(50.0))
+            .expect("8 nm before TOD → advise");
         assert!(msg.contains("Top of descent"), "{msg}");
-        assert!(c.eval(&cruise_with_dest(40.0)).is_none(), "past TOD → this check yields");
+        assert!(
+            c.eval(&cruise_with_dest(40.0)).is_none(),
+            "past TOD → this check yields"
+        );
         // No destination known → silent.
         let mut s = cruise_with_dest(50.0);
         s.dest_dist_nm = None;
@@ -2804,10 +2967,15 @@ mod tests {
     #[test]
     fn tod_passed_names_the_recovery_rate() {
         let c = TodPassed;
-        assert!(c.eval(&cruise_with_dest(45.0)).is_none(), "before TOD → quiet");
+        assert!(
+            c.eval(&cruise_with_dest(45.0)).is_none(),
+            "before TOD → quiet"
+        );
         // Today's miss: level at 14,000, 38 nm out, TOD at 42. Height to lose
         // 10,000 ft over (38-5)/300kt = 6.6 min → ~1,500 fpm.
-        let msg = c.eval(&cruise_with_dest(38.0)).expect("past TOD and level → caution");
+        let msg = c
+            .eval(&cruise_with_dest(38.0))
+            .expect("past TOD and level → caution");
         assert!(msg.contains("1500 feet a minute"), "{msg}");
         // Already descending → moot, quiet.
         let mut s = cruise_with_dest(38.0);
@@ -2864,7 +3032,10 @@ mod tests {
         let p = crate::aircraft::load("md82").expect("md82 profile");
         assert!(!p.advisor.is_empty(), "md82 declares an SOP table");
         let checks = build_checks(&p);
-        let advisors = checks.iter().filter(|c| c.id().starts_with("advisor_")).count();
+        let advisors = checks
+            .iter()
+            .filter(|c| c.id().starts_with("advisor_"))
+            .count();
         assert_eq!(advisors, p.advisor.len());
     }
 
@@ -2940,7 +3111,10 @@ mod tests {
         assert!(c.eval(&s).is_some(), "discharge, nothing producing → warn");
         // MD-82 case: standing battery-bus discharge while both generators charge.
         s.generator_amps_max = 39.0;
-        assert!(c.eval(&s).is_none(), "a producing generator overrules the ammeter");
+        assert!(
+            c.eval(&s).is_none(),
+            "a producing generator overrules the ammeter"
+        );
         s.generator_amps_max = 0.0;
         s.engine_running = false;
         assert!(c.eval(&s).is_none(), "engine off → silent");
@@ -2951,7 +3125,15 @@ mod tests {
         let z = Duration::ZERO;
         // Oil pressure (PSI): warn below the 20 PSI redline; idle lows (e.g. 40)
         // are NOT alarmed (that idle nuisance was the original false positive).
-        let low = EngineHealth { id: "l", severity: Severity::Warning, param: EngineParam::OilPressure, low_side: true, trip: 20.0, clear: None, min_dur: z };
+        let low = EngineHealth {
+            id: "l",
+            severity: Severity::Warning,
+            param: EngineParam::OilPressure,
+            low_side: true,
+            trip: 20.0,
+            clear: None,
+            min_dur: z,
+        };
 
         let mut s = snap(true, true);
         assert!(low.eval(&s).is_none(), "no reading → silent");
@@ -2963,15 +3145,40 @@ mod tests {
         assert!(low.eval(&s).is_none(), "engine off suppresses");
 
         // Oil-temp bands are disjoint (°F thresholds): caution 240–245, warn >245.
-        let caution = EngineHealth { id: "c", severity: Severity::Caution, param: EngineParam::OilTemp, low_side: false, trip: 240.0, clear: Some(245.0), min_dur: z };
-        let warn = EngineHealth { id: "w", severity: Severity::Warning, param: EngineParam::OilTemp, low_side: false, trip: 245.0, clear: None, min_dur: z };
+        let caution = EngineHealth {
+            id: "c",
+            severity: Severity::Caution,
+            param: EngineParam::OilTemp,
+            low_side: false,
+            trip: 240.0,
+            clear: Some(245.0),
+            min_dur: z,
+        };
+        let warn = EngineHealth {
+            id: "w",
+            severity: Severity::Warning,
+            param: EngineParam::OilTemp,
+            low_side: false,
+            trip: 245.0,
+            clear: None,
+            min_dur: z,
+        };
         let mut s = snap(true, true);
         s.oil_temp_f = Some(205.0);
-        assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none(), "205°F cruise → silent");
+        assert!(
+            caution.eval(&s).is_none() && warn.eval(&s).is_none(),
+            "205°F cruise → silent"
+        );
         s.oil_temp_f = Some(242.0);
-        assert!(caution.eval(&s).is_some() && warn.eval(&s).is_none(), "caution band only");
+        assert!(
+            caution.eval(&s).is_some() && warn.eval(&s).is_none(),
+            "caution band only"
+        );
         s.oil_temp_f = Some(250.0);
-        assert!(warn.eval(&s).is_some() && caution.eval(&s).is_none(), "warning band only");
+        assert!(
+            warn.eval(&s).is_some() && caution.eval(&s).is_none(),
+            "warning band only"
+        );
     }
 
     #[test]
@@ -3000,7 +3207,10 @@ mod tests {
         s.on_ground = false;
         assert!(v.eval(&s).is_none(), "vacuum ok → silent");
         s.low_vacuum = true;
-        assert!(v.eval(&s).is_some(), "low vacuum airborne → warn unreliable gyros");
+        assert!(
+            v.eval(&s).is_some(),
+            "low vacuum airborne → warn unreliable gyros"
+        );
         // On the ground the light is NORMAL at idle RPM (POH checks vacuum at
         // run-up power) — cautioning during taxi is noise, never spoken.
         s.on_ground = true;
@@ -3023,8 +3233,20 @@ mod tests {
     #[test]
     fn airspeed_bands_and_flare_and_ground_suppression() {
         // Vs=48 clean → caution ≤57.6 (and >52.8), warning ≤52.8.
-        let caution = StallSpeed { id: "c", severity: Severity::Caution, vs_clean_kts: 48.0, at_or_below_factor: 1.20, above_factor: Some(1.10) };
-        let warn = StallSpeed { id: "w", severity: Severity::Warning, vs_clean_kts: 48.0, at_or_below_factor: 1.10, above_factor: None };
+        let caution = StallSpeed {
+            id: "c",
+            severity: Severity::Caution,
+            vs_clean_kts: 48.0,
+            at_or_below_factor: 1.20,
+            above_factor: Some(1.10),
+        };
+        let warn = StallSpeed {
+            id: "w",
+            severity: Severity::Warning,
+            vs_clean_kts: 48.0,
+            at_or_below_factor: 1.10,
+            above_factor: None,
+        };
         let mut s = snap(true, true);
         s.on_ground = false;
         s.agl_ft = 500.0; // airborne, above the flare
@@ -3071,10 +3293,20 @@ mod tests {
 
     /// The 172's fuel bands: caution ≤ 45 min, warning ≤ 30 min.
     fn fuel_caution() -> FuelEndurance {
-        FuelEndurance { id: "fuel_caution", severity: Severity::Caution, at_or_below_min: 45.0, above_min: Some(30.0) }
+        FuelEndurance {
+            id: "fuel_caution",
+            severity: Severity::Caution,
+            at_or_below_min: 45.0,
+            above_min: Some(30.0),
+        }
     }
     fn fuel_warning() -> FuelEndurance {
-        FuelEndurance { id: "fuel_warning", severity: Severity::Warning, at_or_below_min: 30.0, above_min: None }
+        FuelEndurance {
+            id: "fuel_warning",
+            severity: Severity::Warning,
+            at_or_below_min: 30.0,
+            above_min: None,
+        }
     }
 
     #[test]
@@ -3100,12 +3332,18 @@ mod tests {
     #[test]
     fn cabin_altitude_bands_are_disjoint_and_airborne_only() {
         let caution = CabinAltitude {
-            id: "c", severity: Severity::Caution, band_ft: (10_000.0, Some(12_500.0)),
-            message: "caution", min_dur: Duration::from_secs(10),
+            id: "c",
+            severity: Severity::Caution,
+            band_ft: (10_000.0, Some(12_500.0)),
+            message: "caution",
+            min_dur: Duration::from_secs(10),
         };
         let warning = CabinAltitude {
-            id: "w", severity: Severity::Warning, band_ft: (12_500.0, None),
-            message: "warning", min_dur: Duration::from_secs(4),
+            id: "w",
+            severity: Severity::Warning,
+            band_ft: (12_500.0, None),
+            message: "warning",
+            min_dur: Duration::from_secs(4),
         };
         let mut s = snap(true, true);
         s.on_ground = false;
@@ -3188,7 +3426,10 @@ mod tests {
     #[test]
     fn fuel_pretakeoff_cautions_on_ground_only_when_low() {
         // 45 min caution; 24 kg/hr cruise → 18 kg ≈ 45 min, 14 kg ≈ 35 min.
-        let c = FuelPreTakeoff { caution_min: 45.0, cruise_burn_kg_hr: 24.0 };
+        let c = FuelPreTakeoff {
+            caution_min: 45.0,
+            cruise_burn_kg_hr: 24.0,
+        };
         let mut s = snap(true, true); // on ground, engine running
 
         // Plenty for a flight: silent.
@@ -3230,7 +3471,10 @@ mod tests {
         st.spoke_this_episode = true;
         st.last_spoken = Some(t0);
         assert!(!st.should_speak(Severity::Warning, t0 + Duration::from_secs(1))); // too soon
-        assert!(st.should_speak(Severity::Warning, t0 + RENOTIFY_COOLDOWN + Duration::from_secs(1))); // due
+        assert!(st.should_speak(
+            Severity::Warning,
+            t0 + RENOTIFY_COOLDOWN + Duration::from_secs(1)
+        )); // due
     }
 
     #[test]
@@ -3258,7 +3502,10 @@ mod tests {
         // Recurs almost immediately → suppressed (still within cooldown).
         assert!(!st.should_speak(Severity::Warning, t0 + Duration::from_secs(3)));
         // Recurs well after the cooldown → speaks again.
-        assert!(st.should_speak(Severity::Warning, t0 + RENOTIFY_COOLDOWN + Duration::from_secs(1)));
+        assert!(st.should_speak(
+            Severity::Warning,
+            t0 + RENOTIFY_COOLDOWN + Duration::from_secs(1)
+        ));
     }
 
     #[test]

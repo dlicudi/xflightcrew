@@ -52,8 +52,7 @@ struct Case {
 }
 
 pub fn run(model_path: &str, profile: &AircraftProfile, manifest: &str) -> Result<()> {
-    let text =
-        std::fs::read_to_string(manifest).map_err(|e| anyhow!("reading {manifest}: {e}"))?;
+    let text = std::fs::read_to_string(manifest).map_err(|e| anyhow!("reading {manifest}: {e}"))?;
     let cases: Vec<Case> =
         serde_yaml::from_str(&text).map_err(|e| anyhow!("parsing {manifest}: {e}"))?;
     if cases.is_empty() {
@@ -65,7 +64,11 @@ pub fn run(model_path: &str, profile: &AircraftProfile, manifest: &str) -> Resul
     stt.set_prompt(stt::build_prompt(profile));
     let registry = Registry::for_aircraft(profile);
 
-    println!("model {model_path} · {} · {} cases\n", profile.display_name, cases.len());
+    println!(
+        "model {model_path} · {} · {} cases\n",
+        profile.display_name,
+        cases.len()
+    );
 
     let mut wer_sum = 0.0;
     let (mut cmd_ok, mut cmd_total) = (0u32, 0u32);
@@ -118,8 +121,17 @@ pub fn run(model_path: &str, profile: &AircraftProfile, manifest: &str) -> Resul
             }
         };
         let judged = case.tool.is_some() || case.intent.is_some();
-        let mark = if judged && !verdict.ends_with("OK") { "✗" } else { "✓" };
-        println!("{mark} {:<28} heard {:<30} wer {:.2}  {verdict}", quote(&case.say), quote(&heard), wer);
+        let mark = if judged && !verdict.ends_with("OK") {
+            "✗"
+        } else {
+            "✓"
+        };
+        println!(
+            "{mark} {:<28} heard {:<30} wer {:.2}  {verdict}",
+            quote(&case.say),
+            quote(&heard),
+            wer
+        );
     }
 
     let mean_wer = wer_sum / cases.len() as f64;
@@ -139,7 +151,9 @@ pub fn run(model_path: &str, profile: &AircraftProfile, manifest: &str) -> Resul
 /// True if every key/value in `expected` is present and equal in the resolved
 /// call. `None` expected → any args pass (the tool match alone is the assertion).
 fn args_match(expected: Option<&Value>, call: &ToolCall) -> bool {
-    let Some(expected) = expected else { return true };
+    let Some(expected) = expected else {
+        return true;
+    };
     match (expected.as_object(), call.arguments.as_object()) {
         (Some(exp), Some(got)) => exp.iter().all(|(k, v)| got.get(k) == Some(v)),
         _ => expected == &call.arguments,
@@ -202,13 +216,23 @@ fn load_16k(input: &Path) -> Result<Vec<f32>> {
     }
     let wav = std::env::temp_dir().join("x-copilot-stt-eval-16k.wav");
     let status = Command::new("afconvert")
-        .args([input.to_str().unwrap(), wav.to_str().unwrap(), "-d", "LEI16@16000", "-c", "1", "-f", "WAVE"])
+        .args([
+            input.to_str().unwrap(),
+            wav.to_str().unwrap(),
+            "-d",
+            "LEI16@16000",
+            "-c",
+            "1",
+            "-f",
+            "WAVE",
+        ])
         .status()
         .map_err(|e| anyhow!("spawning afconvert: {e}"))?;
     if !status.success() {
         return Err(anyhow!("afconvert failed to decode {}", input.display()));
     }
-    let reader = hound::WavReader::open(&wav).map_err(|e| anyhow!("reading {}: {e}", wav.display()))?;
+    let reader =
+        hound::WavReader::open(&wav).map_err(|e| anyhow!("reading {}: {e}", wav.display()))?;
     reader
         .into_samples::<i16>()
         .map(|s| s.map(|v| v as f32 / i16::MAX as f32))

@@ -146,7 +146,10 @@ pub fn airport_ils(path: &str, icao: &str) -> Result<Vec<AirportIls>> {
         }
     }
     for ils in &mut out {
-        ils.gs_deg = slopes.iter().find(|(r, _)| *r == ils.runway).map(|(_, a)| *a);
+        ils.gs_deg = slopes
+            .iter()
+            .find(|(r, _)| *r == ils.runway)
+            .map(|(_, a)| *a);
     }
     Ok(out)
 }
@@ -313,7 +316,9 @@ impl AirportInfo {
 
 /// The runways `icao` actually has, from X-Plane's Global Airports `apt.dat`.
 pub fn find_runways(path: &str, icao: &str) -> Result<Vec<Runway>> {
-    Ok(find_airport(path, icao)?.map(|a| a.runways).unwrap_or_default())
+    Ok(find_airport(path, icao)?
+        .map(|a| a.runways)
+        .unwrap_or_default())
 }
 
 /// Find `icao` in X-Plane's Global Airports `apt.dat` (row 1 = airport header
@@ -344,7 +349,9 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
         if !interesting {
             continue;
         }
-        let Ok(line) = std::str::from_utf8(&buf) else { continue };
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            continue;
+        };
         let mut f = line.split_whitespace();
         match f.next() {
             // Airport headers (land/sea/heli) start a block and end the previous.
@@ -378,7 +385,12 @@ pub fn find_airport(path: &str, icao: &str) -> Result<Option<AirportInfo>> {
     if !in_airport && runways.is_empty() {
         return Ok(None);
     }
-    Ok(Some(AirportInfo { name, elev_ft, runways, freqs }))
+    Ok(Some(AirportInfo {
+        name,
+        elev_ft,
+        runways,
+        freqs,
+    }))
 }
 
 /// A land-runway row (code 100): 8 header fields, then a 9-field block per
@@ -436,7 +448,9 @@ pub fn scan_airports(path: &str, mut f: impl FnMut(&str, AirportInfo)) -> Result
         if !matches!(buf.first(), Some(b'1') | Some(b'5')) {
             continue;
         }
-        let Ok(line) = std::str::from_utf8(&buf) else { continue };
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            continue;
+        };
         let mut fields = line.split_whitespace();
         match fields.next() {
             Some("1") | Some("16") | Some("17") => {
@@ -585,7 +599,9 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
         if buf.first() != Some(&b'1') {
             continue;
         }
-        let Ok(line) = std::str::from_utf8(&buf) else { continue };
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            continue;
+        };
         let mut f = line.split_whitespace();
         match f.next() {
             Some("1") | Some("16") | Some("17") => {
@@ -648,7 +664,14 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
                     .filter(|s| !s.is_empty())
                     .collect();
                 let name = f.collect::<Vec<_>>().join(" ").trim().to_string();
-                net.stands.push(Stand { lat, lon, heading, name, kind, accepts });
+                net.stands.push(Stand {
+                    lat,
+                    lon,
+                    heading,
+                    name,
+                    kind,
+                    accepts,
+                });
             }
             Some("1204") if in_airport => {
                 // classification runway-list — attaches to the 1202 row
@@ -782,7 +805,9 @@ impl TaxiNet {
         let mut node = goal;
         let mut hops = 0;
         while node != start {
-            let (_, Some(ei)) = *best.get(&node)? else { return None };
+            let (_, Some(ei)) = *best.get(&node)? else {
+                return None;
+            };
             edges_rev.push(ei);
             let e = &self.edges[ei];
             node = if e.a == node { e.b } else { e.a };
@@ -862,8 +887,10 @@ impl TaxiNet {
         // The distance is the caller's to judge (instrument runways paint
         // their lines much further out than GA fields) — an approximation
         // either way, which is why authored zones win above.
-        let ends_on_runway =
-            self.edges.iter().any(|e| e.runway && (e.a == goal || e.b == goal));
+        let ends_on_runway = self
+            .edges
+            .iter()
+            .any(|e| e.runway && (e.a == goal || e.b == goal));
         let total: f64 = path.windows(2).map(|w| dist_m(w[0], w[1])).sum();
         if zone_edges == 0 && ends_on_runway && total > hold_short_m + 30.0 {
             let mut cut = 0.0;
@@ -894,7 +921,11 @@ impl TaxiNet {
         // the untrimmed path vs the trimmed one; the trimmed path carries at
         // most one point past it (a mid-leg interpolated end), then the
         // original tail follows. Empty when nothing was trimmed.
-        let prefix = full.iter().zip(path.iter()).take_while(|(a, b)| a == b).count();
+        let prefix = full
+            .iter()
+            .zip(path.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
         let mut lead_on: Vec<(f64, f64)> = path[prefix..].to_vec();
         lead_on.extend_from_slice(&full[prefix..]);
         // The route starts where the AIRCRAFT is, not at the node it snapped
@@ -909,7 +940,14 @@ impl TaxiNet {
                 seg.insert(0, (String::new(), false));
             }
         }
-        Some(TaxiRoutePlan { via, crossings, holding_point, path, seg, lead_on })
+        Some(TaxiRoutePlan {
+            via,
+            crossings,
+            holding_point,
+            path,
+            seg,
+            lead_on,
+        })
     }
 }
 
@@ -923,9 +961,10 @@ pub fn best_runway_for_wind(
 ) -> Option<(String, f64, f64)> {
     let mut best: Option<(String, f64, f64)> = None;
     for r in runways {
-        for (ident, hdg) in
-            [(&r.ident_a, r.heading_a_deg()), (&r.ident_b, r.heading_b_deg())]
-        {
+        for (ident, hdg) in [
+            (&r.ident_a, r.heading_a_deg()),
+            (&r.ident_b, r.heading_b_deg()),
+        ] {
             let diff = angle_diff_deg(wind_from_deg, hdg);
             let headwind = wind_kts * diff.to_radians().cos();
             if best.as_ref().is_none_or(|(_, _, hw)| headwind > *hw) {
@@ -1083,7 +1122,10 @@ fn arinc_alt_ft(s: &str) -> Option<f64> {
 /// A CIFP "×10" cell (course, distance) → its real value; blank → `None`.
 fn arinc_tenths(s: &str) -> Option<f64> {
     let s = s.trim();
-    (!s.is_empty()).then(|| s.parse::<f64>().ok()).flatten().map(|v| v / 10.0)
+    (!s.is_empty())
+        .then(|| s.parse::<f64>().ok())
+        .flatten()
+        .map(|v| v / 10.0)
 }
 
 /// Parse the legs of one procedure from CIFP lines. `transition` selects which
@@ -1113,7 +1155,11 @@ pub fn parse_proc_legs<'a>(
             Some(want) if !tr.is_empty() && tr != want => continue,
             _ => {}
         }
-        let seq = f[0].split(':').nth(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let seq = f[0]
+            .split(':')
+            .nth(1)
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
         out.push(ProcLeg {
             seq,
             transition: tr,
@@ -1123,7 +1169,10 @@ pub fn parse_proc_legs<'a>(
             fix: None,
             course_mag: arinc_tenths(cifp_field(&f, 20)),
             dist_nm: arinc_tenths(cifp_field(&f, 21)),
-            turn: cifp_field(&f, 12).chars().next().filter(|c| *c == 'L' || *c == 'R'),
+            turn: cifp_field(&f, 12)
+                .chars()
+                .next()
+                .filter(|c| *c == 'L' || *c == 'R'),
             alt_desc: cifp_field(&f, 22).chars().next().unwrap_or(' '),
             alt1_ft: arinc_alt_ft(cifp_field(&f, 23)),
             alt2_ft: arinc_alt_ft(cifp_field(&f, 24)),
@@ -1176,14 +1225,21 @@ pub fn list_procedures(cifp_dir: &str, icao: &str, kind: ProcKind) -> Vec<String
 /// "-Y"/"-Z" variant suffix. "I27R" → "27R", "R27R-Z" → "27R", "I20-Y" → "20".
 /// `None` if there are no runway digits.
 pub fn approach_runway(ident: &str) -> Option<String> {
-    let body: String = ident.chars().skip_while(|c| c.is_ascii_alphabetic()).collect();
+    let body: String = ident
+        .chars()
+        .skip_while(|c| c.is_ascii_alphabetic())
+        .collect();
     let body = body.split('-').next().unwrap_or("");
     let digits: String = body.chars().take_while(|c| c.is_ascii_digit()).collect();
     if digits.is_empty() {
         return None;
     }
-    let suffix: String =
-        body.chars().skip_while(|c| c.is_ascii_digit()).take(1).filter(|c| matches!(c, 'L' | 'R' | 'C')).collect();
+    let suffix: String = body
+        .chars()
+        .skip_while(|c| c.is_ascii_digit())
+        .take(1)
+        .filter(|c| matches!(c, 'L' | 'R' | 'C'))
+        .collect();
     Some(format!("{digits}{suffix}"))
 }
 
@@ -1193,7 +1249,10 @@ fn runway_matches(a: &str, b: &str) -> bool {
     if runway_number(a) != runway_number(b) {
         return false;
     }
-    let side = |s: &str| s.chars().find(|c| matches!(c, 'L' | 'R' | 'C' | 'l' | 'r' | 'c'));
+    let side = |s: &str| {
+        s.chars()
+            .find(|c| matches!(c, 'L' | 'R' | 'C' | 'l' | 'r' | 'c'))
+    };
     match (side(a), side(b)) {
         (Some(x), Some(y)) => x.eq_ignore_ascii_case(&y),
         _ => true, // one side unspecified → the number match is enough
@@ -1229,7 +1288,9 @@ pub fn sid_for_runway(cifp_dir: &str, icao: &str, runway: &str) -> Option<String
         }
         let f: Vec<&str> = line.split(',').collect();
         let tr = cifp_field(&f, 3);
-        if tr == want || (runway_matches(tr.strip_prefix("RW").unwrap_or(tr), runway) && tr.starts_with("RW")) {
+        if tr == want
+            || (runway_matches(tr.strip_prefix("RW").unwrap_or(tr), runway) && tr.starts_with("RW"))
+        {
             let id = cifp_field(&f, 2);
             if !id.is_empty() {
                 return Some(id.to_string());
@@ -1263,11 +1324,19 @@ pub fn resolve_proc_fixes(
         }
         if let Some(rw) = leg.fix_ident.strip_prefix("RW") {
             if let Some((lat, lon)) = runway_threshold(airport, rw) {
-                leg.fix = Some(Fix { ident: leg.fix_ident.clone(), lat, lon });
+                leg.fix = Some(Fix {
+                    ident: leg.fix_ident.clone(),
+                    lat,
+                    lon,
+                });
             }
         } else if leg.fix_ident == icao {
             if let Some((lat, lon)) = airport.position() {
-                leg.fix = Some(Fix { ident: leg.fix_ident.clone(), lat, lon });
+                leg.fix = Some(Fix {
+                    ident: leg.fix_ident.clone(),
+                    lat,
+                    lon,
+                });
             }
         }
     }
@@ -1281,7 +1350,8 @@ pub fn resolve_proc_fixes(
     if wanted.is_empty() {
         return;
     }
-    let mut found: std::collections::HashMap<(String, String), (f64, f64, f64)> = Default::default();
+    let mut found: std::collections::HashMap<(String, String), (f64, f64, f64)> =
+        Default::default();
     let mut consider = |ident: &str, region: &str, lat: f64, lon: f64| {
         let key = (ident.to_string(), region.to_string());
         if !wanted.contains(&key) {
@@ -1332,7 +1402,11 @@ pub fn resolve_proc_fixes(
             continue;
         }
         if let Some(&(lat, lon, _)) = found.get(&(leg.fix_ident.clone(), leg.fix_region.clone())) {
-            leg.fix = Some(Fix { ident: leg.fix_ident.clone(), lat, lon });
+            leg.fix = Some(Fix {
+                ident: leg.fix_ident.clone(),
+                lat,
+                lon,
+            });
         }
     }
 }
@@ -1374,7 +1448,9 @@ pub fn reconstruct_approach(
             let Some(rest) = f[2].strip_prefix(runway).and_then(|s| s.strip_prefix('D')) else {
                 continue;
             };
-            let Ok(dme) = rest.parse::<u32>() else { continue };
+            let Ok(dme) = rest.parse::<u32>() else {
+                continue;
+            };
             if let (Ok(lat), Ok(lon)) = (f[0].parse::<f64>(), f[1].parse::<f64>()) {
                 dfix.push((dme, f[2].to_string(), lat, lon));
             }
@@ -1396,7 +1472,11 @@ pub fn reconstruct_approach(
             leg_type: "TF".to_string(),
             fix_ident: ident.clone(),
             fix_region: String::new(),
-            fix: Some(Fix { ident: ident.clone(), lat: *lat, lon: *lon }),
+            fix: Some(Fix {
+                ident: ident.clone(),
+                lat: *lat,
+                lon: *lon,
+            }),
             course_mag: None,
             dist_nm: Some(dist_nm),
             turn: None,
@@ -1414,7 +1494,11 @@ pub fn reconstruct_approach(
         leg_type: "TF".to_string(),
         fix_ident: format!("RW{runway}"),
         fix_region: String::new(),
-        fix: Some(Fix { ident: format!("RW{runway}"), lat: thr_lat, lon: thr_lon }),
+        fix: Some(Fix {
+            ident: format!("RW{runway}"),
+            lat: thr_lat,
+            lon: thr_lon,
+        }),
         course_mag: None,
         dist_nm: Some(0.0),
         turn: None,
@@ -1461,17 +1545,33 @@ mod tests {
         writeln!(f, "I").unwrap();
         writeln!(f, "1200 Version - test").unwrap();
         // near (lat 36.71, lon -4.55): freq 10950 -> 109.50, bearing 281.785*360=101442.6
-        writeln!(f, " 4  36.710000000   -4.550000000  100 10950 18 101442.600 ITST LXXX LX 28 ILS-cat-I").unwrap();
+        writeln!(
+            f,
+            " 4  36.710000000   -4.550000000  100 10950 18 101442.600 ITST LXXX LX 28 ILS-cat-I"
+        )
+        .unwrap();
         // far (KSEA-ish)
-        writeln!(f, " 4  47.466600000 -122.317800000  359 11075 18 123840.337 IFAR KSEA K1 28 ILS-cat-I").unwrap();
+        writeln!(
+            f,
+            " 4  47.466600000 -122.317800000  359 11075 18 123840.337 IFAR KSEA K1 28 ILS-cat-I"
+        )
+        .unwrap();
         f.flush().unwrap();
 
         let ils = find_ils(path.to_str().unwrap(), "28", 36.71, -4.55, 60.0)
             .unwrap()
             .expect("should find the near runway-28 ILS");
         assert_eq!(ils.airport, "LXXX");
-        assert!((ils.freq_mhz() - 109.50).abs() < 0.001, "freq {}", ils.freq_mhz());
-        assert!((ils.course_mag - 281.785).abs() < 0.5, "course {}", ils.course_mag);
+        assert!(
+            (ils.freq_mhz() - 109.50).abs() < 0.001,
+            "freq {}",
+            ils.freq_mhz()
+        );
+        assert!(
+            (ils.course_mag - 281.785).abs() < 0.5,
+            "course {}",
+            ils.course_mag
+        );
     }
 
     #[test]
@@ -1491,20 +1591,33 @@ mod tests {
         f.flush().unwrap();
 
         // Field elevation and name come off the header row (LEAL sits at 142 ft).
-        let apt = find_airport(path.to_str().unwrap(), "LEAL").unwrap().expect("found");
+        let apt = find_airport(path.to_str().unwrap(), "LEAL")
+            .unwrap()
+            .expect("found");
         assert_eq!(apt.elev_ft, 142.0);
         assert_eq!(apt.name, "Alicante");
         // Frequencies: only LEAL's, decoded to kHz whatever the row era.
         assert_eq!(apt.freqs.len(), 2, "LEAL's two comm rows, not Sunderland's");
         let twr = apt.freq(FREQ_TOWER).expect("tower row");
         assert_eq!((twr.khz, twr.name.as_str()), (118250, "Tower Freq"));
-        assert_eq!(apt.freq(FREQ_ATIS).expect("atis row").khz, 122100, "legacy 10 kHz units");
+        assert_eq!(
+            apt.freq(FREQ_ATIS).expect("atis row").khz,
+            122100,
+            "legacy 10 kHz units"
+        );
         assert!(apt.freq(FREQ_GROUND).is_none());
         let rw = find_runways(path.to_str().unwrap(), "LEAL").unwrap();
         assert_eq!(rw.len(), 1, "one physical runway, not Sunderland's");
-        assert_eq!((rw[0].ident_a.as_str(), rw[0].ident_b.as_str()), ("10", "28"));
+        assert_eq!(
+            (rw[0].ident_a.as_str(), rw[0].ident_b.as_str()),
+            ("10", "28")
+        );
         // Geometry sanity: the 10 end points roughly east-southeast.
-        assert!((rw[0].heading_a_deg() - 100.0).abs() < 8.0, "{}", rw[0].heading_a_deg());
+        assert!(
+            (rw[0].heading_a_deg() - 100.0).abs() < 8.0,
+            "{}",
+            rw[0].heading_a_deg()
+        );
 
         // The hallucination case: wind 157 at 6 (today's LEAL METAR). The LLM
         // said "runway 18"; the field has 10 and 28, and 10 is more into wind.
@@ -1560,7 +1673,11 @@ mod tests {
         writeln!(f, "1202 7 8 twoway runway 09/27").unwrap();
         // Parking: a gate right by the stand node, and a hangar further out
         // that an arrival must NOT be sent to.
-        writeln!(f, "1300 36.0031000 -5.0050000 180.0 gate turboprops|props Stand 1").unwrap();
+        writeln!(
+            f,
+            "1300 36.0031000 -5.0050000 180.0 gate turboprops|props Stand 1"
+        )
+        .unwrap();
         writeln!(f, "1300 36.0060000 -5.0050000 90.0 hangar jets Maintenance").unwrap();
         writeln!(f, "1 1027 0 0 0MU1 Sunderland").unwrap();
         writeln!(f, "1202 5 6 twoway taxiway Z").unwrap();
@@ -1578,13 +1695,26 @@ mod tests {
         let near = net.nearest_stand(36.0031, -5.0050).expect("a stand");
         assert_eq!(near.name, "Stand 1");
         assert!(near.is_suitable());
-        assert!(net.stands.iter().any(|s| s.kind == "hangar" && !s.is_suitable()));
-        assert_eq!(near.accepts, vec!["turboprops".to_string(), "props".to_string()]);
+        assert!(net
+            .stands
+            .iter()
+            .any(|s| s.kind == "hangar" && !s.is_suitable()));
+        assert_eq!(
+            near.accepts,
+            vec!["turboprops".to_string(), "props".to_string()]
+        );
 
         // From the stand to the 09 threshold: via A and B, crossing 14/32,
         // holding point named for the last taxiway before the runway.
         let plan = net
-            .plan(36.0031, -5.0050, 36.0000, -5.0100, HOLD_SHORT_STANDOFF_M, &[])
+            .plan(
+                36.0031,
+                -5.0050,
+                36.0000,
+                -5.0100,
+                HOLD_SHORT_STANDOFF_M,
+                &[],
+            )
             .expect("a route exists");
         assert_eq!(plan.via, vec!["A".to_string(), "B".to_string()]);
         assert_eq!(plan.crossings, vec!["14/32".to_string()]);
@@ -1602,74 +1732,154 @@ mod tests {
         // route parked the auto taxi's nose across the hold line,
         // 2026-07-20). Node 4's route above stays untrimmed — it never
         // touches a runway edge.
-        let plan2 = net.plan(36.0031, -5.0050, 36.0004, -5.0141, HOLD_SHORT_STANDOFF_M, &[]).expect("a route exists");
+        let plan2 = net
+            .plan(
+                36.0031,
+                -5.0050,
+                36.0004,
+                -5.0141,
+                HOLD_SHORT_STANDOFF_M,
+                &[],
+            )
+            .expect("a route exists");
         assert_eq!(plan2.holding_point, "C");
         let &(llat, llon) = plan2.path.last().unwrap();
         let dx = (llon - (-5.0140)) * 111_320.0 * 36.0_f64.to_radians().cos();
         let dy = (llat - 36.0004) * 111_320.0;
         let d = (dx * dx + dy * dy).sqrt();
-        assert!((35.0..=45.0).contains(&d), "stops ~40 m short of the junction: {d}");
-        assert_eq!(plan2.seg.len(), plan2.path.len() - 1, "seg stays aligned after the trim");
+        assert!(
+            (35.0..=45.0).contains(&d),
+            "stops ~40 m short of the junction: {d}"
+        );
+        assert_eq!(
+            plan2.seg.len(),
+            plan2.path.len() - 1,
+            "seg stays aligned after the trim"
+        );
         // The trimmed tail SURVIVES as the lead-on: from the hold-short point
         // to the runway-junction node — the painted line the line-up drives.
         assert!(!plan2.lead_on.is_empty(), "geometric trim keeps its tail");
-        assert_eq!(*plan2.lead_on.first().unwrap(), *plan2.path.last().unwrap(), "starts at the hold");
-        assert_eq!(*plan2.lead_on.last().unwrap(), (36.0004, -5.0140), "ends at the junction");
+        assert_eq!(
+            *plan2.lead_on.first().unwrap(),
+            *plan2.path.last().unwrap(),
+            "starts at the hold"
+        );
+        assert_eq!(
+            *plan2.lead_on.last().unwrap(),
+            (36.0004, -5.0140),
+            "ends at the junction"
+        );
         // An untrimmed route (node 4, never touches a runway edge) has none.
         assert!(plan.lead_on.is_empty(), "no trim, no lead-on");
         // An instrument-scale standoff trims further back along the same
         // route (Heathrow's CAT holds sit ~100 m out; 40 m parked a taxi on
         // the entry stub past the line, 2026-07-20).
-        let cat = net.plan(36.0031, -5.0050, 36.0004, -5.0141, 100.0, &[]).expect("a route exists");
+        let cat = net
+            .plan(36.0031, -5.0050, 36.0004, -5.0141, 100.0, &[])
+            .expect("a route exists");
         let &(clat, clon) = cat.path.last().unwrap();
         let dx = (clon - (-5.0140)) * 111_320.0 * 36.0_f64.to_radians().cos();
         let dy = (clat - 36.0004) * 111_320.0;
         let d = (dx * dx + dy * dy).sqrt();
-        assert!((95.0..=105.0).contains(&d), "instrument standoff honoured: {d}");
+        assert!(
+            (95.0..=105.0).contains(&d),
+            "instrument standoff honoured: {d}"
+        );
         // AUTHORED active zones beat both guesses: with the destination
         // runway named, the route ends at the zone boundary node — the
         // per-stub holding point as the airport author placed it. The `ils`
         // row on B must NOT extend the zone (LVP holds are future work).
         let zone: Vec<String> = vec!["09".into(), "27".into()];
         let zoned = net
-            .plan(36.0031, -5.0050, 36.0004, -5.0141, HOLD_SHORT_STANDOFF_M, &zone)
+            .plan(
+                36.0031,
+                -5.0050,
+                36.0004,
+                -5.0141,
+                HOLD_SHORT_STANDOFF_M,
+                &zone,
+            )
             .expect("a route exists");
-        assert_eq!(*zoned.path.last().unwrap(), (36.0004, -5.0095), "ends at node 4, the zone edge");
-        assert_eq!(zoned.seg.len(), zoned.path.len() - 1, "seg aligned after the zone trim");
+        assert_eq!(
+            *zoned.path.last().unwrap(),
+            (36.0004, -5.0095),
+            "ends at node 4, the zone edge"
+        );
+        assert_eq!(
+            zoned.seg.len(),
+            zoned.path.len() - 1,
+            "seg aligned after the zone trim"
+        );
 
         // Nowhere near the network: no snap, no plan — never a wild route.
-        assert!(net.plan(37.0, -6.0, 36.0, -5.01, HOLD_SHORT_STANDOFF_M, &[]).is_none());
+        assert!(net
+            .plan(37.0, -6.0, 36.0, -5.01, HOLD_SHORT_STANDOFF_M, &[])
+            .is_none());
         // A field without 1201/1202 rows has no network at all.
-        assert!(find_taxi_net(path.to_str().unwrap(), "0MU1").unwrap().is_some());
-        assert!(find_taxi_net(path.to_str().unwrap(), "LXXX").unwrap().is_none());
+        assert!(find_taxi_net(path.to_str().unwrap(), "0MU1")
+            .unwrap()
+            .is_some());
+        assert!(find_taxi_net(path.to_str().unwrap(), "LXXX")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     #[ignore] // needs the real X-Plane install; run with --ignored
     fn live_heathrow_taxi_route_plans() {
-        let path = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let path =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
         let t = std::time::Instant::now();
-        let net = find_taxi_net(path, "EGLL").unwrap().expect("EGLL has a network");
-        eprintln!("EGLL taxi net: {} nodes, {} edges in {:?}", net.nodes.len(), net.edges.len(), t.elapsed());
+        let net = find_taxi_net(path, "EGLL")
+            .unwrap()
+            .expect("EGLL has a network");
+        eprintln!(
+            "EGLL taxi net: {} nodes, {} edges in {:?}",
+            net.nodes.len(),
+            net.edges.len(),
+            t.elapsed()
+        );
         assert!(net.nodes.len() > 500 && net.edges.len() > 300);
         // From T2 stands (51.4700, -0.4520) to the 27R threshold
         // (51.4775, -0.4325): a real route with named taxiways.
         let t = std::time::Instant::now();
-        let plan = net.plan(51.4700, -0.4520, 51.4775, -0.4325, HOLD_SHORT_STANDOFF_M, &[]).expect("a route");
-        eprintln!("plan in {:?}: via {:?}, cross {:?}, hp {:?}", t.elapsed(), plan.via, plan.crossings, plan.holding_point);
+        let plan = net
+            .plan(
+                51.4700,
+                -0.4520,
+                51.4775,
+                -0.4325,
+                HOLD_SHORT_STANDOFF_M,
+                &[],
+            )
+            .expect("a route");
+        eprintln!(
+            "plan in {:?}: via {:?}, cross {:?}, hp {:?}",
+            t.elapsed(),
+            plan.via,
+            plan.crossings,
+            plan.holding_point
+        );
         assert!(!plan.via.is_empty(), "named taxiways expected at Heathrow");
-        assert!(t.elapsed().as_millis() < 200, "planning must not stall a reply");
+        assert!(
+            t.elapsed().as_millis() < 200,
+            "planning must not stall a reply"
+        );
     }
 
     #[test]
     #[ignore] // needs the real X-Plane install; run with --ignored
     fn live_apt_dat_scan_is_fast_enough_to_speak() {
-        let path = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let path =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
         let t = std::time::Instant::now();
         let rw = find_runways(path, "LEAL").unwrap();
         let elapsed = t.elapsed();
         assert_eq!(rw.len(), 1);
-        assert_eq!((rw[0].ident_a.as_str(), rw[0].ident_b.as_str()), ("10", "28"));
+        assert_eq!(
+            (rw[0].ident_a.as_str(), rw[0].ident_b.as_str()),
+            ("10", "28")
+        );
         // A voice answer stalls past a few seconds — even a debug build must fit.
         assert!(elapsed.as_secs_f64() < 5.0, "scan took {elapsed:?}");
         eprintln!("LEAL scan: {elapsed:?}");
@@ -1693,7 +1903,11 @@ mod tests {
         assert_eq!(ils.len(), 2, "{ils:?}");
         let l = ils.iter().find(|i| i.runway == "09L").expect("09L");
         assert_eq!(l.freq_10khz, 11030);
-        assert!((l.course_mag - 31769.709 / 360.0).abs() < 0.01, "{}", l.course_mag);
+        assert!(
+            (l.course_mag - 31769.709 / 360.0).abs() < 0.01,
+            "{}",
+            l.course_mag
+        );
         assert_eq!(l.gs_deg, Some(3.0), "row-6 encoding: angle×100000 + course");
         let r = ils.iter().find(|i| i.runway == "09R").expect("09R");
         assert_eq!(r.gs_deg, None, "no GS row for 09R in this sample");
@@ -1742,7 +1956,12 @@ mod tests {
         // the crew crate): a Navigraph cycle outranks the stock files.
         fn env_or_first_existing(var: &str, custom: &str, stock: &str) -> String {
             std::env::var(var).unwrap_or_else(|_| {
-                if std::path::Path::new(custom).exists() { custom } else { stock }.to_string()
+                if std::path::Path::new(custom).exists() {
+                    custom
+                } else {
+                    stock
+                }
+                .to_string()
             })
         }
         let nav_data_path = env_or_first_existing(
@@ -1784,7 +2003,11 @@ APPCH:010,A,I27R,BIG,BIG,EG,D, ,V  C, ,   ,IF, , , , , ,      ,    ,    ,    ,  
         // NOT the BIG transition.
         let legs = parse_proc_legs(EGLL_I27R.lines(), ProcKind::Appch, "I27R", None);
         let types: Vec<&str> = legs.iter().map(|l| l.leg_type.as_str()).collect();
-        assert_eq!(types, vec!["IF", "CF", "CF", "CA"], "final segment, BIG excluded");
+        assert_eq!(
+            types,
+            vec!["IF", "CF", "CF", "CA"],
+            "final segment, BIG excluded"
+        );
 
         // The FAF leg: FF27R, flagged, magnetic course 268, platform 2500.
         let faf = &legs[1];
@@ -1809,8 +2032,14 @@ APPCH:010,A,I27R,BIG,BIG,EG,D, ,V  C, ,   ,IF, , , , , ,      ,    ,    ,    ,  
     #[test]
     fn appch_transition_is_included_when_named() {
         let legs = parse_proc_legs(EGLL_I27R.lines(), ProcKind::Appch, "I27R", Some("BIG"));
-        assert!(legs.iter().any(|l| l.fix_ident == "BIG"), "BIG transition kept");
-        assert!(legs.iter().any(|l| l.fix_ident == "RW27R"), "common part still kept");
+        assert!(
+            legs.iter().any(|l| l.fix_ident == "BIG"),
+            "BIG transition kept"
+        );
+        assert!(
+            legs.iter().any(|l| l.fix_ident == "RW27R"),
+            "common part still kept"
+        );
     }
 
     // A Malaga SID off runway 30 (BLN4L): course-to-fix then track-to-fix legs.
@@ -1855,21 +2084,43 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
         let fix = std::env::temp_dir().join("xc-lxgb-fix.dat");
         let mut f = std::fs::File::create(&fix).unwrap();
         // The real LXGB fixes (earth_fix.dat), plus an unrelated field's fix.
-        writeln!(f, "36.157361111 -5.240083333 27D05 LXGB LX 5906505 RWY27 D05").unwrap();
-        writeln!(f, "36.158305556 -5.219500000 27D06 LXGB LX 5906505 RWY27 D06").unwrap();
-        writeln!(f, "36.162027778 -5.137250000 27D10 LXGB LX 5906505 RWY27 D10").unwrap();
-        writeln!(f, "36.104666667 -5.405333333 09D05 LXGB LX 5906505 RWY09 D05").unwrap();
+        writeln!(
+            f,
+            "36.157361111 -5.240083333 27D05 LXGB LX 5906505 RWY27 D05"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "36.158305556 -5.219500000 27D06 LXGB LX 5906505 RWY27 D06"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "36.162027778 -5.137250000 27D10 LXGB LX 5906505 RWY27 D10"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "36.104666667 -5.405333333 09D05 LXGB LX 5906505 RWY09 D05"
+        )
+        .unwrap();
         writeln!(f, "40.000000000 -3.000000000 27D05 LEMD LE 0 other field").unwrap();
         f.flush().unwrap();
 
-        let airport = find_airport(apt.to_str().unwrap(), "LXGB").unwrap().unwrap();
+        let airport = find_airport(apt.to_str().unwrap(), "LXGB")
+            .unwrap()
+            .unwrap();
         let legs = reconstruct_approach(fix.to_str().unwrap(), &airport, "LXGB", "27");
         // Three DME fixes (27D10/06/05) + the threshold, farthest first.
         let idents: Vec<&str> = legs.iter().map(|l| l.fix_ident.as_str()).collect();
         assert_eq!(idents, vec!["27D10", "27D06", "27D05", "RW27"]);
         // Descending altitude on a 3° path — outer fix highest.
         assert!(legs[0].alt1_ft.unwrap() > legs[2].alt1_ft.unwrap());
-        assert!(legs[0].alt1_ft.unwrap() > 2500.0, "10 DME ~ 3000 ft: {:?}", legs[0].alt1_ft);
+        assert!(
+            legs[0].alt1_ft.unwrap() > 2500.0,
+            "10 DME ~ 3000 ft: {:?}",
+            legs[0].alt1_ft
+        );
         // The innermost DME fix (27D05) is the FAF; the threshold is not.
         assert!(legs[2].is_faf, "27D05 is the FAF");
         assert!(!legs[3].is_faf);
@@ -1895,10 +2146,16 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
         f.flush().unwrap();
         let nav = std::env::temp_dir().join("xc-proc-nav.dat");
         let mut f = std::fs::File::create(&nav).unwrap();
-        writeln!(f, "3 38.1525555 -3.6247222 1772 11620 130 1.000 BLN ENRT LE BAILEN VOR/DME").unwrap();
+        writeln!(
+            f,
+            "3 38.1525555 -3.6247222 1772 11620 130 1.000 BLN ENRT LE BAILEN VOR/DME"
+        )
+        .unwrap();
         f.flush().unwrap();
 
-        let airport = find_airport(apt.to_str().unwrap(), "LEMG").unwrap().unwrap();
+        let airport = find_airport(apt.to_str().unwrap(), "LEMG")
+            .unwrap()
+            .unwrap();
         let mut legs = parse_proc_legs(
             "SID:005,5,X,RW30,MG930,LE,P,C,E   , ,   ,CF, ,MLG,LE,D, ,      ,0,0,3120,0050, ,     ,     ,     , ,   ,    ,   ;\n\
              SID:010,5,X,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     ;\n\
@@ -1933,7 +2190,12 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
     #[ignore]
     fn real_install_procedures() {
         fn first_existing(custom: &str, stock: &str) -> String {
-            if std::path::Path::new(custom).exists() { custom } else { stock }.to_string()
+            if std::path::Path::new(custom).exists() {
+                custom
+            } else {
+                stock
+            }
+            .to_string()
         }
         let cifp = first_existing(
             "/Users/duanelicudi/X-Plane 12/Custom Data/CIFP",
@@ -1947,7 +2209,8 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
             "/Users/duanelicudi/X-Plane 12/Custom Data/earth_nav.dat",
             "/Users/duanelicudi/X-Plane 12/Resources/default data/earth_nav.dat",
         );
-        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let apt =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
         let airport = find_airport(apt, "LEMG").unwrap().expect("LEMG in apt.dat");
         let (near_lat, near_lon) = airport.position().unwrap();
 
@@ -1956,7 +2219,9 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
             if let Some(appch) = best_approach(&cifp, "LEMG", rwy) {
                 let mut legs = load_proc_legs(&cifp, "LEMG", ProcKind::Appch, &appch, None);
                 assert!(!legs.is_empty(), "{appch} has legs");
-                resolve_proc_fixes(&fix_path, &nav_path, &airport, "LEMG", &mut legs, near_lat, near_lon);
+                resolve_proc_fixes(
+                    &fix_path, &nav_path, &airport, "LEMG", &mut legs, near_lat, near_lon,
+                );
                 let named: Vec<_> = legs.iter().filter(|l| !l.fix_ident.is_empty()).collect();
                 let resolved = named.iter().filter(|l| l.fix.is_some()).count();
                 assert!(
@@ -1968,24 +2233,40 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
             }
         }
         // At least one SID resolves too.
-        let sid = sid_for_runway(&cifp, "LEMG", "30").or_else(|| sid_for_runway(&cifp, "LEMG", "12"));
+        let sid =
+            sid_for_runway(&cifp, "LEMG", "30").or_else(|| sid_for_runway(&cifp, "LEMG", "12"));
         let sid = sid.expect("LEMG has a SID for 30/12");
         let mut legs = load_proc_legs(&cifp, "LEMG", ProcKind::Sid, &sid, Some("RW30"));
         if legs.is_empty() {
             legs = load_proc_legs(&cifp, "LEMG", ProcKind::Sid, &sid, Some("RW12"));
         }
-        resolve_proc_fixes(&fix_path, &nav_path, &airport, "LEMG", &mut legs, near_lat, near_lon);
-        assert!(legs.iter().any(|l| l.fix.is_some()), "SID {sid} resolved a fix");
+        resolve_proc_fixes(
+            &fix_path, &nav_path, &airport, "LEMG", &mut legs, near_lat, near_lon,
+        );
+        assert!(
+            legs.iter().any(|l| l.fix.is_some()),
+            "SID {sid} resolved a fix"
+        );
 
         // Gibraltar: no coded approach, but the DME fixes reconstruct the
         // straight-in (the whole reason this exists). Runway 27's fixes must
         // chain farthest-first to the threshold, over the water.
-        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let apt =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
         if let Ok(Some(lxgb)) = find_airport(apt, "LXGB") {
-            assert!(list_procedures(&cifp, "LXGB", ProcKind::Appch).is_empty(), "LXGB has no coded approach");
+            assert!(
+                list_procedures(&cifp, "LXGB", ProcKind::Appch).is_empty(),
+                "LXGB has no coded approach"
+            );
             let recon = reconstruct_approach(&fix_path, &lxgb, "LXGB", "27");
-            assert!(recon.len() >= 3, "reconstructed 27 straight-in from DME fixes: {recon:?}");
-            assert!(recon.last().unwrap().fix_ident.starts_with("RW"), "ends at the threshold");
+            assert!(
+                recon.len() >= 3,
+                "reconstructed 27 straight-in from DME fixes: {recon:?}"
+            );
+            assert!(
+                recon.last().unwrap().fix_ident.starts_with("RW"),
+                "ends at the threshold"
+            );
             assert!(recon.iter().any(|l| l.is_faf), "an FAF is flagged");
         }
     }
@@ -1994,7 +2275,11 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
     fn none_when_no_runway_nearby() {
         let path = std::env::temp_dir().join("xc-nav-test2.dat");
         let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, " 4  47.466600000 -122.317800000  359 11075 18 123840.337 IFAR KSEA K1 28 ILS-cat-I").unwrap();
+        writeln!(
+            f,
+            " 4  47.466600000 -122.317800000  359 11075 18 123840.337 IFAR KSEA K1 28 ILS-cat-I"
+        )
+        .unwrap();
         f.flush().unwrap();
         // Aircraft far from the only runway-28 → none within 60nm.
         let r = find_ils(path.to_str().unwrap(), "28", 36.71, -4.55, 60.0).unwrap();

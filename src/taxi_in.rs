@@ -29,7 +29,10 @@ pub fn start(
     prop: Option<crate::aircraft::PropProfile>,
 ) {
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             return;
         };
         rt.block_on(fly(
@@ -114,7 +117,10 @@ async fn fly(
         reminders: None,
     };
     crate::blackbox::record("taxi_in", json!({ "event": "driving" }));
-    let auto_taxi = AutoTaxi { park_brake_valve_set, prop };
+    let auto_taxi = AutoTaxi {
+        park_brake_valve_set,
+        prop,
+    };
     match auto_taxi.execute(&json!({}), &ctx).await {
         Ok(line) => announce(&voice, Priority::Advisory, &line),
         Err(_) => announce(&voice, Priority::Caution, "I couldn't start the taxi in."),

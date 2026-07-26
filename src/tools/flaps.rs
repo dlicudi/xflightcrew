@@ -38,7 +38,11 @@ impl SetFlaps {
 
     /// The detent labels, for the schema enum and the description.
     fn labels(&self) -> Vec<&str> {
-        self.flaps.detents.iter().map(|d| d.label.as_str()).collect()
+        self.flaps
+            .detents
+            .iter()
+            .map(|d| d.label.as_str())
+            .collect()
     }
 }
 
@@ -79,8 +83,16 @@ impl Tool for SetFlaps {
         let target = match self.resolve(&args.notch) {
             Some(d) => d,
             None => {
-                let names: Vec<&str> = self.flaps.detents.iter().map(|d| d.spoken.as_str()).collect();
-                return Ok(format!("I didn't catch the flap setting. Options are {}.", names.join(", ")));
+                let names: Vec<&str> = self
+                    .flaps
+                    .detents
+                    .iter()
+                    .map(|d| d.spoken.as_str())
+                    .collect();
+                return Ok(format!(
+                    "I didn't catch the flap setting. Options are {}.",
+                    names.join(", ")
+                ));
             }
         };
 
@@ -122,11 +134,23 @@ impl SetFlaps {
     /// The per-notch Vfe gate still applies, so "flaps for landing" while fast
     /// refuses rather than dumping full flap.
     fn resolve(&self, notch: &str) -> Option<&FlapDetent> {
-        if let Some(d) = self.flaps.detents.iter().find(|d| d.label.eq_ignore_ascii_case(notch)) {
+        if let Some(d) = self
+            .flaps
+            .detents
+            .iter()
+            .find(|d| d.label.eq_ignore_ascii_case(notch))
+        {
             return Some(d);
         }
-        if ["landing", "land", "full", "down"].iter().any(|a| notch.eq_ignore_ascii_case(a)) {
-            return self.flaps.detents.iter().max_by(|a, b| a.ratio.total_cmp(&b.ratio));
+        if ["landing", "land", "full", "down"]
+            .iter()
+            .any(|a| notch.eq_ignore_ascii_case(a))
+        {
+            return self
+                .flaps
+                .detents
+                .iter()
+                .max_by(|a, b| a.ratio.total_cmp(&b.ratio));
         }
         None
     }

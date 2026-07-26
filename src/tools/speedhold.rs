@@ -98,8 +98,7 @@ pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// parking-brake tool uses this to tell the pilot the throttle is coming to
 /// idle with the brake.
 pub fn taxi_hold_active() -> bool {
-    ACTIVE.load(Ordering::Relaxed)
-        && *MODE.lock().unwrap_or_else(|e| e.into_inner()) == Mode::Taxi
+    ACTIVE.load(Ordering::Relaxed) && *MODE.lock().unwrap_or_else(|e| e.into_inner()) == Mode::Taxi
 }
 
 /// The running taxi hold's target, or `None` when the governor isn't taxiing.
@@ -163,7 +162,11 @@ pub fn throttle_adjust(err_kts: f64, trend_kts_s: f64) -> f64 {
     }
     let p = err_kts * 0.003;
     let d = -trend_kts_s * 0.008; // decaying speed → positive (add power) early
-    let max_up = if err_kts > 10.0 || trend_kts_s < -3.0 { 0.04 } else { 0.015 };
+    let max_up = if err_kts > 10.0 || trend_kts_s < -3.0 {
+        0.04
+    } else {
+        0.015
+    };
     (p + d).clamp(-0.015, max_up)
 }
 
@@ -337,7 +340,9 @@ impl Tool for HoldSpeed {
         // A spoken "stop" in the air is a mishear or a panic; either way the
         // flight hold's 55-knot floor must not be the answer to it.
         if !on_ground && a.knots.is_some_and(|k| k < 1.0) {
-            return Ok("We're airborne — I can't stop the aircraft. Say a speed to hold.".to_string());
+            return Ok(
+                "We're airborne — I can't stop the aircraft. Say a speed to hold.".to_string(),
+            );
         }
         // Mode by context: a small number on the ground is a taxi; airborne (or
         // a big number) is a flight hold. A big number on the ground is neither.
@@ -392,7 +397,8 @@ impl Tool for HoldSpeed {
                 Some(k) => clamp_target(k),
                 None => {
                     return Ok(
-                        "No approach speed on file for this airframe — give me a number.".to_string()
+                        "No approach speed on file for this airframe — give me a number."
+                            .to_string(),
                     )
                 }
             }
@@ -415,7 +421,9 @@ impl Tool for HoldSpeed {
             let base = ctx.config.xplane_base_url.clone();
             let voice = ctx.voice.cloned();
             std::thread::spawn(move || {
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build()
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
                 else {
                     ACTIVE.store(false, Ordering::Relaxed);
                     return;
@@ -545,7 +553,11 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                             break;
                         }
                         override_pending = true;
-                        tracing::info!(thr, lc, "speed governor: throttle deviated, challenging once");
+                        tracing::info!(
+                            thr,
+                            lc,
+                            "speed governor: throttle deviated, challenging once"
+                        );
                         let _ = xp.set_float(THROTTLE, lc).await;
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         continue;
@@ -564,7 +576,11 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     let trend = match prev_ias {
                         Some((last_ias, last_t)) => {
                             let dt = now_t.duration_since(last_t).as_secs_f64();
-                            if (0.2..=2.0).contains(&dt) { (ias - last_ias) / dt } else { 0.0 }
+                            if (0.2..=2.0).contains(&dt) {
+                                (ias - last_ias) / dt
+                            } else {
+                                0.0
+                            }
                         }
                         None => 0.0,
                     };
@@ -659,7 +675,10 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     let lb = xp.get_float(LEFT_BRAKE).await.unwrap_or(0.0);
                     let rb = xp.get_float(RIGHT_BRAKE).await.unwrap_or(0.0);
                     if pilot_took_the_brakes(lb, rb, pb, braking) {
-                        tracing::info!(brake = lb.max(rb).max(pb), "speed governor: pilot braking, throttle idle, paused");
+                        tracing::info!(
+                            brake = lb.max(rb).max(pb),
+                            "speed governor: pilot braking, throttle idle, paused"
+                        );
                         glide(&xp, THROTTLE, 0.0, 300).await;
                         last_cmd = Some(0.0);
                         paused = true;
@@ -682,7 +701,11 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                             break;
                         }
                         override_pending = true;
-                        tracing::info!(thr, lc, "speed governor: throttle deviated, challenging once");
+                        tracing::info!(
+                            thr,
+                            lc,
+                            "speed governor: throttle deviated, challenging once"
+                        );
                         let _ = xp.set_float(THROTTLE, lc).await;
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         continue;
@@ -693,7 +716,11 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     let raw_trend = match prev_gs {
                         Some((last_gs, last_t)) => {
                             let dt = now_t.duration_since(last_t).as_secs_f64();
-                            if (0.05..=2.0).contains(&dt) { (gs_kts - last_gs) / dt } else { 0.0 }
+                            if (0.05..=2.0).contains(&dt) {
+                                (gs_kts - last_gs) / dt
+                            } else {
+                                0.0
+                            }
                         }
                         None => 0.0,
                     };
@@ -752,7 +779,12 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                         brake_out = 0.0;
                     }
                     braking = brake_out > 0.005;
-                    tokio::time::sleep(std::time::Duration::from_millis(if wrote { 100 } else { 300 })).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(if wrote {
+                        100
+                    } else {
+                        300
+                    }))
+                    .await;
                 } else {
                     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 }
@@ -780,7 +812,10 @@ mod tests {
             b = brake_slew(b, 0.5, 0.1);
             ticks += 1;
         }
-        assert!((10..=18).contains(&ticks), "~1.5 s to full park, took {ticks} ticks");
+        assert!(
+            (10..=18).contains(&ticks),
+            "~1.5 s to full park, took {ticks} ticks"
+        );
         // Release is quick — letting go is not a jerk.
         let released = brake_slew(0.5, 0.0, 0.1);
         assert!(released < 0.4, "{released}");
@@ -790,26 +825,41 @@ mod tests {
 
     #[test]
     fn governor_law_is_gentle_and_deadbanded() {
-        assert_eq!(throttle_adjust(1.0, 0.0), 0.0, "in the groove, steady → hands off");
+        assert_eq!(
+            throttle_adjust(1.0, 0.0),
+            0.0,
+            "in the groove, steady → hands off"
+        );
         assert_eq!(throttle_adjust(-1.2, 0.5), 0.0);
         assert!(throttle_adjust(3.0, 0.0) > 0.0, "slow → more power");
         assert!(throttle_adjust(-3.0, 0.0) < 0.0, "fast → less power");
         // The anti-stall reflex: on speed but DECAYING fast → power comes in
         // before the error exists at all.
-        assert!(throttle_adjust(0.0, -2.5) > 0.0, "unwinding needle → power now");
+        assert!(
+            throttle_adjust(0.0, -2.5) > 0.0,
+            "unwinding needle → power now"
+        );
         // And rising speed damps the correction rather than piling on.
         assert!(throttle_adjust(3.0, 3.0) < throttle_adjust(3.0, 0.0));
         // Authority is bounded, asymmetrically: overspeed is a comfort issue,
         // stall is not — the slow side gets the bigger clamp.
         assert_eq!(throttle_adjust(100.0, 0.0), 0.04);
         assert_eq!(throttle_adjust(-100.0, 0.0), -0.015);
-        assert_eq!(throttle_adjust(0.0, -10.0), 0.04, "fast decay unlocks urgency");
+        assert_eq!(
+            throttle_adjust(0.0, -10.0),
+            0.04,
+            "fast decay unlocks urgency"
+        );
     }
 
     #[test]
     fn spoken_targets_are_sanity_bounded() {
         assert_eq!(clamp_target(70.0), 70.0);
-        assert_eq!(clamp_target(7.0), 55.0, "mishear can't idle us into a stall");
+        assert_eq!(
+            clamp_target(7.0),
+            55.0,
+            "mishear can't idle us into a stall"
+        );
         assert_eq!(clamp_target(700.0), 250.0);
         assert_eq!(clamp_taxi_target(10.0), 10.0);
         assert_eq!(clamp_taxi_target(60.0), 25.0, "no takeoff-roll 'taxi'");
@@ -878,7 +928,10 @@ mod tests {
         // Accelerating gently through the target with power in: trim it
         // early too, still no brakes.
         let (thr, brake) = taxi_control(10.0, 10.5, 0.20, 0.8);
-        assert!(thr.unwrap() < 0.20, "building through target: power off early");
+        assert!(
+            thr.unwrap() < 0.20,
+            "building through target: power off early"
+        );
         assert_eq!(brake, 0.0);
         // A genuine SURGE (downhill, +1.5 kt/s) reads as deep overspeed
         // before the speed gets there: idle and brakes, by design.
@@ -891,20 +944,35 @@ mod tests {
     fn manual_toe_brakes_make_the_governor_yield() {
         // BOTH pedals down while we're NOT braking (override off → the ratios
         // are the pilot's pedals): the pilot is slowing us, yield.
-        assert!(pilot_took_the_brakes(0.2, 0.2, 0.0, false), "both pedals = slowing");
-        assert!(pilot_took_the_brakes(0.5, 0.2, 0.0, false), "both engaged, uneven, still slowing");
+        assert!(
+            pilot_took_the_brakes(0.2, 0.2, 0.0, false),
+            "both pedals = slowing"
+        );
+        assert!(
+            pilot_took_the_brakes(0.5, 0.2, 0.0, false),
+            "both engaged, uneven, still slowing"
+        );
         // A SINGLE pedal is differential braking = steering a turn (the only
         // low-speed steering on a castoring nosewheel). The hold must ride
         // through it, not cut throttle to 0 the moment the pilot turns.
-        assert!(!pilot_took_the_brakes(0.4, 0.0, 0.0, false), "left pedal = steering, ride through");
-        assert!(!pilot_took_the_brakes(0.0, 0.4, 0.0, false), "right pedal = steering, ride through");
+        assert!(
+            !pilot_took_the_brakes(0.4, 0.0, 0.0, false),
+            "left pedal = steering, ride through"
+        );
+        assert!(
+            !pilot_took_the_brakes(0.0, 0.4, 0.0, false),
+            "right pedal = steering, ride through"
+        );
         // Pedal rest / sensor noise below the threshold is NOT a takeover.
         assert!(!pilot_took_the_brakes(0.05, 0.03, 0.0, false));
         assert!(!pilot_took_the_brakes(0.0, 0.0, 0.02, false));
         // While the governor is braking (override on) the ratios are OUR own
         // command, not the pilot's — never read them as a takeover, or we'd
         // stand ourselves down the instant we touched the brakes.
-        assert!(!pilot_took_the_brakes(0.6, 0.6, 0.0, true), "that's our brake, not theirs");
+        assert!(
+            !pilot_took_the_brakes(0.6, 0.6, 0.0, true),
+            "that's our brake, not theirs"
+        );
     }
 
     #[test]
@@ -913,15 +981,24 @@ mod tests {
         // latches the parking-brake ratio at regular effort (~0.36 measured
         // live, 2026-07-14). That must read as the pilot braking — the
         // governor throttled straight against it before.
-        assert!(pilot_took_the_brakes(0.0, 0.0, 0.36, false), "toggle latch = slowing");
+        assert!(
+            pilot_took_the_brakes(0.0, 0.0, 0.36, false),
+            "toggle latch = slowing"
+        );
         // A partially-set park handle below the stand-down threshold is
         // braking all the same.
         assert!(pilot_took_the_brakes(0.0, 0.0, 0.3, false));
         // The decay tail after our own held command expires (~0.02 within a
         // second) is noise, not a takeover — and the fresher, higher tail is
         // excluded by the shared brake_cmd_quiet clock, not this threshold.
-        assert!(!pilot_took_the_brakes(0.0, 0.0, 0.02, false), "decay tail is not the pilot");
+        assert!(
+            !pilot_took_the_brakes(0.0, 0.0, 0.02, false),
+            "decay tail is not the pilot"
+        );
         // While the governor itself is braking, nothing reads as the pilot.
-        assert!(!pilot_took_the_brakes(0.0, 0.0, 0.36, true), "our stop, not their toggle");
+        assert!(
+            !pilot_took_the_brakes(0.0, 0.0, 0.36, true),
+            "our stop, not their toggle"
+        );
     }
 }

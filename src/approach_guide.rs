@@ -32,7 +32,11 @@ pub fn arm(path: ApproachPath) {
 }
 
 pub fn cancel() -> bool {
-    GUIDE.lock().unwrap_or_else(|e| e.into_inner()).take().is_some()
+    GUIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .is_some()
 }
 
 pub fn armed() -> Option<ApproachPath> {
@@ -186,7 +190,12 @@ mod tests {
         // 400 ft high → "well high"; shift ~0.15 nm left of centerline
         // (aircraft north of the line for a westbound approach = right side...
         // verified by sign convention below).
-        let d = Deviations { dist_nm: 3.0, xtk_nm: 0.15, vdev_ft: 400.0, on_approach_side: true };
+        let d = Deviations {
+            dist_nm: 3.0,
+            xtk_nm: 0.15,
+            vdev_ft: 400.0,
+            on_approach_side: true,
+        };
         let c = callout(&d).unwrap();
         assert!(c.contains("Slightly left, come right"), "{c}");
         assert!(c.contains("well high"), "{c}");
@@ -199,13 +208,28 @@ mod tests {
 
     #[test]
     fn short_final_goes_terse_then_hands_over() {
-        let d = Deviations { dist_nm: 0.6, xtk_nm: 0.0, vdev_ft: 10.0, on_approach_side: true };
+        let d = Deviations {
+            dist_nm: 0.6,
+            xtk_nm: 0.0,
+            vdev_ft: 10.0,
+            on_approach_side: true,
+        };
         let c = callout(&d).unwrap();
         assert_eq!(c, "On course, on glidepath.");
-        let over = Deviations { dist_nm: 0.3, xtk_nm: 0.0, vdev_ft: 0.0, on_approach_side: true };
+        let over = Deviations {
+            dist_nm: 0.3,
+            xtk_nm: 0.0,
+            vdev_ft: 0.0,
+            on_approach_side: true,
+        };
         assert_eq!(callout(&over).unwrap(), "Over the threshold. Yours.");
         // Beyond/behind the threshold: silence, the flare is the pilot's.
-        let past = Deviations { dist_nm: 0.2, xtk_nm: 0.0, vdev_ft: 0.0, on_approach_side: false };
+        let past = Deviations {
+            dist_nm: 0.2,
+            xtk_nm: 0.0,
+            vdev_ft: 0.0,
+            on_approach_side: false,
+        };
         assert!(callout(&past).is_none());
     }
 

@@ -120,7 +120,10 @@ fn kill_pid(pid: u32) {
 fn wait_with_watchdog(mut child: std::process::Child, what: &str) -> Result<()> {
     let start = std::time::Instant::now();
     loop {
-        match child.try_wait().with_context(|| format!("polling {what}"))? {
+        match child
+            .try_wait()
+            .with_context(|| format!("polling {what}"))?
+        {
             Some(status) if status.success() => return Ok(()),
             Some(status) => bail!("{what} exited with {status}"),
             None if start.elapsed() > SPEECH_WATCHDOG => {

@@ -122,10 +122,7 @@ pub async fn advance_for_ground_roll(
     let _ = xp
         .set_float(&prop.dataref, prop.max_rpm / RAD_PER_SEC_TO_RPM)
         .await;
-    crate::blackbox::record(
-        "prop",
-        json!({ "event": "unfeather", "rpm": prop.max_rpm }),
-    );
+    crate::blackbox::record("prop", json!({ "event": "unfeather", "rpm": prop.max_rpm }));
     Some(prop.max_rpm)
 }
 
@@ -143,7 +140,10 @@ mod tests {
     }
 
     fn arg(setting: Option<&str>, rpm: Option<f64>) -> PropArg {
-        PropArg { setting: setting.map(|s| s.into()), rpm }
+        PropArg {
+            setting: setting.map(|s| s.into()),
+            rpm,
+        }
     }
 
     #[test]
@@ -164,7 +164,7 @@ mod tests {
         assert_eq!(p.target_rpm(&arg(None, Some(1900.0))), Some(1900.0));
         assert_eq!(p.target_rpm(&arg(None, Some(9000.0))), Some(2200.0)); // over max
         assert_eq!(p.target_rpm(&arg(None, Some(500.0))), Some(1600.0)); // under min
-        // rpm takes precedence over a named setting.
+                                                                         // rpm takes precedence over a named setting.
         assert_eq!(p.target_rpm(&arg(Some("low"), Some(2000.0))), Some(2000.0));
     }
 

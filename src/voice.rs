@@ -182,7 +182,11 @@ fn station_model(who: StationSpeaker, config: &Config, seed: usize, locals: &[St
         // DIFFERENT people at every field (offset picks), stable per
         // airport via the seed.
         if !locals.is_empty() && matches!(who, StationSpeaker::Tower | StationSpeaker::Atis) {
-            let offset = if matches!(who, StationSpeaker::Atis) { 1 } else { 0 };
+            let offset = if matches!(who, StationSpeaker::Atis) {
+                1
+            } else {
+                0
+            };
             return locals[(seed + offset) % locals.len()].clone();
         }
         let pool: Vec<&str> = config
@@ -206,15 +210,27 @@ fn station_model(who: StationSpeaker, config: &Config, seed: usize, locals: &[St
         StationSpeaker::Tower => fallback,
         StationSpeaker::Approach => {
             let v = config.atc_approach_piper_voice.as_str();
-            if v.is_empty() { fallback } else { v }
+            if v.is_empty() {
+                fallback
+            } else {
+                v
+            }
         }
         StationSpeaker::Departure => {
             let v = config.atc_departure_piper_voice.as_str();
-            if v.is_empty() { fallback } else { v }
+            if v.is_empty() {
+                fallback
+            } else {
+                v
+            }
         }
         StationSpeaker::Atis => {
             let v = config.atc_atis_piper_voice.as_str();
-            if v.is_empty() { fallback } else { v }
+            if v.is_empty() {
+                fallback
+            } else {
+                v
+            }
         }
     }
     .to_string()
@@ -230,7 +246,10 @@ fn audible_now(tuned: Option<StationSpeaker>, speaker: StationSpeaker) -> bool {
     match tuned {
         None => false,
         Some(StationSpeaker::Tower) => {
-            matches!(speaker, StationSpeaker::Tower | StationSpeaker::Ghost { .. })
+            matches!(
+                speaker,
+                StationSpeaker::Tower | StationSpeaker::Ghost { .. }
+            )
         }
         Some(t) => t == speaker,
     }
@@ -250,12 +269,18 @@ fn station_unhearable(inner: &Inner, station: Option<StationSpeaker>) -> bool {
     if inner.replay.load(std::sync::atomic::Ordering::Relaxed) {
         return true; // a replay is a recording — the world isn't on the air
     }
-    if !inner.radio_powered.load(std::sync::atomic::Ordering::Relaxed) {
+    if !inner
+        .radio_powered
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return true;
     }
     inner.com1_known.load(std::sync::atomic::Ordering::Relaxed)
         && !audible_now(
-            *inner.tuned_station.lock().unwrap_or_else(|e| e.into_inner()),
+            *inner
+                .tuned_station
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
             who,
         )
 }
@@ -602,7 +627,9 @@ impl Voice {
     /// Whether the airframe is crashed. The command loop checks it before
     /// routing a transmission to the world: wreckage doesn't transmit.
     pub fn crashed(&self) -> bool {
-        self.inner.crashed.load(std::sync::atomic::Ordering::Relaxed)
+        self.inner
+            .crashed
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Publish whether the sim is in replay (see `Inner::replay`). Entering a
@@ -743,17 +770,29 @@ impl Voice {
         // echo (Jaccard is diluted by the readback's extra words). The word-count
         // floor keeps a short real command ("heading 180") from being swallowed.
         let long = crate::phrase::word_count(heard) >= 5;
-        said.iter().filter(|(t, _)| t.elapsed() < ECHO_MEMORY).any(|(_, text)| {
-            crate::phrase::word_similarity(heard, text) >= ECHO_SIMILARITY
-                || (long && crate::phrase::word_containment(heard, text) >= 0.85)
-        })
+        said.iter()
+            .filter(|(t, _)| t.elapsed() < ECHO_MEMORY)
+            .any(|(_, text)| {
+                crate::phrase::word_similarity(heard, text) >= ECHO_SIMILARITY
+                    || (long && crate::phrase::word_containment(heard, text) >= 0.85)
+            })
     }
 
     fn enqueue(&self, priority: Priority, text: String, done: Option<Arc<Latch>>, chime: bool) {
         // No em/en dashes reach the TTS — they trip it up. One chokepoint for
         // every spoken utterance (readbacks, monitor callouts, prompts).
         let text = crate::phrase::scrub_dashes(&text);
-        self.push(Utterance { priority, seq: 0, text, chime, negative: false, station: None, cabin: false, stale_by: None, done });
+        self.push(Utterance {
+            priority,
+            seq: 0,
+            text,
+            chime,
+            negative: false,
+            station: None,
+            cabin: false,
+            stale_by: None,
+            done,
+        });
     }
 
     fn enqueue_station(
@@ -765,7 +804,17 @@ impl Voice {
     ) {
         let text = crate::phrase::scrub_dashes(&text);
         tracing::info!(transmitting = %text, "station");
-        self.push(Utterance { priority, seq: 0, text, chime: false, negative: false, station: Some(speaker), cabin: false, stale_by: None, done });
+        self.push(Utterance {
+            priority,
+            seq: 0,
+            text,
+            chime: false,
+            negative: false,
+            station: Some(speaker),
+            cabin: false,
+            stale_by: None,
+            done,
+        });
     }
 
     /// Push a fully-formed utterance onto its channel's queue (stamping the
@@ -840,7 +889,13 @@ impl Voice {
     /// own voice); caution/warning use the coloured alert slot so the chip keeps
     /// its amber/red salience. Cheap, non-blocking, a no-op when unwired.
     fn mirror_to_panel(&self, priority: Priority, text: &str) {
-        if let Some(s) = self.inner.status.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(s) = self
+            .inner
+            .status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             match priority {
                 Priority::Caution => s.alert(crate::plugin_status::AlertLevel::Caution, text),
                 Priority::Warning => s.alert(crate::plugin_status::AlertLevel::Warning, text),
@@ -1056,7 +1111,12 @@ impl StationVoice {
                         shift,
                         "station voice: warm ONNX session + radio effect"
                     );
-                    return StationVoice::Onnx { engine: Box::new(engine), tail, transmissions: 0, shift };
+                    return StationVoice::Onnx {
+                        engine: Box::new(engine),
+                        tail,
+                        transmissions: 0,
+                        shift,
+                    };
                 }
                 Err(e) => {
                     tracing::warn!("station voice load failed ({e:#}); falling back to `say`");
@@ -1086,7 +1146,12 @@ impl StationVoice {
     ) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "onnx-tts")]
-            StationVoice::Onnx { engine, tail, transmissions, shift } => {
+            StationVoice::Onnx {
+                engine,
+                tail,
+                transmissions,
+                shift,
+            } => {
                 *transmissions = transmissions.wrapping_add(1);
                 let variant = *transmissions;
                 let tail = tail.clone();
@@ -1140,7 +1205,9 @@ impl Speaker {
         }
         // `onnx` requested but the feature isn't built in → fall back to `say`.
         if config.tts_backend == "onnx" {
-            tracing::warn!("onnx TTS requested but not built in (need the onnx-tts feature); using `say`");
+            tracing::warn!(
+                "onnx TTS requested but not built in (need the onnx-tts feature); using `say`"
+            );
             config.tts_backend = "say".into();
         }
         // Always announce the resolved backend so the active voice is never a
@@ -1175,7 +1242,9 @@ impl Speaker {
                     **engine = fresh;
                 }
                 Err(e) => {
-                    tracing::error!("pilot voice swap to {spec} failed ({e:#}); keeping the current voice");
+                    tracing::error!(
+                        "pilot voice swap to {spec} failed ({e:#}); keeping the current voice"
+                    );
                 }
             },
         }
@@ -1344,10 +1413,8 @@ fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         } else {
             &mut speaker
         };
-        let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            who.speak(&utt.text)
-        }))
-        .unwrap_or_else(|panic| Err(anyhow::anyhow!("TTS panicked: {}", panic_text(panic))));
+        let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| who.speak(&utt.text)))
+            .unwrap_or_else(|panic| Err(anyhow::anyhow!("TTS panicked: {}", panic_text(panic))));
         if let Err(e) = spoke {
             log_tts_err("TTS", e);
         }
@@ -1420,7 +1487,9 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let who = utt.station.expect("radio queue only holds station utterances");
+        let who = utt
+            .station
+            .expect("radio queue only holds station utterances");
         let model = station_model(who, &station_cfg, seed, &locals);
         // Signal quality from the CURRENT range to the station, read per
         // transmission — the same tower fades in as you close on the field.
@@ -1436,7 +1505,10 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             let slot = &mut stations[who.slot()];
             if slot.as_ref().map(|(m, _)| m.as_str()) != Some(model.as_str()) {
                 let person = station_person(&model, who.slot(), seed);
-                *slot = Some((model.clone(), StationVoice::build(&station_cfg, &model, person)));
+                *slot = Some((
+                    model.clone(),
+                    StationVoice::build(&station_cfg, &model, person),
+                ));
             }
             // Publish the transmission as on-air just before playback, so a
             // PTT press or a retune can CUT it (no resume). Copilot speech
@@ -1446,12 +1518,15 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             // publish, so `set_com1`/`set_radio_powered` found nothing
             // on the air to cut. The cut generation in `tts::stop_channel`
             // kills even a player that hasn't registered its pid yet.
-            slot.as_mut().expect("just built").1.speak(&utt.text, quality, |_samples, _rate| {
-                *inner.now_playing.lock().unwrap_or_else(|e| e.into_inner()) = Some(who);
-                if station_unhearable(inner, Some(who)) {
-                    crate::tts::stop_channel(crate::tts::Channel::Radio);
-                }
-            })
+            slot.as_mut()
+                .expect("just built")
+                .1
+                .speak(&utt.text, quality, |_samples, _rate| {
+                    *inner.now_playing.lock().unwrap_or_else(|e| e.into_inner()) = Some(who);
+                    if station_unhearable(inner, Some(who)) {
+                        crate::tts::stop_channel(crate::tts::Channel::Radio);
+                    }
+                })
         }))
         .unwrap_or_else(|panic| {
             let what = panic_text(panic);
@@ -1493,7 +1568,10 @@ fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
 /// An env-tunable f32 with a default (station cadence knobs).
 #[cfg(feature = "onnx-tts")]
 fn env_f32(name: &str, default: f32) -> f32 {
-    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 /// Resolve the reminder chime to a playable file, or `None` to skip it. An
@@ -1532,21 +1610,36 @@ mod tests {
     use super::*;
 
     fn utt(priority: Priority, seq: u64) -> Utterance {
-        Utterance { priority, seq, text: String::new(), chime: false, negative: false, station: None, cabin: false, stale_by: None, done: None }
+        Utterance {
+            priority,
+            seq,
+            text: String::new(),
+            chime: false,
+            negative: false,
+            station: None,
+            cabin: false,
+            stale_by: None,
+            done: None,
+        }
     }
 
     #[test]
     fn airport_voice_crews_are_stable_distinct_and_never_home() {
         // Stable per name, never 0 (0 = the home field's curated voices).
-        assert_eq!(station_voice_seed("Ciudad Real"), station_voice_seed("Ciudad Real"));
+        assert_eq!(
+            station_voice_seed("Ciudad Real"),
+            station_voice_seed("Ciudad Real")
+        );
         assert_ne!(station_voice_seed("Ciudad Real"), 0);
-        assert_ne!(station_voice_seed("Ciudad Real"), station_voice_seed("Malaga"));
+        assert_ne!(
+            station_voice_seed("Ciudad Real"),
+            station_voice_seed("Malaga")
+        );
         // With a pool, a seeded airport picks from it — and the four positions
         // land on distinct voices when the pool has at least four entries.
         let cfg = Config {
             atc_piper_voice: "tower.onnx".into(),
-            atc_voice_pool: "a.onnx, b.onnx, c.onnx, d.onnx, e.onnx, f.onnx, g.onnx, h.onnx"
-                .into(),
+            atc_voice_pool: "a.onnx, b.onnx, c.onnx, d.onnx, e.onnx, f.onnx, g.onnx, h.onnx".into(),
             ..Config::default()
         };
         let seed = station_voice_seed("Ciudad Real");
@@ -1562,12 +1655,25 @@ mod tests {
         let mut unique = crew.clone();
         unique.sort();
         unique.dedup();
-        assert_eq!(unique.len(), 4, "positions must be distinct people: {crew:?}");
+        assert_eq!(
+            unique.len(),
+            4,
+            "positions must be distinct people: {crew:?}"
+        );
         // Seed 0 = the curated home voices, pool or not.
-        assert_eq!(station_model(StationSpeaker::Tower, &cfg, 0, &[]), "tower.onnx");
+        assert_eq!(
+            station_model(StationSpeaker::Tower, &cfg, 0, &[]),
+            "tower.onnx"
+        );
         // No pool → curated voices even for a seeded airport.
-        let bare = Config { atc_piper_voice: "tower.onnx".into(), ..Config::default() };
-        assert_eq!(station_model(StationSpeaker::Tower, &bare, seed, &[]), "tower.onnx");
+        let bare = Config {
+            atc_piper_voice: "tower.onnx".into(),
+            ..Config::default()
+        };
+        assert_eq!(
+            station_model(StationSpeaker::Tower, &bare, seed, &[]),
+            "tower.onnx"
+        );
         // Country casting: the local accents man the tower and read the
         // ATIS — DIFFERENT people when the roster has two or more ("main
         // thing is that we actually have different voices", 2026-07-12);
@@ -1578,23 +1684,46 @@ mod tests {
         assert!(locals.contains(&twr), "{twr}");
         assert!(locals.contains(&atis), "{atis}");
         assert_ne!(twr, atis, "tower and ATIS must be different people");
-        assert!(!locals.contains(&station_model(StationSpeaker::Approach, &cfg, seed, &locals)));
+        assert!(!locals.contains(&station_model(
+            StationSpeaker::Approach,
+            &cfg,
+            seed,
+            &locals
+        )));
         // A one-voice roster still casts it (tower and ATIS then share).
         let solo = vec!["es1.onnx".to_string()];
-        assert_eq!(station_model(StationSpeaker::Tower, &cfg, seed, &solo), "es1.onnx");
-        assert_eq!(station_model(StationSpeaker::Atis, &cfg, seed, &solo), "es1.onnx");
+        assert_eq!(
+            station_model(StationSpeaker::Tower, &cfg, seed, &solo),
+            "es1.onnx"
+        );
+        assert_eq!(
+            station_model(StationSpeaker::Atis, &cfg, seed, &solo),
+            "es1.onnx"
+        );
         // Geography: Castilian in Spain and the Canaries (with real variety
         // on the roster), es_MX only in Spanish Latin America, neutral
         // elsewhere (and NEVER es_MX in Spain).
         // Spain is deliberately EMPTY since the 2026-07-12 audition (every
         // Castilian model failed the ear; quality beats accent) — but if a
         // voice ever returns, it must be es_ES, never es_MX.
-        assert!(local_accents_for("LEMD").iter().all(|m| m.contains("es_ES")));
-        assert!(local_accents_for("GCXO").iter().all(|m| m.contains("es_ES")));
-        assert!(local_accents_for("MMMX").iter().all(|m| m.contains("es_MX")));
-        assert!(local_accents_for("SBGR").is_empty(), "Brazil speaks Portuguese, stays neutral");
+        assert!(local_accents_for("LEMD")
+            .iter()
+            .all(|m| m.contains("es_ES")));
+        assert!(local_accents_for("GCXO")
+            .iter()
+            .all(|m| m.contains("es_ES")));
+        assert!(local_accents_for("MMMX")
+            .iter()
+            .all(|m| m.contains("es_MX")));
+        assert!(
+            local_accents_for("SBGR").is_empty(),
+            "Brazil speaks Portuguese, stays neutral"
+        );
         assert!(local_accents_for("EGLL").is_empty());
-        assert!(local_accents_for("LXGB").is_empty(), "home field keeps its curated cast anyway");
+        assert!(
+            local_accents_for("LXGB").is_empty(),
+            "home field keeps its curated cast anyway"
+        );
     }
 
     #[test]
@@ -1631,9 +1760,17 @@ mod tests {
 
     fn bare_inner() -> Inner {
         Inner {
-            queue: Mutex::new(Queue { heap: BinaryHeap::new(), seq: 0, shutdown: false }),
+            queue: Mutex::new(Queue {
+                heap: BinaryHeap::new(),
+                seq: 0,
+                shutdown: false,
+            }),
             cv: Condvar::new(),
-            radio_queue: Mutex::new(Queue { heap: BinaryHeap::new(), seq: 0, shutdown: false }),
+            radio_queue: Mutex::new(Queue {
+                heap: BinaryHeap::new(),
+                seq: 0,
+                shutdown: false,
+            }),
             radio_cv: Condvar::new(),
             speaking: Mutex::new((false, false)),
             status: Mutex::new(None),
@@ -1661,31 +1798,49 @@ mod tests {
         // None but com1_known is false) — station audio must play.
         assert!(!station_unhearable(&inner, Some(Tower)));
         // Copilot speech is intercom: hearable even with the radio dead.
-        inner.radio_powered.store(false, std::sync::atomic::Ordering::Relaxed);
+        inner
+            .radio_powered
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(!station_unhearable(&inner, None));
         assert!(station_unhearable(&inner, Some(Tower)));
-        inner.radio_powered.store(true, std::sync::atomic::Ordering::Relaxed);
+        inner
+            .radio_powered
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         // Crashed: wreckage receives nothing, powered bus or not — but the
         // copilot's intercom still plays (someone has to say why it's quiet).
-        inner.crashed.store(true, std::sync::atomic::Ordering::Relaxed);
+        inner
+            .crashed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(station_unhearable(&inner, Some(Tower)));
         assert!(!station_unhearable(&inner, None));
-        inner.crashed.store(false, std::sync::atomic::Ordering::Relaxed);
+        inner
+            .crashed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // Replay: the world is a recording — no station audio, but the
         // copilot's intercom still answers.
-        inner.replay.store(true, std::sync::atomic::Ordering::Relaxed);
+        inner
+            .replay
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(station_unhearable(&inner, Some(Tower)));
         assert!(!station_unhearable(&inner, None));
-        inner.replay.store(false, std::sync::atomic::Ordering::Relaxed);
+        inner
+            .replay
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // Paused is NOT replay: a transmission already on the air finishes
         // its sentence (the monitor's tick-skip stops anything new; only the
         // transmit paths gate on paused).
-        inner.paused.store(true, std::sync::atomic::Ordering::Relaxed);
+        inner
+            .paused
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(!station_unhearable(&inner, Some(Tower)));
-        inner.paused.store(false, std::sync::atomic::Ordering::Relaxed);
+        inner
+            .paused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // Once tuning is published, only the tuned position (and its ghosts)
         // is hearable; a real read that's off every frequency silences all.
-        inner.com1_known.store(true, std::sync::atomic::Ordering::Relaxed);
+        inner
+            .com1_known
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         *inner.tuned_station.lock().unwrap() = Some(Approach);
         assert!(!station_unhearable(&inner, Some(Approach)));
         assert!(station_unhearable(&inner, Some(Tower)));
@@ -1706,7 +1861,11 @@ mod tests {
         voice.say_station(Priority::Readback, StationSpeaker::Tower, "cleared to land");
         voice.set_radio_powered(true);
         voice.set_com1(Some(121_500), Some(StationSpeaker::Approach));
-        voice.say_station(Priority::Readback, StationSpeaker::Tower, "line up and wait");
+        voice.say_station(
+            Priority::Readback,
+            StationSpeaker::Tower,
+            "line up and wait",
+        );
         // Dropped means dropped: neither transmission was actually spoken
         // (finished speech always lands in the echo memory).
         assert!(voice.inner.spoken.lock().unwrap().is_empty());
@@ -1741,7 +1900,10 @@ mod tests {
         let _guard = crate::mode::TEST_LOCK.lock().unwrap();
         crate::mode::set(crate::mode::Mode::AtcOnly);
         let voice = Voice::new(Config::default());
-        voice.alert(Priority::Warning, "traffic short final and we're on the runway");
+        voice.alert(
+            Priority::Warning,
+            "traffic short final and we're on the runway",
+        );
         voice.chime(Priority::Advisory, "reminder: carb heat");
         voice.alert_stale_by(
             Priority::Advisory,
@@ -1781,10 +1943,19 @@ mod tests {
         // (advisories, readbacks, cautions) — a crew member doesn't talk over
         // ATC. A Warning (stall, terrain) breaks through immediately.
         for p in [Priority::Advisory, Priority::Readback, Priority::Caution] {
-            assert!(!intercom_may_start(p, true), "{p:?} must wait for the frequency");
-            assert!(intercom_may_start(p, false), "{p:?} speaks on a quiet frequency");
+            assert!(
+                !intercom_may_start(p, true),
+                "{p:?} must wait for the frequency"
+            );
+            assert!(
+                intercom_may_start(p, false),
+                "{p:?} speaks on a quiet frequency"
+            );
         }
-        assert!(intercom_may_start(Priority::Warning, true), "a Warning talks over the radio");
+        assert!(
+            intercom_may_start(Priority::Warning, true),
+            "a Warning talks over the radio"
+        );
         assert!(intercom_may_start(Priority::Warning, false));
     }
 

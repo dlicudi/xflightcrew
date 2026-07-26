@@ -109,7 +109,11 @@ pub fn load_tail_wav(path: &str, target_rate: u32) -> anyhow::Result<Vec<f32>> {
         hound::SampleFormat::Float => reader.samples::<f32>().filter_map(Result::ok).collect(),
         hound::SampleFormat::Int => {
             let scale = (1_i64 << (spec.bits_per_sample - 1)) as f32;
-            reader.samples::<i32>().filter_map(Result::ok).map(|s| s as f32 / scale).collect()
+            reader
+                .samples::<i32>()
+                .filter_map(Result::ok)
+                .map(|s| s as f32 / scale)
+                .collect()
         }
     };
     let mono = crate::mic::downmix(&raw, spec.channels as usize);
@@ -123,11 +127,21 @@ pub fn load_tail_wav(path: &str, target_rate: u32) -> anyhow::Result<Vec<f32>> {
     Ok(out)
 }
 
-fn radioize_core(samples: &mut Vec<f32>, sample_rate: u32, variant: u32, synth_tail: bool, quality: f32) {
+fn radioize_core(
+    samples: &mut Vec<f32>,
+    sample_rate: u32,
+    variant: u32,
+    synth_tail: bool,
+    quality: f32,
+) {
     if samples.is_empty() {
         return;
     }
-    let quality = if quality.is_finite() { quality.clamp(0.0, 1.0) } else { 1.0 };
+    let quality = if quality.is_finite() {
+        quality.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
     let fs = sample_rate as f32;
     let mut pick = Lcg::new(0x000A_11CE ^ variant.wrapping_mul(0x9E37_79B9));
     let mut noise = Lcg::new(0x5EED_CAFE ^ variant.wrapping_mul(0x85EB_CA6B));
@@ -138,7 +152,11 @@ fn radioize_core(samples: &mut Vec<f32>, sample_rate: u32, variant: u32, synth_t
     // they sit in the same spectrum. The tail is the signature sound: the
     // carrier stays up for a beat after the last word, then the receiver's
     // squelch closes with a smoothed hiss burst that cuts hard.
-    let key_click = burst(&mut noise, (fs * range(0.008, 0.018)) as usize, range(0.07, 0.16));
+    let key_click = burst(
+        &mut noise,
+        (fs * range(0.008, 0.018)) as usize,
+        range(0.07, 0.16),
+    );
     let squelch = if synth_tail {
         squelch_tail(
             &mut noise,
@@ -356,14 +374,20 @@ mod tests {
         let run = |freq: f32| {
             let mut hp = Biquad::highpass(fs, 300.0);
             let mut lp = Biquad::lowpass(fs, 3000.0);
-            let out: Vec<f32> = sine(freq, fs, 0.5).iter().map(|&x| lp.process(hp.process(x))).collect();
+            let out: Vec<f32> = sine(freq, fs, 0.5)
+                .iter()
+                .map(|&x| lp.process(hp.process(x)))
+                .collect();
             rms(&out[out.len() / 2..]) // steady state
         };
         let voice = run(1000.0);
         let rumble = run(60.0);
         let hiss = run(8000.0);
         assert!(voice > 0.25, "1 kHz should pass, rms {voice}");
-        assert!(rumble < voice * 0.1, "60 Hz should die: {rumble} vs {voice}");
+        assert!(
+            rumble < voice * 0.1,
+            "60 Hz should die: {rumble} vs {voice}"
+        );
         assert!(hiss < voice * 0.2, "8 kHz should die: {hiss} vs {voice}");
     }
 
@@ -385,7 +409,10 @@ mod tests {
         assert!((ratio - 1.0 / 0.92).abs() < 0.01, "len ratio {ratio}");
         // Linear interpolation must not add energy.
         let peak = s.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
-        assert!(peak <= 0.51, "resample must not exceed the source peak: {peak}");
+        assert!(
+            peak <= 0.51,
+            "resample must not exceed the source peak: {peak}"
+        );
     }
 
     #[test]
@@ -406,8 +433,14 @@ mod tests {
     fn shift_factor_is_never_unity_and_stays_intelligible() {
         for person in 0..64_u64 {
             let f = shift_factor(person);
-            assert!((f - 1.0).abs() >= 0.02, "person {person} got a shift nobody would hear: {f}");
-            assert!((0.9..=1.1).contains(&f), "person {person} shifted past intelligibility: {f}");
+            assert!(
+                (f - 1.0).abs() >= 0.02,
+                "person {person} got a shift nobody would hear: {f}"
+            );
+            assert!(
+                (0.9..=1.1).contains(&f),
+                "person {person} shifted past intelligibility: {f}"
+            );
             // Stable: the same person always speaks at the same pitch.
             assert_eq!(f, shift_factor(person));
         }
@@ -419,7 +452,14 @@ mod tests {
     #[test]
     fn signal_quality_maps_range_sanely() {
         // Close in: full quieting. Unknown or garbage: fail open to perfect.
-        for r in [None, Some(0.0), Some(5.0), Some(8.0), Some(f64::NAN), Some(-3.0)] {
+        for r in [
+            None,
+            Some(0.0),
+            Some(5.0),
+            Some(8.0),
+            Some(f64::NAN),
+            Some(-3.0),
+        ] {
             assert_eq!(signal_quality(r), 1.0, "range {r:?}");
         }
         // Fades monotonically with range, and bottoms out readable.
@@ -430,7 +470,11 @@ mod tests {
         );
         assert!(q20 < 1.0 && q40 < q20 && q65 < q40, "{q20} {q40} {q65}");
         assert!((signal_quality(Some(70.0)) - 0.35).abs() < 1e-4);
-        assert_eq!(signal_quality(Some(500.0)), 0.35, "floor: degraded, never unreadable");
+        assert_eq!(
+            signal_quality(Some(500.0)),
+            0.35,
+            "floor: degraded, never unreadable"
+        );
     }
 
     #[test]
@@ -440,7 +484,10 @@ mod tests {
         let mut q1 = legacy.clone();
         radioize_variant(&mut legacy, fs, 7);
         radioize_variant_q(&mut q1, fs, 7, 1.0);
-        assert_eq!(legacy, q1, "quality 1.0 must not change the strong-signal sound");
+        assert_eq!(
+            legacy, q1,
+            "quality 1.0 must not change the strong-signal sound"
+        );
     }
 
     #[test]
@@ -466,7 +513,10 @@ mod tests {
         );
         // AGC: the voice itself stays at a comparable level — SNR drops, not volume.
         let peak_weak = weak.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
-        assert!(peak_weak > 0.6, "weak signal must stay audible: {peak_weak}");
+        assert!(
+            peak_weak > 0.6,
+            "weak signal must stay audible: {peak_weak}"
+        );
     }
 
     #[test]
@@ -475,9 +525,15 @@ mod tests {
         let mut s = sine(1000.0, fs as f32, 0.3);
         let before = s.len();
         radioize(&mut s, fs);
-        assert!(s.len() > before, "key click + squelch tail extend the audio");
+        assert!(
+            s.len() > before,
+            "key click + squelch tail extend the audio"
+        );
         let peak = s.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
-        assert!(peak <= 0.9 && peak > 0.5, "normalized hot but unclipped: {peak}");
+        assert!(
+            peak <= 0.9 && peak > 0.5,
+            "normalized hot but unclipped: {peak}"
+        );
         // The squelch burst (last ~55 ms: attack + decay body) is audible
         // noise, not silence.
         let tail = &s[s.len() - (fs as usize * 55 / 1000)..];
@@ -504,7 +560,9 @@ mod tests {
     fn recorded_tail_is_spliced_clean_after_the_gap() {
         let fs = 22050;
         let mut s = sine(1000.0, fs as f32, 0.3);
-        let tail: Vec<f32> = (0..800).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let tail: Vec<f32> = (0..800)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
         let mut plain = s.clone();
         radioize_core(&mut plain, fs, 7, false, 1.0);
         radioize_with_tail(&mut s, fs, 7, &tail);
@@ -512,7 +570,10 @@ mod tests {
         // The tail is NOT band-passed or normalized with the speech: the last
         // samples are exactly the recording at the per-variant gain.
         let gain = s.last().unwrap() / tail.last().unwrap();
-        assert!((0.35..=0.55).contains(&gain.abs()), "tail gain in range: {gain}");
+        assert!(
+            (0.35..=0.55).contains(&gain.abs()),
+            "tail gain in range: {gain}"
+        );
         let spliced = &s[s.len() - tail.len()..];
         for (a, b) in spliced.iter().zip(&tail) {
             assert!((a - b * gain).abs() < 1e-6, "tail must be verbatim, scaled");

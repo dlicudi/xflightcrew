@@ -66,6 +66,7 @@ pub fn next_letter(c: char) -> char {
 }
 
 /// ICAO spelling alphabet, for the information letter.
+#[rustfmt::skip]
 pub fn nato(c: char) -> &'static str {
     match c {
         'A' => "Alpha", 'B' => "Bravo", 'C' => "Charlie", 'D' => "Delta",
@@ -156,7 +157,10 @@ pub fn report(s: &Snapshot, letter: char) -> String {
     let vis = if km >= 9.9 {
         "Visibility one zero kilometers or more".to_string()
     } else {
-        format!("Visibility {} kilometers", spoken_digits(&format!("{:.0}", km.max(1.0))))
+        format!(
+            "Visibility {} kilometers",
+            spoken_digits(&format!("{:.0}", km.max(1.0)))
+        )
     };
 
     let t = s.oat_c.round() as i64;
@@ -214,7 +218,10 @@ mod tests {
         assert!(r.starts_with("Gibraltar information Alpha."), "{r}");
         assert!(r.contains("Time one two five zero zulu"), "{r}");
         assert!(r.contains("Runway in use two seven"), "{r}");
-        assert!(r.contains("Wind two five zero degrees, one two knots"), "{r}");
+        assert!(
+            r.contains("Wind two five zero degrees, one two knots"),
+            "{r}"
+        );
         assert!(r.contains("Visibility one zero kilometers or more"), "{r}");
         assert!(r.contains("Temperature two four"), "{r}");
         assert!(r.contains("QNH one zero one eight"), "{r}");
@@ -254,7 +261,10 @@ mod tests {
             let mut cur = edition.clone();
             cur.wind_from_deg = dir;
             cur.zulu_sec += 600.0; // time never makes a new edition
-            assert!(!new_edition(&edition, &cur), "3 kt wobble to {dir} cut an edition");
+            assert!(
+                !new_edition(&edition, &cur),
+                "3 kt wobble to {dir} cut an edition"
+            );
         }
     }
 
@@ -263,7 +273,10 @@ mod tests {
         let edition = snap(); // wind 251 at 12
         let mut wind_swing = snap();
         wind_swing.wind_from_deg = 285.0;
-        assert!(new_edition(&edition, &wind_swing), "30+ degree swing at 12 kt");
+        assert!(
+            new_edition(&edition, &wind_swing),
+            "30+ degree swing at 12 kt"
+        );
         let mut wind_north = snap();
         wind_north.wind_from_deg = 5.0; // circular diff vs 251 is ~114, not ~246
         assert!(new_edition(&edition, &wind_north));

@@ -13,14 +13,12 @@ mod audio;
 mod autoland;
 mod autotakeoff;
 mod autotaxi;
-mod circuit;
-mod full_auto;
 mod cabin;
-mod radiofx;
-mod rag;
 mod checklist;
+mod circuit;
 mod config;
 mod failures;
+mod full_auto;
 mod grammar;
 mod livestate;
 mod llm;
@@ -31,17 +29,19 @@ mod phrase;
 mod plugin_status;
 mod prefs;
 mod procedure;
-mod terrain;
+mod radiofx;
+mod rag;
 mod readback;
 mod simbrief;
 mod stt;
 mod stt_eval;
 mod taxi_guide;
 mod taxi_in;
+mod terrain;
+mod tools;
 mod tts;
 #[cfg(feature = "onnx-tts")]
 mod tts_onnx;
-mod tools;
 mod ui;
 mod vad;
 mod voice;
@@ -85,7 +85,11 @@ async fn main() -> Result<()> {
         (!tui).then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(file_writer))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(file_writer),
+        )
         .with(stderr_layer)
         .init();
 
@@ -108,7 +112,11 @@ async fn main() -> Result<()> {
     // Cabin crew staffing, same precedence: explicit env > the panel's saved
     // pick > auto (the airframe profile decides). Panel-toggleable live.
     let initial_staffing = cabin::Staffing::parse(&config.cabin_crew)
-        .or_else(|| prefs::cabin_crew().as_deref().and_then(cabin::Staffing::parse))
+        .or_else(|| {
+            prefs::cabin_crew()
+                .as_deref()
+                .and_then(cabin::Staffing::parse)
+        })
         .unwrap_or(cabin::Staffing::Auto);
     cabin::set_staffing(initial_staffing);
     tracing::info!(cabin_crew = initial_staffing.as_str(), "cabin staffing");
@@ -128,7 +136,9 @@ async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("key-probe") {
         use device_query::{DeviceQuery, DeviceState};
         let ds = DeviceState::new();
-        println!("Press a key to see its name (grant Input Monitoring if prompted). Ctrl-C to quit.");
+        println!(
+            "Press a key to see its name (grant Input Monitoring if prompted). Ctrl-C to quit."
+        );
         let mut last: Vec<device_query::Keycode> = Vec::new();
         loop {
             let keys = ds.get_keys();
@@ -156,7 +166,9 @@ async fn main() -> Result<()> {
     // `cargo run -- onnx-info <model>` dumps an ONNX model's input/output signature.
     #[cfg(feature = "onnx-tts")]
     if std::env::args().nth(1).as_deref() == Some("onnx-info") {
-        let path = std::env::args().nth(2).ok_or_else(|| anyhow!("usage: x-copilot onnx-info <model.onnx>"))?;
+        let path = std::env::args()
+            .nth(2)
+            .ok_or_else(|| anyhow!("usage: x-copilot onnx-info <model.onnx>"))?;
         println!("{}", tts_onnx::inspect(&path)?);
         return Ok(());
     }
@@ -171,15 +183,18 @@ async fn main() -> Result<()> {
         });
         // Kokoro model → Kokoro engine (voice via XCOPILOT_KOKORO_VOICE); else piper.
         if config.piper_voice.contains("kokoro") {
-            let voice = std::env::var("XCOPILOT_KOKORO_VOICE").unwrap_or_else(|_| "am_michael".into());
+            let voice =
+                std::env::var("XCOPILOT_KOKORO_VOICE").unwrap_or_else(|_| "am_michael".into());
             eprintln!("kokoro: {} voice={}", config.piper_voice, voice);
             tts_onnx::KokoroTts::load(&config.piper_voice, &voice)?.speak(&text)?;
         } else {
-            eprintln!("voice: {}  (length={} noise={} noise_w={})",
+            eprintln!(
+                "voice: {}  (length={} noise={} noise_w={})",
                 config.piper_voice,
                 std::env::var("XCOPILOT_TTS_LENGTH").unwrap_or_else(|_| "model".into()),
                 std::env::var("XCOPILOT_TTS_NOISE").unwrap_or_else(|_| "model".into()),
-                std::env::var("XCOPILOT_TTS_NOISE_W").unwrap_or_else(|_| "model".into()));
+                std::env::var("XCOPILOT_TTS_NOISE_W").unwrap_or_else(|_| "model".into())
+            );
             tts_onnx::OnnxTts::load(&config.piper_voice)?.speak(&text)?;
         }
         return Ok(());
@@ -233,13 +248,16 @@ async fn main() -> Result<()> {
     // accuracy. `WHISPER_MODEL=...` switches the model under test. Offline, so it
     // uses a fixed profile (no X-Plane needed).
     if std::env::args().nth(1).as_deref() == Some("stt-eval") {
-        let manifest = std::env::args().nth(2).unwrap_or_else(|| "bench/stt_cases.yaml".to_string());
+        let manifest = std::env::args()
+            .nth(2)
+            .unwrap_or_else(|| "bench/stt_cases.yaml".to_string());
         let id = if config.aircraft.eq_ignore_ascii_case("auto") {
             "cessna_172sp".to_string()
         } else {
             config.aircraft.clone()
         };
-        let profile = aircraft::load(&id).ok_or_else(|| anyhow!("unknown aircraft profile: {id}"))?;
+        let profile =
+            aircraft::load(&id).ok_or_else(|| anyhow!("unknown aircraft profile: {id}"))?;
         return stt_eval::run(&config.whisper_model_path, &profile, &manifest);
     }
 
@@ -334,7 +352,11 @@ async fn main() -> Result<()> {
     // swap live. Only where the pick can matter — the `say` backend ignores
     // piper models entirely.
     if config.tts_backend != "say" {
-        spawn_voice_picker(config.xplane_base_url.clone(), voice.clone(), config.piper_voice.clone());
+        spawn_voice_picker(
+            config.xplane_base_url.clone(),
+            voice.clone(),
+            config.piper_voice.clone(),
+        );
     }
 
     // The panel's Settings-tab toggles (app mode, cabin-crew staffing):
@@ -364,7 +386,12 @@ async fn main() -> Result<()> {
         let base = config.xplane_base_url.clone();
         if !config.atc_airport.trim().is_empty() {
             std::thread::spawn(move || {
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
                 rt.block_on(async move {
                     let xp = XPlaneClient::new(base);
                     loop {
@@ -375,7 +402,9 @@ async fn main() -> Result<()> {
                             .map(|v| v.round() as i64);
                         if let Some((lat, lon, alt_ft)) = position(&xp).await {
                             let row = match station::active_station_in_range(lat, lon, alt_ft) {
-                                Some((airport, services)) => radio_panel_line(&airport, &services, com1),
+                                Some((airport, services)) => {
+                                    radio_panel_line(&airport, &services, com1)
+                                }
                                 // Out of range (or no station yet): the row keeps
                                 // showing where the radio actually is, nothing more.
                                 None => radio_panel_line("", &[], com1),
@@ -433,7 +462,12 @@ async fn main() -> Result<()> {
         let det_voice = voice.clone();
         let det_status = status_sink.clone();
         std::thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
             rt.block_on(async move {
                 let xp = XPlaneClient::new(base);
                 // The last ICAO shown on the panel, so it's published once and on change.
@@ -497,8 +531,15 @@ async fn main() -> Result<()> {
         let mon_status = status_sink.clone();
         let mon_cabin = cabin_state.clone();
         std::thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
-            rt.block_on(monitor::run(mon_config, mon_live, mon_voice, mon_status, mon_cabin));
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(monitor::run(
+                mon_config, mon_live, mon_voice, mon_status, mon_cabin,
+            ));
         });
     }
 
@@ -526,7 +567,12 @@ async fn main() -> Result<()> {
         let poll_base = config.xplane_base_url.clone();
         let atc_on = !config.atc_airport.trim().is_empty();
         std::thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
             rt.block_on(async move {
                 let xp = XPlaneClient::new(poll_base);
                 loop {
@@ -570,9 +616,24 @@ async fn main() -> Result<()> {
             reporter = reporter.with_status(s);
         }
         std::thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
             if let Err(e) = rt.block_on(run_session(
-                config, stt, llm, live_profile, voice, continuous, explicit, ptt, reporter, Some(cmd_rx), cabin_state,
+                config,
+                stt,
+                llm,
+                live_profile,
+                voice,
+                continuous,
+                explicit,
+                ptt,
+                reporter,
+                Some(cmd_rx),
+                cabin_state,
             )) {
                 tracing::error!("voice loop ended: {e:#}");
             }
@@ -581,7 +642,10 @@ async fn main() -> Result<()> {
         ui::run_dashboard(title, engines, commands, rx, cmd_tx)?; // blocks until the user quits
         Ok(())
     } else {
-        println!("\n  x-copilot — {} ({}). Ctrl-C to quit.\n", profile.display_name, config.listen_mode);
+        println!(
+            "\n  x-copilot — {} ({}). Ctrl-C to quit.\n",
+            profile.display_name, config.listen_mode
+        );
         let mut reporter = Reporter::plain();
         if let Some(s) = status_sink {
             reporter = reporter.with_status(s);
@@ -590,7 +654,20 @@ async fn main() -> Result<()> {
         // need a way in — same channel, same consumer.
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<String>();
         spawn_panel_request_poller(config.xplane_base_url.clone(), cmd_tx);
-        run_session(config, stt, llm, live_profile, voice, continuous, explicit, ptt, reporter, Some(cmd_rx), cabin_state).await
+        run_session(
+            config,
+            stt,
+            llm,
+            live_profile,
+            voice,
+            continuous,
+            explicit,
+            ptt,
+            reporter,
+            Some(cmd_rx),
+            cabin_state,
+        )
+        .await
     }
 }
 
@@ -640,7 +717,10 @@ fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::Sender<Stri
             };
             tracing::info!(request = v, cmd, "panel button request");
             // Consume first so a slow channel can't double-fire the request.
-            let _ = http.patch(&url).json(&serde_json::json!({ "data": 0 })).send();
+            let _ = http
+                .patch(&url)
+                .json(&serde_json::json!({ "data": 0 }))
+                .send();
             if tx.send(cmd.to_string()).is_err() {
                 return; // session gone
             }
@@ -728,7 +808,9 @@ fn spawn_voice_picker(base_url: String, voice: Voice, current_spec: String) {
                     continue;
                 }
             }
-            let Some((list_id, idx_id)) = ids else { continue };
+            let Some((list_id, idx_id)) = ids else {
+                continue;
+            };
             let picked = http
                 .get(format!("{rest}/datarefs/{idx_id}/value"))
                 .send()
@@ -743,8 +825,9 @@ fn spawn_voice_picker(base_url: String, voice: Voice, current_spec: String) {
             if v < 0 {
                 // The plugin's registered default: its state was wiped (plugin
                 // reload) while our ids stayed valid — repopulate the picker.
-                if applied >= 0 && (!patch(list_id, serde_json::json!(roster_b64))
-                    || !patch(idx_id, serde_json::json!(applied)))
+                if applied >= 0
+                    && (!patch(list_id, serde_json::json!(roster_b64))
+                        || !patch(idx_id, serde_json::json!(applied)))
                 {
                     ids = None;
                 }
@@ -891,7 +974,11 @@ enum Ptt {
     /// the transmit-switch dataref (`xcopilot/radio_ptt_active`): held = the
     /// utterance is a radio transmission for the tuned ATC station, not a
     /// copilot command. Empty = no radio PTT bound.
-    Dataref { live: std::sync::Arc<LiveState>, name: String, radio: String },
+    Dataref {
+        live: std::sync::Arc<LiveState>,
+        name: String,
+        radio: String,
+    },
 }
 
 /// The active aircraft profile, shared between the command loop, the monitor, and
@@ -922,7 +1009,8 @@ impl LiveProfile {
     }
     fn swap(&self, p: aircraft::AircraftProfile) {
         *self.inner.write().unwrap() = p;
-        self.generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1106,7 +1194,11 @@ async fn run_session(
     // the tower phrasing more than doubles it (483 → 1,047 ms median, felt as
     // sim fps dips) — cockpit commands must never pay for it.
     stt.set_prompt(stt::build_prompt(&profile));
-    stt.set_radio_prompt(format!("{} {}", stt::build_prompt(&profile), tower::STT_PROMPT));
+    stt.set_radio_prompt(format!(
+        "{} {}",
+        stt::build_prompt(&profile),
+        tower::STT_PROMPT
+    ));
     // Tool specs for the LLM = curated tools + each checklist as a no-arg "tool"
     // the loop intercepts and runs interactively.
     let mut specs = registry.specs();
@@ -1175,7 +1267,13 @@ async fn run_session(
     let mut listener = if continuous {
         // Share the speech arbiter's mic gate so the listener mutes itself while
         // the copilot speaks (readbacks and monitor alerts alike).
-        Some(Listener::start(config.vad_threshold, config.end_silence_ms, reporter.clone(), voice.mic_gate(), std::time::Duration::from_millis(config.mic_gate_tail_ms))?)
+        Some(Listener::start(
+            config.vad_threshold,
+            config.end_silence_ms,
+            reporter.clone(),
+            voice.mic_gate(),
+            std::time::Duration::from_millis(config.mic_gate_tail_ms),
+        )?)
     } else {
         None
     };
@@ -1183,7 +1281,10 @@ async fn run_session(
     // clips the start of a command. Only one of `listener`/`ptt_mic` opens the
     // device — they're mutually exclusive (continuous vs PTT).
     let ptt_mic = if ptt.is_some() {
-        Some(PttMic::start(voice.mic_gate(), std::time::Duration::from_millis(config.mic_gate_tail_ms))?)
+        Some(PttMic::start(
+            voice.mic_gate(),
+            std::time::Duration::from_millis(config.mic_gate_tail_ms),
+        )?)
     } else {
         None
     };
@@ -1217,7 +1318,11 @@ async fn run_session(
         // the monitor's ticks and the routing gates below read mode::* live.
         let now_mode = mode::get();
         if now_mode != applied_mode {
-            tracing::info!(from = applied_mode.as_str(), to = now_mode.as_str(), "mode change");
+            tracing::info!(
+                from = applied_mode.as_str(),
+                to = now_mode.as_str(),
+                "mode change"
+            );
             blackbox::record(
                 "mode",
                 serde_json::json!({ "from": applied_mode.as_str(), "to": now_mode.as_str() }),
@@ -1232,7 +1337,10 @@ async fn run_session(
                         .await;
                 }
                 let line = match atc_station.as_ref() {
-                    Some(st) => format!("ATC is on. {} is up.", station::spoken_airport(st.airport_name())),
+                    Some(st) => format!(
+                        "ATC is on. {} is up.",
+                        station::spoken_airport(st.airport_name())
+                    ),
                     None => "ATC is on, no station configured.".to_string(),
                 };
                 reporter.log(ui::LogKind::Info, line.clone());
@@ -1251,8 +1359,14 @@ async fn run_session(
                         .set_float("sim/operation/sound/radio_volume_ratio", 1.0)
                         .await;
                 }
-                reporter.log(ui::LogKind::Info, "ATC off; the radio belongs to the real world now".to_string());
-                voice.alert(Priority::Advisory, "ATC is off. Radio is all yours.".to_string());
+                reporter.log(
+                    ui::LogKind::Info,
+                    "ATC off; the radio belongs to the real world now".to_string(),
+                );
+                voice.alert(
+                    Priority::Advisory,
+                    "ATC is off. Radio is all yours.".to_string(),
+                );
             }
             // Crew side (edges only: AtcOnly is the one mode without a crew).
             if applied_mode == mode::Mode::AtcOnly && now_mode != mode::Mode::AtcOnly {
@@ -1302,7 +1416,9 @@ async fn run_session(
         // input is already captured, and a silent cockpit must still swap
         // (the Heathrow handoff sat unconsumed for minutes, 2026-07-10, and
         // the party line waited on it).
-        if let Some((icao, apt)) = party_line::take_pending_station().filter(|_| mode::atc_enabled()) {
+        if let Some((icao, apt)) =
+            party_line::take_pending_station().filter(|_| mode::atc_enabled())
+        {
             let name = apt.name.clone();
             match station::Station::from_airport(apt) {
                 Some(mut st) => {
@@ -1332,7 +1448,9 @@ async fn run_session(
                     }
                     atc_station = Some(st);
                 }
-                None => tracing::warn!(%name, "region handoff to a field without a tower; keeping the old station"),
+                None => {
+                    tracing::warn!(%name, "region handoff to a field without a tower; keeping the old station")
+                }
             }
         }
 
@@ -1354,7 +1472,10 @@ async fn run_session(
         if party_line::take_pending_go_around() {
             if let Some(st) = atc_station.as_mut() {
                 st.apply_monitor_go_around();
-                reporter.log(ui::LogKind::Info, "tower: go-around ordered, landing clearance void");
+                reporter.log(
+                    ui::LogKind::Info,
+                    "tower: go-around ordered, landing clearance void",
+                );
             }
         }
 
@@ -1374,14 +1495,20 @@ async fn run_session(
                         // Both sides logged so the full ATC transcript shows in
                         // the log, not just the panel.
                         tracing::info!(target: "x_copilot::radio", copilot = %call, "tx");
-                        say(&voice, &reporter, ui::LogKind::Readback, &format!("{call}."));
+                        say(
+                            &voice,
+                            &reporter,
+                            ui::LogKind::Readback,
+                            &format!("{call}."),
+                        );
                         if let Some((reply, who)) = st
                             .handle_transmission(&call.to_ascii_lowercase(), xplane.view())
                             .await
                         {
                             if !reply.is_empty() {
                                 tracing::info!(target: "x_copilot::radio", station = %who.tag(), reply = %reply, "rx");
-                                reporter.log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
+                                reporter
+                                    .log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
                                 voice.say_station(Priority::Readback, who, &reply);
                             }
                         }
@@ -1420,7 +1547,11 @@ async fn run_session(
             checklists = checklist::load(&profile).unwrap_or_default();
             manual_index = rag::Index::load(&profile.id);
             stt.set_prompt(stt::build_prompt(&profile));
-            stt.set_radio_prompt(format!("{} {}", stt::build_prompt(&profile), tower::STT_PROMPT));
+            stt.set_radio_prompt(format!(
+                "{} {}",
+                stt::build_prompt(&profile),
+                tower::STT_PROMPT
+            ));
             specs = registry.specs();
             specs.extend(checklists.iter().map(|c| c.spec()));
             tracing::info!(aircraft = %profile.display_name, "reconfigured for new aircraft");
@@ -1440,7 +1571,13 @@ async fn run_session(
                     // Recover non-value actions first (e.g. restart after a shutdown).
                     for (tname, targs) in &snap.inverse {
                         if let Some(tool) = registry.get(tname) {
-                            let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice), status: reporter.status_sink(), reminders: Some(&reminders) };
+                            let ctx = ToolCtx {
+                                xplane: &xplane,
+                                config: &config,
+                                voice: Some(&voice),
+                                status: reporter.status_sink(),
+                                reminders: Some(&reminders),
+                            };
                             if tool.execute(targs, &ctx).await.is_ok() {
                                 acts.push(recovery_label(tname));
                             }
@@ -1448,7 +1585,12 @@ async fn run_session(
                     }
                     // Disengage the autopilot before resetting its dials — stop the
                     // aircraft flying the wrong thing first. servos_off_any is clean.
-                    if snap.disengage_ap && xplane.run_command("sim/autopilot/servos_off_any").await.is_ok() {
+                    if snap.disengage_ap
+                        && xplane
+                            .run_command("sim/autopilot/servos_off_any")
+                            .await
+                            .is_ok()
+                    {
                         acts.push("autopilot disengaged".to_string());
                     }
                     for (dr, label, old, is_int) in &snap.reverts {
@@ -1478,8 +1620,12 @@ async fn run_session(
         // (2026-07-13). The copilot is in the wreck too; they answer on the
         // intercom, and the world stays silent until the flight resets.
         if from_radio && voice.crashed() {
-            say(&voice, &reporter, ui::LogKind::Warn,
-                "Nobody's reading us. The airplane's wrecked, that radio is gone.");
+            say(
+                &voice,
+                &reporter,
+                ui::LogKind::Warn,
+                "Nobody's reading us. The airplane's wrecked, that radio is gone.",
+            );
             continue;
         }
 
@@ -1488,8 +1634,12 @@ async fn run_session(
         // replayed positions (a replayed crash landing earned a compliance
         // berate, 2026-07-14). The copilot is still on the intercom.
         if from_radio && voice.replay() {
-            say(&voice, &reporter, ui::LogKind::Warn,
-                "We're in replay, nobody's on the air. Go back to live and I'll key it.");
+            say(
+                &voice,
+                &reporter,
+                ui::LogKind::Warn,
+                "We're in replay, nobody's on the air. Go back to live and I'll key it.",
+            );
             continue;
         }
 
@@ -1498,8 +1648,12 @@ async fn run_session(
         // would land on positions that aren't advancing). The copilot is
         // crew on the intercom and still answers.
         if from_radio && voice.paused() {
-            say(&voice, &reporter, ui::LogKind::Warn,
-                "Sim's paused, the radio call can wait. Unpause and I'll key it.");
+            say(
+                &voice,
+                &reporter,
+                ui::LogKind::Warn,
+                "Sim's paused, the radio call can wait. Unpause and I'll key it.",
+            );
             continue;
         }
 
@@ -1512,8 +1666,12 @@ async fn run_session(
         // confident avionics-off read. Before the confidence gate, so a garbled
         // dead-radio press can't earn the tower's "say again" either.
         if from_radio && !voice.radio_powered() {
-            say(&voice, &reporter, ui::LogKind::Warn,
-                "Radios are dead — we're not transmitting. Check the avionics master.");
+            say(
+                &voice,
+                &reporter,
+                ui::LogKind::Warn,
+                "Radios are dead — we're not transmitting. Check the avionics master.",
+            );
             continue;
         }
 
@@ -1541,12 +1699,19 @@ async fn run_session(
                             continue;
                         }
                     }
-                    reporter.log(ui::LogKind::Info, "garbled transmission, nobody on frequency");
+                    reporter.log(
+                        ui::LogKind::Info,
+                        "garbled transmission, nobody on frequency",
+                    );
                     continue;
                 }
                 if explicit && mode::copilot_enabled() {
-                    say(&voice, &reporter, ui::LogKind::Info,
-                        readback::one_of(&["Say again?", "Didn't catch that.", "One more time?"]));
+                    say(
+                        &voice,
+                        &reporter,
+                        ui::LogKind::Info,
+                        readback::one_of(&["Say again?", "Didn't catch that.", "One more time?"]),
+                    );
                 } else {
                     reporter.log(ui::LogKind::Info, "low confidence, ignored");
                 }
@@ -1572,7 +1737,10 @@ async fn run_session(
                 continue;
             }
             if let Some(st) = atc_station.as_mut() {
-                if let Some((reply, who)) = st.handle_transmission(&command.to_ascii_lowercase(), xplane.view()).await {
+                if let Some((reply, who)) = st
+                    .handle_transmission(&command.to_ascii_lowercase(), xplane.view())
+                    .await
+                {
                     // Empty reply = a readback the controller accepted; a real
                     // frequency stays quiet, so we do too.
                     if reply.is_empty() {
@@ -1606,10 +1774,7 @@ async fn run_session(
                     format!("No answer there. {}", void_briefing(&xplane, st).await)
                 } else {
                     match xplane.get_float(datarefs::COM1_FREQ_KHZ).await {
-                        Ok(v) => format!(
-                            "No answer on {}.",
-                            atis::spoken_mhz(v.round() as i64)
-                        ),
+                        Ok(v) => format!("No answer on {}.", atis::spoken_mhz(v.round() as i64)),
                         Err(_) => "No answer there.".to_string(),
                     }
                 };
@@ -1701,10 +1866,21 @@ async fn run_session(
                         serde_json::json!({ "resume": true })
                     };
                     tracing::info!(stop = stopish, "governor stop/go word, pre-gate");
-                    let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice), status: reporter.status_sink(), reminders: Some(&reminders) };
+                    let ctx = ToolCtx {
+                        xplane: &xplane,
+                        config: &config,
+                        voice: Some(&voice),
+                        status: reporter.status_sink(),
+                        reminders: Some(&reminders),
+                    };
                     match tool.execute(&args, &ctx).await {
                         Ok(line) => say(&voice, &reporter, ui::LogKind::Readback, &line),
-                        Err(e) => say(&voice, &reporter, ui::LogKind::Warn, &format!("Tried, but: {e:#}")),
+                        Err(e) => say(
+                            &voice,
+                            &reporter,
+                            ui::LogKind::Warn,
+                            &format!("Tried, but: {e:#}"),
+                        ),
                     }
                     continue;
                 }
@@ -1776,9 +1952,7 @@ async fn run_session(
         // unreliable here (it had the fuel in its context and still said "I don't
         // have fuel information"). A fuel question reads the datarefs and is spoken
         // straight back.
-        if is_fuel_query(&command)
-            && grammar::try_parse(&command, &registry, &profile).is_none()
-        {
+        if is_fuel_query(&command) && grammar::try_parse(&command, &registry, &profile).is_none() {
             // The landing-fuel projection needs the destination, which is only
             // populated by a plan fetch — after a restart it's empty until
             // something asks. Prime it (cached, cheap) so "will we have enough
@@ -1786,7 +1960,8 @@ async fn run_session(
             if !config.simbrief_id.trim().is_empty() {
                 let _ = ensure_plan(&config, &mut fp_cache, false).await;
             }
-            let line = fuel_report(&xplane, &profile, Some(&live), is_endurance_query(&command)).await;
+            let line =
+                fuel_report(&xplane, &profile, Some(&live), is_endurance_query(&command)).await;
             say(&voice, &reporter, ui::LogKind::Readback, &line);
             continue;
         }
@@ -1811,8 +1986,12 @@ async fn run_session(
                 voice.say_cabin(Priority::Readback, &reply);
                 reporter.status(ui::Phase::Listening);
             } else {
-                say(&voice, &reporter, ui::LogKind::Readback,
-                    "No cabin crew on this airframe. It's just us up front.");
+                say(
+                    &voice,
+                    &reporter,
+                    ui::LogKind::Readback,
+                    "No cabin crew on this airframe. It's just us up front.",
+                );
             }
             continue;
         }
@@ -1820,9 +1999,7 @@ async fn run_session(
         // answered deterministically off the published taxi route — the FO
         // reading the airport diagram, never the LLM. Position reads happen
         // BEFORE the route lock: no guard held across an await.
-        if is_taxi_query(&command)
-            && grammar::try_parse(&command, &registry, &profile).is_none()
-        {
+        if is_taxi_query(&command) && grammar::try_parse(&command, &registry, &profile).is_none() {
             let pos = match (
                 xplane.get_float(datarefs::LATITUDE).await,
                 xplane.get_float(datarefs::LONGITUDE).await,
@@ -1830,21 +2007,16 @@ async fn run_session(
                 (Ok(lat), Ok(lon)) => Some((lat, lon)),
                 _ => None,
             };
-            let line = party_line::with_taxi_route(|route| {
-                match (route, pos) {
-                    (Some(w), Some((lat, lon))) => taxi_guide::describe(w, lat, lon),
-                    (Some(w), None) if !w.via.is_empty() => {
-                        format!("The cleared route is via {}.", w.via)
-                    }
-                    (Some(_), None) => {
-                        "We have a taxi clearance, but I can't read our position right now."
-                            .to_string()
-                    }
-                    (None, _) => {
-                        "We don't have a taxi clearance yet. Call the tower and request taxi."
-                            .to_string()
-                    }
+            let line = party_line::with_taxi_route(|route| match (route, pos) {
+                (Some(w), Some((lat, lon))) => taxi_guide::describe(w, lat, lon),
+                (Some(w), None) if !w.via.is_empty() => {
+                    format!("The cleared route is via {}.", w.via)
                 }
+                (Some(_), None) => {
+                    "We have a taxi clearance, but I can't read our position right now.".to_string()
+                }
+                (None, _) => "We don't have a taxi clearance yet. Call the tower and request taxi."
+                    .to_string(),
             });
             say(&voice, &reporter, ui::LogKind::Readback, &line);
             continue;
@@ -1874,26 +2046,40 @@ async fn run_session(
                 let circuit_flying = circuit::ACTIVE.load(Relaxed);
                 let procedure_flying = procedure::ACTIVE.load(Relaxed);
                 let full_auto_running = full_auto::ACTIVE.load(Relaxed);
-                if (speed_held || mix_held || reverse_in || taxi_driving || takeoff_flying
-                    || circuit_flying || procedure_flying || full_auto_running)
+                if (speed_held
+                    || mix_held
+                    || reverse_in
+                    || taxi_driving
+                    || takeoff_flying
+                    || circuit_flying
+                    || procedure_flying
+                    || full_auto_running)
                     && release_intent(&tl)
                 {
                     let names_mix = tl.contains("mixture") || tl.contains("mix");
-                    let names_speed = tl.contains("throttle") || tl.contains("speed")
-                        || tl.contains("power") || tl.contains("taxi") || tl.contains("thr");
+                    let names_speed = tl.contains("throttle")
+                        || tl.contains("speed")
+                        || tl.contains("power")
+                        || tl.contains("taxi")
+                        || tl.contains("thr");
                     // The steering half of an auto taxi, releasable on its
                     // own: "my steering" keeps the speed hold — the
                     // pre-existing "you steer, I have the throttle" split.
-                    let names_steer = tl.contains("steer") || tl.contains("pedal")
-                        || tl.contains("rudder") || tl.contains("nosewheel");
+                    let names_steer = tl.contains("steer")
+                        || tl.contains("pedal")
+                        || tl.contains("rudder")
+                        || tl.contains("nosewheel");
                     let names_reverse = tl.contains("reverse");
                     // "Release parking brake" names a lever NOBODY here holds:
                     // it's for the brake tool, so it must not count as a
                     // generic release — that dropped the speed hold instead
                     // and left the throttle up with the brake still set
                     // (SR22, 2026-07-11).
-                    let generic = !names_mix && !names_speed && !names_reverse
-                        && !names_steer && !tl.contains("brake");
+                    let generic = !names_mix
+                        && !names_speed
+                        && !names_reverse
+                        && !names_steer
+                        && !tl.contains("brake");
                     let mut released: Vec<&str> = Vec::new();
                     // Full auto owns the entire chain (engine, taxi, line-up,
                     // circuit); cancelling it stands them all down and wins the
@@ -1906,14 +2092,21 @@ async fn run_session(
                     // (takeoff or autoland); aborting it stands them ALL down,
                     // so it wins the generic release and the per-loop branches
                     // below are skipped (they'd double up on its sub-loops).
-                    if !full_auto_running && circuit_flying && (names_speed || names_steer || generic) {
+                    if !full_auto_running
+                        && circuit_flying
+                        && (names_speed || names_steer || generic)
+                    {
                         circuit::abort();
                         released.push("circuit off, your aircraft");
                     }
                     // A published-procedure follower is airborne on the AP (it
                     // aborts its autoland handoff too); a lever-shaped or generic
                     // release hands it back.
-                    if !full_auto_running && !circuit_flying && procedure_flying && (names_speed || generic) {
+                    if !full_auto_running
+                        && !circuit_flying
+                        && procedure_flying
+                        && (names_speed || generic)
+                    {
                         procedure::abort();
                         released.push("procedure off, your aircraft");
                     }
@@ -1921,11 +2114,19 @@ async fn run_session(
                     // a reject — the loop stands down silently, steering
                     // expires, and the power stays set for the pilot now
                     // flying it ("abort takeoff" is the arresting path).
-                    if !circuit_flying && !full_auto_running && takeoff_flying && (names_speed || names_steer || generic) {
+                    if !circuit_flying
+                        && !full_auto_running
+                        && takeoff_flying
+                        && (names_speed || names_steer || generic)
+                    {
                         autotakeoff::ACTIVE.store(false, Relaxed);
                         released.push("your takeoff, power is set");
                     }
-                    if !circuit_flying && !full_auto_running && taxi_driving && (names_speed || names_steer || generic) {
+                    if !circuit_flying
+                        && !full_auto_running
+                        && taxi_driving
+                        && (names_speed || names_steer || generic)
+                    {
                         autotaxi::ACTIVE.store(false, Relaxed);
                         if names_steer && !names_speed && !generic {
                             released.push("steering's yours, I still have the speed");
@@ -2055,9 +2256,14 @@ async fn run_session(
             // "do we have a reminder set?"). Checked before set_reminder so "cancel"
             // wins over arming.
             if tl.contains("reminder") {
-                if tl.contains("cancel") || tl.contains("clear") || tl.contains("forget")
-                    || tl.contains("remove") || tl.contains("delete") || tl.contains("scrap")
-                    || tl.contains("never mind") || tl.contains("nevermind")
+                if tl.contains("cancel")
+                    || tl.contains("clear")
+                    || tl.contains("forget")
+                    || tl.contains("remove")
+                    || tl.contains("delete")
+                    || tl.contains("scrap")
+                    || tl.contains("never mind")
+                    || tl.contains("nevermind")
                 {
                     let n = reminders.cancel_all();
                     let line = match n {
@@ -2071,8 +2277,12 @@ async fn run_session(
                 // A mention of reminders with no arming cue is a recall ("do we have a
                 // reminder?"). If it names a condition ("set a reminder to wake me at
                 // 5000 feet"), fall through to arm it instead.
-                let arming = tl.contains("wake") || tl.contains("descent") || tl.contains("feet")
-                    || tl.contains("altitude") || tl.contains("minute") || tl.contains("waypoint")
+                let arming = tl.contains("wake")
+                    || tl.contains("descent")
+                    || tl.contains("feet")
+                    || tl.contains("altitude")
+                    || tl.contains("minute")
+                    || tl.contains("waypoint")
                     || tl.contains("reach");
                 if !arming {
                     let list = reminders.active();
@@ -2124,8 +2334,12 @@ async fn run_session(
             // arm, not a status query to answer now. Let it fall through to the tool
             // layer so it doesn't get hijacked by the nav-progress branch below (both
             // mention "next waypoint").
-            let is_reminder = tl.contains("wake") || tl.contains("remind") || tl.contains("notify")
-                || tl.contains("let me know") || tl.contains("tell me when") || tl.contains("heads up");
+            let is_reminder = tl.contains("wake")
+                || tl.contains("remind")
+                || tl.contains("notify")
+                || tl.contains("let me know")
+                || tl.contains("tell me when")
+                || tl.contains("heads up");
             // Time/distance to top of descent ("how long before TOD"). Guarded by
             // is_reminder so "wake me at top of descent" still arms the reminder.
             // "top of descent" is reliably misheard ("when is top of descent" came in
@@ -2135,7 +2349,9 @@ async fn run_session(
             if !is_reminder
                 && ((tl.contains("top") && tl.contains("descent"))
                     || tl.contains("t o d")
-                    || tl.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "tod"))
+                    || tl
+                        .split(|c: char| !c.is_ascii_alphanumeric())
+                        .any(|w| w == "tod"))
             {
                 let line = time_to_tod(&config, &xplane, &mut fp_cache).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
@@ -2145,11 +2361,21 @@ async fn run_session(
             // distance to the destination airport over groundspeed. Needs a destination
             // cue plus a time cue, so it beats the next-waypoint branch below.
             if !is_reminder
-                && (tl.contains("land") || tl.contains("destination") || tl.contains("arrive")
-                    || tl.contains("arrival") || tl.contains("get there") || tl.contains("get in")
-                    || tl.contains("en route") || tl.contains("enroute") || tl.contains("on route"))
-                && (tl.contains("time") || tl.contains("eta") || tl.contains("when")
-                    || tl.contains("how long") || tl.contains("estimat") || tl.contains("remaining"))
+                && (tl.contains("land")
+                    || tl.contains("destination")
+                    || tl.contains("arrive")
+                    || tl.contains("arrival")
+                    || tl.contains("get there")
+                    || tl.contains("get in")
+                    || tl.contains("en route")
+                    || tl.contains("enroute")
+                    || tl.contains("on route"))
+                && (tl.contains("time")
+                    || tl.contains("eta")
+                    || tl.contains("when")
+                    || tl.contains("how long")
+                    || tl.contains("estimat")
+                    || tl.contains("remaining"))
             {
                 let line = eta_to_destination(&config, &xplane, &mut fp_cache).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
@@ -2159,13 +2385,18 @@ async fn run_session(
             // never the LLM (which answered "9999 feet": our own cruise altitude).
             if !is_reminder
                 && (tl.contains("destination") || tl.contains("arrival"))
-                && (tl.contains("altitude") || tl.contains("elevation") || tl.contains("height")
+                && (tl.contains("altitude")
+                    || tl.contains("elevation")
+                    || tl.contains("height")
                     || tl.contains("how high"))
             {
                 if !config.simbrief_id.trim().is_empty() {
                     let _ = ensure_plan(&config, &mut fp_cache, false).await;
                 }
-                let dest = monitor::DESTINATION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let dest = monitor::DESTINATION
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 let line = match dest {
                     Some(d) => format!(
                         "Field elevation at the destination is about {:.0} feet.",
@@ -2180,8 +2411,12 @@ async fn run_session(
             // (which once invented "runway 18" at a field that only has 10/28).
             if !is_reminder
                 && tl.contains("runway")
-                && (tl.contains("which") || tl.contains("what") || tl.contains("should")
-                    || tl.contains("use") || tl.contains("best") || tl.contains("active")
+                && (tl.contains("which")
+                    || tl.contains("what")
+                    || tl.contains("should")
+                    || tl.contains("use")
+                    || tl.contains("best")
+                    || tl.contains("active")
                     || tl.contains("recommend"))
             {
                 reporter.status(ui::Phase::Thinking);
@@ -2192,8 +2427,10 @@ async fn run_session(
             // "Are we good for landing?" — the landing-config check. Phrased as a
             // question so "set flaps for landing" (a command) never lands here.
             if !is_reminder
-                && (tl.contains("good for landing") || tl.contains("ready for landing")
-                    || tl.contains("ready to land") || tl.contains("good to land")
+                && (tl.contains("good for landing")
+                    || tl.contains("ready for landing")
+                    || tl.contains("ready to land")
+                    || tl.contains("good to land")
                     || (tl.contains("landing") && tl.contains("are we")))
             {
                 let line = landing_readiness(&xplane, &profile).await;
@@ -2204,8 +2441,11 @@ async fn run_session(
             // answers. Guarded so light *commands* ("nav lights on") never match.
             if !is_reminder
                 && (tl.contains("light") || tl.contains("configur"))
-                && (tl.contains("need") || tl.contains("should") || tl.contains("do we")
-                    || tl.contains("are we") || tl.contains("anything"))
+                && (tl.contains("need")
+                    || tl.contains("should")
+                    || tl.contains("do we")
+                    || tl.contains("are we")
+                    || tl.contains("anything"))
             {
                 let line = config_advice(&xplane, &profile).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
@@ -2220,7 +2460,9 @@ async fn run_session(
             // "Are we on course / on track?" — HSI deviation + waypoint, computed
             // (the LLM once answered this with the single word "heading").
             if !is_reminder
-                && (tl.contains("on course") || tl.contains("off course") || tl.contains("on track"))
+                && (tl.contains("on course")
+                    || tl.contains("off course")
+                    || tl.contains("on track"))
             {
                 let line = on_course_report(&xplane, Some(&live)).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
@@ -2229,8 +2471,12 @@ async fn run_session(
             // Navigation progress (often a command, not a question): ETA / distance /
             // time to the next waypoint.
             if !is_reminder
-                && (tl.contains("next waypoint") || tl.contains("next fix") || tl.contains("eta")
-                    || tl.contains("how far") || tl.contains("time to") || tl.contains("distance to"))
+                && (tl.contains("next waypoint")
+                    || tl.contains("next fix")
+                    || tl.contains("eta")
+                    || tl.contains("how far")
+                    || tl.contains("time to")
+                    || tl.contains("distance to"))
             {
                 let line = nav_progress(&xplane, Some(&live)).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
@@ -2242,10 +2488,15 @@ async fn run_session(
             // Load the SimBrief route into the GPS/FMS (checked before the brief, so
             // "load the flight plan" loads rather than just reading it back).
             let wants_load = (tl.contains("load") || tl.contains("program") || tl.contains("send"))
-                && (routeish || tl.contains("plan") || tl.contains("gps") || tl.contains("fms") || tl.contains("flight"));
+                && (routeish
+                    || tl.contains("plan")
+                    || tl.contains("gps")
+                    || tl.contains("fms")
+                    || tl.contains("flight"));
             if wants_load {
                 reporter.status(ui::Phase::Thinking);
-                let refresh = tl.contains("refresh") || tl.contains("reload") || tl.contains("update");
+                let refresh =
+                    tl.contains("refresh") || tl.contains("reload") || tl.contains("update");
                 let line = load_route_to_fms(&config, &xplane, &mut fp_cache, refresh).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
@@ -2257,16 +2508,24 @@ async fn run_session(
             let nav_intent = tl.contains("navigate")
                 || tl.contains("follow")
                 || tl.contains("track")
-                || tl.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "fly");
+                || tl
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|w| w == "fly");
             let is_plan = !nav_intent
-                && (tl.contains("flight plan") || tl.contains("simbrief") || tl.contains("fetch the plan")
-                    || tl.contains("where are we going") || tl.contains("where are we headed")
-                    || (routeish && (tl.contains("our") || tl.contains("the") || tl.contains("what"))));
+                && (tl.contains("flight plan")
+                    || tl.contains("simbrief")
+                    || tl.contains("fetch the plan")
+                    || tl.contains("where are we going")
+                    || tl.contains("where are we headed")
+                    || (routeish
+                        && (tl.contains("our") || tl.contains("the") || tl.contains("what"))));
             if is_plan {
                 reporter.status(ui::Phase::Thinking);
-                let refresh = tl.contains("refresh") || tl.contains("reload") || tl.contains("update");
+                let refresh =
+                    tl.contains("refresh") || tl.contains("reload") || tl.contains("update");
                 let want_route = routeish;
-                let line = flight_plan_report(&config, &xplane, &mut fp_cache, refresh, want_route).await;
+                let line =
+                    flight_plan_report(&config, &xplane, &mut fp_cache, refresh, want_route).await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
@@ -2305,8 +2564,12 @@ async fn run_session(
         // live in the G1000 172, 2026-07-14). Joined into `parsed` so whisper's
         // habitual trailing "?" doesn't shunt a match down the question path.
         let parsed = grammar::try_parse(&matchable, &registry, &profile).or_else(|| {
-            checklist::match_request(&matchable, &checklists)
-                .map(|cl| vec![llm::ToolCall { name: cl.id.clone(), arguments: serde_json::json!({}) }])
+            checklist::match_request(&matchable, &checklists).map(|cl| {
+                vec![llm::ToolCall {
+                    name: cl.id.clone(),
+                    arguments: serde_json::json!({}),
+                }]
+            })
         });
         let opener_q = looks_like_question(matchable.trim_end_matches(['?', '.', ' ']));
         let is_question = looks_like_question(&matchable) && (opener_q || parsed.is_none());
@@ -2316,7 +2579,9 @@ async fn run_session(
         if is_question {
             // A turbine (jet) reports N1/N2/ITT, not the piston RPM/CHT metrics.
             let turbine = !profile.engine && profile.throttle;
-            if let Some(answer) = answer_state_query(&matchable, &xplane, Some(&live), turbine).await {
+            if let Some(answer) =
+                answer_state_query(&matchable, &xplane, Some(&live), turbine).await
+            {
                 say(&voice, &reporter, ui::LogKind::Readback, &answer);
                 continue;
             }
@@ -2371,7 +2636,11 @@ async fn run_session(
             _ => config.llm_enabled,
         };
         let calls = if let Some(c) = fast {
-            tracing::info!(path = "fast", tool = c.first().map(|x| x.name.as_str()).unwrap_or(""), "command path");
+            tracing::info!(
+                path = "fast",
+                tool = c.first().map(|x| x.name.as_str()).unwrap_or(""),
+                "command path"
+            );
             c
         } else if llm_enabled_now {
             // Fast-path missed and the LLM is enabled: ANSWER-ONLY fallback. It is
@@ -2380,7 +2649,11 @@ async fn run_session(
             // answer; anything else gets "Say again?". Never an action on a guess.
             let ts = Instant::now();
             let snap = state_snapshot(&xplane, &profile, Some(&live)).await;
-            tracing::info!(ms = ts.elapsed().as_millis(), state = snap.as_deref().unwrap_or("(none)"), "state snapshot");
+            tracing::info!(
+                ms = ts.elapsed().as_millis(),
+                state = snap.as_deref().unwrap_or("(none)"),
+                "state snapshot"
+            );
             // Ground the answer in the manuals, when indexed: POM excerpts first
             // (aircraft-specific beats general), then the shared FAA-handbook
             // index for what no POM covers. Two small embedding calls, worst case.
@@ -2397,8 +2670,14 @@ async fn run_session(
             }
             let excerpts = (!excerpt_parts.is_empty()).then(|| excerpt_parts.join("\n---\n"));
             let t = Instant::now();
-            let answer = llm.answer(&command, &ctx_history, snap.as_deref(), excerpts.as_deref()).await;
-            tracing::info!(ms = t.elapsed().as_millis(), path = "llm-answer", "command path");
+            let answer = llm
+                .answer(&command, &ctx_history, snap.as_deref(), excerpts.as_deref())
+                .await;
+            tracing::info!(
+                ms = t.elapsed().as_millis(),
+                path = "llm-answer",
+                "command path"
+            );
             match answer {
                 Ok(Some(text)) => say(&voice, &reporter, ui::LogKind::Readback, &text),
                 Ok(None) => {
@@ -2452,7 +2731,10 @@ async fn run_session(
                 call.arguments = serde_json::json!({});
             }
             tracing::info!(tool = %call.name, args = %call.arguments, "tool selected");
-            reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
+            reporter.log(
+                ui::LogKind::Tool,
+                format!("{} {}", call.name, call.arguments),
+            );
 
             // A checklist isn't a one-shot tool — the copilot runs it: reads each
             // item, does the ones it can, calls out the pilot's. Needs the voice,
@@ -2461,7 +2743,20 @@ async fn run_session(
             // one and ignore any other calls the LLM returned in the same turn
             // (guards against chaining through several checklists at once).
             if let Some(cl) = checklists.iter().find(|c| c.id == call.name) {
-                run_checklist(cl, &xplane, &config, &mut listener, &ptt_mic, &stt, &ptt, typed.as_ref(), &voice, &reporter, &interrupt).await;
+                run_checklist(
+                    cl,
+                    &xplane,
+                    &config,
+                    &mut listener,
+                    &ptt_mic,
+                    &stt,
+                    &ptt,
+                    typed.as_ref(),
+                    &voice,
+                    &reporter,
+                    &interrupt,
+                )
+                .await;
                 break;
             }
 
@@ -2471,7 +2766,12 @@ async fn run_session(
             let proceed = 'confirm: loop {
                 let Some(tool) = registry.get(&call.name) else {
                     tracing::warn!("LLM picked unknown tool: {}", call.name);
-                    say(&voice, &reporter, ui::LogKind::Warn, "That command isn't wired up yet.");
+                    say(
+                        &voice,
+                        &reporter,
+                        ui::LogKind::Warn,
+                        "That command isn't wired up yet.",
+                    );
                     break 'confirm false;
                 };
                 let intent = if config.confirm_critical {
@@ -2479,12 +2779,25 @@ async fn run_session(
                 } else {
                     None
                 };
-                let Some(intent) = intent else { break 'confirm true };
+                let Some(intent) = intent else {
+                    break 'confirm true;
+                };
 
-                say(&voice, &reporter, ui::LogKind::Confirm, &format!("Confirm, {intent}?"));
+                say(
+                    &voice,
+                    &reporter,
+                    ui::LogKind::Confirm,
+                    &format!("Confirm, {intent}?"),
+                );
                 reporter.status(ui::Phase::Listening);
-                let Some((reply, _)) = listen_once(&mut listener, &ptt_mic, &stt, &ptt, None) else {
-                    say(&voice, &reporter, ui::LogKind::Warn, "Cancelled, no confirmation heard.");
+                let Some((reply, _)) = listen_once(&mut listener, &ptt_mic, &stt, &ptt, None)
+                else {
+                    say(
+                        &voice,
+                        &reporter,
+                        ui::LogKind::Warn,
+                        "Cancelled, no confirmation heard.",
+                    );
                     break 'confirm false;
                 };
                 if is_affirmative(&reply.text) {
@@ -2500,10 +2813,21 @@ async fn run_session(
                         if state.is_none() {
                             state = state_snapshot(&xplane, &profile, Some(&live)).await;
                         }
-                        match llm.choose_tool(&format!("{command}, {correction}"), &specs, &ctx_history, state.as_deref()).await {
+                        match llm
+                            .choose_tool(
+                                &format!("{command}, {correction}"),
+                                &specs,
+                                &ctx_history,
+                                state.as_deref(),
+                            )
+                            .await
+                        {
                             Ok(mut cs) if !cs.is_empty() => {
                                 call = cs.remove(0);
-                                reporter.log(ui::LogKind::Tool, format!("{} {}", call.name, call.arguments));
+                                reporter.log(
+                                    ui::LogKind::Tool,
+                                    format!("{} {}", call.name, call.arguments),
+                                );
                                 continue 'confirm;
                             }
                             _ => {
@@ -2524,7 +2848,9 @@ async fn run_session(
 
             // Execute the curated tool (writes the dataref + reads back).
             reporter.status(ui::Phase::Thinking);
-            let Some(tool) = registry.get(&call.name) else { continue };
+            let Some(tool) = registry.get(&call.name) else {
+                continue;
+            };
             // Snapshot the datarefs this tool is about to change, so "belay that"
             // can put them back. Captured before the write; stored only if the write
             // succeeds. Tools with no reversible dataref (engine start, pushback)
@@ -2607,7 +2933,13 @@ async fn run_session(
                 };
                 sink.callout(&text);
             }
-            let ctx = ToolCtx { xplane: &xplane, config: &config, voice: Some(&voice), status: reporter.status_sink(), reminders: Some(&reminders) };
+            let ctx = ToolCtx {
+                xplane: &xplane,
+                config: &config,
+                voice: Some(&voice),
+                status: reporter.status_sink(),
+                reminders: Some(&reminders),
+            };
             // Execute, retrying once on error: a single transient blip (a dropped
             // Web API request, including the autopilot-engage commands the client
             // doesn't itself retry) shouldn't fail an action. Every tool is safe to
@@ -2642,7 +2974,12 @@ async fn run_session(
             // rolling fast (takeoff/landing roll) clips the crew to bare callouts.
             let busy = live.get(datarefs::ON_GROUND_ANY).is_some_and(|v| v > 0.5)
                 && live.get(datarefs::AIRSPEED_KTS).is_some_and(|v| v > 40.0);
-            say(&voice, &reporter, ui::LogKind::Readback, &readback::vary_ack(&readback, busy));
+            say(
+                &voice,
+                &reporter,
+                ui::LogKind::Readback,
+                &readback::vary_ack(&readback, busy),
+            );
             // Glance done — return the camera to where it was before the snap (the
             // readback just played, so you've seen the switch move).
             if let Some(head) = restore_view {
@@ -2716,8 +3053,19 @@ async fn run_checklist(
     use std::sync::atomic::Ordering;
     // Start clean — only a press *during* this run should stop it.
     interrupt.store(false, Ordering::Relaxed);
-    say(voice, reporter, ui::LogKind::Info, &format!("Running the {} checklist.", cl.title));
-    let ctx = ToolCtx { xplane, config, voice: Some(voice), status: reporter.status_sink(), reminders: None };
+    say(
+        voice,
+        reporter,
+        ui::LogKind::Info,
+        &format!("Running the {} checklist.", cl.title),
+    );
+    let ctx = ToolCtx {
+        xplane,
+        config,
+        voice: Some(voice),
+        status: reporter.status_sink(),
+        reminders: None,
+    };
     let mut failed = 0usize;
     let mut aborted = false;
     for item in &cl.items {
@@ -2743,7 +3091,12 @@ async fn run_checklist(
             // The pilot's item — call it out, don't perform it.
             Item::CallOut(text) => say(voice, reporter, ui::LogKind::Confirm, text),
             // The copilot's item — do it, then read the item back (or flag it).
-            Item::Act { say: line, tool, args, confirm } => {
+            Item::Act {
+                say: line,
+                tool,
+                args,
+                confirm,
+            } => {
                 // Destructive step — ask first. Yes does it; "stop/abort/cancel"
                 // aborts the whole checklist; anything else just skips this step.
                 // Exception: mixture-to-cutoff only stops a *running* engine, so
@@ -2757,7 +3110,12 @@ async fn run_checklist(
                 };
                 if ask {
                     let hazard = confirm.expect("ask implies a confirm hazard");
-                    say(voice, reporter, ui::LogKind::Confirm, &format!("Confirm, {hazard}?"));
+                    say(
+                        voice,
+                        reporter,
+                        ui::LogKind::Confirm,
+                        &format!("Confirm, {hazard}?"),
+                    );
                     reporter.status(ui::Phase::Listening);
                     let reply = listen_once(listener, ptt_mic, stt, ptt, None).map(|(r, _)| r);
                     match reply {
@@ -2767,24 +3125,58 @@ async fn run_checklist(
                             break;
                         }
                         _ => {
-                            say(voice, reporter, ui::LogKind::Info, &format!("{line} Skipped — your call."));
+                            say(
+                                voice,
+                                reporter,
+                                ui::LogKind::Info,
+                                &format!("{line} Skipped — your call."),
+                            );
                             continue;
                         }
                     }
                 }
-                if checklist::run_step(tool, args, &cl.lights, &cl.flaps, &cl.electrical, &cl.fuel_selector, cl.engines, cl.magnetos_per_engine, cl.park_brake_valve_set, cl.pitot_heat_dataref.clone(), &ctx).await.is_ok() {
+                if checklist::run_step(
+                    tool,
+                    args,
+                    &cl.lights,
+                    &cl.flaps,
+                    &cl.electrical,
+                    &cl.fuel_selector,
+                    cl.engines,
+                    cl.magnetos_per_engine,
+                    cl.park_brake_valve_set,
+                    cl.pitot_heat_dataref.clone(),
+                    &ctx,
+                )
+                .await
+                .is_ok()
+                {
                     say(voice, reporter, ui::LogKind::Readback, line);
                 } else {
-                    say(voice, reporter, ui::LogKind::Warn, &format!("{line} Didn't take — check it."));
+                    say(
+                        voice,
+                        reporter,
+                        ui::LogKind::Warn,
+                        &format!("{line} Didn't take — check it."),
+                    );
                     failed += 1;
                 }
             }
             // A dataref we don't actuate — read it and confirm or flag.
-            Item::Verify { say: line, dataref, index, cond, settable } => {
+            Item::Verify {
+                say: line,
+                dataref,
+                index,
+                cond,
+                settable,
+            } => {
                 match checklist::read_dataref(xplane, dataref, *index).await {
-                    Some(v) if cond.eval(v) => {
-                        say(voice, reporter, ui::LogKind::Readback, &format!("{line} Confirmed."))
-                    }
+                    Some(v) if cond.eval(v) => say(
+                        voice,
+                        reporter,
+                        ui::LogKind::Readback,
+                        &format!("{line} Confirmed."),
+                    ),
                     // Not in the desired state.
                     Some(_) if *settable => {
                         // An actionable switch — set it to the checklist's own
@@ -2793,14 +3185,27 @@ async fn run_checklist(
                         // flag it.
                         let target = cond.target();
                         let wrote = match index {
-                            Some(i) => xplane.set_float_array_elem(dataref, *i, target).await.is_ok(),
+                            Some(i) => xplane
+                                .set_float_array_elem(dataref, *i, target)
+                                .await
+                                .is_ok(),
                             None => xplane.set_float(dataref, target).await.is_ok(),
                         };
                         let now = checklist::read_dataref(xplane, dataref, *index).await;
                         if wrote && now.is_some_and(|v| cond.eval(v)) {
-                            say(voice, reporter, ui::LogKind::Readback, &format!("{line} Set."));
+                            say(
+                                voice,
+                                reporter,
+                                ui::LogKind::Readback,
+                                &format!("{line} Set."),
+                            );
                         } else {
-                            say(voice, reporter, ui::LogKind::Warn, &format!("{line} Couldn't set it — check it."));
+                            say(
+                                voice,
+                                reporter,
+                                ui::LogKind::Warn,
+                                &format!("{line} Couldn't set it — check it."),
+                            );
                             failed += 1;
                         }
                     }
@@ -2831,9 +3236,17 @@ async fn run_checklist(
 /// from a plain "no" at a step, which just skips that one item)?
 fn is_abort(reply: &str) -> bool {
     let r = reply.to_lowercase();
-    ["abort", "stop", "cancel", "belay", "disregard", "halt", "quit"]
-        .iter()
-        .any(|w| r.contains(w))
+    [
+        "abort",
+        "stop",
+        "cancel",
+        "belay",
+        "disregard",
+        "halt",
+        "quit",
+    ]
+    .iter()
+    .any(|w| r.contains(w))
 }
 
 /// Standard Levenshtein edit distance.
@@ -2865,13 +3278,23 @@ fn load_wav_16k(input: &str) -> Result<Vec<f32>> {
     }
     let wav = std::env::temp_dir().join("x-copilot-16k.wav");
     let status = Command::new("afconvert")
-        .args([input, wav.to_str().unwrap(), "-d", "LEI16@16000", "-c", "1", "-f", "WAVE"])
+        .args([
+            input,
+            wav.to_str().unwrap(),
+            "-d",
+            "LEI16@16000",
+            "-c",
+            "1",
+            "-f",
+            "WAVE",
+        ])
         .status()
         .map_err(|e| anyhow!("spawning afconvert: {e}"))?;
     if !status.success() {
         return Err(anyhow!("afconvert failed to decode {input}"));
     }
-    let reader = hound::WavReader::open(&wav).map_err(|e| anyhow!("reading {}: {e}", wav.display()))?;
+    let reader =
+        hound::WavReader::open(&wav).map_err(|e| anyhow!("reading {}: {e}", wav.display()))?;
     reader
         .into_samples::<i16>()
         .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
@@ -2905,15 +3328,26 @@ fn analyze_commands() -> Result<()> {
         .unwrap_or_default();
     paths.sort();
     for p in paths {
-        let is_log = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("x-copilot.log"));
+        let is_log = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("x-copilot.log"));
         if !is_log {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&p) else { continue };
+        let Ok(content) = std::fs::read_to_string(&p) else {
+            continue;
+        };
         for line in content.lines() {
             if let Some(i) = line.find("transcript=") {
                 let rest = &line[i + "transcript=".len()..];
-                last = Some(rest.split(" confidence=").next().unwrap_or(rest).trim().to_lowercase());
+                last = Some(
+                    rest.split(" confidence=")
+                        .next()
+                        .unwrap_or(rest)
+                        .trim()
+                        .to_lowercase(),
+                );
             } else if line.contains("⌨") {
                 if let (Some(a), Some(b)) = (line.find('"'), line.rfind('"')) {
                     if b > a {
@@ -2984,7 +3418,8 @@ fn listen_once(
             use device_query::DeviceQuery;
             let dev = device_query::DeviceState::new();
             let key = *key;
-            mic.capture(|| dev.get_keys().contains(&key), idle_timeout).ok()?
+            mic.capture(|| dev.get_keys().contains(&key), idle_timeout)
+                .ok()?
         }
         // Sim-dataref push-to-talk (the X-Plane plugin's bound buttons), warm
         // mic. Either button captures; the radio one tags the utterance as a
@@ -3059,7 +3494,13 @@ fn next_input(
                 return Some(Input::Typed(t));
             }
         }
-        if let Some((t, tx)) = listen_once(listener, ptt_mic, stt, ptt, Some(Duration::from_millis(150))) {
+        if let Some((t, tx)) = listen_once(
+            listener,
+            ptt_mic,
+            stt,
+            ptt,
+            Some(Duration::from_millis(150)),
+        ) {
             return Some(Input::Spoken(t, tx));
         }
         // Timed out idle (or a discarded blip) — re-check the typed channel,
@@ -3072,7 +3513,14 @@ fn next_input(
 
 /// Negation words — a reply containing any of these is never an affirmative.
 const NEGATIONS: &[&str] = &[
-    "negative", "cancel", "abort", "stop", "belay", "disregard", "wrong", "no",
+    "negative",
+    "cancel",
+    "abort",
+    "stop",
+    "belay",
+    "disregard",
+    "wrong",
+    "no",
 ];
 
 /// Is a spoken reply an affirmative confirmation? Defaults to `false` (safe) —
@@ -3080,8 +3528,22 @@ const NEGATIONS: &[&str] = &[
 fn is_affirmative(reply: &str) -> bool {
     let r = reply.to_lowercase();
     const YES: &[&str] = &[
-        "affirm", "affirmative", "confirm", "yes", "yeah", "yep", "roger", "correct",
-        "copy", "proceed", "go ahead", "do it", "right", "indeed", "okay", "absolutely",
+        "affirm",
+        "affirmative",
+        "confirm",
+        "yes",
+        "yeah",
+        "yep",
+        "roger",
+        "correct",
+        "copy",
+        "proceed",
+        "go ahead",
+        "do it",
+        "right",
+        "indeed",
+        "okay",
+        "absolutely",
     ];
     if NEGATIONS.iter().any(|w| r.contains(w)) {
         return false;
@@ -3144,12 +3606,13 @@ fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
 /// `t` is already normalized (filler stripped). Capabilities are read live from the
 /// registry, so the answer matches the actual aircraft.
 fn conversational(t: &str, registry: &Registry) -> Option<String> {
-    let has = |w: &str| {
-        t.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == w)
-    };
+    let has = |w: &str| t.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == w);
     // "say again" / "repeat that" / "what did you say" → repeat the last readback.
-    if t.contains("say again") || t.contains("repeat") || t.contains("come again")
-        || t.contains("what did you say") || t.contains("didnt catch that")
+    if t.contains("say again")
+        || t.contains("repeat")
+        || t.contains("come again")
+        || t.contains("what did you say")
+        || t.contains("didnt catch that")
     {
         return Some(match LAST_READBACK.lock().ok().and_then(|l| l.clone()) {
             Some(prev) => prev,
@@ -3159,27 +3622,58 @@ fn conversational(t: &str, registry: &Registry) -> Option<String> {
     // "what can you do" / "help" / "what can I ask" → list live capabilities.
     // Bare "help me" only: "help me land on runway 28" is a request for that
     // specific help (the talk-down), not a menu (it got the menu, live).
-    if t.contains("what can you do") || t.contains("what can i") || t.contains("what do you do")
-        || t.contains("what are you able") || t == "help me" || t == "help"
-        || t.contains("capabilities") || t.contains("what commands")
+    if t.contains("what can you do")
+        || t.contains("what can i")
+        || t.contains("what do you do")
+        || t.contains("what are you able")
+        || t == "help me"
+        || t == "help"
+        || t.contains("capabilities")
+        || t.contains("what commands")
     {
         let mut caps: Vec<&str> = Vec::new();
         let any = |names: &[&str]| names.iter().any(|n| registry.get(n).is_some());
-        if any(&["set_flaps"]) { caps.push("flaps"); }
-        if any(&["gear"]) { caps.push("gear"); }
-        if any(&["set_throttle"]) { caps.push("throttle"); }
-        if any(&["start_engines", "start_engine"]) { caps.push("engine start and shutdown"); }
-        if any(&["set_heading", "set_altitude"]) { caps.push("the autopilot"); }
-        if any(&["set_com1", "set_nav1"]) { caps.push("radios"); }
-        if any(&["set_transponder_mode"]) { caps.push("the transponder"); }
-        if any(&["set_lights", "set_flood_lights"]) { caps.push("lights"); }
-        if any(&["set_electrical", "set_power"]) { caps.push("electrical"); }
-        if any(&["set_fuel_selector"]) { caps.push("fuel selectors"); }
-        if any(&["set_barometer"]) { caps.push("the altimeter"); }
+        if any(&["set_flaps"]) {
+            caps.push("flaps");
+        }
+        if any(&["gear"]) {
+            caps.push("gear");
+        }
+        if any(&["set_throttle"]) {
+            caps.push("throttle");
+        }
+        if any(&["start_engines", "start_engine"]) {
+            caps.push("engine start and shutdown");
+        }
+        if any(&["set_heading", "set_altitude"]) {
+            caps.push("the autopilot");
+        }
+        if any(&["set_com1", "set_nav1"]) {
+            caps.push("radios");
+        }
+        if any(&["set_transponder_mode"]) {
+            caps.push("the transponder");
+        }
+        if any(&["set_lights", "set_flood_lights"]) {
+            caps.push("lights");
+        }
+        if any(&["set_electrical", "set_power"]) {
+            caps.push("electrical");
+        }
+        if any(&["set_fuel_selector"]) {
+            caps.push("fuel selectors");
+        }
+        if any(&["set_barometer"]) {
+            caps.push("the altimeter");
+        }
         let list = match caps.len() {
             0 => "the basics".to_string(),
             1 => caps[0].to_string(),
-            _ => format!("{}, and {}", caps[..caps.len() - 1].join(", "), caps[caps.len() - 1]),
+            _ => format!(
+                "{}, and {}",
+                caps[..caps.len() - 1].join(", "),
+                caps[caps.len() - 1]
+            ),
         };
         return Some(format!(
             "I can work the {list}. I can also read back the altitude, heading, speed, fuel, and weather. Just say what you want."
@@ -3195,11 +3689,18 @@ fn conversational(t: &str, registry: &Registry) -> Option<String> {
     // Bare praise ("good", "nice", "perfect") only as a SHORT standalone ack — so a
     // longer question like "is the weather good" isn't hijacked.
     let words = t.split_whitespace().count();
-    if words <= 3 && (has("good") || has("nice") || has("great") || has("perfect") || t.contains("well done")) {
+    if words <= 3
+        && (has("good") || has("nice") || has("great") || has("perfect") || t.contains("well done"))
+    {
         return Some("Standing by.".to_string());
     }
-    if t.contains("you there") || t.contains("are you there") || t.contains("you with me")
-        || t == "hello" || t == "hi" || t.contains("you awake") || t.contains("you copy")
+    if t.contains("you there")
+        || t.contains("are you there")
+        || t.contains("you with me")
+        || t == "hello"
+        || t == "hi"
+        || t.contains("you awake")
+        || t.contains("you copy")
     {
         return Some("Standing by, go ahead.".to_string());
     }
@@ -3210,13 +3711,27 @@ fn conversational(t: &str, registry: &Registry) -> Option<String> {
 /// continuously-read snapshot + autopilot-status set. (Arrays like engine-running,
 /// and the tool path's read-after-write confirms, stay on REST.)
 const SNAPSHOT_DATAREFS: &[&str] = &[
-    datarefs::ALTITUDE_FT, datarefs::AIRSPEED_KTS, datarefs::VVI_FPM,
-    datarefs::COMPASS_HEADING_DEG, datarefs::FLAP_RATIO, datarefs::GEAR_HANDLE_DOWN,
-    datarefs::ON_GROUND_ANY, datarefs::FUEL_TOTAL_KG, datarefs::WIND_DIR_DEG_TRUE,
-    datarefs::WIND_SPEED_MSC, datarefs::OAT_DEG_C, datarefs::VISIBILITY_SM,
-    datarefs::QNH_PASCALS, datarefs::SERVOS_ON, datarefs::APPROACH_STATUS,
-    datarefs::NAV_STATUS, datarefs::HEADING_STATUS, datarefs::COM1_FREQ_KHZ,
-    DR_LLM_ENABLED, DR_OPT_SNAP, DR_OPT_TONE,
+    datarefs::ALTITUDE_FT,
+    datarefs::AIRSPEED_KTS,
+    datarefs::VVI_FPM,
+    datarefs::COMPASS_HEADING_DEG,
+    datarefs::FLAP_RATIO,
+    datarefs::GEAR_HANDLE_DOWN,
+    datarefs::ON_GROUND_ANY,
+    datarefs::FUEL_TOTAL_KG,
+    datarefs::WIND_DIR_DEG_TRUE,
+    datarefs::WIND_SPEED_MSC,
+    datarefs::OAT_DEG_C,
+    datarefs::VISIBILITY_SM,
+    datarefs::QNH_PASCALS,
+    datarefs::SERVOS_ON,
+    datarefs::APPROACH_STATUS,
+    datarefs::NAV_STATUS,
+    datarefs::HEADING_STATUS,
+    datarefs::COM1_FREQ_KHZ,
+    DR_LLM_ENABLED,
+    DR_OPT_SNAP,
+    DR_OPT_TONE,
 ];
 
 /// The 3D-cockpit camera position (pilot's-head datarefs) — read to remember the
@@ -3266,14 +3781,23 @@ fn angle_delta_deg(a: f64, b: f64) -> f64 {
 /// Human label for the on-screen callout: "FLAPS → 10", "GEAR → DOWN", "PROPS →
 /// CRUISE". Generic: the tool name minus set_, plus the argument values.
 fn callout_label(tool: &str, args: &serde_json::Value) -> String {
-    let name = tool.trim_start_matches("set_").replace('_', " ").to_uppercase();
+    let name = tool
+        .trim_start_matches("set_")
+        .replace('_', " ")
+        .to_uppercase();
     let vals: Vec<String> = args
         .as_object()
         .map(|o| {
             o.values()
                 .map(|v| match v {
                     serde_json::Value::String(s) => s.to_uppercase(),
-                    serde_json::Value::Bool(b) => if *b { "ON".into() } else { "OFF".into() },
+                    serde_json::Value::Bool(b) => {
+                        if *b {
+                            "ON".into()
+                        } else {
+                            "OFF".into()
+                        }
+                    }
                     other => other.to_string(),
                 })
                 .collect()
@@ -3368,19 +3892,23 @@ async fn landing_readiness(xp: &XPlaneClient, profile: &aircraft::AircraftProfil
         .unwrap_or(0.0);
     if let Some(app) = profile.reference.as_ref().and_then(|r| r.approach_kts) {
         if ias > app + 15.0 {
-            issues.push(format!("{ias:.0} knots is fast against the {app:.0} reference"));
+            issues.push(format!(
+                "{ias:.0} knots is fast against the {app:.0} reference"
+            ));
         } else {
             goods.push(format!("{ias:.0} knots against a {app:.0} reference"));
         }
     } else {
-        goods.push(format!("{ias:.0} knots", ));
+        goods.push(format!("{ias:.0} knots",));
     }
     // Landing-phase SOP rows (landing light and friends).
     for item in &profile.advisor {
         if !item.phases.iter().any(|p| p == "landing") {
             continue;
         }
-        let Ok(v) = xp.get_float(&item.dataref).await else { continue };
+        let Ok(v) = xp.get_float(&item.dataref).await else {
+            continue;
+        };
         if (v > 0.5) != item.expect_on {
             issues.push(item.say.trim_end_matches('.').to_lowercase());
         }
@@ -3413,7 +3941,9 @@ async fn config_advice(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -
     let mut wrong: Vec<String> = Vec::new();
     let mut arrival_items = false;
     for item in &profile.advisor {
-        let Ok(v) = xp.get_float(&item.dataref).await else { continue };
+        let Ok(v) = xp.get_float(&item.dataref).await else {
+            continue;
+        };
         let satisfied = (v > 0.5) == item.expect_on;
         if item.phases.iter().any(|p| p == phase) {
             if !satisfied {
@@ -3421,7 +3951,10 @@ async fn config_advice(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -
             }
         } else if airborne
             && !satisfied
-            && item.phases.iter().any(|p| p == "approach" || p == "landing")
+            && item
+                .phases
+                .iter()
+                .any(|p| p == "approach" || p == "landing")
         {
             arrival_items = true;
         }
@@ -3444,9 +3977,12 @@ async fn config_advice(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -
 /// the kind of question that must never be guessed.
 async fn traffic_report(xp: &XPlaneClient) -> String {
     let (bear, dist, alt) = (
-        xp.get_float_array("sim/cockpit2/tcas/indicators/relative_bearing_degs").await,
-        xp.get_float_array("sim/cockpit2/tcas/indicators/relative_distance_mtrs").await,
-        xp.get_float_array("sim/cockpit2/tcas/indicators/relative_altitude_mtrs").await,
+        xp.get_float_array("sim/cockpit2/tcas/indicators/relative_bearing_degs")
+            .await,
+        xp.get_float_array("sim/cockpit2/tcas/indicators/relative_distance_mtrs")
+            .await,
+        xp.get_float_array("sim/cockpit2/tcas/indicators/relative_altitude_mtrs")
+            .await,
     );
     let (Ok(bear), Ok(dist), Ok(alt)) = (bear, dist, alt) else {
         return "No traffic picture available.".to_string();
@@ -3472,7 +4008,10 @@ async fn traffic_report(xp: &XPlaneClient) -> String {
         .filter(|(d, _, a)| *d < 15.0 * 1852.0 && a.abs() < 3000.0 / 3.28084)
         .collect();
     if targets.is_empty() {
-        let nearest = all.iter().min_by(|a, b| a.0.total_cmp(&b.0)).expect("non-empty");
+        let nearest = all
+            .iter()
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .expect("non-empty");
         return format!(
             "No factor traffic. Nearest is {:.0} miles out, {:.0} feet {}.",
             nearest.0 / 1852.0,
@@ -3486,7 +4025,11 @@ async fn traffic_report(xp: &XPlaneClient) -> String {
         .take(3)
         .map(|(d, b, a)| {
             let nm = d / 1852.0;
-            let range = if nm < 1.0 { "under a mile".to_string() } else { format!("{nm:.0} miles") };
+            let range = if nm < 1.0 {
+                "under a mile".to_string()
+            } else {
+                format!("{nm:.0} miles")
+            };
             let clock = match (((b + 15.0).rem_euclid(360.0)) / 30.0) as i32 {
                 0 => 12,
                 c => c,
@@ -3503,8 +4046,16 @@ async fn traffic_report(xp: &XPlaneClient) -> String {
         })
         .collect();
     let more = targets.len().saturating_sub(3);
-    let tail = if more > 0 { format!(", and {more} more further out") } else { String::new() };
-    let noun = if targets.len() == 1 { "One target" } else { "Traffic" };
+    let tail = if more > 0 {
+        format!(", and {more} more further out")
+    } else {
+        String::new()
+    };
+    let noun = if targets.len() == 1 {
+        "One target"
+    } else {
+        "Traffic"
+    };
     format!("{noun}: {}{tail}.", calls.join("; "))
 }
 
@@ -3514,9 +4065,15 @@ async fn traffic_report(xp: &XPlaneClient) -> String {
 async fn on_course_report(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
     // Parked, the question has no meaning — and the naive answer was nonsense
     // ("On course. 0 miles, 0 minutes." spoken live on the ramp).
-    let on_ground =
-        xp.get_float("sim/flightmodel/failures/onground_any").await.unwrap_or(0.0) > 0.5;
-    let gs = xp.get_float("sim/flightmodel/position/groundspeed").await.unwrap_or(0.0);
+    let on_ground = xp
+        .get_float("sim/flightmodel/failures/onground_any")
+        .await
+        .unwrap_or(0.0)
+        > 0.5;
+    let gs = xp
+        .get_float("sim/flightmodel/position/groundspeed")
+        .await
+        .unwrap_or(0.0);
     if on_ground && gs < 15.0 {
         return "We're on the ground — course comes alive once we're flying the route.".to_string();
     }
@@ -3524,7 +4081,13 @@ async fn on_course_report(xp: &XPlaneClient, live: Option<&LiveState>) -> String
     if progress.starts_with("No active GPS waypoint") {
         return progress;
     }
-    let dots = read1(live, xp, "sim/cockpit2/radios/indicators/hsi_hdef_dots_pilot").await.ok();
+    let dots = read1(
+        live,
+        xp,
+        "sim/cockpit2/radios/indicators/hsi_hdef_dots_pilot",
+    )
+    .await
+    .ok();
     let verdict = match dots {
         Some(d) if d.abs() <= 0.5 => "On course.".to_string(),
         Some(d) => format!(
@@ -3539,9 +4102,20 @@ async fn on_course_report(xp: &XPlaneClient, live: Option<&LiveState>) -> String
 }
 
 async fn nav_progress(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
-    let wp = xp.get_string("sim/cockpit2/radios/indicators/gps_nav_id").await.unwrap_or_default();
-    let dist = read1(live, xp, "sim/cockpit2/radios/indicators/gps_dme_distance_nm").await.ok();
-    let tmin = read1(live, xp, "sim/cockpit2/radios/indicators/gps_dme_time_min").await.ok();
+    let wp = xp
+        .get_string("sim/cockpit2/radios/indicators/gps_nav_id")
+        .await
+        .unwrap_or_default();
+    let dist = read1(
+        live,
+        xp,
+        "sim/cockpit2/radios/indicators/gps_dme_distance_nm",
+    )
+    .await
+    .ok();
+    let tmin = read1(live, xp, "sim/cockpit2/radios/indicators/gps_dme_time_min")
+        .await
+        .ok();
     if wp.trim().is_empty() && dist.is_none() {
         return "No active GPS waypoint. Load and navigate a route first.".to_string();
     }
@@ -3550,11 +4124,15 @@ async fn nav_progress(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
         s.push_str(&format!("Next waypoint {}, ", wp.trim()));
     }
     if let Some(d) = dist {
-        s.push_str(&format!("{d:.0} miles", ));
+        s.push_str(&format!("{d:.0} miles",));
     }
     if let Some(tm) = tmin {
         let (h, mn) = ((tm / 60.0) as i32, (tm % 60.0).round() as i32);
-        let time = if h > 0 { format!("{h} hours {mn} minutes") } else { format!("{mn} minutes") };
+        let time = if h > 0 {
+            format!("{h} hours {mn} minutes")
+        } else {
+            format!("{mn} minutes")
+        };
         s.push_str(&format!(", {time}"));
     }
     format!("{}.", s.trim_end_matches([',', ' ']))
@@ -3613,7 +4191,11 @@ async fn tod_phrase(dist_nm: f64, xp: &XPlaneClient) -> String {
     if dist_nm <= 0.0 {
         return "We're at top of descent, time to start down.".to_string();
     }
-    let gs_kts = xp.get_float("sim/flightmodel/position/groundspeed").await.unwrap_or(0.0) * MS_TO_KTS;
+    let gs_kts = xp
+        .get_float("sim/flightmodel/position/groundspeed")
+        .await
+        .unwrap_or(0.0)
+        * MS_TO_KTS;
     if gs_kts < 30.0 {
         return format!("Top of descent about {dist_nm:.0} miles ahead.");
     }
@@ -3644,7 +4226,11 @@ async fn eta_to_destination(
     let Some(dest) = fp.waypoints.last().cloned() else {
         return "No destination in the plan.".to_string();
     };
-    let dest_name = if fp.destination.is_empty() { dest.ident.clone() } else { fp.destination.clone() };
+    let dest_name = if fp.destination.is_empty() {
+        dest.ident.clone()
+    } else {
+        fp.destination.clone()
+    };
     let (lat, lon, gs_ms) = match (
         xp.get_float("sim/flightmodel/position/latitude").await,
         xp.get_float("sim/flightmodel/position/longitude").await,
@@ -3662,7 +4248,11 @@ async fn eta_to_destination(
     }
     let mins = (dist / gs_kts * 60.0).round() as i64;
     let (h, m) = (mins / 60, mins % 60);
-    let eta = if h > 0 { format!("{h} hours {m} minutes") } else { format!("{m} minutes") };
+    let eta = if h > 0 {
+        format!("{h} hours {m} minutes")
+    } else {
+        format!("{m} minutes")
+    };
     format!("About {eta} to {dest_name}, {dist:.0} miles out at {gs_kts:.0} knots.")
 }
 
@@ -3675,13 +4265,38 @@ async fn eta_to_destination(
 /// in a row missed while the governor kept taxiing.
 fn release_intent(t: &str) -> bool {
     const CUES: &[&str] = &[
-        "release", "let go", "let me go", "stop touching", "stop holding",
-        "stop taxi", "hands off", "leave the throttle", "leave it",
-        "stop steering", "my steering", "my pedals", "my rudder",
-        "give me command", "give me control", "give me the",
-        "my controls", "my control", "mic control", "my throttle", "my thr",
-        "my power", "my aircraft", "my plane", "my airplane", "my mixture", "my mix",
-        "i have control", "i have the", "im taking", "i am taking", "taking control",
+        "release",
+        "let go",
+        "let me go",
+        "stop touching",
+        "stop holding",
+        "stop taxi",
+        "hands off",
+        "leave the throttle",
+        "leave it",
+        "stop steering",
+        "my steering",
+        "my pedals",
+        "my rudder",
+        "give me command",
+        "give me control",
+        "give me the",
+        "my controls",
+        "my control",
+        "mic control",
+        "my throttle",
+        "my thr",
+        "my power",
+        "my aircraft",
+        "my plane",
+        "my airplane",
+        "my mixture",
+        "my mix",
+        "i have control",
+        "i have the",
+        "im taking",
+        "i am taking",
+        "taking control",
     ];
     CUES.iter().any(|c| t.contains(c))
 }
@@ -3702,9 +4317,16 @@ async fn runway_advice(
     let Some((_, fp)) = cache.as_ref() else {
         return "Couldn't fetch your SimBrief plan.".to_string();
     };
-    let on_ground =
-        xp.get_float("sim/flightmodel/failures/onground_any").await.unwrap_or(1.0) > 0.5;
-    let icao = if on_ground { fp.origin.clone() } else { fp.destination.clone() };
+    let on_ground = xp
+        .get_float("sim/flightmodel/failures/onground_any")
+        .await
+        .unwrap_or(1.0)
+        > 0.5;
+    let icao = if on_ground {
+        fp.origin.clone()
+    } else {
+        fp.destination.clone()
+    };
     // apt.dat is a ~400 MB streaming scan — off the async thread it goes.
     let (path, icao2) = (config.apt_data_path.clone(), icao.clone());
     let runways = tokio::task::spawn_blocking(move || nav::find_runways(&path, &icao2))
@@ -3719,14 +4341,18 @@ async fn runway_advice(
         .iter()
         .flat_map(|r| [r.ident_a.as_str(), r.ident_b.as_str()])
         .collect();
-    let wind_dir = xp.get_float(datarefs::WIND_DIR_DEG_TRUE).await.unwrap_or(0.0);
-    let wind_kts =
-        xp.get_float(datarefs::WIND_SPEED_MSC).await.unwrap_or(0.0) * MS_TO_KTS;
+    let wind_dir = xp
+        .get_float(datarefs::WIND_DIR_DEG_TRUE)
+        .await
+        .unwrap_or(0.0);
+    let wind_kts = xp.get_float(datarefs::WIND_SPEED_MSC).await.unwrap_or(0.0) * MS_TO_KTS;
     if wind_kts < 3.0 {
-        return format!("Wind's calm. Any runway works; {icao} has {}.", all.join(" and "));
+        return format!(
+            "Wind's calm. Any runway works; {icao} has {}.",
+            all.join(" and ")
+        );
     }
-    let Some((ident, _, headwind)) = nav::best_runway_for_wind(&runways, wind_dir, wind_kts)
-    else {
+    let Some((ident, _, headwind)) = nav::best_runway_for_wind(&runways, wind_dir, wind_kts) else {
         return format!("I don't have runway data for {icao}.");
     };
     let component = if headwind >= 0.0 {
@@ -3743,7 +4369,10 @@ async fn runway_advice(
 /// First element of a per-engine array dataref (engine 1), or `None` on a failed
 /// read. Engine indicators are arrays, so they bypass the scalar `read1`/cache.
 async fn read_engine0(xp: &XPlaneClient, name: &str) -> Option<f64> {
-    xp.get_float_array(name).await.ok().and_then(|v| v.first().copied())
+    xp.get_float_array(name)
+        .await
+        .ok()
+        .and_then(|v| v.first().copied())
 }
 
 /// Live "are all systems within safe parameters?" check — reads the engine,
@@ -3752,7 +4381,9 @@ async fn read_engine0(xp: &XPlaneClient, name: &str) -> Option<f64> {
 /// datarefs read °F despite their names.) The deterministic answer to "check all
 /// systems".
 async fn systems_check(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> String {
-    let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running").await.is_some_and(|v| v > 0.5);
+    let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running")
+        .await
+        .is_some_and(|v| v > 0.5);
     if !running {
         return "Engine's not running, nothing to check.".to_string();
     }
@@ -3770,17 +4401,29 @@ async fn systems_check(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -
             (Ok(lo), Ok(hi)) if hi > lo && hi > 0.0 => (lo, hi),
             _ => (20.0, 105.0),
         };
-        if (lo..=hi).contains(&v) { ok.push(format!("oil pressure {v:.0}")); }
-        else { flags.push(format!("oil pressure {v:.0} pounds")); }
+        if (lo..=hi).contains(&v) {
+            ok.push(format!("oil pressure {v:.0}"));
+        } else {
+            flags.push(format!("oil pressure {v:.0} pounds"));
+        }
     }
-    if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_temperature_deg_C").await {
-        if v < 240.0 { ok.push(format!("oil temp {v:.0}")); } else { flags.push(format!("oil temp {v:.0} degrees")); }
+    if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_temperature_deg_C").await
+    {
+        if v < 240.0 {
+            ok.push(format!("oil temp {v:.0}"));
+        } else {
+            flags.push(format!("oil temp {v:.0} degrees"));
+        }
     }
     // CHT is a piston reading; a turbine profile (no piston `engine` group) has
     // no cylinders to report.
     if profile.engine {
         if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/CHT_deg_C").await {
-            if v < 450.0 { ok.push(format!("C H T {v:.0}")); } else { flags.push(format!("C H T {v:.0} degrees")); }
+            if v < 450.0 {
+                ok.push(format!("C H T {v:.0}"));
+            } else {
+                flags.push(format!("C H T {v:.0} degrees"));
+            }
         }
     }
     // Suction only matters where a vacuum gyro exists — a glass/turbine panel
@@ -3788,11 +4431,19 @@ async fn systems_check(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -
     // on every check (seen live).
     if profile.directional_gyro {
         if let Ok(v) = xp.get_float("sim/cockpit/misc/vacuum").await {
-            if v >= 4.0 { ok.push(format!("vacuum {v:.1}")); } else { flags.push(format!("low vacuum {v:.1}")); }
+            if v >= 4.0 {
+                ok.push(format!("vacuum {v:.1}"));
+            } else {
+                flags.push(format!("low vacuum {v:.1}"));
+            }
         }
     }
     if let Some(v) = read_engine0(xp, "sim/cockpit2/electrical/battery_amps").await {
-        if v >= -5.0 { ok.push("charging".to_string()); } else { flags.push(format!("battery discharging {:.0} amps", v.abs())); }
+        if v >= -5.0 {
+            ok.push("charging".to_string());
+        } else {
+            flags.push(format!("battery discharging {:.0} amps", v.abs()));
+        }
     }
     if flags.is_empty() {
         // Verdict first, gauge recital never: a crew member concludes ("all in
@@ -3810,11 +4461,18 @@ async fn systems_check(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -
         format!(
             "{}{}",
             VERDICTS[i],
-            if charging { " Battery's charging fine." } else { "" }
+            if charging {
+                " Battery's charging fine."
+            } else {
+                ""
+            }
         )
     } else {
         // Something's off: the flags get the airtime, the rest gets one word.
-        format!("Mostly green, but watch this: {}. Everything else is normal.", flags.join(", "))
+        format!(
+            "Mostly green, but watch this: {}. Everything else is normal.",
+            flags.join(", ")
+        )
     }
 }
 
@@ -3824,12 +4482,20 @@ async fn systems_check(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -
 /// commands; engine fail-words are past-tense so "stop the engine" still
 /// commands too.
 fn is_power_loss_query(t: &str) -> bool {
-    t.contains("lost power") || t.contains("losing power") || t.contains("lose power")
-        || t.contains("power loss") || t.contains("loss of power")
+    t.contains("lost power")
+        || t.contains("losing power")
+        || t.contains("lose power")
+        || t.contains("power loss")
+        || t.contains("loss of power")
         || (t.contains("engine")
-            && (t.contains("quit") || t.contains("stopped") || t.contains("died")
-                || t.contains("dead") || t.contains("failed") || t.contains("failure")
-                || t.contains("cut out") || t.contains("cutting out")
+            && (t.contains("quit")
+                || t.contains("stopped")
+                || t.contains("died")
+                || t.contains("dead")
+                || t.contains("failed")
+                || t.contains("failure")
+                || t.contains("cut out")
+                || t.contains("cutting out")
                 || (t.contains("why") && (t.contains("lost") || t.contains("lose")))))
 }
 
@@ -3839,17 +4505,25 @@ fn is_power_loss_query(t: &str) -> bool {
 /// be busy). Same trust model as `systems_check`: read the datarefs, never the
 /// LLM.
 async fn power_loss_diagnosis(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> String {
-    let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running").await.is_some_and(|v| v > 0.5);
+    let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running")
+        .await
+        .is_some_and(|v| v > 0.5);
     let piston = profile.turboprop_start.is_none() && !profile.turbine_start;
     let mut causes: Vec<String> = Vec::new();
 
     // Fuel chain, most likely first. Selector OFF starves the engine within a
     // minute (and an xlua plugin reload can snap it there behind your back).
-    let selector = xp.get_float("sim/cockpit2/fuel/fuel_tank_selector").await.ok();
+    let selector = xp
+        .get_float("sim/cockpit2/fuel/fuel_tank_selector")
+        .await
+        .ok();
     if profile.fuel_selector.is_some() && selector.is_some_and(|s| s < 0.5) {
         causes.push("the fuel selector is off, select a tank now".to_string());
     }
-    let tanks = xp.get_float_array(datarefs::FUEL_PER_TANK_KG).await.unwrap_or_default();
+    let tanks = xp
+        .get_float_array(datarefs::FUEL_PER_TANK_KG)
+        .await
+        .unwrap_or_default();
     let total_kg: f64 = tanks.iter().sum();
     if !tanks.is_empty() && total_kg < 2.0 {
         causes.push("the tanks are dry, we're out of fuel".to_string());
@@ -3867,10 +4541,16 @@ async fn power_loss_diagnosis(xp: &XPlaneClient, profile: &aircraft::AircraftPro
         }
     }
     if piston {
-        if read_engine0(xp, "sim/cockpit2/engine/actuators/mixture_ratio").await.is_some_and(|m| m < 0.15) {
+        if read_engine0(xp, "sim/cockpit2/engine/actuators/mixture_ratio")
+            .await
+            .is_some_and(|m| m < 0.15)
+        {
             causes.push("the mixture is at cutoff, push it rich".to_string());
         }
-        if read_engine0(xp, "sim/cockpit2/engine/actuators/ignition_key").await.is_some_and(|k| k < 0.5) {
+        if read_engine0(xp, "sim/cockpit2/engine/actuators/ignition_key")
+            .await
+            .is_some_and(|k| k < 0.5)
+        {
             causes.push("the ignition is off, mags to both".to_string());
         }
     }
@@ -3885,18 +4565,25 @@ async fn power_loss_diagnosis(xp: &XPlaneClient, profile: &aircraft::AircraftPro
             "no fuel flow with fuel on board, check the boost pump and fuel pressure".to_string(),
         );
     }
-    let throttle =
-        read_engine0(xp, "sim/cockpit2/engine/actuators/throttle_ratio").await.unwrap_or(0.0);
+    let throttle = read_engine0(xp, "sim/cockpit2/engine/actuators/throttle_ratio")
+        .await
+        .unwrap_or(0.0);
     if running && causes.is_empty() && throttle < 0.05 {
         causes.push("the throttle is closed".to_string());
     }
 
     if !causes.is_empty() {
-        let state = if running { "Engine's still turning" } else { "Engine's stopped" };
+        let state = if running {
+            "Engine's still turning"
+        } else {
+            "Engine's stopped"
+        };
         return format!("{state}. Likely cause: {}.", causes.join("; also "));
     }
     // Nothing conclusive: give the raw picture so the pilot can work the problem.
-    let rpm = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm").await.unwrap_or(0.0);
+    let rpm = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm")
+        .await
+        .unwrap_or(0.0);
     let gph = flow_kg_s * 3600.0 / AVGAS_KG_PER_GAL;
     let mut line = if running {
         format!(
@@ -3927,16 +4614,24 @@ async fn ensure_plan(
     refresh: bool,
 ) -> Result<(), String> {
     if config.simbrief_id.trim().is_empty() {
-        return Err("No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can pull your flight plan.".to_string());
+        return Err(
+            "No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can pull your flight plan."
+                .to_string(),
+        );
     }
-    let fresh = cache.as_ref().is_some_and(|(t, _)| t.elapsed() < FLIGHT_PLAN_TTL);
+    let fresh = cache
+        .as_ref()
+        .is_some_and(|(t, _)| t.elapsed() < FLIGHT_PLAN_TTL);
     if refresh || !fresh {
         match simbrief::fetch(&config.simbrief_id).await {
             Ok(fp) => *cache = Some((Instant::now(), fp)),
             Err(e) => {
                 tracing::warn!("simbrief fetch failed: {e:#}");
                 if cache.is_none() {
-                    return Err("Couldn't fetch your SimBrief plan. Generate one first, or check the ID.".to_string());
+                    return Err(
+                        "Couldn't fetch your SimBrief plan. Generate one first, or check the ID."
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -3967,28 +4662,33 @@ async fn ensure_plan(
                 Some((_, e)) => e,
                 None => {
                     let (path, icao) = (config.apt_data_path.clone(), fp.destination.clone());
-                    let scanned = tokio::task::spawn_blocking(move || nav::find_airport(&path, &icao))
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .flatten()
-                        .map(|a| a.elev_ft);
+                    let scanned =
+                        tokio::task::spawn_blocking(move || nav::find_airport(&path, &icao))
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .flatten()
+                            .map(|a| a.elev_ft);
                     // Fallback: the waypoint altitude when plausible, else sea
                     // level (which only makes TOD earlier — the safe direction).
-                    let e = scanned
-                        .unwrap_or(if (0.0..12_000.0).contains(&w.alt) { w.alt } else { 0.0 });
+                    let e = scanned.unwrap_or(if (0.0..12_000.0).contains(&w.alt) {
+                        w.alt
+                    } else {
+                        0.0
+                    });
                     *ELEV_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some((fp.destination.clone(), e));
                     e
                 }
             };
-            *monitor::DESTINATION.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(monitor::Destination {
-                    lat: w.lat,
-                    lon: w.lon,
-                    elev_ft,
-                    tod_ring_nm: ring,
-                });
+            *monitor::DESTINATION
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(monitor::Destination {
+                lat: w.lat,
+                lon: w.lon,
+                elev_ft,
+                tod_ring_nm: ring,
+            });
         }
     }
     Ok(())
@@ -4018,11 +4718,19 @@ async fn load_route_to_fms(
         .map(|w| format!("{},{:.4},{:.4},{}", w.ident, w.lat, w.lon, w.alt as i64))
         .collect::<Vec<_>>()
         .join("|");
-    let (origin, dest, n) = (fp.origin.clone(), fp.destination.clone(), fp.waypoints.len());
-    if xp.set_data("xcopilot/fms/route", payload.as_bytes()).await.is_err()
+    let (origin, dest, n) = (
+        fp.origin.clone(),
+        fp.destination.clone(),
+        fp.waypoints.len(),
+    );
+    if xp
+        .set_data("xcopilot/fms/route", payload.as_bytes())
+        .await
+        .is_err()
         || xp.set_int("xcopilot/fms/load", 1).await.is_err()
     {
-        return "Couldn't reach the plugin to load the route. Is the X-COPILOT plugin running?".to_string();
+        return "Couldn't reach the plugin to load the route. Is the X-COPILOT plugin running?"
+            .to_string();
     }
     format!("Loading {n} waypoints into the GPS, {origin} to {dest}. Check the flight plan page.")
 }
@@ -4058,7 +4766,9 @@ async fn flight_plan_report(
     if let Ok(alt) = xp.get_float(datarefs::ALTITUDE_FT).await {
         let diff = fp.cruise_alt_ft - alt;
         if diff > 300.0 {
-            line.push_str(&format!(" You're at {alt:.0}, {diff:.0} to climb to cruise."));
+            line.push_str(&format!(
+                " You're at {alt:.0}, {diff:.0} to climb to cruise."
+            ));
         } else if diff < -300.0 {
             line.push_str(&format!(" You're at {alt:.0}, above planned cruise."));
         } else {
@@ -4067,13 +4777,18 @@ async fn flight_plan_report(
     }
     // Top of descent.
     if fp.tod_to_dest_nm > 0.5 {
-        line.push_str(&format!(" Top of descent about {:.0} miles before {}.", fp.tod_to_dest_nm, fp.destination));
+        line.push_str(&format!(
+            " Top of descent about {:.0} miles before {}.",
+            fp.tod_to_dest_nm, fp.destination
+        ));
     }
     // Fuel check: planned block vs what's in the tanks (read in kg, report gallons).
     if let Ok(kg) = xp.get_float(datarefs::FUEL_TOTAL_KG).await {
         let aboard = kg / AVGAS_KG_PER_GAL;
         if aboard + 0.5 >= fp.block_fuel_gal {
-            line.push_str(&format!(" You have {aboard:.0} gallons aboard, enough for the plan."));
+            line.push_str(&format!(
+                " You have {aboard:.0} gallons aboard, enough for the plan."
+            ));
         } else {
             line.push_str(&format!(
                 " You have {aboard:.0} aboard, but the plan needs {:.0}; short about {:.0}.",
@@ -4094,8 +4809,11 @@ fn aircraft_info(profile: &aircraft::AircraftProfile, t: &str) -> Option<String>
         || t.contains("what plane")
         || t.contains("what are we in")
         || ((t.contains("tell me about") || t.contains("describe") || t.contains("about the"))
-            && (t.contains("aircraft") || t.contains("plane") || t.contains("cessna")
-                || t.contains("172") || t.contains("skyhawk")));
+            && (t.contains("aircraft")
+                || t.contains("plane")
+                || t.contains("cessna")
+                || t.contains("172")
+                || t.contains("skyhawk")));
     if !asks {
         return None;
     }
@@ -4120,7 +4838,9 @@ fn aircraft_info(profile: &aircraft::AircraftProfile, t: &str) -> Option<String>
         r.and_then(|r| r.fuel_useable_gal),
         r.and_then(|r| r.endurance_hours),
     ) {
-        line.push_str(&format!(" {g:.0} gallons useable for roughly {h:.0} hours.", ));
+        line.push_str(&format!(
+            " {g:.0} gallons useable for roughly {h:.0} hours.",
+        ));
     }
     Some(line)
 }
@@ -4150,14 +4870,20 @@ fn reference_limits(profile: &aircraft::AircraftProfile, t: &str) -> Option<Stri
             parts.push(format!("Va, maneuvering speed, {}", kt(v)));
         }
     }
-    if t.contains("vfe") || t.contains("flap speed") || t.contains("flaps speed") || t.contains("flap limit") {
+    if t.contains("vfe")
+        || t.contains("flap speed")
+        || t.contains("flaps speed")
+        || t.contains("flap limit")
+    {
         if let Some(p) = vfe_phrase(profile) {
             parts.push(p);
         }
     }
     if t.contains("stall") {
         match (profile.vs_clean_kts, r.and_then(|r| r.vs0_kts)) {
-            (Some(c), Some(f)) => parts.push(format!("stall {c:.0} knots clean, {f:.0} with full flaps")),
+            (Some(c), Some(f)) => {
+                parts.push(format!("stall {c:.0} knots clean, {f:.0} with full flaps"))
+            }
             (Some(c), None) => parts.push(format!("stall {c:.0} knots clean")),
             (None, Some(f)) => parts.push(format!("stall {f:.0} knots with full flaps")),
             (None, None) => {}
@@ -4173,7 +4899,11 @@ fn reference_limits(profile: &aircraft::AircraftProfile, t: &str) -> Option<Stri
             parts.push(format!("Vy, best rate of climb, {}", kt(v)));
         }
     }
-    if t.contains("rotat") || t.contains("liftoff") || t.contains("lift off") || t.contains("takeoff speed") {
+    if t.contains("rotat")
+        || t.contains("liftoff")
+        || t.contains("lift off")
+        || t.contains("takeoff speed")
+    {
         if let Some(v) = r.and_then(|r| r.vr_kts) {
             parts.push(format!("rotate at {}", kt(v)));
         }
@@ -4219,8 +4949,13 @@ fn reference_limits(profile: &aircraft::AircraftProfile, t: &str) -> Option<Stri
         }
     }
     if t.contains("fuel capacity") || t.contains("tank capacity") {
-        match (r.and_then(|r| r.fuel_capacity_gal), r.and_then(|r| r.fuel_useable_gal)) {
-            (Some(c), Some(u)) => parts.push(format!("fuel capacity {c:.0} gallons, {u:.0} useable")),
+        match (
+            r.and_then(|r| r.fuel_capacity_gal),
+            r.and_then(|r| r.fuel_useable_gal),
+        ) {
+            (Some(c), Some(u)) => {
+                parts.push(format!("fuel capacity {c:.0} gallons, {u:.0} useable"))
+            }
             (Some(c), None) => parts.push(format!("fuel capacity {c:.0} gallons")),
             _ => {}
         }
@@ -4247,25 +4982,47 @@ fn reference_limits(profile: &aircraft::AircraftProfile, t: &str) -> Option<Stri
             ));
         }
     }
-    if t.contains("redline") || t.contains("max rpm") || t.contains("maximum rpm") || t.contains("red line") {
+    if t.contains("redline")
+        || t.contains("max rpm")
+        || t.contains("maximum rpm")
+        || t.contains("red line")
+    {
         if let Some(v) = r.and_then(|r| r.max_rpm) {
             parts.push(format!("maximum RPM {}", with_commas(v)));
         }
     }
     // A general "performance limits" / "V-speeds" ask gets the key summary.
     if parts.is_empty()
-        && (t.contains("performance limit") || t.contains("v speed") || t.contains("v-speed")
+        && (t.contains("performance limit")
+            || t.contains("v speed")
+            || t.contains("v-speed")
             || (t.contains("limits") && t.contains("performance")))
     {
         let mut s: Vec<String> = Vec::new();
-        if let Some(v) = profile.vne_kts { s.push(format!("Vne {v:.0}")); }
-        if let Some(v) = r.and_then(|r| r.vno_kts) { s.push(format!("Vno {v:.0}")); }
-        if let Some(v) = r.and_then(|r| r.va_kts) { s.push(format!("Va {v:.0}")); }
-        if let Some(v) = r.and_then(|r| r.vy_kts) { s.push(format!("Vy {v:.0}")); }
-        if let Some(v) = r.and_then(|r| r.best_glide_kts) { s.push(format!("best glide {v:.0}")); }
-        if let Some(v) = profile.vs_clean_kts { s.push(format!("stall {v:.0} clean")); }
-        if let Some(v) = r.and_then(|r| r.max_gross_lb) { s.push(format!("max gross {} pounds", with_commas(v))); }
-        if let Some(v) = r.and_then(|r| r.service_ceiling_ft) { s.push(format!("service ceiling {} feet", with_commas(v))); }
+        if let Some(v) = profile.vne_kts {
+            s.push(format!("Vne {v:.0}"));
+        }
+        if let Some(v) = r.and_then(|r| r.vno_kts) {
+            s.push(format!("Vno {v:.0}"));
+        }
+        if let Some(v) = r.and_then(|r| r.va_kts) {
+            s.push(format!("Va {v:.0}"));
+        }
+        if let Some(v) = r.and_then(|r| r.vy_kts) {
+            s.push(format!("Vy {v:.0}"));
+        }
+        if let Some(v) = r.and_then(|r| r.best_glide_kts) {
+            s.push(format!("best glide {v:.0}"));
+        }
+        if let Some(v) = profile.vs_clean_kts {
+            s.push(format!("stall {v:.0} clean"));
+        }
+        if let Some(v) = r.and_then(|r| r.max_gross_lb) {
+            s.push(format!("max gross {} pounds", with_commas(v)));
+        }
+        if let Some(v) = r.and_then(|r| r.service_ceiling_ft) {
+            s.push(format!("service ceiling {} feet", with_commas(v)));
+        }
         if !s.is_empty() {
             parts.push(s.join(", "));
         }
@@ -4363,8 +5120,12 @@ fn is_taxi_query(text: &str) -> bool {
     let hp = t.contains("holding point")
         && (t.contains("where") || t.contains("which") || t.contains("how far"));
     let route = (t.contains("taxi") || t.contains(" route"))
-        && (t.contains("what") || t.contains("which") || t.contains("where")
-            || t.contains("say") || t.contains("repeat") || t.contains("remind"));
+        && (t.contains("what")
+            || t.contains("which")
+            || t.contains("where")
+            || t.contains("say")
+            || t.contains("repeat")
+            || t.contains("remind"));
     way || hp || route
 }
 
@@ -4404,9 +5165,17 @@ async fn fuel_report(
     let burn_kg_hr = if live_burn_kg_hr > 1.0 {
         live_burn_kg_hr
     } else {
-        profile.fuel.as_ref().map(|f| f.cruise_burn_kg_hr).unwrap_or(0.0)
+        profile
+            .fuel
+            .as_ref()
+            .map(|f| f.cruise_burn_kg_hr)
+            .unwrap_or(0.0)
     };
-    let basis = if live_burn_kg_hr > 1.0 { "at this burn" } else { "at cruise" };
+    let basis = if live_burn_kg_hr > 1.0 {
+        "at this burn"
+    } else {
+        "at cruise"
+    };
 
     let dur = if burn_kg_hr > 0.0 {
         let hours = total_kg / burn_kg_hr;
@@ -4443,7 +5212,11 @@ async fn fuel_report(
             let (l, r) = (tanks[0] / AVGAS_KG_PER_GAL, tanks[1] / AVGAS_KG_PER_GAL);
             line.push_str(&format!(". Left {l:.0}, right {r:.0}"));
             if (l - r).abs() >= 5.0 {
-                line.push_str(if l > r { " — favor the right" } else { " — favor the left" });
+                line.push_str(if l > r {
+                    " — favor the right"
+                } else {
+                    " — favor the left"
+                });
             }
         }
     }
@@ -4451,21 +5224,33 @@ async fn fuel_report(
     // "what's left when we get there": project to the planned destination at the
     // live burn and judge it against the airframe's reserve. Airborne with a
     // known destination and real groundspeed only.
-    let dest = monitor::DESTINATION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let dest = monitor::DESTINATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     if let Some(d) = dest {
         if live_burn_kg_hr > 1.0 {
             let (lat, lon, gs_ms) = (
-                xp.get_float("sim/flightmodel/position/latitude").await.unwrap_or(0.0),
-                xp.get_float("sim/flightmodel/position/longitude").await.unwrap_or(0.0),
-                xp.get_float("sim/flightmodel/position/groundspeed").await.unwrap_or(0.0),
+                xp.get_float("sim/flightmodel/position/latitude")
+                    .await
+                    .unwrap_or(0.0),
+                xp.get_float("sim/flightmodel/position/longitude")
+                    .await
+                    .unwrap_or(0.0),
+                xp.get_float("sim/flightmodel/position/groundspeed")
+                    .await
+                    .unwrap_or(0.0),
             );
             let gs = gs_ms * MS_TO_KTS;
             if gs > 40.0 {
                 let dist = nav::haversine_nm(lat, lon, d.lat, d.lon);
                 let at_dest_kg = total_kg - live_burn_kg_hr * (dist / gs);
                 let mins_left = (at_dest_kg.max(0.0) / live_burn_kg_hr) * 60.0;
-                let reserve =
-                    profile.fuel.as_ref().map(|f| f.reserve_caution_min).unwrap_or(45.0);
+                let reserve = profile
+                    .fuel
+                    .as_ref()
+                    .map(|f| f.reserve_caution_min)
+                    .unwrap_or(45.0);
                 let at_dest_gal = at_dest_kg / AVGAS_KG_PER_GAL;
                 let verdict = if at_dest_kg <= 0.0 {
                     "that doesn't reach the destination — plan a fuel stop".to_string()
@@ -4522,11 +5307,20 @@ async fn answer_state_query(
     // (a seized engine lives at rel_seize_0, no "engine" in it) can't hide. It's
     // an early return because the scan is ~800 concurrent reads — a beat slower
     // than a single value, so it only runs when the pilot actually asks.
-    let asks_failures = t.contains("what's wrong") || t.contains("whats wrong")
-        || t.contains("anything wrong") || t.contains("any failure") || t.contains("failures")
-        || t.contains("anything fail") || t.contains("anything broken") || t.contains("malfunction")
-        || t.contains("systems check") || t.contains("system status") || t.contains("systems status")
-        || t.contains("status check") || t.contains("all systems") || t.contains("everything ok");
+    let asks_failures = t.contains("what's wrong")
+        || t.contains("whats wrong")
+        || t.contains("anything wrong")
+        || t.contains("any failure")
+        || t.contains("failures")
+        || t.contains("anything fail")
+        || t.contains("anything broken")
+        || t.contains("malfunction")
+        || t.contains("systems check")
+        || t.contains("system status")
+        || t.contains("systems status")
+        || t.contains("status check")
+        || t.contains("all systems")
+        || t.contains("everything ok");
     if asks_failures {
         return Some(match failures::scan(xp).await {
             Ok(f) => failures::summary(&f)
@@ -4544,7 +5338,8 @@ async fn answer_state_query(
     // "autothrottle" / "auto throttle" is the autoflight state, not the lever
     // position — answer the engage state and don't let the bare-throttle branch
     // below also fire ("autothrottle" contains "throttle").
-    let autothrottle_q = t.contains("autothrottle") || t.contains("auto throttle") || t.contains("auto-throttle");
+    let autothrottle_q =
+        t.contains("autothrottle") || t.contains("auto throttle") || t.contains("auto-throttle");
     if autothrottle_q {
         if let Ok(v) = read1(live, xp, "sim/cockpit2/autopilot/autothrottle_enabled").await {
             parts.push(match v {
@@ -4577,7 +5372,11 @@ async fn answer_state_query(
         }
     }
     // "speed" alone → airspeed, unless it was "vertical speed".
-    if t.contains("airspeed") || t.contains("air speed") || t.contains("how fast") || (t.contains("speed") && !vs_q) {
+    if t.contains("airspeed")
+        || t.contains("air speed")
+        || t.contains("how fast")
+        || (t.contains("speed") && !vs_q)
+    {
         if let Ok(v) = read1(live, xp, datarefs::AIRSPEED_KTS).await {
             parts.push(format!("{v:.0} knots"));
         }
@@ -4586,11 +5385,16 @@ async fn answer_state_query(
     // as fuel). "weather" gives the lot; specific words give just that field.
     let wx = t.contains("weather") || t.contains("metar") || t.contains("conditions");
     if wx || t.contains("wind") {
-        if let (Ok(dir), Ok(spd_ms)) =
-            (read1(live, xp, datarefs::WIND_DIR_DEG_TRUE).await, read1(live, xp, datarefs::WIND_SPEED_MSC).await)
-        {
+        if let (Ok(dir), Ok(spd_ms)) = (
+            read1(live, xp, datarefs::WIND_DIR_DEG_TRUE).await,
+            read1(live, xp, datarefs::WIND_SPEED_MSC).await,
+        ) {
             let kts = spd_ms * MS_TO_KTS;
-            parts.push(if kts < 1.0 { "wind calm".to_string() } else { format!("wind {dir:03.0} at {kts:.0} knots") });
+            parts.push(if kts < 1.0 {
+                "wind calm".to_string()
+            } else {
+                format!("wind {dir:03.0} at {kts:.0} knots")
+            });
         }
     }
     if wx || t.contains("visibility") {
@@ -4600,7 +5404,10 @@ async fn answer_state_query(
     }
     // "pressure" alone could mean the altimeter or the oil — exclude oil pressure
     // so "how's the oil pressure?" doesn't also blurt the altimeter setting.
-    if wx || t.contains("altimeter") || t.contains("qnh") || t.contains("barometric")
+    if wx
+        || t.contains("altimeter")
+        || t.contains("qnh")
+        || t.contains("barometric")
         || (t.contains("pressure") && !t.contains("oil"))
     {
         if let Ok(v) = read1(live, xp, datarefs::QNH_PASCALS).await {
@@ -4608,7 +5415,12 @@ async fn answer_state_query(
             parts.push(format!("altimeter {:.2}", v / 3386.389));
         }
     }
-    if wx || (t.contains("temperature") && !t.contains("oil")) || t.contains("how cold") || t.contains("how hot") || t.contains(" oat") {
+    if wx
+        || (t.contains("temperature") && !t.contains("oil"))
+        || t.contains("how cold")
+        || t.contains("how hot")
+        || t.contains(" oat")
+    {
         if let Ok(v) = read1(live, xp, datarefs::OAT_DEG_C).await {
             parts.push(format!("outside air temperature {v:.0} degrees celsius"));
         }
@@ -4617,11 +5429,24 @@ async fn answer_state_query(
     // General "how's the engine?" → a one-line health summary. Only when no
     // specific instrument is named (those are handled below, no double-up).
     if t.contains("engine")
-        && !["oil", "egt", "exhaust", "itt", "cht", "cylinder", "rpm", "n1", "n2", "fuel flow"]
-            .iter()
-            .any(|k| t.contains(k))
+        && ![
+            "oil",
+            "egt",
+            "exhaust",
+            "itt",
+            "cht",
+            "cylinder",
+            "rpm",
+            "n1",
+            "n2",
+            "fuel flow",
+        ]
+        .iter()
+        .any(|k| t.contains(k))
     {
-        let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running").await.is_some_and(|v| v > 0.5);
+        let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running")
+            .await
+            .is_some_and(|v| v > 0.5);
         if !running {
             parts.push(if turbine { "engines off" } else { "engine off" }.to_string());
         } else if turbine {
@@ -4636,30 +5461,47 @@ async fn answer_state_query(
             if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/ITT_deg_C").await {
                 bits.push(format!("I T T {v:.0} degrees"));
             }
-            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_pressure_psi").await {
+            if let Some(v) =
+                read_engine0(xp, "sim/cockpit2/engine/indicators/oil_pressure_psi").await
+            {
                 bits.push(format!("oil pressure {v:.0} pounds"));
             }
-            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/fuel_flow_kg_sec").await {
-                bits.push(format!("fuel flow {:.0} pounds an hour", v * 3600.0 * LB_PER_KG));
+            if let Some(v) =
+                read_engine0(xp, "sim/cockpit2/engine/indicators/fuel_flow_kg_sec").await
+            {
+                bits.push(format!(
+                    "fuel flow {:.0} pounds an hour",
+                    v * 3600.0 * LB_PER_KG
+                ));
             }
             parts.push(bits.join(", "));
         } else {
             let mut bits = vec!["engine running".to_string()];
-            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm").await {
+            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm").await
+            {
                 bits.push(format!("{v:.0} R P M"));
             }
-            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_pressure_psi").await {
+            if let Some(v) =
+                read_engine0(xp, "sim/cockpit2/engine/indicators/oil_pressure_psi").await
+            {
                 bits.push(format!("oil pressure {v:.0} pounds"));
             }
             // oil_temp / CHT datarefs read °F despite their names.
-            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_temperature_deg_C").await {
+            if let Some(v) =
+                read_engine0(xp, "sim/cockpit2/engine/indicators/oil_temperature_deg_C").await
+            {
                 bits.push(format!("oil temp {v:.0} degrees"));
             }
             if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/CHT_deg_C").await {
                 bits.push(format!("C H T {v:.0}"));
             }
-            if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/fuel_flow_kg_sec").await {
-                bits.push(format!("fuel flow {:.1} gallons an hour", v * 3600.0 / AVGAS_KG_PER_GAL));
+            if let Some(v) =
+                read_engine0(xp, "sim/cockpit2/engine/indicators/fuel_flow_kg_sec").await
+            {
+                bits.push(format!(
+                    "fuel flow {:.1} gallons an hour",
+                    v * 3600.0 / AVGAS_KG_PER_GAL
+                ));
             }
             parts.push(bits.join(", "));
         }
@@ -4693,7 +5535,9 @@ async fn answer_state_query(
     }
     if t.contains("oil temp") || (t.contains("oil") && t.contains("temperature")) {
         // oil_temperature_deg_C is misnamed — reads °F already.
-        if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/oil_temperature_deg_C").await {
+        if let Some(v) =
+            read_engine0(xp, "sim/cockpit2/engine/indicators/oil_temperature_deg_C").await
+        {
             parts.push(format!("oil temperature {v:.0} degrees"));
         }
     }
@@ -4727,28 +5571,42 @@ async fn answer_state_query(
             if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/N2_percent").await {
                 parts.push(format!("N 2 {v:.0} percent"));
             }
-        } else if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm").await {
+        } else if let Some(v) =
+            read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm").await
+        {
             parts.push(format!("{v:.0} R P M"));
         }
     }
     if t.contains("fuel flow") || t.contains("flow") || t.contains("burning") {
         if let Some(v) = read_engine0(xp, "sim/cockpit2/engine/indicators/fuel_flow_kg_sec").await {
             if turbine {
-                parts.push(format!("fuel flow {:.0} pounds an hour", v * 3600.0 * LB_PER_KG));
+                parts.push(format!(
+                    "fuel flow {:.0} pounds an hour",
+                    v * 3600.0 * LB_PER_KG
+                ));
             } else {
-                parts.push(format!("fuel flow {:.1} gallons an hour", v * 3600.0 / AVGAS_KG_PER_GAL));
+                parts.push(format!(
+                    "fuel flow {:.1} gallons an hour",
+                    v * 3600.0 / AVGAS_KG_PER_GAL
+                ));
             }
         }
     }
-    if t.contains("ammeter") || t.contains("amps") || t.contains("charging")
-        || t.contains("battery") || t.contains("voltage") || t.contains("volts")
+    if t.contains("ammeter")
+        || t.contains("amps")
+        || t.contains("charging")
+        || t.contains("battery")
+        || t.contains("voltage")
+        || t.contains("volts")
         || t.contains("state of charge")
     {
         // Report VOLTAGE and amps together. Amps alone is misleading: a dead-flat
         // battery reads "+15 amps charging" while sitting at 20 volts, going
         // nowhere (seen live). Voltage is the state-of-charge/health number; amps
         // is only the direction of flow. The copilot used to read only amps.
-        if let Some(v) = read_engine0(xp, "sim/cockpit2/electrical/battery_voltage_actual_volts").await {
+        if let Some(v) =
+            read_engine0(xp, "sim/cockpit2/electrical/battery_voltage_actual_volts").await
+        {
             let health = if battery_low(v) { " (low)" } else { "" };
             parts.push(format!("battery {v:.1} volts{health}"));
         }
@@ -4756,7 +5614,13 @@ async fn answer_state_query(
             parts.push(format!("bus {v:.1} volts"));
         }
         if let Some(v) = read_engine0(xp, "sim/cockpit2/electrical/battery_amps").await {
-            let state = if v > 1.0 { "charging" } else if v < -1.0 { "discharging" } else { "steady" };
+            let state = if v > 1.0 {
+                "charging"
+            } else if v < -1.0 {
+                "discharging"
+            } else {
+                "steady"
+            };
             parts.push(format!("{v:+.0} amps, {state}"));
         }
     }
@@ -4823,7 +5687,10 @@ async fn state_snapshot(
         }
     }
     if let Ok(v) = og {
-        parts.push(format!("on the ground: {}", if v > 0.5 { "yes" } else { "no" }));
+        parts.push(format!(
+            "on the ground: {}",
+            if v > 0.5 { "yes" } else { "no" }
+        ));
     }
     if let Ok(v) = fuel {
         // Report in gallons (how a GA pilot thinks) with the mass alongside, plus an
@@ -4863,7 +5730,10 @@ async fn state_snapshot(
     // Engine status — only when X-Plane is actually reachable (some scalar read
     // succeeded), since engine_running defaults to true when it can't read.
     if !parts.is_empty() {
-        parts.push(format!("engines {}", if engine { "running" } else { "off" }));
+        parts.push(format!(
+            "engines {}",
+            if engine { "running" } else { "off" }
+        ));
     }
     if ap != "--" {
         parts.push(format!("autopilot {ap}"));
@@ -5004,23 +5874,77 @@ fn undoable_drefs(tool: &str) -> &'static [Undoable] {
     match tool {
         "set_flaps" => &[("sim/cockpit2/controls/flap_ratio", "flaps", F)],
         "gear" => &[("sim/cockpit2/controls/gear_handle_down", "the gear", F)],
-        "speedbrake" => &[("sim/cockpit2/controls/speedbrake_ratio", "the speedbrakes", F)],
-        "set_throttle" => &[("sim/cockpit2/engine/actuators/throttle_ratio_all", "throttle", F)],
-        "set_mixture" | "lean_mixture" => &[("sim/cockpit2/engine/actuators/mixture_ratio_all", "mixture", F)],
+        "speedbrake" => &[(
+            "sim/cockpit2/controls/speedbrake_ratio",
+            "the speedbrakes",
+            F,
+        )],
+        "set_throttle" => &[(
+            "sim/cockpit2/engine/actuators/throttle_ratio_all",
+            "throttle",
+            F,
+        )],
+        "set_mixture" | "lean_mixture" => &[(
+            "sim/cockpit2/engine/actuators/mixture_ratio_all",
+            "mixture",
+            F,
+        )],
         "set_pitch_trim" => &[("sim/cockpit2/controls/elevator_trim", "pitch trim", F)],
-        "set_barometer" | "set_altimeter_current" => {
-            &[("sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot", "the altimeter", F)]
-        }
-        "set_parking_brake" => &[("sim/cockpit2/controls/parking_brake_ratio", "the parking brake", F)],
-        "set_heading" => &[("sim/cockpit2/autopilot/heading_dial_deg_mag_pilot", "the heading bug", F)],
-        "set_altitude" => &[("sim/cockpit2/autopilot/altitude_dial_ft", "the altitude select", F)],
-        "set_vertical_speed" | "set_climb" => &[("sim/cockpit/autopilot/vertical_velocity", "vertical speed", F)],
-        "set_transponder" => &[("sim/cockpit2/radios/actuators/transponder_code", "the squawk", I)],
-        "set_transponder_mode" => &[("sim/cockpit2/radios/actuators/transponder_mode", "the transponder mode", I)],
-        "set_com1" => &[("sim/cockpit2/radios/actuators/com1_frequency_hz_833", "com 1", I)],
-        "set_com2" => &[("sim/cockpit2/radios/actuators/com2_frequency_hz_833", "com 2", I)],
-        "set_nav1" => &[("sim/cockpit2/radios/actuators/nav1_frequency_hz", "nav 1", I)],
-        "set_obs" => &[("sim/cockpit2/radios/actuators/nav1_obs_deg_mag_pilot", "the OBS", F)],
+        "set_barometer" | "set_altimeter_current" => &[(
+            "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot",
+            "the altimeter",
+            F,
+        )],
+        "set_parking_brake" => &[(
+            "sim/cockpit2/controls/parking_brake_ratio",
+            "the parking brake",
+            F,
+        )],
+        "set_heading" => &[(
+            "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot",
+            "the heading bug",
+            F,
+        )],
+        "set_altitude" => &[(
+            "sim/cockpit2/autopilot/altitude_dial_ft",
+            "the altitude select",
+            F,
+        )],
+        "set_vertical_speed" | "set_climb" => &[(
+            "sim/cockpit/autopilot/vertical_velocity",
+            "vertical speed",
+            F,
+        )],
+        "set_transponder" => &[(
+            "sim/cockpit2/radios/actuators/transponder_code",
+            "the squawk",
+            I,
+        )],
+        "set_transponder_mode" => &[(
+            "sim/cockpit2/radios/actuators/transponder_mode",
+            "the transponder mode",
+            I,
+        )],
+        "set_com1" => &[(
+            "sim/cockpit2/radios/actuators/com1_frequency_hz_833",
+            "com 1",
+            I,
+        )],
+        "set_com2" => &[(
+            "sim/cockpit2/radios/actuators/com2_frequency_hz_833",
+            "com 2",
+            I,
+        )],
+        "set_nav1" => &[(
+            "sim/cockpit2/radios/actuators/nav1_frequency_hz",
+            "nav 1",
+            I,
+        )],
+        "set_obs" => &[(
+            "sim/cockpit2/radios/actuators/nav1_obs_deg_mag_pilot",
+            "the OBS",
+            F,
+        )],
         _ => &[],
     }
 }
@@ -5074,86 +5998,245 @@ fn join_and(items: &[String]) -> String {
 const COMMAND_KEYWORDS: &[&str] = &[
     // radio calls to the ATC station ("request taxi"/"radio"/"takeoff"/
     // "departure" are already covered below; these two aren't)
-    "clearance", "tower",
+    "clearance",
+    "tower",
     // flaps / gear / trim
-    "flap", "flaps", "gear", "trim",
+    "flap",
+    "flaps",
+    "gear",
+    "trim",
     // autopilot / vertical nav
-    "autopilot", "heading", "altitude", "climb", "descend", "maintain", "level",
-    "vertical", "vs", "approach", "ils", "localizer", "glideslope", "obs",
-    "course", "radial", "runway",
+    "autopilot",
+    "heading",
+    "altitude",
+    "climb",
+    "descend",
+    "maintain",
+    "level",
+    "vertical",
+    "vs",
+    "approach",
+    "ils",
+    "localizer",
+    "glideslope",
+    "obs",
+    "course",
+    "radial",
+    "runway",
     // vertical-nav synonyms whisper actually produced that the gate missed:
     // "ascend 500" (for climb), "physical speed 500" (mishear of vertical speed).
-    "ascend", "ascent", "speed",
+    "ascend",
+    "ascent",
+    "speed",
     // airliner autoflight: AP speed select + autothrottle
-    "airspeed", "autothrottle",
+    "airspeed",
+    "autothrottle",
     // speedbrakes / spoilers
-    "speedbrake", "speedbrakes", "spoiler", "spoilers",
+    "speedbrake",
+    "speedbrakes",
+    "spoiler",
+    "spoilers",
     // reverse thrust: "thrust" is above, but the bare rollout call is
     // "Reverse thrusters!" — and "thrusters" is 3 edits from "thrust", so the
     // fuzzy match never saves it. Ate the pilot's actual landing-rollout call
     // on the Twotter's first reverse flight (2026-07-09) while the wordier
     // "set reverse power" phrasings sailed through on "power".
-    "reverse", "reversers", "thrusters", "stow",
+    "reverse",
+    "reversers",
+    "thrusters",
+    "stow",
     // lights
-    "light", "lights", "beacon", "strobe", "strobes", "taxi", "landing", "nav",
-    "navigation", "flood", "floods",
+    "light",
+    "lights",
+    "beacon",
+    "strobe",
+    "strobes",
+    "taxi",
+    "landing",
+    "nav",
+    "navigation",
+    "flood",
+    "floods",
     // engine / fuel
-    "throttle", "thrust", "power", "idle", "mixture", "rich", "lean", "engine",
-    "engines", "start", "ignition", "shutdown", "magneto", "magnetos", "mags", "carb",
-    "carburetor", "fuel", "pump", "boost", "primer", "selector",
+    "throttle",
+    "thrust",
+    "power",
+    "idle",
+    "mixture",
+    "rich",
+    "lean",
+    "engine",
+    "engines",
+    "start",
+    "ignition",
+    "shutdown",
+    "magneto",
+    "magnetos",
+    "mags",
+    "carb",
+    "carburetor",
+    "fuel",
+    "pump",
+    "boost",
+    "primer",
+    "selector",
     // constant-speed props ("props", so len>=5 fuzzy also catches whisper's
     // "prope"/"propp"; "rpm" for the explicit-RPM phrasing).
-    "prop", "props", "propeller", "propellers", "rpm", "feather",
+    "prop",
+    "props",
+    "propeller",
+    "propellers",
+    "rpm",
+    "feather",
     // electrical
-    "battery", "alternator", "generator", "avionics", "electrical", "electric",
-    "electrics", "bus", "master", "inverter", "inverters", "efis",
+    "battery",
+    "alternator",
+    "generator",
+    "avionics",
+    "electrical",
+    "electric",
+    "electrics",
+    "bus",
+    "master",
+    "inverter",
+    "inverters",
+    "efis",
     // radios / transponder
-    "com", "comm", "radio", "frequency", "tune", "squawk", "transponder",
-    "ident", "barometer", "altimeter", "baro", "kollsman", "qnh", "vor",
+    "com",
+    "comm",
+    "radio",
+    "frequency",
+    "tune",
+    "squawk",
+    "transponder",
+    "ident",
+    "barometer",
+    "altimeter",
+    "baro",
+    "kollsman",
+    "qnh",
+    "vor",
     // instruments / misc controls ("break(s)" = the STT homophone the
     // grammar already tolerates; "release breaks" was gate-swallowed)
-    "gyro", "pitot", "brake", "brakes", "break", "breaks", "parking", "heat",
+    "gyro",
+    "pitot",
+    "brake",
+    "brakes",
+    "break",
+    "breaks",
+    "parking",
+    "heat",
     // ramp / ground-ops: chocks, ground power, pushback, services
-    "chocks", "chock", "pushback", "push", "tug", "gpu", "ground", "refuel",
-    "service", "services",
+    "chocks",
+    "chock",
+    "pushback",
+    "push",
+    "tug",
+    "gpu",
+    "ground",
+    "refuel",
+    "service",
+    "services",
     // checklist invocations: "checklist(s)" is the trigger word every one shares
     // (so "normal take-off checklist" reaches the LLM even when STT splits
     // "takeoff"), plus the phase words for the shorthand ("configure for takeoff").
-    "checklist", "checklists", "takeoff", "configure", "config", "departure",
-    "secure", "clean", "cruise", "preflight", "limits", "performance",
+    "checklist",
+    "checklists",
+    "takeoff",
+    "configure",
+    "config",
+    "departure",
+    "secure",
+    "clean",
+    "cruise",
+    "preflight",
+    "limits",
+    "performance",
     // systems-status check + reference-limit / V-speed queries
-    "systems", "system", "vne", "vno", "vfe", "vspeed", "vspeeds",
+    "systems",
+    "system",
+    "vne",
+    "vno",
+    "vfe",
+    "vspeed",
+    "vspeeds",
     // aircraft-info queries
-    "aircraft", "plane", "cessna", "skyhawk",
+    "aircraft",
+    "plane",
+    "cessna",
+    "skyhawk",
     // SimBrief flight plan + loading the route into the GPS/FMS
-    "simbrief", "flightplan", "plan", "route", "load", "program", "gps", "fms",
+    "simbrief",
+    "flightplan",
+    "plan",
+    "route",
+    "load",
+    "program",
+    "gps",
+    "fms",
     // couple the autopilot to the flight plan
-    "navigate", "follow", "track",
+    "navigate",
+    "follow",
+    "track",
     // navigation progress queries
-    "waypoint", "eta",
+    "waypoint",
+    "eta",
     // ETA to the destination ("time before we land", "when do we arrive")
-    "land", "destination", "arrive", "arrival",
+    "land",
+    "destination",
+    "arrive",
+    "arrival",
     // time/distance to top of descent
-    "descent", "tod",
+    "descent",
+    "tod",
     // reminders ("wake me at top of descent", "remind me in 10 minutes")
-    "wake", "remind", "notify", "heads-up", "reminder", "reminders", "cancel",
+    "wake",
+    "remind",
+    "notify",
+    "heads-up",
+    "reminder",
+    "reminders",
+    "cancel",
     // emergency abort/undo of the last action
-    "belay", "undo", "abort", "disregard", "scratch", "revert",
+    "belay",
+    "undo",
+    "abort",
+    "disregard",
+    "scratch",
+    "revert",
     // emergency recovery / take-control + autoland handoff ("land"/"ground" already above)
-    "recover", "stabilize", "stabilise", "control", "controls", "autoland",
+    "recover",
+    "stabilize",
+    "stabilise",
+    "control",
+    "controls",
+    "autoland",
     // the full-length line-up ("backtrack runway 09")
     "backtrack",
     // auto circuit — the whole traffic pattern ("do a circuit", "fly the
     // pattern", "circuits and bumps"). Without these the domain gate dropped
     // "do a circuit" as not-a-command, before the grammar ever saw it
     // (2026-07-23). "takeoff"/"land" already cover "take off and land".
-    "circuit", "circuits", "pattern", "traffic",
+    "circuit",
+    "circuits",
+    "pattern",
+    "traffic",
     // full auto — the whole flight from cold ("full auto", "do everything",
     // "start up and fly", "fly from cold").
-    "auto", "automated", "everything", "cold", "fly",
+    "auto",
+    "automated",
+    "everything",
+    "cold",
+    "fly",
     // fly_procedure — real published SID/approach ("fly the ILS", "shoot the
     // approach", "fly the SID/arrival/departure").
-    "approach", "ils", "rnav", "sid", "departure", "arrival", "shoot",
+    "approach",
+    "ils",
+    "rnav",
+    "sid",
+    "departure",
+    "arrival",
+    "shoot",
 ];
 
 /// True if the utterance is a question about the flight (answered from state,
@@ -5171,15 +6254,17 @@ fn looks_like_question(text: &str) -> bool {
         return true;
     }
     const OPENERS: &[&str] = &[
-        "what", "what's", "whats", "how", "how's", "hows", "how much", "how many",
-        "how far", "how high", "how fast", "where", "where's", "wheres", "when",
-        "when's", "whens", "which", "why", "why's", "whys", "who", "who's", "whos",
-        "tell me",
+        "what", "what's", "whats", "how", "how's", "hows", "how much", "how many", "how far",
+        "how high", "how fast", "where", "where's", "wheres", "when", "when's", "whens", "which",
+        "why", "why's", "whys", "who", "who's", "whos", "tell me",
         // Generic auxiliaries: no command starts with these, and they must beat the
         // command grammar ("is our heading 270?" answers, never acts).
         "is", "are", "am", "have", "has",
     ];
-    if OPENERS.iter().any(|o| t == *o || t.starts_with(&format!("{o} "))) {
+    if OPENERS
+        .iter()
+        .any(|o| t == *o || t.starts_with(&format!("{o} ")))
+    {
         return true;
     }
     // do-support ("do/does/did") is a question ONLY with a subject pronoun after
@@ -5190,7 +6275,9 @@ fn looks_like_question(text: &str) -> bool {
     const DO_SUBJECTS: &[&str] = &["you", "we", "i", "it", "they", "he", "she", "this", "that"];
     for aux in ["do", "does", "did"] {
         if let Some(rest) = t.strip_prefix(&format!("{aux} ")) {
-            return DO_SUBJECTS.iter().any(|s| rest == *s || rest.starts_with(&format!("{s} ")));
+            return DO_SUBJECTS
+                .iter()
+                .any(|s| rest == *s || rest.starts_with(&format!("{s} ")));
         }
     }
     false
@@ -5205,8 +6292,11 @@ fn looks_like_command(text: &str) -> bool {
     // keyword "takeoff") and "line us up" were both swallowed WITHOUT EVEN
     // A MISS CHIME, live 2026-07-20. Checked on the raw text first.
     let t = text.to_ascii_lowercase();
-    if t.contains("take off") || t.contains("line up") || t.contains("line us up")
-        || t.contains("line me up") || t.contains("lined up")
+    if t.contains("take off")
+        || t.contains("line up")
+        || t.contains("line us up")
+        || t.contains("line me up")
+        || t.contains("lined up")
     {
         return true;
     }
@@ -5245,8 +6335,8 @@ fn looks_like_command(text: &str) -> bool {
 ///   re-stating the value of the command just given ("throttle fifty" → "seventy").
 fn looks_like_followup(text: &str) -> bool {
     const FOLLOWUP_WORDS: &[&str] = &[
-        "it", "that", "them", "those", "again", "back", "undo", "revert",
-        "reset", "more", "less", "instead", "also", "other", "same", "too",
+        "it", "that", "them", "those", "again", "back", "undo", "revert", "reset", "more", "less",
+        "instead", "also", "other", "same", "too",
     ];
     // A SHORT bare quantity is an adjustment to the last command ("sixty
     // percent", "two thousand five hundred"). A long string of numbers ("one two
@@ -5344,9 +6434,7 @@ fn command_subject(cmd: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     for w in cmd.split_whitespace() {
         let bare = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-        if bare.chars().any(|c| c.is_ascii_digit())
-            || is_value_word(&bare.to_ascii_lowercase())
-        {
+        if bare.chars().any(|c| c.is_ascii_digit()) || is_value_word(&bare.to_ascii_lowercase()) {
             break;
         }
         out.push(w);
@@ -5411,7 +6499,11 @@ fn install_home_station(config: &Config, voice: &voice::Voice) -> Option<station
     station::spawn_taxi_net_load(config.apt_data_path.clone(), home_icao.clone());
     // ILS + real approach platforms (earth_nav.dat + CIFP scans, also
     // backgrounded): vectors offer the ILS once this lands.
-    station::spawn_ils_load(config.nav_data_path.clone(), config.cifp_dir.clone(), home_icao);
+    station::spawn_ils_load(
+        config.nav_data_path.clone(),
+        config.cifp_dir.clone(),
+        home_icao,
+    );
     // Enroute region: index every towered field (a full apt.dat pass, so a
     // background thread) so the flight can outgrow its departure airport —
     // the monitor's region_tick hands off to whichever tower is nearest.
@@ -5510,17 +6602,12 @@ async fn position(xp: &XPlaneClient) -> Option<(f64, f64, f64)> {
 /// Just those two chips: the full comm plan lives in the ATC tab now
 /// (2026-07-10), and repeating every frequency here was noise. An empty
 /// airport (active station out of VHF range) leaves only the COM1 chip.
-fn radio_panel_line(
-    airport: &str,
-    services: &[(String, i64)],
-    com1_khz: Option<i64>,
-) -> String {
+fn radio_panel_line(airport: &str, services: &[(String, i64)], com1_khz: Option<i64>) -> String {
     let mut parts = Vec::new();
     if !airport.is_empty() {
         parts.push(airport.to_uppercase());
     }
-    let tuned = com1_khz
-        .and_then(|c| services.iter().find(|(_, khz)| (c - khz).abs() <= 5));
+    let tuned = com1_khz.and_then(|c| services.iter().find(|(_, khz)| (c - khz).abs() <= 5));
     match (tuned, com1_khz) {
         (Some((word, khz)), _) => parts.push(format!(
             ">{} {:.3}",
@@ -5548,7 +6635,11 @@ fn atc_panel_payload(fields: &[station::RangedField]) -> String {
         }
         // The separators are structural — scrub them from free-text names.
         let name = f.name.replace(['|', ','], " ");
-        seg.push_str(&format!("{},{}", name.trim().to_uppercase(), f.dist_nm.round() as i64));
+        seg.push_str(&format!(
+            "{},{}",
+            name.trim().to_uppercase(),
+            f.dist_nm.round() as i64
+        ));
         for (word, khz) in &f.services {
             seg.push_str(&format!(",{} {khz}", service_label(word)));
         }
@@ -5627,7 +6718,10 @@ mod tests {
         assert!(mk(1.0, 0.0).is_pressed() && mk(0.0, 1.0).is_pressed());
         // No radio dataref bound → radio is never pressed; intercom still works.
         let p = Ptt::Dataref {
-            live: Arc::new(crate::livestate::LiveState::from_pairs(&[(intercom_dref, 1.0)])),
+            live: Arc::new(crate::livestate::LiveState::from_pairs(&[(
+                intercom_dref,
+                1.0,
+            )])),
             name: intercom_dref.to_string(),
             radio: String::new(),
         };
@@ -5636,7 +6730,10 @@ mod tests {
         // state), physical routing is complete and intercom speech must never
         // content-route to ATC; without one, content routing is the only path
         // to the tower and stays. A keyboard PTT is never a radio.
-        assert!(mk(0.0, 0.0).has_radio_channel(), "bound radio key, even unpressed");
+        assert!(
+            mk(0.0, 0.0).has_radio_channel(),
+            "bound radio key, even unpressed"
+        );
         assert!(!p.has_radio_channel(), "no radio dataref bound");
         assert!(!Ptt::Key(device_query::Keycode::F13).has_radio_channel());
     }
@@ -5669,9 +6766,13 @@ mod tests {
             name: name.to_string(),
             dist_nm: dist,
             active,
-            services: vec![("tower".to_string(), 118325_i64), ("atis".to_string(), 121800)],
+            services: vec![
+                ("tower".to_string(), 118325_i64),
+                ("atis".to_string(), 121800),
+            ],
         };
-        let payload = super::atc_panel_payload(&[f("Badajoz", 21.7, false), f("Gibraltar", 2.1, true)]);
+        let payload =
+            super::atc_panel_payload(&[f("Badajoz", 21.7, false), f("Gibraltar", 2.1, true)]);
         assert_eq!(
             payload,
             "BADAJOZ,22,TWR 118325,ATIS 121800|*GIBRALTAR,2,TWR 118325,ATIS 121800"
@@ -5679,10 +6780,15 @@ mod tests {
         // Separators are structural — a name containing them can't corrupt
         // neighbouring fields.
         let payload = super::atc_panel_payload(&[f("El Molinillo, Almendralejo|x", 3.0, false)]);
-        assert!(payload.starts_with("EL MOLINILLO  ALMENDRALEJO X,3,"), "{payload}");
+        assert!(
+            payload.starts_with("EL MOLINILLO  ALMENDRALEJO X,3,"),
+            "{payload}"
+        );
         // Too many fields: trailing ones drop instead of overflowing the
         // plugin's 500-byte text buffer.
-        let many: Vec<_> = (0..40).map(|i| f(&format!("Field Number {i:02}"), i as f64, false)).collect();
+        let many: Vec<_> = (0..40)
+            .map(|i| f(&format!("Field Number {i:02}"), i as f64, false))
+            .collect();
         let payload = super::atc_panel_payload(&many);
         assert!(payload.len() <= crate::plugin_status::TEXT_MAX);
         assert!(payload.contains("FIELD NUMBER 00"));
@@ -5690,9 +6796,21 @@ mod tests {
 
     #[test]
     fn undo_recognizes_emergency_phrasings() {
-        for w in ["belay that", "undo", "undo that", "abort", "scratch that", "as you were",
-                  "disregard", "revert", "reverse that", "take it back", "cancel that",
-                  "abort. didn't catch a command there. abort.", "a boat"] {
+        for w in [
+            "belay that",
+            "undo",
+            "undo that",
+            "abort",
+            "scratch that",
+            "as you were",
+            "disregard",
+            "revert",
+            "reverse that",
+            "take it back",
+            "cancel that",
+            "abort. didn't catch a command there. abort.",
+            "a boat",
+        ] {
             assert!(is_undo(w), "{w:?} should trigger undo");
         }
         // Not an undo (would clobber normal speech / the reminder cancel).
@@ -5712,9 +6830,17 @@ mod tests {
     #[test]
     fn reference_limits_come_from_the_profile() {
         let p = super::aircraft::load("cessna_172sp").expect("profile");
-        assert_eq!(super::reference_limits(&p, "what's best glide").as_deref(), Some("best glide 68 knots."));
-        assert_eq!(super::reference_limits(&p, "rotation speed").as_deref(), Some("rotate at 55 knots."));
-        assert!(super::reference_limits(&p, "what's vy").unwrap().contains("74 knots"));
+        assert_eq!(
+            super::reference_limits(&p, "what's best glide").as_deref(),
+            Some("best glide 68 knots.")
+        );
+        assert_eq!(
+            super::reference_limits(&p, "rotation speed").as_deref(),
+            Some("rotate at 55 knots.")
+        );
+        assert!(super::reference_limits(&p, "what's vy")
+            .unwrap()
+            .contains("74 knots"));
         // Vfe is derived from the flap detents, grouped by speed.
         assert_eq!(
             super::reference_limits(&p, "flap speed").as_deref(),
@@ -5725,9 +6851,16 @@ mod tests {
 
         // The SR22 carries its own card — different numbers, same machinery.
         let sr = super::aircraft::load("cirrus_sr22").expect("sr22 profile");
-        assert_eq!(super::reference_limits(&sr, "best glide").as_deref(), Some("best glide 88 knots."));
-        assert!(super::reference_limits(&sr, "never exceed").unwrap().contains("204"));
-        assert!(super::reference_limits(&sr, "max crosswind").unwrap().contains("21"));
+        assert_eq!(
+            super::reference_limits(&sr, "best glide").as_deref(),
+            Some("best glide 88 knots.")
+        );
+        assert!(super::reference_limits(&sr, "never exceed")
+            .unwrap()
+            .contains("204"));
+        assert!(super::reference_limits(&sr, "max crosswind")
+            .unwrap()
+            .contains("21"));
     }
 
     #[test]
@@ -5735,13 +6868,22 @@ mod tests {
         let p = super::aircraft::load("md82").expect("md82 profile loads");
         assert_eq!(p.id, "md82");
         assert!(p.autopilot && p.throttle && p.retractable_gear);
-        assert!(!p.engine && !p.magnetos && !p.carb_heat, "jet has no piston systems");
+        assert!(
+            !p.engine && !p.magnetos && !p.carb_heat,
+            "jet has no piston systems"
+        );
         assert_eq!(p.vne_kts, Some(340.0)); // Vmo
         let reg = super::tools::Registry::for_aircraft(&p);
         assert!(reg.get("gear").is_some(), "retractable gear -> gear tool");
-        assert!(reg.get("set_throttle").is_some(), "throttle flag -> thrust levers");
+        assert!(
+            reg.get("set_throttle").is_some(),
+            "throttle flag -> thrust levers"
+        );
         assert!(reg.get("set_mixture").is_none(), "no mixture on a jet");
-        assert!(reg.get("start_engine").is_none(), "no piston start on a jet");
+        assert!(
+            reg.get("start_engine").is_none(),
+            "no piston start on a jet"
+        );
         assert!(reg.get("set_flaps").is_some());
         // Electrical is wired (battery, generators, avionics, "all"), so "all
         // electrical systems on" has a tool to land on.
@@ -5752,23 +6894,44 @@ mod tests {
         // set_electrical (the remap once powered the aircraft back up on a
         // shutdown request).
         use serde_json::json;
-        assert!(super::wants_procedural_power_up("set_electrical", &json!({"system":"all","on":true})));
-        assert!(super::wants_procedural_power_up("set_electrical", &json!({"system":"all"})));
-        assert!(!super::wants_procedural_power_up("set_electrical", &json!({"system":"all","on":false})));
-        assert!(!super::wants_procedural_power_up("set_electrical", &json!({"system":"battery","on":true})));
+        assert!(super::wants_procedural_power_up(
+            "set_electrical",
+            &json!({"system":"all","on":true})
+        ));
+        assert!(super::wants_procedural_power_up(
+            "set_electrical",
+            &json!({"system":"all"})
+        ));
+        assert!(!super::wants_procedural_power_up(
+            "set_electrical",
+            &json!({"system":"all","on":false})
+        ));
+        assert!(!super::wants_procedural_power_up(
+            "set_electrical",
+            &json!({"system":"battery","on":true})
+        ));
         // Jet start sequence, not the piston one-shot.
         assert!(reg.get("start_engines").is_some());
         assert!(reg.get("start_engine").is_none());
         // Pitot heat goes through the overhead heat knob (the stock command is a
         // no-op on this airframe), and "speed for landing" has a figure to use.
-        assert_eq!(p.pitot_heat_dataref.as_deref(), Some("laminar/md82/ice/heatknob"));
-        assert_eq!(p.reference.as_ref().and_then(|r| r.approach_kts), Some(140.0));
+        assert_eq!(
+            p.pitot_heat_dataref.as_deref(),
+            Some("laminar/md82/ice/heatknob")
+        );
+        assert_eq!(
+            p.reference.as_ref().and_then(|r| r.approach_kts),
+            Some(140.0)
+        );
         // ...and the piston 172 is the other way round.
-        let c172 = super::tools::Registry::for_aircraft(&super::aircraft::load("cessna_172sp").unwrap());
+        let c172 =
+            super::tools::Registry::for_aircraft(&super::aircraft::load("cessna_172sp").unwrap());
         assert!(c172.get("start_engines").is_none());
         assert!(c172.get("start_engine").is_some());
         // Reference card answers from the POM.
-        assert!(super::reference_limits(&p, "service ceiling").unwrap().contains("37,000"));
+        assert!(super::reference_limits(&p, "service ceiling")
+            .unwrap()
+            .contains("37,000"));
         // "What are we in" describes it as a twin-engine jet, not single-engine.
         let info = super::aircraft_info(&p, "what aircraft are we in").unwrap();
         assert!(info.contains("twin-engine jet"), "got: {info}");
@@ -5780,7 +6943,10 @@ mod tests {
     #[test]
     fn join_and_reads_naturally() {
         assert_eq!(join_and(&["flaps".into()]), "flaps");
-        assert_eq!(join_and(&["flaps".into(), "throttle".into()]), "flaps and throttle");
+        assert_eq!(
+            join_and(&["flaps".into(), "throttle".into()]),
+            "flaps and throttle"
+        );
         assert_eq!(
             join_and(&["flaps".into(), "throttle".into(), "mixture".into()]),
             "flaps, throttle, and mixture"
@@ -5811,43 +6977,89 @@ mod tests {
     #[test]
     fn real_commands_pass_the_domain_gate() {
         for c in [
-            "flaps ten", "gear up", "landing light on", "strobes off",
-            "autopilot heading 270", "climb and maintain 7000", "descend at 500",
-            "throttle 60 percent", "mixture full rich", "start the engine",
-            "battery on", "squawk 1200", "align the gyro", "pitot heat on",
-            "fuel pump on", "carb heat off", "magnetos both", "trim nose up",
-            "nav one 109.5", "set the OBS to 240", "com two 121.9",
-            "transponder standby", "prepare the ILS for runway 13", "flood lights on",
+            "flaps ten",
+            "gear up",
+            "landing light on",
+            "strobes off",
+            "autopilot heading 270",
+            "climb and maintain 7000",
+            "descend at 500",
+            "throttle 60 percent",
+            "mixture full rich",
+            "start the engine",
+            "battery on",
+            "squawk 1200",
+            "align the gyro",
+            "pitot heat on",
+            "fuel pump on",
+            "carb heat off",
+            "magnetos both",
+            "trim nose up",
+            "nav one 109.5",
+            "set the OBS to 240",
+            "com two 121.9",
+            "transponder standby",
+            "prepare the ILS for runway 13",
+            "flood lights on",
             // Phrasings that previously fell through the gate (issue: rejected
             // before reaching the LLM).
-            "electrics off", "fix the gyro drift", "master switch on",
-            "generator on", "squawk VFR",
+            "electrics off",
+            "fix the gyro drift",
+            "master switch on",
+            "generator on",
+            "squawk VFR",
             // Verbatim whisper output from logs/ that the gate used to reject —
             // recovered by the ignition/ascend/speed keywords.
-            "Ignition on.", "Ascend 500 feet per minute.", "Physical speed 500.",
+            "Ignition on.",
+            "Ascend 500 feet per minute.",
+            "Physical speed 500.",
             // Whisper glued "flood lights" into one token; the compound and its
             // "blood" mishearing must still reach the LLM.
-            "Floodlights on.", "Turn on the floodlights.", "Increase floodlights.",
-            "Bloodlights on.", "landinglight on",
+            "Floodlights on.",
+            "Turn on the floodlights.",
+            "Increase floodlights.",
+            "Bloodlights on.",
+            "landinglight on",
             // Phase-config macro invocations must reach the LLM.
-            "configure for takeoff", "set up for takeoff", "takeoff config",
-            "get ready for takeoff", "prep for departure",
-            "configure for landing", "get ready for landing",
-            "after landing", "clean up", "clear of the runway",
-            "secure the aircraft", "secure", "full shutdown",
+            "configure for takeoff",
+            "set up for takeoff",
+            "takeoff config",
+            "get ready for takeoff",
+            "prep for departure",
+            "configure for landing",
+            "get ready for landing",
+            "after landing",
+            "clean up",
+            "clear of the runway",
+            "secure the aircraft",
+            "secure",
+            "full shutdown",
             // "checklist" carries any phase past the gate, even hyphenated STT.
-            "Normal take-off checklist.", "starting engine checklist", "preflight checklist",
+            "Normal take-off checklist.",
+            "starting engine checklist",
+            "preflight checklist",
             // The bare rollout call — silently gated on the Twotter's first
             // reverse flight ("thrusters" is too far from "thrust" for fuzzy).
-            "Reverse thrusters.", "reversers", "stow reverse", "cancel reverse",
+            "Reverse thrusters.",
+            "reversers",
+            "stow reverse",
+            "cancel reverse",
             // Split compounds — swallowed with no miss chime, live 2026-07-20.
-            "Take off for me.", "Let's take off.", "You have to take off.",
-            "Line us up.", "line me up", "Get us lined up.",
+            "Take off for me.",
+            "Let's take off.",
+            "You have to take off.",
+            "Line us up.",
+            "line me up",
+            "Get us lined up.",
             // Auto circuit — the whole pattern. "Do a circuit" was dropped as
             // not-a-command (circuit vocabulary missing from the gate), live
             // 2026-07-23.
-            "Do a circuit.", "fly a circuit", "fly the pattern",
-            "circuits and bumps", "make a right circuit", "take off and land",
+            "Do a circuit.",
+            "fly a circuit",
+            "fly the pattern",
+            "circuits and bumps",
+            "make a right circuit",
+            "take off and land",
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
         }
@@ -5864,20 +7076,35 @@ mod tests {
         // the real 172 registry, so the next such gap fails here.
         let prof = crate::aircraft::load("cessna_172sp").expect("172 profile");
         let reg = crate::tools::Registry::for_aircraft(&prof);
-        assert!(reg.get("circuit").is_some(), "the 172 registers the circuit tool");
-        assert!(reg.get("full_auto").is_some(), "the 172 registers the full_auto tool");
+        assert!(
+            reg.get("circuit").is_some(),
+            "the 172 registers the circuit tool"
+        );
+        assert!(
+            reg.get("full_auto").is_some(),
+            "the 172 registers the full_auto tool"
+        );
         // "do a circuit" is the whole flight to the pilot, so it routes to the
         // full-auto orchestrator (which flies the airborne circuit itself once
         // on the runway).
         for cmd in [
-            "do a circuit", "fly a circuit", "take off and land",
-            "circuits and bumps", "make a right circuit",
+            "do a circuit",
+            "fly a circuit",
+            "take off and land",
+            "circuits and bumps",
+            "make a right circuit",
         ] {
             assert!(looks_like_command(cmd), "{cmd:?} must pass the domain gate");
-            assert!(!super::looks_like_question(cmd), "{cmd:?} must not be withheld as a question");
+            assert!(
+                !super::looks_like_question(cmd),
+                "{cmd:?} must not be withheld as a question"
+            );
             let parsed = super::grammar::try_parse(cmd, &reg, &prof)
                 .unwrap_or_else(|| panic!("{cmd:?} must parse to a command"));
-            assert_eq!(parsed[0].name, "full_auto", "{cmd:?} must route to full_auto");
+            assert_eq!(
+                parsed[0].name, "full_auto",
+                "{cmd:?} must route to full_auto"
+            );
         }
     }
 
@@ -5886,16 +7113,29 @@ mod tests {
         // Every phrasing the pilot actually tried while fighting to take the
         // throttle back from the taxi governor — all must release.
         for t in [
-            "my throttle", "my thruffles", "mic control", "my throat",
-            "release immediately", "let me go. stop touching the throttle",
-            "give me command", "give me command now", "my power",
-            "stop holding speed", "i have control", "im taking control",
+            "my throttle",
+            "my thruffles",
+            "mic control",
+            "my throat",
+            "release immediately",
+            "let me go. stop touching the throttle",
+            "give me command",
+            "give me command now",
+            "my power",
+            "stop holding speed",
+            "i have control",
+            "im taking control",
         ] {
             assert!(super::release_intent(t), "{t:?} must release");
         }
         // Ordinary commands must not trip it (it only runs while a hold is
         // active, but even then these should pass through).
-        for t in ["taxi at 10 knots", "flaps ten", "hold 70 knots", "landing light on"] {
+        for t in [
+            "taxi at 10 knots",
+            "flaps ten",
+            "hold 70 knots",
+            "landing light on",
+        ] {
             assert!(!super::release_intent(t), "{t:?} must not release");
         }
     }
@@ -5906,15 +7146,32 @@ mod tests {
     #[test]
     fn corrections_yield_the_bare_value() {
         // The live case: "Power 8 percent" executed, then the fix dead-ended.
-        assert_eq!(correction_value("I said 80 percent."), Some("80 percent".into()));
-        assert_eq!(correction_value("no, two five zero"), Some("two five zero".into()));
+        assert_eq!(
+            correction_value("I said 80 percent."),
+            Some("80 percent".into())
+        );
+        assert_eq!(
+            correction_value("no, two five zero"),
+            Some("two five zero".into())
+        );
         assert_eq!(correction_value("No, I said forty"), Some("forty".into()));
-        assert_eq!(correction_value("make it sixty percent"), Some("sixty percent".into()));
-        assert_eq!(correction_value("correction, one thousand five hundred"),
-                   Some("one thousand five hundred".into()));
-        assert_eq!(correction_value("How about eighty percent?"), Some("eighty percent".into()));
+        assert_eq!(
+            correction_value("make it sixty percent"),
+            Some("sixty percent".into())
+        );
+        assert_eq!(
+            correction_value("correction, one thousand five hundred"),
+            Some("one thousand five hundred".into())
+        );
+        assert_eq!(
+            correction_value("How about eighty percent?"),
+            Some("eighty percent".into())
+        );
         // Whisper dropping the "how" (heard live on the Twotter flight).
-        assert_eq!(correction_value("About 40 percent?"), Some("40 percent".into()));
+        assert_eq!(
+            correction_value("About 40 percent?"),
+            Some("40 percent".into())
+        );
         assert_eq!(correction_value("about we start the descent"), None);
         // "how about" with a full command is a question for the copilot, not a
         // value correction.
@@ -5931,13 +7188,21 @@ mod tests {
     #[test]
     fn followups_are_recognized_but_plain_chatter_is_not() {
         for c in [
-            "switch it back to both", "do that again", "a bit more", "undo that",
-            "the other tank", "seventy percent", "60%", "two thousand",
+            "switch it back to both",
+            "do that again",
+            "a bit more",
+            "undo that",
+            "the other tank",
+            "seventy percent",
+            "60%",
+            "two thousand",
         ] {
             assert!(looks_like_followup(c), "{c:?} should look like a follow-up");
         }
         for c in [
-            "nice weather today", "where are we", "hello copilot",
+            "nice weather today",
+            "where are we",
+            "hello copilot",
             // A long counting string is noise, not a bare-value follow-up.
             "one two three four five six seven eight ten",
         ] {
@@ -5956,7 +7221,14 @@ mod tests {
         assert!(has_number("sixty percent") && has_number("60%") && has_number("two thousand"));
         assert!(!has_number("switch it back to both"));
         // The rewrite a bare follow-up would produce:
-        assert_eq!(format!("{} {}", command_subject("throttle eighty percent"), "sixty percent"), "throttle sixty percent");
+        assert_eq!(
+            format!(
+                "{} {}",
+                command_subject("throttle eighty percent"),
+                "sixty percent"
+            ),
+            "throttle sixty percent"
+        );
     }
 
     #[test]
@@ -5975,7 +7247,13 @@ mod tests {
     #[test]
     fn glued_light_compound_does_not_overmatch() {
         // Stripping a light/lights suffix must not wave through non-cockpit words.
-        for g in ["moonlight", "highlight", "delight", "spotlight", "flashlight"] {
+        for g in [
+            "moonlight",
+            "highlight",
+            "delight",
+            "spotlight",
+            "flashlight",
+        ] {
             assert!(!looks_like_command(g), "{g:?} should still be rejected");
         }
     }
@@ -5994,7 +7272,12 @@ mod tests {
         // 1014" (four QNH settings swallowed live, 2026-07-20) only becomes
         // the "qnh" keyword after folding, and the brake homophone rides
         // its own keywords.
-        for c in ["Q and H 1014.", "Change Q and H to 1014.", "Release breaks.", "Q&H 1013"] {
+        for c in [
+            "Q and H 1014.",
+            "Change Q and H to 1014.",
+            "Release breaks.",
+            "Q&H 1013",
+        ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
         }
     }
@@ -6002,8 +7285,12 @@ mod tests {
     #[test]
     fn phonetic_garbage_is_rejected() {
         for g in [
-            "Nautilapuku", "Mokuli ke maluku", "Reki ki panaki",
-            "Tiki Maliki, WaKiPi", "Take a look at the video", "",
+            "Nautilapuku",
+            "Mokuli ke maluku",
+            "Reki ki panaki",
+            "Tiki Maliki, WaKiPi",
+            "Take a look at the video",
+            "",
         ] {
             assert!(!looks_like_command(g), "{g:?} should be rejected");
         }
@@ -6011,7 +7298,15 @@ mod tests {
 
     #[test]
     fn affirmatives_proceed() {
-        for r in ["affirm", "affirmative", "yes", "confirm", "roger that", "correct", "go ahead"] {
+        for r in [
+            "affirm",
+            "affirmative",
+            "yes",
+            "confirm",
+            "roger that",
+            "correct",
+            "go ahead",
+        ] {
             assert!(is_affirmative(r), "{r:?} should confirm");
         }
     }
@@ -6019,7 +7314,16 @@ mod tests {
     #[test]
     fn negatives_and_ambiguity_cancel() {
         // explicit no, and anything not clearly yes, must NOT proceed
-        for r in ["negative", "no", "cancel", "stop", "abort", "uh what", "descend 700", ""] {
+        for r in [
+            "negative",
+            "no",
+            "cancel",
+            "stop",
+            "abort",
+            "uh what",
+            "descend 700",
+            "",
+        ] {
             assert!(!is_affirmative(r), "{r:?} must not confirm");
         }
     }
@@ -6093,7 +7397,9 @@ mod tests {
         assert!(is_power_loss_query("engine cut out"));
         // Commands and unrelated mentions must not be hijacked.
         assert!(!is_power_loss_query("reduce power by ten percent"));
-        assert!(!is_power_loss_query("reduce power, we lost too much altitude"));
+        assert!(!is_power_loss_query(
+            "reduce power, we lost too much altitude"
+        ));
         assert!(!is_power_loss_query("stop the engine"));
         assert!(!is_power_loss_query("start the engine"));
         assert!(!is_power_loss_query("full power"));
@@ -6103,35 +7409,53 @@ mod tests {
     fn whisper_label_strips_path_prefix_and_suffix() {
         use super::whisper_model_label;
         assert_eq!(whisper_model_label("models/ggml-base.en.bin"), "base.en");
-        assert_eq!(whisper_model_label("/a/b/ggml-large-v3-turbo.bin"), "large-v3-turbo");
+        assert_eq!(
+            whisper_model_label("/a/b/ggml-large-v3-turbo.bin"),
+            "large-v3-turbo"
+        );
         assert_eq!(whisper_model_label("small.en"), "small.en");
     }
 
     #[test]
     fn questions_are_detected_commands_are_not() {
         for q in [
-            "how much fuel do we have", "what's our heading", "what is our altitude?",
-            "are we configured for landing", "how high are we", "tell me the airspeed",
-            "do we have enough fuel to make it?", "where are we",
+            "how much fuel do we have",
+            "what's our heading",
+            "what is our altitude?",
+            "are we configured for landing",
+            "how high are we",
+            "tell me the airspeed",
+            "do we have enough fuel to make it?",
+            "where are we",
             // Keyword+number questions: same shape as a command, so they must be
             // caught here and withheld from the grammar fast-path (which would
             // otherwise *act* on them) — see the fast-path gate in run_session.
-            "is the heading 270?", "did we set flaps to ten?",
+            "is the heading 270?",
+            "did we set flaps to ten?",
             // Contraction openers, in raw and apostrophe-stripped forms: without
             // them "Where's the parking brake?" parsed as a command and SET the
             // brake (seen live). Never an action from a question shape.
-            "where's the parking brake", "wheres the parking brake",
-            "who's flying", "when's our descent",
+            "where's the parking brake",
+            "wheres the parking brake",
+            "who's flying",
+            "when's our descent",
         ] {
             assert!(looks_like_question(q), "{q:?} should be a question");
         }
         for c in [
-            "flaps ten", "gear up", "set heading 270", "throttle 60 percent",
-            "landing light on", "start the engine",
+            "flaps ten",
+            "gear up",
+            "set heading 270",
+            "throttle 60 percent",
+            "landing light on",
+            "start the engine",
             // do-support imperatives: "do <article/noun>" is a COMMAND, not a
             // question. "Do a circuit" missed live because "do" was a blanket
             // question opener and swallowed the parsed command (2026-07-23).
-            "do a circuit", "do a touch and go", "do a go around", "do another circuit",
+            "do a circuit",
+            "do a touch and go",
+            "do a go around",
+            "do another circuit",
         ] {
             assert!(!looks_like_question(c), "{c:?} should not be a question");
         }

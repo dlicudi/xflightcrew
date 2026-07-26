@@ -31,8 +31,11 @@ pub async fn sample_ft(xp: &XPlaneClient, pts: &[(f64, f64)]) -> Option<Vec<f64>
     }
     let pts = &pts[..pts.len().min(MAX_POINTS)];
     let gen0 = xp.get_float(GEN).await.ok()?;
-    let q: String =
-        pts.iter().map(|(la, lo)| format!("{la:.5},{lo:.5}")).collect::<Vec<_>>().join("|");
+    let q: String = pts
+        .iter()
+        .map(|(la, lo)| format!("{la:.5},{lo:.5}"))
+        .collect::<Vec<_>>()
+        .join("|");
     xp.set_data(QUERY, q.as_bytes()).await.ok()?;
     // The probe runs in the next flight loop — one frame. Poll briefly.
     for _ in 0..20 {

@@ -137,7 +137,9 @@ pub static ABORT: AtomicBool = AtomicBool::new(false);
 
 /// One-line status for the dashboard's "managing" panel.
 pub fn status() -> Option<String> {
-    ACTIVE.load(Ordering::Relaxed).then(|| "auto circuit".to_string())
+    ACTIVE
+        .load(Ordering::Relaxed)
+        .then(|| "auto circuit".to_string())
 }
 
 /// Radio calls the copilot makes on our behalf during the circuit — the ONE
@@ -158,7 +160,10 @@ pub fn take_crew_radio() -> Vec<String> {
 /// Queue a radio call for the main loop to transmit. Public so the full-auto
 /// orchestrator can request taxi through the same channel.
 pub fn transmit(call: String) {
-    CREW_RADIO.lock().unwrap_or_else(|e| e.into_inner()).push_back(call);
+    CREW_RADIO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back(call);
 }
 
 /// The aircraft's callsign, spoken the way the tower says it ("November one
@@ -184,8 +189,9 @@ pub fn radio_call(callsign: &Option<String>, msg: &str) -> String {
 /// Spell a runway identifier for the radio: "27" -> "two seven", "09L" -> "zero
 /// nine left". Digit by digit, with the L/R/C suffix spoken.
 pub fn spell_runway(id: &str) -> String {
-    const DIGITS: [&str; 10] =
-        ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
+    const DIGITS: [&str; 10] = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    ];
     let mut out: Vec<String> = Vec::new();
     for c in id.chars() {
         match c {
@@ -291,7 +297,14 @@ pub fn next_leg(leg: Leg) -> Option<Leg> {
 /// track, right of the takeoff course positive. `left` selects the pattern
 /// side. Each leg advances when the aircraft reaches the geometric point LESS
 /// the turn-anticipation lead, so the slow AP turn rolls out on the line.
-pub fn pattern_advance(leg: Leg, a_m: f64, x_m: f64, g: &Geometry, runway_len_m: f64, left: bool) -> bool {
+pub fn pattern_advance(
+    leg: Leg,
+    a_m: f64,
+    x_m: f64,
+    g: &Geometry,
+    runway_len_m: f64,
+    left: bool,
+) -> bool {
     // The pattern sits on the LEFT (negative cross-track) for a standard
     // circuit; `side * x_m` is then "distance out to the pattern side", always
     // positive as we fly away from the runway on crosswind.
@@ -341,9 +354,7 @@ pub fn choose_pattern(
     let tpa = field_elev_ft + tpa_agl_ft;
     let terrain_ok = |f: &SideFacts| f.terrain_max_ft.is_none_or(|m| tpa - m >= TERRAIN_CLEAR_FT);
     let clean = |f: &SideFacts| terrain_ok(f) && f.airspace.is_none();
-    let raise = |f: &SideFacts| {
-        (f.terrain_max_ft.unwrap_or(field_elev_ft) + tpa_agl_ft).max(tpa)
-    };
+    let raise = |f: &SideFacts| (f.terrain_max_ft.unwrap_or(field_elev_ft) + tpa_agl_ft).max(tpa);
     let (df, of) = if default_left { (l, r) } else { (r, l) };
     if clean(df) {
         return (default_left, tpa, "default_side_clear");
@@ -371,7 +382,11 @@ pub fn choose_pattern(
                 } else {
                     (false, r)
                 };
-            let why = if facts.airspace.is_some() { "airspace_unavoidable" } else { "raised_for_terrain" };
+            let why = if facts.airspace.is_some() {
+                "airspace_unavoidable"
+            } else {
+                "raised_for_terrain"
+            };
             (side_left, raise(facts), why)
         }
     }
@@ -393,13 +408,23 @@ pub fn sea_side_is_left(course_deg: f64) -> bool {
 fn frame_to_latlon(rwy: &crate::autoland::Runway, a_m: f64, x_m: f64) -> (f64, f64) {
     let (lat, lon) =
         crate::nav::project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, a_m / M_PER_NM);
-    crate::nav::project_latlon(lat, lon, (rwy.course_deg + 90.0).rem_euclid(360.0), x_m / M_PER_NM)
+    crate::nav::project_latlon(
+        lat,
+        lon,
+        (rwy.course_deg + 90.0).rem_euclid(360.0),
+        x_m / M_PER_NM,
+    )
 }
 
 /// The sampling polyline for one pattern side: points along upwind-extension,
 /// crosswind, downwind, base, and final, in the runway frame. ~20 points —
 /// inside the plugin probe channel's per-query cap.
-fn pattern_polyline(rwy: &crate::autoland::Runway, g: &Geometry, runway_len_m: f64, left: bool) -> Vec<(f64, f64)> {
+fn pattern_polyline(
+    rwy: &crate::autoland::Runway,
+    g: &Geometry,
+    runway_len_m: f64,
+    left: bool,
+) -> Vec<(f64, f64)> {
     let side = if left { -1.0 } else { 1.0 };
     let x_out = side * g.width_m;
     let a_up = runway_len_m + g.upwind_past_m;
@@ -421,7 +446,9 @@ fn pattern_polyline(rwy: &crate::autoland::Runway, g: &Geometry, runway_len_m: f
     for i in 1..=4 {
         pts.push((a_dn + (0.0 - a_dn) * i as f64 / 4.0, 0.0));
     }
-    pts.into_iter().map(|(a, x)| frame_to_latlon(rwy, a, x)).collect()
+    pts.into_iter()
+        .map(|(a, x)| frame_to_latlon(rwy, a, x))
+        .collect()
 }
 
 /// How close (metres) to an authored waypoint counts as reaching it. Generous,
@@ -467,19 +494,43 @@ fn authored_circuit(
     let dn = geom.downwind_past_m;
     Some(vec![
         // Climb out on the runway heading.
-        AuthoredWpt { a_m: up, x_m: 0.0, alt_msl_ft: tpa_msl_ft },
+        AuthoredWpt {
+            a_m: up,
+            x_m: 0.0,
+            alt_msl_ft: tpa_msl_ft,
+        },
         // Turn to the bay side; downwind held wide to clear the Rock's flank.
-        AuthoredWpt { a_m: up, x_m: side * w * 1.3, alt_msl_ft: tpa_msl_ft },
-        AuthoredWpt { a_m: 0.0, x_m: side * w * 1.3, alt_msl_ft: tpa_msl_ft },
-        AuthoredWpt { a_m: -dn, x_m: side * w * 1.3, alt_msl_ft: tpa_msl_ft },
+        AuthoredWpt {
+            a_m: up,
+            x_m: side * w * 1.3,
+            alt_msl_ft: tpa_msl_ft,
+        },
+        AuthoredWpt {
+            a_m: 0.0,
+            x_m: side * w * 1.3,
+            alt_msl_ft: tpa_msl_ft,
+        },
+        AuthoredWpt {
+            a_m: -dn,
+            x_m: side * w * 1.3,
+            alt_msl_ft: tpa_msl_ft,
+        },
         // Base back over the water, descending to the handoff height.
-        AuthoredWpt { a_m: -dn * 1.2, x_m: side * w * 0.6, alt_msl_ft: handoff },
+        AuthoredWpt {
+            a_m: -dn * 1.2,
+            x_m: side * w * 0.6,
+            alt_msl_ft: handoff,
+        },
         // Rejoin the centreline and hand to autoland on a NORMAL final: ~2 nm
         // out (`-dn`, not `-dn * 0.5`), so the handoff height sits on a ~3°
         // glidepath, not a 6.5° dive autoland can't capture. Handing off at 1 nm
         // / 700 ft looped the LXGB approach into a permanent go-around
         // (2026-07-26).
-        AuthoredWpt { a_m: -dn, x_m: 0.0, alt_msl_ft: handoff },
+        AuthoredWpt {
+            a_m: -dn,
+            x_m: 0.0,
+            alt_msl_ft: handoff,
+        },
     ])
 }
 
@@ -531,7 +582,11 @@ async fn fly_authored_route(
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if ABORT.load(Ordering::SeqCst) {
-            stand_down(&voice, "Circuit cancelled. Your aircraft.", "abort_authored");
+            stand_down(
+                &voice,
+                "Circuit cancelled. Your aircraft.",
+                "abort_authored",
+            );
             return;
         }
         if crate::xplane::sim_frozen(&xp).await {
@@ -548,7 +603,9 @@ async fn fly_authored_route(
             xp.get_float(IAS),
             xp.get_float(THROTTLE_ALL),
         );
-        let (Ok(lat), Ok(lon)) = (lat_r, lon_r) else { continue };
+        let (Ok(lat), Ok(lon)) = (lat_r, lon_r) else {
+            continue;
+        };
         let alt_msl_ft = elev_r.map(|m| m * M_TO_FT).unwrap_or(f64::NAN);
         let (hdg_on, vs_on) = (hdg_st.unwrap_or(1.0) > 0.5, vs_st.unwrap_or(1.0) > 0.5);
 
@@ -596,7 +653,9 @@ async fn fly_authored_route(
             prev_ias = Some((ias, t_now));
             let delta = crate::tools::speedhold::throttle_adjust(pattern_kts - ias, ias_trend);
             if delta != 0.0 {
-                let _ = xp.set_float(THROTTLE_ALL, (thr + delta).clamp(0.0, 1.0)).await;
+                let _ = xp
+                    .set_float(THROTTLE_ALL, (thr + delta).clamp(0.0, 1.0))
+                    .await;
             }
         }
 
@@ -617,13 +676,23 @@ async fn fly_authored_route(
         }
     }
     // The last waypoint sits on short final — hand the landing to autoland.
-    alert(&voice, Priority::Advisory, crate::readback::one_of(&[
-        "Turning final. Landing us.",
-        "On final now. I'll put her down.",
-        "Turning final. Bringing us in.",
-    ]));
-    transmit(radio_call(&callsign, &format!("final runway {}", spell_runway(&rwy_id))));
-    crate::blackbox::record("circuit", serde_json::json!({"event": "handoff_autoland_authored"}));
+    alert(
+        &voice,
+        Priority::Advisory,
+        crate::readback::one_of(&[
+            "Turning final. Landing us.",
+            "On final now. I'll put her down.",
+            "Turning final. Bringing us in.",
+        ]),
+    );
+    transmit(radio_call(
+        &callsign,
+        &format!("final runway {}", spell_runway(&rwy_id)),
+    ));
+    crate::blackbox::record(
+        "circuit",
+        serde_json::json!({"event": "handoff_autoland_authored"}),
+    );
     crate::autoland::ABORT.store(false, Ordering::SeqCst);
     crate::autoland::run_autoland(base_url, apt_dat, cfg, approach_ias, voice, None, None);
     ACTIVE.store(false, Ordering::SeqCst);
@@ -637,7 +706,10 @@ pub fn start(base_url: String, voice: Option<Voice>, p: Params) {
     }
     ABORT.store(false, Ordering::SeqCst);
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             ACTIVE.store(false, Ordering::SeqCst);
             return;
         };
@@ -660,7 +732,10 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 /// down. Never leaves the aircraft with nobody watching the loop.
 fn stand_down(voice: &Option<Voice>, line: &str, reason: &str) {
     ACTIVE.store(false, Ordering::SeqCst);
-    crate::blackbox::record("circuit", serde_json::json!({"event": "stand_down", "reason": reason}));
+    crate::blackbox::record(
+        "circuit",
+        serde_json::json!({"event": "stand_down", "reason": reason}),
+    );
     alert(voice, Priority::Caution, line);
 }
 
@@ -670,10 +745,16 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // The departure runway — its course drives every leg heading. Fit it from
     // where we're pointing right now (lined up before the roll), the same way
     // the takeoff loop does.
-    let (Ok(lat), Ok(lon), Ok(psi)) =
-        (xp.get_float(LAT).await, xp.get_float(LON).await, xp.get_float(PSI_TRUE).await)
-    else {
-        stand_down(&voice, "I can't read our position. The circuit is off, your aircraft.", "no_position");
+    let (Ok(lat), Ok(lon), Ok(psi)) = (
+        xp.get_float(LAT).await,
+        xp.get_float(LON).await,
+        xp.get_float(PSI_TRUE).await,
+    ) else {
+        stand_down(
+            &voice,
+            "I can't read our position. The circuit is off, your aircraft.",
+            "no_position",
+        );
         return;
     };
     let cands = nearby_runways(&p.apt_dat, lat, lon, 3.0).unwrap_or_default();
@@ -727,8 +808,13 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         airspace: crate::airspace::first_conflict(&spaces, &poly_r, tpa_probe_ft)
             .map(|a| a.spoken_name()),
     };
-    let (left, tpa_msl_ft, side_pick) =
-        choose_pattern(p.left_pattern, &l_facts, &r_facts, field_elev_ft, p.tpa_agl_ft);
+    let (left, tpa_msl_ft, side_pick) = choose_pattern(
+        p.left_pattern,
+        &l_facts,
+        &r_facts,
+        field_elev_ft,
+        p.tpa_agl_ft,
+    );
     // Gibraltar: the ONLY safe side is SOUTH — over the sea, looping around the
     // Rock. NORTH is Spain (restricted, foreign soil). choose_pattern picks the
     // LOWER-TERRAIN side, which at LXGB is the flat isthmus to the north, and it
@@ -765,7 +851,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             ),
         ),
         "switched_side_for_airspace" => {
-            let name = if p.left_pattern { &l_facts.airspace } else { &r_facts.airspace };
+            let name = if p.left_pattern {
+                &l_facts.airspace
+            } else {
+                &r_facts.airspace
+            };
             alert(
                 &voice,
                 Priority::Caution,
@@ -783,7 +873,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             &format!("Terrain in the pattern, flying it at {tpa_msl_ft:.0} feet."),
         ),
         "airspace_unavoidable" => {
-            let name = if left { &l_facts.airspace } else { &r_facts.airspace };
+            let name = if left {
+                &l_facts.airspace
+            } else {
+                &r_facts.airspace
+            };
             alert(
                 &voice,
                 Priority::Caution,
@@ -796,11 +890,15 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         }
         _ => {}
     }
-    alert(&voice, Priority::Advisory, crate::readback::one_of(&[
-        "Flying a full circuit. My takeoff first.",
-        "Full circuit coming up. I'll take us off first.",
-        "Let's fly the circuit. My takeoff to start.",
-    ]));
+    alert(
+        &voice,
+        Priority::Advisory,
+        crate::readback::one_of(&[
+            "Flying a full circuit. My takeoff first.",
+            "Full circuit coming up. I'll take us off first.",
+            "Let's fly the circuit. My takeoff to start.",
+        ]),
+    );
 
     // --- Phase 1: the takeoff (the proven loop). Arm it, then wait for it to
     // hand off. It clears its own ACTIVE at the thousand-foot handoff — or on a
@@ -809,7 +907,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         if ABORT.load(Ordering::SeqCst) {
-            stand_down(&voice, "Circuit cancelled. Your aircraft.", "abort_takeoff_phase");
+            stand_down(
+                &voice,
+                "Circuit cancelled. Your aircraft.",
+                "abort_takeoff_phase",
+            );
             return;
         }
         if !autotakeoff::ACTIVE.load(Ordering::SeqCst) {
@@ -818,10 +920,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     }
     let agl_ft = xp.get_float(AGL_M).await.unwrap_or(0.0) * M_TO_FT;
     if agl_ft < AIRBORNE_MIN_AGL_FT {
-        stand_down(&voice, "The takeoff didn't get us airborne, so the circuit is off.", "takeoff_rejected");
+        stand_down(
+            &voice,
+            "The takeoff didn't get us airborne, so the circuit is off.",
+            "takeoff_rejected",
+        );
         return;
     }
-    crate::blackbox::record("circuit", serde_json::json!({"event": "takeoff_handoff", "agl_ft": agl_ft}));
+    crate::blackbox::record(
+        "circuit",
+        serde_json::json!({"event": "takeoff_handoff", "agl_ft": agl_ft}),
+    );
 
     // --- Phase 2a: an AUTHORED track, where the parametric rectangle can't be
     // flown clear (LXGB — R-164 blankets both sides, so the rectangle flies
@@ -840,11 +949,15 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 "circuit",
                 serde_json::json!({"event": "authored_route", "wpts": route.len()}),
             );
-            alert(&voice, Priority::Advisory, crate::readback::one_of(&[
-                "Airborne. Flying the bay circuit, around the Rock.",
-                "Off the ground. Taking the bay circuit around the Rock.",
-                "Airborne. Around the Rock we go, over the bay.",
-            ]));
+            alert(
+                &voice,
+                Priority::Advisory,
+                crate::readback::one_of(&[
+                    "Airborne. Flying the bay circuit, around the Rock.",
+                    "Off the ground. Taking the bay circuit around the Rock.",
+                    "Airborne. Around the Rock we go, over the bay.",
+                ]),
+            );
             let mag_var = xp.get_float(MAG_VAR).await.unwrap_or(0.0);
             fly_authored_route(
                 XPlaneClient::new(base_url.clone()),
@@ -862,18 +975,25 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             .await;
             return;
         }
-        crate::blackbox::record("circuit", serde_json::json!({"event": "authored_route_unsafe"}));
+        crate::blackbox::record(
+            "circuit",
+            serde_json::json!({"event": "authored_route_unsafe"}),
+        );
         alert(
             &voice,
             Priority::Caution,
             "The Rock circuit isn't clear from here. Flying the standard pattern.",
         );
     }
-    alert(&voice, Priority::Advisory, crate::readback::one_of(&[
-        "Airborne. Flying the pattern.",
-        "Off the ground. Into the pattern.",
-        "Airborne. Taking us round the pattern.",
-    ]));
+    alert(
+        &voice,
+        Priority::Advisory,
+        crate::readback::one_of(&[
+            "Airborne. Flying the pattern.",
+            "Off the ground. Into the pattern.",
+            "Airborne. Taking us round the pattern.",
+        ]),
+    );
 
     // --- Phase 2: the pattern rides the AP EXACTLY as the takeoff left it —
     // servos + HDG + VS engaged, VS dial at the climb rate. NOTHING is
@@ -895,7 +1015,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         Ok(v) => v,
         Err(_) => true_to_mag(rwy_course, mag_var),
     };
-    bug_mag = slew_bug(bug_mag, true_to_mag(leg_heading(rwy_course, Leg::Upwind, left), mag_var), BUG_SLEW_PER_TICK);
+    bug_mag = slew_bug(
+        bug_mag,
+        true_to_mag(leg_heading(rwy_course, Leg::Upwind, left), mag_var),
+        BUG_SLEW_PER_TICK,
+    );
     let _ = xp.set_float(HDG_BUG, bug_mag).await;
     // Forward terrain guard cadence + throttle; a fired guard raises the
     // vertical target floor for a while instead of pressing dead buttons.
@@ -913,7 +1037,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if ABORT.load(Ordering::SeqCst) {
-            stand_down(&voice, "Circuit cancelled. Your aircraft.", "abort_pattern_phase");
+            stand_down(
+                &voice,
+                "Circuit cancelled. Your aircraft.",
+                "abort_pattern_phase",
+            );
             return;
         }
         // A frozen sim (pause/replay) suspends the sequence; the AP holds.
@@ -932,7 +1060,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             xp.get_float(VS_STATUS),
         );
         let (ias_r, thr_r) = tokio::join!(xp.get_float(IAS), xp.get_float(THROTTLE_ALL));
-        let (Ok(lat), Ok(lon)) = (lat, lon) else { continue };
+        let (Ok(lat), Ok(lon)) = (lat, lon) else {
+            continue;
+        };
         let agl_ft = agl_m.unwrap_or(0.0) * M_TO_FT;
         let alt_msl_ft = elev_m.map(|m| m * M_TO_FT).unwrap_or(f64::NAN);
         let (hdg_on, vs_on) = (hdg_st.unwrap_or(1.0) > 0.5, vs_st.unwrap_or(1.0) > 0.5);
@@ -947,7 +1077,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // crab = heading - track; command heading = leg heading + crab.
         let (psi_v, hp_v) = (psi_r.ok(), hpath_r.ok());
         let crab = match (psi_v, hp_v) {
-            (Some(psi), Some(hp)) => (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0),
+            (Some(psi), Some(hp)) => {
+                (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0)
+            }
             _ => 0.0,
         };
         let want_hdg = leg_heading(rwy_course, leg, left) + crab;
@@ -1038,7 +1170,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             prev_ias = Some((ias, t_now));
             let delta = crate::tools::speedhold::throttle_adjust(pattern_kts - ias, ias_trend);
             if delta != 0.0 {
-                let _ = xp.set_float(THROTTLE_ALL, (thr + delta).clamp(0.0, 1.0)).await;
+                let _ = xp
+                    .set_float(THROTTLE_ALL, (thr + delta).clamp(0.0, 1.0))
+                    .await;
             }
         }
 
@@ -1069,7 +1203,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             Leg::Downwind => {
                 alert(&voice, Priority::Advisory, "Downwind.");
                 // The copilot reports the pattern position to the tower.
-                transmit(radio_call(&callsign, &format!("downwind runway {}", spell_runway(&rwy_id))));
+                transmit(radio_call(
+                    &callsign,
+                    &format!("downwind runway {}", spell_runway(&rwy_id)),
+                ));
             }
             Leg::Base => {
                 // Turn base and start down — the VS law above flies the
@@ -1078,13 +1215,20 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 transmit(radio_call(&callsign, "turning base"));
             }
             Leg::Final => {
-                alert(&voice, Priority::Advisory, crate::readback::one_of(&[
-                    "Turning final. Landing us.",
-                    "On final now. I'll put her down.",
-                    "Turning final. Bringing us in.",
-                ]));
+                alert(
+                    &voice,
+                    Priority::Advisory,
+                    crate::readback::one_of(&[
+                        "Turning final. Landing us.",
+                        "On final now. I'll put her down.",
+                        "Turning final. Bringing us in.",
+                    ]),
+                );
                 // The final report — this is what earns the landing clearance.
-                transmit(radio_call(&callsign, &format!("final runway {}", spell_runway(&rwy_id))));
+                transmit(radio_call(
+                    &callsign,
+                    &format!("final runway {}", spell_runway(&rwy_id)),
+                ));
                 // Prefer the airport's PUBLISHED approach when we're actually
                 // positioned to fly it (a wide/arrival pattern outside and above
                 // the FAF) — that's the terrain-safe path. A tight circuit sits
@@ -1101,11 +1245,18 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                     cfg: &p.cfg,
                     approach_ias: p.approach_ias,
                 };
-                if try_published_arrival(arr, &rwy.icao, &rwy_id, &base_url, &voice, lat, lon, alt_msl).await {
+                if try_published_arrival(
+                    arr, &rwy.icao, &rwy_id, &base_url, &voice, lat, lon, alt_msl,
+                )
+                .await
+                {
                     ACTIVE.store(false, Ordering::SeqCst);
                     return;
                 }
-                crate::blackbox::record("circuit", serde_json::json!({"event": "handoff_autoland", "agl_ft": agl_ft}));
+                crate::blackbox::record(
+                    "circuit",
+                    serde_json::json!({"event": "handoff_autoland", "agl_ft": agl_ft}),
+                );
                 crate::autoland::ABORT.store(false, Ordering::SeqCst);
                 crate::autoland::run_autoland(
                     // A fresh client for autoland's own thread.
@@ -1164,12 +1315,24 @@ async fn try_published_arrival(
         arr.fix_data_path.to_string(),
         arr.nav_data_path.to_string(),
     );
-    let (icao, rwy_id, cfg, ias) = (icao.to_string(), rwy_id.to_string(), arr.cfg.clone(), arr.approach_ias);
+    let (icao, rwy_id, cfg, ias) = (
+        icao.to_string(),
+        rwy_id.to_string(),
+        arr.cfg.clone(),
+        arr.approach_ias,
+    );
     // find_airport + procedure load/resolve read big files — off the reactor.
     let plan = tokio::task::spawn_blocking(move || {
         let airport = crate::nav::find_airport(&apt_dat, &icao).ok().flatten()?;
-        let end = crate::procedure::EndAction::Approach { apt_dat: apt_dat.clone(), cfg, approach_ias: ias };
-        crate::procedure::approach_plan_for(&cifp, &fixp, &navp, &airport, &icao, &rwy_id, lat, lon, end).ok()
+        let end = crate::procedure::EndAction::Approach {
+            apt_dat: apt_dat.clone(),
+            cfg,
+            approach_ias: ias,
+        };
+        crate::procedure::approach_plan_for(
+            &cifp, &fixp, &navp, &airport, &icao, &rwy_id, lat, lon, end,
+        )
+        .ok()
     })
     .await
     .ok()
@@ -1178,11 +1341,21 @@ async fn try_published_arrival(
         return false;
     };
     if !crate::procedure::approach_flyable_from(&plan, lat, lon, alt_msl) {
-        crate::blackbox::record("circuit", serde_json::json!({"event": "approach_declined", "reason": "inside_or_below_faf"}));
+        crate::blackbox::record(
+            "circuit",
+            serde_json::json!({"event": "approach_declined", "reason": "inside_or_below_faf"}),
+        );
         return false;
     }
-    crate::blackbox::record("circuit", serde_json::json!({"event": "handoff_procedure", "name": plan.name}));
-    alert(voice, Priority::Advisory, &format!("Joining {}.", plan.name));
+    crate::blackbox::record(
+        "circuit",
+        serde_json::json!({"event": "handoff_procedure", "name": plan.name}),
+    );
+    alert(
+        voice,
+        Priority::Advisory,
+        &format!("Joining {}.", plan.name),
+    );
     crate::procedure::ABORT.store(false, Ordering::SeqCst);
     crate::procedure::start(base_url.to_string(), voice.clone(), plan);
     true
@@ -1251,7 +1424,10 @@ mod tests {
         // Counterclockwise across the seam works too: 2.6 -> 330 is a 32.6°
         // short-way step, done in one write; a farther target clamps.
         assert!((slew_bug(2.6, 330.0, 40.0) - 330.0).abs() < 1e-9);
-        assert!((slew_bug(2.6, 280.0, 40.0) - 322.6).abs() < 1e-9, "clamped first step");
+        assert!(
+            (slew_bug(2.6, 280.0, 40.0) - 322.6).abs() < 1e-9,
+            "clamped first step"
+        );
         // Small deltas go direct.
         assert!((slew_bug(100.0, 110.0, 40.0) - 110.0).abs() < 1e-9);
     }
@@ -1264,7 +1440,12 @@ mod tests {
         let geom = Geometry::for_radius(r);
         // The width must exceed the turn DIAMETER — legs shorter than the
         // diameter are what degenerated the rectangle into loops.
-        assert!(geom.width_m > 2.0 * r, "width {} vs diameter {}", geom.width_m, 2.0 * r);
+        assert!(
+            geom.width_m > 2.0 * r,
+            "width {} vs diameter {}",
+            geom.width_m,
+            2.0 * r
+        );
         assert!(geom.downwind_past_m > geom.width_m, "room for base + final");
         assert!(geom.lead_m < r, "lead is less than the radius itself");
         // A bad speed read can't produce a degenerate pattern.
@@ -1278,7 +1459,14 @@ mod tests {
         assert!(!pattern_advance(Leg::Upwind, L - 100.0, 0.0, &g(), L, true));
         // Past the end + margin: turn crosswind (the altitude no longer gates —
         // a real pattern climbs to TPA on the crosswind/downwind).
-        assert!(pattern_advance(Leg::Upwind, L + g().upwind_past_m + 1.0, 0.0, &g(), L, true));
+        assert!(pattern_advance(
+            Leg::Upwind,
+            L + g().upwind_past_m + 1.0,
+            0.0,
+            &g(),
+            L,
+            true
+        ));
     }
 
     #[test]
@@ -1299,47 +1487,97 @@ mod tests {
     fn downwind_turns_base_past_the_landing_threshold() {
         let geom = g();
         // Still abeam / not far enough back -> hold.
-        assert!(!pattern_advance(Leg::Downwind, 200.0, -geom.width_m, &geom, L, true));
+        assert!(!pattern_advance(
+            Leg::Downwind,
+            200.0,
+            -geom.width_m,
+            &geom,
+            L,
+            true
+        ));
         // Past the threshold by the led base distance -> turn base.
         let at = geom.downwind_past_m - geom.lead_m + 1.0;
-        assert!(pattern_advance(Leg::Downwind, -at, -geom.width_m, &geom, L, true));
+        assert!(pattern_advance(
+            Leg::Downwind,
+            -at,
+            -geom.width_m,
+            &geom,
+            L,
+            true
+        ));
     }
 
     #[test]
     fn base_turns_final_one_radius_from_the_centreline() {
         let geom = g();
         // Still well left of the capture line -> hold.
-        assert!(!pattern_advance(Leg::Base, -geom.downwind_past_m, -(geom.final_capture_m + 200.0), &geom, L, true));
+        assert!(!pattern_advance(
+            Leg::Base,
+            -geom.downwind_past_m,
+            -(geom.final_capture_m + 200.0),
+            &geom,
+            L,
+            true
+        ));
         // Within one radius: the 90° turn rolls out on the centreline.
-        assert!(pattern_advance(Leg::Base, -geom.downwind_past_m, -(geom.final_capture_m - 50.0), &geom, L, true));
+        assert!(pattern_advance(
+            Leg::Base,
+            -geom.downwind_past_m,
+            -(geom.final_capture_m - 50.0),
+            &geom,
+            L,
+            true
+        ));
     }
 
     fn facts(terrain: Option<f64>, air: Option<&str>) -> SideFacts {
-        SideFacts { terrain_max_ft: terrain, airspace: air.map(|s| s.to_string()) }
+        SideFacts {
+            terrain_max_ft: terrain,
+            airspace: air.map(|s| s.to_string()),
+        }
     }
 
     #[test]
     fn terrain_pick_switches_sides_and_raises_when_boxed_in() {
         // The Gibraltar case: left downwind crosses the Rock (1,400 ft), right
         // side is the flat bay — a default-left ask switches right at TPA.
-        let (left, tpa, why) =
-            choose_pattern(true, &facts(Some(1400.0), None), &facts(Some(50.0), None), 11.0, 1000.0);
+        let (left, tpa, why) = choose_pattern(
+            true,
+            &facts(Some(1400.0), None),
+            &facts(Some(50.0), None),
+            11.0,
+            1000.0,
+        );
         assert!(!left, "switched off the Rock side");
         assert!((tpa - 1011.0).abs() < 1.0);
         assert_eq!(why, "switched_side_for_terrain");
         // Clear both sides: the asked-for side stands.
-        let (left, _, why) =
-            choose_pattern(true, &facts(Some(30.0), None), &facts(Some(20.0), None), 11.0, 1000.0);
+        let (left, _, why) = choose_pattern(
+            true,
+            &facts(Some(30.0), None),
+            &facts(Some(20.0), None),
+            11.0,
+            1000.0,
+        );
         assert!(left);
         assert_eq!(why, "default_side_clear");
         // Boxed in (a valley field): fly the LOWER side, high enough to clear.
-        let (left, tpa, why) =
-            choose_pattern(true, &facts(Some(2000.0), None), &facts(Some(1500.0), None), 500.0, 1000.0);
+        let (left, tpa, why) = choose_pattern(
+            true,
+            &facts(Some(2000.0), None),
+            &facts(Some(1500.0), None),
+            500.0,
+            1000.0,
+        );
         assert!(!left, "the lower side");
-        assert!((tpa - 2500.0).abs() < 1.0, "raised to terrain + pattern height: {tpa}");
+        assert!(
+            (tpa - 2500.0).abs() < 1.0,
+            "raised to terrain + pattern height: {tpa}"
+        );
         assert_eq!(why, "raised_for_terrain");
         // No probe data: default side, default height — the old behavior.
-        let (left, tpa, why) = choose_pattern(true, &facts(None, None), &facts(None, None), 11.0, 1000.0);
+        let (left, tpa, why) =
+            choose_pattern(true, &facts(None, None), &facts(None, None), 11.0, 1000.0);
         assert!(left);
         assert!((tpa - 1011.0).abs() < 1.0);
         assert_eq!(why, "default_side_clear");
@@ -1389,10 +1627,15 @@ mod tests {
     #[test]
     #[ignore]
     fn real_install_lxgb_side_pick() {
-        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let apt =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
         let air = "/Users/duanelicudi/X-Plane 12/Custom Data/airspaces/airspace.txt";
         let cands = nearby_runways(apt, 36.1515, -5.3412, 2.0).expect("apt.dat");
-        let rwy = cands.iter().find(|r| r.id == "27").expect("LXGB 27").clone();
+        let rwy = cands
+            .iter()
+            .find(|r| r.id == "27")
+            .expect("LXGB 27")
+            .clone();
         let geom = Geometry::for_radius(turn_radius_m(41.0));
         let poly_l = pattern_polyline(&rwy, &geom, rwy.length_m, true);
         let poly_r = pattern_polyline(&rwy, &geom, rwy.length_m, false);
@@ -1405,11 +1648,20 @@ mod tests {
         println!("right (north, bay side) airspace: {r_air:?}");
         // Terrain from the real probe values seen live: Rock ~1,400 under the
         // southern downwind, flat under the northern.
-        let l = SideFacts { terrain_max_ft: Some(1400.0), airspace: l_air };
-        let r = SideFacts { terrain_max_ft: Some(60.0), airspace: r_air };
+        let l = SideFacts {
+            terrain_max_ft: Some(1400.0),
+            airspace: l_air,
+        };
+        let r = SideFacts {
+            terrain_max_ft: Some(60.0),
+            airspace: r_air,
+        };
         let (left, tpa_msl, why) = choose_pattern(true, &l, &r, 11.0, 1000.0);
         println!("DECISION: left={left} tpa={tpa_msl:.0} why={why}");
-        assert!(!left || tpa_msl > 1900.0, "never a 1,000 ft pattern over the Rock");
+        assert!(
+            !left || tpa_msl > 1900.0,
+            "never a 1,000 ft pattern over the Rock"
+        );
     }
 
     #[test]
@@ -1446,8 +1698,15 @@ mod tests {
 
     fn lxgb_rwy() -> crate::autoland::Runway {
         crate::autoland::Runway {
-            icao: "LXGB".into(), id: "27".into(), thr_lat: 36.1508, thr_lon: -5.3385,
-            course_deg: 267.5, length_m: 1680.0, surface: 1, dist_nm: 0.0, elev_ft: 11.0,
+            icao: "LXGB".into(),
+            id: "27".into(),
+            thr_lat: 36.1508,
+            thr_lon: -5.3385,
+            course_deg: 267.5,
+            length_m: 1680.0,
+            surface: 1,
+            dist_nm: 0.0,
+            elev_ft: 11.0,
         }
     }
 
@@ -1474,14 +1733,21 @@ mod tests {
         let route = authored_circuit(&lxgb_rwy(), &g(), 11.0, 1074.0, true).unwrap();
         // Left pattern → every offset is on the left (x_m <= 0), never crossing
         // to the Rock side.
-        assert!(route.iter().all(|w| w.x_m <= 0.1), "all waypoints on the picked side");
+        assert!(
+            route.iter().all(|w| w.x_m <= 0.1),
+            "all waypoints on the picked side"
+        );
         // Upwind starts on the centreline, the last waypoint returns to it for
         // the autoland handoff.
         assert!((route.first().unwrap().x_m).abs() < 0.1);
         assert!((route.last().unwrap().x_m).abs() < 0.1);
         // The downwind is held wider than the base — the "around the Rock" bulge.
         let max_out = route.iter().map(|w| w.x_m.abs()).fold(0.0, f64::max);
-        assert!(max_out > g().width_m, "downwind carried wide, {max_out} vs {}", g().width_m);
+        assert!(
+            max_out > g().width_m,
+            "downwind carried wide, {max_out} vs {}",
+            g().width_m
+        );
         // Descends from TPA to the handoff height by the end.
         assert!(route.first().unwrap().alt_msl_ft > route.last().unwrap().alt_msl_ft);
     }
@@ -1489,6 +1755,9 @@ mod tests {
     #[test]
     fn authored_circuit_mirrors_for_a_right_pattern() {
         let route = authored_circuit(&lxgb_rwy(), &g(), 11.0, 1074.0, false).unwrap();
-        assert!(route.iter().all(|w| w.x_m >= -0.1), "right pattern → offsets to the right");
+        assert!(
+            route.iter().all(|w| w.x_m >= -0.1),
+            "right pattern → offsets to the right"
+        );
     }
 }

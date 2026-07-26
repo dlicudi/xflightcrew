@@ -55,7 +55,11 @@ impl Tool for PowerUp {
         json!({ "type": "object", "properties": {} })
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
-        spawn(ctx.config.xplane_base_url.clone(), ctx.voice.cloned(), ctx.status.cloned());
+        spawn(
+            ctx.config.xplane_base_url.clone(),
+            ctx.voice.cloned(),
+            ctx.status.cloned(),
+        );
         Ok("Powering up. Running the electrical.".to_string())
     }
 }
@@ -71,7 +75,10 @@ fn say(voice: &Option<Voice>, status: &Option<StatusSink>, line: &str) {
 
 fn spawn(base: String, voice: Option<Voice>, status: Option<StatusSink>) {
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             return;
         };
         rt.block_on(async move {
@@ -100,7 +107,11 @@ async fn wait_until(xp: &XPlaneClient, dr: &str, secs: u64, ok: impl Fn(f64) -> 
 /// The electrical bring-up, step by step. `pub(crate)` so the engine start can run
 /// it first when the APU/bleed isn't up yet (mirrors the aircraft's autostart,
 /// which runs autoboard first).
-pub(crate) async fn run_prep(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<StatusSink>) {
+pub(crate) async fn run_prep(
+    xp: &XPlaneClient,
+    voice: &Option<Voice>,
+    status: &Option<StatusSink>,
+) {
     // 1. Battery on (and locked).
     if xp.get_float(BATTERY_ON).await.unwrap_or(0.0) < 0.5 {
         xp.run_command(CMD_BATTERY).await.ok();
@@ -118,7 +129,11 @@ pub(crate) async fn run_prep(xp: &XPlaneClient, voice: &Option<Voice>, status: &
         xp.set_int_array_elem(START_PUMP, 0, 1).await.ok(); // aux electric fuel pump
         xp.set_int(APU_STARTER, 2).await.ok(); // engage starter
         if !wait_until(xp, APU_N1, 75, |v| v > 95.0).await {
-            say(voice, status, "The A P U didn't come up. Holding the power-up.");
+            say(
+                voice,
+                status,
+                "The A P U didn't come up. Holding the power-up.",
+            );
             return;
         }
     }

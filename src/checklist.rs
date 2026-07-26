@@ -96,9 +96,21 @@ impl Cond {
             Cond::Eq(n) | Cond::Ne(n) => n,
             Cond::Range(a, b) => (a + b) / 2.0,
             // "more than": full if near the top, else just over the line.
-            Cond::Gt(n) => if n >= 0.85 { 1.0 } else { (n + 0.05).min(1.0) },
+            Cond::Gt(n) => {
+                if n >= 0.85 {
+                    1.0
+                } else {
+                    (n + 0.05).min(1.0)
+                }
+            }
             // "less than": zero if near the bottom, else just under the line.
-            Cond::Lt(n) => if n <= 0.05 { 0.0 } else { (n - 0.05).max(0.0) },
+            Cond::Lt(n) => {
+                if n <= 0.05 {
+                    0.0
+                } else {
+                    (n - 0.05).max(0.0)
+                }
+            }
         }
     }
 
@@ -124,14 +136,25 @@ pub enum Item {
     /// A system we own: perform it via a curated tool (which reads back).
     /// `confirm` is `Some(hazard)` for destructive steps (engine start/stop, the
     /// run-up) — the runner asks "Confirm, {hazard}?" and skips on a no.
-    Act { say: String, tool: &'static str, args: Value, confirm: Option<&'static str> },
+    Act {
+        say: String,
+        tool: &'static str,
+        args: Value,
+        confirm: Option<&'static str>,
+    },
     /// A dataref outside our curated tools: read it and check the state. When
     /// `settable` it's an actionable switch we may write to the condition's target
     /// if it's not already there (then confirm). When `!settable` it's an
     /// observe-only item — a CHECK/test step or a read-only indicator/annunciator
     /// (or a custom `laminar/*` dataref we can't write from outside): read and
     /// confirm if satisfied, otherwise just call it out for the pilot. Never write.
-    Verify { say: String, dataref: String, index: Option<usize>, cond: Cond, settable: bool },
+    Verify {
+        say: String,
+        dataref: String,
+        index: Option<usize>,
+        cond: Cond,
+        settable: bool,
+    },
 }
 
 /// One interpreted checklist. Carries the profile bits its actions need (lights,
@@ -169,8 +192,11 @@ impl Checklist {
 /// Read and interpret the airframe's XChecklist file into runnable checklists.
 /// `Ok(vec![])` if the profile names no checklist file.
 pub fn load(profile: &AircraftProfile) -> Result<Vec<Checklist>> {
-    let Some(path) = &profile.checklist else { return Ok(Vec::new()) };
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading checklist file {path}"))?;
+    let Some(path) = &profile.checklist else {
+        return Ok(Vec::new());
+    };
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading checklist file {path}"))?;
     Ok(parse(&text, profile))
 }
 
@@ -204,7 +230,10 @@ pub fn match_request<'a>(transcript: &str, checklists: &'a [Checklist]) -> Optio
             let title: Vec<&str> = c.id.split('_').collect();
             let matched = |q: &String| title.iter().any(|t| word_match(q, t));
             query.iter().all(matched).then(|| {
-                let hit = title.iter().filter(|t| query.iter().any(|q| word_match(q, t))).count();
+                let hit = title
+                    .iter()
+                    .filter(|t| query.iter().any(|q| word_match(q, t)))
+                    .count();
                 (title.len() - hit, c)
             })
         })
@@ -259,11 +288,48 @@ fn request_words(transcript: &str) -> Vec<String> {
         return Vec::new();
     }
     const FILLER: &[&str] = &[
-        "checklist", "checklists", "run", "running", "do", "read", "give", "perform",
-        "complete", "execute", "begin", "go", "through", "over", "the", "a", "an", "my",
-        "me", "us", "please", "let", "lets", "now", "for", "to", "and", "then", "okay",
-        "ok", "roger", "it", "its", "is", "time", "ready", "with", "you", "your", "we",
-        "can", "could",
+        "checklist",
+        "checklists",
+        "run",
+        "running",
+        "do",
+        "read",
+        "give",
+        "perform",
+        "complete",
+        "execute",
+        "begin",
+        "go",
+        "through",
+        "over",
+        "the",
+        "a",
+        "an",
+        "my",
+        "me",
+        "us",
+        "please",
+        "let",
+        "lets",
+        "now",
+        "for",
+        "to",
+        "and",
+        "then",
+        "okay",
+        "ok",
+        "roger",
+        "it",
+        "its",
+        "is",
+        "time",
+        "ready",
+        "with",
+        "you",
+        "your",
+        "we",
+        "can",
+        "could",
     ];
     words.retain(|w| !FILLER.contains(&w.as_str()));
     words
@@ -273,9 +339,7 @@ fn request_words(transcript: &str) -> Vec<String> {
 /// the two carries at least four letters - "start" reaches "starting",
 /// "engine" reaches "engines", but "off" can't reach "takeoff".
 fn word_match(q: &str, t: &str) -> bool {
-    q == t
-        || (q.len() >= 4 && t.starts_with(q))
-        || (t.len() >= 4 && q.starts_with(t))
+    q == t || (q.len() >= 4 && t.starts_with(q)) || (t.len() >= 4 && q.starts_with(t))
 }
 
 /// Parse XChecklist text against an airframe profile (its `checklist_map` drives
@@ -289,8 +353,9 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
     // The selector's positions (with their dataref values) let `action_for`
     // decode a file condition like `fuel_tank_selector:1` into the right position
     // for *this* airframe (172: 4=both; SR22: 0=off/1=left/2=right).
-    let fuel_positions: &[FuelPosition] =
-        fuel_selector.as_ref().map_or(&[], |f| f.positions.as_slice());
+    let fuel_positions: &[FuelPosition] = fuel_selector
+        .as_ref()
+        .map_or(&[], |f| f.positions.as_slice());
     let map = &profile.checklist_map;
     let mut out: Vec<Checklist> = Vec::new();
     let mut cur: Option<Checklist> = None;
@@ -311,7 +376,9 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((dir, rest)) = line.split_once(':') else { continue };
+        let Some((dir, rest)) = line.split_once(':') else {
+            continue;
+        };
         // Coloured variants (`sw_item_c`, `sw_itemvoid_c`, `sw_remark_c`) behave
         // exactly like the plain directive — the colour is display-only and gets
         // stripped from the text. `sw_define_colour`/`sw_continue` keep their
@@ -321,7 +388,7 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
             "sw_checklist" => {
                 finish(&mut out, &mut cur);
                 arm_runup = false; // don't let an arm leak across sections
-                // `MENU:TITLE` — the title is what we name and speak.
+                                   // `MENU:TITLE` — the title is what we name and speak.
                 let title = rest.split_once(':').map(|(_, t)| t).unwrap_or(rest).trim();
                 cur = Some(Checklist {
                     id: slug(title),
@@ -408,7 +475,12 @@ fn parse_item(rest: &str, map: &[ChecklistMapEntry], fuel: &[FuelPosition]) -> I
     match action_for(map, &base, &cond, fuel) {
         Some((tool, args)) => {
             let confirm = confirm_for(tool, &args);
-            Item::Act { say, tool, args, confirm }
+            Item::Act {
+                say,
+                tool,
+                args,
+                confirm,
+            }
         }
         None => {
             // Only auto-set items that are both an action (not a CHECK/observe
@@ -417,7 +489,13 @@ fn parse_item(rest: &str, map: &[ChecklistMapEntry], fuel: &[FuelPosition]) -> I
             // `laminar/*` datarefs) are observe-only — reading them is honest,
             // writing them fails and floods the readback with "couldn't set it".
             let settable = !is_observe_response(response) && !is_readonly_dataref(&base);
-            Item::Verify { say, dataref: base, index, cond, settable }
+            Item::Verify {
+                say,
+                dataref: base,
+                index,
+                cond,
+                settable,
+            }
         }
     }
 }
@@ -428,8 +506,7 @@ fn parse_item(rest: &str, map: &[ChecklistMapEntry], fuel: &[FuelPosition]) -> I
 fn is_observe_response(resp: &str) -> bool {
     let r = resp.trim().to_ascii_uppercase();
     const OBSERVE: &[&str] = &[
-        "CHECK", "VERIFY", "CONFIRM", "MONITOR", "NOTE", "OBSERVE", "TEST",
-        "CHECKED", "ENSURE",
+        "CHECK", "VERIFY", "CONFIRM", "MONITOR", "NOTE", "OBSERVE", "TEST", "CHECKED", "ENSURE",
     ];
     OBSERVE.iter().any(|w| r.starts_with(w))
         || r.contains("AS REQ")
@@ -456,11 +533,7 @@ fn is_readonly_dataref(d: &str) -> bool {
 /// (`(a:1)&&(b:1)`, `||`), function predicates (`closer_than(...)`), or anything
 /// with braces/parens. Such items degrade to call-outs.
 fn is_compound_condition(c: &str) -> bool {
-    c.starts_with('(')
-        || c.contains("&&")
-        || c.contains("||")
-        || c.contains('(')
-        || c.contains('{')
+    c.starts_with('(') || c.contains("&&") || c.contains("||") || c.contains('(') || c.contains('{')
 }
 
 /// Hazard text for pulling the mixture to idle cutoff. Only worth confirming
@@ -520,7 +593,13 @@ fn action_for(
         ChecklistAction::Light(key) => Some(("set_lights", json!({ "light": key, "on": on }))),
         ChecklistAction::Transponder => match cond {
             Cond::Eq(n) => {
-                let mode = if *n < 0.5 { "off" } else if *n < 2.5 { "standby" } else { "altitude" };
+                let mode = if *n < 0.5 {
+                    "off"
+                } else if *n < 2.5 {
+                    "standby"
+                } else {
+                    "altitude"
+                };
                 Some(("set_transponder_mode", json!({ "mode": mode })))
             }
             _ => None,
@@ -532,8 +611,12 @@ fn action_for(
             // is N; `:!N` ("not both" on the 172) picks the first position that
             // isn't N. Inequalities (`:>0` shutoff-pushed-in) stay verify-only.
             let key = match cond {
-                Cond::Eq(n) => fuel.iter().find(|p| p.value.is_some_and(|v| (v - n).abs() < 0.5)),
-                Cond::Ne(n) => fuel.iter().find(|p| p.value.is_some_and(|v| (v - n).abs() >= 0.5)),
+                Cond::Eq(n) => fuel
+                    .iter()
+                    .find(|p| p.value.is_some_and(|v| (v - n).abs() < 0.5)),
+                Cond::Ne(n) => fuel
+                    .iter()
+                    .find(|p| p.value.is_some_and(|v| (v - n).abs() >= 0.5)),
                 _ => None,
             }?;
             Some(("set_fuel_selector", json!({ "position": key.key })))
@@ -542,12 +625,20 @@ fn action_for(
             // Files express "up"/"full" as either a bound (172: `<0.02`/`>0.90`)
             // or an exact value (SR22: `0.0`/`1.0`).
             Cond::Lt(n) | Cond::Eq(n) if *n <= 0.1 => Some(("set_flaps", json!({ "notch": "up" }))),
-            Cond::Gt(n) | Cond::Eq(n) if *n >= 0.85 => Some(("set_flaps", json!({ "notch": "full" }))),
+            Cond::Gt(n) | Cond::Eq(n) if *n >= 0.85 => {
+                Some(("set_flaps", json!({ "notch": "full" })))
+            }
             _ => None, // "as required" / intermediate (e.g. 50%) → the pilot's call
         },
         ChecklistAction::Mixture => {
             let t = cond.target();
-            let pct = if t >= 0.9 { 100 } else if t <= 0.1 { 0 } else { 65 };
+            let pct = if t >= 0.9 {
+                100
+            } else if t <= 0.1 {
+                0
+            } else {
+                65
+            };
             Some(("set_mixture", json!({ "percent": pct })))
         }
         ChecklistAction::Throttle => {
@@ -561,7 +652,15 @@ fn action_for(
                 if v >= 3.5 {
                     Some(("start_engine", json!({})))
                 } else {
-                    let pos = if v < 0.5 { "off" } else if v < 1.5 { "right" } else if v < 2.5 { "left" } else { "both" };
+                    let pos = if v < 0.5 {
+                        "off"
+                    } else if v < 1.5 {
+                        "right"
+                    } else if v < 2.5 {
+                        "left"
+                    } else {
+                        "both"
+                    };
                     Some(("set_magnetos", json!({ "position": pos })))
                 }
             }
@@ -596,33 +695,61 @@ pub async fn run_step(
 ) -> Result<String> {
     match tool {
         "set_parking_brake" => {
-            SetParkingBrake { valve_set: park_brake_valve_set }.execute(args, ctx).await
+            SetParkingBrake {
+                valve_set: park_brake_valve_set,
+            }
+            .execute(args, ctx)
+            .await
         }
         "set_pitch_trim" => SetPitchTrim.execute(args, ctx).await,
-        "set_electrical" => SetElectrical::new(electrical.to_vec()).execute(args, ctx).await,
+        "set_electrical" => {
+            SetElectrical::new(electrical.to_vec())
+                .execute(args, ctx)
+                .await
+        }
         "set_mixture" => SetMixture.execute(args, ctx).await,
         "set_throttle" => SetThrottle.execute(args, ctx).await,
         "set_fuel_selector" => match fuel_selector {
             Some(f) => SetFuelSelector::new(f.clone()).execute(args, ctx).await,
             None => bail!("no fuel selector on this airframe"),
         },
-        "set_magnetos" => SetMagnetos { engines, per_engine: magnetos_per_engine }.execute(args, ctx).await,
+        "set_magnetos" => {
+            SetMagnetos {
+                engines,
+                per_engine: magnetos_per_engine,
+            }
+            .execute(args, ctx)
+            .await
+        }
         "set_pitot_heat" => {
-            SetPitotHeat { override_dataref: pitot_heat_dataref }.execute(args, ctx).await
+            SetPitotHeat {
+                override_dataref: pitot_heat_dataref,
+            }
+            .execute(args, ctx)
+            .await
         }
         "set_carb_heat" => SetCarbHeat { engines }.execute(args, ctx).await,
         // Universal-array pumps only: checklist-mapped airframes (172/SR22)
         // don't use the command override.
-        "set_fuel_pump" => SetFuelPump { engines, commands: None }.execute(args, ctx).await,
+        "set_fuel_pump" => {
+            SetFuelPump {
+                engines,
+                commands: None,
+            }
+            .execute(args, ctx)
+            .await
+        }
         "set_transponder_mode" => SetTransponderMode.execute(args, ctx).await,
         "autopilot_off" => AutopilotOff.execute(args, ctx).await,
-        "start_engine" => StartEngine {
-            fuel_selector: fuel_selector.clone(),
-            alternator_on_cmds: crate::tools::alternator_on_cmds(electrical),
-            bus_power_on_cmds: crate::tools::bus_power_on_cmds(electrical),
+        "start_engine" => {
+            StartEngine {
+                fuel_selector: fuel_selector.clone(),
+                alternator_on_cmds: crate::tools::alternator_on_cmds(electrical),
+                bus_power_on_cmds: crate::tools::bus_power_on_cmds(electrical),
+            }
+            .execute(args, ctx)
+            .await
         }
-        .execute(args, ctx)
-        .await,
         "stop_engine" => StopEngine.execute(args, ctx).await,
         "set_lights" => SetLights::new(lights.to_vec()).execute(args, ctx).await,
         "set_flaps" => match flaps {
@@ -717,7 +844,10 @@ fn clean_narration(s: &str) -> Option<String> {
 /// Lowercase, strip colour codes and the `[...]` non-simulated brackets, and
 /// capitalize the first letter — readable for TTS without SHOUTING acronyms.
 fn humanize(s: &str) -> String {
-    let stripped: String = strip_colors(s).chars().filter(|&c| c != '[' && c != ']').collect();
+    let stripped: String = strip_colors(s)
+        .chars()
+        .filter(|&c| c != '[' && c != ']')
+        .collect();
     let lowered = stripped.trim().to_lowercase();
     cap_first(&lowered)
 }
@@ -784,7 +914,9 @@ mod tests {
         let m = p172().checklist_map;
         let parse_item = |r: &str| super::parse_item(r, &m, &[]);
         // sw_item_c with colour codes mid-text — colours stripped, item mapped.
-        match parse_item(r"\green\Parking brakes\yellow\, engaged|\white\CHECK:sim/flightmodel/controls/parkbrake:1") {
+        match parse_item(
+            r"\green\Parking brakes\yellow\, engaged|\white\CHECK:sim/flightmodel/controls/parkbrake:1",
+        ) {
             Item::Act { say, tool, .. } => {
                 assert_eq!(tool, "set_parking_brake");
                 assert_eq!(say, "Parking brakes, engaged, check.");
@@ -793,30 +925,42 @@ mod tests {
         }
         // Compound (&&) condition → call-out (can't evaluate honestly).
         assert!(matches!(
-            parse_item(r"\green\Batteries\yellow\, both on|\white\CHECK:(sim/.../battery_on[0]:1)&&(sim/.../battery_on[1]:1)"),
+            parse_item(
+                r"\green\Batteries\yellow\, both on|\white\CHECK:(sim/.../battery_on[0]:1)&&(sim/.../battery_on[1]:1)"
+            ),
             Item::CallOut(_)
         ));
         // Function predicate → call-out.
         assert!(matches!(
-            parse_item(r"\green\Altimeter\yellow\, set QNH|\white\CHECK:1:closer_than({a},{b},0.02)"),
+            parse_item(
+                r"\green\Altimeter\yellow\, set QNH|\white\CHECK:1:closer_than({a},{b},0.02)"
+            ),
             Item::CallOut(_)
         ));
         // An operator we don't model (`><`) → call-out, never a fake verify.
         assert!(matches!(
-            parse_item(r"\green\HDG Bug\yellow\, set|\white\CHECK:sim/cockpit/autopilot/heading:><0.01"),
+            parse_item(
+                r"\green\HDG Bug\yellow\, set|\white\CHECK:sim/cockpit/autopilot/heading:><0.01"
+            ),
             Item::CallOut(_)
         ));
     }
 
     #[test]
     fn strips_colours_and_skips_decoration() {
-        assert_eq!(strip_colors(r"\green\Door(s)\yellow\, open"), "Door(s), open");
+        assert_eq!(
+            strip_colors(r"\green\Door(s)\yellow\, open"),
+            "Door(s), open"
+        );
         // Nav pointers and pure rules are silent…
         assert_eq!(clean_narration(r"\cyan\ >>> NEXT: BEFORE TAXI"), None);
         assert_eq!(clean_narration(r"\cyan\ ======================"), None);
         assert_eq!(clean_narration(r"\cyan\ -o-"), None);
         // …but a real heading survives, colour-stripped.
-        assert_eq!(clean_narration(r"\white\ *** MAGNETOS TEST").as_deref(), Some("Magnetos test."));
+        assert_eq!(
+            clean_narration(r"\white\ *** MAGNETOS TEST").as_deref(),
+            Some("Magnetos test.")
+        );
     }
 
     // Small helper so the panics above name the variant.
@@ -849,8 +993,14 @@ mod tests {
         assert_eq!(slug("BEFORE TAKEOFF"), "before_takeoff");
         assert_eq!(slug("STARTING ENGINE"), "starting_engine");
         assert_eq!(slug("*** CESSNA 172SP ***"), "cessna_172sp");
-        assert_eq!(split_index("sim/.../mixture_ratio[0]"), ("sim/.../mixture_ratio".into(), Some(0)));
-        assert_eq!(split_index("sim/.../parkbrake"), ("sim/.../parkbrake".into(), None));
+        assert_eq!(
+            split_index("sim/.../mixture_ratio[0]"),
+            ("sim/.../mixture_ratio".into(), Some(0))
+        );
+        assert_eq!(
+            split_index("sim/.../parkbrake"),
+            ("sim/.../parkbrake".into(), None)
+        );
     }
 
     #[test]
@@ -862,8 +1012,14 @@ mod tests {
         assert_eq!(hit("before takeoff checklist"), Some("before_takeoff"));
         // Polite wrappings, split compounds, and whisper's trailing period/"?"
         // arrive as separator noise - all resolve to the same section.
-        assert_eq!(hit("run the before take off check list"), Some("before_takeoff"));
-        assert_eq!(hit("let's do the pre-flight checklist, please"), Some("preflight"));
+        assert_eq!(
+            hit("run the before take off check list"),
+            Some("before_takeoff")
+        );
+        assert_eq!(
+            hit("let's do the pre-flight checklist, please"),
+            Some("preflight")
+        );
         assert_eq!(hit("checklist before taxi"), Some("before_taxi"));
         assert_eq!(hit("shut down checklist"), Some("engine_shutdown"));
         assert_eq!(hit("cruise checklist"), Some("cruise"));
@@ -874,7 +1030,10 @@ mod tests {
         // Prefix tolerance: "start" reaches "starting", and the exact-title
         // candidate beats the longer "before starting engine".
         assert_eq!(hit("engine start checklist"), Some("starting_engine"));
-        assert_eq!(hit("before start checklist"), Some("before_starting_engine"));
+        assert_eq!(
+            hit("before start checklist"),
+            Some("before_starting_engine")
+        );
 
         // Never a guess: ambiguous or unknown asks return None (the caller
         // declines and names the options), and without the trigger word
@@ -902,9 +1061,18 @@ mod tests {
         // ignition (set_magnetos / start_engine) and pitch trim. Never an unbuilt
         // system (e.g. the off/left/right fuel selector isn't checklist-mapped).
         let wired = [
-            "set_parking_brake", "set_transponder_mode", "set_pitot_heat", "set_lights",
-            "set_throttle", "set_mixture", "set_flaps", "set_electrical",
-            "set_fuel_pump", "set_magnetos", "start_engine", "set_pitch_trim",
+            "set_parking_brake",
+            "set_transponder_mode",
+            "set_pitot_heat",
+            "set_lights",
+            "set_throttle",
+            "set_mixture",
+            "set_flaps",
+            "set_electrical",
+            "set_fuel_pump",
+            "set_magnetos",
+            "start_engine",
+            "set_pitch_trim",
             "set_fuel_selector",
         ];
         let mut acts = 0;
@@ -912,7 +1080,10 @@ mod tests {
         for c in &cls {
             for it in &c.items {
                 if let Item::Act { tool, .. } = it {
-                    assert!(wired.contains(tool), "SR22 acted on an unwired tool: {tool}");
+                    assert!(
+                        wired.contains(tool),
+                        "SR22 acted on an unwired tool: {tool}"
+                    );
                     seen.insert(*tool);
                     acts += 1;
                 }
@@ -920,7 +1091,12 @@ mod tests {
         }
         assert!(acts > 0, "expected the wired acts");
         // The newly-wired systems actually show up in the interpreted file.
-        for t in ["set_fuel_pump", "set_magnetos", "set_pitch_trim", "set_fuel_selector"] {
+        for t in [
+            "set_fuel_pump",
+            "set_magnetos",
+            "set_pitch_trim",
+            "set_fuel_selector",
+        ] {
             assert!(seen.contains(t), "expected the SR22 file to drive {t}");
         }
     }
@@ -930,7 +1106,11 @@ mod tests {
         // With no checklist_map, an item we'd normally act on becomes a verify
         // (we can read it) — never an Act. This is the SR22's state until its
         // map is filled in: read-along + call-out, no actuation.
-        let it = super::parse_item("PARKING BRAKE|ON:sim/flightmodel/controls/parkbrake:1", &[], &[]);
+        let it = super::parse_item(
+            "PARKING BRAKE|ON:sim/flightmodel/controls/parkbrake:1",
+            &[],
+            &[],
+        );
         assert!(matches!(it, Item::Verify { .. }));
     }
 
@@ -941,7 +1121,12 @@ mod tests {
         // Parking brake ON → set_parking_brake(on).
         let it = parse_item("PARKING BRAKE|ON:sim/flightmodel/controls/parkbrake:1");
         match it {
-            Item::Act { say, tool, args, confirm } => {
+            Item::Act {
+                say,
+                tool,
+                args,
+                confirm,
+            } => {
                 assert_eq!(tool, "set_parking_brake");
                 assert_eq!(args, json!({ "on": true }));
                 assert_eq!(say, "Parking brake, on.");
@@ -963,7 +1148,9 @@ mod tests {
             _ => panic!("expected Act"),
         }
         // Throttle range → midpoint percent.
-        match parse_item("THROTTLE|OPEN 1/4 INCH:sim/cockpit2/engine/actuators/throttle_ratio[0]:0.15|0.20") {
+        match parse_item(
+            "THROTTLE|OPEN 1/4 INCH:sim/cockpit2/engine/actuators/throttle_ratio[0]:0.15|0.20",
+        ) {
             Item::Act { tool, args, .. } => {
                 assert_eq!(tool, "set_throttle");
                 assert_eq!(args, json!({ "percent": 18 }));
@@ -971,12 +1158,20 @@ mod tests {
             _ => panic!("expected Act"),
         }
         // No dataref → call-out.
-        assert!(matches!(parse_item("FUEL QUANTITY|SUFFICIENT"), Item::CallOut(_)));
+        assert!(matches!(
+            parse_item("FUEL QUANTITY|SUFFICIENT"),
+            Item::CallOut(_)
+        ));
         // A dataref we don't own → verify, and a writable switch is settable.
-        match parse_item("STATIC PRESSURE ALTERNATE|OFF:sim/cockpit2/switches/alternate_static_air_ratio:<0.1") {
+        match parse_item(
+            "STATIC PRESSURE ALTERNATE|OFF:sim/cockpit2/switches/alternate_static_air_ratio:<0.1",
+        ) {
             Item::Verify { cond, settable, .. } => {
                 assert_eq!(cond, Cond::Lt(0.1));
-                assert!(settable, "a writable switch with an action response is settable");
+                assert!(
+                    settable,
+                    "a writable switch with an action response is settable"
+                );
             }
             _ => panic!("expected Verify"),
         }
@@ -986,18 +1181,26 @@ mod tests {
     fn observe_and_readonly_items_are_not_settable() {
         let parse_item = |r: &str| super::parse_item(r, &[], &[]);
         // A CHECK response → observe-only, never written.
-        match parse_item("CLEAR MASTER CAUTION|CHECK:sim/cockpit/warnings/annunciators/master_caution:0") {
+        match parse_item(
+            "CLEAR MASTER CAUTION|CHECK:sim/cockpit/warnings/annunciators/master_caution:0",
+        ) {
             Item::Verify { settable, .. } => assert!(!settable, "CHECK is observe-only"),
             other => panic!("expected Verify, got {}", variant(&other)),
         }
         // A read-only indicator dataref → observe-only even with an action response.
         match parse_item("APU POWER|ON:sim/cockpit2/bleedair/indicators/bleed_available_center:1") {
-            Item::Verify { settable, .. } => assert!(!settable, "an indicator dataref isn't writable"),
+            Item::Verify { settable, .. } => {
+                assert!(!settable, "an indicator dataref isn't writable")
+            }
             other => panic!("expected Verify, got {}", variant(&other)),
         }
         // "ON IF NEEDED" is the pilot's discretion → observe-only.
-        match parse_item("ENGINE ANTI ICE|ON IF NEEDED:sim/cockpit/switches/anti_ice_inlet_heat_per_engine[0]:1") {
-            Item::Verify { settable, .. } => assert!(!settable, "conditional 'if needed' isn't forced"),
+        match parse_item(
+            "ENGINE ANTI ICE|ON IF NEEDED:sim/cockpit/switches/anti_ice_inlet_heat_per_engine[0]:1",
+        ) {
+            Item::Verify { settable, .. } => {
+                assert!(!settable, "conditional 'if needed' isn't forced")
+            }
             other => panic!("expected Verify, got {}", variant(&other)),
         }
     }
@@ -1007,7 +1210,10 @@ mod tests {
         // `>>>` advisory headers ("If ICING Conditions", weather descriptors) are
         // sub-note decoration, not spoken steps.
         assert_eq!(super::clean_narration(">>>If ICING Conditions"), None);
-        assert_eq!(super::clean_narration(">>> Temp below 10 C / Fog / Rain / Snow"), None);
+        assert_eq!(
+            super::clean_narration(">>> Temp below 10 C / Fog / Rain / Snow"),
+            None
+        );
         // A substantive remark still survives.
         assert!(super::clean_narration("MAGNETO TEST").is_some());
     }
@@ -1043,7 +1249,10 @@ mod tests {
         // through to a read-only verify.
         let sr22 = [pos("off", 0.0), pos("left", 1.0), pos("right", 2.0)];
         for (val, want) in [("0", "off"), ("1", "left"), ("2", "right")] {
-            match act(&format!("FUEL|X:sim/cockpit2/fuel/fuel_tank_selector:{val}"), &sr22) {
+            match act(
+                &format!("FUEL|X:sim/cockpit2/fuel/fuel_tank_selector:{val}"),
+                &sr22,
+            ) {
                 Item::Act { tool, args, .. } => {
                     assert_eq!(tool, "set_fuel_selector");
                     assert_eq!(args, json!({ "position": want }));
@@ -1054,7 +1263,10 @@ mod tests {
         // "switch to fullest" (`:>0.1`) names no single position, so it stays a
         // read-only verify rather than guessing a tank.
         assert!(matches!(
-            act("FUEL|FULLEST:sim/cockpit2/fuel/fuel_tank_selector:>0.1", &sr22),
+            act(
+                "FUEL|FULLEST:sim/cockpit2/fuel/fuel_tank_selector:>0.1",
+                &sr22
+            ),
             Item::Verify { .. }
         ));
     }
@@ -1073,14 +1285,20 @@ mod tests {
         assert!(ids.contains(&"engine_shutdown"));
         // The before-takeoff list actuates the parking brake (first real item).
         let bt = cls.iter().find(|c| c.id == "before_takeoff").unwrap();
-        assert!(bt.items.iter().any(|i| matches!(i, Item::Act { tool, .. } if *tool == "set_parking_brake")));
+        assert!(bt
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Act { tool, .. } if *tool == "set_parking_brake")));
 
         // The file's "X CHECKLIST" / "...COMPLETED" boilerplate is dropped — the
         // runner announces start/end itself, so none should survive as narration.
         for c in &cls {
             for item in &c.items {
                 if let Item::Narrate(t) = item {
-                    assert!(!t.to_lowercase().contains("checklist"), "leaked boilerplate: {t:?}");
+                    assert!(
+                        !t.to_lowercase().contains("checklist"),
+                        "leaked boilerplate: {t:?}"
+                    );
                 }
             }
         }
@@ -1097,16 +1315,27 @@ mod tests {
 
         // Engine shutdown kills the engine via mixture cutoff — that step is gated.
         let shut = cls.iter().find(|c| c.id == "engine_shutdown").unwrap();
-        assert!(shut.items.iter().any(|i| matches!(i, Item::Act { tool, args, confirm, .. }
+        assert!(shut
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Act { tool, args, confirm, .. }
             if *tool == "set_mixture" && args["percent"] == 0 && confirm.is_some())));
 
         // The run-up is armed by the MAGNETO TEST remark: exactly one step in
         // before-takeoff confirms (the throttle-up), and it's a throttle step.
         let bt = cls.iter().find(|c| c.id == "before_takeoff").unwrap();
-        let gated: Vec<&str> = bt.items.iter().filter_map(|i| match i {
-            Item::Act { tool, confirm: Some(_), .. } => Some(*tool),
-            _ => None,
-        }).collect();
+        let gated: Vec<&str> = bt
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Act {
+                    tool,
+                    confirm: Some(_),
+                    ..
+                } => Some(*tool),
+                _ => None,
+            })
+            .collect();
         assert_eq!(gated, vec!["set_throttle"]);
     }
 }

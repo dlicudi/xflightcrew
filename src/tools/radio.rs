@@ -103,7 +103,9 @@ impl Tool for SetTransponder {
         let code = args.code;
         // Squawk codes are octal: 0000–7777, no digit above 7.
         let valid = (0..=7777).contains(&code)
-            && format!("{:04}", code).bytes().all(|b| (b'0'..=b'7').contains(&b));
+            && format!("{:04}", code)
+                .bytes()
+                .all(|b| (b'0'..=b'7').contains(&b));
         if !valid {
             return Ok(format!(
                 "{code:04} isn't a valid squawk — digits must be zero through seven."
@@ -185,7 +187,11 @@ impl Tool for SwapRadio {
         let (cmd, spoken) = match a.radio.to_ascii_lowercase().as_str() {
             "com1" => (CMD_COM1_FLIP, "com one"),
             "com2" => (CMD_COM2_FLIP, "com two"),
-            other => return Ok(format!("I didn't catch which radio '{other}'. Say com one or com two.")),
+            other => {
+                return Ok(format!(
+                    "I didn't catch which radio '{other}'. Say com one or com two."
+                ))
+            }
         };
         ctx.xplane.run_command(cmd).await?;
         Ok(format!("Roger, swapped {spoken}."))

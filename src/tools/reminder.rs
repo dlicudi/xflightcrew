@@ -54,7 +54,11 @@ impl Reminders {
         };
         let mut v = self.inner.lock().unwrap();
         v.retain(|a| !a.done.load(Ordering::Relaxed));
-        v.push(Armed { desc, cancel: life.cancel.clone(), done: life.done.clone() });
+        v.push(Armed {
+            desc,
+            cancel: life.cancel.clone(),
+            done: life.done.clone(),
+        });
         life
     }
 
@@ -88,7 +92,10 @@ struct Life {
 
 impl Life {
     fn standalone() -> Self {
-        Self { cancel: Arc::new(AtomicBool::new(false)), done: Arc::new(AtomicBool::new(false)) }
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            done: Arc::new(AtomicBool::new(false)),
+        }
     }
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
@@ -203,7 +210,10 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             return;
         };
         rt.block_on(body);
@@ -221,25 +231,45 @@ fn arm_timer(mins: f64, life: Life, voice: Option<Voice>, status: Option<StatusS
             tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
         }
         if !life.cancelled() {
-            announce(&voice, &status, &format!("Heads up, that's {mins:.0} minutes."));
+            announce(
+                &voice,
+                &status,
+                &format!("Heads up, that's {mins:.0} minutes."),
+            );
         }
     });
 }
 
-fn arm_altitude(base: String, target: f64, current: f64, life: Life, voice: Option<Voice>, status: Option<StatusSink>) {
+fn arm_altitude(
+    base: String,
+    target: f64,
+    current: f64,
+    life: Life,
+    voice: Option<Voice>,
+    status: Option<StatusSink>,
+) {
     let climbing = target > current;
     spawn(async move {
         let _guard = DoneGuard(life.done.clone());
         let xp = XPlaneClient::new(base);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(REMINDER_DEADLINE_SECS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(REMINDER_DEADLINE_SECS);
         while std::time::Instant::now() < deadline {
             if life.cancelled() {
                 return;
             }
             if let Ok(alt) = xp.get_float(ALT_FT).await {
-                let reached = if climbing { alt >= target - 50.0 } else { alt <= target + 50.0 };
+                let reached = if climbing {
+                    alt >= target - 50.0
+                } else {
+                    alt <= target + 50.0
+                };
                 if reached {
-                    announce(&voice, &status, &format!("Heads up, passing {target:.0} feet."));
+                    announce(
+                        &voice,
+                        &status,
+                        &format!("Heads up, passing {target:.0} feet."),
+                    );
                     return;
                 }
             }
@@ -248,11 +278,18 @@ fn arm_altitude(base: String, target: f64, current: f64, life: Life, voice: Opti
     });
 }
 
-fn arm_waypoint(base: String, from: String, life: Life, voice: Option<Voice>, status: Option<StatusSink>) {
+fn arm_waypoint(
+    base: String,
+    from: String,
+    life: Life,
+    voice: Option<Voice>,
+    status: Option<StatusSink>,
+) {
     spawn(async move {
         let _guard = DoneGuard(life.done.clone());
         let xp = XPlaneClient::new(base);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(REMINDER_DEADLINE_SECS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(REMINDER_DEADLINE_SECS);
         // The active GPS waypoint sequences when we reach it: the id flips to the
         // next leg. Fire on that change (or when the id empties at the end).
         while std::time::Instant::now() < deadline {
@@ -306,11 +343,18 @@ async fn dist_to_tod(xp: &XPlaneClient, ring: Option<(f64, f64, f64)>) -> Option
     Some(crate::nav::haversine_nm(lat, lon, dlat, dlon) - ring_nm)
 }
 
-fn arm_tod(base: String, ring: Option<(f64, f64, f64)>, life: Life, voice: Option<Voice>, status: Option<StatusSink>) {
+fn arm_tod(
+    base: String,
+    ring: Option<(f64, f64, f64)>,
+    life: Life,
+    voice: Option<Voice>,
+    status: Option<StatusSink>,
+) {
     spawn(async move {
         let _guard = DoneGuard(life.done.clone());
         let xp = XPlaneClient::new(base);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(REMINDER_DEADLINE_SECS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(REMINDER_DEADLINE_SECS);
         // Wait until TOD is genuinely ahead (a positive distance) before arming the
         // trigger, so arming while already descending doesn't fire instantly; then
         // call out when we're within a couple of miles.

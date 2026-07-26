@@ -30,18 +30,23 @@ const CMD_STARTER: &str = "sim/starters/engage_starter_1";
 // monitor's "alternator offline" check doesn't fire the instant we finish.
 const CMD_ALTERNATOR_ON: &str = "sim/electrical/generator_1_on";
 const GENERATOR: &str = "sim/cockpit/electrical/generator_on"; // array; [0] = alternator
-// Per-engine actuator arrays (the 172 is single-engine → element 0).
+                                                               // Per-engine actuator arrays (the 172 is single-engine → element 0).
 const FUEL_PUMP: &str = "sim/cockpit2/engine/actuators/fuel_pump_on";
 const IGNITION_KEY: &str = "sim/cockpit2/engine/actuators/ignition_key"; // 0 off,1 R,2 L,3 both,4 start
-// Per-engine magneto selector (0 off,1 R,2 L,3 both) — for radials whose mags
-// aren't the single `ignition_key` (e.g. the DC-3, one selector per engine).
+                                                                         // Per-engine magneto selector (0 off,1 R,2 L,3 both) — for radials whose mags
+                                                                         // aren't the single `ignition_key` (e.g. the DC-3, one selector per engine).
 const IGNITION_ON: &str = "sim/cockpit/engine/ignition_on";
 const CARB_HEAT: &str = "sim/cockpit2/engine/actuators/carb_heat_ratio"; // 0 cold .. 1 hot
 
 /// Write the same value to elements `0..engines` of an int array dataref — for
 /// per-engine accessories on a multi (carb heat, boost pump, magnetos). A single
 /// engine writes just element 0, exactly as before.
-async fn set_each_engine(ctx: &ToolCtx<'_>, dataref: &str, engines: usize, value: i64) -> Result<()> {
+async fn set_each_engine(
+    ctx: &ToolCtx<'_>,
+    dataref: &str,
+    engines: usize,
+    value: i64,
+) -> Result<()> {
     for i in 0..engines.max(1) {
         ctx.xplane.set_int_array_elem(dataref, i, value).await?;
     }
@@ -85,8 +90,9 @@ struct PercentArg {
 /// A real copilot queries a nonsense number; it doesn't round it to the nearest
 /// lever stop and act.
 fn bad_percent_reply(system: &str, p: f64) -> Option<String> {
-    (!(0.0..=100.0).contains(&p))
-        .then(|| format!("Say again? I heard {system} {p:.0} percent, and it runs zero to one hundred."))
+    (!(0.0..=100.0).contains(&p)).then(|| {
+        format!("Say again? I heard {system} {p:.0} percent, and it runs zero to one hundred.")
+    })
 }
 
 /// Drive a 0.0–1.0 actuator smoothly from its current value to `to`, like a hand
@@ -112,7 +118,9 @@ async fn ramp_actuator(ctx: &ToolCtx<'_>, dataref: &str, to: f64) -> Result<()> 
     for i in 1..=steps {
         let t = i as f64 / steps as f64;
         let eased = t * t * (3.0 - 2.0 * t); // smoothstep
-        ctx.xplane.set_float(dataref, from + (to - from) * eased).await?;
+        ctx.xplane
+            .set_float(dataref, from + (to - from) * eased)
+            .await?;
         tokio::time::sleep(std::time::Duration::from_millis(STEP_MS)).await;
     }
     // Land exactly on the target so float rounding can't leave it a hair short.
@@ -175,7 +183,9 @@ impl Tool for SetThrottle {
         } else if let Some(p) = a.percent {
             p
         } else {
-            return Ok("Say a throttle setting — a percent, or by how much to change it.".to_string());
+            return Ok(
+                "Say a throttle setting — a percent, or by how much to change it.".to_string(),
+            );
         };
         let ratio = (target_pct / 100.0).clamp(0.0, 1.0);
         // Ease the lever to the target instead of snapping it — feels like a real
@@ -230,7 +240,12 @@ impl Tool for SetMixture {
         // the engine. (On the ground it's a normal shutdown, confirmed separately.)
         // Default to airborne if the read fails, so an unknown state errs safe.
         if p.percent <= 0.0
-            && ctx.xplane.get_float("sim/flightmodel/failures/onground_any").await.unwrap_or(0.0) <= 0.5
+            && ctx
+                .xplane
+                .get_float("sim/flightmodel/failures/onground_any")
+                .await
+                .unwrap_or(0.0)
+                <= 0.5
         {
             return Ok("Negative, I won't cut the mixture in flight.".to_string());
         }
@@ -271,7 +286,11 @@ async fn seek_metric_peak(
     const COARSE_SETTLE_MS: u64 = 450;
     const FINE_SETTLE_MS: u64 = 600;
 
-    let mut mix = ctx.xplane.get_float(MIXTURE).await?.clamp(MIX_LEAN_FLOOR, 0.95);
+    let mut mix = ctx
+        .xplane
+        .get_float(MIXTURE)
+        .await?
+        .clamp(MIX_LEAN_FLOOR, 0.95);
     tokio::time::sleep(std::time::Duration::from_millis(COARSE_SETTLE_MS)).await;
     let mut best_mix = mix;
     let mut best_val = engine0(ctx, metric, 0.0).await;
@@ -355,7 +374,9 @@ pub fn mixture_status() -> Option<&'static str> {
     if LEAN_SEEKING.load(Ordering::Relaxed) {
         return Some("mixture lean in progress");
     }
-    MIX_MANAGED.load(Ordering::Relaxed).then_some("mixture auto-lean")
+    MIX_MANAGED
+        .load(Ordering::Relaxed)
+        .then_some("mixture auto-lean")
 }
 
 /// Should the manager re-trim? Altitude or power moved enough that the last
@@ -466,7 +487,11 @@ async fn glide_lever(xp: &crate::xplane::XPlaneClient, dataref: &str, to: f64) {
 }
 
 async fn read_egt(xp: &crate::xplane::XPlaneClient) -> f64 {
-    xp.get_float_array(EGT_CEL).await.ok().and_then(|v| v.first().copied()).unwrap_or(0.0)
+    xp.get_float_array(EGT_CEL)
+        .await
+        .ok()
+        .and_then(|v| v.first().copied())
+        .unwrap_or(0.0)
 }
 
 /// Arm the continuous manager (idempotent): spawned on its own thread with its
@@ -476,7 +501,9 @@ pub fn arm_mixture_manager(base_url: String) {
     use std::sync::atomic::Ordering;
     if !MIX_MANAGED.swap(true, Ordering::Relaxed) {
         std::thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
             else {
                 MIX_MANAGED.store(false, Ordering::Relaxed);
                 return;
@@ -532,7 +559,13 @@ impl Tool for LeanMixture {
         let resolved = match mode.as_str() {
             "economy" => "economy",
             "power" => "power",
-            _ => if alt >= LEAN_FLOOR_ALT_FT { "economy" } else { "rich" },
+            _ => {
+                if alt >= LEAN_FLOOR_ALT_FT {
+                    "economy"
+                } else {
+                    "rich"
+                }
+            }
         };
 
         match resolved {
@@ -548,7 +581,9 @@ impl Tool for LeanMixture {
             "economy" => {
                 // Don't lean hard at high power down low (detonation risk). Up high,
                 // full throttle is still under 75% power, so leaning is correct.
-                if alt < LEAN_FLOOR_ALT_FT && ctx.xplane.get_float(THROTTLE).await.unwrap_or(0.0) > 0.80 {
+                if alt < LEAN_FLOOR_ALT_FT
+                    && ctx.xplane.get_float(THROTTLE).await.unwrap_or(0.0) > 0.80
+                {
                     return Ok(
                         "We're at high power down low, I'll hold off leaning; \
                          leaning hard there risks detonation. Reduce to cruise power or climb first."
@@ -585,7 +620,10 @@ fn spawn_lean_seek(ctx: &ToolCtx<'_>, economy: bool) {
     let voice = ctx.voice.cloned();
     let status = ctx.status.cloned();
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             LEAN_SEEKING.store(false, Ordering::Relaxed);
             return;
         };
@@ -634,13 +672,15 @@ async fn lean_seek(ctx: &ToolCtx<'_>, economy: bool) -> Option<String> {
             Ok(Some((best, egt))) => {
                 if let Err(e) = ramp_actuator(ctx, MIXTURE, (best + 0.03).min(1.0)).await {
                     tracing::warn!("lean seek: setting the peak failed: {e:#}");
-                    return Some("Couldn't finish the lean, mixture's where I left it.".to_string());
+                    return Some(
+                        "Couldn't finish the lean, mixture's where I left it.".to_string(),
+                    );
                 }
                 let pct = ctx.xplane.get_float(MIXTURE).await.unwrap_or(best + 0.03) * 100.0;
                 let gph = engine0(ctx, FUEL_FLOW_KG_S, 0.0).await * 3600.0 / AVGAS_KG_PER_GAL;
                 let egt_f = egt * 9.0 / 5.0 + 32.0; // dataref is °C
-                // From here it's continuous: the manager re-trims as altitude
-                // or power changes, until the pilot takes the lever back.
+                                                    // From here it's continuous: the manager re-trims as altitude
+                                                    // or power changes, until the pilot takes the lever back.
                 arm_mixture_manager(ctx.config.xplane_base_url.clone());
                 Some(format!(
                     "Leaned to peak EGT, mixture {pct:.0} percent, EGT {egt_f:.0} degrees, burning {gph:.1} gallons an hour. I'll keep it trimmed as we climb or descend."
@@ -657,10 +697,14 @@ async fn lean_seek(ctx: &ToolCtx<'_>, economy: bool) -> Option<String> {
             Ok(Some((best, rpm))) => {
                 if let Err(e) = ramp_actuator(ctx, MIXTURE, best).await {
                     tracing::warn!("lean seek: setting max power failed: {e:#}");
-                    return Some("Couldn't finish the lean, mixture's where I left it.".to_string());
+                    return Some(
+                        "Couldn't finish the lean, mixture's where I left it.".to_string(),
+                    );
                 }
                 let pct = ctx.xplane.get_float(MIXTURE).await.unwrap_or(best) * 100.0;
-                Some(format!("Leaned for max power — {rpm:.0} RPM at mixture {pct:.0} percent."))
+                Some(format!(
+                    "Leaned for max power — {rpm:.0} RPM at mixture {pct:.0} percent."
+                ))
             }
             Err(e) => {
                 tracing::warn!("lean seek: RPM hunt failed: {e:#}");
@@ -732,7 +776,13 @@ impl Tool for StartEngine {
             }
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         }
-        let volts = ctx.xplane.get_float_array(BUS_VOLTS).await?.first().copied().unwrap_or(0.0);
+        let volts = ctx
+            .xplane
+            .get_float_array(BUS_VOLTS)
+            .await?
+            .first()
+            .copied()
+            .unwrap_or(0.0);
         if volts < MIN_START_VOLTS {
             return Ok(format!(
                 "Battery's low, only {volts:.0} volts — connect ground power or you may not get a start."
@@ -754,17 +804,25 @@ impl Tool for StartEngine {
                 None => None,
             };
             if off == Some(true) {
-                let mut target =
-                    fs.positions.iter().find(|p| p.key.eq_ignore_ascii_case("both"));
+                let mut target = fs
+                    .positions
+                    .iter()
+                    .find(|p| p.key.eq_ignore_ascii_case("both"));
                 if target.is_none() {
                     let tanks = ctx
                         .xplane
                         .get_float_array(crate::datarefs::FUEL_PER_TANK_KG)
                         .await
                         .unwrap_or_default();
-                    let side =
-                        if tanks.len() >= 2 && tanks[1] > tanks[0] { "right" } else { "left" };
-                    target = fs.positions.iter().find(|p| p.key.eq_ignore_ascii_case(side));
+                    let side = if tanks.len() >= 2 && tanks[1] > tanks[0] {
+                        "right"
+                    } else {
+                        "left"
+                    };
+                    target = fs
+                        .positions
+                        .iter()
+                        .find(|p| p.key.eq_ignore_ascii_case(side));
                 }
                 if let Some(pos) = target {
                     ctx.xplane.run_command(&pos.command).await?;
@@ -807,7 +865,11 @@ impl Tool for StartEngine {
                     }
                     self.alternator_on_cmds.len()
                 };
-                let gens = ctx.xplane.get_float_array(GENERATOR).await.unwrap_or_default();
+                let gens = ctx
+                    .xplane
+                    .get_float_array(GENERATOR)
+                    .await
+                    .unwrap_or_default();
                 let alt_on = gens.len() >= n_alts && gens.iter().take(n_alts).all(|g| *g > 0.5);
                 // Bring the avionics master online now the engine's running and
                 // the alternator is charging — matches the STARTING ENGINE
@@ -817,11 +879,19 @@ impl Tool for StartEngine {
                 // The avionics-master ON command is universal (sim/systems/...),
                 // so fire it directly rather than coupling to the (now
                 // profile-built) electrical tool.
-                let avionics_on = ctx.xplane.run_command("sim/systems/avionics_on").await.is_ok();
+                let avionics_on = ctx
+                    .xplane
+                    .run_command("sim/systems/avionics_on")
+                    .await
+                    .is_ok();
                 // Narrate the start sequence so the pilot hears what was done on
                 // their behalf, not just the end state.
                 let alt = if alt_on {
-                    if n_alts > 1 { "alternators on" } else { "alternator on" }
+                    if n_alts > 1 {
+                        "alternators on"
+                    } else {
+                        "alternator on"
+                    }
                 } else {
                     "but the alternator didn't come on, check it"
                 };
@@ -852,7 +922,12 @@ async fn read_switch(ctx: &ToolCtx<'_>, dref: &str) -> Option<f64> {
     if let Some(open) = dref.find('[') {
         let base = &dref[..open];
         let idx: usize = dref[open + 1..dref.find(']')?].parse().ok()?;
-        ctx.xplane.get_float_array(base).await.ok()?.get(idx).copied()
+        ctx.xplane
+            .get_float_array(base)
+            .await
+            .ok()?
+            .get(idx)
+            .copied()
     } else {
         ctx.xplane.get_float(dref).await.ok()
     }
@@ -885,7 +960,11 @@ impl Tool for SetFuelPump {
         // Command-driven pumps (profile override): fire the airframe's own
         // switches and confirm from its readbacks, not the universal array.
         if let Some(pc) = &self.commands {
-            let cmds = if a.on { &pc.on_commands } else { &pc.off_commands };
+            let cmds = if a.on {
+                &pc.on_commands
+            } else {
+                &pc.off_commands
+            };
             for c in cmds {
                 ctx.xplane.run_command(c).await?;
             }
@@ -905,8 +984,18 @@ impl Tool for SetFuelPump {
             });
         }
         set_each_engine(ctx, FUEL_PUMP, self.engines, a.on as i64).await?;
-        let on = ctx.xplane.get_float_array(FUEL_PUMP).await?.first().copied().unwrap_or(0.0) > 0.5;
-        Ok(format!("Roger, fuel pump {}.", if on { "on" } else { "off" }))
+        let on = ctx
+            .xplane
+            .get_float_array(FUEL_PUMP)
+            .await?
+            .first()
+            .copied()
+            .unwrap_or(0.0)
+            > 0.5;
+        Ok(format!(
+            "Roger, fuel pump {}.",
+            if on { "on" } else { "off" }
+        ))
     }
 }
 
@@ -935,8 +1024,18 @@ impl Tool for SetCarbHeat {
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: OnArg = serde_json::from_value(args.clone())?;
         set_each_engine(ctx, CARB_HEAT, self.engines, a.on as i64).await?;
-        let on = ctx.xplane.get_float_array(CARB_HEAT).await?.first().copied().unwrap_or(0.0) > 0.5;
-        Ok(format!("Roger, carb heat {}.", if on { "on" } else { "off" }))
+        let on = ctx
+            .xplane
+            .get_float_array(CARB_HEAT)
+            .await?
+            .first()
+            .copied()
+            .unwrap_or(0.0)
+            > 0.5;
+        Ok(format!(
+            "Roger, carb heat {}.",
+            if on { "on" } else { "off" }
+        ))
     }
 }
 
@@ -982,16 +1081,38 @@ impl Tool for SetMagnetos {
             "right" => 1,
             "left" => 2,
             "both" => 3,
-            other => return Ok(format!("I didn't catch the magneto position '{other}'. Say off, left, right, or both.")),
+            other => {
+                return Ok(format!(
+                    "I didn't catch the magneto position '{other}'. Say off, left, right, or both."
+                ))
+            }
         };
-        let dref = if self.per_engine { IGNITION_ON } else { IGNITION_KEY };
+        let dref = if self.per_engine {
+            IGNITION_ON
+        } else {
+            IGNITION_KEY
+        };
         if self.per_engine {
             set_each_engine(ctx, IGNITION_ON, self.engines, key).await?;
         } else {
             ctx.xplane.set_int_array_elem(IGNITION_KEY, 0, key).await?;
         }
-        let actual = ctx.xplane.get_float_array(dref).await?.first().copied().unwrap_or(-1.0).round() as i64;
-        let name = match actual { 0 => "off", 1 => "right", 2 => "left", 3 => "both", 4 => "start", _ => "unknown" };
+        let actual = ctx
+            .xplane
+            .get_float_array(dref)
+            .await?
+            .first()
+            .copied()
+            .unwrap_or(-1.0)
+            .round() as i64;
+        let name = match actual {
+            0 => "off",
+            1 => "right",
+            2 => "left",
+            3 => "both",
+            4 => "start",
+            _ => "unknown",
+        };
         Ok(format!("Roger, magnetos {name}."))
     }
 }
@@ -1030,10 +1151,19 @@ impl Tool for SetFuelSelector {
          'both tanks', 'feed from the right', 'fuel selector off'."
     }
     fn parameters(&self) -> Value {
-        let mut keys: Vec<&str> = self.profile.positions.iter().map(|p| p.key.as_str()).collect();
+        let mut keys: Vec<&str> = self
+            .profile
+            .positions
+            .iter()
+            .map(|p| p.key.as_str())
+            .collect();
         keys.push("switch");
-        let listing: Vec<String> =
-            self.profile.positions.iter().map(|p| format!("{} ({})", p.key, p.spoken)).collect();
+        let listing: Vec<String> = self
+            .profile
+            .positions
+            .iter()
+            .map(|p| format!("{} ({})", p.key, p.spoken))
+            .collect();
         json!({
             "type": "object",
             "properties": {
@@ -1051,37 +1181,41 @@ impl Tool for SetFuelSelector {
         // SR22 has no BOTH, so this happens every half hour). Resolved from the
         // current selector; from anything that isn't a wing tank, ask for a side.
         let requested = a.position.to_ascii_lowercase();
-        let requested = if matches!(requested.as_str(), "switch" | "swap" | "other") {
-            let current = match &self.profile.readback {
-                Some(dref) => ctx.xplane.get_float(dref).await.ok().and_then(|actual| {
-                    self.profile
-                        .positions
-                        .iter()
-                        .find(|p| p.value.is_some_and(|v| (v - actual).abs() < 0.5))
-                        .map(|p| p.key.as_str())
-                }),
-                None => None,
-            };
-            match current {
-                Some("left") => "right".to_string(),
-                Some("right") => "left".to_string(),
-                _ => {
-                    return Ok(
+        let requested =
+            if matches!(requested.as_str(), "switch" | "swap" | "other") {
+                let current = match &self.profile.readback {
+                    Some(dref) => ctx.xplane.get_float(dref).await.ok().and_then(|actual| {
+                        self.profile
+                            .positions
+                            .iter()
+                            .find(|p| p.value.is_some_and(|v| (v - actual).abs() < 0.5))
+                            .map(|p| p.key.as_str())
+                    }),
+                    None => None,
+                };
+                match current {
+                    Some("left") => "right".to_string(),
+                    Some("right") => "left".to_string(),
+                    _ => return Ok(
                         "I can't tell which tank we're feeding from — say left tank or right tank."
                             .to_string(),
-                    )
+                    ),
                 }
-            }
-        } else {
-            requested
-        };
+            } else {
+                requested
+            };
         let Some(pos) = self
             .profile
             .positions
             .iter()
             .find(|p| p.key.eq_ignore_ascii_case(&requested))
         else {
-            let names: Vec<&str> = self.profile.positions.iter().map(|p| p.spoken.as_str()).collect();
+            let names: Vec<&str> = self
+                .profile
+                .positions
+                .iter()
+                .map(|p| p.spoken.as_str())
+                .collect();
             return Ok(format!(
                 "I didn't catch the fuel position '{}'. I have {}.",
                 a.position,
@@ -1129,7 +1263,9 @@ impl Tool for StopEngine {
         // ask for confirmation, refuse unless it's actually safe: on the ground,
         // stopped, and parking brake set.
         if ctx.xplane.get_float(ONGROUND).await? < 0.5 {
-            return Ok("Negative — we're airborne. I won't shut the engine down in flight.".to_string());
+            return Ok(
+                "Negative — we're airborne. I won't shut the engine down in flight.".to_string(),
+            );
         }
         if ctx.xplane.get_float(GROUNDSPEED).await? > 1.0 {
             return Ok("Negative — still moving. Bring her to a stop first.".to_string());
@@ -1152,7 +1288,9 @@ impl Tool for StopEngine {
                 .map(|r| r > 0.5)
                 .unwrap_or(false);
             if !running {
-                return Ok("Roger — mixture to idle cutoff, magnetos off. Engine shut down.".to_string());
+                return Ok(
+                    "Roger — mixture to idle cutoff, magnetos off. Engine shut down.".to_string(),
+                );
             }
         }
         Ok("Mixture to cutoff, engine winding down.".to_string())
@@ -1168,7 +1306,10 @@ mod tests {
         // "Power two hundred percent" (seen live) was silently clamped to full
         // power. It must come back as a query, never an action.
         let reply = bad_percent_reply("throttle", 200.0).expect("200% must be rejected");
-        assert!(reply.contains("200"), "reply names the heard value: {reply}");
+        assert!(
+            reply.contains("200"),
+            "reply names the heard value: {reply}"
+        );
         assert!(bad_percent_reply("mixture", -5.0).is_some());
         // Sane values pass through untouched, including the extremes.
         assert!(bad_percent_reply("throttle", 0.0).is_none());
@@ -1191,17 +1332,35 @@ mod tests {
             status: None,
             reminders: None,
         };
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let out = rt.block_on(seek_metric_peak(&ctx, EGT_CEL, 12.0)).unwrap();
         assert!(out.is_none(), "released seek must not report a peak");
-        assert!(!fake.wrote(MIXTURE), "released seek must not move the lever");
+        assert!(
+            !fake.wrote(MIXTURE),
+            "released seek must not move the lever"
+        );
     }
 
     #[test]
     fn retrim_triggers_on_altitude_or_power_change() {
-        assert!(!needs_retrim(10_000.0, 10_200.0, 0.65, 0.65), "small drift stays put");
-        assert!(needs_retrim(10_500.0, 10_000.0, 0.65, 0.65), "climbed 500 → re-lean");
-        assert!(needs_retrim(10_000.0, 10_000.0, 0.80, 0.65), "power change → re-lean");
-        assert!(needs_retrim(8_000.0, f64::MIN, 0.65, f64::MIN), "first pass always trims");
+        assert!(
+            !needs_retrim(10_000.0, 10_200.0, 0.65, 0.65),
+            "small drift stays put"
+        );
+        assert!(
+            needs_retrim(10_500.0, 10_000.0, 0.65, 0.65),
+            "climbed 500 → re-lean"
+        );
+        assert!(
+            needs_retrim(10_000.0, 10_000.0, 0.80, 0.65),
+            "power change → re-lean"
+        );
+        assert!(
+            needs_retrim(8_000.0, f64::MIN, 0.65, f64::MIN),
+            "first pass always trims"
+        );
     }
 }

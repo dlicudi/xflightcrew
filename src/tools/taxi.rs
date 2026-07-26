@@ -101,7 +101,13 @@ impl Tool for AutoTaxi {
         {
             return Ok("We're in replay. Go back to live and ask again.".to_string());
         }
-        if ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) < 0.5 {
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::ON_GROUND_ANY)
+            .await
+            .unwrap_or(0.0)
+            < 0.5
+        {
             return Ok("We're airborne. No taxiing up here.".to_string());
         }
         // The route is ATC's: no clearance, no guidance, no driving.
@@ -112,7 +118,9 @@ impl Tool for AutoTaxi {
             );
         };
         let Some(route) = autotaxi::Route::build(&watch) else {
-            return Ok("The cleared route's too short to drive. We're basically there.".to_string());
+            return Ok(
+                "The cleared route's too short to drive. We're basically there.".to_string(),
+            );
         };
         let (Ok(lat), Ok(lon), Ok(psi)) = (
             ctx.xplane.get_float(autotaxi::LAT).await,
@@ -173,7 +181,11 @@ impl Tool for AutoTaxi {
         // it by the right name (the tower cleared us "to stand ...").
         let dest = if party_line::taxi_to_stand() {
             let s = crate::station::spoken_stand(&watch.holding_point);
-            if s.is_empty() { "parking".to_string() } else { s }
+            if s.is_empty() {
+                "parking".to_string()
+            } else {
+                s
+            }
         } else {
             let hp = crate::station::spoken_taxiway(&watch.holding_point);
             if hp.is_empty() {
@@ -263,7 +275,13 @@ impl Tool for LineUp {
         {
             return Ok("We're in replay. Go back to live and ask again.".to_string());
         }
-        if ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) < 0.5 {
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::ON_GROUND_ANY)
+            .await
+            .unwrap_or(0.0)
+            < 0.5
+        {
             return Ok("We're airborne.".to_string());
         }
         // Driving onto a runway needs the tower's word for it when a tower
@@ -306,15 +324,17 @@ impl Tool for LineUp {
         .and_then(|r| r.ok())
         .unwrap_or_default();
         let cleared = party_line::clearance_runway();
-        let force_backtrack = args.get("backtrack").and_then(Value::as_bool).unwrap_or(false);
+        let force_backtrack = args
+            .get("backtrack")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         // Full-length check: the POH roll with the takeoff tool's 1.4
         // margin, floored at the plain line-up's own minimum.
         let needed_m = self.takeoff_roll_m.map_or(400.0, |m| (m * 1.4).max(400.0));
         // The cleared route's trimmed tail — the authored yellow lead-on from
         // the hold onto the centreline. The line-up drives it when it's ours.
-        let lead_on = party_line::with_taxi_route(|r| {
-            r.map(|w| w.lead_on.clone()).unwrap_or_default()
-        });
+        let lead_on =
+            party_line::with_taxi_route(|r| r.map(|w| w.lead_on.clone()).unwrap_or_default());
         let Some((rwy, plan)) = autotaxi::pick_line_up_plan(
             &cands,
             lat,
@@ -358,8 +378,10 @@ impl Tool for LineUp {
             lead_on: Vec::new(),
         };
         let Some(mut route) = autotaxi::Route::build(&watch) else {
-            return Ok("We're basically on the runway already. Roll forward a touch and we're lined up."
-                .to_string());
+            return Ok(
+                "We're basically on the runway already. Roll forward a touch and we're lined up."
+                    .to_string(),
+            );
         };
         route.done_line = Some(if backtracking {
             "At the numbers. Coming around.".to_string()
@@ -367,7 +389,11 @@ impl Tool for LineUp {
             format!("Lined up runway {spoken}. Holding position.")
         });
         // A backtrack taxis briskly down the strip; a plain line-up creeps.
-        let drive_kts = if backtracking { BACKTRACK_KTS } else { LINE_UP_KTS };
+        let drive_kts = if backtracking {
+            BACKTRACK_KTS
+        } else {
+            LINE_UP_KTS
+        };
         // Governor through the front door: parking-brake and held-brake
         // gates apply to a line-up unchanged.
         let arm_line = speedhold::HoldSpeed {
@@ -393,7 +419,12 @@ impl Tool for LineUp {
                 "Backtracking runway {spoken} for the full length. Your pedals or my controls take it back any time."
             ));
         }
-        autotaxi::start(ctx.config.xplane_base_url.clone(), ctx.voice.cloned(), route, LINE_UP_KTS);
+        autotaxi::start(
+            ctx.config.xplane_base_url.clone(),
+            ctx.voice.cloned(),
+            route,
+            LINE_UP_KTS,
+        );
         Ok(format!(
             "Lining us up, runway {spoken}. Your pedals or my controls take it back any time."
         ))
@@ -442,7 +473,13 @@ impl Tool for TaxiToParking {
         {
             return Ok("We're in replay. Go back to live and ask again.".to_string());
         }
-        if ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) < 0.5 {
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::ON_GROUND_ANY)
+            .await
+            .unwrap_or(0.0)
+            < 0.5
+        {
             return Ok("We're airborne. Land first, then I'll taxi us in.".to_string());
         }
         crate::taxi_in::start(

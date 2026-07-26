@@ -57,7 +57,11 @@ pub fn record_push_to_talk() -> Result<Vec<f32>> {
 
     let interleaved = std::mem::take(&mut *input.buffer.lock().unwrap());
     let mono = downmix(&interleaved, input.channels);
-    Ok(resample_linear(&mono, input.sample_rate, WHISPER_SAMPLE_RATE))
+    Ok(resample_linear(
+        &mono,
+        input.sample_rate,
+        WHISPER_SAMPLE_RATE,
+    ))
 }
 
 /// Diagnostic: open the mic and print live RMS levels so you can confirm capture
@@ -82,7 +86,11 @@ pub fn mic_check(threshold: f32) -> Result<()> {
         idle_ticks = 0;
         let level = rms(&downmix(&new, input.channels));
         let bar = "█".repeat(((level * 300.0) as usize).min(50));
-        let tag = if level > threshold { "SPEECH" } else { "quiet " };
+        let tag = if level > threshold {
+            "SPEECH"
+        } else {
+            "quiet "
+        };
         println!("  {tag}  rms={level:.4}  |{bar}");
     }
 }
@@ -105,11 +113,20 @@ impl Listener {
     /// Start capturing, then calibrate the VAD to the room's noise floor so the
     /// speech threshold sits above ambient. `vad_floor` is a hard minimum (the
     /// configured `XCOPILOT_VAD_RMS`), so a quiet room can't drive it too low.
-    pub fn start(vad_floor: f32, end_silence_ms: u32, reporter: Reporter, gate: MicGate, gate_tail: Duration) -> Result<Self> {
+    pub fn start(
+        vad_floor: f32,
+        end_silence_ms: u32,
+        reporter: Reporter,
+        gate: MicGate,
+        gate_tail: Duration,
+    ) -> Result<Self> {
         let input = open_input()?;
         input.stream.play().context("starting input stream")?;
 
-        reporter.log(LogKind::Info, "calibrating microphone — stay quiet for ~1s…");
+        reporter.log(
+            LogKind::Info,
+            "calibrating microphone — stay quiet for ~1s…",
+        );
         std::thread::sleep(Duration::from_millis(300)); // discard startup transient
         input.buffer.lock().unwrap().clear();
         let mut ambient_peak = 0.0f32;
@@ -202,18 +219,16 @@ impl Listener {
                 if let Some(utterance) = self.segmenter.push(frame) {
                     // Drop consumed audio; anything captured after starts fresh.
                     *self.input.buffer.lock().unwrap() = Vec::new();
-                    let resampled = resample_linear(
-                        &utterance,
-                        self.input.sample_rate,
-                        WHISPER_SAMPLE_RATE,
-                    );
+                    let resampled =
+                        resample_linear(&utterance, self.input.sample_rate, WHISPER_SAMPLE_RATE);
                     // Speech gate: only hand real speech to whisper. Non-speech
                     // bursts (sim/engine audio, knocks) are dropped, and we keep
                     // listening rather than transcribing noise into a command.
                     if self.speech.is_speech(&resampled) {
                         return Ok(resampled);
                     }
-                    self.reporter.log(LogKind::Info, "ignored (no speech detected)");
+                    self.reporter
+                        .log(LogKind::Info, "ignored (no speech detected)");
                     pending.clear();
                     self.segmenter.reset();
                     continue 'capture;
@@ -401,7 +416,10 @@ mod tests {
     use super::*;
 
     fn frames(samples: &[f32], frame_len: usize) -> Vec<&[f32]> {
-        samples.chunks(frame_len).filter(|c| c.len() == frame_len).collect()
+        samples
+            .chunks(frame_len)
+            .filter(|c| c.len() == frame_len)
+            .collect()
     }
 
     #[test]
@@ -432,7 +450,10 @@ mod tests {
         let utterance = got.expect("segmenter should emit one utterance");
         // Roughly the speech span (+ trailing silence window), not the leading silence.
         let secs = utterance.len() as f32 / 16_000.0;
-        assert!(secs > 0.4 && secs < 1.0, "unexpected utterance length: {secs}s");
+        assert!(
+            secs > 0.4 && secs < 1.0,
+            "unexpected utterance length: {secs}s"
+        );
     }
 
     #[test]
@@ -472,9 +493,16 @@ mod tests {
         let utt = utt.expect("utterance");
         // The clip starts with the quiet pre-roll, not the loud onset — proof the
         // first word's attack would survive.
-        assert!(utt[0].abs() < 0.05, "expected pre-roll before speech, got {}", utt[0]);
+        assert!(
+            utt[0].abs() < 0.05,
+            "expected pre-roll before speech, got {}",
+            utt[0]
+        );
         // Pre-roll (~240 ms = 8 frames) pads ahead of the 16 speech frames.
         let captured = utt.len() / frame_len;
-        assert!(captured >= 16 + 6, "expected pre-roll padding, got {captured} frames");
+        assert!(
+            captured >= 16 + 6,
+            "expected pre-roll padding, got {captured} frames"
+        );
     }
 }

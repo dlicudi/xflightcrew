@@ -113,7 +113,9 @@ async fn embed_one(base: &str, model: &str, text: &str) -> Result<Vec<f32>> {
         .json(&serde_json::json!({ "model": model, "prompt": text }))
         .send()
         .await
-        .context("Ollama embeddings call failed — is Ollama running, and is the embedding model pulled?")?
+        .context(
+            "Ollama embeddings call failed — is Ollama running, and is the embedding model pulled?",
+        )?
         .error_for_status()
         .context("embedding model error — `ollama pull nomic-embed-text`?")?
         .json()
@@ -190,12 +192,19 @@ pub async fn build_index(ollama_base: &str, aircraft_id: &str, pdfs: &[String]) 
                 Err(_) => match embed_one(ollama_base, &model, &text).await {
                     Ok(e) => e,
                     Err(e) => {
-                        println!("  ! skipping chunk {i} ({e:#}): {}…", &text[..text.len().min(60)]);
+                        println!(
+                            "  ! skipping chunk {i} ({e:#}): {}…",
+                            &text[..text.len().min(60)]
+                        );
                         continue;
                     }
                 },
             };
-            chunks.push(Chunk { source: source.clone(), text, embedding });
+            chunks.push(Chunk {
+                source: source.clone(),
+                text,
+                embedding,
+            });
             if (i + 1) % 50 == 0 {
                 println!("  …{} embedded", i + 1);
                 let _ = std::io::stdout().flush();
@@ -235,7 +244,10 @@ mod tests {
         assert!(chunks[0].contains("fuel system") && chunks[0].contains("Third"));
         assert!(!chunks[0].contains(" 42 "));
         // Long input splits at ~CHUNK_CHARS without cutting a paragraph.
-        let long = (0..40).map(|i| format!("Paragraph number {i} with some words.")).collect::<Vec<_>>().join("\n\n");
+        let long = (0..40)
+            .map(|i| format!("Paragraph number {i} with some words."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
         let chunks = chunk_text(&long);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|c| c.len() <= CHUNK_CHARS + 120));

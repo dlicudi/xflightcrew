@@ -34,7 +34,12 @@ impl SetElectrical {
         if let Some(open) = dref.find('[') {
             let base = &dref[..open];
             let idx: usize = dref[open + 1..dref.find(']')?].parse().ok()?;
-            ctx.xplane.get_float_array(base).await.ok()?.get(idx).copied()
+            ctx.xplane
+                .get_float_array(base)
+                .await
+                .ok()?
+                .get(idx)
+                .copied()
         } else {
             ctx.xplane.get_float(dref).await.ok()
         }
@@ -47,29 +52,47 @@ impl SetElectrical {
     /// the unnumbered single ("battery one" where the only key is "battery").
     fn find_system(&self, requested: &str) -> Option<&ElectricalSystem> {
         let req = requested.to_ascii_lowercase();
-        if let Some(s) = self.systems.iter().find(|s| s.key.eq_ignore_ascii_case(&req)) {
+        if let Some(s) = self
+            .systems
+            .iter()
+            .find(|s| s.key.eq_ignore_ascii_case(&req))
+        {
             return Some(s);
         }
         let plural = match req.strip_suffix('y') {
             Some(stem) => format!("{stem}ies"),
             None => format!("{req}s"),
         };
-        if let Some(s) = self.systems.iter().find(|s| s.key.eq_ignore_ascii_case(&plural)) {
+        if let Some(s) = self
+            .systems
+            .iter()
+            .find(|s| s.key.eq_ignore_ascii_case(&plural))
+        {
             return Some(s);
         }
-        let mut pref = self.systems.iter().filter(|s| s.key.to_ascii_lowercase().starts_with(&req));
+        let mut pref = self
+            .systems
+            .iter()
+            .filter(|s| s.key.to_ascii_lowercase().starts_with(&req));
         if let (Some(one), None) = (pref.next(), pref.next()) {
             return Some(one);
         }
         if let Some(stem) = req.strip_suffix(|c: char| c.is_ascii_digit()) {
-            return self.systems.iter().find(|s| s.key.eq_ignore_ascii_case(stem));
+            return self
+                .systems
+                .iter()
+                .find(|s| s.key.eq_ignore_ascii_case(stem));
         }
         None
     }
 
     /// Fire a system's commands and read its state back.
     async fn switch(&self, sys: &ElectricalSystem, on: bool, ctx: &ToolCtx<'_>) -> Result<String> {
-        let cmds = if on { &sys.on_commands } else { &sys.off_commands };
+        let cmds = if on {
+            &sys.on_commands
+        } else {
+            &sys.off_commands
+        };
         for c in cmds {
             ctx.xplane.run_command(c).await?;
         }
@@ -90,7 +113,12 @@ impl SetElectrical {
         } else {
             // Mixed — report rather than lie. (e.g. one of a pair didn't move.)
             let on_n = states.iter().filter(|&&s| s).count();
-            format!("{}: {} of {} on — check the panel.", sys.spoken, on_n, states.len())
+            format!(
+                "{}: {} of {} on — check the panel.",
+                sys.spoken,
+                on_n,
+                states.len()
+            )
         })
     }
 }
@@ -114,7 +142,11 @@ impl Tool for SetElectrical {
     fn parameters(&self) -> Value {
         let mut keys: Vec<&str> = self.systems.iter().map(|s| s.key.as_str()).collect();
         keys.push("all");
-        let listing: Vec<String> = self.systems.iter().map(|s| format!("{} ({})", s.key, s.spoken)).collect();
+        let listing: Vec<String> = self
+            .systems
+            .iter()
+            .map(|s| format!("{} ({})", s.key, s.spoken))
+            .collect();
         json!({
             "type": "object",
             "properties": {
@@ -144,7 +176,10 @@ impl Tool for SetElectrical {
 
         let Some(sys) = self.find_system(&args.system) else {
             let names: Vec<&str> = self.systems.iter().map(|s| s.spoken.as_str()).collect();
-            return Ok(format!("I didn't catch which system. I have {}.", names.join(", ")));
+            return Ok(format!(
+                "I didn't catch which system. I have {}.",
+                names.join(", ")
+            ));
         };
         self.switch(sys, args.on, ctx).await
     }
@@ -168,8 +203,13 @@ mod tests {
     fn find_system_resolves_split_and_single_airframes() {
         // SR22-style split systems: bare noun -> the pair entry; numbered -> exact.
         let sr22 = SetElectrical::new(vec![
-            sys("battery1"), sys("battery2"), sys("alternator1"), sys("alternator2"),
-            sys("batteries"), sys("alternators"), sys("avionics"),
+            sys("battery1"),
+            sys("battery2"),
+            sys("alternator1"),
+            sys("alternator2"),
+            sys("batteries"),
+            sys("alternators"),
+            sys("avionics"),
         ]);
         assert_eq!(sr22.find_system("alternator").unwrap().key, "alternators");
         assert_eq!(sr22.find_system("battery").unwrap().key, "batteries");

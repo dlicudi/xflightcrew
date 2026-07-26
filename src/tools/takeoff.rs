@@ -89,7 +89,13 @@ impl Tool for AutoTakeoff {
         {
             return Ok("We're in replay. Go back to live and ask again.".to_string());
         }
-        if ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(1.0) < 0.5 {
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::ON_GROUND_ANY)
+            .await
+            .unwrap_or(1.0)
+            < 0.5
+        {
             return Ok("We're already flying.".to_string());
         }
         // A drive in progress (line-up, auto taxi) is NOT killed by asking
@@ -174,7 +180,9 @@ impl Tool for AutoTakeoff {
                 handoff_agl_ft: autotakeoff::DEFAULT_HANDOFF_AGL_FT,
             },
         );
-        Ok("My takeoff. Checking the runway. Say abort takeoff or my controls any time."
-            .to_string())
+        Ok(
+            "My takeoff. Checking the runway. Say abort takeoff or my controls any time."
+                .to_string(),
+        )
     }
 }

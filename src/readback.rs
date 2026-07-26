@@ -60,8 +60,8 @@ pub fn vary_ack(line: &str, busy: bool) -> String {
         return line.to_string(); // not an affirmative confirmation — leave it
     };
     let callout = capitalize_first(body); // "Flaps ten."
-    // Heads-down on the roll: terse. Leave the anti-repeat state untouched so a
-    // busy spell doesn't bias which wrapper the next quiet ack collapses away.
+                                          // Heads-down on the roll: terse. Leave the anti-repeat state untouched so a
+                                          // busy spell doesn't bias which wrapper the next quiet ack collapses away.
     if busy {
         return callout;
     }
@@ -73,7 +73,7 @@ pub fn vary_ack(line: &str, busy: bool) -> String {
     }
     match next_prefix() {
         None => callout,
-        Some(p) => format!("{p} {body}"),   // "Got it, flaps ten."
+        Some(p) => format!("{p} {body}"), // "Got it, flaps ten."
     }
 }
 
@@ -117,15 +117,19 @@ fn next_prefix() -> Option<&'static str> {
     // so we can forbid an immediate repeat of the same wrapper.
     static LAST: AtomicU8 = AtomicU8::new(0);
     let idx = match rng_next() % 100 {
-        0..=54 => 0,   // 55% — bare "Flaps ten."
-        55..=71 => 1,  // "Okay,"
-        72..=84 => 2,  // "Got it,"
-        85..=92 => 3,  // "Alright,"
-        93..=97 => 4,  // "Roger,"
-        _ => 5,        // "Copy,"
+        0..=54 => 0,  // 55% — bare "Flaps ten."
+        55..=71 => 1, // "Okay,"
+        72..=84 => 2, // "Got it,"
+        85..=92 => 3, // "Alright,"
+        93..=97 => 4, // "Roger,"
+        _ => 5,       // "Copy,"
     };
     // Same wrapper twice running → collapse to the bare callout instead.
-    let idx = if idx != 0 && idx == LAST.load(Ordering::Relaxed) { 0 } else { idx };
+    let idx = if idx != 0 && idx == LAST.load(Ordering::Relaxed) {
+        0
+    } else {
+        idx
+    };
     LAST.store(idx, Ordering::Relaxed);
     (idx != 0).then(|| PREFIXES[(idx - 1) as usize])
 }
@@ -176,7 +180,10 @@ mod tests {
         for _ in 0..200 {
             let out = vary_ack("Roger — autopilot off. You have the airplane.", false);
             match wrapper_of(&out) {
-                None => assert_eq!(out, "Autopilot off. You have the airplane.", "bare: {out:?}"),
+                None => assert_eq!(
+                    out, "Autopilot off. You have the airplane.",
+                    "bare: {out:?}"
+                ),
                 Some(p) => assert_eq!(out, format!("{p} {body}"), "unexpected: {out:?}"),
             }
         }
@@ -215,7 +222,11 @@ mod tests {
             "Say again?",
         ] {
             assert_eq!(vary_ack(line, false), line, "{line:?} must be unchanged");
-            assert_eq!(vary_ack(line, true), line, "{line:?} must be unchanged when busy");
+            assert_eq!(
+                vary_ack(line, true),
+                line,
+                "{line:?} must be unchanged when busy"
+            );
         }
     }
 

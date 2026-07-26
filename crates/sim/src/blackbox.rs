@@ -29,13 +29,24 @@ pub fn record(kind: &str, fields: serde_json::Value) {
     // First use: open once (or record the decision not to — env off / no logs dir).
     if guard.is_none() {
         let enabled = !matches!(
-            std::env::var("XCOPILOT_BLACKBOX").unwrap_or_default().to_lowercase().as_str(),
+            std::env::var("XCOPILOT_BLACKBOX")
+                .unwrap_or_default()
+                .to_lowercase()
+                .as_str(),
             "off" | "0" | "false"
         );
-        *guard = Some(enabled.then(|| {
-            let _ = std::fs::create_dir_all("logs");
-            std::fs::OpenOptions::new().create(true).append(true).open("logs/blackbox.jsonl").ok()
-        }).flatten());
+        *guard = Some(
+            enabled
+                .then(|| {
+                    let _ = std::fs::create_dir_all("logs");
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("logs/blackbox.jsonl")
+                        .ok()
+                })
+                .flatten(),
+        );
     }
     if let Some(Some(f)) = guard.as_mut() {
         let _ = writeln!(f, "{line}");

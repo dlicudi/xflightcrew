@@ -69,7 +69,8 @@ impl OnnxTts {
 
         let sample_rate = cfg["audio"]["sample_rate"]
             .as_u64()
-            .ok_or_else(|| anyhow!("{cfg_path}: missing audio.sample_rate"))? as u32;
+            .ok_or_else(|| anyhow!("{cfg_path}: missing audio.sample_rate"))?
+            as u32;
 
         let map = cfg["phoneme_id_map"]
             .as_object()
@@ -93,9 +94,18 @@ impl OnnxTts {
         // `noise_w` = rhythm variation. Nudging a flat voice: length down, noise_w up.
         let inf = &cfg["inference"];
         let scales = [
-            env_scale("XCOPILOT_TTS_NOISE", inf["noise_scale"].as_f64().unwrap_or(0.667)),
-            env_scale("XCOPILOT_TTS_LENGTH", inf["length_scale"].as_f64().unwrap_or(1.0)),
-            env_scale("XCOPILOT_TTS_NOISE_W", inf["noise_w"].as_f64().unwrap_or(0.8)),
+            env_scale(
+                "XCOPILOT_TTS_NOISE",
+                inf["noise_scale"].as_f64().unwrap_or(0.667),
+            ),
+            env_scale(
+                "XCOPILOT_TTS_LENGTH",
+                inf["length_scale"].as_f64().unwrap_or(1.0),
+            ),
+            env_scale(
+                "XCOPILOT_TTS_NOISE_W",
+                inf["noise_w"].as_f64().unwrap_or(0.8),
+            ),
         ];
 
         // Multi-speaker voices take a `sid` input; single-speaker models
@@ -103,7 +113,13 @@ impl OnnxTts {
         let num_speakers = cfg["num_speakers"].as_i64().unwrap_or(1);
         let speaker = (num_speakers > 1).then_some(sid.clamp(0, num_speakers - 1));
 
-        Ok(Self { session, phoneme_ids, sample_rate, scales, speaker })
+        Ok(Self {
+            session,
+            phoneme_ids,
+            sample_rate,
+            scales,
+            speaker,
+        })
     }
 
     /// The voice's output sample rate (from its `.onnx.json`) — callers that
@@ -116,7 +132,12 @@ impl OnnxTts {
     /// `XCOPILOT_TTS_*` env knobs which apply to every voice in the process.
     /// `None` keeps the current value. noise = timbre variation, length = pace
     /// (lower is faster), noise_w = rhythm variation.
-    pub fn override_scales(&mut self, noise: Option<f32>, length: Option<f32>, noise_w: Option<f32>) {
+    pub fn override_scales(
+        &mut self,
+        noise: Option<f32>,
+        length: Option<f32>,
+        noise_w: Option<f32>,
+    ) {
         if let Some(v) = noise {
             self.scales[0] = v;
         }
@@ -195,7 +216,11 @@ impl OnnxTts {
     /// `radiofx`). The caller plays via [`crate::tts::play_pcm`]; the speech
     /// arbiter keeps the buffer so a PTT press can "step on" the transmission
     /// and the release can play the remainder from the real-time position.
-    pub fn render_with(&mut self, text: &str, fx: impl FnOnce(&mut Vec<f32>, u32)) -> Result<Vec<f32>> {
+    pub fn render_with(
+        &mut self,
+        text: &str,
+        fx: impl FnOnce(&mut Vec<f32>, u32),
+    ) -> Result<Vec<f32>> {
         let mut samples = self.synth_chunked(text)?;
         fx(&mut samples, self.sample_rate);
         Ok(samples)
@@ -302,7 +327,9 @@ impl KokoroTts {
             .commit_from_file(model_path)
             .map_err(|e| anyhow!("loading Kokoro {model_path}: {e}"))?;
 
-        let dir = Path::new(model_path).parent().unwrap_or_else(|| Path::new("."));
+        let dir = Path::new(model_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
         let cfg_path = dir.join("kokoro-config.json");
         let cfg: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&cfg_path).with_context(|| format!("reading {cfg_path:?}"))?,
@@ -323,20 +350,31 @@ impl KokoroTts {
         let style_path = dir.join("kokoro-voices").join(format!("{voice}.bin"));
         let bytes = std::fs::read(&style_path)
             .with_context(|| format!("reading Kokoro voice {style_path:?} (pre-extracted f32)"))?;
-        let style_rows: Vec<f32> =
-            bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        let style_rows: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
         if style_rows.len() < KOKORO_STYLE_DIM {
-            bail!("Kokoro voice {voice} style table too small ({} floats)", style_rows.len());
+            bail!(
+                "Kokoro voice {voice} style table too small ({} floats)",
+                style_rows.len()
+            );
         }
 
-        Ok(Self { session, vocab, style_rows })
+        Ok(Self {
+            session,
+            vocab,
+            style_rows,
+        })
     }
 
     /// Synthesize to mono 24 kHz `f32` samples.
     pub fn synth(&mut self, text: &str) -> Result<Vec<f32>> {
         let phonemes = phonemize(text)?;
-        let ids: Vec<i64> =
-            phonemes.chars().filter_map(|c| self.vocab.get(&c).copied()).collect();
+        let ids: Vec<i64> = phonemes
+            .chars()
+            .filter_map(|c| self.vocab.get(&c).copied())
+            .collect();
         if ids.is_empty() {
             bail!("no Kokoro tokens for {text:?} (phonemized to {phonemes:?})");
         }
@@ -418,7 +456,10 @@ fn session_threads() -> usize {
 /// A VITS scale: the env override (`name`) if set and parseable, else the voice's
 /// own value. Lets the voice be tuned from `.env` without editing the model json.
 fn env_scale(name: &str, default: f64) -> f32 {
-    std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(default as f32)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .unwrap_or(default as f32)
 }
 
 /// Spoken names for A–Z, so acronyms spelled letter-by-letter ("A P U", "C H T")
@@ -427,8 +468,32 @@ fn env_scale(name: &str, default: f64) -> f32 {
 // Spellings chosen so espeak-ng pronounces each as the letter NAME: "eigh" → /eɪ/
 // (a plain "ay" comes out /aɪ/ = "I", and "eff" doubles to "ee-eff"), etc.
 const LETTER_NAMES: [&str; 26] = [
-    "eigh", "bee", "see", "dee", "ee", "ef", "jee", "aitch", "eye", "jay", "kay", "el", "em", "en",
-    "oh", "pee", "cue", "ar", "ess", "tee", "you", "vee", "double you", "ex", "why", "zee",
+    "eigh",
+    "bee",
+    "see",
+    "dee",
+    "ee",
+    "ef",
+    "jee",
+    "aitch",
+    "eye",
+    "jay",
+    "kay",
+    "el",
+    "em",
+    "en",
+    "oh",
+    "pee",
+    "cue",
+    "ar",
+    "ess",
+    "tee",
+    "you",
+    "vee",
+    "double you",
+    "ex",
+    "why",
+    "zee",
 ];
 
 /// Expand standalone single capital letters to their spoken names (keeping any
@@ -493,7 +558,10 @@ fn espeak_ipa(clause: &str) -> Result<String> {
     if !out.status.success() {
         bail!("espeak-ng exited with {}", out.status);
     }
-    Ok(String::from_utf8_lossy(&out.stdout).replace('\n', " ").trim().to_string())
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .replace('\n', " ")
+        .trim()
+        .to_string())
 }
 
 #[cfg(test)]
@@ -523,7 +591,10 @@ mod tests {
         assert!(chunks.iter().all(|c| c.len() <= 220));
 
         // Decimals and short readbacks must not split.
-        assert_eq!(speech_chunks("Roger, altimeter 30.17."), vec!["Roger, altimeter 30.17."]);
+        assert_eq!(
+            speech_chunks("Roger, altimeter 30.17."),
+            vec!["Roger, altimeter 30.17."]
+        );
         assert_eq!(speech_chunks("Flaps up."), vec!["Flaps up."]);
         // Question marks end sentences too.
         assert_eq!(speech_chunks("Say again? Flaps up.").len(), 2);
@@ -543,13 +614,19 @@ mod tests {
         let _ = tts.synth(PHRASES[0]).expect("warm-up synth"); // JIT kernels
         println!("\none-time session load: {load_ms:7.1} ms");
 
-        println!("{:<52}{:>8}{:>10}{:>10}", "phrase", "speech", "WARM", "COLD");
+        println!(
+            "{:<52}{:>8}{:>10}{:>10}",
+            "phrase", "speech", "WARM", "COLD"
+        );
         let (mut wsum, mut csum) = (0.0, 0.0);
         for p in PHRASES {
             let t = Instant::now();
             let s = tts.synth(p).expect("warm synth");
             let wms = t.elapsed().as_secs_f64() * 1000.0;
-            assert!(s.len() as u32 > tts.sample_rate / 5, "got <0.2s of audio for {p:?}");
+            assert!(
+                s.len() as u32 > tts.sample_rate / 5,
+                "got <0.2s of audio for {p:?}"
+            );
 
             let t = Instant::now();
             let mut fresh = OnnxTts::load(MODEL).expect("reload");
@@ -563,8 +640,11 @@ mod tests {
         }
         let (wmean, cmean) = (wsum / 4.0, csum / 4.0);
         println!("  {:<50}{:>8}{wmean:>8.1}ms{cmean:>8.1}ms", "mean", "");
-        println!("  → cold pays {:.1}x the warm cost (+{:.0} ms reload tax/utterance)\n",
-                 cmean / wmean, cmean - wmean);
+        println!(
+            "  → cold pays {:.1}x the warm cost (+{:.0} ms reload tax/utterance)\n",
+            cmean / wmean,
+            cmean - wmean
+        );
 
         // Write one out so the audio can be ear-checked.
         let wav = std::env::temp_dir().join("x-copilot-onnx-test.wav");
@@ -618,7 +698,9 @@ mod station_voice_tests {
             let mut s = v.synth(phrase).expect("synth");
             // Production shape: the recorded AFV click when present.
             match crate::radiofx::load_tail_wav("assets/afv/Click_f32.wav", v.sample_rate) {
-                Ok(tail) => crate::radiofx::radioize_with_tail(&mut s, v.sample_rate, i as u32 + 1, &tail),
+                Ok(tail) => {
+                    crate::radiofx::radioize_with_tail(&mut s, v.sample_rate, i as u32 + 1, &tail)
+                }
                 Err(_) => crate::radiofx::radioize_variant(&mut s, v.sample_rate, i as u32 + 1),
             }
             let wav = out_dir.join(format!("{model}.wav"));
@@ -658,7 +740,9 @@ mod station_voice_tests {
             v.override_scales(None, Some(1.1), Some(1.0));
             let mut s = v.synth(phrase).expect("synth");
             match crate::radiofx::load_tail_wav("assets/afv/Click_f32.wav", v.sample_rate) {
-                Ok(tail) => crate::radiofx::radioize_with_tail(&mut s, v.sample_rate, i as u32 + 1, &tail),
+                Ok(tail) => {
+                    crate::radiofx::radioize_with_tail(&mut s, v.sample_rate, i as u32 + 1, &tail)
+                }
                 Err(_) => crate::radiofx::radioize_variant(&mut s, v.sample_rate, i as u32 + 1),
             }
             let wav = out_dir.join(format!("{label}.wav"));
@@ -670,10 +754,19 @@ mod station_voice_tests {
     #[test]
     fn speaker_specs_split_cleanly() {
         assert_eq!(super::split_speaker("models/v.onnx"), ("models/v.onnx", 0));
-        assert_eq!(super::split_speaker("models/v.onnx#1"), ("models/v.onnx", 1));
-        assert_eq!(super::split_speaker("models/v.onnx#0"), ("models/v.onnx", 0));
+        assert_eq!(
+            super::split_speaker("models/v.onnx#1"),
+            ("models/v.onnx", 1)
+        );
+        assert_eq!(
+            super::split_speaker("models/v.onnx#0"),
+            ("models/v.onnx", 0)
+        );
         // A '#' that isn't a speaker id stays part of the path.
-        assert_eq!(super::split_speaker("models/v#a.onnx"), ("models/v#a.onnx", 0));
+        assert_eq!(
+            super::split_speaker("models/v#a.onnx"),
+            ("models/v#a.onnx", 0)
+        );
     }
 
     /// Reproduces the live 2026-07-07 station-voice shape: the copilot's Ryan

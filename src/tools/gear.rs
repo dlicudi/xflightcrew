@@ -50,7 +50,10 @@ impl Tool for Gear {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: Args = serde_json::from_value(args.clone())?;
-        let up = matches!(a.position.to_ascii_lowercase().as_str(), "up" | "retract" | "raise");
+        let up = matches!(
+            a.position.to_ascii_lowercase().as_str(),
+            "up" | "retract" | "raise"
+        );
 
         // Safety gate: never raise the gear while we're on the ground.
         if up {
@@ -69,10 +72,17 @@ impl Tool for Gear {
             }
         }
 
-        ctx.xplane.set_float(GEAR_HANDLE, if up { 0.0 } else { 1.0 }).await?;
+        ctx.xplane
+            .set_float(GEAR_HANDLE, if up { 0.0 } else { 1.0 })
+            .await?;
         // Read the handle back (the gear itself takes seconds to cycle, but the
         // handle reflects the commanded position immediately).
-        let down = ctx.xplane.get_float(GEAR_HANDLE).await.unwrap_or(if up { 0.0 } else { 1.0 }) > 0.5;
+        let down = ctx
+            .xplane
+            .get_float(GEAR_HANDLE)
+            .await
+            .unwrap_or(if up { 0.0 } else { 1.0 })
+            > 0.5;
         Ok(format!("Roger, gear {}.", if down { "down" } else { "up" }))
     }
 }

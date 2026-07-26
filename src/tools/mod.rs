@@ -14,27 +14,27 @@ pub mod approach;
 pub mod autoland;
 pub mod autopilot;
 pub mod circuit;
-pub mod full_auto;
 pub mod controls;
 pub mod cycle;
 pub mod electrical;
 pub mod engine;
 pub mod flaps;
+pub mod full_auto;
 pub mod gear;
-pub mod jet_start;
 pub mod ground;
 pub mod instruments;
+pub mod jet_start;
 pub mod lights;
 pub mod power;
 pub mod procedure;
 pub mod prop;
 pub mod radio;
 pub mod recover;
+pub mod reminder;
 pub mod reverse;
 pub mod speedhold;
 pub mod takeoff;
 pub mod taxi;
-pub mod reminder;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -160,7 +160,9 @@ impl Registry {
         }
 
         if profile.retractable_gear {
-            tools.push(Box::new(gear::Gear { vlo_kts: profile.vlo_kts }));
+            tools.push(Box::new(gear::Gear {
+                vlo_kts: profile.vlo_kts,
+            }));
         }
 
         if !profile.lights.is_empty() {
@@ -168,7 +170,9 @@ impl Registry {
         }
 
         if profile.flood_lights {
-            tools.push(Box::new(lights::SetFloodLights::new(profile.flood_lights_dataref.clone())));
+            tools.push(Box::new(lights::SetFloodLights::new(
+                profile.flood_lights_dataref.clone(),
+            )));
         }
 
         if profile.autopilot {
@@ -373,7 +377,9 @@ impl Registry {
         // Reverse thrust (rollout only, self-stowing) — turboprops/jets whose
         // profile says the model has a usable beta/reverse range.
         if profile.reverse_thrust {
-            tools.push(Box::new(reverse::ReverseThrust { engines: profile.engines }));
+            tools.push(Box::new(reverse::ReverseThrust {
+                engines: profile.engines,
+            }));
         }
 
         if profile.fuel_pump || profile.fuel_pump_commands.is_some() {
@@ -391,7 +397,9 @@ impl Registry {
         }
 
         if profile.carb_heat {
-            tools.push(Box::new(engine::SetCarbHeat { engines: profile.engines }));
+            tools.push(Box::new(engine::SetCarbHeat {
+                engines: profile.engines,
+            }));
         }
 
         if let Some(fs) = &profile.fuel_selector {
@@ -405,7 +413,9 @@ impl Registry {
             tools.push(Box::new(cycle::SetPower::new(ps.clone())));
         }
         if !profile.fuel_selectors.is_empty() {
-            tools.push(Box::new(cycle::SetCycleFuelSelector::new(profile.fuel_selectors.clone())));
+            tools.push(Box::new(cycle::SetCycleFuelSelector::new(
+                profile.fuel_selectors.clone(),
+            )));
         }
         if let Some(start) = &profile.piston_start {
             tools.push(Box::new(cycle::StartEngines::new(
@@ -449,7 +459,9 @@ impl Registry {
         }
 
         if !profile.electrical.is_empty() {
-            tools.push(Box::new(electrical::SetElectrical::new(profile.electrical.clone())));
+            tools.push(Box::new(electrical::SetElectrical::new(
+                profile.electrical.clone(),
+            )));
         }
 
         if profile.barometer {
@@ -622,7 +634,13 @@ mod power_cmd_tests {
             sys("battery", &["Twin_Otter/battery/power_to_battery"]),
             sys("master", &["Twin_Otter/dc_master/master_on"]),
             sys("generator1", &["Twin_Otter/generators/left_on"]),
-            sys("generators", &["Twin_Otter/generators/left_on", "Twin_Otter/generators/right_on"]),
+            sys(
+                "generators",
+                &[
+                    "Twin_Otter/generators/left_on",
+                    "Twin_Otter/generators/right_on",
+                ],
+            ),
             sys("bleed", &["Twin_Otter/bleed_air/left_on"]),
         ];
         assert_eq!(

@@ -63,7 +63,11 @@ pub async fn scan(xp: &XPlaneClient) -> Result<Vec<ActiveFailure>> {
             }?;
             (scalar >= FAILED).then(|| {
                 let (system, label) = classify(&name);
-                ActiveFailure { dataref: name, label, system }
+                ActiveFailure {
+                    dataref: name,
+                    label,
+                    system,
+                }
             })
         })
         .buffer_unordered(READ_CONCURRENCY)
@@ -71,7 +75,11 @@ pub async fn scan(xp: &XPlaneClient) -> Result<Vec<ActiveFailure>> {
         .collect()
         .await;
     // Highest-priority system first, then stable by dataref for determinism.
-    failed.sort_by(|a, b| a.system.cmp(&b.system).then_with(|| a.dataref.cmp(&b.dataref)));
+    failed.sort_by(|a, b| {
+        a.system
+            .cmp(&b.system)
+            .then_with(|| a.dataref.cmp(&b.dataref))
+    });
     Ok(failed)
 }
 
@@ -166,11 +174,20 @@ fn classify(dataref: &str) -> (System, String) {
 /// number. Handles both `foo_0` and `foo0` shapes. `None` when there's no index.
 fn split_engine_index(core: &str) -> (&str, Option<u32>) {
     let trimmed = core.trim_end_matches('_');
-    let digits: String = trimmed.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = trimmed
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     if digits.is_empty() {
         return (core, None);
     }
-    let n: u32 = digits.chars().rev().collect::<String>().parse().unwrap_or(0);
+    let n: u32 = digits
+        .chars()
+        .rev()
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
     let base = &trimmed[..trimmed.len() - digits.len()];
     (base.trim_end_matches('_'), Some(n + 1))
 }
@@ -210,18 +227,42 @@ mod tests {
 
     #[test]
     fn engine_index_is_one_based_and_both_name_shapes_work() {
-        assert_eq!(classify("sim/operation/failures/rel_seize_1").1, "engine 2 seized");
-        assert_eq!(classify("sim/operation/failures/rel_engfai0").1, "engine 1 failure");
-        assert_eq!(classify("sim/operation/failures/rel_engfir2").1, "engine 3 fire");
+        assert_eq!(
+            classify("sim/operation/failures/rel_seize_1").1,
+            "engine 2 seized"
+        );
+        assert_eq!(
+            classify("sim/operation/failures/rel_engfai0").1,
+            "engine 1 failure"
+        );
+        assert_eq!(
+            classify("sim/operation/failures/rel_engfir2").1,
+            "engine 3 fire"
+        );
     }
 
     #[test]
     fn systems_are_bucketed_for_priority() {
-        assert_eq!(classify("sim/operation/failures/rel_fuel_leak").0, System::Fuel);
-        assert_eq!(classify("sim/operation/failures/rel_batter0").0, System::Electrical);
-        assert_eq!(classify("sim/operation/failures/rel_genera1").0, System::Electrical);
-        assert_eq!(classify("sim/operation/failures/rel_vacuum").0, System::Instruments);
-        assert_eq!(classify("sim/operation/failures/rel_gear_ind").0, System::Gear);
+        assert_eq!(
+            classify("sim/operation/failures/rel_fuel_leak").0,
+            System::Fuel
+        );
+        assert_eq!(
+            classify("sim/operation/failures/rel_batter0").0,
+            System::Electrical
+        );
+        assert_eq!(
+            classify("sim/operation/failures/rel_genera1").0,
+            System::Electrical
+        );
+        assert_eq!(
+            classify("sim/operation/failures/rel_vacuum").0,
+            System::Instruments
+        );
+        assert_eq!(
+            classify("sim/operation/failures/rel_gear_ind").0,
+            System::Gear
+        );
     }
 
     #[test]

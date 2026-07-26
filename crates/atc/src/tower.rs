@@ -292,8 +292,7 @@ pub fn parse_intent(transcript: &str) -> Intent {
     // "London") as a landing: any sentence about changing/switching a
     // frequency is that request and nothing else.
     if t.contains("frequenc")
-        && (word("switch") || word("change") || word("changing") || word("tune")
-            || word("request"))
+        && (word("switch") || word("change") || word("changing") || word("tune") || word("request"))
     {
         return Intent::RequestFrequencyChange;
     }
@@ -320,8 +319,16 @@ pub fn parse_intent(transcript: &str) -> Intent {
     // never parse as a takeoff request — the 2026-07-08 flight was CLEARED FOR
     // TAKEOFF for asking it. Radio check, wind check and squawk check stay
     // above this guard: the question-shaped calls a tower genuinely answers.
-    if word("what") || word("which") || word("how") || word("where") || word("when")
-        || word("why") || word("shall") || word("should") || word("can") || word("could")
+    if word("what")
+        || word("which")
+        || word("how")
+        || word("where")
+        || word("when")
+        || word("why")
+        || word("shall")
+        || word("should")
+        || word("can")
+        || word("could")
         || word("confirm")
     {
         return Intent::Unknown;
@@ -469,7 +476,9 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "request_startup" => Intent::RequestStartup,
         "request_shutdown" => Intent::RequestShutdown,
         "request_takeoff" => Intent::RequestTakeoff,
-        "request_landing" => Intent::RequestLanding { touch_and_go: false },
+        "request_landing" => Intent::RequestLanding {
+            touch_and_go: false,
+        },
         "request_touch_and_go" => Intent::RequestLanding { touch_and_go: true },
         "report_final" => Intent::ReportFinal,
         "report_downwind" => Intent::ReportDownwind,
@@ -506,11 +515,28 @@ pub fn is_readback(transcript: &str) -> bool {
     // "transponder set to 4503" is the squawk readback in cockpit words
     // (real 2026-07-10 call, answered "say again" while the watch was
     // already confirming the code).
-    ["descending", "descend", "maintaining", "maintain", "climbing", "climb", "passing",
-     "heading", "cleared", "roger", "wilco", "squawk", "squawking", "transponder", "copy",
-     "copied", "holding", "lining"]
-        .iter()
-        .any(|w| word(w))
+    [
+        "descending",
+        "descend",
+        "maintaining",
+        "maintain",
+        "climbing",
+        "climb",
+        "passing",
+        "heading",
+        "cleared",
+        "roger",
+        "wilco",
+        "squawk",
+        "squawking",
+        "transponder",
+        "copy",
+        "copied",
+        "holding",
+        "lining",
+    ]
+    .iter()
+    .any(|w| word(w))
         || t.contains("line up")
 }
 
@@ -525,9 +551,17 @@ pub enum Awaited {
     HoldPosition,
     /// "line up and wait" — lining-up words; a CONDITIONAL clearance
     /// ("behind the landing traffic ... behind") must echo the condition.
-    LineUp { runway: String, behind: bool },
-    Takeoff { runway: String },
-    Landing { runway: String, touch_and_go: bool },
+    LineUp {
+        runway: String,
+        behind: bool,
+    },
+    Takeoff {
+        runway: String,
+    },
+    Landing {
+        runway: String,
+        touch_and_go: bool,
+    },
 }
 
 /// A clearance awaiting its readback: what must be echoed, the instruction
@@ -549,7 +583,9 @@ pub enum ReadbackCheck {
     Correct,
     /// The echo names a DIFFERENT runway — the dangerous readback error, and
     /// the whole reason controllers listen to readbacks.
-    WrongRunway { heard: String },
+    WrongRunway {
+        heard: String,
+    },
     NotAReadback,
 }
 
@@ -609,7 +645,11 @@ fn designator_at(toks: &[String]) -> Option<String> {
         });
     }
     let trimmed = digits.trim_start_matches('0');
-    let mut out = if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() };
+    let mut out = if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    };
     if let Some(s) = side {
         out.push(s);
     }
@@ -649,7 +689,10 @@ pub fn check_readback(transcript: &str, awaited: &Awaited) -> ReadbackCheck {
     // A fresh request, a readiness call, or a confirm-question is never the
     // echo — those get the challenge (which repeats the instruction, so
     // "confirm cleared for takeoff?" is answered by the repeat).
-    if word("request") || word("requesting") || word("ready") || word("confirm")
+    if word("request")
+        || word("requesting")
+        || word("ready")
+        || word("confirm")
         || t.contains("say again")
     {
         return ReadbackCheck::NotAReadback;
@@ -657,9 +700,10 @@ pub fn check_readback(transcript: &str, awaited: &Awaited) -> ReadbackCheck {
     let verb_ok = match awaited {
         Awaited::HoldPosition => word("hold") || word("holding"),
         Awaited::LineUp { behind, .. } => {
-            let lining =
-                t.contains("line up") || t.contains("lining up") || t.contains("line-up")
-                    || word("lineup");
+            let lining = t.contains("line up")
+                || t.contains("lining up")
+                || t.contains("line-up")
+                || word("lineup");
             // The condition is part of the clearance: it must come back.
             lining && (!behind || word("behind"))
         }
@@ -762,19 +806,31 @@ impl Tower {
     pub fn suggested_readback(&self, callsign: &str) -> Option<String> {
         Some(match &self.pending.as_ref()?.awaited {
             Awaited::HoldPosition => format!("Holding position, {callsign}."),
-            Awaited::LineUp { runway, behind: false } => {
+            Awaited::LineUp {
+                runway,
+                behind: false,
+            } => {
                 format!("Lining up runway {runway}, {callsign}.")
             }
-            Awaited::LineUp { runway, behind: true } => format!(
-                "Behind the landing traffic, lining up runway {runway} behind, {callsign}."
-            ),
+            Awaited::LineUp {
+                runway,
+                behind: true,
+            } => {
+                format!("Behind the landing traffic, lining up runway {runway} behind, {callsign}.")
+            }
             Awaited::Takeoff { runway } => {
                 format!("Cleared for takeoff runway {runway}, {callsign}.")
             }
-            Awaited::Landing { runway, touch_and_go: false } => {
+            Awaited::Landing {
+                runway,
+                touch_and_go: false,
+            } => {
                 format!("Cleared to land runway {runway}, {callsign}.")
             }
-            Awaited::Landing { runway, touch_and_go: true } => {
+            Awaited::Landing {
+                runway,
+                touch_and_go: true,
+            } => {
                 format!("Cleared touch and go runway {runway}, {callsign}.")
             }
         })
@@ -810,7 +866,10 @@ impl Tower {
             }
             ReadbackCheck::WrongRunway { .. } => {
                 let instruction = pending.instruction.clone();
-                Some(format!("{}, negative. I say again: {instruction}", ctx.callsign))
+                Some(format!(
+                    "{}, negative. I say again: {instruction}",
+                    ctx.callsign
+                ))
             }
             ReadbackCheck::NotAReadback => {
                 // The question-shaped calls a controller answers regardless.
@@ -936,7 +995,10 @@ impl Tower {
                         ctx.callsign, ctx.runway
                     );
                     self.arm(
-                        Awaited::LineUp { runway: ctx.runway.clone(), behind: true },
+                        Awaited::LineUp {
+                            runway: ctx.runway.clone(),
+                            behind: true,
+                        },
                         &line,
                     );
                     line
@@ -963,7 +1025,10 @@ impl Tower {
                         ctx.callsign, ctx.runway
                     );
                     self.arm(
-                        Awaited::LineUp { runway: ctx.runway.clone(), behind: false },
+                        Awaited::LineUp {
+                            runway: ctx.runway.clone(),
+                            behind: false,
+                        },
                         &line,
                     );
                     line
@@ -979,10 +1044,7 @@ impl Tower {
                 // A ghost is ON the strip: nobody lines up onto an occupied
                 // runway.
                 State::TaxiCleared | State::LinedUp if ctx.runway_occupied => {
-                    let line = format!(
-                        "{}, hold position, traffic on the runway.",
-                        ctx.callsign
-                    );
+                    let line = format!("{}, hold position, traffic on the runway.", ctx.callsign);
                     self.arm(Awaited::HoldPosition, &line);
                     line
                 }
@@ -992,7 +1054,12 @@ impl Tower {
                         "{}, runway {}, wind {}, cleared for takeoff.",
                         ctx.callsign, ctx.runway, ctx.wind
                     );
-                    self.arm(Awaited::Takeoff { runway: ctx.runway.clone() }, &line);
+                    self.arm(
+                        Awaited::Takeoff {
+                            runway: ctx.runway.clone(),
+                        },
+                        &line,
+                    );
                     line
                 }
                 // A takeoff request from anywhere else gets the taxi first —
@@ -1120,7 +1187,10 @@ impl Tower {
             // An initial hail: invite the message. No state change — the
             // request that follows does the driving.
             Intent::Greeting => {
-                format!("{}, {} Tower, pass your message.", ctx.callsign, ctx.airport)
+                format!(
+                    "{}, {} Tower, pass your message.",
+                    ctx.callsign, ctx.airport
+                )
             }
             // Radio housekeeping: approve and let them go. No state change.
             Intent::RequestFrequencyChange => {
@@ -1218,7 +1288,10 @@ mod tests {
         assert_eq!(parse_intent("good evening, merida"), Intent::Greeting);
         assert_eq!(parse_intent("hello, banahos"), Intent::Greeting);
         // Greeting words never outrank a real request in the same breath.
-        assert_eq!(parse_intent("good morning, request taxi"), Intent::RequestTaxi);
+        assert_eq!(
+            parse_intent("good morning, request taxi"),
+            Intent::RequestTaxi
+        );
         // Flight following, straight and through whisper's mangle.
         assert_eq!(
             parse_intent("request flight following"),
@@ -1311,7 +1384,10 @@ mod tests {
         assert_eq!(parse_intent("squawk seven zero zero zero"), Intent::Unknown);
         assert!(is_readback("squawk seven zero zero zero"));
         // Arrivals taxi IN — never a fresh departure taxi.
-        assert_eq!(parse_intent("request taxi to parking"), Intent::RequestTaxiIn);
+        assert_eq!(
+            parse_intent("request taxi to parking"),
+            Intent::RequestTaxiIn
+        );
         assert_eq!(parse_intent("taxi to the ramp"), Intent::RequestTaxiIn);
         // "I've just landed" is an arrival on the runway, not "say again".
         assert_eq!(parse_intent("i've just landed"), Intent::RequestTaxiIn);
@@ -1371,9 +1447,18 @@ mod tests {
         assert_eq!(parse_intent("set the parking brake"), Intent::Unknown);
         // "do you copy/read/hear me" / "are you there" are radio checks — five
         // real calls across the 2026-07 flights, all stonewalled.
-        assert_eq!(parse_intent("gibraltar tower, do you copy"), Intent::RadioCheck);
-        assert_eq!(parse_intent("malaga tower, do you hear me?"), Intent::RadioCheck);
-        assert_eq!(parse_intent("chipotle tower, are you there?"), Intent::RadioCheck);
+        assert_eq!(
+            parse_intent("gibraltar tower, do you copy"),
+            Intent::RadioCheck
+        );
+        assert_eq!(
+            parse_intent("malaga tower, do you hear me?"),
+            Intent::RadioCheck
+        );
+        assert_eq!(
+            parse_intent("chipotle tower, are you there?"),
+            Intent::RadioCheck
+        );
         assert_eq!(parse_intent("how's the wind looking"), Intent::WindCheck);
         // Checklist call-outs are cockpit ritual, never radio calls.
         assert_eq!(parse_intent("takeoff checklist"), Intent::Unknown);
@@ -1398,7 +1483,14 @@ mod tests {
     fn state_intent_matrix_holds_the_invariants() {
         use Intent::*;
         use State::*;
-        let states = [Parked, TaxiCleared, LinedUp, TakeoffCleared, Inbound, ClearedToLand];
+        let states = [
+            Parked,
+            TaxiCleared,
+            LinedUp,
+            TakeoffCleared,
+            Inbound,
+            ClearedToLand,
+        ];
         let intents = [
             RadioCheck,
             RequestTaxi,
@@ -1406,7 +1498,9 @@ mod tests {
             RequestStartup,
             RequestShutdown,
             RequestTakeoff,
-            RequestLanding { touch_and_go: false },
+            RequestLanding {
+                touch_and_go: false,
+            },
             RequestLanding { touch_and_go: true },
             ReportFinal,
             ReportDownwind,
@@ -1434,7 +1528,10 @@ mod tests {
 
                 // A controller always answers, and always by callsign.
                 assert!(!reply.is_empty(), "{cell}: silent");
-                assert!(reply.contains(&c.callsign), "{cell}: no callsign in {reply:?}");
+                assert!(
+                    reply.contains(&c.callsign),
+                    "{cell}: no callsign in {reply:?}"
+                );
 
                 // A takeoff clearance is only ever spoken to an aircraft that
                 // asked for one FROM the holding-point states — never handed
@@ -1445,7 +1542,10 @@ mod tests {
                         matches!(start, TaxiCleared | LinedUp | TakeoffCleared),
                         "{cell}: takeoff clearance from the wrong state"
                     );
-                    assert!(reply.contains(&c.runway), "{cell}: clearance without runway");
+                    assert!(
+                        reply.contains(&c.runway),
+                        "{cell}: clearance without runway"
+                    );
                     assert!(reply.contains(&c.wind), "{cell}: clearance without wind");
                 }
                 // A landing clearance only ever answers a final report — or a
@@ -1456,7 +1556,10 @@ mod tests {
                         matches!(intent, ReportFinal | Mayday),
                         "{cell}: unasked landing clearance"
                     );
-                    assert!(reply.contains(&c.runway), "{cell}: clearance without runway");
+                    assert!(
+                        reply.contains(&c.runway),
+                        "{cell}: clearance without runway"
+                    );
                     assert!(reply.contains(&c.wind), "{cell}: clearance without wind");
                 }
 
@@ -1505,7 +1608,10 @@ mod tests {
             let mut twr = Tower::new();
             twr.state = start;
             twr.handle(RequestVectors, &no_app);
-            assert_eq!(twr.state, Inbound, "{start:?}: no-approach vectors must join");
+            assert_eq!(
+                twr.state, Inbound,
+                "{start:?}: no-approach vectors must join"
+            );
         }
     }
 
@@ -1527,7 +1633,14 @@ mod tests {
             assert_eq!(parse_intent(call), Intent::Mayday, "{call}");
         }
         use State::*;
-        for start in [Parked, TaxiCleared, LinedUp, TakeoffCleared, Inbound, ClearedToLand] {
+        for start in [
+            Parked,
+            TaxiCleared,
+            LinedUp,
+            TakeoffCleared,
+            Inbound,
+            ClearedToLand,
+        ] {
             let mut twr = Tower::new();
             twr.state = start;
             let r = twr.handle(Intent::Mayday, &ctx());
@@ -1581,9 +1694,15 @@ mod tests {
         assert_eq!(parse_intent("downwind runway 09"), Intent::ReportDownwind);
         assert_eq!(parse_intent("downwind for landing"), Intent::ReportDownwind);
         assert_eq!(parse_intent("turning base"), Intent::ReportBase);
-        assert_eq!(parse_intent("left base runway two seven"), Intent::ReportBase);
+        assert_eq!(
+            parse_intent("left base runway two seven"),
+            Intent::ReportBase
+        );
         assert_eq!(parse_intent("crosswind"), Intent::ReportCrosswind);
-        assert_eq!(parse_intent("upwind, november 172SP"), Intent::ReportCrosswind);
+        assert_eq!(
+            parse_intent("upwind, november 172SP"),
+            Intent::ReportCrosswind
+        );
         // "base" without pattern context is not a report.
         assert_eq!(parse_intent("base"), Intent::Unknown);
         // A crosswind QUESTION is crew talk, not a position report.
@@ -1614,7 +1733,11 @@ mod tests {
         let r = twr.handle(Intent::RequestTakeoff, &busy(1.8));
         assert!(r.contains("cancel takeoff clearance"), "{r}");
         assert!(r.contains("hold position"), "{r}");
-        assert_eq!(twr.state, State::LinedUp, "clearance withdrawn, still on the pavement");
+        assert_eq!(
+            twr.state,
+            State::LinedUp,
+            "clearance withdrawn, still on the pavement"
+        );
     }
 
     #[test]
@@ -1650,7 +1773,10 @@ mod tests {
         let mut twr = Tower::new();
         twr.state = State::TaxiCleared;
         let r = twr.handle(Intent::RequestTakeoff, &busy(2.4));
-        assert!(r.contains("behind the landing Speedbird three zero six"), "{r}");
+        assert!(
+            r.contains("behind the landing Speedbird three zero six"),
+            "{r}"
+        );
         assert!(r.contains("line up runway zero niner behind"), "{r}");
         assert!(!r.contains("cleared for takeoff"), "{r}");
         assert_eq!(twr.state, State::LinedUp);
@@ -1738,23 +1864,34 @@ mod tests {
         let mut t2 = Tower::new();
         t2.state = State::TaxiCleared;
         t2.handle(Intent::RequestTakeoff, &c);
-        let g = t2.gate("cleared for takeoff runway zero niner, november 172SP",
-                        parse_intent("cleared for takeoff runway zero niner, november 172SP"), &c);
+        let g = t2.gate(
+            "cleared for takeoff runway zero niner, november 172SP",
+            parse_intent("cleared for takeoff runway zero niner, november 172SP"),
+            &c,
+        );
         assert_eq!(g, Some(String::new()), "correct readback = silence");
         assert!(t2.pending().is_none());
         // The WRONG runway is corrected, never waved through.
         let mut t3 = Tower::new();
         t3.state = State::TaxiCleared;
         t3.handle(Intent::RequestTakeoff, &c);
-        let g = t3.gate("cleared for takeoff runway two seven, november 172SP",
-                        Intent::Unknown, &c).expect("gate speaks");
+        let g = t3
+            .gate(
+                "cleared for takeoff runway two seven, november 172SP",
+                Intent::Unknown,
+                &c,
+            )
+            .expect("gate speaks");
         assert!(g.contains("negative"), "{g}");
         assert!(g.contains("I say again"), "{g}");
         assert!(t3.pending().is_some(), "debt stands until the right echo");
         // The callsign's own digits never read as a runway.
         let p = t3.pending().unwrap();
         assert_eq!(
-            check_readback("november one seven two sierra papa, cleared for takeoff", &p.awaited),
+            check_readback(
+                "november one seven two sierra papa, cleared for takeoff",
+                &p.awaited
+            ),
             ReadbackCheck::Correct,
             "no runway named at all is accepted; callsign digits are not a runway"
         );
@@ -1762,16 +1899,28 @@ mod tests {
         let mut t4 = Tower::new();
         t4.state = State::TaxiCleared;
         t4.handle(Intent::RequestTakeoff, &c);
-        let g = t4.gate("uhh what was that", Intent::Unknown, &c).expect("challenge");
+        let g = t4
+            .gate("uhh what was that", Intent::Unknown, &c)
+            .expect("challenge");
         assert!(g.contains("read back"), "{g}");
-        assert!(g.contains("cleared for takeoff"), "the challenge repeats the instruction: {g}");
+        assert!(
+            g.contains("cleared for takeoff"),
+            "the challenge repeats the instruction: {g}"
+        );
         // ...the question-shaped calls a tower answers pass straight through...
         assert_eq!(t4.gate("say wind", Intent::WindCheck, &c), None);
-        assert!(t4.pending().is_some(), "an answered question keeps the debt");
+        assert!(
+            t4.pending().is_some(),
+            "an answered question keeps the debt"
+        );
         // ...and two spent challenges release the gate — a garbled radio must
         // never deadlock the FSM.
         t4.gate("garble garble", Intent::Unknown, &c);
-        assert_eq!(t4.gate("garble again", Intent::Unknown, &c), None, "gate lets go");
+        assert_eq!(
+            t4.gate("garble again", Intent::Unknown, &c),
+            None,
+            "gate lets go"
+        );
         assert!(t4.pending().is_none());
         // A mayday is NEVER answered with "read back".
         let mut t5 = Tower::new();
@@ -1787,8 +1936,14 @@ mod tests {
         t6.handle(Intent::RequestTakeoff, &ground);
         assert!(t6.pending().is_some());
         let flying = ctx(); // on_ground: false
-        assert_eq!(t6.gate("some new call downwind", Intent::ReportDownwind, &flying), None);
-        assert!(t6.pending().is_none(), "airborne voids the takeoff readback");
+        assert_eq!(
+            t6.gate("some new call downwind", Intent::ReportDownwind, &flying),
+            None
+        );
+        assert!(
+            t6.pending().is_none(),
+            "airborne voids the takeoff readback"
+        );
     }
 
     #[test]
@@ -1800,18 +1955,28 @@ mod tests {
         let p = twr.pending().expect("landing clearance awaits the echo");
         assert_eq!(
             p.awaited,
-            Awaited::Landing { runway: "zero niner".into(), touch_and_go: false }
+            Awaited::Landing {
+                runway: "zero niner".into(),
+                touch_and_go: false
+            }
         );
         assert_eq!(
-            check_readback("cleared to land runway zero niner, november 172SP", &p.awaited),
+            check_readback(
+                "cleared to land runway zero niner, november 172SP",
+                &p.awaited
+            ),
             ReadbackCheck::Correct
         );
         assert_eq!(
             check_readback("cleared to land runway two seven right", &p.awaited),
-            ReadbackCheck::WrongRunway { heard: "27R".into() }
+            ReadbackCheck::WrongRunway {
+                heard: "27R".into()
+            }
         );
         // The coach knows the exact line owed.
-        let s = twr.suggested_readback("November 172SP").expect("a suggestion");
+        let s = twr
+            .suggested_readback("November 172SP")
+            .expect("a suggestion");
         assert!(s.contains("Cleared to land runway zero niner"), "{s}");
         // A go-around clears the debt along with the clearance.
         twr.handle(Intent::GoAround, &c);
@@ -1830,7 +1995,10 @@ mod tests {
         assert!(twr.pending().is_some());
         twr.apply_go_around();
         assert_eq!(twr.state, State::Inbound);
-        assert!(twr.pending().is_none(), "the dead clearance's echo is not owed");
+        assert!(
+            twr.pending().is_none(),
+            "the dead clearance's echo is not owed"
+        );
     }
 
     #[test]
@@ -2047,7 +2215,9 @@ mod tests {
         // A generic "request taxi" right after landing is an arrival too.
         let mut twr2 = Tower::new();
         twr2.state = State::ClearedToLand;
-        assert!(twr2.handle(Intent::RequestTaxi, &c).contains("taxi to stand one two"));
+        assert!(twr2
+            .handle(Intent::RequestTaxi, &c)
+            .contains("taxi to stand one two"));
 
         // No stand planned (field with no parking, or off the network) → the
         // honest flat fallback, never a fabricated stand.
@@ -2055,6 +2225,8 @@ mod tests {
         c3.stand = String::new();
         let mut twr3 = Tower::new();
         twr3.state = State::ClearedToLand;
-        assert!(twr3.handle(Intent::RequestTaxiIn, &c3).contains("taxi to parking"));
+        assert!(twr3
+            .handle(Intent::RequestTaxiIn, &c3)
+            .contains("taxi to parking"));
     }
 }

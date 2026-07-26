@@ -57,7 +57,8 @@ pub(crate) async fn drive_park_brake(
             }
         }
     }
-    xp.run_command(if on { CMD_PARK_SET } else { CMD_PARK_RELEASE }).await?;
+    xp.run_command(if on { CMD_PARK_SET } else { CMD_PARK_RELEASE })
+        .await?;
     // Commands apply on the next sim frame — give it a beat.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let mut set = xp.get_float(PARK_BRAKE).await? > 0.5;
@@ -109,7 +110,9 @@ impl Tool for SetParkingBrake {
         // with the request — on airframes that pin the ratio from it (C90B) a
         // release can't stick otherwise, and the handle animates from it either
         // way. The desired value depends on the per-aircraft sense.
-        let desired_valve = self.valve_set.map(|set| if args.on { set } else { 1.0 - set });
+        let desired_valve = self
+            .valve_set
+            .map(|set| if args.on { set } else { 1.0 - set });
         let valve_now = match desired_valve {
             Some(_) => ctx.xplane.get_float(PARK_BRAKE_VALVE).await.ok(),
             None => None,
@@ -141,8 +144,16 @@ impl Tool for SetParkingBrake {
         Ok(format!(
             "Roger, parking brake {}.{}{}",
             if args.on { "set" } else { "released" },
-            if args.on && taxi_hold { " Throttle's coming to idle — taxi hold released." } else { "" },
-            if crew_released { " I'm off the pedals." } else { "" }
+            if args.on && taxi_hold {
+                " Throttle's coming to idle — taxi hold released."
+            } else {
+                ""
+            },
+            if crew_released {
+                " I'm off the pedals."
+            } else {
+                ""
+            }
         ))
     }
 }
@@ -196,11 +207,17 @@ async fn brake_holder(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
         {
             BRAKES_HELD.store(false, Ordering::Relaxed);
             if let Some(v) = &voice {
-                v.say(crate::voice::Priority::Advisory, "Airborne, brakes released.");
+                v.say(
+                    crate::voice::Priority::Advisory,
+                    "Airborne, brakes released.",
+                );
             }
             break;
         }
-        if let Err(e) = xp.run_command_for(super::BRAKES_REGULAR, BRAKE_HOLD_SECS).await {
+        if let Err(e) = xp
+            .run_command_for(super::BRAKES_REGULAR, BRAKE_HOLD_SECS)
+            .await
+        {
             tracing::warn!("brake hold: command failed: {e:#}");
         } else {
             super::note_brake_cmd();
@@ -273,7 +290,11 @@ impl Tool for HoldBrakes {
             ))
             .await;
             let park = ctx.xplane.get_float(PARK_BRAKE).await.unwrap_or(0.0) > 0.5;
-            let still = ctx.xplane.get_float(LEFT_BRAKE).await.is_ok_and(|r| r > 0.3);
+            let still = ctx
+                .xplane
+                .get_float(LEFT_BRAKE)
+                .await
+                .is_ok_and(|r| r > 0.3);
             return Ok(if park {
                 "Brakes released. Parking brake's still set, mind.".to_string()
             } else if still {
@@ -289,8 +310,12 @@ impl Tool for HoldBrakes {
         // hold, and a held brake is a blown tyre at the next touchdown. A
         // failed read assumes ground — if the API is down the command below
         // fails loudly anyway.
-        let on_ground =
-            ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(1.0) > 0.5;
+        let on_ground = ctx
+            .xplane
+            .get_float(crate::datarefs::ON_GROUND_ANY)
+            .await
+            .unwrap_or(1.0)
+            > 0.5;
         if !on_ground {
             return Ok("We're airborne, nothing to hold the brakes for up here.".to_string());
         }
@@ -331,8 +356,9 @@ impl Tool for HoldBrakes {
                 let base = ctx.config.xplane_base_url.clone();
                 let voice = ctx.voice.cloned();
                 std::thread::spawn(move || {
-                    let Ok(rt) =
-                        tokio::runtime::Builder::new_current_thread().enable_all().build()
+                    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
                     else {
                         BRAKES_HELD.store(false, Ordering::Relaxed);
                         return;
@@ -349,7 +375,11 @@ impl Tool for HoldBrakes {
             Ok(false) => "Tried, but the pedals don't read pressed. Check the brakes.".to_string(),
             _ => format!(
                 "Brakes held.{} Say brakes off when you want them.",
-                if taxi_hold { " Taxi hold released, throttle's closed." } else { "" }
+                if taxi_hold {
+                    " Taxi hold released, throttle's closed."
+                } else {
+                    ""
+                }
             ),
         })
     }
@@ -447,16 +477,30 @@ impl Tool for SetSpeedbrake {
             "extend" | "deploy" | "out" | "up" => (1.0, "extended"),
             "retract" | "stow" | "in" | "down" => (0.0, "retracted"),
             "arm" => (-0.5, "armed"),
-            other => return Ok(format!("I can extend, retract, or arm the speedbrakes, not '{other}'.")),
+            other => {
+                return Ok(format!(
+                    "I can extend, retract, or arm the speedbrakes, not '{other}'."
+                ))
+            }
         };
         // Safety gate: don't deploy the speedbrakes on short final. With the gear
         // down and low above the ground, full speedbrake dumps lift right where a
         // go-around or flare needs it. (Arming for landing is fine — that's the
         // ground-spoiler auto-deploy, not lift-dumping in the air.)
         if target > 0.5 {
-            let agl_ft = ctx.xplane.get_float(crate::datarefs::AGL_METERS).await.unwrap_or(99999.0) * 3.28084;
+            let agl_ft = ctx
+                .xplane
+                .get_float(crate::datarefs::AGL_METERS)
+                .await
+                .unwrap_or(99999.0)
+                * 3.28084;
             let gear_down = ctx.xplane.get_float(GEAR_HANDLE_DOWN).await.unwrap_or(0.0) > 0.5;
-            let on_ground = ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(1.0) > 0.5;
+            let on_ground = ctx
+                .xplane
+                .get_float(crate::datarefs::ON_GROUND_ANY)
+                .await
+                .unwrap_or(1.0)
+                > 0.5;
             if !on_ground && gear_down && agl_ft < 1000.0 {
                 return Ok(format!(
                     "Negative, we're on final at {agl_ft:.0} feet with the gear down. I won't deploy the speedbrakes here."
@@ -472,7 +516,10 @@ impl Tool for SetSpeedbrake {
         } else {
             "retracted"
         };
-        Ok(format!("Speedbrakes {state}.", state = if state == word { word } else { state }))
+        Ok(format!(
+            "Speedbrakes {state}.",
+            state = if state == word { word } else { state }
+        ))
     }
 }
 
@@ -495,7 +542,13 @@ mod tests {
     use crate::xplane::FakeXPlane;
 
     fn ctx<'a>(fake: &'a FakeXPlane, cfg: &'a crate::config::Config) -> ToolCtx<'a> {
-        ToolCtx { xplane: fake, config: cfg, voice: None, status: None, reminders: None }
+        ToolCtx {
+            xplane: fake,
+            config: cfg,
+            voice: None,
+            status: None,
+            reminders: None,
+        }
     }
 
     // The refusal gates all sit BEFORE the already-held check, so these
@@ -505,7 +558,10 @@ mod tests {
     async fn brakes_on_refuses_airborne() {
         let cfg = crate::config::Config::default();
         let fake = FakeXPlane::with_reads(&[(crate::datarefs::ON_GROUND_ANY, 0.0)]);
-        let out = HoldBrakes.execute(&json!({"on": true}), &ctx(&fake, &cfg)).await.unwrap();
+        let out = HoldBrakes
+            .execute(&json!({"on": true}), &ctx(&fake, &cfg))
+            .await
+            .unwrap();
         assert!(out.to_lowercase().contains("airborne"), "{out}");
     }
 
@@ -514,11 +570,12 @@ mod tests {
         // THE mishear gate: a "brakes on" landing mid-takeoff-roll must be
         // refused, never latched.
         let cfg = crate::config::Config::default();
-        let fake = FakeXPlane::with_reads(&[
-            (crate::datarefs::ON_GROUND_ANY, 1.0),
-            (THROTTLE, 0.8),
-        ]);
-        let out = HoldBrakes.execute(&json!({"on": true}), &ctx(&fake, &cfg)).await.unwrap();
+        let fake =
+            FakeXPlane::with_reads(&[(crate::datarefs::ON_GROUND_ANY, 1.0), (THROTTLE, 0.8)]);
+        let out = HoldBrakes
+            .execute(&json!({"on": true}), &ctx(&fake, &cfg))
+            .await
+            .unwrap();
         assert!(out.to_lowercase().contains("power"), "{out}");
     }
 
@@ -530,7 +587,10 @@ mod tests {
             (THROTTLE, 0.0),
             (PARK_BRAKE, 1.0),
         ]);
-        let out = HoldBrakes.execute(&json!({"on": true}), &ctx(&fake, &cfg)).await.unwrap();
+        let out = HoldBrakes
+            .execute(&json!({"on": true}), &ctx(&fake, &cfg))
+            .await
+            .unwrap();
         assert!(out.contains("Parking brake"), "{out}");
     }
 
@@ -546,12 +606,18 @@ mod tests {
             (PARK_BRAKE, 0.0),
             (LEFT_BRAKE, 0.6), // pedals read pressed for the readback
         ]);
-        let out = HoldBrakes.execute(&json!({"on": true}), &ctx(&fake, &cfg)).await.unwrap();
+        let out = HoldBrakes
+            .execute(&json!({"on": true}), &ctx(&fake, &cfg))
+            .await
+            .unwrap();
         assert!(out.contains("Brakes held"), "{out}");
         assert!(brakes_held());
 
         // Second "brakes on" while holding: idempotent, no double-spawn.
-        let out = HoldBrakes.execute(&json!({"on": true}), &ctx(&fake, &cfg)).await.unwrap();
+        let out = HoldBrakes
+            .execute(&json!({"on": true}), &ctx(&fake, &cfg))
+            .await
+            .unwrap();
         assert!(out.contains("already holding"), "{out}");
 
         let fake = FakeXPlane::with_reads(&[
@@ -559,11 +625,17 @@ mod tests {
             (PARK_BRAKE, 0.0),
             (LEFT_BRAKE, 0.0), // pedals free once the held command expires
         ]);
-        let out = HoldBrakes.execute(&json!({"on": false}), &ctx(&fake, &cfg)).await.unwrap();
+        let out = HoldBrakes
+            .execute(&json!({"on": false}), &ctx(&fake, &cfg))
+            .await
+            .unwrap();
         assert!(out.contains("released"), "{out}");
         assert!(!brakes_held());
 
-        let out = HoldBrakes.execute(&json!({"on": false}), &ctx(&fake, &cfg)).await.unwrap();
+        let out = HoldBrakes
+            .execute(&json!({"on": false}), &ctx(&fake, &cfg))
+            .await
+            .unwrap();
         assert!(out.contains("wasn't holding"), "{out}");
     }
 }

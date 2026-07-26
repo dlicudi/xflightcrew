@@ -104,7 +104,11 @@ impl Tool for SetAltimeterCurrent {
         // levels would be wrong. Below it, the sim's ambient sea-level pressure
         // (QNH) is correct: with it set the altimeter reads true MSL / field
         // elevation. Use indicated altitude to decide (it's what the pilot sees).
-        let alt = ctx.xplane.get_float(crate::datarefs::ALTITUDE_FT).await.unwrap_or(0.0);
+        let alt = ctx
+            .xplane
+            .get_float(crate::datarefs::ALTITUDE_FT)
+            .await
+            .unwrap_or(0.0);
         if alt >= self.transition_altitude_ft {
             ctx.xplane.set_float(BARO, STANDARD_INHG).await?;
             let actual = ctx.xplane.get_float(BARO).await?;
@@ -161,11 +165,17 @@ impl Tool for SetPitotHeat {
         let a: PitotArgs = serde_json::from_value(args.clone())?;
         match &self.override_dataref {
             Some(dref) => {
-                ctx.xplane.set_float(dref, if a.on { 1.0 } else { 0.0 }).await?;
+                ctx.xplane
+                    .set_float(dref, if a.on { 1.0 } else { 0.0 })
+                    .await?;
             }
             None => {
                 ctx.xplane
-                    .run_command(if a.on { CMD_PITOT_HEAT_ON } else { CMD_PITOT_HEAT_OFF })
+                    .run_command(if a.on {
+                        CMD_PITOT_HEAT_ON
+                    } else {
+                        CMD_PITOT_HEAT_OFF
+                    })
                     .await?;
             }
         }
@@ -179,7 +189,10 @@ impl Tool for SetPitotHeat {
                 if on { "on" } else { "off" }
             ));
         }
-        Ok(format!("Roger, pitot heat {}.", if on { "on" } else { "off" }))
+        Ok(format!(
+            "Roger, pitot heat {}.",
+            if on { "on" } else { "off" }
+        ))
     }
 }
 
@@ -221,7 +234,10 @@ impl Tool for AlignGyro {
         if drift.abs() < 2.0 {
             Ok("Roger, directional gyro synced to the compass.".to_string())
         } else {
-            Ok(format!("Gyro synced; still {:.0} degrees of drift.", drift.abs()))
+            Ok(format!(
+                "Gyro synced; still {:.0} degrees of drift.",
+                drift.abs()
+            ))
         }
     }
 }

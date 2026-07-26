@@ -26,7 +26,7 @@ const XFEED_R: &str = "laminar/md82/bleedair/engineR_xfeed_lever";
 const APU_ON: &str = "laminar/md82/bleedair/APU_on";
 const CMD_APU_BLEED_OFF: &str = "laminar/md82cmd/bleedair/APU_up"; // "up" decrements 1 -> 0
 const CMD_APU_BLEED_ON: &str = "laminar/md82cmd/bleedair/APU_dwn"; // "dwn" increments 0 -> 1
-// Bleed-air manifold pressure needle — the pneumatic starters need this up to crank.
+                                                                   // Bleed-air manifold pressure needle — the pneumatic starters need this up to crank.
 const BLEED_NEEDLE: &str = "laminar/md82/bleedair/bleedair_needle";
 const XTIE_L: &str = "laminar/md82/electrical/cross_tie_APU_L";
 const XTIE_R: &str = "laminar/md82/electrical/cross_tie_APU_R";
@@ -62,7 +62,11 @@ impl Tool for StartEngines {
                 return Ok("Engines are already running.".to_string());
             }
         }
-        spawn(ctx.config.xplane_base_url.clone(), ctx.voice.cloned(), ctx.status.cloned());
+        spawn(
+            ctx.config.xplane_base_url.clone(),
+            ctx.voice.cloned(),
+            ctx.status.cloned(),
+        );
         Ok("Starting engines, stand by.".to_string())
     }
 }
@@ -77,7 +81,10 @@ fn say(voice: &Option<Voice>, status: &Option<StatusSink>, line: &str) {
 
 fn spawn(base: String, voice: Option<Voice>, status: Option<StatusSink>) {
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             return;
         };
         rt.block_on(async move {
@@ -88,7 +95,11 @@ fn spawn(base: String, voice: Option<Voice>, status: Option<StatusSink>) {
 }
 
 async fn n2(xp: &XPlaneClient, idx: usize) -> f64 {
-    xp.get_float_array(N2).await.ok().and_then(|v| v.get(idx).copied()).unwrap_or(0.0)
+    xp.get_float_array(N2)
+        .await
+        .ok()
+        .and_then(|v| v.get(idx).copied())
+        .unwrap_or(0.0)
 }
 
 /// Poll engine `idx`'s N2 until it passes `pct`, or give up after `secs`.
@@ -139,14 +150,30 @@ async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<
         "jet start: pre-crank bleed state"
     );
     if needle < 2.0 {
-        say(voice, status, "No bleed pressure on the manifold, can't crank. Check the A P U bleed.");
+        say(
+            voice,
+            status,
+            "No bleed pressure on the manifold, can't crank. Check the A P U bleed.",
+        );
         return;
     }
 
     // Crank each engine in turn: right (idx 1, starter 2), then left (idx 0, starter 1).
     for (idx, starter, lever_open, lever_close, side) in [
-        (1usize, "sim/starters/engage_starter_2", XFEED_R, XFEED_L, "right"),
-        (0usize, "sim/starters/engage_starter_1", XFEED_L, XFEED_R, "left"),
+        (
+            1usize,
+            "sim/starters/engage_starter_2",
+            XFEED_R,
+            XFEED_L,
+            "right",
+        ),
+        (
+            0usize,
+            "sim/starters/engage_starter_1",
+            XFEED_L,
+            XFEED_R,
+            "left",
+        ),
     ] {
         // Generator on for this engine; route start air to it (open its cross-feed,
         // close the other).
@@ -163,14 +190,22 @@ async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<
                 bleed_needle = xp.get_float(BLEED_NEEDLE).await.unwrap_or(0.0),
                 "jet start: engine failed to spool"
             );
-            say(voice, status, &format!("The {side} engine won't spool, check bleed air. Start aborted."));
+            say(
+                voice,
+                status,
+                &format!("The {side} engine won't spool, check bleed air. Start aborted."),
+            );
             return;
         }
         // 20% N2 — introduce fuel (the fuel handle), then wait for idle.
         say(voice, status, &format!("{} fuel on.", cap(side)));
         xp.set_float_array_elem(MIXTURE, idx, 1.0).await.ok();
         if !wait_n2(xp, idx, N2_IDLE, 60).await {
-            say(voice, status, &format!("The {side} engine hung below idle, watch it."));
+            say(
+                voice,
+                status,
+                &format!("The {side} engine hung below idle, watch it."),
+            );
             return;
         }
         say(voice, status, &format!("The {side} engine is running."));
@@ -182,7 +217,11 @@ async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<
 
     // Transfer to the engine generators (on from the crank) and shut the APU down
     // -- it's only needed to start. Bleed off, APU buses off, APU master off.
-    say(voice, status, "On engine generators, shutting the A P U down.");
+    say(
+        voice,
+        status,
+        "On engine generators, shutting the A P U down.",
+    );
     if xp.get_float(APU_ON).await.unwrap_or(0.0) > 0.5 {
         xp.run_command(CMD_APU_BLEED_OFF).await.ok();
     }
@@ -199,7 +238,9 @@ async fn run_sequence(xp: &XPlaneClient, voice: &Option<Voice>, status: &Option<
 
 fn cap(s: &str) -> String {
     let mut c = s.chars();
-    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+    c.next()
+        .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+        .unwrap_or_default()
 }
 
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
@@ -231,7 +272,9 @@ impl Tool for StopEngines {
         // Safety gate: never shut the engines down airborne. Default to airborne if
         // the read fails, so an unknown state errs safe.
         if ctx.xplane.get_float(ON_GROUND).await.unwrap_or(0.0) <= 0.5 {
-            return Ok("Negative, we're airborne. I will not shut the engines down in flight.".to_string());
+            return Ok(
+                "Negative, we're airborne. I will not shut the engines down in flight.".to_string(),
+            );
         }
         if let Ok(r) = ctx.xplane.get_float_array(ENGN_RUNNING).await {
             if r.len() >= 2 && r.iter().take(2).all(|&v| v < 0.5) {

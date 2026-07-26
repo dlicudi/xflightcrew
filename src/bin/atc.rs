@@ -27,8 +27,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use x_copilot::{
-    atis, config::Config, datarefs, mic, nav, phrase, stt, tower, tts,
-    xplane::XPlaneClient,
+    atis, config::Config, datarefs, mic, nav, phrase, stt, tower, tts, xplane::XPlaneClient,
 };
 
 /// Read-only view of the simulator. ATC observes and speaks; it must never
@@ -45,7 +44,10 @@ impl SimView {
             .enable_all()
             .build()
             .context("building tokio runtime")?;
-        Ok(SimView { client: XPlaneClient::new(base), rt })
+        Ok(SimView {
+            client: XPlaneClient::new(base),
+            rt,
+        })
     }
     fn get_float(&self, name: &str) -> Result<f64> {
         self.rt.block_on(self.client.get_float(name))
@@ -67,7 +69,10 @@ fn parse_freq_khz(s: &str) -> Result<i64> {
 }
 
 fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_string())
+    std::env::var(key)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// 8.33 channel names can sit 5 kHz off the actual carrier (118.330 names
@@ -128,7 +133,9 @@ fn transmit(voice: &Config, gate: &mic::MicGate, text: &str) {
 /// Is COM1 audible on the audio panel? Unknown (dataref missing on some
 /// airframes) counts as audible — better to speak than to go silently deaf.
 fn com1_audible(sim: &SimView) -> bool {
-    sim.get_float(datarefs::AUDIO_SELECTION_COM1).map(|v| v > 0.5).unwrap_or(true)
+    sim.get_float(datarefs::AUDIO_SELECTION_COM1)
+        .map(|v| v > 0.5)
+        .unwrap_or(true)
 }
 
 fn main() -> Result<()> {
@@ -151,7 +158,10 @@ fn main() -> Result<()> {
 
     let tower_khz = apt.freq(nav::FREQ_TOWER).map(|f| f.khz);
     // ATIS only where the data or the env says so — never on the tower.
-    let mut atis_khz = match std::env::var("XCOPILOT_ATIS_FREQ").ok().filter(|v| !v.is_empty()) {
+    let mut atis_khz = match std::env::var("XCOPILOT_ATIS_FREQ")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
         Some(v) => Some(parse_freq_khz(&v)?),
         None => apt.freq(nav::FREQ_ATIS).map(|f| f.khz),
     };
@@ -200,7 +210,11 @@ fn main() -> Result<()> {
                 ptt.store(keyed, Ordering::Relaxed);
                 eprintln!(
                     "{}",
-                    if keyed { "[mic keyed - speak, then press Enter]" } else { "[transmitting]" }
+                    if keyed {
+                        "[mic keyed - speak, then press Enter]"
+                    } else {
+                        "[transmitting]"
+                    }
                 );
             }
         });
@@ -213,7 +227,9 @@ fn main() -> Result<()> {
         w.set_prompt(tower::STT_PROMPT.to_string());
         let m = mic::PttMic::start(gate.clone(), Duration::from_millis(700))
             .context("opening the mic (tower needs one; is a mic connected?)")?;
-        tracing::info!("tower ready — tune COM1, press Enter to key the mic, Enter again to transmit");
+        tracing::info!(
+            "tower ready — tune COM1, press Enter to key the mic, Enter again to transmit"
+        );
         (Some(m), Some(w))
     } else {
         (None, None)
@@ -248,8 +264,8 @@ fn main() -> Result<()> {
             if tuned(com1, twr_khz) {
                 // Blocks up to 1 s waiting for a key-down, then until key-up —
                 // the 1 s timeout doubles as the COM1 re-poll cadence.
-                let audio =
-                    ptt_mic.capture(|| ptt.load(Ordering::Relaxed), Some(Duration::from_secs(1)))?;
+                let audio = ptt_mic
+                    .capture(|| ptt.load(Ordering::Relaxed), Some(Duration::from_secs(1)))?;
                 if audio.len() < mic::WHISPER_SAMPLE_RATE as usize / 4 {
                     continue; // nothing (or a sub-quarter-second blip)
                 }
@@ -280,7 +296,9 @@ fn main() -> Result<()> {
                     wind: spoken_wind(&snap),
                     holding_point: "Alpha".to_string(),
                     stand: String::new(),
-                    approach: apt.freq(nav::FREQ_APPROACH).map(|f| atis::spoken_mhz(f.khz)),
+                    approach: apt
+                        .freq(nav::FREQ_APPROACH)
+                        .map(|f| atis::spoken_mhz(f.khz)),
                     // The standalone binary predates the ground-aware mayday
                     // and the assigned-squawk state: conspicuity only. Same
                     // for the traffic/wake/taxi-route context — no TCAS or

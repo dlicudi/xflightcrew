@@ -162,7 +162,11 @@ impl Tool for Pushback {
             "left" => (CMD_PUSH_LEFT, "Roger, pushing back, turning left."),
             "right" => (CMD_PUSH_RIGHT, "Roger, pushing back, turning right."),
             "straight" | "start" => (CMD_PUSH_STRAIGHT, "Roger, pushing back."),
-            other => return Ok(format!("Say pushback straight, left, right, or stop — not '{other}'.")),
+            other => {
+                return Ok(format!(
+                    "Say pushback straight, left, right, or stop — not '{other}'."
+                ))
+            }
         };
         ctx.xplane.run_command(cmd).await?;
         Ok(say.to_string())

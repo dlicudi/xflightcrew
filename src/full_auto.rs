@@ -113,7 +113,10 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
     }
     ABORT.store(false, SeqCst);
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             ACTIVE.store(false, SeqCst);
             return;
         };
@@ -189,11 +192,15 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         reminders: None,
     };
 
-    announce(&voice, Priority::Advisory, crate::readback::one_of(&[
-        "Full auto. Starting from cold.",
-        "Full auto it is. Taking her from cold and dark.",
-        "Alright, full auto. Starting cold.",
-    ]));
+    announce(
+        &voice,
+        Priority::Advisory,
+        crate::readback::one_of(&[
+            "Full auto. Starting from cold.",
+            "Full auto it is. Taking her from cold and dark.",
+            "Alright, full auto. Starting cold.",
+        ]),
+    );
     event("start", json!({}));
     // The callsign the tower knows us by, so our calls sound like a real pilot.
     let callsign = crate::circuit::crew_callsign(&xp).await;
@@ -203,13 +210,20 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // Only turbine airframes need the APU/electrical bring-up; a piston's
         // start_engine powers its own bus.
         if tools.power_up_first {
-            announce(&voice, Priority::Advisory, crate::readback::one_of(&[
-                "Powering up.",
-                "Getting some power on.",
-                "Bringing her to life.",
-            ]));
+            announce(
+                &voice,
+                Priority::Advisory,
+                crate::readback::one_of(&[
+                    "Powering up.",
+                    "Getting some power on.",
+                    "Bringing her to life.",
+                ]),
+            );
             let r = crate::tools::power::PowerUp.execute(&json!({}), &ctx).await;
-            event("power_up", json!({ "reply": r.as_ref().map(|s| s.as_str()).unwrap_or("err") }));
+            event(
+                "power_up",
+                json!({ "reply": r.as_ref().map(|s| s.as_str()).unwrap_or("err") }),
+            );
             bail_if_abort!();
         }
 
@@ -223,22 +237,33 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 let _ = xp.run_command(cmd).await;
             }
             tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-            event("bus_power", json!({ "cmds": tools.bus_power_on_cmds.len() }));
+            event(
+                "bus_power",
+                json!({ "cmds": tools.bus_power_on_cmds.len() }),
+            );
             bail_if_abort!();
         }
 
-        announce(&voice, Priority::Advisory, crate::readback::one_of(&[
-            "Starting the engine.",
-            "Spinning up the engine.",
-            "Cranking her over.",
-        ]));
+        announce(
+            &voice,
+            Priority::Advisory,
+            crate::readback::one_of(&[
+                "Starting the engine.",
+                "Spinning up the engine.",
+                "Cranking her over.",
+            ]),
+        );
         match tools.start_engine.execute(&json!({}), &ctx).await {
             Ok(reply) => announce(&voice, Priority::Advisory, &reply),
             Err(_) => {}
         }
         // The starter cranks for a few seconds before it catches.
         if !wait_until(40.0, 500, || engine_running(&xp)).await {
-            give_up(&voice, "The engine didn't catch. Full auto is off, your aircraft.", "no_engine");
+            give_up(
+                &voice,
+                "The engine didn't catch. Full auto is off, your aircraft.",
+                "no_engine",
+            );
             return;
         }
         event("engine_running", json!({}));
@@ -252,8 +277,15 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             for cmd in &tools.all_electrical_on_cmds {
                 let _ = xp.run_command(cmd).await;
             }
-            announce(&voice, Priority::Advisory, "Electrical set. Generators and bleeds on.");
-            event("electrical_set", json!({ "cmds": tools.all_electrical_on_cmds.len() }));
+            announce(
+                &voice,
+                Priority::Advisory,
+                "Electrical set. Generators and bleeds on.",
+            );
+            event(
+                "electrical_set",
+                json!({ "cmds": tools.all_electrical_on_cmds.len() }),
+            );
         }
     }
     bail_if_abort!();
@@ -271,17 +303,25 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             if let Some(khz) = crate::party_line::home_tower_khz() {
                 let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
                 event("tuned_tower", json!({ "khz": khz }));
-                announce(&voice, Priority::Advisory, crate::readback::one_of(&[
-                    "Tuning the tower, requesting taxi.",
-                    "Getting the tower, asking for taxi.",
-                    "On the tower now, requesting taxi.",
-                ]));
+                announce(
+                    &voice,
+                    Priority::Advisory,
+                    crate::readback::one_of(&[
+                        "Tuning the tower, requesting taxi.",
+                        "Getting the tower, asking for taxi.",
+                        "On the tower now, requesting taxi.",
+                    ]),
+                );
             } else {
-                announce(&voice, Priority::Advisory, crate::readback::one_of(&[
-                    "Requesting taxi.",
-                    "Asking for taxi.",
-                    "Calling for taxi.",
-                ]));
+                announce(
+                    &voice,
+                    Priority::Advisory,
+                    crate::readback::one_of(&[
+                        "Requesting taxi.",
+                        "Asking for taxi.",
+                        "Calling for taxi.",
+                    ]),
+                );
             }
             crate::circuit::transmit(crate::circuit::radio_call(&callsign, "request taxi"));
             event("request_taxi", json!({}));
@@ -305,20 +345,31 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         bail_if_abort!();
 
         // Drive the cleared route to the holding point.
-        announce(&voice, Priority::Advisory, crate::readback::one_of(&[
-            "Taxiing to the runway.",
-            "Rolling out to the runway.",
-            "Taking us to the runway.",
-        ]));
+        announce(
+            &voice,
+            Priority::Advisory,
+            crate::readback::one_of(&[
+                "Taxiing to the runway.",
+                "Rolling out to the runway.",
+                "Taking us to the runway.",
+            ]),
+        );
         match tools.taxi.execute(&json!({}), &ctx).await {
             Ok(reply) => announce(&voice, Priority::Advisory, &reply),
             Err(_) => {}
         }
         // Wait for the drive to finish (it clears ACTIVE at the holding point).
         if crate::autotaxi::ACTIVE.load(SeqCst)
-            && !wait_until(600.0, 1000, || async { !crate::autotaxi::ACTIVE.load(SeqCst) }).await
+            && !wait_until(600.0, 1000, || async {
+                !crate::autotaxi::ACTIVE.load(SeqCst)
+            })
+            .await
         {
-            give_up(&voice, "The taxi didn't finish. Your aircraft.", "taxi_stalled");
+            give_up(
+                &voice,
+                "The taxi didn't finish. Your aircraft.",
+                "taxi_stalled",
+            );
             return;
         }
         bail_if_abort!();
@@ -338,7 +389,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 Some((hl, hn)) => {
                     let (Ok(lat), Ok(lon)) = (xp.get_float(LAT).await, xp.get_float(LON).await)
                     else {
-                        give_up(&voice, "I can't read our position. Your aircraft.", "no_position");
+                        give_up(
+                            &voice,
+                            "I can't read our position. Your aircraft.",
+                            "no_position",
+                        );
                         return;
                     };
                     let dist_m = crate::nav::haversine_nm(lat, lon, hl, hn) * 1852.0;
@@ -403,11 +458,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 }
                 bail_if_abort!();
             }
-            announce(&voice, Priority::Advisory, crate::readback::one_of(&[
-                "Lining up.",
-                "Lining us up.",
-                "Taking the runway.",
-            ]));
+            announce(
+                &voice,
+                Priority::Advisory,
+                crate::readback::one_of(&["Lining up.", "Lining us up.", "Taking the runway."]),
+            );
             match tools.line_up.execute(&json!({}), &ctx).await {
                 Ok(reply) => announce(&voice, Priority::Advisory, &reply),
                 Err(_) => {}
@@ -416,9 +471,16 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // is ~1 km) — the 120 s that fit a plain line-up timed out mid-taxi
             // (2026-07-26). Give it the taxi's budget.
             if crate::autotaxi::ACTIVE.load(SeqCst)
-                && !wait_until(600.0, 1000, || async { !crate::autotaxi::ACTIVE.load(SeqCst) }).await
+                && !wait_until(600.0, 1000, || async {
+                    !crate::autotaxi::ACTIVE.load(SeqCst)
+                })
+                .await
             {
-                give_up(&voice, "The line-up didn't finish. Your aircraft.", "line_up_stalled");
+                give_up(
+                    &voice,
+                    "The line-up didn't finish. Your aircraft.",
+                    "line_up_stalled",
+                );
                 return;
             }
             bail_if_abort!();
@@ -453,11 +515,15 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     // --- Stage 4: the mission — a circuit, or the SimBrief flight -------------
     match &tools.mission {
         Mission::Circuit { right } => {
-            announce(&voice, Priority::Advisory, crate::readback::one_of(&[
-                "Lined up. Flying the circuit.",
-                "Lined up and ready. Flying the circuit.",
-                "On the runway. Off we go, flying the circuit.",
-            ]));
+            announce(
+                &voice,
+                Priority::Advisory,
+                crate::readback::one_of(&[
+                    "Lined up. Flying the circuit.",
+                    "Lined up and ready. Flying the circuit.",
+                    "On the runway. Off we go, flying the circuit.",
+                ]),
+            );
             let args = json!({ "right": right });
             match tools.circuit.execute(&args, &ctx).await {
                 Ok(reply) => announce(&voice, Priority::Advisory, &reply),
@@ -509,7 +575,9 @@ async fn fly_route(
     // write a byte-array dataref, which is why this lives here and not in the
     // arming tool.
     if !route.fms_payload.is_empty() {
-        let _ = xp.set_data("xcopilot/fms/route", route.fms_payload.as_bytes()).await;
+        let _ = xp
+            .set_data("xcopilot/fms/route", route.fms_payload.as_bytes())
+            .await;
         let _ = xp.set_int("xcopilot/fms/load", 1).await;
     }
 
@@ -518,19 +586,34 @@ async fn fly_route(
     announce(
         voice,
         Priority::Advisory,
-        &format!("Cleared to go. Flying your plan to {}. My takeoff.", route.dest_name),
+        &format!(
+            "Cleared to go. Flying your plan to {}. My takeoff.",
+            route.dest_name
+        ),
     );
     match tools.takeoff.execute(&json!({}), ctx).await {
         Ok(reply) => announce(voice, Priority::Advisory, &reply),
         Err(_) => {}
     }
     if !crate::autotakeoff::ACTIVE.load(Relaxed) {
-        give_up(voice, "The takeoff didn't arm, so the flight is off. Your aircraft.", "takeoff_refused");
+        give_up(
+            voice,
+            "The takeoff didn't arm, so the flight is off. Your aircraft.",
+            "takeoff_refused",
+        );
         return;
     }
-    if !wait_until(360.0, 1000, || async { !crate::autotakeoff::ACTIVE.load(Relaxed) }).await {
+    if !wait_until(360.0, 1000, || async {
+        !crate::autotakeoff::ACTIVE.load(Relaxed)
+    })
+    .await
+    {
         if !ABORT.load(SeqCst) {
-            give_up(voice, "The takeoff never finished. Your aircraft.", "takeoff_stalled");
+            give_up(
+                voice,
+                "The takeoff never finished. Your aircraft.",
+                "takeoff_stalled",
+            );
         } else {
             give_up(voice, "Cancelled. Your aircraft.", "abort");
         }
@@ -538,7 +621,11 @@ async fn fly_route(
     }
     let agl_ft = xp.get_float(AGL_M).await.unwrap_or(0.0) * M_TO_FT;
     if agl_ft < AIRBORNE_MIN_AGL_FT {
-        give_up(voice, "The takeoff didn't get us airborne, so the flight is off.", "takeoff_rejected");
+        give_up(
+            voice,
+            "The takeoff didn't get us airborne, so the flight is off.",
+            "takeoff_rejected",
+        );
         return;
     }
     event("airborne", json!({ "agl_ft": agl_ft }));
@@ -560,9 +647,17 @@ async fn fly_route(
         },
     );
     // Generous ceiling — ABORT bails out of the wait immediately.
-    if !wait_until(4.0 * 3600.0, 2000, || async { !crate::procedure::ACTIVE.load(Relaxed) }).await {
+    if !wait_until(4.0 * 3600.0, 2000, || async {
+        !crate::procedure::ACTIVE.load(Relaxed)
+    })
+    .await
+    {
         if !ABORT.load(SeqCst) {
-            give_up(voice, "The enroute leg never completed. Your aircraft.", "enroute_stalled");
+            give_up(
+                voice,
+                "The enroute leg never completed. Your aircraft.",
+                "enroute_stalled",
+            );
         } else {
             give_up(voice, "Cancelled. Your aircraft.", "abort");
         }
@@ -577,7 +672,11 @@ async fn fly_route(
     // --- Arrival: prefer the destination's PUBLISHED approach (the terrain-
     // safe corridor, the circuit's arrival rule); a visual autoland otherwise.
     let (Ok(lat), Ok(lon)) = (xp.get_float(LAT).await, xp.get_float(LON).await) else {
-        give_up(voice, "I can't read our position for the arrival. Your aircraft.", "no_position");
+        give_up(
+            voice,
+            "I can't read our position for the arrival. Your aircraft.",
+            "no_position",
+        );
         return;
     };
     let alt_msl_ft = xp.get_float(ELEV_M).await.unwrap_or(0.0) * M_TO_FT;
@@ -600,9 +699,17 @@ async fn fly_route(
         let dest = route.dest_icao.clone();
         let cfg = tools.circuit.cfg.clone();
         let ias = tools.circuit.approach_ias;
-        tokio::task::spawn_blocking(move || build_arrival(&apt_dat, &cifp, &fixp, &navp, &dest, lat, lon, cfg, ias, wind))
-            .await
-            .unwrap_or(Arrival { plan: None, rwy_id: None, tower_khz: None })
+        tokio::task::spawn_blocking(move || {
+            build_arrival(
+                &apt_dat, &cifp, &fixp, &navp, &dest, lat, lon, cfg, ias, wind,
+            )
+        })
+        .await
+        .unwrap_or(Arrival {
+            plan: None,
+            rwy_id: None,
+            tower_khz: None,
+        })
     };
     // The radio: tune the DESTINATION'S tower from its own apt.dat comm row —
     // never `home_tower_khz`, which is whoever the enroute region last handed
@@ -623,8 +730,15 @@ async fn fly_route(
     let landing_rwy = built.rwy_id.clone();
     match built.plan {
         Some(plan) if crate::procedure::approach_flyable_from(&plan, lat, lon, alt_msl_ft) => {
-            event("arrival_procedure", json!({ "name": plan.name, "runway": landing_rwy }));
-            announce(voice, Priority::Advisory, &format!("Setting up {}.", plan.name));
+            event(
+                "arrival_procedure",
+                json!({ "name": plan.name, "runway": landing_rwy }),
+            );
+            announce(
+                voice,
+                Priority::Advisory,
+                &format!("Setting up {}.", plan.name),
+            );
             crate::procedure::ABORT.store(false, SeqCst);
             crate::procedure::start(config.xplane_base_url.clone(), voice.clone(), plan);
         }
@@ -653,8 +767,7 @@ async fn fly_route(
     // the visual). Nothing left to actuate here — the arrival loops own the
     // aircraft — so this watch is the orchestrator's last duty.
     let called = wait_until(1800.0, 1000, || async {
-        crate::autoland::ACTIVE.load(Relaxed)
-            || !crate::procedure::ACTIVE.load(Relaxed)
+        crate::autoland::ACTIVE.load(Relaxed) || !crate::procedure::ACTIVE.load(Relaxed)
     })
     .await;
     // A procedure→autoland handoff has a brief both-inactive window while the
@@ -682,13 +795,21 @@ async fn fly_route(
             !crate::autoland::ACTIVE.load(Relaxed)
         })
         .await;
-        let on_ground = xp.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) > 0.5;
+        let on_ground = xp
+            .get_float(crate::datarefs::ON_GROUND_ANY)
+            .await
+            .unwrap_or(0.0)
+            > 0.5;
         if landed && on_ground && !ABORT.load(SeqCst) {
-            announce(voice, Priority::Advisory, crate::readback::one_of(&[
-                "Down. I'll taxi us to parking.",
-                "Down and clear. Taxiing us to parking.",
-                "On the ground. I'll get us to the gate.",
-            ]));
+            announce(
+                voice,
+                Priority::Advisory,
+                crate::readback::one_of(&[
+                    "Down. I'll taxi us to parking.",
+                    "Down and clear. Taxiing us to parking.",
+                    "On the ground. I'll get us to the gate.",
+                ]),
+            );
             event("taxi_in", json!({}));
             crate::taxi_in::start(
                 config.xplane_base_url.clone(),
@@ -735,7 +856,11 @@ fn build_arrival(
     wind: Option<(f64, f64)>,
 ) -> Arrival {
     let Some(airport) = crate::nav::find_airport(apt_dat, dest).ok().flatten() else {
-        return Arrival { plan: None, rwy_id: None, tower_khz: None };
+        return Arrival {
+            plan: None,
+            rwy_id: None,
+            tower_khz: None,
+        };
     };
     let tower_khz = airport.freq(crate::nav::FREQ_TOWER).map(|f| f.khz);
     // Into the wind when it's strong enough to matter...
@@ -765,16 +890,26 @@ fn build_arrival(
         best_id
     });
     let Some(rwy_id) = rwy_id else {
-        return Arrival { plan: None, rwy_id: None, tower_khz };
+        return Arrival {
+            plan: None,
+            rwy_id: None,
+            tower_khz,
+        };
     };
     let end = crate::procedure::EndAction::Approach {
         apt_dat: apt_dat.to_string(),
         cfg,
         approach_ias,
     };
-    let plan =
-        crate::procedure::approach_plan_for(cifp, fixp, navp, &airport, dest, &rwy_id, lat, lon, end).ok();
-    Arrival { plan, rwy_id: Some(rwy_id), tower_khz }
+    let plan = crate::procedure::approach_plan_for(
+        cifp, fixp, navp, &airport, dest, &rwy_id, lat, lon, end,
+    )
+    .ok();
+    Arrival {
+        plan,
+        rwy_id: Some(rwy_id),
+        tower_khz,
+    }
 }
 
 /// Call the tower for departure and wait for it to move us to a departure
@@ -782,15 +917,22 @@ fn build_arrival(
 /// voiced + transcribed by the crew-radio drain, along with the tower's reply.
 async fn request_departure(voice: &Option<Voice>, callsign: &Option<String>) {
     use crate::tower::State::{LinedUp, TakeoffCleared};
-    announce(voice, Priority::Advisory, crate::readback::one_of(&[
-        "Calling for departure.",
-        "Calling the tower for departure.",
-        "Getting our departure clearance.",
-    ]));
+    announce(
+        voice,
+        Priority::Advisory,
+        crate::readback::one_of(&[
+            "Calling for departure.",
+            "Calling the tower for departure.",
+            "Getting our departure clearance.",
+        ]),
+    );
     crate::circuit::transmit(crate::circuit::radio_call(callsign, "ready for departure"));
     event("request_departure", json!({}));
     wait_until(20.0, 1000, || async {
-        matches!(crate::party_line::clearance_state(), Some(LinedUp) | Some(TakeoffCleared))
+        matches!(
+            crate::party_line::clearance_state(),
+            Some(LinedUp) | Some(TakeoffCleared)
+        )
     })
     .await;
 }
@@ -830,11 +972,15 @@ async fn ensure_takeoff_cleared(
         if crate::party_line::takeoff_hold_armed() {
             // Held for traffic: wait it out, silently. Say so once.
             if !announced_hold {
-                announce(voice, Priority::Advisory, crate::readback::one_of(&[
-                    "Holding, the tower has traffic. I'll wait.",
-                    "Tower's got traffic. Holding here.",
-                    "We've got traffic ahead. Holding for now.",
-                ]));
+                announce(
+                    voice,
+                    Priority::Advisory,
+                    crate::readback::one_of(&[
+                        "Holding, the tower has traffic. I'll wait.",
+                        "Tower's got traffic. Holding here.",
+                        "We've got traffic ahead. Holding for now.",
+                    ]),
+                );
                 announced_hold = true;
             }
         } else if last_call.elapsed() >= NUDGE_EVERY {
@@ -849,7 +995,10 @@ async fn ensure_takeoff_cleared(
             *read_back = true;
             crate::circuit::transmit(crate::circuit::radio_call(
                 callsign,
-                &format!("cleared for takeoff runway {}", crate::circuit::spell_runway(&rwy)),
+                &format!(
+                    "cleared for takeoff runway {}",
+                    crate::circuit::spell_runway(&rwy)
+                ),
             ));
             event("readback_takeoff", json!({ "runway": rwy }));
         }
@@ -871,7 +1020,10 @@ async fn lined_up(xp: &XPlaneClient, tools: &SubTools, _config: &Config) -> bool
     ) else {
         return false;
     };
-    let needed_m = tools.line_up.takeoff_roll_m.map_or(500.0, |m| (m * 1.4).max(500.0));
+    let needed_m = tools
+        .line_up
+        .takeoff_roll_m
+        .map_or(500.0, |m| (m * 1.4).max(500.0));
     let apt = crate::tools::autoland::apt_dat_path();
     let cands = crate::autoland::nearby_runways(&apt, lat, lon, 3.0).unwrap_or_default();
     crate::autotakeoff::runway_fit(&cands, lat, lon, psi, needed_m).is_some()

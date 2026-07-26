@@ -82,14 +82,29 @@ impl Tool for Circuit {
             });
         }
         if circuit::ACTIVE.load(Relaxed) {
-            return Ok("I'm already flying the circuit. Say 'cancel the circuit' to stop.".to_string());
+            return Ok(
+                "I'm already flying the circuit. Say 'cancel the circuit' to stop.".to_string(),
+            );
         }
         // The same gates the takeoff arms behind — a circuit starts with one.
-        if ctx.xplane.get_float(crate::datarefs::IS_IN_REPLAY).await.is_ok_and(|v| v > 0.5) {
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::IS_IN_REPLAY)
+            .await
+            .is_ok_and(|v| v > 0.5)
+        {
             return Ok("We're in replay. Go back to live and ask again.".to_string());
         }
-        if ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(1.0) < 0.5 {
-            return Ok("We're already flying — say 'land the aircraft' for the landing.".to_string());
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::ON_GROUND_ANY)
+            .await
+            .unwrap_or(1.0)
+            < 0.5
+        {
+            return Ok(
+                "We're already flying — say 'land the aircraft' for the landing.".to_string(),
+            );
         }
         if crate::autotaxi::ACTIVE.load(Relaxed) {
             return Ok(
@@ -171,8 +186,10 @@ impl Tool for Circuit {
                 left_pattern: !a.right,
             },
         );
-        Ok("My circuit — takeoff, the pattern, and back around to land. Say 'cancel \
+        Ok(
+            "My circuit — takeoff, the pattern, and back around to land. Say 'cancel \
             the circuit' or 'my controls' any time."
-            .to_string())
+                .to_string(),
+        )
     }
 }

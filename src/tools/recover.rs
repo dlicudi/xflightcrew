@@ -207,7 +207,12 @@ fn run_recovery(
     // Hold ~1.3×Vs during the recovery; a sane floor if Vs is unknown.
     let min_safe_ias = (stall_speed_kts * 1.3).max(70.0);
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
         rt.block_on(async move {
             let xp = XPlaneClient::new(base);
             ACTIVE.store(true, Ordering::SeqCst);
@@ -370,8 +375,12 @@ mod tests {
 
     fn state(bank: f64, pitch: f64, stall: f64, ias: f64) -> RecoveryState {
         RecoveryState {
-            bank_deg: bank, pitch_deg: pitch, roll_rate_dps: 0.0,
-            pitch_rate_dps: 0.0, ias_kts: ias, stall_ratio: stall,
+            bank_deg: bank,
+            pitch_deg: pitch,
+            roll_rate_dps: 0.0,
+            pitch_rate_dps: 0.0,
+            ias_kts: ias,
+            stall_ratio: stall,
             min_safe_ias: 90.0,
         }
     }
@@ -380,7 +389,11 @@ mod tests {
     fn stall_pushes_nose_down_and_powers_up_before_rolling() {
         // Deep in a stall: nose-down push, gentle roll, full power, not stable.
         let c = recovery_inputs(&state(30.0, 15.0, 0.8, 75.0));
-        assert!(c.pitch < 0.0, "must push nose down to unstall, got {}", c.pitch);
+        assert!(
+            c.pitch < 0.0,
+            "must push nose down to unstall, got {}",
+            c.pitch
+        );
         assert_eq!(c.throttle, Some(RECOVERY_THROTTLE));
         assert!(c.roll.abs() <= 0.25, "roll stays gentle near the stall");
         assert!(!c.stable);

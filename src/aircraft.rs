@@ -584,32 +584,58 @@ pub struct FlapDetent {
 /// the top level (the monitor uses them) and aren't duplicated here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReferenceProfile {
-    #[serde(default)] pub kind: Option<String>,            // e.g. "single-engine aircraft", "twin-engine jet"
-    #[serde(default)] pub vno_kts: Option<f64>,            // max structural cruise
-    #[serde(default)] pub va_kts: Option<f64>,             // maneuvering
-    #[serde(default)] pub vx_kts: Option<f64>,             // best angle of climb
-    #[serde(default)] pub vy_kts: Option<f64>,             // best rate of climb
-    #[serde(default)] pub vr_kts: Option<f64>,             // rotate
-    #[serde(default)] pub best_glide_kts: Option<f64>,
-    #[serde(default)] pub vs0_kts: Option<f64>,            // stall, full flaps
-    #[serde(default)] pub approach_kts: Option<f64>,
-    #[serde(default)] pub max_crosswind_kts: Option<f64>,  // demonstrated
-    #[serde(default)] pub cruise_kts: Option<f64>,
-    #[serde(default)] pub best_climb_fpm: Option<f64>,
-    #[serde(default)] pub max_gross_lb: Option<f64>,
-    #[serde(default)] pub empty_weight_lb: Option<f64>,
-    #[serde(default)] pub useful_load_lb: Option<f64>,
-    #[serde(default)] pub service_ceiling_ft: Option<f64>,
-    #[serde(default)] pub fuel_capacity_gal: Option<f64>,
-    #[serde(default)] pub fuel_useable_gal: Option<f64>,
-    #[serde(default)] pub endurance_hours: Option<f64>,
-    #[serde(default)] pub takeoff_distance_ft: Option<f64>,
-    #[serde(default)] pub landing_distance_ft: Option<f64>,
-    #[serde(default)] pub max_rpm: Option<f64>,
-    #[serde(default)] pub oil_temp_min_f: Option<f64>,
-    #[serde(default)] pub oil_temp_max_f: Option<f64>,
-    #[serde(default)] pub oil_press_min_psi: Option<f64>,
-    #[serde(default)] pub oil_press_max_psi: Option<f64>,
+    #[serde(default)]
+    pub kind: Option<String>, // e.g. "single-engine aircraft", "twin-engine jet"
+    #[serde(default)]
+    pub vno_kts: Option<f64>, // max structural cruise
+    #[serde(default)]
+    pub va_kts: Option<f64>, // maneuvering
+    #[serde(default)]
+    pub vx_kts: Option<f64>, // best angle of climb
+    #[serde(default)]
+    pub vy_kts: Option<f64>, // best rate of climb
+    #[serde(default)]
+    pub vr_kts: Option<f64>, // rotate
+    #[serde(default)]
+    pub best_glide_kts: Option<f64>,
+    #[serde(default)]
+    pub vs0_kts: Option<f64>, // stall, full flaps
+    #[serde(default)]
+    pub approach_kts: Option<f64>,
+    #[serde(default)]
+    pub max_crosswind_kts: Option<f64>, // demonstrated
+    #[serde(default)]
+    pub cruise_kts: Option<f64>,
+    #[serde(default)]
+    pub best_climb_fpm: Option<f64>,
+    #[serde(default)]
+    pub max_gross_lb: Option<f64>,
+    #[serde(default)]
+    pub empty_weight_lb: Option<f64>,
+    #[serde(default)]
+    pub useful_load_lb: Option<f64>,
+    #[serde(default)]
+    pub service_ceiling_ft: Option<f64>,
+    #[serde(default)]
+    pub fuel_capacity_gal: Option<f64>,
+    #[serde(default)]
+    pub fuel_useable_gal: Option<f64>,
+    #[serde(default)]
+    pub endurance_hours: Option<f64>,
+    #[serde(default)]
+    pub takeoff_distance_ft: Option<f64>,
+    #[serde(default)]
+    pub landing_distance_ft: Option<f64>,
+    #[serde(default)]
+    pub max_rpm: Option<f64>,
+    #[serde(default)]
+    pub oil_temp_min_f: Option<f64>,
+    #[serde(default)]
+    pub oil_temp_max_f: Option<f64>,
+    #[serde(default)]
+    pub oil_press_min_psi: Option<f64>,
+    #[serde(default)]
+    pub oil_press_max_psi: Option<f64>,
 }
 
 /// One switchable light.
@@ -773,7 +799,10 @@ mod tests {
         let builtin = cessna_172sp();
         let yaml_elec: Vec<&str> = p.electrical.iter().map(|e| e.key.as_str()).collect();
         let builtin_elec: Vec<&str> = builtin.electrical.iter().map(|e| e.key.as_str()).collect();
-        assert_eq!(yaml_elec, builtin_elec, "electrical mismatch (YAML vs built-in)");
+        assert_eq!(
+            yaml_elec, builtin_elec,
+            "electrical mismatch (YAML vs built-in)"
+        );
     }
 
     #[test]
@@ -789,7 +818,10 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{id}.yaml failed to parse: {e:#}"));
             assert_eq!(p.id, id);
             let fs = p.fuel_selector.expect("fuel selector present");
-            assert!(fs.positions.iter().all(|p| !p.key.is_empty() && !p.command.is_empty()));
+            assert!(fs
+                .positions
+                .iter()
+                .all(|p| !p.key.is_empty() && !p.command.is_empty()));
             assert!(!p.checklist_map.is_empty());
         }
     }
@@ -809,8 +841,8 @@ mod tests {
         assert_eq!(p.vlo_kts, Some(140.0));
         assert!(p.throttle && !p.engine);
         assert!(p.fuel_selector.is_none()); // uses the dual cycle selectors instead
-        // Twin per-engine accessories, verified live: magnetos (via ignition_on),
-        // carb heat, and the boost pumps, all written across both engines.
+                                            // Twin per-engine accessories, verified live: magnetos (via ignition_on),
+                                            // carb heat, and the boost pumps, all written across both engines.
         assert_eq!(p.engines, 2);
         assert!(p.magnetos && p.magnetos_per_engine && p.carb_heat && p.fuel_pump);
         // No functional X-Plane autopilot on this airframe (servos never latch,
@@ -873,7 +905,13 @@ mod tests {
         // Electrical wired to parity with the other profiles: battery, dual
         // generators (+ both), avionics.
         let elec: Vec<&str> = p.electrical.iter().map(|e| e.key.as_str()).collect();
-        for k in ["battery", "generator1", "generator2", "generators", "avionics"] {
+        for k in [
+            "battery",
+            "generator1",
+            "generator2",
+            "generators",
+            "avionics",
+        ] {
             assert!(elec.contains(&k), "c90b electrical missing {k}");
         }
         assert!(p.flood_lights); // cockpit floods wired (generic_lights_switch[0])
@@ -916,7 +954,10 @@ mod tests {
         assert!(!p.turbine_start && !p.magnetos && !p.carb_heat);
         // PT6 start with the press-and-hold starter: one engine, no start_dn
         // (the held button releases itself), igniter armed, boost pump fed.
-        let ts = p.turboprop_start.as_ref().expect("evolution turboprop start");
+        let ts = p
+            .turboprop_start
+            .as_ref()
+            .expect("evolution turboprop start");
         assert!(ts.starter_held);
         assert_eq!(ts.start_up.len(), 1);
         assert!(ts.start_dn.is_empty());
@@ -928,7 +969,14 @@ mod tests {
         // generators" pair (POM: GEN and ALT are not normally used together) and
         // no avionics switch (the xlua forces avionics on at flight start).
         let elec: Vec<&str> = p.electrical.iter().map(|e| e.key.as_str()).collect();
-        for k in ["battery1", "battery2", "batteries", "generator", "alternator", "dc_power"] {
+        for k in [
+            "battery1",
+            "battery2",
+            "batteries",
+            "generator",
+            "alternator",
+            "dc_power",
+        ] {
             assert!(elec.contains(&k), "evolution electrical missing {k}");
         }
         assert!(!elec.contains(&"avionics") && !elec.contains(&"generators"));
@@ -980,13 +1028,23 @@ mod tests {
         // Boost pumps are COMMAND-driven (the universal array is a no-op on
         // this add-on): fuel_pump off, the override wired for both pumps.
         assert!(!p.fuel_pump);
-        let pc = p.fuel_pump_commands.as_ref().expect("twotter pump commands");
+        let pc = p
+            .fuel_pump_commands
+            .as_ref()
+            .expect("twotter pump commands");
         assert_eq!(pc.on_commands.len(), 2);
         assert_eq!(pc.off_commands.len(), 2);
         assert_eq!(pc.readback.len(), 2);
         // Electrical: battery + DC master + generators (each/both) + bleed air.
         let elec: Vec<&str> = p.electrical.iter().map(|e| e.key.as_str()).collect();
-        for k in ["battery", "master", "generator1", "generator2", "generators", "bleed"] {
+        for k in [
+            "battery",
+            "master",
+            "generator1",
+            "generator2",
+            "generators",
+            "bleed",
+        ] {
             assert!(elec.contains(&k), "twotter electrical missing {k}");
         }
         // PT6 start with the fire-once starter: no start_dn (the model latches
@@ -1041,7 +1099,15 @@ mod tests {
         assert_eq!(pos, ["off", "left", "right"]);
         // Dual electrical: BAT1/BAT2/ALT1/ALT2 + the pair switches + avionics.
         let elec: Vec<&str> = p.electrical.iter().map(|e| e.key.as_str()).collect();
-        for k in ["battery1", "battery2", "alternator1", "alternator2", "batteries", "alternators", "avionics"] {
+        for k in [
+            "battery1",
+            "battery2",
+            "alternator1",
+            "alternator2",
+            "batteries",
+            "alternators",
+            "avionics",
+        ] {
             assert!(elec.contains(&k), "SR22 electrical missing {k}");
         }
         // Flaps 0/50/100.
@@ -1072,13 +1138,22 @@ mod tests {
         // The boost pump, key-start ignition, pitch trim and fuel selector ARE
         // now mapped.
         let matches: Vec<&str> = yaml_map.iter().map(|e| e.match_.as_str()).collect();
-        for m in ["boost_pump", "ignition_key", "ignition_on", "elevator_trim", "fuel_tank_selector"] {
+        for m in [
+            "boost_pump",
+            "ignition_key",
+            "ignition_on",
+            "elevator_trim",
+            "fuel_tank_selector",
+        ] {
             assert!(matches.contains(&m), "SR22 map missing {m}");
         }
         // Fuel-selector positions carry their dataref values so the checklist can
         // decode `fuel_tank_selector:N` (0=off/1=left/2=right).
         let fsel = p.fuel_selector.as_ref().unwrap();
-        assert_eq!(fsel.readback.as_deref(), Some("sim/cockpit2/fuel/fuel_tank_selector"));
+        assert_eq!(
+            fsel.readback.as_deref(),
+            Some("sim/cockpit2/fuel/fuel_tank_selector")
+        );
         assert_eq!(fsel.positions.iter().filter_map(|p| p.value).count(), 3);
     }
 }
@@ -1094,15 +1169,14 @@ fn cessna_172sp() -> AircraftProfile {
         ratio,
         vfe_kts: vfe,
     };
-    let light = |key: &str, spoken: &str, dataref: &str, cmd_on: &str, cmd_off: &str| {
-        LightProfile {
+    let light =
+        |key: &str, spoken: &str, dataref: &str, cmd_on: &str, cmd_off: &str| LightProfile {
             key: key.into(),
             spoken: spoken.into(),
             dataref: dataref.into(),
             command_on: Some(cmd_on.into()),
             command_off: Some(cmd_off.into()),
-        }
-    };
+        };
     let fuel_pos = |key: &str, spoken: &str, command: &str, value: Option<f64>| FuelPosition {
         key: key.into(),
         spoken: spoken.into(),
@@ -1144,28 +1218,58 @@ fn cessna_172sp() -> AircraftProfile {
         cabin_crew: false,
         park_brake_valve_set: None,
         electrical: {
-            let e = |key: &str, spoken: &str, on: &[&str], off: &[&str], rb: &[&str]| ElectricalSystem {
-                key: key.into(),
-                spoken: spoken.into(),
-                on_commands: on.iter().map(|s| s.to_string()).collect(),
-                off_commands: off.iter().map(|s| s.to_string()).collect(),
-                readback: rb.iter().map(|s| s.to_string()).collect(),
+            let e = |key: &str, spoken: &str, on: &[&str], off: &[&str], rb: &[&str]| {
+                ElectricalSystem {
+                    key: key.into(),
+                    spoken: spoken.into(),
+                    on_commands: on.iter().map(|s| s.to_string()).collect(),
+                    off_commands: off.iter().map(|s| s.to_string()).collect(),
+                    readback: rb.iter().map(|s| s.to_string()).collect(),
+                }
             };
             vec![
-                e("battery", "battery", &["sim/electrical/battery_1_on"], &["sim/electrical/battery_1_off"],
-                  &["sim/cockpit/electrical/battery_on"]),
-                e("alternator", "alternator", &["sim/electrical/generator_1_on"], &["sim/electrical/generator_1_off"],
-                  &["sim/cockpit/electrical/generator_on[0]"]),
+                e(
+                    "battery",
+                    "battery",
+                    &["sim/electrical/battery_1_on"],
+                    &["sim/electrical/battery_1_off"],
+                    &["sim/cockpit/electrical/battery_on"],
+                ),
+                e(
+                    "alternator",
+                    "alternator",
+                    &["sim/electrical/generator_1_on"],
+                    &["sim/electrical/generator_1_off"],
+                    &["sim/cockpit/electrical/generator_on[0]"],
+                ),
                 // The two AVIONICS switches: BUS 1 (avionics master) + BUS 2 (cross-tie).
-                e("avionics", "avionics master",
-                  &["sim/systems/avionics_on", "sim/electrical/cross_tie_on"],
-                  &["sim/systems/avionics_off", "sim/electrical/cross_tie_off"],
-                  &["sim/cockpit/electrical/avionics_on", "sim/cockpit2/electrical/cross_tie"]),
+                e(
+                    "avionics",
+                    "avionics master",
+                    &["sim/systems/avionics_on", "sim/electrical/cross_tie_on"],
+                    &["sim/systems/avionics_off", "sim/electrical/cross_tie_off"],
+                    &[
+                        "sim/cockpit/electrical/avionics_on",
+                        "sim/cockpit2/electrical/cross_tie",
+                    ],
+                ),
                 // Split BAT/ALT rocker — battery + alternator together, NOT avionics.
-                e("master", "master",
-                  &["sim/electrical/battery_1_on", "sim/electrical/generator_1_on"],
-                  &["sim/electrical/battery_1_off", "sim/electrical/generator_1_off"],
-                  &["sim/cockpit/electrical/battery_on", "sim/cockpit/electrical/generator_on[0]"]),
+                e(
+                    "master",
+                    "master",
+                    &[
+                        "sim/electrical/battery_1_on",
+                        "sim/electrical/generator_1_on",
+                    ],
+                    &[
+                        "sim/electrical/battery_1_off",
+                        "sim/electrical/generator_1_off",
+                    ],
+                    &[
+                        "sim/cockpit/electrical/battery_on",
+                        "sim/cockpit/electrical/generator_on[0]",
+                    ],
+                ),
             ]
         },
         flood_lights: true,
@@ -1240,7 +1344,10 @@ fn cessna_172sp() -> AircraftProfile {
         }),
         checklist: Some("checklists/cessna_172sp.txt".into()),
         checklist_map: {
-            let m = |s: &str, a: ChecklistAction| ChecklistMapEntry { match_: s.into(), action: a };
+            let m = |s: &str, a: ChecklistAction| ChecklistMapEntry {
+                match_: s.into(),
+                action: a,
+            };
             use ChecklistAction::*;
             vec![
                 m("parkbrake", ParkingBrake),
@@ -1266,16 +1373,41 @@ fn cessna_172sp() -> AircraftProfile {
             ]
         },
         lights: vec![
-            light("nav", "navigation lights", "sim/cockpit2/switches/navigation_lights_on",
-                  "sim/lights/nav_lights_on", "sim/lights/nav_lights_off"),
-            light("beacon", "beacon", "sim/cockpit2/switches/beacon_on",
-                  "sim/lights/beacon_lights_on", "sim/lights/beacon_lights_off"),
-            light("strobe", "strobe lights", "sim/cockpit2/switches/strobe_lights_on",
-                  "sim/lights/strobe_lights_on", "sim/lights/strobe_lights_off"),
-            light("landing", "landing light", "sim/cockpit2/switches/landing_lights_on",
-                  "sim/lights/landing_lights_on", "sim/lights/landing_lights_off"),
-            light("taxi", "taxi light", "sim/cockpit2/switches/taxi_light_on",
-                  "sim/lights/taxi_lights_on", "sim/lights/taxi_lights_off"),
+            light(
+                "nav",
+                "navigation lights",
+                "sim/cockpit2/switches/navigation_lights_on",
+                "sim/lights/nav_lights_on",
+                "sim/lights/nav_lights_off",
+            ),
+            light(
+                "beacon",
+                "beacon",
+                "sim/cockpit2/switches/beacon_on",
+                "sim/lights/beacon_lights_on",
+                "sim/lights/beacon_lights_off",
+            ),
+            light(
+                "strobe",
+                "strobe lights",
+                "sim/cockpit2/switches/strobe_lights_on",
+                "sim/lights/strobe_lights_on",
+                "sim/lights/strobe_lights_off",
+            ),
+            light(
+                "landing",
+                "landing light",
+                "sim/cockpit2/switches/landing_lights_on",
+                "sim/lights/landing_lights_on",
+                "sim/lights/landing_lights_off",
+            ),
+            light(
+                "taxi",
+                "taxi light",
+                "sim/cockpit2/switches/taxi_light_on",
+                "sim/lights/taxi_lights_on",
+                "sim/lights/taxi_lights_off",
+            ),
         ],
     }
 }
@@ -1293,13 +1425,14 @@ fn cirrus_sr22() -> AircraftProfile {
         ratio,
         vfe_kts: vfe,
     };
-    let light = |key: &str, spoken: &str, dataref: &str, cmd_on: &str, cmd_off: &str| LightProfile {
-        key: key.into(),
-        spoken: spoken.into(),
-        dataref: dataref.into(),
-        command_on: Some(cmd_on.into()),
-        command_off: Some(cmd_off.into()),
-    };
+    let light =
+        |key: &str, spoken: &str, dataref: &str, cmd_on: &str, cmd_off: &str| LightProfile {
+            key: key.into(),
+            spoken: spoken.into(),
+            dataref: dataref.into(),
+            command_on: Some(cmd_on.into()),
+            command_off: Some(cmd_off.into()),
+        };
     let fuel_pos = |key: &str, spoken: &str, command: &str, value: Option<f64>| FuelPosition {
         key: key.into(),
         spoken: spoken.into(),
@@ -1352,32 +1485,80 @@ fn cirrus_sr22() -> AircraftProfile {
         // Dual battery/alternator + avionics — datarefs/commands verified against
         // the rustdecks SR22 deck.
         electrical: {
-            let e = |key: &str, spoken: &str, on: &[&str], off: &[&str], rb: &[&str]| ElectricalSystem {
-                key: key.into(),
-                spoken: spoken.into(),
-                on_commands: on.iter().map(|s| s.to_string()).collect(),
-                off_commands: off.iter().map(|s| s.to_string()).collect(),
-                readback: rb.iter().map(|s| s.to_string()).collect(),
+            let e = |key: &str, spoken: &str, on: &[&str], off: &[&str], rb: &[&str]| {
+                ElectricalSystem {
+                    key: key.into(),
+                    spoken: spoken.into(),
+                    on_commands: on.iter().map(|s| s.to_string()).collect(),
+                    off_commands: off.iter().map(|s| s.to_string()).collect(),
+                    readback: rb.iter().map(|s| s.to_string()).collect(),
+                }
             };
             vec![
-                e("battery1", "battery one", &["sim/electrical/battery_1_on"], &["sim/electrical/battery_1_off"],
-                  &["sim/cockpit2/electrical/battery_on[0]"]),
-                e("battery2", "battery two", &["sim/electrical/battery_2_on"], &["sim/electrical/battery_2_off"],
-                  &["sim/cockpit2/electrical/battery_on[1]"]),
-                e("alternator1", "alternator one", &["sim/electrical/generator_1_on"], &["sim/electrical/generator_1_off"],
-                  &["sim/cockpit2/electrical/generator_on[0]"]),
-                e("alternator2", "alternator two", &["sim/electrical/generator_2_on"], &["sim/electrical/generator_2_off"],
-                  &["sim/cockpit2/electrical/generator_on[1]"]),
-                e("batteries", "both batteries",
-                  &["sim/electrical/battery_1_on", "sim/electrical/battery_2_on"],
-                  &["sim/electrical/battery_1_off", "sim/electrical/battery_2_off"],
-                  &["sim/cockpit2/electrical/battery_on[0]", "sim/cockpit2/electrical/battery_on[1]"]),
-                e("alternators", "both alternators",
-                  &["sim/electrical/generator_1_on", "sim/electrical/generator_2_on"],
-                  &["sim/electrical/generator_1_off", "sim/electrical/generator_2_off"],
-                  &["sim/cockpit2/electrical/generator_on[0]", "sim/cockpit2/electrical/generator_on[1]"]),
-                e("avionics", "avionics master", &["sim/systems/avionics_on"], &["sim/systems/avionics_off"],
-                  &["sim/cockpit/electrical/avionics_on"]),
+                e(
+                    "battery1",
+                    "battery one",
+                    &["sim/electrical/battery_1_on"],
+                    &["sim/electrical/battery_1_off"],
+                    &["sim/cockpit2/electrical/battery_on[0]"],
+                ),
+                e(
+                    "battery2",
+                    "battery two",
+                    &["sim/electrical/battery_2_on"],
+                    &["sim/electrical/battery_2_off"],
+                    &["sim/cockpit2/electrical/battery_on[1]"],
+                ),
+                e(
+                    "alternator1",
+                    "alternator one",
+                    &["sim/electrical/generator_1_on"],
+                    &["sim/electrical/generator_1_off"],
+                    &["sim/cockpit2/electrical/generator_on[0]"],
+                ),
+                e(
+                    "alternator2",
+                    "alternator two",
+                    &["sim/electrical/generator_2_on"],
+                    &["sim/electrical/generator_2_off"],
+                    &["sim/cockpit2/electrical/generator_on[1]"],
+                ),
+                e(
+                    "batteries",
+                    "both batteries",
+                    &["sim/electrical/battery_1_on", "sim/electrical/battery_2_on"],
+                    &[
+                        "sim/electrical/battery_1_off",
+                        "sim/electrical/battery_2_off",
+                    ],
+                    &[
+                        "sim/cockpit2/electrical/battery_on[0]",
+                        "sim/cockpit2/electrical/battery_on[1]",
+                    ],
+                ),
+                e(
+                    "alternators",
+                    "both alternators",
+                    &[
+                        "sim/electrical/generator_1_on",
+                        "sim/electrical/generator_2_on",
+                    ],
+                    &[
+                        "sim/electrical/generator_1_off",
+                        "sim/electrical/generator_2_off",
+                    ],
+                    &[
+                        "sim/cockpit2/electrical/generator_on[0]",
+                        "sim/cockpit2/electrical/generator_on[1]",
+                    ],
+                ),
+                e(
+                    "avionics",
+                    "avionics master",
+                    &["sim/systems/avionics_on"],
+                    &["sim/systems/avionics_off"],
+                    &["sim/cockpit/electrical/avionics_on"],
+                ),
             ]
         },
         // Key-start ignition: set_magnetos writes the universal ignition_key
@@ -1400,8 +1581,18 @@ fn cirrus_sr22() -> AircraftProfile {
             readback: Some("sim/cockpit2/fuel/fuel_tank_selector".into()),
             positions: vec![
                 fuel_pos("off", "off", "laminar/sr22/fuel_sel_left_off", Some(0.0)),
-                fuel_pos("left", "left", "laminar/sr22/fuel_sel_left_select", Some(1.0)),
-                fuel_pos("right", "right", "laminar/sr22/fuel_sel_right_select", Some(2.0)),
+                fuel_pos(
+                    "left",
+                    "left",
+                    "laminar/sr22/fuel_sel_left_select",
+                    Some(1.0),
+                ),
+                fuel_pos(
+                    "right",
+                    "right",
+                    "laminar/sr22/fuel_sel_right_select",
+                    Some(2.0),
+                ),
             ],
         }),
         directional_gyro: false, // G1000 glass — no vacuum DG
@@ -1464,19 +1655,37 @@ fn cirrus_sr22() -> AircraftProfile {
         // Lights — datarefs verified against the rustdecks SR22 deck; universal
         // on/off commands.
         lights: vec![
-            light("nav", "nav lights", "sim/cockpit2/switches/navigation_lights_on",
-                  "sim/lights/nav_lights_on", "sim/lights/nav_lights_off"),
-            light("strobe", "strobe lights", "sim/cockpit2/switches/strobe_lights_on",
-                  "sim/lights/strobe_lights_on", "sim/lights/strobe_lights_off"),
-            light("landing", "landing light", "sim/cockpit2/switches/landing_lights_switch[0]",
-                  "sim/lights/landing_lights_on", "sim/lights/landing_lights_off"),
+            light(
+                "nav",
+                "nav lights",
+                "sim/cockpit2/switches/navigation_lights_on",
+                "sim/lights/nav_lights_on",
+                "sim/lights/nav_lights_off",
+            ),
+            light(
+                "strobe",
+                "strobe lights",
+                "sim/cockpit2/switches/strobe_lights_on",
+                "sim/lights/strobe_lights_on",
+                "sim/lights/strobe_lights_off",
+            ),
+            light(
+                "landing",
+                "landing light",
+                "sim/cockpit2/switches/landing_lights_switch[0]",
+                "sim/lights/landing_lights_on",
+                "sim/lights/landing_lights_off",
+            ),
         ],
         // Acts on universal-dataref systems plus the now-wired boost pump,
         // key-start ignition, pitch trim and the off/left/right fuel selector
         // (decoded from the profile's position values). The dual battery/
         // alternator stay call-out — their file conditions are compound `&&`.
         checklist_map: {
-            let m = |s: &str, a: ChecklistAction| ChecklistMapEntry { match_: s.into(), action: a };
+            let m = |s: &str, a: ChecklistAction| ChecklistMapEntry {
+                match_: s.into(),
+                action: a,
+            };
             use ChecklistAction::*;
             vec![
                 m("parkbrake", ParkingBrake),
@@ -1489,9 +1698,9 @@ fn cirrus_sr22() -> AircraftProfile {
                 m("nav_lights", Light("nav".into())),
                 m("strobe_lights", Light("strobe".into())),
                 m("landing_lights", Light("landing".into())),
-                m("boost_pump", FuelPump),    // laminar/sr22/switch/boost_pump → set_fuel_pump
-                m("ignition_key", Ignition),  // actuators/ignition_key: 4=start, 0=off
-                m("ignition_on", Ignition),   // mag test: 1=R, 2=L, 3=both
+                m("boost_pump", FuelPump), // laminar/sr22/switch/boost_pump → set_fuel_pump
+                m("ignition_key", Ignition), // actuators/ignition_key: 4=start, 0=off
+                m("ignition_on", Ignition), // mag test: 1=R, 2=L, 3=both
                 m("elevator_trim", PitchTrim), // "set T/O" → centre (not ail_trim)
                 m("fuel_tank_selector", FuelSelector), // 0=off/1=left/2=right
             ]

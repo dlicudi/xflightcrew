@@ -89,11 +89,17 @@ pub struct Reporter {
 impl Reporter {
     /// Plain-stdout reporter (no TUI).
     pub fn plain() -> Self {
-        Reporter { sink: Sink::Plain, status: None }
+        Reporter {
+            sink: Sink::Plain,
+            status: None,
+        }
     }
     /// TUI reporter feeding the dashboard channel.
     pub fn tui(tx: Sender<Report>) -> Self {
-        Reporter { sink: Sink::Tui(tx), status: None }
+        Reporter {
+            sink: Sink::Tui(tx),
+            status: None,
+        }
     }
     /// Also mirror status into the in-sim plugin panel.
     pub fn with_status(mut self, status: crate::plugin_status::StatusSink) -> Self {
@@ -110,7 +116,10 @@ impl Reporter {
     /// plumbing lines ("not a command: ...") that read as debug noise on the
     /// cockpit panel but still belong in the desktop transcript.
     pub fn log_quiet(&self, kind: LogKind, text: impl Into<String>) {
-        self.send(Report::Log { kind, text: text.into() });
+        self.send(Report::Log {
+            kind,
+            text: text.into(),
+        });
     }
 
     pub fn log(&self, kind: LogKind, text: impl Into<String>) {
@@ -404,11 +413,16 @@ fn draw(f: &mut Frame, app: &App) {
         Phase::Idle => ("○", "idle", Color::DarkGray),
     };
     // Title + phase on the left; the active engines right-aligned on the same line.
-    let [status_left, status_right] =
-        Layout::horizontal([Constraint::Min(20), Constraint::Length(app.engines.len() as u16 + 1)])
-            .areas(status);
+    let [status_left, status_right] = Layout::horizontal([
+        Constraint::Min(20),
+        Constraint::Length(app.engines.len() as u16 + 1),
+    ])
+    .areas(status);
     let status_line = Line::from(vec![
-        Span::styled(format!(" {} ", app.title), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" {} ", app.title),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
         Span::styled(format!("{dot} {label}"), Style::default().fg(c)),
     ]);
@@ -423,7 +437,8 @@ fn draw(f: &mut Frame, app: &App) {
     );
 
     // --- body: log (left) | aircraft + commands (right) ---
-    let [left, right] = Layout::horizontal([Constraint::Min(30), Constraint::Length(26)]).areas(body);
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(30), Constraint::Length(26)]).areas(body);
 
     // left: log (top) + mic meter (bottom)
     let [logarea, micarea] =
@@ -441,7 +456,11 @@ fn draw(f: &mut Frame, app: &App) {
         })
         .collect();
     f.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title(" conversation ")),
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" conversation "),
+        ),
         logarea,
     );
 
@@ -472,7 +491,9 @@ fn draw(f: &mut Frame, app: &App) {
         .map(|(name, khz)| {
             let mhz = format!("{:.3}", *khz as f64 / 1000.0);
             if tuned_ok(*khz) {
-                let on = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+                let on = Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD);
                 Line::from(vec![
                     Span::styled("▸ ", on),
                     Span::styled(format!("{name:<10}"), on),
@@ -488,7 +509,11 @@ fn draw(f: &mut Frame, app: &App) {
         })
         .collect();
     if !radio_lines.is_empty() {
-        if let Some(c) = app.radio.com1_khz.filter(|_| !app.radio.services.iter().any(|(_, k)| tuned_ok(*k))) {
+        if let Some(c) = app
+            .radio
+            .com1_khz
+            .filter(|_| !app.radio.services.iter().any(|(_, k)| tuned_ok(*k)))
+        {
             let off = Style::default().fg(Color::Yellow);
             radio_lines.push(Line::from(vec![
                 Span::styled("▸ ", off),
@@ -497,7 +522,11 @@ fn draw(f: &mut Frame, app: &App) {
             ]));
         }
     }
-    let radio_h = if radio_lines.is_empty() { 0 } else { radio_lines.len() as u16 + 2 };
+    let radio_h = if radio_lines.is_empty() {
+        0
+    } else {
+        radio_lines.len() as u16 + 2
+    };
     let [acarea, radioarea, mgarea, cmdarea] = Layout::vertical([
         Constraint::Length(9),
         Constraint::Length(radio_h),
@@ -523,7 +552,14 @@ fn draw(f: &mut Frame, app: &App) {
         kv("IAS", format!("{:.0} kt", a.ias)),
         kv("VSI", format!("{:+.0} fpm", a.vsi)),
         kv("FLAP", format!("{:.0}%", a.flaps_pct)),
-        kv("AP", if a.ap_mode.is_empty() { "--".into() } else { a.ap_mode.clone() }),
+        kv(
+            "AP",
+            if a.ap_mode.is_empty() {
+                "--".into()
+            } else {
+                a.ap_mode.clone()
+            },
+        ),
     ];
     f.render_widget(
         Paragraph::new(ac).block(Block::default().borders(Borders::ALL).title(" aircraft ")),
@@ -559,10 +595,19 @@ fn draw(f: &mut Frame, app: &App) {
     let cmds: Vec<ListItem> = app.commands[start..]
         .iter()
         .take(rows)
-        .map(|c| ListItem::new(Span::styled(c.clone(), Style::default().fg(Color::DarkGray))))
+        .map(|c| {
+            ListItem::new(Span::styled(
+                c.clone(),
+                Style::default().fg(Color::DarkGray),
+            ))
+        })
         .collect();
     let title = if len > rows {
-        format!(" say {}{} ", if start > 0 { "↑" } else { " " }, if start < max_start { "↓" } else { " " })
+        format!(
+            " say {}{} ",
+            if start > 0 { "↑" } else { " " },
+            if start < max_start { "↓" } else { " " }
+        )
     } else {
         " say ".to_string()
     };
@@ -574,10 +619,18 @@ fn draw(f: &mut Frame, app: &App) {
     // --- bottom line: command-mode hint, or the text input when editing ---
     let input_line = if app.editing {
         Line::from(vec![
-            Span::styled(" › ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " › ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(app.input.as_str()),
             Span::styled("▏", Style::default().fg(Color::Cyan)),
-            Span::styled("   Enter run · Esc done", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "   Enter run · Esc done",
+                Style::default().fg(Color::DarkGray),
+            ),
         ])
     } else {
         Line::from(Span::styled(

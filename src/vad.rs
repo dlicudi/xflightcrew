@@ -29,7 +29,9 @@ pub struct SpeechFilter {
 
 impl SpeechFilter {
     pub fn new() -> Self {
-        Self { vad: Detector::const_default() }
+        Self {
+            vad: Detector::const_default(),
+        }
     }
 
     /// True if enough of `audio` (16 kHz mono f32) is voiced speech.
@@ -63,7 +65,10 @@ mod tests {
     fn silence_and_noise_are_not_speech() {
         let mut f = SpeechFilter::new();
         // 1s of digital silence.
-        assert!(!f.is_speech(&vec![0.0f32; 16_000]), "silence should be rejected");
+        assert!(
+            !f.is_speech(&vec![0.0f32; 16_000]),
+            "silence should be rejected"
+        );
         // 1s of low-level hiss (deterministic wrapping LCG, no rng/overflow).
         let mut x: u64 = 1;
         let noise: Vec<f32> = (0..16_000)
@@ -82,12 +87,28 @@ mod tests {
     #[ignore = "requires macOS say/afconvert"]
     fn vad_passes_real_speech() {
         use std::process::Command;
-        Command::new("say").args(["-o", "/tmp/xc-vad.aiff", "Roger, flaps ten, gear up."]).status().unwrap();
+        Command::new("say")
+            .args(["-o", "/tmp/xc-vad.aiff", "Roger, flaps ten, gear up."])
+            .status()
+            .unwrap();
         Command::new("afconvert")
-            .args(["/tmp/xc-vad.aiff", "/tmp/xc-vad.wav", "-d", "LEI16@16000", "-c", "1", "-f", "WAVE"])
-            .status().unwrap();
-        let samples: Vec<f32> = hound::WavReader::open("/tmp/xc-vad.wav").unwrap()
-            .into_samples::<i16>().map(|s| s.unwrap() as f32 / i16::MAX as f32).collect();
+            .args([
+                "/tmp/xc-vad.aiff",
+                "/tmp/xc-vad.wav",
+                "-d",
+                "LEI16@16000",
+                "-c",
+                "1",
+                "-f",
+                "WAVE",
+            ])
+            .status()
+            .unwrap();
+        let samples: Vec<f32> = hound::WavReader::open("/tmp/xc-vad.wav")
+            .unwrap()
+            .into_samples::<i16>()
+            .map(|s| s.unwrap() as f32 / i16::MAX as f32)
+            .collect();
         let mut f = SpeechFilter::new();
         assert!(f.is_speech(&samples), "real speech should pass the gate");
     }

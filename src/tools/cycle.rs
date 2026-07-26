@@ -109,8 +109,12 @@ impl Tool for SetPower {
     }
     fn parameters(&self) -> Value {
         let keys: Vec<&str> = self.profile.states.iter().map(|s| s.key.as_str()).collect();
-        let listing: Vec<String> =
-            self.profile.states.iter().map(|s| format!("{} ({})", s.key, s.spoken)).collect();
+        let listing: Vec<String> = self
+            .profile
+            .states
+            .iter()
+            .map(|s| format!("{} ({})", s.key, s.spoken))
+            .collect();
         json!({
             "type": "object",
             "properties": {
@@ -122,19 +126,40 @@ impl Tool for SetPower {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: StateArg = serde_json::from_value(args.clone())?;
-        let Some(state) = self.profile.states.iter().find(|s| s.key.eq_ignore_ascii_case(&a.state)) else {
-            let names: Vec<&str> = self.profile.states.iter().map(|s| s.spoken.as_str()).collect();
-            return Ok(format!("I didn't catch the power setting '{}'. I have {}.", a.state, names.join(", ")));
+        let Some(state) = self
+            .profile
+            .states
+            .iter()
+            .find(|s| s.key.eq_ignore_ascii_case(&a.state))
+        else {
+            let names: Vec<&str> = self
+                .profile
+                .states
+                .iter()
+                .map(|s| s.spoken.as_str())
+                .collect();
+            return Ok(format!(
+                "I didn't catch the power setting '{}'. I have {}.",
+                a.state,
+                names.join(", ")
+            ));
         };
         let reached = cycle_to(ctx, &self.profile.switch, state.value).await?;
         if reached != state.value {
-            return Ok(format!("I couldn't move the power switch to {} — it stuck at {}.", state.spoken, reached));
+            return Ok(format!(
+                "I couldn't move the power switch to {} — it stuck at {}.",
+                state.spoken, reached
+            ));
         }
         // Confirm from the battery readback when given.
         if let Some(dref) = &self.profile.battery_readback {
             if let Ok(arr) = ctx.xplane.get_float_array(dref).await {
                 let live = arr.iter().any(|&v| v > 0.5);
-                let volts = ctx.xplane.get_float_array(BUS_VOLTS).await.ok()
+                let volts = ctx
+                    .xplane
+                    .get_float_array(BUS_VOLTS)
+                    .await
+                    .ok()
                     .and_then(|v| v.into_iter().find(|&x| x > 0.0));
                 if live {
                     return match volts {
@@ -204,13 +229,29 @@ impl Tool for SetCycleFuelSelector {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: FuelSelArgs = serde_json::from_value(args.clone())?;
-        let Some(sel) = self.selectors.iter().find(|s| s.key.eq_ignore_ascii_case(&a.selector)) else {
+        let Some(sel) = self
+            .selectors
+            .iter()
+            .find(|s| s.key.eq_ignore_ascii_case(&a.selector))
+        else {
             let names: Vec<&str> = self.selectors.iter().map(|s| s.spoken.as_str()).collect();
-            return Ok(format!("Which selector? I have the {}.", names.join(" and the ")));
+            return Ok(format!(
+                "Which selector? I have the {}.",
+                names.join(" and the ")
+            ));
         };
-        let Some(pos) = sel.positions.iter().find(|p| p.key.eq_ignore_ascii_case(&a.position)) else {
+        let Some(pos) = sel
+            .positions
+            .iter()
+            .find(|p| p.key.eq_ignore_ascii_case(&a.position))
+        else {
             let names: Vec<&str> = sel.positions.iter().map(|p| p.spoken.as_str()).collect();
-            return Ok(format!("I didn't catch the position '{}' for the {}. I have {}.", a.position, sel.spoken, names.join(", ")));
+            return Ok(format!(
+                "I didn't catch the position '{}' for the {}. I have {}.",
+                a.position,
+                sel.spoken,
+                names.join(", ")
+            ));
         };
         let reached = cycle_to(ctx, &sel.switch, pos.value).await?;
         if let Some(hit) = sel.positions.iter().find(|p| p.value == reached) {
@@ -252,9 +293,18 @@ impl Tool for SetMixture {
          off'. To shut the engines down use stop_engines."
     }
     fn parameters(&self) -> Value {
-        let keys: Vec<&str> = self.profile.notches.iter().map(|n| n.key.as_str()).collect();
-        let listing: Vec<String> =
-            self.profile.notches.iter().map(|n| format!("{} ({})", n.key, n.spoken)).collect();
+        let keys: Vec<&str> = self
+            .profile
+            .notches
+            .iter()
+            .map(|n| n.key.as_str())
+            .collect();
+        let listing: Vec<String> = self
+            .profile
+            .notches
+            .iter()
+            .map(|n| format!("{} ({})", n.key, n.spoken))
+            .collect();
         json!({
             "type": "object",
             "properties": {
@@ -266,17 +316,38 @@ impl Tool for SetMixture {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: NotchArg = serde_json::from_value(args.clone())?;
-        let Some(notch) = self.profile.notches.iter().find(|n| n.key.eq_ignore_ascii_case(&a.notch)) else {
-            let names: Vec<&str> = self.profile.notches.iter().map(|n| n.spoken.as_str()).collect();
-            return Ok(format!("I didn't catch the mixture setting '{}'. I have {}.", a.notch, names.join(", ")));
+        let Some(notch) = self
+            .profile
+            .notches
+            .iter()
+            .find(|n| n.key.eq_ignore_ascii_case(&a.notch))
+        else {
+            let names: Vec<&str> = self
+                .profile
+                .notches
+                .iter()
+                .map(|n| n.spoken.as_str())
+                .collect();
+            return Ok(format!(
+                "I didn't catch the mixture setting '{}'. I have {}.",
+                a.notch,
+                names.join(", ")
+            ));
         };
-        ctx.xplane.set_float(&self.profile.lever, notch.value as f64).await?;
+        ctx.xplane
+            .set_float(&self.profile.lever, notch.value as f64)
+            .await?;
         // Confirm the lever settled on the requested notch when a readback is set
         // (the lever animates, so give it a moment, then round to the nearest).
         if let Some(dref) = &self.profile.readback {
             tokio::time::sleep(Duration::from_millis(400)).await;
             if let Ok(actual) = ctx.xplane.get_float(dref).await {
-                if let Some(hit) = self.profile.notches.iter().find(|n| (n.value as f64 - actual).abs() < 0.5) {
+                if let Some(hit) = self
+                    .profile
+                    .notches
+                    .iter()
+                    .find(|n| (n.value as f64 - actual).abs() < 0.5)
+                {
                     return Ok(format!("Roger, mixture {}.", hit.spoken));
                 }
             }
@@ -301,7 +372,11 @@ impl StartEngines {
         selectors: Vec<CycleSelectorProfile>,
         power: Option<PowerSwitchProfile>,
     ) -> Self {
-        Self { start, selectors, power }
+        Self {
+            start,
+            selectors,
+            power,
+        }
     }
 }
 
@@ -343,7 +418,12 @@ impl Tool for StartEngines {
                 cycle_to(ctx, &power.switch, batt.value).await?;
             }
         }
-        let volts = ctx.xplane.get_float_array(BUS_VOLTS).await?.into_iter().fold(0.0_f64, f64::max);
+        let volts = ctx
+            .xplane
+            .get_float_array(BUS_VOLTS)
+            .await?
+            .into_iter()
+            .fold(0.0_f64, f64::max);
         if volts < MIN_START_VOLTS {
             return Ok(format!(
                 "Battery's low, only {volts:.0} volts — connect ground power before starting."
@@ -363,17 +443,23 @@ impl Tool for StartEngines {
         // chopping the throttle to a 12% crack would yank power off the live
         // engine and dump the pilot's setting — so airborne we leave the throttle
         // where they have it and just re-light.
-        ctx.xplane.set_float(&self.start.mixture_lever, self.start.mixture_start_notch).await?;
+        ctx.xplane
+            .set_float(&self.start.mixture_lever, self.start.mixture_start_notch)
+            .await?;
         let on_ground = ctx.xplane.get_float(ONGROUND).await.unwrap_or(1.0) > 0.5;
         if on_ground {
-            ctx.xplane.set_float(THROTTLE_ALL, self.start.throttle_crack).await?;
+            ctx.xplane
+                .set_float(THROTTLE_ALL, self.start.throttle_crack)
+                .await?;
         }
         ctx.xplane.run_command(&self.start.mags_both).await?;
 
         // Crank each starter, then wait for that engine to catch.
         let mut started = 0usize;
         for (i, starter) in self.start.starters.iter().enumerate() {
-            ctx.xplane.run_command_for(starter, self.start.crank_secs).await?;
+            ctx.xplane
+                .run_command_for(starter, self.start.crank_secs)
+                .await?;
             let mut caught = false;
             for _ in 0..8 {
                 tokio::time::sleep(Duration::from_millis(700)).await;
@@ -429,18 +515,24 @@ impl Tool for StopEngines {
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         // Don't shut engines down in flight or while still rolling.
         if ctx.xplane.get_float(ONGROUND).await? < 0.5 {
-            return Ok("Negative — we're airborne. I won't shut the engines down in flight.".to_string());
+            return Ok(
+                "Negative — we're airborne. I won't shut the engines down in flight.".to_string(),
+            );
         }
         if ctx.xplane.get_float(GROUNDSPEED).await? > 1.0 {
             return Ok("Negative — still moving. Bring her to a stop first.".to_string());
         }
-        ctx.xplane.set_float(&self.start.mixture_lever, self.start.mixture_cutoff_notch).await?;
+        ctx.xplane
+            .set_float(&self.start.mixture_lever, self.start.mixture_cutoff_notch)
+            .await?;
         ctx.xplane.run_command(&self.start.mags_off).await?;
 
         for _ in 0..6 {
             tokio::time::sleep(Duration::from_millis(600)).await;
             if !engine_running(ctx, 0).await {
-                return Ok("Roger — mixtures to idle cutoff, magnetos off. Engines shut down.".to_string());
+                return Ok(
+                    "Roger — mixtures to idle cutoff, magnetos off. Engines shut down.".to_string(),
+                );
             }
         }
         Ok("Mixtures to cutoff, engines winding down.".to_string())
@@ -501,7 +593,12 @@ impl Tool for StartTurbines {
             return Ok("Engines are already running.".to_string());
         }
         // Need battery/bus power to crank (the generators come online as we go).
-        let volts = ctx.xplane.get_float_array(BUS_VOLTS).await?.into_iter().fold(0.0_f64, f64::max);
+        let volts = ctx
+            .xplane
+            .get_float_array(BUS_VOLTS)
+            .await?
+            .into_iter()
+            .fold(0.0_f64, f64::max);
         if volts < 12.0 {
             return Ok(format!(
                 "No bus power, only {volts:.0} volts — battery on (or ground power) before starting."
@@ -522,12 +619,16 @@ impl Tool for StartTurbines {
             // POM ground-start order — verified live BOTH ways on the C90: fuel in
             // before cranking = no light-off (ITT falls, N1 stalls ~24%); condition
             // CUTOFF -> crank -> fuel (low idle) at 12% N1 -> lights every time.
-            ctx.xplane.set_float_array_elem(&self.start.condition_lever, i, 0.0).await?;
+            ctx.xplane
+                .set_float_array_elem(&self.start.condition_lever, i, 0.0)
+                .await?;
             // Held starters are re-armed every poll tick with a short duration
             // (the Web API caps a single activation well under a PT6's crank
             // time); once we stop re-arming, the button releases itself.
             if self.start.starter_held {
-                ctx.xplane.run_command_for(&self.start.start_up[i], 2.0).await?;
+                ctx.xplane
+                    .run_command_for(&self.start.start_up[i], 2.0)
+                    .await?;
             } else {
                 ctx.xplane.run_command(&self.start.start_up[i]).await?; // starter on
             }
@@ -537,12 +638,19 @@ impl Tool for StartTurbines {
             for _ in 0..deadline {
                 tokio::time::sleep(Duration::from_millis(700)).await;
                 if self.start.starter_held {
-                    let _ = ctx.xplane.run_command_for(&self.start.start_up[i], 2.0).await;
+                    let _ = ctx
+                        .xplane
+                        .run_command_for(&self.start.start_up[i], 2.0)
+                        .await;
                 }
                 let n1 = n1_percent(ctx, i).await;
                 if !fuel_in && n1 >= FUEL_INTRO_N1 {
                     ctx.xplane
-                        .set_float_array_elem(&self.start.condition_lever, i, self.start.condition_start)
+                        .set_float_array_elem(
+                            &self.start.condition_lever,
+                            i,
+                            self.start.condition_start,
+                        )
                         .await?;
                     fuel_in = true;
                 }
@@ -556,7 +664,9 @@ impl Tool for StartTurbines {
             }
             if lit {
                 started += 1;
-                ctx.xplane.set_float_array_elem(&self.start.condition_lever, i, self.start.condition_run).await?;
+                ctx.xplane
+                    .set_float_array_elem(&self.start.condition_lever, i, self.start.condition_run)
+                    .await?;
                 // Generator online so the bus can power the next start. The list is
                 // per-engine GROUPS (the C90's 3-pos switches need a dn,up pair per
                 // engine), so fire this engine's slice, not a single command.
@@ -567,18 +677,21 @@ impl Tool for StartTurbines {
             } else {
                 // Didn't catch — back to cutoff rather than leaving fuel flowing
                 // into a dead engine.
-                ctx.xplane.set_float_array_elem(&self.start.condition_lever, i, 0.0).await?;
+                ctx.xplane
+                    .set_float_array_elem(&self.start.condition_lever, i, 0.0)
+                    .await?;
             }
         }
 
         match started {
-            0 => Ok("Cranking — nothing lit. Check the condition levers and bus power, then try again.".to_string()),
+            0 => Ok(
+                "Cranking — nothing lit. Check the condition levers and bus power, then try again."
+                    .to_string(),
+            ),
             s if s == dead.len() && dead.len() == n => Ok(format!(
                 "Roger — starters cut at idle, generators on. All {n} running."
             )),
-            s if s == dead.len() => Ok(format!(
-                "Roger — relit {s}, all engines running."
-            )),
+            s if s == dead.len() => Ok(format!("Roger — relit {s}, all engines running.")),
             s => Ok(format!(
                 "Got {s} of {} lit. The other didn't catch — check it and try again.",
                 dead.len()
@@ -612,19 +725,25 @@ impl Tool for StopTurbines {
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         if ctx.xplane.get_float(ONGROUND).await? < 0.5 {
-            return Ok("Negative — we're airborne. I won't shut the engines down in flight.".to_string());
+            return Ok(
+                "Negative — we're airborne. I won't shut the engines down in flight.".to_string(),
+            );
         }
         if ctx.xplane.get_float(GROUNDSPEED).await? > 1.0 {
             return Ok("Negative — still moving. Bring her to a stop first.".to_string());
         }
         let n = self.start.start_up.len();
         for i in 0..n {
-            ctx.xplane.set_float_array_elem(&self.start.condition_lever, i, 0.0).await?; // fuel cutoff
+            ctx.xplane
+                .set_float_array_elem(&self.start.condition_lever, i, 0.0)
+                .await?; // fuel cutoff
         }
         for _ in 0..6 {
             tokio::time::sleep(Duration::from_millis(600)).await;
             if !engine_running(ctx, 0).await {
-                return Ok("Roger — condition levers to fuel cutoff. Engines shut down.".to_string());
+                return Ok(
+                    "Roger — condition levers to fuel cutoff. Engines shut down.".to_string(),
+                );
             }
         }
         Ok("Condition levers to cutoff, engines winding down.".to_string())

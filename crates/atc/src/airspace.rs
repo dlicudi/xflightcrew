@@ -65,7 +65,13 @@ impl Airspace {
             'Q' => "danger area",
             _ => "restricted area",
         };
-        let ident = self.name.split('(').next().unwrap_or("").trim().replace('-', " ");
+        let ident = self
+            .name
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .replace('-', " ");
         if ident.is_empty() {
             kind.to_string()
         } else {
@@ -78,8 +84,14 @@ impl Airspace {
 fn dms(tok: &str, hemi: char) -> Option<f64> {
     let mut parts = tok.split(':');
     let d: f64 = parts.next()?.trim().parse().ok()?;
-    let m: f64 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
-    let s: f64 = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
+    let m: f64 = parts
+        .next()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0.0);
+    let s: f64 = parts
+        .next()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0.0);
     let v = d + m / 60.0 + s / 3600.0;
     Some(if hemi == 'S' || hemi == 'W' { -v } else { v })
 }
@@ -186,7 +198,8 @@ pub fn parse_no_go(text: impl Iterator<Item = String>) -> Vec<Airspace> {
                 let r_lon = r_lat / clat.to_radians().cos().max(1e-6);
                 for k in 0..24 {
                     let th = (k as f64) * std::f64::consts::TAU / 24.0;
-                    a.poly.push((clat + r_lat * th.cos(), clon + r_lon * th.sin()));
+                    a.poly
+                        .push((clat + r_lat * th.cos(), clon + r_lon * th.sin()));
                 }
             }
         } else if let Some(rest) = line.strip_prefix("DB ") {
@@ -244,7 +257,9 @@ pub fn first_conflict<'a>(
     pts: &[(f64, f64)],
     alt_ft: f64,
 ) -> Option<&'a Airspace> {
-    spaces.iter().find(|a| pts.iter().any(|(la, lo)| a.blocks(*la, *lo, alt_ft)))
+    spaces
+        .iter()
+        .find(|a| pts.iter().any(|(la, lo)| a.blocks(*la, *lo, alt_ft)))
 }
 
 #[cfg(test)]
@@ -326,6 +341,9 @@ mod tests {
         let outside = [(35.5, -5.25)];
         assert!(first_conflict(&spaces, &inside, 1000.0).is_some());
         assert!(first_conflict(&spaces, &outside, 1000.0).is_none());
-        assert!(first_conflict(&spaces, &inside, 9000.0).is_none(), "above the band");
+        assert!(
+            first_conflict(&spaces, &inside, 9000.0).is_none(),
+            "above the band"
+        );
     }
 }

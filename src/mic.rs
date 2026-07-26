@@ -47,7 +47,9 @@ pub(crate) struct Input {
 /// Name of the default input device cpal will capture from — for display in
 /// the UI. `None` if no device is present or the platform won't name it.
 pub fn default_input_name() -> Option<String> {
-    cpal::default_host().default_input_device().and_then(|d| d.name().ok())
+    cpal::default_host()
+        .default_input_device()
+        .and_then(|d| d.name().ok())
 }
 
 /// Open the default input device and build (but don't start) its stream.
@@ -65,7 +67,12 @@ pub(crate) fn open_input() -> Result<Input> {
     let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let stream = build_stream(&device, &config, buffer.clone())?;
 
-    Ok(Input { stream, buffer, sample_rate, channels })
+    Ok(Input {
+        stream,
+        buffer,
+        sample_rate,
+        channels,
+    })
 }
 
 /// Audio kept *before* the PTT press, prepended to the capture so the start of a
@@ -97,7 +104,11 @@ impl PttMic {
     pub fn start(gate: MicGate, gate_tail: Duration) -> Result<PttMic> {
         let input = open_input()?;
         input.stream.play().context("starting input stream")?;
-        Ok(PttMic { input, gate, gate_tail })
+        Ok(PttMic {
+            input,
+            gate,
+            gate_tail,
+        })
     }
 
     /// Wait up to `idle_timeout` for `is_active` to go true (returning empty if it
@@ -154,7 +165,11 @@ impl PttMic {
 
         let interleaved = std::mem::take(&mut *self.input.buffer.lock().unwrap());
         let mono = downmix(&interleaved, self.input.channels);
-        Ok(resample_linear(&mono, self.input.sample_rate, WHISPER_SAMPLE_RATE))
+        Ok(resample_linear(
+            &mono,
+            self.input.sample_rate,
+            WHISPER_SAMPLE_RATE,
+        ))
     }
 
     /// Drop all but the last `keep` samples so the idle buffer can't grow unbounded
@@ -208,7 +223,10 @@ fn build_stream(
             &stream_config,
             move |data: &[u16], _| {
                 let mut b = buffer.lock().unwrap();
-                b.extend(data.iter().map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0));
+                b.extend(
+                    data.iter()
+                        .map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0),
+                );
             },
             err_fn,
             None,

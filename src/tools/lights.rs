@@ -44,7 +44,11 @@ impl SetLights {
     /// clarifying prompt rather than snapping to something arbitrary.
     fn resolve_light(&self, input: &str) -> Option<&LightProfile> {
         let want = input.trim().to_ascii_lowercase();
-        if let Some(l) = self.lights.iter().find(|l| l.key.eq_ignore_ascii_case(&want)) {
+        if let Some(l) = self
+            .lights
+            .iter()
+            .find(|l| l.key.eq_ignore_ascii_case(&want))
+        {
             return Some(l);
         }
         let stripped = want.strip_suffix('s').unwrap_or(want.as_str());
@@ -97,7 +101,10 @@ impl Tool for SetLights {
                 // Don't hard-fail (e.g. whisper hears "beak" for "beacon") —
                 // ask, listing what we actually have.
                 let names: Vec<&str> = self.lights.iter().map(|l| l.spoken.as_str()).collect();
-                return Ok(format!("I didn't catch which light. I have {}.", names.join(", ")));
+                return Ok(format!(
+                    "I didn't catch which light. I have {}.",
+                    names.join(", ")
+                ));
             }
         };
 
@@ -117,12 +124,22 @@ impl Tool for SetLights {
         match cmd {
             Some(c) => ctx.xplane.run_command(c).await?,
             None => match idx {
-                Some(i) => ctx.xplane.set_int_array_elem(base, i, args.on as i64).await?,
+                Some(i) => {
+                    ctx.xplane
+                        .set_int_array_elem(base, i, args.on as i64)
+                        .await?
+                }
                 None => ctx.xplane.set_int(base, args.on as i64).await?,
             },
         }
         let actual_on = match idx {
-            Some(i) => ctx.xplane.get_float_array(base).await?.get(i).copied().unwrap_or(0.0),
+            Some(i) => ctx
+                .xplane
+                .get_float_array(base)
+                .await?
+                .get(i)
+                .copied()
+                .unwrap_or(0.0),
             None => ctx.xplane.get_float(base).await?,
         } > 0.5;
 
@@ -208,7 +225,12 @@ impl Tool for SetFloodLights {
             (Some(p), _) => (p.clamp(0, 100) as f64) / 100.0,
             (None, Some(true)) => 1.0,
             (None, Some(false)) => 0.0,
-            (None, None) => return Ok("I didn't catch a flood-light setting — say on, off, or a percentage.".to_string()),
+            (None, None) => {
+                return Ok(
+                    "I didn't catch a flood-light setting — say on, off, or a percentage."
+                        .to_string(),
+                )
+            }
         };
 
         // Profile override: a single on/off switch (the King Air's overhead flood
@@ -222,10 +244,19 @@ impl Tool for SetFloodLights {
                 None => ctx.xplane.set_int(base, on as i64).await?,
             }
             let actual = match idx {
-                Some(i) => ctx.xplane.get_float_array(base).await?.get(i).copied().unwrap_or(0.0),
+                Some(i) => ctx
+                    .xplane
+                    .get_float_array(base)
+                    .await?
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0.0),
                 None => ctx.xplane.get_float(base).await?,
             } > 0.5;
-            return Ok(format!("Roger, flood lights {}.", if actual { "on" } else { "off" }));
+            return Ok(format!(
+                "Roger, flood lights {}.",
+                if actual { "on" } else { "off" }
+            ));
         }
 
         // Pilot side: scalar brightness. Copilot side: one float array element.

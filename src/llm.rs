@@ -130,7 +130,11 @@ fn coerce_args(name: &str, mut args: Value, tools: &[ToolSpec]) -> Value {
     let Some(spec) = tools.iter().find(|t| t.name == name) else {
         return args;
     };
-    let Some(props) = spec.parameters.get("properties").and_then(|p| p.as_object()) else {
+    let Some(props) = spec
+        .parameters
+        .get("properties")
+        .and_then(|p| p.as_object())
+    else {
         return args;
     };
     let props = props.clone();
@@ -222,13 +226,18 @@ fn json_objects(s: &str) -> Vec<(usize, String)> {
 fn recover_text_toolcalls(content: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
     let mut out = Vec::new();
     for (start, blob) in json_objects(content) {
-        let Ok(v) = serde_json::from_str::<Value>(&blob) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&blob) else {
+            continue;
+        };
         // Form A: a full call object {"name": "...", "arguments"|"parameters": {...}}.
         if let Some(name) = v.get("name").and_then(Value::as_str) {
             if let Some(spec) = tools.iter().find(|t| t.name == name) {
                 let raw = v.get("arguments").or_else(|| v.get("parameters")).cloned();
                 let raw = raw.filter(Value::is_object).unwrap_or_else(|| json!({}));
-                out.push(ToolCall { name: spec.name.clone(), arguments: coerce_args(&spec.name, raw, tools) });
+                out.push(ToolCall {
+                    name: spec.name.clone(),
+                    arguments: coerce_args(&spec.name, raw, tools),
+                });
                 continue;
             }
         }
@@ -236,7 +245,10 @@ fn recover_text_toolcalls(content: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
         if v.is_object() {
             let prefix = content[..start].trim_end();
             if let Some(spec) = tools.iter().find(|t| prefix.ends_with(t.name.as_str())) {
-                out.push(ToolCall { name: spec.name.clone(), arguments: coerce_args(&spec.name, v, tools) });
+                out.push(ToolCall {
+                    name: spec.name.clone(),
+                    arguments: coerce_args(&spec.name, v, tools),
+                });
             }
         }
     }
@@ -248,7 +260,11 @@ fn recover_text_toolcalls(content: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
 /// a brace.
 #[allow(dead_code)] // retained for the unused act path / tests — see UNIFIED_PROMPT
 fn looks_like_toolcall_echo(content: &str, tools: &[ToolSpec]) -> bool {
-    if content.trim_start().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("act:")) {
+    if content
+        .trim_start()
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("act:"))
+    {
         return true;
     }
     let lc = content.to_ascii_lowercase();
@@ -301,7 +317,11 @@ fn dedup_calls(calls: Vec<ToolCall>) -> Vec<ToolCall> {
             keep[i] = true;
         }
     }
-    calls.into_iter().zip(keep).filter_map(|(c, k)| k.then_some(c)).collect()
+    calls
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(c, k)| k.then_some(c))
+        .collect()
 }
 
 /// Thin client over a local Ollama server.
@@ -382,8 +402,16 @@ impl Llm {
     ) -> Result<Vec<ToolCall>> {
         // Deterministic first pass.
         let t = Instant::now();
-        let calls = self.choose_tool_at(transcript, tools, history, state, 0.0).await?;
-        tracing::info!(pass = 0, temp = 0.0, ms = t.elapsed().as_millis(), n = calls.len(), "llm tool-pick pass");
+        let calls = self
+            .choose_tool_at(transcript, tools, history, state, 0.0)
+            .await?;
+        tracing::info!(
+            pass = 0,
+            temp = 0.0,
+            ms = t.elapsed().as_millis(),
+            n = calls.len(),
+            "llm tool-pick pass"
+        );
         if !calls.is_empty() {
             return Ok(dedup_calls(calls));
         }
@@ -393,8 +421,16 @@ impl Llm {
         for (i, &temp) in RETRY_TEMPS.iter().enumerate() {
             tracing::debug!(temp, transcript = %transcript, "tool selection empty; retrying with temperature bump");
             let t = Instant::now();
-            let calls = self.choose_tool_at(transcript, tools, history, state, temp).await?;
-            tracing::info!(pass = i + 1, temp, ms = t.elapsed().as_millis(), n = calls.len(), "llm tool-pick retry");
+            let calls = self
+                .choose_tool_at(transcript, tools, history, state, temp)
+                .await?;
+            tracing::info!(
+                pass = i + 1,
+                temp,
+                ms = t.elapsed().as_millis(),
+                n = calls.len(),
+                "llm tool-pick retry"
+            );
             if !calls.is_empty() {
                 tracing::info!(temp, transcript = %transcript, n = calls.len(), "recovered tool(s) on retry");
                 return Ok(dedup_calls(calls));
@@ -414,14 +450,24 @@ impl Llm {
         temperature: f64,
     ) -> Result<Vec<ToolCall>> {
         let msg = self
-            .chat_call(SYSTEM_PROMPT, transcript, tools, history, state, temperature)
+            .chat_call(
+                SYSTEM_PROMPT,
+                transcript,
+                tools,
+                history,
+                state,
+                temperature,
+            )
             .await?;
         Ok(msg
             .tool_calls
             .into_iter()
             .map(|tc| {
                 let args = coerce_args(&tc.function.name, tc.function.arguments, tools);
-                ToolCall { name: tc.function.name, arguments: args }
+                ToolCall {
+                    name: tc.function.name,
+                    arguments: args,
+                }
             })
             .collect())
     }
@@ -442,8 +488,16 @@ impl Llm {
         state: Option<&str>,
     ) -> Result<Decision> {
         let t = Instant::now();
-        let d = self.decide_at(transcript, tools, history, state, 0.0).await?;
-        tracing::info!(pass = 0, temp = 0.0, ms = t.elapsed().as_millis(), decided = !matches!(d, Decision::None), "llm act-or-answer pass");
+        let d = self
+            .decide_at(transcript, tools, history, state, 0.0)
+            .await?;
+        tracing::info!(
+            pass = 0,
+            temp = 0.0,
+            ms = t.elapsed().as_millis(),
+            decided = !matches!(d, Decision::None),
+            "llm act-or-answer pass"
+        );
         if !matches!(d, Decision::None) {
             return Ok(d);
         }
@@ -451,8 +505,16 @@ impl Llm {
         // attribute a slow turn to retries rather than one heavy call.
         for (i, &temp) in RETRY_TEMPS.iter().enumerate() {
             let t = Instant::now();
-            let d = self.decide_at(transcript, tools, history, state, temp).await?;
-            tracing::info!(pass = i + 1, temp, ms = t.elapsed().as_millis(), decided = !matches!(d, Decision::None), "llm act-or-answer retry");
+            let d = self
+                .decide_at(transcript, tools, history, state, temp)
+                .await?;
+            tracing::info!(
+                pass = i + 1,
+                temp,
+                ms = t.elapsed().as_millis(),
+                decided = !matches!(d, Decision::None),
+                "llm act-or-answer retry"
+            );
             if !matches!(d, Decision::None) {
                 return Ok(d);
             }
@@ -526,7 +588,14 @@ impl Llm {
         };
         // No tools attached → the model physically cannot actuate anything.
         let msg = self
-            .chat_call(ANSWER_PROMPT, transcript, &[], history, combined.as_deref(), 0.0)
+            .chat_call(
+                ANSWER_PROMPT,
+                transcript,
+                &[],
+                history,
+                combined.as_deref(),
+                0.0,
+            )
             .await?;
         let reply = sanitize_reply(&msg.content);
         // The prompt steers non-questions to reply "Say again?" — that's the
@@ -549,14 +618,24 @@ impl Llm {
         temperature: f64,
     ) -> Result<Decision> {
         let msg = self
-            .chat_call(UNIFIED_PROMPT, transcript, tools, history, state, temperature)
+            .chat_call(
+                UNIFIED_PROMPT,
+                transcript,
+                tools,
+                history,
+                state,
+                temperature,
+            )
             .await?;
         let calls: Vec<ToolCall> = msg
             .tool_calls
             .into_iter()
             .map(|tc| {
                 let args = coerce_args(&tc.function.name, tc.function.arguments, tools);
-                ToolCall { name: tc.function.name, arguments: args }
+                ToolCall {
+                    name: tc.function.name,
+                    arguments: args,
+                }
             })
             .collect();
         if !calls.is_empty() {
@@ -709,7 +788,10 @@ mod tests {
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].arguments, json!({"on": false}));
         // Genuine prose is never mistaken for a tool call.
-        assert!(!looks_like_toolcall_echo("We're at 3,000 feet, climbing.", &tools));
+        assert!(!looks_like_toolcall_echo(
+            "We're at 3,000 feet, climbing.",
+            &tools
+        ));
         assert!(recover_text_toolcalls("We're parked, engines off.", &tools).is_empty());
     }
 
@@ -726,19 +808,32 @@ mod tests {
             }}),
         }];
         // string-typed numbers/bools get coerced; the enum string is left alone.
-        let out = coerce_args("t", json!({"heading":"270","on":"false","pct":"50","notch":"10"}), &tools);
+        let out = coerce_args(
+            "t",
+            json!({"heading":"270","on":"false","pct":"50","notch":"10"}),
+            &tools,
+        );
         assert_eq!(out["heading"], json!(270));
         assert_eq!(out["on"], json!(false));
         assert_eq!(out["pct"], json!(50.0));
         assert_eq!(out["notch"], json!("10"));
         // already-typed args are untouched; an unknown tool passes through.
-        assert_eq!(coerce_args("t", json!({"heading":270}), &tools)["heading"], json!(270));
-        assert_eq!(coerce_args("unknown", json!({"a":"1"}), &tools), json!({"a":"1"}));
+        assert_eq!(
+            coerce_args("t", json!({"heading":270}), &tools)["heading"],
+            json!(270)
+        );
+        assert_eq!(
+            coerce_args("unknown", json!({"a":"1"}), &tools),
+            json!({"a":"1"})
+        );
     }
 
     #[test]
     fn dedup_collapses_conflicting_keeps_addressable() {
-        let c = |name: &str, args: Value| ToolCall { name: name.into(), arguments: args };
+        let c = |name: &str, args: Value| ToolCall {
+            name: name.into(),
+            arguments: args,
+        };
         let out = dedup_calls(vec![
             c("set_flaps", json!({ "notch": "10" })),
             c("set_flaps", json!({ "notch": "20" })),
@@ -830,15 +925,43 @@ mod tests {
         // (utterance, expected tool, optional (arg key, expected value))
         let cases: &[(&str, &str, Option<(&str, Value)>)] = &[
             ("flaps up", "set_flaps", Some(("notch", json!("up")))),
-            ("set flaps to ten degrees", "set_flaps", Some(("notch", json!("10")))),
-            ("give me full flaps", "set_flaps", Some(("notch", json!("full")))),
-            ("turn on the landing light", "set_lights", Some(("light", json!("landing")))),
+            (
+                "set flaps to ten degrees",
+                "set_flaps",
+                Some(("notch", json!("10"))),
+            ),
+            (
+                "give me full flaps",
+                "set_flaps",
+                Some(("notch", json!("full"))),
+            ),
+            (
+                "turn on the landing light",
+                "set_lights",
+                Some(("light", json!("landing"))),
+            ),
             ("strobes off", "set_lights", Some(("on", json!(false)))),
             ("beacon on", "set_lights", Some(("light", json!("beacon")))),
-            ("flood lights on", "set_flood_lights", Some(("on", json!(true)))),
-            ("flood lights off", "set_flood_lights", Some(("on", json!(false)))),
-            ("flood lights 50 percent", "set_flood_lights", Some(("percent", json!(50)))),
-            ("dim the floods to 30 percent", "set_flood_lights", Some(("percent", json!(30)))),
+            (
+                "flood lights on",
+                "set_flood_lights",
+                Some(("on", json!(true))),
+            ),
+            (
+                "flood lights off",
+                "set_flood_lights",
+                Some(("on", json!(false))),
+            ),
+            (
+                "flood lights 50 percent",
+                "set_flood_lights",
+                Some(("percent", json!(50))),
+            ),
+            (
+                "dim the floods to 30 percent",
+                "set_flood_lights",
+                Some(("percent", json!(30))),
+            ),
             ("autopilot heading 270", "set_heading", None),
             ("fly heading 090", "set_heading", None),
             ("climb and maintain 7000", "set_altitude", None),
@@ -849,20 +972,56 @@ mod tests {
             ("mixture full rich", "set_mixture", None),
             ("set altimeter 29.92", "set_barometer", None),
             ("com one 118.5", "set_com1", None),
-            ("parking brake set", "set_parking_brake", Some(("on", json!(true)))),
-            ("release the parking brake", "set_parking_brake", Some(("on", json!(false)))),
+            (
+                "parking brake set",
+                "set_parking_brake",
+                Some(("on", json!(true))),
+            ),
+            (
+                "release the parking brake",
+                "set_parking_brake",
+                Some(("on", json!(false))),
+            ),
             ("start the engine", "start_engine", None),
             ("switch engines on", "start_engine", None),
             ("engine on", "start_engine", None),
             ("shut down the engine", "stop_engine", None),
             ("engine off", "stop_engine", None),
-            ("battery on", "set_electrical", Some(("system", json!("battery")))),
-            ("turn off the avionics", "set_electrical", Some(("system", json!("avionics")))),
-            ("alternator on", "set_electrical", Some(("system", json!("alternator")))),
-            ("switch on all electrical systems", "set_electrical", Some(("system", json!("all")))),
-            ("squawk 1200", "set_transponder", Some(("code", json!(1200)))),
-            ("set transponder to 4521", "set_transponder", Some(("code", json!(4521)))),
-            ("prepare the ILS for runway 28", "prepare_ils", Some(("runway", json!("28")))),
+            (
+                "battery on",
+                "set_electrical",
+                Some(("system", json!("battery"))),
+            ),
+            (
+                "turn off the avionics",
+                "set_electrical",
+                Some(("system", json!("avionics"))),
+            ),
+            (
+                "alternator on",
+                "set_electrical",
+                Some(("system", json!("alternator"))),
+            ),
+            (
+                "switch on all electrical systems",
+                "set_electrical",
+                Some(("system", json!("all"))),
+            ),
+            (
+                "squawk 1200",
+                "set_transponder",
+                Some(("code", json!(1200))),
+            ),
+            (
+                "set transponder to 4521",
+                "set_transponder",
+                Some(("code", json!(4521))),
+            ),
+            (
+                "prepare the ILS for runway 28",
+                "prepare_ils",
+                Some(("runway", json!("28"))),
+            ),
             ("set up the ILS runway 13", "prepare_ils", None),
             ("align the gyro", "align_gyro", None),
             ("sync the heading indicator", "align_gyro", None),
@@ -871,23 +1030,57 @@ mod tests {
             ("pitot heat on", "set_pitot_heat", Some(("on", json!(true)))),
             ("fuel pump on", "set_fuel_pump", Some(("on", json!(true)))),
             ("carb heat off", "set_carb_heat", Some(("on", json!(false)))),
-            ("magnetos both", "set_magnetos", Some(("position", json!("both")))),
-            ("fuel selector left", "set_fuel_selector", Some(("position", json!("left")))),
-            ("trim nose up", "set_pitch_trim", Some(("action", json!("nose_up")))),
-            ("set takeoff trim", "set_pitch_trim", Some(("action", json!("takeoff")))),
+            (
+                "magnetos both",
+                "set_magnetos",
+                Some(("position", json!("both"))),
+            ),
+            (
+                "fuel selector left",
+                "set_fuel_selector",
+                Some(("position", json!("left"))),
+            ),
+            (
+                "trim nose up",
+                "set_pitch_trim",
+                Some(("action", json!("nose_up"))),
+            ),
+            (
+                "set takeoff trim",
+                "set_pitch_trim",
+                Some(("action", json!("takeoff"))),
+            ),
             ("nav one 109.5", "set_nav1", None),
             ("set the OBS to 240", "set_obs", None),
             ("com two 121.9", "set_com2", None),
             ("swap com one", "swap_radio", Some(("radio", json!("com1")))),
-            ("transponder standby", "set_transponder_mode", Some(("mode", json!("standby")))),
-            ("squawk altitude", "set_transponder_mode", Some(("mode", json!("altitude")))),
-            ("ident", "set_transponder_mode", Some(("mode", json!("ident")))),
+            (
+                "transponder standby",
+                "set_transponder_mode",
+                Some(("mode", json!("standby"))),
+            ),
+            (
+                "squawk altitude",
+                "set_transponder_mode",
+                Some(("mode", json!("altitude"))),
+            ),
+            (
+                "ident",
+                "set_transponder_mode",
+                Some(("mode", json!("ident"))),
+            ),
         ];
 
         println!("\n  model: {}", cfg.model);
         let mut failures = 0;
         for (utterance, expected_tool, expected_arg) in cases {
-            match llm.choose_tool(utterance, &specs, &[], None).await.expect("ollama call failed").into_iter().next() {
+            match llm
+                .choose_tool(utterance, &specs, &[], None)
+                .await
+                .expect("ollama call failed")
+                .into_iter()
+                .next()
+            {
                 Some(call) => {
                     let tool_ok = call.name == *expected_tool;
                     let arg_ok = expected_arg
@@ -940,7 +1133,11 @@ mod tests {
         let positives: &[(&str, &str, Option<(&str, Value)>)] = &[
             ("Slaps up.", "set_flaps", Some(("notch", json!("up")))), // flaps→slaps
             ("Flaps down 10.", "set_flaps", Some(("notch", json!("10")))), // (log)
-            ("Flaps 10 degrees.", "set_flaps", Some(("notch", json!("10")))), // (log)
+            (
+                "Flaps 10 degrees.",
+                "set_flaps",
+                Some(("notch", json!("10"))),
+            ), // (log)
             ("vertical speed 500.", "set_vertical_speed", None),      // (log)
             ("Set vertical speed 500.", "set_vertical_speed", None),  // (log)
             ("Heading 20.", "set_heading", None),                     // (log)
@@ -950,14 +1147,38 @@ mod tests {
             ("throttle 50%!", "set_throttle", None),                  // (log) punctuation
             ("mixture 100%", "set_mixture", None),                    // (log)
             ("Lean mixture, 50%.", "set_mixture", None),              // (log)
-            ("battery on.", "set_electrical", Some(("system", json!("battery")))), // (log)
-            ("avionics on...", "set_electrical", Some(("system", json!("avionics")))), // (log)
-            ("Landing light on.", "set_lights", Some(("light", json!("landing")))), // (log)
+            (
+                "battery on.",
+                "set_electrical",
+                Some(("system", json!("battery"))),
+            ), // (log)
+            (
+                "avionics on...",
+                "set_electrical",
+                Some(("system", json!("avionics"))),
+            ), // (log)
+            (
+                "Landing light on.",
+                "set_lights",
+                Some(("light", json!("landing"))),
+            ), // (log)
             ("Nav Light on.", "set_lights", Some(("light", json!("nav")))), // (log)
             ("Taxi light off.", "set_lights", Some(("on", json!(false)))), // (log)
-            ("probe lights on.", "set_lights", Some(("light", json!("strobe")))), // (log) strobe→probe
-            ("Floodlights on.", "set_flood_lights", Some(("on", json!(true)))), // (log) glued compound
-            ("Bloodlights off.", "set_flood_lights", Some(("on", json!(false)))), // (log) flood→blood
+            (
+                "probe lights on.",
+                "set_lights",
+                Some(("light", json!("strobe"))),
+            ), // (log) strobe→probe
+            (
+                "Floodlights on.",
+                "set_flood_lights",
+                Some(("on", json!(true))),
+            ), // (log) glued compound
+            (
+                "Bloodlights off.",
+                "set_flood_lights",
+                Some(("on", json!(false))),
+            ), // (log) flood→blood
             ("Start engines.", "start_engine", None),                 // (log) plural
             ("at Radio 122.", "set_com1", None),                      // (log) radio→com1
         ];
@@ -977,11 +1198,19 @@ mod tests {
         println!("  -- positives (noisy commands) --");
         for (utterance, expected_tool, expected_arg) in positives {
             if !crate::looks_like_command(utterance) {
-                println!("  ⊘ {utterance:?} -> blocked by looks_like_command (gate gap, not scored)");
+                println!(
+                    "  ⊘ {utterance:?} -> blocked by looks_like_command (gate gap, not scored)"
+                );
                 gate_skipped += 1;
                 continue;
             }
-            match llm.choose_tool(utterance, &specs, &[], None).await.expect("ollama call failed").into_iter().next() {
+            match llm
+                .choose_tool(utterance, &specs, &[], None)
+                .await
+                .expect("ollama call failed")
+                .into_iter()
+                .next()
+            {
                 Some(call) => {
                     let tool_ok = call.name == *expected_tool;
                     let arg_ok = expected_arg
@@ -1010,10 +1239,19 @@ mod tests {
                 gate_skipped += 1;
                 continue;
             }
-            match llm.choose_tool(utterance, &specs, &[], None).await.expect("ollama call failed").into_iter().next() {
+            match llm
+                .choose_tool(utterance, &specs, &[], None)
+                .await
+                .expect("ollama call failed")
+                .into_iter()
+                .next()
+            {
                 None => println!("  ✓ {utterance:?} -> (declined, correct)"),
                 Some(call) => {
-                    println!("  ✗ {utterance:?} -> {} {} (should have declined)", call.name, call.arguments);
+                    println!(
+                        "  ✗ {utterance:?} -> {} {} (should have declined)",
+                        call.name, call.arguments
+                    );
                     failures += 1;
                 }
             }
@@ -1046,54 +1284,127 @@ mod tests {
         // marks an item we suspect has NO tool yet (a known gap to confirm).
         let cases: &[(&str, &str, Option<(&str, Value)>)] = &[
             // electrical: "master switch" = battery, "avionics switch"
-            ("master switch on", "set_electrical", Some(("system", json!("master")))),
-            ("master switch off", "set_electrical", Some(("system", json!("master")))),
-            ("avionics switch off", "set_electrical", Some(("system", json!("avionics")))),
-            ("alternator off", "set_electrical", Some(("system", json!("alternator")))),
+            (
+                "master switch on",
+                "set_electrical",
+                Some(("system", json!("master"))),
+            ),
+            (
+                "master switch off",
+                "set_electrical",
+                Some(("system", json!("master"))),
+            ),
+            (
+                "avionics switch off",
+                "set_electrical",
+                Some(("system", json!("avionics"))),
+            ),
+            (
+                "alternator off",
+                "set_electrical",
+                Some(("system", json!("alternator"))),
+            ),
             // fuel: the checklist says "fuel valve" / "fuel shutoff valve", not "selector".
             // The 172 selector is LEFT/BOTH/RIGHT only — "off" is the separate red
             // fuel shutoff valve, not a selector position, so it has no tool (a gap).
-            ("fuel valve both", "set_fuel_selector", Some(("position", json!("both")))),
+            (
+                "fuel valve both",
+                "set_fuel_selector",
+                Some(("position", json!("both"))),
+            ),
             ("fuel valve off", "", None),
-            ("fuel shutoff valve both", "set_fuel_selector", Some(("position", json!("both")))),
+            (
+                "fuel shutoff valve both",
+                "set_fuel_selector",
+                Some(("position", json!("both"))),
+            ),
             // ignition switch positions
             ("ignition start", "start_engine", None),
-            ("ignition off", "set_magnetos", Some(("position", json!("off")))),
-            ("ignition both", "set_magnetos", Some(("position", json!("both")))),
+            (
+                "ignition off",
+                "set_magnetos",
+                Some(("position", json!("off"))),
+            ),
+            (
+                "ignition both",
+                "set_magnetos",
+                Some(("position", json!("both"))),
+            ),
             // engine config vocabulary
             ("mixture idle cutoff", "set_mixture", None),
-            ("prime the engine", "", None),           // suspected gap: no primer tool
-            ("prime as required", "", None),           // suspected gap
+            ("prime the engine", "", None), // suspected gap: no primer tool
+            ("prime as required", "", None), // suspected gap
             ("throttle open one eighth", "set_throttle", None),
             ("throttle seventeen hundred RPM", "set_throttle", None),
-            ("carb heat cold", "set_carb_heat", Some(("on", json!(false)))),
+            (
+                "carb heat cold",
+                "set_carb_heat",
+                Some(("on", json!(false))),
+            ),
             // "wing flaps" (the checklist's wording) not just "flaps"
             ("wing flaps up", "set_flaps", Some(("notch", json!("up")))),
             ("wing flaps zero", "set_flaps", Some(("notch", json!("up")))),
             // other checklist phrasings
-            ("beacon light on", "set_lights", Some(("light", json!("beacon")))),
-            ("transponder on alt", "set_transponder_mode", Some(("mode", json!("altitude")))),
-            ("trim set for takeoff", "set_pitch_trim", Some(("action", json!("takeoff")))),
-            ("brakes test and set", "set_parking_brake", Some(("on", json!(true)))),
+            (
+                "beacon light on",
+                "set_lights",
+                Some(("light", json!("beacon"))),
+            ),
+            (
+                "transponder on alt",
+                "set_transponder_mode",
+                Some(("mode", json!("altitude"))),
+            ),
+            (
+                "trim set for takeoff",
+                "set_pitch_trim",
+                Some(("action", json!("takeoff"))),
+            ),
+            (
+                "brakes test and set",
+                "set_parking_brake",
+                Some(("on", json!(true))),
+            ),
         ];
 
         println!("\n  model: {}  (checklist vocabulary)\n", cfg.model);
         let mut gaps = 0;
         for (utterance, expected_tool, expected_arg) in cases {
             let gated = crate::looks_like_command(utterance);
-            let call = llm.choose_tool(utterance, &specs, &[], None).await.expect("ollama").into_iter().next();
-            let got = call.as_ref().map(|c| format!("{} {}", c.name, c.arguments)).unwrap_or_else(|| "(no tool)".into());
+            let call = llm
+                .choose_tool(utterance, &specs, &[], None)
+                .await
+                .expect("ollama")
+                .into_iter()
+                .next();
+            let got = call
+                .as_ref()
+                .map(|c| format!("{} {}", c.name, c.arguments))
+                .unwrap_or_else(|| "(no tool)".into());
             let ok = match (expected_tool, &call) {
-                (&"", None) => true, // confirmed gap
+                (&"", None) => true,    // confirmed gap
                 (&"", Some(_)) => true, // bonus: something handled it
                 (_, Some(c)) => {
                     c.name == *expected_tool
-                        && expected_arg.as_ref().map(|(k, v)| c.arguments.get(*k) == Some(v)).unwrap_or(true)
+                        && expected_arg
+                            .as_ref()
+                            .map(|(k, v)| c.arguments.get(*k) == Some(v))
+                            .unwrap_or(true)
                 }
                 (_, None) => false,
             };
-            let mark = if !gated { "⊘" } else if ok { "✓" } else { "✗" };
-            let note = if expected_tool.is_empty() { "  [suspected gap]" } else { "" };
+            let mark = if !gated {
+                "⊘"
+            } else if ok {
+                "✓"
+            } else {
+                "✗"
+            };
+            let note = if expected_tool.is_empty() {
+                "  [suspected gap]"
+            } else {
+                ""
+            };
             println!("  {mark} {utterance:?} -> {got}{note}");
             if !gated || !ok {
                 gaps += 1;
@@ -1125,13 +1436,22 @@ mod tests {
         let temps = [0.0, 0.3, 0.5, 0.7, 0.9];
         const TRIES: usize = 5;
 
-        println!("\n  model: {}   ({TRIES} tries per cell; right-tool hits)\n", cfg.model);
+        println!(
+            "\n  model: {}   ({TRIES} tries per cell; right-tool hits)\n",
+            cfg.model
+        );
         for (phrase, want) in hard {
             print!("  {phrase:<32}");
             for t in temps {
                 let mut hits = 0;
                 for _ in 0..TRIES {
-                    if let Some(c) = llm.choose_tool_at(phrase, &specs, &[], None, t).await.expect("ollama").into_iter().next() {
+                    if let Some(c) = llm
+                        .choose_tool_at(phrase, &specs, &[], None, t)
+                        .await
+                        .expect("ollama")
+                        .into_iter()
+                        .next()
+                    {
                         if c.name == want {
                             hits += 1;
                         }
@@ -1161,9 +1481,18 @@ mod tests {
         let profile = aircraft::builtin(&cfg.aircraft).unwrap();
         let registry = Registry::for_aircraft(&profile);
         let specs = registry.specs();
-        let ctx = ToolCtx { xplane: &xplane, config: &cfg, voice: None, status: None, reminders: None };
+        let ctx = ToolCtx {
+            xplane: &xplane,
+            config: &cfg,
+            voice: None,
+            status: None,
+            reminders: None,
+        };
 
-        println!("\n  model: {} | aircraft: {}\n", cfg.model, profile.display_name);
+        println!(
+            "\n  model: {} | aircraft: {}\n",
+            cfg.model, profile.display_name
+        );
 
         // (utterance, substring the readback should contain)
         let commands = [

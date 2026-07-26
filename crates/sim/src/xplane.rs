@@ -52,7 +52,8 @@ where
 /// aircraft reloads — so a cached handle stops resolving until we drop it.
 fn is_not_found(err: &anyhow::Error) -> bool {
     err.chain().any(|e| {
-        e.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status)
+        e.downcast_ref::<reqwest::Error>()
+            .and_then(reqwest::Error::status)
             == Some(reqwest::StatusCode::NOT_FOUND)
     })
 }
@@ -158,7 +159,9 @@ impl XPlaneClient {
                 .query(&[("filter[name]", name)])
                 .send()
                 .await
-                .with_context(|| format!("GET {url} (is X-Plane running with the Web API enabled?)"))?
+                .with_context(|| {
+                    format!("GET {url} (is X-Plane running with the Web API enabled?)")
+                })?
                 .error_for_status()?
                 .json()
                 .await
@@ -532,7 +535,13 @@ impl FakeXPlane {
 
     /// The most recent value written to `name`, if any.
     pub fn last_write(&self, name: &str) -> Option<f64> {
-        self.writes.lock().unwrap().iter().rev().find(|(n, _)| n == name).map(|(_, v)| *v)
+        self.writes
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| *v)
     }
 
     /// Whether `name` was ever written.
@@ -547,7 +556,11 @@ impl FakeXPlane {
 
     /// Index of the first time `command` ran, for ordering assertions.
     pub fn command_index(&self, command: &str) -> Option<usize> {
-        self.commands.lock().unwrap().iter().position(|c| c == command)
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|c| c == command)
     }
 }
 
@@ -566,7 +579,10 @@ impl XPlane for FakeXPlane {
         Ok(())
     }
     async fn set_int(&self, name: &str, value: i64) -> Result<()> {
-        self.writes.lock().unwrap().push((name.to_string(), value as f64));
+        self.writes
+            .lock()
+            .unwrap()
+            .push((name.to_string(), value as f64));
         Ok(())
     }
     async fn run_command(&self, name: &str) -> Result<()> {
@@ -581,7 +597,10 @@ impl XPlane for FakeXPlane {
         Ok(Vec::new())
     }
     async fn set_int_array_elem(&self, name: &str, _index: usize, value: i64) -> Result<()> {
-        self.writes.lock().unwrap().push((name.to_string(), value as f64));
+        self.writes
+            .lock()
+            .unwrap()
+            .push((name.to_string(), value as f64));
         Ok(())
     }
     async fn set_float_array_elem(&self, name: &str, _index: usize, value: f64) -> Result<()> {

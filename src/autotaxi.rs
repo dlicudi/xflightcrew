@@ -41,11 +41,11 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::station::TaxiWatch;
 use crate::taxi_guide;
 use crate::tools::speedhold;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
-use crate::station::TaxiWatch;
 
 pub(crate) const LAT: &str = "sim/flightmodel/position/latitude";
 pub(crate) const LON: &str = "sim/flightmodel/position/longitude";
@@ -114,7 +114,9 @@ pub static LAST_ARRIVED: AtomicBool = AtomicBool::new(false);
 
 /// One-line status for the dashboard's "managing" panel.
 pub fn status() -> Option<String> {
-    ACTIVE.load(Ordering::Relaxed).then(|| "auto taxi".to_string())
+    ACTIVE
+        .load(Ordering::Relaxed)
+        .then(|| "auto taxi".to_string())
 }
 
 /// The cleared route, pre-digested into the local flat-earth frame the
@@ -143,8 +145,11 @@ impl Route {
             return None;
         }
         let geo = taxi_guide::Geo::new(watch.path[0].0);
-        let pts: Vec<(f64, f64)> =
-            watch.path.iter().map(|&p| geo.to_m(watch.path[0], p)).collect();
+        let pts: Vec<(f64, f64)> = watch
+            .path
+            .iter()
+            .map(|&p| geo.to_m(watch.path[0], p))
+            .collect();
         let mut cum = vec![0.0_f64];
         for w in pts.windows(2) {
             cum.push(cum.last().unwrap() + taxi_guide::dist(w[0], w[1]));
@@ -157,14 +162,10 @@ impl Route {
         }
         let mut bends: Vec<(f64, f64)> = Vec::new();
         for i in 1..pts.len() - 1 {
-            let b_in = taxi_guide::bearing(
-                taxi_guide::point_at(&pts, &cum, cum[i] - WINDOW_M),
-                pts[i],
-            );
-            let b_out = taxi_guide::bearing(
-                pts[i],
-                taxi_guide::point_at(&pts, &cum, cum[i] + WINDOW_M),
-            );
+            let b_in =
+                taxi_guide::bearing(taxi_guide::point_at(&pts, &cum, cum[i] - WINDOW_M), pts[i]);
+            let b_out =
+                taxi_guide::bearing(pts[i], taxi_guide::point_at(&pts, &cum, cum[i] + WINDOW_M));
             let delta = taxi_guide::angle_diff(b_out, b_in).abs();
             if delta >= TURN_DEG {
                 bends.push((cum[i], delta));
@@ -217,8 +218,16 @@ impl Route {
         self.bends
             .iter()
             .filter(|(at, _)| progress < at + 15.0 && at - progress < lead)
-            .map(|&(_, deg)| if deg >= SHARP_DEG { SHARP_KTS } else { TURN_KTS })
-            .fold(None, |acc: Option<f64>, cap| Some(acc.map_or(cap, |a| a.min(cap))))
+            .map(|&(_, deg)| {
+                if deg >= SHARP_DEG {
+                    SHARP_KTS
+                } else {
+                    TURN_KTS
+                }
+            })
+            .fold(None, |acc: Option<f64>, cap| {
+                Some(acc.map_or(cap, |a| a.min(cap)))
+            })
     }
 }
 
@@ -361,7 +370,12 @@ pub fn line_up_stops_m(
 /// runway. `None` (use the diagonal fallback) when the heading is within ~15
 /// degrees of the runway (no clean crossing), points away from the centreline,
 /// crosses behind the threshold, or would run implausibly far.
-fn roll_forward_entry_m(course_deg: f64, a0: f64, x0: f64, heading_deg: Option<f64>) -> Option<f64> {
+fn roll_forward_entry_m(
+    course_deg: f64,
+    a0: f64,
+    x0: f64,
+    heading_deg: Option<f64>,
+) -> Option<f64> {
     let psi = heading_deg?;
     let rel = ((psi - course_deg + 540.0).rem_euclid(360.0) - 180.0).to_radians();
     let s = rel.sin();
@@ -421,7 +435,12 @@ pub fn line_up_path_from_lead_on(
     // pursuit can actually follow (it chorded the raw corner, probed
     // 2026-07-24).
     let mut path = vec![(lat, lon)];
-    path.extend(lead_on.iter().copied().filter(|p| dist_m((lat, lon), *p) > 5.0));
+    path.extend(
+        lead_on
+            .iter()
+            .copied()
+            .filter(|p| dist_m((lat, lon), *p) > 5.0),
+    );
     let stop = project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, stop_m / M_PER_NM);
     let corner = path.pop()?; // the junction (or the aircraft itself — refused below)
     if path.is_empty() {
@@ -436,13 +455,15 @@ pub fn line_up_path_from_lead_on(
 /// starts `r_m` back along the inbound leg, ends `r_m` down the outbound leg,
 /// bulging toward the corner — the painted lead-on curve the taxi networks
 /// don't model. Radii clamp to half of each leg so short legs stay sane.
-fn fillet_corner(prev: (f64, f64), corner: (f64, f64), next: (f64, f64), r_m: f64) -> Vec<(f64, f64)> {
-    let seg = |a: (f64, f64), b: (f64, f64), t: f64| {
-        (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
-    };
-    let len = |a: (f64, f64), b: (f64, f64)| {
-        crate::autoland::haversine_nm(a.0, a.1, b.0, b.1) * M_PER_NM
-    };
+fn fillet_corner(
+    prev: (f64, f64),
+    corner: (f64, f64),
+    next: (f64, f64),
+    r_m: f64,
+) -> Vec<(f64, f64)> {
+    let seg = |a: (f64, f64), b: (f64, f64), t: f64| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+    let len =
+        |a: (f64, f64), b: (f64, f64)| crate::autoland::haversine_nm(a.0, a.1, b.0, b.1) * M_PER_NM;
     let l_in = len(prev, corner);
     let l_out = len(corner, next);
     if l_in < 1.0 || l_out < 1.0 {
@@ -450,7 +471,7 @@ fn fillet_corner(prev: (f64, f64), corner: (f64, f64), next: (f64, f64), r_m: f6
     }
     let a = seg(corner, prev, (r_m.min(l_in * 0.5)) / l_in); // arc entry, on the inbound leg
     let b = seg(corner, next, (r_m.min(l_out * 0.5)) / l_out); // arc exit, on the outbound leg
-    // Quadratic Bezier a -> corner(control) -> b, sampled.
+                                                               // Quadratic Bezier a -> corner(control) -> b, sampled.
     let bez = |t: f64| {
         let u = 1.0 - t;
         (
@@ -511,7 +532,12 @@ pub fn backtrack_pocket_path(
         rwy.course_deg - 90.0
     };
     let mid = c(BACKTRACK_TURN_START_M / 2.0);
-    let pocket = project_latlon(mid.0, mid.1, pocket_bearing, BACKTRACK_POCKET_OFFSET_M / M_PER_NM);
+    let pocket = project_latlon(
+        mid.0,
+        mid.1,
+        pocket_bearing,
+        BACKTRACK_POCKET_OFFSET_M / M_PER_NM,
+    );
     Some(vec![(lat, lon), entry, turn_start, pocket])
 }
 
@@ -568,8 +594,8 @@ pub fn pick_line_up_plan(
         // departures (backtracking 3 km of active runway is not the move).
         const DEEP_INTERSECTION_M: f64 = 200.0;
         const FULL_LENGTH_MATTERS_M: f64 = 2500.0;
-        let deep_intersection = stop_m.is_some_and(|s| s > DEEP_INTERSECTION_M)
-            && r.length_m <= FULL_LENGTH_MATTERS_M;
+        let deep_intersection =
+            stop_m.is_some_and(|s| s > DEEP_INTERSECTION_M) && r.length_m <= FULL_LENGTH_MATTERS_M;
         let wants_backtrack = force_backtrack
             || ahead.is_none_or(|a| a < needed_m)
             || plain.is_none()
@@ -608,7 +634,9 @@ pub fn pick_line_up(
                 continue;
             }
         }
-        let Some(path) = line_up_path(r, lat, lon, heading_deg) else { continue };
+        let Some(path) = line_up_path(r, lat, lon, heading_deg) else {
+            continue;
+        };
         if best.as_ref().is_none_or(|(_, _, d)| r.dist_nm < *d) {
             best = Some((r.clone(), path, r.dist_nm));
         }
@@ -661,7 +689,10 @@ pub fn start(base_url: String, voice: Option<Voice>, route: Route, base_kts: f64
     }
     LAST_ARRIVED.store(false, Ordering::Relaxed);
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             ACTIVE.store(false, Ordering::Relaxed);
             return;
         };
@@ -684,7 +715,10 @@ pub fn start_backtrack(
 ) {
     start(base_url.clone(), voice.clone(), route, base_kts);
     std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             return;
         };
         rt.block_on(async move {
@@ -798,7 +832,10 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // runaway that got that far), touch nothing.
         if !speedhold::taxi_hold_active() {
             let on_ground = xp.get_float(ON_GROUND).await.unwrap_or(0.0) > 0.5;
-            tracing::info!(on_ground, "auto taxi: taxi hold gone, arresting and releasing");
+            tracing::info!(
+                on_ground,
+                "auto taxi: taxi hold gone, arresting and releasing"
+            );
             if on_ground {
                 let _ = xp.set_float(THROTTLE, 0.0).await;
                 if xp
@@ -814,7 +851,11 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
                     "I've lost the speed hold. Throttle's idle. Your aircraft.",
                 );
             } else {
-                alert(&voice, Priority::Caution, "I've lost the speed hold. Your aircraft.");
+                alert(
+                    &voice,
+                    Priority::Caution,
+                    "I've lost the speed hold. Your aircraft.",
+                );
             }
             crate::blackbox::record(
                 "autotaxi",
@@ -924,7 +965,10 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             } else if route.holding_point.is_empty() {
                 "Holding point. Holding position, brakes set.".to_string()
             } else {
-                format!("Holding point {}. Holding position, brakes set.", route.holding_point)
+                format!(
+                    "Holding point {}. Holding position, brakes set.",
+                    route.holding_point
+                )
             };
             alert(&voice, Priority::Advisory, &line);
             ACTIVE.store(false, Ordering::Relaxed);
@@ -1048,7 +1092,10 @@ mod tests {
     /// Lat/lon from meters east/north of the origin — the inverse of
     /// [`Geo::to_m`], so routes read like a taxi diagram.
     fn ll(x_m: f64, y_m: f64) -> (f64, f64) {
-        (LAT0 + y_m / 111_320.0, LON0 + x_m / (111_320.0 * LAT0.to_radians().cos()))
+        (
+            LAT0 + y_m / 111_320.0,
+            LON0 + x_m / (111_320.0 * LAT0.to_radians().cos()),
+        )
     }
 
     /// East 200 m, left turn north, 300 m to the holding point — the guide's
@@ -1097,7 +1144,10 @@ mod tests {
     #[test]
     fn steering_is_proportional_and_bounded() {
         assert_eq!(steer_cmd(0.0), 0.0);
-        assert!(steer_cmd(10.0) > 0.0 && steer_cmd(10.0) < 1.0, "right of course, steer right");
+        assert!(
+            steer_cmd(10.0) > 0.0 && steer_cmd(10.0) < 1.0,
+            "right of course, steer right"
+        );
         assert!(steer_cmd(-10.0) < 0.0);
         assert_eq!(steer_cmd(90.0), 1.0, "full deflection is the cap");
         assert_eq!(steer_cmd(-170.0), -1.0);
@@ -1134,7 +1184,10 @@ mod tests {
         let (lat, lon) = ll(190.0, 0.0);
         let (progress, _) = r.fix(lat, lon).expect("fix");
         let err = r.heading_err_deg(lat, lon, 90.0, progress, lookahead_m(10.0));
-        assert!(err < -10.0, "aim point should pull left into the turn, got {err}");
+        assert!(
+            err < -10.0,
+            "aim point should pull left into the turn, got {err}"
+        );
     }
 
     #[test]
@@ -1160,7 +1213,10 @@ mod tests {
     fn stop_ramp_is_gentle_and_finishes() {
         assert_eq!(stop_ramp_kts(0.0), 0.0);
         assert_eq!(stop_ramp_kts(0.4), 0.0, "inside half a meter is stopped");
-        assert!(stop_ramp_kts(1.0) >= 2.0, "creep floor carries the last meters");
+        assert!(
+            stop_ramp_kts(1.0) >= 2.0,
+            "creep floor carries the last meters"
+        );
         let (near, far) = (stop_ramp_kts(10.0), stop_ramp_kts(40.0));
         assert!(near < far, "closer is slower: {near} vs {far}");
         assert!(far < 13.0, "40 m out needs no takeoff-roll pace: {far}");
@@ -1188,7 +1244,10 @@ mod tests {
     fn steering_authority_tapers_with_speed_so_a_standstill_breaks_away() {
         assert!(steer_authority(0.0) < 0.4, "parked lock must stay partial");
         assert!(steer_authority(0.0) > 0.2, "but enough to actually turn");
-        assert!(steer_authority(1.5) > steer_authority(0.5), "authority builds with the roll");
+        assert!(
+            steer_authority(1.5) > steer_authority(0.5),
+            "authority builds with the roll"
+        );
         assert_eq!(steer_authority(3.0), 1.0, "full lock once rolling");
         assert_eq!(steer_authority(20.0), 1.0);
     }
@@ -1202,9 +1261,20 @@ mod tests {
         let (progress, lateral) = r.fix(lat, lon).expect("fix");
         let err = r.heading_err_deg(lat, lon, 270.0, progress, lookahead_m(3.0));
         assert!(err.abs() > 150.0, "backwards means a big error, got {err}");
-        assert_eq!(steer_cmd(err).abs(), 1.0, "turn-around wants full deflection");
-        assert!(join_allowance_m(lateral, err) > 0.0, "wrong-facing start must join");
-        assert_eq!(join_cap_kts(err), SHARP_KTS, "turn-arounds happen at the sharp pace");
+        assert_eq!(
+            steer_cmd(err).abs(),
+            1.0,
+            "turn-around wants full deflection"
+        );
+        assert!(
+            join_allowance_m(lateral, err) > 0.0,
+            "wrong-facing start must join"
+        );
+        assert_eq!(
+            join_cap_kts(err),
+            SHARP_KTS,
+            "turn-arounds happen at the sharp pace"
+        );
     }
 
     #[test]
@@ -1218,7 +1288,10 @@ mod tests {
         let err = r.heading_err_deg(lat, lon, 90.0, progress, lookahead_m(5.0));
         assert!(err > 20.0, "must aim back at the route, got {err}");
         let allow = join_allowance_m(lateral, err);
-        assert!(allow >= lateral + JOIN_GROW_M - 1.0, "guard covers the engage distance: {allow}");
+        assert!(
+            allow >= lateral + JOIN_GROW_M - 1.0,
+            "guard covers the engage distance: {allow}"
+        );
     }
 
     #[test]
@@ -1230,7 +1303,10 @@ mod tests {
         assert!(join_allowance_m(2.0, 170.0) > OFF_ROUTE_STOP_M);
         // Captured only when close AND aligned.
         assert!(join_done(5.0, 10.0));
-        assert!(!join_done(5.0, 90.0), "close but still turning is not joined");
+        assert!(
+            !join_done(5.0, 90.0),
+            "close but still turning is not joined"
+        );
         assert!(!join_done(20.0, 10.0), "aligned but wide is not joined");
         // Aligned rejoins ride at bend speed, not the sharp crawl.
         assert_eq!(join_cap_kts(20.0), TURN_KTS);
@@ -1254,21 +1330,37 @@ mod tests {
         // A 2,000 m runway taking off due north from (0,0); hold-short spot
         // 40 m EAST of the centreline, abeam the numbers.
         let rwy = Runway {
-            icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
-            course_deg: 0.0, length_m: 2000.0, surface: 1, dist_nm: 0.02, elev_ft: 0.0,
+            icao: "TEST".into(),
+            id: "36".into(),
+            thr_lat: 0.0,
+            thr_lon: 0.0,
+            course_deg: 0.0,
+            length_m: 2000.0,
+            surface: 1,
+            dist_nm: 0.02,
+            elev_ft: 0.0,
         };
         let (hlat, hlon) = crate::autoland::project_latlon(0.0, 0.0, 90.0, 40.0 / 1852.0);
         let path = line_up_path(&rwy, hlat, hlon, None).expect("feasible");
         assert_eq!(path.len(), 3);
         // The entry point is ON the centreline, ahead of abeam.
         let (elat, elon) = path[1];
-        assert!((cross_track_nm(elat, elon, &rwy) * 1852.0).abs() < 2.0, "entry on centreline");
+        assert!(
+            (cross_track_nm(elat, elon, &rwy) * 1852.0).abs() < 2.0,
+            "entry on centreline"
+        );
         let entry_past = -along_track_nm(elat, elon, &rwy) * 1852.0;
-        assert!(entry_past > 20.0 && entry_past < 120.0, "ahead of abeam: {entry_past}");
+        assert!(
+            entry_past > 20.0 && entry_past < 120.0,
+            "ahead of abeam: {entry_past}"
+        );
         // The stop point is further down, still leaving plenty of runway.
         let (blat, blon) = path[2];
         let stop_past = -along_track_nm(blat, blon, &rwy) * 1852.0;
-        assert!(stop_past > entry_past + 40.0, "finishes aligned: {stop_past}");
+        assert!(
+            stop_past > entry_past + 40.0,
+            "finishes aligned: {stop_past}"
+        );
         // Too far off the strip is not a line-up.
         let (flat, flon) = crate::autoland::project_latlon(0.0, 0.0, 90.0, 300.0 / 1852.0);
         assert!(line_up_path(&rwy, flat, flon, None).is_none());
@@ -1284,8 +1376,15 @@ mod tests {
         // Runway 36 (course 0, due north) from (0,0). Hold-short 40 m EAST of
         // the centreline, abeam the numbers.
         let rwy = Runway {
-            icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
-            course_deg: 0.0, length_m: 2000.0, surface: 1, dist_nm: 0.02, elev_ft: 0.0,
+            icao: "TEST".into(),
+            id: "36".into(),
+            thr_lat: 0.0,
+            thr_lon: 0.0,
+            course_deg: 0.0,
+            length_m: 2000.0,
+            surface: 1,
+            dist_nm: 0.02,
+            elev_ft: 0.0,
         };
         let (hlat, hlon) = crate::autoland::project_latlon(0.0, 0.0, 90.0, 40.0 / 1852.0);
         // Nose pointed due WEST — straight at the runway. Leg one should follow
@@ -1295,7 +1394,10 @@ mod tests {
         let brg = bearing_deg(path[0].0, path[0].1, path[1].0, path[1].1);
         let off = ((brg - 270.0 + 540.0).rem_euclid(360.0) - 180.0).abs();
         assert!(off < 12.0, "leg one follows the nose (270), got {brg}");
-        assert!((cross_track_nm(path[1].0, path[1].1, &rwy) * 1852.0).abs() < 3.0, "entry on centreline");
+        assert!(
+            (cross_track_nm(path[1].0, path[1].1, &rwy) * 1852.0).abs() < 3.0,
+            "entry on centreline"
+        );
 
         // Nose nearly aligned with the runway (5 degrees): no clean forward
         // crossing, so it falls back to the diagonal swing — clearly off the
@@ -1303,7 +1405,10 @@ mod tests {
         let path2 = line_up_path(&rwy, hlat, hlon, Some(5.0)).expect("feasible");
         let brg2 = bearing_deg(path2[0].0, path2[0].1, path2[1].0, path2[1].1);
         let off2 = ((brg2 - 5.0 + 540.0).rem_euclid(360.0) - 180.0).abs();
-        assert!(off2 > 20.0, "near-aligned nose falls back to the diagonal, got {brg2}");
+        assert!(
+            off2 > 20.0,
+            "near-aligned nose falls back to the diagonal, got {brg2}"
+        );
     }
 
     /// Real-install probe: what does the LXGB planner actually hand the
@@ -1313,12 +1418,22 @@ mod tests {
     #[test]
     #[ignore]
     fn live_lxgb_line_up_lead_on() {
-        let apt = "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
-        let net = crate::nav::find_taxi_net(apt, "LXGB").unwrap().expect("LXGB network");
+        let apt =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let net = crate::nav::find_taxi_net(apt, "LXGB")
+            .unwrap()
+            .expect("LXGB network");
         let zones: Vec<String> = vec!["27".into(), "09".into()];
         // Apron, mid-field north side -> the 27 end.
         let plan = net
-            .plan(36.1535, -5.3495, 36.1515, -5.3412, crate::nav::HOLD_SHORT_STANDOFF_M, &zones)
+            .plan(
+                36.1535,
+                -5.3495,
+                36.1515,
+                -5.3412,
+                crate::nav::HOLD_SHORT_STANDOFF_M,
+                &zones,
+            )
             .expect("a route");
         println!("holding_point: {} via {:?}", plan.holding_point, plan.via);
         let m = |p: (f64, f64)| {
@@ -1334,11 +1449,23 @@ mod tests {
         for p in &plan.lead_on {
             println!("  {:?}", m(*p));
         }
-        assert!(!plan.lead_on.is_empty(), "zone-trimmed route must keep its lead-on");
+        assert!(
+            !plan.lead_on.is_empty(),
+            "zone-trimmed route must keep its lead-on"
+        );
         // Now the picker, from the route's actual end (where the taxi stops).
         let &(hlat, hlon) = plan.path.last().unwrap();
         let cands = crate::autoland::nearby_runways(apt, hlat, hlon, 1.0).unwrap();
-        let picked = pick_line_up_plan(&cands, hlat, hlon, Some("27"), 400.0, false, None, Some(&plan.lead_on));
+        let picked = pick_line_up_plan(
+            &cands,
+            hlat,
+            hlon,
+            Some("27"),
+            400.0,
+            false,
+            None,
+            Some(&plan.lead_on),
+        );
         let (rwy, lp) = picked.expect("a line-up plan");
         println!("picked runway {}", rwy.id);
         match lp {
@@ -1347,7 +1474,11 @@ mod tests {
                 for q in &p {
                     println!("  {:?}", m(*q));
                 }
-                assert!(p.len() > 3, "authored points present, not a 3-point diagonal: {}", p.len());
+                assert!(
+                    p.len() > 3,
+                    "authored points present, not a 3-point diagonal: {}",
+                    p.len()
+                );
             }
             LineUpPlan::Backtrack(_) => println!("backtrack picked"),
         }
@@ -1358,8 +1489,15 @@ mod tests {
         use crate::autoland::{project_latlon, Runway};
         // Runway 36 from (0,0); hold 40 m east of the centreline, abeam 100 m.
         let rwy = Runway {
-            icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
-            course_deg: 0.0, length_m: 2000.0, surface: 1, dist_nm: 0.02, elev_ft: 0.0,
+            icao: "TEST".into(),
+            id: "36".into(),
+            thr_lat: 0.0,
+            thr_lon: 0.0,
+            course_deg: 0.0,
+            length_m: 2000.0,
+            surface: 1,
+            dist_nm: 0.02,
+            elev_ft: 0.0,
         };
         let at = |a_m: f64, x_m: f64| {
             let (la, lo) = project_latlon(0.0, 0.0, 0.0, a_m / 1852.0);
@@ -1368,22 +1506,37 @@ mod tests {
         let (hlat, hlon) = at(100.0, 40.0);
         // The authored yellow line: from the hold, curving onto the centreline
         // at 160 m past the threshold (two intermediate points shape the curve).
-        let lead_on = vec![at(105.0, 38.0), at(125.0, 25.0), at(150.0, 8.0), at(160.0, 0.0)];
+        let lead_on = vec![
+            at(105.0, 38.0),
+            at(125.0, 25.0),
+            at(150.0, 8.0),
+            at(160.0, 0.0),
+        ];
         let (path, stop) =
             line_up_path_from_lead_on(&rwy, hlat, hlon, &lead_on).expect("drives the lead-on");
         // The authored points lead the drive path in order; the sharp junction
         // corner is replaced by a sampled fillet arc, then the stop continues
         // down the centreline.
-        assert!(path.len() >= 8, "aircraft + authored + arc + stop: {}", path.len());
+        assert!(
+            path.len() >= 8,
+            "aircraft + authored + arc + stop: {}",
+            path.len()
+        );
         assert_eq!(path[1], lead_on[0]);
         assert_eq!(path[2], lead_on[1]);
         assert_eq!(path[3], lead_on[2]);
-        assert!((stop - 240.0).abs() < 1.0, "junction 160 + align 80: {stop}");
+        assert!(
+            (stop - 240.0).abs() < 1.0,
+            "junction 160 + align 80: {stop}"
+        );
         // The arc stays between the two legs: every sampled point is on the
         // hold side of the centreline and short of the stop.
         for p in &path[4..path.len() - 1] {
             let x = crate::autoland::cross_track_nm(p.0, p.1, &rwy) * 1852.0;
-            assert!((-1.0..=40.0).contains(&x), "arc point off the corner: x={x}");
+            assert!(
+                (-1.0..=40.0).contains(&x),
+                "arc point off the corner: x={x}"
+            );
         }
         // A lead-on from ANOTHER stub (300 m away) is refused — never drive
         // someone else's painted line.
@@ -1395,9 +1548,17 @@ mod tests {
         // And the picker prefers it over the synthetic diagonal for the same
         // runway.
         let cands = vec![rwy.clone()];
-        let (r, plan) =
-            pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, false, Some(270.0), Some(&lead_on))
-                .expect("picked");
+        let (r, plan) = pick_line_up_plan(
+            &cands,
+            hlat,
+            hlon,
+            Some("36"),
+            400.0,
+            false,
+            Some(270.0),
+            Some(&lead_on),
+        )
+        .expect("picked");
         assert_eq!(r.id, "36");
         match plan {
             LineUpPlan::Plain(p) => assert_eq!(p[1], lead_on[0], "authored path won"),
@@ -1409,8 +1570,15 @@ mod tests {
     fn line_up_pick_honors_the_cleared_runway() {
         use crate::autoland::Runway;
         let mk = |id: &str, course: f64, thr: (f64, f64), dist: f64| Runway {
-            icao: "TEST".into(), id: id.into(), thr_lat: thr.0, thr_lon: thr.1,
-            course_deg: course, length_m: 2000.0, surface: 1, dist_nm: dist, elev_ft: 0.0,
+            icao: "TEST".into(),
+            id: id.into(),
+            thr_lat: thr.0,
+            thr_lon: thr.1,
+            course_deg: course,
+            length_m: 2000.0,
+            surface: 1,
+            dist_nm: dist,
+            elev_ft: 0.0,
         };
         // Both ends of one strip: 36 at the near threshold, 18 at the far.
         let far = crate::autoland::project_latlon(0.0, 0.0, 0.0, 2000.0 / 1852.0);
@@ -1420,7 +1588,13 @@ mod tests {
         let (r, _) = pick_line_up(&cands, hlat, hlon, None, None).expect("pick");
         assert_eq!(r.id, "36");
         // The tower cleared 36: same answer, crosschecked.
-        assert_eq!(pick_line_up(&cands, hlat, hlon, Some("36"), None).unwrap().0.id, "36");
+        assert_eq!(
+            pick_line_up(&cands, hlat, hlon, Some("36"), None)
+                .unwrap()
+                .0
+                .id,
+            "36"
+        );
         // The tower cleared 18 and we're at the 36 end: nothing safe to
         // drive onto — the far end is a taxi clearance, not a line-up.
         assert!(pick_line_up(&cands, hlat, hlon, Some("18"), None).is_none());
@@ -1433,8 +1607,15 @@ mod tests {
         // (holding point Charlie left 580 m ahead for a 09 departure,
         // 2026-07-22). Runway 36 from (0,0) for test geometry.
         let rwy = Runway {
-            icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
-            course_deg: 0.0, length_m: 1712.0, surface: 1, dist_nm: 0.6, elev_ft: 0.0,
+            icao: "TEST".into(),
+            id: "36".into(),
+            thr_lat: 0.0,
+            thr_lon: 0.0,
+            course_deg: 0.0,
+            length_m: 1712.0,
+            surface: 1,
+            dist_nm: 0.6,
+            elev_ft: 0.0,
         };
         let mid = crate::autoland::project_latlon(0.0, 0.0, 0.0, 1170.0 / 1852.0);
         let (hlat, hlon) = crate::autoland::project_latlon(mid.0, mid.1, 90.0, 40.0 / 1852.0);
@@ -1442,16 +1623,30 @@ mod tests {
         // The route heads TOWARD the threshold: each point's along-track
         // shrinks, and the pocket ends up beside the numbers, off the
         // centreline (turning room, never a pivot).
-        let along: Vec<f64> =
-            path.iter().map(|&(a, b)| -along_track_nm(a, b, &rwy) * 1852.0).collect();
-        assert!(along.windows(2).all(|w| w[1] < w[0] + 1.0), "monotonic toward the numbers: {along:?}");
+        let along: Vec<f64> = path
+            .iter()
+            .map(|&(a, b)| -along_track_nm(a, b, &rwy) * 1852.0)
+            .collect();
+        assert!(
+            along.windows(2).all(|w| w[1] < w[0] + 1.0),
+            "monotonic toward the numbers: {along:?}"
+        );
         let (plat, plon) = *path.last().unwrap();
         let pocket_along = -along_track_nm(plat, plon, &rwy) * 1852.0;
         let pocket_off = (cross_track_nm(plat, plon, &rwy) * 1852.0).abs();
-        assert!(pocket_along < 60.0, "pocket beside the numbers: {pocket_along}");
-        assert!(pocket_off > 8.0 && pocket_off < 20.0, "turning room: {pocket_off}");
+        assert!(
+            pocket_along < 60.0,
+            "pocket beside the numbers: {pocket_along}"
+        );
+        assert!(
+            pocket_off > 8.0 && pocket_off < 20.0,
+            "turning room: {pocket_off}"
+        );
         // A line-up FROM the pocket is feasible — that's leg two, the 180.
-        assert!(line_up_path(&rwy, plat, plon, None).is_some(), "leg two must exist");
+        assert!(
+            line_up_path(&rwy, plat, plon, None).is_some(),
+            "leg two must exist"
+        );
         // Near the numbers already: no backtrack, the plain line-up owns it.
         let near = crate::autoland::project_latlon(0.0, 0.0, 0.0, 60.0 / 1852.0);
         let (nlat, nlon) = crate::autoland::project_latlon(near.0, near.1, 90.0, 40.0 / 1852.0);
@@ -1462,8 +1657,15 @@ mod tests {
     fn line_up_plan_backtracks_to_the_numbers_from_a_deep_intersection() {
         use crate::autoland::Runway;
         let rwy = Runway {
-            icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
-            course_deg: 0.0, length_m: 1712.0, surface: 1, dist_nm: 0.6, elev_ft: 0.0,
+            icao: "TEST".into(),
+            id: "36".into(),
+            thr_lat: 0.0,
+            thr_lon: 0.0,
+            course_deg: 0.0,
+            length_m: 1712.0,
+            surface: 1,
+            dist_nm: 0.6,
+            elev_ft: 0.0,
         };
         let cands = vec![rwy];
         // 1,170 m down the strip: a deep intersection on a short field. The

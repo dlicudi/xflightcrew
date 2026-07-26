@@ -18,7 +18,9 @@ pub enum StationSpeaker {
     /// A GHOST pilot on the party line — live traffic given a voice. The
     /// seed (hash of its callsign) picks a stable person from the pool, so
     /// Speedbird 306 sounds like the same pilot on every call.
-    Ghost { seed: usize },
+    Ghost {
+        seed: usize,
+    },
 }
 
 impl StationSpeaker {
