@@ -473,9 +473,13 @@ fn authored_circuit(
         AuthoredWpt { a_m: 0.0, x_m: side * w * 1.3, alt_msl_ft: tpa_msl_ft },
         AuthoredWpt { a_m: -dn, x_m: side * w * 1.3, alt_msl_ft: tpa_msl_ft },
         // Base back over the water, descending to the handoff height.
-        AuthoredWpt { a_m: -dn * 1.15, x_m: side * w * 0.6, alt_msl_ft: handoff },
-        // Rejoin the centreline on short final — autoland takes it here.
-        AuthoredWpt { a_m: -dn * 0.5, x_m: 0.0, alt_msl_ft: handoff },
+        AuthoredWpt { a_m: -dn * 1.2, x_m: side * w * 0.6, alt_msl_ft: handoff },
+        // Rejoin the centreline and hand to autoland on a NORMAL final: ~2 nm
+        // out (`-dn`, not `-dn * 0.5`), so the handoff height sits on a ~3°
+        // glidepath, not a 6.5° dive autoland can't capture. Handing off at 1 nm
+        // / 700 ft looped the LXGB approach into a permanent go-around
+        // (2026-07-26).
+        AuthoredWpt { a_m: -dn, x_m: 0.0, alt_msl_ft: handoff },
     ])
 }
 
