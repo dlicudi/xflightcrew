@@ -169,11 +169,18 @@ impl Tool for AutoTaxi {
             route,
             base,
         );
-        let hp = crate::station::spoken_taxiway(&watch.holding_point);
-        let dest = if hp.is_empty() {
-            "the holding point".to_string()
+        // An arrival route ends at a parking stand, not a holding point — call
+        // it by the right name (the tower cleared us "to stand ...").
+        let dest = if party_line::taxi_to_stand() {
+            let s = crate::station::spoken_stand(&watch.holding_point);
+            if s.is_empty() { "parking".to_string() } else { s }
         } else {
-            format!("holding point {hp}")
+            let hp = crate::station::spoken_taxiway(&watch.holding_point);
+            if hp.is_empty() {
+                "the holding point".to_string()
+            } else {
+                format!("holding point {hp}")
+            }
         };
         Ok(if joining {
             format!(
@@ -390,5 +397,61 @@ impl Tool for LineUp {
         Ok(format!(
             "Lining us up, runway {spoken}. Your pedals or my controls take it back any time."
         ))
+    }
+}
+
+/// `taxi_to_parking` — the copilot requests the taxi-in from ATC and drives the
+/// aircraft to the nearest stand after landing. The arrival mirror of the
+/// departure taxi: [`AutoTaxi`] drives an already-cleared route, this ASKS for
+/// it first, then drives it (see [`crate::taxi_in`]).
+pub struct TaxiToParking {
+    pub park_brake_valve_set: Option<f64>,
+    /// Constant-speed prop levers, so a turboprop unfeathers before the taxi.
+    pub prop: Option<PropProfile>,
+}
+
+#[async_trait]
+impl Tool for TaxiToParking {
+    fn name(&self) -> &str {
+        "taxi_to_parking"
+    }
+
+    fn description(&self) -> &str {
+        "The copilot taxis the aircraft to PARKING after landing: it requests \
+         the taxi-in clearance from the tower, then drives the cleared route to \
+         the nearest stand. Use when the pilot asks the copilot to taxi in or \
+         park: 'taxi to parking', 'take us to the stand', 'park us', 'park the \
+         aircraft', 'taxi to the gate', 'taxi to the ramp'. (A DEPARTURE 'taxi \
+         for me' to the holding point is auto_taxi, not this.)"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if autotaxi::ACTIVE.load(Relaxed) {
+            return Ok("I'm already taxiing us.".to_string());
+        }
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::IS_IN_REPLAY)
+            .await
+            .is_ok_and(|v| v > 0.5)
+        {
+            return Ok("We're in replay. Go back to live and ask again.".to_string());
+        }
+        if ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) < 0.5 {
+            return Ok("We're airborne. Land first, then I'll taxi us in.".to_string());
+        }
+        crate::taxi_in::start(
+            ctx.config.xplane_base_url.clone(),
+            ctx.config.clone(),
+            ctx.voice.cloned(),
+            self.park_brake_valve_set,
+            self.prop.clone(),
+        );
+        Ok("Taxiing to parking — getting the clearance.".to_string())
     }
 }

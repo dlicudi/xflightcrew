@@ -38,6 +38,7 @@ mod simbrief;
 mod stt;
 mod stt_eval;
 mod taxi_guide;
+mod taxi_in;
 mod tts;
 #[cfg(feature = "onnx-tts")]
 mod tts_onnx;

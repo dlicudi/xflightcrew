@@ -345,6 +345,12 @@ impl Registry {
                     .map(|f| f * 0.3048),
                 prop: profile.prop.clone(),
             }));
+            // Taxi to PARKING after landing — requests the taxi-in from ATC and
+            // drives the cleared stand route.
+            tools.push(Box::new(taxi::TaxiToParking {
+                park_brake_valve_set: profile.park_brake_valve_set,
+                prop: profile.prop.clone(),
+            }));
         }
 
         // Airliner autoflight extras: AP speed select + autothrottle.

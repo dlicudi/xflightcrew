@@ -226,20 +226,45 @@ impl Guide {
                 });
             }
         }
-        let hp = spoken_taxiway(&watch.holding_point);
+        // An arrival route ends at a parking stand — the guide calls it a stand,
+        // not a holding point (the tower cleared us "to stand ..."). Departure
+        // (and every synthetic-route test) reads the flag as false.
+        let (line, short) = if crate::party_line::taxi_to_stand() {
+            let s = crate::station::spoken_stand(&watch.holding_point);
+            let mut c = s.chars();
+            let spoken = c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect());
+            (
+                if spoken.is_empty() {
+                    "Parking ahead. That's us.".into()
+                } else {
+                    format!("{spoken} ahead. That's us.")
+                },
+                if watch.holding_point.is_empty() {
+                    "parking".into()
+                } else {
+                    format!("stand {}", watch.holding_point)
+                },
+            )
+        } else {
+            let hp = spoken_taxiway(&watch.holding_point);
+            (
+                if hp.is_empty() {
+                    "Holding point ahead. That's us.".into()
+                } else {
+                    format!("Holding point {hp} ahead. That's us.")
+                },
+                if watch.holding_point.is_empty() {
+                    "holding point".into()
+                } else {
+                    format!("hold {}", watch.holding_point)
+                },
+            )
+        };
         cues.push(Cue {
             at_m: total,
             kind: CueKind::HoldingPoint,
-            line: if hp.is_empty() {
-                "Holding point ahead. That's us.".into()
-            } else {
-                format!("Holding point {hp} ahead. That's us.")
-            },
-            short: if watch.holding_point.is_empty() {
-                "holding point".into()
-            } else {
-                format!("hold {}", watch.holding_point)
-            },
+            line,
+            short,
             dir: None,
             sharp: false,
         });

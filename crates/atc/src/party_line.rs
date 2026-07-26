@@ -33,6 +33,12 @@ pub(crate) static CLEARANCE: Mutex<Option<ClearanceSnap>> = Mutex::new(None);
 /// (world) and the progressive taxi guide (crew).
 pub(crate) static TAXI_ROUTE: Mutex<Option<TaxiWatch>> = Mutex::new(None);
 
+/// Whether the current [`TAXI_ROUTE`] is an ARRIVAL route to a parking stand
+/// (vs a departure to a holding point) — set alongside the route so the crew
+/// phrases "stand ..." instead of "holding point ...". Kept parallel rather
+/// than a `TaxiWatch` field to avoid churning every construction of it.
+pub(crate) static TAXI_TO_STAND: Mutex<bool> = Mutex::new(false);
+
 /// A takeoff clearance withheld for landing traffic — armed by the reply
 /// path, released by the monitor once the final has stayed clear.
 pub(crate) static TAKEOFF_HOLD: Mutex<Option<TakeoffHold>> = Mutex::new(None);
@@ -93,6 +99,12 @@ pub fn clearance_runway() -> Option<String> {
 /// can never be held across an await.
 pub fn with_taxi_route<R>(f: impl FnOnce(Option<&TaxiWatch>) -> R) -> R {
     f(lock(&TAXI_ROUTE).as_ref())
+}
+
+/// True when the cleared taxi route is an ARRIVAL to a parking stand — the crew
+/// calls the destination a "stand", not a "holding point".
+pub fn taxi_to_stand() -> bool {
+    *lock(&TAXI_TO_STAND)
 }
 
 /// A takeoff clearance is currently being withheld for traffic.

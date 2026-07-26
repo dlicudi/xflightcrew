@@ -826,6 +826,28 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     {
         return Some(call("line_up", json!({ "backtrack": true })));
     }
+    // Taxi to PARKING after landing — the copilot requests the taxi-in from ATC
+    // and drives to the nearest stand. BEFORE auto_taxi (which is the departure
+    // taxi to a holding point). Generic/request-shaped forms only: a specific
+    // "taxi to stand 12 via ..." is a taxi READBACK to the tower, not a request
+    // to the copilot (the same trap auto_taxi dodges).
+    if t.contains("taxi to parking")
+        || t.contains("taxi to the stand")
+        || t.contains("taxi to the gate")
+        || t.contains("taxi to the ramp")
+        || t.contains("taxi to the apron")
+        || t.contains("taxi us in")
+        || t == "taxi in"
+        || t.contains("take us to parking")
+        || t.contains("take us to the stand")
+        || t.contains("take us to the gate")
+        || t.contains("take us to the ramp")
+        || t.contains("park us")
+        || t.contains("park the aircraft")
+        || t.contains("park the plane")
+    {
+        return Some(call("taxi_to_parking", json!({})));
+    }
     // Auto taxi — the copilot steers the cleared route to the holding point.
     // Before every speed-hold rule, so "taxi for me at 12 knots" doesn't fall
     // into plain hold_speed. Deliberately NOT matching "taxi to holding point
@@ -1933,6 +1955,15 @@ mod tests {
         assert_eq!(one("take us to holding point").unwrap().0, "auto_taxi");
         assert_eq!(one("tax you for me").unwrap().0, "auto_taxi");
         assert_eq!(one("okay taxi foamy").unwrap().0, "auto_taxi");
+        // Taxi to PARKING (arrival) — distinct from the departure auto_taxi.
+        assert_eq!(one("taxi to parking").unwrap(), ("taxi_to_parking".into(), json!({})));
+        assert_eq!(one("take us to the stand").unwrap().0, "taxi_to_parking");
+        assert_eq!(one("taxi to the gate").unwrap().0, "taxi_to_parking");
+        assert_eq!(one("park us").unwrap().0, "taxi_to_parking");
+        assert_eq!(one("park the aircraft").unwrap().0, "taxi_to_parking");
+        assert_eq!(one("taxi us in").unwrap().0, "taxi_to_parking");
+        // ...but the departure taxi to a holding point is still auto_taxi.
+        assert_eq!(one("taxi for me").unwrap().0, "auto_taxi");
         // Auto takeoff — first/second-person shapes only.
         assert_eq!(one("take off for me").unwrap(), ("auto_takeoff".into(), json!({})));
         assert_eq!(one("you have the takeoff").unwrap().0, "auto_takeoff");

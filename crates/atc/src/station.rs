@@ -23,7 +23,7 @@ use sim::datarefs;
 // `party_line`'s accessors, never these statics.
 pub(crate) use crate::party_line::{
     CLEARANCE, LANDING_HANDOFF, PENDING_GO_AROUND, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE,
-    TAKEOFF_HOLD, TAXI_ROUTE, VECTORS,
+    TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS,
 };
 
 /// Which of the station's frequencies COM1 is tuned to.
@@ -581,6 +581,7 @@ impl Station {
                     holding_point: r.holding_point.clone(),
                     lead_on: r.lead_on.clone(),
                 });
+            *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
         }
         // The arrival taxi-in publishes its stand route the same way, so the
         // crew's auto_taxi drives it to parking. `was` is the pre-transition
@@ -598,6 +599,7 @@ impl Station {
                     holding_point: r.holding_point.clone(),
                     lead_on: r.lead_on.clone(),
                 });
+            *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = true;
         }
         // A takeoff request answered with anything SHORT of the clearance —
         // hold position (traffic, wake, occupied strip), a conditional or
@@ -3364,7 +3366,8 @@ fn plan_taxi_route_to_stand(
 
 /// Speak a parking-stand name: spell digit runs ("Stand 12" -> "stand one
 /// two"), lowercase the rest. Plain and unambiguous, like real ground phrasing.
-fn spoken_stand(name: &str) -> String {
+/// `pub` so the crew's auto-taxi calls the destination by the same name.
+pub fn spoken_stand(name: &str) -> String {
     name.split_whitespace()
         .map(|w| {
             if !w.is_empty() && w.chars().all(|c| c.is_ascii_digit()) {
