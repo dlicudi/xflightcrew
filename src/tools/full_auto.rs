@@ -38,6 +38,9 @@ pub struct FullAuto {
     // taxi / line-up
     pub park_brake_valve_set: Option<f64>,
     pub takeoff_roll_m: Option<f64>,
+    /// Flap-handle ratio set for takeoff and retracted climbing out (profile's
+    /// `flaps.takeoff_ratio`); `None` leaves the flaps alone.
+    pub takeoff_flap_ratio: Option<f64>,
     /// Constant-speed prop levers, threaded into every ground-roll sub-tool so
     /// they unfeather before taxi/line-up/takeoff. `None` on the pistons.
     pub prop: Option<crate::aircraft::PropProfile>,
@@ -155,6 +158,7 @@ impl Tool for FullAuto {
                 vy_kts: self.vy_kts,
                 climb_fpm: self.climb_fpm,
                 retract_gear: self.retract_gear,
+                takeoff_flap_ratio: self.takeoff_flap_ratio,
                 takeoff_roll_m: self.takeoff_roll_m,
                 approach_ias: self.approach_ias,
                 prop: self.prop.clone(),
@@ -165,6 +169,7 @@ impl Tool for FullAuto {
                 vy_kts: self.vy_kts,
                 climb_fpm: self.climb_fpm,
                 retract_gear: self.retract_gear,
+                takeoff_flap_ratio: self.takeoff_flap_ratio,
                 takeoff_roll_m: self.takeoff_roll_m,
                 prop: self.prop.clone(),
             },

@@ -23,6 +23,7 @@ pub struct Circuit {
     pub vy_kts: f64,
     pub climb_fpm: f64,
     pub retract_gear: bool,
+    pub takeoff_flap_ratio: Option<f64>,
     pub takeoff_roll_m: Option<f64>,
     /// Approach speed handed to autoland on final (KIAS).
     pub approach_ias: f64,
@@ -175,6 +176,7 @@ impl Tool for Circuit {
                     vy_kts: self.vy_kts,
                     climb_fpm: self.climb_fpm,
                     retract_gear: self.retract_gear,
+                    takeoff_flap_ratio: self.takeoff_flap_ratio,
                     cleared_runway: party_line::clearance_runway(),
                     needed_m: self.takeoff_roll_m.map_or(500.0, |m| m * 1.4),
                     // Hand off low so the circuit turns crosswind while still

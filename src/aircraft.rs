@@ -561,6 +561,11 @@ fn advisor_expect_on_default() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlapProfile {
     pub detents: Vec<FlapDetent>,
+    /// The flap-handle ratio set for takeoff (0.0 = clean). `None` means the
+    /// auto-takeoff leaves the flaps where they are. 0.0 on a clean-takeoff type
+    /// (the 172) still matters — it ensures the config before the roll.
+    #[serde(default)]
+    pub takeoff_ratio: Option<f64>,
 }
 
 /// One flap handle position.
@@ -1318,6 +1323,7 @@ fn cessna_172sp() -> AircraftProfile {
                 detent("20", "twenty degrees", 2.0 / 3.0, Some(85.0)),
                 detent("full", "full", 1.0, Some(85.0)),
             ],
+            takeoff_ratio: Some(0.0), // 172 takes off clean
         }),
         fuel: Some(FuelProfile {
             reserve_caution_min: 45.0,
@@ -1624,6 +1630,7 @@ fn cirrus_sr22() -> AircraftProfile {
                 detent("50", "fifty percent", 0.5, Some(150.0)),
                 detent("full", "full", 1.0, Some(110.0)),
             ],
+            takeoff_ratio: None,
         }),
         // SR22 ~92 gal usable, ~17 gal/hr cruise (~46 kg/hr). Verify.
         fuel: Some(FuelProfile {

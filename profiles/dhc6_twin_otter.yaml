@@ -173,6 +173,7 @@ reference:
 # follows flap1_deploy_ratio for animation). Modeled detents 0/10/20/30/40
 # degrees; Vfe 105 KIAS for the first notch (acf_Vfe1), 95 beyond (acf_Vfem).
 flaps:
+  takeoff_ratio: 0.25   # 10 degrees — the Twin Otter's STOL takeoff flap
   detents:
     - { label: up,   spoken: up,             ratio: 0.0 }
     - { label: "10", spoken: ten degrees,    ratio: 0.25, vfe_kts: 105.0 }

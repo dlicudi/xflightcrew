@@ -48,7 +48,11 @@ const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
+const FLAP_HANDLE: &str = "sim/cockpit2/controls/flap_ratio";
 const XPDR_MODE: &str = "sim/cockpit2/radios/actuators/transponder_mode"; // 0 off,1 stby,2 on,3 alt
+/// Clean up the takeoff flaps this high AGL, once safely above Vy — a
+/// conservative "positive climb, gear up, then flaps" point.
+const FLAP_RETRACT_AGL_FT: f64 = 400.0;
 const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
@@ -221,6 +225,9 @@ pub struct Params {
     /// Ceiling on the commanded climb, fpm.
     pub climb_fpm: f64,
     pub retract_gear: bool,
+    /// Flap-handle ratio to set for takeoff, retracted once safely climbing.
+    /// `None` leaves the flaps as the pilot left them.
+    pub takeoff_flap_ratio: Option<f64>,
     /// The runway END the tower cleared ("09R"), for the line-up crosscheck.
     /// `None` when no ATC is running or no runway is on the clearance.
     pub cleared_runway: Option<String>,
@@ -617,6 +624,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     )
     .await;
 
+    // Takeoff flaps from the profile, set before speed builds. 0.0 on a
+    // clean-takeoff type still runs, guaranteeing the config off the gate.
+    if let Some(ratio) = p.takeoff_flap_ratio {
+        let _ = xp.set_float(FLAP_HANDLE, ratio).await;
+    }
+    // Nothing to retract if we took off clean (<= a whisker of flap).
+    let mut flaps_retracted = p.takeoff_flap_ratio.unwrap_or(0.0) <= 0.01;
+
     let mut airborne = false;
     let mut rotated = false;
     let mut ap_engaged = false;
@@ -884,6 +899,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             gear_raised = true;
             let _ = xp.set_float(GEAR_HANDLE, 0.0).await;
             alert(&voice, Priority::Advisory, "Gear up.");
+        }
+        // Clean up the takeoff flaps once safely climbing above Vy — after the
+        // gear, the way a crew does it.
+        if !flaps_retracted && agl_ft > FLAP_RETRACT_AGL_FT && ias > p.vy_kts {
+            flaps_retracted = true;
+            let _ = xp.set_float(FLAP_HANDLE, 0.0).await;
+            alert(&voice, Priority::Advisory, "Flaps up.");
         }
         if !ap_engaged {
             if agl_ft < AP_ENGAGE_AGL_FT {

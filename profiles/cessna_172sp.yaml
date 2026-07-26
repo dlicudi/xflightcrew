@@ -163,6 +163,7 @@ advisor:
 
 # Flap detents, retracted → full. Vfe is the max IAS (kts) to extend to each.
 flaps:
+  takeoff_ratio: 0.0   # the 172 takes off clean (flaps up)
   detents:
     - { label: up,   spoken: up,             ratio: 0.0 }
     - { label: "10", spoken: ten degrees,    ratio: 0.3333, vfe_kts: 110.0 }

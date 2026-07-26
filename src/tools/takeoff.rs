@@ -26,6 +26,9 @@ pub struct AutoTakeoff {
     pub vy_kts: f64,
     pub climb_fpm: f64,
     pub retract_gear: bool,
+    /// Flap-handle ratio set for takeoff and retracted climbing out (from the
+    /// profile's `flaps.takeoff_ratio`); `None` leaves the flaps alone.
+    pub takeoff_flap_ratio: Option<f64>,
     /// POH takeoff ground roll, meters, when the profile knows it.
     pub takeoff_roll_m: Option<f64>,
     /// Constant-speed prop levers, advanced to full-forward before the roll.
@@ -175,6 +178,7 @@ impl Tool for AutoTakeoff {
                 vy_kts: self.vy_kts,
                 climb_fpm: self.climb_fpm,
                 retract_gear: self.retract_gear,
+                takeoff_flap_ratio: self.takeoff_flap_ratio,
                 cleared_runway: party_line::clearance_runway(),
                 needed_m: self.takeoff_roll_m.map_or(500.0, |m| m * 1.4),
                 handoff_agl_ft: autotakeoff::DEFAULT_HANDOFF_AGL_FT,

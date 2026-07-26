@@ -249,6 +249,7 @@ impl Registry {
                 vy_kts: vy,
                 climb_fpm: climb,
                 retract_gear: profile.retractable_gear,
+                takeoff_flap_ratio: profile.flaps.as_ref().and_then(|f| f.takeoff_ratio),
                 takeoff_roll_m,
                 prop: profile.prop.clone(),
             }));
@@ -261,6 +262,7 @@ impl Registry {
                 vy_kts: vy,
                 climb_fpm: climb,
                 retract_gear: profile.retractable_gear,
+                takeoff_flap_ratio: profile.flaps.as_ref().and_then(|f| f.takeoff_ratio),
                 takeoff_roll_m,
                 approach_ias,
                 prop: profile.prop.clone(),
@@ -284,6 +286,7 @@ impl Registry {
                     bus_power_on_cmds: bus_power_on_cmds(&profile.electrical),
                     park_brake_valve_set: profile.park_brake_valve_set,
                     takeoff_roll_m,
+                    takeoff_flap_ratio: profile.flaps.as_ref().and_then(|f| f.takeoff_ratio),
                     prop: profile.prop.clone(),
                     turboprop_start: profile.turboprop_start.clone(),
                     all_electrical_on_cmds: all_electrical_on_cmds(&profile.electrical),
