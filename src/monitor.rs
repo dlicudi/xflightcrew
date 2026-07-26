@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::aircraft::AircraftProfile;
 use crate::config::Config;
-use crate::plugin_status::{AlertLevel, StatusSink};
+use crate::plugin_status::StatusSink;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -537,16 +537,11 @@ impl FireState {
             || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
             || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
         if !flying && self.sustained(min_duration, now) && self.should_speak(sev, now) {
-            // Mirror the callout to the in-sim panel (monitor speaks via Voice,
-            // which otherwise bypasses the panel's Reporter), coloured by severity.
-            if let Some(s) = status {
-                let level = match sev {
-                    Severity::Advisory => AlertLevel::Advisory,
-                    Severity::Caution => AlertLevel::Caution,
-                    Severity::Warning => AlertLevel::Warning,
-                };
-                s.alert(level, &msg);
-            }
+            // Mirror OR action, never both: `voice.alert` below already posts the
+            // spoken line to the panel transcript, so a separate `s.alert` here
+            // wrote every callout twice (a coloured line AND a green one). The
+            // one door all callouts pass through — the whole class was doubling.
+            let _ = status;
             // Black box: the callout is part of the flight record (the LEAL–LEMD
             // CFIT forensics had to be reconstructed without them), and it's what
             // the post-flight distiller counts.

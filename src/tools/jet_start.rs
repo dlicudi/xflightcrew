@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx};
-use crate::plugin_status::{AlertLevel, StatusSink};
+use crate::plugin_status::StatusSink;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -68,9 +68,8 @@ impl Tool for StartEngines {
 }
 
 fn say(voice: &Option<Voice>, status: &Option<StatusSink>, line: &str) {
-    if let Some(s) = status {
-        s.alert(AlertLevel::Advisory, line);
-    }
+    // Mirror OR action, never both: v.alert already posts to the panel.
+    let _ = status;
     if let Some(v) = voice {
         v.alert(Priority::Advisory, line.to_string());
     }

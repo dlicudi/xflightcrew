@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolCtx};
-use crate::plugin_status::{AlertLevel, StatusSink};
+use crate::plugin_status::StatusSink;
 use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
@@ -61,9 +61,9 @@ impl Tool for PowerUp {
 }
 
 fn say(voice: &Option<Voice>, status: &Option<StatusSink>, line: &str) {
-    if let Some(s) = status {
-        s.alert(AlertLevel::Advisory, line);
-    }
+    // Mirror OR action, never both: v.alert already posts the line to the panel
+    // transcript, so a separate s.alert here double-wrote it.
+    let _ = status;
     if let Some(v) = voice {
         v.alert(Priority::Advisory, line.to_string());
     }

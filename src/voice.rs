@@ -825,7 +825,7 @@ impl Voice {
             return;
         }
         let text = text.into();
-        self.mirror_to_panel(&text);
+        self.mirror_to_panel(priority, &text);
         self.enqueue(priority, text, None, false);
     }
 
@@ -834,11 +834,18 @@ impl Voice {
         *self.inner.status.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
     }
 
-    /// Mirror a spoken line onto the panel's action/transcript field. Cheap and
-    /// non-blocking; a no-op when the sink isn't wired.
-    fn mirror_to_panel(&self, text: &str) {
+    /// Mirror a spoken line onto the panel transcript — the ONE place a spoken
+    /// line reaches the panel, so callers must NOT also post it (that was the
+    /// duplicate-text bug). Advisory rides the green action slot (the crew's
+    /// own voice); caution/warning use the coloured alert slot so the chip keeps
+    /// its amber/red salience. Cheap, non-blocking, a no-op when unwired.
+    fn mirror_to_panel(&self, priority: Priority, text: &str) {
         if let Some(s) = self.inner.status.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            s.action(text);
+            match priority {
+                Priority::Caution => s.alert(crate::plugin_status::AlertLevel::Caution, text),
+                Priority::Warning => s.alert(crate::plugin_status::AlertLevel::Warning, text),
+                Priority::Advisory | Priority::Readback => s.action(text),
+            }
         }
     }
 

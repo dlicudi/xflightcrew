@@ -818,16 +818,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // terrain. Validated against the live terrain probe first; if any waypoint
     // isn't clear (a wrong hand-authored point, an off-nominal start), fall
     // back to the standard pattern rather than fly it into a hill.
-    // PARKED: the authored around-the-Rock waypoint loop flew the wrong shape in
-    // the sim (a ~3.7 km excursion, tight loops) and can't be tuned blind. The
-    // circuit flies the proven parametric rectangle instead, forced to the sea
-    // side by `sea_side_is_left` above — a normal south-of-the-field pattern over
-    // the water at LXGB, never north into Spain. Flip to `false &&` to re-enable
-    // once the waypoints are set from real map positions.
-    let use_authored = false;
-    if let Some(route) = authored_circuit(&rwy, &geom, field_elev_ft, tpa_msl_ft, left)
-        .filter(|_| use_authored)
-    {
+    // The authored around-the-Rock loop, once the sea-side fix pointed it the
+    // right way (clockwise on 09), flew a clean circuit south around the Rock and
+    // handed to autoland — confirmed in the sim (2026-07-26). It runs whenever
+    // it's available and terrain-clear.
+    if let Some(route) = authored_circuit(&rwy, &geom, field_elev_ft, tpa_msl_ft, left) {
         if authored_route_clears_terrain(&xp, &rwy, &route).await {
             crate::blackbox::record(
                 "circuit",
