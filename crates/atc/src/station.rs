@@ -1626,6 +1626,15 @@ pub fn compliance_tick(
                 return Some(ComplianceCall { line, crew: false });
             }
         }
+        // A cleared ARRIVAL taxi-in to a stand authorises being on the runway
+        // just landed on and following the published route to parking — the
+        // taxi-in sets the FSM to `Parked` (not `TaxiCleared`) and ends the
+        // vacate grace early, so without this the berate fired ~2 min after
+        // "taxi to stand" at a crew still clearing the landing runway on its own
+        // cleared route. It's the arrival mirror of the departure `TaxiCleared`
+        // exemption below; off-route deviations are still caught by the
+        // route-deviation check above.
+        let arrival_taxi = *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner());
         // On the active runway without any clearance to be there: not rolling
         // (a takeoff/landing roll is covered above), not vacating after a
         // legal landing, and the state says holding-point at best. Repeats on
@@ -1649,8 +1658,10 @@ pub fn compliance_tick(
                 // is LEGAL: silence while it keeps moving, and a stopped
                 // crossing earns "expedite" — never the berate (the tower
                 // shouted "you are on runway two seven without clearance" at
-                // a pilot following its own route, 2026-07-14).
-                if *state == tower::State::TaxiCleared && on_cleared_runway_crossing(lat, lon) {
+                // a pilot following its own route, 2026-07-14). Holds for a
+                // DEPARTURE (state TaxiCleared) and an ARRIVAL taxi-in alike.
+                let cleared_taxi = *state == tower::State::TaxiCleared || arrival_taxi;
+                if cleared_taxi && on_cleared_runway_crossing(lat, lon) {
                     if gs_kts < 3.0 {
                         w.last_call = Some(now);
                         let rwy = atis::spoken_runway(&rwy);
@@ -1668,6 +1679,13 @@ pub fn compliance_tick(
                             }
                         });
                     }
+                    return None;
+                }
+                // An arrival vacating the runway it just landed on is NOT on a
+                // route "crossing" (the runway is the start of the taxi-in, not a
+                // leg to cross), so the check above misses it — but vacating under
+                // a taxi-in clearance can never be an incursion. Stay silent.
+                if arrival_taxi {
                     return None;
                 }
                 w.last_call = Some(now);
@@ -4747,6 +4765,10 @@ mod tests {
         }];
         *CLEARANCE.lock().unwrap() = None;
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        // No arrival taxi-in in play — this test's occupancy berate depends on it
+        // (a prior test could leave the shared flag set).
+        *TAXI_TO_STAND.lock().unwrap() = false;
+        *TAXI_ROUTE.lock().unwrap() = None;
         let t0 = Instant::now();
         let sec = std::time::Duration::from_secs;
 
@@ -4832,6 +4854,61 @@ mod tests {
 
         *ACTIVE_FIELD.lock().unwrap() = None;
         *ACTIVE_PANEL.lock().unwrap() = None;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+        *CLEARANCE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    }
+
+    #[test]
+    fn arrival_taxi_in_is_not_a_runway_incursion() {
+        // The live fault (2026-07-27): after landing and getting a taxi-in
+        // clearance to the stand, the tower shouted "on runway without clearance"
+        // a couple of minutes later. The taxi-in sets the FSM to `Parked` (not
+        // `TaxiCleared`) and ends the vacate grace early, so a crew still clearing
+        // the landing runway on its own cleared route got berated. A live arrival
+        // taxi-in authorises vacating the runway.
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.1512, -5.3554));
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+            width_m: 0.0,
+            ident_a: "09".into(),
+            ident_b: "27".into(),
+            lat_a: 36.1512,
+            lon_a: -5.3554,
+            lat_b: 36.1517,
+            lon_b: -5.3366,
+        }];
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        *TAXI_ROUTE.lock().unwrap() = None;
+        // Down, cleared to taxi to the stand: FSM Parked, still physically on 27.
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::Parked,
+            callsign: "November one seven two Sierra Papa".into(),
+            runway_ident: "27".into(),
+            pending_readback: None,
+        });
+        let t0 = Instant::now();
+        let sec = std::time::Duration::from_secs;
+
+        // WITH the arrival taxi-in flag: vacating the landing runway is legal,
+        // well past the 120 s vacate grace — no berate.
+        *TAXI_TO_STAND.lock().unwrap() = true;
+        assert!(
+            compliance_tick(36.15155, -5.342, 20.0, true, 0.0, true, t0 + sec(200)).is_none(),
+            "a cleared arrival taxi-in must not be berated for vacating the runway"
+        );
+
+        // Control: drop the flag (a bare Parked state) and the SAME position IS
+        // an incursion — proving the exemption, not the geometry, silenced it.
+        *TAXI_TO_STAND.lock().unwrap() = false;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        let call = compliance_tick(36.15155, -5.342, 20.0, true, 0.0, true, t0 + sec(400))
+            .expect("occupancy berate without the taxi-in flag");
+        assert!(call.line.contains("without clearance"), "{}", call.line);
+
+        // Clean up the shared world for the next test.
+        *TAXI_TO_STAND.lock().unwrap() = false;
+        *ACTIVE_FIELD.lock().unwrap() = None;
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
         *CLEARANCE.lock().unwrap() = None;
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
