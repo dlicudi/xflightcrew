@@ -27,6 +27,14 @@ pub struct FullAuto {
     /// DC-bus power-on commands (battery + master) for airframes whose stock
     /// battery dataref is overwritten by a custom switch sync (the Twin Otter).
     pub bus_power_on_cmds: Vec<String>,
+    /// The turboprop start sequence, when the airframe is a turboprop — full
+    /// auto cranks a PT6 with this instead of the piston start (which never
+    /// catches on a turbine).
+    pub turboprop_start: Option<crate::aircraft::TurbineStartProfile>,
+    /// EVERY electrical system's ON command — the full bring-up run after the
+    /// engine catches (generators AND bleed air, which feed the Twin Otter's
+    /// autopilot). Empty on airframes with no electrical profile.
+    pub all_electrical_on_cmds: Vec<String>,
     // taxi / line-up
     pub park_brake_valve_set: Option<f64>,
     pub takeoff_roll_m: Option<f64>,
@@ -115,11 +123,18 @@ impl Tool for FullAuto {
         };
 
         let sub = crate::full_auto::SubTools {
-            start_engine: crate::tools::engine::StartEngine {
-                fuel_selector: self.fuel_selector.clone(),
-                alternator_on_cmds: self.alternator_on_cmds.clone(),
-                bus_power_on_cmds: self.bus_power_on_cmds.clone(),
+            // A turboprop cranks with the PT6 start; everything else with the
+            // piston start. Both run behind full auto's own bus-power step.
+            start_engine: match &self.turboprop_start {
+                Some(ts) => Box::new(crate::tools::cycle::StartTurbines::new(ts.clone())),
+                None => Box::new(crate::tools::engine::StartEngine {
+                    fuel_selector: self.fuel_selector.clone(),
+                    alternator_on_cmds: self.alternator_on_cmds.clone(),
+                    bus_power_on_cmds: self.bus_power_on_cmds.clone(),
+                }),
             },
+            bus_power_on_cmds: self.bus_power_on_cmds.clone(),
+            all_electrical_on_cmds: self.all_electrical_on_cmds.clone(),
             taxi: crate::tools::taxi::AutoTaxi {
                 park_brake_valve_set: self.park_brake_valve_set,
                 prop: self.prop.clone(),

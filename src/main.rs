@@ -478,9 +478,9 @@ async fn main() -> Result<()> {
                                     let name = p.display_name.clone();
                                     tracing::info!(icao = %icao, profile = %id, "aircraft changed; switching profile");
                                     live.swap(p);
-                                    if let Some(s) = det_status.as_ref() {
-                                        s.alert(plugin_status::AlertLevel::Advisory, &format!("Now set up for the {name}."));
-                                    }
+                                    // Mirror OR action, never both: voice.alert already
+                                    // posts the spoken line to the panel transcript, so a
+                                    // separate s.alert here double-wrote it (blue + green).
                                     det_voice.alert(voice::Priority::Advisory, format!("Now set up for the {name}."));
                                 }
                             }

@@ -79,7 +79,19 @@ pub struct Route {
 /// The tested sub-tools the orchestrator invokes, built from the profile by the
 /// arming tool (power-up is stateless, constructed inline).
 pub struct SubTools {
-    pub start_engine: crate::tools::engine::StartEngine,
+    /// The engine-start tool for THIS airframe — the piston `StartEngine` or, on
+    /// a turboprop, the PT6 `StartTurbines` (condition levers + fire-once
+    /// starter). Piston-cranking a turboprop never catches, so the Twin Otter's
+    /// full-auto start failed until this became per-airframe (2026-07-26).
+    pub start_engine: Box<dyn crate::tools::Tool>,
+    /// Battery + DC-master commands to power the bus BEFORE the start — the
+    /// turboprop start only checks volts, it doesn't switch the battery on, and
+    /// the Twin Otter's battery is a custom command a stock write can't set.
+    pub bus_power_on_cmds: Vec<String>,
+    /// EVERY electrical system's ON command — fired AFTER the engine catches so
+    /// the generators and bleed air (which feed the Twin Otter's autopilot) come
+    /// on, not just the cranking bus.
+    pub all_electrical_on_cmds: Vec<String>,
     pub taxi: crate::tools::taxi::AutoTaxi,
     pub line_up: crate::tools::taxi::LineUp,
     pub circuit: crate::tools::circuit::Circuit,
@@ -193,6 +205,20 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             bail_if_abort!();
         }
 
+        // Power the DC bus the way THIS airframe does it before cranking: the
+        // turboprop start only checks volts, and the Twin Otter's battery is a
+        // custom command the stock write can't set — so a cold start read 0 V
+        // and never turned a blade (2026-07-26). No-op for pistons (empty).
+        if !tools.bus_power_on_cmds.is_empty() {
+            announce(&voice, Priority::Advisory, "Battery on.");
+            for cmd in &tools.bus_power_on_cmds {
+                let _ = xp.run_command(cmd).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            event("bus_power", json!({ "cmds": tools.bus_power_on_cmds.len() }));
+            bail_if_abort!();
+        }
+
         announce(&voice, Priority::Advisory, "Starting the engine.");
         match tools.start_engine.execute(&json!({}), &ctx).await {
             Ok(reply) => announce(&voice, Priority::Advisory, &reply),
@@ -204,6 +230,19 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             return;
         }
         event("engine_running", json!({}));
+
+        // Complete the electrical now the engine's turning: generators AND
+        // bleed air on. On the Twin Otter the bleeds feed the autopilot and
+        // anti-ice, so a circuit flown without them has no servos. Skipped when
+        // PowerUp already ran the bus (jets), and a no-op on airframes with no
+        // electrical profile. Battery/master re-fire harmlessly.
+        if !tools.power_up_first && !tools.all_electrical_on_cmds.is_empty() {
+            for cmd in &tools.all_electrical_on_cmds {
+                let _ = xp.run_command(cmd).await;
+            }
+            announce(&voice, Priority::Advisory, "Electrical set. Generators and bleeds on.");
+            event("electrical_set", json!({ "cmds": tools.all_electrical_on_cmds.len() }));
+        }
     }
     bail_if_abort!();
 

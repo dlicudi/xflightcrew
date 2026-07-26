@@ -554,8 +554,21 @@ pub fn pick_line_up_plan(
             ),
         };
         let ahead = stop_m.map(|s| r.length_m - s);
-        let wants_backtrack =
-            force_backtrack || ahead.is_none_or(|a| a < needed_m) || plain.is_none();
+        // Use the FULL length for a departure: if the line-up entry sits well
+        // past the numbers (a deep intersection like LXGB's Charlie, which
+        // enters the middle of 09) on a short/medium runway, backtrack to the
+        // threshold rather than accept the reduced length — even when the roll
+        // would fit. A departure lines up at the START of the runway; the pilot
+        // shouldn't have to ask (2026-07-26). Long runways keep intersection
+        // departures (backtracking 3 km of active runway is not the move).
+        const DEEP_INTERSECTION_M: f64 = 200.0;
+        const FULL_LENGTH_MATTERS_M: f64 = 2500.0;
+        let deep_intersection = stop_m.is_some_and(|s| s > DEEP_INTERSECTION_M)
+            && r.length_m <= FULL_LENGTH_MATTERS_M;
+        let wants_backtrack = force_backtrack
+            || ahead.is_none_or(|a| a < needed_m)
+            || plain.is_none()
+            || deep_intersection;
         let plan = if wants_backtrack {
             match backtrack_pocket_path(r, lat, lon) {
                 Some(p) => Some(LineUpPlan::Backtrack(p)),
@@ -1441,20 +1454,22 @@ mod tests {
     }
 
     #[test]
-    fn line_up_plan_backtracks_only_when_short() {
+    fn line_up_plan_backtracks_to_the_numbers_from_a_deep_intersection() {
         use crate::autoland::Runway;
         let rwy = Runway {
             icao: "TEST".into(), id: "36".into(), thr_lat: 0.0, thr_lon: 0.0,
             course_deg: 0.0, length_m: 1712.0, surface: 1, dist_nm: 0.6, elev_ft: 0.0,
         };
         let cands = vec![rwy];
-        // 1,170 m down the strip: a plain line-up leaves ~460 m — enough for
-        // a 172 (needs 400), a backtrack for an SR22 (needs 700).
+        // 1,170 m down the strip: a deep intersection on a short field. The
+        // plain line-up would leave ~460 m — enough for a 172's roll — but a
+        // departure uses the FULL length, so we backtrack to the numbers even
+        // when it fits (the LXGB Charlie case the pilot kept flagging).
         let mid = crate::autoland::project_latlon(0.0, 0.0, 0.0, 1170.0 / 1852.0);
         let (hlat, hlon) = crate::autoland::project_latlon(mid.0, mid.1, 90.0, 40.0 / 1852.0);
         assert!(matches!(
             pick_line_up_plan(&cands, hlat, hlon, Some("36"), 400.0, false, None, None),
-            Some((_, LineUpPlan::Plain(_)))
+            Some((_, LineUpPlan::Backtrack(_)))
         ));
         assert!(matches!(
             pick_line_up_plan(&cands, hlat, hlon, Some("36"), 700.0, false, None, None),

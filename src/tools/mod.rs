@@ -281,6 +281,8 @@ impl Registry {
                     park_brake_valve_set: profile.park_brake_valve_set,
                     takeoff_roll_m,
                     prop: profile.prop.clone(),
+                    turboprop_start: profile.turboprop_start.clone(),
+                    all_electrical_on_cmds: all_electrical_on_cmds(&profile.electrical),
                     cfg: ap,
                     vr_kts: vr,
                     vy_kts: vy,
@@ -559,6 +561,25 @@ pub fn bus_power_on_cmds(systems: &[crate::aircraft::ElectricalSystem]) -> Vec<S
                 if !cmds.contains(c) {
                     cmds.push(c.clone());
                 }
+            }
+        }
+    }
+    cmds
+}
+
+/// EVERY electrical system's ON command, in profile order, deduped — the full
+/// bring-up full auto runs AFTER the engine catches so the aircraft is properly
+/// powered for the flight, not just cranked. On the Twin Otter this is what
+/// finally switches the generators AND the BLEED AIR on — and the bleeds feed
+/// the autopilot and anti-ice, so a circuit flown without them is a circuit
+/// with no servos. Empty on airframes with no electrical profile (the 172,
+/// which powers its own bus at start). Battery/master re-fire harmlessly.
+pub fn all_electrical_on_cmds(systems: &[crate::aircraft::ElectricalSystem]) -> Vec<String> {
+    let mut cmds: Vec<String> = Vec::new();
+    for s in systems {
+        for c in &s.on_commands {
+            if !cmds.contains(c) {
+                cmds.push(c.clone());
             }
         }
     }
