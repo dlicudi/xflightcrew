@@ -428,6 +428,25 @@ pub fn run_autoland(
                 // guidance turns back to the FAP immediately, which is a killer
                 // at 50 ft (see [`GoAroundLatch`]).
                 let ga = go_around.update(last_phase, raw.phase, radio_ft);
+                // Runaway backstop: an approach that keeps missing (arrives too
+                // fast/high to ever capture) would loop go-arounds forever,
+                // accelerating toward Vne. After MAX_GO_AROUNDS, stop trying:
+                // level the wings, throttle to a safe climb, and give the
+                // aircraft back — a real crew would divert, not keep diving at
+                // a runway they can't make (LXGB Twin Otter, 2026-07-26).
+                if go_around.attempts() > MAX_GO_AROUNDS {
+                    let _ = xp.set_float(THROTTLE_ALL, 0.5).await;
+                    announce(
+                        "Unable to land — we've gone around too many times. Your aircraft."
+                            .into(),
+                        Priority::Warning,
+                    );
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "give_up", "reason": "max_go_arounds", "attempts": go_around.attempts()}),
+                    );
+                    break;
+                }
                 let g = if ga {
                     go_around_guidance(&rwy, raw.dist_nm, raw.glidepath_alt_ft, ias, approach_ias)
                 } else {
@@ -727,11 +746,26 @@ pub fn cross_track_nm(lat: f64, lon: f64, rwy: &Runway) -> f64 {
 #[derive(Debug, Default)]
 pub struct GoAroundLatch {
     active: bool,
+    /// How many go-arounds this approach has flown — a runaway backstop. An
+    /// approach that keeps missing (arrives too fast/high to capture, as the
+    /// LXGB Twin Otter did off the tight circuit) would otherwise firewall a
+    /// climb, release at 800 ft, re-intercept, miss again — forever, accelerating
+    /// toward Vne. After [`MAX_GO_AROUNDS`] the loop gives the aircraft back.
+    attempts: u32,
 }
+
+/// Give up (level off, hand to the pilot) after this many go-arounds on one
+/// approach rather than loop a missed approach until the fuel runs out.
+pub const MAX_GO_AROUNDS: u32 = 2;
 
 impl GoAroundLatch {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Go-arounds flown so far this approach.
+    pub fn attempts(&self) -> u32 {
+        self.attempts
     }
 
     /// Advance the latch one tick: `prev`/`now` are the raw guidance phases,
@@ -753,6 +787,7 @@ impl GoAroundLatch {
             && radio_ft < TERRAIN_FLOOR_AGL_FT
         {
             self.active = true;
+            self.attempts += 1;
         }
         self.active
     }
@@ -1202,6 +1237,23 @@ mod tests {
         // A HIGH overflight never latches: the immediate turn back is fine.
         let mut high = GoAroundLatch::new();
         assert!(!high.update(Some(Final), Intercept, 800.0));
+    }
+
+    #[test]
+    fn go_around_latch_counts_attempts_for_the_runaway_backstop() {
+        use ApproachPhase::*;
+        let mut l = GoAroundLatch::new();
+        assert_eq!(l.attempts(), 0);
+        // Each Final->Intercept low is one go-around; climbing back through
+        // 800 ft releases the latch for the next attempt.
+        for n in 1..=3 {
+            assert!(l.update(Some(Final), Intercept, 50.0), "latched low");
+            assert_eq!(l.attempts(), n, "counted");
+            assert!(l.update(Some(Intercept), Intercept, 50.0), "stays latched climbing");
+            assert!(!l.update(Some(Intercept), Intercept, 900.0), "released above 800 ft");
+        }
+        // The loop gives up once attempts EXCEED the cap.
+        assert!(l.attempts() > MAX_GO_AROUNDS);
     }
 
     #[test]
