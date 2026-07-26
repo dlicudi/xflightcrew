@@ -348,7 +348,7 @@ impl Station {
             );
             return None;
         };
-        let (ctx, wx) = self.build_ctx(xp).await;
+        let (ctx, wx) = self.build_ctx(xp, intent).await;
         let before = self.twr.state;
         let reply = self.route_unkeyed(transcript, service, &ctx, wx)?;
         sim::blackbox::record(
@@ -417,7 +417,7 @@ impl Station {
             );
             return None;
         };
-        let (ctx, wx) = self.build_ctx(xp).await;
+        let (ctx, wx) = self.build_ctx(xp, tower::parse_intent(transcript)).await;
         let before = self.twr.state;
         let reply = self.route_keyed(transcript, service, &ctx, wx);
         sim::blackbox::record(
@@ -632,7 +632,8 @@ impl Station {
     /// TakeoffCleared and the departure handoff arms, exactly as if the
     /// clearance had been issued on the reply path.
     pub async fn apply_monitor_takeoff_clearance(&mut self, xp: SimView<'_>) {
-        let (ctx, _wx) = self.build_ctx(xp).await;
+        // A departure context (the monitor's release watch) — never an arrival.
+        let (ctx, _wx) = self.build_ctx(xp, tower::Intent::RequestTakeoff).await;
         self.twr.state = tower::State::TakeoffCleared;
         // The released clearance owes its readback exactly like one issued
         // on the reply path.
@@ -1033,7 +1034,7 @@ impl Station {
     /// Read the sim once and build the live context for a reply. Best-effort:
     /// a failed read falls back to silence on that item rather than a wrong
     /// number.
-    async fn build_ctx(&mut self, xp: SimView<'_>) -> (tower::Ctx, Wx) {
+    async fn build_ctx(&mut self, xp: SimView<'_>, intent: tower::Intent) -> (tower::Ctx, Wx) {
         let wx = Wx {
             wind_from_deg: xp
                 .get_float(datarefs::WIND_DIR_DEG_TRUE)
@@ -1079,23 +1080,35 @@ impl Station {
         // The taxi route from where the aircraft actually is, planned fresh
         // per ground call so the eventual clearance matches the stand you
         // are on, not the one you asked from an hour ago.
+        // An ARRIVAL taxi-in (the pilot said "taxi to parking" — RequestTaxiIn,
+        // or a bare "request taxi" while still holding a landing clearance)
+        // routes to the nearest STAND; everything else is a departure to the
+        // runway. Keyed on the INTENT, not the FSM state — the state falls back
+        // to Parked after landing (region handoff, a prior taxi-in), which used
+        // to leave a real "taxi to parking" answered flat with no route
+        // (2026-07-26).
+        let arrival = matches!(intent, tower::Intent::RequestTaxiIn)
+            || (matches!(intent, tower::Intent::RequestTaxi)
+                && self.twr.state == tower::State::ClearedToLand);
         self.planned_route = None;
         if on_ground {
             if let (Ok(lat), Ok(lon)) = (
                 xp.get_float(datarefs::LATITUDE).await,
                 xp.get_float(datarefs::LONGITUDE).await,
             ) {
-                // On the ground fresh off a landing (state still ClearedToLand),
-                // the next taxi is INBOUND — route to the nearest stand, not the
-                // departure runway. Everything else is a departure.
-                self.planned_route = if self.twr.state == tower::State::ClearedToLand {
+                self.planned_route = if arrival {
                     plan_taxi_route_to_stand(&self.apt.runways, lat, lon)
                 } else {
                     plan_taxi_route_to(&self.apt.runways, &ident, lat, lon)
                 };
             }
         }
-        (self.make_ctx(wx, qnh, callsign, on_ground, final_traffic, runway_occupied, wake_secs_left), wx)
+        (
+            self.make_ctx(
+                wx, qnh, callsign, on_ground, arrival, final_traffic, runway_occupied, wake_secs_left,
+            ),
+            wx,
+        )
     }
 
     /// The pure half of [`Station::build_ctx`] — everything after the sim
@@ -1107,6 +1120,7 @@ impl Station {
         qnh: String,
         callsign: String,
         on_ground: bool,
+        arrival: bool,
         final_traffic: Option<FinalTraffic>,
         runway_occupied: bool,
         wake_secs_left: Option<u64>,
@@ -1133,7 +1147,7 @@ impl Station {
                 .unwrap_or_else(|| "Alpha".to_string()),
             // Arrival taxi-in (route was planned to a stand): the spoken stand
             // name for "taxi to stand ...". Empty on a departure.
-            stand: if self.twr.state == tower::State::ClearedToLand {
+            stand: if arrival {
                 route.map(|r| spoken_stand(&r.holding_point)).unwrap_or_default()
             } else {
                 String::new()
@@ -4382,7 +4396,7 @@ mod tests {
         let wx = Wx { wind_from_deg: 90.0, wind_kts: 8.0 };
         // LXGB has an approach service: the zone clearance carries the code.
         let mut st = lxgb();
-        let ctx = st.make_ctx(wx, "QNH one zero one seven".into(), "November one seven two Sierra Papa".into(), true, None, false, None);
+        let ctx = st.make_ctx(wx, "QNH one zero one seven".into(), "November one seven two Sierra Papa".into(), true, false, None, false, None);
         let r = st.respond(Service::Tower, tower::Intent::RequestClearance, &ctx, wx);
         let code = st.assigned_squawk.expect("discrete code issued");
         let spoken = atis::spoken_digits(&code.to_string());
@@ -4394,7 +4408,7 @@ mod tests {
         let mut st = lxgb();
         st.approach_khz = None;
         st.departure_khz = None;
-        let ctx = st.make_ctx(wx, "QNH one zero one seven".into(), "November one seven two Sierra Papa".into(), true, None, false, None);
+        let ctx = st.make_ctx(wx, "QNH one zero one seven".into(), "November one seven two Sierra Papa".into(), true, false, None, false, None);
         let r = st.respond(Service::Tower, tower::Intent::RequestClearance, &ctx, wx);
         assert!(r.contains("seven zero zero zero"), "{r}");
         assert!(st.assigned_squawk.is_none());
@@ -4434,7 +4448,7 @@ mod tests {
         let wx = Wx { wind_from_deg: 90.0, wind_kts: 8.0 };
         let mut st = lxgb();
         // Before any radar service: the VFR conspicuity.
-        let ctx = st.make_ctx(wx, "QNH one zero one seven".into(), "November one seven two Sierra Papa".into(), false, None, false, None);
+        let ctx = st.make_ctx(wx, "QNH one zero one seven".into(), "November one seven two Sierra Papa".into(), false, false, None, false, None);
         let r = st.twr.handle(tower::Intent::SquawkCheck, &ctx);
         assert!(r.contains("seven zero zero zero"), "{r}");
         // Flight following assigns the discrete code...
@@ -4444,7 +4458,7 @@ mod tests {
         assert!(r.contains(&spoken), "{r}");
         assert!(!r.contains("radar contact"), "contact is the watch's call, not theatre: {r}");
         // ...and every later squawk check repeats THAT code, tower included.
-        let ctx = st.make_ctx(wx, "QNH one zero one seven".into(), "November one seven two Sierra Papa".into(), false, None, false, None);
+        let ctx = st.make_ctx(wx, "QNH one zero one seven".into(), "November one seven two Sierra Papa".into(), false, false, None, false, None);
         let r = st.twr.handle(tower::Intent::SquawkCheck, &ctx);
         assert!(r.contains(&spoken), "{r}");
         assert!(!r.contains("seven zero zero zero"), "{r}");
@@ -5821,19 +5835,19 @@ mod tests {
         let mut st = lxgb();
         let ctx = {
             st.note_information("gibraltar tower, with information alpha, request taxi");
-            st.make_ctx(w, "QNH one zero one eight".into(), "November".into(), true, None, false, None)
+            st.make_ctx(w, "QNH one zero one eight".into(), "November".into(), true, false, None, false, None)
         };
         let reply = st.twr.handle(tower::parse_intent("request taxi"), &ctx);
         assert!(!reply.contains("QNH"), "{reply}");
         // A STALE letter keeps the numbers — safety over brevity.
         let mut st = lxgb();
         st.note_information("with information zulu, request taxi");
-        let ctx = st.make_ctx(w, "QNH one zero one eight".into(), "November".into(), true, None, false, None);
+        let ctx = st.make_ctx(w, "QNH one zero one eight".into(), "November".into(), true, false, None, false, None);
         let reply = st.twr.handle(tower::parse_intent("request taxi"), &ctx);
         assert!(reply.contains("QNH one zero one eight"), "{reply}");
         // No letter at all: numbers as always.
         let mut st = lxgb();
-        let ctx = st.make_ctx(w, "QNH one zero one eight".into(), "November".into(), true, None, false, None);
+        let ctx = st.make_ctx(w, "QNH one zero one eight".into(), "November".into(), true, false, None, false, None);
         let reply = st.twr.handle(tower::parse_intent("request taxi"), &ctx);
         assert!(reply.contains("QNH one zero one eight"), "{reply}");
         *ATIS.lock().unwrap() = None;
@@ -5973,6 +5987,7 @@ mod tests {
             "QNH one zero one seven".into(),
             "November one seven two Sierra Papa".into(),
             false, // airborne default; only the mayday answer reads it
+            false, // not an arrival taxi-in
             None,  // final clear; traffic-aware cases build their own ctx
             false, // runway unoccupied
             None,  // no wake clock
