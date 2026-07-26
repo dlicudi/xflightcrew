@@ -384,8 +384,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 Ok(reply) => announce(&voice, Priority::Advisory, &reply),
                 Err(_) => {}
             }
+            // A full-length backtrack is a long, slow drive (LXGB's 09 backtrack
+            // is ~1 km) — the 120 s that fit a plain line-up timed out mid-taxi
+            // (2026-07-26). Give it the taxi's budget.
             if crate::autotaxi::ACTIVE.load(SeqCst)
-                && !wait_until(120.0, 1000, || async { !crate::autotaxi::ACTIVE.load(SeqCst) }).await
+                && !wait_until(600.0, 1000, || async { !crate::autotaxi::ACTIVE.load(SeqCst) }).await
             {
                 give_up(&voice, "The line-up didn't finish. Your aircraft.", "line_up_stalled");
                 return;

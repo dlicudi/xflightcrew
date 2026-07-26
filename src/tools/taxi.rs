@@ -211,6 +211,11 @@ pub struct LineUp {
 
 /// Line-up pace: a runway entry is a sharp-corner maneuver end to end.
 const LINE_UP_KTS: f64 = 6.0;
+/// A full-length backtrack is a long straight run down the strip — taxi it at a
+/// brisk pace, not the tight line-up crawl (LXGB's ~1 km 09 backtrack took 6
+/// minutes at 6 kt and full auto timed out). The governor still auto-caps to
+/// 4-6 kt through the turn-around and ramps to the stop at the numbers.
+const BACKTRACK_KTS: f64 = 14.0;
 
 #[async_trait]
 impl Tool for LineUp {
@@ -354,13 +359,15 @@ impl Tool for LineUp {
         } else {
             format!("Lined up runway {spoken}. Holding position.")
         });
+        // A backtrack taxis briskly down the strip; a plain line-up creeps.
+        let drive_kts = if backtracking { BACKTRACK_KTS } else { LINE_UP_KTS };
         // Governor through the front door: parking-brake and held-brake
         // gates apply to a line-up unchanged.
         let arm_line = speedhold::HoldSpeed {
             approach_kts: None,
             park_brake_valve_set: self.park_brake_valve_set,
         }
-        .execute(&json!({ "knots": LINE_UP_KTS }), ctx)
+        .execute(&json!({ "knots": drive_kts }), ctx)
         .await?;
         if !speedhold::taxi_hold_active() {
             return Ok(arm_line);
@@ -373,7 +380,7 @@ impl Tool for LineUp {
                 ctx.voice.cloned(),
                 route,
                 rwy.clone(),
-                LINE_UP_KTS,
+                drive_kts,
             );
             return Ok(format!(
                 "Backtracking runway {spoken} for the full length. Your pedals or my controls take it back any time."
