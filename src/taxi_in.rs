@@ -18,6 +18,7 @@ use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
+const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 
 /// Spawn the arrival taxi on its own thread + runtime + client.
 pub fn start(
@@ -95,6 +96,13 @@ async fn fly(
             return;
         }
     }
+
+    // Release the brakes autoland set at the stop ("down and stopped, brakes
+    // on") — otherwise the taxi governor reads the residual parking-brake
+    // pressure as the pilot braking and never applies power, and the aircraft
+    // sits stagnant at the numbers (2026-07-26). The same "brakes off" full auto
+    // does before a departure taxi.
+    let _ = xp.set_float(PARK_BRAKE, 0.0).await;
 
     // Drive the cleared stand route. AutoTaxi owns the gates (on ground, on the
     // route, steer channel) and speaks the readback ("My taxi. stand ...").
