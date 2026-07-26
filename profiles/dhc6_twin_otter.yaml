@@ -189,11 +189,16 @@ lights:
   - { key: landing, spoken: landing lights,  dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
   - { key: taxi,    spoken: taxi light,      dataref: sim/cockpit2/switches/taxi_light_on,        command_on: sim/lights/taxi_lights_on,    command_off: sim/lights/taxi_lights_off }
 
-# SOP advisor: strobes airborne, landing lights for departure and arrival.
-# The copilot ACTS on these, not just advises: `command` fires the switch on
-# the moment the phase wants it (strobes for the whole flight, landing lights
-# for departure and arrival). Drop `command` to go back to a spoken nudge.
+# SOP advisor: taxi light on the ground, strobes airborne, landing lights for
+# departure and arrival. The copilot ACTS on these, not just advises: `command`
+# fires the switch the moment the phase wants it. Landing lights are deliberately
+# NOT on the ground (they dazzle other crews on the taxiway — that's what the
+# taxi light is for). Drop `command` to go back to a spoken nudge.
 advisor:
+  - dataref: sim/cockpit2/switches/taxi_light_on
+    phases: [ground]
+    say: "Taxi light on."
+    command: sim/lights/taxi_lights_on
   - dataref: sim/cockpit2/switches/strobe_lights_on
     phases: [takeoff, climb, cruise, approach, landing]
     say: "Strobes on."

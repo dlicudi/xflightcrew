@@ -768,9 +768,25 @@ mod tests {
         assert!(p.autopilot && p.engine && p.barometer && p.com_radio);
         assert!(!p.retractable_gear);
         assert_eq!(p.lights.len(), 5);
-        // SOP advisor rows: strobes airborne, landing light for takeoff/arrival.
-        assert_eq!(p.advisor.len(), 2);
+        // SOP advisor rows: taxi light on the ground, strobes airborne, landing
+        // light for takeoff/arrival.
+        assert_eq!(p.advisor.len(), 3);
         assert!(p.advisor.iter().all(|a| a.expect_on));
+        // The taxi light auto-comes-on for taxi (the ground phase)...
+        let taxi = p
+            .advisor
+            .iter()
+            .find(|a| a.command.as_deref() == Some("sim/lights/taxi_lights_on"))
+            .expect("a taxi-light SOP row");
+        assert_eq!(taxi.phases, vec!["ground".to_string()]);
+        // ...and the landing light is never expected on the ground (it dazzles
+        // other crews — that's the taxi light's job).
+        let landing = p
+            .advisor
+            .iter()
+            .find(|a| a.command.as_deref() == Some("sim/lights/landing_lights_on"))
+            .expect("a landing-light SOP row");
+        assert!(!landing.phases.iter().any(|ph| ph == "ground"));
         let flaps = p.flaps.expect("has flaps");
         assert_eq!(flaps.detents.len(), 4);
         assert_eq!(flaps.detents[0].label, "up");

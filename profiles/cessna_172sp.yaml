@@ -142,11 +142,16 @@ checklist_map:
   - { match: navigation_lights,             action: !light nav }
   - { match: nav_lights,                    action: !light nav }
 
-# Phase-expectation advisor: standard VFR lighting discipline. Strobes on
-# whenever airborne; landing light for the takeoff and the arrival.
-# The copilot ACTS on these (fires `command`) rather than only advising —
-# strobes for the flight, landing light for departure and arrival.
+# Phase-expectation advisor: standard VFR lighting discipline. Taxi light on
+# the ground; strobes whenever airborne; landing light for the takeoff and the
+# arrival. The copilot ACTS on these (fires `command`) rather than only advising.
+# Landing light is deliberately NOT on the ground — the taxi light is what you
+# use to taxi; landing lights on the taxiway dazzle other crews.
 advisor:
+  - dataref: sim/cockpit2/switches/taxi_light_on
+    phases: [ground]
+    say: Taxi light on.
+    command: sim/lights/taxi_lights_on
   - dataref: sim/cockpit2/switches/strobe_lights_on
     phases: [takeoff, climb, cruise, approach, landing]
     say: Strobes on.
