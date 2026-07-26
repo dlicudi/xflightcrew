@@ -3365,10 +3365,13 @@ fn plan_taxi_route_to_stand(
 }
 
 /// Speak a parking-stand name: spell digit runs ("Stand 12" -> "stand one
-/// two"), lowercase the rest. Plain and unambiguous, like real ground phrasing.
-/// `pub` so the crew's auto-taxi calls the destination by the same name.
+/// two"), lowercase the rest, and prefix "stand" for a bare designator (LXGB
+/// names its gates "1".."5", so this reads "stand five", not just "five") —
+/// unless the name already says what kind of parking it is. `pub` so the crew's
+/// auto-taxi calls the destination by the same name.
 pub fn spoken_stand(name: &str) -> String {
-    name.split_whitespace()
+    let spoken = name
+        .split_whitespace()
         .map(|w| {
             if !w.is_empty() && w.chars().all(|c| c.is_ascii_digit()) {
                 atis::spoken_digits(w)
@@ -3377,7 +3380,21 @@ pub fn spoken_stand(name: &str) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    if spoken.is_empty() {
+        return spoken;
+    }
+    let names_the_kind = name.split_whitespace().any(|w| {
+        matches!(
+            w.to_ascii_lowercase().as_str(),
+            "stand" | "gate" | "ramp" | "apron" | "bay" | "parking" | "tie-down" | "tiedown"
+        )
+    });
+    if names_the_kind {
+        spoken
+    } else {
+        format!("stand {spoken}")
+    }
 }
 
 fn plan_taxi_route_to(
