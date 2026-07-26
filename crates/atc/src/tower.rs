@@ -112,6 +112,10 @@ pub struct Ctx {
     pub wind: String,
     /// Holding point name ("Alpha").
     pub holding_point: String,
+    /// Spoken parking-stand name for an ARRIVAL taxi-in ("stand one two"),
+    /// planned to the nearest suitable stand. Empty on a departure, or when the
+    /// field publishes no stands (the reply falls back to "taxi to parking").
+    pub stand: String,
     /// Approach frequency, spoken ("one two two decimal eight") — for the
     /// vectors redirect. `None` = the field has no approach service.
     pub approach: Option<String>,
@@ -168,6 +172,22 @@ fn via_clause(ctx: &Ctx) -> String {
     } else {
         format!(" via {}", ctx.taxi_via.join(", "))
     }
+}
+
+/// The arrival taxi-in clearance: "taxi to stand one two via Alpha, cross
+/// runway zero niner, this frequency." Falls back to the flat "taxi to parking"
+/// when no stand route was planned (field has no stands, or off the network).
+fn taxi_in_reply(ctx: &Ctx) -> String {
+    if ctx.stand.is_empty() {
+        return format!("{}, taxi to parking, this frequency.", ctx.callsign);
+    }
+    format!(
+        "{}, taxi to {}{}{}, this frequency.",
+        ctx.callsign,
+        ctx.stand,
+        via_clause(ctx),
+        crossing_clause(ctx),
+    )
 }
 
 /// The ", cross runway ..." clause when the taxi route crosses one.
@@ -859,11 +879,11 @@ impl Tower {
             // fresh departure wanting the holding point).
             Intent::RequestTaxiIn => {
                 self.state = State::Parked;
-                format!("{}, taxi to parking, this frequency.", ctx.callsign)
+                taxi_in_reply(ctx)
             }
             Intent::RequestTaxi if self.state == State::ClearedToLand => {
                 self.state = State::Parked;
-                format!("{}, taxi to parking, this frequency.", ctx.callsign)
+                taxi_in_reply(ctx)
             }
             Intent::RequestTaxi => {
                 self.state = State::TaxiCleared;
@@ -1152,6 +1172,7 @@ mod tests {
             qnh: "QNH one zero one seven".into(),
             wind: "zero niner zero degrees, three knots".into(),
             holding_point: "Alpha".into(),
+            stand: String::new(),
             approach: Some("one two two decimal eight".into()),
             squawk: "seven zero zero zero".into(),
             final_traffic_nm: None,
@@ -2003,5 +2024,37 @@ mod tests {
         );
         assert_eq!(spoken_callsign("G-ABCD"), "Golf Alpha Bravo Charlie Delta");
         assert_eq!(spoken_callsign(""), "");
+    }
+
+    #[test]
+    fn arrival_taxi_in_clears_to_the_planned_stand() {
+        // Fresh off landing, "taxi to parking" earns a real taxi-in clearance
+        // to the planned stand — with the via and any runway crossing — and
+        // drops the FSM back to Parked.
+        let mut c = ctx();
+        c.stand = "stand one two".into();
+        c.taxi_via = vec!["Alpha".into(), "Bravo".into()];
+        c.taxi_crossings = vec!["zero niner".into()];
+        let mut twr = Tower::new();
+        twr.state = State::ClearedToLand;
+        let reply = twr.handle(Intent::RequestTaxiIn, &c);
+        assert!(reply.contains("taxi to stand one two"), "{reply:?}");
+        assert!(reply.contains("via Alpha, Bravo"), "{reply:?}");
+        assert!(reply.contains("cross runway zero niner"), "{reply:?}");
+        assert!(reply.contains("this frequency"), "{reply:?}");
+        assert_eq!(twr.state, State::Parked);
+
+        // A generic "request taxi" right after landing is an arrival too.
+        let mut twr2 = Tower::new();
+        twr2.state = State::ClearedToLand;
+        assert!(twr2.handle(Intent::RequestTaxi, &c).contains("taxi to stand one two"));
+
+        // No stand planned (field with no parking, or off the network) → the
+        // honest flat fallback, never a fabricated stand.
+        let mut c3 = ctx();
+        c3.stand = String::new();
+        let mut twr3 = Tower::new();
+        twr3.state = State::ClearedToLand;
+        assert!(twr3.handle(Intent::RequestTaxiIn, &c3).contains("taxi to parking"));
     }
 }

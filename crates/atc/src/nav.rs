@@ -504,11 +504,38 @@ pub struct TaxiEdge {
     pub zone_of: Vec<String>,
 }
 
+/// A parking position — apt.dat row 1300 (ramp start location). The endpoint
+/// an arrival taxi routes to.
+#[derive(Debug, Clone)]
+pub struct Stand {
+    pub lat: f64,
+    pub lon: f64,
+    /// True heading the aircraft parks on (nose direction).
+    pub heading: f64,
+    /// The stand name as painted ("Stand 12", "A7", "GA North").
+    pub name: String,
+    /// apt.dat location type: gate / hangar / tie_down / misc. A hangar is not
+    /// a suitable parking stand to send an arrival to.
+    pub kind: String,
+    /// Aircraft categories the stand accepts (apt.dat field: heavy / jets /
+    /// turboprops / props / helos / fighters), lowercased. Empty = unspecified.
+    pub accepts: Vec<String>,
+}
+
+impl Stand {
+    /// A stand an arrival can actually park at — anything but a hangar.
+    pub fn is_suitable(&self) -> bool {
+        !self.kind.eq_ignore_ascii_case("hangar")
+    }
+}
+
 /// The taxi routing network of one airport.
 #[derive(Debug, Clone, Default)]
 pub struct TaxiNet {
     pub nodes: std::collections::HashMap<i64, (f64, f64)>,
     pub edges: Vec<TaxiEdge>,
+    /// Parking stands (apt.dat 1300), for arrival taxi-to-parking.
+    pub stands: Vec<Stand>,
 }
 
 /// The default hold-short standoff: how far back from the runway-junction
@@ -601,6 +628,28 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
                     zone_of: Vec::new(),
                 });
             }
+            Some("1300") if in_airport => {
+                // lat lon heading loc_type plane_types name...
+                // e.g. `1300 52.30 -1.20 90.0 gate jets|turboprops Stand 12`
+                let (lat, lon, heading) = match (
+                    f.next().and_then(|s| s.parse::<f64>().ok()),
+                    f.next().and_then(|s| s.parse::<f64>().ok()),
+                    f.next().and_then(|s| s.parse::<f64>().ok()),
+                ) {
+                    (Some(a), Some(b), Some(h)) => (a, b, h),
+                    _ => continue,
+                };
+                let kind = f.next().unwrap_or("misc").to_string();
+                let accepts = f
+                    .next()
+                    .unwrap_or("")
+                    .split('|')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let name = f.collect::<Vec<_>>().join(" ").trim().to_string();
+                net.stands.push(Stand { lat, lon, heading, name, kind, accepts });
+            }
             Some("1204") if in_airport => {
                 // classification runway-list — attaches to the 1202 row
                 // above it. arrival/departure/both zones bound the runway
@@ -623,6 +672,22 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
 }
 
 impl TaxiNet {
+    /// The nearest SUITABLE parking stand (excludes hangars) by straight-line
+    /// distance — the destination an arrival taxi routes to. `None` when the
+    /// field publishes no stands.
+    pub fn nearest_stand(&self, lat: f64, lon: f64) -> Option<&Stand> {
+        let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
+        let d2 = |s: &Stand| {
+            let dx = (s.lon - lon) * m_per_deg_lon;
+            let dy = (s.lat - lat) * 111_320.0;
+            dx * dx + dy * dy
+        };
+        self.stands
+            .iter()
+            .filter(|s| s.is_suitable())
+            .min_by(|a, b| d2(a).total_cmp(&d2(b)))
+    }
+
     /// Route from a position to a position (a stand to a runway threshold)
     /// and extract the phrasable plan. `None` when either end doesn't snap
     /// to the network (within 3 km) or no path exists.
@@ -1493,6 +1558,10 @@ mod tests {
         writeln!(f, "1204 departure 09,27").unwrap();
         writeln!(f, "1204 arrival 09,27").unwrap();
         writeln!(f, "1202 7 8 twoway runway 09/27").unwrap();
+        // Parking: a gate right by the stand node, and a hangar further out
+        // that an arrival must NOT be sent to.
+        writeln!(f, "1300 36.0031000 -5.0050000 180.0 gate turboprops|props Stand 1").unwrap();
+        writeln!(f, "1300 36.0060000 -5.0050000 90.0 hangar jets Maintenance").unwrap();
         writeln!(f, "1 1027 0 0 0MU1 Sunderland").unwrap();
         writeln!(f, "1202 5 6 twoway taxiway Z").unwrap();
         f.flush().unwrap();
@@ -1502,6 +1571,15 @@ mod tests {
             .expect("network found");
         assert_eq!(net.nodes.len(), 6);
         assert_eq!(net.edges.len(), 5, "only LTST's edges, not Sunderland's");
+
+        // Parking: both stands parse; the nearest SUITABLE one (from a point
+        // near the gate) is the gate, never the hangar.
+        assert_eq!(net.stands.len(), 2, "gate + hangar");
+        let near = net.nearest_stand(36.0031, -5.0050).expect("a stand");
+        assert_eq!(near.name, "Stand 1");
+        assert!(near.is_suitable());
+        assert!(net.stands.iter().any(|s| s.kind == "hangar" && !s.is_suitable()));
+        assert_eq!(near.accepts, vec!["turboprops".to_string(), "props".to_string()]);
 
         // From the stand to the 09 threshold: via A and B, crossing 14/32,
         // holding point named for the last taxiway before the runway.

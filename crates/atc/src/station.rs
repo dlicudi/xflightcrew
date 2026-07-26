@@ -582,6 +582,23 @@ impl Station {
                     lead_on: r.lead_on.clone(),
                 });
         }
+        // The arrival taxi-in publishes its stand route the same way, so the
+        // crew's auto_taxi drives it to parking. `was` is the pre-transition
+        // state (a "request taxi" right after landing is an arrival too).
+        if service == Service::Tower
+            && (intent == tower::Intent::RequestTaxiIn
+                || (intent == tower::Intent::RequestTaxi
+                    && was == tower::State::ClearedToLand))
+        {
+            *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) =
+                self.planned_route.as_ref().filter(|r| r.path.len() >= 2).map(|r| TaxiWatch {
+                    path: r.path.clone(),
+                    via: spoken_via(&r.via).join(", "),
+                    seg: r.seg.clone(),
+                    holding_point: r.holding_point.clone(),
+                    lead_on: r.lead_on.clone(),
+                });
+        }
         // A takeoff request answered with anything SHORT of the clearance —
         // hold position (traffic, wake, occupied strip), a conditional or
         // plain line-up, a cancellation — arms the release watch, so the
@@ -1066,7 +1083,14 @@ impl Station {
                 xp.get_float(datarefs::LATITUDE).await,
                 xp.get_float(datarefs::LONGITUDE).await,
             ) {
-                self.planned_route = plan_taxi_route_to(&self.apt.runways, &ident, lat, lon);
+                // On the ground fresh off a landing (state still ClearedToLand),
+                // the next taxi is INBOUND — route to the nearest stand, not the
+                // departure runway. Everything else is a departure.
+                self.planned_route = if self.twr.state == tower::State::ClearedToLand {
+                    plan_taxi_route_to_stand(&self.apt.runways, lat, lon)
+                } else {
+                    plan_taxi_route_to(&self.apt.runways, &ident, lat, lon)
+                };
             }
         }
         (self.make_ctx(wx, qnh, callsign, on_ground, final_traffic, runway_occupied, wake_secs_left), wx)
@@ -1105,6 +1129,13 @@ impl Station {
                 .map(|r| spoken_taxiway(&r.holding_point))
                 .filter(|h| !h.is_empty())
                 .unwrap_or_else(|| "Alpha".to_string()),
+            // Arrival taxi-in (route was planned to a stand): the spoken stand
+            // name for "taxi to stand ...". Empty on a departure.
+            stand: if self.twr.state == tower::State::ClearedToLand {
+                route.map(|r| spoken_stand(&r.holding_point)).unwrap_or_default()
+            } else {
+                String::new()
+            },
             approach: self.approach_khz.map(atis::spoken_mhz),
             squawk: self
                 .assigned_squawk
@@ -3311,6 +3342,41 @@ pub fn spawn_taxi_net_load(apt_path: String, icao: String) {
 /// Plan the taxi route from the aircraft to the holding point of `ident`'s
 /// runway end. `None` when there's no network (yet), no snap, or no path —
 /// the clearance then falls back to the route-less phrasing.
+/// Route an ARRIVAL from where it is to the NEAREST suitable parking stand —
+/// the mirror of [`plan_taxi_route_to`] for taxi-in. Same generic Dijkstra; the
+/// destination is a stand, so there's no runway hold-short trim (a stand is a
+/// genuine off-runway end node), and the plan's `holding_point` carries the raw
+/// stand name so the reply and the crew call it by name. Runway crossings on
+/// the way in are still named. `None` when the field has no stands or neither
+/// end snaps to the network.
+fn plan_taxi_route_to_stand(
+    runways: &[nav::Runway],
+    lat: f64,
+    lon: f64,
+) -> Option<nav::TaxiRoutePlan> {
+    let net = TAXI_NET.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+    let stand = net.nearest_stand(lat, lon)?.clone();
+    let mut plan = net.plan(lat, lon, stand.lat, stand.lon, 0.0, &[])?;
+    plan.holding_point = stand.name.clone();
+    mark_runway_crossings(&mut plan, runways);
+    Some(plan)
+}
+
+/// Speak a parking-stand name: spell digit runs ("Stand 12" -> "stand one
+/// two"), lowercase the rest. Plain and unambiguous, like real ground phrasing.
+fn spoken_stand(name: &str) -> String {
+    name.split_whitespace()
+        .map(|w| {
+            if !w.is_empty() && w.chars().all(|c| c.is_ascii_digit()) {
+                atis::spoken_digits(w)
+            } else {
+                w.to_ascii_lowercase()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn plan_taxi_route_to(
     runways: &[nav::Runway],
     ident: &str,
@@ -4617,6 +4683,7 @@ mod tests {
         *TAXI_NET.lock().unwrap() = Some(std::sync::Arc::new(nav::TaxiNet {
             nodes,
             edges: vec![edge(1, 2, "A"), edge(2, 3, "A"), edge(3, 4, "H1")],
+            stands: vec![],
         }));
         *TAXI_ROUTE.lock().unwrap() = Some(TaxiWatch {
             path: vec![
@@ -6518,6 +6585,7 @@ mod tests {
             qnh: "QNH one zero one five".into(),
             wind: "calm".into(),
             holding_point: "Alpha".into(),
+            stand: String::new(),
             approach: Some(atis::spoken_mhz(122800)),
             squawk: "seven zero zero zero".into(),
             final_traffic_nm: None,
@@ -6861,6 +6929,7 @@ mod tests {
                 qnh: "QNH one zero one seven".into(),
                 wind: "calm".into(),
                 holding_point: "Alpha".into(),
+                stand: String::new(),
                 approach: Some(atis::spoken_mhz(122800)),
                 squawk: "seven zero zero zero".into(),
                 final_traffic_nm: None,
@@ -7081,6 +7150,7 @@ mod tests {
             qnh: "QNH one zero one seven".into(),
             wind: "calm".into(),
             holding_point: "Alpha".into(),
+            stand: String::new(),
             approach: Some(atis::spoken_mhz(122800)),
             squawk: "seven zero zero zero".into(),
             final_traffic_nm: None,

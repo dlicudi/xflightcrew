@@ -279,6 +279,7 @@ fn main() -> Result<()> {
                     qnh: atis::spoken_digits(&format!("{:.0}", snap.qnh_hpa)),
                     wind: spoken_wind(&snap),
                     holding_point: "Alpha".to_string(),
+                    stand: String::new(),
                     approach: apt.freq(nav::FREQ_APPROACH).map(|f| atis::spoken_mhz(f.khz)),
                     // The standalone binary predates the ground-aware mayday
                     // and the assigned-squawk state: conspicuity only. Same
