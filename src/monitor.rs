@@ -1470,13 +1470,6 @@ pub async fn run(
     // Last strip pushed to the panel — only re-send on change.
     let mut last_strip = String::new();
 
-    // Long-term memory: brief from the carry-forward on startup, and remember
-    // the flight after shutdown. `was_airborne` arms the debrief on liftoff.
-    let memory = crate::debrief::memory_dir();
-    if let Some(brief) = crate::debrief::CarryForward::briefing_once_today(&memory, &live.get().id) {
-        voice.alert(Priority::Advisory, brief);
-    }
-    let mut was_airborne = false;
     // Talk-down pacing: when the last callout went out, and whether we've
     // already handed over at the threshold (say it once, then shut up).
     let mut guide_last: Option<Instant> = None;
@@ -1529,18 +1522,15 @@ pub async fn run(
             states = checks.iter().map(|c| (c.id(), FireState::new())).collect();
             tracing::info!(checks = checks.len(), "monitor: reconfigured for new aircraft");
             crate::blackbox::record("flight_meta", serde_json::json!({ "aircraft": live.get().id }));
-            if let Some(brief) = crate::debrief::CarryForward::briefing_once_today(&memory, &live.get().id) {
-                voice.alert(Priority::Advisory, brief);
-            }
         }
         // Replay or pause: neither is the aircraft flying NOW — a replay is a
         // recording, a pause is real but frozen — so nothing here may react.
         // One gate covers the whole reactive tick: checks and callouts, the
-        // ATC compliance / incursion / region watches, crash recording, the
-        // flight-ended debrief. A replayed crash landing earned "you landed on
-        // runway two seven without clearance" and a second crash event
-        // (2026-07-14). Fail open: a failed read means live. State
-        // (FireStates, was_airborne) simply freezes and resumes on live.
+        // ATC compliance / incursion / region watches, and crash recording.
+        // A replayed crash landing earned "you landed on runway two seven
+        // without clearance" and a second crash event (2026-07-14). Fail
+        // open: a failed read means live. State (FireStates) simply freezes
+        // and resumes on live.
         let in_replay = xp
             .get_float(crate::datarefs::IS_IN_REPLAY)
             .await
@@ -1600,9 +1590,9 @@ pub async fn run(
             }
 
             // Crew-side watches stand down entirely in ATC-only mode: no
-            // copilot, no callouts, no debrief — the pilot kept the world
-            // and sent the crew home. World ticks are inert without the
-            // station's published state, so most need no gate of their own;
+            // copilot and no callouts — the pilot kept the world and sent
+            // the crew home. World ticks are inert without the station's
+            // published state, so most need no gate of their own;
             // region_tick is the exception (its index cache survives).
             let crew_on = crate::mode::copilot_enabled();
 
@@ -1615,39 +1605,31 @@ pub async fn run(
                 let say = |line: &str| {
                     voice.alert(Priority::Advisory, line.to_string());
                 };
+                // Casual ground chatter, not phraseology — so it varies flight to
+                // flight (the value is nothing to standardise here, unlike a callout).
                 if snap.tug_attached && !prev_attached && !snap.pushing_back {
-                    say("Tug connected, ready for pushback.");
+                    say(crate::readback::one_of(&[
+                        "Tug connected, ready for pushback.",
+                        "Tug's hooked up, ready to push.",
+                        "Ground's connected, ready when you are.",
+                    ]));
                 }
                 if snap.pushing_back && !prev_pushing {
-                    say("Pushing back.");
+                    say(crate::readback::one_of(&[
+                        "Pushing back.",
+                        "Here we go, pushing back.",
+                        "And we're pushing.",
+                    ]));
                 } else if !snap.pushing_back && prev_pushing {
-                    say("Pushback complete, tug clear.");
+                    say(crate::readback::one_of(&[
+                        "Pushback complete, tug clear.",
+                        "Pushback done, tug's clear.",
+                        "That's us off the gate, tug clear.",
+                    ]));
                 }
             }
             prev_attached = snap.tug_attached;
             prev_pushing = snap.pushing_back;
-
-            // Flight ended (was airborne, now parked with the engines off) →
-            // distill the black box into memory and speak the debrief. Once per
-            // flight: the arm resets only on the next liftoff.
-            if !snap.on_ground {
-                was_airborne = true;
-            } else if was_airborne && !snap.engine_running && snap.groundspeed_kts < 5.0 {
-                was_airborne = false;
-                let mem = memory.clone();
-                let done = tokio::task::spawn_blocking(move || {
-                    crate::debrief::remember(std::path::Path::new("logs/blackbox.jsonl"), &mem)
-                })
-                .await;
-                if let Ok(Some(summary)) = done {
-                    tracing::info!(aircraft = %summary.aircraft, "flight distilled to memory");
-                    // The memory is written in every mode; the spoken debrief
-                    // is the copilot's — ATC-only keeps the record, not the talk.
-                    if crew_on {
-                        voice.alert(Priority::Advisory, summary.spoken());
-                    }
-                }
-            }
 
             // The wreck flag: X-Plane raises has_crashed the instant the
             // airframe is destroyed; a flight reset drops it, and the world

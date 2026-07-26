@@ -617,7 +617,11 @@ async fn fly_authored_route(
         }
     }
     // The last waypoint sits on short final — hand the landing to autoland.
-    alert(&voice, Priority::Advisory, "Turning final. Landing us.");
+    alert(&voice, Priority::Advisory, crate::readback::one_of(&[
+        "Turning final. Landing us.",
+        "On final now. I'll put her down.",
+        "Turning final. Bringing us in.",
+    ]));
     transmit(radio_call(&callsign, &format!("final runway {}", spell_runway(&rwy_id))));
     crate::blackbox::record("circuit", serde_json::json!({"event": "handoff_autoland_authored"}));
     crate::autoland::ABORT.store(false, Ordering::SeqCst);
@@ -792,7 +796,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         }
         _ => {}
     }
-    alert(&voice, Priority::Advisory, "Flying a full circuit. My takeoff first.");
+    alert(&voice, Priority::Advisory, crate::readback::one_of(&[
+        "Flying a full circuit. My takeoff first.",
+        "Full circuit coming up. I'll take us off first.",
+        "Let's fly the circuit. My takeoff to start.",
+    ]));
 
     // --- Phase 1: the takeoff (the proven loop). Arm it, then wait for it to
     // hand off. It clears its own ACTIVE at the thousand-foot handoff — or on a
@@ -832,7 +840,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 "circuit",
                 serde_json::json!({"event": "authored_route", "wpts": route.len()}),
             );
-            alert(&voice, Priority::Advisory, "Airborne. Flying the bay circuit, around the Rock.");
+            alert(&voice, Priority::Advisory, crate::readback::one_of(&[
+                "Airborne. Flying the bay circuit, around the Rock.",
+                "Off the ground. Taking the bay circuit around the Rock.",
+                "Airborne. Around the Rock we go, over the bay.",
+            ]));
             let mag_var = xp.get_float(MAG_VAR).await.unwrap_or(0.0);
             fly_authored_route(
                 XPlaneClient::new(base_url.clone()),
@@ -857,7 +869,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             "The Rock circuit isn't clear from here. Flying the standard pattern.",
         );
     }
-    alert(&voice, Priority::Advisory, "Airborne. Flying the pattern.");
+    alert(&voice, Priority::Advisory, crate::readback::one_of(&[
+        "Airborne. Flying the pattern.",
+        "Off the ground. Into the pattern.",
+        "Airborne. Taking us round the pattern.",
+    ]));
 
     // --- Phase 2: the pattern rides the AP EXACTLY as the takeoff left it —
     // servos + HDG + VS engaged, VS dial at the climb rate. NOTHING is
@@ -1062,7 +1078,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 transmit(radio_call(&callsign, "turning base"));
             }
             Leg::Final => {
-                alert(&voice, Priority::Advisory, "Turning final. Landing us.");
+                alert(&voice, Priority::Advisory, crate::readback::one_of(&[
+                    "Turning final. Landing us.",
+                    "On final now. I'll put her down.",
+                    "Turning final. Bringing us in.",
+                ]));
                 // The final report — this is what earns the landing clearance.
                 transmit(radio_call(&callsign, &format!("final runway {}", spell_runway(&rwy_id))));
                 // Prefer the airport's PUBLISHED approach when we're actually

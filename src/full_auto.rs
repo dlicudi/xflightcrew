@@ -189,7 +189,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         reminders: None,
     };
 
-    announce(&voice, Priority::Advisory, "Full auto. Starting from cold.");
+    announce(&voice, Priority::Advisory, crate::readback::one_of(&[
+        "Full auto. Starting from cold.",
+        "Full auto it is. Taking her from cold and dark.",
+        "Alright, full auto. Starting cold.",
+    ]));
     event("start", json!({}));
     // The callsign the tower knows us by, so our calls sound like a real pilot.
     let callsign = crate::circuit::crew_callsign(&xp).await;
@@ -199,7 +203,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // Only turbine airframes need the APU/electrical bring-up; a piston's
         // start_engine powers its own bus.
         if tools.power_up_first {
-            announce(&voice, Priority::Advisory, "Powering up.");
+            announce(&voice, Priority::Advisory, crate::readback::one_of(&[
+                "Powering up.",
+                "Getting some power on.",
+                "Bringing her to life.",
+            ]));
             let r = crate::tools::power::PowerUp.execute(&json!({}), &ctx).await;
             event("power_up", json!({ "reply": r.as_ref().map(|s| s.as_str()).unwrap_or("err") }));
             bail_if_abort!();
@@ -219,7 +227,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             bail_if_abort!();
         }
 
-        announce(&voice, Priority::Advisory, "Starting the engine.");
+        announce(&voice, Priority::Advisory, crate::readback::one_of(&[
+            "Starting the engine.",
+            "Spinning up the engine.",
+            "Cranking her over.",
+        ]));
         match tools.start_engine.execute(&json!({}), &ctx).await {
             Ok(reply) => announce(&voice, Priority::Advisory, &reply),
             Err(_) => {}
@@ -259,9 +271,17 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             if let Some(khz) = crate::party_line::home_tower_khz() {
                 let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
                 event("tuned_tower", json!({ "khz": khz }));
-                announce(&voice, Priority::Advisory, "Tuning the tower, requesting taxi.");
+                announce(&voice, Priority::Advisory, crate::readback::one_of(&[
+                    "Tuning the tower, requesting taxi.",
+                    "Getting the tower, asking for taxi.",
+                    "On the tower now, requesting taxi.",
+                ]));
             } else {
-                announce(&voice, Priority::Advisory, "Requesting taxi.");
+                announce(&voice, Priority::Advisory, crate::readback::one_of(&[
+                    "Requesting taxi.",
+                    "Asking for taxi.",
+                    "Calling for taxi.",
+                ]));
             }
             crate::circuit::transmit(crate::circuit::radio_call(&callsign, "request taxi"));
             event("request_taxi", json!({}));
@@ -285,7 +305,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         bail_if_abort!();
 
         // Drive the cleared route to the holding point.
-        announce(&voice, Priority::Advisory, "Taxiing to the runway.");
+        announce(&voice, Priority::Advisory, crate::readback::one_of(&[
+            "Taxiing to the runway.",
+            "Rolling out to the runway.",
+            "Taking us to the runway.",
+        ]));
         match tools.taxi.execute(&json!({}), &ctx).await {
             Ok(reply) => announce(&voice, Priority::Advisory, &reply),
             Err(_) => {}
@@ -379,7 +403,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 }
                 bail_if_abort!();
             }
-            announce(&voice, Priority::Advisory, "Lining up.");
+            announce(&voice, Priority::Advisory, crate::readback::one_of(&[
+                "Lining up.",
+                "Lining us up.",
+                "Taking the runway.",
+            ]));
             match tools.line_up.execute(&json!({}), &ctx).await {
                 Ok(reply) => announce(&voice, Priority::Advisory, &reply),
                 Err(_) => {}
@@ -425,7 +453,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     // --- Stage 4: the mission — a circuit, or the SimBrief flight -------------
     match &tools.mission {
         Mission::Circuit { right } => {
-            announce(&voice, Priority::Advisory, "Lined up. Flying the circuit.");
+            announce(&voice, Priority::Advisory, crate::readback::one_of(&[
+                "Lined up. Flying the circuit.",
+                "Lined up and ready. Flying the circuit.",
+                "On the runway. Off we go, flying the circuit.",
+            ]));
             let args = json!({ "right": right });
             match tools.circuit.execute(&args, &ctx).await {
                 Ok(reply) => announce(&voice, Priority::Advisory, &reply),
@@ -652,7 +684,11 @@ async fn fly_route(
         .await;
         let on_ground = xp.get_float(crate::datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) > 0.5;
         if landed && on_ground && !ABORT.load(SeqCst) {
-            announce(voice, Priority::Advisory, "Down. I'll taxi us to parking.");
+            announce(voice, Priority::Advisory, crate::readback::one_of(&[
+                "Down. I'll taxi us to parking.",
+                "Down and clear. Taxiing us to parking.",
+                "On the ground. I'll get us to the gate.",
+            ]));
             event("taxi_in", json!({}));
             crate::taxi_in::start(
                 config.xplane_base_url.clone(),
@@ -746,7 +782,11 @@ fn build_arrival(
 /// voiced + transcribed by the crew-radio drain, along with the tower's reply.
 async fn request_departure(voice: &Option<Voice>, callsign: &Option<String>) {
     use crate::tower::State::{LinedUp, TakeoffCleared};
-    announce(voice, Priority::Advisory, "Calling for departure.");
+    announce(voice, Priority::Advisory, crate::readback::one_of(&[
+        "Calling for departure.",
+        "Calling the tower for departure.",
+        "Getting our departure clearance.",
+    ]));
     crate::circuit::transmit(crate::circuit::radio_call(callsign, "ready for departure"));
     event("request_departure", json!({}));
     wait_until(20.0, 1000, || async {
@@ -790,7 +830,11 @@ async fn ensure_takeoff_cleared(
         if crate::party_line::takeoff_hold_armed() {
             // Held for traffic: wait it out, silently. Say so once.
             if !announced_hold {
-                announce(voice, Priority::Advisory, "Holding, the tower has traffic. I'll wait.");
+                announce(voice, Priority::Advisory, crate::readback::one_of(&[
+                    "Holding, the tower has traffic. I'll wait.",
+                    "Tower's got traffic. Holding here.",
+                    "We've got traffic ahead. Holding for now.",
+                ]));
                 announced_hold = true;
             }
         } else if last_call.elapsed() >= NUDGE_EVERY {

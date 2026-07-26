@@ -16,7 +16,6 @@ mod autotaxi;
 mod circuit;
 mod full_auto;
 mod cabin;
-mod debrief;
 mod radiofx;
 mod rag;
 mod checklist;
@@ -73,17 +72,6 @@ use xplane::XPlaneClient;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     use tracing_subscriber::prelude::*;
-    // `--distill`: one-shot — distill the black box into memory and exit.
-    // The in-session debrief only fires on the airborne→parked edge, so a
-    // flight that ended before a restart (or a crash of the app) needs this
-    // to make it into memory.
-    if std::env::args().any(|a| a == "--distill") {
-        match debrief::remember(std::path::Path::new("logs/blackbox.jsonl"), &debrief::memory_dir()) {
-            Some(s) => println!("{}", s.spoken()),
-            None => println!("No completed flight in the black box."),
-        }
-        return Ok(());
-    }
     let config = Config::from_env()?;
     let tui = config.ui == "tui";
 
@@ -2648,9 +2636,13 @@ async fn run_session(
                 }
             }
             // Vary the acknowledgment on affirmative readbacks (bare callout most
-            // of the time, "Roger,"/"Copy," occasionally); the canonical readback
-            // is what's recorded for history context.
-            say(&voice, &reporter, ui::LogKind::Readback, &readback::vary_ack(&readback));
+            // of the time, else an intercom-natural ack, never the same one
+            // twice running); the canonical readback is what's recorded for
+            // history context. Heads-down workload proxy: on the ground and
+            // rolling fast (takeoff/landing roll) clips the crew to bare callouts.
+            let busy = live.get(datarefs::ON_GROUND_ANY).is_some_and(|v| v > 0.5)
+                && live.get(datarefs::AIRSPEED_KTS).is_some_and(|v| v > 40.0);
+            say(&voice, &reporter, ui::LogKind::Readback, &readback::vary_ack(&readback, busy));
             // Glance done — return the camera to where it was before the snap (the
             // readback just played, so you've seen the switch move).
             if let Some(head) = restore_view {
