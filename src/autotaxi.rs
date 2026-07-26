@@ -499,14 +499,19 @@ pub fn backtrack_pocket_path(
     let entry_m = (past_m - lateral.clamp(30.0, 60.0)).max(BACKTRACK_TURN_START_M + 30.0);
     let entry = c(entry_m);
     let turn_start = c(BACKTRACK_TURN_START_M);
-    // The pocket: beside the numbers, right of the direction of travel.
+    // Swing the teardrop toward the side the aircraft CAME IN on — the taxiway/
+    // apron side, which is the way the painted turn-pad leads. A fixed hand
+    // turned the wrong way against the yellow line at LXGB 09 (2026-07-26).
+    // `cross_track` is signed (+ = right of the runway course); default to the
+    // right of travel when we're dead on the centreline.
+    let entry_ct_m = cross_track_nm(lat, lon, rwy) * M_PER_NM;
+    let pocket_bearing = if entry_ct_m >= 0.0 {
+        rwy.course_deg + 90.0
+    } else {
+        rwy.course_deg - 90.0
+    };
     let mid = c(BACKTRACK_TURN_START_M / 2.0);
-    let pocket = project_latlon(
-        mid.0,
-        mid.1,
-        rwy.course_deg - 90.0,
-        BACKTRACK_POCKET_OFFSET_M / M_PER_NM,
-    );
+    let pocket = project_latlon(mid.0, mid.1, pocket_bearing, BACKTRACK_POCKET_OFFSET_M / M_PER_NM);
     Some(vec![(lat, lon), entry, turn_start, pocket])
 }
 
