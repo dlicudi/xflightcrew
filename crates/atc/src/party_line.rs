@@ -55,6 +55,11 @@ pub(crate) static PENDING_STATION: Mutex<Option<(String, nav::AirportInfo)>> = M
 /// loop consumes it and syncs the tower FSM to what was said on frequency.
 pub(crate) static PENDING_TAKEOFF_CLEARANCE: Mutex<bool> = Mutex::new(false);
 
+/// Set when the monitor sequences a held departure onto the runway with a
+/// line-up-and-wait; the main loop consumes it and syncs the tower FSM to
+/// what was said on frequency, exactly like [`PENDING_TAKEOFF_CLEARANCE`].
+pub(crate) static PENDING_LINE_UP: Mutex<bool> = Mutex::new(false);
+
 /// Set when the monitor orders a go-around (traffic on the runway); the main
 /// loop consumes it and voids the landing clearance in the tower FSM, so the
 /// coach can never keep suggesting the readback of a cancelled clearance.
@@ -144,6 +149,11 @@ pub fn take_pending_station() -> Option<(String, nav::AirportInfo)> {
 /// Consume the released-takeoff-clearance flag. Main loop only.
 pub fn take_pending_takeoff_clearance() -> bool {
     std::mem::take(&mut *lock(&PENDING_TAKEOFF_CLEARANCE))
+}
+
+/// Consume the sequenced-line-up flag. Main loop only.
+pub fn take_pending_line_up() -> bool {
+    std::mem::take(&mut *lock(&PENDING_LINE_UP))
 }
 
 /// Consume the go-around-ordered flag. Main loop only.

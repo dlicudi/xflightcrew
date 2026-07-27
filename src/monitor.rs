@@ -1500,6 +1500,23 @@ fn r1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
 
+/// Whether the radio has power, from the airframe's avionics readback and the
+/// value read off it. Fails OPEN twice over: no readback dataref (the airframe
+/// models no avionics master) and a failed read both mean powered.
+///
+/// This is a decision, not a publish — the caller writes the result EVERY tick.
+/// The flag is process-wide and outlives an airframe switch, so simply going
+/// quiet latches whatever the last aircraft said: a cold-and-dark 172 published
+/// false, the pilot swapped to a Twin Otter (no avionics master, nothing left
+/// to publish), and the stale false silently binned every crew radio call for
+/// the rest of the session (Heathrow, 2026-07-27).
+fn radio_powered_from(readback: Option<&str>, read: Option<f64>) -> bool {
+    match (readback, read) {
+        (Some(_), Some(v)) => v > 0.5,
+        _ => true,
+    }
+}
+
 /// The avionics-master readback dataref for an airframe, when it models one —
 /// it gates whether the pilot can HEAR the radio (station audio). `None` when
 /// there's no avionics system, or none with a readback: then the radio stays
@@ -1806,11 +1823,21 @@ pub async fn run(
                 // reads only — a read failure or an airframe with no avionics
                 // readback keeps the radio powered (fail open, never a
                 // mysteriously silent controller).
-                if let Some(dref) = &avionics_readback {
-                    if let Ok(v) = xp.get_float(dref).await {
-                        voice.set_radio_powered(v > 0.5);
-                    }
-                }
+                // Fail open must be RESTORED, not merely defaulted: the flag is
+                // process-wide and survives an airframe switch, so "stop
+                // publishing" latches whatever the LAST aircraft said. A
+                // cold-and-dark 172 published false, the pilot swapped to a Twin
+                // Otter (no avionics master — nothing left to publish), and the
+                // stale false silently binned every crew radio call for the rest
+                // of the session: full auto's clearance and taxi requests never
+                // left the aircraft and it blamed the tower ("no taxi clearance
+                // came back", Heathrow 2026-07-27). A failed read is the same
+                // trap one tick wide.
+                let read = match &avionics_readback {
+                    Some(dref) => xp.get_float(dref).await.ok(),
+                    None => None,
+                };
+                voice.set_radio_powered(radio_powered_from(avionics_readback.as_deref(), read));
                 // Runway incursion: sitting (or slow-taxiing) ON a runway with
                 // live traffic in THAT strip's final corridor — the one
                 // conflict geometry where seconds matter. Repeats every 15 s
@@ -2881,6 +2908,33 @@ mod tests {
             let p = crate::aircraft::load(id).expect(id);
             assert_eq!(avionics_readback_dref(&p), None, "{id} must fail open");
         }
+    }
+
+    /// Fail open has to be RESTORED on every tick, not just defaulted at boot:
+    /// `radio_powered` is process-wide and outlives an airframe switch. A
+    /// cold-and-dark 172 publishes false; swapping to an airframe with no
+    /// avionics master leaves nothing to publish, and the stale false used to
+    /// bin every crew radio call for the rest of the session (Heathrow,
+    /// 2026-07-27 — full auto's clearance and taxi requests never left the
+    /// aircraft and it blamed the tower).
+    #[test]
+    fn an_airframe_switch_cannot_latch_a_dead_radio() {
+        // The 172, cold and dark: its avionics master reads off.
+        let c172 = avionics_readback_dref(&crate::aircraft::load("cessna_172sp").unwrap());
+        assert!(!radio_powered_from(c172.as_deref(), Some(0.0)));
+        assert!(radio_powered_from(c172.as_deref(), Some(1.0)));
+        // A failed read on the SAME airframe fails open rather than holding
+        // the last answer — one tick of the same trap.
+        assert!(radio_powered_from(c172.as_deref(), None));
+        // Swap to the Twin Otter: no avionics master, so nothing to read. The
+        // decision must be "powered" on its own, never inherited from the 172
+        // that was cold and dark a moment ago.
+        let otter = avionics_readback_dref(&crate::aircraft::load("dhc6_twin_otter").unwrap());
+        assert_eq!(otter, None);
+        assert!(
+            radio_powered_from(otter.as_deref(), None),
+            "an airframe with no avionics master must fail OPEN, not inherit"
+        );
     }
 
     fn snap(engine_running: bool, alternator_on: bool) -> Snapshot {

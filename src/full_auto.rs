@@ -514,7 +514,10 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         for attempt in 0..2 {
             if atc_running && !can_enter() {
                 // Held short (traffic, wake): the clearance must come first.
-                if !ensure_takeoff_cleared(&voice, &callsign, &mut read_back).await {
+                // Held SHORT: a line-up-and-wait is a good enough answer to
+                // get us moving — the clearance is asked for again from the
+                // runway, below.
+                if !ensure_takeoff_cleared(&voice, &callsign, &mut read_back, true).await {
                     give_up(
                         &voice,
                         "The tower never cleared us for takeoff. Your aircraft. \
@@ -567,7 +570,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
 
         // The takeoff clearance, if the line-up went on under line-up-and-wait
         // (already satisfied when the held-short path above got it first).
-        if atc_running && !ensure_takeoff_cleared(&voice, &callsign, &mut read_back).await {
+        if atc_running && !ensure_takeoff_cleared(&voice, &callsign, &mut read_back, false).await {
             give_up(
                 &voice,
                 "We're lined up and ready, but the tower never cleared us for takeoff. \
@@ -1012,12 +1015,21 @@ async fn request_departure(voice: &Option<Voice>, callsign: &Option<String>) {
 /// clearance is wrong. Reads the clearance back ONCE across calls
 /// (`read_back`); the tower enforces the runway-critical readback. Returns
 /// whether we ended up cleared; abortable throughout.
+///
+/// `accept_line_up` is the difference between the two calls this makes. Held
+/// SHORT of the runway, a line-up-and-wait is the answer we're waiting for —
+/// the tower has sequenced us and wants us on the strip, so we take it, read
+/// it back, and drive on (the caller asks again from the runway). Already ON
+/// the runway, only the takeoff clearance will do. Without the distinction a
+/// sequenced departure waited out its whole budget behind the hold line while
+/// the tower believed it was lined up (Heathrow 27L, 2026-07-27).
 async fn ensure_takeoff_cleared(
     voice: &Option<Voice>,
     callsign: &Option<String>,
     read_back: &mut bool,
+    accept_line_up: bool,
 ) -> bool {
-    use crate::tower::State::TakeoffCleared;
+    use crate::tower::State::{LinedUp, TakeoffCleared};
     /// Wait this long overall for the clearance — long enough to sit out a
     /// traffic hold, bounded so a dead frequency eventually hands back.
     const OVERALL_SECS: f64 = 480.0;
@@ -1031,7 +1043,10 @@ async fn ensure_takeoff_cleared(
         if ABORT.load(SeqCst) {
             return false;
         }
-        if matches!(crate::party_line::clearance_state(), Some(TakeoffCleared)) {
+        let state = crate::party_line::clearance_state();
+        if matches!(state, Some(TakeoffCleared))
+            || (accept_line_up && matches!(state, Some(LinedUp)))
+        {
             break;
         }
         if Instant::now() >= deadline {
@@ -1057,9 +1072,20 @@ async fn ensure_takeoff_cleared(
         }
         tokio::time::sleep(Duration::from_millis(1000)).await;
     }
-    // Cleared — read it back, once across the whole departure sequence.
-    if !*read_back {
-        if let Some(rwy) = crate::party_line::clearance_runway() {
+    // Read back what we were actually given. A line-up-and-wait is its own
+    // runway-critical item — echoing "cleared for takeoff" at it would earn a
+    // "negative" from the readback enforcement and, worse, is not what we
+    // were told to do. The takeoff readback stays one-shot across the whole
+    // departure sequence; the line-up's is owed at the moment it's issued.
+    let lined_up_only = matches!(crate::party_line::clearance_state(), Some(LinedUp));
+    if let Some(rwy) = crate::party_line::clearance_runway() {
+        if lined_up_only {
+            crate::circuit::transmit(crate::circuit::radio_call(
+                callsign,
+                &format!("lining up runway {}", crate::circuit::spell_runway(&rwy)),
+            ));
+            event("readback_line_up", json!({ "runway": rwy }));
+        } else if !*read_back {
             *read_back = true;
             crate::circuit::transmit(crate::circuit::radio_call(
                 callsign,

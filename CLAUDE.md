@@ -189,10 +189,36 @@ once airborne; `XCOPILOT_ATC_READBACK=false` keeps the coach suggestions and
 drops the challenges); a **LinedUp state** ("line up and wait", the
 conditional "behind the landing <telephony>, line up behind" against exactly
 ONE arrival ≥1.5 nm out, and cancel-takeoff now lands here so the release
-watch owes the re-clearance); **wake turbulence** (a 2-minute clock started
+watch owes the re-clearance); a **runway in use that can't drift**
+(`pick_runway`: FROZEN while a departure is committed —
+TaxiCleared/LinedUp/TakeoffCleared — plus `RUNWAY_SWAP_MARGIN_KTS`
+hysteresis, because two parallels have the same heading to within rounding
+error and the ≥5 kt guard never protected against THAT. At EGLL the pick
+flip-flopped between 27R and 27L on noise in the wind direction, invisibly:
+both are "two seven" in speech. A silent flip after the 27L taxi clearance
+pointed the takeoff hold at Heathrow's ARRIVAL stream, which never has a
+15 s gap — held at November one for the full eight minutes, "traffic on
+short final" for a departure runway two probes found empty, 2026-07-27.
+The arm log names the runway and every gate now, because "held for traffic"
+is undiagnosable at a parallel field otherwise); **wake turbulence** (a 2-minute clock started
 by an airline-prefixed ghost lifting off our strip — TCAS carries no type,
 so airline callsign = medium-or-heavier — which turns "cleared for takeoff"
-into LUAW and blocks the hold release); and **named taxi routes** (apt.dat
+into LUAW and blocks the hold release, but measured from when the HOLD went
+on, NOT the last liftoff: separation is owed behind the departure ahead of
+you IN SEQUENCE, and a ghost that took your slot while you sat at the
+taxiway restarts nothing you owe. Un-capped, a field whose departure
+interval is shorter than the separation itself made the release condition
+unreachable — Heathrow 27L lifts one off about every two minutes, and full
+auto sat out its whole 480 s budget at holding point Sierra before handing
+back, 2026-07-27. The same watch now SEQUENCES a held departure instead of
+leaving it behind the line: strip clear + wake clock running = "line up and
+wait" (`PENDING_LINE_UP` → `apply_monitor_line_up`, the
+`PENDING_TAKEOFF_CLEARANCE` pattern one state earlier), never onto an
+occupied runway. `ensure_takeoff_cleared` takes `accept_line_up` for the
+same reason — held SHORT, a LUAW is the answer we're waiting for; already
+lined up, only the clearance will do, and without the distinction full auto
+waited out its budget behind the hold line while the tower believed it was
+on the strip); and **named taxi routes** (apt.dat
 1201/1202 network, background-loaded per station in `TAXI_NET`, Dijkstra
 with runway edges ×25 → "taxi to holding point Alpha one runway two seven
 right via Bravo, Link two seven", crossings called out — detected from
@@ -250,7 +276,18 @@ intercom, no radio needed) says "radios are dead" (a cold-dark SR22 raised
 Gibraltar and got a squawk, 2026-07-12). FAIL OPEN by design, both
 directions: an airframe with no avionics system, or a read that fails,
 keeps the radio powered — a mysteriously dead radio is worse than one that
-works with the panel dark. And ONE frequency at a time: monitor-side
+works with the panel dark. Fail open is RESTORED every tick
+(`radio_powered_from`), never merely defaulted at boot: the flag is
+process-wide and outlives an airframe switch, so a watch that simply stops
+publishing latches whatever the LAST aircraft said. A cold-and-dark 172
+published false, the pilot swapped to a Twin Otter (no avionics master,
+nothing left to publish), and the stale false silently binned every crew
+radio call for the rest of the session — full auto's clearance and taxi
+requests never left the aircraft and it blamed the tower ("no taxi
+clearance came back", Heathrow 2026-07-27). The drop is no longer silent
+either: `take_crew_radio` drains unconditionally, so a failed gate loses
+the call for good and the caller reads the silence as ATC not answering.
+And ONE frequency at a time: monitor-side
 controller calls (compliance berates, incursion shouts, go-around orders)
 speak as the controller COM1 is actually tuned to (`tuned_speaker` in
 [src/monitor.rs](src/monitor.rs)), and tower-frequency traffic (the
@@ -571,6 +608,12 @@ the sim's apt.dat); and the in-sim soak checklist
 [docs/atc-chaos-card.md](docs/atc-chaos-card.md). Every routing decision is
 blackboxed as a `"kind":"atc"` event — mine `logs/blackbox.jsonl` after each
 flight. Safety property: a mishear may earn "say again", never a clearance.
+The tracing filter must name EVERY workspace crate
+([src/main.rs](src/main.rs) defaults to `x_copilot=info,atc=info,sim=info`):
+after the crate split a crew-only default silently dropped the whole world
+side, so "release watch armed" and "wake clock started" never reached
+`logs/` and the Heathrow hold above had to be diagnosed by probing the live
+sim instead of grepping (2026-07-27).
 
 History: ATC started as a separate binary ([src/bin/atc.rs](src/bin/atc.rs),
 still buildable — tower + ATIS glue around the same lib modules) on the "the

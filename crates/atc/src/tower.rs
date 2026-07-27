@@ -784,6 +784,21 @@ impl Tower {
         });
     }
 
+    /// Arm the line-up readback for a line-up-and-wait the MONITOR spoke
+    /// (the held-clearance watch sequencing a departure onto the runway
+    /// while the wake clock runs) — same contract as
+    /// [`Tower::arm_takeoff_readback`], one state earlier.
+    pub fn arm_line_up_readback(&mut self, runway: String, instruction: String) {
+        self.pending = Some(PendingReadback {
+            awaited: Awaited::LineUp {
+                runway,
+                behind: false,
+            },
+            instruction,
+            nudges: 0,
+        });
+    }
+
     /// The MONITOR ordered a go-around (traffic on the runway): the landing
     /// clearance is void and the flight is back in the pattern, exactly as
     /// if the pilot had called the go-around on the reply path. Any owed

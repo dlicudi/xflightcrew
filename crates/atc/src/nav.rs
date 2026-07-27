@@ -975,6 +975,27 @@ pub fn best_runway_for_wind(
     best
 }
 
+/// The headwind component on one named runway END, for comparing a candidate
+/// against the runway already in use. `None` if the field has no such end.
+pub fn headwind_for(
+    runways: &[Runway],
+    ident: &str,
+    wind_from_deg: f64,
+    wind_kts: f64,
+) -> Option<f64> {
+    for r in runways {
+        for (id, hdg) in [
+            (&r.ident_a, r.heading_a_deg()),
+            (&r.ident_b, r.heading_b_deg()),
+        ] {
+            if id == ident {
+                return Some(wind_kts * angle_diff_deg(wind_from_deg, hdg).to_radians().cos());
+            }
+        }
+    }
+    None
+}
+
 /// Smallest signed angle a−b, degrees, in −180..180.
 fn angle_diff_deg(a: f64, b: f64) -> f64 {
     (a - b + 540.0).rem_euclid(360.0) - 180.0

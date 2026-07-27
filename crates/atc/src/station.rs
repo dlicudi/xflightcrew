@@ -22,8 +22,8 @@ use sim::xplane::SimView;
 // and its tests) writes them by their bare names; the crew side reads via
 // `party_line`'s accessors, never these statics.
 pub(crate) use crate::party_line::{
-    ASSIGNED_SQUAWK, CLEARANCE, LANDING_HANDOFF, PENDING_GO_AROUND, PENDING_STATION,
-    PENDING_TAKEOFF_CLEARANCE, TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS,
+    ASSIGNED_SQUAWK, CLEARANCE, LANDING_HANDOFF, PENDING_GO_AROUND, PENDING_LINE_UP,
+    PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS,
 };
 
 /// Which of the station's frequencies COM1 is tuned to.
@@ -259,6 +259,7 @@ impl Station {
         *PENDING_TAKEOFF_CLEARANCE
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = false;
+        *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *GO_AROUND_LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *GHOSTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -315,6 +316,7 @@ impl Station {
         *PENDING_TAKEOFF_CLEARANCE
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = false;
+        *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
     }
 
@@ -646,8 +648,22 @@ impl Station {
                 runway: ctx.runway.clone(),
                 runway_ident: self.runway_in_use.clone().unwrap_or_default(),
                 clear_since: None,
+                armed_at: Instant::now(),
+                // A hold issued FROM the runway is already sequenced: the
+                // conditional/plain line-up put us there, so the watch owes a
+                // release, not another line-up.
+                lined_up: self.twr.state == tower::State::LinedUp,
             });
-            tracing::info!("takeoff clearance withheld; release watch armed");
+            // Name the runway: at a parallel-runway field "held for traffic"
+            // is only diagnosable if you can see WHICH strip the watch is
+            // looking at (2026-07-27).
+            tracing::info!(
+                runway = %self.runway_in_use.clone().unwrap_or_default(),
+                final_nm = ?ctx.final_traffic_nm,
+                occupied = ctx.runway_occupied,
+                wake_secs = ?ctx.wake_secs_left,
+                "takeoff clearance withheld; release watch armed"
+            );
         }
         reply
     }
@@ -670,6 +686,23 @@ impl Station {
             c.pending_readback = self.twr.suggested_readback(&ctx.callsign);
         }
         self.arm_departure_handoff(&ctx);
+    }
+
+    /// Sync the tower FSM with the line-up-and-wait the MONITOR spoke when it
+    /// sequenced a held departure onto the runway (see [`takeoff_hold_tick`]):
+    /// the state moves to LinedUp and the line-up readback is owed, exactly as
+    /// if the instruction had been issued on the reply path. The hold stays
+    /// armed — the release is still to come.
+    pub async fn apply_monitor_line_up(&mut self, xp: SimView<'_>) {
+        let (ctx, _wx) = self.build_ctx(xp, tower::Intent::RequestTakeoff).await;
+        self.twr.state = tower::State::LinedUp;
+        self.twr.arm_line_up_readback(
+            ctx.runway.clone(),
+            format!("line up and wait runway {}.", ctx.runway),
+        );
+        if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            c.pending_readback = self.twr.suggested_readback(&ctx.callsign);
+        }
     }
 
     /// Sync the tower FSM with the go-around order the MONITOR spoke (see
@@ -1062,11 +1095,40 @@ impl Station {
     /// (≥ 5 kt): in calm the into-wind pick flip-flops on noise, and a
     /// controller doesn't swap the runway between two transmissions.
     fn pick_runway(&mut self, wind_from: f64, wind_kts: f64) -> String {
+        // A departure being SEQUENCED owns its runway. Once a taxi clearance
+        // names one, the pick is frozen until the flight leaves or the
+        // clearance dies — a controller does not move you to the other
+        // parallel between your taxi clearance and your takeoff clearance.
+        let committed = matches!(
+            self.twr.state,
+            tower::State::TaxiCleared | tower::State::LinedUp | tower::State::TakeoffCleared
+        );
+        if committed && self.runway_in_use.is_some() {
+            return self.runway_in_use.clone().unwrap_or_default();
+        }
         if wind_kts >= 5.0 || self.runway_in_use.is_none() {
-            if let Some((id, _, _)) =
+            if let Some((id, _, hw)) =
                 nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts)
             {
-                self.runway_in_use = Some(id);
+                // Hysteresis: the runway in use keeps its job unless another
+                // beats it by a REAL margin. The >= 5 kt guard was meant to
+                // stop the flip-flop, but between two parallels the headwinds
+                // differ by rounding error at any wind speed — EGLL's strips
+                // are both 270 degrees to within a hundredth of a degree, so
+                // which one won was decided by noise in the wind direction,
+                // and nothing in the phraseology gives it away (both are "two
+                // seven"). A silent flip from the 27L taxi clearance to 27R
+                // pointed the takeoff hold at Heathrow's ARRIVAL stream, which
+                // never has a 15 s gap: held at November one for the full
+                // eight minutes and handed back, "traffic on short final" for
+                // a departure runway that was empty (2026-07-27).
+                let current = self
+                    .runway_in_use
+                    .as_deref()
+                    .and_then(|cur| nav::headwind_for(&self.apt.runways, cur, wind_from, wind_kts));
+                if current.is_none_or(|cur_hw| hw > cur_hw + RUNWAY_SWAP_MARGIN_KTS) {
+                    self.runway_in_use = Some(id);
+                }
             }
         }
         self.runway_in_use.clone().unwrap_or_default()
@@ -3262,7 +3324,20 @@ pub struct TakeoffHold {
     /// The end ident ("09R"), for the strip-restricted traffic check.
     runway_ident: String,
     clear_since: Option<Instant>,
+    /// When the hold went on — the wake block is measured against this, so a
+    /// busy field's departure stream can't extend it forever (see
+    /// [`takeoff_hold_tick`]).
+    armed_at: Instant,
+    /// Whether the watch has already sequenced this departure onto the
+    /// runway with a line-up-and-wait. One shot: the aircraft can only take
+    /// the runway once.
+    lined_up: bool,
 }
+
+/// How much better another runway's headwind must be before the tower swaps
+/// the runway in use. Big enough that two parallels (identical headings,
+/// headwinds equal to rounding error) can never trade places on noise.
+const RUNWAY_SWAP_MARGIN_KTS: f64 = 3.0;
 
 /// The final must stay clear this long before the held clearance releases —
 /// an arrival crossing the fence vanishes from the airborne band while still
@@ -3295,7 +3370,7 @@ pub fn takeoff_hold_tick(
         let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
         strip(&runways, &hold.runway_ident).cloned()
     };
-    let blocked = match &rwy {
+    let traffic = match &rwy {
         Some(r) => {
             final_traffic_for(targets, r, field_elev_ft).is_some()
                 || targets
@@ -3311,11 +3386,41 @@ pub fn takeoff_hold_tick(
                 || targets
                     .iter()
                     .any(|t| t.on_ground && on_active_runway(t.lat, t.lon).is_some())
-        } // The wake clock blocks the release exactly like traffic does: a held
-          // clearance behind a departed heavy waits out the two minutes.
-    } || wake_remaining(&hold.runway_ident, now).is_some();
-    if blocked {
+        }
+    };
+    // The wake clock blocks the release exactly like traffic does: a held
+    // clearance behind a departed heavy waits out the two minutes. But it is
+    // measured from when the HOLD went on, not from the last liftoff —
+    // separation is owed behind the departure ahead of you IN SEQUENCE, and
+    // a ghost that took your slot while you sat at the taxiway restarts
+    // nothing you owe. Un-capped, a field whose departure interval is
+    // shorter than the separation itself (Heathrow's 27L: a liftoff about
+    // every two minutes) re-armed the clock faster than it could expire, the
+    // release condition became unreachable, and full auto sat out its entire
+    // budget at holding point Sierra before handing the aircraft back
+    // (2026-07-27). One full interval at the hold IS the separation.
+    let wake = now.duration_since(hold.armed_at).as_secs() < WAKE_SECS
+        && wake_remaining(&hold.runway_ident, now).is_some();
+    if traffic || wake {
         hold.clear_since = None;
+        // The strip is clear and only the wake clock is running: sequence the
+        // departure ONTO the runway instead of leaving it at the taxiway
+        // while the queue rolls past. Line-up-and-wait is what a real tower
+        // gives here, and it is what makes the release meaningful — an
+        // aircraft still behind the hold line is not next for anything. Never
+        // onto an OCCUPIED runway, which is why this sits under `!traffic`.
+        if wake && !traffic && !hold.lined_up {
+            hold.lined_up = true;
+            let line = format!(
+                "{}, line up and wait runway {}, wake turbulence, departing traffic ahead of you.",
+                hold.callsign, hold.runway
+            );
+            if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                c.state = tower::State::LinedUp;
+            }
+            *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            return Some(line);
+        }
         return None;
     }
     let since = *hold.clear_since.get_or_insert(now);
@@ -5711,11 +5816,16 @@ mod tests {
     #[test]
     fn held_takeoff_clearance_releases_when_the_final_stays_clear() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // No wake clock: this test is about the TRAFFIC gate alone, and a
+        // stale one left by another test would block every tick.
+        *WAKE.lock().unwrap() = None;
         *TAKEOFF_HOLD.lock().unwrap() = Some(TakeoffHold {
             callsign: "November one seven two Sierra Papa".into(),
             runway: "zero niner".into(),
             runway_ident: "09".into(),
             clear_since: None,
+            armed_at: Instant::now(),
+            lined_up: false,
         });
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
         *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
@@ -5802,6 +5912,8 @@ mod tests {
             runway: "zero niner".into(),
             runway_ident: "09".into(),
             clear_since: Some(t0),
+            armed_at: t0,
+            lined_up: false,
         });
         assert!(takeoff_hold_tick(&[], elev, false, t0 + sec(120)).is_none());
         assert!(
@@ -5815,6 +5927,123 @@ mod tests {
         assert!(!*PENDING_TAKEOFF_CLEARANCE.lock().unwrap());
 
         *CLEARANCE.lock().unwrap() = None;
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+    }
+
+    /// Heathrow, 2026-07-27: held at holding point Sierra for 27L, full auto
+    /// sat out its entire 480 s budget and handed the aircraft back. The
+    /// runway had clear gaps and no arrival was in our corridor — but a
+    /// liftoff off 27L about every two minutes re-armed a 120 s wake clock
+    /// faster than it could expire, so the release condition was unreachable.
+    /// The hold must now sequence the departure onto the runway and, once one
+    /// full wake interval has been served at the hold, release it.
+    #[test]
+    fn a_busy_departure_field_sequences_the_hold_then_releases_it() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let t0 = Instant::now();
+        let sec = std::time::Duration::from_secs;
+        let elev = 83.0;
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+            width_m: 50.0,
+            ident_a: "09R".into(),
+            ident_b: "27L".into(),
+            lat_a: 51.4647701,
+            lon_a: -0.4867489,
+            lat_b: 51.4649460,
+            lon_b: -0.4340638,
+        }];
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::TaxiCleared,
+            callsign: "November two four four Kilo Romeo".into(),
+            runway_ident: "27L".into(),
+            pending_readback: None,
+        });
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
+        *PENDING_LINE_UP.lock().unwrap() = false;
+        *TAKEOFF_HOLD.lock().unwrap() = Some(TakeoffHold {
+            callsign: "November two four four Kilo Romeo".into(),
+            runway: "two seven left".into(),
+            runway_ident: "27L".into(),
+            clear_since: None,
+            armed_at: t0,
+            lined_up: false,
+        });
+        // A heavy just rotated off our strip.
+        let departed = |at: Instant| {
+            *WAKE.lock().unwrap() = Some(Wake {
+                since: at,
+                runway_ident: "27L".into(),
+            });
+        };
+        // A ghost holding on the runway, and the queue's next departure
+        // sitting on the threshold — both are ON our strip.
+        let squatter = TcasTarget {
+            callsign: "BAW1346".into(),
+            lat: 51.46494,
+            lon: -0.4345,
+            ele_ft: elev,
+            on_ground: true,
+            vs_fpm: 0.0,
+        };
+
+        departed(t0);
+        // Strip occupied AND the wake clock running: no line-up onto an
+        // occupied runway, ever.
+        assert!(
+            takeoff_hold_tick(std::slice::from_ref(&squatter), elev, true, t0 + sec(1)).is_none()
+        );
+        assert!(!*PENDING_LINE_UP.lock().unwrap(), "never onto a busy strip");
+
+        // Strip clear, wake still running: sequenced onto the runway rather
+        // than left at the taxiway while the queue rolls past.
+        let line = takeoff_hold_tick(&[], elev, true, t0 + sec(30)).expect("line up and wait");
+        assert!(
+            line.contains("line up and wait runway two seven left"),
+            "{line}"
+        );
+        assert!(*PENDING_LINE_UP.lock().unwrap(), "the FSM sync is armed");
+        assert_eq!(
+            CLEARANCE.lock().unwrap().as_ref().unwrap().state,
+            tower::State::LinedUp
+        );
+        // One shot: the aircraft can only take the runway once.
+        assert!(takeoff_hold_tick(&[], elev, true, t0 + sec(31)).is_none());
+
+        // The queue keeps departing ahead of us. Each liftoff used to restart
+        // our clock; it no longer does — but inside the first interval the
+        // separation we genuinely owe still holds us.
+        departed(t0 + sec(60));
+        assert!(takeoff_hold_tick(&[], elev, true, t0 + sec(61)).is_none());
+        assert!(takeoff_hold_tick(&[], elev, true, t0 + sec(119)).is_none());
+
+        // One full wake interval served at the hold: later departures are the
+        // queue's separation, not ours. The clear timer starts...
+        departed(t0 + sec(130));
+        assert!(takeoff_hold_tick(&[], elev, true, t0 + sec(140)).is_none());
+        // ...but a ghost back on the strip still resets it. Safety is kept.
+        assert!(
+            takeoff_hold_tick(std::slice::from_ref(&squatter), elev, true, t0 + sec(150)).is_none()
+        );
+        assert!(
+            takeoff_hold_tick(&[], elev, true, t0 + sec(160)).is_none(),
+            "the clear window restarts behind the squatter"
+        );
+        let line = takeoff_hold_tick(&[], elev, true, t0 + sec(176)).expect("release");
+        assert!(line.contains("traffic clear"), "{line}");
+        assert!(
+            line.contains("Runway two seven left, cleared for takeoff"),
+            "{line}"
+        );
+        assert!(*PENDING_TAKEOFF_CLEARANCE.lock().unwrap());
+        assert_eq!(
+            CLEARANCE.lock().unwrap().as_ref().unwrap().state,
+            tower::State::TakeoffCleared
+        );
+
+        *WAKE.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+        *PENDING_LINE_UP.lock().unwrap() = false;
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     }
@@ -6603,6 +6832,62 @@ mod tests {
         assert_eq!(st.pick_runway(170.0, 0.0), "27");
         // Actual wind changes the runway like a real controller would.
         assert_eq!(st.pick_runway(90.0, 10.0), "09");
+    }
+
+    /// Two parallels have the SAME heading to within rounding error, so which
+    /// one "wins" the wind was decided by noise — and nothing in the
+    /// phraseology gives it away, both are "two seven". A silent flip from the
+    /// 27L taxi clearance to 27R pointed the takeoff hold at Heathrow's
+    /// ARRIVAL stream, which never has a 15 s gap: held at November one for
+    /// the full eight minutes and handed back, "traffic on short final" for a
+    /// departure runway that was empty (2026-07-27).
+    #[test]
+    fn parallel_runways_never_trade_places_under_a_departure() {
+        let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
+        // Heathrow's real pair: both 09/27, headings a hundredth of a degree
+        // apart. 09L/27R is first in apt.dat, so it wins any tie.
+        st.apt.runways = vec![
+            nav::Runway {
+                width_m: 50.0,
+                ident_a: "09L".into(),
+                ident_b: "27R".into(),
+                lat_a: 51.4774781,
+                lon_a: -0.4894423,
+                lat_b: 51.4776753,
+                lon_b: -0.4332600,
+            },
+            nav::Runway {
+                width_m: 50.0,
+                ident_a: "09R".into(),
+                ident_b: "27L".into(),
+                lat_a: 51.4647701,
+                lon_a: -0.4867489,
+                lat_b: 51.4649460,
+                lon_b: -0.4340638,
+            },
+        ];
+        // The tower is working 27L — the taxi clearance named it.
+        st.runway_in_use = Some("27L".into());
+        st.twr.state = tower::State::TaxiCleared;
+        // Every subsequent transmission, in any wind, keeps 27L: the departure
+        // is committed and a controller does not move it to the other
+        // parallel mid-sequence.
+        for (from, kts) in [(250.0, 12.0), (270.0, 25.0), (269.0, 8.0), (271.0, 30.0)] {
+            assert_eq!(st.pick_runway(from, kts), "27L", "wind {from}/{kts}");
+        }
+        st.twr.state = tower::State::LinedUp;
+        assert_eq!(st.pick_runway(280.0, 18.0), "27L");
+        st.twr.state = tower::State::TakeoffCleared;
+        assert_eq!(st.pick_runway(260.0, 18.0), "27L");
+
+        // Uncommitted, the hysteresis still holds the pick against a parallel
+        // that is "better" by rounding error...
+        st.twr.state = tower::State::Parked;
+        for (from, kts) in [(250.0, 12.0), (270.0, 20.0), (271.0, 9.0)] {
+            assert_eq!(st.pick_runway(from, kts), "27L", "wind {from}/{kts}");
+        }
+        // ...but a genuine reversal still turns the field around, as it must.
+        assert_eq!(st.pick_runway(90.0, 20.0), "09R");
     }
 
     #[test]

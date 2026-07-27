@@ -79,8 +79,14 @@ async fn main() -> Result<()> {
     // scribble over the dashboard, so it's omitted there (file only).
     let file_appender = tracing_appender::rolling::daily("logs", "x-copilot.log");
     let (file_writer, _log_guard) = tracing_appender::non_blocking(file_appender);
+    // Every workspace crate, not just the crew: since the 2026-07-14 split the
+    // world's tracing lives in `atc` and the Web API client's in `sim`, and a
+    // crew-only filter silently dropped both — "release watch armed" and "wake
+    // clock started" were invisible in flight logs, so a Heathrow departure
+    // held for eight minutes had to be diagnosed by probing the live sim
+    // instead of grepping (2026-07-27).
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "x_copilot=info".into());
+        .unwrap_or_else(|_| "x_copilot=info,atc=info,sim=info".into());
     let stderr_layer =
         (!tui).then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     tracing_subscriber::registry()
@@ -1464,6 +1470,20 @@ async fn run_session(
             }
         }
 
+        // The monitor sequenced a held departure onto the runway while the
+        // wake clock runs: same sync, one state earlier. The hold stays armed
+        // — the release is still to come, now with the aircraft actually at
+        // the front of the queue.
+        if party_line::take_pending_line_up() {
+            if let Some(st) = atc_station.as_mut() {
+                st.apply_monitor_line_up(xplane.view()).await;
+                reporter.log(
+                    ui::LogKind::Info,
+                    "tower: held departure sequenced, line up and wait",
+                );
+            }
+        }
+
         // A go-around the monitor ordered (traffic on the runway): the
         // landing clearance is void in the FSM too, so the coach's next
         // line is the go-around acknowledgment, never the dead clearance's
@@ -1488,6 +1508,17 @@ async fn run_session(
         // radio then, the same rule a keyed transmission follows below.
         {
             let calls = circuit::take_crew_radio();
+            // A discarded transmission is never silent. The queue is drained
+            // unconditionally, so a failed gate loses the call for good — and
+            // the caller (full auto) reads the resulting silence as the TOWER
+            // not answering, which sent it hunting a clearance that was never
+            // asked for (Heathrow 2026-07-27).
+            if !calls.is_empty() && mode::atc_enabled() && !voice.radio_powered() {
+                tracing::warn!(
+                    calls = calls.len(),
+                    "crew radio call dropped: the radio is unpowered"
+                );
+            }
             if !calls.is_empty() && mode::atc_enabled() && voice.radio_powered() {
                 if let Some(st) = atc_station.as_mut() {
                     for call in calls {
