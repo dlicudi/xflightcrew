@@ -611,6 +611,11 @@ pub struct ReferenceProfile {
     pub max_crosswind_kts: Option<f64>, // demonstrated
     #[serde(default)]
     pub cruise_kts: Option<f64>,
+    /// Target INDICATED airspeed to hold in cruise (the autoflight cruise-power
+    /// governor chases this). Distinct from `cruise_kts`, which is the spoken POH
+    /// figure (usually a TAS). `None` = no automatic cruise-power reduction.
+    #[serde(default)]
+    pub cruise_ias_kts: Option<f64>,
     #[serde(default)]
     pub best_climb_fpm: Option<f64>,
     #[serde(default)]
@@ -1348,6 +1353,7 @@ fn cessna_172sp() -> AircraftProfile {
             approach_kts: Some(65.0),
             max_crosswind_kts: Some(15.0),
             cruise_kts: Some(124.0),
+            cruise_ias_kts: Some(108.0), // KIAS to hold in cruise (124 kt TAS)
             best_climb_fpm: Some(730.0),
             max_gross_lb: Some(2558.0),
             empty_weight_lb: Some(1640.0),
@@ -1658,6 +1664,7 @@ fn cirrus_sr22() -> AircraftProfile {
             approach_kts: None,
             max_crosswind_kts: Some(21.0),
             cruise_kts: Some(180.0), // normal cruise (manual lists 213 KTAS max)
+            cruise_ias_kts: None,    // no full-auto for the SR22 yet
             best_climb_fpm: Some(1200.0),
             max_gross_lb: Some(3600.0),
             empty_weight_lb: Some(2354.0),

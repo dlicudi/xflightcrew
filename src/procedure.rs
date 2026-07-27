@@ -112,6 +112,11 @@ pub struct Plan {
     /// the airspeed: an unprotected 700 fpm enroute climb bled 86 knots down
     /// to a 53-knot stall departure at 4,600 ft (LEJR, 2026-07-24).
     pub vy_kts: f64,
+    /// Indicated cruise speed for the cruise-power governor. `Some` on an enroute
+    /// flight arms the speed-hold (throttle finds the power to hold it) for the
+    /// whole leg, released at handoff; `None` leaves the throttle alone (the
+    /// climb-out setting rides through — approaches/SIDs, which manage their own).
+    pub cruise_ias_kts: Option<f64>,
 }
 
 /// The true great-circle bearing to a leg's fix, or `None` for a to-altitude
@@ -234,6 +239,7 @@ pub fn approach_plan_for(
         legs,
         end,
         vy_kts: 0.0,
+        cruise_ias_kts: None, // an approach/SID manages its own speed
     })
 }
 
@@ -356,6 +362,9 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 
 fn stand_down(voice: &Option<Voice>, line: &str, reason: &str) {
     ACTIVE.store(false, Ordering::SeqCst);
+    // Drop any cruise-power hold so nothing keeps working the throttle after we
+    // hand back (no-op if it was never armed).
+    crate::tools::speedhold::release();
     crate::blackbox::record(
         "procedure",
         serde_json::json!({"event": "stand_down", "reason": reason}),
@@ -369,6 +378,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         legs,
         end,
         vy_kts,
+        cruise_ias_kts,
     } = plan;
     let handoff = handoff_index(&legs);
     crate::blackbox::record(
@@ -408,6 +418,22 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // and driven to the real target, the capture works FOR us: it owns the
     // level-off at the constraint more cleanly than the VS chase.
     let mut last_alt_dial: Option<f64> = None;
+
+    // Cruise power: on an enroute flight, arm the flight speed-hold at the
+    // planned indicated cruise speed. The throttle law then FINDS the power —
+    // full while slow (the climb still commands full throttle), settling to
+    // cruise power once at speed, robust to weight/altitude/temp. Pitch (the VS
+    // law below) owns altitude; the governor owns speed. Released at every exit
+    // so autoland/the arrival own the throttle alone.
+    if matches!(end, EndAction::Enroute) {
+        if let Some(kts) = cruise_ias_kts {
+            crate::tools::speedhold::arm_flight(base_url.clone(), voice.clone(), kts);
+            crate::blackbox::record(
+                "procedure",
+                serde_json::json!({"event": "cruise_power", "target_ias": kts}),
+            );
+        }
+    }
 
     let mut idx = 0usize;
     while idx < legs.len() {
@@ -558,6 +584,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     None,
                     None,
                 );
+                crate::tools::speedhold::release();
                 ACTIVE.store(false, Ordering::SeqCst);
                 return;
             }
@@ -578,6 +605,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     }
 
     // Ran off the end of the legs (a departure, or an approach with no handoff).
+    // Drop any cruise-power hold before handing back (no-op if never armed).
+    crate::tools::speedhold::release();
     match end {
         EndAction::Level => {
             crate::blackbox::record("procedure", serde_json::json!({"event": "complete_level"}));
@@ -792,6 +821,7 @@ mod tests {
             legs: vec![faf],
             end: EndAction::Level,
             vy_kts: 0.0,
+            cruise_ias_kts: None,
         };
         // Tight circuit: 0.3 nm from the FAF at 700 ft — NOT flyable (autoland).
         let (near_lat, near_lon) = crate::nav::project_latlon(36.0, -5.0, 0.0, 0.3);

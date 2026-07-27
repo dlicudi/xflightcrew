@@ -162,6 +162,7 @@ reference:
   vs0_kts: 54.0            # stall, landing config (acf_Vso)
   approach_kts: 80.0       # typical short final, flaps down
   cruise_kts: 160.0        # max cruise TAS at 10,000 ft
+  cruise_ias_kts: 130.0    # KIAS the cruise-power governor holds (160 kt TAS); tune in-sim
   max_gross_lb: 12500.0    # MTOW (acf_m_max)
   empty_weight_lb: 7415.0  # 3363 kg per the add-on's W&B manager
   useful_load_lb: 5085.0

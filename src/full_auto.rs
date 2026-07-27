@@ -100,6 +100,9 @@ pub struct SubTools {
     /// The takeoff tool, armed directly on a Flight mission (a circuit brings
     /// its own takeoff inside the circuit orchestrator).
     pub takeoff: crate::tools::takeoff::AutoTakeoff,
+    /// Indicated cruise speed for the enroute cruise-power hold (profile's
+    /// `reference.cruise_ias_kts`); `None` leaves cruise at climb power.
+    pub cruise_ias_kts: Option<f64>,
     pub mission: Mission,
     /// Run the electrical/APU power-up before the engine start. Only turbine
     /// airframes need it — a piston's `start_engine` brings its own battery up,
@@ -708,6 +711,7 @@ async fn fly_route(
             // The climb to cruise runs on the speed-protected law — the
             // unprotected rate stalled the first LEJR climb at 53 knots.
             vy_kts: tools.takeoff.vy_kts,
+            cruise_ias_kts: tools.cruise_ias_kts,
         },
     );
     // Generous ceiling — ABORT bails out of the wait immediately.

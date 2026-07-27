@@ -41,6 +41,9 @@ pub struct FullAuto {
     /// Flap-handle ratio set for takeoff and retracted climbing out (profile's
     /// `flaps.takeoff_ratio`); `None` leaves the flaps alone.
     pub takeoff_flap_ratio: Option<f64>,
+    /// Indicated cruise speed for the enroute cruise-power hold (profile's
+    /// `reference.cruise_ias_kts`); `None` leaves cruise at climb power.
+    pub cruise_ias_kts: Option<f64>,
     /// Constant-speed prop levers, threaded into every ground-roll sub-tool so
     /// they unfeather before taxi/line-up/takeoff. `None` on the pistons.
     pub prop: Option<crate::aircraft::PropProfile>,
@@ -173,6 +176,7 @@ impl Tool for FullAuto {
                 takeoff_roll_m: self.takeoff_roll_m,
                 prop: self.prop.clone(),
             },
+            cruise_ias_kts: self.cruise_ias_kts,
             mission,
             power_up_first: self.power_up_first,
         };

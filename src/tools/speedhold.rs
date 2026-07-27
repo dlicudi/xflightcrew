@@ -118,6 +118,34 @@ pub fn set_taxi_target(kts: f64) {
         *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner()) = clamp_taxi_target(kts);
     }
 }
+
+/// Arm (or retarget) the FLIGHT speed-hold governor from code — the autoflight
+/// cruise-power hold. Same Flight-mode arm the `hold_speed` tool does: sets the
+/// target and, if the governor isn't already running, starts it on its own
+/// thread. Idempotent; a running hold just picks up the new target.
+pub fn arm_flight(base_url: String, voice: Option<crate::voice::Voice>, target_kts: f64) {
+    *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner()) = clamp_target(target_kts);
+    *MODE.lock().unwrap_or_else(|e| e.into_inner()) = Mode::Flight;
+    if !ACTIVE.swap(true, Ordering::Relaxed) {
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                ACTIVE.store(false, Ordering::Relaxed);
+                return;
+            };
+            rt.block_on(governor(XPlaneClient::new(base_url), voice));
+        });
+    }
+}
+
+/// Stand the governor down (no-op if idle) — the follower calls this before
+/// handing off to autoland, which runs its own speed law and must own the
+/// throttle alone.
+pub fn release() {
+    ACTIVE.store(false, Ordering::Relaxed);
+}
 /// Target knots — updated live by a new `hold_speed` call, no restart.
 static TARGET_KTS: Mutex<f64> = Mutex::new(0.0);
 /// The last rolling taxi target, so "go" after a "stop" resumes the same

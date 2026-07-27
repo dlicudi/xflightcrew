@@ -241,6 +241,7 @@ fn build_plan(
                 legs,
                 end: EndAction::Level,
                 vy_kts,
+                cruise_ias_kts: None, // a SID/approach manages its own speed
             },
             ack,
         ));

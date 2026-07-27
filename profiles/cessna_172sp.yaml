@@ -95,6 +95,7 @@ reference:
   approach_kts: 65.0
   max_crosswind_kts: 15.0  # demonstrated
   cruise_kts: 124.0
+  cruise_ias_kts: 108.0    # KIAS the cruise-power governor holds (124 kt TAS); tune in-sim
   best_climb_fpm: 730.0
   max_gross_lb: 2558.0
   empty_weight_lb: 1640.0
