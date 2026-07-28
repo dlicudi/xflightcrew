@@ -67,6 +67,11 @@ struct LoadWindow {
     slowest_ms: u64,
     /// Reads served from the value cache — requests the sim never saw.
     cache_hits: u64,
+    /// Requests per dataref name, so a load report names the hogs. Cutting a
+    /// rate needs to know what it is MADE of: the first cache attempt assumed
+    /// duplication and recovered 2.5%, because the loops each read different
+    /// datarefs rather than the same ones twice (2026-07-28).
+    by_name: std::collections::HashMap<String, u64>,
 }
 
 static LOAD: std::sync::Mutex<Option<LoadWindow>> = std::sync::Mutex::new(None);
@@ -82,6 +87,14 @@ fn note_cache_hit() {
 
 /// Account for one attempt against the API — one actual trip to the socket,
 /// which is what the sim pays for, not one logical operation.
+/// Attribute one request to the dataref it was for.
+fn note_named(name: &str) {
+    let mut guard = LOAD.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(w) = guard.as_mut() {
+        *w.by_name.entry(name.to_string()).or_insert(0) += 1;
+    }
+}
+
 fn note_request(elapsed: std::time::Duration, ok: bool) {
     let mut guard = LOAD.lock().unwrap_or_else(|e| e.into_inner());
     let w = guard.get_or_insert_with(|| LoadWindow {
@@ -90,6 +103,7 @@ fn note_request(elapsed: std::time::Duration, ok: bool) {
         failures: 0,
         slowest_ms: 0,
         cache_hits: 0,
+        by_name: std::collections::HashMap::new(),
     });
     w.requests += 1;
     w.failures += u64::from(!ok);
@@ -108,9 +122,13 @@ fn note_request(elapsed: std::time::Duration, ok: bool) {
         slowest_ms = w.slowest_ms,
         "web api load"
     );
+    let mut top: Vec<(String, u64)> = w.by_name.drain().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.truncate(8);
     crate::blackbox::record(
         "api_load",
         serde_json::json!({
+            "top": top.iter().map(|(n, c)| format!("{n} x{c}")).collect::<Vec<_>>(),
             "rate_per_s": (rate * 10.0).round() / 10.0,
             "requests": w.requests,
             "cache_hits": w.cache_hits,
@@ -125,6 +143,7 @@ fn note_request(elapsed: std::time::Duration, ok: bool) {
         failures: 0,
         slowest_ms: 0,
         cache_hits: 0,
+        by_name: std::collections::HashMap::new(),
     };
 }
 
@@ -296,6 +315,7 @@ impl XPlaneClient {
     /// (the poller hits this every frame), drop the stale id and resolve by name
     /// again. `decoding` labels the JSON-decode step for error context.
     async fn get_value(&self, name: &str, decoding: &'static str) -> Result<serde_json::Value> {
+        note_named(name);
         let ttl = value_cache_ttl();
         if !ttl.is_zero() {
             if let Some((at, v)) = self.value_cache.lock().await.get(name) {

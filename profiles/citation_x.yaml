@@ -14,7 +14,14 @@ display_name: Cessna Citation X
 # Capability flags.
 autopilot: true        # set_heading / set_altitude / set_vertical_speed
 throttle: true         # thrust levers — jet, so NO piston engine group
-autothrottle: true     # set_speed (AP speed bug) + autothrottle on/off
+# NO autothrottle. The real Citation X has one; this X-Plane model does not —
+# there is not a single mention of one anywhere in its xlua scripts, and the
+# `autothrottle` tool is written against laminar/md82 datarefs regardless.
+# Declaring it also WITHHELD `hold_speed`, so "reduce speed" reached a tool
+# that sets an AP speed bug with nothing behind it while the tool that could
+# have worked the levers was not registered at all (2026-07-28). Speed here is
+# the throttle governor's job, or FLC's in a climb or descent.
+autothrottle: false
 speedbrake: true       # the wing spoilers double as speedbrakes
 barometer: true
 pitot_heat: true

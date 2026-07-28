@@ -7139,6 +7139,16 @@ mod tests {
             p.reference.as_ref().and_then(|r| r.takeoff_distance_ft),
             Some(7450.0)
         );
+        // This model has no autothrottle, whatever the real aircraft has: the
+        // speed tool must be the throttle governor, not an AP bug with nothing
+        // behind it. Declaring one also withheld `hold_speed` entirely, so
+        // "reduce speed" did nothing at all (2026-07-28).
+        let cit_reg = super::tools::Registry::for_aircraft(
+            &super::aircraft::load("citation_x").expect("citation_x loads"),
+        );
+        assert!(cit_reg.get("hold_speed").is_some(), "speed is the governor's");
+        assert!(cit_reg.get("set_speed").is_none());
+        assert!(cit_reg.get("autothrottle").is_none());
         // A toggle-only system must not be skipped by the bulk power-up: the
         // Citation's avionics master has no ON command, so "all electrical on"
         // fired nothing for it and full auto left the radios dead while
