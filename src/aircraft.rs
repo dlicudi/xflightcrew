@@ -471,9 +471,20 @@ pub struct ApuStartProfile {
     /// Toggle for the APU master, fired only if `master_readback` says it's off.
     pub master_toggle: String,
     pub master_readback: String,
-    /// Commands that drive the starter switch to its start position, in order
-    /// (the Citation X's is a 3-position switch needing two "up"s).
+    /// The starter command, HELD until the APU lights (see `light_n1`).
+    ///
+    /// It is a spring-loaded momentary on the Citation X, and the script only
+    /// engages the starter after the command has been held longer than a
+    /// second: `phase == 1 and duration > 1.0`, springing back to ON the
+    /// instant it is released. Firing it twice for a second and a half each —
+    /// which is what "press it, then press it again" looks like in code — gives
+    /// the APU about half a second of starter and it never lights.
     pub starter_commands: Vec<String>,
+    /// APU speed at which it is lit and self-sustaining, so the starter can be
+    /// let go and it spools to `ready_n1` on its own. The aircraft's own
+    /// checklist says "HOLD TILL START" against N1 > 10.
+    #[serde(default = "default_apu_light_n1")]
+    pub light_n1: f64,
     /// APU speed dataref and the value that counts as running.
     pub n1_dataref: String,
     #[serde(default = "default_apu_ready_n1")]
@@ -488,6 +499,9 @@ pub struct ApuStartProfile {
 
 fn default_apu_ready_n1() -> f64 {
     95.0
+}
+fn default_apu_light_n1() -> f64 {
+    15.0
 }
 fn default_apu_ready_secs() -> f64 {
     90.0

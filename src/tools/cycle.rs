@@ -583,17 +583,31 @@ async fn start_apu(ctx: &ToolCtx<'_>, apu: &crate::aircraft::ApuStartProfile) ->
             let _ = ctx.xplane.run_command(&apu.master_toggle).await;
             tokio::time::sleep(Duration::from_millis(800)).await;
         }
-        for cmd in &apu.starter_commands {
-            let _ = ctx.xplane.run_command_for(cmd, 1.5).await;
-            tokio::time::sleep(Duration::from_millis(700)).await;
-        }
-        let deadline = (apu.ready_secs / 1.0) as u32;
-        let mut up = false;
-        for _ in 0..deadline {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if ctx.xplane.get_float(&apu.n1_dataref).await.unwrap_or(0.0) >= apu.ready_n1 {
-                up = true;
+        // HOLD the starter until it lights. The switch is spring-loaded and the
+        // script arms the starter only past a second of hold, so a press — even
+        // a press repeated — buys a fraction of a second of cranking and the
+        // APU never catches. Re-armed on a cadence shorter than each hold, so
+        // the switch never springs back mid-start.
+        let mut lit = false;
+        for _ in 0..(apu.ready_secs / 1.5) as u32 {
+            for cmd in &apu.starter_commands {
+                let _ = ctx.xplane.run_command_for(cmd, 2.0).await;
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if ctx.xplane.get_float(&apu.n1_dataref).await.unwrap_or(0.0) >= apu.light_n1 {
+                lit = true;
                 break;
+            }
+        }
+        // Lit and self-sustaining: let the switch go and let it spool up.
+        let mut up = false;
+        if lit {
+            for _ in 0..(apu.ready_secs as u32) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if ctx.xplane.get_float(&apu.n1_dataref).await.unwrap_or(0.0) >= apu.ready_n1 {
+                    up = true;
+                    break;
+                }
             }
         }
         if !up {
