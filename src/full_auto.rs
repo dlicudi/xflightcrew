@@ -94,6 +94,8 @@ pub struct SubTools {
     /// the generators and bleed air (which feed the Twin Otter's autopilot) come
     /// on, not just the cranking bus.
     pub all_electrical_on_cmds: Vec<String>,
+    /// Toggle-only electrical switches: read, then fired only if off.
+    pub all_electrical_toggles: Vec<crate::aircraft::ToggleSwitch>,
     pub taxi: crate::tools::taxi::AutoTaxi,
     pub line_up: crate::tools::taxi::LineUp,
     pub circuit: crate::tools::circuit::Circuit,
@@ -301,9 +303,19 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // anti-ice, so a circuit flown without them has no servos. Skipped when
         // PowerUp already ran the bus (jets), and a no-op on airframes with no
         // electrical profile. Battery/master re-fire harmlessly.
-        if !tools.power_up_first && !tools.all_electrical_on_cmds.is_empty() {
+        if !tools.power_up_first
+            && !(tools.all_electrical_on_cmds.is_empty() && tools.all_electrical_toggles.is_empty())
+        {
             for cmd in &tools.all_electrical_on_cmds {
                 let _ = xp.run_command(cmd).await;
+            }
+            // Toggle-only systems have no ON command, so a bulk power-up that
+            // fires command lists skips them SILENTLY. That left the Citation's
+            // avionics master off after "electrical set", and the radios dead.
+            for t in &tools.all_electrical_toggles {
+                if xp.get_float(&t.dataref).await.unwrap_or(0.0) <= 0.5 {
+                    let _ = xp.run_command(&t.command).await;
+                }
             }
             announce(
                 &voice,
@@ -312,7 +324,10 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             );
             event(
                 "electrical_set",
-                json!({ "cmds": tools.all_electrical_on_cmds.len() }),
+                json!({
+                    "cmds": tools.all_electrical_on_cmds.len(),
+                    "toggles": tools.all_electrical_toggles.len(),
+                }),
             );
         }
     }

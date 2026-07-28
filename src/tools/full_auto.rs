@@ -97,6 +97,8 @@ pub struct FullAuto {
     /// engine catches (generators AND bleed air, which feed the Twin Otter's
     /// autopilot). Empty on airframes with no electrical profile.
     pub all_electrical_on_cmds: Vec<String>,
+    /// Toggle-only electrical switches (see `tools::all_electrical_toggles`).
+    pub all_electrical_toggles: Vec<crate::aircraft::ToggleSwitch>,
     // taxi / line-up
     pub park_brake_valve_set: Option<f64>,
     pub takeoff_roll_m: Option<f64>,
@@ -238,6 +240,7 @@ impl Tool for FullAuto {
             },
             bus_power_on_cmds: self.bus_power_on_cmds.clone(),
             all_electrical_on_cmds: self.all_electrical_on_cmds.clone(),
+            all_electrical_toggles: self.all_electrical_toggles.clone(),
             taxi: crate::tools::taxi::AutoTaxi {
                 park_brake_valve_set: self.park_brake_valve_set,
                 prop: self.prop.clone(),

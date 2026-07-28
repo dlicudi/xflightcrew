@@ -7139,6 +7139,16 @@ mod tests {
             p.reference.as_ref().and_then(|r| r.takeoff_distance_ft),
             Some(7450.0)
         );
+        // A toggle-only system must not be skipped by the bulk power-up: the
+        // Citation's avionics master has no ON command, so "all electrical on"
+        // fired nothing for it and full auto left the radios dead while
+        // announcing the electrical was set (2026-07-28).
+        let cit = super::aircraft::load("citation_x").expect("citation_x loads");
+        let toggles = super::tools::all_electrical_toggles(&cit.electrical);
+        assert!(
+            toggles.iter().any(|t| t.dataref.contains("avionics")),
+            "the bulk power-up must reach the avionics master"
+        );
         // The ground drives exist on a jet too. They were gated behind
         // `!autothrottle` alongside the airborne speed tool, so neither jet had
         // a taxi, line-up or park tool and "taxi for me" reached nothing —

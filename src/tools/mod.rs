@@ -311,6 +311,7 @@ impl Registry {
                     piston_engine: profile.engine || profile.piston_start.is_some(),
                     turboprop_start: profile.turboprop_start.clone(),
                     all_electrical_on_cmds: all_electrical_on_cmds(&profile.electrical),
+                    all_electrical_toggles: all_electrical_toggles(&profile.electrical),
                     cfg: ap,
                     vr_kts: vr,
                     vy_kts: vy,
@@ -626,6 +627,21 @@ pub fn bus_power_on_cmds(systems: &[crate::aircraft::ElectricalSystem]) -> Vec<S
 /// the autopilot and anti-ice, so a circuit flown without them is a circuit
 /// with no servos. Empty on airframes with no electrical profile (the 172,
 /// which powers its own bus at start). Battery/master re-fire harmlessly.
+/// Every toggle-only switch across the airframe's electrical systems.
+///
+/// A bulk power-up that fires `on_commands` skips these entirely, because a
+/// toggle-driven system HAS no on command — and skipping is silent. The
+/// Citation X's avionics master is toggle-only, so full auto powered up,
+/// announced "generators and bleeds on", and left the radios dead; the copilot
+/// then correctly reported "we're not transmitting, check the avionics master"
+/// about a switch it had just declined to touch (2026-07-28). Fired only where
+/// the readback says the system is actually off.
+pub fn all_electrical_toggles(
+    systems: &[crate::aircraft::ElectricalSystem],
+) -> Vec<crate::aircraft::ToggleSwitch> {
+    systems.iter().flat_map(|s| s.toggles.clone()).collect()
+}
+
 pub fn all_electrical_on_cmds(systems: &[crate::aircraft::ElectricalSystem]) -> Vec<String> {
     let mut cmds: Vec<String> = Vec::new();
     for s in systems {
