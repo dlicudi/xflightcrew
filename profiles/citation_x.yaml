@@ -58,9 +58,29 @@ auto_prep: false
 # right, but the generic sequence watched 12% N1 — a threshold the AE3007 does
 # not reach until after its own starter has already quit. Hence `fuel_intro_n2`.
 turboprop_start:
+  # The APU first — without its bleed the engines do not turn AT ALL. Verified
+  # live: APU off, the starter command is accepted, the annunciator lights and
+  # ignition_key goes to 4, and N2 stays flat at zero; APU generator and bleed
+  # on, the same command spooled N2 0 to 30 percent in fifteen seconds. Its
+  # generator also powers bus_volts[1], which is the bus CitX_engine.lua reads
+  # for the LEFT starter and which batteries alone leave dead. Timings are the
+  # ones measured by hand: master, two ups on the starter switch, ~25 s to 100
+  # percent N1, then generator and bleed.
+  apu:
+    master_toggle: laminar/CitX/APU/master_switch_toggle
+    master_readback: laminar/CitX/APU/master_switch
+    starter_commands: [laminar/CitX/APU/starter_switch_up, laminar/CitX/APU/starter_switch_up]
+    n1_dataref: sim/cockpit/engine/APU_N1
+    ready_n1: 95.0
+    ready_secs: 90.0
+    after_ready_commands: [laminar/CitX/APU/gen_switch_up, laminar/CitX/APU/bleed_switch_up]
   condition_lever: sim/cockpit2/engine/actuators/mixture_ratio  # fuel cutoff -> idle
-  condition_start: 1.0
-  condition_run: 1.0
+  # Fuel-on is 0.5, not 1.0: with the ground-idle switch NORM the throttle
+  # script clamps mixture to idle_max_value = 0.5 (it writes
+  # mixture = (1 - lever) * 0.5 below idle). Writing 1.0 lands at 0.5 anyway —
+  # observed live — but say what we mean.
+  condition_start: 0.5
+  condition_run: 0.5
   starter_held: true          # phase==1 && duration>0.1 — a press is a no-op
   fuel_intro_n2: 10.0         # the aircraft's own figure
   n1_idle: 18.0               # AE3007 ground idle; the PT6 default of 50 never arrives

@@ -561,6 +561,58 @@ async fn n1_percent(ctx: &ToolCtx<'_>, idx: usize) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Bring the APU up and open its bleed, so the engines have something to be
+/// motored by. `Err` carries the line to speak when it doesn't come up.
+async fn start_apu(ctx: &ToolCtx<'_>, apu: &crate::aircraft::ApuStartProfile) -> Result<(), String> {
+    let running = ctx
+        .xplane
+        .get_float(&apu.n1_dataref)
+        .await
+        .unwrap_or(0.0);
+    if running < apu.ready_n1 {
+        // The master is a toggle on every airframe seen so far: read it, and
+        // fire only if it's actually off. Blind toggling switches OFF an APU
+        // that a previous attempt already started.
+        let master_on = ctx
+            .xplane
+            .get_float(&apu.master_readback)
+            .await
+            .unwrap_or(0.0)
+            > 0.5;
+        if !master_on {
+            let _ = ctx.xplane.run_command(&apu.master_toggle).await;
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+        for cmd in &apu.starter_commands {
+            let _ = ctx.xplane.run_command_for(cmd, 1.5).await;
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
+        let deadline = (apu.ready_secs / 1.0) as u32;
+        let mut up = false;
+        for _ in 0..deadline {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if ctx.xplane.get_float(&apu.n1_dataref).await.unwrap_or(0.0) >= apu.ready_n1 {
+                up = true;
+                break;
+            }
+        }
+        if !up {
+            return Err(
+                "The APU didn't come up, so there's no bleed air to turn the engines. Your aircraft."
+                    .to_string(),
+            );
+        }
+    }
+    // Generator and bleed: the engines need the air, and the left starter needs
+    // the bus the APU generator powers.
+    for cmd in &apu.after_ready_commands {
+        let _ = ctx.xplane.run_command(cmd).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    Ok(())
+}
+
 async fn n2_percent(ctx: &ToolCtx<'_>, idx: usize) -> f64 {
     ctx.xplane
         .get_float_array(N2_PERCENT)
@@ -621,6 +673,19 @@ impl Tool for StartTurbines {
             return Ok(format!(
                 "No bus power, only {volts:.0} volts — battery on (or ground power) before starting."
             ));
+        }
+
+        // A turbofan is motored by BLEED AIR: without the APU running and its
+        // bleed open, the starter command is accepted, the annunciator lights,
+        // ignition_key goes to 4 — and the engine does not turn at all. Proven
+        // live on the Citation X (2026-07-28): APU off, N2 flat at zero; APU
+        // generator and bleed on, the same command spooled N2 0 -> 30% in
+        // fifteen seconds. Its generator also powers the bus the left starter's
+        // own gate reads, which batteries alone leave dead.
+        if let Some(apu) = &self.start.apu {
+            if let Err(why) = start_apu(ctx, apu).await {
+                return Ok(why);
+            }
         }
 
         let mut started = 0usize;
@@ -784,6 +849,30 @@ mod tests {
     /// 40% N2, which an AE3007 reaches with N1 barely off the stop — so waiting
     /// for 12% N1 there means the starter quits before fuel is ever introduced
     /// and the engine never lights (2026-07-28).
+    /// A turbofan is motored by BLEED AIR. Without the APU the starter is
+    /// accepted and the engine does not turn — proven live on the Citation X
+    /// (2026-07-28): N2 flat at zero with the APU off, 0 to 30% in fifteen
+    /// seconds with its generator and bleed on. "Cranking, nothing lit" was
+    /// the sequence doing everything right with no air to do it with.
+    #[test]
+    fn a_turbofan_start_brings_the_apu_up_first() {
+        let p = crate::aircraft::load("citation_x").expect("citation_x loads");
+        let s = p.turboprop_start.expect("start sequence");
+        let apu = s.apu.expect("a jet start needs the APU");
+        assert!(!apu.starter_commands.is_empty());
+        assert!(apu.ready_n1 >= 90.0, "wait for a RUNNING APU: {}", apu.ready_n1);
+        // Generator AND bleed: the air motors the engine, the generator powers
+        // the bus the left starter's own gate reads.
+        assert_eq!(apu.after_ready_commands.len(), 2, "generator and bleed");
+        // Free turbines have no APU step at all.
+        for id in ["dhc6_twin_otter", "king_air_c90b", "lancair_evolution"] {
+            let t = crate::aircraft::load(id)
+                .and_then(|a| a.turboprop_start)
+                .unwrap_or_else(|| panic!("{id} start"));
+            assert!(t.apu.is_none(), "{id} needs no APU");
+        }
+    }
+
     #[test]
     fn a_turbofan_introduces_fuel_on_n2_not_n1() {
         let p = crate::aircraft::load("citation_x").expect("citation_x loads");
