@@ -53,7 +53,13 @@ pub(crate) const LON: &str = "sim/flightmodel/position/longitude";
 /// east/north frame — never the magnetic compass.
 pub(crate) const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
-const THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
+/// The thrust lever THIS airframe obeys — not always the stock one (the
+/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
+/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
+/// thrust). Resolved per call, so a profile swap takes effect immediately.
+fn throttle_dref() -> String {
+    crate::aircraft::throttle_dataref()
+}
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 /// The plugin's proportional steering channel (-1..1, right positive).
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
@@ -93,11 +99,64 @@ const JOIN_ERR_SLOW_DEG: f64 = 60.0;
 /// Full steering deflection at this much heading error.
 const STEER_FULL_DEG: f64 = 30.0;
 /// Route bends at/above this (smoothed like the guide's cues) slow the
-/// schedule to [`TURN_KTS`]; at/above `SHARP_DEG`, to [`SHARP_KTS`].
+/// schedule to the pace's turn cap; at/above `SHARP_DEG`, to its sharp cap.
 const TURN_DEG: f64 = 30.0;
 const SHARP_DEG: f64 = 100.0;
+/// The GA pace, tuned on the 172 and the default for any airframe whose
+/// profile declares nothing. See [`Pace`].
+const STRAIGHT_KTS: f64 = 10.0;
 const TURN_KTS: f64 = 6.0;
 const SHARP_KTS: f64 = 4.0;
+
+/// How briskly this airframe taxis: the straight-leg pace and the two bend
+/// caps. Carried BY THE ROUTE, not a process-wide static, so a profile swap
+/// can't leave the last aircraft's pace pointed at the next one — the same
+/// trap the radio-power latch and the transponder knob selector fell into.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pace {
+    pub straight: f64,
+    pub turn: f64,
+    pub sharp: f64,
+}
+
+impl Default for Pace {
+    fn default() -> Self {
+        Pace {
+            straight: STRAIGHT_KTS,
+            turn: TURN_KTS,
+            sharp: SHARP_KTS,
+        }
+    }
+}
+
+impl Pace {
+    /// Resolve an airframe's declared pacing, field by field — anything the
+    /// profile leaves out keeps the GA figure.
+    pub fn from_profile(t: Option<&crate::aircraft::TaxiProfile>) -> Pace {
+        let d = Pace::default();
+        let Some(t) = t else { return d };
+        // Clamped to the governor's own taxi ceiling: a profile typo must not
+        // become a takeoff roll with the tower's route as its plan.
+        Pace {
+            straight: t
+                .kts
+                .map_or(d.straight, crate::tools::speedhold::clamp_taxi_target),
+            turn: t.turn_kts.map_or(d.turn, |k| k.clamp(2.0, 25.0)),
+            sharp: t.sharp_kts.map_or(d.sharp, |k| k.clamp(2.0, 25.0)),
+        }
+    }
+
+    /// The speed cap while joining: a turn-around happens at the sharp-corner
+    /// pace, an aligned rejoin at ordinary bend speed. Never the open-taxiway
+    /// pace — the aircraft is off the pavement it was cleared on.
+    pub fn join_cap_kts(&self, err_deg: f64) -> f64 {
+        if err_deg.abs() > JOIN_ERR_SLOW_DEG {
+            self.sharp
+        } else {
+            self.turn
+        }
+    }
+}
 /// Bearing smoothing window for bend detection, meters (the guide's value:
 /// densely-noded fillet arcs must not read as hairpins).
 const WINDOW_M: f64 = 15.0;
@@ -106,6 +165,20 @@ const WINDOW_M: f64 = 15.0;
 /// `autoland::ACTIVE`. Cleared by the loop itself, the release path in
 /// main, or the `auto_taxi` tool's off switch.
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// True while a BACKTRACK is in progress, including the gap between its two
+/// legs. `ACTIVE` alone drops false in that gap — leg one ends, the supervisor
+/// builds leg two, and a caller polling `ACTIVE` sees "the drive is finished"
+/// for a moment that isn't. Full auto did exactly that and called a running
+/// line-up a failure one second after leg two engaged (Luton, 2026-07-28).
+pub static BACKTRACKING: AtomicBool = AtomicBool::new(false);
+
+/// True while ANY auto drive owns the aircraft — the drive itself, or a
+/// backtrack between its legs. What a caller waiting for "are we there yet"
+/// should poll.
+pub fn driving() -> bool {
+    ACTIVE.load(Ordering::Relaxed) || BACKTRACKING.load(Ordering::Relaxed)
+}
+
 /// Whether the LAST drive ended by ARRIVING at its stop (vs a handback,
 /// arrest, or off-route stand-down). The backtrack supervisor reads this to
 /// decide whether leg two may begin — any other ending already spoke and
@@ -136,6 +209,9 @@ pub struct Route {
     /// Overrides the arrival line when set — a LINE-UP drive ends with
     /// "Lined up runway two seven", not "Holding point".
     pub done_line: Option<String>,
+    /// This airframe's pacing. `build` defaults it to the GA figures; the
+    /// arming tool sets the flying aircraft's own (see [`Pace`]).
+    pub pace: Pace,
 }
 
 impl Route {
@@ -179,6 +255,7 @@ impl Route {
             bends,
             holding_point: crate::station::spoken_taxiway(&watch.holding_point),
             done_line: None,
+            pace: Pace::default(),
         })
     }
 
@@ -220,9 +297,9 @@ impl Route {
             .filter(|(at, _)| progress < at + 15.0 && at - progress < lead)
             .map(|&(_, deg)| {
                 if deg >= SHARP_DEG {
-                    SHARP_KTS
+                    self.pace.sharp
                 } else {
-                    TURN_KTS
+                    self.pace.turn
                 }
             })
             .fold(None, |acc: Option<f64>, cap| {
@@ -287,17 +364,6 @@ pub fn join_allowance_m(lateral: f64, err_deg: f64) -> f64 {
 /// True when a join has captured the route: close in and pointed along it.
 pub fn join_done(lateral: f64, err_deg: f64) -> bool {
     lateral < JOIN_DONE_LAT_M && err_deg.abs() < JOIN_DONE_ERR_DEG
-}
-
-/// The speed cap while joining: a turn-around happens at the sharp-corner
-/// pace, an aligned rejoin at ordinary bend speed. Never the open-taxiway
-/// pace — the aircraft is off the pavement it was cleared on.
-pub fn join_cap_kts(err_deg: f64) -> f64 {
-    if err_deg.abs() > JOIN_ERR_SLOW_DEG {
-        SHARP_KTS
-    } else {
-        TURN_KTS
-    }
 }
 
 // ---- Line-up: from the hold-short position onto the runway centreline ----
@@ -541,6 +607,83 @@ pub fn backtrack_pocket_path(
     Some(vec![(lat, lon), entry, turn_start, pocket])
 }
 
+/// The same backtrack, entering the runway along the AUTHORED lead-on — the
+/// painted line from the holding point onto the centreline — instead of a
+/// diagonal aimed at a point down the strip.
+///
+/// The plain line-up learned this in 2026-07-24 ([`line_up_path_from_lead_on`]);
+/// the backtrack kept its diagonal and it put an MD-82 in the grass at Luton
+/// (2026-07-27). Its leg one ran from the holding point to a centreline point
+/// 30 to 60 m nearer the threshold — 23 degrees off the stub the aircraft was
+/// standing on — so the drive left the pavement within fifty metres, bogged,
+/// and the governor called it stagnant with the aircraft off the taxiway. The
+/// entry is not ours to invent: the stub is drawn, and the only question is
+/// which way we turn at the top of it.
+pub fn backtrack_pocket_path_from_lead_on(
+    rwy: &crate::autoland::Runway,
+    lat: f64,
+    lon: f64,
+    lead_on: &[(f64, f64)],
+) -> Option<Vec<(f64, f64)>> {
+    use crate::autoland::{along_track_nm, cross_track_nm, haversine_nm, project_latlon};
+    let dist_m = |a: (f64, f64), b: (f64, f64)| haversine_nm(a.0, a.1, b.0, b.1) * M_PER_NM;
+    let (&first, &last) = (lead_on.first()?, lead_on.last()?);
+    // OURS, and ending on THIS centreline — the same two tests the plain
+    // lead-on line-up applies, for the same reason: a foreign stub is
+    // displaced along the runway, not merely far away.
+    let a_air = -along_track_nm(lat, lon, rwy) * M_PER_NM;
+    if (-along_track_nm(first.0, first.1, rwy) * M_PER_NM - a_air).abs() > 80.0 {
+        return None;
+    }
+    if (cross_track_nm(last.0, last.1, rwy) * M_PER_NM).abs() > 20.0 {
+        return None;
+    }
+    // Same "is a backtrack worth it" test as the synthetic version — measured
+    // from the AIRCRAFT, not the junction: near the numbers the plain line-up
+    // already stops within a plane-length or two of them. And the junction has
+    // to sit beyond the turn pocket, or there is nothing to drive back along.
+    if a_air < BACKTRACK_MIN_M {
+        return None;
+    }
+    let junction_a = -along_track_nm(last.0, last.1, rwy) * M_PER_NM;
+    if junction_a < BACKTRACK_TURN_START_M + 30.0 {
+        return None;
+    }
+    let c = |d_m: f64| project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, d_m / M_PER_NM);
+    let turn_start = c(BACKTRACK_TURN_START_M);
+    let entry_ct_m = cross_track_nm(lat, lon, rwy) * M_PER_NM;
+    let pocket_bearing = if entry_ct_m >= 0.0 {
+        rwy.course_deg + 90.0
+    } else {
+        rwy.course_deg - 90.0
+    };
+    let mid = c(BACKTRACK_TURN_START_M / 2.0);
+    let pocket = project_latlon(
+        mid.0,
+        mid.1,
+        pocket_bearing,
+        BACKTRACK_POCKET_OFFSET_M / M_PER_NM,
+    );
+    // Aircraft, up the drawn stub, a fillet around the junction (the network
+    // draws a right angle, the paint curves), then down the strip to the
+    // pocket.
+    let mut path = vec![(lat, lon)];
+    path.extend(
+        lead_on
+            .iter()
+            .copied()
+            .filter(|p| dist_m((lat, lon), *p) > 5.0),
+    );
+    let corner = path.pop()?;
+    if path.is_empty() {
+        return None;
+    }
+    path.extend(fillet_corner(*path.last()?, corner, turn_start, 18.0));
+    path.push(turn_start);
+    path.push(pocket);
+    (path.len() >= 4).then_some(path)
+}
+
 /// How a line-up will be driven: straight on, or the full-length backtrack.
 pub enum LineUpPlan {
     Plain(Vec<(f64, f64)>),
@@ -601,7 +744,13 @@ pub fn pick_line_up_plan(
             || plain.is_none()
             || deep_intersection;
         let plan = if wants_backtrack {
-            match backtrack_pocket_path(r, lat, lon) {
+            // The drawn stub first, here too — a backtrack still has to get
+            // ONTO the runway, and inventing that entry is what put an
+            // aircraft in the grass (see `backtrack_pocket_path_from_lead_on`).
+            let via_lead_bt = lead_on
+                .and_then(|lo| backtrack_pocket_path_from_lead_on(r, lat, lon, lo))
+                .or_else(|| backtrack_pocket_path(r, lat, lon));
+            match via_lead_bt {
                 Some(p) => Some(LineUpPlan::Backtrack(p)),
                 None => plain.map(LineUpPlan::Plain),
             }
@@ -713,6 +862,10 @@ pub fn start_backtrack(
     rwy: crate::autoland::Runway,
     base_kts: f64,
 ) {
+    // Leg two is built here, far from the tool that knows the airframe — carry
+    // the pace across rather than letting the fresh route fall back to GA.
+    let pace = route.pace;
+    BACKTRACKING.store(true, Ordering::Relaxed);
     start(base_url.clone(), voice.clone(), route, base_kts);
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -731,19 +884,23 @@ pub fn start_backtrack(
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             if ACTIVE.load(Ordering::Relaxed) || !LAST_ARRIVED.load(Ordering::Relaxed) {
+                BACKTRACKING.store(false, Ordering::Relaxed);
                 return; // taken over, arrested, or still (impossibly) driving
             }
             if !crate::tools::speedhold::taxi_hold_active() {
+                BACKTRACKING.store(false, Ordering::Relaxed);
                 return; // speed authority gone with leg one — nobody drives
             }
             let xp = XPlaneClient::new(base_url.clone());
             let (Ok(lat), Ok(lon)) = (xp.get_float(LAT).await, xp.get_float(LON).await) else {
+                BACKTRACKING.store(false, Ordering::Relaxed);
                 return;
             };
             // Leg two of a backtrack: the aircraft has turned around and is
             // already aligned down the strip, so the diagonal fallback (None)
             // is correct — there is no lead-on to follow here.
             let Some(path) = line_up_path(&rwy, lat, lon, None) else {
+                BACKTRACKING.store(false, Ordering::Relaxed);
                 alert(
                     &voice,
                     Priority::Caution,
@@ -759,6 +916,7 @@ pub fn start_backtrack(
                 lead_on: Vec::new(),
             };
             let Some(mut route2) = Route::build(&watch) else {
+                BACKTRACKING.store(false, Ordering::Relaxed);
                 alert(
                     &voice,
                     Priority::Caution,
@@ -767,6 +925,7 @@ pub fn start_backtrack(
                 return;
             };
             let spoken = crate::atis::spoken_runway(&rwy.id);
+            route2.pace = pace;
             route2.done_line = Some(format!("Lined up runway {spoken}. Holding position."));
             crate::blackbox::record(
                 "autotaxi",
@@ -774,6 +933,8 @@ pub fn start_backtrack(
             );
             crate::tools::speedhold::set_taxi_target(base_kts);
             start(base_url, voice, route2, base_kts);
+            // Leg two owns ACTIVE from here.
+            BACKTRACKING.store(false, Ordering::Relaxed);
         });
     });
 }
@@ -837,7 +998,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
                 "auto taxi: taxi hold gone, arresting and releasing"
             );
             if on_ground {
-                let _ = xp.set_float(THROTTLE, 0.0).await;
+                let _ = xp.set_float(&throttle_dref(), 0.0).await;
                 if xp
                     .run_command_for(crate::tools::BRAKES_REGULAR, crate::tools::BRAKE_HOLD_SECS)
                     .await
@@ -1068,7 +1229,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         if !ext_stopped {
             let mut sched = schedule_kts(base, &route, progress, gs_kts);
             if join_allow.unwrap_or(0.0) > 0.0 {
-                sched = sched.min(join_cap_kts(err));
+                sched = sched.min(route.pace.join_cap_kts(err));
             }
             if (sched - last_sched).abs() > 0.01 {
                 speedhold::set_taxi_target(sched);
@@ -1210,6 +1371,53 @@ mod tests {
     }
 
     #[test]
+    fn an_airframes_own_pace_drives_the_bend_caps() {
+        // The 172 default is unchanged by the profile hook existing at all.
+        let ga = Route::build(&watch()).expect("route");
+        assert_eq!(ga.pace, Pace::default());
+        assert_eq!(schedule_kts(10.0, &ga, 170.0, 10.0), TURN_KTS);
+
+        // A jet declares its own: 18 down the straight, 10 through the bends.
+        let mut jet = Route::build(&watch()).expect("route");
+        jet.pace = Pace::from_profile(Some(&crate::aircraft::TaxiProfile {
+            kts: Some(18.0),
+            turn_kts: Some(10.0),
+            sharp_kts: Some(6.0),
+        }));
+        assert_eq!(jet.pace.straight, 18.0);
+        assert_eq!(schedule_kts(18.0, &jet, 50.0, 18.0), 18.0, "open taxiway");
+        assert_eq!(schedule_kts(18.0, &jet, 170.0, 18.0), 10.0, "into the bend");
+        // The stop is still a stop, at any pace.
+        assert_eq!(schedule_kts(18.0, &jet, jet.total - STOP_SHORT_M, 3.0), 0.0);
+        // Turn-arounds stay at the sharp crawl on both airframes.
+        assert_eq!(jet.pace.join_cap_kts(-170.0), 6.0);
+    }
+
+    #[test]
+    fn a_partial_or_absurd_taxi_profile_keeps_safe_figures() {
+        // Omitted fields keep the GA defaults, field by field.
+        let partial = Pace::from_profile(Some(&crate::aircraft::TaxiProfile {
+            kts: Some(15.0),
+            turn_kts: None,
+            sharp_kts: None,
+        }));
+        assert_eq!(partial.straight, 15.0);
+        assert_eq!(partial.turn, TURN_KTS);
+        assert_eq!(partial.sharp, SHARP_KTS);
+        // A typo can't become a takeoff roll with the tower's route as a plan.
+        let absurd = Pace::from_profile(Some(&crate::aircraft::TaxiProfile {
+            kts: Some(180.0),
+            turn_kts: Some(90.0),
+            sharp_kts: Some(0.0),
+        }));
+        assert_eq!(absurd.straight, 25.0);
+        assert_eq!(absurd.turn, 25.0);
+        assert_eq!(absurd.sharp, 2.0);
+        // No profile at all is the GA pace.
+        assert_eq!(Pace::from_profile(None), Pace::default());
+    }
+
+    #[test]
     fn stop_ramp_is_gentle_and_finishes() {
         assert_eq!(stop_ramp_kts(0.0), 0.0);
         assert_eq!(stop_ramp_kts(0.4), 0.0, "inside half a meter is stopped");
@@ -1271,7 +1479,7 @@ mod tests {
             "wrong-facing start must join"
         );
         assert_eq!(
-            join_cap_kts(err),
+            Pace::default().join_cap_kts(err),
             SHARP_KTS,
             "turn-arounds happen at the sharp pace"
         );
@@ -1309,8 +1517,8 @@ mod tests {
         );
         assert!(!join_done(20.0, 10.0), "aligned but wide is not joined");
         // Aligned rejoins ride at bend speed, not the sharp crawl.
-        assert_eq!(join_cap_kts(20.0), TURN_KTS);
-        assert_eq!(join_cap_kts(-170.0), SHARP_KTS);
+        assert_eq!(Pace::default().join_cap_kts(20.0), TURN_KTS);
+        assert_eq!(Pace::default().join_cap_kts(-170.0), SHARP_KTS);
     }
 
     #[test]
@@ -1564,6 +1772,67 @@ mod tests {
             LineUpPlan::Plain(p) => assert_eq!(p[1], lead_on[0], "authored path won"),
             LineUpPlan::Backtrack(_) => panic!("no backtrack expected"),
         }
+    }
+
+    /// Luton, 2026-07-27: a full-length departure off a mid-runway holding
+    /// point. The backtrack's leg one aimed at a centreline point 30-60 m
+    /// nearer the threshold — 23 degrees off the stub the aircraft was
+    /// standing on — and drove an MD-82 off the pavement inside fifty metres.
+    /// A backtrack has to reach the runway along the DRAWN stub too; only the
+    /// direction it turns at the top is ours to choose.
+    #[test]
+    fn a_backtrack_enters_along_the_drawn_stub_not_across_the_grass() {
+        use crate::autoland::{cross_track_nm, project_latlon, Runway};
+        let rwy = Runway {
+            icao: "TEST".into(),
+            id: "36".into(),
+            thr_lat: 0.0,
+            thr_lon: 0.0,
+            course_deg: 0.0,
+            length_m: 2156.0,
+            surface: 1,
+            dist_nm: 0.05,
+            elev_ft: 0.0,
+        };
+        let at = |a_m: f64, x_m: f64| {
+            let (la, lo) = project_latlon(0.0, 0.0, 0.0, a_m / 1852.0);
+            project_latlon(la, lo, 90.0, x_m / 1852.0)
+        };
+        // Hold 430 m down the strip, 45 m off to the side; the drawn stub runs
+        // straight in, perpendicular, to the junction.
+        let (hlat, hlon) = at(430.0, 45.0);
+        let lead_on = vec![at(430.0, 0.0)];
+        let path = backtrack_pocket_path_from_lead_on(&rwy, hlat, hlon, &lead_on)
+            .expect("backtrack via the stub");
+        // Every point of the entry, up to the junction, stays on the stub's
+        // own along-track station — it never drifts down the runway before
+        // reaching the centreline, which is exactly what crossed the grass.
+        let a_of = |p: (f64, f64)| -crate::autoland::along_track_nm(p.0, p.1, &rwy) * 1852.0;
+        let mut reached = false;
+        for p in &path {
+            let x = cross_track_nm(p.0, p.1, &rwy) * 1852.0;
+            if x.abs() <= 1.0 {
+                reached = true;
+            }
+            if !reached {
+                assert!(
+                    (a_of(*p) - 430.0).abs() < 25.0,
+                    "entry wandered down the runway before reaching it: a={}",
+                    a_of(*p)
+                );
+            }
+        }
+        assert!(reached, "the entry never reaches the centreline");
+        // ...and it still ends in the turn pocket by the numbers.
+        let last = *path.last().unwrap();
+        assert!(a_of(last) < BACKTRACK_TURN_START_M + 5.0, "ends at the numbers");
+        // The synthetic fallback is what it replaces: that one leaves the stub
+        // immediately, which is the bug.
+        let synth = backtrack_pocket_path(&rwy, hlat, hlon).expect("synthetic exists");
+        assert!(
+            (a_of(synth[1]) - 430.0).abs() > 25.0,
+            "the old diagonal aimed down the runway from the start"
+        );
     }
 
     #[test]

@@ -96,6 +96,21 @@ impl SetElectrical {
         for c in cmds {
             ctx.xplane.run_command(c).await?;
         }
+        // Toggle-only switches: read each, fire only if it doesn't already
+        // match. Firing a toggle blind as "on" switches OFF anything that was
+        // already on — and on an xlua airframe the toggle is the ONLY way in,
+        // because its datarefs refuse writes (403).
+        for t in &sys.toggles {
+            let now_on = Self::read(ctx, &t.dataref).await.is_some_and(|v| v > 0.5);
+            if now_on != on {
+                ctx.xplane.run_command(&t.command).await?;
+            }
+        }
+        // Toggle-only systems are driven by writing their switch dataref
+        // instead — see `ElectricalSystem::write_datarefs`.
+        for d in &sys.write_datarefs {
+            ctx.xplane.set_int(d, i64::from(on)).await?;
+        }
         // Confirm from the readback datarefs: all on / all off / mixed.
         let mut states = Vec::new();
         for d in &sys.readback {
@@ -191,6 +206,8 @@ mod tests {
 
     fn sys(key: &str) -> ElectricalSystem {
         ElectricalSystem {
+            write_datarefs: vec![],
+            toggles: vec![],
             key: key.into(),
             spoken: key.into(),
             on_commands: vec![],

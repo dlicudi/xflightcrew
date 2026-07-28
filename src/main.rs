@@ -29,6 +29,7 @@ mod phrase;
 mod plugin_status;
 mod prefs;
 mod procedure;
+mod pushback;
 mod radiofx;
 mod rag;
 mod readback;
@@ -997,6 +998,8 @@ pub(crate) struct LiveProfile {
 
 impl LiveProfile {
     fn new(p: aircraft::AircraftProfile) -> std::sync::Arc<Self> {
+        tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
+        aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
         std::sync::Arc::new(Self {
             inner: std::sync::RwLock::new(p),
             generation: std::sync::atomic::AtomicU64::new(0),
@@ -1014,6 +1017,12 @@ impl LiveProfile {
         self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
     fn swap(&self, p: aircraft::AircraftProfile) {
+        // Republished on EVERY swap, including to None: a selector that
+        // outlives its airframe aims the next aircraft's mode writes at a knob
+        // it doesn't have (the same shape as the radio-power flag that latched
+        // across a 172 -> Twin Otter change, 2026-07-27).
+        tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
+        aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
         *self.inner.write().unwrap() = p;
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -3484,6 +3493,7 @@ fn icao_to_profile(icao: &str) -> String {
         "C172" => "cessna_172sp",
         "SR22" => "cirrus_sr22",
         "MD82" | "MD80" | "MD83" | "MD88" => "md82",
+        "C750" | "C75B" => "citation_x",
         "DC3" | "DC30" => "dc3",
         "BE9L" | "BE9T" | "C90" | "C90B" => "king_air_c90b",
         "EVOT" | "EVOP" => "lancair_evolution",
@@ -7022,6 +7032,32 @@ mod tests {
     }
 
     #[test]
+    fn citation_x_loads_with_the_poms_own_figures() {
+        let p = super::aircraft::load("citation_x").expect("citation_x profile loads");
+        assert_eq!(super::icao_to_profile("C750"), "citation_x");
+        assert!(p.autopilot && p.throttle && p.retractable_gear);
+        assert!(!p.engine, "a jet declares no piston engine group");
+        // POM p.80: Vr 145, Vref 132, Vs1 clean 136, Vle 210. Vmo is altitude
+        // dependent (270 low / 350 high) and the low figure is the one flown.
+        let r = p.reference.as_ref().expect("reference figures");
+        assert_eq!(r.vr_kts, Some(145.0));
+        assert_eq!(r.approach_kts, Some(132.0));
+        assert_eq!(p.vs_clean_kts, Some(136.0));
+        assert_eq!(p.vlo_kts, Some(210.0));
+        assert_eq!(p.vne_kts, Some(270.0));
+        // The POM's Vy of 300 KIAS is a cruise climb, and a 300 kt circuit is
+        // not a circuit. The profile carries a departure speed, and the
+        // pattern is capped against the approach speed regardless.
+        let vy = r.vy_kts.expect("vy");
+        assert!(vy <= 200.0, "vy is a climb-out speed, got {vy}");
+        let pat = super::circuit::pattern_speed_kts(vy, r.approach_kts.unwrap());
+        assert!(pat <= 198.0, "pattern capped at 1.5x approach, got {pat}");
+        // The runway it demands must fit the runways it flies from.
+        let roll_m = r.takeoff_roll_ft.expect("ground roll") * 0.3048;
+        assert!(roll_m * 1.4 < 2162.0, "must fit Luton: {:.0} m", roll_m * 1.4);
+    }
+
+    #[test]
     fn md82_is_a_jet_with_gear_no_piston_tools() {
         let p = super::aircraft::load("md82").expect("md82 profile loads");
         assert_eq!(p.id, "md82");
@@ -7080,6 +7116,48 @@ mod tests {
         assert_eq!(
             p.reference.as_ref().and_then(|r| r.approach_kts),
             Some(140.0)
+        );
+        // The runway the automation demands must fit runways this aircraft
+        // actually operates from. The recited 7,450 ft is a FACTORED FIELD
+        // LENGTH at max weight; read as a ground roll it earned a x1.4 on top
+        // and asked for 3,179 m — more than the whole of Luton's 2,162 m 25,
+        // so the line-up backtracked for length it did not need and full auto
+        // then failed its own lined-up test twice (2026-07-28).
+        let roll_m = p
+            .reference
+            .as_ref()
+            .and_then(|r| r.takeoff_roll_ft.or(r.takeoff_distance_ft))
+            .expect("md82 declares a takeoff roll")
+            * 0.3048;
+        assert!(
+            roll_m * 1.4 < 2162.0,
+            "an MD-82 must be able to depart Luton: needs {:.0} m of 2162",
+            roll_m * 1.4
+        );
+        // ...and the recited figure is still the POM one, unchanged.
+        assert_eq!(
+            p.reference.as_ref().and_then(|r| r.takeoff_distance_ft),
+            Some(7450.0)
+        );
+        // The ground drives exist on a jet too. They were gated behind
+        // `!autothrottle` alongside the airborne speed tool, so neither jet had
+        // a taxi, line-up or park tool and "taxi for me" reached nothing —
+        // only full auto worked, because it builds its own (2026-07-28).
+        for t in ["auto_taxi", "line_up", "taxi_to_parking"] {
+            assert!(reg.get(t).is_some(), "a jet needs {t}");
+        }
+        // ...but the airborne speed tool is still the AP's bug on an airliner.
+        assert!(
+            reg.get("hold_speed").is_none(),
+            "an autothrottle airframe sets the speed bug, not a throttle hold"
+        );
+        assert!(reg.get("set_speed").is_some());
+        // A jet taxis like a jet: the GA 10/6/4 is a brake setting on this
+        // airframe, which rolls past 10 knots at idle thrust on its own.
+        let pace = super::autotaxi::Pace::from_profile(p.taxi.as_ref());
+        assert!(
+            pace.straight > 15.0 && pace.turn >= 8.0,
+            "MD-82 must taxi briskly, got {pace:?}"
         );
         // ...and the piston 172 is the other way round.
         let c172 =

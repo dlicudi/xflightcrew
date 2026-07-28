@@ -39,6 +39,20 @@ pub struct AircraftProfile {
     /// when asked. Per-airframe, from the POH/POM. `None` = no reference answers.
     #[serde(default)]
     pub reference: Option<ReferenceProfile>,
+    /// How briskly the copilot taxis this airframe. `None` = the built-in GA
+    /// pace (see [`TaxiProfile`]).
+    #[serde(default)]
+    pub taxi: Option<TaxiProfile>,
+    /// The thrust-lever dataref this airframe obeys, when it is not the stock
+    /// one. `None` = `throttle_ratio_all` (see [`throttle_dataref`]).
+    #[serde(default)]
+    pub throttle_dataref: Option<String>,
+    /// Pitch attitude at which this airframe's tail touches the runway,
+    /// degrees. The auto-takeoff rotation will not command within a margin of
+    /// it. `None` on airframes short enough that elevator authority runs out
+    /// long before tail clearance does — every GA single so far.
+    #[serde(default)]
+    pub tail_strike_deg: Option<f64>,
     /// Path to an XChecklist file to interpret (relative to the working dir).
     /// `None` means no checklists for this airframe. The file is read-only input;
     /// the copilot interprets it (see [`crate::checklist`]).
@@ -111,6 +125,13 @@ pub struct AircraftProfile {
     /// Transponder (`set_transponder` / squawk).
     #[serde(default)]
     pub transponder: bool,
+    /// Override for airframes whose transponder MODE selector is an add-on's
+    /// own knob, where the stock `transponder_mode` actuator is not an input
+    /// at all but an OUTPUT the add-on rewrites every frame from that knob
+    /// (the RWDesigns Twin Otter's KT73 — see
+    /// [`TransponderModeKnob`]). `None` = the stock actuator, the universal case.
+    #[serde(default)]
+    pub transponder_mode_knob: Option<TransponderModeKnob>,
     /// ILS approach setup (`prepare_ils`) — needs a NAV radio + approach mode.
     #[serde(default)]
     pub ils: bool,
@@ -436,6 +457,42 @@ pub struct CycleSelectorProfile {
 /// each engine fire its start switch (crank), wait for N1 to reach idle, release
 /// the starter, bring that engine's generator online (so the bus can power the
 /// next start), and finally condition levers to the run position.
+/// The APU bring-up a jet's engine start needs first.
+///
+/// A turbofan is motored by BLEED AIR, and on the Citation X the APU also
+/// powers a bus the engine's own start gate reads. Verified live 2026-07-28:
+/// with batteries on but the APU off, the starter command is accepted, the
+/// annunciator lights and `ignition_key` goes to 4 — and the engine does not
+/// turn at all. With the APU generator and bleed on, the same command spooled
+/// N2 from 0 to 30% in fifteen seconds. A turboprop needs none of this, so the
+/// whole block is optional.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApuStartProfile {
+    /// Toggle for the APU master, fired only if `master_readback` says it's off.
+    pub master_toggle: String,
+    pub master_readback: String,
+    /// Commands that drive the starter switch to its start position, in order
+    /// (the Citation X's is a 3-position switch needing two "up"s).
+    pub starter_commands: Vec<String>,
+    /// APU speed dataref and the value that counts as running.
+    pub n1_dataref: String,
+    #[serde(default = "default_apu_ready_n1")]
+    pub ready_n1: f64,
+    /// How long to wait for it to come up (it took ~25 s live).
+    #[serde(default = "default_apu_ready_secs")]
+    pub ready_secs: f64,
+    /// Fired once it's running — generator, then bleed air.
+    #[serde(default)]
+    pub after_ready_commands: Vec<String>,
+}
+
+fn default_apu_ready_n1() -> f64 {
+    95.0
+}
+fn default_apu_ready_secs() -> f64 {
+    90.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurbineStartProfile {
     /// Condition-lever (fuel) array dataref. Each engine's element is written.
@@ -462,6 +519,17 @@ pub struct TurbineStartProfile {
     /// N1 (%) at which the engine is lit and stable enough to cut the starter.
     #[serde(default = "default_n1_idle")]
     pub n1_idle: f64,
+    /// Introduce fuel at this N2 (%) instead of the default N1 threshold.
+    ///
+    /// A free turbine and a turbofan spool differently, and the sequence was
+    /// written against the first: fuel goes in at 12% N1, which on a PT6 is a
+    /// well-lit starter motor. On the Citation X's AE3007 the aircraft's own
+    /// procedure introduces fuel at 10% N2, where N1 is barely off the stop —
+    /// wait for 12% N1 there and the starter has already auto-cut (its script
+    /// stops it at 40% N2) with no fuel ever introduced. `None` keeps the N1
+    /// behaviour every turboprop profile was tuned on.
+    #[serde(default)]
+    pub fuel_intro_n2: Option<f64>,
     /// Max seconds to crank one engine before giving up.
     #[serde(default = "default_turbine_crank_secs")]
     pub crank_secs: f64,
@@ -475,6 +543,10 @@ pub struct TurbineStartProfile {
     /// Auto Ignition Arm – ON"). Empty = airframe has none.
     #[serde(default)]
     pub ignition_arm: Vec<String>,
+    /// The APU bring-up this airframe needs before it can crank at all.
+    /// `None` on every free turbine (see [`ApuStartProfile`]).
+    #[serde(default)]
+    pub apu: Option<ApuStartProfile>,
 }
 
 fn default_n1_idle() -> f64 {
@@ -634,6 +706,21 @@ pub struct ReferenceProfile {
     pub endurance_hours: Option<f64>,
     #[serde(default)]
     pub takeoff_distance_ft: Option<f64>,
+    /// GROUND ROLL, feet — the runway the wheels actually need. The automation
+    /// flies this one (the line-up's full-length check, `runway_fit`, full
+    /// auto's lined-up test), all of which add their own ×1.4 margin on top.
+    ///
+    /// Distinct from `takeoff_distance_ft`, which is the figure the copilot
+    /// RECITES: on a GA single that is the distance over a 50 ft obstacle, but
+    /// on an airliner it is the factored takeoff FIELD LENGTH at max weight,
+    /// which already carries its own margins. Multiplying that again demanded
+    /// 3179 m for an MD-82 — more than the whole of Luton's runway — so the
+    /// line-up backtracked for length it did not need and full auto then judged
+    /// a perfectly good line-up a failure and quit, twice (2026-07-28).
+    /// `None` falls back to `takeoff_distance_ft`, which is what every GA
+    /// profile has always used.
+    #[serde(default)]
+    pub takeoff_roll_ft: Option<f64>,
     #[serde(default)]
     pub landing_distance_ft: Option<f64>,
     #[serde(default)]
@@ -646,6 +733,47 @@ pub struct ReferenceProfile {
     pub oil_press_min_psi: Option<f64>,
     #[serde(default)]
     pub oil_press_max_psi: Option<f64>,
+}
+
+/// Taxi pacing, per airframe: the pace on a straight taxiway, and the caps the
+/// schedule falls to for an ordinary bend and a sharp one.
+///
+/// These were one set of numbers for every aircraft (10/6/4), tuned on the 172,
+/// where 10 knots is a THROTTLE setting. On a jet it is a brake setting: an
+/// MD-82 at idle thrust rolls past 10 knots on flat pavement on its own, so the
+/// governor rides the brakes the whole taxi, and airline practice is nearer
+/// 15-20 knots down a long taxiway with 10 through the turns. Anything omitted
+/// falls back to the GA figures, so an airframe that says nothing taxis exactly
+/// as it did before this existed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaxiProfile {
+    /// Pace on a straight leg, knots — the target when the pilot names none.
+    #[serde(default)]
+    pub kts: Option<f64>,
+    /// Cap through an ordinary bend (>= 30 degrees).
+    #[serde(default)]
+    pub turn_kts: Option<f64>,
+    /// Cap through a sharp corner (>= 100 degrees) and a turn-around join.
+    #[serde(default)]
+    pub sharp_kts: Option<f64>,
+}
+
+/// A switch whose only control is a TOGGLE command, paired with the dataref
+/// that reads its state.
+///
+/// Firing a toggle as "on" turns the switch OFF whenever it was already on, so
+/// a toggle can only be driven safely by reading first and acting on the
+/// difference. Whole airframes are built this way: every light and the avionics
+/// master on the Citation X are toggle-only, and its xlua datarefs are
+/// READ-ONLY over the Web API (`PATCH … → 403 dataref_is_readonly`, verified
+/// live 2026-07-28), so commands are not merely preferred there — they are the
+/// only way to actuate anything at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToggleSwitch {
+    /// The toggle command to fire when the state doesn't match.
+    pub command: String,
+    /// The 0/1 dataref that reads this switch's actual position.
+    pub dataref: String,
 }
 
 /// One switchable light.
@@ -665,6 +793,20 @@ pub struct LightProfile {
     pub command_on: Option<String>,
     #[serde(default)]
     pub command_off: Option<String>,
+    /// Further switch datarefs driven to the SAME state as `dataref`. One
+    /// "light" on the panel is sometimes two switches: the Citation X has
+    /// independent left and right landing lights, and switching only one leaves
+    /// the aircraft half lit while the readback happily confirms the half it
+    /// looked at. Written, never commanded — the extras exist precisely because
+    /// the airframe has no single command for the pair.
+    #[serde(default)]
+    pub also_datarefs: Vec<String>,
+    /// Toggle-only switches making up this light. When present these are
+    /// driven INSTEAD of the command/dataref above: each is read and toggled
+    /// only if it doesn't already match. One "light" can be several — the
+    /// Citation X's landing lights are an independent left and right.
+    #[serde(default)]
+    pub toggles: Vec<ToggleSwitch>,
 }
 
 /// One electrical system the `set_electrical` tool can switch. Driven by the
@@ -682,8 +824,46 @@ pub struct ElectricalSystem {
     pub spoken: String,
     pub on_commands: Vec<String>,
     pub off_commands: Vec<String>,
+    /// Switch datarefs written to 1/0 directly, for systems the sim lets us
+    /// write but that have no on/off command. Fired after any commands above.
+    /// NOT a way to drive an xlua add-on: those datarefs are read-only over the
+    /// Web API (403), which is what `toggles` exists for.
+    #[serde(default)]
+    pub write_datarefs: Vec<String>,
+    /// Toggle-only switches in this system, each read first and toggled only if
+    /// it doesn't already match the target (see [`ToggleSwitch`]). The Citation
+    /// X's avionics master is toggle-only AND its dataref is unwritable, so
+    /// this is the only way to switch it.
+    #[serde(default)]
+    pub toggles: Vec<ToggleSwitch>,
     #[serde(default)]
     pub readback: Vec<String>,
+}
+
+/// The add-on's own transponder mode SELECTOR, for airframes where the stock
+/// `transponder_mode` actuator is downstream of the knob rather than upstream
+/// of the box.
+///
+/// The RWDesigns Twin Otter is the case that found this: its KT73 is a SASL
+/// instrument, and `master.lua`'s `KT73()` runs every frame setting
+/// `sim/cockpit/radios/transponder_mode` FROM `TO/radios/KT73SelKnob`. Writing
+/// the stock actuator therefore does nothing that survives a frame — the
+/// cockpit knob never moves and the mode snaps back — so the copilot's
+/// standby/altitude switching was silently a no-op on that airframe
+/// (2026-07-27). Same shape as [`AircraftProfile::fuel_pump_commands`]: the
+/// universal write is not wrong, it is simply not connected to anything here.
+///
+/// The values are the KNOB's positions, which need not match the stock
+/// encoding at all (the Twotter's ALT is knob 5 and drives stock mode 2, not
+/// 3), which is exactly why the readback re-reads the KNOB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransponderModeKnob {
+    /// The add-on's selector dataref ("TO/radios/KT73SelKnob").
+    pub dataref: String,
+    pub off: i64,
+    pub standby: i64,
+    pub on: i64,
+    pub altitude: i64,
 }
 
 /// Custom on/off commands for the electric boost pumps, for airframes where the
@@ -696,6 +876,13 @@ pub struct ElectricalSystem {
 pub struct PumpCommands {
     pub on_commands: Vec<String>,
     pub off_commands: Vec<String>,
+    /// Switch datarefs written to 1/0 directly, for systems whose only control
+    /// is a TOGGLE command. Firing a toggle as "on" turns the system off
+    /// whenever it was already on, which is worse than having no tool at all —
+    /// the Citation X's avionics master is the case (`cmd_avionics_toggle` is
+    /// the only command its scripts create). Written after any commands above.
+    #[serde(default)]
+    pub write_datarefs: Vec<String>,
     #[serde(default)]
     pub readback: Vec<String>,
 }
@@ -755,6 +942,39 @@ pub fn load(id: &str) -> Option<AircraftProfile> {
         },
         Err(_) => builtin(id), // no YAML file — use the built-in definition
     }
+}
+
+/// The universal thrust-lever dataref: what every airframe used until one
+/// didn't.
+pub const STOCK_THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
+
+/// The thrust lever THIS airframe actually obeys, republished on every profile
+/// swap (including back to `None`) — a stale override would aim the next
+/// aircraft's power at a dataref it doesn't use, the same shape as the
+/// transponder knob and the radio-power latch.
+static THROTTLE_DREF: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Publish the airframe's thrust-lever dataref. Called on EVERY profile swap.
+pub fn publish_throttle_dataref(dref: Option<String>) {
+    *THROTTLE_DREF.lock().unwrap_or_else(|e| e.into_inner()) = dref;
+}
+
+/// The dataref every throttle write and read should use.
+///
+/// The Citation X is why this exists. Its `CitX_throttle.lua` tracks
+/// `throttle_jet_rev_ratio`, never `throttle_ratio_all`, and re-drives its own
+/// levers from that every frame — so every reduction the speed governor
+/// commanded went to a dataref the aircraft ignores. Flown live 2026-07-28 it
+/// held takeoff thrust through the whole pattern: 215 knots on upwind, 309 on
+/// crosswind, 373 on downwind against a 198 kt target, past both Vmo figures,
+/// still climbing with a descent commanded. The copilot could not slow it down
+/// and had no way to know.
+pub fn throttle_dataref() -> String {
+    THROTTLE_DREF
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| STOCK_THROTTLE.to_string())
 }
 
 /// Built-in profile by id (fallback when no YAML file exists).
@@ -1197,6 +1417,8 @@ fn cessna_172sp() -> AircraftProfile {
     };
     let light =
         |key: &str, spoken: &str, dataref: &str, cmd_on: &str, cmd_off: &str| LightProfile {
+            also_datarefs: Vec::new(),
+            toggles: Vec::new(),
             key: key.into(),
             spoken: spoken.into(),
             dataref: dataref.into(),
@@ -1239,6 +1461,8 @@ fn cessna_172sp() -> AircraftProfile {
         directional_gyro: true,
         com_radio: true,
         transponder: true,
+        // Stock actuator: both builtins model a sim-native transponder.
+        transponder_mode_knob: None,
         ils: true,
         parking_brake: true,
         cabin_crew: false,
@@ -1246,6 +1470,8 @@ fn cessna_172sp() -> AircraftProfile {
         electrical: {
             let e = |key: &str, spoken: &str, on: &[&str], off: &[&str], rb: &[&str]| {
                 ElectricalSystem {
+                    write_datarefs: Vec::new(),
+                    toggles: Vec::new(),
                     key: key.into(),
                     spoken: spoken.into(),
                     on_commands: on.iter().map(|s| s.to_string()).collect(),
@@ -1340,6 +1566,10 @@ fn cessna_172sp() -> AircraftProfile {
         // 172SP Vne (never-exceed) 163 KIAS.
         vne_kts: Some(163.0),
         vlo_kts: None,
+        // The GA pace is the built-in default — nothing to declare.
+        taxi: None,
+        throttle_dataref: None,
+        tail_strike_deg: None,
         // Reference figures from the X-Plane C172 Pilot's Operating Manual.
         reference: Some(ReferenceProfile {
             kind: Some("single-engine aircraft".into()),
@@ -1363,6 +1593,9 @@ fn cessna_172sp() -> AircraftProfile {
             fuel_useable_gal: Some(53.0),
             endurance_hours: Some(4.0),
             takeoff_distance_ft: Some(1630.0),
+            // No separate ground roll: on a GA single the over-50-ft figure is
+            // already a sane "runway needed", and it is what has been flown.
+            takeoff_roll_ft: None,
             landing_distance_ft: Some(1335.0),
             max_rpm: Some(2700.0),
             oil_temp_min_f: Some(100.0),
@@ -1455,6 +1688,8 @@ fn cirrus_sr22() -> AircraftProfile {
     };
     let light =
         |key: &str, spoken: &str, dataref: &str, cmd_on: &str, cmd_off: &str| LightProfile {
+            also_datarefs: Vec::new(),
+            toggles: Vec::new(),
             key: key.into(),
             spoken: spoken.into(),
             dataref: dataref.into(),
@@ -1492,6 +1727,8 @@ fn cirrus_sr22() -> AircraftProfile {
         com2_radio: true,
         nav_radio: true,
         transponder: true,
+        // Stock actuator: both builtins model a sim-native transponder.
+        transponder_mode_knob: None,
         ils: true,
         parking_brake: true,
         cabin_crew: false,
@@ -1515,6 +1752,8 @@ fn cirrus_sr22() -> AircraftProfile {
         electrical: {
             let e = |key: &str, spoken: &str, on: &[&str], off: &[&str], rb: &[&str]| {
                 ElectricalSystem {
+                    write_datarefs: Vec::new(),
+                    toggles: Vec::new(),
                     key: key.into(),
                     spoken: spoken.into(),
                     on_commands: on.iter().map(|s| s.to_string()).collect(),
@@ -1650,6 +1889,9 @@ fn cirrus_sr22() -> AircraftProfile {
         // SR22 Vne (never-exceed) 204 KIAS.
         vne_kts: Some(204.0),
         vlo_kts: None,
+        taxi: None,
+        throttle_dataref: None,
+        tail_strike_deg: None,
         // Reference figures from the X-Plane Cirrus SR22 Pilot's Operating Manual
         // (the modeled aircraft is the turbo TSIO-550-K, ceiling 25,000 ft).
         reference: Some(ReferenceProfile {
@@ -1674,6 +1916,7 @@ fn cirrus_sr22() -> AircraftProfile {
             fuel_useable_gal: None,
             endurance_hours: Some(5.0), // 92 gal / ~18 gph
             takeoff_distance_ft: None,
+            takeoff_roll_ft: None,
             landing_distance_ft: None,
             max_rpm: Some(2700.0),
             oil_temp_min_f: None,
@@ -1737,3 +1980,4 @@ fn cirrus_sr22() -> AircraftProfile {
         },
     }
 }
+

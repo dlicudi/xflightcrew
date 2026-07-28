@@ -24,6 +24,69 @@ use tokio::sync::Mutex;
 const HTTP_ATTEMPTS: usize = 3;
 const HTTP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(60);
 
+/// How often the request-rate accounting reports, seconds.
+const LOAD_REPORT_SECS: f64 = 30.0;
+
+/// Web API load over the current reporting window. The Web API is served from
+/// inside X-Plane's own frame loop, so what we ask of it is a load the SIM
+/// carries — and when the sim freezes, the only thing our logs record is the
+/// failures that follow. Twice on 2026-07-28 the question "were we hammering
+/// it?" could not be answered from the logs at all, because nothing ever
+/// counted the requests that SUCCEEDED. Now the rate is on the record, in the
+/// log and in the blackbox, whether or not anything goes wrong.
+struct LoadWindow {
+    start: std::time::Instant,
+    requests: u64,
+    failures: u64,
+    slowest_ms: u64,
+}
+
+static LOAD: std::sync::Mutex<Option<LoadWindow>> = std::sync::Mutex::new(None);
+
+/// Account for one attempt against the API — one actual trip to the socket,
+/// which is what the sim pays for, not one logical operation.
+fn note_request(elapsed: std::time::Duration, ok: bool) {
+    let mut guard = LOAD.lock().unwrap_or_else(|e| e.into_inner());
+    let w = guard.get_or_insert_with(|| LoadWindow {
+        start: std::time::Instant::now(),
+        requests: 0,
+        failures: 0,
+        slowest_ms: 0,
+    });
+    w.requests += 1;
+    w.failures += u64::from(!ok);
+    w.slowest_ms = w.slowest_ms.max(elapsed.as_millis() as u64);
+    let secs = w.start.elapsed().as_secs_f64();
+    if secs < LOAD_REPORT_SECS {
+        return;
+    }
+    let rate = w.requests as f64 / secs;
+    tracing::info!(
+        target: "sim::load",
+        rate = format!("{rate:.0}/s"),
+        requests = w.requests,
+        failures = w.failures,
+        slowest_ms = w.slowest_ms,
+        "web api load"
+    );
+    crate::blackbox::record(
+        "api_load",
+        serde_json::json!({
+            "rate_per_s": (rate * 10.0).round() / 10.0,
+            "requests": w.requests,
+            "failures": w.failures,
+            "slowest_ms": w.slowest_ms,
+            "window_s": (secs * 10.0).round() / 10.0,
+        }),
+    );
+    *w = LoadWindow {
+        start: std::time::Instant::now(),
+        requests: 0,
+        failures: 0,
+        slowest_ms: 0,
+    };
+}
+
 /// Run an idempotent Web API request, retrying a few times on failure. A 404 is
 /// *not* retried: it means the dataref id is stale (X-Plane reassigns ids across
 /// restarts and aircraft reloads), so re-issuing the same id just spams the log —
@@ -36,7 +99,10 @@ where
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match op().await {
+        let started = std::time::Instant::now();
+        let result = op().await;
+        note_request(started.elapsed(), result.is_ok());
+        match result {
             Ok(v) => return Ok(v),
             Err(e) if attempt < HTTP_ATTEMPTS && !is_not_found(&e) => {
                 tracing::warn!(attempt, "X-Plane request failed, retrying: {e:#}");

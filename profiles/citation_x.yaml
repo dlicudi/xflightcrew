@@ -1,0 +1,224 @@
+# Aircraft profile — X-Plane stock Cessna Citation X (C750).
+#
+# The second jet, and a deliberately DIFFERENT one from the MD-82: a clean
+# Laminar aircraft on stock systems rather than a study-level xlua model. Every
+# figure below is from the aircraft itself — the Operating-Speeds table on p.80
+# of `X-Plane_Citation_X_Pilot_Operating_Manual.pdf` and the specifications on
+# p.6, both shipped inside the aircraft folder — not from memory.
+#
+# ENGINE START IS THE PILOT'S on this airframe (see `turbine_start` below).
+
+id: citation_x
+display_name: Cessna Citation X
+
+# Capability flags.
+autopilot: true        # set_heading / set_altitude / set_vertical_speed
+throttle: true         # thrust levers — jet, so NO piston engine group
+autothrottle: true     # set_speed (AP speed bug) + autothrottle on/off
+speedbrake: true       # the wing spoilers double as speedbrakes
+barometer: true
+pitot_heat: true
+# ...and it is the CitX pitot/static switch, not the stock one (see the
+# electrical note: stock commands are not wired to this aircraft).
+pitot_heat_dataref: laminar/CitX/ice/pitot_static_left
+pitch_trim: true
+com_radio: true
+com2_radio: true
+nav_radio: true
+transponder: true
+ils: true
+parking_brake: true
+retractable_gear: true
+cabin_crew: false      # a bizjet flight deck talks to the cabin directly
+
+# NOT the MD-82's jet sequence: that one is written against laminar/md82/*
+# cross-tie levers and a bleed needle this aircraft does not have. This airframe
+# starts through `turboprop_start` below, which is the generic crank/fuel/idle
+# sequence and fits it exactly.
+turbine_start: false
+auto_prep: false
+
+# Engine start, read out of the aircraft's own CitX_engine.lua rather than from
+# its printed checklist — the script is what the sim actually runs, and it
+# disagrees with the checklist twice.
+#
+# `cmd_starter_left/right` fire only when phase == 1 AND duration > 0.1, so the
+# starter must be HELD. An ordinary instantaneous command press does nothing at
+# all, which is why nothing happened when the copilot tried: `starter_held`
+# below is not an optimisation, it is the difference between working and not.
+#
+# The other conditions the script checks are `bus_volts > 20` (batteries on) and
+# `igniter_on + auto_igniter_on > 0`. The ignition switches sit at NORM (-1) by
+# default, and NORM sets `auto_igniter_on = 1` — so nothing needs arming and
+# `ignition_arm` stays empty.
+#
+# Where the checklist is wrong: it says wait for 60% N2 before the second
+# engine, but the script cuts the starter itself at 40% N2 (`if N2_percent_L >
+# 40 then timer_starter_L = 0`). And its fuel-introduction point (10% N2) is
+# right, but the generic sequence watched 12% N1 — a threshold the AE3007 does
+# not reach until after its own starter has already quit. Hence `fuel_intro_n2`.
+turboprop_start:
+  condition_lever: sim/cockpit2/engine/actuators/mixture_ratio  # fuel cutoff -> idle
+  condition_start: 1.0
+  condition_run: 1.0
+  starter_held: true          # phase==1 && duration>0.1 — a press is a no-op
+  fuel_intro_n2: 10.0         # the aircraft's own figure
+  n1_idle: 18.0               # AE3007 ground idle; the PT6 default of 50 never arrives
+  crank_secs: 30.0            # the script's own MAX STARTER DURATION
+  start_up:
+    - laminar/CitX/engine/cmd_starter_left
+    - laminar/CitX/engine/cmd_starter_right
+  generators:
+    - laminar/CitX/electrical/cmd_generator_left_up
+    - laminar/CitX/electrical/cmd_generator_right_up
+
+# Jet — none of the piston systems apply.
+engine: false
+magnetos: false
+carb_heat: false
+fuel_pump: false
+directional_gyro: false
+
+# Electrical. This airframe is xlua like the MD-82, and its scripts replace only
+# SIX stock commands (the starters, shut_down, idle_hi_lo, auto_board,
+# auto_start) — verified by grepping `replace_command` across
+# plugins/xlua/scripts. Everything else stock is therefore NOT wired to this
+# aircraft: `sim/electrical/battery_1_on` moves nothing here. The commands below
+# are the aircraft's own, read out of CitX_electrical.lua.
+#
+# Avionics has no on/off COMMAND — the scripts create only
+# `cmd_avionics_toggle` — and its dataref refuses writes (403 read-only over the
+# Web API, like every other laminar/CitX dataref, verified live 2026-07-28). So
+# it is driven as a TOGGLE: read the switch, fire only if it doesn't match.
+electrical:
+  - key: battery
+    spoken: batteries
+    on_commands:  [laminar/CitX/electrical/cmd_battery_left_on, laminar/CitX/electrical/cmd_battery_right_on]
+    off_commands: [laminar/CitX/electrical/cmd_battery_left_off, laminar/CitX/electrical/cmd_battery_right_off]
+    readback:     [laminar/CitX/electrical/battery_left, laminar/CitX/electrical/battery_right]
+  - key: generators
+    spoken: generators
+    on_commands:  [laminar/CitX/electrical/cmd_generator_left_up, laminar/CitX/electrical/cmd_generator_right_up]
+    off_commands: [laminar/CitX/electrical/cmd_generator_left_dwn, laminar/CitX/electrical/cmd_generator_right_dwn]
+    readback:     [laminar/CitX/electrical/generator_left, laminar/CitX/electrical/generator_right]
+  - key: avionics
+    spoken: avionics
+    on_commands:  []
+    off_commands: []
+    toggles:
+      - { command: laminar/CitX/electrical/cmd_avionics_toggle,       dataref: laminar/CitX/electrical/avionics }
+      - { command: laminar/CitX/electrical/cmd_avionics_eicas_toggle, dataref: laminar/CitX/electrical/avionics_eicas }
+    readback: [laminar/CitX/electrical/avionics, laminar/CitX/electrical/avionics_eicas]
+
+# Exterior lights, again the aircraft's own datarefs. Written directly rather
+# than commanded: every light command CitX_lights.lua creates is a TOGGLE, and
+# the tool needs a definite on and a definite off. The dataref IS the switch
+# position here, and it is read back after the write, so a light that refuses to
+# move is reported rather than assumed.
+#
+# Landing lights are two independent switches, so that key carries two toggles.
+lights:
+  - key: nav
+    spoken: navigation lights
+    dataref: laminar/CitX/lights/navigation
+    toggles: [{ command: laminar/CitX/lights/cmd_navigation_toggle, dataref: laminar/CitX/lights/navigation }]
+  - key: recognition
+    spoken: recognition lights
+    dataref: laminar/CitX/lights/recognition
+    toggles: [{ command: laminar/CitX/lights/cmd_recognition_toggle, dataref: laminar/CitX/lights/recognition }]
+  - key: taxi
+    spoken: taxi light
+    dataref: laminar/CitX/lights/taxi
+    toggles: [{ command: laminar/CitX/lights/cmd_taxi_toggle, dataref: laminar/CitX/lights/taxi }]
+  - key: landing
+    spoken: landing lights
+    dataref: laminar/CitX/lights/landing_left
+    toggles:
+      - { command: laminar/CitX/lights/cmd_landing_left_toggle,  dataref: laminar/CitX/lights/landing_left }
+      - { command: laminar/CitX/lights/cmd_landing_right_toggle, dataref: laminar/CitX/lights/landing_right }
+
+# The thrust levers this airframe OBEYS. CitX_throttle.lua tracks
+# `throttle_jet_rev_ratio` and re-drives its own levers from it every frame; it
+# never reads `throttle_ratio_all`, which is what every loop wrote by default.
+# Flown live 2026-07-28 the aircraft held takeoff thrust through an entire
+# pattern — 215 kt upwind, 309 crosswind, 373 downwind against a 198 kt target,
+# past both Vmo figures and still climbing with a descent commanded. Writing
+# THIS dataref moves the levers: verified in the air, lever ratio went from
+# takeoff thrust to 0.1 and the aircraft slowed.
+throttle_dataref: sim/cockpit2/engine/actuators/throttle_jet_rev_ratio_all
+
+# Vmo is ALTITUDE-DEPENDENT on this aircraft: 270 KIAS below 8,000 ft, 350
+# above (Mmo 0.935). The monitor carries one number and everything the
+# automation flies happens low, so the LOW-altitude limit is the one declared —
+# conservative where it matters, and it will nag in a high-speed cruise.
+vne_kts: 270.0
+# Clean stall (Vs1). Full-flap stall is 115; minimum controllable speed is 140.
+vs_clean_kts: 136.0
+# Gear operating/extended limit.
+vlo_kts: 210.0
+
+# Static reference figures, POM p.80 (speeds) and p.6 (weights, performance).
+#
+# NOTE Vy: the POM's best-rate figure is 300 KIAS, which is a CRUISE-CLIMB
+# number, not a pattern speed. `vy_kts` here is the initial climb-out speed the
+# takeoff law holds and the circuit's pattern speed derives from, so it carries
+# a departure figure instead. The circuit caps the pattern at 1.5x the approach
+# speed anyway, but a profile should not need saving by a clamp.
+reference:
+  kind: twin-engine jet
+  vr_kts: 145.0                # POM: rotate
+  vy_kts: 200.0               # initial climb-out / pattern speed (POM Vy 300 is cruise climb)
+  vx_kts: 270.0                # POM best angle (again a cruise figure)
+  best_climb_fpm: 3650.0       # POM: rate of climb; the climb law takes 80%
+  cruise_ias_kts: 270.0        # KIAS held in cruise (Mmo 0.935 up high)
+  approach_kts: 132.0          # POM: Vref
+  vs0_kts: 115.0               # POM: stall, landing configuration
+  cruise_kts: 527.0            # M0.92 at altitude, KTAS
+  max_gross_lb: 36000.0
+  empty_weight_lb: 22000.0
+  useful_load_lb: 14000.0
+  service_ceiling_ft: 51000.0
+  max_crosswind_kts: 10.0      # POM: maximum demonstrated
+  fuel_capacity_gal: 1940.0    # 13,000 lb Jet A-1 at 6.7 lb/gal
+  endurance_hours: 4.5         # 13,000 lb / 2,900 lb per hour
+  takeoff_distance_ft: 5140.0  # RECITED: field length at MTOW. VERIFY
+  takeoff_roll_ft: 3600.0      # GROUND ROLL — what the automation checks a runway against. VERIFY
+  landing_distance_ft: 3400.0  # VERIFY
+
+# Taxi pacing: a jet, so the GA 10/6/4 is a brake setting here too — but a
+# light one, so a shade gentler than the MD-82's.
+taxi:
+  kts: 15.0
+  turn_kts: 10.0
+  sharp_kts: 6.0
+
+# Four detents in the aircraft file (0/5/15/35 degrees). The POM gives a single
+# Vfe of 180 KIAS; the per-notch limits below are the usual descending ladder
+# and are all VERIFY.
+flaps:
+  takeoff_ratio: 0.333
+  detents:
+    - { label: up,   spoken: up,          ratio: 0.0 }
+    - { label: "5",  spoken: five,        ratio: 0.333, vfe_kts: 250.0 } # VERIFY
+    - { label: "15", spoken: fifteen,     ratio: 0.667, vfe_kts: 210.0 } # VERIFY
+    - { label: "35", spoken: thirty five, ratio: 1.0,   vfe_kts: 180.0 } # POM Vfe
+
+# Phase-expectation advisor: the deltas worth calling on a light jet.
+advisor:
+  - dataref: laminar/CitX/ice/pitot_static_left
+    phases: [takeoff, climb, cruise, approach, landing]
+    say: Pitot heat's off.
+  - dataref: laminar/CitX/autopilot/left_yd
+    phases: [climb, cruise]
+    say: Yaw damper's still off.
+
+# The XChecklist file the pilot flies with (ELATES v1.3), copied from the
+# aircraft folder. The copilot reads each item, performs the ones mapped below
+# and calls out the rest.
+checklist: checklists/citation_x.txt
+checklist_map:
+  - { match: parking_brake,     action: parking_brake }
+  - { match: transponder_mode,  action: transponder }
+  - { match: taxi_light,        action: !light taxi }
+  - { match: navigation_light,  action: !light nav }
+  - { match: landing_lights,    action: !light landing }

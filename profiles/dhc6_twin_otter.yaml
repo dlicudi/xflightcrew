@@ -39,7 +39,20 @@ barometer: true        # set_barometer
 com_radio: true        # set_com1
 com2_radio: true       # set_com2 / swap_radio (two KX155A units + the G530)
 nav_radio: true        # set_nav1 / set_obs
-transponder: true      # set_transponder (KT70)
+transponder: true      # set_transponder (the CODE is stock and sticks)
+
+# The KT73's mode selector is the add-on's, not the sim's. master.lua's KT73()
+# runs every frame writing sim/cockpit/radios/transponder_mode FROM this knob,
+# so writing the stock actuator is a no-op that snaps back within a frame (the
+# copilot's standby/ALT switching did nothing at all until 2026-07-27). Knob
+# positions from that same function: 0 OFF, 1 SBY, 3 GND, 4 ON, 5 ALT — note
+# ALT drives stock mode 2, not 3, which is why the readback reads the KNOB.
+transponder_mode_knob:
+  dataref: TO/radios/KT73SelKnob
+  off: 0
+  standby: 1
+  on: 4
+  altitude: 5
 parking_brake: true    # stock parking_brake_ratio (the model reads it for its handle)
 pitot_heat: true       # stock pitot_heat_on — the model mirrors it to both sides + static + AOA
 pitch_trim: true       # set_pitch_trim (universal elevator_trim)

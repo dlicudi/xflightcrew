@@ -275,11 +275,18 @@ impl Snapshot {
             .await
             .unwrap_or(0.0)
             > 0.5;
-        let pushing_back = xp
+        // Being pushed = hooked to a tug AND moving. NOT `tow_in_progress`:
+        // probed live during a real push, that dataref stayed 0 from hook-up
+        // to release (2026-07-27), so the callouts keyed on it ("Pushing
+        // back", "Pushback complete, tug clear") could never speak and the
+        // only line the pilot ever heard was the tug connecting. Read anyway,
+        // as extra evidence in case some airframe does raise it.
+        let towing = xp
             .get_float("sim/flightmodel2/misc/tow_in_progress")
             .await
             .unwrap_or(0.0)
             > 0.5;
+        let pushing_back = towing || (tug_attached && groundspeed_kts > 0.3);
         let engine_running = xp
             .get_float_array("sim/flightmodel/engine/ENGN_running")
             .await
@@ -1755,7 +1762,11 @@ pub async fn run(
                         "Here we go, pushing back.",
                         "And we're pushing.",
                     ]));
-                } else if !snap.pushing_back && prev_pushing {
+                }
+                // Clear is the BAR coming off, not the rolling stopping: now
+                // that `pushing_back` is motion-based, a pause mid-push would
+                // otherwise announce a tug that is still hooked to the nose.
+                if !snap.tug_attached && prev_attached {
                     say(crate::readback::one_of(&[
                         "Pushback complete, tug clear.",
                         "Pushback done, tug's clear.",

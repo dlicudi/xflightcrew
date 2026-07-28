@@ -19,7 +19,6 @@ use crate::xplane::XPlaneClient;
 
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
-const XPDR_MODE: &str = "sim/cockpit2/radios/actuators/transponder_mode"; // 1 = standby
 
 /// Spawn the arrival taxi on its own thread + runtime + client.
 pub fn start(
@@ -28,6 +27,7 @@ pub fn start(
     voice: Option<Voice>,
     park_brake_valve_set: Option<f64>,
     prop: Option<crate::aircraft::PropProfile>,
+    pace: crate::autotaxi::Pace,
 ) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -42,6 +42,7 @@ pub fn start(
             voice,
             park_brake_valve_set,
             prop,
+            pace,
         ));
     });
 }
@@ -63,6 +64,7 @@ async fn fly(
     voice: Option<Voice>,
     park_brake_valve_set: Option<f64>,
     prop: Option<crate::aircraft::PropProfile>,
+    pace: crate::autotaxi::Pace,
 ) {
     // Ask the tower for the taxi-in unless we already hold a stand clearance.
     if !stand_route_ready() {
@@ -121,6 +123,7 @@ async fn fly(
     let auto_taxi = AutoTaxi {
         park_brake_valve_set,
         prop,
+        pace,
     };
     match auto_taxi.execute(&json!({}), &ctx).await {
         Ok(line) => announce(&voice, Priority::Advisory, &line),
@@ -167,8 +170,10 @@ async fn secure(xp: &XPlaneClient, voice: &Option<Voice>) {
     );
     // Park brake firmly set (the taxi already set it — belt and braces).
     let _ = xp.set_float(PARK_BRAKE, 1.0).await;
-    // Transponder to standby now we're off the movement area.
-    let _ = xp.set_int(XPDR_MODE, 1).await;
+    // Transponder to standby now we're off the movement area. Through the
+    // shared writer so an add-on's own box (the Twin Otter's KT73) has its
+    // KNOB turned — the stock dataref is that airframe's output, not its input.
+    let _ = crate::tools::radio::set_mode(xp, crate::tools::radio::XpdrMode::Standby).await;
     // Exterior lights not wanted at the stand (stock commands).
     for cmd in [
         "sim/lights/strobe_lights_off",

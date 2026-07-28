@@ -21,7 +21,13 @@ use crate::aircraft::{
 };
 
 /// Universal throttle (all engines), 0..1.
-const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
+/// The thrust lever THIS airframe obeys — not always the stock one (the
+/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
+/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
+/// thrust). Resolved per call, so a profile swap takes effect immediately.
+fn throttle_dref() -> String {
+    crate::aircraft::throttle_dataref()
+}
 /// Per-engine "is running" flags.
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 /// N1 at which the condition lever introduces fuel during a PT6 start (POM: crank
@@ -39,6 +45,9 @@ const MIN_START_VOLTS: f64 = 12.0;
 const ONGROUND: &str = "sim/flightmodel/failures/onground_any";
 const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed"; // m/s
 const N1_PERCENT: &str = "sim/cockpit2/engine/indicators/N1_percent"; // per-engine, turbine spool
+/// Per-engine N2 — the high-pressure spool a TURBOFAN's start is flown
+/// against (see [`crate::aircraft::TurbineStartProfile::fuel_intro_n2`]).
+const N2_PERCENT: &str = "sim/cockpit2/engine/indicators/N2_percent";
 
 /// Drive a [`CycleSwitch`] to `target` by reading its position and firing
 /// `up`/`down`. Bounded by the detent span so a stuck switch can't loop forever.
@@ -449,7 +458,7 @@ impl Tool for StartEngines {
         let on_ground = ctx.xplane.get_float(ONGROUND).await.unwrap_or(1.0) > 0.5;
         if on_ground {
             ctx.xplane
-                .set_float(THROTTLE_ALL, self.start.throttle_crack)
+                .set_float(&throttle_dref(), self.start.throttle_crack)
                 .await?;
         }
         ctx.xplane.run_command(&self.start.mags_both).await?;
@@ -552,6 +561,15 @@ async fn n1_percent(ctx: &ToolCtx<'_>, idx: usize) -> f64 {
         .unwrap_or(0.0)
 }
 
+async fn n2_percent(ctx: &ToolCtx<'_>, idx: usize) -> f64 {
+    ctx.xplane
+        .get_float_array(N2_PERCENT)
+        .await
+        .ok()
+        .and_then(|v| v.get(idx).copied())
+        .unwrap_or(0.0)
+}
+
 pub struct StartTurbines {
     start: TurbineStartProfile,
 }
@@ -644,7 +662,16 @@ impl Tool for StartTurbines {
                         .await;
                 }
                 let n1 = n1_percent(ctx, i).await;
-                if !fuel_in && n1 >= FUEL_INTRO_N1 {
+                // Fuel goes in on the spool the AIRFRAME's own procedure uses:
+                // N2 on a turbofan, N1 on a free turbine. The Citation X cuts
+                // its own starter at 40% N2, which it reaches with N1 barely
+                // off the stop — waiting for 12% N1 there means the starter
+                // quits before fuel is ever introduced (2026-07-28).
+                let (spool, intro) = match self.start.fuel_intro_n2 {
+                    Some(n2) => (n2_percent(ctx, i).await, n2),
+                    None => (n1, FUEL_INTRO_N1),
+                };
+                if !fuel_in && spool >= intro {
                     ctx.xplane
                         .set_float_array_elem(
                             &self.start.condition_lever,
@@ -747,5 +774,32 @@ impl Tool for StopTurbines {
             }
         }
         Ok("Condition levers to cutoff, engines winding down.".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Fuel goes in on the spool the AIRFRAME uses. The sequence was written
+    /// against a PT6 (12% N1); the Citation X's own script cuts its starter at
+    /// 40% N2, which an AE3007 reaches with N1 barely off the stop — so waiting
+    /// for 12% N1 there means the starter quits before fuel is ever introduced
+    /// and the engine never lights (2026-07-28).
+    #[test]
+    fn a_turbofan_introduces_fuel_on_n2_not_n1() {
+        let p = crate::aircraft::load("citation_x").expect("citation_x loads");
+        let s = p.turboprop_start.expect("declares a start sequence");
+        assert_eq!(s.fuel_intro_n2, Some(10.0));
+        // Held, not pressed: cmd_starter_* ignores anything under 0.1 s, so an
+        // ordinary command press does nothing at all on this airframe.
+        assert!(s.starter_held, "an instantaneous press is a no-op here");
+        // Idle N1 has to be reachable — the PT6 default of 50 never arrives.
+        assert!(s.n1_idle < 30.0, "{}", s.n1_idle);
+        // And every free turbine keeps the behaviour it was tuned on.
+        for id in ["dhc6_twin_otter", "king_air_c90b", "lancair_evolution"] {
+            let t = crate::aircraft::load(id)
+                .and_then(|a| a.turboprop_start)
+                .unwrap_or_else(|| panic!("{id} start"));
+            assert_eq!(t.fuel_intro_n2, None, "{id} still watches N1");
+        }
     }
 }

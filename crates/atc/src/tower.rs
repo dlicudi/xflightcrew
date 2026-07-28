@@ -739,7 +739,7 @@ pub fn check_readback(transcript: &str, awaited: &Awaited) -> ReadbackCheck {
 
 /// A conditional line-up needs the arrival far enough out that the pilot can
 /// actually get behind it — inside this, "hold position" is the honest call.
-const CONDITIONAL_MIN_NM: f64 = 1.5;
+pub(crate) const CONDITIONAL_MIN_NM: f64 = 1.5;
 
 /// The tower's side of the dialogue: one aircraft (the player), one runway.
 pub struct Tower {

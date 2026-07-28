@@ -154,6 +154,23 @@ impl Registry {
     /// system present on the airframe contributes its tool(s).
     pub fn for_aircraft(profile: &AircraftProfile) -> Self {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+        // How briskly this airframe taxis. Resolved once here so every ground
+        // drive — the spoken auto taxi, the line-up, the arrival, and the ones
+        // full auto builds for itself — is paced by the aircraft actually
+        // loaded. A jet is not a 172: see `aircraft::TaxiProfile`.
+        let pace = crate::autotaxi::Pace::from_profile(profile.taxi.as_ref());
+        // The runway the wheels actually need, meters. Prefer the declared
+        // GROUND ROLL; the recited takeoff distance is the fallback the GA
+        // profiles have always used, but on an airliner that figure is a
+        // factored field length, and the ×1.4 every consumer adds then lands
+        // past the end of real runways (see `ReferenceProfile::takeoff_roll_ft`).
+        // One computation, because the line-up and the takeoff must agree on
+        // what "enough runway" means.
+        let takeoff_roll_m = profile
+            .reference
+            .as_ref()
+            .and_then(|r| r.takeoff_roll_ft.or(r.takeoff_distance_ft))
+            .map(|f| f * 0.3048);
 
         if let Some(flaps) = &profile.flaps {
             tools.push(Box::new(flaps::SetFlaps::new(flaps.clone())));
@@ -238,11 +255,6 @@ impl Registry {
                 .as_ref()
                 .and_then(|r| r.best_climb_fpm)
                 .map_or(500.0, |c| (c * 0.8).clamp(400.0, 1500.0));
-            let takeoff_roll_m = profile
-                .reference
-                .as_ref()
-                .and_then(|r| r.takeoff_distance_ft)
-                .map(|f| f * 0.3048);
             tools.push(Box::new(takeoff::AutoTakeoff {
                 cfg: ap.clone(),
                 vr_kts: vr,
@@ -252,11 +264,13 @@ impl Registry {
                 takeoff_flap_ratio: profile.flaps.as_ref().and_then(|f| f.takeoff_ratio),
                 takeoff_roll_m,
                 prop: profile.prop.clone(),
+                tail_strike_deg: profile.tail_strike_deg,
             }));
             // Auto circuit — one command that flies takeoff + pattern + landing
             // by orchestrating the takeoff loop, the AP, and autoland. Shares
             // the takeoff speeds and the autoland approach speed above.
             tools.push(Box::new(circuit::Circuit {
+                tail_strike_deg: profile.tail_strike_deg,
                 cfg: ap.clone(),
                 vr_kts: vr,
                 vy_kts: vy,
@@ -289,6 +303,12 @@ impl Registry {
                     takeoff_flap_ratio: profile.flaps.as_ref().and_then(|f| f.takeoff_ratio),
                     cruise_ias_kts: profile.reference.as_ref().and_then(|r| r.cruise_ias_kts),
                     prop: profile.prop.clone(),
+                    pace,
+                    tail_strike_deg: profile.tail_strike_deg,
+                    // "Can we start it at all": the generic piston group OR a
+                    // custom cycle-switch piston sequence (the DC-3, whose
+                    // mixture is xlua-overridden so it declares no `engine`).
+                    piston_engine: profile.engine || profile.piston_start.is_some(),
                     turboprop_start: profile.turboprop_start.clone(),
                     all_electrical_on_cmds: all_electrical_on_cmds(&profile.electrical),
                     cfg: ap,
@@ -305,6 +325,7 @@ impl Registry {
                     // spin (2026-07-26). Turboprops power their bus at the start
                     // instead (StartEngine's profile battery/master commands).
                     power_up_first: profile.turbine_start,
+                    jet_start: profile.turbine_start,
                 }));
             }
         }
@@ -338,26 +359,35 @@ impl Registry {
                 approach_kts: approach,
                 park_brake_valve_set: profile.park_brake_valve_set,
             }));
-            // Auto taxi stands on the same governor, so it ships with it —
-            // and the line-up (hold-short onto the centreline) with both.
+        }
+
+        // The GROUND drives, for anything with a throttle — autothrottle or
+        // not. These were gated behind `!autothrottle` along with `hold_speed`,
+        // which is right for the AIRBORNE speed tool (an airliner sets its
+        // speed bug) and wrong for these: on the ground the taxi governor is
+        // the only speed control there is, and auto taxi arms it directly
+        // rather than through the registry. The effect was that neither jet
+        // had a taxi, line-up or park tool at all — "taxi for me" reached
+        // nothing on the MD-82 or the Citation, and only full auto worked
+        // because it builds its own copies (found 2026-07-28).
+        if profile.engine || profile.throttle {
             tools.push(Box::new(taxi::AutoTaxi {
                 park_brake_valve_set: profile.park_brake_valve_set,
                 prop: profile.prop.clone(),
+                pace,
             }));
             tools.push(Box::new(taxi::LineUp {
                 park_brake_valve_set: profile.park_brake_valve_set,
-                takeoff_roll_m: profile
-                    .reference
-                    .as_ref()
-                    .and_then(|r| r.takeoff_distance_ft)
-                    .map(|f| f * 0.3048),
+                takeoff_roll_m,
                 prop: profile.prop.clone(),
+                pace,
             }));
             // Taxi to PARKING after landing — requests the taxi-in from ATC and
             // drives the cleared stand route.
             tools.push(Box::new(taxi::TaxiToParking {
                 park_brake_valve_set: profile.park_brake_valve_set,
                 prop: profile.prop.clone(),
+                pace,
             }));
         }
 
@@ -622,6 +652,8 @@ mod power_cmd_tests {
 
     fn sys(key: &str, on: &[&str]) -> ElectricalSystem {
         ElectricalSystem {
+            write_datarefs: vec![],
+            toggles: vec![],
             key: key.into(),
             spoken: key.into(),
             on_commands: on.iter().map(|s| s.to_string()).collect(),

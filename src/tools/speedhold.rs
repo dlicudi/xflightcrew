@@ -32,7 +32,13 @@ use super::{Tool, ToolCtx, BRAKES_REGULAR, BRAKE_HOLD_SECS};
 use crate::xplane::XPlaneClient;
 
 const IAS: &str = "sim/cockpit2/gauges/indicators/airspeed_kts_pilot";
-const THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
+/// The thrust lever THIS airframe obeys — not always the stock one (the
+/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
+/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
+/// thrust). Resolved per call, so a profile swap takes effect immediately.
+fn throttle_dref() -> String {
+    crate::aircraft::throttle_dataref()
+}
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const LEFT_BRAKE: &str = "sim/cockpit2/controls/left_brake_ratio";
@@ -572,7 +578,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
         let on_ground = xp.get_float(ON_GROUND).await.ok().map(|v| v > 0.5);
         match mode {
             Mode::Flight => {
-                if let (Ok(ias), Ok(thr)) = (xp.get_float(IAS).await, xp.get_float(THROTTLE).await)
+                if let (Ok(ias), Ok(thr)) = (xp.get_float(IAS).await, xp.get_float(&throttle_dref()).await)
                 {
                     if let Some(lc) = last_cmd.filter(|lc| (thr - lc).abs() > 0.15) {
                         if override_pending {
@@ -586,7 +592,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                             lc,
                             "speed governor: throttle deviated, challenging once"
                         );
-                        let _ = xp.set_float(THROTTLE, lc).await;
+                        let _ = xp.set_float(&throttle_dref(), lc).await;
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         continue;
                     }
@@ -616,7 +622,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     let adj = throttle_adjust(target - ias, trend);
                     if adj != 0.0 {
                         let cmd = (thr + adj).clamp(0.0, 1.0);
-                        glide(&xp, THROTTLE, cmd, 200).await; // ~most of the tick
+                        glide(&xp, &throttle_dref(), cmd, 200).await; // ~most of the tick
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     } else {
                         // In the groove: don't spin the API at 20 Hz doing nothing.
@@ -656,7 +662,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     tracing::info!(
                         "speed governor: parking brake set, closing throttle, standing down"
                     );
-                    glide(&xp, THROTTLE, 0.0, 400).await;
+                    glide(&xp, &throttle_dref(), 0.0, 400).await;
                     ACTIVE.store(false, Ordering::Relaxed);
                     break;
                 }
@@ -669,7 +675,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     let lb = xp.get_float(LEFT_BRAKE).await.unwrap_or(0.0);
                     let rb = xp.get_float(RIGHT_BRAKE).await.unwrap_or(0.0);
                     if lb.max(rb).max(pb) > PILOT_BRAKE_RESUME {
-                        if xp.get_float(THROTTLE).await.is_ok_and(|t| t > 0.15) {
+                        if xp.get_float(&throttle_dref()).await.is_ok_and(|t| t > 0.15) {
                             tracing::info!(
                                 "speed governor: throttle advanced while brake-paused, releasing"
                             );
@@ -707,7 +713,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                             brake = lb.max(rb).max(pb),
                             "speed governor: pilot braking, throttle idle, paused"
                         );
-                        glide(&xp, THROTTLE, 0.0, 300).await;
+                        glide(&xp, &throttle_dref(), 0.0, 300).await;
                         last_cmd = Some(0.0);
                         paused = true;
                         if let Some(v) = &voice {
@@ -720,7 +726,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     }
                 }
                 if let (Ok(gs_ms), Ok(thr)) =
-                    (xp.get_float(GS_MS).await, xp.get_float(THROTTLE).await)
+                    (xp.get_float(GS_MS).await, xp.get_float(&throttle_dref()).await)
                 {
                     if let Some(lc) = last_cmd.filter(|lc| (thr - lc).abs() > 0.15) {
                         if override_pending {
@@ -734,7 +740,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                             lc,
                             "speed governor: throttle deviated, challenging once"
                         );
-                        let _ = xp.set_float(THROTTLE, lc).await;
+                        let _ = xp.set_float(&throttle_dref(), lc).await;
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         continue;
                     }
@@ -757,7 +763,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     let (new_thr, brake) = taxi_control(target, gs_kts, thr, gs_trend);
                     let wrote = new_thr.is_some() || brake > 0.0 || braking;
                     if let Some(t) = new_thr {
-                        glide(&xp, THROTTLE, t, 200).await;
+                        glide(&xp, &throttle_dref(), t, 200).await;
                         last_cmd = Some(t);
                     }
                     // Brakes go through the plugin's proportional channel —

@@ -242,7 +242,13 @@ const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
 const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
-const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
+/// The thrust lever THIS airframe obeys — not always the stock one (the
+/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
+/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
+/// thrust). Resolved per call, so a profile swap takes effect immediately.
+fn throttle_dref() -> String {
+    crate::aircraft::throttle_dataref()
+}
 const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
 // Rollout: nose steering + proportional wheel brakes through the plugin, the
@@ -339,6 +345,13 @@ pub fn run_autoland(
 
             let mut last_phase: Option<ApproachPhase> = None;
             let mut go_around = GoAroundLatch::new();
+            // The "going around" transmission: said once per balked landing,
+            // with the callsign read from the aircraft the first time it's
+            // needed (an HTTP read, so not on every tick).
+            let mut said_going_around = false;
+            let mut going_around_callsign: Option<Option<String>> = None;
+            // When the current missed approach started, for the runaway guard.
+            let mut missed_since: Option<std::time::Instant> = None;
             let mut gear_down = false;
             let mut last_flap: Option<f64> = None;
             let mut vs_diverged: u32 = 0;
@@ -408,8 +421,9 @@ pub fn run_autoland(
                     let psi = psi_r.as_ref().copied().unwrap_or(rwy.course_deg);
                     let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
                     let steer = roll_law.step(err, 0.4, gs_kts, 0.0);
+                    let thr_dref = throttle_dref();
                     let (_, _) = tokio::join!(
-                        xp.set_float(THROTTLE_ALL, 0.0),
+                        xp.set_float(&thr_dref, 0.0),
                         xp.set_float(TAXI_STEER, steer),
                     );
                     if gs_kts > 2.0 {
@@ -455,7 +469,56 @@ pub fn run_autoland(
                 // straight ahead) until clear of the ground — the raw intercept
                 // guidance turns back to the FAP immediately, which is a killer
                 // at 50 ft (see [`GoAroundLatch`]).
-                let ga = go_around.update(last_phase, raw.phase, radio_ft);
+                let along_nm = along_track_nm(lat, lon, &rwy);
+                let missed = go_around.update(
+                    last_phase,
+                    raw.phase,
+                    radio_ft,
+                    raw.dist_nm,
+                    along_nm,
+                    join_point_nm(alt, rwy.elev_ft),
+                );
+                let ga = missed.is_some();
+                // The tower is owed this the moment it happens: it is holding a
+                // landing clearance for an aircraft that is no longer landing,
+                // and it works the traffic underneath us. Luton 2026-07-28: the
+                // autoland balked, climbed away and repositioned over the field
+                // for four minutes, and nothing was ever said — the FSM sat in
+                // ClearedToLand throughout. Announced ONCE, on the arming tick.
+                if missed == Some(MissedStage::Climb) && !said_going_around {
+                    said_going_around = true;
+                    if going_around_callsign.is_none() {
+                        going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
+                    }
+                    let cs = going_around_callsign.clone().flatten();
+                    crate::circuit::transmit(crate::circuit::radio_call(&cs, "going around"));
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "going_around", "radio": radio_ft}),
+                    );
+                }
+                // Cleared to try again: the next balked landing is a new call.
+                if missed.is_none() {
+                    said_going_around = false;
+                    missed_since = None;
+                } else if missed_since.is_none() {
+                    missed_since = Some(std::time::Instant::now());
+                }
+                // A missed approach that never ends is its own emergency.
+                if missed_since
+                    .is_some_and(|t| t.elapsed().as_secs_f64() > MAX_MISSED_APPROACH_SECS)
+                {
+                    let _ = xp.set_float(&throttle_dref(), 0.5).await;
+                    announce(
+                        "I can't get us back round for another approach. Your aircraft.".into(),
+                        Priority::Warning,
+                    );
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "give_up", "reason": "missed_approach_timeout"}),
+                    );
+                    break;
+                }
                 // Runaway backstop: an approach that keeps missing (arrives too
                 // fast/high to ever capture) would loop go-arounds forever,
                 // accelerating toward Vne. After MAX_GO_AROUNDS, stop trying:
@@ -463,7 +526,7 @@ pub fn run_autoland(
                 // aircraft back — a real crew would divert, not keep diving at
                 // a runway they can't make (LXGB Twin Otter, 2026-07-26).
                 if go_around.attempts() > MAX_GO_AROUNDS {
-                    let _ = xp.set_float(THROTTLE_ALL, 0.5).await;
+                    let _ = xp.set_float(&throttle_dref(), 0.5).await;
                     announce(
                         "Unable to land — we've gone around too many times. Your aircraft."
                             .into(),
@@ -475,10 +538,20 @@ pub fn run_autoland(
                     );
                     break;
                 }
-                let g = if ga {
-                    go_around_guidance(&rwy, raw.dist_nm, raw.glidepath_alt_ft, ias, approach_ias)
-                } else {
-                    raw
+                let g = match missed {
+                    Some(stage) => missed_approach_guidance(
+                        &rwy,
+                        stage,
+                        lat,
+                        lon,
+                        alt,
+                        radio_ft,
+                        raw.dist_nm,
+                        raw.glidepath_alt_ft,
+                        ias,
+                        approach_ias,
+                    ),
+                    None => raw,
                 };
                 let phase_word = match g.phase {
                     ApproachPhase::Intercept => "INTERCEPT",
@@ -541,11 +614,17 @@ pub fn run_autoland(
                 let trend_kts_s = prev_ias.map_or(0.0, |p| (ias - p) / dt_s);
                 prev_ias = Some(ias);
                 prev_ias_t = now;
-                let thr_now = xp.get_float(THROTTLE_ALL).await.unwrap_or(0.5);
-                let thr = if ga {
-                    // Go-around is firewall, not a governor holding approach
-                    // speed — the LXGB miss flew its last 20 seconds at the
-                    // governor's idea of "on speed" with the ground coming up.
+                let thr_now = xp.get_float(&throttle_dref()).await.unwrap_or(0.5);
+                let thr = if missed == Some(MissedStage::Climb) {
+                    // The balked landing itself is firewall, not a governor
+                    // holding approach speed — the LXGB miss flew its last 20
+                    // seconds at the governor's idea of "on speed" with the
+                    // ground coming up. ONLY the climb: full power belongs to
+                    // the seconds of getting away from the runway, not to the
+                    // minutes of repositioning that follow. Left firewalled
+                    // across the whole missed approach (the first flight of the
+                    // sticky version, Luton 2026-07-28) the MD-82 accelerated to
+                    // 284 KIAS on the outbound leg and was still gaining.
                     1.0
                 } else if g.phase == ApproachPhase::Flare {
                     0.0
@@ -553,7 +632,7 @@ pub fn run_autoland(
                     let adj = crate::tools::speedhold::throttle_adjust(g.target_ias_kts - ias, trend_kts_s);
                     (thr_now + adj).clamp(0.1, 1.0)
                 };
-                let _ = xp.set_float(THROTTLE_ALL, thr).await;
+                let _ = xp.set_float(&throttle_dref(), thr).await;
 
                 // Config: gear down inside 6 nm; flaps by distance AND vertical
                 // state (full only once on the path — see [`flap_schedule`]).
@@ -625,7 +704,9 @@ pub fn run_autoland(
 }
 
 /// Feet of altitude per nm along a 3° glidepath (tan 3° × 6076 ft/nm ≈ 318).
-const GLIDEPATH_FT_PER_NM: f64 = 318.0;
+/// Public because the circuit descends its base leg onto the same path — a
+/// pattern that hands over 500 ft below it has already lost the approach.
+pub const GLIDEPATH_FT_PER_NM: f64 = 318.0;
 /// Aim the glidepath at a touchdown point ~300 m (≈1,000 ft) PAST the threshold,
 /// so the path crosses the numbers at a standard ~50 ft threshold-crossing
 /// height and touches in the touchdown zone — not planted on the leading edge.
@@ -771,9 +852,36 @@ pub fn cross_track_nm(lat: f64, lon: f64, rwy: &Runway) -> f64 {
 /// below [`TERRAIN_FLOOR_AGL_FT`], holds through every phase flicker the raw
 /// guidance produces down there, and releases at the floor, where the normal
 /// intercept guidance takes over the turn back to the FAP.
+/// Where a balked landing is in the missed approach. Two stages, because a
+/// missed approach is a PROCEDURE, not a moment: releasing the aircraft back to
+/// the ordinary intercept guidance the instant it was clear of the ground left
+/// it 800 ft over the far end with the field behind it and no plan, and the
+/// stateless guidance then argued with itself — see `descent_limit_fpm` for the
+/// vertical half of the Luton orbit (2026-07-28) and `Reposition` for the
+/// lateral half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissedStage {
+    /// Straight ahead on runway heading, climbing away from the ground. The one
+    /// direction a runway promises is flyable.
+    Climb,
+    /// Repositioning: outbound to the join point at platform height, held there
+    /// until established OUTSIDE the FAP on the approach side — which is simply
+    /// where a normal approach begins.
+    ///
+    /// This stage is what makes the decision STICKY, and stickiness is the
+    /// whole point. The ordinary guidance picks its target from the CURRENT
+    /// altitude error, so at reposition height the choice flips every time the
+    /// aircraft crosses the distance where the path is 500 ft below it: turn
+    /// out, fly out, the error shrinks, turn back in, the error grows, turn out
+    /// again. At Luton that oscillation ran between 1.1 and 4.1 nm for three
+    /// and a half minutes with a landing clearance live and the tower working
+    /// arrivals underneath. An outbound leg has to run to completion.
+    Reposition,
+}
+
 #[derive(Debug, Default)]
 pub struct GoAroundLatch {
-    active: bool,
+    stage: Option<MissedStage>,
     /// How many go-arounds this approach has flown — a runaway backstop. An
     /// approach that keeps missing (arrives too fast/high to capture, as the
     /// LXGB Twin Otter did off the tight circuit) would otherwise firewall a
@@ -785,6 +893,12 @@ pub struct GoAroundLatch {
 /// Give up (level off, hand to the pilot) after this many go-arounds on one
 /// approach rather than loop a missed approach until the fuel runs out.
 pub const MAX_GO_AROUNDS: u32 = 2;
+/// ...and give up on a single missed approach that has run this long. A
+/// reposition leg is a couple of minutes of flying; one that is still going
+/// after this is not repositioning, it is lost, and the counter above cannot
+/// catch it because a second go-around needs another approach to fail first.
+/// Costs nothing when everything works and bounds the failure when it doesn't.
+pub const MAX_MISSED_APPROACH_SECS: f64 = 300.0;
 
 impl GoAroundLatch {
     pub fn new() -> Self {
@@ -797,55 +911,110 @@ impl GoAroundLatch {
     }
 
     /// Advance the latch one tick: `prev`/`now` are the raw guidance phases,
-    /// `radio_ft` the radio altitude. Returns whether the latch is flying.
+    /// `radio_ft` the radio altitude, `dist_nm` the distance to the threshold,
+    /// `along_nm` the signed along-track (positive = approach side) and
+    /// `join_nm` the [`join_point_nm`] the reposition leg is flying out to.
+    /// Returns the stage being flown, `None` when the approach is the pilot's
+    /// normal one again.
     pub fn update(
         &mut self,
         prev: Option<ApproachPhase>,
         now: ApproachPhase,
         radio_ft: f64,
-    ) -> bool {
-        if self.active {
-            // Clear of the ground — hand the turn back to the intercept
-            // guidance. 800 ft, not the 500 ft terrain floor: the turn back
-            // toward the FAP is the leg that crosses whatever the runway
-            // points away from, and releasing at 500 put the LXGB go-around
-            // eastbound at the Rock with no height in hand (2026-07-22).
-            // Straight ahead is the one direction a runway promises is
-            // flyable — buy the climb there.
-            if radio_ft >= GO_AROUND_TURN_AGL_FT {
-                self.active = false;
+        dist_nm: f64,
+        along_nm: f64,
+        join_nm: f64,
+    ) -> Option<MissedStage> {
+        match self.stage {
+            // Clear of the ground — stop climbing straight ahead and start
+            // repositioning. 800 ft, not the 500 ft terrain floor: the turn
+            // back is the leg that crosses whatever the runway points away
+            // from, and releasing at 500 put the LXGB go-around eastbound at
+            // the Rock with no height in hand (2026-07-22).
+            Some(MissedStage::Climb) if radio_ft >= GO_AROUND_TURN_AGL_FT => {
+                self.stage = Some(MissedStage::Reposition);
             }
-        } else if now == ApproachPhase::Intercept
-            && matches!(prev, Some(ApproachPhase::Final | ApproachPhase::Flare))
-            && radio_ft < TERRAIN_FLOOR_AGL_FT
-        {
-            self.active = true;
-            self.attempts += 1;
+            // Out at the join point on the approach side: that is where an
+            // approach starts, so hand back. Releasing merely OUTSIDE the FAP
+            // would hand back mid-outbound-leg, pointing away from the field,
+            // and leave the ordinary guidance to fly a 180 on final.
+            Some(MissedStage::Reposition) if along_nm > 0.0 && dist_nm >= join_nm - 0.2 => {
+                self.stage = None;
+            }
+            None if now == ApproachPhase::Intercept
+                && matches!(prev, Some(ApproachPhase::Final | ApproachPhase::Flare))
+                && radio_ft < TERRAIN_FLOOR_AGL_FT =>
+            {
+                self.stage = Some(MissedStage::Climb);
+                self.attempts += 1;
+            }
+            _ => {}
         }
-        self.active
+        self.stage
     }
 }
 
-/// The command a latched go-around flies: runway heading (straight ahead, no
-/// turn near the ground), a bounded climb once the speed is there — level
-/// acceleration first, because climbing slow bleeds energy to a stall — and a
-/// raised speed target for the throttle (the loop firewall it anyway while
-/// latched; the target keeps the governor sane on the release tick).
-pub fn go_around_guidance(
+/// Where a descent from `cur_alt_ft` meets the extended centreline: the point
+/// to be established at before flying the path down, never closer than the FAP.
+/// The 1.15 is margin — arriving exactly on a 3° path with no slack leaves
+/// nothing for the capture.
+pub fn join_point_nm(cur_alt_ft: f64, rwy_elev_ft: f64) -> f64 {
+    ((cur_alt_ft - rwy_elev_ft) / GLIDEPATH_FT_PER_NM * 1.15).clamp(FAP_NM, 40.0)
+}
+
+/// The command a latched go-around flies.
+///
+/// [`MissedStage::Climb`] is runway heading (straight ahead, no turn near the
+/// ground) and a bounded climb once the speed is there — level acceleration
+/// first, because climbing slow bleeds energy to a stall.
+///
+/// [`MissedStage::Reposition`] steers OUTBOUND to the join point down the
+/// extended centreline and holds platform height there. It does not chase the
+/// glidepath: the path inside the join point is the one this leg is flying away
+/// from, and descending toward it is what turned the Luton missed approach into
+/// an orbit. Levelling at platform height means arriving at the FAP already on
+/// the path, which is the whole reason the reposition altitude is defined as
+/// the path height at the FAP.
+///
+/// Both stages ask the throttle governor for a margin over the approach speed
+/// (the loop firewalls it anyway while latched; the target keeps the governor
+/// sane on the release tick).
+#[allow(clippy::too_many_arguments)]
+pub fn missed_approach_guidance(
     rwy: &Runway,
+    stage: MissedStage,
+    cur_lat: f64,
+    cur_lon: f64,
+    cur_alt_ft: f64,
+    radio_alt_ft: f64,
     dist_nm: f64,
     glidepath_alt_ft: f64,
     ias_kts: f64,
     approach_ias: f64,
 ) -> Guidance {
-    let target_vs = if approach_ias - ias_kts > SPEED_FLOOR_MARGIN_KTS {
-        0.0
-    } else {
-        MAX_CLIMB_FPM
+    let slow = approach_ias - ias_kts > SPEED_FLOOR_MARGIN_KTS;
+    let (target_heading_deg, target_vs_fpm) = match stage {
+        MissedStage::Climb => (
+            rwy.course_deg,
+            if slow { 0.0 } else { MAX_CLIMB_FPM },
+        ),
+        MissedStage::Reposition => {
+            // Same join point the ordinary guidance uses, so the handback is
+            // continuous.
+            let join_nm = join_point_nm(cur_alt_ft, rwy.elev_ft);
+            let recip = (rwy.course_deg + 180.0) % 360.0;
+            let (jlat, jlon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, join_nm);
+            let vs = if radio_alt_ft < REPOSITION_MIN_AGL_FT - 50.0 && !slow {
+                ((REPOSITION_MIN_AGL_FT - radio_alt_ft) * 2.0).clamp(100.0, MAX_CLIMB_FPM)
+            } else {
+                0.0
+            };
+            (bearing_deg(cur_lat, cur_lon, jlat, jlon), vs)
+        }
     };
     Guidance {
-        target_heading_deg: rwy.course_deg,
-        target_vs_fpm: target_vs,
+        target_heading_deg,
+        target_vs_fpm,
         target_ias_kts: approach_ias + CLIMB_ENERGY_BONUS_KTS,
         dist_nm,
         glidepath_alt_ft,
@@ -909,7 +1078,7 @@ pub fn guidance(
     // capturing) that means flying OUTBOUND first; the point walks back toward
     // the FAP as altitude burns off (a teardrop join).
     const CAPTURE_ABOVE_FT: f64 = 500.0;
-    let join_nm = ((cur_alt_ft - rwy.elev_ft) / GLIDEPATH_FT_PER_NM * 1.15).clamp(FAP_NM, 40.0);
+    let join_nm = join_point_nm(cur_alt_ft, rwy.elev_ft);
 
     // Are we past the threshold, on the departure side, still airborne? (The flare
     // branch below, checked first, owns a normal float/rollout across the numbers.)
@@ -1048,9 +1217,55 @@ pub fn guidance(
     };
     let has_climb_energy = ias_kts > approach_ias + CLIMB_SPEED_MARGIN_KTS;
 
+    // A SOFT floor under the descent, not the hard edge the climb gate is.
+    // Repositioning wants REPOSITION_MIN_AGL_FT (~1,590 ft AGL), the 3° path
+    // inside 5 nm sits below it, and the two laws met at a step: dive at 1,200
+    // toward the path, cross the floor, climb at 800 back through it, repeat.
+    // The Luton go-around (2026-07-28) rode that limit cycle for three and a
+    // half minutes, porpoising 1,859 to 2,050 ft while wandering between 1.1
+    // and 4.1 nm from the field. Fading the permitted descent to zero AT the
+    // floor lands the aircraft on it instead of through it.
+    let descent_limit_fpm = if phase == ApproachPhase::Intercept {
+        -((radio_alt_ft - REPOSITION_MIN_AGL_FT) * 2.0).clamp(0.0, 1200.0)
+    } else {
+        -1200.0
+    };
+
+    // What the vertical path asks for, computed first so the speed-protection
+    // branch below can be measured against it.
+    let path_vs = match phase {
+        ApproachPhase::Flare => -100.0, // arrest the descent near the ground
+        // Below the floor without the surplus to climb: hold level while the
+        // throttle bonus rebuilds it — NEVER track the glidepath down. The
+        // glidepath altitude is distance-symmetric, so a rejoin on the wrong
+        // side of the threshold reads "on path" and descends (KPDK 16).
+        _ if below_terrain_floor => 0.0,
+        // On/above speed but below the glidepath: hold level and let the path
+        // descend to us — don't climb to intercept. Speed protection above has
+        // already handled the case where holding level would stall us.
+        _ if alt_err < -50.0 => 0.0,
+        // 1.2 fpm per ft of path error: the old 0.4 recovered 77 fpm
+        // against the 190 ft the LXGB 09 final carried — it arrived at
+        // the numbers still 190 ft high (2026-07-22). 1.2 converges a
+        // 200 ft error inside the last mile; the clamp still forbids a
+        // dive.
+        _ => (nominal_vs - alt_err * 1.2)
+            .clamp(-1200.0, 0.0)
+            .max(descent_limit_fpm),
+    };
+
     let speed_deficit = approach_ias - ias_kts;
     let target_vs = if phase != ApproachPhase::Flare && speed_deficit > SPEED_FLOOR_MARGIN_KTS {
-        -(speed_deficit * 40.0).clamp(200.0, 700.0)
+        // Nose down to regain speed — but NEVER shallower than the path was
+        // already asking for. The protection rate is a fixed 40 fpm per knot
+        // capped at 700, which on a slow airframe is steeper than the path and
+        // on a fast one is not: a jet on a 3° path at 140 kt needs ~740 fpm, so
+        // 9 knots slow produced a 360 fpm "protection" that HALVED the descent
+        // and made the aircraft slower still, the exact opposite of the intent.
+        // The MD-82 drifted above the path through the last mile that way and
+        // crossed the threshold 51 ft high at 152 kt, which is the overflight
+        // that forced the Luton go-around (2026-07-28).
+        path_vs.min(-(speed_deficit * 40.0).clamp(200.0, 700.0))
     } else if below_terrain_floor && has_climb_energy {
         // Bounded climb toward THIS PHASE'S floor, steeper the deeper below
         // it. The magnitude used to reference the 500 ft terrain floor even
@@ -1063,24 +1278,7 @@ pub fn guidance(
         };
         ((floor_ft - radio_alt_ft) * 2.0).clamp(100.0, MAX_CLIMB_FPM)
     } else {
-        match phase {
-            ApproachPhase::Flare => -100.0, // arrest the descent near the ground
-            // Below the floor without the surplus to climb: hold level while the
-            // throttle bonus rebuilds it — NEVER track the glidepath down. The
-            // glidepath altitude is distance-symmetric, so a rejoin on the wrong
-            // side of the threshold reads "on path" and descends (KPDK 16).
-            _ if below_terrain_floor => 0.0,
-            // On/above speed but below the glidepath: hold level and let the path
-            // descend to us — don't climb to intercept. Speed protection above has
-            // already handled the case where holding level would stall us.
-            _ if alt_err < -50.0 => 0.0,
-            // 1.2 fpm per ft of path error: the old 0.4 recovered 77 fpm
-            // against the 190 ft the LXGB 09 final carried — it arrived at
-            // the numbers still 190 ft high (2026-07-22). 1.2 converges a
-            // 200 ft error inside the last mile; the clamp still forbids a
-            // dive.
-            _ => (nominal_vs - alt_err * 1.2).clamp(-1200.0, 0.0),
-        }
+        path_vs
     };
 
     // Below the terrain floor, ask the throttle governor for extra speed so it
@@ -1199,6 +1397,32 @@ mod tests {
             0.0,
         );
         assert_eq!(g_ok.target_vs_fpm, 0.0, "on speed below path → level hold");
+        // ...and protection must never be SHALLOWER than the path the aircraft
+        // is already flying. On a fast airframe the fixed 40 fpm/kt rate is
+        // less than the path itself, so it used to REDUCE the descent — which
+        // both loses the path and loses speed, the opposite of the intent. The
+        // Luton MD-82 (2026-07-28) was 9 kt slow at 1.5 nm on a 3° path: the
+        // path wanted ~740 fpm down, protection commanded 360, and it arrived
+        // over the threshold 51 ft high and 12 kt fast for a go-around.
+        let (jlat, jlon) = project_latlon(0.0, 0.0, 180.0, 1.5);
+        let jet = guidance(
+            jlat,
+            jlon,
+            520.0 + 1.5 * GLIDEPATH_FT_PER_NM,
+            1.5 * GLIDEPATH_FT_PER_NM,
+            140.0,
+            131.0,
+            &rwy_north(),
+            140.0,
+            25.0,
+            0.0,
+        );
+        let path_vs = -(140.0 / 60.0) * GLIDEPATH_FT_PER_NM;
+        assert!(
+            jet.target_vs_fpm <= path_vs,
+            "protection must not be shallower than the {path_vs:.0} fpm path, got {}",
+            jet.target_vs_fpm
+        );
         // Speed protection never fights the flare (we WANT to slow down landing).
         let g_flare = guidance(
             0.001,
@@ -1533,23 +1757,65 @@ mod tests {
         // re-fired past the threshold and pulled the power, and the aircraft
         // hit 200 m south of the strip. Low, the latch must own the go-around.
         use ApproachPhase::*;
+        use MissedStage::*;
         let mut latch = GoAroundLatch::new();
+        // Just past the threshold, so along-track is negative throughout.
+        let up = |l: &mut GoAroundLatch, p, n, r| l.update(Some(p), n, r, 0.2, -0.2, FAP_NM);
         // Final ticking along at 60 ft: not a go-around.
-        assert!(!latch.update(Some(Final), Final, 60.0));
-        // Overflight: Final degrades to Intercept at 57 ft → latch.
-        assert!(latch.update(Some(Final), Intercept, 57.0));
+        assert_eq!(up(&mut latch, Final, Final, 60.0), None);
+        // Overflight: Final degrades to Intercept at 57 ft → latch, climbing.
+        assert_eq!(up(&mut latch, Final, Intercept, 57.0), Some(Climb));
         // The raw guidance flickering (Intercept → Flare past the threshold →
         // Intercept) must not shake it loose while still low.
-        assert!(latch.update(Some(Intercept), Flare, 22.0));
-        assert!(latch.update(Some(Flare), Intercept, 35.0));
-        // Above the old 500 ft floor but below the turn height: still held —
-        // turning back at 520 ft is how the Rock CFIT happened (2026-07-22).
-        assert!(latch.update(Some(Intercept), Intercept, 520.0));
-        // At the turn height: release — the intercept turn is safe now.
-        assert!(!latch.update(Some(Intercept), Intercept, 850.0));
+        assert_eq!(up(&mut latch, Intercept, Flare, 22.0), Some(Climb));
+        assert_eq!(up(&mut latch, Flare, Intercept, 35.0), Some(Climb));
+        // Above the old 500 ft floor but below the turn height: still climbing
+        // straight ahead — turning back at 520 ft is how the Rock CFIT
+        // happened (2026-07-22).
+        assert_eq!(up(&mut latch, Intercept, Intercept, 520.0), Some(Climb));
+        // At the turn height: start repositioning, but do NOT hand back yet —
+        // 800 ft over the far end with the field behind us is not an approach.
+        assert_eq!(up(&mut latch, Intercept, Intercept, 850.0), Some(Reposition));
         // A HIGH overflight never latches: the immediate turn back is fine.
         let mut high = GoAroundLatch::new();
-        assert!(!high.update(Some(Final), Intercept, 800.0));
+        assert_eq!(up(&mut high, Final, Intercept, 800.0), None);
+    }
+
+    /// The missed approach is a procedure, not a moment: the reposition stage
+    /// runs until the aircraft is back where an approach starts. Anything less
+    /// and the stateless guidance re-decides every tick — the Luton orbit,
+    /// 1.1 to 4.1 nm for three and a half minutes (2026-07-28).
+    #[test]
+    fn the_reposition_runs_until_established_outside_the_fap() {
+        use ApproachPhase::*;
+        use MissedStage::*;
+        let mut l = GoAroundLatch::new();
+        // Platform height puts the join point ~5.75 nm out.
+        let join = join_point_nm(1600.0, 0.0);
+        assert_eq!(
+            l.update(Some(Final), Intercept, 50.0, 0.2, -0.2, join),
+            Some(Climb)
+        );
+        assert_eq!(
+            l.update(Some(Intercept), Intercept, 900.0, 1.0, -1.0, join),
+            Some(Reposition)
+        );
+        // Departure side, miles out: still repositioning, however far.
+        assert_eq!(
+            l.update(Some(Intercept), Intercept, 1600.0, 6.0, -6.0, join),
+            Some(Reposition)
+        );
+        // Approach side but short of the join point: an approach can't start
+        // here, and handing back mid-outbound-leg means a 180 on final.
+        assert_eq!(
+            l.update(Some(Intercept), Intercept, 1600.0, 5.2, 5.2, join),
+            Some(Reposition)
+        );
+        // Out at the join point on the approach side: hand back.
+        assert_eq!(
+            l.update(Some(Intercept), Intercept, 1600.0, join, join, join),
+            None
+        );
     }
 
     #[test]
@@ -1557,18 +1823,28 @@ mod tests {
         use ApproachPhase::*;
         let mut l = GoAroundLatch::new();
         assert_eq!(l.attempts(), 0);
-        // Each Final->Intercept low is one go-around; climbing back through
-        // 800 ft releases the latch for the next attempt.
+        // Each Final->Intercept low is one go-around; the latch releases once
+        // the aircraft is repositioned outside the FAP, ready to try again.
         for n in 1..=3 {
-            assert!(l.update(Some(Final), Intercept, 50.0), "latched low");
+            assert!(
+                l.update(Some(Final), Intercept, 50.0, 0.2, -0.2, FAP_NM).is_some(),
+                "latched low"
+            );
             assert_eq!(l.attempts(), n, "counted");
             assert!(
-                l.update(Some(Intercept), Intercept, 50.0),
+                l.update(Some(Intercept), Intercept, 50.0, 0.3, -0.3, FAP_NM)
+                    .is_some(),
                 "stays latched climbing"
             );
             assert!(
-                !l.update(Some(Intercept), Intercept, 900.0),
-                "released above 800 ft"
+                l.update(Some(Intercept), Intercept, 900.0, 2.0, -2.0, FAP_NM)
+                    .is_some(),
+                "and stays latched repositioning"
+            );
+            assert!(
+                l.update(Some(Intercept), Intercept, 1600.0, 5.5, 5.5, FAP_NM)
+                    .is_none(),
+                "released once established at the join point"
             );
         }
         // The loop gives up once attempts EXCEED the cap.
@@ -1578,8 +1854,22 @@ mod tests {
     #[test]
     fn go_around_guidance_climbs_straight_ahead_on_speed() {
         let rwy = rwy_north();
+        let climb = |ias| {
+            missed_approach_guidance(
+                &rwy,
+                MissedStage::Climb,
+                -0.005,
+                0.0,
+                200.0,
+                150.0,
+                0.3,
+                100.0,
+                ias,
+                90.0,
+            )
+        };
         // On speed: full climb, straight down the runway heading.
-        let g = go_around_guidance(&rwy, 0.3, 100.0, 92.0, 90.0);
+        let g = climb(92.0);
         assert_eq!(g.phase, ApproachPhase::Intercept);
         assert!(
             heading_diff(g.target_heading_deg, rwy.course_deg) < 0.1,
@@ -1588,9 +1878,75 @@ mod tests {
         assert!(g.target_vs_fpm > 0.0 && g.target_vs_fpm <= MAX_CLIMB_FPM);
         // Slow (deficit beyond the floor margin): level acceleration first —
         // climbing slow at full flap is how a go-around stalls.
-        let g_slow = go_around_guidance(&rwy, 0.3, 100.0, 75.0, 90.0);
+        let g_slow = climb(75.0);
         assert_eq!(g_slow.target_vs_fpm, 0.0, "build speed before climbing");
         assert!(heading_diff(g_slow.target_heading_deg, rwy.course_deg) < 0.1);
+    }
+
+    /// The tower is owed the call, so the words have to be words it knows: the
+    /// FSM sat in ClearedToLand through a four-minute missed approach because
+    /// nothing was ever transmitted (Luton, 2026-07-28). This pins the phrase
+    /// the loop sends against the parser that has to understand it.
+    #[test]
+    fn the_going_around_call_reads_as_a_go_around_to_the_tower() {
+        let call = crate::circuit::radio_call(
+            &Some("November five five two Alpha Alpha".to_string()),
+            "going around",
+        );
+        assert_eq!(
+            crate::tower::parse_intent(&call.to_ascii_lowercase()),
+            crate::tower::Intent::GoAround,
+            "{call}"
+        );
+        // ...and without a readable tail number it still parses.
+        let bare = crate::circuit::radio_call(&None, "going around");
+        assert_eq!(
+            crate::tower::parse_intent(&bare),
+            crate::tower::Intent::GoAround
+        );
+    }
+
+    /// The reposition leg flies OUTBOUND to the join point and levels at
+    /// platform height — it never dives at the glidepath under it, which is
+    /// the path it is flying away from.
+    #[test]
+    fn the_reposition_leg_flies_outbound_and_holds_platform_height() {
+        let rwy = rwy_north(); // course ~000, threshold at 0,0
+        // Half a mile past the far end at 900 ft, on speed: the join point is
+        // SOUTH (approach side), so the aircraft must turn around.
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.5);
+        let g = missed_approach_guidance(
+            &rwy,
+            MissedStage::Reposition,
+            lat,
+            lon,
+            900.0,
+            900.0,
+            0.5,
+            200.0,
+            95.0,
+            90.0,
+        );
+        assert!(
+            heading_diff(g.target_heading_deg, 180.0) < 20.0,
+            "outbound to the join point, got {}",
+            g.target_heading_deg
+        );
+        assert!(g.target_vs_fpm > 0.0, "still below platform: climb");
+        // At platform height it levels off rather than chasing the path down.
+        let level = missed_approach_guidance(
+            &rwy,
+            MissedStage::Reposition,
+            lat,
+            lon,
+            REPOSITION_MIN_AGL_FT + 100.0,
+            REPOSITION_MIN_AGL_FT + 100.0,
+            0.5,
+            200.0,
+            95.0,
+            90.0,
+        );
+        assert_eq!(level.target_vs_fpm, 0.0, "hold platform, never dive at it");
     }
 
     #[test]

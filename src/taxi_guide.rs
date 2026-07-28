@@ -357,9 +357,22 @@ impl Guide {
         if !(2.0..40.0).contains(&gs_kts) {
             return None;
         }
+        // A tug has us: nothing about the route ahead is a cue yet.
+        if crate::pushback::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            self.prev_fix = None;
+            return None;
+        }
         let (progress, lateral) = project(&self.path, lat, lon)?;
         let prev = self.prev_fix.replace((progress, lateral));
         if lateral > OFF_ROUTE_M {
+            return None;
+        }
+        // Moving BACKWARDS along the route — a push, or a pilot reversing.
+        // Groundspeed can't tell direction (it is a magnitude), so the route
+        // itself has to: "next left, onto Sierra" is never a cue for an
+        // aircraft travelling the other way. Slack for GPS jitter at a
+        // standstill; the guide simply waits until we roll forward again.
+        if prev.is_some_and(|(p, _)| progress < p - 1.0) {
             return None;
         }
         if self
