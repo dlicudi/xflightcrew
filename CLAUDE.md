@@ -844,6 +844,23 @@ mirrors spoken lines to the panel transcript itself — any watch that ALSO
 posts `s.action(same line)` double-writes the chat (the Jerez relocation
 note; gyro-sync and autoland hit it first). Mirror OR action, never both.
 
+**Web API load is a sim cost, and it is measured** (2026-07-28). The API is
+served from inside X-Plane's flight loop, so every request is frame time the
+sim does not get. Two hangs that day could not be attributed either way,
+because the logs recorded only FAILURES — nothing ever counted the requests
+that succeeded. `crates/sim/src/xplane.rs` now reports rate, cache hits,
+failures and the slowest response every 30 s, to the log and the blackbox
+(`"kind":"api_load"`). The first numbers were 70-80 req/s sustained, with the
+per-window slowest response climbing 50 → 100 → 125 ms in the minutes before a
+freeze: the shape of load, not of a single event. Most of that volume was
+DUPLICATION (the monitor's eighteen checks run in one burst wanting the same
+airspeed and altitude; the control loops re-read what the monitor just read),
+so reads are served from a 60 ms value cache — shorter than any control tick,
+and a write drops its own entry so the readback every tool's trust rests on
+still sees the real post-write value. Whether this fixes the hangs is unknown:
+the plugin (in-process, drawing every frame, never profiled) and LiveTraffic
+are the other two suspects, and the counter is what will tell them apart.
+
 Battle-test surface (all deterministic, in `cargo test --workspace` unless
 noted — plain `cargo test` at the root only runs the crew package now): the
 state-by-intent matrix test in [crates/atc/src/tower.rs](crates/atc/src/tower.rs); the adversarial
