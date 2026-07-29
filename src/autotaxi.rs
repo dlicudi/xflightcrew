@@ -63,6 +63,12 @@ fn throttle_dref() -> String {
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 /// The plugin's proportional steering channel (-1..1, right positive).
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
+/// The sim's own toe-brake inputs, for the differential-brake steering assist
+/// ([`brake_steer_split`]). Written one side at a time and zeroed on every
+/// stand-down; pilot toe input on the SAME datarefs wins by the pedal/steer
+/// yield machinery, not by arbitration here.
+const LEFT_BRAKE: &str = "sim/cockpit2/controls/left_brake_ratio";
+const RIGHT_BRAKE: &str = "sim/cockpit2/controls/right_brake_ratio";
 /// The plugin's pilot-feet latch: 1 = the yaw axis moved, override dropped.
 const STEER_YIELD: &str = "xcopilot/steer_yield";
 const MS_TO_KTS: f64 = 1.943_844;
@@ -117,6 +123,15 @@ pub struct Pace {
     pub straight: f64,
     pub turn: f64,
     pub sharp: f64,
+    /// Steering feel, per airframe — see [`crate::aircraft::TaxiProfile`].
+    pub steer_full_deg: f64,
+    pub steer_lead_s: f64,
+    pub steer_slew_per_s: Option<f64>,
+    /// Differential-brake steering assist (castoring nosewheel + no prop
+    /// wash) — see [`brake_steer_split`].
+    pub brake_steer: bool,
+    /// Pure-pursuit aim time, seconds — see [`lookahead_m_with`].
+    pub lookahead_s: f64,
 }
 
 impl Default for Pace {
@@ -125,6 +140,11 @@ impl Default for Pace {
             straight: STRAIGHT_KTS,
             turn: TURN_KTS,
             sharp: SHARP_KTS,
+            steer_full_deg: STEER_FULL_DEG,
+            steer_lead_s: STEER_RATE_LEAD_S,
+            steer_slew_per_s: None,
+            brake_steer: false,
+            lookahead_s: 5.0,
         }
     }
 }
@@ -143,6 +163,17 @@ impl Pace {
                 .map_or(d.straight, crate::tools::speedhold::clamp_taxi_target),
             turn: t.turn_kts.map_or(d.turn, |k| k.clamp(2.0, 25.0)),
             sharp: t.sharp_kts.map_or(d.sharp, |k| k.clamp(2.0, 25.0)),
+            // Clamped the same way the speeds are: a profile typo must not be
+            // able to make the steering either inert or a bang-bang switch.
+            steer_full_deg: t
+                .steer_full_deg
+                .map_or(d.steer_full_deg, |v| v.clamp(10.0, 90.0)),
+            steer_lead_s: t.steer_lead_s.map_or(d.steer_lead_s, |v| v.clamp(0.0, 3.0)),
+            // A slew below 0.5/s is the auto-takeoff limit-cycle trap; refuse to
+            // configure one that tight rather than ship a new oscillation.
+            steer_slew_per_s: t.steer_slew_per_s.map(|v| v.clamp(0.5, 10.0)),
+            brake_steer: t.brake_steer,
+            lookahead_s: t.lookahead_s.map_or(5.0, |v| v.clamp(3.0, 12.0)),
         }
     }
 
@@ -312,8 +343,27 @@ impl Route {
 /// [`STEER_FULL_DEG`]. The plant decides whether raw P is enough: a linked
 /// nosewheel (172) is self-damped, a castoring one is not — feed this
 /// [`damped_err_deg`], never the raw error.
-pub fn steer_cmd(err_deg: f64) -> f64 {
-    (err_deg / STEER_FULL_DEG).clamp(-1.0, 1.0)
+pub fn steer_cmd_with(err_deg: f64, full_deg: f64) -> f64 {
+    (err_deg / full_deg).clamp(-1.0, 1.0)
+}
+
+/// Rate-limit the steering command toward `want`. A taxiing aircraft is a
+/// vehicle with people in it: the lever slamming half its travel in under a
+/// second is felt in the cabin as a jolt, whatever it does for tracking.
+///
+/// Per SECOND and dt-scaled, never per tick — the auto-takeoff roll learned
+/// that the hard way (a 0.25-per-tick limiter swept only 0.5/s and the rudder
+/// chased the error a second behind in exact steps, a textbook slew-induced
+/// limit cycle, 2026-07-21). `None` is no limit, which is every airframe that
+/// has never needed one.
+pub fn slew_steer(prev: f64, want: f64, per_s: Option<f64>, dt: f64) -> f64 {
+    match per_s {
+        Some(rate) if dt > 0.0 => {
+            let step = rate * dt;
+            prev + (want - prev).clamp(-step, step)
+        }
+        _ => want,
+    }
 }
 
 /// Lead the heading error by the yaw rate. On a castoring nosewheel (SR22)
@@ -324,8 +374,8 @@ pub fn steer_cmd(err_deg: f64) -> f64 {
 /// crest. On a linked nosewheel taxi yaw rates are small and the term is
 /// nearly inert, so the 172 keeps its proven feel.
 pub const STEER_RATE_LEAD_S: f64 = 0.6;
-pub fn damped_err_deg(err_deg: f64, yaw_rate_dps: f64) -> f64 {
-    err_deg - yaw_rate_dps * STEER_RATE_LEAD_S
+pub fn damped_err_deg(err_deg: f64, yaw_rate_dps: f64, lead_s: f64) -> f64 {
+    err_deg - yaw_rate_dps * lead_s
 }
 
 /// Steering authority vs groundspeed: a fully deflected nosewheel at a
@@ -337,6 +387,77 @@ pub fn damped_err_deg(err_deg: f64, yaw_rate_dps: f64) -> f64 {
 /// the wheel is actually steering.
 pub fn steer_authority(gs_kts: f64) -> f64 {
     0.35 + 0.65 * (gs_kts / 3.0).clamp(0.0, 1.0)
+}
+
+/// The steer command below which the brakes stay out of it. Small on
+/// purpose: "small corrections are the yoke channel's" was the original
+/// rationale, and on the one class of airframe that carries the assist the
+/// yoke channel is DEAD — below the deadband nothing steers at all. At 0.2
+/// the SF50 could not make small sustained corrections, so it drifted until
+/// the error bought a command past 0.5, then slow-corrected, 13 m out and
+/// back for whole legs (2026-07-29, the fifth taxi). A castoring-wheel jet
+/// rides a breath of inside brake down a not-quite-straight taxiway because
+/// that is the only steering it has — the real aircraft does the same.
+const BRAKE_STEER_DEADBAND: f64 = 0.05;
+/// The most inside-brake the assist may apply. Well under the governor's own
+/// stop braking: this is a nudge, not a pivot. History: 0.25 pulled 14 m of
+/// offset back in ten seconds on the assist's first sortie but read as
+/// "violent, oversteering" from the cabin (2026-07-28) and was cut to 0.16 —
+/// but the violence was the OLD unsaturated mapping slamming the full cap on
+/// at the deadband edge, a shape that no longer exists, and the retreated cap
+/// then could not fly a BEND: fifth taxi, mid-bend at 10-13 kt, steer at
+/// 0.52-0.60 — effectively the cap — returned 0-0.5 deg/s of yaw against the
+/// 3-4 the curve demanded, and the aircraft ran 24 m off the outside
+/// (2026-07-29). Back to the value that demonstrably turned the aircraft,
+/// applied smoothly by the saturated mapping and the slew.
+const BRAKE_STEER_MAX: f64 = 0.25;
+/// The command at which the assist reaches that max. NOT 1.0: tracking can
+/// never command full deflection — the heading error would have to exceed
+/// the whole `steer_full_deg` — so a max reached only at 1.0 is a max the
+/// loop can never draw on. The fourth SF50 taxi proved it (2026-07-29):
+/// steer sat above 0.5 for two thirds of an 11-minute taxi, which mapped to
+/// ~0.07 of brake and 0.69 deg/s of yaw against the ~3.5 the assist gives
+/// flat out, and the aircraft held a one-sided 9 m offset (15 m max, the
+/// error changing sign four times in 11 minutes) — starvation, not a weave.
+/// Saturating at 0.6 hands the tracking band the full authority the cap was
+/// sized for.
+const BRAKE_STEER_SAT: f64 = 0.6;
+/// The assist's own slew, per second — pedals squeeze, they don't stab,
+/// exactly the taxi governor's brake discipline.
+const BRAKE_STEER_SLEW_PER_S: f64 = 0.4;
+/// Speed band the assist fades in across. Below it the nosewheel's own
+/// low-speed steering (and the stop machinery) owns the aircraft — braking a
+/// near-stopped aircraft asymmetrically is a lurch.
+const BRAKE_STEER_MIN_KTS: f64 = 4.0;
+const BRAKE_STEER_FULL_KTS: f64 = 7.0;
+
+/// Differential-brake steering: the (left, right) brake ratios for a steer
+/// command, for airframes flagged [`Pace::brake_steer`].
+///
+/// The yoke-heading channel is nosewheel + rudder, and on a castoring-wheel
+/// JET both halves are dead at taxi speed — the wheel takes no input and a
+/// turbofan puts no wash over the rudder. The SF50 proved it: steer −0.6 held
+/// for thirty seconds while the cross-track error grew to 13.8 m and the
+/// aircraft tracked the grass parallel to the taxiway (Luton, 2026-07-28,
+/// the blackbox trail). A touch of inside brake is how the real aircraft is
+/// steered.
+///
+/// One side only, ever — the governor's pilot-brake detector reads
+/// `min(left, right)`, deliberately, so a single-side assist never reads as
+/// the pilot slowing the aircraft. The governor's speed loop simply carries
+/// the extra drag.
+pub fn brake_steer_split(steer: f64, gs_kts: f64) -> (f64, f64) {
+    let authority =
+        ((gs_kts - BRAKE_STEER_MIN_KTS) / (BRAKE_STEER_FULL_KTS - BRAKE_STEER_MIN_KTS))
+            .clamp(0.0, 1.0);
+    let excess = ((steer.abs() - BRAKE_STEER_DEADBAND) / (BRAKE_STEER_SAT - BRAKE_STEER_DEADBAND))
+        .clamp(0.0, 1.0);
+    let b = excess * BRAKE_STEER_MAX * authority;
+    if steer > 0.0 {
+        (0.0, b) // nose right: right brake
+    } else {
+        (b, 0.0)
+    }
 }
 
 /// Straighten the nosewheel as a stop closes: braking shifts weight onto
@@ -799,19 +920,56 @@ pub fn pick_line_up(
 /// centreline offset read as 12° of error and half-lock steer — the SR22
 /// S-weaved ±4 m for whole legs even with the rate lead (2026-07-22).
 /// Longer aim turns the same offset into ~8° and a quarter-lock nudge.
+/// Test-only since the live loop took the aim from the profile
+/// ([`Pace::lookahead_s`]); the tests pin this proven 5 s baseline.
+#[cfg(test)]
 pub fn lookahead_m(gs_kts: f64) -> f64 {
-    (gs_kts * 0.514 * 5.0).clamp(16.0, 50.0)
+    lookahead_m_with(gs_kts, 5.0)
+}
+
+/// [`lookahead_m`] with the airframe's own aim time. A slow plant needs a
+/// LONG aim: the SF50 (castoring wheel, brake-assisted, ~3.5 deg/s of yaw at
+/// full command) crossed the centreline 24 degrees ANGLED at 12 kt with the
+/// 5 s aim — it cannot turn fast enough to roll out in 31 m, so every
+/// crossing overshot ~10 m the other way, a slow drunk S down the taxiway
+/// (2026-07-29). Aim further out and the same offset asks for a shallower
+/// crossing the plant can actually fly. The cap scales with the aim so a
+/// long-aim airframe keeps it at speed.
+pub fn lookahead_m_with(gs_kts: f64, aim_s: f64) -> f64 {
+    (gs_kts * 0.514 * aim_s).clamp(16.0, 10.0 * aim_s)
 }
 
 /// The braking-distance speed cap approaching the stop point: v = √(2·a·d)
 /// at a gentle 0.5 m/s², floored at a 2-knot creep so the last meters
 /// actually finish. At/inside half a meter it's a stop.
 pub fn stop_ramp_kts(remaining_m: f64) -> f64 {
-    if remaining_m <= 0.5 {
+    if remaining_m <= STOP_ZERO_M {
         return 0.0;
     }
-    (MS_TO_KTS * (2.0 * 0.5 * remaining_m).sqrt()).max(2.0)
+    (MS_TO_KTS * (2.0 * 0.5 * remaining_m).sqrt()).max(CREEP_KTS)
 }
+
+/// Where the schedule commands a full stop, and the creep it will not go below
+/// on the way in. These two are a PAIR, and getting them out of step is what
+/// made the SF50 unable to line up at Luton (2026-07-28).
+///
+/// The old figures were a 2 kt creep held until half a metre to go, against an
+/// arrival test of `remaining <= 1 m && gs < 1.5 kt`. So the schedule was still
+/// DRIVING at 2 kt through the window the arrival test needed it under 1.5, and
+/// 2 kt needs `v^2/2a` = 1.06 m to stop at the ramp's own 0.5 m/s^2 — more than
+/// the distance left — before any braking lag. Every leg therefore sailed past
+/// its stop point: the blackbox shows `remaining_m` pinned at -5 with the
+/// aircraft still rolling, and because `stop_straighten` has faded the steering
+/// out by then, it drifted while nobody was holding the nose. Three line-up
+/// legs in a row finished 2.5 to 8.6 m off with the aim point behind them, and
+/// full auto's `lined_up` check — correctly — called it a failure.
+///
+/// 1.2 kt needs 0.38 m, comfortably inside the 1 m zero. The creep still moves
+/// (the reason it exists at all: too low and the last metres never finish), and
+/// the zero now matches the arrival test's own 1 m so the two agree about where
+/// the route ends.
+const CREEP_KTS: f64 = 1.2;
+const STOP_ZERO_M: f64 = 1.0;
 
 /// The scheduled taxi target: the pilot's pace, capped by any nearby bend
 /// and by the stop ramp.
@@ -973,6 +1131,13 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     // differences of an HTTP read are noise the lead would amplify.
     let mut prev_psi: Option<(f64, std::time::Instant)> = None;
     let mut yaw_rate = 0.0f64;
+    // Last steering command, so the slew limiter has something to move FROM.
+    let mut prev_steer = 0.0f64;
+    // Whether the brake-steer assist currently has a wheel braked, so every
+    // exit path can release it exactly once — and the last commanded pair,
+    // so the assist's own slew has something to move from.
+    let mut bs_on = false;
+    let mut bs_prev = (0.0f64, 0.0f64);
     // Stagnation watch: commanding motion but not moving (see below).
     let mut stalled_since: Option<std::time::Instant> = None;
     loop {
@@ -1074,7 +1239,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // stop_straighten then froze the leftover angle (LXGB Echo,
         // 2026-07-24, twice). Only bites close-in, where the stop ramp has
         // already slowed us below weave speeds.
-        let look = lookahead_m(gs_kts).min((remaining * 0.6).max(6.0));
+        let look = lookahead_m_with(gs_kts, route.pace.lookahead_s).min((remaining * 0.6).max(6.0));
         let err = route.heading_err_deg(lat, lon, psi, progress, look);
         let allow = *join_allow.get_or_insert_with(|| {
             let a = join_allowance_m(lateral, err);
@@ -1174,6 +1339,9 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // bleeding speed off) the wheel straightens so the brakes never
         // bite onto a deflected nosewheel.
         let now = std::time::Instant::now();
+        let dt = prev_psi.map_or(0.2, |(_, t0)| {
+            now.duration_since(t0).as_secs_f64().clamp(0.05, 1.0)
+        });
         let raw_rate = prev_psi.map_or(0.0, |(p, t0)| {
             let dt = now.duration_since(t0).as_secs_f64();
             if (0.05..=1.0).contains(&dt) {
@@ -1184,18 +1352,58 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         });
         prev_psi = Some((psi, now));
         yaw_rate = yaw_rate * 0.5 + raw_rate.clamp(-90.0, 90.0) * 0.5;
-        let mut steer = stop_straighten(
-            steer_cmd(damped_err_deg(err, yaw_rate)) * steer_authority(gs_kts),
+        let want = stop_straighten(
+            steer_cmd_with(
+                damped_err_deg(err, yaw_rate, route.pace.steer_lead_s),
+                route.pace.steer_full_deg,
+            ) * steer_authority(gs_kts),
             remaining,
         );
+        let mut steer = slew_steer(prev_steer, want, route.pace.steer_slew_per_s, dt);
+        prev_steer = steer;
         if ext_stopped {
             steer *= (gs_kts / 3.0).clamp(0.0, 1.0);
+        }
+        // The brake half of the steering, where the airframe needs it. Only
+        // ever one side, slewed on like a foot (BRAKE_STEER_SLEW_PER_S),
+        // released the moment the command shrinks back into the deadband.
+        // The writes are CONCURRENT with each other and gated on actually
+        // changing: two sequential HTTP awaits added to every tick dragged
+        // the whole control loop from a 0.3 s period to over a second, and a
+        // one-second steering loop is its own violence (2026-07-28, the
+        // assist's first sortie).
+        if route.pace.brake_steer {
+            let (wl, wr) = brake_steer_split(steer, gs_kts);
+            let bl = slew_steer(bs_prev.0, wl, Some(BRAKE_STEER_SLEW_PER_S), dt);
+            let br = slew_steer(bs_prev.1, wr, Some(BRAKE_STEER_SLEW_PER_S), dt);
+            let changed = (bl - bs_prev.0).abs() > 0.02 || (br - bs_prev.1).abs() > 0.02;
+            let releasing = bs_on && bl <= 0.001 && br <= 0.001;
+            if (bl > 0.0 || br > 0.0) && changed {
+                let (a, b) = tokio::join!(
+                    xp.set_float(LEFT_BRAKE, bl),
+                    xp.set_float(RIGHT_BRAKE, br)
+                );
+                let _ = (a, b);
+                bs_prev = (bl, br);
+                bs_on = true;
+            } else if releasing {
+                let (a, b) = tokio::join!(
+                    xp.set_float(LEFT_BRAKE, 0.0),
+                    xp.set_float(RIGHT_BRAKE, 0.0)
+                );
+                let _ = (a, b);
+                bs_prev = (0.0, 0.0);
+                bs_on = false;
+            } else if changed {
+                bs_prev = (bl, br);
+            }
         }
         crate::blackbox::record(
             "autotaxi",
             serde_json::json!({
                 "event": "drive", "gs": gs_kts, "err": err, "yaw_dps": yaw_rate,
                 "steer": steer, "lat_m": lateral, "remaining_m": remaining,
+                "bs": bs_on,
             }),
         );
         if xp.set_float(TAXI_STEER, steer).await.is_err() {
@@ -1240,6 +1448,14 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     }
     // Politeness on the way out — expiry would do it within the second.
     let _ = xp.set_float(TAXI_STEER, 0.0).await;
+    // The brake-steer datarefs do NOT expire like the plugin channel does, so
+    // a braked wheel left behind would drag forever. Every exit is a `break`
+    // to here (checked — no returns inside the loop), so one release covers
+    // them all.
+    if bs_on {
+        let _ = xp.set_float(LEFT_BRAKE, 0.0).await;
+        let _ = xp.set_float(RIGHT_BRAKE, 0.0).await;
+    }
     ACTIVE.store(false, Ordering::Relaxed);
     tracing::info!("auto taxi stopped");
 }
@@ -1304,14 +1520,14 @@ mod tests {
 
     #[test]
     fn steering_is_proportional_and_bounded() {
-        assert_eq!(steer_cmd(0.0), 0.0);
+        assert_eq!(steer_cmd_with(0.0, STEER_FULL_DEG), 0.0);
         assert!(
-            steer_cmd(10.0) > 0.0 && steer_cmd(10.0) < 1.0,
+            steer_cmd_with(10.0, STEER_FULL_DEG) > 0.0 && steer_cmd_with(10.0, STEER_FULL_DEG) < 1.0,
             "right of course, steer right"
         );
-        assert!(steer_cmd(-10.0) < 0.0);
-        assert_eq!(steer_cmd(90.0), 1.0, "full deflection is the cap");
-        assert_eq!(steer_cmd(-170.0), -1.0);
+        assert!(steer_cmd_with(-10.0, STEER_FULL_DEG) < 0.0);
+        assert_eq!(steer_cmd_with(90.0, STEER_FULL_DEG), 1.0, "full deflection is the cap");
+        assert_eq!(steer_cmd_with(-170.0, STEER_FULL_DEG), -1.0);
     }
 
     #[test]
@@ -1382,7 +1598,8 @@ mod tests {
         jet.pace = Pace::from_profile(Some(&crate::aircraft::TaxiProfile {
             kts: Some(18.0),
             turn_kts: Some(10.0),
-            sharp_kts: Some(6.0),
+            sharp_kts: Some(6.0),            ..Default::default()
+
         }));
         assert_eq!(jet.pace.straight, 18.0);
         assert_eq!(schedule_kts(18.0, &jet, 50.0, 18.0), 18.0, "open taxiway");
@@ -1399,7 +1616,8 @@ mod tests {
         let partial = Pace::from_profile(Some(&crate::aircraft::TaxiProfile {
             kts: Some(15.0),
             turn_kts: None,
-            sharp_kts: None,
+            sharp_kts: None,            ..Default::default()
+
         }));
         assert_eq!(partial.straight, 15.0);
         assert_eq!(partial.turn, TURN_KTS);
@@ -1408,7 +1626,8 @@ mod tests {
         let absurd = Pace::from_profile(Some(&crate::aircraft::TaxiProfile {
             kts: Some(180.0),
             turn_kts: Some(90.0),
-            sharp_kts: Some(0.0),
+            sharp_kts: Some(0.0),            ..Default::default()
+
         }));
         assert_eq!(absurd.straight, 25.0);
         assert_eq!(absurd.turn, 25.0);
@@ -1420,9 +1639,9 @@ mod tests {
     #[test]
     fn stop_ramp_is_gentle_and_finishes() {
         assert_eq!(stop_ramp_kts(0.0), 0.0);
-        assert_eq!(stop_ramp_kts(0.4), 0.0, "inside half a meter is stopped");
+        assert_eq!(stop_ramp_kts(0.4), 0.0, "inside the stop zone is stopped");
         assert!(
-            stop_ramp_kts(1.0) >= 2.0,
+            stop_ramp_kts(2.0) >= CREEP_KTS,
             "creep floor carries the last meters"
         );
         let (near, far) = (stop_ramp_kts(10.0), stop_ramp_kts(40.0));
@@ -1430,15 +1649,154 @@ mod tests {
         assert!(far < 13.0, "40 m out needs no takeoff-roll pace: {far}");
     }
 
+    /// The schedule must be able to STOP the aircraft inside the window the
+    /// arrival test is watching, or every leg overshoots its own end.
+    ///
+    /// Luton 2026-07-28: a 2 kt creep held to 0.5 m to go, against arrival at
+    /// `remaining <= 1 m && gs < 1.5 kt`. The schedule was still commanding
+    /// 2 kt through the window that wanted under 1.5, and 2 kt cannot stop in
+    /// half a metre at the ramp's own 0.5 m/s^2. Three SF50 line-up legs ran
+    /// past their stop points — `remaining_m` pinned at -5, still rolling,
+    /// steering already faded out by `stop_straighten` so the nose drifted —
+    /// and full auto rightly called the line-up a failure.
+    #[test]
+    fn the_stop_ramp_can_actually_stop_before_the_arrival_window() {
+        // Commanded stop no later than the arrival test's own 1 m.
+        const ARRIVAL_M: f64 = 1.0;
+        const ARRIVAL_KTS: f64 = 1.5;
+        assert_eq!(stop_ramp_kts(ARRIVAL_M), 0.0, "zero by the arrival window");
+        // The creep must be slow enough to stop within the zero distance at
+        // the ramp's own deceleration, before any braking lag.
+        let v = CREEP_KTS / MS_TO_KTS;
+        let stopping_m = v * v / (2.0 * 0.5);
+        assert!(
+            stopping_m < STOP_ZERO_M,
+            "creep of {CREEP_KTS} kt needs {stopping_m:.2} m but only gets {STOP_ZERO_M}"
+        );
+        // ...and the creep must still be under the arrival test's speed, so
+        // reaching the point is enough to be judged arrived.
+        assert!(CREEP_KTS < ARRIVAL_KTS, "the creep must satisfy arrival");
+    }
+
+    /// The yoke-heading channel is dead on a castoring-wheel jet at taxi
+    /// speed (steer −0.6 for 30 s while the offset grew to 13.8 m — Luton,
+    /// 2026-07-28), so the assist brakes the inside wheel. One side only,
+    /// ever: the governor's pilot-brake detector reads `min(left, right)`.
+    #[test]
+    fn brake_steer_brakes_the_inside_wheel_only() {
+        // A breath of command is a breath of brake — on a castoring wheel
+        // the brake IS the steering, so only jitter stays off it entirely.
+        assert_eq!(brake_steer_split(0.04, 10.0), (0.0, 0.0));
+        let (_, small) = brake_steer_split(0.15, 10.0);
+        assert!(small > 0.0 && small < 0.06, "gentle, not zero: {small}");
+        // Near-stopped: no asymmetric lurch, whatever the command.
+        assert_eq!(brake_steer_split(0.9, 2.0), (0.0, 0.0));
+        // A real correction at taxi speed: inside wheel, bounded, one side.
+        let (l, r) = brake_steer_split(0.6, 10.0);
+        assert_eq!(l, 0.0, "nose right brakes the RIGHT wheel only");
+        assert!(r > 0.05 && r <= BRAKE_STEER_MAX, "{r}");
+        let (l2, r2) = brake_steer_split(-0.6, 10.0);
+        assert_eq!(r2, 0.0);
+        assert!((l2 - r).abs() < 1e-12, "symmetric: {l2} vs {r}");
+        // Full authority arrives INSIDE the tracking band, not at a command
+        // the loop can never reach: steer sat at ~0.55 for two thirds of the
+        // fourth SF50 taxi drawing only 0.07 of brake, and the aircraft held
+        // a one-sided 9 m offset the whole way (2026-07-29).
+        assert_eq!(r, BRAKE_STEER_MAX, "saturated by {BRAKE_STEER_SAT}: {r}");
+        let (_, mid) = brake_steer_split(0.55, 10.0);
+        assert!(mid > 0.8 * BRAKE_STEER_MAX, "tracking-band command near max: {mid}");
+        assert!(brake_steer_split(1.0, 60.0).1 <= BRAKE_STEER_MAX);
+        // min(left, right) is zero in every case above — the governor can
+        // never read the assist as the pilot slowing the aircraft.
+        for s in [-1.0, -0.5, 0.5, 1.0] {
+            let (a, b) = brake_steer_split(s, 12.0);
+            assert_eq!(a.min(b), 0.0);
+        }
+        // The SF50 declares it; the 172 (linked nosewheel) must not.
+        let sf = Pace::from_profile(
+            crate::aircraft::load("cirrus_vision_sf50")
+                .expect("sf50")
+                .taxi
+                .as_ref(),
+        );
+        assert!(sf.brake_steer);
+        let c172 = Pace::from_profile(
+            crate::aircraft::load("cessna_172sp")
+                .expect("172")
+                .taxi
+                .as_ref(),
+        );
+        assert!(!c172.brake_steer);
+    }
+
+    /// A taxiing aircraft carries people. The lever may not slam.
+    #[test]
+    fn the_steering_lever_is_rate_limited_when_an_airframe_asks() {
+        // No limit declared: unchanged, whatever the demand.
+        assert_eq!(slew_steer(0.0, 1.0, None, 0.2), 1.0);
+        // Limited: 0.8/s over a 0.2 s tick is 0.16 of travel, not the lot.
+        let s = slew_steer(0.0, 1.0, Some(0.8), 0.2);
+        assert!((s - 0.16).abs() < 1e-9, "{s}");
+        // Symmetric, and it converges rather than ringing past the target.
+        assert!((slew_steer(0.0, -1.0, Some(0.8), 0.2) + 0.16).abs() < 1e-9);
+        let near = slew_steer(0.5, 0.52, Some(0.8), 0.2);
+        assert!((near - 0.52).abs() < 1e-9, "small moves pass through: {near}");
+    }
+
+    /// The steering law is per-airframe because the PLANT is. Measured over the
+    /// blackbox at 4-12 kt, yaw per unit steer is 12.8 deg/s on the 172 and
+    /// 6.9 on the SF50 — the castoring nosewheel is the laggier plant, and lag
+    /// wants phase lead, not gain.
+    #[test]
+    fn the_sf50_taxis_more_gently_than_the_airframe_the_law_was_tuned_on() {
+        let sf = Pace::from_profile(
+            crate::aircraft::load("cirrus_vision_sf50")
+                .expect("sf50")
+                .taxi
+                .as_ref(),
+        );
+        let c172 = Pace::from_profile(
+            crate::aircraft::load("cessna_172sp")
+                .expect("172")
+                .taxi
+                .as_ref(),
+        );
+        // The 172 keeps exactly the feel it was tuned with.
+        assert_eq!(c172.steer_full_deg, STEER_FULL_DEG);
+        assert_eq!(c172.steer_lead_s, STEER_RATE_LEAD_S);
+        assert_eq!(c172.steer_slew_per_s, None);
+        // The SF50 moves the lever less, and leads harder.
+        assert!(sf.steer_full_deg > c172.steer_full_deg, "gentler gain");
+        assert!(sf.steer_lead_s > c172.steer_lead_s, "more damping");
+        let slew = sf.steer_slew_per_s.expect("a rate limit");
+        // Generous on purpose: a tight slew is its own limit cycle, and the
+        // aircraft's own p90 lever rate over the whole taxi was 0.18/s.
+        assert!(slew >= 0.5, "a tight slew re-creates the oscillation: {slew}");
+        // Same error, less lever — that is the thing the cabin feels.
+        let err = 18.0;
+        assert!(
+            steer_cmd_with(err, sf.steer_full_deg) < steer_cmd_with(err, c172.steer_full_deg)
+        );
+        // And a longer aim: ~3.5 deg/s of yaw cannot fly the 5 s aim's
+        // crossings — it met the centreline 24 degrees angled and S-weaved
+        // ±10 m (2026-07-29). Same offset, shallower ask.
+        assert!(sf.lookahead_s > c172.lookahead_s);
+        assert_eq!(c172.lookahead_s, 5.0, "the 172 keeps its proven aim");
+        assert!(
+            lookahead_m_with(12.0, sf.lookahead_s) > 1.5 * lookahead_m_with(12.0, 5.0),
+            "the SF50 aims well past the shared default at taxi pace"
+        );
+    }
+
     #[test]
     fn rate_lead_checks_the_swing() {
         // Nose swinging hard through a small error: the lead commands
         // countersteer before the crest — this is the SR22 snake killer.
-        assert!(damped_err_deg(5.0, 40.0) < 0.0);
+        assert!(damped_err_deg(5.0, 40.0, STEER_RATE_LEAD_S) < 0.0);
         // Steady nose: pure P unchanged, the 172 keeps its proven feel.
-        assert_eq!(damped_err_deg(10.0, 0.0), 10.0);
+        assert_eq!(damped_err_deg(10.0, 0.0, STEER_RATE_LEAD_S), 10.0);
         // A gentle commanded bend (~8 deg/s) keeps most of its steer.
-        assert!(damped_err_deg(15.0, 8.0) > 9.0);
+        assert!(damped_err_deg(15.0, 8.0, STEER_RATE_LEAD_S) > 9.0);
     }
 
     #[test]
@@ -1470,7 +1828,7 @@ mod tests {
         let err = r.heading_err_deg(lat, lon, 270.0, progress, lookahead_m(3.0));
         assert!(err.abs() > 150.0, "backwards means a big error, got {err}");
         assert_eq!(
-            steer_cmd(err).abs(),
+            steer_cmd_with(err, STEER_FULL_DEG).abs(),
             1.0,
             "turn-around wants full deflection"
         );

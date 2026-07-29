@@ -530,6 +530,25 @@ pub struct TurbineStartProfile {
     /// Per-engine generator-ON command, fired once that engine reaches idle.
     #[serde(default)]
     pub generators: Vec<String>,
+    /// The airframe's OWN securing control, fired by `stop_engines` after the
+    /// condition levers go to cutoff. Empty = the levers are the whole story,
+    /// which is the case on every free turbine here.
+    ///
+    /// Same shape as [`AircraftProfile::fuel_pump_commands`] and
+    /// [`TransponderModeKnob`]: the universal write is not wrong, it is simply
+    /// not the control the aircraft is secured with. The SF50 is the case that
+    /// found this — its POM's Parking checklist says "ENGINE START / STOP -
+    /// STOP", which is the ignition knob to OFF, and sf50_ignition.lua's
+    /// handler is what actually fires `sim/starters/shut_down_1` *and* drops
+    /// the boost pump and igniter with it. Cutting the mixture alone winds the
+    /// engine down but leaves the knob at RUN with the pump and igniter live,
+    /// which is not a secured aircraft.
+    ///
+    /// Fired AFTER the cutoff, never instead of it: the lever write is the
+    /// backstop if the command is a no-op, and every airframe that declares
+    /// nothing here behaves exactly as it did before this existed.
+    #[serde(default)]
+    pub shutdown_commands: Vec<String>,
     /// N1 (%) at which the engine is lit and stable enough to cut the starter.
     #[serde(default = "default_n1_idle")]
     pub n1_idle: f64,
@@ -770,6 +789,52 @@ pub struct TaxiProfile {
     /// Cap through a sharp corner (>= 100 degrees) and a turn-around join.
     #[serde(default)]
     pub sharp_kts: Option<f64>,
+    /// Heading error (degrees) at which the steering commands FULL deflection.
+    /// Bigger = gentler. `None` keeps the shared default, which was tuned on the
+    /// 172.
+    #[serde(default)]
+    pub steer_full_deg: Option<f64>,
+    /// Seconds of yaw-rate LEAD mixed into the steering error — the damping
+    /// term. `None` keeps the shared default.
+    ///
+    /// This is the knob a CASTORING nosewheel needs, and the reason it is
+    /// per-airframe at all. A linked nosewheel (172, MD-82) is self-damped and
+    /// its taxi yaw rates are small, so the term is nearly inert there; a
+    /// castoring one steers through the rudder and differential braking, which
+    /// is a laggier plant that the same gain drives into a weave. Measured over
+    /// the blackbox at 4-12 kt, yaw response per unit of steer runs 44 deg/s on
+    /// the Twin Otter and 12.8 on the 172, but only 6.9 on the SF50 and 2.3 on
+    /// the SR22 — the two castoring airframes are not weaker loops by accident,
+    /// they are laggier ones, and lag is fixed with phase lead, not gain.
+    #[serde(default)]
+    pub steer_lead_s: Option<f64>,
+    /// Cap on how fast the steering command may travel, per SECOND. `None` = no
+    /// limit, which is every airframe that has never needed one.
+    ///
+    /// Deliberately generous where it is set: a slew limit is phase lag, and a
+    /// TIGHT one causes the very oscillation it looks like it should cure (the
+    /// auto-takeoff roll's 0.25-per-tick limiter swept only 0.5/s and produced a
+    /// textbook slew-induced limit cycle, 2026-07-21). Set it above the rate the
+    /// airframe actually uses so it only ever clips the violent transient.
+    #[serde(default)]
+    pub steer_slew_per_s: Option<f64>,
+    /// Pure-pursuit aim time for the taxi steering, seconds. `None` keeps the
+    /// shared 5 s. A slow-turning plant needs a LONG aim — see the autotaxi
+    /// lookahead law; the SF50 carries 9.
+    #[serde(default)]
+    pub lookahead_s: Option<f64>,
+    /// Steer with DIFFERENTIAL BRAKES as well as the yoke-heading channel.
+    ///
+    /// For airframes where that channel has nothing behind it at taxi speed:
+    /// a castoring nosewheel takes no steering input, and on a JET there is no
+    /// prop wash over the rudder either, so between walking pace and
+    /// rudder-effective speed the aircraft simply does not answer. The SF50 is
+    /// the proving case: thirty seconds of full-scale steer command while the
+    /// cross-track error GREW to 13.8 m and the aircraft taxied down the grass
+    /// beside taxiway Alpha (Luton, 2026-07-28). Real castoring-wheel aircraft
+    /// are steered exactly this way — a touch of inside brake.
+    #[serde(default)]
+    pub brake_steer: bool,
 }
 
 /// A switch whose only control is a TOGGLE command, paired with the dataref

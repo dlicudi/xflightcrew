@@ -1,0 +1,553 @@
+# Aircraft profile - X-Plane 12 stock Cirrus Vision SF50 (acf_ICAO "SF50").
+#
+# A single-engine very light jet: one Williams FJ33 turbofan, retractable gear,
+# pressurized, G1000 (X1000) glass, and the CAPS airframe parachute. The third
+# jet profile and the SIMPLEST of them, because unlike the MD-82 and the
+# Citation X this airframe's xlua is almost entirely cosmetic.
+#
+# That claim is checked, not assumed. `replace_command` appears exactly TWICE
+# across plugins/xlua/scripts, and both are the AI helpers (`auto_board`,
+# `auto_start`); every real system reads and writes STOCK datarefs:
+#   sf50_electrical.lua   only zeroes battery_on[0..1] / generator_on[0..1] at
+#                         the cold-and-dark init, nothing per frame
+#   sf50_lights.lua       stock strobe / landing / navigation switches
+#   sf50_anti_ice.lua     stock ice_pitot_heat_on_pilot and friends
+#   sf50_parkbrake.lua    reads park_brake_valve for an ANIMATION only
+#   sf50_landgear.lua     handle animation only (stock gear_handle_animation)
+#   sf50_fuel_selector.lua stock fuel_tank_selector
+#   sf50_autopilot.lua    stock, plus a wrap on wing_leveler (the LVL button)
+#   sf50_sound.lua        an avionics-boot sound flag, nothing actuated
+# So the universal tools drive this aircraft directly for everything this
+# profile exposes. The ONE exception is the engine start, which is genuinely
+# custom - see `turboprop_start` below.
+#
+# The add-on trap the Twin Otter and the Citation X sprang (the stock actuator
+# being the model's OUTPUT, rewritten every frame from its own switch) DOES
+# exist here, just not on anything wired below. Three cases, recorded so the
+# next person does not have to rediscover them:
+#   * BLEED AIR: sf50_bleed_fresh_air.lua's `before_physics` runs
+#     `pack_center = custom_slider_on[20]` every frame, so writing
+#     `bleedair/actuators/pack_center` is a no-op. The switch is the slider, and
+#     `laminar/SF50/fresh_air_on` is what turns bleed ON despite the name (its
+#     handler writes 1, and X-Plane's own command description reads "Bleed Air
+#     On"; `fresh_air_off` writes 0 = FRESH).
+#   * OXYGEN: worse, because BOTH obvious controls are no-ops.
+#     sf50_oxygen.lua's `after_physics` syncs the button FROM
+#     `demand_flow_setting`, so writing `custom_slider_on[19]` is undone within
+#     a frame - and so is `laminar/SF50/oxygen_master_on`, which only writes
+#     that same slider. The one control that works is the WRAPPED stock command
+#     `sim/operation/slider_20`, whose after-handler sets `demand_flow_setting`
+#     from the button. (X-Plane's slider commands are 1-based against a 0-based
+#     dataref, hence slider_20 driving slider[19].)
+#   * ANTI-ICE: sf50_anti_ice.lua's `after_physics` drives the copilot pitot,
+#     both static heats and both AOA heats FROM `ice_pitot_heat_on_pilot`. That
+#     one is a helpful sync rather than a trap - it means the single stock
+#     switch this profile's `pitot_heat` writes really is the master for the
+#     whole probe-heat system - but writing any of the others is pointless.
+# None of the three is exposed as a tool today; all three are in `locations`.
+#
+# Sources, in this order of authority:
+#   * the aircraft's own xlua scripts (what the sim actually runs)
+#   * CirrusSF50.acf limits, read directly: Vne 250, Vno 250, Vs 75, Vso 67,
+#     Vy 120, Vfe1/Vfem 190, Vle 210, 2 flap detents, m_max 6000, m_empty 3572,
+#     fuel 2000 lb, ONE engine, and gear 0 (the nose) flagged CASTORING
+#   * sf50_zzAI.lua's own auto-start sequence, which is the aircraft telling us
+#     in its own words how it wants to be started (see `turboprop_start`)
+#   * X-Plane_SF50_Pilot_Operating_Manual.pdf (specifications p.5, cockpit tour
+#     p.15-32, Operating-Speeds table p.61), shipped in the aircraft folder
+# Where the POM and the .acf disagree the disagreement is called out inline and
+# the .acf usually wins, because it is what the sim flies.
+#
+# NOT yet flown. Everything marked VERIFY needs one sortie.
+
+id: cirrus_vision_sf50
+display_name: Cirrus Vision SF50
+
+# Capability flags.
+autopilot: true        # stock servos/HDG/ALT/VS/NAV/APR, all on the AP panel
+throttle: true         # ONE thrust lever - jet, so no piston engine group
+# No autothrottle. The AP panel (POM p.31-32) has HDG, NAV, APR, ALT, VS, FLC,
+# VNV, LVL, YD and FD, and nothing that moves the lever. Declaring one would
+# also WITHHOLD `hold_speed`, which is the trap the Citation X sprang on
+# 2026-07-28: "reduce speed" reached a tool that sets a speed bug with nothing
+# behind it. Speed here is the throttle governor's job, or FLC's.
+autothrottle: false
+speedbrake: false      # no speedbrakes or spoilers on this airframe
+reverse_thrust: false  # POM p.28: "There is no reverse thrust system present"
+barometer: true        # G1000 CRS/BARO rotary
+pitot_heat: true       # stock ice_pitot_heat_on_pilot, driven by the stock cmd
+pitch_trim: true       # electric trim (sim/cockpit2/controls/elevator_trim)
+com_radio: true        # G1000 PFD
+com2_radio: true       # G1000 MFD
+nav_radio: true        # NAV1/NAV2 + OBS
+transponder: true      # stock, no add-on knob in front of it
+ils: true              # APR button, localizer + glideslope (POM p.33-35)
+parking_brake: true
+# The valve, not just the ratio. sf50_parkbrake.lua animates the cockpit handle
+# from `park_brake_valve`, so the HANDLE is what the valve drives and the ratio
+# alone moves nothing the pilot can see - release the brakes without this and
+# the lever sits there set while the aircraft rolls, which is what it looked
+# like from the cockpit (2026-07-28).
+#
+# The sense was left unset as the "safe default" and that was the wrong call:
+# on this airframe the valve is the control, so declining to touch it is not
+# neutral. Measured live with the aircraft flying and the brakes off,
+# `park_brake_valve` reads 0 and `parking_brake_ratio` 0.0, so 0 is RELEASED
+# and 1 is set - the SR22's sense, and the opposite of the C90B's. VERIFY the
+# set direction on the ground (it is an int, so there is nothing else it can be,
+# but it has only been observed from the released side).
+park_brake_valve_set: 1.0
+retractable_gear: true
+cabin_crew: false      # a five-seat personal jet is flown single pilot
+
+# Jet: none of the piston systems apply.
+engine: false
+magnetos: false
+carb_heat: false
+directional_gyro: false  # G1000 glass, no vacuum DG
+flood_lights: false      # only panel/instrument brightness rheostats are modeled
+
+# The electric boost pump is NOT the pilot's switch on this airframe: the
+# IGNITION knob owns it. sf50_ignition.lua sets fuel_pump_on[0] = 1 when the
+# knob goes to RUN and 0 when it goes to OFF, and there is no separate pump
+# switch anywhere in the 3D cockpit. Exposing `set_fuel_pump` would write the
+# same dataref behind the knob's back and leave the two disagreeing.
+fuel_pump: false
+
+# NOT the MD-82 jet sequence (`turbine_start`), which is written against
+# laminar/md82 cross-tie levers and a bleed needle this aircraft does not have,
+# and NOT the Citation X's either - the SF50 has no APU at all. It goes through
+# `turboprop_start` below, the generic crank/fuel/idle sequence, configured to
+# get out of the aircraft's own way.
+turbine_start: false
+auto_prep: false       # no APU/bleed/bus procedure: batteries and generators
+
+# Engine start, read out of sf50_ignition.lua rather than from the checklist,
+# because the script is what the sim runs.
+#
+# The aircraft starts itself. There are exactly TWO controls: the ignition knob
+# (OFF/RUN) and the START/STOP button, and after that `update_button_systems()`
+# runs the whole sequence per frame - it fires sim/starters/engage_starter_1,
+# and at N2 > 54 with the starter running it CUTS the starter and turns the
+# igniter off. So this sequence's job is to press two things in order and then
+# watch, not to crank.
+#
+# The gates, in the script's own words:
+#   ignition_up   -> knob_state = 1, fuel_pump_on[0] = 1, igniter_on[0] = 1
+#   eng_start_stop_toggle -> button_state = 1 ONLY IF N2 < 9.0 AND knob_state == 1
+# which is why `ignition_arm` is not an optimisation here: press the button with
+# the knob at OFF and the handler takes the `elseif knob_state == 0` branch and
+# sets button_state to 0. Nothing happens, and nothing explains why.
+#
+# Both are ordinary momentary presses (`phase == 0`), so `starter_held` is
+# false and there is no `start_dn` to release. Pressing the button a second time
+# is harmless: past 9% N2 with the knob at RUN neither branch of the handler
+# matches, so it is a no-op rather than a shutdown. The aircraft's own AI
+# presses it twice for exactly that reason.
+#
+# The rest of the numbers come from sf50_zzAI.lua's auto-start, which is this
+# aircraft's own account of its start. In order, its steps are: strobes ON,
+# THRUST LEVER TO IDLE, engine knob to RUN, press START, then monitor - and the
+# monitor's completion test is `N2 > 50`, with a 20 second budget. It never
+# looks at N1 except as one of three alternative "not a hot start" signs
+# (`ITT < 877 or N1 > 0 or oil pressure > 35`), and it never writes the mixture
+# at any point in the entire sequence.
+#
+# NOT done here: the thrust lever to idle. This sequence has no throttle step,
+# so a start commanded with the lever up is the pilot's (or full auto's) to get
+# right, exactly as on every other profile.
+turboprop_start:
+  # The mixture is not a control on this airframe at all. sf50_ignition.lua's
+  # own comment on mixture_ratio reads "NO MORE: controlled by 'starter engage
+  # condition lever' in planemaker" - X-Plane introduces the fuel itself when
+  # the starter engages - and the AI start confirms it by never touching it.
+  #
+  # But the sequence REQUIRES a condition lever, and writes it to 0 before
+  # cranking (right on a PT6, where fuel in before the crank means no
+  # light-off). So the aim here is to make our writes as close to nothing as
+  # the sequence allows: `fuel_intro_n2: 0.0` is satisfied on the very first
+  # poll, which puts the lever back one 700 ms tick after it went to cutoff. If
+  # a start ever hangs with N2 spooling and no light, this is the first place
+  # to look.
+  condition_lever: sim/cockpit2/engine/actuators/mixture_ratio
+  condition_start: 1.0    # sf50_ignition.lua's engines-running init writes 1
+  condition_run: 1.0
+  fuel_intro_n2: 0.0      # first poll: the cutoff window is one tick wide
+  ignition_arm: [laminar/SF50/ignition_up]        # knob to RUN: fuel pump + igniter
+  start_up: [laminar/SF50/eng_start_stop_toggle]  # the START/STOP button
+  starter_held: false     # a momentary press, not a held starter
+  boost_pumps: false      # ignition_up already did it (see `fuel_pump` above)
+  # Idle N1, and this field is the Citation X trap in a different costume: the
+  # sequence can only watch N1, and NOTHING on this airframe is specified in
+  # N1. The script cuts its own starter at N2 > 54; the AI start completes at
+  # N2 > 50; and the one N1 mention in either is `N1_percent > 0`, i.e. the fan
+  # is barely turning at all when the engine is otherwise happy. The PT6
+  # default of 50 this field would otherwise take is certainly never reached.
+  #
+  # There is one real N1 observation to hand, and it argues for going LOWER
+  # than instinct suggests. The POM's After Takeoff screenshot (p.50) shows the
+  # EIS with the engine running: N1 23.7, N2 66.3, fuel flow 37.6 gph. The POM's
+  # own burn table puts idle at 12 gph against that 37.6, so idle N1 sits well
+  # under 23.7 - a threshold in the twenties could plausibly never be reached at
+  # idle, which is precisely the failure this field is prone to.
+  #
+  # 8 cannot declare a dead engine started on its own: `engine_running` has to
+  # agree in the same breath, and the aircraft cuts its own starter at N2 > 54
+  # regardless of what we think. Calling it lit a little early is harmless here
+  # (the generators go on, `condition_run` rewrites a value already set); waiting
+  # for a number that never arrives is not. VERIFY: blackbox the idle N1 on the
+  # first live start and tighten this to the real figure.
+  n1_idle: 8.0
+  crank_secs: 45.0        # the AI start budgets 20 s; this is deliberate slack
+  generators:
+    - sim/electrical/generator_1_on
+    - sim/electrical/generator_2_on
+  # Shutdown. The POM's Parking checklist says "ENGINE START / STOP - STOP",
+  # which is this knob back to OFF, and the knob is what actually secures the
+  # aircraft: `SF50_ignition_down_CMDhandler` sets knob_state = 0, drops
+  # `fuel_pump_on[0]` and `igniter_on[0]`, and stops the starter, after which
+  # `update_button_systems` sees button_state == 0 and fires
+  # `sim/starters/shut_down_1` itself.
+  #
+  # Cutting the mixture alone does wind the engine down, but leaves the knob at
+  # RUN with the boost pump and igniter still live. The shared `stop_engines`
+  # does the cutoff first and then fires this, so the lever remains the backstop
+  # if the command ever stops working.
+  shutdown_commands: [laminar/SF50/ignition_down]
+
+# Electrical. BATTERY 1, BATTERY 2, GENERATOR 1, GENERATOR 2 are the POM's own
+# labels (the cold-and-dark checklist p.42 and the parking checklist p.60 name
+# all four). The 3D panel carries only the stock *_toggle commands, but nothing
+# replaces the stock on/off pair, so the definite commands are used - a toggle
+# fired as "on" turns a switch that was already on OFF.
+#
+# There is NO avionics master entry because there is no avionics master: no
+# manipulator in the cockpit object, no command, and nothing in the electrical
+# script. The monitor's radio-power check therefore fails open on this airframe,
+# which is the intended behaviour for an aircraft with no such switch.
+#
+# GROUND POWER is modeled (sf50_zzAI.lua works GPU_can_be_called_for,
+# GPU_generator_on and sim/electrical/GPU_on, and its auto-start disconnects the
+# GPU as step 6), and is deliberately NOT listed for the same reason the Lancair
+# leaves it out: "all electrical systems on" fires every entry in this list, and
+# calling a phantom GPU up mid-flight would be wrong. A ground-power tool that
+# knows it belongs on the ground is the follow-up.
+electrical:
+  - key: battery1
+    spoken: battery one
+    on_commands:  [sim/electrical/battery_1_on]
+    off_commands: [sim/electrical/battery_1_off]
+    readback:     ["sim/cockpit2/electrical/battery_on[0]"]
+  - key: battery2
+    spoken: battery two
+    on_commands:  [sim/electrical/battery_2_on]
+    off_commands: [sim/electrical/battery_2_off]
+    readback:     ["sim/cockpit2/electrical/battery_on[1]"]
+  - key: batteries
+    spoken: both batteries
+    on_commands:  [sim/electrical/battery_1_on, sim/electrical/battery_2_on]
+    off_commands: [sim/electrical/battery_1_off, sim/electrical/battery_2_off]
+    readback:     ["sim/cockpit2/electrical/battery_on[0]", "sim/cockpit2/electrical/battery_on[1]"]
+  - key: generator1
+    spoken: generator one
+    on_commands:  [sim/electrical/generator_1_on]
+    off_commands: [sim/electrical/generator_1_off]
+    readback:     ["sim/cockpit2/electrical/generator_on[0]"]
+  - key: generator2
+    spoken: generator two
+    on_commands:  [sim/electrical/generator_2_on]
+    off_commands: [sim/electrical/generator_2_off]
+    readback:     ["sim/cockpit2/electrical/generator_on[1]"]
+  - key: generators
+    spoken: both generators
+    on_commands:  [sim/electrical/generator_1_on, sim/electrical/generator_2_on]
+    off_commands: [sim/electrical/generator_1_off, sim/electrical/generator_2_off]
+    readback:     ["sim/cockpit2/electrical/generator_on[0]", "sim/cockpit2/electrical/generator_on[1]"]
+
+# Exterior lights. THREE, and only three. This was worth proving rather than
+# inferring, because the POM's checklists DO call for a taxi light ("TAXI
+# LIGHTS - ON" before taxi, "OFF" at parking). The cockpit object settles it -
+# its complete list of light manipulators is:
+#     ATTR_manip_command button sim/lights/nav_lights_toggle      Navigation lights
+#     ATTR_manip_command button sim/lights/landing_lights_toggle  Landing lights
+#     ATTR_manip_command button sim/lights/strobe_lights_toggle   Strobe lights
+# and sf50_lights.lua finds exactly those same three switches. There is no taxi
+# light and no beacon on this model. The POM reuses ONE generic cockpit
+# photograph for its nav, landing and taxi rows, and the taxi one points at a
+# switch that is not there. No taxi key is exposed rather than one that writes
+# into the void, and the checklist file drops those two rows with the same note.
+lights:
+  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on, command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
+  - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
+  - { key: landing, spoken: landing lights,    dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+
+# Fuel Control Switch, POM p.29: AUTO (both wing tanks, the normal setting and
+# the one that keeps the aircraft in balance), LEFT, RIGHT. There is no OFF
+# position on this selector. The values are the ones sf50_fuel_selector.lua
+# cycles between - 1 left, 4 both, 3 right - and the knob's own up/down order,
+# so "both" really does sit in the middle.
+fuel_selector:
+  readback: sim/cockpit2/fuel/fuel_tank_selector
+  positions:
+    - { key: left,  spoken: left,  command: sim/fuel/fuel_selector_lft, value: 1 }
+    - { key: both,  spoken: both,  command: sim/fuel/fuel_selector_all, value: 4 }
+    - { key: right, spoken: right, command: sim/fuel/fuel_selector_rgt, value: 3 }
+
+# Fuel-endurance alerting. POM p.5 burn table: 575 lb/hr high cruise (300 kt at
+# FL280), which is 261 kg/hr. Note the POM's own gallon figures are internally
+# inconsistent (575 lb/hr against 69 gal/hr implies 8.34 lb/gal, and Jet A-1 is
+# about 6.75) - the POUNDS are the figure to trust, and they are what this uses.
+fuel:
+  reserve_caution_min: 45.0
+  reserve_warning_min: 30.0
+  cruise_burn_kg_hr: 261.0
+
+# Never-exceed, KIAS. The .acf models 250 and so does the real aircraft's Vmo;
+# the POM's Operating-Speeds table says 320, which is not a figure this airframe
+# has anywhere else (its own Vno row says 300, above the .acf's Vne). The
+# monitor's overspeed callout gets the modeled limit.
+vne_kts: 250.0
+
+# Clean stall, KIAS, and this one is a JUDGEMENT, so here is the working. The
+# .acf models Vs 75 and Vso 67; the POM says Vs1 86 and Vso 67. The monitor
+# scales this by flap ratio (full flap = 0.83x) and cautions at 1.2x the result.
+#   86 -> full-flap 71, caution below 86 kt, which is ABOVE the POM's own
+#         87 kt landing speed: it would speak on every single approach.
+#   75 -> full-flap 62, warning at 68, which is the real 67 kt stall itself:
+#         far too late to be a warning.
+# 80 puts the flap-adjusted stall on the aircraft's actual Vso of 67, so the
+# caution lands at 80 kt and the warning at 74 - clear of an 87 kt approach,
+# with real margin above the stall. VERIFY against a stall in the sim.
+vs_clean_kts: 80.0
+
+# Gear operating limit, KIAS, and this one comes from the COCKPIT PLACARD,
+# which outranks both the table and the .acf. The POM's After Takeoff and
+# Landing photographs (p.50, p.54) show the gear handle close up, and the
+# panel beside it is legible when the page is rendered at 400 dpi and zoomed:
+#
+#     GEAR UP / Vlo ret / 160 KIAS        (above the handle)
+#     G D / Vl / 210                      (on the knob itself)
+#
+# So the retract limit this aircraft is placarded for is 160, and the extended
+# limit is 210 - and the .acf's `_Vle_kts 210` matches the placard exactly,
+# which is the corroboration that makes the reading trustworthy.
+#
+# The Operating-Speeds table on p.61 is simply wrong here: it gives Vlo 170 and
+# Vle 150, an extended limit BELOW the operating limit, which no aircraft is
+# placarded with. The tool refuses to CYCLE the gear above this figure, so the
+# retract limit is the binding one.
+vlo_kts: 160.0
+
+# Flaps. Three positions, and the aircraft names them TWO ways: the flap LEVER
+# has detents at 0, 50% and 100% (POM p.29), while the EIS flap gauge on the MFD
+# is scaled UP / 10 / 35 and the Before Taxi checklist reads "FLAPS - SET (10
+# Degrees)". Both are the same three positions - 50% IS 10 degrees - and the
+# gauge scale is readable in the p.50 screenshot at 400 dpi.
+#
+# Degrees is what the labels carry, because it is what the checklist says, what
+# the gauge shows, and what the other jet profiles use. The .acf's two detents
+# agree on the count, and takeoff is the middle one.
+#
+# Vfe: the .acf models one number, 190 (`_Vfe1_kts` and `_Vfem_kts` both), and
+# the POM's table gives one, 170. 190 is the real aircraft's first-notch limit
+# and 150 its full-flap limit, which is very likely what the POM's stray
+# "Vle 150" row actually is - it is the one number in that table with nowhere
+# else to belong. The descending ladder below is VERIFY on the second notch.
+flaps:
+  takeoff_ratio: 0.5
+  detents:
+    - { label: up,   spoken: up,                ratio: 0.0 }
+    - { label: "10", spoken: ten degrees,       ratio: 0.5, vfe_kts: 190.0 }
+    - { label: "35", spoken: thirty five degrees, ratio: 1.0, vfe_kts: 150.0 }
+
+# Static reference figures recited on request. POM p.5 (specifications) and
+# p.61 (Operating-Speeds), with the .acf consulted where they disagree.
+reference:
+  kind: single-engine jet
+  vr_kts: 90.0             # POM: rotate
+  vx_kts: 91.0             # POM: best angle
+  # NOTE Vy: the POM's best-rate figure is 160 KIAS, which is a CRUISE climb,
+  # not a pattern speed - the same trap the Citation X's 300 kt Vy set. This
+  # field is the speed the takeoff law holds after rotation and the one the
+  # circuit's pattern speed derives from, so it carries the .acf's own 120,
+  # which is a departure figure. The pattern is capped against the approach
+  # speed regardless, but a profile should not need saving by a clamp.
+  vy_kts: 120.0
+  vno_kts: 250.0           # .acf max structural cruise (POM says 300)
+  best_glide_kts: 104.0    # POM: Vbg
+  vs0_kts: 67.0            # POM and .acf agree: stall, landing configuration
+  approach_kts: 87.0       # POM: landing speed, full flap
+  cruise_kts: 300.0        # POM: long-range cruise, KTAS
+  # Indicated speed the cruise governor holds. 300 KTAS at FL280 is about
+  # 195 KIAS; 190 leaves margin and is well under Vmo at any level. VERIFY.
+  cruise_ias_kts: 190.0
+  best_climb_fpm: 2000.0   # VERIFY - the POM gives climb TIME (25 min to cruise), not a rate
+  max_gross_lb: 6000.0     # POM and .acf agree
+  empty_weight_lb: 3636.0  # POM operating empty (the .acf models 3,572)
+  useful_load_lb: 2300.0   # POM: useful payload
+  service_ceiling_ft: 28000.0
+  # 2,000 lb of Jet A-1 (see the burn note above). Corroborated by the EIS fuel
+  # gauge in the POM's p.50 screenshot, whose per-side scale runs 0/30/60/90/120
+  # to a full mark beyond it - a total near 296, not the 240 the POM's own
+  # inconsistent gal/hr figures would imply.
+  fuel_capacity_gal: 296.0
+  endurance_hours: 3.5     # 2,000 lb at the 575 lb/hr high-cruise burn
+  max_crosswind_kts: 16.0  # POM: maximum demonstrated
+  # The POM's "Minimum Takeoff Distance" is used for BOTH figures deliberately.
+  # It is almost certainly a distance rather than a ground roll, so reading it
+  # as the roll is conservative in the only direction that matters: the
+  # automation multiplies this by 1.4 before deciding a runway is long enough,
+  # and 2,036 ft x 1.4 is 869 m, which no field this aircraft flies from is
+  # short of. Getting this backwards is what stopped an MD-82 departing Luton.
+  takeoff_distance_ft: 2036.0
+  takeoff_roll_ft: 2036.0
+  landing_distance_ft: 1721.0
+
+# Taxi pacing. A 6,000 lb jet at idle thrust rolls, so this is nearer a brake
+# setting than a throttle setting - but it is a fifth of an MD-82, so it sits
+# between the GA 10/6/4 and the Citation X's 15/10/6. VERIFY on the first taxi.
+#
+# STEERING, though, is the open question on this airframe and not a tuning one:
+# the .acf flags gear 0 (the nose, x = 0) as CASTORING. Like the SR22, the
+# nosewheel free-castors and steering is differential braking plus rudder, so
+# `yoke_heading_ratio` - which is the plugin's whole taxi_steer channel - may
+# do very little at low speed. Auto taxi, the line-up and the auto-takeoff roll
+# are all UNTESTED here for that reason. Differential-brake steering remains
+# future work (it is the same gap the SR22 profile carries).
+taxi:
+  kts: 12.0
+  turn_kts: 8.0
+  sharp_kts: 5.0
+  # Steering feel, from the first live taxi (Luton, 2026-07-28), which weaved
+  # about +/-4.8 m either side of the centreline on a 14 second cycle with the
+  # lever swinging +/-0.65 — enough movement to be felt in the cabin.
+  #
+  # The cause is the plant, not the gains being too hot. Measured over the
+  # blackbox at 4-12 kt, yaw response per unit of steer is 12.8 deg/s on the
+  # 172 this law was tuned on and only 6.9 on the SF50, so its LOOP gain was
+  # already the gentler of the two — and it was the one oscillating. What the
+  # two airframes really differ in is phase: the 172's nosewheel is linked and
+  # self-damping, the SF50's CASTORS (its .acf flags gear 0 castoring, travel
+  # tapering 40 deg at low speed to 10 at high), so it steers through the rudder
+  # and differential braking, which lags. Lag is cured with phase lead, not with
+  # gain — the SR22, the other castoring airframe here, has the same signature.
+  #
+  # So: a bit over twice the yaw-rate lead, a 40 percent gain cut to shrink the
+  # movement itself, and a rate limit on the lever. The limit is deliberately
+  # far above the 0.18/s this aircraft actually used (p90 over the whole taxi)
+  # so it only ever clips the violent transient — a TIGHT slew is its own
+  # oscillation. FIRST PASS, needs a re-fly: if it now wanders wide instead of
+  # weaving, the gain went too far and steer_full_deg is the one to walk back.
+  steer_full_deg: 42.0
+  steer_slew_per_s: 0.8
+  # ...and the second sortie the same evening proved gains alone cannot fix a
+  # plant that is not listening: steer held at -0.6 for thirty seconds while
+  # the cross-track error GREW to 13.8 m and the aircraft taxied down the
+  # grass parallel to Luton's Alpha. The yoke-heading channel is nosewheel +
+  # rudder; this nosewheel CASTORS and a turbofan puts no wash over the
+  # rudder, so between walking pace and rudder-effective speed nothing
+  # answers. Differential brakes are how the real aircraft steers, and now how
+  # this one does.
+  brake_steer: true
+  # Third sortie (2026-07-29): loop healthy, weave back anyway — a slow S,
+  # +/-10 m on a ~30 s period, crossing the centreline 24 degrees ANGLED.
+  # Even brake-assisted this plant yaws ~3.5 deg/s flat out, so the shared
+  # 5 s aim asks for turns it cannot fly and every crossing overshoots. A 9 s
+  # aim asks the same offset as a shallow crossing it CAN fly; the lead comes
+  # up with it so the crossing swing is checked earlier.
+  lookahead_s: 9.0
+  steer_lead_s: 2.0
+  # Fourth taxi (2026-07-29, the 9 s aim in): no weave left - the error
+  # changed sign four times in eleven minutes - but a one-sided 9 m mean
+  # offset (15 max) with steer pinned above 0.5 for two thirds of the taxi
+  # and only 0.69 deg/s of yaw to show for it. That convicted the assist's
+  # MAPPING, not this profile: the brake reached its 0.16 max only at a
+  # command of 1.0, which tracking can never issue (the error would have to
+  # exceed steer_full_deg), so the mid-band ran on ~0.07 of brake. Fixed in
+  # brake_steer_split (BRAKE_STEER_SAT 0.6, shared with any future castoring
+  # airframe); these numbers stay put for the re-fly.
+
+# Phase-expectation advisor. All stock datarefs on this airframe.
+#
+# The two light rows are ACTIONED, not merely advised, the same way the 172's
+# are - and the strobe row has the aircraft's own backing: step 1 of its
+# auto-start, before it touches anything else, is "set the strobe lights switch
+# to ON". No taxi-light row, because this model has no taxi light.
+#
+# Pitot heat is the one switch that matters most here: the anti-ice script
+# drives the copilot pitot, both statics and both AOA probes off it, so this
+# single row covers the whole probe-heat system.
+advisor:
+  - dataref: sim/cockpit2/ice/ice_pitot_heat_on_pilot
+    phases: [takeoff, climb, cruise, approach, landing]
+    say: Pitot heat's off.
+  - dataref: sim/cockpit2/switches/yaw_damper_on
+    phases: [climb, cruise]
+    say: Yaw damper's still off.
+  - dataref: sim/cockpit2/switches/strobe_lights_on
+    phases: [takeoff, climb, cruise, approach, landing]
+    say: Strobes on.
+    command: sim/lights/strobe_lights_on
+  - dataref: sim/cockpit2/switches/landing_lights_on
+    phases: [takeoff, approach, landing]
+    say: Landing lights on.
+    command: sim/lights/landing_lights_on
+
+# The XChecklist file, transcribed by hand from the POM's Checklists section
+# (p.40-60). Those pages are IMAGES, so there is no text to extract and no
+# third-party ELATES file shipped with this aircraft - every line was read off
+# the rendered pages. The two "TAXI LIGHTS" rows are deliberately dropped (see
+# the lights note above); everything else is the POM's own wording and order.
+checklist: checklists/cirrus_vision_sf50.txt
+checklist_map:
+  # Batteries and generators are called in PAIRS by the checklist ("BATTERY 1 -
+  # ON" immediately above "BATTERY 2 - ON"), and the interpreter strips the
+  # array index before matching, so one dataref cannot select one side anyway.
+  # Mapping both to the paired key is therefore the honest reading of the item
+  # AND the only one the machinery can express.
+  - { match: electrical/battery_on,   action: !electrical batteries }
+  - { match: electrical/generator_on, action: !electrical generators }
+  - { match: parking_brake_ratio,     action: parking_brake }
+  - { match: transponder_mode,        action: transponder }
+  - { match: fuel_tank_selector,      action: fuel_selector }
+  - { match: flap_ratio,              action: flaps }
+  - { match: throttle_ratio,          action: throttle }
+  - { match: pitot_heat_on,           action: pitot_heat }
+  - { match: landing_lights,          action: !light landing }
+  - { match: strobe_lights,           action: !light strobe }
+  - { match: navigation_lights,       action: !light nav }
+
+# Cockpit geography, from the POM's Tour of the Cockpit (p.15 overhead, p.28-29
+# center pedestal, p.30-32 autopilot panel), its checklist photographs (p.42-60)
+# and the aircraft's own view names. No live panel session yet, so nothing here
+# claims a side of the panel the POM does not show.
+locations:
+  caps: "the CAPS deployment lever on the overhead panel. It fires the airframe parachute, and it is a last resort"
+  parachute: "the CAPS deployment lever on the overhead panel. It fires the airframe parachute, and it is a last resort"
+  fire extinguisher: "the engine fire suppression switch on the overhead panel. It puts the fire out and the engine with it"
+  cabin dump: "the cabin pressure dump button on the overhead panel. It depressurizes instantly if the outflow valve has failed"
+  pressurization: "automatic in the cruise, off the bleed air. The dump button on the overhead is the manual way out"
+  oxygen: "the oxygen master button. The aircraft wants it on before you go, and it opens the crew demand valve"
+  bleed air: "the bleed air button. BLEED feeds the pack and pressurizes the cabin, FRESH is ram air. The start sequence leaves it on BLEED"
+  thrust lever: "the single thrust lever on the center pedestal. One engine, one lever, and no reverse on this aircraft"
+  throttle: "the single thrust lever on the center pedestal"
+  flap lever: "on the center pedestal beside the thrust lever. Three positions: up, fifty percent, and one hundred"
+  flaps: "the flap lever on the center pedestal. Up, fifty percent, or one hundred"
+  fuel selector: "the fuel control switch on the center pedestal. AUTO feeds from both wings and keeps her in balance; LEFT and RIGHT are for a supply problem on the other side"
+  fuel control switch: "on the center pedestal. AUTO feeds both wings, LEFT and RIGHT isolate a tank"
+  ignition: "the ignition knob on the center console, just forward of the thrust lever: OFF and RUN. RUN brings the boost pump and the igniter up, and the start button does nothing until it is there"
+  engine start: "the red START and STOP button on the center console, outboard of the thrust lever. Ignition to RUN first, then press it once and the aircraft runs the rest of the start itself"
+  shut down: "the same red START and STOP button on the center console, pressed with the ignition knob back at OFF"
+  battery: "BATTERY 1 and BATTERY 2 on the systems panel"
+  generator: "GENERATOR 1 and GENERATOR 2 on the systems panel"
+  autopilot panel: "the autopilot control panel beside the systems panel: HDG, NAV, APR, ALT, VS, FLC, VNV, LVL, YD and FD, with the heading, vertical speed and altitude select rotaries"
+  flight director: "the FD button on the autopilot control panel"
+  yaw damper: "the YD button on the autopilot control panel"
+  level button: "the LVL button on the autopilot control panel. It levels the wings and the pitch instantly, but the speed is still yours"
+  gear handle: "the landing gear lever on the panel. The systems display shows the gear state as well"
+  parking brake: "the parking brake handle. The systems display carries its state too"
+  pitot heat: "the pitot heat switch. One switch does the lot on this aircraft: both pitots, both statics and both AOA probes follow it"
+  ground power: "ground power is available at the stand, and the aircraft wants it disconnected before you taxi"
+  avionics: "there is no avionics master on this aircraft. The displays come up with the batteries"
+  taxi light: "no separate taxi light on this model. The landing lights are the only forward lights"
+  beacon: "this model has no beacon. Use the strobes"

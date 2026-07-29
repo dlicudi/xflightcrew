@@ -844,12 +844,25 @@ impl Tool for StopTurbines {
                 .set_float_array_elem(&self.start.condition_lever, i, 0.0)
                 .await?; // fuel cutoff
         }
+        // ...then the airframe's own securing control, where it has one. On the
+        // SF50 the ignition knob is what fires the sim's shutdown AND drops the
+        // boost pump and igniter; cutting the mixture alone leaves the knob at
+        // RUN with both still live, which is not a secured aircraft. Best
+        // effort: the cutoff above has already stopped the fuel, so a command
+        // that fails must not turn a successful shutdown into an error.
+        let secured = !self.start.shutdown_commands.is_empty();
+        for cmd in &self.start.shutdown_commands {
+            let _ = ctx.xplane.run_command(cmd).await;
+        }
+        let done = if secured {
+            "Roger — fuel cutoff and the ignition off. Engines shut down and secured."
+        } else {
+            "Roger — condition levers to fuel cutoff. Engines shut down."
+        };
         for _ in 0..6 {
             tokio::time::sleep(Duration::from_millis(600)).await;
             if !engine_running(ctx, 0).await {
-                return Ok(
-                    "Roger — condition levers to fuel cutoff. Engines shut down.".to_string(),
-                );
+                return Ok(done.to_string());
             }
         }
         Ok("Condition levers to cutoff, engines winding down.".to_string())
