@@ -1160,8 +1160,30 @@ pub fn guidance(
         // the cut ±35° at 100 ft over the numbers (2026-07-24). Short final
         // uses small course-referenced corrections only — offsets there are
         // either small or the balk gate's problem.
+        // FIXED-lead pursuit, not half-the-remaining-distance. With the aim at
+        // d/2 the cut angle decays only LINEARLY with distance (offset falls
+        // as d², cut ~ offset/d ~ d), so the aircraft rode the WHOLE final at
+        // an angle and only rolled out at the flare — measured at EGSS 22:
+        // final began 5.4 nm out with a 28° cut, still 20° at 3 nm, 9° at
+        // 1.9, 5° inside a mile, aligned at 0.13 nm, i.e. over the numbers
+        // ("never in line with the runway, always at an angle", 2026-07-28).
+        // A fixed lead makes the convergence exponential in TIME instead:
+        // hard correction early, established miles out, then a tracked,
+        // wings-level final — which is what "stabilised approach" means.
+        // ~30 s of travel, floored so a slow single still aims somewhere and
+        // capped so the far-out cut stays flyable.
         let cut = if dist_nm > 0.30 {
-            let aim_nm = (dist_nm * 0.5).clamp(0.15, 2.0);
+            let lead_nm = (gs_kts / 120.0).clamp(0.6, 1.5);
+            let along = along_track_nm(cur_lat, cur_lon, rwy);
+            // The aim must sit AHEAD of the aircraft along the approach: an
+            // aim past our own along-track position flips the bearing and the
+            // cut with it (the ±35° S over the numbers, 2026-07-24). Abeam
+            // close-in (tiny `along`, big offset) halve what's left instead —
+            // the balk gate owns that geometry anyway.
+            let mut aim_nm = (along - lead_nm).max(0.15);
+            if aim_nm >= along {
+                aim_nm = (along * 0.5).max(0.02);
+            }
             let (alat, alon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, aim_nm);
             let brg = bearing_deg(cur_lat, cur_lon, alat, alon);
             ((brg - rwy.course_deg + 540.0).rem_euclid(360.0) - 180.0).clamp(-35.0, 35.0)
@@ -2102,6 +2124,47 @@ mod tests {
         assert_eq!(g.phase, ApproachPhase::Flare);
     }
 
+    /// The user-visible property the whole final law exists for: from a real
+    /// offset at the top of final, the aircraft must be ESTABLISHED — cut
+    /// under 3° — well before short final, not rolling out in the flare.
+    /// March the kinematics through the guidance and check where alignment
+    /// actually arrives.
+    #[test]
+    fn the_final_is_established_miles_before_the_threshold() {
+        let rwy = rwy_north();
+        let gs_kts = 120.0;
+        // Top of final: 5 nm out, 0.4 nm right of the centreline.
+        let mut d_nm = 5.0f64;
+        let mut off_nm = 0.4f64;
+        let mut established_at = None;
+        for _ in 0..600 {
+            if d_nm < 0.4 {
+                break;
+            }
+            let (lat, lon) = project_latlon(0.0, 0.0, 180.0, d_nm);
+            let lon_off = lon + off_nm / 60.0;
+            let on_path = (d_nm + TOUCHDOWN_AIM_NM) * GLIDEPATH_FT_PER_NM;
+            let g = guidance(
+                lat, lon_off, on_path, on_path, gs_kts, 100.0, &rwy, 90.0, 25.0, 0.0,
+            );
+            let cut = ((g.target_heading_deg + 540.0).rem_euclid(360.0)) - 180.0;
+            if established_at.is_none() && cut.abs() < 3.0 && off_nm.abs() < 0.05 {
+                established_at = Some(d_nm);
+            }
+            // Fly one second along the commanded heading (no wind, perfect AP).
+            let dt_h = 1.0 / 3600.0;
+            let trk = g.target_heading_deg.to_radians();
+            off_nm += gs_kts * dt_h * trk.sin();
+            d_nm -= gs_kts * dt_h * trk.cos().abs();
+        }
+        let est = established_at.expect("the approach must become established");
+        assert!(
+            est > 2.0,
+            "established by {est:.2} nm — short final is too late (the EGSS \
+             approach aligned at 0.13 nm and it felt exactly as unsafe as it was)"
+        );
+    }
+
     #[test]
     fn final_pursuit_cut_scales_with_distance_remaining() {
         // 0.2 nm RIGHT of the centreline. The cut toward the line must be
@@ -2128,11 +2191,19 @@ mod tests {
         };
         let far = at(3.0);
         let close = at(0.8);
-        // Offset RIGHT of a north course → cut LEFT (negative).
-        assert!(cut(&far) < -2.0, "far cut leftward: {:.1}", cut(&far));
+        // Offset RIGHT of a north course → cut LEFT (negative), and a REAL
+        // intercept at BOTH distances. The fixed-lead pursuit replaced the
+        // half-remaining aim precisely because the far-out cut was too shy:
+        // with the aim at d/2 the offset decayed as d² and the aircraft rode
+        // the whole final at an angle, aligning at 0.13 nm — over the numbers
+        // (EGSS 22, 2026-07-28). Same offset now earns roughly the same cut
+        // at any distance, which is what makes the convergence exponential
+        // in time and the last miles wings-level.
+        assert!(cut(&far) < -12.0, "far cut is a real intercept: {:.1}", cut(&far));
+        assert!(cut(&close) < -12.0, "close cut too: {:.1}", cut(&close));
         assert!(
-            cut(&close) < cut(&far) - 8.0,
-            "close-in cut much harder: far {:.1} vs close {:.1}",
+            cut(&close) <= cut(&far) + 1.0,
+            "never softer close-in: far {:.1} vs close {:.1}",
             cut(&far),
             cut(&close)
         );
