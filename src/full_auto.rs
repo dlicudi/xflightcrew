@@ -41,15 +41,53 @@ const PA_PER_INHG: f64 = 3386.389;
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Set to cancel ("cancel" / "my controls").
 pub static ABORT: AtomicBool = AtomicBool::new(false);
+/// The most recent stage `event()` recorded ("request taxi", "lined up"),
+/// underscores spaced for reading. The panel's Flight tab shows it beside the
+/// FULL AUTO headline; empty between runs.
+static STAGE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// The mission label ("circuit" / "flight"), set at start so the status names
+/// WHICH full auto is running — the pilot pressed CIRCUIT, so the headline
+/// must say circuit, not just the orchestrator's name. Empty between runs.
+static MISSION: std::sync::Mutex<&'static str> = std::sync::Mutex::new("");
 
-/// One-line status for the dashboard.
+/// The human-readable current stage, empty when idle or not yet staged.
+pub fn stage() -> String {
+    STAGE.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+fn clear_stage() {
+    if let Ok(mut s) = STAGE.lock() {
+        s.clear();
+    }
+    if let Ok(mut m) = MISSION.lock() {
+        *m = "";
+    }
+}
+
+/// One-line status for the dashboard, mission and stage folded in once known:
+/// "full auto circuit: request taxi" (the panel renders it as
+/// "FULL AUTO CIRCUIT [request taxi]").
 pub fn status() -> Option<String> {
-    ACTIVE.load(SeqCst).then(|| "full auto".to_string())
+    ACTIVE.load(SeqCst).then(|| {
+        let mission = MISSION.lock().map(|m| *m).unwrap_or("");
+        let name = if mission.is_empty() {
+            "full auto".to_string()
+        } else {
+            format!("full auto {mission}")
+        };
+        let stage = stage();
+        if stage.is_empty() {
+            name
+        } else {
+            format!("{name}: {stage}")
+        }
+    })
 }
 
 /// Cancel the sequence and stand down every sub-loop it may have armed.
 pub fn abort() -> bool {
     ABORT.store(true, SeqCst);
+    clear_stage();
     crate::autotaxi::ACTIVE.store(false, SeqCst);
     crate::autotakeoff::ACTIVE.store(false, SeqCst);
     crate::circuit::abort();
@@ -130,6 +168,12 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
         return;
     }
     ABORT.store(false, SeqCst);
+    if let Ok(mut m) = MISSION.lock() {
+        *m = match tools.mission {
+            Mission::Circuit { .. } => "circuit",
+            Mission::Flight(_) => "flight",
+        };
+    }
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -140,6 +184,7 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
         };
         rt.block_on(fly(XPlaneClient::new(base_url), config, voice, tools));
         ACTIVE.store(false, SeqCst);
+        clear_stage();
     });
 }
 
@@ -151,6 +196,9 @@ fn announce(voice: &Option<Voice>, priority: Priority, line: &str) {
 }
 
 fn event(stage: &str, detail: serde_json::Value) {
+    if let Ok(mut s) = STAGE.lock() {
+        *s = stage.replace('_', " ");
+    }
     crate::blackbox::record("full_auto", json!({ "stage": stage, "detail": detail }));
 }
 
@@ -158,6 +206,7 @@ fn event(stage: &str, detail: serde_json::Value) {
 fn give_up(voice: &Option<Voice>, line: &str, reason: &str) {
     ACTIVE.store(false, SeqCst);
     event("give_up", json!({ "reason": reason }));
+    clear_stage();
     announce(voice, Priority::Caution, line);
 }
 

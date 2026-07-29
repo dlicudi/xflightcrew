@@ -3176,4 +3176,67 @@ mod tests {
         // substring bug) — it asks which setting instead of guessing 1600.
         assert_eq!(g("prop flow").unwrap(), ("set_prop".into(), json!({})));
     }
+
+    /// The plugin panel's buttons inject English through the request channel
+    /// ([`crate::auto_status::REQUEST_PHRASES`] + the CANCEL button's
+    /// context phrases) — every one must parse HERE, deterministically, or a
+    /// button press would fall through to the LLM (or to nothing). Pins the
+    /// whole panel button surface to the grammar.
+    #[test]
+    fn panel_request_phrases_parse_deterministically() {
+        let expect: &[(i64, &str)] = &[
+            (1, "recover"),
+            (2, "autoland"),
+            (3, "autopilot_off"),
+            (4, "full_auto"),
+            (5, "full_auto"),
+            (6, "pushback"),
+            (7, "auto_taxi"),
+            (8, "line_up"),
+            (9, "auto_takeoff"),
+            (10, "full_auto"),
+        ];
+        assert_eq!(expect.len(), crate::auto_status::REQUEST_PHRASES.len());
+        for (code, phrase) in crate::auto_status::REQUEST_PHRASES {
+            let tool = expect
+                .iter()
+                .find(|(c, _)| c == code)
+                .map(|(_, t)| *t)
+                .unwrap_or_else(|| panic!("no expectation for request code {code}"));
+            assert_eq!(
+                one(phrase).map(|(t, _)| t).as_deref(),
+                Some(tool),
+                "request code {code}: {phrase:?}"
+            );
+        }
+        // The CANCEL button (code 11): every phrase cancel_phrase() can pick.
+        assert_eq!(
+            one("cancel full auto").unwrap(),
+            ("full_auto".into(), json!({"off": true}))
+        );
+        assert_eq!(
+            one("cancel autoland").unwrap(),
+            ("autoland".into(), json!({"cancel": true}))
+        );
+        assert_eq!(
+            one("abort takeoff").unwrap(),
+            ("auto_takeoff".into(), json!({"off": true}))
+        );
+        assert_eq!(
+            one("cancel the circuit").unwrap(),
+            ("full_auto".into(), json!({"off": true}))
+        );
+        assert_eq!(
+            one("cancel the approach").unwrap(),
+            ("fly_procedure".into(), json!({"off": true}))
+        );
+        assert_eq!(
+            one("stop pushback").unwrap(),
+            ("pushback".into(), json!({"action": "stop"}))
+        );
+        assert_eq!(
+            one("cancel auto taxi").unwrap(),
+            ("auto_taxi".into(), json!({"off": true}))
+        );
+    }
 }

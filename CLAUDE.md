@@ -861,6 +861,37 @@ mirrors spoken lines to the panel transcript itself — any watch that ALSO
 posts `s.action(same line)` double-writes the chat (the Jerez relocation
 note; gyro-sync and autoland hit it first). Mirror OR action, never both.
 
+**The panel is an automation instrument now** (2026-07-29 revamp). Tabs are
+Flight | Log | ATC | Route | Settings — Flight first and default: the live
+strip, an automation status well fed by `xcopilot/status/auto` (composed by
+[src/auto_status.rs](src/auto_status.rs): marker byte '1' = cancellable, then
+one line per active manager, primary as "NAME|stage"; `full_auto::event()`
+stores its stage string, and the mission is folded into the name so the
+button pressed matches the headline: "FULL AUTO CIRCUIT [request taxi]" /
+"FULL AUTO FLIGHT [...]"),
+published change-gated from the monitor tick — NOT the 1 Hz radio thread,
+which only exists when ATC is configured — with an unconditional resend every
+5 ticks because a plugin reload zeroes the buffers and a change-gate would
+leave the tab blank. Below the well, BUTTONS for every automation
+(FULL AUTO / FLY PLAN / PUSH BACK / TAXI / LINE UP / TAKEOFF / CIRCUIT /
+LAND + guarded RECOVER / MY CONTROLS): each injects the same English a pilot
+would speak through the request channel (`auto_status::REQUEST_PHRASES`,
+codes 4-10; a grammar test pins every phrase to its tool so a button can
+never reach the LLM), and CANCEL (code 11) has no fixed phrase — the app
+picks per what's running ("cancel full auto" outranks all, its abort
+cascades). The old Calls tab folded into ATC (coach block on top, radio
+chips, stations, phraseology reference in CollapsingHeaders; the
+readback-owed dot moved to the ATC tab); the shared header rows are gone —
+each tab owns its space, and the status bar gained an AUTO annunciator lit
+from any tab. Type is B612 (the Airbus cockpit face, OFL — TTFs +
+license in plugin/third_party/b612, embedded via xxd headers), baked at
+THREE sizes because the ImGui atlas binds at the first ImgWindow ctor and
+can never rebake: UI scale (Settings radios, `xcopilot/opt/ui_scale`,
+publish/pick protocol, persisted via prefs.json) is a font SWAP plus
+`ScaleAllSizes` from a stored base style, never an atlas touch. The B612
+glyph ranges include en/em dash and bullet; the app-side dash scrub stays
+for old plugins.
+
 **Web API load is a sim cost, and it is measured** (2026-07-28). The API is
 served from inside X-Plane's flight loop, so every request is frame time the
 sim does not get. Two hangs that day could not be attributed either way,

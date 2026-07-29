@@ -1604,6 +1604,12 @@ pub async fn run(
     let mut prev_pushing = false;
     // Last strip pushed to the panel — only re-send on change.
     let mut last_strip = String::new();
+    // Last automation feed pushed, plus a tick countdown that forces a
+    // periodic resend: a plugin reload zeroes its buffers, and a purely
+    // change-gated publish would leave the Flight tab blank until the next
+    // real change (the aircraft-chip heartbeat is the same lesson).
+    let mut last_auto = String::new();
+    let mut auto_resend = 0u8;
 
     // Talk-down pacing: when the last callout went out, and whether we've
     // already handed over at the threshold (say it once, then shut up).
@@ -2672,6 +2678,17 @@ pub async fn run(
                 if strip != last_strip {
                     s.strip(&strip);
                     last_strip = strip;
+                }
+                // The Flight tab's automation feed, published here rather than
+                // the 1 Hz radio poller because that thread only exists when
+                // ATC is configured — auto status must flow with ATC off.
+                let auto = crate::auto_status::compose();
+                if auto != last_auto || auto_resend == 0 {
+                    s.auto_status(&auto);
+                    last_auto = auto;
+                    auto_resend = 5;
+                } else {
+                    auto_resend -= 1;
                 }
             }
 

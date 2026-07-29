@@ -26,6 +26,11 @@ struct Prefs {
     /// pick, honored at the next boot unless `XCOPILOT_CABIN_CREW` overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cabin_crew: Option<String>,
+    /// The panel's UI scale index (0 = 100%, 1 = 125%, 2 = 150%). Purely a
+    /// panel concern — the app only remembers it and republishes across
+    /// plugin reloads and boots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ui_scale: Option<i64>,
 }
 
 fn load() -> Prefs {
@@ -73,6 +78,18 @@ pub fn cabin_crew() -> Option<String> {
 pub fn save_cabin_crew(staffing: &str) {
     let mut prefs = load();
     prefs.cabin_crew = Some(staffing.to_string());
+    store(prefs);
+}
+
+/// The saved panel UI scale index (0/1/2), if any.
+pub fn ui_scale() -> Option<i64> {
+    load().ui_scale.filter(|v| (0..=2).contains(v))
+}
+
+/// Persist a new panel UI scale pick. Best-effort, like the others.
+pub fn save_ui_scale(v: i64) {
+    let mut prefs = load();
+    prefs.ui_scale = Some(v);
     store(prefs);
 }
 

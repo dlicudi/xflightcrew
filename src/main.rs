@@ -10,6 +10,7 @@
 mod aircraft;
 mod approach_guide;
 mod audio;
+mod auto_status;
 mod autoland;
 mod autotakeoff;
 mod autotaxi;
@@ -679,8 +680,11 @@ async fn main() -> Result<()> {
 }
 
 /// Poll the plugin panel's request dataref (`xcopilot/request`) and turn button
-/// presses into commands on the typed-command channel: 1 = "take control",
-/// 2 = "land the aircraft", 3 = "my controls". The value is consumed (written
+/// presses into commands on the typed-command channel — the phrases live in
+/// [`auto_status::REQUEST_PHRASES`], the same English a pilot would speak, so
+/// a button can never do anything the voice can't. CANCEL (code 11) has no
+/// fixed phrase: the cancel is per-automation in the grammar, so the phrase is
+/// picked from whatever is actually running. The value is consumed (written
 /// back to 0) once injected, so a press fires exactly once. Best-effort like the
 /// status sink: no plugin / no X-Plane just means the buttons do nothing.
 fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::Sender<String>) {
@@ -716,18 +720,26 @@ fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::Sender<Stri
                 id = None; // stale id (sim restarted) — re-resolve
                 continue;
             };
-            let cmd = match v {
-                1 => "take control",
-                2 => "land the aircraft",
-                3 => "my controls",
-                _ => continue,
+            let cmd = if v == auto_status::REQUEST_CANCEL {
+                auto_status::cancel_phrase()
+            } else {
+                auto_status::REQUEST_PHRASES
+                    .iter()
+                    .find(|(code, _)| *code == v)
+                    .map(|(_, phrase)| *phrase)
             };
-            tracing::info!(request = v, cmd, "panel button request");
-            // Consume first so a slow channel can't double-fire the request.
-            let _ = http
-                .patch(&url)
-                .json(&serde_json::json!({ "data": 0 }))
-                .send();
+            if v != 0 {
+                tracing::info!(request = v, cmd, "panel button request");
+                // Consume first so a slow channel can't double-fire the
+                // request — and even a code with nothing to say (CANCEL with
+                // nothing running, an unknown code from a newer plugin) is
+                // consumed, or it would re-log every 300 ms forever.
+                let _ = http
+                    .patch(&url)
+                    .json(&serde_json::json!({ "data": 0 }))
+                    .send();
+            }
+            let Some(cmd) = cmd else { continue };
             if tx.send(cmd.to_string()).is_err() {
                 return; // session gone
             }
@@ -745,6 +757,12 @@ const DR_OPT_MODE: &str = "xcopilot/opt/mode";
 /// The panel's cabin-crew radio buttons (Auto / Aboard / Off) — values are
 /// `cabin::Staffing::panel_index`, `-1` = plugin default (unpublished).
 const DR_OPT_CABIN: &str = "xcopilot/opt/cabin_crew";
+/// The panel's UI-scale radio buttons (100% / 125% / 150%, index 0/1/2) —
+/// purely a panel concern; the app remembers the pick and republishes it
+/// across plugin reloads and boots. `-1` = plugin default (unpublished).
+const DR_OPT_UI_SCALE: &str = "xcopilot/opt/ui_scale";
+/// The UI scale the app currently holds for the publish/pick protocol.
+static UI_SCALE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// Publish the pilot-voice roster (every piper model on disk) to the plugin's
 /// Settings picker, then poll for picks. A pick swaps the copilot's voice live
@@ -897,7 +915,25 @@ fn spawn_settings_poller(base_url: String) {
                 }
             },
         },
+        PanelSetting {
+            dref: DR_OPT_UI_SCALE,
+            id: None,
+            current: || UI_SCALE.load(std::sync::atomic::Ordering::Relaxed),
+            apply: |v| {
+                if (0..=2).contains(&v) {
+                    tracing::info!(ui_scale = v, "panel UI scale pick");
+                    UI_SCALE.store(v, std::sync::atomic::Ordering::Relaxed);
+                    prefs::save_ui_scale(v);
+                }
+            },
+        },
     ];
+    // The scale is pure remembered state — seed it from prefs so the first
+    // publish shows the saved pick, not a hardcoded default.
+    UI_SCALE.store(
+        prefs::ui_scale().unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     std::thread::spawn(move || {
         let Ok(http) = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
@@ -5895,57 +5931,8 @@ async fn poll_aircraft(xp: &XPlaneClient) -> Option<ui::Aircraft> {
         vsi: xp.get_float(datarefs::VVI_FPM).await.ok()?,
         flaps_pct: xp.get_float(datarefs::FLAP_RATIO).await.ok()? * 100.0,
         ap_mode: ap_mode(xp, None).await,
-        managing: active_managers(),
+        managing: auto_status::active_managers(),
     })
-}
-
-/// What the copilot is actively managing right now — the continuous control
-/// loops that keep working between commands — one short line each, for the
-/// dashboard's "managing" panel. Ordered by priority: an emergency (autoland /
-/// recovery, both publish through [`autoland::PANEL`]) outranks the routine
-/// governors. Cheap atomic/mutex reads, safe to poll every tick.
-fn active_managers() -> Vec<String> {
-    let mut v = Vec::new();
-    if let Ok(p) = autoland::PANEL.lock() {
-        if !p.is_empty() {
-            v.push(p.clone());
-        }
-    }
-    // Recovery without a panel line yet (the watcher writes it a beat later).
-    if v.is_empty() && tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        v.push("recovery".to_string());
-    }
-    if let Some(a) = approach_guide::armed() {
-        v.push(format!("talk-down {} {}", a.icao, a.runway_id));
-    }
-    if let Some(s) = full_auto::status() {
-        v.push(s);
-    }
-    if let Some(s) = circuit::status() {
-        v.push(s);
-    }
-    if let Some(s) = procedure::status() {
-        v.push(s);
-    }
-    if let Some(s) = autotakeoff::status() {
-        v.push(s);
-    }
-    if let Some(s) = autotaxi::status() {
-        v.push(s);
-    }
-    if let Some(s) = tools::speedhold::status() {
-        v.push(s);
-    }
-    if tools::controls::brakes_held() {
-        v.push("holding brakes".to_string());
-    }
-    if let Some(s) = tools::reverse::status() {
-        v.push(s);
-    }
-    if let Some(s) = tools::engine::mixture_status() {
-        v.push(s.to_string());
-    }
-    v
 }
 
 /// Summarize the active autopilot lateral mode for the panel. Reads prefer the
