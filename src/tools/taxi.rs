@@ -20,13 +20,14 @@ use crate::autotaxi;
 use crate::party_line;
 use crate::tower;
 
-/// Default pace when the pilot doesn't name one — a brisk GA taxi.
-const DEFAULT_KTS: f64 = 10.0;
-
 pub struct AutoTaxi {
     /// The airframe's park-brake valve SET sense, passed through to the
     /// inner `hold_speed` arm so its release gates work unchanged.
     pub park_brake_valve_set: Option<f64>,
+    /// How briskly this airframe taxis — the pace when the pilot names none,
+    /// and the bend caps the route's schedule falls to. Built from the profile
+    /// (so a swap rebuilds it), never read from a static.
+    pub pace: autotaxi::Pace,
     /// Constant-speed prop levers, when the airframe has them. Advanced out of
     /// feather at arm time — a turboprop makes no taxi thrust with feathered
     /// blades however far the power lever comes up. `None` on the pistons.
@@ -35,7 +36,7 @@ pub struct AutoTaxi {
 
 #[derive(Deserialize, Default)]
 struct Args {
-    /// Taxi pace, knots. Absent = 10.
+    /// Taxi pace, knots. Absent = the airframe's own pace.
     #[serde(default)]
     knots: Option<f64>,
     /// true = stop auto-taxiing and hand everything back.
@@ -63,7 +64,7 @@ impl Tool for AutoTaxi {
         json!({
             "type": "object",
             "properties": {
-                "knots": {"type": "number", "description": "taxi pace, knots; absent = 10"},
+                "knots": {"type": "number", "description": "taxi pace, knots; absent = this airframe's normal taxi pace"},
                 "off": {"type": "boolean", "description": "true = stop auto-taxiing, hand everything back"}
             }
         })
@@ -117,11 +118,12 @@ impl Tool for AutoTaxi {
                     .to_string(),
             );
         };
-        let Some(route) = autotaxi::Route::build(&watch) else {
+        let Some(mut route) = autotaxi::Route::build(&watch) else {
             return Ok(
                 "The cleared route's too short to drive. We're basically there.".to_string(),
             );
         };
+        route.pace = self.pace;
         let (Ok(lat), Ok(lon), Ok(psi)) = (
             ctx.xplane.get_float(autotaxi::LAT).await,
             ctx.xplane.get_float(autotaxi::LON).await,
@@ -154,7 +156,7 @@ impl Tool for AutoTaxi {
                     .to_string(),
             );
         }
-        let base = speedhold::clamp_taxi_target(a.knots.unwrap_or(DEFAULT_KTS)).max(3.0);
+        let base = speedhold::clamp_taxi_target(a.knots.unwrap_or(self.pace.straight)).max(3.0);
         // Arm the governor through the front door: every parking-brake and
         // held-brake gate in hold_speed applies to an auto taxi unchanged.
         let arm_line = speedhold::HoldSpeed {
@@ -226,15 +228,18 @@ pub struct LineUp {
     /// (a line-up is an auto taxi — same feathered-blade wall). `None` on
     /// the pistons.
     pub prop: Option<PropProfile>,
+    /// This airframe's pacing — a line-up rides the TURN cap (a runway entry
+    /// is a bend end to end), a backtrack the straight-leg pace.
+    pub pace: autotaxi::Pace,
 }
 
-/// Line-up pace: a runway entry is a sharp-corner maneuver end to end.
-const LINE_UP_KTS: f64 = 6.0;
 /// A full-length backtrack is a long straight run down the strip — taxi it at a
 /// brisk pace, not the tight line-up crawl (LXGB's ~1 km 09 backtrack took 6
-/// minutes at 6 kt and full auto timed out). The governor still auto-caps to
-/// 4-6 kt through the turn-around and ramps to the stop at the numbers.
-const BACKTRACK_KTS: f64 = 14.0;
+/// minutes at 6 kt and full auto timed out). The governor still auto-caps
+/// through the turn-around and ramps to the stop at the numbers. Floored here
+/// so a GA airframe keeps the 14 kt that fixed that timeout, while a jet
+/// backtracks at its own (higher) straight-leg pace.
+const BACKTRACK_FLOOR_KTS: f64 = 14.0;
 
 #[async_trait]
 impl Tool for LineUp {
@@ -383,6 +388,7 @@ impl Tool for LineUp {
                     .to_string(),
             );
         };
+        route.pace = self.pace;
         route.done_line = Some(if backtracking {
             "At the numbers. Coming around.".to_string()
         } else {
@@ -390,9 +396,9 @@ impl Tool for LineUp {
         });
         // A backtrack taxis briskly down the strip; a plain line-up creeps.
         let drive_kts = if backtracking {
-            BACKTRACK_KTS
+            self.pace.straight.max(BACKTRACK_FLOOR_KTS)
         } else {
-            LINE_UP_KTS
+            self.pace.turn
         };
         // Governor through the front door: parking-brake and held-brake
         // gates apply to a line-up unchanged.
@@ -423,7 +429,7 @@ impl Tool for LineUp {
             ctx.config.xplane_base_url.clone(),
             ctx.voice.cloned(),
             route,
-            LINE_UP_KTS,
+            drive_kts,
         );
         Ok(format!(
             "Lining us up, runway {spoken}. Your pedals or my controls take it back any time."
@@ -439,6 +445,8 @@ pub struct TaxiToParking {
     pub park_brake_valve_set: Option<f64>,
     /// Constant-speed prop levers, so a turboprop unfeathers before the taxi.
     pub prop: Option<PropProfile>,
+    /// This airframe's pacing, handed to the arrival drive.
+    pub pace: autotaxi::Pace,
 }
 
 #[async_trait]
@@ -488,6 +496,7 @@ impl Tool for TaxiToParking {
             ctx.voice.cloned(),
             self.park_brake_valve_set,
             self.prop.clone(),
+            self.pace,
         );
         Ok("Taxiing to parking — getting the clearance.".to_string())
     }

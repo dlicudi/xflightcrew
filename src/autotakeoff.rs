@@ -46,10 +46,15 @@ const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
-const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
+/// The thrust lever THIS airframe obeys — not always the stock one (the
+/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
+/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
+/// thrust). Resolved per call, so a profile swap takes effect immediately.
+fn throttle_dref() -> String {
+    crate::aircraft::throttle_dataref()
+}
 const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 const FLAP_HANDLE: &str = "sim/cockpit2/controls/flap_ratio";
-const XPDR_MODE: &str = "sim/cockpit2/radios/actuators/transponder_mode"; // 0 off,1 stby,2 on,3 alt
 /// Clean up the takeoff flaps this high AGL, once safely above Vy — a
 /// conservative "positive climb, gear up, then flaps" point.
 const FLAP_RETRACT_AGL_FT: f64 = 400.0;
@@ -171,12 +176,30 @@ const XTK_MAX_DEG: f64 = 8.0;
 /// rotate at 55 knots, the AP held the nose down, and the aircraft
 /// levitated off at 98 with 250 m of runway left.
 const ROTATE_PITCH_DEG: f64 = 8.0;
+/// ...reached at this RATE, degrees per second. A rotation is a rate, not a
+/// step, and treating it as a step is what struck an MD-82's tail at Luton
+/// (2026-07-28): the target appeared 8° away in one tick, the integrator wound
+/// to its cap pulling for it, and the nose arrived with enough momentum to
+/// sail through the target to 10.6° at 21 ft — on a fuselage whose geometry
+/// runs out around 11. Ramping the commanded attitude from wherever the nose
+/// was keeps the error small, so the elevator never winds up in the first
+/// place. 2.5°/s is the rate airline procedure asks a pilot to rotate at.
+const ROTATE_RATE_DEG_S: f64 = 2.5;
 /// Integrating pitch law: deflection per degree-second of attitude error,
 /// a lead on the pitch rate for damping, and caps. Integrating, so it
 /// holds whatever standing elevator the trim state demands with the
 /// attitude ON target — the same reason the roll law grew its trim.
 const PITCH_GAIN_PER_DEG_S: f64 = 0.05;
-const PITCH_LEAD_S: f64 = 0.5;
+/// The damping lead, seconds. Applied to the rate ERROR (how far off the
+/// COMMANDED rotation rate the nose is), not the raw pitch rate: damping the
+/// raw rate would fight the rotation itself, since a nose coming up at exactly
+/// the commanded 2.5°/s is doing precisely what was asked. Raised from 0.5 with
+/// the rate ramp, because it now has a rate to measure against.
+const PITCH_LEAD_S: f64 = 1.0;
+/// Margin below an airframe's tail-strike attitude that the rotation will not
+/// command past. The target (8°) normally sits below this anyway — the clamp
+/// exists for the OVERSHOOT, which is what actually strikes.
+const TAIL_STRIKE_MARGIN_DEG: f64 = 2.0;
 const PITCH_MAX: f64 = 0.65;
 const PITCH_MIN: f64 = -0.10;
 /// Hand the established climb to the autopilot this high — clear of ground
@@ -237,6 +260,13 @@ pub struct Params {
     /// hands off LOWER (~500) so it turns crosswind while still climbing,
     /// instead of running four kilometres straight ahead to reach 1000 first.
     pub handoff_agl_ft: f64,
+    /// The attitude at which this airframe's tail touches the runway, degrees.
+    /// The rotation will not command within [`TAIL_STRIKE_MARGIN_DEG`] of it.
+    /// `None` on airframes short enough not to have one worth naming.
+    pub tail_strike_deg: Option<f64>,
+    /// Never-exceed / Vmo, KIAS — the climb's OVERSPEED protection. `None`
+    /// keeps the full-power climb every airframe flew before this existed.
+    pub vne_kts: Option<f64>,
 }
 
 /// Fit the aircraft's position and heading to a runway end: which strip are
@@ -274,6 +304,34 @@ pub fn runway_fit(
         }
     }
     best.map(|(r, _, rem)| (r, rem))
+}
+
+/// The string crosscheck's escape hatch for duplicated pavement: apt.dat can
+/// carry ONE physical strip as two rows under different designators —
+/// Stansted's 3,052 m 04/22 and its 1,048 m 04C/22C are collinear to under a
+/// metre of cross-track, the author's model of the field's center
+/// designators. Lined up there, [`runway_fit`] names the LONG row (the short
+/// one fails the length gate) while the tower cleared "two two center", and
+/// the string compare refused a takeoff from exactly the cleared position —
+/// three times in a row, EGSS 2026-07-29. If the CLEARED designator itself
+/// fits our position and heading (the fit's own gates, minus length — an
+/// administrative sub-segment's declared distance is not the pavement), we
+/// are standing on the cleared runway whatever the fitted row is called. A
+/// reciprocal still fails on heading and a true parallel on cross-track, so
+/// the backwards-line-up trap this check exists for is intact.
+pub fn cleared_fits_here(
+    cands: &[Runway],
+    cleared: &str,
+    lat: f64,
+    lon: f64,
+    psi_true: f64,
+) -> bool {
+    cands.iter().any(|r| {
+        runway_matches(&r.id, cleared)
+            && heading_diff(psi_true, r.course_deg) <= ALIGN_MAX_DEG
+            && (cross_track_nm(lat, lon, r) * M_PER_NM).abs() <= LATERAL_MAX_M
+            && along_track_nm(lat, lon, r) * M_PER_NM <= BEFORE_THRESHOLD_MAX_M
+    })
 }
 
 /// Two runway idents name the same end when they match ignoring case and a
@@ -374,14 +432,52 @@ pub fn rotate_ok(err_deg: f64, remaining_m: f64) -> bool {
 pub struct RotatePitch {
     out: f64,
     prev_theta: Option<f64>,
+    /// The commanded attitude, ramped at [`ROTATE_RATE_DEG_S`] from wherever
+    /// the nose was on the first tick. `None` until then.
+    target: Option<f64>,
+    /// Highest attitude this airframe may be commanded to, degrees — its
+    /// tail-strike angle less [`TAIL_STRIKE_MARGIN_DEG`]. `None` on airframes
+    /// with no geometry limit worth naming (the GA singles: a 172 runs out of
+    /// elevator long before it runs out of tail clearance).
+    ceiling: Option<f64>,
 }
 
 impl RotatePitch {
+    /// `tail_strike_deg` is the airframe's tail-clearance attitude, from the
+    /// profile. `None` leaves the law with only its own 8° target.
+    pub fn new(tail_strike_deg: Option<f64>) -> Self {
+        RotatePitch {
+            out: 0.0,
+            prev_theta: None,
+            target: None,
+            ceiling: tail_strike_deg.map(|d| d - TAIL_STRIKE_MARGIN_DEG),
+        }
+    }
+
+    /// The attitude being commanded right now — the ramp, for the blackbox.
+    pub fn target_deg(&self) -> f64 {
+        self.target.unwrap_or(0.0)
+    }
+
     pub fn step(&mut self, theta_deg: f64, dt_s: f64) -> f64 {
         let dt = dt_s.clamp(0.05, 1.0);
         let rate = self.prev_theta.map_or(0.0, |p| (theta_deg - p) / dt);
         self.prev_theta = Some(theta_deg);
-        let err = ROTATE_PITCH_DEG - theta_deg - PITCH_LEAD_S * rate;
+        // The commanded attitude walks up from where the nose actually was,
+        // never further than the airframe's geometry allows.
+        let cap = self
+            .ceiling
+            .map_or(ROTATE_PITCH_DEG, |c| ROTATE_PITCH_DEG.min(c));
+        let target = match self.target {
+            None => theta_deg.min(cap),
+            Some(t) => (t + ROTATE_RATE_DEG_S * dt).min(cap),
+        };
+        self.target = Some(target);
+        // Damp the rate ERROR: while the ramp is still climbing, the nose is
+        // SUPPOSED to be moving at ROTATE_RATE_DEG_S, and subtracting that
+        // motion as if it were an overshoot is what stalls a rotation.
+        let want_rate = if target < cap { ROTATE_RATE_DEG_S } else { 0.0 };
+        let err = target - theta_deg - PITCH_LEAD_S * (rate - want_rate);
         self.out = (self.out + err * PITCH_GAIN_PER_DEG_S * dt).clamp(PITCH_MIN, PITCH_MAX);
         self.out
     }
@@ -464,6 +560,53 @@ pub fn climb_vs_fpm(ias_kts: f64, vy_kts: f64, max_fpm: f64) -> f64 {
     (max_fpm - (vy_kts - ias_kts).max(0.0) * 60.0).clamp(150.0, max_fpm)
 }
 
+/// How far below Vne the overspeed protection starts working, and how much
+/// climb rate it trades in per knot of excess.
+const OVERSPEED_GUARD_KTS: f64 = 20.0;
+const OVERSPEED_VS_PER_KT: f64 = 60.0;
+const OVERSPEED_VS_MAX_FPM: f64 = 1500.0;
+/// Thrust is pulled no lower than this in the climb — enough to keep climbing.
+const CLIMB_THROTTLE_MIN: f64 = 0.55;
+const OVERSPEED_THR_PER_KT: f64 = 0.02;
+
+/// Climb rate with speed protection on BOTH sides.
+///
+/// [`climb_vs_fpm`] only ever protected the slow side: below Vy it backs the
+/// rate off, above Vy it commands the maximum and nothing else. That is right
+/// for a trainer, which cannot outrun itself at full power, and wrong for a
+/// jet, which can. The SF50 left the runway at full thrust and accelerated
+/// through the climb to 270 KIAS against a Vmo of 250 — measured live in the
+/// climb, 2026-07-28 — with the copilot commanding a placid 1500 fpm the
+/// whole way, because nothing in the law was watching the top end.
+///
+/// Inside the guard band the excess speed is traded for altitude: climb
+/// HARDER, which is what a pilot does with thrust they cannot reduce. The
+/// trade is capped so the protection can never become a pitch-up of its own.
+pub fn climb_vs_protected(ias_kts: f64, vy_kts: f64, max_fpm: f64, vne_kts: Option<f64>) -> f64 {
+    let base = climb_vs_fpm(ias_kts, vy_kts, max_fpm);
+    let Some(vne) = vne_kts else { return base };
+    let over = ias_kts - (vne - OVERSPEED_GUARD_KTS);
+    if over <= 0.0 {
+        return base;
+    }
+    base + (over * OVERSPEED_VS_PER_KT).min(OVERSPEED_VS_MAX_FPM)
+}
+
+/// Climb thrust with the same guard. Trading speed for rate is only half an
+/// answer — on an airframe with this much excess thrust the aircraft simply
+/// re-accelerates — so the lever comes back too, which is the other half of
+/// what a pilot does. Never below [`CLIMB_THROTTLE_MIN`]: the point is to stop
+/// overspeeding, not to stop climbing. Airframes with no declared Vne are
+/// untouched and keep the full-power climb they have always flown.
+pub fn climb_throttle(ias_kts: f64, vne_kts: Option<f64>) -> f64 {
+    let Some(vne) = vne_kts else { return 1.0 };
+    let over = ias_kts - (vne - OVERSPEED_GUARD_KTS);
+    if over <= 0.0 {
+        return 1.0;
+    }
+    (1.0 - over * OVERSPEED_THR_PER_KT).max(CLIMB_THROTTLE_MIN)
+}
+
 /// Reject when the runway is running out and rotation speed is still short:
 /// inside the margin with less than 90% of Vr there is no takeoff today.
 pub fn must_reject(remaining_m: f64, ias_kts: f64, vr_kts: f64) -> bool {
@@ -500,7 +643,7 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 
 /// Throttle idle, one expiring brake pulse, steering released, and say why.
 async fn reject(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &str) {
-    let _ = xp.set_float(THROTTLE_ALL, 0.0).await;
+    let _ = xp.set_float(&throttle_dref(), 0.0).await;
     if xp
         .run_command_for(crate::tools::BRAKES_REGULAR, crate::tools::BRAKE_HOLD_SECS)
         .await
@@ -558,7 +701,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         return;
     };
     if let Some(clr) = &p.cleared_runway {
-        if !runway_matches(&rwy.id, clr) {
+        if !runway_matches(&rwy.id, clr) && !cleared_fits_here(&cands, clr, lat, lon, psi) {
             alert(
                 &voice,
                 Priority::Warning,
@@ -638,9 +781,11 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut gear_raised = !p.retract_gear;
     let mut positive_called = false;
     let mut thr_challenged = false;
-    let mut pitch_law = RotatePitch::default();
+    let mut pitch_law = RotatePitch::new(p.tail_strike_deg);
     let mut wings = WingsLevel::default();
     let mut last_vs_cmd: Option<f64> = None;
+    // Last climb thrust commanded, so the lever is only rewritten when it moves.
+    let mut last_climb_thr = 1.0f64;
     let mut last_thr_cmd = 0.3_f64;
     // The roll section's heading error, one tick stale, for the throttle's
     // swinging-nose hold (throttle is commanded before position is read).
@@ -691,6 +836,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // took ~350 ms and dragged the control tick to half a second — the
         // lag behind the fourth sortie's weave. Joined, the tick runs at
         // the sleep rate.
+        let thr_dref = throttle_dref();
         let (
             lat,
             lon,
@@ -714,7 +860,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             xp.get_float(AGL_M),
             xp.get_float(ON_GROUND),
             xp.get_float(STEER_YIELD),
-            xp.get_float(THROTTLE_ALL),
+            xp.get_float(&thr_dref),
             xp.get_float(THETA),
             xp.get_float(PHI),
             xp.get_float(PITCH_YIELD),
@@ -784,7 +930,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         } else {
             thr_challenged = false;
         }
-        let _ = xp.set_float(THROTTLE_ALL, thr_cmd).await;
+        let _ = xp.set_float(&throttle_dref(), thr_cmd).await;
         last_thr_cmd = thr_cmd;
 
         if !airborne {
@@ -832,6 +978,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 "autotakeoff",
                 serde_json::json!({
                     "event": "roll", "gs": gs_kts, "ias": ias, "err": err,
+                    // Attitude and the commanded ramp: the Luton tail strike
+                    // happened during the roll and the log carried no theta at
+                    // all, so the peak that struck is simply not in the record.
+                    "theta": theta_deg, "pitch_tgt": pitch_law.target_deg(),
                     "steer": steer, "trim": steer_law.trim(), "xtk_m": xtk_m,
                     "thr": thr_cmd, "remaining_m": remaining, "dt": dt,
                 }),
@@ -878,9 +1028,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 airborne = true;
                 let _ = xp.set_float(TAXI_STEER, 0.0).await;
                 // Transponder to ALT (mode C) now we're flying — real ops squawk
-                // altitude on departure. Stock dataref; a no-op on an airframe
-                // with no transponder, so no profile gate needed.
-                let _ = xp.set_int(XPDR_MODE, 3).await;
+                // altitude on departure. Through the shared writer, so an
+                // airframe whose box is an add-on's own (the Twin Otter's KT73,
+                // which rewrites the stock dataref from its knob every frame)
+                // gets its KNOB turned rather than a write nothing reads. A
+                // no-op on an airframe with no transponder, so no profile gate.
+                let _ = crate::tools::radio::set_mode(&xp, crate::tools::radio::XpdrMode::Altitude)
+                    .await;
                 crate::blackbox::record(
                     "autotakeoff",
                     serde_json::json!({"event": "liftoff", "ias": ias}),
@@ -956,7 +1110,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             if xp.get_float(VS_STATUS).await.unwrap_or(0.0) <= 0.5 {
                 let _ = xp.run_command(CMD_VS_MODE).await;
             }
-            let vs = climb_vs_fpm(ias, p.vy_kts, p.climb_fpm);
+            let vs = climb_vs_protected(ias, p.vy_kts, p.climb_fpm, p.vne_kts);
             let _ = xp.set_float(VS_DIAL, vs).await;
             last_vs_cmd = Some(vs);
             crate::blackbox::record(
@@ -964,10 +1118,17 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 serde_json::json!({"event": "ap_engaged", "ias": ias, "agl": agl_ft, "cmd_vs": vs}),
             );
         }
-        let vs = climb_vs_fpm(ias, p.vy_kts, p.climb_fpm);
+        let vs = climb_vs_protected(ias, p.vy_kts, p.climb_fpm, p.vne_kts);
         if last_vs_cmd.is_none_or(|v| (v - vs).abs() > 40.0) {
             let _ = xp.set_float(VS_DIAL, vs).await;
             last_vs_cmd = Some(vs);
+        }
+        // ...and the lever comes back with it. Trading speed for rate alone
+        // just lets an airframe with spare thrust re-accelerate.
+        let thr = climb_throttle(ias, p.vne_kts);
+        if (thr - last_climb_thr).abs() > 0.01 {
+            let _ = xp.set_float(&throttle_dref(), thr).await;
+            last_climb_thr = thr;
         }
         if xp.get_float(VS_STATUS).await.unwrap_or(1.0) <= 0.5 {
             // Someone (or a mode change) dropped VS: re-engage, and force a
@@ -1044,6 +1205,63 @@ mod tests {
         assert!(runway_fit(&cands, lat, lon, 0.0, 500.0).is_none());
         // Backwards on the strip fits the RECIPROCAL end, never this one.
         assert!(runway_fit(&cands, 0.0, 0.0, 180.0, 500.0).is_none());
+    }
+
+    /// Stansted's real geometry (Global Airports apt.dat): the 1,048 m
+    /// 04C/22C row is a collinear sub-segment of the 3,052 m 04/22 pavement.
+    /// Cleared "22C" and lined up mid-strip, the fit names "22" (the short
+    /// row fails the length gate for a jet's factored roll) and the string
+    /// compare refused the takeoff — EGSS, 2026-07-29, three times.
+    #[test]
+    fn collinear_duplicate_designators_pass_the_crosscheck() {
+        // Course 222.8 for the 22 ends: threshold at the NE, rolling SW.
+        let cands = vec![
+            Runway {
+                icao: "EGSS".into(),
+                id: "22C".into(),
+                thr_lat: 51.8895556,
+                thr_lon: 0.2416333,
+                course_deg: 222.8,
+                length_m: 1048.0,
+                surface: 1,
+                dist_nm: 0.0,
+                elev_ft: 348.0,
+            },
+            Runway {
+                icao: "EGSS".into(),
+                id: "22".into(),
+                thr_lat: 51.8951583,
+                thr_lon: 0.2500444,
+                course_deg: 222.8,
+                length_m: 3052.0,
+                surface: 1,
+                dist_nm: 0.0,
+                elev_ft: 348.0,
+            },
+        ];
+        // The stop the line-up delivered: on the shared centreline, 190 m
+        // down the 22C row, nose roughly down the strip.
+        let (lat, lon) = (51.88799, 0.23930);
+        // A factored roll longer than the 22C row's remainder: the fit
+        // skips 22C and names the long row.
+        let (rwy, rem) = runway_fit(&cands, lat, lon, 223.0, 900.0).expect("on the pavement");
+        assert_eq!(rwy.id, "22", "the short row fails the length gate");
+        assert!(rem > 1500.0, "{rem}");
+        assert!(!runway_matches(&rwy.id, "22C"), "the strings alone refuse");
+        // The escape hatch: the cleared designator fits where we stand.
+        assert!(cleared_fits_here(&cands, "22C", lat, lon, 223.0));
+        // The traps stay armed: the reciprocal fails on heading, a name
+        // not under the wheels fails outright.
+        assert!(!cleared_fits_here(&cands, "04C", lat, lon, 223.0));
+        assert!(!cleared_fits_here(&cands, "27", lat, lon, 223.0));
+        // A true parallel 200 m abeam fails on cross-track.
+        let mut parallel = cands[0].clone();
+        parallel.id = "22R".into();
+        let (plat, plon) =
+            project_latlon(parallel.thr_lat, parallel.thr_lon, 132.8, 200.0 / 1852.0);
+        parallel.thr_lat = plat;
+        parallel.thr_lon = plon;
+        assert!(!cleared_fits_here(&[parallel], "22R", lat, lon, 223.0));
     }
 
     #[test]
@@ -1254,6 +1472,88 @@ mod tests {
         assert!(rotate_ok(25.0, 300.0), "yawed but running out: fly");
     }
 
+    /// A rotation is a RATE. Luton 2026-07-28: the old law saw the whole 8° as
+    /// error on the first tick, wound the integrator to its cap pulling for it,
+    /// and the nose arrived with enough momentum to overshoot to 10.6° at 21 ft
+    /// — a tail strike on a fuselage that runs out around 11, then a ±2.5°
+    /// oscillation for the rest of the initial climb.
+    #[test]
+    fn the_rotation_walks_the_nose_up_instead_of_snatching_it() {
+        let mut law = RotatePitch::new(None);
+        // First tick from a nose-on-the-ground attitude: the commanded target
+        // starts THERE, so the error is small and the elevator stays gentle.
+        let first = law.step(0.0, 0.15);
+        assert!(first > 0.0 && first < 0.05, "gentle to start: {first}");
+        assert!(law.target_deg() < 1.0, "target starts at the nose");
+        // Two seconds later the commanded attitude has walked up about
+        // 2.5°/s, and no further than the 8° target.
+        let mut ramp = RotatePitch::new(None);
+        for _ in 0..14 {
+            ramp.step(0.0, 0.15);
+        }
+        let t = ramp.target_deg();
+        assert!((t - 2.1 * ROTATE_RATE_DEG_S).abs() < 1.5, "ramping: {t}");
+        for _ in 0..60 {
+            ramp.step(0.0, 0.15);
+        }
+        assert!(
+            (ramp.target_deg() - ROTATE_PITCH_DEG).abs() < 1e-6,
+            "and stops at the target: {}",
+            ramp.target_deg()
+        );
+        // A nose FOLLOWING the ramp is doing what was asked, so the elevator
+        // must not keep winding: the rate damping measures the rate ERROR, not
+        // the rotation itself.
+        let mut good = RotatePitch::new(None);
+        let mut theta = 0.0;
+        let mut peak: f64 = 0.0;
+        for _ in 0..60 {
+            let out = good.step(theta, 0.15);
+            peak = peak.max(out);
+            theta = (theta + ROTATE_RATE_DEG_S * 0.15).min(ROTATE_PITCH_DEG);
+        }
+        assert!(
+            peak < 0.25,
+            "a rotation on rate needs no big pull: peak {peak}"
+        );
+    }
+
+    /// A long fuselage gets a ceiling: the profile's tail-strike attitude, less
+    /// a margin, bounds what the rotation may ever ask for.
+    #[test]
+    fn a_tail_strike_limit_caps_the_commanded_attitude() {
+        // 9.5° geometry, 2° margin → 7.5°, below the law's own 8° target.
+        let mut md = RotatePitch::new(Some(9.5));
+        for _ in 0..80 {
+            md.step(0.0, 0.15);
+        }
+        assert!(
+            (md.target_deg() - 7.5).abs() < 1e-6,
+            "capped by the airframe: {}",
+            md.target_deg()
+        );
+        // Past the ceiling, the law pushes back rather than holding the pull.
+        let mut over = RotatePitch::new(Some(9.5));
+        for _ in 0..40 {
+            over.step(0.0, 0.15);
+        }
+        let pulling = over.out;
+        for _ in 0..20 {
+            over.step(11.0, 0.15);
+        }
+        assert!(
+            over.out < pulling,
+            "above the tail limit the elevator must relax: {} !< {pulling}",
+            over.out
+        );
+        // No limit declared → the plain 8° target, unchanged.
+        let mut ga = RotatePitch::new(None);
+        for _ in 0..80 {
+            ga.step(0.0, 0.15);
+        }
+        assert!((ga.target_deg() - ROTATE_PITCH_DEG).abs() < 1e-6);
+    }
+
     #[test]
     fn rotation_is_an_elevator_pull_that_holds_the_attitude() {
         // Sortie five: rotate called at 55 knots, the AP's VS mode held the
@@ -1327,6 +1627,47 @@ mod tests {
         assert_eq!(climb_vs_fpm(40.0, 74.0, 700.0), 150.0);
         // Fast: capped at the profile's rate, no zoom climb.
         assert_eq!(climb_vs_fpm(95.0, 74.0, 700.0), 700.0);
+    }
+
+    /// The climb protected only the SLOW side, which is right for a trainer
+    /// (it cannot outrun itself at full power) and wrong for a jet, which can.
+    /// The SF50 left Luton at full thrust and accelerated to 270 KIAS against
+    /// a Vmo of 250 while the copilot placidly commanded 1500 fpm and never
+    /// touched the lever (measured live in the climb, 2026-07-28).
+    #[test]
+    fn the_climb_protects_the_fast_side_too() {
+        const VNE: f64 = 250.0;
+        // Well below the guard band: untouched, both rate and thrust.
+        assert_eq!(climb_vs_protected(200.0, 120.0, 2000.0, Some(VNE)), 2000.0);
+        assert_eq!(climb_throttle(200.0, Some(VNE)), 1.0);
+        // Inside the band the aircraft climbs HARDER — excess speed traded
+        // for altitude — and the lever comes back with it.
+        let fast = climb_vs_protected(245.0, 120.0, 2000.0, Some(VNE));
+        assert!(fast > 2000.0, "trade the speed for rate: {fast}");
+        let thr = climb_throttle(245.0, Some(VNE));
+        assert!(thr < 1.0, "and pull the lever: {thr}");
+        // Harder the faster it gets, monotonically, on both.
+        assert!(climb_vs_protected(260.0, 120.0, 2000.0, Some(VNE)) > fast);
+        assert!(climb_throttle(260.0, Some(VNE)) < thr);
+        // The protection can never become a pitch-up or a shutdown of its own.
+        let extreme = climb_vs_protected(400.0, 120.0, 2000.0, Some(VNE));
+        assert!(
+            extreme <= 2000.0 + OVERSPEED_VS_MAX_FPM,
+            "capped: {extreme}"
+        );
+        assert!(climb_throttle(400.0, Some(VNE)) >= CLIMB_THROTTLE_MIN);
+        // An airframe that declares no Vne keeps exactly the climb it had.
+        assert_eq!(
+            climb_vs_protected(260.0, 120.0, 2000.0, None),
+            climb_vs_fpm(260.0, 120.0, 2000.0)
+        );
+        assert_eq!(climb_throttle(260.0, None), 1.0);
+        // The 172 is nowhere near its Vne in a climb, so nothing changes for it.
+        assert_eq!(
+            climb_vs_protected(74.0, 74.0, 700.0, Some(163.0)),
+            climb_vs_fpm(74.0, 74.0, 700.0)
+        );
+        assert_eq!(climb_throttle(74.0, Some(163.0)), 1.0);
     }
 
     #[test]
@@ -1484,7 +1825,7 @@ mod tests {
                 throttle_cmd(elapsed, last_err, gs_kts)
             };
             let thr_cmd = throttle_slew(last_thr_cmd, thr_want, dt);
-            sim.set_float(THROTTLE_ALL, thr_cmd).await.unwrap();
+            sim.set_float(&throttle_dref(), thr_cmd).await.unwrap();
             last_thr_cmd = thr_cmd;
             hit_full_throttle |= thr_cmd >= 0.99;
 
@@ -1536,7 +1877,7 @@ mod tests {
 
             // Advance the world from what we actually wrote to the channels.
             let steer_a = sim.last_write(TAXI_STEER).unwrap();
-            let thr_a = sim.last_write(THROTTLE_ALL).unwrap();
+            let thr_a = sim.last_write(&throttle_dref()).unwrap();
             let pitch_a = if rotated {
                 sim.last_write(TAKEOFF_PITCH).unwrap()
             } else {

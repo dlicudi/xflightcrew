@@ -52,6 +52,11 @@ const TextRef& radio_row();
 const TextRef& coach();
 bool coach_urgent();
 char coach_group();
+// The Flight tab's automation feed (marker byte already stripped): one line
+// per active manager, primary first as "NAME|stage". auto_active() is the
+// marker — true while something the CANCEL button can stand down is running.
+const TextRef& auto_status();
+bool auto_active();
 const std::vector<AtcField>& atc_fields();
 
 // COM1, for the ATC tab: khz read (0 if the sim dataref is missing) and the
@@ -76,6 +81,9 @@ int opt_mode();
 void set_opt_mode(int v);
 int opt_cabin();
 void set_opt_cabin(int v);
+// UI scale index (0 = 100%, 1 = 125%, 2 = 150%; -1 = app hasn't published).
+int opt_ui_scale();
+void set_opt_ui_scale(int v);
 int opt_voice();
 void set_opt_voice(int v);
 const char* voice_list();

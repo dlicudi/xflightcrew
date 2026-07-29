@@ -27,7 +27,13 @@ const OVR_PITCH: &str = "sim/operation/override/override_joystick_pitch";
 const OVR_ROLL: &str = "sim/operation/override/override_joystick_roll";
 const YOKE_PITCH: &str = "sim/joystick/yoke_pitch_ratio"; // +1 nose up, -1 nose down
 const YOKE_ROLL: &str = "sim/joystick/yoke_roll_ratio"; // +1 right, -1 left
-const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
+/// The thrust lever THIS airframe obeys — not always the stock one (the
+/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
+/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
+/// thrust). Resolved per call, so a profile swap takes effect immediately.
+fn throttle_dref() -> String {
+    crate::aircraft::throttle_dataref()
+}
 
 // --- state reads ---
 const BANK: &str = "sim/flightmodel/position/phi"; // roll, deg (+ = right wing down)
@@ -253,7 +259,7 @@ fn run_recovery(
                 let _ = xp.set_float(YOKE_PITCH, cmd.pitch).await;
                 let _ = xp.set_float(YOKE_ROLL, cmd.roll).await;
                 if let Some(t) = cmd.throttle {
-                    let _ = xp.set_float(THROTTLE_ALL, t).await;
+                    let _ = xp.set_float(&throttle_dref(), t).await;
                 }
                 // Re-trim to RELIEVE the yoke: a nose-up trim (from slowing toward a
                 // stall) fights a nose-down push, so when we're holding a big pitch
@@ -345,7 +351,7 @@ fn run_recovery(
             if xp.get_float(ALT_HOLD_STATUS).await.unwrap_or(0.0) <= 0.5 {
                 let _ = xp.run_command(CMD_ALT_HOLD).await;
             }
-            let _ = xp.set_float(THROTTLE_ALL, CRUISE_THROTTLE).await;
+            let _ = xp.set_float(&throttle_dref(), CRUISE_THROTTLE).await;
 
             let line = format!(
                 "Recovered. Autopilot holding heading {hdg:.0} and {hold:.0} feet. You have control when ready."

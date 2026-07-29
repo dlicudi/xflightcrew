@@ -4,9 +4,15 @@
 //! whole gate-to-gate sequence by invoking the SAME tested tools the pilot
 //! would, in order, waiting on each before the next:
 //!
-//!   power up -> start engine -> release brake -> REQUEST TAXI from the tower
-//!   -> auto-taxi to the hold -> line up -> fly the circuit (takeoff, pattern,
-//!   land, stop).
+//!   power up -> start engine -> altimeter -> REQUEST TAXI from the tower
+//!   -> (pushback if nose-in) -> auto-taxi to the hold -> line up -> fly the
+//!   circuit (takeoff, pattern, land, stop).
+//!
+//! No blanket brake release anywhere in the chain: the brakes stay as the
+//! pilot left them until something actually drives — the taxi governor,
+//! pushback and auto-takeoff each release at their own moment (the stage-2
+//! release left an idle jet brakeless during the tug wait and it crept into
+//! the grass, Luton 2026-07-28).
 //!
 //! The taxi route is the tower's to give — the copilot can't invent one — so
 //! this transmits "request taxi" and drives whatever clearance comes back
@@ -26,7 +32,6 @@ use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
-const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 const BARO_KNOB: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot";
@@ -36,15 +41,53 @@ const PA_PER_INHG: f64 = 3386.389;
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Set to cancel ("cancel" / "my controls").
 pub static ABORT: AtomicBool = AtomicBool::new(false);
+/// The most recent stage `event()` recorded ("request taxi", "lined up"),
+/// underscores spaced for reading. The panel's Flight tab shows it beside the
+/// FULL AUTO headline; empty between runs.
+static STAGE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// The mission label ("circuit" / "flight"), set at start so the status names
+/// WHICH full auto is running — the pilot pressed CIRCUIT, so the headline
+/// must say circuit, not just the orchestrator's name. Empty between runs.
+static MISSION: std::sync::Mutex<&'static str> = std::sync::Mutex::new("");
 
-/// One-line status for the dashboard.
+/// The human-readable current stage, empty when idle or not yet staged.
+pub fn stage() -> String {
+    STAGE.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+fn clear_stage() {
+    if let Ok(mut s) = STAGE.lock() {
+        s.clear();
+    }
+    if let Ok(mut m) = MISSION.lock() {
+        *m = "";
+    }
+}
+
+/// One-line status for the dashboard, mission and stage folded in once known:
+/// "full auto circuit: request taxi" (the panel renders it as
+/// "FULL AUTO CIRCUIT [request taxi]").
 pub fn status() -> Option<String> {
-    ACTIVE.load(SeqCst).then(|| "full auto".to_string())
+    ACTIVE.load(SeqCst).then(|| {
+        let mission = MISSION.lock().map(|m| *m).unwrap_or("");
+        let name = if mission.is_empty() {
+            "full auto".to_string()
+        } else {
+            format!("full auto {mission}")
+        };
+        let stage = stage();
+        if stage.is_empty() {
+            name
+        } else {
+            format!("{name}: {stage}")
+        }
+    })
 }
 
 /// Cancel the sequence and stand down every sub-loop it may have armed.
 pub fn abort() -> bool {
     ABORT.store(true, SeqCst);
+    clear_stage();
     crate::autotaxi::ACTIVE.store(false, SeqCst);
     crate::autotakeoff::ACTIVE.store(false, SeqCst);
     crate::circuit::abort();
@@ -94,6 +137,8 @@ pub struct SubTools {
     /// the generators and bleed air (which feed the Twin Otter's autopilot) come
     /// on, not just the cranking bus.
     pub all_electrical_on_cmds: Vec<String>,
+    /// Toggle-only electrical switches: read, then fired only if off.
+    pub all_electrical_toggles: Vec<crate::aircraft::ToggleSwitch>,
     pub taxi: crate::tools::taxi::AutoTaxi,
     pub line_up: crate::tools::taxi::LineUp,
     pub circuit: crate::tools::circuit::Circuit,
@@ -105,10 +150,16 @@ pub struct SubTools {
     pub cruise_ias_kts: Option<f64>,
     pub mission: Mission,
     /// Run the electrical/APU power-up before the engine start. Only turbine
+    /// True when the airframe declares no start sequence we can fly at all.
+    pub no_start_sequence: bool,
     /// airframes need it — a piston's `start_engine` brings its own battery up,
     /// and running PowerUp on a 172 had the copilot narrating an APU it doesn't
     /// have ("APU not coming up", 2026-07-23).
     pub power_up_first: bool,
+    /// How long to wait for the engine to be running after the start is fired
+    /// (`StartKind::engine_start_secs`). Per airframe CLASS: a jet's start is a
+    /// three-minute procedure, a piston's is seconds.
+    pub engine_start_secs: f64,
 }
 
 /// Spawn the orchestrator on its own thread + runtime + client.
@@ -117,6 +168,12 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
         return;
     }
     ABORT.store(false, SeqCst);
+    if let Ok(mut m) = MISSION.lock() {
+        *m = match tools.mission {
+            Mission::Circuit { .. } => "circuit",
+            Mission::Flight(_) => "flight",
+        };
+    }
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -127,6 +184,7 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
         };
         rt.block_on(fly(XPlaneClient::new(base_url), config, voice, tools));
         ACTIVE.store(false, SeqCst);
+        clear_stage();
     });
 }
 
@@ -138,6 +196,9 @@ fn announce(voice: &Option<Voice>, priority: Priority, line: &str) {
 }
 
 fn event(stage: &str, detail: serde_json::Value) {
+    if let Ok(mut s) = STAGE.lock() {
+        *s = stage.replace('_', " ");
+    }
     crate::blackbox::record("full_auto", json!({ "stage": stage, "detail": detail }));
 }
 
@@ -145,6 +206,7 @@ fn event(stage: &str, detail: serde_json::Value) {
 fn give_up(voice: &Option<Voice>, line: &str, reason: &str) {
     ACTIVE.store(false, SeqCst);
     event("give_up", json!({ "reason": reason }));
+    clear_stage();
     announce(voice, Priority::Caution, line);
 }
 
@@ -212,6 +274,17 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
 
     // --- Stage 1: electrics + engine ------------------------------------------
     if !engine_running(&xp).await {
+        // A turbine we have no sequence for is not a piston. Say so and stop,
+        // rather than crank a starter this airframe hasn't got — the failure
+        // the MD-82 taught us, from the other side (see `StartKind::None`).
+        if tools.no_start_sequence {
+            give_up(
+                &voice,
+                "I don't have an engine start for this aircraft. Get the engines running and say full auto again.",
+                "no_start_sequence",
+            );
+            return;
+        }
         // Only turbine airframes need the APU/electrical bring-up; a piston's
         // start_engine powers its own bus.
         if tools.power_up_first {
@@ -224,11 +297,16 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                     "Bringing her to life.",
                 ]),
             );
-            let r = crate::tools::power::PowerUp.execute(&json!({}), &ctx).await;
-            event(
-                "power_up",
-                json!({ "reply": r.as_ref().map(|s| s.as_str()).unwrap_or("err") }),
-            );
+            // Run the bring-up INLINE, not through the PowerUp tool: the tool
+            // spawns the sequence and answers "running the electrical"
+            // immediately, so full auto walked straight on to the engine start,
+            // which found the APU still down and started a SECOND copy of the
+            // same sequence. Two racing copies both read a cross-tie as open and
+            // both fire its toggle command, which leaves it shut. Here the
+            // orchestrator is already on its own thread, so waiting is free and
+            // "power up, then crank" is true again.
+            crate::tools::power::run_prep(&xp, &voice, &None).await;
+            event("power_up", json!({ "inline": true }));
             bail_if_abort!();
         }
 
@@ -262,8 +340,9 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             Ok(reply) => announce(&voice, Priority::Advisory, &reply),
             Err(_) => {}
         }
-        // The starter cranks for a few seconds before it catches.
-        if !wait_until(40.0, 500, || engine_running(&xp)).await {
+        // The starter cranks before it catches — for seconds on a piston, for
+        // minutes on the jet's two-engine bleed-air sequence.
+        if !wait_until(tools.engine_start_secs, 500, || engine_running(&xp)).await {
             give_up(
                 &voice,
                 "The engine didn't catch. Full auto is off, your aircraft.",
@@ -278,9 +357,19 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // anti-ice, so a circuit flown without them has no servos. Skipped when
         // PowerUp already ran the bus (jets), and a no-op on airframes with no
         // electrical profile. Battery/master re-fire harmlessly.
-        if !tools.power_up_first && !tools.all_electrical_on_cmds.is_empty() {
+        if !tools.power_up_first
+            && !(tools.all_electrical_on_cmds.is_empty() && tools.all_electrical_toggles.is_empty())
+        {
             for cmd in &tools.all_electrical_on_cmds {
                 let _ = xp.run_command(cmd).await;
+            }
+            // Toggle-only systems have no ON command, so a bulk power-up that
+            // fires command lists skips them SILENTLY. That left the Citation's
+            // avionics master off after "electrical set", and the radios dead.
+            for t in &tools.all_electrical_toggles {
+                if xp.get_float(&t.dataref).await.unwrap_or(0.0) <= 0.5 {
+                    let _ = xp.run_command(&t.command).await;
+                }
             }
             announce(
                 &voice,
@@ -289,14 +378,26 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             );
             event(
                 "electrical_set",
-                json!({ "cmds": tools.all_electrical_on_cmds.len() }),
+                json!({
+                    "cmds": tools.all_electrical_on_cmds.len(),
+                    "toggles": tools.all_electrical_toggles.len(),
+                }),
             );
         }
     }
     bail_if_abort!();
 
-    // --- Stage 2: brakes off --------------------------------------------------
-    let _ = xp.set_float(PARK_BRAKE, 0.0).await;
+    // --- Stage 2: altimeter ---------------------------------------------------
+    // NO brake release here, deliberately. The brakes used to come off at this
+    // stage — engine just started, taxi clearance not yet requested — which is
+    // minutes before anything drives, and an idle jet on a flat apron rolls:
+    // the SF50 crept from 0 to 2.8 kt with `park=0.0` while full auto was
+    // still WAITING FOR THE TUG, and ended up in the grass (Luton,
+    // 2026-07-28). Nobody needs the early release: the taxi governor
+    // auto-releases (valve-aware) when a drive arms, the pushback stage
+    // handles its own brakes-off at hook-up, and the auto-takeoff releases on
+    // the runway. Brakes stay as the pilot left them until something is
+    // actually driving.
 
     // Set the altimeter to field QNH before departure — a misset altimeter is
     // the classic level-bust. Autoland aims at the runway's true elevation so it
@@ -363,8 +464,42 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             }
             bail_if_abort!();
         }
-        // The taxi route is the tower's. Ask for it if we don't already hold one.
-        if crate::party_line::with_taxi_route(|r| r.is_none()) {
+        // The taxi route is the tower's. Ask for it if we don't already hold
+        // one — or if the one we hold WAS PLANNED FROM SOMEWHERE ELSE. A
+        // clearance outlives a reposition: the tower planned a route from the
+        // aircraft's spot on Stansted's 22C, full auto's first attempt gave
+        // up waiting one second before it arrived, the pilot moved to a gate
+        // a kilometre away, and the SECOND attempt reused the fossil — read
+        // "nose in" against a lane 1 km off, called a tug to push toward it,
+        // and the taxi drive then (correctly) refused at 1090 m off route
+        // (2026-07-29). A route is only OURS if it starts within reach of
+        // the auto-taxi's own join limit; otherwise ask again and the tower
+        // re-plans from where we actually are.
+        let route_is_ours = {
+            let (lat_r, lon_r) = tokio::join!(xp.get_float(LAT), xp.get_float(LON));
+            match (lat_r, lon_r) {
+                (Ok(lat), Ok(lon)) => crate::party_line::with_taxi_route(|r| {
+                    r.map(|w| {
+                        w.path
+                            .iter()
+                            .any(|p| crate::nav::haversine_nm(lat, lon, p.0, p.1) * 1852.0 < 200.0)
+                    })
+                })
+                .unwrap_or(false),
+                // Position unknown: trust the route rather than re-request in
+                // a loop we can't verify our way out of.
+                _ => crate::party_line::with_taxi_route(|r| r.is_some()),
+            }
+        };
+        if !route_is_ours {
+            if crate::party_line::with_taxi_route(|r| r.is_some()) {
+                announce(
+                    &voice,
+                    Priority::Advisory,
+                    "That taxi clearance was from the old spot. Asking again from here.",
+                );
+                event("stale_taxi_route", json!({}));
+            }
             // Tune COM1 to the tower first — the request goes nowhere if we're
             // off frequency (the crew radio only reaches the tuned station).
             if let Some(khz) = crate::party_line::home_tower_khz() {
@@ -395,8 +530,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // The call queues behind our own intercom lines AND anyone the
             // tower is already working — the clock must outlast a worked
             // arrival. 25 s gave up ONE SECOND before a busy Jerez frequency
-            // came back with the clearance (16:45Z, 2026-07-24).
-            let got = wait_until(90.0, 1000, || async {
+            // came back with the clearance (16:45Z, 2026-07-24) — and 90 s
+            // then gave up ONE SECOND before a busy Stansted did the same
+            // thing (2026-07-29, the tower was working a Ryanair arrival and
+            // berating us for sitting on its runway). Whatever this number
+            // is, a queued frequency will someday beat it by a second; 180
+            // outlasts two worked arrivals.
+            let got = wait_until(180.0, 1000, || async {
                 crate::party_line::with_taxi_route(|r| r.is_some())
             })
             .await;
@@ -407,6 +547,83 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                     "no_taxi_clearance",
                 );
                 return;
+            }
+        }
+        bail_if_abort!();
+
+        // Off the stand FIRST, when the cleared route's way out runs behind
+        // us: at a nose-in gate the taxi drive's opening metres point into
+        // the terminal. Read from the route itself, so a tie-down we can taxi
+        // straight out of never calls a tug (see `pushback::plan`). Best
+        // effort by design — a field or airframe with no tug falls back to
+        // the taxi join's own turn-around, which is ugly on an apron but is
+        // exactly the behaviour that shipped before this stage existed. The
+        // push itself is narrated by the monitor's pushback watch, so the
+        // only crew line here is the ask.
+        {
+            let (lat_r, lon_r, psi_r) = tokio::join!(
+                xp.get_float(LAT),
+                xp.get_float(LON),
+                xp.get_float(crate::autotaxi::PSI_TRUE),
+            );
+            let path = crate::party_line::with_taxi_route(|r| r.map(|w| w.path.clone()))
+                .unwrap_or_default();
+            if let (Ok(lat), Ok(lon), Ok(psi)) = (lat_r, lon_r, psi_r) {
+                if let Some(plan) = crate::pushback::plan(lat, lon, psi, &path) {
+                    announce(
+                        &voice,
+                        Priority::Advisory,
+                        crate::readback::one_of(&[
+                            "We're nose in. Calling for pushback.",
+                            "Way out's behind us. Calling for a push.",
+                            "Nose in here, so pushback first.",
+                        ]),
+                    );
+                    event(
+                        "pushback",
+                        json!({ "back_m": plan.back_m, "target_hdg": plan.target_hdg }),
+                    );
+                    match crate::pushback::run(
+                        &xp,
+                        &ctx,
+                        &voice,
+                        &plan,
+                        &ABORT,
+                        tools.taxi.park_brake_valve_set,
+                    )
+                    .await
+                    {
+                        Ok(back_m) => event("pushback_done", json!({ "back_m": back_m })),
+                        Err(why) => {
+                            event("pushback_failed", json!({ "why": why }));
+                            // Say what actually happened. One line covered
+                            // every failure, so a tug that came, hooked on and
+                            // pushed us fifty metres was reported as "no tug
+                            // came" — the pilot watching it out the window has
+                            // no reason to trust anything else the copilot
+                            // says after that (2026-07-27). An abort is the
+                            // pilot's own and is already spoken for.
+                            let line = match why.as_str() {
+                                "abort" => "",
+                                "no_tug" => {
+                                    "No tug came, so I'll turn us around under our own steam. \
+                                     Watch the wingtips."
+                                }
+                                "tug_released" => {
+                                    "The tug let go early. I'll bring us round the rest of the \
+                                     way myself. Watch the wingtips."
+                                }
+                                _ => {
+                                    "That's as far as the push got. I'll bring us round the rest \
+                                     of the way myself. Watch the wingtips."
+                                }
+                            };
+                            if !line.is_empty() {
+                                announce(&voice, Priority::Advisory, line);
+                            }
+                        }
+                    }
+                }
             }
         }
         bail_if_abort!();
@@ -425,12 +642,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             Ok(reply) => announce(&voice, Priority::Advisory, &reply),
             Err(_) => {}
         }
-        // Wait for the drive to finish (it clears ACTIVE at the holding point).
-        if crate::autotaxi::ACTIVE.load(SeqCst)
-            && !wait_until(600.0, 1000, || async {
-                !crate::autotaxi::ACTIVE.load(SeqCst)
-            })
-            .await
+        // Wait for the drive to finish. `driving()`, not ACTIVE: a backtrack
+        // drops ACTIVE in the gap between its two legs, and polling the bare
+        // flag reads that gap as "finished".
+        if crate::autotaxi::driving()
+            && !wait_until(600.0, 1000, || async { !crate::autotaxi::driving() }).await
         {
             give_up(
                 &voice,
@@ -540,11 +756,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // A full-length backtrack is a long, slow drive (LXGB's 09 backtrack
             // is ~1 km) — the 120 s that fit a plain line-up timed out mid-taxi
             // (2026-07-26). Give it the taxi's budget.
-            if crate::autotaxi::ACTIVE.load(SeqCst)
-                && !wait_until(600.0, 1000, || async {
-                    !crate::autotaxi::ACTIVE.load(SeqCst)
-                })
-                .await
+            // `driving()` covers the gap between a backtrack's two legs —
+            // ACTIVE alone drops there, and full auto called a running line-up
+            // a failure one second after leg two engaged (2026-07-28).
+            if crate::autotaxi::driving()
+                && !wait_until(600.0, 1000, || async { !crate::autotaxi::driving() }).await
             {
                 give_up(
                     &voice,
@@ -888,6 +1104,7 @@ async fn fly_route(
                 voice.clone(),
                 tools.taxi.park_brake_valve_set,
                 tools.taxi.prop.clone(),
+                tools.taxi.pace,
             );
         }
     }

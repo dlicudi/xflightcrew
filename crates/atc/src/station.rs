@@ -649,6 +649,7 @@ impl Station {
                 runway_ident: self.runway_in_use.clone().unwrap_or_default(),
                 clear_since: None,
                 armed_at: Instant::now(),
+                logged_at: Instant::now(),
                 // A hold issued FROM the runway is already sequenced: the
                 // conditional/plain line-up put us there, so the watch owes a
                 // release, not another line-up.
@@ -3328,6 +3329,8 @@ pub struct TakeoffHold {
     /// busy field's departure stream can't extend it forever (see
     /// [`takeoff_hold_tick`]).
     armed_at: Instant,
+    /// When the "still held" diagnostic last went out.
+    logged_at: Instant,
     /// Whether the watch has already sequenced this departure onto the
     /// runway with a line-up-and-wait. One shot: the aircraft can only take
     /// the runway once.
@@ -3343,6 +3346,26 @@ const RUNWAY_SWAP_MARGIN_KTS: f64 = 3.0;
 /// an arrival crossing the fence vanishes from the airborne band while still
 /// rolling out, and "cleared for takeoff" over a lander is a contradiction.
 const HOLD_CLEAR_SECS: f64 = 15.0;
+
+/// How far out the nearest arrival may be and still have a departure released
+/// ahead of it.
+///
+/// A real tower THREADS departures into the arrival stream; it does not wait
+/// for an empty four-mile final, because at a single-runway field working a
+/// landing every couple of minutes that final is never empty. Requiring
+/// [`final_traffic_for`]'s whole 4 nm corridor to be clear made the release
+/// unreachable at Gatwick: held at holding point Mike for runway 26L with an
+/// arrival at half a mile, then eight minutes of stream behind it, and full
+/// auto handed the aircraft back (2026-07-27). Three miles is about eighty
+/// seconds at approach speed — a light twin is airborne and turning out well
+/// inside that, which is the gap controllers actually use. The runway itself
+/// being clear is a SEPARATE and absolute condition below.
+const DEPART_GAP_NM: f64 = 3.0;
+
+/// While a departure is held, log what is holding it at this cadence. "Held
+/// for traffic" is undiagnosable after the fact otherwise — the Heathrow hold
+/// had to be reconstructed by probing the live sim (2026-07-27).
+const HOLD_LOG_SECS: f64 = 15.0;
 
 /// One pass of the held-clearance watch: with OUR runway's final clear (no
 /// arrival in its corridor, no ghost on the strip — a parallel runway's
@@ -3370,22 +3393,29 @@ pub fn takeoff_hold_tick(
         let runways = ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner());
         strip(&runways, &hold.runway_ident).cloned()
     };
+    // The two conditions are DIFFERENT in kind, and conflating them is what
+    // made the release unreachable under injected traffic: the runway being
+    // occupied is absolute, while an arrival on final is a question of GAP.
+    let inbound = rwy
+        .as_ref()
+        .and_then(|r| final_traffic_for(targets, r, field_elev_ft));
+    let on_strip = match &rwy {
+        Some(r) => targets
+            .iter()
+            .any(|t| t.on_ground && on_runway(r, t.lat, t.lon).is_some()),
+        None => targets
+            .iter()
+            .any(|t| t.on_ground && on_active_runway(t.lat, t.lon).is_some()),
+    };
     let traffic = match &rwy {
-        Some(r) => {
-            final_traffic_for(targets, r, field_elev_ft).is_some()
-                || targets
-                    .iter()
-                    .any(|t| t.on_ground && on_runway(r, t.lat, t.lon).is_some())
-        }
+        Some(_) => on_strip || inbound.as_ref().is_some_and(|f| f.nm < DEPART_GAP_NM),
         // No geometry for the held runway: fall back to the blunt any-runway
         // checks rather than clearing blind.
         None => {
-            targets
-                .iter()
-                .any(|t| !t.on_ground && (30.0..1500.0).contains(&(t.ele_ft - field_elev_ft)))
+            on_strip
                 || targets
                     .iter()
-                    .any(|t| t.on_ground && on_active_runway(t.lat, t.lon).is_some())
+                    .any(|t| !t.on_ground && (30.0..1500.0).contains(&(t.ele_ft - field_elev_ft)))
         }
     };
     // The wake clock blocks the release exactly like traffic does: a held
@@ -3403,16 +3433,50 @@ pub fn takeoff_hold_tick(
         && wake_remaining(&hold.runway_ident, now).is_some();
     if traffic || wake {
         hold.clear_since = None;
-        // The strip is clear and only the wake clock is running: sequence the
-        // departure ONTO the runway instead of leaving it at the taxiway
-        // while the queue rolls past. Line-up-and-wait is what a real tower
-        // gives here, and it is what makes the release meaningful — an
-        // aircraft still behind the hold line is not next for anything. Never
-        // onto an OCCUPIED runway, which is why this sits under `!traffic`.
-        if wake && !traffic && !hold.lined_up {
+        // What is holding us, at a cadence — a held departure that says
+        // nothing for eight minutes can only be diagnosed by probing the
+        // live sim, which is how the Heathrow hold had to be found.
+        if hold.logged_at.elapsed().as_secs_f64() >= HOLD_LOG_SECS {
+            hold.logged_at = now;
+            tracing::info!(
+                runway = %hold.runway_ident,
+                final_nm = ?inbound.as_ref().map(|f| (f.nm * 10.0).round() / 10.0),
+                arrivals = inbound.as_ref().map(|f| f.count).unwrap_or(0),
+                on_strip,
+                wake,
+                lined_up = hold.lined_up,
+                "departure still held"
+            );
+        }
+        // The strip is clear and the blocker is only a CLOCK or a gap that
+        // hasn't opened yet: sequence the departure ONTO the runway instead
+        // of leaving it at the taxiway while the stream rolls past. Line up
+        // and wait is what a real tower gives here, and it is what makes the
+        // release meaningful — an aircraft still behind the hold line is not
+        // next for anything. Never onto an OCCUPIED runway, which is why
+        // every branch sits under `!on_strip`.
+        //
+        // Behind an ARRIVAL the same rule the tower's own conditional uses
+        // applies: one aircraft, far enough out (`CONDITIONAL_MIN_NM`). A
+        // lander at half a mile earns the hold, not the pavement.
+        let staging = if !hold.lined_up && !on_strip {
+            if wake {
+                Some("wake turbulence, departing traffic ahead of you")
+            } else if inbound
+                .as_ref()
+                .is_some_and(|f| f.count <= 1 && f.nm >= tower::CONDITIONAL_MIN_NM)
+            {
+                Some("landing traffic ahead of you")
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(reason) = staging {
             hold.lined_up = true;
             let line = format!(
-                "{}, line up and wait runway {}, wake turbulence, departing traffic ahead of you.",
+                "{}, line up and wait runway {}, {reason}.",
                 hold.callsign, hold.runway
             );
             if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -5825,6 +5889,7 @@ mod tests {
             runway_ident: "09".into(),
             clear_since: None,
             armed_at: Instant::now(),
+            logged_at: Instant::now(),
             lined_up: false,
         });
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
@@ -5871,8 +5936,22 @@ mod tests {
         };
         let t0 = Instant::now();
         let sec = std::time::Duration::from_secs;
-        // Traffic on OUR final: nothing, and the clear-timer resets.
-        assert!(takeoff_hold_tick(std::slice::from_ref(&ours), elev, true, t0).is_none());
+        // Traffic on OUR final inside the departure gap: no release. The
+        // strip itself is clear and the lander is far enough out, so the
+        // tower STAGES us instead of parking us behind the line — once.
+        let staged = takeoff_hold_tick(std::slice::from_ref(&ours), elev, true, t0)
+            .expect("line up and wait");
+        assert!(
+            staged.contains("line up and wait runway zero niner"),
+            "{staged}"
+        );
+        assert!(staged.contains("landing traffic"), "{staged}");
+        assert!(*PENDING_LINE_UP.lock().unwrap());
+        *PENDING_LINE_UP.lock().unwrap() = false;
+        assert!(
+            takeoff_hold_tick(std::slice::from_ref(&ours), elev, true, t0).is_none(),
+            "one shot: the aircraft can only take the runway once"
+        );
         // Only the PARALLEL runway's arrival: not our traffic — the timer
         // runs (the runway-blind check held a Heathrow 09R departure forever).
         assert!(
@@ -5913,6 +5992,7 @@ mod tests {
             runway_ident: "09".into(),
             clear_since: Some(t0),
             armed_at: t0,
+            logged_at: t0,
             lined_up: false,
         });
         assert!(takeoff_hold_tick(&[], elev, false, t0 + sec(120)).is_none());
@@ -5927,6 +6007,145 @@ mod tests {
         assert!(!*PENDING_TAKEOFF_CLEARANCE.lock().unwrap());
 
         *CLEARANCE.lock().unwrap() = None;
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
+        *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
+    }
+
+    /// Gatwick 26L, 2026-07-27, with injected traffic: held at holding point
+    /// Mike behind an arrival at half a mile, and the release never came —
+    /// eight minutes, then a hand-back. Every plane landed except ours. A
+    /// single-runway field working a landing every couple of minutes NEVER
+    /// has an empty four-mile final, so requiring the whole corridor to be
+    /// clear made the release unreachable; a real tower threads the departure
+    /// into the gap instead. The runway itself stays absolute.
+    #[test]
+    fn a_busy_arrival_stream_still_gets_a_departure_away() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let t0 = Instant::now();
+        let sec = std::time::Duration::from_secs;
+        let elev = 202.0;
+        *WAKE.lock().unwrap() = None;
+        // Gatwick's main strip.
+        *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
+            width_m: 45.0,
+            ident_a: "08R".into(),
+            ident_b: "26L".into(),
+            lat_a: 51.1512,
+            lon_a: -0.1997,
+            lat_b: 51.1560,
+            lon_b: -0.1424,
+        }];
+        *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
+            state: tower::State::TaxiCleared,
+            callsign: "November two four four Kilo Romeo".into(),
+            runway_ident: "26L".into(),
+            pending_readback: None,
+        });
+        *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
+        *PENDING_LINE_UP.lock().unwrap() = false;
+        *TAKEOFF_HOLD.lock().unwrap() = Some(TakeoffHold {
+            callsign: "November two four four Kilo Romeo".into(),
+            runway: "two six left".into(),
+            runway_ident: "26L".into(),
+            clear_since: None,
+            armed_at: t0,
+            logged_at: t0,
+            lined_up: false,
+        });
+        // An arrival on the 26L final: `nm` beyond the 26L threshold along the
+        // extended centreline (landing westbound, so the approach lies east of
+        // the field), on a 3-degree slope.
+        let m_lon = 111_320.0 * 51.154_f64.to_radians().cos();
+        let (ux, uy) = {
+            let (dx, dy) = ((-0.1424 + 0.1997) * m_lon, (51.1560 - 51.1512) * 111_320.0);
+            let len = (dx * dx + dy * dy).sqrt();
+            (dx / len, dy / len)
+        };
+        let arrival = |nm: f64| TcasTarget {
+            callsign: "EZY83".into(),
+            lat: 51.1560 + nm * 1852.0 * uy / 111_320.0,
+            lon: -0.1424 + nm * 1852.0 * ux / m_lon,
+            ele_ft: elev + 300.0 * nm,
+            on_ground: false,
+            vs_fpm: -700.0,
+        };
+        // Half a mile out: too close to stage, too close to release. This is
+        // exactly where the live hold began.
+        assert!(takeoff_hold_tick(std::slice::from_ref(&arrival(0.5)), elev, true, t0).is_none());
+        assert!(
+            !*PENDING_LINE_UP.lock().unwrap(),
+            "never onto the runway under a lander"
+        );
+
+        // Two miles out, the strip momentarily clear: too close to depart
+        // ahead of, far enough to STAGE. The tower puts us on the pavement
+        // rather than parking us behind the line for a stream that never ends.
+        let line = takeoff_hold_tick(
+            std::slice::from_ref(&arrival(2.0)),
+            elev,
+            true,
+            t0 + sec(60),
+        )
+        .expect("line up and wait");
+        assert!(
+            line.contains("line up and wait runway two six left"),
+            "{line}"
+        );
+        assert!(line.contains("landing traffic"), "{line}");
+        assert!(*PENDING_LINE_UP.lock().unwrap());
+        assert!(
+            takeoff_hold_tick(
+                std::slice::from_ref(&arrival(1.8)),
+                elev,
+                true,
+                t0 + sec(70)
+            )
+            .is_none(),
+            "one shot: the aircraft can only take the runway once"
+        );
+        // ...and while it rolls out ON our strip, no release at all.
+        let rollout = TcasTarget {
+            callsign: "EZY83".into(),
+            lat: 51.1540,
+            lon: -0.1700,
+            ele_ft: elev,
+            on_ground: true,
+            vs_fpm: 0.0,
+        };
+        assert!(
+            takeoff_hold_tick(std::slice::from_ref(&rollout), elev, true, t0 + sec(120)).is_none()
+        );
+
+        // Vacated, with the next arrival 3.5 nm out and closing: THIS is the
+        // gap a real tower departs into. Under the old all-or-nothing gate
+        // that aircraft was still "traffic on final" — inside the 4 nm
+        // corridor — and the departure sat here until it gave up.
+        assert!(
+            takeoff_hold_tick(
+                std::slice::from_ref(&arrival(3.5)),
+                elev,
+                true,
+                t0 + sec(130)
+            )
+            .is_none(),
+            "the clear window has to stabilise first"
+        );
+        let line = takeoff_hold_tick(
+            std::slice::from_ref(&arrival(3.2)),
+            elev,
+            true,
+            t0 + sec(146),
+        )
+        .expect("release");
+        assert!(line.contains("traffic clear"), "{line}");
+        assert!(
+            line.contains("Runway two six left, cleared for takeoff"),
+            "{line}"
+        );
+        assert!(*PENDING_TAKEOFF_CLEARANCE.lock().unwrap());
+
+        *CLEARANCE.lock().unwrap() = None;
+        *PENDING_LINE_UP.lock().unwrap() = false;
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
     }
@@ -5967,6 +6186,7 @@ mod tests {
             runway_ident: "27L".into(),
             clear_since: None,
             armed_at: t0,
+            logged_at: t0,
             lined_up: false,
         });
         // A heavy just rotated off our strip.

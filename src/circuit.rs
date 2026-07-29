@@ -53,7 +53,13 @@ const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
 const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
 const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
-const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
+/// The thrust lever THIS airframe obeys — not always the stock one (the
+/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
+/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
+/// thrust). Resolved per call, so a profile swap takes effect immediately.
+fn throttle_dref() -> String {
+    crate::aircraft::throttle_dataref()
+}
 
 const M_TO_FT: f64 = 3.280_84;
 const M_PER_NM: f64 = 1852.0;
@@ -120,9 +126,98 @@ impl Geometry {
     }
 }
 
-/// Height above the field to hand to autoland on base, feet — low enough that
-/// autoland intercepts a sane final, high enough to have turned final safely.
+/// Floor for the base/final descent, feet above the field — the lowest the
+/// pattern will put the aircraft before autoland takes it. It is a FLOOR now,
+/// not a target: the leg descends the 3° path and stops here (see the vertical
+/// law). Flown as a flat target it delivered a jet to the handoff 520 ft BELOW
+/// the path it was then expected to fly down (Luton, 2026-07-28).
 const HANDOFF_AGL_FT: f64 = 700.0;
+/// How far above the approach speed the base and final legs are flown. Enough
+/// margin to stay comfortably clean-configured, close enough that autoland has
+/// only the last few knots to take off with flaps.
+const APPROACH_LEG_MARGIN_KTS: f64 = 20.0;
+/// Ceiling on the pattern speed, as a multiple of the approach speed.
+const PATTERN_MAX_APPROACH_MULT: f64 = 1.5;
+/// Altitude-capture gain: commanded fpm per foot of error.
+const ALT_GAIN_FPM_PER_FT: f64 = 3.0;
+/// ...and how far AHEAD the capture looks, seconds. A vertical speed does not
+/// stop when the command does: an airliner rolling out of a 700 fpm climb
+/// carries on for the best part of ten seconds. Pure proportional control on
+/// altitude therefore commanded a climb right up to the target, sailed 100 ft
+/// through it, commanded a descent, sailed back — the MD-82 hunted ±60 ft
+/// around pattern altitude for the whole downwind with a period near forty
+/// seconds (Luton, 2026-07-28). Feeding the CURRENT vertical speed forward
+/// levels the aircraft where it will actually arrive.
+const ALT_LEAD_S: f64 = 8.0;
+
+/// The commanded vertical speed for an altitude capture: proportional on the
+/// error, led by where the current vertical speed is taking us.
+pub fn alt_capture_vs(target_ft: f64, alt_ft: f64, vs_fpm: f64) -> f64 {
+    let projected = alt_ft + vs_fpm / 60.0 * ALT_LEAD_S;
+    ((target_ft - projected) * ALT_GAIN_FPM_PER_FT).clamp(-500.0, 700.0)
+}
+
+/// The altitude the base/final legs fly to, ft MSL: the 3° path at the
+/// aircraft's TRACK distance from the threshold, bounded below by the handoff
+/// floor and above by the pattern altitude.
+///
+/// Track distance (along the axis plus across it, the L the aircraft will
+/// actually fly) rather than straight-line: on a wide base the two disagree
+/// badly. A jet swinging round a 2.5 km turn radius is still moving AWAY down
+/// the runway axis faster than it closes laterally, so the straight-line
+/// distance GROWS through the first half of the turn — and a path computed
+/// from it grows with it. Flown live that lifted the target 170 ft mid-base,
+/// the commanded descent collapsed from 500 fpm to 145, and the aircraft
+/// levelled off and sat there until the geometry came back round
+/// (2026-07-28). Track miles are also simply the right measure: they are what
+/// a 3° profile is flown against.
+///
+/// The pattern exists to deliver the aircraft to autoland, and autoland flies
+/// that path from the handoff — so the base leg should arrive ON it. A flat
+/// target made the handover height depend only on how wide the pattern was: the
+/// 172 lands near the path by luck of its small one, while the MD-82's reaches
+/// the centreline around 4 nm, where the path is 1,340 ft up and the old 700 ft
+/// target left 520 ft to make up. That became a dive, twelve knots of extra
+/// speed, and an overflight go-around (Luton, 2026-07-28).
+///
+/// Bounded above by the pattern altitude, so this can only ever DELAY a
+/// descent, never command a climb on base.
+pub fn approach_leg_alt_ft(field_elev_ft: f64, tpa_msl_ft: f64, a_m: f64, x_m: f64) -> f64 {
+    let dist_nm = (a_m.abs() + x_m.abs()) / M_PER_NM;
+    let floor = field_elev_ft + HANDOFF_AGL_FT;
+    (field_elev_ft + dist_nm * crate::autoland::GLIDEPATH_FT_PER_NM)
+        .clamp(floor, tpa_msl_ft.max(floor))
+}
+
+/// The speed the pattern legs are flown at: the airframe's climb speed, but
+/// never more than [`PATTERN_MAX_APPROACH_MULT`] times its approach speed.
+///
+/// Vy is not a pattern speed on a jet. The Citation X's published best-rate
+/// figure is 300 KIAS — a cruise-climb number — and flown as a circuit speed it
+/// would ask for a turn radius of about ten kilometres from geometry that
+/// clamps at 2.5. The MD-82's 200 kt was the same mistake in a milder form.
+/// A pattern at 1.5x the approach speed is what these aircraft actually fly,
+/// and for every GA profile Vy already sits below that, so nothing changes.
+pub fn pattern_speed_kts(vy_kts: f64, approach_ias: f64) -> f64 {
+    vy_kts
+        .max(60.0)
+        .min((approach_ias * PATTERN_MAX_APPROACH_MULT).max(60.0))
+}
+
+/// The speed the base and final legs are flown at. Vy is a CLIMB speed: an
+/// MD-82 arrived on base at 226 KIAS against a 140 kt approach speed and handed
+/// autoland an aircraft it could not slow down in the mile that was left
+/// (Luton, 2026-07-28). Slow toward the approach speed, but never below a
+/// margin over it — the circuit flies clean, and a jet at its flapped approach
+/// speed with the flaps still up is not slow, it is near the stall. And never
+/// FASTER than the pattern speed, so a GA airframe (whose Vy already sits below
+/// approach + margin) keeps exactly what it flew before.
+pub fn approach_leg_kts(pattern_kts: f64, approach_ias: f64) -> f64 {
+    pattern_kts
+        .min(approach_ias + APPROACH_LEG_MARGIN_KTS)
+        .max(approach_ias)
+}
+
 /// An airborne AGL below this after the takeoff loop exits means it REJECTED
 /// (never flew) — the circuit is off, not into the pattern.
 const AIRBORNE_MIN_AGL_FT: f64 = 300.0;
@@ -592,6 +687,7 @@ async fn fly_authored_route(
         if crate::xplane::sim_frozen(&xp).await {
             continue;
         }
+        let thr_dref = throttle_dref();
         let (lat_r, lon_r, elev_r, psi_r, hp_r, hdg_st, vs_st, ias_r, thr_r) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
@@ -601,7 +697,7 @@ async fn fly_authored_route(
             xp.get_float(HDG_STATUS),
             xp.get_float(VS_STATUS),
             xp.get_float(IAS),
-            xp.get_float(THROTTLE_ALL),
+            xp.get_float(&thr_dref),
         );
         let (Ok(lat), Ok(lon)) = (lat_r, lon_r) else {
             continue;
@@ -654,7 +750,7 @@ async fn fly_authored_route(
             let delta = crate::tools::speedhold::throttle_adjust(pattern_kts - ias, ias_trend);
             if delta != 0.0 {
                 let _ = xp
-                    .set_float(THROTTLE_ALL, (thr + delta).clamp(0.0, 1.0))
+                    .set_float(&throttle_dref(), (thr + delta).clamp(0.0, 1.0))
                     .await;
             }
         }
@@ -781,7 +877,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // radius matches the geometry above — a pattern flown at climb power runs
     // away to Vne and balloons ~3x wider (LXGB, 2026-07-26). Captured here,
     // before `p.takeoff` is moved into the takeoff loop.
-    let pattern_kts = p.takeoff.vy_kts.max(60.0);
+    let pattern_kts = pattern_speed_kts(p.takeoff.vy_kts, p.approach_ias);
+    // ...and the speed the approach-setup legs are flown at.
+    let approach_kts = approach_leg_kts(pattern_kts, p.approach_ias);
 
     // The world under BOTH candidate patterns: terrain probed from the sim
     // itself, and the no-go airspace polygons the G1000 draws (OpenAir file).
@@ -1033,6 +1131,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // leading on the airspeed trend EMA'd tick to tick (the flight law's input).
     let mut prev_ias: Option<(f64, std::time::Instant)> = None;
     let mut ias_trend = 0.0_f64;
+    // Vertical speed, derived the same way, for the altitude capture's lead.
+    let mut prev_alt: Option<(f64, std::time::Instant)> = None;
+    let mut vs_est = 0.0_f64;
+    // The ratcheted base/final descent target — see the vertical law below.
+    let mut descent_target: Option<f64> = None;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1059,7 +1162,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             xp.get_float(HDG_STATUS),
             xp.get_float(VS_STATUS),
         );
-        let (ias_r, thr_r) = tokio::join!(xp.get_float(IAS), xp.get_float(THROTTLE_ALL));
+        let thr_dref = throttle_dref();
+        let (ias_r, thr_r) = tokio::join!(xp.get_float(IAS), xp.get_float(&thr_dref));
         let (Ok(lat), Ok(lon)) = (lat, lon) else {
             continue;
         };
@@ -1124,8 +1228,21 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // (engage syncs it away — the takeoff's lesson).
         guard_floor_ft = guard_floor_ft.filter(|(_, t)| t.elapsed().as_secs() < 60);
         let leg_target = match leg {
-            Leg::Base | Leg::Final => field_elev_ft + HANDOFF_AGL_FT,
-            _ => tpa_msl_ft,
+            // Base and final descend the 3° PATH, not to a flat height.
+            Leg::Base | Leg::Final => {
+                // ...and RATCHETED: an approach descends. Whatever the
+                // geometry does mid-turn, the target may fall and hold, never
+                // climb back — a target that rises is a level-off with the
+                // runway ahead, and the aircraft chases it every time.
+                let want = approach_leg_alt_ft(field_elev_ft, tpa_msl_ft, a_m, x_m);
+                let t = descent_target.map_or(want, |d: f64| d.min(want));
+                descent_target = Some(t);
+                t
+            }
+            _ => {
+                descent_target = None;
+                tpa_msl_ft
+            }
         };
         // The guard floor never applies on base/final: descending toward the
         // runway is the POINT there, and autoland brings its own terrain
@@ -1137,8 +1254,20 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         } else {
             guard_floor_ft.map_or(leg_target, |(f, _)| leg_target.max(f))
         };
+        // Vertical speed, derived from successive altitude reads (the same
+        // trick the speed law uses on IAS) — the lead term the capture needs.
+        if alt_msl_ft.is_finite() {
+            let t_now = std::time::Instant::now();
+            if let Some((prev, t_prev)) = prev_alt {
+                let dt = t_now.duration_since(t_prev).as_secs_f64();
+                if (0.1..=2.0).contains(&dt) {
+                    vs_est = 0.6 * vs_est + 0.4 * (alt_msl_ft - prev) / dt * 60.0;
+                }
+            }
+            prev_alt = Some((alt_msl_ft, t_now));
+        }
         let vs_cmd = if alt_msl_ft.is_finite() {
-            ((target_alt - alt_msl_ft) * 3.0).clamp(-500.0, 700.0)
+            alt_capture_vs(target_alt, alt_msl_ft, vs_est)
         } else {
             0.0
         };
@@ -1168,10 +1297,16 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 }
             }
             prev_ias = Some((ias, t_now));
-            let delta = crate::tools::speedhold::throttle_adjust(pattern_kts - ias, ias_trend);
+            // Base and final fly the approach-setup speed; the rest of the
+            // pattern flies Vy (which is also what the geometry was sized on).
+            let want_kts = match leg {
+                Leg::Base | Leg::Final => approach_kts,
+                _ => pattern_kts,
+            };
+            let delta = crate::tools::speedhold::throttle_adjust(want_kts - ias, ias_trend);
             if delta != 0.0 {
                 let _ = xp
-                    .set_float(THROTTLE_ALL, (thr + delta).clamp(0.0, 1.0))
+                    .set_float(&throttle_dref(), (thr + delta).clamp(0.0, 1.0))
                     .await;
             }
         }
@@ -1364,6 +1499,115 @@ async fn try_published_arrival(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The base leg hands autoland an aircraft ON the path it is about to fly,
+    /// whatever size the pattern is. Luton 2026-07-28: a flat 700 ft target put
+    /// the MD-82 at the handover 520 ft below a path it then had one mile to
+    /// catch, and it did not.
+    #[test]
+    fn the_base_leg_descends_the_path_not_to_a_flat_height() {
+        let (elev, tpa) = (520.0, 520.0 + 1500.0);
+        // 4 nm out on the centreline: the 3° path is ~1,272 ft above the field.
+        let far = approach_leg_alt_ft(elev, tpa, -4.0 * M_PER_NM, 0.0);
+        assert!(
+            (far - (elev + 4.0 * crate::autoland::GLIDEPATH_FT_PER_NM)).abs() < 1.0,
+            "should target the path, got {far}"
+        );
+        // Closer in, the path is lower — and the leg follows it down.
+        let near = approach_leg_alt_ft(elev, tpa, -2.5 * M_PER_NM, 0.0);
+        assert!(near < far, "{near} !< {far}");
+        // Never below the handoff floor, however short the final.
+        assert_eq!(
+            approach_leg_alt_ft(elev, tpa, -0.2 * M_PER_NM, 0.0),
+            elev + HANDOFF_AGL_FT
+        );
+        // ...and never a CLIMB: far out, where the path is above the pattern
+        // altitude, the leg simply holds what it has (the GA case — a 172's
+        // 1,000 ft circuit is below the path at 4 nm).
+        let ga_tpa = elev + 1000.0;
+        assert_eq!(
+            approach_leg_alt_ft(elev, ga_tpa, -4.0 * M_PER_NM, 0.0),
+            ga_tpa,
+            "hold the pattern altitude, never climb on base"
+        );
+    }
+
+    /// The target follows TRACK miles, not straight-line distance. On a wide
+    /// base the aircraft is still moving away down the runway axis faster than
+    /// it closes laterally, so the straight-line distance grows through the
+    /// first half of the turn — and a path computed from it lifts the target
+    /// 170 ft, levels the aircraft off with the runway ahead, and waits
+    /// (2026-07-28).
+    #[test]
+    fn the_base_target_follows_track_miles_not_the_straight_line() {
+        let (elev, tpa) = (520.0, 520.0 + 1500.0);
+        // The live geometry, four seconds apart, mid-base turn: straight-line
+        // distance GREW (3.93 → 4.09 nm) while track miles grew far less
+        // steeply — and the ratchet in the loop stops even that from lifting
+        // the target. Here the point is simply that the two measures differ.
+        let straight = |a: f64, x: f64| (a * a + x * x).sqrt() / M_PER_NM;
+        let (a1, x1) = (-4307.0, -5866.0);
+        let (a2, x2) = (-4811.0, -5845.0);
+        assert!(straight(a2, x2) > straight(a1, x1), "straight-line grows");
+        // Track miles put the aircraft much further out than the straight
+        // line does, so the commanded path is higher and the leg holds
+        // pattern altitude instead of diving early.
+        assert_eq!(
+            approach_leg_alt_ft(elev, tpa, a1, x1),
+            tpa,
+            "still 5.5 track miles out: hold the pattern altitude"
+        );
+        // Once it is genuinely close in, the target is the path again.
+        let close = approach_leg_alt_ft(elev, tpa, -2.0 * M_PER_NM, 0.0);
+        assert!(close < tpa && close > elev, "{close}");
+    }
+
+    /// Base and final are flown at an approach-setup speed, not the climb speed
+    /// the rest of the pattern uses — but only ever SLOWER than the pattern.
+    #[test]
+    fn the_approach_legs_slow_toward_the_approach_speed() {
+        // Jet: Vy 200, approach 140 → 160, comfortably clean, close enough for
+        // autoland to take the last 20 kt off with flaps.
+        assert_eq!(approach_leg_kts(200.0, 140.0), 160.0);
+        // Trainer: Vy 74 is already below approach + margin, so nothing
+        // changes — this must never speed a light aircraft UP on base.
+        assert_eq!(approach_leg_kts(74.0, 65.0), 74.0);
+        // A slow pattern speed is still never taken below the approach speed.
+        assert_eq!(approach_leg_kts(60.0, 65.0), 65.0);
+    }
+
+    /// The altitude capture leads on vertical speed, because a vertical speed
+    /// does not stop when the command does. Luton 2026-07-28: pure proportional
+    /// control climbed at 700 fpm right up to pattern altitude, sailed 100 ft
+    /// through it, and hunted ±60 ft for the whole downwind.
+    #[test]
+    fn the_altitude_capture_levels_where_the_aircraft_will_arrive() {
+        // Well below, stationary in the vertical: climb at the clamp.
+        assert_eq!(alt_capture_vs(2000.0, 1000.0, 0.0), 700.0);
+        // Same error, but already climbing hard: the command backs off,
+        // because most of that gap will be eaten before the aircraft responds.
+        let climbing = alt_capture_vs(2000.0, 1900.0, 700.0);
+        let level = alt_capture_vs(2000.0, 1900.0, 0.0);
+        assert!(climbing < level, "{climbing} !< {level}");
+        // Arriving at the target with rate on: command a descent to stop the
+        // overshoot BEFORE it happens, which is the whole point.
+        assert!(
+            alt_capture_vs(2000.0, 2000.0, 700.0) < 0.0,
+            "must arrest an overshoot in progress"
+        );
+        // On target and steady: hands off.
+        assert_eq!(alt_capture_vs(2000.0, 2000.0, 0.0), 0.0);
+    }
+
+    /// A jet flies a jet's circuit: 1,500 ft, because its wider pattern turns
+    /// final where a 3° path is well above a trainer's 1,000 ft.
+    #[test]
+    fn the_pattern_altitude_follows_the_airframe() {
+        use crate::tools::circuit::pattern_alt_agl_ft;
+        assert_eq!(pattern_alt_agl_ft(65.0), 1000.0, "trainer");
+        assert_eq!(pattern_alt_agl_ft(90.0), 1000.0, "fast single");
+        assert_eq!(pattern_alt_agl_ft(140.0), 1500.0, "jet");
+    }
 
     #[test]
     fn left_pattern_turns_ninety_degrees_left_each_leg() {

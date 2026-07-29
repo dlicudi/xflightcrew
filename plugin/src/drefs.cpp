@@ -106,6 +106,15 @@ static XPLMDataRef g_opt_cabin_dref = nullptr;
 static int ReadOptCabin(void*) { return g_opt_cabin; }
 static void WriteOptCabin(void*, int v) { g_opt_cabin = v; }
 
+// UI scale (100% / 125% / 150%, index 0/1/2). Same publish/pick protocol as
+// the mode: the app publishes the saved pref, the Settings radios write the
+// pilot's pick back, the app persists it. The panel applies whatever is here
+// each frame, so a pick takes effect immediately. -1 = untouched/wiped.
+static int g_opt_ui_scale = -1;
+static XPLMDataRef g_opt_ui_scale_dref = nullptr;
+static int ReadOptUiScale(void*) { return g_opt_ui_scale; }
+static void WriteOptUiScale(void*, int v) { g_opt_ui_scale = v; }
+
 // Copilot voice picker. The app publishes the roster of piper models on disk
 // (newline-separated display names) into `voice_list` and the active voice's
 // index into `voice`; the Settings combo writes the pilot's pick back, the app
@@ -160,6 +169,10 @@ static TextRef g_atc = {{0}, 0};
 // refreshed continuously by the app. Empty = no station. Rendered twice:
 // the Calls tab's SAY NOW header, and the Log tab's pinned footer strip.
 static TextRef g_coach = {{0}, 0};
+// Automation feed — the Flight tab's live view of what the copilot is flying
+// (full auto stage, autoland phase, taxi governor...). Marker byte + one line
+// per active manager, primary first as "NAME|stage".
+static TextRef g_auto = {{0}, 0};
 
 static XPLMDataRef g_phase_dref = nullptr;
 static XPLMDataRef g_heard_dref = nullptr;
@@ -171,6 +184,7 @@ static XPLMDataRef g_callout_dref = nullptr;
 static XPLMDataRef g_radio_dref = nullptr;
 static XPLMDataRef g_atc_dref = nullptr;
 static XPLMDataRef g_coach_dref = nullptr;
+static XPLMDataRef g_auto_dref = nullptr;
 // COM1 active frequency (integer kHz despite the sim's `hz` name) — read for
 // the ATC tab's tuned highlight, written by its click-to-tune.
 static XPLMDataRef g_com1_dref = nullptr;
@@ -683,6 +697,22 @@ static void WriteCoach(void*, void* in, int offset, int len) {
         g_coach.len -= 2;
     }
 }
+// Automation feed — the coach's marker-byte scheme: byte 0 is '1' while
+// something the CANCEL button can stand down is running, '0' when idle,
+// stripped off here so the panel renders clean lines. Markerless text (an
+// older app) renders as-is and reads as idle.
+static bool g_auto_active = false;
+static void WriteAuto(void*, void* in, int offset, int len) {
+    StoreText(&g_auto, in, offset, len);
+    g_auto_active = false;
+    if (g_auto.len >= 1 && (g_auto.buf[0] == '0' || g_auto.buf[0] == '1')) {
+        g_auto_active = (g_auto.buf[0] == '1');
+        std::memmove(g_auto.buf, g_auto.buf + 1,
+                     static_cast<size_t>(g_auto.len - 1) + 1);
+        g_auto.len -= 1;
+    }
+}
+
 // Callout — stamp the arrival time; the toast shows for a short window after.
 // An optional "nx,ny|" prefix (fractions of the half-screen from centre) aims
 // the toast toward the control the camera glanced at.
@@ -818,6 +848,14 @@ void start() {
         "xcopilot/status/coach", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteCoach, &g_coach, &g_coach);
+    g_auto_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/auto", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteAuto, &g_auto, &g_auto);
+    g_opt_ui_scale_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/ui_scale", xplmType_Int, 1,
+        ReadOptUiScale, WriteOptUiScale, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     g_com1_dref = XPLMFindDataRef("sim/cockpit2/radios/actuators/com1_frequency_hz_833");
     g_taxi_brake_dref = XPLMRegisterDataAccessor(
         "xcopilot/taxi_brake", xplmType_Float, 1,
@@ -913,6 +951,8 @@ void stop_first() {
     if (g_roll_dref) { XPLMUnregisterDataAccessor(g_roll_dref); g_roll_dref = nullptr; }
     if (g_roll_yield_dref) { XPLMUnregisterDataAccessor(g_roll_yield_dref); g_roll_yield_dref = nullptr; }
     if (g_taxi_brake_dref) { XPLMUnregisterDataAccessor(g_taxi_brake_dref); g_taxi_brake_dref = nullptr; }
+    if (g_opt_ui_scale_dref) { XPLMUnregisterDataAccessor(g_opt_ui_scale_dref); g_opt_ui_scale_dref = nullptr; }
+    if (g_auto_dref) { XPLMUnregisterDataAccessor(g_auto_dref); g_auto_dref = nullptr; }
     if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }
     if (g_atc_dref) { XPLMUnregisterDataAccessor(g_atc_dref); g_atc_dref = nullptr; }
     if (g_radio_dref) { XPLMUnregisterDataAccessor(g_radio_dref); g_radio_dref = nullptr; }
@@ -956,6 +996,8 @@ const TextRef& radio_row() { return g_radio; }
 const TextRef& coach() { return g_coach; }
 bool coach_urgent() { return g_coach_urgent; }
 char coach_group() { return g_coach_group; }
+const TextRef& auto_status() { return g_auto; }
+bool auto_active() { return g_auto_active; }
 const std::vector<AtcField>& atc_fields() { return g_atc_fields; }
 
 int com1_khz() { return g_com1_dref ? XPLMGetDatai(g_com1_dref) : 0; }
@@ -976,6 +1018,8 @@ int opt_mode() { return g_opt_mode; }
 void set_opt_mode(int v) { g_opt_mode = v; }
 int opt_cabin() { return g_opt_cabin; }
 void set_opt_cabin(int v) { g_opt_cabin = v; }
+int opt_ui_scale() { return g_opt_ui_scale; }
+void set_opt_ui_scale(int v) { g_opt_ui_scale = v; }
 int opt_voice() { return g_opt_voice; }
 void set_opt_voice(int v) { g_opt_voice = v; }
 const char* voice_list() { return g_voice_list.buf; }

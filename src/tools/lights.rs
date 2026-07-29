@@ -115,6 +115,47 @@ impl Tool for SetLights {
         // v1 lookup 404s on the bracketed name, so split it (seen live: "switch
         // landing lights off" flipped the light, then the readback 404'd and the
         // whole tool reported failure).
+        // Toggle-only lights (the Citation X: every light is a toggle, and its
+        // datarefs are read-only over the API) — read each switch and fire only
+        // where it differs, then fall through to the readback below.
+        if !light.toggles.is_empty() {
+            for t in &light.toggles {
+                let (tb, ti) = split_index(&t.dataref);
+                let now_on = match ti {
+                    Some(i) => ctx
+                        .xplane
+                        .get_float_array(tb)
+                        .await
+                        .ok()
+                        .and_then(|v| v.get(i).copied())
+                        .unwrap_or(0.0),
+                    None => ctx.xplane.get_float(tb).await.unwrap_or(0.0),
+                } > 0.5;
+                if now_on != args.on {
+                    ctx.xplane.run_command(&t.command).await?;
+                }
+            }
+            let (rb, ri) = split_index(&light.dataref);
+            let actual_on = match ri {
+                Some(i) => ctx
+                    .xplane
+                    .get_float_array(rb)
+                    .await?
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0.0),
+                None => ctx.xplane.get_float(rb).await?,
+            } > 0.5;
+            return Ok(if actual_on == args.on {
+                format!(
+                    "Roger, {} {}.",
+                    light.spoken,
+                    if args.on { "on" } else { "off" }
+                )
+            } else {
+                format!("The {} didn't move.", light.spoken)
+            });
+        }
         let cmd = if args.on {
             light.command_on.as_deref()
         } else {
@@ -131,6 +172,21 @@ impl Tool for SetLights {
                 }
                 None => ctx.xplane.set_int(base, args.on as i64).await?,
             },
+        }
+        // One panel light can be two switches (the Citation X's landing lights
+        // are independent left and right). Drive the rest to the same state, or
+        // the aircraft flies half lit with a readback that confirms the half it
+        // happened to look at.
+        for extra in &light.also_datarefs {
+            let (ebase, eidx) = split_index(extra);
+            match eidx {
+                Some(i) => {
+                    ctx.xplane
+                        .set_int_array_elem(ebase, i, args.on as i64)
+                        .await?
+                }
+                None => ctx.xplane.set_int(ebase, args.on as i64).await?,
+            }
         }
         let actual_on = match idx {
             Some(i) => ctx

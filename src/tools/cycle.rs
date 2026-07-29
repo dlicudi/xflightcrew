@@ -21,7 +21,13 @@ use crate::aircraft::{
 };
 
 /// Universal throttle (all engines), 0..1.
-const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
+/// The thrust lever THIS airframe obeys — not always the stock one (the
+/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
+/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
+/// thrust). Resolved per call, so a profile swap takes effect immediately.
+fn throttle_dref() -> String {
+    crate::aircraft::throttle_dataref()
+}
 /// Per-engine "is running" flags.
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 /// N1 at which the condition lever introduces fuel during a PT6 start (POM: crank
@@ -39,6 +45,9 @@ const MIN_START_VOLTS: f64 = 12.0;
 const ONGROUND: &str = "sim/flightmodel/failures/onground_any";
 const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed"; // m/s
 const N1_PERCENT: &str = "sim/cockpit2/engine/indicators/N1_percent"; // per-engine, turbine spool
+/// Per-engine N2 — the high-pressure spool a TURBOFAN's start is flown
+/// against (see [`crate::aircraft::TurbineStartProfile::fuel_intro_n2`]).
+const N2_PERCENT: &str = "sim/cockpit2/engine/indicators/N2_percent";
 
 /// Drive a [`CycleSwitch`] to `target` by reading its position and firing
 /// `up`/`down`. Bounded by the detent span so a stuck switch can't loop forever.
@@ -449,7 +458,7 @@ impl Tool for StartEngines {
         let on_ground = ctx.xplane.get_float(ONGROUND).await.unwrap_or(1.0) > 0.5;
         if on_ground {
             ctx.xplane
-                .set_float(THROTTLE_ALL, self.start.throttle_crack)
+                .set_float(&throttle_dref(), self.start.throttle_crack)
                 .await?;
         }
         ctx.xplane.run_command(&self.start.mags_both).await?;
@@ -552,6 +561,80 @@ async fn n1_percent(ctx: &ToolCtx<'_>, idx: usize) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Bring the APU up and open its bleed, so the engines have something to be
+/// motored by. `Err` carries the line to speak when it doesn't come up.
+async fn start_apu(
+    ctx: &ToolCtx<'_>,
+    apu: &crate::aircraft::ApuStartProfile,
+) -> Result<(), String> {
+    let running = ctx.xplane.get_float(&apu.n1_dataref).await.unwrap_or(0.0);
+    if running < apu.ready_n1 {
+        // The master is a toggle on every airframe seen so far: read it, and
+        // fire only if it's actually off. Blind toggling switches OFF an APU
+        // that a previous attempt already started.
+        let master_on = ctx
+            .xplane
+            .get_float(&apu.master_readback)
+            .await
+            .unwrap_or(0.0)
+            > 0.5;
+        if !master_on {
+            let _ = ctx.xplane.run_command(&apu.master_toggle).await;
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+        // HOLD the starter until it lights. The switch is spring-loaded and the
+        // script arms the starter only past a second of hold, so a press — even
+        // a press repeated — buys a fraction of a second of cranking and the
+        // APU never catches. Re-armed on a cadence shorter than each hold, so
+        // the switch never springs back mid-start.
+        let mut lit = false;
+        for _ in 0..(apu.ready_secs / 1.5) as u32 {
+            for cmd in &apu.starter_commands {
+                let _ = ctx.xplane.run_command_for(cmd, 2.0).await;
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if ctx.xplane.get_float(&apu.n1_dataref).await.unwrap_or(0.0) >= apu.light_n1 {
+                lit = true;
+                break;
+            }
+        }
+        // Lit and self-sustaining: let the switch go and let it spool up.
+        let mut up = false;
+        if lit {
+            for _ in 0..(apu.ready_secs as u32) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if ctx.xplane.get_float(&apu.n1_dataref).await.unwrap_or(0.0) >= apu.ready_n1 {
+                    up = true;
+                    break;
+                }
+            }
+        }
+        if !up {
+            return Err(
+                "The APU didn't come up, so there's no bleed air to turn the engines. Your aircraft."
+                    .to_string(),
+            );
+        }
+    }
+    // Generator and bleed: the engines need the air, and the left starter needs
+    // the bus the APU generator powers.
+    for cmd in &apu.after_ready_commands {
+        let _ = ctx.xplane.run_command(cmd).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    Ok(())
+}
+
+async fn n2_percent(ctx: &ToolCtx<'_>, idx: usize) -> f64 {
+    ctx.xplane
+        .get_float_array(N2_PERCENT)
+        .await
+        .ok()
+        .and_then(|v| v.get(idx).copied())
+        .unwrap_or(0.0)
+}
+
 pub struct StartTurbines {
     start: TurbineStartProfile,
 }
@@ -605,6 +688,19 @@ impl Tool for StartTurbines {
             ));
         }
 
+        // A turbofan is motored by BLEED AIR: without the APU running and its
+        // bleed open, the starter command is accepted, the annunciator lights,
+        // ignition_key goes to 4 — and the engine does not turn at all. Proven
+        // live on the Citation X (2026-07-28): APU off, N2 flat at zero; APU
+        // generator and bleed on, the same command spooled N2 0 -> 30% in
+        // fifteen seconds. Its generator also powers the bus the left starter's
+        // own gate reads, which batteries alone leave dead.
+        if let Some(apu) = &self.start.apu {
+            if let Err(why) = start_apu(ctx, apu).await {
+                return Ok(why);
+            }
+        }
+
         let mut started = 0usize;
         for &i in &dead {
             // POM start items from the FUEL panel + checklist: this engine's boost
@@ -644,7 +740,16 @@ impl Tool for StartTurbines {
                         .await;
                 }
                 let n1 = n1_percent(ctx, i).await;
-                if !fuel_in && n1 >= FUEL_INTRO_N1 {
+                // Fuel goes in on the spool the AIRFRAME's own procedure uses:
+                // N2 on a turbofan, N1 on a free turbine. The Citation X cuts
+                // its own starter at 40% N2, which it reaches with N1 barely
+                // off the stop — waiting for 12% N1 there means the starter
+                // quits before fuel is ever introduced (2026-07-28).
+                let (spool, intro) = match self.start.fuel_intro_n2 {
+                    Some(n2) => (n2_percent(ctx, i).await, n2),
+                    None => (n1, FUEL_INTRO_N1),
+                };
+                if !fuel_in && spool >= intro {
                     ctx.xplane
                         .set_float_array_elem(
                             &self.start.condition_lever,
@@ -738,14 +843,82 @@ impl Tool for StopTurbines {
                 .set_float_array_elem(&self.start.condition_lever, i, 0.0)
                 .await?; // fuel cutoff
         }
+        // ...then the airframe's own securing control, where it has one. On the
+        // SF50 the ignition knob is what fires the sim's shutdown AND drops the
+        // boost pump and igniter; cutting the mixture alone leaves the knob at
+        // RUN with both still live, which is not a secured aircraft. Best
+        // effort: the cutoff above has already stopped the fuel, so a command
+        // that fails must not turn a successful shutdown into an error.
+        let secured = !self.start.shutdown_commands.is_empty();
+        for cmd in &self.start.shutdown_commands {
+            let _ = ctx.xplane.run_command(cmd).await;
+        }
+        let done = if secured {
+            "Roger — fuel cutoff and the ignition off. Engines shut down and secured."
+        } else {
+            "Roger — condition levers to fuel cutoff. Engines shut down."
+        };
         for _ in 0..6 {
             tokio::time::sleep(Duration::from_millis(600)).await;
             if !engine_running(ctx, 0).await {
-                return Ok(
-                    "Roger — condition levers to fuel cutoff. Engines shut down.".to_string(),
-                );
+                return Ok(done.to_string());
             }
         }
         Ok("Condition levers to cutoff, engines winding down.".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Fuel goes in on the spool the AIRFRAME uses. The sequence was written
+    /// against a PT6 (12% N1); the Citation X's own script cuts its starter at
+    /// 40% N2, which an AE3007 reaches with N1 barely off the stop — so waiting
+    /// for 12% N1 there means the starter quits before fuel is ever introduced
+    /// and the engine never lights (2026-07-28).
+    /// A turbofan is motored by BLEED AIR. Without the APU the starter is
+    /// accepted and the engine does not turn — proven live on the Citation X
+    /// (2026-07-28): N2 flat at zero with the APU off, 0 to 30% in fifteen
+    /// seconds with its generator and bleed on. "Cranking, nothing lit" was
+    /// the sequence doing everything right with no air to do it with.
+    #[test]
+    fn a_turbofan_start_brings_the_apu_up_first() {
+        let p = crate::aircraft::load("citation_x").expect("citation_x loads");
+        let s = p.turboprop_start.expect("start sequence");
+        let apu = s.apu.expect("a jet start needs the APU");
+        assert!(!apu.starter_commands.is_empty());
+        assert!(
+            apu.ready_n1 >= 90.0,
+            "wait for a RUNNING APU: {}",
+            apu.ready_n1
+        );
+        // Generator AND bleed: the air motors the engine, the generator powers
+        // the bus the left starter's own gate reads.
+        assert_eq!(apu.after_ready_commands.len(), 2, "generator and bleed");
+        // Free turbines have no APU step at all.
+        for id in ["dhc6_twin_otter", "king_air_c90b", "lancair_evolution"] {
+            let t = crate::aircraft::load(id)
+                .and_then(|a| a.turboprop_start)
+                .unwrap_or_else(|| panic!("{id} start"));
+            assert!(t.apu.is_none(), "{id} needs no APU");
+        }
+    }
+
+    #[test]
+    fn a_turbofan_introduces_fuel_on_n2_not_n1() {
+        let p = crate::aircraft::load("citation_x").expect("citation_x loads");
+        let s = p.turboprop_start.expect("declares a start sequence");
+        assert_eq!(s.fuel_intro_n2, Some(10.0));
+        // Held, not pressed: cmd_starter_* ignores anything under 0.1 s, so an
+        // ordinary command press does nothing at all on this airframe.
+        assert!(s.starter_held, "an instantaneous press is a no-op here");
+        // Idle N1 has to be reachable — the PT6 default of 50 never arrives.
+        assert!(s.n1_idle < 30.0, "{}", s.n1_idle);
+        // And every free turbine keeps the behaviour it was tuned on.
+        for id in ["dhc6_twin_otter", "king_air_c90b", "lancair_evolution"] {
+            let t = crate::aircraft::load(id)
+                .and_then(|a| a.turboprop_start)
+                .unwrap_or_else(|| panic!("{id} start"));
+            assert_eq!(t.fuel_intro_n2, None, "{id} still watches N1");
+        }
     }
 }

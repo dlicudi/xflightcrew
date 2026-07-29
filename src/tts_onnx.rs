@@ -54,12 +54,7 @@ impl OnnxTts {
         // ort's builder error carries the (non-Send) builder back, so it can't go
         // through `?` into anyhow directly — map via Display first. Chained on the
         // temporary builder so no `mut` binding is needed.
-        let session = Session::builder()
-            .map_err(|e| anyhow!("ort session builder: {e}"))?
-            .with_intra_threads(session_threads())
-            .map_err(|e| anyhow!("ort session threads: {e}"))?
-            .commit_from_file(model_path)
-            .map_err(|e| anyhow!("loading ONNX voice {model_path}: {e}"))?;
+        let session = build_session(model_path, Some(session_threads()), "ONNX voice")?;
 
         let cfg_path = format!("{model_path}.json");
         let cfg: serde_json::Value = serde_json::from_str(
@@ -320,12 +315,7 @@ impl KokoroTts {
     /// Load the Kokoro model, its vocab (sibling `kokoro-config.json`), and a
     /// voice's style table (`models/kokoro-voices/<voice>.bin`).
     pub fn load(model_path: &str, voice: &str) -> Result<Self> {
-        let session = Session::builder()
-            .map_err(|e| anyhow!("ort session builder: {e}"))?
-            .with_intra_threads(session_threads())
-            .map_err(|e| anyhow!("ort session threads: {e}"))?
-            .commit_from_file(model_path)
-            .map_err(|e| anyhow!("loading Kokoro {model_path}: {e}"))?;
+        let session = build_session(model_path, Some(session_threads()), "Kokoro")?;
 
         let dir = Path::new(model_path)
             .parent()
@@ -425,10 +415,7 @@ impl KokoroTts {
 /// Dump an ONNX model's input/output signature — used to wire up a new model
 /// (e.g. Kokoro, whose I/O differs from piper VITS). `cargo run -- onnx-info <m>`.
 pub fn inspect(model_path: &str) -> Result<String> {
-    let session = Session::builder()
-        .map_err(|e| anyhow!("ort session builder: {e}"))?
-        .commit_from_file(model_path)
-        .map_err(|e| anyhow!("loading {model_path}: {e}"))?;
+    let session = build_session(model_path, None, "model")?;
     let mut s = format!("model: {model_path}\nINPUTS:\n");
     for i in session.inputs() {
         s.push_str(&format!("  {:<12} {:?}\n", i.name(), i.dtype()));
@@ -445,6 +432,43 @@ pub fn inspect(model_path: &str) -> Result<String> {
 /// rendering X-Plane, each readback's synthesis burst was reported live
 /// (2026-07-08) as a sim frame-rate dip. Synthesis stays comfortably faster
 /// than realtime on a few cores; `XCOPILOT_TTS_THREADS` overrides.
+/// ONNX Runtime builds its environment and its graph-optimizer registries
+/// lazily, on whichever thread creates the first session — and two threads
+/// reaching that at once is a segfault inside the transpose optimizer, not an
+/// error:
+///
+/// ```text
+/// EXC_BAD_ACCESS (SIGSEGV) KERN_INVALID_ADDRESS   thread 5: voice-intercom
+///   onnx_transpose_optimization::GetHandler(...)
+///   onnxruntime::InferenceSession::Initialize()
+///   ort::session::builder::...commit_from_file
+/// ```
+///
+/// Seen at startup on 2026-07-28 and gone on the very next run, which is the
+/// signature of a race: the intercom, the station radio and the cabin each load
+/// their own voice on their own thread, and a boot where two first-utterances
+/// land together hits it. Creation is serialised here; inference afterwards is
+/// per-session and stays parallel.
+static ORT_SESSION_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Build an ONNX session, one thread at a time. `threads` is the intra-op
+/// thread count, `None` for the runtime's default (the model inspector).
+fn build_session(model_path: &str, threads: Option<usize>, what: &str) -> Result<Session> {
+    let _guard = ORT_SESSION_INIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let builder = Session::builder().map_err(|e| anyhow!("ort session builder: {e}"))?;
+    let mut builder = match threads {
+        Some(n) => builder
+            .with_intra_threads(n)
+            .map_err(|e| anyhow!("ort session threads: {e}"))?,
+        None => builder,
+    };
+    builder
+        .commit_from_file(model_path)
+        .map_err(|e| anyhow!("loading {what} {model_path}: {e}"))
+}
+
 fn session_threads() -> usize {
     std::env::var("XCOPILOT_TTS_THREADS")
         .ok()

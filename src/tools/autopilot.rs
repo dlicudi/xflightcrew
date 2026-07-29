@@ -66,7 +66,13 @@ const MIN_AP_ALTITUDE_FT: f64 = 500.0;
 const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
 /// Throttle (all engines), 0..1. A commanded climb sets this to full — the AP
 /// only controls pitch, so without power a 172 trades airspeed for altitude.
-const THROTTLE_ALL: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
+/// The thrust lever THIS airframe obeys — not always the stock one (the
+/// Citation X tracks `throttle_jet_rev_ratio`, so every write to
+/// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
+/// thrust). Resolved per call, so a profile swap takes effect immediately.
+fn throttle_dref() -> String {
+    crate::aircraft::throttle_dataref()
+}
 /// Throttle restored once a climb captures its target / on level-off (~cruise
 /// power for a 172). Not a precise %, just "off the climb stop" so the aircraft
 /// settles at the altitude instead of accelerating at full power.
@@ -410,7 +416,7 @@ async fn arm_altitude(
     // just bleeds airspeed. Full throttle for the climb; the watcher eases it back
     // to cruise at capture. (Autothrottle will replace this later.)
     if climb {
-        let _ = ctx.xplane.set_float(THROTTLE_ALL, 1.0).await;
+        let _ = ctx.xplane.set_float(&throttle_dref(), 1.0).await;
     }
     Ok((
         if climb {
@@ -549,9 +555,9 @@ fn capture_at_altitude(
                         // leave it rather than overriding their setting.
                         let mut eased = false;
                         if was_climb {
-                            match xp.get_float(THROTTLE_ALL).await {
+                            match xp.get_float(&throttle_dref()).await {
                                 Ok(thr) if thr >= FIREWALL_HANDBACK_FLOOR => {
-                                    let _ = xp.set_float(THROTTLE_ALL, CRUISE_THROTTLE).await;
+                                    let _ = xp.set_float(&throttle_dref(), CRUISE_THROTTLE).await;
                                     eased = true;
                                 }
                                 _ => {} // pilot took manual throttle — don't touch it
@@ -917,7 +923,10 @@ impl Tool for LevelOff {
         // Converging to cruise from either direction is the safe default until
         // airspeed-aware power management lands — making it conditional (leave the
         // pilot's setting) would risk that decay when levelling from a descent.
-        let _ = ctx.xplane.set_float(THROTTLE_ALL, CRUISE_THROTTLE).await;
+        let _ = ctx
+            .xplane
+            .set_float(&throttle_dref(), CRUISE_THROTTLE)
+            .await;
 
         if servos_engaged(ctx).await? {
             Ok(format!(
@@ -1448,7 +1457,7 @@ mod tests {
             "dials the commanded VS"
         );
         assert_eq!(
-            fake.last_write(THROTTLE_ALL),
+            fake.last_write(&throttle_dref()),
             Some(1.0),
             "firewalls the throttle for the climb"
         );
@@ -1470,7 +1479,7 @@ mod tests {
         );
         assert_eq!(fake.last_write(VS_DIAL), Some(signed));
         assert!(
-            !fake.wrote(THROTTLE_ALL),
+            !fake.wrote(&throttle_dref()),
             "descent must not firewall (or touch) the throttle"
         );
     }

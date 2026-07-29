@@ -25,6 +25,26 @@
 #include "common.h"
 #include "drefs.h"
 #include "fms.h"
+#include "font_b612_regular.h"
+#include "font_b612_bold.h"
+
+// B612 — the Airbus-designed cockpit typeface (OFL, see
+// plugin/third_party/b612/OFL.txt) — baked once into the shared atlas at
+// every UI scale (the atlas binds when the first ImgWindow is constructed
+// and can never be rebuilt after, so scale switching is a font SWAP).
+// Index = the ui_scale option (0 = 100%, 1 = 125%, 2 = 150%).
+static ImFont* g_font_body[3] = {nullptr, nullptr, nullptr};
+static ImFont* g_font_head[3] = {nullptr, nullptr, nullptr};
+static const float kUiScale[3] = {1.0f, 1.25f, 1.5f};
+// Latin-1 plus the en/em dash and bullet the app's text actually uses (the
+// default range stops at U+00FF, which is why the old default-font panel
+// needed the app-side dash scrub; the scrub stays for old plugins).
+static const ImWchar kGlyphRanges[] = {
+    0x0020, 0x00FF,
+    0x2013, 0x2014,
+    0x2022, 0x2022,
+    0,
+};
 
 // Transmission log shown in the panel, each entry stamped with wall-clock time
 // so a test flight can be reviewed afterwards.
@@ -167,17 +187,25 @@ public:
         s.Colors[ImGuiCol_TableRowBg]       = slate1;
         s.Colors[ImGuiCol_TableRowBgAlt]    = ImVec4(0.14f, 0.15f, 0.18f, 1.0f);
         SetWindowResizingLimits(260, 160, 1400, 1400);
+        // The styled-but-unscaled baseline: scale switches restore this and
+        // re-derive, because ScaleAllSizes is multiplicative and compounding
+        // it would grow the paddings run over run.
+        mBaseStyle = s;
     }
 
 private:
-    // Selected tab (0 = Log, 1 = Route, 2 = ATC, 3 = Calls, 4 = Settings) — content renders after
-    // the shared context rows, so the tab bar itself sits at the very top.
+    // Selected tab (0 = Flight, 1 = Log, 2 = ATC, 3 = Route, 4 = Settings).
+    // Flight is first and default: the automation instrument is the panel's
+    // reason to be on screen mid-flight.
     int mTab = 0;
+    // The applied UI scale index; -1 forces the first frame to apply one.
+    int mScaleIdx = -1;
+    ImGuiStyle mBaseStyle;
 
 protected:
-    // The status strip: crew state, aircraft, and the two talk lights. Lives
-    // at the BOTTOM of the panel (instrument-style: controls above,
-    // annunciators below).
+    // The status strip: crew state, aircraft, the two talk lights, and the
+    // automation annunciator. Lives at the BOTTOM of the panel
+    // (instrument-style: controls above, annunciators below).
     void drawStatusBar(bool connected) {
         if (connected) {
             Chip(PhaseLabel(drefs::phase()), PhaseColor(drefs::phase()));
@@ -194,38 +222,63 @@ protected:
         ImGui::SameLine();
         // TX = the radio (ATC) push-to-talk, distinct from the intercom PTT.
         Chip("TX", drefs::radio_ptt_active() ? COL_AMBER : COL_DIM);
+        ImGui::SameLine();
+        // AUTO lights amber while any automation is flying/driving — visible
+        // from every tab, so a running full auto is never out of sight.
+        Chip("AUTO", (connected && drefs::auto_active()) ? COL_AMBER : COL_DIM);
+        // A button press waiting for the app to consume it (~300 ms).
+        if (connected && drefs::request() != 0) {
+            ImGui::SameLine();
+            Chip("SENT", COL_CYAN);
+        }
     }
 
     void buildInterface() override {
+        // Apply the UI scale: swap the pre-baked font size and re-derive the
+        // style metrics from the unscaled baseline. The option dataref is the
+        // instant source of truth — a Settings pick applies THIS frame.
+        int scale = drefs::opt_ui_scale();
+        if (scale < 0 || scale > 2) scale = 0;
+        if (scale != mScaleIdx) {
+            mScaleIdx = scale;
+            ImGuiStyle& s = ImGui::GetStyle();
+            s = mBaseStyle;
+            s.ScaleAllSizes(kUiScale[scale]);
+            SetWindowResizingLimits(
+                static_cast<int>(260 * kUiScale[scale]),
+                static_cast<int>(160 * kUiScale[scale]), 1400, 1400);
+        }
+        if (g_font_body[mScaleIdx]) ImGui::PushFont(g_font_body[mScaleIdx]);
+
         // The app heartbeats the phase ~1/s; a stale timestamp = not running.
         bool connected = drefs::app_connected();
 
         // Tabs at the very top: what you're looking AT comes first; state
-        // annunciators live in the bottom status bar. Content renders after
-        // the shared context rows, so those stay visible on every tab.
+        // annunciators live in the bottom status bar. Each tab owns its whole
+        // content — no shared header rows competing for height.
         if (ImGui::BeginTabBar("xcp_tabs")) {
+            if (ImGui::BeginTabItem("Flight")) {
+                mTab = 0;
+                ImGui::EndTabItem();
+            }
             // Unread dot on the Log tab while entries arrive unseen — cleared
             // the moment the tab is shown, so it only lights up from others.
             ImGuiTabItemFlags logFlags =
                 g_log_unseen ? ImGuiTabItemFlags_UnsavedDocument : 0;
             if (ImGui::BeginTabItem("Log", nullptr, logFlags)) {
                 g_log_unseen = false;
-                mTab = 0;
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Route")) {
                 mTab = 1;
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("ATC")) {
+            // A dot on ATC while a readback is OWED — a live condition, not
+            // an unread counter: it stays lit until the readback is paid.
+            ImGuiTabItemFlags atcFlags =
+                drefs::coach_urgent() ? ImGuiTabItemFlags_UnsavedDocument : 0;
+            if (ImGui::BeginTabItem("ATC", nullptr, atcFlags)) {
                 mTab = 2;
                 ImGui::EndTabItem();
             }
-            // A dot on Calls while a readback is OWED — a live condition,
-            // not an unread counter: it stays lit until the readback is paid.
-            ImGuiTabItemFlags callsFlags =
-                drefs::coach_urgent() ? ImGuiTabItemFlags_UnsavedDocument : 0;
-            if (ImGui::BeginTabItem("Calls", nullptr, callsFlags)) {
+            if (ImGui::BeginTabItem("Route")) {
                 mTab = 3;
                 ImGui::EndTabItem();
             }
@@ -236,82 +289,170 @@ protected:
             ImGui::EndTabBar();
         }
 
-        // Live flight strip — the app refreshes this with what the copilot sees
-        // (emergency phase/runway, cabin altitude, endurance). Hidden when empty.
-        const TextRef& strip = drefs::strip();
-        if (connected && strip.len > 0) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_CYAN));
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextUnformatted(strip.buf);
-            ImGui::PopTextWrapPos();
-            ImGui::PopStyleColor();
-        }
-
-        // Radio row — the field's comm plan as chips, the tuned one lit amber
-        // ('>' prefix from the app). An instrument row, not a log line: it
-        // reads like the radio stack, at a glance. Hidden when empty.
-        const TextRef& radio = drefs::radio_row();
-        if (connected && radio.len > 0) {
-            char row[512];
-            std::memcpy(row, radio.buf, sizeof row);
-            char* seg = row;
-            bool first = true;
-            while (seg != nullptr) {
-                char* bar = std::strstr(seg, " | ");
-                if (bar != nullptr) *bar = '\0';
-                bool lit = (seg[0] == '>');
-                if (lit) seg++;
-                if (!first) ImGui::SameLine();
-                Chip(seg, lit ? COL_AMBER : COL_DIM);
-                first = false;
-                seg = (bar != nullptr) ? bar + 3 : nullptr;
-            }
-        }
-
-        // Emergency buttons — the mouse fallback when voice fails mid-emergency.
-        // Guarded-switch styling: the two that take the aircraft are filled dark
-        // red, the one that gives it back dark green. Each writes a request code
-        // the app polls and runs as the matching voice command.
-        if (connected) {
-            const ImVec4 redBg(0.42f, 0.13f, 0.11f, 1.0f), redHov(0.55f, 0.17f, 0.14f, 1.0f);
-            const ImVec4 greenBg(0.11f, 0.32f, 0.16f, 1.0f), greenHov(0.14f, 0.42f, 0.21f, 1.0f);
-            ImGui::PushStyleColor(ImGuiCol_Button, redBg);
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, redHov);
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, redHov);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_WHITE));
-            if (ImGui::SmallButton("RECOVER")) drefs::set_request(1);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("AUTOLAND")) drefs::set_request(2);
-            ImGui::PopStyleColor(4);
-            ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Button, greenBg);
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, greenHov);
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, greenHov);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_WHITE));
-            if (ImGui::SmallButton("MY CONTROLS")) drefs::set_request(3);
-            ImGui::PopStyleColor(4);
-            if (drefs::request() != 0) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "sent...");
-            }
-            ImGui::Separator();
-        }
-
-        // Body: the selected tab's content. Log = the transmission record;
-        // Route = what the app pushed for the FMS; Settings = the runtime
-        // switches.
+        // Body: the selected tab's content, in its OWN scroll region between
+        // the fixed tab bar and the fixed status bar. Without this child, a
+        // tab taller than the window (Settings, an expanded phraseology
+        // reference) scrolled the whole window and carried the tab bar off
+        // the top. Transparent bg so the body reads as the window, not a
+        // well — the wells inside keep their slate.
+        const float statusH = ImGui::GetFrameHeightWithSpacing()
+            + ImGui::GetStyle().ItemSpacing.y;
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+        ImGui::BeginChild("tab_body", ImVec2(0, -statusH), false);
+        ImGui::PopStyleColor();
         switch (mTab) {
-            case 0: buildLogTab(connected); break;
-            case 1: buildRouteTab(); break;
+            case 0: buildFlightTab(connected); break;
+            case 1: buildLogTab(connected); break;
             case 2: buildAtcTab(connected); break;
-            case 3: buildCallsTab(connected); break;
+            case 3: buildRouteTab(); break;
             default: buildSettingsTab(); break;
         }
+        ImGui::EndChild();
 
         // Bottom status bar — annunciators live under the content, like a
         // panel's lamp row.
         ImGui::Separator();
         drawStatusBar(connected);
+
+        if (g_font_body[mScaleIdx]) ImGui::PopFont();
+    }
+
+    // One request button: fixed width so rows form a grid, writes its code to
+    // the request channel the app polls (each code injects the same English
+    // phrase a pilot would speak — the buttons can't do anything the voice
+    // can't).
+    void requestButton(const char* label, int code, float width) {
+        if (ImGui::Button(label, ImVec2(width, 0.0f))) drefs::set_request(code);
+    }
+
+    // The Flight tab: the automation instrument. What the copilot is flying
+    // right now, the live strip, and the mouse fallback for every automation
+    // the voice can arm.
+    void buildFlightTab(bool connected) {
+        if (!connected) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                               "Start x-copilot to connect.");
+            return;
+        }
+
+        // Live flight strip — what the copilot sees (emergency phase/runway,
+        // cabin altitude, endurance, next-turn hint). Hidden when empty.
+        const TextRef& strip = drefs::strip();
+        if (strip.len > 0) {
+            if (g_font_head[mScaleIdx]) ImGui::PushFont(g_font_head[mScaleIdx]);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_CYAN));
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(strip.buf);
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+            if (g_font_head[mScaleIdx]) ImGui::PopFont();
+        }
+
+        // Reserve the button block below the well: (CANCEL when active) + two
+        // arm rows + the guarded row; the status bar is drawn by
+        // buildInterface after the tab.
+        const bool active = drefs::auto_active();
+        const float rowH = ImGui::GetFrameHeightWithSpacing();
+        const float footer = rowH * (active ? 4.0f : 3.0f)
+            + ImGui::GetStyle().ItemSpacing.y;
+
+        // The automation status well: the auto feed, primary line first as
+        // NAME|stage, the rest one dim line each.
+        ImGui::BeginChild("auto_well", ImVec2(0, -footer), true);
+        const TextRef& feed = drefs::auto_status();
+        if (feed.len == 0) {
+            const char* hint = "No automation active.";
+            ImVec2 ts = ImGui::CalcTextSize(hint);
+            ImGui::SetCursorPos(ImVec2((ImGui::GetWindowWidth() - ts.x) * 0.5f,
+                                       (ImGui::GetWindowHeight() - ts.y) * 0.5f));
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", hint);
+        } else {
+            char buf[512];
+            std::memcpy(buf, feed.buf, sizeof buf);
+            char* line = buf;
+            bool first = true;
+            while (line != nullptr) {
+                char* nl = std::strchr(line, '\n');
+                if (nl != nullptr) *nl = '\0';
+                if (first) {
+                    // Primary: "NAME|stage" — the manager as the headline,
+                    // the stage as a chip beside it.
+                    char* bar = std::strchr(line, '|');
+                    const char* stage = "";
+                    if (bar != nullptr) {
+                        *bar = '\0';
+                        stage = bar + 1;
+                    }
+                    if (g_font_head[mScaleIdx]) ImGui::PushFont(g_font_head[mScaleIdx]);
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE),
+                                       "%s", line);
+                    if (g_font_head[mScaleIdx]) ImGui::PopFont();
+                    if (stage[0] != '\0') {
+                        ImGui::SameLine();
+                        Chip(stage, COL_AMBER);
+                    }
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                                          ImGui::ColorConvertU32ToFloat4(COL_DIM));
+                    ImGui::PushTextWrapPos(0.0f);
+                    ImGui::TextUnformatted(line);
+                    ImGui::PopTextWrapPos();
+                    ImGui::PopStyleColor();
+                }
+                first = false;
+                line = (nl != nullptr) ? nl + 1 : nullptr;
+            }
+        }
+        ImGui::EndChild();
+
+        const ImGuiStyle& st = ImGui::GetStyle();
+        const ImVec4 redBg(0.42f, 0.13f, 0.11f, 1.0f), redHov(0.55f, 0.17f, 0.14f, 1.0f);
+        const ImVec4 greenBg(0.11f, 0.32f, 0.16f, 1.0f), greenHov(0.14f, 0.42f, 0.21f, 1.0f);
+
+        // CANCEL — full width, only while something is running to cancel. The
+        // app picks the right phrase for whatever is active ("cancel full
+        // auto", "abort takeoff", ...).
+        if (active) {
+            ImGui::PushStyleColor(ImGuiCol_Button, redBg);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, redHov);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, redHov);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_WHITE));
+            requestButton("CANCEL", 11, ImGui::GetContentRegionAvail().x);
+            ImGui::PopStyleColor(4);
+        }
+
+        // The arm grid: every automation the voice can start. Always enabled
+        // — a tool that can't run right now refuses with a spoken reason,
+        // exactly as it would a spoken command.
+        const float w4 =
+            (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x * 3.0f) / 4.0f;
+        requestButton("FULL AUTO", 4, w4); ImGui::SameLine();
+        requestButton("FLY PLAN", 5, w4); ImGui::SameLine();
+        requestButton("PUSH BACK", 6, w4); ImGui::SameLine();
+        requestButton("TAXI", 7, w4);
+        requestButton("LINE UP", 8, w4); ImGui::SameLine();
+        requestButton("TAKEOFF", 9, w4); ImGui::SameLine();
+        requestButton("CIRCUIT", 10, w4); ImGui::SameLine();
+        requestButton("LAND", 2, w4);
+
+        // The guarded row — the emergency switches. RECOVER takes the
+        // aircraft (dark red), MY CONTROLS gives everything back (dark
+        // green).
+        const float w2 = (ImGui::GetContentRegionAvail().x
+                          - st.ItemSpacing.x) / 2.0f;
+        ImGui::PushStyleColor(ImGuiCol_Button, redBg);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, redHov);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, redHov);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_WHITE));
+        requestButton("RECOVER", 1, w2);
+        ImGui::PopStyleColor(4);
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, greenBg);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, greenHov);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, greenHov);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_WHITE));
+        requestButton("MY CONTROLS", 3, w2);
+        ImGui::PopStyleColor(4);
     }
 
     // Transmission log — recent heard/action lines with coloured tags, each
@@ -337,9 +478,9 @@ protected:
             coach_h = ImGui::CalcTextSize(coachText.buf, nullptr, false, wrap_w).y
                 + ImGui::GetStyle().ItemSpacing.y * 2.0f;
         }
-        // Two reserved rows below the well (the log controls and the bottom
-        // status bar drawn by buildInterface), plus the coach strip.
-        const float footer = ImGui::GetFrameHeightWithSpacing() * 2.0f
+        // One reserved row below the well (the log controls; the status bar
+        // sits outside the tab body now), plus the coach strip.
+        const float footer = ImGui::GetFrameHeightWithSpacing()
             + ImGui::GetStyle().ItemSpacing.y + coach_h;
         ImGui::BeginChild("log", ImVec2(0, -footer), true);
         if (g_log.empty()) {
@@ -470,30 +611,66 @@ protected:
         }
     }
 
-    // Every station in VHF range, nearest first, pushed by the app. The tab is
-    // an instrument, not a listing: each frequency is a button — click to tune
-    // COM1 — and the tuned one is lit amber. The active station (the one that
-    // answers radio calls) is named in green.
+    // The radio picture, one tab: what to SAY NOW (live, from the tower's
+    // state machine), the field's comm plan, every station in VHF range —
+    // each frequency a click-to-tune button, the tuned one lit amber — and
+    // the phraseology reference for learning the words. The active station
+    // (the one that answers radio calls) is named in green.
     void buildAtcTab(bool connected) {
         if (!connected) {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
                                "Waiting for the app.");
             return;
         }
-        const std::vector<AtcField>& atc_fields = drefs::atc_fields();
-        if (atc_fields.empty()) {
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
-                               "No stations in VHF range.");
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
-                               "Range grows with altitude.");
-            return;
+        // The coach line: an owed readback is not a suggestion — amber, and
+        // named for what it is. Everything else is a calm cyan hint. Ask the
+        // copilot "what do I say?" for the same line by voice.
+        const TextRef& coachText = drefs::coach();
+        if (coachText.len > 0) {
+            ImU32 col = drefs::coach_urgent() ? COL_AMBER : COL_CYAN;
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(
+                                   drefs::coach_urgent() ? COL_AMBER : COL_DIM),
+                               drefs::coach_urgent() ? "READBACK OWED" : "SAY NOW");
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(col));
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(coachText.buf);
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+            ImGui::Separator();
         }
+        // Radio row — the tuned field's comm plan as chips, the tuned service
+        // lit amber ('>' prefix from the app). Reads like the radio stack.
+        const TextRef& radio = drefs::radio_row();
+        if (radio.len > 0) {
+            char row[512];
+            std::memcpy(row, radio.buf, sizeof row);
+            char* seg = row;
+            bool first = true;
+            while (seg != nullptr) {
+                char* bar = std::strstr(seg, " | ");
+                if (bar != nullptr) *bar = '\0';
+                bool lit = (seg[0] == '>');
+                if (lit) seg++;
+                if (!first) ImGui::SameLine();
+                Chip(seg, lit ? COL_AMBER : COL_DIM);
+                first = false;
+                seg = (bar != nullptr) ? bar + 3 : nullptr;
+            }
+            ImGui::Separator();
+        }
+        const std::vector<AtcField>& atc_fields = drefs::atc_fields();
         int com1 = drefs::com1_khz();
-        // Two reserved rows below the well: the tune hint and the bottom
-        // status bar (drawn by buildInterface after the tab content).
-        const float footer = ImGui::GetFrameHeightWithSpacing() * 2.0f
+        // One reserved row below the well: the tune hint (the status bar
+        // sits outside the tab body now).
+        const float footer = ImGui::GetFrameHeightWithSpacing()
             + ImGui::GetStyle().ItemSpacing.y;
         if (ImGui::BeginChild("atc_well", ImVec2(0, -footer))) {
+            if (atc_fields.empty()) {
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                                   "No stations in VHF range.");
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
+                                   "Range grows with altitude.");
+            }
             for (size_t i = 0; i < atc_fields.size(); ++i) {
                 const AtcField& f = atc_fields[i];
                 ImGui::PushID(static_cast<int>(i));
@@ -536,35 +713,12 @@ protected:
                 if (i + 1 < atc_fields.size()) ImGui::Separator();
                 ImGui::PopID();
             }
-        }
-        ImGui::EndChild();
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
-                           "Click a frequency to tune COM1.");
-    }
 
-    // The radio coach: what to SAY NOW (live, from the tower's state machine,
-    // pushed by the app) over a phraseology reference — the learning tool.
-    // Ask the copilot "what do I say?" for the same line by voice.
-    void buildCallsTab(bool connected) {
-        const TextRef& coachText = drefs::coach();
-        if (connected && coachText.len > 0) {
-            // An owed readback is not a suggestion — amber, and named for
-            // what it is. Everything else stays the calm cyan hint.
-            ImU32 col = drefs::coach_urgent() ? COL_AMBER : COL_CYAN;
-            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(
-                                   drefs::coach_urgent() ? COL_AMBER : COL_DIM),
-                               drefs::coach_urgent() ? "READBACK OWED" : "SAY NOW");
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(col));
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextUnformatted(coachText.buf);
-            ImGui::PopTextWrapPos();
-            ImGui::PopStyleColor();
+            // The phraseology reference — the learning tool, collapsed under
+            // the live picture. The group matching the flight phase (the
+            // coach payload's group marker) is named "you are here" style.
+            ImGui::Spacing();
             ImGui::Separator();
-        }
-        // One reserved row below the well: the bottom status bar.
-        const float footer = ImGui::GetFrameHeightWithSpacing()
-            + ImGui::GetStyle().ItemSpacing.y;
-        if (ImGui::BeginChild("calls_well", ImVec2(0, -footer))) {
             struct Phrase { const char* say; const char* gets; };
             struct Group { const char* title; char key; const Phrase* items; int n; };
             static const Phrase dep[] = {
@@ -598,24 +752,29 @@ protected:
                 {"DEPARTURE", 'D', dep, 5}, {"ARRIVAL AND CIRCUIT", 'A', arr, 6},
                 {"ANY TIME", 0, misc, 6}, {"EMERGENCY", 0, emer, 2},
             };
-            // The group matching the live flight phase (the coach payload's
-            // group marker) reads "you are here"; the rest stay dim.
-            char active = (connected && coachText.len > 0) ? drefs::coach_group() : 0;
+            // Collapsible per group so the live picture keeps the space; the
+            // group matching the live flight phase is highlighted and starts
+            // open ("you are here"), the rest stay collapsed and dim.
+            char activeGroup = (coachText.len > 0) ? drefs::coach_group() : 0;
             for (const Group& g : groups) {
-                bool here = g.key != 0 && g.key == active;
-                ImGui::TextColored(
-                    ImGui::ColorConvertU32ToFloat4(here ? COL_CYAN : COL_DIM),
-                    here ? "%s  <" : "%s", g.title);
-                for (int i = 0; i < g.n; ++i) {
+                bool here = g.key != 0 && g.key == activeGroup;
+                if (here) ImGui::SetNextItemOpen(true, ImGuiCond_Appearing);
+                ImGui::PushStyleColor(
+                    ImGuiCol_Text,
+                    ImGui::ColorConvertU32ToFloat4(here ? COL_CYAN : COL_DIM));
+                bool open = ImGui::CollapsingHeader(g.title);
+                ImGui::PopStyleColor();
+                if (!open) continue;
+                for (int k = 0; k < g.n; ++k) {
                     ImGui::Bullet();
                     ImGui::SameLine();
                     ImGui::PushTextWrapPos(0.0f);
-                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE), "%s", g.items[i].say);
+                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE), "%s", g.items[k].say);
                     ImGui::PopTextWrapPos();
                     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_DIM));
                     ImGui::Indent(18.0f);
                     ImGui::PushTextWrapPos(0.0f);
-                    ImGui::TextUnformatted(g.items[i].gets);
+                    ImGui::TextUnformatted(g.items[k].gets);
                     ImGui::PopTextWrapPos();
                     ImGui::Unindent(18.0f);
                     ImGui::PopStyleColor();
@@ -625,7 +784,7 @@ protected:
         }
         ImGui::EndChild();
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
-                           "Or ask the copilot: what do I say?");
+                           "Click a frequency to tune COM1.");
     }
 
     // Live runtime switches. Each checkbox drives a dataref the app polls live;
@@ -641,6 +800,21 @@ protected:
             ImGui::RadioButton("Copilot only (real/external ATC has the radio)", &mode, 1);
             ImGui::RadioButton("ATC only (no copilot, no LLM)", &mode, 2);
             if (mode != drefs::opt_mode()) drefs::set_opt_mode(mode);
+            ImGui::Spacing();
+            ImGui::Separator();
+        }
+        // UI scale — applied by buildInterface the frame after a pick, and
+        // remembered by the app (publish/pick like the mode radios; hidden
+        // until the app publishes).
+        int uiScale = drefs::opt_ui_scale();
+        if (uiScale >= 0) {
+            ImGui::TextUnformatted("UI scale");
+            ImGui::RadioButton("100%", &uiScale, 0);
+            ImGui::SameLine();
+            ImGui::RadioButton("125%", &uiScale, 1);
+            ImGui::SameLine();
+            ImGui::RadioButton("150%", &uiScale, 2);
+            if (uiScale != drefs::opt_ui_scale()) drefs::set_opt_ui_scale(uiScale);
             ImGui::Spacing();
             ImGui::Separator();
         }
@@ -753,13 +927,33 @@ static int TogglePanelHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
 namespace panel {
 
 void create() {
-    // One shared font atlas for all ImgWindows (uses ImGui's default font).
+    // One shared font atlas for all ImgWindows. Every font and size is baked
+    // HERE: the atlas binds its texture when the first ImgWindow is
+    // constructed below, and can never take another font after that — scale
+    // switching swaps between these pre-baked sizes at draw time.
     ImgWindow::sFontAtlas = std::make_shared<ImgFontAtlas>();
+    ImFontConfig cfg;
+    cfg.FontDataOwnedByAtlas = false;  // the arrays are static — never freed
+    static const float kBodyPx[3] = {16.0f, 20.0f, 24.0f};
+    static const float kHeadPx[3] = {20.0f, 25.0f, 30.0f};
+    // Body first: the first font added is the atlas default, so even a code
+    // path that never pushes a font renders B612 at 100%.
+    for (int i = 0; i < 3; ++i) {
+        g_font_body[i] = ImgWindow::sFontAtlas->AddFontFromMemoryTTF(
+            B612_Regular_ttf, static_cast<int>(B612_Regular_ttf_len),
+            kBodyPx[i], &cfg, kGlyphRanges);
+    }
+    for (int i = 0; i < 3; ++i) {
+        g_font_head[i] = ImgWindow::sFontAtlas->AddFontFromMemoryTTF(
+            B612_Bold_ttf, static_cast<int>(B612_Bold_ttf_len),
+            kHeadPx[i], &cfg, kGlyphRanges);
+    }
 
     int sl, st, sr, sb;
     XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
     // Start well below the top edge so the panel clears the X-Plane menu bar.
-    int wl = sl + 50, wt = st - 150, wr = wl + 420, wb = wt - 300;
+    // Wide enough for the Flight tab's four-button rows in the 16px body font.
+    int wl = sl + 50, wt = st - 150, wr = wl + 470, wb = wt - 340;
     g_panel = std::make_unique<XCopilotPanel>(wl, wt, wr, wb);
     g_toggle_cmd = XPLMCreateCommand("xcopilot/toggle_panel", "x-copilot: toggle the status panel");
     XPLMRegisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr);

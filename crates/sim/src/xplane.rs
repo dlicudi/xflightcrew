@@ -24,6 +24,129 @@ use tokio::sync::Mutex;
 const HTTP_ATTEMPTS: usize = 3;
 const HTTP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(60);
 
+/// How often the request-rate accounting reports, seconds.
+const LOAD_REPORT_SECS: f64 = 30.0;
+
+/// How long a dataref VALUE may be reused before it is fetched again.
+///
+/// The Web API is served from inside X-Plane's flight loop, so every request is
+/// frame time the sim does not get. Measured on 2026-07-28 we were sustaining
+/// 70-80 requests a second, and the per-window slowest response climbed 50 ms →
+/// 100 → 125 in the minutes before the sim wedged — the shape of load, not of a
+/// single bad event. Most of that volume is DUPLICATION: the monitor's eighteen
+/// checks run in one burst and several want the same airspeed and altitude, and
+/// the control loops re-read the position datarefs the monitor just read.
+///
+/// A window this short is invisible to the laws — every control loop ticks at
+/// 150 ms or slower — but it collapses a burst of duplicate reads into one
+/// request. Writes invalidate their own entry (see `set_value`), so the
+/// readback-after-write that every tool's trust rests on still sees the real
+/// post-write value. `XCOPILOT_DREF_CACHE_MS=0` disables it.
+fn value_cache_ttl() -> std::time::Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("XCOPILOT_DREF_CACHE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(60)
+    });
+    std::time::Duration::from_millis(ms)
+}
+
+/// Web API load over the current reporting window. The Web API is served from
+/// inside X-Plane's own frame loop, so what we ask of it is a load the SIM
+/// carries — and when the sim freezes, the only thing our logs record is the
+/// failures that follow. Twice on 2026-07-28 the question "were we hammering
+/// it?" could not be answered from the logs at all, because nothing ever
+/// counted the requests that SUCCEEDED. Now the rate is on the record, in the
+/// log and in the blackbox, whether or not anything goes wrong.
+struct LoadWindow {
+    start: std::time::Instant,
+    requests: u64,
+    failures: u64,
+    slowest_ms: u64,
+    /// Reads served from the value cache — requests the sim never saw.
+    cache_hits: u64,
+    /// Requests per dataref name, so a load report names the hogs. Cutting a
+    /// rate needs to know what it is MADE of: the first cache attempt assumed
+    /// duplication and recovered 2.5%, because the loops each read different
+    /// datarefs rather than the same ones twice (2026-07-28).
+    by_name: std::collections::HashMap<String, u64>,
+}
+
+static LOAD: std::sync::Mutex<Option<LoadWindow>> = std::sync::Mutex::new(None);
+
+/// A read served from cache: counted so the load report shows what the
+/// window would have cost without it.
+fn note_cache_hit() {
+    let mut guard = LOAD.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(w) = guard.as_mut() {
+        w.cache_hits += 1;
+    }
+}
+
+/// Account for one attempt against the API — one actual trip to the socket,
+/// which is what the sim pays for, not one logical operation.
+/// Attribute one request to the dataref it was for.
+fn note_named(name: &str) {
+    let mut guard = LOAD.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(w) = guard.as_mut() {
+        *w.by_name.entry(name.to_string()).or_insert(0) += 1;
+    }
+}
+
+fn note_request(elapsed: std::time::Duration, ok: bool) {
+    let mut guard = LOAD.lock().unwrap_or_else(|e| e.into_inner());
+    let w = guard.get_or_insert_with(|| LoadWindow {
+        start: std::time::Instant::now(),
+        requests: 0,
+        failures: 0,
+        slowest_ms: 0,
+        cache_hits: 0,
+        by_name: std::collections::HashMap::new(),
+    });
+    w.requests += 1;
+    w.failures += u64::from(!ok);
+    w.slowest_ms = w.slowest_ms.max(elapsed.as_millis() as u64);
+    let secs = w.start.elapsed().as_secs_f64();
+    if secs < LOAD_REPORT_SECS {
+        return;
+    }
+    let rate = w.requests as f64 / secs;
+    tracing::info!(
+        target: "sim::load",
+        rate = format!("{rate:.0}/s"),
+        requests = w.requests,
+        cached = w.cache_hits,
+        failures = w.failures,
+        slowest_ms = w.slowest_ms,
+        "web api load"
+    );
+    let mut top: Vec<(String, u64)> = w.by_name.drain().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.truncate(8);
+    crate::blackbox::record(
+        "api_load",
+        serde_json::json!({
+            "top": top.iter().map(|(n, c)| format!("{n} x{c}")).collect::<Vec<_>>(),
+            "rate_per_s": (rate * 10.0).round() / 10.0,
+            "requests": w.requests,
+            "cache_hits": w.cache_hits,
+            "failures": w.failures,
+            "slowest_ms": w.slowest_ms,
+            "window_s": (secs * 10.0).round() / 10.0,
+        }),
+    );
+    *w = LoadWindow {
+        start: std::time::Instant::now(),
+        requests: 0,
+        failures: 0,
+        slowest_ms: 0,
+        cache_hits: 0,
+        by_name: std::collections::HashMap::new(),
+    };
+}
+
 /// Run an idempotent Web API request, retrying a few times on failure. A 404 is
 /// *not* retried: it means the dataref id is stale (X-Plane reassigns ids across
 /// restarts and aircraft reloads), so re-issuing the same id just spams the log —
@@ -36,7 +159,10 @@ where
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match op().await {
+        let started = std::time::Instant::now();
+        let result = op().await;
+        note_request(started.elapsed(), result.is_ok());
+        match result {
             Ok(v) => return Ok(v),
             Err(e) if attempt < HTTP_ATTEMPTS && !is_not_found(&e) => {
                 tracing::warn!(attempt, "X-Plane request failed, retrying: {e:#}");
@@ -101,6 +227,8 @@ pub struct XPlaneClient {
     id_cache: Mutex<HashMap<String, i64>>,
     /// Resolved `command name -> numeric id` (commands live on the v2 API).
     command_cache: Mutex<HashMap<String, i64>>,
+    /// Recently-read values, `name -> (when, value)`. See [`value_cache_ttl`].
+    value_cache: Mutex<HashMap<String, (std::time::Instant, serde_json::Value)>>,
 }
 
 #[derive(Deserialize)]
@@ -143,6 +271,7 @@ impl XPlaneClient {
             base: base.trim_end_matches('/').to_string(),
             id_cache: Mutex::new(HashMap::new()),
             command_cache: Mutex::new(HashMap::new()),
+            value_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -186,6 +315,16 @@ impl XPlaneClient {
     /// (the poller hits this every frame), drop the stale id and resolve by name
     /// again. `decoding` labels the JSON-decode step for error context.
     async fn get_value(&self, name: &str, decoding: &'static str) -> Result<serde_json::Value> {
+        note_named(name);
+        let ttl = value_cache_ttl();
+        if !ttl.is_zero() {
+            if let Some((at, v)) = self.value_cache.lock().await.get(name) {
+                if at.elapsed() < ttl {
+                    note_cache_hit();
+                    return Ok(v.clone());
+                }
+            }
+        }
         let mut refreshed = false;
         loop {
             let id = self.dataref_id(name).await?;
@@ -203,7 +342,15 @@ impl XPlaneClient {
             })
             .await;
             match result {
-                Ok(resp) => return Ok(resp.data),
+                Ok(resp) => {
+                    if !ttl.is_zero() {
+                        self.value_cache.lock().await.insert(
+                            name.to_string(),
+                            (std::time::Instant::now(), resp.data.clone()),
+                        );
+                    }
+                    return Ok(resp.data);
+                }
                 Err(e) if !refreshed && is_not_found(&e) => {
                     self.id_cache.lock().await.remove(name); // stale handle — re-resolve
                     refreshed = true;
@@ -288,6 +435,9 @@ impl XPlaneClient {
 
     /// Write a raw JSON value to a dataref's `value` endpoint.
     async fn set_value(&self, name: &str, value: serde_json::Value) -> Result<()> {
+        // A write makes any cached value a lie, and the readback that follows
+        // it is the whole trust model — drop the entry so that read is real.
+        self.value_cache.lock().await.remove(name);
         let body = json!({ "data": value });
         let mut refreshed = false;
         loop {
@@ -606,5 +756,20 @@ impl XPlane for FakeXPlane {
     async fn set_float_array_elem(&self, name: &str, _index: usize, value: f64) -> Result<()> {
         self.writes.lock().unwrap().push((name.to_string(), value));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    /// The cache window has to be short enough that no control law can tell.
+    /// Every loop that flies the aircraft ticks at 150 ms or slower, so a value
+    /// may never be more than a fraction of a tick old.
+    #[test]
+    fn the_value_cache_window_is_shorter_than_a_control_tick() {
+        let ttl = super::value_cache_ttl();
+        assert!(
+            ttl <= std::time::Duration::from_millis(75),
+            "a stale read must not reach a control law: {ttl:?}"
+        );
     }
 }

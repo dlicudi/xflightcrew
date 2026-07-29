@@ -281,6 +281,102 @@ impl Tool for SetObs {
     }
 }
 
+/// A transponder mode the copilot switches to, decoupled from any one
+/// airframe's encoding: [`set_mode`] maps it to the stock actuator AND, where
+/// the airframe's box is an add-on's, to that add-on's own knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XpdrMode {
+    Off,
+    Standby,
+    On,
+    Altitude,
+}
+
+impl XpdrMode {
+    /// The stock `transponder_mode` encoding.
+    fn stock(self) -> i64 {
+        match self {
+            XpdrMode::Off => 0,
+            XpdrMode::Standby => 1,
+            XpdrMode::On => 2,
+            XpdrMode::Altitude => 3,
+        }
+    }
+    fn spoken(self) -> &'static str {
+        match self {
+            XpdrMode::Off => "off",
+            XpdrMode::Standby => "standby",
+            XpdrMode::On => "on",
+            XpdrMode::Altitude => "altitude",
+        }
+    }
+    fn knob(self, k: &crate::aircraft::TransponderModeKnob) -> i64 {
+        match self {
+            XpdrMode::Off => k.off,
+            XpdrMode::Standby => k.standby,
+            XpdrMode::On => k.on,
+            XpdrMode::Altitude => k.altitude,
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "off" => XpdrMode::Off,
+            "standby" => XpdrMode::Standby,
+            "on" => XpdrMode::On,
+            "altitude" => XpdrMode::Altitude,
+            _ => return None,
+        })
+    }
+}
+
+/// The ACTIVE airframe's mode selector, if its transponder is an add-on's own
+/// (see [`crate::aircraft::TransponderModeKnob`]).
+///
+/// Process-wide, so it is republished on EVERY profile swap — including to
+/// `None` — never merely set when an airframe happens to have one. A
+/// published-once flag that outlives an airframe change is how a cold-and-dark
+/// 172 silently killed a Twin Otter's radio for a whole session (2026-07-27);
+/// the same trap here would aim every mode write at a knob the new aircraft
+/// doesn't have.
+static MODE_KNOB: std::sync::Mutex<Option<crate::aircraft::TransponderModeKnob>> =
+    std::sync::Mutex::new(None);
+
+/// Publish (or clear) the active airframe's transponder selector. Called from
+/// the one place the live profile changes.
+pub fn publish_mode_knob(knob: Option<crate::aircraft::TransponderModeKnob>) {
+    *MODE_KNOB.lock().unwrap_or_else(|e| e.into_inner()) = knob;
+}
+
+/// Set the transponder mode on THIS airframe, and confirm it from what the
+/// box actually reads back.
+///
+/// The stock actuator is always written: it is the real input on nearly every
+/// aircraft, and where it isn't, writing it is harmless. Where the profile
+/// names an add-on knob, that knob is written too and is what the readback
+/// believes — on the Twin Otter the stock dataref is an OUTPUT the add-on
+/// rewrites from the knob every frame, so reading it back confirms nothing but
+/// the add-on's own opinion (and its ALT is stock mode 2, not 3).
+///
+/// Returns whether the box now reads what we asked for.
+pub async fn set_mode(xp: &dyn crate::xplane::XPlane, mode: XpdrMode) -> bool {
+    let knob = MODE_KNOB.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let stock_ok = xp.set_int(XPDR_MODE, mode.stock()).await.is_ok();
+    let Some(k) = knob else {
+        return stock_ok
+            && xp
+                .get_float(XPDR_MODE)
+                .await
+                .is_ok_and(|v| v.round() as i64 == mode.stock());
+    };
+    let want = mode.knob(&k);
+    if xp.set_int(&k.dataref, want).await.is_err() {
+        return false;
+    }
+    xp.get_float(&k.dataref)
+        .await
+        .is_ok_and(|v| v.round() as i64 == want)
+}
+
 pub struct SetTransponderMode;
 
 #[derive(Deserialize)]
@@ -320,14 +416,101 @@ impl Tool for SetTransponderMode {
             ctx.xplane.run_command(CMD_XPDR_IDENT).await?;
             return Ok("Roger, ident.".to_string());
         }
-        let (val, spoken) = match a.mode.to_ascii_lowercase().as_str() {
-            "off" => (0, "off"),
-            "standby" => (1, "standby"),
-            "on" => (2, "on"),
-            "altitude" => (3, "altitude"),
-            other => return Ok(format!("I didn't catch the transponder mode '{other}'.")),
+        let Some(mode) = XpdrMode::parse(&a.mode) else {
+            return Ok(format!("I didn't catch the transponder mode '{}'.", a.mode));
         };
-        ctx.xplane.set_int(XPDR_MODE, val).await?;
-        Ok(format!("Roger, transponder {spoken}."))
+        // Confirm the ACTION, not the intent: on an airframe whose box is an
+        // add-on's, the write can land on a dataref nothing reads.
+        Ok(if set_mode(ctx.xplane, mode).await {
+            format!("Roger, transponder {}.", mode.spoken())
+        } else {
+            format!(
+                "I set the transponder to {}, but it's not reading back. Check the box.",
+                mode.spoken()
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The serialising lock below is deliberately held across awaits.
+    #![allow(clippy::await_holding_lock)]
+
+    use super::*;
+    use crate::xplane::FakeXPlane;
+
+    /// The published selector is process-wide (one aircraft is loaded at a
+    /// time), so these tests take turns with it. Held across the awaits on
+    /// purpose — that is the point of the lock, and each test drives its own
+    /// current-thread runtime, so nothing can deadlock behind it.
+    static KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The Twin Otter's KT73 is the add-on's own box: master.lua rewrites the
+    /// stock `transponder_mode` from `TO/radios/KT73SelKnob` every frame, so a
+    /// stock write is a no-op that snaps back and the copilot's standby/ALT
+    /// switching did nothing at all (2026-07-27). The mode write must turn the
+    /// KNOB, and the readback must believe the knob — the airframe's ALT is
+    /// knob 5 driving stock mode 2, so a stock readback would call the right
+    /// answer wrong.
+    #[tokio::test]
+    async fn an_add_on_transponder_gets_its_own_knob_turned() {
+        let _g = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p = crate::aircraft::load("dhc6_twin_otter").expect("twotter profile loads");
+        let knob = p
+            .transponder_mode_knob
+            .clone()
+            .expect("the KT73 selector is wired in the profile");
+        publish_mode_knob(Some(knob.clone()));
+
+        // The box comes back reading ALT (knob 5).
+        let fake = FakeXPlane::with_reads(&[(knob.dataref.as_str(), 5.0)]);
+        assert!(set_mode(&fake, XpdrMode::Altitude).await);
+        assert_eq!(fake.last_write(&knob.dataref), Some(5.0), "the knob turned");
+        // The stock actuator is still written — harmless here, and it is the
+        // real input on every airframe without an add-on box.
+        assert_eq!(fake.last_write(XPDR_MODE), Some(3.0));
+
+        // A knob that doesn't move is reported, not assumed: the copilot
+        // confirms the ACTION, not the intent.
+        let stuck = FakeXPlane::with_reads(&[(knob.dataref.as_str(), 1.0)]);
+        assert!(!set_mode(&stuck, XpdrMode::Altitude).await);
+
+        publish_mode_knob(None);
+    }
+
+    /// With no add-on box the stock actuator IS the input, and nothing else is
+    /// touched.
+    #[tokio::test]
+    async fn a_stock_transponder_is_written_directly() {
+        let _g = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        publish_mode_knob(None);
+        let fake = FakeXPlane::with_reads(&[(XPDR_MODE, 1.0)]);
+        assert!(set_mode(&fake, XpdrMode::Standby).await);
+        assert_eq!(fake.last_write(XPDR_MODE), Some(1.0));
+        assert!(!fake.wrote("TO/radios/KT73SelKnob"));
+    }
+
+    /// The selector is republished on every profile swap, so it can never
+    /// outlive its airframe: swapping off the Twin Otter must not leave the
+    /// next aircraft's mode writes aimed at a knob it doesn't have (the shape
+    /// of the radio-power flag that latched across an airframe change,
+    /// 2026-07-27).
+    #[tokio::test]
+    async fn the_selector_cannot_outlive_its_airframe() {
+        let _g = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p = crate::aircraft::load("dhc6_twin_otter").expect("twotter profile loads");
+        publish_mode_knob(p.transponder_mode_knob.clone());
+        // ...and now a 172, which has no add-on box.
+        let c172 = crate::aircraft::load("cessna_172sp").expect("172 profile loads");
+        assert!(c172.transponder_mode_knob.is_none());
+        publish_mode_knob(c172.transponder_mode_knob.clone());
+
+        let fake = FakeXPlane::with_reads(&[(XPDR_MODE, 3.0)]);
+        assert!(set_mode(&fake, XpdrMode::Altitude).await);
+        assert!(
+            !fake.wrote("TO/radios/KT73SelKnob"),
+            "the Otter's knob must not follow us to the next aircraft"
+        );
     }
 }

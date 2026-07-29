@@ -83,10 +83,37 @@ vlo_kts: 270.0
 # No fixed clean-stall figure: a jet's stall speed varies strongly with weight and
 # config, so the fixed-value airspeed caution is left off (vs_clean_kts unset).
 
-# Static reference figures from the X-Plane MD-82 POM. Takeoff V-speeds (V1/Vr/V2)
-# are weight-dependent and computed per departure, so they're not carried here.
+# The attitude at which the tail touches. The DC-9-80 family is long and
+# famously tail-strike prone, and the auto-takeoff rotation is bounded 2 degrees
+# below this. Luton 2026-07-28: the rotation overshot its 8 degree target to
+# 10.6 at 21 ft and struck the tail. VERIFY against the POM.
+tail_strike_deg: 9.5
+
+# Taxi pacing. The defaults (10/6/4) were tuned on a 172, where 10 knots is a
+# THROTTLE setting; on this airframe it is a BRAKE setting, because an MD-82 at
+# idle thrust rolls past 10 knots on flat pavement by itself, so the governor
+# would ride the brakes the whole taxi. Airline practice is 15-20 knots down a
+# long taxiway, slowing to about 10 through the turns.
+taxi:
+  kts: 18.0
+  turn_kts: 10.0
+  sharp_kts: 6.0
+
+# Static reference figures from the X-Plane MD-82 POM.
+#
+# The V-speeds below are NOT reference trivia — the automation flies them. They
+# were missing, and the fallbacks are stall-based: no vs_clean_kts means vs
+# defaults to 60 kt, so vr came out at 60 x 1.15 = 69 and full auto would have
+# called "rotate" at 69 knots in an MD-82 (2026-07-27). A single mid-weight
+# figure is used, because the automation needs A number and a weight-computed
+# card is future work; they read high at light weight, which is the safe side
+# for a rotation speed.
 reference:
   kind: twin-engine jet
+  vr_kts: 140.0                # rotate, ~130,000 lb (V1 137 / V2 149). VERIFY
+  vy_kts: 200.0                # climb-out + pattern speed the laws hold. VERIFY
+  best_climb_fpm: 2500.0       # initial climb, light; the climb law takes 80%
+  cruise_ias_kts: 250.0        # KIAS the cruise governor holds (~M0.76 up high)
   approach_kts: 140.0          # final approach, full flap / gear down (133-140)
   cruise_kts: 439.0            # long-range cruise (KTAS); max level 500
   max_gross_lb: 140000.0       # MTOW
@@ -95,7 +122,15 @@ reference:
   service_ceiling_ft: 37000.0
   fuel_capacity_gal: 5840.0    # ~48,500 lb Jet A-1
   endurance_hours: 8.0         # ~48,500 lb / 6,000 lb per hour
-  takeoff_distance_ft: 7450.0
+  takeoff_distance_ft: 7450.0   # RECITED: factored field length at MTOW
+  # GROUND ROLL, what the automation checks a runway against (it adds its own
+  # x1.4). At the same mid-weight the V-speeds above assume, ~130,000 lb: the
+  # field length is around 5,500 ft, of which the roll to lift-off is roughly
+  # 4,400. The recited 7,450 above is a FACTORED FIELD LENGTH at max weight and
+  # was being used as a roll — x1.4 demanded 3,179 m, more than the whole of
+  # Luton's runway, so full auto backtracked for length it did not need and then
+  # failed its own lined-up test twice (2026-07-28). VERIFY against the POM.
+  takeoff_roll_ft: 4400.0
   landing_distance_ft: 4850.0
 
 # Laminar's stock MD-82 XChecklist (by royaloak). The copilot reads each item,
@@ -134,6 +169,9 @@ advisor:
 # Flap handle detents 0 / 11 / 15 / 28 / 40 degrees (slats extend automatically).
 # Ratios and per-notch Vfe are best-effort from MD-80 placards — VERIFY in the sim.
 flaps:
+  # Flaps 11 is the normal takeoff setting: the auto takeoff sets it before the
+  # roll and retracts it climbing out. Without this the jet departed clean.
+  takeoff_ratio: 0.275
   detents:
     - { label: up,   spoken: up,             ratio: 0.0 }
     - { label: "11", spoken: eleven,         ratio: 0.275, vfe_kts: 280.0 } # VERIFY

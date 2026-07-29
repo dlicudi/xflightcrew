@@ -20,6 +20,62 @@ use crate::aircraft::FuelSelectorProfile;
 use crate::full_auto::{Mission, Route};
 use crate::tools::autopilot::ApConfig;
 
+/// Which engine start a full-auto sequence runs — one per airframe CLASS, and
+/// they are not interchangeable: the piston start cranks a starter that isn't
+/// there on a turbine and then reports "check fuel and mixture" about levers
+/// the aircraft hasn't got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartKind {
+    Piston,
+    Turboprop,
+    Jet,
+    /// A turbine airframe that declares NO start sequence — the Citation X,
+    /// whose stock systems the MD-82's APU/bleed/cross-tie sequence does not
+    /// fit. There is nothing to crank, so full auto says so instead of
+    /// falling through to the piston start and cranking a starter that isn't
+    /// there (which is exactly what it did to the MD-82 until 2026-07-27).
+    None,
+}
+
+/// The class from the profile's start declarations. The PT6 sequence wins where
+/// an airframe declares both, because a turboprop's start is the specific one;
+/// `turbine_start` alone means a jet with an APU and bleed-air starters. The
+/// absence of both is a piston — but only if the airframe HAS pistons.
+///
+/// The jet arm was MISSING until 2026-07-27: `turbine_start` airframes fell
+/// through to the piston start, so full auto on an MD-82 announced "spinning
+/// up the engine" and then "cranking, the engine hasn't caught" at a cold jet
+/// that was never going to catch. `piston` closes the other half of that hole:
+/// a turbine with no sequence declared is not a piston, it is an airframe we
+/// cannot start.
+pub fn start_kind(turboprop: bool, jet: bool, piston: bool) -> StartKind {
+    match (turboprop, jet, piston) {
+        (true, _, _) => StartKind::Turboprop,
+        (false, true, _) => StartKind::Jet,
+        (false, false, true) => StartKind::Piston,
+        (false, false, false) => StartKind::None,
+    }
+}
+
+impl StartKind {
+    /// How long full auto waits for the engine to be RUNNING after it fires the
+    /// start — a per-class figure, because the three starts are not the same
+    /// order of duration. A piston catches in seconds. The jet sequence is a
+    /// procedure: bleed pressure, then crank/fuel/idle on the right engine, then
+    /// the same again on the left (which is the one full auto watches), and its
+    /// own internal waits alone bound it near three minutes. The single
+    /// piston-shaped 40 s deadline gave up on an MD-82 forty seconds in, while
+    /// the start sequence was still waiting on bleed pressure and went on to
+    /// crank both engines for a full-auto run that had already called "your
+    /// aircraft" (Luton, 2026-07-27).
+    pub fn engine_start_secs(self) -> f64 {
+        match self {
+            StartKind::Jet => 300.0,
+            StartKind::Turboprop | StartKind::Piston | StartKind::None => 40.0,
+        }
+    }
+}
+
 pub struct FullAuto {
     // engine start
     pub fuel_selector: Option<FuelSelectorProfile>,
@@ -31,10 +87,18 @@ pub struct FullAuto {
     /// auto cranks a PT6 with this instead of the piston start (which never
     /// catches on a turbine).
     pub turboprop_start: Option<crate::aircraft::TurbineStartProfile>,
+    /// Jet with an APU (profile `turbine_start`): full auto cranks it with the
+    /// `start_engines` sequence — bleed air, N2, fuel at 20% — not the piston
+    /// start. THREE airframe classes, three starts; the missing third had full
+    /// auto piston-cranking an MD-82 ("cranking, the engine hasn't caught,
+    /// check fuel and mixture") on an aircraft with neither, 2026-07-27.
+    pub jet_start: bool,
     /// EVERY electrical system's ON command — the full bring-up run after the
     /// engine catches (generators AND bleed air, which feed the Twin Otter's
     /// autopilot). Empty on airframes with no electrical profile.
     pub all_electrical_on_cmds: Vec<String>,
+    /// Toggle-only electrical switches (see `tools::all_electrical_toggles`).
+    pub all_electrical_toggles: Vec<crate::aircraft::ToggleSwitch>,
     // taxi / line-up
     pub park_brake_valve_set: Option<f64>,
     pub takeoff_roll_m: Option<f64>,
@@ -47,6 +111,13 @@ pub struct FullAuto {
     /// Constant-speed prop levers, threaded into every ground-roll sub-tool so
     /// they unfeather before taxi/line-up/takeoff. `None` on the pistons.
     pub prop: Option<crate::aircraft::PropProfile>,
+    /// This airframe's taxi pacing, threaded into the ground-roll sub-tools it
+    /// builds — the chain must taxi a jet like a jet, same as a spoken ask.
+    pub pace: crate::autotaxi::Pace,
+    /// Its tail-strike attitude, threaded the same way.
+    pub tail_strike_deg: Option<f64>,
+    /// Vne/Vmo for the climb's overspeed protection.
+    pub vne_kts: Option<f64>,
     // circuit / climb-out
     pub cfg: ApConfig,
     pub vr_kts: f64,
@@ -56,6 +127,11 @@ pub struct FullAuto {
     pub approach_ias: f64,
     /// Turbine airframe → run the APU/electrical power-up before engine start.
     pub power_up_first: bool,
+    /// The airframe has SOME piston start we can fly — the generic `engine`
+    /// group, or a custom cycle-switch sequence (`piston_start`, the DC-3).
+    /// Without it and without a turbine sequence there is no start at all —
+    /// see [`StartKind::None`].
+    pub piston_engine: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -133,12 +209,32 @@ impl Tool for FullAuto {
             )
         };
 
+        let kind = start_kind(
+            self.turboprop_start.is_some(),
+            self.jet_start,
+            self.piston_engine,
+        );
         let sub = crate::full_auto::SubTools {
-            // A turboprop cranks with the PT6 start; everything else with the
-            // piston start. Both run behind full auto's own bus-power step.
-            start_engine: match &self.turboprop_start {
-                Some(ts) => Box::new(crate::tools::cycle::StartTurbines::new(ts.clone())),
-                None => Box::new(crate::tools::engine::StartEngine {
+            no_start_sequence: kind == StartKind::None,
+            // One start per airframe CLASS: a turboprop cranks with the PT6
+            // sequence, a jet with the APU/bleed-air sequence, a piston with
+            // the one-shot start. All run behind full auto's own bus-power
+            // step. Getting this wrong is silent and total — the piston start
+            // on a turbine cranks something that isn't there and reports
+            // "check fuel and mixture" about levers the aircraft hasn't got.
+            start_engine: match (
+                start_kind(
+                    self.turboprop_start.is_some(),
+                    self.jet_start,
+                    self.piston_engine,
+                ),
+                &self.turboprop_start,
+            ) {
+                (StartKind::Turboprop, Some(ts)) => {
+                    Box::new(crate::tools::cycle::StartTurbines::new(ts.clone()))
+                }
+                (StartKind::Jet, _) => Box::new(crate::tools::jet_start::StartEngines),
+                _ => Box::new(crate::tools::engine::StartEngine {
                     fuel_selector: self.fuel_selector.clone(),
                     alternator_on_cmds: self.alternator_on_cmds.clone(),
                     bus_power_on_cmds: self.bus_power_on_cmds.clone(),
@@ -146,16 +242,21 @@ impl Tool for FullAuto {
             },
             bus_power_on_cmds: self.bus_power_on_cmds.clone(),
             all_electrical_on_cmds: self.all_electrical_on_cmds.clone(),
+            all_electrical_toggles: self.all_electrical_toggles.clone(),
             taxi: crate::tools::taxi::AutoTaxi {
                 park_brake_valve_set: self.park_brake_valve_set,
                 prop: self.prop.clone(),
+                pace: self.pace,
             },
             line_up: crate::tools::taxi::LineUp {
                 park_brake_valve_set: self.park_brake_valve_set,
                 takeoff_roll_m: self.takeoff_roll_m,
                 prop: self.prop.clone(),
+                pace: self.pace,
             },
             circuit: crate::tools::circuit::Circuit {
+                tail_strike_deg: self.tail_strike_deg,
+                vne_kts: self.vne_kts,
                 cfg: self.cfg.clone(),
                 vr_kts: self.vr_kts,
                 vy_kts: self.vy_kts,
@@ -167,6 +268,8 @@ impl Tool for FullAuto {
                 prop: self.prop.clone(),
             },
             takeoff: crate::tools::takeoff::AutoTakeoff {
+                tail_strike_deg: self.tail_strike_deg,
+                vne_kts: self.vne_kts,
                 cfg: self.cfg.clone(),
                 vr_kts: self.vr_kts,
                 vy_kts: self.vy_kts,
@@ -179,6 +282,12 @@ impl Tool for FullAuto {
             cruise_ias_kts: self.cruise_ias_kts,
             mission,
             power_up_first: self.power_up_first,
+            engine_start_secs: start_kind(
+                self.turboprop_start.is_some(),
+                self.jet_start,
+                self.piston_engine,
+            )
+            .engine_start_secs(),
         };
         crate::full_auto::start(
             ctx.config.xplane_base_url.clone(),
@@ -294,5 +403,60 @@ impl FullAuto {
             }),
             ack,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every shipped profile is exactly ONE airframe class, and full auto
+    /// picks that class's start. The MD-82 is the case that found the gap:
+    /// `turbine_start` with no `turboprop_start` fell through to the piston
+    /// start, and full auto sat at a cold jet cranking a starter it doesn't
+    /// have, telling the pilot to check a mixture lever it doesn't have
+    /// either (Gatwick, 2026-07-27).
+    #[test]
+    fn full_auto_starts_each_airframe_the_way_its_engines_start() {
+        for (id, want) in [
+            ("cessna_172sp", StartKind::Piston),
+            ("cirrus_sr22", StartKind::Piston),
+            ("dc3", StartKind::Piston),
+            ("lancair_evolution", StartKind::Turboprop),
+            ("dhc6_twin_otter", StartKind::Turboprop),
+            ("king_air_c90b", StartKind::Turboprop),
+            ("md82", StartKind::Jet),
+            // The Citation X is a turbofan, but the generic crank/fuel/idle
+            // sequence fits it once the fuel goes in on N2 — so it starts
+            // through the same path a PT6 does, not the MD-82's APU/bleed one.
+            ("citation_x", StartKind::Turboprop),
+        ] {
+            let p = crate::aircraft::load(id).unwrap_or_else(|| panic!("{id} profile loads"));
+            let got = start_kind(
+                p.turboprop_start.is_some(),
+                p.turbine_start,
+                p.engine || p.piston_start.is_some(),
+            );
+            assert_eq!(got, want, "{id}");
+            // A jet has no piston engine group to fall back on, which is
+            // exactly why the wrong start is silent and total.
+            if got == StartKind::Jet {
+                assert!(!p.engine, "{id}: a jet declares no piston engine group");
+            }
+        }
+    }
+
+    /// The wait for the engine has to cover the start it just fired. The jet
+    /// sequence's own internal waits bound it near three minutes (bleed
+    /// pressure, then crank/fuel/idle twice), so a deadline shorter than that
+    /// gives up on a start that is still running normally — which is what a
+    /// single 40 s figure did at Luton on 2026-07-27.
+    #[test]
+    fn the_engine_wait_outlasts_the_start_it_fired() {
+        let jet = StartKind::Jet.engine_start_secs();
+        assert!(jet >= 200.0, "jet start deadline too short: {jet}");
+        assert!(jet > StartKind::Piston.engine_start_secs());
+        assert!(StartKind::Piston.engine_start_secs() >= 30.0);
+        assert!(StartKind::Turboprop.engine_start_secs() >= 30.0);
     }
 }

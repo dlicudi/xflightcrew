@@ -10,6 +10,7 @@
 mod aircraft;
 mod approach_guide;
 mod audio;
+mod auto_status;
 mod autoland;
 mod autotakeoff;
 mod autotaxi;
@@ -29,6 +30,7 @@ mod phrase;
 mod plugin_status;
 mod prefs;
 mod procedure;
+mod pushback;
 mod radiofx;
 mod rag;
 mod readback;
@@ -678,8 +680,11 @@ async fn main() -> Result<()> {
 }
 
 /// Poll the plugin panel's request dataref (`xcopilot/request`) and turn button
-/// presses into commands on the typed-command channel: 1 = "take control",
-/// 2 = "land the aircraft", 3 = "my controls". The value is consumed (written
+/// presses into commands on the typed-command channel — the phrases live in
+/// [`auto_status::REQUEST_PHRASES`], the same English a pilot would speak, so
+/// a button can never do anything the voice can't. CANCEL (code 11) has no
+/// fixed phrase: the cancel is per-automation in the grammar, so the phrase is
+/// picked from whatever is actually running. The value is consumed (written
 /// back to 0) once injected, so a press fires exactly once. Best-effort like the
 /// status sink: no plugin / no X-Plane just means the buttons do nothing.
 fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::Sender<String>) {
@@ -715,18 +720,26 @@ fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::Sender<Stri
                 id = None; // stale id (sim restarted) — re-resolve
                 continue;
             };
-            let cmd = match v {
-                1 => "take control",
-                2 => "land the aircraft",
-                3 => "my controls",
-                _ => continue,
+            let cmd = if v == auto_status::REQUEST_CANCEL {
+                auto_status::cancel_phrase()
+            } else {
+                auto_status::REQUEST_PHRASES
+                    .iter()
+                    .find(|(code, _)| *code == v)
+                    .map(|(_, phrase)| *phrase)
             };
-            tracing::info!(request = v, cmd, "panel button request");
-            // Consume first so a slow channel can't double-fire the request.
-            let _ = http
-                .patch(&url)
-                .json(&serde_json::json!({ "data": 0 }))
-                .send();
+            if v != 0 {
+                tracing::info!(request = v, cmd, "panel button request");
+                // Consume first so a slow channel can't double-fire the
+                // request — and even a code with nothing to say (CANCEL with
+                // nothing running, an unknown code from a newer plugin) is
+                // consumed, or it would re-log every 300 ms forever.
+                let _ = http
+                    .patch(&url)
+                    .json(&serde_json::json!({ "data": 0 }))
+                    .send();
+            }
+            let Some(cmd) = cmd else { continue };
             if tx.send(cmd.to_string()).is_err() {
                 return; // session gone
             }
@@ -744,6 +757,12 @@ const DR_OPT_MODE: &str = "xcopilot/opt/mode";
 /// The panel's cabin-crew radio buttons (Auto / Aboard / Off) — values are
 /// `cabin::Staffing::panel_index`, `-1` = plugin default (unpublished).
 const DR_OPT_CABIN: &str = "xcopilot/opt/cabin_crew";
+/// The panel's UI-scale radio buttons (100% / 125% / 150%, index 0/1/2) —
+/// purely a panel concern; the app remembers the pick and republishes it
+/// across plugin reloads and boots. `-1` = plugin default (unpublished).
+const DR_OPT_UI_SCALE: &str = "xcopilot/opt/ui_scale";
+/// The UI scale the app currently holds for the publish/pick protocol.
+static UI_SCALE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// Publish the pilot-voice roster (every piper model on disk) to the plugin's
 /// Settings picker, then poll for picks. A pick swaps the copilot's voice live
@@ -896,7 +915,25 @@ fn spawn_settings_poller(base_url: String) {
                 }
             },
         },
+        PanelSetting {
+            dref: DR_OPT_UI_SCALE,
+            id: None,
+            current: || UI_SCALE.load(std::sync::atomic::Ordering::Relaxed),
+            apply: |v| {
+                if (0..=2).contains(&v) {
+                    tracing::info!(ui_scale = v, "panel UI scale pick");
+                    UI_SCALE.store(v, std::sync::atomic::Ordering::Relaxed);
+                    prefs::save_ui_scale(v);
+                }
+            },
+        },
     ];
+    // The scale is pure remembered state — seed it from prefs so the first
+    // publish shows the saved pick, not a hardcoded default.
+    UI_SCALE.store(
+        prefs::ui_scale().unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     std::thread::spawn(move || {
         let Ok(http) = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
@@ -997,6 +1034,8 @@ pub(crate) struct LiveProfile {
 
 impl LiveProfile {
     fn new(p: aircraft::AircraftProfile) -> std::sync::Arc<Self> {
+        tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
+        aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
         std::sync::Arc::new(Self {
             inner: std::sync::RwLock::new(p),
             generation: std::sync::atomic::AtomicU64::new(0),
@@ -1014,6 +1053,12 @@ impl LiveProfile {
         self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
     fn swap(&self, p: aircraft::AircraftProfile) {
+        // Republished on EVERY swap, including to None: a selector that
+        // outlives its airframe aims the next aircraft's mode writes at a knob
+        // it doesn't have (the same shape as the radio-power flag that latched
+        // across a 172 -> Twin Otter change, 2026-07-27).
+        tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
+        aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
         *self.inner.write().unwrap() = p;
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -3484,6 +3529,8 @@ fn icao_to_profile(icao: &str) -> String {
         "C172" => "cessna_172sp",
         "SR22" => "cirrus_sr22",
         "MD82" | "MD80" | "MD83" | "MD88" => "md82",
+        "C750" | "C75B" => "citation_x",
+        "SF50" => "cirrus_vision_sf50",
         "DC3" | "DC30" => "dc3",
         "BE9L" | "BE9T" | "C90" | "C90B" => "king_air_c90b",
         "EVOT" | "EVOP" => "lancair_evolution",
@@ -5884,57 +5931,8 @@ async fn poll_aircraft(xp: &XPlaneClient) -> Option<ui::Aircraft> {
         vsi: xp.get_float(datarefs::VVI_FPM).await.ok()?,
         flaps_pct: xp.get_float(datarefs::FLAP_RATIO).await.ok()? * 100.0,
         ap_mode: ap_mode(xp, None).await,
-        managing: active_managers(),
+        managing: auto_status::active_managers(),
     })
-}
-
-/// What the copilot is actively managing right now — the continuous control
-/// loops that keep working between commands — one short line each, for the
-/// dashboard's "managing" panel. Ordered by priority: an emergency (autoland /
-/// recovery, both publish through [`autoland::PANEL`]) outranks the routine
-/// governors. Cheap atomic/mutex reads, safe to poll every tick.
-fn active_managers() -> Vec<String> {
-    let mut v = Vec::new();
-    if let Ok(p) = autoland::PANEL.lock() {
-        if !p.is_empty() {
-            v.push(p.clone());
-        }
-    }
-    // Recovery without a panel line yet (the watcher writes it a beat later).
-    if v.is_empty() && tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        v.push("recovery".to_string());
-    }
-    if let Some(a) = approach_guide::armed() {
-        v.push(format!("talk-down {} {}", a.icao, a.runway_id));
-    }
-    if let Some(s) = full_auto::status() {
-        v.push(s);
-    }
-    if let Some(s) = circuit::status() {
-        v.push(s);
-    }
-    if let Some(s) = procedure::status() {
-        v.push(s);
-    }
-    if let Some(s) = autotakeoff::status() {
-        v.push(s);
-    }
-    if let Some(s) = autotaxi::status() {
-        v.push(s);
-    }
-    if let Some(s) = tools::speedhold::status() {
-        v.push(s);
-    }
-    if tools::controls::brakes_held() {
-        v.push("holding brakes".to_string());
-    }
-    if let Some(s) = tools::reverse::status() {
-        v.push(s);
-    }
-    if let Some(s) = tools::engine::mixture_status() {
-        v.push(s.to_string());
-    }
-    v
 }
 
 /// Summarize the active autopilot lateral mode for the panel. Reads prefer the
@@ -7022,6 +7020,191 @@ mod tests {
     }
 
     #[test]
+    fn citation_x_loads_with_the_poms_own_figures() {
+        let p = super::aircraft::load("citation_x").expect("citation_x profile loads");
+        assert_eq!(super::icao_to_profile("C750"), "citation_x");
+        assert!(p.autopilot && p.throttle && p.retractable_gear);
+        assert!(!p.engine, "a jet declares no piston engine group");
+        // POM p.80: Vr 145, Vref 132, Vs1 clean 136, Vle 210. Vmo is altitude
+        // dependent (270 low / 350 high) and the low figure is the one flown.
+        let r = p.reference.as_ref().expect("reference figures");
+        assert_eq!(r.vr_kts, Some(145.0));
+        assert_eq!(r.approach_kts, Some(132.0));
+        assert_eq!(p.vs_clean_kts, Some(136.0));
+        assert_eq!(p.vlo_kts, Some(210.0));
+        assert_eq!(p.vne_kts, Some(270.0));
+        // The POM's Vy of 300 KIAS is a cruise climb, and a 300 kt circuit is
+        // not a circuit. The profile carries a departure speed, and the
+        // pattern is capped against the approach speed regardless.
+        let vy = r.vy_kts.expect("vy");
+        assert!(vy <= 200.0, "vy is a climb-out speed, got {vy}");
+        let pat = super::circuit::pattern_speed_kts(vy, r.approach_kts.unwrap());
+        assert!(pat <= 198.0, "pattern capped at 1.5x approach, got {pat}");
+        // The runway it demands must fit the runways it flies from.
+        let roll_m = r.takeoff_roll_ft.expect("ground roll") * 0.3048;
+        assert!(
+            roll_m * 1.4 < 2162.0,
+            "must fit Luton: {:.0} m",
+            roll_m * 1.4
+        );
+    }
+
+    /// The SF50 is a jet whose xlua is cosmetic, so the whole profile stands on
+    /// STOCK datarefs — the one custom thing is the start, which is two button
+    /// presses in a fixed order rather than a crank.
+    #[test]
+    fn sf50_is_a_stock_systems_jet_with_a_two_press_start() {
+        let p = super::aircraft::load("cirrus_vision_sf50").expect("sf50 profile loads");
+        assert_eq!(super::icao_to_profile("SF50"), "cirrus_vision_sf50");
+        assert!(p.autopilot && p.throttle && p.retractable_gear);
+        assert!(
+            !p.engine && !p.magnetos && !p.carb_heat,
+            "a jet declares no piston systems"
+        );
+        // No autothrottle on this model, so speed must be the throttle
+        // governor's — declaring one withholds `hold_speed` entirely, which is
+        // how "reduce speed" became a no-op on the Citation X (2026-07-28).
+        let reg = super::tools::Registry::for_aircraft(&p);
+        assert!(reg.get("hold_speed").is_some(), "speed is the governor's");
+        assert!(reg.get("set_speed").is_none());
+        assert!(reg.get("autothrottle").is_none());
+        // The ground drives exist on a jet too (the same 2026-07-28 gate).
+        for t in ["auto_taxi", "line_up", "taxi_to_parking"] {
+            assert!(reg.get(t).is_some(), "a jet needs {t}");
+        }
+        // Turbine start, not the piston one-shot.
+        assert!(reg.get("start_engines").is_some());
+        assert!(reg.get("start_engine").is_none());
+        let s = p.turboprop_start.as_ref().expect("a start sequence");
+        // No APU anywhere on this airframe: nothing to bring up before cranking.
+        assert!(s.apu.is_none(), "the SF50 has no APU");
+        // The ignition knob is a PREREQUISITE, not a nicety: the START button's
+        // handler only latches when knob_state == 1, so pressing it with the
+        // knob at OFF silently sets button_state to 0 instead.
+        assert_eq!(
+            s.ignition_arm.first().map(String::as_str),
+            Some("laminar/SF50/ignition_up")
+        );
+        assert_eq!(
+            s.start_up.first().map(String::as_str),
+            Some("laminar/SF50/eng_start_stop_toggle")
+        );
+        // Momentary presses, both of them — nothing to hold and nothing to
+        // release (the Citation X's starter is the opposite case).
+        assert!(!s.starter_held, "the SF50's controls are momentary presses");
+        assert!(s.start_dn.is_empty());
+        // Securing the aircraft is the KNOB, not the mixture: `ignition_down`
+        // is what drops the boost pump and igniter and fires the sim's own
+        // shutdown. Cutting fuel alone leaves both live with the knob at RUN.
+        assert_eq!(
+            s.shutdown_commands,
+            vec!["laminar/SF50/ignition_down".to_string()]
+        );
+        // ...and every airframe that has no such control keeps the old
+        // lever-only shutdown untouched.
+        for id in [
+            "dhc6_twin_otter",
+            "king_air_c90b",
+            "lancair_evolution",
+            "citation_x",
+        ] {
+            let t = crate::aircraft::load(id)
+                .and_then(|a| a.turboprop_start)
+                .unwrap_or_else(|| panic!("{id} start"));
+            assert!(t.shutdown_commands.is_empty(), "{id} secures on the levers");
+        }
+        // A turbofan's idle N1 is nowhere near the PT6 default of 50, and the
+        // script's own figure (N2 > 54, where it cuts its starter) says nothing
+        // about N1 — too high a threshold waits for a number that never comes.
+        assert!(s.n1_idle < 30.0, "{}", s.n1_idle);
+        // The stall band is set so the flap-adjusted stall lands on the real
+        // Vso of 67, clear of the POM's own 87 kt landing speed: the .acf's 75
+        // warns at the stall itself, and the POM's Vs1 of 86 cautions on every
+        // approach ever flown.
+        let r = p.reference.as_ref().expect("reference figures");
+        let vs_clean = p.vs_clean_kts.expect("clean stall");
+        let full_flap_vs = vs_clean * (1.0 - 0.17);
+        let approach = r.approach_kts.expect("approach speed");
+        assert!(
+            1.20 * full_flap_vs < approach,
+            "the caution band must sit below the approach speed: {:.0} vs {approach}",
+            1.20 * full_flap_vs
+        );
+        assert!(
+            1.10 * full_flap_vs > r.vs0_kts.expect("vs0"),
+            "the warning must come BEFORE the stall"
+        );
+        // Vy carries a climb-out speed, not the POM's 160 kt cruise climb.
+        let vy = r.vy_kts.expect("vy");
+        assert!(vy <= 140.0, "vy is a climb-out speed, got {vy}");
+        // Three flap positions, takeoff at the middle one, descending Vfe
+        // ladder. The labels are DEGREES (the EIS gauge is scaled UP/10/35 and
+        // the checklist says "FLAPS - SET (10 Degrees)"), not the lever's
+        // 50%/100% - both name the same three positions.
+        let f = p.flaps.as_ref().expect("flaps");
+        assert_eq!(f.detents.len(), 3);
+        assert_eq!(f.takeoff_ratio, Some(0.5));
+        assert_eq!(f.detents[1].label, "10");
+        assert_eq!(f.detents[2].label, "35");
+        assert!(f.detents[2].vfe_kts < f.detents[1].vfe_kts);
+        // The gear limit is the COCKPIT PLACARD ("Vlo ret 160 KIAS", legible in
+        // the POM's p.50 photograph), not the p.61 table — which gives Vlo 170
+        // against a Vle of 150, an extended limit below the operating limit,
+        // which no aircraft is placarded with. The placard's other half (Vle
+        // 210) matches the .acf exactly, which is what makes the reading safe.
+        assert_eq!(p.vlo_kts, Some(160.0));
+        // Three exterior lights and no taxi light: the cockpit object's
+        // complete manipulator list is nav, landing and strobe, whatever the
+        // POM's before-taxi and parking checklists call for.
+        let keys: Vec<&str> = p.lights.iter().map(|l| l.key.as_str()).collect();
+        assert_eq!(keys, vec!["nav", "strobe", "landing"]);
+        // The checklist is transcribed from the POM's image-only pages, and
+        // parses into runnable lists rather than a wall of call-outs.
+        let text = std::fs::read_to_string(p.checklist.as_ref().expect("a checklist"))
+            .expect("the checklist file exists");
+        let lists = super::checklist::parse(&text, &p);
+        assert!(
+            lists.len() >= 8,
+            "one list per POM section: {}",
+            lists.len()
+        );
+        // A checklist whose every line is a call-out is a transcription, not a
+        // copilot. The map must actually connect: the lights, gear, flaps,
+        // brake, transponder and electrical items are ours to perform.
+        use super::checklist::Item;
+        let acted = lists
+            .iter()
+            .flat_map(|c| &c.items)
+            .filter(|i| matches!(i, Item::Act { .. }))
+            .count();
+        assert!(
+            acted >= 12,
+            "the map must connect: only {acted} acted items"
+        );
+        // ...and the "AS REQUIRED" / "CHECK" rows must stay observe-only —
+        // writing a probe-heat item the POM leaves to the pilot is not ours.
+        let forced = lists.iter().flat_map(|c| &c.items).any(|i| {
+            matches!(i, Item::Verify { say, settable, .. }
+                     if *settable && say.to_ascii_lowercase().contains("as required"))
+        });
+        assert!(!forced, "an 'as required' item must never be auto-set");
+        // ...and no ITEM may call for a taxi light, which this aircraft has not
+        // got — the two POM rows are dropped on purpose. (The `#` header
+        // explains the omission, so only real item lines are checked.)
+        assert!(
+            !text
+                .lines()
+                .filter(|l| l.trim_start().starts_with("sw_item"))
+                .any(|l| l.to_ascii_lowercase().contains("taxi light")),
+            "the taxi-light rows must stay dropped"
+        );
+        // The fuel selector has no OFF position (POM p.29: AUTO/LEFT/RIGHT).
+        let fs = p.fuel_selector.as_ref().expect("fuel selector");
+        assert!(fs.positions.iter().all(|q| q.key != "off"));
+        assert_eq!(fs.positions.len(), 3);
+    }
+
+    #[test]
     fn md82_is_a_jet_with_gear_no_piston_tools() {
         let p = super::aircraft::load("md82").expect("md82 profile loads");
         assert_eq!(p.id, "md82");
@@ -7080,6 +7263,71 @@ mod tests {
         assert_eq!(
             p.reference.as_ref().and_then(|r| r.approach_kts),
             Some(140.0)
+        );
+        // The runway the automation demands must fit runways this aircraft
+        // actually operates from. The recited 7,450 ft is a FACTORED FIELD
+        // LENGTH at max weight; read as a ground roll it earned a x1.4 on top
+        // and asked for 3,179 m — more than the whole of Luton's 2,162 m 25,
+        // so the line-up backtracked for length it did not need and full auto
+        // then failed its own lined-up test twice (2026-07-28).
+        let roll_m = p
+            .reference
+            .as_ref()
+            .and_then(|r| r.takeoff_roll_ft.or(r.takeoff_distance_ft))
+            .expect("md82 declares a takeoff roll")
+            * 0.3048;
+        assert!(
+            roll_m * 1.4 < 2162.0,
+            "an MD-82 must be able to depart Luton: needs {:.0} m of 2162",
+            roll_m * 1.4
+        );
+        // ...and the recited figure is still the POM one, unchanged.
+        assert_eq!(
+            p.reference.as_ref().and_then(|r| r.takeoff_distance_ft),
+            Some(7450.0)
+        );
+        // This model has no autothrottle, whatever the real aircraft has: the
+        // speed tool must be the throttle governor, not an AP bug with nothing
+        // behind it. Declaring one also withheld `hold_speed` entirely, so
+        // "reduce speed" did nothing at all (2026-07-28).
+        let cit_reg = super::tools::Registry::for_aircraft(
+            &super::aircraft::load("citation_x").expect("citation_x loads"),
+        );
+        assert!(
+            cit_reg.get("hold_speed").is_some(),
+            "speed is the governor's"
+        );
+        assert!(cit_reg.get("set_speed").is_none());
+        assert!(cit_reg.get("autothrottle").is_none());
+        // A toggle-only system must not be skipped by the bulk power-up: the
+        // Citation's avionics master has no ON command, so "all electrical on"
+        // fired nothing for it and full auto left the radios dead while
+        // announcing the electrical was set (2026-07-28).
+        let cit = super::aircraft::load("citation_x").expect("citation_x loads");
+        let toggles = super::tools::all_electrical_toggles(&cit.electrical);
+        assert!(
+            toggles.iter().any(|t| t.dataref.contains("avionics")),
+            "the bulk power-up must reach the avionics master"
+        );
+        // The ground drives exist on a jet too. They were gated behind
+        // `!autothrottle` alongside the airborne speed tool, so neither jet had
+        // a taxi, line-up or park tool and "taxi for me" reached nothing —
+        // only full auto worked, because it builds its own (2026-07-28).
+        for t in ["auto_taxi", "line_up", "taxi_to_parking"] {
+            assert!(reg.get(t).is_some(), "a jet needs {t}");
+        }
+        // ...but the airborne speed tool is still the AP's bug on an airliner.
+        assert!(
+            reg.get("hold_speed").is_none(),
+            "an autothrottle airframe sets the speed bug, not a throttle hold"
+        );
+        assert!(reg.get("set_speed").is_some());
+        // A jet taxis like a jet: the GA 10/6/4 is a brake setting on this
+        // airframe, which rolls past 10 knots at idle thrust on its own.
+        let pace = super::autotaxi::Pace::from_profile(p.taxi.as_ref());
+        assert!(
+            pace.straight > 15.0 && pace.turn >= 8.0,
+            "MD-82 must taxi briskly, got {pace:?}"
         );
         // ...and the piston 172 is the other way round.
         let c172 =
