@@ -147,7 +147,11 @@ impl Tool for SetLights {
                 None => ctx.xplane.get_float(rb).await?,
             } > 0.5;
             return Ok(if actual_on == args.on {
-                format!("Roger, {} {}.", light.spoken, if args.on { "on" } else { "off" })
+                format!(
+                    "Roger, {} {}.",
+                    light.spoken,
+                    if args.on { "on" } else { "off" }
+                )
             } else {
                 format!("The {} didn't move.", light.spoken)
             });

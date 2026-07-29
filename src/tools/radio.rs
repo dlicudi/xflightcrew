@@ -417,10 +417,7 @@ impl Tool for SetTransponderMode {
             return Ok("Roger, ident.".to_string());
         }
         let Some(mode) = XpdrMode::parse(&a.mode) else {
-            return Ok(format!(
-                "I didn't catch the transponder mode '{}'.",
-                a.mode
-            ));
+            return Ok(format!("I didn't catch the transponder mode '{}'.", a.mode));
         };
         // Confirm the ACTION, not the intent: on an airframe whose box is an
         // add-on's, the write can land on a dataref nothing reads.

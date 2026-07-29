@@ -480,9 +480,9 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             match (lat_r, lon_r) {
                 (Ok(lat), Ok(lon)) => crate::party_line::with_taxi_route(|r| {
                     r.map(|w| {
-                        w.path.iter().any(|p| {
-                            crate::nav::haversine_nm(lat, lon, p.0, p.1) * 1852.0 < 200.0
-                        })
+                        w.path
+                            .iter()
+                            .any(|p| crate::nav::haversine_nm(lat, lon, p.0, p.1) * 1852.0 < 200.0)
                     })
                 })
                 .unwrap_or(false),
@@ -566,8 +566,8 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 xp.get_float(LON),
                 xp.get_float(crate::autotaxi::PSI_TRUE),
             );
-            let path =
-                crate::party_line::with_taxi_route(|r| r.map(|w| w.path.clone())).unwrap_or_default();
+            let path = crate::party_line::with_taxi_route(|r| r.map(|w| w.path.clone()))
+                .unwrap_or_default();
             if let (Ok(lat), Ok(lon), Ok(psi)) = (lat_r, lon_r, psi_r) {
                 if let Some(plan) = crate::pushback::plan(lat, lon, psi, &path) {
                     announce(

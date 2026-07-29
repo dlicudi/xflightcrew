@@ -7042,7 +7042,11 @@ mod tests {
         assert!(pat <= 198.0, "pattern capped at 1.5x approach, got {pat}");
         // The runway it demands must fit the runways it flies from.
         let roll_m = r.takeoff_roll_ft.expect("ground roll") * 0.3048;
-        assert!(roll_m * 1.4 < 2162.0, "must fit Luton: {:.0} m", roll_m * 1.4);
+        assert!(
+            roll_m * 1.4 < 2162.0,
+            "must fit Luton: {:.0} m",
+            roll_m * 1.4
+        );
     }
 
     /// The SF50 is a jet whose xlua is cosmetic, so the whole profile stands on
@@ -7098,7 +7102,12 @@ mod tests {
         );
         // ...and every airframe that has no such control keeps the old
         // lever-only shutdown untouched.
-        for id in ["dhc6_twin_otter", "king_air_c90b", "lancair_evolution", "citation_x"] {
+        for id in [
+            "dhc6_twin_otter",
+            "king_air_c90b",
+            "lancair_evolution",
+            "citation_x",
+        ] {
             let t = crate::aircraft::load(id)
                 .and_then(|a| a.turboprop_start)
                 .unwrap_or_else(|| panic!("{id} start"));
@@ -7154,7 +7163,11 @@ mod tests {
         let text = std::fs::read_to_string(p.checklist.as_ref().expect("a checklist"))
             .expect("the checklist file exists");
         let lists = super::checklist::parse(&text, &p);
-        assert!(lists.len() >= 8, "one list per POM section: {}", lists.len());
+        assert!(
+            lists.len() >= 8,
+            "one list per POM section: {}",
+            lists.len()
+        );
         // A checklist whose every line is a call-out is a transcription, not a
         // copilot. The map must actually connect: the lights, gear, flaps,
         // brake, transponder and electrical items are ours to perform.
@@ -7164,7 +7177,10 @@ mod tests {
             .flat_map(|c| &c.items)
             .filter(|i| matches!(i, Item::Act { .. }))
             .count();
-        assert!(acted >= 12, "the map must connect: only {acted} acted items");
+        assert!(
+            acted >= 12,
+            "the map must connect: only {acted} acted items"
+        );
         // ...and the "AS REQUIRED" / "CHECK" rows must stay observe-only —
         // writing a probe-heat item the POM leaves to the pilot is not ours.
         let forced = lists.iter().flat_map(|c| &c.items).any(|i| {
@@ -7277,7 +7293,10 @@ mod tests {
         let cit_reg = super::tools::Registry::for_aircraft(
             &super::aircraft::load("citation_x").expect("citation_x loads"),
         );
-        assert!(cit_reg.get("hold_speed").is_some(), "speed is the governor's");
+        assert!(
+            cit_reg.get("hold_speed").is_some(),
+            "speed is the governor's"
+        );
         assert!(cit_reg.get("set_speed").is_none());
         assert!(cit_reg.get("autothrottle").is_none());
         // A toggle-only system must not be skipped by the bulk power-up: the

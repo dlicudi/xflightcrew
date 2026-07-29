@@ -447,9 +447,8 @@ const BRAKE_STEER_FULL_KTS: f64 = 7.0;
 /// the pilot slowing the aircraft. The governor's speed loop simply carries
 /// the extra drag.
 pub fn brake_steer_split(steer: f64, gs_kts: f64) -> (f64, f64) {
-    let authority =
-        ((gs_kts - BRAKE_STEER_MIN_KTS) / (BRAKE_STEER_FULL_KTS - BRAKE_STEER_MIN_KTS))
-            .clamp(0.0, 1.0);
+    let authority = ((gs_kts - BRAKE_STEER_MIN_KTS) / (BRAKE_STEER_FULL_KTS - BRAKE_STEER_MIN_KTS))
+        .clamp(0.0, 1.0);
     let excess = ((steer.abs() - BRAKE_STEER_DEADBAND) / (BRAKE_STEER_SAT - BRAKE_STEER_DEADBAND))
         .clamp(0.0, 1.0);
     let b = excess * BRAKE_STEER_MAX * authority;
@@ -1379,10 +1378,8 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             let changed = (bl - bs_prev.0).abs() > 0.02 || (br - bs_prev.1).abs() > 0.02;
             let releasing = bs_on && bl <= 0.001 && br <= 0.001;
             if (bl > 0.0 || br > 0.0) && changed {
-                let (a, b) = tokio::join!(
-                    xp.set_float(LEFT_BRAKE, bl),
-                    xp.set_float(RIGHT_BRAKE, br)
-                );
+                let (a, b) =
+                    tokio::join!(xp.set_float(LEFT_BRAKE, bl), xp.set_float(RIGHT_BRAKE, br));
                 let _ = (a, b);
                 bs_prev = (bl, br);
                 bs_on = true;
@@ -1522,11 +1519,16 @@ mod tests {
     fn steering_is_proportional_and_bounded() {
         assert_eq!(steer_cmd_with(0.0, STEER_FULL_DEG), 0.0);
         assert!(
-            steer_cmd_with(10.0, STEER_FULL_DEG) > 0.0 && steer_cmd_with(10.0, STEER_FULL_DEG) < 1.0,
+            steer_cmd_with(10.0, STEER_FULL_DEG) > 0.0
+                && steer_cmd_with(10.0, STEER_FULL_DEG) < 1.0,
             "right of course, steer right"
         );
         assert!(steer_cmd_with(-10.0, STEER_FULL_DEG) < 0.0);
-        assert_eq!(steer_cmd_with(90.0, STEER_FULL_DEG), 1.0, "full deflection is the cap");
+        assert_eq!(
+            steer_cmd_with(90.0, STEER_FULL_DEG),
+            1.0,
+            "full deflection is the cap"
+        );
         assert_eq!(steer_cmd_with(-170.0, STEER_FULL_DEG), -1.0);
     }
 
@@ -1598,8 +1600,8 @@ mod tests {
         jet.pace = Pace::from_profile(Some(&crate::aircraft::TaxiProfile {
             kts: Some(18.0),
             turn_kts: Some(10.0),
-            sharp_kts: Some(6.0),            ..Default::default()
-
+            sharp_kts: Some(6.0),
+            ..Default::default()
         }));
         assert_eq!(jet.pace.straight, 18.0);
         assert_eq!(schedule_kts(18.0, &jet, 50.0, 18.0), 18.0, "open taxiway");
@@ -1616,8 +1618,8 @@ mod tests {
         let partial = Pace::from_profile(Some(&crate::aircraft::TaxiProfile {
             kts: Some(15.0),
             turn_kts: None,
-            sharp_kts: None,            ..Default::default()
-
+            sharp_kts: None,
+            ..Default::default()
         }));
         assert_eq!(partial.straight, 15.0);
         assert_eq!(partial.turn, TURN_KTS);
@@ -1626,8 +1628,8 @@ mod tests {
         let absurd = Pace::from_profile(Some(&crate::aircraft::TaxiProfile {
             kts: Some(180.0),
             turn_kts: Some(90.0),
-            sharp_kts: Some(0.0),            ..Default::default()
-
+            sharp_kts: Some(0.0),
+            ..Default::default()
         }));
         assert_eq!(absurd.straight, 25.0);
         assert_eq!(absurd.turn, 25.0);
@@ -1704,7 +1706,10 @@ mod tests {
         // a one-sided 9 m offset the whole way (2026-07-29).
         assert_eq!(r, BRAKE_STEER_MAX, "saturated by {BRAKE_STEER_SAT}: {r}");
         let (_, mid) = brake_steer_split(0.55, 10.0);
-        assert!(mid > 0.8 * BRAKE_STEER_MAX, "tracking-band command near max: {mid}");
+        assert!(
+            mid > 0.8 * BRAKE_STEER_MAX,
+            "tracking-band command near max: {mid}"
+        );
         assert!(brake_steer_split(1.0, 60.0).1 <= BRAKE_STEER_MAX);
         // min(left, right) is zero in every case above — the governor can
         // never read the assist as the pilot slowing the aircraft.
@@ -1740,7 +1745,10 @@ mod tests {
         // Symmetric, and it converges rather than ringing past the target.
         assert!((slew_steer(0.0, -1.0, Some(0.8), 0.2) + 0.16).abs() < 1e-9);
         let near = slew_steer(0.5, 0.52, Some(0.8), 0.2);
-        assert!((near - 0.52).abs() < 1e-9, "small moves pass through: {near}");
+        assert!(
+            (near - 0.52).abs() < 1e-9,
+            "small moves pass through: {near}"
+        );
     }
 
     /// The steering law is per-airframe because the PLANT is. Measured over the
@@ -1771,12 +1779,13 @@ mod tests {
         let slew = sf.steer_slew_per_s.expect("a rate limit");
         // Generous on purpose: a tight slew is its own limit cycle, and the
         // aircraft's own p90 lever rate over the whole taxi was 0.18/s.
-        assert!(slew >= 0.5, "a tight slew re-creates the oscillation: {slew}");
+        assert!(
+            slew >= 0.5,
+            "a tight slew re-creates the oscillation: {slew}"
+        );
         // Same error, less lever — that is the thing the cabin feels.
         let err = 18.0;
-        assert!(
-            steer_cmd_with(err, sf.steer_full_deg) < steer_cmd_with(err, c172.steer_full_deg)
-        );
+        assert!(steer_cmd_with(err, sf.steer_full_deg) < steer_cmd_with(err, c172.steer_full_deg));
         // And a longer aim: ~3.5 deg/s of yaw cannot fly the 5 s aim's
         // crossings — it met the centreline 24 degrees angled and S-weaved
         // ±10 m (2026-07-29). Same offset, shallower ask.
@@ -2183,7 +2192,10 @@ mod tests {
         assert!(reached, "the entry never reaches the centreline");
         // ...and it still ends in the turn pocket by the numbers.
         let last = *path.last().unwrap();
-        assert!(a_of(last) < BACKTRACK_TURN_START_M + 5.0, "ends at the numbers");
+        assert!(
+            a_of(last) < BACKTRACK_TURN_START_M + 5.0,
+            "ends at the numbers"
+        );
         // The synthetic fallback is what it replaces: that one leaves the stub
         // immediately, which is the bug.
         let synth = backtrack_pocket_path(&rwy, hlat, hlon).expect("synthetic exists");

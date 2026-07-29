@@ -923,7 +923,10 @@ impl Tool for LevelOff {
         // Converging to cruise from either direction is the safe default until
         // airspeed-aware power management lands — making it conditional (leave the
         // pilot's setting) would risk that decay when levelling from a descent.
-        let _ = ctx.xplane.set_float(&throttle_dref(), CRUISE_THROTTLE).await;
+        let _ = ctx
+            .xplane
+            .set_float(&throttle_dref(), CRUISE_THROTTLE)
+            .await;
 
         if servos_engaged(ctx).await? {
             Ok(format!(

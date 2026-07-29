@@ -185,7 +185,8 @@ pub fn alt_capture_vs(target_ft: f64, alt_ft: f64, vs_fpm: f64) -> f64 {
 pub fn approach_leg_alt_ft(field_elev_ft: f64, tpa_msl_ft: f64, a_m: f64, x_m: f64) -> f64 {
     let dist_nm = (a_m.abs() + x_m.abs()) / M_PER_NM;
     let floor = field_elev_ft + HANDOFF_AGL_FT;
-    (field_elev_ft + dist_nm * crate::autoland::GLIDEPATH_FT_PER_NM).clamp(floor, tpa_msl_ft.max(floor))
+    (field_elev_ft + dist_nm * crate::autoland::GLIDEPATH_FT_PER_NM)
+        .clamp(floor, tpa_msl_ft.max(floor))
 }
 
 /// The speed the pattern legs are flown at: the airframe's climb speed, but

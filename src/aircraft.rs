@@ -2059,4 +2059,3 @@ fn cirrus_sr22() -> AircraftProfile {
         },
     }
 }
-

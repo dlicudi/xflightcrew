@@ -5941,7 +5941,10 @@ mod tests {
         // tower STAGES us instead of parking us behind the line — once.
         let staged = takeoff_hold_tick(std::slice::from_ref(&ours), elev, true, t0)
             .expect("line up and wait");
-        assert!(staged.contains("line up and wait runway zero niner"), "{staged}");
+        assert!(
+            staged.contains("line up and wait runway zero niner"),
+            "{staged}"
+        );
         assert!(staged.contains("landing traffic"), "{staged}");
         assert!(*PENDING_LINE_UP.lock().unwrap());
         *PENDING_LINE_UP.lock().unwrap() = false;
@@ -6069,19 +6072,35 @@ mod tests {
         // Half a mile out: too close to stage, too close to release. This is
         // exactly where the live hold began.
         assert!(takeoff_hold_tick(std::slice::from_ref(&arrival(0.5)), elev, true, t0).is_none());
-        assert!(!*PENDING_LINE_UP.lock().unwrap(), "never onto the runway under a lander");
+        assert!(
+            !*PENDING_LINE_UP.lock().unwrap(),
+            "never onto the runway under a lander"
+        );
 
         // Two miles out, the strip momentarily clear: too close to depart
         // ahead of, far enough to STAGE. The tower puts us on the pavement
         // rather than parking us behind the line for a stream that never ends.
-        let line = takeoff_hold_tick(std::slice::from_ref(&arrival(2.0)), elev, true, t0 + sec(60))
-            .expect("line up and wait");
-        assert!(line.contains("line up and wait runway two six left"), "{line}");
+        let line = takeoff_hold_tick(
+            std::slice::from_ref(&arrival(2.0)),
+            elev,
+            true,
+            t0 + sec(60),
+        )
+        .expect("line up and wait");
+        assert!(
+            line.contains("line up and wait runway two six left"),
+            "{line}"
+        );
         assert!(line.contains("landing traffic"), "{line}");
         assert!(*PENDING_LINE_UP.lock().unwrap());
         assert!(
-            takeoff_hold_tick(std::slice::from_ref(&arrival(1.8)), elev, true, t0 + sec(70))
-                .is_none(),
+            takeoff_hold_tick(
+                std::slice::from_ref(&arrival(1.8)),
+                elev,
+                true,
+                t0 + sec(70)
+            )
+            .is_none(),
             "one shot: the aircraft can only take the runway once"
         );
         // ...and while it rolls out ON our strip, no release at all.
@@ -6102,12 +6121,22 @@ mod tests {
         // that aircraft was still "traffic on final" — inside the 4 nm
         // corridor — and the departure sat here until it gave up.
         assert!(
-            takeoff_hold_tick(std::slice::from_ref(&arrival(3.5)), elev, true, t0 + sec(130))
-                .is_none(),
+            takeoff_hold_tick(
+                std::slice::from_ref(&arrival(3.5)),
+                elev,
+                true,
+                t0 + sec(130)
+            )
+            .is_none(),
             "the clear window has to stabilise first"
         );
-        let line = takeoff_hold_tick(std::slice::from_ref(&arrival(3.2)), elev, true, t0 + sec(146))
-            .expect("release");
+        let line = takeoff_hold_tick(
+            std::slice::from_ref(&arrival(3.2)),
+            elev,
+            true,
+            t0 + sec(146),
+        )
+        .expect("release");
         assert!(line.contains("traffic clear"), "{line}");
         assert!(
             line.contains("Runway two six left, cleared for takeoff"),

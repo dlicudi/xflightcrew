@@ -411,10 +411,7 @@ async fn run_inner(
             if abort.load(SeqCst) {
                 break false;
             }
-            let (a, t) = tokio::join!(
-                xp.get_float(PUSH_ATTACHED),
-                xp.get_float(TOW_IN_PROGRESS)
-            );
+            let (a, t) = tokio::join!(xp.get_float(PUSH_ATTACHED), xp.get_float(TOW_IN_PROGRESS));
             if a.unwrap_or(0.0) > 0.5 || t.unwrap_or(0.0) > 0.5 {
                 event(json!({ "event": "hooked", "waited_s": r1(began.elapsed().as_secs_f64()) }));
                 break true;
@@ -426,10 +423,7 @@ async fn run_inner(
             if !said && waited >= TUG_PATIENCE_SECS {
                 said = true;
                 if let Some(v) = voice {
-                    v.alert(
-                        Priority::Advisory,
-                        "Still waiting on the tug.".to_string(),
-                    );
+                    v.alert(Priority::Advisory, "Still waiting on the tug.".to_string());
                 }
             }
             if !said2 && waited >= TUG_PATIENCE2_SECS {
@@ -454,7 +448,12 @@ async fn run_inner(
         // taxiing.
         send(ctx, "stop").await;
         event(json!({ "event": "no_tug", "waited_s": TUG_WAIT_SECS }));
-        return Err(if abort.load(SeqCst) { "abort" } else { "no_tug" }.into());
+        return Err(if abort.load(SeqCst) {
+            "abort"
+        } else {
+            "no_tug"
+        }
+        .into());
     }
 
     // Hooked: NOW the brakes come off — the crew's "brakes released" answer to
@@ -544,23 +543,25 @@ async fn run_inner(
         // tug back to the bar (it is standing at the nose), and wait for the
         // re-hook like the first hook, bounded much tighter.
         if towed && !towing && !attached {
-            let err_now = angle_diff_deg(plan.target_hdg, xp.get_float(PSI_TRUE).await.unwrap_or(0.0));
-            let complete = done(back_m, err_now, plan)
-                || (back_m >= MIN_BACK_M && err_now.abs() <= ALIGN_DEG);
+            let err_now =
+                angle_diff_deg(plan.target_hdg, xp.get_float(PSI_TRUE).await.unwrap_or(0.0));
+            let complete =
+                done(back_m, err_now, plan) || (back_m >= MIN_BACK_M && err_now.abs() <= ALIGN_DEG);
             if complete || issues >= MAX_ISSUES {
                 event(json!({ "event": "tug_finished", "back_m": r1(back_m),
                               "err": r1(err_now), "complete": complete }));
                 if complete {
                     break;
                 }
-                let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set)
-                    .await;
+                let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
                 return Err("tug_released".into());
             }
             cmd = steer_for(err_now, sense);
             issues += 1;
-            event(json!({ "event": "reissued_after_release", "pattern": cmd.action(),
-                          "issue": issues, "err": r1(err_now) }));
+            event(
+                json!({ "event": "reissued_after_release", "pattern": cmd.action(),
+                          "issue": issues, "err": r1(err_now) }),
+            );
             send(ctx, cmd.action()).await;
             let rehooked = wait_for(REHOOK_SECS, abort, || async {
                 let (a, t) =
@@ -570,8 +571,7 @@ async fn run_inner(
             .await;
             if !rehooked {
                 send(ctx, "stop").await;
-                let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set)
-                    .await;
+                let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
                 event(json!({ "event": "no_rehook", "back_m": r1(back_m) }));
                 return Err("tug_released".into());
             }
@@ -586,7 +586,10 @@ async fn run_inner(
         // been correctly told to swing the nose left.
         if !towed && !nudged && began.elapsed().as_secs_f64() >= NUDGE_SECS {
             nudged = true;
-            tracing::info!(pattern = cmd.action(), "pushback: hooked but not moving, asking again");
+            tracing::info!(
+                pattern = cmd.action(),
+                "pushback: hooked but not moving, asking again"
+            );
             event(json!({ "event": "nudge", "pattern": cmd.action() }));
             send(ctx, cmd.action()).await;
         }
@@ -644,7 +647,10 @@ async fn run_inner(
                     // with the CORRECTED sense once it has stopped, which is
                     // the one moment a new pattern is known to take (the
                     // hook-up re-issue is the same moment).
-                    tracing::info!(sense, "pushback: turn sense inverted, correcting at the tug's next stop");
+                    tracing::info!(
+                        sense,
+                        "pushback: turn sense inverted, correcting at the tug's next stop"
+                    );
                     event(json!({ "event": "sense_learned", "sense": sense }));
                     turn_since = None;
                 }
@@ -792,7 +798,10 @@ mod tests {
         // No route at all is nothing to plan against.
         assert_eq!(plan(me.0, me.1, 90.0, &[]), None);
         // A route whose points are all still on the stand: no way out to read.
-        assert_eq!(plan(me.0, me.1, 90.0, &[me, at(LAT0, LON0, 2.0, 1.0)]), None);
+        assert_eq!(
+            plan(me.0, me.1, 90.0, &[me, at(LAT0, LON0, 2.0, 1.0)]),
+            None
+        );
     }
 
     /// The push distance is bounded at both ends — and a "way out" hundreds
@@ -805,10 +814,18 @@ mod tests {
     fn the_push_distance_stays_within_stand_scale() {
         let me = (LAT0, LON0);
         // A lane at the edge of stand scale still clamps the push distance.
-        let long = vec![me, at(LAT0, LON0, -200.0, 0.0), at(LAT0, LON0, -200.0, 90.0)];
+        let long = vec![
+            me,
+            at(LAT0, LON0, -200.0, 0.0),
+            at(LAT0, LON0, -200.0, 90.0),
+        ];
         assert_eq!(plan(me.0, me.1, 90.0, &long).unwrap().back_m, MAX_BACK_M);
         // Past MAX_NODE_M the route was planned from somewhere else: refuse.
-        let stale = vec![me, at(LAT0, LON0, -400.0, 0.0), at(LAT0, LON0, -400.0, 90.0)];
+        let stale = vec![
+            me,
+            at(LAT0, LON0, -400.0, 0.0),
+            at(LAT0, LON0, -400.0, 90.0),
+        ];
         assert_eq!(plan(me.0, me.1, 90.0, &stale), None);
         let near = vec![me, at(LAT0, LON0, -11.0, 0.0), at(LAT0, LON0, -11.0, 90.0)];
         assert_eq!(plan(me.0, me.1, 90.0, &near).unwrap().back_m, MIN_BACK_M);
@@ -857,7 +874,14 @@ mod tests {
         // 2026-07-27 push went from 64.6 to 154.8 degrees off.
         assert!(sense_is_wrong(true, true, 90.0, 64.6, 154.8, 1));
         // The threshold sits between the two, well clear of both.
-        assert!(!sense_is_wrong(true, true, 90.0, 20.0, 20.0 + SENSE_TOL_DEG, 1));
+        assert!(!sense_is_wrong(
+            true,
+            true,
+            90.0,
+            20.0,
+            20.0 + SENSE_TOL_DEG,
+            1
+        ));
         assert!(sense_is_wrong(
             true,
             true,

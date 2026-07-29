@@ -1257,7 +1257,8 @@ mod tests {
         // A true parallel 200 m abeam fails on cross-track.
         let mut parallel = cands[0].clone();
         parallel.id = "22R".into();
-        let (plat, plon) = project_latlon(parallel.thr_lat, parallel.thr_lon, 132.8, 200.0 / 1852.0);
+        let (plat, plon) =
+            project_latlon(parallel.thr_lat, parallel.thr_lon, 132.8, 200.0 / 1852.0);
         parallel.thr_lat = plat;
         parallel.thr_lon = plon;
         assert!(!cleared_fits_here(&[parallel], "22R", lat, lon, 223.0));
@@ -1650,7 +1651,10 @@ mod tests {
         assert!(climb_throttle(260.0, Some(VNE)) < thr);
         // The protection can never become a pitch-up or a shutdown of its own.
         let extreme = climb_vs_protected(400.0, 120.0, 2000.0, Some(VNE));
-        assert!(extreme <= 2000.0 + OVERSPEED_VS_MAX_FPM, "capped: {extreme}");
+        assert!(
+            extreme <= 2000.0 + OVERSPEED_VS_MAX_FPM,
+            "capped: {extreme}"
+        );
         assert!(climb_throttle(400.0, Some(VNE)) >= CLIMB_THROTTLE_MIN);
         // An airframe that declares no Vne keeps exactly the climb it had.
         assert_eq!(

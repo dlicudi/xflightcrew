@@ -406,9 +406,11 @@ impl Tool for HoldSpeed {
         // `off: true` still passes: releasing a hold is always safe.
         if !on_ground && !a.off {
             if crate::circuit::ACTIVE.load(Ordering::Relaxed) {
-                return Ok("The circuit has the throttle — it flies the pattern speed. \
+                return Ok(
+                    "The circuit has the throttle — it flies the pattern speed. \
                            Say cancel circuit if you want the speed."
-                    .to_string());
+                        .to_string(),
+                );
             }
             if crate::autoland::ACTIVE.load(Ordering::Relaxed) {
                 return Ok(
@@ -623,8 +625,10 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
         let on_ground = xp.get_float(ON_GROUND).await.ok().map(|v| v > 0.5);
         match mode {
             Mode::Flight => {
-                if let (Ok(ias), Ok(thr)) = (xp.get_float(IAS).await, xp.get_float(&throttle_dref()).await)
-                {
+                if let (Ok(ias), Ok(thr)) = (
+                    xp.get_float(IAS).await,
+                    xp.get_float(&throttle_dref()).await,
+                ) {
                     if let Some(lc) = last_cmd.filter(|lc| (thr - lc).abs() > 0.15) {
                         if override_pending {
                             tracing::info!(thr, lc, "speed governor: pilot override, releasing");
@@ -770,9 +774,10 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                         continue;
                     }
                 }
-                if let (Ok(gs_ms), Ok(thr)) =
-                    (xp.get_float(GS_MS).await, xp.get_float(&throttle_dref()).await)
-                {
+                if let (Ok(gs_ms), Ok(thr)) = (
+                    xp.get_float(GS_MS).await,
+                    xp.get_float(&throttle_dref()).await,
+                ) {
                     if let Some(lc) = last_cmd.filter(|lc| (thr - lc).abs() > 0.15) {
                         if override_pending {
                             tracing::info!(thr, lc, "speed governor: pilot override, releasing");

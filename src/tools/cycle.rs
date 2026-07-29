@@ -563,12 +563,11 @@ async fn n1_percent(ctx: &ToolCtx<'_>, idx: usize) -> f64 {
 
 /// Bring the APU up and open its bleed, so the engines have something to be
 /// motored by. `Err` carries the line to speak when it doesn't come up.
-async fn start_apu(ctx: &ToolCtx<'_>, apu: &crate::aircraft::ApuStartProfile) -> Result<(), String> {
-    let running = ctx
-        .xplane
-        .get_float(&apu.n1_dataref)
-        .await
-        .unwrap_or(0.0);
+async fn start_apu(
+    ctx: &ToolCtx<'_>,
+    apu: &crate::aircraft::ApuStartProfile,
+) -> Result<(), String> {
+    let running = ctx.xplane.get_float(&apu.n1_dataref).await.unwrap_or(0.0);
     if running < apu.ready_n1 {
         // The master is a toggle on every airframe seen so far: read it, and
         // fire only if it's actually off. Blind toggling switches OFF an APU
@@ -887,7 +886,11 @@ mod tests {
         let s = p.turboprop_start.expect("start sequence");
         let apu = s.apu.expect("a jet start needs the APU");
         assert!(!apu.starter_commands.is_empty());
-        assert!(apu.ready_n1 >= 90.0, "wait for a RUNNING APU: {}", apu.ready_n1);
+        assert!(
+            apu.ready_n1 >= 90.0,
+            "wait for a RUNNING APU: {}",
+            apu.ready_n1
+        );
         // Generator AND bleed: the air motors the engine, the generator powers
         // the bus the left starter's own gate reads.
         assert_eq!(apu.after_ready_commands.len(), 2, "generator and bleed");

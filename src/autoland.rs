@@ -994,10 +994,7 @@ pub fn missed_approach_guidance(
 ) -> Guidance {
     let slow = approach_ias - ias_kts > SPEED_FLOOR_MARGIN_KTS;
     let (target_heading_deg, target_vs_fpm) = match stage {
-        MissedStage::Climb => (
-            rwy.course_deg,
-            if slow { 0.0 } else { MAX_CLIMB_FPM },
-        ),
+        MissedStage::Climb => (rwy.course_deg, if slow { 0.0 } else { MAX_CLIMB_FPM }),
         MissedStage::Reposition => {
             // Same join point the ordinary guidance uses, so the handback is
             // continuous.
@@ -1797,7 +1794,10 @@ mod tests {
         assert_eq!(up(&mut latch, Intercept, Intercept, 520.0), Some(Climb));
         // At the turn height: start repositioning, but do NOT hand back yet —
         // 800 ft over the far end with the field behind us is not an approach.
-        assert_eq!(up(&mut latch, Intercept, Intercept, 850.0), Some(Reposition));
+        assert_eq!(
+            up(&mut latch, Intercept, Intercept, 850.0),
+            Some(Reposition)
+        );
         // A HIGH overflight never latches: the immediate turn back is fine.
         let mut high = GoAroundLatch::new();
         assert_eq!(up(&mut high, Final, Intercept, 800.0), None);
@@ -1849,7 +1849,8 @@ mod tests {
         // the aircraft is repositioned outside the FAP, ready to try again.
         for n in 1..=3 {
             assert!(
-                l.update(Some(Final), Intercept, 50.0, 0.2, -0.2, FAP_NM).is_some(),
+                l.update(Some(Final), Intercept, 50.0, 0.2, -0.2, FAP_NM)
+                    .is_some(),
                 "latched low"
             );
             assert_eq!(l.attempts(), n, "counted");
@@ -1934,8 +1935,8 @@ mod tests {
     #[test]
     fn the_reposition_leg_flies_outbound_and_holds_platform_height() {
         let rwy = rwy_north(); // course ~000, threshold at 0,0
-        // Half a mile past the far end at 900 ft, on speed: the join point is
-        // SOUTH (approach side), so the aircraft must turn around.
+                               // Half a mile past the far end at 900 ft, on speed: the join point is
+                               // SOUTH (approach side), so the aircraft must turn around.
         let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.5);
         let g = missed_approach_guidance(
             &rwy,
@@ -2199,7 +2200,11 @@ mod tests {
         // (EGSS 22, 2026-07-28). Same offset now earns roughly the same cut
         // at any distance, which is what makes the convergence exponential
         // in time and the last miles wings-level.
-        assert!(cut(&far) < -12.0, "far cut is a real intercept: {:.1}", cut(&far));
+        assert!(
+            cut(&far) < -12.0,
+            "far cut is a real intercept: {:.1}",
+            cut(&far)
+        );
         assert!(cut(&close) < -12.0, "close cut too: {:.1}", cut(&close));
         assert!(
             cut(&close) <= cut(&far) + 1.0,
