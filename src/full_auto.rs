@@ -4,9 +4,15 @@
 //! whole gate-to-gate sequence by invoking the SAME tested tools the pilot
 //! would, in order, waiting on each before the next:
 //!
-//!   power up -> start engine -> release brake -> REQUEST TAXI from the tower
-//!   -> auto-taxi to the hold -> line up -> fly the circuit (takeoff, pattern,
-//!   land, stop).
+//!   power up -> start engine -> altimeter -> REQUEST TAXI from the tower
+//!   -> (pushback if nose-in) -> auto-taxi to the hold -> line up -> fly the
+//!   circuit (takeoff, pattern, land, stop).
+//!
+//! No blanket brake release anywhere in the chain: the brakes stay as the
+//! pilot left them until something actually drives — the taxi governor,
+//! pushback and auto-takeoff each release at their own moment (the stage-2
+//! release left an idle jet brakeless during the tug wait and it crept into
+//! the grass, Luton 2026-07-28).
 //!
 //! The taxi route is the tower's to give — the copilot can't invent one — so
 //! this transmits "request taxi" and drives whatever clearance comes back
@@ -26,7 +32,6 @@ use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
-const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 const BARO_KNOB: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot";
@@ -333,8 +338,17 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     }
     bail_if_abort!();
 
-    // --- Stage 2: brakes off --------------------------------------------------
-    let _ = xp.set_float(PARK_BRAKE, 0.0).await;
+    // --- Stage 2: altimeter ---------------------------------------------------
+    // NO brake release here, deliberately. The brakes used to come off at this
+    // stage — engine just started, taxi clearance not yet requested — which is
+    // minutes before anything drives, and an idle jet on a flat apron rolls:
+    // the SF50 crept from 0 to 2.8 kt with `park=0.0` while full auto was
+    // still WAITING FOR THE TUG, and ended up in the grass (Luton,
+    // 2026-07-28). Nobody needs the early release: the taxi governor
+    // auto-releases (valve-aware) when a drive arms, the pushback stage
+    // handles its own brakes-off at hook-up, and the auto-takeoff releases on
+    // the runway. Brakes stay as the pilot left them until something is
+    // actually driving.
 
     // Set the altimeter to field QNH before departure — a misset altimeter is
     // the classic level-bust. Autoland aims at the runway's true elevation so it
@@ -401,8 +415,42 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             }
             bail_if_abort!();
         }
-        // The taxi route is the tower's. Ask for it if we don't already hold one.
-        if crate::party_line::with_taxi_route(|r| r.is_none()) {
+        // The taxi route is the tower's. Ask for it if we don't already hold
+        // one — or if the one we hold WAS PLANNED FROM SOMEWHERE ELSE. A
+        // clearance outlives a reposition: the tower planned a route from the
+        // aircraft's spot on Stansted's 22C, full auto's first attempt gave
+        // up waiting one second before it arrived, the pilot moved to a gate
+        // a kilometre away, and the SECOND attempt reused the fossil — read
+        // "nose in" against a lane 1 km off, called a tug to push toward it,
+        // and the taxi drive then (correctly) refused at 1090 m off route
+        // (2026-07-29). A route is only OURS if it starts within reach of
+        // the auto-taxi's own join limit; otherwise ask again and the tower
+        // re-plans from where we actually are.
+        let route_is_ours = {
+            let (lat_r, lon_r) = tokio::join!(xp.get_float(LAT), xp.get_float(LON));
+            match (lat_r, lon_r) {
+                (Ok(lat), Ok(lon)) => crate::party_line::with_taxi_route(|r| {
+                    r.map(|w| {
+                        w.path.iter().any(|p| {
+                            crate::nav::haversine_nm(lat, lon, p.0, p.1) * 1852.0 < 200.0
+                        })
+                    })
+                })
+                .unwrap_or(false),
+                // Position unknown: trust the route rather than re-request in
+                // a loop we can't verify our way out of.
+                _ => crate::party_line::with_taxi_route(|r| r.is_some()),
+            }
+        };
+        if !route_is_ours {
+            if crate::party_line::with_taxi_route(|r| r.is_some()) {
+                announce(
+                    &voice,
+                    Priority::Advisory,
+                    "That taxi clearance was from the old spot. Asking again from here.",
+                );
+                event("stale_taxi_route", json!({}));
+            }
             // Tune COM1 to the tower first — the request goes nowhere if we're
             // off frequency (the crew radio only reaches the tuned station).
             if let Some(khz) = crate::party_line::home_tower_khz() {
@@ -433,8 +481,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // The call queues behind our own intercom lines AND anyone the
             // tower is already working — the clock must outlast a worked
             // arrival. 25 s gave up ONE SECOND before a busy Jerez frequency
-            // came back with the clearance (16:45Z, 2026-07-24).
-            let got = wait_until(90.0, 1000, || async {
+            // came back with the clearance (16:45Z, 2026-07-24) — and 90 s
+            // then gave up ONE SECOND before a busy Stansted did the same
+            // thing (2026-07-29, the tower was working a Ryanair arrival and
+            // berating us for sitting on its runway). Whatever this number
+            // is, a queued frequency will someday beat it by a second; 180
+            // outlasts two worked arrivals.
+            let got = wait_until(180.0, 1000, || async {
                 crate::party_line::with_taxi_route(|r| r.is_some())
             })
             .await;
@@ -481,7 +534,16 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                         "pushback",
                         json!({ "back_m": plan.back_m, "target_hdg": plan.target_hdg }),
                     );
-                    match crate::pushback::run(&xp, &ctx, &voice, &plan, &ABORT).await {
+                    match crate::pushback::run(
+                        &xp,
+                        &ctx,
+                        &voice,
+                        &plan,
+                        &ABORT,
+                        tools.taxi.park_brake_valve_set,
+                    )
+                    .await
+                    {
                         Ok(back_m) => event("pushback_done", json!({ "back_m": back_m })),
                         Err(why) => {
                             event("pushback_failed", json!({ "why": why }));

@@ -756,11 +756,28 @@ the same semantics: the command issued before a tug exists only SUMMONS one
 pattern is sent again on hook-up; and a tug that stops having moved has
 FINISHED, which is why `STALL_SECS` ends the push — motionless, the same
 sortie sat out 203 further seconds to `MAX_SECS`. Short of the plan the tug
-is asked for another pattern, bounded by `MAX_ISSUES`. Which of
-`pushback_left`/`pushback_right` swings the nose which way is still LEARNED,
-not assumed (`learn_sense`: the first sustained turn that makes the error
-WORSE flips the sense once) — now acted on by re-issuing the OPPOSITE
-pattern, since there is no per-tick steer left to correct. Every tug
+is asked for another pattern, bounded by `MAX_ISSUES`. A pushback command is ONE
+complete manoeuvre, and COMPLETION INCLUDES LETTING GO of the bar: the
+Stansted trail (2026-07-28) shows "Nose 90 left" executed to the letter —
+err pinned at −98.5 for 30 m of straight push, a clean ~90° arc, bar off —
+with nothing sent after the initial issue, so "attached dropped after we
+rolled" is the manoeuvre's normal END, not a tug abandoning us (three pushes
+were failed as `tug_released` for finishing correctly). The release handler
+now judges completion (aligned within `ALIGN_DEG`, or `done()`); short of the
+plan it issues the NEXT pattern — which summons the tug back to the bar (it
+is standing at the nose; `REHOOK_SECS` bounds the wait) — bounded by
+`MAX_ISSUES`. Which way `pushback_left` swings the nose is still LEARNED per
+session (`sense_is_wrong` flips once, `LEARNED_SENSE` keeps the verdict), but
+the DEFAULT guess is now the measured one: on X-Plane 12.4.3 `pushback_left`
+swings the nose CLOCKWISE, opposite to its "Nose 90 left" description —
+three pushes, three identical full-turn trails. A correction is never sent
+mid-manoeuvre (that re-aims the tug); the release handler and the hook-up
+re-issue are the moments a pattern takes. Brakes are the stage's own too:
+SET for the tug wait (full auto's early stage-2 release left an idle jet
+brakeless for the minutes-long wait and it crept into the grass, same day —
+the release is deleted; the taxi governor, pushback and auto-takeoff each
+release at their own moment), released at hook-up, re-set at disconnect and
+on the mid-apron failure exits. Every tug
 instruction goes through the
 same `pushback` tool a spoken "push back left" reaches — one owner for the
 ground-ops commands. The tug handshake is ONE dataref plus our own position:

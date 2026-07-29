@@ -27,7 +27,7 @@
 //! failures). Laws are pure and battle-test as plain `cargo test`; events
 //! blackbox as `"kind":"pushback"`.
 
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicI8, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -56,6 +56,13 @@ const M_PER_NM: f64 = 1852.0;
 /// Route points closer than this to the aircraft are the stand itself, not
 /// the way out — the planner's polyline starts AT the nose.
 const MIN_NODE_M: f64 = 10.0;
+/// ...and a "way out" farther than this is not OUR way out at all: the route
+/// was planned from somewhere the aircraft no longer is. A stale clearance
+/// (planned from runway 22C, aircraft since repositioned to a gate 1 km
+/// away) read as "nose in" and called a tug to push toward a lane a
+/// kilometre off (EGSS, 2026-07-29). The stand's own lane is tens of
+/// metres away, never hundreds.
+const MAX_NODE_M: f64 = 250.0;
 /// The way out must be at least this far off the nose before we call a tug.
 /// Past the wing line, not merely off to one side: a sixty-degree turn out of
 /// a tie-down is a taxi, and asking for a pushback to make it would be the
@@ -89,11 +96,27 @@ const CAL_SECS: f64 = 4.0;
 const TICK_MS: u64 = 500;
 /// How long to wait for the tug to drive up and take hold. Minutes, not
 /// seconds: it is a vehicle crossing an airport, not a dataref flipping (see
-/// the wait loop in [`run`]).
-const TUG_WAIT_SECS: f64 = 180.0;
+/// the wait loop in [`run`]) — X-Plane searches 1500 m for one and lets it
+/// drive up to 6 km, and there is no dataref that says "it's on its way", so
+/// this deadline is a blind bet against an invisible vehicle.
+///
+/// It has now lost that bet TWICE, in the same direction: 30 s gave up on the
+/// first live push with the tug still driving (Gatwick, 2026-07-27), was
+/// raised to 180 — and 180 then gave up at Luton with the tug visibly almost
+/// at the nose (2026-07-28; the previous push at the SAME field had hooked at
+/// 125 s, so arrivals genuinely spread past that ceiling). The cost of the
+/// two outcomes is not symmetric: waiting longer at a tug-less field costs a
+/// few quiet minutes before the same fallback, while giving up early costs
+/// the whole push AND the apron turn-around that follows, with the pilot
+/// watching the tug arrive at an aircraft that just drove off. So: six
+/// minutes, and the crew narrates the wait so it never reads as a hang.
+const TUG_WAIT_SECS: f64 = 360.0;
 /// Past this the wait stops looking normal, so the crew says what we're
 /// waiting for — an aircraft sitting silently on a stand reads as a hang.
 const TUG_PATIENCE_SECS: f64 = 30.0;
+/// A second crew line deep into the wait, so the long ceiling stays narrated
+/// rather than silent ("still coming" beats three quiet minutes).
+const TUG_PATIENCE2_SECS: f64 = 150.0;
 /// Hooked on but not rolling this long after the ask: say it again, once.
 const NUDGE_SECS: f64 = 12.0;
 /// Rolled back this far and the push is genuinely under way — the "are we
@@ -115,6 +138,10 @@ const MAX_ISSUES: u32 = 3;
 const MAX_SECS: f64 = 300.0;
 /// How long to wait for the tug to unhook and clear before taxiing.
 const TUG_CLEAR_SECS: f64 = 30.0;
+/// How long to wait for the tug to take the bar AGAIN for a continuation
+/// segment. It is standing at the nose, not driving across the airport —
+/// the Stansted re-hook after a completed segment took seconds.
+const REHOOK_SECS: f64 = 60.0;
 
 /// What the push is aiming at, read off the cleared taxi route.
 #[derive(Debug, Clone, PartialEq)]
@@ -162,6 +189,9 @@ pub fn plan(lat: f64, lon: f64, psi: f64, path: &[(f64, f64)]) -> Option<Plan> {
         .iter()
         .enumerate()
         .find(|(_, p)| from_us(p) >= MIN_NODE_M)?;
+    if from_us(node) > MAX_NODE_M {
+        return None; // the route doesn't start here — see MAX_NODE_M
+    }
     let out_bearing = nav::bearing_deg(lat, lon, node.0, node.1);
     if angle_diff_deg(out_bearing, psi).abs() < BEHIND_DEG {
         return None;
@@ -246,6 +276,16 @@ fn event(detail: serde_json::Value) {
 ///
 /// `abort` is the caller's cancel flag ("my controls"), checked every tick;
 /// an abort always stops the tug before returning.
+/// Which way `pushback_right` actually swings the nose on THIS sim build:
+/// +1 = clockwise (the naive reading), -1 = counter-clockwise, 0 = not yet
+/// observed. Learned once under tow and kept for the SESSION, not per push:
+/// re-learning it every push is how both Luton pushes died on 2026-07-28 —
+/// each started from the same wrong guess, each convicted it ~46 m in, and
+/// the mid-push correction made the tug let go (see the flip site). Never
+/// persisted to disk — a sim update may change it, and one observation per
+/// session is cheap.
+static LEARNED_SENSE: AtomicI8 = AtomicI8::new(0);
+
 /// True while a tug is pushing us. The taxi guide reads it and goes quiet:
 /// groundspeed is a MAGNITUDE, so being pushed back at four knots looks exactly
 /// like taxiing forward at four, and the stand is the cleared route's first
@@ -254,6 +294,12 @@ fn event(detail: serde_json::Value) {
 /// 2026-07-28, with the tug still connected).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// One-line status for the dashboard/panel; the stage detail (tug wait, under
+/// tow) is full auto's to narrate — this only says a push is running.
+pub fn status() -> Option<String> {
+    ACTIVE.load(SeqCst).then(|| "pushback".to_string())
+}
+
 /// Run the push, holding [`ACTIVE`] for its duration however it ends.
 pub async fn run(
     xp: &XPlaneClient,
@@ -261,9 +307,18 @@ pub async fn run(
     voice: &Option<Voice>,
     plan: &Plan,
     abort: &AtomicBool,
+    valve_set: Option<f64>,
 ) -> Result<f64, String> {
     ACTIVE.store(true, SeqCst);
-    let out = run_inner(xp, ctx, voice, plan, abort).await;
+    let out = run_inner(xp, ctx, voice, plan, abort, valve_set).await;
+    // Stop-and-let-go on EVERY exit, unconditionally. A pushback command is a
+    // whole manoeuvre the tug runs on its own, and a re-issued continuation
+    // outlives any return path that forgets this line: the MAX_ISSUES exit
+    // returned mid-manoeuvre and the tug kept working the aircraft in stages
+    // — through full auto's taxi attempt and past its stand-down — until the
+    // pilot asked what on earth was going on and the command had to be fired
+    // by hand over the Web API (2026-07-29). Idempotent when already stopped.
+    send(ctx, "stop").await;
     ACTIVE.store(false, SeqCst);
     out
 }
@@ -274,6 +329,10 @@ async fn run_inner(
     voice: &Option<Voice>,
     plan: &Plan,
     abort: &AtomicBool,
+    // The airframe's park-brake valve SET sense — brakes are held for the
+    // tug wait and re-set at disconnect through the same valve-aware routine
+    // the parking-brake tool uses.
+    valve_set: Option<f64>,
 ) -> Result<f64, String> {
     let (Ok(start_lat), Ok(start_lon), Ok(start_psi)) =
         tokio::join!(xp.get_float(LAT), xp.get_float(LON), xp.get_float(PSI_TRUE))
@@ -292,7 +351,20 @@ async fn run_inner(
     // off the lane, and the taxi join had to turn a Gatwick MD-82 round on the
     // apron (2026-07-27).
     let err0 = angle_diff_deg(plan.target_hdg, start_psi);
-    let cmd_now = steer_for(err0, 1);
+    // Start from what this session has already OBSERVED — and when nothing
+    // has been observed yet, from what the BUILD has been measured to do:
+    // three pushes on 2026-07-28 (two at Luton, one at Stansted), three
+    // identical verdicts, full turn trails in the blackbox — X-Plane 12.4.3's
+    // `pushback_left` swings the NOSE clockwise, the opposite of its
+    // "Nose 90 left" description. So the naive reading is the wrong default
+    // on the one build we can measure. Still learned per session: a future
+    // build that fixes the command names flips one push's first turn, not
+    // every push forever.
+    let sense0: i8 = match LEARNED_SENSE.load(SeqCst) {
+        0 => -1,
+        v => v,
+    };
+    let cmd_now = steer_for(err0, sense0);
     // The arm log carries the GEOMETRY, not just the plan: "no tug came" is
     // undiagnosable afterwards without knowing which stand we sat on and how
     // far the lane was (the Heathrow lesson — name every gate in the log).
@@ -307,6 +379,15 @@ async fn run_inner(
     }));
     // Issuing a pushback command with no tug about is what SUMMONS one.
     send(ctx, cmd_now.action()).await;
+
+    // Brakes SET for the wait — the real call is "parking brake set, expecting
+    // the tug", and the wait is minutes long. This is not optional dressing:
+    // full auto used to release the brakes right after engine start, and an
+    // idle jet on a flat apron rolls — the SF50 crept to 2.8 kt brakeless
+    // while this very wait was running and went into the grass (Luton,
+    // 2026-07-28). Valve-aware, same routine the parking-brake tool uses; a
+    // failure here is not fatal (the pilot may be holding the toe brakes).
+    let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
 
     // The tug drives up and hooks on BEFORE anything moves — two datarefs,
     // two moments: `pushback_attached` when it's on the bar, `tow_in_progress`
@@ -324,6 +405,7 @@ async fn run_inner(
     let hooked = {
         let began = Instant::now();
         let mut said = false;
+        let mut said2 = false;
         let mut logged = began;
         loop {
             if abort.load(SeqCst) {
@@ -350,6 +432,15 @@ async fn run_inner(
                     );
                 }
             }
+            if !said2 && waited >= TUG_PATIENCE2_SECS {
+                said2 = true;
+                if let Some(v) = voice {
+                    v.alert(
+                        Priority::Advisory,
+                        "Tug's taking its time — I'll give it a few more minutes.".to_string(),
+                    );
+                }
+            }
             if logged.elapsed().as_secs_f64() >= 15.0 {
                 logged = Instant::now();
                 event(json!({ "event": "waiting", "waited_s": r1(waited) }));
@@ -366,6 +457,12 @@ async fn run_inner(
         return Err(if abort.load(SeqCst) { "abort" } else { "no_tug" }.into());
     }
 
+    // Hooked: NOW the brakes come off — the crew's "brakes released" answer to
+    // the tug's "brakes off please", and the first moment releasing them is
+    // safe (something is holding the aircraft).
+    let _ = crate::tools::controls::drive_park_brake(ctx.xplane, false, valve_set).await;
+    event(json!({ "event": "brakes_released" }));
+
     // The tug ignores a command issued before it was on the bar: the summon
     // above brought it, and nothing moved until the command was sent AGAIN
     // once hooked (live, the re-send was the twelve-second "nudge" and the
@@ -375,9 +472,9 @@ async fn run_inner(
     event(json!({ "event": "issued", "pattern": cmd_now.action(), "issue": 1 }));
 
     let began = Instant::now();
-    // The guess: `pushback_right` swings the nose clockwise. Checked against
-    // the aircraft's own behaviour on the first sustained turn, once.
-    let mut sense: i8 = 1;
+    // The guess (or the session's learned answer). Still checked against the
+    // aircraft's own behaviour on the first sustained turn, once.
+    let mut sense: i8 = sense0;
     let mut flipped = false;
     let mut cmd = cmd_now;
     let mut issues = 1u32;
@@ -402,6 +499,9 @@ async fn run_inner(
         }
         if began.elapsed().as_secs_f64() > MAX_SECS {
             send(ctx, "stop").await;
+            // Mid-apron with no tug and no drive coming for seconds yet:
+            // brakes on. The taxi join's governor releases them when it arms.
+            let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
             event(json!({ "event": "timeout", "back_m": r1(back_m) }));
             return Err("timeout".into());
         }
@@ -431,14 +531,54 @@ async fn run_inner(
         // release check below could never fire, and the nudge fired at twelve
         // seconds on every push that was already rolling normally.
         towed |= towing || back_m > MOVED_M;
-        // The tug let go without us asking — the pilot stopped it, or the sim
-        // ended the tow. Not ours to restart: report where we got to. Only
-        // once we've actually rolled: hooked-but-not-yet-moving is the normal
-        // first seconds of every push, and reading it as a release would
-        // abandon the stage before it began.
+        // The bar came off after we'd rolled. This is NOT a failure — it is
+        // how a pushback ENDS on this sim: each command is one complete
+        // manoeuvre ("Nose 90 left" = straight segment, ~90° swing, stop,
+        // RELEASE), and the Stansted trail proved it — err pinned at −98.5
+        // for 30 m of straight push, a clean 90° arc, and the bar off with
+        // nothing sent after the initial issue (2026-07-28). Treating it as
+        // "tug let go early" failed a push that was executing perfectly.
+        //
+        // So: aligned enough, or out of asks — the push is complete. Short of
+        // the plan with asks left — issue the next pattern, which SUMMONS the
+        // tug back to the bar (it is standing at the nose), and wait for the
+        // re-hook like the first hook, bounded much tighter.
         if towed && !towing && !attached {
-            event(json!({ "event": "tug_released", "back_m": r1(back_m) }));
-            return Err("tug_released".into());
+            let err_now = angle_diff_deg(plan.target_hdg, xp.get_float(PSI_TRUE).await.unwrap_or(0.0));
+            let complete = done(back_m, err_now, plan)
+                || (back_m >= MIN_BACK_M && err_now.abs() <= ALIGN_DEG);
+            if complete || issues >= MAX_ISSUES {
+                event(json!({ "event": "tug_finished", "back_m": r1(back_m),
+                              "err": r1(err_now), "complete": complete }));
+                if complete {
+                    break;
+                }
+                let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set)
+                    .await;
+                return Err("tug_released".into());
+            }
+            cmd = steer_for(err_now, sense);
+            issues += 1;
+            event(json!({ "event": "reissued_after_release", "pattern": cmd.action(),
+                          "issue": issues, "err": r1(err_now) }));
+            send(ctx, cmd.action()).await;
+            let rehooked = wait_for(REHOOK_SECS, abort, || async {
+                let (a, t) =
+                    tokio::join!(xp.get_float(PUSH_ATTACHED), xp.get_float(TOW_IN_PROGRESS));
+                a.unwrap_or(0.0) > 0.5 || t.unwrap_or(0.0) > 0.5
+            })
+            .await;
+            if !rehooked {
+                send(ctx, "stop").await;
+                let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set)
+                    .await;
+                event(json!({ "event": "no_rehook", "back_m": r1(back_m) }));
+                return Err("tug_released".into());
+            }
+            event(json!({ "event": "rehooked" }));
+            turn_since = (cmd != Steer::Straight).then_some((Instant::now(), err_now));
+            moved_at = Instant::now();
+            continue;
         }
         // On the bar but going nowhere: ask again, once. The first command
         // only summoned the truck. Re-issue THE SAME pattern — the nudge used
@@ -493,13 +633,20 @@ async fn run_inner(
                 ) {
                     sense = -sense;
                     flipped = true;
-                    cmd = steer_for(err, sense);
-                    issues += 1;
-                    tracing::info!(sense, pattern = cmd.action(), "pushback: turn sense inverted");
-                    event(json!({ "event": "sense_learned", "sense": sense, "pattern": cmd.action() }));
-                    send(ctx, cmd.action()).await;
-                    turn_since = Some((Instant::now(), err));
-                    moved_at = Instant::now();
+                    LEARNED_SENSE.store(sense, SeqCst);
+                    // Learn it, remember it for the session — and DO NOT
+                    // re-issue the corrected pattern mid-push. A different
+                    // pattern sent to a tug mid-manoeuvre makes it LET GO:
+                    // both Luton pushes on 2026-07-28 show `sense_learned`
+                    // followed by `tug_released` one second later, ~46 m into
+                    // the plan. The tug is running a whole manoeuvre it will
+                    // finish and stop; the stall-continuation below re-issues
+                    // with the CORRECTED sense once it has stopped, which is
+                    // the one moment a new pattern is known to take (the
+                    // hook-up re-issue is the same moment).
+                    tracing::info!(sense, "pushback: turn sense inverted, correcting at the tug's next stop");
+                    event(json!({ "event": "sense_learned", "sense": sense }));
+                    turn_since = None;
                 }
             }
         }
@@ -529,6 +676,12 @@ async fn run_inner(
 
     send(ctx, "stop").await;
     event(json!({ "event": "stopped", "back_m": r1(back_m) }));
+    // Push complete: brakes SET while the tug unhooks — "parking brake set,
+    // disconnect" — and set they STAY until the taxi drive arms and its
+    // governor releases them itself. The gap between the tug letting go and
+    // the taxi engaging is exactly the window the stand creep happened in.
+    let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
+    event(json!({ "event": "brakes_set" }));
     // Wait for the tug to unhook and drive clear before any power goes on —
     // taxiing into your own tug is a way to end a flight on the stand. Watch
     // the BAR: gating this on tow_in_progress alone made it a no-op, because
@@ -642,14 +795,21 @@ mod tests {
         assert_eq!(plan(me.0, me.1, 90.0, &[me, at(LAT0, LON0, 2.0, 1.0)]), None);
     }
 
-    /// The push distance is bounded at both ends: a rounding-error route
-    /// doesn't call a tug for four metres, and a long apron leg doesn't turn
-    /// the push into a reverse taxi.
+    /// The push distance is bounded at both ends — and a "way out" hundreds
+    /// of metres off is not a long stand, it is a route that doesn't start
+    /// here. A stale clearance (planned from runway 22C before a reposition
+    /// to a gate 1 km away) read as nose-in and called a tug to push toward
+    /// a lane a kilometre off (EGSS, 2026-07-29); the old clamp would have
+    /// pushed 120 m toward it, which is a reverse taxi to nowhere.
     #[test]
     fn the_push_distance_stays_within_stand_scale() {
         let me = (LAT0, LON0);
-        let far = vec![me, at(LAT0, LON0, -400.0, 0.0), at(LAT0, LON0, -400.0, 90.0)];
-        assert_eq!(plan(me.0, me.1, 90.0, &far).unwrap().back_m, MAX_BACK_M);
+        // A lane at the edge of stand scale still clamps the push distance.
+        let long = vec![me, at(LAT0, LON0, -200.0, 0.0), at(LAT0, LON0, -200.0, 90.0)];
+        assert_eq!(plan(me.0, me.1, 90.0, &long).unwrap().back_m, MAX_BACK_M);
+        // Past MAX_NODE_M the route was planned from somewhere else: refuse.
+        let stale = vec![me, at(LAT0, LON0, -400.0, 0.0), at(LAT0, LON0, -400.0, 90.0)];
+        assert_eq!(plan(me.0, me.1, 90.0, &stale), None);
         let near = vec![me, at(LAT0, LON0, -11.0, 0.0), at(LAT0, LON0, -11.0, 90.0)];
         assert_eq!(plan(me.0, me.1, 90.0, &near).unwrap().back_m, MIN_BACK_M);
     }
