@@ -306,6 +306,34 @@ pub fn runway_fit(
     best.map(|(r, _, rem)| (r, rem))
 }
 
+/// The string crosscheck's escape hatch for duplicated pavement: apt.dat can
+/// carry ONE physical strip as two rows under different designators —
+/// Stansted's 3,052 m 04/22 and its 1,048 m 04C/22C are collinear to under a
+/// metre of cross-track, the author's model of the field's center
+/// designators. Lined up there, [`runway_fit`] names the LONG row (the short
+/// one fails the length gate) while the tower cleared "two two center", and
+/// the string compare refused a takeoff from exactly the cleared position —
+/// three times in a row, EGSS 2026-07-29. If the CLEARED designator itself
+/// fits our position and heading (the fit's own gates, minus length — an
+/// administrative sub-segment's declared distance is not the pavement), we
+/// are standing on the cleared runway whatever the fitted row is called. A
+/// reciprocal still fails on heading and a true parallel on cross-track, so
+/// the backwards-line-up trap this check exists for is intact.
+pub fn cleared_fits_here(
+    cands: &[Runway],
+    cleared: &str,
+    lat: f64,
+    lon: f64,
+    psi_true: f64,
+) -> bool {
+    cands.iter().any(|r| {
+        runway_matches(&r.id, cleared)
+            && heading_diff(psi_true, r.course_deg) <= ALIGN_MAX_DEG
+            && (cross_track_nm(lat, lon, r) * M_PER_NM).abs() <= LATERAL_MAX_M
+            && along_track_nm(lat, lon, r) * M_PER_NM <= BEFORE_THRESHOLD_MAX_M
+    })
+}
+
 /// Two runway idents name the same end when they match ignoring case and a
 /// stray leading zero ("9" vs "09"). Empty on either side is a pass — no
 /// data is not a mismatch.
@@ -673,7 +701,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         return;
     };
     if let Some(clr) = &p.cleared_runway {
-        if !runway_matches(&rwy.id, clr) {
+        if !runway_matches(&rwy.id, clr) && !cleared_fits_here(&cands, clr, lat, lon, psi) {
             alert(
                 &voice,
                 Priority::Warning,
@@ -1177,6 +1205,62 @@ mod tests {
         assert!(runway_fit(&cands, lat, lon, 0.0, 500.0).is_none());
         // Backwards on the strip fits the RECIPROCAL end, never this one.
         assert!(runway_fit(&cands, 0.0, 0.0, 180.0, 500.0).is_none());
+    }
+
+    /// Stansted's real geometry (Global Airports apt.dat): the 1,048 m
+    /// 04C/22C row is a collinear sub-segment of the 3,052 m 04/22 pavement.
+    /// Cleared "22C" and lined up mid-strip, the fit names "22" (the short
+    /// row fails the length gate for a jet's factored roll) and the string
+    /// compare refused the takeoff — EGSS, 2026-07-29, three times.
+    #[test]
+    fn collinear_duplicate_designators_pass_the_crosscheck() {
+        // Course 222.8 for the 22 ends: threshold at the NE, rolling SW.
+        let cands = vec![
+            Runway {
+                icao: "EGSS".into(),
+                id: "22C".into(),
+                thr_lat: 51.8895556,
+                thr_lon: 0.2416333,
+                course_deg: 222.8,
+                length_m: 1048.0,
+                surface: 1,
+                dist_nm: 0.0,
+                elev_ft: 348.0,
+            },
+            Runway {
+                icao: "EGSS".into(),
+                id: "22".into(),
+                thr_lat: 51.8951583,
+                thr_lon: 0.2500444,
+                course_deg: 222.8,
+                length_m: 3052.0,
+                surface: 1,
+                dist_nm: 0.0,
+                elev_ft: 348.0,
+            },
+        ];
+        // The stop the line-up delivered: on the shared centreline, 190 m
+        // down the 22C row, nose roughly down the strip.
+        let (lat, lon) = (51.88799, 0.23930);
+        // A factored roll longer than the 22C row's remainder: the fit
+        // skips 22C and names the long row.
+        let (rwy, rem) = runway_fit(&cands, lat, lon, 223.0, 900.0).expect("on the pavement");
+        assert_eq!(rwy.id, "22", "the short row fails the length gate");
+        assert!(rem > 1500.0, "{rem}");
+        assert!(!runway_matches(&rwy.id, "22C"), "the strings alone refuse");
+        // The escape hatch: the cleared designator fits where we stand.
+        assert!(cleared_fits_here(&cands, "22C", lat, lon, 223.0));
+        // The traps stay armed: the reciprocal fails on heading, a name
+        // not under the wheels fails outright.
+        assert!(!cleared_fits_here(&cands, "04C", lat, lon, 223.0));
+        assert!(!cleared_fits_here(&cands, "27", lat, lon, 223.0));
+        // A true parallel 200 m abeam fails on cross-track.
+        let mut parallel = cands[0].clone();
+        parallel.id = "22R".into();
+        let (plat, plon) = project_latlon(parallel.thr_lat, parallel.thr_lon, 132.8, 200.0 / 1852.0);
+        parallel.thr_lat = plat;
+        parallel.thr_lon = plon;
+        assert!(!cleared_fits_here(&[parallel], "22R", lat, lon, 223.0));
     }
 
     #[test]
