@@ -264,6 +264,9 @@ pub struct Params {
     /// The rotation will not command within [`TAIL_STRIKE_MARGIN_DEG`] of it.
     /// `None` on airframes short enough not to have one worth naming.
     pub tail_strike_deg: Option<f64>,
+    /// Never-exceed / Vmo, KIAS — the climb's OVERSPEED protection. `None`
+    /// keeps the full-power climb every airframe flew before this existed.
+    pub vne_kts: Option<f64>,
 }
 
 /// Fit the aircraft's position and heading to a runway end: which strip are
@@ -529,6 +532,53 @@ pub fn climb_vs_fpm(ias_kts: f64, vy_kts: f64, max_fpm: f64) -> f64 {
     (max_fpm - (vy_kts - ias_kts).max(0.0) * 60.0).clamp(150.0, max_fpm)
 }
 
+/// How far below Vne the overspeed protection starts working, and how much
+/// climb rate it trades in per knot of excess.
+const OVERSPEED_GUARD_KTS: f64 = 20.0;
+const OVERSPEED_VS_PER_KT: f64 = 60.0;
+const OVERSPEED_VS_MAX_FPM: f64 = 1500.0;
+/// Thrust is pulled no lower than this in the climb — enough to keep climbing.
+const CLIMB_THROTTLE_MIN: f64 = 0.55;
+const OVERSPEED_THR_PER_KT: f64 = 0.02;
+
+/// Climb rate with speed protection on BOTH sides.
+///
+/// [`climb_vs_fpm`] only ever protected the slow side: below Vy it backs the
+/// rate off, above Vy it commands the maximum and nothing else. That is right
+/// for a trainer, which cannot outrun itself at full power, and wrong for a
+/// jet, which can. The SF50 left the runway at full thrust and accelerated
+/// through the climb to 270 KIAS against a Vmo of 250 — measured live in the
+/// climb, 2026-07-28 — with the copilot commanding a placid 1500 fpm the
+/// whole way, because nothing in the law was watching the top end.
+///
+/// Inside the guard band the excess speed is traded for altitude: climb
+/// HARDER, which is what a pilot does with thrust they cannot reduce. The
+/// trade is capped so the protection can never become a pitch-up of its own.
+pub fn climb_vs_protected(ias_kts: f64, vy_kts: f64, max_fpm: f64, vne_kts: Option<f64>) -> f64 {
+    let base = climb_vs_fpm(ias_kts, vy_kts, max_fpm);
+    let Some(vne) = vne_kts else { return base };
+    let over = ias_kts - (vne - OVERSPEED_GUARD_KTS);
+    if over <= 0.0 {
+        return base;
+    }
+    base + (over * OVERSPEED_VS_PER_KT).min(OVERSPEED_VS_MAX_FPM)
+}
+
+/// Climb thrust with the same guard. Trading speed for rate is only half an
+/// answer — on an airframe with this much excess thrust the aircraft simply
+/// re-accelerates — so the lever comes back too, which is the other half of
+/// what a pilot does. Never below [`CLIMB_THROTTLE_MIN`]: the point is to stop
+/// overspeeding, not to stop climbing. Airframes with no declared Vne are
+/// untouched and keep the full-power climb they have always flown.
+pub fn climb_throttle(ias_kts: f64, vne_kts: Option<f64>) -> f64 {
+    let Some(vne) = vne_kts else { return 1.0 };
+    let over = ias_kts - (vne - OVERSPEED_GUARD_KTS);
+    if over <= 0.0 {
+        return 1.0;
+    }
+    (1.0 - over * OVERSPEED_THR_PER_KT).max(CLIMB_THROTTLE_MIN)
+}
+
 /// Reject when the runway is running out and rotation speed is still short:
 /// inside the margin with less than 90% of Vr there is no takeoff today.
 pub fn must_reject(remaining_m: f64, ias_kts: f64, vr_kts: f64) -> bool {
@@ -706,6 +756,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut pitch_law = RotatePitch::new(p.tail_strike_deg);
     let mut wings = WingsLevel::default();
     let mut last_vs_cmd: Option<f64> = None;
+    // Last climb thrust commanded, so the lever is only rewritten when it moves.
+    let mut last_climb_thr = 1.0f64;
     let mut last_thr_cmd = 0.3_f64;
     // The roll section's heading error, one tick stale, for the throttle's
     // swinging-nose hold (throttle is commanded before position is read).
@@ -1030,7 +1082,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             if xp.get_float(VS_STATUS).await.unwrap_or(0.0) <= 0.5 {
                 let _ = xp.run_command(CMD_VS_MODE).await;
             }
-            let vs = climb_vs_fpm(ias, p.vy_kts, p.climb_fpm);
+            let vs = climb_vs_protected(ias, p.vy_kts, p.climb_fpm, p.vne_kts);
             let _ = xp.set_float(VS_DIAL, vs).await;
             last_vs_cmd = Some(vs);
             crate::blackbox::record(
@@ -1038,10 +1090,17 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 serde_json::json!({"event": "ap_engaged", "ias": ias, "agl": agl_ft, "cmd_vs": vs}),
             );
         }
-        let vs = climb_vs_fpm(ias, p.vy_kts, p.climb_fpm);
+        let vs = climb_vs_protected(ias, p.vy_kts, p.climb_fpm, p.vne_kts);
         if last_vs_cmd.is_none_or(|v| (v - vs).abs() > 40.0) {
             let _ = xp.set_float(VS_DIAL, vs).await;
             last_vs_cmd = Some(vs);
+        }
+        // ...and the lever comes back with it. Trading speed for rate alone
+        // just lets an airframe with spare thrust re-accelerate.
+        let thr = climb_throttle(ias, p.vne_kts);
+        if (thr - last_climb_thr).abs() > 0.01 {
+            let _ = xp.set_float(&throttle_dref(), thr).await;
+            last_climb_thr = thr;
         }
         if xp.get_float(VS_STATUS).await.unwrap_or(1.0) <= 0.5 {
             // Someone (or a mode change) dropped VS: re-engage, and force a
@@ -1483,6 +1542,44 @@ mod tests {
         assert_eq!(climb_vs_fpm(40.0, 74.0, 700.0), 150.0);
         // Fast: capped at the profile's rate, no zoom climb.
         assert_eq!(climb_vs_fpm(95.0, 74.0, 700.0), 700.0);
+    }
+
+    /// The climb protected only the SLOW side, which is right for a trainer
+    /// (it cannot outrun itself at full power) and wrong for a jet, which can.
+    /// The SF50 left Luton at full thrust and accelerated to 270 KIAS against
+    /// a Vmo of 250 while the copilot placidly commanded 1500 fpm and never
+    /// touched the lever (measured live in the climb, 2026-07-28).
+    #[test]
+    fn the_climb_protects_the_fast_side_too() {
+        const VNE: f64 = 250.0;
+        // Well below the guard band: untouched, both rate and thrust.
+        assert_eq!(climb_vs_protected(200.0, 120.0, 2000.0, Some(VNE)), 2000.0);
+        assert_eq!(climb_throttle(200.0, Some(VNE)), 1.0);
+        // Inside the band the aircraft climbs HARDER — excess speed traded
+        // for altitude — and the lever comes back with it.
+        let fast = climb_vs_protected(245.0, 120.0, 2000.0, Some(VNE));
+        assert!(fast > 2000.0, "trade the speed for rate: {fast}");
+        let thr = climb_throttle(245.0, Some(VNE));
+        assert!(thr < 1.0, "and pull the lever: {thr}");
+        // Harder the faster it gets, monotonically, on both.
+        assert!(climb_vs_protected(260.0, 120.0, 2000.0, Some(VNE)) > fast);
+        assert!(climb_throttle(260.0, Some(VNE)) < thr);
+        // The protection can never become a pitch-up or a shutdown of its own.
+        let extreme = climb_vs_protected(400.0, 120.0, 2000.0, Some(VNE));
+        assert!(extreme <= 2000.0 + OVERSPEED_VS_MAX_FPM, "capped: {extreme}");
+        assert!(climb_throttle(400.0, Some(VNE)) >= CLIMB_THROTTLE_MIN);
+        // An airframe that declares no Vne keeps exactly the climb it had.
+        assert_eq!(
+            climb_vs_protected(260.0, 120.0, 2000.0, None),
+            climb_vs_fpm(260.0, 120.0, 2000.0)
+        );
+        assert_eq!(climb_throttle(260.0, None), 1.0);
+        // The 172 is nowhere near its Vne in a climb, so nothing changes for it.
+        assert_eq!(
+            climb_vs_protected(74.0, 74.0, 700.0, Some(163.0)),
+            climb_vs_fpm(74.0, 74.0, 700.0)
+        );
+        assert_eq!(climb_throttle(74.0, Some(163.0)), 1.0);
     }
 
     #[test]

@@ -32,6 +32,8 @@ pub struct Circuit {
     pub prop: Option<PropProfile>,
     /// This airframe's tail-strike attitude, degrees (profile).
     pub tail_strike_deg: Option<f64>,
+    /// Vne/Vmo for the climb's overspeed protection.
+    pub vne_kts: Option<f64>,
 }
 
 /// Default pattern altitude above the field, feet (a standard light-aircraft
@@ -192,6 +194,7 @@ impl Tool for Circuit {
                 cfg: self.cfg.clone(),
                 takeoff: autotakeoff::Params {
                     tail_strike_deg: self.tail_strike_deg,
+                    vne_kts: self.vne_kts,
                     apt_dat: super::autoland::apt_dat_path(),
                     cfg: self.cfg.clone(),
                     vr_kts: self.vr_kts,

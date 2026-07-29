@@ -116,6 +116,8 @@ pub struct FullAuto {
     pub pace: crate::autotaxi::Pace,
     /// Its tail-strike attitude, threaded the same way.
     pub tail_strike_deg: Option<f64>,
+    /// Vne/Vmo for the climb's overspeed protection.
+    pub vne_kts: Option<f64>,
     // circuit / climb-out
     pub cfg: ApConfig,
     pub vr_kts: f64,
@@ -254,6 +256,7 @@ impl Tool for FullAuto {
             },
             circuit: crate::tools::circuit::Circuit {
                 tail_strike_deg: self.tail_strike_deg,
+                vne_kts: self.vne_kts,
                 cfg: self.cfg.clone(),
                 vr_kts: self.vr_kts,
                 vy_kts: self.vy_kts,
@@ -266,6 +269,7 @@ impl Tool for FullAuto {
             },
             takeoff: crate::tools::takeoff::AutoTakeoff {
                 tail_strike_deg: self.tail_strike_deg,
+                vne_kts: self.vne_kts,
                 cfg: self.cfg.clone(),
                 vr_kts: self.vr_kts,
                 vy_kts: self.vy_kts,

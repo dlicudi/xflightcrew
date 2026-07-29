@@ -265,12 +265,14 @@ impl Registry {
                 takeoff_roll_m,
                 prop: profile.prop.clone(),
                 tail_strike_deg: profile.tail_strike_deg,
+                vne_kts: profile.vne_kts,
             }));
             // Auto circuit — one command that flies takeoff + pattern + landing
             // by orchestrating the takeoff loop, the AP, and autoland. Shares
             // the takeoff speeds and the autoland approach speed above.
             tools.push(Box::new(circuit::Circuit {
                 tail_strike_deg: profile.tail_strike_deg,
+                vne_kts: profile.vne_kts,
                 cfg: ap.clone(),
                 vr_kts: vr,
                 vy_kts: vy,
@@ -305,6 +307,7 @@ impl Registry {
                     prop: profile.prop.clone(),
                     pace,
                     tail_strike_deg: profile.tail_strike_deg,
+                    vne_kts: profile.vne_kts,
                     // "Can we start it at all": the generic piston group OR a
                     // custom cycle-switch piston sequence (the DC-3, whose
                     // mixture is xlua-overridden so it declares no `engine`).

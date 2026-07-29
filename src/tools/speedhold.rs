@@ -201,7 +201,18 @@ pub fn throttle_adjust(err_kts: f64, trend_kts_s: f64) -> f64 {
     } else {
         0.015
     };
-    (p + d).clamp(-0.015, max_up)
+    // The fast side scales with urgency too. A flat 0.015 was sized on GA,
+    // where nothing accelerates hard at pattern power; a jet off the runway
+    // accelerated 125 to 241 knots across one upwind-to-downwind while the
+    // circuit's law pulled the lever at the polite rate the whole way (SF50,
+    // Luton 2026-07-28). Well past the target, or building fast: pull like
+    // you mean it. Overspeed is a comfort problem right up until it's Vmo.
+    let max_down = if err_kts < -10.0 || trend_kts_s > 3.0 {
+        0.04
+    } else {
+        0.015
+    };
+    (p + d).clamp(-max_down, max_up)
 }
 
 /// Sanity bounds for a spoken flight target — outside this it's a mishear.
@@ -264,8 +275,12 @@ pub fn taxi_control(
         // TRIMS (a bend slow-down, target still moving) cap well below a
         // stop's effort: a 12→6 kt bend target braked at 0.45 and threw
         // everyone forward ("still very abrupt", SR22 2026-07-22).
-        let cap = if target_kts < 1.0 { 0.6 } else { 0.3 };
-        (Some(0.0), ((-eff - 3.0) * 0.12 + 0.1).clamp(0.1, cap))
+        // Rolling caps came down AGAIN for the SF50 ("braking / slowing down
+        // is a bit jerky", 2026-07-28) — the third airframe to say so, and
+        // every complaint has moved these numbers the same direction. A stop
+        // keeps its 0.6 authority; a rolling trim is passengers' comfort.
+        let cap = if target_kts < 1.0 { 0.6 } else { 0.22 };
+        (Some(0.0), ((-eff - 3.0) * 0.09 + 0.08).clamp(0.08, cap))
     } else if eff < -1.0 {
         // A little fast: power off is the whole correction for a rolling
         // taxi — idle thrust won't hold it fast on the flat, and braking to
@@ -295,7 +310,9 @@ pub fn brake_slew(prev: f64, want: f64, dt_s: f64) -> f64 {
     let dt = dt_s.clamp(0.02, 1.0);
     // 0.35/s apply: the 0.5/s squeeze still read as a stab on the SR22's
     // effective brakes ("still very abrupt", 2026-07-22).
-    let step = if want > prev { 0.35 * dt } else { 1.5 * dt };
+    // 0.28/s apply: 0.35 still drew "a bit jerky" from the SF50's cabin
+    // (2026-07-28). Releases stay quick — that is never the jerk.
+    let step = if want > prev { 0.28 * dt } else { 1.5 * dt };
     prev + (want - prev).clamp(-step, step)
 }
 
@@ -377,6 +394,34 @@ impl Tool for HoldSpeed {
             return Ok(
                 "We're airborne — I can't stop the aircraft. Say a speed to hold.".to_string(),
             );
+        }
+        // ONE owner for the lever. The circuit, a procedure and autoland each
+        // manage speed themselves, and arming a second governor on top is a
+        // tug-of-war, not a handover: "reduce airspeed to 160" spoken on a
+        // circuit's downwind armed this hold against the circuit's own power
+        // law, each side re-commanding over the other, and the lever never
+        // came down — the aircraft rode X-Plane's overspeed protection at
+        // 270 KIAS for three minutes while the circuit commanded a descent it
+        // never got (SF50, Luton 2026-07-28). Refuse with the real answer.
+        // `off: true` still passes: releasing a hold is always safe.
+        if !on_ground && !a.off {
+            if crate::circuit::ACTIVE.load(Ordering::Relaxed) {
+                return Ok("The circuit has the throttle — it flies the pattern speed. \
+                           Say cancel circuit if you want the speed."
+                    .to_string());
+            }
+            if crate::autoland::ACTIVE.load(Ordering::Relaxed) {
+                return Ok(
+                    "The autoland has the throttle. Say cancel autoland if you want the speed."
+                        .to_string(),
+                );
+            }
+            if crate::procedure::ACTIVE.load(Ordering::Relaxed) {
+                return Ok(
+                    "The approach has the throttle. Say cancel the approach if you want the speed."
+                        .to_string(),
+                );
+            }
         }
         // Mode by context: a small number on the ground is a taxi; airborne (or
         // a big number) is a flight hold. A big number on the ground is neither.
@@ -781,6 +826,18 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     });
                     last_brake_t = Some(now_bt);
                     brake_out = brake_slew(brake_out, brake, brake_dt);
+                    // The brake trace was invisible: "braking is jerky" has
+                    // been reported three times and diagnosed by feel every
+                    // time. Log only while anything is happening.
+                    if brake_out > 0.005 || brake > 0.0 {
+                        crate::blackbox::record(
+                            "speedhold",
+                            serde_json::json!({
+                                "event": "brake", "cmd": brake, "out": brake_out,
+                                "gs": gs_kts, "target": target, "trend": gs_trend,
+                            }),
+                        );
+                    }
                     if brake_out > 0.005 {
                         let mut smoothed = false;
                         if !trim_fallback {
@@ -878,7 +935,13 @@ mod tests {
         // Authority is bounded, asymmetrically: overspeed is a comfort issue,
         // stall is not — the slow side gets the bigger clamp.
         assert_eq!(throttle_adjust(100.0, 0.0), 0.04);
-        assert_eq!(throttle_adjust(-100.0, 0.0), -0.015);
+        // The fast side pulls with the same urgency it pushes: a flat -0.015
+        // let a jet run 125 to 270 knots through a whole circuit (2026-07-28).
+        assert_eq!(throttle_adjust(-100.0, 0.0), -0.04);
+        // ...but a small overspeed still gets the polite step.
+        assert_eq!(throttle_adjust(-5.0, 0.0), -0.015);
+        // Building fast counts as urgent even before the error is big.
+        assert_eq!(throttle_adjust(-5.0, 4.0), -0.04);
         assert_eq!(
             throttle_adjust(0.0, -10.0),
             0.04,

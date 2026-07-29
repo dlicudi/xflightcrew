@@ -36,6 +36,8 @@ pub struct AutoTakeoff {
     pub prop: Option<PropProfile>,
     /// This airframe's tail-strike attitude, degrees (profile).
     pub tail_strike_deg: Option<f64>,
+    /// Vne/Vmo for the climb's overspeed protection.
+    pub vne_kts: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -175,6 +177,7 @@ impl Tool for AutoTakeoff {
             ctx.voice.cloned(),
             autotakeoff::Params {
                 tail_strike_deg: self.tail_strike_deg,
+                vne_kts: self.vne_kts,
                 apt_dat: super::autoland::apt_dat_path(),
                 cfg: self.cfg.clone(),
                 vr_kts: self.vr_kts,
