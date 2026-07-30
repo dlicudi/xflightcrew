@@ -83,17 +83,23 @@ const M_PER_NM: f64 = 1852.0;
 // advance EARLY by a turn-anticipation lead so the rollout lands ON the target
 // line instead of overshooting it by a full radius.
 
-/// The bank the AP flies in a heading capture. A STANDARD RATE turn (3°/s) is
-/// what an autopilot actually does, and at pattern speed that is about 20°.
+/// The bank the AP actually flies in a heading capture, conservative
+/// (shallower = wider radius = wider pattern).
 ///
-/// 14° was chosen on the theory that over-estimating the radius is safe. It is
-/// not: radius scales with 1/tan(bank), so 14° made every pattern dimension
-/// half again too big — a 2.24 nm-wide circuit at EGHI, whose base leg then
-/// rolled out 2.45 km abeam with only 2.4 km of runway distance left to close
-/// it. Autoland saturated at its 35° cut for the whole final and crossed the
-/// threshold 188 m off the centreline (2026-07-30). A pattern too big to
-/// intercept is not the safe direction.
-const AP_BANK_DEG: f64 = 20.0;
+/// 20° was tried — a standard-rate turn, which is what an autopilot nominally
+/// does — and it broke the pattern: at EGHI the legs became short enough that
+/// each trigger fired while the aircraft was still banked from the previous
+/// turn, and the rectangle degenerated into a figure of eight (2026-07-30).
+/// That is the exact failure this constant's conservatism exists to prevent,
+/// and it is documented at the top of this file from the LXGB loops.
+///
+/// The lesson is that the number must match what the AP DOES, not what a
+/// standard-rate turn implies — if it rolls into 14°, sizing the pattern for
+/// 20° asks for corners it cannot make. Oversized is survivable; undersized
+/// is not. The approach being too wide to intercept was a real problem, but
+/// the fix for that is the handover gate (`interceptable`), not a tighter
+/// pattern the aircraft cannot fly.
+const AP_BANK_DEG: f64 = 14.0;
 /// Max heading-bug movement per 500 ms tick, degrees — see [`slew_bug`].
 const BUG_SLEW_PER_TICK: f64 = 40.0;
 
@@ -1856,11 +1862,12 @@ mod tests {
 
     #[test]
     fn geometry_scales_from_the_turn_radius() {
-        // ~80 kt (41 m/s) at a STANDARD-RATE 20° bank → radius ~470 m. It was
-        // ~700 at the old 14°, and that half-again-bigger pattern is what put
-        // the base rollout beyond what the final could intercept.
+        // ~80 kt (41 m/s) at 14° bank → radius ~700 m. A standard-rate 20° was
+        // tried and reverted: the tighter pattern degenerated into a figure of
+        // eight because the legs got shorter than the turns. The pattern being
+        // WIDE is handled by the handover gate below, not by shrinking it.
         let r = turn_radius_m(41.0);
-        assert!((400.0..650.0).contains(&r), "radius {r}");
+        assert!((550.0..900.0).contains(&r), "radius {r}");
         let geom = Geometry::for_radius(r);
         // The width must exceed the turn DIAMETER — legs shorter than the
         // diameter are what degenerated the rectangle into loops.

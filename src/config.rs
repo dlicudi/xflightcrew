@@ -284,6 +284,9 @@ impl Config {
                 .or_else(|| std::env::var("PIPER_VOICE").ok())
                 .unwrap_or_else(|| "models/en_US-amy-medium.onnx".into()),
             cabin_piper_voice: env_or("XCOPILOT_CABIN_VOICE", "models/en_US-hfc_female-medium.onnx"),
+            // NOTE: a copilot/cabin collision is resolved after construction —
+            // see `resolve_persona_voices`. The panel's voice picker can set
+            // the pilot to anything, including this default.
             cabin_crew: env_or("XCOPILOT_CABIN_CREW", ""),
             // Prefer Custom Data (Navigraph/updated AIRAC) when it exists — it's
             // what X-Plane itself flies on; the stock file goes stale the moment
@@ -377,7 +380,11 @@ impl Config {
             //
             // The home field's curated voices (alba, ryan, northern male) stay
             // OUT: another airport must never answer in the home tower's voice
-            // ("still the scottish lady", 2026-07-09). Accented non-English
+            // ("still the scottish lady", 2026-07-09). So do the two INTERCOM
+            // personas — the copilot (amy) and the cabin crew (hfc_female)
+            // were both sitting in here, so some airport was always going to
+            // answer in your first officer's voice. With 154 addressable
+            // voices in models/ there is no reason to share one. Accented non-English
             // voices stay out too — es_* are cast by country, so a German
             // field never draws a Spanish controller from here.
             atc_voice_pool: env_or(
@@ -388,18 +395,50 @@ impl Config {
                  models/en_GB-aru-medium.onnx#2,models/en_GB-aru-medium.onnx#7,\
                  models/en_GB-cori-medium.onnx,\
                  models/en_GB-southern_english_female-low.onnx,\
-                 models/en_US-joe-medium.onnx,models/en_US-amy-medium.onnx,\
+                 models/en_US-joe-medium.onnx,models/en_US-danny-low.onnx,\
                  models/en_US-bryce-medium.onnx,models/en_US-john-medium.onnx,\
                  models/en_US-norman-medium.onnx,models/en_US-kusal-medium.onnx,\
                  models/en_US-lessac-medium.onnx,models/en_US-hfc_male-medium.onnx,\
-                 models/en_US-hfc_female-medium.onnx,models/en_US-mike-medium.onnx,\
+                 models/en_US-reza_ibrahim-medium.onnx,models/en_US-mike-medium.onnx,\
                  models/en_US-sam-medium.onnx,models/en_US-kathleen-low.onnx",
             ),
             atc_voice_shift: env_or("XCOPILOT_ATC_VOICE_SHIFT", "true") != "false",
             atc_squelch_wav: env_or("XCOPILOT_SQUELCH_WAV", "assets/afv/Click_f32.wav"),
             atc_voice: env_or("XCOPILOT_ATC_VOICE", "Daniel"),
             atc_rate: env_or("XCOPILOT_ATC_RATE", "165"),
-        })
+        }
+        .resolve_persona_voices())
+    }
+
+    /// Two personas on the same intercom must not share a voice.
+    ///
+    /// The panel's voice picker sets the pilot to anything the user clicks,
+    /// including the cabin crew's default — and it does: a saved
+    /// `pilot_voice` of en_US-hfc_female-medium made the first officer and
+    /// the flight attendant the same person on the MD-82 (2026-07-30). A
+    /// better default cannot fix that, because the picker outranks defaults.
+    /// So the collision is resolved here, after everything has been read.
+    ///
+    /// Only the CABIN moves. The pilot's voice is an explicit choice the user
+    /// made in the panel and must be honoured exactly.
+    fn resolve_persona_voices(mut self) -> Self {
+        if self.cabin_piper_voice != self.piper_voice {
+            return self;
+        }
+        // Anything on the intercom that is not the pilot and not a controller.
+        const CABIN_ALTERNATES: &[&str] = &[
+            "models/en_GB-jenny_dioco-medium.onnx",
+            "models/en_US-kristin-medium.onnx",
+            "models/en_US-hfc_female-medium.onnx",
+            "models/en_GB-southern_english_female-low.onnx",
+        ];
+        if let Some(alt) = CABIN_ALTERNATES
+            .iter()
+            .find(|v| **v != self.piper_voice && !self.atc_voice_pool.contains(**v))
+        {
+            self.cabin_piper_voice = (*alt).to_string();
+        }
+        self
     }
 }
 
@@ -462,5 +501,53 @@ mod tests {
             british * 3 >= entries,
             "at least a third British: {british} of {entries}"
         );
+    }
+
+    /// No two PERSONAS may share a voice, and none of them may sit in the
+    /// away-field pool.
+    ///
+    /// The pool is what every airport other than home answers in, so a voice
+    /// that is also the copilot's means a controller eventually replies in
+    /// your first officer's voice. The home-field voices were excluded on
+    /// purpose and documented; the two intercom personas were not, and both
+    /// the copilot (amy) and the cabin crew (hfc_female) were sitting in
+    /// there until 2026-07-30.
+    #[test]
+    fn no_persona_shares_a_voice_with_another_or_with_the_pool() {
+        let cfg = Config::from_env().expect("config loads");
+        let pool: Vec<&str> = cfg
+            .atc_voice_pool
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let personas: Vec<(&str, &str)> = vec![
+            ("copilot", cfg.piper_voice.as_str()),
+            ("cabin crew", cfg.cabin_piper_voice.as_str()),
+            ("home tower", cfg.atc_piper_voice.as_str()),
+            ("home approach", cfg.atc_approach_piper_voice.as_str()),
+            ("home departure", cfg.atc_departure_piper_voice.as_str()),
+        ];
+
+        for (who, v) in &personas {
+            if v.is_empty() {
+                continue; // empty = inherit another slot, by design
+            }
+            assert!(
+                !pool.contains(v),
+                "{who} voice {v} is also in the away-field pool — an airport will answer as {who}"
+            );
+        }
+        // ...and the personas must differ from each other. An empty slot is a
+        // deliberate inherit (ATIS from the tower), so skip those.
+        for (i, (who_a, a)) in personas.iter().enumerate() {
+            for (who_b, b) in personas.iter().skip(i + 1) {
+                if a.is_empty() || b.is_empty() {
+                    continue;
+                }
+                assert_ne!(a, b, "{who_a} and {who_b} share the voice {a}");
+            }
+        }
     }
 }
