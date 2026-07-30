@@ -83,9 +83,17 @@ const M_PER_NM: f64 = 1852.0;
 // advance EARLY by a turn-anticipation lead so the rollout lands ON the target
 // line instead of overshooting it by a full radius.
 
-/// The bank the AP actually flies in a heading capture, conservative (shallower
-/// = wider radius = wider pattern — over-estimating the radius is safe).
-const AP_BANK_DEG: f64 = 14.0;
+/// The bank the AP flies in a heading capture. A STANDARD RATE turn (3°/s) is
+/// what an autopilot actually does, and at pattern speed that is about 20°.
+///
+/// 14° was chosen on the theory that over-estimating the radius is safe. It is
+/// not: radius scales with 1/tan(bank), so 14° made every pattern dimension
+/// half again too big — a 2.24 nm-wide circuit at EGHI, whose base leg then
+/// rolled out 2.45 km abeam with only 2.4 km of runway distance left to close
+/// it. Autoland saturated at its 35° cut for the whole final and crossed the
+/// threshold 188 m off the centreline (2026-07-30). A pattern too big to
+/// intercept is not the safe direction.
+const AP_BANK_DEG: f64 = 20.0;
 /// Max heading-bug movement per 500 ms tick, degrees — see [`slew_bug`].
 const BUG_SLEW_PER_TICK: f64 = 40.0;
 
@@ -127,6 +135,25 @@ impl Geometry {
             lead_m: 0.9 * r,
         }
     }
+}
+
+/// The steepest cut autoland will fly to regain the centreline (its final
+/// pursuit saturates here), and the margin we insist on over the bare
+/// geometry before handing an approach to it.
+const MAX_INTERCEPT_CUT_DEG: f64 = 35.0;
+const INTERCEPT_MARGIN: f64 = 1.3;
+
+/// Can an aircraft `xtk_m` off the centreline with `along_m` still to run
+/// actually reach it, at the steepest cut autoland flies?
+///
+/// EGHI 2026-07-30: handed off 2,815 m abeam with 2,421 m to run — the offset
+/// EXCEEDED the distance, a 49° angle to the runway. No cut closes that, so
+/// autoland flew the whole final saturated and crossed the threshold 188 m
+/// off. The circuit must fly its own turn onto final and only let go once the
+/// geometry is actually flyable.
+pub fn interceptable(xtk_m: f64, along_m: f64) -> bool {
+    let need = xtk_m.abs() / MAX_INTERCEPT_CUT_DEG.to_radians().tan();
+    along_m >= need * INTERCEPT_MARGIN
 }
 
 /// Floor for the base/final descent, feet above the field — the lowest the
@@ -1173,6 +1200,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     let mut descent_target: Option<f64> = None;
     // Gear goes down ONCE, at the 180, and the latch is what makes it once.
     let mut gear_lowered = !retractable_gear;
+    // Set when the base turn onto final may BEGIN. The handover waits for the
+    // geometry to become flyable, not merely for the leg to change.
+    let mut turning_final = false;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1211,6 +1241,55 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // (negative on the approach side) and cross-track (right positive).
         let a_m = -along_track_nm(lat, lon, &rwy) * M_PER_NM;
         let x_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
+
+        // --- Hand over only when autoland can actually fly it. ---
+        // `turning_final` means the turn onto final is under way; the aircraft
+        // is still up to 1.3 radii abeam at that moment. Releasing there gave
+        // autoland 2,815 m of offset with 2,421 m to run — a 49° angle, no cut
+        // closes it — and it crossed the threshold 188 m off the paint. Fly
+        // our own turn, let go when the offset is closeable.
+        if turning_final && interceptable(x_m, a_m.abs()) {
+            let alt_msl = field_elev_ft + agl_ft;
+            let arr = ArrivalCtx {
+                apt_dat: &p.apt_dat,
+                cifp_dir: &p.cifp_dir,
+                fix_data_path: &p.fix_data_path,
+                nav_data_path: &p.nav_data_path,
+                cfg: &p.cfg,
+                approach_ias: p.approach_ias,
+            };
+            if try_published_arrival(
+                arr, &rwy.icao, &rwy_id, &base_url, &voice, lat, lon, alt_msl,
+            )
+            .await
+            {
+                ACTIVE.store(false, Ordering::SeqCst);
+                return;
+            }
+            crate::blackbox::record(
+                "circuit",
+                serde_json::json!({
+                    "event": "handoff_autoland",
+                    "agl_ft": agl_ft,
+                    "icao": rwy.icao,
+                    "rwy": rwy_id,
+                    "xtk_m": x_m,
+                    "along_m": a_m,
+                }),
+            );
+            crate::autoland::ABORT.store(false, Ordering::SeqCst);
+            crate::autoland::run_autoland(
+                base_url.clone(),
+                p.apt_dat.clone(),
+                p.cfg.clone(),
+                p.approach_ias,
+                voice.clone(),
+                None,
+                Some(rwy_id.clone()),
+            );
+            ACTIVE.store(false, Ordering::SeqCst);
+            return;
+        }
 
         // Fly each leg as a TRACK, not a bare heading: crab into the wind so the
         // AP holds the ground track. Without this a 12 kt crosswind blew the
@@ -1418,6 +1497,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 transmit(radio_call(&callsign, "turning base"));
             }
             Leg::Final => {
+                // ARM the turn onto final; do NOT hand over here. Reaching
+                // `final_capture_m` means the base turn may BEGIN, not that
+                // the aircraft is on the centreline — it is still 1.3 radii
+                // abeam at that instant. Handing autoland an aircraft 2,815 m
+                // off with 2,421 m to run gave it a 49° angle it could not
+                // close, and it crossed the threshold 188 m off the paint
+                // (EGHI, 2026-07-30). The circuit flies its own turn now and
+                // lets go when the geometry is actually flyable.
                 alert(
                     &voice,
                     Priority::Advisory,
@@ -1432,60 +1519,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                     &callsign,
                     &format!("final runway {}", spell_runway(&rwy_id)),
                 ));
-                // Prefer the airport's PUBLISHED approach when we're actually
-                // positioned to fly it (a wide/arrival pattern outside and above
-                // the FAF) — that's the terrain-safe path. A tight circuit sits
-                // inside the FAF below platform, so this declines and autoland
-                // takes the short final, unchanged.
-                let alt_msl = field_elev_ft + agl_ft;
-                // Pass individual fields — `p.takeoff` was already moved into the
-                // takeoff loop, so `&p` can't be borrowed whole here.
-                let arr = ArrivalCtx {
-                    apt_dat: &p.apt_dat,
-                    cifp_dir: &p.cifp_dir,
-                    fix_data_path: &p.fix_data_path,
-                    nav_data_path: &p.nav_data_path,
-                    cfg: &p.cfg,
-                    approach_ias: p.approach_ias,
-                };
-                if try_published_arrival(
-                    arr, &rwy.icao, &rwy_id, &base_url, &voice, lat, lon, alt_msl,
-                )
-                .await
-                {
-                    ACTIVE.store(false, Ordering::SeqCst);
-                    return;
-                }
-                crate::blackbox::record(
-                    "circuit",
-                    serde_json::json!({
-                        "event": "handoff_autoland",
-                        "agl_ft": agl_ft,
-                        "icao": rwy.icao,
-                        "rwy": rwy_id,
-                    }),
-                );
-                crate::autoland::ABORT.store(false, Ordering::SeqCst);
-                // FORCE the pattern's own runway — see the authored handoff for
-                // why `None` here is a bug and not a default. Southampton,
-                // 2026-07-30: the circuit turned final at EGHI, handed off
-                // bare, and autoland's track search chose EGHL 09 SIXTEEN MILES
-                // away. It then flew away from the field for five minutes,
-                // pinned in Intercept 1,600 ft below a glidepath it could never
-                // capture, bleeding 125 kt to 92 with the gear up.
-                crate::autoland::run_autoland(
-                    // A fresh client for autoland's own thread.
-                    base_url.clone(),
-                    p.apt_dat.clone(),
-                    p.cfg.clone(),
-                    p.approach_ias,
-                    voice.clone(),
-                    None,
-                    Some(rwy_id.clone()),
-                );
-                // The circuit's job is done; autoland owns the aircraft now.
-                ACTIVE.store(false, Ordering::SeqCst);
-                return;
+                turning_final = true;
             }
             Leg::Upwind => {}
         }
@@ -1822,9 +1856,11 @@ mod tests {
 
     #[test]
     fn geometry_scales_from_the_turn_radius() {
-        // ~80 kt (41 m/s) at 14° bank → radius ~700 m.
+        // ~80 kt (41 m/s) at a STANDARD-RATE 20° bank → radius ~470 m. It was
+        // ~700 at the old 14°, and that half-again-bigger pattern is what put
+        // the base rollout beyond what the final could intercept.
         let r = turn_radius_m(41.0);
-        assert!((550.0..900.0).contains(&r), "radius {r}");
+        assert!((400.0..650.0).contains(&r), "radius {r}");
         let geom = Geometry::for_radius(r);
         // The width must exceed the turn DIAMETER — legs shorter than the
         // diameter are what degenerated the rectangle into loops.
@@ -1836,6 +1872,17 @@ mod tests {
         );
         assert!(geom.downwind_past_m > geom.width_m, "room for base + final");
         assert!(geom.lead_m < r, "lead is less than the radius itself");
+        // The pattern must be INTERCEPTABLE: after the base turn eats one
+        // radius of the offset, what is left has to be closeable in the
+        // distance that remains. A geometry that fails this cannot be flown
+        // onto the centreline however well the laws behave — EGHI handed
+        // autoland 2,815 m of offset with 2,421 m to run and it crossed the
+        // threshold 188 m off the paint.
+        let rollout_xtk = (geom.final_capture_m - r).max(0.0);
+        assert!(
+            interceptable(rollout_xtk, geom.downwind_past_m.min(2.0 * r + 1200.0)),
+            "base rolls out {rollout_xtk:.0} m off — must be closeable"
+        );
         // A bad speed read can't produce a degenerate pattern.
         assert!(turn_radius_m(0.0) >= 250.0);
         assert!(turn_radius_m(500.0) <= 2500.0);
@@ -2147,5 +2194,37 @@ mod tests {
             route.iter().all(|w| w.x_m >= -0.1),
             "right pattern → offsets to the right"
         );
+    }
+
+    /// The handover must wait for a geometry autoland can actually fly.
+    ///
+    /// EGHI 2026-07-30: released 2,815 m off the centreline with 2,421 m to
+    /// run — the offset EXCEEDED the distance, a 49 degree angle. Autoland
+    /// saturated at its 35 degree cut for the entire final and crossed the
+    /// threshold 188 m off the paint. Reaching `final_capture_m` means the
+    /// base turn may BEGIN, not that the aircraft is on the centreline.
+    #[test]
+    fn the_handover_waits_until_the_centreline_is_reachable() {
+        // The exact geometry that failed.
+        assert!(
+            !interceptable(2815.0, 2421.0),
+            "offset larger than the distance to run is never flyable"
+        );
+        // Sign must not matter — the other side of the centreline is the same
+        // problem.
+        assert!(!interceptable(-2815.0, 2421.0));
+
+        // A rollout close to the centreline with room to run is fine.
+        assert!(interceptable(400.0, 2000.0));
+        assert!(interceptable(-400.0, 2000.0));
+
+        // The boundary behaves: at the bare 35 degree geometry it is refused
+        // (we insist on margin), and it is accepted once the margin is there.
+        let bare = 1000.0 / MAX_INTERCEPT_CUT_DEG.to_radians().tan();
+        assert!(!interceptable(1000.0, bare * 1.05), "bare geometry is not enough");
+        assert!(interceptable(1000.0, bare * INTERCEPT_MARGIN + 1.0));
+
+        // On the centreline anything works, including at the threshold.
+        assert!(interceptable(0.0, 0.0));
     }
 }
