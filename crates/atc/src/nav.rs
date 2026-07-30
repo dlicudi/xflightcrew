@@ -842,13 +842,34 @@ impl TaxiNet {
             // The honest answer is the short taxi it actually is: out to the
             // node, then in to the stand. No named legs, because none were
             // traversed.
+            // The path must START AT THE AIRCRAFT. A normal route begins at
+            // its snapped node and the drive JOINS to it, which is fine when
+            // the aircraft is beside that node — but here the whole point is
+            // that one node serves both ends, and the aircraft can be a long
+            // way from it. First cut began at the node: at EGHI that put the
+            // route's start 224 m from an aircraft that was stopped, so the
+            // drive's arrival test ("within a metre and under 1.5 kt") was
+            // true on the first tick and taxi_in went from "driving" to
+            // "secured" in two seconds without moving.
             let node = *self.nodes.get(&start)?;
-            let path = vec![node, (to_lat, to_lon)];
+            let here = (from_lat, from_lon);
+            let dest = (to_lat, to_lon);
+            // Route VIA the node when it is roughly on the way — it sits on
+            // the taxiway, which is where we would rather be — but not when
+            // doubling back to it would be the long way round.
+            let via_node =
+                dist_m(here, node) + dist_m(node, dest) <= 1.6 * dist_m(here, dest).max(1.0);
+            let path = if via_node {
+                vec![here, node, dest]
+            } else {
+                vec![here, dest]
+            };
+            let seg = vec![(String::new(), false); path.len() - 1];
             return Some(TaxiRoutePlan {
                 via: Vec::new(),
                 crossings: Vec::new(),
                 holding_point: String::new(),
-                seg: vec![(String::new(), false)],
+                seg,
                 path,
                 lead_on: Vec::new(),
             });
@@ -2631,13 +2652,23 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
             zone_of: Vec::new(),
         });
         let (stand_lat, stand_lon) = (50.94995, -1.35985);
+        let (ac_lat, ac_lon) = (50.95005, -1.36005);
         let plan = net
-            .plan(50.95005, -1.36005, stand_lat, stand_lon, 0.0, &[])
+            .plan(ac_lat, ac_lon, stand_lat, stand_lon, 0.0, &[])
             .expect("a close stand is a short taxi, not an impossible one");
         assert!(
             plan.path.len() >= 2,
             "the publication drops anything shorter: {:?}",
             plan.path
+        );
+        // It must START AT THE AIRCRAFT. Starting at the snapped node put the
+        // route 224 m from a stopped aircraft at EGHI, so the drive's arrival
+        // test was true on tick one and it "secured" in two seconds without
+        // moving.
+        let first = plan.path[0];
+        assert!(
+            (first.0 - ac_lat).abs() < 1e-6 && (first.1 - ac_lon).abs() < 1e-6,
+            "route must begin where the aircraft is, got {first:?}"
         );
         let end = *plan.path.last().unwrap();
         assert!(
