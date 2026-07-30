@@ -4951,7 +4951,7 @@ async fn load_route_to_fms(
         .is_err()
         || xp.set_int("xcopilot/fms/load", 1).await.is_err()
     {
-        return "Couldn't reach the plugin to load the route. Is the X-COPILOT plugin running?"
+        return "Couldn't reach the plugin to load the route. Is the XVoiceLayer plugin running?"
             .to_string();
     }
     format!("Loading {n} waypoints into the GPS, {origin} to {dest}. Check the flight plan page.")

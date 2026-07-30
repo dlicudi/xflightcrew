@@ -165,7 +165,7 @@ public:
         : ImgWindow(l, t, r, b, xplm_WindowDecorationRoundRectangle,
                     xplm_WindowLayerFloatingWindows) {
         // Keep the title clean; version + build id go to Log.txt on startup instead.
-        SetWindowTitle("X-COPILOT");
+        SetWindowTitle("XVoiceLayer");
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
         // One visual system: dark slate instrument, grey controls, color used
@@ -992,8 +992,8 @@ void create() {
     g_toggle_cmd = XPLMCreateCommand("xcopilot/toggle_panel", "XVoiceLayer: toggle the status panel");
     XPLMRegisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr);
 
-    int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "X-COPILOT", nullptr, 0);
-    g_menu = XPLMCreateMenu("X-COPILOT", XPLMFindPluginsMenu(), idx, MenuHandler, nullptr);
+    int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "XVoiceLayer", nullptr, 0);
+    g_menu = XPLMCreateMenu("XVoiceLayer", XPLMFindPluginsMenu(), idx, MenuHandler, nullptr);
     XPLMAppendMenuItem(g_menu, "Toggle status panel", (void*)"toggle", 0);
 }
 

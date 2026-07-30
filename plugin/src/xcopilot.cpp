@@ -38,9 +38,13 @@
 // ---- lifecycle --------------------------------------------------------------
 
 PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
-    std::strcpy(name, "X-COPILOT");
+    std::strcpy(name, "XVoiceLayer");
+    // The SIGNATURE is an identity contract, not branding, so it keeps the old
+    // name for the same reason the xcopilot/* datarefs do: X-Plane and any
+    // other plugin identify us by this string. Nothing looks it up today, but
+    // changing it buys nothing and can only break a future lookup.
     std::strcpy(sig, "com.dlicudi.xcopilot");
-    std::strcpy(desc, "X-COPILOT " XCOPILOT_VERSION ", push-to-talk and status panel for the voice copilot.");
+    std::strcpy(desc, "XVoiceLayer " XCOPILOT_VERSION ", push-to-talk and status panel for the voice layer.");
 
     // Get POSIX paths from the SDK, not legacy Mac HFS ("Macintosh HD:Users:...");
     // otherwise fopen can't open the nav-data file we read the AIRAC cycle from.

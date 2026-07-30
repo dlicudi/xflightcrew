@@ -21,12 +21,14 @@ branding, and changing them breaks live installs for nothing: the `xcopilot/*`
 DATAREF namespace (the app and the plugin agree on these strings), the
 `XCOPILOT_*` ENV VARS (the pilot's own `.env` and `prefs.json`), and the plugin
 binary `xcopilot.xpl` (rename it and X-Plane happily loads BOTH copies, which
-double-registers every dataref). The GitHub repo IS renamed to
-`dlicudi/xvoicelayer` (2026-07-30; the old URL redirects, so stale clones keep
-working), but the LOCAL directory is deliberately still `~/GitHub/x-copilot`:
-renaming it must also move `~/.claude/projects/-Users-duanelicudi-GitHub-x-copilot`
-(25 memories and the session history are keyed on that path) and fix
-`.claude/settings*.json` plus `~/GitHub/rustdecks/CLAUDE.md:34`. The Rust crate
+double-registers every dataref). Everything else DID move on 2026-07-30: the
+GitHub repo (`dlicudi/xvoicelayer`, old URL redirects, so stale clones keep
+working) and the local directory (`~/GitHub/xvoicelayer`). The directory move
+was the fiddly one, because three things key on the absolute path and none of
+them announce it when they break: `~/.claude/projects/-Users-duanelicudi-GitHub-*`
+(25 memories and 55 session transcripts, silently orphaned by a plain `mv` of
+the repo alone), the absolute paths in `.claude/settings*.json`, and the
+cross-reference at `~/GitHub/rustdecks/CLAUDE.md:34`. The Rust crate
 identifier DID change, to `xvoicelayer` — see the tracing-filter warning in the
 battle-test section, since a stale filter silently drops every crew-side log
 line.
