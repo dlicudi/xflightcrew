@@ -105,5 +105,10 @@ scripts/llm_bench.sh qwen3:8b                # compare models on the tool-pick b
 
 ## Licensing
 
-Currently proprietary (all rights reserved) — a maybe-commercial product kept
-closed until there's a reason to open it.
+**GPL-3.0-or-later** ([LICENSE](LICENSE)). This is free software and will never
+be commercial: copyleft is the point, so that the flight-sim ecosystem's payware
+norm can't absorb this work without giving it back.
+
+Third-party components keep their own (all permissive, all GPL-compatible): the
+X-Plane SDK is MIT/BSD, Dear ImGui is MIT, ImgWindow is BSD-3-Clause, and the
+B612 font is under the SIL Open Font License.

@@ -4,6 +4,13 @@
 [workspace]
 members = ["crates/atc", "crates/sim"]
 
+# One license across the workspace, inherited by every member, for the same
+# reason the deps are pinned here: the crates must never drift apart. GPL-3.0
+# (not 2.0) because several deps are Apache-2.0, which is compatible with v3
+# only. Decided 2026-07-30; see the Licensing section of CLAUDE.md.
+[workspace.package]
+license = "GPL-3.0-or-later"
+
 # One version of each shared dep across the workspace, so the crates never drift.
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
