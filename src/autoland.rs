@@ -2471,4 +2471,61 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // The circuit handoff must FORCE its own runway, because the track-based
+    // search is free to prefer a different AIRFIELD entirely.
+    //
+    // Southampton, 2026-07-30: the circuit turned final at EGHI and handed to
+    // autoland with `forced_rwy: None`. The search chose EGHL 09 sixteen miles
+    // north, and the aircraft flew away from the field it had just circled for
+    // five minutes. This pins the DIFFERENCE between the two picks: on downwind
+    // (heading away from the landing end), the track search does not return
+    // the near field, and forcing the ident does.
+    #[test]
+    fn a_forced_ident_beats_the_track_search_at_the_wrong_field() {
+        let dir = std::env::temp_dir().join(format!("xvl_circuit_rwy_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("apt.dat");
+        // NEAR field: runway 02/20, the one we flew the pattern around.
+        // FAR field ~16 nm north: runway 09/27, aligned nothing like our track.
+        std::fs::write(
+            &path,
+            "1 20 0 0 NEAR Near Field\n\
+             100 45 1 0 0.25 0 0 0 02 50.950 -1.360 0 0 1 0 0 0 20 50.965 -1.350 0 0 1 0 0 0\n\
+             1 620 0 0 FAR Far Field\n\
+             100 45 1 0 0.25 0 0 0 09 51.190 -1.040 0 0 1 0 0 0 27 51.190 -1.010 0 0 1 0 0 0\n",
+        )
+        .unwrap();
+        let p = path.to_str().unwrap();
+        // Downwind for 20: abeam the near field, tracking roughly 020 — i.e.
+        // the RECIPROCAL of the landing direction, which is what made the
+        // track search look elsewhere in the first place.
+        let (lat, lon, hdg) = (50.958, -1.330, 20.0);
+
+        // Forcing the pattern's ident lands us at the near field, every time.
+        let forced = runway_by_id(p, lat, lon, "20", 40.0)
+            .unwrap()
+            .expect("20 is the pattern runway, right here");
+        assert_eq!(forced.id, "20");
+        assert!(
+            forced.dist_nm < 5.0,
+            "forced pick must be the field we are circling, got {:.1} nm",
+            forced.dist_nm
+        );
+
+        // The bare track search is NOT required to agree, and that is the whole
+        // point: whatever it returns, it is not authoritative for a circuit.
+        if let Ok(Some(searched)) = best_landing_runway(p, lat, lon, hdg, 40.0, 1200.0) {
+            assert!(
+                forced.dist_nm <= searched.dist_nm,
+                "forcing the ident must never be farther than the search: \
+                 forced {} at {:.1} nm vs searched {} at {:.1} nm",
+                forced.id,
+                forced.dist_nm,
+                searched.id,
+                searched.dist_nm
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

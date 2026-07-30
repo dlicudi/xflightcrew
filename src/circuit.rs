@@ -787,10 +787,23 @@ async fn fly_authored_route(
     ));
     crate::blackbox::record(
         "circuit",
-        serde_json::json!({"event": "handoff_autoland_authored"}),
+        serde_json::json!({"event": "handoff_autoland_authored", "rwy": rwy_id}),
     );
     crate::autoland::ABORT.store(false, Ordering::SeqCst);
-    crate::autoland::run_autoland(base_url, apt_dat, cfg, approach_ias, voice, None, None);
+    // FORCE the pattern's own runway. Bare `None` sends autoland to its
+    // EMERGENCY behaviour — search the whole apt.dat for the best end by track
+    // — which is right for an engine failure and catastrophically wrong here:
+    // we are on short final to a runway we just took off from and flew a
+    // pattern around, and the search does not know that.
+    crate::autoland::run_autoland(
+        base_url,
+        apt_dat,
+        cfg,
+        approach_ias,
+        voice,
+        None,
+        Some(rwy_id.clone()),
+    );
     ACTIVE.store(false, Ordering::SeqCst);
 }
 
@@ -1390,9 +1403,21 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 }
                 crate::blackbox::record(
                     "circuit",
-                    serde_json::json!({"event": "handoff_autoland", "agl_ft": agl_ft}),
+                    serde_json::json!({
+                        "event": "handoff_autoland",
+                        "agl_ft": agl_ft,
+                        "icao": rwy.icao,
+                        "rwy": rwy_id,
+                    }),
                 );
                 crate::autoland::ABORT.store(false, Ordering::SeqCst);
+                // FORCE the pattern's own runway — see the authored handoff for
+                // why `None` here is a bug and not a default. Southampton,
+                // 2026-07-30: the circuit turned final at EGHI, handed off
+                // bare, and autoland's track search chose EGHL 09 SIXTEEN MILES
+                // away. It then flew away from the field for five minutes,
+                // pinned in Intercept 1,600 ft below a glidepath it could never
+                // capture, bleeding 125 kt to 92 with the gear up.
                 crate::autoland::run_autoland(
                     // A fresh client for autoland's own thread.
                     base_url.clone(),
@@ -1401,7 +1426,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                     p.approach_ias,
                     voice.clone(),
                     None,
-                    None,
+                    Some(rwy_id.clone()),
                 );
                 // The circuit's job is done; autoland owns the aircraft now.
                 ACTIVE.store(false, Ordering::SeqCst);
