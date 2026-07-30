@@ -284,7 +284,25 @@ final leg is exempt) — and a crossing on the cleared
 route is never berated as an incursion: silence while moving, "expedite"
 when stopped (the tower shouted "on runway two seven without clearance" at
 a pilot following its own route, 2026-07-14) — off-route nudges
-from the compliance watch via `TAXI_ROUTE`). The coach's first suggestion is
+from the compliance watch via `TAXI_ROUTE`. A runway destination snaps to a
+node that can REACH the runway, never merely the taxiway node nearest the
+threshold (`plan_to_runway` / `runway_entrance_near`): EGHI's parallel
+taxiway ends in a dead-end stub 172 m abeam the strip, which being 631 m
+from the 20 threshold against 1047 m for the nearest real entrance won the
+plain snap — so the tower cleared us to "holding point Alpha five runway two
+zero" and the drive stopped at a stub connected to nothing, with no runway
+edge at the goal the hold-short trim never ran and `lead_on` came out empty,
+leaving the line-up to invent the entrance the drawn lead-on exists to
+supply (2026-07-30). An ENTRANCE is decided by connectivity, never edge
+names, for the same reason `mark_runway_crossings` distrusts the flags: on
+a runway edge, or one hop from one. It is a class and not a field — 3,446
+of 22,334 runway ends worldwide move to a real entrance, 776 have none
+authored at all and keep the plain snap (never a refusal: no entrance in
+the data is not a reason to refuse to taxi), and zero previously-routable
+ends became unroutable. The split is by CALLER, not inferred from geometry,
+because the three destinations genuinely differ: a threshold, a stand, and
+the off-route replan's already-trimmed holding point — which sits a
+standoff back and must not be dragged onto the junction the trim removed). The coach's first suggestion is
 always the readback owed (`ClearanceSnap.pending_readback`); `suggest_call`
 (one source for the voice coach AND the panel's Calls tab, 2026-07-13)
 returns a structured `Suggestion` — a prerequisite line when one exists

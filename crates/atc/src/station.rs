@@ -3772,7 +3772,7 @@ fn plan_taxi_route_to(
         (r.width_m / 2.0 + 30.0).max(nav::HOLD_SHORT_STANDOFF_M)
     };
     let zone = [r.ident_a.clone(), r.ident_b.clone()];
-    let mut plan = net.plan(lat, lon, tlat, tlon, standoff, &zone)?;
+    let mut plan = net.plan_to_runway(lat, lon, tlat, tlon, standoff, &zone)?;
     mark_runway_crossings(&mut plan, runways);
     Some(plan)
 }

@@ -732,6 +732,57 @@ impl TaxiNet {
         hold_short_m: f64,
         hold_zone: &[String],
     ) -> Option<TaxiRoutePlan> {
+        self.plan_inner(
+            from_lat,
+            from_lon,
+            to_lat,
+            to_lon,
+            hold_short_m,
+            hold_zone,
+            false,
+        )
+    }
+
+    /// [`plan`](Self::plan) to a RUNWAY — the destination is a threshold, and
+    /// the route must end somewhere the aircraft can get onto the strip from.
+    ///
+    /// Split from `plan` rather than inferred from the geometry because the
+    /// callers genuinely differ and only they know: the departure planner is
+    /// handed a threshold, taxi-in is handed a stand, and the off-route replan
+    /// is handed the standing route's already-trimmed holding point — which
+    /// sits a hold-short standoff from the runway and must NOT be dragged back
+    /// onto the junction the trim just removed.
+    pub fn plan_to_runway(
+        &self,
+        from_lat: f64,
+        from_lon: f64,
+        to_lat: f64,
+        to_lon: f64,
+        hold_short_m: f64,
+        hold_zone: &[String],
+    ) -> Option<TaxiRoutePlan> {
+        self.plan_inner(
+            from_lat,
+            from_lon,
+            to_lat,
+            to_lon,
+            hold_short_m,
+            hold_zone,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_inner(
+        &self,
+        from_lat: f64,
+        from_lon: f64,
+        to_lat: f64,
+        to_lon: f64,
+        hold_short_m: f64,
+        hold_zone: &[String],
+        to_runway: bool,
+    ) -> Option<TaxiRoutePlan> {
         let m_per_deg_lat = 111_320.0;
         let m_per_deg_lon = 111_320.0 * from_lat.to_radians().cos();
         let dist_m = |a: (f64, f64), b: (f64, f64)| -> f64 {
@@ -746,16 +797,32 @@ impl TaxiNet {
             taxiway_nodes.insert(e.a);
             taxiway_nodes.insert(e.b);
         }
-        let snap = |lat: f64, lon: f64| -> Option<i64> {
-            taxiway_nodes
-                .iter()
+        let snap_within = |lat: f64, lon: f64, from: &std::collections::HashSet<i64>| {
+            from.iter()
                 .filter_map(|id| self.nodes.get(id).map(|&p| (*id, dist_m((lat, lon), p))))
                 .min_by(|x, y| x.1.total_cmp(&y.1))
                 .filter(|(_, d)| *d < 3000.0)
                 .map(|(id, _)| id)
         };
-        let start = snap(from_lat, from_lon)?;
-        let goal = snap(to_lat, to_lon)?;
+        let start = snap_within(from_lat, from_lon, &taxiway_nodes)?;
+        // A runway destination must snap to a node that can actually REACH the
+        // runway, not merely to the taxiway node that happens to lie nearest
+        // the threshold. Nearest-anything is how EGHI's runway 20 became a
+        // clearance to nowhere (2026-07-30): the north end of the parallel
+        // taxiway A5 is a dead-end stub 172 m abeam the strip, and being the
+        // closest taxiway node to the threshold (631 m, against 1047 m for the
+        // nearest real entrance) it won the snap. The tower cleared us to
+        // "holding point Alpha five runway two zero", the drive stopped at a
+        // stub connected to nothing, and because the goal touched no runway
+        // edge the hold-short trim never ran and `lead_on` came out empty —
+        // leaving the line-up to invent an entrance, which is the trap the
+        // drawn lead-on exists to close. Across the whole apt.dat this is a
+        // class, not a field: 3,498 of 21,656 runway ends snap to a
+        // non-entrance, 551 of them badly (EFHK 04R, ENBO 07, ESNN 34).
+        let goal = to_runway
+            .then(|| self.runway_entrance_near(to_lat, to_lon, &taxiway_nodes))
+            .flatten()
+            .or_else(|| snap_within(to_lat, to_lon, &taxiway_nodes))?;
         if start == goal {
             return None;
         }
@@ -948,6 +1015,63 @@ impl TaxiNet {
             seg,
             lead_on,
         })
+    }
+
+    /// The taxiway node nearest `(lat, lon)` that can actually get onto a
+    /// runway from there. `None` when the field's network models no entrance at
+    /// all, which leaves [`plan_to_runway`](Self::plan_to_runway) on the plain
+    /// nearest-node snap rather than refusing a route the old code would fly.
+    ///
+    /// "Entrance" is decided by CONNECTIVITY, never by edge names: apt.dat
+    /// authors leave runway edges unnamed often enough that
+    /// [`mark_runway_crossings`](crate::station) already refuses to trust the
+    /// flags for the same reason. A node qualifies if it sits on a runway edge,
+    /// or one hop from a node that does — which is exactly how a network draws
+    /// the stub from a holding point out to the centreline.
+    ///
+    /// Nearest wins among entrances, with no check that the entrance belongs to
+    /// the runway asked for. At a parallel-runway field the entrances of the
+    /// other strip sit a runway separation away, so the right one wins on
+    /// distance anyway; a field that breaks that assumption would need the
+    /// destination runway's own geometry passed in.
+    fn runway_entrance_near(
+        &self,
+        lat: f64,
+        lon: f64,
+        taxiway_nodes: &std::collections::HashSet<i64>,
+    ) -> Option<i64> {
+        let m_per_deg_lat = 111_320.0;
+        let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
+        let mut runway_nodes: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for e in self.edges.iter().filter(|e| e.runway) {
+            runway_nodes.insert(e.a);
+            runway_nodes.insert(e.b);
+        }
+        if runway_nodes.is_empty() {
+            return None;
+        }
+        let mut adjacent: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for e in &self.edges {
+            if runway_nodes.contains(&e.a) {
+                adjacent.insert(e.b);
+            }
+            if runway_nodes.contains(&e.b) {
+                adjacent.insert(e.a);
+            }
+        }
+        taxiway_nodes
+            .iter()
+            .filter(|id| runway_nodes.contains(id) || adjacent.contains(id))
+            .filter_map(|id| {
+                self.nodes.get(id).map(|&p| {
+                    let dx = (p.1 - lon) * m_per_deg_lon;
+                    let dy = (p.0 - lat) * m_per_deg_lat;
+                    (*id, dx.hypot(dy))
+                })
+            })
+            .min_by(|x, y| x.1.total_cmp(&y.1))
+            .filter(|(_, d)| *d < 3000.0)
+            .map(|(id, _)| id)
     }
 }
 
@@ -1843,6 +1967,154 @@ mod tests {
         assert!(find_taxi_net(path.to_str().unwrap(), "LXXX")
             .unwrap()
             .is_none());
+    }
+
+    /// Southampton's shape, which made a clearance to nowhere (2026-07-30).
+    ///
+    /// EGHI's parallel taxiway runs 170 m abeam the strip and its north end —
+    /// the A5 stub — is a DEAD END, connected to no runway edge. Being the
+    /// taxiway node nearest the runway 20 threshold (631 m, against 1047 m for
+    /// the nearest real entrance) it won the plain snap, so the tower cleared
+    /// us to "holding point Alpha five runway two zero" and the drive stopped
+    /// 172 m abeam a runway it could not reach. A runway destination has to
+    /// snap to a node the aircraft can get ONTO the runway from.
+    #[test]
+    fn a_runway_route_ends_at_an_entrance_not_the_nearest_dead_end() {
+        // Runway 09/27 along lat 36.0000; the 27 threshold is the east end.
+        // A parallel taxiway 111 m south, its EAST end (22) a dead-end stub
+        // that is much the nearest taxiway node to that threshold. The only
+        // real entrance is the stub 20->10, out at the west end.
+        //
+        //         09 thr                                      27 thr
+        //   ---------(10)=========(11)------------------------- runway
+        //             |                                (10,11 centreline)
+        //            (20)-------(21)-------(22)   <- dead end, nearest
+        //             |
+        //            (30) stand
+        let path = std::env::temp_dir().join("xc-taxi-deadend.dat");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "1    50 0 0 LTDE Deadend").unwrap();
+        writeln!(f, "100 45.33 27 727 0.10 1 3 0  09 36.0000000 -5.0100000 0 0 3 3 0 2 27 36.0000000 -5.0000000 0 0 3 3 0 2").unwrap();
+        writeln!(f, "1201 36.0000000 -5.0080000 both 10 rwy_w").unwrap();
+        writeln!(f, "1201 36.0000000 -5.0030000 both 11 rwy_e").unwrap();
+        writeln!(f, "1201 35.9990000 -5.0080000 both 20 hp").unwrap();
+        writeln!(f, "1201 35.9990000 -5.0040000 both 21 par").unwrap();
+        writeln!(f, "1201 35.9990000 -5.0015000 both 22 stub").unwrap();
+        writeln!(f, "1201 35.9985000 -5.0075000 both 30 stand").unwrap();
+        writeln!(f, "1202 10 11 twoway runway 09/27").unwrap();
+        writeln!(f, "1202 20 10 twoway taxiway A1").unwrap();
+        writeln!(f, "1202 20 21 twoway taxiway A").unwrap();
+        writeln!(f, "1202 21 22 twoway taxiway A5").unwrap();
+        writeln!(f, "1202 30 20 twoway taxiway A1").unwrap();
+        drop(f);
+        let net = find_taxi_net(path.to_str().unwrap(), "LTDE")
+            .unwrap()
+            .expect("a network");
+
+        let m = |a: (f64, f64), b: (f64, f64)| {
+            let dx = (a.1 - b.1) * 111_320.0 * 36.0_f64.to_radians().cos();
+            let dy = (a.0 - b.0) * 111_320.0;
+            (dx * dx + dy * dy).sqrt()
+        };
+        let thr27 = (36.0000, -5.0000);
+        // The trap: the dead-end stub really is nearest, by a wide margin.
+        assert!(
+            m((35.9990, -5.0015), thr27) < m((36.0000, -5.0080), thr27),
+            "the stub is the nearest taxiway node — that is the whole trap"
+        );
+
+        // Routing to the runway ends at the entrance, hold-short trimmed off
+        // the junction, with the drawn lead-on kept for the line-up.
+        let plan = net
+            .plan_to_runway(35.9985, -5.0075, thr27.0, thr27.1, 40.0, &[])
+            .expect("a route exists");
+        let end = *plan.path.last().unwrap();
+        assert!(
+            m(end, (36.0000, -5.0080)) < 50.0,
+            "ends near the entrance stub, not the dead end: {end:?}"
+        );
+        assert!(
+            m(end, (35.9990, -5.0015)) > 300.0,
+            "and nowhere near the A5 dead end"
+        );
+        assert_eq!(plan.holding_point, "A1");
+        assert!(
+            !plan.lead_on.is_empty(),
+            "the entrance touches a runway edge, so the trim keeps a lead-on \
+             for the line-up to drive — the dead end had none to keep"
+        );
+        assert_eq!(plan.seg.len(), plan.path.len() - 1, "seg stays aligned");
+
+        // A POINT destination keeps the plain nearest-node snap: the off-route
+        // replan aims at the standing route's already-trimmed holding point,
+        // and must not be dragged back onto the junction the trim removed.
+        let point = net
+            .plan(35.9985, -5.0075, 35.9990, -5.0016, 40.0, &[])
+            .expect("a route exists");
+        assert!(
+            m(*point.path.last().unwrap(), (35.9990, -5.0015)) < 20.0,
+            "a point goal still snaps to the node nearest it"
+        );
+
+        // A network that models no runway at all falls back rather than
+        // refusing a route it would have flown before.
+        let path2 = std::env::temp_dir().join("xc-taxi-norwy.dat");
+        let mut f2 = std::fs::File::create(&path2).unwrap();
+        writeln!(f2, "1    50 0 0 LTNR Norunway").unwrap();
+        writeln!(f2, "1201 35.9990000 -5.0080000 both 20 hp").unwrap();
+        writeln!(f2, "1201 35.9990000 -5.0015000 both 22 stub").unwrap();
+        writeln!(f2, "1202 20 22 twoway taxiway A").unwrap();
+        drop(f2);
+        let bare = find_taxi_net(path2.to_str().unwrap(), "LTNR")
+            .unwrap()
+            .expect("a network");
+        assert!(
+            bare.plan_to_runway(35.9990, -5.0081, thr27.0, thr27.1, 40.0, &[])
+                .is_some(),
+            "no entrance in the data is not a reason to refuse to taxi"
+        );
+    }
+
+    /// The real Southampton network behind the fix above.
+    /// `cargo test -p atc -- --ignored live_eghi_runway_20 --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn live_eghi_runway_20_holds_at_an_entrance() {
+        let path =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let Ok(Some(net)) = find_taxi_net(path, "EGHI") else {
+            return; // no install, no verdict
+        };
+        // The GA apron stand the SF50 departed from, and the 20 threshold.
+        let (slat, slon) = (50.953095, -1.358671);
+        let (tlat, tlon) = (50.9589489, -1.3519495);
+        let zone: Vec<String> = vec!["02".into(), "20".into()];
+        let plan = net
+            .plan_to_runway(slat, slon, tlat, tlon, 100.0, &zone)
+            .expect("a route");
+        let end = *plan.path.last().unwrap();
+        let m = |a: (f64, f64), b: (f64, f64)| {
+            let dx = (a.1 - b.1) * 111_320.0 * 50.95_f64.to_radians().cos();
+            let dy = (a.0 - b.0) * 111_320.0;
+            (dx * dx + dy * dy).sqrt()
+        };
+        println!(
+            "holding point {} via {:?}, {:.0} m of route, ends {:.0} m from thr20",
+            plan.holding_point,
+            plan.via,
+            plan.path.windows(2).map(|w| m(w[0], w[1])).sum::<f64>(),
+            m(end, (tlat, tlon))
+        );
+        // The A5 dead end is at 50.954136,-1.357265 — 172 m abeam the strip
+        // with no connection to it. Anywhere but there.
+        assert!(
+            m(end, (50.954136, -1.357265)) > 100.0,
+            "must not end at the A5 dead-end stub: {end:?}"
+        );
+        assert!(
+            !plan.lead_on.is_empty(),
+            "a real entrance leaves the line-up a drawn lead-on"
+        );
     }
 
     #[test]
