@@ -870,4 +870,33 @@ mod station_voice_tests {
             eprintln!("  {voice}: {} samples, peak {peak:.3}", pcm.len());
         }
     }
+
+    /// Latency is the deciding number for the COPILOT: a readback that lands
+    /// late is worse than one that sounds slightly synthetic. Radio voices can
+    /// afford more, the intercom cannot.
+    #[test]
+    #[ignore]
+    fn engine_latency_comparison() {
+        // What the copilot ACTUALLY says most: a short readback. Long-form
+        // latency is the wrong measure when speech is chunked per sentence.
+        let line = "Roger, flaps ten.";
+        if std::path::Path::new("models/en_US-joe-medium.onnx").exists() {
+            let mut p = super::OnnxTts::load("models/en_US-joe-medium.onnx").unwrap();
+            let _ = p.synth("warm up");
+            let t0 = std::time::Instant::now();
+            let pcm = p.synth(line).unwrap();
+            let ms = t0.elapsed().as_millis();
+            let secs = pcm.len() as f64 / f64::from(p.sample_rate());
+            eprintln!("  piper   {ms:>5} ms for {secs:.2}s audio  ({:.1}x realtime)", secs * 1000.0 / ms as f64);
+        }
+        if std::path::Path::new("models/kokoro-v1.0.onnx").exists() {
+            let mut k = super::KokoroTts::load("models/kokoro-v1.0.onnx", "bm_george").unwrap();
+            let _ = k.synth("warm up");
+            let t0 = std::time::Instant::now();
+            let pcm = k.synth(line).unwrap();
+            let ms = t0.elapsed().as_millis();
+            let secs = pcm.len() as f64 / 24000.0;
+            eprintln!("  kokoro  {ms:>5} ms for {secs:.2}s audio  ({:.1}x realtime)", secs * 1000.0 / ms as f64);
+        }
+    }
 }
