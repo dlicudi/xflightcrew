@@ -78,9 +78,16 @@ impl Airspace {
             Some((i, rest)) => (i.trim(), rest.split_once(')').map_or(rest, |(d, _)| d).trim()),
             None => (self.name.trim(), ""),
         };
-        let say = |s: &str| s.replace('-', " ").split_whitespace().collect::<Vec<_>>().join(" ");
-        let ident = say(ident_raw);
-        let described = say(desc);
+        // A DESIGNATOR is an identifier: keep its case, just unpick the
+        // dashes for TTS. A DESCRIPTION is prose, so it gets the full
+        // treatment — shorthand expanded, the repeated class word dropped,
+        // and the shouting lowercased.
+        let ident = ident_raw
+            .replace('-', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let described = speakable(&desc.replace('-', " "), kind);
         match () {
             _ if is_designator(ident_raw) && !ident.is_empty() => format!("{kind} {ident}"),
             _ if !described.is_empty() => format!("{kind} {described}"),
@@ -88,6 +95,51 @@ impl Airspace {
             _ => kind.to_string(),
         }
     }
+}
+
+/// Aviation shorthand that appears in OpenAir names and is not a word.
+///
+/// Counted across the shipping file's 15,700 no-go names: TEMP 1359, PJE 343,
+/// MOA 162, UAS 141, UAV 124, FLTS 4. Read aloud these come out as noise —
+/// "MET RESEARCH FLTS AREA ALPHA" said "flits" (heard 2026-07-30).
+///
+/// Deliberately short: only expansions that are unambiguous. FBZ (145) and UAF
+/// (91) are frequent but I could not pin their meaning, and a confident wrong
+/// expansion is worse than an abbreviation the pilot can still recognise.
+const SPOKEN_ABBREVIATIONS: &[(&str, &str)] = &[
+    ("FLTS", "flights"),
+    ("FLT", "flight"),
+    ("TEMP", "temporary"),
+    ("PJE", "parachute jumping"),
+    ("MOA", "military operations"),
+    ("UAS", "drone"),
+    ("UAV", "drone"),
+    ("ACFT", "aircraft"),
+    ("TRNG", "training"),
+    ("MIL", "military"),
+];
+
+/// Make an OpenAir name speakable: expand the shorthand, drop a repeat of the
+/// class word, and lowercase the shouting.
+///
+/// The repeat matters — 19% of no-go names already contain "AREA", so pairing
+/// them with a "danger area" prefix says it twice ("danger area MET RESEARCH
+/// FLTS AREA ALPHA").
+fn speakable(name: &str, kind: &str) -> String {
+    name.split_whitespace()
+        .filter(|w| {
+            // Drop a standalone "AREA"/"ZONE" the class word already supplies.
+            let bare = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            !kind.split_whitespace().any(|k| k.eq_ignore_ascii_case(bare))
+        })
+        .map(|w| {
+            SPOKEN_ABBREVIATIONS
+                .iter()
+                .find(|(a, _)| w.eq_ignore_ascii_case(a))
+                .map_or_else(|| w.to_ascii_lowercase(), |(_, full)| (*full).to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Does this OpenAir ident read as a real airspace DESIGNATOR — the thing a
@@ -408,7 +460,9 @@ mod tests {
         // A squashed word: the parenthetical is the name.
         assert_eq!(
             space('Q', "W-METRSEARCH (MET RESEARCH FLTS AREA ALPHA)").spoken_name(),
-            "danger area MET RESEARCH FLTS AREA ALPHA"
+            // FLTS expanded, the repeated "AREA" dropped (the class word
+            // already said it), and the shouting lowered.
+            "danger area met research flights alpha"
         );
         // Never emits the gibberish that started this.
         assert!(!space('Q', "W-METRSEARCH (MET RESEARCH FLTS AREA ALPHA)")
@@ -417,6 +471,8 @@ mod tests {
 
         // No parenthetical at all: whatever we have is better than nothing.
         assert_eq!(space('P', "P-56").spoken_name(), "prohibited area P 56");
+        // A bare name with no parenthetical takes the IDENT path, which
+        // preserves case — it may be a designator and those are identifiers.
         assert_eq!(space('Q', "DANGER ZONE").spoken_name(), "danger area DANGER ZONE");
         // Nothing usable: the class alone, never a dangling "area ".
         assert_eq!(space('Q', "   ").spoken_name(), "danger area");
