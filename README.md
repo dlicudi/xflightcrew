@@ -3,117 +3,215 @@
 **The voice layer for X-Plane 12: copilot, ATC and cabin crew. Entirely local.**
 
 X-Plane simulates the aircraft and the world. It does not simulate the people.
-This does. You speak a command, a **local** LLM picks the matching action,
-XVoiceLayer writes the X-Plane dataref, and it reads the result back aloud.
+This does.
+
+You are one pilot in the cockpit. XVoiceLayer is everyone else: the **copilot**
+in the other seat who works the panel and can fly the aircraft, the **tower** on
+the radio, and the **cabin crew** down the back. Three voices, one microphone,
+and nothing leaves your machine.
 
 ```
 🎙️  "flaps ten"  →  whisper (STT)  →  LLM picks a tool  →  write dataref  →  "Roger, flaps ten."
 ```
 
-It's the **actor** in the cockpit: you fly and command, it works the panel and
-confirms — hands stay on the controls, eyes stay outside. The whole loop is local
-and real-time (ears, brain, and mouth all run on your machine; nothing is metered
-per call).
+Named after [XEarthLayer](https://github.com/samsoir/xearthlayer), which layers
+in what you *see*; this layers in what you *hear*.
 
-Three voices share the one microphone: the **copilot** on the intercom, the
-**tower** on the radio, and the **cabin crew** down the back. Named after
-[XEarthLayer](https://github.com/samsoir/xearthlayer), which layers in what you
-see; this layers in what you hear.
+## Why it's different
 
-## What it can do
+**It has hands.** Other voice add-ons narrate. This one writes datarefs: it
+works the panel, and it will taxi, line up, take off, fly a circuit or a
+published approach, and land. Different trust model, so every action is gated
+and read back from the aircraft's *actual* state, never from the intent.
 
-- **Single commands** across every 172 system — flaps, autopilot, engine, fuel,
-  electrics, lights, radios, transponder, instruments.
-- **Checklists the copilot runs** — say "run the before-takeoff checklist" and it
-  reads each item aloud, **acts** the ones it can, **verifies** the ones it can
-  read, and **calls out** the ones that are yours. The lists are **interpreted
-  from XChecklist files** (the X-Plane community format), so any aircraft's
-  checklist drops straight in — preflight to shutdown.
-- **Compound commands** — "flaps ten and throttle seventy" runs both.
-- **Conversational context** — "throttle fifty percent" then "seventy percent";
-  "switch it back to both".
-- **Safety gates + readbacks** — refuses unsafe actions (flap Vfe, low-altitude
-  AP targets), confirms safety-critical ones, and reads back the *actual* state.
-- **Background monitor** — calls out problems unprompted (alternator offline, low
-  fuel).
+**It's genuinely offline.** Ears (whisper), brain (Ollama), and mouth (ONNX/
+piper) all run locally. Nothing is metered per call, and it works with the
+network off.
 
-➡️ **Full command + checklist reference:**
-[Cessna 172SP](docs/cessna_172sp.md) · [Cirrus SR22](docs/cirrus_sr22.md)
-· Monitor details: [docs/monitoring.md](docs/monitoring.md)
+**The tower is deterministic.** ATC is a state machine, not an LLM — a mishear
+can earn "say again", but it can never earn a clearance.
+
+## What it does
+
+### Talk to the copilot
+
+- **Commands** across every system the airframe has: flaps, gear, autopilot,
+  engine, fuel, electrics, lights, radios, transponder, instruments.
+- **Compound and conversational** — "flaps ten and throttle seventy", then
+  "make it eighty", "switch it back to both".
+- **Checklists it actually runs** — "run the before-takeoff checklist": it reads
+  each item, **acts** the ones it can, **verifies** the ones it can read, and
+  **calls out** the ones that are yours. Interpreted from **XChecklist** files,
+  so any aircraft's list drops straight in.
+- **Safety gates and readbacks** — refuses flap extension over Vfe, gear up on
+  the ground, low-altitude AP targets; re-reads the dataref after writing and
+  confirms what the aircraft *did*.
+- **A background monitor** that speaks up unprompted: alternator offline, low
+  fuel, gear, stall, terrain, altitude deviations.
+
+### Let it fly
+
+Say it and the copilot takes that phase. Each hands back on "my controls", and
+each refuses rather than guesses.
+
+| Say | It does |
+|---|---|
+| "push back left" | Calls a tug and steers the push onto the lane |
+| "taxi for me" | Drives the cleared route to the holding point |
+| "line us up" | Rides the painted lead-on onto the centreline |
+| "take off for me" | Rolls, tracks the centreline, rotates, climbs to 1,000 ft |
+| "do a circuit" | The whole pattern, terrain- and airspace-aware, to a landing |
+| "fly the ILS" | Follows the published approach from real chart data |
+| "land us" | Autoland from wherever you are |
+| "full auto" | All of it, cold and dark to the runway |
+| "fly my flight plan" | Your SimBrief route, gate to gate |
+
+### Talk to the tower
+
+Real frequencies from `apt.dat`, region-accurate phraseology (ICAO/CAP 413 vs
+FAA), and a controller that sequences you rather than reading a script:
+
+- Clearance, taxi with **named routes** ("taxi to holding point Alpha one via
+  Bravo, Link two seven"), line-up-and-wait, takeoff, circuits, vectors, ILS
+  approaches, landing clearance, taxi in.
+- **Readback enforcement** on the runway-critical items, a runway-in-use that
+  can't drift mid-departure, **wake turbulence** separation, and departures
+  threaded into gaps in the arrival stream.
+- **ATIS** on its own frequency, and an **enroute region** that hands you down
+  the airway from field to field.
+- A **progressive taxi guide** in the copilot's voice: "next left, onto Sierra
+  five Whiskey", with runway crossings called.
+
+### Talk to the cabin
+
+On airframes that carry crew: "cabin crew, prepare for landing" gets an
+acknowledgement, the interphone chime, and a "cabin secure" report when they
+mean it. Sterile-cockpit rules apply.
+
+## In the sim
+
+A small companion plugin ([plugin/](plugin/)) adds what the Web API can't do: a
+dedicated **push-to-talk** (separate keys for the intercom and the radio), the
+FMS route load, terrain queries, and the control channels the ground automation
+steers through.
+
+It also draws an in-sim **status panel** — Flight, Transcript, ATC, Route and
+Settings tabs — with the live strip, an automation status well, one-press
+buttons for every automation, and the phraseology reference.
 
 ## Quick start
 
-You need three local pieces running:
+Three local pieces:
 
-1. **X-Plane 12** with the Web API enabled (Settings → Network → Web API, port 8086).
+1. **X-Plane 12** with the Web API on (Settings → Network → Web API, port 8086).
 2. **[Ollama](https://ollama.com)** with a tool-calling model:
    ```sh
    ollama serve
-   ollama pull qwen3:8b        # the default; won the tool-pick battery
+   ollama pull qwen3:8b
    ```
-3. A **whisper.cpp** model for speech-to-text — a ggml `.bin` in `models/`
-   (e.g. `ggml-base.en.bin`).
+3. A **whisper.cpp** model — a ggml `.bin` in `models/`, e.g. `ggml-base.en.bin`.
 
 Then:
 
 ```sh
-cp .env.example .env          # all defaults are sensible; tweak if needed
-cargo run                     # plain stdout UI
-XCOPILOT_UI=tui cargo run     # terminal dashboard (conversation, aircraft panel, mic)
+cp .env.example .env
+cargo run
 ```
 
-The aircraft profile is auto-detected from X-Plane (`acf_ICAO`); the stock 172SP
-is the built-in default.
+Optional but recommended, for push-to-talk and the panel:
 
-### Speak or type
+```sh
+make -C plugin install
+```
 
-- **Continuous** (default): just speak commands.
-- **Push-to-talk**: `XCOPILOT_LISTEN=ptt` — Enter to start/stop recording.
-- **TUI text input**: in the dashboard, press **Enter** to open the command line,
-  type a command, Enter to run it (Esc leaves, `q` quits). Great for testing — no
-  mic, no STT mishears.
+The aircraft profile is auto-detected from `acf_ICAO`. Profiles ship for the
+Cessna 172SP, Cirrus SR22, Cirrus Vision SF50, Citation X, King Air C90B,
+Lancair Evolution, MD-82, Twin Otter and DC-3, with a built-in fallback for
+anything else.
+
+### Speaking to it
+
+- **Continuous** (default): just talk.
+- **Push-to-talk**: `XCOPILOT_LISTEN=ptt`, or bind the plugin's PTT commands in
+  X-Plane. The **radio** PTT transmits to ATC; the **intercom** PTT talks to the
+  copilot.
+- **Type instead**: `XCOPILOT_UI=tui` gives a dashboard with a command line —
+  no mic, no mishears, ideal for testing.
+
+### Running only half of it
+
+`XCOPILOT_MODE` (or the panel's Settings tab, live):
+
+- `both` — copilot and ATC (default)
+- `copilot` — no simulated ATC, so real/online ATC owns the radio
+- `atc` — the world without the crew; needs no Ollama at all
 
 ## Stack
 
 | Stage | How |
 |---|---|
 | Mic capture | `cpal` |
-| Speech-to-text | `whisper-rs` (whisper.cpp, Metal GPU on Apple Silicon) |
+| Speech-to-text | `whisper-rs` (whisper.cpp, Metal on Apple Silicon) |
 | LLM tool-picker | local **Ollama** (`/api/chat`), backend-neutral tool schema |
-| X-Plane write | `reqwest` → X-Plane Web API (`PATCH /api/v1/datarefs/...`) |
-| Text-to-speech | macOS `say` (default) or `piper` |
+| X-Plane read/write | `reqwest` → Web API (`PATCH /api/v1/datarefs/...`) |
+| In-sim capability | native C++ plugin (PTT, panel, FMS, terrain, controls) |
+| Text-to-speech | in-process ONNX (default), or `piper` / macOS `say` |
 
-The tool surface is per-airframe: an aircraft profile declares which systems
-exist and their limits, and the tool registry is built from it. See
-[CLAUDE.md](CLAUDE.md) for the design rationale.
+Rust, because this is a latency- and audio-sensitive real-time loop. The
+workspace splits the world from the crew: `crates/atc` is the tower and can
+only *read* the sim, `crates/sim` is the shared Web API client, and the copilot
+embeds both. That boundary is compiler-checked, not a convention.
+
+The tool surface is per-airframe: a profile declares which systems exist and
+their limits, and the tool registry is built from it — so a 172 is never
+offered a gear lever. See [CLAUDE.md](CLAUDE.md) for the design rationale.
 
 ## Configuration
 
-All via environment / `.env` — see [.env.example](.env.example) for the full,
-documented list. Common knobs:
+All via environment / `.env` — [.env.example](.env.example) is the documented
+list. Common knobs:
 
 | Var | Default | What |
 |---|---|---|
+| `XCOPILOT_MODE` | `both` | `both`, `copilot`, `atc` |
 | `XCOPILOT_MODEL` | `qwen3:8b` | Ollama tool-calling model |
 | `XCOPILOT_UI` | `plain` | `plain` or `tui` |
 | `XCOPILOT_LISTEN` | `continuous` | `continuous` or `ptt` |
 | `XCOPILOT_CONFIRM` | `true` | require "affirm" before safety-critical commands |
 | `XCOPILOT_MONITOR` | `true` | background problem callouts |
-| `XCOPILOT_END_SILENCE_MS` | `900` | trailing silence that ends an utterance |
+| `XCOPILOT_ATC_AIRPORT` | `LXGB` | home field for the tower |
+| `XCOPILOT_SIMBRIEF_ID` | — | your SimBrief username, for flight plans |
+
+The `xcopilot/*` datarefs, the `XCOPILOT_*` variables and the `xcopilot.xpl`
+plugin keep the project's old working name on purpose: they are wire contracts
+between the app, the plugin and your own config, and renaming them would break
+live installs for nothing.
+
+## Reference
+
+- Commands and checklists: [Cessna 172SP](docs/cessna_172sp.md) ·
+  [Cirrus SR22](docs/cirrus_sr22.md)
+- Background callouts: [docs/monitoring.md](docs/monitoring.md)
+- In-sim ATC soak test: [docs/atc-chaos-card.md](docs/atc-chaos-card.md)
 
 ## Tests
 
 ```sh
-cargo test                                   # unit tests (no sim/LLM needed)
-scripts/llm_bench.sh qwen3:8b                # compare models on the tool-pick battery (needs Ollama)
+cargo test --workspace                        # everything deterministic, no sim or LLM needed
+cargo test --release -p atc -- --ignored atc_world_sweep   # cross-airport sweep (needs apt.dat)
+cargo run -- stt-eval bench/atc_stt_cases.yaml             # spoken-call accuracy
+scripts/llm_bench.sh qwen3:8b                             # tool-pick battery (needs Ollama)
 ```
+
+Every flight writes `logs/blackbox.jsonl`; `xvl analyze` mines the logs for
+phrasings the deterministic grammar missed.
 
 ## Licensing
 
-**GPL-3.0-or-later** ([LICENSE](LICENSE)). This is free software and will never
-be commercial: copyleft is the point, so that the flight-sim ecosystem's payware
-norm can't absorb this work without giving it back.
+**GPL-3.0-or-later** ([LICENSE](LICENSE)). Free software, never commercial, and
+X-Plane only. Copyleft is the point: the flight-sim ecosystem's payware norm
+shouldn't be able to absorb this work without giving it back.
 
-Third-party components keep their own (all permissive, all GPL-compatible): the
-X-Plane SDK is MIT/BSD, Dear ImGui is MIT, ImgWindow is BSD-3-Clause, and the
-B612 font is under the SIL Open Font License.
+Third-party components keep their own, all permissive and all GPL-compatible:
+the X-Plane SDK is MIT/BSD, Dear ImGui is MIT, ImgWindow is BSD-3-Clause, and
+the B612 font is under the SIL Open Font License.
