@@ -422,22 +422,42 @@ impl Config {
     /// Only the CABIN moves. The pilot's voice is an explicit choice the user
     /// made in the panel and must be honoured exactly.
     fn resolve_persona_voices(mut self) -> Self {
-        if self.cabin_piper_voice != self.piper_voice {
-            return self;
-        }
-        // Anything on the intercom that is not the pilot and not a controller.
-        const CABIN_ALTERNATES: &[&str] = &[
+        // Fallbacks in preference order. Any voice here must be one nothing
+        // else claims by default.
+        const ALTERNATES: &[&str] = &[
             "models/en_GB-jenny_dioco-medium.onnx",
             "models/en_US-kristin-medium.onnx",
-            "models/en_US-hfc_female-medium.onnx",
             "models/en_GB-southern_english_female-low.onnx",
+            "models/en_US-hfc_female-medium.onnx",
+            "models/en_GB-cori-high.onnx",
+            "models/en_US-lessac-high.onnx",
         ];
-        if let Some(alt) = CABIN_ALTERNATES
-            .iter()
-            .find(|v| **v != self.piper_voice && !self.atc_voice_pool.contains(**v))
-        {
-            self.cabin_piper_voice = (*alt).to_string();
-        }
+
+        // The PILOT never moves: it is an explicit choice made in the panel
+        // and must be honoured exactly. Everything else yields to it, and to
+        // whatever has already been settled — so a chain (pilot == tower ==
+        // cabin) resolves to three different voices rather than two.
+        let mut taken: Vec<String> = vec![self.piper_voice.clone()];
+        let mut settle = |slot: &mut String| {
+            if slot.is_empty() {
+                return; // empty = inherit another slot, by design (ATIS).
+            }
+            if !taken.contains(slot) {
+                taken.push(slot.clone());
+                return;
+            }
+            if let Some(alt) = ALTERNATES
+                .iter()
+                .find(|v| !taken.iter().any(|t| t == *v) && !self.atc_voice_pool.contains(**v))
+            {
+                *slot = (*alt).to_string();
+                taken.push(slot.clone());
+            }
+        };
+        settle(&mut self.cabin_piper_voice);
+        settle(&mut self.atc_piper_voice);
+        settle(&mut self.atc_approach_piper_voice);
+        settle(&mut self.atc_departure_piper_voice);
         self
     }
 }
