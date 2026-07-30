@@ -89,6 +89,11 @@ const M_PER_NM: f64 = 1852.0;
 /// runway centreline, and the aircraft still stopped past the hold line
 /// (2026-07-20): the standoff belongs to the planner, not this margin.
 const STOP_SHORT_M: f64 = 5.0;
+/// Inside this many meters of the stop, steer to the route's FINAL BEARING
+/// rather than to a pursuit aim point. Chosen from the live trace: the
+/// pursuit error was still honest at 8 m to run (-8°) and had begun walking
+/// by 4 m (+1°), so the swap happens before it degrades rather than after.
+const STOP_HEADING_HOLD_M: f64 = 8.0;
 /// Lateral drift at which the loop stops the aircraft and gives steering
 /// back, once ESTABLISHED on the route. Deliberately much tighter than the
 /// guide/compliance 60 m: the law holds a couple of meters in normal work,
@@ -359,6 +364,43 @@ impl Route {
         let here = geo.to_m(self.path[0], (lat, lon));
         let aim = taxi_guide::point_at(&self.pts, &self.cum, progress + lookahead);
         taxi_guide::angle_diff(taxi_guide::bearing(here, aim), heading_true)
+    }
+
+    /// The direction the route's LAST segment runs, degrees true.
+    ///
+    /// Near the stop this replaces the pure-pursuit aim, because the aim point
+    /// saturates: `point_at` clamps at the final point, so once the aircraft
+    /// rolls past it the bearing to it swings round BEHIND and the law
+    /// commands a hard turn toward a waypoint already passed. Measured at
+    /// EGHI (2026-07-30), the error ran away with the aircraft dead on the
+    /// centreline:
+    ///
+    ///   rem  0.04 m -> err   9.5°     rem -3.6 m -> err  38.6°
+    ///   rem -4.4  m -> err  70.2°     rem -5.0 m -> err 162.6°
+    ///
+    /// Steering pinned at its limit and the nose came round: 0.07 m off the
+    /// line to 3.00 m in four seconds. Every stop did it — hold, line-up,
+    /// backtrack, taxi-in — because they all drive this one loop.
+    pub fn final_bearing_deg(&self) -> Option<f64> {
+        let n = self.pts.len();
+        (n >= 2).then(|| taxi_guide::bearing(self.pts[n - 2], self.pts[n - 1]))
+    }
+
+    /// Heading error against the route's final bearing — what to fly once the
+    /// pursuit aim can no longer be trusted. Falls back to the pursuit error
+    /// when the route is too short to have a final segment.
+    pub fn stop_heading_err_deg(
+        &self,
+        lat: f64,
+        lon: f64,
+        heading_true: f64,
+        progress: f64,
+        lookahead: f64,
+    ) -> f64 {
+        match self.final_bearing_deg() {
+            Some(b) => taxi_guide::angle_diff(b, heading_true),
+            None => self.heading_err_deg(lat, lon, heading_true, progress, lookahead),
+        }
     }
 
     /// Meters left before the stop point short of the holding point.
@@ -1344,7 +1386,17 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // 2026-07-24, twice). Only bites close-in, where the stop ramp has
         // already slowed us below weave speeds.
         let look = lookahead_m_with(gs_kts, route.pace.lookahead_s).min((remaining * 0.6).max(6.0));
-        let err = route.heading_err_deg(lat, lon, psi, progress, look);
+        // Inside the stop zone, fly the route's FINAL BEARING instead of
+        // pursuing an aim point that has stopped moving. See
+        // `final_bearing_deg`: past the end the pursuit error runs to 160°+
+        // and steers the aircraft into a turn toward a waypoint behind it.
+        // Holding the last segment's direction is what a pilot does — nose
+        // straight down the paint, roll to a halt.
+        let err = if remaining <= STOP_HEADING_HOLD_M {
+            route.stop_heading_err_deg(lat, lon, psi, progress, look)
+        } else {
+            route.heading_err_deg(lat, lon, psi, progress, look)
+        };
         let allow = *join_allow.get_or_insert_with(|| {
             let a = join_allowance_m(lateral, err);
             if a > 0.0 {
@@ -2608,5 +2660,67 @@ mod tests {
             lead_on: Vec::new(),
         };
         assert!(Route::build(&w).is_none(), "nothing to drive on 15 m");
+    }
+
+    /// Every stop turned the aircraft, and the guidance was doing it.
+    ///
+    /// The pursuit aim point clamps at the route's final point, so once the
+    /// aircraft rolls past it the bearing to that point swings BEHIND and the
+    /// law commands a hard turn toward a waypoint already passed. EGHI
+    /// 2026-07-30, dead on the centreline at the stop point and then:
+    ///
+    ///   rem  0.04 -> err   9.5     rem -3.6 -> err  38.6
+    ///   rem -4.4  -> err  70.2     rem -5.0 -> err 162.6
+    ///
+    /// 0.07 m off the line to 3.00 m in four seconds, steering pinned. It hit
+    /// the hold, the line-up, the backtrack and the taxi-in alike, because all
+    /// four drive this one loop.
+    #[test]
+    fn the_stop_holds_the_routes_heading_instead_of_chasing_a_passed_point() {
+        // A straight route heading due east, 120 m long.
+        let w = TaxiWatch {
+            path: vec![ll(0.0, 0.0), ll(120.0, 0.0)],
+            via: String::new(),
+            seg: vec![(String::new(), false)],
+            holding_point: String::new(),
+            lead_on: Vec::new(),
+        };
+        let r = Route::build(&w).expect("a straight two-point route drives");
+        let bearing = r.final_bearing_deg().expect("a two-point route has one");
+        assert!(
+            (bearing - 90.0).abs() < 2.0,
+            "due east route, got {bearing:.1}"
+        );
+
+        // Sitting PAST the end, pointed correctly down the route. The pursuit
+        // error is nonsense here; the stop error must be ~0.
+        let past = ll(125.0, 0.0);
+        let (past_lat, past_lon) = (past.0, past.1);
+        let progress = r.total;
+        let pursuit = r.heading_err_deg(past_lat, past_lon, 90.0, progress, 6.0);
+        let held = r.stop_heading_err_deg(past_lat, past_lon, 90.0, progress, 6.0);
+        assert!(
+            pursuit.abs() > 90.0,
+            "the pursuit error should be wild past the end: {pursuit:.1}"
+        );
+        assert!(
+            held.abs() < 2.0,
+            "holding the route heading must read straight: {held:.1}"
+        );
+
+        // And it still CORRECTS a genuinely crooked nose rather than going
+        // blind — 20° off reads as 20° off, with the sign that unwinds it.
+        let crooked = r.stop_heading_err_deg(past_lat, past_lon, 110.0, progress, 6.0);
+        assert!(
+            (crooked + 20.0).abs() < 2.0,
+            "20 deg right of course should command left: {crooked:.1}"
+        );
+
+        // The swap only happens near the stop; further out the pursuit still
+        // owns the steering, which is what folds cross-track back in.
+        assert!(
+            STOP_HEADING_HOLD_M > 0.0 && STOP_HEADING_HOLD_M < 20.0,
+            "the hold zone is the last few metres, not the whole leg"
+        );
     }
 }

@@ -1171,6 +1171,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     let mut vs_est = 0.0_f64;
     // The ratcheted base/final descent target — see the vertical law below.
     let mut descent_target: Option<f64> = None;
+    // Gear goes down ONCE, at the 180, and the latch is what makes it once.
+    let mut gear_lowered = !retractable_gear;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1262,6 +1264,22 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // change; a dropped VS mode is re-engaged and the dial rewritten
         // (engage syncs it away — the takeoff's lesson).
         guard_floor_ft = guard_floor_ft.filter(|(_, t)| t.elapsed().as_secs() < 60);
+        // GEAR DOWN abeam the touchdown point — the same moment the descent
+        // starts, which is how a real pattern does it: power back, gear down,
+        // start down. Putting it a leg later (on base) while the descent had
+        // already moved to the 180 left the aircraft descending, slowing and
+        // gear-up for the whole second half of downwind, which is exactly the
+        // configuration an airframe's gear warning exists to shout about — and
+        // it did, all the way round (SF50 at EGHI, twice).
+        //
+        // Base is kept as the backstop for any path that reaches it without
+        // passing the abeam test; the latch means it can only fire once.
+        if !gear_lowered && (matches!(leg, Leg::Base) || (matches!(leg, Leg::Downwind) && a_m < 0.0))
+        {
+            let _ = xp.set_float(GEAR_HANDLE, 1.0).await;
+            alert(&voice, Priority::Advisory, "Gear down.");
+            gear_lowered = true;
+        }
         let leg_target = match leg {
             // Abeam the touchdown point and later, START DOWN — the 180, where
             // a real pattern reduces power. Holding TPA to the base turn left
@@ -1394,24 +1412,6 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 ));
             }
             Leg::Base => {
-                // GEAR DOWN, turning base. Nothing in the circuit lowered it,
-                // because extension lived only in autoland's "inside 6 nm" —
-                // and the circuit does not hand over until the final turn, well
-                // inside that. So a retractable airframe flew the whole
-                // downwind and base at pattern speed with the wheels up, and
-                // the aircraft's OWN gear warning called it, correctly, all the
-                // way round (SF50 at EGHI, heard live 2026-07-30).
-                //
-                // Base is a beat later than the real-world call (abeam the
-                // touchdown point, on downwind), and deliberately so: it is the
-                // moment this loop already owns, it is still well ahead of the
-                // approach, and it keeps the gear out of the pattern's speed
-                // and turn logic. Autoland's own extension stays as the
-                // backstop for every path that does not come through here.
-                if retractable_gear {
-                    let _ = xp.set_float(GEAR_HANDLE, 1.0).await;
-                    alert(&voice, Priority::Advisory, "Gear down.");
-                }
                 // Turn base and start down — the VS law above flies the
                 // descent once the leg target drops to the handoff height.
                 alert(&voice, Priority::Advisory, "Base. Descending.");
