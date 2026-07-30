@@ -26,7 +26,7 @@ const GPU_VOLTS: &str = "sim/cockpit2/electrical/GPU_generator_volts";
 const CMD_PUSH_STRAIGHT: &str = "sim/ground_ops/pushback_straight";
 const CMD_PUSH_LEFT: &str = "sim/ground_ops/pushback_left";
 const CMD_PUSH_RIGHT: &str = "sim/ground_ops/pushback_right";
-const CMD_PUSH_STOP: &str = "sim/ground_ops/pushback_stop";
+pub(crate) const CMD_PUSH_STOP: &str = "sim/ground_ops/pushback_stop";
 // --- services ---
 const CMD_SERVICE: &str = "sim/ground_ops/service_plane";
 
@@ -126,6 +126,10 @@ impl Tool for SetGroundPower {
 
 pub struct Pushback;
 
+fn pushback_continues(action: &str) -> bool {
+    !matches!(action, "stop" | "halt")
+}
+
 #[derive(Deserialize)]
 struct PushArg {
     /// "straight" (start), "left", "right", or "stop".
@@ -169,6 +173,13 @@ impl Tool for Pushback {
             }
         };
         ctx.xplane.run_command(cmd).await?;
+        // Native pushback commands start a manoeuvre that continues after this
+        // one-shot tool returns. Publish that ownership so the Flight tab keeps
+        // CANCEL visible; STOP clears it after the command has landed.
+        crate::pushback::ACTIVE.store(
+            pushback_continues(&a.action),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         Ok(say.to_string())
     }
 }
@@ -191,5 +202,20 @@ impl Tool for RequestService {
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         ctx.xplane.run_command(CMD_SERVICE).await?;
         Ok("Roger, requesting ground services.".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pushback_continues;
+
+    #[test]
+    fn native_pushback_stays_cancellable_until_stop() {
+        for action in ["straight", "start", "left", "right"] {
+            assert!(pushback_continues(action), "{action}");
+        }
+        for action in ["stop", "halt"] {
+            assert!(!pushback_continues(action), "{action}");
+        }
     }
 }

@@ -508,6 +508,17 @@ async fn main() -> Result<()> {
                                 if let Some(p) = aircraft::load(&id) {
                                     let name = p.display_name.clone();
                                     tracing::info!(icao = %icao, profile = %id, "aircraft changed; switching profile");
+                                    // A manual/native push continues inside
+                                    // X-Plane after its one-shot command. Stop
+                                    // it before clearing its published state
+                                    // and swapping actuator selectors.
+                                    if pushback::ACTIVE.load(
+                                        std::sync::atomic::Ordering::SeqCst,
+                                    ) {
+                                        let _ = xp
+                                            .run_command(tools::ground::CMD_PUSH_STOP)
+                                            .await;
+                                    }
                                     live.swap(p);
                                     // Mirror OR action, never both: voice.alert already
                                     // posts the spoken line to the panel transcript, so a
@@ -1053,6 +1064,11 @@ impl LiveProfile {
         self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
     fn swap(&self, p: aircraft::AircraftProfile) {
+        // A spawned controller owns parameters from the profile that armed it.
+        // Stop every owner before changing the global actuator selectors;
+        // otherwise an old takeoff/autoland loop can start driving the newly
+        // loaded aircraft with the previous airframe's speeds and limits.
+        stand_down_for_aircraft_change();
         // Republished on EVERY swap, including to None: a selector that
         // outlives its airframe aims the next aircraft's mode writes at a knob
         // it doesn't have (the same shape as the radio-power flag that latched
@@ -1063,6 +1079,31 @@ impl LiveProfile {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// Release every continuous manager before an aircraft profile changes.
+///
+/// The high-level aborts cascade through their sub-loops; the direct atomic
+/// clears cover managers that can also run independently. Native pushback's
+/// command is stopped by the async detection poller, which has the X-Plane
+/// client needed to send it.
+fn stand_down_for_aircraft_change() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    full_auto::abort();
+    circuit::abort();
+    procedure::abort();
+    autoland::abort();
+    tools::recover::abort();
+    approach_guide::cancel();
+    autotakeoff::ACTIVE.store(false, SeqCst);
+    autotaxi::ACTIVE.store(false, SeqCst);
+    autotaxi::BACKTRACKING.store(false, SeqCst);
+    tools::speedhold::ACTIVE.store(false, SeqCst);
+    tools::reverse::ACTIVE.store(false, SeqCst);
+    tools::engine::MIX_MANAGED.store(false, SeqCst);
+    tools::engine::LEAN_SEEKING.store(false, SeqCst);
+    pushback::ACTIVE.store(false, SeqCst);
 }
 
 impl Ptt {
