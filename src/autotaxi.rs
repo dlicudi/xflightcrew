@@ -507,13 +507,43 @@ pub fn brake_steer_split(steer: f64, gs_kts: f64) -> (f64, f64) {
     }
 }
 
+/// Steering held while still rolling, even after the distance fade has run
+/// out. Enough for the yaw damper to arrest a rotation, far short of the
+/// full deflection that carves.
+const STRAIGHTEN_FLOOR: f64 = 0.35;
+/// Below this groundspeed the aircraft has genuinely stopped and the fade may
+/// go to zero. Matches the arrival test's own 1.5 kt so the two agree.
+const STRAIGHTEN_HOLD_KTS: f64 = 1.5;
+
 /// Straighten the nosewheel as a stop closes: braking shifts weight onto
 /// the nosewheel, and a deflected one carves under it — every stop at a
 /// bendy route end turned into a swerve-and-lurch ("when you brake, the
 /// aircraft steers", 2026-07-20). Full steering beyond 8 m to go, faded
-/// to none across the last meters; the aircraft stops straight.
-pub fn stop_straighten(steer: f64, remaining_m: f64) -> f64 {
-    steer * ((remaining_m - 1.0) / 7.0).clamp(0.0, 1.0)
+/// across the last meters.
+///
+/// The fade may NOT reach zero while the aircraft is still moving.
+/// `remaining_m` SATURATES at `-STOP_SHORT_M` the instant the projection
+/// reaches the end of the polyline (`remaining = total - STOP_SHORT_M -
+/// progress`, and progress cannot exceed total), so the distance term pins at
+/// -5 and the fade hits zero with 2-3 kt still on the clock. Zeroing the
+/// command also kills the yaw-rate damping *inside* it, so a residual rotation
+/// goes unarrested through the last metres.
+///
+/// EGHI 2026-07-30, at the HOLDING POINT and repeatably: steer pinned at 0.00,
+/// yaw −2 deg/s unarrested, cross-track growing 2.45 → 5.08 m while coasting
+/// 2.7 → 1.6 kt. The aircraft stopped several metres off the paint and visibly
+/// crooked. The same signature is in all three stops of that sortie.
+///
+/// The carve this exists to prevent needs SPEED; by the arrival threshold
+/// there is none left to carve with, so a floor below it is free.
+pub fn stop_straighten(steer: f64, remaining_m: f64, gs_kts: f64) -> f64 {
+    let fade = ((remaining_m - 1.0) / 7.0).clamp(0.0, 1.0);
+    let floor = if gs_kts > STRAIGHTEN_HOLD_KTS {
+        STRAIGHTEN_FLOOR
+    } else {
+        0.0
+    };
+    steer * fade.max(floor)
 }
 
 /// The lateral allowance for an engage at `lateral` meters off the route
@@ -1406,6 +1436,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
                 route.pace.steer_full_deg,
             ) * steer_authority(gs_kts),
             remaining,
+            gs_kts,
         );
         let mut steer = slew_steer(prev_steer, want, route.pace.steer_slew_per_s, dt);
         prev_steer = steer;
@@ -1988,13 +2019,57 @@ mod tests {
 
     #[test]
     fn the_wheel_straightens_into_the_stop() {
-        // Well out: steering untouched. Closing on the stop: faded. At the
-        // stop line: straight, so the brakes never bite a deflected wheel.
-        assert_eq!(stop_straighten(0.8, 50.0), 0.8);
-        let close = stop_straighten(0.8, 4.0);
+        // Stopped (or as good as): the fade owns it, so the brakes never bite
+        // a deflected wheel. Well out: steering untouched. Closing: faded.
+        const STOPPED: f64 = 0.0;
+        assert_eq!(stop_straighten(0.8, 50.0, STOPPED), 0.8);
+        let close = stop_straighten(0.8, 4.0, STOPPED);
         assert!(close > 0.0 && close < 0.5, "{close}");
-        assert_eq!(stop_straighten(0.8, 1.0), 0.0);
-        assert_eq!(stop_straighten(-0.8, 0.5), 0.0, "both directions");
+        assert_eq!(stop_straighten(0.8, 1.0, STOPPED), 0.0);
+        assert_eq!(stop_straighten(-0.8, 0.5, STOPPED), 0.0, "both directions");
+    }
+
+    /// The fade must not disarm the nose while the aircraft is still rolling.
+    ///
+    /// `remaining_m` saturates at `-STOP_SHORT_M` as soon as the projection
+    /// reaches the end of the polyline, so the distance term pins at -5 with
+    /// 2-3 kt still on the clock — and zeroing the command there also kills
+    /// the yaw damping inside it. EGHI 2026-07-30: steer 0.00, yaw -2 deg/s
+    /// unarrested, cross-track growing 2.45 -> 5.08 m while coasting to a
+    /// stop, at the HOLDING POINT and in all three stops of that sortie.
+    #[test]
+    fn the_nose_is_still_held_while_the_aircraft_is_still_moving() {
+        // The exact saturated value the blackbox pins at, at the speed it was
+        // actually doing when the steering went to zero.
+        let rolling = stop_straighten(0.8, -STOP_SHORT_M, 2.7);
+        assert!(
+            rolling.abs() > 0.0,
+            "steering must survive past the end of the polyline while rolling"
+        );
+        assert!(
+            rolling.abs() >= 0.8 * STRAIGHTEN_FLOOR - 1e-9,
+            "and keep enough authority to arrest yaw: {rolling}"
+        );
+        // Sign is preserved — this only ever scales the command.
+        assert!(stop_straighten(-0.8, -STOP_SHORT_M, 2.7) < 0.0);
+
+        // ...but once genuinely stopped it goes to zero, so the original
+        // carve-under-braking fix still holds.
+        assert_eq!(stop_straighten(0.8, -STOP_SHORT_M, 0.4), 0.0);
+        assert_eq!(stop_straighten(0.8, -STOP_SHORT_M, STRAIGHTEN_HOLD_KTS), 0.0);
+
+        // It is a FLOOR, never a boost: far out, full steering is unchanged
+        // whether moving or not.
+        assert_eq!(stop_straighten(0.8, 50.0, 12.0), 0.8);
+        // And it never exceeds the command it was given.
+        for gs in [0.0, 1.4, 1.6, 3.0, 10.0] {
+            for rem in [-5.0, 0.0, 2.0, 8.0, 40.0] {
+                assert!(
+                    stop_straighten(0.8, rem, gs) <= 0.8 + 1e-9,
+                    "never amplifies (rem {rem}, gs {gs})"
+                );
+            }
+        }
     }
 
     #[test]
