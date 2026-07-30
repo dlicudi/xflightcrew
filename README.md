@@ -2,13 +2,13 @@
 
 **The voice layer for X-Plane 12: copilot, ATC and cabin crew. Entirely local.**
 
-X-Plane simulates the aircraft and the world. It does not simulate the people.
-This does.
-
 You are one pilot in the cockpit. XVoiceLayer is everyone else: the **copilot**
 in the other seat who works the panel and can fly the aircraft, the **tower** on
 the radio, and the **cabin crew** down the back. Three voices, one microphone,
 and nothing leaves your machine.
+
+You speak normally and they answer in their own voices — no menus, no key
+combinations, and no connection to anything.
 
 ```
 🎙️  "flaps ten"  →  whisper (STT)  →  LLM picks a tool  →  write dataref  →  "Roger, flaps ten."
@@ -17,19 +17,22 @@ and nothing leaves your machine.
 Named after [XEarthLayer](https://github.com/samsoir/xearthlayer), which layers
 in what you *see*; this layers in what you *hear*.
 
-## Why it's different
+## What it's for
 
-**It has hands.** Other voice add-ons narrate. This one writes datarefs: it
-works the panel, and it will taxi, line up, take off, fly a circuit or a
-published approach, and land. Different trust model, so every action is gated
-and read back from the aircraft's *actual* state, never from the intent.
+**It has hands.** It doesn't just talk — it writes datarefs. It works the panel,
+and it will taxi, line up, take off, fly a circuit or a published approach, and
+land. That's a different trust model from a voice that only narrates, so every
+action is gated and read back from the aircraft's *actual* state, never from the
+intent.
 
 **It's genuinely offline.** Ears (whisper), brain (Ollama), and mouth (ONNX/
 piper) all run locally. Nothing is metered per call, and it works with the
 network off.
 
 **The tower is deterministic.** ATC is a state machine, not an LLM — a mishear
-can earn "say again", but it can never earn a clearance.
+can earn "say again", but it can never earn a clearance. Frequencies, taxi
+routes and approach geometry come from X-Plane's own `apt.dat`, `earth_nav.dat`
+and CIFP data, so the field you're at is the field it works.
 
 ## What it does
 
