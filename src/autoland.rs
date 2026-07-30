@@ -750,6 +750,35 @@ const FAP_NM: f64 = 5.0;
 /// Approach speed is already ~1.3×Vs, so this margin still stays well above stall.
 const SPEED_FLOOR_MARGIN_KTS: f64 = 7.0;
 
+/// Clean manoeuvring speed for the intercept, as a multiple of the airframe's
+/// approach speed. The two scale together across every airframe we fly, which
+/// is why this is a RATIO and not another profile field to thread through five
+/// callers: the SF50's 87 kt approach gives 126 (it was flying 125 when the
+/// circuit handed off), the 172's 65 gives 94, and the MD-82's 140 gives 203 —
+/// within a few knots of the 200 its profile already declares as the pattern
+/// speed. A profile figure can always override this later.
+const CLEAN_APPROACH_RATIO: f64 = 1.45;
+/// Start slowing to the approach speed here (nm), reaching it at the FAP.
+/// Commanding the approach speed from the moment autoland arms is what flew an
+/// SF50 at 92 kt NINE MILES OUT with the gear up (Southampton, 2026-07-30) —
+/// the airframe's own gear warning was right and we were wrong. Gear comes
+/// down at 6 nm, inside this ramp, so it extends well below Vlo.
+const DECEL_START_NM: f64 = 10.0;
+
+/// Speed to command at this distance: clean far out, approach speed by the FAP,
+/// linear between. Pure, so the schedule is testable without a sim.
+pub fn scheduled_ias(dist_nm: f64, approach_ias: f64) -> f64 {
+    let clean = approach_ias * CLEAN_APPROACH_RATIO;
+    if dist_nm >= DECEL_START_NM {
+        clean
+    } else if dist_nm <= FAP_NM {
+        approach_ias
+    } else {
+        let frac = (dist_nm - FAP_NM) / (DECEL_START_NM - FAP_NM);
+        approach_ias + (clean - approach_ias) * frac
+    }
+}
+
 /// Past the threshold by more than this (nm along the centreline, departure side)
 /// with no landing = an overflight. Go around: fly back to the FAP instead of
 /// tracking the runway heading straight out. Seen live 2026-07-06: overflew the
@@ -1328,11 +1357,15 @@ pub fn guidance(
     };
 
     // Below the terrain floor, ask the throttle governor for extra speed so it
-    // builds the surplus the climb gate needs; otherwise hold the approach speed.
+    // builds the surplus the climb gate needs. Otherwise fly the DECELERATION
+    // SCHEDULE: clean out at range, approach speed by the FAP. The floor case
+    // still wins, and the schedule can only ever ask for MORE speed than the
+    // bare approach figure, so nothing downstream sees a slower target than it
+    // used to.
     let target_ias = if below_terrain_floor {
         approach_ias + CLIMB_ENERGY_BONUS_KTS
     } else {
-        approach_ias
+        scheduled_ias(dist_nm, approach_ias)
     };
 
     Guidance {
@@ -2478,7 +2511,8 @@ mod tests {
     // Southampton, 2026-07-30: the circuit turned final at EGHI and handed to
     // autoland with `forced_rwy: None`. The search chose EGHL 09 sixteen miles
     // north, and the aircraft flew away from the field it had just circled for
-    // five minutes. This pins the DIFFERENCE between the two picks: on downwind
+    // five minutes, pinned in Intercept below a glidepath it could never
+    // capture. This pins the DIFFERENCE between the two picks: on downwind
     // (heading away from the landing end), the track search does not return
     // the near field, and forcing the ident does.
     #[test]
@@ -2515,6 +2549,8 @@ mod tests {
 
         // The bare track search is NOT required to agree, and that is the whole
         // point: whatever it returns, it is not authoritative for a circuit.
+        // If it ever wanders to the far field, the forced pick above is what
+        // keeps the aircraft home.
         if let Ok(Some(searched)) = best_landing_runway(p, lat, lon, hdg, 40.0, 1200.0) {
             assert!(
                 forced.dist_nm <= searched.dist_nm,
@@ -2527,5 +2563,53 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The approach speed is what you cross the threshold at, NOT what you fly
+    // the intercept at. Commanding it from the moment autoland arms flew an
+    // SF50 (approach 87 kt) at 92 kt nine miles out with the gear up, and the
+    // airframe's own gear warning called it (Southampton, 2026-07-30).
+    #[test]
+    fn the_approach_speed_is_flown_at_the_faf_not_at_range() {
+        const VAPP: f64 = 87.0; // SF50, profiles/cirrus_vision_sf50.yaml
+
+        // Far out: clean manoeuvring speed, near what it was actually flying
+        // when the circuit handed off (125 kt).
+        let far = scheduled_ias(16.0, VAPP);
+        assert!(
+            (120.0..=132.0).contains(&far),
+            "clean intercept speed should be ~126 kt, got {far:.0}"
+        );
+        assert_eq!(far, scheduled_ias(40.0, VAPP), "flat beyond the ramp");
+
+        // The failure datapoint: 8.8 nm out it was doing 92. It should be well
+        // above the approach speed there.
+        let at_bug = scheduled_ias(8.8, VAPP);
+        assert!(
+            at_bug > VAPP + 20.0,
+            "at 8.8 nm we must still be clean-ish, got {at_bug:.0}"
+        );
+
+        // Gear comes down at 6 nm — comfortably below the SF50's 160 kt Vlo.
+        assert!(scheduled_ias(6.0, VAPP) < 160.0, "gear speed must be legal");
+
+        // Stabilised at the approach speed by the FAP and all the way in.
+        assert_eq!(scheduled_ias(FAP_NM, VAPP), VAPP);
+        assert_eq!(scheduled_ias(2.0, VAPP), VAPP);
+        assert_eq!(scheduled_ias(0.0, VAPP), VAPP);
+
+        // Monotonic: never speeds up as it gets closer, never below Vapp.
+        let mut prev = f64::MAX;
+        let mut d = 20.0;
+        while d >= 0.0 {
+            let v = scheduled_ias(d, VAPP);
+            assert!(v <= prev + 1e-9, "speed must not rise on the way in at {d} nm");
+            assert!(v >= VAPP - 1e-9, "never below the approach speed at {d} nm");
+            prev = v;
+            d -= 0.25;
+        }
+
+        // Scales with the airframe, so a 172 is not asked to fly a jet profile.
+        assert!(scheduled_ias(16.0, 65.0) < 100.0, "172 stays a 172");
     }
 }
