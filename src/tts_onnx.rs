@@ -843,4 +843,31 @@ mod station_voice_tests {
         assert!(!same(&a, &b), "speaker 4 and 33 rendered identically");
         assert!(!same(&b, &c), "speaker 33 and 80 rendered identically");
     }
+
+    /// Kokoro is installed and unreachable: the model, the vocab and 54
+    /// extracted voice tables are all in models/, and nothing in config can
+    /// select any of them. This proves the loader works before wiring it.
+    #[test]
+    #[ignore]
+    fn kokoro_voices_render() {
+        let model = "models/kokoro-v1.0.onnx";
+        if !std::path::Path::new(model).exists() {
+            eprintln!("no kokoro model, skipping");
+            return;
+        }
+        // A British male, an American male and a British female.
+        for voice in ["bm_george", "am_michael", "bf_emma"] {
+            let mut tts = match super::KokoroTts::load(model, voice) {
+                Ok(t) => t,
+                Err(e) => panic!("{voice} failed to load: {e:#}"),
+            };
+            let pcm = tts
+                .synth("Southampton Tower, good afternoon, November two five one Charlie Victor.")
+                .unwrap_or_else(|e| panic!("{voice} failed to render: {e:#}"));
+            assert!(pcm.len() > 16000, "{voice} produced only {} samples", pcm.len());
+            let peak = pcm.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(peak > 0.01, "{voice} rendered silence (peak {peak})");
+            eprintln!("  {voice}: {} samples, peak {peak:.3}", pcm.len());
+        }
+    }
 }
