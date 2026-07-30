@@ -982,14 +982,23 @@ that succeeded. `crates/sim/src/xplane.rs` now reports rate, cache hits,
 failures and the slowest response every 30 s, to the log and the blackbox
 (`"kind":"api_load"`). The first numbers were 70-80 req/s sustained, with the
 per-window slowest response climbing 50 → 100 → 125 ms in the minutes before a
-freeze: the shape of load, not of a single event. Most of that volume was
-DUPLICATION (the monitor's eighteen checks run in one burst wanting the same
-airspeed and altitude; the control loops re-read what the monitor just read),
-so reads are served from a 60 ms value cache — shorter than any control tick,
-and a write drops its own entry so the readback every tool's trust rests on
-still sees the real post-write value. Whether this fixes the hangs is unknown:
-the plugin (in-process, drawing every frame, never profiled) and LiveTraffic
-are the other two suspects, and the counter is what will tell them apart.
+freeze: the shape of load, not of a single event. Reads are served from a 60 ms
+value cache (shorter than any control tick; a write drops its own entry so the
+readback every tool's trust rests on still sees the real post-write value) —
+but the DUPLICATION that cache was built for is NOT where the volume comes
+from. Measured, it recovers about 2.5%, because the loops each read DIFFERENT
+datarefs rather than the same ones twice, and a whole EGHI sortie logged
+`cached=0` in every 30 s window. Do not read that zero as a broken cache; it
+is the honest answer, and it is why the load report also records a per-dataref
+histogram to the blackbox (`top`), which is the only thing that can actually
+name a hog. That sortie's: latitude and longitude 7,312 each, then
+`is_in_replay` 3,803 and `paused` 3,791 (the freeze check, ~4/s between them,
+for two flags that change almost never — the obvious candidate for a longer
+per-dataref TTL), `onground_any` 3,723, elevation 3,375, groundspeed 3,070,
+psi 2,877, over 61 windows. Whether any of this causes the hangs is still
+unknown: the per-window slowest response reached 4,533 ms mid-flight, and the
+plugin (in-process, drawing every frame, never profiled) and LiveTraffic remain
+the other two suspects.
 
 Battle-test surface (all deterministic, in `cargo test --workspace` unless
 noted — plain `cargo test` at the root only runs the crew package now): the
