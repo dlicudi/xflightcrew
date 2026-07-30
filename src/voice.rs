@@ -124,6 +124,84 @@ pub fn pilot_voice_choices() -> Vec<String> {
     voices
 }
 
+/// Which accents man the towers at fields OTHER than home.
+///
+/// A pool is what every airport you fly to answers in, and picking it as a
+/// preset beats ticking boxes: models/ holds 154 addressable voices once the
+/// multi-speaker packs are counted, and nobody wants a 154-row checklist. What
+/// a pilot actually wants to say is "British controllers".
+///
+/// Order is the panel's radio order, and the index is what `prefs` stores, so
+/// inserting a variant in the middle would silently re-map a saved pick.
+/// Append only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccentPool {
+    British,
+    American,
+    Mixed,
+    Every,
+}
+
+impl AccentPool {
+    pub const ALL: [AccentPool; 4] = [
+        AccentPool::British,
+        AccentPool::American,
+        AccentPool::Mixed,
+        AccentPool::Every,
+    ];
+
+    pub fn from_index(i: i64) -> Option<AccentPool> {
+        Self::ALL.get(usize::try_from(i).ok()?).copied()
+    }
+
+    pub fn index(self) -> i64 {
+        Self::ALL.iter().position(|p| *p == self).unwrap_or(2) as i64
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AccentPool::British => "British",
+            AccentPool::American => "American",
+            AccentPool::Mixed => "Mixed",
+            AccentPool::Every => "Every accent",
+        }
+    }
+
+    /// Does a voice spec belong in this pool?
+    fn accepts(self, spec: &str) -> bool {
+        let gb = spec.contains("en_GB");
+        let us = spec.contains("en_US");
+        match self {
+            AccentPool::British => gb,
+            AccentPool::American => us,
+            AccentPool::Mixed => gb || us,
+            // Non-English voices are cast by COUNTRY, never drawn at random —
+            // a German field must not answer in Spanish. "Every accent" still
+            // means every ENGLISH accent here.
+            AccentPool::Every => gb || us,
+        }
+    }
+
+    /// Build the pool from a candidate roster, dropping anything already spoken
+    /// for. `reserved` is the personas (copilot, cabin, home tower and its
+    /// colleagues) — a controller must never answer in one of those voices.
+    pub fn build(self, roster: &[String], reserved: &[&str]) -> Vec<String> {
+        let picked: Vec<String> = roster
+            .iter()
+            .filter(|v| self.accepts(v))
+            .filter(|v| !reserved.iter().any(|r| r == &v.as_str()))
+            .cloned()
+            .collect();
+        // Never hand back an empty pool: an empty one falls all the way back
+        // to the single curated station voice, so every field would share one
+        // controller. Widening beats that.
+        if picked.is_empty() && self != AccentPool::Mixed {
+            return AccentPool::Mixed.build(roster, reserved);
+        }
+        picked
+    }
+}
+
 /// The cast identity a station voice speaks AS — what keys its pitch/pace
 /// shift ([`crate::radiofx::shift_factor`]). Model + position + airport seed,
 /// so the same pool model is a different person at a different field or in a
@@ -2002,5 +2080,55 @@ mod tests {
         assert_eq!(h.pop().unwrap().seq, 5);
         assert_eq!(h.pop().unwrap().seq, 6);
         assert_eq!(h.pop().unwrap().seq, 7);
+    }
+
+    /// The accent pools must be usable, disjoint where it matters, and must
+    /// never hand back an empty list.
+    #[test]
+    fn accent_pools_pick_sensibly() {
+        let roster: Vec<String> = [
+            "models/en_GB-vctk-medium.onnx#4",
+            "models/en_GB-cori-medium.onnx",
+            "models/en_US-joe-medium.onnx",
+            "models/en_US-mike-medium.onnx",
+            "models/es_ES-davefx-medium.onnx",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+        let british = AccentPool::British.build(&roster, &[]);
+        assert_eq!(british.len(), 2, "{british:?}");
+        assert!(british.iter().all(|v| v.contains("en_GB")));
+
+        let american = AccentPool::American.build(&roster, &[]);
+        assert_eq!(american.len(), 2, "{american:?}");
+
+        // Non-English is cast by COUNTRY, never drawn at random — a German
+        // field must not answer in Spanish just because "every" was picked.
+        for pool in AccentPool::ALL {
+            assert!(
+                !pool.build(&roster, &[]).iter().any(|v| v.contains("es_ES")),
+                "{} must not draw a Spanish voice",
+                pool.label()
+            );
+        }
+
+        // Reserved personas are removed — a controller must never answer in
+        // the copilot's voice.
+        let reserved = ["models/en_US-joe-medium.onnx"];
+        let us = AccentPool::American.build(&roster, &reserved);
+        assert!(!us.contains(&reserved[0].to_string()), "{us:?}");
+
+        // A pool that would come back empty widens instead of leaving every
+        // field sharing one curated voice.
+        let only_us: Vec<String> = vec!["models/en_US-joe-medium.onnx".into()];
+        assert!(!AccentPool::British.build(&only_us, &[]).is_empty());
+
+        // Index round-trips, because prefs stores the number.
+        for p in AccentPool::ALL {
+            assert_eq!(AccentPool::from_index(p.index()), Some(p));
+        }
+        assert_eq!(AccentPool::from_index(99), None);
     }
 }
