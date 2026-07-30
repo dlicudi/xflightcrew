@@ -185,12 +185,28 @@ pub fn alt_capture_vs(target_ft: f64, alt_ft: f64, vs_fpm: f64) -> f64 {
 ///
 /// Bounded above by the pattern altitude, so this can only ever DELAY a
 /// descent, never command a climb on base.
+/// The floor may not hold us ABOVE the path we are trying to join. A flat
+/// 700 ft AGL did exactly that on a tight pattern: an SF50 turning final at
+/// 1.84 nm meets a 3° path at 585 ft AGL, so the floor sat 115 ft over it and
+/// even a perfectly flown base handed autoland an aircraft already high
+/// (EGHI, 2026-07-30 — it then flew the whole final 400 ft high, crossed the
+/// threshold 70 ft up and went around). Where the path is lower than the
+/// floor, the path is the answer: it is converging on the runway, which is
+/// the one place we are allowed to be low.
 pub fn approach_leg_alt_ft(field_elev_ft: f64, tpa_msl_ft: f64, a_m: f64, x_m: f64) -> f64 {
     let dist_nm = (a_m.abs() + x_m.abs()) / M_PER_NM;
-    let floor = field_elev_ft + HANDOFF_AGL_FT;
-    (field_elev_ft + dist_nm * crate::autoland::GLIDEPATH_FT_PER_NM)
-        .clamp(floor, tpa_msl_ft.max(floor))
+    let path = field_elev_ft + dist_nm * crate::autoland::GLIDEPATH_FT_PER_NM;
+    let floor = (field_elev_ft + HANDOFF_AGL_FT).min(path);
+    path.clamp(floor, tpa_msl_ft.max(floor))
 }
+
+/// Height to be down to by the base turn, AGL. The pattern used to hold TPA
+/// until base and then try to lose the lot in one leg, which does not fit: at
+/// EGHI the SF50 had to shed 600 ft in a 1.1 nm base (~900 fpm) and managed
+/// 150. A real circuit starts down abeam the touchdown point, on the 180, and
+/// this is that descent's target — low enough to give base a reachable job,
+/// high enough to stay a sane downwind height.
+const DOWNWIND_DESCENT_AGL_FT: f64 = 800.0;
 
 /// The speed the pattern legs are flown at: the airframe's climb speed, but
 /// never more than [`PATTERN_MAX_APPROACH_MULT`] times its approach speed.
@@ -1247,6 +1263,21 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // (engage syncs it away — the takeoff's lesson).
         guard_floor_ft = guard_floor_ft.filter(|(_, t)| t.elapsed().as_secs() < 60);
         let leg_target = match leg {
+            // Abeam the touchdown point and later, START DOWN — the 180, where
+            // a real pattern reduces power. Holding TPA to the base turn left
+            // the whole descent to one short leg it could not fit (see
+            // DOWNWIND_DESCENT_AGL_FT). Deliberately a FLAT target and not the
+            // path: the path's distance term here is the Manhattan
+            // |along| + |across|, which on an OUTBOUND downwind shrinks as the
+            // aircraft flies away from the runway and would ratchet us down to
+            // a few hundred feet while still abeam. Ratcheted like base, so it
+            // can only ever descend.
+            Leg::Downwind if a_m < 0.0 => {
+                let want = (field_elev_ft + DOWNWIND_DESCENT_AGL_FT).min(tpa_msl_ft);
+                let t = descent_target.map_or(want, |d: f64| d.min(want));
+                descent_target = Some(t);
+                t
+            }
             // Base and final descend the 3° PATH, not to a flat height.
             Leg::Base | Leg::Final => {
                 // ...and RATCHETED: an approach descends. Whatever the
@@ -1565,10 +1596,32 @@ mod tests {
         // Closer in, the path is lower — and the leg follows it down.
         let near = approach_leg_alt_ft(elev, tpa, -2.5 * M_PER_NM, 0.0);
         assert!(near < far, "{near} !< {far}");
-        // Never below the handoff floor, however short the final.
-        assert_eq!(
-            approach_leg_alt_ft(elev, tpa, -0.2 * M_PER_NM, 0.0),
-            elev + HANDOFF_AGL_FT
+        // The floor may not hold us ABOVE the path. It used to: a flat
+        // 700 ft AGL bottom meant that on any pattern turning final inside
+        // ~2.2 nm — where the 3° path is below 700 — the leg levelled off over
+        // the path it was trying to join. The SF50's 1.84 nm final at EGHI met
+        // a path at 585 ft AGL and the floor sat 115 ft on top of it
+        // (2026-07-30). Close in, the path wins.
+        let short_final = approach_leg_alt_ft(elev, tpa, -0.2 * M_PER_NM, 0.0);
+        let path_there = elev + 0.2 * crate::autoland::GLIDEPATH_FT_PER_NM;
+        assert!(
+            (short_final - path_there).abs() < 1.0,
+            "close in the target IS the path, got {short_final} want {path_there}"
+        );
+        assert!(
+            short_final < elev + HANDOFF_AGL_FT,
+            "and it is allowed below the old flat floor"
+        );
+
+        // The EGHI geometry that produced the go-around: 1.84 nm final, field
+        // at 41 ft, jet pattern. The handover must not be above the path.
+        let (eghi, jet_tpa) = (41.0, 41.0 + 1184.0);
+        let handover = approach_leg_alt_ft(eghi, jet_tpa, -1.84 * M_PER_NM, 0.0);
+        let eghi_path = eghi + 1.84 * crate::autoland::GLIDEPATH_FT_PER_NM;
+        assert!(
+            handover <= eghi_path + 1.0,
+            "handed off {:.0} ft above the path",
+            handover - eghi_path
         );
         // ...and never a CLIMB: far out, where the path is above the pattern
         // altitude, the leg simply holds what it has (the GA case — a 172's
@@ -1578,6 +1631,48 @@ mod tests {
             approach_leg_alt_ft(elev, ga_tpa, -4.0 * M_PER_NM, 0.0),
             ga_tpa,
             "hold the pattern altitude, never climb on base"
+        );
+    }
+
+    /// The descent has to START abeam the touchdown point, because base alone
+    /// is not long enough to hold it.
+    ///
+    /// EGHI 2026-07-30: TPA 1,184 ft AGL, final turned at 1.84 nm where the
+    /// path is 585 — 600 ft to lose in a 1.1 nm base, about 900 fpm. It
+    /// managed 150, arrived 400 ft high, stayed high the whole final, crossed
+    /// the threshold 70 ft up and went around. Splitting the descent gives
+    /// base a job it can actually do.
+    #[test]
+    fn the_downwind_descent_leaves_base_a_reachable_job() {
+        let (elev, tpa_agl) = (41.0, 1184.0);
+        let tpa = elev + tpa_agl;
+        let downwind_target = (elev + DOWNWIND_DESCENT_AGL_FT).min(tpa);
+
+        // It descends, but stays a sane downwind height.
+        assert!(downwind_target < tpa, "the 180 is where you start down");
+        assert!(
+            downwind_target - elev >= 700.0,
+            "still a circuit height, not an approach: {:.0} ft AGL",
+            downwind_target - elev
+        );
+
+        // What base is left with, against what it had before.
+        let path_at_final = elev + 1.84 * crate::autoland::GLIDEPATH_FT_PER_NM;
+        let was = tpa - path_at_final;
+        let now = downwind_target - path_at_final;
+        assert!(
+            now < was * 0.75,
+            "base's descent must shrink materially: {now:.0} ft vs {was:.0}"
+        );
+
+        // A 172's 1,000 ft circuit must not be pushed DOWN to 800 by this and
+        // then find itself below its own pattern — the target is bounded by
+        // the pattern altitude, so a low circuit is simply left alone.
+        let ga_tpa = elev + 600.0;
+        assert_eq!(
+            (elev + DOWNWIND_DESCENT_AGL_FT).min(ga_tpa),
+            ga_tpa,
+            "never descend below a pattern that is already lower"
         );
     }
 
