@@ -199,13 +199,7 @@ async fn main() -> Result<()> {
         let text = std::env::args().nth(2).unwrap_or_else(|| {
             "Roger, flaps up. Gear down, three green. Caution, fuel endurance forty minutes.".into()
         });
-        // Kokoro model → Kokoro engine (voice via XCOPILOT_KOKORO_VOICE); else piper.
-        if config.piper_voice.contains("kokoro") {
-            let voice =
-                std::env::var("XCOPILOT_KOKORO_VOICE").unwrap_or_else(|_| "am_michael".into());
-            eprintln!("kokoro: {} voice={}", config.piper_voice, voice);
-            tts_onnx::KokoroTts::load(&config.piper_voice, &voice)?.speak(&text)?;
-        } else {
+        {
             eprintln!(
                 "voice: {}  (length={} noise={} noise_w={})",
                 config.piper_voice,

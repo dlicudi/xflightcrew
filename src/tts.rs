@@ -7,7 +7,6 @@
 //!     can't start.
 //!   - `piper` — shell out to the piper binary + a voice model (Horizon's trick).
 //!
-//! A later iteration could run Kokoro ONNX in-process via the `ort` crate.
 
 use std::io::Write;
 use std::process::{Command, Stdio};

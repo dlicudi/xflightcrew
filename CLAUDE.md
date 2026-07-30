@@ -72,7 +72,7 @@ earns its keep over a Python runtime + GIL.
 | STT | `whisper-rs` (whisper.cpp bindings) — push-to-talk for v1 |
 | LLM tool-use | **Local** — `reqwest` → Ollama (`/api/chat`), backend-neutral tool schema |
 | X-Plane write | `reqwest` PATCH to the Web API (`PATCH /api/v1/datarefs/{id}/value`) |
-| TTS readback | shell out to `piper`, or run Kokoro ONNX via the `ort` crate later |
+| TTS readback | in-process piper VITS via the `ort` crate (ONE engine, see below) |
 
 **LLM runs locally — cloud is ruled out** because per-call API metering doesn't
 fit a real-time copilot you'd use for a whole flight. The whole loop is offline:

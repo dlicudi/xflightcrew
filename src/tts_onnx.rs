@@ -249,7 +249,7 @@ const SENTENCE_GAP_S: f64 = 0.22;
 /// Split text into sentence-sized chunks for synthesis. VITS-family models are
 /// trained on single sentences: a whole paragraph in one pass comes out rushed
 /// (the duration predictor compresses the pacing — a nine-sentence flight-plan
-/// brief was heard live at roughly double speed), and Kokoro's style table
+/// brief was heard live at roughly double speed), and a style table
 /// additionally clamps on long inputs. Sentences end at `.`/`?`/`!` followed by
 /// whitespace, so decimals ("altimeter 30.17") never split; a sentence still
 /// longer than ~220 chars splits again at comma boundaries.
@@ -294,126 +294,8 @@ pub(crate) fn speech_chunks(text: &str) -> Vec<String> {
     out
 }
 
-/// Kokoro-82M TTS — a more natural/expressive voice than piper, in the same warm
-/// in-process ONNX session. Different I/O than piper VITS: it takes `tokens`
-/// (phoneme ids wrapped with 0), a 256-d `style` vector for the chosen voice, and
-/// a `speed` scalar, and emits 24 kHz audio. Phonemes come from the shared espeak
-/// path; ids map through Kokoro's own vocab (kokoro-config.json). The per-voice
-/// style table is pre-extracted to models/kokoro-voices/<voice>.bin ([510,256] f32,
-/// indexed by phoneme count — Kokoro picks the style row matching the token length).
-pub struct KokoroTts {
-    session: Session,
-    vocab: HashMap<char, i64>,
-    style_rows: Vec<f32>, // 510 * 256 f32 for the selected voice
-}
-
-const KOKORO_SR: u32 = 24_000;
-const KOKORO_STYLE_DIM: usize = 256;
-const KOKORO_MAX_ROWS: usize = 510;
-
-impl KokoroTts {
-    /// Load the Kokoro model, its vocab (sibling `kokoro-config.json`), and a
-    /// voice's style table (`models/kokoro-voices/<voice>.bin`).
-    pub fn load(model_path: &str, voice: &str) -> Result<Self> {
-        let session = build_session(model_path, Some(session_threads()), "Kokoro")?;
-
-        let dir = Path::new(model_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
-        let cfg_path = dir.join("kokoro-config.json");
-        let cfg: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&cfg_path).with_context(|| format!("reading {cfg_path:?}"))?,
-        )?;
-        let vocab = cfg["vocab"]
-            .as_object()
-            .ok_or_else(|| anyhow!("{cfg_path:?}: missing vocab"))?
-            .iter()
-            .filter_map(|(k, v)| {
-                let mut ch = k.chars();
-                match (ch.next(), ch.next()) {
-                    (Some(c), None) => v.as_i64().map(|id| (c, id)),
-                    _ => None, // skip any multi-char vocab keys
-                }
-            })
-            .collect();
-
-        let style_path = dir.join("kokoro-voices").join(format!("{voice}.bin"));
-        let bytes = std::fs::read(&style_path)
-            .with_context(|| format!("reading Kokoro voice {style_path:?} (pre-extracted f32)"))?;
-        let style_rows: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
-        if style_rows.len() < KOKORO_STYLE_DIM {
-            bail!(
-                "Kokoro voice {voice} style table too small ({} floats)",
-                style_rows.len()
-            );
-        }
-
-        Ok(Self {
-            session,
-            vocab,
-            style_rows,
-        })
-    }
-
-    /// Synthesize to mono 24 kHz `f32` samples.
-    pub fn synth(&mut self, text: &str) -> Result<Vec<f32>> {
-        let phonemes = phonemize(text)?;
-        let ids: Vec<i64> = phonemes
-            .chars()
-            .filter_map(|c| self.vocab.get(&c).copied())
-            .collect();
-        if ids.is_empty() {
-            bail!("no Kokoro tokens for {text:?} (phonemized to {phonemes:?})");
-        }
-        // Style row is indexed by phoneme count (clamped to the table).
-        let row = ids.len().min(KOKORO_MAX_ROWS - 1);
-        let style = self.style_rows[row * KOKORO_STYLE_DIM..(row + 1) * KOKORO_STYLE_DIM].to_vec();
-
-        // tokens = 0, <phoneme ids>, 0
-        let mut tokens = Vec::with_capacity(ids.len() + 2);
-        tokens.push(0);
-        tokens.extend_from_slice(&ids);
-        tokens.push(0);
-        let n = tokens.len() as i64;
-
-        let outputs = self.session.run(ort::inputs![
-            "tokens" => Tensor::from_array(([1_i64, n], tokens))?,
-            "style" => Tensor::from_array(([1_i64, KOKORO_STYLE_DIM as i64], style))?,
-            "speed" => Tensor::from_array(([1_i64], vec![1.0_f32]))?,
-        ])?;
-        let (_shape, data) = outputs[0].try_extract_tensor::<f32>()?;
-        Ok(data.to_vec())
-    }
-
-    /// Synthesize and play. Session stays warm for the next call. Chunked like
-    /// the piper path — Kokoro also mis-paces long passages, and its style row
-    /// (indexed by phoneme count) clamps at the table edge on a paragraph.
-    pub fn speak(&mut self, text: &str) -> Result<()> {
-        let t = std::time::Instant::now();
-        let gap = vec![0.0_f32; (KOKORO_SR as f64 * SENTENCE_GAP_S) as usize];
-        let mut samples = Vec::new();
-        for chunk in speech_chunks(text) {
-            if !samples.is_empty() {
-                samples.extend_from_slice(&gap);
-            }
-            samples.extend(self.synth(&chunk)?);
-        }
-        tracing::info!(
-            ms = t.elapsed().as_millis() as u64,
-            chars = text.len(),
-            "tts synth"
-        );
-        let wav = std::env::temp_dir().join("xvoicelayer-kokoro.wav");
-        write_wav(&wav, &samples, KOKORO_SR)?;
-        crate::tts::play(&wav)
-    }
-}
-
 /// Dump an ONNX model's input/output signature — used to wire up a new model
-/// (e.g. Kokoro, whose I/O differs from piper VITS). `cargo run -- onnx-info <m>`.
+/// (a model whose I/O differs from piper VITS). `cargo run -- onnx-info <m>`.
 pub fn inspect(model_path: &str) -> Result<String> {
     let session = build_session(model_path, None, "model")?;
     let mut s = format!("model: {model_path}\nINPUTS:\n");
@@ -844,59 +726,5 @@ mod station_voice_tests {
         assert!(!same(&b, &c), "speaker 33 and 80 rendered identically");
     }
 
-    /// Kokoro is installed and unreachable: the model, the vocab and 54
-    /// extracted voice tables are all in models/, and nothing in config can
-    /// select any of them. This proves the loader works before wiring it.
-    #[test]
-    #[ignore]
-    fn kokoro_voices_render() {
-        let model = "models/kokoro-v1.0.onnx";
-        if !std::path::Path::new(model).exists() {
-            eprintln!("no kokoro model, skipping");
-            return;
-        }
-        // A British male, an American male and a British female.
-        for voice in ["bm_george", "am_michael", "bf_emma"] {
-            let mut tts = match super::KokoroTts::load(model, voice) {
-                Ok(t) => t,
-                Err(e) => panic!("{voice} failed to load: {e:#}"),
-            };
-            let pcm = tts
-                .synth("Southampton Tower, good afternoon, November two five one Charlie Victor.")
-                .unwrap_or_else(|e| panic!("{voice} failed to render: {e:#}"));
-            assert!(pcm.len() > 16000, "{voice} produced only {} samples", pcm.len());
-            let peak = pcm.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            assert!(peak > 0.01, "{voice} rendered silence (peak {peak})");
-            eprintln!("  {voice}: {} samples, peak {peak:.3}", pcm.len());
-        }
-    }
 
-    /// Latency is the deciding number for the COPILOT: a readback that lands
-    /// late is worse than one that sounds slightly synthetic. Radio voices can
-    /// afford more, the intercom cannot.
-    #[test]
-    #[ignore]
-    fn engine_latency_comparison() {
-        // What the copilot ACTUALLY says most: a short readback. Long-form
-        // latency is the wrong measure when speech is chunked per sentence.
-        let line = "Roger, flaps ten.";
-        if std::path::Path::new("models/en_US-joe-medium.onnx").exists() {
-            let mut p = super::OnnxTts::load("models/en_US-joe-medium.onnx").unwrap();
-            let _ = p.synth("warm up");
-            let t0 = std::time::Instant::now();
-            let pcm = p.synth(line).unwrap();
-            let ms = t0.elapsed().as_millis();
-            let secs = pcm.len() as f64 / f64::from(p.sample_rate());
-            eprintln!("  piper   {ms:>5} ms for {secs:.2}s audio  ({:.1}x realtime)", secs * 1000.0 / ms as f64);
-        }
-        if std::path::Path::new("models/kokoro-v1.0.onnx").exists() {
-            let mut k = super::KokoroTts::load("models/kokoro-v1.0.onnx", "bm_george").unwrap();
-            let _ = k.synth("warm up");
-            let t0 = std::time::Instant::now();
-            let pcm = k.synth(line).unwrap();
-            let ms = t0.elapsed().as_millis();
-            let secs = pcm.len() as f64 / 24000.0;
-            eprintln!("  kokoro  {ms:>5} ms for {secs:.2}s audio  ({:.1}x realtime)", secs * 1000.0 / ms as f64);
-        }
-    }
 }

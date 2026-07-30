@@ -31,15 +31,6 @@ struct Prefs {
     /// plugin reloads and boots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ui_scale: Option<i64>,
-    /// The cabin crew's voice — a piper model path, picked in the Voices tab.
-    /// `None` = never chosen, so the config default (and the copilot-collision
-    /// guard) decide.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cabin_voice: Option<String>,
-    /// Which accents man the towers at fields other than home — the index of
-    /// a [`crate::voice::AccentPool`]. `None` = never chosen.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    atc_accents: Option<i64>,
 }
 
 fn load() -> Prefs {
@@ -61,33 +52,6 @@ pub fn pilot_voice() -> Option<String> {
 pub fn save_pilot_voice(spec: &str) {
     let mut prefs = load();
     prefs.pilot_voice = Some(spec.to_string());
-    store(prefs);
-}
-
-/// The saved cabin-crew voice pick, if it still points at a model on disk.
-pub fn cabin_voice() -> Option<String> {
-    load().cabin_voice.filter(|p| {
-        // The spec may carry a `#N` speaker suffix; the FILE is what must exist.
-        Path::new(p.split('#').next().unwrap_or(p)).exists()
-    })
-}
-
-/// Persist a new cabin-crew voice pick.
-pub fn save_cabin_voice(spec: &str) {
-    let mut prefs = load();
-    prefs.cabin_voice = Some(spec.to_string());
-    store(prefs);
-}
-
-/// The saved ATC accent-pool index, if any.
-pub fn atc_accents() -> Option<i64> {
-    load().atc_accents
-}
-
-/// Persist the ATC accent-pool pick.
-pub fn save_atc_accents(v: i64) {
-    let mut prefs = load();
-    prefs.atc_accents = Some(v);
     store(prefs);
 }
 
