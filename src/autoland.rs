@@ -16,8 +16,30 @@ use std::io::{BufRead, BufReader};
 pub(crate) use crate::nav::{bearing_deg, haversine_nm, project_latlon};
 
 const M_PER_NM: f64 = 1852.0;
-/// apt.dat surface codes that are hard (asphalt=1, concrete=2) — preferred.
-const HARD_SURFACES: [i32; 2] = [1, 2];
+
+/// apt.dat surface codes we will put wheels on.
+///
+/// 1 and 2 are the legacy asphalt/concrete pair. X-Plane 12 replaced that pair
+/// with a MATERIAL system numbered 20-38 and 50-57, and a whitelist of just
+/// [1, 2] therefore hid **36% of every usable runway on earth** from the
+/// emergency autoland: 4,870 of the 13,390 runways at or above our 1,200 m
+/// minimum. Not obscure strips either — EGLL is surface 25 and 29, and PANC,
+/// ENGM, EKCH, ESSA, KSEA, OMDB, EBBR, CYYC, EGAA and LTFM are all in the new
+/// range. Heathrow was invisible to the autoland.
+///
+/// Southampton, 2026-07-30: EGHI 20 is surface 22, so it was never a candidate
+/// at 2.16 nm and the search took Lasham's legacy asphalt 15.81 nm away. Note
+/// this gate gutted BOTH entry points — `runway_by_id` filters on it too, so
+/// even the circuit FORCING its own runway would have been rejected here and
+/// fallen back to the same wrong field.
+///
+/// Still a whitelist and not a blacklist, because the soft codes must never
+/// win by default: 3 turf, 4 dirt, 5 gravel, 12 dry lakebed, 13 water, 14
+/// snow, 15 transparent. 39-49 are unused in the current global apt.dat and
+/// are deliberately NOT accepted — an unknown code should not become a runway.
+const fn is_hard_surface(s: i32) -> bool {
+    matches!(s, 1 | 2 | 20..=38 | 50..=57)
+}
 
 /// One landing option: touch down AT `thr`, tracking `course_deg` toward the far end.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,7 +62,7 @@ pub struct Runway {
 
 impl Runway {
     fn hard(&self) -> bool {
-        HARD_SURFACES.contains(&self.surface)
+        is_hard_surface(self.surface)
     }
 }
 
@@ -2562,6 +2584,84 @@ mod tests {
                 searched.dist_nm
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // X-Plane 12 numbers paved surfaces 20-38 and 50-57, not just the legacy
+    // asphalt=1 / concrete=2. Accepting only [1, 2] hid 36% of the world's
+    // usable runways from the emergency autoland, Heathrow among them.
+    #[test]
+    fn xp12_paved_surface_codes_are_landable() {
+        // Legacy pair, still valid.
+        assert!(is_hard_surface(1), "asphalt");
+        assert!(is_hard_surface(2), "concrete");
+
+        // The one that started it: EGHI 20 is surface 22, and it sat 2.16 nm
+        // away while the search took Lasham at 15.81.
+        assert!(is_hard_surface(22), "EGHI, KCLT, LTFJ");
+        // A spread of real fields across the XP12 material range.
+        for (code, who) in [
+            (23, "ENGM / PANC"),
+            (25, "EGLL"),
+            (26, "EKCH / ENBR"),
+            (27, "EFHK"),
+            (29, "EGLL / EBCI"),
+            (30, "EGLC / BIRK"),
+            (33, "EGAA / LTFM"),
+            (34, "ESSA / EKCH"),
+            (35, "EBBR"),
+            (37, "OMDB / LTAC"),
+            (50, "CYYC / UKBB"),
+            (51, "KSEA"),
+            (55, "ULLI / KPDX"),
+            (57, "KGEG"),
+        ] {
+            assert!(is_hard_surface(code), "surface {code} is paved: {who}");
+        }
+
+        // The soft ones must NEVER become a runway — this is why the check
+        // stays a whitelist.
+        for (code, what) in [
+            (3, "turf"),
+            (4, "dirt"),
+            (5, "gravel"),
+            (12, "dry lakebed"),
+            (13, "water"),
+            (14, "snow"),
+            (15, "transparent"),
+        ] {
+            assert!(!is_hard_surface(code), "surface {code} ({what}) is not landable");
+        }
+
+        // Unused/unknown codes are rejected rather than assumed paved.
+        assert!(!is_hard_surface(0));
+        assert!(!is_hard_surface(45), "39-49 unused in the global apt.dat");
+        assert!(!is_hard_surface(99));
+    }
+
+    // A forced ident must survive the surface gate. `runway_by_id` filters on
+    // hard() too, so before the XP12 codes were accepted, the circuit forcing
+    // its own runway at Southampton would STILL have been rejected here and
+    // fallen back to the track search that chose the wrong airfield.
+    #[test]
+    fn a_forced_ident_resolves_on_an_xp12_paved_runway() {
+        let dir = std::env::temp_dir().join(format!("xvl_surf22_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("apt.dat");
+        // EGHI-shaped: runway 02/20, surface 22, 1885 m.
+        std::fs::write(
+            &path,
+            "1 44 0 0 EGHI Southampton\n\
+             100 45 22 0 0.25 0 0 0 02 50.9425 -1.3660 0 0 1 0 0 0 20 50.9585 -1.3520 0 0 1 0 0 0\n",
+        )
+        .unwrap();
+        let p = path.to_str().unwrap();
+        let r = runway_by_id(p, 50.984, -1.311, "20", 40.0)
+            .unwrap()
+            .expect("surface 22 is a paved runway and must resolve");
+        assert_eq!(r.id, "20");
+        assert_eq!(r.surface, 22);
+        assert!(r.dist_nm < 5.0, "it is right there: {:.1} nm", r.dist_nm);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
