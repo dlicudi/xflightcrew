@@ -1017,14 +1017,40 @@ pub fn lookahead_m_with(gs_kts: f64, aim_s: f64) -> f64 {
     (gs_kts * 0.514 * aim_s).clamp(16.0, 10.0 * aim_s)
 }
 
-/// The braking-distance speed cap approaching the stop point: v = √(2·a·d)
-/// at a gentle 0.5 m/s², floored at a 2-knot creep so the last meters
-/// actually finish. At/inside half a meter it's a stop.
+/// Deceleration the stop ramp plans for, m/s².
+///
+/// NOT the deceleration the brakes can achieve — that is about 0.7 m/s² at the
+/// gentle end (measured: 0.14-0.18 brake gave a -1.36 kt/s trend at EGHI). It
+/// is deliberately far below it, because the ramp has to command a speed the
+/// governor will actually ACT on, and `taxi_control` only brakes once the
+/// aircraft is 3 kt above target. A √ curve is flat far out and steep near
+/// zero, so at 0.5 that gap did not open until ~7 m to go:
+///
+///   rem 22.9 m -> target 9.3 kt vs 9.54 actual   no brake
+///   rem 11.2 m -> target 6.5 kt vs 9.24 actual   no brake
+///   rem  6.8 m -> target 5.1 kt vs 9.14 actual   first brake, far too late
+///
+/// The aircraft then crossed the hold line at 6.7 kt and coasted five metres
+/// past it, nose over the yellow — a runway incursion, and with the steering
+/// already released it stopped skewed as well (EGHI, photographed 2026-07-30).
+///
+/// Worse, `taxi_control` cannot tell a planned STOP from a bend trim: both are
+/// just a target above 1 kt, so both get the 0.22 comfort cap that three
+/// airframes' jerkiness complaints put there. Full 0.6 authority arrives only
+/// inside the last metre. Rather than re-open that tuning, this starts the
+/// deceleration early enough that comfort braking is enough: at 0.25 the same
+/// 22.9 m commands 6.6 kt, the 3 kt gap opens around 15 m out, and there is
+/// then twice the distance to stop in with ~2.8x the needed authority.
+const STOP_DECEL_MS2: f64 = 0.25;
+
+/// The braking-distance speed cap approaching the stop point: v = √(2·a·d) at
+/// [`STOP_DECEL_MS2`], floored at a creep so the last meters actually finish.
+/// At/inside [`STOP_ZERO_M`] it's a stop.
 pub fn stop_ramp_kts(remaining_m: f64) -> f64 {
     if remaining_m <= STOP_ZERO_M {
         return 0.0;
     }
-    (MS_TO_KTS * (2.0 * 0.5 * remaining_m).sqrt()).max(CREEP_KTS)
+    (MS_TO_KTS * (2.0 * STOP_DECEL_MS2 * remaining_m).sqrt()).max(CREEP_KTS)
 }
 
 /// Where the schedule commands a full stop, and the creep it will not go below
@@ -2027,6 +2053,68 @@ mod tests {
         assert!(close > 0.0 && close < 0.5, "{close}");
         assert_eq!(stop_straighten(0.8, 1.0, STOPPED), 0.0);
         assert_eq!(stop_straighten(-0.8, 0.5, STOPPED), 0.0, "both directions");
+    }
+
+    /// The ramp must open the governor's braking gap while there is still room
+    /// to stop, not a couple of metres out.
+    ///
+    /// `taxi_control` brakes when `(target - gs) - trend*2.5 < -3.0`, i.e. only
+    /// once the aircraft is ~3 kt above target, and until the target drops
+    /// below 1 kt it is capped at the 0.22 comfort effort. At EGHI, taxiing at
+    /// 12 kt base, that gap did not open until 6.8 m to go: the aircraft
+    /// crossed the hold line at 6.7 kt and finished five metres past it with
+    /// its nose over the yellow.
+    #[test]
+    fn braking_starts_with_room_to_stop_at_the_hold() {
+        const BASE: f64 = 12.0; // the EGHI taxi's own base speed
+        const BRAKE_GAP_KTS: f64 = 3.0; // taxi_control's threshold
+        // Measured achievable deceleration at the gentle comfort effort.
+        const ACHIEVABLE_MS2: f64 = 0.6;
+
+        // Where does the aircraft, still doing its base speed, first find
+        // itself 3 kt above the commanded target?
+        let mut brake_at = 0.0;
+        let mut d = 0.0;
+        while d < 80.0 {
+            if BASE - stop_ramp_kts(d) >= BRAKE_GAP_KTS {
+                brake_at = d;
+            }
+            d += 0.1;
+        }
+        // It has to be far enough out to actually stop from base speed.
+        let need_m = (BASE / MS_TO_KTS).powi(2) / (2.0 * ACHIEVABLE_MS2);
+        assert!(
+            brake_at > need_m,
+            "braking must begin with room: opens at {brake_at:.1} m but \
+             stopping from {BASE} kt needs {need_m:.1} m"
+        );
+        // And with margin, not just barely — the governor has its own loop
+        // lag on top of the physics.
+        //
+        // The margin is only ~1.35x, and that is the honest ceiling of this
+        // approach rather than a number to tune toward. Stopping from 12 kt
+        // takes ~32 m ONLY because `taxi_control` caps a planned stop at the
+        // 0.22 comfort effort until the last metre, and a real aircraft stops
+        // from 12 kt in a fraction of that. The deeper fix is to tell
+        // `taxi_control` that a stop is planned so it can use its 0.6
+        // authority earlier; that re-opens tuning three airframes have already
+        // complained about, so it is deliberately not bundled with this.
+        assert!(
+            brake_at > need_m * 1.25,
+            "want margin: {brake_at:.1} m vs {need_m:.1} m needed"
+        );
+
+        // The ramp is still a ramp: monotonic, and it still reaches a stop.
+        let mut prev = 0.0;
+        let mut d = 0.0;
+        while d <= 60.0 {
+            let v = stop_ramp_kts(d);
+            assert!(v >= prev - 1e-9, "monotonic at {d} m");
+            prev = v;
+            d += 0.5;
+        }
+        assert_eq!(stop_ramp_kts(STOP_ZERO_M), 0.0, "still stops");
+        assert!(stop_ramp_kts(2.0) >= CREEP_KTS, "creep survives");
     }
 
     /// The fade must not disarm the nose while the aircraft is still rolling.
