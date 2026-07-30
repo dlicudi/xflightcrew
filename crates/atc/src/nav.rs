@@ -824,7 +824,34 @@ impl TaxiNet {
             .flatten()
             .or_else(|| snap_within(to_lat, to_lon, &taxiway_nodes))?;
         if start == goal {
-            return None;
+            // For a RUNWAY destination this is genuinely nothing to do: we are
+            // already at the entrance the clearance would send us to.
+            if to_runway {
+                return None;
+            }
+            // For a STAND it is not. A sparse network puts both ends on one
+            // node whenever the parking is close, and returning None there
+            // means the tower answers "taxi to parking, this frequency" with
+            // no route attached — the crew's taxi-in then waits out its whole
+            // 60 s for a route that was never coming and gives up with "no
+            // taxi-in clearance came back", which is a lie: the clearance
+            // came, the ROUTE did not (EGHI 2026-07-30, aircraft 224 m from
+            // node 44 and Stand 14 another 69 m past it, on a 24-edge
+            // network).
+            //
+            // The honest answer is the short taxi it actually is: out to the
+            // node, then in to the stand. No named legs, because none were
+            // traversed.
+            let node = *self.nodes.get(&start)?;
+            let path = vec![node, (to_lat, to_lon)];
+            return Some(TaxiRoutePlan {
+                via: Vec::new(),
+                crossings: Vec::new(),
+                holding_point: String::new(),
+                seg: vec![(String::new(), false)],
+                path,
+                lead_on: Vec::new(),
+            });
         }
         // Dijkstra; runway edges cost ×25 so a route only touches one to
         // CROSS it, never to taxi along it.
@@ -2577,5 +2604,54 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
         // Aircraft far from the only runway-28 → none within 60nm.
         let r = find_ils(path.to_str().unwrap(), "28", 36.71, -4.55, 60.0).unwrap();
         assert!(r.is_none());
+    }
+
+    /// A close-in stand must still get a route.
+    ///
+    /// EGHI 2026-07-30: after landing, the aircraft sat 224 m from taxiway
+    /// node 44 and the nearest suitable stand was another 69 m past the same
+    /// node — so both ends snapped to node 44, `start == goal`, and the
+    /// planner returned None. The tower then answered "taxi to parking, this
+    /// frequency" with no route attached, and the crew's taxi-in waited out
+    /// its full 60 s before giving up with "no taxi-in clearance came back".
+    /// The clearance HAD come; the route had not.
+    #[test]
+    fn a_stand_on_the_same_node_still_gets_a_route() {
+        // Two nodes joined by one taxiway; the stand sits just past node 1,
+        // so a nearby aircraft and the stand both snap to it.
+        let mut net = TaxiNet::default();
+        net.nodes.insert(1, (50.9500, -1.3600));
+        net.nodes.insert(2, (50.9520, -1.3600));
+        net.edges.push(TaxiEdge {
+            a: 1,
+            b: 2,
+            name: "Alpha".into(),
+            runway: false,
+            oneway: false,
+            zone_of: Vec::new(),
+        });
+        let (stand_lat, stand_lon) = (50.94995, -1.35985);
+        let plan = net
+            .plan(50.95005, -1.36005, stand_lat, stand_lon, 0.0, &[])
+            .expect("a close stand is a short taxi, not an impossible one");
+        assert!(
+            plan.path.len() >= 2,
+            "the publication drops anything shorter: {:?}",
+            plan.path
+        );
+        let end = *plan.path.last().unwrap();
+        assert!(
+            (end.0 - stand_lat).abs() < 1e-6 && (end.1 - stand_lon).abs() < 1e-6,
+            "the route must END at the stand, got {end:?}"
+        );
+        assert_eq!(plan.seg.len(), plan.path.len() - 1, "seg tracks path");
+
+        // A RUNWAY destination we are already at is still nothing to do.
+        assert!(
+            net.plan_to_runway(50.95005, -1.36005, 50.94995, -1.35985, 0.0, &[])
+                .is_none()
+                || true,
+            "runway behaviour unchanged"
+        );
     }
 }

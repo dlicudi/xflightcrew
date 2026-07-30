@@ -93,12 +93,27 @@ async fn fly(
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         if !got {
-            announce(
-                &voice,
-                Priority::Caution,
-                "No taxi-in clearance came back. Your aircraft.",
-            );
-            crate::blackbox::record("taxi_in", json!({ "event": "no_clearance" }));
+            // Say WHICH of the two failed. The tower sets `taxi_to_stand` on
+            // its reply and publishes the route separately, so a cleared
+            // aircraft with no route is a different fault from a silent
+            // frequency — and announcing "no clearance came back" when the
+            // clearance plainly did came out as a flat contradiction of what
+            // the pilot had just heard (EGHI 2026-07-30: "taxi to parking,
+            // this frequency", then sixty seconds of nothing, then that).
+            let cleared = crate::party_line::taxi_to_stand();
+            let (line, why) = if cleared {
+                (
+                    "The tower cleared us to parking but sent no route. Your aircraft.",
+                    "no_route",
+                )
+            } else {
+                (
+                    "No taxi-in clearance came back. Your aircraft.",
+                    "no_clearance",
+                )
+            };
+            announce(&voice, Priority::Caution, line);
+            crate::blackbox::record("taxi_in", json!({ "event": why, "cleared": cleared }));
             return;
         }
     }
