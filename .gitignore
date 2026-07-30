@@ -47,7 +47,7 @@ __pycache__/
 voice/voices/
 .venv-spk
 
-# Generated manual-retrieval indexes (x-copilot index) — rebuildable artifacts.
+# Generated manual-retrieval indexes (xvl index) — rebuildable artifacts.
 indexes/
 
 # Source PDFs for the indexes (FAA handbooks, POMs) — large, re-downloadable.

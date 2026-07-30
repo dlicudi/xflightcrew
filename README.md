@@ -1,8 +1,10 @@
-# x-copilot
+# XVoiceLayer
 
-A voice-commanded copilot for X-Plane. You speak a command, a **local** LLM picks
-the matching action, x-copilot writes the X-Plane dataref, and it reads the
-result back aloud.
+**The voice layer for X-Plane 12: copilot, ATC and cabin crew. Entirely local.**
+
+X-Plane simulates the aircraft and the world. It does not simulate the people.
+This does. You speak a command, a **local** LLM picks the matching action,
+XVoiceLayer writes the X-Plane dataref, and it reads the result back aloud.
 
 ```
 🎙️  "flaps ten"  →  whisper (STT)  →  LLM picks a tool  →  write dataref  →  "Roger, flaps ten."
@@ -13,7 +15,10 @@ confirms — hands stay on the controls, eyes stay outside. The whole loop is lo
 and real-time (ears, brain, and mouth all run on your machine; nothing is metered
 per call).
 
-> `x-copilot` is the working name. (Product name TBD.)
+Three voices share the one microphone: the **copilot** on the intercom, the
+**tower** on the radio, and the **cabin crew** down the back. Named after
+[XEarthLayer](https://github.com/samsoir/xearthlayer), which layers in what you
+see; this layers in what you hear.
 
 ## What it can do
 

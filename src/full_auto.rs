@@ -189,7 +189,7 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
 }
 
 fn announce(voice: &Option<Voice>, priority: Priority, line: &str) {
-    tracing::info!(target: "x_copilot::full_auto", spoke = %line, "copilot");
+    tracing::info!(target: "xvoicelayer::full_auto", spoke = %line, "copilot");
     if let Some(v) = voice {
         v.alert(priority, line.to_string());
     }

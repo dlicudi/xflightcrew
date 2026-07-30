@@ -316,7 +316,7 @@ pub fn run_autoland(
             let xp = XPlaneClient::new(base);
             ACTIVE.store(true, Ordering::SeqCst);
             let announce = |line: String, sev: Priority| {
-                tracing::info!(target: "x_copilot::autoland", spoke = %line, "copilot");
+                tracing::info!(target: "xvoicelayer::autoland", spoke = %line, "copilot");
                 if let Some(v) = &voice { v.alert(sev, line); }
             };
 
@@ -340,14 +340,14 @@ pub fn run_autoland(
             let rwy = match picked {
                 Ok(Some(r)) => r,
                 other => {
-                    tracing::warn!(target: "x_copilot::autoland", ?other, from=?(lat0, lon0), "no runway found");
+                    tracing::warn!(target: "xvoicelayer::autoland", ?other, from=?(lat0, lon0), "no runway found");
                     announce("No suitable runway within range. You have the aircraft.".into(), Priority::Warning);
                     ACTIVE.store(false, Ordering::SeqCst);
                     return;
                 }
             };
             tracing::info!(
-                target: "x_copilot::autoland",
+                target: "xvoicelayer::autoland",
                 icao = %rwy.icao, id = %rwy.id, dist_nm = rwy.dist_nm,
                 len_m = rwy.length_m, course = rwy.course_deg, elev = rwy.elev_ft,
                 "runway selected"
@@ -590,7 +590,7 @@ pub fn run_autoland(
                     rwy.icao, rwy.id, g.dist_nm, phase_word
                 ));
                 tracing::info!(
-                    target: "x_copilot::autoland",
+                    target: "xvoicelayer::autoland",
                     dist = g.dist_nm, alt, gp_alt = g.glidepath_alt_ft, vs = g.target_vs_fpm,
                     hdg = g.target_heading_deg, ias, radio = radio_ft, phase = ?g.phase,
                     "autoland"

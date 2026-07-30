@@ -1,4 +1,4 @@
-//! x-copilot (working name; product name: Roger)
+//! XVoiceLayer — the voice layer for X-Plane 12: copilot, ATC and cabin crew.
 //!
 //! The voice loop, end to end and fully local:
 //!   listen → whisper (STT) → local LLM picks one tool →
@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
 
     // Always log to a daily-rolling file. In TUI mode the stderr layer would
     // scribble over the dashboard, so it's omitted there (file only).
-    let file_appender = tracing_appender::rolling::daily("logs", "x-copilot.log");
+    let file_appender = tracing_appender::rolling::daily("logs", "xvoicelayer.log");
     let (file_writer, _log_guard) = tracing_appender::non_blocking(file_appender);
     // Every workspace crate, not just the crew: since the 2026-07-14 split the
     // world's tracing lives in `atc` and the Web API client's in `sim`, and a
@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
     // held for eight minutes had to be diagnosed by probing the live sim
     // instead of grepping (2026-07-27).
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "x_copilot=info,atc=info,sim=info".into());
+        .unwrap_or_else(|_| "xvoicelayer=info,atc=info,sim=info".into());
     let stderr_layer =
         (!tui).then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     tracing_subscriber::registry()
@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         build = env!("XCOPILOT_BUILD"),
-        "x-copilot starting"
+        "XVoiceLayer starting"
     );
 
     // Initial app mode: explicit env > the panel's saved pick > both. The
@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("transcribe") {
         let path = std::env::args()
             .nth(2)
-            .ok_or_else(|| anyhow!("usage: x-copilot transcribe <audio-file>"))?;
+            .ok_or_else(|| anyhow!("usage: xvl transcribe <audio-file>"))?;
         let text = transcribe_file(&config.whisper_model_path, &path)?;
         println!("{text}");
         return Ok(());
@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("onnx-info") {
         let path = std::env::args()
             .nth(2)
-            .ok_or_else(|| anyhow!("usage: x-copilot onnx-info <model.onnx>"))?;
+            .ok_or_else(|| anyhow!("usage: xvl onnx-info <model.onnx>"))?;
         println!("{}", tts_onnx::inspect(&path)?);
         return Ok(());
     }
@@ -215,28 +215,28 @@ async fn main() -> Result<()> {
         return analyze_commands();
     }
 
-    // `x-copilot index <aircraft_id> <manual.pdf...>` — build the manual index the
+    // `xvl index <aircraft_id> <manual.pdf...>` — build the manual index the
     // answer-only LLM grounds its answers in (see src/rag.rs).
     if std::env::args().nth(1).as_deref() == Some("index") {
         let args: Vec<String> = std::env::args().skip(2).collect();
         let Some((id, pdfs)) = args.split_first() else {
-            eprintln!("usage: x-copilot index <aircraft_id> <manual.pdf> [more.pdf...]");
+            eprintln!("usage: xvl index <aircraft_id> <manual.pdf> [more.pdf...]");
             std::process::exit(2);
         };
         if pdfs.is_empty() {
-            eprintln!("usage: x-copilot index <aircraft_id> <manual.pdf> [more.pdf...]");
+            eprintln!("usage: xvl index <aircraft_id> <manual.pdf> [more.pdf...]");
             std::process::exit(2);
         }
         let cfg = config::Config::from_env()?;
         return rag::build_index(&cfg.ollama_base_url, id, pdfs).await;
     }
 
-    // `x-copilot ask <aircraft_id> <question...>` — retrieval smoke test: print the
+    // `xvl ask <aircraft_id> <question...>` — retrieval smoke test: print the
     // manual chunks a question would pull, without the voice loop or the LLM.
     if std::env::args().nth(1).as_deref() == Some("ask") {
         let args: Vec<String> = std::env::args().skip(2).collect();
         let Some((id, q)) = args.split_first() else {
-            eprintln!("usage: x-copilot ask <aircraft_id> <question>");
+            eprintln!("usage: xvl ask <aircraft_id> <question>");
             std::process::exit(2);
         };
         let question = q.join(" ");
@@ -246,7 +246,7 @@ async fn main() -> Result<()> {
                 Some(hits) => println!("{hits}"),
                 None => println!("(no relevant excerpts above the score floor)"),
             },
-            None => println!("no index for '{id}' — build one with: x-copilot index {id} <pdfs>"),
+            None => println!("no index for '{id}' — build one with: xvl index {id} <pdfs>"),
         }
         return Ok(());
     }
@@ -298,7 +298,7 @@ async fn main() -> Result<()> {
         aircraft = %profile.display_name,
         mode = %config.listen_mode,
         llm = if config.llm_enabled { "answer-only (Ollama)" } else { "off (deterministic)" },
-        "starting x-copilot"
+        "starting XVoiceLayer"
     );
 
     // whisper model load is the one slow init — do it once, up front. Bias its
@@ -567,7 +567,7 @@ async fn main() -> Result<()> {
         // its own runtime; the dashboard renders on the main thread.
         let (tx, rx) = std::sync::mpsc::channel::<ui::Report>();
         let title = format!(
-            "x-copilot {} ({}) · {}",
+            "XVoiceLayer {} ({}) · {}",
             env!("CARGO_PKG_VERSION"),
             env!("XCOPILOT_BUILD"),
             profile.display_name
@@ -662,7 +662,7 @@ async fn main() -> Result<()> {
         Ok(())
     } else {
         println!(
-            "\n  x-copilot — {} ({}). Ctrl-C to quit.\n",
+            "\n  XVoiceLayer — {} ({}). Ctrl-C to quit.\n",
             profile.display_name, config.listen_mode
         );
         let mut reporter = Reporter::plain();
@@ -1252,7 +1252,7 @@ async fn run_session(
         tracing::error!("checklist load failed: {e:#}; running without checklists");
         Vec::new()
     });
-    // The aircraft's manual index (built with `x-copilot index <id> <pdfs>`), for
+    // The aircraft's manual index (built with `xvl index <id> <pdfs>`), for
     // grounding the answer-only LLM in the POM. Absent = answers from state alone.
     let mut manual_index = rag::Index::load(&profile.id);
     if manual_index.is_some() {
@@ -1612,7 +1612,7 @@ async fn run_session(
                         // The copilot transmits (its own voice), then the tower.
                         // Both sides logged so the full ATC transcript shows in
                         // the log, not just the panel.
-                        tracing::info!(target: "x_copilot::radio", copilot = %call, "tx");
+                        tracing::info!(target: "xvoicelayer::radio", copilot = %call, "tx");
                         say(
                             &voice,
                             &reporter,
@@ -1624,7 +1624,7 @@ async fn run_session(
                             .await
                         {
                             if !reply.is_empty() {
-                                tracing::info!(target: "x_copilot::radio", station = %who.tag(), reply = %reply, "rx");
+                                tracing::info!(target: "xvoicelayer::radio", station = %who.tag(), reply = %reply, "rx");
                                 reporter
                                     .log(ui::LogKind::Readback, format!("{}: {reply}", who.tag()));
                                 voice.say_station(Priority::Readback, who, &reply);
@@ -3446,7 +3446,7 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// Transcribe an audio file with whisper, for `x-copilot transcribe <file>`.
+/// Transcribe an audio file with whisper, for `xvl transcribe <file>`.
 /// Decodes/resamples to 16 kHz mono via macOS `afconvert` (handles mp3/m4a/wav/…
 /// — whisper needs 16 kHz mono), reads the PCM, and returns the text. Reuses the
 /// same STT model the live loop uses, so no extra model download.
@@ -3456,7 +3456,7 @@ fn load_wav_16k(input: &str) -> Result<Vec<f32>> {
     if !std::path::Path::new(input).exists() {
         return Err(anyhow!("no such file: {input}"));
     }
-    let wav = std::env::temp_dir().join("x-copilot-16k.wav");
+    let wav = std::env::temp_dir().join("xvoicelayer-16k.wav");
     let status = Command::new("afconvert")
         .args([
             input,
@@ -3511,7 +3511,7 @@ fn analyze_commands() -> Result<()> {
         let is_log = p
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("x-copilot.log"));
+            .is_some_and(|n| n.starts_with("xvoicelayer.log"));
         if !is_log {
             continue;
         }

@@ -160,7 +160,7 @@ static void load_fms_route() {
         XPLMSetDestinationFMSFlightPlanEntry(xplm_Fpl_Pilot_Primary, 0);
     }
     char msg[96];
-    std::snprintf(msg, sizeof msg, "x-copilot plugin: loaded %d FMS waypoints\n", idx);
+    std::snprintf(msg, sizeof msg, "XVoiceLayer plugin: loaded %d FMS waypoints\n", idx);
     XPLMDebugString(msg);
 }
 

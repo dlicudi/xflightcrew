@@ -354,7 +354,7 @@ pub fn start(base_url: String, voice: Option<Voice>, plan: Plan) {
 }
 
 fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
-    tracing::info!(target: "x_copilot::procedure", spoke = %line, "copilot");
+    tracing::info!(target: "xvoicelayer::procedure", spoke = %line, "copilot");
     if let Some(v) = voice {
         v.alert(priority, line.to_string());
     }

@@ -1,4 +1,4 @@
-# Build the x-copilot X-Plane plugin (macOS, universal arm64 + x86_64).
+# Build the XVoiceLayer X-Plane plugin (macOS, universal arm64 + x86_64).
 #
 # Prereq: the X-Plane SDK (free, developer.x-plane.com/sdk) extracted to plugin/SDK
 # so that plugin/SDK/CHeaders/XPLM/*.h and plugin/SDK/Libraries/Mac/XPLM.framework

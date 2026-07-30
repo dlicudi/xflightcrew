@@ -1265,7 +1265,7 @@ mod tests {
     }
 
     /// **Checklist-vocabulary battery.** The product model is "the pilot reads a
-    /// paper checklist aloud and x-copilot executes each line", so every
+    /// paper checklist aloud and XVoiceLayer executes each line", so every
     /// actionable item on a real Cessna 172 checklist must be a working command.
     /// The common verbs (mixture/flaps/lights) are covered by the clean battery;
     /// this targets the checklist-specific *vocabulary* that the tool

@@ -1,5 +1,5 @@
-// x-copilot X-Plane plugin — a virtual push-to-talk plus a slick in-sim status
-// panel (Dear ImGui) for the x-copilot voice assistant.
+// XVoiceLayer X-Plane plugin — a virtual push-to-talk plus a slick in-sim status
+// panel (Dear ImGui) for the XVoiceLayer voice assistant.
 //
 // PTT: command `xcopilot/ptt` (bind to a button/key) drives the readable dataref
 // `xcopilot/ptt_active` (1 while held). The app captures the mic only while it's
@@ -16,7 +16,7 @@
 // station in VHF range, click a frequency to tune COM1), and Settings (live
 // switches, e.g. the LLM-fallback dataref `xcopilot/llm_enabled`, -1 auto
 // / 0 off / 1 on, which the app polls each utterance).
-// Toggle via Plugins → x-copilot.
+// Toggle via Plugins → XVoiceLayer.
 //
 // Layout: this file is only the plugin lifecycle. The dataref/command surface
 // lives in drefs.cpp, the ImGui panel in panel.cpp, and the FMS mailbox plus
@@ -53,7 +53,7 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
 
     char started[160];
     std::snprintf(started, sizeof started,
-                  "x-copilot plugin: started, build %s, AIRAC %s (ptt + ImGui status panel)\n",
+                  "XVoiceLayer plugin: started, build %s, AIRAC %s (ptt + ImGui status panel)\n",
                   XCOPILOT_BUILD,
                   fms::airac_cycle().empty() ? "unknown" : fms::airac_cycle().c_str());
     XPLMDebugString(started);

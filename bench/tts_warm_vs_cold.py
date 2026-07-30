@@ -5,7 +5,7 @@ Usage (from repo root; needs models/en_US-amy-medium.onnx + espeak-ng on PATH):
     python3 -m venv /tmp/ttsbench && /tmp/ttsbench/bin/pip install onnxruntime numpy
     /tmp/ttsbench/bin/python bench/tts_warm_vs_cold.py
 
-Measure the TTS architecture variable that actually matters for x-copilot:
+Measure the TTS architecture variable that actually matters for XVoiceLayer:
 warm in-process session (load once, reuse) vs cold reload-per-utterance
 (what a subprocess piper backend pays every call).
 

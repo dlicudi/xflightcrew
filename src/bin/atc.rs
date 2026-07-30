@@ -1,5 +1,5 @@
 //! `atc`: the air traffic side of the radio, a separate process from the
-//! copilot on purpose. The two share code (via the `x_copilot` lib target),
+//! copilot on purpose. The two share code (via the `xvoicelayer` lib target),
 //! not state: both watch the same simulator through the Web API, and the
 //! tuned COM1 frequency decides who answers. This process is structurally
 //! READ-ONLY toward the simulator: every dataref access goes through
@@ -9,7 +9,7 @@
 //! Services, each on its own apt.dat frequency:
 //!   - Tower (row 1054): two-way. Key the mic (Enter in this terminal to key,
 //!     Enter again to transmit), speak a request, get a clearance back from
-//!     the deterministic state machine in [`x_copilot::tower`].
+//!     the deterministic state machine in [`xvoicelayer::tower`].
 //!   - ATIS (row 1050, or XCOPILOT_ATIS_FREQ): a looping broadcast built from
 //!     live sim weather. Only exists where the data (or the env) says so —
 //!     it never squats on the tower frequency, and it respects the audio
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use x_copilot::{
+use xvoicelayer::{
     atis, config::Config, datarefs, mic, nav, phrase, stt, tower, tts, xplane::XPlaneClient,
 };
 

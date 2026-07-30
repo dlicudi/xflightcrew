@@ -360,7 +360,7 @@ async fn fly_to(
     let vs_mode = mode_engaged(ctx, VS_STATUS).await;
     let alt_hold_mode = mode_engaged(ctx, ALT_HOLD_STATUS).await;
     tracing::info!(
-        target: "x_copilot::autopilot",
+        target: "xvoicelayer::autopilot",
         movement,
         commanded_fpm = signed,
         vs_dial,
@@ -529,7 +529,7 @@ fn capture_at_altitude(
                         // settles consistently off-target, tune CAPTURE_LEAD_FT from
                         // (alt_at_capture - target) and the settled altitude.
                         tracing::info!(
-                            target: "x_copilot::autopilot",
+                            target: "xvoicelayer::autopilot",
                             target_alt = target,
                             alt_at_capture = alt,
                             was_climb,

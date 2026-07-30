@@ -24,17 +24,21 @@ anyhow = "1"
 tracing = "0.1"
 
 [package]
-name = "x-copilot"
+# The package is the product; the binary is the short form you type. The crate
+# identifier that follows from this name (`xvoicelayer`) is also the tracing
+# target prefix — if you ever change it, change the RUST_LOG default in
+# src/main.rs with it or every crew-side log line silently disappears.
+name = "xvoicelayer"
 version = "0.1.0"
 edition = "2021"
 # Plain `cargo run` means the copilot; the atc binary is opt-in (--bin atc).
-default-run = "x-copilot"
-description = "A voice-commanded copilot for X-Plane (working name; product name: Roger)"
-license = "LicenseRef-proprietary"
+default-run = "xvl"
+description = "The voice layer for X-Plane 12: copilot, ATC and cabin crew, entirely local"
+license.workspace = true
 publish = false
 
 [[bin]]
-name = "x-copilot"
+name = "xvl"
 path = "src/main.rs"
 
 # The old standalone-ATC dev skeleton: tower FSM + ATIS glue over the atc

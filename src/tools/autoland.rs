@@ -1,6 +1,6 @@
 //! `autoland` — native emergency autoland (no external plugin).
 //!
-//! x-copilot owns the *upset recovery* (`recover`); this flies a full approach and
+//! XVoiceLayer owns the *upset recovery* (`recover`); this flies a full approach and
 //! landing to the nearest suitable runway, entirely in-process: it parses X-Plane's
 //! `apt.dat` for the runway ([`crate::autoland`]), then an AP-first control loop
 //! tracks the final approach course and 3° glidepath, lowers gear/flaps, and eases

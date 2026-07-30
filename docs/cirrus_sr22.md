@@ -1,11 +1,11 @@
 # Cirrus SR22 — voice command reference
 
-Everything you can say (or type) to x-copilot when flying the stock X-Plane
+Everything you can say (or type) to XVoiceLayer when flying the stock X-Plane
 **Cirrus SR22** (Laminar). The command surface is per-airframe — this is the set
 the SR22 profile exposes ([profiles/cirrus_sr22.yaml](../profiles/cirrus_sr22.yaml)).
 
 How it works: you speak (or type in the TUI), a local LLM picks one curated
-tool, x-copilot writes the dataref, then **reads back the actual result**
+tool, XVoiceLayer writes the dataref, then **reads back the actual result**
 ("Roger, flaps fifty"). It confirms the *action*, not the intent.
 
 - **Compound commands** work: "flaps fifty and throttle seventy" runs both.
@@ -161,7 +161,7 @@ clear runway → shutdown.*
 
 ## Safety gates
 
-x-copilot refuses (and explains) rather than do something unsafe:
+XVoiceLayer refuses (and explains) rather than do something unsafe:
 
 - **Flap Vfe** — flaps 50% need < 150 KIAS; full needs < 110 KIAS. Too fast →
   refused ("118 knots is above the 110-knot limit for flaps full").

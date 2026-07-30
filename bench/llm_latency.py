@@ -5,7 +5,7 @@ Usage (needs a live `ollama serve`; from repo root):
     python3 bench/llm_latency.py qwen3:8b
     python3 bench/llm_latency.py qwen3:8b qwen2.5:7b-instruct <mlx-model-tag>
 
-Measures the latency variable that actually matters for x-copilot: the
+Measures the latency variable that actually matters for XVoiceLayer: the
 per-command cost of one tool-pick request, broken into **prefill** (processing
 the prompt) vs **generation**, with a realistic, app-sized payload — ~32 tool
 schemas + the system prompt + a live state line, ~3k tokens. Prefill of that

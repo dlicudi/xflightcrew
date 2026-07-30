@@ -1,16 +1,35 @@
-# x-copilot
+# XVoiceLayer
 
-A voice-commanded copilot for X-Plane. The pilot speaks a command, an LLM picks
-the matching action, the agent writes the X-Plane dataref, and the copilot reads
-the action back aloud.
+The voice layer for X-Plane 12: copilot, ATC and cabin crew, entirely local. The
+pilot speaks a command, an LLM picks the matching action, the agent writes the
+X-Plane dataref, and the copilot reads the action back aloud.
 
 ```
 🎙️  "Flaps up"   →  STT  →  LLM picks a tool  →  write dataref  →  TTS "Flaps up!"
 ```
 
-`x-copilot` is the **working name** (scaffolding). Naming is **parked**
-(2026-07-11); the leading candidate is **Roger** — it encodes the whole thesis:
-you speak, it acts, it confirms ("Roger, flaps up"). Rename before going public.
+**Named 2026-07-30** (the working title `XVoiceLayer` is retired, and so is the
+long-parked naming question). The name follows
+[XEarthLayer](https://github.com/samsoir/xearthlayer), a sibling X-Plane 12
+project on the same stack (Rust, open source, driven over the Web API): it
+layers in what you SEE, this layers in what you HEAR. "Voice" is the honest
+through-line, because STT, TTS, the copilot, the tower and the cabin crew have
+nothing in common except that they are all speech in both directions.
+
+Three names survive the rename ON PURPOSE, because they are wire contracts, not
+branding, and changing them breaks live installs for nothing: the `xcopilot/*`
+DATAREF namespace (the app and the plugin agree on these strings), the
+`XCOPILOT_*` ENV VARS (the pilot's own `.env` and `prefs.json`), and the plugin
+binary `xcopilot.xpl` (rename it and X-Plane happily loads BOTH copies, which
+double-registers every dataref). The GitHub repo IS renamed to
+`dlicudi/xvoicelayer` (2026-07-30; the old URL redirects, so stale clones keep
+working), but the LOCAL directory is deliberately still `~/GitHub/x-copilot`:
+renaming it must also move `~/.claude/projects/-Users-duanelicudi-GitHub-x-copilot`
+(25 memories and the session history are keyed on that path) and fix
+`.claude/settings*.json` plus `~/GitHub/rustdecks/CLAUDE.md:34`. The Rust crate
+identifier DID change, to `xvoicelayer` — see the tracing-filter warning in the
+battle-test section, since a stale filter silently drops every crew-side log
+line.
 
 ## Relationship to Horizon
 
@@ -19,10 +38,10 @@ and the distinction is the whole point:
 
 - **Horizon = instructor.** One-way, grades you, and *deliberately never touches
   the controls*. That's what teaching is.
-- **x-copilot = crew.** Two-way, *acts on the aircraft* by writing datarefs.
+- **XVoiceLayer = crew.** Two-way, *acts on the aircraft* by writing datarefs.
   Different trust model, failure modes, and UX. Merging them would muddy both.
 
-Horizon is Python; x-copilot is Rust, so code isn't lifted directly — but two
+Horizon is Python; XVoiceLayer is Rust, so code isn't lifted directly — but two
 patterns port over conceptually: its X-Plane Web API client (~30 lines of HTTP)
 and its "shell out to the `piper` binary" TTS trick.
 
@@ -514,8 +533,33 @@ read feet coming OFF as a press) plus a 4-frame sustained-deflection
 requirement. The taxi guide keeps
 narrating over it — one voice, the copilot calling its own turns. Laws
 battle-test as plain `cargo test`; events blackbox as `"kind":"autotaxi"`.
-Steering on a castoring nosewheel (SR22) is untested — yoke_heading does
-little there at low speed; differential-brake steering is future work.
+Steering on a castoring nosewheel is differential BRAKE
+(`brake_steer_split`), because yoke_heading has nothing to work with there —
+no nosewheel bite and no prop wash over the rudder. It shipped 2026-07-28
+writing the stock `cockpit2/controls/*_brake_ratio` over REST, which is a
+NO-OP whenever a toe-brake axis is assigned: XP12 re-drives those ratios from
+the pilot's hardware every frame, exactly as the symmetric taxi_brake channel
+had already learned in July. Probed at a Southampton stand (2026-07-30) a
+PATCH of 0.25 read back 0.0000 within 400 ms bare, and held 0.2500 under
+`override_toe_brakes` — so the SF50 spent every taxi with its only real
+control surface disconnected, and the blackbox shows it: the same command
+magnitude that gave -4.93 deg/s in the first 180 m returned -0.27 for the
+remaining 700, cross-track wandering to 13.9 m in a limit cycle that never
+damped. Every brake-steer tuning note from the 2026-07-28/29 sorties
+(`BRAKE_STEER_MAX` 0.25 vs 0.16, `BRAKE_STEER_SAT` 0.6 and its "starvation"
+diagnosis) was therefore tuning a number that never reached the aircraft and
+is worth re-deriving. The split now goes through plugin channels
+(`xcopilot/taxi_brake_l` / `_r`) which hold the override at frame rate, and
+the plugin arbitrates them against the governor's stopping brake PER WHEEL —
+one owner, since two writers on one dataref is the whole bug. The app writes
+them EVERY tick: the channel is a heartbeat that expires in a second, so the
+old change-gate (fine against a persistent dataref) would drop the brake in
+the middle of a turn, which is exactly where a command sits still. All three
+control writes share one `tokio::join!`, so the tick still costs one round
+trip. Not yet flown — the sim was shut down before the live re-test. A brake
+YIELD is still future work: the override deafens the pilot's toe brakes while
+it is up, and only the 1 s expiry frees them, where steering has
+`steer_yield`.
 
 Depth (added 2026-07-20, same day): **auto takeoff** — "take off for me" /
 "your takeoff" / bare "take off" (first/second-person shapes ONLY; the
@@ -893,7 +937,7 @@ posts `s.action(same line)` double-writes the chat (the Jerez relocation
 note; gyro-sync and autoland hit it first). Mirror OR action, never both.
 
 **The panel is an automation instrument now** (2026-07-29 revamp). Tabs are
-Flight | Log | ATC | Route | Settings — Flight first and default: the live
+Flight | Transcript | ATC | Route | Settings — Flight first and default: the live
 strip, an automation status well fed by `xcopilot/status/auto` (composed by
 [src/auto_status.rs](src/auto_status.rs): marker byte '1' = cancellable, then
 one line per active manager, primary as "NAME|stage"; `full_auto::event()`
@@ -954,7 +998,9 @@ the sim's apt.dat); and the in-sim soak checklist
 blackboxed as a `"kind":"atc"` event — mine `logs/blackbox.jsonl` after each
 flight. Safety property: a mishear may earn "say again", never a clearance.
 The tracing filter must name EVERY workspace crate
-([src/main.rs](src/main.rs) defaults to `x_copilot=info,atc=info,sim=info`):
+([src/main.rs](src/main.rs) defaults to `xvoicelayer=info,atc=info,sim=info` —
+the crew crate's identifier follows the Cargo package name, so a package rename
+must move this default with it):
 after the crate split a crew-only default silently dropped the whole world
 side, so "release watch armed" and "wake clock started" never reached
 `logs/` and the Heathrow hold above had to be diagnosed by probing the live
@@ -1068,11 +1114,31 @@ is just more tools. Don't over-build the framework before that loop works.
 
 ## Licensing
 
-Direction decided, exact license **parked** (2026-07-11): this will be **open
-source, not commercial** — the earlier maybe-commercial framing is dead. No
-LICENSE file yet (repo is private, so the interim all-rights-reserved default is
-harmless). The parked choice is between dual `MIT OR Apache-2.0` (Rust
-convention, Apache patent grant, maximum adoption) and `GPL-3.0-or-later`
-(copyleft — stops payware bundling without giving back; matches Welly's ATC).
-Sole-author means relicensing stays free until outside contributions are
-accepted — decide before merging any.
+**`GPL-3.0-or-later`** (2026-07-30, `LICENSE` at the root, declared once in
+`[workspace.package]` and inherited by every crate). Two things are now settled
+and not open questions: this is **open source, never commercial**, and it is
+**X-Plane only** — no MSFS port, whatever the incumbents' platform reach. Only
+the product NAME stays parked.
+
+Copyleft over the dual `MIT OR Apache-2.0` the Rust convention would suggest,
+because the threat here is specific and demonstrated: the flight-sim ecosystem
+is payware-dominated, and Skylink Simulations sells this exact product shape
+(deterministic ATC + voice copilot + cabin crew) for $49. Under a permissive
+license the tower FSM, the taxi planner, the wake-separation logic and the
+ground-drive laws could be lifted straight into closed payware. The usual
+argument FOR permissive is commercial adoption, which is a LIBRARY concern —
+this is an end-user application, so it costs us nothing to refuse. It is also
+the reversible direction: a sole author can always relicense GPL code as
+permissive later, but MIT grants already handed out can never be clawed back.
+Two bonuses: `3.0` specifically because several deps are Apache-2.0 (compatible
+with GPLv3, NOT GPLv2), and matching Welly's ATC now makes his IFR/live-ATIS
+code legally liftable, where the old rule was patterns-yes-code-no.
+
+The linking question people assume blocks this doesn't: `plugin/SDK/license.txt`
+is plain MIT/BSD, not a proprietary SDK license — as are Dear ImGui (MIT) and
+ImgWindow (BSD-3-Clause); B612 stays OFL. All GPL-compatible, all keep their own
+terms. Sole-author relicensing stays free only until outside contributions are
+merged — settle any change of heart BEFORE accepting a PR. One consequence to
+keep in mind: `crates/atc` is built for extraction, and GPL means any future
+consumer of it must be GPL too — `LGPL-3.0` on that one crate is the escape
+hatch if it should ever be broadly embeddable, deliberately not done now.

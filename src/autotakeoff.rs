@@ -635,7 +635,7 @@ pub fn start(base_url: String, voice: Option<Voice>, p: Params) {
 }
 
 fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
-    tracing::info!(target: "x_copilot::autotakeoff", spoke = %line, "copilot");
+    tracing::info!(target: "xvoicelayer::autotakeoff", spoke = %line, "copilot");
     if let Some(v) = voice {
         v.alert(priority, line);
     }

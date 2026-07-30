@@ -818,7 +818,7 @@ pub fn start(base_url: String, voice: Option<Voice>, p: Params) {
 fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
     // Log every spoken line so the auto-flight narration shows up in the app
     // log, not just through the speakers (background loops have no reporter).
-    tracing::info!(target: "x_copilot::circuit", spoke = %line, "copilot");
+    tracing::info!(target: "xvoicelayer::circuit", spoke = %line, "copilot");
     if let Some(v) = voice {
         v.alert(priority, line.to_string());
     }

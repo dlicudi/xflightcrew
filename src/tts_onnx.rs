@@ -201,7 +201,7 @@ impl OnnxTts {
     /// stitched with a short pause — one giant pass comes out rushed.
     pub fn speak(&mut self, text: &str) -> Result<()> {
         let samples = self.synth_chunked(text)?;
-        let wav = std::env::temp_dir().join("x-copilot-onnx.wav");
+        let wav = std::env::temp_dir().join("xvoicelayer-onnx.wav");
         write_wav(&wav, &samples, self.sample_rate)?;
         crate::tts::play(&wav)
     }
@@ -406,7 +406,7 @@ impl KokoroTts {
             chars = text.len(),
             "tts synth"
         );
-        let wav = std::env::temp_dir().join("x-copilot-kokoro.wav");
+        let wav = std::env::temp_dir().join("xvoicelayer-kokoro.wav");
         write_wav(&wav, &samples, KOKORO_SR)?;
         crate::tts::play(&wav)
     }
@@ -671,7 +671,7 @@ mod tests {
         );
 
         // Write one out so the audio can be ear-checked.
-        let wav = std::env::temp_dir().join("x-copilot-onnx-test.wav");
+        let wav = std::env::temp_dir().join("xvoicelayer-onnx-test.wav");
         let s = tts.synth("Roger, flaps up.").unwrap();
         write_wav(&wav, &s, tts.sample_rate).unwrap();
         println!("  wrote sample: {}", wav.display());

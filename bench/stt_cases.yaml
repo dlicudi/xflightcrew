@@ -1,4 +1,4 @@
-# STT accuracy cases for `x-copilot stt-eval`.
+# STT accuracy cases for `xvl stt-eval`.
 #
 # Each case is spoken (`say`), then checked two ways: word error rate against the
 # transcript, and — when `tool`/`args` are given — whether the deterministic

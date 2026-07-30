@@ -1,6 +1,6 @@
-# x-copilot X-Plane plugin
+# XVoiceLayer X-Plane plugin
 
-A tiny native plugin that gives x-copilot a **dedicated push-to-talk** inside the
+A tiny native plugin that gives XVoiceLayer a **dedicated push-to-talk** inside the
 sim. It registers:
 
 - a command **`xcopilot/ptt`** — bind it to any joystick/HOTAS button or key in
@@ -8,7 +8,7 @@ sim. It registers:
 - a read-only dataref **`xcopilot/ptt_active`** — `1` while that command is held,
   `0` otherwise.
 
-The x-copilot app polls `xcopilot/ptt_active` over the X-Plane Web API and opens
+The XVoiceLayer app polls `xcopilot/ptt_active` over the X-Plane Web API and opens
 the mic only while it's `1`. Unlike `sim/operation/contact_atc_ptt`, this does
 **not** key the radio, and unlike a global keyboard hook it needs **no macOS
 Input-Monitoring permission** — the button press is read by X-Plane itself.
@@ -45,7 +45,7 @@ make install XPLANE="/path/to/X-Plane 12"
 This copies the `.xpl` to `<X-Plane 12>/Resources/plugins/xcopilot/mac_x64/`.
 Restart X-Plane, then bind a button to the `xcopilot/ptt` command.
 
-## Wire up x-copilot
+## Wire up XVoiceLayer
 
 Point the app at the dataref:
 

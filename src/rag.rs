@@ -1,7 +1,7 @@
 //! Manual retrieval — index the aircraft's operating manuals so the answer-only
 //! LLM can ground its answers in the actual POM.
 //!
-//! `x-copilot index <aircraft_id> <pdf...>` extracts each PDF's text (`pdftotext`),
+//! `xvl index <aircraft_id> <pdf...>` extracts each PDF's text (`pdftotext`),
 //! chunks it, embeds every chunk with a local Ollama embedding model, and writes
 //! `indexes/<aircraft_id>.json`. At question time the session loads the active
 //! aircraft's index and [`Index::retrieve`]s the best chunks by cosine similarity;
@@ -25,7 +25,7 @@ pub fn embed_model() -> String {
 /// Weather, Risk Management, Weight & Balance). Consulted alongside the active
 /// aircraft's POM index at question time, so "what is class B airspace" gets an
 /// answer even when no POM covers it. Built like any other index:
-/// `x-copilot index general_aviation manuals/faa/*.pdf`.
+/// `xvl index general_aviation manuals/faa/*.pdf`.
 pub const GENERAL_ID: &str = "general_aviation";
 
 /// Where an aircraft's index lives, relative to the working dir.
