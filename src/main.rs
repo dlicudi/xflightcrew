@@ -87,8 +87,18 @@ async fn main() -> Result<()> {
     // clock started" were invisible in flight logs, so a Heathrow departure
     // held for eight minutes had to be diagnosed by probing the live sim
     // instead of grepping (2026-07-27).
+    // BOTH names for the crew, and they are not the same thing: a log line's
+    // default target is `module_path!()`, which for code in a BINARY is the
+    // BIN name (`xvl`) and for code in the lib is the PACKAGE name
+    // (`xvoicelayer`). Naming only the package silently dropped all 158
+    // default-target sites in this file and its modules — the startup/build
+    // line included, so the one documented way to tell which build is flying
+    // ("check the build= line") reported nothing, while the explicit
+    // `target: "xvoicelayer::..."` lines kept arriving and made the log look
+    // healthy (2026-07-30, found by grepping for a startup line that was
+    // never there). Renaming the binary must move this default with it.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "xvoicelayer=info,atc=info,sim=info".into());
+        .unwrap_or_else(|_| "xvoicelayer=info,xvl=info,atc=info,sim=info".into());
     let stderr_layer =
         (!tui).then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
     tracing_subscriber::registry()

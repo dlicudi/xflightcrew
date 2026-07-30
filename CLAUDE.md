@@ -1005,9 +1005,13 @@ the sim's apt.dat); and the in-sim soak checklist
 blackboxed as a `"kind":"atc"` event — mine `logs/blackbox.jsonl` after each
 flight. Safety property: a mishear may earn "say again", never a clearance.
 The tracing filter must name EVERY workspace crate
-([src/main.rs](src/main.rs) defaults to `xvoicelayer=info,atc=info,sim=info` —
-the crew crate's identifier follows the Cargo package name, so a package rename
-must move this default with it):
+([src/main.rs](src/main.rs) defaults to
+`xvoicelayer=info,xvl=info,atc=info,sim=info` — and the crew needs BOTH of its
+names, because a line's default target is `module_path!()`, which is the BIN
+name for code in a binary and the PACKAGE name for code in the lib. Naming only
+the package dropped all 158 default-target sites, the startup/build line
+included, while the explicit `target: "xvoicelayer::..."` lines kept arriving
+and made the log look healthy, 2026-07-30. Renaming either must move this):
 after the crate split a crew-only default silently dropped the whole world
 side, so "release watch armed" and "wake clock started" never reached
 `logs/` and the Heathrow hold above had to be diagnosed by probing the live
