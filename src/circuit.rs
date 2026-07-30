@@ -53,6 +53,9 @@ const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
 const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
 const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
+/// Gear handle — the circuit lowers it turning base (autoland's own
+/// extension only fires inside 6 nm, which this hands over well inside of).
+const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 /// The thrust lever THIS airframe obeys — not always the stock one (the
 /// Citation X tracks `throttle_jet_rev_ratio`, so every write to
 /// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
@@ -1014,6 +1017,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // --- Phase 1: the takeoff (the proven loop). Arm it, then wait for it to
     // hand off. It clears its own ACTIVE at the thousand-foot handoff — or on a
     // reject, which we tell apart by how high we ended up.
+    // Read before the move: `p.takeoff` goes into the takeoff loop below, and
+    // the base leg needs to know whether this airframe HAS gear to lower.
+    let retractable_gear = p.takeoff.retract_gear;
     autotakeoff::start(base_url.clone(), voice.clone(), p.takeoff);
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1357,6 +1363,24 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 ));
             }
             Leg::Base => {
+                // GEAR DOWN, turning base. Nothing in the circuit lowered it,
+                // because extension lived only in autoland's "inside 6 nm" —
+                // and the circuit does not hand over until the final turn, well
+                // inside that. So a retractable airframe flew the whole
+                // downwind and base at pattern speed with the wheels up, and
+                // the aircraft's OWN gear warning called it, correctly, all the
+                // way round (SF50 at EGHI, heard live 2026-07-30).
+                //
+                // Base is a beat later than the real-world call (abeam the
+                // touchdown point, on downwind), and deliberately so: it is the
+                // moment this loop already owns, it is still well ahead of the
+                // approach, and it keeps the gear out of the pattern's speed
+                // and turn logic. Autoland's own extension stays as the
+                // backstop for every path that does not come through here.
+                if retractable_gear {
+                    let _ = xp.set_float(GEAR_HANDLE, 1.0).await;
+                    alert(&voice, Priority::Advisory, "Gear down.");
+                }
                 // Turn base and start down — the VS law above flies the
                 // descent once the leg target drops to the handoff height.
                 alert(&voice, Priority::Advisory, "Base. Descending.");

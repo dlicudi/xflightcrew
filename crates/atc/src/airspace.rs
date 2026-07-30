@@ -58,26 +58,62 @@ impl Airspace {
     }
 
     /// How the copilot says it: "restricted area R 164". Dashes swapped for
-    /// spaces (TTS), the parenthetical location dropped.
+    /// spaces (TTS).
+    ///
+    /// The OpenAir `AN` line is `<ident> (<description>)`, and WHICH half is
+    /// speakable depends on the ident. A real designator is what a pilot says
+    /// — "restricted area R 521" — so `R-521 (LUCAS HEIGHTS ANSTO RESEARCH R)`
+    /// keeps the ident and drops the rest. But plenty of idents are squashed
+    /// words, and reading those aloud is gibberish: `W-METRSEARCH (MET
+    /// RESEARCH FLTS AREA ALPHA)` came out as "danger area W METRSEARCH", the
+    /// hyphen having become a space on the way (seen in the transcript,
+    /// 2026-07-30). There the parenthetical IS the name.
     pub fn spoken_name(&self) -> String {
         let kind = match self.class {
             'P' => "prohibited area",
             'Q' => "danger area",
             _ => "restricted area",
         };
-        let ident = self
-            .name
-            .split('(')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .replace('-', " ");
-        if ident.is_empty() {
-            kind.to_string()
-        } else {
-            format!("{kind} {ident}")
+        let (ident_raw, desc) = match self.name.split_once('(') {
+            Some((i, rest)) => (i.trim(), rest.split_once(')').map_or(rest, |(d, _)| d).trim()),
+            None => (self.name.trim(), ""),
+        };
+        let say = |s: &str| s.replace('-', " ").split_whitespace().collect::<Vec<_>>().join(" ");
+        let ident = say(ident_raw);
+        let described = say(desc);
+        match () {
+            _ if is_designator(ident_raw) && !ident.is_empty() => format!("{kind} {ident}"),
+            _ if !described.is_empty() => format!("{kind} {described}"),
+            _ if !ident.is_empty() => format!("{kind} {ident}"),
+            _ => kind.to_string(),
         }
     }
+}
+
+/// Does this OpenAir ident read as a real airspace DESIGNATOR — the thing a
+/// pilot actually says, like `R-521`, `D-138`, `EG D513`?
+///
+/// The test is simply whether every letter run in it is short. Designators are
+/// a letter or two beside a number; the idents that must NOT be spoken are
+/// squashed words, and `METRSEARCH` fails on its ten-letter run where `R` and
+/// `EG` pass. A digit is required too, so a bare word can never qualify.
+fn is_designator(ident: &str) -> bool {
+    let ident = ident.trim();
+    if ident.is_empty() || !ident.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let mut run = 0usize;
+    for c in ident.chars() {
+        if c.is_ascii_alphabetic() {
+            run += 1;
+            if run > 3 {
+                return false;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    true
 }
 
 /// "36:09:13 N" / "005:28:58 W" → signed degrees. Also accepts D:M forms.
@@ -345,5 +381,52 @@ mod tests {
             first_conflict(&spaces, &inside, 9000.0).is_none(),
             "above the band"
         );
+    }
+
+    /// The OpenAir `AN` line is `<ident> (<description>)` and only ONE of the
+    /// two is speakable, depending on the ident.
+    ///
+    /// `W-METRSEARCH (MET RESEARCH FLTS AREA ALPHA)` was announced as "danger
+    /// area W METRSEARCH" — the hyphen became a space and the readable half
+    /// was thrown away (transcript, 2026-07-30). A real designator like R-521
+    /// must still win, because that IS what a pilot says.
+    #[test]
+    fn the_speakable_half_of_an_airspace_name_wins() {
+        let space = |class: char, name: &str| Airspace {
+            class,
+            name: name.to_string(),
+            floor_ft: 0.0,
+            ceiling_ft: 5000.0,
+            poly: vec![],
+        };
+
+        // A designator: keep it, dashes to spaces.
+        assert_eq!(
+            space('R', "R-521        (LUCAS HEIGHTS ANSTO RESEARCH R)").spoken_name(),
+            "restricted area R 521"
+        );
+        // A squashed word: the parenthetical is the name.
+        assert_eq!(
+            space('Q', "W-METRSEARCH (MET RESEARCH FLTS AREA ALPHA)").spoken_name(),
+            "danger area MET RESEARCH FLTS AREA ALPHA"
+        );
+        // Never emits the gibberish that started this.
+        assert!(!space('Q', "W-METRSEARCH (MET RESEARCH FLTS AREA ALPHA)")
+            .spoken_name()
+            .contains("METRSEARCH"));
+
+        // No parenthetical at all: whatever we have is better than nothing.
+        assert_eq!(space('P', "P-56").spoken_name(), "prohibited area P 56");
+        assert_eq!(space('Q', "DANGER ZONE").spoken_name(), "danger area DANGER ZONE");
+        // Nothing usable: the class alone, never a dangling "area ".
+        assert_eq!(space('Q', "   ").spoken_name(), "danger area");
+
+        // The designator test itself.
+        for d in ["R-521", "P-56", "EG D513", "D-138"] {
+            assert!(is_designator(d), "{d} is a designator");
+        }
+        for w in ["METRSEARCH", "W-METRSEARCH", "DANGER ZONE", ""] {
+            assert!(!is_designator(w), "{w} is not a designator");
+        }
     }
 }
