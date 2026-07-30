@@ -361,20 +361,39 @@ impl Config {
             // Empty = the tower's voice; ATIS on a real field is often the
             // same controller reading onto the loop anyway.
             atc_atis_piper_voice: env_or("XCOPILOT_ATC_ATIS_PIPER_VOICE", ""),
-            // ACCENT-NEUTRAL voices only: accented voices are cast by
-            // country instead (voice::local_accent_for — Castilian in Spain,
-            // es_MX in Spanish Latin America), so a German field never draws
-            // a Spanish controller from the pool. The home field's curated
-            // voices (alba, ryan, northern male) are deliberately NOT here
-            // either: another airport must never answer in the home tower's
-            // voice ("still the scottish lady", 2026-07-09).
+            // The pool every field OTHER than home draws its controller from.
+            //
+            // It used to be nine American voices, which meant a British field
+            // always answered in an American accent — the pool is what you
+            // hear at every airport you fly to, so it was the wrong nine.
+            // Half of it is British now, weighted that way on purpose because
+            // that is where the flying happens.
+            //
+            // The `#N` suffix selects a speaker from a MULTI-speaker model.
+            // en_GB-vctk-medium alone carries 109 British voices, so a handful
+            // of entries buys more real variety than a handful of files: two
+            // controllers at different fields are now unlikely to share a
+            // voice at all, before the voice-shift even runs.
+            //
+            // The home field's curated voices (alba, ryan, northern male) stay
+            // OUT: another airport must never answer in the home tower's voice
+            // ("still the scottish lady", 2026-07-09). Accented non-English
+            // voices stay out too — es_* are cast by country, so a German
+            // field never draws a Spanish controller from here.
             atc_voice_pool: env_or(
                 "XCOPILOT_ATC_VOICE_POOL",
-                "models/en_US-joe-medium.onnx,models/en_US-amy-medium.onnx,\
+                "models/en_GB-vctk-medium.onnx#4,models/en_GB-vctk-medium.onnx#19,\
+                 models/en_GB-vctk-medium.onnx#33,models/en_GB-vctk-medium.onnx#58,\
+                 models/en_GB-vctk-medium.onnx#80,models/en_GB-vctk-medium.onnx#96,\
+                 models/en_GB-aru-medium.onnx#2,models/en_GB-aru-medium.onnx#7,\
+                 models/en_GB-cori-medium.onnx,\
+                 models/en_GB-southern_english_female-low.onnx,\
+                 models/en_US-joe-medium.onnx,models/en_US-amy-medium.onnx,\
                  models/en_US-bryce-medium.onnx,models/en_US-john-medium.onnx,\
                  models/en_US-norman-medium.onnx,models/en_US-kusal-medium.onnx,\
                  models/en_US-lessac-medium.onnx,models/en_US-hfc_male-medium.onnx,\
-                 models/en_US-hfc_female-medium.onnx",
+                 models/en_US-hfc_female-medium.onnx,models/en_US-mike-medium.onnx,\
+                 models/en_US-sam-medium.onnx,models/en_US-kathleen-low.onnx",
             ),
             atc_voice_shift: env_or("XCOPILOT_ATC_VOICE_SHIFT", "true") != "false",
             atc_squelch_wav: env_or("XCOPILOT_SQUELCH_WAV", "assets/afv/Click_f32.wav"),
@@ -397,5 +416,51 @@ fn default_ui() -> &'static str {
         "tui"
     } else {
         "plain"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every voice the ATC pool names must actually be on disk, and the `#N`
+    /// speaker suffixes must be in range for their model. A pool entry that
+    /// does not resolve falls back to the default voice, so a typo makes two
+    /// airports share a controller silently.
+    #[test]
+    fn the_atc_voice_pool_resolves() {
+        let cfg = Config::from_env().expect("config loads");
+        let mut entries = 0usize;
+        let mut british = 0usize;
+        for spec in cfg.atc_voice_pool.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            entries += 1;
+            if spec.contains("en_GB") {
+                british += 1;
+            }
+            let (path, sid) = match spec.rsplit_once('#') {
+                Some((p, n)) => (p, n.parse::<i64>().unwrap_or(0)),
+                None => (spec, 0),
+            };
+            // Voices are a big download and may not be present in CI.
+            if !std::path::Path::new(path).exists() {
+                continue;
+            }
+            let cfg_path = format!("{path}.json");
+            let raw = std::fs::read_to_string(&cfg_path)
+                .unwrap_or_else(|e| panic!("{cfg_path} unreadable: {e}"));
+            let j: serde_json::Value = serde_json::from_str(&raw).expect("voice json parses");
+            let n = j["num_speakers"].as_i64().unwrap_or(1);
+            assert!(
+                sid < n,
+                "{spec}: speaker {sid} but the model has {n} — it would silently render speaker 0"
+            );
+        }
+        assert!(entries >= 8, "a thin pool means airports share voices: {entries}");
+        // The flying is in the UK; the pool must not be all-American, which is
+        // what it was until 2026-07-30.
+        assert!(
+            british * 3 >= entries,
+            "at least a third British: {british} of {entries}"
+        );
     }
 }

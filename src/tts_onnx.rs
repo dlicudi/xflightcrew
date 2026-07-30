@@ -814,4 +814,33 @@ mod station_voice_tests {
         crate::radiofx::radioize(&mut a, alba.sample_rate);
         assert!(!a.is_empty());
     }
+
+    /// Real synthesis through the multi-speaker path — the `#N` suffix must
+    /// select a DIFFERENT voice, not silently fall back to speaker 0.
+    /// Ignored by default: needs the voice files present.
+    #[test]
+    #[ignore]
+    fn multi_speaker_voices_render_and_differ() {
+        let base = "models/en_GB-vctk-medium.onnx";
+        if !std::path::Path::new(base).exists() {
+            eprintln!("no vctk model, skipping");
+            return;
+        }
+        let say = |spec: &str| {
+            let mut tts = super::OnnxTts::load(spec).expect("loads");
+            tts.synth("Southampton Tower, good afternoon.").expect("renders")
+        };
+        let a = say(&format!("{base}#4"));
+        let b = say(&format!("{base}#33"));
+        let c = say(&format!("{base}#80"));
+        for (n, v) in [("4", &a), ("33", &b), ("80", &c)] {
+            assert!(v.len() > 8000, "speaker {n} produced only {} samples", v.len());
+        }
+        // Different speakers must produce genuinely different audio.
+        let same = |x: &Vec<f32>, y: &Vec<f32>| {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p == q)
+        };
+        assert!(!same(&a, &b), "speaker 4 and 33 rendered identically");
+        assert!(!same(&b, &c), "speaker 33 and 80 rendered identically");
+    }
 }
