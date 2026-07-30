@@ -189,7 +189,13 @@ const ROTATE_RATE_DEG_S: f64 = 2.5;
 /// a lead on the pitch rate for damping, and caps. Integrating, so it
 /// holds whatever standing elevator the trim state demands with the
 /// attitude ON target — the same reason the roll law grew its trim.
-const PITCH_GAIN_PER_DEG_S: f64 = 0.05;
+/// Proportional elevator per degree of (lead-compensated) attitude error —
+/// the path that answers immediately and adds no phase lag.
+const PITCH_P_PER_DEG: f64 = 0.03;
+/// Integral gain, per degree per second. Only has to find the STANDING pull,
+/// so it is a fifth of the old pure-integrator gain: at that speed it trims
+/// rather than flies.
+const PITCH_TRIM_PER_DEG_S: f64 = 0.01;
 /// The damping lead, seconds. Applied to the rate ERROR (how far off the
 /// COMMANDED rotation rate the nose is), not the raw pitch rate: damping the
 /// raw rate would fight the rotation itself, since a nose coming up at exactly
@@ -432,18 +438,21 @@ pub fn rotate_ok(err_deg: f64, remaining_m: f64) -> bool {
 pub struct RotatePitch {
     out: f64,
     prev_theta: Option<f64>,
-    /// Smoothed pitch rate, deg/s. The RAW two-sample rate is what this law
-    /// damps with, and on a 0.15-0.3 s tick with the nose moving ~6 deg/s the
-    /// lead term it feeds (`PITCH_LEAD_S` = 1 s) contributes ±6° — larger than
-    /// the ±4° attitude error it exists to damp. The loop goes rate-dominated
-    /// and rings: an SF50 held 5.6° to 13.2° about an 8° target, period ~1.3 s,
-    /// all the way from liftoff to the 300 ft AP handover, where it stopped
-    /// dead because the autopilot flies it from there (EGHI, 2026-07-30).
+    /// The standing pull the trim state demands — the INTEGRAL part, kept
+    /// separate from `out` so the proportional path can move without
+    /// disturbing it.
     ///
-    /// Every other rate in this codebase is smoothed for exactly this reason —
-    /// the taxi loop's yaw and the speed governor's trend both run an EMA.
-    /// This one was reading raw.
-    rate: f64,
+    /// This law was a PURE integrator and rang from liftoff to the 300 ft AP
+    /// handover, where it stopped dead because the autopilot flies it from
+    /// there: 5.6° to 13.2° about an 8° target, hard against `PITCH_MIN` on
+    /// every down-swing (SF50 at EGHI, 2026-07-30). Elevator to pitch rate to
+    /// attitude is already about a double integration; a third in the
+    /// controller cannot be stabilised by one lead term at any gain.
+    ///
+    /// Smoothing the rate was tried first and measurably made it WORSE
+    /// (spread 7.6° to 13.6°) — the rate feeds the DAMPING path, so filtering
+    /// it puts lag where the phase margin is thinnest.
+    trim: f64,
     /// The commanded attitude, ramped at [`ROTATE_RATE_DEG_S`] from wherever
     /// the nose was on the first tick. `None` until then.
     target: Option<f64>,
@@ -461,7 +470,7 @@ impl RotatePitch {
         RotatePitch {
             out: 0.0,
             prev_theta: None,
-            rate: 0.0,
+            trim: 0.0,
             target: None,
             ceiling: tail_strike_deg.map(|d| d - TAIL_STRIKE_MARGIN_DEG),
         }
@@ -474,13 +483,13 @@ impl RotatePitch {
 
     pub fn step(&mut self, theta_deg: f64, dt_s: f64) -> f64 {
         let dt = dt_s.clamp(0.05, 1.0);
-        let raw_rate = self.prev_theta.map_or(0.0, |p| (theta_deg - p) / dt);
+        // RAW rate. Smoothing it was tried and measurably made the ring WORSE
+        // (spread 7.6 deg -> 13.6 deg, EGHI 2026-07-30): this is the DAMPING
+        // path, and a filter puts lag exactly where the phase margin is thin.
+        let rate = self
+            .prev_theta
+            .map_or(0.0, |p| ((theta_deg - p) / dt).clamp(-30.0, 30.0));
         self.prev_theta = Some(theta_deg);
-        // Half-and-half, the same blend the taxi loop's yaw damper uses: enough
-        // to take the sampling noise out of the lead term without lagging the
-        // real motion the damping is for.
-        self.rate = self.rate * 0.5 + raw_rate.clamp(-30.0, 30.0) * 0.5;
-        let rate = self.rate;
         // The commanded attitude walks up from where the nose actually was,
         // never further than the airframe's geometry allows.
         let cap = self
@@ -496,7 +505,20 @@ impl RotatePitch {
         // motion as if it were an overshoot is what stalls a rotation.
         let want_rate = if target < cap { ROTATE_RATE_DEG_S } else { 0.0 };
         let err = target - theta_deg - PITCH_LEAD_S * (rate - want_rate);
-        self.out = (self.out + err * PITCH_GAIN_PER_DEG_S * dt).clamp(PITCH_MIN, PITCH_MAX);
+        // PROPORTIONAL + integral, not integral alone.
+        //
+        // Elevator -> pitch rate -> attitude is already about a double
+        // integration. A pure integrator on top makes three, and one lead term
+        // cannot supply the phase to stabilise that at ANY gain — it was never
+        // going to settle, only ring wider or narrower. It rang 5.6-13.2 deg
+        // about an 8 deg target, hard against PITCH_MIN on every down-swing.
+        //
+        // The proportional path answers immediately and adds no lag; the
+        // integrator is left to do the one job the original comment actually
+        // wanted from it — hold the standing pull the trim state demands, so
+        // that on target and steady the elevator does not fall away.
+        self.trim = (self.trim + err * PITCH_TRIM_PER_DEG_S * dt).clamp(PITCH_MIN, PITCH_MAX);
+        self.out = (err * PITCH_P_PER_DEG + self.trim).clamp(PITCH_MIN, PITCH_MAX);
         self.out
     }
 }
@@ -1501,7 +1523,19 @@ mod tests {
         // First tick from a nose-on-the-ground attitude: the commanded target
         // starts THERE, so the error is small and the elevator stays gentle.
         let first = law.step(0.0, 0.15);
-        assert!(first > 0.0 && first < 0.05, "gentle to start: {first}");
+        // "Gentle" is a small FRACTION of the available pull, not a number a
+        // pure integrator produced for free by starting at zero. The law is
+        // P+I now, so the first tick is deliberately non-zero — that is the
+        // proportional path doing its job. What must never happen is the
+        // snatch: jumping toward the cap.
+        assert!(first > 0.0, "it must start pulling: {first}");
+        assert!(
+            first < 0.2 * PITCH_MAX,
+            "gentle to start, not a snatch: {first} of {PITCH_MAX}"
+        );
+        // The real anti-snatch guarantee, unchanged: the COMMANDED attitude
+        // starts at the nose and is walked up, so the law never sees the whole
+        // 8 degrees as error on tick one.
         assert!(law.target_deg() < 1.0, "target starts at the nose");
         // Two seconds later the commanded attitude has walked up about
         // 2.5°/s, and no further than the 8° target.
