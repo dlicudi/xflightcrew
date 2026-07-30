@@ -483,7 +483,20 @@ to holding point ..." shapes (both phrasings went unanswered live,
 2026-07-20). Spoken "stop"/"go"/"taxi at N" fold into the schedule as
 external retargets (`LAST_TAXI_KTS` untouched by schedule writes, so "go"
 resumes the pilot's pace). Refuses in replay, airborne, way off the route,
-or with no published clearance. The governor evaporating
+or with no published clearance. The schedule also knows where the aircraft
+IS, not only how the paint bends ahead (`Pace::track_cap_kts`, 2026-07-30):
+the bend caps read the route and nothing else, and the JOIN cap stops at the
+`join_done` latch — 15 m and 45 degrees, loose enough to fire in the middle
+of a capture that has not happened. Southampton: the SF50 latched joined at
+14.8 m and -28 degrees, the last leg was straight so the cap returned to
+12 kt, and it accelerated 6.5 to 12.7 kt while still 13 m off with 27
+degrees of crossing angle and 33 m to run. On a castoring-wheel jet whose
+whole steering authority is a quarter of one-sided brake (~3.5 deg/s flat
+out) that is unrecoverable — it floats wide, which is exactly the trail.
+Cross-track and heading error now cap the schedule at the bend pace, then
+the sharp pace, every tick and past the latch; slowing is what buys a weak
+plant more degrees per metre. It can only ever slow, so an airframe holding
+the centreline is untouched. The governor evaporating
 mid-drive is ARRESTED, never silent: the throttle-override check can't
 tell a pilot's hand from a hardware-axis bump the sim re-drives, and the
 first Gatwick sortie (2026-07-20) ran 10 to 50 kt through the grass at

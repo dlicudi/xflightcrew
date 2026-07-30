@@ -102,6 +102,17 @@ const JOIN_DONE_ERR_DEG: f64 = 45.0;
 /// While joining with the nose still this far off the aim, hold the
 /// sharp-turn pace; better aligned joins ride at ordinary bend speed.
 const JOIN_ERR_SLOW_DEG: f64 = 60.0;
+/// Cross-track error that has a wheel off the centreline but is still well
+/// inside the paint (a code-C taxiway is ~23 m wide): back off to the bend
+/// pace. Past [`TRACK_SHARP_LAT_M`] the aircraft is at or beyond the edge and
+/// only the sharp-corner pace is honest. See [`Pace::track_cap_kts`].
+const TRACK_TURN_LAT_M: f64 = 6.0;
+const TRACK_SHARP_LAT_M: f64 = 12.0;
+/// The same two bands in heading. Deliberately looser than the lateral pair: a
+/// healthy pure-pursuit intercept carries a real crossing angle by design, so
+/// only an angle no intercept would ask for should slow the schedule.
+const TRACK_TURN_ERR_DEG: f64 = 20.0;
+const TRACK_SHARP_ERR_DEG: f64 = 35.0;
 /// Full steering deflection at this much heading error.
 const STEER_FULL_DEG: f64 = 30.0;
 /// Route bends at/above this (smoothed like the guide's cues) slow the
@@ -185,6 +196,35 @@ impl Pace {
             self.sharp
         } else {
             self.turn
+        }
+    }
+
+    /// The speed cap for how the aircraft is actually TRACKING, as opposed to
+    /// how the route ahead bends.
+    ///
+    /// The bend caps read the paint and nothing else: they answer "how sharp is
+    /// what's coming", never "are we on it". Between them and `join_cap_kts`
+    /// there was a hole — the join cap stops at the `join_done` latch (15 m,
+    /// 45 deg), which is loose enough to fire in the middle of a capture that
+    /// has not happened, and past it the schedule went straight back to the
+    /// open-taxiway pace. Southampton, 2026-07-30: the SF50 latched joined at
+    /// 14.8 m and -28 deg, the last leg was straight so the cap returned to
+    /// 12 kt, and it accelerated 6.5 -> 12.7 kt while still 13 m off with 27
+    /// deg of crossing angle and 33 m to run. On a castoring-wheel jet whose
+    /// entire steering authority is a quarter of one-sided brake (~3.5 deg/s
+    /// flat out) that is unrecoverable: it simply floats wide.
+    ///
+    /// So speed backs off for the error itself, and the cap outlives the join
+    /// latch. Slowing down is what a pilot does when the centreline is drifting
+    /// away from under the nose; it buys the steering more degrees per metre,
+    /// which is the only currency a weak plant has.
+    pub fn track_cap_kts(&self, lateral_m: f64, err_deg: f64) -> f64 {
+        if lateral_m > TRACK_SHARP_LAT_M || err_deg.abs() > TRACK_SHARP_ERR_DEG {
+            self.sharp
+        } else if lateral_m > TRACK_TURN_LAT_M || err_deg.abs() > TRACK_TURN_ERR_DEG {
+            self.turn
+        } else {
+            self.straight
         }
     }
 }
@@ -1437,6 +1477,10 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             if join_allow.unwrap_or(0.0) > 0.0 {
                 sched = sched.min(route.pace.join_cap_kts(err));
             }
+            // Applied every tick, joined or not: the route's bends know nothing
+            // about where the aircraft actually is, and the join cap lets go
+            // too early to cover it.
+            sched = sched.min(route.pace.track_cap_kts(lateral, err));
             if (sched - last_sched).abs() > 0.01 {
                 speedhold::set_taxi_target(sched);
                 last_sched = sched;
@@ -1735,6 +1779,47 @@ mod tests {
                 .as_ref(),
         );
         assert!(!c172.brake_steer);
+    }
+
+    /// The schedule has to know where the aircraft IS, not just how the paint
+    /// bends ahead of it — the Southampton SF50 taxi (2026-07-30).
+    #[test]
+    fn a_mistracking_aircraft_is_slowed_whatever_the_route_ahead_does() {
+        let sf = Pace::from_profile(
+            crate::aircraft::load("cirrus_vision_sf50")
+                .expect("sf50")
+                .taxi
+                .as_ref(),
+        );
+        // On the centreline and pointed along it: the open-taxiway pace,
+        // untouched. The cap must never be the thing that slows a good taxi.
+        assert_eq!(sf.track_cap_kts(0.5, 2.0), sf.straight);
+        assert_eq!(sf.track_cap_kts(TRACK_TURN_LAT_M, 0.0), sf.straight);
+        // Drifting off the line, or crossing it at an angle no intercept would
+        // ask for: bend pace.
+        assert_eq!(sf.track_cap_kts(8.0, 5.0), sf.turn);
+        assert_eq!(sf.track_cap_kts(1.0, 25.0), sf.turn);
+        // The numbers off the blackbox: 13 m off with 27 deg of crossing angle,
+        // where it was doing 12.7 kt on a straight last leg. Sharp pace.
+        assert_eq!(sf.track_cap_kts(13.0, 27.0), sf.sharp);
+        // Which side is irrelevant.
+        assert_eq!(sf.track_cap_kts(1.0, -40.0), sf.sharp);
+        // It can only ever slow the schedule down.
+        for lat in [0.0, 5.0, 7.0, 13.0, 40.0] {
+            for err in [0.0, 10.0, 30.0, 90.0] {
+                assert!(sf.track_cap_kts(lat, err) <= sf.straight);
+                assert!(sf.track_cap_kts(lat, err) >= sf.sharp);
+            }
+        }
+        // A trainer holding the centreline within a wheel's width is untouched
+        // too — this is not a tax on airframes that track well.
+        let c172 = Pace::from_profile(
+            crate::aircraft::load("cessna_172sp")
+                .expect("172")
+                .taxi
+                .as_ref(),
+        );
+        assert_eq!(c172.track_cap_kts(2.0, 8.0), c172.straight);
     }
 
     /// A taxiing aircraft carries people. The lever may not slam.
