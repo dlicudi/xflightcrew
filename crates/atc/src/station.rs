@@ -4084,6 +4084,20 @@ pub struct VectorPlan {
     last_heading: Option<i64>,
 }
 
+impl VectorPlan {
+    /// The approach clearance has been spoken, so the vectors are finished and
+    /// the crew owes the "established" report.
+    pub(crate) fn is_cleared(&self) -> bool {
+        self.cleared
+    }
+    /// The heading last actually TRANSMITTED, not an internal target — a crew
+    /// complying with vectors must fly the number it was given. `None` before
+    /// the first instruction goes out.
+    pub(crate) fn last_heading_deg(&self) -> Option<i64> {
+        self.last_heading
+    }
+}
+
 /// How far out the vectors aim you onto final (the join point) for a VISUAL
 /// approach; an ILS join is computed from its platform instead.
 const JOIN_FINAL_NM: f64 = 6.0;

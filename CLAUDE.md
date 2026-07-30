@@ -228,6 +228,11 @@ published by `Station::install()`, called by the owner — never by
 publishes for the copilot lives in [crates/atc/src/party_line.rs](crates/atc/src/party_line.rs) —
 seven statics, read only through its narrow accessors (`clearance_state`,
 `with_taxi_route`, `takeoff_hold_armed`, `vectored_callsign`,
+`assigned_vector` — what the controller actually TRANSMITTED (heading,
+platform altitude, whether the approach clearance has been issued), for a
+crew that intends to COMPLY rather than fly its own path beside a controller
+who believes it is being vectored; `vectored_callsign` only says a plan
+exists —
 `landing_handoff_runway` — the approach→tower handoff that still owes the
 tower a "final" report, feeding the crew's landing-clearance coach — plus
 two `take_*` queue consumers for the main loop). The world side (station/tower)

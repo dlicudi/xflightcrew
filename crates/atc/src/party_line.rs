@@ -134,6 +134,40 @@ pub fn vectored_callsign() -> Option<String> {
     lock(&VECTORS).as_ref().map(|p| p.callsign.clone())
 }
 
+/// What the controller has actually TOLD US to fly, for a crew that intends to
+/// comply. `vectored_callsign` only says a plan exists; this says what was
+/// assigned, which is what an autoflight arrival needs to obey rather than
+/// invent its own path alongside a controller who thinks it is being vectored.
+///
+/// `None` until the first vector has been transmitted — before that there is
+/// nothing owed, and the crew flies its own navigation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssignedVector {
+    /// Last assigned heading, degrees. Already rounded to the ten the
+    /// controller actually spoke, so the crew flies the SPOKEN number.
+    pub heading_deg: f64,
+    /// Intercept (platform) altitude, ft MSL.
+    pub target_alt_ft: f64,
+    /// The approach clearance has been issued ("cleared ILS approach, report
+    /// established"), so the vectors are done and the crew owes the report.
+    pub cleared: bool,
+    /// Landing runway as spoken, for the report and the crosscheck.
+    pub runway_spoken: String,
+}
+
+/// The vector currently owed, if a controller is working us and has spoken at
+/// least one instruction.
+pub fn assigned_vector() -> Option<AssignedVector> {
+    let g = lock(&VECTORS);
+    let p = g.as_ref()?;
+    Some(AssignedVector {
+        heading_deg: p.last_heading_deg()? as f64,
+        target_alt_ft: p.target_alt_ft,
+        cleared: p.is_cleared(),
+        runway_spoken: p.runway_spoken.clone(),
+    })
+}
+
 /// The runway the approach handed you toward while you still owe the tower a
 /// "final" report — i.e. cleared for the APPROACH but not to LAND. `None` once
 /// the tower clears the landing or the wheels are down.

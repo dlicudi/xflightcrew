@@ -2025,6 +2025,45 @@ mod tests {
         );
     }
 
+    /// Both calls the vectored arrival makes have to be words the tower knows,
+    /// for the same reason the go-around does. Asking for vectors and then
+    /// reporting established is the sequence that earns the approach clearance
+    /// and, after it, the landing clearance — a phrasing the parser shrugs at
+    /// leaves the automation complying with a controller who never engaged.
+    #[test]
+    fn the_vectored_arrival_calls_read_as_the_tower_expects() {
+        let cs = Some("November five five two Alpha Alpha".to_string());
+
+        let ask = crate::circuit::radio_call(&cs, "request vectors");
+        assert_eq!(
+            crate::tower::parse_intent(&ask.to_ascii_lowercase()),
+            crate::tower::Intent::RequestVectors,
+            "{ask}"
+        );
+        // ...and with no readable tail number.
+        assert_eq!(
+            crate::tower::parse_intent(&crate::circuit::radio_call(&None, "request vectors")),
+            crate::tower::Intent::RequestVectors
+        );
+
+        // "established" is the report the ILS clearance asks for, and it must
+        // reach the tower as the FINAL report that earns the landing
+        // clearance — not as an unknown.
+        let est = crate::circuit::radio_call(&cs, "established");
+        assert_ne!(
+            crate::tower::parse_intent(&est.to_ascii_lowercase()),
+            crate::tower::Intent::Unknown,
+            "the established report must parse: {est}"
+        );
+
+        // The guard that makes "request vectors" safe: a ground call carrying
+        // the same word is NOT a vectoring request (a real 2026-07-09 call).
+        assert_ne!(
+            crate::tower::parse_intent("request vectors for taxi to parking"),
+            crate::tower::Intent::RequestVectors
+        );
+    }
+
     /// The reposition leg flies OUTBOUND to the join point and levels at
     /// platform height — it never dives at the glidepath under it, which is
     /// the path it is flying away from.
