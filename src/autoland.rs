@@ -227,6 +227,10 @@ const LON: &str = "sim/flightmodel/position/longitude";
 const ELEV_M: &str = "sim/flightmodel/position/elevation";
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
+/// Weight-on-wheels for the player aircraft. Radio altitude and airspeed are
+/// not touchdown evidence: a normal flare can be below five feet and a knot
+/// below target while the wheels are still airborne.
+const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 /// TRUE heading and TRUE ground track: their difference is the wind crab the
@@ -260,6 +264,20 @@ const ROLLOUT_BRAKE: f64 = 0.45;
 const ROLLOUT_BRAKE_HOLD: f64 = 0.5;
 const M_TO_FT: f64 = 3.280_84;
 const MS_TO_KTS: f64 = 1.943_84;
+
+/// Rollout starts only after weight-on-wheels. The speed terms distinguish a
+/// landing from a low pass once on the surface; they must never substitute for
+/// the ground signal because a normal flare can satisfy both in the air.
+fn should_start_rollout(
+    already_rolling: bool,
+    on_ground: bool,
+    radio_ft: f64,
+    gs_kts: f64,
+    ias_kts: f64,
+    approach_ias: f64,
+) -> bool {
+    already_rolling || (on_ground && radio_ft < 5.0 && (gs_kts < 45.0 || ias_kts < approach_ias))
+}
 
 /// Cancel an active autoland; returns whether one was flying.
 pub fn abort() -> bool {
@@ -382,13 +400,14 @@ pub fn run_autoland(
                 }
                 // One read burst — nine sequential HTTP awaits is the slow-tick
                 // disease that gave the takeoff its slew weave (sortie four).
-                let (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r, psi_r, hpath_r) = tokio::join!(
+                let (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r, psi_r, hpath_r, ground_r) = tokio::join!(
                     xp.get_float(LAT), xp.get_float(LON), xp.get_float(ELEV_M),
                     xp.get_float(AGL_M), xp.get_float(GS_MS), xp.get_float(MAG_VAR),
                     xp.get_float(IAS), xp.get_float(PSI_TRUE), xp.get_float(HPATH_TRUE),
+                    xp.get_float(ON_GROUND),
                 );
-                let (Ok(lat), Ok(lon), Ok(elev_m), Ok(agl_m), Ok(gs_ms), Ok(var), Ok(ias)) =
-                    (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r)
+                let (Ok(lat), Ok(lon), Ok(elev_m), Ok(agl_m), Ok(gs_ms), Ok(var), Ok(ias), Ok(on_ground)) =
+                    (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r, ground_r)
                 else { tokio::time::sleep(std::time::Duration::from_millis(300)).await; continue };
                 let alt = elev_m * M_TO_FT;
                 let radio_ft = agl_m * M_TO_FT;
@@ -411,10 +430,18 @@ pub fn run_autoland(
                 // approach guidance floated past the aimpoint, flipped
                 // Flare->Intercept, and the go-around latch firewalled it off
                 // the end into the bay (LXGB, 2026-07-26). Airspeed below the
-                // approach speed means we're on the wheels and committed,
-                // whatever the wind is doing to the groundspeed — never go
-                // around from there, especially on a short runway.
-                if rolling_out || (radio_ft < 5.0 && (gs_kts < 45.0 || ias < approach_ias)) {
+                // approach speed can identify a committed landing only after
+                // weight-on-wheels. Without that gate a normal flare below five
+                // feet could latch rollout in the air, cut power, and arm the
+                // brakes before touchdown.
+                if should_start_rollout(
+                    rolling_out,
+                    on_ground > 0.5,
+                    radio_ft,
+                    gs_kts,
+                    ias,
+                    approach_ias,
+                ) {
                     rolling_out = true;
                     let xtk_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
                     let target = crate::autotakeoff::roll_target_heading(rwy.course_deg, xtk_m);
@@ -1321,6 +1348,20 @@ pub fn guidance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollout_requires_weight_on_wheels() {
+        // A normal flare can be below five feet and slightly below target;
+        // neither airspeed nor radio altitude is proof of touchdown.
+        assert!(!should_start_rollout(false, false, 3.0, 70.0, 89.0, 90.0));
+        assert!(!should_start_rollout(false, false, 3.0, 40.0, 89.0, 90.0));
+        // The same committed state starts rollout once the wheels are down,
+        // including a tailwind landing whose groundspeed remains high.
+        assert!(should_start_rollout(false, true, 3.0, 70.0, 89.0, 90.0));
+        assert!(should_start_rollout(false, true, 3.0, 40.0, 95.0, 90.0));
+        // Once latched, a noisy WOW sample cannot return control to approach.
+        assert!(should_start_rollout(true, false, 10.0, 70.0, 95.0, 90.0));
+    }
 
     fn rwy_north() -> Runway {
         // A runway at the equator, landing due north (course 0), threshold at 0,0.
