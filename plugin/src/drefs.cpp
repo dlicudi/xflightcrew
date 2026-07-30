@@ -167,7 +167,7 @@ static TextRef g_radio = {{0}, 0};
 static TextRef g_atc = {{0}, 0};
 // The radio coach's suggested next call for the current tower state,
 // refreshed continuously by the app. Empty = no station. Rendered twice:
-// the Calls tab's SAY NOW header, and the Log tab's pinned footer strip.
+// the Calls tab's SAY NOW header, and the Transcript tab's pinned footer strip.
 static TextRef g_coach = {{0}, 0};
 // Automation feed — the Flight tab's live view of what the copilot is flying
 // (full auto stage, autoland phase, taxi governor...). Marker byte + one line
@@ -205,6 +205,28 @@ static float g_taxi_brake = 0.0f;
 static float g_taxi_brake_stamp = -1.0f;
 static bool g_taxi_brake_applied = false;
 static const float kTaxiBrakeFreshSecs = 1.0f;
+
+// The DIFFERENTIAL half of the same pedals: xcopilot/taxi_brake_l and
+// xcopilot/taxi_brake_r, one side at a time, the steering assist for a
+// castoring-nosewheel airframe where yoke_heading has nothing to work with.
+//
+// It lives here and not in the app for the reason written above the symmetric
+// channel, which the assist had to learn twice: the app wrote the ratios
+// straight over REST and XP12 re-drove them from the pilot's assigned toe-brake
+// axes the same frame. Probed live at a Southampton stand (2026-07-30), a
+// PATCH of 0.25 read back 0.0000 within 400 ms with no override up and held
+// 0.2500 indefinitely with one — so every brake-steer tuning note in
+// autotaxi.rs from the 2026-07-28 and -29 sorties was tuning a number that
+// never reached the aircraft, and the SF50 wandered its whole taxi with its
+// only real control surface disconnected.
+//
+// One stamp for the pair: the app writes both sides together, so either write
+// refreshes the channel and a silent writer expires both.
+static XPLMDataRef g_steer_brake_l_dref = nullptr;
+static XPLMDataRef g_steer_brake_r_dref = nullptr;
+static float g_steer_brake_l = 0.0f;
+static float g_steer_brake_r = 0.0f;
+static float g_steer_brake_stamp = -1.0f;
 
 // Proportional taxi steering, same shape as the brake channel: the app writes
 // xcopilot/taxi_steer (-1..1) and the flight loop drives yoke_heading_ratio
@@ -393,6 +415,16 @@ static void WriteTaxiBrake(void*, float v) {
     g_taxi_brake = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
     g_taxi_brake_stamp = XPLMGetElapsedTime();
 }
+static float ReadSteerBrakeL(void*) { return g_steer_brake_l; }
+static void WriteSteerBrakeL(void*, float v) {
+    g_steer_brake_l = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    g_steer_brake_stamp = XPLMGetElapsedTime();
+}
+static float ReadSteerBrakeR(void*) { return g_steer_brake_r; }
+static void WriteSteerBrakeR(void*, float v) {
+    g_steer_brake_r = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    g_steer_brake_stamp = XPLMGetElapsedTime();
+}
 static float ReadTaxiSteer(void*) { return g_taxi_steer; }
 static void WriteTaxiSteer(void*, float v) {
     g_taxi_steer = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
@@ -487,14 +519,28 @@ static float TaxiAssistLoop(float, float, int, void*) {
         g_terrain_gen++;
     }
 
+    // Both brake channels land on the same two ratios, so they are arbitrated
+    // HERE, per wheel, in the one place that owns the override — two writers
+    // racing for one dataref is the bug this channel exists to end. The
+    // stopping brake is symmetric and the steering assist is one-sided; the
+    // wheel takes whichever wants it harder, so a stop mid-turn still stops
+    // and never cancels the turn it was called in.
     const bool fresh = g_taxi_brake_stamp >= 0.0f
         && XPLMGetElapsedTime() - g_taxi_brake_stamp <= kTaxiBrakeFreshSecs;
-    if (fresh && g_taxi_brake > 0.0f) {
+    const bool sb_fresh = g_steer_brake_stamp >= 0.0f
+        && XPLMGetElapsedTime() - g_steer_brake_stamp <= kTaxiBrakeFreshSecs;
+    float want_l = fresh ? g_taxi_brake : 0.0f;
+    float want_r = want_l;
+    if (sb_fresh) {
+        if (g_steer_brake_l > want_l) want_l = g_steer_brake_l;
+        if (g_steer_brake_r > want_r) want_r = g_steer_brake_r;
+    }
+    if (want_l > 0.0f || want_r > 0.0f) {
         // The override holds ONLY while we're actively braking, so the
         // pedals are the pilot's the rest of the time.
         if (g_override_toe_brakes) XPLMSetDatai(g_override_toe_brakes, 1);
-        if (g_l_brake_ratio) XPLMSetDataf(g_l_brake_ratio, g_taxi_brake);
-        if (g_r_brake_ratio) XPLMSetDataf(g_r_brake_ratio, g_taxi_brake);
+        if (g_l_brake_ratio) XPLMSetDataf(g_l_brake_ratio, want_l);
+        if (g_r_brake_ratio) XPLMSetDataf(g_r_brake_ratio, want_r);
         g_taxi_brake_applied = true;
     } else if (g_taxi_brake_applied) {
         if (g_l_brake_ratio) XPLMSetDataf(g_l_brake_ratio, 0.0f);
@@ -755,7 +801,7 @@ static void WriteAlert(void*, void* in, int offset, int len) {
 namespace drefs {
 
 void start() {
-    g_ptt_cmd = XPLMCreateCommand("xcopilot/ptt", "x-copilot: hold to talk");
+    g_ptt_cmd = XPLMCreateCommand("xcopilot/ptt", "XVoiceLayer: hold to talk");
     XPLMRegisterCommandHandler(g_ptt_cmd, PttCommandHandler, 1, nullptr);
 
     g_ptt_dref = XPLMRegisterDataAccessor(
@@ -764,7 +810,7 @@ void start() {
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
 
     g_radio_ptt_cmd =
-        XPLMCreateCommand("xcopilot/radio_ptt", "x-copilot: hold to transmit (radio/ATC)");
+        XPLMCreateCommand("xcopilot/radio_ptt", "XVoiceLayer: hold to transmit (radio/ATC)");
     XPLMRegisterCommandHandler(g_radio_ptt_cmd, RadioPttCommandHandler, 1, nullptr);
 
     g_radio_ptt_dref = XPLMRegisterDataAccessor(
@@ -861,6 +907,14 @@ void start() {
         "xcopilot/taxi_brake", xplmType_Float, 1,
         nullptr, nullptr, ReadTaxiBrake, WriteTaxiBrake, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_steer_brake_l_dref = XPLMRegisterDataAccessor(
+        "xcopilot/taxi_brake_l", xplmType_Float, 1,
+        nullptr, nullptr, ReadSteerBrakeL, WriteSteerBrakeL, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_steer_brake_r_dref = XPLMRegisterDataAccessor(
+        "xcopilot/taxi_brake_r", xplmType_Float, 1,
+        nullptr, nullptr, ReadSteerBrakeR, WriteSteerBrakeR, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     g_l_brake_ratio = XPLMFindDataRef("sim/cockpit2/controls/left_brake_ratio");
     g_r_brake_ratio = XPLMFindDataRef("sim/cockpit2/controls/right_brake_ratio");
     g_override_toe_brakes = XPLMFindDataRef("sim/operation/override/override_toe_brakes");
@@ -951,6 +1005,8 @@ void stop_first() {
     if (g_roll_dref) { XPLMUnregisterDataAccessor(g_roll_dref); g_roll_dref = nullptr; }
     if (g_roll_yield_dref) { XPLMUnregisterDataAccessor(g_roll_yield_dref); g_roll_yield_dref = nullptr; }
     if (g_taxi_brake_dref) { XPLMUnregisterDataAccessor(g_taxi_brake_dref); g_taxi_brake_dref = nullptr; }
+    if (g_steer_brake_l_dref) { XPLMUnregisterDataAccessor(g_steer_brake_l_dref); g_steer_brake_l_dref = nullptr; }
+    if (g_steer_brake_r_dref) { XPLMUnregisterDataAccessor(g_steer_brake_r_dref); g_steer_brake_r_dref = nullptr; }
     if (g_opt_ui_scale_dref) { XPLMUnregisterDataAccessor(g_opt_ui_scale_dref); g_opt_ui_scale_dref = nullptr; }
     if (g_auto_dref) { XPLMUnregisterDataAccessor(g_auto_dref); g_auto_dref = nullptr; }
     if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }

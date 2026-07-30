@@ -67,8 +67,16 @@ const TAXI_STEER: &str = "xcopilot/taxi_steer";
 /// ([`brake_steer_split`]). Written one side at a time and zeroed on every
 /// stand-down; pilot toe input on the SAME datarefs wins by the pedal/steer
 /// yield machinery, not by arbitration here.
-const LEFT_BRAKE: &str = "sim/cockpit2/controls/left_brake_ratio";
-const RIGHT_BRAKE: &str = "sim/cockpit2/controls/right_brake_ratio";
+/// The differential-brake steering channels. NOT the stock ratios: XP12
+/// re-drives `cockpit2/controls/*_brake_ratio` from the pilot's assigned
+/// toe-brake axes every frame, so a REST write is gone before the next read
+/// (probed live 2026-07-30 — a PATCH of 0.25 read back 0.0000 within 400 ms,
+/// and held 0.2500 under `override_toe_brakes`). Only the plugin can hold that
+/// override at frame rate, and it arbitrates these against the governor's
+/// stopping brake per wheel. The channels expire a second after writes stop,
+/// so a dead app frees the pedals by silence.
+const LEFT_BRAKE: &str = "xcopilot/taxi_brake_l";
+const RIGHT_BRAKE: &str = "xcopilot/taxi_brake_r";
 /// The plugin's pilot-feet latch: 1 = the yaw axis moved, override dropped.
 const STEER_YIELD: &str = "xcopilot/steer_yield";
 const MS_TO_KTS: f64 = 1.943_844;
@@ -1407,44 +1415,46 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // The brake half of the steering, where the airframe needs it. Only
         // ever one side, slewed on like a foot (BRAKE_STEER_SLEW_PER_S),
         // released the moment the command shrinks back into the deadband.
-        // The writes are CONCURRENT with each other and gated on actually
-        // changing: two sequential HTTP awaits added to every tick dragged
-        // the whole control loop from a 0.3 s period to over a second, and a
-        // one-second steering loop is its own violence (2026-07-28, the
-        // assist's first sortie).
-        if route.pace.brake_steer {
+        //
+        // Written EVERY tick, never edge-gated on change. The plugin channel
+        // is a heartbeat that expires a second after writes stop, so skipping
+        // a steady command doesn't leave the last one standing, it drops the
+        // brake mid-turn — and a turn is exactly where the command sits still
+        // for seconds. (The old gate existed to keep HTTP off the tick, which
+        // the join! below already buys: all three control writes go out
+        // together, so the whole steering output costs ONE round trip, not
+        // three. The 2026-07-28 lesson was about sequential awaits dragging
+        // the loop to a second, not about the number of writes.)
+        let (bl, br) = if route.pace.brake_steer {
             let (wl, wr) = brake_steer_split(steer, gs_kts);
             let bl = slew_steer(bs_prev.0, wl, Some(BRAKE_STEER_SLEW_PER_S), dt);
             let br = slew_steer(bs_prev.1, wr, Some(BRAKE_STEER_SLEW_PER_S), dt);
-            let changed = (bl - bs_prev.0).abs() > 0.02 || (br - bs_prev.1).abs() > 0.02;
-            let releasing = bs_on && bl <= 0.001 && br <= 0.001;
-            if (bl > 0.0 || br > 0.0) && changed {
-                let (a, b) =
-                    tokio::join!(xp.set_float(LEFT_BRAKE, bl), xp.set_float(RIGHT_BRAKE, br));
-                let _ = (a, b);
-                bs_prev = (bl, br);
-                bs_on = true;
-            } else if releasing {
-                let (a, b) = tokio::join!(
-                    xp.set_float(LEFT_BRAKE, 0.0),
-                    xp.set_float(RIGHT_BRAKE, 0.0)
-                );
-                let _ = (a, b);
-                bs_prev = (0.0, 0.0);
-                bs_on = false;
-            } else if changed {
-                bs_prev = (bl, br);
-            }
-        }
+            bs_prev = (bl, br);
+            bs_on = bl > 0.0 || br > 0.0;
+            (bl, br)
+        } else {
+            (0.0, 0.0)
+        };
         crate::blackbox::record(
             "autotaxi",
             serde_json::json!({
                 "event": "drive", "gs": gs_kts, "err": err, "yaw_dps": yaw_rate,
                 "steer": steer, "lat_m": lateral, "remaining_m": remaining,
-                "bs": bs_on,
+                "bs": bs_on, "bl": bl, "br": br,
             }),
         );
-        if xp.set_float(TAXI_STEER, steer).await.is_err() {
+        let steer_write = if route.pace.brake_steer {
+            let (s, a, b) = tokio::join!(
+                xp.set_float(TAXI_STEER, steer),
+                xp.set_float(LEFT_BRAKE, bl),
+                xp.set_float(RIGHT_BRAKE, br),
+            );
+            let _ = (a, b);
+            s
+        } else {
+            xp.set_float(TAXI_STEER, steer).await
+        };
+        if steer_write.is_err() {
             // The channel vanished (plugin reload): no steering, no drive.
             tracing::warn!("auto taxi: steer channel lost, stopping");
             speedhold::set_taxi_target(0.0);

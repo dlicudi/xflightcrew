@@ -67,7 +67,7 @@ static bool g_log_autoscroll = true;
 static bool g_flt_copilot = true;
 static bool g_flt_atc = true;
 static bool g_flt_others = true;
-// New entries arrived since the Log tab was last shown — drives an unread dot
+// New entries arrived since the Transcript tab was last shown — drives an unread dot
 // on the tab so activity isn't missed while on Route/Settings.
 static bool g_log_unseen = false;
 
@@ -134,6 +134,31 @@ static void TagChip(const char* label, ImU32 col, float width) {
     ImGui::Dummy(size);
 }
 
+// Tab marker: a filled dot in space the label RESERVES (kTabPad trailing
+// spaces), drawn after the tab item off its own rect. ImGui's
+// UnsavedDocument flag is deliberately not used — it renders a superscript
+// "*", which is the IDE "you have unsaved edits" idiom (nothing here is
+// unsaved), and it reserves no width, so it clips the label it sits beside.
+// Reserved space also means the bar never jitters as a marker lights.
+//
+// Color carries the URGENCY, and the two markers are not the same signal:
+// amber = something is OWED (a readback the pilot must transmit), dim =
+// something is merely UNREAD. One glyph for both was the old bug.
+static const char* kTabPad = "   ";
+static void TabMarker(bool lit, ImU32 col) {
+    // Call straight after BeginTabItem, in or out of the block: the tab
+    // header is the last item either way. IsItemVisible keeps a dot from
+    // floating loose when a narrow window scrolls its tab off the bar.
+    if (!lit || !ImGui::IsItemVisible()) return;
+    ImVec2 lo = ImGui::GetItemRectMin();
+    ImVec2 hi = ImGui::GetItemRectMax();
+    const float r = ImGui::GetFontSize() * 0.19f;
+    // Centred vertically in the tab, inside the space the padding reserved.
+    ImVec2 c(hi.x - ImGui::GetStyle().FramePadding.x - r,
+             (lo.y + hi.y) * 0.5f);
+    ImGui::GetWindowDrawList()->AddCircleFilled(c, r, col, 12);
+}
+
 class XCopilotPanel : public ImgWindow {
 public:
     XCopilotPanel(int l, int t, int r, int b)
@@ -194,7 +219,7 @@ public:
     }
 
 private:
-    // Selected tab (0 = Flight, 1 = Log, 2 = ATC, 3 = Route, 4 = Settings).
+    // Selected tab (0 = Flight, 1 = Transcript, 2 = ATC, 3 = Route, 4 = Settings).
     // Flight is first and default: the automation instrument is the panel's
     // reason to be on screen mid-flight.
     int mTab = 0;
@@ -261,22 +286,31 @@ protected:
                 mTab = 0;
                 ImGui::EndTabItem();
             }
-            // Unread dot on the Log tab while entries arrive unseen — cleared
-            // the moment the tab is shown, so it only lights up from others.
-            ImGuiTabItemFlags logFlags =
-                g_log_unseen ? ImGuiTabItemFlags_UnsavedDocument : 0;
-            if (ImGui::BeginTabItem("Log", nullptr, logFlags)) {
-                g_log_unseen = false;
-                mTab = 1;
-                ImGui::EndTabItem();
+            // Dim dot on Transcript while entries arrive unseen — cleared the
+            // moment the tab is shown, so it only lights up from others. Dim
+            // on purpose: unread rows on a scrolling record are information,
+            // not a duty, and must not read as loud as the ATC dot below.
+            {
+                const bool open = ImGui::BeginTabItem(
+                    ("Transcript" + std::string(kTabPad)).c_str());
+                TabMarker(g_log_unseen, COL_DIM);
+                if (open) {
+                    g_log_unseen = false;
+                    mTab = 1;
+                    ImGui::EndTabItem();
+                }
             }
-            // A dot on ATC while a readback is OWED — a live condition, not
-            // an unread counter: it stays lit until the readback is paid.
-            ImGuiTabItemFlags atcFlags =
-                drefs::coach_urgent() ? ImGuiTabItemFlags_UnsavedDocument : 0;
-            if (ImGui::BeginTabItem("ATC", nullptr, atcFlags)) {
-                mTab = 2;
-                ImGui::EndTabItem();
+            // Amber dot on ATC while a readback is OWED — a live condition,
+            // not an unread counter: it stays lit until the readback is paid,
+            // and it is a duty, so it gets the urgent color.
+            {
+                const bool open = ImGui::BeginTabItem(
+                    ("ATC" + std::string(kTabPad)).c_str());
+                TabMarker(drefs::coach_urgent(), COL_AMBER);
+                if (open) {
+                    mTab = 2;
+                    ImGui::EndTabItem();
+                }
             }
             if (ImGui::BeginTabItem("Route")) {
                 mTab = 3;
@@ -331,7 +365,7 @@ protected:
     void buildFlightTab(bool connected) {
         if (!connected) {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
-                               "Start x-copilot to connect.");
+                               "Start XVoiceLayer to connect.");
             return;
         }
 
@@ -485,7 +519,7 @@ protected:
         ImGui::BeginChild("log", ImVec2(0, -footer), true);
         if (g_log.empty()) {
             // Empty state, centred in the well — not a footer mumble.
-            const char* hint = connected ? "Hold PTT and speak." : "Start x-copilot to connect.";
+            const char* hint = connected ? "Hold PTT and speak." : "Start XVoiceLayer to connect.";
             ImVec2 ts = ImGui::CalcTextSize(hint);
             ImGui::SetCursorPos(ImVec2((ImGui::GetWindowWidth() - ts.x) * 0.5f,
                                        (ImGui::GetWindowHeight() - ts.y) * 0.5f));
@@ -955,7 +989,7 @@ void create() {
     // Wide enough for the Flight tab's four-button rows in the 16px body font.
     int wl = sl + 50, wt = st - 150, wr = wl + 470, wb = wt - 340;
     g_panel = std::make_unique<XCopilotPanel>(wl, wt, wr, wb);
-    g_toggle_cmd = XPLMCreateCommand("xcopilot/toggle_panel", "x-copilot: toggle the status panel");
+    g_toggle_cmd = XPLMCreateCommand("xcopilot/toggle_panel", "XVoiceLayer: toggle the status panel");
     XPLMRegisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr);
 
     int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "X-COPILOT", nullptr, 0);
