@@ -316,7 +316,7 @@ impl Biquad {
 
     fn lowpass(fs: f32, f: f32) -> Self {
         let (sin, cos) = (2.0 * std::f32::consts::PI * f / fs).sin_cos();
-        let alpha = sin / (2.0 * 0.7071);
+        let alpha = sin / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
         Self::from_coeffs(
             (1.0 - cos) / 2.0,
             1.0 - cos,
@@ -329,7 +329,7 @@ impl Biquad {
 
     fn highpass(fs: f32, f: f32) -> Self {
         let (sin, cos) = (2.0 * std::f32::consts::PI * f / fs).sin_cos();
-        let alpha = sin / (2.0 * 0.7071);
+        let alpha = sin / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
         Self::from_coeffs(
             (1.0 + cos) / 2.0,
             -(1.0 + cos),
@@ -499,7 +499,7 @@ mod tests {
         // squelch burst out of the measurement).
         let sine_n = fs * 3 / 10;
         let mut src = sine(1000.0, fs as f32, 0.3);
-        src.extend(std::iter::repeat(0.0).take(sine_n));
+        src.extend(std::iter::repeat_n(0.0, sine_n));
         let (mut strong, mut weak) = (src.clone(), src);
         radioize_with_tail_q(&mut strong, fs as u32, 3, &[], 1.0);
         radioize_with_tail_q(&mut weak, fs as u32, 3, &[], 0.35);

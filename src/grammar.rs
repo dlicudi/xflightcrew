@@ -843,13 +843,11 @@ fn parse_one(t: &str) -> Option<ToolCall> {
             "up".to_string()
         } else if t.contains("three quarter") || t.contains("three-quarter") {
             "three-quarter".to_string()
-        } else if has(t, "full") {
-            "full".to_string()
         // Whisper garbles of "full" heard live on the Twotter approach
         // (2026-07-09): "Flaps, ooh." / "Flaps, cool." / "Flaps, pull." —
         // four dead ends in a row for the same lever. "up" wins above, so
         // "pull the flaps up" is untouched.
-        } else if has(t, "ooh") || has(t, "cool") || has(t, "pull") {
+        } else if has(t, "full") || has(t, "ooh") || has(t, "cool") || has(t, "pull") {
             "full".to_string()
         } else if has(t, "approach") {
             "approach".to_string()
@@ -2153,7 +2151,7 @@ mod tests {
             one("transponder alt mode").unwrap().1,
             json!({"mode":"altitude"})
         );
-        assert_eq!(one("mode c on").is_none(), true); // no transponder word — not ours
+        assert!(one("mode c on").is_none()); // no transponder word — not ours
         assert_eq!(
             one("transponder mode c on").unwrap().1,
             json!({"mode":"altitude"})

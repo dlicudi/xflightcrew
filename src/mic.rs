@@ -36,6 +36,12 @@ impl MicGate {
     }
 }
 
+impl Default for MicGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// An open input device: the live stream plus the buffer its callback fills.
 pub(crate) struct Input {
     pub(crate) stream: cpal::Stream,

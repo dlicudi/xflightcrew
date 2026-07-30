@@ -680,6 +680,7 @@ pub async fn read_dataref(xp: &XPlaneClient, dataref: &str, index: Option<usize>
 /// Perform one checklist action by dispatching to the matching single-action
 /// tool (which reads the dataref back, so the action is verified). Lights/flaps
 /// tools are built from the profile.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_step(
     tool: &str,
     args: &Value,

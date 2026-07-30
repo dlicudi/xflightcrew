@@ -896,7 +896,8 @@ pub fn pick_line_up(
     cleared: Option<&str>,
     heading_deg: Option<f64>,
 ) -> Option<(crate::autoland::Runway, Vec<(f64, f64)>)> {
-    let mut best: Option<(crate::autoland::Runway, Vec<(f64, f64)>, f64)> = None;
+    type LineUpCandidate = (crate::autoland::Runway, Vec<(f64, f64)>, f64);
+    let mut best: Option<LineUpCandidate> = None;
     for r in cands {
         if let Some(c) = cleared {
             if !crate::autotakeoff::runway_matches(&r.id, c) {
@@ -1677,7 +1678,9 @@ mod tests {
         );
         // ...and the creep must still be under the arrival test's speed, so
         // reaching the point is enough to be judged arrived.
-        assert!(CREEP_KTS < ARRIVAL_KTS, "the creep must satisfy arrival");
+        const {
+            assert!(CREEP_KTS < ARRIVAL_KTS, "the creep must satisfy arrival");
+        }
     }
 
     /// The yoke-heading channel is dead on a castoring-wheel jet at taxi

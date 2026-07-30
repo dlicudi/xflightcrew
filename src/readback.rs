@@ -81,7 +81,7 @@ pub fn vary_ack(line: &str, busy: bool) -> String {
 /// Returns `None` when it doesn't fire, or when the callout isn't a clean single
 /// clause ending in a period (a two-sentence readback would tag its tail oddly).
 fn trailing_ack(callout: &str) -> Option<String> {
-    if rng_next() % 10 != 0 {
+    if !rng_next().is_multiple_of(10) {
         return None;
     }
     let head = callout.strip_suffix('.')?;

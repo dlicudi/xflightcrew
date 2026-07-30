@@ -1622,7 +1622,7 @@ mod tests {
         assert_eq!(climb_vs_fpm(74.0, 74.0, 700.0), 700.0);
         // 10 kt slow: backed off, still climbing.
         let slow = climb_vs_fpm(64.0, 74.0, 700.0);
-        assert!(slow < 700.0 && slow >= 150.0, "{slow}");
+        assert!((150.0..700.0).contains(&slow), "{slow}");
         // Absurdly slow: pinned at the floor, never a descent.
         assert_eq!(climb_vs_fpm(40.0, 74.0, 700.0), 150.0);
         // Fast: capped at the profile's rate, no zoom climb.

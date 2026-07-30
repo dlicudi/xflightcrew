@@ -123,7 +123,7 @@ fn note_request(elapsed: std::time::Duration, ok: bool) {
         "web api load"
     );
     let mut top: Vec<(String, u64)> = w.by_name.drain().collect();
-    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.sort_by_key(|item| std::cmp::Reverse(item.1));
     top.truncate(8);
     crate::blackbox::record(
         "api_load",
@@ -711,6 +711,12 @@ impl FakeXPlane {
             .unwrap()
             .iter()
             .position(|c| c == command)
+    }
+}
+
+impl Default for FakeXPlane {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

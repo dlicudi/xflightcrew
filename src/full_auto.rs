@@ -336,9 +336,8 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 "Cranking her over.",
             ]),
         );
-        match tools.start_engine.execute(&json!({}), &ctx).await {
-            Ok(reply) => announce(&voice, Priority::Advisory, &reply),
-            Err(_) => {}
+        if let Ok(reply) = tools.start_engine.execute(&json!({}), &ctx).await {
+            announce(&voice, Priority::Advisory, &reply);
         }
         // The starter cranks before it catches — for seconds on a piston, for
         // minutes on the jet's two-engine bleed-air sequence.
@@ -357,8 +356,8 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // anti-ice, so a circuit flown without them has no servos. Skipped when
         // PowerUp already ran the bus (jets), and a no-op on airframes with no
         // electrical profile. Battery/master re-fire harmlessly.
-        if !tools.power_up_first
-            && !(tools.all_electrical_on_cmds.is_empty() && tools.all_electrical_toggles.is_empty())
+        if !(tools.power_up_first
+            || tools.all_electrical_on_cmds.is_empty() && tools.all_electrical_toggles.is_empty())
         {
             for cmd in &tools.all_electrical_on_cmds {
                 let _ = xp.run_command(cmd).await;
@@ -638,9 +637,8 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 "Taking us to the runway.",
             ]),
         );
-        match tools.taxi.execute(&json!({}), &ctx).await {
-            Ok(reply) => announce(&voice, Priority::Advisory, &reply),
-            Err(_) => {}
+        if let Ok(reply) = tools.taxi.execute(&json!({}), &ctx).await {
+            announce(&voice, Priority::Advisory, &reply);
         }
         // Wait for the drive to finish. `driving()`, not ACTIVE: a backtrack
         // drops ACTIVE in the gap between its two legs, and polling the bare
@@ -749,9 +747,8 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 Priority::Advisory,
                 crate::readback::one_of(&["Lining up.", "Lining us up.", "Taking the runway."]),
             );
-            match tools.line_up.execute(&json!({}), &ctx).await {
-                Ok(reply) => announce(&voice, Priority::Advisory, &reply),
-                Err(_) => {}
+            if let Ok(reply) = tools.line_up.execute(&json!({}), &ctx).await {
+                announce(&voice, Priority::Advisory, &reply);
             }
             // A full-length backtrack is a long, slow drive (LXGB's 09 backtrack
             // is ~1 km) — the 120 s that fit a plain line-up timed out mid-taxi
@@ -811,9 +808,8 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 ]),
             );
             let args = json!({ "right": right });
-            match tools.circuit.execute(&args, &ctx).await {
-                Ok(reply) => announce(&voice, Priority::Advisory, &reply),
-                Err(_) => {}
+            if let Ok(reply) = tools.circuit.execute(&args, &ctx).await {
+                announce(&voice, Priority::Advisory, &reply);
             }
             event("circuit_armed", json!({}));
             // The circuit owns the aircraft from here; our job is done.
@@ -877,9 +873,8 @@ async fn fly_route(
             route.dest_name
         ),
     );
-    match tools.takeoff.execute(&json!({}), ctx).await {
-        Ok(reply) => announce(voice, Priority::Advisory, &reply),
-        Err(_) => {}
+    if let Ok(reply) = tools.takeoff.execute(&json!({}), ctx).await {
+        announce(voice, Priority::Advisory, &reply);
     }
     if !crate::autotakeoff::ACTIVE.load(Relaxed) {
         give_up(

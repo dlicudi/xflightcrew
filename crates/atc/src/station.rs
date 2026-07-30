@@ -2246,7 +2246,8 @@ pub(crate) fn active_tower_khz() -> Option<i64> {
 /// The active station's panel identity — name, field elevation, published
 /// services — for the radio row and the ATC tab. Published by
 /// [`Station::install`], like the rest of the side state.
-static ACTIVE_PANEL: Mutex<Option<(String, f64, Vec<(String, i64)>)>> = Mutex::new(None);
+type ActivePanel = (String, f64, Vec<(String, i64)>);
+static ACTIVE_PANEL: Mutex<Option<ActivePanel>> = Mutex::new(None);
 
 /// A ground station's nominal antenna height. VHF range is line of sight, so
 /// even on the ramp the mast buys a few miles.
@@ -7567,7 +7568,7 @@ mod tests {
             on_ground: true,
             vs_fpm: 0.0,
         };
-        wake_note_targets(&[rolling.clone()], t0);
+        wake_note_targets(std::slice::from_ref(&rolling), t0);
         assert!(WAKE.lock().unwrap().is_none(), "still rolling: no clock");
         let airborne = TcasTarget {
             ele_ft: 150.0,
@@ -7596,7 +7597,7 @@ mod tests {
             on_ground: true,
             vs_fpm: 0.0,
         };
-        wake_note_targets(&[ga.clone()], t0);
+        wake_note_targets(std::slice::from_ref(&ga), t0);
         wake_note_targets(
             &[TcasTarget {
                 ele_ft: 150.0,
@@ -7735,7 +7736,7 @@ mod tests {
             vs_fpm: 0.0,
         };
         assert!(chatter_tick(
-            &[rolling.clone()],
+            std::slice::from_ref(&rolling),
             "Gibraltar",
             36.1512,
             -5.3554,

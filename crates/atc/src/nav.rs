@@ -1481,7 +1481,7 @@ pub fn reconstruct_approach(
         return Vec::new();
     }
     // Farthest DME first (fly inbound); the innermost is the FAF.
-    dfix.sort_by(|a, b| b.0.cmp(&a.0));
+    dfix.sort_by_key(|item| std::cmp::Reverse(item.0));
     let elev = airport.elev_ft;
     let mut legs: Vec<ProcLeg> = Vec::new();
     let last = dfix.len() - 1;

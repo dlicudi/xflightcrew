@@ -1059,7 +1059,7 @@ enum StationVoice {
         /// 1.0 = disabled.
         shift: f32,
     },
-    Say(Config),
+    Say(Box<Config>),
 }
 
 impl StationVoice {
@@ -1123,12 +1123,12 @@ impl StationVoice {
                 }
             }
         }
-        StationVoice::Say(Config {
+        StationVoice::Say(Box::new(Config {
             tts_backend: "say".into(),
             say_voice: config.atc_voice.clone(),
             say_rate: config.atc_rate.clone(),
             ..Config::default()
-        })
+        }))
     }
 
     /// Speak `text` as this station at received signal `quality` (see
@@ -1181,7 +1181,7 @@ impl StationVoice {
 /// session warm (the subprocess `say`/`piper` paths are stateless per call).
 enum Speaker {
     /// Shell out per utterance: `say` or `piper` (see [`tts::speak`]).
-    Subprocess(Config),
+    Subprocess(Box<Config>),
     /// In-process warm ONNX session (feature `onnx-tts`, `XCOPILOT_TTS=onnx`) — the
     /// default voice backend.
     #[cfg(feature = "onnx-tts")]
@@ -1213,7 +1213,7 @@ impl Speaker {
         // Always announce the resolved backend so the active voice is never a
         // guess — the `say`/`piper` subprocess paths were previously silent.
         tracing::info!(backend = %config.tts_backend, "TTS: subprocess backend (per-utterance)");
-        Speaker::Subprocess(config)
+        Speaker::Subprocess(Box::new(config))
     }
 
     fn speak(&mut self, text: &str) -> anyhow::Result<()> {
@@ -1533,12 +1533,12 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             tracing::error!("station voice panicked ({what}); demoting to `say` fallback");
             stations[who.slot()] = Some((
                 model.clone(),
-                StationVoice::Say(Config {
+                StationVoice::Say(Box::new(Config {
                     tts_backend: "say".into(),
                     say_voice: station_cfg.atc_voice.clone(),
                     say_rate: station_cfg.atc_rate.clone(),
                     ..Config::default()
-                }),
+                })),
             ));
             Err(anyhow::anyhow!("TTS panicked: {what}"))
         });

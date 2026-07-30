@@ -585,6 +585,7 @@ impl FireState {
     /// has held continuously for `min_duration`. Marks firing either way.
     /// Returns whether it SPOKE this call — the caller fires any `fix_action`
     /// command on that rising edge, so the copilot acts exactly once per episode.
+    #[allow(clippy::too_many_arguments)]
     fn active(
         &mut self,
         id: &str,
@@ -1204,7 +1205,7 @@ impl Check for CabinAltitude {
     }
     fn eval(&self, s: &Snapshot) -> Option<String> {
         let (low, high) = self.band_ft;
-        let in_band = s.cabin_altitude_ft >= low && high.map_or(true, |h| s.cabin_altitude_ft < h);
+        let in_band = s.cabin_altitude_ft >= low && high.is_none_or(|h| s.cabin_altitude_ft < h);
         (!s.on_ground && in_band).then(|| self.message.to_string())
     }
     fn min_duration(&self) -> Duration {
@@ -1262,19 +1263,17 @@ impl Check for FuelSelectorOff {
 }
 
 fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
-    let mut checks: Vec<Box<dyn Check>> = Vec::new();
-
-    // Universal: every airframe can roll with the brake set.
-    checks.push(Box::new(RollingOnParkBrake));
-
-    // Universal terrain guard: any airframe can dive into the ground.
-    checks.push(Box::new(SinkRate));
-
-    // Descent advisor — armed only when a flight plan gave us a destination
-    // (the checks read `Snapshot::dest_*`, `None` without one).
-    checks.push(Box::new(TodAhead));
-    checks.push(Box::new(TodPassed));
-    checks.push(Box::new(HighOnProfile));
+    let mut checks: Vec<Box<dyn Check>> = vec![
+        // Universal: every airframe can roll with the brake set.
+        Box::new(RollingOnParkBrake),
+        // Universal terrain guard: any airframe can dive into the ground.
+        Box::new(SinkRate),
+        // Descent advisor — armed only when a flight plan gave us a destination
+        // (the checks read `Snapshot::dest_*`, `None` without one).
+        Box::new(TodAhead),
+        Box::new(TodPassed),
+        Box::new(HighOnProfile),
+    ];
 
     // Phase-expectation advisor rows from the profile's SOP table.
     for (index, item) in profile.advisor.iter().enumerate() {
@@ -2658,7 +2657,7 @@ pub async fn run(
             let mute = xp
                 .get_float("xcopilot/opt/monitor_mute")
                 .await
-                .map_or(false, |v| v > 0.5);
+                .is_ok_and(|v| v > 0.5);
             PANEL_MUTE.store(mute, std::sync::atomic::Ordering::Relaxed);
             if let Some(s) = status.as_ref() {
                 let mut strip = compose_strip(&snap);

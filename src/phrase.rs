@@ -147,8 +147,7 @@ pub fn scrub_dashes(s: &str) -> String {
     }
     s.replace(" — ", ", ")
         .replace(" – ", ", ")
-        .replace('—', "-")
-        .replace('–', "-")
+        .replace(['—', '–'], "-")
 }
 
 /// Word-set Jaccard similarity in 0..1, case/punctuation-insensitive. Used to spot

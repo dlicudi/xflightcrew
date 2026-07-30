@@ -267,8 +267,8 @@ pub fn enroute_legs(
         .iter()
         .enumerate()
         .filter(|(i, w)| {
-            !(*i == 0 && w.ident.eq_ignore_ascii_case(origin))
-                && !(*i == waypoints.len() - 1 && w.ident.eq_ignore_ascii_case(destination))
+            (*i != 0 || !w.ident.eq_ignore_ascii_case(origin))
+                && (*i != waypoints.len() - 1 || !w.ident.eq_ignore_ascii_case(destination))
         })
         .map(|(_, w)| w)
         .collect();

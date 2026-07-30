@@ -1231,6 +1231,12 @@ impl Tower {
     }
 }
 
+impl Default for Tower {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A tail number spoken ICAO-style: letters as NATO words, digits read out.
 /// "N172SP" -> "November one seven two Sierra Papa".
 pub fn spoken_callsign(tail: &str) -> String {

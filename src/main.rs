@@ -1131,6 +1131,7 @@ fn wants_procedural_power_up(name: &str, args: &serde_json::Value) -> bool {
         && args.get("on").and_then(|v| v.as_bool()) != Some(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     config: Config,
     mut stt: Stt,
@@ -2035,7 +2036,7 @@ async fn run_session(
                 // Desktop-only: on the cockpit panel this reads as debug noise
                 // shouting CAUTION at the pilot for thinking out loud.
                 reporter.log_quiet(ui::LogKind::Warn, format!("not a command: \"{command}\""));
-                if explicit && live.get(DR_OPT_TONE).map_or(true, |v| v > 0.5) {
+                if explicit && live.get(DR_OPT_TONE).is_none_or(|v| v > 0.5) {
                     voice.negative();
                 }
                 continue;
@@ -2813,7 +2814,7 @@ async fn run_session(
                     // (not a question, or out of scope). Same as a grammar miss:
                     // negative tone on PTT, no misleading spoken "Say again?".
                     reporter.log(ui::LogKind::Warn, format!("no match: \"{command}\""));
-                    if explicit && live.get(DR_OPT_TONE).map_or(true, |v| v > 0.5) {
+                    if explicit && live.get(DR_OPT_TONE).is_none_or(|v| v > 0.5) {
                         voice.negative();
                     }
                 }
@@ -2831,7 +2832,7 @@ async fn run_session(
             // acknowledge with the negative tone. Continuous mode stays silent.
             tracing::info!(path = "deterministic-miss", "command path");
             reporter.log(ui::LogKind::Warn, format!("unrecognized: \"{command}\""));
-            if explicit && live.get(DR_OPT_TONE).map_or(true, |v| v > 0.5) {
+            if explicit && live.get(DR_OPT_TONE).is_none_or(|v| v > 0.5) {
                 voice.negative();
             }
             continue;
@@ -3012,7 +3013,7 @@ async fn run_session(
             // The panel's "camera snap" setting; OFF unless explicitly enabled —
             // moving the pilot's view proved disorienting, so the callout toast
             // carries the information and the glance is opt-in via Settings.
-            let snap_enabled = live.get(DR_OPT_SNAP).map_or(false, |v| v > 0.5);
+            let snap_enabled = live.get(DR_OPT_SNAP).is_some_and(|v| v > 0.5);
             // Where the control sits relative to the final (blended) view — the
             // rotation REMAINDER — so the plugin can place the callout toast over
             // it on screen instead of dead-centre.
@@ -5242,7 +5243,7 @@ fn with_commas(n: f64) -> String {
     let bytes = digits.as_bytes();
     let mut out = String::new();
     for (i, c) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*c as char);

@@ -437,8 +437,8 @@ mod tests {
 
         // 1s silence, ~0.5s tone (speech), 1s silence.
         let mut audio = vec![0.0f32; frame_len * 33];
-        audio.extend(std::iter::repeat(0.3).take(frame_len * 16));
-        audio.extend(std::iter::repeat(0.0).take(frame_len * 33));
+        audio.extend(std::iter::repeat_n(0.3, frame_len * 16));
+        audio.extend(std::iter::repeat_n(0.0, frame_len * 33));
 
         let mut got = None;
         for f in frames(&audio, frame_len) {
@@ -462,8 +462,8 @@ mod tests {
         // require 300ms of speech to count.
         let mut seg = Segmenter::new(0.05, 2.5, 0.0, 90, 300, 100_000, 30);
         let mut audio = vec![0.0f32; frame_len * 5];
-        audio.extend(std::iter::repeat(0.3).take(frame_len * 2)); // only 60ms of "speech"
-        audio.extend(std::iter::repeat(0.0).take(frame_len * 10));
+        audio.extend(std::iter::repeat_n(0.3, frame_len * 2)); // only 60ms of "speech"
+        audio.extend(std::iter::repeat_n(0.0, frame_len * 10));
 
         let mut got = None;
         for f in frames(&audio, frame_len) {
@@ -479,9 +479,9 @@ mod tests {
         let frame_len = 480;
         let mut seg = Segmenter::new(0.05, 2.5, 0.0, 90, 60, 100_000, 30);
         let mut audio = vec![0.0f32; frame_len * 20]; // initial silence
-        audio.extend(std::iter::repeat(0.01).take(frame_len * 10)); // quiet pre-onset ambient
-        audio.extend(std::iter::repeat(0.3).take(frame_len * 16)); // speech
-        audio.extend(std::iter::repeat(0.0).take(frame_len * 10));
+        audio.extend(std::iter::repeat_n(0.01, frame_len * 10)); // quiet pre-onset ambient
+        audio.extend(std::iter::repeat_n(0.3, frame_len * 16)); // speech
+        audio.extend(std::iter::repeat_n(0.0, frame_len * 10));
 
         let mut utt = None;
         for f in frames(&audio, frame_len) {

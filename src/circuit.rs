@@ -1202,7 +1202,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // vertical target floor (flown by the VS law below) for a minute.
         // Silently inactive without the plugin probe (the old behavior).
         tick = tick.wrapping_add(1);
-        if tick % 4 == 0 && alt_msl_ft.is_finite() {
+        if tick.is_multiple_of(4) && alt_msl_ft.is_finite() {
             if let Some(hp) = hp_v {
                 let (glat, glon) = crate::nav::project_latlon(lat, lon, hp, 1.2);
                 if let Some(e) = crate::terrain::max_elevation_ft(&xp, &[(glat, glon)]).await {

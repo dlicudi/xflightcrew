@@ -768,6 +768,8 @@ mod tests {
     use crate::config::Config;
     use crate::tools::Registry;
 
+    type LlmCase<'a> = (&'a str, &'a str, Option<(&'a str, Value)>);
+
     #[test]
     fn recovers_toolcall_emitted_as_text() {
         let tools = vec![ToolSpec {
@@ -924,7 +926,7 @@ mod tests {
         let specs = Registry::for_aircraft(&profile).specs();
 
         // (utterance, expected tool, optional (arg key, expected value))
-        let cases: &[(&str, &str, Option<(&str, Value)>)] = &[
+        let cases: &[LlmCase<'_>] = &[
             ("flaps up", "set_flaps", Some(("notch", json!("up")))),
             (
                 "set flaps to ten degrees",
@@ -1131,7 +1133,7 @@ mod tests {
 
         // Positives: noisy real-world phrasings → expected tool (+ optional arg).
         // Strings marked "(log)" are verbatim whisper output from logs/.
-        let positives: &[(&str, &str, Option<(&str, Value)>)] = &[
+        let positives: &[LlmCase<'_>] = &[
             ("Slaps up.", "set_flaps", Some(("notch", json!("up")))), // flaps→slaps
             ("Flaps down 10.", "set_flaps", Some(("notch", json!("10")))), // (log)
             (
@@ -1283,7 +1285,7 @@ mod tests {
 
         // Spoken exactly as a pilot reads the C172 checklist. expected_tool = ""
         // marks an item we suspect has NO tool yet (a known gap to confirm).
-        let cases: &[(&str, &str, Option<(&str, Value)>)] = &[
+        let cases: &[LlmCase<'_>] = &[
             // electrical: "master switch" = battery, "avionics switch"
             (
                 "master switch on",
