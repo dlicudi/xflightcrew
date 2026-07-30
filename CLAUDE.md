@@ -232,7 +232,14 @@ seven statics, read only through its narrow accessors (`clearance_state`,
 platform altitude, whether the approach clearance has been issued), for a
 crew that intends to COMPLY rather than fly its own path beside a controller
 who believes it is being vectored; `vectored_callsign` only says a plan
-exists —
+exists. NO CONSUMER YET, deliberately: full auto's vectored arrival was
+written and REVERTED the same day (2026-07-30), because `arm_vectors` lives
+on the APPROACH controller and the tower answers a vector request with
+"contact Approach on ...". Requesting on the tower frequency and then waiting
+is a no-op at every field that HAS approach service, and it cost 45 s of
+unmanaged flight at the fields that don't. Doing it properly needs an
+`approach_khz` accessor (the Station has the field, the crew has no reader),
+a COM1 retune, and a second request on the new frequency —
 `landing_handoff_runway` — the approach→tower handoff that still owes the
 tower a "final" report, feeding the crew's landing-clearance coach — plus
 two `take_*` queue consumers for the main loop). The world side (station/tower)

@@ -841,114 +841,6 @@ const AIRBORNE_MIN_AGL_FT: f64 = 300.0;
 /// Stage 4 of a Flight mission: the takeoff, the enroute fixes at the plan's
 /// altitudes, then the destination's published approach with autoland as the
 /// fallback — every phase one of the proven loops, watched in sequence.
-/// Longest we will sit under vectors before giving up and flying our own
-/// arrival. Generous: a real downwind-base-final vectored circuit at a busy
-/// field takes minutes, and the exit below is a fall-through, not a failure.
-const VECTOR_MAX_SECS: f64 = 420.0;
-/// Stop chasing the assigned altitude once within this of it.
-const VECTOR_ALT_DEADBAND_FT: f64 = 200.0;
-
-/// Request vectors and fly the ones we are given, until the approach clearance
-/// arrives (then report established) or the budget runs out.
-///
-/// Returns when the crew should resume its own arrival. Deliberately quiet
-/// about failure: not being vectored is the normal case at most fields.
-async fn fly_assigned_vectors(
-    xp: &XPlaneClient,
-    voice: &Option<Voice>,
-    callsign: &Option<String>,
-) {
-    use crate::party_line::assigned_vector;
-
-    crate::circuit::transmit(crate::circuit::radio_call(callsign, "request vectors"));
-    event("request_vectors", json!({}));
-
-    let start = std::time::Instant::now();
-    let mut complying = false;
-    loop {
-        if start.elapsed().as_secs_f64() > VECTOR_MAX_SECS {
-            event("vectors_timeout", json!({ "complying": complying }));
-            return;
-        }
-        if crate::xplane::sim_frozen(xp).await {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            continue;
-        }
-        let Some(v) = assigned_vector() else {
-            // Nothing assigned yet. If we were never vectored at all, the
-            // field has no approach service and the tower said so — fall
-            // through rather than orbit waiting for an answer that is not
-            // coming.
-            if complying {
-                event("vectors_ended", json!({}));
-                return;
-            }
-            if start.elapsed().as_secs_f64() > 45.0 {
-                event("vectors_unanswered", json!({}));
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            continue;
-        };
-
-        if !complying {
-            complying = true;
-            announce(
-                voice,
-                Priority::Advisory,
-                "Under radar vectors. Flying the controller's headings.",
-            );
-            event("vectors_accepted", json!({ "runway": v.runway_spoken }));
-        }
-
-        // The controller's heading is a TRUE bearing (the station computes it
-        // with nav::bearing_deg), and the bug is MAGNETIC. Converting is not
-        // optional — it is a 20° error where the variation is large.
-        let mag_var = xp
-            .get_float("sim/flightmodel/position/magnetic_variation")
-            .await
-            .unwrap_or(0.0);
-        let bug = crate::autoland::true_to_mag(v.heading_deg, mag_var);
-        let _ = xp
-            .set_float(
-                "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot",
-                bug,
-            )
-            .await;
-
-        // Descend toward the platform altitude, never climb to it: the vector
-        // altitude is a ceiling we are being brought down to, and a climb here
-        // would fight an approach that is trying to get us low enough to
-        // intercept from below.
-        if let Ok(alt) = xp.get_float("sim/flightmodel/misc/h_ind").await {
-            let err = alt - v.target_alt_ft;
-            let vs = if err > VECTOR_ALT_DEADBAND_FT {
-                -(err * 2.0).clamp(300.0, 1500.0)
-            } else {
-                0.0
-            };
-            let _ = xp
-                .set_float("sim/cockpit/autopilot/vertical_velocity", vs)
-                .await;
-        }
-
-        // "Cleared ILS approach, report established" — the vectors are done.
-        // The report is what earns the tower handoff and, after it, the
-        // landing clearance.
-        if v.cleared {
-            crate::circuit::transmit(crate::circuit::radio_call(callsign, "established"));
-            event("established_reported", json!({ "runway": v.runway_spoken }));
-            announce(
-                voice,
-                Priority::Advisory,
-                "Cleared for the approach, established. Landing us.",
-            );
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
-}
-
 async fn fly_route(
     xp: &XPlaneClient,
     config: &Config,
@@ -1114,22 +1006,6 @@ async fn fly_route(
         crate::circuit::transmit(crate::circuit::radio_call(callsign, "inbound for landing"));
         event("inbound_call", json!({ "khz": khz }));
     }
-    // --- Vectors: ASK the controller, then COMPLY. ---
-    // The station has been able to vector since July — it builds the intercept
-    // from real localizer data, reads the platform altitude out of the CIFP
-    // approach legs, and aims a join point that keeps us BELOW the slope — and
-    // no automation had ever asked for it. The crew re-derived a worse approach
-    // alongside a controller who was never engaged.
-    //
-    // Asking obliges us to fly what we are told, which is why this reads
-    // `assigned_vector` (what was TRANSMITTED) rather than inventing a path
-    // beside a controller who believes we are complying. Every exit falls
-    // through to the approach/autoland branch below unchanged, so no station,
-    // no approach service, or a controller that never answers costs nothing.
-    if callsign.is_some() && crate::mode::atc_enabled() {
-        fly_assigned_vectors(xp, voice, callsign).await;
-    }
-
     // The wind-chosen end (build_arrival) drives BOTH the published-approach
     // branch and the visual fallback — the visual autoland is forced onto the
     // same runway so a tailwind can't be re-picked back in by track.
