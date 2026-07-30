@@ -432,6 +432,18 @@ pub fn rotate_ok(err_deg: f64, remaining_m: f64) -> bool {
 pub struct RotatePitch {
     out: f64,
     prev_theta: Option<f64>,
+    /// Smoothed pitch rate, deg/s. The RAW two-sample rate is what this law
+    /// damps with, and on a 0.15-0.3 s tick with the nose moving ~6 deg/s the
+    /// lead term it feeds (`PITCH_LEAD_S` = 1 s) contributes ±6° — larger than
+    /// the ±4° attitude error it exists to damp. The loop goes rate-dominated
+    /// and rings: an SF50 held 5.6° to 13.2° about an 8° target, period ~1.3 s,
+    /// all the way from liftoff to the 300 ft AP handover, where it stopped
+    /// dead because the autopilot flies it from there (EGHI, 2026-07-30).
+    ///
+    /// Every other rate in this codebase is smoothed for exactly this reason —
+    /// the taxi loop's yaw and the speed governor's trend both run an EMA.
+    /// This one was reading raw.
+    rate: f64,
     /// The commanded attitude, ramped at [`ROTATE_RATE_DEG_S`] from wherever
     /// the nose was on the first tick. `None` until then.
     target: Option<f64>,
@@ -449,6 +461,7 @@ impl RotatePitch {
         RotatePitch {
             out: 0.0,
             prev_theta: None,
+            rate: 0.0,
             target: None,
             ceiling: tail_strike_deg.map(|d| d - TAIL_STRIKE_MARGIN_DEG),
         }
@@ -461,8 +474,13 @@ impl RotatePitch {
 
     pub fn step(&mut self, theta_deg: f64, dt_s: f64) -> f64 {
         let dt = dt_s.clamp(0.05, 1.0);
-        let rate = self.prev_theta.map_or(0.0, |p| (theta_deg - p) / dt);
+        let raw_rate = self.prev_theta.map_or(0.0, |p| (theta_deg - p) / dt);
         self.prev_theta = Some(theta_deg);
+        // Half-and-half, the same blend the taxi loop's yaw damper uses: enough
+        // to take the sampling noise out of the lead term without lagging the
+        // real motion the damping is for.
+        self.rate = self.rate * 0.5 + raw_rate.clamp(-30.0, 30.0) * 0.5;
+        let rate = self.rate;
         // The commanded attitude walks up from where the nose actually was,
         // never further than the airframe's geometry allows.
         let cap = self
@@ -1575,7 +1593,18 @@ mod tests {
         for _ in 0..10 {
             settled.step(ROTATE_PITCH_DEG - 1.0, 0.15);
         }
-        settled.step(ROTATE_PITCH_DEG, 0.15);
+        // The rate estimate is SMOOTHED (see RotatePitch::rate), so arriving
+        // at the target leaves a decaying rate residue for a few ticks before
+        // the pull is truly standing. Let the filter settle, then it must hold
+        // dead still — and it must CONVERGE on the way, never wander.
+        let mut prev_gap = f64::MAX;
+        for _ in 0..20 {
+            let x = settled.step(ROTATE_PITCH_DEG, 0.15);
+            let y = settled.step(ROTATE_PITCH_DEG, 0.15);
+            let gap = (x - y).abs();
+            assert!(gap <= prev_gap + 1e-9, "must converge, not ring: {gap}");
+            prev_gap = gap;
+        }
         let a = settled.step(ROTATE_PITCH_DEG, 0.15);
         let b = settled.step(ROTATE_PITCH_DEG, 0.15);
         assert!(
