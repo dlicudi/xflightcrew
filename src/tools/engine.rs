@@ -24,7 +24,6 @@ const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed"; // m/s
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 const CMD_MAGS_BOTH: &str = "sim/magnetos/magnetos_both";
 const CMD_MAGS_OFF: &str = "sim/magnetos/magnetos_off";
-const CMD_STARTER: &str = "sim/starters/engage_starter_1";
 // Alternator (generator #1): the ALT half of the master switch. Brought online
 // as part of the start so the running engine charges the bus — and so the
 // monitor's "alternator offline" check doesn't fire the instant we finish.
@@ -715,6 +714,18 @@ async fn lean_seek(ctx: &ToolCtx<'_>, economy: bool) -> Option<String> {
 }
 
 pub struct StartEngine {
+    /// How many engines to crank, in order. A piston twin has a starter per
+    /// engine and no combined command, so the sequence runs once per engine.
+    pub engines: usize,
+    /// Per-side CYCLE selectors (one per engine), for airframes whose fuel
+    /// valves are knobs stepped by up/down commands rather than set directly.
+    /// Same failure as the singular selector below, through a different shape:
+    /// the Baron 58's selectors sat at OFF, so a textbook start — mags both,
+    /// mixture rich, throttle cracked, 28 volts on the bus from a ground cart —
+    /// cranked two dry engines and reported "neither engine has caught"
+    /// (2026-08-01). Its position dataref is READ-ONLY, so nothing but the
+    /// command could ever have opened them.
+    pub cycle_selectors: Vec<crate::aircraft::CycleSelectorProfile>,
     /// The airframe's fuel selector, when it has one. A start with the selector
     /// OFF just cranks dry (seen live on the SR22 after an xlua plugin reload
     /// reset it), so the sequence selects a tank first, like the checklist does.
@@ -831,26 +842,52 @@ impl Tool for StartEngine {
             }
         }
 
+        // Cycle selectors to their start positions BEFORE anything else: on
+        // these airframes only the command opens the valve, and everything
+        // below is just cranking a dry engine until it says so.
+        let mut cycled = Vec::new();
+        for sel in &self.cycle_selectors {
+            if let Some(target) = sel.start_value {
+                let landed = super::cycle::cycle_to(ctx, &sel.switch, target).await?;
+                if landed != target {
+                    return Ok(format!(
+                        "The {} won't move off {landed} — check it before I crank.",
+                        sel.spoken
+                    ));
+                }
+                cycled.push(sel.spoken.clone());
+            }
+        }
+        if !cycled.is_empty() {
+            fuel_note = format!("{} on, ", crate::join_and(&cycled));
+        }
+
         // Pre-start configuration.
         ctx.xplane.set_float(MIXTURE, 1.0).await?; // full rich
         ctx.xplane.set_float(THROTTLE, 0.1).await?; // crack the throttle
         ctx.xplane.run_command(CMD_MAGS_BOTH).await?;
 
-        // Crank the starter (held a few seconds so it can catch).
-        ctx.xplane.run_command_for(CMD_STARTER, 3.0).await?;
-
-        // Give it a moment to fire, then confirm engine 1 is running.
-        for _ in 0..6 {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let running = ctx
-                .xplane
-                .get_float_array(ENGN_RUNNING)
-                .await
-                .ok()
-                .and_then(|v| v.first().copied())
-                .map(|r| r > 0.5)
-                .unwrap_or(false);
-            if running {
+        // Crank each engine in turn, one starter at a time (they share a
+        // battery, and a real start sequence is sequential anyway). A twin
+        // whose second starter is never touched taxis out on one engine while
+        // the copilot reports a successful start — the check below reads the
+        // engine it just cranked, not always element 0.
+        let engines = self.engines.max(1);
+        let mut caught = 0usize;
+        for i in 0..engines {
+            ctx.xplane
+                .run_command_for(&starter_command(i), 3.0)
+                .await?;
+            for _ in 0..6 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if engine_running(ctx, i).await {
+                    caught += 1;
+                    break;
+                }
+            }
+        }
+        {
+            if caught == engines {
                 // Bring the charging sources online now there's an engine to
                 // drive them — ALL of them (the SR22's ALT 2 sat off forever
                 // when this only fired generator 1), so we charge the bus
@@ -896,16 +933,44 @@ impl Tool for StartEngine {
                     "but the alternator didn't come on, check it"
                 };
                 let avi = if avionics_on { ", avionics on" } else { "" };
+                let started = if engines > 1 {
+                    "Both engines started"
+                } else {
+                    "Engine started"
+                };
                 return Ok(format!(
                     "Roger — {fuel_note}mixture rich, throttle cracked, mags both, cranking. \
-                     Engine started, {alt}{avi}."
+                     {started}, {alt}{avi}."
                 ));
             }
         }
+        // Say WHICH engine on a twin: "the engine hasn't caught" sends the
+        // pilot looking at the one that is already running.
+        let which = match (engines, caught) {
+            (1, _) => "the engine hasn't caught".to_string(),
+            (_, 0) => "neither engine has caught".to_string(),
+            (_, n) => format!("engine {} hasn't caught", n + 1),
+        };
         Ok(format!(
-            "Cranking — {fuel_note}the engine hasn't caught. Check fuel and mixture, then try again."
+            "Cranking — {fuel_note}{which}. Check fuel and mixture, then try again."
         ))
     }
+}
+
+/// The starter command for engine `i` (0-based): X-Plane numbers them from one.
+fn starter_command(i: usize) -> String {
+    format!("sim/starters/engage_starter_{}", i + 1)
+}
+
+/// Is engine `i` running? A failed read is "not running", so the caller keeps
+/// waiting rather than declaring a start it never saw.
+async fn engine_running(ctx: &ToolCtx<'_>, i: usize) -> bool {
+    ctx.xplane
+        .get_float_array(ENGN_RUNNING)
+        .await
+        .ok()
+        .and_then(|v| v.get(i).copied())
+        .is_some_and(|r| r > 0.5)
 }
 
 /// Electric/auxiliary fuel pump(s). `engines` = how many to switch (a twin
@@ -1087,21 +1152,27 @@ impl Tool for SetMagnetos {
                 ))
             }
         };
+        // Both selectors are per-engine ARRAYS; they differ only in which one
+        // the airframe wires its mags to. So both write every engine: the key
+        // switches on a piston twin are one per engine (the Baron 58 has a left
+        // and a right), and writing element 0 alone left the right engine on
+        // whatever the pilot last selected while the readback — also element 0
+        // — happily confirmed the change. A single engine writes element 0 and
+        // nothing else, exactly as before.
         let dref = if self.per_engine {
             IGNITION_ON
         } else {
             IGNITION_KEY
         };
-        if self.per_engine {
-            set_each_engine(ctx, IGNITION_ON, self.engines, key).await?;
-        } else {
-            ctx.xplane.set_int_array_elem(IGNITION_KEY, 0, key).await?;
-        }
+        set_each_engine(ctx, dref, self.engines, key).await?;
+        // Confirm from the LAST engine written: element 0 can be right while a
+        // later one silently refused (a failed write, a model that drives its
+        // own switch), and the mag check is exactly where that matters.
         let actual = ctx
             .xplane
             .get_float_array(dref)
             .await?
-            .first()
+            .get(self.engines.max(1) - 1)
             .copied()
             .unwrap_or(-1.0)
             .round() as i64;
@@ -1300,6 +1371,85 @@ impl Tool for StopEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cold start with the fuel selectors OFF must OPEN them, not crank two
+    /// dry engines and report that neither caught (Baron 58, 2026-08-01). The
+    /// aircraft's own selector dataref is read-only, so the cycle command is
+    /// the only thing that can do it.
+    #[tokio::test]
+    async fn a_cold_start_opens_cycle_fuel_selectors_first() {
+        let profile = crate::aircraft::load("beechcraft_baron_58").expect("baron profile");
+        let cfg = crate::config::Config::default();
+        // Selectors already ON: the start proceeds and cranks BOTH engines.
+        // The engines "catch" shortly after the first crank, driven from a
+        // task alongside — otherwise the sequence waits out its full
+        // three-second-per-engine give-up and the test costs six seconds.
+        let fake = std::sync::Arc::new(crate::xplane::FakeXPlane::with_reads(&[
+            (BATTERY, 1.0),
+            (ONGROUND, 1.0),
+            ("laminar/b58/fuel_selector_L", 1.0),
+            ("laminar/b58/fuel_selector_R", 1.0),
+        ]));
+        fake.set_read_array(BUS_VOLTS, &[28.0]);
+        fake.set_read_array(ENGN_RUNNING, &[0.0, 0.0]);
+        let catching = fake.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            catching.set_read_array(ENGN_RUNNING, &[1.0, 1.0]);
+        });
+        let start = StartEngine {
+            engines: 2,
+            cycle_selectors: profile.fuel_selectors.clone(),
+            fuel_selector: None,
+            alternator_on_cmds: Vec::new(),
+            bus_power_on_cmds: Vec::new(),
+        };
+        let ctx = ToolCtx {
+            xplane: fake.as_ref(),
+            config: &cfg,
+            voice: None,
+            status: None,
+            reminders: None,
+        };
+        let reply = start.execute(&json!({}), &ctx).await.expect("start runs");
+        assert!(reply.contains("Both engines started"), "{reply}");
+        assert!(fake.ran("sim/starters/engage_starter_1"));
+        assert!(
+            fake.ran("sim/starters/engage_starter_2"),
+            "a twin cranks both"
+        );
+
+        // Selectors stuck OFF (the position never moves): refuse and say so,
+        // rather than cranking a dry engine to no effect.
+        let stuck = crate::xplane::FakeXPlane::with_reads(&[
+            (BATTERY, 1.0),
+            (ONGROUND, 1.0),
+            ("laminar/b58/fuel_selector_L", 0.0),
+            ("laminar/b58/fuel_selector_R", 0.0),
+        ]);
+        stuck.set_read_array(BUS_VOLTS, &[28.0]);
+        stuck.set_read_array(ENGN_RUNNING, &[0.0, 0.0]);
+        let ctx = ToolCtx {
+            xplane: &stuck,
+            config: &cfg,
+            voice: None,
+            status: None,
+            reminders: None,
+        };
+        let reply = start.execute(&json!({}), &ctx).await.expect("start runs");
+        assert!(
+            stuck.ran("laminar/b58/fuel_selector_L_up"),
+            "it must try the command: {reply}"
+        );
+        assert!(
+            reply.contains("left fuel selector"),
+            "name what is wrong: {reply}"
+        );
+        assert!(
+            !stuck.ran("sim/starters/engage_starter_1"),
+            "never crank a dry engine: {reply}"
+        );
+    }
 
     #[test]
     fn impossible_percent_is_queried_not_clamped() {

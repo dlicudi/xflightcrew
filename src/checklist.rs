@@ -744,6 +744,8 @@ pub async fn run_step(
         "autopilot_off" => AutopilotOff.execute(args, ctx).await,
         "start_engine" => {
             StartEngine {
+                engines,
+                cycle_selectors: Vec::new(),
                 fuel_selector: fuel_selector.clone(),
                 alternator_on_cmds: crate::tools::alternator_on_cmds(electrical),
                 bus_power_on_cmds: crate::tools::bus_power_on_cmds(electrical),

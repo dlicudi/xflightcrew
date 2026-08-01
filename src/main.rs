@@ -3576,6 +3576,7 @@ fn icao_to_profile(icao: &str) -> String {
         "SF50" => "cirrus_vision_sf50",
         "DC3" | "DC30" => "dc3",
         "BE9L" | "BE9T" | "C90" | "C90B" => "king_air_c90b",
+        "BE58" | "BE55" => "beechcraft_baron_58",
         "EVOT" | "EVOP" => "lancair_evolution",
         "DHC6" => "dhc6_twin_otter",
         _ => "cessna_172sp",
@@ -5120,6 +5121,24 @@ fn reference_limits(profile: &aircraft::AircraftProfile, t: &str) -> Option<Stri
     if t.contains("vy") || t.contains("best rate") || t.contains("best climb") {
         if let Some(v) = r.and_then(|r| r.vy_kts) {
             parts.push(format!("Vy, best rate of climb, {}", kt(v)));
+        }
+    }
+    // The twin pair. Asked for by name far more often than by definition ("what's
+    // blue line?"), and absent on a single, where the profile leaves them unset.
+    if t.contains("vyse") || t.contains("blue line") || t.contains("single engine climb") {
+        if let Some(v) = r.and_then(|r| r.vyse_kts) {
+            parts.push(format!(
+                "blue line, Vyse, {} — single-engine best rate",
+                kt(v)
+            ));
+        }
+    }
+    if t.contains("vmc") || t.contains("red line") || t.contains("minimum control") {
+        if let Some(v) = r.and_then(|r| r.vmca_kts) {
+            parts.push(format!(
+                "Vmca, single-engine minimum control, {}",
+                kt(v)
+            ));
         }
     }
     if t.contains("rotat")
@@ -7134,6 +7153,43 @@ mod tests {
         assert!(super::reference_limits(&sr, "max crosswind")
             .unwrap()
             .contains("21"));
+    }
+
+    /// The Baron answers the two questions only a twin gets asked, and the
+    /// mapping that gets you the profile in the first place.
+    #[test]
+    fn the_baron_recites_the_twin_speeds() {
+        assert_eq!(super::icao_to_profile("BE58"), "beechcraft_baron_58");
+        assert_eq!(super::icao_to_profile("be58"), "beechcraft_baron_58");
+        let p = super::aircraft::load("beechcraft_baron_58").expect("baron profile");
+        assert!(super::reference_limits(&p, "what's blue line")
+            .unwrap()
+            .contains("100 knots"));
+        assert!(super::reference_limits(&p, "what's vmc")
+            .unwrap()
+            .contains("84 knots"));
+        // Per-notch Vfe, spoken as two limits rather than one.
+        let vfe = super::reference_limits(&p, "flap speed").unwrap();
+        assert!(vfe.contains("152") && vfe.contains("122"), "{vfe}");
+        // A single has neither twin speed, so it says nothing rather than
+        // inventing one.
+        let c172 = super::aircraft::load("cessna_172sp").expect("172 profile");
+        assert!(super::reference_limits(&c172, "what's blue line").is_none());
+
+        // The profile shapes the tool surface: retractable gear earns a gear
+        // tool the 172 never gets, and a fuel-injected engine earns no carb
+        // heat. This is the whole point of per-airframe profiles.
+        let reg = super::tools::Registry::for_aircraft(&p);
+        assert!(reg.get("gear").is_some(), "the Baron's gear retracts");
+        assert!(reg.get("set_magnetos").is_some());
+        assert!(reg.get("start_engine").is_some());
+        assert!(
+            reg.get("set_carb_heat").is_none(),
+            "IO-550s are fuel injected"
+        );
+        assert!(super::tools::Registry::for_aircraft(&c172)
+            .get("gear")
+            .is_none());
     }
 
     #[test]

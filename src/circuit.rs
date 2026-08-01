@@ -162,6 +162,40 @@ pub fn interceptable(xtk_m: f64, along_m: f64) -> bool {
     along_m >= need * INTERCEPT_MARGIN
 }
 
+/// How near the runway course counts as "our turn has rolled out".
+const ROLLED_OUT_HDG_DEG: f64 = 12.0;
+/// Distance still to run below which we hand over regardless of alignment: a
+/// turn that has gone wrong is still better flown by autoland's intercept than
+/// by a pattern leg that has run out of room.
+const LAST_DITCH_ALONG_M: f64 = 1500.0;
+
+/// Is the aircraft ready to be handed to autoland?
+///
+/// Three conditions, and the middle one is the one that was missing.
+/// `interceptable` asks whether autoland COULD close the offset; being able to
+/// close it is not the same as being lined up. The circuit's own final leg
+/// commands the runway heading and nothing else — it has no intercept — so the
+/// turn onto final is the only thing that ever puts the aircraft on the
+/// centreline, and releasing at the instant that turn is ARMED means it is
+/// never flown at all.
+///
+/// EGHI, 2026-08-01, a Baron: base was crossing at 290° with 1,813 m still to
+/// go to the centreline and 4,092 m to run. `interceptable` said yes (a 28°
+/// cut), so autoland took it there and flew the diagonal in — the aircraft
+/// approached and touched down at an angle instead of rolling out on the
+/// centreline and flying a straight final. The turn was armed and then
+/// immediately handed away.
+///
+/// So: wait until our own turn has actually rolled out onto the runway course
+/// (by which point the geometry leaves ~0.3 radii to trim, which is what
+/// autoland's final pursuit is for), unless we are running out of distance.
+pub fn ready_for_autoland(xtk_m: f64, along_m: f64, hdg_err_deg: f64) -> bool {
+    if !interceptable(xtk_m, along_m) {
+        return false;
+    }
+    hdg_err_deg.abs() <= ROLLED_OUT_HDG_DEG || along_m.abs() <= LAST_DITCH_ALONG_M
+}
+
 /// Floor for the base/final descent, feet above the field — the lowest the
 /// pattern will put the aircraft before autoland takes it. It is a FLOOR now,
 /// not a target: the leg descends the 3° path and stops here (see the vertical
@@ -1248,13 +1282,20 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         let a_m = -along_track_nm(lat, lon, &rwy) * M_PER_NM;
         let x_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
 
-        // --- Hand over only when autoland can actually fly it. ---
-        // `turning_final` means the turn onto final is under way; the aircraft
-        // is still up to 1.3 radii abeam at that moment. Releasing there gave
-        // autoland 2,815 m of offset with 2,421 m to run — a 49° angle, no cut
-        // closes it — and it crossed the threshold 188 m off the paint. Fly
-        // our own turn, let go when the offset is closeable.
-        if turning_final && interceptable(x_m, a_m.abs()) {
+        // --- Hand over only once our own turn onto final has rolled out. ---
+        // `turning_final` means the turn may BEGIN; the aircraft is still up
+        // to 1.3 radii abeam at that instant, pointing across the centreline.
+        // See `ready_for_autoland` for why "autoland could close this" is not
+        // the same question as "we are lined up".
+        // A failed heading read reads as "not rolled out yet": it can only
+        // delay the handoff by a tick, where treating it as aligned would hand
+        // over the very thing this guard exists to prevent.
+        let hdg_err = psi_r
+            .as_ref()
+            .ok()
+            .map(|psi| ((psi - rwy_course + 540.0).rem_euclid(360.0)) - 180.0)
+            .unwrap_or(180.0);
+        if turning_final && ready_for_autoland(x_m, a_m.abs(), hdg_err) {
             let alt_msl = field_elev_ft + agl_ft;
             let arr = ArrivalCtx {
                 apt_dat: &p.apt_dat,
@@ -2233,5 +2274,41 @@ mod tests {
 
         // On the centreline anything works, including at the threshold.
         assert!(interceptable(0.0, 0.0));
+    }
+
+    /// Being ABLE to close the offset is not being lined up, and the circuit
+    /// has no intercept of its own — its final leg commands the runway heading
+    /// and nothing else. So the handover waits for our own turn to roll out.
+    #[test]
+    fn the_handover_waits_for_the_turn_to_roll_out_not_just_for_flyable_geometry() {
+        // EGHI 2026-08-01, the Baron, taken straight from the blackbox: on
+        // base at 290 true, runway 02 (course 20), 1,813 m off the centreline
+        // with 4,092 m to run. The geometry is a 28 degree cut, so
+        // `interceptable` is happy...
+        let hdg_err_on_base = ((290.0 - 20.0 + 540.0_f64).rem_euclid(360.0)) - 180.0;
+        assert!(interceptable(1813.0, 4092.0), "a 28 degree cut is closeable");
+        // ...but the aircraft is still 90 degrees across the centreline, and
+        // handing it over there is what made it approach and land at an angle.
+        assert!(
+            !ready_for_autoland(1813.0, 4092.0, hdg_err_on_base),
+            "still turning: fly the turn, do not hand over the diagonal"
+        );
+
+        // Rolled out on the runway course with the usual 0.3-radii trim left:
+        // this is the straight-in autoland is for.
+        assert!(ready_for_autoland(400.0, 3500.0, 3.0));
+        assert!(ready_for_autoland(-400.0, 3500.0, -3.0));
+        // Just outside the rollout tolerance, still turning.
+        assert!(!ready_for_autoland(400.0, 3500.0, 25.0));
+
+        // The last-ditch valve: out of room and still not aligned, autoland's
+        // intercept beats a pattern leg that has nowhere left to go.
+        assert!(ready_for_autoland(300.0, 1200.0, 40.0));
+        // ...but never something autoland cannot fly at all, however close.
+        assert!(!ready_for_autoland(2815.0, 1200.0, 0.0));
+
+        // A failed heading read must not read as aligned — the caller passes
+        // 180, the worst case, so the handover simply waits a tick.
+        assert!(!ready_for_autoland(1813.0, 4092.0, 180.0));
     }
 }

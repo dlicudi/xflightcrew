@@ -19,9 +19,27 @@ const CMD_TOGGLE_CHOCKS: &str = "sim/flight_controls/toggle_chocks";
 /// Per-wheel chock state (array, 1 = chocked).
 const IS_CHOCKED: &str = "sim/flightmodel2/gear/is_chocked";
 // --- ground power ---
+/// Summons or dismisses the ground power CART. It drives up, plugs in, and
+/// starts generating — and that is all it does.
 const CMD_TOGGLE_GPU: &str = "sim/ground_ops/toggle_gpu_request";
-/// GPU output volts — > 0 means the aircraft is *receiving* ground power.
+/// What the cart is generating. Above zero means a cart is there and live; it
+/// says NOTHING about whether the aircraft is drawing from it.
 const GPU_VOLTS: &str = "sim/cockpit2/electrical/GPU_generator_volts";
+/// The aircraft's external-power contactor: 1 = the cart is actually feeding
+/// the bus.
+///
+/// This is the half that was missing, and the failure is silent in the worst
+/// way (Baron 58, 2026-08-01). The cart arrived and generated 28 volts, so a
+/// check on `GPU_VOLTS` alone said "ground power's already connected" — twice,
+/// to a pilot who had been told by full auto that the battery was at 21 volts
+/// and would not start. The bus was still on the battery at 20.7. On airframes
+/// with an EXT PWR switch the pilot closes this themselves; the Baron models no
+/// such switch, so nobody was ever going to close it and the cart sat there
+/// humming to itself.
+const GPU_ON: &str = "sim/cockpit/electrical/gpu_on";
+/// Main bus volts — what the aircraft actually has to start with, and the only
+/// honest readback for "is there power".
+const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
 // --- pushback ---
 const CMD_PUSH_STRAIGHT: &str = "sim/ground_ops/pushback_straight";
 const CMD_PUSH_LEFT: &str = "sim/ground_ops/pushback_left";
@@ -46,9 +64,24 @@ async fn chocked(ctx: &ToolCtx<'_>) -> bool {
         > 0.5
 }
 
-/// True when the aircraft is receiving ground power.
-async fn gpu_connected(ctx: &ToolCtx<'_>) -> bool {
+/// True when a ground power cart is present and generating.
+async fn cart_present(ctx: &ToolCtx<'_>) -> bool {
     ctx.xplane.get_float(GPU_VOLTS).await.unwrap_or(0.0) > 1.0
+}
+
+/// True when the aircraft is actually being fed by it — cart present AND the
+/// contactor closed. Both halves, because either alone is a lie.
+async fn gpu_connected(ctx: &ToolCtx<'_>) -> bool {
+    cart_present(ctx).await && ctx.xplane.get_float(GPU_ON).await.unwrap_or(0.0) > 0.5
+}
+
+/// Main bus volts, for a readback that reports power rather than intent.
+async fn bus_volts(ctx: &ToolCtx<'_>) -> Option<f64> {
+    ctx.xplane
+        .get_float_array(BUS_VOLTS)
+        .await
+        .ok()
+        .and_then(|v| v.first().copied())
 }
 
 fn on_off_schema() -> Value {
@@ -105,21 +138,45 @@ impl Tool for SetGroundPower {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: OnArg = serde_json::from_value(args.clone())?;
-        let connected = gpu_connected(ctx).await;
-        if connected == a.on {
-            return Ok(if connected {
-                "Ground power's already connected.".to_string()
+        if gpu_connected(ctx).await == a.on {
+            return Ok(if a.on {
+                match bus_volts(ctx).await {
+                    Some(v) => format!("Ground power's already connected, bus at {v:.0} volts."),
+                    None => "Ground power's already connected.".to_string(),
+                }
             } else {
                 "Ground power's already disconnected.".to_string()
             });
         }
-        ctx.xplane.run_command(CMD_TOGGLE_GPU).await?;
-        // The cart takes a moment to roll up and connect, so we can't read the
-        // volts back instantly — confirm the request, not an immediate state.
-        Ok(if a.on {
-            "Roger, requesting ground power.".to_string()
+        // TWO steps, because they are two different things: the cart has to be
+        // there, and the aircraft has to be drawing from it. The request
+        // command is a TOGGLE, so it only ever fires when the cart's presence
+        // is not already what we want — firing it blind sends away the cart we
+        // just asked for.
+        let cart = cart_present(ctx).await;
+        if a.on {
+            if !cart {
+                ctx.xplane.run_command(CMD_TOGGLE_GPU).await?;
+            }
+            ctx.xplane.set_int(GPU_ON, 1).await?;
         } else {
-            "Roger, disconnecting ground power.".to_string()
+            ctx.xplane.set_int(GPU_ON, 0).await?;
+            if cart {
+                ctx.xplane.run_command(CMD_TOGGLE_GPU).await?;
+            }
+        }
+        if !a.on {
+            return Ok("Roger, ground power disconnected.".to_string());
+        }
+        // Report the BUS, not the request: "requesting ground power" while the
+        // battery sits at 21 volts is the answer that started this. A cart
+        // still driving up reads as no power yet, and says so.
+        Ok(match bus_volts(ctx).await {
+            Some(v) if v > 24.0 => format!("Roger, ground power on, bus at {v:.0} volts."),
+            Some(v) => format!(
+                "Ground power requested — the cart's still coming, bus at {v:.0} volts."
+            ),
+            None => "Roger, requesting ground power.".to_string(),
         })
     }
 }
@@ -207,7 +264,86 @@ impl Tool for RequestService {
 
 #[cfg(test)]
 mod tests {
-    use super::pushback_continues;
+    use super::*;
+    use crate::xplane::FakeXPlane;
+
+    fn ctx<'a>(fake: &'a FakeXPlane, cfg: &'a crate::config::Config) -> ToolCtx<'a> {
+        ToolCtx {
+            xplane: fake,
+            config: cfg,
+            voice: None,
+            status: None,
+            reminders: None,
+        }
+    }
+
+    /// No cart yet: summon one AND close the contactor. Closing it is the half
+    /// that was missing — the cart generated 28 volts into a bus that stayed on
+    /// the battery at 20.7, and the tool called that "already connected".
+    #[tokio::test]
+    async fn connecting_summons_the_cart_and_closes_the_contactor() {
+        let cfg = crate::config::Config::default();
+        let fake = FakeXPlane::with_reads(&[(GPU_VOLTS, 0.0), (GPU_ON, 0.0)]);
+        let out = SetGroundPower
+            .execute(&serde_json::json!({"on": true}), &ctx(&fake, &cfg))
+            .await
+            .expect("connect");
+        assert!(fake.ran(CMD_TOGGLE_GPU), "no cart present, so summon one");
+        assert_eq!(fake.last_write(GPU_ON), Some(1.0), "{out}");
+    }
+
+    /// A cart already standing there must NOT be re-requested: the request is a
+    /// toggle, so firing it blind sends away the cart we are trying to use.
+    /// Only the contactor moves.
+    #[tokio::test]
+    async fn a_cart_already_there_is_not_toggled_away() {
+        let cfg = crate::config::Config::default();
+        let fake = FakeXPlane::with_reads(&[(GPU_VOLTS, 28.0), (GPU_ON, 0.0)]);
+        SetGroundPower
+            .execute(&serde_json::json!({"on": true}), &ctx(&fake, &cfg))
+            .await
+            .expect("connect");
+        assert!(
+            !fake.ran(CMD_TOGGLE_GPU),
+            "the cart is already here; toggling would dismiss it"
+        );
+        assert_eq!(fake.last_write(GPU_ON), Some(1.0));
+    }
+
+    /// "Already connected" needs BOTH halves. A live cart with an open
+    /// contactor is not power, and saying so is what left a pilot with a flat
+    /// battery and a cheerful readback.
+    #[tokio::test]
+    async fn a_live_cart_alone_is_not_connected() {
+        let cfg = crate::config::Config::default();
+        let live_cart_open_contactor = FakeXPlane::with_reads(&[(GPU_VOLTS, 28.0), (GPU_ON, 0.0)]);
+        assert!(
+            !gpu_connected(&ctx(&live_cart_open_contactor, &cfg)).await,
+            "cart present, contactor open: the bus has nothing"
+        );
+        let closed_but_no_cart = FakeXPlane::with_reads(&[(GPU_VOLTS, 0.0), (GPU_ON, 1.0)]);
+        assert!(
+            !gpu_connected(&ctx(&closed_but_no_cart, &cfg)).await,
+            "contactor closed onto nothing"
+        );
+        let both = FakeXPlane::with_reads(&[(GPU_VOLTS, 28.0), (GPU_ON, 1.0)]);
+        assert!(gpu_connected(&ctx(&both, &cfg)).await);
+    }
+
+    /// Disconnecting opens the contactor first, then releases the cart — in
+    /// that order, so the bus is never dropped by a cart driving away from a
+    /// still-closed contactor.
+    #[tokio::test]
+    async fn disconnecting_opens_the_contactor_then_releases_the_cart() {
+        let cfg = crate::config::Config::default();
+        let fake = FakeXPlane::with_reads(&[(GPU_VOLTS, 28.0), (GPU_ON, 1.0)]);
+        SetGroundPower
+            .execute(&serde_json::json!({"on": false}), &ctx(&fake, &cfg))
+            .await
+            .expect("disconnect");
+        assert_eq!(fake.last_write(GPU_ON), Some(0.0));
+        assert!(fake.ran(CMD_TOGGLE_GPU), "send the cart away");
+    }
 
     #[test]
     fn native_pushback_stays_cancellable_until_stop() {

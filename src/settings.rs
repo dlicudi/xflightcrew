@@ -757,25 +757,31 @@ mod tests {
     /// Boot publishes the configuration where every consumer reads it, and
     /// hands back the same thing it published: a loop that re-reads the store
     /// per tick and a boot path that kept its own copy must not disagree.
+    ///
+    /// Asserted on fields the registry does NOT manage, deliberately. A
+    /// registry-managed field is exactly the one `install` is entitled to
+    /// overwrite from prefs.json, so asserting the value we passed in would
+    /// make this test pass or fail on whatever the developer last clicked.
     #[test]
     fn install_publishes_the_configuration_it_returns() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cfg = Config {
-            taxi_guide: true,
-            voice_volume: 0.5,
             atc_airport: "EGHI".into(),
+            whisper_model_path: "models/ggml-tiny.en.bin".into(),
             ..Config::default()
         };
         let resolved = install(cfg);
-        assert!(resolved.taxi_guide);
         assert_eq!(resolved.atc_airport, "EGHI");
         let seen_by_a_loop = live();
-        assert!(seen_by_a_loop.taxi_guide);
-        assert_eq!(seen_by_a_loop.voice_volume, 0.5);
+        assert_eq!(seen_by_a_loop.atc_airport, "EGHI");
+        assert_eq!(seen_by_a_loop.whisper_model_path, "models/ggml-tiny.en.bin");
         // ...and a subsequent change is visible to the next reader, which is
         // the whole point of the store.
-        update(|c| c.taxi_guide = false);
-        assert!(!live().taxi_guide);
-        assert!(resolved.taxi_guide, "the boot snapshot is still its own");
+        update(|c| c.atc_airport = "LXGB".into());
+        assert_eq!(live().atc_airport, "LXGB");
+        assert_eq!(
+            resolved.atc_airport, "EGHI",
+            "the boot snapshot is still its own"
+        );
     }
 }

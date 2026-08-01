@@ -129,6 +129,66 @@ a perfectly good line-up a failure, twice, and the MD-82 could not depart
 the field at all. Both default to the old figures when a profile is silent,
 so every GA airframe is untouched.
 
+A STOCK airframe can expose a gap the add-ons never did (2026-08-01, the
+Beechcraft Baron 58, `BE58`). It is the first piston twin whose systems are
+all stock: the DC-3 is a twin too, but every system on it is xlua-overridden,
+so it goes through the cycle-switch model and the generic tools were never
+asked to drive two of anything. They half-did. `set_magnetos` wrote
+`ignition_key[0]` only, so the right engine kept whatever the pilot last
+selected while the readback — also element 0 — confirmed the change, which is
+the mag check confirming itself. `start_engine` cranked `engage_starter_1` and
+watched `ENGN_running[0]`, so it would have reported a successful start with
+the right engine cold, and full auto would have taxied out on one. Both now
+take `engines` and run per engine (the readback reads the LAST one written,
+since element 0 can be right while a later one silently refused), and the
+starter command is derived per engine rather than a constant. Singles are
+byte-identical: one engine writes element 0 and cranks starter 1, exactly as
+before. The profile itself is worth reading for where its numbers come from,
+because two sources disagree and both are right about different things: the
+`.acf` is what the flight model FLIES (the monitor's clean stall is its 84 kt,
+not the POM card's 80) and the shipped POM is what the copilot RECITES. Per-notch
+Vfe matters here as much as on the 172 — approach flap is good to 152 kt and
+full only to 122, and the POM's single "Vfe 152" would put full flap out thirty
+knots early. `vyse_kts` and `vmca_kts` joined the reference card for it: blue
+line and red line are the two speeds only a twin gets asked for, and they stay
+`None` on a single so the copilot says nothing rather than inventing one.
+
+The same airframe found the ground-power tool telling a confident lie the same
+day. **A cart and a contactor are two different things.** `set_ground_power`
+summoned the cart (`sim/ground_ops/toggle_gpu_request`) and judged success from
+`GPU_generator_volts`, which is what the CART is generating and says nothing
+about whether the aircraft is drawing from it. The cart arrived, generated 28
+volts, and the tool answered "ground power's already connected" — twice, to a
+pilot whose battery full auto had just called at 21 volts, with the bus still
+on that battery at 20.7. The missing half is `sim/cockpit/electrical/gpu_on`,
+the external-power contactor: on an airframe with an EXT PWR switch the pilot
+closes it, and the Baron models no such switch, so nobody was ever going to.
+The tool now does both, in order (contactor last on connect, first on
+disconnect), fires the cart TOGGLE only when the cart's presence is not already
+what it wants — firing it blind dismisses the cart you just asked for — and
+reports BUS volts instead of the request, because "requesting ground power"
+while the battery sits at 21 volts is the answer that started this.
+
+And a third, in the circuit, from the same sortie: **being able to close an
+offset is not being lined up.** The 2026-07-30 fix made the handover to
+autoland wait for `interceptable` — can autoland's 35-degree pursuit actually
+reach the centreline from here — which fixed a threshold crossed 188 m off the
+paint. It is the wrong QUESTION for a base leg. The circuit's own final leg
+commands the runway heading and nothing else; it has no intercept, so the turn
+onto final is the only thing that ever puts the aircraft on the centreline, and
+`turning_final` means that turn may BEGIN. At EGHI the Baron was handed over on
+base at 290 degrees with 1,813 m still to go to the centreline and 4,092 m to
+run: a 28-degree cut, comfortably "interceptable", so autoland took it there
+and flew the diagonal in. The aircraft approached and touched down at an angle,
+having never flown the turn that was armed a second earlier. `ready_for_autoland`
+now waits for our own turn to ROLL OUT (heading within `ROLLED_OUT_HDG_DEG` of
+the runway course, which the 1.3-radii geometry leaves about 0.3 radii of trim
+after — exactly what autoland's final pursuit is for), with a last-ditch valve
+so a botched turn with `LAST_DITCH_ALONG_M` left still gets flown by autoland
+rather than by a pattern leg with nowhere to go. A failed heading read counts as
+NOT rolled out: it can only cost a tick, where the opposite hands over the very
+thing the guard exists to prevent.
+
 A recurring add-on trap the profile exists to absorb: on a study-level
 airframe the stock actuator can be the add-on's OUTPUT, not its input — the
 model drives the sim dataref from its own switch every frame, so the

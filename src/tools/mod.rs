@@ -297,6 +297,8 @@ impl Registry {
             // with an engine to start).
             if profile.engine || profile.throttle {
                 tools.push(Box::new(full_auto::FullAuto {
+                    engines: profile.engines,
+                    cycle_selectors: profile.fuel_selectors.clone(),
                     fuel_selector: profile.fuel_selector.clone(),
                     alternator_on_cmds: alternator_on_cmds(&profile.electrical),
                     bus_power_on_cmds: bus_power_on_cmds(&profile.electrical),
@@ -405,6 +407,8 @@ impl Registry {
             tools.push(Box::new(engine::SetMixture));
             tools.push(Box::new(engine::LeanMixture));
             tools.push(Box::new(engine::StartEngine {
+                engines: profile.engines,
+                cycle_selectors: profile.fuel_selectors.clone(),
                 fuel_selector: profile.fuel_selector.clone(),
                 alternator_on_cmds: alternator_on_cmds(&profile.electrical),
                 bus_power_on_cmds: bus_power_on_cmds(&profile.electrical),

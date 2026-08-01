@@ -696,6 +696,12 @@ impl XPlane for XPlaneClient {
 /// Compiled unconditionally so downstream crates' test suites can use it.
 pub struct FakeXPlane {
     reads: std::sync::Mutex<HashMap<String, f64>>,
+    /// Array-valued reads, for the per-engine and per-bus datarefs. Without
+    /// these every array read came back EMPTY, which reads downstream as zero
+    /// volts / no engine running — so any code path behind an array gate was
+    /// untestable, and the paths behind them are exactly the ones that fail
+    /// silently in the cockpit (a start that cranks a dry engine).
+    array_reads: std::sync::Mutex<HashMap<String, Vec<f64>>>,
     /// Every set_float/set_int, in order, as (dataref, value).
     writes: std::sync::Mutex<Vec<(String, f64)>>,
     /// Every command run, in order.
@@ -706,6 +712,7 @@ impl FakeXPlane {
     pub fn new() -> Self {
         Self {
             reads: std::sync::Mutex::new(HashMap::new()),
+            array_reads: std::sync::Mutex::new(HashMap::new()),
             writes: std::sync::Mutex::new(Vec::new()),
             commands: std::sync::Mutex::new(Vec::new()),
         }
@@ -738,6 +745,14 @@ impl FakeXPlane {
             .rev()
             .find(|(n, _)| n == name)
             .map(|(_, v)| *v)
+    }
+
+    /// Preset an array-valued read (bus volts, per-engine indicators).
+    pub fn set_read_array(&self, name: &str, values: &[f64]) {
+        self.array_reads
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), values.to_vec());
     }
 
     /// Whether `name` was ever written.
@@ -795,8 +810,20 @@ impl XPlane for FakeXPlane {
         self.commands.lock().unwrap().push(name.to_string());
         Ok(())
     }
-    async fn get_float_array(&self, _name: &str) -> Result<Vec<f64>> {
-        Ok(Vec::new())
+    async fn get_float_array(&self, name: &str) -> Result<Vec<f64>> {
+        // A preset array wins; then a scalar preset, read as a one-element
+        // array (which is what a single-engine dataref is); else empty, the
+        // long-standing default.
+        if let Some(v) = self.array_reads.lock().unwrap().get(name) {
+            return Ok(v.clone());
+        }
+        Ok(self
+            .reads
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|v| vec![*v])
+            .unwrap_or_default())
     }
     async fn set_int_array_elem(&self, name: &str, _index: usize, value: i64) -> Result<()> {
         self.writes
