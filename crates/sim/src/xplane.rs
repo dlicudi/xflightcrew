@@ -76,6 +76,52 @@ struct LoadWindow {
 
 static LOAD: std::sync::Mutex<Option<LoadWindow>> = std::sync::Mutex::new(None);
 
+/// A read-only look at the load window in progress, for the desktop health
+/// screen. The 30 s report tells the story AFTER the fact, in a log line and a
+/// blackbox event; a freeze is watched in real time, so the same counters have
+/// to be readable mid-window. Reading never resets the window — the report
+/// still owns that.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LoadSnapshot {
+    /// Seconds elapsed in the window so far (resets every `LOAD_REPORT_SECS`).
+    pub window_s: f64,
+    pub requests: u64,
+    pub cache_hits: u64,
+    pub failures: u64,
+    pub slowest_ms: u64,
+    /// The busiest datarefs so far this window, descending.
+    pub top: Vec<(String, u64)>,
+}
+
+impl LoadSnapshot {
+    /// Requests per second so far this window. Meaningless in the first
+    /// fraction of a second, hence the floor.
+    pub fn rate_per_s(&self) -> f64 {
+        self.requests as f64 / self.window_s.max(0.25)
+    }
+}
+
+/// Snapshot the current load window, or `None` before the first request.
+pub fn load_snapshot() -> Option<LoadSnapshot> {
+    let guard = LOAD.lock().unwrap_or_else(|e| e.into_inner());
+    let w = guard.as_ref()?;
+    let mut top: Vec<(String, u64)> = w
+        .by_name
+        .iter()
+        .map(|(n, c)| (n.clone(), *c))
+        .collect();
+    top.sort_by_key(|item| std::cmp::Reverse(item.1));
+    top.truncate(6);
+    Some(LoadSnapshot {
+        window_s: w.start.elapsed().as_secs_f64(),
+        requests: w.requests,
+        cache_hits: w.cache_hits,
+        failures: w.failures,
+        slowest_ms: w.slowest_ms,
+        top,
+    })
+}
+
 /// A read served from cache: counted so the load report shows what the
 /// window would have cost without it.
 fn note_cache_hit() {

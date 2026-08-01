@@ -981,6 +981,70 @@ publish/pick protocol, persisted via prefs.json) is a font SWAP plus
 glyph ranges include en/em dash and bullet; the app-side dash scrub stays
 for old plugins.
 
+**The terminal is the OTHER screen: setup and diagnosis** (2026-07-31). Once
+the panel became the automation instrument, the desktop dashboard
+([src/ui.rs](src/ui.rs)) was flying in formation with it: an attitude strip,
+a radio box and an automation list, all repeating what the cockpit and the
+panel already showed, on a screen nobody looks at mid-manoeuvre. The split is
+by what each surface CAN do. The panel owns act-and-glance. The terminal owns
+what the panel structurally cannot: whether every dependency is actually up,
+what we are costing the sim, and what was said. Tabs are Health (default) and
+Transcript, with Settings and a blackbox Events tail to follow. The aircraft
+strip and radio box are gone, and with them nine dataref reads a second that
+were charged to X-Plane's own frame loop for a display that told the pilot
+nothing the windscreen did not; the poll thread now costs ONE plugin probe.
+Health reads facts that were previously discoverable only by grepping the boot
+log, three of which have each cost a sortie: the Web API load window, read
+live through `sim::xplane::load_snapshot` rather than waiting for the 30 s
+report (the slowest response climbing is the shape a freeze arrives in);
+whether the plugin is loaded at all, probed by reading `xcopilot/ptt_active`,
+since the app never links the SDK and the datarefs existing is the only
+evidence available; and the EFFECTIVE TTS engine (`voice::pilot_engine`),
+which is what the speaker thread built after every fallback, not what the
+config asked for. A model that fails to load drops the copilot to macOS `say`,
+which is audible and otherwise diagnosable only in the boot log. COM1 stays,
+as a DIAGNOSIS and not a second radio: the frequency next to the service it
+belongs to, or amber when it is on none of them, which is the whole of "why is
+nobody answering". The screen renders under `TestBackend` in plain
+`cargo test`, so the layout arithmetic (a transcript scrolled past both ends,
+a 20x6 terminal) is pinned rather than found in the cockpit.
+
+**Settings are a registry, and the live value lives in one place**
+(2026-07-31). Forty-six `XCOPILOT_*` variables were readable only at boot, and
+exactly four choices reached prefs.json, so tuning a mic gate by ear cost a
+restart per attempt. The block was never per-knob plumbing: `Config` was built
+once by `from_env` and CLONED into each thread, which made every field a boot
+constant even where its consumer already re-read it every tick.
+[src/settings.rs](src/settings.rs) holds it in an `Arc<Config>` instead, and a
+consumer takes a fresh `settings::live()` handle at the top of its loop (one
+line in the monitor, one in the session loop) — copy-on-write, so a tick that
+started before an edit finishes on the snapshot it began with rather than
+seeing half of one. That single change made the taxi guide, the party line, the
+confirm gate, the confidence bands, the LLM fallback and the SimBrief lookup
+live, because they were all already per-tick reads. The knobs that are NOT read
+per tick get pushed instead: the mic trio lives inside the open audio device
+(`Listener::retune`, `Segmenter::retune`, and `PttMic`'s gate tail became an
+atomic so a shared reference can retune it), pushed once between utterances by
+`CaptureTuning`, and readback enforcement lives inside the tower FSM, so it is
+re-pushed per tick rather than only at station install. A knob is DECLARED once
+in the registry (name, pinning variable, how to render, validate, step, apply
+and persist), and the Settings screen is a view of that list, never a second
+copy of the schema — which is how the in-sim panel's three bespoke pickers can
+move onto it later without inventing a third precedence chain. The rule that
+matters is the pin: precedence is env > saved pref > default, so a knob whose
+variable is set (including from `.env`, which dotenvy has already loaded) is
+REFUSED with the variable named on screen. Accepting that edit and letting the
+next boot silently revert it is the "always end up back with ryan" bug wearing
+a new face, and a settings screen is exactly where it would happen again.
+Values persist to a generic `settings` map in prefs.json, with the four
+existing typed fields left alone — mode and cabin crew are `Persist::Own`,
+since the panel protocol already owns their boot path, and a second one here
+would be two precedence chains for one value. Stored forms carry no unit
+(a "900 ms" its own parser rejects would forget itself at the next boot, which
+a test pins), and a value outside the declared range — legal, because env vars
+are parsed by config.rs and not by the registry — renders fine and is pulled in
+by the first keypress.
+
 **Web API load is a sim cost, and it is measured** (2026-07-28). The API is
 served from inside X-Plane's flight loop, so every request is frame time the
 sim does not get. Two hangs that day could not be attributed either way,

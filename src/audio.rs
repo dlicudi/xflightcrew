@@ -161,6 +161,16 @@ impl Listener {
         })
     }
 
+    /// Retune the capture gates without reopening the device (and without
+    /// re-running the ambient calibration, whose result is the ADAPTIVE floor
+    /// and is still valid — only the hard minimum moves). The settings screen
+    /// calls this between utterances: tuning a mic gate by ear is why these
+    /// are settings at all, and a restart per attempt made that unusable.
+    pub fn retune(&mut self, vad_floor: f32, end_silence_ms: u32, gate_tail: Duration) {
+        self.segmenter.retune(vad_floor, end_silence_ms);
+        self.gate_tail = gate_tail;
+    }
+
     /// Block until a complete spoken utterance is captured, then return it as
     /// mono 16 kHz f32. Audio captured before this call (e.g. while we were
     /// transcribing or speaking) is discarded, so the copilot never hears its
@@ -314,6 +324,17 @@ impl Segmenter {
     /// Whether an utterance is currently being captured (voiced, not yet ended).
     pub fn in_speech(&self) -> bool {
         self.in_speech
+    }
+
+    /// Change the hard threshold minimum and the end-of-speech silence between
+    /// utterances. The learned noise floor is deliberately kept: it is what
+    /// the room measured, and a settings change is about the pilot's ear, not
+    /// about the room having changed. `abs_min` is already the hard floor
+    /// under [`Segmenter::threshold`], so a raise takes effect on the very
+    /// next frame with nothing else to adjust.
+    pub fn retune(&mut self, abs_min: f32, end_silence_ms: u32) {
+        self.abs_min = abs_min;
+        self.end_silence_ms = end_silence_ms;
     }
 
     /// Current speech threshold from the adaptive floor.

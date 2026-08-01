@@ -100,7 +100,10 @@ pub struct PttMic {
     /// holding PTT through a readback can't feed our own voice (over speakers)
     /// back in. Same half-duplex guard the copilot's `Listener` uses.
     gate: MicGate,
-    gate_tail: Duration,
+    /// Milliseconds the mic stays muted after we stop speaking. Atomic because
+    /// the settings screen retunes it live and every caller holds the mic by
+    /// shared reference.
+    gate_tail_ms: std::sync::atomic::AtomicU64,
 }
 
 impl PttMic {
@@ -113,8 +116,21 @@ impl PttMic {
         Ok(PttMic {
             input,
             gate,
-            gate_tail,
+            gate_tail_ms: std::sync::atomic::AtomicU64::new(gate_tail.as_millis() as u64),
         })
+    }
+
+    /// Retune the post-speech mute window (the echo guard) while the mic stays
+    /// open — tuning this by ear is the whole point of it being a setting.
+    pub fn set_gate_tail(&self, tail: Duration) {
+        self.gate_tail_ms.store(
+            tail.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn gate_tail(&self) -> Duration {
+        Duration::from_millis(self.gate_tail_ms.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Wait up to `idle_timeout` for `is_active` to go true (returning empty if it
@@ -157,7 +173,7 @@ impl PttMic {
         let mut spoke_until: Option<Instant> = None;
         while is_active() {
             if self.gate.is_speaking() {
-                spoke_until = Some(Instant::now() + self.gate_tail);
+                spoke_until = Some(Instant::now() + self.gate_tail());
             }
             if spoke_until.is_some_and(|t| Instant::now() < t) {
                 self.input.buffer.lock().unwrap().clear();

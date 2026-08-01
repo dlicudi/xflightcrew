@@ -31,6 +31,13 @@ struct Prefs {
     /// plugin reloads and boots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ui_scale: Option<i64>,
+    /// Everything the settings registry owns ([`crate::settings`]), stored as
+    /// `key -> rendered value`. A map rather than more typed fields because the
+    /// registry is the schema: a knob is declared once there, and this file
+    /// simply remembers what was chosen. Unknown keys are preserved on
+    /// rewrite, so a pref saved by a newer build survives an older one.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    settings: std::collections::BTreeMap<String, String>,
 }
 
 fn load() -> Prefs {
@@ -90,6 +97,21 @@ pub fn ui_scale() -> Option<i64> {
 pub fn save_ui_scale(v: i64) {
     let mut prefs = load();
     prefs.ui_scale = Some(v);
+    store(prefs);
+}
+
+/// A saved registry setting, as it was rendered when stored.
+pub fn setting(key: &str) -> Option<String> {
+    load().settings.get(key).cloned()
+}
+
+/// Persist one registry setting. Best-effort like the rest: a read-only
+/// working directory costs the persistence, never the live change.
+pub fn save_setting(key: &str, rendered: &str) {
+    let mut prefs = load();
+    prefs
+        .settings
+        .insert(key.to_string(), rendered.to_string());
     store(prefs);
 }
 
