@@ -332,6 +332,23 @@ impl FullAuto {
         &self,
         ctx: &ToolCtx<'_>,
     ) -> std::result::Result<(Mission, String), String> {
+        // Airborne, the mission cannot arm — and the refusal must say what
+        // DOES fly up here. The origin check below used to answer first,
+        // telling a pilot enroute at 8,000 ft "we're not at LXGB... say full
+        // auto for a circuit here" (2026-08-02). A failed read falls
+        // through: the sequence re-checks on its own thread.
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::ON_GROUND_ANY)
+            .await
+            .is_ok_and(|og| og < 0.5)
+        {
+            return Err(
+                "We're already flying, so full auto can't start. Say navigate to follow \
+                 the plan, fly the ILS for the arrival, or land for me."
+                    .to_string(),
+            );
+        }
         if ctx.config.simbrief_id.trim().is_empty() {
             return Err(
                 "No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can fly your plan.".to_string(),

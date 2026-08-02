@@ -319,7 +319,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         give_up(
             &voice,
             "We're already flying — full auto starts from the ground. \
-             Say do a circuit, fly the flight plan, or land for me.",
+             Say navigate to follow the plan, fly the ILS, or land for me.",
             "armed_airborne",
         );
         return;
