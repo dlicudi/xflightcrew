@@ -609,7 +609,16 @@ pub fn throttle_slew(prev: f64, want: f64, dt_s: f64) -> f64 {
 /// energy rule autoland's go-around flies. Never below a positive floor:
 /// once airborne the aircraft keeps climbing away from the ground.
 pub fn climb_vs_fpm(ias_kts: f64, vy_kts: f64, max_fpm: f64) -> f64 {
-    (max_fpm - (vy_kts - ias_kts).max(0.0) * 60.0).clamp(150.0, max_fpm)
+    // The floor must never EXCEED the request: the procedure follower passes
+    // its own shrinking level-off command as the cap, and f64::clamp PANICS
+    // on min > max — clamp(150, 145.9) killed the enroute follower thread
+    // dead at 7,950 ft, fifty feet under its 8,000 ft level-off, and the
+    // flight continued on whatever the AP dials last held (LXGB to LEMG,
+    // 2026-08-02). A request already under the floor is granted as asked:
+    // near level-off, "keep climbing away from the ground" is not the
+    // question any more.
+    let cap = max_fpm.max(0.0);
+    (cap - (vy_kts - ias_kts).max(0.0) * 60.0).clamp(150.0_f64.min(cap), cap)
 }
 
 /// How far below Vne the overspeed protection starts working, and how much
@@ -1769,6 +1778,12 @@ mod tests {
         assert!((150.0..700.0).contains(&slow), "{slow}");
         // Absurdly slow: pinned at the floor, never a descent.
         assert_eq!(climb_vs_fpm(40.0, 74.0, 700.0), 150.0);
+        // A request already UNDER the floor is granted, never a panic:
+        // f64::clamp aborts the thread on min > max, and the follower's
+        // level-off asked for 145.9 (LXGB to LEMG, 2026-08-02).
+        assert_eq!(climb_vs_fpm(155.0, 105.0, 145.9), 145.9);
+        assert_eq!(climb_vs_fpm(100.0, 105.0, 100.0), 100.0);
+        assert_eq!(climb_vs_fpm(120.0, 105.0, 0.0), 0.0);
         // Fast: capped at the profile's rate, no zoom climb.
         assert_eq!(climb_vs_fpm(95.0, 74.0, 700.0), 700.0);
     }
