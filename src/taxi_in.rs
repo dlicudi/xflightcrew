@@ -213,14 +213,20 @@ async fn vacate(
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    crate::blackbox::record(
-        "taxi_in",
-        json!({ "event": "vacated", "arrived": crate::autotaxi::LAST_ARRIVED.load(Relaxed) }),
-    );
-    // Report it. The tower's own taxi-in reply comes next, and a controller
-    // hearing "runway vacated" before the request is exactly the order.
-    let callsign = crate::circuit::crew_callsign(xp).await;
-    crate::circuit::transmit(crate::circuit::radio_call(&callsign, "runway vacated"));
+    let arrived = crate::autotaxi::LAST_ARRIVED.load(Relaxed);
+    crate::blackbox::record("taxi_in", json!({ "event": "vacated", "arrived": arrived }));
+    // Report it — but only a drive that ARRIVED has anything to report. The
+    // timeout, a refused join and a pilot handback all reach this line too,
+    // possibly still mid-runway, and "runway vacated" transmitted from the
+    // strip is a false report to a tower still holding our landing clearance
+    // (audit, 2026-08-02). The taxi-in request still goes out either way; an
+    // unvacated runway keeps its clearance standing, which is the truth.
+    if arrived {
+        // The tower's own taxi-in reply comes next, and a controller hearing
+        // "runway vacated" before the request is exactly the order.
+        let callsign = crate::circuit::crew_callsign(xp).await;
+        crate::circuit::transmit(crate::circuit::radio_call(&callsign, "runway vacated"));
+    }
 }
 
 async fn fly(
@@ -251,14 +257,25 @@ async fn fly(
     // brakes — the same rule as pushback: a stage that is not moving the
     // aircraft is holding it.
     if !crate::autotaxi::driving() {
-        let gs = xp
+        // Fail CLOSED on the speed read: the likeliest reason it fails is the
+        // same faltering client that just bailed the vacate at
+        // `vacate_no_position` — exactly the path most likely to have
+        // inherited a rolling handoff — and a redundant brake on a stopped
+        // aircraft costs nothing, where a coasting one on a runway is the
+        // thing this line exists to stop. And valve-aware like every other
+        // brake owner: on a valve airframe the bare ratio write is the
+        // fallback `drive_park_brake` only reaches AFTER the valve, and can
+        // be a no-op on its own (audit, 2026-08-02).
+        let gs_kts = xp
             .get_float("sim/flightmodel/position/groundspeed")
             .await
-            .unwrap_or(0.0)
-            * 1.943_84;
-        if gs > 3.0 {
-            let _ = xp.set_float(PARK_BRAKE, 1.0).await;
-            crate::blackbox::record("taxi_in", json!({ "event": "arrest_rolling", "gs": gs }));
+            .map(|v| v * 1.943_84);
+        if gs_kts.as_ref().map_or(true, |gs| *gs > 3.0) {
+            let _ = crate::tools::controls::drive_park_brake(&xp, true, park_brake_valve_set).await;
+            crate::blackbox::record(
+                "taxi_in",
+                json!({ "event": "arrest_rolling", "gs": gs_kts.unwrap_or(-1.0) }),
+            );
         }
     }
 
@@ -337,6 +354,18 @@ async fn fly(
         prop,
         pace,
     };
+    // A vacate that over-ran its budget may still be driving; arming the
+    // stand drive on top would be refused, and the fall-through below would
+    // then read the VACATE's arrival latch as the stand's. Wait it out
+    // (bounded), then clear the latch so only THIS drive's arrival can
+    // secure — securing on the vacate's own arrival one state earlier is
+    // what parked an aircraft "on the stand" just off the strip, transponder
+    // to standby and lights off, on a live taxiway (audit, 2026-08-02).
+    let overrun = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while crate::autotaxi::driving() && std::time::Instant::now() < overrun {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    crate::autotaxi::LAST_ARRIVED.store(false, std::sync::atomic::Ordering::Relaxed);
     match auto_taxi.execute(&json!({}), &ctx).await {
         Ok(line) => announce(&voice, Priority::Advisory, &line),
         Err(_) => {

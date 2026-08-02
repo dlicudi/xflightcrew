@@ -42,6 +42,17 @@ impl SetLights {
     /// them. The threshold is deliberately tight (≤2) and plurals are normalized
     /// first, so genuine unknowns ("disco lights") still fall through to the
     /// clarifying prompt rather than snapping to something arbitrary.
+    /// Does this airframe declare a light `key` would resolve to? The execute
+    /// path answers an unknown key with an Ok QUESTION ("I didn't catch which
+    /// light...") — right for a misheard pilot, unreadable for a caller
+    /// judging success by Ok: full auto read it as the switch thrown and
+    /// announced "Beacon on" on airframes with no beacon, blackboxing lights
+    /// that were never touched (audit, 2026-08-02). A programmatic caller
+    /// checks here first and stays silent about switches that don't exist.
+    pub fn declares(&self, key: &str) -> bool {
+        self.resolve_light(key).is_some()
+    }
+
     fn resolve_light(&self, input: &str) -> Option<&LightProfile> {
         let want = input.trim().to_ascii_lowercase();
         if let Some(l) = self

@@ -577,6 +577,22 @@ const AHEAD_OF_ABEAM_DEG: f64 = 100.0;
 /// rest, and it is requested from wherever this ends.
 const MAX_VACATE_STEPS: usize = 8;
 
+/// How far from an authored runway edge still counts as ON the strip. A
+/// vacate planned from anywhere else is a drive TOWARD a runway, not off one:
+/// the caller's gate is the standing landing clearance, which holds from
+/// touchdown until the taxi-in request — so a "taxi to parking" retried from
+/// a taxiway after a give-up re-entered here and aimed the aircraft back at
+/// the runway entrance (audit, 2026-08-02). Only judgeable where runway
+/// edges are authored; thin data keeps the old behaviour, as everywhere else
+/// in the vacate.
+const VACATE_ON_RUNWAY_M: f64 = 60.0;
+
+/// The exit snap's distance bound — the same 3 km every other snap in this
+/// file caps at (`snap_within`, `runway_entrance_near`). Without it a stale
+/// clearance at one field planned a "vacate" toward a junction kilometres
+/// away at another.
+const MAX_EXIT_SNAP_M: f64 = 3_000.0;
+
 /// A planned exit from the runway we have just landed on: the polyline to
 /// drive, and the taxiway it puts us on.
 ///
@@ -871,6 +887,39 @@ impl TaxiNet {
         if taxiway_nodes.is_empty() {
             return None;
         }
+        // Only plan a vacate FROM the strip. The caller's gate is the standing
+        // landing clearance, which holds from touchdown to the taxi-in
+        // request — position is what says the vacate already happened. Where
+        // runway edges are authored, an aircraft nowhere near one has nothing
+        // to vacate, and the nearest-junction-ahead snap below would aim it
+        // BACK at the runway entrance. Thin data (no runway edges) cannot
+        // judge this and keeps the old behaviour.
+        let seg_dist_m = |p: (f64, f64), a: (f64, f64), b: (f64, f64)| -> f64 {
+            let (px, py) = ((p.1 - a.1) * m_per_deg_lon, (p.0 - a.0) * m_per_deg_lat);
+            let (bx, by) = ((b.1 - a.1) * m_per_deg_lon, (b.0 - a.0) * m_per_deg_lat);
+            let len2 = bx * bx + by * by;
+            let t = if len2 > 0.0 {
+                ((px * bx + py * by) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let (dx, dy) = (px - t * bx, py - t * by);
+            (dx * dx + dy * dy).sqrt()
+        };
+        let mut has_runway_edges = false;
+        let mut on_strip = false;
+        for e in self.edges.iter().filter(|e| e.runway) {
+            has_runway_edges = true;
+            if let (Some(&a), Some(&b)) = (self.nodes.get(&e.a), self.nodes.get(&e.b)) {
+                if seg_dist_m(here, a, b) <= VACATE_ON_RUNWAY_M {
+                    on_strip = true;
+                    break;
+                }
+            }
+        }
+        if has_runway_edges && !on_strip {
+            return None;
+        }
         // Candidate exits: runway nodes that a taxiway also touches — the
         // JUNCTION where the two meet.
         //
@@ -898,6 +947,9 @@ impl TaxiNet {
             .filter(|id| runway_nodes.is_empty() || runway_nodes.contains(id))
             .filter_map(|id| self.nodes.get(id).map(|&p| (*id, p)))
             .filter(|(_, p)| ahead(*p))
+            // Bounded like every other snap in this file: a junction
+            // kilometres away is another airport's, not our exit.
+            .filter(|(_, p)| dist_m(here, *p) <= MAX_EXIT_SNAP_M)
             .min_by(|x, y| dist_m(here, x.1).total_cmp(&dist_m(here, y.1)))
             .map(|(id, _)| id)?;
 
@@ -937,24 +989,35 @@ impl TaxiNet {
                     if seen.contains(&nxt) {
                         return None;
                     }
-                    // Leaving the zone is the point: prefer any edge that is
-                    // outside it, so a junction never sends us further along
-                    // the protected pavement when a way out exists.
-                    let in_zone = e.zone_of.iter().any(|z| zone.contains(z));
+                    // Leaving protected pavement is the point: rank clean
+                    // edges first, then our own runway's zone, then — last of
+                    // all — an edge inside ANOTHER runway's zone. `zone` only
+                    // carries the runway we landed on, so a plain
+                    // "in-our-zone" test read a link crossing an intersecting
+                    // runway as a way OUT and actively preferred driving
+                    // across the other strip, with the metres counted as
+                    // clearance (audit, 2026-08-02).
+                    let zone_rank: u8 = if e.zone_of.is_empty() {
+                        0
+                    } else if e.zone_of.iter().all(|z| zone.contains(z)) {
+                        1
+                    } else {
+                        2
+                    };
                     self.nodes
                         .get(&nxt)
-                        .map(|&p| (nxt, p, e.name.clone(), in_zone))
+                        .map(|&p| (nxt, p, e.name.clone(), zone_rank))
                 })
                 .min_by(|x, y| {
-                    // Out-of-zone first, then whichever gets us furthest from
-                    // the runway we are standing on.
+                    // Cleanest pavement first, then whichever gets us furthest
+                    // from the runway we are standing on.
                     x.3.cmp(&y.3)
                         .then_with(|| dist_m(here, y.1).total_cmp(&dist_m(here, x.1)))
                 });
-            let Some((nxt, p, name, in_zone)) = step else {
+            let Some((nxt, p, name, zone_rank)) = step else {
                 break;
             };
-            if !in_zone {
+            if zone_rank == 0 {
                 left_zone = true;
             }
             if left_zone {
@@ -965,6 +1028,17 @@ impl TaxiNet {
             names.push(name);
         }
 
+        // A walk that never moved found no traversable taxiway edge at the
+        // junction — a one-way stub authored toward the runway is enough. The
+        // "plan" would be a single leg from the aircraft to a node ON the
+        // centreline: a drive down the runway reported as a vacate, with
+        // "runway vacated" already owed from the strip. No plan is strictly
+        // better — the caller falls through to the taxi-in from the runway,
+        // exactly as it behaved before the vacate existed (audit, 2026-08-02,
+        // demonstrated by the dead-end test below).
+        if names.is_empty() {
+            return None;
+        }
         // The path starts AT THE AIRCRAFT — the same rule the stand route
         // learned the hard way, because a drive whose route begins 200 m away
         // reads as already-arrived on its first tick.
@@ -3034,5 +3108,91 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
         assert!(TaxiNet::default()
             .plan_vacate(51.0034, -1.0000, 0.0, &zone, VACATE_CLEAR_M)
             .is_none());
+    }
+
+    /// A junction whose only taxiway link is authored one-way TOWARD the
+    /// runway (standard ground-flow authoring) is a dead end for the outward
+    /// walk. Before the audit fix this returned a one-leg "plan" from the
+    /// aircraft to a node ON the centreline — a drive down the runway that
+    /// taxi_in then reported as a vacate. No plan is the honest answer.
+    #[test]
+    fn a_dead_end_junction_is_a_refusal_not_a_runway_plan() {
+        let mut net = TaxiNet::default();
+        net.nodes.insert(1, (51.0000, -1.0000));
+        net.nodes.insert(2, (51.0036, -1.0000));
+        net.nodes.insert(3, (51.0072, -1.0000));
+        net.nodes.insert(12, (51.0036, -0.99786));
+        let e = |a: i64, b: i64, name: &str, runway: bool, oneway: bool, z: &[&str]| TaxiEdge {
+            a,
+            b,
+            name: name.into(),
+            runway,
+            oneway,
+            zone_of: z.iter().map(|s| s.to_string()).collect(),
+        };
+        net.edges.push(e(1, 2, "36/18", true, false, &["36", "18"]));
+        net.edges.push(e(2, 3, "36/18", true, false, &["36", "18"]));
+        // The ONLY link at the junction, one-way toward the runway.
+        net.edges.push(e(12, 2, "A2", false, true, &["36", "18"]));
+        let zone = ["36".to_string(), "18".to_string()];
+        assert!(
+            net.plan_vacate(51.0000, -1.0000, 0.0, &zone, VACATE_CLEAR_M)
+                .is_none(),
+            "an untraversable exit must refuse, never plan down the strip"
+        );
+    }
+
+    /// A vacate is planned FROM the strip. From the parallel taxiway — the
+    /// give-up-then-retry case, where the landing clearance still stands —
+    /// the nearest-junction-ahead snap would aim the aircraft back AT the
+    /// runway, so where runway edges exist to judge by, off-strip refuses.
+    #[test]
+    fn a_vacate_from_the_taxiway_is_a_refusal() {
+        let net = vacate_net();
+        let zone = ["36".to_string(), "18".to_string()];
+        // On Alpha, 150 m east of the centreline, pointing up the taxiway.
+        assert!(
+            net.plan_vacate(51.0034, -0.99786, 0.0, &zone, VACATE_CLEAR_M)
+                .is_none(),
+            "already off the strip: nothing to vacate"
+        );
+        // ...and thin data still cannot judge it, so it keeps the old
+        // behaviour rather than refusing (the 776-ends rule).
+        let mut no_rwy = vacate_net();
+        no_rwy.edges.retain(|e| !e.runway);
+        assert!(no_rwy
+            .plan_vacate(51.0034, -0.99786, 0.0, &zone, VACATE_CLEAR_M)
+            .is_some());
+    }
+
+    /// At an intersecting-runway field the way off our strip must never be
+    /// ACROSS the other one. `zone` names only the runway we landed on, so a
+    /// plain in-our-zone test read a link inside the crossing runway's zone
+    /// as clean pavement and preferred it over our own exit stub.
+    #[test]
+    fn the_walk_prefers_our_exit_stub_over_a_crossing_runways_zone() {
+        let mut net = vacate_net();
+        // A link west from the same junction, inside the CROSSING runway's
+        // active zone (drawn as a plain taxiway edge, the EGLL-N7 pattern).
+        net.nodes.insert(22, (51.0036, -1.00214));
+        net.edges.push(TaxiEdge {
+            a: 2,
+            b: 22,
+            name: "B".into(),
+            runway: false,
+            oneway: false,
+            zone_of: vec!["09".to_string(), "27".to_string()],
+        });
+        let zone = ["36".to_string(), "18".to_string()];
+        let plan = net
+            .plan_vacate(51.0034, -1.0000, 0.0, &zone, VACATE_CLEAR_M)
+            .expect("still plans");
+        // The first step off the junction is our own stub EAST onto Alpha,
+        // never the westbound link across the other strip.
+        let step = plan.path[2];
+        assert!(
+            step.1 > -1.0000,
+            "walked across the crossing runway's zone: {plan:?}"
+        );
     }
 }

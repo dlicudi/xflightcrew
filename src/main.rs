@@ -2024,19 +2024,68 @@ async fn run_session(
                 .any(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric()) == "stop")
                 && !tl.contains("stop holding")
             {
-                tracing::info!("pushback stop word, pre-gate");
-                pushback::ABORT.store(true, std::sync::atomic::Ordering::SeqCst);
-                // And the sequence that armed it. "Stop" during a push means
-                // stop, not "skip the push and start taxiing" — which is what
-                // aborting only the push would have full auto do next.
-                full_auto::abort();
-                say(
-                    &voice,
-                    &reporter,
-                    ui::LogKind::Readback,
-                    "Stopping the push. Brakes on, your aircraft.",
-                );
-                continue;
+                // The flag can outlive its push: the native tool latches it
+                // and nothing clears it when the tug finishes on its own.
+                // Airborne, a push is definitionally over — heal the flag and
+                // let the words route normally, because "stop the descent" is
+                // not about a tug, and consuming it here would cascade
+                // full_auto::abort() into whatever is flying. A failed read
+                // counts as on the ground: down there, stopping is always the
+                // safe reading.
+                let airborne = xplane
+                    .get_float(datarefs::ON_GROUND_ANY)
+                    .await
+                    .is_ok_and(|og| og < 0.5);
+                if airborne {
+                    tracing::info!("pushback flag stale airborne; cleared, not consumed");
+                    pushback::ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                } else if pushback::steered() {
+                    // Full auto's steered push: its loop consumes ABORT, stops
+                    // the tug and sets the brakes itself.
+                    tracing::info!("pushback stop word, pre-gate");
+                    pushback::ABORT.store(true, std::sync::atomic::Ordering::SeqCst);
+                    // And the sequence that armed it. "Stop" during a push
+                    // means stop, not "skip the push and start taxiing" —
+                    // which is what aborting only the push would have full
+                    // auto do next. Only a steered push can be full auto's.
+                    full_auto::abort();
+                    say(
+                        &voice,
+                        &reporter,
+                        ui::LogKind::Readback,
+                        "Stopping the push. Brakes on, your aircraft.",
+                    );
+                    continue;
+                } else {
+                    // A NATIVE push (the spoken tool's one-shot command): no
+                    // loop is listening, so the stop must reach the tug from
+                    // HERE. ABORT alone was a flag nobody read — "stop
+                    // pushback", the panel CANCEL's own phrase, was swallowed
+                    // by this branch forever while the tug kept pushing and
+                    // the copilot claimed brakes it never set (audit,
+                    // 2026-08-02).
+                    tracing::info!("native pushback stop, pre-gate");
+                    let _ = xplane.run_command(tools::ground::CMD_PUSH_STOP).await;
+                    let _ = tools::controls::drive_park_brake(
+                        &xplane,
+                        true,
+                        profile.park_brake_valve_set,
+                    )
+                    .await;
+                    pushback::ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                    say(
+                        &voice,
+                        &reporter,
+                        ui::LogKind::Readback,
+                        "Stopping the push. Brakes on, your aircraft.",
+                    );
+                    // A governor also driving means the flag was stale, not a
+                    // push — fall through so "stop" reaches the brakes it was
+                    // actually for.
+                    if !tools::speedhold::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                }
             }
         }
         if tools::speedhold::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -5161,10 +5210,7 @@ fn reference_limits(profile: &aircraft::AircraftProfile, t: &str) -> Option<Stri
     }
     if t.contains("vmc") || t.contains("red line") || t.contains("minimum control") {
         if let Some(v) = r.and_then(|r| r.vmca_kts) {
-            parts.push(format!(
-                "Vmca, single-engine minimum control, {}",
-                kt(v)
-            ));
+            parts.push(format!("Vmca, single-engine minimum control, {}", kt(v)));
         }
     }
     if t.contains("rotat")

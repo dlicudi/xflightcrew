@@ -181,11 +181,15 @@ base at 290 degrees with 1,813 m still to go to the centreline and 4,092 m to
 run: a 28-degree cut, comfortably "interceptable", so autoland took it there
 and flew the diagonal in. The aircraft approached and touched down at an angle,
 having never flown the turn that was armed a second earlier. `ready_for_autoland`
-now waits for our own turn to ROLL OUT (heading within `ROLLED_OUT_HDG_DEG` of
-the runway course, which the 1.3-radii geometry leaves about 0.3 radii of trim
-after — exactly what autoland's final pursuit is for), with a last-ditch valve
+now waits for our own turn to ROLL OUT (ground TRACK within
+`ROLLED_OUT_HDG_DEG` of the runway course — track, not heading, since
+2026-08-02: the final leg commands intercept-plus-crab, so in any crosswind
+the NOSE sits a whole wind-correction angle off the course on a perfect
+centreline, and a heading gate could never pass — 12 degrees at 16 kt across
+a 172's 74 kt, with every handover then falling through the last-ditch
+valve), with a last-ditch valve
 so a botched turn with `LAST_DITCH_ALONG_M` left still gets flown by autoland
-rather than by a pattern leg with nowhere to go. A failed heading read counts as
+rather than by a pattern leg with nowhere to go. A failed track read counts as
 NOT rolled out: it can only cost a tick, where the opposite hands over the very
 thing the guard exists to prevent.
 
@@ -767,7 +771,19 @@ brakes off, which is exactly where it matters: a Baron rolling off its stand at
 the whole utterance, so "stop for fuel" reaches the router and not the brakes),
 and the pre-gate branch grew a `pushback::ACTIVE` arm that sets
 `pushback::ABORT` and cancels full auto with it, because "stop" during a push
-means stop, not "skip the push and start taxiing".
+means stop, not "skip the push and start taxiing". The arm learned who is
+listening (audit, 2026-08-02): ABORT only has a consumer when full auto's
+STEERED loop is flying the push (`pushback::steered()`), and the spoken
+tool's NATIVE push latches ACTIVE with no loop at all — so against a native
+push the branch swallowed every stop-phrase (the panel CANCEL's own "stop
+pushback" included) while the tug kept pushing and the copilot claimed
+brakes it never set. The native arm now sends `pushback_stop` and sets the
+brakes itself and clears the flag; airborne, a set flag is definitionally
+stale, so it is healed and the words route on ("stop the descent" must never
+cascade `full_auto::abort()` into whatever is flying — which is also why the
+steered arm's abort is what it always was, full auto's own); and with the
+governor also driving the branch falls through so "stop" still reaches the
+brakes it was for.
 
 **Line up** (same day) bridges the two: "line us up" / "line me up" /
 bare "line up" (the LUAW readback always carries "wait", "lining up" is
@@ -1371,7 +1387,11 @@ note; gyro-sync and autoland hit it first). Mirror OR action, never both.
 **The panel is an automation instrument now** (2026-07-29 revamp). Tabs are
 Flight | Transcript | ATC | Route | Settings — Flight first and default: the live
 strip, an automation status well fed by `xcopilot/status/auto` (composed by
-[src/auto_status.rs](src/auto_status.rs): marker byte '1' = cancellable, then
+[src/auto_status.rs](src/auto_status.rs): marker byte '1' = a manager is
+actually flying/driving (the AUTO annunciator; since the audit of 2026-08-02
+CANCEL renders unconditionally plugin-side, because the "my controls"
+fallback made cancellable always-true and the chip lit amber parked
+cold-and-dark), then
 one line per active manager, primary as "NAME|stage"; `full_auto::event()`
 stores its stage string, and the mission is folded into the name so the
 button pressed matches the headline: "FULL AUTO CIRCUIT [request taxi]" /

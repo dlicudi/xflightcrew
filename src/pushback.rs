@@ -159,6 +159,13 @@ const HOLD_BRAKE: f64 = 0.4;
 /// must catch the creep while the creep failure above must never fire from
 /// jitter, and they are different jobs.
 const HOLD_AT_M: f64 = 0.3;
+/// The post-push hold's own thresholds: no backward progress for this long,
+/// AND this far forward of the push's high-water mark, before a released
+/// tug's dead air is held against. Both much tighter than the 12 s stall
+/// clock — the Baron reached 21 kt inside one of these windows — and the
+/// regression term keeps a swing's sideways plateau off the brakes.
+const HOLD_STALL_SECS: f64 = 3.0;
+const HOLD_REGRESS_M: f64 = 1.0;
 /// Consecutive polls the attach/tow flag must hold before the tug counts as
 /// CONNECTED. One blip is the tug positioning, and releasing the brakes on it
 /// is how three pushes died in the dead air (2026-08-02).
@@ -321,8 +328,29 @@ pub fn back_along(start_lat: f64, start_lon: f64, start_psi: f64, lat: f64, lon:
 /// forward, and a push already under way must never be braked against) and
 /// the aircraft has drifted forward of the stand — the idle-thrust walk that
 /// killed three EGHI pushes in the tug's own dead air (2026-08-02).
-pub fn should_hold_creep(towed: bool, towing: bool, attached: bool, back_m: f64) -> bool {
-    !towed && !towing && !attached && back_m < -HOLD_AT_M
+pub fn should_hold_creep(
+    towed: bool,
+    towing: bool,
+    attached: bool,
+    back_m: f64,
+    sliding: bool,
+) -> bool {
+    if towing || attached {
+        return false;
+    }
+    if !towed {
+        return back_m < -HOLD_AT_M;
+    }
+    // After the push has moved us the start line is metres behind, so the
+    // pre-push test above can never fire again — and `towed` is a latch that
+    // never clears, so on the airframe whose attach flag only ever blips, a
+    // tug that let go mid-plan left the aircraft brakeless at idle through
+    // the whole re-issue window: 25 m of push, release, and the same
+    // idle-thrust walk the hold exists for, now measured from a high-water
+    // mark instead of the stand (audit, 2026-08-02). SLIDING — stalled for a
+    // beat AND regressing forward off that mark — is what tells idle creep
+    // from a live swing's sideways plateau, which must never meet a brake.
+    sliding
 }
 
 fn event(detail: serde_json::Value) {
@@ -354,6 +382,20 @@ static LEARNED_SENSE: AtomicI8 = AtomicI8::new(0);
 /// 2026-07-28, with the tug still connected).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// True while the STEERED push loop ([`run`]) is working the manoeuvre — the
+/// one consumer of [`ABORT`]. The spoken tool's native one-shot sets only
+/// [`ACTIVE`], and the distinction is what tells the command loop whether a
+/// stop word has a listener or must stop the tug itself: ABORT against a
+/// native push was a flag nobody read, and every stop-phrase — the panel
+/// CANCEL's "stop pushback" included — was consumed with the tug still
+/// pushing (audit, 2026-08-02).
+static STEERED: AtomicBool = AtomicBool::new(false);
+
+/// Is the steered loop the thing holding [`ACTIVE`] right now?
+pub fn steered() -> bool {
+    STEERED.load(SeqCst)
+}
+
 /// The pilot's own stop, set from the command loop. Separate from the caller's
 /// abort flag (full auto's), because "stop" during a push is about THIS
 /// manoeuvre and must not depend on who armed it: a push holds the aircraft
@@ -382,6 +424,7 @@ pub async fn run(
     valve_set: Option<f64>,
 ) -> Result<f64, String> {
     ACTIVE.store(true, SeqCst);
+    STEERED.store(true, SeqCst);
     ABORT.store(false, SeqCst);
     let out = run_inner(xp, ctx, voice, plan, abort, valve_set).await;
     // Stop-and-let-go on EVERY exit, unconditionally. A pushback command is a
@@ -392,6 +435,7 @@ pub async fn run(
     // pilot asked what on earth was going on and the command had to be fired
     // by hand over the Web API (2026-07-29). Idempotent when already stopped.
     send(ctx, "stop").await;
+    STEERED.store(false, SeqCst);
     ACTIVE.store(false, SeqCst);
     out
 }
@@ -495,7 +539,9 @@ async fn run_inner(
             if a.unwrap_or(0.0) > 0.5 || t.unwrap_or(0.0) > 0.5 {
                 solid += 1;
                 if solid >= HOOK_SOLID_POLLS {
-                    event(json!({ "event": "hooked", "waited_s": r1(began.elapsed().as_secs_f64()) }));
+                    event(
+                        json!({ "event": "hooked", "waited_s": r1(began.elapsed().as_secs_f64()) }),
+                    );
                     break true;
                 }
                 tokio::time::sleep(Duration::from_millis(TICK_MS)).await;
@@ -631,7 +677,9 @@ async fn run_inner(
         // expiring proportional brake channel instead: it holds the aircraft
         // this tick and frees itself in a second, so a tug that begins its
         // manoeuvre is never fighting a latched brake.
-        if should_hold_creep(towed, towing, attached, back_m) {
+        let sliding = moved_at.elapsed().as_secs_f64() >= HOLD_STALL_SECS
+            && back_m < moved_m - HOLD_REGRESS_M;
+        if should_hold_creep(towed, towing, attached, back_m, sliding) {
             let _ = xp.set_float(TAXI_BRAKE, HOLD_BRAKE).await;
         }
         // Going the WRONG WAY with nobody pushing: the brakes are off for the
@@ -1065,17 +1113,27 @@ mod tests {
     #[test]
     fn creep_is_held_against_never_braked_into_a_push() {
         // Drifting forward with nobody pushing: hold.
-        assert!(should_hold_creep(false, false, false, -0.5));
+        assert!(should_hold_creep(false, false, false, -0.5, false));
         // Inside the drift deadband: leave the brakes alone.
-        assert!(!should_hold_creep(false, false, false, -0.2));
+        assert!(!should_hold_creep(false, false, false, -0.2, false));
         // Moving BACK is the tug working, whatever the flags say.
-        assert!(!should_hold_creep(false, false, false, 1.0));
+        assert!(!should_hold_creep(false, false, false, 1.0, false));
         // A tug on the bar, mid-tow, or a push already under way is never
         // braked against — a "Nose 90" arc can carry the reference point
         // forward for a moment and must not meet a brake when it does.
-        assert!(!should_hold_creep(false, false, true, -0.5));
-        assert!(!should_hold_creep(false, true, false, -0.5));
-        assert!(!should_hold_creep(true, false, false, -0.5));
+        assert!(!should_hold_creep(false, false, true, -0.5, false));
+        assert!(!should_hold_creep(false, true, false, -0.5, false));
+        // After the push has moved us, the `towed` latch alone no longer
+        // disarms the hold: a released tug plus a forward SLIDE off the
+        // high-water mark is the same idle-thrust walk, 25 m further back —
+        // the latch never clears, and it disarmed the hold for good after
+        // the first 1.5 m of every push (audit, 2026-08-02).
+        assert!(should_hold_creep(true, false, false, 24.0, true));
+        // ...but a swing's plateau (no slide) is not creep, and the flags up
+        // still win over everything.
+        assert!(!should_hold_creep(true, false, false, 24.0, false));
+        assert!(!should_hold_creep(true, true, false, 24.0, true));
+        assert!(!should_hold_creep(true, false, true, 24.0, true));
         // The hold engages well before the creep FAILURE would: the backstop
         // stays a backstop.
         assert!(HOLD_AT_M < CREEP_M);

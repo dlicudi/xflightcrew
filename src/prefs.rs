@@ -109,9 +109,7 @@ pub fn setting(key: &str) -> Option<String> {
 /// working directory costs the persistence, never the live change.
 pub fn save_setting(key: &str, rendered: &str) {
     let mut prefs = load();
-    prefs
-        .settings
-        .insert(key.to_string(), rendered.to_string());
+    prefs.settings.insert(key.to_string(), rendered.to_string());
     store(prefs);
 }
 

@@ -51,7 +51,10 @@ pub enum Phase {
 
 /// One message from the voice loop (or poll thread) to the dashboard.
 pub enum Report {
-    Log { kind: LogKind, text: String },
+    Log {
+        kind: LogKind,
+        text: String,
+    },
     Status(Phase),
     Mic(f32),
     /// Boxed: the health snapshot dwarfs every other variant, and this channel
@@ -522,7 +525,10 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 format!(" XVoiceLayer {} ", app.boot.version),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("({}) ", app.boot.build), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("({}) ", app.boot.build),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::raw(" "),
             Span::styled(format!("{dot} {label}"), Style::default().fg(c)),
         ])),
@@ -625,14 +631,24 @@ fn draw_health(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 kv("cached", format!("{}", l.cache_hits)),
                 Line::from(vec![
-                    Span::styled(format!("{:<9}", "failures"), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{:<9}", "failures"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                     Span::styled(
                         l.failures.to_string(),
-                        Style::default().fg(if l.failures > 0 { Color::Red } else { Color::White }),
+                        Style::default().fg(if l.failures > 0 {
+                            Color::Red
+                        } else {
+                            Color::White
+                        }),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(format!("{:<9}", "slowest"), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{:<9}", "slowest"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                     Span::styled(format!("{} ms", l.slowest_ms), slow_style),
                 ]),
             ];
@@ -652,8 +668,11 @@ fn draw_health(f: &mut Frame, app: &App, area: Rect) {
         }
     };
     f.render_widget(
-        Paragraph::new(load_lines)
-            .block(Block::default().borders(Borders::ALL).title(" web api load ")),
+        Paragraph::new(load_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" web api load "),
+        ),
         right,
     );
 
@@ -661,10 +680,7 @@ fn draw_health(f: &mut Frame, app: &App, area: Rect) {
     let [flight, autos] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(bottom);
 
-    let mut rows = vec![
-        kv("mode", h.mode.clone()),
-        kv("cabin", h.cabin.clone()),
-    ];
+    let mut rows = vec![kv("mode", h.mode.clone()), kv("cabin", h.cabin.clone())];
     if app.boot.atc_airport.is_empty() {
         rows.push(kv("atc", "off".into()));
     } else {
@@ -681,14 +697,20 @@ fn draw_health(f: &mut Frame, app: &App, area: Rect) {
         // second copy of the cockpit radio.
         rows.push(match (h.com1_khz, h.tuned_service()) {
             (Some(khz), Some(service)) => Line::from(vec![
-                Span::styled(format!("{:<9}", "com1"), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:<9}", "com1"),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(
                     format!("{:.3} {service}", khz as f64 / 1000.0),
                     Style::default().fg(Color::Green),
                 ),
             ]),
             (Some(khz), None) => Line::from(vec![
-                Span::styled(format!("{:<9}", "com1"), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:<9}", "com1"),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(
                     format!("{:.3} (no station)", khz as f64 / 1000.0),
                     Style::default().fg(Color::Yellow),
@@ -741,9 +763,10 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     // Keep the cursor on screen without a scrollbar: page the window so the
     // selected row is always inside it.
     let rows = list.height.saturating_sub(2).max(1) as usize;
-    let start = app.cursor.saturating_sub(rows.saturating_sub(1)).min(
-        settings::ALL.len().saturating_sub(rows),
-    );
+    let start = app
+        .cursor
+        .saturating_sub(rows.saturating_sub(1))
+        .min(settings::ALL.len().saturating_sub(rows));
 
     let items: Vec<ListItem> = settings::ALL
         .iter()

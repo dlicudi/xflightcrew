@@ -875,9 +875,7 @@ impl Tool for StartEngine {
         let engines = self.engines.max(1);
         let mut caught = 0usize;
         for i in 0..engines {
-            ctx.xplane
-                .run_command_for(&starter_command(i), 3.0)
-                .await?;
+            ctx.xplane.run_command_for(&starter_command(i), 3.0).await?;
             for _ in 0..6 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 if engine_running(ctx, i).await {

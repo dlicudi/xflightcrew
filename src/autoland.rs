@@ -920,8 +920,7 @@ pub fn overflight_allowance_nm(length_m: f64, radio_alt_ft: f64, flare_radio_ft:
     if radio_alt_ft > flare_radio_ft * ROUNDOUT_MULT {
         return OVERFLIGHT_GO_AROUND_NM;
     }
-    ((length_m - FLOAT_MIN_REMAINING_M).min(0.5 * length_m) / M_PER_NM)
-        .max(OVERFLIGHT_GO_AROUND_NM)
+    ((length_m - FLOAT_MIN_REMAINING_M).min(0.5 * length_m) / M_PER_NM).max(OVERFLIGHT_GO_AROUND_NM)
 }
 
 /// A latched go-around climbs straight ahead until this height before the
@@ -982,6 +981,26 @@ const FLARE_MAX_DIST_NM: f64 = 0.35;
 /// than from the full path rate or a level float.
 const ROUNDOUT_MULT: f64 = 2.0;
 const ROUNDOUT_VS_FPM: f64 = -250.0;
+
+/// May the roundout own the descent from HERE? Only where a
+/// [`ROUNDOUT_VS_FPM`] descent still REACHES the pavement. At or past the
+/// threshold, always — there the unsigned glidepath distance grows again and
+/// alt_err stops meaning anything, which is the arithmetic the roundout
+/// exists to pre-empt. Short of it, the sink from this height must cover the
+/// metres to the threshold: 40 ft at 0.2 nm closes (a normal crossing), and
+/// 30 ft at 0.3 nm does not — that aircraft is dragged low, and a commanded
+/// descent grounds it ~190 m into the approach lights where the level-hold
+/// would have let the path come down to it (audit, 2026-08-02). A failed
+/// (zero) groundspeed read denies the roundout, which falls back to the
+/// level-hold: short of the runway, level is always the safe reading.
+fn roundout_reaches_pavement(along_nm: f64, radio_alt_ft: f64, gs_kts: f64) -> bool {
+    if along_nm <= 0.0 {
+        return true;
+    }
+    let sink_s = radio_alt_ft / (ROUNDOUT_VS_FPM.abs() / 60.0);
+    let reach_m = gs_kts * 0.514_444 * sink_s;
+    along_nm * M_PER_NM <= reach_m
+}
 /// ...and only within this much cross-track of the centreline (~37 m — about a
 /// runway half-width plus margin). Beyond it the aircraft is over grass, and
 /// touching down there is how the LXGB 09 rollout ended in wreckage
@@ -1502,10 +1521,20 @@ pub fn guidance(
         // staged descent — this, then the flare's -100 — arrives at the
         // flare with flying speed, which is what a soft touchdown is made
         // of.
+        // ...but only where its own descent still REACHES the pavement.
+        // `in_flare_zone`'s first term is an unsigned distance, so this
+        // branch also fires SHORT of the threshold — right for a normal
+        // landing (40 ft crosses the numbers from ~0.1 nm out), and a
+        // commanded descent into the approach lights for an aircraft dragged
+        // low: at 30 ft radio 0.3 nm short, -250 fpm touches down ~190 m
+        // BEFORE the runway, where the old level-hold below let the path
+        // come down to it (audit, 2026-08-02). The test is the physical one
+        // — see `roundout_reaches_pavement`.
         ApproachPhase::Final
             if in_flare_zone
                 && xtk.abs() <= FLARE_MAX_XTK_NM
-                && radio_alt_ft <= flare_radio_ft * ROUNDOUT_MULT =>
+                && radio_alt_ft <= flare_radio_ft * ROUNDOUT_MULT
+                && roundout_reaches_pavement(along_nm, radio_alt_ft, gs_kts) =>
         {
             ROUNDOUT_VS_FPM
         }
@@ -1645,6 +1674,18 @@ mod tests {
         assert_eq!(g.phase, ApproachPhase::Flare);
         assert_eq!(g.target_vs_fpm, -100.0);
 
+        // Dragged LOW short of the threshold the roundout must NOT own it:
+        // from 30 ft at 0.3 nm its -250 grounds ~190 m before the pavement.
+        // The level-hold holds, and the path comes down to us — the guard is
+        // the physical reach test, not the distance band (audit, 2026-08-02).
+        let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 0.3);
+        let g = guidance(lat, lon, 30.0, 30.0, 100.0, 100.0, &rwy, 95.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Final);
+        assert_eq!(
+            g.target_vs_fpm, 0.0,
+            "a commanded descent here lands in the approach lights"
+        );
+
         // And a genuine overflight go-around is untouched by the roundout.
         let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.3);
         let g = guidance(lat, lon, 150.0, 150.0, 95.0, 95.0, &rwy, 95.0, 25.0, 0.0);
@@ -1687,7 +1728,11 @@ mod tests {
         // Past the allowance the overflight verdict returns.
         let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.50);
         let g = guidance(lat, lon, 20.0, 20.0, 92.0, 92.0, &rwy, 95.0, 25.0, 0.0);
-        assert_eq!(g.phase, ApproachPhase::Intercept, "not down by 823 m: go around");
+        assert_eq!(
+            g.phase,
+            ApproachPhase::Intercept,
+            "not down by 823 m: go around"
+        );
 
         // And HIGH past the threshold goes around at the old margin, float or
         // no float — the 167 ft overflight stays caught.
@@ -2947,7 +2992,10 @@ mod tests {
             (14, "snow"),
             (15, "transparent"),
         ] {
-            assert!(!is_hard_surface(code), "surface {code} ({what}) is not landable");
+            assert!(
+                !is_hard_surface(code),
+                "surface {code} ({what}) is not landable"
+            );
         }
 
         // Unused/unknown codes are rejected rather than assumed paved.
@@ -3020,7 +3068,10 @@ mod tests {
         let mut d = 20.0;
         while d >= 0.0 {
             let v = scheduled_ias(d, VAPP);
-            assert!(v <= prev + 1e-9, "speed must not rise on the way in at {d} nm");
+            assert!(
+                v <= prev + 1e-9,
+                "speed must not rise on the way in at {d} nm"
+            );
             assert!(v >= VAPP - 1e-9, "never below the approach speed at {d} nm");
             prev = v;
             d -= 0.25;

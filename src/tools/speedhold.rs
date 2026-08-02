@@ -208,22 +208,14 @@ pub fn throttle_adjust(err_kts: f64, trend_kts_s: f64) -> f64 {
     // the escalation gates watch the SAME projection — urgency about where
     // the speed will be, not where it was.
     let proj = err_kts - trend_kts_s * THROTTLE_LEAD_S;
-    let max_up = if proj > 10.0 {
-        0.04
-    } else {
-        0.015
-    };
+    let max_up = if proj > 10.0 { 0.04 } else { 0.015 };
     // The fast side scales with urgency too. A flat 0.015 was sized on GA,
     // where nothing accelerates hard at pattern power; a jet off the runway
     // accelerated 125 to 241 knots across one upwind-to-downwind while the
     // circuit's law pulled the lever at the polite rate the whole way (SF50,
     // Luton 2026-07-28). Well past the target, or building fast: pull like
     // you mean it. Overspeed is a comfort problem right up until it's Vmo.
-    let max_down = if proj < -10.0 {
-        0.04
-    } else {
-        0.015
-    };
+    let max_down = if proj < -10.0 { 0.04 } else { 0.015 };
     (proj * 0.003).clamp(-max_down, max_up)
 }
 

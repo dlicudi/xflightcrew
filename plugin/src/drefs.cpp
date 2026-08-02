@@ -743,10 +743,11 @@ static void WriteCoach(void*, void* in, int offset, int len) {
         g_coach.len -= 2;
     }
 }
-// Automation feed — the coach's marker-byte scheme: byte 0 is '1' while
-// something the CANCEL button can stand down is running, '0' when idle,
-// stripped off here so the panel renders clean lines. Markerless text (an
-// older app) renders as-is and reads as idle.
+// Automation feed — the coach's marker-byte scheme: byte 0 is '1' while a
+// manager is actually flying/driving (the AUTO annunciator; CANCEL renders
+// unconditionally, since the app's pick falls back to the universal "my
+// controls"), '0' when idle, stripped off here so the panel renders clean
+// lines. Markerless text (an older app) renders as-is and reads as idle.
 static bool g_auto_active = false;
 static void WriteAuto(void*, void* in, int offset, int len) {
     StoreText(&g_auto, in, offset, len);

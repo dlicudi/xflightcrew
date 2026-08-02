@@ -2120,7 +2120,7 @@ mod tests {
     fn braking_starts_with_room_to_stop_at_the_hold() {
         const BASE: f64 = 12.0; // the EGHI taxi's own base speed
         const BRAKE_GAP_KTS: f64 = 3.0; // taxi_control's threshold
-        // Measured achievable deceleration at the gentle comfort effort.
+                                        // Measured achievable deceleration at the gentle comfort effort.
         const ACHIEVABLE_MS2: f64 = 0.6;
 
         // Where does the aircraft, still doing its base speed, first find
@@ -2196,7 +2196,10 @@ mod tests {
         // ...but once genuinely stopped it goes to zero, so the original
         // carve-under-braking fix still holds.
         assert_eq!(stop_straighten(0.8, -STOP_SHORT_M, 0.4), 0.0);
-        assert_eq!(stop_straighten(0.8, -STOP_SHORT_M, STRAIGHTEN_HOLD_KTS), 0.0);
+        assert_eq!(
+            stop_straighten(0.8, -STOP_SHORT_M, STRAIGHTEN_HOLD_KTS),
+            0.0
+        );
 
         // It is a FLOOR, never a boost: far out, full steering is unchanged
         // whether moving or not.
