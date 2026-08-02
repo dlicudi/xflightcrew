@@ -327,6 +327,26 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     // The callsign the tower knows us by, so our calls sound like a real pilot.
     let callsign = crate::circuit::crew_callsign(&xp).await;
 
+    // On a Flight mission the route goes into the GPS NOW, at the gate. The
+    // write used to sit at the top of stage 4 — fly_route was where the
+    // concrete client happened to be — so the whole start-up and taxi ran
+    // with an empty flight-plan page, and the pilot read that as "it didn't
+    // load" and commanded the load by hand mid-taxi (LXGB to LEMG,
+    // 2026-08-02). The map during the taxi is half of what loading the plan
+    // is FOR. Best effort, exactly as it was at the runway.
+    if let Mission::Flight(route) = &tools.mission {
+        if !route.fms_payload.is_empty() {
+            let _ = xp
+                .set_data("xcopilot/fms/route", route.fms_payload.as_bytes())
+                .await;
+            let _ = xp.set_int("xcopilot/fms/load", 1).await;
+            event(
+                "fms_loaded",
+                json!({ "waypoints": route.fms_payload.split('|').count() }),
+            );
+        }
+    }
+
     // --- Stage 1: electrics + engine ------------------------------------------
     if !engine_running(&xp).await {
         // A turbine we have no sequence for is not a piston. Say so and stop,
@@ -989,16 +1009,8 @@ async fn fly_route(
 ) {
     use std::sync::atomic::Ordering::Relaxed;
 
-    // Show the route on the GPS too (the plugin's FMS mailbox, the same path
-    // "load the flight plan" takes). Best-effort: only the concrete client can
-    // write a byte-array dataref, which is why this lives here and not in the
-    // arming tool.
-    if !route.fms_payload.is_empty() {
-        let _ = xp
-            .set_data("xcopilot/fms/route", route.fms_payload.as_bytes())
-            .await;
-        let _ = xp.set_int("xcopilot/fms/load", 1).await;
-    }
+    // (The GPS already has the route: fly() writes the FMS mailbox at arm
+    // time, at the gate, so the taxi happens with the plan on the map.)
 
     // --- Takeoff: the proven loop, armed through its tool so every arm-time
     // gate applies (the pitch-channel probe included).

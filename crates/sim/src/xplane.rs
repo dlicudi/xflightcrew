@@ -306,16 +306,37 @@ pub async fn sim_frozen(xp: &dyn XPlane) -> bool {
 pub struct XPlaneClient {
     http: reqwest::Client,
     base: String,
-    /// Resolved `dataref name -> numeric id`, to save a round trip per read/write.
-    /// Ids are stable within a session but X-Plane reassigns them across restarts
-    /// and aircraft reloads, so a value op that 404s evicts the entry here and
-    /// re-resolves by name (see `get_value` / `set_value`) — the cache self-heals.
-    id_cache: Mutex<HashMap<String, i64>>,
-    /// Resolved `command name -> numeric id` (commands live on the v2 API).
-    command_cache: Mutex<HashMap<String, i64>>,
-    /// Recently-read values, `name -> (when, value)`. See [`value_cache_ttl`].
-    value_cache: Mutex<HashMap<String, (std::time::Instant, serde_json::Value)>>,
 }
+
+/// The caches are PROCESS-WIDE, not per-client, keyed by base URL then name —
+/// two clients on the same sim share every resolution and value, while tests
+/// against distinct mock servers stay isolated.
+///
+/// They were per-instance until 2026-08-02, which quietly turned every TTL
+/// into a per-LOOP cap: each control loop builds its own client on its own
+/// thread, and the flight mission runs five at once (procedure follower,
+/// cruise governor, monitor, session, region). `is_in_replay` + `paused` —
+/// capped at 2/s each by the 500 ms TTL — still hit the sim at ~11/s
+/// combined, inside a sortie sustaining 96 req/s while the sim dipped to
+/// 9.5 fps on the climb-out and the pilot watched the rudder judder and the
+/// pitch bob (LXGB, 2026-08-02). The API is served from X-Plane's flight
+/// loop; every deduplicated read is frame time handed back. Sharing the id
+/// caches also kills the resolution burst each newly spawned loop paid — the
+/// arrival used to re-resolve ~30 names right as autoland armed.
+///
+/// Ids are stable within a sim session but X-Plane reassigns them across
+/// restarts and aircraft reloads, so a value op that 404s evicts the entry
+/// and re-resolves by name (see `get_value` / `set_value`) — self-healing,
+/// now for every client at once. Values: `name -> (when, value)`, windows per
+/// [`value_cache_ttl`] / [`ttl_for`]; a write drops its own entry so the
+/// readback every tool's trust rests on still sees the real post-write value.
+type PerBase<V> = HashMap<String, HashMap<String, V>>;
+static ID_CACHE: std::sync::LazyLock<Mutex<PerBase<i64>>> =
+    std::sync::LazyLock::new(Default::default);
+static COMMAND_CACHE: std::sync::LazyLock<Mutex<PerBase<i64>>> =
+    std::sync::LazyLock::new(Default::default);
+static VALUE_CACHE: std::sync::LazyLock<Mutex<PerBase<(std::time::Instant, serde_json::Value)>>> =
+    std::sync::LazyLock::new(Default::default);
 
 #[derive(Deserialize)]
 struct CommandIndex {
@@ -355,15 +376,18 @@ impl XPlaneClient {
         Self {
             http,
             base: base.trim_end_matches('/').to_string(),
-            id_cache: Mutex::new(HashMap::new()),
-            command_cache: Mutex::new(HashMap::new()),
-            value_cache: Mutex::new(HashMap::new()),
         }
     }
 
     /// Resolve a dataref's numeric id, caching the result.
     async fn dataref_id(&self, name: &str) -> Result<i64> {
-        if let Some(id) = self.id_cache.lock().await.get(name).copied() {
+        if let Some(id) = ID_CACHE
+            .lock()
+            .await
+            .get(&self.base)
+            .and_then(|m| m.get(name))
+            .copied()
+        {
             return Ok(id);
         }
 
@@ -391,7 +415,12 @@ impl XPlaneClient {
             .map(|d| d.id)
             .ok_or_else(|| anyhow!("dataref not found: {name}"))?;
 
-        self.id_cache.lock().await.insert(name.to_string(), id);
+        ID_CACHE
+            .lock()
+            .await
+            .entry(self.base.clone())
+            .or_default()
+            .insert(name.to_string(), id);
         Ok(id)
     }
 
@@ -404,7 +433,12 @@ impl XPlaneClient {
         note_named(name);
         let ttl = ttl_for(name);
         if !ttl.is_zero() {
-            if let Some((at, v)) = self.value_cache.lock().await.get(name) {
+            if let Some((at, v)) = VALUE_CACHE
+                .lock()
+                .await
+                .get(&self.base)
+                .and_then(|m| m.get(name))
+            {
                 if at.elapsed() < ttl {
                     note_cache_hit();
                     return Ok(v.clone());
@@ -430,15 +464,22 @@ impl XPlaneClient {
             match result {
                 Ok(resp) => {
                     if !ttl.is_zero() {
-                        self.value_cache.lock().await.insert(
-                            name.to_string(),
-                            (std::time::Instant::now(), resp.data.clone()),
-                        );
+                        VALUE_CACHE
+                            .lock()
+                            .await
+                            .entry(self.base.clone())
+                            .or_default()
+                            .insert(
+                                name.to_string(),
+                                (std::time::Instant::now(), resp.data.clone()),
+                            );
                     }
                     return Ok(resp.data);
                 }
                 Err(e) if !refreshed && is_not_found(&e) => {
-                    self.id_cache.lock().await.remove(name); // stale handle — re-resolve
+                    if let Some(m) = ID_CACHE.lock().await.get_mut(&self.base) {
+                        m.remove(name); // stale handle — re-resolve
+                    }
                     refreshed = true;
                 }
                 Err(e) => return Err(e),
@@ -523,7 +564,9 @@ impl XPlaneClient {
     async fn set_value(&self, name: &str, value: serde_json::Value) -> Result<()> {
         // A write makes any cached value a lie, and the readback that follows
         // it is the whole trust model — drop the entry so that read is real.
-        self.value_cache.lock().await.remove(name);
+        if let Some(m) = VALUE_CACHE.lock().await.get_mut(&self.base) {
+            m.remove(name);
+        }
         let body = json!({ "data": value });
         let mut refreshed = false;
         loop {
@@ -543,7 +586,9 @@ impl XPlaneClient {
             match result {
                 Ok(()) => return Ok(()),
                 Err(e) if !refreshed && is_not_found(&e) => {
-                    self.id_cache.lock().await.remove(name); // stale handle — re-resolve
+                    if let Some(m) = ID_CACHE.lock().await.get_mut(&self.base) {
+                        m.remove(name); // stale handle — re-resolve
+                    }
                     refreshed = true;
                 }
                 Err(e) => return Err(e),
@@ -555,7 +600,13 @@ impl XPlaneClient {
     /// `filter[name]` query doesn't work for commands, so we fetch the full
     /// index once and cache it.
     async fn command_id(&self, name: &str) -> Result<i64> {
-        if let Some(id) = self.command_cache.lock().await.get(name).copied() {
+        if let Some(id) = COMMAND_CACHE
+            .lock()
+            .await
+            .get(&self.base)
+            .and_then(|m| m.get(name))
+            .copied()
+        {
             return Ok(id);
         }
         let url = format!("{}/api/v2/commands", self.base);
@@ -579,7 +630,12 @@ impl XPlaneClient {
             .map(|c| c.id)
             .ok_or_else(|| anyhow!("command not found: {name}"))?;
 
-        self.command_cache.lock().await.insert(name.to_string(), id);
+        COMMAND_CACHE
+            .lock()
+            .await
+            .entry(self.base.clone())
+            .or_default()
+            .insert(name.to_string(), id);
         Ok(id)
     }
 
