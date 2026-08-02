@@ -133,6 +133,11 @@ pub struct FullAuto {
     pub lights: Vec<crate::aircraft::LightProfile>,
     /// Panel flood-lighting dataref override, when the airframe has its own.
     pub flood_dataref: Option<String>,
+    /// ...or a toggle command, when the switch is one (the Baron 58). Carried
+    /// alongside the dataref because full auto builds its OWN copy of the
+    /// flood tool: an override wired here and not there is a tool that behaves
+    /// one way for the pilot and another for the automation.
+    pub flood_toggle: Option<crate::aircraft::ToggleSwitch>,
     // circuit / climb-out
     pub cfg: ApConfig,
     pub vr_kts: f64,
@@ -231,7 +236,10 @@ impl Tool for FullAuto {
         );
         let sub = crate::full_auto::SubTools {
             lights: crate::tools::lights::SetLights::new(self.lights.clone()),
-            flood: crate::tools::lights::SetFloodLights::new(self.flood_dataref.clone()),
+            flood: crate::tools::lights::SetFloodLights::new(
+                self.flood_dataref.clone(),
+                self.flood_toggle.clone(),
+            ),
             no_start_sequence: kind == StartKind::None,
             // One start per airframe CLASS: a turboprop cranks with the PT6
             // sequence, a jet with the APU/bleed-air sequence, a piston with

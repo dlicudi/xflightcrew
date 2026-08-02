@@ -193,6 +193,54 @@ rather than by a pattern leg with nowhere to go. A failed track read counts as
 NOT rolled out: it can only cost a tick, where the opposite hands over the very
 thing the guard exists to prevent.
 
+**A name in a profile is not evidence the thing exists, and the copilot has
+hands as well as a voice** (2026-08-02, the Baron again). Adding its roof flood
+lights meant probing the live sim for them, and the probe convicted the entry
+already sitting two lines above: `flood_lights_dataref` was
+`laminar/b58/lighting/flood_light_switch`, and NO DATAREF OF THAT NAME EXISTS.
+The name belongs to a COMMAND ("Flood Light Toggle Switch"), so every
+`set_flood_lights` on this airframe wrote into nothing and then read nothing
+back, and nobody noticed because a tool that fails silently and a tool that
+works look identical from the cockpit unless you watch the switch. Its real
+position is `laminar/b58/flood_light_toggle/switch_pos`, read-only, so it needs
+the same read-before-firing toggle the Citation X taught (`flood_lights_toggle`,
+carried through full auto's own copy of the tool as well, or the automation and
+the pilot get different behaviour from one switch). The roof floods themselves
+are two writable pods, `roof_L_on` and `roof_R_on`, written together for the
+landing-light reason: one pod lit is a readback confirming the half it looked
+at. The general lesson is the cheap one: `is_writable` and existence are one
+`curl` away whenever the sim is up, and a profile line copied from a deck config
+is a HYPOTHESIS until then.
+
+The new half is [src/cockpit_auto.rs](src/cockpit_auto.rs), the first thing the
+copilot does to the cockpit unasked rather than on request: interior lights
+flagged `auto_at_night` come on once the aircraft is powered and the sun is
+down, and the GNS430's welcome page gets its two ENT presses
+(`gps_ack_command`) once per power-up. "Night falls", "battery on" and "engines
+started" are not three triggers but ONE condition becoming true — powered AND
+dark — which is why the state machine is over (bus volts, sun pitch) and not
+over events. Three rules shape it, and they are all the same rule. It is
+one-shot per spell and never re-asserted, because a watch that re-fires every
+tick is not an automation, it is a fight with the pilot over a switch (the gyro
+sync's cooldown is the same instinct). "Off" is only ever commanded for a light
+the copilot itself switched on, and the `set_lights` tool drops that claim the
+moment the pilot moves the switch themselves, so daybreak cannot undo a
+decision made at midnight. And only INTERIOR lights may be flagged: switching an
+exterior light on the pilot's behalf changes what other traffic sees, and a
+profile test enforces it rather than trusting the YAML. The sun threshold
+carries hysteresis (0 degrees down, +5 up) because a single threshold chatters
+through every ripple in the read while the sun sits on the horizon. The watch
+runs on its own 2 s clock rather than the monitor's 3 Hz — the sun moves a
+quarter degree a minute — and is skipped entirely on an airframe declaring
+neither duty, so nothing pays a read for a capability it does not have. It sits
+ABOVE the `quiet` narration gate on purpose: a pilot who mutes the panel still
+wants their lights. Every light write, the copilot's and the pilot's, now goes
+through one `tools::lights::apply` (the KT73 rule), which also made the plain
+write path compare its readback against the INTENT — it used to report whatever
+came back, so a write that silently failed answered "Roger, landing lights off"
+to "landing lights on", a readback confirming itself. Blackboxes as
+`"kind":"cockpit_auto"`. NOT yet flown.
+
 A recurring add-on trap the profile exists to absorb: on a study-level
 airframe the stock actuator can be the add-on's OUTPUT, not its input — the
 model drives the sim dataref from its own switch every frame, so the

@@ -189,6 +189,7 @@ impl Registry {
         if profile.flood_lights {
             tools.push(Box::new(lights::SetFloodLights::new(
                 profile.flood_lights_dataref.clone(),
+                profile.flood_lights_toggle.clone(),
             )));
         }
 
@@ -317,6 +318,7 @@ impl Registry {
                     vs_clean_kts: profile.vs_clean_kts,
                     lights: profile.lights.clone(),
                     flood_dataref: profile.flood_lights_dataref.clone(),
+                    flood_toggle: profile.flood_lights_toggle.clone(),
                     // "Can we start it at all": the generic piston group OR a
                     // custom cycle-switch piston sequence (the DC-3, whose
                     // mixture is xlua-overridden so it declares no `engine`).

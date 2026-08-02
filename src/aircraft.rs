@@ -164,6 +164,28 @@ pub struct AircraftProfile {
     /// `sim/cockpit2/switches/generic_lights_switch[0]`). `None` → universal floods.
     #[serde(default)]
     pub flood_lights_dataref: Option<String>,
+    /// Override for airframes whose flood switch is a TOGGLE command with a
+    /// read-only position dataref, which no write can drive. Read first, fired
+    /// only when the position differs — the Citation X rule: a toggle fired as
+    /// "on" turns the system off whenever it was already on.
+    ///
+    /// The Baron 58 is the case that found this. Its profile declared
+    /// `flood_lights_dataref: laminar/b58/lighting/flood_light_switch`, and
+    /// probing the live sim showed that name is a COMMAND, not a dataref — the
+    /// airframe has no dataref by that name at all, so every `set_flood_lights`
+    /// on the Baron was a write into nothing that then read back nothing
+    /// (2026-08-02). Its real position lives at
+    /// `laminar/b58/flood_light_toggle/switch_pos`, read-only.
+    #[serde(default)]
+    pub flood_lights_toggle: Option<ToggleSwitch>,
+    /// A command fired TWICE when the aircraft comes alive, to acknowledge the
+    /// GNS430's welcome/database page — the screen that otherwise sits there
+    /// until somebody presses ENT. `None` on airframes with no such unit.
+    /// Fired once per power-up (see [`crate::cockpit_auto`]), never repeated
+    /// while the bus stays live, so a pilot navigating the unit is never
+    /// interrupted by a stray ENT.
+    #[serde(default)]
+    pub gps_ack_command: Option<String>,
     /// Override switch for pitot heat when the stock command is a no-op — the
     /// airframe's script drives the heat from its own control and overwrites the
     /// stock datarefs every frame (MD-82: `laminar/md82/ice/heatknob`, 0 = off,
@@ -895,6 +917,18 @@ pub struct LightProfile {
     /// Citation X's landing lights are an independent left and right.
     #[serde(default)]
     pub toggles: Vec<ToggleSwitch>,
+    /// The copilot switches this light on by its own hand once the aircraft is
+    /// powered and the sun is down, and off again at daybreak (see
+    /// [`crate::cockpit_auto`]). For the cockpit lighting a crew member would
+    /// simply reach up and set — the Baron's roof floods — never for an
+    /// EXTERIOR light, where switching on the pilot's behalf changes what other
+    /// traffic sees.
+    ///
+    /// One-shot per spell, never re-asserted: the pilot switching it back off
+    /// is the pilot's decision and the copilot does not argue. Off is only ever
+    /// commanded for a light the copilot itself turned on.
+    #[serde(default)]
+    pub auto_at_night: bool,
 }
 
 /// One electrical system the `set_electrical` tool can switch. Driven by the
@@ -1283,6 +1317,45 @@ mod tests {
         assert_eq!(landing.also_datarefs.len(), 1);
         assert!(landing.command_on.is_none(), "written, never commanded");
 
+        // Roof floods: a left and a right pod, written together for the same
+        // reason, and the one light on this airframe the copilot sets itself
+        // after dark.
+        let roof = p
+            .lights
+            .iter()
+            .find(|l| l.key == "roof")
+            .expect("baron roof lights");
+        assert_eq!(roof.dataref, "laminar/b58/lighting/roof_L_on");
+        assert_eq!(
+            roof.also_datarefs,
+            vec!["laminar/b58/lighting/roof_R_on".to_string()],
+            "one pod lit is a readback confirming the half it looked at"
+        );
+        assert!(roof.auto_at_night);
+        // Interior only. Switching an EXTERIOR light on the pilot's behalf
+        // changes what other traffic sees, so nothing out there is ever
+        // flagged: this assertion is the guard on that rule, not a restatement
+        // of the profile.
+        for l in p.lights.iter().filter(|l| l.auto_at_night) {
+            assert_eq!(l.key, "roof", "{} is not an interior light", l.key);
+        }
+
+        // The flood switch is a COMMAND with a read-only position dataref —
+        // probing the live sim showed no `flood_light_switch` DATAREF exists,
+        // so the profile's old `flood_lights_dataref` wrote into nothing and
+        // read back nothing (2026-08-02).
+        assert!(p.flood_lights);
+        assert!(
+            p.flood_lights_dataref.is_none(),
+            "there is no such dataref on this airframe"
+        );
+        let flood = p.flood_lights_toggle.as_ref().expect("baron flood toggle");
+        assert_eq!(flood.command, "laminar/b58/lighting/flood_light_switch");
+        assert_eq!(flood.dataref, "laminar/b58/flood_light_toggle/switch_pos");
+
+        // The GNS430's welcome page, cleared once per power-up.
+        assert_eq!(p.gps_ack_command.as_deref(), Some("sim/GPS/g430n1_ent"));
+
         // One battery, one alternator per engine, plus the pair and avionics.
         let keys: Vec<&str> = p.electrical.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(
@@ -1585,6 +1658,7 @@ fn cessna_172sp() -> AircraftProfile {
         |key: &str, spoken: &str, dataref: &str, cmd_on: &str, cmd_off: &str| LightProfile {
             also_datarefs: Vec::new(),
             toggles: Vec::new(),
+            auto_at_night: false,
             key: key.into(),
             spoken: spoken.into(),
             dataref: dataref.into(),
@@ -1603,6 +1677,8 @@ fn cessna_172sp() -> AircraftProfile {
         engines: 1,
         magnetos_per_engine: false,
         flood_lights_dataref: None,
+        flood_lights_toggle: None,
+        gps_ack_command: None,
         // Cycle-switch systems (the DC-3 pattern) — not used by the GA singles.
         power_switch: None,
         fuel_selectors: Vec::new(),
@@ -1858,6 +1934,7 @@ fn cirrus_sr22() -> AircraftProfile {
         |key: &str, spoken: &str, dataref: &str, cmd_on: &str, cmd_off: &str| LightProfile {
             also_datarefs: Vec::new(),
             toggles: Vec::new(),
+            auto_at_night: false,
             key: key.into(),
             spoken: spoken.into(),
             dataref: dataref.into(),
@@ -1876,6 +1953,8 @@ fn cirrus_sr22() -> AircraftProfile {
         engines: 1,
         magnetos_per_engine: false,
         flood_lights_dataref: None,
+        flood_lights_toggle: None,
+        gps_ack_command: None,
         // Cycle-switch systems (the DC-3 pattern) — not used by the GA singles.
         power_switch: None,
         fuel_selectors: Vec::new(),

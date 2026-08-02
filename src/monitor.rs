@@ -1573,6 +1573,21 @@ pub async fn run(
     let mut checks = build_checks(&live.get());
     let mut drefs = advisor_drefs(&live.get());
     let mut avionics_readback = avionics_readback_dref(&live.get());
+    // The cockpit duties the copilot performs unasked, per airframe: interior
+    // lights flagged `auto_at_night`, and a GPS welcome page to acknowledge.
+    // Collected at rebuild so an airframe declaring NEITHER never pays a read.
+    let cockpit_duties =
+        |p: &AircraftProfile| -> (Vec<crate::aircraft::LightProfile>, Option<String>) {
+            (
+                p.lights
+                    .iter()
+                    .filter(|l| l.auto_at_night)
+                    .cloned()
+                    .collect(),
+                p.gps_ack_command.clone(),
+            )
+        };
+    let (mut night_lights, mut gps_ack) = cockpit_duties(&live.get());
     // Whether THIS airframe carries a crew, rebuilt on aircraft switch; the
     // live staffing setting is read at the watch itself (cabin::aboard), so
     // a panel flip applies mid-flight without a profile swap.
@@ -1629,6 +1644,16 @@ pub async fn run(
     // Gyro auto-sync cooldown (drift resets to ~0 on sync, so this only guards
     // against a sim-side write failing silently and re-triggering every tick).
     let mut gyro_sync_last: Option<Instant> = None;
+    // The unasked cockpit duties (night lights, GPS welcome page) and their own
+    // slower clock. The monitor ticks at 3 Hz and neither input justifies that:
+    // the sun moves a quarter of a degree a minute, and a battery master thrown
+    // two seconds ago is still "just now" to the pilot. At 3 Hz this pair would
+    // have been 6 reads/s, the same order as the replay/pause flags the load
+    // histogram singled out as the obvious thing to slow down.
+    let mut cockpit_auto = crate::cockpit_auto::CockpitAuto::default();
+    let mut cockpit_auto_last: Option<Instant> = None;
+    /// How often the cockpit duties look at the sun and the bus.
+    const COCKPIT_AUTO_EVERY: Duration = Duration::from_secs(2);
     // Party-line cadence, and whether an advisory is waiting on its "clear of
     // traffic" closure.
     let mut chatter_last: Option<Instant> = None;
@@ -1663,6 +1688,13 @@ pub async fn run(
             checks = build_checks(&live.get());
             drefs = advisor_drefs(&live.get());
             avionics_readback = avionics_readback_dref(&live.get());
+            (night_lights, gps_ack) = cockpit_duties(&live.get());
+            // A new airframe is a new cockpit: whatever we set on the last one
+            // says nothing about this one's switches, and its GPS has its own
+            // welcome page. Same rule as the radio-power latch — a process-wide
+            // fact that outlives its airframe aims the next aircraft's writes
+            // at something it may not have.
+            cockpit_auto = crate::cockpit_auto::CockpitAuto::default();
             cabin_capable = live.get().cabin_crew;
             states = checks.iter().map(|c| (c.id(), FireState::new())).collect();
             tracing::info!(
@@ -1804,6 +1836,95 @@ pub async fn run(
                     );
                 }
                 voice.set_crashed(is_crashed);
+            }
+            // The cockpit duties a crew member performs unasked: the
+            // interior lights once the aircraft is alive and the sun is
+            // down, and the GNS430's welcome page. Crew-gated for the same
+            // reason as the gyro sync above — this is the copilot's HAND on
+            // the panel, and in ATC-only nobody is aboard to reach it.
+            // Skipped entirely on an airframe that declares neither duty,
+            // so nothing pays for a capability it doesn't have.
+            if crew_on
+                && (!night_lights.is_empty() || gps_ack.is_some())
+                && cockpit_auto_last.is_none_or(|t| now.duration_since(t) >= COCKPIT_AUTO_EVERY)
+            {
+                cockpit_auto_last = Some(now);
+                // The pilot switched one of these themselves since our last
+                // pass: their switch now, not ours.
+                if crate::cockpit_auto::take_pilot_moved_lights() {
+                    cockpit_auto.pilot_took_the_lights();
+                }
+                // Both best-effort: a failed read must not act. Defaulting
+                // either way would be a guess with a switch on the end of
+                // it — a missing sun angle reading as night would light the
+                // cockpit at noon.
+                let sun = xp.get_float("sim/graphics/scenery/sun_pitch_degrees").await;
+                let volts = xp
+                    .get_float_array("sim/cockpit2/electrical/bus_volts")
+                    .await
+                    .ok()
+                    .and_then(|v| v.first().copied());
+                if let (Ok(sun), Some(volts)) = (sun, volts) {
+                    for action in cockpit_auto.tick(sun, volts) {
+                        use crate::cockpit_auto::Action;
+                        match action {
+                            Action::LightsOn | Action::LightsOff => {
+                                let on = action == Action::LightsOn;
+                                // Through the SAME writer the `set_lights`
+                                // tool uses, so every profile mechanism and
+                                // the readback behave identically whether a
+                                // pilot asked or the copilot decided.
+                                let mut done = Vec::new();
+                                for l in &night_lights {
+                                    if crate::tools::lights::apply(&xp, l, on)
+                                        .await
+                                        .is_ok_and(|actual| actual == on)
+                                    {
+                                        done.push(l.spoken.clone());
+                                    }
+                                }
+                                crate::blackbox::record(
+                                    "cockpit_auto",
+                                    serde_json::json!({
+                                        "event": if on { "lights_on" } else { "lights_off" },
+                                        "sun_pitch_deg": r1(sun), "bus_volts": r1(volts),
+                                        "lights": done,
+                                    }),
+                                );
+                                // Speak only what actually moved: a switch
+                                // that refused is not an announcement, it
+                                // is the ground-power lie in a new coat.
+                                if let Some(what) = done.first() {
+                                    voice.alert(
+                                        Priority::Advisory,
+                                        if on {
+                                            format!("Sun's down, {what} on.")
+                                        } else {
+                                            format!("Daylight, {what} off.")
+                                        },
+                                    );
+                                }
+                            }
+                            Action::AckGps => {
+                                // Twice: the welcome page and the database
+                                // page behind it. Silent — clearing a
+                                // startup screen is not worth a word, and
+                                // the pilot sees the unit come up.
+                                if let Some(cmd) = &gps_ack {
+                                    let a = xp.run_command(cmd).await;
+                                    let b = xp.run_command(cmd).await;
+                                    crate::blackbox::record(
+                                        "cockpit_auto",
+                                        serde_json::json!({
+                                            "event": "gps_ack", "command": cmd,
+                                            "ok": a.is_ok() && b.is_ok(),
+                                        }),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
             // Approach vectors: armed by the ATC station when the pilot requests
             // vectors on the approach frequency. Advisory narration only; muted

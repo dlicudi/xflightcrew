@@ -17,6 +17,7 @@ mod autotaxi;
 mod cabin;
 mod checklist;
 mod circuit;
+mod cockpit_auto;
 mod config;
 mod failures;
 mod full_auto;
