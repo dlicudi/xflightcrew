@@ -876,9 +876,18 @@ handing the flight down the airway) with "inbound for landing" then the
 final report at the autoland handoff — the call that earns the landing
 clearance. The arming tool fetches the OFP on demand, refuses without a
 plan or when the plan departs a field we aren't at, and best-effort loads
-the route into the GPS via the FMS mailbox. Cruise POWER is untouched
-(the climb-out throttle rides through cruise — a real cruise-power pull
-is future work). Everything blackboxes as `"kind":"full_auto"` /
+the route into the GPS via the FMS mailbox. Cruise POWER is a speed, not a
+lever position: the enroute legs arm the flight speed-hold at the
+profile's `reference.cruise_ias_kts` (procedure.rs `cruise_ias_kts` —
+throttle finds the power that holds the IAS, full while still slow out of
+the climb, so it self-adjusts for weight/altitude/temp; pitch owns
+altitude; released at every exit so autoland owns the throttle alone).
+The number is the AIRFRAME's, never SimBrief's — the plan supplies the
+altitudes, the profile the speed (172: 108 KIAS; Baron: 180, still
+VERIFY), and a profile without one leaves the throttle at climb power,
+which was the only behaviour before this existed. Flying the OFP's own
+cruise schedule (cost index / mach / planned TAS) is the part that is
+still future work. Everything blackboxes as `"kind":"full_auto"` /
 `"circuit"` / `"procedure"`.
 
 Depth (added 2026-07-28): **the approach is sized for the airframe, and a
