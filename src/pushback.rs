@@ -142,6 +142,27 @@ const TUG_CLEAR_SECS: f64 = 30.0;
 /// segment. It is standing at the nose, not driving across the airport —
 /// the Stansted re-hook after a completed segment took seconds.
 const REHOOK_SECS: f64 = 60.0;
+/// Rolled FORWARD this far from the stand and no tug is pushing us — we are
+/// creeping under our own idle thrust with the brakes off. Ends the push,
+/// brakes on. Past `MOVED_M` so the same jitter both tests tolerate cannot
+/// trip it, and small enough to catch the creep while it is still slow.
+///
+/// A BACKSTOP now, not the first line: the hold below arrests the creep long
+/// before this fires, so reaching it means the brake channel isn't working
+/// (an old plugin) — only then is giving up right.
+const CREEP_M: f64 = 2.5;
+/// The proportional brake channel (1 s expiry — the same one autoland's
+/// rollout squeezes), and how hard the push loop holds against idle creep.
+const TAXI_BRAKE: &str = "xcopilot/taxi_brake";
+const HOLD_BRAKE: f64 = 0.4;
+/// Forward drift that starts the hold. Under `MOVED_M` on purpose: the hold
+/// must catch the creep while the creep failure above must never fire from
+/// jitter, and they are different jobs.
+const HOLD_AT_M: f64 = 0.3;
+/// Consecutive polls the attach/tow flag must hold before the tug counts as
+/// CONNECTED. One blip is the tug positioning, and releasing the brakes on it
+/// is how three pushes died in the dead air (2026-08-02).
+const HOOK_SOLID_POLLS: u32 = 3;
 
 /// What the push is aiming at, read off the cleared taxi route.
 #[derive(Debug, Clone, PartialEq)]
@@ -265,6 +286,45 @@ fn angle_diff_deg(a: f64, b: f64) -> f64 {
     (a - b + 540.0).rem_euclid(360.0) - 180.0
 }
 
+/// How far BACK we have come: displacement from the stand projected onto the
+/// reverse of the heading we started on. Signed — negative means we have
+/// rolled FORWARD off the stand.
+///
+/// This has to be signed, and the reason is a whole sortie. It was the plain
+/// haversine distance from the start point, which is a MAGNITUDE: a metre
+/// forward and a metre back read identically, exactly the trap the taxi guide
+/// hit when four knots backwards narrated as "next left" (2026-07-28). At
+/// Southampton the tug hooked on, never pushed, and the Baron — brakes off for
+/// the hook-up, both engines idling — crept FORWARD off the stand. The creep
+/// counted as pushback progress, crossed `MOVED_M`, latched `towed`, and with
+/// the attach flag reading false the loop concluded the tug had let go after
+/// pushing us 1.2 m. It then waited out a re-hook that was never coming while
+/// the aircraft accelerated to 21 kt across the apron (2026-08-01).
+///
+/// Projected onto the START heading, not the current one, because a "Nose 90"
+/// pattern swings the aircraft up to a right angle mid-push: the nose ends up
+/// across the displacement, but the displacement is still behind where the
+/// nose BEGAN, which is what "how far back have we come" means.
+pub fn back_along(start_lat: f64, start_lon: f64, start_psi: f64, lat: f64, lon: f64) -> f64 {
+    let d_m = nav::haversine_nm(start_lat, start_lon, lat, lon) * M_PER_NM;
+    if d_m <= 0.0 {
+        return 0.0;
+    }
+    let brg = nav::bearing_deg(start_lat, start_lon, lat, lon);
+    // Angle between where we went and straight back up the original tail.
+    let off = angle_diff_deg(brg, start_psi + 180.0).to_radians();
+    d_m * off.cos()
+}
+
+/// Should this tick squeeze the brake channel against forward creep? Only
+/// while NOBODY is pushing (a tug mid-arc can carry the reference point
+/// forward, and a push already under way must never be braked against) and
+/// the aircraft has drifted forward of the stand — the idle-thrust walk that
+/// killed three EGHI pushes in the tug's own dead air (2026-08-02).
+pub fn should_hold_creep(towed: bool, towing: bool, attached: bool, back_m: f64) -> bool {
+    !towed && !towing && !attached && back_m < -HOLD_AT_M
+}
+
 fn event(detail: serde_json::Value) {
     crate::blackbox::record("pushback", detail);
 }
@@ -294,6 +354,18 @@ static LEARNED_SENSE: AtomicI8 = AtomicI8::new(0);
 /// 2026-07-28, with the tug still connected).
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// The pilot's own stop, set from the command loop. Separate from the caller's
+/// abort flag (full auto's), because "stop" during a push is about THIS
+/// manoeuvre and must not depend on who armed it: a push holds the aircraft
+/// with the brakes off and no governor running, so it is the one stage where
+/// the word has to land somewhere. Cleared at the start of every run.
+pub static ABORT: AtomicBool = AtomicBool::new(false);
+
+/// Either flag — the caller's, or the pilot's.
+fn stopping(abort: &AtomicBool) -> bool {
+    abort.load(SeqCst) || ABORT.load(SeqCst)
+}
+
 /// One-line status for the dashboard/panel; the stage detail (tug wait, under
 /// tow) is full auto's to narrate — this only says a push is running.
 pub fn status() -> Option<String> {
@@ -310,6 +382,7 @@ pub async fn run(
     valve_set: Option<f64>,
 ) -> Result<f64, String> {
     ACTIVE.store(true, SeqCst);
+    ABORT.store(false, SeqCst);
     let out = run_inner(xp, ctx, voice, plan, abort, valve_set).await;
     // Stop-and-let-go on EVERY exit, unconditionally. A pushback command is a
     // whole manoeuvre the tug runs on its own, and a re-issued continuation
@@ -407,15 +480,28 @@ async fn run_inner(
         let mut said = false;
         let mut said2 = false;
         let mut logged = began;
+        // CONNECTED means connected, not glimpsed. All three dead EGHI pushes
+        // show the attach flag up for exactly ONE poll as the tug positioned,
+        // false again by the first push tick — and the brakes came off on that
+        // blip, four seconds before the creep guard killed the push the tug
+        // had not started. The pilot's rule is the right one: brakes stay ON
+        // until the tug is solidly on the bar, THEN release (2026-08-02).
+        let mut solid = 0u32;
         loop {
-            if abort.load(SeqCst) {
+            if stopping(abort) {
                 break false;
             }
             let (a, t) = tokio::join!(xp.get_float(PUSH_ATTACHED), xp.get_float(TOW_IN_PROGRESS));
             if a.unwrap_or(0.0) > 0.5 || t.unwrap_or(0.0) > 0.5 {
-                event(json!({ "event": "hooked", "waited_s": r1(began.elapsed().as_secs_f64()) }));
-                break true;
+                solid += 1;
+                if solid >= HOOK_SOLID_POLLS {
+                    event(json!({ "event": "hooked", "waited_s": r1(began.elapsed().as_secs_f64()) }));
+                    break true;
+                }
+                tokio::time::sleep(Duration::from_millis(TICK_MS)).await;
+                continue;
             }
+            solid = 0;
             let waited = began.elapsed().as_secs_f64();
             if waited >= TUG_WAIT_SECS {
                 break false;
@@ -448,27 +534,24 @@ async fn run_inner(
         // taxiing.
         send(ctx, "stop").await;
         event(json!({ "event": "no_tug", "waited_s": TUG_WAIT_SECS }));
-        return Err(if abort.load(SeqCst) {
-            "abort"
-        } else {
-            "no_tug"
-        }
-        .into());
+        return Err(if stopping(abort) { "abort" } else { "no_tug" }.into());
     }
-
-    // Hooked: NOW the brakes come off — the crew's "brakes released" answer to
-    // the tug's "brakes off please", and the first moment releasing them is
-    // safe (something is holding the aircraft).
-    let _ = crate::tools::controls::drive_park_brake(ctx.xplane, false, valve_set).await;
-    event(json!({ "event": "brakes_released" }));
 
     // The tug ignores a command issued before it was on the bar: the summon
     // above brought it, and nothing moved until the command was sent AGAIN
     // once hooked (live, the re-send was the twelve-second "nudge" and the
     // push began a minute later, 2026-07-27). So re-issue here, and treat the
     // pre-hook command as having done its one job — calling the truck.
+    // Issued BEFORE the brakes come off: the aircraft is never brakeless with
+    // a tug that has no instruction yet.
     send(ctx, cmd_now.action()).await;
     event(json!({ "event": "issued", "pattern": cmd_now.action(), "issue": 1 }));
+
+    // Hooked, instructed: NOW the brakes come off — the crew's "brakes
+    // released" answer to the tug's "brakes off please", and the first moment
+    // releasing them is safe (something is holding the aircraft).
+    let _ = crate::tools::controls::drive_park_brake(ctx.xplane, false, valve_set).await;
+    event(json!({ "event": "brakes_released" }));
 
     let began = Instant::now();
     // The guess (or the session's learned answer). Still checked against the
@@ -490,9 +573,21 @@ async fn run_inner(
     // been repeated to a tug that hooked on but never moved.
     let mut towed = false;
     let mut nudged = false;
+    // Whether the attach flag has EVER read true inside this loop. On the
+    // Baron at EGHI it blips once during the hook wait and reads false from
+    // the first push tick on — three pushes in a row, 2026-08-02 — so "the
+    // bar came off" can only mean something on an airframe where the bar was
+    // ever seen ON. Without this gate, a real push on that airframe would be
+    // declared released `MOVED_M` metres in, and the re-issue would re-aim
+    // the tug mid-manoeuvre.
+    let mut saw_attached = false;
     loop {
-        if abort.load(SeqCst) {
+        if stopping(abort) {
             send(ctx, "stop").await;
+            // Brakes on. The bar may be off and the engines are running, so an
+            // abort that only stops the TUG leaves the aircraft rolling —
+            // the same hole the re-hook wait had.
+            let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
             event(json!({ "event": "abort", "back_m": r1(back_m) }));
             return Err("abort".into());
         }
@@ -523,7 +618,36 @@ async fn run_inner(
         };
         let towing = tow_r.is_ok_and(|v| v > 0.5);
         let attached = att_r.is_ok_and(|v| v > 0.5);
-        back_m = nav::haversine_nm(start_lat, start_lon, lat, lon) * M_PER_NM;
+        saw_attached |= attached;
+        back_m = back_along(start_lat, start_lon, start_psi, lat, lon);
+        // HOLD against idle creep — don't fail on it. The dead air between the
+        // hook-up and the tug actually rolling is MINUTES on this sim (Luton:
+        // 74 s; the nudge era: "the push began a minute later"), the brakes
+        // are off for the tug, and a Baron at idle walks forward in seconds.
+        // Three EGHI pushes died exactly there on 2026-08-02: hooked, brakes
+        // released, forward 3 m in four seconds, `creeping`, every time — the
+        // creep guard was killing pushes the tug had simply not started yet.
+        // So while nobody is pushing and we are drifting FORWARD, squeeze the
+        // expiring proportional brake channel instead: it holds the aircraft
+        // this tick and frees itself in a second, so a tug that begins its
+        // manoeuvre is never fighting a latched brake.
+        if should_hold_creep(towed, towing, attached, back_m) {
+            let _ = xp.set_float(TAXI_BRAKE, HOLD_BRAKE).await;
+        }
+        // Going the WRONG WAY with nobody pushing: the brakes are off for the
+        // tug and the engines are running, so this is our own idle thrust
+        // walking us off the stand. Nothing downstream can recover from it —
+        // the taxi fallback would join a route from an aircraft already
+        // rolling — so it ends the push here, brakes on. Gated on not being
+        // under tow, because a tug swinging a long nose CAN carry the
+        // reference point forward for a moment mid-arc. With the hold above
+        // this is the backstop for a missing brake channel, not the norm.
+        if !towing && !attached && back_m < -CREEP_M {
+            send(ctx, "stop").await;
+            let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
+            event(json!({ "event": "creeping", "back_m": r1(back_m) }));
+            return Err("creeping".into());
+        }
         // "Under tow" is measured off our OWN movement. The dataref that
         // sounds like it says this doesn't (see PUSH_ATTACHED): live, it read
         // 0 through an entire push, which left `towed` false forever — the
@@ -542,7 +666,13 @@ async fn run_inner(
         // the plan with asks left — issue the next pattern, which SUMMONS the
         // tug back to the bar (it is standing at the nose), and wait for the
         // re-hook like the first hook, bounded much tighter.
-        if towed && !towing && !attached {
+        //
+        // Gated on the bar having ever been SEEN on (`saw_attached`): on an
+        // airframe where the attach flag reads false through a real push, the
+        // bar "coming off" is a fact about the dataref, not the tug, and a
+        // completed manoeuvre still ends through the stall path below —
+        // "stopped after moving is completion" needs no flag to say so.
+        if towed && !towing && !attached && saw_attached {
             let err_now =
                 angle_diff_deg(plan.target_hdg, xp.get_float(PSI_TRUE).await.unwrap_or(0.0));
             let complete =
@@ -562,6 +692,18 @@ async fn run_inner(
                 json!({ "event": "reissued_after_release", "pattern": cmd.action(),
                           "issue": issues, "err": r1(err_now) }),
             );
+            // BRAKES ON FIRST. The bar is off, so nothing is holding us — and
+            // the engines are running, which is the whole of the rule at the
+            // hook-up release above ("the first moment releasing them is safe
+            // is when something is holding the aircraft"). Waiting out the
+            // re-hook brakeless is the same hole the tug WAIT had before
+            // 2026-07-27, one state later: at Southampton the tug let go after
+            // 1.2 m, this wait ran its full minute, and the Baron rolled
+            // FORWARD off the stand at idle thrust to 21 kt while the module
+            // believed it was standing still — the tower berated us for being
+            // off the cleared route and the pilot had to stop it by voice
+            // (2026-08-01).
+            let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
             send(ctx, cmd.action()).await;
             let rehooked = wait_for(REHOOK_SECS, abort, || async {
                 let (a, t) =
@@ -571,10 +713,14 @@ async fn run_inner(
             .await;
             if !rehooked {
                 send(ctx, "stop").await;
+                // Already set above; re-assert, since the give-up path is the
+                // one a fallback taxi picks up from.
                 let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
                 event(json!({ "event": "no_rehook", "back_m": r1(back_m) }));
                 return Err("tug_released".into());
             }
+            // On the bar again: same handshake as the first hook-up.
+            let _ = crate::tools::controls::drive_park_brake(ctx.xplane, false, valve_set).await;
             event(json!({ "event": "rehooked" }));
             turn_since = (cmd != Steer::Straight).then_some((Instant::now(), err_now));
             moved_at = Instant::now();
@@ -730,7 +876,7 @@ where
 {
     let deadline = Instant::now() + Duration::from_secs_f64(secs);
     loop {
-        if abort.load(SeqCst) {
+        if stopping(abort) {
             return false;
         }
         if cond().await {
@@ -912,6 +1058,29 @@ mod tests {
         assert!(!sense_is_wrong(true, true, 60.0, 64.6, 20.0, 1));
     }
 
+    /// The tug's dead air is survived by HOLDING, not by failing. Three EGHI
+    /// pushes on 2026-08-02: hooked, brakes released, the Baron walked
+    /// forward 3 m at idle in four seconds, and `creeping` killed a push the
+    /// tug had simply not started yet — every time.
+    #[test]
+    fn creep_is_held_against_never_braked_into_a_push() {
+        // Drifting forward with nobody pushing: hold.
+        assert!(should_hold_creep(false, false, false, -0.5));
+        // Inside the drift deadband: leave the brakes alone.
+        assert!(!should_hold_creep(false, false, false, -0.2));
+        // Moving BACK is the tug working, whatever the flags say.
+        assert!(!should_hold_creep(false, false, false, 1.0));
+        // A tug on the bar, mid-tow, or a push already under way is never
+        // braked against — a "Nose 90" arc can carry the reference point
+        // forward for a moment and must not meet a brake when it does.
+        assert!(!should_hold_creep(false, false, true, -0.5));
+        assert!(!should_hold_creep(false, true, false, -0.5));
+        assert!(!should_hold_creep(true, false, false, -0.5));
+        // The hold engages well before the creep FAILURE would: the backstop
+        // stays a backstop.
+        assert!(HOLD_AT_M < CREEP_M);
+    }
+
     /// The deadband: inside it the tug pushes straight, because chasing the
     /// last few degrees costs apron the taxi's own steering owns.
     #[test]
@@ -958,5 +1127,40 @@ mod tests {
         assert_eq!(Steer::Straight.action(), "straight");
         assert_eq!(Steer::Left.action(), "left");
         assert_eq!(Steer::Right.action(), "right");
+    }
+
+    /// The Southampton creep (2026-08-01). Progress along the push is a
+    /// SIGNED quantity: the tug hooked on, never pushed, and the aircraft
+    /// rolled forward off the stand at idle with the brakes off for the
+    /// hook-up. Measured as a plain distance from the stand that forward roll
+    /// read as pushback progress, latched "under tow", and the loop then
+    /// waited out a re-hook that was never coming while the aircraft
+    /// accelerated across the apron.
+    #[test]
+    fn rolling_forward_is_never_pushback_progress() {
+        // Facing east (090). Behind us is west.
+        let psi = 90.0;
+        let back = at(LAT0, LON0, -10.0, 0.0); // 10 m west = 10 m back
+        assert!((back_along(LAT0, LON0, psi, back.0, back.1) - 10.0).abs() < 0.2);
+
+        // The live case: 1.5 m FORWARD, which the old magnitude read as 1.5 m
+        // of push — enough to cross MOVED_M and latch the tow.
+        let fwd = at(LAT0, LON0, 1.6, 0.0);
+        let crept = back_along(LAT0, LON0, psi, fwd.0, fwd.1);
+        assert!(crept < 0.0, "forward roll must be negative, got {crept}");
+        assert!(crept < MOVED_M, "and must never latch the tow, got {crept}");
+
+        // Sitting still is neither.
+        assert!(back_along(LAT0, LON0, psi, LAT0, LON0).abs() < 0.01);
+
+        // A "Nose 90" push swings the aircraft up to a right angle, so the
+        // measurement is against the heading we STARTED on: 30 m back and 12 m
+        // to one side is still ~30 m of push, whatever the nose is doing now.
+        let arc = at(LAT0, LON0, -30.0, 12.0);
+        let along = back_along(LAT0, LON0, psi, arc.0, arc.1);
+        assert!((along - 30.0).abs() < 0.5, "arc measured {along}");
+
+        // And the creep guard fires before the aircraft can get going.
+        const { assert!(CREEP_M > MOVED_M) } // jitter must not trip the creep guard
     }
 }

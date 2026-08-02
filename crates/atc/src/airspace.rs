@@ -75,7 +75,10 @@ impl Airspace {
             _ => "restricted area",
         };
         let (ident_raw, desc) = match self.name.split_once('(') {
-            Some((i, rest)) => (i.trim(), rest.split_once(')').map_or(rest, |(d, _)| d).trim()),
+            Some((i, rest)) => (
+                i.trim(),
+                rest.split_once(')').map_or(rest, |(d, _)| d).trim(),
+            ),
             None => (self.name.trim(), ""),
         };
         // A DESIGNATOR is an identifier: keep its case, just unpick the
@@ -130,7 +133,9 @@ fn speakable(name: &str, kind: &str) -> String {
         .filter(|w| {
             // Drop a standalone "AREA"/"ZONE" the class word already supplies.
             let bare = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-            !kind.split_whitespace().any(|k| k.eq_ignore_ascii_case(bare))
+            !kind
+                .split_whitespace()
+                .any(|k| k.eq_ignore_ascii_case(bare))
         })
         .map(|w| {
             SPOKEN_ABBREVIATIONS
@@ -473,7 +478,10 @@ mod tests {
         assert_eq!(space('P', "P-56").spoken_name(), "prohibited area P 56");
         // A bare name with no parenthetical takes the IDENT path, which
         // preserves case — it may be a designator and those are identifiers.
-        assert_eq!(space('Q', "DANGER ZONE").spoken_name(), "danger area DANGER ZONE");
+        assert_eq!(
+            space('Q', "DANGER ZONE").spoken_name(),
+            "danger area DANGER ZONE"
+        );
         // Nothing usable: the class alone, never a dangling "area ".
         assert_eq!(space('Q', "   ").spoken_name(), "danger area");
 

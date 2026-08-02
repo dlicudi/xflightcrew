@@ -125,6 +125,14 @@ pub struct FullAuto {
     pub tail_strike_deg: Option<f64>,
     /// Vne/Vmo for the climb's overspeed protection.
     pub vne_kts: Option<f64>,
+    /// Slowest the pattern may climb toward — see `circuit::climb_limit_fpm`.
+    pub climb_floor_kts: f64,
+    /// Clean stall speed, the floor under the pattern speed (flown clean).
+    pub vs_clean_kts: Option<f64>,
+    /// The airframe's exterior lights, for the departure light schedule.
+    pub lights: Vec<crate::aircraft::LightProfile>,
+    /// Panel flood-lighting dataref override, when the airframe has its own.
+    pub flood_dataref: Option<String>,
     // circuit / climb-out
     pub cfg: ApConfig,
     pub vr_kts: f64,
@@ -222,6 +230,8 @@ impl Tool for FullAuto {
             self.piston_engine,
         );
         let sub = crate::full_auto::SubTools {
+            lights: crate::tools::lights::SetLights::new(self.lights.clone()),
+            flood: crate::tools::lights::SetFloodLights::new(self.flood_dataref.clone()),
             no_start_sequence: kind == StartKind::None,
             // One start per airframe CLASS: a turboprop cranks with the PT6
             // sequence, a jet with the APU/bleed-air sequence, a piston with
@@ -275,6 +285,8 @@ impl Tool for FullAuto {
                 takeoff_roll_m: self.takeoff_roll_m,
                 approach_ias: self.approach_ias,
                 prop: self.prop.clone(),
+                climb_floor_kts: self.climb_floor_kts,
+                vs_clean_kts: self.vs_clean_kts,
             },
             takeoff: crate::tools::takeoff::AutoTakeoff {
                 tail_strike_deg: self.tail_strike_deg,

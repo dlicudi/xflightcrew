@@ -273,6 +273,18 @@ pub struct Params {
     /// Never-exceed / Vmo, KIAS — the climb's OVERSPEED protection. `None`
     /// keeps the full-power climb every airframe flew before this existed.
     pub vne_kts: Option<f64>,
+    /// True when an ORCHESTRATOR armed this takeoff and will keep flying after
+    /// the handoff (the circuit, full auto, a procedure) — as opposed to the
+    /// pilot asking for a takeoff on its own.
+    ///
+    /// It decides one thing, and that one thing is the most important sentence
+    /// this module speaks. The handoff line said "your aircraft"
+    /// UNCONDITIONALLY, so a circuit's takeoff told the pilot they had control
+    /// at the exact moment the circuit was taking it. A pilot who believes
+    /// that either fights the automation for the yoke or, worse, sits back
+    /// while nobody flies — and the whole trust model here rests on the
+    /// copilot being right about who has the aircraft.
+    pub handoff_to_caller: bool,
 }
 
 /// Fit the aircraft's position and heading to a runway end: which strip are
@@ -1181,17 +1193,31 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             serde_json::json!({"event": "climb", "ias": ias, "agl": agl_ft, "cmd_vs": vs}),
         );
         if agl_ft >= p.handoff_agl_ft.max(AP_ENGAGE_AGL_FT + 50.0) {
+            // Say the height we ACTUALLY reached, not a hardcoded thousand: a
+            // circuit hands off at 500 ft, and it announced "one thousand
+            // feet" there — a number the pilot can see is wrong on the
+            // altimeter, from the same sentence that tells them who is flying.
+            let height = spoken_height_ft(agl_ft);
             alert(
                 &voice,
                 Priority::Caution,
                 &format!(
-                    "One thousand feet, {} knots. Your aircraft. The autopilot is holding runway heading and the climb.",
-                    ias.round() as i64
+                    "{height}, {} knots. {}",
+                    ias.round() as i64,
+                    if p.handoff_to_caller {
+                        // The circuit, full auto or a procedure is taking it.
+                        // Saying "your aircraft" here is a lie about the one
+                        // thing that must never be wrong.
+                        "The autopilot is holding runway heading and the climb."
+                    } else {
+                        "Your aircraft. The autopilot is holding runway heading and the climb."
+                    }
                 ),
             );
             crate::blackbox::record(
                 "autotakeoff",
-                serde_json::json!({"event": "handoff", "agl": agl_ft, "ias": ias}),
+                serde_json::json!({"event": "handoff", "agl": agl_ft, "ias": ias,
+                                   "to_caller": p.handoff_to_caller}),
             );
             return;
         }
@@ -1199,10 +1225,65 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     }
 }
 
+/// A height called the way a pilot calls it, rounded to the nearest hundred:
+/// "five hundred feet", "one thousand feet", "one thousand five hundred feet".
+/// Spelled out rather than left as digits because this goes to TTS, where a
+/// bare "1500" is read as a quantity, not an altitude.
+pub fn spoken_height_ft(agl_ft: f64) -> String {
+    const ONES: [&str; 10] = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    ];
+    let h = (agl_ft.max(0.0) / 100.0).round() as i64 * 100;
+    let thousands = h / 1000;
+    let hundreds = (h % 1000) / 100;
+    let mut out = String::new();
+    if thousands > 0 {
+        let t = ONES.get(thousands as usize).copied().unwrap_or("");
+        if t.is_empty() {
+            // Above nine thousand this is not a takeoff handoff any more;
+            // fall back to the number rather than inventing words for it.
+            out.push_str(&thousands.to_string());
+        } else {
+            out.push_str(t);
+        }
+        out.push_str(" thousand");
+    }
+    if hundreds > 0 {
+        if thousands > 0 {
+            out.push(' ');
+        }
+        out.push_str(ONES[hundreds as usize]);
+        out.push_str(" hundred");
+    }
+    if out.is_empty() {
+        out.push_str("zero");
+    }
+    out.push_str(" feet");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::autoland::project_latlon;
+
+    /// The handoff line is the most important sentence this module speaks,
+    /// and it was wrong in two ways at once on every circuit (2026-08-01,
+    /// caught live in the cockpit): it said "your aircraft" while the circuit
+    /// was taking control, and it announced "one thousand feet" at the
+    /// circuit's 500 ft handoff — a number the pilot could see was wrong on
+    /// the altimeter, in the same breath as the claim about who was flying.
+    #[test]
+    fn the_handoff_names_the_real_height() {
+        assert_eq!(spoken_height_ft(500.0), "five hundred feet");
+        assert_eq!(spoken_height_ft(1000.0), "one thousand feet");
+        assert_eq!(spoken_height_ft(1500.0), "one thousand five hundred feet");
+        // It is called on the tick that CROSSES the height, so it is never
+        // exactly round: round to the hundred a pilot would say.
+        assert_eq!(spoken_height_ft(1013.0), "one thousand feet");
+        assert_eq!(spoken_height_ft(517.0), "five hundred feet");
+        assert_eq!(spoken_height_ft(2050.0), "two thousand one hundred feet");
+    }
 
     /// A 2,000 m runway at the equator, taking off due north from (0,0).
     fn rwy_north() -> Runway {

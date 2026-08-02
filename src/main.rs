@@ -2013,6 +2013,32 @@ async fn run_session(
         // philosophy as the release path: when we hold a control, ambiguity
         // resolves toward the pilot's authority over it — and on the ground,
         // stopping is always the safe reading.
+        // A PUSH holds the aircraft with no governor running, so the branch
+        // below could never see it — and a push is exactly where "stop" is
+        // most urgent, since the brakes are off for the tug. Cancel the push;
+        // its abort path stops the tug and sets the brakes.
+        if pushback::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            let tl = command.to_ascii_lowercase();
+            if tl
+                .split_whitespace()
+                .any(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric()) == "stop")
+                && !tl.contains("stop holding")
+            {
+                tracing::info!("pushback stop word, pre-gate");
+                pushback::ABORT.store(true, std::sync::atomic::Ordering::SeqCst);
+                // And the sequence that armed it. "Stop" during a push means
+                // stop, not "skip the push and start taxiing" — which is what
+                // aborting only the push would have full auto do next.
+                full_auto::abort();
+                say(
+                    &voice,
+                    &reporter,
+                    ui::LogKind::Readback,
+                    "Stopping the push. Brakes on, your aircraft.",
+                );
+                continue;
+            }
+        }
         if tools::speedhold::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
             let tl = command.to_ascii_lowercase();
             let words: Vec<&str> = tl
@@ -6417,6 +6443,15 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "brakes",
     "break",
     "breaks",
+    // "stop" is a control word, not chatter. It was missing, and the only
+    // reason it ever worked was the pre-gate branch below that fires while the
+    // speed governor is running — so the moment the aircraft was moving with
+    // no governor, the one word a pilot actually shouts was dropped as ambient
+    // with no miss chime. Southampton: a Baron rolling off its stand at 21 kt,
+    // "Stop." at 0.9996 confidence, nothing (2026-08-01). The grammar's bare
+    // stop already requires the WHOLE utterance to be it, so "stop for fuel"
+    // still just reaches the router rather than actuating.
+    "stop",
     "parking",
     "heat",
     // ramp / ground-ops: chocks, ground power, pushback, services
@@ -7211,7 +7246,7 @@ mod tests {
         // pattern is capped against the approach speed regardless.
         let vy = r.vy_kts.expect("vy");
         assert!(vy <= 200.0, "vy is a climb-out speed, got {vy}");
-        let pat = super::circuit::pattern_speed_kts(vy, r.approach_kts.unwrap());
+        let pat = super::circuit::pattern_speed_kts(vy, r.approach_kts.unwrap(), p.vs_clean_kts);
         assert!(pat <= 198.0, "pattern capped at 1.5x approach, got {pat}");
         // The runway it demands must fit the runways it flies from.
         let roll_m = r.takeoff_roll_ft.expect("ground roll") * 0.3048;
@@ -7859,6 +7894,34 @@ mod tests {
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
         }
+    }
+
+    /// "Stop" is a control word and must reach the router from a cold gate.
+    /// It was missing from the keyword table, so in continuous mode it only
+    /// ever worked through the pre-gate branch that fires while the speed
+    /// governor is running. With a push under way — brakes off for the tug,
+    /// no governor — a Baron rolled off its Southampton stand to 21 kt and
+    /// "Stop." at 0.9996 confidence was dropped as ambient, no miss chime
+    /// (2026-08-01).
+    #[test]
+    fn stop_reaches_the_router_with_no_governor_running() {
+        for c in ["Stop.", "stop", "Stop stop stop!", "Stop the aircraft."] {
+            assert!(looks_like_command(c), "{c:?} must pass the domain gate");
+        }
+        // Passing the GATE is not actuating: the grammar's bare-stop rule
+        // still wants the whole utterance, so a sentence that merely contains
+        // the word goes to the router, not to the brakes.
+        let prof = crate::aircraft::load("beechcraft_baron_58").expect("Baron profile");
+        let reg = crate::tools::Registry::for_aircraft(&prof);
+        let stop = super::grammar::try_parse("stop", &reg, &prof)
+            .expect("bare stop must parse to a command");
+        assert_eq!(stop[0].name, "hold_speed");
+        assert_eq!(stop[0].arguments["knots"], 0);
+        assert!(
+            super::grammar::try_parse("we should stop for fuel at the next field", &reg, &prof)
+                .is_none(),
+            "a sentence that merely contains the word must not brake"
+        );
     }
 
     #[test]

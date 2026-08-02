@@ -176,6 +176,9 @@ impl Tool for AutoTakeoff {
             ctx.config.xplane_base_url.clone(),
             ctx.voice.cloned(),
             autotakeoff::Params {
+                // A takeoff the PILOT asked for: they get the aircraft at the
+                // handoff, which is the whole point of asking.
+                handoff_to_caller: false,
                 tail_strike_deg: self.tail_strike_deg,
                 vne_kts: self.vne_kts,
                 apt_dat: super::autoland::apt_dat_path(),

@@ -281,11 +281,52 @@ const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
 // same channels the taxi governor drives.
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
 const TAXI_BRAKE: &str = "xcopilot/taxi_brake";
-/// Brake application on the rollout, and the gentler hold once stopped.
-const ROLLOUT_BRAKE: f64 = 0.45;
+/// The gentler brake hold once stopped.
 const ROLLOUT_BRAKE_HOLD: f64 = 0.5;
+/// Throttle a give-up hands back with: enough to hold level flight with gear
+/// down and landing flap out, which is the state a balked landing leaves the
+/// aircraft in. Half throttle was not (110 → 80 kt, EGHI 2026-08-02).
+const GIVE_UP_THROTTLE: f64 = 0.75;
 const M_TO_FT: f64 = 3.280_84;
 const MS_TO_KTS: f64 = 1.943_84;
+
+/// The deceleration a rollout aims for when the runway leaves the choice open,
+/// m/s². A flat 0.45 brake ratio measured ~3.3 m/s² on the Baron — maximum
+/// autobrake territory, applied from touchdown speed to a dead stop, and the
+/// pilot called it "brakes really really hard" (EGHI, 2026-08-02). Real
+/// autobrake LOW is ~1.2-1.8; this errs on the firm side of comfortable
+/// because the distance term below, not this figure, is what guarantees the
+/// stop.
+const ROLLOUT_COMFORT_DECEL: f64 = 1.6;
+/// Brake ratio per m/s² of wanted deceleration — calibrated from the same
+/// measurement (0.45 ratio ≈ 3.3 m/s² including aero drag, so the wheel share
+/// is a little under that).
+const BRAKE_RATIO_PER_MPS2: f64 = 0.15;
+/// The rollout hands off to a following vacate at or below this groundspeed —
+/// taxi pace, never a stop. Stopping dead on an active runway and then
+/// re-accelerating to leave it was neither procedure nor comfortable.
+const VACATE_HANDOFF_KTS: f64 = 10.0;
+
+/// Brake ratio for the rollout: a comfortable deceleration, unless stopping
+/// within the pavement actually remaining demands more. `target_kts` is the
+/// speed the rollout is aiming for — zero for a full stop, taxi pace when a
+/// vacate follows.
+fn rollout_brake_ratio(gs_kts: f64, target_kts: f64, remaining_m: f64) -> f64 {
+    let v = (gs_kts.max(0.0)) / MS_TO_KTS;
+    let vt = (target_kts.max(0.0)) / MS_TO_KTS;
+    // What physics requires to be at target speed with 30% of the remaining
+    // runway still in hand — the safety term, immune to the comfort figure.
+    let usable = (remaining_m * 0.7).max(30.0);
+    let required = ((v * v - vt * vt) / (2.0 * usable)).max(0.0);
+    let decel = required.max(ROLLOUT_COMFORT_DECEL);
+    (decel * BRAKE_RATIO_PER_MPS2).clamp(0.2, 0.8)
+}
+
+/// Set by full auto before its landing: a vacate drive follows this rollout,
+/// so end it at taxi pace instead of a dead stop. Consumed (swapped false) by
+/// the rollout that honours it and cleared on abort, so a standalone "land for
+/// me" — where nobody follows — always brakes to a stop as before.
+pub static VACATE_FOLLOWS: AtomicBool = AtomicBool::new(false);
 
 /// Rollout starts only after weight-on-wheels. The speed terms distinguish a
 /// landing from a low pass once on the surface; they must never substitute for
@@ -304,6 +345,7 @@ fn should_start_rollout(
 /// Cancel an active autoland; returns whether one was flying.
 pub fn abort() -> bool {
     ABORT.store(true, Ordering::SeqCst);
+    VACATE_FOLLOWS.store(false, Ordering::SeqCst);
     ACTIVE.swap(false, Ordering::SeqCst)
 }
 
@@ -402,10 +444,12 @@ pub fn run_autoland(
             // Cross-track history for the intercept damping term.
             let mut prev_xtk: Option<(f64, std::time::Instant)> = None;
             let mut xtk_rate: f64 = 0.0;
-            // Rollout: latched at touchdown, then brakes to a full stop. The
-            // takeoff roll law (P + trim, tested) holds the centreline through
-            // the plugin steer channel while it brakes.
+            // Rollout: latched at touchdown, then brakes down — to a full stop,
+            // or to taxi pace when a vacate drive follows. The takeoff roll law
+            // (P + trim, tested) holds the centreline through the plugin steer
+            // channel while it brakes.
             let mut rolling_out = false;
+            let mut vacate_follows = false;
             let mut roll_law = crate::autotakeoff::RollSteer::default();
             loop {
                 if GEN.load(Ordering::SeqCst) != my_gen || ABORT.load(Ordering::SeqCst) {
@@ -464,7 +508,13 @@ pub fn run_autoland(
                     ias,
                     approach_ias,
                 ) {
-                    rolling_out = true;
+                    // Consumed once, at rollout entry: a stale flag from a
+                    // mission that never landed must not turn a later
+                    // standalone landing into a rolling handoff to nobody.
+                    if !rolling_out {
+                        rolling_out = true;
+                        vacate_follows = VACATE_FOLLOWS.swap(false, Ordering::SeqCst);
+                    }
                     let xtk_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
                     let target = crate::autotakeoff::roll_target_heading(rwy.course_deg, xtk_m);
                     let psi = psi_r.as_ref().copied().unwrap_or(rwy.course_deg);
@@ -475,8 +525,30 @@ pub fn run_autoland(
                         xp.set_float(&thr_dref, 0.0),
                         xp.set_float(TAXI_STEER, steer),
                     );
+                    // A vacate follows: hand off ROLLING at taxi pace — the
+                    // completion of a landing is clearing the runway, and a
+                    // dead stop on the strip followed by a re-acceleration was
+                    // neither procedure nor comfortable (EGHI, 2026-08-02).
+                    // The vacate drive arms the governor from the current
+                    // position, which takes a rolling aircraft like any join.
+                    if vacate_follows && gs_kts <= VACATE_HANDOFF_KTS {
+                        let _ = xp.set_float(TAXI_BRAKE, 0.0).await;
+                        let _ = xp.set_float(TAXI_STEER, 0.0).await;
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({ "event": "rolling_handoff", "gs": gs_kts }),
+                        );
+                        break;
+                    }
                     if gs_kts > 2.0 {
-                        let _ = xp.set_float(TAXI_BRAKE, ROLLOUT_BRAKE).await;
+                        // Brake by wanted deceleration, not a fixed clamp: a
+                        // comfortable rate when the runway allows it, harder
+                        // only when stopping in what remains demands it.
+                        let along_m = along_track_nm(lat, lon, &rwy) * M_PER_NM;
+                        let remaining_m = (rwy.length_m + along_m).max(0.0);
+                        let target_kts = if vacate_follows { VACATE_HANDOFF_KTS } else { 0.0 };
+                        let brake = rollout_brake_ratio(gs_kts, target_kts, remaining_m);
+                        let _ = xp.set_float(TAXI_BRAKE, brake).await;
                         set_panel(&format!("AUTOLAND {} {} ROLLOUT", rwy.icao, rwy.id));
                         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                         continue;
@@ -557,9 +629,22 @@ pub fn run_autoland(
                 if missed_since
                     .is_some_and(|t| t.elapsed().as_secs_f64() > MAX_MISSED_APPROACH_SECS)
                 {
-                    let _ = xp.set_float(&throttle_dref(), 0.5).await;
+                    // A give-up must hand back a FLYABLE aircraft. The balked
+                    // landing left gear down and landing flap out, and a flat
+                    // 0.5 throttle cannot hold level flight dirty: the Baron
+                    // decayed 110 to 80 kt at -900 fpm in the thirty seconds
+                    // after the old handback (EGHI, 2026-08-02). Climb power,
+                    // VS dial zeroed — the AP is already holding heading — and
+                    // the line says what is actually held.
+                    let thr_dref = throttle_dref();
+                    let _ = tokio::join!(
+                        xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
+                        xp.set_float(VS_DIAL, 0.0),
+                    );
                     announce(
-                        "I can't get us back round for another approach. Your aircraft.".into(),
+                        "I can't get us back round for another approach. Your aircraft — \
+                         the autopilot is holding heading and altitude, gear is down."
+                            .into(),
                         Priority::Warning,
                     );
                     crate::blackbox::record(
@@ -575,9 +660,15 @@ pub fn run_autoland(
                 // aircraft back — a real crew would divert, not keep diving at
                 // a runway they can't make (LXGB Twin Otter, 2026-07-26).
                 if go_around.attempts() > MAX_GO_AROUNDS {
-                    let _ = xp.set_float(&throttle_dref(), 0.5).await;
+                    // Same flyable-handback rule as the timeout above.
+                    let thr_dref = throttle_dref();
+                    let _ = tokio::join!(
+                        xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
+                        xp.set_float(VS_DIAL, 0.0),
+                    );
                     announce(
-                        "Unable to land — we've gone around too many times. Your aircraft."
+                        "Unable to land — we've gone around too many times. Your aircraft — \
+                         the autopilot is holding heading and altitude, gear is down."
                             .into(),
                         Priority::Warning,
                     );
@@ -808,6 +899,30 @@ pub fn scheduled_ias(dist_nm: f64, approach_ias: f64) -> f64 {
 /// 60 kt, never turning back. The margin ignores a normal float/rollout past the
 /// threshold (the flare branch, checked first, still owns the touchdown).
 const OVERFLIGHT_GO_AROUND_NM: f64 = 0.15;
+/// The float must leave at least this much pavement to land and stop on before
+/// the overflight rule lets it continue — the Baron's measured comfortable
+/// rollout from 79 kt used ~550 m.
+const FLOAT_MIN_REMAINING_M: f64 = 900.0;
+
+/// How far past the threshold the aircraft may fly before "overflight" is the
+/// verdict. The fixed 0.15 nm was tuned when the descent ran at path rate all
+/// the way to the flare gate; the roundout legitimately floats further, and at
+/// EGHI it balked a perfectly good landing at 26.3 ft radio — ONE FOOT above
+/// the 25 ft flare gate — with 1,400 m of runway still ahead (2026-08-02).
+/// Low over the pavement, in the landing float, the question is not "how far
+/// past the numbers" but "is there still room to land and stop": allow the
+/// float as long as [`FLOAT_MIN_REMAINING_M`] remains, capped at half the
+/// runway (not down by halfway is a go-around on ANY runway), floored at the
+/// old margin so a short strip keeps exactly the old rule. HIGH past the
+/// threshold (above the roundout band) is still the old 0.15 nm — the 167 ft
+/// overflight and the MD-82's 51-ft-high 152 kt float both stay caught.
+pub fn overflight_allowance_nm(length_m: f64, radio_alt_ft: f64, flare_radio_ft: f64) -> f64 {
+    if radio_alt_ft > flare_radio_ft * ROUNDOUT_MULT {
+        return OVERFLIGHT_GO_AROUND_NM;
+    }
+    ((length_m - FLOAT_MIN_REMAINING_M).min(0.5 * length_m) / M_PER_NM)
+        .max(OVERFLIGHT_GO_AROUND_NM)
+}
 
 /// A latched go-around climbs straight ahead until this height before the
 /// intercept guidance may turn it back toward the FAP (see GoAroundLatch).
@@ -861,6 +976,12 @@ const CLIMB_ENERGY_BONUS_KTS: f64 = 12.0;
 /// altitude is terrain under the approach, not the runway. (25 ft on a 3° path
 /// is ~0.08 nm out; 0.35 leaves margin for displaced thresholds.)
 const FLARE_MAX_DIST_NM: f64 = 0.35;
+/// The roundout band: below this multiple of the flare height (inside the same
+/// runway gates as the flare itself), the vertical target eases to
+/// [`ROUNDOUT_VS_FPM`] so the flare is entered from a gentle descent rather
+/// than from the full path rate or a level float.
+const ROUNDOUT_MULT: f64 = 2.0;
+const ROUNDOUT_VS_FPM: f64 = -250.0;
 /// ...and only within this much cross-track of the centreline (~37 m — about a
 /// runway half-width plus margin). Beyond it the aircraft is over grass, and
 /// touching down there is how the LXGB 09 rollout ended in wreckage
@@ -971,12 +1092,17 @@ pub struct GoAroundLatch {
 /// Give up (level off, hand to the pilot) after this many go-arounds on one
 /// approach rather than loop a missed approach until the fuel runs out.
 pub const MAX_GO_AROUNDS: u32 = 2;
-/// ...and give up on a single missed approach that has run this long. A
-/// reposition leg is a couple of minutes of flying; one that is still going
-/// after this is not repositioning, it is lost, and the counter above cannot
-/// catch it because a second go-around needs another approach to fail first.
-/// Costs nothing when everything works and bounds the failure when it doesn't.
-pub const MAX_MISSED_APPROACH_SECS: f64 = 300.0;
+/// ...and give up on a single missed approach that has run this long. The
+/// counter above cannot catch a lost reposition because a second go-around
+/// needs another approach to fail first. But the bound must be LONGER than
+/// the flight the reposition itself commands: climb straight ahead to 800 ft,
+/// turn back, overfly the field, and fly out to a join point ~6 nm on the
+/// approach side — at a piston twin's 110 kt that is comfortably over five
+/// minutes, and the old 300 s expired with the aircraft mid-leg at 3.8 nm,
+/// compliant, pointing away from the field, which the give-up then handed to
+/// the pilot as-is (EGHI, 2026-08-02). Ten minutes still bounds a genuinely
+/// lost missed approach well inside fuel margins.
+pub const MAX_MISSED_APPROACH_SECS: f64 = 600.0;
 
 impl GoAroundLatch {
     pub fn new() -> Self {
@@ -1120,6 +1246,36 @@ pub struct Guidance {
     pub phase: ApproachPhase,
 }
 
+/// Where the final's pure pursuit aims, in nm from the threshold measured back
+/// up the approach. Negative means a point PAST the threshold, on the runway.
+///
+/// The lead is fixed — about thirty seconds of travel — because that is what
+/// makes the convergence exponential in TIME rather than linear in distance:
+/// hard correction early, established miles out, then a tracked wings-level
+/// final, which is what "stabilised approach" means. An aim at half the
+/// remaining distance decays the cut only linearly, and the aircraft rides the
+/// whole final at an angle (EGSS 22, 2026-07-28: 28 degrees at 5.4 nm, still
+/// 20 at 3, aligned only at 0.13 nm, i.e. over the numbers).
+///
+/// The trap this closes is that the fix for that was itself undone on short
+/// final. Flooring the aim AT the threshold meant that inside one lead
+/// distance the aim stopped advancing and the EFFECTIVE lead shrank — 0.875 nm
+/// at 1.2 nm out, 0.55 at 0.7, 0.20 at 0.35 — which is the d/2 law again,
+/// reintroduced exactly where being lined up matters most. At Southampton the
+/// cut sat at 16 degrees from 0.87 nm all the way in to 0.32, then snapped to
+/// the runway course over the numbers with the aircraft still 6 degrees off
+/// and still turning (2026-08-01).
+///
+/// So the aim keeps its full lead all the way in and simply walks past the
+/// threshold. That is not a trick: the extended centreline and the runway
+/// centreline are one line. Bounded by the pavement so the aim is always a
+/// point on the runway.
+pub fn pursuit_aim_nm(along_nm: f64, gs_kts: f64, rwy_len_m: f64) -> f64 {
+    let lead_nm = (gs_kts / 120.0).clamp(0.6, 1.5);
+    let past_nm = (rwy_len_m / M_PER_NM * 0.8).clamp(0.2, 1.5);
+    (along_nm - lead_nm).max(-past_nm)
+}
+
 /// Compute the approach guidance: steer to the final approach point then track the
 /// centreline, and descend the 3° glidepath. Pure — the control loop applies it via
 /// the autopilot. `flare_radio_ft` is the height above the runway to start the flare.
@@ -1155,13 +1311,20 @@ pub fn guidance(
     const CAPTURE_ABOVE_FT: f64 = 500.0;
     let join_nm = join_point_nm(cur_alt_ft, rwy.elev_ft);
 
-    // Are we past the threshold, on the departure side, still airborne? (The flare
-    // branch below, checked first, owns a normal float/rollout across the numbers.)
-    let past_threshold = along_track_nm(cur_lat, cur_lon, rwy) < -OVERFLIGHT_GO_AROUND_NM;
+    // Are we past the threshold, on the departure side, still airborne — by
+    // more than the landing float is allowed? (The flare branch below, checked
+    // first, owns a normal float/rollout across the numbers.)
+    let along_nm = along_track_nm(cur_lat, cur_lon, rwy);
+    let float_nm = overflight_allowance_nm(rwy.length_m, radio_alt_ft, flare_radio_ft);
+    let past_threshold = along_nm < -float_nm;
+    // The flare/roundout environment: short final by plain distance, or
+    // anywhere over the pavement the float allowance still covers — `dist_nm`
+    // is unsigned, so past the threshold it alone would end the flare zone at
+    // 0.35 nm while the float is still legitimately landing.
+    let in_flare_zone = dist_nm <= FLARE_MAX_DIST_NM || (along_nm < 0.0 && !past_threshold);
 
     let xtk = cross_track_nm(cur_lat, cur_lon, rwy);
-    let (phase, target_heading) = if radio_alt_ft <= flare_radio_ft && dist_nm <= FLARE_MAX_DIST_NM
-    {
+    let (phase, target_heading) = if radio_alt_ft <= flare_radio_ft && in_flare_zone {
         // Low radio altitude alone is NOT the flare cue — terrain rises to meet
         // the approach path miles from the field (seen live: "flared" at 7 ft AGL
         // 4.1 nm out at LEMI, power cut over open ground; and again into a dip
@@ -1248,17 +1411,8 @@ pub fn guidance(
         // ~30 s of travel, floored so a slow single still aims somewhere and
         // capped so the far-out cut stays flyable.
         let cut = if dist_nm > 0.30 {
-            let lead_nm = (gs_kts / 120.0).clamp(0.6, 1.5);
             let along = along_track_nm(cur_lat, cur_lon, rwy);
-            // The aim must sit AHEAD of the aircraft along the approach: an
-            // aim past our own along-track position flips the bearing and the
-            // cut with it (the ±35° S over the numbers, 2026-07-24). Abeam
-            // close-in (tiny `along`, big offset) halve what's left instead —
-            // the balk gate owns that geometry anyway.
-            let mut aim_nm = (along - lead_nm).max(0.15);
-            if aim_nm >= along {
-                aim_nm = (along * 0.5).max(0.02);
-            }
+            let aim_nm = pursuit_aim_nm(along, gs_kts, rwy.length_m);
             let (alat, alon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, aim_nm);
             let brg = bearing_deg(cur_lat, cur_lon, alat, alon);
             ((brg - rwy.course_deg + 540.0).rem_euclid(360.0) - 180.0).clamp(-35.0, 35.0)
@@ -1337,6 +1491,24 @@ pub fn guidance(
         // glidepath altitude is distance-symmetric, so a rejoin on the wrong
         // side of the threshold reads "on path" and descends (KPDK 16).
         _ if below_terrain_floor => 0.0,
+        // ROUNDOUT: on final over the pavement, just above the flare gate,
+        // keep coming down gently — never chase the path and never hold
+        // level. Both wrong answers happened from the same arithmetic: past
+        // the threshold the (unsigned) glidepath distance grows again, so
+        // alt_err goes negative and the level-hold branch below fired at
+        // 27 ft over the runway. The aircraft floated level, bled the very
+        // airspeed the flare needed, and dropped on from the mush at
+        // -380 fpm one knot above the clean stall (EGHI, 2026-08-02). A
+        // staged descent — this, then the flare's -100 — arrives at the
+        // flare with flying speed, which is what a soft touchdown is made
+        // of.
+        ApproachPhase::Final
+            if in_flare_zone
+                && xtk.abs() <= FLARE_MAX_XTK_NM
+                && radio_alt_ft <= flare_radio_ft * ROUNDOUT_MULT =>
+        {
+            ROUNDOUT_VS_FPM
+        }
         // On/above speed but below the glidepath: hold level and let the path
         // descend to us — don't climb to intercept. Speed protection above has
         // already handled the case where holding level would stall us.
@@ -1416,6 +1588,112 @@ mod tests {
         assert!(should_start_rollout(false, true, 3.0, 40.0, 95.0, 90.0));
         // Once latched, a noisy WOW sample cannot return control to approach.
         assert!(should_start_rollout(true, false, 10.0, 70.0, 95.0, 90.0));
+    }
+
+    /// The rollout brakes by wanted deceleration, not a fixed clamp. A flat
+    /// 0.45 measured ~3.3 m/s² from 79 kt to a dead stop — "brakes really
+    /// really hard" from the right seat (EGHI, 2026-08-02) — on a runway with
+    /// over a kilometre to spare.
+    #[test]
+    fn rollout_brakes_for_comfort_unless_the_runway_disagrees() {
+        // Plenty of pavement: the comfort rate, well under the old 0.45.
+        let easy = rollout_brake_ratio(79.0, 0.0, 1300.0);
+        assert!((0.2..0.3).contains(&easy), "{easy}");
+        // Short remaining: physics outranks comfort.
+        let tight = rollout_brake_ratio(79.0, 0.0, 300.0);
+        assert!(tight > 0.5, "{tight}");
+        // ...and the cap holds even when the sums say more.
+        assert_eq!(rollout_brake_ratio(120.0, 0.0, 80.0), 0.8);
+        // Slowing to a vacate handoff needs less than slowing to a stop.
+        assert!(
+            rollout_brake_ratio(40.0, VACATE_HANDOFF_KTS, 500.0)
+                <= rollout_brake_ratio(40.0, 0.0, 500.0)
+        );
+        // Near the target the floor still holds a gentle squeeze on.
+        assert!(rollout_brake_ratio(12.0, 10.0, 800.0) >= 0.2);
+    }
+
+    /// The flare is entered from a roundout, never from a level float. Past
+    /// the threshold the unsigned glidepath distance grows again, alt_err
+    /// goes negative, and the level-hold branch commanded 0 fpm at 27 ft over
+    /// the runway: the aircraft floated, bled the speed the flare needed, and
+    /// dropped on at -380 fpm one knot above the clean stall (EGHI,
+    /// 2026-08-02).
+    #[test]
+    fn the_flare_is_entered_from_a_roundout_not_a_float() {
+        let rwy = rwy_north();
+        // Short final, over the pavement environment, just above the flare
+        // gate (radio 40 ft, flare 25, band 50): a gentle continued descent.
+        let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 0.2);
+        let g = guidance(lat, lon, 40.0, 40.0, 95.0, 95.0, &rwy, 95.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Final);
+        assert_eq!(g.target_vs_fpm, ROUNDOUT_VS_FPM);
+
+        // The live float case: just past the threshold (inside the overflight
+        // margin), 30 ft radio — alt_err is negative here and the old law
+        // held LEVEL. It must keep descending.
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.05);
+        let g = guidance(lat, lon, 30.0, 30.0, 93.0, 93.0, &rwy, 95.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Final);
+        assert_eq!(
+            g.target_vs_fpm, ROUNDOUT_VS_FPM,
+            "a level float at 30 ft is how the mush happened"
+        );
+
+        // Below the flare gate the flare still owns the touchdown.
+        let g = guidance(lat, lon, 20.0, 20.0, 92.0, 92.0, &rwy, 95.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Flare);
+        assert_eq!(g.target_vs_fpm, -100.0);
+
+        // And a genuine overflight go-around is untouched by the roundout.
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.3);
+        let g = guidance(lat, lon, 150.0, 150.0, 95.0, 95.0, &rwy, 95.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Intercept);
+    }
+
+    /// The overflight rule must know a landing float from an overflight. At
+    /// EGHI it balked at 26.3 ft radio — ONE FOOT above the flare gate — at
+    /// 0.165 nm past the threshold with 1,400 m of runway still ahead, then
+    /// the missed approach timed out mid-reposition and the give-up handed
+    /// the pilot a dirty aircraft at half throttle (2026-08-02).
+    #[test]
+    fn a_low_float_over_a_long_runway_is_a_landing_not_an_overflight() {
+        // EGHI-sized runway: 1,723 m.
+        let mut rwy = rwy_north();
+        rwy.length_m = 1723.0;
+        // Low in the float: the allowance is runway-aware — 823 m here.
+        let low = overflight_allowance_nm(1723.0, 26.0, 25.0);
+        assert!((low - 823.0 / M_PER_NM).abs() < 0.01, "{low}");
+        // High past the threshold keeps the old hair-trigger.
+        assert_eq!(overflight_allowance_nm(1723.0, 160.0, 25.0), 0.15);
+        // A short strip keeps the old rule even in the float, and a long one
+        // is capped at half its length.
+        assert_eq!(overflight_allowance_nm(700.0, 20.0, 25.0), 0.15);
+        assert!((overflight_allowance_nm(3900.0, 20.0, 25.0) - 1950.0 / M_PER_NM).abs() < 0.01);
+
+        // The live balk, replayed: 0.165 nm past the threshold, 26 ft radio.
+        // Must be a roundout on Final, not a go-around.
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.165);
+        let g = guidance(lat, lon, 26.0, 26.0, 94.0, 97.0, &rwy, 95.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Final, "this was a landing");
+        assert_eq!(g.target_vs_fpm, ROUNDOUT_VS_FPM);
+
+        // Deeper down the float, below the flare gate — dist past the old
+        // 0.35 nm flare-zone bound — the flare still owns the touchdown.
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.40);
+        let g = guidance(lat, lon, 18.0, 18.0, 92.0, 92.0, &rwy, 95.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Flare);
+
+        // Past the allowance the overflight verdict returns.
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.50);
+        let g = guidance(lat, lon, 20.0, 20.0, 92.0, 92.0, &rwy, 95.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Intercept, "not down by 823 m: go around");
+
+        // And HIGH past the threshold goes around at the old margin, float or
+        // no float — the 167 ft overflight stays caught.
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.2);
+        let g = guidance(lat, lon, 160.0, 160.0, 95.0, 95.0, &rwy, 95.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Intercept);
     }
 
     fn rwy_north() -> Runway {
@@ -2750,5 +3028,48 @@ mod tests {
 
         // Scales with the airframe, so a 172 is not asked to fly a jet profile.
         assert!(scheduled_ias(16.0, 65.0) < 100.0, "172 stays a 172");
+    }
+
+    /// The pursuit lead must stay FIXED all the way to the threshold. It did
+    /// not: flooring the aim at the threshold let the effective lead shrink
+    /// inside one lead distance, which is the d/2 law the fixed lead was
+    /// introduced to replace, back on short final where being lined up
+    /// matters most. Southampton: the cut sat at 16 degrees from 0.87 nm to
+    /// 0.32, then snapped to the runway course over the numbers with the
+    /// aircraft still 6 degrees off and still turning (2026-08-01).
+    #[test]
+    fn the_pursuit_lead_does_not_collapse_on_short_final() {
+        let (gs, len) = (105.0, 1723.0); // the Baron at EGHI 02
+        let lead = |along: f64| along - pursuit_aim_nm(along, gs, len);
+
+        // The same lead at every distance, far out and short final alike.
+        let far = lead(1.68);
+        for along in [1.2, 0.9, 0.7, 0.5, 0.35] {
+            assert!(
+                (lead(along) - far).abs() < 1e-9,
+                "lead collapsed to {:.3} at {along} nm (was {far:.3})",
+                lead(along)
+            );
+        }
+
+        // Which means the aim walks PAST the threshold, onto the runway. That
+        // is the point: the extended centreline and the runway centreline are
+        // the same line.
+        assert!(pursuit_aim_nm(0.35, gs, len) < 0.0);
+
+        // ...but never past the far end of it.
+        let past = -pursuit_aim_nm(0.0, gs, len);
+        assert!(
+            past <= len / M_PER_NM,
+            "aim {past:.2} nm past the threshold on a {:.2} nm runway",
+            len / M_PER_NM
+        );
+
+        // The cut therefore keeps shrinking with the offset instead of
+        // holding: half the offset at the same range is half the cut.
+        let cut = |xtk: f64, along: f64| (xtk / (along - pursuit_aim_nm(along, gs, len))).atan();
+        assert!(cut(0.25, 0.7) > cut(0.125, 0.7));
+        // ...and closing in at a FIXED offset no longer grows it.
+        assert!((cut(0.1, 1.2) - cut(0.1, 0.4)).abs() < 1e-9);
     }
 }

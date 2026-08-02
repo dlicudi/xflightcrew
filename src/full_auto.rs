@@ -139,6 +139,14 @@ pub struct SubTools {
     pub all_electrical_on_cmds: Vec<String>,
     /// Toggle-only electrical switches: read, then fired only if off.
     pub all_electrical_toggles: Vec<crate::aircraft::ToggleSwitch>,
+    /// The airframe's exterior lights, driven through the SAME tool a spoken
+    /// "beacon on" reaches — one owner for the switch, so a light that is two
+    /// switches or a dataref rather than a command behaves identically here.
+    pub lights: crate::tools::lights::SetLights,
+    /// Panel / cockpit flood lighting. Exterior lights are for other people to
+    /// see us; this one is so the PILOT can read the panel — full auto brought
+    /// a Baron to life and left the cockpit dark (2026-08-01).
+    pub flood: crate::tools::lights::SetFloodLights,
     pub taxi: crate::tools::taxi::AutoTaxi,
     pub line_up: crate::tools::taxi::LineUp,
     pub circuit: crate::tools::circuit::Circuit,
@@ -200,6 +208,23 @@ fn event(stage: &str, detail: serde_json::Value) {
         *s = stage.replace('_', " ");
     }
     crate::blackbox::record("full_auto", json!({ "stage": stage, "detail": detail }));
+}
+
+/// Set one exterior light, best effort and silent.
+///
+/// Full auto turned on NO lights at all: it powered the bus, started the
+/// engines, taxied, lined up and took off dark, while the ARRIVAL explicitly
+/// switched strobes, taxi and landing lights off at the stand — an asymmetry
+/// that is the whole proof it was an oversight rather than a decision
+/// (2026-08-01). A profile that doesn't declare the key simply errors and is
+/// ignored, so an airframe with no beacon is not a failed departure.
+async fn light(tools: &SubTools, ctx: &ToolCtx<'_>, key: &str, on: bool) -> bool {
+    use crate::tools::Tool;
+    tools
+        .lights
+        .execute(&json!({ "light": key, "on": on }), ctx)
+        .await
+        .is_ok()
 }
 
 /// Give up cleanly.
@@ -269,6 +294,28 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         ]),
     );
     event("start", json!({}));
+    // Full auto is a GATE-to-gate chain: armed in the air it walks its ground
+    // stages against reality. After the missed-approach give-up the pilot hit
+    // FULL AUTO at 1,475 ft descending at 900 fpm, and the chain read a stale
+    // `LAST_ARRIVED` from the morning's taxi as "at the hold", called ready
+    // for departure, and requested a takeoff clearance while the aircraft
+    // sank (EGHI, 2026-08-02). Airborne, the honest answer is the tools that
+    // fly: refuse and name them.
+    let agl_ft = xp.get_float(AGL_M).await.unwrap_or(0.0) * M_TO_FT;
+    let on_ground = xp
+        .get_float(crate::datarefs::ON_GROUND_ANY)
+        .await
+        .unwrap_or(1.0)
+        > 0.5;
+    if !on_ground && agl_ft > 50.0 {
+        give_up(
+            &voice,
+            "We're already flying — full auto starts from the ground. \
+             Say do a circuit, fly the flight plan, or land for me.",
+            "armed_airborne",
+        );
+        return;
+    }
     // The callsign the tower knows us by, so our calls sound like a real pilot.
     let callsign = crate::circuit::crew_callsign(&xp).await;
 
@@ -327,14 +374,41 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             bail_if_abort!();
         }
 
+        // Beacon BEFORE the propeller moves — that is what it is for, and it
+        // is the one light with an actual safety job on a ramp. Nav lights with
+        // it, since they belong on whenever the master is.
+        let beacon = light(&tools, &ctx, "beacon", true).await;
+        light(&tools, &ctx, "nav", true).await;
+        // Panel lighting with them. The bus is live and the pilot is about to
+        // be asked to read instruments.
+        {
+            use crate::tools::Tool;
+            let lit = tools
+                .flood
+                .execute(&json!({ "on": true }), &ctx)
+                .await
+                .is_ok();
+            event("lights_panel", json!({ "on": lit }));
+        }
+        event("lights_beacon", json!({ "beacon": beacon }));
+        // Only claim the beacon on an airframe that has one — the Lancair's
+        // switch row is NAV / LAND / STRB and nothing else.
         announce(
             &voice,
             Priority::Advisory,
-            crate::readback::one_of(&[
-                "Starting the engine.",
-                "Spinning up the engine.",
-                "Cranking her over.",
-            ]),
+            if beacon {
+                crate::readback::one_of(&[
+                    "Beacon on. Starting the engine.",
+                    "Beacon's on, spinning up the engine.",
+                    "Beacon on, cranking her over.",
+                ])
+            } else {
+                crate::readback::one_of(&[
+                    "Starting the engine.",
+                    "Spinning up the engine.",
+                    "Cranking her over.",
+                ])
+            },
         );
         if let Ok(reply) = tools.start_engine.execute(&json!({}), &ctx).await {
             announce(&voice, Priority::Advisory, &reply);
@@ -418,6 +492,19 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             );
         }
     }
+
+    // ...and align the DG to the compass, the other half of the same two
+    // items. The monitor's auto-sync is deliberately AIRBORNE-only, on the
+    // rule that on the ground you align at the run-up — which is right, and
+    // full auto IS the run-up. Left to the monitor, the sync lands at the
+    // first moment the wheels leave the ground: at Southampton a Baron taxied,
+    // lined up and started its roll with the heading indicator 159.7 degrees
+    // out, and the alignment arrived twenty-six seconds after the line-up
+    // (2026-08-01). Nothing the automation flies reads the DG (the AP bug is a
+    // magnetic heading, and every ground loop uses true heading), so this is
+    // for the pilot watching the panel — which is reason enough.
+    let _ = xp.run_command("sim/instruments/DG_sync_mag").await;
+    event("gyro_synced", json!({}));
     bail_if_abort!();
 
     // --- Stage 3: onto the runway ---------------------------------------------
@@ -612,6 +699,11 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                                     "The tug let go early. I'll bring us round the rest of the \
                                      way myself. Watch the wingtips."
                                 }
+                                "creeping" => {
+                                    "The tug never pushed us and we were rolling forward, so \
+                                     I've got the brakes. I'll turn us around under our own \
+                                     steam. Watch the wingtips."
+                                }
                                 _ => {
                                     "That's as far as the push got. I'll bring us round the rest \
                                      of the way myself. Watch the wingtips."
@@ -628,6 +720,8 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         bail_if_abort!();
 
         // Drive the cleared route to the holding point.
+        let taxi_lit = light(&tools, &ctx, "taxi", true).await;
+        event("lights_taxi", json!({ "on": taxi_lit }));
         announce(
             &voice,
             Priority::Advisory,
@@ -780,6 +874,15 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             }
         }
         event("lined_up", json!({}));
+        // On the runway: strobes and landing lights. These are the two that
+        // say "this aeroplane is about to move fast", which is why they go on
+        // here and not at the holding point.
+        let strobe = light(&tools, &ctx, "strobe", true).await;
+        let landing = light(&tools, &ctx, "landing", true).await;
+        event(
+            "lights_takeoff",
+            json!({ "strobe": strobe, "landing": landing }),
+        );
 
         // The takeoff clearance, if the line-up went on under line-up-and-wait
         // (already satisfied when the held-short path above got it first).
@@ -812,7 +915,12 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 announce(&voice, Priority::Advisory, &reply);
             }
             event("circuit_armed", json!({}));
-            // The circuit owns the aircraft from here; our job is done.
+            // The circuit owns the FLYING from here, but not the last stage:
+            // it hands the final to autoland, which stops on the runway and
+            // lets go. Somebody has to vacate. See `taxi_in_after_landing` —
+            // ninety seconds holding Southampton's 02 with an arrival at half
+            // a mile is what "our job is done" used to mean here.
+            taxi_in_after_landing(&xp, &config, &voice, &tools, true).await;
             ACTIVE.store(false, SeqCst);
         }
         Mission::Flight(route) => {
@@ -837,6 +945,12 @@ const WIND_DECISIVE_KTS: f64 = 4.0;
 /// An airborne AGL below this after the takeoff loop exits means it REJECTED
 /// (never flew) — same reading the circuit uses.
 const AIRBORNE_MIN_AGL_FT: f64 = 300.0;
+
+/// How long the circuit's taxi-in stage waits for autoland to ARM before
+/// concluding the pattern never got that far. Generous: a takeoff, a climb to
+/// pattern altitude, a full rectangle and a base leg, at trainer speeds, with
+/// a go-around's worth of slack on top.
+const ARM_WAIT_SECS: f64 = 900.0;
 
 /// Stage 4 of a Flight mission: the takeoff, the enroute fixes at the plan's
 /// altitudes, then the destination's published approach with autoland as the
@@ -1072,39 +1186,100 @@ async fn fly_route(
     // taxi we ran at the start. Bounded so a balk/abort can't hang here, and
     // skipped unless we actually got the aircraft down on the ground (autoland
     // also goes inactive on a go-around, climbing away).
-    if crate::autoland::ACTIVE.load(Relaxed) && !ABORT.load(SeqCst) {
-        let landed = wait_until(1800.0, 1000, || async {
-            !crate::autoland::ACTIVE.load(Relaxed)
-        })
-        .await;
-        let on_ground = xp
-            .get_float(crate::datarefs::ON_GROUND_ANY)
-            .await
-            .unwrap_or(0.0)
-            > 0.5;
-        if landed && on_ground && !ABORT.load(SeqCst) {
-            announce(
-                voice,
-                Priority::Advisory,
-                crate::readback::one_of(&[
-                    "Down. I'll taxi us to parking.",
-                    "Down and clear. Taxiing us to parking.",
-                    "On the ground. I'll get us to the gate.",
-                ]),
-            );
-            event("taxi_in", json!({}));
-            crate::taxi_in::start(
-                config.xplane_base_url.clone(),
-                config.clone(),
-                voice.clone(),
-                tools.taxi.park_brake_valve_set,
-                tools.taxi.prop.clone(),
-                tools.taxi.pace,
-            );
-        }
+    if crate::autoland::ACTIVE.load(Relaxed) {
+        taxi_in_after_landing(xp, config, voice, tools, false).await;
     }
     event("arrival_owns", json!({}));
     ACTIVE.store(false, SeqCst);
+}
+
+/// The last stage of any mission that ends with a landing: once autoland has
+/// rolled out and stopped, request the taxi-in and drive to the stand.
+///
+/// This is not tidiness, it is the runway. Autoland stops ON the strip and
+/// hands back, and for a CIRCUIT nothing came after it — full auto armed the
+/// circuit and exited, so the aircraft simply sat where it stopped. At
+/// Southampton it held runway 02 for ninety seconds after touchdown while an
+/// arrival closed from 2.6 nm to 0.5 nm: six `runway_incursion` records, and
+/// the tower telling the lander "continue approach, traffic on the runway
+/// ahead". It only moved because the pilot said "taxi to parking"
+/// (2026-08-01). Vacating is part of the landing, so it belongs to whoever
+/// owns the landing.
+///
+/// `wait_for_arm` is for the circuit, whose autoland is minutes away when the
+/// mission is armed; the flight path calls this with autoland already running.
+async fn taxi_in_after_landing(
+    xp: &XPlaneClient,
+    config: &Config,
+    voice: &Option<Voice>,
+    tools: &SubTools,
+    wait_for_arm: bool,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if wait_for_arm
+        && !wait_until(ARM_WAIT_SECS, 1000, || async {
+            crate::autoland::ACTIVE.load(Relaxed)
+        })
+        .await
+    {
+        event("no_autoland", json!({}));
+        return;
+    }
+    if ABORT.load(SeqCst) {
+        return;
+    }
+    // The panel's automation well reads the stage string, and full auto now
+    // stays ACTIVE through the mission instead of dropping out at the arm —
+    // so say where we actually are rather than leaving "circuit armed" up for
+    // the whole flight.
+    event("on_approach", json!({}));
+    // A vacate drive follows this landing, so the rollout may hand off at taxi
+    // pace instead of stopping dead on the strip — landing includes getting
+    // off the runway, and it is one continuous manoeuvre, not a stop and a
+    // fresh start (EGHI, 2026-08-02). Consumed by the rollout; cleared below
+    // if the landing never happens, so it cannot go stale.
+    crate::autoland::VACATE_FOLLOWS.store(true, Relaxed);
+    let landed = wait_until(1800.0, 1000, || async {
+        !crate::autoland::ACTIVE.load(Relaxed)
+    })
+    .await;
+    // Autoland also goes inactive climbing away from a go-around, so being on
+    // the ground is the half of "landed" that matters here.
+    let on_ground = xp
+        .get_float(crate::datarefs::ON_GROUND_ANY)
+        .await
+        .unwrap_or(0.0)
+        > 0.5;
+    if !landed || !on_ground || ABORT.load(SeqCst) {
+        // The landing never completed here — take the rolling-handoff offer
+        // back, or a later standalone landing would hand off to nobody.
+        crate::autoland::VACATE_FOLLOWS.store(false, Relaxed);
+        event(
+            "no_taxi_in",
+            json!({ "landed": landed, "on_ground": on_ground }),
+        );
+        return;
+    }
+    announce(
+        voice,
+        Priority::Advisory,
+        crate::readback::one_of(&[
+            "Down. I'll get us off the runway and taxi to parking.",
+            "Down. Vacating and taxiing us to parking.",
+            "On the ground. I'll clear the runway and get us to the gate.",
+        ]),
+    );
+    event("taxi_in", json!({}));
+    crate::taxi_in::start(
+        config.xplane_base_url.clone(),
+        config.clone(),
+        voice.clone(),
+        tools.taxi.park_brake_valve_set,
+        tools.taxi.prop.clone(),
+        tools.taxi.pace,
+        // We have just landed, so the first thing owed is the runway itself.
+        crate::taxi_in::vacate_runway(),
+    );
 }
 
 /// What the blocking arrival builder found: the approach plan + runway when

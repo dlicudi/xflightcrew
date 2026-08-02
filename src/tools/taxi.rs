@@ -490,6 +490,10 @@ impl Tool for TaxiToParking {
         {
             return Ok("We're airborne. Land first, then I'll taxi us in.".to_string());
         }
+        // Vacate first only if we are still ON the runway — see
+        // `taxi_in::vacate_runway` for why a standing landing clearance is
+        // the signal and a bare `clearance_runway` is not.
+        let vacate_from = crate::taxi_in::vacate_runway();
         crate::taxi_in::start(
             ctx.config.xplane_base_url.clone(),
             ctx.config.clone(),
@@ -497,6 +501,7 @@ impl Tool for TaxiToParking {
             self.park_brake_valve_set,
             self.prop.clone(),
             self.pace,
+            vacate_from,
         );
         Ok("Taxiing to parking — getting the clearance.".to_string())
     }

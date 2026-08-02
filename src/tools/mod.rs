@@ -282,6 +282,8 @@ impl Registry {
                 takeoff_roll_m,
                 approach_ias,
                 prop: profile.prop.clone(),
+                climb_floor_kts: circuit::climb_floor(profile),
+                vs_clean_kts: profile.vs_clean_kts,
             }));
             // Fly a REAL published SID / instrument approach from the sim's CIFP —
             // the terrain-safe path where the circuit only guessed. Shares the AP
@@ -310,6 +312,10 @@ impl Registry {
                     pace,
                     tail_strike_deg: profile.tail_strike_deg,
                     vne_kts: profile.vne_kts,
+                    climb_floor_kts: circuit::climb_floor(profile),
+                    vs_clean_kts: profile.vs_clean_kts,
+                    lights: profile.lights.clone(),
+                    flood_dataref: profile.flood_lights_dataref.clone(),
                     // "Can we start it at all": the generic piston group OR a
                     // custom cycle-switch piston sequence (the DC-3, whose
                     // mixture is xlua-overridden so it declares no `engine`).
@@ -666,6 +672,56 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+}
+
+#[cfg(test)]
+mod departure_lights_tests {
+    /// Full auto flew DARK — no beacon, no nav, no taxi light, no strobes, no
+    /// landing lights — while the arrival explicitly switched strobes, taxi
+    /// and landing off at the stand. Turning off what was never turned on is
+    /// the proof it was an oversight (2026-08-01). The schedule is only as
+    /// good as the profile keys it names, so check every shipped profile
+    /// actually declares them.
+    #[test]
+    fn every_profile_declares_the_lights_the_departure_switches() {
+        let dir = std::path::Path::new("profiles");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).expect("profiles dir").flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "yaml") {
+                continue;
+            }
+            let id = path.file_stem().unwrap().to_string_lossy().to_string();
+            let Some(p) = crate::aircraft::load(&id) else {
+                continue;
+            };
+            if p.lights.is_empty() {
+                continue; // an airframe with no light layer is not a failure
+            }
+            checked += 1;
+            let keys: Vec<&str> = p.lights.iter().map(|l| l.key.as_str()).collect();
+            // Nav, and at least one anti-collision light. NOT beacon
+            // specifically: the Lancair Evolution's switch row really is
+            // NAV / LAND / STRB with no separate beacon, and inventing a
+            // switch an airframe hasn't got is the trap the profile comments
+            // exist to prevent. The departure schedule no-ops any key a
+            // profile doesn't declare, so this only catches a profile that
+            // would depart with nothing lit at all.
+            // Nav, plus at least one light the TAKEOFF half of the schedule
+            // can switch. Deliberately not "beacon" specifically: the Lancair
+            // Evolution's switch row really is NAV / LAND / STRB with no
+            // separate beacon, and inventing a switch an airframe hasn't got
+            // is the trap the profile comments exist to prevent. The schedule
+            // no-ops any key a profile omits, so this catches only a profile
+            // that would depart with nothing lit at all.
+            assert!(keys.contains(&"nav"), "{id}: no nav lights in {keys:?}");
+            assert!(
+                keys.contains(&"strobe") || keys.contains(&"landing"),
+                "{id}: nothing for the takeoff to light in {keys:?}"
+            );
+        }
+        assert!(checked > 0, "no profiles with lights were checked");
+    }
 }
 
 #[cfg(test)]
