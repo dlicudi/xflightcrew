@@ -2038,5 +2038,4 @@ mod tests {
         assert_eq!(h.pop().unwrap().seq, 6);
         assert_eq!(h.pop().unwrap().seq, 7);
     }
-
 }

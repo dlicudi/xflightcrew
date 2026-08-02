@@ -149,11 +149,7 @@ impl LoadSnapshot {
 pub fn load_snapshot() -> Option<LoadSnapshot> {
     let guard = LOAD.lock().unwrap_or_else(|e| e.into_inner());
     let w = guard.as_ref()?;
-    let mut top: Vec<(String, u64)> = w
-        .by_name
-        .iter()
-        .map(|(n, c)| (n.clone(), *c))
-        .collect();
+    let mut top: Vec<(String, u64)> = w.by_name.iter().map(|(n, c)| (n.clone(), *c)).collect();
     top.sort_by_key(|item| std::cmp::Reverse(item.1));
     top.truncate(6);
     Some(LoadSnapshot {

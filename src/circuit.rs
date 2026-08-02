@@ -240,6 +240,16 @@ const LAST_DITCH_XTK_M: f64 = 2.0 * ESTABLISHED_XTK_M;
 /// So: wait until our own turn has actually rolled out onto the runway course
 /// (by which point the geometry leaves ~0.3 radii to trim, which is what
 /// autoland's final pursuit is for), unless we are running out of distance.
+///
+/// `hdg_err_deg` is the ground TRACK against the runway course, never the
+/// nose: the final leg commands intercept-plus-crab, so on the centreline in
+/// any crosswind the heading sits a whole wind-correction angle off the
+/// course — 12 degrees at 16 kt across a 172's 74 kt approach — and a
+/// heading-based gate can never pass while the aircraft tracks the
+/// centreline perfectly. Every handover would then fall through the
+/// last-ditch valve, which is the exact bypass this test exists to guard
+/// (audit, 2026-08-02). The track is also the honest question: it is what
+/// autoland inherits.
 pub fn ready_for_autoland(xtk_m: f64, along_m: f64, hdg_err_deg: f64) -> bool {
     if !interceptable(xtk_m, along_m) {
         return false;
@@ -1590,13 +1600,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // to 1.3 radii abeam at that instant, pointing across the centreline.
         // See `ready_for_autoland` for why "autoland could close this" is not
         // the same question as "we are lined up".
-        // A failed heading read reads as "not rolled out yet": it can only
-        // delay the handoff by a tick, where treating it as aligned would hand
-        // over the very thing this guard exists to prevent.
-        let hdg_err = psi_r
+        // Rolled out is judged on the ground TRACK, not the nose: the leg
+        // commands intercept-plus-crab, so on the centreline in a crosswind
+        // the heading carries the whole wind-correction angle and a
+        // heading-based gate never passes (see `ready_for_autoland`). A
+        // failed track read reads as "not rolled out yet": it can only delay
+        // the handoff by a tick, where treating it as aligned would hand over
+        // the very thing this guard exists to prevent.
+        let hdg_err = hpath_r
             .as_ref()
             .ok()
-            .map(|psi| ((psi - rwy_course + 540.0).rem_euclid(360.0)) - 180.0)
+            .map(|hp| ((hp - rwy_course + 540.0).rem_euclid(360.0)) - 180.0)
             .unwrap_or(180.0);
         if turning_final && ready_for_autoland(x_m, a_m.abs(), hdg_err) {
             let alt_msl = field_elev_ft + agl_ft;
@@ -1711,7 +1725,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         //
         // Base is kept as the backstop for any path that reaches it without
         // passing the abeam test; the latch means it can only fire once.
-        if !gear_lowered && (matches!(leg, Leg::Base) || (matches!(leg, Leg::Downwind) && a_m < 0.0))
+        if !gear_lowered
+            && (matches!(leg, Leg::Base) || (matches!(leg, Leg::Downwind) && a_m < 0.0))
         {
             let _ = xp.set_float(GEAR_HANDLE, 1.0).await;
             alert(&voice, Priority::Advisory, "Gear down.");
@@ -2235,7 +2250,10 @@ mod tests {
         assert_eq!(climb_limit_fpm(700.0, 105.0, 0.0, full, floor), 700.0);
         // And at the throttle's own setpoint, with room to spare: the steady
         // operating point must sit ABOVE the fade band, not on its edge.
-        assert!(pattern > full + 3.0, "no headroom left: {pattern} vs {full}");
+        assert!(
+            pattern > full + 3.0,
+            "no headroom left: {pattern} vs {full}"
+        );
         assert_eq!(climb_limit_fpm(700.0, pattern, 0.0, full, floor), 700.0);
         // Genuine sag below Vy still fades, and blue line still shuts it.
         let sagged = climb_limit_fpm(700.0, 103.0, 0.0, full, floor);
@@ -2770,7 +2788,10 @@ mod tests {
         // The boundary behaves: at the bare 35 degree geometry it is refused
         // (we insist on margin), and it is accepted once the margin is there.
         let bare = 1000.0 / MAX_INTERCEPT_CUT_DEG.to_radians().tan();
-        assert!(!interceptable(1000.0, bare * 1.05), "bare geometry is not enough");
+        assert!(
+            !interceptable(1000.0, bare * 1.05),
+            "bare geometry is not enough"
+        );
         assert!(interceptable(1000.0, bare * INTERCEPT_MARGIN + 1.0));
 
         // On the centreline anything works, including at the threshold.
@@ -2787,7 +2808,10 @@ mod tests {
         // with 4,092 m to run. The geometry is a 28 degree cut, so
         // `interceptable` is happy...
         let hdg_err_on_base = ((290.0 - 20.0 + 540.0_f64).rem_euclid(360.0)) - 180.0;
-        assert!(interceptable(1813.0, 4092.0), "a 28 degree cut is closeable");
+        assert!(
+            interceptable(1813.0, 4092.0),
+            "a 28 degree cut is closeable"
+        );
         // ...but the aircraft is still 90 degrees across the centreline, and
         // handing it over there is what made it approach and land at an angle.
         assert!(

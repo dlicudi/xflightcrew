@@ -266,6 +266,7 @@ impl Registry {
                 prop: profile.prop.clone(),
                 tail_strike_deg: profile.tail_strike_deg,
                 vne_kts: profile.vne_kts,
+                handoff_to_caller: false,
             }));
             // Auto circuit — one command that flies takeoff + pattern + landing
             // by orchestrating the takeoff loop, the AP, and autoland. Shares

@@ -66,15 +66,23 @@ pub fn active_managers() -> Vec<String> {
     v
 }
 
-/// The `xcopilot/status/auto` payload. Byte 0 is a marker ('1' = something is
-/// running that the CANCEL button can stand down, '0' = idle), then one line
+/// The `xcopilot/status/auto` payload. Byte 0 is a marker ('1' = a manager is
+/// actively flying/driving — the AUTO annunciator, NOT CANCEL's gate, which
+/// is always available on the plugin side), then one line
 /// per active manager, newline-separated, highest priority first. The primary
 /// line is structured `NAME|stage` for the panel's headline row ("full auto:
 /// request taxi" becomes "FULL AUTO|request taxi"); the rest stay plain.
 pub fn compose() -> String {
     let mut lines = active_managers();
     let mut out = String::new();
-    out.push(if cancel_phrase().is_some() { '1' } else { '0' });
+    // The marker is "a manager is actually flying/driving" — the AUTO
+    // annunciator and the panel headline. It stopped being derivable from
+    // `cancel_phrase()` the day that gained its "my controls" fallback and
+    // became always-Some: the amber AUTO chip lit permanently, parked
+    // cold-and-dark included (audit, 2026-08-02). CANCEL's availability is
+    // the plugin's own business now — the button always aborts SOMETHING,
+    // which is exactly why it can no longer double as this signal.
+    out.push(if lines.is_empty() { '0' } else { '1' });
     if lines.is_empty() {
         return out;
     }

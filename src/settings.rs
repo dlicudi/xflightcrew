@@ -60,7 +60,9 @@ pub fn install(cfg: Config) -> Arc<Config> {
                     tracing::warn!(key = s.key, value = %raw, "saved setting rejected; keeping the default");
                 }
             }
-            None => tracing::warn!(key = s.key, value = %raw, "saved setting unreadable; keeping the default"),
+            None => {
+                tracing::warn!(key = s.key, value = %raw, "saved setting unreadable; keeping the default")
+            }
         }
     }
     live()
@@ -147,12 +149,7 @@ impl Kind {
     pub fn render(&self, v: &Value) -> String {
         match (self, v) {
             (Kind::Bool, Value::Bool(b)) => if *b { "on" } else { "off" }.to_string(),
-            (
-                Kind::Num {
-                    decimals, unit, ..
-                },
-                Value::Num(n),
-            ) => {
+            (Kind::Num { decimals, unit, .. }, Value::Num(n)) => {
                 let num = format!("{n:.*}", *decimals);
                 if unit.is_empty() {
                     num
@@ -720,7 +717,10 @@ mod tests {
     #[test]
     fn an_env_pinned_setting_refuses_the_edit() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let s = ALL.iter().find(|s| s.key == "taxi_guide").expect("declared");
+        let s = ALL
+            .iter()
+            .find(|s| s.key == "taxi_guide")
+            .expect("declared");
         // SAFETY: the lock above serialises every env-mutating test.
         unsafe { std::env::set_var(s.env, "true") };
         assert!(s.env_pinned());
@@ -733,7 +733,10 @@ mod tests {
     /// Applying a value of the wrong shape changes nothing.
     #[test]
     fn a_mismatched_value_is_rejected_not_coerced() {
-        let s = ALL.iter().find(|s| s.key == "taxi_guide").expect("declared");
+        let s = ALL
+            .iter()
+            .find(|s| s.key == "taxi_guide")
+            .expect("declared");
         assert!(!(s.apply)(&Value::Num(1.0)));
         let s = ALL
             .iter()

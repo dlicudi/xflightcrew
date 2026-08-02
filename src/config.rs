@@ -491,7 +491,12 @@ mod tests {
         let cfg = Config::from_env().expect("config loads");
         let mut entries = 0usize;
         let mut british = 0usize;
-        for spec in cfg.atc_voice_pool.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        for spec in cfg
+            .atc_voice_pool
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             entries += 1;
             if spec.contains("en_GB") {
                 british += 1;
@@ -514,7 +519,10 @@ mod tests {
                 "{spec}: speaker {sid} but the model has {n} — it would silently render speaker 0"
             );
         }
-        assert!(entries >= 8, "a thin pool means airports share voices: {entries}");
+        assert!(
+            entries >= 8,
+            "a thin pool means airports share voices: {entries}"
+        );
         // The flying is in the UK; the pool must not be all-American, which is
         // what it was until 2026-07-30.
         assert!(

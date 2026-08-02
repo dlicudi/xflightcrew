@@ -38,6 +38,13 @@ pub struct AutoTakeoff {
     pub tail_strike_deg: Option<f64>,
     /// Vne/Vmo for the climb's overspeed protection.
     pub vne_kts: Option<f64>,
+    /// Who gets the aircraft at the handoff. False for the registry's copy —
+    /// a takeoff the PILOT asked for hands to the pilot, which is the whole
+    /// point of asking. True for full auto's copy: its Flight mission arms
+    /// the takeoff through THIS tool, and "your aircraft" at 1,000 ft with
+    /// `fly_route` about to arm the enroute legs is the handoff-truth bug in
+    /// its last remaining home (audit, 2026-08-02).
+    pub handoff_to_caller: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -176,9 +183,9 @@ impl Tool for AutoTakeoff {
             ctx.config.xplane_base_url.clone(),
             ctx.voice.cloned(),
             autotakeoff::Params {
-                // A takeoff the PILOT asked for: they get the aircraft at the
-                // handoff, which is the whole point of asking.
-                handoff_to_caller: false,
+                // Registry copy: the pilot asked, the pilot gets the
+                // aircraft. Full auto's copy sets true — see the field doc.
+                handoff_to_caller: self.handoff_to_caller,
                 tail_strike_deg: self.tail_strike_deg,
                 vne_kts: self.vne_kts,
                 apt_dat: super::autoland::apt_dat_path(),

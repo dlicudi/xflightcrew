@@ -289,6 +289,10 @@ impl Tool for FullAuto {
                 vs_clean_kts: self.vs_clean_kts,
             },
             takeoff: crate::tools::takeoff::AutoTakeoff {
+                // The Flight mission arms the takeoff through this copy, and
+                // the orchestrator takes the climb from the handoff — the
+                // pilot must not be told "your aircraft" there.
+                handoff_to_caller: true,
                 tail_strike_deg: self.tail_strike_deg,
                 vne_kts: self.vne_kts,
                 cfg: self.cfg.clone(),

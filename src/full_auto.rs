@@ -220,6 +220,14 @@ fn event(stage: &str, detail: serde_json::Value) {
 /// ignored, so an airframe with no beacon is not a failed departure.
 async fn light(tools: &SubTools, ctx: &ToolCtx<'_>, key: &str, on: bool) -> bool {
     use crate::tools::Tool;
+    // Declared first: the tool answers an unknown light with an Ok QUESTION
+    // ("I didn't catch which light..."), which is right for a misheard pilot
+    // and a lie under `.is_ok()` — the SR22, SF50 and Lancair have no beacon,
+    // and full auto announced "Beacon on" and blackboxed switches it never
+    // touched on all three (audit, 2026-08-02).
+    if !tools.lights.declares(key) {
+        return false;
+    }
     tools
         .lights
         .execute(&json!({ "light": key, "on": on }), ctx)
@@ -914,6 +922,21 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             if let Ok(reply) = tools.circuit.execute(&args, &ctx).await {
                 announce(&voice, Priority::Advisory, &reply);
             }
+            // A refusal comes back Ok with the reason as the reply, so the
+            // reply proves nothing — the FLAG is the arm, exactly as
+            // fly_route checks the takeoff's. Without this, a refused
+            // circuit fell through to a 900 s wait for an autoland that was
+            // never coming, with every re-arm answered "I'm already running
+            // the full sequence" (audit, 2026-08-02). The refusal line has
+            // already been spoken; this only stands the sequence down.
+            if !crate::circuit::ACTIVE.load(SeqCst) {
+                give_up(
+                    &voice,
+                    "The circuit didn't arm, so I'm standing down. Your aircraft.",
+                    "circuit_refused",
+                );
+                return;
+            }
             event("circuit_armed", json!({}));
             // The circuit owns the FLYING from here, but not the last stage:
             // it hands the final to autoland, which stops on the runway and
@@ -1216,14 +1239,26 @@ async fn taxi_in_after_landing(
     wait_for_arm: bool,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    if wait_for_arm
-        && !wait_until(ARM_WAIT_SECS, 1000, || async {
+    if wait_for_arm {
+        // Wait for autoland to ARM — or for the mission to DIE first. The
+        // condition used to be autoland alone, and a circuit cancelled with
+        // "cancel the circuit" (which touches no full-auto flag) left this
+        // wait holding full auto for its whole 900 s (audit, 2026-08-02).
+        // The mission is alive while any of its flyers is: the circuit, the
+        // published approach it may escalate to, or autoland itself.
+        wait_until(ARM_WAIT_SECS, 1000, || async {
             crate::autoland::ACTIVE.load(Relaxed)
+                || !(crate::circuit::ACTIVE.load(Relaxed) || crate::procedure::ACTIVE.load(Relaxed))
         })
-        .await
-    {
-        event("no_autoland", json!({}));
-        return;
+        .await;
+        // The handoff clears the circuit's flag AROUND arming autoland, so a
+        // "nothing flying" read gets a beat of grace before it means dead.
+        let armed = crate::autoland::ACTIVE.load(Relaxed)
+            || wait_until(5.0, 250, || async { crate::autoland::ACTIVE.load(Relaxed) }).await;
+        if !armed {
+            event("no_autoland", json!({}));
+            return;
+        }
     }
     if ABORT.load(SeqCst) {
         return;

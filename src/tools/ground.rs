@@ -173,9 +173,9 @@ impl Tool for SetGroundPower {
         // still driving up reads as no power yet, and says so.
         Ok(match bus_volts(ctx).await {
             Some(v) if v > 24.0 => format!("Roger, ground power on, bus at {v:.0} volts."),
-            Some(v) => format!(
-                "Ground power requested — the cart's still coming, bus at {v:.0} volts."
-            ),
+            Some(v) => {
+                format!("Ground power requested — the cart's still coming, bus at {v:.0} volts.")
+            }
             None => "Roger, requesting ground power.".to_string(),
         })
     }

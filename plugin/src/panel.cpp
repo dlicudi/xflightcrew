@@ -382,13 +382,11 @@ protected:
             if (g_font_head[mScaleIdx]) ImGui::PopFont();
         }
 
-        // Reserve the button block below the well: (CANCEL when active) + two
-        // arm rows + the guarded row; the status bar is drawn by
-        // buildInterface after the tab.
-        const bool active = drefs::auto_active();
+        // Reserve the button block below the well: CANCEL + two arm rows +
+        // the guarded row; the status bar is drawn by buildInterface after
+        // the tab.
         const float rowH = ImGui::GetFrameHeightWithSpacing();
-        const float footer = rowH * (active ? 4.0f : 3.0f)
-            + ImGui::GetStyle().ItemSpacing.y;
+        const float footer = rowH * 4.0f + ImGui::GetStyle().ItemSpacing.y;
 
         // The automation status well: the auto feed, primary line first as
         // NAME|stage, the rest one dim line each.
@@ -443,10 +441,15 @@ protected:
         const ImVec4 redBg(0.42f, 0.13f, 0.11f, 1.0f), redHov(0.55f, 0.17f, 0.14f, 1.0f);
         const ImVec4 greenBg(0.11f, 0.32f, 0.16f, 1.0f), greenHov(0.14f, 0.42f, 0.21f, 1.0f);
 
-        // CANCEL — full width, only while something is running to cancel. The
-        // app picks the right phrase for whatever is active ("cancel full
-        // auto", "abort takeoff", ...).
-        if (active) {
+        // CANCEL — full width, ALWAYS. The app picks the right phrase for
+        // whatever is active ("cancel full auto", "abort takeoff", ...) and
+        // falls back to "my controls" when nothing is — which is exactly the
+        // state that most needs the button: a missed-approach give-up leaves
+        // every manager flag down while the AP still flies the aircraft
+        // dirty and slow, and gating on the marker made CANCEL vanish at
+        // that moment (audit, 2026-08-02). The marker now feeds only the
+        // AUTO annunciator.
+        {
             ImGui::PushStyleColor(ImGuiCol_Button, redBg);
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, redHov);
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, redHov);
