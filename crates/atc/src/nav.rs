@@ -558,6 +558,45 @@ pub struct TaxiNet {
 /// runways, whose holding positions sit ~100 m out.
 pub const HOLD_SHORT_STANDOFF_M: f64 = 40.0;
 
+/// How far past the runway's zone boundary a vacate drives before it is
+/// finished. The mirror of [`HOLD_SHORT_STANDOFF_M`]: a departure stops that
+/// far SHORT of the line, an arrival ends that far PAST it, and for the same
+/// reason — the aircraft has length, and the nose being over the line is not
+/// the tail being over it.
+pub const VACATE_CLEAR_M: f64 = 60.0;
+
+/// An exit more than this off the rollout heading is BEHIND us: reaching it
+/// would mean taxiing back down the runway, which is worse than the longer
+/// exit ahead. Abeam counts as ahead — we are stopped, so the drive's own
+/// join owns the turn.
+const AHEAD_OF_ABEAM_DEG: f64 = 100.0;
+
+/// Hard stop on the vacate walk. A field whose active zones swallow half the
+/// apron would otherwise send us to the terminal: this is the first hundred
+/// metres off the strip, not the taxi in — the taxi-in clearance owns the
+/// rest, and it is requested from wherever this ends.
+const MAX_VACATE_STEPS: usize = 8;
+
+/// A planned exit from the runway we have just landed on: the polyline to
+/// drive, and the taxiway it puts us on.
+///
+/// Deliberately NOT a [`TaxiRoutePlan`]. There is no clearance here, no
+/// holding point and no via list to read back — vacating is the completion of
+/// the landing clearance we already hold, not a new instruction, and dressing
+/// it as a cleared route would invite a readback for something nobody issued.
+#[derive(Debug, Clone)]
+pub struct VacatePlan {
+    /// Starts AT THE AIRCRAFT, ends clear of the runway's protected zone.
+    pub path: Vec<(f64, f64)>,
+    /// Per-segment `(name, is_runway)`, aligned with `path` exactly as
+    /// [`TaxiRoutePlan::seg`] is — the drive and the guide read both the same
+    /// way.
+    pub seg: Vec<(String, bool)>,
+    /// The taxiway we end up on, for the crew line and the "runway vacated"
+    /// report. May be empty on an unnamed link.
+    pub exit_name: String,
+}
+
 /// A planned taxi route, ready to phrase: ordered taxiway names, runways
 /// crossed, the holding-point name, and the node polyline for the
 /// off-route compliance watch. Names are RAW apt.dat strings — the station
@@ -770,6 +809,191 @@ impl TaxiNet {
             hold_zone,
             true,
         )
+    }
+
+    /// Plan the drive OFF the runway we have just landed on.
+    ///
+    /// The arrival mirror of `plan_to_runway`, and it reuses that work rather
+    /// than inventing a second idea of where a runway meets a taxiway: an
+    /// ENTRANCE and an EXIT are the same node, decided by the same
+    /// connectivity relation (on a runway edge, or one hop from one) — only
+    /// the direction of travel differs. And the zone walk below is the
+    /// hold-short trim run backwards: the trim DROPS the trailing edges inside
+    /// the runway's protected zone so a departure stops short of the line;
+    /// this KEEPS going until it is `clear_m` past the same boundary, because
+    /// the tail has to be over it too.
+    ///
+    /// Why this exists at all: the taxi-in used to transmit its request from
+    /// wherever autoland stopped and wait up to sixty seconds for a route,
+    /// sitting on the strip the whole time — and on the give-up path it handed
+    /// back "your aircraft" still on the runway. Vacating needs no clearance
+    /// from anybody. It is the completion of the landing clearance we already
+    /// hold, so it happens first and the request comes from the taxiway, which
+    /// is the order a real crew flies.
+    ///
+    /// `psi_true` is the rollout direction: exits BEHIND us are refused, since
+    /// reaching one means taxiing back down the runway, which is worse than
+    /// the longer exit ahead. `zone` names the runway ends whose active zone
+    /// we want to be clear of.
+    ///
+    /// Never refuses for want of data — a field with no authored runway edges
+    /// (776 ends worldwide) falls back to the nearest taxiway node ahead, and
+    /// only a field with no network at all returns `None`.
+    pub fn plan_vacate(
+        &self,
+        lat: f64,
+        lon: f64,
+        psi_true: f64,
+        zone: &[String],
+        clear_m: f64,
+    ) -> Option<VacatePlan> {
+        let m_per_deg_lat = 111_320.0;
+        let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
+        let dist_m = |a: (f64, f64), b: (f64, f64)| -> f64 {
+            let dx = (a.1 - b.1) * m_per_deg_lon;
+            let dy = (a.0 - b.0) * m_per_deg_lat;
+            (dx * dx + dy * dy).sqrt()
+        };
+        let here = (lat, lon);
+        // Ahead of abeam, measured from the rollout heading. We are stopped, so
+        // the drive's own join owns the turn; this only rules out the exits
+        // that would send us back down the strip.
+        let ahead = |p: (f64, f64)| -> bool {
+            let brg = bearing_deg(lat, lon, p.0, p.1);
+            angle_diff_deg(brg, psi_true).abs() <= AHEAD_OF_ABEAM_DEG
+        };
+
+        let mut taxiway_nodes: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for e in self.edges.iter().filter(|e| !e.runway) {
+            taxiway_nodes.insert(e.a);
+            taxiway_nodes.insert(e.b);
+        }
+        if taxiway_nodes.is_empty() {
+            return None;
+        }
+        // Candidate exits: runway nodes that a taxiway also touches — the
+        // JUNCTION where the two meet.
+        //
+        // This is where an exit and an entrance stop being the same thing.
+        // `runway_entrance_near` accepts a node one hop OFF the runway,
+        // because a departure holds short there and the drawn lead-on carries
+        // it the rest of the way. An arrival cannot use that node as its
+        // decision point: measuring "is this exit ahead of me" at the far end
+        // of a link says nothing about where the link MEETS the runway, and a
+        // junction 22 m behind the aircraft reads as an exit 150 m off to the
+        // side. Southbound on the test net that picked the turn-off we had
+        // just rolled past. The junction is the exit; the walk below carries
+        // us onto the taxiway from there.
+        //
+        // When the field authors no runway edges at all there is nothing to
+        // filter on, so every taxiway node is a candidate and the nearest one
+        // ahead wins — the same degradation `plan_to_runway` makes.
+        let mut runway_nodes: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for e in self.edges.iter().filter(|e| e.runway) {
+            runway_nodes.insert(e.a);
+            runway_nodes.insert(e.b);
+        }
+        let exit = taxiway_nodes
+            .iter()
+            .filter(|id| runway_nodes.is_empty() || runway_nodes.contains(id))
+            .filter_map(|id| self.nodes.get(id).map(|&p| (*id, p)))
+            .filter(|(_, p)| ahead(*p))
+            .min_by(|x, y| dist_m(here, x.1).total_cmp(&dist_m(here, y.1)))
+            .map(|(id, _)| id)?;
+
+        // Walk outward until `clear_m` past the exit, never along a runway
+        // edge and never back through a node we have used. "Outward" is
+        // measured from the AIRCRAFT, which is on the runway — so maximising
+        // it is literally "get away from the runway", which is the whole job.
+        let mut path_ids = vec![exit];
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        seen.insert(exit);
+        let mut names: Vec<String> = Vec::new();
+        // Distance travelled OUTSIDE the zone. Metres covered while still
+        // inside it earn no credit, which is the whole point: the link from
+        // the runway onto the parallel taxiway is itself a zone edge, so
+        // counting its length would finish the drive at the far end of it —
+        // and by the hold-short trim's own logic that far node IS the holding
+        // point, i.e. exactly the line we are trying to get the tail over.
+        let mut clear_gone = 0.0;
+        // A field whose zones swallow the apron would otherwise walk us to the
+        // terminal; the vacate is the first hundred metres, not the taxi in.
+        let mut left_zone = zone.is_empty();
+        while clear_gone < clear_m && names.len() < MAX_VACATE_STEPS {
+            let cur = *path_ids.last()?;
+            let cur_p = *self.nodes.get(&cur)?;
+            let step = self
+                .edges
+                .iter()
+                .filter(|e| !e.runway)
+                .filter_map(|e| {
+                    let nxt = if e.a == cur {
+                        e.b
+                    } else if e.b == cur && !e.oneway {
+                        e.a
+                    } else {
+                        return None;
+                    };
+                    if seen.contains(&nxt) {
+                        return None;
+                    }
+                    // Leaving the zone is the point: prefer any edge that is
+                    // outside it, so a junction never sends us further along
+                    // the protected pavement when a way out exists.
+                    let in_zone = e.zone_of.iter().any(|z| zone.contains(z));
+                    self.nodes
+                        .get(&nxt)
+                        .map(|&p| (nxt, p, e.name.clone(), in_zone))
+                })
+                .min_by(|x, y| {
+                    // Out-of-zone first, then whichever gets us furthest from
+                    // the runway we are standing on.
+                    x.3.cmp(&y.3)
+                        .then_with(|| dist_m(here, y.1).total_cmp(&dist_m(here, x.1)))
+                });
+            let Some((nxt, p, name, in_zone)) = step else {
+                break;
+            };
+            if !in_zone {
+                left_zone = true;
+            }
+            if left_zone {
+                clear_gone += dist_m(cur_p, p);
+            }
+            path_ids.push(nxt);
+            seen.insert(nxt);
+            names.push(name);
+        }
+
+        // The path starts AT THE AIRCRAFT — the same rule the stand route
+        // learned the hard way, because a drive whose route begins 200 m away
+        // reads as already-arrived on its first tick.
+        let mut path = vec![here];
+        for id in &path_ids {
+            path.push(*self.nodes.get(id)?);
+        }
+        // The first leg is the one off the runway itself; it has no authored
+        // name, and calling it by the runway's would be a lie.
+        let mut seg = vec![(String::new(), true)];
+        for n in &names {
+            seg.push((n.clone(), false));
+        }
+        seg.truncate(path.len().saturating_sub(1));
+        // Where we END UP, not the link we turned onto. The walk usually
+        // crosses a short stub inside the zone before reaching the parallel
+        // taxiway, and it is the latter the crew reports being clear on and
+        // the taxi-in plans from.
+        let exit_name = names
+            .iter()
+            .rev()
+            .find(|n| !n.is_empty())
+            .cloned()
+            .unwrap_or_default();
+        (path.len() >= 2).then_some(VacatePlan {
+            path,
+            seg,
+            exit_name,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2677,12 +2901,138 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
         );
         assert_eq!(plan.seg.len(), plan.path.len() - 1, "seg tracks path");
 
-        // A RUNWAY destination we are already at is still nothing to do.
+        // A RUNWAY destination we are already at is still nothing to do. This
+        // was written as `.is_none() || true`, which asserts nothing and hid
+        // behind a "runway behaviour unchanged" message — probed, the call
+        // really does return None here, so assert it.
         assert!(
             net.plan_to_runway(50.95005, -1.36005, 50.94995, -1.35985, 0.0, &[])
-                .is_none()
-                || true,
-            "runway behaviour unchanged"
+                .is_none(),
+            "a runway destination on the node we are already at is no taxi"
         );
+        // ...and a runway destination that IS somewhere else still plans, even
+        // though this net has no runway edges for `runway_entrance_near` to
+        // find. No authored entrance degrades to the plain snap; it is never a
+        // refusal, because "no entrance in the data" is not a reason to refuse
+        // to taxi (776 runway ends worldwide have none).
+        let far = net
+            .plan_to_runway(50.95005, -1.36005, 50.9520, -1.3600, 0.0, &[])
+            .expect("no runway edges means the plain snap, not a refusal");
+        let plain = net
+            .plan(50.95005, -1.36005, 50.9520, -1.3600, 0.0, &[])
+            .expect("the plain plan is the yardstick");
+        assert_eq!(
+            far.path, plain.path,
+            "with no entrance authored, they agree"
+        );
+    }
+
+    /// A strip running north with a taxiway parallel to it, joined abeam each
+    /// runway node. Nodes 1..3 are the runway, 11..13 the taxiway.
+    fn vacate_net() -> TaxiNet {
+        let mut net = TaxiNet::default();
+        // Runway 36/18, three nodes up the centreline (0, 400, 800 m north).
+        net.nodes.insert(1, (51.0000, -1.0000));
+        net.nodes.insert(2, (51.0036, -1.0000));
+        net.nodes.insert(3, (51.0072, -1.0000));
+        // Parallel taxiway ~150 m east, abeam each.
+        net.nodes.insert(11, (51.0000, -0.99786));
+        net.nodes.insert(12, (51.0036, -0.99786));
+        net.nodes.insert(13, (51.0072, -0.99786));
+        let e = |a, b, name: &str, runway, zone: &[&str]| TaxiEdge {
+            a,
+            b,
+            name: name.into(),
+            runway,
+            oneway: false,
+            zone_of: zone.iter().map(|s| s.to_string()).collect(),
+        };
+        net.edges.push(e(1, 2, "36/18", true, &["36", "18"]));
+        net.edges.push(e(2, 3, "36/18", true, &["36", "18"]));
+        // The links onto the taxiway sit INSIDE the runway's active zone...
+        net.edges.push(e(1, 11, "A1", false, &["36", "18"]));
+        net.edges.push(e(2, 12, "A2", false, &["36", "18"]));
+        net.edges.push(e(3, 13, "A3", false, &["36", "18"]));
+        // ...and the parallel taxiway itself is outside it.
+        net.edges.push(e(11, 12, "Alpha", false, &[]));
+        net.edges.push(e(12, 13, "Alpha", false, &[]));
+        net
+    }
+
+    /// Vacating is the completion of the landing clearance, not a new
+    /// instruction — so it plans from where autoland stopped us without
+    /// asking anybody, and it must not stop with the tail still on the paint.
+    #[test]
+    fn a_vacate_leaves_the_runway_forwards_and_gets_fully_clear() {
+        let net = vacate_net();
+        let zone = ["36".to_string(), "18".to_string()];
+        // Stopped just short of node 2, rolled out northbound on 36.
+        let (lat, lon) = (51.0034, -1.0000);
+        let plan = net
+            .plan_vacate(lat, lon, 0.0, &zone, VACATE_CLEAR_M)
+            .expect("there is an exit ahead");
+
+        // Starts at the aircraft — a route that begins at the snapped node
+        // reads as already-arrived on the drive's first tick (the EGHI stand
+        // lesson, one module over).
+        assert!(
+            (plan.path[0].0 - lat).abs() < 1e-9 && (plan.path[0].1 - lon).abs() < 1e-9,
+            "must start where the aircraft is, got {:?}",
+            plan.path[0]
+        );
+        assert_eq!(plan.seg.len(), plan.path.len() - 1, "seg tracks path");
+
+        // It does NOT stop on the link: that edge is inside the active zone,
+        // so the walk carries on down Alpha until it is past the boundary.
+        assert!(plan.path.len() >= 3, "must not stop on the link: {plan:?}");
+        assert_eq!(plan.exit_name, "Alpha");
+        let end = *plan.path.last().unwrap();
+        let east_m = (end.1 - lon) * 111_320.0 * lat.to_radians().cos();
+        assert!(east_m > 140.0, "must end off the strip, {east_m} m east");
+
+        // Never BACKWARDS down the runway. Landing the other way from the same
+        // spot, the exit taken must be the one that is now ahead.
+        let south = net
+            .plan_vacate(lat, lon, 180.0, &zone, VACATE_CLEAR_M)
+            .expect("there is an exit ahead that way too");
+        assert!(
+            south.path[1].0 < lat,
+            "a southbound rollout must exit south, got {:?}",
+            south.path[1]
+        );
+    }
+
+    /// The two ways the data can be thin. Neither is a reason to sit on a
+    /// runway, so neither is a refusal — the same rule `plan_to_runway`
+    /// follows for the 776 runway ends with no authored entrance.
+    #[test]
+    fn a_vacate_degrades_rather_than_refusing() {
+        let zone = ["36".to_string(), "18".to_string()];
+
+        // No authored ACTIVE ZONES: nothing marks the boundary, so the walk
+        // just runs its clearance distance out from the exit. Still a plan.
+        let mut no_zone = vacate_net();
+        for e in &mut no_zone.edges {
+            e.zone_of.clear();
+        }
+        let p = no_zone
+            .plan_vacate(51.0034, -1.0000, 0.0, &zone, VACATE_CLEAR_M)
+            .expect("no zones is not a refusal");
+        assert!(p.path.len() >= 2);
+
+        // No authored RUNWAY edges: nothing to be adjacent to, so every
+        // taxiway node is a candidate and the nearest ahead wins.
+        let mut no_rwy = vacate_net();
+        no_rwy.edges.retain(|e| !e.runway);
+        let p = no_rwy
+            .plan_vacate(51.0034, -1.0000, 0.0, &zone, VACATE_CLEAR_M)
+            .expect("no runway edges is not a refusal either");
+        assert!(p.path.len() >= 2);
+
+        // No network at all is the one honest None: there is nothing to drive
+        // along, and the caller keeps its old behaviour.
+        assert!(TaxiNet::default()
+            .plan_vacate(51.0034, -1.0000, 0.0, &zone, VACATE_CLEAR_M)
+            .is_none());
     }
 }

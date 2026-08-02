@@ -1,0 +1,191 @@
+# Aircraft profile — X-Plane 12 stock Beechcraft Baron 58 (Laminar).
+# Loaded when X-Plane reports acf_ICAO "BE58" (XCOPILOT_AIRCRAFT=auto).
+#
+# The first PISTON TWIN with stock systems, which is what makes it interesting:
+# the DC-3 is a twin too, but every system on it is xlua-overridden, so it goes
+# through the cycle-switch model and none of the generic tools apply. Here they
+# all do — and doing so exposed two single-engine assumptions in tools that had
+# only ever met singles (see `engines: 2` below).
+#
+# Numbers come from two sources, and where they disagree the comment says so:
+#   - Baron_58.acf — what the flight model actually flies (every V-speed, the
+#     flap detent count, gear retraction, engine type and count).
+#   - X-Plane_Baron_Pilot_Operating_Manual.pdf, shipped with the aircraft — the
+#     recited reference card (weights, ceiling, fuel, ground roll).
+# Dataref and command names are from the verified cockpitdecks Baron 58 deck
+# (~/GitHub/cockpitdecks-configs/decks/beechcraft-baron-58), the same source
+# the SR22 profile was built from.
+
+id: beechcraft_baron_58
+display_name: Beechcraft Baron 58
+
+# --- Capability flags: universal-dataref tools only ---
+autopilot: true        # set_heading / set_altitude / set_vertical_speed. VERIFY LIVE
+                       # before trusting the automation: the acf's _autopilot_logic
+                       # reads 0, and the DC-3 taught us that a profile claiming an
+                       # autopilot that never latches makes every AP command fail
+                       # silently. Stock Laminar airframes normally drive the stock
+                       # AP, so this starts true — but fly one circuit and watch
+                       # servos_on latch before believing it.
+ils: true              # prepare_ils (flies the approach through the AP above)
+barometer: true        # set_barometer
+com_radio: true        # set_com1
+com2_radio: true       # set_com2 / swap_radio
+nav_radio: true        # set_nav1 / set_obs
+transponder: true      # set_transponder
+parking_brake: true    # set_parking_brake
+pitot_heat: true       # set_pitot_heat
+pitch_trim: true       # set_pitch_trim (universal elevator_trim)
+directional_gyro: true # steam gauges on a vacuum system (_has_hsi 0,
+                       # _has_vac_cross_tied 1) — the DG drifts and wants syncing
+speedbrake: false
+cabin_crew: false      # six seats, one pilot, no interphone
+
+# Retractable gear — the first thing that separates this from the 172. VLE and
+# VLO are both 152 KIAS (acf `_Vle_kts`, POM "Maximum Speed Landing Gear
+# Operating"); the gear tool refuses a cycle above it.
+retractable_gear: true
+vlo_kts: 152.0
+
+# --- Twin ---
+# Every per-engine tool writes BOTH array elements. Two tools had assumed a
+# single engine and were fixed for this airframe rather than worked around:
+# `set_magnetos` wrote only ignition_key[0] (the right engine kept whatever the
+# pilot last selected, while the readback — also element 0 — confirmed the
+# change), and `start_engine` cranked only starter 1 and watched only
+# ENGN_running[0], so it would have reported a successful start with the right
+# engine cold.
+engines: 2
+engine: true           # set_mixture / lean_mixture / start_engine / stop_engine
+magnetos: true         # ignition_key per engine (0 off, 1 R, 2 L, 3 both, 4 start)
+magnetos_per_engine: false  # ...via ignition_key, NOT the DC-3's ignition_on
+carb_heat: false       # Continental IO-550 — fuel injected (acf `_engn/0/_type RCP_INJ`)
+fuel_pump: true        # boost pumps, fuel_pump_on[0] and [1]
+
+# Fuel selectors: one per side, and the reason the first start attempt failed.
+# They sit at OFF on a cold aircraft, and the start sequence had no idea they
+# existed — mags both, mixture rich, throttle cracked, 28 volts on the bus from
+# a ground cart, and both engines cranked dry (2026-08-01).
+#
+# Cycle switches, like the DC-3's: `laminar/b58/fuel_selector_L` is READ-ONLY
+# (a PATCH returns 403), so only the up/down commands can move them and a
+# dataref write could never have worked. Values measured live: 0 = off,
+# 1 = on, and the engines lit on 1. The real airframe also has a CROSSFEED
+# position; it is deliberately not declared here because it is unverified, and
+# `max: 1` means the cycle logic can never step onto a position we have not
+# proven exists.
+fuel_selectors:
+  - key: left
+    spoken: left fuel selector
+    engine: 0
+    start_value: 1
+    switch: { position: laminar/b58/fuel_selector_L, up: laminar/b58/fuel_selector_L_up, down: laminar/b58/fuel_selector_L_dwn, min: 0, max: 1, wrap: false }
+    positions:
+      - { key: "off", spoken: "off", value: 0 }
+      - { key: "on",  spoken: "on",  value: 1 }
+  - key: right
+    spoken: right fuel selector
+    engine: 1
+    start_value: 1
+    switch: { position: laminar/b58/fuel_selector_R, up: laminar/b58/fuel_selector_R_up, down: laminar/b58/fuel_selector_R_dwn, min: 0, max: 1, wrap: false }
+    positions:
+      - { key: "off", spoken: "off", value: 0 }
+      - { key: "on",  spoken: "on",  value: 1 }
+
+# Constant-speed props, 2700 RPM redline (POM: "3 blade metal, constant speed").
+# Cruise and low-pitch figures are the usual Baron settings — VERIFY against the
+# POM's power tables before trusting "props to cruise" as a number rather than
+# a direction.
+prop:
+  dataref: sim/cockpit2/engine/actuators/prop_rotation_speed_rad_sec_all
+  max_rpm: 2700
+  cruise_rpm: 2500
+  min_rpm: 2100
+
+# One battery, two alternators (one per engine), plus the avionics master.
+# Commands and readbacks from the cockpitdecks Baron deck. On/off commands
+# rather than the deck's toggles on purpose: a toggle fired as "on" turns the
+# system OFF whenever it was already on (the Citation X avionics trap).
+electrical:
+  - { key: battery,     spoken: battery,          on_commands: [sim/electrical/battery_1_on],   off_commands: [sim/electrical/battery_1_off],   readback: ["sim/cockpit2/electrical/battery_on[0]"] }
+  - { key: alternator1, spoken: left alternator,  on_commands: [sim/electrical/generator_1_on], off_commands: [sim/electrical/generator_1_off], readback: ["sim/cockpit2/electrical/generator_on[0]"] }
+  - { key: alternator2, spoken: right alternator, on_commands: [sim/electrical/generator_2_on], off_commands: [sim/electrical/generator_2_off], readback: ["sim/cockpit2/electrical/generator_on[1]"] }
+  - { key: alternators, spoken: both alternators, on_commands: [sim/electrical/generator_1_on, sim/electrical/generator_2_on], off_commands: [sim/electrical/generator_1_off, sim/electrical/generator_2_off], readback: ["sim/cockpit2/electrical/generator_on[0]", "sim/cockpit2/electrical/generator_on[1]"] }
+  - { key: avionics,    spoken: avionics master,  on_commands: [sim/systems/avionics_on],       off_commands: [sim/systems/avionics_off],       readback: [sim/cockpit/electrical/avionics_on] }
+
+# Panel flood lighting (laminar/b58 custom switch, from the deck config).
+flood_lights: true
+flood_lights_dataref: laminar/b58/lighting/flood_light_switch
+
+# Three flap positions (POM: "The Baron has three flap positions"; acf
+# `_flap_detents 2`, i.e. two beyond up). The per-notch Vfe split is the reason
+# this can't be a generic flap layer: the acf carries Vfe1 152 for approach
+# flap and Vfem 122 for full, and the POM's single "Vfe 152" would let the
+# copilot put full flap out 30 knots too fast. Takeoff is clean.
+flaps:
+  takeoff_ratio: 0.0
+  detents:
+    - { label: up,       spoken: up,       ratio: 0.0 }
+    - { label: approach, spoken: approach, ratio: 0.5, vfe_kts: 152.0 }
+    - { label: full,     spoken: full,     ratio: 1.0, vfe_kts: 122.0 }
+
+# Clean stall driving the airspeed monitor. The acf flies 84 KIAS; the POM's
+# card says 80. The higher number is the one the aircraft will actually stall
+# at in the sim, so the monitor uses it and the recited card below keeps the
+# POM's figure.
+vs_clean_kts: 84.0
+
+# Never-exceed (acf `_Vne_kts`, POM agrees) — drives the overspeed callout.
+vne_kts: 223.0
+
+# Fuel-endurance alerting. 194 gal capacity at the POM's 32 gal/hr:
+# 32 gal/hr x 2.72 kg/gal (avgas) = 87 kg/hr.
+fuel:
+  reserve_caution_min: 45.0
+  reserve_warning_min: 30.0
+  cruise_burn_kg_hr: 87.0
+
+# Static reference figures recited on request. Speeds are the POM's operational
+# speeds page (which matches the acf except for the clean stall noted above);
+# weights, ceiling, fuel and ground roll are its specification page.
+reference:
+  kind: twin-engine aircraft
+  vno_kts: 195.0             # POM "Maximum Structural Cruise Speed (Vc)"
+  va_kts: 156.0
+  vx_kts: 92.0
+  vy_kts: 105.0
+  vr_kts: 85.0
+  vs0_kts: 74.0
+  vyse_kts: 100.0            # blue line — single-engine best rate
+  vmca_kts: 84.0             # single-engine minimum control speed
+  approach_kts: 100.0        # VERIFY: flown at blue line until short final
+  cruise_kts: 202.0          # POM "Max. Cruise Speed"
+  cruise_ias_kts: 180.0      # VERIFY: what full auto sets the bug to in cruise
+  best_climb_fpm: 1700.0     # VERIFY against the POM climb chart
+  max_crosswind_kts: 22.0    # VERIFY: the type's demonstrated crosswind
+  max_gross_lb: 5500.0       # POM "Max. Takeoff Weight"
+  empty_weight_lb: 4030.0    # POM "Basic Empty Weight" (X-Plane's model: 3,983)
+  useful_load_lb: 1494.0
+  service_ceiling_ft: 20688.0
+  fuel_capacity_gal: 194.0
+  endurance_hours: 5.5       # 194 gal at 32 gal/hr, less what is unusable
+  takeoff_roll_ft: 1373.0    # POM GROUND ROLL — the figure the automation checks
+                             # a runway against, deliberately not a factored
+                             # field length (see CLAUDE.md on the MD-82)
+  max_rpm: 2700.0
+
+# Lights — datarefs and commands from the cockpitdecks Baron deck. The landing
+# lights are TWO independent switches, one per wing: they are written together
+# rather than commanded, because switching only one leaves the aircraft half
+# lit while the readback happily confirms the half it looked at (the Citation X
+# lesson, 2026-07-28).
+lights:
+  - { key: nav,     spoken: nav lights,     dataref: sim/cockpit2/switches/navigation_lights_on, command_on: sim/lights/nav_lights_on,    command_off: sim/lights/nav_lights_off }
+  - { key: strobe,  spoken: strobe lights,  dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: sim/lights/strobe_lights_on, command_off: sim/lights/strobe_lights_off }
+  - { key: beacon,  spoken: beacon,         dataref: sim/cockpit2/switches/beacon_on,            command_on: sim/lights/beacon_lights_on, command_off: sim/lights/beacon_lights_off }
+  - { key: taxi,    spoken: taxi light,     dataref: sim/cockpit/electrical/taxi_light_on,       command_on: sim/lights/taxi_lights_on,   command_off: sim/lights/taxi_lights_off }
+  - { key: landing, spoken: landing lights, dataref: "sim/cockpit2/switches/landing_lights_switch[0]", also_datarefs: ["sim/cockpit2/switches/landing_lights_switch[1]"] }
+
+# No XChecklist file ships for this airframe, so there is no `checklist` /
+# `checklist_map` block and no `locations` — cockpit geography is answered from
+# a verified layout or not at all, never guessed.

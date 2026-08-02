@@ -194,9 +194,21 @@ pub fn throttle_adjust(err_kts: f64, trend_kts_s: f64) -> f64 {
     if err_kts.abs() < 1.5 && trend_kts_s.abs() < 1.0 {
         return 0.0; // in the groove and steady: hands off
     }
-    let p = err_kts * 0.003;
-    let d = -trend_kts_s * 0.008; // decaying speed → positive (add power) early
-    let max_up = if err_kts > 10.0 || trend_kts_s < -3.0 {
+    // Act on the error we are HEADED FOR, not the one on the dial. The old
+    // P+D was algebraically this same projection at 2.7 s of lead, which is
+    // shorter than the lever's own slew: the circuit took the Baron at 131 kt
+    // off a takeoff handoff, pulled hard for a 109 kt target, and was STILL
+    // pulling at 124 with the speed already falling 2.5 kt/s toward it — the
+    // sag ran through the target to 98.7, one knot below blue line, and full
+    // recovery authority only arrived at the old gate's raw err > 10, i.e.
+    // once the aircraft was ALREADY 10 kt slow. The climb limiter then cut
+    // the climb to zero and the aircraft porpoised at 700 ft AGL (EGHI,
+    // 2026-08-02). Five seconds of lead stops the pull while the excess is
+    // still burning off and brings the power back before the undershoot, and
+    // the escalation gates watch the SAME projection — urgency about where
+    // the speed will be, not where it was.
+    let proj = err_kts - trend_kts_s * THROTTLE_LEAD_S;
+    let max_up = if proj > 10.0 {
         0.04
     } else {
         0.015
@@ -207,13 +219,19 @@ pub fn throttle_adjust(err_kts: f64, trend_kts_s: f64) -> f64 {
     // circuit's law pulled the lever at the polite rate the whole way (SF50,
     // Luton 2026-07-28). Well past the target, or building fast: pull like
     // you mean it. Overspeed is a comfort problem right up until it's Vmo.
-    let max_down = if err_kts < -10.0 || trend_kts_s > 3.0 {
+    let max_down = if proj < -10.0 {
         0.04
     } else {
         0.015
     };
-    (p + d).clamp(-max_down, max_up)
+    (proj * 0.003).clamp(-max_down, max_up)
 }
+
+/// How far ahead [`throttle_adjust`] projects the airspeed, seconds. Longer
+/// than the lever slew it has to lead — 2.7 s (the old implicit lead) let a
+/// hard pull overshoot the target by ten knots — and the same order as the
+/// climb limiter's and altitude capture's leads.
+const THROTTLE_LEAD_S: f64 = 5.0;
 
 /// Sanity bounds for a spoken flight target — outside this it's a mishear.
 pub fn clamp_target(kts: f64) -> f64 {
@@ -952,6 +970,36 @@ mod tests {
             0.04,
             "fast decay unlocks urgency"
         );
+    }
+
+    /// The takeoff-handoff transient (EGHI Baron, 2026-08-02): the circuit
+    /// inherits 131 kt at full power against a 109 kt target, and the old law
+    /// was still pulling at 124 with the speed already falling 2.5 kt/s — the
+    /// sag ran to 98.7, below blue line, the climb limiter cut to zero, and
+    /// the aircraft porpoised at 700 ft AGL. The law must ease off while the
+    /// excess is burning and bring power back BEFORE the undershoot.
+    #[test]
+    fn the_pull_eases_before_the_target_and_power_returns_before_the_sag() {
+        // 15 kt fast but plunging toward the target: no more than a polite
+        // pull — the plunge is doing the work.
+        assert!(
+            throttle_adjust(-15.0, -2.5) > -0.015,
+            "still pulling hard with the speed already falling"
+        );
+        // 6 kt fast and plunging: power is already coming BACK.
+        assert!(
+            throttle_adjust(-5.8, -2.5) > 0.01,
+            "the sag is five seconds out — the lever must be moving up now"
+        );
+        // On target and falling 2 kt/s: full recovery authority, not the
+        // polite step the old raw-error gate allowed until 10 kt slow.
+        assert!(
+            throttle_adjust(1.2, -2.0) > 0.03,
+            "recovery urgency must key off the projection"
+        );
+        // The mirror case stays urgent: near target but accelerating hard is
+        // the SF50 runaway, and the projection pulls at the big clamp.
+        assert_eq!(throttle_adjust(-5.0, 4.0), -0.04);
     }
 
     #[test]

@@ -706,6 +706,15 @@ pub struct ReferenceProfile {
     pub vy_kts: Option<f64>, // best rate of climb
     #[serde(default)]
     pub vr_kts: Option<f64>, // rotate
+    /// Blue line: single-engine best rate of climb. A TWIN's number — the one
+    /// speed a multi pilot flies the whole engine-failure drill against — and
+    /// meaningless on a single, so it stays `None` there.
+    #[serde(default)]
+    pub vyse_kts: Option<f64>,
+    /// Red line: single-engine minimum control speed. The other half of the
+    /// twin pair above.
+    #[serde(default)]
+    pub vmca_kts: Option<f64>,
     #[serde(default)]
     pub best_glide_kts: Option<f64>,
     #[serde(default)]
@@ -1211,6 +1220,83 @@ mod tests {
         assert_eq!(mix.notches.last().map(|n| n.value), Some(3)); // full rich
     }
 
+    /// The Baron is the first STOCK piston twin: unlike the DC-3 (every system
+    /// xlua-overridden) the generic tools drive it directly, so what this test
+    /// guards is that the twin-ness actually reaches them.
+    #[test]
+    fn beechcraft_baron_58_yaml_loads() {
+        let text = std::fs::read_to_string("profiles/beechcraft_baron_58.yaml").unwrap();
+        let p: AircraftProfile = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("beechcraft_baron_58.yaml failed to parse: {e:#}"));
+        assert_eq!(p.id, "beechcraft_baron_58");
+
+        // Twin, generic piston group. `engines` is what makes the magneto and
+        // start tools write both engines rather than only number one.
+        assert_eq!(p.engines, 2);
+        assert!(p.engine && p.magnetos && p.fuel_pump);
+        assert!(!p.magnetos_per_engine); // ignition_key, not the DC-3's ignition_on
+        assert!(!p.carb_heat); // IO-550, fuel injected
+        assert!(!p.turbine_start && p.piston_start.is_none());
+
+        // Per-side fuel selectors, cycle-driven. Without these the start
+        // sequence cranks two dry engines: they sit at OFF cold, and their
+        // position dataref is read-only, so only the command can open them.
+        assert_eq!(p.fuel_selectors.len(), 2);
+        let (l, r) = (&p.fuel_selectors[0], &p.fuel_selectors[1]);
+        assert_eq!((l.engine, r.engine), (0, 1));
+        assert_eq!((l.start_value, r.start_value), (Some(1), Some(1)));
+        assert!(l.switch.up.ends_with("_L_up") && r.switch.up.ends_with("_R_up"));
+        // Never step onto a position we have not proven exists in the sim.
+        assert_eq!((l.switch.min, l.switch.max), (0, 1));
+        assert!(!l.switch.wrap, "off must not wrap round from on");
+
+        // Retractable gear with a limit — the 172's whole reason for having no
+        // gear tool is that it has none.
+        assert!(p.retractable_gear);
+        assert_eq!(p.vlo_kts, Some(152.0));
+
+        // Per-notch Vfe is the point of a flap profile: approach flap is good to
+        // 152 KIAS and full only to 122, and one figure for both would put full
+        // flap out thirty knots early.
+        let flaps = p.flaps.as_ref().expect("baron flaps");
+        assert_eq!(flaps.detents.len(), 3);
+        assert_eq!(flaps.takeoff_ratio, Some(0.0)); // clean takeoff
+        let vfe: Vec<Option<f64>> = flaps.detents.iter().map(|d| d.vfe_kts).collect();
+        assert_eq!(vfe, vec![None, Some(152.0), Some(122.0)]);
+
+        // The twin speeds a multi pilot actually asks for.
+        let r = p.reference.as_ref().expect("baron reference");
+        assert_eq!(r.vyse_kts, Some(100.0)); // blue line
+        assert_eq!(r.vmca_kts, Some(84.0));
+        assert_eq!(r.kind.as_deref(), Some("twin-engine aircraft"));
+        // The ground roll, not a factored field length (the MD-82 lesson).
+        assert_eq!(r.takeoff_roll_ft, Some(1373.0));
+
+        // Two independent landing-light switches, written together: switching
+        // one leaves the aircraft half lit with a readback that confirms the
+        // half it looked at (the Citation X trap).
+        let landing = p
+            .lights
+            .iter()
+            .find(|l| l.key == "landing")
+            .expect("baron landing light");
+        assert_eq!(landing.also_datarefs.len(), 1);
+        assert!(landing.command_on.is_none(), "written, never commanded");
+
+        // One battery, one alternator per engine, plus the pair and avionics.
+        let keys: Vec<&str> = p.electrical.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "battery",
+                "alternator1",
+                "alternator2",
+                "alternators",
+                "avionics"
+            ]
+        );
+    }
+
     #[test]
     fn king_air_c90b_yaml_loads() {
         // YAML-only profile. Deserialize directly so a malformed field fails here
@@ -1657,6 +1743,8 @@ fn cessna_172sp() -> AircraftProfile {
             va_kts: Some(99.0),
             vx_kts: Some(62.0),
             vy_kts: Some(74.0),
+            vyse_kts: None,
+            vmca_kts: None,
             vr_kts: Some(55.0),
             best_glide_kts: Some(68.0),
             vs0_kts: Some(40.0),
@@ -1980,6 +2068,8 @@ fn cirrus_sr22() -> AircraftProfile {
             va_kts: Some(133.0),
             vx_kts: Some(88.0),
             vy_kts: Some(101.0),
+            vyse_kts: None,
+            vmca_kts: None,
             vr_kts: Some(73.0),
             best_glide_kts: Some(88.0),
             vs0_kts: Some(60.0),

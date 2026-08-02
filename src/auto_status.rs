@@ -99,7 +99,17 @@ pub fn compose() -> String {
 /// actually running — cancelling is per-automation in the grammar ("cancel
 /// full auto", "abort takeoff"), so the button must choose like a pilot would.
 /// Full auto outranks its own sub-loops because its cancel cascades into all
-/// of them. A bare speed hold is not covered here: "MY CONTROLS" releases it.
+/// of them.
+///
+/// NEVER None: the fallback is "my controls", the universal hand-back
+/// (autopilot off, every hold released). The old None was returned exactly
+/// when the pilot most needed the button: after the missed-approach give-up
+/// every ACTIVE flag was already false — full auto had given up, autoland had
+/// broken out — while the AP still flew the aircraft with landing flap out
+/// and decaying airspeed, and CANCEL mapped to nothing and was silently
+/// consumed (EGHI, 2026-08-02). An abort button that goes dead precisely when
+/// things have gone wrong is worse than none; "stop everything, give it to
+/// me" must always be available, and covers the bare speed hold too.
 pub fn cancel_phrase() -> Option<&'static str> {
     if full_auto::ACTIVE.load(Relaxed) {
         return Some("cancel full auto");
@@ -122,7 +132,7 @@ pub fn cancel_phrase() -> Option<&'static str> {
     if autotaxi::driving() {
         return Some("cancel auto taxi");
     }
-    None
+    Some("my controls")
 }
 
 /// Panel request codes → the English command each button speaks. The single

@@ -3236,5 +3236,10 @@ mod tests {
             one("cancel auto taxi").unwrap(),
             ("auto_taxi".into(), json!({"off": true}))
         );
+        // ...and the nothing-running fallback: CANCEL is never a dead button.
+        // After the missed-approach give-up every ACTIVE flag was false while
+        // the AP still flew the aircraft dirty and slow, and CANCEL mapped to
+        // None and did nothing, silently (EGHI, 2026-08-02).
+        assert_eq!(one("my controls").unwrap().0, "autopilot_off");
     }
 }

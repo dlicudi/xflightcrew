@@ -103,10 +103,46 @@ const AP_BANK_DEG: f64 = 14.0;
 /// Max heading-bug movement per 500 ms tick, degrees — see [`slew_bug`].
 const BUG_SLEW_PER_TICK: f64 = 40.0;
 
-/// Coordinated-turn radius at `gs_mps`, meters: v²/(g·tan φ). Clamped to sane
-/// pattern bounds so a bad speed read can't produce a degenerate geometry.
+/// The bank the AP was MEASURED to fly, for the one dimension where being
+/// conservative is the error rather than the safeguard.
+///
+/// `AP_BANK_DEG` above is deliberately shallow because everything it sizes —
+/// pattern width, downwind length — is safe when it comes out too big and
+/// broke the pattern into figure-eights when it came out too small. The
+/// base-to-final capture is the exception: it is a distance the aircraft turns
+/// IN, so over-estimating it starts the turn early and rolls out SHORT of the
+/// centreline. Southampton, the Baron: the model wanted 1.3 x 1,443 = 1,876 m,
+/// the aircraft actually turned in 1,048, and it rolled out 776 m to the side
+/// (the arithmetic predicts 828 — see the test). Back-solved from that turn at
+/// the real approach groundspeed the AP was banking 15.8 degrees, not 14.
+/// Rounded a little shallow so the turn still errs EARLY, because with the
+/// final leg's intercept an early roll-out is a gentle closure while a late
+/// one is an S-turn across the centreline.
+const AP_BANK_FINAL_DEG: f64 = 15.5;
+
+/// Coordinated-turn radius at `gs_mps` and `bank_deg`, meters: v²/(g·tan φ).
+/// Clamped to sane pattern bounds so a bad speed read can't produce a
+/// degenerate geometry.
+pub fn turn_radius_at(gs_mps: f64, bank_deg: f64) -> f64 {
+    (gs_mps * gs_mps / (9.81 * bank_deg.to_radians().tan())).clamp(250.0, 2500.0)
+}
+
+/// Pattern turn radius — the conservative one, sizing every leg but the
+/// base-to-final capture.
 pub fn turn_radius_m(gs_mps: f64) -> f64 {
-    (gs_mps * gs_mps / (9.81 * AP_BANK_DEG.to_radians().tan())).clamp(250.0, 2500.0)
+    turn_radius_at(gs_mps, AP_BANK_DEG)
+}
+
+/// The radius the BASE-TO-FINAL turn is actually flown at: the approach-leg
+/// speed with no padding, at the measured bank.
+///
+/// Both of the pattern estimate's safety margins point the wrong way here. It
+/// pads the speed by 1.1 (59.4 m/s against the 54.0 the aircraft flew) and it
+/// banks shallow, and each one makes the radius BIGGER, which starts the turn
+/// EARLIER, which is what left three quarters of a radius of offset for the
+/// final leg to deal with.
+pub fn final_turn_radius_m(approach_kts: f64) -> f64 {
+    turn_radius_at(approach_kts.max(60.0) * 0.514_444, AP_BANK_FINAL_DEG)
 }
 
 /// The pattern's dimensions, all derived from one turn radius.
@@ -128,7 +164,17 @@ pub struct Geometry {
 }
 
 impl Geometry {
+    /// One radius for the whole pattern — the shape tests use, and the right
+    /// answer whenever the pattern and approach speeds are the same.
     pub fn for_radius(r: f64) -> Geometry {
+        Geometry::for_radii(r, r)
+    }
+
+    /// `r` sizes the pattern; `final_r` sizes only the base-to-final capture,
+    /// which is turned at the approach speed and is the one dimension where
+    /// an over-estimate rolls out SHORT of the centreline instead of merely
+    /// flying a wider box. See [`final_turn_radius_m`].
+    pub fn for_radii(r: f64, final_r: f64) -> Geometry {
         Geometry {
             upwind_past_m: (0.5 * r).max(300.0),
             width_m: (2.2 * r).max(900.0),
@@ -137,7 +183,7 @@ impl Geometry {
             // base leg ridden by a tailwind turns wider — one radius rolled
             // out south of the centreline (the overshoot, 2026-07-24).
             // Rolling out slightly EARLY is free; autoland tracks in.
-            final_capture_m: (1.3 * r).max(250.0),
+            final_capture_m: (1.3 * final_r).max(250.0),
             lead_m: 0.9 * r,
         }
     }
@@ -160,6 +206,125 @@ const INTERCEPT_MARGIN: f64 = 1.3;
 pub fn interceptable(xtk_m: f64, along_m: f64) -> bool {
     let need = xtk_m.abs() / MAX_INTERCEPT_CUT_DEG.to_radians().tan();
     along_m >= need * INTERCEPT_MARGIN
+}
+
+/// How near the runway course counts as "our turn has rolled out".
+const ROLLED_OUT_HDG_DEG: f64 = 12.0;
+/// Distance still to run below which we hand over regardless of alignment: a
+/// turn that has gone wrong is still better flown by autoland's intercept than
+/// by a pattern leg that has run out of room.
+const LAST_DITCH_ALONG_M: f64 = 1500.0;
+/// ...and how far off the centreline the valve will still accept. Twice the
+/// established tolerance: enough that a turn which merely finished untidily
+/// still gets handed over rather than flown into the ground by a pattern leg,
+/// and tight enough that the 776 m diagonal never qualifies.
+const LAST_DITCH_XTK_M: f64 = 2.0 * ESTABLISHED_XTK_M;
+
+/// Is the aircraft ready to be handed to autoland?
+///
+/// Three conditions, and the middle one is the one that was missing.
+/// `interceptable` asks whether autoland COULD close the offset; being able to
+/// close it is not the same as being lined up. The circuit's own final leg
+/// commands the runway heading and nothing else — it has no intercept — so the
+/// turn onto final is the only thing that ever puts the aircraft on the
+/// centreline, and releasing at the instant that turn is ARMED means it is
+/// never flown at all.
+///
+/// EGHI, 2026-08-01, a Baron: base was crossing at 290° with 1,813 m still to
+/// go to the centreline and 4,092 m to run. `interceptable` said yes (a 28°
+/// cut), so autoland took it there and flew the diagonal in — the aircraft
+/// approached and touched down at an angle instead of rolling out on the
+/// centreline and flying a straight final. The turn was armed and then
+/// immediately handed away.
+///
+/// So: wait until our own turn has actually rolled out onto the runway course
+/// (by which point the geometry leaves ~0.3 radii to trim, which is what
+/// autoland's final pursuit is for), unless we are running out of distance.
+pub fn ready_for_autoland(xtk_m: f64, along_m: f64, hdg_err_deg: f64) -> bool {
+    if !interceptable(xtk_m, along_m) {
+        return false;
+    }
+    // The last-ditch valve: out of room, and autoland's intercept beats a
+    // pattern leg with nowhere left to go. It bypasses the alignment test
+    // below, so it must not become the normal way we hand over — it existed
+    // because the final leg had no intercept of its own and genuinely could
+    // not close an offset. It has one now, so the valve is for a turn that
+    // went WRONG, not for one that simply hasn't finished: a big offset this
+    // close in is exactly the angled arrival the test below exists to
+    // prevent, and handing it over is not better than flying the intercept.
+    if along_m.abs() <= LAST_DITCH_ALONG_M && xtk_m.abs() <= LAST_DITCH_XTK_M {
+        return true;
+    }
+    // Rolled out on the runway HEADING is not established on the runway
+    // CENTRELINE, and the difference is a landing at an angle. The 2026-07-30
+    // fix added the heading test after a handover on base flew the diagonal
+    // in; at Southampton the heading test passed — 8 degrees, comfortably
+    // rolled out — with the aircraft 776 m to the side, flying parallel.
+    // Autoland's pursuit then had to close 776 m in 1.7 nm on top of an
+    // approach it was already high on, and the aircraft crossed the threshold
+    // still 6 degrees off the runway heading, still turning (2026-08-01).
+    // Established means BOTH, and the final leg's own intercept is what gets
+    // us there (see `final_intercept_hdg`).
+    hdg_err_deg.abs() <= ROLLED_OUT_HDG_DEG && xtk_m.abs() <= ESTABLISHED_XTK_M
+}
+
+/// How close to the centreline counts as ESTABLISHED, metres.
+///
+/// This is the 0.3 radii of trim the pattern geometry was always designed to
+/// leave, and it is what autoland's final pursuit is for. What failed at
+/// Southampton was not the existence of a residual but its SIZE: 776 m, most
+/// of a radius, handed over on top of an approach already 206 ft high, and
+/// autoland was still turning as it crossed the threshold. Half that, on a
+/// path, is a trim; three quarters of a radius is a diagonal.
+///
+/// Not tighter, deliberately: the final leg's intercept has to be able to
+/// actually REACH this before the handoff, and a gate the leg cannot satisfy
+/// deadlocks into the last-ditch valve, which hands over the very thing this
+/// exists to prevent.
+const ESTABLISHED_XTK_M: f64 = 300.0;
+
+/// The steepest cut the final leg will take toward the centreline. The
+/// standard intercept angle for an instrument approach, and comfortably inside
+/// autoland's own 35-degree pursuit limit, so a leg flown at the cap still
+/// hands over something interceptable.
+const MAX_FINAL_CUT_DEG: f64 = 30.0;
+
+/// How far ahead the final leg aims when closing the centreline.
+///
+/// Sets how long the cut stays at the cap: the full 30 degrees holds until the
+/// offset is inside `FINAL_AIM_M * tan(30)`, about 520 m, and fades from
+/// there. A gentler aim reads better on paper and does not work — at 2,000 m
+/// the cut had faded to 8 degrees by the time the offset was down to 300, and
+/// the simulated intercept from the live roll-out only just made the
+/// centreline before it ran out of runway. Hold the intercept like an
+/// instrument approach does, then wash it out.
+const FINAL_AIM_M: f64 = 900.0;
+
+/// The heading the FINAL leg flies: the runway course, cut toward the
+/// centreline in proportion to how far off it we are.
+///
+/// The final leg used to command the runway course and nothing else, which
+/// makes it a leg that flies PARALLEL to the centreline forever. That was
+/// survivable only while the turn onto final was assumed to roll out on the
+/// line — and it does not. `final_capture_m` is 1.3 turn radii deliberately
+/// ("rolling out slightly EARLY is free; autoland tracks in"), but the radius
+/// model over-estimates what the autopilot actually flies: at Southampton the
+/// turn began 1,850 m out and consumed only ~1,050 m, so it rolled out 776 m
+/// short of the centreline and then held runway heading all the way to the
+/// handoff, closing almost nothing (2026-08-01). "Slightly early" was three
+/// quarters of a radius, and free it was not.
+///
+/// Pure pursuit at a point down the centreline, capped — the same shape the
+/// taxi steering uses, for the same reason: it is a turn a real aeroplane can
+/// fly, and it fades to zero as the offset closes instead of overshooting.
+pub fn final_intercept_hdg(course_deg: f64, xtk_m: f64) -> f64 {
+    let cut = (xtk_m.abs() / FINAL_AIM_M)
+        .atan()
+        .to_degrees()
+        .min(MAX_FINAL_CUT_DEG);
+    // Positive cross-track is right of the course, so close it by cutting
+    // LEFT, and the other way about.
+    (course_deg - xtk_m.signum() * cut).rem_euclid(360.0)
 }
 
 /// Floor for the base/final descent, feet above the field — the lowest the
@@ -226,11 +391,50 @@ pub fn alt_capture_vs(target_ft: f64, alt_ft: f64, vs_fpm: f64) -> f64 {
 /// threshold 70 ft up and went around). Where the path is lower than the
 /// floor, the path is the answer: it is converging on the runway, which is
 /// the one place we are allowed to be low.
-pub fn approach_leg_alt_ft(field_elev_ft: f64, tpa_msl_ft: f64, a_m: f64, x_m: f64) -> f64 {
-    let dist_nm = (a_m.abs() + x_m.abs()) / M_PER_NM;
+pub fn approach_leg_alt_ft(field_elev_ft: f64, tpa_msl_ft: f64, dist_m: f64) -> f64 {
+    let dist_nm = dist_m.abs() / M_PER_NM;
     let path = field_elev_ft + dist_nm * crate::autoland::GLIDEPATH_FT_PER_NM;
     let floor = (field_elev_ft + HANDOFF_AGL_FT).min(path);
     path.clamp(floor, tpa_msl_ft.max(floor))
+}
+
+/// The distance a leg's glidepath target is computed against: how far the
+/// aircraft still has to go DOWN THE APPROACH COURSE, which is not the same as
+/// how far away it is.
+///
+/// This used to be track miles — along-track plus cross-track — and the
+/// cross-track term is what wrecked the approach. A 3° path is flown against
+/// distance-to-threshold along the FINAL APPROACH COURSE; adding the lateral
+/// offset inflates the target by exactly however far off the centreline you
+/// are, and on a base leg that is the whole leg. At Southampton the Baron
+/// began base 3,324 m off the centreline, so track miles read 3.33 nm and
+/// asked for 1,101 ft when the real distance to the threshold was 1.53 nm and
+/// the path was at 529. The aircraft flew base and most of final level at
+/// 800 ft AGL; the target only fell below it eleven seconds before the
+/// handoff; autoland inherited an aircraft 206 ft high at 1.7 nm, flew the
+/// whole final high, crossed the threshold 80 ft up at 102 knots and went
+/// around (2026-08-01).
+///
+/// But plain along-track is wrong too, and wrong in the dangerous direction.
+/// On base the aircraft is flying ACROSS the extended centreline, so its
+/// along-track distance GROWS to a peak at the roll-out and only then starts
+/// shrinking. Aiming at the path for the distance we have *now* means aiming
+/// at a path for a point we are about to move further away from — at the same
+/// stand that reads 529 ft with 3.3 km still to fly, which is a dive to
+/// nowhere.
+///
+/// So base aims at the roll-out: the path altitude at the distance the turn
+/// onto final will actually deliver us to, which the pattern geometry already
+/// knows as `downwind_past_m` (predicted 4,087 m, flown 3,966 — close enough
+/// to fly). Final then follows the real along-track distance down. That is
+/// also simply how an approach works: platform until the path meets you, then
+/// down the path.
+pub fn path_dist_m(leg: Leg, a_m: f64, rollout_m: f64) -> f64 {
+    match leg {
+        // Never nearer than where the roll-out puts us.
+        Leg::Base => a_m.abs().max(rollout_m),
+        _ => a_m.abs(),
+    }
 }
 
 /// Height to be down to by the base turn, AGL. The pattern used to hold TPA
@@ -250,11 +454,27 @@ const DOWNWIND_DESCENT_AGL_FT: f64 = 800.0;
 /// clamps at 2.5. The MD-82's 200 kt was the same mistake in a milder form.
 /// A pattern at 1.5x the approach speed is what these aircraft actually fly,
 /// and for every GA profile Vy already sits below that, so nothing changes.
-pub fn pattern_speed_kts(vy_kts: f64, approach_ias: f64) -> f64 {
-    vy_kts
+pub fn pattern_speed_kts(vy_kts: f64, approach_ias: f64, vs_clean_kts: Option<f64>) -> f64 {
+    let base = vy_kts
         .max(60.0)
-        .min((approach_ias * PATTERN_MAX_APPROACH_MULT).max(60.0))
+        .min((approach_ias * PATTERN_MAX_APPROACH_MULT).max(60.0));
+    // ...and never near the CLEAN stall, because the pattern is flown clean.
+    // The Baron's Vy is 105 against an 84 kt clean stall — 1.25 Vs, which is
+    // four knots above the airspeed caution band (1.2 Vs = 100.8) and so every
+    // normal variation on downwind, base and final dipped into it. Six
+    // callouts in one circuit, and every one of them was correct: the aeroplane
+    // really was that close to the band. A flapped approach speed is not a
+    // clean pattern speed, and nothing here knew the difference.
+    let floor = vs_clean_kts.map_or(0.0, |v| v * PATTERN_MIN_STALL_MULT);
+    base.max(floor)
 }
+
+/// The clean pattern is flown no slower than this multiple of the CLEAN stall.
+/// 1.3 Vs is the usual approach minimum, and it is applied to the clean figure
+/// here because the circuit never lowers flap before the handoff. Only bites on
+/// an airframe whose Vy sits close to its clean stall — a 172 (Vy 74, stall 48)
+/// and an MD-82 (Vy 200, stall 100) are both untouched.
+const PATTERN_MIN_STALL_MULT: f64 = 1.3;
 
 /// The speed the base and final legs are flown at. Vy is a CLIMB speed: an
 /// MD-82 arrived on base at 226 KIAS against a 140 kt approach speed and handed
@@ -268,6 +488,108 @@ pub fn approach_leg_kts(pattern_kts: f64, approach_ias: f64) -> f64 {
     pattern_kts
         .min(approach_ias + APPROACH_LEG_MARGIN_KTS)
         .max(approach_ias)
+}
+
+/// How far ahead the climb limiter judges the airspeed, seconds. Long enough
+/// to lead the airframe's own response, short enough not to invent a speed:
+/// the same order as the altitude capture's lead.
+const CLIMB_SPEED_LEAD_S: f64 = 5.0;
+
+/// The slowest the pattern will climb toward: a floor under the speed
+/// protection below. Blue line where the airframe has one, else a margin over
+/// the clean stall.
+///
+/// A twin's Vyse is the honest number here and it is not a comfort figure —
+/// below blue line a light twin cannot climb on one engine at all, and the
+/// margin to Vmca is what is left of the pilot's options.
+pub fn climb_floor_kts(vyse_kts: Option<f64>, vs_clean_kts: Option<f64>) -> f64 {
+    let from_stall = vs_clean_kts.map(|v| v * 1.15);
+    match (vyse_kts, from_stall) {
+        (Some(a), Some(b)) => a.max(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => 0.0,
+    }
+}
+
+/// How much of a commanded CLIMB the airspeed will actually support. Scales
+/// the rate to zero as the speed falls from the pattern speed to the floor.
+///
+/// The autopilot's vertical mode buys rate with airspeed, and it will keep
+/// buying: a Baron 58 rolled into the crosswind turn at 127 kt and came out at
+/// 85 — one knot over its clean stall and one over Vmca — with the VS law
+/// still asking for 880 fpm and the stabilizer trimmed to the nose-up stop.
+/// Six airspeed callouts fired across one Southampton circuit and every one of
+/// them was right (2026-08-01). The throttle law alone cannot fix this: it is
+/// already commanding more power, and in a climbing turn on a piston twin
+/// there is none left to give. Lowering the nose is the other half, and it is
+/// the half a pilot would do first.
+///
+/// Only ever REDUCES a climb — descents (negative) pass through untouched, and
+/// an aircraft at or above its full-rate speed (see [`climb_full_rate_kts`])
+/// keeps the rate it asked for, so every airframe with power to spare is
+/// unchanged.
+pub fn climb_limit_fpm(
+    vs_cmd: f64,
+    ias: f64,
+    ias_trend_kts_per_s: f64,
+    want_kts: f64,
+    floor_kts: f64,
+) -> f64 {
+    if vs_cmd <= 0.0 || !ias.is_finite() || floor_kts <= 0.0 {
+        return vs_cmd;
+    }
+    // Judge the speed we are HEADING FOR, not the one on the dial. Reacting to
+    // the instantaneous reading made this a bang-bang gate and it limit-cycled
+    // live: the commanded rate went 700 to 0 in four seconds as the speed dipped
+    // through the band, HELD there while the aircraft was already accelerating
+    // back, then slammed open again — the aeroplane porpoising about thirty feet
+    // either side with a period near twenty-five seconds (2026-08-01, felt in the
+    // cockpit before it was seen in the log). The projection fixes both ends: it
+    // starts easing the climb off before the speed is lost, so the dip is
+    // shallower, and it gives the rate back as soon as the speed is genuinely
+    // recovering instead of waiting for it to arrive. Same lead trick
+    // `alt_capture_vs` uses on altitude and the stall callout uses on airspeed.
+    let ias = ias + ias_trend_kts_per_s * CLIMB_SPEED_LEAD_S;
+    // Full rate AT the pattern speed — that is the speed the airframe is meant
+    // to be climbing at, and an aircraft flying it correctly must never be
+    // penalised. The fade runs downward from there to the floor.
+    if ias >= want_kts {
+        return vs_cmd;
+    }
+    if ias <= floor_kts {
+        return 0.0;
+    }
+    // A pattern speed at or below the floor leaves nothing to fade across
+    // (the two checks above have already covered it).
+    vs_cmd * ((ias - floor_kts) / (want_kts - floor_kts))
+}
+
+/// The speed at which [`climb_limit_fpm`] grants the FULL commanded rate: the
+/// speed the climb is actually FLOWN at, never the leg target the throttle
+/// holds.
+///
+/// Those were the same number until the clean-stall floor raised the Baron's
+/// pattern speed to 109.2 kt — four knots ABOVE its Vy of 105 — and the two
+/// changes shipped the same evening without meeting. The throttle law holds
+/// the leg speed, so wiring that same speed in as the limiter's full-rate
+/// threshold parks the aircraft at the exact top of a nine-knot fade band:
+/// full climb is unreachable WHILE climbing (climbing at Vy is what the
+/// airframe does), and every knot of normal jitter swings the granted rate
+/// across half its range. Live it porpoised exactly as the projection was
+/// supposed to prevent — cmd_vs 700 to 0 on crosswind with the Baron
+/// DESCENDING at 190 fpm at 670 ft AGL mid-climb-out, then the whole downwind
+/// hung 100 ft below pattern altitude with the capture choked to 0-150 fpm
+/// and the speed see-sawing 104 to 113 on a 25 s cycle (EGHI, 2026-08-02).
+/// The unit test had pinned Vy as `want` all along; the call site passed the
+/// pattern speed, and the four-knot difference was the whole failure.
+///
+/// Capped below the leg speed (a jet's book Vy is a cruise-climb figure far
+/// above its pattern speed, and must not RAISE the threshold), and held a
+/// margin above the floor so a profile whose Vy sits at or under the floor
+/// still leaves a band to fade across instead of a cliff.
+pub fn climb_full_rate_kts(leg_kts: f64, vy_kts: f64, floor_kts: f64) -> f64 {
+    leg_kts.min(vy_kts).max(floor_kts + 2.0)
 }
 
 /// An airborne AGL below this after the takeoff loop exits means it REJECTED
@@ -386,6 +708,12 @@ pub struct Params {
     pub tpa_agl_ft: f64,
     /// Standard left-hand pattern unless the pilot asked for right.
     pub left_pattern: bool,
+    /// Clean stall speed, KIAS — the floor under the pattern speed, since the
+    /// circuit is flown clean. `None` leaves the speed as Vy alone.
+    pub vs_clean_kts: Option<f64>,
+    /// The slowest the pattern may climb toward, KIAS. See
+    /// [`climb_limit_fpm`]; 0 disables the protection.
+    pub climb_floor_kts: f64,
 }
 
 /// The four legs after the departure runway; `Final` is the handoff to autoland.
@@ -937,14 +1265,23 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // a bit) — fixed constants smaller than the turn diameter degenerated the
     // rectangle into loops (LXGB, 2026-07-24).
     let gs_est_mps = p.takeoff.vy_kts.max(60.0) * 0.514_444 * 1.1;
-    let geom = Geometry::for_radius(turn_radius_m(gs_est_mps));
     // The pattern SPEED the throttle holds in the loop (~Vy), so the flown turn
     // radius matches the geometry above — a pattern flown at climb power runs
     // away to Vne and balloons ~3x wider (LXGB, 2026-07-26). Captured here,
     // before `p.takeoff` is moved into the takeoff loop.
-    let pattern_kts = pattern_speed_kts(p.takeoff.vy_kts, p.approach_ias);
+    let pattern_kts = pattern_speed_kts(p.takeoff.vy_kts, p.approach_ias, p.vs_clean_kts);
     // ...and the speed the approach-setup legs are flown at.
     let approach_kts = approach_leg_kts(pattern_kts, p.approach_ias);
+    // Two radii, because the base-to-final turn is flown slower than the
+    // pattern and is the one dimension where an over-estimate rolls us out
+    // short of the centreline rather than merely wide.
+    let geom = Geometry::for_radii(turn_radius_m(gs_est_mps), final_turn_radius_m(approach_kts));
+    // The floor under the climb's speed protection, captured before `p` moves.
+    let p_climb_floor_kts = p.climb_floor_kts;
+    // ...and the speed the climb is flown at, for the limiter's full-rate
+    // threshold — NOT the leg speed the throttle holds (see
+    // `climb_full_rate_kts` for the four knots that cost a circuit).
+    let p_vy_kts = p.takeoff.vy_kts;
 
     // The world under BOTH candidate patterns: terrain probed from the sim
     // itself, and the no-go airspace polygons the G1000 draws (OpenAir file).
@@ -1248,13 +1585,20 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         let a_m = -along_track_nm(lat, lon, &rwy) * M_PER_NM;
         let x_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
 
-        // --- Hand over only when autoland can actually fly it. ---
-        // `turning_final` means the turn onto final is under way; the aircraft
-        // is still up to 1.3 radii abeam at that moment. Releasing there gave
-        // autoland 2,815 m of offset with 2,421 m to run — a 49° angle, no cut
-        // closes it — and it crossed the threshold 188 m off the paint. Fly
-        // our own turn, let go when the offset is closeable.
-        if turning_final && interceptable(x_m, a_m.abs()) {
+        // --- Hand over only once our own turn onto final has rolled out. ---
+        // `turning_final` means the turn may BEGIN; the aircraft is still up
+        // to 1.3 radii abeam at that instant, pointing across the centreline.
+        // See `ready_for_autoland` for why "autoland could close this" is not
+        // the same question as "we are lined up".
+        // A failed heading read reads as "not rolled out yet": it can only
+        // delay the handoff by a tick, where treating it as aligned would hand
+        // over the very thing this guard exists to prevent.
+        let hdg_err = psi_r
+            .as_ref()
+            .ok()
+            .map(|psi| ((psi - rwy_course + 540.0).rem_euclid(360.0)) - 180.0)
+            .unwrap_or(180.0);
+        if turning_final && ready_for_autoland(x_m, a_m.abs(), hdg_err) {
             let alt_msl = field_elev_ft + agl_ft;
             let arr = ArrivalCtx {
                 apt_dat: &p.apt_dat,
@@ -1308,7 +1652,15 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             }
             _ => 0.0,
         };
-        let want_hdg = leg_heading(rwy_course, leg, left) + crab;
+        // Every leg but the last flies its own heading. FINAL flies an
+        // intercept: it is the leg whose whole job is to be ON the centreline
+        // by the handoff, and commanding the bare runway course makes it a leg
+        // that flies parallel to the line it is supposed to join.
+        let leg_hdg = match leg {
+            Leg::Final => final_intercept_hdg(rwy_course, x_m),
+            _ => leg_heading(rwy_course, leg, left),
+        };
+        let want_hdg = leg_hdg + crab;
         let target_mag = true_to_mag(want_hdg, mag_var);
         bug_mag = slew_bug(bug_mag, target_mag, BUG_SLEW_PER_TICK);
         let _ = xp.set_float(HDG_BUG, bug_mag).await;
@@ -1387,7 +1739,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 // geometry does mid-turn, the target may fall and hold, never
                 // climb back — a target that rises is a level-off with the
                 // runway ahead, and the aircraft chases it every time.
-                let want = approach_leg_alt_ft(field_elev_ft, tpa_msl_ft, a_m, x_m);
+                let want = approach_leg_alt_ft(
+                    field_elev_ft,
+                    tpa_msl_ft,
+                    path_dist_m(leg, a_m, geom.downwind_past_m),
+                );
                 let t = descent_target.map_or(want, |d: f64| d.min(want));
                 descent_target = Some(t);
                 t
@@ -1419,11 +1775,24 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             }
             prev_alt = Some((alt_msl_ft, t_now));
         }
-        let vs_cmd = if alt_msl_ft.is_finite() {
+        let vs_want = if alt_msl_ft.is_finite() {
             alt_capture_vs(target_alt, alt_msl_ft, vs_est)
         } else {
             0.0
         };
+        // ...and only as much of it as the airspeed will pay for. The AP buys
+        // rate with knots, and on a piston twin in a climbing turn there is no
+        // power left to buy them back — see `climb_limit_fpm`.
+        let ias_read = match &ias_r {
+            Ok(v) => *v,
+            Err(_) => f64::NAN,
+        };
+        let want_now = match leg {
+            Leg::Base | Leg::Final => approach_kts,
+            _ => pattern_kts,
+        };
+        let full_kts = climb_full_rate_kts(want_now, p_vy_kts, p_climb_floor_kts);
+        let vs_cmd = climb_limit_fpm(vs_want, ias_read, ias_trend, full_kts, p_climb_floor_kts);
         if !vs_on {
             let _ = xp.run_command(CMD_VS_MODE).await;
             last_vs_cmd = None; // engage synced the dial; force a rewrite
@@ -1628,13 +1997,13 @@ mod tests {
     fn the_base_leg_descends_the_path_not_to_a_flat_height() {
         let (elev, tpa) = (520.0, 520.0 + 1500.0);
         // 4 nm out on the centreline: the 3° path is ~1,272 ft above the field.
-        let far = approach_leg_alt_ft(elev, tpa, -4.0 * M_PER_NM, 0.0);
+        let far = approach_leg_alt_ft(elev, tpa, -4.0 * M_PER_NM);
         assert!(
             (far - (elev + 4.0 * crate::autoland::GLIDEPATH_FT_PER_NM)).abs() < 1.0,
             "should target the path, got {far}"
         );
         // Closer in, the path is lower — and the leg follows it down.
-        let near = approach_leg_alt_ft(elev, tpa, -2.5 * M_PER_NM, 0.0);
+        let near = approach_leg_alt_ft(elev, tpa, -2.5 * M_PER_NM);
         assert!(near < far, "{near} !< {far}");
         // The floor may not hold us ABOVE the path. It used to: a flat
         // 700 ft AGL bottom meant that on any pattern turning final inside
@@ -1642,7 +2011,7 @@ mod tests {
         // the path it was trying to join. The SF50's 1.84 nm final at EGHI met
         // a path at 585 ft AGL and the floor sat 115 ft on top of it
         // (2026-07-30). Close in, the path wins.
-        let short_final = approach_leg_alt_ft(elev, tpa, -0.2 * M_PER_NM, 0.0);
+        let short_final = approach_leg_alt_ft(elev, tpa, -0.2 * M_PER_NM);
         let path_there = elev + 0.2 * crate::autoland::GLIDEPATH_FT_PER_NM;
         assert!(
             (short_final - path_there).abs() < 1.0,
@@ -1656,7 +2025,7 @@ mod tests {
         // The EGHI geometry that produced the go-around: 1.84 nm final, field
         // at 41 ft, jet pattern. The handover must not be above the path.
         let (eghi, jet_tpa) = (41.0, 41.0 + 1184.0);
-        let handover = approach_leg_alt_ft(eghi, jet_tpa, -1.84 * M_PER_NM, 0.0);
+        let handover = approach_leg_alt_ft(eghi, jet_tpa, -1.84 * M_PER_NM);
         let eghi_path = eghi + 1.84 * crate::autoland::GLIDEPATH_FT_PER_NM;
         assert!(
             handover <= eghi_path + 1.0,
@@ -1668,7 +2037,7 @@ mod tests {
         // 1,000 ft circuit is below the path at 4 nm).
         let ga_tpa = elev + 1000.0;
         assert_eq!(
-            approach_leg_alt_ft(elev, ga_tpa, -4.0 * M_PER_NM, 0.0),
+            approach_leg_alt_ft(elev, ga_tpa, -4.0 * M_PER_NM),
             ga_tpa,
             "hold the pattern altitude, never climb on base"
         );
@@ -1716,34 +2085,207 @@ mod tests {
         );
     }
 
-    /// The target follows TRACK miles, not straight-line distance. On a wide
-    /// base the aircraft is still moving away down the runway axis faster than
-    /// it closes laterally, so the straight-line distance grows through the
-    /// first half of the turn — and a path computed from it lifts the target
-    /// 170 ft, levels the aircraft off with the runway ahead, and waits
-    /// (2026-07-28).
+    /// The Southampton approach (2026-08-01), which is the whole reason the
+    /// glidepath distance is no longer track miles.
+    ///
+    /// The Baron began base 3,324 m off the centreline. Track miles read 3.33
+    /// nm and asked for 1,101 ft when the real distance to the threshold was
+    /// 1.53 nm and the 3° path was at 529 — the target was inflated by exactly
+    /// the lateral offset. The aircraft flew base and most of final level at
+    /// 800 ft AGL, the target dropped below it only eleven seconds before the
+    /// handoff, and autoland was handed an aircraft 206 ft high at 1.7 nm. It
+    /// flew the whole final high, crossed the threshold 80 ft up at 102 knots
+    /// and went around.
     #[test]
-    fn the_base_target_follows_track_miles_not_the_straight_line() {
-        let (elev, tpa) = (520.0, 520.0 + 1500.0);
-        // The live geometry, four seconds apart, mid-base turn: straight-line
-        // distance GREW (3.93 → 4.09 nm) while track miles grew far less
-        // steeply — and the ratchet in the loop stops even that from lifting
-        // the target. Here the point is simply that the two measures differ.
-        let straight = |a: f64, x: f64| (a * a + x * x).sqrt() / M_PER_NM;
-        let (a1, x1) = (-4307.0, -5866.0);
-        let (a2, x2) = (-4811.0, -5845.0);
-        assert!(straight(a2, x2) > straight(a1, x1), "straight-line grows");
-        // Track miles put the aircraft much further out than the straight
-        // line does, so the commanded path is higher and the leg holds
-        // pattern altitude instead of diving early.
-        assert_eq!(
-            approach_leg_alt_ft(elev, tpa, a1, x1),
-            tpa,
-            "still 5.5 track miles out: hold the pattern altitude"
+    fn the_glidepath_distance_is_down_the_course_not_across_it() {
+        let (elev, tpa) = (41.0, 41.0 + 1000.0);
+        let rollout = 4087.0; // geom.downwind_past_m, the live figure
+
+        // The live base-entry geometry. Track miles (the old measure) put the
+        // target above the pattern altitude itself; the real path is far
+        // below. This is the bug, stated as a number.
+        let (a, x): (f64, f64) = (-2840.0, 3324.0);
+        let track = approach_leg_alt_ft(elev, tpa, a.abs() + x.abs());
+        let along = approach_leg_alt_ft(elev, tpa, a);
+        assert!(
+            track - along > 500.0,
+            "cross-track inflated the target by {:.0} ft",
+            track - along
         );
-        // Once it is genuinely close in, the target is the path again.
-        let close = approach_leg_alt_ft(elev, tpa, -2.0 * M_PER_NM, 0.0);
-        assert!(close < tpa && close > elev, "{close}");
+
+        // ...but plain along-track is a dive to nowhere at that moment: the
+        // aircraft is crossing the centreline, so its along-track distance is
+        // still GROWING. Base aims at the roll-out instead.
+        assert_eq!(path_dist_m(Leg::Base, a, rollout), rollout);
+        let base_tgt = approach_leg_alt_ft(elev, tpa, path_dist_m(Leg::Base, a, rollout));
+        assert!(
+            (base_tgt - 744.0).abs() < 15.0,
+            "base should aim at the path where the turn delivers us: {base_tgt:.0}"
+        );
+
+        // Flown, the roll-out came at 3,966 m — and there the target is the
+        // path, not the flat 841 the old measure held.
+        let rolled_out = approach_leg_alt_ft(elev, tpa, path_dist_m(Leg::Final, -3966.0, rollout));
+        assert!(
+            (rolled_out - 723.0).abs() < 15.0,
+            "at roll-out the target is the path: {rolled_out:.0}"
+        );
+        assert!(rolled_out < 841.0, "and below what the old measure held");
+
+        // Final follows the along-track distance down; at the handoff point
+        // that is within a hair of what autoland will fly from.
+        let handoff = approach_leg_alt_ft(elev, tpa, path_dist_m(Leg::Final, -3128.0, rollout));
+        assert!(
+            (handoff - 579.0).abs() < 15.0,
+            "handoff on the path: {handoff:.0}"
+        );
+
+        // Still far out, the pattern altitude still caps it — a circuit does
+        // not start down on the upwind.
+        assert_eq!(approach_leg_alt_ft(elev, tpa, -6.0 * M_PER_NM), tpa);
+    }
+
+    /// The Southampton Baron (2026-08-01). It rolled into the crosswind turn
+    /// at 127 kt and came out at 85 — one knot over its clean stall and one
+    /// over Vmca — with the VS law still asking for 880 fpm and the stabilizer
+    /// trimmed to the nose-up stop. The AP will keep buying rate with knots
+    /// unless something stops it.
+    #[test]
+    fn a_climb_is_never_worth_more_than_the_airspeed_left() {
+        // Baron 58: Vy 105, blue line 100, clean stall 84.
+        let floor = climb_floor_kts(Some(100.0), Some(84.0));
+        assert_eq!(floor, 100.0, "blue line outranks the stall margin");
+        let want = 105.0;
+
+        // At the pattern speed, the commanded rate is untouched.
+        assert_eq!(climb_limit_fpm(880.0, 105.0, 0.0, want, floor), 880.0);
+        assert_eq!(climb_limit_fpm(880.0, 130.0, 0.0, want, floor), 880.0);
+
+        // At blue line and below, no climb at all — lower the nose, let the
+        // throttle law get the speed back.
+        assert_eq!(climb_limit_fpm(880.0, 100.0, 0.0, want, floor), 0.0);
+        assert_eq!(
+            climb_limit_fpm(880.0, 85.3, 0.0, want, floor),
+            0.0,
+            "the speed the live circuit actually reached"
+        );
+
+        // ...and in between, a fade rather than a switch.
+        let mid = climb_limit_fpm(880.0, 102.5, 0.0, want, floor);
+        assert!(mid > 0.0 && mid < 880.0, "{mid}");
+        assert!(
+            climb_limit_fpm(880.0, 104.0, 0.0, want, floor) > mid,
+            "and it must be monotone in airspeed"
+        );
+
+        // DESCENTS are never touched: base and final descending is the point.
+        assert_eq!(climb_limit_fpm(-500.0, 85.0, 0.0, want, floor), -500.0);
+
+        // A profile with no reference speeds disables the protection outright
+        // rather than inventing a floor.
+        assert_eq!(climb_floor_kts(None, None), 0.0);
+        assert_eq!(climb_limit_fpm(700.0, 40.0, 0.0, 74.0, 0.0), 700.0);
+
+        // ...and it must not LIMIT-CYCLE. Live it did: 700 fpm to 0 in four
+        // seconds as the speed dipped through the band, held shut while the
+        // aircraft was already accelerating back, then slammed open — the
+        // aeroplane porpoising thirty feet either way (2026-08-01). Judging
+        // the speed we are HEADING FOR fixes both ends.
+        //
+        // Recovering at 2 kt/s from below the floor: give the climb back now,
+        // not in five seconds' time.
+        assert!(
+            climb_limit_fpm(700.0, 99.0, 2.0, want, floor) > 0.0,
+            "a recovering aircraft must not be held at zero climb"
+        );
+        // Decaying at 2 kt/s from above the pattern speed: start easing off
+        // BEFORE the speed is lost, so the dip never gets deep.
+        assert!(
+            climb_limit_fpm(700.0, 112.0, -2.0, want, floor) < 700.0,
+            "a decaying speed must ease the climb early"
+        );
+        // Steady on target is untouched either way.
+        assert_eq!(climb_limit_fpm(700.0, 110.0, 0.0, want, floor), 700.0);
+
+        // A 172 (Vy 74, stall 48) gets a floor of 55 — so a normally flown
+        // trainer pattern never meets the limiter at all.
+        let c172 = climb_floor_kts(None, Some(48.0));
+        assert!((c172 - 55.2).abs() < 0.01, "{c172}");
+        assert_eq!(climb_limit_fpm(700.0, 74.0, 0.0, 74.0, c172), 700.0);
+    }
+
+    /// The full-rate threshold is the speed the climb is FLOWN at, never the
+    /// leg speed the throttle holds. The `want = 105.0` in the test above was
+    /// always Vy; the call site passed the stall-floored pattern speed
+    /// (109.2), and the four-knot gap parked the throttle's setpoint at the
+    /// top of the fade band: full climb unreachable while climbing, cmd_vs
+    /// porpoising 0-150 fpm, the Baron descending at 190 fpm at 670 ft AGL
+    /// mid-climb-out and then a whole downwind hung 100 ft below pattern
+    /// altitude (EGHI, 2026-08-02).
+    #[test]
+    fn full_climb_is_granted_at_the_speed_the_climb_is_flown_at() {
+        // Baron 58, wired exactly as the live loop wires it: pattern 109.2
+        // (1.3 x the 84 kt clean stall), Vy 105, floor 100 (blue line).
+        let pattern = pattern_speed_kts(105.0, 95.0, Some(84.0));
+        let floor = climb_floor_kts(Some(100.0), Some(84.0));
+        let full = climb_full_rate_kts(pattern, 105.0, floor);
+        assert_eq!(full, 105.0, "Vy, not the stall-floored pattern speed");
+
+        // At Vy the climb is untouched — climbing at Vy is flying correctly.
+        assert_eq!(climb_limit_fpm(700.0, 105.0, 0.0, full, floor), 700.0);
+        // And at the throttle's own setpoint, with room to spare: the steady
+        // operating point must sit ABOVE the fade band, not on its edge.
+        assert!(pattern > full + 3.0, "no headroom left: {pattern} vs {full}");
+        assert_eq!(climb_limit_fpm(700.0, pattern, 0.0, full, floor), 700.0);
+        // Genuine sag below Vy still fades, and blue line still shuts it.
+        let sagged = climb_limit_fpm(700.0, 103.0, 0.0, full, floor);
+        assert!(sagged > 0.0 && sagged < 700.0, "{sagged}");
+        assert_eq!(climb_limit_fpm(700.0, 100.0, 0.0, full, floor), 0.0);
+
+        // A jet's book Vy (a cruise-climb figure) must never RAISE the
+        // threshold above the leg speed: the Citation's 300 stays capped at
+        // its pattern speed.
+        let citation = pattern_speed_kts(300.0, 132.0, Some(136.0));
+        assert_eq!(climb_full_rate_kts(citation, 300.0, 156.4), citation);
+
+        // A Vy at or under the floor still leaves a band, never a cliff.
+        assert_eq!(climb_full_rate_kts(96.0, 94.0, 100.0), 102.0);
+    }
+
+    /// The pattern is flown CLEAN, so its speed must clear the CLEAN stall.
+    /// The Baron's Vy is 105 against an 84 kt clean stall — 1.25 Vs, four
+    /// knots above the airspeed caution band — so every normal variation on
+    /// downwind, base and final dipped into it: six callouts in one circuit,
+    /// every one correct (2026-08-01). Flap was 0.00 throughout, which is
+    /// right; nothing knew that made the stall reference 84 and not 70.
+    #[test]
+    fn the_clean_pattern_clears_the_clean_stall() {
+        // Baron 58: Vy 105, approach 95, clean stall 84.
+        let baron = pattern_speed_kts(105.0, 95.0, Some(84.0));
+        assert!(
+            (baron - 109.2).abs() < 0.1,
+            "1.3 x the clean stall: {baron:.1}"
+        );
+        // Clear of the caution band (1.2 Vs) with real margin, not four knots.
+        assert!(baron - 1.2 * 84.0 > 7.0, "margin {:.1}", baron - 1.2 * 84.0);
+
+        // A 172 (Vy 74, clean stall 48) is untouched — its Vy is already
+        // 1.54 Vs, and this must never speed a trainer's circuit up.
+        assert_eq!(pattern_speed_kts(74.0, 65.0, Some(48.0)), 74.0);
+        // ...as is an MD-82 (Vy 200, stall 100) and a Citation (200, 136).
+        assert_eq!(pattern_speed_kts(200.0, 140.0, Some(100.0)), 200.0);
+        assert!(pattern_speed_kts(200.0, 132.0, Some(136.0)) <= 198.0);
+
+        // No stall figure means no floor, never an invented one.
+        assert_eq!(pattern_speed_kts(105.0, 95.0, None), 105.0);
+
+        // The approach legs inherit it, so base and final are clear too.
+        let app = approach_leg_kts(baron, 95.0);
+        assert!(
+            app - 1.2 * 84.0 > 7.0,
+            "base/final margin {:.1}",
+            app - 1.2 * 84.0
+        );
     }
 
     /// Base and final are flown at an approach-setup speed, not the climb speed
@@ -2233,5 +2775,157 @@ mod tests {
 
         // On the centreline anything works, including at the threshold.
         assert!(interceptable(0.0, 0.0));
+    }
+
+    /// Being ABLE to close the offset is not being lined up, and the circuit
+    /// has no intercept of its own — its final leg commands the runway heading
+    /// and nothing else. So the handover waits for our own turn to roll out.
+    #[test]
+    fn the_handover_waits_for_the_turn_to_roll_out_not_just_for_flyable_geometry() {
+        // EGHI 2026-08-01, the Baron, taken straight from the blackbox: on
+        // base at 290 true, runway 02 (course 20), 1,813 m off the centreline
+        // with 4,092 m to run. The geometry is a 28 degree cut, so
+        // `interceptable` is happy...
+        let hdg_err_on_base = ((290.0 - 20.0 + 540.0_f64).rem_euclid(360.0)) - 180.0;
+        assert!(interceptable(1813.0, 4092.0), "a 28 degree cut is closeable");
+        // ...but the aircraft is still 90 degrees across the centreline, and
+        // handing it over there is what made it approach and land at an angle.
+        assert!(
+            !ready_for_autoland(1813.0, 4092.0, hdg_err_on_base),
+            "still turning: fly the turn, do not hand over the diagonal"
+        );
+
+        // Rolled out on the runway course with the designed 0.3-radii trim
+        // left: this is the straight-in autoland is for.
+        assert!(ready_for_autoland(250.0, 3500.0, 3.0));
+        assert!(ready_for_autoland(-250.0, 3500.0, -3.0));
+        // Just outside the rollout tolerance, still turning.
+        assert!(!ready_for_autoland(250.0, 3500.0, 25.0));
+
+        // The live failure (2026-08-01): rolled out on HEADING — eight
+        // degrees, comfortably inside the tolerance — and 776 m to the side,
+        // flying parallel. The heading test alone passed it, autoland flew the
+        // diagonal, and the aircraft crossed the threshold still six degrees
+        // off the runway, still turning. Rolled out is not established.
+        assert!(
+            interceptable(776.0, 3128.0),
+            "the geometry was closeable, which is exactly why heading alone let it through"
+        );
+        assert!(
+            !ready_for_autoland(776.0, 3128.0, 8.0),
+            "parallel and 776 m off is not established"
+        );
+
+        // The last-ditch valve: out of room and still not aligned, autoland's
+        // intercept beats a pattern leg that has nowhere left to go.
+        assert!(ready_for_autoland(300.0, 1200.0, 40.0));
+        // ...but never something autoland cannot fly at all, however close.
+        assert!(!ready_for_autoland(2815.0, 1200.0, 0.0));
+
+        // A failed heading read must not read as aligned — the caller passes
+        // 180, the worst case, so the handover simply waits a tick.
+        assert!(!ready_for_autoland(1813.0, 4092.0, 180.0));
+    }
+
+    /// Where the 776 m came from, in arithmetic. The pattern radius estimate
+    /// pads the speed by 1.1 and banks a deliberately shallow 14 degrees —
+    /// both of which make it BIGGER, which is safe for every dimension it
+    /// sizes except this one, where a bigger capture distance starts the turn
+    /// earlier and rolls out short of the centreline.
+    #[test]
+    fn the_final_capture_is_sized_on_the_turn_actually_flown() {
+        // Southampton, the Baron: Vy 105, approach leg also 105.
+        let pattern_r = turn_radius_m(105.0 * 0.514_444 * 1.1);
+        assert!(
+            (pattern_r - 1443.0).abs() < 20.0,
+            "the pattern estimate: {pattern_r:.0}"
+        );
+        // A 90-degree turn closes exactly one radius of cross-track, and the
+        // aircraft closed 1,048 m (1,830 off at the turn, 782 at the handoff).
+        let flown_r = 1048.0;
+        let old_residual = 1.3 * pattern_r - flown_r;
+        assert!(
+            (old_residual - 776.0).abs() < 100.0,
+            "the old model predicts the live offset: {old_residual:.0} m vs 776 flown"
+        );
+
+        // Sized on the turn actually flown, the roll-out lands near enough to
+        // the centreline that the final leg's intercept is trimming, not
+        // rescuing — and inside what the handoff gate will accept once the
+        // intercept has had a few seconds.
+        let geom = Geometry::for_radii(pattern_r, final_turn_radius_m(105.0));
+        let residual = geom.final_capture_m - flown_r;
+        assert!(
+            (0.0..=ESTABLISHED_XTK_M + 100.0).contains(&residual),
+            "roll out just short of the line, not three quarters of a radius: {residual:.0} m"
+        );
+        // Still EARLY, never late: with an intercept, short is a gentle
+        // closure and long is an S-turn back across the centreline.
+        assert!(residual > 0.0, "must not turn late");
+
+        // The pattern itself is untouched — width and downwind length keep the
+        // conservative radius that stopped the LXGB figure-eights.
+        let plain = Geometry::for_radius(pattern_r);
+        assert_eq!(geom.width_m, plain.width_m);
+        assert_eq!(geom.downwind_past_m, plain.downwind_past_m);
+        assert!(geom.final_capture_m < plain.final_capture_m);
+    }
+
+    /// The final leg has to CONVERGE on the centreline. It used to command the
+    /// runway course and nothing else, which makes it a leg that flies
+    /// parallel to the line it is supposed to be joining — survivable only
+    /// while the turn onto final was assumed to roll out ON the line, and it
+    /// does not: at Southampton the turn began 1,850 m out, consumed only
+    /// ~1,050, and left the aircraft 776 m to the side holding runway heading
+    /// all the way to the handoff (2026-08-01).
+    #[test]
+    fn the_final_leg_flies_an_intercept_not_a_parallel() {
+        let course = 19.4;
+        let cut =
+            |x: f64| ((final_intercept_hdg(course, x) - course + 540.0).rem_euclid(360.0)) - 180.0;
+
+        // On the line, fly the line.
+        assert!(cut(0.0).abs() < 0.01);
+
+        // Off to the RIGHT of the course, cut LEFT to close it, and the other
+        // way about. Getting this backwards flies away from the runway.
+        assert!(cut(776.0) < 0.0, "right of course must cut left");
+        assert!(cut(-776.0) > 0.0, "left of course must cut right");
+
+        // The live offset earns a real intercept, not a token one.
+        assert!(
+            cut(776.0).abs() > 15.0,
+            "776 m off deserves a proper cut, got {:.1}",
+            cut(776.0)
+        );
+
+        // It fades as the offset closes — no overshoot through the centreline.
+        assert!(cut(300.0).abs() < cut(776.0).abs());
+        assert!(cut(80.0).abs() < cut(300.0).abs());
+        assert!(cut(50.0).abs() < 5.0, "nearly on: nearly no cut");
+
+        // ...and is capped, so a wild offset still hands over something
+        // autoland's own 35-degree pursuit can fly.
+        assert!(cut(9000.0).abs() <= MAX_FINAL_CUT_DEG + 0.01);
+        assert!(MAX_FINAL_CUT_DEG < MAX_INTERCEPT_CUT_DEG);
+
+        // The intercept must be able to REACH the handoff gate, or the gate
+        // deadlocks into the last-ditch valve. From the live roll-out (1,830 m
+        // off, 3,966 m to run) a capped cut closes at sin(30) of groundspeed
+        // while the along-track closes at cos(30): check the offset is gone
+        // before the runway is.
+        let (mut x, mut along) = (1830.0_f64, 3966.0_f64);
+        let step_m = 54.0; // ~105 kt, one second
+        let mut ticks = 0;
+        while x > ESTABLISHED_XTK_M && along > 0.0 && ticks < 600 {
+            let c = cut(x).abs().to_radians();
+            x -= step_m * c.sin();
+            along -= step_m * c.cos();
+            ticks += 1;
+        }
+        assert!(
+            x <= ESTABLISHED_XTK_M && along > 900.0,
+            "must be established with room to spare: {x:.0} m off, {along:.0} m to run"
+        );
     }
 }

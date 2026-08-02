@@ -53,6 +53,50 @@ fn value_cache_ttl() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// Datarefs that change almost never, and the longer window they get.
+///
+/// The 60 ms cache was sized for DUPLICATION — two loops wanting the same
+/// airspeed in one burst — and measured, it recovers about 2.5%, because the
+/// loops mostly read DIFFERENT datarefs. Volume, not duplication, is the
+/// problem: a whole EGHI sortie logged `cached=0` in most windows while
+/// sustaining 70-80 req/s, and the per-dataref histogram named the reason.
+/// After latitude and longitude came `is_in_replay` (3,803) and `paused`
+/// (3,791) — the freeze check, about four reads a second between them, for two
+/// flags that change a handful of times in a whole flight.
+///
+/// Nothing needs those within 60 ms. A pause or a replay entry noticed half a
+/// second late costs one control tick, which every loop already tolerates
+/// (`sim_frozen` fails OPEN, and the laws it gates re-check every tick anyway).
+/// Measured at 20:42 on 2026-08-01 the sim dropped to 7 fps against a 60 fps
+/// median in the same 30 s window that logged 76 req/s and a 1,040 ms slowest
+/// response — the API is served from inside X-Plane's flight loop, so this is
+/// frame time the sim does not get.
+const SLOW_DATAREFS: &[&str] = &[
+    "sim/time/is_in_replay",
+    "sim/time/paused",
+    "sim/aircraft/view/acf_ICAO",
+    "sim/aircraft/view/acf_tailnum",
+];
+/// How long a [`SLOW_DATAREFS`] value may be reused. Well under the time any
+/// of them plausibly changes twice, and a whole order of magnitude off the
+/// request rate they were driving.
+const SLOW_DATAREF_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The cache window for one dataref: the long one for the flags that never
+/// move, the configured one for everything else. Disabling the cache
+/// (`XCOPILOT_DREF_CACHE_MS=0`) disables both, so the escape hatch still works.
+fn ttl_for(name: &str) -> std::time::Duration {
+    let base = value_cache_ttl();
+    if base.is_zero() {
+        return base;
+    }
+    if SLOW_DATAREFS.contains(&name) {
+        SLOW_DATAREF_TTL.max(base)
+    } else {
+        base
+    }
+}
+
 /// Web API load over the current reporting window. The Web API is served from
 /// inside X-Plane's own frame loop, so what we ask of it is a load the SIM
 /// carries — and when the sim freezes, the only thing our logs record is the
@@ -75,6 +119,52 @@ struct LoadWindow {
 }
 
 static LOAD: std::sync::Mutex<Option<LoadWindow>> = std::sync::Mutex::new(None);
+
+/// A read-only look at the load window in progress, for the desktop health
+/// screen. The 30 s report tells the story AFTER the fact, in a log line and a
+/// blackbox event; a freeze is watched in real time, so the same counters have
+/// to be readable mid-window. Reading never resets the window — the report
+/// still owns that.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LoadSnapshot {
+    /// Seconds elapsed in the window so far (resets every `LOAD_REPORT_SECS`).
+    pub window_s: f64,
+    pub requests: u64,
+    pub cache_hits: u64,
+    pub failures: u64,
+    pub slowest_ms: u64,
+    /// The busiest datarefs so far this window, descending.
+    pub top: Vec<(String, u64)>,
+}
+
+impl LoadSnapshot {
+    /// Requests per second so far this window. Meaningless in the first
+    /// fraction of a second, hence the floor.
+    pub fn rate_per_s(&self) -> f64 {
+        self.requests as f64 / self.window_s.max(0.25)
+    }
+}
+
+/// Snapshot the current load window, or `None` before the first request.
+pub fn load_snapshot() -> Option<LoadSnapshot> {
+    let guard = LOAD.lock().unwrap_or_else(|e| e.into_inner());
+    let w = guard.as_ref()?;
+    let mut top: Vec<(String, u64)> = w
+        .by_name
+        .iter()
+        .map(|(n, c)| (n.clone(), *c))
+        .collect();
+    top.sort_by_key(|item| std::cmp::Reverse(item.1));
+    top.truncate(6);
+    Some(LoadSnapshot {
+        window_s: w.start.elapsed().as_secs_f64(),
+        requests: w.requests,
+        cache_hits: w.cache_hits,
+        failures: w.failures,
+        slowest_ms: w.slowest_ms,
+        top,
+    })
+}
 
 /// A read served from cache: counted so the load report shows what the
 /// window would have cost without it.
@@ -316,7 +406,7 @@ impl XPlaneClient {
     /// again. `decoding` labels the JSON-decode step for error context.
     async fn get_value(&self, name: &str, decoding: &'static str) -> Result<serde_json::Value> {
         note_named(name);
-        let ttl = value_cache_ttl();
+        let ttl = ttl_for(name);
         if !ttl.is_zero() {
             if let Some((at, v)) = self.value_cache.lock().await.get(name) {
                 if at.elapsed() < ttl {
@@ -650,6 +740,12 @@ impl XPlane for XPlaneClient {
 /// Compiled unconditionally so downstream crates' test suites can use it.
 pub struct FakeXPlane {
     reads: std::sync::Mutex<HashMap<String, f64>>,
+    /// Array-valued reads, for the per-engine and per-bus datarefs. Without
+    /// these every array read came back EMPTY, which reads downstream as zero
+    /// volts / no engine running — so any code path behind an array gate was
+    /// untestable, and the paths behind them are exactly the ones that fail
+    /// silently in the cockpit (a start that cranks a dry engine).
+    array_reads: std::sync::Mutex<HashMap<String, Vec<f64>>>,
     /// Every set_float/set_int, in order, as (dataref, value).
     writes: std::sync::Mutex<Vec<(String, f64)>>,
     /// Every command run, in order.
@@ -660,6 +756,7 @@ impl FakeXPlane {
     pub fn new() -> Self {
         Self {
             reads: std::sync::Mutex::new(HashMap::new()),
+            array_reads: std::sync::Mutex::new(HashMap::new()),
             writes: std::sync::Mutex::new(Vec::new()),
             commands: std::sync::Mutex::new(Vec::new()),
         }
@@ -692,6 +789,14 @@ impl FakeXPlane {
             .rev()
             .find(|(n, _)| n == name)
             .map(|(_, v)| *v)
+    }
+
+    /// Preset an array-valued read (bus volts, per-engine indicators).
+    pub fn set_read_array(&self, name: &str, values: &[f64]) {
+        self.array_reads
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), values.to_vec());
     }
 
     /// Whether `name` was ever written.
@@ -749,8 +854,20 @@ impl XPlane for FakeXPlane {
         self.commands.lock().unwrap().push(name.to_string());
         Ok(())
     }
-    async fn get_float_array(&self, _name: &str) -> Result<Vec<f64>> {
-        Ok(Vec::new())
+    async fn get_float_array(&self, name: &str) -> Result<Vec<f64>> {
+        // A preset array wins; then a scalar preset, read as a one-element
+        // array (which is what a single-engine dataref is); else empty, the
+        // long-standing default.
+        if let Some(v) = self.array_reads.lock().unwrap().get(name) {
+            return Ok(v.clone());
+        }
+        Ok(self
+            .reads
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|v| vec![*v])
+            .unwrap_or_default())
     }
     async fn set_int_array_elem(&self, name: &str, _index: usize, value: i64) -> Result<()> {
         self.writes
@@ -777,5 +894,38 @@ mod load_tests {
             ttl <= std::time::Duration::from_millis(75),
             "a stale read must not reach a control law: {ttl:?}"
         );
+    }
+
+    /// The freeze flags were ~4 reads a second of a value that changes a
+    /// handful of times in a whole flight, and they sat second only to
+    /// position in the per-dataref histogram. The API is served from inside
+    /// X-Plane's flight loop, so that is frame time the sim does not get: at
+    /// 20:42 on 2026-08-01 it dropped to 7 fps against a 60 fps median in the
+    /// same window that logged 76 req/s and a 1,040 ms slowest response.
+    #[test]
+    fn the_flags_that_never_move_get_a_longer_window() {
+        let base = super::value_cache_ttl();
+        for slow in super::SLOW_DATAREFS {
+            assert!(
+                super::ttl_for(slow) >= super::SLOW_DATAREF_TTL,
+                "{slow} should get the long window"
+            );
+            assert!(
+                super::ttl_for(slow) > base,
+                "...and a longer one than the default"
+            );
+        }
+        // Everything a control law reads keeps the short window.
+        for live in [
+            "sim/flightmodel/position/latitude",
+            "sim/flightmodel/position/indicated_airspeed",
+            "sim/cockpit2/controls/parking_brake_ratio",
+        ] {
+            assert_eq!(super::ttl_for(live), base, "{live} must stay live");
+        }
+        // Half a second is still far short of anything that would let a
+        // stale freeze flag matter: the loops re-check every tick and
+        // `sim_frozen` fails open.
+        assert!(super::SLOW_DATAREF_TTL < std::time::Duration::from_secs(1));
     }
 }

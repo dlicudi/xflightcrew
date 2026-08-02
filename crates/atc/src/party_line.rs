@@ -118,6 +118,27 @@ pub fn taxi_to_stand() -> bool {
     *lock(&TAXI_TO_STAND)
 }
 
+/// The drive OFF the runway we have just landed on, planned from the field's
+/// taxi network. `psi_true` is the rollout direction; `runway` is the end we
+/// landed on.
+///
+/// This is the one accessor here that is not a published CLEARANCE, and that
+/// is deliberate rather than a leak. The world owns the airport's geometry —
+/// the taxi network is loaded once per station and the crew has no business
+/// keeping a second copy — but vacating needs no permission from the tower:
+/// it is the completion of the landing clearance the crew already holds. So
+/// the crew asks the world a question about pavement and gets an answer, with
+/// no controller in the loop and nothing to read back. The station can still
+/// never actuate; this returns geometry.
+pub fn plan_vacate(
+    lat: f64,
+    lon: f64,
+    psi_true: f64,
+    runway: &str,
+) -> Option<crate::nav::VacatePlan> {
+    crate::station::plan_vacate_from(lat, lon, psi_true, runway)
+}
+
 /// The discrete squawk the controller assigned, if one has been — the crew dials
 /// it into the transponder after the clearance.
 pub fn assigned_squawk() -> Option<i64> {

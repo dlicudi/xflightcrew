@@ -52,7 +52,7 @@ const N2_PERCENT: &str = "sim/cockpit2/engine/indicators/N2_percent";
 /// Drive a [`CycleSwitch`] to `target` by reading its position and firing
 /// `up`/`down`. Bounded by the detent span so a stuck switch can't loop forever.
 /// Returns the final position read back.
-async fn cycle_to(ctx: &ToolCtx<'_>, sw: &CycleSwitch, target: i64) -> Result<i64> {
+pub(crate) async fn cycle_to(ctx: &ToolCtx<'_>, sw: &CycleSwitch, target: i64) -> Result<i64> {
     let span = (sw.max - sw.min + 1).max(1);
     let mut last = (ctx.xplane.get_float(&sw.position).await?).round() as i64;
     for _ in 0..=span {

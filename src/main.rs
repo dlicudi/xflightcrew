@@ -21,6 +21,7 @@ mod config;
 mod failures;
 mod full_auto;
 mod grammar;
+mod health;
 mod livestate;
 mod llm;
 mod mic;
@@ -34,6 +35,7 @@ mod pushback;
 mod radiofx;
 mod rag;
 mod readback;
+mod settings;
 mod simbrief;
 mod stt;
 mod stt_eval;
@@ -118,6 +120,13 @@ async fn main() -> Result<()> {
         build = env!("XCOPILOT_BUILD"),
         "XVoiceLayer starting"
     );
+
+    // Publish the configuration to the live store and let saved preferences
+    // fill in every registry knob the environment is silent about (env still
+    // wins — see settings.rs). From here on the boot path uses this resolved
+    // snapshot, while the loops re-read `settings::live()` each tick so a
+    // change made from the Settings screen applies without a restart.
+    let config: Config = (*settings::install(config)).clone();
 
     // Initial app mode: explicit env > the panel's saved pick > both. The
     // panel's Settings tab can change it live from here on (mode.rs).
@@ -567,28 +576,17 @@ async fn main() -> Result<()> {
     }
 
     if config.ui == "tui" {
-        // TUI: voice loop + aircraft poll run on background threads, each with
-        // its own runtime; the dashboard renders on the main thread.
+        // TUI: the voice loop and the health poll run on background threads,
+        // each with its own runtime; the dashboard renders on the main thread.
         let (tx, rx) = std::sync::mpsc::channel::<ui::Report>();
-        let title = format!(
-            "XVoiceLayer {} ({}) · {}",
-            env!("CARGO_PKG_VERSION"),
-            env!("XCOPILOT_BUILD"),
-            profile.display_name
-        );
-        // The active engines, shown in the status bar: STT (whisper model), LLM,
-        // and TTS backend — so it's obvious at a glance what's running.
-        let engines = format!(
-            "whisper {} · llm {} · tts {}",
-            whisper_model_label(&config.whisper_model_path),
-            config.model,
-            config.tts_backend,
-        );
-        let commands = command_hints();
+        let boot_facts = boot_health(&config);
 
         let tx_poll = tx.clone();
-        let poll_base = config.xplane_base_url.clone();
-        let atc_on = !config.atc_airport.trim().is_empty();
+        let mut collector = health::Collector::new(
+            XPlaneClient::new(config.xplane_base_url.clone()),
+            live_profile.clone(),
+            &config,
+        );
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -597,32 +595,12 @@ async fn main() -> Result<()> {
                 return;
             };
             rt.block_on(async move {
-                let xp = XPlaneClient::new(poll_base);
                 loop {
-                    if let Some(ac) = poll_aircraft(&xp).await {
-                        if tx_poll.send(ui::Report::Aircraft(ac)).is_err() {
-                            break; // dashboard gone
-                        }
-                    }
-                    // The radio panel mirrors the in-sim one: the ACTIVE
-                    // station's comm plan, only while it's in VHF range —
-                    // empty (panel hidden) otherwise.
-                    if atc_on {
-                        let com1 = xp
-                            .get_float(datarefs::COM1_FREQ_KHZ)
-                            .await
-                            .ok()
-                            .map(|v| v.round() as i64);
-                        if let Some((lat, lon, alt_ft)) = position(&xp).await {
-                            let (airport, services) =
-                                station::active_station_in_range(lat, lon, alt_ft)
-                                    .unwrap_or_default();
-                            let _ = tx_poll.send(ui::Report::Radio(ui::Radio {
-                                airport,
-                                services,
-                                com1_khz: com1,
-                            }));
-                        }
+                    if tx_poll
+                        .send(ui::Report::Health(Box::new(collector.poll().await)))
+                        .is_err()
+                    {
+                        break; // dashboard gone
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 }
@@ -662,7 +640,7 @@ async fn main() -> Result<()> {
             }
         });
 
-        ui::run_dashboard(title, engines, commands, rx, cmd_tx)?; // blocks until the user quits
+        ui::run_dashboard(boot_facts, rx, cmd_tx)?; // blocks until the user quits
         Ok(())
     } else {
         println!(
@@ -1386,6 +1364,8 @@ async fn run_session(
         None
     };
 
+    let mut capture_tuning = CaptureTuning::of(&config);
+
     reporter.log(
         ui::LogKind::Info,
         match &ptt {
@@ -1397,6 +1377,15 @@ async fn run_session(
     );
 
     loop {
+        // This utterance's settings, read fresh: the confidence bands, the
+        // confirm gate, the LLM fallback and the readback challenges all
+        // become live changes rather than boot constants. Boot-time values
+        // (paths, base URLs, the capture wiring) stay as they were resolved.
+        let config = settings::live();
+        // Capture tuning IS re-applied, because tuning a mic gate by ear is
+        // the reason a settings screen exists: a change lands on the next
+        // utterance instead of the next launch.
+        capture_tuning.follow(&config, listener.as_mut(), ptt_mic.as_ref());
         reporter.status(ui::Phase::Listening);
         // Input is spoken (gated like before) or typed in the TUI. A typed
         // command is deliberate, so it skips the confidence/wake/domain gates and
@@ -1549,6 +1538,14 @@ async fn run_session(
                     tracing::warn!(%name, "region handoff to a field without a tower; keeping the old station")
                 }
             }
+        }
+
+        // Readback enforcement lives INSIDE the tower FSM, so unlike the
+        // settings the loop reads per tick, it has to be pushed. Done here and
+        // not only at station install, or the Settings screen would show a
+        // knob that quietly waits for the next airport.
+        if let Some(st) = atc_station.as_mut() {
+            st.set_enforce_readback(config.atc_readback);
         }
 
         // A held takeoff clearance the monitor released once the final
@@ -2016,6 +2013,32 @@ async fn run_session(
         // philosophy as the release path: when we hold a control, ambiguity
         // resolves toward the pilot's authority over it — and on the ground,
         // stopping is always the safe reading.
+        // A PUSH holds the aircraft with no governor running, so the branch
+        // below could never see it — and a push is exactly where "stop" is
+        // most urgent, since the brakes are off for the tug. Cancel the push;
+        // its abort path stops the tug and sets the brakes.
+        if pushback::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            let tl = command.to_ascii_lowercase();
+            if tl
+                .split_whitespace()
+                .any(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric()) == "stop")
+                && !tl.contains("stop holding")
+            {
+                tracing::info!("pushback stop word, pre-gate");
+                pushback::ABORT.store(true, std::sync::atomic::Ordering::SeqCst);
+                // And the sequence that armed it. "Stop" during a push means
+                // stop, not "skip the push and start taxiing" — which is what
+                // aborting only the push would have full auto do next.
+                full_auto::abort();
+                say(
+                    &voice,
+                    &reporter,
+                    ui::LogKind::Readback,
+                    "Stopping the push. Brakes on, your aircraft.",
+                );
+                continue;
+            }
+        }
         if tools::speedhold::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
             let tl = command.to_ascii_lowercase();
             let words: Vec<&str> = tl
@@ -3579,6 +3602,7 @@ fn icao_to_profile(icao: &str) -> String {
         "SF50" => "cirrus_vision_sf50",
         "DC3" | "DC30" => "dc3",
         "BE9L" | "BE9T" | "C90" | "C90B" => "king_air_c90b",
+        "BE58" | "BE55" => "beechcraft_baron_58",
         "EVOT" | "EVOP" => "lancair_evolution",
         "DHC6" => "dhc6_twin_otter",
         _ => "cessna_172sp",
@@ -5125,6 +5149,24 @@ fn reference_limits(profile: &aircraft::AircraftProfile, t: &str) -> Option<Stri
             parts.push(format!("Vy, best rate of climb, {}", kt(v)));
         }
     }
+    // The twin pair. Asked for by name far more often than by definition ("what's
+    // blue line?"), and absent on a single, where the profile leaves them unset.
+    if t.contains("vyse") || t.contains("blue line") || t.contains("single engine climb") {
+        if let Some(v) = r.and_then(|r| r.vyse_kts) {
+            parts.push(format!(
+                "blue line, Vyse, {} — single-engine best rate",
+                kt(v)
+            ));
+        }
+    }
+    if t.contains("vmc") || t.contains("red line") || t.contains("minimum control") {
+        if let Some(v) = r.and_then(|r| r.vmca_kts) {
+            parts.push(format!(
+                "Vmca, single-engine minimum control, {}",
+                kt(v)
+            ));
+        }
+    }
     if t.contains("rotat")
         || t.contains("liftoff")
         || t.contains("lift off")
@@ -5967,18 +6009,118 @@ async fn state_snapshot(
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-/// Read the live aircraft state for the dashboard panel. Returns `None` if
-/// X-Plane is unreachable (panel keeps its last values).
-async fn poll_aircraft(xp: &XPlaneClient) -> Option<ui::Aircraft> {
-    Some(ui::Aircraft {
-        heading: xp.get_float(datarefs::COMPASS_HEADING_DEG).await.ok()?,
-        altitude: xp.get_float(datarefs::ALTITUDE_FT).await.ok()?,
-        ias: xp.get_float(datarefs::AIRSPEED_KTS).await.ok()?,
-        vsi: xp.get_float(datarefs::VVI_FPM).await.ok()?,
-        flaps_pct: xp.get_float(datarefs::FLAP_RATIO).await.ok()? * 100.0,
-        ap_mode: ap_mode(xp, None).await,
-        managing: auto_status::active_managers(),
-    })
+/// The capture tuning currently applied to the open microphone.
+///
+/// The three mic knobs are the ones a pilot tunes by ear, so they are live —
+/// but they live INSIDE the audio device's own state, not in a value read per
+/// frame. This tracks what was last pushed so a change from the settings
+/// screen is applied exactly once, between utterances, rather than re-pushed
+/// (and re-logged) on every tick of a silent cockpit.
+struct CaptureTuning {
+    vad_bits: u32,
+    end_silence_ms: u32,
+    gate_tail_ms: u64,
+}
+
+impl CaptureTuning {
+    fn of(config: &Config) -> Self {
+        CaptureTuning {
+            vad_bits: config.vad_threshold.to_bits(),
+            end_silence_ms: config.end_silence_ms,
+            gate_tail_ms: config.mic_gate_tail_ms,
+        }
+    }
+
+    /// Push any changed value into the live mic. Only one of listener/ptt_mic
+    /// ever exists (continuous vs push-to-talk), but both take the echo guard.
+    fn follow(&mut self, config: &Config, listener: Option<&mut Listener>, ptt: Option<&PttMic>) {
+        let next = CaptureTuning::of(config);
+        if next.vad_bits == self.vad_bits
+            && next.end_silence_ms == self.end_silence_ms
+            && next.gate_tail_ms == self.gate_tail_ms
+        {
+            return;
+        }
+        let tail = std::time::Duration::from_millis(next.gate_tail_ms);
+        if let Some(l) = listener {
+            l.retune(config.vad_threshold, next.end_silence_ms, tail);
+        }
+        if let Some(m) = ptt {
+            m.set_gate_tail(tail);
+        }
+        tracing::info!(
+            vad = config.vad_threshold,
+            end_silence_ms = next.end_silence_ms,
+            gate_tail_ms = next.gate_tail_ms,
+            "capture retuned"
+        );
+        *self = next;
+    }
+}
+
+/// The session facts the desktop health screen shows: everything settled at
+/// boot, after every fallback and collision fix has been applied. Read off the
+/// resolved [`Config`], never off the environment, so what the screen reports
+/// is what the process is actually running.
+fn boot_health(config: &Config) -> health::Boot {
+    // The capture path in precedence order — the same order `main` wires it,
+    // so a PTT dataref that quietly outranks a configured key is visible
+    // rather than mysterious.
+    let listen = if !config.ptt_dataref.trim().is_empty() {
+        format!("ptt dataref · {}", config.ptt_dataref)
+    } else if !config.ptt_key.trim().is_empty() {
+        format!("ptt key · {}", config.ptt_key)
+    } else {
+        config.listen_mode.clone()
+    };
+
+    let mut voices = vec![("cabin", voice_stem(&config.cabin_piper_voice))];
+    if !config.atc_airport.trim().is_empty() {
+        voices.push(("tower", voice_stem(&config.atc_piper_voice)));
+        voices.push(("approach", voice_stem(&config.atc_approach_piper_voice)));
+        voices.push(("departure", voice_stem(&config.atc_departure_piper_voice)));
+    }
+
+    health::Boot {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build: env!("XCOPILOT_BUILD").to_string(),
+        whisper: format!(
+            "{} · {}",
+            whisper_model_label(&config.whisper_model_path),
+            if config.whisper_gpu { "gpu" } else { "cpu" }
+        ),
+        listen,
+        mic: audio::default_input_name().unwrap_or_else(|| "no input device".into()),
+        xplane_url: config.xplane_base_url.clone(),
+        ollama_url: config.ollama_base_url.clone(),
+        llm_model: config.model.clone(),
+        llm_enabled: config.llm_enabled,
+        atc_airport: config.atc_airport.trim().to_string(),
+        simbrief: !config.simbrief_id.trim().is_empty(),
+        voices,
+    }
+}
+
+/// A voice model path as the screen names it: the file stem, which is how the
+/// panel's picker and the config comments name them too.
+fn voice_stem(spec: &str) -> String {
+    if spec.trim().is_empty() {
+        return "(inherits tower)".into();
+    }
+    // A pool-style `path#N` spec keeps its speaker number: two entries from the
+    // same multi-speaker model are different people.
+    let (path, sid) = match spec.rsplit_once('#') {
+        Some((p, n)) => (p, Some(n)),
+        None => (spec, None),
+    };
+    let stem = std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| spec.to_string());
+    match sid {
+        Some(n) => format!("{stem}#{n}"),
+        None => stem,
+    }
 }
 
 /// Summarize the active autopilot lateral mode for the panel. Reads prefer the
@@ -6301,6 +6443,15 @@ const COMMAND_KEYWORDS: &[&str] = &[
     "brakes",
     "break",
     "breaks",
+    // "stop" is a control word, not chatter. It was missing, and the only
+    // reason it ever worked was the pre-gate branch below that fires while the
+    // speed governor is running — so the moment the aircraft was moving with
+    // no governor, the one word a pilot actually shouts was dropped as ambient
+    // with no miss chime. Southampton: a Baron rolling off its stand at 21 kt,
+    // "Stop." at 0.9996 confidence, nothing (2026-08-01). The grammar's bare
+    // stop already requires the WHOLE utterance to be it, so "stop for fuel"
+    // still just reaches the router rather than actuating.
+    "stop",
     "parking",
     "heat",
     // ramp / ground-ops: chocks, ground power, pushback, services
@@ -6837,32 +6988,6 @@ fn whisper_model_label(path: &str) -> String {
     stem.strip_prefix("ggml-").unwrap_or(stem).to_string()
 }
 
-fn command_hints() -> Vec<String> {
-    [
-        "flaps ten / full",
-        "landing light on",
-        "strobes off",
-        "autopilot heading 270",
-        "climb and maintain 7000",
-        "descend at 500",
-        "throttle 60 percent",
-        "mixture full rich",
-        "start the engine",
-        "engine off",
-        "set altimeter 29.92",
-        "com one 118.5",
-        "squawk 1200",
-        "parking brake set",
-        "battery on / alternator on",
-        "avionics on",
-        "align the gyro",
-        "prepare the ILS for runway 13",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -7065,6 +7190,43 @@ mod tests {
             .contains("21"));
     }
 
+    /// The Baron answers the two questions only a twin gets asked, and the
+    /// mapping that gets you the profile in the first place.
+    #[test]
+    fn the_baron_recites_the_twin_speeds() {
+        assert_eq!(super::icao_to_profile("BE58"), "beechcraft_baron_58");
+        assert_eq!(super::icao_to_profile("be58"), "beechcraft_baron_58");
+        let p = super::aircraft::load("beechcraft_baron_58").expect("baron profile");
+        assert!(super::reference_limits(&p, "what's blue line")
+            .unwrap()
+            .contains("100 knots"));
+        assert!(super::reference_limits(&p, "what's vmc")
+            .unwrap()
+            .contains("84 knots"));
+        // Per-notch Vfe, spoken as two limits rather than one.
+        let vfe = super::reference_limits(&p, "flap speed").unwrap();
+        assert!(vfe.contains("152") && vfe.contains("122"), "{vfe}");
+        // A single has neither twin speed, so it says nothing rather than
+        // inventing one.
+        let c172 = super::aircraft::load("cessna_172sp").expect("172 profile");
+        assert!(super::reference_limits(&c172, "what's blue line").is_none());
+
+        // The profile shapes the tool surface: retractable gear earns a gear
+        // tool the 172 never gets, and a fuel-injected engine earns no carb
+        // heat. This is the whole point of per-airframe profiles.
+        let reg = super::tools::Registry::for_aircraft(&p);
+        assert!(reg.get("gear").is_some(), "the Baron's gear retracts");
+        assert!(reg.get("set_magnetos").is_some());
+        assert!(reg.get("start_engine").is_some());
+        assert!(
+            reg.get("set_carb_heat").is_none(),
+            "IO-550s are fuel injected"
+        );
+        assert!(super::tools::Registry::for_aircraft(&c172)
+            .get("gear")
+            .is_none());
+    }
+
     #[test]
     fn citation_x_loads_with_the_poms_own_figures() {
         let p = super::aircraft::load("citation_x").expect("citation_x profile loads");
@@ -7084,7 +7246,7 @@ mod tests {
         // pattern is capped against the approach speed regardless.
         let vy = r.vy_kts.expect("vy");
         assert!(vy <= 200.0, "vy is a climb-out speed, got {vy}");
-        let pat = super::circuit::pattern_speed_kts(vy, r.approach_kts.unwrap());
+        let pat = super::circuit::pattern_speed_kts(vy, r.approach_kts.unwrap(), p.vs_clean_kts);
         assert!(pat <= 198.0, "pattern capped at 1.5x approach, got {pat}");
         // The runway it demands must fit the runways it flies from.
         let roll_m = r.takeoff_roll_ft.expect("ground roll") * 0.3048;
@@ -7732,6 +7894,34 @@ mod tests {
         ] {
             assert!(looks_like_command(c), "{c:?} should pass the domain gate");
         }
+    }
+
+    /// "Stop" is a control word and must reach the router from a cold gate.
+    /// It was missing from the keyword table, so in continuous mode it only
+    /// ever worked through the pre-gate branch that fires while the speed
+    /// governor is running. With a push under way — brakes off for the tug,
+    /// no governor — a Baron rolled off its Southampton stand to 21 kt and
+    /// "Stop." at 0.9996 confidence was dropped as ambient, no miss chime
+    /// (2026-08-01).
+    #[test]
+    fn stop_reaches_the_router_with_no_governor_running() {
+        for c in ["Stop.", "stop", "Stop stop stop!", "Stop the aircraft."] {
+            assert!(looks_like_command(c), "{c:?} must pass the domain gate");
+        }
+        // Passing the GATE is not actuating: the grammar's bare-stop rule
+        // still wants the whole utterance, so a sentence that merely contains
+        // the word goes to the router, not to the brakes.
+        let prof = crate::aircraft::load("beechcraft_baron_58").expect("Baron profile");
+        let reg = crate::tools::Registry::for_aircraft(&prof);
+        let stop = super::grammar::try_parse("stop", &reg, &prof)
+            .expect("bare stop must parse to a command");
+        assert_eq!(stop[0].name, "hold_speed");
+        assert_eq!(stop[0].arguments["knots"], 0);
+        assert!(
+            super::grammar::try_parse("we should stop for fuel at the next field", &reg, &prof)
+                .is_none(),
+            "a sentence that merely contains the word must not brake"
+        );
     }
 
     #[test]

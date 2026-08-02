@@ -1,14 +1,25 @@
-//! Arrival taxi-to-parking — the CREW half. The world (tower) provides the
-//! route (see `crates/atc`'s `RequestTaxiIn`, which plans to the nearest stand
-//! and publishes it); this asks for it over the crew radio and then drives the
-//! published stand route with `AutoTaxi`.
+//! Arrival taxi-to-parking — the CREW half, in two phases: VACATE, then taxi.
 //!
-//! It mirrors full_auto's request-then-drive taxi step, scoped to the arrival:
-//! request the taxi-in if we don't already hold a stand clearance, wait for the
-//! tower to publish it, then hand the drive to `AutoTaxi` — which phrases the
-//! destination as "stand ..." off [`crate::party_line::taxi_to_stand`]. With
-//! real/external ATC (no simulated tower) the pilot owns the request; we only
-//! drive what's already cleared.
+//! **Vacating comes first and asks nobody.** Clearing the runway is the
+//! completion of the landing clearance we already hold, not a new instruction,
+//! so it needs no controller in the loop and owes no readback. This used to be
+//! the other way round: the request went out from wherever autoland stopped —
+//! on the runway — and the drive waited up to sixty seconds for the tower to
+//! publish a stand route, with the give-up path handing back "your aircraft"
+//! still on the strip. At Southampton that held runway 02 for ninety seconds
+//! after touchdown while an arrival closed from 2.6 nm to 0.5, the tower
+//! telling the lander "continue approach, traffic on the runway ahead"
+//! (2026-08-01). Sixteen of those seconds were spent waiting for a clearance
+//! to do something that never needed one.
+//!
+//! Phase two is the original: the world (tower) provides the stand route (see
+//! `crates/atc`'s `RequestTaxiIn`), this asks for it over the crew radio and
+//! hands the drive to `AutoTaxi` — which phrases the destination as "stand ..."
+//! off [`crate::party_line::taxi_to_stand`]. With real/external ATC (no
+//! simulated tower) the pilot owns the request; we only drive what's already
+//! cleared. Note that a copilot-only boot has no station and therefore no taxi
+//! network either, so the vacate degrades to nothing there — the pilot is
+//! flying with real ATC and owns the rollout.
 
 use serde_json::json;
 
@@ -19,8 +30,17 @@ use crate::xplane::XPlaneClient;
 
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
+/// True heading — the rollout direction, so a vacate never picks an exit
+/// behind us (reaching one means taxiing back down the runway).
+const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 
 /// Spawn the arrival taxi on its own thread + runtime + client.
+/// `vacate_from` is the runway END we have just landed on, when we have: the
+/// drive off it runs before anything is requested. `None` means we are already
+/// on a taxiway (the pilot asking for a taxi-in at the holding point) and there
+/// is nothing to vacate — build it with [`vacate_runway`], never from
+/// `clearance_runway` alone.
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     base_url: String,
     config: Config,
@@ -28,6 +48,7 @@ pub fn start(
     park_brake_valve_set: Option<f64>,
     prop: Option<crate::aircraft::PropProfile>,
     pace: crate::autotaxi::Pace,
+    vacate_from: Option<String>,
 ) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -43,6 +64,7 @@ pub fn start(
             park_brake_valve_set,
             prop,
             pace,
+            vacate_from,
         ));
     });
 }
@@ -53,9 +75,152 @@ fn announce(voice: &Option<Voice>, priority: Priority, line: &str) {
     }
 }
 
+/// The runway to vacate, or `None` when there is nothing to vacate.
+///
+/// A STANDING LANDING CLEARANCE is the signal, and it is the right one
+/// precisely because of how narrow it is: the tower issues it on final and the
+/// taxi-in request is what clears it, so the state holds over exactly the
+/// window between touchdown and asking to go to the stand. Reading
+/// `clearance_runway` on its own would hand a stale ident from an earlier
+/// flight to a drive that then aims for a runway exit from the middle of a
+/// taxiway — a process-wide fact outliving its moment, which is the shape of
+/// half the bugs in this codebase. With no simulated tower there is no
+/// clearance and no taxi network either, so this is `None` and the pilot owns
+/// the rollout, as they already did.
+pub fn vacate_runway() -> Option<String> {
+    (crate::party_line::clearance_state() == Some(crate::tower::State::ClearedToLand))
+        .then(crate::party_line::clearance_runway)
+        .flatten()
+}
+
 /// A stand (arrival) route is already published — the drive can start now.
 fn stand_route_ready() -> bool {
     crate::party_line::taxi_to_stand() && crate::party_line::with_taxi_route(|r| r.is_some())
+}
+
+/// How long to give the drive off the runway before pressing on regardless.
+/// A vacate is a hundred metres at taxi pace; well past that, something has
+/// gone wrong and continuing to the taxi-in request beats waiting silently.
+const VACATE_MAX_SECS: f64 = 120.0;
+
+/// Phase one: drive clear of `rwy`, then report it.
+///
+/// Best effort throughout, and every failure falls through to the taxi-in
+/// exactly as it behaved before this existed — no network at the field, a
+/// runway with no authored exits, a drive that refuses. The one thing this
+/// must never do is BLOCK the taxi-in, because the taxi-in is the other way
+/// off the runway.
+async fn vacate(
+    xp: &XPlaneClient,
+    config: &Config,
+    voice: &Option<Voice>,
+    park_brake_valve_set: Option<f64>,
+    prop: Option<crate::aircraft::PropProfile>,
+    pace: crate::autotaxi::Pace,
+    rwy: &str,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (lat_r, lon_r, psi_r) = tokio::join!(
+        xp.get_float(crate::datarefs::LATITUDE),
+        xp.get_float(crate::datarefs::LONGITUDE),
+        xp.get_float(PSI_TRUE),
+    );
+    let (Ok(lat), Ok(lon), Ok(psi)) = (lat_r, lon_r, psi_r) else {
+        crate::blackbox::record("taxi_in", json!({ "event": "vacate_no_position" }));
+        return;
+    };
+    let Some(plan) = crate::party_line::plan_vacate(lat, lon, psi, rwy) else {
+        // No network, or no exit ahead. The taxi-in still runs; it just starts
+        // from the runway as it always did.
+        crate::blackbox::record("taxi_in", json!({ "event": "vacate_no_plan", "rwy": rwy }));
+        return;
+    };
+    let watch = crate::station::TaxiWatch {
+        path: plan.path.clone(),
+        via: String::new(),
+        seg: plan.seg.clone(),
+        holding_point: String::new(),
+        lead_on: Vec::new(),
+    };
+    let Some(mut route) = crate::autotaxi::Route::build(&watch) else {
+        // Shorter than the drive's own minimum: we are close enough to clear
+        // that the taxi-in's first metres will do it.
+        crate::blackbox::record(
+            "taxi_in",
+            json!({ "event": "vacate_too_short", "pts": plan.path.len() }),
+        );
+        return;
+    };
+    route.pace = pace;
+    route.done_line = Some(if plan.exit_name.is_empty() {
+        "Clear of the runway.".to_string()
+    } else {
+        format!(
+            "Clear of the runway on {}.",
+            crate::station::spoken_taxiway(&plan.exit_name)
+        )
+    });
+    crate::blackbox::record(
+        "taxi_in",
+        json!({ "event": "vacating", "rwy": rwy, "exit": plan.exit_name,
+                "pts": plan.path.len() }),
+    );
+    announce(voice, Priority::Advisory, "Clearing the runway.");
+    // Brakes off — autoland set them at the stop, and the governor reads the
+    // residual pressure as the pilot braking and never applies power (the
+    // stagnant-at-the-numbers trap, 2026-07-26).
+    let _ = xp.set_float(PARK_BRAKE, 0.0).await;
+    // Governor through the SAME front door the auto taxi and the line-up use,
+    // so every parking-brake and held-brake gate applies to a vacate
+    // unchanged. Driving without it would be a drive with nobody on the
+    // throttle, which is the one failure this module must not add.
+    let ctx = ToolCtx {
+        xplane: xp,
+        config,
+        voice: voice.as_ref(),
+        status: None,
+        reminders: None,
+    };
+    let drive_kts = crate::tools::speedhold::clamp_taxi_target(pace.turn).max(3.0);
+    let armed = crate::tools::speedhold::HoldSpeed {
+        approach_kts: None,
+        park_brake_valve_set,
+    }
+    .execute(&json!({ "knots": drive_kts }), &ctx)
+    .await;
+    if armed.is_err() || !crate::tools::speedhold::taxi_hold_active() {
+        crate::blackbox::record("taxi_in", json!({ "event": "vacate_no_governor" }));
+        return;
+    }
+    // Props out of feather before the drive rolls (the same wall auto taxi
+    // and the line-up hit): a turboprop with feathered blades makes no thrust.
+    crate::tools::prop::advance_for_ground_roll(xp, &prop).await;
+    crate::autotaxi::start(
+        config.xplane_base_url.clone(),
+        voice.clone(),
+        route,
+        drive_kts,
+    );
+
+    // Wait for it to finish. Bounded, and a timeout is not fatal: the taxi-in
+    // request goes out regardless, which is the other way off the pavement.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(VACATE_MAX_SECS);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    while crate::autotaxi::driving() {
+        if std::time::Instant::now() >= deadline {
+            crate::blackbox::record("taxi_in", json!({ "event": "vacate_timeout" }));
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    crate::blackbox::record(
+        "taxi_in",
+        json!({ "event": "vacated", "arrived": crate::autotaxi::LAST_ARRIVED.load(Relaxed) }),
+    );
+    // Report it. The tower's own taxi-in reply comes next, and a controller
+    // hearing "runway vacated" before the request is exactly the order.
+    let callsign = crate::circuit::crew_callsign(xp).await;
+    crate::circuit::transmit(crate::circuit::radio_call(&callsign, "runway vacated"));
 }
 
 async fn fly(
@@ -65,7 +230,39 @@ async fn fly(
     park_brake_valve_set: Option<f64>,
     prop: Option<crate::aircraft::PropProfile>,
     pace: crate::autotaxi::Pace,
+    vacate_from: Option<String>,
 ) {
+    // --- Phase one: get off the runway. No clearance, no request, no wait. ---
+    if let Some(rwy) = vacate_from {
+        vacate(
+            &xp,
+            &config,
+            &voice,
+            park_brake_valve_set,
+            prop.clone(),
+            pace,
+            &rwy,
+        )
+        .await;
+    }
+    // Autoland may have handed off ROLLING (taxi pace, brakes released) on the
+    // promise that the vacate drive takes over. Any vacate failure path breaks
+    // that promise, and the request wait below is minutes of nobody on the
+    // brakes — the same rule as pushback: a stage that is not moving the
+    // aircraft is holding it.
+    if !crate::autotaxi::driving() {
+        let gs = xp
+            .get_float("sim/flightmodel/position/groundspeed")
+            .await
+            .unwrap_or(0.0)
+            * 1.943_84;
+        if gs > 3.0 {
+            let _ = xp.set_float(PARK_BRAKE, 1.0).await;
+            crate::blackbox::record("taxi_in", json!({ "event": "arrest_rolling", "gs": gs }));
+        }
+    }
+
+    // --- Phase two: the taxi-in proper, from wherever phase one left us. ---
     // Ask the tower for the taxi-in unless we already hold a stand clearance.
     if !stand_route_ready() {
         let Some(khz) = crate::party_line::home_tower_khz() else {

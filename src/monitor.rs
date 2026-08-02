@@ -1652,6 +1652,11 @@ pub async fn run(
     let mut was_paused = false;
 
     loop {
+        // Settings that this tick reads (the taxi guide, the party line) are
+        // taken fresh from the live store, so a Settings-screen change applies
+        // on the next tick rather than the next boot. Boot-time values used
+        // above (the sample rate, the base URL) deliberately stay as they were.
+        let config = crate::settings::live();
         // Aircraft switched → rebuild the checks for the new airframe.
         if live.generation() != gen {
             gen = live.generation();

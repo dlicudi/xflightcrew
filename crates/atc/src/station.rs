@@ -3703,6 +3703,45 @@ fn plan_taxi_route_to_stand(
     Some(plan)
 }
 
+/// Plan the drive off `runway` from where the rollout stopped. Reached only
+/// through [`crate::party_line::plan_vacate`] — `TAXI_NET` stays station-private.
+///
+/// The active zone is asked for by BOTH ends of the strip, not just the one we
+/// landed on: apt.dat 1204 rows are per runway END (an arrival zone for 09 and
+/// another for 27 covering much the same pavement), and an edge marked only
+/// for the opposite direction is still the pavement we are trying to get off.
+pub(crate) fn plan_vacate_from(
+    lat: f64,
+    lon: f64,
+    psi_true: f64,
+    runway: &str,
+) -> Option<nav::VacatePlan> {
+    let net = TAXI_NET.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+    let mut zone = vec![runway.to_string()];
+    if let Some(r) = reciprocal_end(runway) {
+        zone.push(r);
+    }
+    net.plan_vacate(lat, lon, psi_true, &zone, nav::VACATE_CLEAR_M)
+}
+
+/// The other end of the same strip: "09L" -> "27R", "36" -> "18". `None` when
+/// the ident isn't a runway designator we can turn around.
+fn reciprocal_end(id: &str) -> Option<String> {
+    let digits: String = id.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let side: String = id[digits.len()..].to_string();
+    let n: u32 = digits.parse().ok()?;
+    if n == 0 || n > 36 {
+        return None;
+    }
+    let opp = if n > 18 { n - 18 } else { n + 18 };
+    let side = match side.as_str() {
+        "L" => "R",
+        "R" => "L",
+        s => s,
+    };
+    Some(format!("{opp:02}{side}"))
+}
+
 /// Speak a parking-stand name: spell digit runs ("Stand 12" -> "stand one
 /// two"), lowercase the rest, and prefix "stand" for a bare designator (LXGB
 /// names its gates "1".."5", so this reads "stand five", not just "five") —

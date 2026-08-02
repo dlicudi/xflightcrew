@@ -1188,6 +1188,30 @@ enum Speaker {
     Onnx(Box<crate::tts_onnx::OnnxTts>),
 }
 
+/// What the copilot's voice ACTUALLY resolved to, for the health screen:
+/// backend plus model, after every fallback. Requested and effective differ on
+/// exactly the days it matters (a model that failed to load drops to `say`,
+/// which is audible but only diagnosable in the boot log), so the screen reads
+/// this rather than `config.tts_backend`.
+static PILOT_ENGINE: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+fn publish_pilot_engine(backend: &str, model: &str) {
+    let stem = std::path::Path::new(model)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| model.to_string());
+    *PILOT_ENGINE.lock().unwrap_or_else(|e| e.into_inner()) = Some((backend.to_string(), stem));
+}
+
+/// The copilot's live (backend, voice) pair, once the speaker thread has built
+/// its engine. `None` until then.
+pub fn pilot_engine() -> Option<(String, String)> {
+    PILOT_ENGINE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 impl Speaker {
     fn build(mut config: Config) -> Self {
         #[cfg(feature = "onnx-tts")]
@@ -1195,6 +1219,7 @@ impl Speaker {
             match crate::tts_onnx::OnnxTts::load(&config.piper_voice) {
                 Ok(engine) => {
                     tracing::info!(model = %config.piper_voice, "TTS: warm in-process ONNX session");
+                    publish_pilot_engine("onnx", &config.piper_voice);
                     return Speaker::Onnx(Box::new(engine));
                 }
                 Err(e) => {
@@ -1213,6 +1238,14 @@ impl Speaker {
         // Always announce the resolved backend so the active voice is never a
         // guess — the `say`/`piper` subprocess paths were previously silent.
         tracing::info!(backend = %config.tts_backend, "TTS: subprocess backend (per-utterance)");
+        publish_pilot_engine(
+            &config.tts_backend,
+            if config.tts_backend == "piper" {
+                &config.piper_voice
+            } else {
+                &config.say_voice
+            },
+        );
         Speaker::Subprocess(Box::new(config))
     }
 
@@ -1233,12 +1266,14 @@ impl Speaker {
         match self {
             Speaker::Subprocess(config) => {
                 tracing::info!(model = %spec, "TTS: pilot voice swapped (subprocess)");
+                publish_pilot_engine(&config.tts_backend, &spec);
                 config.piper_voice = spec;
             }
             #[cfg(feature = "onnx-tts")]
             Speaker::Onnx(engine) => match crate::tts_onnx::OnnxTts::load(&spec) {
                 Ok(fresh) => {
                     tracing::info!(model = %spec, "TTS: pilot voice swapped (warm ONNX)");
+                    publish_pilot_engine("onnx", &spec);
                     **engine = fresh;
                 }
                 Err(e) => {
