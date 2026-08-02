@@ -757,6 +757,39 @@ the same breath as the claim about control. `Params.handoff_to_caller` (set by
 the two construction sites, which happen to be exactly the two cases) drops the
 "your aircraft" clause, and `spoken_height_ft` calls the height actually
 reached.
+
+**The rotation rang for four days because the damping term was measuring the
+wrong thing, and no test could fail** (2026-08-02). The initial climb oscillated
+about its 8 degree target from liftoff to the 300 ft AP handover on every
+sortie. It was diagnosed twice and "fixed" twice: the rate was smoothed (which
+made it measurably worse, since a filter puts lag where the phase margin is
+thinnest), then the law went P+I on the argument that elevator to pitch rate to
+attitude is already a double integration and a third could only ring. The
+structure was right and the ringing did not stop. Across 49 takeoffs in the
+blackbox the same-airframe pair either side of that change (SF50, EGHI 20, one
+evening) went 1.26 to 1.89 direction reversals per second and 20% to 48% of
+ticks pinned against `PITCH_MIN`: the peak-to-peak halved and the oscillation
+got FASTER, which is the shape of a damping problem, not a structural one. Both
+faults were in the one term nobody had suspected. The rate was DIFFERENCED from
+the attitude over the loop's 0.25 s tick, which amplifies every wobble in the
+read by 1/dt and carries an inherent half-sample delay, so the damping arrived
+about 50 degrees out of phase at the ~0.9 s period it actually rang at and drove
+the motion instead of opposing it. And `PITCH_LEAD_S` was 1.0 s, the far side of
+a cliff: swept against a plant, the worst-case spread is flat at 2.3 degrees
+anywhere in 0.3 to 0.5 and breaks to 10.2 at 1.0. It now damps on the sim's
+MEASURED pitch rate (`sim/flightmodel/position/Q`, already used by the recover
+tool), which needs neither differencing nor a filter, at a 0.3 s lead. 0.3 and
+not 0.5 because it is the only value that also survives the fallback when the
+read fails: a failed read must cost accuracy, not stability. The reason three
+gain changes shipped with every test passing is that the sortie test's pitch
+model is a first-order lag, and a single lag cannot ring at any gain, so it
+would have passed for ANY of them. `the_rotation_settles_instead_of_ringing`
+flies the law against a second-order plant through the loop's real transport
+delay and asserts the two numbers the blackbox reports, attitude spread and time
+spent against a stop; it fails at the shipped 1.0. Per-tick `climb_manual`
+events now carry `q` and `dt`, because the ring was in the damping path and the
+record carried nothing about what it damped on. NOT yet flown.
+
 Related trap fixed the same day: `looks_like_command` (the continuous-mode
 domain gate) matched per-token keywords only, so the split compounds
 "take off ..." and "line us up" were swallowed with no miss chime —

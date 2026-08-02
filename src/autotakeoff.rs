@@ -72,6 +72,9 @@ const TAKEOFF_ROLL: &str = "xcopilot/roll";
 const ROLL_YIELD: &str = "xcopilot/roll_yield";
 const THETA: &str = "sim/flightmodel/position/true_theta";
 const PHI: &str = "sim/flightmodel/position/true_phi";
+/// The sim's own pitch rate, deg/s — what the rotation law damps on. Measured,
+/// so it needs neither differencing nor a filter; see [`RotatePitch::step`].
+const PITCH_RATE: &str = "sim/flightmodel/position/Q";
 const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 
 const M_TO_FT: f64 = 3.280_84;
@@ -198,10 +201,19 @@ const PITCH_P_PER_DEG: f64 = 0.03;
 const PITCH_TRIM_PER_DEG_S: f64 = 0.01;
 /// The damping lead, seconds. Applied to the rate ERROR (how far off the
 /// COMMANDED rotation rate the nose is), not the raw pitch rate: damping the
-/// raw rate would fight the rotation itself, since a nose coming up at exactly
-/// the commanded 2.5°/s is doing precisely what was asked. Raised from 0.5 with
-/// the rate ramp, because it now has a rate to measure against.
-const PITCH_LEAD_S: f64 = 1.0;
+/// raw pitch rate would fight the rotation itself, since a nose coming up at
+/// exactly the commanded 2.5°/s is doing precisely what was asked.
+///
+/// It was 1.0 s, and that is the far side of a cliff. Swept against a
+/// second-order pitch plant with the loop's real transport delay
+/// (`the_rotation_settles_instead_of_ringing`), the worst-case attitude spread
+/// across the plant uncertainty runs 2.3-2.4° anywhere in 0.3-0.5 s, then
+/// breaks to 9.7° at 0.8 and 10.2° at 1.0 — the lead term stops damping the
+/// motion and starts driving it. 0.3 rather than 0.5 because it is the only
+/// value that also survives the FALLBACK rate (see `RotatePitch::step`): with
+/// a differenced attitude the same sweep gives 4.5° at 0.3 and 14.6° at 0.5.
+/// A failed read must cost accuracy, not stability.
+const PITCH_LEAD_S: f64 = 0.3;
 /// Margin below an airframe's tail-strike attitude that the rotation will not
 /// command past. The target (8°) normally sits below this anyway — the clamp
 /// exists for the OVERSHOOT, which is what actually strikes.
@@ -461,9 +473,14 @@ pub struct RotatePitch {
     /// attitude is already about a double integration; a third in the
     /// controller cannot be stabilised by one lead term at any gain.
     ///
-    /// Smoothing the rate was tried first and measurably made it WORSE
-    /// (spread 7.6° to 13.6°) — the rate feeds the DAMPING path, so filtering
-    /// it puts lag where the phase margin is thinnest.
+    /// Going P+I fixed the structure and did NOT stop the ringing, which is
+    /// the part worth remembering: across 49 takeoffs in the blackbox the
+    /// same-airframe pair either side of that change (SF50, EGHI 20, one
+    /// evening) went 1.26 -> 1.89 direction reversals per second and 20% ->
+    /// 48% of ticks pinned against `PITCH_MIN`. The peak-to-peak halved and
+    /// the oscillation got FASTER. What was actually driving it was the
+    /// damping term's rate estimate and its 1 s lead — see
+    /// [`RotatePitch::step`] and [`PITCH_LEAD_S`] (2026-08-02).
     trim: f64,
     /// The commanded attitude, ramped at [`ROTATE_RATE_DEG_S`] from wherever
     /// the nose was on the first tick. `None` until then.
@@ -493,14 +510,29 @@ impl RotatePitch {
         self.target.unwrap_or(0.0)
     }
 
-    pub fn step(&mut self, theta_deg: f64, dt_s: f64) -> f64 {
+    /// `rate_deg_s` is the sim's MEASURED pitch rate (`sim/flightmodel/
+    /// position/Q`). `None` falls back to differencing the attitude, which is
+    /// what this law did for its whole life and is the reason it rang.
+    ///
+    /// A two-sample difference over the loop's 0.25 s tick is a bad estimator
+    /// twice over: it amplifies every wobble in the attitude read by 1/dt (a
+    /// 1° tick-to-tick movement becomes 4°/s, and at the old 1 s lead that is
+    /// 4° of phantom error against a real error of 1-2°), and it carries an
+    /// inherent half-sample delay — so the DAMPING term arrives about 50° out
+    /// of phase at the ~0.9 s period the aircraft actually rang at, which
+    /// makes it drive the motion rather than oppose it. Q has neither problem:
+    /// it is measured, not differentiated, so it needs no filter (and a filter
+    /// was tried and measurably made things worse, EGHI 2026-07-30 — it put
+    /// lag back exactly where the phase margin is thinnest).
+    ///
+    /// Q is the BODY-axis rate where the law wants the Euler pitch rate; they
+    /// differ by cos(bank), and this climb holds the wings inside
+    /// `CLIMB_BANK_MAX_DEG`, so the error is under 1%.
+    pub fn step(&mut self, theta_deg: f64, rate_deg_s: Option<f64>, dt_s: f64) -> f64 {
         let dt = dt_s.clamp(0.05, 1.0);
-        // RAW rate. Smoothing it was tried and measurably made the ring WORSE
-        // (spread 7.6 deg -> 13.6 deg, EGHI 2026-07-30): this is the DAMPING
-        // path, and a filter puts lag exactly where the phase margin is thin.
-        let rate = self
-            .prev_theta
-            .map_or(0.0, |p| ((theta_deg - p) / dt).clamp(-30.0, 30.0));
+        let rate = rate_deg_s
+            .unwrap_or_else(|| self.prev_theta.map_or(0.0, |p| (theta_deg - p) / dt))
+            .clamp(-30.0, 30.0);
         self.prev_theta = Some(theta_deg);
         // The commanded attitude walks up from where the nose actually was,
         // never further than the airframe's geometry allows.
@@ -910,6 +942,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             thr_read,
             theta,
             phi,
+            pitch_q,
             pitch_yield,
             roll_yield,
         ) = tokio::join!(
@@ -924,6 +957,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             xp.get_float(&thr_dref),
             xp.get_float(THETA),
             xp.get_float(PHI),
+            xp.get_float(PITCH_RATE),
             xp.get_float(PITCH_YIELD),
             xp.get_float(ROLL_YIELD),
         );
@@ -937,6 +971,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         let agl_ft = agl_m * M_TO_FT;
         let theta_deg = theta.unwrap_or(0.0);
         let phi_deg = phi.unwrap_or(0.0);
+        // A failed read falls back to differencing the attitude inside the
+        // law — worse, but it is one tick, and it is the behaviour the whole
+        // of this loop's history flew on.
+        let pitch_rate = pitch_q.ok();
         let now_t = std::time::Instant::now();
         let dt = last_tick
             .map_or(0.15, |t| (now_t - t).as_secs_f64())
@@ -1043,6 +1081,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     // happened during the roll and the log carried no theta at
                     // all, so the peak that struck is simply not in the record.
                     "theta": theta_deg, "pitch_tgt": pitch_law.target_deg(),
+                    "q": pitch_rate,
                     "steer": steer, "trim": steer_law.trim(), "xtk_m": xtk_m,
                     "thr": thr_cmd, "remaining_m": remaining, "dt": dt,
                 }),
@@ -1064,7 +1103,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             if rotated {
                 // Wings held level through the pull — the rudder steering
                 // still owns the heading until liftoff.
-                let pitch = pitch_law.step(theta_deg, dt);
+                let pitch = pitch_law.step(theta_deg, pitch_rate, dt);
                 let ail = wings.step(phi_deg, 0.0, dt);
                 let (wp, wr) = tokio::join!(
                     xp.set_float(TAKEOFF_PITCH, pitch),
@@ -1129,7 +1168,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 // gently toward runway heading, since the rudder steering
                 // ended at liftoff.
                 let hdg_err = ((rwy.course_deg - psi + 540.0).rem_euclid(360.0)) - 180.0;
-                let pitch = pitch_law.step(theta_deg, dt);
+                let pitch = pitch_law.step(theta_deg, pitch_rate, dt);
                 let ail = wings.step(phi_deg, climb_bank_target(hdg_err), dt);
                 let (wp, wr) = tokio::join!(
                     xp.set_float(TAKEOFF_PITCH, pitch),
@@ -1151,7 +1190,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     "autotakeoff",
                     serde_json::json!({
                         "event": "climb_manual", "ias": ias, "agl": agl_ft,
-                        "theta": theta_deg, "pitch": pitch,
+                        // `q` is the measured pitch rate the damping runs on
+                        // (null = the read failed and the law differenced the
+                        // attitude instead), and `dt` the tick it was sampled
+                        // over. The 2026-08-02 diagnosis needed both and the
+                        // record carried neither: the ring was in the DAMPING
+                        // path, and nothing logged what it damped on.
+                        "theta": theta_deg, "pitch": pitch, "q": pitch_rate, "dt": dt,
+                        "pitch_tgt": pitch_law.target_deg(),
                         "phi": phi_deg, "ail": ail, "hdg_err": hdg_err,
                     }),
                 );
@@ -1612,7 +1658,7 @@ mod tests {
         let mut law = RotatePitch::new(None);
         // First tick from a nose-on-the-ground attitude: the commanded target
         // starts THERE, so the error is small and the elevator stays gentle.
-        let first = law.step(0.0, 0.15);
+        let first = law.step(0.0, None, 0.15);
         // "Gentle" is a small FRACTION of the available pull, not a number a
         // pure integrator produced for free by starting at zero. The law is
         // P+I now, so the first tick is deliberately non-zero — that is the
@@ -1631,12 +1677,12 @@ mod tests {
         // 2.5°/s, and no further than the 8° target.
         let mut ramp = RotatePitch::new(None);
         for _ in 0..14 {
-            ramp.step(0.0, 0.15);
+            ramp.step(0.0, None, 0.15);
         }
         let t = ramp.target_deg();
         assert!((t - 2.1 * ROTATE_RATE_DEG_S).abs() < 1.5, "ramping: {t}");
         for _ in 0..60 {
-            ramp.step(0.0, 0.15);
+            ramp.step(0.0, None, 0.15);
         }
         assert!(
             (ramp.target_deg() - ROTATE_PITCH_DEG).abs() < 1e-6,
@@ -1650,7 +1696,7 @@ mod tests {
         let mut theta = 0.0;
         let mut peak: f64 = 0.0;
         for _ in 0..60 {
-            let out = good.step(theta, 0.15);
+            let out = good.step(theta, None, 0.15);
             peak = peak.max(out);
             theta = (theta + ROTATE_RATE_DEG_S * 0.15).min(ROTATE_PITCH_DEG);
         }
@@ -1667,7 +1713,7 @@ mod tests {
         // 9.5° geometry, 2° margin → 7.5°, below the law's own 8° target.
         let mut md = RotatePitch::new(Some(9.5));
         for _ in 0..80 {
-            md.step(0.0, 0.15);
+            md.step(0.0, None, 0.15);
         }
         assert!(
             (md.target_deg() - 7.5).abs() < 1e-6,
@@ -1677,11 +1723,11 @@ mod tests {
         // Past the ceiling, the law pushes back rather than holding the pull.
         let mut over = RotatePitch::new(Some(9.5));
         for _ in 0..40 {
-            over.step(0.0, 0.15);
+            over.step(0.0, None, 0.15);
         }
         let pulling = over.out;
         for _ in 0..20 {
-            over.step(11.0, 0.15);
+            over.step(11.0, None, 0.15);
         }
         assert!(
             over.out < pulling,
@@ -1691,7 +1737,7 @@ mod tests {
         // No limit declared → the plain 8° target, unchanged.
         let mut ga = RotatePitch::new(None);
         for _ in 0..80 {
-            ga.step(0.0, 0.15);
+            ga.step(0.0, None, 0.15);
         }
         assert!((ga.target_deg() - ROTATE_PITCH_DEG).abs() < 1e-6);
     }
@@ -1703,11 +1749,11 @@ mod tests {
         // aircraft levitated off at 98 with 250 m left. The rotation law is
         // an integrating elevator pull to the target attitude.
         let mut law = RotatePitch::default();
-        let first = law.step(0.0, 0.15);
+        let first = law.step(0.0, None, 0.15);
         assert!(first > 0.0, "nose on the ground, pull back: {first}");
         let mut out = first;
         for _ in 0..40 {
-            out = law.step(0.0, 0.15);
+            out = law.step(0.0, None, 0.15);
         }
         assert!(out > 0.3, "an unresponsive nose earns more pull: {out}");
         assert!(out <= PITCH_MAX + 1e-9, "capped: {out}");
@@ -1715,22 +1761,21 @@ mod tests {
         // elevator the trim state demands at this speed.
         let mut settled = RotatePitch::default();
         for _ in 0..10 {
-            settled.step(ROTATE_PITCH_DEG - 1.0, 0.15);
+            settled.step(ROTATE_PITCH_DEG - 1.0, None, 0.15);
         }
-        // The rate estimate is SMOOTHED (see RotatePitch::rate), so arriving
-        // at the target leaves a decaying rate residue for a few ticks before
-        // the pull is truly standing. Let the filter settle, then it must hold
-        // dead still — and it must CONVERGE on the way, never wander.
+        // Arriving at the target leaves a rate residue for a tick or two
+        // before the pull is truly standing. Let that wash out, then it must
+        // hold dead still — and it must CONVERGE on the way, never wander.
         let mut prev_gap = f64::MAX;
         for _ in 0..20 {
-            let x = settled.step(ROTATE_PITCH_DEG, 0.15);
-            let y = settled.step(ROTATE_PITCH_DEG, 0.15);
+            let x = settled.step(ROTATE_PITCH_DEG, None, 0.15);
+            let y = settled.step(ROTATE_PITCH_DEG, None, 0.15);
             let gap = (x - y).abs();
             assert!(gap <= prev_gap + 1e-9, "must converge, not ring: {gap}");
             prev_gap = gap;
         }
-        let a = settled.step(ROTATE_PITCH_DEG, 0.15);
-        let b = settled.step(ROTATE_PITCH_DEG, 0.15);
+        let a = settled.step(ROTATE_PITCH_DEG, None, 0.15);
+        let b = settled.step(ROTATE_PITCH_DEG, None, 0.15);
         assert!(
             a > 0.0 && (a - b).abs() < 1e-6,
             "holds at target: {a} vs {b}"
@@ -1738,16 +1783,172 @@ mod tests {
         // A nose rising fast toward the target backs the pull off (the
         // rate lead), so the rotation doesn't slingshot past the attitude.
         let mut rising = RotatePitch::default();
-        let before = rising.step(2.0, 0.15);
-        let after = rising.step(6.0, 0.15);
+        let before = rising.step(2.0, None, 0.15);
+        let after = rising.step(6.0, None, 0.15);
         assert!(after < before, "fast rise backs off: {before} -> {after}");
         // And the nose-down authority is a fraction of the pull: this law
         // rotates, it never bunts.
         let mut over = RotatePitch::default();
         for _ in 0..100 {
-            over.step(30.0, 0.15);
+            over.step(30.0, None, 0.15);
         }
         assert!(over.out >= PITCH_MIN - 1e-9, "floor holds: {}", over.out);
+    }
+
+    /// A second-order pitch plant: elevator commands pitch ACCELERATION,
+    /// aero damping opposes the rate, static stability opposes the attitude.
+    /// `m0` is a standing nose-up moment — climb power plus a nose-up
+    /// stabiliser, which is what makes holding the target need nose-DOWN
+    /// elevator against a floor of only [`PITCH_MIN`].
+    ///
+    /// This is the order the real aircraft has, and it is the whole point: the
+    /// sortie test's pitch model is a first-order lag, and a single lag cannot
+    /// ring at any gain, which is why the law rang through three gain changes
+    /// with every test passing.
+    struct PitchPlant {
+        theta: f64,
+        q: f64,
+        wn: f64,
+        zeta: f64,
+        m_delta: f64,
+        m0: f64,
+    }
+
+    impl PitchPlant {
+        fn new(zeta: f64, m0: f64) -> Self {
+            PitchPlant {
+                theta: 0.0,
+                q: 0.0,
+                wn: 2.5,
+                zeta,
+                m_delta: 167.0,
+                m0,
+            }
+        }
+        fn advance(&mut self, elevator: f64, dur_s: f64) {
+            let h = 0.005_f64;
+            let mut left = dur_s;
+            while left > 1e-9 {
+                let step = h.min(left);
+                let qd = self.m_delta * elevator + self.m0
+                    - 2.0 * self.zeta * self.wn * self.q
+                    - self.wn * self.wn * self.theta;
+                self.q += qd * step;
+                self.theta += self.q * step;
+                left -= step;
+            }
+        }
+    }
+
+    /// Fly the rotation law against that plant through the loop's real
+    /// transport delay (a REST write does not reach the aircraft the instant
+    /// it is computed) and measure what the blackbox measures: the attitude
+    /// spread once the ramp has arrived, and how much of the time the elevator
+    /// is pinned against a stop.
+    ///
+    /// Returns (spread_deg, saturated_fraction).
+    fn fly_rotation(zeta: f64, m0: f64, lag_s: f64, measured_rate: bool) -> (f64, f64) {
+        let mut plant = PitchPlant::new(zeta, m0);
+        let mut law = RotatePitch::default();
+        // A deterministic stand-in for the wobble in a real attitude read —
+        // the differencing estimator's whole problem is what it does to this.
+        // A deterministic LCG, because the wobble must actually wobble: this
+        // is the ±0.05° the differencing estimator turns into ±0.2°/s of
+        // phantom rate at a 0.25 s tick, which is the whole mechanism under
+        // test. (Written first as a float recurrence that silently collapsed
+        // to a constant zero — a noise source stuck at zero makes the fallback
+        // path look better than it is.)
+        let mut seed = 1_u32;
+        let mut wobble = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (f64::from(seed >> 8) / f64::from(1_u32 << 23) - 1.0) * 0.05
+        };
+        let mut pending: Vec<(f64, f64)> = Vec::new();
+        let mut applied = 0.0;
+        let (mut t, dt) = (0.0_f64, 0.25_f64);
+        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+        let (mut ticks, mut saturated) = (0.0, 0.0);
+        while t < 18.0 {
+            let rate = measured_rate.then_some(plant.q);
+            let cmd = law.step(plant.theta + wobble(), rate, dt);
+            pending.push((t + lag_s, cmd));
+            // Advance the plant across the tick, applying commands as they land.
+            let (mut now, end) = (t, t + dt);
+            while now < end - 1e-9 {
+                let next = pending
+                    .iter()
+                    .map(|&(at, _)| at)
+                    .filter(|&at| at > now && at < end)
+                    .fold(end, f64::min);
+                plant.advance(applied, next - now);
+                now = next;
+                while let Some(i) = pending.iter().position(|&(at, _)| at <= now) {
+                    applied = pending.remove(i).1;
+                }
+            }
+            t = end;
+            // Measure once the ramp has had time to deliver the nose.
+            if t > 5.0 {
+                lo = lo.min(plant.theta);
+                hi = hi.max(plant.theta);
+                ticks += 1.0;
+                if cmd <= PITCH_MIN + 1e-9 || cmd >= PITCH_MAX - 1e-9 {
+                    saturated += 1.0;
+                }
+            }
+        }
+        (hi - lo, saturated / ticks)
+    }
+
+    /// The rotation must SETTLE on the target, not ring about it.
+    ///
+    /// Four takeoffs at EGHI on one evening, same airframe either side of the
+    /// P+I change: 1.26 -> 1.89 direction reversals per second, 20% -> 48% of
+    /// ticks hard against `PITCH_MIN`. Every sortie after it was the same
+    /// shape (08-01: 57% and 2.42/s; 08-02: 48% and 2.27/s, ~0.9 s period,
+    /// holding 7.0-10.8 about an 8 degree target). The structure was not the
+    /// fault — the DAMPING term was, on both counts: a rate differenced from
+    /// the attitude over a 0.25 s tick, and a 1 s lead on it.
+    ///
+    /// This is the test that could have caught it. The plant is second order
+    /// with the loop's transport delay, so it CAN ring; the assertions are the
+    /// two numbers the blackbox reports.
+    #[test]
+    fn the_rotation_settles_instead_of_ringing() {
+        // Across the plant uncertainty — damping, standing nose-up moment, and
+        // how long a REST write takes to reach the aircraft.
+        for zeta in [0.35, 0.45, 0.55] {
+            for m0 in [0.0, 20.0, 40.0] {
+                for lag in [0.10, 0.20, 0.30] {
+                    let (spread, sat) = fly_rotation(zeta, m0, lag, true);
+                    assert!(
+                        spread < 4.0,
+                        "rings: {spread:.1} deg spread (zeta {zeta}, m0 {m0}, lag {lag})"
+                    );
+                    assert!(
+                        sat < 0.05,
+                        "camps on a stop: {:.0}% of ticks (zeta {zeta}, m0 {m0}, lag {lag})",
+                        sat * 100.0
+                    );
+                }
+            }
+        }
+        // The fallback — no measured rate, the law differences the attitude —
+        // must cost accuracy, not stability. This is why PITCH_LEAD_S is 0.3
+        // and not the 0.5 the measured path alone would allow: at 0.5 this
+        // same sweep reaches a 14.6 degree spread with 31% saturation.
+        for lag in [0.10, 0.20, 0.30] {
+            let (spread, sat) = fly_rotation(0.45, 40.0, lag, false);
+            assert!(spread < 6.0, "fallback rings: {spread:.1} deg (lag {lag})");
+            assert!(sat < 0.05, "fallback camps: {:.0}%", sat * 100.0);
+        }
+        // And the shipped lead is on the flat part of the curve, not the edge
+        // of a cliff: the whole failure was a constant sitting past one.
+        let at_ship = fly_rotation(0.45, 40.0, 0.20, true).0;
+        assert!(
+            at_ship < 2.5,
+            "the tuned point must be comfortable: {at_ship:.1} deg"
+        );
     }
 
     #[test]
@@ -2015,7 +2216,7 @@ mod tests {
             }
             let mut pitch = 0.0;
             if rotated {
-                pitch = pitch_law.step(af.theta_deg, dt);
+                pitch = pitch_law.step(af.theta_deg, None, dt);
                 sim.set_float(TAKEOFF_PITCH, pitch).await.unwrap();
             }
 
