@@ -1446,7 +1446,42 @@ one-poll flicker, and the pattern is issued BEFORE the release — the aircraft
 is never brakeless with a tug that has no instruction yet. The
 still-unanswered question is narrower now: whether the flag goes solid once
 the tug finishes positioning (the pilot's experience says it will), and the
-next sortie's blackbox answers it.
+next sortie's blackbox answers it. **It did** (Malaga, 2026-08-03): the hook
+went solid and held, the brakes came off on a real connection, and the tug
+pushed. So the push itself is SOLVED, and what the same two sorties then
+exposed is that everything downstream of it was judging the result against
+numbers a tug cannot deliver.
+
+**A pattern is ninety degrees, and that belongs in the arithmetic** (2026-08-03,
+Malaga, two identical sorties at one stand). The tug ran a textbook Nose 90 both
+times: 55 m back, the nose swung 041 to 311, then it stopped and let go exactly
+as the command says it will. Both were reported to the pilot as "the tug let go
+early" — the same wrong verb the 2026-07-28 Stansted fix removed one state
+earlier, and this time it cost the whole ground chain. Three faults compound and
+they are all the same fault. (1) The PLAN wanted 135.4 degrees, which one
+pattern can never satisfy, and nothing checked that when the plan was made:
+`done()` wants ±6 and the release-time "good enough" test wanted ±20, so a
+44.6-degree residual failed both. (2) The loop's answer to that residual was
+`steer_for(-44.6)` — ANOTHER 90-degree swing, which would have left us 45
+degrees off the other way. `worth_another_pattern` is the missing question:
+another pattern helps only while real DISTANCE is owed (a straight segment
+earns its ask) or at least HALF a swing is, because 45 degrees is the point
+below which the next pattern overshoots by more than the error it was sent to
+remove. (3) The re-issue then waited `REHOOK_SECS` for a tug that has never
+once come back — `reissued_after_release` fired four times across the entire
+blackbox and `rehooked` answered it zero times, four for four, each costing the
+full deadline before the identical give-up. The premise was "it is standing at
+the nose"; measured, the hook takes MINUTES (262 s and 268 s here, 90 s at
+Luton) because it is a vehicle driving across an airport, and a released one
+drives away. So the bar coming off now ENDS the push, and the only question is
+`push_delivered` — has the tug delivered what a tug CAN deliver. Forty degrees
+and 55 m off the stand is the taxi join's problem, and the join is built for
+it (141 degrees under its own steam, Gatwick 2026-07-27); a metre and a half
+is still a genuine failure and still reported as one. The stall path also
+learned that only a tug ON THE BAR can take an instruction: without that gate
+the stall clock and the release branch both fired inside one tick (`issued` #2
+and `reissued_after_release` #3, 0.6 s apart), spending the whole budget on a
+tug that had already gone.
 
 Depth (added 2026-07-28, evening): four traps of the same family — a fact one
 part of the system knows and another needs. The taxi GUIDE narrated a

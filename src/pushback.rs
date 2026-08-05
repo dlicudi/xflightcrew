@@ -78,6 +78,16 @@ const MAX_BACK_M: f64 = 120.0;
 const DEAD_DEG: f64 = 6.0;
 /// Close enough to "pointing down the lane" to let the tug go.
 const ALIGN_DEG: f64 = 20.0;
+/// What ONE pattern delivers. X-Plane's commands are whole manoeuvres named
+/// "Nose 90 left" / "Nose 90 right", and every measured trail agrees: a clean
+/// ~90-degree swing, then the tug stops and lets go. This is a fact about the
+/// SIM, and it belongs in the arithmetic — a plan wanting 135 degrees cannot
+/// be satisfied by one pattern no matter how patiently we wait for it.
+const PATTERN_DEG: f64 = 90.0;
+/// Meaningfully short of the planned distance — enough that another straight
+/// segment is worth an ask. Under this the remaining metres are the taxi
+/// drive's to cover in its first seconds.
+const SHORT_PUSH_M: f64 = 10.0;
 /// Extra distance the turn may use past the planned stop before we stop
 /// anyway — the push ENDS, aligned or not, rather than reversing across the
 /// apron in search of the last twenty degrees.
@@ -138,10 +148,10 @@ const MAX_ISSUES: u32 = 3;
 const MAX_SECS: f64 = 300.0;
 /// How long to wait for the tug to unhook and clear before taxiing.
 const TUG_CLEAR_SECS: f64 = 30.0;
-/// How long to wait for the tug to take the bar AGAIN for a continuation
-/// segment. It is standing at the nose, not driving across the airport —
-/// the Stansted re-hook after a completed segment took seconds.
-const REHOOK_SECS: f64 = 60.0;
+// There is deliberately no re-hook deadline. A released tug is never asked
+// back: `reissued_after_release` fired four times across the whole blackbox
+// and `rehooked` never once answered it, so the wait was a pure four-for-four
+// tax on the give-up. See the release branch in `run_inner`.
 /// Rolled FORWARD this far from the stand and no tug is pushing us — we are
 /// creeping under our own idle thrust with the brakes off. Ends the push,
 /// brakes on. Past `MOVED_M` so the same jitter both tests tolerate cannot
@@ -286,6 +296,42 @@ pub fn sense_is_wrong(
 /// enough past that to stop chasing the alignment across the apron.
 pub fn done(back_m: f64, err_deg: f64, plan: &Plan) -> bool {
     back_m >= plan.back_m + CHASE_M || (back_m >= plan.back_m && err_deg.abs() <= ALIGN_DEG)
+}
+
+/// Would asking for ANOTHER pattern actually improve things?
+///
+/// Two ways it can, and only two. Real DISTANCE is still owed, which a
+/// straight segment earns. Or at least half a SWING is — and half is the bar
+/// because a pattern is 90 degrees whether we want 90 or 10, so below 45 the
+/// next one overshoots by more than the error it was sent to remove.
+///
+/// At Malaga the tug ran a textbook Nose 90: 55 m back, the nose swung 041 to
+/// 311, and it stopped and let go exactly as the command says it will. The
+/// plan had wanted 135 degrees, which one pattern can never deliver, so the
+/// loop found a 44.6-degree residual and asked for another 90 — a swing that
+/// would have left us 45 degrees off the OTHER way. Twice, on two sorties at
+/// the same stand (2026-08-03).
+pub fn worth_another_pattern(back_m: f64, err_deg: f64, plan: &Plan) -> bool {
+    if back_m >= plan.back_m + CHASE_M {
+        return false; // past the plan and its chase margin: stop spending apron
+    }
+    back_m < plan.back_m - SHORT_PUSH_M || err_deg.abs() >= PATTERN_DEG / 2.0
+}
+
+/// Has the tug delivered everything a tug CAN deliver? [`done`] is the PLANNED
+/// finish; this is the achievable one, and the difference is what failed two
+/// perfectly executed pushes.
+///
+/// The residual belongs to the taxi drive, which is built for it: the join
+/// pure-pursuits onto the route from any angle and has turned a nose-in Twin
+/// Otter through 141 degrees under its own steam (Gatwick, 2026-07-27). Forty
+/// degrees is a taxi turn, not a turn-around, and refusing to hand it over
+/// costs the pilot a "the tug let go early" for a manoeuvre they watched go
+/// perfectly out of the window — the same wrong verb the 2026-07-28 Stansted
+/// fix removed one state earlier.
+pub fn push_delivered(back_m: f64, err_deg: f64, plan: &Plan) -> bool {
+    done(back_m, err_deg, plan)
+        || (back_m >= MIN_BACK_M && !worth_another_pattern(back_m, err_deg, plan))
 }
 
 /// Smallest signed angle a−b, degrees, in −180..180.
@@ -710,10 +756,9 @@ async fn run_inner(
         // nothing sent after the initial issue (2026-07-28). Treating it as
         // "tug let go early" failed a push that was executing perfectly.
         //
-        // So: aligned enough, or out of asks — the push is complete. Short of
-        // the plan with asks left — issue the next pattern, which SUMMONS the
-        // tug back to the bar (it is standing at the nose), and wait for the
-        // re-hook like the first hook, bounded much tighter.
+        // So the bar coming off ENDS the push, either way — the only question
+        // is whether what the tug delivered is usable (`push_delivered`), and
+        // there is no asking it back once it has let go.
         //
         // Gated on the bar having ever been SEEN on (`saw_attached`): on an
         // airframe where the attach flag reads false through a real push, the
@@ -723,56 +768,24 @@ async fn run_inner(
         if towed && !towing && !attached && saw_attached {
             let err_now =
                 angle_diff_deg(plan.target_hdg, xp.get_float(PSI_TRUE).await.unwrap_or(0.0));
-            let complete =
-                done(back_m, err_now, plan) || (back_m >= MIN_BACK_M && err_now.abs() <= ALIGN_DEG);
-            if complete || issues >= MAX_ISSUES {
-                event(json!({ "event": "tug_finished", "back_m": r1(back_m),
-                              "err": r1(err_now), "complete": complete }));
-                if complete {
-                    break;
-                }
-                let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
-                return Err("tug_released".into());
+            let delivered = push_delivered(back_m, err_now, plan);
+            event(json!({ "event": "tug_finished", "back_m": r1(back_m),
+                          "err": r1(err_now), "delivered": delivered }));
+            if delivered {
+                break;
             }
-            cmd = steer_for(err_now, sense);
-            issues += 1;
-            event(
-                json!({ "event": "reissued_after_release", "pattern": cmd.action(),
-                          "issue": issues, "err": r1(err_now) }),
-            );
-            // BRAKES ON FIRST. The bar is off, so nothing is holding us — and
-            // the engines are running, which is the whole of the rule at the
-            // hook-up release above ("the first moment releasing them is safe
-            // is when something is holding the aircraft"). Waiting out the
-            // re-hook brakeless is the same hole the tug WAIT had before
-            // 2026-07-27, one state later: at Southampton the tug let go after
-            // 1.2 m, this wait ran its full minute, and the Baron rolled
-            // FORWARD off the stand at idle thrust to 21 kt while the module
-            // believed it was standing still — the tower berated us for being
-            // off the cleared route and the pilot had to stop it by voice
-            // (2026-08-01).
+            // Short, and the bar is OFF: that is the end of the push. There is
+            // no summoning it back — `reissued_after_release` fired four times
+            // across the whole blackbox and `rehooked` has never once fired
+            // against it, four for four, each costing the full REHOOK_SECS
+            // before the same give-up. The premise was that the tug "is
+            // standing at the nose"; measured, the hook takes minutes (262 s
+            // and 268 s at Malaga, 90 s at Luton) because it is a vehicle
+            // driving across an airport, and a released one drives away.
+            // Failing here immediately hands the fallback taxi four hundred
+            // wasted seconds back.
             let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
-            send(ctx, cmd.action()).await;
-            let rehooked = wait_for(REHOOK_SECS, abort, || async {
-                let (a, t) =
-                    tokio::join!(xp.get_float(PUSH_ATTACHED), xp.get_float(TOW_IN_PROGRESS));
-                a.unwrap_or(0.0) > 0.5 || t.unwrap_or(0.0) > 0.5
-            })
-            .await;
-            if !rehooked {
-                send(ctx, "stop").await;
-                // Already set above; re-assert, since the give-up path is the
-                // one a fallback taxi picks up from.
-                let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
-                event(json!({ "event": "no_rehook", "back_m": r1(back_m) }));
-                return Err("tug_released".into());
-            }
-            // On the bar again: same handshake as the first hook-up.
-            let _ = crate::tools::controls::drive_park_brake(ctx.xplane, false, valve_set).await;
-            event(json!({ "event": "rehooked" }));
-            turn_since = (cmd != Steer::Straight).then_some((Instant::now(), err_now));
-            moved_at = Instant::now();
-            continue;
+            return Err("tug_released".into());
         }
         // On the bar but going nowhere: ask again, once. The first command
         // only summoned the truck. Re-issue THE SAME pattern — the nudge used
@@ -860,7 +873,15 @@ async fn run_inner(
             moved_m = back_m;
             moved_at = Instant::now();
         } else if towed && moved_at.elapsed().as_secs_f64() >= STALL_SECS {
-            if issues >= MAX_ISSUES || back_m >= plan.back_m {
+            // Only a tug still ON THE BAR can take an instruction. Without
+            // this the stall clock and the release branch both fired within
+            // one tick at Malaga — `issued` #2 and `reissued_after_release`
+            // #3, 0.6 s apart — spending the whole budget on a tug that had
+            // already let go (2026-08-03).
+            if issues >= MAX_ISSUES
+                || !worth_another_pattern(back_m, err, plan)
+                || (saw_attached && !attached)
+            {
                 event(json!({ "event": "tug_finished", "back_m": r1(back_m), "err": r1(err) }));
                 break;
             }
@@ -1104,6 +1125,47 @@ mod tests {
         assert!(!sense_is_wrong(true, false, 30.0, 64.6, 154.8, 1));
         // A turn that's working is left alone, however long it runs.
         assert!(!sense_is_wrong(true, true, 60.0, 64.6, 20.0, 1));
+    }
+
+    /// A pattern is 90 degrees, so a plan wanting 135 cannot be finished by
+    /// one — and the residual it leaves is a taxi turn, not a failure. The
+    /// exact Malaga numbers, both sorties (2026-08-03): stand heading 041,
+    /// lane 265.9, so 135.4 degrees owed; the tug pushed 55 m and swung the
+    /// nose to 311, textbook, and both pushes were reported to the pilot as
+    /// "the tug let go early".
+    #[test]
+    fn a_completed_ninety_is_a_delivered_push_not_a_failure() {
+        let plan = Plan {
+            back_m: 56.35,
+            target_hdg: 265.9,
+            node: (LAT0, LON0),
+        };
+        // What the tug actually delivered, and what the loop asked next.
+        assert!(
+            !worth_another_pattern(53.9, -44.6, &plan),
+            "another 90 from 44.6 degrees off overshoots 45 the other way"
+        );
+        assert!(
+            push_delivered(53.9, -44.6, &plan),
+            "55 m back and 45 degrees off is the taxi join's problem, not the tug's"
+        );
+        // It is NOT the planned finish — that is the whole point of the split.
+        assert!(!done(53.9, -44.6, &plan));
+
+        // Still owed half a swing: worth the ask, and not yet delivered.
+        assert!(worth_another_pattern(53.9, -95.0, &plan));
+        assert!(!push_delivered(53.9, -95.0, &plan));
+        // Still owed real distance, however well aligned: a straight segment
+        // earns its ask.
+        assert!(worth_another_pattern(20.0, 2.0, &plan));
+        assert!(!push_delivered(20.0, 2.0, &plan));
+        // Past the plan and its chase margin: stop spending apron either way.
+        assert!(!worth_another_pattern(90.0, -95.0, &plan));
+
+        // A tug that let go after a metre is still a genuine failure — the
+        // Southampton push (2026-08-01) must not be waved through as
+        // "delivered" by the new leniency.
+        assert!(!push_delivered(1.2, -130.0, &plan));
     }
 
     /// The tug's dead air is survived by HOLDING, not by failing. Three EGHI
