@@ -3697,7 +3697,8 @@ fn plan_taxi_route_to_stand(
 ) -> Option<nav::TaxiRoutePlan> {
     let net = TAXI_NET.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
     let stand = net.nearest_stand(lat, lon)?.clone();
-    let mut plan = net.plan(lat, lon, stand.lat, stand.lon, 0.0, &[])?;
+    // To the STAND, not to the taxiway node nearest it — see `plan_to_stand`.
+    let mut plan = net.plan_to_stand(lat, lon, &stand)?;
     plan.holding_point = stand.name.clone();
     mark_runway_crossings(&mut plan, runways);
     Some(plan)

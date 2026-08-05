@@ -1606,6 +1606,22 @@ one makes clearing the runway more urgent, not less. A stale ident is harmless
 where the stop was not, since `plan_vacate` refuses unless we are on an
 authored runway edge. NOT yet flown.
 
+**The apron is where the network stops, and an arrival has to get past it**
+(same sortie). apt.dat routes taxiways; the lead-in painted into a stand is
+mostly not in the network at all, so `plan`'s destination snap put the last
+point at whatever node lay nearest the stand and the drive finished there —
+66 m short of stand W5 at Malaga, parked across the live taxiway the tower had
+just cleared somebody else down, twice, having named the stand both times.
+`plan_to_stand` continues the route from that node to the stand itself, and the
+continuation rides the paint like everything else (`STAND_LEAD_IN_MAX_M` 120 m,
+because a stand further out than that is not the one this route serves and
+driving blind across an unseen apron is worse than stopping short of it). The
+leg carries no NAME: an apron lead-in is not a taxiway, and the guide would
+otherwise call a turn "onto" something that is on no chart. At LEMG the route
+now finishes 0.0 m from W5. The departure mirror has been right since the
+lead-on landed — a route ends short of the runway ON PURPOSE there, and the
+drawn line carries it the rest of the way.
+
 Depth (added 2026-07-28, evening): four traps of the same family — a fact one
 part of the system knows and another needs. The taxi GUIDE narrated a
 **pushback** ("Rolling again. Sharp left next, onto Bravo" with the tug

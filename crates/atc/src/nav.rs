@@ -589,6 +589,19 @@ const PAINT_PARALLEL_DEG: f64 = 25.0;
 /// how finely the drive can be asked to trace a fillet.
 const PAINT_SAMPLE_M: f64 = 5.0;
 
+/// How far past the network's last node a stand may sit and still be driven
+/// to. The routing network stops at the taxiway; the apron lead-in into a
+/// stand is usually not modelled at all, so without this the drive finishes
+/// at the nearest node and parks ON THE TAXIWAY — 66 m from stand W5 at
+/// Malaga, across the lane the tower had just cleared somebody else down
+/// (2026-08-05). Bounded because past this the "stand" is not the one this
+/// route serves and driving blind across an apron is worse than stopping.
+const STAND_LEAD_IN_MAX_M: f64 = 120.0;
+
+/// ...and inside this the route already ends at the stand; anything shorter
+/// is inside the tolerance of where the aircraft parks anyway.
+const STAND_LEAD_IN_MIN_M: f64 = 6.0;
+
 /// The default hold-short standoff: how far back from the runway-junction
 /// node a planned route ends. Clears the painted line at GA fields
 /// (30-50 m from the centreline); callers pass more for instrument
@@ -1070,6 +1083,53 @@ impl TaxiNet {
             .iter()
             .filter(|s| s.is_suitable())
             .min_by(|a, b| d2(a).total_cmp(&d2(b)))
+    }
+
+    /// [`plan`](Self::plan) to a STAND — the arrival mirror of
+    /// [`plan_to_runway`](Self::plan_to_runway), and it exists for the same
+    /// reason: the network's nearest node is not the destination.
+    ///
+    /// A departure's route ends short of the runway ON PURPOSE and the drawn
+    /// lead-on carries it the rest of the way. An arrival's ended short by
+    /// ACCIDENT, because apt.dat routes taxiways and mostly does not model
+    /// the apron: the plain snap put the last point at whatever node lay
+    /// nearest the stand and the drive stopped there, which at Malaga was
+    /// 66 m short of stand W5 and parked across a live taxiway — twice, the
+    /// tower having named the stand both times (2026-08-05).
+    ///
+    /// So the route is continued from that node to the stand itself, and the
+    /// continuation rides the paint like everything else: the lead-in to a
+    /// stand IS a drawn line at any field that paints one, and where none is
+    /// drawn the straight leg is what the pavement is for. Bounded by
+    /// [`STAND_LEAD_IN_MAX_M`] — a stand further out than that is not the one
+    /// this route serves, and the old stop-at-the-node behaviour is better
+    /// than inventing a drive across an unseen apron.
+    pub fn plan_to_stand(&self, from_lat: f64, from_lon: f64, stand: &Stand) -> Option<TaxiRoutePlan> {
+        let mut plan = self.plan(from_lat, from_lon, stand.lat, stand.lon, 0.0, &[])?;
+        let end = *plan.path.last()?;
+        let m_per_deg_lon = 111_320.0 * stand.lat.to_radians().cos();
+        let gap = {
+            let (dx, dy) = (
+                (stand.lon - end.1) * m_per_deg_lon,
+                (stand.lat - end.0) * 111_320.0,
+            );
+            (dx * dx + dy * dy).sqrt()
+        };
+        if !(STAND_LEAD_IN_MIN_M..=STAND_LEAD_IN_MAX_M).contains(&gap) {
+            return Some(plan);
+        }
+        // Sampled and snapped exactly like a planned leg, so a drawn lead-in
+        // is followed where there is one. The leg carries no NAME: an apron
+        // lead-in is not a taxiway, and the guide would otherwise invent a
+        // turn "onto" something the pilot cannot see on the chart.
+        let (lead, lead_seg) = ride_paint(
+            &self.paint,
+            &[end, (stand.lat, stand.lon)],
+            &[(String::new(), false)],
+        );
+        plan.path.extend(lead.into_iter().skip(1));
+        plan.seg.extend(lead_seg);
+        Some(plan)
     }
 
     /// Route from a position to a position (a stand to a runway threshold)
@@ -2803,6 +2863,79 @@ mod tests {
         assert_eq!(bare_seg, seg);
     }
 
+    /// An arrival is driven to the STAND, not to the taxiway node nearest it.
+    ///
+    /// The network models the taxiway and stops; the apron lead-in usually
+    /// isn't in it at all. At Malaga that left the aircraft parked 66 m short
+    /// of the stand the tower had named, across a live taxiway, twice
+    /// (2026-08-05).
+    #[test]
+    fn an_arrival_is_driven_onto_the_stand_the_tower_named() {
+        let dir = std::env::temp_dir().join(format!("xvl_stand_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("apt.dat");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "I").unwrap();
+        writeln!(f, "1000 Generated").unwrap();
+        writeln!(f, "1 10 0 0 TEST Test Field").unwrap();
+        // A taxiway east-west; the stand sits 60 m north of its east end,
+        // with nothing in the network to reach it.
+        let a = ll(0.0, 0.0);
+        let b = ll(200.0, 0.0);
+        let stand_p = ll(200.0, 60.0);
+        writeln!(f, "1201 {:.7} {:.7} both 1 A", a.0, a.1).unwrap();
+        writeln!(f, "1201 {:.7} {:.7} both 2 A", b.0, b.1).unwrap();
+        writeln!(f, "1202 1 2 twoway taxiway A").unwrap();
+        writeln!(
+            f,
+            "1300 {:.7} {:.7} 0.0 gate jets|props Stand 1",
+            stand_p.0, stand_p.1
+        )
+        .unwrap();
+        drop(f);
+        let net = find_taxi_net(path.to_str().unwrap(), "TEST")
+            .unwrap()
+            .expect("a network");
+        let stand = net.stands[0].clone();
+        let plan = net.plan_to_stand(a.0, a.1, &stand).expect("a route");
+        let end = *plan.path.last().unwrap();
+        let off = |p: (f64, f64), q: (f64, f64)| {
+            let dx = (p.1 - q.1) * 111_320.0 * LAT0.to_radians().cos();
+            let dy = (p.0 - q.0) * 111_320.0;
+            (dx * dx + dy * dy).sqrt()
+        };
+        assert!(
+            off(end, stand_p) < 1.0,
+            "the drive must finish at the stand, not {:.0} m short on the taxiway",
+            off(end, stand_p)
+        );
+        assert_eq!(
+            plan.seg.len(),
+            plan.path.len() - 1,
+            "the lead-in keeps seg aligned"
+        );
+        assert!(
+            plan.seg.last().is_some_and(|s| s.0.is_empty() && !s.1),
+            "an apron lead-in is not a named taxiway: {:?}",
+            plan.seg.last()
+        );
+
+        // Too far to be this route's stand: the old stop-at-the-node
+        // behaviour, because driving blind across an apron is worse than
+        // stopping short of it.
+        let far = Stand {
+            lat: ll(200.0, 300.0).0,
+            lon: ll(200.0, 300.0).1,
+            ..stand.clone()
+        };
+        let plan = net.plan_to_stand(a.0, a.1, &far).expect("a route");
+        assert!(
+            off(*plan.path.last().unwrap(), (far.lat, far.lon)) > 100.0,
+            "a stand out of lead-in range is not driven to"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A runway leg is left alone, and with it the point a vacate starts
     /// from. The crossing runs square across every taxi line near it, the
     /// strip's own markings are not linear features, and the aircraft's own
@@ -2950,6 +3083,25 @@ mod tests {
             median < 0.5,
             "the route should ride the drawn line, median {median:.2} m off"
         );
+
+        // And the arrival mirror, from where that sortie's taxi-in stopped:
+        // the route must finish ON the stand, not at the taxiway node the
+        // aircraft actually parked on (66 m short of W5, twice).
+        let (plat, plon) = (36.680758, -4.502952);
+        let stand = net.nearest_stand(plat, plon).expect("LEMG has stands").clone();
+        let plan = net
+            .plan_to_stand(plat, plon, &stand)
+            .expect("a route to the stand");
+        let end = *plan.path.last().unwrap();
+        let short = {
+            let (dx, dy) = (
+                (stand.lon - end.1) * m_per_deg_lon,
+                (stand.lat - end.0) * 111_320.0,
+            );
+            (dx * dx + dy * dy).sqrt()
+        };
+        println!("stand {} : route finishes {short:.1} m from it", stand.name);
+        assert!(short < 5.0, "parks {short:.0} m short of stand {}", stand.name);
     }
 
     /// The real Southampton network behind the fix above.
