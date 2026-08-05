@@ -90,6 +90,17 @@ pub fn vacate_runway() -> Option<String> {
     (crate::party_line::clearance_state() == Some(crate::tower::State::ClearedToLand))
         .then(crate::party_line::clearance_runway)
         .flatten()
+        // No standing clearance is not evidence we are not on a runway. The
+        // clearance was the best PROXY available for "we just landed, and on
+        // which strip" — but autoland knows the answer directly, and there
+        // are ordinary ways to hold no clearance while sitting on the
+        // pavement: a controller-ordered go-around voids it (Malaga
+        // 2026-08-05, where the vacate then refused and the aircraft stopped
+        // dead on runway 13 with an arrival at 1.3 nm), and copilot-only mode
+        // never has one at all. A stale ident is harmless here in a way the
+        // stop was not: `plan_vacate` refuses outright unless the aircraft is
+        // actually on an authored runway edge.
+        .or_else(crate::autoland::landed_runway)
 }
 
 /// A stand (arrival) route is already published — the drive can start now.

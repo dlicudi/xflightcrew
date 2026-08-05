@@ -328,6 +328,27 @@ fn rollout_brake_ratio(gs_kts: f64, target_kts: f64, remaining_m: f64) -> f64 {
 /// me" — where nobody follows — always brakes to a stop as before.
 pub static VACATE_FOLLOWS: AtomicBool = AtomicBool::new(false);
 
+/// The runway this autoland actually rolled out on, set at rollout entry.
+///
+/// Where we ARE, as against where a clearance says we should be — and for
+/// vacating, being on the strip is the whole of the question. A landing
+/// clearance can be missing for reasons that have nothing to do with the
+/// pavement under the wheels: at Malaga the tower ordered a go-around, which
+/// voided the clearance, the second approach was never re-cleared, and the
+/// vacate — gated on a STANDING clearance — refused. The aircraft braked to
+/// a stop on runway 13 and sat there through four incursion warnings with an
+/// arrival closing to 1.3 nm (2026-08-05). Landing without a clearance makes
+/// clearing the runway more urgent, not less.
+static LANDED_RUNWAY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The runway the last autoland rolled out on, if it has not been consumed.
+pub fn landed_runway() -> Option<String> {
+    LANDED_RUNWAY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Rollout starts only after weight-on-wheels. The speed terms distinguish a
 /// landing from a low pass once on the surface; they must never substitute for
 /// the ground signal because a normal flare can satisfy both in the air.
@@ -427,6 +448,18 @@ pub fn run_autoland(
 
             let mut last_phase: Option<ApproachPhase> = None;
             let mut go_around = GoAroundLatch::new();
+            // Drain any go-around order left on the party line before this
+            // approach existed. The flag is a latch, not a queue: an order
+            // shouted at somebody else's approach half an hour ago must not
+            // balk this one on its first tick.
+            let _ = crate::party_line::take_pending_go_around();
+            // The final report owed on a SECOND approach. The circuit or the
+            // arrival makes the first one, which is what earns the landing
+            // clearance; a missed approach then flies away, and until this
+            // existed nothing called again — eleven minutes of missed
+            // approach at Malaga with the tower waiting on "report downwind",
+            // then a landing without a clearance (2026-08-05).
+            let mut owe_final_report = false;
             // The "going around" transmission: said once per balked landing,
             // with the callsign read from the aircraft the first time it's
             // needed (an HTTP read, so not on every tick).
@@ -514,6 +547,9 @@ pub fn run_autoland(
                     if !rolling_out {
                         rolling_out = true;
                         vacate_follows = VACATE_FOLLOWS.swap(false, Ordering::SeqCst);
+                        // Wheels on this runway: the fact the vacate needs.
+                        *LANDED_RUNWAY.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(rwy.id.clone());
                     }
                     let xtk_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
                     let target = crate::autotakeoff::roll_target_heading(rwy.course_deg, xtk_m);
@@ -591,6 +627,20 @@ pub fn run_autoland(
                 // guidance turns back to the FAP immediately, which is a killer
                 // at 50 ft (see [`GoAroundLatch`]).
                 let along_nm = along_track_nm(lat, lon, &rwy);
+                // A controller's order beats anything the approach thinks of
+                // itself. Consumed here rather than in the main loop because
+                // this is the thing that can ACT on it; the flag is drained
+                // at arm time above, so only an order given during this
+                // approach can trip it.
+                if crate::party_line::take_pending_go_around()
+                    && go_around.order(on_ground > 0.5)
+                {
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "ordered_go_around", "radio": radio_ft,
+                                           "dist": raw.dist_nm}),
+                    );
+                }
                 let missed = go_around.update(
                     last_phase,
                     raw.phase,
@@ -608,6 +658,10 @@ pub fn run_autoland(
                 // ClearedToLand throughout. Announced ONCE, on the arming tick.
                 if missed == Some(MissedStage::Climb) && !said_going_around {
                     said_going_around = true;
+                    // The go-around VOIDS the landing clearance, so this
+                    // approach owes the tower a fresh final report before it
+                    // can be cleared again — the call that earns it.
+                    owe_final_report = true;
                     if going_around_callsign.is_none() {
                         going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
                     }
@@ -616,6 +670,33 @@ pub fn run_autoland(
                     crate::blackbox::record(
                         "autoland",
                         serde_json::json!({"event": "going_around", "radio": radio_ft}),
+                    );
+                }
+                // Back on final after a missed approach: report it. The first
+                // approach is reported by whoever set this one up (the
+                // circuit's own "final runway ...", or full auto's arrival);
+                // the second is nobody's until here, and a tower that never
+                // hears from us again holds nothing to clear us with. Said on
+                // the way IN — established on final, inside the FAP — because
+                // "final" is a position report and it has to be true.
+                if owe_final_report
+                    && missed.is_none()
+                    && raw.phase == ApproachPhase::Final
+                    && raw.dist_nm <= FAP_NM
+                {
+                    owe_final_report = false;
+                    if going_around_callsign.is_none() {
+                        going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
+                    }
+                    let cs = going_around_callsign.clone().flatten();
+                    crate::circuit::transmit(crate::circuit::radio_call(
+                        &cs,
+                        &format!("final runway {}", crate::circuit::spell_runway(&rwy.id)),
+                    ));
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "final_report", "rwy": rwy.id,
+                                           "dist": raw.dist_nm}),
                     );
                 }
                 // Cleared to try again: the next balked landing is a new call.
@@ -1131,6 +1212,34 @@ impl GoAroundLatch {
     /// Go-arounds flown so far this approach.
     pub fn attempts(&self) -> u32 {
         self.attempts
+    }
+
+    /// A controller ORDERED a go-around: fly it, now, from wherever we are.
+    ///
+    /// Every other entry to a missed approach is something the aircraft
+    /// noticed about itself (off the centreline at flare height, past the
+    /// numbers still airborne). This one comes from outside and outranks all
+    /// of it — the tower can see the runway and we cannot. Returns whether
+    /// this call started one, so the caller records it once.
+    ///
+    /// Malaga, 2026-08-05: "cleared to land" at 13:41:06 and "GO AROUND,
+    /// traffic on the runway" at 13:41:07. The order was published on the
+    /// party line and SPOKEN, and nothing consumed it — the approach flew on
+    /// for another seventy seconds, past a 0.5 nm same-altitude conflict, and
+    /// only balked because it happened to arrive high. The clearance the
+    /// order voided was never re-earned, so the aircraft then landed without
+    /// one, could not vacate for want of it, and sat on the runway with an
+    /// arrival inside two miles. One unread flag cost all of that.
+    ///
+    /// Ignored once on the ground: a landing that has already happened is not
+    /// a landing to abandon, and the rollout is the safer place to be.
+    pub fn order(&mut self, on_ground: bool) -> bool {
+        if on_ground || self.stage.is_some() {
+            return false;
+        }
+        self.stage = Some(MissedStage::Climb);
+        self.attempts += 1;
+        true
     }
 
     /// Advance the latch one tick: `prev`/`now` are the raw guidance phases,
@@ -2257,6 +2366,45 @@ mod tests {
             l.update(Some(Intercept), Intercept, 1600.0, join, join, join),
             None
         );
+    }
+
+    /// A controller's order starts a missed approach from wherever we are,
+    /// and it counts like any other.
+    ///
+    /// Malaga 2026-08-05: "cleared to land" and, one second later, "GO
+    /// AROUND, traffic on the runway". Nothing consumed the order — the
+    /// approach flew on for another seventy seconds through a 0.5 nm
+    /// same-altitude conflict and only balked because it happened to be
+    /// high.
+    #[test]
+    fn an_ordered_go_around_is_flown_from_wherever_the_approach_is() {
+        use ApproachPhase::*;
+        let mut l = GoAroundLatch::new();
+        // Established on final, stable, nothing wrong with the approach: the
+        // aircraft would never have called this one itself.
+        assert_eq!(l.update(Some(Final), Final, 600.0, 2.0, 2.0, FAP_NM), None);
+        assert!(l.order(false), "the order starts one");
+        assert_eq!(l.stage, Some(MissedStage::Climb));
+        assert_eq!(l.attempts(), 1, "an ordered go-around is still a go-around");
+        // Idempotent while one is already being flown — a controller
+        // repeating the order must not restart the climb or burn an attempt.
+        assert!(!l.order(false));
+        assert_eq!(l.attempts(), 1);
+        // And it flies on as usual from there: climb clear of the ground,
+        // then reposition. (The raw guidance under a climb-away reads
+        // Intercept — it is already turning back toward the FAP, which is
+        // exactly what the latch exists to override until we are clear.)
+        assert_eq!(
+            l.update(Some(Final), Intercept, 900.0, 0.5, -0.5, 6.0),
+            Some(MissedStage::Reposition),
+            "clear of the ground, so reposition"
+        );
+
+        // On the ground it is too late: a landing that has already happened
+        // is not one to abandon, and the rollout is the safer place to be.
+        let mut rolled = GoAroundLatch::new();
+        assert!(!rolled.order(true));
+        assert_eq!(rolled.attempts(), 0);
     }
 
     #[test]

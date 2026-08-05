@@ -1577,6 +1577,35 @@ on both sides, and a signed value silently disables such a test on one of them.
 Exactly the trap the taxi guide hit when four knots backwards read as four
 forwards during a pushback, one module over.
 
+**One unread flag cost the entire arrival** (2026-08-05, Malaga, the circuit
+flown right after the paint fix). At 13:41:06 the tower cleared us to land; at
+13:41:07 it ordered "go around, traffic on the runway". `PENDING_GO_AROUND` had
+been published on the party line since the day it was written and NOTHING EVER
+CONSUMED IT, so the approach flew on for another seventy seconds — through a
+0.5 nm same-altitude conflict — and balked only because it happened to arrive
+high. Then the cascade, where every link is a fact the previous link owed it.
+The order VOIDS the landing clearance, and the missed approach never reported
+again (the circuit makes the first "final" call; autoland's re-approach made
+none), so eleven minutes later the aircraft landed without a clearance and the
+tower said so. No clearance meant `vacate_runway` — gated on a STANDING
+ClearedToLand — returned `None`, the vacate never ran, `taxi_in` arrested the
+roll where it stood, and the Baron sat ON runway 13 through four incursion
+warnings with an arrival closing to 1.3 nm. One fix per link.
+`GoAroundLatch::order` flies a controller's order from wherever the approach
+is, and it outranks everything the aircraft notices about itself, because the
+tower can see the runway and we cannot; consumed in the autoland loop (the
+thing that can ACT on it) rather than the main loop, drained at arm time so a
+stale order cannot balk the next approach, and refused once on the ground,
+where a landing that has already happened is not one to abandon. Autoland then
+owes a fresh `final` report after any go-around, made established inside the
+FAP because a position report has to be true. And `vacate_runway` falls back to
+`autoland::landed_runway`, the strip the wheels actually rolled out on: no
+standing clearance is not evidence that we are not on a runway (an ordered
+go-around voids it, and copilot-only mode never has one), and landing without
+one makes clearing the runway more urgent, not less. A stale ident is harmless
+where the stop was not, since `plan_vacate` refuses unless we are on an
+authored runway edge. NOT yet flown.
+
 Depth (added 2026-07-28, evening): four traps of the same family — a fact one
 part of the system knows and another needs. The taxi GUIDE narrated a
 **pushback** ("Rolling again. Sharp left next, onto Bravo" with the tug
