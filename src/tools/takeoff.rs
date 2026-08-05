@@ -45,6 +45,9 @@ pub struct AutoTakeoff {
     /// `fly_route` about to arm the enroute legs is the handoff-truth bug in
     /// its last remaining home (audit, 2026-08-02).
     pub handoff_to_caller: bool,
+    /// The airframe's park-brake valve SET sense (profile), for the brakes-off
+    /// at brake release.
+    pub park_brake_valve_set: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -186,6 +189,7 @@ impl Tool for AutoTakeoff {
                 // Registry copy: the pilot asked, the pilot gets the
                 // aircraft. Full auto's copy sets true — see the field doc.
                 handoff_to_caller: self.handoff_to_caller,
+                park_brake_valve_set: self.park_brake_valve_set,
                 tail_strike_deg: self.tail_strike_deg,
                 vne_kts: self.vne_kts,
                 apt_dat: super::autoland::apt_dat_path(),

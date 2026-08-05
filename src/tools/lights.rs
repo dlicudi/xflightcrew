@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use sim::xplane::XPlane;
+
 use super::{Tool, ToolCtx};
 use crate::aircraft::LightProfile;
 
@@ -72,6 +74,71 @@ impl SetLights {
     }
 }
 
+/// Read one 0/1 switch dataref, which may be an array element (`name[i]`).
+async fn read_switch(xp: &dyn XPlane, dr: &str) -> Option<bool> {
+    let (base, idx) = split_index(dr);
+    let v = match idx {
+        Some(i) => xp.get_float_array(base).await.ok()?.get(i).copied()?,
+        None => xp.get_float(base).await.ok()?,
+    };
+    Some(v > 0.5)
+}
+
+/// Drive one profile light to `on` and report the state it ACTUALLY reached.
+///
+/// The single writer for this, shared by the `set_lights` tool and the
+/// copilot's own night-lights watch ([`crate::cockpit_auto`]) — the same rule
+/// the transponder mode learned on the Twin Otter's KT73: two callers writing
+/// one switch by two routes is how one of them silently stops working. Every
+/// mechanism a profile can declare lives here (toggle-only switches read before
+/// firing, a command that animates the panel, a plain write, and the extra
+/// datarefs one "light" can be), and so does the readback every caller's trust
+/// rests on.
+pub async fn apply(xp: &dyn XPlane, light: &LightProfile, on: bool) -> Result<bool> {
+    // Toggle-only lights (the Citation X: every light is a toggle, and its
+    // datarefs are read-only over the API) — read each switch and fire only
+    // where it differs, so "on" can never turn an already-on switch off.
+    if !light.toggles.is_empty() {
+        for t in &light.toggles {
+            if read_switch(xp, &t.dataref).await != Some(on) {
+                xp.run_command(&t.command).await?;
+            }
+        }
+    } else {
+        let cmd = if on {
+            light.command_on.as_deref()
+        } else {
+            light.command_off.as_deref()
+        };
+        let (base, idx) = split_index(&light.dataref);
+        match cmd {
+            // Prefer the command: it animates the 3D switch, where a raw write
+            // may set the value and leave the panel looking untouched.
+            Some(c) => xp.run_command(c).await?,
+            None => match idx {
+                Some(i) => xp.set_int_array_elem(base, i, on as i64).await?,
+                None => xp.set_int(base, on as i64).await?,
+            },
+        }
+        // One panel light can be two switches (the Citation X's landing lights
+        // are independent left and right; the Baron's roof floods are a left
+        // and a right pod). Drive the rest to the same state, or the aircraft
+        // flies half lit with a readback that confirms the half it happened to
+        // look at.
+        for extra in &light.also_datarefs {
+            let (ebase, eidx) = split_index(extra);
+            match eidx {
+                Some(i) => xp.set_int_array_elem(ebase, i, on as i64).await?,
+                None => xp.set_int(ebase, on as i64).await?,
+            }
+        }
+    }
+    // The readback is the point: confirm the ACTION, never the intent.
+    read_switch(xp, &light.dataref)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("readback failed for {}", light.dataref))
+}
+
 #[async_trait]
 impl Tool for SetLights {
     fn name(&self) -> &str {
@@ -119,102 +186,34 @@ impl Tool for SetLights {
             }
         };
 
-        // Prefer the command (it animates the panel switch); fall back to a raw
-        // dataref write if the profile doesn't supply one. Either way, read the
-        // dataref back and confirm the *actual* state. The dataref may be an
-        // array element (`landing_lights_switch[0]` on the SR22/Evolution) — the
-        // v1 lookup 404s on the bracketed name, so split it (seen live: "switch
-        // landing lights off" flipped the light, then the readback 404'd and the
-        // whole tool reported failure).
-        // Toggle-only lights (the Citation X: every light is a toggle, and its
-        // datarefs are read-only over the API) — read each switch and fire only
-        // where it differs, then fall through to the readback below.
-        if !light.toggles.is_empty() {
-            for t in &light.toggles {
-                let (tb, ti) = split_index(&t.dataref);
-                let now_on = match ti {
-                    Some(i) => ctx
-                        .xplane
-                        .get_float_array(tb)
-                        .await
-                        .ok()
-                        .and_then(|v| v.get(i).copied())
-                        .unwrap_or(0.0),
-                    None => ctx.xplane.get_float(tb).await.unwrap_or(0.0),
-                } > 0.5;
-                if now_on != args.on {
-                    ctx.xplane.run_command(&t.command).await?;
-                }
-            }
-            let (rb, ri) = split_index(&light.dataref);
-            let actual_on = match ri {
-                Some(i) => ctx
-                    .xplane
-                    .get_float_array(rb)
-                    .await?
-                    .get(i)
-                    .copied()
-                    .unwrap_or(0.0),
-                None => ctx.xplane.get_float(rb).await?,
-            } > 0.5;
-            return Ok(if actual_on == args.on {
-                format!(
-                    "Roger, {} {}.",
-                    light.spoken,
-                    if args.on { "on" } else { "off" }
-                )
-            } else {
-                format!("The {} didn't move.", light.spoken)
-            });
-        }
-        let cmd = if args.on {
-            light.command_on.as_deref()
-        } else {
-            light.command_off.as_deref()
-        };
-        let (base, idx) = split_index(&light.dataref);
-        match cmd {
-            Some(c) => ctx.xplane.run_command(c).await?,
-            None => match idx {
-                Some(i) => {
-                    ctx.xplane
-                        .set_int_array_elem(base, i, args.on as i64)
-                        .await?
-                }
-                None => ctx.xplane.set_int(base, args.on as i64).await?,
-            },
-        }
-        // One panel light can be two switches (the Citation X's landing lights
-        // are independent left and right). Drive the rest to the same state, or
-        // the aircraft flies half lit with a readback that confirms the half it
-        // happened to look at.
-        for extra in &light.also_datarefs {
-            let (ebase, eidx) = split_index(extra);
-            match eidx {
-                Some(i) => {
-                    ctx.xplane
-                        .set_int_array_elem(ebase, i, args.on as i64)
-                        .await?
-                }
-                None => ctx.xplane.set_int(ebase, args.on as i64).await?,
-            }
-        }
-        let actual_on = match idx {
-            Some(i) => ctx
-                .xplane
-                .get_float_array(base)
-                .await?
-                .get(i)
-                .copied()
-                .unwrap_or(0.0),
-            None => ctx.xplane.get_float(base).await?,
-        } > 0.5;
+        // One shared writer owns every mechanism and the readback (see
+        // [`apply`]). The dataref may be an array element
+        // (`landing_lights_switch[0]` on the SR22/Evolution) — the v1 lookup
+        // 404s on the bracketed name, so it is split there (seen live: "switch
+        // landing lights off" flipped the light, then the readback 404'd and
+        // the whole tool reported failure).
+        let actual_on = apply(ctx.xplane, light, args.on).await?;
 
-        Ok(format!(
-            "Roger, {} {}.",
-            light.spoken,
-            if actual_on { "on" } else { "off" }
-        ))
+        // The pilot reached for a switch the copilot also drives, so the
+        // copilot drops its claim: daybreak must leave this where the PILOT
+        // left it, not undo their decision hours later.
+        if light.auto_at_night {
+            crate::cockpit_auto::note_pilot_moved_lights();
+        }
+
+        // Confirm the ACTION against what was asked. The toggle path already
+        // did this; the write path used to report whatever the readback said,
+        // so a write that silently failed answered "Roger, landing lights off"
+        // to "landing lights on" — a readback that confirms itself.
+        Ok(if actual_on == args.on {
+            format!(
+                "Roger, {} {}.",
+                light.spoken,
+                if args.on { "on" } else { "off" }
+            )
+        } else {
+            format!("The {} didn't move.", light.spoken)
+        })
     }
 }
 
@@ -232,11 +231,21 @@ const FLOOD_COPILOT_IDX: usize = 1;
 /// array element written as `name[i]`.
 pub struct SetFloodLights {
     override_dataref: Option<String>,
+    /// A flood switch that is a TOGGLE command with a read-only position, which
+    /// no write can drive (the Baron 58). Takes precedence over
+    /// `override_dataref`.
+    toggle: Option<crate::aircraft::ToggleSwitch>,
 }
 
 impl SetFloodLights {
-    pub fn new(override_dataref: Option<String>) -> Self {
-        Self { override_dataref }
+    pub fn new(
+        override_dataref: Option<String>,
+        toggle: Option<crate::aircraft::ToggleSwitch>,
+    ) -> Self {
+        Self {
+            override_dataref,
+            toggle,
+        }
     }
 }
 
@@ -299,6 +308,23 @@ impl Tool for SetFloodLights {
                 )
             }
         };
+
+        // A toggle-command flood (the Baron 58: `flood_light_switch` is a
+        // COMMAND, and its position dataref is read-only). Read first and fire
+        // only if it differs — a toggle fired as "on" turns the light off
+        // whenever it was already on, which is worse than having no tool.
+        if let Some(t) = &self.toggle {
+            let on = level > 0.5;
+            if read_switch(ctx.xplane, &t.dataref).await != Some(on) {
+                ctx.xplane.run_command(&t.command).await?;
+            }
+            return Ok(match read_switch(ctx.xplane, &t.dataref).await {
+                Some(actual) if actual == on => {
+                    format!("Roger, flood lights {}.", if on { "on" } else { "off" })
+                }
+                _ => "The flood lights didn't move.".to_string(),
+            });
+        }
 
         // Profile override: a single on/off switch (the King Air's overhead flood
         // is `generic_lights_switch[0]`, a switch, not a rheostat — so it's on/off,

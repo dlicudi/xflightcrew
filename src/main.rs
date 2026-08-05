@@ -17,6 +17,7 @@ mod autotaxi;
 mod cabin;
 mod checklist;
 mod circuit;
+mod cockpit_auto;
 mod config;
 mod failures;
 mod full_auto;
@@ -5227,7 +5228,17 @@ fn reference_limits(profile: &aircraft::AircraftProfile, t: &str) -> Option<Stri
             parts.push(format!("best glide {}", kt(v)));
         }
     }
-    if t.contains("approach") || t.contains("landing speed") || t.contains("final approach") {
+    // "approach" alone is a COMMAND word as often as a question word: "fly
+    // the approach" / "shoot the approach" arm the procedure follower, and a
+    // bare contains() swallowed the command here and answered "approach
+    // around 100 knots" to a pilot trying to start the Malaga arrival
+    // (2026-08-02). A speed question about the approach always carries a
+    // speed word; require one.
+    if t.contains("landing speed")
+        || t.contains("vref")
+        || (t.contains("approach")
+            && (t.contains("speed") || t.contains("knots") || t.contains("how fast")))
+    {
         if let Some(v) = r.and_then(|r| r.approach_kts) {
             parts.push(format!("approach around {}", kt(v)));
         }
@@ -7221,6 +7232,15 @@ mod tests {
         );
         // A non-limits utterance returns nothing.
         assert!(super::reference_limits(&p, "set flaps ten").is_none());
+        // A COMMAND naming the approach is not a speed question: "fly the
+        // approach" was swallowed here and answered "approach around 100
+        // knots" instead of arming the Malaga arrival (2026-08-02). The
+        // question keeps working; it always carries a speed word.
+        assert!(super::reference_limits(&p, "fly the approach").is_none());
+        assert!(super::reference_limits(&p, "shoot the approach").is_none());
+        assert!(super::reference_limits(&p, "what's our approach speed")
+            .unwrap()
+            .contains("approach around"));
 
         // The SR22 carries its own card — different numbers, same machinery.
         let sr = super::aircraft::load("cirrus_sr22").expect("sr22 profile");

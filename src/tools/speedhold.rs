@@ -92,6 +92,17 @@ const PILOT_BRAKE_RESUME: f64 = 0.05;
 ///
 /// The caller must only trust these reads once `tools::brake_cmd_quiet()` —
 /// our own held stop command rides the same parking-brake ratio while active.
+///
+/// Both of those guards are CLOCKS, and a clock cannot see a latch. If
+/// something makes one of our own brake applications permanent, it outlives
+/// `governor_braking` and it outlives `brake_cmd_quiet`, and this then reports
+/// the governor's own squeeze as the pilot's foot — forever, since nothing will
+/// ever release a brake nobody knows is on. That is not hypothetical: it is
+/// what stranded a Baron at Malaga through the park-brake valve (2026-08-03).
+/// The lesson is upstream of here. Anything that can turn a momentary brake
+/// into a latched one must be disarmed before the drive starts
+/// ([`crate::tools::controls::ensure_park_brake_valve`]), because at this end
+/// our own brake and the pilot's are genuinely indistinguishable.
 fn pilot_took_the_brakes(left: f64, right: f64, parkbrake: f64, governor_braking: bool) -> bool {
     !governor_braking && (left.min(right) > PILOT_BRAKE_YIELD || parkbrake > PILOT_BRAKE_YIELD)
 }
@@ -326,6 +337,31 @@ pub fn brake_slew(prev: f64, want: f64, dt_s: f64) -> f64 {
     prev + (want - prev).clamp(-step, step)
 }
 
+/// Must this quiet tick WRITE a zero to the proportional brake channel?
+///
+/// Two reasons. We were braking and have stopped, so the squeeze is released
+/// promptly rather than left to the channel's expiry. Or this governor has not
+/// zeroed the channel even once, which makes the arm-time state explicit
+/// instead of inherited — a fresh governor starts with `braking` false, so
+/// without this the release branch never runs at all on a drive that never
+/// brakes.
+///
+/// The second half was written to fix the Malaga stall on the theory that the
+/// toe RATIOS latch across a standdown, and that theory is WRONG — worth
+/// keeping here, because a fix with a plausible story attached is how the
+/// `tow_in_progress` dead code survived a fortnight. Probed live the next day
+/// (2026-08-03) with the aircraft still stuck: `left_brake_ratio` and
+/// `right_brake_ratio` both read 0.0 and `override_toe_brakes` 0, so the
+/// plugin's expiry cleans up after itself exactly as documented. What was
+/// actually holding the Baron was `parking_brake_ratio`, latched at the value
+/// of the governor's own squeeze by the park-brake VALVE — see
+/// [`crate::tools::controls::ensure_park_brake_valve`], which is the real fix.
+/// This one stays because zeroing a channel you have not zeroed is honest and
+/// costs one write, not because it was ever the bug.
+pub fn should_release_brake_channel(braking: bool, already_released: bool) -> bool {
+    braking || !already_released
+}
+
 pub struct HoldSpeed {
     /// The profile's final-approach speed, for "hold approach speed".
     pub approach_kts: Option<f64>,
@@ -475,6 +511,26 @@ impl Tool for HoldSpeed {
                 );
             }
         }
+        // The valve is ISOLATED for the whole drive, not merely as a side
+        // effect of releasing a brake that happened to be set. It has to be
+        // unconditional, because the failure needs no parking brake to start
+        // it: left in the SET position the valve traps brake pressure, and the
+        // governor's own proportional squeezes — whose entire contract is that
+        // they expire within a second — latch into `parking_brake_ratio` at
+        // whatever value was squeezed. The tick after that reads its own brake
+        // as the pilot's foot and pauses, so the drive stops itself and waits
+        // forever for a pilot who is not braking (Malaga, BE58, 2026-08-03:
+        // one 0.10 anticipatory squeeze at 9 kt, stopped four seconds later,
+        // stagnant with 602 of 631 m to run). An airframe declaring no valve
+        // is untouched.
+        if taxi {
+            super::controls::ensure_park_brake_valve(
+                ctx.xplane,
+                false,
+                self.park_brake_valve_set,
+            )
+            .await;
+        }
         let target = if taxi {
             match a.knots {
                 Some(k) => clamp_taxi_target(k),
@@ -579,6 +635,21 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
     // The proportional channel failed once (plugin absent or old): warned,
     // trims fall back to the held command for the rest of this governor.
     let mut trim_fallback = false;
+    // Whether the proportional channel has been zeroed since this governor
+    // armed. It has NOT, and that is the whole of this flag: the channel's
+    // plugin override expires in a second, but the toe ratios KEEP the last
+    // value written under it, and on an airframe with no toe-brake axis
+    // assigned nothing re-drives them back to zero. So a governor that stopped
+    // while holding a stop leaves the brakes on at 0.5 — invisibly, since it
+    // is not the parking brake, lights no annunciator, and the pilot has no
+    // pedal to clear it with. The NEXT drive then inherits them: at Malaga a
+    // Baron made 0.66 kt in eighty-five seconds, spun 73 degrees on the spot
+    // and was called stagnant, and both of that day's taxis peaked at 3.9 and
+    // 0.7 kt against 11-14 on every day before it (2026-08-03; probed live,
+    // the ratios still read 0.5 minutes after standdown and a plain write of
+    // zero stuck, so nothing at all was re-driving them). Cleared once on arm,
+    // so no drive can ever start against the last one's brakes.
+    let mut brake_released = false;
     // The slewed brake actually written (the squeeze), and its clock.
     let mut brake_out = 0.0_f64;
     let mut last_brake_t: Option<std::time::Instant> = None;
@@ -855,6 +926,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     }
                     if brake_out > 0.005 {
                         let mut smoothed = false;
+                        brake_released = false;
                         if !trim_fallback {
                             match xp.set_float(TAXI_BRAKE, brake_out).await {
                                 Ok(()) => smoothed = true,
@@ -875,13 +947,23 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                                 }
                             }
                         }
-                    } else if braking && !trim_fallback {
+                    } else if should_release_brake_channel(braking, brake_released) && !trim_fallback
+                    {
                         // Release the trim channel promptly instead of riding
                         // out its expiry; a failure here is covered by that
                         // same expiry, so it's only worth a debug line.
+                        //
+                        // The `!brake_released` half is the ARM-TIME clear (see
+                        // the flag): expiry frees the override, never the
+                        // ratios, so the first quiet tick of every governor
+                        // must write the zero that the last one's stop left
+                        // behind. Without it a fresh governor's `braking`
+                        // starts false, this branch never fires, and the drive
+                        // rolls against brakes it did not set and cannot see.
                         if let Err(e) = xp.set_float(TAXI_BRAKE, 0.0).await {
                             tracing::debug!("speed governor: brake release write failed: {e:#}");
                         }
+                        brake_released = true;
                         brake_out = 0.0;
                     }
                     braking = brake_out > 0.005;
@@ -898,8 +980,35 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
         }
     }
     tracing::info!("speed governor stopped");
-    // Nothing to clean on the way out: the held brake command expires by
-    // itself within BRAKE_HOLD_SECS, however this loop ended.
+    // The held brake COMMAND expires by itself within BRAKE_HOLD_SECS, and
+    // that is all this used to say. The proportional CHANNEL is the other
+    // half and it does not clean up after itself: its override expires, its
+    // ratios do not (see `brake_released`). So a governor that stops while
+    // squeezing hands the pilot a boot on the pedals they cannot find or
+    // release.
+    //
+    // Released here only when something ELSE is holding the aircraft — the
+    // parking brake, which is exactly what every caller sets at the end of a
+    // drive ("Holding position, brakes set"). Zeroing it unconditionally
+    // would be the opposite failure, an aircraft rolling off a stand at idle
+    // with nobody on the brakes, which this project has already paid for
+    // twice. Still squeezing with no park brake set, the squeeze stays and is
+    // logged: the arm-time clear above means it can no longer poison the next
+    // drive, and a warning beats a silent latch.
+    if braking && !trim_fallback {
+        let held = xp.get_float(PARK_BRAKE).await.unwrap_or(0.0) > 0.5;
+        if held {
+            if let Err(e) = xp.set_float(TAXI_BRAKE, 0.0).await {
+                tracing::debug!("speed governor: exit brake release failed: {e:#}");
+            }
+        } else {
+            tracing::warn!(
+                brake_out,
+                "speed governor: stopped mid-squeeze with no parking brake — \
+                 leaving the brakes on rather than letting it roll"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1142,5 +1251,26 @@ mod tests {
             !pilot_took_the_brakes(0.0, 0.0, 0.36, true),
             "our stop, not their toggle"
         );
+    }
+
+    /// No drive may start against the last drive's brakes. The channel's
+    /// override expires, its toe ratios do not, and nothing re-drives them on
+    /// an airframe with no toe-brake axis — so the release has to be WRITTEN,
+    /// and a fresh governor is exactly the case that used to skip it.
+    #[test]
+    fn a_fresh_governor_clears_the_last_ones_brakes() {
+        // The bug, in one line: `braking` starts false on arm, so gating the
+        // release on it alone means the very first tick writes nothing and the
+        // taxi rolls against an inherited 0.5 (Malaga, 2026-08-03).
+        assert!(
+            should_release_brake_channel(false, false),
+            "arm-time clear: never inherit the last governor's squeeze"
+        );
+        // Once cleared, a quiet tick stays quiet — this is not an every-tick
+        // write, and the API load report is the reason to care.
+        assert!(!should_release_brake_channel(false, true));
+        // Coming off a squeeze always releases promptly, cleared or not.
+        assert!(should_release_brake_channel(true, true));
+        assert!(should_release_brake_channel(true, false));
     }
 }

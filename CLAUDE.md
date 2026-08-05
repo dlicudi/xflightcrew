@@ -193,6 +193,54 @@ rather than by a pattern leg with nowhere to go. A failed track read counts as
 NOT rolled out: it can only cost a tick, where the opposite hands over the very
 thing the guard exists to prevent.
 
+**A name in a profile is not evidence the thing exists, and the copilot has
+hands as well as a voice** (2026-08-02, the Baron again). Adding its roof flood
+lights meant probing the live sim for them, and the probe convicted the entry
+already sitting two lines above: `flood_lights_dataref` was
+`laminar/b58/lighting/flood_light_switch`, and NO DATAREF OF THAT NAME EXISTS.
+The name belongs to a COMMAND ("Flood Light Toggle Switch"), so every
+`set_flood_lights` on this airframe wrote into nothing and then read nothing
+back, and nobody noticed because a tool that fails silently and a tool that
+works look identical from the cockpit unless you watch the switch. Its real
+position is `laminar/b58/flood_light_toggle/switch_pos`, read-only, so it needs
+the same read-before-firing toggle the Citation X taught (`flood_lights_toggle`,
+carried through full auto's own copy of the tool as well, or the automation and
+the pilot get different behaviour from one switch). The roof floods themselves
+are two writable pods, `roof_L_on` and `roof_R_on`, written together for the
+landing-light reason: one pod lit is a readback confirming the half it looked
+at. The general lesson is the cheap one: `is_writable` and existence are one
+`curl` away whenever the sim is up, and a profile line copied from a deck config
+is a HYPOTHESIS until then.
+
+The new half is [src/cockpit_auto.rs](src/cockpit_auto.rs), the first thing the
+copilot does to the cockpit unasked rather than on request: interior lights
+flagged `auto_at_night` come on once the aircraft is powered and the sun is
+down, and the GNS430's welcome page gets its two ENT presses
+(`gps_ack_command`) once per power-up. "Night falls", "battery on" and "engines
+started" are not three triggers but ONE condition becoming true — powered AND
+dark — which is why the state machine is over (bus volts, sun pitch) and not
+over events. Three rules shape it, and they are all the same rule. It is
+one-shot per spell and never re-asserted, because a watch that re-fires every
+tick is not an automation, it is a fight with the pilot over a switch (the gyro
+sync's cooldown is the same instinct). "Off" is only ever commanded for a light
+the copilot itself switched on, and the `set_lights` tool drops that claim the
+moment the pilot moves the switch themselves, so daybreak cannot undo a
+decision made at midnight. And only INTERIOR lights may be flagged: switching an
+exterior light on the pilot's behalf changes what other traffic sees, and a
+profile test enforces it rather than trusting the YAML. The sun threshold
+carries hysteresis (0 degrees down, +5 up) because a single threshold chatters
+through every ripple in the read while the sun sits on the horizon. The watch
+runs on its own 2 s clock rather than the monitor's 3 Hz — the sun moves a
+quarter degree a minute — and is skipped entirely on an airframe declaring
+neither duty, so nothing pays a read for a capability it does not have. It sits
+ABOVE the `quiet` narration gate on purpose: a pilot who mutes the panel still
+wants their lights. Every light write, the copilot's and the pilot's, now goes
+through one `tools::lights::apply` (the KT73 rule), which also made the plain
+write path compare its readback against the INTENT — it used to report whatever
+came back, so a write that silently failed answered "Roger, landing lights off"
+to "landing lights on", a readback confirming itself. Blackboxes as
+`"kind":"cockpit_auto"`. NOT yet flown.
+
 A recurring add-on trap the profile exists to absorb: on a study-level
 airframe the stock actuator can be the add-on's OUTPUT, not its input — the
 model drives the sim dataref from its own switch every frame, so the
@@ -757,6 +805,39 @@ the same breath as the claim about control. `Params.handoff_to_caller` (set by
 the two construction sites, which happen to be exactly the two cases) drops the
 "your aircraft" clause, and `spoken_height_ft` calls the height actually
 reached.
+
+**The rotation rang for four days because the damping term was measuring the
+wrong thing, and no test could fail** (2026-08-02). The initial climb oscillated
+about its 8 degree target from liftoff to the 300 ft AP handover on every
+sortie. It was diagnosed twice and "fixed" twice: the rate was smoothed (which
+made it measurably worse, since a filter puts lag where the phase margin is
+thinnest), then the law went P+I on the argument that elevator to pitch rate to
+attitude is already a double integration and a third could only ring. The
+structure was right and the ringing did not stop. Across 49 takeoffs in the
+blackbox the same-airframe pair either side of that change (SF50, EGHI 20, one
+evening) went 1.26 to 1.89 direction reversals per second and 20% to 48% of
+ticks pinned against `PITCH_MIN`: the peak-to-peak halved and the oscillation
+got FASTER, which is the shape of a damping problem, not a structural one. Both
+faults were in the one term nobody had suspected. The rate was DIFFERENCED from
+the attitude over the loop's 0.25 s tick, which amplifies every wobble in the
+read by 1/dt and carries an inherent half-sample delay, so the damping arrived
+about 50 degrees out of phase at the ~0.9 s period it actually rang at and drove
+the motion instead of opposing it. And `PITCH_LEAD_S` was 1.0 s, the far side of
+a cliff: swept against a plant, the worst-case spread is flat at 2.3 degrees
+anywhere in 0.3 to 0.5 and breaks to 10.2 at 1.0. It now damps on the sim's
+MEASURED pitch rate (`sim/flightmodel/position/Q`, already used by the recover
+tool), which needs neither differencing nor a filter, at a 0.3 s lead. 0.3 and
+not 0.5 because it is the only value that also survives the fallback when the
+read fails: a failed read must cost accuracy, not stability. The reason three
+gain changes shipped with every test passing is that the sortie test's pitch
+model is a first-order lag, and a single lag cannot ring at any gain, so it
+would have passed for ANY of them. `the_rotation_settles_instead_of_ringing`
+flies the law against a second-order plant through the loop's real transport
+delay and asserts the two numbers the blackbox reports, attitude spread and time
+spent against a stop; it fails at the shipped 1.0. Per-tick `climb_manual`
+events now carry `q` and `dt`, because the ring was in the damping path and the
+record carried nothing about what it damped on. NOT yet flown.
+
 Related trap fixed the same day: `looks_like_command` (the continuous-mode
 domain gate) matched per-token keywords only, so the split compounds
 "take off ..." and "line us up" were swallowed with no miss chime —
@@ -1365,7 +1446,220 @@ one-poll flicker, and the pattern is issued BEFORE the release — the aircraft
 is never brakeless with a tug that has no instruction yet. The
 still-unanswered question is narrower now: whether the flag goes solid once
 the tug finishes positioning (the pilot's experience says it will), and the
-next sortie's blackbox answers it.
+next sortie's blackbox answers it. **It did** (Malaga, 2026-08-03): the hook
+went solid and held, the brakes came off on a real connection, and the tug
+pushed. So the push itself is SOLVED, and what the same two sorties then
+exposed is that everything downstream of it was judging the result against
+numbers a tug cannot deliver.
+
+**A pattern is ninety degrees, and that belongs in the arithmetic** (2026-08-03,
+Malaga, two identical sorties at one stand). The tug ran a textbook Nose 90 both
+times: 55 m back, the nose swung 041 to 311, then it stopped and let go exactly
+as the command says it will. Both were reported to the pilot as "the tug let go
+early" — the same wrong verb the 2026-07-28 Stansted fix removed one state
+earlier, and this time it cost the whole ground chain. Three faults compound and
+they are all the same fault. (1) The PLAN wanted 135.4 degrees, which one
+pattern can never satisfy, and nothing checked that when the plan was made:
+`done()` wants ±6 and the release-time "good enough" test wanted ±20, so a
+44.6-degree residual failed both. (2) The loop's answer to that residual was
+`steer_for(-44.6)` — ANOTHER 90-degree swing, which would have left us 45
+degrees off the other way. `worth_another_pattern` is the missing question:
+another pattern helps only while real DISTANCE is owed (a straight segment
+earns its ask) or at least HALF a swing is, because 45 degrees is the point
+below which the next pattern overshoots by more than the error it was sent to
+remove. (3) The re-issue then waited `REHOOK_SECS` for a tug that has never
+once come back — `reissued_after_release` fired four times across the entire
+blackbox and `rehooked` answered it zero times, four for four, each costing the
+full deadline before the identical give-up. The premise was "it is standing at
+the nose"; measured, the hook takes MINUTES (262 s and 268 s here, 90 s at
+Luton) because it is a vehicle driving across an airport, and a released one
+drives away. So the bar coming off now ENDS the push, and the only question is
+`push_delivered` — has the tug delivered what a tug CAN deliver. Forty degrees
+and 55 m off the stand is the taxi join's problem, and the join is built for
+it (141 degrees under its own steam, Gatwick 2026-07-27); a metre and a half
+is still a genuine failure and still reported as one. The stall path also
+learned that only a tug ON THE BAR can take an instruction: without that gate
+the stall clock and the release branch both fired inside one tick (`issued` #2
+and `reissued_after_release` #3, 0.6 s apart), spending the whole budget on a
+tug that had already gone.
+
+**The taxi governor was braking itself to a standstill, through the park-brake
+VALVE** (2026-08-03, Malaga, three taxis over two sorties). Every drive died the
+same way: roll cleanly to about 9 kt, make one small anticipatory squeeze, stop
+dead within four seconds, and sit there until `stagnant` fired with 602 of
+631 m still to run. Re-engaging repeated it one squeeze later.
+
+The valve is the whole of it, and it had been read as an animation flag. While
+`park_brake_valve` sits in the SET position the sim traps any brake application
+into `parking_brake_ratio` and LATCHES it — which is just what a park-brake
+valve physically does, connect the wheel-brake line to the accumulator so
+pressure put into the line stays in it. So the proportional channel
+`xcopilot/taxi_brake`, whose entire contract is that a squeeze expires within a
+second, was writing a PERMANENT parking brake at the squeeze's own value. The
+blackbox shows it exactly: `park` steps 0.0 to 0.1 on a `cmd 0.10` and 0.0 to
+0.3 on an `out 0.28`, and the second one was still holding the aircraft an hour
+later. Then the governor's own next tick reads that ratio as the pilot's foot
+and pauses — idle throttle, waiting for a pilot who is not braking. Both of the
+self-pollution guards there (`governor_braking`, `brake_cmd_quiet`) are CLOCKS,
+and a clock cannot see a latch: anything that makes one of our own applications
+permanent outlives both, which is why the fix has to be upstream and not another
+gate.
+
+Nothing ever opened the valve because the SET path went through the valve-aware
+`drive_park_brake` and the RELEASE path did not — three call sites wrote
+`parking_brake_ratio = 0.0` raw (both taxi_in phases and the auto-takeoff's
+brake release), which looks complete and leaves the valve armed behind it. The
+asymmetry IS the bug. `ensure_park_brake_valve` is now the one seam, commanded
+absolutely (`park_brake_valve_open`/`_close`, not a toggle guarded by a stale
+read), the governor isolates the valve on every taxi arm rather than only as a
+side effect of releasing a brake that happened to be set, and
+`release_park_brake_for_roll` replaces the three raw writes. The BE58 profile
+declares `park_brake_valve_set: 1.0` — measured both ways live, and per-airframe
+for the usual reason: SET is 1 here and on the SR22, 0 on the C90B, so a
+constant would strand half the fleet with the valve backwards. An airframe
+declaring no valve is untouched.
+
+Worth keeping: the FIRST diagnosis of this, the same day, was wrong. It blamed
+the toe RATIOS latching across a standdown (expiry frees the plugin override,
+never the ratios) and shipped `should_release_brake_channel` against that story.
+Probed live the next day with the aircraft still stuck, `left_brake_ratio` and
+`right_brake_ratio` both read 0.0 and `override_toe_brakes` 0 — the plugin's
+expiry cleans up after itself exactly as documented, and the 0.5 that had been
+read off "the ratios" was the parking brake all along. The arm-time clear stays
+because zeroing a channel you have not zeroed is honest and costs one write, not
+because it was ever the bug; its doc comment now says so, since a fix with a
+plausible story attached is how `tow_in_progress` survived a fortnight. The exit
+release stays too, and means more now than it did: with the valve isolated a
+governor that dies mid-squeeze leaves NOTHING holding the aircraft, so it
+releases only when the parking brake is actually set and logs the case where it
+is not. NOT yet flown.
+
+**The route is the network's; the LINE is the paint's** (2026-08-05, Malaga,
+noticed from the cockpit window rather than from a log). The Baron taxied
+1,214 m to runway 13 tracking its planned route to 0.05-0.13 m, and did the
+whole taxi 1.7 to 2.8 m to one side of the yellow line — 5 to 6 m through the
+taxiway E junction. Nothing was wrong with the drive. apt.dat carries two
+descriptions of the same pavement and the routing network is authoritative
+about only one of them: 1201/1202 are hand-authored TOPOLOGY (what connects to
+what, and what it is called), while the yellow line itself is drawn separately
+as a 120 linear feature, and at LEMG the two sit metres apart. Following the
+network exactly is therefore following an approximation exactly.
+`find_taxi_net` now also collects the drawn centrelines (line types 1 and 51,
+beziers sampled, since the fillet at a junction is a curve and its chord is
+not), and `ride_paint` resamples every planned route onto them: each leg is cut
+into 5 m samples and each sample slid sideways onto the nearest drawn line
+running the same way — inside `PAINT_SNAP_M` (8 m; wider is a different
+taxiway, not a mis-drawn network) and `PAINT_PARALLEL_DEG` (25 degrees, which
+is what stops a route being dragged onto the taxiway it is CROSSING, or onto a
+hold bar drawn square across it). It can only ever move a point sideways onto a
+line the leg was already following: the topology, the names, the crossings and
+the holding point stay the network's. The departure route rides it, so does the
+lead-on (which IS a painted line) and the vacate; runway legs are left alone,
+and with them the vacate's start point, which is the aircraft's own position and
+the one point in any route that must never move. At LEMG 230 of the route's 242
+points now sit ON the line (median 0.00 m, from 1.7-2.8), and the 12 that don't
+are where nothing is drawn — thin data degrades, it never refuses. One
+knock-on, from the same family as every other unit change: a leg used to mean a
+network EDGE, so `mark_runway_crossings` exempting "the last leg" exempted the
+whole approach to the holding point, and a leg is now metres long — the
+exemption is the route's TAIL (`TAIL_EXEMPT_M`) or a route announces a crossing
+of the runway it is holding short of. NOT yet flown.
+
+The same sortie's other half is a diagnosis fix: **an unsigned quantity
+standing in for a signed one reads plausibly and is wrong half the time.** The
+taxi blackbox's `lat_m` was a DISTANCE from the route, so the entire log of
+every taxi ever flown records how far off the line the aircraft ran and never
+which side — which is the only question when the pilot can see the paint.
+`taxi_guide::project_signed` keeps the side (positive is right of the route's
+direction of travel) and `project` is its `.abs()`, because every GATE
+genuinely wants the magnitude: "off the route by more than X" is the same fault
+on both sides, and a signed value silently disables such a test on one of them.
+Exactly the trap the taxi guide hit when four knots backwards read as four
+forwards during a pushback, one module over.
+
+**One unread flag cost the entire arrival** (2026-08-05, Malaga, the circuit
+flown right after the paint fix). At 13:41:06 the tower cleared us to land; at
+13:41:07 it ordered "go around, traffic on the runway". `PENDING_GO_AROUND` had
+been published on the party line since the day it was written and NOTHING EVER
+CONSUMED IT, so the approach flew on for another seventy seconds — through a
+0.5 nm same-altitude conflict — and balked only because it happened to arrive
+high. Then the cascade, where every link is a fact the previous link owed it.
+The order VOIDS the landing clearance, and the missed approach never reported
+again (the circuit makes the first "final" call; autoland's re-approach made
+none), so eleven minutes later the aircraft landed without a clearance and the
+tower said so. No clearance meant `vacate_runway` — gated on a STANDING
+ClearedToLand — returned `None`, the vacate never ran, `taxi_in` arrested the
+roll where it stood, and the Baron sat ON runway 13 through four incursion
+warnings with an arrival closing to 1.3 nm. One fix per link.
+`GoAroundLatch::order` flies a controller's order from wherever the approach
+is, and it outranks everything the aircraft notices about itself, because the
+tower can see the runway and we cannot; consumed in the autoland loop (the
+thing that can ACT on it) rather than the main loop, drained at arm time so a
+stale order cannot balk the next approach, and refused once on the ground,
+where a landing that has already happened is not one to abandon. Autoland then
+owes a fresh `final` report after any go-around, made established inside the
+FAP because a position report has to be true. And `vacate_runway` falls back to
+`autoland::landed_runway`, the strip the wheels actually rolled out on: no
+standing clearance is not evidence that we are not on a runway (an ordered
+go-around voids it, and copilot-only mode never has one), and landing without
+one makes clearing the runway more urgent, not less. A stale ident is harmless
+where the stop was not, since `plan_vacate` refuses unless we are on an
+authored runway edge. NOT yet flown.
+
+**The apron is where the network stops, and an arrival has to get past it**
+(same sortie). apt.dat routes taxiways; the lead-in painted into a stand is
+mostly not in the network at all, so `plan`'s destination snap put the last
+point at whatever node lay nearest the stand and the drive finished there —
+66 m short of stand W5 at Malaga, parked across the live taxiway the tower had
+just cleared somebody else down, twice, having named the stand both times.
+`plan_to_stand` continues the route from that node to the stand itself, and the
+continuation rides the paint like everything else (`STAND_LEAD_IN_MAX_M` 120 m,
+because a stand further out than that is not the one this route serves and
+driving blind across an unseen apron is worse than stopping short of it). The
+leg carries no NAME: an apron lead-in is not a taxiway, and the guide would
+otherwise call a turn "onto" something that is on no chart. At LEMG the route
+now finishes 0.0 m from W5. The departure mirror has been right since the
+lead-on landed — a route ends short of the runway ON PURPOSE there, and the
+drawn line carries it the rest of the way.
+
+**A proportional controller cannot track a ramp, and a glidepath is a ramp**
+(2026-08-05, the same Malaga circuit — the reason the first approach was
+already lost before autoland ever saw it). The aircraft was handed over 174 ft
+above the 3 degree path with 2,827 m to run, and autoland closed only half of
+that in a mile, so it crossed the numbers 59 ft high and balked. The pattern
+had rolled out onto final only 54 ft high; the error then GREW, monotonically,
+to 172 ft in forty seconds. Two faults in `alt_capture_vs`, and the second one
+hides inside the fix for the first. (1) There was no feed-forward for the
+target's OWN rate. On final the target is the path at our distance to run, so
+it walks down at 318 ft per mile covered — 510 fpm at the Baron's closure — and
+a proportional law tracking a ramp settles at exactly ramp over gain: 510/3 is
+170 ft, against 174 flown. The clamp said the same thing twice over, since a
+flat -500 fpm is LESS than a 3 degree path's own rate at any approach speed
+above 94 kt, so the leg could not have held the path with zero error and
+perfect control. `path_descent_fpm` feeds the rate forward (from the measured
+GROUND closure, because the path descends per mile COVERED and an IAS proxy
+would over-command by the whole headwind), and the descent authority is that
+rate plus a fixed correction budget, which leaves a standing target's clamp
+exactly where it was. (2) The 8 s lead then projected the AIRCRAFT forward and
+compared it against where the target is NOW, which in a steady descent reads
+the aircraft as rate-times-lead lower than it is and parks the law 77 ft high
+all by itself. The lead compares two futures now; for a fixed target its future
+is its present, so the downwind and the base leg are bit-for-bit unchanged.
+Simulated against the flown profile the old law grows 51 ft of error to 250 and
+pins the command at -500 the whole way; the new one converges to zero. NOT yet
+flown.
+
+**And a route to a stand is never a departure's** (same sortie, one taxi
+later). Full auto asks the tower for a taxi clearance unless it already holds
+one, where "holds one" was `route_is_ours`: does the published route pass
+within 200 m of us. An arrival's clearance ENDS where we are parked, so it
+passes that test with room to spare — full auto adopted the taxi-in route it
+had just finished driving, skipped the request entirely (no `request_taxi`, no
+`tuned_tower` in the stage log), drove 33 s of an already-complete 88 m route
+back toward the stand from 66 m off it, and announced itself at the holding
+point. The tower's answer to the departure request was "taxi to holding point
+Hotel Whiskey one FIRST", and the line-up failed. The party line already knew
+which kind of route it had published (`taxi_to_stand`); nobody had asked it.
 
 Depth (added 2026-07-28, evening): four traps of the same family — a fact one
 part of the system knows and another needs. The taxi GUIDE narrated a

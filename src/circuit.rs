@@ -361,11 +361,60 @@ const ALT_GAIN_FPM_PER_FT: f64 = 3.0;
 /// levels the aircraft where it will actually arrive.
 const ALT_LEAD_S: f64 = 8.0;
 
-/// The commanded vertical speed for an altitude capture: proportional on the
-/// error, led by where the current vertical speed is taking us.
-pub fn alt_capture_vs(target_ft: f64, alt_ft: f64, vs_fpm: f64) -> f64 {
-    let projected = alt_ft + vs_fpm / 60.0 * ALT_LEAD_S;
-    ((target_ft - projected) * ALT_GAIN_FPM_PER_FT).clamp(-500.0, 700.0)
+/// How much descent the capture may command BEYOND the target's own rate.
+/// For a target standing still this is the whole authority and reproduces the
+/// law's original 500 fpm floor exactly; on a glidepath it is what closes an
+/// error on top of simply keeping up.
+const ALT_MAX_EXTRA_DESCENT_FPM: f64 = 500.0;
+
+/// The rate a 3° path descends at, fpm, closing on the threshold at
+/// `closure_kts` — the feed-forward for [`alt_capture_vs`].
+///
+/// 318 ft per nautical mile is a slope, not a rate: it becomes a rate only
+/// when something is flying down it, and how fast is the aircraft's business.
+/// Zero when nothing is closing (a base leg aims at a FIXED point, so its
+/// target does not move and there is nothing to feed forward).
+pub fn path_descent_fpm(closure_kts: f64) -> f64 {
+    if closure_kts <= 0.0 {
+        return 0.0;
+    }
+    -crate::autoland::GLIDEPATH_FT_PER_NM * closure_kts / 60.0
+}
+
+/// The commanded vertical speed for an altitude capture: the target's own
+/// rate, plus proportional on the error, led by where the current vertical
+/// speed is taking us.
+///
+/// `target_rate_fpm` is the feed-forward and it is the whole of the fix from
+/// Malaga (2026-08-05). Without it this is a proportional controller chasing
+/// a RAMP, and a proportional controller cannot track a ramp: it settles at a
+/// constant lag of exactly ramp rate over gain. On final the target is the 3°
+/// path walking down at 510 fpm as we close, the gain is 3 fpm per foot, and
+/// 510/3 is 170 ft. The Baron was handed to autoland 174 ft high — the error
+/// did not merely fail to close, it GREW from 54 ft at the roll-out to 172 ft
+/// at the handoff, monotonically, exactly as the algebra says it must.
+///
+/// The old descent clamp was the same fault twice over: a flat -500 fpm is
+/// LESS than a 3° path's own rate at any approach speed above 94 kt, so the
+/// aircraft could not have stayed on the path even with zero error and
+/// perfect control. It is now the target's rate plus a fixed correction
+/// budget, which leaves a standing target's authority exactly where it was.
+pub fn alt_capture_vs(target_ft: f64, target_rate_fpm: f64, alt_ft: f64, vs_fpm: f64) -> f64 {
+    // The lead compares two FUTURES. Projecting the aircraft forward while
+    // comparing it against where the target is NOW is the same mistake in a
+    // second coat: in a steady descent it reads the aircraft as lower than it
+    // is by rate times lead, so the law settles there — 77 ft high at 580 fpm
+    // with an 8 s lead, on top of the ramp lag above. Projecting both leaves
+    // a fixed target's behaviour bit-for-bit unchanged (its future is its
+    // present) and lets a tracked path settle on zero error.
+    let lead = ALT_LEAD_S / 60.0;
+    let projected = alt_ft + vs_fpm * lead;
+    let projected_target = target_ft + target_rate_fpm * lead;
+    let correction = (projected_target - projected) * ALT_GAIN_FPM_PER_FT;
+    (target_rate_fpm + correction).clamp(
+        target_rate_fpm.min(0.0) - ALT_MAX_EXTRA_DESCENT_FPM,
+        700.0,
+    )
 }
 
 /// The altitude the base/final legs fly to, ft MSL: the 3° path at the
@@ -1549,6 +1598,13 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // Vertical speed, derived the same way, for the altitude capture's lead.
     let mut prev_alt: Option<(f64, std::time::Instant)> = None;
     let mut vs_est = 0.0_f64;
+    // ...and the rate we are closing the threshold at, derived the same way
+    // again, for the glidepath's feed-forward. GROUND closure, not airspeed:
+    // the path descends at 318 ft for every mile actually covered, so a
+    // headwind genuinely slows the target down and an IAS proxy would
+    // over-command by the whole wind (see `path_descent_fpm`).
+    let mut prev_along: Option<(f64, std::time::Instant)> = None;
+    let mut closure_kts = 0.0_f64;
     // The ratcheted base/final descent target — see the vertical law below.
     let mut descent_target: Option<f64> = None;
     // Gear goes down ONCE, at the 180, and the latch is what makes it once.
@@ -1790,8 +1846,29 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             }
             prev_alt = Some((alt_msl_ft, t_now));
         }
+        // The target MOVES on final: it is the glidepath at our distance to
+        // run, so it walks down as we close, and the capture has to be told
+        // that or it flies a permanent lag (see `alt_capture_vs`). Only on
+        // final — base aims at the fixed roll-out point, and downwind at a
+        // level altitude, so for those the target really is standing still.
+        if a_m.is_finite() {
+            let t_now = std::time::Instant::now();
+            if let Some((prev, t_prev)) = prev_along {
+                let dt = t_now.duration_since(t_prev).as_secs_f64();
+                if (0.1..=2.0).contains(&dt) {
+                    let closing = (prev.abs() - a_m.abs()) / dt * 1.943_844;
+                    closure_kts = (0.6 * closure_kts + 0.4 * closing).clamp(0.0, 400.0);
+                }
+            }
+            prev_along = Some((a_m, t_now));
+        }
+        let target_rate = if leg == Leg::Final {
+            path_descent_fpm(closure_kts)
+        } else {
+            0.0
+        };
         let vs_want = if alt_msl_ft.is_finite() {
-            alt_capture_vs(target_alt, alt_msl_ft, vs_est)
+            alt_capture_vs(target_alt, target_rate, alt_msl_ft, vs_est)
         } else {
             0.0
         };
@@ -2320,6 +2397,61 @@ mod tests {
         assert_eq!(approach_leg_kts(60.0, 65.0), 65.0);
     }
 
+    /// A proportional controller cannot track a ramp, and the glidepath is a
+    /// ramp — so the final leg flew a permanent lag and handed autoland an
+    /// aircraft it could not get down.
+    ///
+    /// This is the Malaga approach, simulated (2026-08-05). The circuit rolls
+    /// out onto final 4,067 m from the threshold at 800 ft MSL, 54 ft above
+    /// the path, closing at 110 kt, and flies the leg. The blackbox says what
+    /// happened for real: the error GREW to 172 ft by the handoff, the
+    /// commanded descent never once passed the old -500 clamp, and the
+    /// commanded rate at the end (-406) was less than the rate the target
+    /// itself was descending at (-510). The aircraft was not failing to close
+    /// the gap; it was falling further behind every second.
+    #[test]
+    fn the_final_leg_stays_on_a_glidepath_it_is_flying_down() {
+        let elev = 48.0;
+        let tpa = elev + 1000.0;
+        let closure = 110.0;
+        // Where the roll-out actually put us, and the height it left us at.
+        let mut along_m = 4067.0;
+        let mut alt = elev + 752.0;
+        let mut vs = -150.0;
+        let dt = 1.0;
+        let mut worst_high: f64 = 0.0;
+        while along_m > 400.0 {
+            let target = approach_leg_alt_ft(elev, tpa, along_m);
+            let cmd = alt_capture_vs(target, path_descent_fpm(closure), alt, vs);
+            // A VS-mode autopilot gets to its commanded rate quickly and then
+            // holds it; a first-order lag is plenty to show the tracking.
+            vs += (cmd - vs) * 0.4;
+            alt += vs / 60.0 * dt;
+            along_m -= closure * 1852.0 / 3600.0 * dt;
+            worst_high = worst_high.max(alt - target);
+        }
+        assert!(
+            worst_high < 50.0,
+            "the leg must never get FURTHER above the path than it started: \
+             {worst_high:.0} ft high"
+        );
+        // The handoff point itself — 1.5 nm out, where autoland took over
+        // 174 ft high on the day.
+        let at_handoff = alt - approach_leg_alt_ft(elev, tpa, along_m);
+        assert!(
+            at_handoff.abs() < 40.0,
+            "autoland must inherit an aircraft on the path: {at_handoff:.0} ft off"
+        );
+        // And the reason the old law could not have done it even in principle:
+        // its descent authority was less than the path's own rate.
+        assert!(
+            path_descent_fpm(closure) < -500.0,
+            "a 3 degree path at approach speed descends faster than the old clamp"
+        );
+        // A standing target keeps exactly the authority it always had.
+        assert_eq!(alt_capture_vs(0.0, 0.0, 1000.0, 0.0), -500.0);
+    }
+
     /// The altitude capture leads on vertical speed, because a vertical speed
     /// does not stop when the command does. Luton 2026-07-28: pure proportional
     /// control climbed at 700 fpm right up to pattern altitude, sailed 100 ft
@@ -2327,20 +2459,20 @@ mod tests {
     #[test]
     fn the_altitude_capture_levels_where_the_aircraft_will_arrive() {
         // Well below, stationary in the vertical: climb at the clamp.
-        assert_eq!(alt_capture_vs(2000.0, 1000.0, 0.0), 700.0);
+        assert_eq!(alt_capture_vs(2000.0, 0.0, 1000.0, 0.0), 700.0);
         // Same error, but already climbing hard: the command backs off,
         // because most of that gap will be eaten before the aircraft responds.
-        let climbing = alt_capture_vs(2000.0, 1900.0, 700.0);
-        let level = alt_capture_vs(2000.0, 1900.0, 0.0);
+        let climbing = alt_capture_vs(2000.0, 0.0, 1900.0, 700.0);
+        let level = alt_capture_vs(2000.0, 0.0, 1900.0, 0.0);
         assert!(climbing < level, "{climbing} !< {level}");
         // Arriving at the target with rate on: command a descent to stop the
         // overshoot BEFORE it happens, which is the whole point.
         assert!(
-            alt_capture_vs(2000.0, 2000.0, 700.0) < 0.0,
+            alt_capture_vs(2000.0, 0.0, 2000.0, 700.0) < 0.0,
             "must arrest an overshoot in progress"
         );
         // On target and steady: hands off.
-        assert_eq!(alt_capture_vs(2000.0, 2000.0, 0.0), 0.0);
+        assert_eq!(alt_capture_vs(2000.0, 0.0, 2000.0, 0.0), 0.0);
     }
 
     /// A jet flies a jet's circuit: 1,500 ft, because its wider pattern turns

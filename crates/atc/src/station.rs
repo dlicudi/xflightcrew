@@ -3697,7 +3697,8 @@ fn plan_taxi_route_to_stand(
 ) -> Option<nav::TaxiRoutePlan> {
     let net = TAXI_NET.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
     let stand = net.nearest_stand(lat, lon)?.clone();
-    let mut plan = net.plan(lat, lon, stand.lat, stand.lon, 0.0, &[])?;
+    // To the STAND, not to the taxiway node nearest it — see `plan_to_stand`.
+    let mut plan = net.plan_to_stand(lat, lon, &stand)?;
     plan.holding_point = stand.name.clone();
     mark_runway_crossings(&mut plan, runways);
     Some(plan)
@@ -3827,17 +3828,36 @@ fn plan_taxi_route_to(
 /// designator pair and runway-flagged — which feeds the clearance's "cross
 /// runway ..." clause, the guide's "check it's clear, then cross" cue, AND
 /// the cleared-crossing exemption in the incursion watch, all keyed on that
-/// flag. The FINAL leg is exempt when taxiway-flagged: post-trim it ends at
-/// the hold-short point NEAR the destination strip, which must not read as
+/// flag. The route's TAIL is exempt when taxiway-flagged: post-trim it ends
+/// at the hold-short point NEAR the destination strip, which must not read as
 /// crossing it.
+///
+/// How much tail that is. One network edge used to be the unit of a leg, so
+/// exempting the last leg exempted the whole approach to the holding point;
+/// legs are metres long now that routes are resampled onto the paint. This is
+/// the standoff the trim itself works in — anything nearer the end than this
+/// is the same final approach to the same hold.
+const TAIL_EXEMPT_M: f64 = nav::HOLD_SHORT_STANDOFF_M;
+
 fn mark_runway_crossings(plan: &mut nav::TaxiRoutePlan, runways: &[nav::Runway]) {
     let last = plan.seg.len().saturating_sub(1);
+    // Distance from each leg's start to the end of the route, so the "we stop
+    // short of the destination runway, we don't cross it" exemption covers
+    // the whole approach to the holding point. It used to be `i == last`,
+    // which was the same thing while a leg meant a network edge — since the
+    // route is resampled onto the paint a leg is a few metres, and the last
+    // one alone is a sliver that exempts nothing.
+    let mut to_end: Vec<f64> = vec![0.0; plan.path.len()];
+    for i in (0..plan.path.len().saturating_sub(1)).rev() {
+        let (a, b) = (plan.path[i], plan.path[i + 1]);
+        to_end[i] = to_end[i + 1] + crate::nav::haversine_nm(a.0, a.1, b.0, b.1) * 1852.0;
+    }
     for i in 0..plan.seg.len() {
         let (name, is_runway) = plan.seg[i].clone();
         if is_runway && !name.is_empty() {
             continue; // the planner already counted this one
         }
-        if !is_runway && i == last {
+        if !is_runway && (i == last || to_end.get(i).is_some_and(|d| *d < TAIL_EXEMPT_M)) {
             continue; // ends short of the destination runway, not across it
         }
         // Sample the leg every ~20 m (its midpoint alone can miss a strip
@@ -5281,6 +5301,27 @@ mod tests {
         };
         mark_runway_crossings(&mut final_leg, &runways);
         assert!(final_leg.crossings.is_empty(), "{:?}", final_leg.crossings);
+        // Same approach to the same hold, resampled onto the paint: the legs
+        // are metres long now, so the exemption has to be the route's TAIL
+        // and not merely its last leg. Exempting one 5 m sliver would have
+        // the route announce a crossing of the runway it is holding short of.
+        // 170 m of approach to a hold 25 m short of the strip (an authored
+        // zone can leave it that close), in 5 m samples: several of the last
+        // legs sit inside the runway's own half-width, and each one of them
+        // would name a crossing if only the very last were exempt.
+        let (from, to) = (36.14980, 36.151325);
+        let mut resampled = nav::TaxiRoutePlan {
+            via: vec!["A".into()],
+            crossings: Vec::new(),
+            holding_point: "A1".into(),
+            path: (0..=34)
+                .map(|k| (from + (to - from) * k as f64 / 34.0, -5.3420))
+                .collect(),
+            seg: vec![("A".to_string(), false); 34],
+            lead_on: vec![],
+        };
+        mark_runway_crossings(&mut resampled, &runways);
+        assert!(resampled.crossings.is_empty(), "{:?}", resampled.crossings);
         // A route that never touches the pavement names nothing.
         let mut clear = nav::TaxiRoutePlan {
             via: vec!["A".into()],
@@ -5325,6 +5366,7 @@ mod tests {
             nodes,
             edges: vec![edge(1, 2, "A"), edge(2, 3, "A"), edge(3, 4, "H1")],
             stands: vec![],
+            paint: vec![],
         }));
         *TAXI_ROUTE.lock().unwrap() = Some(TaxiWatch {
             path: vec![

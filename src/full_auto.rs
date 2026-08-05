@@ -319,7 +319,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         give_up(
             &voice,
             "We're already flying — full auto starts from the ground. \
-             Say do a circuit, fly the flight plan, or land for me.",
+             Say navigate to follow the plan, fly the ILS, or land for me.",
             "armed_airborne",
         );
         return;
@@ -589,7 +589,17 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // (2026-07-29). A route is only OURS if it starts within reach of
         // the auto-taxi's own join limit; otherwise ask again and the tower
         // re-plans from where we actually are.
-        let route_is_ours = {
+        // ...and a route to a STAND is never a departure's, however near it
+        // starts. An arrival's clearance ends where we are parked, so the
+        // reach test below passes it with room to spare: at Malaga full auto
+        // adopted the taxi-in route it had just finished driving, skipped the
+        // request entirely, drove 33 s of an already-complete 88 m route back
+        // toward the stand from 66 m off it, and announced itself at the
+        // holding point — the tower's answer to the departure request was
+        // "taxi to holding point Hotel Whiskey one FIRST", and the line-up
+        // then failed (2026-08-05). The party line already knows which kind
+        // of route it published; nobody had asked it.
+        let route_is_ours = !crate::party_line::taxi_to_stand() && {
             let (lat_r, lon_r) = tokio::join!(xp.get_float(LAT), xp.get_float(LON));
             match (lat_r, lon_r) {
                 (Ok(lat), Ok(lon)) => crate::party_line::with_taxi_route(|r| {
@@ -607,12 +617,17 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         };
         if !route_is_ours {
             if crate::party_line::with_taxi_route(|r| r.is_some()) {
+                let arrival = crate::party_line::taxi_to_stand();
                 announce(
                     &voice,
                     Priority::Advisory,
-                    "That taxi clearance was from the old spot. Asking again from here.",
+                    if arrival {
+                        "That was our taxi in to the stand. Asking for a departure clearance."
+                    } else {
+                        "That taxi clearance was from the old spot. Asking again from here."
+                    },
                 );
-                event("stale_taxi_route", json!({}));
+                event("stale_taxi_route", json!({ "arrival": arrival }));
             }
             // Tune COM1 to the tower first — the request goes nowhere if we're
             // off frequency (the crew radio only reaches the tuned station).

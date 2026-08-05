@@ -1452,6 +1452,13 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         if has(t, "nav") && (has(t, "light") || has(t, "lights")) {
             return Some(call("set_lights", json!({ "light": "nav", "on": on })));
         }
+        // Roof floods (the Baron's cockpit pods). The copilot sets these itself
+        // after dark, but the pilot must still be able to say so — and "roof"
+        // needs no light/lights qualifier, since nothing else on the aircraft
+        // is called one.
+        if has(t, "roof") {
+            return Some(call("set_lights", json!({ "light": "roof", "on": on })));
+        }
         for (kw, key) in [
             ("avionics", "avionics"),
             ("battery", "battery"),
@@ -2883,6 +2890,23 @@ mod tests {
             one("parking break off").unwrap(),
             ("set_parking_brake".into(), json!({"on":false}))
         );
+        // Roof floods, deterministically — the copilot sets them itself after
+        // dark, and the pilot must still be able to say so without the LLM.
+        assert_eq!(
+            one("roof lights on").unwrap(),
+            ("set_lights".into(), json!({"light":"roof","on":true}))
+        );
+        assert_eq!(
+            one("roof lights off").unwrap(),
+            ("set_lights".into(), json!({"light":"roof","on":false}))
+        );
+        assert_eq!(
+            one("turn off the roof lights").unwrap(),
+            ("set_lights".into(), json!({"light":"roof","on":false}))
+        );
+        // The panel floods are a DIFFERENT switch and must not be swallowed by
+        // the roof rule: the Baron has both, and they are wired independently.
+        assert_eq!(one("flood lights on").unwrap().0, "set_flood_lights");
         assert_eq!(one("parking break set").unwrap().1, json!({"on":true}));
     }
 

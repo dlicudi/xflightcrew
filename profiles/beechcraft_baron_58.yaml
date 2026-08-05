@@ -35,6 +35,23 @@ nav_radio: true        # set_nav1 / set_obs
 transponder: true      # set_transponder
 parking_brake: true    # set_parking_brake
 pitot_heat: true       # set_pitot_heat
+
+# Park-brake VALVE sense: 1 = SET, the same way round as the SR22 and the
+# opposite of the C90B. Measured live, both directions (2026-08-03):
+# `park_brake_valve_open` drives the dataref to 1 and `..._close` to 0, and with
+# it at 1 a 0.35 write to the proportional taxi-brake channel appears in
+# `parking_brake_ratio` as 0.35 and STAYS there; at 0 the same write leaves the
+# ratio at zero. So this is not an animation flag — the valve decides whether a
+# momentary brake becomes a permanent one.
+#
+# Its absence here is what stranded a Baron at Malaga. The taxi governor made
+# one 0.10 anticipatory squeeze at 9 kt, the sim trapped it, and the governor's
+# next tick read 0.10 on the parking brake as the pilot's foot and paused —
+# idle throttle, stagnant with 602 of 631 m still to run. Re-engaging repeated
+# it at 0.28, which was still holding the aircraft an hour later. Nothing ever
+# opened the valve because the SET path went through the valve-aware routine
+# and the RELEASE path wrote the ratio raw.
+park_brake_valve_set: 1.0
 pitch_trim: true       # set_pitch_trim (universal elevator_trim)
 directional_gyro: true # steam gauges on a vacuum system (_has_hsi 0,
                        # _has_vac_cross_tied 1) — the DG drifts and wants syncing
@@ -113,9 +130,24 @@ electrical:
   - { key: alternators, spoken: both alternators, on_commands: [sim/electrical/generator_1_on, sim/electrical/generator_2_on], off_commands: [sim/electrical/generator_1_off, sim/electrical/generator_2_off], readback: ["sim/cockpit2/electrical/generator_on[0]", "sim/cockpit2/electrical/generator_on[1]"] }
   - { key: avionics,    spoken: avionics master,  on_commands: [sim/systems/avionics_on],       off_commands: [sim/systems/avionics_off],       readback: [sim/cockpit/electrical/avionics_on] }
 
-# Panel flood lighting (laminar/b58 custom switch, from the deck config).
+# Panel flood lighting. `laminar/b58/lighting/flood_light_switch` was declared
+# here as a DATAREF and is not one: probing the live sim (2026-08-02) shows no
+# dataref by that name exists at all, and the name belongs to a COMMAND ("Flood
+# Light Toggle Switch"). So every `set_flood_lights` on this airframe was a
+# write into nothing, followed by a readback of nothing. The switch's real
+# position is `laminar/b58/flood_light_toggle/switch_pos`, which is READ-ONLY —
+# so a toggle it must be, read before firing (the Citation X rule: a toggle
+# fired as "on" turns the light off whenever it was already on).
 flood_lights: true
-flood_lights_dataref: laminar/b58/lighting/flood_light_switch
+flood_lights_toggle:
+  command: laminar/b58/lighting/flood_light_switch
+  dataref: laminar/b58/flood_light_toggle/switch_pos
+
+# The GNS430 boots to a welcome/database page that sits there until somebody
+# presses ENT twice. The copilot does it once per power-up (see
+# `src/cockpit_auto.rs`), never again while the bus stays live, so a pilot
+# working the unit is not interrupted by a stray ENT.
+gps_ack_command: sim/GPS/g430n1_ent
 
 # Three flap positions (POM: "The Baron has three flap positions"; acf
 # `_flap_detents 2`, i.e. two beyond up). The per-notch Vfe split is the reason
@@ -185,6 +217,14 @@ lights:
   - { key: beacon,  spoken: beacon,         dataref: sim/cockpit2/switches/beacon_on,            command_on: sim/lights/beacon_lights_on, command_off: sim/lights/beacon_lights_off }
   - { key: taxi,    spoken: taxi light,     dataref: sim/cockpit/electrical/taxi_light_on,       command_on: sim/lights/taxi_lights_on,   command_off: sim/lights/taxi_lights_off }
   - { key: landing, spoken: landing lights, dataref: "sim/cockpit2/switches/landing_lights_switch[0]", also_datarefs: ["sim/cockpit2/switches/landing_lights_switch[1]"] }
+  # Roof flood lights: two pods, left and right, both writable (verified live
+  # 2026-08-02). Written together for the same reason as the landing lights —
+  # switching one leaves the cockpit half lit while the readback confirms the
+  # half it looked at. `auto_at_night` is what makes the copilot reach up and
+  # set these itself once the aircraft is powered and the sun is down; it is
+  # deliberately only on an INTERIOR light, where switching on the pilot's
+  # behalf changes nothing another aircraft can see.
+  - { key: roof, spoken: roof lights, dataref: laminar/b58/lighting/roof_L_on, also_datarefs: [laminar/b58/lighting/roof_R_on], auto_at_night: true }
 
 # No XChecklist file ships for this airframe, so there is no `checklist` /
 # `checklist_map` block and no `locations` — cockpit geography is answered from

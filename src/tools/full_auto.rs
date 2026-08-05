@@ -133,6 +133,11 @@ pub struct FullAuto {
     pub lights: Vec<crate::aircraft::LightProfile>,
     /// Panel flood-lighting dataref override, when the airframe has its own.
     pub flood_dataref: Option<String>,
+    /// ...or a toggle command, when the switch is one (the Baron 58). Carried
+    /// alongside the dataref because full auto builds its OWN copy of the
+    /// flood tool: an override wired here and not there is a tool that behaves
+    /// one way for the pilot and another for the automation.
+    pub flood_toggle: Option<crate::aircraft::ToggleSwitch>,
     // circuit / climb-out
     pub cfg: ApConfig,
     pub vr_kts: f64,
@@ -231,7 +236,10 @@ impl Tool for FullAuto {
         );
         let sub = crate::full_auto::SubTools {
             lights: crate::tools::lights::SetLights::new(self.lights.clone()),
-            flood: crate::tools::lights::SetFloodLights::new(self.flood_dataref.clone()),
+            flood: crate::tools::lights::SetFloodLights::new(
+                self.flood_dataref.clone(),
+                self.flood_toggle.clone(),
+            ),
             no_start_sequence: kind == StartKind::None,
             // One start per airframe CLASS: a turboprop cranks with the PT6
             // sequence, a jet with the APU/bleed-air sequence, a piston with
@@ -274,6 +282,7 @@ impl Tool for FullAuto {
                 pace: self.pace,
             },
             circuit: crate::tools::circuit::Circuit {
+                park_brake_valve_set: self.park_brake_valve_set,
                 tail_strike_deg: self.tail_strike_deg,
                 vne_kts: self.vne_kts,
                 cfg: self.cfg.clone(),
@@ -293,6 +302,7 @@ impl Tool for FullAuto {
                 // the orchestrator takes the climb from the handoff — the
                 // pilot must not be told "your aircraft" there.
                 handoff_to_caller: true,
+                park_brake_valve_set: self.park_brake_valve_set,
                 tail_strike_deg: self.tail_strike_deg,
                 vne_kts: self.vne_kts,
                 cfg: self.cfg.clone(),
@@ -332,6 +342,23 @@ impl FullAuto {
         &self,
         ctx: &ToolCtx<'_>,
     ) -> std::result::Result<(Mission, String), String> {
+        // Airborne, the mission cannot arm — and the refusal must say what
+        // DOES fly up here. The origin check below used to answer first,
+        // telling a pilot enroute at 8,000 ft "we're not at LXGB... say full
+        // auto for a circuit here" (2026-08-02). A failed read falls
+        // through: the sequence re-checks on its own thread.
+        if ctx
+            .xplane
+            .get_float(crate::datarefs::ON_GROUND_ANY)
+            .await
+            .is_ok_and(|og| og < 0.5)
+        {
+            return Err(
+                "We're already flying, so full auto can't start. Say navigate to follow \
+                 the plan, fly the ILS for the arrival, or land for me."
+                    .to_string(),
+            );
+        }
         if ctx.config.simbrief_id.trim().is_empty() {
             return Err(
                 "No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can fly your plan.".to_string(),
