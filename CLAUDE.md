@@ -1565,6 +1565,18 @@ whole approach to the holding point, and a leg is now metres long — the
 exemption is the route's TAIL (`TAIL_EXEMPT_M`) or a route announces a crossing
 of the runway it is holding short of. NOT yet flown.
 
+The same sortie's other half is a diagnosis fix: **an unsigned quantity
+standing in for a signed one reads plausibly and is wrong half the time.** The
+taxi blackbox's `lat_m` was a DISTANCE from the route, so the entire log of
+every taxi ever flown records how far off the line the aircraft ran and never
+which side — which is the only question when the pilot can see the paint.
+`taxi_guide::project_signed` keeps the side (positive is right of the route's
+direction of travel) and `project` is its `.abs()`, because every GATE
+genuinely wants the magnitude: "off the route by more than X" is the same fault
+on both sides, and a signed value silently disables such a test on one of them.
+Exactly the trap the taxi guide hit when four knots backwards read as four
+forwards during a pushback, one module over.
+
 Depth (added 2026-07-28, evening): four traps of the same family — a fact one
 part of the system knows and another needs. The taxi GUIDE narrated a
 **pushback** ("Rolling again. Sharp left next, onto Bravo" with the tug

@@ -343,9 +343,18 @@ impl Route {
         })
     }
 
-    /// Project a lat/lon fix: (along-route progress m, lateral m).
+    /// Project a lat/lon fix: (along-route progress m, DISTANCE off the route
+    /// in m). Never negative — every gate here asks "how far off", which is
+    /// the same question on both sides of the line.
     pub fn fix(&self, lat: f64, lon: f64) -> Option<(f64, f64)> {
         taxi_guide::project(&self.path, lat, lon)
+    }
+
+    /// [`fix`](Self::fix) keeping the SIDE: positive is right of the route.
+    /// What the drive records, so a trail can be read against the paint
+    /// afterwards instead of only saying how far off it was.
+    pub fn fix_signed(&self, lat: f64, lon: f64) -> Option<(f64, f64)> {
+        taxi_guide::project_signed(&self.path, lat, lon)
     }
 
     /// Heading error (signed degrees, right positive) from the aircraft's
@@ -1372,10 +1381,13 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             continue;
         };
         let gs_kts = gs_ms * MS_TO_KTS;
-        let Some((progress, lateral)) = route.fix(lat, lon) else {
+        // Signed here, magnitude everywhere below: the gates ask how far off
+        // the route we are, and the record wants to know which side.
+        let Some((progress, offset)) = route.fix_signed(lat, lon) else {
             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             continue;
         };
+        let lateral = offset.abs();
         let remaining = route.remaining(progress);
         // Steering error first: the join state and the guard both need it.
         // The aim is capped by what's LEFT of the route: near the stop the
@@ -1547,8 +1559,13 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         crate::blackbox::record(
             "autotaxi",
             serde_json::json!({
+                // `lat_m` is SIGNED — right of the route is positive. It was
+                // a distance until 2026-08-05, which made every taxi trail in
+                // the log unreadable against the paint: "two metres off" says
+                // nothing about which side, and the side is the whole
+                // question when the pilot can see the line.
                 "event": "drive", "gs": gs_kts, "err": err, "yaw_dps": yaw_rate,
-                "steer": steer, "lat_m": lateral, "remaining_m": remaining,
+                "steer": steer, "lat_m": offset, "remaining_m": remaining,
                 "bs": bs_on, "bl": bl, "br": br,
             }),
         );

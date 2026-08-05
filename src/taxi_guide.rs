@@ -611,9 +611,29 @@ pub(crate) fn point_at(pts: &[(f64, f64)], cum: &[f64], s: f64) -> (f64, f64) {
     *pts.last().unwrap()
 }
 
-/// Project a position onto the route: (along-route progress m, lateral m).
-/// `None` on a degenerate path.
+/// Project a position onto the route: (along-route progress m, DISTANCE from
+/// it in m — never negative). `None` on a degenerate path.
+///
+/// The magnitude is what every guard wants: off the route by more than X is
+/// the same fault whichever side it happened on, and a signed value silently
+/// disables such a test on one side of the line. Use
+/// [`project_signed`] where the SIDE is the question — which is diagnosis,
+/// and any law that wants to close an offset rather than merely notice it.
 pub(crate) fn project(path: &[(f64, f64)], lat: f64, lon: f64) -> Option<(f64, f64)> {
+    project_signed(path, lat, lon).map(|(along, off)| (along, off.abs()))
+}
+
+/// [`project`] keeping the SIDE: positive is right of the route's direction
+/// of travel, negative is left.
+///
+/// Worth having because a magnitude cannot be diagnosed. Every taxi drive
+/// blackboxed `lat_m` as a distance, so a whole flight's record could say the
+/// aircraft ran two metres off the line and never which side — which is
+/// exactly the question when the pilot is looking at the paint out of the
+/// window (Malaga, 2026-08-05). Same family as the groundspeed the taxi guide
+/// read as forward motion during a pushback: an unsigned quantity standing in
+/// for a signed one reads plausibly and is wrong half the time.
+pub(crate) fn project_signed(path: &[(f64, f64)], lat: f64, lon: f64) -> Option<(f64, f64)> {
     if path.len() < 2 {
         return None;
     }
@@ -634,9 +654,13 @@ pub(crate) fn project(path: &[(f64, f64)], lat: f64, lon: f64) -> Option<(f64, f
         };
         let c = (a.0 + t * dx, a.1 + t * dy);
         let d = dist(p, c);
+        // Coordinates are (east, north), so the cross product of the leg
+        // direction with the offset is positive to the LEFT — negate it and
+        // the sign reads the way a pilot describes it.
+        let side = dy * (p.0 - c.0) - dx * (p.1 - c.1);
         let along = cum + t * len2.sqrt();
-        if best.is_none_or(|(_, bd)| d < bd) {
-            best = Some((along, d));
+        if best.is_none_or(|(_, bd): (f64, f64)| d < bd.abs()) {
+            best = Some((along, if side < 0.0 { -d } else { d }));
         }
         cum += len2.sqrt();
     }
@@ -655,6 +679,34 @@ mod tests {
     fn ll(x_m: f64, y_m: f64) -> (f64, f64) {
         let g = Geo::new(LAT0);
         (LAT0 + y_m / g.m_per_deg_lat, LON0 + x_m / g.m_per_deg_lon)
+    }
+
+    /// Right of the route is positive, left is negative, and the plain
+    /// [`project`] is still the distance every guard compares against.
+    ///
+    /// Pinned because the two are one keystroke apart at the call site and
+    /// the failure is silent: a guard written `off > LIMIT` against a signed
+    /// value simply stops firing on one side of the line, and nothing about
+    /// the number looks wrong in a log.
+    #[test]
+    fn the_side_of_the_route_is_recorded_and_the_guards_still_see_a_distance() {
+        // Due east; a point 5 m north of it is to the LEFT.
+        let east = [ll(0.0, 0.0), ll(200.0, 0.0)];
+        let (along, off) = project_signed(&east, ll(100.0, 5.0).0, ll(100.0, 5.0).1).unwrap();
+        assert!((along - 100.0).abs() < 1.0, "{along}");
+        assert!((off + 5.0).abs() < 0.2, "north of an eastbound leg is left: {off}");
+        let (_, right) = project_signed(&east, ll(100.0, -5.0).0, ll(100.0, -5.0).1).unwrap();
+        assert!((right - 5.0).abs() < 0.2, "south of it is right: {right}");
+        // Reverse the leg and the sides swap — the sign is about the
+        // direction of travel, not the compass.
+        let west = [ll(200.0, 0.0), ll(0.0, 0.0)];
+        let (_, flipped) = project_signed(&west, ll(100.0, 5.0).0, ll(100.0, 5.0).1).unwrap();
+        assert!((flipped - 5.0).abs() < 0.2, "{flipped}");
+        // And the unsigned door every gate comes through is unchanged.
+        for p in [ll(100.0, 5.0), ll(100.0, -5.0)] {
+            let (_, d) = project(&east, p.0, p.1).unwrap();
+            assert!((d - 5.0).abs() < 0.2, "project stays a distance: {d}");
+        }
     }
 
     /// East 200 m on W, left turn north onto S5W, cross runway 09L/27R,
