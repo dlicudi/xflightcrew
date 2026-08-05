@@ -550,7 +550,44 @@ pub struct TaxiNet {
     pub edges: Vec<TaxiEdge>,
     /// Parking stands (apt.dat 1300), for arrival taxi-to-parking.
     pub stands: Vec<Stand>,
+    /// The PAINT: every drawn taxi centreline at the field, as polylines with
+    /// their beziers already sampled (apt.dat 120 linear features carrying
+    /// line type 1 or 51). Empty at a field that draws none, or when the
+    /// caller built the net without them.
+    ///
+    /// The network and the paint answer two different questions and the
+    /// network is only authoritative for one of them. 1201/1202 give
+    /// TOPOLOGY — what connects to what, and what it is called — and they are
+    /// authored by hand as an approximation of the pavement, so their
+    /// geometry can sit metres from the line the pilot is looking at. At
+    /// Malaga the Baron tracked its planned route to within 0.12 m for a
+    /// kilometre and taxied the whole way 1.7 to 2.8 m to the side of the
+    /// drawn line, up to 6 m through the taxiway E junction (2026-08-05).
+    /// It is the same lesson the runway lead-on already carries: the entry
+    /// onto the strip is DRAWN, and inventing it is how an aircraft ends up
+    /// in the grass. See [`TaxiNet::ride_paint`].
+    pub paint: Vec<Vec<(f64, f64)>>,
 }
+
+/// How far a drawn centreline may be from the planned route and still be the
+/// line that route MEANT. Sized off the error being corrected: Malaga's
+/// network sits 1.7 to 2.8 m off its paint on the straights and about 6 m
+/// through a junction, and the next parallel line at a normal field is a
+/// taxiway width away. Wider than this is not a mis-drawn network, it is a
+/// different taxiway, and moving a route there would be inventing one.
+const PAINT_SNAP_M: f64 = 8.0;
+
+/// How far off the leg's own direction a drawn line may run and still be the
+/// same line. This is what stops a route being dragged onto the taxiway it is
+/// crossing, or onto a hold bar drawn square across it: those run at an angle
+/// no continuation of this leg does.
+const PAINT_PARALLEL_DEG: f64 = 25.0;
+
+/// Spacing of the samples a leg is broken into before snapping. The drawn
+/// line curves where the network draws a corner, so a leg has to be sampled
+/// to follow it at all — and the samples ARE the new route, so this is also
+/// how finely the drive can be asked to trace a fillet.
+const PAINT_SAMPLE_M: f64 = 5.0;
 
 /// The default hold-short standoff: how far back from the runway-junction
 /// node a planned route ends. Clears the painted line at GA fields
@@ -637,15 +674,240 @@ pub struct TaxiRoutePlan {
     pub lead_on: Vec<(f64, f64)>,
 }
 
+/// apt.dat painted-line types that mean "taxiway centreline": solid yellow,
+/// and the same line drawn with a black border (which is what most modern
+/// scenery uses). Deliberately only these two — an edge line, a hold-short
+/// bar or a roadway marking is not a line to drive down, and one wrong type
+/// here snaps a route sideways onto a marking that merely runs nearby.
+const PAINT_CENTRELINE_TYPES: [&str; 2] = ["1", "51"];
+
+/// Points sampled along one bezier segment of a drawn line. The curves are
+/// junction fillets a few tens of metres long, so eight is smooth to well
+/// under the snap tolerance and keeps the polyline cheap to project onto.
+const BEZIER_STEPS: usize = 8;
+
+/// One node of a drawn linear feature while it is being parsed.
+#[derive(Clone, Copy)]
+struct PaintNode {
+    p: (f64, f64),
+    /// The bezier control point, when the row carried one (112/114/116). The
+    /// control on the far side of the node is its mirror image, which is what
+    /// makes the drawn line smooth through the node.
+    ctrl: Option<(f64, f64)>,
+    /// Does the segment STARTING here carry a centreline line type? apt.dat
+    /// attaches the type to the node the segment leaves, and a string's
+    /// terminating row (115/116) carries no type at all — so this is a
+    /// property of the segment, read off its first node.
+    centre: bool,
+}
+
+/// Cubic bezier point at `t`.
+fn bezier(p0: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), t: f64) -> (f64, f64) {
+    let u = 1.0 - t;
+    let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+    (
+        a * p0.0 + b * p1.0 + c * p2.0 + d * p3.0,
+        a * p0.1 + b * p1.1 + c * p2.1 + d * p3.1,
+    )
+}
+
+/// Turn one parsed linear feature into the centreline polylines it contains,
+/// beziers sampled. A feature can mix types (a taxiway line that becomes a
+/// hold bar), so this emits a run per unbroken stretch of centreline rather
+/// than one polyline per feature.
+fn flush_paint_feature(nodes: &mut Vec<PaintNode>, out: &mut Vec<Vec<(f64, f64)>>) {
+    let mut run: Vec<(f64, f64)> = Vec::new();
+    for i in 0..nodes.len().saturating_sub(1) {
+        let (a, b) = (nodes[i], nodes[i + 1]);
+        if !a.centre {
+            if run.len() >= 2 {
+                out.push(std::mem::take(&mut run));
+            } else {
+                run.clear();
+            }
+            continue;
+        }
+        if run.is_empty() {
+            run.push(a.p);
+        }
+        match (a.ctrl, b.ctrl) {
+            (None, None) => run.push(b.p),
+            (ca, cb) => {
+                let p1 = ca.unwrap_or(a.p);
+                // The incoming control is the outgoing one mirrored through
+                // the node — that mirror is the whole reason apt.dat stores
+                // only one per node.
+                let p2 = cb.map_or(b.p, |c| (2.0 * b.p.0 - c.0, 2.0 * b.p.1 - c.1));
+                for k in 1..=BEZIER_STEPS {
+                    run.push(bezier(a.p, p1, p2, b.p, k as f64 / BEZIER_STEPS as f64));
+                }
+            }
+        }
+    }
+    if run.len() >= 2 {
+        out.push(run);
+    }
+    nodes.clear();
+}
+
+/// A route polyline with its per-leg `(name, is_runway)`, aligned the way
+/// [`TaxiRoutePlan::seg`] is: `seg[i]` describes `path[i] -> path[i+1]`.
+pub type RoutePolyline = (Vec<(f64, f64)>, Vec<(String, bool)>);
+
+/// The drawn centreline nearest `p` that could be a continuation of a leg
+/// running on bearing `brg`: its index in `paint` and the foot of the
+/// perpendicular. `prefer` is the line the previous sample snapped to, which
+/// wins whenever it is still a candidate — without that, two lines drawn a
+/// metre apart (a taxiway and the stand lead-in leaving it) swap the route
+/// between them sample by sample and saw-tooth a straight leg.
+fn nearest_paint(
+    paint: &[Vec<(f64, f64)>],
+    p: (f64, f64),
+    brg: f64,
+    prefer: Option<usize>,
+    m_per_deg_lon: f64,
+) -> Option<(usize, (f64, f64))> {
+    let mut best: Option<(f64, usize, (f64, f64))> = None;
+    let mut best_prefer: Option<(f64, usize, (f64, f64))> = None;
+    for (idx, line) in paint.iter().enumerate() {
+        for w in line.windows(2) {
+            let (ax, ay) = ((w[0].1 - p.1) * m_per_deg_lon, (w[0].0 - p.0) * 111_320.0);
+            let (bx, by) = ((w[1].1 - p.1) * m_per_deg_lon, (w[1].0 - p.0) * 111_320.0);
+            let (dx, dy) = (bx - ax, by - ay);
+            let len2 = dx * dx + dy * dy;
+            if len2 < 1e-6 {
+                continue;
+            }
+            let t = (-(ax * dx + ay * dy) / len2).clamp(0.0, 1.0);
+            let (fx, fy) = (ax + t * dx, ay + t * dy);
+            let d = (fx * fx + fy * fy).sqrt();
+            if d > PAINT_SNAP_M {
+                continue;
+            }
+            // Undirected: a line drawn from the other end is the same line.
+            let gap = (dx.atan2(dy).to_degrees() - brg).rem_euclid(180.0);
+            if gap.min(180.0 - gap) > PAINT_PARALLEL_DEG {
+                continue;
+            }
+            let foot = (p.0 + fy / 111_320.0, p.1 + fx / m_per_deg_lon);
+            if best.is_none_or(|(bd, _, _)| d < bd) {
+                best = Some((d, idx, foot));
+            }
+            if prefer == Some(idx) && best_prefer.is_none_or(|(bd, _, _)| d < bd) {
+                best_prefer = Some((d, idx, foot));
+            }
+        }
+    }
+    best_prefer.or(best).map(|(_, idx, foot)| (idx, foot))
+}
+
+/// Move a planned route onto the paint it is an approximation of, returning
+/// the resampled `(path, seg)`.
+///
+/// The route out of the planner is a chain of 1201 nodes: the right taxiways
+/// in the right order, drawn by hand to within a few metres of the yellow
+/// line. Following it exactly — which the drive does, to 0.12 m — puts the
+/// aircraft a couple of metres to one side of the line for the whole taxi,
+/// which is what the pilot sees and what a ground crew would fail you for.
+/// So each leg is sampled and each sample slid sideways onto the drawn
+/// centreline, when there is one running the same way close enough to be the
+/// same line.
+///
+/// It can only ever move a point `PAINT_SNAP_M` sideways onto a line the leg
+/// was already following, never re-route: the topology, the names, the
+/// crossings and the holding point are the network's and are untouched. A
+/// field that draws no centrelines (or a net built without them) gets its
+/// route back unchanged, not a refusal.
+///
+/// Runway legs are left alone. A crossing runs square across every taxi line
+/// near it, the strip's own markings are not 120 features anyway, and the
+/// runway geometry is authoritative where the taxi network is not.
+pub fn ride_paint(
+    paint: &[Vec<(f64, f64)>],
+    path: &[(f64, f64)],
+    seg: &[(String, bool)],
+) -> RoutePolyline {
+    if paint.is_empty() || path.len() < 2 {
+        return (path.to_vec(), seg.to_vec());
+    }
+    let m_per_deg_lon = 111_320.0 * path[0].0.to_radians().cos();
+    let dist_m = |a: (f64, f64), b: (f64, f64)| {
+        let (dx, dy) = ((a.1 - b.1) * m_per_deg_lon, (a.0 - b.0) * 111_320.0);
+        (dx * dx + dy * dy).sqrt()
+    };
+    let mut out_path: Vec<(f64, f64)> = Vec::with_capacity(path.len() * 4);
+    let mut out_seg: Vec<(String, bool)> = Vec::with_capacity(path.len() * 4);
+    let mut prefer: Option<usize> = None;
+    for i in 0..path.len() - 1 {
+        let (a, b) = (path[i], path[i + 1]);
+        let s = seg.get(i).cloned().unwrap_or_default();
+        let len = dist_m(a, b);
+        if s.1 || len < 0.5 {
+            out_path.push(a);
+            out_seg.push(s);
+            prefer = None;
+            continue;
+        }
+        let brg = bearing_deg(a.0, a.1, b.0, b.1);
+        let n = ((len / PAINT_SAMPLE_M).round() as usize).max(1);
+        for k in 0..n {
+            let t = k as f64 / n as f64;
+            let raw = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+            let snapped = match nearest_paint(paint, raw, brg, prefer, m_per_deg_lon) {
+                Some((idx, q)) => {
+                    prefer = Some(idx);
+                    q
+                }
+                None => raw,
+            };
+            // Progress along the route must stay monotonic: every consumer
+            // projects onto this polyline and reads how far along it is, and
+            // a sample slid BACKWARDS past the one before it would read as
+            // the aircraft losing ground. Nothing in the gates above forbids
+            // it outright, so the cheap answer is to keep the raw sample —
+            // one unsnapped point in the middle of a snapped run is invisible.
+            let keeps_going = out_path
+                .last()
+                .is_none_or(|&prev| dist_m(prev, snapped) > 0.25 && {
+                    let step = bearing_deg(prev.0, prev.1, snapped.0, snapped.1);
+                    let gap = (step - brg).rem_euclid(360.0);
+                    gap.min(360.0 - gap) < 90.0
+                });
+            out_path.push(if keeps_going { snapped } else { raw });
+            out_seg.push(s.clone());
+        }
+    }
+    // The end point rides the last leg's bearing, so a route that finishes at
+    // a holding point finishes ON the line, which is where it will stop.
+    let last = path[path.len() - 1];
+    let prev = path[path.len() - 2];
+    let end = if seg.last().is_some_and(|s| s.1) {
+        last
+    } else {
+        let brg = bearing_deg(prev.0, prev.1, last.0, last.1);
+        nearest_paint(paint, last, brg, prefer, m_per_deg_lon).map_or(last, |(_, q)| q)
+    };
+    out_path.push(end);
+    (out_path, out_seg)
+}
+
 /// Parse `icao`'s taxi network from apt.dat — same streaming block scan as
-/// [`find_airport`], collecting 1201 (node) and 1202 (edge) rows. `None`
-/// when the field has no network (small strips mostly don't).
+/// [`find_airport`], collecting 1201 (node) and 1202 (edge) rows, plus the
+/// drawn taxi centrelines (120 linear features) the routing geometry is only
+/// an approximation of. `None` when the field has no network (small strips
+/// mostly don't) — the paint alone is not a network, since it carries no
+/// connectivity and no names.
 pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
     let file = std::fs::File::open(path).with_context(|| format!("open {path}"))?;
     let mut reader = BufReader::with_capacity(1 << 20, file);
     let mut net = TaxiNet::default();
     let mut in_airport = false;
     let mut buf = Vec::with_capacity(256);
+    // The linear feature being read. Nodes only count as PAINT inside a 120
+    // block: the same 111-116 rows draw pavement boundaries (110) and the
+    // airport perimeter (130), and a boundary is not a line to taxi down.
+    let mut in_feature = false;
+    let mut feature: Vec<PaintNode> = Vec::new();
     loop {
         buf.clear();
         if reader.read_until(b'\n', &mut buf).unwrap_or(0) == 0 {
@@ -658,7 +920,51 @@ pub fn find_taxi_net(path: &str, icao: &str) -> Result<Option<TaxiNet>> {
             continue;
         };
         let mut f = line.split_whitespace();
-        match f.next() {
+        let row = f.next();
+        // Any row that opens a new block ends the feature being read.
+        if !matches!(row, Some("111" | "112" | "113" | "114" | "115" | "116")) {
+            flush_paint_feature(&mut feature, &mut net.paint);
+            in_feature = in_airport && row == Some("120");
+        }
+        match row {
+            Some("111" | "112" | "113" | "114" | "115" | "116") if in_feature => {
+                let (Some(lat), Some(lon)) = (
+                    f.next().and_then(|s| s.parse::<f64>().ok()),
+                    f.next().and_then(|s| s.parse::<f64>().ok()),
+                ) else {
+                    continue;
+                };
+                // 112/114/116 carry the bezier control point before the
+                // attributes; the plain rows go straight to them.
+                let ctrl = if matches!(row, Some("112" | "114" | "116")) {
+                    match (
+                        f.next().and_then(|s| s.parse::<f64>().ok()),
+                        f.next().and_then(|s| s.parse::<f64>().ok()),
+                    ) {
+                        (Some(a), Some(b)) => Some((a, b)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let centre = f.any(|a| PAINT_CENTRELINE_TYPES.contains(&a));
+                feature.push(PaintNode {
+                    p: (lat, lon),
+                    ctrl,
+                    centre,
+                });
+                // 113/114 close a loop: the drawn line returns to its start.
+                if matches!(row, Some("113" | "114")) {
+                    if let Some(&first) = feature.first() {
+                        feature.push(first);
+                    }
+                    flush_paint_feature(&mut feature, &mut net.paint);
+                    in_feature = false;
+                } else if matches!(row, Some("115" | "116")) {
+                    flush_paint_feature(&mut feature, &mut net.paint);
+                    in_feature = false;
+                }
+            }
             Some("1") | Some("16") | Some("17") => {
                 if in_airport {
                     break;
@@ -1063,6 +1369,11 @@ impl TaxiNet {
             .find(|n| !n.is_empty())
             .cloned()
             .unwrap_or_default();
+        // Onto the paint, like the departure route. The first leg is flagged
+        // as the runway one, so the snap leaves it — and with it the start
+        // point, which is the aircraft's own position and the one point in
+        // any route that must never be moved.
+        let (path, seg) = ride_paint(&self.paint, &path, &seg);
         (path.len() >= 2).then_some(VacatePlan {
             path,
             seg,
@@ -1341,6 +1652,13 @@ impl TaxiNet {
             .count();
         let mut lead_on: Vec<(f64, f64)> = path[prefix..].to_vec();
         lead_on.extend_from_slice(&full[prefix..]);
+        // Onto the paint, now the route is trimmed and the lead-on split off:
+        // the network chose the taxiways, the drawn line says where they run.
+        // Both halves ride it — the lead-on IS a painted line (the yellow one
+        // from the holding point onto the strip), and the line-up drives it.
+        (path, seg) = ride_paint(&self.paint, &path, &seg);
+        let lead_seg = vec![(String::new(), false); lead_on.len().saturating_sub(1)];
+        lead_on = ride_paint(&self.paint, &lead_on, &lead_seg).0;
         // The route starts where the AIRCRAFT is, not at the node it snapped
         // to: the apron leg from the stand to the network is part of the
         // cleared route, so the off-route watch and the taxi guide measure
@@ -2418,6 +2736,219 @@ mod tests {
             bare.plan_to_runway(35.9990, -5.0081, thr27.0, thr27.1, 40.0, &[])
                 .is_some(),
             "no entrance in the data is not a reason to refuse to taxi"
+        );
+    }
+
+    /// A field near 36°N, so the paint tests read as a taxi diagram in
+    /// metres: `ll(east, north)` from the airport reference point.
+    const LAT0: f64 = 36.0;
+    const LON0: f64 = -5.0;
+    fn ll(east_m: f64, north_m: f64) -> (f64, f64) {
+        (
+            LAT0 + north_m / 111_320.0,
+            LON0 + east_m / (111_320.0 * LAT0.to_radians().cos()),
+        )
+    }
+
+    /// The whole point, in one test: a network drawn beside its paint, and a
+    /// route that comes back ON the paint.
+    ///
+    /// The geometry is Malaga's, reduced (2026-08-05). The drawn line runs
+    /// due east; the 1201 nodes that name it were authored 2.5 m north of it,
+    /// which is inside the tolerance of anyone eyeballing a WED window and
+    /// twenty times what the drive's own tracking error is.
+    #[test]
+    fn a_route_rides_the_drawn_line_the_network_only_approximates() {
+        let paint = vec![vec![ll(0.0, 0.0), ll(400.0, 0.0)]];
+        let path = vec![ll(0.0, 2.5), ll(200.0, 2.5), ll(400.0, 2.5)];
+        let seg = vec![("A".to_string(), false); 2];
+        let (rode, rode_seg) = ride_paint(&paint, &path, &seg);
+        assert_eq!(rode_seg.len(), rode.len() - 1, "seg stays aligned with path");
+        assert!(rode_seg.iter().all(|s| s.0 == "A"), "names are untouched");
+        let off = |p: (f64, f64)| (p.0 - LAT0) * 111_320.0;
+        for p in &rode {
+            assert!(
+                off(*p).abs() < 0.05,
+                "every point should sit on the drawn line, not 2.5 m north of it: {:.2} m",
+                off(*p)
+            );
+        }
+        // Along-track is preserved: this moves a route sideways, never
+        // shortens or re-routes it.
+        let east = |p: (f64, f64)| (p.1 - LON0) * 111_320.0 * LAT0.to_radians().cos();
+        assert!(east(rode[0]).abs() < 0.5 && (east(*rode.last().unwrap()) - 400.0).abs() < 0.5);
+        assert!(
+            rode.windows(2).all(|w| east(w[1]) > east(w[0])),
+            "progress along the route must stay monotonic"
+        );
+
+        // A line that merely passes nearby is not this leg's line. Same
+        // geometry, but the paint crosses at right angles: nothing snaps,
+        // and the route is handed back as it was rather than dragged onto
+        // the taxiway it is crossing.
+        let across = vec![vec![ll(200.0, -50.0), ll(200.0, 50.0)]];
+        let (unmoved, _) = ride_paint(&across, &path, &seg);
+        assert!(unmoved.iter().all(|p| (off(*p) - 2.5).abs() < 0.05));
+
+        // Too far away to be the same line: a taxiway width out is a
+        // different taxiway, and a route is never invented onto one.
+        let far = vec![vec![ll(0.0, -20.0), ll(400.0, -20.0)]];
+        let (kept, _) = ride_paint(&far, &path, &seg);
+        assert!(kept.iter().all(|p| (off(*p) - 2.5).abs() < 0.05));
+
+        // No paint at all (thin data, or a net built without it) is not a
+        // refusal — the route comes back exactly as planned.
+        let (bare, bare_seg) = ride_paint(&[], &path, &seg);
+        assert_eq!(bare, path);
+        assert_eq!(bare_seg, seg);
+    }
+
+    /// A runway leg is left alone, and with it the point a vacate starts
+    /// from. The crossing runs square across every taxi line near it, the
+    /// strip's own markings are not linear features, and the aircraft's own
+    /// position is the one point in any route that must never move.
+    #[test]
+    fn the_snap_never_moves_a_runway_leg_or_the_start_of_a_vacate() {
+        let paint = vec![vec![ll(-30.0, 0.0), ll(400.0, 0.0)]];
+        let path = vec![ll(0.0, 4.0), ll(60.0, 4.0), ll(200.0, 4.0)];
+        let seg = vec![("".to_string(), true), ("B".to_string(), false)];
+        let (rode, _) = ride_paint(&paint, &path, &seg);
+        assert_eq!(rode[0], path[0], "the runway leg keeps its start exactly");
+        let off = |p: (f64, f64)| (p.0 - LAT0) * 111_320.0;
+        assert!(
+            off(*rode.last().unwrap()).abs() < 0.05,
+            "the taxiway leg after it still rides the line"
+        );
+    }
+
+    /// The parse: line type on the node the segment LEAVES, beziers sampled,
+    /// and anything that is not a centreline left out of the paint.
+    #[test]
+    fn drawn_centrelines_parse_out_of_a_linear_feature() {
+        let dir = std::env::temp_dir().join(format!("xvl_paint_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("apt.dat");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "I").unwrap();
+        writeln!(f, "1000 Generated").unwrap();
+        writeln!(f, "1 10 0 0 TEST Test Field").unwrap();
+        writeln!(f, "1201 36.0000000 -5.0000000 both 1 A").unwrap();
+        writeln!(f, "1201 36.0000000 -5.0010000 both 2 A").unwrap();
+        writeln!(f, "1202 1 2 twoway taxiway A").unwrap();
+        // A centreline with a bezier in the middle, then a stretch of some
+        // other marking, then the terminator.
+        writeln!(f, "120 taxiway A centre").unwrap();
+        writeln!(f, "111 36.0000000 -5.0000000 51").unwrap();
+        writeln!(f, "112 36.0000000 -5.0005000 36.0000500 -5.0005000 51").unwrap();
+        writeln!(f, "111 36.0000000 -5.0010000 4").unwrap();
+        writeln!(f, "115 36.0000000 -5.0015000").unwrap();
+        // A pavement boundary drawn with the same rows is NOT paint to drive.
+        writeln!(f, "110 1 0.0 0.0 apron").unwrap();
+        writeln!(f, "111 36.0100000 -5.0000000 51").unwrap();
+        writeln!(f, "113 36.0100000 -5.0010000 51").unwrap();
+        drop(f);
+        let net = find_taxi_net(path.to_str().unwrap(), "TEST")
+            .unwrap()
+            .expect("a network");
+        assert_eq!(net.paint.len(), 1, "one centreline run: {:?}", net.paint);
+        let line = &net.paint[0];
+        assert!(
+            line.len() > BEZIER_STEPS,
+            "the curve is sampled, not a straight chord: {}",
+            line.len()
+        );
+        // The bezier bulges north of the chord, which is the whole reason to
+        // sample it rather than join the nodes.
+        let bulge = line
+            .iter()
+            .map(|p| (p.0 - 36.0) * 111_320.0)
+            .fold(0.0_f64, f64::max);
+        assert!(bulge > 0.5, "bezier ignored: {bulge:.2} m");
+        // The type-4 leg (a hold bar) is not a line to taxi down, so the run
+        // ends at the node where the centreline type stops — the segment
+        // beyond it is drawn, but it is not a line to drive.
+        assert!(
+            line.iter().all(|p| p.1 >= -5.0010 - 1e-9),
+            "the run must stop where the centreline type stops: {:?}",
+            line.last()
+        );
+        assert!(
+            (line.last().unwrap().1 + 5.0010).abs() < 1e-9,
+            "and it must reach it: {:?}",
+            line.last()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sortie this came from, measured against the real file.
+    /// `cargo test -p atc -- --ignored live_lemg_route_rides --nocapture`
+    ///
+    /// Malaga, 2026-08-05: the Baron taxied 1,214 m from its GA stand to
+    /// runway 13, tracking the planned route to 0.12 m and the drawn line to
+    /// nothing better than 1.7 m. The assertion is on the route, not on the
+    /// aircraft — where the route runs is the only part of that we own.
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn live_lemg_route_rides_the_paint() {
+        let path =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let Ok(Some(net)) = find_taxi_net(path, "LEMG") else {
+            return; // no install, no verdict
+        };
+        assert!(!net.paint.is_empty(), "LEMG draws its taxi centrelines");
+        let (slat, slon) = (36.682214, -4.502304); // the stand it pushed off
+        let (tlat, tlon) = (36.6620, -4.5100); // runway 13 threshold, near enough
+        let zone: Vec<String> = vec!["13".into(), "31".into()];
+        let plan = net
+            .plan_to_runway(slat, slon, tlat, tlon, 100.0, &zone)
+            .expect("a route");
+        // Distance from each route point to the nearest drawn centreline,
+        // whatever direction it runs — a plain "how far off the paint is it".
+        let m_per_deg_lon = 111_320.0 * slat.to_radians().cos();
+        let to_paint = |p: (f64, f64)| -> f64 {
+            net.paint
+                .iter()
+                .flat_map(|l| l.windows(2))
+                .map(|w| {
+                    let (ax, ay) = ((w[0].1 - p.1) * m_per_deg_lon, (w[0].0 - p.0) * 111_320.0);
+                    let (bx, by) = ((w[1].1 - p.1) * m_per_deg_lon, (w[1].0 - p.0) * 111_320.0);
+                    let (dx, dy) = (bx - ax, by - ay);
+                    let l2 = dx * dx + dy * dy;
+                    let t = if l2 > 1e-6 {
+                        (-(ax * dx + ay * dy) / l2).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    ((ax + t * dx).powi(2) + (ay + t * dy).powi(2)).sqrt()
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        let mut offs: Vec<f64> = plan.path.iter().skip(1).map(|&p| to_paint(p)).collect();
+        offs.sort_by(f64::total_cmp);
+        let median = offs[offs.len() / 2];
+        let p90 = offs[offs.len() * 9 / 10];
+        println!(
+            "{} points ({} riding the line) over {:.0} m: median {:.2} m off the paint, \
+             p90 {:.2} m, worst {:.2} m",
+            offs.len(),
+            offs.iter().filter(|d| **d < 0.5).count(),
+            plan.path
+                .windows(2)
+                .map(|w| {
+                    let (dx, dy) = (
+                        (w[0].1 - w[1].1) * m_per_deg_lon,
+                        (w[0].0 - w[1].0) * 111_320.0,
+                    );
+                    (dx * dx + dy * dy).sqrt()
+                })
+                .sum::<f64>(),
+            median,
+            p90,
+            offs.last().unwrap()
+        );
+        assert!(
+            median < 0.5,
+            "the route should ride the drawn line, median {median:.2} m off"
         );
     }
 

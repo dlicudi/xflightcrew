@@ -1534,6 +1534,37 @@ governor that dies mid-squeeze leaves NOTHING holding the aircraft, so it
 releases only when the parking brake is actually set and logs the case where it
 is not. NOT yet flown.
 
+**The route is the network's; the LINE is the paint's** (2026-08-05, Malaga,
+noticed from the cockpit window rather than from a log). The Baron taxied
+1,214 m to runway 13 tracking its planned route to 0.05-0.13 m, and did the
+whole taxi 1.7 to 2.8 m to one side of the yellow line — 5 to 6 m through the
+taxiway E junction. Nothing was wrong with the drive. apt.dat carries two
+descriptions of the same pavement and the routing network is authoritative
+about only one of them: 1201/1202 are hand-authored TOPOLOGY (what connects to
+what, and what it is called), while the yellow line itself is drawn separately
+as a 120 linear feature, and at LEMG the two sit metres apart. Following the
+network exactly is therefore following an approximation exactly.
+`find_taxi_net` now also collects the drawn centrelines (line types 1 and 51,
+beziers sampled, since the fillet at a junction is a curve and its chord is
+not), and `ride_paint` resamples every planned route onto them: each leg is cut
+into 5 m samples and each sample slid sideways onto the nearest drawn line
+running the same way — inside `PAINT_SNAP_M` (8 m; wider is a different
+taxiway, not a mis-drawn network) and `PAINT_PARALLEL_DEG` (25 degrees, which
+is what stops a route being dragged onto the taxiway it is CROSSING, or onto a
+hold bar drawn square across it). It can only ever move a point sideways onto a
+line the leg was already following: the topology, the names, the crossings and
+the holding point stay the network's. The departure route rides it, so does the
+lead-on (which IS a painted line) and the vacate; runway legs are left alone,
+and with them the vacate's start point, which is the aircraft's own position and
+the one point in any route that must never move. At LEMG 230 of the route's 242
+points now sit ON the line (median 0.00 m, from 1.7-2.8), and the 12 that don't
+are where nothing is drawn — thin data degrades, it never refuses. One
+knock-on, from the same family as every other unit change: a leg used to mean a
+network EDGE, so `mark_runway_crossings` exempting "the last leg" exempted the
+whole approach to the holding point, and a leg is now metres long — the
+exemption is the route's TAIL (`TAIL_EXEMPT_M`) or a route announces a crossing
+of the runway it is holding short of. NOT yet flown.
+
 Depth (added 2026-07-28, evening): four traps of the same family — a fact one
 part of the system knows and another needs. The taxi GUIDE narrated a
 **pushback** ("Rolling again. Sharp left next, onto Bravo" with the tug
