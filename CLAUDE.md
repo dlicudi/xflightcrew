@@ -1622,6 +1622,18 @@ now finishes 0.0 m from W5. The departure mirror has been right since the
 lead-on landed — a route ends short of the runway ON PURPOSE there, and the
 drawn line carries it the rest of the way.
 
+**And a route to a stand is never a departure's** (same sortie, one taxi
+later). Full auto asks the tower for a taxi clearance unless it already holds
+one, where "holds one" was `route_is_ours`: does the published route pass
+within 200 m of us. An arrival's clearance ENDS where we are parked, so it
+passes that test with room to spare — full auto adopted the taxi-in route it
+had just finished driving, skipped the request entirely (no `request_taxi`, no
+`tuned_tower` in the stage log), drove 33 s of an already-complete 88 m route
+back toward the stand from 66 m off it, and announced itself at the holding
+point. The tower's answer to the departure request was "taxi to holding point
+Hotel Whiskey one FIRST", and the line-up failed. The party line already knew
+which kind of route it had published (`taxi_to_stand`); nobody had asked it.
+
 Depth (added 2026-07-28, evening): four traps of the same family — a fact one
 part of the system knows and another needs. The taxi GUIDE narrated a
 **pushback** ("Rolling again. Sharp left next, onto Bravo" with the tug
