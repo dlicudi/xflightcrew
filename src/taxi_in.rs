@@ -29,7 +29,6 @@ use crate::voice::{Priority, Voice};
 use crate::xplane::XPlaneClient;
 
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
-const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 /// True heading — the rollout direction, so a vacate never picks an exit
 /// behind us (reaching one means taxiing back down the runway).
 const PSI_TRUE: &str = "sim/flightmodel/position/psi";
@@ -168,8 +167,11 @@ async fn vacate(
     announce(voice, Priority::Advisory, "Clearing the runway.");
     // Brakes off — autoland set them at the stop, and the governor reads the
     // residual pressure as the pilot braking and never applies power (the
-    // stagnant-at-the-numbers trap, 2026-07-26).
-    let _ = xp.set_float(PARK_BRAKE, 0.0).await;
+    // stagnant-at-the-numbers trap, 2026-07-26). Through the valve-aware
+    // release: a bare ratio write leaves the valve where the stop's
+    // `park_brake_set` put it, and an armed valve traps the governor's own
+    // first squeeze straight back into the parking brake (2026-08-03).
+    crate::tools::controls::release_park_brake_for_roll(xp, park_brake_valve_set).await;
     // Governor through the SAME front door the auto taxi and the line-up use,
     // so every parking-brake and held-brake gate applies to a vacate
     // unchanged. Driving without it would be a drive with nobody on the
@@ -336,8 +338,9 @@ async fn fly(
     // on") — otherwise the taxi governor reads the residual parking-brake
     // pressure as the pilot braking and never applies power, and the aircraft
     // sits stagnant at the numbers (2026-07-26). The same "brakes off" full auto
-    // does before a departure taxi.
-    let _ = xp.set_float(PARK_BRAKE, 0.0).await;
+    // does before a departure taxi, and valve-aware for the reason above: the
+    // ratio-only write left the valve armed to re-trap the first squeeze.
+    crate::tools::controls::release_park_brake_for_roll(&xp, park_brake_valve_set).await;
 
     // Drive the cleared stand route. AutoTaxi owns the gates (on ground, on the
     // route, steer channel) and speaks the readback ("My taxi. stand ...").
@@ -388,7 +391,7 @@ async fn fly(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     if crate::autotaxi::LAST_ARRIVED.load(Relaxed) {
-        secure(&xp, &voice).await;
+        secure(&xp, &voice, park_brake_valve_set).await;
     }
 }
 
@@ -399,7 +402,7 @@ async fn fly(
 /// deliberately left to the pilot for now — it's airframe-specific (a piston's
 /// mixture cutoff vs a turboprop's condition levers) and wants sim validation
 /// before the copilot cuts an engine on its own.
-async fn secure(xp: &XPlaneClient, voice: &Option<Voice>) {
+async fn secure(xp: &XPlaneClient, voice: &Option<Voice>, park_brake_valve_set: Option<f64>) {
     announce(
         voice,
         Priority::Advisory,
@@ -410,7 +413,11 @@ async fn secure(xp: &XPlaneClient, voice: &Option<Voice>) {
         ]),
     );
     // Park brake firmly set (the taxi already set it — belt and braces).
-    let _ = xp.set_float(PARK_BRAKE, 1.0).await;
+    // Through the valve-aware routine, which is what makes "firmly" true on an
+    // airframe that models a valve: the drive ISOLATES it so the governor's
+    // squeezes cannot latch, and a raw ratio write into an isolated valve is
+    // the last thing you want to be trusting at a stand.
+    let _ = crate::tools::controls::drive_park_brake(xp, true, park_brake_valve_set).await;
     // Transponder to standby now we're off the movement area. Through the
     // shared writer so an add-on's own box (the Twin Otter's KT73) has its
     // KNOB turned — the stock dataref is that airframe's output, not its input.

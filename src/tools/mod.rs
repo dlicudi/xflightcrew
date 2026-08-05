@@ -268,6 +268,7 @@ impl Registry {
                 tail_strike_deg: profile.tail_strike_deg,
                 vne_kts: profile.vne_kts,
                 handoff_to_caller: false,
+                park_brake_valve_set: profile.park_brake_valve_set,
             }));
             // Auto circuit — one command that flies takeoff + pattern + landing
             // by orchestrating the takeoff loop, the AP, and autoland. Shares
@@ -286,6 +287,7 @@ impl Registry {
                 prop: profile.prop.clone(),
                 climb_floor_kts: circuit::climb_floor(profile),
                 vs_clean_kts: profile.vs_clean_kts,
+                park_brake_valve_set: profile.park_brake_valve_set,
             }));
             // Fly a REAL published SID / instrument approach from the sim's CIFP —
             // the terrain-safe path where the circuit only guessed. Shares the AP

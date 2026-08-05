@@ -282,6 +282,7 @@ impl Tool for FullAuto {
                 pace: self.pace,
             },
             circuit: crate::tools::circuit::Circuit {
+                park_brake_valve_set: self.park_brake_valve_set,
                 tail_strike_deg: self.tail_strike_deg,
                 vne_kts: self.vne_kts,
                 cfg: self.cfg.clone(),
@@ -301,6 +302,7 @@ impl Tool for FullAuto {
                 // the orchestrator takes the climb from the handoff — the
                 // pilot must not be told "your aircraft" there.
                 handoff_to_caller: true,
+                park_brake_valve_set: self.park_brake_valve_set,
                 tail_strike_deg: self.tail_strike_deg,
                 vne_kts: self.vne_kts,
                 cfg: self.cfg.clone(),

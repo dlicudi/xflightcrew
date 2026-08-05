@@ -1483,6 +1483,57 @@ the stall clock and the release branch both fired inside one tick (`issued` #2
 and `reissued_after_release` #3, 0.6 s apart), spending the whole budget on a
 tug that had already gone.
 
+**The taxi governor was braking itself to a standstill, through the park-brake
+VALVE** (2026-08-03, Malaga, three taxis over two sorties). Every drive died the
+same way: roll cleanly to about 9 kt, make one small anticipatory squeeze, stop
+dead within four seconds, and sit there until `stagnant` fired with 602 of
+631 m still to run. Re-engaging repeated it one squeeze later.
+
+The valve is the whole of it, and it had been read as an animation flag. While
+`park_brake_valve` sits in the SET position the sim traps any brake application
+into `parking_brake_ratio` and LATCHES it — which is just what a park-brake
+valve physically does, connect the wheel-brake line to the accumulator so
+pressure put into the line stays in it. So the proportional channel
+`xcopilot/taxi_brake`, whose entire contract is that a squeeze expires within a
+second, was writing a PERMANENT parking brake at the squeeze's own value. The
+blackbox shows it exactly: `park` steps 0.0 to 0.1 on a `cmd 0.10` and 0.0 to
+0.3 on an `out 0.28`, and the second one was still holding the aircraft an hour
+later. Then the governor's own next tick reads that ratio as the pilot's foot
+and pauses — idle throttle, waiting for a pilot who is not braking. Both of the
+self-pollution guards there (`governor_braking`, `brake_cmd_quiet`) are CLOCKS,
+and a clock cannot see a latch: anything that makes one of our own applications
+permanent outlives both, which is why the fix has to be upstream and not another
+gate.
+
+Nothing ever opened the valve because the SET path went through the valve-aware
+`drive_park_brake` and the RELEASE path did not — three call sites wrote
+`parking_brake_ratio = 0.0` raw (both taxi_in phases and the auto-takeoff's
+brake release), which looks complete and leaves the valve armed behind it. The
+asymmetry IS the bug. `ensure_park_brake_valve` is now the one seam, commanded
+absolutely (`park_brake_valve_open`/`_close`, not a toggle guarded by a stale
+read), the governor isolates the valve on every taxi arm rather than only as a
+side effect of releasing a brake that happened to be set, and
+`release_park_brake_for_roll` replaces the three raw writes. The BE58 profile
+declares `park_brake_valve_set: 1.0` — measured both ways live, and per-airframe
+for the usual reason: SET is 1 here and on the SR22, 0 on the C90B, so a
+constant would strand half the fleet with the valve backwards. An airframe
+declaring no valve is untouched.
+
+Worth keeping: the FIRST diagnosis of this, the same day, was wrong. It blamed
+the toe RATIOS latching across a standdown (expiry frees the plugin override,
+never the ratios) and shipped `should_release_brake_channel` against that story.
+Probed live the next day with the aircraft still stuck, `left_brake_ratio` and
+`right_brake_ratio` both read 0.0 and `override_toe_brakes` 0 — the plugin's
+expiry cleans up after itself exactly as documented, and the 0.5 that had been
+read off "the ratios" was the parking brake all along. The arm-time clear stays
+because zeroing a channel you have not zeroed is honest and costs one write, not
+because it was ever the bug; its doc comment now says so, since a fix with a
+plausible story attached is how `tow_in_progress` survived a fortnight. The exit
+release stays too, and means more now than it did: with the valve isolated a
+governor that dies mid-squeeze leaves NOTHING holding the aircraft, so it
+releases only when the parking brake is actually set and logs the case where it
+is not. NOT yet flown.
+
 Depth (added 2026-07-28, evening): four traps of the same family — a fact one
 part of the system knows and another needs. The taxi GUIDE narrated a
 **pushback** ("Rolling again. Sharp left next, onto Bravo" with the tug

@@ -75,7 +75,6 @@ const PHI: &str = "sim/flightmodel/position/true_phi";
 /// The sim's own pitch rate, deg/s — what the rotation law damps on. Measured,
 /// so it needs neither differencing nor a filter; see [`RotatePitch::step`].
 const PITCH_RATE: &str = "sim/flightmodel/position/Q";
-const PARK_BRAKE: &str = "sim/cockpit2/controls/parking_brake_ratio";
 
 const M_TO_FT: f64 = 3.280_84;
 const MS_TO_KTS: f64 = 1.943_844;
@@ -297,6 +296,10 @@ pub struct Params {
     /// while nobody flies — and the whole trust model here rests on the
     /// copilot being right about who has the aircraft.
     pub handoff_to_caller: bool,
+    /// The airframe's park-brake valve SET sense, for the brakes-off before the
+    /// roll. `None` = the airframe models no valve, and the ratio is the whole
+    /// of the parking brake.
+    pub park_brake_valve_set: Option<f64>,
 }
 
 /// Fit the aircraft's position and heading to a runway end: which strip are
@@ -823,8 +826,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // The line-up ends "brakes set" — the parking-brake ratio latched. It
     // is OURS to release: sortie five's first engage sat at full power,
     // groundspeed zero, for twelve seconds against the parked brake and
-    // rejected as stagnant.
-    let _ = xp.set_float(PARK_BRAKE, 0.0).await;
+    // rejected as stagnant. The VALVE goes with it (2026-08-03): left in the
+    // set position it traps the roll's own brake applications — the reject
+    // path's stopping pulse included — back into the parking brake.
+    crate::tools::controls::release_park_brake_for_roll(&xp, p.park_brake_valve_set).await;
     tracing::info!(
         icao = %rwy.icao, id = %rwy.id, remaining_m, vr = p.vr_kts, "auto takeoff: rolling"
     );

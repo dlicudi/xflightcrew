@@ -39,6 +39,9 @@ pub struct Circuit {
     pub climb_floor_kts: f64,
     /// Clean stall speed, the floor under the pattern speed (flown clean).
     pub vs_clean_kts: Option<f64>,
+    /// The airframe's park-brake valve SET sense (profile), passed to the
+    /// takeoff so its brakes-off releases the valve as well as the ratio.
+    pub park_brake_valve_set: Option<f64>,
 }
 
 /// Default pattern altitude above the field, feet (a standard light-aircraft
@@ -227,6 +230,7 @@ impl Tool for Circuit {
                     handoff_agl_ft: 500.0,
                     // The CIRCUIT takes it at the handoff, not the pilot.
                     handoff_to_caller: true,
+                    park_brake_valve_set: self.park_brake_valve_set,
                 },
                 approach_ias: self.approach_ias,
                 tpa_agl_ft: pattern_alt_agl_ft(self.approach_ias),

@@ -24,8 +24,24 @@ const TRIM_TAKEOFF: f64 = 0.0;
 /// pins `parking_brake_ratio` back to 1 while set); on the SR22 it's the
 /// opposite (1 = set, no ratio pinning). So the tool only drives the valve when
 /// the profile says which value means SET (`park_brake_valve_set`).
+///
+/// The valve is not cosmetic and it is not only about the HANDLE, which is how
+/// it was read until 2026-08-03: while it is in the SET position the sim traps
+/// any brake application into `parking_brake_ratio` and LATCHES it there. That
+/// is the physical thing a park-brake valve does — it connects the wheel-brake
+/// line to the accumulator, so pressure put into the line stays in it — and it
+/// makes every momentary squeeze on the proportional taxi-brake channel a
+/// permanent parking brake at the squeeze's own value. See
+/// `ensure_park_brake_valve`, and `speedhold`'s taxi arm for who must care.
 const PARK_BRAKE_VALVE: &str = "sim/cockpit2/controls/park_brake_valve";
-const CMD_VALVE_TOGGLE: &str = "sim/flight_controls/park_brake_valve_toggle";
+/// Deterministic valve commands, for the same reason the handle uses
+/// set/release over a toggle: a toggle guarded by a state read flips the wrong
+/// way whenever the read is stale, and the read here is a whole HTTP round trip
+/// old. `open` drives the dataref to 1 and `close` to 0 (verified live on the
+/// BE58, 2026-08-03) — X-Plane's naming, not a claim about which one holds the
+/// aircraft, which is exactly what `park_brake_valve_set` exists to say.
+const CMD_VALVE_OPEN: &str = "sim/flight_controls/park_brake_valve_open";
+const CMD_VALVE_CLOSE: &str = "sim/flight_controls/park_brake_valve_close";
 /// The parking-brake commands — preferred over a raw dataref write: custom
 /// airframes intercept commands, while a written ratio can be ignored or
 /// overwritten by their systems scripts (the MD-82 pitot-heat lesson).
@@ -40,6 +56,56 @@ pub struct SetParkingBrake {
     pub valve_set: Option<f64>,
 }
 
+/// Drive the park-brake VALVE to match `set`, where the airframe declares which
+/// value means SET. A no-op on an airframe that declares none, and idempotent:
+/// the commands are absolute, so it can be called on every arm.
+///
+/// Worth calling on its own, and not only as `drive_park_brake`'s first step,
+/// because the valve holds authority the HANDLE does not. Left in the SET
+/// position it traps brake pressure, so the proportional taxi-brake channel —
+/// whose whole contract is that a squeeze expires within a second — writes a
+/// PERMANENT brake instead. At Malaga a Baron's taxi governor made one 0.10
+/// anticipatory squeeze, the sim latched `parking_brake_ratio` at 0.10, and the
+/// governor's own next tick read that as the pilot's foot and paused: idle
+/// throttle, waiting for a pilot who was not braking, stagnant with 602 of
+/// 631 m to run. Re-engaging repeated it one squeeze later at 0.28, which was
+/// still holding the aircraft an hour afterwards (2026-08-03).
+pub(crate) async fn ensure_park_brake_valve(
+    xp: &dyn crate::xplane::XPlane,
+    set: bool,
+    valve_set: Option<f64>,
+) {
+    let Some(want) = valve_set.map(|s| if set { s } else { 1.0 - s }) else {
+        return;
+    };
+    let cmd = if want > 0.5 {
+        CMD_VALVE_OPEN
+    } else {
+        CMD_VALVE_CLOSE
+    };
+    if let Err(e) = xp.run_command(cmd).await {
+        tracing::debug!("park brake valve: {cmd} failed: {e:#}");
+    }
+}
+
+/// Release the parking brake for a drive that is about to roll — the ratio AND
+/// the valve, which is the half three call sites used to skip.
+///
+/// They wrote `parking_brake_ratio = 0.0` directly, which looks complete and is
+/// not: the ratio goes to zero, the valve stays where the last `park_brake_set`
+/// put it, and the first thing the taxi governor does with a released brake and
+/// an armed valve is squeeze itself back to a standstill (see
+/// `ensure_park_brake_valve`). The asymmetry is the whole bug — the SET path
+/// went through the valve-aware routine and the RELEASE path did not.
+pub(crate) async fn release_park_brake_for_roll(
+    xp: &dyn crate::xplane::XPlane,
+    valve_set: Option<f64>,
+) {
+    if let Err(e) = drive_park_brake(xp, false, valve_set).await {
+        tracing::debug!("park brake release for roll failed: {e:#}");
+    }
+}
+
 /// Drive the parking brake to `on`, valve-aware — THE one way any tool moves
 /// it. Valve first (per the airframe's SET sense), then the brake, command
 /// before raw write, verified by readback. The taxi hold's auto-release once
@@ -50,13 +116,7 @@ pub(crate) async fn drive_park_brake(
     on: bool,
     valve_set: Option<f64>,
 ) -> Result<bool> {
-    if let Some(want) = valve_set.map(|set| if on { set } else { 1.0 - set }) {
-        if let Ok(now) = xp.get_float(PARK_BRAKE_VALVE).await {
-            if (now - want).abs() > 0.5 {
-                xp.run_command(CMD_VALVE_TOGGLE).await?;
-            }
-        }
-    }
+    ensure_park_brake_valve(xp, on, valve_set).await;
     xp.run_command(if on { CMD_PARK_SET } else { CMD_PARK_RELEASE })
         .await?;
     // Commands apply on the next sim frame — give it a beat.
@@ -637,5 +697,61 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("wasn't holding"), "{out}");
+    }
+
+    /// The valve follows the airframe's declared sense in BOTH directions, and
+    /// it is commanded absolutely rather than toggled off a read.
+    ///
+    /// The sense being per-airframe is the whole reason this is a profile field
+    /// and not a constant: SET is 1 on the BE58 and the SR22, 0 on the C90B, so
+    /// a routine that picked either one would strand half the fleet with the
+    /// valve backwards — which on the trapping airframes means arming the very
+    /// latch this exists to prevent.
+    #[tokio::test]
+    async fn the_valve_follows_the_airframes_declared_sense() {
+        let fake = FakeXPlane::new();
+        ensure_park_brake_valve(&fake, true, Some(1.0)).await;
+        assert!(fake.ran(CMD_VALVE_OPEN), "1 = set must drive the valve to 1");
+        let fake = FakeXPlane::new();
+        ensure_park_brake_valve(&fake, false, Some(1.0)).await;
+        assert!(fake.ran(CMD_VALVE_CLOSE), "releasing must drive it to 0");
+
+        // C90B sense, the mirror image.
+        let fake = FakeXPlane::new();
+        ensure_park_brake_valve(&fake, true, Some(0.0)).await;
+        assert!(fake.ran(CMD_VALVE_CLOSE), "0 = set must drive the valve to 0");
+        let fake = FakeXPlane::new();
+        ensure_park_brake_valve(&fake, false, Some(0.0)).await;
+        assert!(fake.ran(CMD_VALVE_OPEN));
+
+        // An airframe that models no valve is never touched — the Twin Otter
+        // trap in reverse: a command sent to a system that isn't there is at
+        // best noise and at worst somebody else's switch.
+        let fake = FakeXPlane::new();
+        ensure_park_brake_valve(&fake, false, None).await;
+        assert!(!fake.ran(CMD_VALVE_OPEN) && !fake.ran(CMD_VALVE_CLOSE));
+    }
+
+    /// Releasing for a roll moves the VALVE, not just the ratio.
+    ///
+    /// This is the assertion that would have caught Malaga. Three call sites
+    /// wrote `parking_brake_ratio = 0.0` and called it a release: the ratio
+    /// went to zero, the valve stayed where the last `park_brake_set` left it,
+    /// and the taxi governor's first anticipatory squeeze was trapped straight
+    /// back into the parking brake — where the governor's own next tick read it
+    /// as the pilot's foot and paused for good.
+    #[tokio::test]
+    async fn releasing_for_a_roll_isolates_the_valve_too() {
+        let fake = FakeXPlane::with_reads(&[(PARK_BRAKE, 0.0)]);
+        release_park_brake_for_roll(&fake, Some(1.0)).await;
+        assert!(
+            fake.ran(CMD_VALVE_CLOSE),
+            "a release that leaves the valve armed re-traps the next squeeze"
+        );
+        assert!(fake.ran(CMD_PARK_RELEASE), "the handle comes off too");
+        assert!(
+            fake.command_index(CMD_VALVE_CLOSE) < fake.command_index(CMD_PARK_RELEASE),
+            "valve first, so the ratio has somewhere to vent to"
+        );
     }
 }
