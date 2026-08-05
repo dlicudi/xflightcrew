@@ -1622,6 +1622,33 @@ now finishes 0.0 m from W5. The departure mirror has been right since the
 lead-on landed — a route ends short of the runway ON PURPOSE there, and the
 drawn line carries it the rest of the way.
 
+**A proportional controller cannot track a ramp, and a glidepath is a ramp**
+(2026-08-05, the same Malaga circuit — the reason the first approach was
+already lost before autoland ever saw it). The aircraft was handed over 174 ft
+above the 3 degree path with 2,827 m to run, and autoland closed only half of
+that in a mile, so it crossed the numbers 59 ft high and balked. The pattern
+had rolled out onto final only 54 ft high; the error then GREW, monotonically,
+to 172 ft in forty seconds. Two faults in `alt_capture_vs`, and the second one
+hides inside the fix for the first. (1) There was no feed-forward for the
+target's OWN rate. On final the target is the path at our distance to run, so
+it walks down at 318 ft per mile covered — 510 fpm at the Baron's closure — and
+a proportional law tracking a ramp settles at exactly ramp over gain: 510/3 is
+170 ft, against 174 flown. The clamp said the same thing twice over, since a
+flat -500 fpm is LESS than a 3 degree path's own rate at any approach speed
+above 94 kt, so the leg could not have held the path with zero error and
+perfect control. `path_descent_fpm` feeds the rate forward (from the measured
+GROUND closure, because the path descends per mile COVERED and an IAS proxy
+would over-command by the whole headwind), and the descent authority is that
+rate plus a fixed correction budget, which leaves a standing target's clamp
+exactly where it was. (2) The 8 s lead then projected the AIRCRAFT forward and
+compared it against where the target is NOW, which in a steady descent reads
+the aircraft as rate-times-lead lower than it is and parks the law 77 ft high
+all by itself. The lead compares two futures now; for a fixed target its future
+is its present, so the downwind and the base leg are bit-for-bit unchanged.
+Simulated against the flown profile the old law grows 51 ft of error to 250 and
+pins the command at -500 the whole way; the new one converges to zero. NOT yet
+flown.
+
 **And a route to a stand is never a departure's** (same sortie, one taxi
 later). Full auto asks the tower for a taxi clearance unless it already holds
 one, where "holds one" was `route_is_ours`: does the published route pass
