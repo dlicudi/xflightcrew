@@ -123,6 +123,33 @@ impl Tool for SetChocks {
 
 pub struct SetGroundPower;
 
+/// When WE last summoned a cart that has not yet arrived (no volts). The
+/// request command is a toggle and a cart in transit generates nothing, so
+/// volts alone cannot tell "no cart asked for" from "cart still driving up" —
+/// and "ground power off" during the drive-up used to early-out as "already
+/// disconnected" and let the cart arrive anyway. Cleared the moment the cart
+/// is seen live or the request is cancelled, and EXPIRES: a cart the sim
+/// dismissed on its own (engine start, taxi) with no GPU call in between
+/// would latch this for the rest of the process, and "ground power off" at
+/// the destination hours later then fired the toggle against nothing and
+/// summoned a fresh cart while answering "disconnected" — the
+/// process-wide-fact-outliving-its-context trap again. Carts drive up in
+/// under a minute; a request older than the TTL is stale evidence, and doing
+/// nothing is the safe read. In-process only: a cart summoned through the
+/// sim's own menu is invisible here, exactly as before.
+static CART_REQUESTED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// How long a summoned-but-unseen cart stays "pending" before the latch is
+/// stale. Generous against the sim's actual drive-up time.
+const CART_REQUEST_TTL_SECS: u64 = 180;
+
+fn cart_pending() -> bool {
+    CART_REQUESTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|t| t.elapsed().as_secs() < CART_REQUEST_TTL_SECS)
+}
+
 #[async_trait]
 impl Tool for SetGroundPower {
     fn name(&self) -> &str {
@@ -138,46 +165,61 @@ impl Tool for SetGroundPower {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: OnArg = serde_json::from_value(args.clone())?;
-        if gpu_connected(ctx).await == a.on {
-            return Ok(if a.on {
-                match bus_volts(ctx).await {
-                    Some(v) => format!("Ground power's already connected, bus at {v:.0} volts."),
-                    None => "Ground power's already connected.".to_string(),
-                }
-            } else {
-                "Ground power's already disconnected.".to_string()
-            });
-        }
         // TWO steps, because they are two different things: the cart has to be
         // there, and the aircraft has to be drawing from it. The request
         // command is a TOGGLE, so it only ever fires when the cart's presence
         // is not already what we want — firing it blind sends away the cart we
         // just asked for.
         let cart = cart_present(ctx).await;
+        if cart {
+            // A live cart makes the pending-request latch moot either way.
+            *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         if a.on {
+            if gpu_connected(ctx).await {
+                return Ok(match bus_volts(ctx).await {
+                    Some(v) => format!("Ground power's already connected, bus at {v:.0} volts."),
+                    None => "Ground power's already connected.".to_string(),
+                });
+            }
             if !cart {
                 ctx.xplane.run_command(CMD_TOGGLE_GPU).await?;
+                *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(std::time::Instant::now());
             }
             ctx.xplane.set_int(GPU_ON, 1).await?;
-        } else {
-            ctx.xplane.set_int(GPU_ON, 0).await?;
-            if cart {
-                ctx.xplane.run_command(CMD_TOGGLE_GPU).await?;
-            }
+            // Report the BUS, not the request: "requesting ground power" while
+            // the battery sits at 21 volts is the answer that started this. A
+            // cart still driving up reads as no power yet, and says so.
+            return Ok(match bus_volts(ctx).await {
+                Some(v) if v > 24.0 => format!("Roger, ground power on, bus at {v:.0} volts."),
+                Some(v) => {
+                    format!(
+                        "Ground power requested — the cart's still coming, bus at {v:.0} volts."
+                    )
+                }
+                None => "Roger, requesting ground power.".to_string(),
+            });
         }
-        if !a.on {
-            return Ok("Roger, ground power disconnected.".to_string());
+        // Disconnect: check the halves INDEPENDENTLY. The old shortcut asked
+        // "connected?" (cart AND contactor), so a summoned-but-not-arrived
+        // cart, or a closed contactor with no cart, answered "already
+        // disconnected" and left both standing — the cart then arrived and fed
+        // a bus the pilot had been told was off external power.
+        let contactor = ctx.xplane.get_float(GPU_ON).await.unwrap_or(0.0) > 0.5;
+        let pending = cart_pending();
+        if !contactor && !cart && !pending {
+            return Ok("Ground power's already disconnected.".to_string());
         }
-        // Report the BUS, not the request: "requesting ground power" while the
-        // battery sits at 21 volts is the answer that started this. A cart
-        // still driving up reads as no power yet, and says so.
-        Ok(match bus_volts(ctx).await {
-            Some(v) if v > 24.0 => format!("Roger, ground power on, bus at {v:.0} volts."),
-            Some(v) => {
-                format!("Ground power requested — the cart's still coming, bus at {v:.0} volts.")
-            }
-            None => "Roger, requesting ground power.".to_string(),
-        })
+        // Contactor first, then release the cart — the bus is never dropped by
+        // a cart driving away from a still-closed contactor. A cart still in
+        // transit (our own pending request) is cancelled by the same toggle.
+        ctx.xplane.set_int(GPU_ON, 0).await?;
+        if cart || pending {
+            ctx.xplane.run_command(CMD_TOGGLE_GPU).await?;
+        }
+        *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        Ok("Roger, ground power disconnected.".to_string())
     }
 }
 
@@ -277,11 +319,16 @@ mod tests {
         }
     }
 
+    /// The pending-cart latch is process-wide, so the GPU tests take turns.
+    static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// No cart yet: summon one AND close the contactor. Closing it is the half
     /// that was missing — the cart generated 28 volts into a bus that stayed on
     /// the battery at 20.7, and the tool called that "already connected".
     #[tokio::test]
     async fn connecting_summons_the_cart_and_closes_the_contactor() {
+        let _g = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let cfg = crate::config::Config::default();
         let fake = FakeXPlane::with_reads(&[(GPU_VOLTS, 0.0), (GPU_ON, 0.0)]);
         let out = SetGroundPower
@@ -297,6 +344,8 @@ mod tests {
     /// Only the contactor moves.
     #[tokio::test]
     async fn a_cart_already_there_is_not_toggled_away() {
+        let _g = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let cfg = crate::config::Config::default();
         let fake = FakeXPlane::with_reads(&[(GPU_VOLTS, 28.0), (GPU_ON, 0.0)]);
         SetGroundPower
@@ -335,6 +384,8 @@ mod tests {
     /// still-closed contactor.
     #[tokio::test]
     async fn disconnecting_opens_the_contactor_then_releases_the_cart() {
+        let _g = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let cfg = crate::config::Config::default();
         let fake = FakeXPlane::with_reads(&[(GPU_VOLTS, 28.0), (GPU_ON, 1.0)]);
         SetGroundPower
@@ -343,6 +394,54 @@ mod tests {
             .expect("disconnect");
         assert_eq!(fake.last_write(GPU_ON), Some(0.0));
         assert!(fake.ran(CMD_TOGGLE_GPU), "send the cart away");
+    }
+
+    /// A cart still driving up (our own fresh request, no volts yet) IS
+    /// cancelled by "ground power off" — the case the latch exists for.
+    #[tokio::test]
+    async fn a_cart_still_driving_up_is_cancelled_by_disconnect() {
+        let _g = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::time::Instant::now());
+        let cfg = crate::config::Config::default();
+        let fake = FakeXPlane::with_reads(&[(GPU_VOLTS, 0.0), (GPU_ON, 0.0)]);
+        let out = SetGroundPower
+            .execute(&serde_json::json!({"on": false}), &ctx(&fake, &cfg))
+            .await
+            .expect("disconnect");
+        assert!(
+            fake.ran(CMD_TOGGLE_GPU),
+            "the in-transit cart must be cancelled: {out}"
+        );
+        assert!(
+            CART_REQUESTED.lock().unwrap().is_none(),
+            "the latch dies with the cancellation"
+        );
+    }
+
+    /// A request the sim outlived (the cart came and went with no GPU call in
+    /// between, or never came at all) must NOT fire the toggle at the
+    /// destination hours later — that SUMMONS a cart while saying
+    /// "disconnected". Past the TTL the latch is stale evidence, not a fact.
+    #[tokio::test]
+    async fn a_stale_cart_request_never_summons_a_cart() {
+        let _g = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(
+            std::time::Instant::now()
+                - std::time::Duration::from_secs(CART_REQUEST_TTL_SECS + 60),
+        );
+        let cfg = crate::config::Config::default();
+        let fake = FakeXPlane::with_reads(&[(GPU_VOLTS, 0.0), (GPU_ON, 0.0)]);
+        let out = SetGroundPower
+            .execute(&serde_json::json!({"on": false}), &ctx(&fake, &cfg))
+            .await
+            .expect("disconnect");
+        assert!(
+            !fake.ran(CMD_TOGGLE_GPU),
+            "a stale latch fired the toggle against nothing: {out}"
+        );
+        assert!(out.contains("already disconnected"), "{out}");
+        *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     #[test]
