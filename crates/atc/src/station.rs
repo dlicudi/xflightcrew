@@ -266,6 +266,18 @@ impl Station {
         *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *WAKE_PREV.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // The previous field's worksheets die with it: a region handoff calls
+        // install() WITHOUT uninstall(), and anything left armed here keeps
+        // acting for a station that no longer exists. An armed vector plan
+        // kept steering toward the old field's threshold; a takeoff handoff
+        // ("contact <old field> Departure on ...") could fire on a later
+        // climb at the new field; a stale arrival taxi-in flag exempted
+        // runway occupancy from the incursion watch. Same trap family as the
+        // radio-power latch: a process-wide fact must not outlive its field.
+        *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ACTIVE_PANEL.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((self.apt.name.clone(), self.apt.elev_ft, services(&self.apt)));
         *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = self.apt.runways.clone();
@@ -309,9 +321,12 @@ impl Station {
         // boot.
         *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // The doc on the party line promises this one dies here.
+        *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *PENDING_TAKEOFF_CLEARANCE
             .lock()
@@ -1700,7 +1715,16 @@ pub fn compliance_tick(
         // cleared route. It's the arrival mirror of the departure `TaxiCleared`
         // exemption below; off-route deviations are still caught by the
         // route-deviation check above.
-        let arrival_taxi = *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner());
+        // The flag only counts WITH the route it was published alongside,
+        // matching the crew-side consumers: the exemption below silences the
+        // incursion berate outright, and a bare flag that survived a swap or
+        // a route-less clearance would switch that safety net off with
+        // nothing to show the occupancy is part of a cleared drive.
+        let arrival_taxi = *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner())
+            && TAXI_ROUTE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
         // On the active runway without any clearance to be there: not rolling
         // (a takeoff/landing roll is covered above), not vacating after a
         // legal landing, and the state says holding-point at best. Repeats on
@@ -2750,19 +2774,25 @@ pub fn spoken_ghost(id: &str) -> String {
     };
     // ICAO 3-letter prefix first ("IBE3421"), then IATA 2-letter where the
     // third character is a digit ("BA306" — but never "BAC" of a tail).
+    // Byte-boundary-safe slicing on purpose: the flight id comes off raw
+    // TCAS bytes through from_utf8_lossy, and a garbage feed's replacement
+    // characters land mid-slice — `get` answers None where `split_at` would
+    // panic the monitor thread.
     if id.len() > 3 {
-        let (prefix, rest) = id.split_at(3);
-        if let Some((_, telephony)) = TELEPHONY.iter().find(|(p, _)| *p == prefix) {
-            if let Some(rest) = spoken_rest(rest) {
-                return format!("{telephony} {rest}");
+        if let (Some(prefix), Some(rest)) = (id.get(..3), id.get(3..)) {
+            if let Some((_, telephony)) = TELEPHONY.iter().find(|(p, _)| *p == prefix) {
+                if let Some(rest) = spoken_rest(rest) {
+                    return format!("{telephony} {rest}");
+                }
             }
         }
     }
     if id.len() > 2 && id.as_bytes()[2].is_ascii_digit() {
-        let (prefix, rest) = id.split_at(2);
-        if let Some((_, telephony)) = TELEPHONY_IATA.iter().find(|(p, _)| *p == prefix) {
-            if let Some(rest) = spoken_rest(rest) {
-                return format!("{telephony} {rest}");
+        if let (Some(prefix), Some(rest)) = (id.get(..2), id.get(2..)) {
+            if let Some((_, telephony)) = TELEPHONY_IATA.iter().find(|(p, _)| *p == prefix) {
+                if let Some(rest) = spoken_rest(rest) {
+                    return format!("{telephony} {rest}");
+                }
             }
         }
     }
@@ -3437,7 +3467,10 @@ pub fn takeoff_hold_tick(
         // What is holding us, at a cadence — a held departure that says
         // nothing for eight minutes can only be diagnosed by probing the
         // live sim, which is how the Heathrow hold had to be found.
-        if hold.logged_at.elapsed().as_secs_f64() >= HOLD_LOG_SECS {
+        // On the injected clock like the rest of the tick, so tests that
+        // drive `now` see the same cadence the sim does (duration_since
+        // saturates to zero if `now` sits behind the stamp).
+        if now.duration_since(hold.logged_at).as_secs_f64() >= HOLD_LOG_SECS {
             hold.logged_at = now;
             tracing::info!(
                 runway = %hold.runway_ident,
@@ -3533,11 +3566,18 @@ static WAKE_PREV: Mutex<Option<std::collections::HashMap<String, (bool, Instant)
 /// Does this flight id carry an airline prefix (ICAO 3-letter or IATA
 /// 2-letter + digit)? The wake heuristic's "medium or heavier".
 fn is_airline(id: &str) -> bool {
+    // `get`, never a byte-index slice: the id comes off raw TCAS bytes via
+    // from_utf8_lossy, and slicing a replacement character mid-way panics.
     let id = id.trim();
-    (id.len() > 3 && TELEPHONY.iter().any(|(p, _)| *p == &id[..3]))
+    (id.len() > 3
+        && id
+            .get(..3)
+            .is_some_and(|pfx| TELEPHONY.iter().any(|(p, _)| *p == pfx)))
         || (id.len() > 2
             && id.as_bytes()[2].is_ascii_digit()
-            && TELEPHONY_IATA.iter().any(|(p, _)| *p == &id[..2]))
+            && id
+                .get(..2)
+                .is_some_and(|pfx| TELEPHONY_IATA.iter().any(|(p, _)| *p == pfx)))
 }
 
 /// One pass of the wake watch: a ghost transitioning ground→air near the
@@ -4795,6 +4835,24 @@ mod tests {
     }
 
     #[test]
+    fn garbled_flight_ids_never_panic_the_telephony() {
+        // Flight ids come off raw TCAS bytes through from_utf8_lossy, so a
+        // garbage feed hands us replacement characters whose byte boundaries
+        // sit exactly where the airline-prefix slices used to cut. A bad id
+        // must degrade to NATO spelling, never panic the monitor thread.
+        for id in ["A\u{FFFD}12", "B\u{FFFD}306", "\u{FFFD}\u{FFFD}", "é1", "BÉ306"] {
+            let spoken = spoken_ghost(id);
+            assert!(!spoken.contains('\u{FFFD}'), "{id:?}: {spoken:?}");
+            let _ = is_airline(id);
+        }
+        // The honest ids still resolve, both spellings.
+        assert_eq!(spoken_ghost("BAW306"), "Speedbird three zero six");
+        assert_eq!(spoken_ghost("BA306"), "Speedbird three zero six");
+        assert!(is_airline("BAW306") && is_airline("BA306"));
+        assert!(!is_airline("N172SP"));
+    }
+
+    #[test]
     fn discrete_squawks_are_valid_and_deterministic() {
         for cs in ["November one seven two Sierra Papa", "G-ABCD", "x"] {
             let code = discrete_squawk(cs);
@@ -5149,13 +5207,31 @@ mod tests {
         let t0 = Instant::now();
         let sec = std::time::Duration::from_secs;
 
-        // WITH the arrival taxi-in flag: vacating the landing runway is legal,
-        // well past the 120 s vacate grace — no berate.
+        // WITH the arrival taxi-in flag AND its published route: vacating the
+        // landing runway is legal, well past the 120 s vacate grace — no
+        // berate. The route lives on the taxiway (off the strip), the way a
+        // stand route does once the vacate is under way.
         *TAXI_TO_STAND.lock().unwrap() = true;
+        *TAXI_ROUTE.lock().unwrap() = Some(TaxiWatch {
+            path: vec![(36.1470, -5.3420), (36.1460, -5.3420)],
+            via: "Alpha".into(),
+            seg: vec![("A".into(), false)],
+            holding_point: "Stand 1".into(),
+            lead_on: vec![],
+        });
         assert!(
             compliance_tick(36.15155, -5.342, 20.0, true, 0.0, true, t0 + sec(200)).is_none(),
             "a cleared arrival taxi-in must not be berated for vacating the runway"
         );
+
+        // The bare flag WITHOUT a route is not a clearance: a stale flag that
+        // survived a station swap (or a route-less reply) must not switch the
+        // incursion watch off. Same position, route gone: the berate stands.
+        *TAXI_ROUTE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        let call = compliance_tick(36.15155, -5.342, 20.0, true, 0.0, true, t0 + sec(300))
+            .expect("occupancy berate with the flag but no published route");
+        assert!(call.line.contains("without clearance"), "{}", call.line);
 
         // Control: drop the flag (a bare Parked state) and the SAME position IS
         // an incursion — proving the exemption, not the geometry, silenced it.
@@ -5171,6 +5247,70 @@ mod tests {
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
         *CLEARANCE.lock().unwrap() = None;
         *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+    }
+
+    #[test]
+    fn a_station_swap_retires_the_previous_fields_worksheets() {
+        // A region handoff calls install() WITHOUT uninstall() (main loop,
+        // take_pending_station). Anything install() forgets to clear keeps
+        // acting for the field that no longer exists: an armed vector plan
+        // kept steering toward the old threshold, the takeoff handoff line
+        // named the old field, and a stale arrival taxi-in flag exempted
+        // runway occupancy from the incursion watch at the new one.
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let st_a = lxgb();
+        st_a.install();
+        // Field A's leftovers.
+        *VECTORS.lock().unwrap() = Some(VectorPlan {
+            callsign: "November one seven two Sierra Papa".into(),
+            thr_lat: 36.1508,
+            thr_lon: -5.3596,
+            course_deg: 88.0,
+            runway_spoken: "zero niner".into(),
+            tower_spoken: Some("one three one decimal two".into()),
+            target_alt_ft: 1500.0,
+            ils: false,
+            join_nm: 6.0,
+            cleared: false,
+            dialect: Dialect::Icao,
+            last_tx: None,
+            last_heading: None,
+        });
+        *HANDOFF.lock().unwrap() = Some(Handoff {
+            line: "November one seven two Sierra Papa, contact Gibraltar Departure on one three \
+                   zero decimal four."
+                .into(),
+            min_alt_ft: 711.0,
+        });
+        *LANDING_HANDOFF.lock().unwrap() = Some("zero niner".into());
+        *TAXI_TO_STAND.lock().unwrap() = true;
+        // The swap: field B installs over field A.
+        let st_b = lxgb();
+        st_b.install();
+        assert!(
+            VECTORS.lock().unwrap().is_none(),
+            "field A's vector plan must die with its station"
+        );
+        assert!(
+            HANDOFF.lock().unwrap().is_none(),
+            "field A's departure handoff must die with its station"
+        );
+        assert!(
+            LANDING_HANDOFF.lock().unwrap().is_none(),
+            "field A's approach handoff must die with its station"
+        );
+        assert!(
+            !*TAXI_TO_STAND.lock().unwrap(),
+            "field A's arrival taxi-in flag must die with its station"
+        );
+        Station::uninstall();
+        // And uninstall retires the same set plus the published squawk, as
+        // the party-line doc promises.
+        *ASSIGNED_SQUAWK.lock().unwrap() = Some(4512);
+        *TAXI_TO_STAND.lock().unwrap() = true;
+        Station::uninstall();
+        assert!(ASSIGNED_SQUAWK.lock().unwrap().is_none());
+        assert!(!*TAXI_TO_STAND.lock().unwrap());
     }
 
     #[test]
