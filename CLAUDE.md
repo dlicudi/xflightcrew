@@ -76,6 +76,17 @@ links the SDK.
    write must not answer "Roger"),
 3. **safety gates** ("gear up" on the ground refuses and explains).
 
+Back-references ("a bit more", "come left ten", "turn it off", "do that
+again") resolve deterministically against the **dialogue stack**
+([src/dialogue.rs](src/dialogue.rs)) of calls actually executed: CLOSED
+vocabulary (one word outside the shape never resolves - "more coffee" is
+chatter, not a speed change), 120 s anchor TTL, automations never re-armed
+from a back-reference, stack cleared on airframe swap. Resolved calls ride
+the normal tool path, so every gate and readback still applies.
+Configuration-state questions ("is the gear down?") answer from the SAME
+datarefs the tools write; the question OPENER is what routes them - the
+words inside are a command's.
+
 ## Aircraft profiles drive the tool surface
 
 Profiles ([src/aircraft.rs](src/aircraft.rs), `profiles/<id>.yaml`,

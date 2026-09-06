@@ -19,6 +19,7 @@ mod checklist;
 mod circuit;
 mod cockpit_auto;
 mod config;
+mod dialogue;
 mod failures;
 mod full_auto;
 mod grammar;
@@ -1297,6 +1298,10 @@ async fn run_session(
     // Recovery for recent utterances (a stack), so "belay that" can walk back the
     // last command, then the one before it, each with how to undo it.
     let mut undo_stack: Vec<UndoSnapshot> = Vec::new();
+    // The dialogue stack: executed calls, so back-references ("a bit more",
+    // "turn it off", "do that again") resolve deterministically against what
+    // was actually just done.
+    let mut dialogue = dialogue::Dialogue::new();
 
     // Barge-in: a watcher thread that, while the copilot is speaking, kills the
     // audio the instant PTT is pressed — so the pilot is never talked over and a
@@ -1684,6 +1689,9 @@ async fn run_session(
             ));
             specs = registry.specs();
             specs.extend(checklists.iter().map(|c| c.spec()));
+            // The old airframe's conversation dies with it: a back-reference
+            // must never nudge a value commanded on a different aircraft.
+            dialogue.clear();
             tracing::info!(aircraft = %profile.display_name, "reconfigured for new aircraft");
         }
 
@@ -2824,10 +2832,8 @@ async fn run_session(
         // Other state reads ("what's our altitude/heading/airspeed") — deterministic
         // too, but only when it's a question, so "set heading 270" still commands.
         if is_question {
-            // A turbine (jet) reports N1/N2/ITT, not the piston RPM/CHT metrics.
-            let turbine = !profile.engine && profile.throttle;
             if let Some(answer) =
-                answer_state_query(&matchable, &xplane, Some(&live), turbine).await
+                answer_state_query(&matchable, &xplane, Some(&live), &profile).await
             {
                 say(&voice, &reporter, ui::LogKind::Readback, &answer);
                 continue;
@@ -2840,7 +2846,30 @@ async fn run_session(
         // LLM at all — no GPU burst, no latency, and it can't pick the wrong tool.
         // Genuine questions are held back ("is our heading 270?" shares a command's
         // keyword+number shape — the OPENER decides); they go to the answer path.
-        let fast = if is_question { None } else { parsed };
+        let mut fast = if is_question { None } else { parsed };
+        // Back-references ride the dialogue stack: "a bit more", "come left
+        // ten", "turn it off", "do that again" mean nothing to the grammar
+        // (its RELATIVE bail-out) and the LLM fallback cannot actuate, so
+        // resolve them deterministically against the calls just executed.
+        // Closed vocabulary — anything else falls through to the normal miss.
+        if fast.is_none() && !is_question {
+            match dialogue.resolve(&matchable, &registry) {
+                Some(dialogue::Resolution::Calls(c)) => {
+                    tracing::info!(
+                        path = "dialogue",
+                        tool = c.first().map(|x| x.name.as_str()).unwrap_or(""),
+                        "command path"
+                    );
+                    fast = Some(c);
+                }
+                Some(dialogue::Resolution::Say(line)) => {
+                    tracing::info!(path = "dialogue-say", "command path");
+                    say(&voice, &reporter, ui::LogKind::Readback, &line);
+                    continue;
+                }
+                None => {}
+            }
+        }
         // A recognized command whose CAPABILITY this airframe lacks (an autopilot
         // command on the AP-less DC-3) — decline honestly rather than fall through
         // to "Say again?" or a vague LLM answer.
@@ -3217,6 +3246,9 @@ async fn run_session(
             };
             // Gather this action's recovery into the turn (pushed once after the loop).
             if ok {
+                // Anchor for back-references ("a bit more", "turn it off"):
+                // what was actually executed, exactly as called.
+                dialogue.record(&call.name, &call.arguments);
                 turn_reverts.extend(pre);
                 turn_disengage_ap |= ap_was_off;
                 // Actions with no value to revert get an explicit inverse command.
@@ -5622,10 +5654,56 @@ async fn answer_state_query(
     cmd: &str,
     xp: &XPlaneClient,
     live: Option<&LiveState>,
-    turbine: bool,
+    profile: &aircraft::AircraftProfile,
 ) -> Option<String> {
     let t = cmd.to_ascii_lowercase();
+    // A turbine (jet) reports N1/N2/ITT, not the piston RPM/CHT metrics.
+    let turbine = !profile.engine && profile.throttle;
     let mut parts: Vec<String> = Vec::new();
+
+    // Configuration state — "is the gear down?", "where are the flaps?",
+    // "is the parking brake set?". Answered from the SAME datarefs the tools
+    // write (the pitot switch honours the profile override, so a study-level
+    // airframe's relocated switch never makes this a lie). These only run on
+    // question-shaped input, so "gear down" stays a command.
+    if t.contains("flap") {
+        if let Ok(v) = read1(live, xp, "sim/cockpit2/controls/flap_ratio").await {
+            parts.push(if v <= 0.01 {
+                "flaps up".to_string()
+            } else if v >= 0.99 {
+                "flaps full".to_string()
+            } else {
+                format!("flaps {:.0} percent", v * 100.0)
+            });
+        }
+    }
+    if t.contains("gear") {
+        if let Ok(v) = read1(live, xp, "sim/cockpit2/controls/gear_handle_down").await {
+            parts.push(if v > 0.5 {
+                "gear down".to_string()
+            } else {
+                "gear up".to_string()
+            });
+        }
+    }
+    if t.contains("parking brake") || t.contains("park brake") || t.contains("handbrake") {
+        if let Ok(v) = read1(live, xp, "sim/cockpit2/controls/parking_brake_ratio").await {
+            parts.push(if v > 0.5 {
+                "parking brake set".to_string()
+            } else {
+                "parking brake released".to_string()
+            });
+        }
+    }
+    if t.contains("pitot") {
+        let dref = profile
+            .pitot_heat_dataref
+            .as_deref()
+            .unwrap_or("sim/cockpit2/ice/ice_pitot_heat_on_pilot");
+        if let Ok(v) = read1(live, xp, dref).await {
+            parts.push(format!("pitot heat {}", if v > 0.5 { "on" } else { "off" }));
+        }
+    }
 
     // System-wide failure check — reads the COMPLETE X-Plane failure set (see
     // failures.rs), never a keyword subset, so a failure with an off-pattern name
@@ -8166,6 +8244,27 @@ mod tests {
             "do another circuit",
         ] {
             assert!(!looks_like_question(c), "{c:?} should not be a question");
+        }
+    }
+
+    /// Configuration-state questions ("is the gear down?") carry the same
+    /// keywords as their command twins ("gear down"), so the question OPENER
+    /// is what routes them to the answer path — these must all read as
+    /// questions, and the loop's gate then withholds them from the grammar
+    /// (which would otherwise ACT on the words inside).
+    #[test]
+    fn config_state_questions_route_to_the_answer_path() {
+        for q in [
+            "is the gear down",
+            "are the flaps up",
+            "is the parking brake set",
+            "is the pitot heat on",
+            "where are the flaps",
+        ] {
+            assert!(looks_like_question(q), "{q:?} should be a question");
+        }
+        for c in ["gear down", "flaps up", "parking brake on", "pitot heat on"] {
+            assert!(!looks_like_question(c), "{c:?} must stay a command");
         }
     }
 
