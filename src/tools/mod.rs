@@ -424,7 +424,9 @@ impl Registry {
                 alternator_on_cmds: alternator_on_cmds(&profile.electrical),
                 bus_power_on_cmds: bus_power_on_cmds(&profile.electrical),
             }));
-            tools.push(Box::new(engine::StopEngine));
+            tools.push(Box::new(engine::StopEngine {
+                engines: profile.engines,
+            }));
         }
 
         // Reverse thrust (rollout only, self-stowing) — turboprops/jets whose

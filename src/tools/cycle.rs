@@ -406,18 +406,17 @@ impl Tool for StartEngines {
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let n = self.start.starters.len();
-        // Already running? Don't re-crank a live engine.
-        let any_running = {
-            let mut r = false;
-            for i in 0..n {
-                if engine_running(ctx, i).await {
-                    r = true;
-                    break;
-                }
+        // Start only the DEAD engines: a twin with one flamed out must relight
+        // just that one (the old gate refused outright if ANY engine was
+        // turning, so a one-engine relight was impossible — the same trap the
+        // turbine sequence fixed). Running engines are left completely alone.
+        let mut dead: Vec<usize> = Vec::new();
+        for i in 0..n {
+            if !engine_running(ctx, i).await {
+                dead.push(i);
             }
-            r
-        };
-        if any_running {
+        }
+        if dead.is_empty() {
             return Ok("Engines are already running.".to_string());
         }
 
@@ -463,9 +462,13 @@ impl Tool for StartEngines {
         }
         ctx.xplane.run_command(&self.start.mags_both).await?;
 
-        // Crank each starter, then wait for that engine to catch.
+        // Crank each DEAD engine's starter, then wait for it to catch. A
+        // running engine's starter is never engaged.
         let mut started = 0usize;
-        for (i, starter) in self.start.starters.iter().enumerate() {
+        for &i in &dead {
+            let Some(starter) = self.start.starters.get(i) else {
+                continue;
+            };
             ctx.xplane
                 .run_command_for(starter, self.start.crank_secs)
                 .await?;
@@ -488,11 +491,15 @@ impl Tool for StartEngines {
 
         match started {
             0 => Ok("Cranking — nothing caught. Check the fuel selectors and mixture, then try again.".to_string()),
-            s if s == n => Ok(format!(
+            s if s == dead.len() && dead.len() == n => Ok(format!(
                 "Roger — fuel to the mains, mixture rich, mags both, cranking. All {n} running, generators on."
             )),
+            s if s == dead.len() => Ok(format!(
+                "Roger — relit {s}, all engines running."
+            )),
             s => Ok(format!(
-                "Got {s} of {n} running. The other didn't catch — check its fuel selector and try again."
+                "Got {s} of {} running. The other didn't catch — check its fuel selector and try again.",
+                dead.len()
             )),
         }
     }
@@ -536,9 +543,19 @@ impl Tool for StopEngines {
             .await?;
         ctx.xplane.run_command(&self.start.mags_off).await?;
 
+        let n = self.start.starters.len();
         for _ in 0..6 {
             tokio::time::sleep(Duration::from_millis(600)).await;
-            if !engine_running(ctx, 0).await {
+            // EVERY engine must be down before "shut down" is spoken —
+            // element 0 alone can read stopped with the other still turning.
+            let mut any_running = false;
+            for i in 0..n.max(1) {
+                if engine_running(ctx, i).await {
+                    any_running = true;
+                    break;
+                }
+            }
+            if !any_running {
                 return Ok(
                     "Roger — mixtures to idle cutoff, magnetos off. Engines shut down.".to_string(),
                 );
@@ -860,7 +877,16 @@ impl Tool for StopTurbines {
         };
         for _ in 0..6 {
             tokio::time::sleep(Duration::from_millis(600)).await;
-            if !engine_running(ctx, 0).await {
+            // EVERY engine must be down before "shut down" is spoken —
+            // element 0 alone can read stopped with the other still turning.
+            let mut any_running = false;
+            for i in 0..n.max(1) {
+                if engine_running(ctx, i).await {
+                    any_running = true;
+                    break;
+                }
+            }
+            if !any_running {
                 return Ok(done.to_string());
             }
         }

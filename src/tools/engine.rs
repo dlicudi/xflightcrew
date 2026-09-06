@@ -756,17 +756,25 @@ impl Tool for StartEngine {
         json!({ "type": "object", "properties": {}, "additionalProperties": false })
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
-        // Already running? Don't re-crank a live engine.
-        let already_running = ctx
-            .xplane
-            .get_float_array(ENGN_RUNNING)
-            .await
-            .ok()
-            .and_then(|v| v.first().copied())
-            .map(|r| r > 0.5)
-            .unwrap_or(false);
-        if already_running {
-            return Ok("Engine's already running.".to_string());
+        // Start only the DEAD engines. The old gate read element 0 alone, so a
+        // Baron with the left running and the right cold answered "already
+        // running" and the dead engine could never be started; the mirror case
+        // (left cold, right running) cranked a starter into a live engine.
+        // Per-engine, like the crank/readback fix of 2026-08-01 and the
+        // turbine sequence's relight.
+        let engines = self.engines.max(1);
+        let mut dead: Vec<usize> = Vec::new();
+        for i in 0..engines {
+            if !engine_running(ctx, i).await {
+                dead.push(i);
+            }
+        }
+        if dead.is_empty() {
+            return Ok(if engines > 1 {
+                "Engines are already running.".to_string()
+            } else {
+                "Engine's already running.".to_string()
+            });
         }
 
         // Battery check: the battery must be on, and with enough voltage to crank.
@@ -867,25 +875,29 @@ impl Tool for StartEngine {
         ctx.xplane.set_float(THROTTLE, 0.1).await?; // crack the throttle
         ctx.xplane.run_command(CMD_MAGS_BOTH).await?;
 
-        // Crank each engine in turn, one starter at a time (they share a
+        // Crank each DEAD engine in turn, one starter at a time (they share a
         // battery, and a real start sequence is sequential anyway). A twin
         // whose second starter is never touched taxis out on one engine while
         // the copilot reports a successful start — the check below reads the
-        // engine it just cranked, not always element 0.
-        let engines = self.engines.max(1);
-        let mut caught = 0usize;
-        for i in 0..engines {
+        // engine it just cranked, not always element 0. Running engines are
+        // never cranked: a starter into a live engine is the mirror bug.
+        let mut failed: Vec<usize> = Vec::new();
+        for &i in &dead {
             ctx.xplane.run_command_for(&starter_command(i), 3.0).await?;
+            let mut lit = false;
             for _ in 0..6 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 if engine_running(ctx, i).await {
-                    caught += 1;
+                    lit = true;
                     break;
                 }
             }
+            if !lit {
+                failed.push(i);
+            }
         }
         {
-            if caught == engines {
+            if failed.is_empty() {
                 // Bring the charging sources online now there's an engine to
                 // drive them — ALL of them (the SR22's ALT 2 sat off forever
                 // when this only fired generator 1), so we charge the bus
@@ -931,10 +943,14 @@ impl Tool for StartEngine {
                     "but the alternator didn't come on, check it"
                 };
                 let avi = if avionics_on { ", avionics on" } else { "" };
-                let started = if engines > 1 {
-                    "Both engines started"
+                // A partial relight names the engine it started; a full cold
+                // start keeps the familiar wording.
+                let started = if engines == 1 {
+                    "Engine started".to_string()
+                } else if dead.len() == engines {
+                    "Both engines started".to_string()
                 } else {
-                    "Engine started"
+                    format!("Engine {} started, all engines running", dead[0] + 1)
                 };
                 return Ok(format!(
                     "Roger — {fuel_note}mixture rich, throttle cracked, mags both, cranking. \
@@ -943,11 +959,15 @@ impl Tool for StartEngine {
             }
         }
         // Say WHICH engine on a twin: "the engine hasn't caught" sends the
-        // pilot looking at the one that is already running.
-        let which = match (engines, caught) {
+        // pilot looking at the one that is already running. The failed list
+        // carries the real indices now, not a count read as an index.
+        let which = match (engines, failed.as_slice()) {
             (1, _) => "the engine hasn't caught".to_string(),
-            (_, 0) => "neither engine has caught".to_string(),
-            (_, n) => format!("engine {} hasn't caught", n + 1),
+            (n, f) if f.len() == n => "neither engine has caught".to_string(),
+            (_, f) => {
+                let names: Vec<String> = f.iter().map(|i| format!("{}", i + 1)).collect();
+                format!("engine {} hasn't caught", names.join(" and "))
+            }
         };
         Ok(format!(
             "Cranking — {fuel_note}{which}. Check fuel and mixture, then try again."
@@ -1311,7 +1331,12 @@ impl Tool for SetFuelSelector {
     }
 }
 
-pub struct StopEngine;
+pub struct StopEngine {
+    /// How many engines the shutdown confirmation polls. Element 0 alone can
+    /// read stopped while a later engine keeps turning (the magnetos lesson:
+    /// confirm the LAST engine, not the first).
+    pub engines: usize,
+}
 
 #[async_trait]
 impl Tool for StopEngine {
@@ -1348,15 +1373,17 @@ impl Tool for StopEngine {
 
         for _ in 0..5 {
             tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-            let running = ctx
-                .xplane
-                .get_float_array(ENGN_RUNNING)
-                .await
-                .ok()
-                .and_then(|v| v.first().copied())
-                .map(|r| r > 0.5)
-                .unwrap_or(false);
-            if !running {
+            // EVERY engine must be down before "shut down" is spoken. Element
+            // 0 stopping first with the right engine still turning was a
+            // readback confirming the half it looked at.
+            let mut any_running = false;
+            for i in 0..self.engines.max(1) {
+                if engine_running(ctx, i).await {
+                    any_running = true;
+                    break;
+                }
+            }
+            if !any_running {
                 return Ok(
                     "Roger — mixture to idle cutoff, magnetos off. Engine shut down.".to_string(),
                 );
@@ -1447,6 +1474,94 @@ mod tests {
             !stuck.ran("sim/starters/engage_starter_1"),
             "never crank a dry engine: {reply}"
         );
+    }
+
+    /// One engine running, one cold: the start must relight ONLY the dead one.
+    /// The old entry gate read element 0 alone, so left-running/right-cold
+    /// answered "already running" and the dead engine could never be started,
+    /// while the mirror case cranked a starter into a live engine.
+    #[tokio::test]
+    async fn a_twin_relight_cranks_only_the_dead_engine() {
+        let profile = crate::aircraft::load("beechcraft_baron_58").expect("baron profile");
+        let cfg = crate::config::Config::default();
+        let start = StartEngine {
+            engines: 2,
+            cycle_selectors: profile.fuel_selectors.clone(),
+            fuel_selector: None,
+            alternator_on_cmds: Vec::new(),
+            bus_power_on_cmds: Vec::new(),
+        };
+
+        // Left running, right cold: crank starter 2 and never starter 1.
+        let fake = std::sync::Arc::new(crate::xplane::FakeXPlane::with_reads(&[
+            (BATTERY, 1.0),
+            (ONGROUND, 1.0),
+            ("laminar/b58/fuel_selector_L", 1.0),
+            ("laminar/b58/fuel_selector_R", 1.0),
+        ]));
+        fake.set_read_array(BUS_VOLTS, &[28.0]);
+        fake.set_read_array(ENGN_RUNNING, &[1.0, 0.0]);
+        let catching = fake.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            catching.set_read_array(ENGN_RUNNING, &[1.0, 1.0]);
+        });
+        let ctx = ToolCtx {
+            xplane: fake.as_ref(),
+            config: &cfg,
+            voice: None,
+            status: None,
+            reminders: None,
+        };
+        let reply = start.execute(&json!({}), &ctx).await.expect("start runs");
+        assert!(
+            !fake.ran("sim/starters/engage_starter_1"),
+            "never crank a live engine: {reply}"
+        );
+        assert!(fake.ran("sim/starters/engage_starter_2"), "{reply}");
+        assert!(reply.contains("Engine 2 started"), "{reply}");
+
+        // Mirror case: left cold, right running.
+        let fake = std::sync::Arc::new(crate::xplane::FakeXPlane::with_reads(&[
+            (BATTERY, 1.0),
+            (ONGROUND, 1.0),
+            ("laminar/b58/fuel_selector_L", 1.0),
+            ("laminar/b58/fuel_selector_R", 1.0),
+        ]));
+        fake.set_read_array(BUS_VOLTS, &[28.0]);
+        fake.set_read_array(ENGN_RUNNING, &[0.0, 1.0]);
+        let catching = fake.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            catching.set_read_array(ENGN_RUNNING, &[1.0, 1.0]);
+        });
+        let ctx = ToolCtx {
+            xplane: fake.as_ref(),
+            config: &cfg,
+            voice: None,
+            status: None,
+            reminders: None,
+        };
+        let reply = start.execute(&json!({}), &ctx).await.expect("start runs");
+        assert!(fake.ran("sim/starters/engage_starter_1"), "{reply}");
+        assert!(
+            !fake.ran("sim/starters/engage_starter_2"),
+            "never crank a live engine: {reply}"
+        );
+
+        // Both running: honest refusal, nothing cranked.
+        let fake = crate::xplane::FakeXPlane::new();
+        fake.set_read_array(ENGN_RUNNING, &[1.0, 1.0]);
+        let ctx = ToolCtx {
+            xplane: &fake,
+            config: &cfg,
+            voice: None,
+            status: None,
+            reminders: None,
+        };
+        let reply = start.execute(&json!({}), &ctx).await.expect("start runs");
+        assert!(reply.contains("already running"), "{reply}");
+        assert!(!fake.ran("sim/starters/engage_starter_1"));
     }
 
     #[test]

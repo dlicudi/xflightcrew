@@ -753,7 +753,7 @@ pub async fn run_step(
             .execute(args, ctx)
             .await
         }
-        "stop_engine" => StopEngine.execute(args, ctx).await,
+        "stop_engine" => StopEngine { engines }.execute(args, ctx).await,
         "set_lights" => SetLights::new(lights.to_vec()).execute(args, ctx).await,
         "set_flaps" => match flaps {
             Some(f) => SetFlaps::new(f.clone()).execute(args, ctx).await,
