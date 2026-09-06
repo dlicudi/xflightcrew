@@ -346,10 +346,14 @@ impl Tool for SetFloodLights {
                     .unwrap_or(0.0),
                 None => ctx.xplane.get_float(base).await?,
             } > 0.5;
-            return Ok(format!(
-                "Roger, flood lights {}.",
-                if actual { "on" } else { "off" }
-            ));
+            // Confirm against the INTENT, not just report what came back: a
+            // write that silently failed used to answer "Roger, flood lights
+            // off" to "flood lights on" (the set_lights lesson).
+            return Ok(if actual == on {
+                format!("Roger, flood lights {}.", if on { "on" } else { "off" })
+            } else {
+                "The flood lights didn't move.".to_string()
+            });
         }
 
         // Pilot side: scalar brightness. Copilot side: one float array element.

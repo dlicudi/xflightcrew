@@ -171,6 +171,18 @@ impl Tool for Recover {
         json!({ "type": "object", "properties": {}, "additionalProperties": false })
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        // Already flying one: a repeated "recover" (the one phrase a panicked
+        // pilot repeats) must not arm a second copy. The superseded first run
+        // used to zero the joystick overrides the new one had just taken,
+        // ~100 ms in, leaving the live recovery writing yoke ratios the sim
+        // re-drove from the pilot's hardware every frame: an inert recovery
+        // in an actual upset, reported as flown.
+        if ACTIVE.load(Ordering::SeqCst) {
+            return Ok(
+                "I'm already recovering — I have the aircraft. Say my controls to take it back."
+                    .to_string(),
+            );
+        }
         ABORT.store(false, Ordering::SeqCst);
         run_recovery(
             ctx.config.xplane_base_url.clone(),

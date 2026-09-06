@@ -111,7 +111,10 @@ impl SetElectrical {
         for d in &sys.write_datarefs {
             ctx.xplane.set_int(d, i64::from(on)).await?;
         }
-        // Confirm from the readback datarefs: all on / all off / mixed.
+        // Confirm from the readback datarefs, AGAINST THE INTENT. Reporting
+        // whatever came back answered "Roger, avionics master on" to "avionics
+        // off" when the command silently failed — the readback confirming
+        // itself (the set_lights lesson, applied here).
         let mut states = Vec::new();
         for d in &sys.readback {
             if let Some(v) = Self::read(ctx, d).await {
@@ -121,10 +124,10 @@ impl SetElectrical {
         Ok(if states.is_empty() {
             // No readback configured — trust the command.
             format!("Roger, {} {}.", sys.spoken, if on { "on" } else { "off" })
-        } else if states.iter().all(|&s| s) {
-            format!("Roger, {} on.", sys.spoken)
-        } else if states.iter().all(|&s| !s) {
-            format!("Roger, {} off.", sys.spoken)
+        } else if states.iter().all(|&s| s == on) {
+            format!("Roger, {} {}.", sys.spoken, if on { "on" } else { "off" })
+        } else if states.iter().all(|&s| s != on) {
+            format!("The {} didn't move.", sys.spoken)
         } else {
             // Mixed — report rather than lie. (e.g. one of a pair didn't move.)
             let on_n = states.iter().filter(|&&s| s).count();
@@ -180,13 +183,28 @@ impl Tool for SetElectrical {
         let args: Args = serde_json::from_value(args.clone())?;
 
         if args.system.eq_ignore_ascii_case("all") {
+            // Aggregate the per-system results instead of announcing success
+            // unconditionally: a switch that didn't move must reach the pilot,
+            // not vanish behind a cheerful summary.
+            let mut problems: Vec<String> = Vec::new();
             for sys in &self.systems {
-                self.switch(sys, args.on, ctx).await?;
+                let line = self.switch(sys, args.on, ctx).await?;
+                if !line.starts_with("Roger") {
+                    problems.push(line);
+                }
             }
-            return Ok(format!(
-                "Roger, all electrical systems {}.",
-                if args.on { "on" } else { "off" }
-            ));
+            return Ok(if problems.is_empty() {
+                format!(
+                    "Roger, all electrical systems {}.",
+                    if args.on { "on" } else { "off" }
+                )
+            } else {
+                format!(
+                    "All electrical systems {}, except: {}",
+                    if args.on { "on" } else { "off" },
+                    problems.join(" ")
+                )
+            });
         }
 
         let Some(sys) = self.find_system(&args.system) else {

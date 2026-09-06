@@ -55,9 +55,12 @@ impl Tool for Gear {
             "up" | "retract" | "raise"
         );
 
-        // Safety gate: never raise the gear while we're on the ground.
+        // Safety gate: never raise the gear while we're on the ground. A
+        // FAILED read defaults to "on the ground" so an unknown state refuses
+        // rather than folding the gear on the ramp (every sibling gate errs
+        // the safe way; this one used to default to airborne and fail open).
         if up {
-            let on_ground = ctx.xplane.get_float(ON_GROUND).await.unwrap_or(0.0) > 0.5;
+            let on_ground = ctx.xplane.get_float(ON_GROUND).await.unwrap_or(1.0) > 0.5;
             if on_ground {
                 return Ok("Negative, we're on the ground. I won't raise the gear.".to_string());
             }
@@ -84,5 +87,53 @@ impl Tool for Gear {
             .unwrap_or(if up { 0.0 } else { 1.0 })
             > 0.5;
         Ok(format!("Roger, gear {}.", if down { "down" } else { "up" }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xplane::FakeXPlane;
+
+    fn ctx<'a>(fake: &'a FakeXPlane, cfg: &'a crate::config::Config) -> ToolCtx<'a> {
+        ToolCtx {
+            xplane: fake,
+            config: cfg,
+            voice: None,
+            status: None,
+            reminders: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn gear_up_refuses_on_the_ground_and_when_the_ground_read_fails() {
+        let cfg = crate::config::Config::default();
+        // On the ground: refused, and the handle is never touched.
+        let grounded = FakeXPlane::with_reads(&[(ON_GROUND, 1.0)]);
+        let out = Gear { vlo_kts: None }
+            .execute(&json!({"position": "up"}), &ctx(&grounded, &cfg))
+            .await
+            .unwrap();
+        assert!(out.contains("on the ground"), "{out}");
+        assert!(!grounded.wrote(GEAR_HANDLE), "refusal must not move the handle");
+
+        // The ground read FAILS (no preset): an unknown state must refuse too.
+        // This gate used to default to airborne and raise the gear on the ramp.
+        let unknown = FakeXPlane::new();
+        let out = Gear { vlo_kts: None }
+            .execute(&json!({"position": "up"}), &ctx(&unknown, &cfg))
+            .await
+            .unwrap();
+        assert!(out.contains("on the ground"), "failed read errs safe: {out}");
+        assert!(!unknown.wrote(GEAR_HANDLE));
+
+        // Airborne and under the gear speed: the handle moves.
+        let flying = FakeXPlane::with_reads(&[(ON_GROUND, 0.0), (IAS_KTS, 100.0), (GEAR_HANDLE, 0.0)]);
+        let out = Gear { vlo_kts: Some(150.0) }
+            .execute(&json!({"position": "up"}), &ctx(&flying, &cfg))
+            .await
+            .unwrap();
+        assert!(out.contains("gear up"), "{out}");
+        assert_eq!(flying.last_write(GEAR_HANDLE), Some(0.0));
     }
 }
