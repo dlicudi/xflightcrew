@@ -1701,17 +1701,25 @@ impl TaxiNet {
             }
         }
         // The lead-on: whatever the trims removed, from the (possibly moved)
-        // hold point out to the runway-junction node. Longest common prefix of
-        // the untrimmed path vs the trimmed one; the trimmed path carries at
-        // most one point past it (a mid-leg interpolated end), then the
-        // original tail follows. Empty when nothing was trimmed.
-        let prefix = full
-            .iter()
-            .zip(path.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-        let mut lead_on: Vec<(f64, f64)> = path[prefix..].to_vec();
-        lead_on.extend_from_slice(&full[prefix..]);
+        // hold point out to the runway-junction node. It STARTS at the
+        // trimmed route's own end, always: the zone trim and the sliver-pop
+        // truncate at a node, which leaves the trimmed path a strict prefix
+        // of the full one — the old longest-common-prefix arithmetic then
+        // skipped the holding point itself, and a one-edge zone tail (the
+        // per-stub authoring EGLL uses) degenerated the lead-on to a single
+        // point. Then the original tail follows from the first point the
+        // trims touched. Empty when nothing was trimmed.
+        let trimmed = full.len() != path.len() || full.last() != path.last();
+        let mut lead_on: Vec<(f64, f64)> = Vec::new();
+        if trimmed {
+            lead_on.extend(path.last().copied());
+            let prefix = full
+                .iter()
+                .zip(path.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            lead_on.extend_from_slice(&full[prefix..]);
+        }
         // Onto the paint, now the route is trimmed and the lead-on split off:
         // the network chose the taxiways, the drawn line says where they run.
         // Both halves ride it — the lead-on IS a painted line (the yellow one
