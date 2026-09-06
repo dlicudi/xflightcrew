@@ -339,10 +339,24 @@ pub fn parse_intent(transcript: &str) -> Intent {
     // "Established" (ILS/localizer) is the same report by other words: to
     // the tower it earns the landing clearance, to approach it earns the
     // tower handoff — both exactly what the final report does.
+    // Cockpit vocabulary is excluded the same way the landing request below
+    // excludes light/gear/flaps: "final checks complete", "flaps set for
+    // final" and "established in the cruise" are crew talk, and this is the
+    // arm that earns the clearance most directly, so a mishear here is the
+    // exact failure the corpus exists to prevent. A real final report never
+    // carries these words, so the honest calls all still parse.
     if (word("final") || t.contains("establish"))
         && !t.contains("what")
         && !t.contains("how")
         && !t.contains("speed")
+        && !word("check")
+        && !word("checks")
+        && !word("flaps")
+        && !word("gear")
+        && !word("light")
+        && !word("lights")
+        && !word("set")
+        && !word("cruise")
     {
         return Intent::ReportFinal;
     }
@@ -1056,6 +1070,21 @@ impl Tower {
                     self.arm(Awaited::HoldPosition, &line);
                     line
                 }
+                // Already cleared, and a ghost has since taken the strip: the
+                // clearance is CANCELLED, exactly like the final-traffic case
+                // above. A re-ask must never repeat "cleared for takeoff"
+                // over traffic on the runway. The aircraft may be on the
+                // pavement, so it lands in LinedUp and the release watch owes
+                // the re-clearance.
+                State::TakeoffCleared if ctx.runway_occupied => {
+                    self.state = State::LinedUp;
+                    let line = format!(
+                        "{}, cancel takeoff clearance, hold position, traffic on the runway.",
+                        ctx.callsign
+                    );
+                    self.arm(Awaited::HoldPosition, &line);
+                    line
+                }
                 // A ghost is ON the strip: nobody lines up onto an occupied
                 // runway.
                 State::TaxiCleared | State::LinedUp if ctx.runway_occupied => {
@@ -1633,6 +1662,33 @@ mod tests {
                 twr.state, Inbound,
                 "{start:?}: no-approach vectors must join"
             );
+        }
+
+        // A ghost ON the strip: a re-ask never repeats the takeoff clearance
+        // from ANY of the committed states. Holding-point states hold where
+        // they are; an already-cleared aircraft has its clearance CANCELLED
+        // and lands in LinedUp (it may be on the pavement), with the release
+        // watch owing the re-clearance.
+        let mut occupied = ctx();
+        occupied.runway_occupied = true;
+        for &start in &[TaxiCleared, LinedUp, TakeoffCleared] {
+            let mut twr = Tower::new();
+            twr.state = start;
+            let r = twr.handle(RequestTakeoff, &occupied);
+            assert!(
+                !r.contains("cleared for takeoff"),
+                "{start:?}: cleared onto an occupied runway: {r}"
+            );
+            assert!(r.contains("hold position"), "{start:?}: {r}");
+            if start == TakeoffCleared {
+                assert!(r.contains("cancel takeoff clearance"), "{r}");
+                assert_eq!(
+                    twr.state, LinedUp,
+                    "clearance withdrawn, still on the pavement"
+                );
+            } else {
+                assert_eq!(twr.state, start, "{start:?}: hold moves nobody");
+            }
         }
     }
 
