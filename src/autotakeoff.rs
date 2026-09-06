@@ -639,6 +639,30 @@ pub fn throttle_slew(prev: f64, want: f64, dt_s: f64) -> f64 {
     }
 }
 
+/// The ONE throttle command per tick, ground or air. Airborne, the climb's
+/// overspeed guard IS the command: the guard used to live in a second,
+/// change-gated write further down the loop while this path commanded an
+/// unconditional 1.0 every airborne tick, so the guard's reduced lever
+/// survived exactly one tick before full power was re-driven over it (the
+/// SF50's Vmo overspeed, back again), and with a deep cut the pilot-override
+/// detector then read the guard's own write as a hand pulling the lever and
+/// handed the takeoff away mid-climb. Two writers on one lever is the whole
+/// bug; this seam is where the loop and the test agree on the number.
+pub fn tick_throttle_want(
+    airborne: bool,
+    elapsed_s: f64,
+    err_deg: f64,
+    gs_kts: f64,
+    ias_kts: f64,
+    vne_kts: Option<f64>,
+) -> f64 {
+    if airborne {
+        climb_throttle(ias_kts, vne_kts)
+    } else {
+        throttle_cmd(elapsed_s, err_deg, gs_kts)
+    }
+}
+
 /// The commanded climb rate: the profile's best rate, backed off while the
 /// airspeed is below the climb speed — speed first, rate second, the same
 /// energy rule autoland's go-around flies. Never below a positive floor:
@@ -717,6 +741,13 @@ pub fn start(base_url: String, voice: Option<Voice>, p: Params) {
         return;
     }
     REJECT.store(false, Ordering::Relaxed);
+    // A cancel racing the arm lands between the claim and the clear above:
+    // it flips ACTIVE off after our swap, and the line above just erased its
+    // flag. The cancel wins; verify the claim survived before anything flies
+    // (the same claim-clear-verify order every automation start uses).
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -882,8 +913,6 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut pitch_law = RotatePitch::new(p.tail_strike_deg);
     let mut wings = WingsLevel::default();
     let mut last_vs_cmd: Option<f64> = None;
-    // Last climb thrust commanded, so the lever is only rewritten when it moves.
-    let mut last_climb_thr = 1.0f64;
     let mut last_thr_cmd = 0.3_f64;
     // The roll section's heading error, one tick stale, for the throttle's
     // swinging-nose hold (throttle is commanded before position is read).
@@ -1013,12 +1042,12 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // re-drives jitters; a hand keeps winning), then it's a pilot
         // reject — hands off everything.
         let elapsed = roll_start.elapsed().as_secs_f64() - frozen_secs;
-        let thr_want = if airborne {
-            1.0
-        } else {
-            throttle_cmd(elapsed, last_err, gs_kts)
-        };
+        let thr_want = tick_throttle_want(airborne, elapsed, last_err, gs_kts, ias, p.vne_kts);
         let thr_cmd = throttle_slew(last_thr_cmd, thr_want, dt);
+        // FAIL OPEN, deliberately: a failed throttle read impersonates our own
+        // command, so an API blink can never register as a pilot pull mid-roll.
+        // The cost is one tick of blindness to a real hand; the alternative is
+        // a takeoff handed away by a hiccup.
         let thr_now = thr_read.unwrap_or(thr_cmd);
         if thr_now < last_thr_cmd - 0.25 && elapsed > 2.0 {
             if thr_challenged {
@@ -1235,13 +1264,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let _ = xp.set_float(VS_DIAL, vs).await;
             last_vs_cmd = Some(vs);
         }
-        // ...and the lever comes back with it. Trading speed for rate alone
-        // just lets an airframe with spare thrust re-accelerate.
-        let thr = climb_throttle(ias, p.vne_kts);
-        if (thr - last_climb_thr).abs() > 0.01 {
-            let _ = xp.set_float(&throttle_dref(), thr).await;
-            last_climb_thr = thr;
-        }
+        // (The lever comes back with it too, through the top-of-loop writer,
+        // which commands `climb_throttle` on every airborne tick. A second
+        // change-gated write here fought that writer and lost: the guard's
+        // value survived one tick before full power was re-driven over it.)
         if xp.get_float(VS_STATUS).await.unwrap_or(1.0) <= 0.5 {
             // Someone (or a mode change) dropped VS: re-engage, and force a
             // dial rewrite next tick — the engage just synced it away.
@@ -1526,6 +1552,48 @@ mod tests {
             "two seconds of swing stays a nudge: {}",
             big.trim()
         );
+    }
+
+    /// The overspeed guard must OWN the airborne lever. It used to share it
+    /// with an unconditional 1.0 commanded every airborne tick, so the
+    /// guard's reduced write survived one tick at a time (the SF50's Vmo
+    /// overspeed came straight back), and the pilot-override detector read
+    /// the guard's own deep cut as a hand on the lever. March the loop's
+    /// real per-tick arithmetic through one writer: the lever settles ON the
+    /// guard value and stays, and the readback of our own write can never
+    /// trip the override threshold.
+    #[test]
+    fn the_overspeed_guard_owns_the_airborne_lever() {
+        let vne = Some(250.0); // SF50 Vmo, the measured live case
+        let mut last_thr_cmd = 1.0_f64; // full power off the runway
+        for _ in 0..40 {
+            let want = tick_throttle_want(true, 60.0, 0.0, 140.0, 270.0, vne);
+            let thr_cmd = throttle_slew(last_thr_cmd, want, 0.4);
+            // The sim reads back what this loop wrote last tick; the
+            // override detector (thr_now < last_cmd - 0.25) must never see
+            // the guard's own command as a pilot pull.
+            let thr_now = last_thr_cmd;
+            assert!(
+                thr_now >= last_thr_cmd - 0.25,
+                "the guard's own write tripped the override detector"
+            );
+            last_thr_cmd = thr_cmd;
+        }
+        let guard = climb_throttle(270.0, vne);
+        assert!(guard < 0.75, "the live case cuts deep: {guard}");
+        assert!(
+            (last_thr_cmd - guard).abs() < 1e-9,
+            "the lever settles ON the guard and stays: {last_thr_cmd} vs {guard}"
+        );
+        // Ground ticks are untouched: the roll's ramp and swinging-nose hold
+        // still own the lever there.
+        assert_eq!(tick_throttle_want(false, 10.0, 2.0, 8.0, 0.0, vne), 1.0);
+        assert_eq!(
+            tick_throttle_want(false, 10.0, 14.0, 8.0, 0.0, vne),
+            THROTTLE_HOLD_RATIO
+        );
+        // No declared Vne keeps the full-power climb every airframe flew.
+        assert_eq!(tick_throttle_want(true, 60.0, 0.0, 140.0, 200.0, None), 1.0);
     }
 
     #[test]
