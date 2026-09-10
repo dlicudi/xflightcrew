@@ -4,6 +4,27 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## Local flight planner, stage one — 2026-09-10
+
+The only way to get a route into the FMS was a SimBrief plan. The plugin's
+`xcopilot/fms/route` mailbox takes an ident/lat/lon list and labels the first
+and last points as airports (unknown idents fall back to lat/lon rows), so a
+local planner only had to produce the same list. `src/flightplan.rs` parses
+"plan a flight to X" / "divert to X" (ICAO spelled or written, or airport
+name words folded for accents), resolves origin and destination in one
+apt.dat pass, picks a cruise altitude by rule over the sim's terrain probe,
+works time and fuel from the profile, and refuses a destination whose longest
+runway is under the landing distance. The plan lands in the same cache as
+SimBrief's with `PlanSource::Local`, so TOD, ETA, runway advice, the monitor's
+destination and the GPS load all work unchanged; `ensure_plan` no longer
+demands a SimBrief ID when a local plan is shelved, and never refetches over
+one without an explicit refresh. A bare "divert" asks "to where?" and takes a
+short place-shaped answer for 30 s, guarded by the command grammar so "flaps
+ten" can never become an airport lookup. Rounding lesson from the tests:
+`{:.0}` on 12.5 prints 12 (half to even), so fixtures avoid halves. Owed:
+an enroute point so full auto can fly a local plan (`enroute_legs` drops
+both airports and yields no legs), airspace dog-legs, airways with SID/STAR.
+
 ## Deterministic conversation foundation — 2026-09-06
 
 The command-oriented history could not support Q&A follow-ups, and spoken

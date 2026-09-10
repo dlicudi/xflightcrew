@@ -67,6 +67,13 @@ of the aircraft's loaded checklist; they do not perform or verify its items.
   confirms what the aircraft *did*.
 - **A background monitor** that speaks up unprompted: alternator offline, low
   fuel, gear, stall, terrain, altitude deviations.
+- **Flight planning from a destination** — "plan a flight to Malaga", "divert
+  to Gibraltar", "take us to lima echo mike golf". A direct route from the field
+  you're at, cruise altitude picked over the sim's own terrain, time and fuel
+  from the aircraft profile against what's in the tanks, and a refusal when the
+  runway there is too short. It briefs the plan first; "load it" puts it in the
+  GPS, and "fly my flight plan" still needs the SimBrief route for now. No
+  SimBrief account, no network.
 
 ### Let it fly
 

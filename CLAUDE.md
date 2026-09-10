@@ -141,6 +141,24 @@ XP11-format plan IN MEMORY (AIRAC stamped from earth_nav.dat), loads via
 only a load fills the CDU's ORIGIN/DEST. The plan also feeds the monitor's
 `DESTINATION` and the fuel check.
 
+**Local planner** ([src/flightplan.rs](src/flightplan.rs), "plan a flight to
+X" / "divert to X" / a bare "divert" then "to where?"): a DIRECT plan in the
+same `FlightPlan` shape (`PlanSource::Local`), so every consumer above is
+shared. Origin is the nearest field with land runways (the plugin labels the
+first and last points as airports, so an airborne origin is still a field);
+destination resolves from one apt.dat pass by exact ICAO (spelled phonetically
+or written; 3 letters also tried with K) or by name words (towered and longest
+runway win a tie). Cruise altitude is the rule in `cruise_altitude_ft`
+(distance-earned, terrain-floored over the plugin probe, ceiling and oxygen
+capped, semicircular by bearing, VFR +500 unless pressurised). Fuel comes
+from the profile's cruise speed and `cruise_burn_kg_hr` or is NOT spoken. A
+destination runway shorter than the landing (else takeoff) distance is
+REFUSED. A local plan never expires into a SimBrief refetch and needs no
+SimBrief ID; only an explicit refresh may replace it. The brief is read
+first; "load it" is a separate word and a plan on the shelf authorises
+nothing. Still owed: an enroute point so full auto can fly a local plan
+(`enroute_legs` yields nothing from two airports), airspace dog-legs, airways.
+
 ## ATC: the world, not the crew
 
 ATC runs in-process as a frequency-routed station (`crates/atc`): one mic, one

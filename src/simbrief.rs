@@ -16,8 +16,17 @@ use serde_json::Value;
 const AVGAS_LB_PER_GAL: f64 = 6.0;
 const AVGAS_KG_PER_GAL: f64 = 2.72;
 
+/// Where a plan came from. A LOCAL plan (the direct-to planner) is the
+/// pilot's own decision and never silently replaced by a SimBrief refetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanSource {
+    SimBrief,
+    Local,
+}
+
 /// The briefed essentials of a SimBrief OFP. Fuel figures are in US gallons.
 pub struct FlightPlan {
+    pub source: PlanSource,
     pub origin: String,      // ICAO
     pub destination: String, // ICAO
     pub alternate: String,   // ICAO (may be empty)
@@ -131,6 +140,7 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
     }
 
     Ok(FlightPlan {
+        source: PlanSource::SimBrief,
         origin,
         destination,
         alternate: s("/alternate/icao_code"),

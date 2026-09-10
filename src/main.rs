@@ -22,6 +22,7 @@ mod config;
 mod conversation;
 mod dialogue;
 mod failures;
+mod flightplan;
 mod full_auto;
 mod grammar;
 mod health;
@@ -1290,6 +1291,9 @@ async fn run_session(
     let mut last_subject: Option<String> = None;
     // Cached SimBrief plan (it doesn't change mid-flight); re-fetched on TTL or "refresh".
     let mut fp_cache: Option<(Instant, simbrief::FlightPlan)> = None;
+    // A bare "divert" / "plan a flight" asked "to where?"; the next short
+    // utterance inside this window is the answer.
+    let mut plan_pending: Option<Instant> = None;
     // Last time the crew read the full comm plan after a dead-air transmission.
     // The 2026-07-08 night flight called Malaga, Jerez and Cadiz in a row and got
     // the whole Gibraltar briefing every time — once is help, thrice is butting in.
@@ -2667,6 +2671,45 @@ async fn run_session(
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
+            // The local flight planner: "plan a flight to Malaga", "divert to
+            // Gibraltar", or the short answer to its own "to where?". Sits
+            // before the reminder/TOD/ETA branches, which key on words a
+            // destination request never carries. Deterministic: apt.dat,
+            // the profile, and the sim's terrain probe. A plan on the shelf
+            // authorises nothing; "load it" is a separate word.
+            {
+                let asked = plan_pending.is_some_and(|t| t.elapsed() < PLAN_ASK_WINDOW);
+                let req = flightplan::parse_request(&tl).or_else(|| {
+                    // An answer is a place, short, and not a command in its own right.
+                    let words = tl.split_whitespace().count();
+                    let reply = tl.trim().strip_prefix("to ").unwrap_or(tl.trim());
+                    (asked
+                        && words <= 4
+                        && grammar::try_parse(&command, &registry, &profile).is_none())
+                    .then(|| flightplan::parse_destination(reply))
+                    .flatten()
+                    .map(|d| flightplan::PlanRequest {
+                        dest: Some(d),
+                        load: false,
+                    })
+                });
+                if let Some(req) = req {
+                    plan_pending = None;
+                    let line = match req.dest {
+                        None => {
+                            plan_pending = Some(Instant::now());
+                            "To where?".to_string()
+                        }
+                        Some(_) => {
+                            reporter.status(ui::Phase::Thinking);
+                            plan_flight(&config, &xplane, &profile, &mut fp_cache, &req).await
+                        }
+                    };
+                    conversation.observe(&command, &line, Instant::now());
+                    say(&voice, &reporter, ui::LogKind::Readback, &line);
+                    continue;
+                }
+            }
             // "wake me / remind me / let me know / tell me when ..." is a reminder to
             // arm, not a status query to answer now. Let it fall through to the tool
             // layer so it doesn't get hijacked by the nav-progress branch below (both
@@ -2824,8 +2867,13 @@ async fn run_session(
             let routeish = tl.contains("route") || tl.contains("root") || tl.contains("road");
             // Load the SimBrief route into the GPS/FMS (checked before the brief, so
             // "load the flight plan" loads rather than just reading it back).
+            // "load it" / "send that" right after a local plan was briefed is the
+            // follow-up the brief itself invites.
+            let load_followup =
+                fp_cache.is_some() && tl.split_whitespace().any(|w| w == "it" || w == "that");
             let wants_load = (tl.contains("load") || tl.contains("program") || tl.contains("send"))
                 && (routeish
+                    || load_followup
                     || tl.contains("plan")
                     || tl.contains("gps")
                     || tl.contains("fms")
@@ -5101,16 +5149,24 @@ async fn ensure_plan(
     cache: &mut Option<(Instant, simbrief::FlightPlan)>,
     refresh: bool,
 ) -> Result<(), String> {
-    if config.simbrief_id.trim().is_empty() {
+    // A local plan (the direct-to planner) is the pilot's own decision: it
+    // never expires into a SimBrief refetch, and needs no SimBrief ID. An
+    // explicit refresh may swap it for SimBrief when that fetch succeeds.
+    let local = cache
+        .as_ref()
+        .is_some_and(|(_, fp)| fp.source == simbrief::PlanSource::Local);
+    if config.simbrief_id.trim().is_empty() && !local {
         return Err(
-            "No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can pull your flight plan."
+            "No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can pull your flight plan, \
+             or say plan a flight to, and a destination."
                 .to_string(),
         );
     }
     let fresh = cache
         .as_ref()
-        .is_some_and(|(t, _)| t.elapsed() < FLIGHT_PLAN_TTL);
-    if refresh || !fresh {
+        .is_some_and(|(t, _)| t.elapsed() < FLIGHT_PLAN_TTL)
+        || (local && !refresh);
+    if (refresh || !fresh) && !config.simbrief_id.trim().is_empty() {
         match simbrief::fetch(&config.simbrief_id).await {
             Ok(fp) => *cache = Some((Instant::now(), fp)),
             Err(e) => {
@@ -5180,6 +5236,137 @@ async fn ensure_plan(
         }
     }
     Ok(())
+}
+
+/// How long a bare "divert" / "plan a flight" waits for its "to where?" answer.
+const PLAN_ASK_WINDOW: Duration = Duration::from_secs(30);
+
+/// The local planner: a direct flight to a spoken destination, no SimBrief.
+/// Resolves the field from apt.dat (and the field we are at or nearest to as
+/// the origin), refuses a runway the profile cannot land on, picks the cruise
+/// altitude by rule over the sim's own terrain, works the fuel from the
+/// profile's cruise burn, and shelves the result where every other plan
+/// consumer looks (GPS load, TOD, ETA, the monitor's destination). `load`
+/// also sends it to the GPS in the same breath.
+async fn plan_flight(
+    config: &Config,
+    xp: &XPlaneClient,
+    profile: &aircraft::AircraftProfile,
+    cache: &mut Option<(Instant, simbrief::FlightPlan)>,
+    req: &flightplan::PlanRequest,
+) -> String {
+    let Some(dest) = req.dest.as_ref() else {
+        return "To where?".to_string();
+    };
+    let (lat, lon, fuel_kg) = tokio::join!(
+        xp.get_float(datarefs::LATITUDE),
+        xp.get_float(datarefs::LONGITUDE),
+        xp.get_float(datarefs::FUEL_TOTAL_KG),
+    );
+    let (Ok(lat), Ok(lon)) = (lat, lon) else {
+        return "I can't read our position, so I can't plan from here.".to_string();
+    };
+    // apt.dat is a ~400 MB streaming scan: off the async thread.
+    let (path, d) = (config.apt_data_path.clone(), dest.clone());
+    let resolved =
+        match tokio::task::spawn_blocking(move || flightplan::resolve(&path, &d, (lat, lon))).await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!("flight plan: apt.dat scan failed: {e:#}");
+                return "I can't read the airport database right now.".to_string();
+            }
+            Err(_) => return "The airport lookup died on me. Say it again.".to_string(),
+        };
+    let Some(to) = resolved.dest else {
+        return format!(
+            "I don't know an airport called {}. Try the ICAO code, letter by letter.",
+            dest.spoken()
+        );
+    };
+    let Some(from) = resolved.origin else {
+        return "I can't find an airport near us to plan from.".to_string();
+    };
+    if from.icao == to.icao {
+        return format!(
+            "We're already at {}, {}.",
+            to.name,
+            flightplan::spell_code(&to.icao)
+        );
+    }
+    let r = profile.reference.as_ref();
+    let needed = flightplan::runway_needed_ft(
+        r.and_then(|r| r.landing_distance_ft),
+        r.and_then(|r| r.takeoff_distance_ft),
+    );
+    if let Some(line) = flightplan::runway_refusal(&to, needed) {
+        blackbox::record(
+            "flightplan",
+            serde_json::json!({ "event": "refused", "dest": to.icao, "runway_ft": to.longest_runway_ft, "needed_ft": needed }),
+        );
+        return line;
+    }
+    let dist_nm = nav::haversine_nm(from.lat, from.lon, to.lat, to.lon);
+    let bearing = nav::bearing_deg(from.lat, from.lon, to.lat, to.lon);
+    let samples = flightplan::route_samples((from.lat, from.lon), (to.lat, to.lon));
+    let max_terrain_ft = terrain::max_elevation_ft(xp, &samples).await;
+    let kind = r
+        .and_then(|r| r.kind.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let pressurised = kind.contains("jet") || kind.contains("turboprop");
+    let cruise_alt_ft = flightplan::cruise_altitude_ft(&flightplan::AltInputs {
+        bearing_deg: bearing,
+        dist_nm,
+        origin_elev_ft: from.elev_ft,
+        dest_elev_ft: to.elev_ft,
+        max_terrain_ft,
+        service_ceiling_ft: r.and_then(|r| r.service_ceiling_ft),
+        pressurised,
+    });
+    let cruise_kts = r.and_then(|r| r.cruise_kts);
+    let burn = profile
+        .fuel
+        .as_ref()
+        .map(|f| f.cruise_burn_kg_hr)
+        .unwrap_or(0.0);
+    let planned = flightplan::Planned {
+        dest_matches: resolved.dest_matches,
+        origin: from,
+        dest: to,
+        dist_nm,
+        bearing_deg: bearing,
+        cruise_alt_ft,
+        max_terrain_ft,
+        fuel: flightplan::fuel_plan(dist_nm, cruise_kts, burn),
+        cruise_kts,
+        aboard_gal: fuel_kg.ok().map(|kg| kg / AVGAS_KG_PER_GAL),
+        aircraft: profile.display_name.clone(),
+    };
+    blackbox::record(
+        "flightplan",
+        serde_json::json!({
+            "event": "planned",
+            "origin": planned.origin.icao,
+            "dest": planned.dest.icao,
+            "dist_nm": (dist_nm * 10.0).round() / 10.0,
+            "bearing": bearing.round(),
+            "cruise_alt_ft": cruise_alt_ft,
+            "max_terrain_ft": max_terrain_ft,
+            "block_gal": planned.fuel.as_ref().map(|f| f.block_gal),
+            "aboard_gal": planned.aboard_gal,
+            "load": req.load,
+        }),
+    );
+    *cache = Some((Instant::now(), planned.to_flight_plan()));
+    // The same seam SimBrief uses to hand the monitor its destination (TOD).
+    let _ = ensure_plan(config, cache, false).await;
+    let mut line = planned.brief(req.load);
+    if req.load {
+        line.push(' ');
+        line.push_str(&load_route_to_fms(config, xp, cache, false).await);
+    }
+    line
 }
 
 /// Load the SimBrief route into the GPS/FMS: hand the waypoints to the plugin
