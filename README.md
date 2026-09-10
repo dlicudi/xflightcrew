@@ -11,7 +11,7 @@ You speak normally and they answer in their own voices — no menus, no key
 combinations, and no connection to anything.
 
 ```
-🎙️  "flaps ten"  →  whisper (STT)  →  LLM picks a tool  →  write dataref  →  "Roger, flaps ten."
+🎙️  "flaps ten"  →  whisper (STT)  →  deterministic grammar  →  curated tool + readback  →  TTS
 ```
 
 Named after [XEarthLayer](https://github.com/samsoir/xearthlayer), which layers
@@ -37,6 +37,22 @@ and CIFP data, so the field you're at is the field it works.
 ## What it does
 
 ### Talk to the copilot
+
+**Conversation works without an LLM.** Ask for a reading, then “and now?” to
+refresh it or “and heading?” to change the subject. “Why?” recalls the source
+of the last supported answer or the actual report from a command, including
+refusals. “What's our speed?” asks which speed you mean; reply “airspeed”,
+“groundspeed”, or “vertical speed”. “What are you managing?” reads the current
+automation status. “Keep it brief” adjusts explanations for this session.
+These follow-ups never select a control action. See the
+[supported conversation examples and boundaries](docs/deterministic-copilot.md).
+
+You can also combine readings (“could you tell me our altitude and heading?”),
+return to an earlier topic (“back to altitude”), or ask “what was my last
+request?” For a checklist walkthrough, say “walk me through the before takeoff
+checklist”, then “next item”, “previous item”, or “pause the preview”. “Resume
+the preview” returns to the saved item after another question. These are previews
+of the aircraft's loaded checklist; they do not perform or verify its items.
 
 - **Commands** across every system the airframe has: flaps, gear, autopilot,
   engine, fuel, electrics, lights, radios, transponder, instruments.
@@ -155,7 +171,8 @@ anything else.
 |---|---|
 | Mic capture | `cpal` |
 | Speech-to-text | `whisper-rs` (whisper.cpp, Metal on Apple Silicon) |
-| LLM tool-picker | local **Ollama** (`/api/chat`), backend-neutral tool schema |
+| Commands and conversation | deterministic grammar, curated tools, conversation state |
+| Optional answer fallback | local **Ollama**, answer-only; off by default, unnecessary for the conversation features above |
 | X-Plane read/write | `reqwest` → Web API (`PATCH /api/v1/datarefs/...`) |
 | In-sim capability | native C++ plugin (PTT, panel, FMS, terrain, controls) |
 | Text-to-speech | in-process ONNX (default), or `piper` / macOS `say` |

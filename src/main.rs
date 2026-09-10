@@ -1,7 +1,7 @@
 //! XVoiceLayer — the voice layer for X-Plane 12: copilot, ATC and cabin crew.
 //!
 //! The voice loop, end to end and fully local:
-//!   listen → whisper (STT) → local LLM picks one tool →
+//!   listen → whisper (STT) → deterministic command/conversation routing →
 //!   write dataref + read back → say/piper (TTS) confirms.
 //!
 //! Two capture modes (config `listen_mode`): `continuous` (always listening,
@@ -19,6 +19,7 @@ mod checklist;
 mod circuit;
 mod cockpit_auto;
 mod config;
+mod conversation;
 mod dialogue;
 mod failures;
 mod full_auto;
@@ -1302,6 +1303,7 @@ async fn run_session(
     // "turn it off", "do that again") resolve deterministically against what
     // was actually just done.
     let mut dialogue = dialogue::Dialogue::new();
+    let mut conversation = conversation::Conversation::default();
 
     // Barge-in: a watcher thread that, while the copilot is speaking, kills the
     // audio the instant PTT is pressed — so the pilot is never talked over and a
@@ -1692,6 +1694,12 @@ async fn run_session(
             // The old airframe's conversation dies with it: a back-reference
             // must never nudge a value commanded on a different aircraft.
             dialogue.clear();
+            conversation.clear();
+            history.clear();
+            last_subject = None;
+            if let Ok(mut last) = LAST_READBACK.lock() {
+                *last = None;
+            }
             tracing::info!(aircraft = %profile.display_name, "reconfigured for new aircraft");
         }
 
@@ -1701,6 +1709,7 @@ async fn run_session(
         // must beat every gate: a panic word that's low-confidence, or glued to an
         // echoed readback, still has to land. Deterministic and instant.
         if is_undo(&command) {
+            conversation.clear();
             match undo_stack.pop() {
                 None => say(&voice, &reporter, ui::LogKind::Warn, "Nothing to undo."),
                 Some(snap) => {
@@ -2049,6 +2058,7 @@ async fn run_session(
                     tracing::info!("pushback flag stale airborne; cleared, not consumed");
                     pushback::ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
                 } else if pushback::steered() {
+                    conversation.clear();
                     // Full auto's steered push: its loop consumes ABORT, stops
                     // the tug and sets the brakes itself.
                     tracing::info!("pushback stop word, pre-gate");
@@ -2074,6 +2084,7 @@ async fn run_session(
                     // the copilot claimed brakes it never set (audit,
                     // 2026-08-02).
                     tracing::info!("native pushback stop, pre-gate");
+                    conversation.clear();
                     let _ = xplane.run_command(tools::ground::CMD_PUSH_STOP).await;
                     let _ = tools::controls::drive_park_brake(
                         &xplane,
@@ -2114,6 +2125,7 @@ async fn run_session(
             ) || tl.contains("keep going")
                 || tl.contains("carry on");
             if stopish || goish {
+                conversation.clear();
                 if let Some(tool) = registry.get("hold_speed") {
                     let args = if stopish {
                         serde_json::json!({ "knots": 0 })
@@ -2140,6 +2152,73 @@ async fn run_session(
                     continue;
                 }
             }
+        }
+        // Read-only conversation runs before the spoken domain gate: "and now"
+        // and clarification replies have no command keyword. Its response type
+        // has no tool/action variant, and refreshed questions never enter grammar.
+        if let Some(response) = conversation.respond(&command, Instant::now()) {
+            let line = match response {
+                conversation::Response::Say(line) => line,
+                conversation::Response::Checklist(request) => {
+                    preview_checklist(&request, &checklists, &mut conversation, Instant::now())
+                }
+                conversation::Response::ReadMany(queries) => {
+                    let answers = futures::future::join_all(
+                        queries
+                            .iter()
+                            .map(|query| conversation_read(query, &xplane, &profile)),
+                    )
+                    .await;
+                    let lines: Vec<String> = queries
+                        .iter()
+                        .zip(answers)
+                        .map(|(query, answer)| {
+                            answer.unwrap_or_else(|| format!("No simulator reading for: {query}."))
+                        })
+                        .collect();
+                    let line = lines.join(" ");
+                    conversation.observe_many(queries, lines, Instant::now());
+                    line
+                }
+                conversation::Response::Status => {
+                    conversation::status_answer(&auto_status::active_managers())
+                }
+                conversation::Response::Reference(query) => {
+                    match reference_limits(&profile, query) {
+                        Some(line) => {
+                            conversation.reference(&profile.display_name, &line, Instant::now());
+                            line
+                        }
+                        None => {
+                            conversation.clear_topic();
+                            "That reference isn't available in this aircraft's profile.".into()
+                        }
+                    }
+                }
+                conversation::Response::Read(query) => {
+                    // Explicit rechecks use REST rather than an un-timestamped
+                    // pushed cache entry that might predate a disconnected socket.
+                    match conversation_read(query, &xplane, &profile).await {
+                        Some(line) => {
+                            conversation.observe(query, &line, Instant::now());
+                            line
+                        }
+                        None => {
+                            conversation.clear_topic();
+                            "I couldn't get that reading from the simulator.".into()
+                        }
+                    }
+                }
+            };
+            tracing::info!(path = "conversation", "command path");
+            blackbox::record(
+                "conversation",
+                serde_json::json!({
+                    "utterance": &command, "reply": &line,
+                }),
+            );
+            say(&voice, &reporter, ui::LogKind::Readback, &line);
+            continue;
         }
         if !from_text
             && !looks_like_command(&command)
@@ -2217,6 +2296,7 @@ async fn run_session(
             }
             let line =
                 fuel_report(&xplane, &profile, Some(&live), is_endurance_query(&command)).await;
+            conversation.observe(&command, &line, Instant::now());
             say(&voice, &reporter, ui::LogKind::Readback, &line);
             continue;
         }
@@ -2578,10 +2658,12 @@ async fn run_session(
                 continue;
             }
             if let Some(line) = reference_limits(&profile, &tl) {
+                conversation.reference(&profile.display_name, &line, Instant::now());
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
             if let Some(line) = aircraft_info(&profile, &tl) {
+                conversation.reference(&profile.display_name, &line, Instant::now());
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
@@ -2835,6 +2917,7 @@ async fn run_session(
             if let Some(answer) =
                 answer_state_query(&matchable, &xplane, Some(&live), &profile).await
             {
+                conversation.observe(&command, &answer, Instant::now());
                 say(&voice, &reporter, ui::LogKind::Readback, &answer);
                 continue;
             }
@@ -2876,6 +2959,7 @@ async fn run_session(
         if fast.is_none() {
             if let Some(msg) = grammar::declined(&matchable, &registry) {
                 tracing::info!(path = "declined", "command path");
+                conversation.report(&command, &msg, false, Instant::now());
                 say(&voice, &reporter, ui::LogKind::Readback, &msg);
                 continue;
             }
@@ -2988,6 +3072,7 @@ async fn run_session(
         // Readbacks from this utterance's actions, recorded as the assistant
         // turn afterwards so the next command can refer back to what was done.
         let mut turn_readbacks: Vec<String> = Vec::new();
+        let mut turn_failed = false;
         // Recovery for everything this utterance does, gathered so one "belay that"
         // undoes the whole set of commands, not just the last tool.
         let mut turn_reverts: Vec<(String, String, f64, bool)> = Vec::new();
@@ -3244,6 +3329,7 @@ async fn run_session(
                     }
                 }
             };
+            turn_failed |= !ok;
             // Gather this action's recovery into the turn (pushed once after the loop).
             if ok {
                 // Anchor for back-references ("a bit more", "turn it off"):
@@ -3277,6 +3363,14 @@ async fn run_session(
                 }
             }
             turn_readbacks.push(readback);
+        }
+        if !turn_readbacks.is_empty() {
+            conversation.report(
+                &command,
+                &turn_readbacks.join(" "),
+                turn_failed,
+                Instant::now(),
+            );
         }
 
         // Push this utterance's recovery onto the undo stack (newest on top), bounded.
@@ -3312,6 +3406,68 @@ async fn run_session(
             history.retain(|(_, _, t)| t.elapsed() < HISTORY_TTL);
         }
     }
+}
+
+/// Read-only adapter: fuel has its own quantity/endurance reporter, distinct
+/// from the instrument reader. Every other question stays on the state path.
+async fn conversation_read(
+    query: &str,
+    xp: &XPlaneClient,
+    profile: &aircraft::AircraftProfile,
+) -> Option<String> {
+    if is_fuel_query(query) {
+        Some(fuel_report(xp, profile, None, is_endurance_query(query)).await)
+    } else {
+        answer_state_query(query, xp, None, profile).await
+    }
+}
+
+/// Discuss the loaded checklist without invoking its runner or any step. Require
+/// an unambiguous title; a partial name such as "engine" offers the candidates.
+fn preview_checklist(
+    request: &str,
+    checklists: &[checklist::Checklist],
+    conversation: &mut conversation::Conversation,
+    now: Instant,
+) -> String {
+    let request = request.to_ascii_lowercase();
+    let query: Vec<_> = request
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let candidates: Vec<_> = checklists
+        .iter()
+        .filter(|cl| {
+            let title = cl.title.to_ascii_lowercase();
+            let title: Vec<_> = title.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+            query.iter().all(|word| title.contains(word))
+        })
+        .collect();
+    let selected = candidates
+        .iter()
+        .find(|cl| cl.title.eq_ignore_ascii_case(&request))
+        .copied()
+        .or_else(|| (candidates.len() == 1 && !request.is_empty()).then(|| candidates[0]));
+    let Some(cl) = selected else {
+        let choices = if candidates.is_empty() {
+            checklists.iter().collect()
+        } else {
+            candidates
+        };
+        return conversation
+            .choose_checklist(choices.iter().map(|cl| cl.title.clone()).collect(), now);
+    };
+    let items = cl
+        .items
+        .iter()
+        .map(|item| match item {
+            checklist::Item::Narrate(line)
+            | checklist::Item::CallOut(line)
+            | checklist::Item::Act { say: line, .. }
+            | checklist::Item::Verify { say: line, .. } => line.clone(),
+        })
+        .collect();
+    conversation.start_preview(cl.title.clone(), items, now)
 }
 
 /// Run a checklist the way a pilot-monitoring would: read each item aloud,
@@ -5774,11 +5930,16 @@ async fn answer_state_query(
             parts.push(format!("{v:+.0} feet per minute"));
         }
     }
-    // "speed" alone → airspeed, unless it was "vertical speed".
+    let groundspeed_q = t.contains("groundspeed") || t.contains("ground speed");
+    if groundspeed_q {
+        if let Ok(v) = xp.get_float("sim/flightmodel/position/groundspeed").await {
+            parts.push(format!("groundspeed {:.0} knots", v * MS_TO_KTS));
+        }
+    }
+    // "speed" alone → airspeed, unless a different speed was explicitly named.
     if t.contains("airspeed")
         || t.contains("air speed")
-        || t.contains("how fast")
-        || (t.contains("speed") && !vs_q)
+        || (!groundspeed_q && (t.contains("how fast") || (t.contains("speed") && !vs_q)))
     {
         if let Ok(v) = read1(live, xp, datarefs::AIRSPEED_KTS).await {
             parts.push(format!("{v:.0} knots"));
@@ -7332,6 +7493,100 @@ mod tests {
         assert!(super::reference_limits(&sr, "max crosswind")
             .unwrap()
             .contains("21"));
+    }
+
+    #[test]
+    fn conversation_sortie_uses_real_profile_answers_without_a_model() {
+        use super::conversation::{Conversation, Response};
+        let now = std::time::Instant::now();
+        let profile = super::aircraft::load("cessna_172sp").unwrap();
+        let mut crew = Conversation::default();
+        let line = super::reference_limits(&profile, "what's best glide").unwrap();
+        crew.reference(&profile.display_name, &line, now);
+        let Some(Response::Say(why)) = crew.respond("why that speed?", now) else {
+            panic!("must explain the reference");
+        };
+        assert!(why.contains("68 knots"));
+        assert!(why.contains("aircraft profile"));
+        let Some(Response::Reference(question)) = crew.respond("and blue line?", now) else {
+            panic!("must request reference, never a command");
+        };
+        assert!(
+            super::reference_limits(&profile, question).is_none(),
+            "no twin speed invented on a single"
+        );
+
+        crew.observe("what is our altitude", "3500 feet", now);
+        for words in ["and heading?", "and flaps?", "and gear?", "and fuel?"] {
+            let Some(Response::Read(question)) = crew.respond(words, now) else {
+                panic!("{words} must be a reading");
+            };
+            assert!(super::looks_like_question(question));
+        }
+        let registry = super::Registry::for_aircraft(&profile);
+        assert!(crew.respond("flaps ten", now).is_none());
+        let calls = super::grammar::try_parse("flaps ten", &registry, &profile).unwrap();
+        assert_eq!(calls[0].name, "set_flaps");
+        crew.report("flaps ten", "Negative, too fast for flaps.", false, now);
+        let Some(Response::Say(why)) = crew.respond("why?", now) else {
+            panic!("missing refusal")
+        };
+        assert!(why.contains("Negative, too fast"));
+        assert!(
+            matches!(
+                crew.respond("check that again", now),
+                Some(Response::Say(_))
+            ),
+            "cannot replay the flap command"
+        );
+    }
+
+    #[test]
+    fn checklist_preview_uses_loaded_items_and_clarifies_ambiguous_titles() {
+        use super::conversation::{Conversation, Response};
+        let now = std::time::Instant::now();
+        let profile = super::aircraft::load("cessna_172sp").unwrap();
+        let lists = super::checklist::parse(
+            "sw_checklist:Before Takeoff\nsw_item:Brakes|SET\nsw_item:Flaps|TEN\n\
+             sw_checklist:Before Landing\nsw_item:Mixture|RICH\n",
+            &profile,
+        );
+        let mut crew = Conversation::default();
+        let line = super::preview_checklist("before", &lists, &mut crew, now);
+        assert!(line.contains("Which checklist"), "{line}");
+        let Some(Response::Checklist(title)) = crew.respond("before takeoff", now) else {
+            panic!("missing preview choice")
+        };
+        let line = super::preview_checklist(&title, &lists, &mut crew, now);
+        assert!(line.contains("item 1 of 2"), "{line}");
+        assert!(line.contains("Brakes"), "{line}");
+        let Some(Response::Say(line)) = crew.respond("next item", now) else {
+            panic!("missing next item")
+        };
+        assert!(line.contains("Flaps"));
+        let line =
+            super::preview_checklist("before takeoff and start engines", &lists, &mut crew, now);
+        assert!(
+            line.contains("Which checklist"),
+            "must not silently select a partial title"
+        );
+        assert!(super::preview_checklist("", &[], &mut crew, now).contains("No checklists"));
+    }
+
+    #[test]
+    fn conversational_fuel_questions_select_the_dedicated_reporter() {
+        let mut crew = super::conversation::Conversation::default();
+        for text in ["could you tell me our fuel", "tell me about endurance"] {
+            let Some(super::conversation::Response::Read(query)) =
+                crew.respond(text, std::time::Instant::now())
+            else {
+                panic!("missing read")
+            };
+            assert!(
+                super::is_fuel_query(query),
+                "{query} must use fuel_report, not the instrument-only reader"
+            );
+        }
     }
 
     /// The Baron answers the two questions only a twin gets asked, and the

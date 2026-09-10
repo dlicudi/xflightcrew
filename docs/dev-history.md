@@ -4,6 +4,40 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## Deterministic conversation foundation — 2026-09-06
+
+The command-oriented history could not support Q&A follow-ups, and spoken
+fragments could die at the domain gate before reaching a conversation handler.
+`src/conversation.rs` now owns separate, expiring evidence for supported answers,
+action reports, reference knowledge, and automation status. It runs before that
+gate and returns only speech or read-only questions; never tools. Actual tool
+readbacks are preserved, because `Ok(String)` also represents a safety refusal
+and is not a success flag. Numeric command history is now cleared alongside the
+dialogue stack on airframe swaps. Groundspeed queries were also incorrectly
+answering airspeed through the generic speed matcher; the two are now distinct.
+See [the conversation contract](deterministic-copilot.md) for supported exchanges,
+timeouts, test coverage, and the remaining crew-model work. No LLM is needed.
+
+### Broader questions, topic history, checklist previews — 2026-09-07
+
+Whole-sentence matching and one topic were still too restrictive. Conversation
+now composes question openers with closed subject phrases (up to four readings,
+queried concurrently), keeps 12 recent evidence records, and supports explicit
+returns to a named reading. An unrelated command still retires the implicit
+topic; history never becomes an action anchor. Compound action reports are
+recorded once per turn, rather than storing each partial result as a separate
+request. The read-only adapter now routes fuel to `fuel_report`: it is absent
+from the generic instrument reader, which previously made “and fuel?” miss.
+
+Checklist walkthroughs preview the loaded items without calling the runner or
+`run_step`. Ambiguous titles prompt for a selection; next/previous navigate a
+preview, and an explicit resume restores the item after another topic. Both
+selection and preview expire, and airframe swaps clear them. No item is marked
+complete. Tests exercise actual parsed checklist content, title clarification,
+compound questions, history expiry, interrupt/resume, and adversarial phrases.
+
+---
+
 # XVoiceLayer
 
 The voice layer for X-Plane 12: copilot, ATC and cabin crew, entirely local. The
