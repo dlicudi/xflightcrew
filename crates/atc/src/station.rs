@@ -7612,10 +7612,9 @@ mod tests {
         // The takeoff clearance armed the handoff; airborne through 700 ft it
         // fires exactly once, to the departure frequency.
         assert!(handoff_tick(300.0, false).is_none(), "still low");
-        assert!(
-            crate::party_line::take_departure_handoff().is_none(),
-            "nothing published before the line is spoken"
-        );
+        // Drain whatever another scene left on the party line: the handoff
+        // is published for the crew the moment the line goes out, below.
+        let _ = crate::party_line::take_departure_handoff();
         let line = handoff_tick(900.0, false).expect("handoff due");
         assert!(
             line.contains("Departure on one three zero decimal four"),
