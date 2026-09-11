@@ -1190,7 +1190,29 @@ partial flap), with the pilot told "no profile for this airframe" and the
 172 fallback used only when the file is unreadable, said aloud;
 `bus_volts_nominal` scales the start gate; and autoland's guidance treats an
 uninterceptable position above the terrain floor as a reposition to the join
-point rather than a final (the below-floor balk from the same day stays). Still unowned: the zone clearance's
+point rather than a final (the below-floor balk from the same day stays).
+
+**Assumptions into checks (2026-09-11, the same evening).** Both of the day's
+failures were the system acting confidently on something it had never
+checked, so three checks went in. (1) A speed floor under every automation:
+`aircraft::speed_floor_kts` is 1.2 x the live profile's clean Vs, published per
+swap, and both arming points — `speedhold::arm_flight` and `run_autoland` —
+raise a lower target to it, say so and record it. The RV-10's 65 kt would have
+become 78 before anything flew it. (2) The arrival is briefed at the gate:
+`full_auto::brief_arrival` runs when "fly the flight plan" is armed and puts
+what the destination offers into the acknowledgement ("Gibraltar has a
+straight-in on two seven. The wind at the time picks the runway."), refusing
+a destination the airport data lacks. What was discovered at 25 nm is now a
+briefing item at the stand. (3) `xvl debrief` reads the blackbox and prints
+the sortie: aircraft (flagging a no-profile airframe), max altitude and
+speed, minimum airspeed airborne and where, every touchdown with its sink
+rate, taxi stops, callouts by id, low-confidence utterances, and the
+narrative — autoland armings, crashes, balks, ordered go-arounds, give-ups,
+floored targets, void radio calls, compliance challenges, handoffs, region
+swaps, full-auto stages. Run on the RV-10 flight it printed "min IAS
+airborne 23 kt at 16:41:22Z, 810 ft AGL" unprompted: the two hours of grep
+that found the day's faults, as a command, and the first piece of the
+instructor's scorer. Still unowned: the zone clearance's
 "not above two thousand feet" (neither side carries the altitude limit) and
 the squawk watch's "radar contact" spoken before the handoff.
 

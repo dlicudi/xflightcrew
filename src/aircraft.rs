@@ -1122,6 +1122,38 @@ pub fn min_start_volts() -> f64 {
     nominal * 23.0 / 24.0
 }
 
+/// The airspeed FLOOR under every automation's target, from the live profile's
+/// clean stall speed: no governor, autoland or follower may ask for less than
+/// [`SPEED_FLOOR_RATIO`] times Vs, whatever number it was handed. The RV-10
+/// was flown to 63 kt by an autoland whose approach speed was a Cessna's 65,
+/// its own clean stall (2026-09-11): the target was wrong and nothing below
+/// it asked whether it could be. `None` = the profile declares no Vs.
+static SPEED_FLOOR_KTS: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+/// 1.2 Vs: below the 1.3 an approach is flown at, above anything a wing can
+/// hold level with a bank on. A target under this is a wrong number.
+pub const SPEED_FLOOR_RATIO: f64 = 1.2;
+
+/// Publish the airframe's speed floor from its clean stall speed. Called on
+/// EVERY profile swap.
+pub fn publish_speed_floor(vs_clean_kts: Option<f64>) {
+    *SPEED_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner()) =
+        vs_clean_kts.filter(|v| *v > 0.0).map(|v| (v * SPEED_FLOOR_RATIO).round());
+}
+
+/// The live airframe's speed floor, kts, if its profile declares a clean stall.
+pub fn speed_floor_kts() -> Option<f64> {
+    *SPEED_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `asked`, raised to the floor when it is under it. Pure; the callers say so
+/// aloud and record it.
+pub fn floored_target(asked: f64, floor: Option<f64>) -> f64 {
+    match floor {
+        Some(f) if asked < f => f,
+        _ => asked,
+    }
+}
+
 /// The live airframe's VLO/VLE, if its profile declares one.
 pub fn gear_limit_kts() -> Option<f64> {
     *GEAR_LIMIT_KTS.lock().unwrap_or_else(|e| e.into_inner())
@@ -2473,6 +2505,18 @@ P _engn/0/_type RCP_INJ
             ]
         );
         assert!(p.checklist.is_none(), "the 172's checklist is not this aircraft's");
+    }
+
+    #[test]
+    fn no_target_goes_below_the_stall_floor() {
+        // The RV-10: Vs 65, floor 78. The 172's 65 kt approach is under it.
+        super::publish_speed_floor(Some(65.0));
+        assert_eq!(super::speed_floor_kts(), Some(78.0));
+        assert_eq!(super::floored_target(65.0, super::speed_floor_kts()), 78.0);
+        assert_eq!(super::floored_target(100.0, super::speed_floor_kts()), 100.0);
+        // A profile with no Vs floors nothing (the old behaviour, honestly).
+        super::publish_speed_floor(None);
+        assert_eq!(super::floored_target(65.0, super::speed_floor_kts()), 65.0);
     }
 
     #[test]

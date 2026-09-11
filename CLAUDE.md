@@ -33,9 +33,12 @@ explicit-target lines keep arriving and make it look healthy.
 
 ## Neighbours
 
-- **Horizon** (`~/GitHub/horizon`): separate product, never merge. Horizon is
-  the instructor (one-way, grades you, never touches the controls); this is
-  crew (two-way, acts on the aircraft). Different trust model.
+- **Horizon** (`~/GitHub/horizon`): ABANDONED (2026-09-11; it had become a
+  charter logbook, never an instructor). Nothing lives there. A flight
+  instructor, if built, is a third persona HERE, mode-gated like ATC-only so
+  it never actuates: the monitor's callouts, the ATC coach, the handbook RAG
+  and the automations as demonstrations exist; a blackbox scorer against ACS
+  tolerances, a lesson state machine and narration do not.
 - **rustdecks** (`~/GitHub/rustdecks`): sibling Loupedeck controller. When
   hunting a dataref/command name, check its `examples/*.yaml` (and the
   cockpitdecks clones it references) before the sim's DataRefs.txt - names
@@ -114,6 +117,11 @@ tools; YAML carries per-airframe config. Standing rules:
   and only if the file is unreadable do the 172 numbers apply, said aloud.
   Approach speed derived = max(1.3 Vso, 1.2 Vs). `bus_volts_nominal`
   scales the start gate (12 volt systems exist).
+- **No automation target goes below the airframe's speed floor**
+  (`aircraft::speed_floor_kts`, 1.2 x clean Vs, republished per swap):
+  `speedhold::arm_flight` and `run_autoland` raise the target to it, say so,
+  and blackbox `target_floored` / `approach_ias_floored`. A wrong number
+  handed down from a profile, a plan or a pilot is still a wrong number.
 - **A profile line is a HYPOTHESIS until probed live**: `is_writable` and
   existence are one curl away when the sim is up. A "dataref" name may really
   be a command; read-only switch positions need read-before-fire toggle tools
@@ -351,6 +359,10 @@ history):
   gaps during backtracks), refuses to arm airborne (names the tools that
   fly), and both missions end with `taxi_in_after_landing`. Cruise power is a
   SPEED from the profile (`reference.cruise_ias_kts`), never SimBrief's.
+  **The arrival is briefed at the gate** (`full_auto::brief_arrival` in the
+  arming ack: published approach, straight-in, or "I'll land visually"; a
+  destination the data lacks is refused there) - found 25 nm out it was a
+  crash.
 - **Autoland**: pursuit aim keeps its full lead all the way in
   (`pursuit_aim_nm` - the aim walks down the runway, bounded by pavement);
   roundout band (`ROUNDOUT_MULT`/`ROUNDOUT_VS_FPM`) before the flare - a
@@ -467,8 +479,11 @@ whisper output - **add every new wart here**); scripted sortie dialogues over
 (`cargo run -- stt-eval bench/atc_stt_cases.yaml`); the world sweep
 (`cargo test --release -p atc -- --ignored atc_world_sweep`, needs apt.dat);
 ILS smoke test (`cargo test -- --ignored real_install_ils`); the in-sim soak
-checklist [docs/atc-chaos-card.md](docs/atc-chaos-card.md). Mine
-`logs/blackbox.jsonl` after every flight.
+checklist [docs/atc-chaos-card.md](docs/atc-chaos-card.md). `xvl debrief`
+([src/debrief.rs](src/debrief.rs)) reads `logs/blackbox.jsonl` after every
+flight: aircraft, the numbers, every callout, and the narrative of events an
+instructor would write down (crashes, balks, void calls, floored targets,
+taxi stops). Run it before diagnosing by hand.
 
 When a control law misbehaves in the air but its test passes, suspect the
 test's plant first: a first-order lag cannot ring at any gain. Sortie tests

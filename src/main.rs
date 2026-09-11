@@ -20,6 +20,7 @@ mod circuit;
 mod cockpit_auto;
 mod config;
 mod conversation;
+mod debrief;
 mod dialogue;
 mod failures;
 mod flightplan;
@@ -222,6 +223,19 @@ async fn main() -> Result<()> {
             );
             tts_onnx::OnnxTts::load(&config.piper_voice)?.speak(&text)?;
         }
+        return Ok(());
+    }
+
+    // `xvl debrief [logs/blackbox.jsonl]` — what the last flight did, from the
+    // blackbox: the read a pilot gets after the sortie, and the one the
+    // fly-fix-fly loop starts from.
+    if std::env::args().nth(1).as_deref() == Some("debrief") {
+        let path = std::env::args()
+            .nth(2)
+            .unwrap_or_else(|| "logs/blackbox.jsonl".to_string());
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow!("reading {path}: {e}"))?;
+        print!("{}", debrief::report(text.lines()));
         return Ok(());
     }
 
@@ -1116,6 +1130,7 @@ impl LiveProfile {
         aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
         aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());
         aircraft::publish_bus_volts(p.bus_volts_nominal);
+        aircraft::publish_speed_floor(p.vs_clean_kts);
         std::sync::Arc::new(Self {
             inner: std::sync::RwLock::new(p),
             generation: std::sync::atomic::AtomicU64::new(0),
@@ -1146,6 +1161,7 @@ impl LiveProfile {
         aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
         aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());
         aircraft::publish_bus_volts(p.bus_volts_nominal);
+        aircraft::publish_speed_floor(p.vs_clean_kts);
         *self.inner.write().unwrap() = p;
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);

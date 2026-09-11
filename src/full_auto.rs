@@ -1462,6 +1462,53 @@ async fn taxi_in_after_landing(
     );
 }
 
+/// The arrival, briefed AT THE GATE: what the destination offers and what
+/// full auto will therefore do there — a published approach, a straight-in
+/// reconstructed from DME fixes, or a visual landing. The Gibraltar crash was
+/// discovered 25 nm out, when the arrival was first built; nothing about it
+/// needed the aircraft to be airborne. `Err` is a refusal: a destination the
+/// airport data doesn't have, or one with no runway, is not a destination.
+pub fn brief_arrival(apt_dat: &str, cifp: &str, fix_path: &str, dest: &str) -> Result<String, String> {
+    let airport = crate::nav::find_airport(apt_dat, dest)
+        .ok()
+        .flatten()
+        .ok_or_else(|| format!("I can't find {dest} in the airport data, so I can't plan the arrival."))?;
+    if airport.runways.is_empty() {
+        return Err(format!("{} has no runways in the airport data.", airport.name));
+    }
+    let (mut published, mut straight_in) = (Vec::new(), Vec::new());
+    for r in &airport.runways {
+        for id in [&r.ident_a, &r.ident_b] {
+            let spoken = crate::circuit::spell_runway(id);
+            if let Some(appch) = crate::nav::best_approach(cifp, dest, id) {
+                published.push(format!(
+                    "the {} on {spoken}",
+                    crate::procedure::approach_kind(&appch)
+                ));
+            } else if !crate::nav::reconstruct_approach(fix_path, &airport, dest, id).is_empty() {
+                straight_in.push(spoken);
+            }
+        }
+    }
+    let name = &airport.name;
+    let mut parts = Vec::new();
+    if !published.is_empty() {
+        parts.push(format!("{name} has {}", published.join(", ")));
+    }
+    if !straight_in.is_empty() {
+        parts.push(format!(
+            "{}a straight-in on {}",
+            if published.is_empty() { format!("{name} has ") } else { "and ".to_string() },
+            straight_in.join(" and ")
+        ));
+    }
+    Ok(if parts.is_empty() {
+        format!("{name} has no published approach and no straight-in, so I'll land visually. The wind at the time picks the runway.")
+    } else {
+        format!("{}. The wind at the time picks the runway.", parts.join(" "))
+    })
+}
+
 /// What the blocking arrival builder found: the approach plan + runway when
 /// one could be built, and the destination's own tower frequency either way.
 struct Arrival {
@@ -1693,6 +1740,41 @@ async fn lined_up(xp: &XPlaneClient, tools: &SubTools, _config: &Config) -> bool
 #[cfg(test)]
 mod tests {
     use super::departure_check_in;
+
+    // The arrival is briefed at the gate. Gibraltar, as the data has it: no
+    // coded approach, DME fixes on 27's centreline, 09's off it.
+    #[test]
+    fn the_gate_brief_says_what_the_destination_offers() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("xvl-brief");
+        std::fs::create_dir_all(&dir).unwrap();
+        let apt = dir.join("apt.dat");
+        let mut f = std::fs::File::create(&apt).unwrap();
+        writeln!(f, "1 11 0 0 LXGB Gibraltar").unwrap();
+        writeln!(f, "100 46 0 0 0 0 0 0 09 36.1509000 -5.3581000 0 0 0 0 0 0 27 36.1515000 -5.3412000 0 0 0 0 0 0").unwrap();
+        f.flush().unwrap();
+        let fix = dir.join("earth_fix.dat");
+        let mut f = std::fs::File::create(&fix).unwrap();
+        writeln!(f, "36.157361111 -5.240083333 27D05 LXGB LX 5906505 RWY27 D05").unwrap();
+        writeln!(f, "36.104666667 -5.405333333 09D05 LXGB LX 5906505 RWY09 D05").unwrap();
+        f.flush().unwrap();
+        let cifp = dir.join("no-cifp");
+        let brief = super::brief_arrival(
+            apt.to_str().unwrap(),
+            cifp.to_str().unwrap(),
+            fix.to_str().unwrap(),
+            "LXGB",
+        )
+        .expect("a brief");
+        assert_eq!(
+            brief,
+            "Gibraltar has a straight-in on two seven. The wind at the time picks the runway."
+        );
+        // A destination the data doesn't have is a refusal, at the gate.
+        let why = super::brief_arrival(apt.to_str().unwrap(), cifp.to_str().unwrap(), fix.to_str().unwrap(), "ZZZZ")
+            .expect_err("refused");
+        assert!(why.contains("ZZZZ"), "{why}");
+    }
 
     // The first call to Departure has to read as a CHECK-IN to the station
     // (a readback carrying "passing"/"climbing", never a request), or the

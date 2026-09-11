@@ -404,6 +404,23 @@ pub fn run_autoland(
                 tracing::info!(target: "xvoicelayer::autoland", spoke = %line, "copilot");
                 if let Some(v) = &voice { v.alert(sev, line); }
             };
+            // The approach speed is a number somebody handed us; the airframe's
+            // stall floor is a fact. A Cessna's 65 kt on an RV-10 whose clean
+            // stall is 65 flew the speed schedule into a stall (2026-09-11).
+            let approach_ias = {
+                let floored = crate::aircraft::floored_target(approach_ias, crate::aircraft::speed_floor_kts());
+                if floored > approach_ias {
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "approach_ias_floored", "asked": approach_ias, "floor": floored}),
+                    );
+                    announce(
+                        format!("Approach speed {approach_ias:.0} is below this airframe's {floored:.0} knot floor. Using {floored:.0}."),
+                        Priority::Caution,
+                    );
+                }
+                floored
+            };
 
             // Find the runway (a full apt.dat pass, a few seconds — that's why the
             // tool says "searching"). Needs a valid position first.

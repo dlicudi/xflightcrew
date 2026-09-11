@@ -434,10 +434,26 @@ impl FullAuto {
             .collect::<Vec<_>>()
             .join("|");
 
+        // The arrival, briefed NOW: what the destination offers and what
+        // full auto will do there. Found at the gate, it is a briefing item;
+        // found 25 nm out, it was a crash (Gibraltar, 2026-09-11). A
+        // destination the data can't land at is refused here, not there.
+        let arrival = {
+            let (apt, cifp, fixp, dest) = (
+                ctx.config.apt_data_path.clone(),
+                ctx.config.cifp_dir.clone(),
+                ctx.config.fix_data_path.clone(),
+                fp.destination.clone(),
+            );
+            tokio::task::spawn_blocking(move || crate::full_auto::brief_arrival(&apt, &cifp, &fixp, &dest))
+                .await
+                .map_err(|e| format!("The arrival brief failed: {e}"))??
+        };
+
         let n = legs.len();
         let ack = format!(
             "Full auto, {} to {}. I'll start up, get our taxi, take off, and fly the \
-             {} enroute {} at {:.0} feet, then the approach into {}. Say cancel or my \
+             {} enroute {} at {:.0} feet, then the approach into {}. {} Say cancel or my \
              controls any time.",
             fp.origin,
             fp.destination,
@@ -445,6 +461,7 @@ impl FullAuto {
             if n == 1 { "fix" } else { "fixes" },
             fp.cruise_alt_ft,
             dest_name,
+            arrival,
         );
         Ok((
             Mission::Flight(Route {

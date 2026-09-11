@@ -141,7 +141,27 @@ pub fn set_taxi_target(kts: f64) {
 /// target and, if the governor isn't already running, starts it on its own
 /// thread. Idempotent; a running hold just picks up the new target.
 pub fn arm_flight(base_url: String, voice: Option<crate::voice::Voice>, target_kts: f64) {
-    *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner()) = clamp_target(target_kts);
+    // The airframe's stall floor outranks whoever is asking: a wrong number
+    // handed down from a profile, a plan or a pilot is still a wrong number
+    // (the RV-10's 65 kt "approach speed", 2026-09-11).
+    let asked = clamp_target(target_kts);
+    let target = crate::aircraft::floored_target(asked, crate::aircraft::speed_floor_kts());
+    if target > asked {
+        tracing::warn!(asked, floor = target, "speed governor: target raised to the airframe's floor");
+        crate::blackbox::record(
+            "speedhold",
+            serde_json::json!({"event": "target_floored", "asked": asked, "floor": target}),
+        );
+        if let Some(v) = &voice {
+            v.alert(
+                crate::voice::Priority::Caution,
+                format!(
+                    "{asked:.0} knots is below the {target:.0} knot floor for this airframe. Holding {target:.0}."
+                ),
+            );
+        }
+    }
+    *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner()) = target;
     *MODE.lock().unwrap_or_else(|e| e.into_inner()) = Mode::Flight;
     if !ACTIVE.swap(true, Ordering::Relaxed) {
         std::thread::spawn(move || {
