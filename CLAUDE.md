@@ -105,6 +105,15 @@ tools; YAML carries per-airframe config. Standing rules:
   Singles stay byte-identical (element 0, starter 1).
 - Twin-only speeds (`vyse_kts`, `vmca_kts`) stay `None` on singles: the
   copilot says nothing rather than inventing a number.
+- **An unknown type is never silently the 172** (RV-10, 2026-09-11: flown
+  on the 172's 65 kt approach, its own clean stall, into a stall).
+  `known_profile` maps ICAO to a curated profile; anything else gets
+  `aircraft::generic_from_acf` (speeds, flap detents and Vfe, gear, injected
+  vs carburetted, weights from the sim's own `.acf` via `acf_relative_path`
+  under `xplane_root()`), the pilot hears "no profile for this airframe",
+  and only if the file is unreadable do the 172 numbers apply, said aloud.
+  Approach speed derived = max(1.3 Vso, 1.2 Vs). `bus_volts_nominal`
+  scales the start gate (12 volt systems exist).
 - **A profile line is a HYPOTHESIS until probed live**: `is_writable` and
   existence are one curl away when the sim is up. A "dataref" name may really
   be a command; read-only switch positions need read-before-fire toggle tools
@@ -365,6 +374,12 @@ history):
   the CLEAN approach speed (`power_hold_target`); autoland's gear and flaps
   wait for the profile's VLO/Vfe (`gear_may_extend`, `flap_within_limits`,
   republished per airframe); taxi-in never follows `has_crashed`.
+  Above the floor the same geometry is a REPOSITION to the join point, not
+  a "final": "land the aircraft" from 1.5 nm abeam flew a saturated cut.
+  **Below the terrain floor a final must still be interceptable**
+  (`stabilised_xtk` = the circuit's `interceptable`, inside the FAP only) or
+  it balks with height in hand - the flare gate under 100 ft was the only
+  lateral balk, which is why the crash happened at 95 ft.
 - **The crew works the radio as full auto flies** (same sortie): a
   conditional line-up waits on `party_line::line_up_condition_clear()` (the
   world's traffic picture, published by the release watch every tick) before

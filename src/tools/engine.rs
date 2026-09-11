@@ -15,10 +15,6 @@ const THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
 const MIXTURE: &str = "sim/cockpit2/engine/actuators/mixture_ratio_all";
 const BATTERY: &str = "sim/cockpit/electrical/battery_on";
 const BUS_VOLTS: &str = "sim/cockpit2/electrical/bus_volts";
-/// Below this bus voltage the battery is too flat to reliably crank the starter
-/// (the 172 is a 24V system; a healthy pre-start bus sits ~24-25V). Drops to the
-/// low 22s after accessories run with the engine off.
-const MIN_START_VOLTS: f64 = 23.0;
 const ONGROUND: &str = "sim/flightmodel/failures/onground_any";
 const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed"; // m/s
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
@@ -802,7 +798,10 @@ impl Tool for StartEngine {
             .first()
             .copied()
             .unwrap_or(0.0);
-        if volts < MIN_START_VOLTS {
+        // The gate scales with the airframe's system voltage (profile
+        // `bus_volts_nominal`): 23 on a 24 volt system, 11.5 on the RV-10's
+        // 12, which the flat 23 called "low" at a healthy 12 (2026-09-11).
+        if volts < crate::aircraft::min_start_volts() {
             return Ok(format!(
                 "Battery's low, only {volts:.0} volts — connect ground power or you may not get a start."
             ));

@@ -291,14 +291,25 @@ async fn main() -> Result<()> {
     // Cessna if detection fails (e.g. X-Plane not reachable yet). The probe
     // client is used and dropped here — `run_session` makes its own (a reqwest
     // client must be used on the runtime it runs on).
+    let mut startup_generic: Option<aircraft::AircraftProfile> = None;
     let aircraft_id = if config.aircraft.eq_ignore_ascii_case("auto") {
         let probe = XPlaneClient::new(config.xplane_base_url.clone());
         match probe.aircraft_icao().await {
-            Ok(icao) => {
-                let id = icao_to_profile(&icao);
-                tracing::info!(icao = %icao, profile = %id, "auto-detected aircraft");
-                id
-            }
+            Ok(icao) => match known_profile(&icao) {
+                Some(id) => {
+                    tracing::info!(icao = %icao, profile = %id, "auto-detected aircraft");
+                    id
+                }
+                None => {
+                    // An unknown type: its own placards, or the 172's numbers
+                    // with a warning in the log (the swap watch says it aloud).
+                    startup_generic = generic_profile(&probe, &icao).await;
+                    if startup_generic.is_none() {
+                        tracing::warn!(icao = %icao, "no profile and no readable .acf; defaulting to cessna_172sp numbers");
+                    }
+                    generic_profile_id(&icao)
+                }
+            },
             Err(e) => {
                 tracing::warn!("aircraft auto-detect failed ({e:#}); defaulting to cessna_172sp");
                 "cessna_172sp".to_string()
@@ -307,8 +318,18 @@ async fn main() -> Result<()> {
     } else {
         config.aircraft.clone()
     };
-    let profile = aircraft::load(&aircraft_id)
-        .ok_or_else(|| anyhow!("unknown aircraft profile: {aircraft_id}"))?;
+    let profile = match startup_generic {
+        Some(p) => p,
+        None => aircraft::load(&aircraft_id)
+            .or_else(|| {
+                aircraft_id.starts_with("generic_").then(|| {
+                    let mut p = aircraft::load("cessna_172sp")?;
+                    p.id = aircraft_id.clone();
+                    Some(p)
+                })?
+            })
+            .ok_or_else(|| anyhow!("unknown aircraft profile: {aircraft_id}"))?,
+    };
 
     tracing::info!(
         model = %config.model,
@@ -520,9 +541,28 @@ async fn main() -> Result<()> {
                                 }
                                 shown = chip;
                             }
-                            let id = icao_to_profile(&icao);
+                            let known = known_profile(&icao);
+                            let id = known.clone().unwrap_or_else(|| generic_profile_id(&icao));
                             if id != live.id() {
-                                if let Some(p) = aircraft::load(&id) {
+                                // A known type loads its profile. An unknown one
+                                // gets its own placards, or the 172's numbers —
+                                // and either way the pilot HEARS which, because
+                                // a silent fallback is how the RV-10 was flown
+                                // to a stall on a Cessna's approach speed.
+                                let (loaded, line) = match known {
+                                    Some(_) => (aircraft::load(&id), None),
+                                    None => match generic_profile(&xp, &icao).await {
+                                        Some(p) => (Some(p), Some("No profile for this airframe. I'm flying it on the placards from its own aircraft file. Treat every automation as untested.".to_string())),
+                                        None => (
+                                            aircraft::load("cessna_172sp").map(|mut p| {
+                                                p.id = id.clone();
+                                                p
+                                            }),
+                                            Some(format!("No profile for {icao} and I can't read its aircraft file. Falling back to Cessna 172 numbers, which are wrong for it. No automation until there's a profile.")),
+                                        ),
+                                    },
+                                };
+                                if let Some(p) = loaded {
                                     let name = p.display_name.clone();
                                     tracing::info!(icao = %icao, profile = %id, "aircraft changed; switching profile");
                                     // A manual/native push continues inside
@@ -540,7 +580,8 @@ async fn main() -> Result<()> {
                                     // Mirror OR action, never both: voice.alert already
                                     // posts the spoken line to the panel transcript, so a
                                     // separate s.alert here double-wrote it (blue + green).
-                                    det_voice.alert(voice::Priority::Advisory, format!("Now set up for the {name}."));
+                                    let line = line.unwrap_or_else(|| format!("Now set up for the {name}."));
+                                    det_voice.alert(voice::Priority::Advisory, line);
                                 }
                             }
                         }
@@ -1074,6 +1115,7 @@ impl LiveProfile {
         tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
         aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
         aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());
+        aircraft::publish_bus_volts(p.bus_volts_nominal);
         std::sync::Arc::new(Self {
             inner: std::sync::RwLock::new(p),
             generation: std::sync::atomic::AtomicU64::new(0),
@@ -1103,6 +1145,7 @@ impl LiveProfile {
         tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
         aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
         aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());
+        aircraft::publish_bus_volts(p.bus_volts_nominal);
         *self.inner.write().unwrap() = p;
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -3922,20 +3965,64 @@ fn analyze_commands() -> Result<()> {
 /// Map an X-Plane ICAO type code to a profile id. Unknown types fall back to
 /// the Cessna so the app stays usable; add rows as profiles are added.
 fn icao_to_profile(icao: &str) -> String {
-    match icao.to_uppercase().as_str() {
-        "C172" => "cessna_172sp",
-        "SR22" => "cirrus_sr22",
-        "MD82" | "MD80" | "MD83" | "MD88" => "md82",
-        "C750" | "C75B" => "citation_x",
-        "SF50" => "cirrus_vision_sf50",
-        "DC3" | "DC30" => "dc3",
-        "BE9L" | "BE9T" | "C90" | "C90B" => "king_air_c90b",
-        "BE58" | "BE55" => "beechcraft_baron_58",
-        "EVOT" | "EVOP" => "lancair_evolution",
-        "DHC6" => "dhc6_twin_otter",
-        _ => "cessna_172sp",
+    known_profile(icao).unwrap_or_else(|| "cessna_172sp".to_string())
+}
+
+/// The curated profile for an ICAO type, if one exists. `None` is an
+/// airframe nobody has written a profile for — and that is NOT the 172: the
+/// RV-10 flew on the 172's numbers for lack of this distinction (approach
+/// speed equal to its own clean stall, flap limit 11 kt under its placard,
+/// a healthy 12 volt battery called low; 2026-09-11). An unknown type gets a
+/// profile built from its own `.acf` placards instead (`generic_profile`).
+fn known_profile(icao: &str) -> Option<String> {
+    Some(
+        match icao.to_uppercase().as_str() {
+            "C172" => "cessna_172sp",
+            "SR22" => "cirrus_sr22",
+            "MD82" | "MD80" | "MD83" | "MD88" => "md82",
+            "C750" | "C75B" => "citation_x",
+            "SF50" => "cirrus_vision_sf50",
+            "DC3" | "DC30" => "dc3",
+            "BE9L" | "BE9T" | "C90" | "C90B" => "king_air_c90b",
+            "BE58" | "BE55" => "beechcraft_baron_58",
+            "EVOT" | "EVOP" => "lancair_evolution",
+            "DHC6" => "dhc6_twin_otter",
+            "RV10" => "vans_rv10",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// The profile id an unknown type flies under, so the detector's "changed?"
+/// comparison is stable across ticks.
+fn generic_profile_id(icao: &str) -> String {
+    format!("generic_{}", icao.to_lowercase())
+}
+
+/// A profile for an unknown airframe from its own `.acf`: the sim names the
+/// file (`acf_relative_path`, relative to the install), the placards come
+/// out of it. `None` when the file can't be found or read — the caller then
+/// falls back to the 172's numbers and SAYS so.
+async fn generic_profile(xp: &XPlaneClient, icao: &str) -> Option<aircraft::AircraftProfile> {
+    let rel = xp
+        .get_string("sim/aircraft/view/acf_relative_path")
+        .await
+        .ok()
+        .filter(|r| !r.is_empty())?;
+    let path = format!("{}/{}", tools::autoland::xplane_root(), rel);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let mut p = aircraft::generic_from_acf(icao, &text);
+            p.id = generic_profile_id(icao);
+            tracing::warn!(icao, path = %path, "no profile for this airframe; built one from its .acf placards");
+            Some(p)
+        }
+        Err(e) => {
+            tracing::warn!(icao, path = %path, "no profile for this airframe and its .acf is unreadable: {e}");
+            None
+        }
     }
-    .to_string()
 }
 
 /// Capture one utterance (continuous VAD or push-to-talk) and transcribe it.
@@ -7853,6 +7940,28 @@ mod tests {
         assert!(super::tools::Registry::for_aircraft(&c172)
             .get("gear")
             .is_none());
+    }
+
+    // The RV-10 flew on the 172's numbers for lack of a profile (2026-09-11).
+    #[test]
+    fn the_rv10_has_its_own_profile_and_unknown_types_are_not_the_172() {
+        assert_eq!(super::icao_to_profile("RV10"), "vans_rv10");
+        assert_eq!(super::known_profile("ZZZZ"), None, "unknown is unknown, not a Cessna");
+        assert_eq!(super::generic_profile_id("ZZZZ"), "generic_zzzz");
+        let p = super::aircraft::load("vans_rv10").expect("RV-10 profile loads");
+        let r = p.reference.as_ref().expect("reference card");
+        assert_eq!(r.approach_kts, Some(80.0), "not the 172's 65, which is the RV-10's clean stall");
+        assert_eq!(p.vs_clean_kts, Some(65.0));
+        assert_eq!(p.bus_volts_nominal, Some(12.0));
+        assert!(!p.retractable_gear && !p.carb_heat && p.magnetos);
+        let flaps = p.flaps.as_ref().expect("flaps");
+        let vfe: Vec<Option<f64>> = flaps.detents.iter().map(|d| d.vfe_kts).collect();
+        assert_eq!(vfe, vec![None, Some(96.0), Some(87.0)]);
+        let sel = p.fuel_selector.as_ref().expect("xlua fuel selector");
+        assert!(
+            sel.readback.as_deref().is_some_and(|r| r.contains("laminar/rv10")),
+            "the stock selector is not the RV-10's"
+        );
     }
 
     #[test]

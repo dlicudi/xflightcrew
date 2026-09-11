@@ -1155,10 +1155,44 @@ line-up pace coasted to a dead stop three times in 205 m: at 6.9 kt building
 0.9 kt/s the projection called it 3 kt over, idle-and-brake followed, prop
 drag stopped the Baron, and the rebuild from idle repeated it. Idle-and-brake
 now needs the speed to actually be 2 kt over unless the build is a surge
-(1.2 kt/s), and a trim that has taken leaves the lever alone. Still unowned:
-the zone clearance's "not above two thousand feet" (neither side carries the
-altitude limit) and the squawk watch's "radar contact" spoken before the
-handoff.
+(1.2 kt/s), and a trim that has taken leaves the lever alone. And the reason the crash was a crash rather than a
+go-around: autoland's only lateral balk was the flare gate (under 100 ft,
+inside 0.6 nm), so a final that never converged descended to 95 ft still
+306 m off the centreline before balking, with a 470 fpm sink and full flap
+to reverse and the North Front ahead. The go-around itself was right (full
+power and +800 fpm on the same tick); it was four seconds too late. Below
+the terrain floor and inside the FAP the final must now still be
+interceptable (`stabilised_xtk`, the circuit's own `interceptable` test: the
+35 degree cut can close the offset with margin in the distance left) or the
+guidance flips to Intercept and the latch flies the balk from 500 ft. Not an
+angle gate: the pursuit deliberately flies a 370 m offset out from 0.8 nm,
+and a 5 degree rule would have balked that.
+
+**The RV-10 that had no profile (LXGB, 16:37Z, 2026-09-11).** The pilot
+loaded the stock Van's RV-10 and every number the copilot used was a Cessna
+172's, because `icao_to_profile` fell through to `cessna_172sp` for any type
+it did not know and said nothing. The consequences, in order: "flaps twenty"
+refused at 89 kt against the 172's 85 kt limit (the RV-10 is placarded 96);
+"start engines" warned "battery's low, only 12 volts" on a healthy 12 volt
+system, against a 23 volt gate written for the 172's 24; and "land the
+aircraft" at 1.5 nm abeam Gibraltar's 09 armed autoland, whose guidance
+called any position inside the FAP "final" and flew a saturated 35 degree cut
+while the speed schedule pulled the aircraft to the 172's 65 kt approach
+speed, which is the RV-10's CLEAN stall (acf Vs 65). It stalled at 63 kt with
+a third of flap, departed to 33 kt and +1,900 fpm, recovered, and stalled
+again. Fixes: `profiles/vans_rv10.yaml` (acf figures where the POM and the
+model disagree, the xlua fuel selector, 12 volts); `known_profile` returns
+`None` for unknown types and `generic_from_acf` builds a profile from the
+aircraft's own `.acf` placards (speeds, detents with Vfe1..Vfem, gear from
+Vle, injected vs carburetted, weights; approach = max(1.3 Vso, 1.2 Vs) because
+the acf's Vso is what the author typed and the model stalls above it with
+partial flap), with the pilot told "no profile for this airframe" and the
+172 fallback used only when the file is unreadable, said aloud;
+`bus_volts_nominal` scales the start gate; and autoland's guidance treats an
+uninterceptable position above the terrain floor as a reposition to the join
+point rather than a final (the below-floor balk from the same day stays). Still unowned: the zone clearance's
+"not above two thousand feet" (neither side carries the altitude limit) and
+the squawk watch's "radar contact" spoken before the handoff.
 
 Depth (added 2026-07-28): **the approach is sized for the airframe, and a
 missed approach is a procedure**. One MD-82 circuit at Luton exposed four

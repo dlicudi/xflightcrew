@@ -35,6 +35,11 @@ pub struct AircraftProfile {
     /// tool refuses cycling the gear above it. `None` = no gear speed gate.
     #[serde(default)]
     pub vlo_kts: Option<f64>,
+    /// Nominal DC bus voltage (12 or 24). The engine-start "battery's low"
+    /// gate scales with it: a healthy 12 volt RV-10 read "only 12 volts"
+    /// against the 172's 24 volt threshold (2026-09-11). `None` = 24.
+    #[serde(default)]
+    pub bus_volts_nominal: Option<f64>,
     /// Static reference figures (V-speeds, weights, limits) the copilot recites
     /// when asked. Per-airframe, from the POH/POM. `None` = no reference answers.
     #[serde(default)]
@@ -1096,6 +1101,27 @@ pub fn publish_config_limits(vlo_kts: Option<f64>, flaps: Option<&FlapProfile>) 
         .unwrap_or_default();
 }
 
+/// The live airframe's nominal bus voltage, published per swap like the
+/// other selectors. `None` = the 24 volt default.
+static BUS_VOLTS_NOMINAL: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// Publish the airframe's nominal bus voltage. Called on EVERY profile swap.
+pub fn publish_bus_volts(nominal: Option<f64>) {
+    *BUS_VOLTS_NOMINAL.lock().unwrap_or_else(|e| e.into_inner()) = nominal;
+}
+
+/// Below this bus voltage the battery is too flat to reliably crank: 23 on a
+/// 24 volt system (a healthy pre-start bus sits ~24-25, the low 22s after
+/// accessories with the engine off), and the same 4% margin under whatever
+/// the live airframe's profile says its system is.
+pub fn min_start_volts() -> f64 {
+    let nominal = BUS_VOLTS_NOMINAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or(24.0);
+    nominal * 23.0 / 24.0
+}
+
 /// The live airframe's VLO/VLE, if its profile declares one.
 pub fn gear_limit_kts() -> Option<f64> {
     *GEAR_LIMIT_KTS.lock().unwrap_or_else(|e| e.into_inner())
@@ -1122,6 +1148,128 @@ pub fn throttle_dataref() -> String {
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_else(|| STOCK_THROTTLE.to_string())
+}
+
+/// A profile for an airframe nobody has written one for, built from the
+/// placards in its own `.acf` file: the speeds, the flap detents and their
+/// limits, whether the gear retracts, whether the engine is carburetted. The
+/// tool surface is the stock 172's (stock datarefs are the best guess for a
+/// stock-systems airframe); only the NUMBERS change, and those are the ones
+/// that hurt. The RV-10 flew on the 172's 65 kt approach speed — its own clean
+/// stall speed — because the fallback was silent and total (2026-09-11).
+///
+/// `acf_text` is the file's contents (`P key value` lines). Pure, so it
+/// battle-tests on a fixture. Approach speed is the larger of 1.3 Vso and
+/// 1.2 Vs: the acf's Vso is what the author typed, and the model can stall
+/// above it with partial flap (the RV-10 did, at 63 kt against a Vso of 50).
+pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
+    let vals: std::collections::HashMap<&str, &str> = acf_text
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            (it.next()? == "P").then(|| (it.next(), it.next()))?.into()
+        })
+        .filter_map(|(k, v)| Some((k?, v?)))
+        .collect();
+    let num = |k: &str| vals.get(k).and_then(|v| v.parse::<f64>().ok());
+    let kts = |k: &str| num(k).filter(|v| *v > 0.0 && *v < 9000.0);
+    let mut p = cessna_172sp();
+    p.id = format!("generic_{}", icao.to_lowercase());
+    let name = vals.get("acf/_name").map(|s| s.to_string()).unwrap_or_else(|| icao.to_string());
+    // `_name` is one token here (split on whitespace); good enough for a label.
+    p.display_name = format!("{name} (no profile)");
+    p.checklist = None;
+    p.checklist_map = Vec::new();
+    p.bus_volts_nominal = None;
+
+    let vs = kts("acf/_Vs_kts");
+    let vso = kts("acf/_Vso_kts");
+    p.vs_clean_kts = vs.or(p.vs_clean_kts);
+    p.vne_kts = kts("acf/_Vne_kts").or(p.vne_kts);
+    let vle = kts("acf/_Vle_kts");
+    p.retractable_gear = vle.is_some();
+    p.vlo_kts = vle;
+    let injected = vals
+        .get("_engn/0/_type")
+        .is_some_and(|t| t.contains("INJ") || !t.starts_with("RCP"));
+    p.carb_heat = !injected;
+    if vals.get("_engn/0/_type").is_some_and(|t| !t.starts_with("RCP")) {
+        // Not a piston: the magneto and mixture-side tools would be lies.
+        p.magnetos = false;
+        p.fuel_pump = false;
+    }
+
+    // Flap detents: `_flap_detents` notches at `_flap1_dn/i` degrees; ratio
+    // is degrees over the last notch; Vfe1 for the first, Vfem for the last,
+    // a straight line between.
+    let detents = num("acf/_flap_detents").map(|d| d as usize).unwrap_or(0);
+    let degs: Vec<f64> = (1..=detents)
+        .filter_map(|i| num(&format!("acf/_flap1_dn/{i}")))
+        .filter(|d| *d > 0.0)
+        .collect();
+    if let (Some(last), true) = (degs.last().copied(), !degs.is_empty()) {
+        let vfe1 = kts("acf/_Vfe1_kts");
+        let vfem = kts("acf/_Vfem_kts").or(vfe1);
+        let n = degs.len();
+        let mut list = vec![FlapDetent {
+            label: "up".into(),
+            spoken: "up".into(),
+            ratio: 0.0,
+            vfe_kts: None,
+        }];
+        for (i, d) in degs.iter().enumerate() {
+            let full = i + 1 == n;
+            let vfe = match (vfe1, vfem) {
+                (Some(a), Some(b)) if n > 1 => Some(a + (b - a) * i as f64 / (n - 1) as f64),
+                (a, b) => b.or(a),
+            };
+            list.push(FlapDetent {
+                label: if full { "full".into() } else { format!("{d:.0}") },
+                spoken: if full { "full".into() } else { format!("{d:.0} degrees") },
+                ratio: (d / last * 10_000.0).round() / 10_000.0,
+                vfe_kts: vfe.map(f64::round),
+            });
+        }
+        p.flaps = Some(FlapProfile {
+            detents: list,
+            takeoff_ratio: Some(0.0),
+        });
+    }
+
+    let r = p.reference.get_or_insert_with(Default::default);
+    r.vno_kts = kts("acf/_Vno_kts").or(r.vno_kts);
+    r.va_kts = kts("acf/_Va_kts").or(r.va_kts);
+    r.vx_kts = kts("acf/_Vx_kts").or(r.vx_kts);
+    r.vy_kts = kts("acf/_Vy_kts").or(r.vy_kts);
+    r.best_glide_kts = kts("acf/_Vbg_kts").or(r.best_glide_kts);
+    r.vs0_kts = vso.or(r.vs0_kts);
+    if let Some(vs) = vs {
+        r.vr_kts = Some((vs * 1.1).round());
+        let by_vso = vso.map(|v| v * 1.3).unwrap_or(0.0);
+        r.approach_kts = Some(by_vso.max(vs * 1.2).round());
+    }
+    if let Some(vno) = r.vno_kts {
+        r.cruise_ias_kts = Some((vno * 0.85).round());
+    }
+    r.cruise_kts = None;
+    r.best_climb_fpm = None;
+    r.max_gross_lb = num("acf/_m_max").or(r.max_gross_lb);
+    r.empty_weight_lb = num("acf/_m_empty").or(r.empty_weight_lb);
+    r.useful_load_lb = match (r.max_gross_lb, r.empty_weight_lb) {
+        (Some(g), Some(e)) if g > e => Some(g - e),
+        _ => None,
+    };
+    for f in [
+        &mut r.service_ceiling_ft,
+        &mut r.fuel_capacity_gal,
+        &mut r.fuel_useable_gal,
+        &mut r.endurance_hours,
+        &mut r.takeoff_distance_ft,
+        &mut r.landing_distance_ft,
+    ] {
+        *f = None; // not in the acf: not recited
+    }
+    p
 }
 
 /// Built-in profile by id (fallback when no YAML file exists).
@@ -1733,6 +1881,7 @@ fn cessna_172sp() -> AircraftProfile {
         ils: true,
         parking_brake: true,
         cabin_crew: false,
+        bus_volts_nominal: None,
         park_brake_valve_set: None,
         electrical: {
             let e = |key: &str, spoken: &str, on: &[&str], off: &[&str], rb: &[&str]| {
@@ -2004,6 +2153,7 @@ fn cirrus_sr22() -> AircraftProfile {
         ils: true,
         parking_brake: true,
         cabin_crew: false,
+        bus_volts_nominal: None,
         park_brake_valve_set: None,
         pitot_heat: true,
         pitot_heat_dataref: None,
@@ -2252,5 +2402,85 @@ fn cirrus_sr22() -> AircraftProfile {
                 m("fuel_tank_selector", FuelSelector), // 0=off/1=left/2=right
             ]
         },
+    }
+}
+
+#[cfg(test)]
+mod generic_profile_tests {
+    // An unknown airframe flies on its own placards, never the 172's. The
+    // fixture is the RV-10's acf, the airframe that showed why (2026-09-11).
+    #[test]
+    fn an_unknown_airframe_gets_a_profile_from_its_own_acf() {
+        let acf = "\
+A
+1100
+ACF
+P acf/_ICAO RV10
+P acf/_name Van's RV-10
+P acf/_Vs_kts 65.000000000
+P acf/_Vso_kts 50.000000000
+P acf/_Vfe1_kts 96.000000000
+P acf/_Vfem_kts 87.000000000
+P acf/_Vno_kts 156.000000000
+P acf/_Vne_kts 200.000000000
+P acf/_Vle_kts 9.9999E4
+P acf/_Vx_kts 78.000000000
+P acf/_Vy_kts 90.000000000
+P acf/_Vbg_kts 85.000000000
+P acf/_Va_kts 0.000000000
+P acf/_flap_detents 2
+P acf/_flap1_dn/0 0.000000000
+P acf/_flap1_dn/1 10.000000000
+P acf/_flap1_dn/2 30.000000000
+P acf/_flap1_dn/3 0.000000000
+P acf/_m_empty 1700.000000000
+P acf/_m_max 2700.000000000
+P _engn/0/_type RCP_INJ
+";
+        let p = super::generic_from_acf("RV10", acf);
+        assert_eq!(p.id, "generic_rv10");
+        assert!(p.display_name.contains("(no profile)"), "{}", p.display_name);
+        assert_eq!(p.vs_clean_kts, Some(65.0));
+        assert_eq!(p.vne_kts, Some(200.0));
+        assert!(!p.retractable_gear, "Vle 99999 is fixed gear");
+        assert!(!p.carb_heat, "injected");
+        assert!(p.magnetos, "still a piston");
+        let r = p.reference.as_ref().unwrap();
+        // 1.3 Vso is 65 — the clean stall. 1.2 Vs is 78, and that is the floor.
+        assert_eq!(r.approach_kts, Some(78.0));
+        assert_eq!(r.vr_kts, Some(72.0));
+        assert_eq!(
+            (r.vno_kts, r.vx_kts, r.vy_kts, r.vs0_kts),
+            (Some(156.0), Some(78.0), Some(90.0), Some(50.0))
+        );
+        assert_eq!(r.va_kts, Some(99.0), "a zero placard keeps the base's figure");
+        assert_eq!(r.cruise_ias_kts, Some(133.0));
+        assert_eq!(r.max_gross_lb, Some(2700.0));
+        assert_eq!(r.useful_load_lb, Some(1000.0));
+        assert_eq!(r.takeoff_distance_ft, None, "not in the acf: not recited");
+        let flaps = p.flaps.as_ref().unwrap();
+        let d: Vec<(String, f64, Option<f64>)> = flaps
+            .detents
+            .iter()
+            .map(|d| (d.label.clone(), d.ratio, d.vfe_kts))
+            .collect();
+        assert_eq!(
+            d,
+            vec![
+                ("up".into(), 0.0, None),
+                ("10".into(), 0.3333, Some(96.0)),
+                ("full".into(), 1.0, Some(87.0)),
+            ]
+        );
+        assert!(p.checklist.is_none(), "the 172's checklist is not this aircraft's");
+    }
+
+    #[test]
+    fn the_start_gate_scales_with_the_system_voltage() {
+        super::publish_bus_volts(None);
+        assert!((super::min_start_volts() - 23.0).abs() < 1e-9, "24 volt default");
+        super::publish_bus_volts(Some(12.0));
+        assert!((super::min_start_volts() - 11.5).abs() < 1e-9, "a healthy 12 is not low");
+        super::publish_bus_volts(None);
     }
 }

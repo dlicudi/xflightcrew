@@ -946,6 +946,21 @@ pub const GLIDEPATH_FT_PER_NM: f64 = 318.0;
 const TOUCHDOWN_AIM_NM: f64 = 300.0 / M_PER_NM;
 /// Final approach point: intercept the extended centreline this far out (nm).
 const FAP_NM: f64 = 5.0;
+/// Can a final still be made from `xtk_nm` off the centreline with `along_nm`
+/// to run — will the pursuit's steepest cut close the offset, with margin,
+/// before the threshold? The circuit asks exactly this before it hands over
+/// (`circuit::interceptable`); below the terrain floor autoland asks it of
+/// itself. A 370 m offset at 0.8 nm passes (the pursuit flies that out); the
+/// Gibraltar handoff's 1,660 m at 1.5 nm does not. See the balk in [`guidance`].
+/// The gate applies on the approach side with this much still to run: closer
+/// in, the flare gate and the pursuit's own short-final law own the question
+/// (and past the threshold the along-track is negative, which the intercept
+/// sum would read as "can't", over a landing that is already happening).
+const STABILISED_MIN_ALONG_NM: f64 = 0.3;
+
+pub fn stabilised_xtk(xtk_nm: f64, along_nm: f64) -> bool {
+    crate::circuit::interceptable(xtk_nm * M_PER_NM, along_nm * M_PER_NM)
+}
 /// Airspeed this far below the approach speed triggers speed protection (nose
 /// down to regain it), before the decay reaches a stall and disconnects the AP.
 /// Approach speed is already ~1.3×Vs, so this margin still stays well above stall.
@@ -1592,6 +1607,34 @@ pub fn guidance(
             // with. The 22 ft flare-gate balk arrested nothing — the aircraft
             // still skimmed the ground at 91 kt before climbing (2026-07-22).
             (ApproachPhase::Intercept, rwy.course_deg)
+        } else if along_nm > STABILISED_MIN_ALONG_NM
+            && radio_alt_ft >= TERRAIN_FLOOR_AGL_FT
+            && !stabilised_xtk(xtk, along_nm)
+        {
+            // Inside the FAP but not somewhere a final can be flown from:
+            // reposition to the join point out along the centreline, the
+            // way the alt_err branch above does. "Land the aircraft" from
+            // 1.5 nm abeam Gibraltar's 09 used to be called FINAL here — a
+            // saturated 35 degree cut, the speed schedule pulling the RV-10
+            // to its 65 kt "approach speed", and a stall (2026-09-11).
+            let (jlat, jlon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, join_nm);
+            (
+                ApproachPhase::Intercept,
+                bearing_deg(cur_lat, cur_lon, jlat, jlon),
+            )
+        } else if radio_alt_ft < TERRAIN_FLOOR_AGL_FT
+            && (STABILISED_MIN_ALONG_NM..FAP_NM).contains(&along_nm)
+            && !stabilised_xtk(xtk, along_nm)
+        {
+            // Below the terrain floor and not laterally stabilised: a balk
+            // with height in hand. That flare gate above was the ONLY lateral
+            // balk, so a final that never converged (handed off 50 degrees
+            // off at Gibraltar) flew to 95 ft still 306 m off the centreline,
+            // went around with a 470 fpm sink and full flap, and hit the
+            // North Front four seconds later (2026-09-11). Inside the FAP
+            // only: further out the intercept is still legitimately wide,
+            // and radio height alone means nothing over rising ground.
+            (ApproachPhase::Intercept, rwy.course_deg)
         } else {
             (
                 ApproachPhase::Final,
@@ -1789,6 +1832,42 @@ mod tests {
         );
         // Near the target the floor still holds a gentle squeeze on.
         assert!(rollout_brake_ratio(12.0, 10.0, 800.0) >= 0.2);
+    }
+
+    // Gibraltar 2026-09-11: the only lateral balk was the flare gate under
+    // 100 ft, so a final that never converged flew to 95 ft still 306 m off
+    // the centreline, went around with no height in hand, and hit the North
+    // Front. Below the terrain floor, off the course is a go-around.
+    #[test]
+    fn an_unstabilised_final_balks_with_height_in_hand() {
+        let rwy = rwy_north();
+        // The crash geometry at the floor: 1.5 nm out, 480 ft, 0.9 nm right.
+        let (clat, clon) = project_latlon(0.0, 0.0, 180.0, 1.5);
+        let (lat, lon) = project_latlon(clat, clon, 90.0, 0.9);
+        let g = guidance(lat, lon, 480.0, 480.0, 90.0, 100.0, &rwy, 100.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Intercept, "balk at the floor, not at the flare gate");
+        // A normal final 40 m off at the same point: still on final.
+        let (lat, lon) = project_latlon(clat, clon, 90.0, 0.02);
+        let g = guidance(lat, lon, 480.0, 480.0, 90.0, 100.0, &rwy, 100.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Final);
+        // Above the floor the same geometry is not a balk but a REPOSITION:
+        // steer out to the join point instead of calling it final. The RV-10
+        // "Land the aircraft" at 1.5 nm abeam, 660 ft (2026-09-11).
+        let (clat, clon) = project_latlon(0.0, 0.0, 180.0, 1.06);
+        let (lat, lon) = project_latlon(clat, clon, 90.0, 1.06);
+        let g = guidance(lat, lon, 660.0, 660.0, 120.0, 120.0, &rwy, 80.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Intercept, "not a final from there");
+        // The join point lies down the extended centreline, south of us and
+        // west: a heading in the south-west quadrant, never the runway's.
+        assert!((160.0..=260.0).contains(&g.target_heading_deg), "{}", g.target_heading_deg);
+
+        // The rule itself: the offset the steepest cut can still close with
+        // margin in the distance left. No opinion outside the FAP (an
+        // intercept is allowed to be wide out there).
+        assert!(!stabilised_xtk(0.9, 1.5), "the Gibraltar handoff");
+        assert!(stabilised_xtk(0.10, 1.5));
+        assert!(stabilised_xtk(0.2, 0.8), "the pursuit flies this one out");
+        assert!(!stabilised_xtk(0.2, 0.3));
     }
 
     /// The flare is entered from a roundout, never from a level float. Past

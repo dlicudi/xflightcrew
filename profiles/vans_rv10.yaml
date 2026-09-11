@@ -1,0 +1,151 @@
+# Aircraft profile — X-Plane 12 stock Van's RV-10 (Laminar).
+# Loaded when X-Plane reports acf_ICAO "RV10" (XCOPILOT_AIRCRAFT=auto).
+#
+# Written the day after the RV-10 flew on the Cessna 172's numbers because no
+# profile existed (2026-09-11): the 172 fallback's 65 kt approach speed is the
+# RV-10's CLEAN stall speed, so the emergency autoland slowed it into a stall
+# at 63 kt with a third of flap; the 172's 85 kt flap limit refused flaps at
+# 89 kt on an airframe placarded 96; and the engine start called a healthy
+# 12 volt system "low" against the 172's 24 volt threshold.
+#
+# Numbers, and where they come from:
+#   - RV-10.acf — what the flight model actually flies (V-speeds, the two flap
+#     detents, fixed gear, injected engine, 2,700 lb). Where the POM disagrees
+#     the acf wins, the same rule as the Baron: the model stalled at 63-65 kt
+#     with a third of flap, which is the acf's Vs 65, not the POM's 60.
+#   - X-Plane_RV-10_Pilot_Operating_Manual.pdf, shipped with the aircraft —
+#     the recited reference card (Vr, Va, crosswind, weights, burn, ceiling).
+# Systems are stock except the ones its xlua overrides: the fuel selector
+# (laminar/rv10/tank_sel_left / _right, position 0 / 3), the dome lights,
+# seat heat and the autopilot knob. Everything else here is stock datarefs.
+
+id: vans_rv10
+display_name: Van's RV-10
+
+autopilot: true        # G1000 / GFC 700-style AP (_autopilot_logic 11). VERIFY LIVE.
+ils: true
+engine: true           # set_throttle / set_mixture (IO-540, RCP_INJ)
+barometer: true
+directional_gyro: false # glass: the G1000 HSI needs no DG sync
+com_radio: true
+com2_radio: true
+nav_radio: true
+transponder: true
+parking_brake: true
+pitot_heat: true
+pitch_trim: true
+retractable_gear: false # fixed gear (acf Vle 99999 = no gear limit)
+carb_heat: false        # fuel injected — no carburettor heat
+magnetos: true
+fuel_pump: true
+flood_lights: true
+cabin_crew: false       # four seats, one pilot, no interphone
+
+# X-Plane models the RV-10 as a 12 volt system: a healthy pre-start bus reads
+# ~12 volts, which the 172's 23 volt start gate called "low".
+bus_volts_nominal: 12.0
+
+electrical:
+  - key: battery
+    spoken: battery
+    on_commands:  [sim/electrical/battery_1_on]
+    off_commands: [sim/electrical/battery_1_off]
+    readback:     [sim/cockpit/electrical/battery_on]
+  - key: alternator
+    spoken: alternator
+    on_commands:  [sim/electrical/generator_1_on]
+    off_commands: [sim/electrical/generator_1_off]
+    readback:     ["sim/cockpit/electrical/generator_on[0]"]
+  - key: avionics
+    spoken: avionics master
+    on_commands:  [sim/systems/avionics_on, sim/electrical/cross_tie_on]
+    off_commands: [sim/systems/avionics_off, sim/electrical/cross_tie_off]
+    readback:     [sim/cockpit/electrical/avionics_on, sim/cockpit2/electrical/cross_tie]
+  - key: master
+    spoken: master
+    on_commands:  [sim/electrical/battery_1_on, sim/electrical/generator_1_on]
+    off_commands: [sim/electrical/battery_1_off, sim/electrical/generator_1_off]
+    readback:     [sim/cockpit/electrical/battery_on, "sim/cockpit/electrical/generator_on[0]"]
+
+# Left/right only — no BOTH on an RV-10. The xlua owns the selector: its
+# position dataref is laminar/rv10/switch/fuel_tank_pos (0 left, 3 right) and
+# the stock fuel_selector commands do nothing to it.
+fuel_selector:
+  readback: laminar/rv10/switch/fuel_tank_pos
+  positions:
+    - { key: left,  spoken: left,  command: laminar/rv10/tank_sel_left,  value: 0 }
+    - { key: right, spoken: right, command: laminar/rv10/tank_sel_right, value: 3 }
+
+# Constant-speed prop (acf _prop_type 1), IO-540 red line 2,700.
+prop:
+  dataref: sim/cockpit2/engine/actuators/prop_rotation_speed_rad_sec_all
+  max_rpm: 2700
+  cruise_rpm: 2400
+  min_rpm: 2000
+
+fuel:
+  reserve_caution_min: 45.0
+  reserve_warning_min: 30.0
+  cruise_burn_kg_hr: 30.0   # POM: 11 US gal/hr at cruise
+
+vs_clean_kts: 65.0          # acf Vs (the model's clean stall; POM says 60)
+vne_kts: 200.0
+
+reference:
+  kind: single-engine aircraft
+  vno_kts: 156.0            # acf (the POM's 188 is not what the model flies)
+  va_kts: 125.0             # POM
+  vx_kts: 78.0              # acf (POM 65)
+  vy_kts: 90.0              # acf (POM 103)
+  vr_kts: 65.0              # POM
+  best_glide_kts: 85.0      # acf and POM agree
+  vs0_kts: 50.0             # acf (POM 56)
+  approach_kts: 80.0        # 1.3 x Vs with flap; Van's own final-approach figure
+  max_crosswind_kts: 25.0   # POM, demonstrated
+  cruise_kts: 165.0         # 75% cruise TAS (POM max cruise 175)
+  cruise_ias_kts: 140.0     # what the cruise-power governor holds, below Vno. VERIFY in-sim
+  best_climb_fpm: 1400.0
+  max_gross_lb: 2700.0      # acf
+  empty_weight_lb: 1700.0   # acf (POM basic empty 1,520)
+  useful_load_lb: 1000.0
+  service_ceiling_ft: 20000.0
+  fuel_capacity_gal: 60.0
+  fuel_useable_gal: 58.0
+  endurance_hours: 4.5
+  takeoff_distance_ft: 1200.0
+  landing_distance_ft: 1300.0
+  max_rpm: 2700.0
+  oil_temp_min_f: 100.0
+  oil_temp_max_f: 245.0
+  oil_press_min_psi: 55.0
+  oil_press_max_psi: 95.0
+
+advisor:
+  - dataref: sim/cockpit2/switches/taxi_light_on
+    phases: [ground]
+    say: Taxi light on.
+    command: sim/lights/taxi_lights_on
+  - dataref: sim/cockpit2/switches/strobe_lights_on
+    phases: [takeoff, climb, cruise, approach, landing]
+    say: Strobes on.
+    command: sim/lights/strobe_lights_on
+  - dataref: sim/cockpit2/switches/landing_lights_on
+    phases: [takeoff, approach, landing]
+    say: Landing light on.
+    command: sim/lights/landing_lights_on
+
+# Two detents in the acf: 10 degrees (ratio 0.333) and 30 (full). Vfe from
+# the acf: 96 for the first notch, 87 full.
+flaps:
+  takeoff_ratio: 0.0
+  detents:
+    - { label: up,   spoken: up,          ratio: 0.0 }
+    - { label: "10", spoken: ten degrees, ratio: 0.3333, vfe_kts: 96.0 }
+    - { label: full, spoken: full,        ratio: 1.0,    vfe_kts: 87.0 }
+
+lights:
+  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on, command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
+  - { key: beacon,  spoken: beacon,            dataref: sim/cockpit2/switches/beacon_on,            command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
+  - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
+  - { key: landing, spoken: landing light,     dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+  - { key: taxi,    spoken: taxi light,        dataref: sim/cockpit2/switches/taxi_light_on,        command_on: sim/lights/taxi_lights_on,    command_off: sim/lights/taxi_lights_off }
