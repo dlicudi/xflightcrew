@@ -65,6 +65,19 @@ pub(crate) static PENDING_LINE_UP: Mutex<bool> = Mutex::new(false);
 /// coach can never keep suggesting the readback of a cancelled clearance.
 pub(crate) static PENDING_GO_AROUND: Mutex<bool> = Mutex::new(false);
 
+/// A CONDITIONAL line-up's condition, as the world sees it: `Some(false)`
+/// while the named arrival is still on final, `Some(true)` once it is down on
+/// the strip or gone, `None` when no conditional line-up stands. Published by
+/// the release watch every tick, so the crew waits on the world's picture of
+/// the traffic and never on its own guess.
+pub(crate) static LINE_UP_CONDITION: Mutex<Option<bool>> = Mutex::new(None);
+
+/// The after-takeoff handoff the tower spoke ("contact Malaga Departure on
+/// one two one decimal zero two five"): the station's spoken name and its
+/// frequency, armed once when the line goes out and consumed by the crew
+/// that works the radio.
+pub(crate) static DEPARTURE_HANDOFF: Mutex<Option<(String, i64)>> = Mutex::new(None);
+
 /// The runway the APPROACH controller cleared you toward and handed to the
 /// tower ("cleared visual/ILS approach runway X, contact Tower"). You still
 /// owe the tower a "final" report before you're cleared to LAND — an approach
@@ -148,6 +161,21 @@ pub fn assigned_squawk() -> Option<i64> {
 /// A takeoff clearance is currently being withheld for traffic.
 pub fn takeoff_hold_armed() -> bool {
     lock(&TAKEOFF_HOLD).is_some()
+}
+
+/// The condition of a CONDITIONAL line-up ("behind the landing X, line up
+/// behind"): `Some(false)` while X is still on final, `Some(true)` once it
+/// has passed, `None` when the standing line-up is unconditional or there is
+/// none. A crew about to cross the hold line waits on `Some(false)`.
+pub fn line_up_condition_clear() -> Option<bool> {
+    *lock(&LINE_UP_CONDITION)
+}
+
+/// Consume the after-takeoff handoff the tower spoke: the station to call
+/// ("Malaga Departure") and its frequency in kHz. The crew that works the
+/// radio reads it back, retunes, and checks in.
+pub fn take_departure_handoff() -> Option<(String, i64)> {
+    lock(&DEPARTURE_HANDOFF).take()
 }
 
 /// The callsign under approach vectors, if a plan is armed.

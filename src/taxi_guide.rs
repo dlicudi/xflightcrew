@@ -634,6 +634,32 @@ pub(crate) fn project(path: &[(f64, f64)], lat: f64, lon: f64) -> Option<(f64, f
 /// read as forward motion during a pushback: an unsigned quantity standing in
 /// for a signed one reads plausibly and is wrong half the time.
 pub(crate) fn project_signed(path: &[(f64, f64)], lat: f64, lon: f64) -> Option<(f64, f64)> {
+    project_signed_with(path, lat, lon, None)
+}
+
+/// [`project_signed`] onto the part of the route that runs the way the
+/// aircraft is FACING (segments within 90 degrees of `heading_true`), falling
+/// back to the plain nearest when none does. For joining a route: the nearest
+/// paint can be a leg already behind the nose. After a pushback that stopped
+/// 60 m short of its node, the plain projection put the Baron on the
+/// stand-to-node leg it had just been pushed down, and the join drove a
+/// loop back to the node before setting off (Malaga, 12:11Z, 2026-09-11).
+pub(crate) fn project_signed_facing(
+    path: &[(f64, f64)],
+    lat: f64,
+    lon: f64,
+    heading_true: f64,
+) -> Option<(f64, f64)> {
+    project_signed_with(path, lat, lon, Some(heading_true))
+        .or_else(|| project_signed_with(path, lat, lon, None))
+}
+
+fn project_signed_with(
+    path: &[(f64, f64)],
+    lat: f64,
+    lon: f64,
+    facing: Option<f64>,
+) -> Option<(f64, f64)> {
     if path.len() < 2 {
         return None;
     }
@@ -647,6 +673,12 @@ pub(crate) fn project_signed(path: &[(f64, f64)], lat: f64, lon: f64) -> Option<
         let (a, b) = (w[0], w[1]);
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
         let len2 = dx * dx + dy * dy;
+        if let Some(hdg) = facing {
+            if len2 >= 1.0 && angle_diff(bearing(a, b), hdg).abs() > 90.0 {
+                cum += len2.sqrt();
+                continue;
+            }
+        }
         let t = if len2 < 1.0 {
             0.0
         } else {
@@ -679,6 +711,30 @@ mod tests {
     fn ll(x_m: f64, y_m: f64) -> (f64, f64) {
         let g = Geo::new(LAT0);
         (LAT0 + y_m / g.m_per_deg_lat, LON0 + x_m / g.m_per_deg_lon)
+    }
+
+    /// The pushback that let go early (Malaga, 2026-09-11): the route runs
+    /// stand → node (south, 120 m) → off to the north-west. The aircraft sits
+    /// 60 m down the first leg, 15 m west of it, already facing north-west.
+    /// The nearest paint is the leg behind its tail; the leg it should join
+    /// is the one it is facing.
+    #[test]
+    fn a_join_projects_onto_the_leg_the_nose_points_along() {
+        // Node at (0,-120); the NW leg runs from it toward (-100, -70).
+        let route = [ll(0.0, 0.0), ll(0.0, -120.0), ll(-100.0, -70.0)];
+        let (lat, lon) = ll(-15.0, -60.0);
+        let (along_plain, _) = project_signed(&route, lat, lon).unwrap();
+        assert!((along_plain - 60.0).abs() < 1.0, "nearest paint: the stand leg, {along_plain}");
+        let nw = bearing((0.0, -120.0), (-100.0, -70.0));
+        let (along_facing, off) = project_signed_facing(&route, lat, lon, nw).unwrap();
+        assert!(along_facing > 120.0, "facing NW: the NW leg, {along_facing}");
+        assert!(off.abs() < 60.0, "within joining distance: {off}");
+        // Facing the way the stand leg runs, the plain answer stands.
+        let (along_south, _) = project_signed_facing(&route, lat, lon, 180.0).unwrap();
+        assert!((along_south - 60.0).abs() < 1.0, "{along_south}");
+        // No leg runs the way we face: the plain nearest, never nothing.
+        let east = [ll(0.0, 0.0), ll(200.0, 0.0)];
+        assert!(project_signed_facing(&east, ll(100.0, 5.0).0, ll(100.0, 5.0).1, 270.0).is_some());
     }
 
     /// Right of the route is positive, left is negative, and the plain

@@ -1101,6 +1101,65 @@ cruise schedule (cost index / mach / planned TAS) is the part that is
 still future work. Everything blackboxes as `"kind":"full_auto"` /
 `"circuit"` / `"procedure"`.
 
+**The Gibraltar straight-in that wasn't (LEMG-LXGB, 12:46Z, 2026-09-11).** Full
+auto flew a Baron 58 gate to gate and crashed it into the North Front four
+seconds into a go-around. The chain: LXGB has no coded approach, so the arrival
+reconstructed a "straight-in" to 09 from the `09D05`/`09D06` DME fixes — and
+those fixes are on the VOR/DME approach's OFFSET track, 50 degrees south of the
+extended centreline (the ident says "runway 09, 5 DME", not "on the 09
+course"). The follower flew them faithfully, handed autoland the aircraft at
+the FAF 3.6 km abeam with 5.5 km to run, and autoland's 35 degree cut needs
+5.1 km to close 3.6 km: a saturated final that was still 306 m off at 95 ft,
+"Going around", and the wreck. Two aggravators rode along. An approach plan
+had `cruise_ias_kts: None` ("manages its own speed") while the enroute
+governor had just been released, so the throttle stayed at cruise power down
+the whole straight-in: 195 kt at the handoff on a 100 kt approach, and autoland
+put the gear and flaps out at once against placards of 152. And afterwards the
+sim's `has_crashed` left the airframe "on the ground", autoland read the stop as
+a rollout, and full auto said "On the ground. I'll clear the runway", called
+for taxi, and armed auto taxi on the wreckage. Fixes, each with a test:
+`reconstruct_approach` keeps only DME fixes within `RECON_ALIGN_DEG` (10) of
+the reciprocal course (the real 09 fixes yield NO straight-in, the visual
+autoland takes it; the 27 fixes are on course and still reconstruct);
+`approach_plan_for` refuses any FAF that fails the circuit's `interceptable`
+test (`faf_off_course`); `power_hold_target` arms the governor at the clean
+approach speed (1.45 x Vapp) for approach plans and lets go BEFORE autoland's
+throttle law starts; the gear waits for the profile's VLO and each flap detent
+for its Vfe (`gear_may_extend`, `flap_within_limits`, published per airframe
+next to the thrust-lever selector); `taxi_in_after_landing` reads
+`has_crashed`. Six more from the same sortie, fixed the same day, each with a
+test: (1) the conditional line-up ("behind the landing Bee-line, line up
+behind") was flown as unconditional — full auto rolled five seconds after the
+words with the lander at 2.4 nm, and reached the pavement 15 s after the
+touchdown only because the line-up crawled for 85 s. The release watch now
+publishes the condition every tick (`LINE_UP_CONDITION`: the named arrival is
+off the final) and full auto waits on `line_up_condition_clear()` before
+crossing the hold line. (2) "Contact Malaga Departure on 121.025" had no crew
+consumer: no readback, no retune, and the flight heard Malaga's party line for
+thirteen minutes until the region swap. `handoff_tick` now publishes the
+station and frequency (`take_departure_handoff`), and the enroute wait reads
+it back on the tower frequency, retunes, and checks in with altitude
+(`departure_check_in`, shaped to earn "radar contact"). (3) The inbound call
+went out three seconds BEFORE the region swapped to Gibraltar: void, and the
+zone watch challenged the arrival as unknown traffic. The call now waits for
+`home_tower_khz` to become the tuned frequency (45 s bound). (4) The first
+approach leg's 1,397 ft was dialled 25 nm out and the aircraft flew 18 nm level
+at 1,400 ft across the Strait past Europa Point; `descent_target_ft` holds the
+previous target until the 700 fpm top of descent. (5) SimBrief charted MG834
+at 3,900 between two 4,000 ft fixes and the dial dipped for nothing; a fix
+within 300 ft of cruise is cruise. (6) The tug let go 60 m short of its node
+with the heading already right, the plain projection put the aircraft on the
+stand-to-node leg behind its tail, and the join drove a loop back to the node;
+a join now projects along the nose (`project_signed_facing`). (7) The 6 kt
+line-up pace coasted to a dead stop three times in 205 m: at 6.9 kt building
+0.9 kt/s the projection called it 3 kt over, idle-and-brake followed, prop
+drag stopped the Baron, and the rebuild from idle repeated it. Idle-and-brake
+now needs the speed to actually be 2 kt over unless the build is a surge
+(1.2 kt/s), and a trim that has taken leaves the lever alone. Still unowned:
+the zone clearance's "not above two thousand feet" (neither side carries the
+altitude limit) and the squawk watch's "radar contact" spoken before the
+handoff.
+
 Depth (added 2026-07-28): **the approach is sized for the airframe, and a
 missed approach is a procedure**. One MD-82 circuit at Luton exposed four
 faults in a row, and they compound: the pattern delivered the aircraft LOW,

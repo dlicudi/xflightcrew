@@ -857,15 +857,22 @@ pub fn run_autoland(
 
                 // Config: gear down inside 6 nm; flaps by distance AND vertical
                 // state (full only once on the path — see [`flap_schedule`]).
-                // Written only when the target changes, so the setting isn't
-                // re-asserted against the pilot every tick.
-                if !gear_down && g.dist_nm < 6.0 {
+                // Both wait for the speed the placard allows (the profile's
+                // VLO and per-detent Vfe): a fast handoff slows first and
+                // configures as the limits open up. Written only when the
+                // target changes, so the setting isn't re-asserted against the
+                // pilot every tick.
+                if !gear_down
+                    && g.dist_nm < 6.0
+                    && gear_may_extend(ias, crate::aircraft::gear_limit_kts())
+                {
                     let _ = xp.set_float(GEAR_HANDLE, 1.0).await;
                     gear_down = true;
                 }
                 // Go-around flap: half, whatever the schedule says — full flap
                 // won't climb, and clean this low gives the sink away.
-                let flap = if ga { 0.5 } else { flap_schedule(g.dist_nm, alt - g.glidepath_alt_ft) };
+                let wanted = if ga { 0.5 } else { flap_schedule(g.dist_nm, alt - g.glidepath_alt_ft) };
+                let flap = flap_within_limits(wanted, ias, &crate::aircraft::flap_limits());
                 if last_flap != Some(flap) {
                     last_flap = Some(flap);
                     let _ = xp.set_float(FLAP_RATIO, flap).await;
@@ -908,7 +915,7 @@ pub fn run_autoland(
                             }
                         }
                         ApproachPhase::Intercept => "Intercepting the final approach.",
-                        ApproachPhase::Final => "Established on final, gear and flaps down.",
+                        ApproachPhase::Final => "On final. Gear and flaps as the speed allows.",
                         ApproachPhase::Flare => "Over the threshold, flaring, power to idle.",
                     };
                     announce(line.into(), Priority::Caution);
@@ -959,10 +966,43 @@ const CLEAN_APPROACH_RATIO: f64 = 1.45;
 /// down at 6 nm, inside this ramp, so it extends well below Vlo.
 const DECEL_START_NM: f64 = 10.0;
 
+/// The clean manoeuvring speed for an airframe with this approach speed — what
+/// autoland flies outside the deceleration ramp, and what the procedure
+/// follower holds down a straight-in so the FAF handoff arrives at a speed
+/// autoland expects.
+pub fn clean_approach_ias(approach_ias: f64) -> f64 {
+    approach_ias * CLEAN_APPROACH_RATIO
+}
+
+/// May the gear come down at this speed? The profile's VLO/VLE gates it; a
+/// profile with no figure never gates. Autoland used to lower the gear the
+/// moment it was inside 6 nm whatever the speed: 195 kt on a Baron placarded
+/// 152 (2026-09-11).
+pub fn gear_may_extend(ias_kts: f64, vlo_kts: Option<f64>) -> bool {
+    vlo_kts.is_none_or(|v| ias_kts <= v)
+}
+
+/// The most flap the schedule's `wanted` ratio allows at this speed: the
+/// deepest detent at or below `wanted` whose placard Vfe the speed respects.
+/// `limits` is the profile's detents as `(ratio, Vfe)`, retracted first; a
+/// detent with no Vfe never gates, and an empty list (no flap profile) hands
+/// `wanted` straight back. The setting is held back, not skipped: as the speed
+/// bleeds off, the schedule's target becomes legal and goes out then.
+pub fn flap_within_limits(wanted: f64, ias_kts: f64, limits: &[(f64, Option<f64>)]) -> f64 {
+    if limits.is_empty() {
+        return wanted;
+    }
+    limits
+        .iter()
+        .filter(|(ratio, vfe)| *ratio <= wanted + 1e-6 && vfe.is_none_or(|v| ias_kts <= v))
+        .map(|(ratio, _)| *ratio)
+        .fold(0.0, f64::max)
+}
+
 /// Speed to command at this distance: clean far out, approach speed by the FAP,
 /// linear between. Pure, so the schedule is testable without a sim.
 pub fn scheduled_ias(dist_nm: f64, approach_ias: f64) -> f64 {
-    let clean = approach_ias * CLEAN_APPROACH_RATIO;
+    let clean = clean_approach_ias(approach_ias);
     if dist_nm >= DECEL_START_NM {
         clean
     } else if dist_nm <= FAP_NM {
@@ -3176,6 +3216,25 @@ mod tests {
         assert_eq!(r.surface, 22);
         assert!(r.dist_nm < 5.0, "it is right there: {:.1} nm", r.dist_nm);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Gibraltar 2026-09-11: the straight-in handed off at 195 kt and the gear
+    // and flaps went out at once, 40 kt over the Baron's placards. The config
+    // now waits for the speed the profile allows and goes out as it decays.
+    #[test]
+    fn gear_and_flaps_wait_for_their_placard_speeds() {
+        // Baron 58: VLO 152, approach flap Vfe 152, full flap Vfe 122.
+        const BARON: [(f64, Option<f64>); 3] = [(0.0, None), (0.5, Some(152.0)), (1.0, Some(122.0))];
+        assert!(!gear_may_extend(195.0, Some(152.0)), "no gear at 195 on a 152 placard");
+        assert!(gear_may_extend(150.0, Some(152.0)));
+        assert!(gear_may_extend(195.0, None), "no figure, no gate (the old behaviour)");
+
+        assert_eq!(flap_within_limits(0.5, 195.0, &BARON), 0.0, "held clean at 195");
+        assert_eq!(flap_within_limits(0.5, 145.0, &BARON), 0.5, "approach flap once under 152");
+        assert_eq!(flap_within_limits(1.0, 130.0, &BARON), 0.5, "full wanted, 130 kt: only approach");
+        assert_eq!(flap_within_limits(1.0, 100.0, &BARON), 1.0, "full flap under 122");
+        assert_eq!(flap_within_limits(0.0, 195.0, &BARON), 0.0, "retraction never gated");
+        assert_eq!(flap_within_limits(1.0, 195.0, &[]), 1.0, "no flap profile: schedule stands");
     }
 
     // The approach speed is what you cross the threshold at, NOT what you fly

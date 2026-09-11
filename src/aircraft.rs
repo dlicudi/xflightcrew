@@ -1081,6 +1081,31 @@ pub fn publish_throttle_dataref(dref: Option<String>) {
     *THROTTLE_DREF.lock().unwrap_or_else(|e| e.into_inner()) = dref;
 }
 
+/// The configuration placards autoland extends the gear and flaps against:
+/// VLO/VLE, and each flap detent's `(ratio, Vfe)`. Republished on every
+/// profile swap like the thrust lever, so a fast handoff on the next airframe
+/// is judged by ITS limits. Empty/`None` = the profile is silent, no gate.
+static GEAR_LIMIT_KTS: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+static FLAP_LIMITS: std::sync::Mutex<Vec<(f64, Option<f64>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Publish the airframe's gear and flap speed limits. Called on EVERY profile swap.
+pub fn publish_config_limits(vlo_kts: Option<f64>, flaps: Option<&FlapProfile>) {
+    *GEAR_LIMIT_KTS.lock().unwrap_or_else(|e| e.into_inner()) = vlo_kts;
+    *FLAP_LIMITS.lock().unwrap_or_else(|e| e.into_inner()) = flaps
+        .map(|f| f.detents.iter().map(|d| (d.ratio, d.vfe_kts)).collect())
+        .unwrap_or_default();
+}
+
+/// The live airframe's VLO/VLE, if its profile declares one.
+pub fn gear_limit_kts() -> Option<f64> {
+    *GEAR_LIMIT_KTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The live airframe's flap detents as `(ratio, Vfe)`, retracted first.
+pub fn flap_limits() -> Vec<(f64, Option<f64>)> {
+    FLAP_LIMITS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// The dataref every throttle write and read should use.
 ///
 /// The Citation X is why this exists. Its `CitX_throttle.lua` tracks

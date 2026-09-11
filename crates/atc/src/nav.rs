@@ -2372,6 +2372,35 @@ pub fn reconstruct_approach(
     if dfix.is_empty() {
         return Vec::new();
     }
+    // Only fixes ON the final approach course reconstruct a straight-in. The
+    // ident says "runway 09, 6 DME", not "on the 09 centreline": Gibraltar's
+    // 09D05/09D06 lie on the VOR/DME approach's offset track, 50 degrees
+    // south of the runway's extended centreline. Flown as a straight-in they
+    // handed autoland the aircraft 3.6 km abeam with 5.5 km to run, which its
+    // 35 degree cut cannot close: a saturated final, a go-around at 95 ft
+    // still 300 m off the centreline, and a crash into the North Front
+    // (12:46Z, 2026-09-11). A fix off the course is not a straight-in fix;
+    // with none left there is no straight-in, and the caller lands visually.
+    let Some(course) = runway_course_deg(airport, runway) else {
+        return Vec::new();
+    };
+    let inbound_from = (course + 180.0).rem_euclid(360.0);
+    dfix.retain(|(_, ident, lat, lon)| {
+        let brg = bearing_deg(thr_lat, thr_lon, *lat, *lon);
+        let off = ((brg - inbound_from + 540.0).rem_euclid(360.0) - 180.0).abs();
+        let aligned = off <= RECON_ALIGN_DEG;
+        if !aligned {
+            tracing::info!(
+                ident,
+                off_deg = off,
+                "DME fix is off the final approach course, not a straight-in fix"
+            );
+        }
+        aligned
+    });
+    if dfix.is_empty() {
+        return Vec::new();
+    }
     // Farthest DME first (fly inbound); the innermost is the FAF.
     dfix.sort_by_key(|item| std::cmp::Reverse(item.0));
     let elev = airport.elev_ft;
@@ -2424,7 +2453,7 @@ pub fn reconstruct_approach(
 }
 
 /// The threshold position of runway `id` at `airport`, matching either end.
-fn runway_threshold(airport: &AirportInfo, id: &str) -> Option<(f64, f64)> {
+pub fn runway_threshold(airport: &AirportInfo, id: &str) -> Option<(f64, f64)> {
     airport.runways.iter().find_map(|r| {
         if runway_matches(&r.ident_a, id) {
             Some((r.lat_a, r.lon_a))
@@ -2435,6 +2464,40 @@ fn runway_threshold(airport: &AirportInfo, id: &str) -> Option<(f64, f64)> {
         }
     })
 }
+
+/// The landing course of runway `id` at `airport`, degrees true.
+pub fn runway_course_deg(airport: &AirportInfo, id: &str) -> Option<f64> {
+    airport.runways.iter().find_map(|r| {
+        if runway_matches(&r.ident_a, id) {
+            Some(r.heading_a_deg())
+        } else if runway_matches(&r.ident_b, id) {
+            Some(r.heading_b_deg())
+        } else {
+            None
+        }
+    })
+}
+
+/// A point in the runway frame: `(cross-track m, along-track m)` relative to
+/// the threshold, where along-track is positive on the APPROACH side (short of
+/// the threshold, still to fly) and cross-track is signed right of the inbound
+/// course. Where an approach fix sits relative to the final approach course.
+pub fn runway_frame_m(
+    thr_lat: f64,
+    thr_lon: f64,
+    course_deg: f64,
+    lat: f64,
+    lon: f64,
+) -> (f64, f64) {
+    let d_m = haversine_nm(thr_lat, thr_lon, lat, lon) * 1852.0;
+    let brg = bearing_deg(thr_lat, thr_lon, lat, lon);
+    let rel = (brg - (course_deg + 180.0)).to_radians();
+    (d_m * rel.sin(), d_m * rel.cos())
+}
+
+/// How far a DME fix's bearing from the threshold may stray from the runway's
+/// reciprocal course and still count as ON the final approach course.
+const RECON_ALIGN_DEG: f64 = 10.0;
 
 #[cfg(test)]
 mod tests {
@@ -3470,6 +3533,17 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
             "36.104666667 -5.405333333 09D05 LXGB LX 5906505 RWY09 D05"
         )
         .unwrap();
+        writeln!(
+            f,
+            "36.088000000 -5.404666667 09D06 LXGB LX 5906505 RWY09 D06"
+        )
+        .unwrap();
+        // A synthetic 09 fix that IS on the 09 centreline, 4 nm out.
+        writeln!(
+            f,
+            "36.148200000 -5.440600000 09D04 LXGB LX 5906505 RWY09 D04"
+        )
+        .unwrap();
         writeln!(f, "40.000000000 -3.000000000 27D05 LEMD LE 0 other field").unwrap();
         f.flush().unwrap();
 
@@ -3494,6 +3568,44 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
         assert!(!idents.contains(&"09D05"));
         // A runway with no DME fixes → nothing to reconstruct.
         assert!(reconstruct_approach(fix.to_str().unwrap(), &airport, "LXGB", "18").is_empty());
+
+        // Runway 09: the real 09D05/09D06 sit on the VOR/DME approach's offset
+        // track, ~50 degrees south of the centreline. They are NOT straight-in
+        // fixes (flying them as such crashed a Baron into the North Front,
+        // 2026-09-11); only the on-course 09D04 survives, and it is the FAF.
+        let legs = reconstruct_approach(fix.to_str().unwrap(), &airport, "LXGB", "09");
+        let idents: Vec<&str> = legs.iter().map(|l| l.fix_ident.as_str()).collect();
+        assert_eq!(idents, vec!["09D04", "RW09"], "off-course DME fixes dropped");
+        assert!(legs[0].is_faf);
+        let (xtk_m, along_m) = runway_frame_m(
+            36.1509, -5.3581, runway_course_deg(&airport, "09").unwrap(), 36.1482, -5.4406,
+        );
+        assert!(xtk_m.abs() < 100.0, "on the centreline: xtk {xtk_m:.0} m");
+        assert!((along_m - 4.0 * 1852.0).abs() < 200.0, "4 nm out: {along_m:.0} m");
+        // And the offset fix, in the same frame: abeam, not ahead.
+        let (xtk_m, along_m) = runway_frame_m(
+            36.1509, -5.3581, runway_course_deg(&airport, "09").unwrap(), 36.104666667, -5.405333333,
+        );
+        assert!(xtk_m.abs() > 4000.0, "09D05 is {xtk_m:.0} m off the centreline");
+        assert!(along_m < 5000.0, "with only {along_m:.0} m to run");
+    }
+
+    #[test]
+    fn no_on_course_dme_fixes_means_no_straight_in() {
+        let apt = std::env::temp_dir().join("xc-lxgb-apt-nofix.dat");
+        let mut f = std::fs::File::create(&apt).unwrap();
+        writeln!(f, "1 11 0 0 LXGB Gibraltar").unwrap();
+        writeln!(f, "100 46 0 0 0 0 0 0 09 36.1509000 -5.3581000 0 0 0 0 0 0 27 36.1515000 -5.3412000 0 0 0 0 0 0").unwrap();
+        f.flush().unwrap();
+        let fix = std::env::temp_dir().join("xc-lxgb-fix-nofix.dat");
+        let mut f = std::fs::File::create(&fix).unwrap();
+        writeln!(f, "36.104666667 -5.405333333 09D05 LXGB LX 5906505 RWY09 D05").unwrap();
+        writeln!(f, "36.088000000 -5.404666667 09D06 LXGB LX 5906505 RWY09 D06").unwrap();
+        f.flush().unwrap();
+        let airport = find_airport(apt.to_str().unwrap(), "LXGB").unwrap().unwrap();
+        // The live Gibraltar case: every 09 fix is off course, so there is no
+        // reconstruction at all and the arrival falls back to a visual landing.
+        assert!(reconstruct_approach(fix.to_str().unwrap(), &airport, "LXGB", "09").is_empty());
     }
 
     #[test]

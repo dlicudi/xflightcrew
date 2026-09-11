@@ -1073,6 +1073,7 @@ impl LiveProfile {
     fn new(p: aircraft::AircraftProfile) -> std::sync::Arc<Self> {
         tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
         aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
+        aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());
         std::sync::Arc::new(Self {
             inner: std::sync::RwLock::new(p),
             generation: std::sync::atomic::AtomicU64::new(0),
@@ -1101,6 +1102,7 @@ impl LiveProfile {
         // across a 172 -> Twin Otter change, 2026-07-27).
         tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
         aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
+        aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());
         *self.inner.write().unwrap() = p;
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);

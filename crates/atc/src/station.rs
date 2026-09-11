@@ -22,8 +22,9 @@ use sim::xplane::SimView;
 // and its tests) writes them by their bare names; the crew side reads via
 // `party_line`'s accessors, never these statics.
 pub(crate) use crate::party_line::{
-    ASSIGNED_SQUAWK, CLEARANCE, LANDING_HANDOFF, PENDING_GO_AROUND, PENDING_LINE_UP,
-    PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS,
+    ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, LANDING_HANDOFF, LINE_UP_CONDITION,
+    PENDING_GO_AROUND, PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, TAKEOFF_HOLD,
+    TAXI_ROUTE, TAXI_TO_STAND, VECTORS,
 };
 
 /// Which of the station's frequencies COM1 is tuned to.
@@ -278,6 +279,8 @@ impl Station {
         *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ACTIVE_PANEL.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((self.apt.name.clone(), self.apt.elev_ft, services(&self.apt)));
         *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = self.apt.runways.clone();
@@ -323,6 +326,8 @@ impl Station {
         *TAXI_ROUTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *TAXI_TO_STAND.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *VECTORS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *LANDING_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // The doc on the party line promises this one dies here.
@@ -669,6 +674,9 @@ impl Station {
                 // conditional/plain line-up put us there, so the watch owes a
                 // release, not another line-up.
                 lined_up: self.twr.state == tower::State::LinedUp,
+                behind: self.twr.pending().is_some_and(|p| {
+                    matches!(p.awaited, tower::Awaited::LineUp { behind: true, .. })
+                }),
             });
             // Name the runway: at a parallel-runway field "held for traffic"
             // is only diagnosable if you can see WHICH strip the watch is
@@ -904,6 +912,8 @@ impl Station {
                 atis::spoken_mhz(khz)
             ),
             min_alt_ft: self.apt.elev_ft + 700.0,
+            to: format!("{} {}", ctx.airport, name),
+            khz,
         });
         tracing::info!(to = name, "departure handoff armed");
     }
@@ -1849,6 +1859,10 @@ pub struct Handoff {
     pub line: String,
     /// Speak once climbing through this altitude (ft MSL, field + 700).
     pub min_alt_ft: f64,
+    /// The station handed to, as spoken ("Gibraltar Departure"), and its
+    /// frequency — published for the crew the moment the line goes out.
+    pub to: String,
+    pub khz: i64,
 }
 
 static HANDOFF: Mutex<Option<Handoff>> = Mutex::new(None);
@@ -1863,6 +1877,11 @@ pub fn handoff_tick(alt_ft: f64, on_ground: bool) -> Option<String> {
         return None;
     }
     let line = plan.line.clone();
+    // The crew that works the radio gets the instruction as data, not just
+    // as audio: a readback, a retune and a check-in are owed, and until this
+    // was published nothing on the crew side could do them — the Malaga
+    // departure stayed on tower for thirteen minutes (12:23Z, 2026-09-11).
+    *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = Some((plan.to.clone(), plan.khz));
     *guard = None;
     Some(line)
 }
@@ -3388,6 +3407,10 @@ pub struct TakeoffHold {
     /// runway with a line-up-and-wait. One shot: the aircraft can only take
     /// the runway once.
     lined_up: bool,
+    /// The line-up was CONDITIONAL ("behind the landing X, line up behind"):
+    /// the pavement is the pilot's only once X has passed. The watch
+    /// publishes that condition for the crew every tick.
+    behind: bool,
 }
 
 /// How much better another runway's headwind must be before the tower swaps
@@ -3439,6 +3462,7 @@ pub fn takeoff_hold_tick(
     // nobody — void it, silently.
     if !player_on_ground {
         *guard = None;
+        *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
         return None;
     }
     // Our strip, cloned out so the runway lock isn't held across the checks.
@@ -3460,6 +3484,14 @@ pub fn takeoff_hold_tick(
             .iter()
             .any(|t| t.on_ground && on_active_runway(t.lat, t.lon).is_some()),
     };
+    // A CONDITIONAL line-up's condition, for the crew: the named arrival has
+    // passed once it is off the final (down on the strip, or gone). Published
+    // every tick, cleared with the hold. The Baron at Malaga crossed the hold
+    // line five seconds after "behind the landing Bee-line, line up behind"
+    // with the lander at 2.4 nm, and only its 85 s crawl kept it off the
+    // pavement until 15 s after the touchdown (12:21Z, 2026-09-11).
+    *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) =
+        hold.behind.then(|| inbound.is_none());
     let traffic = match &rwy {
         Some(_) => on_strip || inbound.as_ref().is_some_and(|f| f.nm < DEPART_GAP_NM),
         // No geometry for the held runway: fall back to the blunt any-runway
@@ -3558,6 +3590,8 @@ pub fn takeoff_hold_tick(
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = true;
     *guard = None;
+    // Released: the clearance stands on its own, no condition left to wait on.
+    *LINE_UP_CONDITION.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Some(line)
 }
 
@@ -4596,14 +4630,7 @@ fn angle_diff_deg(a: f64, b: f64) -> f64 {
 /// An altitude spoken controller-style: 2000 → "two thousand", 1500 → "one
 /// thousand five hundred".
 fn spoken_alt(ft: f64) -> String {
-    let hundreds = ((ft / 100.0).round() as i64).max(1);
-    let (th, hu) = (hundreds / 10, hundreds % 10);
-    let word = |n: i64| atis::spoken_digits(&n.to_string());
-    match (th, hu) {
-        (0, h) => format!("{} hundred", word(h)),
-        (t, 0) => format!("{} thousand", word(t)),
-        (t, h) => format!("{} thousand {} hundred", word(t), word(h)),
-    }
+    atis::spoken_alt(ft)
 }
 
 /// Outcome of a named-station tuning request ("tune the tower").
@@ -5303,6 +5330,8 @@ mod tests {
                    zero decimal four."
                 .into(),
             min_alt_ft: 711.0,
+            to: "Gibraltar Departure".into(),
+            khz: 130_400,
         });
         *LANDING_HANDOFF.lock().unwrap() = Some("zero niner".into());
         *TAXI_TO_STAND.lock().unwrap() = true;
@@ -6149,6 +6178,7 @@ mod tests {
             armed_at: Instant::now(),
             logged_at: Instant::now(),
             lined_up: false,
+            behind: false,
         });
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
         *CLEARANCE.lock().unwrap() = Some(ClearanceSnap {
@@ -6252,6 +6282,7 @@ mod tests {
             armed_at: t0,
             logged_at: t0,
             lined_up: false,
+            behind: false,
         });
         assert!(takeoff_hold_tick(&[], elev, false, t0 + sec(120)).is_none());
         assert!(
@@ -6309,6 +6340,7 @@ mod tests {
             armed_at: t0,
             logged_at: t0,
             lined_up: false,
+            behind: false,
         });
         // An arrival on the 26L final: `nm` beyond the 26L threshold along the
         // extended centreline (landing westbound, so the approach lies east of
@@ -6446,6 +6478,7 @@ mod tests {
             armed_at: t0,
             logged_at: t0,
             lined_up: false,
+            behind: false,
         });
         // A heavy just rotated off our strip.
         let departed = |at: Instant| {
@@ -7579,12 +7612,20 @@ mod tests {
         // The takeoff clearance armed the handoff; airborne through 700 ft it
         // fires exactly once, to the departure frequency.
         assert!(handoff_tick(300.0, false).is_none(), "still low");
+        assert!(
+            crate::party_line::take_departure_handoff().is_none(),
+            "nothing published before the line is spoken"
+        );
         let line = handoff_tick(900.0, false).expect("handoff due");
         assert!(
             line.contains("Departure on one three zero decimal four"),
             "{line}"
         );
         assert!(handoff_tick(1500.0, false).is_none(), "spoken once");
+        // The crew gets the instruction as data: whom to call, on what.
+        let (to, khz) = crate::party_line::take_departure_handoff().expect("published for the crew");
+        assert_eq!((to.as_str(), khz), ("Gibraltar Departure", 130_400));
+        assert!(crate::party_line::take_departure_handoff().is_none(), "consumed once");
 
         // Scene 2: the departure controller. First readback is the check-in
         // and gets radar contact; later readbacks earn silence.
@@ -7808,10 +7849,11 @@ mod tests {
             TAKEOFF_HOLD.lock().unwrap().is_some(),
             "a conditional line-up owes the clearance: release watch armed"
         );
+        assert!(
+            TAKEOFF_HOLD.lock().unwrap().as_ref().is_some_and(|h| h.behind),
+            "the watch knows the line-up was conditional"
+        );
 
-        // The lander is down and gone: the watch releases the clearance
-        // after the clear window, and the FSM sync is queued for the main
-        // loop exactly like a plain hold.
         *ACTIVE_RUNWAYS.lock().unwrap() = vec![nav::Runway {
             width_m: 0.0,
             ident_a: "09".into(),
@@ -7824,13 +7866,43 @@ mod tests {
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
         let t0 = Instant::now();
         let sec = std::time::Duration::from_secs;
+        // The lander still on final: the crew's condition reads NOT clear —
+        // "behind" means after it, and the Baron that rolled five seconds
+        // after the words (Malaga, 2026-09-11) had nothing to read.
+        let lander = TcasTarget {
+            callsign: "BAW306".into(),
+            lat: 36.1497,
+            lon: -5.4000,
+            ele_ft: 650.0,
+            on_ground: false,
+            vs_fpm: -600.0,
+        };
+        assert!(
+            takeoff_hold_tick(std::slice::from_ref(&lander), 11.0, true, t0).is_none(),
+            "held behind the lander"
+        );
+        assert_eq!(crate::party_line::line_up_condition_clear(), Some(false));
+
+        // The lander is down and gone: the condition clears, then the watch
+        // releases the clearance after the clear window, and the FSM sync is
+        // queued for the main loop exactly like a plain hold.
         assert!(
             takeoff_hold_tick(&[], 11.0, true, t0).is_none(),
             "clear window starts"
         );
+        assert_eq!(
+            crate::party_line::line_up_condition_clear(),
+            Some(true),
+            "lander off the final: the pavement is ours"
+        );
         let line = takeoff_hold_tick(&[], 11.0, true, t0 + sec(16)).expect("release");
         assert!(line.contains("cleared for takeoff"), "{line}");
         assert!(*PENDING_TAKEOFF_CLEARANCE.lock().unwrap());
+        assert_eq!(
+            crate::party_line::line_up_condition_clear(),
+            None,
+            "released: no condition left to wait on"
+        );
 
         *PENDING_TAKEOFF_CLEARANCE.lock().unwrap() = false;
         *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;

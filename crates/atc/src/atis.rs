@@ -102,6 +102,20 @@ pub fn spoken_digits(s: &str) -> String {
 }
 
 /// A radio frequency in kHz spoken as MHz: 131200 -> "one three one decimal two".
+/// An altitude in controller words, to the nearest hundred: "two thousand
+/// five hundred", "eight hundred". Shared by the tower's instructions and the
+/// crew's check-ins so both sides say altitudes the same way.
+pub fn spoken_alt(ft: f64) -> String {
+    let hundreds = ((ft / 100.0).round() as i64).max(1);
+    let (th, hu) = (hundreds / 10, hundreds % 10);
+    let word = |n: i64| spoken_digits(&n.to_string());
+    match (th, hu) {
+        (0, h) => format!("{} hundred", word(h)),
+        (t, 0) => format!("{} thousand", word(t)),
+        (t, h) => format!("{} thousand {} hundred", word(t), word(h)),
+    }
+}
+
 pub fn spoken_mhz(khz: i64) -> String {
     let mhz = khz / 1000;
     let frac = (khz % 1000).abs();

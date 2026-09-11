@@ -280,7 +280,16 @@ pub fn taxi_control(
         return (Some(0.0), brake); // holding position: idle + brakes
     }
     // Where we'll be once a lever change has worked through the spool.
-    let eff = (target_kts - gs_kts) - trend_kts_s * 2.5;
+    let raw = target_kts - gs_kts;
+    let eff = raw - trend_kts_s * 2.5;
+    // A build of speed that only the PROJECTION calls deep: at a slow target
+    // the ordinary breakaway acceleration is enough to do it. The Baron's
+    // 6 kt line-up pace read 6.9 kt building 0.9 kt/s, the projection put
+    // it 3 kt over, idle-and-brake followed, prop drag stopped it dead, and
+    // the rebuild from idle repeated the cycle three times in 205 m (Malaga,
+    // 2026-09-11). Idle-and-brake needs the speed to actually BE over by a
+    // couple of knots, unless the build is a genuine surge (downhill).
+    let surge = trend_kts_s >= SURGE_KTS_S;
     if eff > 1.0 {
         // Too slow, or decaying toward it: a touch more power (never takeoff
         // power), brakes off. Small steps on a fast tick, human feet, not a
@@ -288,7 +297,7 @@ pub fn taxi_control(
         // rebuild from idle doesn't undershoot for ten seconds.
         let step = (eff * 0.003).min(if eff > 3.0 { 0.02 } else { 0.01 });
         (Some((throttle + step).min(0.35)), 0.0)
-    } else if eff < -3.0 {
+    } else if eff < -3.0 && (target_kts < 1.0 || raw < -2.0 || surge) {
         // WELL past the target: idle now and brake in proportion, together —
         // the polite step-down let an SR22 run a 10-knot taxi through 20
         // (2026-07-11). Ramped from the boundary: the old flat 0.2 minimum
@@ -310,8 +319,13 @@ pub fn taxi_control(
         // the deep undershoot on the other side. A STOP keeps braking to
         // the halt once the throttle's closed: idle creep never finishes a
         // stop on its own.
-        if throttle > 0.03 {
+        // Once the speed is already falling, the lever is where it should
+        // be: stepping it further toward idle is what turned a one-knot
+        // trim into a full stop on the Baron's line-up.
+        if throttle > 0.03 && trend_kts_s > SETTLING_KTS_S {
             (Some((throttle - 0.01).max(0.0)), 0.0)
+        } else if throttle > 0.03 {
+            (None, 0.0)
         } else if target_kts < 1.0 {
             (Some(0.0), ((-eff) * 0.08).clamp(0.1, 0.6))
         } else {
@@ -321,6 +335,13 @@ pub fn taxi_control(
         (None, 0.0) // in the groove: hands off, brakes released
     }
 }
+
+/// A build of speed this fast (kt/s) is a surge — downhill, a gust — and
+/// earns idle-and-brake on the projection alone, before the speed gets there.
+const SURGE_KTS_S: f64 = 1.2;
+/// Falling faster than this (kt/s) means a trim has already taken: leave the
+/// lever where it is rather than chase the speed down to idle.
+const SETTLING_KTS_S: f64 = -0.3;
 
 /// Smooth the proportional brake toward the law's demand: pedals SQUEEZE
 /// on, they don't stab ("braking is TOO jerky", 2026-07-20 — every full
@@ -1165,6 +1186,22 @@ mod tests {
         assert!(just_over < 0.2, "gentle at the boundary: {just_over}");
         let (_, way_over) = taxi_control(10.0, 18.0, 0.0, 0.0);
         assert!(way_over > just_over, "deeper overspeed brakes harder");
+    }
+
+    // The 6 kt line-up limit cycle (Malaga, 2026-09-11): 6.9 kt building
+    // 0.9 kt/s at a 6 kt target is a trim, not a stop.
+    #[test]
+    fn taxi_law_holds_a_slow_pace_without_stopping() {
+        let (thr, brake) = taxi_control(6.0, 6.87, 0.18, 0.87);
+        assert_eq!(brake, 0.0, "a one-knot build never earns the brakes");
+        let thr = thr.expect("power comes off a touch");
+        assert!(thr < 0.18 && thr > 0.1, "trimmed, not idled: {thr}");
+        // The trim has taken (speed falling): hands off, the lever stays.
+        assert_eq!(taxi_control(6.0, 6.9, 0.14, -0.6), (None, 0.0));
+        // Actually two knots over and still building: the old answer stands.
+        let (thr, brake) = taxi_control(6.0, 8.3, 0.14, 0.9);
+        assert_eq!(thr, Some(0.0));
+        assert!(brake > 0.0);
     }
 
     #[test]

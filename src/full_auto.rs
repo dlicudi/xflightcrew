@@ -254,6 +254,71 @@ async fn engine_running(xp: &XPlaneClient) -> bool {
 
 /// Poll `cond` every `step`, up to `secs`, bailing on ABORT. Returns whether it
 /// became true in time.
+/// How long a conditional line-up waits for the named arrival to pass before
+/// full auto gives the aircraft back at the hold line.
+const LINE_UP_BEHIND_SECS: f64 = 300.0;
+/// How long the inbound call waits for the destination's station to take
+/// over the frequency before going out regardless.
+const INBOUND_SWAP_WAIT_SECS: f64 = 45.0;
+/// Between the handoff readback and the retune: the readback has to be off
+/// the air on the frequency it was given on before the radio leaves it.
+const HANDOFF_READBACK_SECS: u64 = 4;
+
+/// The enroute wait, working the radio. The tower's after-takeoff handoff
+/// ("contact Malaga Departure on ...") is read back on the frequency it came
+/// on, COM1 is retuned, and the departure is checked in with altitude — the
+/// exchange nobody made at Malaga, where the flight stayed on tower for
+/// thirteen minutes and heard the party line all the way to the region swap
+/// (12:23Z, 2026-09-11). Returns true once the enroute leg completes, false
+/// on abort or the four-hour ceiling.
+async fn wait_enroute_working_the_radio(
+    xp: &XPlaneClient,
+    callsign: &Option<String>,
+    climb_to_ft: f64,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let deadline = Instant::now() + Duration::from_secs_f64(4.0 * 3600.0);
+    loop {
+        if ABORT.load(SeqCst) {
+            return false;
+        }
+        if !crate::procedure::ACTIVE.load(Relaxed) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if let Some((to, khz)) = crate::party_line::take_departure_handoff() {
+            crate::circuit::transmit(crate::circuit::radio_call(
+                callsign,
+                &format!("{to} on {}", crate::atis::spoken_mhz(khz)),
+            ));
+            tokio::time::sleep(Duration::from_secs(HANDOFF_READBACK_SECS)).await;
+            let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+            let alt_ft = xp.get_float(ELEV_M).await.unwrap_or(0.0) * M_TO_FT;
+            crate::circuit::transmit(departure_check_in(callsign, &to, alt_ft, climb_to_ft));
+            event("departure_checkin", json!({ "to": to, "khz": khz, "alt_ft": alt_ft.round() }));
+        }
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+    }
+}
+
+/// The first call to the departure controller: who we are, where we are,
+/// where we're going ("Malaga Departure, November four five X-ray Sierra,
+/// passing two thousand climbing four thousand"). Shaped so the station reads
+/// it as a check-in (a readback with "passing"/"climbing") and answers "radar
+/// contact". With no planned altitude the climb clause is left off rather
+/// than invented.
+pub fn departure_check_in(callsign: &Option<String>, to: &str, alt_ft: f64, climb_to_ft: f64) -> String {
+    let who = callsign.as_ref().map(|c| format!("{c}, ")).unwrap_or_default();
+    let climb = if climb_to_ft > alt_ft + 200.0 {
+        format!(" climbing {}", crate::atis::spoken_alt(climb_to_ft))
+    } else {
+        String::new()
+    };
+    format!("{to}, {who}passing {}{climb}", crate::atis::spoken_alt(alt_ft))
+}
+
 async fn wait_until<F, Fut>(secs: f64, step_ms: u64, mut cond: F) -> bool
 where
     F: FnMut() -> Fut,
@@ -879,6 +944,36 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 }
                 bail_if_abort!();
             }
+            // A CONDITIONAL line-up ("behind the landing X, line up behind")
+            // is a clearance to enter AFTER X, not now. The Baron at Malaga
+            // rolled five seconds after the words with the lander at 2.4 nm
+            // and reached the pavement 15 s after it touched down — the
+            // margin was the 85 s crawl, not any logic (12:21Z, 2026-09-11).
+            // The world publishes the condition every tick from its traffic
+            // picture; wait for it to clear, or for the hold to become a
+            // release (the condition goes away with it).
+            if atc_running && crate::party_line::line_up_condition_clear() == Some(false) {
+                announce(
+                    &voice,
+                    Priority::Advisory,
+                    "Behind the landing traffic. Waiting for it to pass.",
+                );
+                event("line_up_behind_wait", json!({}));
+                if !wait_until(LINE_UP_BEHIND_SECS, 500, || async {
+                    crate::party_line::line_up_condition_clear() != Some(false)
+                })
+                .await
+                {
+                    give_up(
+                        &voice,
+                        "The landing traffic never cleared. Holding short. Your aircraft.",
+                        "line_up_behind_timeout",
+                    );
+                    return;
+                }
+                bail_if_abort!();
+                event("line_up_behind_clear", json!({}));
+            }
             announce(
                 &voice,
                 Priority::Advisory,
@@ -1092,12 +1187,15 @@ async fn fly_route(
             cruise_ias_kts: tools.cruise_ias_kts,
         },
     );
-    // Generous ceiling — ABORT bails out of the wait immediately.
-    if !wait_until(4.0 * 3600.0, 2000, || async {
-        !crate::procedure::ACTIVE.load(Relaxed)
-    })
-    .await
-    {
+    // Generous ceiling — ABORT bails out of the wait immediately. The wait
+    // works the radio: the tower's after-takeoff handoff is owed a readback,
+    // a retune and a check-in.
+    let climb_to_ft = route
+        .legs
+        .iter()
+        .filter_map(|l| l.alt1_ft)
+        .fold(0.0, f64::max);
+    if !wait_enroute_working_the_radio(xp, callsign, climb_to_ft).await {
         if !ABORT.load(SeqCst) {
             give_up(
                 voice,
@@ -1167,8 +1265,18 @@ async fn fly_route(
     // listening.
     if let Some(khz) = built.tower_khz.or_else(crate::party_line::home_tower_khz) {
         let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+        // The call is worth nothing until the station on that frequency IS
+        // the destination: at PIMOS the region swapped to Gibraltar three
+        // seconds AFTER "inbound for landing" went out, the call went into
+        // the void, and Gibraltar's zone watch challenged the arrival as an
+        // unknown aircraft (12:36Z, 2026-09-11). The swap is distance-driven
+        // and due about now; wait for it, bounded, and call either way.
+        let swapped = wait_until(INBOUND_SWAP_WAIT_SECS, 500, || async {
+            crate::party_line::home_tower_khz() == Some(khz)
+        })
+        .await;
         crate::circuit::transmit(crate::circuit::radio_call(callsign, "inbound for landing"));
-        event("inbound_call", json!({ "khz": khz }));
+        event("inbound_call", json!({ "khz": khz, "station_swapped": swapped }));
     }
     // The wind-chosen end (build_arrival) drives BOTH the published-approach
     // branch and the visual fallback — the visual autoland is forced onto the
@@ -1312,13 +1420,23 @@ async fn taxi_in_after_landing(
         .await
         .unwrap_or(0.0)
         > 0.5;
-    if !landed || !on_ground || ABORT.load(SeqCst) {
+    // A wreck is "on the ground" too. The Gibraltar go-around hit the North
+    // Front, the sim raised has_crashed, autoland read the stop as a rollout,
+    // and this said "On the ground. I'll clear the runway", called for taxi,
+    // and armed auto taxi on the wreckage (12:46Z, 2026-09-11). Fail open: a
+    // failed read is not a crash.
+    let crashed = xp
+        .get_float(crate::datarefs::HAS_CRASHED)
+        .await
+        .unwrap_or(0.0)
+        > 0.5;
+    if !landed || !on_ground || crashed || ABORT.load(SeqCst) {
         // The landing never completed here — take the rolling-handoff offer
         // back, or a later standalone landing would hand off to nobody.
         crate::autoland::VACATE_FOLLOWS.store(false, Relaxed);
         event(
             "no_taxi_in",
-            json!({ "landed": landed, "on_ground": on_ground }),
+            json!({ "landed": landed, "on_ground": on_ground, "crashed": crashed }),
         );
         return;
     }
@@ -1570,4 +1688,27 @@ async fn lined_up(xp: &XPlaneClient, tools: &SubTools, _config: &Config) -> bool
     let apt = crate::tools::autoland::apt_dat_path();
     let cands = crate::autoland::nearby_runways(&apt, lat, lon, 3.0).unwrap_or_default();
     crate::autotakeoff::runway_fit(&cands, lat, lon, psi, needed_m).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::departure_check_in;
+
+    // The first call to Departure has to read as a CHECK-IN to the station
+    // (a readback carrying "passing"/"climbing", never a request), or the
+    // departure controller answers "say again" instead of "radar contact".
+    #[test]
+    fn the_departure_check_in_is_shaped_to_earn_radar_contact() {
+        let cs = Some("November four five X-ray Sierra".to_string());
+        let call = departure_check_in(&cs, "Malaga Departure", 1960.0, 4000.0);
+        assert_eq!(
+            call,
+            "Malaga Departure, November four five X-ray Sierra, passing two thousand climbing four thousand"
+        );
+        assert!(crate::tower::is_readback(&call), "{call}");
+        assert_eq!(crate::tower::parse_intent(&call), crate::tower::Intent::Unknown, "{call}");
+        // Already at the planned altitude: no invented climb.
+        let level = departure_check_in(&None, "Malaga Departure", 3980.0, 4000.0);
+        assert_eq!(level, "Malaga Departure, passing four thousand");
+    }
 }

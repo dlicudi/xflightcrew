@@ -357,6 +357,25 @@ history):
   everything** (`GoAroundLatch::order`): consumed in the autoland loop,
   drained at arm time, refused on the ground; a fresh "final" report is owed
   after any go-around, made inside the FAP.
+- **A straight-in is only as good as its fixes** (LXGB 09, 2026-09-11): a
+  DME-fix reconstruction keeps only fixes ON the final approach course
+  (`RECON_ALIGN_DEG`), and `approach_plan_for` refuses any FAF autoland could
+  not intercept from (`faf_off_course`, the circuit's own `interceptable`
+  test) so the arrival falls back to the visual landing. Approach plans hold
+  the CLEAN approach speed (`power_hold_target`); autoland's gear and flaps
+  wait for the profile's VLO/Vfe (`gear_may_extend`, `flap_within_limits`,
+  republished per airframe); taxi-in never follows `has_crashed`.
+- **The crew works the radio as full auto flies** (same sortie): a
+  conditional line-up waits on `party_line::line_up_condition_clear()` (the
+  world's traffic picture, published by the release watch every tick) before
+  crossing the hold line; the after-takeoff handoff is consumed via
+  `take_departure_handoff()` (readback on the old frequency, retune, check-in
+  with altitude); the inbound call waits for the destination's station swap
+  (`home_tower_khz`) before it goes out. A descent waits for its top of
+  descent (`descent_target_ft`), a cruise fix within 300 ft of cruise IS
+  cruise, a JOIN projects along the nose (`project_signed_facing`), and the
+  taxi law's idle-and-brake needs the speed to actually be over by 2 kt
+  unless the build is a surge (`SURGE_KTS_S`).
 - **Taxi guide** ([src/taxi_guide.rs](src/taxi_guide.rs)): early gentle cue,
   quiet inside the 60 m where the compliance watch takes over - never two
   voices on one mistake; gates on `pushback::ACTIVE` and along-track progress

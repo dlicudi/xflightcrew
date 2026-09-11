@@ -357,6 +357,13 @@ impl Route {
         taxi_guide::project_signed(&self.path, lat, lon)
     }
 
+    /// [`fix_signed`](Self::fix_signed) onto the legs that run the way the
+    /// nose points — the projection a JOIN uses, so the nearest paint behind
+    /// the tail never becomes the target (see `taxi_guide::project_signed_facing`).
+    pub fn fix_signed_facing(&self, lat: f64, lon: f64, heading_true: f64) -> Option<(f64, f64)> {
+        taxi_guide::project_signed_facing(&self.path, lat, lon, heading_true)
+    }
+
     /// Heading error (signed degrees, right positive) from the aircraft's
     /// true heading to the pure-pursuit aim point `lookahead` meters further
     /// along the route. Aiming at a point ON the route (not the tangent) is
@@ -1382,8 +1389,17 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         };
         let gs_kts = gs_ms * MS_TO_KTS;
         // Signed here, magnitude everywhere below: the gates ask how far off
-        // the route we are, and the record wants to know which side.
-        let Some((progress, offset)) = route.fix_signed(lat, lon) else {
+        // the route we are, and the record wants to know which side. While
+        // still JOINING, project along the nose: the nearest paint can be a
+        // leg already behind us (the pushback that let go 60 m short of its
+        // node, Malaga 2026-09-11 — the join drove a loop back to the node).
+        let joining = join_allow.is_none_or(|a| a > 0.0);
+        let fixed = if joining {
+            route.fix_signed_facing(lat, lon, psi)
+        } else {
+            route.fix_signed(lat, lon)
+        };
+        let Some((progress, offset)) = fixed else {
             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             continue;
         };

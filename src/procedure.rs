@@ -41,6 +41,8 @@ const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const ELEV_M: &str = "sim/flightmodel/position/elevation";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
+const GS_MS: &str = "sim/flightmodel/position/groundspeed";
+const MS_TO_KTS: f64 = 1.943_84;
 // AP surface (mirror of autopilot.rs / autoland.rs / circuit.rs).
 const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
@@ -158,6 +160,44 @@ pub fn commanded_alt_ft(leg: &ProcLeg, carry: f64) -> f64 {
     leg.alt1_ft.unwrap_or(carry)
 }
 
+/// The descent rate the VS law flies, fpm (its clamp).
+const DESCENT_FPM: f64 = 700.0;
+/// Start down this far before the computed top of descent, nm.
+const TOD_LEAD_NM: f64 = 1.0;
+
+/// The altitude to command NOW for a leg that wants `leg_alt` at a fix
+/// `dist_nm` away: the previous target (`carry`, or where we are if we never
+/// reached it) until the top of descent, then the leg's own. Dialling a
+/// constraint straight in began the descent the moment the leg armed — the
+/// Gibraltar arrival dialled 1,397 ft with 25 nm to run and flew 18 nm level
+/// at 1,400 ft across the Strait, past Europa Point (2026-09-11). Climbs are
+/// untouched (the climb law owns them), so is a small step, and a leg with no
+/// fix has nothing to pace against.
+pub fn descent_target_ft(
+    leg_alt: f64,
+    carry: f64,
+    alt_ft: f64,
+    dist_nm: Option<f64>,
+    gs_kts: f64,
+) -> f64 {
+    let Some(dist_nm) = dist_nm else {
+        return leg_alt;
+    };
+    let drop_ft = alt_ft - leg_alt;
+    if drop_ft <= 100.0 {
+        return leg_alt;
+    }
+    let tod_nm = drop_ft / DESCENT_FPM * (gs_kts.max(60.0) / 60.0) + TOD_LEAD_NM;
+    if dist_nm <= tod_nm {
+        return leg_alt;
+    }
+    if carry <= alt_ft + 100.0 {
+        carry
+    } else {
+        (alt_ft / 100.0).round() * 100.0
+    }
+}
+
 /// The leg to hand off to autoland on an approach: the FAF if the data flags one,
 /// else the last fix leg before the runway threshold, else the last leg. `None`
 /// only when there are no legs. Handing off AT the FAF lets autoland own the
@@ -232,6 +272,12 @@ pub fn approach_plan_for(
     } else {
         (legs, name)
     };
+    // The FAF is where autoland takes the aircraft, so it has to be somewhere
+    // autoland can land FROM. A published approach's FAF is on the course by
+    // definition; a reconstructed one is only as good as its fixes.
+    if let Some(why) = faf_off_course(&legs, airport, rwy_id) {
+        return Err(why);
+    }
     // Approaches descend; the climb protection reference stays off unless the
     // caller sets one (e.g. the enroute follower).
     Ok(Plan {
@@ -239,8 +285,56 @@ pub fn approach_plan_for(
         legs,
         end,
         vy_kts: 0.0,
-        cruise_ias_kts: None, // an approach/SID manages its own speed
+        cruise_ias_kts: None, // the follower holds the clean approach speed
     })
+}
+
+/// The refusal when the handoff fix is not somewhere autoland can intercept the
+/// runway from: the FAF's cross-track and along-track distances in the runway
+/// frame have to pass autoland's own `interceptable` test, the one the circuit
+/// applies before it hands over. Gibraltar's 09D05 sits 3.6 km abeam the 09
+/// centreline with 5.5 km to run (a 50 degree offset); handing off there flew a
+/// saturated 35 degree cut that was still 300 m off at 95 ft, went around, and
+/// crashed (2026-09-11). `None` = flyable, or nothing to judge (no FAF, no
+/// runway geometry) — the follower's own checks take over from there.
+fn faf_off_course(
+    legs: &[ProcLeg],
+    airport: &crate::nav::AirportInfo,
+    rwy_id: &str,
+) -> Option<String> {
+    let hi = handoff_index(legs)?;
+    let faf = legs[hi].fix.as_ref()?;
+    let (thr_lat, thr_lon) = crate::nav::runway_threshold(airport, rwy_id)?;
+    let course = crate::nav::runway_course_deg(airport, rwy_id)?;
+    let (xtk_m, along_m) = crate::nav::runway_frame_m(thr_lat, thr_lon, course, faf.lat, faf.lon);
+    if crate::circuit::interceptable(xtk_m, along_m) {
+        return None;
+    }
+    Some(format!(
+        "The {} fix is {:.1} miles off the runway {} centreline with {:.1} to run. \
+         Autoland can't line up from there, so that approach is out.",
+        faf.ident,
+        xtk_m.abs() / 1852.0,
+        crate::circuit::spell_runway(rwy_id),
+        along_m.max(0.0) / 1852.0
+    ))
+}
+
+/// The indicated speed the throttle governor holds while the follower flies
+/// this plan, if any. Enroute: the profile's cruise speed. An APPROACH: the
+/// clean approach speed autoland itself flies outside the deceleration ramp,
+/// so the handoff at the FAF is at a speed it expects. Before this, an approach
+/// plan left the throttle wherever the enroute leg had it: cruise power all the
+/// way down the straight-in, 195 kt at the FAF against a 100 kt approach speed,
+/// and the gear and flaps went out 40 kt over their limits (2026-09-11).
+pub fn power_hold_target(end: &EndAction, cruise_ias_kts: Option<f64>) -> Option<f64> {
+    match end {
+        EndAction::Enroute => cruise_ias_kts,
+        EndAction::Approach { approach_ias, .. } => {
+            Some(crate::autoland::clean_approach_ias(*approach_ias))
+        }
+        EndAction::Level => None,
+    }
 }
 
 /// Build the ENROUTE legs of a SimBrief plan: direct-to legs over the named
@@ -285,6 +379,10 @@ pub fn enroute_legs(
         .collect();
     let peak = raw.iter().copied().fold(cruise_alt_ft, f64::max);
     let first_at_peak = raw.iter().position(|a| *a >= peak - 100.0).unwrap_or(0);
+    // A fix charted within a few hundred feet of cruise IS cruise: SimBrief
+    // put MG834 at 3,900 between two 4,000 ft fixes and the dial dipped and
+    // came back for nothing (2026-09-11). Real descents are thousands.
+    const CRUISE_DIP_FT: f64 = 300.0;
     mid.iter()
         .zip(raw.iter())
         .enumerate()
@@ -303,7 +401,11 @@ pub fn enroute_legs(
             dist_nm: None,
             turn: None,
             alt_desc: ' ',
-            alt1_ft: Some(if i < first_at_peak { peak } else { *alt }),
+            alt1_ft: Some(if i < first_at_peak || (peak - *alt).abs() <= CRUISE_DIP_FT {
+                peak
+            } else {
+                *alt
+            }),
             alt2_ft: None,
             is_faf: false,
         })
@@ -425,14 +527,13 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // cruise power once at speed, robust to weight/altitude/temp. Pitch (the VS
     // law below) owns altitude; the governor owns speed. Released at every exit
     // so autoland/the arrival own the throttle alone.
-    if matches!(end, EndAction::Enroute) {
-        if let Some(kts) = cruise_ias_kts {
-            crate::tools::speedhold::arm_flight(base_url.clone(), voice.clone(), kts);
-            crate::blackbox::record(
-                "procedure",
-                serde_json::json!({"event": "cruise_power", "target_ias": kts}),
-            );
-        }
+    if let Some(kts) = power_hold_target(&end, cruise_ias_kts) {
+        crate::tools::speedhold::arm_flight(base_url.clone(), voice.clone(), kts);
+        let event = if matches!(end, EndAction::Enroute) { "cruise_power" } else { "approach_power" };
+        crate::blackbox::record(
+            "procedure",
+            serde_json::json!({"event": event, "target_ias": kts}),
+        );
     }
 
     let mut idx = 0usize;
@@ -447,7 +548,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             continue;
         }
 
-        let (lat, lon, elev_m, psi_r, hpath_r, agl_m, vs_st, hdg_st, ias_r) = tokio::join!(
+        let (lat, lon, elev_m, psi_r, hpath_r, agl_m, vs_st, hdg_st, ias_r, gs_r) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
             xp.get_float(ELEV_M),
@@ -457,6 +558,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             xp.get_float(VS_STATUS),
             xp.get_float(HDG_STATUS),
             xp.get_float(IAS),
+            xp.get_float(GS_MS),
         );
         let (Ok(lat), Ok(lon)) = (lat, lon) else {
             continue;
@@ -520,8 +622,12 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // mode re-engaged when dropped (the takeoff's recipe) — and the
         // preselect dialled to the same target so the sim's armed capture
         // levels off AT the constraint instead of a stale value.
-        let want_alt = commanded_alt_ft(leg, carry_alt);
-        carry_alt = want_alt;
+        // A DESCENT waits for its top-of-descent instead of starting the
+        // moment the leg arms — the constraint is at the FIX, not here.
+        let leg_alt = commanded_alt_ft(leg, carry_alt);
+        let gs_kts = gs_r.map(|v| v * MS_TO_KTS).unwrap_or(0.0);
+        let want_alt = descent_target_ft(leg_alt, carry_alt, alt_ft, dist_nm, gs_kts);
+        carry_alt = leg_alt;
         if last_alt_dial.is_none_or(|v| (v - want_alt).abs() > 50.0) {
             let _ = xp.set_float(ALT_DIAL, want_alt).await;
             last_alt_dial = Some(want_alt);
@@ -573,7 +679,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     "procedure",
                     serde_json::json!({"event": "handoff_autoland", "idx": idx, "agl_ft": agl_ft}),
                 );
-                alert(&voice, Priority::Advisory, "Established. Landing us.");
+                alert(&voice, Priority::Advisory, "At the fix. Landing us.");
+                // The governor lets go BEFORE autoland's throttle law starts,
+                // so no tick has two writers on the lever.
+                crate::tools::speedhold::release();
                 crate::autoland::ABORT.store(false, Ordering::SeqCst);
                 crate::autoland::run_autoland(
                     base_url.clone(),
@@ -584,7 +693,6 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     None,
                     None,
                 );
-                crate::tools::speedhold::release();
                 ACTIVE.store(false, Ordering::SeqCst);
                 return;
             }
@@ -682,6 +790,58 @@ mod tests {
             alt2_ft: None,
             is_faf: false,
         }
+    }
+
+    /// Gibraltar as apt.dat has it: 09 at the west end, 27 at the east.
+    fn gibraltar() -> crate::nav::AirportInfo {
+        use std::io::Write;
+        let apt = std::env::temp_dir().join("xvl-proc-lxgb-apt.dat");
+        let mut f = std::fs::File::create(&apt).unwrap();
+        writeln!(f, "1 11 0 0 LXGB Gibraltar").unwrap();
+        writeln!(f, "100 46 0 0 0 0 0 0 09 36.1509000 -5.3581000 0 0 0 0 0 0 27 36.1515000 -5.3412000 0 0 0 0 0 0").unwrap();
+        f.flush().unwrap();
+        crate::nav::find_airport(apt.to_str().unwrap(), "LXGB")
+            .unwrap()
+            .unwrap()
+    }
+
+    // The crash of 2026-09-11: 09D05 sits 3.6 km abeam the 09 centreline with
+    // 5.5 km to run. Handing autoland the aircraft there is not an approach.
+    #[test]
+    fn a_faf_autoland_cannot_intercept_from_is_refused() {
+        let airport = gibraltar();
+        let mut faf = leg("09D05", 36.104666667, -5.405333333);
+        faf.is_faf = true;
+        let legs = vec![leg("09D06", 36.088, -5.404666667), faf, leg("RW09", 36.1509, -5.3581)];
+        let why = faf_off_course(&legs, &airport, "09").expect("refused");
+        assert!(why.contains("09D05") && why.contains("off the runway zero nine centreline"), "{why}");
+
+        // A FAF ON the centreline 4 nm out is fine.
+        let mut faf = leg("09D04", 36.1482, -5.4406);
+        faf.is_faf = true;
+        let legs = vec![faf, leg("RW09", 36.1509, -5.3581)];
+        assert_eq!(faf_off_course(&legs, &airport, "09"), None);
+
+        // Nothing to judge: no legs, or a runway the field doesn't have.
+        assert_eq!(faf_off_course(&[], &airport, "09"), None);
+        assert_eq!(faf_off_course(&legs, &airport, "18"), None);
+    }
+
+    // An approach plan holds the clean approach speed down the straight-in;
+    // before this the throttle stayed at cruise power and the FAF handoff was
+    // at 195 kt on a 100 kt approach (2026-09-11).
+    #[test]
+    fn an_approach_plan_holds_the_clean_approach_speed() {
+        let approach = EndAction::Approach {
+            apt_dat: String::new(),
+            cfg: ApConfig::default(),
+            approach_ias: 100.0,
+        };
+        let held = power_hold_target(&approach, None).expect("an approach holds a speed");
+        assert!((140.0..=150.0).contains(&held), "1.45 x Vapp, got {held}");
+        assert_eq!(power_hold_target(&EndAction::Enroute, Some(180.0)), Some(180.0));
+        assert_eq!(power_hold_target(&EndAction::Enroute, None), None);
+        assert_eq!(power_hold_target(&EndAction::Level, Some(180.0)), None);
     }
 
     #[test]
@@ -792,6 +952,36 @@ mod tests {
         let legs = enroute_legs(&wps, "LEJR", "LXGB", 5000.0);
         let alts: Vec<f64> = legs.iter().map(|l| l.alt1_ft.unwrap()).collect();
         assert_eq!(alts, vec![5000.0, 5000.0, 5000.0, 4000.0]);
+    }
+
+    #[test]
+    fn a_fix_a_hair_under_cruise_is_still_cruise() {
+        // LEMG-LXGB, 2026-09-11: MG834 charted 3,900 between 4,000 ft fixes.
+        let wps = vec![
+            wp("MG833", 36.6, -4.4, 4000.0),
+            wp("MG834", 36.5, -4.5, 3900.0),
+            wp("PIMOS", 36.2, -4.9, 4000.0),
+            wp("XXX", 36.1, -5.1, 2500.0),
+        ];
+        let legs = enroute_legs(&wps, "LEMG", "LXGB", 4000.0);
+        let alts: Vec<f64> = legs.iter().map(|l| l.alt1_ft.unwrap()).collect();
+        assert_eq!(alts, vec![4000.0, 4000.0, 4000.0, 2500.0]);
+    }
+
+    // The Gibraltar arrival: 3,900 ft, first approach fix wanting 1,397 with
+    // 25 nm to run at 200 kt over the ground. Level until the top of descent.
+    #[test]
+    fn a_descent_waits_for_its_top_of_descent() {
+        assert_eq!(descent_target_ft(1397.0, 3900.0, 3888.0, Some(25.0), 200.0), 3900.0);
+        // TOD: 2,491 ft at 700 fpm is 3.6 min, 11.9 nm at 200 kt, plus the lead.
+        assert_eq!(descent_target_ft(1397.0, 3900.0, 3888.0, Some(13.5), 200.0), 3900.0);
+        assert_eq!(descent_target_ft(1397.0, 3900.0, 3888.0, Some(12.0), 200.0), 1397.0);
+        // Climbs, small steps and fix-less legs go straight to the constraint.
+        assert_eq!(descent_target_ft(4000.0, 2000.0, 2000.0, Some(30.0), 200.0), 4000.0);
+        assert_eq!(descent_target_ft(3900.0, 4000.0, 3990.0, Some(30.0), 200.0), 3900.0);
+        assert_eq!(descent_target_ft(1000.0, 4000.0, 4000.0, None, 200.0), 1000.0);
+        // Never reached the previous target: hold where we are, rounded.
+        assert_eq!(descent_target_ft(1000.0, 6000.0, 3460.0, Some(40.0), 200.0), 3500.0);
     }
 
     #[test]
