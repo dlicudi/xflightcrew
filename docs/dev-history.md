@@ -4,6 +4,56 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## The panel on the sim's own renderer, and the field you are standing at — 2026-09-10
+
+X-Plane 12.4.4 (SDK 4.4.0) ships a native panel-graphics API with an ImGui
+helper: a window of content type PanelGraphics gets a draw callback in
+which `XPLMDrawCalls` takes ImGui's vertex/index buffers as-is (20-byte
+`ImDrawVert`, 16-bit indices, per-command scissor in window-local top-left
+pixels) and `XPLMCreateTexture` takes the RGBA8 font atlas. The plugin's
+panel moved onto it (`plugin/src/imgui_xp.cpp`, replacing the vendored
+ImgWindow): no OpenGL, no GL-on-Metal bridge, no fixed-pipeline renderer,
+and Dear ImGui went from 1.80 to 1.92.9b. Two things that were structural
+limits are gone with it. The atlas used to bind ONE GL texture at the first
+window's construction and could never rebake, which is why B612 was baked
+at three sizes and UI scale was a font swap; 1.92's dynamic atlas plus the
+texture-update protocol (`ImTextureStatus_WantCreate/WantUpdates/
+WantDestroy`, answered by create/destroy, both cheap enough per frame)
+means the two faces are added once at no size and `PushFont(font, px)`
+rasterises whatever the frame asks for, so scale is 100..200% in quarter
+steps and any glyph the face carries renders. And `XPLMReloadThisPlugin`
+reloads only us, so the Settings-tab reload no longer bounces every plugin.
+Input is the event-queue API (`AddKeyEvent`/`AddMousePosEvent`), with the
+X-Plane virtual keys mapped and Ctrl kept as Ctrl (`ConfigMacOSXBehaviors`
+off); the pointer is polled once a frame against the window's global
+bounds so a hover never sticks after the mouse leaves; the cursor callback
+answers hand over items and I-beam over text. UX added while there: a
+typed-command line on the Transcript tab (`xcopilot/typed`, a text dataref
+the app polls beside `xcopilot/request`, consumed by writing one NUL back,
+injected on the same typed-command queue so every gate and readback
+applies), and the window's geometry and open state persist in
+`Output/preferences/xvoicelayer_panel.txt` (written 2 s after a move
+settles and at unload, restored only if it fits the current screen). ImGui
+1.92 renames met on the way: `TabUnfocused` is `TabDimmed`, `TabActive` is
+`TabSelected`, `AddRect` swapped its thickness/flags order,
+`GetWindowContentRegionMax` is gone (cursor plus `GetContentRegionAvail`),
+`BeginChild` takes child flags. The plugin now needs 12.4.4+; the Makefile
+defines XPLM420..440 and targets macOS 12 (the 4.4 framework's minimum).
+Rule kept: never reload the plugin while an automation is running, the
+override channels die with it. And a rule learned the expensive way: the
+first cut created the atlas texture inside the draw callback, which the
+header permits ("in callbacks") and the runtime forbids ("Never call this
+function from within a panel draw callback") by ABORTING X-Plane, mid
+taxi-in, on the pilot's own reload. XLua's window creates its texture at
+context creation and its draw callback only submits draw calls; ours now
+runs the whole ImGui frame and every texture create/update/destroy from a
+per-frame flight loop, and the draw callback does nothing but
+`XPLMDrawCalls` on the retained draw data (valid until the next NewFrame).
+A draw command whose texture is not yet uploaded is skipped, never
+created. Corollary for the workflow: an untested plugin build must not be
+installed into the live folder while a flight is running, because any
+reload, the pilot's included, loads it.
+
 ## Local flight planner, stage one — 2026-09-10
 
 The only way to get a route into the FMS was a SimBrief plan. The plugin's

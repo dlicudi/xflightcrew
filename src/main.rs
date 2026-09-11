@@ -684,6 +684,12 @@ async fn main() -> Result<()> {
 /// picked from whatever is actually running. The value is consumed (written
 /// back to 0) once injected, so a press fires exactly once. Best-effort like the
 /// status sink: no plugin / no X-Plane just means the buttons do nothing.
+///
+/// The same thread polls the panel's typed line (`xcopilot/typed`, a text
+/// dataref the Transcript tab writes on Enter): the words go on the same
+/// queue verbatim, consumed by writing a single NUL back (the plugin reads
+/// that as empty). A plugin without the dataref (older build) simply never
+/// resolves it, and the buttons keep working.
 fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::Sender<String>) {
     std::thread::spawn(move || {
         let Ok(http) = reqwest::blocking::Client::builder()
@@ -694,6 +700,7 @@ fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::Sender<Stri
         };
         let rest = format!("{}/api/v1", base_url.trim_end_matches('/'));
         let mut id: Option<i64> = None;
+        let mut typed_id: Option<i64> = None;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(300));
             if id.is_none() {
@@ -702,6 +709,15 @@ fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::Sender<Stri
                     // Plugin not loaded / sim down — retry lazily.
                     std::thread::sleep(std::time::Duration::from_secs(3));
                     continue;
+                }
+                typed_id = crate::plugin_status::resolve_id(&http, &rest, "xcopilot/typed");
+            }
+            if let Some(tid) = typed_id {
+                if let Some(text) = take_typed(&http, &rest, tid) {
+                    tracing::info!(typed = %text, "panel typed command");
+                    if tx.send(text).is_err() {
+                        return; // session gone
+                    }
                 }
             }
             let Some(dref) = id else { continue };
@@ -744,6 +760,30 @@ fn spawn_panel_request_poller(base_url: String, tx: std::sync::mpsc::Sender<Stri
     });
 }
 
+/// One poll of the panel's typed line: the text if there is one (consumed),
+/// else `None`. Consume FIRST, like the request code, so a slow channel can't
+/// inject the same line twice.
+fn take_typed(http: &reqwest::blocking::Client, rest: &str, id: i64) -> Option<String> {
+    use base64::Engine;
+    let url = format!("{rest}/datarefs/{id}/value");
+    let raw = http
+        .get(&url)
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|b| b.get("data").and_then(|d| d.as_str().map(str::to_owned)))?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(raw).ok()?;
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let text = String::from_utf8_lossy(&bytes[..end]).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    let nul = base64::engine::general_purpose::STANDARD.encode([0u8]);
+    let _ = http.patch(&url).json(&serde_json::json!({ "data": nul })).send();
+    Some(text)
+}
+
 /// The panel's copilot-voice picker (see plugin/src/xcopilot.cpp): the app
 /// publishes the roster + current index, the Settings combo writes a pick back.
 const DR_OPT_VOICE: &str = "xcopilot/opt/voice";
@@ -754,7 +794,7 @@ const DR_OPT_MODE: &str = "xcopilot/opt/mode";
 /// The panel's cabin-crew radio buttons (Auto / Aboard / Off) — values are
 /// `cabin::Staffing::panel_index`, `-1` = plugin default (unpublished).
 const DR_OPT_CABIN: &str = "xcopilot/opt/cabin_crew";
-/// The panel's UI-scale radio buttons (100% / 125% / 150%, index 0/1/2) —
+/// The panel's UI-scale radio buttons (100% .. 200% in quarter steps, index 0..4) —
 /// purely a panel concern; the app remembers the pick and republishes it
 /// across plugin reloads and boots. `-1` = plugin default (unpublished).
 const DR_OPT_UI_SCALE: &str = "xcopilot/opt/ui_scale";
@@ -917,7 +957,7 @@ fn spawn_settings_poller(base_url: String) {
             id: None,
             current: || UI_SCALE.load(std::sync::atomic::Ordering::Relaxed),
             apply: |v| {
-                if (0..=2).contains(&v) {
+                if (0..=4).contains(&v) {
                     tracing::info!(ui_scale = v, "panel UI scale pick");
                     UI_SCALE.store(v, std::sync::atomic::Ordering::Relaxed);
                     prefs::save_ui_scale(v);

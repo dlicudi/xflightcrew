@@ -68,6 +68,18 @@ static XPLMDataRef g_request_dref = nullptr;
 static int ReadRequest(void*) { return g_request; }
 static void WriteRequest(void*, int v) { g_request = v; }
 
+// Typed command (plugin → app). The Transcript tab's text line writes the
+// pilot's words here; the app polls, injects them on the typed-command queue
+// (the same one the terminal and the buttons ride), and consumes by writing
+// a single NUL back, which reads as empty here. Never buffered: a second
+// line typed before the app polled replaces the first.
+static TextRef g_typed = {{0}, 0};
+static XPLMDataRef g_typed_dref = nullptr;
+static void WriteTyped(void* ref, void* in, int offset, int len) {
+    StoreText(static_cast<TextRef*>(ref), in, offset, len);
+    if (g_typed.buf[0] == '\0') g_typed.len = 0;
+}
+
 // ---- panel options (plugin → app) --------------------------------------------
 
 // Settings-popup switches the app polls live. Ints so a missing plugin (dataref
@@ -903,6 +915,10 @@ void start() {
         "xcopilot/opt/ui_scale", xplmType_Int, 1,
         ReadOptUiScale, WriteOptUiScale, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_typed_dref = XPLMRegisterDataAccessor(
+        "xcopilot/typed", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteTyped, &g_typed, &g_typed);
     g_com1_dref = XPLMFindDataRef("sim/cockpit2/radios/actuators/com1_frequency_hz_833");
     g_taxi_brake_dref = XPLMRegisterDataAccessor(
         "xcopilot/taxi_brake", xplmType_Float, 1,
@@ -1008,6 +1024,7 @@ void stop_first() {
     if (g_taxi_brake_dref) { XPLMUnregisterDataAccessor(g_taxi_brake_dref); g_taxi_brake_dref = nullptr; }
     if (g_steer_brake_l_dref) { XPLMUnregisterDataAccessor(g_steer_brake_l_dref); g_steer_brake_l_dref = nullptr; }
     if (g_steer_brake_r_dref) { XPLMUnregisterDataAccessor(g_steer_brake_r_dref); g_steer_brake_r_dref = nullptr; }
+    if (g_typed_dref) { XPLMUnregisterDataAccessor(g_typed_dref); g_typed_dref = nullptr; }
     if (g_opt_ui_scale_dref) { XPLMUnregisterDataAccessor(g_opt_ui_scale_dref); g_opt_ui_scale_dref = nullptr; }
     if (g_auto_dref) { XPLMUnregisterDataAccessor(g_auto_dref); g_auto_dref = nullptr; }
     if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }
@@ -1077,6 +1094,11 @@ int opt_cabin() { return g_opt_cabin; }
 void set_opt_cabin(int v) { g_opt_cabin = v; }
 int opt_ui_scale() { return g_opt_ui_scale; }
 void set_opt_ui_scale(int v) { g_opt_ui_scale = v; }
+void set_typed(const char* text) {
+    std::memset(g_typed.buf, 0, sizeof g_typed.buf);
+    std::strncpy(g_typed.buf, text, sizeof g_typed.buf - 1);
+    g_typed.len = static_cast<int>(std::strlen(g_typed.buf));
+}
 int opt_voice() { return g_opt_voice; }
 void set_opt_voice(int v) { g_opt_voice = v; }
 const char* voice_list() { return g_voice_list.buf; }

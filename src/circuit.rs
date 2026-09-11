@@ -166,6 +166,7 @@ pub struct Geometry {
 impl Geometry {
     /// One radius for the whole pattern — the shape tests use, and the right
     /// answer whenever the pattern and approach speeds are the same.
+    #[cfg(test)]
     pub fn for_radius(r: f64) -> Geometry {
         Geometry::for_radii(r, r)
     }

@@ -392,8 +392,12 @@ crew on this airframe", never an LLM improvising.
   (`REQUEST_PHRASES`, grammar-test-pinned so a button never reaches the LLM);
   CANCEL is picked per what's running at PRESS time and ALWAYS aborts
   something ("my controls" fallback). Presses ride the typed-command queue,
-  one per loop pass. Fonts are B612, baked at three sizes (the ImGui atlas
-  can never rebake); UI scale is a font swap.
+  one per loop pass, as does the Transcript tab's typed line
+  (`xcopilot/typed`, consumed by a NUL write). The panel renders through
+  X-Plane's native panel-graphics API (SDK 4.4.0, X-Plane 12.4.4+;
+  [plugin/src/imgui_xp.cpp](plugin/src/imgui_xp.cpp), no OpenGL); fonts are
+  B612 rasterised per frame at the asked size, so UI scale (100..200%) is a
+  real size change. Window geometry persists in the sim's preferences folder.
 - **The terminal is setup and diagnosis** ([src/ui.rs](src/ui.rs), Health +
   Transcript): Web API load window, plugin-loaded probe, EFFECTIVE TTS engine
   (what the speaker thread built after fallbacks), COM1 as diagnosis (amber
@@ -442,7 +446,7 @@ assert the numbers the blackbox reports.
 **GPL-3.0-or-later** (root `LICENSE`, inherited via `[workspace.package]`).
 Settled: open source, never commercial, X-Plane only. Copyleft on purpose
 (the ecosystem is payware-dominated and this exact product shape sells for
-$49). SDK, Dear ImGui, ImgWindow are MIT/BSD; B612 is OFL - all
+$49). SDK and Dear ImGui are MIT/BSD; B612 is OFL - all
 GPL-compatible. Sole-author relicensing stays free only until outside
 contributions merge: settle any change of heart BEFORE accepting a PR.
 `crates/atc` could become LGPL-3.0 if it should ever be broadly embeddable -

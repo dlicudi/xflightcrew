@@ -1,8 +1,9 @@
 # Build the XVoiceLayer X-Plane plugin (macOS, universal arm64 + x86_64).
 #
-# Prereq: the X-Plane SDK (free, developer.x-plane.com/sdk) extracted to plugin/SDK
-# so that plugin/SDK/CHeaders/XPLM/*.h and plugin/SDK/Libraries/Mac/XPLM.framework
-# exist. Then: `make` → build/mac_x64/xcopilot.xpl. `make install` copies it into
+# Prereq: the X-Plane SDK 4.4.0 or newer (free, developer.x-plane.com/sdk;
+# the panel renders through the 4.4 panel-graphics API, so X-Plane 12.4.4+)
+# extracted to plugin/SDK so that plugin/SDK/CHeaders/XPLM/XPLMPanelGraphics.h
+# and plugin/SDK/Libraries/Mac/XPLM.framework exist. Then: `make` → build/mac_x64/xcopilot.xpl. `make install` copies it into
 # X-Plane (override XPLANE=...). See README.md.
 
 PLUGIN  := xcopilot
@@ -14,19 +15,19 @@ ARCHS    := -arch arm64 -arch x86_64
 # Git build id (short SHA, with -dirty when there are uncommitted changes), so the
 # plugin's startup log and panel title show exactly which build is loaded.
 BUILD    := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell git diff --quiet 2>/dev/null || echo -dirty.$$(date +%H%M%S))
-CXXFLAGS := -std=c++17 -fPIC -fvisibility=hidden -O2 -mmacosx-version-min=11.0 \
-            -Wno-deprecated-declarations \
+CXXFLAGS := -std=c++17 -fPIC -fvisibility=hidden -O2 -mmacosx-version-min=12.0 \
+            -Wno-deprecated-declarations -Wno-exceptions \
             -DAPL=1 -DIBM=0 -DLIN=0 -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 \
-            -DXPLM400=1 -DXPLM410=1 -DXCOPILOT_BUILD='"$(BUILD)"' \
-            -I$(SDK)/CHeaders/XPLM -Ithird_party/imgui -Ithird_party/ImgWindow
-LDFLAGS  := -dynamiclib -mmacosx-version-min=11.0 -F$(SDK)/Libraries/Mac \
-            -framework XPLM -framework OpenGL -framework ApplicationServices \
+            -DXPLM400=1 -DXPLM410=1 -DXPLM420=1 -DXPLM430=1 -DXPLM440=1 \
+            -DXCOPILOT_BUILD='"$(BUILD)"' \
+            -I$(SDK)/CHeaders/XPLM -Ithird_party/imgui
+LDFLAGS  := -dynamiclib -mmacosx-version-min=12.0 -F$(SDK)/Libraries/Mac \
+            -framework XPLM -framework ApplicationServices \
             -framework CoreFoundation
 
-SRCS := src/$(PLUGIN).cpp src/drefs.cpp src/panel.cpp src/fms.cpp \
+SRCS := src/$(PLUGIN).cpp src/drefs.cpp src/panel.cpp src/fms.cpp src/imgui_xp.cpp \
         third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp \
-        third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp \
-        third_party/ImgWindow/ImgWindow.cpp third_party/ImgWindow/ImgFontAtlas.cpp
+        third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
 HDRS := $(wildcard src/*.h)
 
 OUT := build/mac_x64/$(PLUGIN).xpl

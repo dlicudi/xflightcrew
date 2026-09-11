@@ -13,20 +13,26 @@ the mic only while it's `1`. Unlike `sim/operation/contact_atc_ptt`, this does
 **not** key the radio, and unlike a global keyboard hook it needs **no macOS
 Input-Monitoring permission** — the button press is read by X-Plane itself.
 
-The panel is a small Dear ImGui window: a toolbar of status chips (PTT light +
-phase) over a scrolling transmission log of what was heard and read back.
+The panel is a Dear ImGui window (Flight | Transcript | ATC | Route | Settings)
+with a status strip of annunciators along the bottom. It is drawn by X-Plane's
+own panel-graphics renderer (SDK 4.4, `src/imgui_xp.cpp`): ImGui's vertex
+buffers go to `XPLMDrawCalls`, its font atlas to `XPLMCreateTexture`, so there
+is no OpenGL in the plugin at all and the panel costs what a stock avionics
+screen costs. The Transcript tab has a typed-command line (Enter sends the
+words on the same queue the voice uses) and the window remembers its place,
+size and open state across sessions in `Output/preferences/xvoicelayer_panel.txt`.
 
 ## Vendored libraries
 
-`third_party/` holds Dear ImGui (MIT) and the `ImgWindow` X-Plane↔ImGui bridge
-(BSD-3, Christopher Collins) — committed so the build is self-contained. On macOS
-ImGui renders through the system OpenGL framework; no extra GL loader is needed.
+`third_party/` holds Dear ImGui (MIT, 1.92) and the B612 typeface (OFL) —
+committed so the build is self-contained.
 
 ## Build (macOS)
 
-Needs the free X-Plane SDK from <https://developer.x-plane.com/sdk/>. Either copy
-it to `plugin/SDK` (so `SDK/CHeaders/XPLM/*.h` and `SDK/Libraries/Mac/XPLM.framework`
-exist), or pass its path with `SDK=...`:
+Needs the free X-Plane SDK **4.4.0 or newer** from
+<https://developer.x-plane.com/sdk/> (the plugin needs X-Plane **12.4.4+** to
+load). Either copy it to `plugin/SDK` (so `SDK/CHeaders/XPLM/XPLMPanelGraphics.h`
+and `SDK/Libraries/Mac/XPLM.framework` exist), or pass its path with `SDK=...`:
 
 ```
 make

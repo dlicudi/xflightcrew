@@ -4,6 +4,7 @@
 
 #include "panel.h"
 
+#include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,11 +17,11 @@
 #include "XPLMDisplay.h"
 #include "XPLMMenus.h"
 #include "XPLMPlugin.h"
+#include "XPLMProcessing.h"
 #include "XPLMUtilities.h"
 
 #include "imgui.h"
-#include "ImgWindow.h"
-#include "ImgFontAtlas.h"
+#include "imgui_xp.h"
 
 #include "common.h"
 #include "drefs.h"
@@ -29,22 +30,17 @@
 #include "font_b612_bold.h"
 
 // B612 — the Airbus-designed cockpit typeface (OFL, see
-// plugin/third_party/b612/OFL.txt) — baked once into the shared atlas at
-// every UI scale (the atlas binds when the first ImgWindow is constructed
-// and can never be rebuilt after, so scale switching is a font SWAP).
-// Index = the ui_scale option (0 = 100%, 1 = 125%, 2 = 150%).
-static ImFont* g_font_body[3] = {nullptr, nullptr, nullptr};
-static ImFont* g_font_head[3] = {nullptr, nullptr, nullptr};
-static const float kUiScale[3] = {1.0f, 1.25f, 1.5f};
-// Latin-1 plus the en/em dash and bullet the app's text actually uses (the
-// default range stops at U+00FF, which is why the old default-font panel
-// needed the app-side dash scrub; the scrub stays for old plugins).
-static const ImWchar kGlyphRanges[] = {
-    0x0020, 0x00FF,
-    0x2013, 0x2014,
-    0x2022, 0x2022,
-    0,
-};
+// plugin/third_party/b612/OFL.txt). Two faces, added once; ImGui 1.92
+// rasterises them at whatever size a frame asks for (the atlas is dynamic
+// on the native renderer), so UI scale is a real size change, not a swap
+// between pre-baked copies, and every glyph the face carries is available.
+static ImFont* g_font_body = nullptr;
+static ImFont* g_font_head = nullptr;
+// Index = the ui_scale option: 100% .. 200% in quarter steps.
+static const float kUiScale[5] = {1.0f, 1.25f, 1.5f, 1.75f, 2.0f};
+static const int kUiScaleCount = 5;
+static const float kBodyPx = 16.0f;
+static const float kHeadPx = 20.0f;
 
 // Transmission log shown in the panel, each entry stamped with wall-clock time
 // so a test flight can be reviewed afterwards.
@@ -114,7 +110,7 @@ static void Chip(const char* label, ImU32 col) {
     ImVec2 ts = ImGui::CalcTextSize(label);
     const float padx = 6.0f, pady = 2.0f;
     ImVec2 size(ts.x + padx * 2, ts.y + pady * 2);
-    dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y), col, 3.0f, 0, 1.2f);
+    dl->AddRect(p, ImVec2(p.x + size.x, p.y + size.y), col, 3.0f, 1.2f);
     dl->AddText(ImVec2(p.x + padx, p.y + pady), col, label);
     ImGui::Dummy(size);
 }
@@ -159,11 +155,43 @@ static void TabMarker(bool lit, ImU32 col) {
     ImGui::GetWindowDrawList()->AddCircleFilled(c, r, col, 12);
 }
 
-class XCopilotPanel : public ImgWindow {
+// ---- remembered geometry ---------------------------------------------------
+// One line in the sim's preferences folder: "left top right bottom visible".
+// Kept beside X-Plane's own prefs (not the app's prefs.json) because it is a
+// property of this sim install's screen, not of the pilot's copilot.
+static std::string geometry_path() {
+    char prefs[512] = {0};
+    XPLMGetPrefsPath(prefs);
+    std::string p(prefs);
+    const size_t slash = p.find_last_of('/');
+    if (slash == std::string::npos) return std::string();
+    return p.substr(0, slash + 1) + "xvoicelayer_panel.txt";
+}
+static bool load_geometry(int& l, int& t, int& r, int& b, bool& visible) {
+    const std::string path = geometry_path();
+    if (path.empty()) return false;
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (f == nullptr) return false;
+    int v = 0;
+    const int n = std::fscanf(f, "%d %d %d %d %d", &l, &t, &r, &b, &v);
+    std::fclose(f);
+    visible = (v != 0);
+    return n == 5;
+}
+static void save_geometry(int l, int t, int r, int b, bool visible) {
+    const std::string path = geometry_path();
+    if (path.empty()) return;
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (f == nullptr) return;
+    std::fprintf(f, "%d %d %d %d %d\n", l, t, r, b, visible ? 1 : 0);
+    std::fclose(f);
+}
+
+class XCopilotPanel : public XpImguiWindow {
 public:
     XCopilotPanel(int l, int t, int r, int b)
-        : ImgWindow(l, t, r, b, xplm_WindowDecorationRoundRectangle,
-                    xplm_WindowLayerFloatingWindows) {
+        : XpImguiWindow(l, t, r, b, xplm_WindowDecorationRoundRectangle,
+                        xplm_WindowLayerFloatingWindows) {
         // Keep the title clean; version + build id go to Log.txt on startup instead.
         SetWindowTitle("XVoiceLayer");
         ImGuiIO& io = ImGui::GetIO();
@@ -196,9 +224,9 @@ public:
         s.Colors[ImGuiCol_ButtonActive]     = slate4;
         s.Colors[ImGuiCol_Tab]              = slate1;
         s.Colors[ImGuiCol_TabHovered]       = slate3;
-        s.Colors[ImGuiCol_TabActive]        = slate2;
-        s.Colors[ImGuiCol_TabUnfocused]     = slate1;
-        s.Colors[ImGuiCol_TabUnfocusedActive] = slate2;
+        s.Colors[ImGuiCol_TabSelected]        = slate2;
+        s.Colors[ImGuiCol_TabDimmed]        = slate1;
+        s.Colors[ImGuiCol_TabDimmedSelected] = slate2;
         s.Colors[ImGuiCol_CheckMark]        = ImVec4(0.47f, 0.88f, 0.55f, 1.0f);
         s.Colors[ImGuiCol_ScrollbarBg]      = slate1;
         s.Colors[ImGuiCol_ScrollbarGrab]    = slate2;
@@ -226,6 +254,39 @@ private:
     // The applied UI scale index; -1 forces the first frame to apply one.
     int mScaleIdx = -1;
     ImGuiStyle mBaseStyle;
+    // The typed-command line (Transcript tab): what the pilot can type when
+    // speaking is not an option, sent on Enter through xcopilot/typed.
+    char mTyped[256] = {0};
+    // A scale change asks the next frame (font pushed, metrics real) to
+    // re-fit the window to its tab strip.
+    bool mFitPending = false;
+
+    // The minimum the tab strip needs at the current font: every label at
+    // its padding, or the bar scrolls behind arrows. Measured, not guessed,
+    // so a bigger face gets a wider floor; the window grows to it (right
+    // and down, kept on screen) rather than truncating its own tabs.
+    void fitToTabs() {
+        const ImGuiStyle& st = ImGui::GetStyle();
+        static const char* kTabs[] = {"Flight", "Transcript   ", "ATC   ", "Route", "Settings"};
+        float tabs = st.WindowPadding.x * 2.0f + st.ScrollbarSize;
+        for (const char* t : kTabs) {
+            tabs += ImGui::CalcTextSize(t).x + st.FramePadding.x * 2.0f + st.ItemInnerSpacing.x;
+        }
+        const int minW = static_cast<int>(tabs + 8.0f);
+        const int minH = static_cast<int>(220 * kUiScale[mScaleIdx]);
+        SetWindowResizingLimits(minW, minH, 1400, 1400);
+        int l, t, r, b;
+        GetWindowGeometry(l, t, r, b);
+        if (r - l < minW || t - b < minH) {
+            int sl, stp, sr, sb;
+            XPLMGetScreenBoundsGlobal(&sl, &stp, &sr, &sb);
+            if (r - l < minW) r = l + minW;
+            if (t - b < minH) b = t - minH;
+            if (r > sr) { l -= r - sr; r = sr; }
+            if (b < sb) { t += sb - b; b = sb; }
+            SetWindowGeometry(l, t, r, b);
+        }
+    }
 
 protected:
     // The status strip: crew state, aircraft, the two talk lights, and the
@@ -263,17 +324,24 @@ protected:
         // style metrics from the unscaled baseline. The option dataref is the
         // instant source of truth — a Settings pick applies THIS frame.
         int scale = drefs::opt_ui_scale();
-        if (scale < 0 || scale > 2) scale = 0;
+        if (scale < 0 || scale >= kUiScaleCount) scale = 0;
         if (scale != mScaleIdx) {
             mScaleIdx = scale;
             ImGuiStyle& s = ImGui::GetStyle();
             s = mBaseStyle;
             s.ScaleAllSizes(kUiScale[scale]);
-            SetWindowResizingLimits(
-                static_cast<int>(260 * kUiScale[scale]),
-                static_cast<int>(160 * kUiScale[scale]), 1400, 1400);
+            s.FontSizeBase = kBodyPx * kUiScale[scale];
+            // The minimum that still fits the tab strip and the footer row
+            // at this scale; a window left smaller than that by a scale-up
+            // grows to it (right and down, kept on screen) rather than
+            // truncating its own tabs.
+            mFitPending = true;
         }
-        if (g_font_body[mScaleIdx]) ImGui::PushFont(g_font_body[mScaleIdx]);
+        ImGui::PushFont(g_font_body, kBodyPx * kUiScale[mScaleIdx]);
+        if (mFitPending) {
+            mFitPending = false;
+            fitToTabs();
+        }
 
         // The app heartbeats the phase ~1/s; a stale timestamp = not running.
         bool connected = drefs::app_connected();
@@ -332,7 +400,7 @@ protected:
         const float statusH = ImGui::GetFrameHeightWithSpacing()
             + ImGui::GetStyle().ItemSpacing.y;
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-        ImGui::BeginChild("tab_body", ImVec2(0, -statusH), false);
+        ImGui::BeginChild("tab_body", ImVec2(0, -statusH), ImGuiChildFlags_None);
         ImGui::PopStyleColor();
         switch (mTab) {
             case 0: buildFlightTab(connected); break;
@@ -348,8 +416,35 @@ protected:
         ImGui::Separator();
         drawStatusBar(connected);
 
-        if (g_font_body[mScaleIdx]) ImGui::PopFont();
+        ImGui::PopFont();
+        rememberGeometry();
     }
+
+    // The window's place and size outlive the session: written to the
+    // preferences folder once a move/resize has settled (2 s), read back at
+    // create. A panel that reopens where the pilot left it is one fewer
+    // thing to do before every flight.
+    int mSavedGeom[4] = {0, 0, 0, 0};
+    float mGeomChangedAt = -1.0f;
+    void rememberGeometry() {
+        int g[4];
+        GetWindowGeometry(g[0], g[1], g[2], g[3]);
+        if (std::memcmp(g, mSavedGeom, sizeof g) == 0) {
+            mGeomChangedAt = -1.0f;
+            return;
+        }
+        const float now = XPLMGetElapsedTime();
+        if (mGeomChangedAt < 0.0f) mGeomChangedAt = now;
+        if (now - mGeomChangedAt < 2.0f) return;
+        std::memcpy(mSavedGeom, g, sizeof g);
+        mGeomChangedAt = -1.0f;
+        save_geometry(g[0], g[1], g[2], g[3], GetVisible());
+    }
+public:
+    void markGeometrySaved(int l, int t, int r, int b) {
+        mSavedGeom[0] = l; mSavedGeom[1] = t; mSavedGeom[2] = r; mSavedGeom[3] = b;
+    }
+protected:
 
     // One request button: fixed width so rows form a grid, writes its code to
     // the request channel the app polls (each code injects the same English
@@ -373,13 +468,13 @@ protected:
         // cabin altitude, endurance, next-turn hint). Hidden when empty.
         const TextRef& strip = drefs::strip();
         if (strip.len > 0) {
-            if (g_font_head[mScaleIdx]) ImGui::PushFont(g_font_head[mScaleIdx]);
+            ImGui::PushFont(g_font_head, kHeadPx * kUiScale[mScaleIdx]);
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(COL_CYAN));
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextUnformatted(strip.buf);
             ImGui::PopTextWrapPos();
             ImGui::PopStyleColor();
-            if (g_font_head[mScaleIdx]) ImGui::PopFont();
+            ImGui::PopFont();
         }
 
         // Reserve the button block below the well: CANCEL + two arm rows +
@@ -390,7 +485,7 @@ protected:
 
         // The automation status well: the auto feed, primary line first as
         // NAME|stage, the rest one dim line each.
-        ImGui::BeginChild("auto_well", ImVec2(0, -footer), true);
+        ImGui::BeginChild("auto_well", ImVec2(0, -footer), ImGuiChildFlags_Borders);
         const TextRef& feed = drefs::auto_status();
         if (feed.len == 0) {
             const char* hint = "No automation active.";
@@ -415,10 +510,10 @@ protected:
                         *bar = '\0';
                         stage = bar + 1;
                     }
-                    if (g_font_head[mScaleIdx]) ImGui::PushFont(g_font_head[mScaleIdx]);
+                    ImGui::PushFont(g_font_head, kHeadPx * kUiScale[mScaleIdx]);
                     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE),
                                        "%s", line);
-                    if (g_font_head[mScaleIdx]) ImGui::PopFont();
+                    ImGui::PopFont();
                     if (stage[0] != '\0') {
                         ImGui::SameLine();
                         Chip(stage, COL_AMBER);
@@ -515,11 +610,19 @@ protected:
             coach_h = ImGui::CalcTextSize(coachText.buf, nullptr, false, wrap_w).y
                 + ImGui::GetStyle().ItemSpacing.y * 2.0f;
         }
-        // One reserved row below the well (the log controls; the status bar
-        // sits outside the tab body now), plus the coach strip.
-        const float footer = ImGui::GetFrameHeightWithSpacing()
+        // Two reserved rows below the well (the typed-command line and the
+        // log controls; the status bar sits outside the tab body now), plus
+        // the coach strip.
+        // (Three rows when the controls wrap under the filters: measured the
+        // same way the wrap decides, so the well shrinks only when they do.)
+        const float ctlNeed = ImGui::CalcTextSize("copilot atc others").x
+            + ImGui::GetFrameHeight() * 4.0f + ImGui::GetStyle().FramePadding.x * 8.0f
+            + ImGui::GetStyle().ItemSpacing.x * 5.0f
+            + ImGui::CalcTextSize("follow Clear").x;
+        const float rows = ImGui::GetContentRegionAvail().x < ctlNeed ? 3.0f : 2.0f;
+        const float footer = ImGui::GetFrameHeightWithSpacing() * rows
             + ImGui::GetStyle().ItemSpacing.y + coach_h;
-        ImGui::BeginChild("log", ImVec2(0, -footer), true);
+        ImGui::BeginChild("log", ImVec2(0, -footer), ImGuiChildFlags_Borders);
         if (g_log.empty()) {
             // Empty state, centred in the well — not a footer mumble.
             const char* hint = connected ? "Hold PTT and speak." : "Start XVoiceLayer to connect.";
@@ -574,6 +677,26 @@ protected:
             ImGui::PopStyleColor();
         }
 
+        // The typed line: the same words the pilot would speak, for when the
+        // mic is the wrong tool (a quiet house, a test, a hoarse throat).
+        // Enter sends it through xcopilot/typed; the app injects it on the
+        // typed-command queue exactly like a terminal line or a button, so
+        // every gate and readback still applies. Focus stays in the field
+        // so a run of commands needs no re-click.
+        {
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::InputTextWithHint("##typed", "Type a command and press Enter",
+                                         mTyped, sizeof mTyped,
+                                         ImGuiInputTextFlags_EnterReturnsTrue)) {
+                if (mTyped[0] != '\0' && connected) {
+                    drefs::set_typed(mTyped);
+                    AppendLog("PILOT", COL_WHITE, mTyped);
+                }
+                mTyped[0] = '\0';
+                ImGui::SetKeyboardFocusHere(-1);
+            }
+        }
+
         // Footer: the view filter on the left, log controls on the right —
         // state lives in the chips, version in Settings.
         ImGui::Checkbox("copilot", &g_flt_copilot);
@@ -581,12 +704,20 @@ protected:
         ImGui::Checkbox("atc", &g_flt_atc);
         ImGui::SameLine();
         ImGui::Checkbox("others", &g_flt_others);
-        // Right-aligned: auto-scroll toggle + clear.
+        // Right-aligned: auto-scroll toggle + clear. On a window too narrow
+        // for both groups on one row (a large UI scale) they take the next
+        // row instead of overprinting the filters.
         const char* clearLbl = "Clear";
         float ctlW = ImGui::CalcTextSize("Clear").x + ImGui::CalcTextSize("follow").x
             + ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 6.0f
             + ImGui::GetStyle().ItemSpacing.x * 2.0f;
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - ctlW);
+        const float rowEnd = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x;
+        const float rightX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - ctlW;
+        if (rightX > rowEnd + ImGui::GetStyle().ItemSpacing.x) {
+            ImGui::SameLine(rightX);
+        } else {
+            ImGui::SetCursorPosX(rightX);
+        }
         ImGui::Checkbox("follow", &g_log_autoscroll);
         ImGui::SameLine();
         if (ImGui::SmallButton(clearLbl)) {
@@ -721,7 +852,7 @@ protected:
                 // edge — Heathrow publishes six services, and clipped
                 // buttons can't be clicked.
                 const float wrap_x =
-                    ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+                    ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
                 for (size_t j = 0; j < f.freqs.size(); ++j) {
                     const AtcService& s = f.freqs[j];
                     bool tuned = std::abs(com1 - s.khz) <= 5;
@@ -846,17 +977,28 @@ protected:
         int uiScale = drefs::opt_ui_scale();
         if (uiScale >= 0) {
             ImGui::TextUnformatted("UI scale");
-            ImGui::RadioButton("100%", &uiScale, 0);
-            ImGui::SameLine();
-            ImGui::RadioButton("125%", &uiScale, 1);
-            ImGui::SameLine();
-            ImGui::RadioButton("150%", &uiScale, 2);
+            static const char* kScaleLabels[kUiScaleCount] = {"100%", "125%", "150%", "175%", "200%"};
+            // Wrap at the panel edge: a radio the pilot cannot see cannot
+            // be picked (the 200% option fell off a 200% panel).
+            const float wrap_x =
+                ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+            for (int i = 0; i < kUiScaleCount; ++i) {
+                if (i > 0) {
+                    const ImGuiStyle& st = ImGui::GetStyle();
+                    const float next_w = ImGui::GetFrameHeight() + st.ItemInnerSpacing.x
+                        + ImGui::CalcTextSize(kScaleLabels[i]).x;
+                    if (ImGui::GetItemRectMax().x + st.ItemSpacing.x + next_w < wrap_x) {
+                        ImGui::SameLine();
+                    }
+                }
+                ImGui::RadioButton(kScaleLabels[i], &uiScale, i);
+            }
             if (uiScale != drefs::opt_ui_scale()) drefs::set_opt_ui_scale(uiScale);
             ImGui::Spacing();
             ImGui::Separator();
         }
-        // In ATC-only mode the copilot's settings would be dead switches
-        // (this ImGui predates BeginDisabled, so hide rather than grey).
+        // In ATC-only mode the copilot's settings would be dead switches:
+        // hidden, not greyed, so the tab reads as the mode it is in.
         const bool crew_off = (mode == 2);
         if (crew_off) {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
@@ -927,10 +1069,11 @@ protected:
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
                            "Changes apply live; no restart needed.");
         ImGui::Separator();
-        // Dev corner: the plugin reload (bounces ALL plugins — the SDK can't
-        // reload just one) and the build identity, out of the pilot's way.
-        if (ImGui::SmallButton("Reload plugins")) {
-            XPLMReloadPlugins();
+        // Dev corner: reload THIS plugin only (SDK 4.4: the other plugins
+        // stay up, and a mid-flight rebuild no longer bounces the airframe's
+        // own systems) and the build identity, out of the pilot's way.
+        if (ImGui::SmallButton("Reload plugin")) {
+            XPLMReloadThisPlugin(0);
         }
         ImGui::SameLine();
         ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
@@ -964,34 +1107,37 @@ static int TogglePanelHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
 namespace panel {
 
 void create() {
-    // One shared font atlas for all ImgWindows. Every font and size is baked
-    // HERE: the atlas binds its texture when the first ImgWindow is
-    // constructed below, and can never take another font after that — scale
-    // switching swaps between these pre-baked sizes at draw time.
-    ImgWindow::sFontAtlas = std::make_shared<ImgFontAtlas>();
-    ImFontConfig cfg;
-    cfg.FontDataOwnedByAtlas = false;  // the arrays are static — never freed
-    static const float kBodyPx[3] = {16.0f, 20.0f, 24.0f};
-    static const float kHeadPx[3] = {20.0f, 25.0f, 30.0f};
-    // Body first: the first font added is the atlas default, so even a code
-    // path that never pushes a font renders B612 at 100%.
-    for (int i = 0; i < 3; ++i) {
-        g_font_body[i] = ImgWindow::sFontAtlas->AddFontFromMemoryTTF(
-            B612_Regular_ttf, static_cast<int>(B612_Regular_ttf_len),
-            kBodyPx[i], &cfg, kGlyphRanges);
-    }
-    for (int i = 0; i < 3; ++i) {
-        g_font_head[i] = ImgWindow::sFontAtlas->AddFontFromMemoryTTF(
-            B612_Bold_ttf, static_cast<int>(B612_Bold_ttf_len),
-            kHeadPx[i], &cfg, kGlyphRanges);
-    }
-
     int sl, st, sr, sb;
     XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
     // Start well below the top edge so the panel clears the X-Plane menu bar.
     // Wide enough for the Flight tab's four-button rows in the 16px body font.
     int wl = sl + 50, wt = st - 150, wr = wl + 470, wb = wt - 340;
+    bool visible = false;
+    // Last session's place, if it still fits the screen we have now (a
+    // monitor that went away must not swallow the panel).
+    int gl, gt, gr, gb;
+    bool gv;
+    if (load_geometry(gl, gt, gr, gb, gv) && gr - gl >= 260 && gt - gb >= 160
+        && gl >= sl && gr <= sr && gb >= sb && gt <= st) {
+        wl = gl; wt = gt; wr = gr; wb = gb;
+        visible = gv;
+    }
     g_panel = std::make_unique<XCopilotPanel>(wl, wt, wr, wb);
+    g_panel->markGeometrySaved(wl, wt, wr, wb);
+
+    // The faces are added to THIS window's atlas, once, at no fixed size:
+    // the frame picks the size (see buildInterface). The first face added is
+    // the default, so even a path that never pushes a font renders B612.
+    {
+        ImFontConfig cfg;
+        cfg.FontDataOwnedByAtlas = false;  // the arrays are static — never freed
+        ImGuiIO& io = ImGui::GetIO();
+        g_font_body = io.Fonts->AddFontFromMemoryTTF(
+            B612_Regular_ttf, static_cast<int>(B612_Regular_ttf_len), 0.0f, &cfg);
+        g_font_head = io.Fonts->AddFontFromMemoryTTF(
+            B612_Bold_ttf, static_cast<int>(B612_Bold_ttf_len), 0.0f, &cfg);
+    }
+    if (visible) g_panel->SetVisible(true);
     g_toggle_cmd = XPLMCreateCommand("xcopilot/toggle_panel", "XVoiceLayer: toggle the status panel");
     XPLMRegisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr);
 
@@ -1002,8 +1148,14 @@ void create() {
 
 void destroy() {
     if (g_toggle_cmd) { XPLMUnregisterCommandHandler(g_toggle_cmd, TogglePanelHandler, 1, nullptr); g_toggle_cmd = nullptr; }
+    if (g_panel) {
+        int l, t, r, b;
+        g_panel->GetWindowGeometry(l, t, r, b);
+        save_geometry(l, t, r, b, g_panel->GetVisible());
+    }
     g_panel.reset();
-    ImgWindow::sFontAtlas.reset();
+    g_font_body = nullptr;
+    g_font_head = nullptr;
     if (g_menu) { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
 }
 

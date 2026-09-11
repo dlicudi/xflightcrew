@@ -81,9 +81,11 @@ int opt_mode();
 void set_opt_mode(int v);
 int opt_cabin();
 void set_opt_cabin(int v);
-// UI scale index (0 = 100%, 1 = 125%, 2 = 150%; -1 = app hasn't published).
+// UI scale index (0 = 100% .. 4 = 200% in quarter steps; -1 = app hasn't published).
 int opt_ui_scale();
 void set_opt_ui_scale(int v);
+// Hand a typed command to the app (xcopilot/typed; consumed by the app).
+void set_typed(const char* text);
 int opt_voice();
 void set_opt_voice(int v);
 const char* voice_list();

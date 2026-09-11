@@ -90,7 +90,7 @@ pub fn save_cabin_crew(staffing: &str) {
 
 /// The saved panel UI scale index (0/1/2), if any.
 pub fn ui_scale() -> Option<i64> {
-    load().ui_scale.filter(|v| (0..=2).contains(v))
+    load().ui_scale.filter(|v| (0..=4).contains(v))
 }
 
 /// Persist a new panel UI scale pick. Best-effort, like the others.
