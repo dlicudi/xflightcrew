@@ -54,6 +54,25 @@ created. Corollary for the workflow: an untested plugin build must not be
 installed into the live folder while a flight is running, because any
 reload, the pilot's included, loads it.
 
+The same session's taxi from Anchorage's GA ramp went 1.4 km on a beeline
+across the aprons before the drawn route began, and the tower was Lake Hood
+Strip's. `region_tick` picked the ground field by raw distance to
+`AirportInfo::position()`, the FIRST runway threshold: Anchorage's first
+row is 7R/25L, 2.7 nm from that ramp, so Lake Hood's single threshold
+(0.9 nm) was "nearer", and the 5 nm enroute hysteresis then pinned it
+there for good. The planner's start snap accepts a taxiway node up to
+3,000 m away, so Lake Hood's network (nearest node 1,393 m) was reached by
+a straight line. Fix in `nav::AirportInfo::ground_distance_nm`: on the
+ground the field is measured by FOOTPRINT, the nearest point on any runway
+centreline (0.56 nm to 15/33 against 0.91 nm to Lake Hood's strip), with a
+0.2 nm ground margin instead of the enroute 5 nm; the test drives both the
+ramp (Anchorage takes over, crew note) and Lake Hood's own parallel taxiway
+60 m off 14/32 (Lake Hood stays). Airborne scoring is untouched. Also
+heard: "then the holding point via ." when a route had no named legs; the
+via clause is now omitted when empty. Not changed: the 3,000 m start snap,
+which is what lets thin Gateway networks degrade instead of refusing; a
+start that far from the network is a station problem, now fixed upstream.
+
 ## Local flight planner, stage one — 2026-09-10
 
 The only way to get a route into the FMS was a SimBrief plan. The plugin's

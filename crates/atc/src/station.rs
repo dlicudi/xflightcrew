@@ -2046,6 +2046,9 @@ static LAST_REGION_SWITCH: Mutex<Option<Instant>> = Mutex::new(None);
 /// The new field must be this much nearer than the active one before a
 /// handoff — hysteresis, so the midpoint between two fields can't flap.
 const SWITCH_MARGIN_NM: f64 = 5.0;
+/// The ground relocation's margin: the field whose pavement is nearer, by a
+/// fraction of a mile, is the field you are at.
+const GROUND_MARGIN_NM: f64 = 0.2;
 /// No handoff to a field further than this — enroute over nowhere keeps the
 /// last controller (a lightweight "radar" continuity).
 const SWITCH_MAX_NM: f64 = 60.0;
@@ -2154,8 +2157,22 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     // BORROWED the big field's frequencies — Trebujena's apt.dat rows name
     // "Jerez Tower"/"Seville Approach", and picking it by raw distance had
     // approach faithfully vectoring the Jerez arrival onto Trebujena's 800 m
-    // grass runway two six (flown 2026-07-11). On the ground, raw nearest:
-    // a relocation goes to the field you are physically at, however small.
+    // grass runway two six (flown 2026-07-11). On the ground, raw nearest by
+    // FOOTPRINT (the nearest runway centreline, not the first threshold): a
+    // relocation goes to the field whose pavement you are physically on,
+    // however small. Measured from the first runway row, Anchorage's GA ramp
+    // was "nearer" Lake Hood Strip than Anchorage itself, and the whole
+    // sortie (2026-09-10) taxied 1.4 km across Anchorage's aprons on a
+    // beeline to Lake Hood's network before the drawn route began.
+    let distance = |a: &RegionApt| -> f64 {
+        if on_ground {
+            a.apt
+                .ground_distance_nm(lat, lon)
+                .unwrap_or_else(|| crate::nav::haversine_nm(lat, lon, a.lat, a.lon))
+        } else {
+            crate::nav::haversine_nm(lat, lon, a.lat, a.lon)
+        }
+    };
     let score = |d: f64, apt: &nav::AirportInfo| {
         if on_ground {
             d
@@ -2166,7 +2183,7 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     let (d_best, s_best, best) = region
         .iter()
         .map(|a| {
-            let d = crate::nav::haversine_nm(lat, lon, a.lat, a.lon);
+            let d = distance(a);
             (d, score(d, &a.apt), a)
         })
         .min_by(|x, y| x.1.total_cmp(&y.1))?;
@@ -2179,13 +2196,18 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     if (on_ground && d_best > AT_FIELD_NM) || (!on_ground && d_best > SWITCH_MAX_NM) {
         return None;
     }
-    // Hysteresis on the same scale the pick was made on.
+    // Hysteresis on the same scale the pick was made on. Adjacent fields
+    // (Anchorage and Lake Hood share a fence) are decided by a fraction of a
+    // mile on the ground, so the enroute margin would pin the pilot to
+    // whichever answered first; the cooldown and a parked aircraft's fixed
+    // geometry keep it from ping-ponging.
     let s_active = region
         .iter()
         .find(|a| a.apt.name == active_name)
-        .map(|a| score(crate::nav::haversine_nm(lat, lon, a.lat, a.lon), &a.apt))
+        .map(|a| score(distance(a), &a.apt))
         .unwrap_or_else(|| crate::nav::haversine_nm(lat, lon, a_lat, a_lon));
-    if s_best + SWITCH_MARGIN_NM > s_active {
+    let margin = if on_ground { GROUND_MARGIN_NM } else { SWITCH_MARGIN_NM };
+    if s_best + margin > s_active {
         return None;
     }
     let khz = best.apt.freq(nav::FREQ_TOWER)?.khz;
@@ -6936,6 +6958,44 @@ mod tests {
         *ATIS.lock().unwrap() = None;
     }
 
+    /// Anchorage's GA ramp north of 15/33 with Lake Hood Strip next door
+    /// (2026-09-10): Anchorage's FIRST runway row is 7R/25L, 2.7 nm away,
+    /// so by threshold Lake Hood (0.9 nm) is "nearer" and the whole sortie
+    /// was cleared to taxi 1.4 km across Anchorage's aprons to Lake Hood's
+    /// network. By footprint the ramp is 0.56 nm from 15/33: Anchorage takes
+    /// over, and it is the crew's note, not a handoff.
+    fn run_adjacent_fields_case() {
+        let rwy = |a: &str, b: &str, la: f64, lo: f64, lb: f64, lob: f64| nav::Runway {
+            ident_a: a.into(),
+            ident_b: b.into(),
+            lat_a: la,
+            lon_a: lo,
+            lat_b: lb,
+            lon_b: lob,
+            width_m: 45.0,
+        };
+        let mut anc = region_apt("Ted Stevens Anchorage Intl", 61.1678, -150.0429);
+        anc.apt.runways = vec![
+            rwy("7R", "25L", 61.1678122, -150.0428651, 61.1678817, -149.9726428),
+            rwy("15", "33", 61.1997218, -150.0145266, 61.1710187, -149.9984751),
+        ];
+        let mut lhd = region_apt("Lake Hood Strip", 61.1895, -149.9685);
+        lhd.apt.runways = vec![rwy("14", "32", 61.1894983, -149.9684894, 61.1836374, -149.9622678)];
+        *REGION.lock().unwrap() = vec![anc, lhd];
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Lake Hood Strip".into(), 61.1895, -149.9685));
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        let sw = region_tick(61.19636, -149.9965, true, Instant::now()).expect("ramp is Anchorage's");
+        assert!(sw.crew, "{}", sw.line);
+        assert!(sw.line.contains("Ted Stevens Anchorage"), "{}", sw.line);
+        // And from Lake Hood's own parallel taxiway (60 m west of 14/32),
+        // Lake Hood stays: that pavement is theirs.
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Lake Hood Strip".into(), 61.1895, -149.9685));
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        assert!(region_tick(61.18743, -149.96737, true, Instant::now()).is_none());
+    }
+
     fn region_apt(name: &str, lat: f64, lon: f64) -> RegionApt {
         RegionApt {
             icao: name.get(0..4).unwrap_or("XXXX").to_uppercase(),
@@ -7088,6 +7148,7 @@ mod tests {
         assert!(sw.crew, "ground switch is the crew's note");
         assert!(sw.line.contains("We're at Malaga"), "{}", sw.line);
         run_borrowing_strip_case(); // same SIDE_STATE_LOCK scope, statics owned here
+        run_adjacent_fields_case();
         *REGION.lock().unwrap() = Vec::new();
         *ACTIVE_FIELD.lock().unwrap() = None;
         *PENDING_STATION.lock().unwrap() = None;

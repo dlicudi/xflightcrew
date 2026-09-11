@@ -293,6 +293,42 @@ impl AirportInfo {
     pub fn position(&self) -> Option<(f64, f64)> {
         self.runways.first().map(|r| (r.lat_a, r.lon_a))
     }
+
+    /// How far (nm) a point is from the field's PAVEMENT: the nearest point on
+    /// any runway centreline. The question "which field am I standing at" is
+    /// about footprint, and [`position`](Self::position) is a poor proxy for
+    /// it on a big airport: Anchorage's first runway row is 7R/25L, whose
+    /// threshold lies 2.7 nm from the GA ramp north of 15/33, while Lake Hood
+    /// Strip's single threshold is 0.9 nm from that same ramp. Measured by
+    /// footprint the ramp is 0.56 nm from Anchorage's 15/33 and 0.91 nm from
+    /// Lake Hood's strip, which is the answer a pilot would give. A field
+    /// with no runway rows has no footprint and answers `None`.
+    pub fn ground_distance_nm(&self, lat: f64, lon: f64) -> Option<f64> {
+        let m_per_deg_lat = 111_320.0;
+        let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
+        let best = self
+            .runways
+            .iter()
+            .map(|r| {
+                // Flat-earth in metres around the query point: the distances
+                // here are a few km at most.
+                let ax = (r.lon_a - lon) * m_per_deg_lon;
+                let ay = (r.lat_a - lat) * m_per_deg_lat;
+                let bx = (r.lon_b - lon) * m_per_deg_lon;
+                let by = (r.lat_b - lat) * m_per_deg_lat;
+                let (dx, dy) = (bx - ax, by - ay);
+                let len2 = dx * dx + dy * dy;
+                let t = if len2 > 0.0 {
+                    (-(ax * dx + ay * dy) / len2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let (px, py) = (ax + t * dx, ay + t * dy);
+                (px * px + py * py).sqrt()
+            })
+            .min_by(|a, b| a.total_cmp(b))?;
+        Some(best / 1852.0)
+    }
 }
 
 impl AirportInfo {

@@ -196,15 +196,21 @@ impl Tool for AutoTaxi {
                 format!("holding point {hp}")
             }
         };
+        // A route with no named legs (a sparse network, or a stand a few
+        // metres off the taxiway) is "then the holding point", not "via ."
+        // (heard at Lake Hood, 2026-09-10).
+        let via = if watch.via.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" via {}", watch.via)
+        };
         Ok(if joining {
             format!(
-                "My taxi. I'll get us onto the route first, then {dest} via {}. Your pedals or my controls take it back any time.",
-                watch.via
+                "My taxi. I'll get us onto the route first, then {dest}{via}. Your pedals or my controls take it back any time.",
             )
         } else {
             format!(
-                "My taxi. {dest} via {}, {base:.0} knots. Your pedals or my controls take it back any time.",
-                watch.via
+                "My taxi. {dest}{via}, {base:.0} knots. Your pedals or my controls take it back any time.",
             )
         })
     }
