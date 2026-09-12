@@ -4023,6 +4023,8 @@ fn analyze_commands() -> Result<()> {
 
 /// Map an X-Plane ICAO type code to a profile id. Unknown types fall back to
 /// the Cessna so the app stays usable; add rows as profiles are added.
+/// The tests' view of the map: a known type's profile, else the 172.
+#[cfg(test)]
 fn icao_to_profile(icao: &str) -> String {
     known_profile(icao).unwrap_or_else(|| "cessna_172sp".to_string())
 }
