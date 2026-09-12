@@ -127,8 +127,10 @@ const TUG_PATIENCE_SECS: f64 = 30.0;
 /// A second crew line deep into the wait, so the long ceiling stays narrated
 /// rather than silent ("still coming" beats three quiet minutes).
 const TUG_PATIENCE2_SECS: f64 = 150.0;
-/// Hooked on but not rolling this long after the ask: say it again, once.
-const NUDGE_SECS: f64 = 12.0;
+/// The tug hooked on, let go WITHOUT pushing, and has been gone this long:
+/// summon it again, once. Never sent to a tug on the bar — a command to an
+/// attached tug drops it off the bar (five pushes for five, 2026-09-12).
+const NUDGE_SECS: f64 = 30.0;
 /// Rolled back this far and the push is genuinely under way — the "are we
 /// moving" test is our OWN position, not a dataref, because the sim raises
 /// none while a tug pushes (see [`PUSH_ATTACHED`]). Comfortably past GPS
@@ -139,10 +141,6 @@ const MOVED_M: f64 = 1.5;
 /// push rather than waiting out `MAX_SECS`. Generous, because the tug's own
 /// acceleration is slow and a real push has slack in it.
 const STALL_SECS: f64 = 12.0;
-/// How many patterns we may ask for in one push. One is the plan; the rest
-/// are continuations when the tug stopped short. Bounded so a tug that cannot
-/// finish cannot keep us at the stand.
-const MAX_ISSUES: u32 = 3;
 /// Whole-push timeout: something is wrong (a tug pushing us nowhere, a stuck
 /// dataref) and the sequence must not sit at the gate forever.
 const MAX_SECS: f64 = 300.0;
@@ -448,6 +446,12 @@ pub fn steered() -> bool {
 /// with the brakes off and no governor running, so it is the one stage where
 /// the word has to land somewhere. Cleared at the start of every run.
 pub static ABORT: AtomicBool = AtomicBool::new(false);
+/// "Skip the push": end the steered push (tug stopped, brakes on) and let
+/// full auto turn the aircraft round under its own steam. Set by the
+/// pushback tool's stop action while a steered push runs; consumed by the
+/// loop, which returns `Err("skipped")`. Distinct from [`ABORT`], which is
+/// full auto's own stop and ends the whole mission.
+pub static SKIP: AtomicBool = AtomicBool::new(false);
 
 /// Either flag — the caller's, or the pilot's.
 fn stopping(abort: &AtomicBool) -> bool {
@@ -472,6 +476,7 @@ pub async fn run(
     ACTIVE.store(true, SeqCst);
     STEERED.store(true, SeqCst);
     ABORT.store(false, SeqCst);
+    SKIP.store(false, SeqCst);
     let out = run_inner(xp, ctx, voice, plan, abort, valve_set).await;
     // Stop-and-let-go on EVERY exit, unconditionally. A pushback command is a
     // whole manoeuvre the tug runs on its own, and a re-issued continuation
@@ -578,7 +583,7 @@ async fn run_inner(
         // until the tug is solidly on the bar, THEN release (2026-08-02).
         let mut solid = 0u32;
         loop {
-            if stopping(abort) {
+            if stopping(abort) || SKIP.load(SeqCst) {
                 break false;
             }
             let (a, t) = tokio::join!(xp.get_float(PUSH_ATTACHED), xp.get_float(TOW_IN_PROGRESS));
@@ -625,19 +630,24 @@ async fn run_inner(
         // us must not hook onto an aircraft that has given up and started
         // taxiing.
         send(ctx, "stop").await;
+        if SKIP.swap(false, SeqCst) {
+            event(json!({ "event": "skipped", "stage": "waiting" }));
+            return Err("skipped".into());
+        }
         event(json!({ "event": "no_tug", "waited_s": TUG_WAIT_SECS }));
         return Err(if stopping(abort) { "abort" } else { "no_tug" }.into());
     }
 
-    // The tug ignores a command issued before it was on the bar: the summon
-    // above brought it, and nothing moved until the command was sent AGAIN
-    // once hooked (live, the re-send was the twelve-second "nudge" and the
-    // push began a minute later, 2026-07-27). So re-issue here, and treat the
-    // pre-hook command as having done its one job — calling the truck.
-    // Issued BEFORE the brakes come off: the aircraft is never brakeless with
-    // a tug that has no instruction yet.
-    send(ctx, cmd_now.action()).await;
-    event(json!({ "event": "issued", "pattern": cmd_now.action(), "issue": 1 }));
+    // NOTHING is sent to a tug on the bar. The summon carried the pattern,
+    // and a command to an attached tug drops it off the bar: every push in
+    // the log (five for five, 2026-09-12) shows `hooked`, the old re-issue,
+    // and the attach flag false on the very next poll, the tug driving off
+    // and coming back ninety seconds later to push. The 2026-07-27 premise
+    // ("nothing moved until the command was sent again") was that cycle seen
+    // from the inside: the re-send was what made it leave, and the push that
+    // "began a minute later" was its return. The tug pushes when the brakes
+    // come off.
+    event(json!({ "event": "on_bar", "pattern": cmd_now.action() }));
 
     // Hooked, instructed: NOW the brakes come off — the crew's "brakes
     // released" answer to the tug's "brakes off please", and the first moment
@@ -650,8 +660,7 @@ async fn run_inner(
     // aircraft's own behaviour on the first sustained turn, once.
     let mut sense: i8 = sense0;
     let mut flipped = false;
-    let mut cmd = cmd_now;
-    let mut issues = 1u32;
+    let cmd = cmd_now;
     // When the pattern went on, and the error it started from — the pair the
     // sense is learned from.
     let mut turn_since: Option<(Instant, f64)> = (cmd != Steer::Straight).then_some((began, err0));
@@ -696,6 +705,12 @@ async fn run_inner(
         if crate::xplane::sim_frozen(xp).await {
             tokio::time::sleep(Duration::from_millis(TICK_MS)).await;
             continue;
+        }
+        if SKIP.swap(false, SeqCst) {
+            send(ctx, "stop").await;
+            let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
+            event(json!({ "event": "skipped", "stage": "pushing", "back_m": r1(back_m) }));
+            return Err("skipped".into());
         }
         let (lat_r, lon_r, psi_r, tow_r, att_r) = tokio::join!(
             xp.get_float(LAT),
@@ -797,15 +812,15 @@ async fn run_inner(
             send(ctx, "stop").await;
             return Err("tug_released".into());
         }
-        // On the bar but going nowhere: ask again, once. The first command
-        // only summoned the truck. Re-issue THE SAME pattern — the nudge used
-        // to send "straight" unconditionally, which re-aimed a tug that had
-        // been correctly told to swing the nose left.
-        if !towed && !nudged && began.elapsed().as_secs_f64() >= NUDGE_SECS {
+        // Hooked on, let go WITHOUT pushing, and gone: summon it again, once,
+        // with THE SAME pattern (a "straight" nudge once re-aimed a tug that
+        // had been correctly told to swing the nose left). Never while it is
+        // on the bar — that command is what makes it let go.
+        if !towed && !attached && !nudged && began.elapsed().as_secs_f64() >= NUDGE_SECS {
             nudged = true;
             tracing::info!(
                 pattern = cmd.action(),
-                "pushback: hooked but not moving, asking again"
+                "pushback: tug left without pushing, asking again"
             );
             event(json!({ "event": "nudge", "pattern": cmd.action() }));
             send(ctx, cmd.action()).await;
@@ -860,10 +875,8 @@ async fn run_inner(
                     // both Luton pushes on 2026-07-28 show `sense_learned`
                     // followed by `tug_released` one second later, ~46 m into
                     // the plan. The tug is running a whole manoeuvre it will
-                    // finish and stop; the stall-continuation below re-issues
-                    // with the CORRECTED sense once it has stopped, which is
-                    // the one moment a new pattern is known to take (the
-                    // hook-up re-issue is the same moment).
+                    // finish and stop; the learned sense serves the NEXT push
+                    // (nothing is ever re-issued to a tug on the bar).
                     tracing::info!(
                         sense,
                         "pushback: turn sense inverted, correcting at the tug's next stop"
@@ -883,24 +896,20 @@ async fn run_inner(
             moved_m = back_m;
             moved_at = Instant::now();
         } else if towed && moved_at.elapsed().as_secs_f64() >= STALL_SECS {
-            // Only a tug still ON THE BAR can take an instruction. Without
-            // this the stall clock and the release branch both fired within
-            // one tick at Malaga — `issued` #2 and `reissued_after_release`
-            // #3, 0.6 s apart — spending the whole budget on a tug that had
-            // already let go (2026-08-03).
-            if issues >= MAX_ISSUES
-                || !worth_another_pattern(back_m, err, plan)
-                || (saw_attached && !attached)
-            {
-                event(json!({ "event": "tug_finished", "back_m": r1(back_m), "err": r1(err) }));
+            // The tug has run its pattern and stopped. It used to be asked
+            // for another; a command to a tug ON THE BAR drops it off the bar
+            // (five for five, 2026-09-12) and it comes back ninety seconds
+            // later, so the push ends here: let go, and judge what it
+            // delivered exactly as at a release. The residual is the taxi's.
+            let delivered = push_delivered(back_m, err, plan);
+            event(json!({ "event": "tug_finished", "back_m": r1(back_m),
+                          "err": r1(err), "delivered": delivered }));
+            if delivered {
                 break;
             }
-            cmd = steer_for(err, sense);
-            issues += 1;
-            event(json!({ "event": "issued", "pattern": cmd.action(), "issue": issues }));
-            send(ctx, cmd.action()).await;
-            turn_since = (cmd != Steer::Straight).then_some((Instant::now(), err));
-            moved_at = Instant::now();
+            send(ctx, "stop").await;
+            let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
+            return Err("short".into());
         }
         tokio::time::sleep(Duration::from_millis(TICK_MS)).await;
     }

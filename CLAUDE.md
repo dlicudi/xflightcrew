@@ -353,8 +353,15 @@ history):
   aircraft** (`handoff_to_caller`) and about the height actually reached.
 - **Pushback** ([src/pushback.rs](src/pushback.rs)): X-Plane's three pushback
   commands are WHOLE manoeuvres the tug executes (a "Nose 90" is ~90 degrees,
-  and that belongs in the plan's arithmetic) - picked once, re-issued only at
-  hook-up, never steered per tick; `pushback_stop` means "stop and let go".
+  and that belongs in the plan's arithmetic) - sent ONCE, at the summon,
+  never steered per tick; `pushback_stop` means "stop and let go". **A
+  command to a tug ON THE BAR drops it off the bar** (five pushes for five,
+  2026-09-12: hooked, re-issued, detached on the next poll, back ninety
+  seconds later): no re-issue at hook-up, no nudge while attached, no
+  second pattern - a tug that stops short is stopped and judged
+  (`push_delivered`), the residual is the taxi's. "Skip / cancel the
+  pushback" is `pushback::SKIP` (the push ends, the mission turns the
+  aircraft under its own steam); the bare "stop" word aborts the mission.
   The bar coming off ENDS the push - judge `push_delivered`, never wait for a
   re-hook (measured: released tugs never come back). Hook needs
   `HOOK_SOLID_POLLS` consecutive attached polls before brakes release, with

@@ -121,10 +121,6 @@ pub fn note_said(text: &str) {
     LAST_SAID.set(text.trim());
 }
 
-/// Forget the last line (a new flight, a mode change).
-pub fn clear_said() {
-    LAST_SAID.clear();
-}
 
 use crate::{approach_guide, autoland, autotakeoff, autotaxi, circuit, full_auto, procedure};
 use crate::{pushback, tools};

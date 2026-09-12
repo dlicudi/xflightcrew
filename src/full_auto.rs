@@ -840,6 +840,10 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                                     "The tug let go early. I'll bring us round the rest of the \
                                      way myself. Watch the wingtips."
                                 }
+                                "skipped" => {
+                                    "Skipping the push. I'll turn us round under our own steam. \
+                                     Watch the wingtips."
+                                }
                                 "creeping" => {
                                     "The tug never pushed us and we were rolling forward, so \
                                      I've got the brakes. I'll turn us around under our own \

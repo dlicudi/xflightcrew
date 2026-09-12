@@ -673,7 +673,22 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         return Some(call("set_ground_power", json!({ "on": on })));
     }
     if has(t, "pushback") || (has(t, "push") && has(t, "back")) {
-        let action = if has(t, "stop") || has(t, "halt") || has(t, "hold") {
+        // "Skip pushback" and "cancel pushback, just fly" parsed as a fresh
+        // straight push and summoned the tug the pilot was refusing (LEMG,
+        // 2026-09-12): every word of refusal is a stop.
+        let action = if has(t, "stop")
+            || has(t, "halt")
+            || has(t, "hold")
+            || has(t, "cancel")
+            || has(t, "skip")
+            || has(t, "abort")
+            || has(t, "no")
+            || has(t, "without")
+            || has(t, "forget")
+            || has(t, "don")
+            || has(t, "dont")
+            || has(t, "never")
+        {
             "stop"
         } else if has(t, "left") {
             "left"
@@ -2872,6 +2887,15 @@ mod tests {
         );
         assert_eq!(one("pushback left").unwrap().1, json!({"action":"left"}));
         assert_eq!(one("stop pushback").unwrap().1, json!({"action":"stop"}));
+        for refusal in [
+            "skip pushback",
+            "cancel pushback, just fly",
+            "no pushback",
+            "don't push back",
+            "forget the pushback",
+        ] {
+            assert_eq!(one(refusal).unwrap().1, json!({"action":"stop"}), "{refusal}");
+        }
         assert_eq!(one("request ground services").unwrap().0, "request_service");
         assert_eq!(one("refuel").unwrap().0, "request_service");
         // "ground power" must NOT be grabbed by the throttle branch (it has "power").

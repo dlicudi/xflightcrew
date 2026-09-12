@@ -260,6 +260,15 @@ impl Tool for Pushback {
     }
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let a: PushArg = serde_json::from_value(args.clone())?;
+        // Full auto's steered push owns the tug: "skip / cancel the pushback"
+        // ends the push (its loop stops the tug and sets the brakes) and the
+        // mission turns the aircraft round under its own steam. The bare
+        // "stop" word is routed earlier and aborts the whole mission; this is
+        // the pilot naming the push, not the flight.
+        if !pushback_continues(&a.action) && crate::pushback::steered() {
+            crate::pushback::SKIP.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Ok("Roger, skipping the push.".to_string());
+        }
         let (cmd, say) = match a.action.as_str() {
             "stop" | "halt" => (CMD_PUSH_STOP, "Roger, pushback stopped."),
             "left" => (CMD_PUSH_LEFT, "Roger, pushing back, turning left."),

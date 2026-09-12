@@ -4,6 +4,40 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## The tug that connected and disconnected at once — 2026-09-12
+
+"The tug seems to connect and disconnect almost immediately, and then
+reconnect. We are doing something wrong." We were. Every push in the
+blackbox (five for five) reads the same: `hooked` after three solid
+attached polls, the re-issue of the pattern the code sent "because the tug
+ignores a command issued before it was on the bar", and the attach flag
+false on the very next poll. The tug drives off, the twelve-second nudge
+sends the command again to a tug that has already gone, and it comes back
+about ninety seconds later to push. The 2026-07-27 premise behind the
+re-issue ("nothing moved until the command was sent again, and the push
+began a minute later") was this same cycle seen from the inside. The stall
+re-issue had the same effect at the far end: `issued` #2 while attached,
+`tug_finished` 0.6 s later, which is what the 2026-08-03 guard had already
+half-noticed.
+
+Rule: **a command to a tug on the bar drops it off the bar.** One command
+per push, at the summon (it carries the pattern); the tug pushes when the
+brakes come off. No re-issue at hook-up (`on_bar` event instead), the nudge
+only re-summons a tug that hooked, let go without pushing and has been gone
+30 s, and a tug that stops short is stopped and judged with
+`push_delivered` (`short` if not) rather than asked for a second pattern
+that it answers by leaving. `MAX_ISSUES` is gone.
+
+And on the same push: "Skip pushback." and "Cancel pushback, just fly."
+both parsed as a fresh straight push, two more tug requests for the pilot
+refusing one. The grammar's refusal words (cancel, skip, abort, no,
+without, forget, don't, never) are all "stop"; under a steered push the
+tool sets `pushback::SKIP`, the loop stops the tug, sets the brakes and
+returns `skipped`, and full auto says "Skipping the push. I'll turn us
+round under our own steam." The bare "stop" word still aborts the whole
+mission, as before. The push loop's `tow_in_progress` note stands: it
+reads 0 throughout.
+
 ## The Flight tab says what the copilot is doing — 2026-09-12
 
 "Could the Flight tab be more informative of what the copilot is doing?"
