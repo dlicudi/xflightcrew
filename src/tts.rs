@@ -196,6 +196,15 @@ pub fn stop_channel(ch: Channel) {
     if let Some(pid) = PLAYER_PID.lock().unwrap_or_else(|e| e.into_inner())[ch as usize] {
         kill_pid(pid);
     }
+    // On the bus the sound lives in the sim, and the speaker thread's waiter
+    // sends the cut when it sees the generation move: the ONE writer, so a
+    // cut can never overtake the next play and silence the wrong line.
+}
+
+/// The channel's cut generation, for a speaker to notice a cut that landed
+/// while it was still rendering.
+pub fn channel_generation(ch: Channel) -> u64 {
+    CUT_GEN[ch as usize].load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Play mono f32 PCM through the platform player (write a temp WAV, play it).
@@ -222,7 +231,149 @@ pub(crate) fn play_pcm(samples: &[f32], sample_rate: u32) -> Result<()> {
         w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
     }
     w.finalize().context("finalizing wav")?;
+    if AUDIO_BUS.load(std::sync::atomic::Ordering::Relaxed) {
+        match play_on_bus(&path, samples.len(), sample_rate) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Once per session: the plugin is missing or old, or the sim is
+                // down. The platform player still speaks, so nothing is lost.
+                if !BUS_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!("audio bus unavailable, playing locally instead: {e:#}");
+                }
+            }
+        }
+    }
     play(&path)
+}
+
+/// Voices through the sim's own audio. Set at startup from
+/// `XCOPILOT_AUDIO_BUS` (which PINS it: the panel can't turn it off) and
+/// otherwise from the panel's Settings switch through [`set_audio_bus`].
+pub static AUDIO_BUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static AUDIO_BUS_PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BUS_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BUS_BASE_URL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// One client for every bus write (a blocking client owns a runtime and a
+/// thread; one per call was a runtime per utterance).
+static BUS_CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+/// The two mailboxes' ids: `[play, cut]`. X-Plane reassigns ids across
+/// restarts and plugin reloads, so a failed write evicts and the next call
+/// re-resolves (the convention in `xplane.rs`: a 404 is a stale id).
+static BUS_IDS: [std::sync::atomic::AtomicI64; 2] = [
+    std::sync::atomic::AtomicI64::new(0),
+    std::sync::atomic::AtomicI64::new(0),
+];
+
+/// Where the sim's Web API is, for the bus writes, and the environment's
+/// verdict. Called once at startup.
+pub fn configure_audio_bus(enabled: bool, base_url: &str) {
+    *BUS_BASE_URL.lock().unwrap_or_else(|e| e.into_inner()) = base_url.trim_end_matches('/').to_string();
+    AUDIO_BUS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    AUDIO_BUS_PINNED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The panel's pick. Refused (false) when the environment pinned it on.
+pub fn set_audio_bus(on: bool) -> bool {
+    if AUDIO_BUS_PINNED.load(std::sync::atomic::Ordering::Relaxed) {
+        return on;
+    }
+    AUDIO_BUS.store(on, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// The plugin mailboxes (see `plugin/src/audio.cpp`).
+const BUS_PLAY: &str = "xcopilot/audio/play";
+const BUS_CUT: &str = "xcopilot/audio/cut";
+/// The sim starts a posted sample on its next frame; allow for that and for
+/// the FMOD tail before declaring the utterance finished.
+const BUS_TAIL_MS: u64 = 200;
+/// How often the waiter looks for a cut: the barge-in latency on the bus.
+const BUS_CUT_POLL_MS: u64 = 20;
+
+/// A blocking Web API write, for the speaker thread. The thread is a plain
+/// one (it blocks on `afplay` today), so a blocking client is fine here; on
+/// a tokio worker it would panic, so refuse rather than find out. A failed
+/// write evicts the cached id: after a plugin reload the next post
+/// re-resolves instead of failing for the rest of the session.
+fn bus_write(slot: usize, name: &str, value: serde_json::Value) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if tokio::runtime::Handle::try_current().is_ok() {
+        bail!("audio bus write from an async thread");
+    }
+    let base = BUS_BASE_URL.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if base.is_empty() {
+        bail!("audio bus not configured");
+    }
+    let client = BUS_CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(1500))
+            .build()
+            .expect("a blocking client")
+    });
+    let mut id = BUS_IDS[slot].load(Relaxed);
+    if id == 0 {
+        #[derive(serde::Deserialize)]
+        struct Index {
+            data: Vec<Meta>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Meta {
+            id: i64,
+            name: String,
+        }
+        let index: Index = client
+            .get(format!("{base}/api/v1/datarefs"))
+            .query(&[("filter[name]", name)])
+            .send()
+            .context("dataref lookup")?
+            .error_for_status()?
+            .json()
+            .context("decoding dataref index")?;
+        id = index
+            .data
+            .into_iter()
+            .find(|d| d.name == name)
+            .map(|d| d.id)
+            .ok_or_else(|| anyhow::anyhow!("{name} not registered (plugin missing or old)"))?;
+        BUS_IDS[slot].store(id, Relaxed);
+    }
+    let ok = client
+        .patch(format!("{base}/api/v1/datarefs/{id}/value"))
+        .json(&serde_json::json!({ "data": value }))
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    if !ok {
+        BUS_IDS[slot].store(0, Relaxed);
+        bail!("writing {name} failed (stale id or sim down); will re-resolve");
+    }
+    BUS_WARNED.store(false, Relaxed);
+    Ok(())
+}
+
+/// Post the WAV to the plugin and wait out its duration, honouring a cut the
+/// way [`run_audible`] does: the killer bumps the channel's generation, this
+/// waiter notices within a tick and tells the plugin to stop the channel.
+fn play_on_bus(path: &std::path::Path, samples: usize, sample_rate: u32) -> Result<()> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let ch = thread_channel();
+    let gen = CUT_GEN[ch as usize].load(SeqCst);
+    let payload = format!("{}|{:.2}|{}", ch as usize, channel_volume(ch), path.display());
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+    bus_write(0, BUS_PLAY, serde_json::json!(b64))?;
+    let total = std::time::Duration::from_millis(
+        (samples as f64 / sample_rate.max(1) as f64 * 1000.0) as u64 + BUS_TAIL_MS,
+    );
+    let start = std::time::Instant::now();
+    while start.elapsed() < total {
+        if CUT_GEN[ch as usize].load(SeqCst) != gen {
+            let _ = bus_write(1, BUS_CUT, serde_json::json!(ch as usize));
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(BUS_CUT_POLL_MS));
+    }
+    Ok(())
 }
 
 /// Play a WAV file using the platform's default CLI player. `pub(crate)` so the

@@ -145,6 +145,10 @@ pub struct Config {
     /// Run the background monitor that calls out problems (e.g. alternator
     /// offline). On by default; set `XCOPILOT_MONITOR=false` to silence it.
     pub monitor_enabled: bool,
+    /// Play the voices through the plugin onto X-Plane's audio buses
+    /// (`XCOPILOT_AUDIO_BUS=true`); the panel's Settings switch also turns it
+    /// on live. Off by default until it has flown.
+    pub audio_bus: bool,
     /// Monitor sample rate in Hz — how often it snapshots datarefs and re-checks.
     pub monitor_hz: f32,
     /// SimBrief numeric user ID, for fetching the latest flight plan (OFP). Empty
@@ -338,6 +342,7 @@ impl Config {
             aircraft: env_or("XCOPILOT_AIRCRAFT", "auto"),
             confirm_critical: env_or("XCOPILOT_CONFIRM", "true") != "false",
             monitor_enabled: env_or("XCOPILOT_MONITOR", "true") != "false",
+            audio_bus: env_or("XCOPILOT_AUDIO_BUS", "false") == "true",
             monitor_hz: env_or("XCOPILOT_MONITOR_HZ", "3").parse().unwrap_or(3.0),
             plugin_status: env_or("XCOPILOT_PLUGIN_STATUS", "true") != "false",
             simbrief_id: env_or("XCOPILOT_SIMBRIEF_ID", ""),

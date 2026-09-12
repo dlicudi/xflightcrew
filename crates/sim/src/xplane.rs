@@ -358,6 +358,8 @@ struct DatarefIndex {
 struct DatarefMeta {
     id: i64,
     name: String,
+    #[serde(default)]
+    is_writable: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -666,6 +668,55 @@ impl XPlaneClient {
             .trim_matches('\0')
             .trim()
             .to_string())
+    }
+
+    /// Every dataref the running sim has, as `(name, writable)`: ONE request,
+    /// for the profile probe that asks about dozens of names at once (a
+    /// profile line is a hypothesis until asked of the sim; the RV-10's xlua
+    /// fuel selector and its autopilot went unverified for a whole flight,
+    /// 2026-09-11). Seeds the id cache on the way past.
+    pub async fn dataref_index(&self) -> Result<Vec<(String, bool)>> {
+        let url = format!("{}/api/v1/datarefs", self.base);
+        let index: DatarefIndex = with_retry(|| async {
+            self.http
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("GET {url} (Web API enabled?)"))?
+                .error_for_status()?
+                .json()
+                .await
+                .context("decoding dataref index")
+        })
+        .await?;
+        let mut cache = ID_CACHE.lock().await;
+        let entry = cache.entry(self.base.clone()).or_default();
+        Ok(index
+            .data
+            .into_iter()
+            .map(|d| {
+                entry.insert(d.name.clone(), d.id);
+                (d.name, d.is_writable.unwrap_or(false))
+            })
+            .collect())
+    }
+
+    /// Every command the running sim has: one request, for the probe.
+    pub async fn command_index(&self) -> Result<Vec<String>> {
+        let url = format!("{}/api/v2/commands", self.base);
+        let index: CommandIndex = with_retry(|| async {
+            self.http
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("GET {url}"))?
+                .error_for_status()?
+                .json()
+                .await
+                .context("decoding command index")
+        })
+        .await?;
+        Ok(index.data.into_iter().map(|c| c.name).collect())
     }
 
     /// The loaded aircraft's ICAO type code (e.g. `C172`), for auto-detection.

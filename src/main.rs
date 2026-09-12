@@ -345,6 +345,9 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("unknown aircraft profile: {aircraft_id}"))?,
     };
 
+    // Voices through the sim's audio: the boot value from the environment; the
+    // panel's Settings switch (xcopilot/opt/audio_bus) turns it on live.
+    tts::configure_audio_bus(config.audio_bus, &config.xplane_base_url);
     tracing::info!(
         model = %config.model,
         aircraft = %profile.display_name,
@@ -532,6 +535,9 @@ async fn main() -> Result<()> {
                 let xp = XPlaneClient::new(base);
                 // The last ICAO shown on the panel, so it's published once and on change.
                 let mut shown = String::new();
+                // The profile id already probed against this sim, so each
+                // airframe is asked about once.
+                let mut probed = String::new();
                 loop {
                     if let Ok(icao) = xp.aircraft_icao().await {
                         let icao = icao.trim().to_string();
@@ -596,6 +602,29 @@ async fn main() -> Result<()> {
                                     // separate s.alert here double-wrote it (blue + green).
                                     let line = line.unwrap_or_else(|| format!("Now set up for the {name}."));
                                     det_voice.alert(voice::Priority::Advisory, line);
+                                }
+                            }
+                            // A profile line is a hypothesis until asked of the
+                            // sim. Once per airframe: every dataref and command
+                            // the live profile relies on, looked up by name; the
+                            // pilot hears what is missing before a tool fails
+                            // on it (the RV-10's xlua selector, 2026-09-11).
+                            if id == live.id() && probed != id {
+                                let names = aircraft::profile_references(&live.get());
+                                match missing_profile_names(&xp, &names).await {
+                                    Ok(missing) => {
+                                        probed = id.clone();
+                                        tracing::info!(profile = %id, total = names.len(), missing = ?missing, "profile probe");
+                                        blackbox::record(
+                                            "profile_probe",
+                                            serde_json::json!({ "profile": id, "total": names.len(), "missing": missing }),
+                                        );
+                                        if let Some(line) = aircraft::probe_summary(&missing, names.len()) {
+                                            det_voice.alert(voice::Priority::Caution, line);
+                                        }
+                                    }
+                                    // Sim unreachable: ask again next tick.
+                                    Err(e) => tracing::debug!("profile probe deferred: {e:#}"),
                                 }
                             }
                         }
@@ -1004,6 +1033,20 @@ fn spawn_settings_poller(base_url: String) {
                     tracing::info!(cabin_crew = s.as_str(), "panel cabin staffing pick");
                     cabin::set_staffing(s);
                     prefs::save_cabin_crew(s.as_str());
+                }
+            },
+        },
+        PanelSetting {
+            dref: DR_OPT_AUDIO_BUS,
+            id: None,
+            current: || tts::AUDIO_BUS.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            apply: |v| {
+                // Pinned on by XCOPILOT_AUDIO_BUS: the pick is refused and
+                // the poller republishes the truth, so the box snaps back.
+                if !tts::set_audio_bus(v > 0) {
+                    tracing::info!("audio bus pinned on by XCOPILOT_AUDIO_BUS; panel pick ignored");
+                } else {
+                    tracing::info!(audio_bus = v > 0, "panel audio bus pick");
                 }
             },
         },
@@ -4010,6 +4053,15 @@ fn known_profile(icao: &str) -> Option<String> {
     )
 }
 
+/// The names a profile relies on that the running sim does not have: two
+/// index fetches (every dataref, every command), one membership test each.
+async fn missing_profile_names(xp: &XPlaneClient, names: &[String]) -> Result<Vec<String>> {
+    let datarefs: std::collections::HashSet<String> =
+        xp.dataref_index().await?.into_iter().map(|(n, _)| n).collect();
+    let commands: std::collections::HashSet<String> = xp.command_index().await?.into_iter().collect();
+    Ok(aircraft::missing_references(names, &datarefs, &commands))
+}
+
 /// The profile id an unknown type flies under, so the detector's "changed?"
 /// comparison is stable across ticks.
 fn generic_profile_id(icao: &str) -> String {
@@ -4501,6 +4553,7 @@ const DR_LLM_ENABLED: &str = "xcopilot/llm_enabled";
 /// the feature's default (both on).
 const DR_OPT_SNAP: &str = "xcopilot/opt/camera_snap";
 const DR_OPT_TONE: &str = "xcopilot/opt/negative_tone";
+const DR_OPT_AUDIO_BUS: &str = "xcopilot/opt/audio_bus";
 
 /// Read a dataref preferring the live-state cache (instant, no round-trip), with a
 /// REST read as the fallback on a cache miss — so it's never worse than polling

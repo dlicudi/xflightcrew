@@ -910,6 +910,7 @@ mod tests {
             atc_voice: String::new(),
             atc_rate: String::new(),
             monitor_enabled: false,
+            audio_bus: false,
             monitor_hz: 3.0,
         }
     }

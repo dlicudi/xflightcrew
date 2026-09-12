@@ -25,7 +25,7 @@ LDFLAGS  := -dynamiclib -mmacosx-version-min=12.0 -F$(SDK)/Libraries/Mac \
             -framework XPLM -framework ApplicationServices \
             -framework CoreFoundation
 
-SRCS := src/$(PLUGIN).cpp src/drefs.cpp src/panel.cpp src/fms.cpp src/imgui_xp.cpp \
+SRCS := src/$(PLUGIN).cpp src/drefs.cpp src/panel.cpp src/fms.cpp src/audio.cpp src/imgui_xp.cpp \
         third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp \
         third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
 HDRS := $(wildcard src/*.h)

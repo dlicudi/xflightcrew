@@ -68,6 +68,18 @@ registration/accessors, `panel.cpp` ImGui window, `fms.cpp` FMS mailbox;
 `make install` from [plugin/](plugin/)) extends the dataref surface with
 `xcopilot/*` datarefs the app drives over the same Web API - the app never
 links the SDK.
+**Voices can ride the sim's audio** (`plugin/src/audio.cpp`, off by default):
+the app already writes each utterance to a WAV; with `XCOPILOT_AUDIO_BUS=true`
+or the panel's Settings switch (`xcopilot/opt/audio_bus`) it posts
+"channel|volume|path" into `xcopilot/audio/play` and the plugin plays it
+with `XPLMPlayPCMOnBus` - the station on COM1, the intercom on the copilot bus
+- so it sits in the cockpit mix, follows the sim's volumes and headset, and
+mutes with the sim. `xcopilot/audio/cut` is the barge-in: the waiter in
+`tts::play_on_bus` is the ONE writer and sends it when the channel's cut
+generation moves, so a cut can never overtake the next play. A failed post
+evicts the cached id (plugin reloads renumber datarefs) and falls back to
+the local player for that clip. The panel switch rides the settings poller
+(`XCOPILOT_AUDIO_BUS=true` pins it on; the pick is refused and republished).
 
 ## Core design rule: curated tool surface, not raw dataref access
 
@@ -123,7 +135,13 @@ tools; YAML carries per-airframe config. Standing rules:
   and blackbox `target_floored` / `approach_ias_floored`. A wrong number
   handed down from a profile, a plan or a pilot is still a wrong number.
 - **A profile line is a HYPOTHESIS until probed live**: `is_writable` and
-  existence are one curl away when the sim is up. A "dataref" name may really
+  existence are one curl away when the sim is up. And it IS probed: on
+  every airframe the detection thread walks the live profile for every
+  dataref/command name (`aircraft::profile_references`, a walk over the
+  profile's own serialisation) and asks the sim (`probe_dataref` /
+  `probe_command`), speaks the missing ones (`probe_summary`) and blackboxes
+  `profile_probe`. A new profile field with a name in it is probed the day it
+  is added. A "dataref" name may really
   be a command; read-only switch positions need read-before-fire toggle tools
   (`*_toggle`), carried through full auto's copies too. Paired lights are
   written together (one pod lit is a readback confirming the half it looked at).
@@ -225,7 +243,12 @@ for coach and panel.
 
 - TWO independent half-duplex channels: copilot INTERCOM and station RADIO,
   own queues/threads/volumes. Intercom defers starting anything below Warning
-  while the radio is on air; a Warning talks straight over. Radio-only cuts
+  while the radio is on air, and a routine line IN PROGRESS is stepped on
+  when the radio keys up: cut mid-word, its remainder (from 0.4 s before the
+  cut, rendered buffer) queued to follow once the frequency is quiet,
+  perishable at 20 s (`interrupt_intercom_for_radio`); a subprocess voice
+  with no buffer is said again whole. A Warning talks straight over and is
+  never stepped on. Radio-only cuts
   (retune, avionics off, crash, replay) never touch the copilot's voice.
 - Radio PTT vs intercom PTT: when a radio key is bound, **physical routing
   beats content routing in BOTH directions**. Content routing to ATC survives

@@ -25,6 +25,7 @@
 
 #include "common.h"
 #include "drefs.h"
+#include "audio.h"
 #include "fms.h"
 #include "font_b612_regular.h"
 #include "font_b612_bold.h"
@@ -1016,6 +1017,10 @@ protected:
         bool tone = drefs::opt_negative_tone() != 0;
         if (ImGui::Checkbox("Negative tone on unrecognized", &tone)) {
             drefs::set_opt_negative_tone(tone ? 1 : 0);
+        }
+        bool bus = audio::opt_audio_bus() == 1;
+        if (ImGui::Checkbox("Voices through X-Plane audio (COM1 / copilot buses)", &bus)) {
+            audio::set_opt_audio_bus(bus ? 1 : 0);
         }
         bool mute = drefs::opt_monitor_mute() != 0;
         if (ImGui::Checkbox("Mute monitor callouts", &mute)) {

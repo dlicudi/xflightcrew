@@ -1304,6 +1304,86 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
     p
 }
 
+/// Every dataref and command name a profile relies on, as strings, for the
+/// probe that asks the sim whether each one exists. A walk over the profile's
+/// own serialisation rather than a hand list of fields: a new field with a
+/// dataref in it is probed the day it is added, not the day someone remembers.
+/// Names are `a/b/...` paths without whitespace; keys that carry prose or
+/// file paths are skipped, an `[index]` suffix is dropped.
+pub fn profile_references(p: &AircraftProfile) -> Vec<String> {
+    const SKIP_KEYS: [&str; 12] = [
+        "match", "say", "spoken", "label", "key", "kind", "checklist", "id", "display_name",
+        "voice", "phases", "positions_spoken",
+    ];
+    fn walk(v: &serde_yaml::Value, key: &str, out: &mut Vec<String>) {
+        match v {
+            serde_yaml::Value::String(s) => {
+                if SKIP_KEYS.contains(&key) {
+                    return;
+                }
+                let name = s.split('[').next().unwrap_or(s).trim();
+                let last = name.rsplit('/').next().unwrap_or("");
+                if name.contains('/')
+                    && !name.contains(char::is_whitespace)
+                    && !last.contains('.')
+                    && !name.starts_with('/')
+                    && !out.iter().any(|o| o == name)
+                {
+                    out.push(name.to_string());
+                }
+            }
+            serde_yaml::Value::Sequence(items) => items.iter().for_each(|i| walk(i, key, out)),
+            serde_yaml::Value::Mapping(m) => {
+                for (k, v) in m {
+                    let k = k.as_str().unwrap_or("");
+                    walk(v, k, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(v) = serde_yaml::to_value(p) {
+        walk(&v, "", &mut out);
+    }
+    out
+}
+
+/// Which of a profile's names the sim does not have: neither a dataref nor
+/// a command. Pure over the two indexes, so the probe's verdict tests
+/// without a sim.
+pub fn missing_references(
+    names: &[String],
+    datarefs: &std::collections::HashSet<String>,
+    commands: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| !datarefs.contains(*n) && !commands.contains(*n))
+        .cloned()
+        .collect()
+}
+
+/// The spoken result of a probe: nothing when every name exists, otherwise
+/// the count and the first few, so the pilot knows which tools will fail
+/// before asking for them.
+pub fn probe_summary(missing: &[String], total: usize) -> Option<String> {
+    if missing.is_empty() {
+        return None;
+    }
+    let shown: Vec<String> = missing
+        .iter()
+        .take(3)
+        .map(|m| m.rsplit('/').next().unwrap_or(m).replace('_', " "))
+        .collect();
+    let more = if missing.len() > 3 { format!(" and {} more", missing.len() - 3) } else { String::new() };
+    Some(format!(
+        "Profile check: {} of {total} names this profile relies on are not in this aircraft: {}{more}. The tools that use them will fail.",
+        missing.len(),
+        shown.join(", ")
+    ))
+}
+
 /// Built-in profile by id (fallback when no YAML file exists).
 pub fn builtin(id: &str) -> Option<AircraftProfile> {
     match id {
@@ -2517,6 +2597,44 @@ P _engn/0/_type RCP_INJ
         // A profile with no Vs floors nothing (the old behaviour, honestly).
         super::publish_speed_floor(None);
         assert_eq!(super::floored_target(65.0, super::speed_floor_kts()), 65.0);
+    }
+
+    // The probe asks the sim about every name a profile relies on. The RV-10's
+    // xlua fuel selector is the case: stock names would have probed fine and
+    // the real ones were never asked (2026-09-11).
+    #[test]
+    fn a_profiles_datarefs_and_commands_are_all_found_by_the_walk() {
+        let p = super::load("vans_rv10").expect("RV-10 profile");
+        let refs = super::profile_references(&p);
+        for must in [
+            "laminar/rv10/switch/fuel_tank_pos",
+            "laminar/rv10/tank_sel_left",
+            "sim/electrical/battery_1_on",
+            "sim/cockpit2/switches/taxi_light_on",
+            "sim/cockpit2/engine/actuators/prop_rotation_speed_rad_sec_all",
+        ] {
+            assert!(refs.iter().any(|r| r == must), "missing {must} in {refs:?}");
+        }
+        assert!(!refs.iter().any(|r| r.contains("checklists/")), "file paths are not datarefs");
+        assert!(!refs.iter().any(|r| r.contains('[')), "indices dropped: {refs:?}");
+        assert!(!refs.iter().any(|r| r.contains(' ')), "prose is not a dataref: {refs:?}");
+        let n = refs.len();
+        assert_eq!(refs.iter().collect::<std::collections::BTreeSet<_>>().len(), n, "deduplicated");
+
+        let have: std::collections::HashSet<String> =
+            refs.iter().filter(|r| r.starts_with("sim/")).cloned().collect();
+        let cmds: std::collections::HashSet<String> =
+            ["laminar/rv10/tank_sel_left".to_string()].into_iter().collect();
+        let missing = super::missing_references(&refs, &have, &cmds);
+        assert!(missing.iter().any(|m| m == "laminar/rv10/tank_sel_right"), "{missing:?}");
+        assert!(!missing.iter().any(|m| m == "laminar/rv10/tank_sel_left"), "a command counts");
+        assert!(!missing.iter().any(|m| m.starts_with("sim/")), "{missing:?}");
+
+        assert_eq!(super::probe_summary(&[], 40), None);
+        let s = super::probe_summary(&["laminar/rv10/tank_sel_left".into()], 40).unwrap();
+        assert!(s.contains("1 of 40") && s.contains("tank sel left"), "{s}");
+        let many: Vec<String> = (0..5).map(|i| format!("sim/x/name_{i}")).collect();
+        assert!(super::probe_summary(&many, 40).unwrap().contains("and 2 more"));
     }
 
     #[test]

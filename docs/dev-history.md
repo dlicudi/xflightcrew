@@ -1104,7 +1104,7 @@ still future work. Everything blackboxes as `"kind":"full_auto"` /
 **The Gibraltar straight-in that wasn't (LEMG-LXGB, 12:46Z, 2026-09-11).** Full
 auto flew a Baron 58 gate to gate and crashed it into the North Front four
 seconds into a go-around. The chain: LXGB has no coded approach, so the arrival
-reconstructed a "straight-in" to 09 from the `09D05`/`09D06` DME fixes — and
+reconstructed a "straight-in" to 09 from the `09D05`/`09D06` DME fixes, and
 those fixes are on the VOR/DME approach's OFFSET track, 50 degrees south of the
 extended centreline (the ident says "runway 09, 5 DME", not "on the 09
 course"). The follower flew them faithfully, handed autoland the aircraft at
@@ -1129,7 +1129,7 @@ for its Vfe (`gear_may_extend`, `flap_within_limits`, published per airframe
 next to the thrust-lever selector); `taxi_in_after_landing` reads
 `has_crashed`. Six more from the same sortie, fixed the same day, each with a
 test: (1) the conditional line-up ("behind the landing Bee-line, line up
-behind") was flown as unconditional — full auto rolled five seconds after the
+behind") was flown as unconditional, full auto rolled five seconds after the
 words with the lander at 2.4 nm, and reached the pavement 15 s after the
 touchdown only because the line-up crawled for 85 s. The release watch now
 publishes the condition every tick (`LINE_UP_CONDITION`: the named arrival is
@@ -1196,7 +1196,7 @@ point rather than a final (the below-floor balk from the same day stays).
 failures were the system acting confidently on something it had never
 checked, so three checks went in. (1) A speed floor under every automation:
 `aircraft::speed_floor_kts` is 1.2 x the live profile's clean Vs, published per
-swap, and both arming points — `speedhold::arm_flight` and `run_autoland` —
+swap, and both arming points, `speedhold::arm_flight` and `run_autoland` ,
 raise a lower target to it, say so and record it. The RV-10's 65 kt would have
 become 78 before anything flew it. (2) The arrival is briefed at the gate:
 `full_auto::brief_arrival` runs when "fly the flight plan" is armed and puts
@@ -1207,12 +1207,58 @@ briefing item at the stand. (3) `xvl debrief` reads the blackbox and prints
 the sortie: aircraft (flagging a no-profile airframe), max altitude and
 speed, minimum airspeed airborne and where, every touchdown with its sink
 rate, taxi stops, callouts by id, low-confidence utterances, and the
-narrative — autoland armings, crashes, balks, ordered go-arounds, give-ups,
+narrative, autoland armings, crashes, balks, ordered go-arounds, give-ups,
 floored targets, void radio calls, compliance challenges, handoffs, region
 swaps, full-auto stages. Run on the RV-10 flight it printed "min IAS
 airborne 23 kt at 16:41:22Z, 810 ft AGL" unprompted: the two hours of grep
 that found the day's faults, as a command, and the first piece of the
-instructor's scorer. Still unowned: the zone clearance's
+instructor's scorer.
+
+**The profile probe, and voices on the sim's buses (2026-09-11, late).** Two
+more from the same day's list. The probe makes the standing rule ("a profile
+line is a hypothesis until probed live") code: `aircraft::profile_references`
+walks the profile's own YAML serialisation for every `a/b/c` name (skipping
+prose keys, file paths and `[index]` suffixes, so a new field with a dataref
+in it is covered the day it is added), and the detection thread asks the sim
+about each one once per airframe, `probe_dataref` (existence and
+`is_writable`) then `probe_command`, speaks the missing ones ("Profile
+check: 2 of 41 names this profile relies on are not in this aircraft: tank
+sel left, tank sel right. The tools that use them will fail.") and blackboxes
+`profile_probe`. The RV-10's xlua fuel selector and autopilot would have been
+verified on load rather than on the flight. The audio bus is the plugin's
+first sound: `plugin/src/audio.cpp` registers `xcopilot/audio/play` (a
+"channel|volume|path" mailbox, the app writes every utterance to a WAV
+already), `xcopilot/audio/cut` and `xcopilot/opt/audio_bus`; the flight loop
+reads the WAV and plays it with `XPLMPlayPCMOnBus`, the station on COM1 and
+the intercom on the copilot bus, one voice per channel, volume from the app's
+channel gains. App side, `tts::play_on_bus` posts the file with a blocking
+Web API write (the speaker thread is a plain thread; on an async one it
+refuses rather than panic), waits out the clip's duration plus a tail, and
+sends the cut the moment the channel's generation moves, the same barge-in
+contract as the local player. Off by default (`XCOPILOT_AUDIO_BUS`, or the
+Settings switch live); a failed post plays locally and warns once. Unflown:
+the bus choice (copilot vs interior for the intercom), the volume scale
+against the sim's own mix, and whether the headset simulation treats the
+copilot bus the way it treats COM1.
+
+**The radio steps on the copilot (2026-09-11, night).** "Will the copilot
+stop speaking if ATC is speaking to us?" It did not: the arbiter gated what
+STARTS (routine lines wait for a quiet frequency) but a line already playing
+ran through a transmission that began a second later. In a real cockpit both
+voices are in the headset and the crew stops mid-word to listen, before
+anyone knows whether the call is theirs, then picks up the remainder. Now the
+intercom loop registers what it is saying (`IntercomPlay`: priority, the
+rendered buffer from the warm ONNX path, the start instant), `Speaker::speak`
+renders first and hands the buffer over before playback, and the radio loop
+calls `interrupt_intercom_for_radio` as it goes on the air: a line below
+Warning is cut (`tts::stop_channel`) and its remainder, from 0.4 s before
+the cut, so the interrupted word is heard whole, is queued as an
+`Utterance::resume` at the same priority, perishable at 20 s, to play once
+the frequency is quiet under the ordinary deferral. A subprocess voice has no
+buffer and is said again whole; a line with less than the lead-in left is not
+owed; a Warning is never stepped on. The remainder rides the normal queue, so
+a PTT press or a second call can step on it again, and the audio bus needs
+nothing: the cut is the same generation bump the bus already honours. Still unowned: the zone clearance's
 "not above two thousand feet" (neither side carries the altitude limit) and
 the squawk watch's "radar contact" spoken before the handoff.
 
@@ -1221,19 +1267,19 @@ missed approach is a procedure**. One MD-82 circuit at Luton exposed four
 faults in a row, and they compound: the pattern delivered the aircraft LOW,
 the vertical law then flew it HIGH, the balked landing had nowhere to go,
 and nobody was told. (1) The base leg descended to a flat 700 ft, so the
-handover height depended only on how wide the pattern was — the jet's turns
+handover height depended only on how wide the pattern was, the jet's turns
 final around 4 nm, where a 3° path is 1,340 ft up, and it arrived 520 ft
 BELOW it (`circuit::approach_leg_alt_ft` now descends the PATH, bounded by
 the handoff floor below and the pattern altitude above, so it can only ever
 delay a descent, never climb on base). A jet also flies a 1,500 ft circuit,
 not a trainer's 1,000 (`pattern_alt_agl_ft`), and sets up at
-`approach_leg_kts` rather than carrying Vy — 200 kt in this airframe, which
+`approach_leg_kts` rather than carrying Vy, 200 kt in this airframe, which
 arrived on base at 226 against a 140 kt approach speed. Never faster than
 the pattern speed, so GA airframes are untouched. (2) SPEED PROTECTION was
 shallower than the path: a fixed 40 fpm per knot capped at 700 is steeper
 than a trainer's path and gentler than a jet's, so 9 kt slow commanded 360
 fpm against the 740 the path wanted, HALVED the descent, and made the
-aircraft slower still — the exact opposite of the intent. It is floored at
+aircraft slower still, the exact opposite of the intent. It is floored at
 the path rate now. The MD-82 crossed the threshold 51 ft high at 152 kt and
 overflew. (3) The go-around then had no procedure. The latch released the
 instant it was clear of the ground, leaving the aircraft 800 ft over the far
@@ -1242,7 +1288,7 @@ tick: outbound while the path was 500 ft below, inbound as soon as it
 wasn't, cycling; and vertically the reposition floor (~1,590 ft AGL) and the
 path tracker met at a step, +800 against -1,200. It orbited for three and a
 half minutes between 1.1 and 4.1 nm and escaped by luck. `MAX_GO_AROUNDS`
-can never catch this — a second miss needs another approach, so the backstop
+can never catch this, a second miss needs another approach, so the backstop
 never armed and nothing gave up. Now `MissedStage` makes it sticky: Climb
 straight ahead, then Reposition outbound to `join_point_nm` at platform
 height, released only when established out there on the approach side (not
@@ -1251,7 +1297,7 @@ the field). The reposition leg never chases the path it is flying away from,
 and `descent_limit_fpm` fades the permitted descent to zero AT the floor
 instead of through it. (4) Nothing was ever transmitted, so the tower held a
 landing clearance for an aircraft that was not landing while it worked the
-traffic underneath — the FSM sat in ClearedToLand the whole time. The loop
+traffic underneath, the FSM sat in ClearedToLand the whole time. The loop
 now calls "going around" once per balked landing over the same crew radio
 channel the circuit's position reports use, and a test pins the phrase
 against `tower::parse_intent`.
@@ -1260,14 +1306,14 @@ Depth (added 2026-08-01, evening): **and autoland's own pursuit lead was
 collapsing on short final.** The fixed-lead pursuit added 2026-07-28 (against
 "never in line with the runway, always at an angle" at EGSS) was undone by its
 own floor: the aim was `(along - lead).max(0.15)`, so inside one lead distance
-the aim STOPPED ADVANCING and the effective lead shrank — 0.875 nm at 1.2 nm
-out, 0.55 at 0.7, 0.20 at 0.35 — which is the d/2 law the fixed lead exists to
+the aim STOPPED ADVANCING and the effective lead shrank, 0.875 nm at 1.2 nm
+out, 0.55 at 0.7, 0.20 at 0.35, which is the d/2 law the fixed lead exists to
 replace, back again exactly where being lined up matters most. At Southampton
 the commanded cut sat at 16 degrees from 0.87 nm all the way in to 0.32, then
 snapped to the runway course over the numbers with the aircraft still 6 degrees
 off and still turning. `pursuit_aim_nm` keeps the full lead all the way in,
-which means the aim walks PAST the threshold and on down the runway — not a
-trick, since the extended centreline and the runway centreline are one line —
+which means the aim walks PAST the threshold and on down the runway, not a
+trick, since the extended centreline and the runway centreline are one line ,
 bounded by the pavement so it is always a point on the runway. It is a pure
 function now, so the lead staying constant is a test rather than a comment.
 The same page closed the **last-ditch bypass**: `ready_for_autoland` returned
@@ -1279,21 +1325,21 @@ that simply has not finished.
 
 Depth (added 2026-08-01, evening): **a leg whose job is to join the centreline
 must converge on it.** The final leg commanded the runway course and nothing
-else — which makes it a leg that flies PARALLEL to the line it is supposed to
+else, which makes it a leg that flies PARALLEL to the line it is supposed to
 be joining. That was survivable only while the turn onto final was assumed to
 roll out ON the line, and it does not. And the reason it rolled out short is
 arithmetic, not luck: `AP_BANK_DEG` is a deliberately shallow 14 degrees and
-`gs_est` pads the speed by 1.1, both of which make the radius BIGGER — safe for
+`gs_est` pads the speed by 1.1, both of which make the radius BIGGER, safe for
 every dimension they size except this one, where a bigger capture distance
 starts the turn EARLIER and rolls out SHORT. The model wanted 1.3 x 1,443 =
 1,876 m; the aircraft turned in 1,048 (a 90-degree turn closes exactly one
 radius of cross-track, so the trail measures the radius directly); the
 predicted residual is 828 m against 776 flown. Back-solved at the real approach
 groundspeed the AP banks 15.8 degrees, not 14. So `final_turn_radius_m` sizes
-that one capture on the turn actually flown — approach speed, no padding,
+that one capture on the turn actually flown, approach speed, no padding,
 `AP_BANK_FINAL_DEG` 15.5 (rounded shallow so it still errs EARLY, because with
 an intercept a short roll-out is a gentle closure and a long one is an S-turn
-back across the centreline) — which takes the residual from 776 m to 346.
+back across the centreline), which takes the residual from 776 m to 346.
 `Geometry::for_radii` keeps the conservative radius for pattern width and
 downwind length, where undersizing is what caused the LXGB figure-eights.
 `final_capture_m` had been 1.3 turn radii on the assumption that
@@ -1301,27 +1347,27 @@ downwind length, where undersizing is what caused the LXGB figure-eights.
 Southampton the turn began 1,850 m out and consumed only ~1,050, so it rolled
 out **776 m short of the centreline** and then held runway heading all the way
 to the handoff, closing almost nothing. "Slightly early" was three quarters of
-a radius, and free it was not — autoland inherited the offset on top of an
+a radius, and free it was not, autoland inherited the offset on top of an
 approach it was already 206 ft high on, flew the diagonal in, and the aircraft
 crossed the threshold **still 6 degrees off the runway heading, still
 turning**. That is the landing-at-an-angle the 2026-07-30 fix was supposed to
 have ended; that fix added a heading test, and a heading test PASSES for an
 aircraft flying perfectly parallel 776 m to the side. `final_intercept_hdg`
-gives the leg a real intercept — pure pursuit at a point down the centreline,
+gives the leg a real intercept, pure pursuit at a point down the centreline,
 capped at `MAX_FINAL_CUT_DEG` (30, inside autoland's own 35), held at the cap
 until the offset is inside ~520 m and washing out from there, so it converges
 like an instrument approach instead of asymptoting (a gentler 2,000 m aim had
 faded to 8 degrees by 300 m off and only just made the centreline before it ran
-out of runway — the simulated intercept from the live roll-out is a test). And
+out of runway, the simulated intercept from the live roll-out is a test). And
 `ready_for_autoland` now requires being ESTABLISHED, not merely rolled out:
 heading AND `ESTABLISHED_XTK_M`. That constant is 300 m rather than something
-tighter on purpose — the intercept has to be able to REACH it before the
+tighter on purpose, the intercept has to be able to REACH it before the
 handoff, and a gate the leg cannot satisfy deadlocks into the last-ditch valve,
 which hands over the exact diagonal the gate exists to prevent.
 
 Depth (added 2026-08-01, evening): **the glidepath distance is measured DOWN
 the approach course, never across it.** `approach_leg_alt_ft` took track miles
-— along-track plus cross-track — and the cross-track term inflates the target
+, along-track plus cross-track, and the cross-track term inflates the target
 by exactly however far off the centreline the aircraft is, which on a base leg
 is the whole leg. Southampton, Baron: base began 3,324 m off the centreline, so
 track miles read 3.33 nm and asked for 1,101 ft when the real distance to the
@@ -1330,7 +1376,7 @@ most of final LEVEL at 800 ft AGL, the target fell below it only eleven seconds
 before the handoff, and autoland was handed an aircraft 206 ft high at 1.7 nm.
 It never recovered: still 118 ft high at half a mile, still 80 ft high over the
 threshold, crossed at 180 ft AGL and 102 kt, overflew the whole runway and went
-around. Plain along-track is wrong in the DANGEROUS direction though — on base
+around. Plain along-track is wrong in the DANGEROUS direction though, on base
 the aircraft is crossing the extended centreline, so its along-track distance
 is still GROWING, and aiming at the path for the distance it has now is a dive
 toward a point it is about to move away from (529 ft with 3.3 km still to fly).
@@ -1338,7 +1384,7 @@ So `path_dist_m` splits it: base aims at the ROLL-OUT, the path altitude where
 the turn onto final will actually deliver us, which the pattern geometry
 already knows as `downwind_past_m` (predicted 4,087 m against 3,966 flown);
 final follows the real along-track distance down. Which is also just how an
-approach works — platform until the path meets you, then down the path. The
+approach works, platform until the path meets you, then down the path. The
 2026-07-28 note that introduced track miles was fixing a different thing (a
 straight-line HYPOTENUSE growing mid-turn), and the ratchet it also added was
 what actually fixed that; the ratchet stays.
@@ -1348,65 +1394,65 @@ and the freeze flags were costing frames.** Two loose ends from the same
 sortie. (1) The circuit flies clean and the callouts are computed clean, but
 the pattern speed had no floor against the clean stall: the Baron's Vy is 105
 against 84, i.e. 1.25 Vs, which is FOUR knots above the airspeed caution band
-(1.2 Vs = 100.8) — so every normal variation on downwind, base and final dipped
+(1.2 Vs = 100.8), so every normal variation on downwind, base and final dipped
 into it and six callouts fired in one circuit, every one of them correct. Flap
 was 0.00 throughout, which is right; nothing knew that made the stall reference
 84 and not the flapped 70. `pattern_speed_kts` takes `vs_clean_kts` and floors
 at `PATTERN_MIN_STALL_MULT` (1.3 Vs), which the approach legs inherit. It only
-bites on an airframe whose Vy sits near its clean stall — a 172 (Vy 74, stall
+bites on an airframe whose Vy sits near its clean stall, a 172 (Vy 74, stall
 48), an MD-82 (200/100) and a Citation (200/136) are all untouched, and a
 profile with no stall figure gets no floor rather than an invented one. Same
 family as the climb limiter: a speed that is fine flapped is not fine clean.
 (2) The Web API cache gained a per-dataref TTL. The 60 ms window was sized for
 DUPLICATION and recovers ~2.5% because the loops read DIFFERENT datarefs;
-VOLUME is the problem, and the histogram named it — after latitude and
+VOLUME is the problem, and the histogram named it, after latitude and
 longitude came `is_in_replay` and `paused`, ~4 reads/s between them for two
 flags that change a handful of times in a whole flight. `SLOW_DATAREFS` get
 500 ms. Nothing needs them sooner: a pause noticed half a second late costs one
 control tick, every loop re-checks each tick, and `sim_frozen` fails open. The
 evidence it matters: at 20:42 the sim dropped to **7 fps against a 60 fps
 median** in the same 30 s window that logged 76 req/s and a 1,040 ms slowest
-response — the API is served from inside X-Plane's flight loop, so that is
+response, the API is served from inside X-Plane's flight loop, so that is
 frame time the sim does not get.
 
 Depth (added 2026-08-02): **the limiter's full-rate speed is the speed the
 climb is FLOWN at, and two same-evening fixes had never met.** The stall floor
-above raised the Baron's pattern speed to 109.2 kt — four knots ABOVE its Vy of
-105 — and the climb limiter below took that same pattern speed as its full-rate
+above raised the Baron's pattern speed to 109.2 kt, four knots ABOVE its Vy of
+105, and the climb limiter below took that same pattern speed as its full-rate
 threshold, while the throttle law holds the aircraft AT it. That parks the
 steady operating point on the exact top edge of a nine-knot fade band: full
 climb is unreachable while climbing (climbing at Vy is what the airframe
-does), and every knot of ordinary jitter — amplified by the 5 s trend
-projection, whose swing is as wide as the whole band — slams the granted rate
+does), and every knot of ordinary jitter, amplified by the 5 s trend
+projection, whose swing is as wide as the whole band, slams the granted rate
 across half its range. The next morning's circuit porpoised exactly as the
 projection was supposed to prevent: cmd_vs 700 to 0 on crosswind with the
 Baron DESCENDING at 190 fpm at 670 ft AGL mid-climb-out, then the whole
 downwind hung 100 ft below pattern altitude with the capture choked to
 0-150 fpm and the speed see-sawing 104-113 on a 25 s cycle (EGHI). The unit
-test had pinned `want = 105.0` — Vy — all along; the call site passed
+test had pinned `want = 105.0`, Vy, all along; the call site passed
 `pattern_kts`, and the four-knot difference between two numbers that used to
 be equal was the entire failure. `climb_full_rate_kts` (Vy capped below the
-leg speed — a jet's book Vy is a cruise-climb figure and must never RAISE the
-threshold — and floored a margin above the fade floor so a degenerate profile
+leg speed, a jet's book Vy is a cruise-climb figure and must never RAISE the
+threshold, and floored a margin above the fade floor so a degenerate profile
 gets a band, not a cliff) is now the one seam, and the test wires it exactly
 as the loop does, so the test and the call site can never again agree on
 semantics while disagreeing on the number.
 
 The SAME sortie's re-fly then showed the other half (2026-08-02, later): with
 the limiter fixed, the downwind climbed clean at the full 700, but one deep
-dive-and-recover cycle survived on crosswind — and its driver was the THROTTLE
+dive-and-recover cycle survived on crosswind, and its driver was the THROTTLE
 law, not the limiter. The circuit inherits the takeoff handoff at 131 kt and
 full power against a 109 kt target; `throttle_adjust`'s P+D is algebraically a
 projection at 2.7 s of lead, shorter than the lever's own slew, so it was
 still pulling at 124 kt with the speed already falling 2.5 kt/s toward the
-target — the sag ran through to 98.7 kt, ONE KNOT BELOW BLUE LINE, and full
+target, the sag ran through to 98.7 kt, ONE KNOT BELOW BLUE LINE, and full
 recovery authority only unlocked at the old gate's raw err > 10, i.e. once the
 aircraft was already 10 kt slow. The limiter (correctly) cut the climb on the
 way through and the aircraft levelled, DESCENDED 65 ft at 700 ft AGL, and
-climbed again — the "oscillation" the pilot reported after the first fix. The
+climbed again, the "oscillation" the pilot reported after the first fix. The
 law now projects 5 s (`THROTTLE_LEAD_S`) and both escalation gates watch the
 PROJECTION: the pull eases while the excess is still burning off, and power
-returns before the undershoot — urgency about where the speed will be, not
+returns before the undershoot, urgency about where the speed will be, not
 where it was. Every old behaviour a test pinned (deadband, SF50 runaway pull,
 anti-stall reflex) is unchanged; the new test pins the handoff transient
 itself.
@@ -1416,30 +1462,30 @@ its rough edges came from treating it as segments.** The Baron's first
 successful circuit was firm on and harsh after, and the blackbox names both.
 (1) The touchdown: past the threshold the (unsigned) glidepath distance grows
 again, alt_err goes negative, and the vertical law's level-hold branch fired at
-27 ft OVER THE RUNWAY — the aircraft floated level, bled the very airspeed the
+27 ft OVER THE RUNWAY, the aircraft floated level, bled the very airspeed the
 flare needed, and dropped on from the mush at -380 fpm one knot above the clean
 stall. A ROUNDOUT band (`ROUNDOUT_MULT` x the flare height, same
 pavement/cross-track gates as the flare) now eases the target to
 `ROUNDOUT_VS_FPM` (-250) so the -100 flare is entered from a gentle descent
-with flying speed — the two wrong answers there, chasing the path rate and
+with flying speed, the two wrong answers there, chasing the path rate and
 holding level, were both the same missing stage. (2) The rollout: a flat 0.45
-brake ratio measured 3.3 m/s² from 79 kt to a DEAD STOP — max-autobrake
-territory on a runway with a kilometre to spare — and then the vacate
+brake ratio measured 3.3 m/s² from 79 kt to a DEAD STOP, max-autobrake
+territory on a runway with a kilometre to spare, and then the vacate
 re-accelerated the aircraft it had just parked. `rollout_brake_ratio` brakes by
 wanted deceleration (comfort 1.6 m/s², overridden by the stop-in-what-remains
 term, so a short runway still gets everything), and when full auto's taxi-in
 follows, the rollout hands off ROLLING at `VACATE_HANDOFF_KTS` (10 kt) straight
-into the vacate drive — stopping dead on an active runway to then leave it was
+into the vacate drive, stopping dead on an active runway to then leave it was
 neither procedure nor comfort. The channel is `autoland::VACATE_FOLLOWS`, set
 by `taxi_in_after_landing` before the landing, CONSUMED at rollout entry and
 cleared on every no-landing path, because a stale process-wide fact is the
 radio-power-latch bug in a new coat: a later standalone "land for me" must
 brake to a stop exactly as before (nobody follows it). The safety half lives in
 taxi_in: any vacate failure after a rolling handoff arrests the roll (parking
-brake + blackbox `arrest_rolling`) before the minutes-long taxi request wait —
+brake + blackbox `arrest_rolling`) before the minutes-long taxi request wait ,
 same rule as pushback, a stage that is not moving the aircraft is holding it.
 The radio order was already right and stays: vacate first (completing the
-landing clearance we hold — no call owed from the strip), "runway vacated" from
+landing clearance we hold, no call owed from the strip), "runway vacated" from
 the taxiway, then the taxi request.
 
 Depth (added 2026-08-02, afternoon): **the overflight rule must know a landing
@@ -1448,12 +1494,12 @@ One chained failure, four fixes, from a single balked landing that should not
 have been balked. The roundout (same morning's fix) legitimately floats
 further down the runway than the old at-path-rate descent ever did, and
 `OVERFLIGHT_GO_AROUND_NM`'s fixed 0.15 nm was tuned on the old profile: at
-EGHI it declared an overflight at 26.3 ft radio — ONE FOOT above the 25 ft
-flare gate — with 1,400 m of runway ahead, and balked a good landing.
+EGHI it declared an overflight at 26.3 ft radio, ONE FOOT above the 25 ft
+flare gate, with 1,400 m of runway ahead, and balked a good landing.
 `overflight_allowance_nm` makes the question runway-aware when the aircraft is
 LOW over the pavement (below the roundout band): float on while
 `FLOAT_MIN_REMAINING_M` (900 m) remains, capped at half the runway, floored at
-the old 0.15 so short strips keep the old rule — and HIGH past the threshold
+the old 0.15 so short strips keep the old rule, and HIGH past the threshold
 keeps the hair-trigger, so the 167 ft overflight and the MD-82's 51-ft float
 stay caught. The flare/roundout zone gate stretches with it (`in_flare_zone`),
 because past the threshold `dist_nm` is unsigned and the plain 0.35 nm bound
@@ -1461,46 +1507,46 @@ would have ended the flare zone mid-float and resurrected the level-hold bug.
 Then the cascade: the missed approach flew its reposition compliantly but
 `MAX_MISSED_APPROACH_SECS` (300 s) was SHORTER than the flight the reposition
 itself commands (climb to 800, turn back, overfly, out to a ~6 nm join point:
-5+ min at 110 kt), so it expired mid-leg — now 600 s. The give-up then set
+5+ min at 110 kt), so it expired mid-leg, now 600 s. The give-up then set
 half throttle and walked away from an aircraft the balk had left with GEAR
 DOWN and LANDING FLAP, which cannot hold level flight at 0.5: it decayed 110
 to 80 kt at -900 fpm in thirty seconds. Give-ups now hand back climb power
 (`GIVE_UP_THROTTLE` 0.75) with the VS dial zeroed and a line that says what is
-actually held ("the autopilot is holding heading and altitude, gear is down" —
+actually held ("the autopilot is holding heading and altitude, gear is down" ,
 the handoff-truth rule again). And the pilot's panic FULL AUTO at 1,475 ft
-descending then walked the GROUND chain — a stale `LAST_ARRIVED` from the
+descending then walked the GROUND chain, a stale `LAST_ARRIVED` from the
 morning's taxi read as "at the hold" and it requested a departure clearance
-from a sinking aircraft — so full auto now refuses to arm airborne and names
+from a sinking aircraft, so full auto now refuses to arm airborne and names
 the tools that fly ("say do a circuit, fly the flight plan, or land for me").
 
 Depth (added 2026-08-01): **a climb is never worth more than the airspeed left,
 and landing includes getting off the runway.** The Baron 58's first full-auto
 circuit reached the gate at Southampton, and found two things the 172 never
 could. (1) The autopilot's vertical mode buys rate with knots and will keep
-buying: rolled into the crosswind turn at 127 kt it came out at 85 — one knot
-over its clean stall and one over Vmca — with the VS law still asking for
+buying: rolled into the crosswind turn at 127 kt it came out at 85, one knot
+over its clean stall and one over Vmca, with the VS law still asking for
 880 fpm and the stabilizer trimmed to the nose-up stop. Six airspeed callouts
 fired across the pattern and every one was right. The throttle law cannot fix
 this alone; it was already commanding more power, and in a climbing turn on a
 piston twin there is none left. `circuit::climb_limit_fpm` fades the commanded
-CLIMB to zero as the speed falls from the pattern speed to `climb_floor_kts` —
+CLIMB to zero as the speed falls from the pattern speed to `climb_floor_kts` ,
 blue line where the airframe publishes one (a twin below Vyse has no
 single-engine climb at all), else 1.15x the clean stall. Full rate AT the
 pattern speed, so an aircraft flown correctly is never penalised; descents pass
 through untouched; a profile with neither reference speed gets 0 and no
 protection rather than an invented number, which is why every GA airframe is
-unchanged (a 172's floor is 55 kt against a Vy of 74 — it never meets the
+unchanged (a 172's floor is 55 kt against a Vy of 74, it never meets the
 limiter). (2) Autoland stops ON the strip and hands back, and for a CIRCUIT
 nothing came after it: full auto armed the circuit and EXITED, so the aircraft
 sat where it stopped. It held runway 02 for ninety seconds with an arrival
-closing 2.6 nm to 0.5 — six `runway_incursion` records and the tower telling
-the lander "continue approach, traffic on the runway ahead" — and only moved
+closing 2.6 nm to 0.5, six `runway_incursion` records and the tower telling
+the lander "continue approach, traffic on the runway ahead", and only moved
 because the pilot said "taxi to parking". `taxi_in_after_landing` is now the
 last stage of BOTH missions (the flight path already had it), so full auto
 stays ACTIVE through the circuit and vacates.
 
 **And vacating asks nobody** (same day, the second half of that fix).
-[src/taxi_in.rs](src/taxi_in.rs) is two phases now — VACATE, then taxi — because
+[src/taxi_in.rs](src/taxi_in.rs) is two phases now, VACATE, then taxi, because
 the original had real procedure backwards: it transmitted the taxi-in request
 from wherever autoland stopped and waited up to sixty seconds for a stand
 route, sitting on the strip the whole time, with the give-up path handing back
@@ -1509,29 +1555,29 @@ the landing clearance we already hold, not a new instruction: no controller in
 the loop, no readback owed, and the call ("runway vacated") goes out from the
 taxiway afterwards, which is the order a real crew flies.
 `nav::plan_vacate` reuses the departure machinery rather than inventing a
-second idea of where a runway meets a taxiway — `zone_of` and the hold-short
+second idea of where a runway meets a taxiway, `zone_of` and the hold-short
 trim, run BACKWARDS (the trim drops trailing edges inside the runway's
 protected zone so a departure stops short; the vacate keeps going until it is
 `VACATE_CLEAR_M` past the same boundary, because the tail has to be over it
-too) — with two things that genuinely differ. Metres covered while still INSIDE
+too), with two things that genuinely differ. Metres covered while still INSIDE
 the zone earn no credit toward that clearance, or the drive finishes at the far
 end of the entry link, which by the trim's own logic IS the holding point, i.e.
 exactly the line we are trying to get past. And an exit is NOT an entrance:
 `runway_entrance_near` accepts a node one hop off the runway (a departure holds
 there and the drawn lead-on carries it on), but an arrival must decide at the
-JUNCTION — measuring "is this exit ahead of me" at the far end of a link says
+JUNCTION, measuring "is this exit ahead of me" at the far end of a link says
 nothing about where that link meets the strip, and a junction 22 m behind the
 aircraft reads as an exit 150 m off to the side. Exits behind the rollout are
 refused outright: reaching one means taxiing back down the runway. Thin data is
-never a refusal (no zones, no runway edges — it degrades; only a field with no
+never a refusal (no zones, no runway edges, it degrades; only a field with no
 network at all declines), the drive arms through the same governor front door
 as the auto taxi and the line-up, and every failure falls through to the
 taxi-in exactly as it behaved before. Reached from the crew side through
-`party_line::plan_vacate` — the one accessor there that is not a published
+`party_line::plan_vacate`, the one accessor there that is not a published
 clearance, deliberately: the world owns the airport's geometry and the crew
 should not keep a second copy, but this returns pavement, not permission.
 Gated on a STANDING landing clearance (`taxi_in::vacate_runway`), which holds
-over exactly the window between touchdown and asking for the stand — reading
+over exactly the window between touchdown and asking for the stand, reading
 `clearance_runway` alone would hand a stale ident to a drive aiming for a
 runway exit from the middle of a taxiway.
 
@@ -1539,56 +1585,56 @@ Depth (added 2026-07-27): **pushback** ([src/pushback.rs](src/pushback.rs)) is
 the chain's first metres, between the taxi clearance and the drive. The
 trigger is the CLEARED ROUTE, not a stand database or a per-airframe flag:
 the first route point that isn't the stand itself is the taxi lane, and its
-bearing sitting past the wing line (`BEHIND_DEG` 100) is what nose-in MEANS —
+bearing sitting past the wing line (`BEHIND_DEG` 100) is what nose-in MEANS ,
 a tie-down you can taxi straight out of plans `None` and never calls a tug.
 The push is STEERED, so it ends on the lane pointing DOWN it (the finish
 heading is the lane's own direction, node to next node, never the reciprocal
-of our push — a stand entered at an angle would otherwise leave us aimed
+of our push, a stand entered at an angle would otherwise leave us aimed
 across the taxiway) and the airliner never has to turn itself around on the
 apron. But steered means CHOSEN, not flown: X-Plane's three pushback commands
-are whole manoeuvres the tug executes and finishes, not a rudder — read
+are whole manoeuvres the tug executes and finishes, not a rudder, read
 Commands.txt, "Nose 90 left" / "Straight back" / "Nose 90 right", and
 `pushback_stop` is "stop and LET GO". So the pattern is picked ONCE from the
 initial heading error and re-issued, never re-steered per tick. The first
 version treated the three as a steering channel and the trap sprang
 immediately: it picked `left` correctly, then its own twelve-second nudge
-sent `straight` unconditionally, which RE-AIMED the tug — and since the
+sent `straight` unconditionally, which RE-AIMED the tug, and since the
 tracked command still read Left, nothing ever sent Left again. A Gatwick
 MD-82 was pushed 51 m dead straight with its heading unchanged to a tenth of
 a degree, 115 degrees off the lane (2026-07-27). Two more things fall out of
 the same semantics: the command issued before a tug exists only SUMMONS one
 (the push began only after the nudge re-issued it once hooked), so the
 pattern is sent again on hook-up; and a tug that stops having moved has
-FINISHED, which is why `STALL_SECS` ends the push — motionless, the same
+FINISHED, which is why `STALL_SECS` ends the push, motionless, the same
 sortie sat out 203 further seconds to `MAX_SECS`. Short of the plan the tug
 is asked for another pattern, bounded by `MAX_ISSUES`. A pushback command is ONE
 complete manoeuvre, and COMPLETION INCLUDES LETTING GO of the bar: the
-Stansted trail (2026-07-28) shows "Nose 90 left" executed to the letter —
-err pinned at −98.5 for 30 m of straight push, a clean ~90° arc, bar off —
+Stansted trail (2026-07-28) shows "Nose 90 left" executed to the letter ,
+err pinned at −98.5 for 30 m of straight push, a clean ~90° arc, bar off ,
 with nothing sent after the initial issue, so "attached dropped after we
 rolled" is the manoeuvre's normal END, not a tug abandoning us (three pushes
 were failed as `tug_released` for finishing correctly). The release handler
 now judges completion (aligned within `ALIGN_DEG`, or `done()`); short of the
-plan it issues the NEXT pattern — which summons the tug back to the bar (it
-is standing at the nose; `REHOOK_SECS` bounds the wait) — bounded by
+plan it issues the NEXT pattern, which summons the tug back to the bar (it
+is standing at the nose; `REHOOK_SECS` bounds the wait), bounded by
 `MAX_ISSUES`. Which way `pushback_left` swings the nose is still LEARNED per
 session (`sense_is_wrong` flips once, `LEARNED_SENSE` keeps the verdict), but
 the DEFAULT guess is now the measured one: on X-Plane 12.4.3 `pushback_left`
-swings the nose CLOCKWISE, opposite to its "Nose 90 left" description —
+swings the nose CLOCKWISE, opposite to its "Nose 90 left" description ,
 three pushes, three identical full-turn trails. A correction is never sent
 mid-manoeuvre (that re-aims the tug); the release handler and the hook-up
 re-issue are the moments a pattern takes. Brakes are the stage's own too:
 SET for the tug wait (full auto's early stage-2 release left an idle jet
-brakeless for the minutes-long wait and it crept into the grass, same day —
+brakeless for the minutes-long wait and it crept into the grass, same day ,
 the release is deleted; the taxi governor, pushback and auto-takeoff each
 release at their own moment), released at hook-up, re-set at disconnect and
 on the mid-apron failure exits. Every tug
 instruction goes through the
-same `pushback` tool a spoken "push back left" reaches — one owner for the
+same `pushback` tool a spoken "push back left" reaches, one owner for the
 ground-ops commands. The tug handshake is ONE dataref plus our own position:
 `pushback_attached` is the bar, and "under tow" is measured by having ROLLED
 (`MOVED_M`). `sim/flightmodel2/misc/tow_in_progress` sounds like the second
-half of that handshake and is not — probed live at a stand with the aircraft
+half of that handshake and is not, probed live at a stand with the aircraft
 rolling backwards under a tug, it read 0 from hook-up to release
 (2026-07-27). Everything that had been gated on it was therefore dead code
 with a plausible story attached: the push never believed it was moving, so
@@ -1596,19 +1642,19 @@ the tug-released check could never fire and the nudge went out at twelve
 seconds on every normal push; the wait-for-the-tug-to-clear before taxiing
 returned true on its first read with the tug still on the nose; and the
 monitor's callouts, which CLAUDE.md claimed narrated the push, spoke only
-"tug connected" — never "pushing back" or "tug clear". The dataref is still
+"tug connected", never "pushing back" or "tug clear". The dataref is still
 read everywhere it was, as extra evidence only, and the per-tick `push`
 events now carry `att`/`tow` so the next sortie can re-settle it. Clear is
 the BAR coming off, never the rolling stopping, or a pause mid-push
 announces a tug that is still hooked on. The stage is INLINE in full auto, not a spawned
-sub-loop like the taxi governor — nothing else can arm a pushback, so there
-is no second owner to arbitrate with — and it is deliberately BEST EFFORT: no
+sub-loop like the taxi governor, nothing else can arm a pushback, so there
+is no second owner to arbitrate with, and it is deliberately BEST EFFORT: no
 tug, a timeout, or a tug that lets go early falls back to the taxi join's own
 turn-around, which is exactly the behaviour that shipped before this stage
 existed. Which failure it was has to reach the pilot, though: full auto spoke
 ONE line for all of them, so a tug that came, hooked on and pushed us fifty
 metres was reported as "no tug came" by a copilot the pilot was watching it
-through the window (2026-07-27) — the failure line is per-reason now.
+through the window (2026-07-27), the failure line is per-reason now.
 Narration is otherwise the MONITOR's (its pushback watch calls the tug
 connecting, the push starting, and the tug clearing), so the module speaks
 only what that watch cannot know: the ask, and the failures. Laws
@@ -1616,8 +1662,8 @@ battle-test as plain `cargo test`; events blackbox as `"kind":"pushback"`
 (the arm log carries the stand position AND the lane node, because "no tug
 came" is undiagnosable without them; per-tick `push` events carry
 back_m/err/steer/sense). First live push (Gatwick, Twin Otter, 2026-07-27)
-proved the trigger and the fallback — nose-in at 141 degrees off the route,
-turned around under its own steam — and convicted the TUG WAIT: the tug is a
+proved the trigger and the fallback, nose-in at 141 degrees off the route,
+turned around under its own steam, and convicted the TUG WAIT: the tug is a
 vehicle crossing an airport, not a dataref flipping (X-Plane searches 1500 m
 for one and lets it drive 6 km:
 `sim/private/controls/trucks/max_search_radius_m` / `max_drive_distance_m`),
@@ -1626,7 +1672,7 @@ now, with a crew line at 30 s so a stand-sitting aircraft never reads as a
 hang, and the give-up still cancels the request so a late tug can't hook onto
 an aircraft that has started taxiing. A tug DOES come: watched live at a
 Gatwick stand the same evening, `pushback_attached` flipped to 1 and the
-aircraft was rolling three seconds later — well inside 180 s, well outside
+aircraft was rolling three seconds later, well inside 180 s, well outside
 30 s. The SENSE CLOCK ran on the wrong thing until 2026-07-28: `CAL_SECS`
 was measured from the ASK, and a verdict of "sense is fine" LATCHED. At
 Luton the tug hooked on 90 s after the request and did not roll for another
@@ -1643,7 +1689,7 @@ whole window showing an unchanged error and buy a wrong guess a free pass).
 **Progress along a push is a SIGNED quantity, and the brakes belong to whoever
 is not holding the aircraft** (2026-08-01, Southampton, one Baron and one
 sortie). `back_m` was the plain haversine distance from the stand, which is a
-MAGNITUDE — the same trap the taxi guide hit when four knots backwards read as
+MAGNITUDE, the same trap the taxi guide hit when four knots backwards read as
 four forwards, one module over. The tug hooked on and never pushed; the
 aircraft, brakes off for the hook-up and both engines idling, crept FORWARD off
 the stand. That creep counted as pushback progress, crossed `MOVED_M`, latched
@@ -1653,25 +1699,25 @@ reverse of the STARTING heading (start, not current: a "Nose 90" pattern puts
 the nose across the displacement, but the displacement is still behind where
 the nose began), and rolling forward past `CREEP_M` with nobody towing ends the
 push, brakes on, as `creeping`. The second half is that the re-hook wait ran
-its full minute BRAKELESS — the hook-up release rule ("the first moment
+its full minute BRAKELESS, the hook-up release rule ("the first moment
 releasing them is safe is when something is holding the aircraft") was written
 for the tug wait in July and not applied one state later, so the Baron
 accelerated to 21 kt across the apron while the module believed it was standing
 still, the tower berated us for leaving the cleared route, and the pilot
 stopped it by voice. Brakes now go on before the re-hook wait and come off
-again on the re-hook, and the ABORT path sets them too — it only ever stopped
+again on the re-hook, and the ABORT path sets them too, it only ever stopped
 the TUG. Every one of these is the same rule: a stage that is not moving the
 aircraft is holding it.
 
 **And the creep guard then killed the pushes it was guarding** (2026-08-02,
 same stand, three in a row). The tug's dead air is MINUTES (Luton: hooked for
 74 s before rolling), the brakes come off at the hook-up, and a Baron at idle
-walks forward in seconds — so every push ran: hooked, brakes released, forward
+walks forward in seconds, so every push ran: hooked, brakes released, forward
 3 m in four seconds, `creeping`, dead, before the tug ever moved. Failing on
 the creep was the wrong verb; the right one is HOLD: `should_hold_creep`
 squeezes the expiring proportional brake channel (`xcopilot/taxi_brake`,
 `HOLD_BRAKE` 0.4, from `HOLD_AT_M` 0.3 m of forward drift) every tick while
-nobody is pushing — it arrests the walk this tick and frees itself in a
+nobody is pushing, it arrests the walk this tick and frees itself in a
 second, so a tug beginning its manoeuvre never fights a latched brake, and it
 is never applied once towing/towed/attached says a push is under way (a "Nose
 90" arc can carry the reference point forward mid-swing). `CREEP_M` survives
@@ -1682,12 +1728,12 @@ never seen ON cannot come off, and on such an airframe a real push ends
 through the movement paths (`done()`, or stall-after-moving = completion)
 rather than being declared released `MOVED_M` metres in and re-aimed
 mid-manoeuvre. And the blip itself is now treated as what it is (2026-08-02,
-after the pilot's ground truth "of course push works" — the sim's tug DOES
+after the pilot's ground truth "of course push works", the sim's tug DOES
 push this aircraft when the brakes are held until it is really connected):
 CONNECTED means connected, not glimpsed. The hook wait requires the
 attach/tow flag up for `HOOK_SOLID_POLLS` consecutive polls before it counts,
 so the brakes stay ON through the tug's positioning instead of releasing on a
-one-poll flicker, and the pattern is issued BEFORE the release — the aircraft
+one-poll flicker, and the pattern is issued BEFORE the release, the aircraft
 is never brakeless with a tug that has no instruction yet. The
 still-unanswered question is narrower now: whether the flag goes solid once
 the tug finishes positioning (the pilot's experience says it will), and the
@@ -1701,25 +1747,25 @@ numbers a tug cannot deliver.
 Malaga, two identical sorties at one stand). The tug ran a textbook Nose 90 both
 times: 55 m back, the nose swung 041 to 311, then it stopped and let go exactly
 as the command says it will. Both were reported to the pilot as "the tug let go
-early" — the same wrong verb the 2026-07-28 Stansted fix removed one state
+early", the same wrong verb the 2026-07-28 Stansted fix removed one state
 earlier, and this time it cost the whole ground chain. Three faults compound and
 they are all the same fault. (1) The PLAN wanted 135.4 degrees, which one
 pattern can never satisfy, and nothing checked that when the plan was made:
 `done()` wants ±6 and the release-time "good enough" test wanted ±20, so a
 44.6-degree residual failed both. (2) The loop's answer to that residual was
-`steer_for(-44.6)` — ANOTHER 90-degree swing, which would have left us 45
+`steer_for(-44.6)`, ANOTHER 90-degree swing, which would have left us 45
 degrees off the other way. `worth_another_pattern` is the missing question:
 another pattern helps only while real DISTANCE is owed (a straight segment
 earns its ask) or at least HALF a swing is, because 45 degrees is the point
 below which the next pattern overshoots by more than the error it was sent to
 remove. (3) The re-issue then waited `REHOOK_SECS` for a tug that has never
-once come back — `reissued_after_release` fired four times across the entire
+once come back, `reissued_after_release` fired four times across the entire
 blackbox and `rehooked` answered it zero times, four for four, each costing the
 full deadline before the identical give-up. The premise was "it is standing at
 the nose"; measured, the hook takes MINUTES (262 s and 268 s here, 90 s at
 Luton) because it is a vehicle driving across an airport, and a released one
 drives away. So the bar coming off now ENDS the push, and the only question is
-`push_delivered` — has the tug delivered what a tug CAN deliver. Forty degrees
+`push_delivered`, has the tug delivered what a tug CAN deliver. Forty degrees
 and 55 m off the stand is the taxi join's problem, and the join is built for
 it (141 degrees under its own steam, Gatwick 2026-07-27); a metre and a half
 is still a genuine failure and still reported as one. The stall path also
@@ -1736,7 +1782,7 @@ dead within four seconds, and sit there until `stagnant` fired with 602 of
 
 The valve is the whole of it, and it had been read as an animation flag. While
 `park_brake_valve` sits in the SET position the sim traps any brake application
-into `parking_brake_ratio` and LATCHES it — which is just what a park-brake
+into `parking_brake_ratio` and LATCHES it, which is just what a park-brake
 valve physically does, connect the wheel-brake line to the accumulator so
 pressure put into the line stays in it. So the proportional channel
 `xcopilot/taxi_brake`, whose entire contract is that a squeeze expires within a
@@ -1744,14 +1790,14 @@ second, was writing a PERMANENT parking brake at the squeeze's own value. The
 blackbox shows it exactly: `park` steps 0.0 to 0.1 on a `cmd 0.10` and 0.0 to
 0.3 on an `out 0.28`, and the second one was still holding the aircraft an hour
 later. Then the governor's own next tick reads that ratio as the pilot's foot
-and pauses — idle throttle, waiting for a pilot who is not braking. Both of the
+and pauses, idle throttle, waiting for a pilot who is not braking. Both of the
 self-pollution guards there (`governor_braking`, `brake_cmd_quiet`) are CLOCKS,
 and a clock cannot see a latch: anything that makes one of our own applications
 permanent outlives both, which is why the fix has to be upstream and not another
 gate.
 
 Nothing ever opened the valve because the SET path went through the valve-aware
-`drive_park_brake` and the RELEASE path did not — three call sites wrote
+`drive_park_brake` and the RELEASE path did not, three call sites wrote
 `parking_brake_ratio = 0.0` raw (both taxi_in phases and the auto-takeoff's
 brake release), which looks complete and leaves the valve armed behind it. The
 asymmetry IS the bug. `ensure_park_brake_valve` is now the one seam, commanded
@@ -1759,7 +1805,7 @@ absolutely (`park_brake_valve_open`/`_close`, not a toggle guarded by a stale
 read), the governor isolates the valve on every taxi arm rather than only as a
 side effect of releasing a brake that happened to be set, and
 `release_park_brake_for_roll` replaces the three raw writes. The BE58 profile
-declares `park_brake_valve_set: 1.0` — measured both ways live, and per-airframe
+declares `park_brake_valve_set: 1.0`, measured both ways live, and per-airframe
 for the usual reason: SET is 1 here and on the SR22, 0 on the C90B, so a
 constant would strand half the fleet with the valve backwards. An airframe
 declaring no valve is untouched.
@@ -1768,7 +1814,7 @@ Worth keeping: the FIRST diagnosis of this, the same day, was wrong. It blamed
 the toe RATIOS latching across a standdown (expiry frees the plugin override,
 never the ratios) and shipped `should_release_brake_channel` against that story.
 Probed live the next day with the aircraft still stuck, `left_brake_ratio` and
-`right_brake_ratio` both read 0.0 and `override_toe_brakes` 0 — the plugin's
+`right_brake_ratio` both read 0.0 and `override_toe_brakes` 0, the plugin's
 expiry cleans up after itself exactly as documented, and the 0.5 that had been
 read off "the ratios" was the parking brake all along. The arm-time clear stays
 because zeroing a channel you have not zeroed is honest and costs one write, not
@@ -1782,7 +1828,7 @@ is not. NOT yet flown.
 **The route is the network's; the LINE is the paint's** (2026-08-05, Malaga,
 noticed from the cockpit window rather than from a log). The Baron taxied
 1,214 m to runway 13 tracking its planned route to 0.05-0.13 m, and did the
-whole taxi 1.7 to 2.8 m to one side of the yellow line — 5 to 6 m through the
+whole taxi 1.7 to 2.8 m to one side of the yellow line, 5 to 6 m through the
 taxiway E junction. Nothing was wrong with the drive. apt.dat carries two
 descriptions of the same pavement and the routing network is authoritative
 about only one of them: 1201/1202 are hand-authored TOPOLOGY (what connects to
@@ -1793,7 +1839,7 @@ network exactly is therefore following an approximation exactly.
 beziers sampled, since the fillet at a junction is a curve and its chord is
 not), and `ride_paint` resamples every planned route onto them: each leg is cut
 into 5 m samples and each sample slid sideways onto the nearest drawn line
-running the same way — inside `PAINT_SNAP_M` (8 m; wider is a different
+running the same way, inside `PAINT_SNAP_M` (8 m; wider is a different
 taxiway, not a mis-drawn network) and `PAINT_PARALLEL_DEG` (25 degrees, which
 is what stops a route being dragged onto the taxiway it is CROSSING, or onto a
 hold bar drawn square across it). It can only ever move a point sideways onto a
@@ -1803,10 +1849,10 @@ lead-on (which IS a painted line) and the vacate; runway legs are left alone,
 and with them the vacate's start point, which is the aircraft's own position and
 the one point in any route that must never move. At LEMG 230 of the route's 242
 points now sit ON the line (median 0.00 m, from 1.7-2.8), and the 12 that don't
-are where nothing is drawn — thin data degrades, it never refuses. One
+are where nothing is drawn, thin data degrades, it never refuses. One
 knock-on, from the same family as every other unit change: a leg used to mean a
 network EDGE, so `mark_runway_crossings` exempting "the last leg" exempted the
-whole approach to the holding point, and a leg is now metres long — the
+whole approach to the holding point, and a leg is now metres long, the
 exemption is the route's TAIL (`TAIL_EXEMPT_M`) or a route announces a crossing
 of the runway it is holding short of. NOT yet flown.
 
@@ -1814,7 +1860,7 @@ The same sortie's other half is a diagnosis fix: **an unsigned quantity
 standing in for a signed one reads plausibly and is wrong half the time.** The
 taxi blackbox's `lat_m` was a DISTANCE from the route, so the entire log of
 every taxi ever flown records how far off the line the aircraft ran and never
-which side — which is the only question when the pilot can see the paint.
+which side, which is the only question when the pilot can see the paint.
 `taxi_guide::project_signed` keeps the side (positive is right of the route's
 direction of travel) and `project` is its `.abs()`, because every GATE
 genuinely wants the magnitude: "off the route by more than X" is the same fault
@@ -1826,14 +1872,14 @@ forwards during a pushback, one module over.
 flown right after the paint fix). At 13:41:06 the tower cleared us to land; at
 13:41:07 it ordered "go around, traffic on the runway". `PENDING_GO_AROUND` had
 been published on the party line since the day it was written and NOTHING EVER
-CONSUMED IT, so the approach flew on for another seventy seconds — through a
-0.5 nm same-altitude conflict — and balked only because it happened to arrive
+CONSUMED IT, so the approach flew on for another seventy seconds, through a
+0.5 nm same-altitude conflict, and balked only because it happened to arrive
 high. Then the cascade, where every link is a fact the previous link owed it.
 The order VOIDS the landing clearance, and the missed approach never reported
 again (the circuit makes the first "final" call; autoland's re-approach made
 none), so eleven minutes later the aircraft landed without a clearance and the
-tower said so. No clearance meant `vacate_runway` — gated on a STANDING
-ClearedToLand — returned `None`, the vacate never ran, `taxi_in` arrested the
+tower said so. No clearance meant `vacate_runway`, gated on a STANDING
+ClearedToLand, returned `None`, the vacate never ran, `taxi_in` arrested the
 roll where it stood, and the Baron sat ON runway 13 through four incursion
 warnings with an arrival closing to 1.3 nm. One fix per link.
 `GoAroundLatch::order` flies a controller's order from wherever the approach
@@ -1854,7 +1900,7 @@ authored runway edge. NOT yet flown.
 **The apron is where the network stops, and an arrival has to get past it**
 (same sortie). apt.dat routes taxiways; the lead-in painted into a stand is
 mostly not in the network at all, so `plan`'s destination snap put the last
-point at whatever node lay nearest the stand and the drive finished there —
+point at whatever node lay nearest the stand and the drive finished there ,
 66 m short of stand W5 at Malaga, parked across the live taxiway the tower had
 just cleared somebody else down, twice, having named the stand both times.
 `plan_to_stand` continues the route from that node to the stand itself, and the
@@ -1864,11 +1910,11 @@ driving blind across an unseen apron is worse than stopping short of it). The
 leg carries no NAME: an apron lead-in is not a taxiway, and the guide would
 otherwise call a turn "onto" something that is on no chart. At LEMG the route
 now finishes 0.0 m from W5. The departure mirror has been right since the
-lead-on landed — a route ends short of the runway ON PURPOSE there, and the
+lead-on landed, a route ends short of the runway ON PURPOSE there, and the
 drawn line carries it the rest of the way.
 
 **A proportional controller cannot track a ramp, and a glidepath is a ramp**
-(2026-08-05, the same Malaga circuit — the reason the first approach was
+(2026-08-05, the same Malaga circuit, the reason the first approach was
 already lost before autoland ever saw it). The aircraft was handed over 174 ft
 above the 3 degree path with 2,827 m to run, and autoland closed only half of
 that in a mile, so it crossed the numbers 59 ft high and balked. The pattern
@@ -1876,7 +1922,7 @@ had rolled out onto final only 54 ft high; the error then GREW, monotonically,
 to 172 ft in forty seconds. Two faults in `alt_capture_vs`, and the second one
 hides inside the fix for the first. (1) There was no feed-forward for the
 target's OWN rate. On final the target is the path at our distance to run, so
-it walks down at 318 ft per mile covered — 510 fpm at the Baron's closure — and
+it walks down at 318 ft per mile covered, 510 fpm at the Baron's closure, and
 a proportional law tracking a ramp settles at exactly ramp over gain: 510/3 is
 170 ft, against 174 flown. The clamp said the same thing twice over, since a
 flat -500 fpm is LESS than a 3 degree path's own rate at any approach speed
@@ -1898,7 +1944,7 @@ flown.
 later). Full auto asks the tower for a taxi clearance unless it already holds
 one, where "holds one" was `route_is_ours`: does the published route pass
 within 200 m of us. An arrival's clearance ENDS where we are parked, so it
-passes that test with room to spare — full auto adopted the taxi-in route it
+passes that test with room to spare, full auto adopted the taxi-in route it
 had just finished driving, skipped the request entirely (no `request_taxi`, no
 `tuned_tower` in the stage log), drove 33 s of an already-complete 88 m route
 back toward the stand from 66 m off it, and announced itself at the holding
@@ -1906,34 +1952,34 @@ point. The tower's answer to the departure request was "taxi to holding point
 Hotel Whiskey one FIRST", and the line-up failed. The party line already knew
 which kind of route it had published (`taxi_to_stand`); nobody had asked it.
 
-Depth (added 2026-07-28, evening): four traps of the same family — a fact one
+Depth (added 2026-07-28, evening): four traps of the same family, a fact one
 part of the system knows and another needs. The taxi GUIDE narrated a
 **pushback** ("Rolling again. Sharp left next, onto Bravo" with the tug
 connected): groundspeed is a MAGNITUDE, so four knots backwards reads exactly
 like four forwards, and the stand IS the cleared route's first point. It gates
-on `pushback::ACTIVE` now, and on the route itself — a fix whose along-track
+on `pushback::ACTIVE` now, and on the route itself, a fix whose along-track
 progress went BACKWARDS is never a moment for "next left". **Full auto** polled
 `autotaxi::ACTIVE` to wait out a drive, but a BACKTRACK drops that flag in the
 gap between its two legs; it read the gap as "finished" and called a running
 line-up a failure one second after leg two engaged. `driving()` (ACTIVE OR
 `BACKTRACKING`) is what a caller waits on. The ground drives (`auto_taxi`,
 `line_up`, `taxi_to_parking`) were registered behind `!autothrottle` alongside
-`hold_speed` — right for the AIRBORNE speed tool, since an airliner sets its
+`hold_speed`, right for the AIRBORNE speed tool, since an airliner sets its
 speed bug, and wrong for these: on the ground the taxi governor is the only
 speed control there is. Neither jet had a taxi tool at all, and only full auto
 worked because it builds its own copies. And one PANEL fact: a light can be two
 switches (`also_datarefs`) and a system's only control can be a TOGGLE
-(`write_datarefs`) — the Citation X's landing lights are independent left and
+(`write_datarefs`), the Citation X's landing lights are independent left and
 right, and firing `cmd_avionics_toggle` as "on" turns the avionics OFF whenever
 they were already on, which is worse than having no tool.
 
 Related trap (2026-07-24): `Voice::alert` now
-mirrors spoken lines to the panel transcript itself — any watch that ALSO
+mirrors spoken lines to the panel transcript itself, any watch that ALSO
 posts `s.action(same line)` double-writes the chat (the Jerez relocation
 note; gyro-sync and autoland hit it first). Mirror OR action, never both.
 
 **The panel is an automation instrument now** (2026-07-29 revamp). Tabs are
-Flight | Transcript | ATC | Route | Settings — Flight first and default: the live
+Flight | Transcript | ATC | Route | Settings, Flight first and default: the live
 strip, an automation status well fed by `xcopilot/status/auto` (composed by
 [src/auto_status.rs](src/auto_status.rs): marker byte '1' = a manager is
 actually flying/driving (the AUTO annunciator; since the audit of 2026-08-02
@@ -1944,19 +1990,19 @@ one line per active manager, primary as "NAME|stage"; `full_auto::event()`
 stores its stage string, and the mission is folded into the name so the
 button pressed matches the headline: "FULL AUTO CIRCUIT [request taxi]" /
 "FULL AUTO FLIGHT [...]"),
-published change-gated from the monitor tick — NOT the 1 Hz radio thread,
-which only exists when ATC is configured — with an unconditional resend every
+published change-gated from the monitor tick, NOT the 1 Hz radio thread,
+which only exists when ATC is configured, with an unconditional resend every
 5 ticks because a plugin reload zeroes the buffers and a change-gate would
 leave the tab blank. Below the well, BUTTONS for every automation
 (FULL AUTO / FLY PLAN / PUSH BACK / TAXI / LINE UP / TAKEOFF / CIRCUIT /
 LAND + guarded RECOVER / MY CONTROLS): each injects the same English a pilot
 would speak through the request channel (`auto_status::REQUEST_PHRASES`,
 codes 4-10; a grammar test pins every phrase to its tool so a button can
-never reach the LLM), and CANCEL (code 11) has no fixed phrase — the app
+never reach the LLM), and CANCEL (code 11) has no fixed phrase, the app
 picks per what's running ("cancel full auto" outranks all, its abort
 cascades), falling back to "my controls" when NOTHING is running
 (2026-08-02): the old None fell exactly when the pilot most needed the button
-— after the missed-approach give-up every ACTIVE flag was already false while
+, after the missed-approach give-up every ACTIVE flag was already false while
 the AP still flew the aircraft dirty and slow, and CANCEL was silently
 consumed with nothing to say. An abort that goes dead precisely when things
 have gone wrong is worse than none; CANCEL always aborts SOMETHING now, and
@@ -1964,13 +2010,13 @@ the fallback is the universal hand-back (autopilot off, every hold released).
 Mechanics worth knowing when diagnosing "the button did nothing": presses
 ride the same typed-command mpsc queue the keyboard uses, consumed one per
 session-loop pass, so presses fire in order and a press can wait out a busy
-loop — but the phrase (including the cancel pick) is resolved at PRESS time
+loop, but the phrase (including the cancel pick) is resolved at PRESS time
 in the poller thread, so a queued CANCEL still cancels what was running when
 the pilot pressed it. The old Calls tab folded into ATC (coach block on top, radio
 chips, stations, phraseology reference in CollapsingHeaders; the
-readback-owed dot moved to the ATC tab); the shared header rows are gone —
+readback-owed dot moved to the ATC tab); the shared header rows are gone ,
 each tab owns its space, and the status bar gained an AUTO annunciator lit
-from any tab. Type is B612 (the Airbus cockpit face, OFL — TTFs +
+from any tab. Type is B612 (the Airbus cockpit face, OFL, TTFs +
 license in plugin/third_party/b612, embedded via xxd headers), baked at
 THREE sizes because the ImGui atlas binds at the first ImgWindow ctor and
 can never rebake: UI scale (Settings radios, `xcopilot/opt/ui_scale`,
@@ -2015,7 +2061,7 @@ once by `from_env` and CLONED into each thread, which made every field a boot
 constant even where its consumer already re-read it every tick.
 [src/settings.rs](src/settings.rs) holds it in an `Arc<Config>` instead, and a
 consumer takes a fresh `settings::live()` handle at the top of its loop (one
-line in the monitor, one in the session loop) — copy-on-write, so a tick that
+line in the monitor, one in the session loop), copy-on-write, so a tick that
 started before an edit finishes on the snapshot it began with rather than
 seeing half of one. That single change made the taxi guide, the party line, the
 confirm gate, the confidence bands, the LLM fallback and the SimBrief lookup
@@ -2027,7 +2073,7 @@ atomic so a shared reference can retune it), pushed once between utterances by
 re-pushed per tick rather than only at station install. A knob is DECLARED once
 in the registry (name, pinning variable, how to render, validate, step, apply
 and persist), and the Settings screen is a view of that list, never a second
-copy of the schema — which is how the in-sim panel's three bespoke pickers can
+copy of the schema, which is how the in-sim panel's three bespoke pickers can
 move onto it later without inventing a third precedence chain. The rule that
 matters is the pin: precedence is env > saved pref > default, so a knob whose
 variable is set (including from `.env`, which dotenvy has already loaded) is
@@ -2035,25 +2081,25 @@ REFUSED with the variable named on screen. Accepting that edit and letting the
 next boot silently revert it is the "always end up back with ryan" bug wearing
 a new face, and a settings screen is exactly where it would happen again.
 Values persist to a generic `settings` map in prefs.json, with the four
-existing typed fields left alone — mode and cabin crew are `Persist::Own`,
+existing typed fields left alone, mode and cabin crew are `Persist::Own`,
 since the panel protocol already owns their boot path, and a second one here
 would be two precedence chains for one value. Stored forms carry no unit
 (a "900 ms" its own parser rejects would forget itself at the next boot, which
-a test pins), and a value outside the declared range — legal, because env vars
-are parsed by config.rs and not by the registry — renders fine and is pulled in
+a test pins), and a value outside the declared range, legal, because env vars
+are parsed by config.rs and not by the registry, renders fine and is pulled in
 by the first keypress.
 
 **Web API load is a sim cost, and it is measured** (2026-07-28). The API is
 served from inside X-Plane's flight loop, so every request is frame time the
 sim does not get. Two hangs that day could not be attributed either way,
-because the logs recorded only FAILURES — nothing ever counted the requests
+because the logs recorded only FAILURES, nothing ever counted the requests
 that succeeded. `crates/sim/src/xplane.rs` now reports rate, cache hits,
 failures and the slowest response every 30 s, to the log and the blackbox
 (`"kind":"api_load"`). The first numbers were 70-80 req/s sustained, with the
 per-window slowest response climbing 50 → 100 → 125 ms in the minutes before a
 freeze: the shape of load, not of a single event. Reads are served from a 60 ms
 value cache (shorter than any control tick; a write drops its own entry so the
-readback every tool's trust rests on still sees the real post-write value) —
+readback every tool's trust rests on still sees the real post-write value) ,
 but the DUPLICATION that cache was built for is NOT where the volume comes
 from. Measured, it recovers about 2.5%, because the loops each read DIFFERENT
 datarefs rather than the same ones twice, and a whole EGHI sortie logged
@@ -2062,7 +2108,7 @@ is the honest answer, and it is why the load report also records a per-dataref
 histogram to the blackbox (`top`), which is the only thing that can actually
 name a hog. That sortie's: latitude and longitude 7,312 each, then
 `is_in_replay` 3,803 and `paused` 3,791 (the freeze check, ~4/s between them,
-for two flags that change almost never — the obvious candidate for a longer
+for two flags that change almost never, the obvious candidate for a longer
 per-dataref TTL), `onground_any` 3,723, elevation 3,375, groundspeed 3,070,
 psi 2,877, over 61 windows. Whether any of this causes the hangs is still
 unknown: the per-window slowest response reached 4,533 ms mid-flight, and the
@@ -2070,21 +2116,21 @@ plugin (in-process, drawing every frame, never profiled) and LiveTraffic remain
 the other two suspects.
 
 Battle-test surface (all deterministic, in `cargo test --workspace` unless
-noted — plain `cargo test` at the root only runs the crew package now): the
+noted, plain `cargo test` at the root only runs the crew package now): the
 state-by-intent matrix test in [crates/atc/src/tower.rs](crates/atc/src/tower.rs); the adversarial
 transcript corpus [crates/atc/bench/atc_corpus.yaml](crates/atc/bench/atc_corpus.yaml) (real whisper
-output mined from flight logs — add every new wart here); scripted sortie
+output mined from flight logs, add every new wart here); scripted sortie
 dialogues over the pure routing layer (`route_keyed`/`route_unkeyed`) in
 [crates/atc/src/station.rs](crates/atc/src/station.rs); the spoken-call eval judged on intent
 accuracy (`cargo run -- stt-eval bench/atc_stt_cases.yaml`); the cross-airport
 world sweep (`cargo test --release -p atc -- --ignored atc_world_sweep`, needs
 the sim's apt.dat); and the in-sim soak checklist
 [docs/atc-chaos-card.md](docs/atc-chaos-card.md). Every routing decision is
-blackboxed as a `"kind":"atc"` event — mine `logs/blackbox.jsonl` after each
+blackboxed as a `"kind":"atc"` event, mine `logs/blackbox.jsonl` after each
 flight. Safety property: a mishear may earn "say again", never a clearance.
 The tracing filter must name EVERY workspace crate
 ([src/main.rs](src/main.rs) defaults to
-`xvoicelayer=info,xvl=info,atc=info,sim=info` — and the crew needs BOTH of its
+`xvoicelayer=info,xvl=info,atc=info,sim=info`, and the crew needs BOTH of its
 names, because a line's default target is `module_path!()`, which is the BIN
 name for code in a binary and the PACKAGE name for code in the lib. Naming only
 the package dropped all 158 default-target sites, the startup/build line
@@ -2096,15 +2142,15 @@ side, so "release watch armed" and "wake clock started" never reached
 sim instead of grepping (2026-07-27).
 
 History: ATC started as a separate binary ([src/bin/atc.rs](src/bin/atc.rs),
-still buildable — tower + ATIS glue around the same lib modules) on the "the
+still buildable, tower + ATIS glue around the same lib modules) on the "the
 world is a different process" theory. Flying it proved the split premature:
 mic/PTT/voice are single shared resources and the second terminal was
 unusable in the cockpit. The right split landed 2026-07-14 as a **compile-time
 boundary, not a second process**: the world lives in the `atc` workspace crate
-(`crates/atc` — station, tower, nav, atis, party_line, speaker identity), both
+(`crates/atc`, station, tower, nav, atis, party_line, speaker identity), both
 sides stand on `crates/sim` (Web API client, dataref names, blackbox), and the
-copilot embeds the world as a library — still one process, one mic, one PTT.
-The atc crate returns `(text, StationSpeaker)` and never speaks or actuates —
+copilot embeds the world as a library, still one process, one mic, one PTT.
+The atc crate returns `(text, StationSpeaker)` and never speaks or actuates ,
 its sim handle is `sim::xplane::SimView`, a read-only view with no writes on
 it, so "the world never touches the controls" is a type, not a promise; its
 dep tree must stay free of whisper/cpal/ort (`cargo tree -p atc` is the
@@ -2117,21 +2163,21 @@ collides.
 ## App modes: Both / Copilot only / ATC only (runtime-toggleable)
 
 The two halves sell separately (2026-07-14): `mode.rs` holds one process-wide
-mode — **both** (default), **copilot** (no simulated ATC: no station ever
+mode, **both** (default), **copilot** (no simulated ATC: no station ever
 loads, radio-keyed speech is IGNORED because real/external ATC owns the
-frequency — no void briefing talking over a VATSIM controller), and **atc**
+frequency, no void briefing talking over a VATSIM controller), and **atc**
 (the world without the crew: deterministic tower/ATIS answer the radio, no
-intercom persona, no tools, and the LLM is never touched — an ATC-only boot
+intercom persona, no tools, and the LLM is never touched, an ATC-only boot
 needs no Ollama at all). Chosen from the plugin's Settings tab
 (`xcopilot/opt/mode`, radio buttons; `spawn_mode_poller` syncs it), persisted
 via prefs.json; `XCOPILOT_MODE` env sets only the BOOT value (env > saved pref
 > both), a panel flip wins from that moment and applies live within ~2 s (the
 main loop's idle tick reconciles). Live transitions: ATC off =
-`Station::uninstall()` (retires ALL published world state — party line + side
+`Station::uninstall()` (retires ALL published world state, party line + side
 state, the same page install() writes) + radio-channel cut; ATC on = the same
 `install_home_station` path boot uses (background scans guard against paying
-boot costs twice — `region_loaded()`); copilot off = intercom cut + Ollama
-evict (`Llm::evict`, keep_alive 0 — reclaims the GPU frames); copilot on =
+boot costs twice, `region_loaded()`); copilot off = intercom cut + Ollama
+evict (`Llm::evict`, keep_alive 0, reclaims the GPU frames); copilot on =
 re-warmup off the critical path. Monitor watches split along the same seam:
 crew watches (callouts, debrief speech, taxi guide, landing coach, talk-down)
 gate on `mode::copilot_enabled()`; world ticks are inert once uninstall clears
@@ -2139,11 +2185,11 @@ their state, except `region_tick` which gates explicitly (its airport index
 survives for cheap re-enable). In ATC-only, content routing still reaches the
 station when no radio key is bound (it's the only path to ATC there), and the
 crew speaks exactly one line ("copilot is off") on the first intercom attempt.
-The atc crate itself never reads the mode — the world stays mode-blind and is
+The atc crate itself never reads the mode, the world stays mode-blind and is
 simply not driven when off.
 
 Depth (added 2026-07-15): the "no crew in ATC-only" rule moved from scattered
-per-site gates into the arbiter itself — `Voice::alert` / `alert_stale_by` /
+per-site gates into the arbiter itself, `Voice::alert` / `alert_stale_by` /
 `chime` (and the cabin paths) drop at the one enqueue door when
 `copilot_enabled()` is false, so no background watch can forget the gate (the
 void-transmission "No answer there" brief, the carry-forward brief, gyro sync,
@@ -2156,23 +2202,23 @@ mode hold `mode::TEST_LOCK`.
 ## Cabin crew: the second intercom persona (2026-07-15)
 
 Channels are physics, personas are tenants: the intercom now carries TWO
-voices — the copilot and the cabin crew ([src/cabin.rs](src/cabin.rs)), with
+voices, the copilot and the cabin crew ([src/cabin.rs](src/cabin.rs)), with
 no third PTT and no third audio channel. The address IS the routing ("cabin
-crew, prepare for landing" — an explicit "cabin crew"/"flight attendants"
+crew, prepare for landing", an explicit "cabin crew"/"flight attendants"
 prefix always routes; bare "cabin" routes only with an unmistakable crew word,
 because cabin lights/pressure/the Lancair's cabin dump switch are copilot
 business). Calls are answered deterministically (keyword intents, "say again"
-over guessing — the tower's safety property), always preceded by the
+over guessing, the tower's safety property), always preceded by the
 interphone chime, in their own voice (`XCOPILOT_CABIN_VOICE`, lazily loaded so
 crewless flights never pay for the model). The crew exists per-airframe
-(profile `cabin_crew: true` — the MD-82 only, so far); staffing is a panel
+(profile `cabin_crew: true`, the MD-82 only, so far); staffing is a panel
 setting like the app mode (Settings tab radios Auto/Aboard/Off →
 `xcopilot/opt/cabin_crew`, synced by the settings poller, persisted via
-prefs.json, applied live at the routing sites — staff a 172 mid-flight);
+prefs.json, applied live at the routing sites, staff a 172 mid-flight);
 `XCOPILOT_CABIN_CREW` sets only the BOOT value (env > saved pref > auto).
 Behavior: "prepare
 for departure/landing" is acknowledged then owes a delayed "cabin secure"
-report (spoken by the monitor's cabin watch — a SAFETY report, exempt from
+report (spoken by the monitor's cabin watch, a SAFETY report, exempt from
 sterile cockpit); the seatbelt-sign watch (the annunciator dataref, so auto
 modes count) calls up only when the sign interrupts a running service AND
 above the sterile floor (10,000 ft AGL, `STERILE_FLOOR_AGL_FT`); climbing
@@ -2187,12 +2233,12 @@ the radio key), PA announcements, and folding the mode enum into a tenant set.
 ## Core design rule: curated tool surface, not raw dataref access
 
 **Never let the LLM write arbitrary datarefs.** Expose a small, explicit set of
-tools — `set_flaps(notch)`, `gear(up|down)`, `set_lights(...)`, `set_freq(...)` —
+tools, `set_flaps(notch)`, `gear(up|down)`, `set_lights(...)`, `set_freq(...)` ,
 where each tool owns:
 
 1. its dataref + valid range (so "flaps up" can't accidentally write throttle),
 2. a **readback** that re-reads the dataref *after* writing and confirms the
-   actual value — a real copilot confirms the *action*, not the *intent*,
+   actual value, a real copilot confirms the *action*, not the *intent*,
 3. **safety gates** (e.g. "gear up" while on the ground → refuse + explain why).
 
 ## v1 milestone
@@ -2206,7 +2252,7 @@ is just more tools. Don't over-build the framework before that loop works.
 **`GPL-3.0-or-later`** (2026-07-30, `LICENSE` at the root, declared once in
 `[workspace.package]` and inherited by every crate). Two things are now settled
 and not open questions: this is **open source, never commercial**, and it is
-**X-Plane only** — no MSFS port, whatever the incumbents' platform reach. Only
+**X-Plane only**, no MSFS port, whatever the incumbents' platform reach. Only
 the product NAME stays parked.
 
 Copyleft over the dual `MIT OR Apache-2.0` the Rust convention would suggest,
@@ -2215,7 +2261,7 @@ is payware-dominated, and Skylink Simulations sells this exact product shape
 (deterministic ATC + voice copilot + cabin crew) for $49. Under a permissive
 license the tower FSM, the taxi planner, the wake-separation logic and the
 ground-drive laws could be lifted straight into closed payware. The usual
-argument FOR permissive is commercial adoption, which is a LIBRARY concern —
+argument FOR permissive is commercial adoption, which is a LIBRARY concern ,
 this is an end-user application, so it costs us nothing to refuse. It is also
 the reversible direction: a sole author can always relicense GPL code as
 permissive later, but MIT grants already handed out can never be clawed back.
@@ -2224,10 +2270,10 @@ with GPLv3, NOT GPLv2), and matching Welly's ATC now makes his IFR/live-ATIS
 code legally liftable, where the old rule was patterns-yes-code-no.
 
 The linking question people assume blocks this doesn't: `plugin/SDK/license.txt`
-is plain MIT/BSD, not a proprietary SDK license — as are Dear ImGui (MIT) and
+is plain MIT/BSD, not a proprietary SDK license, as are Dear ImGui (MIT) and
 ImgWindow (BSD-3-Clause); B612 stays OFL. All GPL-compatible, all keep their own
 terms. Sole-author relicensing stays free only until outside contributions are
-merged — settle any change of heart BEFORE accepting a PR. One consequence to
+merged, settle any change of heart BEFORE accepting a PR. One consequence to
 keep in mind: `crates/atc` is built for extraction, and GPL means any future
-consumer of it must be GPL too — `LGPL-3.0` on that one crate is the escape
+consumer of it must be GPL too, `LGPL-3.0` on that one crate is the escape
 hatch if it should ever be broadly embeddable, deliberately not done now.

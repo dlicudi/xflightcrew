@@ -16,6 +16,7 @@
 #include "XPLMUtilities.h"
 
 #include "fms.h"
+#include "audio.h"
 #include "panel.h"
 
 // ---- PTT --------------------------------------------------------------------
@@ -496,6 +497,7 @@ static float roll_axis_value() {
 }
 
 static float TaxiAssistLoop(float, float, int, void*) {
+    audio::tick(); // main-thread only: whatever the app posted since last frame
     // A pending terrain query: probe every point this frame and publish.
     // Scenery access is flight-loop-only, which is why the accessor merely
     // flagged it. Points a pattern-radius from the aircraft are always inside
@@ -851,6 +853,7 @@ void start() {
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteAircraft, &g_aircraft, &g_aircraft);
     fms::register_datarefs();
+    audio::register_datarefs();
     g_llm_dref = XPLMRegisterDataAccessor(
         "xcopilot/llm_enabled", xplmType_Int, 1,
         ReadLlmEnabled, WriteLlmEnabled, nullptr, nullptr, nullptr, nullptr,
@@ -1044,6 +1047,7 @@ void stop_rest() {
     if (g_strip_dref) { XPLMUnregisterDataAccessor(g_strip_dref); g_strip_dref = nullptr; }
     if (g_request_dref) { XPLMUnregisterDataAccessor(g_request_dref); g_request_dref = nullptr; }
     if (g_llm_dref) { XPLMUnregisterDataAccessor(g_llm_dref); g_llm_dref = nullptr; }
+    audio::unregister_datarefs();
     fms::unregister_datarefs();
     if (g_aircraft_dref) { XPLMUnregisterDataAccessor(g_aircraft_dref); g_aircraft_dref = nullptr; }
     if (g_alert_dref) { XPLMUnregisterDataAccessor(g_alert_dref); g_alert_dref = nullptr; }
