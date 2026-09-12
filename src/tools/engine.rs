@@ -381,6 +381,41 @@ pub fn needs_retrim(alt_ft: f64, last_alt_ft: f64, throttle: f64, last_throttle:
     (alt_ft - last_alt_ft).abs() > 400.0 || (throttle - last_throttle).abs() > 0.08
 }
 
+/// A lever at or above this is "rich": the manager has never leaned it (or
+/// it has been pushed back up), so a trim from here is a full search for the
+/// peak, not a touch-up around it.
+const RICH_LEVER: f64 = 0.90;
+
+/// The manager's seek window from the lever it finds: `(top, floor, step)`.
+/// A leaned lever gets a short fine bracket around itself (the world moved a
+/// little, the peak moved a little). A RICH lever gets the whole range in
+/// coarser steps: the old ±0.05 bracket from full rich was 0.95 to 0.95, one
+/// sample, and the lever sat at 0.98 for the rest of the cruise (the manager
+/// "leaned" nothing when armed from below the floor and flown through it).
+pub fn manager_seek_window(mix: f64) -> (f64, f64, f64) {
+    if mix >= RICH_LEVER {
+        (0.95, MIX_LEAN_FLOOR, 0.03)
+    } else {
+        ((mix + 0.05).min(0.95), (mix - 0.05).max(MIX_LEAN_FLOOR), 0.015)
+    }
+}
+
+/// Mixture full rich for the landing (the BEFORE LANDING item), releasing the
+/// continuous manager and any lean seek first so nothing re-leans behind it.
+/// `Some(true)` when the lever moved, `Some(false)` when it was already rich,
+/// `None` when the lever could not be read (nothing written).
+pub async fn mixture_rich_for_landing(xp: &crate::xplane::XPlaneClient) -> Option<bool> {
+    use std::sync::atomic::Ordering;
+    MIX_MANAGED.store(false, Ordering::Relaxed);
+    LEAN_SEEKING.store(false, Ordering::Relaxed);
+    let mix = xp.get_float(MIXTURE).await.ok()?;
+    if mix >= 0.98 {
+        return Some(false);
+    }
+    glide_lever(xp, MIXTURE, 1.0).await;
+    Some(true)
+}
+
 /// The continuous mixture manager: every couple of seconds, check whether the
 /// world moved (altitude, power) and quietly re-trim — full rich below the
 /// leaning floor, a short fine EGT seek around the current lever above it.
@@ -398,7 +433,14 @@ async fn mixture_manager(xp: crate::xplane::XPlaneClient) {
         if super::recover::ACTIVE.load(Ordering::Relaxed)
             || crate::autoland::ACTIVE.load(Ordering::Relaxed)
         {
+            // Whoever owns the levers now wants them rich (a recovery, a
+            // landing): a lever the manager leaned is pushed back up on the
+            // way out, never left lean under an approach.
             MIX_MANAGED.store(false, Ordering::Relaxed);
+            if last_cmd.is_some_and(|lc| lc < 0.98) {
+                glide_lever(&xp, MIXTURE, 1.0).await;
+                tracing::info!("mixture manager: yielding, full rich");
+            }
             break;
         }
         let (Ok(alt), Ok(thr), Ok(mix)) = (
@@ -430,17 +472,24 @@ async fn mixture_manager(xp: crate::xplane::XPlaneClient) {
                     tracing::info!("mixture manager: below the floor, full rich");
                 }
             } else {
-                // Short fine seek around the current lever: bracket ±0.05 in
-                // 0.015 steps, EGT judged after a short settle. Quiet and quick.
+                // Seek the peak from the lever we find (`manager_seek_window`):
+                // a fine bracket around a leaned lever, the whole range from
+                // a rich one. EGT judged after a short settle. Quiet and quick.
                 let mut best_mix = mix;
                 let mut best_egt = read_egt(&xp).await;
-                let top = (mix + 0.05).min(0.95);
-                let floor = (mix - 0.05).max(MIX_LEAN_FLOOR);
+                let (top, floor, step) = manager_seek_window(mix);
                 let mut m = top;
                 let _ = xp.set_float(MIXTURE, m).await;
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let mut released = false;
                 while m > floor {
-                    m = (m - 0.015).max(floor);
+                    // Released mid-seek (the pilot, a landing's full-rich):
+                    // stop moving the lever, and leave it where THEY put it.
+                    if !MIX_MANAGED.load(Ordering::Relaxed) {
+                        released = true;
+                        break;
+                    }
+                    m = (m - step).max(floor);
                     let _ = xp.set_float(MIXTURE, m).await;
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let egt = read_egt(&xp).await;
@@ -450,6 +499,9 @@ async fn mixture_manager(xp: crate::xplane::XPlaneClient) {
                     } else if best_egt - egt >= 12.0 {
                         break;
                     }
+                }
+                if released {
+                    break;
                 }
                 // Sit just rich of the peak, per the POH.
                 let set = (best_mix + 0.03).min(1.0);
@@ -635,12 +687,14 @@ fn spawn_lean_seek(ctx: &ToolCtx<'_>, economy: bool) {
             LEAN_SEEKING.store(false, Ordering::Relaxed);
             // Released mid-hunt (None): whoever took the mixture back already
             // spoke, the seek just stops moving the lever.
+            // The voice mirrors what it speaks onto the panel itself, so the
+            // line is posted here ONLY when there is no voice to say it (both
+            // paths wrote it twice, blue then green, 2026-09-12).
             if let Some(line) = line {
-                if let Some(s) = &status {
-                    s.alert(crate::plugin_status::AlertLevel::Advisory, &line);
-                }
-                if let Some(v) = &voice {
-                    v.alert(crate::voice::Priority::Advisory, line);
+                match (&voice, &status) {
+                    (Some(v), _) => v.alert(crate::voice::Priority::Advisory, line),
+                    (None, Some(s)) => s.action(&line),
+                    (None, None) => {}
                 }
             }
         });
@@ -1395,6 +1449,23 @@ impl Tool for StopEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manager armed below the floor and flown through it found the lever
+    /// full rich and bracketed ±0.05 around it: one sample at 0.95, "peak"
+    /// there, lever parked at 0.98 for the whole cruise. A rich lever is a
+    /// full search; a leaned one is a touch-up.
+    #[test]
+    fn a_rich_lever_gets_the_whole_range_and_a_leaned_one_a_bracket() {
+        let (top, floor, step) = manager_seek_window(1.0);
+        assert_eq!((top, floor, step), (0.95, MIX_LEAN_FLOOR, 0.03));
+        assert!(floor < 0.5, "a full walk must reach cruise mixtures");
+        let (top, floor, step) = manager_seek_window(0.65);
+        assert!((top - 0.70).abs() < 1e-9 && (floor - 0.60).abs() < 1e-9);
+        assert_eq!(step, 0.015);
+        // The bracket never goes under the lean floor.
+        let (_, floor, _) = manager_seek_window(0.32);
+        assert_eq!(floor, MIX_LEAN_FLOOR);
+    }
 
     /// A cold start with the fuel selectors OFF must OPEN them, not crank two
     /// dry engines and report that neither caught (Baron 58, 2026-08-01). The

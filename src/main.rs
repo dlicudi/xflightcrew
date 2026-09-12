@@ -54,6 +54,7 @@ mod tts_onnx;
 mod ui;
 mod vad;
 mod voice;
+mod weather;
 
 // The world side (ATC) and the simulator plumbing now live in their own
 // crates; these shims keep every existing `crate::station::...` /
@@ -2304,6 +2305,10 @@ async fn run_session(
         // Read-only conversation runs before the spoken domain gate: "and now"
         // and clarification replies have no command keyword. Its response type
         // has no tool/action variant, and refreshed questions never enter grammar.
+        // What the last state answer was about, taken BEFORE respond() retires
+        // the topic for an unrelated utterance: "remind me when we get there"
+        // is unrelated to the conversation module but not to the pilot.
+        let nav_topic = conversation.recent_observation_query(Instant::now());
         if let Some(response) = conversation.respond(&command, Instant::now()) {
             let line = match response {
                 conversation::Response::Say(line) => line,
@@ -2720,13 +2725,21 @@ async fn run_session(
                         .await
                         .ok()
                         .map(|v| v.round() as i64);
+                    // "Should we check in with ATC?" wants a yes or a no ahead
+                    // of the call, not just the phraseology.
+                    let yes_no = station::coach_yes_no(&tl);
                     let line = match station::suggest_call(&callsign, on_ground, dist, com1) {
                         Some(s) => match (s.first, s.call) {
                             (Some(f), Some(c)) => {
-                                format!("{f} Then key the radio and say: {c}")
+                                let lead = if yes_no { "Yes. " } else { "" };
+                                format!("{lead}{f} Then key the radio and say: {c}")
                             }
+                            (Some(f), None) if yes_no => format!("No call owed right now. {f}"),
                             (Some(f), None) => f,
-                            (None, Some(c)) => format!("Key the radio and say: {c}"),
+                            (None, Some(c)) => {
+                                let lead = if yes_no { "Yes. " } else { "" };
+                                format!("{lead}Key the radio and say: {c}")
+                            }
                             (None, None) => "No station on frequency to call.".to_string(),
                         },
                         None => "No station on frequency to call.".to_string(),
@@ -2878,8 +2891,31 @@ async fn run_session(
                         .any(|w| w == "tod"))
             {
                 let line = time_to_tod(&config, &xplane, &mut fp_cache).await;
+                conversation.observe(&command, &line, Instant::now());
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
+            }
+            // Weather somewhere ELSE ("what weather can we expect on arrival",
+            // "weather at LEMG"): the sim's datarefs describe the air we are in,
+            // and reading them back for an arrival question is a confident wrong
+            // answer (seen live 45 nm out of Malaga, 2026-09-12). The real-weather
+            // METAR file is the honest source; without one, say so.
+            if !is_reminder && weather_words(&tl) {
+                if let Some(target) = remote_weather_target(&tl, fp_cache.as_ref().map(|(_, fp)| fp)) {
+                    let line = match target {
+                        RemoteWeather::NoPlan => {
+                            "No flight plan loaded, so I have no destination to look up.".to_string()
+                        }
+                        RemoteWeather::Station { icao, label } => {
+                            match weather::briefing(&tools::autoland::xplane_root(), &icao, &label) {
+                                Ok(l) | Err(l) => l,
+                            }
+                        }
+                    };
+                    conversation.observe(&command, &line, Instant::now());
+                    say(&voice, &reporter, ui::LogKind::Readback, &line);
+                    continue;
+                }
             }
             // ETA to the destination ("time before we land", "when do we get in"):
             // distance to the destination airport over groundspeed. Needs a destination
@@ -2902,6 +2938,7 @@ async fn run_session(
                     || tl.contains("remaining"))
             {
                 let line = eta_to_destination(&config, &xplane, &mut fp_cache).await;
+                conversation.observe(&command, &line, Instant::now());
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
@@ -2992,6 +3029,22 @@ async fn run_session(
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
+            // A NAMED fix ("how much left for PIMOS", "what's after PIMOS"):
+            // the ident is matched fuzzily against the loaded plan, because
+            // whisper spells a fix it has never seen phonetically ("pimmons"
+            // for PIMOS, live 2026-09-12). Only a plan already on the shelf is
+            // consulted: a stray "for X" must never trigger a SimBrief fetch.
+            if !is_reminder {
+                if let Some(q) = fp_cache
+                    .as_ref()
+                    .and_then(|(_, fp)| fix_query(&tl, &fp.waypoints))
+                {
+                    let line = fix_answer(&q, &xplane).await;
+                    conversation.observe(&command, &line, Instant::now());
+                    say(&voice, &reporter, ui::LogKind::Readback, &line);
+                    continue;
+                }
+            }
             // Navigation progress (often a command, not a question): ETA / distance /
             // time to the next waypoint.
             if !is_reminder
@@ -3000,9 +3053,13 @@ async fn run_session(
                     || tl.contains("eta")
                     || tl.contains("how far")
                     || tl.contains("time to")
-                    || tl.contains("distance to"))
+                    || tl.contains("distance to")
+                    || tl.contains("how much left")
+                    || tl.contains("how much further")
+                    || tl.contains("how much longer"))
             {
                 let line = nav_progress(&xplane, Some(&live)).await;
+                conversation.observe(&command, &line, Instant::now());
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
@@ -3064,6 +3121,17 @@ async fn run_session(
         // ten") and match against this, so polite phrasings don't miss. The raw
         // `command` is kept for logging/history.
         let matchable = grammar::normalize(&command);
+        // "Remind me when we get there" is a reminder whose target is the last
+        // thing the copilot answered about (the next waypoint, top of descent).
+        // Resolved here, deterministically, from the conversation topic; the
+        // grammar then sees the words it already understands.
+        let matchable = match conversation::resolve_there(&matchable, nav_topic.as_deref()) {
+            Some(resolved) => {
+                tracing::info!(from = %matchable, to = %resolved, "there resolved");
+                resolved
+            }
+            None => matchable,
+        };
 
         // Conversational glue (acks, "what can you do", "say again") — deterministic,
         // takes no action. Checked before commands/questions so pleasantries don't
@@ -4817,6 +4885,11 @@ async fn on_course_report(xp: &XPlaneClient, live: Option<&LiveState>) -> String
     if progress.starts_with("No active GPS waypoint") {
         return progress;
     }
+    // The follower steers direct to its fix; the HSI needle still shows the
+    // GPS's parked first leg, which is nobody's course.
+    if procedure::active_leg().is_some() {
+        return format!("On course, the autopilot is steering the plan. {progress}");
+    }
     let dots = read1(
         live,
         xp,
@@ -4838,6 +4911,20 @@ async fn on_course_report(xp: &XPlaneClient, live: Option<&LiveState>) -> String
 }
 
 async fn nav_progress(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
+    // A procedure in flight steers its own legs; the sim's GPS is parked on
+    // the plan's first entry and would name a fix passed half an hour ago.
+    if let Some(leg) = procedure::active_leg() {
+        let (lat, lon, gs) = tokio::join!(
+            read1(live, xp, "sim/flightmodel/position/latitude"),
+            read1(live, xp, "sim/flightmodel/position/longitude"),
+            read1(live, xp, "sim/flightmodel/position/groundspeed"),
+        );
+        if let (Ok(lat), Ok(lon)) = (lat, lon) {
+            let gs_kts = gs.unwrap_or(0.0) * MS_TO_KTS;
+            let (dist, mins) = procedure::leg_progress(&leg, lat, lon, gs_kts);
+            return progress_line(&leg.fix, Some(dist), mins);
+        }
+    }
     let wp = xp
         .get_string("sim/cockpit2/radios/indicators/gps_nav_id")
         .await
@@ -4855,9 +4942,14 @@ async fn nav_progress(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
     if wp.trim().is_empty() && dist.is_none() {
         return "No active GPS waypoint. Load and navigate a route first.".to_string();
     }
+    progress_line(wp.trim(), dist, tmin)
+}
+
+/// "Next waypoint X, N miles, M minutes." from whichever source knows the fix.
+fn progress_line(wp: &str, dist: Option<f64>, tmin: Option<f64>) -> String {
     let mut s = String::new();
-    if !wp.trim().is_empty() {
-        s.push_str(&format!("Next waypoint {}, ", wp.trim()));
+    if !wp.is_empty() {
+        s.push_str(&format!("Next waypoint {wp}, "));
     }
     if let Some(d) = dist {
         s.push_str(&format!("{d:.0} miles",));
@@ -4872,6 +4964,259 @@ async fn nav_progress(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
         s.push_str(&format!(", {time}"));
     }
     format!("{}.", s.trim_end_matches([',', ' ']))
+}
+
+/// Does the utterance ask about weather at all (the lot, or one element)?
+fn weather_words(t: &str) -> bool {
+    ["weather", "metar", "conditions", "wind", "visibility", "cloud", "ceiling", "qnh", "altimeter"]
+        .iter()
+        .any(|w| t.contains(w))
+}
+
+/// Where a weather question points when it is not "here".
+#[derive(Debug, PartialEq)]
+enum RemoteWeather {
+    /// The question named the destination but no plan is loaded.
+    NoPlan,
+    Station { icao: String, label: String },
+}
+
+/// Resolve a weather question to a station OTHER than the one we are at:
+/// the plan's destination ("on arrival", "at the destination", "when we
+/// land"), its alternate, its origin ("back at departure"), or an ICAO
+/// spoken after "at/for/in". `None` means the sim's own weather answers.
+fn remote_weather_target(t: &str, plan: Option<&simbrief::FlightPlan>) -> Option<RemoteWeather> {
+    let words: Vec<&str> = t.split_whitespace().collect();
+    let has = |w: &str| words.contains(&w);
+    let dest_cue = t.contains("arrival")
+        || has("arrive")
+        || t.contains("destination")
+        || t.contains("when we land")
+        || t.contains("at landing")
+        || t.contains("on landing")
+        || t.contains("for landing")
+        || t.contains("where we're going")
+        || t.contains("where were going")
+        || t.contains("at the other end")
+        || (has("expect") && !has("here"));
+    let alt_cue = t.contains("alternate") || t.contains("diversion");
+    let origin_cue = t.contains("departure") || t.contains("origin") || t.contains("back home");
+    // An explicit ICAO after a preposition wins over the cues: "weather at LXGB".
+    for (i, w) in words.iter().enumerate() {
+        if matches!(*w, "at" | "for" | "in" | "into" | "over") {
+            if let Some(n) = words.get(i + 1) {
+                let n = n.trim_matches(|c: char| !c.is_ascii_alphabetic());
+                if n.len() == 4 && n.chars().all(|c| c.is_ascii_alphabetic()) {
+                    let icao = n.to_ascii_uppercase();
+                    let known = plan.is_some_and(|fp| {
+                        [&fp.origin, &fp.destination, &fp.alternate]
+                            .iter()
+                            .any(|s| s.eq_ignore_ascii_case(&icao))
+                    });
+                    // Not on the plan: only if the METAR file actually lists it,
+                    // so "in this" or "at that" never becomes an airport.
+                    let on_file = || {
+                        weather::latest_file(&tools::autoland::xplane_root())
+                            .and_then(|p| std::fs::read_to_string(p).ok())
+                            .is_some_and(|text| weather::has_station(&text, &icao))
+                    };
+                    if known || (!["this", "that", "here", "what", "when", "them", "your", "some", "same", "next", "last", "high", "much", "long", "wind", "hold", "will", "also", "just", "them"].contains(&n) && on_file()) {
+                        return Some(RemoteWeather::Station { label: icao.clone(), icao });
+                    }
+                }
+            }
+        }
+    }
+    let pick = |icao: &str| {
+        let icao = icao.trim();
+        (!icao.is_empty()).then(|| RemoteWeather::Station {
+            icao: icao.to_string(),
+            label: icao.to_string(),
+        })
+    };
+    if alt_cue {
+        return match plan {
+            None => Some(RemoteWeather::NoPlan),
+            Some(fp) => pick(&fp.alternate).or(Some(RemoteWeather::NoPlan)),
+        };
+    }
+    if dest_cue {
+        return match plan {
+            None => Some(RemoteWeather::NoPlan),
+            Some(fp) => pick(&fp.destination).or(Some(RemoteWeather::NoPlan)),
+        };
+    }
+    if origin_cue {
+        return plan.and_then(|fp| pick(&fp.origin));
+    }
+    None
+}
+
+/// A question about a NAMED fix on the plan.
+#[derive(Debug, Clone, PartialEq)]
+struct FixQuery {
+    /// Index into the plan's waypoints.
+    idx: usize,
+    ident: String,
+    /// The fix after it, when the plan has one.
+    next: Option<String>,
+    /// Coordinates, for the distance.
+    lat: f64,
+    lon: f64,
+    /// "what's after X" (true) vs "how far to X" (false).
+    after: bool,
+    /// Where the fix sits in the plan, for "fix 3 of 15".
+    of: usize,
+}
+
+/// Edit distance between two short idents, after collapsing doubled letters
+/// (whisper writes "pimmons" for PIMOS; the doubled m is its habit, not the
+/// pilot's).
+fn ident_distance(a: &str, b: &str) -> usize {
+    fn collapse(s: &str) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        for c in s.bytes() {
+            if out.last() != Some(&c) {
+                out.push(c);
+            }
+        }
+        out
+    }
+    let (a, b) = (collapse(a), collapse(b));
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// The plan waypoint a spoken token most plausibly names, if any. First
+/// letter must agree (whisper gets the onset right), and the rest may drift
+/// by up to two edits on a fix of four letters or more. Airports at either
+/// end are excluded: "how far to LEMG" is the destination ETA's job.
+fn match_ident<'a>(token: &str, waypoints: &'a [simbrief::Waypoint]) -> Option<(usize, &'a simbrief::Waypoint)> {
+    let tok = token.to_ascii_lowercase();
+    if tok.len() < 3 {
+        return None;
+    }
+    let last = waypoints.len().checked_sub(1)?;
+    let mut best: Option<(usize, usize, &simbrief::Waypoint)> = None;
+    for (i, wp) in waypoints.iter().enumerate() {
+        if i == 0 || i == last {
+            continue;
+        }
+        let id = wp.ident.to_ascii_lowercase();
+        if id.len() < 3 || id.as_bytes()[0] != tok.as_bytes()[0] {
+            continue;
+        }
+        let allowed = if id.len() >= 5 { 2 } else if id.len() == 4 { 1 } else { 0 };
+        let d = ident_distance(&tok, &id);
+        if d <= allowed && best.is_none_or(|(bd, _, _)| d < bd) {
+            best = Some((d, i, wp));
+        }
+    }
+    best.map(|(_, i, wp)| (i, wp))
+}
+
+/// "How much left for PIMOS", "what's after PIMOS", "when do we reach
+/// PIMOS": a fix named after a preposition, matched against the plan.
+/// Without a preposition there is no candidate, so ordinary chatter with
+/// a fix-like word in it never answers.
+fn fix_query(t: &str, waypoints: &[simbrief::Waypoint]) -> Option<FixQuery> {
+    const PREPS: &[&str] = &[
+        "to", "for", "at", "after", "past", "beyond", "following", "reach", "till", "until", "before",
+    ];
+    // The question has to be ABOUT a fix: a range cue, an "after" word, or
+    // the word waypoint/fix. Without one, "set heading to 270" and friends
+    // never get their object matched against the plan.
+    let range_cue = ["how far", "how long", "how much", "when", "eta", "time", "distance", "miles", "minutes", "till", "until", "reach"]
+        .iter()
+        .any(|c| t.contains(c));
+    let after_word = ["after", "past", "beyond", "following"].iter().any(|w| t.contains(w));
+    if !(range_cue || after_word || t.contains("waypoint") || t.contains("fix")) {
+        return None;
+    }
+    let words: Vec<String> = t
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let mut found: Option<(usize, &simbrief::Waypoint, bool)> = None;
+    for (i, w) in words.iter().enumerate() {
+        if !PREPS.contains(&w.as_str()) {
+            continue;
+        }
+        // "to the next waypoint" is the plain progress question, not a fix.
+        let cand = words[i + 1..]
+            .iter()
+            .find(|c| !matches!(c.as_str(), "the" | "a" | "our" | "that" | "this"))?;
+        if let Some((idx, wp)) = match_ident(cand, waypoints) {
+            let after = matches!(w.as_str(), "after" | "past" | "beyond" | "following");
+            found = Some((idx, wp, after));
+            break;
+        }
+    }
+    let (idx, wp, mut after) = found?;
+    // "what's the waypoint ... PIMOS" with no distance cue: they want the plan
+    // around the fix (what comes next), not a range to it.
+    if !range_cue && (t.contains("waypoint") || t.contains("fix") || t.contains("next")) {
+        after = true;
+    }
+    Some(FixQuery {
+        idx,
+        ident: wp.ident.clone(),
+        next: waypoints.get(idx + 1).map(|n| n.ident.clone()),
+        lat: wp.lat,
+        lon: wp.lon,
+        after,
+        of: waypoints.len(),
+    })
+}
+
+/// Distance and time to a named fix from where we are, and what follows it.
+async fn fix_answer(q: &FixQuery, xp: &XPlaneClient) -> String {
+    let Some((lat, lon, _)) = position(xp).await else {
+        return "I can't read our position right now.".to_string();
+    };
+    let dist = nav::haversine_nm(lat, lon, q.lat, q.lon);
+    let gs_kts = xp
+        .get_float("sim/flightmodel/position/groundspeed")
+        .await
+        .unwrap_or(0.0)
+        * MS_TO_KTS;
+    let active = xp
+        .get_string("sim/cockpit2/radios/indicators/gps_nav_id")
+        .await
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let time = if gs_kts >= 30.0 {
+        let mins = (dist / gs_kts * 60.0).round() as i64;
+        if mins >= 60 {
+            format!(", {} hours {} minutes", mins / 60, mins % 60)
+        } else {
+            format!(", {mins} minutes")
+        }
+    } else {
+        String::new()
+    };
+    let position_word = if active.eq_ignore_ascii_case(&q.ident) {
+        "the active waypoint".to_string()
+    } else {
+        format!("fix {} of {}", q.idx + 1, q.of)
+    };
+    if q.after {
+        return match &q.next {
+            Some(n) => format!("After {} comes {n}. {} is {position_word}, {dist:.0} miles{time}.", q.ident, q.ident),
+            None => format!("{} is the last fix before the destination, {dist:.0} miles{time}.", q.ident),
+        };
+    }
+    format!("{}, {dist:.0} miles{time}. That's {position_word}.", q.ident)
 }
 
 /// A 3-degree descent loses ~1000 ft every 3 nm; Stratos (and most pilots) use a
@@ -6193,6 +6538,91 @@ fn battery_low(volts: f64) -> bool {
     }
 }
 
+/// Does a speed question ask for a judgement, not just the number?
+fn speed_assessment_words(t: &str) -> bool {
+    let words: Vec<&str> = t.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let has = |w: &str| words.contains(&w);
+    let about_speed = has("speed") || has("airspeed") || has("slow") || has("fast") || has("slowly") || has("quick");
+    let judged = has("okay") || has("ok") || has("alright") || has("fine") || has("good") || has("right")
+        || has("normal") || has("safe") || has("enough") || has("too") || has("bit") || has("slow")
+        || has("fast") || has("slowly") || has("comfortable") || has("happy");
+    about_speed && judged && !t.contains("how fast")
+}
+
+/// What the aircraft is doing, for judging its airspeed.
+struct SpeedContext {
+    on_ground: bool,
+    vvi_fpm: f64,
+    agl_ft: f64,
+    flap_ratio: f64,
+    /// The governor's flight target, when it is holding one.
+    hold_kts: Option<f64>,
+    /// The airframe's floor (1.2 x clean Vs), republished per swap.
+    floor_kts: Option<f64>,
+}
+
+/// The verdict on an indicated airspeed: the governor's target first, then
+/// the floor, then the reference speed for the phase (Vy climbing, the
+/// approach reference low and descending or with flap out, cruise IAS
+/// otherwise). `None` when nothing in the profile can judge it, so the
+/// copilot says the number and no more rather than inventing a standard.
+fn speed_verdict(ias: f64, c: &SpeedContext, r: Option<&aircraft::ReferenceProfile>) -> Option<String> {
+    if c.on_ground {
+        return None;
+    }
+    if let Some(floor) = c.floor_kts {
+        if ias < floor {
+            return Some(format!(
+                "that's below the {floor:.0} knot floor, one point two times stall. Nose down or power up."
+            ));
+        }
+    }
+    if let Some(h) = c.hold_kts {
+        let d = ias - h;
+        return Some(if d.abs() <= 3.0 {
+            format!("I'm holding {h:.0}, on target.")
+        } else if d < 0.0 {
+            format!("I'm holding {h:.0}, {:.0} slow and correcting.", -d)
+        } else {
+            format!("I'm holding {h:.0}, {d:.0} fast and correcting.")
+        });
+    }
+    let r = r?;
+    let climbing = c.vvi_fpm > 300.0;
+    let approaching = (c.agl_ft < 3000.0 && c.vvi_fpm < -100.0) || c.flap_ratio > 0.3;
+    if climbing {
+        let vy = r.vy_kts?;
+        let d = ias - vy;
+        return Some(if d.abs() <= 5.0 {
+            format!("we're climbing at Vy, {vy:.0}, that's right.")
+        } else if d < 0.0 {
+            format!("we're climbing, Vy is {vy:.0}, so a touch slow. Lower the nose a little.")
+        } else {
+            format!("we're climbing, Vy is {vy:.0}, so a bit fast, fine for cooling.")
+        });
+    }
+    if approaching {
+        let app = r.approach_kts?;
+        let d = ias - app;
+        return Some(if d.abs() <= 5.0 {
+            format!("on the {app:.0} knot approach reference.")
+        } else if d < 0.0 {
+            format!("below the {app:.0} knot approach reference. Add power.")
+        } else {
+            format!("above the {app:.0} knot approach reference, {d:.0} fast.")
+        });
+    }
+    let cruise = r.cruise_ias_kts.or(r.cruise_kts)?;
+    let d = ias - cruise;
+    Some(if d.abs() <= cruise * 0.1 {
+        format!("normal cruise is {cruise:.0}, so about right.")
+    } else if d < 0.0 {
+        format!("normal cruise is {cruise:.0}, so we're slow. Check the power.")
+    } else {
+        format!("above the normal {cruise:.0} cruise.")
+    })
+}
+
 async fn answer_state_query(
     cmd: &str,
     xp: &XPlaneClient,
@@ -6324,12 +6754,39 @@ async fn answer_state_query(
         }
     }
     // "speed" alone → airspeed, unless a different speed was explicitly named.
+    // "Is our speed okay?" / "aren't we going a bit slow?" want a VERDICT
+    // with the number: against what the governor holds, else the airframe's
+    // reference for the phase we are in. A bare "72 knots" answered neither
+    // (live, 2026-09-12).
+    let speed_judged = speed_assessment_words(&t);
     if t.contains("airspeed")
         || t.contains("air speed")
         || (!groundspeed_q && (t.contains("how fast") || (t.contains("speed") && !vs_q)))
+        || speed_judged
     {
         if let Ok(v) = read1(live, xp, datarefs::AIRSPEED_KTS).await {
-            parts.push(format!("{v:.0} knots"));
+            let mut line = format!("{v:.0} knots");
+            if speed_judged {
+                let (on_ground, vvi, agl_m, flap) = tokio::join!(
+                    read1(live, xp, datarefs::ON_GROUND_ANY),
+                    read1(live, xp, datarefs::VVI_FPM),
+                    read1(live, xp, datarefs::AGL_METERS),
+                    read1(live, xp, datarefs::FLAP_RATIO),
+                );
+                let ctx = SpeedContext {
+                    on_ground: on_ground.map(|g| g > 0.5).unwrap_or(false),
+                    vvi_fpm: vvi.unwrap_or(0.0),
+                    agl_ft: agl_m.map(|m| m * 3.28084).unwrap_or(f64::MAX),
+                    flap_ratio: flap.unwrap_or(0.0),
+                    hold_kts: tools::speedhold::flight_target(),
+                    floor_kts: aircraft::speed_floor_kts(),
+                };
+                if let Some(verdict) = speed_verdict(v, &ctx, profile.reference.as_ref()) {
+                    line.push_str(", ");
+                    line.push_str(&verdict);
+                }
+            }
+            parts.push(line);
         }
     }
     // Weather — answered deterministically, not via the LLM (same reliability fix
@@ -7271,6 +7728,13 @@ fn looks_like_question(text: &str) -> bool {
         // Generic auxiliaries: no command starts with these, and they must beat the
         // command grammar ("is our heading 270?" answers, never acts).
         "is", "are", "am", "have", "has",
+        // Negated auxiliaries ("aren't we going a bit slow?", "isn't the gear
+        // down?"): a question every time, in both the raw and the
+        // apostrophe-stripped form the normaliser leaves (missed live 2026-09-12).
+        "isn't", "isnt", "aren't", "arent", "wasn't", "wasnt", "weren't", "werent",
+        "don't", "dont", "doesn't", "doesnt", "didn't", "didnt", "haven't", "havent",
+        "hasn't", "hasnt", "shouldn't", "shouldnt", "couldn't", "couldnt", "wouldn't",
+        "wouldnt", "won't", "wont", "can't", "cant",
     ];
     if OPENERS
         .iter()
@@ -7284,7 +7748,7 @@ fn looks_like_question(text: &str) -> bool {
     // COMMANDS, and treating the "do" opener as a question swallowed them before
     // the fast path ever ran (the circuit command missed live, 2026-07-23).
     const DO_SUBJECTS: &[&str] = &["you", "we", "i", "it", "they", "he", "she", "this", "that"];
-    for aux in ["do", "does", "did"] {
+    for aux in ["do", "does", "did", "should", "shall"] {
         if let Some(rest) = t.strip_prefix(&format!("{aux} ")) {
             return DO_SUBJECTS
                 .iter()
@@ -7674,9 +8138,22 @@ fn whisper_model_label(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_confidence, is_abort, is_affirmative, is_undo, join_and, radio_panel_line,
-        undoable_drefs, ConfidenceAction, Ptt,
+        classify_confidence, is_abort, is_affirmative, is_undo, join_and, progress_line,
+        radio_panel_line, undoable_drefs, ConfidenceAction, Ptt,
     };
+
+    #[test]
+    fn progress_line_names_fix_distance_and_time() {
+        assert_eq!(
+            progress_line("MG430", Some(2.39), Some(1.43)),
+            "Next waypoint MG430, 2 miles, 1 minutes."
+        );
+        assert_eq!(progress_line("BUKOX", Some(33.4), None), "Next waypoint BUKOX, 33 miles.");
+        assert_eq!(
+            progress_line("LEMG", Some(130.0), Some(95.0)),
+            "Next waypoint LEMG, 130 miles, 1 hours 35 minutes."
+        );
+    }
 
     #[test]
     fn confidence_bands_act_confirm_sayagain_ignore() {
@@ -8948,5 +9425,153 @@ mod tests {
         assert_eq!(correction_text("negative"), None);
         assert_eq!(correction_text("no"), None);
         assert_eq!(correction_text("cancel."), None);
+    }
+}
+
+#[cfg(test)]
+mod gap_tests_2026_09_12 {
+    //! The utterances that missed live on 2026-09-12 (LXGB to LEMG, 172SP),
+    //! verbatim from the log, each now routed deterministically.
+    use super::*;
+
+    fn plan() -> simbrief::FlightPlan {
+        let wp = |ident: &str, lat: f64, lon: f64| simbrief::Waypoint {
+            ident: ident.into(),
+            lat,
+            lon,
+            alt: 8000.0,
+        };
+        simbrief::FlightPlan {
+            source: simbrief::PlanSource::Local,
+            origin: "LXGB".into(),
+            destination: "LEMG".into(),
+            alternate: "LEZL".into(),
+            aircraft: "C172".into(),
+            cruise_alt_ft: 8000.0,
+            distance_nm: 60.0,
+            ete_min: 45.0,
+            block_fuel_gal: 30.0,
+            trip_fuel_gal: 8.0,
+            reserve_gal: 6.0,
+            route: "PIMOS DEKUS".into(),
+            wind_comp_kts: 0.0,
+            wind_dir: 0.0,
+            wind_spd_kts: 0.0,
+            tod_to_dest_nm: 15.0,
+            waypoints: vec![
+                wp("LXGB", 36.15, -5.35),
+                wp("PIMOS", 36.30, -5.10),
+                wp("DEKUS", 36.45, -4.80),
+                wp("LEMG", 36.67, -4.50),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_fix_whisper_misspelled_is_matched_from_the_plan() {
+        let fp = plan();
+        // "How much left for pimmons?" -> the range to PIMOS.
+        let q = fix_query("how much left for pimmons", &fp.waypoints).unwrap();
+        assert_eq!((q.ident.as_str(), q.after, q.idx), ("PIMOS", false, 1));
+        assert_eq!(q.next.as_deref(), Some("DEKUS"));
+        // "And what's the waypoint to act at Pimos?" -> what follows PIMOS.
+        let q = fix_query("and whats the waypoint to act at pimos", &fp.waypoints).unwrap();
+        assert_eq!((q.ident.as_str(), q.after), ("PIMOS", true));
+        let q = fix_query("whats after dekus", &fp.waypoints).unwrap();
+        assert_eq!((q.ident.as_str(), q.after), ("DEKUS", true));
+        assert!(fix_query("when do we reach dekus", &fp.waypoints).is_some());
+        // Airports at either end are the destination ETA's job, not a fix.
+        assert!(fix_query("how far to lemg", &fp.waypoints).is_none());
+        // Commands and the plain progress question never match a fix.
+        assert!(fix_query("set heading to 270", &fp.waypoints).is_none());
+        assert!(fix_query("how long till next waypoint", &fp.waypoints).is_none());
+        assert!(fix_query("how much left for next waypoint", &fp.waypoints).is_none());
+        assert!(fix_query("turn to pilot heading", &fp.waypoints).is_none());
+        // First letter must agree: "dimos" is not PIMOS.
+        assert!(fix_query("how far to dimos", &fp.waypoints).is_none());
+        assert_eq!(ident_distance("pimmons", "pimos"), 1);
+    }
+
+    #[test]
+    fn arrival_weather_points_at_the_destination_never_the_air_we_are_in() {
+        let fp = plan();
+        let st = |icao: &str| RemoteWeather::Station { icao: icao.into(), label: icao.into() };
+        assert_eq!(
+            remote_weather_target("what weather can we expect on arrival", Some(&fp)),
+            Some(st("LEMG"))
+        );
+        assert_eq!(remote_weather_target("whats the wind at the destination", Some(&fp)), Some(st("LEMG")));
+        assert_eq!(remote_weather_target("weather at the alternate", Some(&fp)), Some(st("LEZL")));
+        assert_eq!(remote_weather_target("weather at lxgb", Some(&fp)), Some(st("LXGB")));
+        assert_eq!(remote_weather_target("weather on arrival", None), Some(RemoteWeather::NoPlan));
+        // Here and now stays with the sim's own weather.
+        assert!(remote_weather_target("whats the weather", Some(&fp)).is_none());
+        assert!(remote_weather_target("whats the wind here", Some(&fp)).is_none());
+        assert!(weather_words("what weather can we expect on arrival"));
+        assert!(!weather_words("how much fuel do we have"));
+    }
+
+    #[test]
+    fn speed_questions_get_a_verdict_against_the_phase() {
+        let r = aircraft::ReferenceProfile {
+            vy_kts: Some(74.0),
+            approach_kts: Some(65.0),
+            cruise_ias_kts: Some(110.0),
+            ..Default::default()
+        };
+        let mut c = SpeedContext {
+            on_ground: false,
+            vvi_fpm: 500.0,
+            agl_ft: 1100.0,
+            flap_ratio: 0.0,
+            hold_kts: None,
+            floor_kts: Some(58.0),
+        };
+        // "Aren't we going a bit slow?" at 72 in the climb: Vy is 74.
+        assert_eq!(
+            speed_verdict(72.0, &c, Some(&r)).as_deref(),
+            Some("we're climbing at Vy, 74, that's right.")
+        );
+        assert!(speed_verdict(62.0, &c, Some(&r)).unwrap().contains("a touch slow"));
+        // Below the floor outranks everything, including a governor target.
+        c.hold_kts = Some(70.0);
+        assert!(speed_verdict(55.0, &c, Some(&r)).unwrap().contains("below the 58 knot floor"));
+        assert_eq!(speed_verdict(71.0, &c, Some(&r)).as_deref(), Some("I'm holding 70, on target."));
+        c.hold_kts = None;
+        // Cruise.
+        c.vvi_fpm = 0.0;
+        c.agl_ft = 7000.0;
+        assert!(speed_verdict(90.0, &c, Some(&r)).unwrap().contains("we're slow"));
+        assert!(speed_verdict(108.0, &c, Some(&r)).unwrap().contains("about right"));
+        // Approach, flaps out.
+        c.flap_ratio = 0.6;
+        assert!(speed_verdict(59.0, &c, Some(&r)).unwrap().contains("Add power"));
+        // On the ground, and with no profile, just the number.
+        c.on_ground = true;
+        assert!(speed_verdict(20.0, &c, Some(&r)).is_none());
+        c.on_ground = false;
+        assert!(speed_verdict(90.0, &c, None).is_none());
+
+        assert!(speed_assessment_words("is our speed okay"));
+        assert!(speed_assessment_words("arent we going a bit slow"));
+        assert!(speed_assessment_words("are we too fast"));
+        assert!(!speed_assessment_words("whats our speed"));
+        assert!(!speed_assessment_words("how fast are we going"));
+    }
+
+    #[test]
+    fn negated_auxiliaries_and_should_we_are_questions() {
+        for q in [
+            "arent we going a bit slow",
+            "aren't we going a bit slow",
+            "isnt the gear down",
+            "should we check in with atc",
+            "shall we call the tower",
+            "is our speed okay",
+        ] {
+            assert!(looks_like_question(q), "{q:?}");
+        }
+        // A polite request is still a command once the normaliser has peeled it.
+        assert!(!looks_like_question(grammar::normalize("Can you fly the flight plan?").trim_end_matches('?')));
     }
 }

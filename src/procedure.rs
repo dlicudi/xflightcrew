@@ -67,6 +67,39 @@ pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Set true to cancel ("cancel" / "my controls").
 pub static ABORT: AtomicBool = AtomicBool::new(false);
 
+/// The fix the follower is steering at right now. The sim's own GPS never
+/// sequences while the follower flies (it holds heading, the FMS stays on
+/// entry 1), so "next waypoint" read from `gps_nav_id` answered PIMOS for the
+/// whole flight while the aircraft was five fixes further on (LXGB-LEMG,
+/// 2026-09-12). Crew-side questions and the waypoint reminder read THIS.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActiveLeg {
+    pub fix: String,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+static LEG: std::sync::Mutex<Option<ActiveLeg>> = std::sync::Mutex::new(None);
+
+/// The leg being flown, `None` between procedures or on a to-altitude leg.
+pub fn active_leg() -> Option<ActiveLeg> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    LEG.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn publish_leg(leg: Option<ActiveLeg>) {
+    *LEG.lock().unwrap_or_else(|e| e.into_inner()) = leg;
+}
+
+/// Great-circle distance and, at a usable groundspeed, minutes to the leg's fix.
+pub fn leg_progress(leg: &ActiveLeg, lat: f64, lon: f64, gs_kts: f64) -> (f64, Option<f64>) {
+    let dist = crate::nav::haversine_nm(lat, lon, leg.lat, leg.lon);
+    let mins = (gs_kts > 20.0).then(|| dist / gs_kts * 60.0);
+    (dist, mins)
+}
+
 /// One-line status for the dashboard's "managing" panel.
 pub fn status() -> Option<String> {
     ACTIVE
@@ -91,6 +124,11 @@ pub enum EndAction {
         apt_dat: String,
         cfg: ApConfig,
         approach_ias: f64,
+        /// The approach's runway END ("12"), handed to autoland as its forced
+        /// runway. `None` let autoland self-pick by track, and at a field
+        /// with parallels that put the ILS 12 arrival on 13 against a
+        /// clearance for 12 (LEMG, 2026-09-12).
+        rwy_id: Option<String>,
     },
     /// Departure/arrival that ends in the enroute structure: level at the last
     /// constraint and hand back to the pilot.
@@ -452,6 +490,7 @@ pub fn start(base_url: String, voice: Option<Voice>, plan: Plan) {
             plan,
         ));
         ACTIVE.store(false, Ordering::SeqCst);
+        publish_leg(None);
     });
 }
 
@@ -578,6 +617,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             idx += 1;
             continue;
         }
+        publish_leg(leg.fix.as_ref().map(|f| ActiveLeg {
+            fix: leg.fix_ident.clone(),
+            lat: f.lat,
+            lon: f.lon,
+        }));
 
         // --- Lateral: steer the great-circle track to the fix, wind-crabbed so
         // the AP holds the GROUND track (the circuit's downwind lesson). A
@@ -670,6 +714,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 apt_dat,
                 cfg,
                 approach_ias,
+                rwy_id,
             },
             Some(hi),
         ) = (&end, handoff)
@@ -691,7 +736,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     *approach_ias,
                     voice.clone(),
                     None,
-                    None,
+                    rwy_id.clone(),
                 );
                 ACTIVE.store(false, Ordering::SeqCst);
                 return;
@@ -751,6 +796,32 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
 mod tests {
     use super::*;
     use crate::nav::Fix;
+
+    /// The crew's "next waypoint" answer while a procedure flies: distance to
+    /// the follower's OWN fix, minutes from the groundspeed, no ETA when we are
+    /// not really moving (a parked aircraft is not 0 minutes from anywhere).
+    #[test]
+    fn leg_progress_is_distance_and_minutes_to_the_followers_fix() {
+        // MG430 from the point the LXGB-LEMG flight was actually at when the
+        // GPS still said "PIMOS, 48 miles".
+        let leg = ActiveLeg { fix: "MG430".into(), lat: 36.9985, lon: -4.9035 };
+        let (dist, mins) = leg_progress(&leg, 36.95877, -4.90277, 100.0);
+        assert!((dist - 2.39).abs() < 0.1, "dist {dist}");
+        let mins = mins.expect("moving: an ETA");
+        assert!((mins - 1.43).abs() < 0.1, "mins {mins}");
+        assert_eq!(leg_progress(&leg, 36.95877, -4.90277, 3.0).1, None);
+    }
+
+    #[test]
+    fn no_procedure_means_no_active_leg() {
+        // Whatever a finished follower left in the slot, an inactive
+        // procedure has no leg: the GPS answer applies again.
+        publish_leg(Some(ActiveLeg { fix: "X".into(), lat: 0.0, lon: 0.0 }));
+        if !ACTIVE.load(Ordering::Relaxed) {
+            assert_eq!(active_leg(), None);
+        }
+        publish_leg(None);
+    }
 
     fn leg(fix_ident: &str, lat: f64, lon: f64) -> ProcLeg {
         ProcLeg {
@@ -836,6 +907,7 @@ mod tests {
             apt_dat: String::new(),
             cfg: ApConfig::default(),
             approach_ias: 100.0,
+            rwy_id: None,
         };
         let held = power_hold_target(&approach, None).expect("an approach holds a speed");
         assert!((140.0..=150.0).contains(&held), "1.45 x Vapp, got {held}");

@@ -431,11 +431,50 @@ pub fn run_autoland(
             let hdg0 = xp.get_float("sim/flightmodel/position/psi").await.unwrap_or(0.0);
             // A forced end (arrival chose by wind) is honoured when it's at the
             // field; a stale/unfound id falls back to the track-based search
-            // rather than bailing on the landing.
+            // rather than bailing on the landing. The self-pick is the
+            // EMERGENCY path: at a field with parallels it picks whichever
+            // threshold is nearer, which at LEMG put the ILS 12 arrival on 13
+            // against a "cleared to land runway one two" (2026-09-12) — every
+            // planned arrival must hand its runway down (see `EndAction`).
+            let cleared = crate::party_line::clearance_runway();
             let picked = match forced_rwy.as_deref() {
                 Some(id) => match runway_by_id(&apt_dat, lat0, lon0, id, 40.0) {
-                    Ok(None) => best_landing_runway(&apt_dat, lat0, lon0, hdg0, 40.0, 1200.0),
-                    found => found,
+                    Ok(None) => {
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "forced_runway_missing", "id": id}),
+                        );
+                        best_landing_runway(&apt_dat, lat0, lon0, hdg0, 40.0, 1200.0)
+                    }
+                    Ok(Some(planned)) => {
+                        // The tower's clearance outranks the plan, but only for
+                        // an end at the SAME field — a stale departure clearance
+                        // must never send us to a "09" forty miles away.
+                        match cleared.as_deref().filter(|c| clearance_differs(&planned.id, c)) {
+                            Some(c) => match runway_by_id(&apt_dat, lat0, lon0, c, 40.0) {
+                                Ok(Some(r)) if r.icao == planned.icao => {
+                                    crate::blackbox::record(
+                                        "autoland",
+                                        serde_json::json!({"event": "runway_from_clearance",
+                                            "planned": planned.id, "cleared": r.id}),
+                                    );
+                                    announce(
+                                        format!(
+                                            "Tower cleared us for runway {}, not the planned {}. Landing runway {}.",
+                                            crate::circuit::spell_runway(&r.id),
+                                            crate::circuit::spell_runway(&planned.id),
+                                            crate::circuit::spell_runway(&r.id)
+                                        ),
+                                        Priority::Caution,
+                                    );
+                                    Ok(Some(r))
+                                }
+                                _ => Ok(Some(planned)),
+                            },
+                            None => Ok(Some(planned)),
+                        }
+                    }
+                    err => err,
                 },
                 None => best_landing_runway(&apt_dat, lat0, lon0, hdg0, 40.0, 1200.0),
             };
@@ -494,6 +533,11 @@ pub fn run_autoland(
             // Cross-track history for the intercept damping term.
             let mut prev_xtk: Option<(f64, std::time::Instant)> = None;
             let mut xtk_rate: f64 = 0.0;
+            // Wind crab, low-passed — see [`CrabFilter`] for the hunt it ends.
+            let mut crab_filter = CrabFilter::new();
+            // Integral trim on the final's track error — see [`TrackTrim`]
+            // for the standing 35 m the crab loop could not see.
+            let mut track_trim = TrackTrim::new();
             // Rollout: latched at touchdown, then brakes down — to a full stop,
             // or to taxi pace when a vacate drive follows. The takeoff roll law
             // (P + trim, tested) holds the centreline through the plugin steer
@@ -612,18 +656,6 @@ pub fn run_autoland(
                     announce("Down and stopped. Brakes on, your aircraft.".into(), Priority::Warning);
                     break;
                 }
-                // Wind crab, from the reference recipe (heading vs ground track):
-                // command a heading whose TRACK aligns with the runway, not the
-                // heading itself. P-only tracking left a standing 0.10 nm
-                // cross-track under the LXGB crosswind — touchdown in the grass
-                // (2026-07-22). Fail to zero when either read is missing.
-                let crab = match (&psi_r, &hpath_r) {
-                    (Ok(psi), Ok(hpath)) => {
-                        (((psi - hpath + 540.0).rem_euclid(360.0)) - 180.0).clamp(-15.0, 15.0)
-                    }
-                    _ => 0.0,
-                };
-
                 // Cross-track closure rate (nm/min, positive = drifting right),
                 // low-pass filtered — the damping term that turns the P-only
                 // centreline chase into a crisp intercept-and-rollout. P alone
@@ -631,12 +663,23 @@ pub fn run_autoland(
                 // wind (2026-07-24).
                 let xtk_now = cross_track_nm(lat, lon, &rwy);
                 let t_now = std::time::Instant::now();
-                let raw_rate = prev_xtk.map_or(0.0, |(x0, t0)| {
-                    let dt = t_now.duration_since(t0).as_secs_f64();
-                    if (0.1..=3.0).contains(&dt) { (xtk_now - x0) / dt * 60.0 } else { 0.0 }
-                });
+                let dt_s = prev_xtk.map_or(0.0, |(_, t0)| t_now.duration_since(t0).as_secs_f64());
+                let raw_rate = match prev_xtk {
+                    Some((x0, _)) if (0.1..=3.0).contains(&dt_s) => (xtk_now - x0) / dt_s * 60.0,
+                    _ => 0.0,
+                };
                 prev_xtk = Some((xtk_now, t_now));
                 xtk_rate = xtk_rate * 0.5 + raw_rate.clamp(-3.0, 3.0) * 0.5;
+
+                // Wind crab, from the reference recipe (heading vs ground track):
+                // command a heading whose TRACK aligns with the runway, not the
+                // heading itself. P-only tracking left a standing 0.10 nm
+                // cross-track under the LXGB crosswind — touchdown in the grass
+                // (2026-07-22). LOW-PASSED: the raw read fed straight back to
+                // the bug hunted the LEMG 13 final into a balk (2026-09-12,
+                // see [`CrabFilter`]). Estimated every tick, applied on final.
+                let crab_raw = CrabFilter::raw(psi_r.as_ref().ok().copied(), hpath_r.as_ref().ok().copied());
+                let crab = crab_filter.update(crab_raw, dt_s.clamp(0.0, 3.0));
 
                 let raw = guidance(lat, lon, alt, radio_ft, gs_kts, ias, &rwy, approach_ias, 25.0, xtk_rate);
                 // A missed approach called low is flown by the latch (full power,
@@ -686,7 +729,9 @@ pub fn run_autoland(
                     crate::circuit::transmit(crate::circuit::radio_call(&cs, "going around"));
                     crate::blackbox::record(
                         "autoland",
-                        serde_json::json!({"event": "going_around", "radio": radio_ft}),
+                        serde_json::json!({"event": "going_around", "radio": radio_ft,
+                                           "why": raw.balk, "xtk_m": xtk_now * M_PER_NM,
+                                           "dist": raw.dist_nm, "trim": track_trim.value()}),
                     );
                 }
                 // Back on final after a missed approach: report it. The first
@@ -791,6 +836,12 @@ pub fn run_autoland(
                     ),
                     None => raw,
                 };
+                let trim = track_trim.update(
+                    g.phase,
+                    g.target_heading_deg,
+                    hpath_r.as_ref().ok().copied(),
+                    dt_s.clamp(0.0, 3.0),
+                );
                 let phase_word = match g.phase {
                     ApproachPhase::Intercept => "INTERCEPT",
                     ApproachPhase::Final => "FINAL",
@@ -810,7 +861,8 @@ pub fn run_autoland(
                     "rwy": format!("{} {}", rwy.icao, rwy.id), "dist": g.dist_nm,
                     "alt": alt, "gp_alt": g.glidepath_alt_ft, "cmd_vs": g.target_vs_fpm,
                     "cmd_hdg": g.target_heading_deg, "ias": ias, "radio": radio_ft,
-                    "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab,
+                    "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
+                    "trim": trim, "xtk_m": xtk_now * M_PER_NM,
                 }));
 
                 // Lateral: heading bug in MAGNETIC (guidance is TRUE — see
@@ -819,7 +871,7 @@ pub fn run_autoland(
                 // runway-aligned TRACK; intercept vectors stay coarse.
                 let crabbed = match g.phase {
                     ApproachPhase::Final | ApproachPhase::Flare => {
-                        (g.target_heading_deg + crab).rem_euclid(360.0)
+                        (g.target_heading_deg + crab + trim).rem_euclid(360.0)
                     }
                     ApproachPhase::Intercept => g.target_heading_deg,
                 };
@@ -946,6 +998,147 @@ pub fn run_autoland(
             ACTIVE.store(false, Ordering::SeqCst);
         });
     });
+}
+
+/// Does the standing clearance name a different runway END than the plan?
+/// Idents compare trimmed and case-blind ("12" vs "12 "), a missing or blank
+/// clearance never differs.
+pub fn clearance_differs(planned_id: &str, cleared_id: &str) -> bool {
+    let c = cleared_id.trim();
+    !c.is_empty() && !c.eq_ignore_ascii_case(planned_id.trim())
+}
+
+/// Time constant of the wind-crab estimate the final's lateral law feeds
+/// forward. A wind-correction angle changes over minutes (wind shear down the
+/// last thousand feet); the RAW heading-minus-track read changes every tick.
+/// LEMG 13, 2026-09-12: the raw value was added straight to the heading bug
+/// on final, so every nose swing the autopilot made came back as a bug move
+/// the same tick, unity gain, and the loop hunted. The blackbox has the
+/// signature: crab standard deviation 0.5° on the intercept (where nothing
+/// fed it back), then 1.2, 1.8, 2.5, 3.1, 3.7, 4.0° down the final, a ±9°
+/// swing with a ~13 s period at the numbers, a standing 35 m offset the
+/// short-final law could not close, and the lateral balk gate at 74 ft.
+/// At 15 s the 13 s swing comes through at about a seventh of its amplitude.
+pub const CRAB_TAU_S: f64 = 15.0;
+
+/// The wind crab actually commanded: heading minus ground track, low-passed
+/// with [`CRAB_TAU_S`]. Fed EVERY tick (intercept included) so it is settled
+/// when the final starts. A missing read holds the last estimate rather than
+/// yanking the nose by the whole angle; a filter that has never seen a read
+/// says zero.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CrabFilter {
+    est: Option<f64>,
+}
+
+impl CrabFilter {
+    pub const fn new() -> Self {
+        Self { est: None }
+    }
+
+    /// Raw heading-minus-track (degrees, positive = nose right of track),
+    /// `None` when either read is missing. Clamped to ±15°: beyond that it
+    /// is a turn or a slip, not a wind angle.
+    pub fn raw(psi_true: Option<f64>, hpath_true: Option<f64>) -> Option<f64> {
+        let (psi, hpath) = (psi_true?, hpath_true?);
+        Some((((psi - hpath + 540.0).rem_euclid(360.0)) - 180.0).clamp(-15.0, 15.0))
+    }
+
+    /// Advance by one tick of `dt_s` seconds and return the crab to command.
+    pub fn update(&mut self, raw: Option<f64>, dt_s: f64) -> f64 {
+        match (raw, self.est) {
+            (Some(r), None) => {
+                self.est = Some(r);
+                r
+            }
+            (Some(r), Some(e)) => {
+                let a = (dt_s / CRAB_TAU_S).clamp(0.0, 1.0);
+                let e = e + a * (r - e);
+                self.est = Some(e);
+                e
+            }
+            (None, e) => e.unwrap_or(0.0),
+        }
+    }
+
+    /// The current estimate without advancing.
+    pub fn value(&self) -> f64 {
+        self.est.unwrap_or(0.0)
+    }
+}
+
+/// Time constant (s) of the final's track-error trim: how long a steady
+/// difference between the track the final asks for and the track flown takes
+/// to be integrated out. Slow against the autopilot's heading response (a few
+/// seconds) and the crab filter (15 s), so the three never chase each other.
+pub const TRACK_TRIM_TAU_S: f64 = 30.0;
+/// The most trim the integrator may carry, degrees. A bias bigger than this
+/// is a broken autopilot, not something to trim.
+pub const TRACK_TRIM_MAX_DEG: f64 = 5.0;
+/// A track error beyond this is a turn in progress, not a bias: not integrated.
+const TRACK_TRIM_ERR_CAP_DEG: f64 = 10.0;
+
+/// Integral trim on the final's TRACK error, in degrees added to the heading
+/// bug alongside the wind crab.
+///
+/// The crab loop commands a heading whose track aligns with the runway by
+/// measuring heading minus track — the wind. It cannot see a bias that sits
+/// between the BUG and the heading: an autopilot that settles two degrees
+/// left of its bug produces a track two degrees left of the one asked for,
+/// and both proportional laws on final (the fixed-lead pursuit, then the
+/// 80°/nm short-final cut) only ever ask for a cut, so they equilibrate
+/// where the cut equals the bias — 0.6 nm of lead times tan 2° is 39 m,
+/// 2°/80 is 46 m. LEMG 13, 2026-09-12: the 172's heading sat 1.1° left of
+/// the bug through the whole intercept with no crab in the loop and 1.9°
+/// left down both finals, the position 33 to 37 m left of the centreline
+/// from 1.3 km out, steady, in both approaches, and the lateral gate under
+/// 100 ft (37 m) balked both at 74 and 40 ft. Two go-arounds; the pilot
+/// landed by hand. This integrates the difference between the track the
+/// guidance wants and the track flown, so whatever the cause of the bias
+/// (autopilot law, servo trim, a variation error), the final converges on
+/// the centreline instead of parking beside it. Final only; held through
+/// the flare; reset on anything else so a missed approach never carries a
+/// stale correction into the next attempt.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TrackTrim {
+    deg: f64,
+}
+
+impl TrackTrim {
+    pub const fn new() -> Self {
+        Self { deg: 0.0 }
+    }
+
+    /// Advance by one tick: `wanted_track_deg` is the guidance heading on
+    /// final (the runway course plus the cut, i.e. the TRACK it wants),
+    /// `hpath_true` the sim's ground track. Returns the trim to add.
+    pub fn update(
+        &mut self,
+        phase: ApproachPhase,
+        wanted_track_deg: f64,
+        hpath_true: Option<f64>,
+        dt_s: f64,
+    ) -> f64 {
+        match phase {
+            ApproachPhase::Final => {
+                if let Some(h) = hpath_true {
+                    let err = (wanted_track_deg - h + 540.0).rem_euclid(360.0) - 180.0;
+                    if err.abs() <= TRACK_TRIM_ERR_CAP_DEG {
+                        self.deg = (self.deg + err * dt_s / TRACK_TRIM_TAU_S)
+                            .clamp(-TRACK_TRIM_MAX_DEG, TRACK_TRIM_MAX_DEG);
+                    }
+                }
+            }
+            ApproachPhase::Flare => {}
+            ApproachPhase::Intercept => self.deg = 0.0,
+        }
+        self.deg
+    }
+
+    /// The trim currently applied.
+    pub fn value(&self) -> f64 {
+        self.deg
+    }
 }
 
 /// Feet of altitude per nm along a 3° glidepath (tan 3° × 6076 ft/nm ≈ 318).
@@ -1420,6 +1613,7 @@ pub fn missed_approach_guidance(
         dist_nm,
         glidepath_alt_ft,
         phase: ApproachPhase::Intercept,
+        balk: None,
     }
 }
 
@@ -1444,6 +1638,13 @@ pub struct Guidance {
     /// Where the aircraft *should* be for the glidepath, ft MSL.
     pub glidepath_alt_ft: f64,
     pub phase: ApproachPhase,
+    /// Why this tick balked the landing, when it did: the gate that flipped
+    /// the phase to `Intercept` low enough for the latch to fly it as a missed
+    /// approach. `None` on every ordinary tick. Blackboxed with the
+    /// `going_around` event, because "climbing straight ahead" with no reason
+    /// attached cost a person an hour of reconstruction from the command
+    /// column (LEMG 13, 2026-09-12).
+    pub balk: Option<&'static str>,
 }
 
 /// Where the final's pure pursuit aims, in nm from the threshold measured back
@@ -1524,6 +1725,7 @@ pub fn guidance(
     let in_flare_zone = dist_nm <= FLARE_MAX_DIST_NM || (along_nm < 0.0 && !past_threshold);
 
     let xtk = cross_track_nm(cur_lat, cur_lon, rwy);
+    let mut balk: Option<&'static str> = None;
     let (phase, target_heading) = if radio_alt_ft <= flare_radio_ft && in_flare_zone {
         // Low radio altitude alone is NOT the flare cue — terrain rises to meet
         // the approach path miles from the field (seen live: "flared" at 7 ft AGL
@@ -1536,6 +1738,7 @@ pub fn guidance(
             // grass, wrecked on the rollout (2026-07-22). Off-centreline at
             // flare height is a balked landing — the phase flip drops the
             // GoAroundLatch, which climbs straight ahead.
+            balk = Some("off_centreline_at_flare");
             (ApproachPhase::Intercept, rwy.course_deg)
         } else {
             // Keep steering through the flare — locking the bare runway course
@@ -1557,6 +1760,7 @@ pub fn guidance(
         // energy allows. Takes priority over the join/FAP/final branches so a
         // go-around always turns toward the field regardless of altitude.
         let (fap_lat, fap_lon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, FAP_NM);
+        balk = Some("overflew_the_runway");
         (
             ApproachPhase::Intercept,
             bearing_deg(cur_lat, cur_lon, fap_lat, fap_lon),
@@ -1623,6 +1827,7 @@ pub fn guidance(
             // Not going to make the pavement: balk NOW, with height to work
             // with. The 22 ft flare-gate balk arrested nothing — the aircraft
             // still skimmed the ground at 91 kt before climbing (2026-07-22).
+            balk = Some("off_centreline_low");
             (ApproachPhase::Intercept, rwy.course_deg)
         } else if along_nm > STABILISED_MIN_ALONG_NM
             && radio_alt_ft >= TERRAIN_FLOOR_AGL_FT
@@ -1651,6 +1856,7 @@ pub fn guidance(
             // North Front four seconds later (2026-09-11). Inside the FAP
             // only: further out the intercept is still legitimately wide,
             // and radio height alone means nothing over rising ground.
+            balk = Some("unstabilised_below_floor");
             (ApproachPhase::Intercept, rwy.course_deg)
         } else {
             (
@@ -1807,11 +2013,175 @@ pub fn guidance(
         dist_nm,
         glidepath_alt_ft,
         phase,
+        balk,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // LEMG 13, 2026-09-12: the raw heading-minus-track fed straight back to
+    // the heading bug hunted the final (crab sd 0.5° on the intercept, 4.0°
+    // at the numbers, a ±9° swing with a ~13 s period) into the lateral
+    // balk at 74 ft. The filter must pass the wind angle and eat the swing.
+    /// LEMG 13, 2026-09-12, replayed through the real lateral law: a 172
+    /// whose autopilot settles 2° left of its bug, flown from 3 nm on the
+    /// centreline with the loop's own crab filter and tick. Second-order
+    /// heading response, the tick's transport delay, the glidepath flown
+    /// exactly so only the lateral answer is under test. Returns the
+    /// cross-track (nm, right-positive) at 100 ft radio or at the balk,
+    /// the guidance there and the trim carried.
+    fn fly_final_with_heading_bias(bias_deg: f64, trim_on: bool) -> (f64, Guidance, f64) {
+        let rwy = rwy_north();
+        let gs_kts = 60.0;
+        let dt = 0.6;
+        // 3 nm south of the threshold, on the centreline, on the path.
+        let (mut lat, mut lon) = project_latlon(0.0, 0.0, 180.0, 3.0);
+        let mut psi: f64 = 0.0;
+        let mut psi_dot: f64 = 0.0;
+        let mut crab = super::CrabFilter::new();
+        let mut trim = super::TrackTrim::new();
+        let mut bug = 0.0;
+        let mut trim_deg = 0.0;
+        let mut g = guidance(lat, lon, 1000.0, 1000.0, gs_kts, 65.0, &rwy, 65.0, 25.0, 0.0);
+        for _ in 0..800 {
+            let alt = g.glidepath_alt_ft;
+            g = guidance(lat, lon, alt, alt - rwy.elev_ft, gs_kts, 65.0, &rwy, 65.0, 25.0, 0.0);
+            if alt - rwy.elev_ft < 100.0 || g.phase == ApproachPhase::Intercept {
+                break;
+            }
+            let track = psi; // no wind: the bias is the only thing between bug and track
+            let c = crab.update(super::CrabFilter::raw(Some(psi), Some(track)), dt);
+            trim_deg = if trim_on {
+                trim.update(g.phase, g.target_heading_deg, Some(track), dt)
+            } else {
+                0.0
+            };
+            bug = (g.target_heading_deg + c + trim_deg).rem_euclid(360.0);
+            // The autopilot: second-order toward (bug + bias), ωn 0.5 rad/s, ζ 0.8.
+            let err = (bug + bias_deg - psi + 540.0).rem_euclid(360.0) - 180.0;
+            psi_dot += (0.25 * err - 2.0 * 0.8 * 0.5 * psi_dot) * dt;
+            psi = (psi + psi_dot * dt).rem_euclid(360.0);
+            let (nlat, nlon) = project_latlon(lat, lon, track, gs_kts * dt / 3600.0);
+            lat = nlat;
+            lon = nlon;
+        }
+        let _ = bug;
+        (cross_track_nm(lat, lon, &rwy), g, trim_deg)
+    }
+
+    #[test]
+    fn a_heading_bias_on_final_parks_beside_the_centreline_without_trim() {
+        // The flight, in the plant: 2° left of the bug settles some 40 m
+        // left and never closes, and a lateral gate balks it — the go-around
+        // the pilot watched twice.
+        let (xtk, g, _) = fly_final_with_heading_bias(-2.0, false);
+        assert_eq!(g.phase, ApproachPhase::Intercept, "{:.0} m off", xtk * super::M_PER_NM);
+        assert!(
+            matches!(g.balk, Some("off_centreline_low" | "unstabilised_below_floor")),
+            "{:?}",
+            g.balk
+        );
+        assert!(
+            xtk < -0.015 && xtk > -0.035,
+            "expected the standing offset the flight showed, got {:.0} m",
+            xtk * super::M_PER_NM
+        );
+    }
+
+    #[test]
+    fn the_track_trim_takes_a_biased_final_to_the_centreline() {
+        for bias in [-2.0, 2.0, -1.0] {
+            let (xtk, g, trim) = fly_final_with_heading_bias(bias, true);
+            assert_eq!(g.phase, ApproachPhase::Final, "bias {bias}: {:?}", g.balk);
+            assert!(
+                xtk.abs() < 0.005,
+                "bias {bias}: still {:.0} m off at 100 ft",
+                xtk * super::M_PER_NM
+            );
+            assert!(
+                (trim + bias).abs() < 0.6,
+                "bias {bias}: the trim should carry the bias, carries {trim:.2}"
+            );
+        }
+        // No bias: nothing to trim, and the trim invents nothing.
+        let (xtk, _, trim) = fly_final_with_heading_bias(0.0, true);
+        assert!(xtk.abs() < 0.003 && trim.abs() < 0.3, "xtk {xtk} trim {trim}");
+    }
+
+    #[test]
+    fn the_track_trim_is_final_only_and_never_a_turn() {
+        let mut t = super::TrackTrim::new();
+        // A 30° track error is a turn in progress: not integrated.
+        assert_eq!(t.update(ApproachPhase::Final, 90.0, Some(60.0), 1.0), 0.0);
+        // A 2° error integrates at 2/30 per second.
+        let v = t.update(ApproachPhase::Final, 90.0, Some(88.0), 3.0);
+        assert!((v - 0.2).abs() < 1e-9, "{v}");
+        // Held through the flare, whatever the track does.
+        assert_eq!(t.update(ApproachPhase::Flare, 90.0, Some(80.0), 5.0), v);
+        // A missing track read holds the value.
+        assert_eq!(t.update(ApproachPhase::Final, 90.0, None, 5.0), v);
+        // Wraps: 359 wanted, 1 flown is -2, not +358.
+        let mut w = super::TrackTrim::new();
+        assert!(w.update(ApproachPhase::Final, 359.0, Some(1.0), 3.0) < 0.0);
+        // Capped, and reset by the intercept (a go-around starts clean).
+        for _ in 0..10_000 {
+            t.update(ApproachPhase::Final, 90.0, Some(85.0), 1.0);
+        }
+        assert_eq!(t.value(), super::TRACK_TRIM_MAX_DEG);
+        assert_eq!(t.update(ApproachPhase::Intercept, 90.0, Some(85.0), 1.0), 0.0);
+    }
+
+    #[test]
+    fn crab_filter_settles_on_a_steady_crosswind() {
+        let mut f = super::CrabFilter::new();
+        let mut out = 0.0;
+        for _ in 0..90 {
+            out = f.update(Some(6.0), 0.5);
+        }
+        assert!((out - 6.0).abs() < 0.01, "45 s in, got {out}");
+        // A fresh filter takes its first read whole — no 15 s ramp from zero
+        // on the tick the final begins.
+        let mut g = super::CrabFilter::new();
+        assert_eq!(g.update(Some(6.0), 0.5), 6.0);
+    }
+
+    #[test]
+    fn crab_filter_eats_the_lemg_13_hunt() {
+        let mut f = super::CrabFilter::new();
+        let mut worst = 0.0_f64;
+        for i in 0..600 {
+            let t = i as f64 * 0.5;
+            let raw = 2.0 + 9.0 * (std::f64::consts::TAU * t / 13.0).sin();
+            let out = f.update(Some(raw), 0.5);
+            if t > 60.0 {
+                worst = worst.max((out - 2.0).abs());
+            }
+        }
+        assert!(worst < 2.0, "the swing came through at {worst:.1} degrees");
+        assert!(worst > 0.5, "a filter that passes nothing is a constant, got {worst:.2}");
+    }
+
+    #[test]
+    fn crab_filter_holds_through_a_missed_read() {
+        let mut f = super::CrabFilter::new();
+        for _ in 0..90 {
+            f.update(Some(6.0), 0.5);
+        }
+        assert!((f.update(None, 0.5) - 6.0).abs() < 0.01, "a missed read is not a zero crab");
+        assert_eq!(super::CrabFilter::new().update(None, 0.5), 0.0, "never read = zero");
+        // Wrap-safe: 359 vs 3 is a 4 degree crab, not 356.
+        assert!((super::CrabFilter::raw(Some(359.0), Some(3.0)).unwrap() + 4.0).abs() < 1e-9);
+        assert_eq!(super::CrabFilter::raw(Some(90.0), None), None);
+    }
+
+    #[test]
+    fn a_clearance_for_another_end_differs_and_blanks_do_not() {
+        assert!(super::clearance_differs("12", "13"));
+        assert!(!super::clearance_differs("12", " 12 "));
+        assert!(!super::clearance_differs("09R", "09r"));
+        assert!(!super::clearance_differs("12", ""));
+    }
+
     use super::*;
 
     #[test]

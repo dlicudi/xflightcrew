@@ -100,7 +100,13 @@ from a back-reference, stack cleared on airframe swap. Resolved calls ride
 the normal tool path, so every gate and readback still applies.
 Configuration-state questions ("is the gear down?") answer from the SAME
 datarefs the tools write; the question OPENER is what routes them - the
-words inside are a command's.
+words inside are a command's. A judged speed question ("is our speed okay?")
+gets a verdict against the governor, the floor, then the phase reference
+(`speed_verdict`), never a bare number. Weather AWAY from the aircraft
+(arrival, alternate, a spoken ICAO) comes from X-Plane's real-weather METAR
+file ([src/weather.rs](src/weather.rs)), never the datarefs of the air we
+are in. A named fix ("how far to PIMOS", whisper-spelled) is matched fuzzily
+against the LOADED plan only (`fix_query`).
 
 ## Aircraft profiles drive the tool surface
 
@@ -319,6 +325,13 @@ history):
   Castoring nosewheels steer by differential brake through the PLUGIN
   channels only - REST writes to `*_brake_ratio` are re-driven by hardware
   every frame and silently do nothing.
+- **The sim brakes against hard rudder on its own** (auto-toe brakes for a
+  pilot without toe-brake axes, per the acf's "brake power to help with
+  steering"), and our steer channel IS rudder input. The plugin holds
+  `override_toe_brakes` for the whole time `xcopilot/taxi_steer` is applied,
+  not only while braking; a pilot brake command or toe axis during a steered
+  taxi latches `xcopilot/brake_yield` and hands the brakes back that frame.
+  Never "fix" a corner that stops the aircraft by tuning the governor first.
 - **Line up**: rides the DRAWN lead-on (`TaxiRoutePlan.lead_on`); synthetic
   geometry is the fallback, never the first choice (inventing the entry is
   how aircraft end up in the grass - same for backtracks); crosschecked
@@ -385,7 +398,20 @@ history):
   **The arrival is briefed at the gate** (`full_auto::brief_arrival` in the
   arming ack: published approach, straight-in, or "I'll land visually"; a
   destination the data lacks is refused there) - found 25 nm out it was a
-  crash.
+  crash. **The follower never sequences the FMS**: the sim's GPS sits on the
+  plan's first entry for the whole flight, so anything that names the next
+  fix (progress questions, the course check, the waypoint reminder) reads
+  `procedure::active_leg()` first and the GPS only when nothing is flying.
+  **Full auto flies the checklist items it owns, it never reads the lists**
+  (the XChecklist interpreter is the spoken-request path only): on a
+  continuous-mixture piston (`piston_mixture`, the profile's `engine` group,
+  never the DC-3's notched lever) the enroute leg arms the mixture manager
+  (`engine::arm_mixture_manager`: rich below `LEAN_FLOOR_ALT_FT`, peak EGT
+  above, a FULL walk from a rich lever via `manager_seek_window`, re-trimmed
+  per `needs_retrim`) and the arrival sets full rich through
+  `mixture_rich_for_landing` whatever the field elevation; the manager
+  richens itself when it yields to autoland or a recovery, and stands down
+  on every give-up ("your aircraft" means every lever).
 - **Autoland**: pursuit aim keeps its full lead all the way in
   (`pursuit_aim_nm` - the aim walks down the runway, bounded by pavement);
   roundout band (`ROUNDOUT_MULT`/`ROUNDOUT_VS_FPM`) before the flare - a
@@ -400,7 +426,23 @@ history):
   says what is actually held). **A tower's go-around order outranks
   everything** (`GoAroundLatch::order`): consumed in the autoland loop,
   drained at arm time, refused on the ground; a fresh "final" report is owed
-  after any go-around, made inside the FAP.
+  after any go-around, made inside the FAP. **The wind crab fed forward on
+  final is LOW-PASSED** (`CrabFilter`, `CRAB_TAU_S`): the raw heading-minus-
+  track added to the bug at unity gain hunted the LEMG 13 final into the
+  lateral balk (2026-09-12); the blackbox keeps `crab` (applied) and
+  `crab_raw`. **The crab cancels wind and nothing else**: a bias between
+  the BUG and the HEADING (the 172 settling 2° left of its bug, LEMG 13,
+  same day) passes straight through it and parks a proportional final
+  beside the centreline (0.6 nm of lead x tan 2° = 39 m, on the 37 m gate:
+  two balks). `TrackTrim` integrates the final's track error (wanted track
+  minus `hpath`, 30 s, ±5°, final only, reset by any intercept) into the
+  bug; the tick carries `trim` and `xtk_m`, and every balk names its gate
+  (`Guidance.balk`, on the `going_around` event) so the debrief says why. **Every planned arrival hands its runway down**
+  (`EndAction::Approach { rwy_id }` to `run_autoland`'s forced runway): the
+  self-pick is the emergency path and at a field with parallels it takes
+  the nearer threshold (ILS 12 flown, landing on 13, cleared for 12). The
+  tower's clearance outranks the plan for an end at the SAME field, said
+  aloud and blackboxed `runway_from_clearance`.
 - **A straight-in is only as good as its fixes** (LXGB 09, 2026-09-11): a
   DME-fix reconstruction keeps only fixes ON the final approach course
   (`RECON_ALIGN_DEG`), and `approach_plan_for` refuses any FAF autoland could

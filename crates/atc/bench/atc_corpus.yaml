@@ -104,6 +104,9 @@
 - {text: "november one seven two, final", intent: report_final, radio: true}
 - {text: "turning final", intent: report_final, radio: true}
 - {text: "short final runway two seven", intent: report_final, radio: true}
+# The crew's own autoland reporting the parallel it self-picked (LEMG 2026-09-12);
+# the tower corrects the runway in the clearance, see Tower::correct_final_runway.
+- {text: "november one seven two sierra papa, final runway one three", intent: report_final, radio: true}
 - {text: "final for the touch and go", intent: report_final, radio: true}
 - {text: "on final", intent: report_final, radio: true}
 # "Established" is the ILS arrival's final report (earns the clearance from

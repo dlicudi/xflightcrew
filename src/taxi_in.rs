@@ -33,6 +33,25 @@ const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 /// behind us (reaching one means taxiing back down the runway).
 const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 
+/// The taxi-in has ARRESTED a rolling handoff with the parking brake and is
+/// holding on it while the clearance is worked. The monitor's rolling-park-
+/// brake caution reads this: the copilot must not nag the pilot about a brake
+/// it set itself four seconds earlier (LEMG, 2026-09-12: a manual landing,
+/// "taxi to parking" at 38 kt, the arrest, then "Parking brake is set and
+/// we're rolling — release it"). Dropped the moment the brake is released
+/// for the drive or the taxi-in gives the aircraft back.
+pub(crate) static ARREST_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the taxi-in is holding the aircraft on the parking brake it set
+/// arresting a rolling handoff.
+pub fn arrest_holding() -> bool {
+    ARREST_HOLD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn arrest_release() {
+    ARREST_HOLD.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Spawn the arrival taxi on its own thread + runtime + client.
 /// `vacate_from` is the runway END we have just landed on, when we have: the
 /// drive off it runs before anything is requested. `None` means we are already
@@ -284,7 +303,11 @@ async fn fly(
             .await
             .map(|v| v * 1.943_84);
         if gs_kts.as_ref().map_or(true, |gs| *gs > 3.0) {
+            ARREST_HOLD.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = crate::tools::controls::drive_park_brake(&xp, true, park_brake_valve_set).await;
+            // Say so: a brake the pilot did not set, on a roll they may still
+            // think is theirs, is announced, not discovered.
+            announce(&voice, Priority::Caution, "Brakes on, holding for the taxi clearance.");
             crate::blackbox::record(
                 "taxi_in",
                 json!({ "event": "arrest_rolling", "gs": gs_kts.unwrap_or(-1.0) }),
@@ -302,6 +325,7 @@ async fn fly(
                 Priority::Advisory,
                 "Call the tower for your taxi-in, then say taxi to parking.",
             );
+            arrest_release();
             return;
         };
         // The crew radio only reaches the tuned station — tune the tower first.
@@ -341,6 +365,7 @@ async fn fly(
             };
             announce(&voice, Priority::Caution, line);
             crate::blackbox::record("taxi_in", json!({ "event": why, "cleared": cleared }));
+            arrest_release();
             return;
         }
     }
@@ -352,6 +377,7 @@ async fn fly(
     // does before a departure taxi, and valve-aware for the reason above: the
     // ratio-only write left the valve armed to re-trap the first squeeze.
     crate::tools::controls::release_park_brake_for_roll(&xp, park_brake_valve_set).await;
+    arrest_release();
 
     // Drive the cleared stand route. AutoTaxi owns the gates (on ground, on the
     // route, steer channel) and speaks the readback ("My taxi. stand ...").

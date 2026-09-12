@@ -175,11 +175,7 @@ impl Tool for SetReminder {
                 Ok(format!("Roger, I'll remind you in {mins:.0} minutes."))
             }
             "next_waypoint" => {
-                // get_string lives on the concrete client, not the XPlane trait.
-                let current = XPlaneClient::new(base.clone())
-                    .get_string(GPS_NAV_ID)
-                    .await
-                    .unwrap_or_default();
+                let current = tracked_fix(&XPlaneClient::new(base.clone())).await;
                 if current.trim().is_empty() {
                     return Ok("There's no active GPS waypoint to track. Load and navigate a route first.".to_string());
                 }
@@ -278,6 +274,20 @@ fn arm_altitude(
     });
 }
 
+/// The fix we are flying to: the procedure follower's own leg while one runs
+/// (the sim's GPS stays parked on the plan's first entry the whole time), else
+/// the GPS's active waypoint. Empty when neither knows.
+async fn tracked_fix(xp: &XPlaneClient) -> String {
+    if let Some(leg) = crate::procedure::active_leg() {
+        return leg.fix;
+    }
+    // get_string lives on the concrete client, not the XPlane trait.
+    xp.get_string(GPS_NAV_ID)
+        .await
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
 fn arm_waypoint(
     base: String,
     from: String,
@@ -290,14 +300,21 @@ fn arm_waypoint(
         let xp = XPlaneClient::new(base);
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(REMINDER_DEADLINE_SECS);
-        // The active GPS waypoint sequences when we reach it: the id flips to the
-        // next leg. Fire on that change (or when the id empties at the end).
+        // The tracked fix sequences when we reach it: the id flips to the next
+        // leg. Fire on that change (or when the id empties at the end). A
+        // procedure that finishes hands the GPS's stale entry back; that is the
+        // end of what we were following, not a new fix.
+        let from_procedure = crate::procedure::active_leg().is_some();
         while std::time::Instant::now() < deadline {
             if life.cancelled() {
                 return;
             }
-            if let Ok(id) = xp.get_string(GPS_NAV_ID).await {
-                let id = id.trim().to_string();
+            {
+                let id = if from_procedure && crate::procedure::active_leg().is_none() {
+                    String::new()
+                } else {
+                    tracked_fix(&xp).await
+                };
                 if id != from {
                     let line = if id.is_empty() {
                         format!("Heads up, reached {from}, end of the route.")

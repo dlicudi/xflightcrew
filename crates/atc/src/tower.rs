@@ -922,6 +922,33 @@ impl Tower {
         }
     }
 
+    /// A final report that names the WRONG runway is corrected, not waved
+    /// through. The clearance that answers it already names the right one,
+    /// but a pilot who just said "final runway one three" hears "runway one
+    /// two, cleared to land" as confirmation, not contradiction: the crew's
+    /// autoland reported 13, the tower cleared 12 twice, and the aircraft
+    /// flew 13 both times (LEMG, 2026-09-12). Wraps the reply [`handle`]
+    /// produced; every other call passes through untouched. A report with no
+    /// runway in it is not wrong (whisper eats numbers).
+    pub fn correct_final_runway(transcript: &str, intent: Intent, ctx: &Ctx, reply: String) -> String {
+        if intent != Intent::ReportFinal {
+            return reply;
+        }
+        let (Some(ours), Some(heard)) = (canon_runway(&ctx.runway), runway_after_keyword(transcript))
+        else {
+            return reply;
+        };
+        if ours == heard {
+            return reply;
+        }
+        let prefix = format!("{}, ", ctx.callsign);
+        let body = reply.strip_prefix(&prefix).unwrap_or(&reply);
+        format!(
+            "{}negative, runway {}, I say again runway {}. {body}",
+            prefix, ctx.runway, ctx.runway
+        )
+    }
+
     /// Answer one transmission, advancing the clearance state.
     pub fn handle(&mut self, intent: Intent, ctx: &Ctx) -> String {
         // Any new REQUEST voids an outstanding readback demand — the gate
@@ -2075,6 +2102,37 @@ mod tests {
         assert!(
             twr.pending().is_none(),
             "the dead clearance's echo is not owed"
+        );
+    }
+
+    // LEMG 2026-09-12: "final runway one three" answered with "runway one
+    // two, cleared to land" and nobody heard the difference.
+    #[test]
+    fn a_final_report_on_the_wrong_runway_is_corrected_aloud() {
+        let c = ctx();
+        let mut t = Tower::default();
+        t.state = State::Inbound;
+        let reply = t.handle(Intent::ReportFinal, &c);
+        let fixed = Tower::correct_final_runway(
+            "november one seven two sierra papa, final runway one three",
+            Intent::ReportFinal,
+            &c,
+            reply.clone(),
+        );
+        assert!(
+            fixed.starts_with("November one seven two Sierra Papa, negative, runway zero niner, I say again runway zero niner. runway zero niner, wind"),
+            "{fixed}"
+        );
+        assert!(fixed.ends_with("cleared to land."), "{fixed}");
+        // The right runway, or none spoken: the reply as it was.
+        for t in ["final runway zero niner", "november one seven two, final"] {
+            assert_eq!(Tower::correct_final_runway(t, Intent::ReportFinal, &c, reply.clone()), reply, "{t}");
+        }
+        // Only final reports: a taxi request naming another runway is the
+        // parser's business, not this one's.
+        assert_eq!(
+            Tower::correct_final_runway("request taxi runway one three", Intent::RequestTaxi, &c, reply.clone()),
+            reply
         );
     }
 

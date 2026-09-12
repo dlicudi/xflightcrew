@@ -1227,7 +1227,9 @@ impl Check for RollingOnParkBrake {
         Severity::Caution
     }
     fn eval(&self, s: &Snapshot) -> Option<String> {
-        (s.on_ground && s.groundspeed_kts > 5.0 && s.park_brake > 0.5)
+        // Not when the copilot set it: the taxi-in arrests a rolling handoff
+        // on the parking brake and says so itself (see `taxi_in::arrest_holding`).
+        (s.on_ground && s.groundspeed_kts > 5.0 && s.park_brake > 0.5 && !crate::taxi_in::arrest_holding())
             .then(|| "Parking brake is set and we're rolling — release it.".to_string())
     }
     fn min_duration(&self) -> Duration {
@@ -3534,6 +3536,15 @@ mod tests {
         s.park_brake = 1.0;
         s.on_ground = false;
         assert!(c.eval(&s).is_none(), "not a thing in the air");
+        // The taxi-in's own arrest of a rolling handoff: the copilot set the
+        // brake and announced it; it does not then nag the pilot about it.
+        s.on_ground = true;
+        s.groundspeed_kts = 38.0;
+        assert!(c.eval(&s).is_some());
+        crate::taxi_in::ARREST_HOLD.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(c.eval(&s).is_none(), "the copilot's own brake is not a caution");
+        crate::taxi_in::ARREST_HOLD.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(c.eval(&s).is_some());
     }
 
     #[test]

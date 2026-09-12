@@ -4,6 +4,99 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## Full auto and the mixture — 2026-09-12
+
+"When copilot flies flight plan it's not following checklists? And it is
+not leaning mixture after climbing?" Both true. The XChecklist interpreter
+(`checklist.rs`) is reached only from a spoken request in `main.rs`; the
+full-auto orchestrator never consults the CLIMB, CRUISE, DESCENT or BEFORE
+LANDING lists, it flies its own hard-coded configuration (lights, squawk,
+gear and flaps on final). And the whole mission had no mixture write after
+the engine start: the enroute leg arms the flight speed hold (a throttle
+law), `lean_mixture` and its continuous manager existed but only the
+pilot's voice reached them, and autoland had no full-rich step, so a lever
+the pilot had leaned by hand at cruise flew the go-around and the landing.
+
+Fix, deterministic and through the existing tools. `SubTools.piston_mixture`
+(the profile's generic `engine` group, deliberately NOT `piston_engine`,
+which includes the DC-3's notched xlua lever the manager must not creep):
+after the enroute follower starts, full auto arms `arm_mixture_manager`
+and says so ("I have the mixture: full rich below three thousand, leaned
+for cruise"); at `enroute_complete`, before the arrival is built, it calls
+the new `engine::mixture_rich_for_landing` (releases the manager and any
+seek, glides the lever to full rich, "Mixture full rich." only if it
+moved) so a high field never inherits a leaned lever from the manager's
+MSL floor.
+
+Found on the way: the manager could not actually lean from a rich lever.
+Its re-trim bracketed ±0.05 around the lever it found, so armed at full
+rich (which is what `lean_mixture` below the floor does, promising to lean
+once higher) it sampled 0.95 once, called that the peak, and parked at
+0.98 for the cruise. `manager_seek_window` now returns the whole range in
+0.03 steps from a lever at or above 0.90, the ±0.05 bracket in 0.015 steps
+otherwise (tested). The seek loop also checks `MIX_MANAGED` each step so a
+release mid-hunt (pilot, landing) leaves the lever where the releaser put
+it instead of overwriting it with the seek's own answer a second later.
+And the manager richens on the way out when it yields to autoland or a
+recovery, and full auto's `give_up` clears it: "your aircraft" means every
+lever. Blackbox: `full_auto` events `mixture_managed` and `mixture_rich`.
+
+Not done: reading the checklist files aloud at the phase boundaries. That
+is a different feature (step-by-step with confirmation on hazard items,
+and the CRUISE list's other items are the pilot's), left for its own ask.
+
+## The sim's own toe brakes on the copilot's rudder — 2026-09-12
+
+"There is a lot of jerky braking when steering with the 172 during taxi."
+The blackbox for the LXGB taxi (two drives, 557 m and 1114 m) showed the
+governor's brake trace almost empty: a handful of 0.1 to 0.2 pulses at bend
+caps and after post-turn overshoots, nothing that could be felt as "a lot".
+What it DID show, in every corner: with the steer command past ~0.65 (the
+172's nosewheel has 10 degrees, so that is 6.5 of them) the aircraft fell
+from 6 kt to under 1 kt in four seconds with the yaw rate spiking to 11
+deg/s and NO brake commanded, then crawled at 1 kt for ten seconds while the
+throttle rebuilt from the bend cap's idle, then surged to 12 kt out of the
+turn and earned a real brake pulse for the overshoot. At the join it sat
+sawing 1.5 -> 0.9 kt every 1.2 s: `steer_authority` tapers the command with
+groundspeed, so the command crossed some threshold, a brake bit, the speed
+fell, the command shrank below it, the brake let go, and round again.
+
+The threshold is X-Plane's. Since 11.30 the sim applies **automatic
+differential toe brakes against hard rudder input** for a pilot with no
+toe-brake axes assigned, per the aircraft's Plane Maker "brake power to
+help with steering (if no rudder pedals present)" parameter (the 172's is
+on; the developer notes: "X-Plane can apply the left toe brake for you when
+you apply a lot of left rudder"). Our `xcopilot/taxi_steer` channel drives
+`yoke_heading_ratio`, which is rudder input, and the rule that switches the
+auto-brake off is "a plugin is controlling the toe brakes", i.e.
+`override_toe_brakes`, which the plugin only raised while it was actually
+braking. So every hard nosewheel command came with the sim's brake on the
+inside wheel. This rig has no toe-brake axes (assignments 1/2/3/4/11/14/20/21
+only), so the feature was live the whole time.
+
+Fix, plugin only (`drefs.cpp`): the toe-brake override is held for the
+WHOLE time the steer channel is applied, ratios zero unless a channel wants
+brake. That would lock the pilot out of their brakes for a steered taxi, so
+the yield mirrors the steer channel's: a brake COMMAND (`brakes_regular`,
+`brakes_max`, both toggles, watched by a non-consuming before-handler) or a
+toe-brake AXIS moving off its engage baseline, while the override is up for
+steering alone, latches `xcopilot/brake_yield` and drops the override that
+frame, so the sim's own brake handling runs, the ratios show the press, and
+the governor's takeback detector sees it exactly as before. A channel that
+WANTS brake keeps the override regardless (a governor holding a stop must
+never lose its hold to a tap on the key). Re-armed when the steer channel
+goes stale. The takeoff roll and the autoland rollout steer through the same
+channel and inherit both halves.
+
+Verification owed on the next taxi: `sim/flightmodel2/gear/tire_part_brake`
+must read zero on every wheel while the copilot steers with no brake
+commanded, and the corners should slow at the idle-coast rate the wide left
+turn already showed (about 0.5 kt/s), not collapse. The bend-cap brake
+pulses (0.1 to 0.2 for under a second, tuned down three times already) are
+untouched and are the next thing to judge once the sim's brake is out of the
+picture. Installing while the sim runs: remove the old `.xpl` and copy, never
+overwrite in place (the running sim has it mapped).
+
 ## The panel on the sim's own renderer, and the field you are standing at — 2026-09-10
 
 X-Plane 12.4.4 (SDK 4.4.0) ships a native panel-graphics API with an ImGui
@@ -125,6 +218,72 @@ preview, and an explicit resume restores the item after another topic. Both
 selection and preview expire, and airframe swaps clear them. No item is marked
 complete. Tests exercise actual parsed checklist content, title clarification,
 compound questions, history expiry, interrupt/resume, and adversarial phrases.
+
+### Enroute questions that missed — 2026-09-12
+
+LXGB to LEMG in the 172SP under full auto, the pilot asking the copilot the
+questions a passenger in the right seat asks. The blackbox `heard` events and
+the log's `deterministic-miss` lines gave five silent misses and two wrong
+answers, each now a rule with the live transcript as its test
+(`gap_tests_2026_09_12` in `main.rs`):
+
+- "How much left for pimmons?" and "what's the waypoint to act at Pimos?":
+  whisper spells a fix it has never seen phonetically. `fix_query` takes the
+  word after a preposition, matches it against the LOADED plan's idents
+  (first letter must agree, two edits allowed on a five-letter fix, doubled
+  letters collapsed first), and answers range and time to it or what follows
+  it. Only fires with a range cue, an "after" word or the word waypoint/fix,
+  so "set heading to 270" never has its object matched; only a plan already
+  on the shelf is consulted, so a stray "for X" never triggers a SimBrief
+  fetch. Airports at either end are excluded (that is the destination ETA).
+- "Remind me when we get there.": "there" is whatever the copilot last
+  answered about. `conversation::resolve_there` rewrites it to "the next
+  waypoint" or "top of descent" from the last observation and the grammar
+  arms the reminder it already knows. The referent is captured BEFORE
+  `Conversation::respond`, which retires the topic on any utterance it does
+  not own. A destination ETA stays unresolved on purpose (the tool has no
+  destination reminder); the nav answers now `observe()` so they can be a
+  referent at all.
+- "Aren't we going a bit slow?" missed (no question opener) and "Is our speed
+  okay?" answered a bare "72 knots". Negated auxiliaries are openers now, in
+  both the raw and the apostrophe-stripped form, and "should/shall we" join
+  the do-support rule. A judged speed question gets a verdict: the governor's
+  target first, the airframe floor above everything, then Vy in a climb, the
+  approach reference low-and-descending or with flap, cruise IAS otherwise,
+  and nothing invented when the profile is silent (`speed_verdict`).
+- "Should we check in with ATC?": `station::coach_yes_no` routes the
+  yes/no shape to the coach, which now leads with "Yes." and the call, or
+  "No call owed right now."
+- "What weather can we expect on arrival?" was answered from the sim's own
+  weather datarefs, the air we were IN, 45 nm from Malaga. New `weather.rs`
+  reads X-Plane 12's real-weather download (`Output/real weather/metar-*.txt`,
+  one METAR per station) and briefs the plan's destination, alternate, origin
+  or a spoken ICAO; a stale file says how old it is rather than pretending.
+  The sim's datarefs still answer "here".
+- "How long till the next waypoint?" answered "PIMOS, 18 miles" at 13:48
+  and "PIMOS, 45 miles" at 14:33 while the procedure had called LUNUM,
+  MG452, GUMAZ, BUKOX, OBIGE and MG430 in between; the sim confirmed it live
+  (`gps_nav_id` PIMOS at 48 nm, blackbox leg 6 MG430 at 2.4 nm). The
+  follower flies its legs in heading mode and never sequences the FMS, so
+  the GPS sits on the plan's first entry for the whole flight and every
+  reader of it (`nav_progress`, the on-course check, the `next_waypoint`
+  reminder armed at 13:52 that never fired) named a fix long passed. The
+  follower now publishes its leg (`procedure::active_leg`, cleared when the
+  thread ends, `None` while inactive); the question answers distance and
+  minutes to THAT fix from position and groundspeed, the course check says
+  the autopilot is steering the plan instead of reading HSI dots against
+  nobody's course, and the reminder tracks the follower's fix and treats
+  the follower ending as the end of what it was watching, never as
+  "now tracking PIMOS".
+- The mixture manager's "Leaned to peak EGT" line appeared twice in the
+  transcript, blue then green: the seek thread posted it to the panel as an
+  advisory AND handed it to the voice, which mirrors what it speaks. The
+  CLAUDE.md rule (mirror OR post, never both) applied; it posts only when
+  there is no voice to say it.
+
+Still open from earlier sorties (09-06, 09-10): "do we have any passengers",
+"what kind of questions can I ask you", "how long before we reach the holding
+point", "check electrical systems", "let's get clearance for taxi".
 
 ---
 
@@ -1261,6 +1420,104 @@ a PTT press or a second call can step on it again, and the audio bus needs
 nothing: the cut is the same generation bump the bus already honours. Still unowned: the zone clearance's
 "not above two thousand feet" (neither side carries the altitude limit) and
 the squawk watch's "radar contact" spoken before the handoff.
+
+**The final that hunted, and the parallel it landed on (LEMG, 15:12Z,
+2026-09-12).** Full auto flew the SimBrief plan LXGB to LEMG and the ILS 12
+end to end: clearance, taxi, a released tug, the crossing of 27, departure
+handoff, the enroute leg, the inbound call and "join final runway one two",
+FI12 captured at 15:04:30 and autoland armed from 8.1 nm. Then two things
+the debrief shows in one line each. First, autoland said "runway 13": the
+procedure's FAF handoff passed `run_autoland` no forced runway, so it
+self-picked by track, and at a field with parallels the self-pick takes the
+nearer threshold. The tower cleared "runway one two" twice; the aircraft flew
+13, and would have landed on it. `EndAction::Approach` now carries `rwy_id`
+(full auto, the circuit and the spoken procedure tool all fill it) and the
+handoff passes it down; if the standing clearance names a different end AT
+THE SAME FIELD the clearance wins, aloud, blackboxed `runway_from_clearance`
+(a stale departure clearance can never send us to a "09" forty miles away).
+Second, the balk at 74 ft: a final that the blackbox shows glued to the
+glidepath within 5 ft and 65 kt the whole way down went around with
+"climbing straight ahead" and no other explanation. The gate was the lateral
+one under 100 ft (`FLARE_MAX_XTK_NM`, 37 m), reconstructed from the command:
+inside 0.30 nm the cut is `-xtk * 80`, and `cmd_hdg` minus the course walked
+1.59, 1.60 degrees, i.e. the aircraft sat 35 to 37 m left of the centreline
+from 0.30 nm in and drifted over the line at 74 ft. Why it was there is the
+`crab` column: standard deviation 0.5 degrees through the whole intercept,
+then 1.2, 1.4, 1.8, 2.5, 2.7, 3.1, 3.7, 4.0 down the final, a ±9 degree
+swing with a 13 second period at the numbers. The intercept phase does not
+feed the crab back; the final does, and it fed the RAW heading-minus-track
+read into the heading bug at unity gain every tick, so every nose swing the
+autopilot made came straight back as a bug move and the loop hunted, growing
+all the way down. `CrabFilter` (15 s time constant, estimated every tick so
+it is settled when the final begins, a missed read holds the estimate) now
+supplies the crab; the 13 s swing comes through at a seventh of its
+amplitude, tested against that signature. The blackbox keeps both `crab`
+(applied) and `crab_raw`. The go-around itself was flown correctly (full
+power, +800 fpm, straight ahead to 800 ft, back to the join point, second
+approach from 6.3 nm), against a tower that had asked for runway heading and
+a downwind report; the crew's missed approach and the tower's instructions
+are still two different pictures, noted, not fixed here.
+
+**Same sortie, the position column (15:27Z, the second balk at 40 ft).**
+The debrief after landing showed a second go-around at 40 ft, again with no
+reason attached, and the pilot took the aircraft and landed by hand. The
+state events carry lat/lon, and projected onto the 13 centreline from
+apt.dat they say something the command column could not: the aircraft was
+NOT hunting laterally. It sat 33 to 37 m LEFT of the centreline from 1.3 km
+out (280 ft) to the numbers on the FIRST final, steady to the metre, and 32
+to 38 m left on the second, identically, and each balk fired the tick the
+standing offset crept past the 37 m gate (`FLARE_MAX_XTK_NM`, 0.02 nm):
+74 ft on the first, 40 ft on the second, both `off_centreline_low`. The
+heading was swinging 123 to 136 the whole way (the hunt the filter above
+ends), but the swing's mean is what set the offset, and the mean was wrong:
+true heading averaged 1.9° LEFT of the true-frame bug on both finals, and
+1.07° left of it through the whole intercept, where no crab is in the loop
+at all (193 ticks; the PANC 25R intercept the night before read 0.01°, so
+this is not the variation sign, and the earlier LEMG 13 and 31 finals read
++0.3 and +0.7). A steady bias between the BUG and the HEADING passes
+straight through the crab loop: the crab is heading minus track, so it
+cancels wind and nothing else, and both laws on final are proportional (the
+fixed-lead pursuit, then the 80°/nm short-final cut), so they equilibrate
+where the cut equals the bias: 0.6 nm of lead times tan 2° is 39 m, and
+2°/80 is 46 m, which is exactly the walk from 34 to 37.7 m inside 0.30 nm
+that tripped the gate. Every earlier approach in the blackbox sits within
+±14 m at the same point; this one is an outlier the law had no answer to.
+
+`TrackTrim`: an integral term on the final's TRACK error (the guidance
+heading, i.e. the wanted track, minus `hpath`), 30 s time constant, ±5°
+cap, errors over 10° ignored as a turn, final only, held through the flare,
+reset by any intercept so a missed approach never carries a stale
+correction into the next attempt. Added to the bug alongside the crab.
+Battle-tested through the real `guidance` with a second-order autopilot
+that settles 2° off its bug and the loop's own tick and crab filter: without
+the trim the plant parks 40 m left and balks, exactly the flight; with it
+the final is inside 9 m at 100 ft for ±2° and 1° biases, the trim carrying
+the bias, and inventing nothing when there is none. Why the 172's heading
+sat left of the bug that day is not known (16 kt of wind on the nose wants
+more power on the path, and more torque); the trim does not need to know.
+
+Also from the same debrief: `Guidance.balk` names the gate that balked
+(`off_centreline_at_flare`, `off_centreline_low`, `unstabilised_below_floor`,
+`overflew_the_runway`) and the `going_around` event carries it with the
+cross-track in metres, the tick carries `xtk_m` and `trim`, and the debrief
+prints "GO-AROUND at 74 ft radio: off centreline low, 38 m left of the
+centreline"; the debrief was also rendering the `final_report` event as a
+second "autoland armed: 13 from 5.0 nm, 0 ft radio, 0 kt, phase " line
+(arming detection now wants a tick, not any event with a runway). The
+second final report said "final runway one three" and the tower answered
+"runway one two, cleared to land" as if nothing was wrong: the tower now
+corrects a final report that names the wrong runway in the same breath
+("negative, runway one two, I say again runway one two"), corpus case
+added. And the manual landing's "taxi to parking" at 38 kt: the taxi-in
+arrested the roll on the parking brake, silently, and four seconds later the
+monitor said "Parking brake is set and we're rolling, release it" about
+the copilot's own brake. The arrest now says "Brakes on, holding for the
+taxi clearance" and holds a claim (`taxi_in::arrest_holding`) the caution
+reads, dropped when the brake is released for the drive or the taxi-in
+gives the aircraft back. Still open from this sortie: a landing clearance
+whose runway changes after the arming (a go-around, then "cleared to land
+runway 31") is not re-read by the autoland loop.
+
 
 Depth (added 2026-07-28): **the approach is sized for the airframe, and a
 missed approach is a procedure**. One MD-82 circuit at Luton exposed four

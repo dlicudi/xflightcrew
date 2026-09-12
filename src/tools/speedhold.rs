@@ -121,6 +121,13 @@ pub fn taxi_hold_active() -> bool {
 /// The running taxi hold's target, or `None` when the governor isn't taxiing.
 /// The auto-taxi loop reads this to spot an EXTERNAL retarget (a spoken
 /// "stop" / "go" / "taxi at 12") and fold it into its own speed schedule.
+/// The airspeed the governor is holding in flight, when it is.
+pub fn flight_target() -> Option<f64> {
+    (ACTIVE.load(Ordering::Relaxed)
+        && *MODE.lock().unwrap_or_else(|e| e.into_inner()) == Mode::Flight)
+        .then(|| *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 pub fn taxi_target() -> Option<f64> {
     taxi_hold_active().then(|| *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner()))
 }

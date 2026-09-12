@@ -424,7 +424,7 @@ impl Station {
         if intent == tower::Intent::RequestFrequencyChange {
             return None;
         }
-        Some(self.respond(service, intent, ctx, wx))
+        Some(self.respond(transcript, service, intent, ctx, wx))
     }
 
     /// Remember "with information X" from any call — the next clearance skips
@@ -530,7 +530,7 @@ impl Station {
             }
             return String::new();
         }
-        self.respond(service, intent, ctx, wx)
+        self.respond(transcript, service, intent, ctx, wx)
     }
 
     /// The voice of whichever of this station's positions COM1 is tuned to.
@@ -567,6 +567,7 @@ impl Station {
     /// context and wind were read before the words reached the controller.
     fn respond(
         &mut self,
+        transcript: &str,
         service: Service,
         intent: tower::Intent,
         ctx: &tower::Ctx,
@@ -598,7 +599,7 @@ impl Station {
         } else {
             ctx
         };
-        let reply = self.respond_inner(service, intent, ctx, wx);
+        let reply = self.respond_inner(transcript, service, intent, ctx, wx);
         // Publish the clearance picture for the monitor's compliance watch:
         // two-way contact has happened, and this is what the pilot is (and
         // isn't) cleared to do. Same reply-path-owns-its-static pattern as
@@ -744,6 +745,7 @@ impl Station {
 
     fn respond_inner(
         &mut self,
+        transcript: &str,
         service: Service,
         intent: tower::Intent,
         ctx: &tower::Ctx,
@@ -753,6 +755,9 @@ impl Station {
             Service::Tower => {
                 let was = self.twr.state;
                 let reply = self.twr.handle(intent, ctx);
+                // A final report naming the wrong runway earns its correction
+                // in the same breath as the clearance.
+                let reply = tower::Tower::correct_final_runway(transcript, intent, ctx, reply);
                 // A fresh takeoff clearance arms the after-departure handoff:
                 // once airborne and climbing, the tower sends the flight to
                 // departure (or approach) — the frequency chain, not a tower
@@ -2907,6 +2912,44 @@ pub fn coach_query(t: &str) -> bool {
                 || t.contains("request")
                 || t.contains("talk")))
         || (t.contains("help") && t.contains("radio"))
+        || coach_yes_no(t)
+}
+
+/// "Should we check in with ATC?", "do we need to call the tower?", "is it
+/// time to contact departure?": a yes/no about whether a call is owed. The
+/// coach answers it (yes with the call, or no) rather than the copilot
+/// staying silent (missed live, 2026-09-12).
+pub fn coach_yes_no(t: &str) -> bool {
+    let asks = t.starts_with("should we")
+        || t.starts_with("should i")
+        || t.starts_with("shall we")
+        || t.starts_with("shall i")
+        || t.contains("do we need to")
+        || t.contains("do i need to")
+        || t.contains("do we have to")
+        || t.contains("is it time to")
+        || t.contains("time to check")
+        || t.contains("time we ")
+        || t.contains("we owe")
+        || t.contains("owe them")
+        || t.contains("owe a call");
+    let radio = t.contains("check in")
+        || t.contains("checkin")
+        || t.contains("call ")
+        || t.ends_with("call")
+        || t.contains("contact")
+        || t.contains("talk to")
+        || t.contains("report")
+        || t.contains("radio")
+        || t.contains("atc")
+        || t.contains("tower")
+        || t.contains("ground")
+        || t.contains("departure")
+        || t.contains("approach")
+        || t.contains("center")
+        || t.contains("centre")
+        || t.contains("frequency");
+    asks && radio
 }
 
 /// One coached hint from [`suggest_call`]: an optional prerequisite/status
@@ -4991,7 +5034,7 @@ mod tests {
             false,
             None,
         );
-        let r = st.respond(Service::Tower, tower::Intent::RequestClearance, &ctx, wx);
+        let r = st.respond("", Service::Tower, tower::Intent::RequestClearance, &ctx, wx);
         let code = st.assigned_squawk.expect("discrete code issued");
         let spoken = atis::spoken_digits(&code.to_string());
         assert!(r.contains(&spoken), "{r}");
@@ -5019,7 +5062,7 @@ mod tests {
             false,
             None,
         );
-        let r = st.respond(Service::Tower, tower::Intent::RequestClearance, &ctx, wx);
+        let r = st.respond("", Service::Tower, tower::Intent::RequestClearance, &ctx, wx);
         assert!(r.contains("seven zero zero zero"), "{r}");
         assert!(st.assigned_squawk.is_none());
         assert!(SQUAWK_WATCH.lock().unwrap().is_none());
@@ -6733,8 +6776,20 @@ mod tests {
         ] {
             assert!(coach_query(q), "{q:?} should reach the coach");
         }
+        // Yes/no shapes about whether a call is owed reach the coach too.
+        for q in [
+            "should we check in with atc",
+            "do we need to call the tower",
+            "is it time to contact departure",
+            "shall we report to ground",
+        ] {
+            assert!(coach_query(q), "{q:?} should reach the coach");
+            assert!(coach_yes_no(q), "{q:?} is a yes/no");
+        }
         assert!(!coach_query("flaps ten"));
         assert!(!coach_query("what frequencies are here"));
+        assert!(!coach_query("should we lower the gear"));
+        assert!(!coach_yes_no("what do i say"));
     }
 
     #[test]
@@ -7836,8 +7891,8 @@ mod tests {
         *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
-        st.respond(Service::Tower, tower::Intent::RequestTaxi, &ctx, wx);
-        let r = st.respond(Service::Tower, tower::Intent::RequestTakeoff, &ctx, wx);
+        st.respond("", Service::Tower, tower::Intent::RequestTaxi, &ctx, wx);
+        let r = st.respond("", Service::Tower, tower::Intent::RequestTakeoff, &ctx, wx);
         assert!(
             r.contains("behind the landing Speedbird three zero six"),
             "{r}"

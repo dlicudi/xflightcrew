@@ -152,6 +152,11 @@ pub struct FullAuto {
     /// Without it and without a turbine sequence there is no start at all —
     /// see [`StartKind::None`].
     pub piston_engine: bool,
+    /// The generic continuous mixture lever (`engine` group) specifically,
+    /// not any piston: the DC-3 is a piston with a notched xlua lever the
+    /// manager must not creep. Arms the enroute mixture manager and the
+    /// arrival's full rich.
+    pub piston_mixture: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -315,6 +320,7 @@ impl Tool for FullAuto {
                 prop: self.prop.clone(),
             },
             cruise_ias_kts: self.cruise_ias_kts,
+            piston_mixture: self.piston_mixture,
             mission,
             power_up_first: self.power_up_first,
             engine_start_secs: start_kind(

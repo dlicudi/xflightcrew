@@ -253,6 +253,7 @@ fn build_plan(
         apt_dat: apt_dat.to_string(),
         cfg,
         approach_ias,
+        rwy_id: Some(rwy_id.clone()),
     };
     let plan = procedure::approach_plan_for(
         cifp, fix_path, nav_path, &airport, &icao, &rwy_id, lat, lon, end,

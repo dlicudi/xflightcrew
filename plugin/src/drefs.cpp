@@ -218,6 +218,47 @@ static float g_taxi_brake = 0.0f;
 static float g_taxi_brake_stamp = -1.0f;
 static bool g_taxi_brake_applied = false;
 static const float kTaxiBrakeFreshSecs = 1.0f;
+// The sim's OWN toe brakes against OUR rudder. For a pilot with no toe-brake
+// axes assigned, X-Plane applies automatic differential toe braking whenever
+// the rudder input is deflected hard at taxi speed ("auto-toe brakes",
+// 11.30+, per the aircraft's Plane Maker "brake power to help with steering"
+// parameter; the 172's is on). The steer channel below IS rudder input, so
+// every hard nosewheel command the copilot made got the sim's brake stab on
+// the inside wheel on top: the 172 fell from 6 kt to under 1 in four seconds
+// in a corner with no brake commanded, and sat sawing 1.5 -> 0.9 kt every
+// 1.2 s at the join as the speed-tapered steer command crossed the sim's
+// threshold back and forth (Gibraltar, 2026-09-12, "jerky braking when
+// steering"). The rule that switches the auto-brake off is "a plugin is
+// controlling the toe brakes", i.e. this override, so it is held for the
+// WHOLE time the steer channel is applied, ratios zero unless a channel
+// wants brake, not only while braking.
+//
+// Which would lock the pilot out of their own brakes for the length of a
+// steered taxi, so the yield below mirrors the steer channel's: a brake
+// COMMAND (the key or a button, the only brake a pedal-less pilot has), or a
+// toe-brake AXIS moving off its engage baseline, while the override is held
+// for steering alone, latches xcopilot/brake_yield and drops the override
+// that frame, so the sim's own brake handling runs and the ratios show the
+// press, which is exactly what the governor's takeback detector reads. A
+// channel that WANTS brake keeps the override: the pilot's press changes
+// nothing about an aircraft already being braked, and a governor holding a
+// stop must never lose its hold to a tap on the key. Re-armed when the steer
+// channel goes stale.
+static XPLMDataRef g_brake_yield_dref = nullptr;
+static int g_brake_yield = 0;
+static bool g_brake_hold_for_steer = false;
+static XPLMCommandRef g_brake_cmds[4] = {nullptr, nullptr, nullptr, nullptr};
+static const char* const kBrakeCmdNames[4] = {
+    "sim/flight_controls/brakes_regular",
+    "sim/flight_controls/brakes_max",
+    "sim/flight_controls/brakes_toggle_regular",
+    "sim/flight_controls/brakes_toggle_max",
+};
+static int g_brake_axis_l = -1;
+static int g_brake_axis_r = -1;
+static float g_brake_axis_baseline_l = 0.0f;
+static float g_brake_axis_baseline_r = 0.0f;
+static int g_brake_deflect_frames = 0;
 
 // The DIFFERENTIAL half of the same pedals: xcopilot/taxi_brake_l and
 // xcopilot/taxi_brake_r, one side at a time, the steering assist for a
@@ -331,6 +372,11 @@ static int g_roll_deflect_frames = 0;
 static const int kAxisPitch = 1;
 static const int kAxisRoll = 2;
 static const int kAxisYaw = 3;
+static const int kAxisBrakeL = 6;
+static const int kAxisBrakeR = 7;
+// Movement of a toe-brake axis from its engage baseline that reads as a foot
+// on the pedal (direction-agnostic: calibrations invert).
+static const float kBrakeYieldDelta = 0.25f;
 // Deflection from the baseline that reads as the pilot's hands on the yoke.
 static const float kPitchYieldDelta = 0.25f;
 // Deflection from the baseline that reads as the pilot's feet.
@@ -444,6 +490,7 @@ static void WriteTaxiSteer(void*, float v) {
     g_taxi_steer_stamp = XPLMGetElapsedTime();
 }
 static int ReadSteerYield(void*) { return g_steer_yield; }
+static int ReadBrakeYield(void*) { return g_brake_yield; }
 // Terrain mailbox accessors: the write only stores + flags; the probing
 // itself happens in the flight loop.
 static void WriteTerrainQuery(void*, void* in, int offset, int len) {
@@ -478,6 +525,21 @@ static float yaw_axis_value() {
     float v = 0.0f;
     XPLMGetDatavf(g_joy_axis_values, &v, g_yaw_axis, 1);
     return v;
+}
+
+// A hardware toe-brake axis's current value, or -1 if none is assigned.
+static float brake_axis_value(int axis) {
+    if (axis < 0 || !g_joy_axis_values) return -1.0f;
+    float v = 0.0f;
+    XPLMGetDatavf(g_joy_axis_values, &v, axis, 1);
+    return v;
+}
+// Before-handler on the sim's brake commands, never consuming: a press while
+// the toe-brake override is up for steering alone is the pilot asking for
+// the brakes, and the answer is to hand them over, not to swallow the press.
+static int BrakeCommandHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
+    if (phase == xplm_CommandBegin && g_brake_hold_for_steer) g_brake_yield = 1;
+    return 1;
 }
 
 // The hardware pitch axis's current value, or -1 if none is assigned.
@@ -549,9 +611,15 @@ static float TaxiAssistLoop(float, float, int, void*) {
         if (g_steer_brake_l > want_l) want_l = g_steer_brake_l;
         if (g_steer_brake_r > want_r) want_r = g_steer_brake_r;
     }
-    if (want_l > 0.0f || want_r > 0.0f) {
-        // The override holds ONLY while we're actively braking, so the
-        // pedals are the pilot's the rest of the time.
+    const bool wanted = want_l > 0.0f || want_r > 0.0f;
+    // Held while braking, and while STEERING: an override up is what keeps
+    // the sim's auto-toe brakes off our rudder (see g_brake_yield). Last
+    // frame's steer flag, one frame of lag either way is nothing. A pilot
+    // who has claimed the brakes keeps them until the steer channel is
+    // stale, unless a channel actually wants brake.
+    const bool steer_hold = g_taxi_steer_applied && !g_brake_yield;
+    g_brake_hold_for_steer = steer_hold && !wanted;
+    if (wanted || steer_hold) {
         if (g_override_toe_brakes) XPLMSetDatai(g_override_toe_brakes, 1);
         if (g_l_brake_ratio) XPLMSetDataf(g_l_brake_ratio, want_l);
         if (g_r_brake_ratio) XPLMSetDataf(g_r_brake_ratio, want_r);
@@ -572,28 +640,51 @@ static float TaxiAssistLoop(float, float, int, void*) {
             // Engage edge: find the yaw axis so the yield can watch the
             // pilot's actual hardware.
             g_yaw_axis = -1;
+            g_brake_axis_l = -1;
+            g_brake_axis_r = -1;
             if (g_joy_axis_assignments) {
                 int assign[500];
                 const int n = XPLMGetDatavi(g_joy_axis_assignments, assign, 0, 500);
                 for (int i = 0; i < n; ++i) {
-                    if (assign[i] == kAxisYaw) { g_yaw_axis = i; break; }
+                    if (assign[i] == kAxisYaw && g_yaw_axis < 0) g_yaw_axis = i;
+                    if (assign[i] == kAxisBrakeL && g_brake_axis_l < 0) g_brake_axis_l = i;
+                    if (assign[i] == kAxisBrakeR && g_brake_axis_r < 0) g_brake_axis_r = i;
                 }
             }
             g_steer_engage_frames = 0;
             g_yaw_deflect_frames = 0;
+            g_brake_deflect_frames = 0;
             g_taxi_steer_applied = true;
         }
         const float yaw = yaw_axis_value();
+        const float brk_l = brake_axis_value(g_brake_axis_l);
+        const float brk_r = brake_axis_value(g_brake_axis_r);
         if (g_steer_engage_frames < kYieldArmFrames) {
             // Not armed yet: the baseline keeps following the axis, so the
             // pedals settling after engage become the neutral, not a press.
             ++g_steer_engage_frames;
             g_yaw_axis_baseline = yaw;
-        } else if (g_yaw_axis >= 0 && yaw >= 0.0f
-                   && std::fabs(yaw - g_yaw_axis_baseline) > kYawYieldDelta) {
-            if (++g_yaw_deflect_frames >= kYieldHoldFrames) g_steer_yield = 1;
+            g_brake_axis_baseline_l = brk_l;
+            g_brake_axis_baseline_r = brk_r;
         } else {
-            g_yaw_deflect_frames = 0;
+            if (g_yaw_axis >= 0 && yaw >= 0.0f
+                && std::fabs(yaw - g_yaw_axis_baseline) > kYawYieldDelta) {
+                if (++g_yaw_deflect_frames >= kYieldHoldFrames) g_steer_yield = 1;
+            } else {
+                g_yaw_deflect_frames = 0;
+            }
+            // Toe-brake pedals, for the pilot who has them: the same
+            // baseline-and-hold shape, yielding the BRAKES, not the steering.
+            const bool brk_moved =
+                (g_brake_axis_l >= 0 && brk_l >= 0.0f
+                 && std::fabs(brk_l - g_brake_axis_baseline_l) > kBrakeYieldDelta)
+                || (g_brake_axis_r >= 0 && brk_r >= 0.0f
+                    && std::fabs(brk_r - g_brake_axis_baseline_r) > kBrakeYieldDelta);
+            if (brk_moved && g_brake_hold_for_steer) {
+                if (++g_brake_deflect_frames >= kYieldHoldFrames) g_brake_yield = 1;
+            } else {
+                g_brake_deflect_frames = 0;
+            }
         }
         if (!g_steer_yield) {
             if (g_override_heading) XPLMSetDatai(g_override_heading, 1);
@@ -608,7 +699,10 @@ static float TaxiAssistLoop(float, float, int, void*) {
         g_taxi_steer_applied = false;
     }
     // Writes stopped (the app saw the latch, or died): re-arm for next time.
-    if (!steer_fresh) g_steer_yield = 0;
+    if (!steer_fresh) {
+        g_steer_yield = 0;
+        g_brake_yield = 0;
+    }
 
     // The pitch channel: same freshness, same yield discipline, the yoke
     // instead of the pedals.
@@ -946,6 +1040,16 @@ void start() {
         "xcopilot/steer_yield", xplmType_Int, 0,
         ReadSteerYield, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_brake_yield_dref = XPLMRegisterDataAccessor(
+        "xcopilot/brake_yield", xplmType_Int, 0,
+        ReadBrakeYield, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    for (int i = 0; i < 4; ++i) {
+        g_brake_cmds[i] = XPLMFindCommand(kBrakeCmdNames[i]);
+        if (g_brake_cmds[i]) {
+            XPLMRegisterCommandHandler(g_brake_cmds[i], BrakeCommandHandler, 1, nullptr);
+        }
+    }
     g_pitch_dref = XPLMRegisterDataAccessor(
         "xcopilot/pitch", xplmType_Float, 1,
         nullptr, nullptr, ReadPitch, WritePitch, nullptr, nullptr,
@@ -1016,6 +1120,13 @@ void stop_first() {
     }
     if (g_taxi_steer_dref) { XPLMUnregisterDataAccessor(g_taxi_steer_dref); g_taxi_steer_dref = nullptr; }
     if (g_steer_yield_dref) { XPLMUnregisterDataAccessor(g_steer_yield_dref); g_steer_yield_dref = nullptr; }
+    if (g_brake_yield_dref) { XPLMUnregisterDataAccessor(g_brake_yield_dref); g_brake_yield_dref = nullptr; }
+    for (int i = 0; i < 4; ++i) {
+        if (g_brake_cmds[i]) {
+            XPLMUnregisterCommandHandler(g_brake_cmds[i], BrakeCommandHandler, 1, nullptr);
+            g_brake_cmds[i] = nullptr;
+        }
+    }
     if (g_pitch_dref) { XPLMUnregisterDataAccessor(g_pitch_dref); g_pitch_dref = nullptr; }
     if (g_pitch_yield_dref) { XPLMUnregisterDataAccessor(g_pitch_yield_dref); g_pitch_yield_dref = nullptr; }
     if (g_terrain_query_dref) { XPLMUnregisterDataAccessor(g_terrain_query_dref); g_terrain_query_dref = nullptr; }

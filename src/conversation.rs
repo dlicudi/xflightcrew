@@ -416,6 +416,19 @@ impl Conversation {
         })
     }
 
+    /// The words of the last state question answered, while its topic is
+    /// fresh: what "there" refers to in "remind me when we get there".
+    pub fn recent_observation_query(&self, now: Instant) -> Option<String> {
+        match &self.topic {
+            Some((Evidence::Observation { query, .. }, at))
+                if now.duration_since(*at) <= TOPIC_TTL =>
+            {
+                Some(query.clone())
+            }
+            _ => None,
+        }
+    }
+
     pub fn observe(&mut self, query: &str, line: &str, now: Instant) {
         self.topic = Some((
             Evidence::Observation {
@@ -704,6 +717,43 @@ fn knowledge(t: &str) -> Option<(&'static str, &'static str)> {
             "I can explain recorded reports and recheck supported readings. Open-ended questions outside those rules need an explicit supported answer."),
         _ => return None,
     })
+}
+
+/// Resolve "there" in a reminder against the last navigation answer:
+/// "remind me when we get there" after "how long to the next waypoint" is a
+/// next-waypoint reminder; after a top-of-descent answer it is a TOD one.
+/// Returns the rewritten utterance, or `None` when nothing needs resolving
+/// (no "there", an explicit target already named, or no fresh nav topic).
+/// A destination answer has no reminder the tool can arm, so it stays
+/// unresolved and the reminder grammar's own reply names what it can do.
+pub fn resolve_there(text: &str, topic_query: Option<&str>) -> Option<String> {
+    let t = words(text);
+    let toks: Vec<&str> = t.split(' ').collect();
+    let reminder = ["remind", "wake", "notify", "tell", "know", "heads"]
+        .iter()
+        .any(|w| toks.contains(w));
+    if !reminder || !toks.contains(&"there") {
+        return None;
+    }
+    let explicit = ["waypoint", "fix", "descent", "tod", "feet", "minutes", "minute", "altitude"]
+        .iter()
+        .any(|w| toks.contains(w));
+    if explicit {
+        return None;
+    }
+    let topic = topic_query?;
+    let target = if topic.contains("waypoint") || topic.contains("fix") || topic.contains("how far") {
+        "the next waypoint"
+    } else if topic.contains("descent") || topic.contains("tod") {
+        "top of descent"
+    } else {
+        return None;
+    };
+    let rewritten: Vec<&str> = toks
+        .iter()
+        .map(|w| if *w == "there" { target } else { *w })
+        .collect();
+    Some(rewritten.join(" "))
 }
 
 pub fn status_answer(managers: &[String]) -> String {
@@ -1023,5 +1073,34 @@ mod tests {
         assert!(say(c.respond("back to altitude", now)).contains("3500 feet"));
         c.clear();
         assert!(!say(c.respond("back to altitude", now)).contains("3500"));
+    }
+
+    #[test]
+    fn there_resolves_against_the_last_navigation_answer() {
+        let now = Instant::now();
+        let mut c = Conversation::default();
+        assert!(resolve_there("remind me when we get there", None).is_none());
+        c.observe("How long till next waypoint?", "Next waypoint PIMOS, 18 miles, 18 minutes.", now);
+        let topic = c.recent_observation_query(now);
+        assert_eq!(topic.as_deref(), Some("how long till next waypoint"));
+        assert_eq!(
+            resolve_there("remind me when we get there", topic.as_deref()).as_deref(),
+            Some("remind me when we get the next waypoint")
+        );
+        // An explicit target is left alone; so is a reminder with no "there".
+        assert!(resolve_there("remind me when we get to the next waypoint", topic.as_deref()).is_none());
+        assert!(resolve_there("remind me in ten minutes", topic.as_deref()).is_none());
+        // Top of descent as the topic.
+        c.observe("when is top of descent", "About 20 minutes to top of descent, 30 miles ahead.", now);
+        assert_eq!(
+            resolve_there("wake me when we get there", c.recent_observation_query(now).as_deref()).as_deref(),
+            Some("wake me when we get top of descent")
+        );
+        // A destination ETA has no reminder to arm: unresolved, on purpose.
+        c.observe("how long shall we get to arrival", "About 41 minutes to LEMG.", now);
+        assert!(resolve_there("remind me when we get there", c.recent_observation_query(now).as_deref()).is_none());
+        // The topic expires with the conversation's own TTL.
+        c.observe("how far to the next fix", "Next waypoint PIMOS, 5 miles.", now);
+        assert!(c.recent_observation_query(now + TOPIC_TTL + Duration::from_secs(1)).is_none());
     }
 }

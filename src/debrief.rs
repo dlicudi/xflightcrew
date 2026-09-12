@@ -168,7 +168,11 @@ fn summarise(flight: &[&Value]) -> String {
         let ev = s(e, "event");
         let stage = s(e, "stage");
         let t = hms(f(e, "t").unwrap_or(0.0));
-        if kind == "autoland" && e.get("rwy").is_some() {
+        // An autoland TICK: the runway and no event name. Labelled autoland
+        // events carry a runway too (the final report), and rendered as an
+        // arming they read "13 from 5.0 nm, 0 ft radio, 0 kt, phase " (LEMG,
+        // 2026-09-12).
+        if kind == "autoland" && e.get("rwy").is_some() && e.get("event").is_none() {
             let rwy = s(e, "rwy");
             let now = f(e, "t").unwrap_or(0.0);
             let fresh = last_autoland
@@ -189,7 +193,21 @@ fn summarise(flight: &[&Value]) -> String {
         let line = match (kind.as_str(), ev.as_str()) {
             ("crash", _) => Some(format!("CRASH at {:.0} ft", f(e, "alt").unwrap_or(0.0))),
             ("full_auto", _) => Some(format!("full auto: {stage}{}", detail(e))),
-            ("autoland", "going_around") => Some(format!("GO-AROUND at {:.0} ft radio", f(e, "radio").unwrap_or(0.0))),
+            ("autoland", "going_around") => {
+                let mut l = format!("GO-AROUND at {:.0} ft radio", f(e, "radio").unwrap_or(0.0));
+                if let Some(why) = e.get("why").and_then(|v| v.as_str()) {
+                    l.push_str(&format!(": {}", why.replace('_', " ")));
+                }
+                if let Some(x) = f(e, "xtk_m") {
+                    l.push_str(&format!(", {:.0} m {} of the centreline", x.abs(), if x < 0.0 { "left" } else { "right" }));
+                }
+                Some(l)
+            }
+            ("autoland", "final_report") => Some(format!(
+                "final report: runway {}, {:.1} nm",
+                s(e, "rwy"),
+                f(e, "dist").unwrap_or(0.0)
+            )),
             ("autoland", "ordered_go_around") => Some("go-around ORDERED by the tower".into()),
             ("autoland", "give_up") => Some(format!("autoland gave up: {}", s(e, "reason"))),
             ("autoland", "approach_ias_floored") => Some(format!(
@@ -198,6 +216,15 @@ fn summarise(flight: &[&Value]) -> String {
                 f(e, "floor").unwrap_or(0.0)
             )),
             ("autoland", "rolling_handoff") => Some("landed, rolling handoff to the taxi-in".into()),
+            ("autoland", "forced_runway_missing") => Some(format!(
+                "autoland could not find the planned runway {}, self-picked by track",
+                s(e, "id")
+            )),
+            ("autoland", "runway_from_clearance") => Some(format!(
+                "autoland took the CLEARED runway {} over the planned {}",
+                s(e, "cleared"),
+                s(e, "planned")
+            )),
             ("speedhold", "target_floored") => Some(format!(
                 "speed target {:.0} raised to the airframe floor {:.0}",
                 f(e, "asked").unwrap_or(0.0),
@@ -288,7 +315,8 @@ mod tests {
             r#"{"kind":"autoland","rwy":"LXGB 09","dist":1.47,"radio":660.0,"ias":128.0,"phase":"Final","t":1360.0}"#,
             r#"{"kind":"autoland","rwy":"LXGB 09","dist":1.45,"radio":655.0,"ias":127.0,"phase":"Final","t":1361.0}"#,
             r#"{"kind":"callout","id":"airspeed_warning","msg":"Airspeed.","sev":"Warning","t":1401.0}"#,
-            r#"{"kind":"autoland","event":"going_around","radio":95.0,"t":1500.0}"#,
+            r#"{"kind":"autoland","event":"going_around","radio":95.0,"why":"off_centreline_low","xtk_m":-37.7,"t":1500.0}"#,
+            r#"{"kind":"autoland","event":"final_report","rwy":"09","dist":4.99,"t":1501.0}"#,
             r#"{"kind":"state","t":1503.0,"alt":114.0,"agl":77.0,"ias":101.0,"gs":96.0,"ground":false,"vsi":-259.0}"#,
             r#"{"kind":"crash","lat":36.148,"lon":-5.358,"alt":113.6,"t":1504.0}"#,
             r#"{"kind":"state","t":1505.0,"alt":110.0,"agl":0.0,"ias":0.0,"gs":0.0,"ground":true,"vsi":-900.0}"#,
@@ -302,7 +330,8 @@ mod tests {
         assert!(r.contains("airspeed_warning x1"), "{r}");
         assert!(r.contains("into the VOID"), "{r}");
         assert!(r.contains("raised to the airframe floor 78"), "{r}");
-        assert!(r.contains("GO-AROUND at 95 ft radio"), "{r}");
+        assert!(r.contains("GO-AROUND at 95 ft radio: off centreline low, 38 m left of the centreline"), "{r}");
+        assert!(r.contains("final report: runway 09, 5.0 nm"), "{r}");
         assert_eq!(r.matches("autoland armed").count(), 1, "one arming, not one per tick: {r}");
         assert!(r.contains("autoland armed: LXGB 09 from 1.5 nm, 660 ft radio, 128 kt, phase Final"), "{r}");
         assert!(r.contains("CRASH at 114 ft"), "{r}");

@@ -325,6 +325,7 @@ impl Registry {
                     // custom cycle-switch piston sequence (the DC-3, whose
                     // mixture is xlua-overridden so it declares no `engine`).
                     piston_engine: profile.engine || profile.piston_start.is_some(),
+                    piston_mixture: profile.engine,
                     turboprop_start: profile.turboprop_start.clone(),
                     all_electrical_on_cmds: all_electrical_on_cmds(&profile.electrical),
                     all_electrical_toggles: all_electrical_toggles(&profile.electrical),

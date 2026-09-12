@@ -2045,6 +2045,7 @@ async fn try_published_arrival(
             apt_dat: apt_dat.clone(),
             cfg,
             approach_ias: ias,
+            rwy_id: Some(rwy_id.clone()),
         };
         crate::procedure::approach_plan_for(
             &cifp, &fixp, &navp, &airport, &icao, &rwy_id, lat, lon, end,

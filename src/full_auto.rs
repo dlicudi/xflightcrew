@@ -156,6 +156,14 @@ pub struct SubTools {
     /// Indicated cruise speed for the enroute cruise-power hold (profile's
     /// `reference.cruise_ias_kts`); `None` leaves cruise at climb power.
     pub cruise_ias_kts: Option<f64>,
+    /// The airframe has a continuous piston mixture lever (the profile's
+    /// `engine` group): full auto arms the mixture manager for the enroute
+    /// leg (full rich below the leaning floor, leaned to peak EGT above it,
+    /// re-trimmed as altitude and power move) and sets full rich for the
+    /// arrival. A turbine, or a notched xlua lever (the DC-3), gets neither:
+    /// the mixture stayed wherever the start left it for the whole flight
+    /// (2026-09-12).
+    pub piston_mixture: bool,
     pub mission: Mission,
     /// Run the electrical/APU power-up before the engine start. Only turbine
     /// True when the airframe declares no start sequence we can fly at all.
@@ -238,6 +246,9 @@ async fn light(tools: &SubTools, ctx: &ToolCtx<'_>, key: &str, on: bool) -> bool
 /// Give up cleanly.
 fn give_up(voice: &Option<Voice>, line: &str, reason: &str) {
     ACTIVE.store(false, SeqCst);
+    // "Your aircraft" means every lever: the mixture manager stands down with
+    // the rest, never quietly re-trimming under the pilot's hand.
+    crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
     event("give_up", json!({ "reason": reason }));
     clear_stage();
     announce(voice, Priority::Caution, line);
@@ -1187,6 +1198,19 @@ async fn fly_route(
             cruise_ias_kts: tools.cruise_ias_kts,
         },
     );
+    // The CLIMB and CRUISE checklists' mixture items, flown rather than read:
+    // the continuous manager keeps it full rich below the leaning floor and
+    // leans to peak EGT above it, re-trimming as the climb and the power
+    // settle. The pilot's hand on the lever, or "my mixture", releases it.
+    if tools.piston_mixture {
+        crate::tools::engine::arm_mixture_manager(config.xplane_base_url.clone());
+        event("mixture_managed", json!({}));
+        announce(
+            voice,
+            Priority::Advisory,
+            "I have the mixture: full rich below three thousand, leaned for cruise.",
+        );
+    }
     // Generous ceiling — ABORT bails out of the wait immediately. The wait
     // works the radio: the tower's after-takeoff handoff is owed a readback,
     // a retune and a check-in.
@@ -1212,6 +1236,20 @@ async fn fly_route(
         return;
     }
     event("enroute_complete", json!({}));
+    // The BEFORE LANDING item: full rich for the arrival, whatever the field
+    // elevation (the manager's own floor would leave a leaned lever over a
+    // high field), before the approach or the visual landing is built.
+    if tools.piston_mixture {
+        match crate::tools::engine::mixture_rich_for_landing(xp).await {
+            Some(moved) => {
+                event("mixture_rich", json!({ "moved": moved }));
+                if moved {
+                    announce(voice, Priority::Advisory, "Mixture full rich.");
+                }
+            }
+            None => event("mixture_rich", json!({ "moved": false, "unread": true })),
+        }
+    }
 
     // --- Arrival: prefer the destination's PUBLISHED approach (the terrain-
     // safe corridor, the circuit's arrival rule); a visual autoland otherwise.
@@ -1585,6 +1623,7 @@ fn build_arrival(
         apt_dat: apt_dat.to_string(),
         cfg,
         approach_ias,
+        rwy_id: Some(rwy_id.clone()),
     };
     let plan = crate::procedure::approach_plan_for(
         cifp, fixp, navp, &airport, dest, &rwy_id, lat, lon, end,
