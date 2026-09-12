@@ -368,7 +368,12 @@ history):
   the pattern issued BEFORE release; forward creep is HELD via the expiring
   brake channel, not failed; `tow_in_progress` is dead (probed 0 while under
   tow), read as evidence only. Trigger is the cleared route's first-leg
-  bearing (nose-in), never a stand database.
+  bearing (nose-in), never a stand database for the DIRECTION; but **a tug
+  is only asked for ON A STAND** (`pushback::on_a_stand`: the nearest
+  apt.dat 1300 row via `party_line::nearest_stand` within 35 m, nose within
+  60° of its parking heading; a field with no stand rows keeps the
+  bearing-only rule) - every restart from an off-route stop mid-taxiway
+  called a tug (LEMG, 2026-09-12).
 - **Taxi in** ([src/taxi_in.rs](src/taxi_in.rs)): VACATE first - completing
   the landing clearance we hold, no call owed, planned by running the
   hold-short trim BACKWARDS (no credit for metres inside the zone; exits

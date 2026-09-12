@@ -332,6 +332,35 @@ pub fn push_delivered(back_m: f64, err_deg: f64, plan: &Plan) -> bool {
         || (back_m >= MIN_BACK_M && !worth_another_pattern(back_m, err_deg, plan))
 }
 
+/// How near a published parking position the aircraft must be, and how
+/// close to its parking heading the nose must point, to count as ON it.
+/// Stands are tens of metres apart and a nose-in aircraft sits within a few
+/// degrees of the painted heading; a taxiway node is neither.
+const STAND_M: f64 = 35.0;
+const STAND_ALIGN_DEG: f64 = 60.0;
+
+/// Is the aircraft parked on a stand, so that a tug is the right tool?
+///
+/// A pushback belongs to a stand. The trigger in [`plan`] only asks whether
+/// the route's first node is behind us, and after an off-route stop it is:
+/// every full-auto restart from the middle of LEMG's Bravo called a tug,
+/// waited minutes for it and pushed the aircraft back down a taxiway
+/// (four times, 2026-09-12). `stand` is the nearest published position
+/// (metres, parking heading); `known` whether the field publishes any. A
+/// field with no stand rows keeps the bearing-only rule (nothing to check
+/// against); one WITH them says no unless we are on one, nose aligned.
+pub fn on_a_stand(stand: Option<(f64, f64)>, psi: f64, known: bool) -> bool {
+    if !known {
+        return true;
+    }
+    match stand {
+        Some((dist_m, heading)) => {
+            dist_m <= STAND_M && angle_diff_deg(heading, psi).abs() <= STAND_ALIGN_DEG
+        }
+        None => false,
+    }
+}
+
 /// Smallest signed angle a−b, degrees, in −180..180.
 fn angle_diff_deg(a: f64, b: f64) -> f64 {
     (a - b + 540.0).rem_euclid(360.0) - 180.0
@@ -984,6 +1013,20 @@ fn r1(v: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tug_is_only_for_a_stand() {
+        use super::on_a_stand;
+        // On the stand, nose along its heading: push.
+        assert!(on_a_stand(Some((12.0, 90.0)), 95.0, true));
+        // Mid-taxiway, nearest stand 120 m off: taxi out instead.
+        assert!(!on_a_stand(Some((120.0, 90.0)), 95.0, true));
+        // Beside a stand but pointing out of it (already turned): no tug.
+        assert!(!on_a_stand(Some((12.0, 90.0)), 260.0, true));
+        // A field with no stand rows keeps the bearing-only rule.
+        assert!(on_a_stand(None, 95.0, false));
+        assert!(!on_a_stand(None, 95.0, true));
+    }
+
     use super::*;
 
     /// Metres east/north of a reference point, as a lat/lon — a flat-earth

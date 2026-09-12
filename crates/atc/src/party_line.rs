@@ -127,6 +127,42 @@ pub fn with_taxi_route<R>(f: impl FnOnce(Option<&TaxiWatch>) -> R) -> R {
 
 /// True when the cleared taxi route is an ARRIVAL to a parking stand — the crew
 /// calls the destination a "stand", not a "holding point".
+/// The nearest parking position (apt.dat 1300 row, any kind) to a point:
+/// metres away, the heading the aircraft parks on, the painted name. `None`
+/// when no station is installed, its network has not loaded, or the field
+/// publishes no stands; [`stands_known`] tells those apart from "none near".
+/// The crew asks this before calling a tug: a pushback belongs to a stand,
+/// and the bearing-only trigger alone called one from the middle of a
+/// taxiway on every restart after an off-route stop (LEMG, 2026-09-12).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StandFix {
+    pub dist_m: f64,
+    pub heading: f64,
+    pub name: String,
+}
+
+pub fn nearest_stand(lat: f64, lon: f64) -> Option<StandFix> {
+    let net = crate::station::taxi_net()?;
+    let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
+    net.stands
+        .iter()
+        .map(|s| {
+            let dx = (s.lon - lon) * m_per_deg_lon;
+            let dy = (s.lat - lat) * 111_320.0;
+            StandFix {
+                dist_m: (dx * dx + dy * dy).sqrt(),
+                heading: s.heading,
+                name: s.name.clone(),
+            }
+        })
+        .min_by(|a, b| a.dist_m.total_cmp(&b.dist_m))
+}
+
+/// Whether the active field publishes any parking positions at all.
+pub fn stands_known() -> bool {
+    crate::station::taxi_net().is_some_and(|n| !n.stands.is_empty())
+}
+
 pub fn taxi_to_stand() -> bool {
     *lock(&TAXI_TO_STAND)
 }

@@ -3734,6 +3734,12 @@ pub fn wake_remaining(runway_ident: &str, now: Instant) -> Option<u64> {
 /// exactly as before.
 static TAXI_NET: Mutex<Option<std::sync::Arc<nav::TaxiNet>>> = Mutex::new(None);
 
+/// The loaded taxi network, for the party line's stand accessor. `None`
+/// until the background load lands or when the field has none.
+pub(crate) fn taxi_net() -> Option<std::sync::Arc<nav::TaxiNet>> {
+    TAXI_NET.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// The taxi route the pilot is CLEARED on — published by the reply path
 /// when a taxi clearance is issued, consumed by the compliance watch (ATC's
 /// off-route challenge) and the copilot's progressive taxi guide (the crew

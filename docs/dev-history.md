@@ -4,6 +4,28 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## A tug from the middle of a taxiway — 2026-09-12
+
+"It seems we are using the tug sometimes without reason." Four full-auto
+restarts on the SR22, each from wherever the last taxi had stood down
+(mid-Bravo, 25 m off route), each one "We're nose in. Calling for
+pushback." and a two-to-three-minute wait for a tug to push the aircraft
+back down a taxiway. The trigger (`pushback::plan`) asks one question:
+is the route's first node more than 100 degrees off the nose? After an
+off-route stop it usually is, because the tower re-plans from the nearest
+node, which is behind. The trigger never asked whether we were on a
+stand.
+
+Now it does. `party_line::nearest_stand` reads the loaded taxi network's
+apt.dat 1300 rows (any kind: gate, tie-down, misc), and
+`pushback::on_a_stand` says yes only within 35 m of one with the nose
+within 60 degrees of its parking heading; a field with no stand rows keeps
+the old rule. Off a stand with the way out behind, full auto says so
+("not on a stand, so no tug, I'll turn us round under our own steam"),
+blackboxes `pushback_skipped`, and the taxi join does the turn, which it
+was built for. The direction of a push still comes from the route, never
+from the stand database.
+
 ## The SR22 weave — 2026-09-12
 
 "Oscillating taxi on SR22": the LiveTraffic trail down LEMG's Bravo was a

@@ -796,7 +796,33 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             let path = crate::party_line::with_taxi_route(|r| r.map(|w| w.path.clone()))
                 .unwrap_or_default();
             if let (Ok(lat), Ok(lon), Ok(psi)) = (lat_r, lon_r, psi_r) {
-                if let Some(plan) = crate::pushback::plan(lat, lon, psi, &path) {
+                let plan = crate::pushback::plan(lat, lon, psi, &path);
+                let stand = crate::party_line::nearest_stand(lat, lon);
+                let at_stand = crate::pushback::on_a_stand(
+                    stand.as_ref().map(|s| (s.dist_m, s.heading)),
+                    psi,
+                    crate::party_line::stands_known(),
+                );
+                if plan.is_some() && !at_stand {
+                    // The way out is behind us but this is not a stand: a
+                    // restart from an off-route stop, mid-taxiway. The taxi
+                    // join turns the aircraft round; a tug here is theatre.
+                    announce(
+                        &voice,
+                        Priority::Advisory,
+                        "Way out's behind us, but we're not on a stand, so no tug. \
+                         I'll turn us round under our own steam. Watch the wingtips.",
+                    );
+                    event(
+                        "pushback_skipped",
+                        json!({
+                            "why": "not_on_stand",
+                            "stand": stand.as_ref().map(|s| s.name.clone()),
+                            "dist_m": stand.as_ref().map(|s| s.dist_m),
+                        }),
+                    );
+                }
+                if let Some(plan) = plan.filter(|_| at_stand) {
                     announce(
                         &voice,
                         Priority::Advisory,
