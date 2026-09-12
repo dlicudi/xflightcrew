@@ -1,10 +1,13 @@
 // ---- FMS route loading ------------------------------------------------------
 // The app writes the SimBrief route into xcopilot/fms/route as
 // "IDENT,lat,lon,alt|IDENT,lat,lon,alt|...", then writes 1 to xcopilot/fms/load
-// to build it in the GPS/FMS (only the plugin can, via XPLMNavigation).
+// to build it in the GPS/FMS (only the plugin can, via XPLMNavigation). In
+// flight it writes "IDENT,lat,lon" to xcopilot/fms/goto to sequence the plan.
 
 #include "fms.h"
 
+#include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,8 +19,10 @@
 
 static TextRef g_fms_route = {{0}, 0};
 static int g_fms_load = 0;
+static TextRef g_fms_goto = {{0}, 0};
 static XPLMDataRef g_fms_route_dref = nullptr;
 static XPLMDataRef g_fms_load_dref = nullptr;
+static XPLMDataRef g_fms_goto_dref = nullptr;
 
 // Parse the app's payload into points, without navaid resolution — cheap enough
 // to run on every route write; the Route tab renders straight from this.
@@ -164,6 +169,84 @@ static void load_fms_route() {
     XPLMDebugString(msg);
 }
 
+// ---- Sequencing -------------------------------------------------------------
+// The app's follower steers on the heading bug and never flies GPS mode, so the
+// sim's own FMS sat on entry 1 for a whole flight while the aircraft was five
+// fixes on (LXGB-LEMG, 2026-09-12): the GPS page, the G1000 readouts and every
+// gps_* dataref described a fix long behind. The follower now writes
+// "IDENT,lat,lon" into xcopilot/fms/goto each time it captures a fix; the entry
+// is found among the LOADED plan's entries (whoever loaded it), by ident first,
+// nearest to the position among namesakes, else the nearest entry within a mile
+// (a bare lat/lon point has no ident), and becomes the destination on both the
+// legacy GPS plan and the native FMS plan. No match changes nothing: approach
+// legs are not in the enroute plan and must not drag the destination around.
+
+static double approx_nm(double lat1, double lon1, double lat2, double lon2) {
+    const double dlat = (lat2 - lat1) * 60.0;
+    const double dlon = (lon2 - lon1) * 60.0 * std::cos((lat1 + lat2) * 0.5 * M_PI / 180.0);
+    return std::sqrt(dlat * dlat + dlon * dlon);
+}
+
+static bool ident_eq(const char* a, const char* b) {
+    for (;; ++a, ++b) {
+        const int ca = std::toupper(static_cast<unsigned char>(*a));
+        const int cb = std::toupper(static_cast<unsigned char>(*b));
+        if (ca != cb) return false;
+        if (ca == 0) return true;
+    }
+}
+
+// The entry the payload names, or -1. Pure over the entry table so it can be
+// reasoned about without the sim: ident match wins, distance breaks ties, and a
+// nameless payload or an unmatched ident falls back to proximity only.
+static int find_fms_entry(const char* ident, double lat, double lon) {
+    const int n = XPLMCountFMSEntries();
+    int best = -1;
+    double best_nm = 1e9;
+    bool best_named = false;
+    for (int i = 0; i < n; ++i) {
+        XPLMNavType type = xplm_Nav_Unknown;
+        char id[256] = {0};
+        XPLMNavRef ref = XPLM_NAV_NOT_FOUND;
+        int alt = 0;
+        float la = 0.0f, lo = 0.0f;
+        XPLMGetFMSEntryInfo(i, &type, id, &ref, &alt, &la, &lo);
+        const double d = approx_nm(lat, lon, la, lo);
+        const bool named = ident[0] != '\0' && ident_eq(id, ident);
+        if (named && !best_named) {
+            best = i; best_nm = d; best_named = true;
+        } else if (named == best_named && d < best_nm) {
+            best = i; best_nm = d;
+        }
+    }
+    if (best < 0) return -1;
+    if (!best_named && best_nm > 1.0) return -1;
+    return best;
+}
+
+static void WriteFmsGoto(void*, void* in, int offset, int len) {
+    StoreText(&g_fms_goto, in, offset, len);
+    char buf[sizeof g_fms_goto.buf];
+    std::strncpy(buf, g_fms_goto.buf, sizeof buf);
+    buf[sizeof buf - 1] = '\0';
+    char* save = nullptr;
+    char* ident = strtok_r(buf, ",", &save);
+    char* slat = strtok_r(nullptr, ",", &save);
+    char* slon = strtok_r(nullptr, ",", &save);
+    if (!ident || !slat || !slon) return;
+    const int i = find_fms_entry(ident, std::atof(slat), std::atof(slon));
+    char msg[160];
+    if (i < 0) {
+        std::snprintf(msg, sizeof msg, "XVoiceLayer plugin: fms/goto %s: no such entry in the loaded plan\n", ident);
+        XPLMDebugString(msg);
+        return;
+    }
+    XPLMSetDestinationFMSEntry(i);
+    XPLMSetDestinationFMSFlightPlanEntry(xplm_Fpl_Pilot_Primary, i);
+    std::snprintf(msg, sizeof msg, "XVoiceLayer plugin: fms/goto %s -> entry %d\n", ident, i);
+    XPLMDebugString(msg);
+}
+
 static int ReadFmsLoad(void*) { return g_fms_load; }
 static void WriteFmsLoad(void*, int v) {
     if (v != 0) {
@@ -183,9 +266,14 @@ void register_datarefs() {
         "xcopilot/fms/load", xplmType_Int, 1,
         ReadFmsLoad, WriteFmsLoad, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_fms_goto_dref = XPLMRegisterDataAccessor(
+        "xcopilot/fms/goto", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteFmsGoto, &g_fms_goto, &g_fms_goto);
 }
 
 void unregister_datarefs() {
+    if (g_fms_goto_dref) { XPLMUnregisterDataAccessor(g_fms_goto_dref); g_fms_goto_dref = nullptr; }
     if (g_fms_load_dref) { XPLMUnregisterDataAccessor(g_fms_load_dref); g_fms_load_dref = nullptr; }
     if (g_fms_route_dref) { XPLMUnregisterDataAccessor(g_fms_route_dref); g_fms_route_dref = nullptr; }
 }

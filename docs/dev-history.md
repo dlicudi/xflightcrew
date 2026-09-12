@@ -4,6 +4,33 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## The follower sequences the FMS — 2026-09-12
+
+"Will the copilot make use of GPS now with a flight plan?" No: the follower
+loads the plan into the sim's FMS so the GPS and CDU display it, then flies
+its own bearing-to-fix on the heading bug and never engages GPS/NAV mode.
+Nothing sequenced the FMS, so the GPS page, the G1000 readouts and every
+`gps_*` dataref described entry 1 from LXGB to LEMG while the aircraft was
+five fixes on; the enroute-questions fix that morning stopped TRUSTING the
+GPS (`procedure::active_leg()` first) without making it true.
+
+Now it is true. `xcopilot/fms/goto` (`plugin/src/fms.cpp`) takes
+`IDENT,lat,lon`, finds the entry among the LOADED plan's entries (whoever
+loaded it; `XPLMCountFMSEntries`/`XPLMGetFMSEntryInfo`): an ident match
+wins, distance breaks ties between namesakes, a nameless payload or an
+unmatched ident falls back to the nearest entry within a mile, and no match
+changes nothing (approach legs are not in the enroute plan and must not
+drag the destination around). The hit becomes the destination on both the
+legacy GPS plan and the native FMS plan, as the load does. The follower
+(`procedure::sequence_fms`) writes it once per leg, the first tick it
+steers at that leg, blackboxed `fms_goto`. Steering is unchanged: heading
+bug, VS dial, altitude preselect. Flying ON the GPS (NAV mode, the sim's
+own CDI, per-airframe HSI source knobs) stays a separate, bigger job.
+
+Installed by remove-and-copy under a running full-auto flight; the plugin
+is not reloaded while `xcopilot/status/auto` is non-empty, so the first
+flight on it is the next sim start or an explicit reload.
+
 ## Full auto and the mixture — 2026-09-12
 
 "When copilot flies flight plan it's not following checklists? And it is

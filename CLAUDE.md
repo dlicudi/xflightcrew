@@ -180,7 +180,12 @@ deterministically, no LLM. FMS injection (the FMS is plugin-only): app writes
 XP11-format plan IN MEMORY (AIRAC stamped from earth_nav.dat), loads via
 `XPLMLoadFMSFlightPlan`, active leg to entry 1. Whole-plan load, not per-entry:
 only a load fills the CDU's ORIGIN/DEST. The plan also feeds the monitor's
-`DESTINATION` and the fuel check.
+`DESTINATION` and the fuel check. **The follower sequences it**: the copilot
+flies the heading bug, never GPS mode, so nothing else moves the FMS; each
+leg the follower first steers at is written as `IDENT,lat,lon` to
+`xcopilot/fms/goto` and the plugin makes the matching loaded entry (ident,
+nearest namesake; a nameless point within a mile) the destination on both
+plans. An ident the plan lacks (an approach leg) changes nothing.
 
 **Local planner** ([src/flightplan.rs](src/flightplan.rs), "plan a flight to
 X" / "divert to X" / a bare "divert" then "to where?"): a DIRECT plan in the

@@ -22,7 +22,8 @@ struct RoutePoint {
 
 namespace fms {
 
-// Register/unregister xcopilot/fms/route and xcopilot/fms/load. Called by
+// Register/unregister xcopilot/fms/route, xcopilot/fms/load and
+// xcopilot/fms/goto (the follower sequencing the loaded plan). Called by
 // drefs::start / drefs::stop_rest at the mailboxes' original slot in the
 // registration sequence.
 void register_datarefs();

@@ -93,6 +93,38 @@ fn publish_leg(leg: Option<ActiveLeg>) {
     *LEG.lock().unwrap_or_else(|e| e.into_inner()) = leg;
 }
 
+/// The plugin's `xcopilot/fms/goto` mailbox: sequences the LOADED plan to the
+/// entry with this ident nearest this position, so the sim's GPS page, the
+/// G1000 readouts and every `gps_*` dataref describe the fix the follower is
+/// actually steering at. The follower flies the heading bug, never GPS mode,
+/// so nothing else sequences the FMS: it sat on entry 1 from LXGB to LEMG
+/// while the aircraft was five fixes on (2026-09-12). An ident the plan does
+/// not hold (an approach leg) changes nothing on the plugin side.
+pub const FMS_GOTO: &str = "xcopilot/fms/goto";
+
+/// The mailbox payload: `IDENT,lat,lon`, six decimals like the route payload.
+pub fn fms_goto_payload(ident: &str, lat: f64, lon: f64) -> String {
+    format!("{},{:.6},{:.6}", ident.trim().to_ascii_uppercase(), lat, lon)
+}
+
+/// Sequence the sim's FMS to the leg's fix. Best effort: no plugin, no plan
+/// loaded, or a fix outside it are all silent (the follower does not need
+/// the FMS to fly).
+async fn sequence_fms(xp: &XPlaneClient, idx: usize, leg: &ProcLeg) {
+    let Some(f) = leg.fix.as_ref() else {
+        return;
+    };
+    if leg.fix_ident.is_empty() {
+        return;
+    }
+    let payload = fms_goto_payload(&leg.fix_ident, f.lat, f.lon);
+    let ok = xp.set_data(FMS_GOTO, payload.as_bytes()).await.is_ok();
+    crate::blackbox::record(
+        "procedure",
+        serde_json::json!({"event": "fms_goto", "idx": idx, "fix": leg.fix_ident, "ok": ok}),
+    );
+}
+
 /// Great-circle distance and, at a usable groundspeed, minutes to the leg's fix.
 pub fn leg_progress(leg: &ActiveLeg, lat: f64, lon: f64, gs_kts: f64) -> (f64, Option<f64>) {
     let dist = crate::nav::haversine_nm(lat, lon, leg.lat, leg.lon);
@@ -576,6 +608,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     }
 
     let mut idx = 0usize;
+    // The FMS is sequenced once per leg, when the follower first steers at it.
+    let mut fms_leg: Option<usize> = None;
     while idx < legs.len() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if ABORT.load(Ordering::SeqCst) {
@@ -622,6 +656,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             lat: f.lat,
             lon: f.lon,
         }));
+        if fms_leg != Some(idx) {
+            fms_leg = Some(idx);
+            sequence_fms(&xp, idx, leg).await;
+        }
 
         // --- Lateral: steer the great-circle track to the fix, wind-crabbed so
         // the AP holds the GROUND track (the circuit's downwind lesson). A
@@ -992,6 +1030,14 @@ mod tests {
             lon,
             alt,
         }
+    }
+
+    #[test]
+    fn fms_goto_payload_is_ident_lat_lon() {
+        assert_eq!(
+            fms_goto_payload(" pimos ", 36.4, -5.1234567),
+            "PIMOS,36.400000,-5.123457"
+        );
     }
 
     #[test]
