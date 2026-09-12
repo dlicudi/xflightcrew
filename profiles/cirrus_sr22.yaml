@@ -109,6 +109,25 @@ flaps:
     - { label: full, spoken: full,          ratio: 1.0, vfe_kts: 110.0 }
 
 # XChecklist file to interpret (GoofyJP, read-only).
+# Taxi steering. The nosewheel CASTORS: the yoke-heading channel (nosewheel
+# + rudder) has only prop wash behind it at taxi speed, and measured over the
+# blackbox the yaw response per unit of steer is 2.3 deg/s here against 12.8
+# on the 172 the shared law was tuned on. Without this block the first LEMG
+# taxi (2026-09-12) held full steer for forty seconds for about one degree
+# per second, then the turn came in late and overshot: a +/-20 m weave down
+# Bravo and a 25 m off-route stand-down. Same plant signature as the SF50,
+# so the same medicine, carried over as a first pass: differential brakes
+# through the plugin channels (the way the real aircraft is steered), a long
+# aim, twice the yaw-rate lead, gentler full-scale, a slew clip. Pace stays
+# the GA default. RE-FLY: if it wanders wide instead of weaving, walk
+# steer_full_deg back first.
+taxi:
+  steer_full_deg: 42.0
+  steer_slew_per_s: 0.8
+  steer_lead_s: 2.0
+  lookahead_s: 9.0
+  brake_steer: true
+
 checklist: checklists/cirrus_sr22.txt
 
 # Lights — datarefs verified against the rustdecks SR22 deck; universal commands.

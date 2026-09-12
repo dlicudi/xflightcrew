@@ -4,6 +4,19 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## The SR22 weave — 2026-09-12
+
+"Oscillating taxi on SR22": the LiveTraffic trail down LEMG's Bravo was a
++/-20 m sine, then a loop at the Golf turn and a 25 m off-route
+stand-down. The blackbox: brakes zero throughout (no `brake_steer`), full
+steer held for forty seconds for about one degree per second of yaw, the
+turn arriving late and overshooting on every cycle. The SR22 profile had
+no `taxi:` block at all; it was steering a castoring nosewheel through
+the rudder channel, the gap the SF50 profile's notes had already named as
+"the same gap the SR22 carries". The SF50's block (differential brakes,
+9 s aim, 2 s lead, 42 degree full-scale, 0.8/s slew) is carried over as a
+first pass, to be judged on the next taxi.
+
 ## The tug that connected and disconnected at once — 2026-09-12
 
 "The tug seems to connect and disconnect almost immediately, and then
