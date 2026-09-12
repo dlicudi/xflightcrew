@@ -205,6 +205,9 @@ enum Mode {
     Taxi,
 }
 static MODE: Mutex<Mode> = Mutex::new(Mode::Flight);
+/// The speed the governor last saw (IAS in flight, groundspeed on the
+/// ground), for the panel's "speed 95 kt (at 93)". NaN until the first tick.
+static ACTUAL: Mutex<f64> = Mutex::new(f64::NAN);
 
 /// One-line status for the dashboard's "managing" panel: what the governor is
 /// chasing, or `None` when it isn't running.
@@ -214,10 +217,16 @@ pub fn status() -> Option<String> {
     }
     let kts = *TARGET_KTS.lock().unwrap_or_else(|e| e.into_inner());
     let mode = *MODE.lock().unwrap_or_else(|e| e.into_inner());
+    let actual = *ACTUAL.lock().unwrap_or_else(|e| e.into_inner());
+    let at = if actual.is_finite() {
+        format!(" (at {actual:.0})")
+    } else {
+        String::new()
+    };
     Some(match mode {
         Mode::Taxi if kts < 1.0 => "holding position".to_string(),
-        Mode::Taxi => format!("taxi {kts:.0} kt"),
-        Mode::Flight => format!("speed {kts:.0} kt"),
+        Mode::Taxi => format!("taxi {kts:.0} kt{at}"),
+        Mode::Flight => format!("speed {kts:.0} kt{at}"),
     })
 }
 
@@ -797,6 +806,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                         None => 0.0,
                     };
                     prev_ias = Some((ias, now_t));
+                    *ACTUAL.lock().unwrap_or_else(|e| e.into_inner()) = ias;
                     let adj = throttle_adjust(target - ias, trend);
                     if adj != 0.0 {
                         let cmd = (thr + adj).clamp(0.0, 1.0);
@@ -925,6 +935,7 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                     }
                     override_pending = false;
                     let gs_kts = gs_ms * MS_TO_KTS;
+                    *ACTUAL.lock().unwrap_or_else(|e| e.into_inner()) = gs_kts;
                     let now_t = std::time::Instant::now();
                     let raw_trend = match prev_gs {
                         Some((last_gs, last_t)) => {

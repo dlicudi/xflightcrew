@@ -4,6 +4,54 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## The Flight tab says what the copilot is doing — 2026-09-12
+
+"Could the Flight tab be more informative of what the copilot is doing?"
+Under full auto enroute it read "FULL AUTO FLIGHT | enroute / flying a
+procedure / speed 95 kt / mixture managed": every sub-manager a bare name,
+nothing about which fix, how far, what altitude it was aiming for, or what
+a wait was waiting on.
+
+Now each loop publishes a detail line from the numbers it already has that
+tick (no new sim reads), through `auto_status::Detail`, folded into its
+`status()` as "name: detail" and cleared by a `DetailGuard` held for the
+loop's whole run so no exit path leaves it stale: the follower "to PIMOS,
+12.3 nm, 6 min, climbing to 5,500 ft" (`leg_detail`); the circuit
+"downwind runway 27, 1,200 ft to 1,500, 75 kt"; the taxi "340 m to go";
+the takeoff "rolling, 45 kt, rotate at 55 kt" / "rotating" / "climbing,
+250 ft, handoff at 300 ft"; the governor "speed 95 kt (at 93)"; and full
+auto's waits ("waiting for the squawk", "the landing traffic to pass",
+"the destination's frequency"), a `waiting()` call before each bounded
+wait, cleared by the next stage event. Two panel-only lines come last and
+are never in the spoken status: "ap: hdg 084, alt 5,500, vs +500" from
+whichever loop drives the AP, and "said: Next, PIMOS." from the voice
+arbiter. Everything is rounded to what a pilot would dial (tenths of a
+mile, whole minutes, 10 ft, 5 kt, 50 fpm) so the change-gated publish is
+not re-sent for jitter. The plugin renders the extra lines as it always
+has (dim, wrapped); no plugin change, so the Health tab and "what are you
+doing?" improve for free.
+
+## The released tug that came back — 2026-09-12
+
+LEMG stand, full auto. The plan needed 138 degrees of swing; one "Nose
+90" delivered 99 and the tug let go at 40.6 off, judged not delivered,
+and the fallback taxi started from there. The stall clock had issued a
+SECOND pattern 0.6 s before the release branch saw the bar off (the
+2026-08-03 guard covers the tick AFTER the bar is seen off, not the one
+before). Seventeen seconds into the taxi the aircraft, at 5 kt with full
+right steer commanded, stopped turning: heading held at 260 for ten
+seconds against a +100 degree error, then ran 25 m off the route and
+full auto gave up "taxi incomplete". Wind calm, yield latches clear,
+plugin steer path symmetric. The one thing left pending was that second
+pushback request, which a tug standing at the nose answers in seconds,
+and X-Plane owns the nosewheel while it is on the bar. The early-return
+path never sent `pushback_stop`; it does now (the completion path always
+did). Evidence for next time: the taxi tick blackboxes `tug`
+(`pushback_attached`, a slow dataref) so the record can say whether the
+tug was on. And a stalled-out give-up holds the brakes at the governor
+until the pilot speaks again; that is by design ("a stage that is not
+moving the aircraft is holding it").
+
 ## The follower sequences the FMS — 2026-09-12
 
 "Will the copilot make use of GPS now with a flight plan?" No: the follower

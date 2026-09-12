@@ -1003,6 +1003,7 @@ impl Voice {
             return;
         }
         let text = text.into();
+        crate::auto_status::note_said(&text);
         self.mirror_to_panel(priority, &text);
         self.enqueue(priority, text, None, false);
     }
@@ -1041,6 +1042,7 @@ impl Voice {
             return;
         }
         let text = crate::phrase::scrub_dashes(&text.into());
+        crate::auto_status::note_said(&text);
         self.push(Utterance {
             priority,
             seq: 0,
@@ -1139,7 +1141,9 @@ impl Voice {
             spoken: Mutex::new(false),
             cv: Condvar::new(),
         });
-        self.enqueue(priority, text.into(), Some(latch.clone()), false);
+        let text = text.into();
+        crate::auto_status::note_said(&text);
+        self.enqueue(priority, text, Some(latch.clone()), false);
         let mut spoken = latch.spoken.lock().unwrap();
         while !*spoken {
             spoken = latch.cv.wait(spoken).unwrap();

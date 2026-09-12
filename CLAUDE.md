@@ -504,7 +504,16 @@ crew on this airframe", never an LLM improvising.
   Route | Settings). Status well fed by `xcopilot/status/auto`
   ([src/auto_status.rs](src/auto_status.rs)), published change-gated from the
   monitor tick with an unconditional resend every 5 ticks (plugin reloads
-  zero the buffers). Buttons inject the same English a pilot would speak
+  zero the buffers). **Every manager line carries its live detail**
+  (`auto_status::Detail`, set by the loop from the numbers it already has,
+  rounded so the feed is not re-sent for jitter, cleared by a `DetailGuard`
+  on every exit): the follower's fix, range, minutes and altitude, the
+  circuit's leg, the taxi's metres to go, the takeoff's sub-stage, full
+  auto's "waiting for the squawk" (`wait_status`, cleared by the next stage
+  event), the governor's target against the actual. Two panel-only lines
+  follow the managers and are never spoken: the AP targets (`set_ap_targets`,
+  bug/alt/VS as dialled) and the crew's last spoken line (`note_said`, from
+  `Voice::alert`/`say`). Buttons inject the same English a pilot would speak
   (`REQUEST_PHRASES`, grammar-test-pinned so a button never reaches the LLM);
   CANCEL is picked per what's running at PRESS time and ALWAYS aborts
   something ("my controls" fallback). Presses ride the typed-command queue,

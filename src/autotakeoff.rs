@@ -248,10 +248,14 @@ pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static REJECT: AtomicBool = AtomicBool::new(false);
 
 /// One-line status for the dashboard's "managing" panel.
+/// The takeoff's live line for the panel: the roll with its speed against
+/// Vr, the rotation, the climb against the handoff height.
+pub static DETAIL: crate::auto_status::Detail = crate::auto_status::Detail::new();
+
 pub fn status() -> Option<String> {
     ACTIVE
         .load(Ordering::Relaxed)
-        .then(|| "auto takeoff".to_string())
+        .then(|| DETAIL.line("auto takeoff"))
 }
 
 /// Everything the loop needs, resolved by the arming tool from the profile.
@@ -907,6 +911,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut airborne = false;
     let mut rotated = false;
     let mut ap_engaged = false;
+    let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     let mut gear_raised = !p.retract_gear;
     let mut positive_called = false;
     let mut thr_challenged = false;
@@ -1107,6 +1112,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 .await;
                 return;
             }
+            if !rotated {
+                DETAIL.set(format!(
+                    "rolling, {} kt, rotate at {} kt",
+                    (ias / 5.0).round() * 5.0,
+                    p.vr_kts.round()
+                ));
+            }
             crate::blackbox::record(
                 "autotakeoff",
                 serde_json::json!({
@@ -1128,6 +1140,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // aircraft sideways off the strip.
             if !rotated && ias >= p.vr_kts && rotate_ok(err, remaining) {
                 rotated = true;
+                DETAIL.set("rotating");
                 alert(&voice, Priority::Advisory, "Rotate.");
                 crate::blackbox::record(
                     "autotakeoff",
@@ -1274,6 +1287,12 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let _ = xp.run_command(CMD_VS_MODE).await;
             last_vs_cmd = None;
         }
+        DETAIL.set(format!(
+            "climbing, {} ft, handoff at {} ft",
+            (agl_ft / 50.0).round() * 50.0,
+            p.handoff_agl_ft.max(AP_ENGAGE_AGL_FT + 50.0).round()
+        ));
+        crate::auto_status::set_ap_targets(None, None, Some(vs));
         crate::blackbox::record(
             "autotakeoff",
             serde_json::json!({"event": "climb", "ias": ias, "agl": agl_ft, "cmd_vs": vs}),

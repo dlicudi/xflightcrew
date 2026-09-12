@@ -79,6 +79,11 @@ const LEFT_BRAKE: &str = "xcopilot/taxi_brake_l";
 const RIGHT_BRAKE: &str = "xcopilot/taxi_brake_r";
 /// The plugin's pilot-feet latch: 1 = the yaw axis moved, override dropped.
 const STEER_YIELD: &str = "xcopilot/steer_yield";
+/// The tug on the bar, blackboxed per tick as EVIDENCE only: the taxi that
+/// followed an early tug release could not turn right for fifteen seconds
+/// and the record could not say whether a re-summoned tug had hooked back
+/// on (LEMG, 2026-09-12). A slow dataref, so the read is nearly free.
+const TUG_ATTACHED: &str = "sim/aircraft/overflow/pushback_attached";
 const MS_TO_KTS: f64 = 1.943_844;
 const M_PER_NM: f64 = 1852.0;
 
@@ -270,10 +275,14 @@ pub fn driving() -> bool {
 pub static LAST_ARRIVED: AtomicBool = AtomicBool::new(false);
 
 /// One-line status for the dashboard's "managing" panel.
+/// The taxi's live line for the panel: metres left to the stop point,
+/// rounded to ten so the feed is not re-sent every tick.
+pub static DETAIL: crate::auto_status::Detail = crate::auto_status::Detail::new();
+
 pub fn status() -> Option<String> {
     ACTIVE
         .load(Ordering::Relaxed)
-        .then(|| "auto taxi".to_string())
+        .then(|| DETAIL.line("auto taxi"))
 }
 
 /// The cleared route, pre-digested into the local flat-earth frame the
@@ -1272,6 +1281,7 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 /// within a second by silence alone; the explicit zero write on the way out
 /// is just politeness.
 async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f64) {
+    let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     tracing::info!("auto taxi started");
     crate::blackbox::record(
         "autotaxi",
@@ -1361,13 +1371,15 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // One read burst, not a chain: sequential HTTP awaits stretched the
         // takeoff tick to half a second and bought a slew-limit weave
         // (sortie four) — the same medicine here keeps the steer tick honest.
-        let (yield_r, lat_r, lon_r, psi_r, gs_r) = tokio::join!(
+        let (yield_r, lat_r, lon_r, psi_r, gs_r, tug_r) = tokio::join!(
             xp.get_float(STEER_YIELD),
             xp.get_float(LAT),
             xp.get_float(LON),
             xp.get_float(PSI_TRUE),
             xp.get_float(GS_MS),
+            xp.get_float(TUG_ATTACHED),
         );
+        let tug_on = tug_r.is_ok_and(|v| v > 0.5);
         // The pilot's feet moved the yaw axis: the plugin already dropped
         // the override — stand the loop down and keep the speed hold, which
         // is the pre-existing "you steer, I have the throttle" division.
@@ -1405,6 +1417,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         };
         let lateral = offset.abs();
         let remaining = route.remaining(progress);
+        DETAIL.set(format!("{} m to go", (remaining.max(0.0) / 10.0).round() as i64 * 10));
         // Steering error first: the join state and the guard both need it.
         // The aim is capped by what's LEFT of the route: near the stop the
         // pursuit point must walk the path through the final corner, not
@@ -1582,7 +1595,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
                 // question when the pilot can see the line.
                 "event": "drive", "gs": gs_kts, "err": err, "yaw_dps": yaw_rate,
                 "steer": steer, "lat_m": offset, "remaining_m": remaining,
-                "bs": bs_on, "bl": bl, "br": br,
+                "bs": bs_on, "bl": bl, "br": br, "tug": tug_on,
             }),
         );
         let steer_write = if route.pace.brake_steer {

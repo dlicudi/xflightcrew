@@ -785,6 +785,16 @@ async fn run_inner(
             // Failing here immediately hands the fallback taxi four hundred
             // wasted seconds back.
             let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
+            // Nothing left PENDING in the sim: the stall clock can issue a
+            // second pattern in the very tick before this branch sees the
+            // bar off (0.6 s apart at Malaga, 2026-08-03 and again
+            // 2026-09-12), and a pushback request the tug has not yet
+            // answered summons it back. Standing at the nose it re-hooks in
+            // seconds, and X-Plane then owns the nosewheel: the fallback
+            // taxi that followed the 2026-09-12 release could not turn
+            // right at all and ran 25 m off the route. Stop is the only
+            // word that cancels a request; the completion path sends it too.
+            send(ctx, "stop").await;
             return Err("tug_released".into());
         }
         // On the bar but going nowhere: ask again, once. The first command

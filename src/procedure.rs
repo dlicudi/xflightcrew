@@ -132,11 +132,43 @@ pub fn leg_progress(leg: &ActiveLeg, lat: f64, lon: f64, gs_kts: f64) -> (f64, O
     (dist, mins)
 }
 
+/// The follower's live line for the panel: the fix, the miles and minutes
+/// to it, and the altitude it is flying toward. Set every tick from the
+/// loop's own numbers, cleared with the loop.
+pub static DETAIL: crate::auto_status::Detail = crate::auto_status::Detail::new();
+
 /// One-line status for the dashboard's "managing" panel.
 pub fn status() -> Option<String> {
     ACTIVE
         .load(Ordering::Relaxed)
-        .then(|| "flying a procedure".to_string())
+        .then(|| DETAIL.line("flying a procedure"))
+}
+
+/// "to PIMOS, 12.3 nm, 6 min, climbing to 5,500 ft". A to-altitude leg has
+/// no fix and no range; within 100 ft of the target the aircraft is level.
+/// Ranges to a tenth, minutes whole, altitude to 10 ft: rounded so the
+/// change-gated panel feed is not re-sent for jitter.
+pub fn leg_detail(fix: &str, dist_nm: Option<f64>, gs_kts: f64, alt_ft: f64, want_alt: f64) -> String {
+    let mut parts = Vec::new();
+    if !fix.is_empty() {
+        parts.push(format!("to {fix}"));
+    }
+    if let Some(d) = dist_nm {
+        parts.push(format!("{d:.1} nm"));
+        if gs_kts > 20.0 {
+            parts.push(format!("{:.0} min", d / gs_kts * 60.0));
+        }
+    }
+    let alt = crate::auto_status::commas((want_alt / 10.0).round() as i64 * 10);
+    let diff = want_alt - alt_ft;
+    parts.push(if diff.abs() < 100.0 {
+        format!("level at {alt} ft")
+    } else if diff > 0.0 {
+        format!("climbing to {alt} ft")
+    } else {
+        format!("descending to {alt} ft")
+    });
+    parts.join(", ")
 }
 
 /// Cancel an active procedure and stand down whatever sub-loop is flying;
@@ -554,6 +586,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         cruise_ias_kts,
     } = plan;
     let handoff = handoff_index(&legs);
+    let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     crate::blackbox::record(
         "procedure",
         serde_json::json!({"event": "armed", "name": name, "legs": legs.len(), "approach": matches!(end, EndAction::Approach{..})}),
@@ -736,6 +769,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             let _ = xp.set_float(VS_DIAL, vs_cmd).await;
             last_vs_cmd = Some(vs_cmd);
         }
+        DETAIL.set(leg_detail(&leg.fix_ident, dist_nm, gs_kts, alt_ft, want_alt));
+        crate::auto_status::set_ap_targets(Some(bug_mag), Some(want_alt), Some(vs_cmd));
 
         crate::blackbox::record(
             "procedure",
@@ -1030,6 +1065,19 @@ mod tests {
             lon,
             alt,
         }
+    }
+
+    #[test]
+    fn leg_detail_reads_like_a_progress_line() {
+        assert_eq!(
+            leg_detail("PIMOS", Some(12.34), 120.0, 4820.0, 5497.0),
+            "to PIMOS, 12.3 nm, 6 min, climbing to 5,500 ft"
+        );
+        assert_eq!(leg_detail("", None, 0.0, 5480.0, 5500.0), "level at 5,500 ft");
+        assert_eq!(
+            leg_detail("BLN", Some(3.0), 10.0, 6000.0, 3000.0),
+            "to BLN, 3.0 nm, descending to 3,000 ft"
+        );
     }
 
     #[test]

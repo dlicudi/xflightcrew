@@ -665,10 +665,28 @@ pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static ABORT: AtomicBool = AtomicBool::new(false);
 
 /// One-line status for the dashboard's "managing" panel.
+/// The circuit's live line for the panel: the leg, the runway, the altitude
+/// against the pattern target and the speed. Set every tick, cleared with
+/// the loop.
+pub static DETAIL: crate::auto_status::Detail = crate::auto_status::Detail::new();
+
 pub fn status() -> Option<String> {
     ACTIVE
         .load(Ordering::Relaxed)
-        .then(|| "auto circuit".to_string())
+        .then(|| DETAIL.line("auto circuit"))
+}
+
+/// "downwind runway 27, 1,200 ft to 1,500, 75 kt"; the speed is left out
+/// while the read has not come in.
+pub fn circuit_detail(leg: Leg, rwy_id: &str, alt_ft: f64, target_alt_ft: f64, ias: f64) -> String {
+    let leg = format!("{leg:?}").to_lowercase();
+    let alt = crate::auto_status::commas((alt_ft / 10.0).round() as i64 * 10);
+    let tgt = crate::auto_status::commas((target_alt_ft / 10.0).round() as i64 * 10);
+    let mut s = format!("{leg} runway {rwy_id}, {alt} ft to {tgt}");
+    if ias.is_finite() {
+        s.push_str(&format!(", {} kt", (ias / 5.0).round() * 5.0));
+    }
+    s
 }
 
 /// Radio calls the copilot makes on our behalf during the circuit — the ONE
@@ -1572,6 +1590,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     let mag_var = xp.get_float(MAG_VAR).await.unwrap_or(0.0);
 
     let mut leg = Leg::Upwind;
+    let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     // The dial's CURRENT value seeds the slew (the takeoff left it near the
     // runway heading); every subsequent write moves it the short way only.
     let mut bug_mag = match xp.get_float(HDG_BUG).await {
@@ -1926,6 +1945,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             }
         }
 
+        DETAIL.set(circuit_detail(leg, &rwy_id, alt_msl_ft, target_alt, ias_now));
+        crate::auto_status::set_ap_targets(Some(bug_mag), Some(target_alt), Some(vs_cmd));
         crate::blackbox::record(
             "circuit",
             serde_json::json!({

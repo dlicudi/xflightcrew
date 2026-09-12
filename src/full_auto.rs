@@ -59,6 +59,7 @@ fn clear_stage() {
     if let Ok(mut s) = STAGE.lock() {
         s.clear();
     }
+    WAIT.clear();
     if let Ok(mut m) = MISSION.lock() {
         *m = "";
     }
@@ -211,10 +212,28 @@ fn announce(voice: &Option<Voice>, priority: Priority, line: &str) {
     }
 }
 
+/// What the current stage is waiting on ("the squawk", "the landing
+/// traffic to pass"), for the panel; cleared by the next stage event.
+static WAIT: crate::auto_status::Detail = crate::auto_status::Detail::new();
+
+fn waiting(what: &str) {
+    WAIT.set(what);
+}
+
+/// The panel line under the stage: "waiting for the squawk", or `None`.
+pub fn wait_status() -> Option<String> {
+    if !ACTIVE.load(SeqCst) {
+        return None;
+    }
+    let w = WAIT.get();
+    (!w.is_empty()).then(|| format!("waiting for {w}"))
+}
+
 fn event(stage: &str, detail: serde_json::Value) {
     if let Ok(mut s) = STAGE.lock() {
         *s = stage.replace('_', " ");
     }
+    WAIT.clear();
     crate::blackbox::record("full_auto", json!({ "stage": stage, "detail": detail }));
 }
 
@@ -519,6 +538,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         }
         // The starter cranks before it catches — for seconds on a piston, for
         // minutes on the jet's two-engine bleed-air sequence.
+        waiting("the engine to catch");
         if !wait_until(tools.engine_start_secs, 500, || engine_running(&xp)).await {
             give_up(
                 &voice,
@@ -634,6 +654,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             event("request_clearance", json!({}));
             // The tower answers with a discrete squawk; wait for it, then dial it
             // into the transponder and read it back — the crew's clearance copy.
+            waiting("the squawk");
             wait_until(30.0, 500, || async {
                 crate::party_line::assigned_squawk().is_some()
             })
@@ -741,6 +762,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // berating us for sitting on its runway). Whatever this number
             // is, a queued frequency will someday beat it by a second; 180
             // outlasts two worked arrivals.
+            waiting("a taxi route");
             let got = wait_until(180.0, 1000, || async {
                 crate::party_line::with_taxi_route(|r| r.is_some())
             })
@@ -856,6 +878,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // Wait for the drive to finish. `driving()`, not ACTIVE: a backtrack
         // drops ACTIVE in the gap between its two legs, and polling the bare
         // flag reads that gap as "finished".
+        waiting("the taxi to arrive");
         if crate::autotaxi::driving()
             && !wait_until(600.0, 1000, || async { !crate::autotaxi::driving() }).await
         {
@@ -970,6 +993,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                     "Behind the landing traffic. Waiting for it to pass.",
                 );
                 event("line_up_behind_wait", json!({}));
+                waiting("the landing traffic to pass");
                 if !wait_until(LINE_UP_BEHIND_SECS, 500, || async {
                     crate::party_line::line_up_condition_clear() != Some(false)
                 })
@@ -999,6 +1023,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // `driving()` covers the gap between a backtrack's two legs —
             // ACTIVE alone drops there, and full auto called a running line-up
             // a failure one second after leg two engaged (2026-07-28).
+            waiting("the taxi to arrive");
             if crate::autotaxi::driving()
                 && !wait_until(600.0, 1000, || async { !crate::autotaxi::driving() }).await
             {
@@ -1154,6 +1179,7 @@ async fn fly_route(
         );
         return;
     }
+    waiting("the takeoff");
     if !wait_until(360.0, 1000, || async {
         !crate::autotakeoff::ACTIVE.load(Relaxed)
     })
@@ -1309,6 +1335,7 @@ async fn fly_route(
         // the void, and Gibraltar's zone watch challenged the arrival as an
         // unknown aircraft (12:36Z, 2026-09-11). The swap is distance-driven
         // and due about now; wait for it, bounded, and call either way.
+        waiting("the destination's frequency");
         let swapped = wait_until(INBOUND_SWAP_WAIT_SECS, 500, || async {
             crate::party_line::home_tower_khz() == Some(khz)
         })
@@ -1358,6 +1385,7 @@ async fn fly_route(
     // moment autoland takes the approach (the FAF handoff, or straight away on
     // the visual). Nothing left to actuate here — the arrival loops own the
     // aircraft — so this watch is the orchestrator's last duty.
+    waiting("the arrival to hand to autoland");
     let called = wait_until(1800.0, 1000, || async {
         crate::autoland::ACTIVE.load(Relaxed) || !crate::procedure::ACTIVE.load(Relaxed)
     })
@@ -1419,6 +1447,7 @@ async fn taxi_in_after_landing(
         // wait holding full auto for its whole 900 s (audit, 2026-08-02).
         // The mission is alive while any of its flyers is: the circuit, the
         // published approach it may escalate to, or autoland itself.
+        waiting("the landing to arm");
         wait_until(ARM_WAIT_SECS, 1000, || async {
             crate::autoland::ACTIVE.load(Relaxed)
                 || !(crate::circuit::ACTIVE.load(Relaxed) || crate::procedure::ACTIVE.load(Relaxed))
@@ -1447,6 +1476,7 @@ async fn taxi_in_after_landing(
     // fresh start (EGHI, 2026-08-02). Consumed by the rollout; cleared below
     // if the landing never happens, so it cannot go stale.
     crate::autoland::VACATE_FOLLOWS.store(true, Relaxed);
+    waiting("the landing");
     let landed = wait_until(1800.0, 1000, || async {
         !crate::autoland::ACTIVE.load(Relaxed)
     })
@@ -1652,6 +1682,7 @@ async fn request_departure(voice: &Option<Voice>, callsign: &Option<String>) {
     );
     crate::circuit::transmit(crate::circuit::radio_call(callsign, "ready for departure"));
     event("request_departure", json!({}));
+    waiting("departure clearance");
     wait_until(20.0, 1000, || async {
         matches!(
             crate::party_line::clearance_state(),
