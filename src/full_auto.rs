@@ -890,9 +890,17 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         }
         bail_if_abort!();
 
-        // Drive the cleared route to the holding point.
-        let taxi_lit = light(&tools, &ctx, "taxi", true).await;
-        event("lights_taxi", json!({ "on": taxi_lit }));
+        // Drive the cleared route to the holding point. The taxi light, or
+        // on an airframe that has none the landing light: the SR22 carries
+        // only nav, strobe and landing, and the taxi ran dark because the
+        // "taxi" key was declared nowhere (2026-09-12). That is how the real
+        // aircraft is taxied at night; it goes off at the stand with the rest.
+        let (taxi_key, taxi_lit) = if tools.lights.declares("taxi") {
+            ("taxi", light(&tools, &ctx, "taxi", true).await)
+        } else {
+            ("landing", light(&tools, &ctx, "landing", true).await)
+        };
+        event("lights_taxi", json!({ "on": taxi_lit, "light": taxi_key }));
         announce(
             &voice,
             Priority::Advisory,

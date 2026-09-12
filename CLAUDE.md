@@ -412,6 +412,9 @@ history):
   gaps during backtracks), refuses to arm airborne (names the tools that
   fly), and both missions end with `taxi_in_after_landing`. Cruise power is a
   SPEED from the profile (`reference.cruise_ias_kts`), never SimBrief's.
+  Lights follow the practice: taxi light for the taxi (the landing light
+  on an airframe that declares no taxi light, the SR22), strobes and
+  landing lights only once lined up, all three off at the stand.
   **The arrival is briefed at the gate** (`full_auto::brief_arrival` in the
   arming ack: published approach, straight-in, or "I'll land visually"; a
   destination the data lacks is refused there) - found 25 nm out it was a

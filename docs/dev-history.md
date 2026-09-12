@@ -4,6 +4,19 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## The SR22 has no taxi light — 2026-09-12
+
+"When taxi should we use landing lights?" Not on a taxiway; the taxi light
+is for the taxi and the landing lights go on lined up, which is what full
+auto did. Except: "SR22 does not have a taxi light switch." True, the
+profile declares nav, strobe and landing only (the .acf has one landing
+lite), so `light("taxi")` returned false and the SR22 taxied dark, silently.
+Full auto now uses the landing light for the taxi on any airframe that
+declares no taxi light, which is how a Cirrus is taxied at night, and the
+stand shutdown already turns it off. Still owed, all airframes: landing
+lights off and taxi light on at the vacate, landing lights for a runway
+crossing on the taxi route, and off in the climb.
+
 ## A tug from the middle of a taxiway — 2026-09-12
 
 "It seems we are using the tug sometimes without reason." Four full-auto
