@@ -9,19 +9,24 @@
 //!     Its own queue and speaker thread; station utterances are serialized
 //!     among themselves.
 //!
-//! The two channels CAN overlap — a controller transmitting while the copilot
-//! talks is how a real cockpit sounds. Realism priority is crew discipline,
-//! not audio ducking: the intercom defers *starting* a routine line (anything
-//! below `Warning`) while the radio is on the air, and the perishable
-//! `stale_by` machinery drops what expired waiting. Urgent callouts (stall,
-//! terrain — `Warning`) break through immediately: a real copilot talks over
-//! the radio when you're about to die. The one thing that silences BOTH
+//! The two channels are mixed, not ducked — both reach the headset, as in a
+//! real cockpit. Realism priority is crew discipline: the intercom defers
+//! *starting* a routine line (anything below `Warning`) while the radio is
+//! on the air, and a routine line already in progress STOPS mid-word when a
+//! transmission starts and its remainder is queued to follow once the
+//! frequency is quiet ([`interrupt_intercom_for_radio`] — a crew stops and
+//! listens before it knows whether the call is for them). The perishable
+//! `stale_by` machinery drops what expired waiting, remainders included.
+//! Urgent callouts (stall, terrain — `Warning`) break through immediately
+//! and are never stepped on: a real copilot talks over the radio when you're
+//! about to die. The one thing that silences BOTH
 //! channels is a PTT press (`set_hold` / the barge-in `shutup`) — mic
 //! hygiene: on speakers, any voice still playing bleeds into the capture.
 //!
-//! Priority orders each *queue*, not interruption: a higher-priority utterance
-//! jumps ahead of whatever is still waiting, but never cuts off speech already
-//! playing on its own channel. Within a priority, order is FIFO.
+//! Priority orders each *queue*: a higher-priority utterance jumps ahead of
+//! whatever is still waiting, but never cuts off speech already playing on
+//! its own channel (only the radio going on air does that, above). Within a
+//! priority, order is FIFO.
 //!
 //! Two ways to speak:
 //!   - [`Voice::say`]   — blocking. The command loop must not resume listening
@@ -148,6 +153,7 @@ fn station_person(model: &str, slot: usize, seed: usize) -> u64 {
 pub use crate::speaker::{station_voice_seed, StationSpeaker};
 
 /// One-shot latch a blocking caller waits on until its utterance is spoken.
+#[derive(Default)]
 struct Latch {
     spoken: Mutex<bool>,
     cv: Condvar,
@@ -312,6 +318,124 @@ struct Utterance {
     stale_by: Option<Instant>,
     /// Present for blocking callers; signalled once the utterance is spoken.
     done: Option<Arc<Latch>>,
+    /// Already-rendered audio to play INSTEAD of synthesising `text`: the
+    /// remainder of a line the radio stepped on (see
+    /// [`interrupt_intercom_for_radio`]). `text` stays for the echo memory.
+    resume: Option<Resume>,
+}
+
+/// The rest of a stepped-on intercom line, from just before the cut.
+#[derive(Clone)]
+struct Resume {
+    samples: Arc<Vec<f32>>,
+    rate: u32,
+}
+
+/// What the intercom is saying right now: enough to step on it and come back
+/// to it. `audio` is the rendered line (the warm ONNX path); the subprocess
+/// voices have no buffer, so a stepped-on line of theirs is said again whole.
+/// `done` is the blocking caller's latch, which the REMAINDER inherits: a
+/// caller is released when the sentence is finished, not when it was cut.
+struct IntercomPlay {
+    priority: Priority,
+    audio: Option<Resume>,
+    started: Instant,
+    text: String,
+    cabin: bool,
+    done: Option<Arc<Latch>>,
+}
+
+/// Back up this far before the cut when resuming, so the word that was
+/// interrupted is heard whole ("...as I was saying").
+const RESUME_LEAD_S: f64 = 0.4;
+/// Less than this much of the line left past the cut is not worth coming
+/// back for: the sentence was effectively finished.
+const RESUME_MIN_LEFT_S: f64 = 0.4;
+/// A stepped-on remainder that has waited this long is stale: the moment
+/// has passed, and a fragment out of context is worse than silence.
+const RESUME_STALE_S: u64 = 20;
+
+/// The sample range to resume from: `elapsed` into a line of `len` samples at
+/// `rate`, less the lead-in. `None` when the line had effectively finished.
+fn resume_range(len: usize, rate: u32, elapsed: std::time::Duration) -> Option<std::ops::Range<usize>> {
+    let played = (elapsed.as_secs_f64() * rate as f64) as usize;
+    let lead = (RESUME_LEAD_S * rate as f64) as usize;
+    let min_left = (RESUME_MIN_LEFT_S * rate as f64) as usize;
+    (played + min_left < len).then_some(played.saturating_sub(lead)..len)
+}
+
+/// Does a transmission starting now step on a line of this priority? Routine
+/// lines yield, the way a crew stops mid-word to listen; a Warning (stall,
+/// terrain) does not, because the radio can wait and the ground cannot.
+fn radio_interrupts(priority: Priority) -> bool {
+    priority < Priority::Warning
+}
+
+/// Push onto the intercom queue from anywhere that holds the arbiter.
+fn push_intercom(inner: &Inner, mut utt: Utterance) {
+    let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+    utt.seq = q.seq;
+    q.seq += 1;
+    q.heap.push(utt);
+    drop(q);
+    inner.cv.notify_one();
+}
+
+/// The radio has just gone on the air: a routine intercom line in progress
+/// stops mid-word, and its remainder is queued to be said once the frequency
+/// is quiet — the crew discipline a real cockpit has. Before this the copilot
+/// talked through a transmission it had started a second earlier; the
+/// arbiter only ever gated what STARTS (2026-09-11). The remainder rides the
+/// normal queue, so the same deferral and expiry apply, and a PTT press or a
+/// second call can step on it again.
+fn interrupt_intercom_for_radio(inner: &Inner) {
+    let taken = {
+        let mut playing = inner
+            .intercom_playing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match playing.as_ref() {
+            Some(p) if radio_interrupts(p.priority) => playing.take(),
+            _ => None,
+        }
+    };
+    let Some(p) = taken else {
+        return;
+    };
+    tts::stop_channel(tts::Channel::Intercom);
+    // What is owed: the rendered remainder; the whole line again when there
+    // was no buffer; nothing when the sentence was effectively finished.
+    let owed = match &p.audio {
+        Some(a) => resume_range(a.samples.len(), a.rate, p.started.elapsed()).map(|r| {
+            Some(Resume {
+                samples: Arc::new(a.samples[r].to_vec()),
+                rate: a.rate,
+            })
+        }),
+        None => Some(None),
+    };
+    match owed {
+        Some(resume) => {
+            tracing::info!(text = %p.text, resumed = resume.is_some(), "radio stepped on the intercom; remainder queued");
+            push_intercom(
+                inner,
+                Utterance {
+                    priority: p.priority,
+                    seq: 0,
+                    text: p.text,
+                    chime: false,
+                    negative: false,
+                    station: None,
+                    cabin: p.cabin,
+                    stale_by: Some(Instant::now() + std::time::Duration::from_secs(RESUME_STALE_S)),
+                    done: p.done,
+                    resume,
+                },
+            );
+        }
+        // Finished bar the tail: the caller is released now, not never.
+        None => fire_latch(p.done),
+    }
 }
 
 // Order by priority (higher first), then by *earlier* seq first. BinaryHeap is a
@@ -351,6 +475,9 @@ struct Inner {
     radio_queue: Mutex<Queue>,
     /// Signalled when radio work is queued or on hold release.
     radio_cv: Condvar,
+    /// The intercom line in progress, for the radio to step on (see
+    /// [`interrupt_intercom_for_radio`]); `None` between lines.
+    intercom_playing: Mutex<Option<IntercomPlay>>,
     /// Which channels are speaking right now (intercom, radio). The mic gate
     /// is the OR of the two; the intercom's crew discipline reads the radio
     /// flag to defer routine lines while a station is on the air.
@@ -470,6 +597,7 @@ impl Voice {
             station_local: Mutex::new(Vec::new()),
             hold: std::sync::atomic::AtomicBool::new(false),
             now_playing: Mutex::new(None),
+            intercom_playing: Mutex::new(None),
             tuned_station: Mutex::new(None),
             com1_known: std::sync::atomic::AtomicBool::new(false),
             radio_powered: std::sync::atomic::AtomicBool::new(true),
@@ -791,6 +919,7 @@ impl Voice {
             station: None,
             cabin: false,
             stale_by: None,
+            resume: None,
             done,
         });
     }
@@ -813,6 +942,7 @@ impl Voice {
             station: Some(speaker),
             cabin: false,
             stale_by: None,
+            resume: None,
             done,
         });
     }
@@ -821,17 +951,15 @@ impl Voice {
     /// FIFO seq under the lock): station utterances go to the radio, everything
     /// else to the intercom. The single enqueue chokepoint for speech and tones.
     fn push(&self, mut utt: Utterance) {
-        let (queue, cv) = if utt.station.is_some() {
-            (&self.inner.radio_queue, &self.inner.radio_cv)
-        } else {
-            (&self.inner.queue, &self.inner.cv)
-        };
-        let mut q = queue.lock().unwrap();
+        if utt.station.is_none() {
+            return push_intercom(&self.inner, utt);
+        }
+        let mut q = self.inner.radio_queue.lock().unwrap();
         utt.seq = q.seq;
         q.seq += 1;
         q.heap.push(utt);
         drop(q);
-        cv.notify_one();
+        self.inner.radio_cv.notify_one();
     }
 
     /// Play the negative tone (no speech) and block until it finishes — the
@@ -852,6 +980,7 @@ impl Voice {
             station: None,
             cabin: false,
             stale_by: None,
+            resume: None,
             done: Some(latch.clone()),
         });
         let mut spoken = latch.spoken.lock().unwrap();
@@ -921,6 +1050,7 @@ impl Voice {
             station: None,
             cabin: false,
             stale_by: Some(stale_by),
+            resume: None,
             done: None,
         });
     }
@@ -949,6 +1079,7 @@ impl Voice {
             station: None,
             cabin: true,
             stale_by: None,
+            resume: None,
             done: Some(latch.clone()),
         });
         let mut spoken = latch.spoken.lock().unwrap();
@@ -974,6 +1105,7 @@ impl Voice {
             station: None,
             cabin: true,
             stale_by: None,
+            resume: None,
             done: None,
         });
     }
@@ -1249,11 +1381,31 @@ impl Speaker {
         Speaker::Subprocess(Box::new(config))
     }
 
-    fn speak(&mut self, text: &str) -> anyhow::Result<()> {
+    /// Speak `text`. The warm ONNX path renders first and hands the buffer to
+    /// `on_start` before playback, so the arbiter can step on the line and
+    /// resume its remainder; the subprocess voices have no buffer to offer.
+    /// `on_start` returns whether to go ahead and play: a line stepped on
+    /// during its own render has already been re-queued whole, and playing
+    /// this copy too would be the double speech the step-on exists to stop.
+    fn speak(
+        &mut self,
+        text: &str,
+        on_start: impl FnOnce(Arc<Vec<f32>>, u32) -> bool,
+    ) -> anyhow::Result<()> {
         match self {
-            Speaker::Subprocess(config) => tts::speak(config, text),
+            Speaker::Subprocess(config) => {
+                let _ = on_start;
+                tts::speak(config, text)
+            }
             #[cfg(feature = "onnx-tts")]
-            Speaker::Onnx(engine) => engine.speak(text),
+            Speaker::Onnx(engine) => {
+                let rate = engine.sample_rate();
+                let samples = Arc::new(engine.render_with(text, |_, _| {})?);
+                if !on_start(samples.clone(), rate) {
+                    return Ok(());
+                }
+                tts::play_pcm(&samples, rate)
+            }
         }
     }
 
@@ -1448,13 +1600,61 @@ fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         } else {
             &mut speaker
         };
-        let spoke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| who.speak(&utt.text)))
-            .unwrap_or_else(|panic| Err(anyhow::anyhow!("TTS panicked: {}", panic_text(panic))));
+        // What is playing, for the radio to step on: registered before the
+        // subprocess voices start (no buffer, so a re-say), replaced with the
+        // rendered buffer when the ONNX path hands it over. The record holds
+        // the caller's latch; whoever finishes the sentence fires it.
+        let gen_at_start = tts::channel_generation(tts::Channel::Intercom);
+        let register = |audio: Option<Resume>| {
+            *inner
+                .intercom_playing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(IntercomPlay {
+                priority: utt.priority,
+                audio,
+                started: Instant::now(),
+                text: utt.text.clone(),
+                cabin: utt.cabin,
+                done: utt.done.clone(),
+            });
+        };
+        let spoke = match &utt.resume {
+            Some(r) => {
+                register(Some(r.clone()));
+                tts::play_pcm(&r.samples, r.rate)
+            }
+            None => {
+                register(None);
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    who.speak(&utt.text, |samples, rate| {
+                        // Stepped on during the render: the interrupt has
+                        // already queued this line again whole. Don't play
+                        // this copy under the transmission as well.
+                        if tts::channel_generation(tts::Channel::Intercom) != gen_at_start {
+                            return false;
+                        }
+                        register(Some(Resume { samples, rate }));
+                        true
+                    })
+                }))
+                .unwrap_or_else(|panic| Err(anyhow::anyhow!("TTS panicked: {}", panic_text(panic))))
+            }
+        };
+        // Off the intercom. A record still here means the line finished and
+        // the latch is ours to fire; none means the radio stepped on it and
+        // the remainder now carries the latch.
+        let finished = inner
+            .intercom_playing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Err(e) = spoke {
             log_tts_err("TTS", e);
         }
         remember_spoken(inner, &utt.text);
-        fire_latch(utt.done);
+        if let Some(rec) = finished {
+            fire_latch(rec.done);
+        }
     }
 }
 
@@ -1508,6 +1708,7 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         }
 
         set_channel_speaking(inner, &gate, true, true);
+        interrupt_intercom_for_radio(inner);
         // A panicking station voice is demoted to the `say` fallback for the
         // rest of the session (same catch_unwind rationale as the intercom).
         let seed = inner
@@ -1654,6 +1855,7 @@ mod tests {
             station: None,
             cabin: false,
             stale_by: None,
+            resume: None,
             done: None,
         }
     }
@@ -1813,6 +2015,7 @@ mod tests {
             station_local: Mutex::new(Vec::new()),
             hold: std::sync::atomic::AtomicBool::new(false),
             now_playing: Mutex::new(None),
+            intercom_playing: Mutex::new(None),
             tuned_station: Mutex::new(None),
             com1_known: std::sync::atomic::AtomicBool::new(false),
             radio_powered: std::sync::atomic::AtomicBool::new(true),
@@ -1970,6 +2173,91 @@ mod tests {
         assert_eq!(voice.inner.radio_queue.lock().unwrap().heap.len(), 1);
         voice.set_hold(false);
         crate::mode::set(crate::mode::Mode::Both);
+    }
+
+    #[test]
+    fn a_radio_call_steps_on_a_routine_line_and_the_remainder_is_queued() {
+        // The remainder starts a lead-in before the cut and runs to the end.
+        let r = resume_range(5 * 22_050, 22_050, std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(r.start, (1.6 * 22_050.0) as usize);
+        assert_eq!(r.end, 5 * 22_050);
+        // Cut with nothing worth saying left: nothing owed.
+        assert!(resume_range(5 * 22_050, 22_050, std::time::Duration::from_secs(5)).is_none());
+        assert!(radio_interrupts(Priority::Advisory) && radio_interrupts(Priority::Caution));
+        assert!(!radio_interrupts(Priority::Warning), "a warning talks over the radio");
+
+        // Live: an advisory two seconds into a five-second line when the
+        // tower keys up. The line is cut and its remainder queued, perishable.
+        let inner = bare_inner();
+        let latch = Arc::new(Latch::default());
+        *inner.intercom_playing.lock().unwrap() = Some(IntercomPlay {
+            priority: Priority::Advisory,
+            audio: Some(Resume {
+                samples: Arc::new(vec![0.1_f32; 5 * 22_050]),
+                rate: 22_050,
+            }),
+            started: Instant::now() - std::time::Duration::from_secs(2),
+            text: "fuel's balanced, both tanks even".into(),
+            cabin: false,
+            done: Some(latch.clone()),
+        });
+        interrupt_intercom_for_radio(&inner);
+        assert!(inner.intercom_playing.lock().unwrap().is_none(), "stepped on");
+        let q = inner.queue.lock().unwrap();
+        let utt = q.heap.peek().expect("the remainder is queued");
+        assert_eq!(utt.priority, Priority::Advisory);
+        let r = utt.resume.as_ref().expect("a rendered tail, not a re-say");
+        assert!((r.samples.len() as f64 - 3.4 * 22_050.0).abs() < 100.0, "{}", r.samples.len());
+        assert!(utt.stale_by.is_some(), "a fragment out of context expires");
+        assert!(utt.done.is_some(), "the caller waits for the remainder");
+        assert!(!*latch.spoken.lock().unwrap(), "not released on the cut");
+        drop(q);
+
+        // A warning in progress is not touched.
+        *inner.intercom_playing.lock().unwrap() = Some(IntercomPlay {
+            priority: Priority::Warning,
+            audio: None,
+            started: Instant::now(),
+            text: "airspeed".into(),
+            cabin: false,
+            done: None,
+        });
+        interrupt_intercom_for_radio(&inner);
+        assert!(inner.intercom_playing.lock().unwrap().is_some(), "warnings are not stepped on");
+        assert_eq!(inner.queue.lock().unwrap().heap.len(), 1);
+
+        // A subprocess voice has no buffer: the line is said again whole.
+        *inner.intercom_playing.lock().unwrap() = Some(IntercomPlay {
+            priority: Priority::Readback,
+            audio: None,
+            started: Instant::now(),
+            text: "flaps ten".into(),
+            cabin: true,
+            done: None,
+        });
+        interrupt_intercom_for_radio(&inner);
+        let q = inner.queue.lock().unwrap();
+        assert_eq!(q.heap.len(), 2);
+        let again = q.heap.iter().find(|u| u.text == "flaps ten").expect("re-said");
+        assert!(again.resume.is_none() && again.cabin);
+        drop(q);
+
+        // Cut with only the tail left: nothing owed, and the caller is released.
+        let latch = Arc::new(Latch::default());
+        *inner.intercom_playing.lock().unwrap() = Some(IntercomPlay {
+            priority: Priority::Advisory,
+            audio: Some(Resume {
+                samples: Arc::new(vec![0.1_f32; 22_050]),
+                rate: 22_050,
+            }),
+            started: Instant::now() - std::time::Duration::from_secs(1),
+            text: "done".into(),
+            cabin: false,
+            done: Some(latch.clone()),
+        });
+        interrupt_intercom_for_radio(&inner);
+        assert_eq!(inner.queue.lock().unwrap().heap.len(), 2, "nothing more queued");
+        assert!(*latch.spoken.lock().unwrap(), "released: the sentence was finished");
     }
 
     #[test]
