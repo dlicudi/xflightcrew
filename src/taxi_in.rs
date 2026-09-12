@@ -258,6 +258,11 @@ async fn vacate(
         // "runway vacated" before the request is exactly the order.
         let callsign = crate::circuit::crew_callsign(xp).await;
         crate::circuit::transmit(crate::circuit::radio_call(&callsign, "runway vacated"));
+        // Off the runway: landing lights off, taxi light on, by the shared
+        // rule (an airframe with only a landing lamp keeps it after dusk).
+        let dark = crate::tools::lights::dark_now(xp).await;
+        let did = crate::tools::lights::after_vacate(xp, dark).await;
+        crate::blackbox::record("taxi_in", json!({ "event": "lights_vacated", "did": did, "dark": dark }));
     }
 }
 

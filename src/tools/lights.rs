@@ -15,6 +15,154 @@ use sim::xplane::XPlane;
 use super::{Tool, ToolCtx};
 use crate::aircraft::LightProfile;
 
+/// The active airframe's landing and taxi lights, the two the ground and
+/// climb stages switch. Process-wide, so it is republished on EVERY profile
+/// swap, including to an empty set, never merely set when an airframe
+/// happens to have them (the transponder knob's lesson, 2026-07-27).
+#[derive(Clone, Debug, Default)]
+pub struct Exterior {
+    pub landing: Option<LightProfile>,
+    pub taxi: Option<LightProfile>,
+}
+
+static EXTERIOR: std::sync::Mutex<Exterior> = std::sync::Mutex::new(Exterior {
+    landing: None,
+    taxi: None,
+});
+
+/// Publish the active airframe's exterior set. Called from the one place
+/// the live profile changes.
+pub fn publish_exterior(lights: &[LightProfile]) {
+    let pick = |key: &str| lights.iter().find(|l| l.key.eq_ignore_ascii_case(key)).cloned();
+    *EXTERIOR.lock().unwrap_or_else(|e| e.into_inner()) = Exterior {
+        landing: pick("landing"),
+        taxi: pick("taxi"),
+    };
+}
+
+fn exterior() -> Exterior {
+    EXTERIOR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The sun's elevation; a slow dataref (see the sim crate's list).
+pub const SUN_PITCH: &str = "sim/graphics/scenery/sun_pitch_degrees";
+
+/// Dusk or dark right now, for the light stages. A failed read is DARK:
+/// lights on is the side to err on when the answer is unknown.
+pub async fn dark_now(xp: &dyn XPlane) -> bool {
+    match xp.get_float(SUN_PITCH).await {
+        Ok(p) => crate::cockpit_auto::dusk_or_dark(p),
+        Err(_) => true,
+    }
+}
+
+/// Which light taxis this airframe: its taxi light; failing that its landing
+/// light after dusk (the SR22 carries only a landing lamp, and that is how a
+/// Cirrus is taxied at night); by day, none.
+pub fn taxi_light_for(ext: &Exterior, dark: bool) -> Option<LightProfile> {
+    ext.taxi.clone().or_else(|| dark.then(|| ext.landing.clone()).flatten())
+}
+
+pub fn taxi_light(dark: bool) -> Option<LightProfile> {
+    taxi_light_for(&exterior(), dark)
+}
+
+/// The light for a runway crossing (and for being on the runway at all): the
+/// landing light, unless it is already doing the taxi light's job tonight,
+/// in which case the crossing changes nothing.
+pub fn crossing_light_for(ext: &Exterior, dark: bool) -> Option<LightProfile> {
+    let landing = ext.landing.clone()?;
+    let landing_is_taxi = ext.taxi.is_none() && dark;
+    (!landing_is_taxi).then_some(landing)
+}
+
+pub fn crossing_light(dark: bool) -> Option<LightProfile> {
+    crossing_light_for(&exterior(), dark)
+}
+
+/// Runway vacated: what to switch. Both lights: taxi on, landing off. Only a
+/// landing light: it stays on as the taxi light after dusk, goes off by day.
+/// Returned as (landing, taxi) wants, `None` = leave alone.
+pub fn after_vacate_for(ext: &Exterior, dark: bool) -> (Option<bool>, Option<bool>) {
+    match (&ext.landing, &ext.taxi) {
+        (Some(_), Some(_)) => (Some(false), Some(true)),
+        (Some(_), None) => (Some(dark), None),
+        (None, Some(_)) => (None, Some(true)),
+        (None, None) => (None, None),
+    }
+}
+
+/// Apply [`after_vacate_for`] to the aircraft. Returns what was switched.
+pub async fn after_vacate(xp: &dyn XPlane, dark: bool) -> Value {
+    let ext = exterior();
+    let (landing, taxi) = after_vacate_for(&ext, dark);
+    let mut did = serde_json::Map::new();
+    if let (Some(on), Some(l)) = (landing, ext.landing.as_ref()) {
+        did.insert("landing".into(), json!(apply(xp, l, on).await.is_ok() && on));
+    }
+    if let (Some(on), Some(l)) = (taxi, ext.taxi.as_ref()) {
+        did.insert("taxi".into(), json!(apply(xp, l, on).await.is_ok() && on));
+    }
+    Value::Object(did)
+}
+
+/// Switch the landing light, if this airframe declares one. `false` when it
+/// does not or the write failed.
+pub async fn landing(xp: &dyn XPlane, on: bool) -> bool {
+    match exterior().landing {
+        Some(l) => apply(xp, &l, on).await.is_ok(),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod exterior_tests {
+    use super::*;
+
+    fn lp(key: &str) -> LightProfile {
+        LightProfile {
+            key: key.into(),
+            spoken: key.into(),
+            dataref: format!("sim/test/{key}"),
+            command_on: None,
+            command_off: None,
+            also_datarefs: Vec::new(),
+            toggles: Vec::new(),
+            auto_at_night: false,
+        }
+    }
+    fn both() -> Exterior {
+        Exterior { landing: Some(lp("landing")), taxi: Some(lp("taxi")) }
+    }
+    fn sr22() -> Exterior {
+        Exterior { landing: Some(lp("landing")), taxi: None }
+    }
+
+    #[test]
+    fn the_taxi_light_is_the_taxi_light_and_the_sr22_taxis_on_its_landing_lamp_after_dusk() {
+        assert_eq!(taxi_light_for(&both(), false).map(|l| l.key), Some("taxi".into()));
+        assert_eq!(taxi_light_for(&both(), true).map(|l| l.key), Some("taxi".into()));
+        assert_eq!(taxi_light_for(&sr22(), true).map(|l| l.key), Some("landing".into()));
+        assert!(taxi_light_for(&sr22(), false).is_none());
+    }
+
+    #[test]
+    fn a_crossing_lights_the_landing_light_unless_it_is_already_the_taxi_light() {
+        assert!(crossing_light_for(&both(), true).is_some());
+        assert!(crossing_light_for(&sr22(), false).is_some());
+        assert!(crossing_light_for(&sr22(), true).is_none());
+        assert!(crossing_light_for(&Exterior::default(), false).is_none());
+    }
+
+    #[test]
+    fn vacating_swaps_to_the_taxi_light_or_keeps_the_only_lamp_after_dusk() {
+        assert_eq!(after_vacate_for(&both(), true), (Some(false), Some(true)));
+        assert_eq!(after_vacate_for(&sr22(), true), (Some(true), None));
+        assert_eq!(after_vacate_for(&sr22(), false), (Some(false), None));
+        assert_eq!(after_vacate_for(&Exterior::default(), true), (None, None));
+    }
+}
+
 pub struct SetLights {
     lights: Vec<LightProfile>,
 }

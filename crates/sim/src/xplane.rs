@@ -79,6 +79,8 @@ const SLOW_DATAREFS: &[&str] = &[
     // The tug on the bar: a fact that changes over minutes, read by the
     // taxi tick as evidence (a re-hooked tug owns the nosewheel).
     "sim/aircraft/overflow/pushback_attached",
+    // The sun moves over minutes; the light stages ask it once per decision.
+    "sim/graphics/scenery/sun_pitch_degrees",
 ];
 /// How long a [`SLOW_DATAREFS`] value may be reused. Well under the time any
 /// of them plausibly changes twice, and a whole order of magnitude off the

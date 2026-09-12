@@ -29,6 +29,12 @@ const NIGHT_SUN_PITCH_DEG: f64 = 0.0;
 /// in the read (and on the ground at dawn, through every attitude change, since
 /// this is the SUN's pitch in the world, not ours).
 const DAY_SUN_PITCH_DEG: f64 = 5.0;
+
+/// Dusk or dark for the exterior-light stages (taxi on the landing lamp,
+/// vacate): the sun below the day threshold, so twilight counts as dark.
+pub fn dusk_or_dark(sun_pitch_deg: f64) -> bool {
+    sun_pitch_deg < DAY_SUN_PITCH_DEG
+}
 /// Main-bus volts above which the aircraft counts as powered — battery,
 /// alternator or a ground cart, whichever is feeding it. Well under a healthy
 /// 28 V bus and well over the noise on a dead one: full auto has read a

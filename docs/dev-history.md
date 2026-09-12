@@ -4,6 +4,32 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## Exterior lights by the book — 2026-09-12
+
+"So for the SR22, landing lights = landing + taxi lights?" Yes, and "ok
+let's do it" was the three stages still owed plus the night gate. One rule
+set in `tools::lights` now, on a process-wide `Exterior` (landing and taxi
+`LightProfile`s, republished on every profile swap like the transponder
+knob) and a shared dusk test (`cockpit_auto::dusk_or_dark`, the sun below
+the 5 degree day threshold; a failed read counts as dark, lights on being
+the side to err on):
+
+- taxi: `taxi_light(dark)`: the taxi light, else after dusk the landing
+  light, else none. The SR22 taxis dark by day now, lit at night.
+- runway spans: `Route.runway_spans` from the cleared route's own segment
+  flags (crossings, backtracks, a line-up's last leg), merged where
+  contiguous; the drive lights the landing light 40 m ahead of each and
+  drops it clear of it, blackboxed `crossing_lights`. Not when the landing
+  lamp is already the taxi light tonight (`crossing_light`).
+- climb: off passing 1,000 ft AGL, in the enroute radio wait
+  (`lights_climb`).
+- vacate: `after_vacate`: taxi on and landing off where both exist; a
+  lone landing lamp stays on after dusk and goes off by day
+  (`lights_vacated`).
+
+Pure decisions tested; the writes ride `lights::apply` like every other
+light write. Not flown yet: the sim was closed for the evening.
+
 ## The SR22 has no taxi light — 2026-09-12
 
 "When taxi should we use landing lights?" Not on a taxiway; the taxi light

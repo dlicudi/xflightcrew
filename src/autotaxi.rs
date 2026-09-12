@@ -305,6 +305,36 @@ pub struct Route {
     /// This airframe's pacing. `build` defaults it to the GA figures; the
     /// arming tool sets the flying aircraft's own (see [`Pace`]).
     pub pace: Pace,
+    /// Along-route spans (start m, end m) that run ON a runway: crossings,
+    /// backtracks, a line-up's last leg. From the route's own segment flags,
+    /// merged where contiguous. The drive lights the landing light over them.
+    pub runway_spans: Vec<(f64, f64)>,
+}
+
+/// How far before a runway span the landing light comes on.
+const CROSSING_LEAD_M: f64 = 40.0;
+
+/// Is `progress` on (or within [`CROSSING_LEAD_M`] of) a runway span?
+pub fn on_runway_span(spans: &[(f64, f64)], progress: f64) -> bool {
+    spans
+        .iter()
+        .any(|&(a, b)| progress >= a - CROSSING_LEAD_M && progress <= b)
+}
+
+/// The runway spans of a route from its per-segment flags (`seg[i]` is the
+/// leg `path[i] -> path[i+1]`), contiguous runway legs merged into one.
+pub fn runway_spans(seg: &[(String, bool)], cum: &[f64]) -> Vec<(f64, f64)> {
+    let mut spans: Vec<(f64, f64)> = Vec::new();
+    for (i, (_, is_rwy)) in seg.iter().enumerate() {
+        if !*is_rwy || i + 1 >= cum.len() {
+            continue;
+        }
+        match spans.last_mut() {
+            Some(last) if (last.1 - cum[i]).abs() < 1e-6 => last.1 = cum[i + 1],
+            _ => spans.push((cum[i], cum[i + 1])),
+        }
+    }
+    spans
 }
 
 impl Route {
@@ -340,6 +370,7 @@ impl Route {
                 bends.push((cum[i], delta));
             }
         }
+        let runway_spans = runway_spans(&watch.seg, &cum);
         Some(Route {
             path: watch.path.clone(),
             pts,
@@ -349,6 +380,7 @@ impl Route {
             holding_point: crate::station::spoken_taxiway(&watch.holding_point),
             done_line: None,
             pace: Pace::default(),
+            runway_spans,
         })
     }
 
@@ -1282,6 +1314,14 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 /// is just politeness.
 async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f64) {
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
+    // The landing light over runway spans, decided once for the drive: none
+    // when the airframe's landing lamp is already its taxi light tonight.
+    let crossing_light = if route.runway_spans.is_empty() {
+        None
+    } else {
+        crate::tools::lights::crossing_light(crate::tools::lights::dark_now(&xp).await)
+    };
+    let mut crossing_lit = false;
     tracing::info!("auto taxi started");
     crate::blackbox::record(
         "autotaxi",
@@ -1418,6 +1458,17 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         let lateral = offset.abs();
         let remaining = route.remaining(progress);
         DETAIL.set(format!("{} m to go", (remaining.max(0.0) / 10.0).round() as i64 * 10));
+        if let Some(l) = crossing_light.as_ref() {
+            let want = on_runway_span(&route.runway_spans, progress);
+            if want != crossing_lit {
+                crossing_lit = want;
+                let ok = crate::tools::lights::apply(&xp, l, want).await.is_ok();
+                crate::blackbox::record(
+                    "autotaxi",
+                    serde_json::json!({"event": "crossing_lights", "on": want, "ok": ok, "progress_m": progress}),
+                );
+            }
+        }
         // Steering error first: the join state and the guard both need it.
         // The aim is capped by what's LEFT of the route: near the stop the
         // pursuit point must walk the path through the final corner, not
@@ -1669,6 +1720,26 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runway_spans_merge_and_the_light_leads_the_crossing() {
+        use super::{on_runway_span, runway_spans};
+        // Legs: taxiway 0-100, runway 100-140, runway 140-160, taxiway 160-300.
+        let seg = vec![
+            ("A".to_string(), false),
+            ("09/27".to_string(), true),
+            ("09/27".to_string(), true),
+            ("B".to_string(), false),
+        ];
+        let cum = [0.0, 100.0, 140.0, 160.0, 300.0];
+        let spans = runway_spans(&seg, &cum);
+        assert_eq!(spans, vec![(100.0, 160.0)], "contiguous runway legs are one span");
+        assert!(!on_runway_span(&spans, 50.0), "well before: off");
+        assert!(on_runway_span(&spans, 65.0), "40 m lead: on");
+        assert!(on_runway_span(&spans, 150.0), "on the runway: on");
+        assert!(!on_runway_span(&spans, 161.0), "clear: off");
+        assert!(runway_spans(&[], &cum).is_empty(), "a route with no flags has no spans");
+    }
+
     use super::*;
 
     const LAT0: f64 = 36.0;

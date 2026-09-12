@@ -293,6 +293,8 @@ const INBOUND_SWAP_WAIT_SECS: f64 = 45.0;
 /// Between the handoff readback and the retune: the readback has to be off
 /// the air on the frequency it was given on before the radio leaves it.
 const HANDOFF_READBACK_SECS: u64 = 4;
+/// Clear of the pattern: the landing lights go off passing this height.
+const LANDING_LIGHTS_OFF_AGL_FT: f64 = 1000.0;
 
 /// The enroute wait, working the radio. The tower's after-takeoff handoff
 /// ("contact Malaga Departure on ...") is read back on the frequency it came
@@ -308,6 +310,9 @@ async fn wait_enroute_working_the_radio(
 ) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     let deadline = Instant::now() + Duration::from_secs_f64(4.0 * 3600.0);
+    // Landing lights off once clear of the pattern: one read per pass until
+    // the height is made, then never again this leg.
+    let mut landing_off = false;
     loop {
         if ABORT.load(SeqCst) {
             return false;
@@ -317,6 +322,14 @@ async fn wait_enroute_working_the_radio(
         }
         if Instant::now() >= deadline {
             return false;
+        }
+        if !landing_off {
+            let agl_ft = xp.get_float(AGL_M).await.unwrap_or(0.0) * M_TO_FT;
+            if agl_ft >= LANDING_LIGHTS_OFF_AGL_FT {
+                landing_off = true;
+                let did = crate::tools::lights::landing(xp, false).await;
+                event("lights_climb", json!({ "landing_off": did, "agl_ft": agl_ft.round() }));
+            }
         }
         if let Some((to, khz)) = crate::party_line::take_departure_handoff() {
             crate::circuit::transmit(crate::circuit::radio_call(
@@ -895,12 +908,15 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // only nav, strobe and landing, and the taxi ran dark because the
         // "taxi" key was declared nowhere (2026-09-12). That is how the real
         // aircraft is taxied at night; it goes off at the stand with the rest.
-        let (taxi_key, taxi_lit) = if tools.lights.declares("taxi") {
-            ("taxi", light(&tools, &ctx, "taxi", true).await)
-        } else {
-            ("landing", light(&tools, &ctx, "landing", true).await)
+        let dark = crate::tools::lights::dark_now(&xp).await;
+        let (taxi_key, taxi_lit) = match crate::tools::lights::taxi_light(dark) {
+            Some(l) => {
+                let ok = crate::tools::lights::apply(&xp, &l, true).await.is_ok();
+                (l.key.clone(), ok)
+            }
+            None => ("none".to_string(), false),
         };
-        event("lights_taxi", json!({ "on": taxi_lit, "light": taxi_key }));
+        event("lights_taxi", json!({ "on": taxi_lit, "light": taxi_key, "dark": dark }));
         announce(
             &voice,
             Priority::Advisory,
