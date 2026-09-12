@@ -1,4 +1,4 @@
-//! `autoland` — native emergency autoland (no external plugin).
+//! `autoland` — native autoland to the nearest suitable runway (no external plugin).
 //!
 //! XVoiceLayer owns the *upset recovery* (`recover`); this flies a full approach and
 //! landing to the nearest suitable runway, entirely in-process: it parses X-Plane's
@@ -58,8 +58,9 @@ impl Tool for Autoland {
         "autoland"
     }
     fn description(&self) -> &str {
-        "Emergency autoland: fly a full approach and land at the nearest suitable \
-         runway. Use for 'land the aircraft', 'get us down', 'emergency landing', \
+        "Autoland: fly a full approach and land at the nearest suitable runway \
+         (the Garmin-style nearest-runway mode; the planned arrival is full auto's). \
+         Use for 'land the aircraft', 'get us down', 'emergency landing', \
          'autoland', 'land us'. Pass cancel=true for 'cancel autoland' / 'stop the \
          autoland'. The pilot takes back control with 'my controls'."
     }
@@ -116,7 +117,7 @@ impl Tool for Autoland {
             None,
         );
         Ok(
-            "Roger, emergency autoland. Searching for the nearest runway, then flying \
+            "Roger, autoland. Searching for the nearest runway, then flying \
             the approach. Say 'my controls' to take it back."
                 .to_string(),
         )
