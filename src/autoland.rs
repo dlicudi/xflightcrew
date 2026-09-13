@@ -969,6 +969,14 @@ pub fn run_autoland(
                 if last_phase != Some(g.phase) {
                     let prev = last_phase;
                     last_phase = Some(g.phase);
+                    // The landing light for the landing, at the final: the
+                    // exterior-lights rule lights it lined up and puts it out
+                    // at the vacate, and nothing lit it for the ARRIVAL. The
+                    // BEFORE LANDING cross-check read it off on the LEMG 31
+                    // final (2026-09-12).
+                    if g.phase == ApproachPhase::Final {
+                        let _ = crate::tools::lights::landing(&xp, true).await;
+                    }
                     let line = match g.phase {
                         // Dropping back to Intercept from Final/Flare is a
                         // go-around, not a fresh intercept — say so. Low it's

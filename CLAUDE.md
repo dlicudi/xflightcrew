@@ -1,11 +1,13 @@
 # XVoiceLayer
 
-The voice layer for X-Plane 12: copilot, ATC and cabin crew, entirely local.
-The pilot speaks a command, an LLM picks the matching action, the agent writes
-the X-Plane dataref, and the copilot reads the action back aloud.
+The voice layer for X-Plane 12: copilot, ATC and cabin crew, entirely local
+and entirely deterministic. The pilot speaks a command, the grammar picks the
+matching tool, the agent writes the X-Plane dataref, and the copilot reads the
+action back aloud. **There is no model at runtime** (retired 2026-09-13; the
+history has the evidence): every miss in the logs becomes a rule.
 
 ```
-🎙️  "Flaps up"   →  STT  →  LLM picks a tool  →  write dataref  →  TTS "Flaps up!"
+🎙️  "Flaps up"   →  STT  →  grammar picks a tool  →  write dataref  →  TTS "Flaps up!"
 ```
 
 **Full engineering history lives in [docs/dev-history.md](docs/dev-history.md)**:
@@ -36,9 +38,10 @@ explicit-target lines keep arriving and make it look healthy.
 - **Horizon** (`~/GitHub/horizon`): ABANDONED (2026-09-11; it had become a
   charter logbook, never an instructor). Nothing lives there. A flight
   instructor, if built, is a third persona HERE, mode-gated like ATC-only so
-  it never actuates: the monitor's callouts, the ATC coach, the handbook RAG
-  and the automations as demonstrations exist; a blackbox scorer against ACS
-  tolerances, a lesson state machine and narration do not.
+  it never actuates: the monitor's callouts, the ATC coach, the checklist
+  flow's Instruct flavour and the automations as demonstrations exist; a
+  blackbox scorer against ACS tolerances, a lesson state machine and
+  narration do not.
 - **rustdecks** (`~/GitHub/rustdecks`): sibling Loupedeck controller. When
   hunting a dataref/command name, check its `examples/*.yaml` (and the
   cockpitdecks clones it references) before the sim's DataRefs.txt - names
@@ -53,13 +56,18 @@ Rust, because this is a latency- and audio-sensitive real-time loop.
 |---|---|
 | Mic capture | `cpal` |
 | STT | `whisper-rs` (whisper.cpp bindings), push-to-talk |
-| LLM tool-use | **Local**: `reqwest` → Ollama (`/api/chat`), backend-neutral tool schema |
+| Intent | deterministic: [src/grammar.rs](src/grammar.rs) picks the tool, [src/conversation.rs](src/conversation.rs) and the state answerers handle questions, [src/dialogue.rs](src/dialogue.rs) back-references |
 | X-Plane write | `reqwest` PATCH to the Web API (`PATCH /api/v1/datarefs/{id}/value`) |
 | TTS readback | in-process piper VITS via the `ort` crate |
 
-**LLM runs locally, cloud is ruled out** (per-call metering doesn't fit a
-whole-flight copilot). The tool schema stays backend-neutral (`name` +
-`description` + JSON-schema `parameters`) so the local backend can swap.
+**No LLM, local or cloud.** The answer-only Ollama fallback was measured live
+on 2026-09-12 (qwen3:8b: four calls, no useful answer, sim frame rate cost)
+and removed the next day with its RAG index code, config, panel switch and
+health probe. The work goes into the deterministic layers instead: `xvl
+analyze` lists the most frequent missed phrasings in the logs, and each one
+is a grammar rule, a matcher or a profile entry with the live transcript as
+its test. The one model-shaped future use is an instructor answering handbook
+questions; if it returns, it returns as that persona, never as a fallback.
 
 **X-Plane access: REST for transport, plugin for capability.** Every stock
 dataref read/write goes over the Web API. The C++ plugin
@@ -83,7 +91,7 @@ the local player for that clip. The panel switch rides the settings poller
 
 ## Core design rule: curated tool surface, not raw dataref access
 
-**Never let the LLM write arbitrary datarefs.** Each tool owns:
+**Nothing writes arbitrary datarefs; the grammar picks from curated tools.** Each tool owns:
 
 1. its dataref + valid range,
 2. a **readback** that re-reads AFTER writing and compares against the
@@ -290,7 +298,7 @@ for coach and panel.
 
 Orchestrators compose proven loops; no new flight laws in orchestrators. All
 laws battle-test as plain `cargo test`; everything blackboxes to
-`logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autotakeoff`, `pushback`,
+`logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autotakeoff`, `pushback`, `checklist`,
 `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`, `cabin`,
 `api_load`). Cross-cutting rules, each learned the hard way (details in
 history):
@@ -429,8 +437,8 @@ history):
   plan's first entry for the whole flight, so anything that names the next
   fix (progress questions, the course check, the waypoint reminder) reads
   `procedure::active_leg()` first and the GPS only when nothing is flying.
-  **Full auto flies the checklist items it owns, it never reads the lists**
-  (the XChecklist interpreter is the spoken-request path only): on a
+  **Full auto flies the checklist items it owns; the lists are its
+  cross-check, never its hands** (see the checklist flows below): on a
   continuous-mixture piston (`piston_mixture`, the profile's `engine` group,
   never the DC-3's notched lever) the enroute leg arms the mixture manager
   (`engine::arm_mixture_manager`: rich below `LEAN_FLOOR_ALT_FT`, peak EGT
@@ -501,11 +509,50 @@ history):
   direction. On-demand "which way?" is question-shaped so a readback never
   triggers it.
 
+## Checklist flows: the list at its phase, three flavours
+
+[src/flow.rs](src/flow.rs) runs the airframe's XChecklist sections
+([src/checklist.rs](src/checklist.rs) interprets the file) on their own
+thread, replies taken from the command loop (`flow::take_reply`, CLOSED
+vocabulary: yes/no at a hazard confirm, next/set/checked/skip at an
+instructor's item, stop always; "flaps ten" mid-list is still flaps ten).
+Every `Item::Act` carries the file's own pass test, so a runner reads the
+state FIRST: an item already in state is confirmed, never re-written under
+the pilot's hand, and an item a running loop owns (`held_by_automation`:
+governor/throttle, mixture manager, autoland/flaps, the flying loops/AP) is
+named as held, never written (one writer per dataref). Flavours:
+
+- **Crew** (pilot flying, copilot acting): the spoken "descent checklist"
+  lands here.
+- **Monitor** (an automation flying): read-only cross-check, narration
+  skipped, a discrepancy spoken and blackboxed (`checklist` event
+  `discrepancy`), never a write. The mission's laws act; the list audits.
+- **Instruct** ("talk / walk / guide me through the X checklist",
+  `instruct_request`): never writes by construction; says the item, watches
+  the dataref for the pilot to do it ("Good."), moves on at "next"/"set" or
+  `INSTRUCT_WAIT_SECS`. The first piece of the instructor persona; the
+  conversation module's "preview / explain the X checklist" stays the
+  read-only recital.
+
+**Who starts one**: the monitor's `flow::Tracker` (sustained conditions,
+one-shot per flight, a flight begins at the takeoff roll and ends with the
+after-landing list): climb established (`CLIMB_AGL_FT`), level 30 s above
+2,000 ft AGL, descending 20 s from cruise height, below 1,500 ft descending
+10 s, rolled out under 30 kt for 10 s. Under an automation the Monitor
+flavour starts at once; with a pilot flying the copilot PROPOSES ("Climb
+checklist when you're ready?", `PROPOSAL_TTL`) and "go ahead" runs it,
+"talk me through it" teaches it, "not now" declines - a proposal never acts
+by itself (the cockpit_auto rule). Section-to-title is the same matcher a
+spoken "climb checklist" uses; a file whose titles differ maps them in the
+profile's `checklist_flow:`; a section the file lacks proposes nothing.
+Panel: `flow::status()` ("checklist: climb, 3 of 8") and CANCEL picks "stop
+the checklist" when nothing is flying.
+
 ## App modes & cabin crew
 
 `mode.rs`: **both** (default) / **copilot** (no simulated ATC; radio-keyed
-speech IGNORED - real ATC owns the frequency) / **atc** (deterministic world
-only, no LLM/Ollama needed). Chosen from the panel Settings tab, persisted;
+speech IGNORED - real ATC owns the frequency) / **atc** (the world only, no
+crew). Chosen from the panel Settings tab, persisted;
 `XCOPILOT_MODE` sets only the BOOT value; applies live within ~2 s. The "no
 crew in ATC-only" gate lives in the arbiter's enqueue door (`Voice::alert` and
 friends), not scattered per-site; blocking `say` is mode-routed in the main
@@ -518,7 +565,7 @@ PTT/channel. The address is the routing (explicit "cabin crew" always; bare
 per-airframe (`cabin_crew: true`) + panel staffing Auto/Aboard/Off. "Cabin
 secure" is a safety report, exempt from sterile cockpit
 (`STERILE_FLOOR_AGL_FT` 10,000). On a crewless airframe: an honest "no cabin
-crew on this airframe", never an LLM improvising.
+crew on this airframe", never an improvisation.
 
 ## Panel, terminal, settings
 
@@ -536,7 +583,7 @@ crew on this airframe", never an LLM improvising.
   follow the managers and are never spoken: the AP targets (`set_ap_targets`,
   bug/alt/VS as dialled) and the crew's last spoken line (`note_said`, from
   `Voice::alert`/`say`). Buttons inject the same English a pilot would speak
-  (`REQUEST_PHRASES`, grammar-test-pinned so a button never reaches the LLM);
+  (`REQUEST_PHRASES`, grammar-test-pinned so a button always parses);
   CANCEL is picked per what's running at PRESS time and ALWAYS aborts
   something ("my controls" fallback). Presses ride the typed-command queue,
   one per loop pass, as does the Transcript tab's typed line

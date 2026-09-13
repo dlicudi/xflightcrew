@@ -584,13 +584,6 @@ fn draw_health(f: &mut Frame, app: &App, area: Rect) {
     let mut systems = vec![
         probe_row("X-Plane", &h.xplane, Some(&app.boot.xplane_url)),
         probe_row("plugin", &h.plugin, None),
-        // An LLM that is deliberately off does not need its address printed:
-        // the endpoint is a diagnosis, and there is nothing to diagnose.
-        probe_row(
-            "Ollama",
-            &h.ollama,
-            (!matches!(h.ollama, Probe::Off(_))).then_some(app.boot.ollama_url.as_str()),
-        ),
         kv("whisper", app.boot.whisper.clone()),
     ];
     systems.push(match &h.engine {
@@ -599,7 +592,7 @@ fn draw_health(f: &mut Frame, app: &App, area: Rect) {
     });
     systems.push(kv("mic", app.boot.mic.clone()));
     systems.push(kv("listen", app.boot.listen.clone()));
-    systems.push(kv("llm", llm_label(&app.boot)));
+    systems.push(kv("brain", "deterministic, no model".to_string()));
     f.render_widget(
         Paragraph::new(systems).block(Block::default().borders(Borders::ALL).title(" systems ")),
         left,
@@ -900,14 +893,6 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn llm_label(boot: &health::Boot) -> String {
-    if boot.llm_enabled {
-        format!("{} (answers)", boot.llm_model)
-    } else {
-        "off · deterministic".to_string()
-    }
-}
-
 /// Dataref names are long and share prefixes; the tail is what identifies them.
 fn short_dref(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
@@ -921,7 +906,6 @@ fn probe_row(label: &str, p: &Probe, endpoint: Option<&str>) -> Line<'static> {
         Probe::Unknown => ("…", "checking".to_string(), Color::DarkGray),
         Probe::Up(d) => ("●", d.clone(), Color::Green),
         Probe::Down(d) => ("✗", d.clone(), Color::Red),
-        Probe::Off(d) => ("○", d.clone(), Color::DarkGray),
     };
     let mut spans = vec![
         Span::styled(format!("{label:<9}"), Style::default().fg(Color::DarkGray)),
@@ -958,9 +942,6 @@ mod tests {
                 listen: "ptt dataref · xcopilot/ptt_active".into(),
                 mic: "MacBook Pro Microphone".into(),
                 xplane_url: "http://127.0.0.1:8086".into(),
-                ollama_url: "http://127.0.0.1:11434".into(),
-                llm_model: "qwen3:8b".into(),
-                llm_enabled: false,
                 atc_airport: "LXGB".into(),
                 simbrief: true,
                 voices: vec![("cabin", "en_US-hfc_female-medium".into())],
@@ -968,7 +949,6 @@ mod tests {
             health: health::Live {
                 xplane: Probe::Up("12 ms".into()),
                 plugin: Probe::Down("no xcopilot/* datarefs".into()),
-                ollama: Probe::Off("deterministic (XCOPILOT_LLM=off)".into()),
                 load: Some(sim::xplane::LoadSnapshot {
                     window_s: 12.0,
                     requests: 900,

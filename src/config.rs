@@ -1,37 +1,14 @@
 //! Runtime configuration, loaded from the environment (and an optional `.env`).
 //!
 //! Nothing here is X-Plane-specific beyond the base URL — the tool layer owns
-//! the dataref names. This keeps secrets (the Anthropic key) and machine-local
-//! paths (whisper model, piper voice) out of the code.
+//! the dataref names. This keeps machine-local paths (whisper model, piper
+//! voice) out of the code. Everything is local; there are no secrets.
 
 use anyhow::Result;
 
 /// All the knobs the loop needs to run end to end.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
-    /// Base URL of the local Ollama server, e.g. `http://127.0.0.1:11434`.
-    pub ollama_base_url: String,
-    /// Ollama `keep_alive` for the model (e.g. `60m`, `5m`, `0`). How long it
-    /// stays resident on the GPU after a call; `0` frees GPU memory between
-    /// commands at the cost of a cold-load each time.
-    pub llm_keepalive: String,
-    /// Ollama `num_gpu`: how many model layers to run on the GPU. Empty = Ollama's
-    /// default (all). `0` runs the LLM entirely on the CPU so its inference stops
-    /// contending with a GPU-bound X-Plane (slower thinking, but no FPS dip).
-    pub llm_gpu_layers: String,
-    /// Local model id used for tool selection. Must support tool-calling
-    /// (e.g. `qwen3:8b`, `qwen2.5`, `llama3.1`). Default `qwen3:8b` won the
-    /// tool-pick battery (100% on the clean set, fastest of the perfect
-    /// scorers); `llm.rs` auto-disables its thinking mode for low latency.
-    pub model: String,
-    /// Whether the local LLM is used at all. When `false` (the default) the copilot
-    /// is fully deterministic: the grammar fast-path handles commands, the
-    /// state-query handler answers questions, and anything unrecognized gets "Say
-    /// again?" — Ollama is never contacted. The LLM only ever *answered* questions
-    /// the deterministic handler missed (it never actuates), so turning it off
-    /// loses only some free-form Q&A phrasings, never an action. `XCOPILOT_LLM=on`
-    /// re-enables that answer-only fallback.
-    pub llm_enabled: bool,
     /// Base URL of the X-Plane Web API, e.g. `http://127.0.0.1:8086`.
     pub xplane_base_url: String,
     /// Path to a whisper.cpp `.bin` model (e.g. `ggml-base.en.bin`).
@@ -248,16 +225,6 @@ impl Config {
         let _ = dotenvy::dotenv();
 
         Ok(Self {
-            ollama_base_url: env_or("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
-            model: env_or("XCOPILOT_MODEL", "qwen3:8b"),
-            llm_keepalive: env_or("XCOPILOT_LLM_KEEPALIVE", "60m"),
-            llm_gpu_layers: env_or("XCOPILOT_LLM_GPU_LAYERS", ""),
-            // Off by default — fully deterministic. `on`/`true`/`1`/`yes` enables
-            // the answer-only LLM fallback.
-            llm_enabled: matches!(
-                env_or("XCOPILOT_LLM", "off").to_lowercase().as_str(),
-                "on" | "true" | "1" | "yes"
-            ),
             xplane_base_url: env_or("XPLANE_BASE_URL", "http://127.0.0.1:8086"),
             whisper_model_path: env_or("WHISPER_MODEL", "models/ggml-base.en.bin"),
             whisper_gpu: env_or("XCOPILOT_WHISPER_GPU", "true") != "false",

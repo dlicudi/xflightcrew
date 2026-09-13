@@ -14,8 +14,8 @@
 // rendered as a toolbar of status chips over tabs: Log (scrolling transmission
 // record), Route (the pushed flight plan + a Send-to-FMS re-push), ATC (every
 // station in VHF range, click a frequency to tune COM1), and Settings (live
-// switches, e.g. the LLM-fallback dataref `xcopilot/llm_enabled`, -1 auto
-// / 0 off / 1 on, which the app polls each utterance).
+// switches, each a dataref the app polls: mode, camera snap, negative tone,
+// audio bus, UI scale).
 // Toggle via Plugins → XVoiceLayer.
 //
 // Layout: this file is only the plugin lifecycle. The dataref/command surface

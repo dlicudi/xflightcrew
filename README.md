@@ -25,9 +25,9 @@ land. That's a different trust model from a voice that only narrates, so every
 action is gated and read back from the aircraft's *actual* state, never from the
 intent.
 
-**It's genuinely offline.** Ears (whisper), brain (Ollama), and mouth (ONNX/
-piper) all run locally. Nothing is metered per call, and it works with the
-network off.
+**It's genuinely offline.** Ears (whisper), brain (a deterministic grammar and
+rule set, no model), and mouth (ONNX/piper) all run locally. Nothing is metered
+per call, and it works with the network off.
 
 **The tower is deterministic.** ATC is a state machine, not an LLM — a mishear
 can earn "say again", but it can never earn a clearance. Frequencies, taxi
@@ -38,7 +38,7 @@ and CIFP data, so the field you're at is the field it works.
 
 ### Talk to the copilot
 
-**Conversation works without an LLM.** Ask for a reading, then “and now?” to
+**Conversation is rules, not a model.** Ask for a reading, then “and now?” to
 refresh it or “and heading?” to change the subject. “Why?” recalls the source
 of the last supported answer or the actual report from a command, including
 refusals. “What's our speed?” asks which speed you mean; reply “airspeed”,
@@ -127,15 +127,10 @@ buttons for every automation, and the phraseology reference.
 
 ## Quick start
 
-Three local pieces:
+Two local pieces:
 
 1. **X-Plane 12** with the Web API on (Settings → Network → Web API, port 8086).
-2. **[Ollama](https://ollama.com)** with a tool-calling model:
-   ```sh
-   ollama serve
-   ollama pull qwen3:8b
-   ```
-3. A **whisper.cpp** model — a ggml `.bin` in `models/`, e.g. `ggml-base.en.bin`.
+2. A **whisper.cpp** model — a ggml `.bin` in `models/`, e.g. `ggml-base.en.bin`.
 
 Then:
 
@@ -170,7 +165,7 @@ anything else.
 
 - `both` — copilot and ATC (default)
 - `copilot` — no simulated ATC, so real/online ATC owns the radio
-- `atc` — the world without the crew; needs no Ollama at all
+- `atc` — the world without the crew
 
 ## Stack
 
@@ -179,7 +174,6 @@ anything else.
 | Mic capture | `cpal` |
 | Speech-to-text | `whisper-rs` (whisper.cpp, Metal on Apple Silicon) |
 | Commands and conversation | deterministic grammar, curated tools, conversation state |
-| Optional answer fallback | local **Ollama**, answer-only; off by default, unnecessary for the conversation features above |
 | X-Plane read/write | `reqwest` → Web API (`PATCH /api/v1/datarefs/...`) |
 | In-sim capability | native C++ plugin (PTT, panel, FMS, terrain, controls) |
 | Text-to-speech | in-process ONNX (default), or `piper` / macOS `say` |
@@ -201,7 +195,6 @@ list. Common knobs:
 | Var | Default | What |
 |---|---|---|
 | `XCOPILOT_MODE` | `both` | `both`, `copilot`, `atc` |
-| `XCOPILOT_MODEL` | `qwen3:8b` | Ollama tool-calling model |
 | `XCOPILOT_UI` | `plain` | `plain` or `tui` |
 | `XCOPILOT_LISTEN` | `continuous` | `continuous` or `ptt` |
 | `XCOPILOT_CONFIRM` | `true` | require "affirm" before safety-critical commands |
@@ -224,7 +217,7 @@ live installs for nothing.
 ## Tests
 
 ```sh
-cargo test --workspace                        # everything deterministic, no sim or LLM needed
+cargo test --workspace                        # everything deterministic, no sim needed
 cargo test --release -p atc -- --ignored atc_world_sweep   # cross-airport sweep (needs apt.dat)
 cargo run -- stt-eval bench/atc_stt_cases.yaml             # spoken-call accuracy
 scripts/llm_bench.sh qwen3:8b                             # tool-pick battery (needs Ollama)

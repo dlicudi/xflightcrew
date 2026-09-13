@@ -123,7 +123,7 @@ pub fn note_said(text: &str) {
 
 
 use crate::{approach_guide, autoland, autotakeoff, autotaxi, circuit, full_auto, procedure};
-use crate::{pushback, tools};
+use crate::{flow, pushback, tools};
 
 /// What the copilot is actively managing right now — the continuous control
 /// loops that keep working between commands — one short line each. Ordered by
@@ -176,6 +176,9 @@ pub fn active_managers() -> Vec<String> {
     }
     if let Some(s) = tools::engine::mixture_status() {
         v.push(s.to_string());
+    }
+    if let Some(s) = flow::status() {
+        v.push(s);
     }
     v
 }
@@ -271,6 +274,11 @@ pub fn cancel_phrase() -> Option<&'static str> {
     }
     if autotaxi::driving() {
         return Some("cancel auto taxi");
+    }
+    // A checklist flow with nothing flying: the button stops the list. The
+    // phrase is the flow's own closed reply vocabulary, taken before grammar.
+    if flow::ACTIVE.load(Relaxed) {
+        return Some("stop the checklist");
     }
     Some("my controls")
 }

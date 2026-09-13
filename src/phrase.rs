@@ -1,4 +1,4 @@
-//! Spoken-number normalization for transcripts, before the LLM sees them.
+//! Spoken-number normalization for transcripts, before the grammar sees them.
 //!
 //! Whisper writes numbers inconsistently ("two seven zero", "niner", "decimal"),
 //! and the commands here are number-heavy (headings, altitudes, frequencies,
@@ -780,5 +780,53 @@ mod tests {
         assert_eq!(normalize_numbers("gear up"), "gear up");
         // A lone "point" with no following digit is left as a word.
         assert_eq!(normalize_numbers("to the point"), "to the point");
+    }
+}
+
+/// A line with the copilot's own coaching of what to SAY cut out, for the
+/// echo memory. "We're already flying, so full auto can't start. Say navigate
+/// to follow the plan, fly the ILS for the arrival, or land for me." coached
+/// exactly the words the pilot then spoke, and the echo gate rejected
+/// "Navigate to follow the plan" as the copilot's voice bleeding back through
+/// the mic, without a word (LEMG, 2026-09-12). Every sentence that opens with
+/// "say" (or "just say", "or say", "then say") goes; the rest of the line
+/// still guards against real echo.
+pub fn without_coached_phrase(text: &str) -> String {
+    let mut out = String::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if matches!(b, b'.' | b'!' | b'?') || i + 1 == bytes.len() {
+            let end = if matches!(b, b'.' | b'!' | b'?') { i + 1 } else { i + 1 };
+            let sentence = &text[start..end];
+            let lead = sentence
+                .trim_start_matches(|c: char| !c.is_alphanumeric())
+                .to_ascii_lowercase();
+            let coached = ["say ", "just say ", "or say ", "then say ", "you can say "]
+                .iter()
+                .any(|p| lead.starts_with(p));
+            if !coached {
+                out.push_str(sentence);
+            }
+            start = end;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod coached_tests {
+    use super::without_coached_phrase;
+
+    #[test]
+    fn a_coached_phrase_leaves_the_echo_memory() {
+        let line = "We're already flying, so full auto can't start. Say navigate to follow the plan, fly the ILS for the arrival, or land for me.";
+        let kept = without_coached_phrase(line);
+        assert!(kept.contains("already flying"));
+        assert!(!kept.to_lowercase().contains("navigate"), "{kept}");
+        // A plain readback is untouched.
+        assert_eq!(without_coached_phrase("Flaps ten, set."), "Flaps ten, set.");
+        // "Say again" is the copilot's own line too, and stays.
+        assert_eq!(without_coached_phrase("Say again?"), "");
     }
 }

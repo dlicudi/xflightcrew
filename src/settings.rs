@@ -523,21 +523,6 @@ pub const ALL: &[Setting] = &[
             true
         },
     },
-    Setting {
-        key: "llm_enabled",
-        env: "XCOPILOT_LLM",
-        label: "LLM answers",
-        help: "off is fully deterministic; on adds the answer-only Ollama fallback",
-        kind: Kind::Bool,
-        tier: Tier::Live,
-        persist: Persist::Map,
-        get: || Value::Bool(live().llm_enabled),
-        apply: |v| {
-            let Some(b) = v.as_bool() else { return false };
-            update(|c| c.llm_enabled = b);
-            true
-        },
-    },
 ];
 
 /// Both channel volumes go to the audio layer together (it takes a pair), so a

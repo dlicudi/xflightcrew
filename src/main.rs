@@ -24,11 +24,11 @@ mod debrief;
 mod dialogue;
 mod failures;
 mod flightplan;
+mod flow;
 mod full_auto;
 mod grammar;
 mod health;
 mod livestate;
-mod llm;
 mod mic;
 mod mode;
 mod monitor;
@@ -38,7 +38,6 @@ mod prefs;
 mod procedure;
 mod pushback;
 mod radiofx;
-mod rag;
 mod readback;
 mod settings;
 mod simbrief;
@@ -69,7 +68,6 @@ use anyhow::{anyhow, Result};
 use audio::{Listener, PttMic};
 use config::Config;
 use livestate::LiveState;
-use llm::Llm;
 use stt::Stt;
 use tools::{Registry, ToolCtx};
 use ui::Reporter;
@@ -247,42 +245,6 @@ async fn main() -> Result<()> {
         return analyze_commands();
     }
 
-    // `xvl index <aircraft_id> <manual.pdf...>` — build the manual index the
-    // answer-only LLM grounds its answers in (see src/rag.rs).
-    if std::env::args().nth(1).as_deref() == Some("index") {
-        let args: Vec<String> = std::env::args().skip(2).collect();
-        let Some((id, pdfs)) = args.split_first() else {
-            eprintln!("usage: xvl index <aircraft_id> <manual.pdf> [more.pdf...]");
-            std::process::exit(2);
-        };
-        if pdfs.is_empty() {
-            eprintln!("usage: xvl index <aircraft_id> <manual.pdf> [more.pdf...]");
-            std::process::exit(2);
-        }
-        let cfg = config::Config::from_env()?;
-        return rag::build_index(&cfg.ollama_base_url, id, pdfs).await;
-    }
-
-    // `xvl ask <aircraft_id> <question...>` — retrieval smoke test: print the
-    // manual chunks a question would pull, without the voice loop or the LLM.
-    if std::env::args().nth(1).as_deref() == Some("ask") {
-        let args: Vec<String> = std::env::args().skip(2).collect();
-        let Some((id, q)) = args.split_first() else {
-            eprintln!("usage: xvl ask <aircraft_id> <question>");
-            std::process::exit(2);
-        };
-        let question = q.join(" ");
-        let cfg = config::Config::from_env()?;
-        match rag::Index::load(id) {
-            Some(index) => match index.retrieve(&cfg.ollama_base_url, &question, 4).await {
-                Some(hits) => println!("{hits}"),
-                None => println!("(no relevant excerpts above the score floor)"),
-            },
-            None => println!("no index for '{id}' — build one with: xvl index {id} <pdfs>"),
-        }
-        return Ok(());
-    }
-
     // `cargo run -- stt-eval [manifest.yaml]` runs the offline speech-accuracy
     // harness: each case through whisper + grammar, reporting WER and command
     // accuracy. `WHISPER_MODEL=...` switches the model under test. Offline, so it
@@ -350,24 +312,14 @@ async fn main() -> Result<()> {
     // panel's Settings switch (xcopilot/opt/audio_bus) turns it on live.
     tts::configure_audio_bus(config.audio_bus, &config.xplane_base_url);
     tracing::info!(
-        model = %config.model,
         aircraft = %profile.display_name,
         mode = %config.listen_mode,
-        llm = if config.llm_enabled { "answer-only (Ollama)" } else { "off (deterministic)" },
         "starting XVoiceLayer"
     );
 
     // whisper model load is the one slow init — do it once, up front. Bias its
     // decoding toward the active aircraft's actual systems and phraseology.
     let stt = Stt::load(&config.whisper_model_path, config.whisper_gpu)?;
-    let llm = Llm::new(&config);
-    if config.llm_enabled && mode::copilot_enabled() {
-        // Prefill the answer-path KV cache now, on the ground — not on the
-        // first question at altitude (cold prefill measured at ~10 s of GPU
-        // time, and the sim's frame rate tanks for all of it).
-        let warm = llm.clone();
-        tokio::spawn(async move { warm.warmup().await });
-    }
     // The tool registry, STT prompt, and checklists are all derived from the
     // profile inside run_session — and rebuilt there when the aircraft switches.
 
@@ -715,7 +667,6 @@ async fn main() -> Result<()> {
             if let Err(e) = rt.block_on(run_session(
                 config,
                 stt,
-                llm,
                 live_profile,
                 voice,
                 continuous,
@@ -747,7 +698,6 @@ async fn main() -> Result<()> {
         run_session(
             config,
             stt,
-            llm,
             live_profile,
             voice,
             continuous,
@@ -1309,7 +1259,6 @@ fn wants_procedural_power_up(name: &str, args: &serde_json::Value) -> bool {
 async fn run_session(
     config: Config,
     mut stt: Stt,
-    llm: Llm,
     live_profile: std::sync::Arc<LiveProfile>,
     voice: Voice,
     continuous: bool,
@@ -1351,54 +1300,14 @@ async fn run_session(
     // REST until (or unless) the subscription warms up.
     let live = LiveState::start(&config.xplane_base_url, SNAPSHOT_DATAREFS);
 
-    // The panel button can enable the LLM mid-flight; warm the answer-path KV
-    // cache on the off-to-on edge so the first question never pays cold
-    // prefill (~10 s of GPU steal, measured 2026-07-08). Startup-enabled runs
-    // are warmed from main already.
-    {
-        let warm = llm.clone();
-        let live = live.clone();
-        let mut warmed = config.llm_enabled;
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                match live.get(DR_LLM_ENABLED) {
-                    Some(v) if v >= 0.5 && !warmed => {
-                        warmed = true;
-                        warm.warmup().await;
-                    }
-                    // Explicit off: re-warm on the next enable (the cache may
-                    // have been evicted while the LLM sat unused).
-                    Some(v) if (-0.5..0.5).contains(&v) => warmed = false,
-                    _ => {}
-                }
-            }
-        });
-    }
-
     // Profile-derived state, rebuilt whenever the aircraft switches (see the
     // generation check at the top of the loop). Seeded from the live profile.
     let mut active_gen = live_profile.generation();
     let mut profile = live_profile.get();
     let mut registry = Registry::for_aircraft(&profile);
-    let mut checklists = checklist::load(&profile).unwrap_or_else(|e| {
-        tracing::error!("checklist load failed: {e:#}; running without checklists");
-        Vec::new()
-    });
-    // The aircraft's manual index (built with `xvl index <id> <pdfs>`), for
-    // grounding the answer-only LLM in the POM. Absent = answers from state alone.
-    let mut manual_index = rag::Index::load(&profile.id);
-    if manual_index.is_some() {
-        tracing::info!(aircraft = %profile.id, "manual index loaded");
-    }
-    // The shared general-aviation index (the FAA handbooks: PHAK, AFH, IFH, and
-    // friends) rides alongside the POM for the questions no POM answers —
-    // airspace, weather theory, aerodynamics, procedures. Aircraft-independent,
-    // so it never reloads on an aircraft switch.
-    let general_index = rag::Index::load(rag::GENERAL_ID);
-    if general_index.is_some() {
-        tracing::info!("general aviation index loaded");
-    }
+    // The flow module owns the parsed lists (its phase-boundary runner and
+    // the panel need them off this loop); this is the same Arc for matching.
+    let mut checklists = flow::install(&profile);
     // The ATC station (tower dialogue), merged from the standalone atc binary:
     // it answers when COM1 is tuned to its tower frequency and the words parse
     // as a radio call. Read-only toward the sim; speaks in its own voice
@@ -1425,10 +1334,6 @@ async fn run_session(
         stt::build_prompt(&profile),
         tower::STT_PROMPT
     ));
-    // Tool specs for the LLM = curated tools + each checklist as a no-arg "tool"
-    // the loop intercepts and runs interactively.
-    let mut specs = registry.specs();
-    specs.extend(checklists.iter().map(|c| c.spec()));
     // Rolling conversation memory: recent (command, readback, when) turns, used
     // to resolve back-references and to gate conversational follow-ups.
     let mut history: Vec<(String, String, Instant)> = Vec::new();
@@ -1458,13 +1363,12 @@ async fn run_session(
 
     // Barge-in: a watcher thread that, while the copilot is speaking, kills the
     // audio the instant PTT is pressed — so the pilot is never talked over and a
-    // long readback or checklist yields immediately. Readbacks and checklists block
-    // the command loop while speaking, so the interrupt can't come from it; it needs
-    // its own thread. The flag lets a running checklist see the press and stop.
-    let interrupt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // long readback yields immediately. Readbacks block the command loop while
+    // speaking, so the interrupt can't come from it; it needs its own thread.
+    // (A checklist flow runs on its own thread and is stopped by the WORD
+    // "stop", not the press: the press is how the pilot answers it.)
     if let Some(ptt) = ptt.clone() {
         let wv = voice.clone();
-        let wi = interrupt.clone();
         std::thread::Builder::new()
             .name("barge-in".into())
             .spawn(move || {
@@ -1482,7 +1386,6 @@ async fn run_session(
                     if ptt_down && !was_ptt {
                         if wv.is_speaking() {
                             wv.shutup();
-                            wi.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         wv.set_hold(true);
                     }
@@ -1615,23 +1518,12 @@ async fn run_session(
             }
             // Crew side (edges only: AtcOnly is the one mode without a crew).
             if applied_mode == mode::Mode::AtcOnly && now_mode != mode::Mode::AtcOnly {
-                // Coming back from ATC-only: re-warm the LLM off the critical
-                // path so the first question doesn't pay cold prefill.
-                if config.llm_enabled {
-                    let warm = llm.clone();
-                    tokio::spawn(async move { warm.warmup().await });
-                }
                 atc_only_noted = false;
                 voice.alert(Priority::Advisory, "Copilot back with you.".to_string());
             } else if now_mode == mode::Mode::AtcOnly && applied_mode != mode::Mode::AtcOnly {
                 // Leaving the crew behind: cut any copilot speech and evict
-                // queued crew lines too, then evict the model so the GPU goes
-                // back to the sim. Radio traffic stays on the air.
+                // queued crew lines too. Radio traffic stays on the air.
                 voice.dismiss_crew();
-                if config.llm_enabled {
-                    let ev = llm.clone();
-                    tokio::spawn(async move { ev.evict().await });
-                }
             }
             applied_mode = now_mode;
         }
@@ -1832,16 +1724,13 @@ async fn run_session(
             active_gen = live_profile.generation();
             profile = live_profile.get();
             registry = Registry::for_aircraft(&profile);
-            checklists = checklist::load(&profile).unwrap_or_default();
-            manual_index = rag::Index::load(&profile.id);
+            checklists = flow::install(&profile);
             stt.set_prompt(stt::build_prompt(&profile));
             stt.set_radio_prompt(format!(
                 "{} {}",
                 stt::build_prompt(&profile),
                 tower::STT_PROMPT
             ));
-            specs = registry.specs();
-            specs.extend(checklists.iter().map(|c| c.spec()));
             // The old airframe's conversation dies with it: a back-reference
             // must never nudge a value commanded on a different aircraft.
             dialogue.clear();
@@ -2304,6 +2193,69 @@ async fn run_session(
                 }
             }
         }
+        // A checklist flow owns a closed set of short replies while it runs
+        // (yes/no at a hazard confirm, next/set/checked/skip at an instructor's
+        // item, stop always); a standing proposal ("Climb checklist when you're
+        // ready?") owns "go ahead" / "talk me through it" / "not now". Anything
+        // outside those words routes on: "flaps ten" mid-checklist is still
+        // flaps ten. After the governor and pushback pre-gates, so a "stop"
+        // on the ground stops the aircraft before it stops a list.
+        if let Some(reply) = flow::take_reply(&command) {
+            tracing::info!(?reply, path = "checklist-reply", "command path");
+            reporter.log(ui::LogKind::Info, format!("checklist reply: {reply:?}"));
+            continue;
+        }
+        if let Some(idx) = flow::proposal() {
+            if let Some(answer) = flow::proposal_reply(&command) {
+                tracing::info!(?answer, path = "checklist-proposal", "command path");
+                let flavour = match answer {
+                    flow::ProposalReply::Run => Some(flow::Flavour::Crew),
+                    flow::ProposalReply::Instruct => Some(flow::Flavour::Instruct),
+                    flow::ProposalReply::Decline => None,
+                };
+                match flavour {
+                    Some(f) => {
+                        flow::start(idx, f, (*config).clone(), voice.clone());
+                    }
+                    None => {
+                        flow::decline_proposal();
+                        say(
+                            &voice,
+                            &reporter,
+                            ui::LogKind::Readback,
+                            "Okay. Say the word when you want it.",
+                        );
+                    }
+                }
+                continue;
+            }
+        }
+        // "Talk me through the descent checklist": the instructor flavour, by
+        // name. It never writes; it says each item and watches you do it.
+        if let Some(request) = flow::instruct_request(&command) {
+            tracing::info!(path = "checklist-instruct", "command path");
+            match flow::find_titled(&checklists, &request) {
+                Ok(idx) => {
+                    if !flow::start(idx, flow::Flavour::Instruct, (*config).clone(), voice.clone()) {
+                        say(
+                            &voice,
+                            &reporter,
+                            ui::LogKind::Warn,
+                            "A checklist is already running. Say stop the checklist to end it.",
+                        );
+                    }
+                }
+                Err(choices) => {
+                    let msg = if choices.is_empty() {
+                        "I have no checklists for this aircraft.".to_string()
+                    } else {
+                        format!("Which checklist? I have: {}.", choices.join(", ").to_lowercase())
+                    };
+                    say(&voice, &reporter, ui::LogKind::Readback, &msg);
+                }
+            }
+            continue;
+        }
         // Read-only conversation runs before the spoken domain gate: "and now"
         // and clarification replies have no command keyword. Its response type
         // has no tool/action variant, and refreshed questions never enter grammar.
@@ -2415,26 +2367,10 @@ async fn run_session(
             }
         }
 
-        // History is only useful for the non-numeric voice references the rewrite
-        // can't handle ("switch it back to both"); a typed or named command is
-        // self-contained, and stale repeated turns only confuse the model.
-        let ctx_history: Vec<(String, String)> = if from_text || looks_like_command(&command) {
-            Vec::new()
-        } else {
-            history
-                .iter()
-                .filter(|(_, _, t)| t.elapsed() < HISTORY_TTL)
-                .map(|(u, a, _)| (u.clone(), a.clone()))
-                .collect()
-        };
-
-        // The LLM arbitrates: ACT on a command (one call per distinct action, so
-        // "taxi and nav lights on" makes two) or ANSWER a question in prose — a
-        // polite "could you start the engines?" acts; "what's our heading?"
-        // answers. A live state snapshot grounds both ("a bit more flaps", "how
-        // high are we?") — but only the LLM and the correction path read it, never
-        // the fast-path, so it's computed lazily below: the common fast-path
-        // command pays nothing for the burst of X-Plane reads it never uses.
+        // From here the utterance is resolved deterministically: the grammar
+        // (one call per distinct action, so "taxi and nav lights on" makes
+        // two), the dialogue stack for back-references, the state and
+        // knowledge answerers for questions. Nothing guesses; a miss is a miss.
         reporter.status(ui::Phase::Thinking);
 
         // Deterministic state queries answered without the LLM — the model proved
@@ -2489,7 +2425,21 @@ async fn run_session(
         // answered deterministically off the published taxi route — the FO
         // reading the airport diagram, never the LLM. Position reads happen
         // BEFORE the route lock: no guard held across an await.
-        if is_taxi_query(&command) && grammar::try_parse(&command, &registry, &profile).is_none() {
+        // Only ON THE GROUND: airborne, "where are we going?" is about the
+        // flight plan, and the taxi reading answered it with "we don't have a
+        // taxi clearance yet" at 1,000 ft (LEMG, 2026-09-12). A failed read
+        // keeps the old ground reading.
+        let on_ground_now = || async {
+            xplane
+                .get_float(datarefs::ON_GROUND_ANY)
+                .await
+                .map(|v| v > 0.5)
+                .unwrap_or(true)
+        };
+        if is_taxi_query(&command)
+            && grammar::try_parse(&command, &registry, &profile).is_none()
+            && on_ground_now().await
+        {
             let pos = match (
                 xplane.get_float(datarefs::LATITUDE).await,
                 xplane.get_float(datarefs::LONGITUDE).await,
@@ -3157,14 +3107,13 @@ async fn run_session(
         // only with an interrogative OPENER ("is/are/what/how...") or when the
         // grammar can't parse it anyway.
         // Checklists resolve deterministically by title ("before takeoff
-        // checklist"). Their specs still ride to the LLM, but the answer-only
-        // fallback can never call a tool - so without this, a grammar miss was
-        // the end of the road and every checklist was voice-unreachable (seen
-        // live in the G1000 172, 2026-07-14). Joined into `parsed` so whisper's
-        // habitual trailing "?" doesn't shunt a match down the question path.
+        // checklist"); without this a grammar miss was the end of the road and
+        // every checklist was voice-unreachable (seen live in the G1000 172,
+        // 2026-07-14). Joined into `parsed` so whisper's habitual trailing "?"
+        // doesn't shunt a match down the question path.
         let parsed = grammar::try_parse(&matchable, &registry, &profile).or_else(|| {
             checklist::match_request(&matchable, &checklists).map(|cl| {
-                vec![llm::ToolCall {
+                vec![tools::ToolCall {
                     name: cl.id.clone(),
                     arguments: serde_json::json!({}),
                 }]
@@ -3184,8 +3133,6 @@ async fn run_session(
                 continue;
             }
         }
-
-        let mut state: Option<String> = None;
 
         // Deterministic fast-path: resolve the common, regular commands with no
         // LLM at all — no GPU burst, no latency, and it can't pick the wrong tool.
@@ -3248,15 +3195,6 @@ async fn run_session(
                 continue;
             }
         }
-        // Whether the answer-only LLM fallback is live for THIS utterance. The
-        // plugin's panel button (dataref `xcopilot/llm_enabled`) overrides the
-        // startup default when set: 1 = on, 0 = off, and -1 / cache-miss (plugin
-        // untouched or not loaded) falls back to the XCOPILOT_LLM startup value.
-        let llm_enabled_now = match live.get(DR_LLM_ENABLED) {
-            Some(v) if v >= 0.5 => true,
-            Some(v) if v > -0.5 => false,
-            _ => config.llm_enabled,
-        };
         let calls = if let Some(c) = fast {
             tracing::info!(
                 path = "fast",
@@ -3264,65 +3202,13 @@ async fn run_session(
                 "command path"
             );
             c
-        } else if llm_enabled_now {
-            // Fast-path missed and the LLM is enabled: ANSWER-ONLY fallback. It is
-            // called with no tools and cannot actuate — only the deterministic
-            // grammar ever calls a tool. A genuine question gets a one-line spoken
-            // answer; anything else gets "Say again?". Never an action on a guess.
-            let ts = Instant::now();
-            let snap = state_snapshot(&xplane, &profile, Some(&live)).await;
-            tracing::info!(
-                ms = ts.elapsed().as_millis(),
-                state = snap.as_deref().unwrap_or("(none)"),
-                "state snapshot"
-            );
-            // Ground the answer in the manuals, when indexed: POM excerpts first
-            // (aircraft-specific beats general), then the shared FAA-handbook
-            // index for what no POM covers. Two small embedding calls, worst case.
-            let mut excerpt_parts: Vec<String> = Vec::new();
-            if let Some(ix) = &manual_index {
-                if let Some(e) = ix.retrieve(&config.ollama_base_url, &command, 4).await {
-                    excerpt_parts.push(e);
-                }
-            }
-            if let Some(ix) = &general_index {
-                if let Some(e) = ix.retrieve(&config.ollama_base_url, &command, 3).await {
-                    excerpt_parts.push(e);
-                }
-            }
-            let excerpts = (!excerpt_parts.is_empty()).then(|| excerpt_parts.join("\n---\n"));
-            let t = Instant::now();
-            let answer = llm
-                .answer(&command, &ctx_history, snap.as_deref(), excerpts.as_deref())
-                .await;
-            tracing::info!(
-                ms = t.elapsed().as_millis(),
-                path = "llm-answer",
-                "command path"
-            );
-            match answer {
-                Ok(Some(text)) => say(&voice, &reporter, ui::LogKind::Readback, &text),
-                Ok(None) => {
-                    // Heard clearly, but the answer-only LLM had no useful reply
-                    // (not a question, or out of scope). Same as a grammar miss:
-                    // negative tone on PTT, no misleading spoken "Say again?".
-                    reporter.log(ui::LogKind::Warn, format!("no match: \"{command}\""));
-                    if explicit && live.get(DR_OPT_TONE).is_none_or(|v| v > 0.5) {
-                        voice.negative();
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("LLM answer failed: {e:#}");
-                    reporter.log(ui::LogKind::Warn, "LLM unreachable");
-                }
-            }
-            continue;
         } else {
-            // Fully deterministic (LLM disabled, the default): nothing recognized
-            // it. The transcript was clear (it passed the confidence gate), so a
-            // spoken "Say again?" would falsely imply a mishear and repeating won't
-            // help. Log the miss to the panel and, when addressed directly (PTT),
-            // acknowledge with the negative tone. Continuous mode stays silent.
+            // Nothing recognized it. The transcript was clear (it passed the
+            // confidence gate), so a spoken "Say again?" would falsely imply a
+            // mishear and repeating won't help. Log the miss to the panel and,
+            // when addressed directly (PTT), acknowledge with the negative tone.
+            // Continuous mode stays silent. Every miss here is a rule not yet
+            // written: `xvl analyze` lists them by frequency.
             tracing::info!(path = "deterministic-miss", "command path");
             reporter.log(ui::LogKind::Warn, format!("unrecognized: \"{command}\""));
             if explicit && live.get(DR_OPT_TONE).is_none_or(|v| v > 0.5) {
@@ -3359,27 +3245,22 @@ async fn run_session(
                 format!("{} {}", call.name, call.arguments),
             );
 
-            // A checklist isn't a one-shot tool — the copilot runs it: reads each
-            // item, does the ones it can, calls out the pilot's. Needs the voice,
-            // so it's handled here, not via the plain ToolCtx. A checklist is a
-            // whole phase, run only on demand — so it's never compounded: run this
-            // one and ignore any other calls the LLM returned in the same turn
-            // (guards against chaining through several checklists at once).
-            if let Some(cl) = checklists.iter().find(|c| c.id == call.name) {
-                run_checklist(
-                    cl,
-                    &xplane,
-                    &config,
-                    &mut listener,
-                    &ptt_mic,
-                    &stt,
-                    &ptt,
-                    typed.as_ref(),
-                    &voice,
-                    &reporter,
-                    &interrupt,
-                )
-                .await;
+            // A checklist isn't a one-shot tool — the copilot runs it as a FLOW
+            // on its own thread (`flow::start`, Crew flavour): reads each item,
+            // does the ones it can, calls out the pilot's, and takes its
+            // yes/no/stop replies from this loop. A checklist is a whole phase,
+            // run only on demand — so it's never compounded: start this one and
+            // ignore any other calls the LLM returned in the same turn (guards
+            // against chaining through several checklists at once).
+            if let Some(i) = checklists.iter().position(|c| c.id == call.name) {
+                if !flow::start(i, flow::Flavour::Crew, (*config).clone(), voice.clone()) {
+                    say(
+                        &voice,
+                        &reporter,
+                        ui::LogKind::Warn,
+                        "A checklist is already running. Say stop the checklist to end it.",
+                    );
+                }
                 break;
             }
 
@@ -3437,21 +3318,15 @@ async fn run_session(
                     Some(correction) => {
                         reporter.log(ui::LogKind::Info, format!("correction: \"{correction}\""));
                         reporter.status(ui::Phase::Thinking);
-                        // A fast-path command never took the snapshot — take it now
-                        // so the correction is grounded in live state.
-                        if state.is_none() {
-                            state = state_snapshot(&xplane, &profile, Some(&live)).await;
-                        }
-                        match llm
-                            .choose_tool(
-                                &format!("{command}, {correction}"),
-                                &specs,
-                                &ctx_history,
-                                state.as_deref(),
-                            )
-                            .await
-                        {
-                            Ok(mut cs) if !cs.is_empty() => {
+                        // The correction re-parses through the grammar with the
+                        // original words in front ("flaps ten" + "twenty" reads
+                        // as flaps twenty); nothing outside the grammar is tried.
+                        match grammar::try_parse(
+                            &format!("{command}, {correction}"),
+                            &registry,
+                            &profile,
+                        ) {
+                            Some(mut cs) if !cs.is_empty() => {
                                 call = cs.remove(0);
                                 // The correction WAS the pilot's clear intent, so the
                                 // re-picked tool no longer needs the marginal read-back
@@ -3732,230 +3607,6 @@ fn preview_checklist(
     conversation.start_preview(cl.title.clone(), items, now)
 }
 
-/// Run a checklist the way a pilot-monitoring would: read each item aloud,
-/// perform the ones the copilot can (each tool reads the dataref back, so the
-/// action is verified), and call out the pilot's items. Mostly autonomous — it
-/// performs the flow top to bottom, but **pauses to confirm destructive steps**
-/// (engine start/stop, the run-up). Narration is naturally paced by the speech
-/// queue (one utterance plays before the next).
-///
-/// Abortable: press PTT at any point (the barge-in watcher stops it between
-/// items), say "stop"/"abort"/"cancel" at any confirm prompt, or type it in the
-/// TUI — it stops where it is, leaving what's already done.
-#[allow(clippy::too_many_arguments)]
-async fn run_checklist(
-    cl: &checklist::Checklist,
-    xplane: &XPlaneClient,
-    config: &Config,
-    listener: &mut Option<Listener>,
-    ptt_mic: &Option<PttMic>,
-    stt: &Stt,
-    ptt: &Option<Ptt>,
-    typed: Option<&std::sync::mpsc::Receiver<String>>,
-    voice: &Voice,
-    reporter: &Reporter,
-    interrupt: &std::sync::atomic::AtomicBool,
-) {
-    use checklist::Item;
-    use std::sync::atomic::Ordering;
-    // Start clean — only a press *during* this run should stop it.
-    interrupt.store(false, Ordering::Relaxed);
-    say(
-        voice,
-        reporter,
-        ui::LogKind::Info,
-        &format!("Running the {} checklist.", cl.title),
-    );
-    let ctx = ToolCtx {
-        xplane,
-        config,
-        voice: Some(voice),
-        status: reporter.status_sink(),
-        reminders: None,
-    };
-    let mut failed = 0usize;
-    let mut aborted = false;
-    for item in &cl.items {
-        // Barge-in (PTT pressed during the run) stops the checklist where it is.
-        if interrupt.swap(false, Ordering::Relaxed) {
-            aborted = true;
-            break;
-        }
-        // Typed abort (TUI): drain anything queued since the last item.
-        if let Some(rx) = typed {
-            while let Ok(msg) = rx.try_recv() {
-                if is_abort(&msg) {
-                    aborted = true;
-                }
-            }
-            if aborted {
-                break;
-            }
-        }
-        match item {
-            // Spoken context (remarks, reference lines).
-            Item::Narrate(text) => say(voice, reporter, ui::LogKind::Info, text),
-            // The pilot's item — call it out, don't perform it.
-            Item::CallOut(text) => say(voice, reporter, ui::LogKind::Confirm, text),
-            // The copilot's item — do it, then read the item back (or flag it).
-            Item::Act {
-                say: line,
-                tool,
-                args,
-                confirm,
-            } => {
-                // Destructive step — ask first. Yes does it; "stop/abort/cancel"
-                // aborts the whole checklist; anything else just skips this step.
-                // Exception: mixture-to-cutoff only stops a *running* engine, so
-                // pre-start (the SR22's "mixture lean" before-start item) it's the
-                // normal lean — skip the prompt and just do it.
-                let ask = match confirm {
-                    Some(h) if *h == checklist::CONFIRM_MIXTURE_CUTOFF => {
-                        checklist::engine_running(xplane).await
-                    }
-                    other => other.is_some(),
-                };
-                if ask {
-                    let hazard = confirm.expect("ask implies a confirm hazard");
-                    say(
-                        voice,
-                        reporter,
-                        ui::LogKind::Confirm,
-                        &format!("Confirm, {hazard}?"),
-                    );
-                    reporter.status(ui::Phase::Listening);
-                    let reply = listen_once(listener, ptt_mic, stt, ptt, None).map(|(r, _)| r);
-                    match reply {
-                        Some(r) if is_affirmative(&r.text) => {} // proceed
-                        Some(r) if is_abort(&r.text) => {
-                            aborted = true;
-                            break;
-                        }
-                        _ => {
-                            say(
-                                voice,
-                                reporter,
-                                ui::LogKind::Info,
-                                &format!("{line} Skipped — your call."),
-                            );
-                            continue;
-                        }
-                    }
-                }
-                if checklist::run_step(
-                    tool,
-                    args,
-                    &cl.lights,
-                    &cl.flaps,
-                    &cl.electrical,
-                    &cl.fuel_selector,
-                    cl.engines,
-                    cl.magnetos_per_engine,
-                    cl.park_brake_valve_set,
-                    cl.pitot_heat_dataref.clone(),
-                    &ctx,
-                )
-                .await
-                .is_ok()
-                {
-                    say(voice, reporter, ui::LogKind::Readback, line);
-                } else {
-                    say(
-                        voice,
-                        reporter,
-                        ui::LogKind::Warn,
-                        &format!("{line} Didn't take — check it."),
-                    );
-                    failed += 1;
-                }
-            }
-            // A dataref we don't actuate — read it and confirm or flag.
-            Item::Verify {
-                say: line,
-                dataref,
-                index,
-                cond,
-                settable,
-            } => {
-                match checklist::read_dataref(xplane, dataref, *index).await {
-                    Some(v) if cond.eval(v) => say(
-                        voice,
-                        reporter,
-                        ui::LogKind::Readback,
-                        &format!("{line} Confirmed."),
-                    ),
-                    // Not in the desired state.
-                    Some(_) if *settable => {
-                        // An actionable switch — set it to the checklist's own
-                        // target value (it's the authored procedure, not an
-                        // arbitrary write), then confirm. If the write doesn't take,
-                        // flag it.
-                        let target = cond.target();
-                        let wrote = match index {
-                            Some(i) => xplane
-                                .set_float_array_elem(dataref, *i, target)
-                                .await
-                                .is_ok(),
-                            None => xplane.set_float(dataref, target).await.is_ok(),
-                        };
-                        let now = checklist::read_dataref(xplane, dataref, *index).await;
-                        if wrote && now.is_some_and(|v| cond.eval(v)) {
-                            say(
-                                voice,
-                                reporter,
-                                ui::LogKind::Readback,
-                                &format!("{line} Set."),
-                            );
-                        } else {
-                            say(
-                                voice,
-                                reporter,
-                                ui::LogKind::Warn,
-                                &format!("{line} Couldn't set it — check it."),
-                            );
-                            failed += 1;
-                        }
-                    }
-                    // Observe-only item (CHECK/test step or read-only indicator) not
-                    // yet in state — call it out for the pilot, don't write or flag.
-                    Some(_) => say(voice, reporter, ui::LogKind::Confirm, line),
-                    // Couldn't read it — just call it out, don't flag.
-                    None => say(voice, reporter, ui::LogKind::Confirm, line),
-                }
-            }
-        }
-    }
-    let summary = if aborted {
-        format!("{} checklist aborted — stopped where we were.", cl.title)
-    } else if failed == 0 {
-        format!("{} checklist complete.", cl.title)
-    } else {
-        format!(
-            "{} checklist complete — {failed} item{} didn't take, check the panel.",
-            cl.title,
-            if failed == 1 { "" } else { "s" }
-        )
-    };
-    say(voice, reporter, ui::LogKind::Ok, &summary);
-}
-
-/// Is a reply an abort — "stop", "abort", "cancel" the whole checklist (distinct
-/// from a plain "no" at a step, which just skips that one item)?
-fn is_abort(reply: &str) -> bool {
-    let r = reply.to_lowercase();
-    [
-        "abort",
-        "stop",
-        "cancel",
-        "belay",
-        "disregard",
-        "halt",
-        "quit",
-    ]
-    .iter()
-    .any(|w| r.contains(w))
-}
-
 /// Standard Levenshtein edit distance.
 pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
@@ -4019,15 +3670,15 @@ fn transcribe_file(model_path: &str, input: &str) -> Result<String> {
     Ok(stt.transcribe_verbatim(&samples)?.text.trim().to_string())
 }
 
-/// Mine the logs for fast-path coverage and the LLM-fallback tail. Pairs each
-/// spoken transcript with the `command path` line that followed it, then reports
-/// the fast/LLM split and the most frequent LLM-fallback phrasings — the ones
-/// worth promoting into [`grammar`] next. The ratchet that makes the copilot
-/// cheaper and more deterministic the more it's flown.
+/// Mine the logs for fast-path coverage and the miss tail. Pairs each spoken
+/// transcript with the `command path` line that followed it, then reports the
+/// hit/miss split and the most frequent MISSED phrasings — the ones worth a
+/// rule in [`grammar`] or a matcher next. The ratchet that makes the copilot
+/// cover more the more it's flown.
 fn analyze_commands() -> Result<()> {
     use std::collections::HashMap;
     let mut last: Option<String> = None;
-    let (mut fast, mut llm) = (0u32, 0u32);
+    let (mut fast, mut miss) = (0u32, 0u32);
     let mut tail: HashMap<String, u32> = HashMap::new();
 
     let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir("logs")
@@ -4062,27 +3713,27 @@ fn analyze_commands() -> Result<()> {
                     }
                 }
             } else if line.contains("command path") {
-                if line.contains("path=\"fast\"") {
-                    fast += 1;
-                } else if line.contains("path=\"llm\"") {
-                    llm += 1;
+                if line.contains("path=\"deterministic-miss\"") {
+                    miss += 1;
                     if let Some(t) = &last {
                         *tail.entry(t.clone()).or_default() += 1;
                     }
+                } else if line.contains("path=") {
+                    fast += 1;
                 }
             }
         }
     }
 
-    let total = fast + llm;
+    let total = fast + miss;
     if total == 0 {
         println!("No command-path data in logs yet — run the app and issue some commands first.");
         return Ok(());
     }
     println!("commands analyzed: {total}");
-    println!("  fast-path (no LLM): {fast:>5}  ({}%)", fast * 100 / total);
-    println!("  LLM fallback:       {llm:>5}  ({}%)", llm * 100 / total);
-    println!("\npromotion candidates — frequent LLM-fallback phrasings to add to grammar.rs:");
+    println!("  handled:            {fast:>5}  ({}%)", fast * 100 / total);
+    println!("  missed:             {miss:>5}  ({}%)", miss * 100 / total);
+    println!("\nrule candidates, the most frequent missed phrasings:");
     let mut v: Vec<(String, u32)> = tail.into_iter().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     for (t, n) in v.into_iter().take(20) {
@@ -4534,7 +4185,6 @@ const SNAPSHOT_DATAREFS: &[&str] = &[
     datarefs::NAV_STATUS,
     datarefs::HEADING_STATUS,
     datarefs::COM1_FREQ_KHZ,
-    DR_LLM_ENABLED,
     DR_OPT_SNAP,
     DR_OPT_TONE,
 ];
@@ -4615,12 +4265,6 @@ fn callout_label(tool: &str, args: &serde_json::Value) -> String {
     }
 }
 
-/// The plugin's runtime LLM-fallback toggle (see plugin/src/xcopilot.cpp). Polled
-/// live through the snapshot cache so the panel button takes effect on the next
-/// utterance. `-1` = untouched (follow the `XCOPILOT_LLM` startup default), `0` =
-/// forced off, `1` = forced on. Absent (plugin not loaded) reads as a cache miss,
-/// which also falls back to the startup default.
-const DR_LLM_ENABLED: &str = "xcopilot/llm_enabled";
 /// Panel settings-popup switches, polled the same way. Missing (no plugin) =
 /// the feature's default (both on).
 const DR_OPT_SNAP: &str = "xcopilot/opt/camera_snap";
@@ -6679,6 +6323,82 @@ async fn answer_state_query(
             parts.push(format!("pitot heat {}", if v > 0.5 { "on" } else { "off" }));
         }
     }
+    // "What's the squawk code?" went to the LLM and came back as the words
+    // "Squawk code." (LEMG, 2026-09-12). The code and the mode are two
+    // datarefs the transponder tools already write.
+    if t.contains("squawk") || t.contains("transponder") {
+        if let Ok(c) = read1(live, xp, datarefs::TRANSPONDER_CODE).await {
+            let code = atis::spoken_digits(&format!("{:04}", c.round() as i64));
+            let mode = match read1(live, xp, "sim/cockpit2/radios/actuators/transponder_mode")
+                .await
+                .map(|m| m.round() as i64)
+            {
+                Ok(0) => ", transponder off",
+                Ok(1) => ", standby",
+                Ok(2) => ", on",
+                Ok(3) => ", altitude",
+                Ok(4) => ", test",
+                Ok(5) => ", ground",
+                _ => "",
+            };
+            parts.push(format!("squawk {code}{mode}"));
+        }
+    }
+    // "Where are we?" (not "where are we going", the plan's question): the
+    // position report a pilot gives, from the instruments, the leg being
+    // flown and the plan's destination. Went to the LLM three times and came
+    // back as an echo of the question (LEMG, 2026-09-12).
+    let where_now = (t.contains("where are we")
+        || t.contains("where am i")
+        || t.contains("our position")
+        || t.contains("position report")
+        || t.contains("where exactly are we"))
+        && !t.contains("going")
+        && !t.contains("headed")
+        && !t.contains("heading");
+    if where_now {
+        let (alt, hdg, gs, on_ground, lat, lon) = tokio::join!(
+            read1(live, xp, datarefs::ALTITUDE_FT),
+            read1(live, xp, datarefs::COMPASS_HEADING_DEG),
+            read1(live, xp, "sim/flightmodel/position/groundspeed"),
+            read1(live, xp, datarefs::ON_GROUND_ANY),
+            read1(live, xp, datarefs::LATITUDE),
+            read1(live, xp, datarefs::LONGITUDE),
+        );
+        if on_ground.is_ok_and(|g| g > 0.5) {
+            parts.push("on the ground".to_string());
+        } else if let Ok(a) = alt {
+            parts.push(format!("{} feet", auto_status::commas((a / 10.0).round() as i64 * 10)));
+        }
+        if let Ok(h) = hdg {
+            parts.push(format!("heading {:03}", (h.round() as i64).rem_euclid(360)));
+        }
+        if let Ok(g) = gs {
+            let kts = g * 1.943_84;
+            if kts >= 5.0 {
+                parts.push(format!("{kts:.0} knots over the ground"));
+            }
+        }
+        if let (Ok(lat), Ok(lon)) = (lat, lon) {
+            if let Some(leg) = procedure::active_leg() {
+                let d = nav::haversine_nm(lat, lon, leg.lat, leg.lon);
+                parts.push(format!("{d:.0} miles to {}", leg.fix));
+            }
+            let dest = monitor::DESTINATION
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|d| (d.lat, d.lon));
+            if let Some((dlat, dlon)) = dest {
+                let d = nav::haversine_nm(lat, lon, dlat, dlon);
+                let b = nav::bearing_deg(lat, lon, dlat, dlon);
+                parts.push(format!(
+                    "{d:.0} miles to the destination, bearing {:03}",
+                    (b.round() as i64).rem_euclid(360)
+                ));
+            }
+        }
+    }
 
     // System-wide failure check — reads the COMPLETE X-Plane failure set (see
     // failures.rs), never a keyword subset, so a failure with an off-pattern name
@@ -7043,114 +6763,6 @@ async fn answer_state_query(
     (!parts.is_empty()).then(|| format!("{}.", parts.join(", ")))
 }
 
-/// A compact live-state line for the LLM's context, so it can ground relative or
-/// ambiguous commands ("a bit more flaps", "level off") in what's actually true.
-/// Each field is best-effort: a dataref that won't read is skipped, and if none
-/// read (X-Plane unreachable) this returns `None` and the model runs context-free.
-async fn state_snapshot(
-    xp: &XPlaneClient,
-    profile: &aircraft::AircraftProfile,
-    live: Option<&LiveState>,
-) -> Option<String> {
-    // Reads prefer the live-state WebSocket cache (instant, no round-trip) and
-    // fall back to a concurrent REST read on a cache miss — so this is never worse
-    // than the old all-REST burst, and near-free once the subscription is warm.
-    let (alt, ias, vs, hdg, flap, gear, og, fuel, ap, engine, wind_dir, wind_kts, oat, vis, qnh) = tokio::join!(
-        read1(live, xp, datarefs::ALTITUDE_FT),
-        read1(live, xp, datarefs::AIRSPEED_KTS),
-        read1(live, xp, datarefs::VVI_FPM),
-        read1(live, xp, datarefs::COMPASS_HEADING_DEG),
-        read1(live, xp, datarefs::FLAP_RATIO),
-        read1(live, xp, datarefs::GEAR_HANDLE_DOWN),
-        read1(live, xp, datarefs::ON_GROUND_ANY),
-        read1(live, xp, datarefs::FUEL_TOTAL_KG),
-        ap_mode(xp, live),
-        checklist::engine_running(xp),
-        // Weather, so "what's the weather?" gets real numbers. Wind/OAT are the
-        // cockpit-relative indicators (mirror the gauges); visibility and QNH come
-        // from the XP12 aircraft-weather datarefs. All confirmed reading live.
-        read1(live, xp, datarefs::WIND_DIR_DEG_TRUE),
-        read1(live, xp, datarefs::WIND_SPEED_MSC),
-        read1(live, xp, datarefs::OAT_DEG_C),
-        read1(live, xp, datarefs::VISIBILITY_SM),
-        read1(live, xp, datarefs::QNH_PASCALS),
-    );
-    let mut parts: Vec<String> = Vec::new();
-    if let Ok(v) = alt {
-        parts.push(format!("altitude {v:.0} ft"));
-    }
-    if let Ok(v) = ias {
-        parts.push(format!("airspeed {v:.0} knots"));
-    }
-    if let Ok(v) = vs {
-        parts.push(format!("vertical speed {v:+.0} fpm"));
-    }
-    if let Ok(v) = hdg {
-        parts.push(format!("heading {v:03.0}"));
-    }
-    if let Ok(v) = flap {
-        parts.push(format!("flaps {:.0}%", v * 100.0));
-    }
-    if profile.retractable_gear {
-        if let Ok(v) = gear {
-            parts.push(format!("gear {}", if v > 0.5 { "down" } else { "up" }));
-        }
-    }
-    if let Ok(v) = og {
-        parts.push(format!(
-            "on the ground: {}",
-            if v > 0.5 { "yes" } else { "no" }
-        ));
-    }
-    if let Ok(v) = fuel {
-        // Report in gallons (how a GA pilot thinks) with the mass alongside, plus an
-        // endurance estimate from the profile's cruise burn so "how long can we fly?"
-        // has a real answer.
-        let gal = v / AVGAS_KG_PER_GAL;
-        let mut s = format!("fuel on board {gal:.0} gallons ({v:.0} kg)");
-        if let Some(f) = &profile.fuel {
-            if f.cruise_burn_kg_hr > 0.0 {
-                let hours = v / f.cruise_burn_kg_hr;
-                s.push_str(&format!(", about {hours:.1} hours endurance at cruise"));
-            }
-        }
-        parts.push(s);
-    }
-    // Weather: wind as "direction at speed" (calm if barely moving), plus OAT.
-    // Wind speed is m/s from the aircraft-weather dataref → knots.
-    if let (Ok(dir), Ok(spd_ms)) = (wind_dir, wind_kts) {
-        let kts = spd_ms * MS_TO_KTS;
-        if kts < 1.0 {
-            parts.push("wind calm".to_string());
-        } else {
-            parts.push(format!("wind {dir:03.0} at {kts:.0} knots"));
-        }
-    }
-    if let Ok(v) = oat {
-        parts.push(format!("outside air temperature {v:.0} degrees celsius"));
-    }
-    if let Ok(v) = vis {
-        parts.push(format!("visibility {v:.0} statute miles"));
-    }
-    if let Ok(v) = qnh {
-        // qnh_pas is sea-level pressure in Pascals; report as the altimeter
-        // setting in inches of mercury (1 inHg = 3386.389 Pa).
-        parts.push(format!("altimeter {:.2}", v / 3386.389));
-    }
-    // Engine status — only when X-Plane is actually reachable (some scalar read
-    // succeeded), since engine_running defaults to true when it can't read.
-    if !parts.is_empty() {
-        parts.push(format!(
-            "engines {}",
-            if engine { "running" } else { "off" }
-        ));
-    }
-    if ap != "--" {
-        parts.push(format!("autopilot {ap}"));
-    }
-    (!parts.is_empty()).then(|| parts.join(", "))
-}
-
 /// The capture tuning currently applied to the open microphone.
 ///
 /// The three mic knobs are the ones a pilot tunes by ear, so they are live —
@@ -7234,9 +6846,6 @@ fn boot_health(config: &Config) -> health::Boot {
         listen,
         mic: audio::default_input_name().unwrap_or_else(|| "no input device".into()),
         xplane_url: config.xplane_base_url.clone(),
-        ollama_url: config.ollama_base_url.clone(),
-        llm_model: config.model.clone(),
-        llm_enabled: config.llm_enabled,
         atc_airport: config.atc_airport.trim().to_string(),
         simbrief: !config.simbrief_id.trim().is_empty(),
         voices,
@@ -7262,30 +6871,6 @@ fn voice_stem(spec: &str) -> String {
     match sid {
         Some(n) => format!("{stem}#{n}"),
         None => stem,
-    }
-}
-
-/// Summarize the active autopilot lateral mode for the panel. Reads prefer the
-/// live-state cache when given one (snapshot's hot path), else REST (the poller).
-async fn ap_mode(xp: &XPlaneClient, live: Option<&LiveState>) -> String {
-    let (servos, appr, nav, hdg) = tokio::join!(
-        read1(live, xp, datarefs::SERVOS_ON),
-        read1(live, xp, datarefs::APPROACH_STATUS),
-        read1(live, xp, datarefs::NAV_STATUS),
-        read1(live, xp, datarefs::HEADING_STATUS),
-    );
-    if servos.unwrap_or(0.0) <= 0.5 {
-        return "--".to_string();
-    }
-    let (appr, nav, hdg) = (appr.unwrap_or(0.0), nav.unwrap_or(0.0), hdg.unwrap_or(0.0));
-    if appr >= 1.0 {
-        "APR".into()
-    } else if nav >= 1.0 {
-        "NAV".into()
-    } else if hdg >= 1.0 {
-        "HDG".into()
-    } else {
-        "ON".into()
     }
 }
 
@@ -8140,7 +7725,7 @@ fn whisper_model_label(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_confidence, is_abort, is_affirmative, is_undo, join_and, progress_line,
+        classify_confidence, is_affirmative, is_undo, join_and, progress_line,
         radio_panel_line, undoable_drefs, ConfidenceAction, Ptt,
     };
 
@@ -8856,6 +8441,7 @@ mod tests {
 
     #[test]
     fn abort_is_distinct_from_skip_and_yes() {
+        let is_abort = |w: &str| crate::flow::classify(w) == Some(crate::flow::Reply::Abort);
         // Abort the whole checklist.
         for w in ["stop", "abort", "cancel", "belay that", "disregard"] {
             assert!(is_abort(w), "{w:?} should abort");

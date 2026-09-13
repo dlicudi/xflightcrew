@@ -967,7 +967,7 @@ protected:
             ImGui::TextUnformatted("Mode");
             ImGui::RadioButton("Copilot + ATC", &mode, 0);
             ImGui::RadioButton("Copilot only (real/external ATC has the radio)", &mode, 1);
-            ImGui::RadioButton("ATC only (no copilot, no LLM)", &mode, 2);
+            ImGui::RadioButton("ATC only (no copilot)", &mode, 2);
             if (mode != drefs::opt_mode()) drefs::set_opt_mode(mode);
             ImGui::Spacing();
             ImGui::Separator();
@@ -1006,10 +1006,6 @@ protected:
                                "Copilot settings hidden in ATC-only mode.");
         }
         if (!crew_off) {
-        bool llm_on = (drefs::llm_enabled() == 1);
-        if (ImGui::Checkbox("LLM fallback (answer questions)", &llm_on)) {
-            drefs::set_llm_enabled(llm_on ? 1 : 0);
-        }
         bool snap = drefs::opt_camera_snap() != 0;
         if (ImGui::Checkbox("Camera snap-to-panel on actions", &snap)) {
             drefs::set_opt_camera_snap(snap ? 1 : 0);

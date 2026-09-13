@@ -622,18 +622,12 @@ fn question_queries(t: &str) -> Option<Vec<&'static str>> {
 }
 
 fn preview_request(t: &str) -> Option<&str> {
-    if matches!(
-        t,
-        "preview a checklist" | "preview the checklist" | "walk me through a checklist"
-    ) {
+    // "walk / talk me through" is the live instructor flow (`flow::instruct_request`),
+    // not a preview: a preview reads, the instructor watches you do it.
+    if matches!(t, "preview a checklist" | "preview the checklist") {
         return Some("");
     }
-    let rest = [
-        "walk me through ",
-        "talk me through ",
-        "preview ",
-        "explain ",
-    ]
+    let rest = ["preview ", "explain "]
     .iter()
     .find_map(|prefix| t.strip_prefix(prefix))?;
     rest.trim_start_matches("the ").strip_suffix(" checklist")
@@ -996,9 +990,11 @@ mod tests {
         let now = Instant::now();
         let mut c = Conversation::default();
         assert_eq!(
-            c.respond("walk me through the before takeoff checklist", now),
+            c.respond("preview the before takeoff checklist", now),
             Some(Response::Checklist("before takeoff".into()))
         );
+        // "Walk me through" is the instructor's, not the preview's.
+        assert_eq!(c.respond("walk me through the before takeoff checklist", now), None);
         let line = c.start_preview(
             "Before Takeoff".into(),
             vec!["Brakes set".into(), "Flaps ten".into()],

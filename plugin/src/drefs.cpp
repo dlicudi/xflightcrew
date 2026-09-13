@@ -47,18 +47,6 @@ static int RadioPttCommandHandler(XPLMCommandRef, XPLMCommandPhase phase, void*)
 }
 static int ReadRadioPttActive(void*) { return g_radio_ptt_active; }
 
-// ---- LLM fallback toggle ----------------------------------------------------
-
-// A runtime switch the panel flips and the app reads live (each utterance), so
-// the answer-only LLM fallback can be turned on/off mid-flight without a restart.
-//   -1 = untouched → the app follows its own XCOPILOT_LLM startup default
-//    0 = forced off
-//    1 = forced on
-static int g_llm_enabled = -1;
-static XPLMDataRef g_llm_dref = nullptr;
-static int ReadLlmEnabled(void*) { return g_llm_enabled; }
-static void WriteLlmEnabled(void*, int v) { g_llm_enabled = v; }
-
 // ---- panel requests (plugin → app) -------------------------------------------
 
 // The emergency buttons write a request code the app polls and consumes (same
@@ -948,10 +936,6 @@ void start() {
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteAircraft, &g_aircraft, &g_aircraft);
     fms::register_datarefs();
     audio::register_datarefs();
-    g_llm_dref = XPLMRegisterDataAccessor(
-        "xcopilot/llm_enabled", xplmType_Int, 1,
-        ReadLlmEnabled, WriteLlmEnabled, nullptr, nullptr, nullptr, nullptr,
-        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     g_request_dref = XPLMRegisterDataAccessor(
         "xcopilot/request", xplmType_Int, 1,
         ReadRequest, WriteRequest, nullptr, nullptr, nullptr, nullptr,
@@ -1157,7 +1141,6 @@ void stop_rest() {
     if (g_opt_snap_dref) { XPLMUnregisterDataAccessor(g_opt_snap_dref); g_opt_snap_dref = nullptr; }
     if (g_strip_dref) { XPLMUnregisterDataAccessor(g_strip_dref); g_strip_dref = nullptr; }
     if (g_request_dref) { XPLMUnregisterDataAccessor(g_request_dref); g_request_dref = nullptr; }
-    if (g_llm_dref) { XPLMUnregisterDataAccessor(g_llm_dref); g_llm_dref = nullptr; }
     audio::unregister_datarefs();
     fms::unregister_datarefs();
     if (g_aircraft_dref) { XPLMUnregisterDataAccessor(g_aircraft_dref); g_aircraft_dref = nullptr; }
@@ -1195,8 +1178,6 @@ void tune_com1(int khz) { if (g_com1_dref) XPLMSetDatai(g_com1_dref, khz); }
 int request() { return g_request; }
 void set_request(int v) { g_request = v; }
 
-int llm_enabled() { return g_llm_enabled; }
-void set_llm_enabled(int v) { g_llm_enabled = v; }
 int opt_camera_snap() { return g_opt_camera_snap; }
 void set_opt_camera_snap(int v) { g_opt_camera_snap = v; }
 int opt_negative_tone() { return g_opt_negative_tone; }

@@ -143,6 +143,56 @@ checklist_map:
   - { match: navigation_lights,             action: !light nav }
   - { match: nav_lights,                    action: !light nav }
 
+# Where things are, for "where's the X?" (answered from here, never guessed;
+# longest matching key wins). Laminar 172SP: the rocker switch row runs along
+# the bottom left of the panel, left to right MASTER, FUEL PUMP, BCN, LAND,
+# TAXI, NAV, STROBE, PITOT HEAT. "Where's the fuel pump?" missed three times
+# on the LEMG sortie (2026-09-12) for want of this block.
+locations:
+  fuel pump: "the FUEL PUMP rocker in the switch row along the bottom left of the panel, right of the master switch"
+  aux fuel pump: "the FUEL PUMP rocker in the switch row along the bottom left of the panel, right of the master switch"
+  auxiliary fuel pump: "the FUEL PUMP rocker in the switch row along the bottom left of the panel, right of the master switch"
+  auxiliary pump: "the FUEL PUMP rocker in the switch row along the bottom left of the panel, right of the master switch"
+  boost pump: "the FUEL PUMP rocker in the switch row along the bottom left of the panel, right of the master switch"
+  master switch: "the red split rocker at the left end of the bottom switch row, BAT and ALT halves"
+  battery switch: "the BAT half of the red master rocker at the left end of the bottom switch row"
+  alternator switch: "the ALT half of the red master rocker at the left end of the bottom switch row"
+  avionics master: "the two-part BUS 1 and BUS 2 rocker on the left of the panel, above the bottom switch row"
+  ignition switch: "the key switch on the lower left of the panel, left of the master switch"
+  ignition key: "the key switch on the lower left of the panel, left of the master switch"
+  magnetos: "the key switch on the lower left of the panel, left of the master switch: OFF, R, L, BOTH, START"
+  beacon light: "the BCN rocker in the bottom left switch row, right of the fuel pump"
+  beacon: "the BCN rocker in the bottom left switch row, right of the fuel pump"
+  landing light: "the LAND rocker in the bottom left switch row"
+  taxi light: "the TAXI rocker in the bottom left switch row"
+  nav lights: "the NAV rocker in the bottom left switch row"
+  navigation lights: "the NAV rocker in the bottom left switch row"
+  strobe lights: "the STROBE rocker in the bottom left switch row"
+  strobes: "the STROBE rocker in the bottom left switch row"
+  pitot heat: "the PITOT HEAT rocker at the right end of the bottom left switch row"
+  fuel selector: "on the floor between the seats, the rotary with LEFT, BOTH and RIGHT"
+  fuel shutoff valve: "the red knob on the floor pedestal behind the fuel selector. Pushed in is open"
+  parking brake: "the pull handle under the panel by the pilot's left knee. Pull to set, push to release"
+  flaps: "the flap lever right of the throttle, with 10, 20 and FULL detents and the indicator above it"
+  flap lever: "right of the throttle, with 10, 20 and FULL detents and the indicator above it"
+  throttle: "the black push-pull knob in the centre of the lower panel"
+  mixture: "the red push-pull knob right of the throttle"
+  carb heat: "the knob left of the throttle labelled CARB HEAT. Out is hot"
+  carburettor heat: "the knob left of the throttle labelled CARB HEAT. Out is hot"
+  elevator trim: "the trim wheel on the pedestal below the throttle. Forward is nose down"
+  trim wheel: "on the pedestal below the throttle. Forward is nose down"
+  alternate static: "the pull knob under the panel left of the throttle, labelled STATIC PRESSURE ALTERNATE"
+  circuit breakers: "the row of breakers along the bottom of the pilot's panel, right of the switch row"
+  transponder: "in the radio stack, below the GPS and the nav com radios"
+  autopilot: "the KAP 140 panel in the radio stack, below the transponder"
+  cabin heat: "the two pull knobs under the right side of the panel, CABIN HT and CABIN AIR"
+
+# Checklist flow (src/flow.rs): the section read at each phase boundary. The
+# defaults find this file's own titles by their words (CLIMB, CRUISE, DESCENT,
+# BEFORE LANDING, AFTER LANDING), so nothing is declared here. A file whose
+# titles differ maps them:
+#   checklist_flow: { climb: CLIMB, before_landing: APPROACH, after_landing: TAXI IN }
+
 # Phase-expectation advisor: standard VFR lighting discipline. Taxi light on
 # the ground; strobes whenever airborne; landing light for the takeoff and the
 # arrival. The copilot ACTS on these (fires `command`) rather than only advising.

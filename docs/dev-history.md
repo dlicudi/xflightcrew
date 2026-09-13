@@ -4,6 +4,149 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## The LLM retired, and a night of rules — 2026-09-13
+
+"Is the LLM not worth having?" The answer-only Ollama fallback (qwen3:8b,
+thinking off, off by default since July) was switched on from the panel and
+tested live on the LEMG sortie the evening before: four utterances reached
+it in about a second each, three were correctly refused by its own prompt
+("Say again?" for a statement, chatter and an opinion question), the one
+real question came back as a three-word fragment, the cold load took 96 s,
+and Ollama generating on Metal is the one measured cause of the sim dropping
+to 20 to 30 fps. Everything worth answering that night had been answered
+before the model was consulted. Decision, the pilot's: "the better approach
+is to augment our deterministic code", and "wipe out LLM config etc".
+
+Removed: `llm.rs` and `rag.rs` (the RAG index's only consumer was the answer
+path, and its embeddings came from Ollama), the `index` and `ask`
+subcommands, the config knobs (`XCOPILOT_LLM`, `XCOPILOT_MODEL`,
+`OLLAMA_BASE_URL`, keepalive, GPU layers), the settings-registry knob, the
+Health screen's Ollama probe and LLM line, the plugin's `xcopilot/llm_enabled`
+dataref and its Settings checkbox, the warmup on the mode edge, the
+`ToolSpec` plumbing and each checklist's model-facing description. The
+`ToolCall` type moved to `tools`. The correction path ("negative, 500") now
+re-parses through the grammar instead of re-asking a model. `xvl analyze`
+counts handled against missed and lists the most frequent missed phrasings:
+the ratchet. The `indexes/` files stay on disk, untracked, for the day an
+instructor answers handbook questions.
+
+The rules from the same log, each with the transcript as its test: the 172
+profile gets a `locations:` map (the fuel pump was asked for three times;
+the Laminar switch row and the pedestal, from the real aircraft); "what's
+the squawk code" reads the code and mode; "where are we" gives a position
+report (altitude, heading, groundspeed, the fix being flown, the range and
+bearing to the destination) instead of an echo of the question; "please take
+over" is the hand-over "take control" already was, with the same direction
+test; the echo memory no longer remembers the copilot's own coached phrase
+("Say navigate to follow the plan" was repeated by the pilot and rejected as
+echo, without a word); the instructor flavour performs an item on "can you
+help me with that item" / "you do it" / "do it for me"; the climb list
+triggers at 1,200 ft, after the lights rule has put the landing light out at
+1,000; and autoland lights the landing light at the final, which the BEFORE
+LANDING cross-check had honestly flagged as not set. Still open from that
+log: "navigate" on the 172 reports "LNAV didn't engage" (needs the sim to
+probe the KAP 140's status datarefs), and "fly the flight plan" airborne is
+refused by design while the follower has no airborne-join.
+
+## "Where are we going?" at a thousand feet — 2026-09-12
+
+Same evening, airborne after a restart: "Where are we going?" got "We
+don't have a taxi clearance yet. Call the tower and request taxi." The
+taxi-guide question gate (`is_taxi_query`) ran before the flight-plan
+question path and claimed the words regardless of height. It now applies
+on the ground only (a failed read keeps the ground reading); airborne the
+same words reach the plan path, which names the destination.
+
+## The squawk that arrived 13 seconds late — 2026-09-12
+
+"I think the copilot is not setting transponder code." LEMG to LERL under
+full auto, 23:06Z. The blackbox has `request_clearance` at :09 and the
+tower's clearance with squawk 4503 at :52, but the crew's call only left at
+:45: it rides the speech queue, behind the seventeen-second arming brief
+and a Ryanair the tower was working. The squawk wait was 30 s from the
+QUEUEING, so at :39 full auto said "Tuning the tower, requesting taxi" and
+moved on, and the clearance that came back 13 s later had nobody waiting
+for it. The transponder showed 7000 all the way to the climb, where the
+departure controller asked twice to "confirm squawk four five zero three".
+
+The taxi request learned this in July (25 s, then 90 s, each beaten by a
+second; now 180 s). The squawk gets the same treatment in two halves: the
+wait is 60 s, and the squawk is OWED rather than missed. `ensure_squawk`
+(the pure `squawk_owed` decides: assigned, and the transponder does not
+show it) runs after the wait, at the holding point before the departure
+call, and lined up; a late code is dialled and announced wherever it is
+first seen, blackboxed `squawk_set` with what the transponder showed.
+
+## Checklist flows: the list at its phase, and an instructor's first lesson — 2026-09-12
+
+"When we fly, copilot should be following checklists; it should also be
+capable as an instructor to tell me what to do." Both gaps had the same
+missing piece. The XChecklist interpreter (`checklist.rs`) knew every item's
+words, pass test and action, but was reached only from a spoken request and
+ran INLINE in the command loop, listening for its own confirms with
+`listen_once`; nothing read CLIMB, CRUISE, DESCENT, BEFORE LANDING or AFTER
+LANDING when the flight got there, full auto flew its own hard-coded
+configuration (the 2026-09-12 mixture entry parked "reading the lists at
+the phase boundaries" for its own ask), and the "instructor" was a note in
+CLAUDE.md: a third persona, mode-gated, never actuating.
+
+`flow.rs`. One runner on its own thread (the automations' pattern: a
+`std::thread` with its own current-thread runtime, since the main runtime
+blocks on the mic), speaking through the crew voice (`Voice::say_crew`:
+blocking like `say`, crew-gated and panel-mirrored like `alert`), replies
+taken from the command loop through `flow::take_reply` with a CLOSED
+vocabulary. Three flavours of the same list. **Crew**: the old runner's
+behaviour, plus a read BEFORE the write (an item already in state is
+confirmed, not re-written under the pilot's hand) and `held_by_automation`
+(the governor's throttle, the manager's mixture, autoland's flaps, the
+flying loops' AP are named as held, never written: one writer per dataref).
+**Monitor**: under an automation the copilot IS the pilot flying, so the
+list is a read-only cross-check: narration skipped, each item confirmed
+from its dataref, a discrepancy spoken ("Autopilot, off. Not set.") and
+blackboxed, never a write. The mission's laws act; the list audits them,
+and the debrief now prints the audit. **Instruct**: never writes by
+construction; every item is an instruction, then a 500 ms watch on the
+item's dataref for the pilot to satisfy it ("Good."), advanced by
+"next"/"set"/"checked", skipped by "skip", the clock restarted by "hold
+on", timed out at 45 s ("Still not done. Moving on."). To make the read and
+the watch possible `Item::Act` now carries the file's dataref, index and
+condition alongside the tool call.
+
+Who starts one. The monitor's `flow::Tracker` (pure, tested with a whole
+flight and a pattern): climb at 800 ft AGL climbing, cruise after 30 s
+level above 2,000 ft AGL, descent after 20 s down from a flight that
+reached cruise height, before landing after 10 s descending below 1,500 ft,
+after landing after 10 s under 30 kt on the ground; each once per flight,
+re-armed by the next takeoff roll, so a circuit at 1,000 ft earns climb and
+before-landing only. At a boundary `phase_boundary` starts the Monitor
+flavour if full auto, the follower, the circuit or autoland is flying;
+otherwise the copilot PROPOSES ("Climb checklist when you're ready?") and
+the command loop's `proposal_reply` takes "go ahead"/"yes"/"ready" (Crew),
+"talk me through it" (Instruct) or "not now"/"later" (decline), 120 s TTL,
+never acting on its own. By voice: "descent checklist" and the LLM's
+checklist pick start Crew; "talk / walk / guide / coach me through the X
+checklist" (`instruct_request`) starts Instruct, taken from the
+conversation module's preview, which keeps "preview / explain the X
+checklist" as the read-only recital. Sections resolve by the same
+`match_request` a spoken title uses (the 172 and SR22 files match their own
+words); a profile whose titles differ maps them in `checklist_flow:`; a
+missing section proposes nothing and blackboxes `no_section`.
+
+Retired: `run_checklist` and its `interrupt` flag (the PTT press is now how
+the pilot ANSWERS a list, not how they stop it; the word "stop" stops it,
+after the governor and pushback pre-gates so a "stop" on the ground still
+stops the aircraft first). The panel: `flow::status()` ("checklist: climb,
+3 of 8") in the managers, CANCEL picks "stop the checklist" when nothing is
+flying. Blackbox kind `checklist` (start, proposed, declined, held,
+discrepancy, not_done, complete, abort, no_section), in the debrief.
+
+Not done: a generic list for the six airframes with no checklist file (the
+Baron, DC-3, Otter, C90B, Evolution, RV-10 and every generic airframe hear
+nothing at the boundaries); an instructor MODE that refuses the crew's
+tools; the ACS scorer over the blackbox. Not flown yet: the first in-sim
+sortie will say whether the tracker's thresholds and the Monitor flavour's
+wording are right.
+
 ## Exterior lights by the book — 2026-09-12
 
 "So for the SR22, landing lights = landing + taxi lights?" Yes, and "ok

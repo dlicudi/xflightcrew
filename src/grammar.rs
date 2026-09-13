@@ -2,12 +2,12 @@
 //!
 //! The bulk of real commands are regular — `<subject> <number>`, `<system>
 //! on/off`, `flaps <detent>`, and a handful of fixed verbs (log-mined from actual
-//! usage: ~80%). This parses those straight to tool calls with **no LLM** — no
+//! usage: ~80%). This parses those straight to tool calls deterministically — no
 //! GPU burst, no latency, and it can't pick the wrong tool. Anything it can't
 //! confidently match (compound, relative, fuzzy, novel) returns `None`, and the
-//! caller falls back to the LLM. Note this matches on shape, not intent: a
+//! caller treats the utterance as a miss. Note this matches on shape, not intent: a
 //! question like "is our heading 270?" has the same keyword+number form as a
-//! command, so the caller must withhold questions from the fast-path (the LLM
+//! command, so the caller must withhold questions from the fast-path (the answerers
 //! arbitrates act-vs-answer) before calling in.
 //!
 //! Every candidate is **validated against the live tool schema** (the tool exists
@@ -20,11 +20,11 @@
 use serde_json::{json, Value};
 
 use crate::aircraft::AircraftProfile;
-use crate::llm::ToolCall;
+use crate::tools::ToolCall;
 use crate::phrase::word_value;
 use crate::tools::Registry;
 
-/// Markers of a relative/contextual command only the LLM can resolve.
+/// Markers of a relative/contextual command the dialogue stack resolves, not the grammar.
 const RELATIVE: &[&str] = &[
     "more",
     "less",
@@ -269,10 +269,10 @@ pub fn try_parse(
         return Some(vec![c]);
     }
     if t.is_empty() || is_compound(&t) {
-        return None; // empty or a real multi-action compound -> LLM
+        return None; // empty or a real multi-action compound -> miss
     }
     if RELATIVE.iter().any(|w| t.contains(w)) {
-        return None; // relative/contextual -> LLM
+        return None; // relative/contextual -> the dialogue stack
     }
     let mut c = parse_one(&t)?;
     // Engine start/stop come in a singular flavor (piston single: `start_engine`/
@@ -1587,7 +1587,11 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         || t.contains("i am taking")
         || t.contains("can i take")
         || t.contains("i want");
-    let whole_aircraft_takeover = (t.contains("take control") || t.contains("take the controls"))
+    // "Please take over" was dropped without a word (LEMG, 2026-09-12):
+    // the same hand-over as "take control", with the same direction test.
+    let whole_aircraft_takeover = (t.contains("take control")
+        || t.contains("take the controls")
+        || t.contains("take over"))
         && !pilot_takes
         && ![
             "throttle", "power", "radio", "radios", "flaps", "speed", "heading", "lights",
@@ -1596,7 +1600,10 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         .any(|sys| has(t, sys));
     // The pilot taking over is a release: autopilot off, recovery dropped.
     if pilot_takes
-        && (t.contains("control") || t.contains("the aircraft") || t.contains("the plane"))
+        && (t.contains("control")
+            || t.contains("the aircraft")
+            || t.contains("the plane")
+            || t.contains("take over"))
     {
         return Some(call("autopilot_off", json!({})));
     }
@@ -2288,6 +2295,10 @@ mod tests {
         assert_eq!(one("im taking control").unwrap().0, "autopilot_off");
         // ...while asking the COPILOT to take over still recovers.
         assert_eq!(one("take control").unwrap().0, "recover");
+        assert_eq!(one("please take over").unwrap().0, "recover");
+        assert_eq!(one("can you take over").unwrap().0, "recover");
+        assert_eq!(one("let me take over").unwrap().0, "autopilot_off");
+        assert_ne!(one("take over the radios").map(|(t, _)| t).as_deref(), Some("recover"));
         assert_eq!(one("you have the aircraft").unwrap().0, "recover");
         // Talk-down arm/cancel phrasings, including the live whisper garbles
         // ("top me down", "toadown") and the natural landing-help ask.
@@ -3051,7 +3062,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_falls_back_to_llm() {
+    fn ambiguous_is_a_miss_not_a_guess() {
         assert_eq!(one("a bit more flaps"), None); // relative
         assert_eq!(one("taxi and nav lights on"), None); // compound
         assert_eq!(one("switch it back to both"), None); // relative

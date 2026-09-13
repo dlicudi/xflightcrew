@@ -6,9 +6,10 @@
 //! dataref after writing and confirms the actual value. A copilot confirms the
 //! action, not the intent.
 //!
-//! The [`Tool`] schema is backend-neutral (`name` + `description` +
-//! JSON-schema `parameters`); [`crate::llm`] wraps it into whatever the local
-//! LLM server expects.
+//! The [`Tool`] schema (`name` + `description` + JSON-schema `parameters`) is
+//! what the deterministic grammar and the dialogue stack target: a
+//! [`ToolCall`] names a tool and carries its arguments. No model picks tools;
+//! the LLM that once did was retired on 2026-09-13 (see docs/dev-history.md).
 
 pub mod approach;
 pub mod autoland;
@@ -122,6 +123,10 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
 
     /// Human/LLM-facing description of when to use this tool.
+    /// What the tool does, in the words a pilot would use to ask for it. No
+    /// model reads this any more; it stays as each tool's own statement of
+    /// intent beside its grammar rules, and tests may quote it.
+    #[allow(dead_code)]
     fn description(&self) -> &str;
 
     /// JSON Schema for the tool's arguments (an `object` schema).
@@ -587,17 +592,6 @@ impl Registry {
             .map(|t| t.as_ref())
     }
 
-    /// Backend-neutral specs for every tool, for the LLM request.
-    pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools
-            .iter()
-            .map(|t| ToolSpec {
-                name: t.name().to_string(),
-                description: t.description().to_string(),
-                parameters: t.parameters(),
-            })
-            .collect()
-    }
 }
 
 /// ON commands for every charging source in an electrical profile (keys
@@ -675,11 +669,12 @@ pub fn all_electrical_on_cmds(systems: &[crate::aircraft::ElectricalSystem]) -> 
     cmds
 }
 
-/// A flattened, serializable view of a tool for the LLM layer to wrap.
-pub struct ToolSpec {
+/// A tool picked for an utterance (by the grammar, the dialogue stack or a
+/// checklist title), plus its parsed arguments.
+#[derive(Debug)]
+pub struct ToolCall {
     pub name: String,
-    pub description: String,
-    pub parameters: Value,
+    pub arguments: Value,
 }
 
 #[cfg(test)]

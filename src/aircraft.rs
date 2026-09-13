@@ -67,6 +67,13 @@ pub struct AircraftProfile {
     /// means the copilot only verifies/calls out checklist items (never acts).
     #[serde(default)]
     pub checklist_map: Vec<ChecklistMapEntry>,
+    /// Which file section the checklist flow ([`crate::flow`]) reads at each
+    /// phase boundary, for files whose titles the section words do not find:
+    /// `climb`, `cruise`, `descent`, `before_landing`, `after_landing` -> the
+    /// file's own section title. Empty (the default) means the section words
+    /// match the titles themselves, as they do in the 172 and SR22 files.
+    #[serde(default)]
+    pub checklist_flow: std::collections::BTreeMap<String, String>,
     /// Phase-expectation advisor: switch states the airframe *should* be in per
     /// flight phase; the monitor advises on the delta ("yaw damper's still off"
     /// at climb). Declarative SOP knowledge — the deterministic version of a
@@ -1212,6 +1219,7 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
     p.display_name = format!("{name} (no profile)");
     p.checklist = None;
     p.checklist_map = Vec::new();
+    p.checklist_flow = Default::default();
     p.bus_volts_nominal = None;
 
     let vs = kts("acf/_Vs_kts");
@@ -2163,6 +2171,7 @@ fn cessna_172sp() -> AircraftProfile {
                 m("nav_lights", Light("nav".into())),
             ]
         },
+        checklist_flow: Default::default(),
         lights: vec![
             light(
                 "nav",
@@ -2514,6 +2523,7 @@ fn cirrus_sr22() -> AircraftProfile {
                 m("fuel_tank_selector", FuelSelector), // 0=off/1=left/2=right
             ]
         },
+        checklist_flow: Default::default(),
     }
 }
 

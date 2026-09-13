@@ -1150,6 +1150,18 @@ impl Voice {
         }
     }
 
+    /// Queue a CREW utterance and block until spoken: the checklist flow's
+    /// pacing (one item plays before the next is decided, off the command
+    /// loop). Crew-gated and panel-mirrored like `alert`, blocking like `say`.
+    pub fn say_crew(&self, priority: Priority, text: impl Into<String>) {
+        if !crate::mode::copilot_enabled() {
+            return;
+        }
+        let text = text.into();
+        self.mirror_to_panel(priority, &text);
+        self.say(priority, text);
+    }
+
     /// Queue an utterance as the ATC STATION and block until spoken: the
     /// station's warm ONNX voice with the radio-transmission effect (falling
     /// back to macOS `say`). Same queue, same mic gate, same echo memory as
@@ -1490,7 +1502,10 @@ fn fire_latch(latch: Option<Arc<Latch>>) {
 /// any more than the copilot's). Prunes the old.
 fn remember_spoken(inner: &Inner, text: &str) {
     let mut said = inner.spoken.lock().unwrap();
-    said.push((Instant::now(), text.to_string()));
+    // A phrase the copilot COACHED ("say navigate to follow the plan") is
+    // the one thing the pilot is about to say on purpose; it must not be
+    // remembered as our own voice.
+    said.push((Instant::now(), crate::phrase::without_coached_phrase(text)));
     said.retain(|(t, _)| t.elapsed() < ECHO_MEMORY);
 }
 

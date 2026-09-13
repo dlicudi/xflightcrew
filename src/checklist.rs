@@ -42,7 +42,7 @@ use crate::tools::flaps::SetFlaps;
 use crate::tools::instruments::SetPitotHeat;
 use crate::tools::lights::SetLights;
 use crate::tools::radio::SetTransponderMode;
-use crate::tools::{Tool, ToolCtx, ToolSpec};
+use crate::tools::{Tool, ToolCtx};
 use crate::xplane::XPlaneClient;
 
 /// A pass condition parsed from the file's `dataref:condition` field.
@@ -141,6 +141,13 @@ pub enum Item {
         tool: &'static str,
         args: Value,
         confirm: Option<&'static str>,
+        /// The file's own pass test, kept alongside the action so a runner
+        /// can read the state FIRST (an item already in state is confirmed,
+        /// not re-written under the pilot's hand) and an instructor can watch
+        /// for the pilot to satisfy it without ever writing.
+        dataref: String,
+        index: Option<usize>,
+        cond: Cond,
     },
     /// A dataref outside our curated tools: read it and check the state. When
     /// `settable` it's an actionable switch we may write to the condition's target
@@ -162,7 +169,6 @@ pub enum Item {
 pub struct Checklist {
     pub id: String,
     pub title: String,
-    pub description: String,
     pub items: Vec<Item>,
     pub lights: Vec<LightProfile>,
     pub flaps: Option<FlapProfile>,
@@ -176,17 +182,6 @@ pub struct Checklist {
     /// Per-airframe pitot-heat switch override (see
     /// [`crate::aircraft::AircraftProfile::pitot_heat_dataref`]).
     pub pitot_heat_dataref: Option<String>,
-}
-
-impl Checklist {
-    /// The no-arg tool spec the LLM routes against (the name *is* the pick).
-    pub fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: self.id.clone(),
-            description: self.description.clone(),
-            parameters: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
-        }
-    }
 }
 
 /// Read and interpret the airframe's XChecklist file into runnable checklists.
@@ -393,7 +388,6 @@ pub fn parse(text: &str, profile: &AircraftProfile) -> Vec<Checklist> {
                 cur = Some(Checklist {
                     id: slug(title),
                     title: humanize(title),
-                    description: describe(title),
                     items: Vec::new(),
                     lights: lights.clone(),
                     flaps: flaps.clone(),
@@ -480,6 +474,9 @@ fn parse_item(rest: &str, map: &[ChecklistMapEntry], fuel: &[FuelPosition]) -> I
                 tool,
                 args,
                 confirm,
+                dataref: base,
+                index,
+                cond,
             }
         }
         None => {
@@ -779,19 +776,6 @@ fn slug(title: &str) -> String {
         }
     }
     s.trim_matches('_').to_string()
-}
-
-/// The LLM-facing description: trigger phrasing plus the anti-greedy guard so a
-/// checklist doesn't steal a single-system command.
-fn describe(title: &str) -> String {
-    let t = humanize(title).to_lowercase();
-    format!(
-        "Run the {t} checklist — the copilot reads each item aloud, performs the \
-         ones it can, verifies what it can read, and calls out the pilot's items. \
-         ONLY for a single command asking for the whole '{t}' checklist (e.g. \
-         '{t} checklist', '{t}', 'run the {t} checklist'). Do NOT use when one \
-         system is named ('mixture rich', 'flaps up') — those have their own tools."
-    )
 }
 
 /// Turn a SHOUTED challenge+response into a speakable line: "PARKING BRAKE"|"ON"
@@ -1129,6 +1113,7 @@ mod tests {
                 tool,
                 args,
                 confirm,
+                ..
             } => {
                 assert_eq!(tool, "set_parking_brake");
                 assert_eq!(args, json!({ "on": true }));

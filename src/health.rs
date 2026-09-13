@@ -23,8 +23,6 @@ pub enum Probe {
     Up(String),
     /// Not working, with the reason as far as we know it.
     Down(String),
-    /// Deliberately not in use — an off LLM is healthy, not broken.
-    Off(String),
 }
 
 /// Facts settled at boot and true for the session. Built once in `main` and
@@ -40,10 +38,6 @@ pub struct Boot {
     /// Default input device name.
     pub mic: String,
     pub xplane_url: String,
-    pub ollama_url: String,
-    /// Configured LLM model id, whether or not the LLM is enabled.
-    pub llm_model: String,
-    pub llm_enabled: bool,
     /// The home ATC field, or empty when ATC is off.
     pub atc_airport: String,
     pub simbrief: bool,
@@ -57,7 +51,6 @@ pub struct Boot {
 pub struct Live {
     pub xplane: Probe,
     pub plugin: Probe,
-    pub ollama: Probe,
     pub load: Option<LoadSnapshot>,
     /// Active aircraft profile, as `display name (id)`.
     pub profile: String,
@@ -90,19 +83,8 @@ impl Live {
 pub struct Collector {
     xp: XPlaneClient,
     live_profile: std::sync::Arc<crate::LiveProfile>,
-    ollama_url: String,
-    llm_enabled: bool,
     atc_on: bool,
-    http: reqwest::Client,
-    /// Ticks since the last Ollama probe. It is a local HTTP round trip to a
-    /// server that is either up for the whole session or down for it, so once
-    /// every ten seconds is plenty and a stale verdict is carried between.
-    ticks: u32,
-    ollama: Probe,
 }
-
-/// How often the Ollama probe actually runs, in poll ticks (1 Hz).
-const OLLAMA_EVERY: u32 = 10;
 
 /// A dataref the bundled plugin always registers. Reading it is the cheapest
 /// honest answer to "is the plugin loaded" — the app never links the SDK, so
@@ -118,15 +100,7 @@ impl Collector {
         Collector {
             xp,
             live_profile,
-            ollama_url: config.ollama_base_url.clone(),
-            llm_enabled: config.llm_enabled,
             atc_on: !config.atc_airport.trim().is_empty(),
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(2))
-                .build()
-                .unwrap_or_default(),
-            ticks: 0,
-            ollama: Probe::Unknown,
         }
     }
 
@@ -175,25 +149,6 @@ impl Collector {
                 .map(|v| v.round() as i64);
         }
 
-        if self.ticks.is_multiple_of(OLLAMA_EVERY) {
-            self.ollama = self.probe_ollama().await;
-        }
-        self.ticks = self.ticks.wrapping_add(1);
-        live.ollama = self.ollama.clone();
         live
-    }
-
-    /// Is the local model server up? Off by default is a healthy state, not a
-    /// failure: the copilot is fully deterministic without it.
-    async fn probe_ollama(&self) -> Probe {
-        if !self.llm_enabled {
-            return Probe::Off("deterministic (XCOPILOT_LLM=off)".into());
-        }
-        let url = format!("{}/api/tags", self.ollama_url.trim_end_matches('/'));
-        match self.http.get(url).send().await {
-            Ok(r) if r.status().is_success() => Probe::Up("serving".into()),
-            Ok(r) => Probe::Down(format!("HTTP {}", r.status().as_u16())),
-            Err(_) => Probe::Down("unreachable".into()),
-        }
     }
 }

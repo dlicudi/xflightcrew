@@ -273,6 +273,46 @@ fn give_up(voice: &Option<Voice>, line: &str, reason: &str) {
     announce(voice, Priority::Caution, line);
 }
 
+/// The squawk still to dial: the tower's assigned code when the transponder
+/// does not already show it. `None` when nothing was assigned or it is set.
+/// An unreadable transponder is owed the code too: the tool reads back.
+pub fn squawk_owed(assigned: Option<i64>, actual: Option<f64>) -> Option<i64> {
+    let code = assigned?;
+    match actual {
+        Some(a) if a.round() as i64 == code => None,
+        _ => Some(code),
+    }
+}
+
+/// Dial the assigned squawk if the transponder does not show it yet, and say
+/// so. Called after the clearance wait AND at the later stages, because the
+/// tower's answer can arrive after the wait gave up, and a squawk assigned
+/// is a squawk owed until the wheels leave.
+async fn ensure_squawk(xp: &XPlaneClient, ctx: &ToolCtx<'_>, voice: &Option<Voice>) {
+    let actual = xp
+        .get_float(crate::datarefs::TRANSPONDER_CODE)
+        .await
+        .ok();
+    let Some(code) = squawk_owed(crate::party_line::assigned_squawk(), actual) else {
+        return;
+    };
+    let ok = crate::tools::radio::SetTransponder
+        .execute(&json!({ "code": code }), ctx)
+        .await
+        .is_ok();
+    event("squawk_set", json!({ "code": code, "ok": ok, "was": actual }));
+    if ok {
+        announce(
+            voice,
+            Priority::Advisory,
+            &format!(
+                "Squawk {}, set.",
+                crate::atis::spoken_digits(&format!("{code:04}"))
+            ),
+        );
+    }
+}
+
 async fn engine_running(xp: &XPlaneClient) -> bool {
     xp.get_float_array(ENGN_RUNNING)
         .await
@@ -667,25 +707,19 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             event("request_clearance", json!({}));
             // The tower answers with a discrete squawk; wait for it, then dial it
             // into the transponder and read it back — the crew's clearance copy.
+            // The clock starts when the call is QUEUED, and the call rides the
+            // speech queue behind our own arming brief and anyone the tower is
+            // working: at Malaga 30 s gave up 13 s before the clearance came
+            // back, the squawk was never set, and the tower spent the climb
+            // asking us to confirm 4503 while we showed 7000 (23:06Z,
+            // 2026-09-12). So the wait is longer, and the squawk is OWED, not
+            // missed: `ensure_squawk` sets a late one at the hold and lined up.
             waiting("the squawk");
-            wait_until(30.0, 500, || async {
+            wait_until(60.0, 500, || async {
                 crate::party_line::assigned_squawk().is_some()
             })
             .await;
-            if let Some(code) = crate::party_line::assigned_squawk() {
-                let _ = crate::tools::radio::SetTransponder
-                    .execute(&json!({ "code": code }), &ctx)
-                    .await;
-                announce(
-                    &voice,
-                    Priority::Advisory,
-                    &format!(
-                        "Squawk {}, set.",
-                        crate::atis::spoken_digits(&format!("{code:04}"))
-                    ),
-                );
-                event("squawk_set", json!({ "code": code }));
-            }
+            ensure_squawk(&xp, &ctx, &voice).await;
             bail_if_abort!();
         }
         // The taxi route is the tower's. Ask for it if we don't already hold
@@ -984,6 +1018,9 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             }
         }
         event("at_hold", json!({}));
+        // A squawk that came back after the clearance wait gave up is set
+        // here, before we talk to the tower again.
+        ensure_squawk(&xp, &ctx, &voice).await;
 
         // ATC: get the departure clearance BEFORE lining up — the tower gates
         // both the line-up and the takeoff on it. No station running means
@@ -1102,6 +1139,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             }
         }
         event("lined_up", json!({}));
+        ensure_squawk(&xp, &ctx, &voice).await;
         // On the runway: strobes and landing lights. These are the two that
         // say "this aeroplane is about to move fast", which is why they go on
         // here and not at the holding point.
@@ -1916,5 +1954,20 @@ mod tests {
         // Already at the planned altitude: no invented climb.
         let level = departure_check_in(&None, "Malaga Departure", 3980.0, 4000.0);
         assert_eq!(level, "Malaga Departure, passing four thousand");
+    }
+}
+
+#[cfg(test)]
+mod squawk_tests {
+    use super::squawk_owed;
+
+    /// The Malaga clearance came back after the wait gave up: the code is
+    /// owed until the transponder shows it, and not once it does.
+    #[test]
+    fn a_late_squawk_is_owed_until_dialed() {
+        assert_eq!(squawk_owed(None, Some(7000.0)), None);
+        assert_eq!(squawk_owed(Some(4503), Some(7000.0)), Some(4503));
+        assert_eq!(squawk_owed(Some(4503), None), Some(4503));
+        assert_eq!(squawk_owed(Some(4503), Some(4503.0)), None);
     }
 }

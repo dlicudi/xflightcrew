@@ -1677,6 +1677,9 @@ pub async fn run(
     // Whether the last tick saw the sim in replay / paused, for transition logging.
     let mut was_replay = false;
     let mut was_paused = false;
+    // The checklist flow's phase-boundary detector: climb, cruise, descent,
+    // before landing, after landing, each once per flight.
+    let mut flow_tracker = crate::flow::Tracker::default();
 
     loop {
         // Settings that this tick reads (the taxi guide, the party line) are
@@ -1697,6 +1700,7 @@ pub async fn run(
             // fact that outlives its airframe aims the next aircraft's writes
             // at something it may not have.
             cockpit_auto = crate::cockpit_auto::CockpitAuto::default();
+            flow_tracker = crate::flow::Tracker::default();
             cabin_capable = live.get().cabin_crew;
             states = checks.iter().map(|c| (c.id(), FireState::new())).collect();
             tracing::info!(
@@ -1781,6 +1785,24 @@ pub async fn run(
             // published state, so most need no gate of their own;
             // region_tick is the exception (its index cache survives).
             let crew_on = crate::mode::copilot_enabled();
+
+            // The checklist at its phase: crossing a boundary runs the
+            // matching list as the flying copilot's cross-check when an
+            // automation has the aircraft, or proposes it to the pilot
+            // flying ("Climb checklist when you're ready?"). The tracker is
+            // sustained-condition and one-shot per flight; the flow module
+            // decides who is flying and never acts on a proposal by itself.
+            if crew_on {
+                let sample = crate::flow::Sample {
+                    on_ground: snap.on_ground,
+                    agl_ft: snap.agl_ft,
+                    vsi_fpm: snap.vsi_fpm,
+                    groundspeed_kts: snap.groundspeed_kts,
+                };
+                if let Some(section) = flow_tracker.tick(&sample, now) {
+                    crate::flow::phase_boundary(section, &config, &voice);
+                }
+            }
 
             // Pushback callouts (on the ground): tug hooks up → pushing → clear.
             if crew_on && snap.on_ground {

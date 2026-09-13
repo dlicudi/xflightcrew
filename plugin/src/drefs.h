@@ -69,8 +69,6 @@ int request();
 void set_request(int v);
 
 // Settings-tab switches; each drives a dataref the app polls live.
-int llm_enabled();
-void set_llm_enabled(int v);
 int opt_camera_snap();
 void set_opt_camera_snap(int v);
 int opt_negative_tone();

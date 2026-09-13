@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::aircraft::AircraftProfile;
-use crate::llm::ToolCall;
+use crate::tools::ToolCall;
 use crate::stt::Stt;
 use crate::tools::Registry;
 use crate::{grammar, phrase, stt};

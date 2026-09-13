@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::llm::ToolCall;
+use crate::tools::ToolCall;
 use crate::phrase::word_value;
 use crate::tools::Registry;
 
