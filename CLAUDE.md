@@ -437,6 +437,19 @@ history):
   other exit, and on the 172 it shares the wing cluster with the landing
   lamp); at the vacate landing off and taxi on
   (`after_vacate`); all off at the stand.
+  **The sim's heading mode never reverses a turn in progress** (LXGB
+  2026-09-14, five minutes of orbits): a bug stepped to the OUTSIDE of a
+  bank goes round the long way, so every pursuit steer goes through
+  `circuit::bug_toward` (bug on the nose until the wings are level, then the
+  short way) and the authored follower has a closure watchdog
+  (`authored_stalled`). The authored LXGB route JOINS at the nearest leg
+  (`join_waypoint`), climbs through `climb_limit_fpm` like the rectangle,
+  and is terrain-probed along its LEGS every 150 m (six waypoints on sea
+  either side of the Rock hid the ridge between them): terrain under a
+  pattern-altitude leg raises the pattern altitude (`raise_for_terrain`,
+  said aloud), under a descending leg refuses. The takeoff sets the trim
+  into the takeoff band before the brakes come off (a nose-down stop trim
+  is what the AP's climb lost to at the engage: -1,040 fpm at 325 ft).
   **The arrival is briefed at the gate** (`full_auto::brief_arrival` in the
   arming ack: published approach, straight-in, or "I'll land visually"; a
   destination the data lacks is refused there) - found 25 nm out it was a

@@ -3216,6 +3216,64 @@ rotation law's Q damping, which is a pitch-attitude flare a real hand
 would fly; if the led dial still arrives firm, that is the next step, and
 the tick log will say so in the `vs_dial`/`vvi` columns.
 
+## The circuit orbited the bay: the AP will not reverse a turn (2026-09-14)
+
+LXGB, 172, "let's do the circuits" from cold and dark, runway 09, the
+authored Rock circuit. Four faults in one sortie, each with the blackbox
+line that names it.
+
+**The takeoff sank at the AP engage.** Trim was at the nose-down stop from
+the previous flight (the monitor called it four seconds after liftoff). At
+325 ft AGL the AP took the climb with the dial at 584 fpm and the aircraft
+went to -1,040 fpm, down to 178 ft AGL, 83 to 111 kt, before the servo wound
+the trim back; 500 ft came 1.8 km late. The takeoff loop now sets the trim
+into the takeoff band before the brakes come off (`controls::trim_for_takeoff`,
+`trim_set` event) and records the trim on `ap_engaged`.
+
+**The first leg went the wrong way.** The route was authored with waypoint 0
+(the climb-out point) 1.8 km BEHIND the aircraft, and the follower steered
+back to it: a 270-degree turn from 500 ft, climbing at a flat 700 fpm with
+the throttle law holding pattern speed. IAS fell to 60 kt in the turn (Vx,
+1.26 Vs). The authored follower had its own VS clamp and never called
+`climb_limit_fpm`; the rectangle loop always had. Now it joins at the nearest
+leg (`join_waypoint`, `authored_join` event) and climbs only as fast as the
+airspeed pays for.
+
+**The downwind crossed the Rock.** At 357 s the ground under the track was
+998 ft and the aircraft 523 ft above it, at the 1,650 ft pattern altitude.
+`authored_route_clears_terrain` probed the six WAYPOINTS, which sit on sea
+either side of the ridge; the leg between them crossed it. The rectangle's
+own polyline had the same hole (eight downwind samples 580 m apart reported
+650 ft under a side whose ridge stands at ~1,150). Both are sampled every
+150 m now (`leg_samples`, `densify`; `terrain::max_elevation_ft` chunks
+past the plugin's 24-point query instead of silently truncating). Terrain
+under a pattern-altitude leg RAISES the pattern altitude
+(`raise_for_terrain`, said aloud, `authored_route` carries `raised_ft`);
+terrain under a descending leg or a raise past 1,000 ft refuses the route.
+
+**Then five minutes of orbits.** Capturing waypoint 2 the aircraft was
+banked 4.3 degrees right for it; the bug stepped 25 degrees LEFT for
+waypoint 3 and the AP rolled on to 12 right and went round the long way. A
+live read confirmed heading mode engaged, the bug written and read back
+identical, the bug on the left, the aircraft turning right. X-Plane's
+heading mode does not reverse a turn in progress, and pure pursuit keeps the
+bug moving in the direction of the turn, so it never caught up: standard-rate
+circles drifting downwind across the bay, each later waypoint caught only
+when a circle happened to pass within 350 m, and the copilot silent
+throughout. `bug_toward` now holds the bug ON THE NOSE whenever the wanted
+turn is against a bank over 3 degrees (a capture is the one thing that rolls
+that AP level), then slews the short way from level. Behind it a watchdog
+(`Closure`, `authored_stalled`): no new low on the distance for 45 s levels
+off and re-steers, three of those and the aircraft goes back with heading and
+altitude held.
+
+Also fixed: the climb checklist under a circuit flagged "throttle, full"
+(the circuit's speed law owns the lever; `held_by_automation` names it now)
+and the landing light stayed on (the authored loop never called
+`lights::after_climb`; it does at 1,000 ft). Still open: the tower handed a
+circuit to Departure at 719 ft because the takeoff request never said "for
+circuits"; nobody answered, which was right, but the request should carry it.
+
 ## Cabin crew: the second intercom persona (2026-07-15)
 
 Channels are physics, personas are tenants: the intercom now carries TWO

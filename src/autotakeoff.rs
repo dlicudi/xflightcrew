@@ -64,6 +64,9 @@ const CMD_VS_MODE: &str = "sim/autopilot/vertical_speed";
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
 const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
+/// Elevator trim, -1 (nose down) .. +1, recorded at the AP engage: the one
+/// number that says whether the climb the servo is handed is flyable.
+const ELEV_TRIM: &str = "sim/cockpit2/controls/elevator_trim";
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
 const STEER_YIELD: &str = "xcopilot/steer_yield";
 const TAKEOFF_PITCH: &str = "xcopilot/pitch";
@@ -864,6 +867,15 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // rejected as stagnant. The VALVE goes with it (2026-08-03): left in the
     // set position it traps the roll's own brake applications — the reject
     // path's stopping pulse included — back into the parking brake.
+    // Trim for takeoff BEFORE the brakes come off (see `trim_for_takeoff`:
+    // a nose-down stop trim is what the AP's climb loses to at the engage).
+    if let Some((was, now)) = crate::tools::controls::trim_for_takeoff(&xp).await {
+        crate::blackbox::record(
+            "autotakeoff",
+            serde_json::json!({"event": "trim_set", "was": was, "now": now}),
+        );
+        alert(&voice, Priority::Advisory, "Trim set for takeoff.");
+    }
     crate::tools::controls::release_park_brake_for_roll(&xp, p.park_brake_valve_set).await;
     tracing::info!(
         icao = %rwy.icao, id = %rwy.id, remaining_m, vr = p.vr_kts, "auto takeoff: rolling"
@@ -1267,9 +1279,12 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let vs = climb_vs_protected(ias, p.vy_kts, p.climb_fpm, p.vne_kts);
             let _ = xp.set_float(VS_DIAL, vs).await;
             last_vs_cmd = Some(vs);
+            let trim = xp.get_float(ELEV_TRIM).await.ok();
             crate::blackbox::record(
                 "autotakeoff",
-                serde_json::json!({"event": "ap_engaged", "ias": ias, "agl": agl_ft, "cmd_vs": vs}),
+                serde_json::json!({
+                    "event": "ap_engaged", "ias": ias, "agl": agl_ft, "cmd_vs": vs, "trim": trim,
+                }),
             );
         }
         let vs = climb_vs_protected(ias, p.vy_kts, p.climb_fpm, p.vne_kts);

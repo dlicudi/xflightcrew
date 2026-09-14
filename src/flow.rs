@@ -708,12 +708,7 @@ pub fn take_reply(text: &str) -> Option<Reply> {
         (Reply::Abort, _)
             | (Reply::Yes | Reply::No, Some(Waiting::Confirm))
             | (
-                Reply::Yes
-                    | Reply::Next
-                    | Reply::Skip
-                    | Reply::No
-                    | Reply::Hold
-                    | Reply::DoIt,
+                Reply::Yes | Reply::Next | Reply::Skip | Reply::No | Reply::Hold | Reply::DoIt,
                 Some(Waiting::Advance)
             )
     );
@@ -820,6 +815,11 @@ pub fn held_by_automation(dataref: &str) -> Option<&'static str> {
         || crate::procedure::ACTIVE.load(Relaxed);
     if dataref.contains("throttle") && crate::tools::speedhold::ACTIVE.load(Relaxed) {
         return Some("the speed hold");
+    }
+    // The circuit's own throttle law holds the pattern speed; the climb
+    // list's "throttle, full" is not a discrepancy under it (LXGB 2026-09-14).
+    if dataref.contains("throttle") && crate::circuit::ACTIVE.load(Relaxed) {
+        return Some("the circuit");
     }
     if dataref.contains("mixture") && crate::tools::engine::MIX_MANAGED.load(Relaxed) {
         return Some("the mixture manager");
@@ -1402,7 +1402,10 @@ mod tests {
         assert_eq!(classify("done"), Some(Reply::Next));
         assert_eq!(classify("skip that"), Some(Reply::Skip));
         assert_eq!(classify("hold on"), Some(Reply::Hold));
-        assert_eq!(classify("Can you help me with that item?"), Some(Reply::DoIt));
+        assert_eq!(
+            classify("Can you help me with that item?"),
+            Some(Reply::DoIt)
+        );
         assert_eq!(classify("you do it"), Some(Reply::DoIt));
         assert_eq!(classify("do it for me"), Some(Reply::DoIt));
         assert_eq!(classify("help me with that"), Some(Reply::DoIt));
@@ -1560,7 +1563,10 @@ mod tests {
         *lock(&WAITING) = Some(Waiting::Advance);
         assert_eq!(take_reply("set"), Some(Reply::Next));
         assert_eq!(take_reply("skip"), Some(Reply::Skip));
-        assert_eq!(take_reply("can you help me with that item"), Some(Reply::DoIt));
+        assert_eq!(
+            take_reply("can you help me with that item"),
+            Some(Reply::DoIt)
+        );
         // ...but not at a hazard confirm, where "help me" is not a yes.
         *lock(&WAITING) = Some(Waiting::Confirm);
         assert_eq!(take_reply("help me with that"), None);

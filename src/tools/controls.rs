@@ -18,6 +18,31 @@ const ELEV_TRIM: &str = "sim/cockpit2/controls/elevator_trim";
 const TRIM_STEP: f64 = 0.10;
 /// Takeoff trim setting for the 172 — roughly neutral (the takeoff band).
 const TRIM_TAKEOFF: f64 = 0.0;
+/// Half-width of the takeoff band: a trim further from [`TRIM_TAKEOFF`] than
+/// this is reset before an automated takeoff roll.
+const TRIM_TAKEOFF_TOL: f64 = 0.15;
+
+/// Is the trim outside the takeoff band?
+pub fn trim_needs_reset(current: f64) -> bool {
+    (current - TRIM_TAKEOFF).abs() > TRIM_TAKEOFF_TOL
+}
+
+/// Set the elevator trim for takeoff if it is outside the band. Returns
+/// `(was, now)` when it moved, `None` when it was already in the band or
+/// could not be read. The auto takeoff calls this before the brakes come
+/// off: at LXGB (2026-09-14) the roll started with the trim at the nose-down
+/// stop, the monitor called it four seconds after liftoff, and when the
+/// autopilot took the climb at 325 ft the servo lost to the trim - 1,040
+/// fpm down to 178 ft AGL before it wound the trim back.
+pub async fn trim_for_takeoff(xp: &dyn crate::xplane::XPlane) -> Option<(f64, f64)> {
+    let was = xp.get_float(ELEV_TRIM).await.ok()?;
+    if !trim_needs_reset(was) {
+        return None;
+    }
+    xp.set_float(ELEV_TRIM, TRIM_TAKEOFF).await.ok()?;
+    let now = xp.get_float(ELEV_TRIM).await.unwrap_or(TRIM_TAKEOFF);
+    Some((was, now))
+}
 
 /// Park-brake VALVE (X-Plane 12). Aircraft that model it animate their handle
 /// from this, and its SENSE is per-aircraft: on the C90B 0 = set (and the sim
@@ -711,7 +736,10 @@ mod tests {
     async fn the_valve_follows_the_airframes_declared_sense() {
         let fake = FakeXPlane::new();
         ensure_park_brake_valve(&fake, true, Some(1.0)).await;
-        assert!(fake.ran(CMD_VALVE_OPEN), "1 = set must drive the valve to 1");
+        assert!(
+            fake.ran(CMD_VALVE_OPEN),
+            "1 = set must drive the valve to 1"
+        );
         let fake = FakeXPlane::new();
         ensure_park_brake_valve(&fake, false, Some(1.0)).await;
         assert!(fake.ran(CMD_VALVE_CLOSE), "releasing must drive it to 0");
@@ -719,7 +747,10 @@ mod tests {
         // C90B sense, the mirror image.
         let fake = FakeXPlane::new();
         ensure_park_brake_valve(&fake, true, Some(0.0)).await;
-        assert!(fake.ran(CMD_VALVE_CLOSE), "0 = set must drive the valve to 0");
+        assert!(
+            fake.ran(CMD_VALVE_CLOSE),
+            "0 = set must drive the valve to 0"
+        );
         let fake = FakeXPlane::new();
         ensure_park_brake_valve(&fake, false, Some(0.0)).await;
         assert!(fake.ran(CMD_VALVE_OPEN));
@@ -752,6 +783,20 @@ mod tests {
         assert!(
             fake.command_index(CMD_VALVE_CLOSE) < fake.command_index(CMD_PARK_RELEASE),
             "valve first, so the ratio has somewhere to vent to"
+        );
+    }
+
+    #[test]
+    fn the_trim_is_reset_only_when_it_is_out_of_the_takeoff_band() {
+        assert!(
+            trim_needs_reset(-1.0),
+            "the nose-down stop (LXGB 2026-09-14)"
+        );
+        assert!(trim_needs_reset(0.4));
+        assert!(!trim_needs_reset(0.0));
+        assert!(
+            !trim_needs_reset(0.1),
+            "a hand-set takeoff trim is left alone"
         );
     }
 }

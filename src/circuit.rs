@@ -38,6 +38,9 @@ const LAT: &str = "sim/flightmodel/position/latitude";
 const LON: &str = "sim/flightmodel/position/longitude";
 const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 const HPATH: &str = "sim/flightmodel/position/hpath";
+/// Bank angle, degrees, right wing down positive — the authored follower
+/// reads it to know which way the AP is turning (see `bug_toward`).
+const PHI: &str = "sim/flightmodel/position/phi";
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const ELEV_M: &str = "sim/flightmodel/position/elevation";
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
@@ -412,10 +415,8 @@ pub fn alt_capture_vs(target_ft: f64, target_rate_fpm: f64, alt_ft: f64, vs_fpm:
     let projected = alt_ft + vs_fpm * lead;
     let projected_target = target_ft + target_rate_fpm * lead;
     let correction = (projected_target - projected) * ALT_GAIN_FPM_PER_FT;
-    (target_rate_fpm + correction).clamp(
-        target_rate_fpm.min(0.0) - ALT_MAX_EXTRA_DESCENT_FPM,
-        700.0,
-    )
+    (target_rate_fpm + correction)
+        .clamp(target_rate_fpm.min(0.0) - ALT_MAX_EXTRA_DESCENT_FPM, 700.0)
 }
 
 /// The altitude the base/final legs fly to, ft MSL: the 3° path at the
@@ -832,6 +833,88 @@ pub fn slew_bug(current: f64, target: f64, max_step: f64) -> f64 {
     (current + d.clamp(-max_step, max_step)).rem_euclid(360.0)
 }
 
+/// Bank beyond which the AP is judged to be IN a turn. X-Plane's heading
+/// mode sits at 11-13 degrees for a standard-rate turn; the orbit at LXGB
+/// started from 4.3 degrees, so the threshold sits under that, above the
+/// one or two degrees of wings-level jitter.
+const TURN_IN_PROGRESS_BANK_DEG: f64 = 3.0;
+/// A wanted turn smaller than this against the bank in progress is left to
+/// the AP: it is finishing a capture, not going the long way round.
+const REVERSAL_MIN_DEG: f64 = 10.0;
+
+/// Step the bug toward `want_mag` (as [`slew_bug`]) unless the aircraft is
+/// banked INTO a turn the other way, in which case hold the bug ON THE NOSE
+/// so the AP rolls out first.
+///
+/// The sim's heading mode does not reverse a turn in progress. At LXGB
+/// (2026-09-14) the authored follower captured waypoint 2 while banked four
+/// degrees right for it and stepped the bug 25 degrees LEFT for waypoint 3;
+/// the AP rolled on to 12 degrees right and went round the long way, 340
+/// degrees, and because pure pursuit keeps the bug moving in the direction
+/// of the turn it never caught up: five minutes of standard-rate orbits
+/// drifting downwind across the bay, waypoints caught only when a circle
+/// happened to pass within the capture radius. A bug on the nose is a
+/// capture, and a capture is the one thing that rolls that AP level; from
+/// level the next slew starts the turn the right way.
+pub fn bug_toward(
+    current_bug: f64,
+    want_mag: f64,
+    heading_mag: f64,
+    phi_deg: f64,
+    max_step: f64,
+) -> f64 {
+    let turn = (want_mag - heading_mag + 540.0).rem_euclid(360.0) - 180.0;
+    let banked_other_way = phi_deg.abs() > TURN_IN_PROGRESS_BANK_DEG
+        && turn.abs() > REVERSAL_MIN_DEG
+        && (turn > 0.0) != (phi_deg > 0.0);
+    if banked_other_way {
+        return slew_bug(current_bug, heading_mag, max_step);
+    }
+    slew_bug(current_bug, want_mag, max_step)
+}
+
+/// The authored follower's progress watchdog fires when the distance to the
+/// current waypoint has set no new low for this long: the loop is orbiting or
+/// being blown away, not flying the leg.
+const STALL_S: f64 = 45.0;
+/// A new low has to beat the old one by this much to count as progress
+/// (an orbit's near side re-sets the same distance every lap).
+const STALL_PROGRESS_M: f64 = 25.0;
+/// Stalls the authored follower tolerates before handing the aircraft back.
+const MAX_STALLS: u32 = 3;
+
+/// Distance-closure watchdog for one waypoint (see [`STALL_S`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Closure {
+    best_m: f64,
+    best_at_s: f64,
+}
+
+impl Closure {
+    pub fn new(d_m: f64, now_s: f64) -> Self {
+        Closure {
+            best_m: d_m,
+            best_at_s: now_s,
+        }
+    }
+
+    /// Feed this tick's distance. True once per stall: no new low for
+    /// [`STALL_S`]. The clock restarts so the next stall is judged afresh.
+    pub fn stalled(&mut self, d_m: f64, now_s: f64) -> bool {
+        if d_m < self.best_m - STALL_PROGRESS_M {
+            self.best_m = d_m;
+            self.best_at_s = now_s;
+            return false;
+        }
+        if now_s - self.best_at_s > STALL_S {
+            self.best_m = d_m;
+            self.best_at_s = now_s;
+            return true;
+        }
+        false
+    }
+}
+
 /// The next leg in sequence, or `None` past Final.
 pub fn next_leg(leg: Leg) -> Option<Leg> {
     match leg {
@@ -999,9 +1082,31 @@ fn pattern_polyline(
     for i in 1..=4 {
         pts.push((a_dn + (0.0 - a_dn) * i as f64 / 4.0, 0.0));
     }
-    pts.into_iter()
+    densify(&pts, LEG_SAMPLE_M)
+        .into_iter()
         .map(|(a, x)| frame_to_latlon(rwy, a, x))
         .collect()
+}
+
+/// Fill a frame polyline so no two consecutive samples are further apart
+/// than `step_m`. The Rock's ridge is ~300 m wide and the rectangle's eight
+/// downwind samples were 580 m apart: the probe reported 650 ft of terrain
+/// under a side whose ridge stands at ~1,150 (2026-09-14).
+fn densify(pts: &[(f64, f64)], step_m: f64) -> Vec<(f64, f64)> {
+    let mut out = Vec::with_capacity(pts.len() * 4);
+    for (i, &(a, x)) in pts.iter().enumerate() {
+        if i > 0 {
+            let (pa, px) = pts[i - 1];
+            let len = ((a - pa).powi(2) + (x - px).powi(2)).sqrt();
+            let n = (len / step_m).ceil() as usize;
+            for k in 1..n {
+                let f = k as f64 / n as f64;
+                out.push((pa + (a - pa) * f, px + (x - px) * f));
+            }
+        }
+        out.push((a, x));
+    }
+    out
 }
 
 /// How close (metres) to an authored waypoint counts as reaching it. Generous,
@@ -1087,31 +1192,154 @@ fn authored_circuit(
     ])
 }
 
-/// Probe an authored route against the terrain it's flown at: every waypoint
-/// must clear the ground by [`TERRAIN_CLEAR_FT`]. A missing probe (no plugin)
-/// reads as clear — the old fail-open behavior. Returns false if any sampled
-/// point is too low, so the caller falls back to the rectangle rather than fly
-/// hand-authored coordinates into a hill.
-async fn authored_route_clears_terrain(
+/// The waypoint to fly to from `(a_m, x_m)` (runway frame): the end of the
+/// route leg the aircraft is nearest to, or the one after it when the
+/// aircraft is already past that leg's end. Leg 0 runs from the threshold
+/// along the course to waypoint 0. The follower joins there. At LXGB
+/// (2026-09-14) the takeoff sank at the AP engage and handed off 1.8 km PAST
+/// the climb-out point, and the follower steered back to it: a 270-degree
+/// turn at 60 kt, the wrong way round the first leg. Past the last leg →
+/// the last waypoint (the autoland handoff).
+fn join_waypoint(route: &[AuthoredWpt], a_m: f64, x_m: f64) -> usize {
+    let mut best: Option<(f64, usize)> = None;
+    for (i, wp) in route.iter().enumerate() {
+        let (sa, sx) = if i == 0 {
+            (0.0, 0.0)
+        } else {
+            (route[i - 1].a_m, route[i - 1].x_m)
+        };
+        let (da, dx) = (wp.a_m - sa, wp.x_m - sx);
+        let len2 = da * da + dx * dx;
+        if len2 < 1.0 {
+            continue;
+        }
+        let t = (((a_m - sa) * da + (x_m - sx) * dx) / len2).clamp(0.0, 1.0);
+        let (pa, px) = (sa + t * da, sx + t * dx);
+        let dist = ((a_m - pa).powi(2) + (x_m - px).powi(2)).sqrt();
+        let target = if t >= 0.999 { i + 1 } else { i };
+        if best.is_none_or(|(d, _)| dist < d) {
+            best = Some((dist, target));
+        }
+    }
+    best.map_or(0, |(_, t)| t.min(route.len().saturating_sub(1)))
+}
+
+/// Spacing of the terrain samples along an authored leg, metres. The Rock's
+/// ridge is ~300 m wide; six waypoints probed alone (2026-09-14) sat on sea
+/// either side of it while the downwind between them crossed it 523 ft up.
+const LEG_SAMPLE_M: f64 = 150.0;
+/// The most the authored pattern altitude may be raised over its terrain
+/// before the route is refused instead.
+const MAX_TERRAIN_RAISE_FT: f64 = 1000.0;
+
+/// Sample points along every leg of the route in the runway frame, tagged
+/// with the index of the waypoint the leg runs INTO (legs 1..). Leg 0, the
+/// climb-out from the runway to the first waypoint, is the takeoff's and is
+/// not sampled.
+fn leg_samples(route: &[AuthoredWpt]) -> Vec<(usize, f64, f64)> {
+    let mut out = Vec::new();
+    for i in 1..route.len() {
+        let (p, q) = (route[i - 1], route[i]);
+        let len = ((q.a_m - p.a_m).powi(2) + (q.x_m - p.x_m).powi(2)).sqrt();
+        let n = ((len / LEG_SAMPLE_M).ceil() as usize).max(1);
+        for k in 0..=n {
+            let f = k as f64 / n as f64;
+            out.push((i, p.a_m + (q.a_m - p.a_m) * f, p.x_m + (q.x_m - p.x_m) * f));
+        }
+    }
+    out
+}
+
+/// The highest ground (feet MSL) under each leg of the route, indexed like
+/// the waypoints (entry 0 unused). `None` for a leg = the probe did not
+/// answer (no plugin): read as clear, the old fail-open behaviour.
+async fn leg_terrain_ft(
     xp: &XPlaneClient,
     rwy: &crate::autoland::Runway,
     route: &[AuthoredWpt],
-) -> bool {
-    for wp in route {
-        let (lat, lon) = frame_to_latlon(rwy, wp.a_m, wp.x_m);
-        if let Some(e) = crate::terrain::max_elevation_ft(xp, &[(lat, lon)]).await {
-            if wp.alt_msl_ft - e < TERRAIN_CLEAR_FT {
-                return false;
+) -> Vec<Option<f64>> {
+    let samples = leg_samples(route);
+    let pts: Vec<(f64, f64)> = samples
+        .iter()
+        .map(|&(_, a, x)| frame_to_latlon(rwy, a, x))
+        .collect();
+    let mut out = vec![None; route.len()];
+    let mut at = 0;
+    for chunk in pts.chunks(crate::terrain::MAX_POINTS) {
+        if let Some(elev) = crate::terrain::sample_ft(xp, chunk).await {
+            for (k, e) in elev.into_iter().enumerate() {
+                let leg = samples[at + k].0;
+                out[leg] = Some(out[leg].map_or(e, |m: f64| m.max(e)));
+            }
+        }
+        at += chunk.len();
+    }
+    out
+}
+
+/// Raise the route's pattern altitude until every leg flown AT pattern
+/// altitude clears its terrain by [`TERRAIN_CLEAR_FT`], or refuse. Legs that
+/// descend to the handoff height (into a waypoint below the TPA) cannot be
+/// raised and are refused when their terrain needs more than the height
+/// they end at; a raise past [`MAX_TERRAIN_RAISE_FT`] is refused too.
+/// Returns the route to fly and the pattern altitude it flies.
+fn raise_for_terrain(
+    route: &[AuthoredWpt],
+    tpa_msl_ft: f64,
+    leg_max_ft: &[Option<f64>],
+) -> Result<(Vec<AuthoredWpt>, f64), String> {
+    let at_tpa = |w: &AuthoredWpt| w.alt_msl_ft >= tpa_msl_ft - 1.0;
+    let mut tpa_needed = tpa_msl_ft;
+    for i in 1..route.len() {
+        let Some(Some(ground)) = leg_max_ft.get(i) else {
+            continue;
+        };
+        let need = ground + TERRAIN_CLEAR_FT;
+        if at_tpa(&route[i - 1]) && at_tpa(&route[i]) {
+            tpa_needed = tpa_needed.max(need);
+        } else {
+            let floor = route[i - 1].alt_msl_ft.min(route[i].alt_msl_ft);
+            if need > floor {
+                return Err(format!(
+                    "leg {i} needs {need:.0} ft over {ground:.0} ft ground, flown down to {floor:.0}"
+                ));
             }
         }
     }
-    true
+    if tpa_needed > tpa_msl_ft + MAX_TERRAIN_RAISE_FT {
+        return Err(format!(
+            "pattern altitude would need {tpa_needed:.0} ft, {:.0} over the TPA",
+            tpa_needed - tpa_msl_ft
+        ));
+    }
+    let raised = route
+        .iter()
+        .map(|w| {
+            let mut w = *w;
+            if at_tpa(&w) {
+                w.alt_msl_ft = tpa_needed;
+            }
+            w
+        })
+        .collect();
+    Ok((raised, tpa_needed))
 }
+
+/// Height above the field at which the authored circuit switches the landing
+/// and taxi lights off (the rectangle and full auto's flight do it through
+/// the same `lights::after_climb`).
+const LIGHTS_OFF_AGL_FT: f64 = 1000.0;
 
 /// Fly an authored waypoint route (the LXGB Rock circuit), then hand the final
 /// to autoland. Same control surface as the rectangle loop — HDG bug + VS + the
 /// pattern speed-hold — but steering great-circle to each waypoint instead of
 /// the leg geometry. The last waypoint sits on short final.
+///
+/// Joins at the nearest leg (`join_waypoint`), never
+/// steps the bug against a turn in progress (`bug_toward`), climbs only as
+/// fast as the airspeed pays for (`climb_limit_fpm`, the rectangle's own
+/// law: this loop clamped a flat 700 fpm and flew the first turn at 60 kt),
+/// and gives the aircraft back after [`MAX_STALLS`] legs it could not close.
 #[allow(clippy::too_many_arguments)]
 async fn fly_authored_route(
     xp: XPlaneClient,
@@ -1121,6 +1349,8 @@ async fn fly_authored_route(
     rwy: crate::autoland::Runway,
     mag_var: f64,
     pattern_kts: f64,
+    full_kts: f64,
+    floor_kts: f64,
     callsign: Option<String>,
     apt_dat: String,
     cfg: crate::tools::autopilot::ApConfig,
@@ -1131,7 +1361,12 @@ async fn fly_authored_route(
     let mut last_vs_cmd: Option<f64> = None;
     let mut prev_ias: Option<(f64, std::time::Instant)> = None;
     let mut ias_trend = 0.0_f64;
-    let mut wpt_idx = 0usize;
+    let t_start = std::time::Instant::now();
+    // Picked from the first good position read, not assumed to be 0.
+    let mut wpt_idx: Option<usize> = None;
+    let mut closure: Option<Closure> = None;
+    let mut stalls = 0u32;
+    let mut lights_done = false;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if ABORT.load(Ordering::SeqCst) {
@@ -1146,12 +1381,13 @@ async fn fly_authored_route(
             continue;
         }
         let thr_dref = throttle_dref();
-        let (lat_r, lon_r, elev_r, psi_r, hp_r, hdg_st, vs_st, ias_r, thr_r) = tokio::join!(
+        let (lat_r, lon_r, elev_r, psi_r, hp_r, phi_r, hdg_st, vs_st, ias_r, thr_r) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
             xp.get_float(ELEV_M),
             xp.get_float(PSI_TRUE),
             xp.get_float(HPATH),
+            xp.get_float(PHI),
             xp.get_float(HDG_STATUS),
             xp.get_float(VS_STATUS),
             xp.get_float(IAS),
@@ -1162,30 +1398,77 @@ async fn fly_authored_route(
         };
         let alt_msl_ft = elev_r.map(|m| m * M_TO_FT).unwrap_or(f64::NAN);
         let (hdg_on, vs_on) = (hdg_st.unwrap_or(1.0) > 0.5, vs_st.unwrap_or(1.0) > 0.5);
-
-        let wp = route[wpt_idx];
+        // Position in the departure-runway frame (along the takeoff course
+        // from the threshold, right positive) — the authored waypoints' frame.
+        let a_m = -along_track_nm(lat, lon, &rwy) * M_PER_NM;
+        let x_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
+        let idx = match wpt_idx {
+            Some(i) => i,
+            None => {
+                let i = join_waypoint(&route, a_m, x_m);
+                crate::blackbox::record(
+                    "circuit",
+                    serde_json::json!({
+                        "event": "authored_join", "wpt": i, "skipped": i, "a_m": a_m, "x_m": x_m,
+                    }),
+                );
+                wpt_idx = Some(i);
+                i
+            }
+        };
+        let wp = route[idx];
         let (wlat, wlon) = frame_to_latlon(&rwy, wp.a_m, wp.x_m);
         // Crab so the AP holds the ground TRACK to the waypoint, like the legs.
+        let psi_r = psi_r.ok();
         let crab = match (psi_r, hp_r) {
-            (Ok(psi), Ok(hp)) => {
+            (Some(psi), Ok(hp)) => {
                 (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0)
             }
             _ => 0.0,
         };
-        let want_hdg = crate::nav::bearing_deg(lat, lon, wlat, wlon) + crab;
-        bug_mag = slew_bug(bug_mag, true_to_mag(want_hdg, mag_var), BUG_SLEW_PER_TICK);
+        let want_mag = true_to_mag(
+            crate::nav::bearing_deg(lat, lon, wlat, wlon) + crab,
+            mag_var,
+        );
+        let phi = phi_r.unwrap_or(0.0);
+        bug_mag = match psi_r {
+            Some(psi) => bug_toward(
+                bug_mag,
+                want_mag,
+                true_to_mag(psi, mag_var),
+                phi,
+                BUG_SLEW_PER_TICK,
+            ),
+            None => slew_bug(bug_mag, want_mag, BUG_SLEW_PER_TICK),
+        };
         let _ = xp.set_float(HDG_BUG, bug_mag).await;
         if !hdg_on {
             let _ = xp.run_command(CMD_SERVOS_ON).await;
             let _ = xp.run_command(CMD_HDG_MODE).await;
         }
 
-        // Vertical: VS toward the waypoint altitude (the takeoff's proven recipe).
-        let vs_cmd = if alt_msl_ft.is_finite() {
+        // Airspeed trend first: both the climb limiter and the throttle law
+        // judge the speed they are heading for.
+        let ias = ias_r.as_ref().ok().copied().unwrap_or(f64::NAN);
+        if ias.is_finite() {
+            let t_now = std::time::Instant::now();
+            if let Some((prev, t_prev)) = prev_ias {
+                let dt = t_now.duration_since(t_prev).as_secs_f64();
+                if (0.1..=2.0).contains(&dt) {
+                    ias_trend = 0.6 * ias_trend + 0.4 * (ias - prev) / dt;
+                }
+            }
+            prev_ias = Some((ias, t_now));
+        }
+
+        // Vertical: VS toward the waypoint altitude (the takeoff's proven
+        // recipe), and only as much climb as the airspeed will pay for.
+        let vs_raw = if alt_msl_ft.is_finite() {
             ((wp.alt_msl_ft - alt_msl_ft) * 3.0).clamp(-500.0, 700.0)
         } else {
             0.0
         };
+        let vs_cmd = climb_limit_fpm(vs_raw, ias, ias_trend, full_kts, floor_kts);
         if !vs_on {
             let _ = xp.run_command(CMD_VS_MODE).await;
             last_vs_cmd = None;
@@ -1196,15 +1479,7 @@ async fn fly_authored_route(
         }
 
         // Power holds the pattern speed — the same law the rectangle loop uses.
-        if let (Ok(ias), Ok(thr)) = (ias_r, thr_r) {
-            let t_now = std::time::Instant::now();
-            if let Some((prev, t_prev)) = prev_ias {
-                let dt = t_now.duration_since(t_prev).as_secs_f64();
-                if (0.1..=2.0).contains(&dt) {
-                    ias_trend = 0.6 * ias_trend + 0.4 * (ias - prev) / dt;
-                }
-            }
-            prev_ias = Some((ias, t_now));
+        if let (true, Ok(thr)) = (ias.is_finite(), thr_r) {
             let delta = crate::tools::speedhold::throttle_adjust(pattern_kts - ias, ias_trend);
             if delta != 0.0 {
                 let _ = xp
@@ -1213,19 +1488,66 @@ async fn fly_authored_route(
             }
         }
 
+        // Landing and taxi lights off through 1,000 ft, as the rectangle does.
+        if !lights_done && alt_msl_ft.is_finite() && alt_msl_ft - rwy.elev_ft > LIGHTS_OFF_AGL_FT {
+            lights_done = true;
+            let did = crate::tools::lights::after_climb(&xp).await;
+            crate::blackbox::record(
+                "circuit",
+                serde_json::json!({"event": "lights_climb", "off": did}),
+            );
+        }
+
         let d_m = crate::nav::haversine_nm(lat, lon, wlat, wlon) * M_PER_NM;
         crate::blackbox::record(
             "circuit",
             serde_json::json!({
-                "event": "authored_leg", "wpt": wpt_idx, "d_m": d_m, "bug": bug_mag,
+                "event": "authored_leg", "wpt": idx, "d_m": d_m, "bug": bug_mag,
                 "alt_msl": alt_msl_ft, "tgt_alt": wp.alt_msl_ft, "cmd_vs": vs_cmd,
+                "vs_raw": vs_raw, "ias": ias, "phi": phi,
             }),
         );
 
         if d_m < AUTHORED_CAPTURE_M {
-            wpt_idx += 1;
-            if wpt_idx >= route.len() {
+            wpt_idx = Some(idx + 1);
+            closure = None;
+            if idx + 1 >= route.len() {
                 break;
+            }
+            continue;
+        }
+        // Not closing on the waypoint for a whole [`STALL_S`]: orbiting, or
+        // blown off the leg. Level off (bug on the nose) and let the next
+        // ticks re-steer; three of those and the aircraft goes back.
+        let now_s = t_start.elapsed().as_secs_f64();
+        let stalled = closure
+            .get_or_insert_with(|| Closure::new(d_m, now_s))
+            .stalled(d_m, now_s);
+        if stalled {
+            stalls += 1;
+            crate::blackbox::record(
+                "circuit",
+                serde_json::json!({
+                    "event": "authored_stalled", "wpt": idx, "d_m": d_m, "stalls": stalls,
+                }),
+            );
+            if stalls >= MAX_STALLS {
+                let _ = xp.set_float(VS_DIAL, 0.0).await;
+                stand_down(
+                    &voice,
+                    "I can't make the circuit's next point. Holding heading and altitude. Your aircraft.",
+                    "authored_stalled_out",
+                );
+                return;
+            }
+            alert(
+                &voice,
+                Priority::Caution,
+                "Not closing on the next point. Levelling off and re-joining.",
+            );
+            if let Some(psi) = psi_r {
+                bug_mag = true_to_mag(psi, mag_var);
+                let _ = xp.set_float(HDG_BUG, bug_mag).await;
             }
         }
     }
@@ -1525,11 +1847,41 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // handed to autoland — confirmed in the sim (2026-07-26). It runs whenever
     // it's available and terrain-clear.
     if let Some(route) = authored_circuit(&rwy, &geom, field_elev_ft, tpa_msl_ft, left) {
-        if authored_route_clears_terrain(&xp, &rwy, &route).await {
+        // Probed along the LEGS, not at the waypoints: the six points sat on
+        // sea either side of the Rock while the downwind between them crossed
+        // the ridge 523 ft up (2026-09-14). Terrain under a pattern-altitude
+        // leg raises the pattern altitude; terrain under a descending leg,
+        // or a raise past MAX_TERRAIN_RAISE_FT, refuses the route.
+        let leg_max = leg_terrain_ft(&xp, &rwy, &route).await;
+        let authored = match raise_for_terrain(&route, tpa_msl_ft, &leg_max) {
+            Ok(v) => Some(v),
+            Err(why) => {
+                crate::blackbox::record(
+                    "circuit",
+                    serde_json::json!({"event": "authored_route_unsafe", "why": why}),
+                );
+                None
+            }
+        };
+        if let Some((route, tpa_used)) = authored {
             crate::blackbox::record(
                 "circuit",
-                serde_json::json!({"event": "authored_route", "wpts": route.len()}),
+                serde_json::json!({
+                    "event": "authored_route", "wpts": route.len(),
+                    "tpa_msl_ft": tpa_used, "raised_ft": tpa_used - tpa_msl_ft,
+                    "leg_max_ft": leg_max,
+                }),
             );
+            if tpa_used > tpa_msl_ft + 1.0 {
+                alert(
+                    &voice,
+                    Priority::Advisory,
+                    &format!(
+                        "Pattern altitude {} feet, to clear the Rock.",
+                        (tpa_used / 50.0).round() * 50.0
+                    ),
+                );
+            }
             alert(
                 &voice,
                 Priority::Advisory,
@@ -1548,6 +1900,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 rwy.clone(),
                 mag_var,
                 pattern_kts,
+                climb_full_rate_kts(pattern_kts, p_vy_kts, p_climb_floor_kts),
+                p_climb_floor_kts,
                 callsign.clone(),
                 p.apt_dat.clone(),
                 p.cfg.clone(),
@@ -1556,10 +1910,6 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             .await;
             return;
         }
-        crate::blackbox::record(
-            "circuit",
-            serde_json::json!({"event": "authored_route_unsafe"}),
-        );
         alert(
             &voice,
             Priority::Caution,
@@ -1945,7 +2295,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             }
         }
 
-        DETAIL.set(circuit_detail(leg, &rwy_id, alt_msl_ft, target_alt, ias_now));
+        DETAIL.set(circuit_detail(
+            leg, &rwy_id, alt_msl_ft, target_alt, ias_now,
+        ));
         crate::auto_status::set_ap_targets(Some(bug_mag), Some(target_alt), Some(vs_cmd));
         crate::blackbox::record(
             "circuit",
@@ -3106,5 +3458,159 @@ mod tests {
             x <= ESTABLISHED_XTK_M && along > 900.0,
             "must be established with room to spare: {x:.0} m off, {along:.0} m to run"
         );
+    }
+
+    /// The sim's heading mode does not reverse a turn in progress (LXGB
+    /// 2026-09-14): the tick that captured waypoint 2 had the aircraft 4.3
+    /// degrees right for it and wanted 276 for waypoint 3 with the nose on
+    /// 300.5. The bug must go on the nose until the wings are level, then
+    /// the short way.
+    #[test]
+    fn the_bug_never_steps_against_a_turn_in_progress() {
+        // Banked right, wanted turn left: the bug tracks the nose.
+        let b = bug_toward(302.4, 276.5, 300.5, 4.3, BUG_SLEW_PER_TICK);
+        assert!((b - 300.5).abs() < 0.01, "on the nose, got {b}");
+        // Rolled out: the short way to the waypoint.
+        let b = bug_toward(300.5, 276.5, 300.5, 2.0, BUG_SLEW_PER_TICK);
+        assert!((b - 276.5).abs() < 0.01, "left to the waypoint, got {b}");
+        // Turn wanted the SAME way as the bank: untouched pursuit.
+        let b = bug_toward(100.0, 150.0, 100.0, 12.0, BUG_SLEW_PER_TICK);
+        assert!((b - 140.0).abs() < 0.01, "slewed toward 150, got {b}");
+        // A small reversal is the AP finishing its capture, not a wrong way.
+        let b = bug_toward(100.0, 95.0, 100.0, 12.0, BUG_SLEW_PER_TICK);
+        assert!((b - 95.0).abs() < 0.01, "small correction passes, got {b}");
+        // Across the north seam, banked left, wanted right: nose again.
+        let b = bug_toward(350.0, 30.0, 355.0, -12.0, BUG_SLEW_PER_TICK);
+        assert!(
+            (b - 355.0).abs() < 0.01,
+            "on the nose across the seam, got {b}"
+        );
+    }
+
+    /// The takeoff handed off 1.8 km past the climb-out point; the follower
+    /// must join at the first waypoint still ahead, never steer back.
+    #[test]
+    fn the_join_skips_waypoints_already_behind() {
+        let route = authored_circuit(&lxgb_rwy(), &g(), 11.0, 1650.0, false).unwrap();
+        let up = route[0].a_m;
+        // Over the runway, climbing: the climb-out point is ahead.
+        assert_eq!(join_waypoint(&route, up - 1500.0, 0.0), 0);
+        // The sortie: 3,824 m along, 95 m right — past waypoint 0, short of
+        // the crosswind turn's end.
+        assert_eq!(join_waypoint(&route, up + 1798.0, 95.0), 1);
+        // Halfway down the downwind: its end.
+        assert_eq!(
+            join_waypoint(&route, route[1].a_m * 0.5, route[2].x_m + 50.0),
+            2
+        );
+        // Beyond the last waypoint along its own leg: the last one.
+        let (p, q) = (route[route.len() - 2], route[route.len() - 1]);
+        let (da, dx) = (q.a_m - p.a_m, q.x_m - p.x_m);
+        let len = (da * da + dx * dx).sqrt();
+        let idx = join_waypoint(&route, q.a_m + 100.0 * da / len, q.x_m + 100.0 * dx / len);
+        assert_eq!(idx, route.len() - 1);
+    }
+
+    /// Sampling the legs, not the waypoints: every leg is covered end to end
+    /// at no more than LEG_SAMPLE_M spacing, and the climb-out is left out.
+    #[test]
+    fn the_legs_are_sampled_end_to_end() {
+        let route = authored_circuit(&lxgb_rwy(), &g(), 11.0, 1650.0, false).unwrap();
+        let samples = leg_samples(&route);
+        assert!(samples.iter().all(|s| s.0 >= 1), "leg 0 is the takeoff's");
+        for i in 1..route.len() {
+            let leg: Vec<_> = samples.iter().filter(|s| s.0 == i).collect();
+            let first = leg.first().unwrap();
+            let last = leg.last().unwrap();
+            assert!(
+                (first.1 - route[i - 1].a_m).abs() < 0.01
+                    && (first.2 - route[i - 1].x_m).abs() < 0.01
+            );
+            assert!((last.1 - route[i].a_m).abs() < 0.01 && (last.2 - route[i].x_m).abs() < 0.01);
+            for w in leg.windows(2) {
+                let d = ((w[1].1 - w[0].1).powi(2) + (w[1].2 - w[0].2).powi(2)).sqrt();
+                assert!(d <= LEG_SAMPLE_M + 0.01, "leg {i} sample spacing {d:.0} m");
+            }
+        }
+    }
+
+    /// The Rock circuit's downwind crosses the ridge (~1,130 ft) at a
+    /// 1,650 ft pattern altitude: 520 ft, under the 600 the rule demands. The
+    /// pattern altitude rises to clear it; the handoff waypoints stay put.
+    #[test]
+    fn the_pattern_altitude_rises_over_the_ridge_the_downwind_crosses() {
+        let route = authored_circuit(&lxgb_rwy(), &g(), 11.0, 1650.0, false).unwrap();
+        let mut legs = vec![None; route.len()];
+        legs[2] = Some(1130.0);
+        let (raised, tpa) = raise_for_terrain(&route, 1650.0, &legs).unwrap();
+        assert!((tpa - 1730.0).abs() < 0.01, "tpa {tpa}");
+        for w in &raised[..4] {
+            assert!(
+                (w.alt_msl_ft - 1730.0).abs() < 0.01,
+                "pattern waypoints raised"
+            );
+        }
+        assert!(
+            (raised[4].alt_msl_ft - 711.0).abs() < 0.01,
+            "handoff height untouched"
+        );
+        assert!((raised[5].alt_msl_ft - 711.0).abs() < 0.01);
+        // Sea under every leg: nothing changes.
+        let (same, tpa) = raise_for_terrain(&route, 1650.0, &vec![None; route.len()]).unwrap();
+        assert!((tpa - 1650.0).abs() < 0.01);
+        assert!(same
+            .iter()
+            .zip(&route)
+            .all(|(a, b)| (a.alt_msl_ft - b.alt_msl_ft).abs() < 0.01));
+        // Terrain under a DESCENDING leg cannot be out-climbed: refused.
+        let mut legs = vec![None; route.len()];
+        legs[4] = Some(400.0);
+        assert!(raise_for_terrain(&route, 1650.0, &legs).is_err());
+        // A raise past the cap is refused, not flown.
+        let mut legs = vec![None; route.len()];
+        legs[2] = Some(2200.0);
+        assert!(raise_for_terrain(&route, 1650.0, &legs).is_err());
+    }
+
+    #[test]
+    fn the_rectangle_polyline_is_dense_enough_for_a_ridge() {
+        let pts = densify(&[(0.0, 0.0), (1000.0, 0.0), (1000.0, 700.0)], 150.0);
+        assert_eq!(pts[0], (0.0, 0.0));
+        assert_eq!(*pts.last().unwrap(), (1000.0, 700.0));
+        assert!(pts.contains(&(1000.0, 0.0)), "corners kept");
+        for w in pts.windows(2) {
+            let d = ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt();
+            assert!(d <= 150.01, "spacing {d}");
+        }
+        let poly = pattern_polyline(&lxgb_rwy(), &g(), 1680.0, false);
+        assert!(
+            poly.len() > 60,
+            "a 12 km rectangle needs more than 20 samples: {}",
+            poly.len()
+        );
+    }
+
+    /// The orbit: the distance to waypoint 3 went 2,853 → 2,292 → 3,300 →
+    /// 3,141 over five minutes. A watchdog on "no new low for 45 s" fires
+    /// once per lap; a leg genuinely closing never trips it.
+    #[test]
+    fn the_watchdog_fires_on_an_orbit_and_never_on_a_closing_leg() {
+        let mut c = Closure::new(2908.0, 0.0);
+        assert!(!c.stalled(2853.0, 1.3));
+        assert!(!c.stalled(2292.0, 22.0)); // the near side of the lap
+        for t in 23..67 {
+            let d = 2300.0 + (t as f64 - 22.0) * 25.0; // opening back out
+            assert!(!c.stalled(d, t as f64), "not yet at t={t}");
+        }
+        assert!(c.stalled(3300.0, 68.0), "no new low for 45 s: stalled");
+        assert!(
+            !c.stalled(3290.0, 69.0),
+            "fires once, then the clock restarts"
+        );
+        // A leg closing at 35 m/s never sets the flag.
+        let mut c = Closure::new(2500.0, 0.0);
+        for t in 1..70 {
+            assert!(!c.stalled(2500.0 - 35.0 * t as f64, t as f64));
+        }
     }
 }

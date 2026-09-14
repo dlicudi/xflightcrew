@@ -52,7 +52,15 @@ pub async fn sample_ft(xp: &XPlaneClient, pts: &[(f64, f64)]) -> Option<Vec<f64>
 }
 
 /// The highest ground elevation (feet MSL) under a polyline; `None` = no data.
+/// Any number of points: queried in [`MAX_POINTS`] chunks (a polyline longer
+/// than one query used to be silently truncated to its first 24 samples).
 pub async fn max_elevation_ft(xp: &XPlaneClient, pts: &[(f64, f64)]) -> Option<f64> {
-    let v = sample_ft(xp, pts).await?;
-    v.into_iter().max_by(|a, b| a.total_cmp(b))
+    let mut best: Option<f64> = None;
+    for chunk in pts.chunks(MAX_POINTS) {
+        let v = sample_ft(xp, chunk).await?;
+        for e in v {
+            best = Some(best.map_or(e, |b| b.max(e)));
+        }
+    }
+    best
 }
