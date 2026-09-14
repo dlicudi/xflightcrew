@@ -33,7 +33,12 @@ static EXTERIOR: std::sync::Mutex<Exterior> = std::sync::Mutex::new(Exterior {
 /// Publish the active airframe's exterior set. Called from the one place
 /// the live profile changes.
 pub fn publish_exterior(lights: &[LightProfile]) {
-    let pick = |key: &str| lights.iter().find(|l| l.key.eq_ignore_ascii_case(key)).cloned();
+    let pick = |key: &str| {
+        lights
+            .iter()
+            .find(|l| l.key.eq_ignore_ascii_case(key))
+            .cloned()
+    };
     *EXTERIOR.lock().unwrap_or_else(|e| e.into_inner()) = Exterior {
         landing: pick("landing"),
         taxi: pick("taxi"),
@@ -60,7 +65,9 @@ pub async fn dark_now(xp: &dyn XPlane) -> bool {
 /// light after dusk (the SR22 carries only a landing lamp, and that is how a
 /// Cirrus is taxied at night); by day, none.
 pub fn taxi_light_for(ext: &Exterior, dark: bool) -> Option<LightProfile> {
-    ext.taxi.clone().or_else(|| dark.then(|| ext.landing.clone()).flatten())
+    ext.taxi
+        .clone()
+        .or_else(|| dark.then(|| ext.landing.clone()).flatten())
 }
 
 pub fn taxi_light(dark: bool) -> Option<LightProfile> {
@@ -94,23 +101,57 @@ pub fn after_vacate_for(ext: &Exterior, dark: bool) -> (Option<bool>, Option<boo
 
 /// Apply [`after_vacate_for`] to the aircraft. Returns what was switched.
 pub async fn after_vacate(xp: &dyn XPlane, dark: bool) -> Value {
+    let (landing, taxi) = after_vacate_for(&exterior(), dark);
+    drive_pair(xp, landing, taxi).await
+}
+
+/// Clear of the pattern: every ground light goes off. The landing light did
+/// the takeoff; the taxi light did the taxi and nobody switched it off at
+/// line-up. On the 172 both lamps sit in the same wing cluster, so a taxi
+/// light left burning looks exactly like the landing light the copilot just
+/// announced off (climb checklist, 2026-09-14). Returned as (landing, taxi)
+/// wants, `None` = the airframe has no such switch.
+pub fn after_climb_for(ext: &Exterior) -> (Option<bool>, Option<bool>) {
+    (
+        ext.landing.as_ref().map(|_| false),
+        ext.taxi.as_ref().map(|_| false),
+    )
+}
+
+/// Apply [`after_climb_for`] to the aircraft. Returns what was switched.
+pub async fn after_climb(xp: &dyn XPlane) -> Value {
+    let (landing, taxi) = after_climb_for(&exterior());
+    drive_pair(xp, landing, taxi).await
+}
+
+/// Drive the landing and taxi wants through [`apply`]. Each entry is `true`
+/// only when the switch READ BACK in the wanted state: a write that returned
+/// Ok with the wrong readback used to count as done, and `true` for an "off"
+/// was impossible, so the blackbox could never say the light went off.
+async fn drive_pair(xp: &dyn XPlane, landing: Option<bool>, taxi: Option<bool>) -> Value {
     let ext = exterior();
-    let (landing, taxi) = after_vacate_for(&ext, dark);
     let mut did = serde_json::Map::new();
     if let (Some(on), Some(l)) = (landing, ext.landing.as_ref()) {
-        did.insert("landing".into(), json!(apply(xp, l, on).await.is_ok() && on));
+        did.insert("landing".into(), json!(reached(xp, l, on).await));
     }
     if let (Some(on), Some(l)) = (taxi, ext.taxi.as_ref()) {
-        did.insert("taxi".into(), json!(apply(xp, l, on).await.is_ok() && on));
+        did.insert("taxi".into(), json!(reached(xp, l, on).await));
     }
     Value::Object(did)
 }
 
+/// Apply and report whether the switch read back in the wanted state.
+async fn reached(xp: &dyn XPlane, light: &LightProfile, on: bool) -> bool {
+    apply(xp, light, on)
+        .await
+        .map_or(false, |state| state == on)
+}
+
 /// Switch the landing light, if this airframe declares one. `false` when it
-/// does not or the write failed.
+/// does not, the write failed, or the readback disagrees with the intent.
 pub async fn landing(xp: &dyn XPlane, on: bool) -> bool {
     match exterior().landing {
-        Some(l) => apply(xp, &l, on).await.is_ok(),
+        Some(l) => reached(xp, &l, on).await,
         None => false,
     }
 }
@@ -132,17 +173,32 @@ mod exterior_tests {
         }
     }
     fn both() -> Exterior {
-        Exterior { landing: Some(lp("landing")), taxi: Some(lp("taxi")) }
+        Exterior {
+            landing: Some(lp("landing")),
+            taxi: Some(lp("taxi")),
+        }
     }
     fn sr22() -> Exterior {
-        Exterior { landing: Some(lp("landing")), taxi: None }
+        Exterior {
+            landing: Some(lp("landing")),
+            taxi: None,
+        }
     }
 
     #[test]
     fn the_taxi_light_is_the_taxi_light_and_the_sr22_taxis_on_its_landing_lamp_after_dusk() {
-        assert_eq!(taxi_light_for(&both(), false).map(|l| l.key), Some("taxi".into()));
-        assert_eq!(taxi_light_for(&both(), true).map(|l| l.key), Some("taxi".into()));
-        assert_eq!(taxi_light_for(&sr22(), true).map(|l| l.key), Some("landing".into()));
+        assert_eq!(
+            taxi_light_for(&both(), false).map(|l| l.key),
+            Some("taxi".into())
+        );
+        assert_eq!(
+            taxi_light_for(&both(), true).map(|l| l.key),
+            Some("taxi".into())
+        );
+        assert_eq!(
+            taxi_light_for(&sr22(), true).map(|l| l.key),
+            Some("landing".into())
+        );
         assert!(taxi_light_for(&sr22(), false).is_none());
     }
 
@@ -160,6 +216,13 @@ mod exterior_tests {
         assert_eq!(after_vacate_for(&sr22(), true), (Some(true), None));
         assert_eq!(after_vacate_for(&sr22(), false), (Some(false), None));
         assert_eq!(after_vacate_for(&Exterior::default(), true), (None, None));
+    }
+
+    #[test]
+    fn the_climb_puts_out_every_ground_light_the_airframe_has() {
+        assert_eq!(after_climb_for(&both()), (Some(false), Some(false)));
+        assert_eq!(after_climb_for(&sr22()), (Some(false), None));
+        assert_eq!(after_climb_for(&Exterior::default()), (None, None));
     }
 }
 

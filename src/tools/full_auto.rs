@@ -115,6 +115,8 @@ pub struct FullAuto {
     /// Indicated cruise speed for the enroute cruise-power hold (profile's
     /// `reference.cruise_ias_kts`); `None` leaves cruise at climb power.
     pub cruise_ias_kts: Option<f64>,
+    /// The airframe's transition altitude (QNH below, standard above).
+    pub transition_altitude_ft: f64,
     /// Constant-speed prop levers, threaded into every ground-roll sub-tool so
     /// they unfeather before taxi/line-up/takeoff. `None` on the pistons.
     pub prop: Option<crate::aircraft::PropProfile>,
@@ -320,6 +322,7 @@ impl Tool for FullAuto {
                 prop: self.prop.clone(),
             },
             cruise_ias_kts: self.cruise_ias_kts,
+            transition_altitude_ft: self.transition_altitude_ft,
             piston_mixture: self.piston_mixture,
             mission,
             power_up_first: self.power_up_first,
@@ -451,9 +454,11 @@ impl FullAuto {
                 ctx.config.fix_data_path.clone(),
                 fp.destination.clone(),
             );
-            tokio::task::spawn_blocking(move || crate::full_auto::brief_arrival(&apt, &cifp, &fixp, &dest))
-                .await
-                .map_err(|e| format!("The arrival brief failed: {e}"))??
+            tokio::task::spawn_blocking(move || {
+                crate::full_auto::brief_arrival(&apt, &cifp, &fixp, &dest)
+            })
+            .await
+            .map_err(|e| format!("The arrival brief failed: {e}"))??
         };
 
         let n = legs.len();

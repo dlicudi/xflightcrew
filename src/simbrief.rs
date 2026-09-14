@@ -25,6 +25,7 @@ pub enum PlanSource {
 }
 
 /// The briefed essentials of a SimBrief OFP. Fuel figures are in US gallons.
+#[derive(Clone)]
 pub struct FlightPlan {
     pub source: PlanSource,
     pub origin: String,      // ICAO

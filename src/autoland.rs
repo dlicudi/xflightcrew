@@ -398,6 +398,9 @@ pub fn run_autoland(
             return;
         };
         rt.block_on(async move {
+            // Kept for a re-arm on a different runway (see the clearance
+            // watch in the tick).
+            let base_url = base.clone();
             let xp = XPlaneClient::new(base);
             ACTIVE.store(true, Ordering::SeqCst);
             let announce = |line: String, sev: Priority| {
@@ -545,6 +548,12 @@ pub fn run_autoland(
             let mut rolling_out = false;
             let mut vacate_follows = false;
             let mut roll_law = crate::autotakeoff::RollSteer::default();
+            // The landing readback last sent, so an owed one goes out once
+            // (the party line keeps it owed until the tower hears it).
+            let mut readback_sent: Option<String> = None;
+            // The cleared ident already looked up against apt.dat, so the
+            // (seconds-long) lookup of one that is not at this field runs once.
+            let mut clearance_checked: Option<String> = None;
             loop {
                 if GEN.load(Ordering::SeqCst) != my_gen || ABORT.load(Ordering::SeqCst) {
                     break;
@@ -572,6 +581,94 @@ pub fn run_autoland(
                 let alt = elev_m * M_TO_FT;
                 let radio_ft = agl_m * M_TO_FT;
                 let gs_kts = gs_ms * MS_TO_KTS;
+
+                // THE TOWER'S WORD DURING THE APPROACH. The clearance was read
+                // once, at arm time; the final report that EARNS it goes out
+                // after that, so the answer was never seen: "negative, runway
+                // zero niner, I say again runway zero niner ... cleared to
+                // land" came back five seconds after the pick, and autoland
+                // flew 27 into a 21 kt tailwind (LXGB, 2026-09-14). Now the
+                // landing clearance is read back (the runway-critical echo
+                // the tower waits for, the crew's job while a loop flies),
+                // and a clearance for ANOTHER end of THIS field re-arms the
+                // approach on it: a fresh loop, forced onto the cleared
+                // runway, repositioning from wherever we are. A departure
+                // state's runway is the departure's; a stale one is never
+                // ours to land on.
+                if on_ground < 0.5 && !rolling_out {
+                    let cleared = crate::party_line::clearance_runway();
+                    match crate::party_line::readback_owed() {
+                        None => readback_sent = None,
+                        Some(owed) if landing_readback(&owed) && readback_sent.as_deref() != Some(&owed) => {
+                            readback_sent = Some(owed.clone());
+                            if going_around_callsign.is_none() {
+                                going_around_callsign = Some(crate::circuit::crew_callsign(&xp).await);
+                            }
+                            let cs = going_around_callsign.clone().flatten();
+                            let rwy_words = cleared
+                                .as_deref()
+                                .map(|r| format!(" runway {}", crate::circuit::spell_runway(r)))
+                                .unwrap_or_default();
+                            crate::circuit::transmit(crate::circuit::radio_call(
+                                &cs,
+                                &format!("cleared to land{rwy_words}"),
+                            ));
+                            crate::blackbox::record(
+                                "autoland",
+                                serde_json::json!({"event": "landing_readback", "rwy": cleared}),
+                            );
+                        }
+                        Some(_) => {}
+                    }
+                    if let Some(c) = clearance_switch(
+                        &rwy.id,
+                        crate::party_line::clearance_state(),
+                        cleared.as_deref(),
+                        clearance_checked.as_deref(),
+                    ) {
+                        clearance_checked = Some(c.clone());
+                        match runway_by_id(&apt_dat, lat, lon, &c, 40.0) {
+                            Ok(Some(r)) if r.icao == rwy.icao => {
+                                crate::blackbox::record(
+                                    "autoland",
+                                    serde_json::json!({"event": "runway_from_clearance",
+                                        "planned": rwy.id, "cleared": r.id, "in_flight": true,
+                                        "radio": radio_ft, "dist": r.dist_nm}),
+                                );
+                                announce(
+                                    format!(
+                                        "Tower cleared us for runway {}, not {}. Setting up for runway {}.",
+                                        crate::circuit::spell_runway(&r.id),
+                                        crate::circuit::spell_runway(&rwy.id),
+                                        crate::circuit::spell_runway(&r.id)
+                                    ),
+                                    Priority::Caution,
+                                );
+                                // A new loop owns the aircraft from its first
+                                // tick; this one exits on the generation bump
+                                // and leaves ACTIVE to it.
+                                run_autoland(
+                                    base_url.clone(),
+                                    apt_dat.clone(),
+                                    cfg.clone(),
+                                    approach_ias,
+                                    voice.clone(),
+                                    None,
+                                    Some(r.id),
+                                );
+                                break;
+                            }
+                            other => {
+                                crate::blackbox::record(
+                                    "autoland",
+                                    serde_json::json!({"event": "clearance_runway_elsewhere",
+                                        "flying": format!("{} {}", rwy.icao, rwy.id), "cleared": c,
+                                        "found": other.ok().flatten().map(|r| format!("{} {}", r.icao, r.id))}),
+                                );
+                            }
+                        }
+                    }
+                }
 
                 // ROLLOUT TO A STOP. Once on the ground and slow, cut the power
                 // and brake to a halt before handing off — the old touchdown
@@ -857,9 +954,17 @@ pub fn run_autoland(
                     hdg = g.target_heading_deg, ias, radio = radio_ft, phase = ?g.phase,
                     "autoland"
                 );
+                // The vertical speed actually flown: the watchdog below reads
+                // it, and so does the landing arrest, whose dial leads the
+                // target through the autopilot's lag (`vs_dial_fpm`). The
+                // blackbox keeps both columns: `cmd_vs` is what the law
+                // wants, `vs_dial` what the autopilot was told.
+                let vvi = xp.get_float(VVI_FPM).await.unwrap_or(g.target_vs_fpm);
+                let vs_dial = vs_dial_fpm(g.target_vs_fpm, vvi, g.arresting);
                 crate::blackbox::record("autoland", serde_json::json!({
                     "rwy": format!("{} {}", rwy.icao, rwy.id), "dist": g.dist_nm,
                     "alt": alt, "gp_alt": g.glidepath_alt_ft, "cmd_vs": g.target_vs_fpm,
+                    "vs_dial": vs_dial, "vvi": vvi,
                     "cmd_hdg": g.target_heading_deg, "ias": ias, "radio": radio_ft,
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
                     "trim": trim, "xtk_m": xtk_now * M_PER_NM,
@@ -889,7 +994,7 @@ pub fn run_autoland(
                 if xp.get_float(VS_STATUS).await.unwrap_or(0.0) <= 0.5 {
                     let _ = xp.run_command(CMD_VS_MODE).await;
                 }
-                let _ = xp.set_float(VS_DIAL, g.target_vs_fpm).await;
+                let _ = xp.set_float(VS_DIAL, vs_dial).await;
 
                 // Speed: hold the approach speed with the SAME governor the copilot
                 // uses for speed hold (speedhold::throttle_adjust) — a P+D law whose
@@ -952,7 +1057,6 @@ pub fn run_autoland(
                 // no callout. If actual VS diverges hard for ~5 s, re-arm the VS
                 // mode and tell the pilot — this is exactly when a hand on the
                 // yoke matters.
-                let vvi = xp.get_float(VVI_FPM).await.unwrap_or(g.target_vs_fpm);
                 if g.phase != ApproachPhase::Flare && (vvi - g.target_vs_fpm).abs() > 700.0 {
                     vs_diverged += 1;
                     if vs_diverged == 12 {
@@ -1002,10 +1106,48 @@ pub fn run_autoland(
                 // latched by `rolling_out`, before the approach guidance.)
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             }
-            set_panel("");
-            ACTIVE.store(false, Ordering::SeqCst);
+            // A newer loop (the clearance re-arm above, or any later arm) has
+            // already set ACTIVE for itself; clearing it here would report
+            // "landed or gone around" to whoever waits on it.
+            if GEN.load(Ordering::SeqCst) == my_gen {
+                set_panel("");
+                ACTIVE.store(false, Ordering::SeqCst);
+            }
         });
     });
+}
+
+/// The runway END a clearance heard DURING the approach moves us to, if any:
+/// an arrival-shaped clearance (told to join, or cleared to land) naming a
+/// different end than the one being flown, not already looked up. A
+/// departure state's runway belongs to the departure; a blank or matching
+/// ident changes nothing. The caller still checks the end is at THIS field.
+pub fn clearance_switch(
+    flying: &str,
+    state: Option<crate::tower::State>,
+    cleared: Option<&str>,
+    already_checked: Option<&str>,
+) -> Option<String> {
+    use crate::tower::State::{ClearedToLand, Inbound};
+    if !matches!(state, Some(ClearedToLand | Inbound)) {
+        return None;
+    }
+    let c = cleared?.trim();
+    if !clearance_differs(flying, c) {
+        return None;
+    }
+    if already_checked.is_some_and(|a| a.trim().eq_ignore_ascii_case(c)) {
+        return None;
+    }
+    Some(c.to_string())
+}
+
+/// Is an owed readback the LANDING one? The tower phrases what it waits for
+/// (`Tower::suggested_readback`); a hold or line-up echo is never an
+/// approach's to make.
+pub fn landing_readback(owed: &str) -> bool {
+    let o = owed.trim_start().to_ascii_lowercase();
+    o.starts_with("cleared to land") || o.starts_with("cleared touch and go")
 }
 
 /// Does the standing clearance name a different runway END than the plan?
@@ -1336,6 +1478,38 @@ const FLARE_MAX_DIST_NM: f64 = 0.35;
 const ROUNDOUT_MULT: f64 = 2.0;
 const ROUNDOUT_VS_FPM: f64 = -250.0;
 
+/// The VS mode is a slow servo, and the landing arrest is the one place the
+/// dial's lag is measured in feet of runway. LXGB 27, 2026-09-14 (the 172's
+/// third firm arrival in three days, same shape each time): the roundout
+/// dialled -250 at 49 ft radio and the aircraft was still sinking 386 fpm
+/// four seconds later; the flare dialled -100 at 23 ft and the vertical
+/// speed never moved off -260 before the wheels touched at -309 (the
+/// blackbox's `cmd_vs` column changed on time, the `vsi` column never
+/// followed). Fitted to that tick log the autopilot follows the dial as a
+/// first-order lag of about 4.5 s with a tick of dead time, which from the
+/// flare gate at approach sink is longer than the flare itself. So in the
+/// roundout and the flare the DIAL leads the target by the error the
+/// autopilot still owes (`vs_dial_fpm`): dial = target + gain x (target -
+/// actual). Gain 2 makes the closed lag ~1.5 s, comfortably inside the
+/// stability margin a 1 s dead time leaves (about 7). The dial may read a
+/// CLIMB for a moment - that is the flare, the yoke coming back - capped at
+/// [`VS_LEAD_MAX_CLIMB_FPM`] so a balloon can never be commanded, and the
+/// glidepath above the band is untouched (its own P law tracks a ramp with
+/// `path_descent_fpm`, and every approach test stays byte-identical).
+const VS_LEAD_GAIN: f64 = 2.0;
+const VS_LEAD_MAX_CLIMB_FPM: f64 = 300.0;
+
+/// What to dial into the VS mode so the aircraft actually FLIES `target_fpm`.
+/// Outside a landing arrest (`arresting` false) the dial is the target, as it
+/// always was. Inside one it leads the target by the autopilot's outstanding
+/// error - see [`VS_LEAD_GAIN`].
+pub fn vs_dial_fpm(target_fpm: f64, actual_fpm: f64, arresting: bool) -> f64 {
+    if !arresting {
+        return target_fpm;
+    }
+    (target_fpm + VS_LEAD_GAIN * (target_fpm - actual_fpm)).clamp(-1200.0, VS_LEAD_MAX_CLIMB_FPM)
+}
+
 /// May the roundout own the descent from HERE? Only where a
 /// [`ROUNDOUT_VS_FPM`] descent still REACHES the pavement. At or past the
 /// threshold, always — there the unsigned glidepath distance grows again and
@@ -1622,6 +1796,7 @@ pub fn missed_approach_guidance(
         glidepath_alt_ft,
         phase: ApproachPhase::Intercept,
         balk: None,
+        arresting: false,
     }
 }
 
@@ -1653,6 +1828,10 @@ pub struct Guidance {
     /// attached cost a person an hour of reconstruction from the command
     /// column (LEMG 13, 2026-09-12).
     pub balk: Option<&'static str>,
+    /// The vertical target is a landing ARREST (roundout or flare): the VS
+    /// dial must lead it through the autopilot's lag ([`vs_dial_fpm`]).
+    /// False everywhere else, where the dial is the target.
+    pub arresting: bool,
 }
 
 /// Where the final's pure pursuit aims, in nm from the threshold measured back
@@ -1924,6 +2103,15 @@ pub fn guidance(
         -1200.0
     };
 
+    // The roundout band's own gates, named once: the vertical law below owns
+    // the descent from here, and the dial leads it (`arresting`).
+    let roundout = phase == ApproachPhase::Final
+        && !below_terrain_floor
+        && in_flare_zone
+        && xtk.abs() <= FLARE_MAX_XTK_NM
+        && radio_alt_ft <= flare_radio_ft * ROUNDOUT_MULT
+        && roundout_reaches_pavement(along_nm, radio_alt_ft, gs_kts);
+
     // What the vertical path asks for, computed first so the speed-protection
     // branch below can be measured against it.
     let path_vs = match phase {
@@ -1953,14 +2141,7 @@ pub fn guidance(
         // BEFORE the runway, where the old level-hold below let the path
         // come down to it (audit, 2026-08-02). The test is the physical one
         // — see `roundout_reaches_pavement`.
-        ApproachPhase::Final
-            if in_flare_zone
-                && xtk.abs() <= FLARE_MAX_XTK_NM
-                && radio_alt_ft <= flare_radio_ft * ROUNDOUT_MULT
-                && roundout_reaches_pavement(along_nm, radio_alt_ft, gs_kts) =>
-        {
-            ROUNDOUT_VS_FPM
-        }
+        ApproachPhase::Final if roundout => ROUNDOUT_VS_FPM,
         // On/above speed but below the glidepath: hold level and let the path
         // descend to us — don't climb to intercept. Speed protection above has
         // already handled the case where holding level would stall us.
@@ -2022,6 +2203,7 @@ pub fn guidance(
         glidepath_alt_ft,
         phase,
         balk,
+        arresting: phase == ApproachPhase::Flare || roundout,
     }
 }
 
@@ -2050,10 +2232,23 @@ mod tests {
         let mut trim = super::TrackTrim::new();
         let mut bug = 0.0;
         let mut trim_deg = 0.0;
-        let mut g = guidance(lat, lon, 1000.0, 1000.0, gs_kts, 65.0, &rwy, 65.0, 25.0, 0.0);
+        let mut g = guidance(
+            lat, lon, 1000.0, 1000.0, gs_kts, 65.0, &rwy, 65.0, 25.0, 0.0,
+        );
         for _ in 0..800 {
             let alt = g.glidepath_alt_ft;
-            g = guidance(lat, lon, alt, alt - rwy.elev_ft, gs_kts, 65.0, &rwy, 65.0, 25.0, 0.0);
+            g = guidance(
+                lat,
+                lon,
+                alt,
+                alt - rwy.elev_ft,
+                gs_kts,
+                65.0,
+                &rwy,
+                65.0,
+                25.0,
+                0.0,
+            );
             if alt - rwy.elev_ft < 100.0 || g.phase == ApproachPhase::Intercept {
                 break;
             }
@@ -2083,9 +2278,17 @@ mod tests {
         // left and never closes, and a lateral gate balks it — the go-around
         // the pilot watched twice.
         let (xtk, g, _) = fly_final_with_heading_bias(-2.0, false);
-        assert_eq!(g.phase, ApproachPhase::Intercept, "{:.0} m off", xtk * super::M_PER_NM);
+        assert_eq!(
+            g.phase,
+            ApproachPhase::Intercept,
+            "{:.0} m off",
+            xtk * super::M_PER_NM
+        );
         assert!(
-            matches!(g.balk, Some("off_centreline_low" | "unstabilised_below_floor")),
+            matches!(
+                g.balk,
+                Some("off_centreline_low" | "unstabilised_below_floor")
+            ),
             "{:?}",
             g.balk
         );
@@ -2113,7 +2316,10 @@ mod tests {
         }
         // No bias: nothing to trim, and the trim invents nothing.
         let (xtk, _, trim) = fly_final_with_heading_bias(0.0, true);
-        assert!(xtk.abs() < 0.003 && trim.abs() < 0.3, "xtk {xtk} trim {trim}");
+        assert!(
+            xtk.abs() < 0.003 && trim.abs() < 0.3,
+            "xtk {xtk} trim {trim}"
+        );
     }
 
     #[test]
@@ -2136,7 +2342,10 @@ mod tests {
             t.update(ApproachPhase::Final, 90.0, Some(85.0), 1.0);
         }
         assert_eq!(t.value(), super::TRACK_TRIM_MAX_DEG);
-        assert_eq!(t.update(ApproachPhase::Intercept, 90.0, Some(85.0), 1.0), 0.0);
+        assert_eq!(
+            t.update(ApproachPhase::Intercept, 90.0, Some(85.0), 1.0),
+            0.0
+        );
     }
 
     #[test]
@@ -2166,7 +2375,10 @@ mod tests {
             }
         }
         assert!(worst < 2.0, "the swing came through at {worst:.1} degrees");
-        assert!(worst > 0.5, "a filter that passes nothing is a constant, got {worst:.2}");
+        assert!(
+            worst > 0.5,
+            "a filter that passes nothing is a constant, got {worst:.2}"
+        );
     }
 
     #[test]
@@ -2175,8 +2387,15 @@ mod tests {
         for _ in 0..90 {
             f.update(Some(6.0), 0.5);
         }
-        assert!((f.update(None, 0.5) - 6.0).abs() < 0.01, "a missed read is not a zero crab");
-        assert_eq!(super::CrabFilter::new().update(None, 0.5), 0.0, "never read = zero");
+        assert!(
+            (f.update(None, 0.5) - 6.0).abs() < 0.01,
+            "a missed read is not a zero crab"
+        );
+        assert_eq!(
+            super::CrabFilter::new().update(None, 0.5),
+            0.0,
+            "never read = zero"
+        );
         // Wrap-safe: 359 vs 3 is a 4 degree crab, not 356.
         assert!((super::CrabFilter::raw(Some(359.0), Some(3.0)).unwrap() + 4.0).abs() < 1e-9);
         assert_eq!(super::CrabFilter::raw(Some(90.0), None), None);
@@ -2188,6 +2407,47 @@ mod tests {
         assert!(!super::clearance_differs("12", " 12 "));
         assert!(!super::clearance_differs("09R", "09r"));
         assert!(!super::clearance_differs("12", ""));
+    }
+
+    /// LXGB 2026-09-14: "final runway two seven" earned "negative, runway
+    /// zero niner ... cleared to land" five seconds after the arm-time pick,
+    /// and nothing looked again.
+    #[test]
+    fn a_landing_clearance_for_another_end_moves_the_approach_once() {
+        use crate::tower::State::*;
+        let sw = super::clearance_switch;
+        assert_eq!(
+            sw("27", Some(ClearedToLand), Some("09"), None),
+            Some("09".into())
+        );
+        // Told to join the other end on the inbound call: same switch, earlier.
+        assert_eq!(sw("27", Some(Inbound), Some("09"), None), Some("09".into()));
+        // Looked up once: the apt.dat pass is not repeated every tick.
+        assert_eq!(sw("27", Some(ClearedToLand), Some("09"), Some("09")), None);
+        assert_eq!(sw("27", Some(ClearedToLand), Some("09"), Some("09 ")), None);
+        // Our own end, a blank, or no clearance at all: nothing to do.
+        assert_eq!(sw("27", Some(ClearedToLand), Some("27"), None), None);
+        assert_eq!(sw("27", Some(ClearedToLand), Some(""), None), None);
+        assert_eq!(sw("27", Some(ClearedToLand), None, None), None);
+        // A departure's runway is the departure's, whatever end it names.
+        assert_eq!(sw("27", Some(TakeoffCleared), Some("09"), None), None);
+        assert_eq!(sw("27", Some(TaxiCleared), Some("09"), None), None);
+        assert_eq!(sw("27", None, Some("09"), None), None);
+    }
+
+    #[test]
+    fn only_the_landing_echo_is_the_approachs_to_make() {
+        assert!(super::landing_readback(
+            "Cleared to land runway 09, November one seven two Sierra Papa."
+        ));
+        assert!(super::landing_readback(
+            "Cleared touch and go runway 09, N172SP."
+        ));
+        assert!(!super::landing_readback(
+            "Cleared for takeoff runway 09, N172SP."
+        ));
+        assert!(!super::landing_readback("Holding position, N172SP."));
+        assert!(!super::landing_readback("Lining up runway 09, N172SP."));
     }
 
     use super::*;
@@ -2240,7 +2500,11 @@ mod tests {
         let (clat, clon) = project_latlon(0.0, 0.0, 180.0, 1.5);
         let (lat, lon) = project_latlon(clat, clon, 90.0, 0.9);
         let g = guidance(lat, lon, 480.0, 480.0, 90.0, 100.0, &rwy, 100.0, 25.0, 0.0);
-        assert_eq!(g.phase, ApproachPhase::Intercept, "balk at the floor, not at the flare gate");
+        assert_eq!(
+            g.phase,
+            ApproachPhase::Intercept,
+            "balk at the floor, not at the flare gate"
+        );
         // A normal final 40 m off at the same point: still on final.
         let (lat, lon) = project_latlon(clat, clon, 90.0, 0.02);
         let g = guidance(lat, lon, 480.0, 480.0, 90.0, 100.0, &rwy, 100.0, 25.0, 0.0);
@@ -2254,7 +2518,11 @@ mod tests {
         assert_eq!(g.phase, ApproachPhase::Intercept, "not a final from there");
         // The join point lies down the extended centreline, south of us and
         // west: a heading in the south-west quadrant, never the runway's.
-        assert!((160.0..=260.0).contains(&g.target_heading_deg), "{}", g.target_heading_deg);
+        assert!(
+            (160.0..=260.0).contains(&g.target_heading_deg),
+            "{}",
+            g.target_heading_deg
+        );
 
         // The rule itself: the offset the steepest cut can still close with
         // margin in the distance left. No opinion outside the FAP (an
@@ -2313,6 +2581,119 @@ mod tests {
         let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.3);
         let g = guidance(lat, lon, 150.0, 150.0, 95.0, 95.0, &rwy, 95.0, 25.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Intercept);
+    }
+
+    /// LXGB 27, 2026-09-14, replayed through the vertical law against the
+    /// autopilot it was talking to: a VS mode that follows its dial as a
+    /// first-order lag of 4.5 s behind one tick of dead time, and the flare's
+    /// throttle cut as a sink disturbance of 250 fpm arriving over 1.5 s that
+    /// the same lag has to reject. Both fitted to the tick log: -250 dialled
+    /// at 49 ft, still -386 four seconds on; -100 dialled at 23 ft with the
+    /// throttle closed, the sink eased to -257 and then GREW back to -309 at
+    /// the wheels. A pure lag without the disturbance lands this at -140 and
+    /// would have passed the old law. Flies from 60 ft radio just short of
+    /// the numbers at the 172's approach sink, the dial either the bare
+    /// target (the live sortie) or led through [`vs_dial_fpm`]. Returns the
+    /// sink rate at the wheels, the shallowest rate seen (a balloon would be
+    /// positive) and the seconds it took.
+    fn fly_arrest_through_a_lagging_autopilot(lead: bool) -> (f64, f64, f64) {
+        let rwy = rwy_north();
+        let dt = 0.6;
+        let tau_s = 4.5;
+        let idle_sink_fpm = -250.0;
+        let idle_tau_s = 1.5;
+        let gs_kts = 75.0;
+        let mut radio = 60.0;
+        let mut vs = -400.0;
+        let mut pending_dial = vs; // one tick of dead time on the dial
+        let mut idle_sink = 0.0;
+        let mut along_nm = -0.12; // short of the threshold, on the centreline
+        let mut shallowest: f64 = vs;
+        let mut t = 0.0;
+        let mut saw_roundout = false;
+        let mut saw_flare = false;
+        loop {
+            let (lat, lon) = if along_nm < 0.0 {
+                project_latlon(0.0, 0.0, 180.0, -along_nm)
+            } else {
+                project_latlon(0.0, 0.0, 0.0, along_nm)
+            };
+            let g = guidance(lat, lon, radio, radio, gs_kts, 65.0, &rwy, 65.0, 25.0, 0.0);
+            assert_ne!(
+                g.phase,
+                ApproachPhase::Intercept,
+                "balked at {radio:.0} ft: {:?}",
+                g.balk
+            );
+            saw_roundout |= g.phase == ApproachPhase::Final && g.arresting;
+            saw_flare |= g.phase == ApproachPhase::Flare;
+            let dial = if lead {
+                vs_dial_fpm(g.target_vs_fpm, vs, g.arresting)
+            } else {
+                g.target_vs_fpm
+            };
+            let applied = pending_dial;
+            pending_dial = dial;
+            // The throttle closes at the flare (the loop's own rule) and the
+            // extra sink enters the state; the autopilot only sees it as
+            // vertical-speed error and works it off through its lag.
+            let want_sink = if g.phase == ApproachPhase::Flare {
+                idle_sink_fpm
+            } else {
+                0.0
+            };
+            let d_sink = (want_sink - idle_sink) * (dt / idle_tau_s);
+            idle_sink += d_sink;
+            vs += (applied - vs) * (dt / tau_s) + d_sink;
+            shallowest = shallowest.max(vs);
+            radio += vs / 60.0 * dt;
+            along_nm += gs_kts * dt / 3600.0;
+            t += dt;
+            if radio <= 0.0 {
+                assert!(
+                    saw_roundout && saw_flare,
+                    "the arrest must run roundout then flare"
+                );
+                return (vs, shallowest, t);
+            }
+            assert!(t < 60.0, "never touched down");
+        }
+    }
+
+    /// The flare must arrive at the wheels, not at the dial. The bare target
+    /// reproduces the live arrival (three firm 172 landings in three days,
+    /// -309 fpm at LXGB); the led dial arrests it inside the same height,
+    /// without a balloon and without floating the runway away.
+    #[test]
+    fn the_landing_arrest_leads_the_autopilots_lag() {
+        let (bare_vs, _, bare_t) = fly_arrest_through_a_lagging_autopilot(false);
+        assert!(
+            bare_vs < -250.0,
+            "the bare dial should reproduce the firm arrival, got {bare_vs:.0}"
+        );
+
+        let (led_vs, shallowest, led_t) = fly_arrest_through_a_lagging_autopilot(true);
+        assert!(
+            led_vs > -170.0,
+            "led dial still firm: {led_vs:.0} fpm at the wheels"
+        );
+        assert!(
+            led_vs < -40.0,
+            "the arrest must still land, got {led_vs:.0}"
+        );
+        assert!(shallowest < 0.0, "ballooned to {shallowest:.0} fpm");
+        assert!(
+            led_t < bare_t + 8.0,
+            "floated: {led_t:.1} s vs {bare_t:.1} s"
+        );
+
+        // Outside an arrest the dial is the target, exactly as before.
+        assert_eq!(vs_dial_fpm(-380.0, -600.0, false), -380.0);
+        // Inside one it leads by the outstanding error, capped at a gentle climb.
+        assert_eq!(vs_dial_fpm(-100.0, -300.0, true), 300.0);
+        assert_eq!(vs_dial_fpm(-100.0, -150.0, true), 0.0);
+        assert_eq!(vs_dial_fpm(-100.0, -100.0, true), -100.0);
+        assert_eq!(vs_dial_fpm(-100.0, 200.0, true), -700.0);
     }
 
     /// The overflight rule must know a landing float from an overflight. At
@@ -3698,17 +4079,48 @@ mod tests {
     #[test]
     fn gear_and_flaps_wait_for_their_placard_speeds() {
         // Baron 58: VLO 152, approach flap Vfe 152, full flap Vfe 122.
-        const BARON: [(f64, Option<f64>); 3] = [(0.0, None), (0.5, Some(152.0)), (1.0, Some(122.0))];
-        assert!(!gear_may_extend(195.0, Some(152.0)), "no gear at 195 on a 152 placard");
+        const BARON: [(f64, Option<f64>); 3] =
+            [(0.0, None), (0.5, Some(152.0)), (1.0, Some(122.0))];
+        assert!(
+            !gear_may_extend(195.0, Some(152.0)),
+            "no gear at 195 on a 152 placard"
+        );
         assert!(gear_may_extend(150.0, Some(152.0)));
-        assert!(gear_may_extend(195.0, None), "no figure, no gate (the old behaviour)");
+        assert!(
+            gear_may_extend(195.0, None),
+            "no figure, no gate (the old behaviour)"
+        );
 
-        assert_eq!(flap_within_limits(0.5, 195.0, &BARON), 0.0, "held clean at 195");
-        assert_eq!(flap_within_limits(0.5, 145.0, &BARON), 0.5, "approach flap once under 152");
-        assert_eq!(flap_within_limits(1.0, 130.0, &BARON), 0.5, "full wanted, 130 kt: only approach");
-        assert_eq!(flap_within_limits(1.0, 100.0, &BARON), 1.0, "full flap under 122");
-        assert_eq!(flap_within_limits(0.0, 195.0, &BARON), 0.0, "retraction never gated");
-        assert_eq!(flap_within_limits(1.0, 195.0, &[]), 1.0, "no flap profile: schedule stands");
+        assert_eq!(
+            flap_within_limits(0.5, 195.0, &BARON),
+            0.0,
+            "held clean at 195"
+        );
+        assert_eq!(
+            flap_within_limits(0.5, 145.0, &BARON),
+            0.5,
+            "approach flap once under 152"
+        );
+        assert_eq!(
+            flap_within_limits(1.0, 130.0, &BARON),
+            0.5,
+            "full wanted, 130 kt: only approach"
+        );
+        assert_eq!(
+            flap_within_limits(1.0, 100.0, &BARON),
+            1.0,
+            "full flap under 122"
+        );
+        assert_eq!(
+            flap_within_limits(0.0, 195.0, &BARON),
+            0.0,
+            "retraction never gated"
+        );
+        assert_eq!(
+            flap_within_limits(1.0, 195.0, &[]),
+            1.0,
+            "no flap profile: schedule stands"
+        );
     }
 
     // The approach speed is what you cross the threshold at, NOT what you fly

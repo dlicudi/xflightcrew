@@ -82,16 +82,31 @@ fn summarise(flight: &[&Value]) -> String {
     // --- The numbers, from the 1 Hz state.
     let states: Vec<&&Value> = flight.iter().filter(|e| s(e, "kind") == "state").collect();
     if !states.is_empty() {
-        let max_alt = states.iter().filter_map(|e| f(e, "alt")).fold(f64::MIN, f64::max);
-        let max_ias = states.iter().filter_map(|e| f(e, "ias")).fold(f64::MIN, f64::max);
-        let airborne = states
+        let max_alt = states
             .iter()
-            .filter(|e| b(e, "ground") == Some(false) && f(e, "agl").is_some_and(|a| a > AIRBORNE_AGL_FT));
-        let min_ias = airborne.clone().filter_map(|e| f(e, "ias")).fold(f64::MAX, f64::min);
+            .filter_map(|e| f(e, "alt"))
+            .fold(f64::MIN, f64::max);
+        let max_ias = states
+            .iter()
+            .filter_map(|e| f(e, "ias"))
+            .fold(f64::MIN, f64::max);
+        let airborne = states.iter().filter(|e| {
+            b(e, "ground") == Some(false) && f(e, "agl").is_some_and(|a| a > AIRBORNE_AGL_FT)
+        });
+        let min_ias = airborne
+            .clone()
+            .filter_map(|e| f(e, "ias"))
+            .fold(f64::MAX, f64::min);
         let min_ias_at = airborne
             .clone()
             .filter(|e| f(e, "ias") == Some(min_ias))
-            .map(|e| format!(" at {}Z, {:.0} ft AGL", hms(f(e, "t").unwrap_or(0.0)), f(e, "agl").unwrap_or(0.0)))
+            .map(|e| {
+                format!(
+                    " at {}Z, {:.0} ft AGL",
+                    hms(f(e, "t").unwrap_or(0.0)),
+                    f(e, "agl").unwrap_or(0.0)
+                )
+            })
             .next()
             .unwrap_or_default();
         let flew = airborne.count() > 0;
@@ -99,21 +114,32 @@ fn summarise(flight: &[&Value]) -> String {
             "Max altitude {:.0} ft, max IAS {:.0} kt{}.\n",
             max_alt,
             max_ias,
-            if flew { format!(", min IAS airborne {min_ias:.0} kt{min_ias_at}") } else { String::new() }
+            if flew {
+                format!(", min IAS airborne {min_ias:.0} kt{min_ias_at}")
+            } else {
+                String::new()
+            }
         ));
         // Touchdowns: airborne -> ground transitions, with the sink rate.
+        // The rate at the wheels is the STEEPER of the last airborne sample
+        // and the first ground one: by the time the ground flag samples the
+        // oleos have eaten part of it (LXGB 27, 2026-09-14: -309 in the air,
+        // -156 on the ground, and the grader below already said 309).
         let mut prev_ground = None::<bool>;
+        let mut prev_vsi = 0.0_f64;
         for e in &states {
             let g = b(e, "ground").unwrap_or(true);
+            let vsi = f(e, "vsi").unwrap_or(0.0);
             if prev_ground == Some(false) && g {
                 out.push_str(&format!(
                     "Touchdown {}Z at {:.0} fpm, {:.0} kt.\n",
                     hms(f(e, "t").unwrap_or(0.0)),
-                    f(e, "vsi").unwrap_or(0.0),
+                    vsi.min(prev_vsi),
                     f(e, "ias").unwrap_or(0.0)
                 ));
             }
             prev_ground = Some(g);
+            prev_vsi = vsi;
         }
         // Stops during an auto taxi: rolling to a halt while the drive was on.
         let mut driving = false;
@@ -136,7 +162,9 @@ fn summarise(flight: &[&Value]) -> String {
             }
         }
         if stops > 0 {
-            out.push_str(&format!("Auto taxi rolled to a stop {stops} time(s) before its holding point.\n"));
+            out.push_str(&format!(
+                "Auto taxi rolled to a stop {stops} time(s) before its holding point.\n"
+            ));
         }
     }
 
@@ -158,7 +186,11 @@ fn summarise(flight: &[&Value]) -> String {
                                 "{} {:+.0}{}",
                                 x["axis"].as_str().unwrap_or(""),
                                 x["worst"].as_f64().unwrap_or(0.0),
-                                if x["pass"].as_bool() == Some(true) { "" } else { " (FAIL)" }
+                                if x["pass"].as_bool() == Some(true) {
+                                    ""
+                                } else {
+                                    " (FAIL)"
+                                }
                             )
                         })
                         .collect()
@@ -170,11 +202,19 @@ fn summarise(flight: &[&Value]) -> String {
                 g["task"].as_str().unwrap_or("").replace('_', " "),
                 g["level"].as_str().unwrap_or(""),
                 if g["complete"].as_bool() == Some(true) {
-                    if g["pass"].as_bool() == Some(true) { "PASS" } else { "FAIL" }
+                    if g["pass"].as_bool() == Some(true) {
+                        "PASS"
+                    } else {
+                        "FAIL"
+                    }
                 } else {
                     "not completed"
                 },
-                if axes.is_empty() { String::new() } else { format!(": {}", axes.join(", ")) }
+                if axes.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", axes.join(", "))
+                }
             ))
         })
         .collect();
@@ -217,7 +257,9 @@ fn summarise(flight: &[&Value]) -> String {
         .filter(|e| s(e, "kind") == "heard" && f(e, "confidence").is_some_and(|c| c < 0.7))
         .count();
     if mishears > 0 {
-        out.push_str(&format!("Utterances heard under 0.7 confidence: {mishears}\n"));
+        out.push_str(&format!(
+            "Utterances heard under 0.7 confidence: {mishears}\n"
+        ));
     }
 
     // --- The narrative: everything an instructor would write down.
@@ -262,7 +304,11 @@ fn summarise(flight: &[&Value]) -> String {
                     l.push_str(&format!(": {}", why.replace('_', " ")));
                 }
                 if let Some(x) = f(e, "xtk_m") {
-                    l.push_str(&format!(", {:.0} m {} of the centreline", x.abs(), if x < 0.0 { "left" } else { "right" }));
+                    l.push_str(&format!(
+                        ", {:.0} m {} of the centreline",
+                        x.abs(),
+                        if x < 0.0 { "left" } else { "right" }
+                    ));
                 }
                 Some(l)
             }
@@ -278,7 +324,9 @@ fn summarise(flight: &[&Value]) -> String {
                 f(e, "asked").unwrap_or(0.0),
                 f(e, "floor").unwrap_or(0.0)
             )),
-            ("autoland", "rolling_handoff") => Some("landed, rolling handoff to the taxi-in".into()),
+            ("autoland", "rolling_handoff") => {
+                Some("landed, rolling handoff to the taxi-in".into())
+            }
             ("autoland", "forced_runway_missing") => Some(format!(
                 "autoland could not find the planned runway {}, self-picked by track",
                 s(e, "id")
@@ -294,20 +342,43 @@ fn summarise(flight: &[&Value]) -> String {
                 f(e, "floor").unwrap_or(0.0)
             )),
             ("procedure", "armed") => Some(format!("procedure: {}", s(e, "name"))),
-            ("procedure", "handoff_autoland" | "complete_enroute" | "complete_no_handoff" | "stand_down") => {
-                Some(format!("procedure: {ev}{}", if ev == "stand_down" { format!(" ({})", s(e, "reason")) } else { String::new() }))
+            (
+                "procedure",
+                "handoff_autoland" | "complete_enroute" | "complete_no_handoff" | "stand_down",
+            ) => Some(format!(
+                "procedure: {ev}{}",
+                if ev == "stand_down" {
+                    format!(" ({})", s(e, "reason"))
+                } else {
+                    String::new()
+                }
+            )),
+            ("autotaxi", "engaged" | "off_route" | "holding_point" | "join") => {
+                Some(format!("auto taxi: {ev}{}", detail(e)))
             }
-            ("autotaxi", "engaged" | "off_route" | "holding_point" | "join") => Some(format!("auto taxi: {ev}{}", detail(e))),
             ("pushback", "engaged" | "no_tug" | "hooked") => Some(format!("pushback: {ev}")),
             ("taxi_in", _) => Some(format!("taxi in: {ev}")),
-            ("checklist", "start") => Some(format!("checklist: {} ({})", s(e, "title"), s(e, "flavour"))),
+            ("checklist", "start") => Some(format!(
+                "checklist: {} ({})",
+                s(e, "title"),
+                s(e, "flavour")
+            )),
             ("checklist", "proposed") => Some(format!("checklist proposed: {}", s(e, "title"))),
-            ("checklist", "discrepancy") => Some(format!("checklist discrepancy: {}", s(e, "item"))),
+            ("checklist", "discrepancy") => {
+                Some(format!("checklist discrepancy: {}", s(e, "item")))
+            }
             ("checklist", "not_done") => Some(format!("checklist item not done: {}", s(e, "item"))),
             ("checklist", "abort") => Some(format!("checklist stopped: {}", s(e, "title"))),
-            ("atc", _) if s(e, "outcome") == "void" => Some(format!("radio call into the VOID: \"{}\"", s(e, "transcript"))),
-            ("atc", _) if s(e, "route") == "compliance" => Some(format!("ATC compliance: {}", s(e, "reply"))),
-            ("atc", _) if s(e, "route") == "hold_release" => Some(format!("ATC: {}", s(e, "reply"))),
+            ("atc", _) if s(e, "outcome") == "void" => Some(format!(
+                "radio call into the VOID: \"{}\"",
+                s(e, "transcript")
+            )),
+            ("atc", _) if s(e, "route") == "compliance" => {
+                Some(format!("ATC compliance: {}", s(e, "reply")))
+            }
+            ("atc", _) if s(e, "route") == "hold_release" => {
+                Some(format!("ATC: {}", s(e, "reply")))
+            }
             ("atc_handoff", _) => Some(format!("ATC handoff: {}", s(e, "msg"))),
             ("atc_region", _) => Some(format!("ATC region: {}", s(e, "msg"))),
             ("recover", _) => None, // per tick; counted below
@@ -345,7 +416,10 @@ fn detail(e: &Value) -> String {
     let parts: Vec<String> = d
         .iter()
         .map(|(k, v)| match v {
-            Value::Number(n) => format!("{k}={}", n.as_f64().map(|x| format!("{x:.1}")).unwrap_or_default()),
+            Value::Number(n) => format!(
+                "{k}={}",
+                n.as_f64().map(|x| format!("{x:.1}")).unwrap_or_default()
+            ),
             Value::String(s) => format!("{k}={s}"),
             other => format!("{k}={other}"),
         })
@@ -356,7 +430,12 @@ fn detail(e: &Value) -> String {
 /// Unix seconds → HH:MM:SS (UTC).
 fn hms(t: f64) -> String {
     let secs = t.max(0.0) as u64 % 86_400;
-    format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    )
 }
 
 #[cfg(test)]
@@ -398,10 +477,20 @@ mod tests {
         assert!(r.contains("airspeed_warning x1"), "{r}");
         assert!(r.contains("into the VOID"), "{r}");
         assert!(r.contains("raised to the airframe floor 78"), "{r}");
-        assert!(r.contains("GO-AROUND at 95 ft radio: off centreline low, 38 m left of the centreline"), "{r}");
+        assert!(
+            r.contains("GO-AROUND at 95 ft radio: off centreline low, 38 m left of the centreline"),
+            "{r}"
+        );
         assert!(r.contains("final report: runway 09, 5.0 nm"), "{r}");
-        assert_eq!(r.matches("autoland armed").count(), 1, "one arming, not one per tick: {r}");
-        assert!(r.contains("autoland armed: LXGB 09 from 1.5 nm, 660 ft radio, 128 kt, phase Final"), "{r}");
+        assert_eq!(
+            r.matches("autoland armed").count(),
+            1,
+            "one arming, not one per tick: {r}"
+        );
+        assert!(
+            r.contains("autoland armed: LXGB 09 from 1.5 nm, 660 ft radio, 128 kt, phase Final"),
+            "{r}"
+        );
         assert!(r.contains("CRASH at 114 ft"), "{r}");
         assert!(r.contains("full auto: airborne (agl_ft=1019.6)"), "{r}");
     }
@@ -416,7 +505,10 @@ mod tests {
         ];
         let r = report(lines.iter().copied());
         assert!(r.contains("Flight 2 of 2"), "{r}");
-        assert!(r.contains("beechcraft_baron_58") && !r.contains("CRASH"), "{r}");
+        assert!(
+            r.contains("beechcraft_baron_58") && !r.contains("CRASH"),
+            "{r}"
+        );
         assert_eq!(report(std::iter::empty()), "No blackbox events.\n");
     }
 }

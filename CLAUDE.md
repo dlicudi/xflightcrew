@@ -207,7 +207,13 @@ capped, semicircular by bearing, VFR +500 unless pressurised). Fuel comes
 from the profile's cruise speed and `cruise_burn_kg_hr` or is NOT spoken. A
 destination runway shorter than the landing (else takeoff) distance is
 REFUSED. A local plan never expires into a SimBrief refetch and needs no
-SimBrief ID; only an explicit refresh may replace it. The brief is read
+SimBrief ID; only an explicit refresh may replace it. **A spoken ask for the
+plan ("load / what's the flight plan") re-fetches a SimBrief plan EVERY
+time** (`PlanFetch::Asked`; the 10 min TTL is only for the implicit
+consumers: fuel, TOD, ETA): the pilot regenerates on the website and says
+the same words (LEMG-LEJR re-sent from the shelf four times, 2026-09-14).
+"That's the wrong plan" re-fetches and says whether SimBrief moved
+(`plan_change_line`). The brief is read
 first; "load it" is a separate word and a plan on the shelf authorises
 nothing. Still owed: an enroute point so full auto can fly a local plan
 (`enroute_legs` yields nothing from two airports), airspace dog-legs, airways.
@@ -426,8 +432,10 @@ history):
   (the SR22's one lamp); the landing light over every runway span of the
   route (crossings, backtracks, the line-up leg: `Route.runway_spans`, lit
   40 m ahead) unless it is already the taxi light tonight; strobes and
-  landing lights lined up; landing lights off passing 1,000 ft AGL
-  (`lights_climb`); at the vacate landing off and taxi on
+  landing lights lined up; landing AND taxi lights off passing 1,000 ft AGL
+  (`lights_climb`, `after_climb`: the taxi light lit for the taxi has no
+  other exit, and on the 172 it shares the wing cluster with the landing
+  lamp); at the vacate landing off and taxi on
   (`after_vacate`); all off at the stand.
   **The arrival is briefed at the gate** (`full_auto::brief_arrival` in the
   arming ack: published approach, straight-in, or "I'll land visually"; a
@@ -462,6 +470,22 @@ history):
   plus 1,000 ft; skipped on an approach, whose platform altitudes own the
   descent; disabled for the flight after one unanswered probe). A plan's
   altitude is only as good as the ground under it, whoever handed it down.
+  **The follower flies the ALTIMETER** (`altitude_ft_pilot`): the dial, the
+  plan, the chart and the controller all mean indicated feet, and on a hot
+  day true elevation runs hundreds of feet above it (LINTO, 2026-09-14:
+  7,012 true, 6,838 indicated, VS zeroed, ALTS never captured). Only the
+  terrain floor is true feet, converted through the live offset
+  (`floor_indicated`); the departure check-in's "passing" and the arrival's
+  platform check read the altimeter too. A wrong altimeter setting is
+  therefore a wrong altitude, so the crew keeps it right: ONE rule for the
+  correct setting (`instruments::correct_setting_inhg`: QNH below the
+  profile's transition altitude, standard above) behind the spoken tool,
+  full auto's departure set, the enroute follower's arm
+  (`Plan.transition_altitude_ft`, said only when the knob moved) and the
+  monitor's `AltimeterSetting` check (0.03 inHg, 20 s sustain): with an
+  automation flying it RESETS the knob (`Check::fix_write`) and says so;
+  with the pilot flying it is the pilot's knob, advised once per episode,
+  never re-asserted.
   An autopilot target is judged against that SAME floor, not just the ground
   under the wheels: a climb still into it is RAISED to the floor and said
   aloud, a descent below it refused with the number that works.
@@ -490,12 +514,32 @@ history):
   two balks). `TrackTrim` integrates the final's track error (wanted track
   minus `hpath`, 30 s, ±5°, final only, reset by any intercept) into the
   bug; the tick carries `trim` and `xtk_m`, and every balk names its gate
-  (`Guidance.balk`, on the `going_around` event) so the debrief says why. **Every planned arrival hands its runway down**
+  (`Guidance.balk`, on the `going_around` event) so the debrief says why.
+  **The landing arrest leads the autopilot's lag** (`vs_dial_fpm`, LXGB 27
+  2026-09-14: the 172's VS mode follows its dial as a 4.5 s lag, longer
+  than the flare itself, and three landings in a row touched down at the
+  roundout's rate): in the roundout and the flare (`Guidance.arresting`)
+  the dial is target + 2 x (target - actual), capped at +300; above the
+  band the dial is the target. The tick blackboxes `cmd_vs`, `vs_dial` and
+  `vvi` so the three can be told apart; the sortie test's plant carries the
+  flare's throttle-cut sink, without which a pure lag passes the old law.
+  **Every planned arrival hands its runway down**
   (`EndAction::Approach { rwy_id }` to `run_autoland`'s forced runway): the
   self-pick is the emergency path and at a field with parallels it takes
   the nearer threshold (ILS 12 flown, landing on 13, cleared for 12). The
   tower's clearance outranks the plan for an end at the SAME field, said
-  aloud and blackboxed `runway_from_clearance`.
+  aloud and blackboxed `runway_from_clearance`, and it is watched THROUGH
+  the approach, not read once at the arm: the final report that earns the
+  clearance goes out after the arm, so its answer ("negative, runway zero
+  niner ... cleared to land", LXGB 2026-09-14, 27 flown into a 21 kt
+  tailwind) arrives after any one-time read. Every tick autoland reads
+  back an owed landing clearance (`party_line::readback_owed`) and, on an
+  arrival-shaped clearance for another end of this field
+  (`clearance_switch`), re-arms itself forced onto it; a superseded loop
+  leaves `ACTIVE` to its successor. The arrival's wind pick reads the
+  DESTINATION's METAR before the aircraft's own wind datarefs
+  (`weather::surface_wind`, `arrival_wind`; the datarefs at 30 nm and
+  7,000 ft are the winds aloft), blackboxed on the `arrival_*` event.
 - **A straight-in is only as good as its fixes** (LXGB 09, 2026-09-11): a
   DME-fix reconstruction keeps only fixes ON the final approach course
   (`RECON_ALIGN_DEG`), and `approach_plan_for` refuses any FAF autoland could
@@ -515,10 +559,22 @@ history):
   world's traffic picture, published by the release watch every tick) before
   crossing the hold line; the after-takeoff handoff is consumed via
   `take_departure_handoff()` (readback on the old frequency, retune, check-in
-  with altitude); the inbound call waits for the destination's station swap
-  (`home_tower_khz`) before it goes out. A descent waits for its top of
-  descent (`descent_target_ft`), a cruise fix within 300 ft of cruise IS
-  cruise, a JOIN projects along the nose (`project_signed_facing`), and the
+  with altitude); the region boundary's "radar services terminated, squawk
+  seven thousand, contact X Tower" via `take_region_handoff()` (survives
+  `Station::install` on purpose; readback, 7000 through `SetTransponder`,
+  retune; the arrival stage drains it without a readback; with the pilot
+  flying the monitor says once what is still undone, `region_coach_line`);
+  the inbound call waits for the destination's station swap
+  (`home_tower_khz`) before it goes out: 45 s at the arrival's start, then
+  DEFERRED and made at the swap while the approach flies (the region's
+  nearest field held the frequency for ten more minutes across the strait
+  and the call went into the void), before the final report at the latest. A descent waits for its top of
+  descent (`descent_target_ft`), and THAT point is the only one announced
+  while the follower flies (`procedure::planned_tod`: the monitor's
+  `tod_ahead`/`tod_passed` and the spoken "how far to top of descent" read
+  it before the plan's ring; the ring said "start down" three minutes
+  before the hands moved, LEJR-LXGB 2026-09-14), a cruise fix within
+  300 ft of cruise IS cruise, a JOIN projects along the nose (`project_signed_facing`), and the
   taxi law's idle-and-brake needs the speed to actually be over by 2 kt
   unless the build is a surge (`SURGE_KTS_S`).
 - **Taxi guide** ([src/taxi_guide.rs](src/taxi_guide.rs)): early gentle cue,

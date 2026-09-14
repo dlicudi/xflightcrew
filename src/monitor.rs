@@ -43,6 +43,9 @@ const GYRO_DRIFT_ADVISORY_DEG: f64 = 10.0;
 /// (which clears the handoff and cancels the nudge), short enough to still
 /// leave room to act before the threshold.
 const LANDING_COACH_GRACE_SECS: u64 = 12;
+/// Knob time after "radar services terminated, squawk seven thousand,
+/// contact X Tower" before the copilot checks the code and the frequency.
+const REGION_COACH_GRACE_SECS: u64 = 20;
 
 /// Where this flight is going — the context that turns the monitor from a
 /// systems watchdog into a copilot that can *anticipate*. Set by the main loop
@@ -183,6 +186,19 @@ pub struct Snapshot {
     pub dest_dist_nm: Option<f64>,
     pub dest_elev_ft: Option<f64>,
     pub tod_ring_nm: Option<f64>,
+    /// The procedure follower's OWN top of descent while one flies
+    /// ([`crate::procedure::planned_tod`]). Outranks the ring above for the
+    /// descent advisors: the point the hands will use is the only one worth
+    /// announcing.
+    pub follower_tod: Option<crate::procedure::PlannedTod>,
+    /// The altimeter knob (inHg) and the sim's local QNH (Pa), best-effort,
+    /// for the altimeter cross-check. `None` = that read failed this tick.
+    pub baro_inhg: Option<f64>,
+    pub qnh_pa: Option<f64>,
+    /// An automation is flying the altitude (the follower, full auto, the
+    /// circuit or autoland): the altimeter is then the crew's knob to set,
+    /// not the pilot's to be advised about.
+    pub automation_flying: bool,
     pub phase: Phase,
 }
 
@@ -224,6 +240,15 @@ impl Snapshot {
             .get_float("sim/cockpit2/autopilot/altitude_dial_ft")
             .await
             .ok();
+        let baro_inhg = xp.get_float(BARO_KNOB).await.ok();
+        let qnh_pa = xp.get_float(crate::datarefs::QNH_PASCALS).await.ok();
+        let automation_flying = {
+            use std::sync::atomic::Ordering::Relaxed;
+            crate::procedure::ACTIVE.load(Relaxed)
+                || crate::full_auto::ACTIVE.load(Relaxed)
+                || crate::circuit::ACTIVE.load(Relaxed)
+                || crate::autoland::ACTIVE.load(Relaxed)
+        };
         let ap_servos_on = xp
             .get_float("sim/cockpit2/autopilot/servos_on")
             .await
@@ -475,6 +500,10 @@ impl Snapshot {
             dest_dist_nm,
             dest_elev_ft,
             tod_ring_nm,
+            follower_tod: crate::procedure::planned_tod(),
+            baro_inhg,
+            qnh_pa,
+            automation_flying,
             phase: Phase::Ground,
         };
         s.phase = estimate_phase(&s);
@@ -540,6 +569,12 @@ pub trait Check: Send {
     /// per episode, the moment the advisory speaks, so the copilot *acts* instead
     /// of nagging. `None` (the default) = advisory only, the pilot's switch.
     fn fix_action(&self) -> Option<&str> {
+        None
+    }
+    /// A dataref the copilot should WRITE (a knob, not a switch) when the
+    /// callout speaks: `(dataref, value)`. Same edge-triggered, once-per-episode
+    /// discipline as `fix_action`. `None` (the default) = advisory only.
+    fn fix_write(&self, _s: &Snapshot) -> Option<(&'static str, f64)> {
         None
     }
 }
@@ -1029,6 +1064,24 @@ impl Check for TodAhead {
         if s.on_ground || s.vsi_fpm.abs() > 500.0 {
             return None; // only when level — a climb/descent has its own plan
         }
+        // A follower flying: ITS point, to ITS altitude (LEJR-LXGB,
+        // 2026-09-14: the ring said "past", the hands waited 3 more minutes).
+        if let Some(p) = &s.follower_tod {
+            if p.started || !(0.0..=12.0).contains(&p.to_tod_nm) {
+                return None;
+            }
+            let to_tod = p.to_tod_nm;
+            let alt = crate::auto_status::commas((p.target_ft / 100.0).round() as i64 * 100);
+            let mins = (s.groundspeed_kts > 60.0).then(|| to_tod / s.groundspeed_kts * 60.0);
+            return Some(match mins {
+                Some(m) => format!(
+                    "Descent coming up. Top of descent in about {m:.0} minutes, {to_tod:.0} miles ahead, down to {alt} feet."
+                ),
+                None => format!(
+                    "Descent coming up. Top of descent {to_tod:.0} miles ahead, down to {alt} feet."
+                ),
+            });
+        }
         let (dist, elev, ring) = (s.dest_dist_nm?, s.dest_elev_ft?, s.tod_ring_nm?);
         if s.alt_ft < elev + 6000.0 {
             return None; // already low; TOD math is meaningless
@@ -1067,6 +1120,21 @@ impl Check for TodPassed {
         if s.on_ground || s.vsi_fpm < -400.0 {
             return None; // descending → the message is moot
         }
+        // A follower flying is judged against ITS OWN point: a miss is the
+        // follower a mile past it with the descent still uncommanded, never
+        // the plan's ring passing while the hands are correctly waiting.
+        if let Some(p) = &s.follower_tod {
+            if p.started || p.to_tod_nm > -1.0 || s.groundspeed_kts < 60.0 {
+                return None;
+            }
+            let height = s.alt_ft - p.target_ft;
+            let mins = (p.dist_nm - 1.0).max(2.0) / s.groundspeed_kts * 60.0;
+            let fpm = ((height / mins) / 100.0).round() * 100.0;
+            let alt = crate::auto_status::commas((p.target_ft / 100.0).round() as i64 * 100);
+            return Some(format!(
+                "We're past the descent point and still level. About {fpm:.0} feet a minute makes {alt} feet at the fix."
+            ));
+        }
         let (dist, elev, ring) = (s.dest_dist_nm?, s.dest_elev_ft?, s.tod_ring_nm?);
         if s.alt_ft < elev + 4000.0 || dist >= ring - 1.0 || s.groundspeed_kts < 60.0 {
             return None;
@@ -1100,6 +1168,12 @@ impl Check for HighOnProfile {
     fn eval(&self, s: &Snapshot) -> Option<String> {
         if s.on_ground || s.vsi_fpm > -400.0 {
             return None; // only mid-descent
+        }
+        // The follower's profile is its own (700 fpm to the next fix, not
+        // 300 ft/nm to the field): judging it against the ring's slope would
+        // call a correct descent high.
+        if s.follower_tod.is_some() {
+            return None;
         }
         let (dist, elev, ring) = (s.dest_dist_nm?, s.dest_elev_ft?, s.tod_ring_nm?);
         if dist > ring + 5.0 || dist < 4.0 {
@@ -1243,8 +1317,11 @@ impl Check for RollingOnParkBrake {
     fn eval(&self, s: &Snapshot) -> Option<String> {
         // Not when the copilot set it: the taxi-in arrests a rolling handoff
         // on the parking brake and says so itself (see `taxi_in::arrest_holding`).
-        (s.on_ground && s.groundspeed_kts > 5.0 && s.park_brake > 0.5 && !crate::taxi_in::arrest_holding())
-            .then(|| "Parking brake is set and we're rolling — release it.".to_string())
+        (s.on_ground
+            && s.groundspeed_kts > 5.0
+            && s.park_brake > 0.5
+            && !crate::taxi_in::arrest_holding())
+        .then(|| "Parking brake is set and we're rolling — release it.".to_string())
     }
     fn min_duration(&self) -> Duration {
         Duration::from_secs(2)
@@ -1278,6 +1355,77 @@ impl Check for FuelSelectorOff {
     }
 }
 
+const BARO_KNOB: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot";
+
+/// The altimeter against what it should read (local QNH below the transition
+/// altitude, standard above; `instruments::correct_setting_inhg`). Every
+/// automation flies the INDICATED altitude (LINTO, 2026-09-14), so a wrong
+/// setting is a wrong altitude: with an automation flying the copilot RESETS
+/// the knob and says so; with the pilot flying it is the pilot's knob, said
+/// once per episode and never re-asserted (the cockpit_auto rule). Real
+/// weather walks the QNH a hundredth at a time; the tolerance and the sustain
+/// keep that from becoming chatter.
+struct AltimeterSetting {
+    transition_altitude_ft: f64,
+}
+
+impl AltimeterSetting {
+    fn wanted(&self, s: &Snapshot) -> Option<(f64, f64)> {
+        if !s.engine_running {
+            return None;
+        }
+        let (baro, pa) = (s.baro_inhg?, s.qnh_pa?);
+        if pa <= 0.0 {
+            return None;
+        }
+        let want = crate::tools::instruments::correct_setting_inhg(
+            s.alt_ft,
+            self.transition_altitude_ft,
+            pa,
+        );
+        ((baro - want).abs() >= crate::tools::instruments::ALTIMETER_TOLERANCE_INHG)
+            .then_some((baro, want))
+    }
+}
+
+impl Check for AltimeterSetting {
+    fn id(&self) -> &'static str {
+        "altimeter_setting"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Advisory
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        let (baro, want) = self.wanted(s)?;
+        let spoken = crate::tools::instruments::spoken_setting;
+        Some(if s.automation_flying {
+            format!("Altimeter reset, {}.", spoken(want))
+        } else {
+            let what = if s.alt_ft >= self.transition_altitude_ft {
+                "standard"
+            } else {
+                "QNH"
+            };
+            format!(
+                "Altimeter check, {what} is {}, you have {}.",
+                spoken(want),
+                spoken(baro)
+            )
+        })
+    }
+    /// The pilot turning the knob passes through wrong values on the way to
+    /// the right one; a weather edition moves the QNH under a set knob.
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(20)
+    }
+    fn fix_write(&self, s: &Snapshot) -> Option<(&'static str, f64)> {
+        if !s.automation_flying {
+            return None;
+        }
+        self.wanted(s).map(|(_, want)| (BARO_KNOB, want))
+    }
+}
+
 fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     let mut checks: Vec<Box<dyn Check>> = vec![
         // Universal: every airframe can roll with the brake set.
@@ -1289,6 +1437,11 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         Box::new(TodAhead),
         Box::new(TodPassed),
         Box::new(HighOnProfile),
+        // Universal: every altimeter can be mis-set, and every automation here
+        // flies the indicated altitude off it.
+        Box::new(AltimeterSetting {
+            transition_altitude_ft: profile.transition_altitude_ft,
+        }),
     ];
 
     // Phase-expectation advisor rows from the profile's SOP table.
@@ -1685,6 +1838,10 @@ pub async fn run(
     // prompt reporter is never nagged; `spoken` fires the nudge once.
     let mut landing_coach_seen: Option<Instant> = None;
     let mut landing_coach_spoken = false;
+    // Region-handoff coach: with the pilot flying, the enroute controller's
+    // "squawk seven thousand, contact X Tower on Y" is theirs to obey; after
+    // a grace the copilot says once whatever is still undone.
+    let mut region_coach: Option<(crate::party_line::RegionHandoff, Instant)> = None;
     // The copilot's progressive taxi guide, rebuilt per published clearance
     // route: the pilot monitoring with the airport diagram out.
     let mut taxi_guide: Option<crate::taxi_guide::Guide> = None;
@@ -2343,6 +2500,40 @@ pub async fn run(
                         landing_coach_spoken = false;
                     }
                 }
+                // Region-handoff coach. Full auto consumes the handoff itself
+                // (readback, seven thousand, retune); with anyone else flying
+                // the copilot takes it and, after a grace, names what the
+                // pilot has not done yet — once, never re-asserted.
+                if !crate::full_auto::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(h) = crate::party_line::take_region_handoff() {
+                        region_coach = Some((h, now));
+                    }
+                }
+                if let Some((h, seen)) = region_coach.as_ref() {
+                    if !crew_on || snap.on_ground {
+                        region_coach = None;
+                    } else if now.duration_since(*seen).as_secs() >= REGION_COACH_GRACE_SECS {
+                        let code = if h.squawk_vfr {
+                            xp.get_float(crate::datarefs::TRANSPONDER_CODE)
+                                .await
+                                .ok()
+                                .map(|v| v.round() as i64)
+                        } else {
+                            None
+                        };
+                        if let Some(line) = region_coach_line(h, com1, code) {
+                            crate::blackbox::record(
+                                "atc",
+                                serde_json::json!({
+                                    "route": "region_coach", "khz": h.khz, "com1": com1,
+                                    "squawk_vfr": h.squawk_vfr, "code": code, "reply": &line,
+                                }),
+                            );
+                            voice.alert(Priority::Advisory, line);
+                        }
+                        region_coach = None;
+                    }
+                }
                 // The copilot's progressive taxi guide — the crew half of
                 // the taxi clearance. The tower said the route once; the
                 // pilot monitoring calls the turns just-in-time ("next
@@ -2910,6 +3101,9 @@ pub async fn run(
                                 if let Some(cmd) = check.fix_action() {
                                     let _ = xp.run_command(cmd).await;
                                 }
+                                if let Some((dref, value)) = check.fix_write(&snap) {
+                                    let _ = xp.set_float(dref, value).await;
+                                }
                             }
                         }
                         None => state.clear(),
@@ -3106,6 +3300,71 @@ impl Check for FuelPreTakeoff {
     }
 }
 
+/// What the pilot still owes the region handoff, as one spoken line, or
+/// `None` when both the code and the frequency already comply. `com1` is
+/// COM1 in kHz; `code` the transponder code, read only when seven thousand
+/// was ordered.
+pub fn region_coach_line(
+    h: &crate::party_line::RegionHandoff,
+    com1: Option<i64>,
+    code: Option<i64>,
+) -> Option<String> {
+    let mut owed = Vec::new();
+    if h.squawk_vfr && code != Some(7000) {
+        owed.push("squawk seven thousand".to_string());
+    }
+    if com1.is_none_or(|k| (k - h.khz).abs() > 5) {
+        owed.push(format!("{} on {}", h.to, crate::atis::spoken_mhz(h.khz)));
+    }
+    if owed.is_empty() {
+        return None;
+    }
+    Some(format!("Radar's done with us: {}.", owed.join(", and ")))
+}
+
+#[cfg(test)]
+mod region_coach_tests {
+    use super::region_coach_line;
+    use crate::party_line::RegionHandoff;
+
+    fn h(squawk_vfr: bool) -> RegionHandoff {
+        RegionHandoff {
+            to: "Malaga Tower".into(),
+            khz: 118_100,
+            squawk_vfr,
+        }
+    }
+
+    #[test]
+    fn names_only_what_is_still_undone() {
+        // Both done: silence.
+        assert_eq!(region_coach_line(&h(true), Some(118_100), Some(7000)), None);
+        // 8.33 kHz spacing rounds the read within 5 kHz: still tuned.
+        assert_eq!(region_coach_line(&h(true), Some(118_105), Some(7000)), None);
+        // Code still discrete, frequency right.
+        assert_eq!(
+            region_coach_line(&h(true), Some(118_100), Some(4503)).as_deref(),
+            Some("Radar's done with us: squawk seven thousand.")
+        );
+        // Frequency wrong, code right.
+        assert_eq!(
+            region_coach_line(&h(true), Some(130_400), Some(7000)).as_deref(),
+            Some("Radar's done with us: Malaga Tower on one one eight decimal one.")
+        );
+        // Neither done.
+        assert_eq!(
+            region_coach_line(&h(true), Some(130_400), Some(4503)).as_deref(),
+            Some("Radar's done with us: squawk seven thousand, and Malaga Tower on one one eight decimal one.")
+        );
+        // No squawk ordered: the code is never mentioned, whatever it reads.
+        assert_eq!(region_coach_line(&h(false), Some(118_100), None), None);
+        assert_eq!(
+            region_coach_line(&h(false), None, Some(4503)).as_deref(),
+            Some("Radar's done with us: Malaga Tower on one one eight decimal one.")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3199,8 +3458,85 @@ mod tests {
             dest_dist_nm: None,
             dest_elev_ft: None,
             tod_ring_nm: None,
+            follower_tod: None,
+            baro_inhg: None,
+            qnh_pa: None,
+            automation_flying: false,
             phase: Phase::Ground,
         }
+    }
+
+    /// The LINTO altimeter of 2026-09-14: 30.15 set, QNH 30.10, an
+    /// automation flying indicated altitude 46 ft wrong.
+    fn linto_altimeter(automation_flying: bool) -> Snapshot {
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        s.alt_ft = 6_838.0;
+        s.baro_inhg = Some(30.15);
+        s.qnh_pa = Some(101_946.0);
+        s.automation_flying = automation_flying;
+        s
+    }
+
+    #[test]
+    fn altimeter_check_advises_the_pilot_and_resets_for_an_automation() {
+        let c = AltimeterSetting {
+            transition_altitude_ft: 18_000.0,
+        };
+        let pilot = linto_altimeter(false);
+        let said = c.eval(&pilot).expect("mis-set altimeter is a callout");
+        assert!(
+            said.starts_with("Altimeter check, QNH is three zero one zero"),
+            "{said}"
+        );
+        assert!(said.contains("you have three zero one five"), "{said}");
+        assert!(
+            c.fix_write(&pilot).is_none(),
+            "the pilot's knob is never turned"
+        );
+
+        let auto = linto_altimeter(true);
+        assert_eq!(
+            c.eval(&auto).as_deref(),
+            Some("Altimeter reset, three zero one zero.")
+        );
+        let (dref, v) = c
+            .fix_write(&auto)
+            .expect("an automation's altimeter is set");
+        assert_eq!(dref, BARO_KNOB);
+        assert!((v - 30.10).abs() < 0.005, "{v}");
+    }
+
+    #[test]
+    fn altimeter_check_is_quiet_when_set_or_cold() {
+        let c = AltimeterSetting {
+            transition_altitude_ft: 18_000.0,
+        };
+        let mut s = linto_altimeter(false);
+        s.baro_inhg = Some(30.11); // a hundredth off: within tolerance
+        assert!(c.eval(&s).is_none());
+        s.baro_inhg = Some(30.15);
+        s.engine_running = false; // cold and dark: nobody's flying yet
+        assert!(c.eval(&s).is_none());
+        s.engine_running = true;
+        s.qnh_pa = None; // no pressure from the sim: nothing to compare
+        assert!(c.eval(&s).is_none());
+    }
+
+    #[test]
+    fn altimeter_check_wants_standard_above_the_transition_altitude() {
+        let c = AltimeterSetting {
+            transition_altitude_ft: 6_000.0,
+        };
+        let mut s = linto_altimeter(false);
+        s.baro_inhg = Some(30.10); // QNH set, but we are in the flight levels
+        let said = c
+            .eval(&s)
+            .expect("QNH above the transition altitude is wrong");
+        assert!(
+            said.starts_with("Altimeter check, standard is two niner niner two"),
+            "{said}"
+        );
     }
 
     /// Airborne at cruise with a known destination — the descent-advisor base.
@@ -3254,6 +3590,55 @@ mod tests {
         let mut s = cruise_with_dest(38.0);
         s.vsi_fpm = -2000.0;
         assert!(c.eval(&s).is_none());
+    }
+
+    /// LEJR-LXGB, 2026-09-14: level at 7,000 with the SimBrief ring long
+    /// passed, but the follower pacing its own descent to 27D10 at 3,143 ft.
+    /// The advisor speaks the follower's point and altitude, and "past the
+    /// descent point" is only ever the follower's own miss.
+    #[test]
+    fn follower_tod_outranks_the_plan_ring() {
+        let tod = |to_tod_nm: f64, started: bool| crate::procedure::PlannedTod {
+            fix: "27D10".into(),
+            dist_nm: to_tod_nm + 11.2,
+            to_tod_nm,
+            target_ft: 3143.0,
+            started,
+        };
+        // The ring says "past" (38 nm out, ring 42); the follower says 8 to go.
+        let mut s = cruise_with_dest(38.0);
+        s.follower_tod = Some(tod(8.0, false));
+        assert!(
+            TodPassed.eval(&s).is_none(),
+            "the hands are correctly waiting"
+        );
+        let msg = TodAhead.eval(&s).expect("the follower's point, 8 nm ahead");
+        assert!(msg.contains("8 miles ahead"), "{msg}");
+        assert!(msg.contains("down to 3,100 feet"), "{msg}");
+        // The ring says "coming up" (50 nm out); the follower is 20 nm away.
+        let mut s = cruise_with_dest(50.0);
+        s.follower_tod = Some(tod(20.0, false));
+        assert!(TodAhead.eval(&s).is_none(), "far from the follower's point");
+        // Two miles past its own point and still level: the follower missed.
+        let mut s = cruise_with_dest(38.0);
+        s.follower_tod = Some(tod(-2.0, false));
+        let msg = TodPassed.eval(&s).expect("the follower's own miss");
+        assert!(msg.contains("feet a minute makes 3,100 feet"), "{msg}");
+        // Descent commanded: both quiet, whatever the ring thinks.
+        let mut s = cruise_with_dest(38.0);
+        s.follower_tod = Some(tod(0.0, true));
+        assert!(TodAhead.eval(&s).is_none());
+        assert!(TodPassed.eval(&s).is_none());
+        // Mid-descent on the follower's slope: the ring's slope never judges it.
+        let mut s = cruise_with_dest(30.0);
+        s.vsi_fpm = -700.0;
+        s.alt_ft = 13_000.0;
+        assert!(HighOnProfile.eval(&s).is_some(), "the ring's rule alone");
+        s.follower_tod = Some(tod(-1.0, true));
+        assert!(
+            HighOnProfile.eval(&s).is_none(),
+            "the follower owns its profile"
+        );
     }
 
     #[test]
@@ -3606,7 +3991,10 @@ mod tests {
         s.groundspeed_kts = 38.0;
         assert!(c.eval(&s).is_some());
         crate::taxi_in::ARREST_HOLD.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert!(c.eval(&s).is_none(), "the copilot's own brake is not a caution");
+        assert!(
+            c.eval(&s).is_none(),
+            "the copilot's own brake is not a caution"
+        );
         crate::taxi_in::ARREST_HOLD.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(c.eval(&s).is_some());
     }

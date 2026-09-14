@@ -39,6 +39,12 @@ const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 const HPATH: &str = "sim/flightmodel/position/hpath";
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
 const ELEV_M: &str = "sim/flightmodel/position/elevation";
+/// The altimeter the pilot, the AP's preselect, the plan and ATC all read.
+/// Cruise altitudes are pressure altitudes: on a hot day true altitude runs
+/// hundreds of feet above indicated, and a follower targeting true feet parks
+/// the aircraft below the dial with ALTS armed forever (LINTO, 2026-09-14:
+/// 7,012 true, 6,838 indicated, VS +4 fpm).
+const ALT_IND_FT: &str = crate::datarefs::ALTITUDE_FT;
 const MAG_VAR: &str = "sim/flightmodel/position/magnetic_variation";
 const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 const GS_MS: &str = "sim/flightmodel/position/groundspeed";
@@ -93,6 +99,46 @@ fn publish_leg(leg: Option<ActiveLeg>) {
     *LEG.lock().unwrap_or_else(|e| e.into_inner()) = leg;
 }
 
+/// The follower's OWN top of descent: where its vertical law will start down
+/// for the leg it is flying. The monitor's descent advisor and the spoken
+/// "how far to top of descent" used to measure a different point (SimBrief's
+/// ring, or 3.5 nm per 1,000 ft to the FIELD) while the follower paced its
+/// 700 fpm descent to the next FIX: on the LEJR-LXGB straight-in the copilot
+/// said "past the descent point, 1,100 feet a minute makes the profile" and
+/// "we're at top of descent, time to start down" three minutes before its own
+/// hands moved (2026-09-14). One rule for what the mouth says and the hands
+/// do: while a procedure flies, everything that names the top of descent
+/// reads THIS.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlannedTod {
+    /// The fix the descent is paced against.
+    pub fix: String,
+    /// Miles to the fix.
+    pub dist_nm: f64,
+    /// Miles from here to the descent point; negative once past it.
+    pub to_tod_nm: f64,
+    /// The altitude the follower will fly down to at the fix, indicated feet.
+    pub target_ft: f64,
+    /// True once the follower has commanded the descent.
+    pub started: bool,
+}
+
+static TOD: std::sync::Mutex<Option<PlannedTod>> = std::sync::Mutex::new(None);
+
+/// The follower's planned top of descent for the leg being flown; `None`
+/// between procedures, on a leg with no fix, or when the leg's constraint
+/// is not below us (nothing to descend to yet).
+pub fn planned_tod() -> Option<PlannedTod> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    TOD.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn publish_tod(tod: Option<PlannedTod>) {
+    *TOD.lock().unwrap_or_else(|e| e.into_inner()) = tod;
+}
+
 /// The plugin's `xcopilot/fms/goto` mailbox: sequences the LOADED plan to the
 /// entry with this ident nearest this position, so the sim's GPS page, the
 /// G1000 readouts and every `gps_*` dataref describe the fix the follower is
@@ -104,7 +150,12 @@ pub const FMS_GOTO: &str = "xcopilot/fms/goto";
 
 /// The mailbox payload: `IDENT,lat,lon`, six decimals like the route payload.
 pub fn fms_goto_payload(ident: &str, lat: f64, lon: f64) -> String {
-    format!("{},{:.6},{:.6}", ident.trim().to_ascii_uppercase(), lat, lon)
+    format!(
+        "{},{:.6},{:.6}",
+        ident.trim().to_ascii_uppercase(),
+        lat,
+        lon
+    )
 }
 
 /// Sequence the sim's FMS to the leg's fix. Best effort: no plugin, no plan
@@ -243,6 +294,11 @@ pub struct Plan {
     /// whole leg, released at handoff; `None` leaves the throttle alone (the
     /// climb-out setting rides through — approaches/SIDs, which manage their own).
     pub cruise_ias_kts: Option<f64>,
+    /// The airframe's transition altitude, for setting the altimeter at arm
+    /// time: the follower flies INDICATED altitude, so a mis-set altimeter is a
+    /// mis-flown altitude. `None` (approach plans) leaves the knob alone; the
+    /// monitor's cross-check keeps it right from there.
+    pub transition_altitude_ft: Option<f64>,
 }
 
 /// The true great-circle bearing to a leg's fix, or `None` for a to-altitude
@@ -421,11 +477,9 @@ pub fn descent_target_ft(
     let Some(dist_nm) = dist_nm else {
         return leg_alt;
     };
-    let drop_ft = alt_ft - leg_alt;
-    if drop_ft <= 100.0 {
+    let Some(tod_nm) = descent_point_nm(leg_alt, alt_ft, gs_kts) else {
         return leg_alt;
-    }
-    let tod_nm = drop_ft / DESCENT_FPM * (gs_kts.max(60.0) / 60.0) + TOD_LEAD_NM;
+    };
     if dist_nm <= tod_nm {
         return leg_alt;
     }
@@ -434,6 +488,18 @@ pub fn descent_target_ft(
     } else {
         (alt_ft / 100.0).round() * 100.0
     }
+}
+
+/// Where the descent to `leg_alt` begins: miles BEFORE the fix, at the rate
+/// the VS law flies and the groundspeed we have, plus the lead. `None` when
+/// there is no descent to pace (the constraint is not more than 100 ft below
+/// us). The one formula behind [`descent_target_ft`] and [`planned_tod`].
+pub fn descent_point_nm(leg_alt: f64, alt_ft: f64, gs_kts: f64) -> Option<f64> {
+    let drop_ft = alt_ft - leg_alt;
+    if drop_ft <= 100.0 {
+        return None;
+    }
+    Some(drop_ft / DESCENT_FPM * (gs_kts.max(60.0) / 60.0) + TOD_LEAD_NM)
 }
 
 /// One tick of the follower's vertical bookkeeping, pure so every rule below
@@ -461,6 +527,13 @@ pub struct Vertical {
 /// constraint paced to its top of descent, then the PILOT's altitude if they
 /// have taken it, then the ground AHEAD, which outranks everyone: no target
 /// the follower commands may be into terrain, whoever asked for it.
+/// The terrain floor is TRUE feet (probed ground plus clearance); the dial is
+/// indicated. The live true-minus-indicated offset (temperature and QNH error
+/// together) converts it, so a hot day never eats into the clearance.
+pub fn floor_indicated(floor_true_ft: f64, true_alt_ft: f64, indicated_alt_ft: f64) -> f64 {
+    floor_true_ft - (true_alt_ft - indicated_alt_ft)
+}
+
 pub fn vertical_tick(
     leg: &ProcLeg,
     carry: f64,
@@ -581,6 +654,7 @@ pub fn approach_plan_for(
         end,
         vy_kts: 0.0,
         cruise_ias_kts: None, // the follower holds the clean approach speed
+        transition_altitude_ft: None,
     })
 }
 
@@ -696,11 +770,13 @@ pub fn enroute_legs(
             dist_nm: None,
             turn: None,
             alt_desc: ' ',
-            alt1_ft: Some(if i < first_at_peak || (peak - *alt).abs() <= CRUISE_DIP_FT {
-                peak
-            } else {
-                *alt
-            }),
+            alt1_ft: Some(
+                if i < first_at_peak || (peak - *alt).abs() <= CRUISE_DIP_FT {
+                    peak
+                } else {
+                    *alt
+                },
+            ),
             alt2_ft: None,
             is_faf: false,
         })
@@ -748,6 +824,7 @@ pub fn start(base_url: String, voice: Option<Voice>, plan: Plan) {
         ));
         ACTIVE.store(false, Ordering::SeqCst);
         publish_leg(None);
+        publish_tod(None);
     });
 }
 
@@ -779,12 +856,33 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         end,
         vy_kts,
         cruise_ias_kts,
+        transition_altitude_ft,
     } = plan;
     let handoff = handoff_index(&legs);
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     // Process-wide facts must never outlive the flight that set them.
     clear_pilot_altitude();
     publish_terrain_floor(None);
+    // The altimeter first: every altitude below is read off it. Said only
+    // when the knob actually moved (a correct setting earns no chatter).
+    if let Some(ta) = transition_altitude_ft {
+        if let Some(sync) = crate::tools::instruments::sync_altimeter(&xp, ta).await {
+            crate::blackbox::record(
+                "procedure",
+                serde_json::json!({"event": "altimeter_set", "was": sync.was, "now": sync.now}),
+            );
+            if sync.changed() {
+                alert(
+                    &voice,
+                    Priority::Advisory,
+                    &format!(
+                        "Altimeter set, {}.",
+                        crate::tools::instruments::spoken_setting(sync.now)
+                    ),
+                );
+            }
+        }
+    }
     crate::blackbox::record(
         "procedure",
         serde_json::json!({"event": "armed", "name": name, "legs": legs.len(), "approach": matches!(end, EndAction::Approach{..})}),
@@ -841,7 +939,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // so autoland/the arrival own the throttle alone.
     if let Some(kts) = power_hold_target(&end, cruise_ias_kts) {
         crate::tools::speedhold::arm_flight(base_url.clone(), voice.clone(), kts);
-        let event = if matches!(end, EndAction::Enroute) { "cruise_power" } else { "approach_power" };
+        let event = if matches!(end, EndAction::Enroute) {
+            "cruise_power"
+        } else {
+            "approach_power"
+        };
         crate::blackbox::record(
             "procedure",
             serde_json::json!({"event": event, "target_ias": kts}),
@@ -870,10 +972,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             continue;
         }
 
-        let (lat, lon, elev_m, psi_r, hpath_r, agl_m, vs_st, hdg_st, ias_r, gs_r) = tokio::join!(
+        let (lat, lon, elev_m, alt_ind, psi_r, hpath_r, agl_m, vs_st, hdg_st, ias_r, gs_r) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
             xp.get_float(ELEV_M),
+            xp.get_float(ALT_IND_FT),
             xp.get_float(PSI_TRUE),
             xp.get_float(HPATH),
             xp.get_float(AGL_M),
@@ -885,7 +988,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         let (Ok(lat), Ok(lon)) = (lat, lon) else {
             continue;
         };
-        let alt_ft = elev_m.unwrap_or(0.0) * M_TO_FT;
+        // Fly the ALTIMETER; true altitude stays for the terrain floor only.
+        let true_alt_ft = elev_m.unwrap_or(0.0) * M_TO_FT;
+        let alt_ft = alt_ind.unwrap_or(true_alt_ft);
         let agl_ft = agl_m.unwrap_or(0.0) * M_TO_FT;
 
         let leg = &legs[idx];
@@ -1000,11 +1105,23 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             dist_nm,
             gs_kts,
             pilot_altitude(),
-            terrain_floor_ahead_ft(),
+            terrain_floor_ahead_ft().map(|f| floor_indicated(f, true_alt_ft, alt_ft)),
         );
         let want_alt = v.want_alt;
         carry_alt = v.carry;
         prev_cmd_alt = v.prev_cmd;
+        // The follower's own top of descent, for the advisor and the spoken
+        // answer: the same point the law above paces against. `carry` is the
+        // leg's constraint (carried across unconstrained fixes).
+        publish_tod(dist_nm.and_then(|d| {
+            descent_point_nm(v.carry, alt_ft, gs_kts).map(|tod| PlannedTod {
+                fix: leg.fix_ident.clone(),
+                dist_nm: d,
+                to_tod_nm: d - tod,
+                target_ft: v.carry,
+                started: want_alt < alt_ft - 100.0,
+            })
+        }));
         match v.floored {
             Some(floor) => {
                 if said_floor.is_none_or(|p| floor > p + TERRAIN_RESAY_FT) {
@@ -1080,8 +1197,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             "procedure",
             serde_json::json!({
                 "event": "leg", "idx": idx, "type": leg.leg_type, "fix": leg.fix_ident,
-                "dist_nm": dist_nm, "alt_ft": alt_ft, "want_alt": want_alt, "agl_ft": agl_ft, "crab": crab,
-                "psi": psi_v, "bug": bug_mag, "tgt": target_mag,
+                "dist_nm": dist_nm, "alt_ft": alt_ft, "alt_true": true_alt_ft, "want_alt": want_alt,
+                "agl_ft": agl_ft, "crab": crab, "psi": psi_v, "bug": bug_mag, "tgt": target_mag,
             }),
         );
 
@@ -1194,6 +1311,37 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one formula the follower's law, the advisor and the spoken answer
+    /// all read: LEJR-LXGB, 7,000 ft to 27D10 at 3,143 ft, 113 kt over the
+    /// ground, is 11.4 nm before the fix (10.4 of descent plus the lead).
+    #[test]
+    fn descent_point_is_one_formula() {
+        let tod = descent_point_nm(3_143.0, 7_000.0, 113.0).unwrap();
+        assert!((tod - 11.38).abs() < 0.05, "{tod}");
+        // The law starts down exactly there, not before.
+        assert_eq!(
+            descent_target_ft(3_143.0, 7_000.0, 7_000.0, Some(tod + 0.1), 113.0),
+            7_000.0
+        );
+        assert_eq!(
+            descent_target_ft(3_143.0, 7_000.0, 7_000.0, Some(tod - 0.1), 113.0),
+            3_143.0
+        );
+        // Nothing to descend to: no point to announce.
+        assert_eq!(descent_point_nm(7_000.0, 7_050.0, 113.0), None);
+        assert_eq!(descent_point_nm(8_000.0, 7_000.0, 113.0), None);
+        // Between procedures the accessor is empty whatever was published.
+        publish_tod(Some(PlannedTod {
+            fix: "X".into(),
+            dist_nm: 20.0,
+            to_tod_nm: 8.0,
+            target_ft: 3_000.0,
+            started: false,
+        }));
+        assert_eq!(planned_tod(), None);
+        publish_tod(None);
+    }
     use crate::nav::Fix;
 
     /// The crew's "next waypoint" answer while a procedure flies: distance to
@@ -1203,7 +1351,11 @@ mod tests {
     fn leg_progress_is_distance_and_minutes_to_the_followers_fix() {
         // MG430 from the point the LXGB-LEMG flight was actually at when the
         // GPS still said "PIMOS, 48 miles".
-        let leg = ActiveLeg { fix: "MG430".into(), lat: 36.9985, lon: -4.9035 };
+        let leg = ActiveLeg {
+            fix: "MG430".into(),
+            lat: 36.9985,
+            lon: -4.9035,
+        };
         let (dist, mins) = leg_progress(&leg, 36.95877, -4.90277, 100.0);
         assert!((dist - 2.39).abs() < 0.1, "dist {dist}");
         let mins = mins.expect("moving: an ETA");
@@ -1215,7 +1367,11 @@ mod tests {
     fn no_procedure_means_no_active_leg() {
         // Whatever a finished follower left in the slot, an inactive
         // procedure has no leg: the GPS answer applies again.
-        publish_leg(Some(ActiveLeg { fix: "X".into(), lat: 0.0, lon: 0.0 }));
+        publish_leg(Some(ActiveLeg {
+            fix: "X".into(),
+            lat: 0.0,
+            lon: 0.0,
+        }));
         if !ACTIVE.load(Ordering::Relaxed) {
             assert_eq!(active_leg(), None);
         }
@@ -1312,9 +1468,25 @@ mod tests {
         assert!(v.pilot);
         // It survives the next tick, and the one after: the plan never takes
         // the altitude back on its own.
-        let v = tick(&jrz(), v.carry, v.prev_cmd, 3200.0, 36.0, Some(4000.0), None);
+        let v = tick(
+            &jrz(),
+            v.carry,
+            v.prev_cmd,
+            3200.0,
+            36.0,
+            Some(4000.0),
+            None,
+        );
         assert_eq!(v.want_alt, 4000.0);
-        let v = tick(&jrz(), v.carry, v.prev_cmd, 4000.0, 34.0, Some(4000.0), None);
+        let v = tick(
+            &jrz(),
+            v.carry,
+            v.prev_cmd,
+            4000.0,
+            34.0,
+            Some(4000.0),
+            None,
+        );
         assert_eq!(v.want_alt, 4000.0);
     }
 
@@ -1323,7 +1495,15 @@ mod tests {
     #[test]
     fn terrain_outranks_the_pilot_as_well() {
         let floor = 3861.0 + TERRAIN_CLEARANCE_FT;
-        let v = tick(&jrz(), 2700.0, 2700.0, 2800.0, 38.0, Some(4000.0), Some(floor));
+        let v = tick(
+            &jrz(),
+            2700.0,
+            2700.0,
+            2800.0,
+            38.0,
+            Some(4000.0),
+            Some(floor),
+        );
         assert_eq!(v.want_alt, floor);
         assert_eq!(v.floored, Some(floor));
         assert!(!v.pilot, "the floor set it, not the pilot");
@@ -1338,7 +1518,10 @@ mod tests {
         let d = |(a, b): (f64, f64)| crate::nav::haversine_nm(36.6354, -5.2307, a, b);
         assert!(d(pts[0]) < 1.5, "first point is close ahead: {}", d(pts[0]));
         let last = d(*pts.last().unwrap());
-        assert!((last - 15.0).abs() < 0.5, "last point is the look-ahead: {last}");
+        assert!(
+            (last - 15.0).abs() < 0.5,
+            "last point is the look-ahead: {last}"
+        );
         // Heading 285 is west and slightly north of the aircraft.
         assert!(pts.last().unwrap().1 < -5.2307);
         assert!(pts.last().unwrap().0 > 36.6354);
@@ -1382,9 +1565,16 @@ mod tests {
         let airport = gibraltar();
         let mut faf = leg("09D05", 36.104666667, -5.405333333);
         faf.is_faf = true;
-        let legs = vec![leg("09D06", 36.088, -5.404666667), faf, leg("RW09", 36.1509, -5.3581)];
+        let legs = vec![
+            leg("09D06", 36.088, -5.404666667),
+            faf,
+            leg("RW09", 36.1509, -5.3581),
+        ];
         let why = faf_off_course(&legs, &airport, "09").expect("refused");
-        assert!(why.contains("09D05") && why.contains("off the runway zero nine centreline"), "{why}");
+        assert!(
+            why.contains("09D05") && why.contains("off the runway zero nine centreline"),
+            "{why}"
+        );
 
         // A FAF ON the centreline 4 nm out is fine.
         let mut faf = leg("09D04", 36.1482, -5.4406);
@@ -1410,7 +1600,10 @@ mod tests {
         };
         let held = power_hold_target(&approach, None).expect("an approach holds a speed");
         assert!((140.0..=150.0).contains(&held), "1.45 x Vapp, got {held}");
-        assert_eq!(power_hold_target(&EndAction::Enroute, Some(180.0)), Some(180.0));
+        assert_eq!(
+            power_hold_target(&EndAction::Enroute, Some(180.0)),
+            Some(180.0)
+        );
         assert_eq!(power_hold_target(&EndAction::Enroute, None), None);
         assert_eq!(power_hold_target(&EndAction::Level, Some(180.0)), None);
     }
@@ -1448,6 +1641,17 @@ mod tests {
         let down = to_alt('-', 3000.0);
         assert!(!leg_captured(&down, None, 5000.0), "above: keep descending");
         assert!(leg_captured(&down, None, 3000.0), "made it");
+    }
+
+    #[test]
+    fn terrain_floor_is_converted_to_the_altimeter() {
+        // Hot day: 7,012 true reads 6,838. A 6,500 true floor must be flown
+        // as 6,326 indicated, not 6,500 (174 ft into the clearance).
+        assert!((floor_indicated(6_500.0, 7_012.0, 6_838.0) - 6_326.0).abs() < 1e-9);
+        // Cold day the other way: the indicated floor sits ABOVE the true one.
+        assert!((floor_indicated(6_500.0, 6_800.0, 7_000.0) - 6_700.0).abs() < 1e-9);
+        // Standard day: no change.
+        assert_eq!(floor_indicated(6_500.0, 7_000.0, 7_000.0), 6_500.0);
     }
 
     #[test]
@@ -1576,16 +1780,37 @@ mod tests {
     // 25 nm to run at 200 kt over the ground. Level until the top of descent.
     #[test]
     fn a_descent_waits_for_its_top_of_descent() {
-        assert_eq!(descent_target_ft(1397.0, 3900.0, 3888.0, Some(25.0), 200.0), 3900.0);
+        assert_eq!(
+            descent_target_ft(1397.0, 3900.0, 3888.0, Some(25.0), 200.0),
+            3900.0
+        );
         // TOD: 2,491 ft at 700 fpm is 3.6 min, 11.9 nm at 200 kt, plus the lead.
-        assert_eq!(descent_target_ft(1397.0, 3900.0, 3888.0, Some(13.5), 200.0), 3900.0);
-        assert_eq!(descent_target_ft(1397.0, 3900.0, 3888.0, Some(12.0), 200.0), 1397.0);
+        assert_eq!(
+            descent_target_ft(1397.0, 3900.0, 3888.0, Some(13.5), 200.0),
+            3900.0
+        );
+        assert_eq!(
+            descent_target_ft(1397.0, 3900.0, 3888.0, Some(12.0), 200.0),
+            1397.0
+        );
         // Climbs, small steps and fix-less legs go straight to the constraint.
-        assert_eq!(descent_target_ft(4000.0, 2000.0, 2000.0, Some(30.0), 200.0), 4000.0);
-        assert_eq!(descent_target_ft(3900.0, 4000.0, 3990.0, Some(30.0), 200.0), 3900.0);
-        assert_eq!(descent_target_ft(1000.0, 4000.0, 4000.0, None, 200.0), 1000.0);
+        assert_eq!(
+            descent_target_ft(4000.0, 2000.0, 2000.0, Some(30.0), 200.0),
+            4000.0
+        );
+        assert_eq!(
+            descent_target_ft(3900.0, 4000.0, 3990.0, Some(30.0), 200.0),
+            3900.0
+        );
+        assert_eq!(
+            descent_target_ft(1000.0, 4000.0, 4000.0, None, 200.0),
+            1000.0
+        );
         // Never reached the previous target: hold where we are, rounded.
-        assert_eq!(descent_target_ft(1000.0, 6000.0, 3460.0, Some(40.0), 200.0), 3500.0);
+        assert_eq!(
+            descent_target_ft(1000.0, 6000.0, 3460.0, Some(40.0), 200.0),
+            3500.0
+        );
     }
 
     #[test]
@@ -1616,6 +1841,7 @@ mod tests {
             end: EndAction::Level,
             vy_kts: 0.0,
             cruise_ias_kts: None,
+            transition_altitude_ft: None,
         };
         // Tight circuit: 0.3 nm from the FAF at 700 ft — NOT flyable (autoland).
         let (near_lat, near_lon) = crate::nav::project_latlon(36.0, -5.0, 0.0, 0.3);

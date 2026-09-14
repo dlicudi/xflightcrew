@@ -81,6 +81,10 @@ const SLOW_DATAREFS: &[&str] = &[
     "sim/aircraft/overflow/pushback_attached",
     // The sun moves over minutes; the light stages ask it once per decision.
     "sim/graphics/scenery/sun_pitch_degrees",
+    // The local QNH and the altimeter knob: the monitor's cross-check reads
+    // both every tick, and neither moves faster than a weather edition.
+    "sim/weather/aircraft/qnh_pas",
+    "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot",
 ];
 /// How long a [`SLOW_DATAREFS`] value may be reused. Well under the time any
 /// of them plausibly changes twice, and a whole order of magnitude off the

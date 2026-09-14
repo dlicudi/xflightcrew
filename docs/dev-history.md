@@ -367,6 +367,25 @@ the side to err on):
 Pure decisions tested; the writes ride `lights::apply` like every other
 light write. Not flown yet: the sim was closed for the evening.
 
+## The taxi light rode the whole flight — 2026-09-14
+
+"It says landing lights, off. But I don't think it actually turned landing
+lights off?" On the 172, LEJR-LXGB under full auto. It had: the sim read
+`landing_lights_on` = 0 and every `landing_lights_switch` element 0, and
+the panel screenshot showed LAND down. TAXI was up. `lights_taxi` lit it
+for the taxi, line-up added strobes and landing, `lights_climb` put the
+landing light out at 1,006 ft AGL, and nothing in the mission ever touched
+the taxi light again: the 172's two lamps sit side by side in the left
+wing, so a burning taxi light IS the landing light to anyone looking at
+the aeroplane. The climb checklist (Monitor flavour) then confirmed
+"Landing lights, off" honestly, because that item tests the landing
+switch. Fix: `lights::after_climb_for` (every ground light the airframe
+declares goes off, tested like `after_vacate_for`), applied in the same
+stage; the `lights_climb` event now carries `off: {landing, taxi}`. While
+there: `after_vacate` and `landing` reported `apply(..).is_ok() && on`, so
+an "off" could never blackbox `true` and a wrong readback still counted as
+done. Both now compare the state read back against the intent (`reached`).
+
 ## The SR22 has no taxi light — 2026-09-12
 
 "When taxi should we use landing lights?" Not on a taxiway; the taxi light
@@ -1101,6 +1120,26 @@ unreachable through datarefs — only a plugin can touch it:
 The plan also feeds [src/monitor.rs](src/monitor.rs)'s `DESTINATION` (TOD ring
 against the real field elevation) and the fuel check briefs against what's
 actually in the tanks.
+
+### A spoken ask re-fetches; the TTL is for the side consumers (2026-09-14)
+
+Four "load the flight plan" in two minutes after "that's the wrong flag plan",
+and every one re-sent LEMG-LEJR to the GPS in under 50 ms: the plan was on a
+10 min TTL and the only words that forced a fetch were "refresh / reload /
+update", which nobody says when the plan they regenerated on SimBrief comes
+back wrong. Fixed as a fetch POLICY (`PlanFetch`): `Cached` for the implicit
+consumers (fuel projection, TOD, ETA, destination elevation), `Asked` for
+anything the pilot says by name (a SimBrief plan is fetched every time; a
+local plan stays, so "load it" after "plan a flight to" never swaps it out),
+`Forced` for the refresh words (over a local plan too). `ensure_plan` now
+reports whether a fresh fetch replaced the shelf, so a load that wanted
+SimBrief and got the old plan says "couldn't reach SimBrief, using the plan I
+already had". The complaint itself is a rule now: `wrong_plan_complaint`
+(closed shape: a wrongness word AND a plan word, whisper's "flag plan"
+included) forces a fetch and `plan_change_line` compares origin, destination
+and route string: "SimBrief still has LEMG to LEJR, generate the new plan
+there" or "got the new plan, X to Y, say load it". Full auto was never
+affected: it fetches its own plan at arm time.
 
 ## ATC lives inside the copilot binary (the world, not the crew)
 
@@ -2937,6 +2976,36 @@ observation via TCAS datarefs (ATC only ever *controls the player* and
 *narrates* other traffic), a radio-PTT plugin dataref if content routing ever
 collides.
 
+### The region handoff had no crew consumer (2026-09-14)
+
+The enroute watch's "Radar services terminated. Squawk seven thousand.
+Contact Malaga Tower on one one eight decimal one" was the world's line and
+nothing else: the station armed `PENDING_STATION`, the main loop installed
+the new tower, and the crew did nothing with the words. Full auto stayed on
+the departure frequency until its own arrival stage tuned the destination
+(the thirteen minutes of Malaga's party line that the departure handoff fix
+of 2026-07-24 only half cured), the transponder kept the discrete code for
+the rest of the flight, and a pilot flying by hand heard no coach either.
+
+Same shape as `take_departure_handoff`: the station publishes
+`party_line::RegionHandoff { to, khz, squawk_vfr }` with the spoken line and
+`take_region_handoff()` is the one accessor. It survives `Station::install`
+ON PURPOSE (install runs on the main loop's very next pass, before the crew's
+2 s poll; the departure handoff dies there because the OLD tower's climb
+handoff must not fire at the new field) and `uninstall` ends it. Full auto's
+enroute wait reads it back on the old frequency ("squawking seven thousand,
+Malaga Tower on ...", an `is_readback` shape so the controller answers with
+silence), waits the readback beat, dials 7000 through `SetTransponder`,
+retunes COM1 and blackboxes `region_handoff`; the arrival stage, which has
+already tuned the destination, drains it without a readback (a readback
+there lands on the NEW tower as a garbled call) and still gives the code
+back. With anyone else flying (`full_auto::ACTIVE` false: the pilot, or the
+bare follower) the monitor takes it and after 20 s says once what is still
+undone (`monitor::region_coach_line`: "Radar's done with us: squawk seven
+thousand, and Malaga Tower on ..."), blackboxed `region_coach`, never
+re-asserted. Not done: the pilot's own spoken readback is not checked
+against the handoff (the station stays silent to any readback shape).
+
 ## App modes: Both / Copilot only / ATC only (runtime-toggleable)
 
 The two halves sell separately (2026-07-14): `mode.rs` holds one process-wide
@@ -2975,6 +3044,177 @@ is NOT gated there: the main loop mode-routes it, and the one-line "copilot is
 off" note must speak. The gyro auto-sync ACTION (not just its line) also
 stands down: no crew, no hands on the panel. Tests that set the process-wide
 mode hold `mode::TEST_LOCK`.
+
+## The follower flew true altitude; the dial is indicated (2026-09-14)
+
+VJF-LINTO leg on the 172, cruise 7,000: the AP sat at 6,820 indicated with
+ALTS armed and VS +4 fpm, never capturing. The blackbox `leg` events said
+`alt_ft` 7,009 against `want_alt` 7,000, so the follower commanded VS zero
+and was content. Live reads: `sim/flightmodel/position/elevation` 2,137 m
+(7,012 ft), `altitude_ft_pilot` 6,838, altimeter 30.15, OAT 61F (ISA+14C).
+A hot day puts true altitude above indicated; the follower targeted true
+feet from the elevation dataref while the AP's preselect, the plan, the
+chart and the controller all mean the altimeter.
+
+Fix: the follower's `alt_ft` is now `altitude_ft_pilot` (true elevation
+only as a fallback when the read fails); the terrain floor, which IS true
+feet (probed ground plus clearance), converts through the live
+true-minus-indicated offset (`procedure::floor_indicated`, tested both
+ways) so a hot day never eats the 1,000 ft. Full auto's departure check-in
+("passing two thousand") and the arrival's `approach_flyable_from` read the
+altimeter as well. The `leg` event keeps `alt_true` beside `alt_ft`.
+Consequence to remember: a mis-set altimeter is now a mis-flown altitude,
+exactly as it is for a pilot. The circuit still sizes its pattern from true
+elevation (field plus 1,000 AGL), which is what a pattern height is.
+
+Which raised the next question, the same afternoon: who sets QNH? Until
+now, full auto once at the gate (from `qnh_pas`, never again), the pilot by
+asking, and nobody for "fly the flight plan" (that sortie: 30.15 on the
+knob, QNH 30.10, 46 ft of the gap the altimeter's own). So: one rule for
+the correct setting (`tools::instruments::correct_setting_inhg`, QNH below
+the profile's transition altitude, 29.92 above) shared by the spoken tool,
+full auto's departure set, the follower's arm (`Plan.transition_altitude_ft`,
+`Some` on the enroute plan only; the knob is set and said only when it
+moved) and a new monitor check, `AltimeterSetting`: 0.03 inHg off for 20 s
+with the engine running. Under an automation (follower, full auto, circuit,
+autoland: `Snapshot::automation_flying`) the copilot resets the knob through
+the new `Check::fix_write` hook ("Altimeter reset, three zero one zero")
+and blackboxes the callout; with the pilot flying it advises once
+("Altimeter check, QNH is three zero one zero, you have three zero one
+five") and never turns the pilot's knob, the cockpit_auto rule. Both
+datarefs joined `SLOW_DATAREFS`. Still owed: reading the setting the tower
+gives in a clearance back into the knob (`qnh_clause` is one-way today).
+
+## The mouth and the hands disagreed on top of descent (2026-09-14)
+
+LEJR-LXGB full auto on the 172, straight-in to 27. The enroute completed
+at 7,000 and the approach armed with 27D10 (reconstructed at 3,143 ft)
+44.7 nm out. At 11:18 the monitor said "Descent coming up, top of descent
+in about 6 minutes", at 11:25 "We're past the descent point. About 1100
+feet a minute makes the profile", at 11:28 the spoken answer to "how long
+before top of descent" was "We're at top of descent, time to start down".
+The follower held 6,998 ft through all of it and started down at 11:31,
+11.2 nm from 27D10, exactly where `descent_target_ft` puts it (700 fpm to
+the NEXT fix plus a mile of lead). Nothing was late: the advisor and the
+answer measured a different point (SimBrief's ring, else 3.5 nm per
+1,000 ft to the FIELD), and the pilot asked three times whether the
+copilot knew.
+
+Fix: `procedure::descent_point_nm` is the one formula, and the follower
+publishes `PlannedTod` (fix, miles to it, miles to the descent point,
+target altitude, started) every tick, cleared with the loop and gated on
+`ACTIVE` like `active_leg`. The monitor's snapshot carries it: `tod_ahead`
+speaks the follower's point and altitude ("12 miles ahead, down to 3,100
+feet"), `tod_passed` fires only on the follower's OWN miss (a mile past
+its point with the descent still uncommanded, the rate to make the fix),
+and `high_on_profile` stands down (the follower's 700 fpm to a fix is not
+the ring's 300 ft/nm to the field). `time_to_tod` reads it before the FMS
+and the plan, and says "already descending, down to X feet at FIX" once
+the descent is commanded. Not changed: the follower's own slope. From
+7,000 to 27D10 it is 3.3 degrees at 700 fpm, flyable on the 172 but the
+whole descent in one step; a stepped profile is a separate decision.
+
+## The tower said 09 and the copilot landed on 27 (2026-09-14)
+
+Same LEJR-LXGB sortie, the arrival. Full auto read the aircraft's wind
+datarefs 30 nm out at 7,000 ft (a light westerly aloft, below the 4 kt
+decisive threshold), picked the end by geometry, and set up the
+straight-in to 27. At 11:40:30 it reported "final runway two seven";
+autoland armed two seconds later and read the party line's clearance
+runway once, at the arm: nothing there. At 11:40:37 the tower answered
+"negative, runway zero niner, I say again runway zero niner. Runway zero
+niner, wind zero niner zero degrees, two one knots, cleared to land"
+(`correct_final_runway`, the LEMG 12/13 fix, working exactly as built).
+The words were spoken over the cockpit and nothing read them: no readback
+went out, and the approach flew 27 with 21 kt behind it. Two smaller
+misses on the way in: the inbound call at 11:12 was made 10 minutes before
+the region swapped from Ibn Battouta (genuinely the nearest field across
+the strait) to Gibraltar, so it went into the void and the final report
+was the tower's first word from us; and the crew has never read back a
+landing clearance, only takeoff and line-up.
+
+Fixes, each with the transcript as its test:
+
+- **Autoland watches the tower's word every tick** (`clearance_switch`, a
+  pure decision; the tick block above the rollout law). An arrival-shaped
+  clearance (Inbound or ClearedToLand: a departure state's runway is the
+  departure's) naming a different end is looked up in apt.dat once, and if
+  it is at THIS field the loop announces "Tower cleared us for runway zero
+  niner, not two seven", blackboxes `runway_from_clearance` with
+  `in_flight`, calls `run_autoland` again forced onto the cleared end and
+  exits on the generation bump. The re-arm is the whole approach from the
+  top: the fresh loop repositions to 09's join point from wherever we are
+  (the Intercept phase's job) and the arm-time clearance check finds
+  forced == cleared and says nothing. A superseded loop no longer clears
+  `ACTIVE` on its way out (`GEN == my_gen` guard): the successor set it
+  for itself, and clearing it told full auto "landed or went around".
+- **The landing clearance is read back** by the loop that is flying:
+  `party_line::readback_owed` is the phrased echo the tower waits for
+  (`ClearanceSnap.pending_readback`, already published); a landing one
+  (`landing_readback`, never a hold or a line-up) goes out once per
+  clearance as "cleared to land runway zero niner", the runway spelled
+  the way the proven takeoff readback spells it. Blackboxed
+  `landing_readback`.
+- **The arrival's wind is the field's** (`weather::surface_wind` from the
+  real-weather METAR file, fresh per `staleness`, variable = none;
+  `arrival_wind` falls back to the aircraft datarefs and names the source
+  on the `arrival_*` event). The tower's own pick is from the sim wind at
+  the aircraft when it is near the field, which the METAR is the surface
+  proxy for; a mismatch now self-corrects through the watch above.
+- **The inbound call is deferred to the swap** (`inbound_owed`,
+  `call_inbound`): 45 s at the arrival's start as before, then the
+  final-call watch loop polls `home_tower_khz` and calls the moment the
+  destination's station is up, draining the region handoff there; a field
+  that never swaps gets the inbound right before the final. Blackboxed
+  `inbound_deferred`.
+
+Not done: the deferred inbound on a PROCEDURE arrival still cannot move the
+plan (the reply's "join final runway zero niner" is obeyed only once
+autoland has the aircraft, since the procedure's FAF is 27's); a
+switch during the procedure leg would be an `EndAction` rewrite.
+
+## The flare arrived at the dial, not at the wheels (2026-09-14)
+
+Same LEJR-LXGB sortie, the last ten seconds. The debrief graded the
+touchdown firm (309 fpm at 62 kt), the third firm 172 arrival in three days
+(LEMG 13 on the 12th, LEJR on the 13th, both around 300), and the tick log
+says exactly why. The vertical law did everything it was written to do:
+`cmd_vs` stepped to the roundout's -250 at 49 ft radio and to the flare's
+-100 at 23 ft, on time, over the pavement, on the centreline. The `vsi`
+column never followed. Four seconds after the roundout dial the aircraft was
+still sinking 386; the flare's -100 eased it to -257 and then, with the
+throttle closed, the sink GREW back to -309 at the wheels. Fitted to the
+log, the 172's VS mode follows its dial as a first-order lag of about
+4.5 s behind a tick of dead time, and a flare from 23 ft at approach sink
+lasts five seconds: the whole manoeuvre was shorter than the servo. The
+guidance was right and the autopilot never heard it in time.
+
+The fix is the plant's, not the law's: in the roundout and the flare the
+DIAL now leads the target by the error the autopilot still owes
+(`vs_dial_fpm`: target + 2 x (target - actual), capped at a +300 fpm
+"climb" so a balloon is never commanded), which makes the closed lag about
+1.5 s. The dial may read a climb for a moment near the ground; that is the
+yoke coming back, which is what a flare is. Above the band nothing changes:
+the glidepath's own P law tracks its ramp through `path_descent_fpm`, and
+every approach test stays byte-identical. `Guidance` carries `arresting` so
+the loop knows which regime it is in, and the autoland tick blackboxes
+`vs_dial` and `vvi` beside `cmd_vs`, so the next debrief can tell what the
+law wanted from what the autopilot was told from what it flew.
+
+The test is the sortie: `the_landing_arrest_leads_the_autopilots_lag`
+flies the real vertical law from 60 ft against a lagging VS mode AND the
+flare's throttle cut as a 250 fpm sink disturbance the same lag has to
+reject. The disturbance matters: a pure lag lands the bare dial at -140 and
+would have passed the old law (the plant, again, before the gain). With it
+the bare dial reproduces the live arrival (-330, 10 s) and the led dial
+arrests it to about -100 in 14 s, no balloon, five seconds of extra float
+the overflight allowance already budgets for.
+
+Not done: the flare is still flown through the autopilot. A servo this slow
+argues for the takeoff's answer, the `xcopilot/pitch` channel with the
+rotation law's Q damping, which is a pitch-attitude flare a real hand
+would fly; if the led dial still arrives firm, that is the next step, and
+the tick log will say so in the `vs_dial`/`vvi` columns.
 
 ## Cabin crew: the second intercom persona (2026-07-15)
 

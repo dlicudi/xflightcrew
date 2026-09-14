@@ -34,8 +34,6 @@ use crate::xplane::XPlaneClient;
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
-const BARO_KNOB: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot";
-const PA_PER_INHG: f64 = 3386.389;
 
 /// True while the full-auto orchestrator runs.
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -157,6 +155,9 @@ pub struct SubTools {
     /// Indicated cruise speed for the enroute cruise-power hold (profile's
     /// `reference.cruise_ias_kts`); `None` leaves cruise at climb power.
     pub cruise_ias_kts: Option<f64>,
+    /// The airframe's transition altitude: the altimeter is set to QNH below
+    /// it and standard above, at departure and at the enroute follower's arm.
+    pub transition_altitude_ft: f64,
     /// The airframe has a continuous piston mixture lever (the profile's
     /// `engine` group): full auto arms the mixture manager for the enroute
     /// leg (full rich below the leaning floor, leaned to peak EGT above it,
@@ -289,10 +290,7 @@ pub fn squawk_owed(assigned: Option<i64>, actual: Option<f64>) -> Option<i64> {
 /// tower's answer can arrive after the wait gave up, and a squawk assigned
 /// is a squawk owed until the wheels leave.
 async fn ensure_squawk(xp: &XPlaneClient, ctx: &ToolCtx<'_>, voice: &Option<Voice>) {
-    let actual = xp
-        .get_float(crate::datarefs::TRANSPONDER_CODE)
-        .await
-        .ok();
+    let actual = xp.get_float(crate::datarefs::TRANSPONDER_CODE).await.ok();
     let Some(code) = squawk_owed(crate::party_line::assigned_squawk(), actual) else {
         return;
     };
@@ -300,7 +298,10 @@ async fn ensure_squawk(xp: &XPlaneClient, ctx: &ToolCtx<'_>, voice: &Option<Voic
         .execute(&json!({ "code": code }), ctx)
         .await
         .is_ok();
-    event("squawk_set", json!({ "code": code, "ok": ok, "was": actual }));
+    event(
+        "squawk_set",
+        json!({ "code": code, "ok": ok, "was": actual }),
+    );
     if ok {
         announce(
             voice,
@@ -333,7 +334,8 @@ const INBOUND_SWAP_WAIT_SECS: f64 = 45.0;
 /// Between the handoff readback and the retune: the readback has to be off
 /// the air on the frequency it was given on before the radio leaves it.
 const HANDOFF_READBACK_SECS: u64 = 4;
-/// Clear of the pattern: the landing lights go off passing this height.
+/// Clear of the pattern: the landing AND taxi lights go off passing this
+/// height (the taxi light was lit for the taxi and nothing else puts it out).
 const LANDING_LIGHTS_OFF_AGL_FT: f64 = 1000.0;
 
 /// The enroute wait, working the radio. The tower's after-takeoff handoff
@@ -345,13 +347,15 @@ const LANDING_LIGHTS_OFF_AGL_FT: f64 = 1000.0;
 /// on abort or the four-hour ceiling.
 async fn wait_enroute_working_the_radio(
     xp: &XPlaneClient,
+    ctx: &ToolCtx<'_>,
+    voice: &Option<Voice>,
     callsign: &Option<String>,
     climb_to_ft: f64,
 ) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     let deadline = Instant::now() + Duration::from_secs_f64(4.0 * 3600.0);
-    // Landing lights off once clear of the pattern: one read per pass until
-    // the height is made, then never again this leg.
+    // Landing and taxi lights off once clear of the pattern: one read per
+    // pass until the height is made, then never again this leg.
     let mut landing_off = false;
     loop {
         if ABORT.load(SeqCst) {
@@ -367,8 +371,11 @@ async fn wait_enroute_working_the_radio(
             let agl_ft = xp.get_float(AGL_M).await.unwrap_or(0.0) * M_TO_FT;
             if agl_ft >= LANDING_LIGHTS_OFF_AGL_FT {
                 landing_off = true;
-                let did = crate::tools::lights::landing(xp, false).await;
-                event("lights_climb", json!({ "landing_off": did, "agl_ft": agl_ft.round() }));
+                let did = crate::tools::lights::after_climb(xp).await;
+                event(
+                    "lights_climb",
+                    json!({ "off": did, "agl_ft": agl_ft.round() }),
+                );
             }
         }
         if let Some((to, khz)) = crate::party_line::take_departure_handoff() {
@@ -378,11 +385,74 @@ async fn wait_enroute_working_the_radio(
             ));
             tokio::time::sleep(Duration::from_secs(HANDOFF_READBACK_SECS)).await;
             let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
-            let alt_ft = xp.get_float(ELEV_M).await.unwrap_or(0.0) * M_TO_FT;
+            let alt_ft = xp.get_float(ALT_IND_FT).await.unwrap_or(0.0);
             crate::circuit::transmit(departure_check_in(callsign, &to, alt_ft, climb_to_ft));
-            event("departure_checkin", json!({ "to": to, "khz": khz, "alt_ft": alt_ft.round() }));
+            event(
+                "departure_checkin",
+                json!({ "to": to, "khz": khz, "alt_ft": alt_ft.round() }),
+            );
+        }
+        if let Some(h) = crate::party_line::take_region_handoff() {
+            obey_region_handoff(xp, ctx, voice, callsign, h, true).await;
         }
         tokio::time::sleep(Duration::from_millis(2000)).await;
+    }
+}
+
+/// The crew's readback of the enroute handoff, on the frequency it came on:
+/// "squawking seven thousand, Malaga Tower on one one eight decimal one".
+/// Shaped as a READBACK (the tower FSM's `is_readback` words) so the
+/// controller who gave it answers with silence, never "say again".
+pub fn region_readback(callsign: &Option<String>, h: &crate::party_line::RegionHandoff) -> String {
+    let lead = if h.squawk_vfr {
+        "squawking seven thousand"
+    } else {
+        "roger"
+    };
+    crate::circuit::radio_call(
+        callsign,
+        &format!("{lead}, {} on {}", h.to, crate::atis::spoken_mhz(h.khz)),
+    )
+}
+
+/// Obey "radar services terminated, squawk seven thousand, contact X Tower on
+/// Y": read it back on the old frequency (when `readback`: the arrival stage
+/// has already tuned the destination, and a readback there would land on the
+/// NEW tower as a garbled call), give the discrete code back, retune COM1.
+/// The spoken line had no crew consumer until 2026-09-14: the flight kept the
+/// departure code and the old frequency until its own arrival stage.
+async fn obey_region_handoff(
+    xp: &XPlaneClient,
+    ctx: &ToolCtx<'_>,
+    voice: &Option<Voice>,
+    callsign: &Option<String>,
+    h: crate::party_line::RegionHandoff,
+    readback: bool,
+) {
+    if readback {
+        crate::circuit::transmit(region_readback(callsign, &h));
+        tokio::time::sleep(Duration::from_secs(HANDOFF_READBACK_SECS)).await;
+    }
+    let squawk_ok = if h.squawk_vfr {
+        Some(
+            crate::tools::radio::SetTransponder
+                .execute(&json!({ "code": 7000 }), ctx)
+                .await
+                .is_ok(),
+        )
+    } else {
+        None
+    };
+    let tuned = xp.set_float(COM1_FREQ_KHZ, h.khz as f64).await.is_ok();
+    event(
+        "region_handoff",
+        json!({
+            "to": h.to, "khz": h.khz, "squawk_vfr": h.squawk_vfr,
+            "squawk_set": squawk_ok, "tuned": tuned, "readback": readback,
+        }),
+    );
+    if squawk_ok == Some(true) {
+        announce(voice, Priority::Advisory, "Seven thousand set.");
     }
 }
 
@@ -392,14 +462,25 @@ async fn wait_enroute_working_the_radio(
 /// it as a check-in (a readback with "passing"/"climbing") and answers "radar
 /// contact". With no planned altitude the climb clause is left off rather
 /// than invented.
-pub fn departure_check_in(callsign: &Option<String>, to: &str, alt_ft: f64, climb_to_ft: f64) -> String {
-    let who = callsign.as_ref().map(|c| format!("{c}, ")).unwrap_or_default();
+pub fn departure_check_in(
+    callsign: &Option<String>,
+    to: &str,
+    alt_ft: f64,
+    climb_to_ft: f64,
+) -> String {
+    let who = callsign
+        .as_ref()
+        .map(|c| format!("{c}, "))
+        .unwrap_or_default();
     let climb = if climb_to_ft > alt_ft + 200.0 {
         format!(" climbing {}", crate::atis::spoken_alt(climb_to_ft))
     } else {
         String::new()
     };
-    format!("{to}, {who}passing {}{climb}", crate::atis::spoken_alt(alt_ft))
+    format!(
+        "{to}, {who}passing {}{climb}",
+        crate::atis::spoken_alt(alt_ft)
+    )
 }
 
 async fn wait_until<F, Fut>(secs: f64, step_ms: u64, mut cond: F) -> bool
@@ -653,21 +734,21 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     // the classic level-bust. Autoland aims at the runway's true elevation so it
     // doesn't depend on this, but a real crew sets it, and everything MSL between
     // here and there reads right once it's set.
-    if let Ok(pa) = xp.get_float(crate::datarefs::QNH_PASCALS).await {
-        if pa > 0.0 {
-            let inhg = pa / PA_PER_INHG;
-            let _ = xp.set_float(BARO_KNOB, inhg).await;
-            let spoken = crate::atis::spoken_digits(&format!("{inhg:.2}").replace('.', ""));
-            announce(
-                &voice,
-                Priority::Advisory,
-                &format!("Altimeter set, {spoken}."),
-            );
-            event(
-                "altimeter_set",
-                json!({ "inhg": (inhg * 100.0).round() / 100.0 }),
-            );
-        }
+    if let Some(sync) =
+        crate::tools::instruments::sync_altimeter(&xp, tools.transition_altitude_ft).await
+    {
+        announce(
+            &voice,
+            Priority::Advisory,
+            &format!(
+                "Altimeter set, {}.",
+                crate::tools::instruments::spoken_setting(sync.now)
+            ),
+        );
+        event(
+            "altimeter_set",
+            json!({ "inhg": (sync.now * 100.0).round() / 100.0, "was": (sync.was * 100.0).round() / 100.0 }),
+        );
     }
 
     // ...and align the DG to the compass, the other half of the same two
@@ -950,7 +1031,10 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             }
             None => ("none".to_string(), false),
         };
-        event("lights_taxi", json!({ "on": taxi_lit, "light": taxi_key, "dark": dark }));
+        event(
+            "lights_taxi",
+            json!({ "on": taxi_lit, "light": taxi_key, "dark": dark }),
+        );
         announce(
             &voice,
             Priority::Advisory,
@@ -1213,7 +1297,9 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
 const LAT: &str = "sim/flightmodel/position/latitude";
 const LON: &str = "sim/flightmodel/position/longitude";
 const AGL_M: &str = "sim/flightmodel/position/y_agl";
-const ELEV_M: &str = "sim/flightmodel/position/elevation";
+/// The altimeter, not true elevation: the check-in's "passing" and the arrival's
+/// platform altitudes are what the controller and the chart mean.
+const ALT_IND_FT: &str = crate::datarefs::ALTITUDE_FT;
 const M_TO_FT: f64 = 3.280_84;
 const MS_TO_KTS: f64 = 1.943_844;
 /// Below this surface wind the arrival picks its runway by geometry (the end
@@ -1314,6 +1400,7 @@ async fn fly_route(
             // unprotected rate stalled the first LEJR climb at 53 knots.
             vy_kts: tools.takeoff.vy_kts,
             cruise_ias_kts: tools.cruise_ias_kts,
+            transition_altitude_ft: Some(tools.transition_altitude_ft),
         },
     );
     // The CLIMB and CRUISE checklists' mixture items, flown rather than read:
@@ -1337,7 +1424,7 @@ async fn fly_route(
         .iter()
         .filter_map(|l| l.alt1_ft)
         .fold(0.0, f64::max);
-    if !wait_enroute_working_the_radio(xp, callsign, climb_to_ft).await {
+    if !wait_enroute_working_the_radio(xp, ctx, voice, callsign, climb_to_ft).await {
         if !ABORT.load(SeqCst) {
             give_up(
                 voice,
@@ -1379,16 +1466,29 @@ async fn fly_route(
         );
         return;
     };
-    let alt_msl_ft = xp.get_float(ELEV_M).await.unwrap_or(0.0) * M_TO_FT;
-    // The surface wind near the field (the aircraft-wind datarefs, same source
-    // ATIS and the tower read) chooses the landing runway — see build_arrival.
-    let wind = match (
+    let alt_msl_ft = xp.get_float(ALT_IND_FT).await.unwrap_or(0.0);
+    // The surface wind AT THE FIELD chooses the landing runway (see
+    // build_arrival): the destination's METAR first, the aircraft-wind
+    // datarefs only without one. The datarefs are the wind HERE, and here is
+    // 30 nm out at 7,000 ft: LEJR-LXGB read a light westerly aloft, set up
+    // the straight-in to 27, and the tower's "negative, runway zero niner,
+    // wind zero niner zero degrees, two one knots" came with the landing
+    // clearance (2026-09-14).
+    let aloft = match (
         xp.get_float(crate::datarefs::WIND_DIR_DEG_TRUE).await,
         xp.get_float(crate::datarefs::WIND_SPEED_MSC).await,
     ) {
         (Ok(dir), Ok(spd_ms)) => Some((dir, spd_ms * MS_TO_KTS)),
         _ => None,
     };
+    let metar =
+        crate::weather::surface_wind(&crate::tools::autoland::xplane_root(), &route.dest_icao);
+    let (wind, wind_source) = arrival_wind(metar, aloft);
+    let wind_detail = json!({
+        "source": wind_source,
+        "dir": wind.map(|(d, _)| d.round()),
+        "kts": wind.map(|(_, k)| k.round()),
+    });
     let built = {
         let (apt_dat, cifp, fixp, navp) = (
             crate::tools::autoland::apt_dat_path(),
@@ -1419,6 +1519,7 @@ async fn fly_route(
     // (17:32Z, 2026-07-24). The region hands the STATION over as we close;
     // with COM1 already on the destination's frequency the handoff finds us
     // listening.
+    let mut inbound_owed: Option<i64> = None;
     if let Some(khz) = built.tower_khz.or_else(crate::party_line::home_tower_khz) {
         let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
         // The call is worth nothing until the station on that frequency IS
@@ -1432,8 +1533,19 @@ async fn fly_route(
             crate::party_line::home_tower_khz() == Some(khz)
         })
         .await;
-        crate::circuit::transmit(crate::circuit::radio_call(callsign, "inbound for landing"));
-        event("inbound_call", json!({ "khz": khz, "station_swapped": swapped }));
+        if swapped {
+            call_inbound(xp, ctx, voice, callsign, khz, true).await;
+        } else {
+            // Not yet the destination's frequency: the call would go into
+            // the void (LEJR-LXGB, 2026-09-14: made 10 minutes before the
+            // swap from Ibn Battouta, the nearest field for most of the
+            // strait, so Gibraltar never heard an inbound and the final
+            // report was its first word from us). Owed at the swap, made
+            // below while the arrival flies; before the final report at the
+            // latest.
+            inbound_owed = Some(khz);
+            event("inbound_deferred", json!({ "khz": khz }));
+        }
     }
     // The wind-chosen end (build_arrival) drives BOTH the published-approach
     // branch and the visual fallback — the visual autoland is forced onto the
@@ -1443,7 +1555,7 @@ async fn fly_route(
         Some(plan) if crate::procedure::approach_flyable_from(&plan, lat, lon, alt_msl_ft) => {
             event(
                 "arrival_procedure",
-                json!({ "name": plan.name, "runway": landing_rwy }),
+                json!({ "name": plan.name, "runway": landing_rwy, "wind": wind_detail }),
             );
             announce(
                 voice,
@@ -1454,7 +1566,10 @@ async fn fly_route(
             crate::procedure::start(config.xplane_base_url.clone(), voice.clone(), plan);
         }
         _ => {
-            event("arrival_autoland", json!({ "runway": landing_rwy }));
+            event(
+                "arrival_autoland",
+                json!({ "runway": landing_rwy, "wind": wind_detail }),
+            );
             announce(
                 voice,
                 Priority::Advisory,
@@ -1478,22 +1593,47 @@ async fn fly_route(
     // the visual). Nothing left to actuate here — the arrival loops own the
     // aircraft — so this watch is the orchestrator's last duty.
     waiting("the arrival to hand to autoland");
-    let called = wait_until(1800.0, 1000, || async {
-        crate::autoland::ACTIVE.load(Relaxed) || !crate::procedure::ACTIVE.load(Relaxed)
-    })
-    .await;
+    let deadline = Instant::now() + Duration::from_secs(1800);
+    let called = loop {
+        if ABORT.load(SeqCst) {
+            break false;
+        }
+        // The deferred inbound call goes out the moment the destination's
+        // station is the one on the frequency.
+        if let Some(khz) = inbound_owed {
+            if crate::party_line::home_tower_khz() == Some(khz) {
+                inbound_owed = None;
+                call_inbound(xp, ctx, voice, callsign, khz, true).await;
+            }
+        }
+        if crate::autoland::ACTIVE.load(Relaxed) || !crate::procedure::ACTIVE.load(Relaxed) {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+    };
     // A procedure→autoland handoff has a brief both-inactive window while the
     // autoland thread spins up; give it a beat before concluding nobody flies.
     if called && !crate::autoland::ACTIVE.load(Relaxed) {
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
     if crate::autoland::ACTIVE.load(Relaxed) && !ABORT.load(SeqCst) {
+        // Never swapped (a field with no region of its own): the inbound
+        // still precedes the final, on whatever tower is listening.
+        if let Some(khz) = inbound_owed.take() {
+            call_inbound(xp, ctx, voice, callsign, khz, false).await;
+        }
         let call = match &landing_rwy {
             Some(rwy) => format!("final runway {}", crate::circuit::spell_runway(rwy)),
             None => "final".to_string(),
         };
         crate::circuit::transmit(crate::circuit::radio_call(callsign, &call));
         event("final_call", json!({ "runway": landing_rwy }));
+        // The tower's answer (the clearance, and any correction of the
+        // runway) is autoland's to read back and obey: it watches the party
+        // line every tick and re-arms itself on the cleared end.
     }
 
     // Gate to gate: once autoland is down and stopped (it goes inactive after
@@ -1628,13 +1768,23 @@ async fn taxi_in_after_landing(
 /// discovered 25 nm out, when the arrival was first built; nothing about it
 /// needed the aircraft to be airborne. `Err` is a refusal: a destination the
 /// airport data doesn't have, or one with no runway, is not a destination.
-pub fn brief_arrival(apt_dat: &str, cifp: &str, fix_path: &str, dest: &str) -> Result<String, String> {
+pub fn brief_arrival(
+    apt_dat: &str,
+    cifp: &str,
+    fix_path: &str,
+    dest: &str,
+) -> Result<String, String> {
     let airport = crate::nav::find_airport(apt_dat, dest)
         .ok()
         .flatten()
-        .ok_or_else(|| format!("I can't find {dest} in the airport data, so I can't plan the arrival."))?;
+        .ok_or_else(|| {
+            format!("I can't find {dest} in the airport data, so I can't plan the arrival.")
+        })?;
     if airport.runways.is_empty() {
-        return Err(format!("{} has no runways in the airport data.", airport.name));
+        return Err(format!(
+            "{} has no runways in the airport data.",
+            airport.name
+        ));
     }
     let (mut published, mut straight_in) = (Vec::new(), Vec::new());
     for r in &airport.runways {
@@ -1658,14 +1808,21 @@ pub fn brief_arrival(apt_dat: &str, cifp: &str, fix_path: &str, dest: &str) -> R
     if !straight_in.is_empty() {
         parts.push(format!(
             "{}a straight-in on {}",
-            if published.is_empty() { format!("{name} has ") } else { "and ".to_string() },
+            if published.is_empty() {
+                format!("{name} has ")
+            } else {
+                "and ".to_string()
+            },
             straight_in.join(" and ")
         ));
     }
     Ok(if parts.is_empty() {
         format!("{name} has no published approach and no straight-in, so I'll land visually. The wind at the time picks the runway.")
     } else {
-        format!("{}. The wind at the time picks the runway.", parts.join(" "))
+        format!(
+            "{}. The wind at the time picks the runway.",
+            parts.join(" ")
+        )
     })
 }
 
@@ -1678,6 +1835,43 @@ struct Arrival {
     /// not a plan came with it (the visual fallback and the final call need it).
     rwy_id: Option<String>,
     tower_khz: Option<i64>,
+}
+
+/// The inbound call to the destination's tower, once its station is the one
+/// on the frequency (`swapped`), or regardless at the last moment before the
+/// final report. The swap IS the region handoff: the frequency is already
+/// ours and the readback would be a garbled call to the NEW tower, but a
+/// discrete code still goes back to seven thousand.
+async fn call_inbound(
+    xp: &XPlaneClient,
+    ctx: &ToolCtx<'_>,
+    voice: &Option<Voice>,
+    callsign: &Option<String>,
+    khz: i64,
+    swapped: bool,
+) {
+    if let Some(h) = crate::party_line::take_region_handoff() {
+        obey_region_handoff(xp, ctx, voice, callsign, h, false).await;
+    }
+    crate::circuit::transmit(crate::circuit::radio_call(callsign, "inbound for landing"));
+    event(
+        "inbound_call",
+        json!({ "khz": khz, "station_swapped": swapped }),
+    );
+}
+
+/// The wind the arrival picks its runway by, and where it came from: the
+/// destination's METAR when there is one, else the aircraft's own wind
+/// datarefs (the winds aloft where we are, the only wind without a report).
+pub fn arrival_wind(
+    metar: Option<(f64, f64)>,
+    aircraft: Option<(f64, f64)>,
+) -> (Option<(f64, f64)>, &'static str) {
+    match (metar, aircraft) {
+        (Some(w), _) => (Some(w), "metar"),
+        (None, Some(w)) => (Some(w), "aircraft"),
+        (None, None) => (None, "none"),
+    }
 }
 
 /// Blocking arrival builder: destination airport + the landing runway, then the
@@ -1901,6 +2095,17 @@ async fn lined_up(xp: &XPlaneClient, tools: &SubTools, _config: &Config) -> bool
 
 #[cfg(test)]
 mod tests {
+    /// LEJR-LXGB, 2026-09-14: the aircraft's wind at 7,000 ft set up 27; the
+    /// field's report said 090 at 21.
+    #[test]
+    fn the_field_report_outranks_the_wind_aloft_for_the_runway_pick() {
+        let metar = Some((90.0, 21.0));
+        let aloft = Some((260.0, 5.0));
+        assert_eq!(super::arrival_wind(metar, aloft), (metar, "metar"));
+        assert_eq!(super::arrival_wind(None, aloft), (aloft, "aircraft"));
+        assert_eq!(super::arrival_wind(None, None), (None, "none"));
+    }
+
     use super::departure_check_in;
 
     // The arrival is briefed at the gate. Gibraltar, as the data has it: no
@@ -1917,8 +2122,16 @@ mod tests {
         f.flush().unwrap();
         let fix = dir.join("earth_fix.dat");
         let mut f = std::fs::File::create(&fix).unwrap();
-        writeln!(f, "36.157361111 -5.240083333 27D05 LXGB LX 5906505 RWY27 D05").unwrap();
-        writeln!(f, "36.104666667 -5.405333333 09D05 LXGB LX 5906505 RWY09 D05").unwrap();
+        writeln!(
+            f,
+            "36.157361111 -5.240083333 27D05 LXGB LX 5906505 RWY27 D05"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "36.104666667 -5.405333333 09D05 LXGB LX 5906505 RWY09 D05"
+        )
+        .unwrap();
         f.flush().unwrap();
         let cifp = dir.join("no-cifp");
         let brief = super::brief_arrival(
@@ -1933,8 +2146,13 @@ mod tests {
             "Gibraltar has a straight-in on two seven. The wind at the time picks the runway."
         );
         // A destination the data doesn't have is a refusal, at the gate.
-        let why = super::brief_arrival(apt.to_str().unwrap(), cifp.to_str().unwrap(), fix.to_str().unwrap(), "ZZZZ")
-            .expect_err("refused");
+        let why = super::brief_arrival(
+            apt.to_str().unwrap(),
+            cifp.to_str().unwrap(),
+            fix.to_str().unwrap(),
+            "ZZZZ",
+        )
+        .expect_err("refused");
         assert!(why.contains("ZZZZ"), "{why}");
     }
 
@@ -1950,10 +2168,45 @@ mod tests {
             "Malaga Departure, November four five X-ray Sierra, passing two thousand climbing four thousand"
         );
         assert!(crate::tower::is_readback(&call), "{call}");
-        assert_eq!(crate::tower::parse_intent(&call), crate::tower::Intent::Unknown, "{call}");
+        assert_eq!(
+            crate::tower::parse_intent(&call),
+            crate::tower::Intent::Unknown,
+            "{call}"
+        );
         // Already at the planned altitude: no invented climb.
         let level = departure_check_in(&None, "Malaga Departure", 3980.0, 4000.0);
         assert_eq!(level, "Malaga Departure, passing four thousand");
+    }
+}
+
+#[cfg(test)]
+mod region_handoff_tests {
+    use super::region_readback;
+    use crate::party_line::RegionHandoff;
+
+    /// The readback carries a readback word the tower FSM recognises, the
+    /// station and the frequency; the squawk only when one was ordered.
+    #[test]
+    fn readback_is_readback_shaped() {
+        let cs = Some("November one seven two Sierra Papa".to_string());
+        let h = RegionHandoff {
+            to: "Malaga Tower".into(),
+            khz: 118_100,
+            squawk_vfr: true,
+        };
+        assert_eq!(
+            region_readback(&cs, &h),
+            "November one seven two Sierra Papa, squawking seven thousand, Malaga Tower on one one eight decimal one"
+        );
+        assert!(crate::tower::is_readback(&region_readback(&cs, &h)));
+        let h = RegionHandoff {
+            squawk_vfr: false,
+            ..h
+        };
+        let line = region_readback(&None, &h);
+        assert_eq!(line, "roger, Malaga Tower on one one eight decimal one");
+        assert!(!line.contains("thousand"));
+        assert!(crate::tower::is_readback(&line));
     }
 }
 

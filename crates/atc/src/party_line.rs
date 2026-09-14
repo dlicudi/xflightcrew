@@ -78,6 +78,28 @@ pub(crate) static LINE_UP_CONDITION: Mutex<Option<bool>> = Mutex::new(None);
 /// that works the radio.
 pub(crate) static DEPARTURE_HANDOFF: Mutex<Option<(String, i64)>> = Mutex::new(None);
 
+/// The enroute handoff the region watch spoke ("radar services terminated,
+/// squawk seven thousand, contact Malaga Tower on ..."): whom to call, on
+/// what, and whether the discrete code goes back to conspicuity. Armed once
+/// when the line goes out; consumed by whoever is flying (full auto reads it
+/// back, dials 7000 and retunes; with the pilot flying the monitor coaches
+/// once). It survives `Station::install` on purpose: the main loop installs
+/// the NEW station on its very next pass, before the crew's loop has polled,
+/// and an install that wiped it would lose every handoff. `uninstall` ends it.
+pub(crate) static REGION_HANDOFF: Mutex<Option<RegionHandoff>> = Mutex::new(None);
+
+/// What the enroute controller told us at the region boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegionHandoff {
+    /// The station to call, as spoken ("Malaga Tower").
+    pub to: String,
+    /// Its frequency in kHz.
+    pub khz: i64,
+    /// "Squawk seven thousand" was ordered: a radar service assigned a
+    /// discrete code that is now void.
+    pub squawk_vfr: bool,
+}
+
 /// The runway the APPROACH controller cleared you toward and handed to the
 /// tower ("cleared visual/ILS approach runway X, contact Tower"). You still
 /// owe the tower a "final" report before you're cleared to LAND — an approach
@@ -116,6 +138,19 @@ pub fn clearance_runway() -> Option<String> {
     lock(&CLEARANCE)
         .as_ref()
         .map(|c| c.runway_ident.clone())
+        .filter(|r| !r.is_empty())
+}
+
+/// The readback the tower is still waiting for, phrased ("Cleared to land
+/// runway 09, November one seven two Sierra Papa."), `None` once it has
+/// been heard. The crew's own approach reads it back when an automation is
+/// flying: the tower's "negative, runway zero niner ... cleared to land"
+/// was neither echoed nor obeyed while autoland flew 27 into a 21 kt
+/// tailwind (LXGB, 2026-09-14).
+pub fn readback_owed() -> Option<String> {
+    lock(&CLEARANCE)
+        .as_ref()
+        .and_then(|c| c.pending_readback.clone())
         .filter(|r| !r.is_empty())
 }
 
@@ -212,6 +247,14 @@ pub fn line_up_condition_clear() -> Option<bool> {
 /// radio reads it back, retunes, and checks in.
 pub fn take_departure_handoff() -> Option<(String, i64)> {
     lock(&DEPARTURE_HANDOFF).take()
+}
+
+/// Consume the enroute handoff the region watch spoke: the tower to call, its
+/// frequency, and whether the transponder goes back to seven thousand. The
+/// crew that works the radio reads it back on the OLD frequency, sets the
+/// code and retunes; a pilot flying by hand gets one nudge if neither moved.
+pub fn take_region_handoff() -> Option<RegionHandoff> {
+    lock(&REGION_HANDOFF).take()
 }
 
 /// The callsign under approach vectors, if a plan is armed.

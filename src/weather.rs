@@ -198,7 +198,13 @@ pub fn parse(line: &str) -> Option<Metar> {
                     None => (rest, None),
                 };
                 if let Some(spd) = num(spd) {
-                    let to_kts = |v: u32| if mps { (v as f64 * 1.943_844).round() as u32 } else { v };
+                    let to_kts = |v: u32| {
+                        if mps {
+                            (v as f64 * 1.943_844).round() as u32
+                        } else {
+                            v
+                        }
+                    };
                     m.wind_dir = if dir == "VRB" { None } else { num(dir) };
                     m.wind_kts = to_kts(spd);
                     m.gust_kts = gust.map(to_kts);
@@ -337,8 +343,36 @@ pub fn staleness(modified: SystemTime, now: SystemTime) -> Option<String> {
     Some(if hours < 48 {
         format!("That report is {hours} hours old, real weather may be off.")
     } else {
-        format!("That report is {} days old, real weather may be off.", hours / 24)
+        format!(
+            "That report is {} days old, real weather may be off.",
+            hours / 24
+        )
     })
+}
+
+/// A report's surface wind as (direction true, knots); `None` when the
+/// direction is variable (no runway to face).
+pub fn wind_of(m: &Metar) -> Option<(f64, f64)> {
+    Some((m.wind_dir? as f64, m.wind_kts as f64))
+}
+
+/// The station's surface wind from the newest METAR on file, or `None`: no
+/// file, no line for the station, a variable wind, or a file older than
+/// [`staleness`] lets pass (real weather off, the sim not refreshing). The
+/// arrival's runway pick reads this before the aircraft's own wind: at 30 nm
+/// and 7,000 ft the aircraft is in the winds aloft, and the tower on the
+/// surface may be working the other end (LXGB 27 into 090 at 21, 2026-09-14).
+pub fn surface_wind(xplane_root: &str, icao: &str) -> Option<(f64, f64)> {
+    let path = latest_file(xplane_root)?;
+    let fresh = std::fs::metadata(&path)
+        .and_then(|md| md.modified())
+        .ok()
+        .is_none_or(|t| staleness(t, SystemTime::now()).is_none());
+    if !fresh {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    wind_of(&parse(line_for(&text, icao)?)?)
 }
 
 /// The whole answer for one station: reads the newest file, parses the line,
@@ -376,6 +410,16 @@ mod tests {
     const FILE: &str = "2026/09/12 12:00\nAGGH 121200Z 20002KT 9999 FEW015 SCT026 26/24 Q1011\nLEMG 121330Z 13010KT 090V160 9999 FEW035 26/18 Q1020 NOSIG\nLXGB 121320Z 10016KT 9999 FEW025 25/19 Q1019 NOSIG\n";
 
     #[test]
+    fn the_surface_wind_is_the_reports_and_variable_is_none() {
+        let m = parse(line_for(FILE, "LXGB").unwrap()).unwrap();
+        assert_eq!(wind_of(&m), Some((100.0, 16.0)));
+        let vrb = parse("LEMG 121330Z VRB03KT 9999 FEW035 26/18 Q1020").unwrap();
+        assert_eq!(wind_of(&vrb), None);
+        let calm = parse("LEMG 121330Z 00000KT 9999 FEW035 26/18 Q1020").unwrap();
+        assert_eq!(wind_of(&calm), Some((0.0, 0.0)));
+    }
+
+    #[test]
     fn the_arrival_station_is_found_and_briefed() {
         let line = line_for(FILE, "lemg").unwrap();
         let m = parse(line).unwrap();
@@ -399,7 +443,10 @@ mod tests {
         assert_eq!(m.gust_kts, Some(25));
         assert_eq!(m.vis_m, Some(3219));
         assert_eq!(m.wx, vec!["light rain", "mist"]);
-        assert_eq!(m.clouds, vec!["broken at 800 feet", "overcast at 1500 feet"]);
+        assert_eq!(
+            m.clouds,
+            vec!["broken at 800 feet", "overcast at 1500 feet"]
+        );
         assert_eq!((m.temp_c, m.dew_c), (Some(-2), Some(-4)));
         assert_eq!(m.qnh_hpa, Some(1013));
         let s = spoken(&m, "Kennedy");

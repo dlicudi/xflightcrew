@@ -21,10 +21,11 @@ use sim::xplane::SimView;
 // one audited page. `pub(crate)` re-export so the world side (this module
 // and its tests) writes them by their bare names; the crew side reads via
 // `party_line`'s accessors, never these statics.
+pub use crate::party_line::RegionHandoff;
 pub(crate) use crate::party_line::{
     ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, LANDING_HANDOFF, LINE_UP_CONDITION,
-    PENDING_GO_AROUND, PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, TAKEOFF_HOLD,
-    TAXI_ROUTE, TAXI_TO_STAND, VECTORS,
+    PENDING_GO_AROUND, PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, REGION_HANDOFF,
+    TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS,
 };
 
 /// Which of the station's frequencies COM1 is tuned to.
@@ -333,6 +334,9 @@ impl Station {
         // The doc on the party line promises this one dies here.
         *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // NOT cleared by install(): the new station is installed on the main
+        // loop's next pass, before the crew has consumed the handoff.
+        *REGION_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *PENDING_TAKEOFF_CLEARANCE
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = false;
@@ -1886,7 +1890,8 @@ pub fn handoff_tick(alt_ft: f64, on_ground: bool) -> Option<String> {
     // as audio: a readback, a retune and a check-in are owed, and until this
     // was published nothing on the crew side could do them — the Malaga
     // departure stayed on tower for thirteen minutes (12:23Z, 2026-09-11).
-    *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = Some((plan.to.clone(), plan.khz));
+    *DEPARTURE_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((plan.to.clone(), plan.khz));
     *guard = None;
     Some(line)
 }
@@ -2230,7 +2235,11 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
         .find(|a| a.apt.name == active_name)
         .map(|a| score(distance(a), &a.apt))
         .unwrap_or_else(|| crate::nav::haversine_nm(lat, lon, a_lat, a_lon));
-    let margin = if on_ground { GROUND_MARGIN_NM } else { SWITCH_MARGIN_NM };
+    let margin = if on_ground {
+        GROUND_MARGIN_NM
+    } else {
+        SWITCH_MARGIN_NM
+    };
     if s_best + margin > s_active {
         return None;
     }
@@ -2272,19 +2281,27 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     } else {
         // A discrete code in effect goes back to conspicuity with the service
         // that assigned it.
-        let squawk = if SQUAWK_WATCH
+        let squawk_vfr = SQUAWK_WATCH
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-        {
+            .is_some();
+        let squawk = if squawk_vfr {
             " Squawk seven thousand."
         } else {
             ""
         };
+        let to = format!("{} Tower", spoken_airport(&best.apt.name));
+        // The instruction as data for the crew that has to obey it: the
+        // spoken line alone had no consumer, so the flight kept the discrete
+        // code and the old frequency until its own arrival stage retuned.
+        *REGION_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = Some(RegionHandoff {
+            to: to.clone(),
+            khz,
+            squawk_vfr,
+        });
         RegionSwitch {
             line: format!(
-                "Radar services terminated.{squawk} Contact {} Tower on {}.",
-                spoken_airport(&best.apt.name),
+                "Radar services terminated.{squawk} Contact {to} on {}.",
                 atis::spoken_mhz(khz)
             ),
             crew: false,
@@ -4938,7 +4955,13 @@ mod tests {
         // garbage feed hands us replacement characters whose byte boundaries
         // sit exactly where the airline-prefix slices used to cut. A bad id
         // must degrade to NATO spelling, never panic the monitor thread.
-        for id in ["A\u{FFFD}12", "B\u{FFFD}306", "\u{FFFD}\u{FFFD}", "é1", "BÉ306"] {
+        for id in [
+            "A\u{FFFD}12",
+            "B\u{FFFD}306",
+            "\u{FFFD}\u{FFFD}",
+            "é1",
+            "BÉ306",
+        ] {
             let spoken = spoken_ghost(id);
             assert!(!spoken.contains('\u{FFFD}'), "{id:?}: {spoken:?}");
             let _ = is_airline(id);
@@ -5040,7 +5063,13 @@ mod tests {
             false,
             None,
         );
-        let r = st.respond("", Service::Tower, tower::Intent::RequestClearance, &ctx, wx);
+        let r = st.respond(
+            "",
+            Service::Tower,
+            tower::Intent::RequestClearance,
+            &ctx,
+            wx,
+        );
         let code = st.assigned_squawk.expect("discrete code issued");
         let spoken = atis::spoken_digits(&code.to_string());
         assert!(r.contains(&spoken), "{r}");
@@ -5068,7 +5097,13 @@ mod tests {
             false,
             None,
         );
-        let r = st.respond("", Service::Tower, tower::Intent::RequestClearance, &ctx, wx);
+        let r = st.respond(
+            "",
+            Service::Tower,
+            tower::Intent::RequestClearance,
+            &ctx,
+            wx,
+        );
         assert!(r.contains("seven zero zero zero"), "{r}");
         assert!(st.assigned_squawk.is_none());
         assert!(SQUAWK_WATCH.lock().unwrap().is_none());
@@ -7070,16 +7105,38 @@ mod tests {
         };
         let mut anc = region_apt("Ted Stevens Anchorage Intl", 61.1678, -150.0429);
         anc.apt.runways = vec![
-            rwy("7R", "25L", 61.1678122, -150.0428651, 61.1678817, -149.9726428),
-            rwy("15", "33", 61.1997218, -150.0145266, 61.1710187, -149.9984751),
+            rwy(
+                "7R",
+                "25L",
+                61.1678122,
+                -150.0428651,
+                61.1678817,
+                -149.9726428,
+            ),
+            rwy(
+                "15",
+                "33",
+                61.1997218,
+                -150.0145266,
+                61.1710187,
+                -149.9984751,
+            ),
         ];
         let mut lhd = region_apt("Lake Hood Strip", 61.1895, -149.9685);
-        lhd.apt.runways = vec![rwy("14", "32", 61.1894983, -149.9684894, 61.1836374, -149.9622678)];
+        lhd.apt.runways = vec![rwy(
+            "14",
+            "32",
+            61.1894983,
+            -149.9684894,
+            61.1836374,
+            -149.9622678,
+        )];
         *REGION.lock().unwrap() = vec![anc, lhd];
         *ACTIVE_FIELD.lock().unwrap() = Some(("Lake Hood Strip".into(), 61.1895, -149.9685));
         *PENDING_STATION.lock().unwrap() = None;
         *LAST_REGION_SWITCH.lock().unwrap() = None;
-        let sw = region_tick(61.19636, -149.9965, true, Instant::now()).expect("ramp is Anchorage's");
+        let sw =
+            region_tick(61.19636, -149.9965, true, Instant::now()).expect("ramp is Anchorage's");
         assert!(sw.crew, "{}", sw.line);
         assert!(sw.line.contains("Ted Stevens Anchorage"), "{}", sw.line);
         // And from Lake Hood's own parallel taxiway (60 m west of 14/32),
@@ -7225,6 +7282,7 @@ mod tests {
             runway_ident: "09".into(),
             pending_readback: None,
         });
+        let _ = crate::party_line::take_region_handoff();
         let sw = region_tick(36.6, -4.6, false, t0).expect("handoff");
         assert!(
             !sw.crew,
@@ -7232,6 +7290,42 @@ mod tests {
         );
         assert!(sw.line.contains("Contact Malaga Tower"), "{}", sw.line);
         assert!(sw.line.contains("one one eight decimal one"), "{}", sw.line);
+        // Tower contact only, no radar service: no code to give back, and
+        // the crew gets the instruction as data, once.
+        assert!(!sw.line.contains("seven thousand"), "{}", sw.line);
+        let h = crate::party_line::take_region_handoff().expect("published for the crew");
+        assert_eq!(
+            h,
+            RegionHandoff {
+                to: "Malaga Tower".into(),
+                khz: 118_100,
+                squawk_vfr: false
+            }
+        );
+        assert!(
+            crate::party_line::take_region_handoff().is_none(),
+            "consumed once"
+        );
+        // Same again with a radar service on record: the discrete code goes
+        // back to conspicuity, spoken AND handed down.
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), 36.15, -5.35));
+        *SQUAWK_WATCH.lock().unwrap() = Some(SquawkWatch {
+            code: 4503,
+            callsign: "November one seven two Sierra Papa".into(),
+            speaker: StationSpeaker::Departure,
+            observed: true,
+            first_seen: None,
+            last_nudge: None,
+            nudges: 0,
+        });
+        let sw = region_tick(36.6, -4.6, false, t0).expect("handoff");
+        assert!(sw.line.contains("Squawk seven thousand"), "{}", sw.line);
+        let h = crate::party_line::take_region_handoff().expect("published for the crew");
+        assert!(h.squawk_vfr, "{h:?}");
+        assert_eq!(h.khz, 118_100);
+        *SQUAWK_WATCH.lock().unwrap() = None;
         *CLEARANCE.lock().unwrap() = None;
         // Ground relocation: parked AT Malaga with Gibraltar still active
         // (the "started at LERL, Gibraltar answered" case) — the CREW notes
@@ -7683,9 +7777,13 @@ mod tests {
         );
         assert!(handoff_tick(1500.0, false).is_none(), "spoken once");
         // The crew gets the instruction as data: whom to call, on what.
-        let (to, khz) = crate::party_line::take_departure_handoff().expect("published for the crew");
+        let (to, khz) =
+            crate::party_line::take_departure_handoff().expect("published for the crew");
         assert_eq!((to.as_str(), khz), ("Gibraltar Departure", 130_400));
-        assert!(crate::party_line::take_departure_handoff().is_none(), "consumed once");
+        assert!(
+            crate::party_line::take_departure_handoff().is_none(),
+            "consumed once"
+        );
 
         // Scene 2: the departure controller. First readback is the check-in
         // and gets radar contact; later readbacks earn silence.
@@ -7910,7 +8008,11 @@ mod tests {
             "a conditional line-up owes the clearance: release watch armed"
         );
         assert!(
-            TAKEOFF_HOLD.lock().unwrap().as_ref().is_some_and(|h| h.behind),
+            TAKEOFF_HOLD
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|h| h.behind),
             "the watch knows the line-up was conditional"
         );
 

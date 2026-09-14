@@ -317,6 +317,7 @@ impl Registry {
                     takeoff_roll_m,
                     takeoff_flap_ratio: profile.flaps.as_ref().and_then(|f| f.takeoff_ratio),
                     cruise_ias_kts: profile.reference.as_ref().and_then(|r| r.cruise_ias_kts),
+                    transition_altitude_ft: profile.transition_altitude_ft,
                     prop: profile.prop.clone(),
                     pace,
                     tail_strike_deg: profile.tail_strike_deg,
@@ -591,7 +592,6 @@ impl Registry {
             .find(|t| t.name() == name)
             .map(|t| t.as_ref())
     }
-
 }
 
 /// ON commands for every charging source in an electrical profile (keys

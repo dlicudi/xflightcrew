@@ -71,6 +71,68 @@ impl Tool for SetBarometer {
 /// altitude (1013.25 hPa).
 const STANDARD_INHG: f64 = 29.92;
 
+/// An altimeter error worth a word or a hand: 0.03 inHg is about 30 ft. The
+/// sim's QNH drifts a hundredth at a time under real weather, so anything
+/// tighter would have the copilot re-touching the knob all flight.
+pub const ALTIMETER_TOLERANCE_INHG: f64 = 0.03;
+
+/// The setting the altimeter SHOULD carry: local QNH below the transition
+/// altitude, standard at or above it. Pure; the one rule behind the spoken
+/// tool, full auto's departure set, the follower's arm and the monitor's
+/// cross-check, so they can never disagree about what "correct" is.
+pub fn correct_setting_inhg(
+    indicated_alt_ft: f64,
+    transition_altitude_ft: f64,
+    qnh_pa: f64,
+) -> f64 {
+    if indicated_alt_ft >= transition_altitude_ft {
+        STANDARD_INHG
+    } else {
+        (qnh_pa / PA_PER_INHG).clamp(28.0, 31.5)
+    }
+}
+
+/// "three zero one zero" for 30.10: the way a setting is read on the air.
+pub fn spoken_setting(inhg: f64) -> String {
+    crate::atis::spoken_digits(&format!("{inhg:.2}").replace('.', ""))
+}
+
+/// What a [`sync_altimeter`] did: the knob before and after.
+#[derive(Debug, Clone, Copy)]
+pub struct AltimeterSync {
+    pub was: f64,
+    pub now: f64,
+}
+
+impl AltimeterSync {
+    /// The knob actually moved (by more than the tolerance).
+    pub fn changed(&self) -> bool {
+        (self.now - self.was).abs() >= ALTIMETER_TOLERANCE_INHG
+    }
+}
+
+/// Set the altimeter to the correct setting for where the aircraft is now.
+/// `None` when the sim gave no pressure (nothing written). Read back from the
+/// knob, so `now` is what the pilot sees, not what was asked.
+pub async fn sync_altimeter(
+    xp: &crate::xplane::XPlaneClient,
+    transition_altitude_ft: f64,
+) -> Option<AltimeterSync> {
+    let pa = xp.get_float(crate::datarefs::QNH_PASCALS).await.ok()?;
+    if pa <= 0.0 {
+        return None;
+    }
+    let alt = xp
+        .get_float(crate::datarefs::ALTITUDE_FT)
+        .await
+        .unwrap_or(0.0);
+    let was = xp.get_float(BARO).await.unwrap_or(0.0);
+    let want = correct_setting_inhg(alt, transition_altitude_ft, pa);
+    xp.set_float(BARO, want).await.ok()?;
+    let now = xp.get_float(BARO).await.unwrap_or(want);
+    Some(AltimeterSync { was, now })
+}
+
 pub struct SetAltimeterCurrent {
     /// Transition altitude (ft MSL): at or above it the "correct" setting is
     /// standard pressure, not local QNH.
@@ -109,19 +171,17 @@ impl Tool for SetAltimeterCurrent {
             .get_float(crate::datarefs::ALTITUDE_FT)
             .await
             .unwrap_or(0.0);
+        let pa = ctx.xplane.get_float(crate::datarefs::QNH_PASCALS).await?;
+        let inhg = correct_setting_inhg(alt, self.transition_altitude_ft, pa);
+        ctx.xplane.set_float(BARO, inhg).await?;
+        let actual = ctx.xplane.get_float(BARO).await?;
         if alt >= self.transition_altitude_ft {
-            ctx.xplane.set_float(BARO, STANDARD_INHG).await?;
-            let actual = ctx.xplane.get_float(BARO).await?;
             let fl = (self.transition_altitude_ft / 100.0).round() as i64;
             return Ok(format!(
                 "Roger, above the transition altitude — altimeter standard, {actual:.2}. \
                  (Local QNH below flight level {fl}.)"
             ));
         }
-        let pa = ctx.xplane.get_float(crate::datarefs::QNH_PASCALS).await?;
-        let inhg = (pa / PA_PER_INHG).clamp(28.0, 31.5);
-        ctx.xplane.set_float(BARO, inhg).await?;
-        let actual = ctx.xplane.get_float(BARO).await?;
         Ok(format!("Roger, altimeter set to the local {actual:.2}."))
     }
 }
@@ -239,5 +299,41 @@ impl Tool for AlignGyro {
                 drift.abs()
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn correct_setting_is_qnh_below_and_standard_above_transition() {
+        // 101,946 Pa is the LINTO QNH of 2026-09-14: 30.10, not the 30.15 flown.
+        let q = correct_setting_inhg(7_000.0, 18_000.0, 101_946.0);
+        assert!((q - 30.10).abs() < 0.005, "{q}");
+        assert_eq!(correct_setting_inhg(18_000.0, 18_000.0, 101_946.0), 29.92);
+        assert_eq!(correct_setting_inhg(25_000.0, 6_000.0, 98_000.0), 29.92);
+        // A silly pressure is clamped, never written raw.
+        assert_eq!(correct_setting_inhg(0.0, 18_000.0, 0.0), 28.0);
+    }
+
+    #[test]
+    fn a_setting_is_spoken_digit_by_digit() {
+        assert_eq!(spoken_setting(30.10), "three zero one zero");
+        assert_eq!(spoken_setting(29.92), "two niner niner two");
+    }
+
+    #[test]
+    fn a_sync_within_tolerance_did_not_change_anything() {
+        assert!(!AltimeterSync {
+            was: 30.15,
+            now: 30.16
+        }
+        .changed());
+        assert!(AltimeterSync {
+            was: 30.15,
+            now: 30.10
+        }
+        .changed());
     }
 }

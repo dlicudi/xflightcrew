@@ -242,6 +242,7 @@ fn build_plan(
                 end: EndAction::Level,
                 vy_kts,
                 cruise_ias_kts: None, // a SID/approach manages its own speed
+                transition_altitude_ft: None,
             },
             ack,
         ));

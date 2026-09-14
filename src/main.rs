@@ -233,8 +233,7 @@ async fn main() -> Result<()> {
         let path = std::env::args()
             .nth(2)
             .unwrap_or_else(|| "logs/blackbox.jsonl".to_string());
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow!("reading {path}: {e}"))?;
+        let text = std::fs::read_to_string(&path).map_err(|e| anyhow!("reading {path}: {e}"))?;
         print!("{}", debrief::report(text.lines()));
         return Ok(());
     }
@@ -816,7 +815,10 @@ fn take_typed(http: &reqwest::blocking::Client, rest: &str, id: i64) -> Option<S
         return None;
     }
     let nul = base64::engine::general_purpose::STANDARD.encode([0u8]);
-    let _ = http.patch(&url).json(&serde_json::json!({ "data": nul })).send();
+    let _ = http
+        .patch(&url)
+        .json(&serde_json::json!({ "data": nul }))
+        .send();
     Some(text)
 }
 
@@ -1543,7 +1545,10 @@ async fn run_session(
                 );
             } else if applied_mode == mode::Mode::Instructor && now_mode != mode::Mode::Instructor {
                 if instructor::abandon("mode_change") {
-                    voice.alert(Priority::Advisory, "Lesson over, the mode changed.".to_string());
+                    voice.alert(
+                        Priority::Advisory,
+                        "Lesson over, the mode changed.".to_string(),
+                    );
                 }
                 if now_mode != mode::Mode::AtcOnly {
                     voice.alert(Priority::Advisory, "Copilot back with you.".to_string());
@@ -2270,7 +2275,12 @@ async fn run_session(
             tracing::info!(path = "checklist-instruct", "command path");
             match flow::find_titled(&checklists, &request) {
                 Ok(idx) => {
-                    if !flow::start(idx, flow::Flavour::Instruct, (*config).clone(), voice.clone()) {
+                    if !flow::start(
+                        idx,
+                        flow::Flavour::Instruct,
+                        (*config).clone(),
+                        voice.clone(),
+                    ) {
                         say(
                             &voice,
                             &reporter,
@@ -2283,7 +2293,10 @@ async fn run_session(
                     let msg = if choices.is_empty() {
                         "I have no checklists for this aircraft.".to_string()
                     } else {
-                        format!("Which checklist? I have: {}.", choices.join(", ").to_lowercase())
+                        format!(
+                            "Which checklist? I have: {}.",
+                            choices.join(", ").to_lowercase()
+                        )
                     };
                     say(&voice, &reporter, ui::LogKind::Readback, &msg);
                 }
@@ -2433,7 +2446,7 @@ async fn run_session(
             // something asks. Prime it (cached, cheap) so "will we have enough
             // fuel" projects instead of just reading the tanks.
             if !config.simbrief_id.trim().is_empty() {
-                let _ = ensure_plan(&config, &mut fp_cache, false).await;
+                let _ = ensure_plan(&config, &mut fp_cache, PlanFetch::Cached).await;
             }
             let line =
                 fuel_report(&xplane, &profile, Some(&live), is_endurance_query(&command)).await;
@@ -2903,13 +2916,17 @@ async fn run_session(
             // answer (seen live 45 nm out of Malaga, 2026-09-12). The real-weather
             // METAR file is the honest source; without one, say so.
             if !is_reminder && weather_words(&tl) {
-                if let Some(target) = remote_weather_target(&tl, fp_cache.as_ref().map(|(_, fp)| fp)) {
+                if let Some(target) =
+                    remote_weather_target(&tl, fp_cache.as_ref().map(|(_, fp)| fp))
+                {
                     let line = match target {
                         RemoteWeather::NoPlan => {
-                            "No flight plan loaded, so I have no destination to look up.".to_string()
+                            "No flight plan loaded, so I have no destination to look up."
+                                .to_string()
                         }
                         RemoteWeather::Station { icao, label } => {
-                            match weather::briefing(&tools::autoland::xplane_root(), &icao, &label) {
+                            match weather::briefing(&tools::autoland::xplane_root(), &icao, &label)
+                            {
                                 Ok(l) | Err(l) => l,
                             }
                         }
@@ -2954,7 +2971,7 @@ async fn run_session(
                     || tl.contains("how high"))
             {
                 if !config.simbrief_id.trim().is_empty() {
-                    let _ = ensure_plan(&config, &mut fp_cache, false).await;
+                    let _ = ensure_plan(&config, &mut fp_cache, PlanFetch::Cached).await;
                 }
                 let dest = monitor::DESTINATION
                     .lock()
@@ -3083,9 +3100,25 @@ async fn run_session(
                     || tl.contains("flight"));
             if wants_load {
                 reporter.status(ui::Phase::Thinking);
-                let refresh =
-                    tl.contains("refresh") || tl.contains("reload") || tl.contains("update");
-                let line = load_route_to_fms(&config, &xplane, &mut fp_cache, refresh).await;
+                let line =
+                    load_route_to_fms(&config, &xplane, &mut fp_cache, plan_fetch_for(&tl)).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
+            // "That's the wrong flight plan": the pilot has regenerated it on
+            // SimBrief; fetch again and say whether anything actually changed
+            // (whisper: "wrong flag plan", live 2026-09-14).
+            if wrong_plan_complaint(&tl) {
+                reporter.status(ui::Phase::Thinking);
+                let before = fp_cache.as_ref().map(|(_, fp)| fp.clone());
+                let line = match ensure_plan(&config, &mut fp_cache, PlanFetch::Forced).await {
+                    Err(msg) => msg,
+                    Ok(fetched) => plan_change_line(
+                        before.as_ref(),
+                        fp_cache.as_ref().map(|(_, fp)| fp),
+                        fetched,
+                    ),
+                };
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
@@ -3109,11 +3142,15 @@ async fn run_session(
                         && (tl.contains("our") || tl.contains("the") || tl.contains("what"))));
             if is_plan {
                 reporter.status(ui::Phase::Thinking);
-                let refresh =
-                    tl.contains("refresh") || tl.contains("reload") || tl.contains("update");
                 let want_route = routeish;
-                let line =
-                    flight_plan_report(&config, &xplane, &mut fp_cache, refresh, want_route).await;
+                let line = flight_plan_report(
+                    &config,
+                    &xplane,
+                    &mut fp_cache,
+                    plan_fetch_for(&tl),
+                    want_route,
+                )
+                .await;
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
                 continue;
             }
@@ -3312,8 +3349,8 @@ async fn run_session(
                     }
                     break;
                 }
-                let line = instructor::take_target(&call.name, &call.arguments)
-                    .unwrap_or_else(|| {
+                let line =
+                    instructor::take_target(&call.name, &call.arguments).unwrap_or_else(|| {
                         let label = callout_label(&call.name, &call.arguments);
                         instructor::refusal(&label, !instructor_noted)
                     });
@@ -3860,9 +3897,14 @@ fn known_profile(icao: &str) -> Option<String> {
 /// The names a profile relies on that the running sim does not have: two
 /// index fetches (every dataref, every command), one membership test each.
 async fn missing_profile_names(xp: &XPlaneClient, names: &[String]) -> Result<Vec<String>> {
-    let datarefs: std::collections::HashSet<String> =
-        xp.dataref_index().await?.into_iter().map(|(n, _)| n).collect();
-    let commands: std::collections::HashSet<String> = xp.command_index().await?.into_iter().collect();
+    let datarefs: std::collections::HashSet<String> = xp
+        .dataref_index()
+        .await?
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let commands: std::collections::HashSet<String> =
+        xp.command_index().await?.into_iter().collect();
     Ok(aircraft::missing_references(names, &datarefs, &commands))
 }
 
@@ -4695,9 +4737,19 @@ fn progress_line(wp: &str, dist: Option<f64>, tmin: Option<f64>) -> String {
 
 /// Does the utterance ask about weather at all (the lot, or one element)?
 fn weather_words(t: &str) -> bool {
-    ["weather", "metar", "conditions", "wind", "visibility", "cloud", "ceiling", "qnh", "altimeter"]
-        .iter()
-        .any(|w| t.contains(w))
+    [
+        "weather",
+        "metar",
+        "conditions",
+        "wind",
+        "visibility",
+        "cloud",
+        "ceiling",
+        "qnh",
+        "altimeter",
+    ]
+    .iter()
+    .any(|w| t.contains(w))
 }
 
 /// Where a weather question points when it is not "here".
@@ -4705,7 +4757,10 @@ fn weather_words(t: &str) -> bool {
 enum RemoteWeather {
     /// The question named the destination but no plan is loaded.
     NoPlan,
-    Station { icao: String, label: String },
+    Station {
+        icao: String,
+        label: String,
+    },
 }
 
 /// Resolve a weather question to a station OTHER than the one we are at:
@@ -4747,8 +4802,19 @@ fn remote_weather_target(t: &str, plan: Option<&simbrief::FlightPlan>) -> Option
                             .and_then(|p| std::fs::read_to_string(p).ok())
                             .is_some_and(|text| weather::has_station(&text, &icao))
                     };
-                    if known || (!["this", "that", "here", "what", "when", "them", "your", "some", "same", "next", "last", "high", "much", "long", "wind", "hold", "will", "also", "just", "them"].contains(&n) && on_file()) {
-                        return Some(RemoteWeather::Station { label: icao.clone(), icao });
+                    if known
+                        || (![
+                            "this", "that", "here", "what", "when", "them", "your", "some", "same",
+                            "next", "last", "high", "much", "long", "wind", "hold", "will", "also",
+                            "just", "them",
+                        ]
+                        .contains(&n)
+                            && on_file())
+                    {
+                        return Some(RemoteWeather::Station {
+                            label: icao.clone(),
+                            icao,
+                        });
                     }
                 }
             }
@@ -4826,7 +4892,10 @@ fn ident_distance(a: &str, b: &str) -> usize {
 /// letter must agree (whisper gets the onset right), and the rest may drift
 /// by up to two edits on a fix of four letters or more. Airports at either
 /// end are excluded: "how far to LEMG" is the destination ETA's job.
-fn match_ident<'a>(token: &str, waypoints: &'a [simbrief::Waypoint]) -> Option<(usize, &'a simbrief::Waypoint)> {
+fn match_ident<'a>(
+    token: &str,
+    waypoints: &'a [simbrief::Waypoint],
+) -> Option<(usize, &'a simbrief::Waypoint)> {
     let tok = token.to_ascii_lowercase();
     if tok.len() < 3 {
         return None;
@@ -4841,7 +4910,13 @@ fn match_ident<'a>(token: &str, waypoints: &'a [simbrief::Waypoint]) -> Option<(
         if id.len() < 3 || id.as_bytes()[0] != tok.as_bytes()[0] {
             continue;
         }
-        let allowed = if id.len() >= 5 { 2 } else if id.len() == 4 { 1 } else { 0 };
+        let allowed = if id.len() >= 5 {
+            2
+        } else if id.len() == 4 {
+            1
+        } else {
+            0
+        };
         let d = ident_distance(&tok, &id);
         if d <= allowed && best.is_none_or(|(bd, _, _)| d < bd) {
             best = Some((d, i, wp));
@@ -4856,15 +4931,30 @@ fn match_ident<'a>(token: &str, waypoints: &'a [simbrief::Waypoint]) -> Option<(
 /// a fix-like word in it never answers.
 fn fix_query(t: &str, waypoints: &[simbrief::Waypoint]) -> Option<FixQuery> {
     const PREPS: &[&str] = &[
-        "to", "for", "at", "after", "past", "beyond", "following", "reach", "till", "until", "before",
+        "to",
+        "for",
+        "at",
+        "after",
+        "past",
+        "beyond",
+        "following",
+        "reach",
+        "till",
+        "until",
+        "before",
     ];
     // The question has to be ABOUT a fix: a range cue, an "after" word, or
     // the word waypoint/fix. Without one, "set heading to 270" and friends
     // never get their object matched against the plan.
-    let range_cue = ["how far", "how long", "how much", "when", "eta", "time", "distance", "miles", "minutes", "till", "until", "reach"]
+    let range_cue = [
+        "how far", "how long", "how much", "when", "eta", "time", "distance", "miles", "minutes",
+        "till", "until", "reach",
+    ]
+    .iter()
+    .any(|c| t.contains(c));
+    let after_word = ["after", "past", "beyond", "following"]
         .iter()
-        .any(|c| t.contains(c));
-    let after_word = ["after", "past", "beyond", "following"].iter().any(|w| t.contains(w));
+        .any(|w| t.contains(w));
     if !(range_cue || after_word || t.contains("waypoint") || t.contains("fix")) {
         return None;
     }
@@ -4939,11 +5029,20 @@ async fn fix_answer(q: &FixQuery, xp: &XPlaneClient) -> String {
     };
     if q.after {
         return match &q.next {
-            Some(n) => format!("After {} comes {n}. {} is {position_word}, {dist:.0} miles{time}.", q.ident, q.ident),
-            None => format!("{} is the last fix before the destination, {dist:.0} miles{time}.", q.ident),
+            Some(n) => format!(
+                "After {} comes {n}. {} is {position_word}, {dist:.0} miles{time}.",
+                q.ident, q.ident
+            ),
+            None => format!(
+                "{} is the last fix before the destination, {dist:.0} miles{time}.",
+                q.ident
+            ),
         };
     }
-    format!("{}, {dist:.0} miles{time}. That's {position_word}.", q.ident)
+    format!(
+        "{}, {dist:.0} miles{time}. That's {position_word}.",
+        q.ident
+    )
 }
 
 /// A 3-degree descent loses ~1000 ft every 3 nm; Stratos (and most pilots) use a
@@ -4951,8 +5050,11 @@ async fn fix_answer(q: &FixQuery, xp: &XPlaneClient) -> String {
 /// neither the FMS nor the SimBrief navlog gives a top-of-descent directly.
 pub(crate) const TOD_NM_PER_1000FT: f64 = 3.5;
 
-/// Time and distance to the top of descent ("how long before TOD"), with three
+/// Time and distance to the top of descent ("how long before TOD"), with
 /// fallbacks so it works whether or not the box has VNAV:
+///   0. the procedure follower's OWN point while one flies (the number its
+///      hands use; the ring below said "start down" three minutes early on
+///      the LEJR-LXGB straight-in, 2026-09-14);
 ///   1. the FMS's own computed TOD distance (when the avionics publish one);
 ///   2. SimBrief's planned TOD ring (`tod_to_dest_nm`) measured back from the
 ///      destination, which most GA boxes never compute themselves;
@@ -4963,13 +5065,27 @@ async fn time_to_tod(
     cache: &mut Option<(Instant, simbrief::FlightPlan)>,
 ) -> String {
     const TOD_DIST: &str = "sim/cockpit2/radios/indicators/fms_distance_to_tod_pilot";
+    // 0. The follower's own point, to its own altitude.
+    if let Some(p) = procedure::planned_tod() {
+        let alt = auto_status::commas((p.target_ft / 100.0).round() as i64 * 100);
+        if p.started {
+            return format!("We're already descending, down to {alt} feet at {}.", p.fix);
+        }
+        if p.to_tod_nm <= 0.0 {
+            return format!("We're at top of descent, starting down to {alt} feet.");
+        }
+        return format!(
+            "{} Then down to {alt} feet.",
+            tod_phrase(p.to_tod_nm, xp).await
+        );
+    }
     // 1. The avionics' own VNAV TOD, if it computes one.
     let fms = xp.get_float(TOD_DIST).await.unwrap_or(0.0);
     if fms > 0.0 {
         return tod_phrase(fms, xp).await;
     }
     // 2/3. Derive it from the flight plan: the SimBrief TOD ring, else the formula.
-    if let Err(msg) = ensure_plan(config, cache, false).await {
+    if let Err(msg) = ensure_plan(config, cache, PlanFetch::Cached).await {
         return msg;
     }
     let Some((_, fp)) = cache.as_ref() else {
@@ -5025,7 +5141,7 @@ async fn eta_to_destination(
     xp: &XPlaneClient,
     cache: &mut Option<(Instant, simbrief::FlightPlan)>,
 ) -> String {
-    if let Err(msg) = ensure_plan(config, cache, false).await {
+    if let Err(msg) = ensure_plan(config, cache, PlanFetch::Cached).await {
         return msg;
     }
     let Some((_, fp)) = cache.as_ref() else {
@@ -5119,7 +5235,7 @@ async fn runway_advice(
     xp: &XPlaneClient,
     cache: &mut Option<(Instant, simbrief::FlightPlan)>,
 ) -> String {
-    if let Err(msg) = ensure_plan(config, cache, false).await {
+    if let Err(msg) = ensure_plan(config, cache, PlanFetch::Cached).await {
         return msg;
     }
     let Some((_, fp)) = cache.as_ref() else {
@@ -5410,23 +5526,46 @@ async fn power_loss_diagnosis(xp: &XPlaneClient, profile: &aircraft::AircraftPro
     format!("{line}.")
 }
 
-/// How long a fetched SimBrief plan is reused before re-fetching (it doesn't
-/// change mid-flight). "refresh"/"reload" forces a re-fetch.
+/// How long a fetched SimBrief plan is reused by the IMPLICIT consumers (the
+/// fuel projection, TOD, ETA, the destination weather) before re-fetching.
+/// A spoken ask for the plan never waits on it (`PlanFetch::Asked`).
 const FLIGHT_PLAN_TTL: Duration = Duration::from_secs(600);
 
-/// Make sure `cache` holds a usable plan: reuse it unless stale or `refresh`, and
-/// on a failed re-fetch keep the cached one. `Err` carries a spoken message.
+/// Who is asking for the plan decides whether SimBrief is consulted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlanFetch {
+    /// A side consumer (fuel, TOD, ETA): the shelf plan within its TTL.
+    Cached,
+    /// The pilot asked for the plan by name ("load / what's the flight
+    /// plan"): a SimBrief plan is re-fetched EVERY time, because the pilot
+    /// regenerates it on the website and the words are the same ("load the
+    /// flight plan" x4 in two minutes, LEMG-LEJR loaded four times from the
+    /// shelf after "that's the wrong plan", 2026-09-14). A local plan stays:
+    /// it is the pilot's own decision and "load it" must not swap it out.
+    Asked,
+    /// "refresh / reload / update": re-fetch even over a local plan.
+    Forced,
+}
+
+/// Make sure `cache` holds a usable plan per `fetch`, keeping the cached one
+/// when a re-fetch fails. `Ok(true)` = a fresh fetch replaced the shelf;
+/// `Err` carries a spoken message.
 async fn ensure_plan(
     config: &Config,
     cache: &mut Option<(Instant, simbrief::FlightPlan)>,
-    refresh: bool,
-) -> Result<(), String> {
+    fetch: PlanFetch,
+) -> Result<bool, String> {
     // A local plan (the direct-to planner) is the pilot's own decision: it
-    // never expires into a SimBrief refetch, and needs no SimBrief ID. An
-    // explicit refresh may swap it for SimBrief when that fetch succeeds.
+    // never expires into a SimBrief refetch, and needs no SimBrief ID. Only
+    // an explicit refresh may swap it for SimBrief when that fetch succeeds.
     let local = cache
         .as_ref()
         .is_some_and(|(_, fp)| fp.source == simbrief::PlanSource::Local);
+    let refresh = match fetch {
+        PlanFetch::Cached => false,
+        PlanFetch::Asked => !local,
+        PlanFetch::Forced => true,
+    };
     if config.simbrief_id.trim().is_empty() && !local {
         return Err(
             "No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can pull your flight plan, \
@@ -5438,9 +5577,13 @@ async fn ensure_plan(
         .as_ref()
         .is_some_and(|(t, _)| t.elapsed() < FLIGHT_PLAN_TTL)
         || (local && !refresh);
+    let mut fetched = false;
     if (refresh || !fresh) && !config.simbrief_id.trim().is_empty() {
         match simbrief::fetch(&config.simbrief_id).await {
-            Ok(fp) => *cache = Some((Instant::now(), fp)),
+            Ok(fp) => {
+                *cache = Some((Instant::now(), fp));
+                fetched = true;
+            }
             Err(e) => {
                 tracing::warn!("simbrief fetch failed: {e:#}");
                 if cache.is_none() {
@@ -5507,7 +5650,7 @@ async fn ensure_plan(
             });
         }
     }
-    Ok(())
+    Ok(fetched)
 }
 
 /// How long a bare "divert" / "plan a flight" waits for its "to where?" answer.
@@ -5632,11 +5775,11 @@ async fn plan_flight(
     );
     *cache = Some((Instant::now(), planned.to_flight_plan()));
     // The same seam SimBrief uses to hand the monitor its destination (TOD).
-    let _ = ensure_plan(config, cache, false).await;
+    let _ = ensure_plan(config, cache, PlanFetch::Cached).await;
     let mut line = planned.brief(req.load);
     if req.load {
         line.push(' ');
-        line.push_str(&load_route_to_fms(config, xp, cache, false).await);
+        line.push_str(&load_route_to_fms(config, xp, cache, PlanFetch::Cached).await);
     }
     line
 }
@@ -5647,14 +5790,23 @@ async fn load_route_to_fms(
     config: &Config,
     xp: &XPlaneClient,
     cache: &mut Option<(Instant, simbrief::FlightPlan)>,
-    refresh: bool,
+    fetch: PlanFetch,
 ) -> String {
-    if let Err(msg) = ensure_plan(config, cache, refresh).await {
-        return msg;
-    }
+    let fetched = match ensure_plan(config, cache, fetch).await {
+        Ok(f) => f,
+        Err(msg) => return msg,
+    };
     let Some((_, fp)) = cache.as_ref() else {
         return "Couldn't fetch your SimBrief plan.".to_string();
     };
+    // A load that wanted SimBrief and got the shelf instead says so: the
+    // pilot may have just regenerated the plan the site failed to serve.
+    let stale =
+        if !fetched && fetch != PlanFetch::Cached && fp.source == simbrief::PlanSource::SimBrief {
+            "Couldn't reach SimBrief, using the plan I already had. "
+        } else {
+            ""
+        };
     if fp.waypoints.is_empty() {
         return "No waypoints in the plan to load.".to_string();
     }
@@ -5679,7 +5831,9 @@ async fn load_route_to_fms(
         return "Couldn't reach the plugin to load the route. Is the XVoiceLayer plugin running?"
             .to_string();
     }
-    format!("Loading {n} waypoints into the GPS, {origin} to {dest}. Check the flight plan page.")
+    format!(
+        "{stale}Loading {n} waypoints into the GPS, {origin} to {dest}. Check the flight plan page."
+    )
 }
 
 /// Fetch (or reuse) the SimBrief flight plan and brief it. Deterministic (no LLM);
@@ -5690,10 +5844,10 @@ async fn flight_plan_report(
     config: &Config,
     xp: &XPlaneClient,
     cache: &mut Option<(Instant, simbrief::FlightPlan)>,
-    refresh: bool,
+    fetch: PlanFetch,
     want_route: bool,
 ) -> String {
-    if let Err(msg) = ensure_plan(config, cache, refresh).await {
+    if let Err(msg) = ensure_plan(config, cache, fetch).await {
         return msg;
     }
     let Some((_, fp)) = cache.as_ref() else {
@@ -6046,6 +6200,68 @@ fn with_commas(n: f64) -> String {
     }
 }
 
+/// The fetch policy a spoken plan ask carries: "refresh / reload / update"
+/// forces SimBrief even over a local plan; any other ask re-fetches a
+/// SimBrief plan and keeps a local one.
+fn plan_fetch_for(tl: &str) -> PlanFetch {
+    if tl.contains("refresh") || tl.contains("reload") || tl.contains("update") {
+        PlanFetch::Forced
+    } else {
+        PlanFetch::Asked
+    }
+}
+
+/// "That's the wrong flight plan" / "not that plan": the pilot disowns the
+/// plan on the shelf. Closed shape: a wrongness word AND a plan word
+/// (whisper hears "flag plan", "flight plane", "flight lamp").
+fn wrong_plan_complaint(tl: &str) -> bool {
+    let wrong = tl.contains("wrong") || tl.contains("not that") || tl.contains("not the right");
+    let plan = tl.contains("plan")
+        || tl.contains("flag")
+        || tl.contains("flight")
+        || tl.contains("route")
+        || tl.contains("root");
+    wrong && plan
+}
+
+/// What a forced re-fetch after "wrong plan" found. Compares route identity
+/// (origin, destination, airway string), never the timestamp: a SimBrief
+/// plan re-served unchanged is still the same plan.
+fn plan_change_line(
+    before: Option<&simbrief::FlightPlan>,
+    after: Option<&simbrief::FlightPlan>,
+    fetched: bool,
+) -> String {
+    let Some(after) = after else {
+        return "No plan on the shelf. Generate one on SimBrief, or say plan a flight to, and a \
+                destination."
+            .to_string();
+    };
+    if !fetched {
+        return format!(
+            "Couldn't reach SimBrief. I still have {} to {}.",
+            after.origin, after.destination
+        );
+    }
+    let same = before.is_some_and(|b| {
+        b.origin == after.origin && b.destination == after.destination && b.route == after.route
+    });
+    if same {
+        format!(
+            "SimBrief still has {} to {}. Generate the new plan there, then say load the flight \
+             plan.",
+            after.origin, after.destination
+        )
+    } else {
+        format!(
+            "Got the new plan, {} to {}, {} waypoints. Say load it to send it to the GPS.",
+            after.origin,
+            after.destination,
+            after.waypoints.len()
+        )
+    }
+}
+
 /// True if the utterance is asking about fuel/endurance (a question we answer
 /// deterministically), not commanding the fuel *system* (pump/selector).
 fn is_fuel_query(text: &str) -> bool {
@@ -6267,12 +6483,33 @@ fn battery_low(volts: f64) -> bool {
 
 /// Does a speed question ask for a judgement, not just the number?
 fn speed_assessment_words(t: &str) -> bool {
-    let words: Vec<&str> = t.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let words: Vec<&str> = t
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
     let has = |w: &str| words.contains(&w);
-    let about_speed = has("speed") || has("airspeed") || has("slow") || has("fast") || has("slowly") || has("quick");
-    let judged = has("okay") || has("ok") || has("alright") || has("fine") || has("good") || has("right")
-        || has("normal") || has("safe") || has("enough") || has("too") || has("bit") || has("slow")
-        || has("fast") || has("slowly") || has("comfortable") || has("happy");
+    let about_speed = has("speed")
+        || has("airspeed")
+        || has("slow")
+        || has("fast")
+        || has("slowly")
+        || has("quick");
+    let judged = has("okay")
+        || has("ok")
+        || has("alright")
+        || has("fine")
+        || has("good")
+        || has("right")
+        || has("normal")
+        || has("safe")
+        || has("enough")
+        || has("too")
+        || has("bit")
+        || has("slow")
+        || has("fast")
+        || has("slowly")
+        || has("comfortable")
+        || has("happy");
     about_speed && judged && !t.contains("how fast")
 }
 
@@ -6293,7 +6530,11 @@ struct SpeedContext {
 /// approach reference low and descending or with flap out, cruise IAS
 /// otherwise). `None` when nothing in the profile can judge it, so the
 /// copilot says the number and no more rather than inventing a standard.
-fn speed_verdict(ias: f64, c: &SpeedContext, r: Option<&aircraft::ReferenceProfile>) -> Option<String> {
+fn speed_verdict(
+    ias: f64,
+    c: &SpeedContext,
+    r: Option<&aircraft::ReferenceProfile>,
+) -> Option<String> {
     if c.on_ground {
         return None;
     }
@@ -6449,7 +6690,10 @@ async fn answer_state_query(
         if on_ground.is_ok_and(|g| g > 0.5) {
             parts.push("on the ground".to_string());
         } else if let Ok(a) = alt {
-            parts.push(format!("{} feet", auto_status::commas((a / 10.0).round() as i64 * 10)));
+            parts.push(format!(
+                "{} feet",
+                auto_status::commas((a / 10.0).round() as i64 * 10)
+            ));
         }
         if let Ok(h) = hdg {
             parts.push(format!("heading {:03}", (h.round() as i64).rem_euclid(360)));
@@ -7390,19 +7634,69 @@ fn looks_like_question(text: &str) -> bool {
         return true;
     }
     const OPENERS: &[&str] = &[
-        "what", "what's", "whats", "how", "how's", "hows", "how much", "how many", "how far",
-        "how high", "how fast", "where", "where's", "wheres", "when", "when's", "whens", "which",
-        "why", "why's", "whys", "who", "who's", "whos", "tell me",
+        "what",
+        "what's",
+        "whats",
+        "how",
+        "how's",
+        "hows",
+        "how much",
+        "how many",
+        "how far",
+        "how high",
+        "how fast",
+        "where",
+        "where's",
+        "wheres",
+        "when",
+        "when's",
+        "whens",
+        "which",
+        "why",
+        "why's",
+        "whys",
+        "who",
+        "who's",
+        "whos",
+        "tell me",
         // Generic auxiliaries: no command starts with these, and they must beat the
         // command grammar ("is our heading 270?" answers, never acts).
-        "is", "are", "am", "have", "has",
+        "is",
+        "are",
+        "am",
+        "have",
+        "has",
         // Negated auxiliaries ("aren't we going a bit slow?", "isn't the gear
         // down?"): a question every time, in both the raw and the
         // apostrophe-stripped form the normaliser leaves (missed live 2026-09-12).
-        "isn't", "isnt", "aren't", "arent", "wasn't", "wasnt", "weren't", "werent",
-        "don't", "dont", "doesn't", "doesnt", "didn't", "didnt", "haven't", "havent",
-        "hasn't", "hasnt", "shouldn't", "shouldnt", "couldn't", "couldnt", "wouldn't",
-        "wouldnt", "won't", "wont", "can't", "cant",
+        "isn't",
+        "isnt",
+        "aren't",
+        "arent",
+        "wasn't",
+        "wasnt",
+        "weren't",
+        "werent",
+        "don't",
+        "dont",
+        "doesn't",
+        "doesnt",
+        "didn't",
+        "didnt",
+        "haven't",
+        "havent",
+        "hasn't",
+        "hasnt",
+        "shouldn't",
+        "shouldnt",
+        "couldn't",
+        "couldnt",
+        "wouldn't",
+        "wouldnt",
+        "won't",
+        "wont",
+        "can't",
+        "cant",
     ];
     if OPENERS
         .iter()
@@ -7806,9 +8100,99 @@ fn whisper_model_label(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_confidence, is_affirmative, is_undo, join_and, progress_line,
-        radio_panel_line, undoable_drefs, ConfidenceAction, Ptt,
+        classify_confidence, is_affirmative, is_undo, join_and, plan_change_line, plan_fetch_for,
+        progress_line, radio_panel_line, undoable_drefs, wrong_plan_complaint, ConfidenceAction,
+        PlanFetch, Ptt,
     };
+
+    fn plan(origin: &str, dest: &str, route: &str, n: usize) -> crate::simbrief::FlightPlan {
+        crate::simbrief::FlightPlan {
+            source: crate::simbrief::PlanSource::SimBrief,
+            origin: origin.into(),
+            destination: dest.into(),
+            alternate: String::new(),
+            aircraft: "C172".into(),
+            cruise_alt_ft: 5500.0,
+            distance_nm: 60.0,
+            ete_min: 40.0,
+            block_fuel_gal: 30.0,
+            trip_fuel_gal: 10.0,
+            reserve_gal: 8.0,
+            route: route.into(),
+            wind_comp_kts: 0.0,
+            wind_dir: 0.0,
+            wind_spd_kts: 0.0,
+            tod_to_dest_nm: 0.0,
+            waypoints: (0..n)
+                .map(|i| crate::simbrief::Waypoint {
+                    ident: format!("W{i}"),
+                    lat: 36.0,
+                    lon: -4.0,
+                    alt: 5500.0,
+                })
+                .collect(),
+        }
+    }
+
+    /// Live 2026-09-14: "load the flight plan" four times in two minutes
+    /// after regenerating on SimBrief, each one re-sent LEMG-LEJR from the
+    /// shelf. A spoken ask re-fetches; only a refresh word forces it over a
+    /// local plan.
+    #[test]
+    fn spoken_plan_asks_refetch_simbrief() {
+        for t in [
+            "load the flight plan.",
+            "let's load the flight plan.",
+            "load the flight plane.",
+            "load the flight lamp.",
+            "what's our flight plan",
+        ] {
+            assert_eq!(plan_fetch_for(t), PlanFetch::Asked, "{t}");
+        }
+        for t in [
+            "refresh the flight plan",
+            "reload the plan",
+            "update the flight plan",
+        ] {
+            assert_eq!(plan_fetch_for(t), PlanFetch::Forced, "{t}");
+        }
+    }
+
+    #[test]
+    fn wrong_plan_complaint_is_closed_shape() {
+        // Live whisper output.
+        assert!(wrong_plan_complaint("that's the wrong flag plan."));
+        assert!(wrong_plan_complaint("that's the wrong flight plan"));
+        assert!(wrong_plan_complaint("not that plan"));
+        assert!(wrong_plan_complaint("wrong route"));
+        // A wrongness word without a plan word is not a plan complaint.
+        assert!(!wrong_plan_complaint("wrong, flaps ten"));
+        assert!(!wrong_plan_complaint("that's the wrong runway"));
+        assert!(!wrong_plan_complaint("load the flight plan"));
+    }
+
+    #[test]
+    fn plan_change_line_says_whether_simbrief_moved() {
+        let old = plan("LEMG", "LEJR", "MGA DCT", 9);
+        let same = plan("LEMG", "LEJR", "MGA DCT", 9);
+        let new = plan("LEJR", "LEMG", "JRZ DCT", 6);
+        assert_eq!(
+            plan_change_line(Some(&old), Some(&same), true),
+            "SimBrief still has LEMG to LEJR. Generate the new plan there, then say load the \
+             flight plan."
+        );
+        assert_eq!(
+            plan_change_line(Some(&old), Some(&new), true),
+            "Got the new plan, LEJR to LEMG, 6 waypoints. Say load it to send it to the GPS."
+        );
+        // Nothing on the shelf before: whatever came is new.
+        assert!(plan_change_line(None, Some(&new), true).starts_with("Got the new plan"));
+        assert_eq!(
+            plan_change_line(Some(&old), Some(&old), false),
+            "Couldn't reach SimBrief. I still have LEMG to LEJR."
+        );
+        assert!(plan_change_line(None, None, false).starts_with("No plan on the shelf"));
+    }
 
     #[test]
     fn progress_line_names_fix_distance_and_time() {
@@ -7816,7 +8200,10 @@ mod tests {
             progress_line("MG430", Some(2.39), Some(1.43)),
             "Next waypoint MG430, 2 miles, 1 minutes."
         );
-        assert_eq!(progress_line("BUKOX", Some(33.4), None), "Next waypoint BUKOX, 33 miles.");
+        assert_eq!(
+            progress_line("BUKOX", Some(33.4), None),
+            "Next waypoint BUKOX, 33 miles."
+        );
         assert_eq!(
             progress_line("LEMG", Some(130.0), Some(95.0)),
             "Next waypoint LEMG, 130 miles, 1 hours 35 minutes."
@@ -8162,11 +8549,19 @@ mod tests {
     #[test]
     fn the_rv10_has_its_own_profile_and_unknown_types_are_not_the_172() {
         assert_eq!(super::icao_to_profile("RV10"), "vans_rv10");
-        assert_eq!(super::known_profile("ZZZZ"), None, "unknown is unknown, not a Cessna");
+        assert_eq!(
+            super::known_profile("ZZZZ"),
+            None,
+            "unknown is unknown, not a Cessna"
+        );
         assert_eq!(super::generic_profile_id("ZZZZ"), "generic_zzzz");
         let p = super::aircraft::load("vans_rv10").expect("RV-10 profile loads");
         let r = p.reference.as_ref().expect("reference card");
-        assert_eq!(r.approach_kts, Some(80.0), "not the 172's 65, which is the RV-10's clean stall");
+        assert_eq!(
+            r.approach_kts,
+            Some(80.0),
+            "not the 172's 65, which is the RV-10's clean stall"
+        );
         assert_eq!(p.vs_clean_kts, Some(65.0));
         assert_eq!(p.bus_volts_nominal, Some(12.0));
         assert!(!p.retractable_gear && !p.carb_heat && p.magnetos);
@@ -8175,7 +8570,9 @@ mod tests {
         assert_eq!(vfe, vec![None, Some(96.0), Some(87.0)]);
         let sel = p.fuel_selector.as_ref().expect("xlua fuel selector");
         assert!(
-            sel.readback.as_deref().is_some_and(|r| r.contains("laminar/rv10")),
+            sel.readback
+                .as_deref()
+                .is_some_and(|r| r.contains("laminar/rv10")),
             "the stock selector is not the RV-10's"
         );
     }
@@ -9164,15 +9561,30 @@ mod gap_tests_2026_09_12 {
     #[test]
     fn arrival_weather_points_at_the_destination_never_the_air_we_are_in() {
         let fp = plan();
-        let st = |icao: &str| RemoteWeather::Station { icao: icao.into(), label: icao.into() };
+        let st = |icao: &str| RemoteWeather::Station {
+            icao: icao.into(),
+            label: icao.into(),
+        };
         assert_eq!(
             remote_weather_target("what weather can we expect on arrival", Some(&fp)),
             Some(st("LEMG"))
         );
-        assert_eq!(remote_weather_target("whats the wind at the destination", Some(&fp)), Some(st("LEMG")));
-        assert_eq!(remote_weather_target("weather at the alternate", Some(&fp)), Some(st("LEZL")));
-        assert_eq!(remote_weather_target("weather at lxgb", Some(&fp)), Some(st("LXGB")));
-        assert_eq!(remote_weather_target("weather on arrival", None), Some(RemoteWeather::NoPlan));
+        assert_eq!(
+            remote_weather_target("whats the wind at the destination", Some(&fp)),
+            Some(st("LEMG"))
+        );
+        assert_eq!(
+            remote_weather_target("weather at the alternate", Some(&fp)),
+            Some(st("LEZL"))
+        );
+        assert_eq!(
+            remote_weather_target("weather at lxgb", Some(&fp)),
+            Some(st("LXGB"))
+        );
+        assert_eq!(
+            remote_weather_target("weather on arrival", None),
+            Some(RemoteWeather::NoPlan)
+        );
         // Here and now stays with the sim's own weather.
         assert!(remote_weather_target("whats the weather", Some(&fp)).is_none());
         assert!(remote_weather_target("whats the wind here", Some(&fp)).is_none());
@@ -9201,20 +9613,33 @@ mod gap_tests_2026_09_12 {
             speed_verdict(72.0, &c, Some(&r)).as_deref(),
             Some("we're climbing at Vy, 74, that's right.")
         );
-        assert!(speed_verdict(62.0, &c, Some(&r)).unwrap().contains("a touch slow"));
+        assert!(speed_verdict(62.0, &c, Some(&r))
+            .unwrap()
+            .contains("a touch slow"));
         // Below the floor outranks everything, including a governor target.
         c.hold_kts = Some(70.0);
-        assert!(speed_verdict(55.0, &c, Some(&r)).unwrap().contains("below the 58 knot floor"));
-        assert_eq!(speed_verdict(71.0, &c, Some(&r)).as_deref(), Some("I'm holding 70, on target."));
+        assert!(speed_verdict(55.0, &c, Some(&r))
+            .unwrap()
+            .contains("below the 58 knot floor"));
+        assert_eq!(
+            speed_verdict(71.0, &c, Some(&r)).as_deref(),
+            Some("I'm holding 70, on target.")
+        );
         c.hold_kts = None;
         // Cruise.
         c.vvi_fpm = 0.0;
         c.agl_ft = 7000.0;
-        assert!(speed_verdict(90.0, &c, Some(&r)).unwrap().contains("we're slow"));
-        assert!(speed_verdict(108.0, &c, Some(&r)).unwrap().contains("about right"));
+        assert!(speed_verdict(90.0, &c, Some(&r))
+            .unwrap()
+            .contains("we're slow"));
+        assert!(speed_verdict(108.0, &c, Some(&r))
+            .unwrap()
+            .contains("about right"));
         // Approach, flaps out.
         c.flap_ratio = 0.6;
-        assert!(speed_verdict(59.0, &c, Some(&r)).unwrap().contains("Add power"));
+        assert!(speed_verdict(59.0, &c, Some(&r))
+            .unwrap()
+            .contains("Add power"));
         // On the ground, and with no profile, just the number.
         c.on_ground = true;
         assert!(speed_verdict(20.0, &c, Some(&r)).is_none());
@@ -9241,6 +9666,8 @@ mod gap_tests_2026_09_12 {
             assert!(looks_like_question(q), "{q:?}");
         }
         // A polite request is still a command once the normaliser has peeled it.
-        assert!(!looks_like_question(grammar::normalize("Can you fly the flight plan?").trim_end_matches('?')));
+        assert!(!looks_like_question(
+            grammar::normalize("Can you fly the flight plan?").trim_end_matches('?')
+        ));
     }
 }
