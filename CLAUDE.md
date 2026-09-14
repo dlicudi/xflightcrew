@@ -36,12 +36,11 @@ explicit-target lines keep arriving and make it look healthy.
 ## Neighbours
 
 - **Horizon** (`~/GitHub/horizon`): ABANDONED (2026-09-11; it had become a
-  charter logbook, never an instructor). Nothing lives there. A flight
-  instructor, if built, is a third persona HERE, mode-gated like ATC-only so
-  it never actuates: the monitor's callouts, the ATC coach, the checklist
-  flow's Instruct flavour and the automations as demonstrations exist; a
-  blackbox scorer against ACS tolerances, a lesson state machine and
-  narration do not.
+  charter logbook, never an instructor). Nothing lives there. The flight
+  instructor IS the third persona here (2026-09-13, `mode::Instructor`,
+  [src/instructor.rs](src/instructor.rs); see "App modes"): mode-gated so
+  it never actuates, with the ACS scorer, the lesson state machine and the
+  narration Horizon never got.
 - **rustdecks** (`~/GitHub/rustdecks`): sibling Loupedeck controller. When
   hunting a dataref/command name, check its `examples/*.yaml` (and the
   cockpitdecks clones it references) before the sim's DataRefs.txt - names
@@ -300,7 +299,7 @@ Orchestrators compose proven loops; no new flight laws in orchestrators. All
 laws battle-test as plain `cargo test`; everything blackboxes to
 `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autotakeoff`, `pushback`, `checklist`,
 `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`, `cabin`,
-`api_load`). Cross-cutting rules, each learned the hard way (details in
+`instructor`, `api_load`). Cross-cutting rules, each learned the hard way (details in
 history):
 
 - **A stage that is not moving the aircraft is holding it**: brakes set for
@@ -447,6 +446,25 @@ history):
   `mixture_rich_for_landing` whatever the field elevation; the manager
   richens itself when it yields to autoland or a recovery, and stands down
   on every give-up ("your aircraft" means every lever).
+- **The follower's vertical has three owners, in this order**
+  (`procedure::vertical_tick`, pure and tested): the PLAN's constraint, paced
+  to its top of descent against the last COMMANDED altitude (`prev_cmd_alt`)
+  and never against the leg constraint it is about to become - conflating them
+  defeated the deferral after one tick per leg and started the 5,300 ft
+  descent to JRZ 56 nm out, into the Sierra de Grazalema (2026-09-13); then
+  the PILOT's altitude, HANDED to the follower (`procedure::take_altitude`,
+  from `fly_to` and `level_off`) instead of written to the dial, because a
+  follower that rewrites the dial every tick undoes a spoken override in
+  500 ms and the capture watcher then retires itself - sticky by design, no
+  self-expiry; then the GROUND AHEAD, which outranks both. Nothing the
+  follower commands goes below the highest terrain on the track
+  (`terrain_floor_ahead_ft`: 16 probe points, 15 nm or to the fix, every 10 s,
+  plus 1,000 ft; skipped on an approach, whose platform altitudes own the
+  descent; disabled for the flight after one unanswered probe). A plan's
+  altitude is only as good as the ground under it, whoever handed it down.
+  An autopilot target is judged against that SAME floor, not just the ground
+  under the wheels: a climb still into it is RAISED to the floor and said
+  aloud, a descent below it refused with the number that works.
 - **Autoland**: pursuit aim keeps its full lead all the way in
   (`pursuit_aim_nm` - the aim walks down the runway, bounded by pavement);
   roundout band (`ROUNDOUT_MULT`/`ROUNDOUT_VS_FPM`) before the flare - a
@@ -552,11 +570,66 @@ the checklist" when nothing is flying.
 
 `mode.rs`: **both** (default) / **copilot** (no simulated ATC; radio-keyed
 speech IGNORED - real ATC owns the frequency) / **atc** (the world only, no
-crew). Chosen from the panel Settings tab, persisted;
-`XCOPILOT_MODE` sets only the BOOT value; applies live within ~2 s. The "no
-crew in ATC-only" gate lives in the arbiter's enqueue door (`Voice::alert` and
-friends), not scattered per-site; blocking `say` is mode-routed in the main
-loop so "copilot is off" can speak. The atc crate never reads the mode.
+crew) / **instructor** (the crew with its hands off: persona, callouts, ATC
+coach, checklist read-and-watch and lessons on; every tool refused). Chosen
+from the panel Settings tab, persisted; `XCOPILOT_MODE` sets only the BOOT
+value; applies live within ~2 s. The "no crew in ATC-only" gate lives in
+the arbiter's enqueue door (`Voice::alert` and friends), not scattered
+per-site; blocking `say` is mode-routed in the main loop so "copilot is
+off" can speak. The atc crate never reads the mode. **`mode::crew_actuates()`
+is the hands gate** (false in atc AND instructor): the main loop's tool
+dispatch (one door, before any confirm prompt; the action is named and the
+pilot does it), the monitor's `fix_action`s, `cockpit_auto`, `flow::start`
+(the Crew flavour becomes Instruct there) and undo all check it; entering
+instructor mode runs the airframe-swap stand-down so no loop keeps the
+aircraft, and leaving it abandons the lesson.
+
+Instructor ([src/instructor.rs](src/instructor.rs), 2026-09-13): the third
+persona, on the crew voice, one ACS task at a time (straight and level,
+climb, descent, steep turns, slow flight, pattern, landing). "Teach me
+steep turns" BRIEFS with numbers the instructor ASSIGNS from the book and
+the aircraft's own state (Vy, the approach speed, the altitude rounded to
+100, the heading to 10, a climb to the next 500 at least 1,000 up, a
+descent never below ground plus 1,500) so the scorer never guesses the
+intent; "begin" re-assigns from where the aircraft is NOW and starts the
+scorer; a sustained excursion (3 s) is narrated once with its correction
+("Altitude, 120 low. Nose up a touch."), the recovery acknowledged, a
+standing one re-said at 20 s; the task completes on its own milestone (the
+level-off, both roll-outs, the touchdown, the clock) and reads the grade
+back. Tolerances are the ACS's per level (`Task::standards`, private or
+commercial, "commercial standards" switches); an axis fails on more than
+3 s outside or any excursion past twice the tolerance; a wrong level-off,
+a firm (>300 fpm) or drifting (>5 degrees) touchdown fails the task. An
+AP-shaped command during a lesson is a RETARGET ("heading two seven zero"
+moves the heading axis, `take_target`), never a write. Lessons need
+instructor mode ("teach me" elsewhere says so); the panel CANCEL ends one.
+**The ground is taught too** (2026-09-14): `Task::Taxi` (pace over the
+profile's straight-leg `taxi.kts`, default 15, by more than 3 kt is the
+fault, never slow; complete after 10 s stopped past 150 m, FAILED by
+rolling through the hold line) and `Task::Takeoff` (the centreline is the
+heading captured at 15 kt on the roll, judged from 25 kt to 1,000 ft AGL;
+the rotation speed against Vr, 10 under is early and a fail; Vy +10/-5
+from 200 ft to the top). **"Teach me a full flight" / "lesson from cold
+and dark" is the syllabus** (`Syllabus`, `STEPS`): the ramp lists in the
+Instruct flavour by section key (preflight, before start, engine start,
+before taxi; a missing one is skipped aloud), the engine waited for, the
+taxi graded, the before takeoff list, the takeoff graded, then the pilot's
+own flight with the tracker's phase lists run as Instruct at once
+(`flow::phase_boundary` checks `syllabus_active`, no proposal), the landing
+armed on final once the flight has been above 1,000 ft, 20 s stopped, the
+shutdown list, and one summary per graded task. Engine already running
+starts at before taxi; airborne is refused. The flow is behind the
+`SyllabusIo` seam (`FlowIo` in the monitor, a fake in the tests), so the
+whole flight is a plain `cargo test`.
+`xvl debrief` prints the lessons AND `grade_flight`: the same scorer over
+the `state` records of ANY flight, cut into straight sub-runs at turns,
+targets the median the pilot settled on, the final and touchdown judged
+against the profile's approach speed - the examiner's read of a full auto
+sortie too (LEMG-LEJR: the follower's cruise within 55 ft, the autoland's
+302 fpm arrival "firm"). The `state` record carries `bank` and `track` for
+it; older logs grade without steep turns and drift. Not done: a demonstration
+("show me") with the automations, handbook questions, centreline tracking
+on the taxi (the guide's cross-track is not yet a lesson axis).
 
 Cabin crew ([src/cabin.rs](src/cabin.rs)): second intercom persona, no third
 PTT/channel. The address is the routing (explicit "cabin crew" always; bare
@@ -629,9 +702,13 @@ whisper output - **add every new wart here**); scripted sortie dialogues over
 ILS smoke test (`cargo test -- --ignored real_install_ils`); the in-sim soak
 checklist [docs/atc-chaos-card.md](docs/atc-chaos-card.md). `xvl debrief`
 ([src/debrief.rs](src/debrief.rs)) reads `logs/blackbox.jsonl` after every
-flight: aircraft, the numbers, every callout, and the narrative of events an
-instructor would write down (crashes, balks, void calls, floored targets,
-taxi stops). Run it before diagnosing by hand.
+flight: aircraft, the numbers, the lessons and the ACS grade of every
+straight segment and the landing (`instructor::grade_flight`), every
+callout, and the narrative of events an instructor would write down
+(crashes, balks, void calls, floored targets, taxi stops). Run it before
+diagnosing by hand. **Run tests with `XCOPILOT_BLACKBOX=off`**: any test
+that walks a real path records into the live log (22 test lines landed as
+"flight 117" on 2026-09-13).
 
 When a control law misbehaves in the air but its test passes, suspect the
 test's plant first: a first-order lag cannot ring at any gain. Sortie tests

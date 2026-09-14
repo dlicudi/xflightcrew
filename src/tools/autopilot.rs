@@ -300,6 +300,19 @@ async fn reject_unsafe_target(ctx: &ToolCtx<'_>, target: f64, ceiling: f64) -> O
              Say something at or below {ceiling:.0}."
         ));
     }
+    // The ground AHEAD, when a follower is flying and probing it. The
+    // under-the-wheels test alone cleared 4,000 ft over ground at 1,700 with a
+    // 3,861 ft ridge five miles on the nose (2026-09-13): a target is only
+    // safe against terrain it is about to fly over, not terrain already passed.
+    if let Some(floor) = crate::procedure::terrain_floor_ahead_ft() {
+        if target < floor {
+            let ground = floor - crate::procedure::TERRAIN_CLEARANCE_FT;
+            return Some(format!(
+                "Negative, {target:.0} feet is into the terrain ahead; the high ground on our \
+                 track is about {ground:.0} feet. Say {floor:.0} or higher."
+            ));
+        }
+    }
     let agl = ctx.xplane.get_float(crate::datarefs::AGL_METERS).await.ok();
     let current = ctx.xplane.get_float(CURRENT_ALT).await.ok();
     match (agl, current) {
@@ -323,18 +336,66 @@ async fn reject_unsafe_target(ctx: &ToolCtx<'_>, target: f64, ceiling: f64) -> O
     }
 }
 
+/// A CLIMB commanded to an altitude that is still into the ground ahead is
+/// flown to the terrain floor instead of refused: the pilot asking to go up is
+/// already reacting to the terrain, and "negative" leaves the aircraft exactly
+/// where it was. Returns the floor to fly when the target must be raised
+/// (`None` for a descent, which [`reject_unsafe_target`] refuses, or with no
+/// terrain answer). The same standing rule as the speed floor: raise the
+/// number, say so, log it.
+async fn terrain_raised_target(ctx: &ToolCtx<'_>, target: f64) -> Option<f64> {
+    let floor = crate::procedure::terrain_floor_ahead_ft()?;
+    if target >= floor {
+        return None;
+    }
+    let current = ctx.xplane.get_float(CURRENT_ALT).await.ok()?;
+    (target > current + ALT_CAPTURE_BAND_FT).then_some((floor / 100.0).ceil() * 100.0)
+}
+
 /// Fly the autopilot to `altitude` at `rate` fpm and let it capture/level off.
 /// On this airframe ALT hold alone won't *change* altitude — you must arm the
 /// target AND command a vertical speed, so this sets both. Direction is inferred
 /// from current altitude. Returns ("Climbing to" | "Descending to" | "Holding at",
 /// commanded_fpm_magnitude, servos_engaged).
 /// `rate` is the magnitude in fpm; `None` auto-scales it to the altitude change.
+/// The fourth element says whether the climb throttle was firewalled, so the
+/// readback only promises full power when full power was actually commanded.
 async fn fly_to(
     ctx: &ToolCtx<'_>,
     altitude: f64,
     rate: Option<f64>,
     cfg: &ApConfig,
-) -> Result<(&'static str, f64, bool)> {
+) -> Result<(&'static str, f64, bool, bool)> {
+    // A procedure follower rewrites the altitude dial EVERY tick, so writing it
+    // here would be undone within 500 ms, which is exactly what happened when
+    // a pilot twice ordered a climb away from rising ground and watched the
+    // aircraft stay on the plan's 2,700 ft (2026-09-13). Hand the follower the
+    // number instead: it stays the one writer, its VS law flies the change, and
+    // the pilot's altitude outranks the plan's until they say another one.
+    if crate::procedure::take_altitude(altitude) {
+        let current = ctx.xplane.get_float(CURRENT_ALT).await.unwrap_or(altitude);
+        let diff = altitude - current;
+        let movement = if diff.abs() <= ALT_CAPTURE_BAND_FT {
+            "Holding at"
+        } else if diff > 0.0 {
+            "Climbing to"
+        } else {
+            "Descending to"
+        };
+        // The follower's own clamp is the rate that will be flown, whatever was
+        // asked for; and the governor owns the throttle, so nothing firewalls.
+        let fpm = rate
+            .map(f64::abs)
+            .unwrap_or_else(|| auto_vs_fpm(diff, diff > 0.0))
+            .min(crate::procedure::vs_clamp_fpm());
+        tracing::info!(
+            target: "xvoicelayer::autopilot",
+            movement,
+            target_alt = altitude,
+            "handed the altitude to the follower"
+        );
+        return Ok((movement, fpm, servos_engaged(ctx).await?, false));
+    }
     // Raise the flight director first (some airframes' AP won't hold without it);
     // arm_altitude then engages the servos.
     for c in &cfg.fd_commands {
@@ -369,7 +430,12 @@ async fn fly_to(
         target_alt = altitude,
         "fly_to latched"
     );
-    Ok((movement, signed.abs(), servos_engaged(ctx).await?))
+    Ok((
+        movement,
+        signed.abs(),
+        servos_engaged(ctx).await?,
+        movement.starts_with("Climbing"),
+    ))
 }
 
 /// The synchronous part of [`fly_to`]: read the current altitude, infer the
@@ -845,7 +911,16 @@ impl Tool for SetAltitude {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: AltArgs = serde_json::from_value(args.clone())?;
-        let altitude = args.altitude.max(0.0);
+        let mut altitude = args.altitude.max(0.0);
+
+        // A climb that still doesn't clear the ground ahead is flown to the
+        // floor rather than refused: the pilot is already climbing away from
+        // something, and "negative" would leave them in it.
+        let asked = altitude;
+        let raised = terrain_raised_target(ctx, altitude).await;
+        if let Some(floor) = raised {
+            altitude = floor;
+        }
 
         // Safety gate: refuse a target into the terrain or above the ceiling rather
         // than fly the aircraft toward the ground. "auto level" with no number lands
@@ -859,16 +934,17 @@ impl Tool for SetAltitude {
         // Fly to it: arm the altitude AND command a vertical speed (ALT hold alone
         // won't change altitude on this AP), at a rate scaled to the change, then
         // capture and level off.
-        let (movement, _fpm, engaged) = fly_to(ctx, altitude, None, &self.cfg).await?;
-        // fly_to firewalls the throttle on a climb; say so.
-        let power = if movement.starts_with("Climbing") {
-            "full power, "
-        } else {
-            ""
+        let (movement, _fpm, engaged, firewalled) = fly_to(ctx, altitude, None, &self.cfg).await?;
+        let power = if firewalled { "full power, " } else { "" };
+        let terrain = match raised {
+            Some(_) => format!(
+                " {asked:.0} feet is into the terrain ahead, so I'm taking us to {altitude:.0}."
+            ),
+            None => String::new(),
         };
         if engaged {
             Ok(format!(
-                "Roger — {power}{} {altitude:.0} feet.",
+                "Roger — {power}{} {altitude:.0} feet.{terrain}",
                 movement.to_lowercase()
             ))
         } else {
@@ -911,6 +987,16 @@ impl Tool for LevelOff {
         // the way an ALT-button capture reads out).
         let current = ctx.xplane.get_float(CURRENT_ALT).await?;
         let target = (current / 100.0).round() * 100.0;
+
+        // "Stop the descent" while a follower flies: hand it the altitude the
+        // same way a commanded one is handed over. Wings and throttle are its
+        // own (the lateral law and the governor): taking those here would put
+        // two writers on each.
+        if crate::procedure::take_altitude(target) {
+            return Ok(format!(
+                "Roger, holding {target:.0} feet. You have the altitude; I'm still flying the track."
+            ));
+        }
 
         engage_ap(ctx, &self.cfg).await?;
         ctx.xplane.run_command(CMD_WING_LEVELER).await?;
@@ -1094,7 +1180,12 @@ impl Tool for SetClimb {
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: ClimbArgs = serde_json::from_value(args.clone())?;
-        let altitude = args.altitude.max(0.0);
+        let mut altitude = args.altitude.max(0.0);
+        let asked = altitude;
+        let raised = terrain_raised_target(ctx, altitude).await;
+        if let Some(floor) = raised {
+            altitude = floor;
+        }
         if let Some(refusal) =
             reject_unsafe_target(ctx, altitude, self.cfg.service_ceiling_ft).await
         {
@@ -1105,15 +1196,17 @@ impl Tool for SetClimb {
         // The schema permits fpm 0, so treat anything under 1 fpm as "unspecified"
         // and auto-scale the rate, the same as a plain set_altitude.
         let rate = (args.fpm.abs() >= 1.0).then(|| args.fpm.abs().min(2000.0));
-        let (movement, fpm, engaged) = fly_to(ctx, altitude, rate, &self.cfg).await?;
-        let power = if movement.starts_with("Climbing") {
-            "full power, "
-        } else {
-            ""
+        let (movement, fpm, engaged, firewalled) = fly_to(ctx, altitude, rate, &self.cfg).await?;
+        let power = if firewalled { "full power, " } else { "" };
+        let terrain = match raised {
+            Some(_) => format!(
+                " {asked:.0} feet is into the terrain ahead, so I'm taking us to {altitude:.0}."
+            ),
+            None => String::new(),
         };
         if engaged {
             Ok(format!(
-                "Roger — {power}{} {altitude:.0} feet at {fpm:.0} feet per minute, leveling off there.",
+                "Roger — {power}{} {altitude:.0} feet at {fpm:.0} feet per minute, leveling off there.{terrain}",
                 movement.to_lowercase()
             ))
         } else {

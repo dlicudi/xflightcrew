@@ -28,6 +28,7 @@ mod flow;
 mod full_auto;
 mod grammar;
 mod health;
+mod instructor;
 mod livestate;
 mod mic;
 mod mode;
@@ -1308,6 +1309,7 @@ async fn run_session(
     // The flow module owns the parsed lists (its phase-boundary runner and
     // the panel need them off this loop); this is the same Arc for matching.
     let mut checklists = flow::install(&profile);
+    instructor::install(&profile);
     // The ATC station (tower dialogue), merged from the standalone atc binary:
     // it answers when COM1 is tuned to its tower frequency and the words parse
     // as a radio call. Read-only toward the sim; speaks in its own voice
@@ -1324,6 +1326,9 @@ async fn run_session(
     let mut applied_mode = mode::get();
     // ATC-only: the crew note "copilot is off" is spoken once, not per utterance.
     let mut atc_only_noted = false;
+    // Instructor mode: the full "I don't touch the controls" line once per
+    // spell in the mode, a short "your hands" after.
+    let mut instructor_noted = false;
     // Radio-call vocabulary rides in a SEPARATE whisper bias prompt applied
     // only to radio-keyed captures: prompt prefill is GPU work per decode, and
     // the tower phrasing more than doubles it (483 → 1,047 ms median, felt as
@@ -1525,6 +1530,25 @@ async fn run_session(
                 // queued crew lines too. Radio traffic stays on the air.
                 voice.dismiss_crew();
             }
+            // The instructor's edges: hands come off everything that is
+            // running (the airframe-swap stand-down, since a lesson and a
+            // loop cannot share the aircraft), and a lesson does not
+            // outlive the mode that allowed it.
+            if now_mode == mode::Mode::Instructor && applied_mode != mode::Mode::Instructor {
+                stand_down_for_aircraft_change();
+                instructor_noted = false;
+                voice.alert(
+                    Priority::Advisory,
+                    "Instructor mode. My hands are off the controls. Your aircraft.".to_string(),
+                );
+            } else if applied_mode == mode::Mode::Instructor && now_mode != mode::Mode::Instructor {
+                if instructor::abandon("mode_change") {
+                    voice.alert(Priority::Advisory, "Lesson over, the mode changed.".to_string());
+                }
+                if now_mode != mode::Mode::AtcOnly {
+                    voice.alert(Priority::Advisory, "Copilot back with you.".to_string());
+                }
+            }
             applied_mode = now_mode;
         }
 
@@ -1725,6 +1749,7 @@ async fn run_session(
             profile = live_profile.get();
             registry = Registry::for_aircraft(&profile);
             checklists = flow::install(&profile);
+            instructor::install(&profile);
             stt.set_prompt(stt::build_prompt(&profile));
             stt.set_radio_prompt(format!(
                 "{} {}",
@@ -1750,6 +1775,15 @@ async fn run_session(
         // echoed readback, still has to land. Deterministic and instant.
         if is_undo(&command) {
             conversation.clear();
+            if !mode::crew_actuates() {
+                say(
+                    &voice,
+                    &reporter,
+                    ui::LogKind::Readback,
+                    "Nothing of mine to undo in instructor mode. Your hands.",
+                );
+                continue;
+            }
             match undo_stack.pop() {
                 None => say(&voice, &reporter, ui::LogKind::Warn, "Nothing to undo."),
                 Some(snap) => {
@@ -2254,6 +2288,22 @@ async fn run_session(
                     say(&voice, &reporter, ui::LogKind::Readback, &msg);
                 }
             }
+            continue;
+        }
+        // The instructor's lessons: "teach me steep turns", "begin", "how am
+        // I doing", "end the lesson". Closed vocabulary, and only in
+        // instructor mode, where nothing of ours can touch a control while
+        // the pilot flies the task.
+        if let Some(req) = instructor::request(&command) {
+            tracing::info!(?req, path = "instructor", "command path");
+            let line = if mode::instructing() {
+                instructor::handle(req, instructor::clock_s())
+            } else {
+                "Lessons run in instructor mode, where I keep my hands off. \
+                 Flip the mode in Settings and ask again."
+                    .to_string()
+            };
+            say(&voice, &reporter, ui::LogKind::Readback, &line);
             continue;
         }
         // Read-only conversation runs before the spoken domain gate: "and now"
@@ -3244,6 +3294,37 @@ async fn run_session(
                 ui::LogKind::Tool,
                 format!("{} {}", call.name, call.arguments),
             );
+
+            // Instructor mode: nothing of ours actuates. A checklist runs in
+            // its Instruct flavour (flow::start decides that itself); an
+            // autopilot-shaped call during a lesson becomes the lesson's
+            // target; everything else is refused with the action named, so
+            // the pilot does it. One door, before any confirm prompt.
+            if !mode::crew_actuates() {
+                if let Some(i) = checklists.iter().position(|c| c.id == call.name) {
+                    if !flow::start(i, flow::Flavour::Instruct, (*config).clone(), voice.clone()) {
+                        say(
+                            &voice,
+                            &reporter,
+                            ui::LogKind::Warn,
+                            "A checklist is already running. Say stop the checklist to end it.",
+                        );
+                    }
+                    break;
+                }
+                let line = instructor::take_target(&call.name, &call.arguments)
+                    .unwrap_or_else(|| {
+                        let label = callout_label(&call.name, &call.arguments);
+                        instructor::refusal(&label, !instructor_noted)
+                    });
+                instructor_noted = true;
+                blackbox::record(
+                    "instructor",
+                    serde_json::json!({ "event": "refused", "tool": call.name, "args": call.arguments }),
+                );
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                break;
+            }
 
             // A checklist isn't a one-shot tool — the copilot runs it as a FLOW
             // on its own thread (`flow::start`, Crew flavour): reads each item,

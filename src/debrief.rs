@@ -140,6 +140,69 @@ fn summarise(flight: &[&Value]) -> String {
         }
     }
 
+    // --- The instructor's grade: lessons flown, and every hand-flown
+    // segment scored against the ACS the same way (the level runs, the
+    // climbs and descents, the steep turns, the final and touchdown).
+    let lessons: Vec<String> = flight
+        .iter()
+        .filter(|e| s(e, "kind") == "instructor" && s(e, "event") == "end")
+        .filter_map(|e| {
+            let g = e.get("grade")?;
+            let axes: Vec<String> = g["axes"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter(|x| x["judged_s"].as_f64().unwrap_or(0.0) > 0.0)
+                        .map(|x| {
+                            format!(
+                                "{} {:+.0}{}",
+                                x["axis"].as_str().unwrap_or(""),
+                                x["worst"].as_f64().unwrap_or(0.0),
+                                if x["pass"].as_bool() == Some(true) { "" } else { " (FAIL)" }
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(format!(
+                "  {}Z lesson {} ({} standards): {}{}",
+                hms(f(e, "t").unwrap_or(0.0)),
+                g["task"].as_str().unwrap_or("").replace('_', " "),
+                g["level"].as_str().unwrap_or(""),
+                if g["complete"].as_bool() == Some(true) {
+                    if g["pass"].as_bool() == Some(true) { "PASS" } else { "FAIL" }
+                } else {
+                    "not completed"
+                },
+                if axes.is_empty() { String::new() } else { format!(": {}", axes.join(", ")) }
+            ))
+        })
+        .collect();
+    if !lessons.is_empty() {
+        out.push_str("Lessons:\n");
+        for l in &lessons {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    if !states.is_empty() {
+        let profile = aircraft.last().and_then(|id| crate::aircraft::load(id));
+        let refs: Vec<&Value> = states.iter().map(|e| **e).collect();
+        let graded = crate::instructor::grade_flight(
+            &refs,
+            profile.as_ref(),
+            crate::instructor::Level::Private,
+        );
+        if !graded.is_empty() {
+            out.push_str("ACS grade (private standards, targets taken from the flying):\n");
+            for l in graded {
+                out.push_str("  ");
+                out.push_str(&l);
+                out.push('\n');
+            }
+        }
+    }
+
     // --- Callouts, by id.
     let mut callouts: BTreeMap<String, u32> = BTreeMap::new();
     for e in flight.iter().filter(|e| s(e, "kind") == "callout") {

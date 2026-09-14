@@ -180,6 +180,9 @@ pub fn active_managers() -> Vec<String> {
     if let Some(s) = flow::status() {
         v.push(s);
     }
+    if let Some(s) = crate::instructor::status() {
+        v.push(s);
+    }
     v
 }
 
@@ -279,6 +282,11 @@ pub fn cancel_phrase() -> Option<&'static str> {
     // phrase is the flow's own closed reply vocabulary, taken before grammar.
     if flow::ACTIVE.load(Relaxed) {
         return Some("stop the checklist");
+    }
+    // A lesson briefed or flying, nothing else running: the button ends it
+    // (the instructor's own closed vocabulary, and its debrief follows).
+    if crate::instructor::active() {
+        return Some("end the lesson");
     }
     Some("my controls")
 }

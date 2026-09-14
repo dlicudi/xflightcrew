@@ -4,6 +4,200 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## The instructor teaches from cold and dark, 2026-09-14
+
+"Can the instructor help me taxi?" and "shouldn't the instructor be able to
+teach from cold dark?" Both no, the day after it was built: the lessons
+were air work, and the ground half of a flight is where a student needs
+the most talking-through. The pieces existed (Instruct checklists, the
+taxi guide's cues, the coach) but nothing chained them.
+
+**Two ground tasks.** `Task::Taxi` grades PACE, a fifth axis
+(`Axis::Pace`, its own words: "Pace, 5 over. Ease the power back and hold
+it with the brakes."): the profile's straight-leg `taxi.kts` (15 when
+silent), over by more than 3 kt is the fault, slow never is; judged only
+while moving; complete after 10 s stopped once 150 m are behind it
+("Stopped. Holding short, I take it."), FAILED outright by rolling through
+the hold line at more than 30 kt. `Task::Takeoff` waits for the roll (15 kt
+on the wheels), takes the heading THEN as the centreline (the aircraft at
+the hold line points anywhere, so the brief's heading is a placeholder the
+scorer retargets), judges it from 25 kt to 1,000 ft AGL, notes the rotation
+against Vr from the last sample on the wheels ("Rotated at 54 knots, Vr is
+55."; 10 under is early and a fail, 15 over a note), and Vy +10/-5 from
+200 ft to the top. Vr rides the targets, not a lookup: the first cut read
+it from the lesson statics inside a brief that already held the lock.
+
+**The syllabus.** "Teach me a full flight" / "a lesson from cold and dark"
+walks `STEPS`: the ramp lists (preflight, before start, engine start) in
+the Instruct flavour by section key, each skipped aloud when the file
+lacks it ("No preflight list on this airframe. Do it from memory and carry
+on."); the engine waited for, nagged once a minute; before taxi; the taxi
+graded; before takeoff; the takeoff graded; then "Your flight" with the
+tracker's phase lists run as Instruct at once (`flow::phase_boundary`
+checks `syllabus_active`, no proposal to answer); the landing armed on
+final once the flight has been above 1,000 ft (never on the takeoff's own
+climb-out); 20 s stopped; the shutdown list; "That's the flight" with one
+verdict per graded task and the lists done. Engine already running starts
+at before taxi; airborne is refused. A retarget during a syllabus task
+lands on that task's scorer (a "12 knots" during the taxi moves the pace).
+
+**The flow behind a seam.** The syllabus needs to find, start and watch
+checklist flows from the monitor's tick, and the tests need none of that:
+`SyllabusIo` (find_list / start_list / list_running), `FlowIo` in the
+monitor over `flow::find_section` / `flow::start` / `flow::ACTIVE`, a fake
+in the tests that "runs" each list for two ticks. The whole cold-and-dark
+flight is one plain test, ramp to shutdown, 250 ticks.
+
+Not done: centreline tracking on the taxi (the guide's cross-track is the
+obvious axis), the run-up as a graded item, and the first in-sim run of
+the whole thing.
+
+## The instructor: a mode, a scorer, a lesson, 2026-09-13
+
+"Have we built instructor features yet?" Partly: the checklist flow's
+Instruct flavour, the monitor's callouts and the ATC coach were the pieces;
+the persona, the mode that keeps its hands off, the ACS scorer and the
+lesson were the CLAUDE.md sentence "if built". Built today, entirely
+deterministic, tested as plain `cargo test`.
+
+**A mode, because hands-off must be structural.** `mode::Instructor`
+(panel index 3, "Instructor (teaches and grades, never touches)") keeps the
+persona (`copilot_enabled` stays true: callouts, coach, checklist
+read-and-watch, lessons) and drops the hands: `mode::crew_actuates()` is
+false there and in ATC-only, and every crew writer that is not a spoken
+tool checks it (the monitor's `fix_action`s, `cockpit_auto`, `flow::start`,
+where the Crew flavour becomes Instruct, and undo). The spoken tools are
+refused at the ONE door in the main loop's dispatch, before any confirm
+prompt, with the action named from `callout_label` ("Flaps 1: your hands")
+and the full "I don't touch the controls" line once per spell in the mode.
+Entering the mode runs `stand_down_for_aircraft_change` (a lesson and a
+loop cannot share the aircraft); leaving it abandons the lesson. A checklist
+asked for by title in instructor mode runs Instruct without a special case
+at the call site.
+
+**The instructor assigns; the scorer never guesses.** The hard problem of
+grading a hand-flown task is knowing what the pilot meant. The ACS answer is
+that the examiner specifies, so `Task::assign` does: straight and level at
+the altitude rounded to 100, the heading to 10, the profile's cruise IAS; a
+climb to the next 500 at least 1,000 up at Vy; a descent to the 500 at least
+1,000 down but never below ground plus 1,500; steep turns at 45 (commercial
+50) at or below Va; slow flight at the airframe's speed floor; the pattern
+at field plus `pattern_alt_agl_ft` at the circuit's pattern speed; the
+landing at the approach speed. "Begin" re-assigns from where the aircraft
+IS (a brief at 3,000 and a begin at 3,500 would otherwise grade the wrong
+altitude for the whole task). An AP-shaped command during a lesson
+("heading two seven zero") is refused as a write and taken as a retarget.
+
+**Narration with a sustain.** An axis outside its tolerance for 3 s is
+spoken once with the correction ("Altitude, 120 low. Nose up a touch."),
+the hint only the first time; the recovery is acknowledged; a standing
+excursion is re-said at 20 s. Advisory priority, so the radio wins. The
+task completes on its own milestone: the two-minute clock, the level-off
+held 5 s within 300 ft of the assignment (a level-off elsewhere, 20 s, ends
+the task with "the assignment was X" and fails it), both roll-outs (bank
+under 10 after over 30; the roll-out heading is judged with one second of
+weight, the bank only inside the turn, or the roll-out itself read as 45
+degrees shallow), the touchdown (sink from the last airborne sample, drift
+from heading minus track).
+
+**The pass rule.** An axis passes if it was never more than 3 s outside in
+total and never past twice the tolerance; a firm (>300 fpm) or drifting
+(>5 degrees) touchdown or a wrong level-off fails the task whatever the
+axes say. Examiners forgive a corrected bump; they do not forgive 250 ft.
+
+**The same scorer runs offline.** `instructor::grade_flight` in `xvl
+debrief` takes the blackbox `state` records of any flight, classifies
+samples (ground, turn where bank is recorded, climb, descent, level),
+merges flickers under 8 s, then cuts every run into STRAIGHT sub-runs at
+turns (20 degrees off the run's reference; the turn skipped while
+consecutive samples swing faster than 1 degree/s), because the first pass
+graded an 18-minute cross-country cruise leg as "heading 180 degrees right
+(FAIL)". Targets are what the pilot settled on: the circular mean heading
+and the median speed (the entry speed of a level run is still the climb
+speed: "15 knots slow" until the median), the entry altitude rounded to
+100, the level-off altitude for a climb. Descents are trimmed at 800 ft AGL
+so the final belongs to the landing grade. On the LEMG-LEJR full auto sortie
+it reads as an examiner would: the follower's cruise within 55 ft, the
+climb 21 kt over Vy (a cruise climb), the autoland's 302 fpm arrival "firm"
+and 8 kt fast on final. The `state` record now carries `bank` and `track`.
+
+**Tests write the live blackbox.** The lesson test's events landed in
+`logs/blackbox.jsonl` as "flight 117" (22 lines, stripped); the flow tests'
+"declined" was already there. `XCOPILOT_BLACKBOX=off cargo test` from now
+on; the rule is in CLAUDE.md.
+
+Not done: a demonstration flavour ("show me a steep turn" with the
+automations flying it), the pattern task offline (its altitude window needs
+the field), handbook questions (the model-shaped use, still out), a voice of
+its own (the instructor speaks with the crew voice). Not flown yet: the
+first in-sim lesson will say whether 3 s is the right sustain and whether
+the roll-out threshold of 10 degrees is too tight for a hand-flown 172.
+
+## The plan flew into the Sierra, 2026-09-13
+
+LEMG to LEJR, 172SP, full auto, the pilot riding along and asking questions.
+The follower armed the leg to JRZ at 55.9 nm with the plan's 2,700 ft
+constraint, and started down immediately from 8,000. Forty minutes later the
+aircraft was over the Sierra de Grazalema at 220 ft AGL, the "Before landing"
+checklist had run itself 44 nm out (the monitor's below-1,500-AGL trigger,
+firing on terrain rather than on an approach), and the pilot said "We're going
+to crash", then "Climb to four thousand feet", then, forty-seven seconds
+later, "Climb to four thousand feet now." The blackbox shows every leg event
+in between carrying `want_alt: 2700.0`. A terrain probe along the track at
+that moment: 3,861 ft at 5.1 nm, 3,803 ft at 6.7 nm. The aircraft was
+oscillating between 2,715 and 2,860 ft, which is the signature of two writers
+on one dial.
+
+Three faults, in the order they bit, each one now a rule.
+
+**The top-of-descent deferral worked for exactly one tick per leg.**
+`descent_target_ft` defers a descent until the top of descent and otherwise
+returns `carry`, the previously commanded altitude, which is the whole point
+of the Gibraltar fix of 2026-09-11 (18 nm flown level at 1,400 ft across the
+Strait). But the caller read `carry_alt` and then immediately overwrote it
+with the new leg's own constraint, so from the second tick onward the function
+compared the constraint with itself and returned it. The logs always showed
+one honest `want 8000.0` followed by the dive, and nobody read the pair as a
+symptom. The last COMMANDED altitude and the last leg CONSTRAINT are two
+different quantities and are now two variables (`prev_cmd_alt`, `carry_alt`).
+Tested by ticking the real bookkeeping forward twenty times, not by calling
+`descent_target_ft` once, which always passed.
+
+**A plan's altitude is only as good as the ground under it.** The local
+planner floors its own cruise altitude over the plugin's terrain probe, but a
+constraint handed down from a plan (SimBrief's, or the local planner's own
+destination leg) was flown as given. The follower now probes 16 points along
+the track it is steering, out to 15 nm or the fix, every 10 s, and never
+commands an altitude below the highest ground found plus 1,000 ft. It says
+"Terrain ahead, holding X feet" once per rise and blackboxes `terrain_floor`.
+Skipped on an approach, whose published platform altitudes own the descent
+below the enroute floor. An old plugin with no probe channel disables the
+look-ahead for the flight after one failed answer rather than stalling the
+tick for two seconds in ten.
+
+**The pilot's own override was the thing the automation was strongest
+against.** The follower rewrites `altitude_dial_ft` every tick; the autopilot
+tool wrote the dial and spawned a capture watcher whose documented stand-down
+condition is "the dial moved off our target". So the follower undid the climb
+within 500 ms and the watcher retired itself, twice, and there was no way for
+the pilot to win by speaking. A commanded altitude is now HANDED to the
+follower (`procedure::take_altitude`) instead of written: one writer, the
+follower's VS law flies the change, and the pilot's number outranks the plan's
+until they say another one. Deliberately sticky, with no self-expiry, because
+an override that quietly lapses is this exact accident. `level_off` hands over
+the same way and touches neither the wings nor the throttle, which the lateral
+law and the governor own. The panel says whose altitude is being flown.
+
+And the gate that let 4,000 ft through: `reject_unsafe_target` judged a target
+against the ground UNDER the aircraft, which was 1,700 ft while a 3,861 ft
+ridge sat five miles ahead. It now consults the follower's look-ahead floor,
+and a CLIMB to a target that still doesn't clear it is RAISED to the floor and
+spoken, not refused: the pilot asking to go up is already reacting to the
+terrain, and "negative" leaves the aircraft where it is. A descent below the
+floor is still refused, with the number that would work.
+
+---
+
 ## The LLM retired, and a night of rules — 2026-09-13
 
 "Is the LLM not worth having?" The answer-only Ollama fallback (qwen3:8b,

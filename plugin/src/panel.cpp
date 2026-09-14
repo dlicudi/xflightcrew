@@ -968,6 +968,7 @@ protected:
             ImGui::RadioButton("Copilot + ATC", &mode, 0);
             ImGui::RadioButton("Copilot only (real/external ATC has the radio)", &mode, 1);
             ImGui::RadioButton("ATC only (no copilot)", &mode, 2);
+            ImGui::RadioButton("Instructor (teaches and grades, never touches)", &mode, 3);
             if (mode != drefs::opt_mode()) drefs::set_opt_mode(mode);
             ImGui::Spacing();
             ImGui::Separator();

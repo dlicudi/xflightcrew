@@ -170,6 +170,10 @@ pub struct Snapshot {
     /// Ground track, degrees true (`sim/flightmodel/position/hpath`). `None` =
     /// the read failed; consumers treat it as "track unknown", never 0.
     pub track_deg: Option<f64>,
+    /// True heading (`psi`) and bank (`phi`), degrees, best-effort (0 on a
+    /// failed read): the instructor's scorer and the blackbox state record.
+    pub heading_deg: f64,
+    pub bank_deg: f64,
     /// Sim frame rate (`sim/time/framerate_period`, inverted). `None` = read
     /// failed or the sim is paused (period 0). Feeds the fps-dip watchdog.
     pub fps: Option<f64>,
@@ -244,6 +248,14 @@ impl Snapshot {
             .await
             .unwrap_or(0.0);
         let track_deg = xp.get_float("sim/flightmodel/position/hpath").await.ok();
+        let heading_deg = xp
+            .get_float("sim/flightmodel/position/psi")
+            .await
+            .unwrap_or(0.0);
+        let bank_deg = xp
+            .get_float("sim/flightmodel/position/phi")
+            .await
+            .unwrap_or(0.0);
         let fps = xp
             .get_float("sim/time/framerate_period")
             .await
@@ -457,6 +469,8 @@ impl Snapshot {
             lat,
             lon,
             track_deg,
+            heading_deg,
+            bank_deg,
             fps,
             dest_dist_nm,
             dest_elev_ft,
@@ -1804,6 +1818,33 @@ pub async fn run(
                 }
             }
 
+            // The instructor's lesson: every tick feeds the scorer (and the
+            // brief's picture of the aircraft); narration comes back only
+            // while a lesson flies. Advisory, so the radio is never talked
+            // over for a heading nudge.
+            if crew_on {
+                let sample = crate::instructor::Sample {
+                    t_s: crate::instructor::clock_s(),
+                    alt_ft: snap.alt_ft,
+                    agl_ft: snap.agl_ft,
+                    hdg_deg: snap.heading_deg,
+                    ias_kts: snap.ias_kts,
+                    bank_deg: snap.bank_deg,
+                    vsi_fpm: snap.vsi_fpm,
+                    on_ground: snap.on_ground,
+                    track_deg: snap.track_deg,
+                    gs_kts: snap.groundspeed_kts,
+                    engine_running: snap.engine_running,
+                };
+                let mut io = crate::instructor::FlowIo {
+                    config: &config,
+                    voice: &voice,
+                };
+                for line in crate::instructor::tick_with(sample, &mut io) {
+                    voice.alert(Priority::Advisory, line);
+                }
+            }
+
             // Pushback callouts (on the ground): tug hooks up → pushing → clear.
             if crew_on && snap.on_ground {
                 // Mirror OR action, never both: `voice.alert` already mirrors the
@@ -1869,6 +1910,7 @@ pub async fn run(
             // Skipped entirely on an airframe that declares neither duty,
             // so nothing pays for a capability it doesn't have.
             if crew_on
+                && crate::mode::crew_actuates()
                 && (!night_lights.is_empty() || gps_ack.is_some())
                 && cockpit_auto_last.is_none_or(|t| now.duration_since(t) >= COCKPIT_AUTO_EVERY)
             {
@@ -2782,17 +2824,15 @@ pub async fn run(
             prev_ias = Some((snap.ias_kts, now));
             snap.ias_trend_kts_per_s = trend;
 
-            // Black box: one state record per tick (position/altitude come from
-            // the snapshot; only the heading needs an extra read).
+            // Black box: one state record per tick, all from the snapshot.
+            // Bank and track ride along for the offline ACS grade
+            // (`instructor::grade_flight`: steep turns, touchdown drift).
             let (lat, lon, alt) = (snap.lat, snap.lon, snap.alt_ft);
-            let hdg = xp
-                .get_float("sim/flightmodel/position/psi")
-                .await
-                .unwrap_or(0.0);
             crate::blackbox::record(
                 "state",
                 serde_json::json!({
-                    "lat": lat, "lon": lon, "hdg": r1(hdg), "alt": r1(alt),
+                    "lat": lat, "lon": lon, "hdg": r1(snap.heading_deg), "alt": r1(alt),
+                    "bank": r1(snap.bank_deg), "track": snap.track_deg.map(r1),
                     "ias": r1(snap.ias_kts), "gs": r1(snap.groundspeed_kts),
                     "vsi": r1(snap.vsi_fpm), "agl": r1(snap.agl_ft),
                     "ground": snap.on_ground, "flap": snap.flap_ratio,
@@ -2866,7 +2906,7 @@ pub async fn run(
                             // `crew_on` gate above, and the tick never runs in
                             // replay/pause. Fire-and-forget: the switch flips and
                             // the check clears next tick.
-                            if spoke {
+                            if spoke && crate::mode::crew_actuates() {
                                 if let Some(cmd) = check.fix_action() {
                                     let _ = xp.run_command(cmd).await;
                                 }
@@ -3118,6 +3158,8 @@ mod tests {
         Snapshot {
             on_ground: true,
             groundspeed_kts: 0.0,
+            heading_deg: 0.0,
+            bank_deg: 0.0,
             ias_kts: 0.0,
             ias_trend_kts_per_s: 0.0,
             flap_ratio: 0.0,

@@ -148,7 +148,14 @@ pub fn status() -> Option<String> {
 /// no fix and no range; within 100 ft of the target the aircraft is level.
 /// Ranges to a tenth, minutes whole, altitude to 10 ft: rounded so the
 /// change-gated panel feed is not re-sent for jitter.
-pub fn leg_detail(fix: &str, dist_nm: Option<f64>, gs_kts: f64, alt_ft: f64, want_alt: f64) -> String {
+pub fn leg_detail(
+    fix: &str,
+    dist_nm: Option<f64>,
+    gs_kts: f64,
+    alt_ft: f64,
+    want_alt: f64,
+    owner: AltOwner,
+) -> String {
     let mut parts = Vec::new();
     if !fix.is_empty() {
         parts.push(format!("to {fix}"));
@@ -168,7 +175,22 @@ pub fn leg_detail(fix: &str, dist_nm: Option<f64>, gs_kts: f64, alt_ft: f64, wan
     } else {
         format!("descending to {alt} ft")
     });
+    // Whose number that is, so a glance at the panel says why the follower is
+    // not on the plan's altitude.
+    match owner {
+        AltOwner::Terrain => parts.push("terrain floor".to_string()),
+        AltOwner::Pilot => parts.push("your altitude".to_string()),
+        AltOwner::Plan => {}
+    }
     parts.join(", ")
+}
+
+/// Who set the altitude the follower is flying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AltOwner {
+    Plan,
+    Pilot,
+    Terrain,
 }
 
 /// Cancel an active procedure and stand down whatever sub-loop is flying;
@@ -262,8 +284,122 @@ pub fn commanded_alt_ft(leg: &ProcLeg, carry: f64) -> f64 {
     leg.alt1_ft.unwrap_or(carry)
 }
 
+/// Clearance the follower keeps over the highest ground AHEAD, feet. The
+/// non-mountainous IFR figure, and the least an instructor would accept from
+/// an automation flying a leg it cannot see.
+pub const TERRAIN_CLEARANCE_FT: f64 = 1_000.0;
+/// How far ahead along the track the terrain probe looks, nm. Far enough that
+/// a 700 fpm climb clears what it finds at light-aircraft speeds (15 nm is
+/// over six minutes at 135 kt), short enough that the answer is about the leg
+/// being flown and not the next county.
+const TERRAIN_LOOK_NM: f64 = 15.0;
+/// Seconds between terrain probes. The ground does not move; this is a picture
+/// of what is ahead, not a control input.
+const TERRAIN_PROBE_SECS: f64 = 10.0;
+/// Points per probe. The plugin answers at most [`crate::terrain::MAX_POINTS`].
+const TERRAIN_POINTS: usize = 16;
+/// Re-speak the terrain floor when it rises by more than this, feet.
+const TERRAIN_RESAY_FT: f64 = 200.0;
+
+/// The lowest altitude the follower may command: the highest ground within
+/// [`TERRAIN_LOOK_NM`] ahead plus [`TERRAIN_CLEARANCE_FT`]. `None` means no
+/// terrain answer (old plugin, probe timed out) and the floor is not applied:
+/// the module's standing contract, degrade rather than refuse.
+///
+/// This exists because a plan's altitude is only as good as the ground under
+/// it. The LEMG-LEJR leg to JRZ carried 2,700 ft across the Sierra de
+/// Grazalema, whose ridge probes at 3,861 ft; the follower flew it down to
+/// 220 ft AGL (2026-09-13). The planner floors its own CRUISE altitude over
+/// this same probe, but a constraint handed down from a plan was flown as
+/// given. Nothing the follower commands is trusted over the ground again.
+static TERRAIN_FLOOR: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// The highest-ground floor the follower is currently holding itself to, feet
+/// MSL. `None` outside a procedure or with no terrain answer. Read by the
+/// autopilot tool so a PILOT's altitude is judged against the same ground the
+/// follower can see ahead, not merely what is under the wheels.
+pub fn terrain_floor_ahead_ft() -> Option<f64> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    *TERRAIN_FLOOR.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn publish_terrain_floor(v: Option<f64>) {
+    *TERRAIN_FLOOR.lock().unwrap_or_else(|e| e.into_inner()) = v;
+}
+
+/// An altitude the PILOT commanded while the follower was flying.
+///
+/// The follower is the ONE writer of the altitude dial and rewrites it every
+/// tick. So a spoken "climb to four thousand" was obeyed by the autopilot tool
+/// and undone within 500 ms, twice, while the aircraft oscillated at 220 ft
+/// over rising ground (2026-09-13): the pilot's own override was the thing the
+/// automation was strongest against. It is now not a fight over a dataref: the
+/// tool hands the number here and the follower flies it as its target until the
+/// pilot says another one, keeping every leg's lateral steering.
+static PILOT_ALT: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// Hand the follower an altitude the pilot asked for. `false` (and nothing
+/// taken) when no procedure is flying, so the caller drives the autopilot
+/// itself the way it always has.
+pub fn take_altitude(ft: f64) -> bool {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return false;
+    }
+    *PILOT_ALT.lock().unwrap_or_else(|e| e.into_inner()) = Some(ft);
+    crate::blackbox::record(
+        "procedure",
+        serde_json::json!({"event": "pilot_altitude", "ft": ft}),
+    );
+    true
+}
+
+/// The pilot's commanded altitude, if they have taken the vertical.
+pub fn pilot_altitude() -> Option<f64> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    *PILOT_ALT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn clear_pilot_altitude() {
+    *PILOT_ALT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Points along the ground track from `lat`/`lon` on `brg_true`, out to
+/// `look_nm`, for the terrain probe. Flat-earth stepping: over 15 nm the error
+/// is metres, and the answer is a maximum over samples either way.
+pub fn look_ahead_points(
+    lat: f64,
+    lon: f64,
+    brg_true: f64,
+    look_nm: f64,
+    n: usize,
+) -> Vec<(f64, f64)> {
+    let n = n.max(1);
+    let b = brg_true.to_radians();
+    let coslat = lat.to_radians().cos().abs().max(0.01);
+    (1..=n)
+        .map(|i| {
+            let d = look_nm * i as f64 / n as f64;
+            (
+                lat + b.cos() * d / 60.0,
+                lon + b.sin() * d / (60.0 * coslat),
+            )
+        })
+        .collect()
+}
+
 /// The descent rate the VS law flies, fpm (its clamp).
 const DESCENT_FPM: f64 = 700.0;
+
+/// The rate the follower's vertical law will actually fly, fpm (magnitude):
+/// what a readback must promise when the follower owns the altitude, whatever
+/// rate the pilot asked for.
+pub fn vs_clamp_fpm() -> f64 {
+    DESCENT_FPM
+}
 /// Start down this far before the computed top of descent, nm.
 const TOD_LEAD_NM: f64 = 1.0;
 
@@ -297,6 +433,63 @@ pub fn descent_target_ft(
         carry
     } else {
         (alt_ft / 100.0).round() * 100.0
+    }
+}
+
+/// One tick of the follower's vertical bookkeeping, pure so every rule below
+/// is a plain `cargo test` and not a sortie.
+///
+/// `carry` is the last leg CONSTRAINT (carried across unconstrained fixes);
+/// `prev_cmd` is what was actually COMMANDED last tick, which is what the
+/// top-of-descent deferral paces against. Conflating the two defeated the
+/// deferral after one tick per leg (2026-09-13, see [`descent_target_ft`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Vertical {
+    /// The altitude to command now.
+    pub want_alt: f64,
+    /// `carry` for the next tick.
+    pub carry: f64,
+    /// `prev_cmd` for the next tick.
+    pub prev_cmd: f64,
+    /// The terrain floor, when it is what set `want_alt`.
+    pub floored: Option<f64>,
+    /// True when the pilot's altitude is what set `want_alt`.
+    pub pilot: bool,
+}
+
+/// Order of precedence, each one a rule learned the hard way: the plan's
+/// constraint paced to its top of descent, then the PILOT's altitude if they
+/// have taken it, then the ground AHEAD, which outranks everyone: no target
+/// the follower commands may be into terrain, whoever asked for it.
+pub fn vertical_tick(
+    leg: &ProcLeg,
+    carry: f64,
+    prev_cmd: f64,
+    alt_ft: f64,
+    dist_nm: Option<f64>,
+    gs_kts: f64,
+    pilot: Option<f64>,
+    terrain_floor: Option<f64>,
+) -> Vertical {
+    let leg_alt = commanded_alt_ft(leg, carry);
+    let mut want_alt = descent_target_ft(leg_alt, prev_cmd, alt_ft, dist_nm, gs_kts);
+    let from_pilot = pilot.is_some();
+    if let Some(p) = pilot {
+        want_alt = p;
+    }
+    let mut floored = None;
+    if let Some(floor) = terrain_floor {
+        if want_alt < floor {
+            want_alt = floor;
+            floored = Some(floor);
+        }
+    }
+    Vertical {
+        want_alt,
+        carry: leg_alt,
+        prev_cmd: want_alt,
+        floored,
+        pilot: from_pilot && floored.is_none(),
     }
 }
 
@@ -567,6 +760,8 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 
 fn stand_down(voice: &Option<Voice>, line: &str, reason: &str) {
     ACTIVE.store(false, Ordering::SeqCst);
+    clear_pilot_altitude();
+    publish_terrain_floor(None);
     // Drop any cruise-power hold so nothing keeps working the throttle after we
     // hand back (no-op if it was never armed).
     crate::tools::speedhold::release();
@@ -587,6 +782,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     } = plan;
     let handoff = handoff_index(&legs);
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
+    // Process-wide facts must never outlive the flight that set them.
+    clear_pilot_altitude();
+    publish_terrain_floor(None);
     crate::blackbox::record(
         "procedure",
         serde_json::json!({"event": "armed", "name": name, "legs": legs.len(), "approach": matches!(end, EndAction::Approach{..})}),
@@ -617,6 +815,16 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let _ = xp.set_float(HDG_BUG, bug_mag).await;
     // Carry starts at the current altitude so an unconstrained first leg holds.
     let mut carry_alt = xp.get_float(ELEV_M).await.unwrap_or(0.0) * M_TO_FT;
+    // What we COMMANDED last tick, a different thing from the leg constraint
+    // carried across unconstrained fixes, and the pacing `descent_target_ft`
+    // actually needs. They were one variable until 2026-09-13, and since
+    // `carry_alt` is overwritten with the new leg's own constraint one line
+    // after it is read, the top-of-descent test compared the constraint with
+    // itself from the second tick of every leg onward: the leg to JRZ armed at
+    // 55.9 nm and began its 5,300 ft descent immediately, into the Sierra. The
+    // deferral worked for exactly one tick per leg, which is why the logs
+    // always showed one honest 8,000 followed by the dive.
+    let mut prev_cmd_alt = carry_alt;
     let mut last_vs_cmd: Option<f64> = None;
     // The altitude PRESELECT is driven to the leg target too: a stale dial
     // with capture armed (1,122 ft on the Jerez departure, from nobody's
@@ -643,6 +851,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let mut idx = 0usize;
     // The FMS is sequenced once per leg, when the follower first steers at it.
     let mut fms_leg: Option<usize> = None;
+    // Terrain look-ahead: probed on its own slow cadence (the ground does not
+    // move), disabled for the flight the first time the plugin has no answer so
+    // an old build degrades to the previous behaviour instead of stalling the
+    // tick for two seconds every ten.
+    let mut last_probe = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    let mut terrain_available = true;
+    let mut said_floor: Option<f64> = None;
+    let mut said_alt_hold = false;
     while idx < legs.len() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if ABORT.load(Ordering::SeqCst) {
@@ -739,10 +955,84 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // levels off AT the constraint instead of a stale value.
         // A DESCENT waits for its top-of-descent instead of starting the
         // moment the leg arms — the constraint is at the FIX, not here.
-        let leg_alt = commanded_alt_ft(leg, carry_alt);
         let gs_kts = gs_r.map(|v| v * MS_TO_KTS).unwrap_or(0.0);
-        let want_alt = descent_target_ft(leg_alt, carry_alt, alt_ft, dist_nm, gs_kts);
-        carry_alt = leg_alt;
+
+        // --- Terrain: probe the ground AHEAD along the track and never command
+        // an altitude into it. Skipped on an approach, whose own procedure owns
+        // the descent below the enroute floor (and whose platform altitudes
+        // would otherwise be lifted out of the glideslope by this).
+        let on_approach = matches!(end, EndAction::Approach { .. });
+        if terrain_available
+            && !on_approach
+            && last_probe.elapsed().as_secs_f64() >= TERRAIN_PROBE_SECS
+        {
+            last_probe = std::time::Instant::now();
+            // Look along the track we are STEERING, out to the fix at most: near
+            // a field the answer should be about the field, not the hills past it.
+            let brg = bearing_to_fix(lat, lon, leg)
+                .or(psi_v)
+                .unwrap_or_else(|| bug_mag + mag_var);
+            let look = dist_nm
+                .map(|d| (d + 2.0).min(TERRAIN_LOOK_NM))
+                .unwrap_or(TERRAIN_LOOK_NM);
+            let pts = look_ahead_points(lat, lon, brg, look, TERRAIN_POINTS);
+            match crate::terrain::max_elevation_ft(&xp, &pts).await {
+                Some(ground) => publish_terrain_floor(Some(ground + TERRAIN_CLEARANCE_FT)),
+                None => {
+                    terrain_available = false;
+                    publish_terrain_floor(None);
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "terrain_probe_unavailable"}),
+                    );
+                }
+            }
+        }
+        // --- The pilot's altitude outranks the plan's, the ground outranks
+        // both. The autopilot tool hands a commanded altitude to the follower
+        // rather than writing the dial, so the follower stays the one writer
+        // and an override cannot be undone by the next tick.
+        let v = vertical_tick(
+            leg,
+            carry_alt,
+            prev_cmd_alt,
+            alt_ft,
+            dist_nm,
+            gs_kts,
+            pilot_altitude(),
+            terrain_floor_ahead_ft(),
+        );
+        let want_alt = v.want_alt;
+        carry_alt = v.carry;
+        prev_cmd_alt = v.prev_cmd;
+        match v.floored {
+            Some(floor) => {
+                if said_floor.is_none_or(|p| floor > p + TERRAIN_RESAY_FT) {
+                    said_floor = Some(floor);
+                    alert(
+                        &voice,
+                        Priority::Caution,
+                        &format!(
+                            "Terrain ahead, holding {} feet.",
+                            crate::auto_status::commas((floor / 100.0).ceil() as i64 * 100)
+                        ),
+                    );
+                }
+                crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({"event": "terrain_floor", "idx": idx, "floor": floor,
+                                       "alt_ft": alt_ft, "agl_ft": agl_ft, "dist_nm": dist_nm}),
+                );
+            }
+            // Ground fell away: a later rise is news again.
+            None => {
+                if said_floor.is_some_and(|p| {
+                    terrain_floor_ahead_ft().is_none_or(|f| f < p - TERRAIN_RESAY_FT)
+                }) {
+                    said_floor = None;
+                }
+            }
+        }
         if last_alt_dial.is_none_or(|v| (v - want_alt).abs() > 50.0) {
             let _ = xp.set_float(ALT_DIAL, want_alt).await;
             last_alt_dial = Some(want_alt);
@@ -769,7 +1059,21 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             let _ = xp.set_float(VS_DIAL, vs_cmd).await;
             last_vs_cmd = Some(vs_cmd);
         }
-        DETAIL.set(leg_detail(&leg.fix_ident, dist_nm, gs_kts, alt_ft, want_alt));
+        let owner = if v.floored.is_some() {
+            AltOwner::Terrain
+        } else if v.pilot {
+            AltOwner::Pilot
+        } else {
+            AltOwner::Plan
+        };
+        DETAIL.set(leg_detail(
+            &leg.fix_ident,
+            dist_nm,
+            gs_kts,
+            alt_ft,
+            want_alt,
+            owner,
+        ));
         crate::auto_status::set_ap_targets(Some(bug_mag), Some(want_alt), Some(vs_cmd));
 
         crate::blackbox::record(
@@ -811,8 +1115,28 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     None,
                     rwy_id.clone(),
                 );
+                clear_pilot_altitude();
+                publish_terrain_floor(None);
                 ACTIVE.store(false, Ordering::SeqCst);
                 return;
+            }
+        }
+
+        // A to-altitude leg is satisfied by ALTITUDE, so one cannot sequence
+        // while the pilot owns that altitude. Say so once rather than orbit a
+        // heading in silence waiting for a climb nobody is flying.
+        if dist_nm.is_none() && pilot_altitude().is_some() && !said_alt_hold {
+            said_alt_hold = true;
+            if let Some(t) = leg.alt1_ft {
+                alert(
+                    &voice,
+                    Priority::Caution,
+                    &format!(
+                        "This leg wants {} feet and you have the altitude. Say an altitude to \
+                         carry on, or cancel.",
+                        crate::auto_status::commas(t.round() as i64)
+                    ),
+                );
             }
         }
 
@@ -862,6 +1186,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             );
         }
     }
+    clear_pilot_altitude();
+    publish_terrain_floor(None);
     ACTIVE.store(false, Ordering::SeqCst);
 }
 
@@ -916,6 +1242,106 @@ mod tests {
             alt2_ft: None,
             is_faf: false,
         }
+    }
+
+    /// The leg to JRZ as the LEMG-LEJR plan carried it: a fix 55.9 nm out with
+    /// a 2,700 ft constraint, armed at 8,000 ft in the cruise.
+    fn jrz() -> ProcLeg {
+        let mut l = leg("JRZ", 36.7446, -6.0601);
+        l.alt1_ft = Some(2700.0);
+        l
+    }
+
+    /// The loop's own tick, at the 135 kt the sortie was flown at.
+    fn tick(
+        leg: &ProcLeg,
+        carry: f64,
+        prev: f64,
+        alt: f64,
+        dist_nm: f64,
+        pilot: Option<f64>,
+        floor: Option<f64>,
+    ) -> Vertical {
+        vertical_tick(leg, carry, prev, alt, Some(dist_nm), 135.0, pilot, floor)
+    }
+
+    /// THE bug of 2026-09-13: the descent must WAIT for its top of descent on
+    /// every tick, not only the first of the leg. Ticking the real bookkeeping
+    /// forward the way the loop does is the whole test: `descent_target_ft`
+    /// alone always passed.
+    #[test]
+    fn the_descent_waits_for_its_top_of_descent_tick_after_tick() {
+        let leg = jrz();
+        let (mut carry, mut prev) = (8000.0, 8000.0);
+        // Cruise, 55.9 nm to run: 5,300 ft at 700 fpm and 135 kt needs ~18 nm.
+        for _ in 0..20 {
+            let v = tick(&leg, carry, prev, 8000.0, 55.9, None, None);
+            assert_eq!(v.want_alt, 8000.0, "held the cruise to the top of descent");
+            carry = v.carry;
+            prev = v.prev_cmd;
+        }
+        // Inside it, the constraint is commanded and stays commanded.
+        let v = tick(&leg, carry, prev, 8000.0, 17.0, None, None);
+        assert_eq!(v.want_alt, 2700.0);
+        let v = tick(&leg, v.carry, v.prev_cmd, 7000.0, 15.0, None, None);
+        assert_eq!(v.want_alt, 2700.0);
+    }
+
+    /// The ground outranks the plan. Grazalema probes at 3,861 ft under the
+    /// leg that wanted 2,700: the follower flies the floor, and says so.
+    #[test]
+    fn terrain_ahead_floors_the_plans_constraint() {
+        let floor = 3861.0 + TERRAIN_CLEARANCE_FT;
+        let v = tick(&jrz(), 2700.0, 2700.0, 4000.0, 38.0, None, Some(floor));
+        assert_eq!(v.want_alt, floor);
+        assert_eq!(v.floored, Some(floor));
+        // And the floor is what carries to the next tick, so the climb holds.
+        assert_eq!(v.prev_cmd, floor);
+        // Low ground under a high target changes nothing.
+        let v = tick(&jrz(), 8000.0, 8000.0, 8000.0, 55.9, None, Some(1300.0));
+        assert_eq!(v.want_alt, 8000.0);
+        assert_eq!(v.floored, None);
+    }
+
+    /// A pilot's altitude outranks the plan's constraint: the override that
+    /// was silently undone every 500 ms while the aircraft sank to 220 ft AGL.
+    #[test]
+    fn the_pilots_altitude_outranks_the_plan() {
+        let v = tick(&jrz(), 2700.0, 2700.0, 2800.0, 38.0, Some(4000.0), None);
+        assert_eq!(v.want_alt, 4000.0);
+        assert!(v.pilot);
+        // It survives the next tick, and the one after: the plan never takes
+        // the altitude back on its own.
+        let v = tick(&jrz(), v.carry, v.prev_cmd, 3200.0, 36.0, Some(4000.0), None);
+        assert_eq!(v.want_alt, 4000.0);
+        let v = tick(&jrz(), v.carry, v.prev_cmd, 4000.0, 34.0, Some(4000.0), None);
+        assert_eq!(v.want_alt, 4000.0);
+    }
+
+    /// ...but the ground outranks the PILOT too. Four thousand feet was itself
+    /// into the ridge; the follower holds the floor, not the number asked for.
+    #[test]
+    fn terrain_outranks_the_pilot_as_well() {
+        let floor = 3861.0 + TERRAIN_CLEARANCE_FT;
+        let v = tick(&jrz(), 2700.0, 2700.0, 2800.0, 38.0, Some(4000.0), Some(floor));
+        assert_eq!(v.want_alt, floor);
+        assert_eq!(v.floored, Some(floor));
+        assert!(!v.pilot, "the floor set it, not the pilot");
+    }
+
+    /// The probe looks along the TRACK, not at the aircraft: the first point is
+    /// ahead of us and the last is the full look-ahead out.
+    #[test]
+    fn look_ahead_points_walk_down_the_track() {
+        let pts = look_ahead_points(36.6354, -5.2307, 285.0, 15.0, TERRAIN_POINTS);
+        assert_eq!(pts.len(), TERRAIN_POINTS);
+        let d = |(a, b): (f64, f64)| crate::nav::haversine_nm(36.6354, -5.2307, a, b);
+        assert!(d(pts[0]) < 1.5, "first point is close ahead: {}", d(pts[0]));
+        let last = d(*pts.last().unwrap());
+        assert!((last - 15.0).abs() < 0.5, "last point is the look-ahead: {last}");
+        // Heading 285 is west and slightly north of the aircraft.
+        assert!(pts.last().unwrap().1 < -5.2307);
+        assert!(pts.last().unwrap().0 > 36.6354);
     }
 
     fn to_alt(desc: char, alt: f64) -> ProcLeg {
@@ -1070,13 +1496,25 @@ mod tests {
     #[test]
     fn leg_detail_reads_like_a_progress_line() {
         assert_eq!(
-            leg_detail("PIMOS", Some(12.34), 120.0, 4820.0, 5497.0),
+            leg_detail("PIMOS", Some(12.34), 120.0, 4820.0, 5497.0, AltOwner::Plan),
             "to PIMOS, 12.3 nm, 6 min, climbing to 5,500 ft"
         );
-        assert_eq!(leg_detail("", None, 0.0, 5480.0, 5500.0), "level at 5,500 ft");
         assert_eq!(
-            leg_detail("BLN", Some(3.0), 10.0, 6000.0, 3000.0),
+            leg_detail("", None, 0.0, 5480.0, 5500.0, AltOwner::Plan),
+            "level at 5,500 ft"
+        );
+        assert_eq!(
+            leg_detail("BLN", Some(3.0), 10.0, 6000.0, 3000.0, AltOwner::Plan),
             "to BLN, 3.0 nm, descending to 3,000 ft"
+        );
+        // Not the plan's number: the panel says whose it is.
+        assert_eq!(
+            leg_detail("JRZ", Some(38.0), 135.0, 2800.0, 4900.0, AltOwner::Terrain),
+            "to JRZ, 38.0 nm, 17 min, climbing to 4,900 ft, terrain floor"
+        );
+        assert_eq!(
+            leg_detail("JRZ", Some(38.0), 135.0, 4000.0, 4000.0, AltOwner::Pilot),
+            "to JRZ, 38.0 nm, 17 min, level at 4,000 ft, your altitude"
         );
     }
 

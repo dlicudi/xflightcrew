@@ -373,6 +373,12 @@ pub fn phase_boundary(section: &str, config: &Config, voice: &Voice) {
         start(idx, Flavour::Monitor, config.clone(), voice.clone());
         return;
     }
+    // The instructor's full-flight syllabus runs the list at its phase
+    // itself, read-and-watch, no proposal: the student is flying it.
+    if crate::instructor::syllabus_active() {
+        start(idx, Flavour::Instruct, config.clone(), voice.clone());
+        return;
+    }
     *lock(&PROPOSAL) = Some((idx, Instant::now()));
     crate::blackbox::record(
         "checklist",
@@ -740,6 +746,14 @@ pub fn start(idx: usize, flavour: Flavour, config: Config, voice: Voice) -> bool
     if !crate::mode::copilot_enabled() {
         return false;
     }
+    // An instructor never writes: with the crew's hands off, the Crew
+    // flavour IS the Instruct flavour, decided here at the one door every
+    // caller (a spoken title, a proposal's "go ahead") walks through.
+    let flavour = if matches!(flavour, Flavour::Crew) && !crate::mode::crew_actuates() {
+        Flavour::Instruct
+    } else {
+        flavour
+    };
     let lists = lists();
     if idx >= lists.len() {
         return false;

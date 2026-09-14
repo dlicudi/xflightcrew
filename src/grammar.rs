@@ -239,6 +239,14 @@ pub fn declined(transcript: &str, registry: &Registry) -> Option<String> {
     {
         return Some("I don't have an autopilot on this aircraft.".to_string());
     }
+    // Carb heat on a fuel-injected engine (the 172SP's IO-360, the SR22, the
+    // Baron): the words are a real command, the airframe just has no
+    // carburettor. Name that rather than fall through to "Say again?".
+    if (t.contains("carb") || t.contains("carburetor") || t.contains("carburettor"))
+        && registry.get("set_carb_heat").is_none()
+    {
+        return Some("This engine is fuel injected, so there's no carburettor heat.".to_string());
+    }
     None
 }
 
@@ -3097,6 +3105,21 @@ mod tests {
         assert!(declined("heading 270", &creg).is_none());
         // A non-AP command never declines here (handled elsewhere).
         assert!(declined("flaps up", &reg).is_none());
+    }
+
+    #[test]
+    fn declines_carb_heat_on_a_fuel_injected_engine() {
+        // The 172SP is an IO-360: fuel injected, no carburettor, no knob on the
+        // panel (verified 2026-09-13). Asking for carb heat must be declined by
+        // name, not answered with "Say again?" or a write to carb_heat_ratio.
+        let prof = aircraft::load("cessna_172sp").expect("172 profile");
+        let reg = Registry::for_aircraft(&prof);
+        assert!(reg.get("set_carb_heat").is_none(), "IO-360s are injected");
+        assert!(declined("carb heat on", &reg).is_some());
+        assert!(declined("carburettor heat off", &reg).is_some());
+        // The DC-3's radials DO have it — no decline there.
+        let dc3 = aircraft::load("dc3").expect("dc3 profile");
+        assert!(declined("carb heat on", &Registry::for_aircraft(&dc3)).is_none());
     }
 
     #[test]

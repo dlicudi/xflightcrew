@@ -89,8 +89,8 @@ static void WriteOptTone(void*, int v) { g_opt_negative_tone = v; }
 static int ReadOptMute(void*) { return g_opt_monitor_mute; }
 static void WriteOptMute(void*, int v) { g_opt_monitor_mute = v; }
 
-// App mode (Both / Copilot only / ATC only). The app publishes the live mode
-// (0/1/2, mode.rs panel_index) and polls for the pilot's pick; a pick applies
+// App mode (Both / Copilot only / ATC only / Instructor). The app publishes
+// the live mode (0..3, mode.rs panel_index) and polls for the pilot's pick; a pick applies
 // within ~2 s and persists to prefs.json as the next boot's default. -1 =
 // untouched, which is also how the app detects a plugin reload wiped this
 // state and re-publishes.

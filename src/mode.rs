@@ -5,7 +5,11 @@
 //! ever loads, and radio-keyed speech is none of our business. `AtcOnly` is
 //! the world without the crew: tower/approach/ATIS answer the radio, but no
 //! intercom persona, no tools, and the LLM is never touched (ATC is fully
-//! deterministic).
+//! deterministic). `Instructor` is the crew with its hands off: the
+//! intercom persona, the monitor's callouts, the ATC coach and the lessons
+//! ([`crate::instructor`]) are on, and every curated tool, fix action and
+//! cockpit duty is refused at its door (`crew_actuates`), so nothing of
+//! ours can touch a control while the pilot is being taught.
 //!
 //! Runtime-toggleable from the plugin's Settings tab (`xcopilot/opt/mode`);
 //! the pick persists via [`crate::prefs`]. Precedence: `XCOPILOT_MODE` env
@@ -22,6 +26,7 @@ pub enum Mode {
     Both,
     CopilotOnly,
     AtcOnly,
+    Instructor,
 }
 
 impl Mode {
@@ -32,6 +37,7 @@ impl Mode {
             "both" | "all" | "full" => Some(Mode::Both),
             "copilot" | "copilot-only" | "copilot_only" | "crew" => Some(Mode::CopilotOnly),
             "atc" | "atc-only" | "atc_only" | "world" => Some(Mode::AtcOnly),
+            "instructor" | "instruct" | "cfi" | "lesson" => Some(Mode::Instructor),
             _ => None,
         }
     }
@@ -42,6 +48,7 @@ impl Mode {
             Mode::Both => "both",
             Mode::CopilotOnly => "copilot",
             Mode::AtcOnly => "atc",
+            Mode::Instructor => "instructor",
         }
     }
 
@@ -51,6 +58,7 @@ impl Mode {
             Mode::Both => 0,
             Mode::CopilotOnly => 1,
             Mode::AtcOnly => 2,
+            Mode::Instructor => 3,
         }
     }
 
@@ -59,6 +67,7 @@ impl Mode {
             0 => Some(Mode::Both),
             1 => Some(Mode::CopilotOnly),
             2 => Some(Mode::AtcOnly),
+            3 => Some(Mode::Instructor),
             _ => None,
         }
     }
@@ -79,9 +88,23 @@ pub fn atc_enabled() -> bool {
     get() != Mode::CopilotOnly
 }
 
-/// Is the crew side on — LLM/tools, intercom persona, crew watches.
+/// Is the crew side on: the intercom persona, crew watches, the tools'
+/// door (which `crew_actuates` may still keep shut).
 pub fn copilot_enabled() -> bool {
     get() != Mode::AtcOnly
+}
+
+/// May the crew move anything? False in instructor mode (hands off by
+/// construction) and with no crew at all. Every writer the crew owns that
+/// is not a spoken tool checks THIS: the monitor's fix actions, the cockpit
+/// duties, the checklist's Crew flavour.
+pub fn crew_actuates() -> bool {
+    !matches!(get(), Mode::AtcOnly | Mode::Instructor)
+}
+
+/// Is the instructor in the right seat?
+pub fn instructing() -> bool {
+    get() == Mode::Instructor
 }
 
 /// Tests that SET the process-wide mode must hold this, or they stomp each
@@ -96,12 +119,13 @@ mod tests {
 
     #[test]
     fn parse_roundtrips_and_forgives() {
-        for m in [Mode::Both, Mode::CopilotOnly, Mode::AtcOnly] {
+        for m in [Mode::Both, Mode::CopilotOnly, Mode::AtcOnly, Mode::Instructor] {
             assert_eq!(Mode::parse(m.as_str()), Some(m));
             assert_eq!(Mode::from_panel_index(m.panel_index()), Some(m));
         }
         assert_eq!(Mode::parse("ATC-Only"), Some(Mode::AtcOnly));
         assert_eq!(Mode::parse("crew"), Some(Mode::CopilotOnly));
+        assert_eq!(Mode::parse("Instructor"), Some(Mode::Instructor));
         assert_eq!(Mode::parse(""), None);
         assert_eq!(Mode::parse("banana"), None);
         assert_eq!(Mode::from_panel_index(-1), None);
@@ -112,9 +136,13 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         set(Mode::AtcOnly);
         assert!(atc_enabled() && !copilot_enabled());
+        assert!(!crew_actuates() && !instructing());
         set(Mode::CopilotOnly);
-        assert!(!atc_enabled() && copilot_enabled());
+        assert!(!atc_enabled() && copilot_enabled() && crew_actuates());
+        set(Mode::Instructor);
+        assert!(atc_enabled() && copilot_enabled(), "the persona stays");
+        assert!(!crew_actuates() && instructing(), "the hands do not");
         set(Mode::Both);
-        assert!(atc_enabled() && copilot_enabled());
+        assert!(atc_enabled() && copilot_enabled() && crew_actuates());
     }
 }

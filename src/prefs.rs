@@ -18,7 +18,7 @@ struct Prefs {
     /// picked from the panel's Settings tab. `None` = never chosen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pilot_voice: Option<String>,
-    /// The app mode ("both" | "copilot" | "atc") — the panel's last pick,
+    /// The app mode ("both" | "copilot" | "atc" | "instructor") — the panel's last pick,
     /// honored at the next boot unless `XCOPILOT_MODE` overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
@@ -62,7 +62,7 @@ pub fn save_pilot_voice(spec: &str) {
     store(prefs);
 }
 
-/// The saved app mode, if any ("both" | "copilot" | "atc").
+/// The saved app mode, if any ("both" | "copilot" | "atc" | "instructor").
 pub fn mode() -> Option<String> {
     load().mode
 }
