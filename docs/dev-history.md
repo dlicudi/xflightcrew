@@ -3591,3 +3591,42 @@ The copilot process ended at 14:00:19Z, seven seconds into the go-around,
 with no shutdown line and no macOS crash report; the sim was found paused at
 100 ft AGL in the climb. Cause unknown (a Ctrl-C at the pause is the simplest
 reading).
+
+## The plan preflighted at the gate: fuel, load and both runways before an engine turns - 2026-09-15
+
+Asked whether "fly the flight plan" checks the fuel and the runway, the
+honest answer was no. The arm (`tools/full_auto.rs`) checked that the plan
+departed from this field, had enroute fixes and a destination the data knew
+(`brief_arrival`, added after the Gibraltar crash); the block-fuel-versus-
+tanks line lived only in the spoken plan summary and full auto never called
+it. The monitor's pre-takeoff fuel caution compares endurance to the
+profile's reserve, not to the trip, so a three-hour plan with two hours in
+the tanks departed without a word. The departure runway was judged at the
+line-up (the roll x 1.4 against the pavement ahead) after the start and the
+taxi; the destination's length was never judged for a SimBrief plan at all
+(only the local planner had `runway_refusal`).
+
+SimBrief's fetcher carries the load sheet (`weights`: `pax_count_actual`,
+`bag_count_actual`, `cargo`, `payload`, `est_tow`/`max_tow`,
+`est_ldw`/`max_ldw`, in `params/units`) and the minimum takeoff fuel
+(`fuel/min_takeoff`). The live plan that morning: LXGB-LEAX in the 172,
+three aboard, 67 lb of cargo, 240 lb block, 227 lb minimum, planned at max
+takeoff weight to the pound. `simbrief::PlanWeights` now parses it to kilos
+(the sim's `weight/m_*` unit; the gallon figures go through avgas density
+and are a third out on a jet) and remembers the plan's unit for speech.
+
+`full_auto::preflight` runs at the arm with the sim's `m_fuel_total`,
+`m_fixed` (payload) and `m_total` read in one join and both fields from one
+apt.dat pass. Refusals, each with the number: destination shorter than the
+landing distance (`runway_needed_ft`), origin shorter than
+`takeoff_needed_m` (the line-up's rule, now shared), all-up weight over the
+plan's max TOW (else the profile's `max_gross_lb`), fuel under the plan's
+minimum. Said, not refused: fuel between the minimum and the block (both
+figures), and a payload the sim disagrees with by more than 10 percent and
+20 kg. The ack then says who is aboard. Everything unreadable or absent is
+skipped: a local plan has no sheet and is briefed on fuel alone, a field
+with no rows is `brief_arrival`'s. Tests: `a_plan_that_fits_is_briefed...`,
+`a_runway_too_short_at_either_end...`, `overweight_and_under_fuelled...`,
+`a_load_the_sim_disagrees_with...`, and the parser's
+`the_load_sheet_parses_in_kilos...` over the fetcher's own strings.
+

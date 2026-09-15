@@ -41,6 +41,12 @@ pub const LONGITUDE: &str = "sim/flightmodel/position/longitude";
 pub const ELEVATION_M: &str = "sim/flightmodel/position/elevation";
 /// Total fuel mass. X-Plane reports this in kilograms regardless of airframe.
 pub const FUEL_TOTAL_KG: &str = "sim/flightmodel/weight/m_fuel_total";
+/// The payload the pilot loaded in Weight & Balance (passengers, bags, cargo),
+/// kg — the sim's side of the plan's load sheet.
+pub const PAYLOAD_KG: &str = "sim/flightmodel/weight/m_fixed";
+/// All-up mass now (empty + payload + fuel), kg — what a max takeoff weight
+/// is compared against.
+pub const TOTAL_WEIGHT_KG: &str = "sim/flightmodel/weight/m_total";
 /// Per-tank fuel mass (kg), one element per tank. For a 2-tank single it's
 /// `[left, right]`. Read as an array (not cached); used for the balance callout.
 pub const FUEL_PER_TANK_KG: &str = "sim/flightmodel/weight/m_fuel";

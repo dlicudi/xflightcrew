@@ -337,11 +337,7 @@ pub struct Airport {
 impl Airport {
     fn from_info(icao: &str, a: &nav::AirportInfo) -> Option<Airport> {
         let (lat, lon) = a.position()?;
-        let longest = a
-            .runways
-            .iter()
-            .map(|r| nav::haversine_nm(r.lat_a, r.lon_a, r.lat_b, r.lon_b) * 1852.0 * M_TO_FT)
-            .fold(0.0, f64::max);
+        let longest = longest_runway_ft(a);
         Some(Airport {
             icao: icao.to_string(),
             name: a.name.trim().to_string(),
@@ -509,6 +505,14 @@ pub fn route_samples(o: (f64, f64), d: (f64, f64)) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// The longest runway a field has, feet (0 with no runway rows).
+pub fn longest_runway_ft(a: &nav::AirportInfo) -> f64 {
+    a.runways
+        .iter()
+        .map(|r| nav::haversine_nm(r.lat_a, r.lon_a, r.lat_b, r.lon_b) * 1852.0 * M_TO_FT)
+        .fold(0.0, f64::max)
+}
+
 /// The runway the destination must offer, feet: the profile's landing
 /// distance, else its takeoff distance (what every GA POH gives), else no check.
 pub fn runway_needed_ft(landing_ft: Option<f64>, takeoff_ft: Option<f64>) -> Option<f64> {
@@ -548,6 +552,11 @@ impl Planned {
             block_fuel_gal: f.map(|f| f.block_gal).unwrap_or(0.0),
             trip_fuel_gal: f.map(|f| f.trip_gal).unwrap_or(0.0),
             reserve_gal: f.map(|f| f.reserve_gal).unwrap_or(0.0),
+            block_fuel_kg: f.map(|f| f.block_gal * AVGAS_KG_PER_GAL).unwrap_or(0.0),
+            min_takeoff_fuel_kg: f
+                .map(|f| (f.trip_gal + f.reserve_gal) * AVGAS_KG_PER_GAL)
+                .unwrap_or(0.0),
+            weights: None,
             route: "direct".to_string(),
             wind_comp_kts: 0.0,
             wind_dir: 0.0,
@@ -651,7 +660,7 @@ pub fn spell_code(code: &str) -> String {
         .join(" ")
 }
 
-fn spoken_feet(ft: f64) -> String {
+pub fn spoken_feet(ft: f64) -> String {
     let n = ft.round() as i64;
     let digits = n.abs().to_string();
     let bytes = digits.as_bytes();

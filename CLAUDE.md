@@ -214,7 +214,20 @@ capped, semicircular by bearing, VFR +500 unless pressurised). Fuel comes
 from the profile's cruise speed and `cruise_burn_kg_hr` or is NOT spoken. A
 destination runway shorter than the landing (else takeoff) distance is
 REFUSED. A local plan never expires into a SimBrief refetch and needs no
-SimBrief ID; only an explicit refresh may replace it. **A spoken ask for the
+SimBrief ID; only an explicit refresh may replace it. **"Fly the flight plan" is preflighted AT THE ARM**
+(`full_auto::preflight`, pure and tested; blackbox `preflight` on the
+`full_auto` kind): the destination's longest runway against the profile's
+landing distance, this field's against the factored takeoff roll
+(`takeoff_needed_m`, the line-up's own rule), the sim's all-up weight
+(`weight/m_total`) against the plan's max takeoff weight (else the profile's
+max gross), the tanks against the plan's MINIMUM takeoff fuel (refused
+below, said with both numbers between it and the block), and the sim's
+payload (`weight/m_fixed`) against the OFP's load sheet (`PlanWeights`:
+pax, bags, cargo, payload, TOW/LDW limits, converted to kilos from the
+plan's own unit). A refusal names the number; an unknown figure is skipped,
+never guessed; the pilot hears the fuel and who is aboard in the arming
+ack. Until 2026-09-15 the arm checked only geography: the fuel was found at
+the enroute caution and the runway at the hold. **A spoken ask for the
 plan ("load / what's the flight plan") re-fetches a SimBrief plan EVERY
 time** (`PlanFetch::Asked`; the 10 min TTL is only for the implicit
 consumers: fuel, TOD, ETA): the pilot regenerates on the website and says

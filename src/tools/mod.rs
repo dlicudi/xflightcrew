@@ -315,6 +315,15 @@ impl Registry {
                     bus_power_on_cmds: bus_power_on_cmds(&profile.electrical),
                     park_brake_valve_set: profile.park_brake_valve_set,
                     takeoff_roll_m,
+                    landing_distance_ft: profile
+                        .reference
+                        .as_ref()
+                        .and_then(|r| r.landing_distance_ft),
+                    takeoff_distance_ft: profile
+                        .reference
+                        .as_ref()
+                        .and_then(|r| r.takeoff_distance_ft),
+                    max_gross_lb: profile.reference.as_ref().and_then(|r| r.max_gross_lb),
                     takeoff_flap_ratio: profile.flaps.as_ref().and_then(|f| f.takeoff_ratio),
                     cruise_ias_kts: profile.reference.as_ref().and_then(|r| r.cruise_ias_kts),
                     transition_altitude_ft: profile.transition_altitude_ft,

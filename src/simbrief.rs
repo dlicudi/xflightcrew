@@ -15,6 +15,7 @@ use serde_json::Value;
 
 const AVGAS_LB_PER_GAL: f64 = 6.0;
 const AVGAS_KG_PER_GAL: f64 = 2.72;
+const LB_PER_KG: f64 = 2.204_62;
 
 /// Where a plan came from. A LOCAL plan (the direct-to planner) is the
 /// pilot's own decision and never silently replaced by a SimBrief refetch.
@@ -47,6 +48,62 @@ pub struct FlightPlan {
     pub tod_to_dest_nm: f64,
     /// Enroute waypoints (named fixes + destination), for loading into the GPS/FMS.
     pub waypoints: Vec<Waypoint>,
+    /// Block fuel in KILOGRAMS, the sim's own unit, straight from the plan's
+    /// figure and never through a fuel density: the gallon figures above go
+    /// through avgas density and are wrong by a third on a jet. 0 = unknown.
+    pub block_fuel_kg: f64,
+    /// The plan's MINIMUM takeoff fuel (trip + reserves, no extra), kg. Below
+    /// this the departure is refused; between this and block it is a caution.
+    pub min_takeoff_fuel_kg: f64,
+    /// The load sheet, when the plan carries one (a local plan does not).
+    pub weights: Option<PlanWeights>,
+}
+
+/// The OFP's load sheet, in kilograms. SimBrief plans in the user's unit
+/// (`params/units`, lbs or kgs); everything here is converted on the way in so
+/// it compares against the sim's `weight/m_*` datarefs without a unit in the
+/// way, and `spoken_lbs` remembers which unit the pilot planned in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanWeights {
+    pub pax: u32,
+    pub bags: u32,
+    pub cargo_kg: f64,
+    /// Passengers + bags + cargo: what the sim's `m_fixed` should hold.
+    pub payload_kg: f64,
+    pub est_tow_kg: f64,
+    pub max_tow_kg: f64,
+    pub est_ldw_kg: f64,
+    pub max_ldw_kg: f64,
+    /// The plan was generated in pounds; speak weights in pounds.
+    pub spoken_lbs: bool,
+}
+
+impl PlanWeights {
+    /// A weight in the plan's own unit, rounded to the nearest ten.
+    pub fn spoken(&self, kg: f64) -> String {
+        let (v, unit) = if self.spoken_lbs {
+            (kg * LB_PER_KG, "pounds")
+        } else {
+            (kg, "kilos")
+        };
+        spoken_weight(v, unit)
+    }
+}
+
+/// "2,450 pounds": rounded to ten, grouped, so the TTS says two thousand four
+/// hundred and fifty and not twenty-four fifty.
+pub fn spoken_weight(v: f64, unit: &str) -> String {
+    let n = ((v / 10.0).round() * 10.0) as i64;
+    let digits = n.abs().to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::new();
+    for (i, c) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*c as char);
+    }
+    format!("{out} {unit}")
 }
 
 /// A route waypoint for the FMS: an ident plus position and planned altitude.
@@ -89,13 +146,15 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
         .and_then(Value::as_str)
         .unwrap_or("lbs")
         .to_ascii_lowercase();
+    let in_kg = unit.starts_with("kg");
     let to_gal = move |raw: f64| {
-        if unit.starts_with("kg") {
+        if in_kg {
             raw / AVGAS_KG_PER_GAL
         } else {
             raw / AVGAS_LB_PER_GAL
         }
     };
+    let to_kg = move |raw: f64| if in_kg { raw } else { raw / LB_PER_KG };
     let s = |path: &str| {
         v.pointer(path)
             .and_then(Value::as_str)
@@ -162,6 +221,36 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
         wind_spd_kts: n("/general/avg_wind_spd"),
         tod_to_dest_nm: navlog_tod_to_dest(&v),
         waypoints,
+        block_fuel_kg: to_kg(n("/fuel/plan_ramp")),
+        min_takeoff_fuel_kg: to_kg(n("/fuel/min_takeoff")),
+        weights: parse_weights(&v, in_kg),
+    })
+}
+
+/// The `weights` block, when the plan has one with a takeoff weight in it.
+fn parse_weights(v: &Value, in_kg: bool) -> Option<PlanWeights> {
+    let to_kg = |raw: f64| if in_kg { raw } else { raw / LB_PER_KG };
+    let n = |k: &str| v.pointer(&format!("/weights/{k}")).and_then(num_of);
+    let est_tow_kg = to_kg(n("est_tow")?);
+    if est_tow_kg <= 0.0 {
+        return None;
+    }
+    Some(PlanWeights {
+        pax: n("pax_count_actual")
+            .or_else(|| n("pax_count"))
+            .unwrap_or(0.0)
+            .max(0.0) as u32,
+        bags: n("bag_count_actual")
+            .or_else(|| n("bag_count"))
+            .unwrap_or(0.0)
+            .max(0.0) as u32,
+        cargo_kg: to_kg(n("cargo").unwrap_or(0.0)),
+        payload_kg: to_kg(n("payload").unwrap_or(0.0)),
+        est_tow_kg,
+        max_tow_kg: to_kg(n("max_tow").unwrap_or(0.0)),
+        est_ldw_kg: to_kg(n("est_ldw").unwrap_or(0.0)),
+        max_ldw_kg: to_kg(n("max_ldw").unwrap_or(0.0)),
+        spoken_lbs: !in_kg,
     })
 }
 
@@ -269,4 +358,54 @@ fn navlog_tod_to_dest(v: &Value) -> f64 {
 fn num_of(v: &Value) -> Option<f64> {
     v.as_f64()
         .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The load sheet as the fetcher sends it (LXGB-LEAX in the 172,
+    /// 2026-09-15: three aboard, 67 lb of cargo, planned at max takeoff
+    /// weight). Everything is a string, the unit is the pilot's (lbs), and
+    /// the kilo figures must come out right for the sim's `weight/m_*`.
+    fn ofp(units: &str) -> Value {
+        serde_json::json!({
+            "params": { "units": units },
+            "fuel": { "plan_ramp": "240", "min_takeoff": "227", "enroute_burn": "64", "reserve": "34" },
+            "weights": {
+                "oew": "1631", "pax_count": "3", "bag_count": "3",
+                "pax_count_actual": "3", "bag_count_actual": "1",
+                "cargo": "67", "payload": "592",
+                "est_zfw": "2223", "max_zfw": "2450",
+                "est_tow": "2450", "max_tow": "2450",
+                "est_ldw": "2386", "max_ldw": "2450", "est_ramp": "2463"
+            }
+        })
+    }
+
+    #[test]
+    fn the_load_sheet_parses_in_kilos_whatever_the_plan_was_made_in() {
+        let w = parse_weights(&ofp("lbs"), false).expect("a load sheet");
+        assert_eq!((w.pax, w.bags), (3, 1));
+        assert!(
+            (w.cargo_kg - 67.0 / LB_PER_KG).abs() < 0.01,
+            "{}",
+            w.cargo_kg
+        );
+        assert!((w.payload_kg - 268.5).abs() < 0.5, "{}", w.payload_kg);
+        assert!((w.max_tow_kg - 1111.3).abs() < 0.5, "{}", w.max_tow_kg);
+        assert!(w.spoken_lbs);
+        assert_eq!(w.spoken(w.payload_kg), "590 pounds");
+
+        let w = parse_weights(&ofp("kgs"), true).expect("a load sheet");
+        assert_eq!(w.max_tow_kg, 2450.0);
+        assert!(!w.spoken_lbs);
+        assert_eq!(w.spoken(w.cargo_kg), "70 kilos");
+
+        // No takeoff weight = no sheet, never a sheet of zeros.
+        assert!(
+            parse_weights(&serde_json::json!({"weights": {"pax_count": "3"}}), false).is_none()
+        );
+        assert!(parse_weights(&serde_json::json!({}), false).is_none());
+    }
 }

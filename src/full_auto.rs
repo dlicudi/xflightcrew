@@ -230,7 +230,7 @@ pub fn wait_status() -> Option<String> {
     (!w.is_empty()).then(|| format!("waiting for {w}"))
 }
 
-fn event(stage: &str, detail: serde_json::Value) {
+pub(crate) fn event(stage: &str, detail: serde_json::Value) {
     if let Ok(mut s) = STAGE.lock() {
         *s = stage.replace('_', " ");
     }
@@ -2094,6 +2094,160 @@ async fn ensure_takeoff_cleared(
     true
 }
 
+/// Pavement the takeoff needs, metres: the profile's ground roll with a 1.4
+/// factor (the POH figure is a test pilot's on a dry day), never under 500 m.
+/// One rule for the line-up's fit test and the arm-time field check.
+pub fn takeoff_needed_m(takeoff_roll_m: Option<f64>) -> f64 {
+    takeoff_roll_m.map_or(500.0, |m| (m * 1.4).max(500.0))
+}
+
+/// What the arm-time preflight compares the plan against: the tanks and the
+/// load as the sim has them NOW, the airframe's book figures, and the longest
+/// runway at each end. `None`/0 = unknown, and an unknown is never a refusal.
+#[derive(Debug, Clone, Default)]
+pub struct PreflightFacts {
+    pub fuel_kg: Option<f64>,
+    pub payload_kg: Option<f64>,
+    pub total_kg: Option<f64>,
+    pub max_gross_lb: Option<f64>,
+    pub takeoff_roll_m: Option<f64>,
+    pub landing_distance_ft: Option<f64>,
+    pub takeoff_distance_ft: Option<f64>,
+    pub origin_longest_ft: f64,
+    pub dest_longest_ft: f64,
+}
+
+const LB_PER_KG: f64 = 2.204_62;
+const AVGAS_KG_PER_GAL: f64 = 2.72;
+/// A tank within this of the block is "as planned"; SimBrief rounds too.
+const FUEL_MATCH_FRAC: f64 = 0.03;
+/// Payload within this of the plan (and 20 kg) is "as planned".
+const PAYLOAD_MATCH_FRAC: f64 = 0.10;
+const PAYLOAD_MATCH_KG: f64 = 20.0;
+
+/// The plan against the aircraft, BEFORE full auto starts an engine: the
+/// destination's longest runway against the landing distance, this field's
+/// against the takeoff roll, the all-up weight against the max takeoff weight,
+/// the tanks against the plan's block and minimum takeoff fuel, and the
+/// payload against the load sheet. `Err` is a refusal that names the number;
+/// `Ok` is the brief (fuel and load, each said with its figures) for the
+/// arming ack. Every figure the check lacks is skipped, never guessed: a plan
+/// with no load sheet is briefed on fuel alone. The pilot asked "does the
+/// copilot check the fuel and the runway" (2026-09-15); it did neither at the
+/// arm, and found the fuel at the enroute caution and the runway at the hold.
+pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result<String, String> {
+    use crate::flightplan::spoken_feet;
+    // Fuel in the plan's unit, or the app's gallons on a local plan (whose
+    // fuel is avgas by construction); a weight in the plan's unit, or pounds
+    // (the profile's `max_gross_lb`) when there is no load sheet.
+    let spoken_fuel = |kg: f64| match &fp.weights {
+        Some(w) => w.spoken(kg),
+        None => format!("{:.0} gallons", kg / AVGAS_KG_PER_GAL),
+    };
+    let spoken_weight = |kg: f64| match &fp.weights {
+        Some(w) => w.spoken(kg),
+        None => crate::simbrief::spoken_weight(kg * LB_PER_KG, "pounds"),
+    };
+
+    // The far end first: a field we cannot land at is not a destination.
+    if let Some(need) =
+        crate::flightplan::runway_needed_ft(f.landing_distance_ft, f.takeoff_distance_ft)
+    {
+        if f.dest_longest_ft > 0.0 && f.dest_longest_ft < need {
+            return Err(format!(
+                "Negative. {}'s longest runway is {}, and we need {} to land. Not flying that.",
+                fp.destination,
+                spoken_feet(f.dest_longest_ft),
+                spoken_feet(need)
+            ));
+        }
+    }
+    // This end: the pavement the roll needs, factored, or the line-up would
+    // find out at the hold after the start and the taxi.
+    let need_ft = takeoff_needed_m(f.takeoff_roll_m) * M_TO_FT;
+    if f.takeoff_roll_m.is_some() && f.origin_longest_ft > 0.0 && f.origin_longest_ft < need_ft {
+        return Err(format!(
+            "Negative. {}'s longest runway is {}, and the takeoff needs {}. Not flying that.",
+            fp.origin,
+            spoken_feet(f.origin_longest_ft),
+            spoken_feet(need_ft)
+        ));
+    }
+    // Weight: the plan's max takeoff weight, else the profile's max gross.
+    let max_tow_kg = fp
+        .weights
+        .as_ref()
+        .map(|w| w.max_tow_kg)
+        .filter(|m| *m > 0.0)
+        .or(f.max_gross_lb.map(|lb| lb / LB_PER_KG));
+    if let (Some(total), Some(max)) = (f.total_kg, max_tow_kg) {
+        if total > max * 1.005 {
+            return Err(format!(
+                "Negative. We're at {}, over the max takeoff weight of {}. Not flying that.",
+                spoken_weight(total),
+                spoken_weight(max)
+            ));
+        }
+    }
+    let mut lines = Vec::new();
+    // Fuel: below the minimum takeoff fuel is a refusal; under the block but
+    // above the minimum is said with both numbers; at the block is a check.
+    if let Some(fuel) = f.fuel_kg.filter(|_| fp.block_fuel_kg > 0.0) {
+        let min = fp.min_takeoff_fuel_kg;
+        if min > 0.0 && fuel < min * (1.0 - FUEL_MATCH_FRAC) {
+            return Err(format!(
+                "Negative. {} of fuel aboard, and the plan needs at least {} to go. Fuel up and say it again.",
+                spoken_fuel(fuel),
+                spoken_fuel(min)
+            ));
+        }
+        if fuel < fp.block_fuel_kg * (1.0 - FUEL_MATCH_FRAC) {
+            lines.push(format!(
+                "Fuel {} aboard against a {} block, above the minimum, so we can go.",
+                spoken_fuel(fuel),
+                spoken_fuel(fp.block_fuel_kg)
+            ));
+        } else {
+            lines.push(format!(
+                "Fuel {} aboard for the plan's {}.",
+                spoken_fuel(fuel),
+                spoken_fuel(fp.block_fuel_kg)
+            ));
+        }
+    }
+    // The load sheet: who and what is aboard, and whether the sim agrees.
+    if let Some(w) = &fp.weights {
+        let mut load = match (w.pax, w.cargo_kg > 0.0) {
+            (0, false) => "No passengers or cargo".to_string(),
+            (0, true) => format!("{} of cargo", w.spoken(w.cargo_kg)),
+            (n, false) => format!("{n} passenger{}", if n == 1 { "" } else { "s" }),
+            (n, true) => format!(
+                "{n} passenger{} and {} of cargo",
+                if n == 1 { "" } else { "s" },
+                w.spoken(w.cargo_kg)
+            ),
+        };
+        match f.payload_kg {
+            Some(p) if w.payload_kg > 0.0 => {
+                let off = (p - w.payload_kg).abs();
+                if off > PAYLOAD_MATCH_KG && off > w.payload_kg * PAYLOAD_MATCH_FRAC {
+                    load.push_str(&format!(
+                        " on the plan, but the aircraft is loaded with {} against the plan's {}",
+                        w.spoken(p),
+                        w.spoken(w.payload_kg)
+                    ));
+                } else {
+                    load.push_str(", loaded as planned");
+                }
+            }
+            _ => {}
+        }
+        load.push('.');
+        lines.push(load);
+    }
+    Ok(lines.join(" "))
+}
+
 /// Whether we're already sitting on a runway ready to depart — then taxi and
 /// line-up are skipped. Uses the takeoff loop's own fit against apt.dat.
 async fn lined_up(xp: &XPlaneClient, tools: &SubTools, _config: &Config) -> bool {
@@ -2108,10 +2262,7 @@ async fn lined_up(xp: &XPlaneClient, tools: &SubTools, _config: &Config) -> bool
     ) else {
         return false;
     };
-    let needed_m = tools
-        .line_up
-        .takeoff_roll_m
-        .map_or(500.0, |m| (m * 1.4).max(500.0));
+    let needed_m = takeoff_needed_m(tools.line_up.takeoff_roll_m);
     let apt = crate::tools::autoland::apt_dat_path();
     let cands = crate::autoland::nearby_runways(&apt, lat, lon, 3.0).unwrap_or_default();
     crate::autotakeoff::runway_fit(&cands, lat, lon, psi, needed_m).is_some()
@@ -2119,6 +2270,161 @@ async fn lined_up(xp: &XPlaneClient, tools: &SubTools, _config: &Config) -> bool
 
 #[cfg(test)]
 mod tests {
+    /// A 172 plan LXGB-LEAX as SimBrief sent it (2026-09-15), in kilos.
+    fn plan(weights: bool) -> crate::simbrief::FlightPlan {
+        crate::simbrief::FlightPlan {
+            source: crate::simbrief::PlanSource::SimBrief,
+            origin: "LXGB".into(),
+            destination: "LEAX".into(),
+            alternate: String::new(),
+            aircraft: "C172".into(),
+            cruise_alt_ft: 3500.0,
+            distance_nm: 45.0,
+            ete_min: 35.0,
+            block_fuel_gal: 40.0,
+            trip_fuel_gal: 10.7,
+            reserve_gal: 5.7,
+            route: "DCT".into(),
+            wind_comp_kts: 0.0,
+            wind_dir: 0.0,
+            wind_spd_kts: 0.0,
+            tod_to_dest_nm: 8.0,
+            waypoints: Vec::new(),
+            block_fuel_kg: 109.0,
+            min_takeoff_fuel_kg: 103.0,
+            weights: weights.then(|| crate::simbrief::PlanWeights {
+                pax: 3,
+                bags: 1,
+                cargo_kg: 30.4,
+                payload_kg: 268.5,
+                est_tow_kg: 1111.0,
+                max_tow_kg: 1111.0,
+                est_ldw_kg: 1082.0,
+                max_ldw_kg: 1111.0,
+                spoken_lbs: true,
+            }),
+        }
+    }
+
+    /// The 172's book and both fields, all fine: fuel at the block, loaded
+    /// as planned, Gibraltar's 1,800 m and Axarquia's 1,000 m.
+    fn facts() -> super::PreflightFacts {
+        super::PreflightFacts {
+            fuel_kg: Some(109.0),
+            payload_kg: Some(270.0),
+            total_kg: Some(1100.0),
+            max_gross_lb: Some(2558.0),
+            takeoff_roll_m: Some(1630.0 * 0.3048),
+            landing_distance_ft: Some(1335.0),
+            takeoff_distance_ft: Some(1630.0),
+            origin_longest_ft: 5900.0,
+            dest_longest_ft: 3280.0,
+        }
+    }
+
+    #[test]
+    fn a_plan_that_fits_is_briefed_with_its_fuel_and_its_load() {
+        let brief = super::preflight(&plan(true), &facts()).expect("fits");
+        assert_eq!(
+            brief,
+            "Fuel 240 pounds aboard for the plan's 240 pounds. \
+             3 passengers and 70 pounds of cargo, loaded as planned."
+        );
+        // A local plan has no load sheet and speaks the app's gallons.
+        let brief = super::preflight(&plan(false), &facts()).expect("fits");
+        assert_eq!(brief, "Fuel 40 gallons aboard for the plan's 40 gallons.");
+        // Nothing readable, nothing said, nothing refused.
+        let brief =
+            super::preflight(&plan(true), &super::PreflightFacts::default()).expect("no facts");
+        assert_eq!(brief, "3 passengers and 70 pounds of cargo.");
+    }
+
+    #[test]
+    fn a_runway_too_short_at_either_end_is_refused_at_the_gate() {
+        let short_dest = super::PreflightFacts {
+            dest_longest_ft: 1200.0,
+            ..facts()
+        };
+        let why = super::preflight(&plan(true), &short_dest).expect_err("refused");
+        assert_eq!(
+            why,
+            "Negative. LEAX's longest runway is 1,200 feet, and we need 1,335 feet to land. Not flying that."
+        );
+        // The takeoff needs the roll x 1.4: 1,630 ft -> 2,282 ft.
+        let short_origin = super::PreflightFacts {
+            origin_longest_ft: 2000.0,
+            ..facts()
+        };
+        let why = super::preflight(&plan(true), &short_origin).expect_err("refused");
+        assert!(
+            why.starts_with(
+                "Negative. LXGB's longest runway is 2,000 feet, and the takeoff needs 2,282 feet."
+            ),
+            "{why}"
+        );
+        // A field the data lacks (0) is not a refusal: brief_arrival owns that.
+        let unknown = super::PreflightFacts {
+            origin_longest_ft: 0.0,
+            dest_longest_ft: 0.0,
+            ..facts()
+        };
+        assert!(super::preflight(&plan(true), &unknown).is_ok());
+    }
+
+    #[test]
+    fn overweight_and_under_fuelled_are_refused_with_the_number() {
+        let heavy = super::PreflightFacts {
+            total_kg: Some(1160.0),
+            ..facts()
+        };
+        let why = super::preflight(&plan(true), &heavy).expect_err("refused");
+        assert_eq!(why, "Negative. We're at 2,560 pounds, over the max takeoff weight of 2,450 pounds. Not flying that.");
+        // No load sheet: the profile's max gross (2,558 lb = 1,160 kg) is the limit.
+        let heavy = super::PreflightFacts {
+            total_kg: Some(1180.0),
+            ..facts()
+        };
+        let why = super::preflight(&plan(false), &heavy).expect_err("refused");
+        assert_eq!(why, "Negative. We're at 2,600 pounds, over the max takeoff weight of 2,560 pounds. Not flying that.");
+
+        // Under the minimum takeoff fuel: refused, with both figures.
+        let dry = super::PreflightFacts {
+            fuel_kg: Some(80.0),
+            ..facts()
+        };
+        let why = super::preflight(&plan(true), &dry).expect_err("refused");
+        assert_eq!(why, "Negative. 180 pounds of fuel aboard, and the plan needs at least 230 pounds to go. Fuel up and say it again.");
+        // Between the minimum and the block: said, not refused.
+        let light = super::PreflightFacts {
+            fuel_kg: Some(104.0),
+            ..facts()
+        };
+        let brief = super::preflight(&plan(true), &light).expect("goes");
+        assert!(brief.starts_with("Fuel 230 pounds aboard against a 240 pounds block, above the minimum, so we can go."), "{brief}");
+    }
+
+    #[test]
+    fn a_load_the_sim_disagrees_with_is_said_not_refused() {
+        // Two hundred kilos aboard against the plan's 268: off by more than
+        // 10 percent and 20 kg, so the pilot hears both numbers.
+        let light = super::PreflightFacts {
+            payload_kg: Some(200.0),
+            ..facts()
+        };
+        let brief = super::preflight(&plan(true), &light).expect("goes");
+        assert!(brief.ends_with("3 passengers and 70 pounds of cargo on the plan, but the aircraft is loaded with 440 pounds against the plan's 590 pounds."), "{brief}");
+        // A lone pilot with no cargo.
+        let mut solo = plan(true);
+        let w = solo.weights.as_mut().unwrap();
+        w.pax = 0;
+        w.cargo_kg = 0.0;
+        let brief = super::preflight(&solo, &facts()).expect("goes");
+        assert!(
+            brief.ends_with("No passengers or cargo, loaded as planned."),
+            "{brief}"
+        );
+    }
+
     /// LEJR-LXGB, 2026-09-14: the aircraft's wind at 7,000 ft set up 27; the
     /// field's report said 090 at 21.
     #[test]

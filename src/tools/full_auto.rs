@@ -109,6 +109,12 @@ pub struct FullAuto {
     // taxi / line-up
     pub park_brake_valve_set: Option<f64>,
     pub takeoff_roll_m: Option<f64>,
+    /// Book figures for the arm-time preflight of a Flight mission
+    /// (`full_auto::preflight`): the runway at each end and the all-up weight
+    /// are checked at the gate, not found at the hold or 25 nm out.
+    pub landing_distance_ft: Option<f64>,
+    pub takeoff_distance_ft: Option<f64>,
+    pub max_gross_lb: Option<f64>,
     /// Flap-handle ratio set for takeoff and retracted climbing out (profile's
     /// `flaps.takeoff_ratio`); `None` leaves the flaps alone.
     pub takeoff_flap_ratio: Option<f64>,
@@ -422,17 +428,71 @@ impl FullAuto {
             ));
         }
 
-        // The spoken destination: the airport's name when apt.dat knows it.
-        let dest_name = {
-            let (path, icao) = (ctx.config.apt_data_path.clone(), fp.destination.clone());
-            tokio::task::spawn_blocking(move || crate::nav::find_airport(&path, &icao))
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .flatten()
-                .map(|a| a.name)
-                .unwrap_or_else(|| fp.destination.clone())
+        // Both fields from one blocking pass: the destination's name for the
+        // ack, and each end's longest runway for the preflight.
+        let (origin_apt, dest_apt) = {
+            let (path, o, d) = (
+                ctx.config.apt_data_path.clone(),
+                fp.origin.clone(),
+                fp.destination.clone(),
+            );
+            tokio::task::spawn_blocking(move || {
+                (
+                    crate::nav::find_airport(&path, &o).ok().flatten(),
+                    crate::nav::find_airport(&path, &d).ok().flatten(),
+                )
+            })
+            .await
+            .unwrap_or((None, None))
         };
+        let dest_name = dest_apt
+            .as_ref()
+            .map(|a| a.name.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| fp.destination.clone());
+
+        // The preflight: tanks, load and all-up weight as the sim has them
+        // now, against the plan and the book. A refusal here costs nothing;
+        // the same shortfall found airborne is a diversion.
+        let (fuel, payload, total) = tokio::join!(
+            ctx.xplane.get_float(crate::datarefs::FUEL_TOTAL_KG),
+            ctx.xplane.get_float(crate::datarefs::PAYLOAD_KG),
+            ctx.xplane.get_float(crate::datarefs::TOTAL_WEIGHT_KG),
+        );
+        let facts = crate::full_auto::PreflightFacts {
+            fuel_kg: fuel.ok(),
+            payload_kg: payload.ok(),
+            total_kg: total.ok(),
+            max_gross_lb: self.max_gross_lb,
+            takeoff_roll_m: self.takeoff_roll_m,
+            landing_distance_ft: self.landing_distance_ft,
+            takeoff_distance_ft: self.takeoff_distance_ft,
+            origin_longest_ft: origin_apt
+                .as_ref()
+                .map_or(0.0, crate::flightplan::longest_runway_ft),
+            dest_longest_ft: dest_apt
+                .as_ref()
+                .map_or(0.0, crate::flightplan::longest_runway_ft),
+        };
+        let preflight = crate::full_auto::preflight(&fp, &facts);
+        crate::full_auto::event(
+            "preflight",
+            json!({
+                "origin": fp.origin, "destination": fp.destination,
+                "fuel_kg": facts.fuel_kg, "block_kg": fp.block_fuel_kg,
+                "min_takeoff_kg": fp.min_takeoff_fuel_kg,
+                "payload_kg": facts.payload_kg,
+                "plan_payload_kg": fp.weights.as_ref().map(|w| w.payload_kg),
+                "pax": fp.weights.as_ref().map(|w| w.pax),
+                "cargo_kg": fp.weights.as_ref().map(|w| w.cargo_kg),
+                "total_kg": facts.total_kg,
+                "max_tow_kg": fp.weights.as_ref().map(|w| w.max_tow_kg),
+                "origin_longest_ft": facts.origin_longest_ft,
+                "dest_longest_ft": facts.dest_longest_ft,
+                "refused": preflight.as_ref().err(),
+            }),
+        );
+        let preflight = preflight?;
 
         // The GPS route payload — written by the orchestrator (only the
         // concrete client can set a byte-array dataref).
@@ -462,12 +522,18 @@ impl FullAuto {
         };
 
         let n = legs.len();
+        let preflight = if preflight.is_empty() {
+            String::new()
+        } else {
+            format!("{preflight} ")
+        };
         let ack = format!(
-            "Full auto, {} to {}. I'll start up, get our taxi, take off, and fly the \
+            "Full auto, {} to {}. {}I'll start up, get our taxi, take off, and fly the \
              {} enroute {} at {:.0} feet, then the approach into {}. {} Say cancel or my \
              controls any time.",
             fp.origin,
             fp.destination,
+            preflight,
             n,
             if n == 1 { "fix" } else { "fixes" },
             fp.cruise_alt_ft,
