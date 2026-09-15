@@ -259,7 +259,13 @@ const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 /// lateral law feeds forward on final (heading vs track, the reference recipe).
 const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 const HPATH_TRUE: &str = "sim/flightmodel/position/hpath";
-const VVI_FPM: &str = "sim/cockpit2/gauges/indicators/vvi_dial_fpm";
+/// The vertical speed actually flown (the pilot's VSI). The shared name, not a
+/// local spelling: `cockpit2/gauges/indicators/vvi_dial_fpm` does not exist
+/// in X-Plane 12, and from 2026-07 to 2026-09-14 every read of it failed and
+/// fell back to the COMMANDED rate, so the VS watchdog below could never fire
+/// and the landing arrest's lead (`vs_dial_fpm`) saw zero error on every tick
+/// of the LXGB 09 arrival it was written for (339 fpm at the wheels).
+const VVI_FPM: &str = crate::datarefs::VVI_FPM;
 // AP + controls (mirror of autopilot.rs / recover.rs).
 const CMD_SERVOS_ON: &str = "sim/autopilot/servos_on";
 const CMD_HDG_MODE: &str = "sim/autopilot/heading";
@@ -529,6 +535,8 @@ pub fn run_autoland(
             let mut gear_down = false;
             let mut last_flap: Option<f64> = None;
             let mut vs_diverged: u32 = 0;
+            // Warned once per approach when the VSI cannot be read.
+            let mut vvi_read_failed = false;
             // Airspeed history for the throttle governor's derivative term — the
             // anti-stall reflex needs the TREND (kts/sec), not just the error.
             let mut prev_ias: Option<f64> = None;
@@ -959,12 +967,28 @@ pub fn run_autoland(
                 // target through the autopilot's lag (`vs_dial_fpm`). The
                 // blackbox keeps both columns: `cmd_vs` is what the law
                 // wants, `vs_dial` what the autopilot was told.
-                let vvi = xp.get_float(VVI_FPM).await.unwrap_or(g.target_vs_fpm);
-                let vs_dial = vs_dial_fpm(g.target_vs_fpm, vvi, g.arresting);
+                // A failed read is NO measurement, never the command in
+                // disguise: the dial gets the bare target that tick, the
+                // watchdog does not count it, and the blackbox keeps `null`
+                // so the debrief can see the gauge was missing.
+                let vvi = match xp.get_float(VVI_FPM).await {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        if !vvi_read_failed {
+                            vvi_read_failed = true;
+                            tracing::warn!(target: "xvoicelayer::autoland", error = %e, "VSI read failed; flying the bare VS target");
+                        }
+                        None
+                    }
+                };
+                let vs_dial = match vvi {
+                    Some(v) => vs_dial_fpm(g.target_vs_fpm, v, g.arresting),
+                    None => g.target_vs_fpm,
+                };
                 crate::blackbox::record("autoland", serde_json::json!({
                     "rwy": format!("{} {}", rwy.icao, rwy.id), "dist": g.dist_nm,
                     "alt": alt, "gp_alt": g.glidepath_alt_ft, "cmd_vs": g.target_vs_fpm,
-                    "vs_dial": vs_dial, "vvi": vvi,
+                    "vs_dial": vs_dial, "vvi": vvi, "arresting": g.arresting,
                     "cmd_hdg": g.target_heading_deg, "ias": ias, "radio": radio_ft,
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
                     "trim": trim, "xtk_m": xtk_now * M_PER_NM,
@@ -1057,7 +1081,9 @@ pub fn run_autoland(
                 // no callout. If actual VS diverges hard for ~5 s, re-arm the VS
                 // mode and tell the pilot — this is exactly when a hand on the
                 // yoke matters.
-                if g.phase != ApproachPhase::Flare && (vvi - g.target_vs_fpm).abs() > 700.0 {
+                if g.phase != ApproachPhase::Flare
+                    && vvi.is_some_and(|v| (v - g.target_vs_fpm).abs() > 700.0)
+                {
                     vs_diverged += 1;
                     if vs_diverged == 12 {
                         let _ = xp.run_command(CMD_VS_MODE).await;

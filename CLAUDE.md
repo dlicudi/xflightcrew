@@ -154,7 +154,14 @@ tools; YAML carries per-airframe config. Standing rules:
   profile's own serialisation) and asks the sim (`probe_dataref` /
   `probe_command`), speaks the missing ones (`probe_summary`) and blackboxes
   `profile_probe`. A new profile field with a name in it is probed the day it
-  is added. A "dataref" name may really
+  is added. **The Rust constants are hypotheses too**: two local spellings
+  (`vvi_dial_fpm`, `compass_heading_deg_magnetic`) did not exist and failed
+  for months into fallbacks that impersonated a measurement (the flare lead
+  led nothing, 2026-09-15); read names come from `datarefs::*`, and
+  `cargo test -- --ignored real_install_names` checks every `"sim/..."`
+  literal in the workspace against the install's DataRefs.txt/Commands.txt.
+  **A failed read is NO measurement, never a plausible number**: a control
+  loop skips the tick and blackboxes `null`. A "dataref" name may really
   be a command; read-only switch positions need read-before-fire toggle tools
   (`*_toggle`), carried through full auto's copies too. Paired lights are
   written together (one pod lit is a readback confirming the half it looked at).
@@ -368,6 +375,12 @@ history):
   commands are WHOLE manoeuvres the tug executes (a "Nose 90" is ~90 degrees,
   and that belongs in the plan's arithmetic) - sent ONCE, at the summon,
   never steered per tick; `pushback_stop` means "stop and let go". **A
+  tug mid-swing finishes its pattern whatever it is told**: `done`'s
+  distance test waits while the bar is on and the nose is still moving
+  (`swing_in_progress`; LXGB 2026-09-15, a Nose 90 that ran 45 m straight
+  first), and **a tug on the bar owns the aircraft**: the taxi drive holds
+  on `pushback_attached` (`tug_hold`, no stagnation clock, `TUG_WAIT_SECS`)
+  and rolls when the bar comes off. **A
   command to a tug ON THE BAR drops it off the bar** (five pushes for five,
   2026-09-12: hooked, re-issued, detached on the next poll, back ninety
   seconds later): no re-issue at hook-up, no nudge while attached, no

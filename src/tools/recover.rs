@@ -50,7 +50,10 @@ const CMD_HEADING_MODE: &str = "sim/autopilot/heading";
 const CMD_ALT_HOLD: &str = "sim/autopilot/altitude_hold";
 const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
 const CURRENT_ALT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot";
-const CURRENT_HDG: &str = "sim/cockpit2/gauges/indicators/compass_heading_deg_magnetic";
+/// The shared gauge name: the local spelling `compass_heading_deg_magnetic`
+/// does not exist in X-Plane 12, so every read failed and the bug after a
+/// recovery went to ZERO (the `unwrap_or`), turning the aircraft north.
+const CURRENT_HDG: &str = crate::datarefs::COMPASS_HEADING_DEG;
 const HEADING_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
 const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
 
@@ -354,8 +357,12 @@ fn run_recovery(
             if xp.get_float(HEADING_STATUS).await.unwrap_or(0.0) <= 0.5 {
                 let _ = xp.run_command(CMD_HEADING_MODE).await;
             }
-            let hdg = xp.get_float(CURRENT_HDG).await.unwrap_or(0.0);
-            let _ = crate::tools::autopilot::drive_heading_bug(&xp, hdg).await;
+            // No compass read, no bug write: a heading of "zero" is a turn
+            // north, not a hold, and heading mode keeps whatever is dialled.
+            let hdg = xp.get_float(CURRENT_HDG).await.ok();
+            if let Some(h) = hdg {
+                let _ = crate::tools::autopilot::drive_heading_bug(&xp, h).await;
+            }
             // Altitude hold at the current altitude.
             let alt = xp.get_float(CURRENT_ALT).await.unwrap_or(0.0);
             let hold = (alt / 100.0).round() * 100.0;
@@ -365,9 +372,16 @@ fn run_recovery(
             }
             let _ = xp.set_float(&throttle_dref(), CRUISE_THROTTLE).await;
 
-            let line = format!(
-                "Recovered. Autopilot holding heading {hdg:.0} and {hold:.0} feet. You have control when ready."
-            );
+            // The line says what is actually held: no compass read, no
+            // heading claimed.
+            let line = match hdg {
+                Some(h) => format!(
+                    "Recovered. Autopilot holding heading {h:.0} and {hold:.0} feet. You have control when ready."
+                ),
+                None => format!(
+                    "Recovered. Autopilot holding the dialled heading and {hold:.0} feet. You have control when ready."
+                ),
+            };
             if let Some(s) = &status {
                 s.action(&line);
             }

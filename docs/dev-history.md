@@ -4,6 +4,77 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## The push was called done mid-swing, and the taxi drove against the tug, 2026-09-15
+
+LXGB stand 1, "fly the flight plan" from cold. The plan asked the tug for
+40 m back and a 177-degree turn-out (a Nose 90 left, which delivers ninety;
+the rest is the taxi's). The sim's tug ran 45 m STRAIGHT before it began to
+turn, so by the time the nose was moving the aircraft was already past the
+plan's 40 m plus the 25 m chase margin, and at 65.3 m `done` fired on
+distance with the nose still 140 degrees off and swinging at three degrees
+a second. "Stop" went to the tug; a tug on the bar finishes the pattern it
+was given whatever it is told, so it kept turning, the bar stayed on
+through the whole 30 s clear wait (`tug_not_clear`), and full auto said
+"rolling out" and engaged the taxi anyway. The drive ticks show `tug: true`
+on every one: 34 s at half a knot with the heading error unwinding 82 to 3
+as the TUG turned us, until the 20 s stagnation clock called it stuck and
+the mission stood down `taxi_incomplete`. Forty seconds later the tug let
+go by itself; the restart found the aircraft off the stand and taxied out
+under its own steam without trouble.
+
+Two rules:
+
+- **A swing in progress outranks the distance test**
+  (`pushback::swing_in_progress`, `SWING_DEG` over `SWING_WINDOW_S`): while
+  the bar is on and the heading error moved two degrees in the last two
+  seconds, `done` waits (blackboxed once as `swing_wait`); the push then
+  ends at the tug's OWN stop through the stall path and `push_delivered`,
+  as every completed pattern does. The test carries the sortie's numbers.
+- **A tug on the bar owns the aircraft** (`autotaxi`, `TUG_WAIT_SECS`):
+  the drive reads `pushback_attached` every tick (it already did, for the
+  log), and while it is set it parks the governor at zero, sends no steer
+  heartbeat, does not run the stagnation clock, says once "the tug's still
+  on the nose", and rolls when the bar comes off (`tug_hold` /
+  `tug_released`); three minutes without a release stands it down with the
+  brakes set. The taxi never again mistakes being pushed for driving.
+
+## The flare lead never flew: two dataref names the sim does not have, 2026-09-15
+
+The LXGB 09 circuit landing on the 14th was the first sortie with the led
+flare dial (`vs_dial_fpm`), and it arrived at 339 fpm, the sink growing from
+271 to 339 in the last second, exactly the throttle-cut signature the lead
+was written against. The tick log says why: on all 288 ticks of the
+approach `vvi`, `vs_dial` and `cmd_vs` are the same number to twelve
+decimals. Autoland read its VSI from
+`sim/cockpit2/gauges/indicators/vvi_dial_fpm`, a name X-Plane 12 does not
+have (`DataRefs.txt` has `vvi_fpm_pilot` and `vh_ind_fpm`); the read failed
+on every tick since 330fbc7 and `unwrap_or(target)` handed the lead law the
+command as its measurement, so it saw zero error and led nothing. The same
+dead read is the VS watchdog's input (`|vvi - target| > 700` for 5 s), so
+the LEMI-style "autopilot is not holding the descent" warning could never
+have fired either. A second instance, same class: the stall recovery's
+`compass_heading_deg_magnetic` (real name `compass_heading_deg_mag`)
+failed into `unwrap_or(0.0)`, so every recovery bugged the aircraft north
+and then said "holding heading 0".
+
+Three rules from it:
+
+- **The shared names are the names**: both readers now take
+  `datarefs::VVI_FPM` / `datarefs::COMPASS_HEADING_DEG` rather than a local
+  spelling.
+- **A failed read is NO measurement, never the command in disguise**: the
+  autoland tick keeps `vvi` as an `Option`, the dial gets the bare target
+  and the watchdog skips the tick when it is `None`, the blackbox writes
+  `null` (and now `arresting`), and the loop warns once per approach. The
+  recovery skips the bug write and says "holding the dialled heading".
+- **The Rust constants are probed too**: `aircraft::real_install_names`
+  (`cargo test -- --ignored real_install_names`) scans every `"sim/..."`
+  literal in the workspace against the install's `DataRefs.txt` and
+  `Commands.txt`. The live profile probe covers the YAML; this covers the
+  code. It found exactly these two on first run.
+
+Still to fly: the led dial itself, now that it reads a VSI.
+
 ## The instructor teaches from cold and dark, 2026-09-14
 
 "Can the instructor help me taxi?" and "shouldn't the instructor be able to

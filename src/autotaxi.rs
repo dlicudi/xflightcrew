@@ -84,6 +84,12 @@ const STEER_YIELD: &str = "xcopilot/steer_yield";
 /// and the record could not say whether a re-summoned tug had hooked back
 /// on (LEMG, 2026-09-12). A slow dataref, so the read is nearly free.
 const TUG_ATTACHED: &str = "sim/aircraft/overflow/pushback_attached";
+/// A tug on the bar owns the aircraft: the drive holds (target zero, no
+/// steer heartbeat, the stagnation clock parked) until the bar comes off,
+/// and stands down after this long if it never does. The taxi that engaged
+/// with the tug still turning the nose at LXGB "drove" 34 s at half a knot
+/// and stood the mission down as stagnant (08:15Z, 2026-09-15).
+const TUG_WAIT_SECS: f64 = 180.0;
 const MS_TO_KTS: f64 = 1.943_844;
 const M_PER_NM: f64 = 1852.0;
 
@@ -1335,6 +1341,9 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
     // External stop ("stop" / both pedals park the target at 0): the
     // schedule stands aside until a "go" restores a rolling target.
     let mut ext_stopped = false;
+    // A tug on the bar: held since, and whether the hold has been announced.
+    let mut tug_since: Option<std::time::Instant> = None;
+    let mut tug_held = false;
     // Seeded at the first fix: >0 means we engaged off the route or facing
     // against it and are JOINING — widened guard, bend-speed cap — until
     // captured, when it drops to 0 and the established guard takes over.
@@ -1420,6 +1429,42 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             xp.get_float(TUG_ATTACHED),
         );
         let tug_on = tug_r.is_ok_and(|v| v > 0.5);
+        if tug_on {
+            let t0 = *tug_since.get_or_insert_with(std::time::Instant::now);
+            if !tug_held {
+                tug_held = true;
+                tracing::info!("auto taxi: tug on the bar, holding until it lets go");
+                crate::blackbox::record("autotaxi", serde_json::json!({"event": "tug_hold"}));
+                speedhold::set_taxi_target(0.0);
+                last_sched = 0.0;
+                alert(
+                    &voice,
+                    Priority::Advisory,
+                    "The tug's still on the nose. Holding until it lets go.",
+                );
+            }
+            if t0.elapsed().as_secs_f64() > TUG_WAIT_SECS {
+                tracing::warn!("auto taxi: the tug never let go, standing down");
+                crate::blackbox::record("autotaxi", serde_json::json!({"event": "tug_never_released"}));
+                alert(
+                    &voice,
+                    Priority::Caution,
+                    "The tug hasn't let go. Standing down, brakes set. Your aircraft.",
+                );
+                ACTIVE.store(false, Ordering::Relaxed);
+                break;
+            }
+            // No steer heartbeat: the nosewheel is the tug's, and the
+            // channel expires on its own. Nothing here is a stall.
+            stalled_since = None;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        } else if tug_held {
+            tug_held = false;
+            tug_since = None;
+            crate::blackbox::record("autotaxi", serde_json::json!({"event": "tug_released"}));
+            alert(&voice, Priority::Advisory, "Tug's clear. Rolling.");
+        }
         // The pilot's feet moved the yaw axis: the plugin already dropped
         // the override — stand the loop down and keep the speed hold, which
         // is the pre-existing "you steer, I have the throttle" division.

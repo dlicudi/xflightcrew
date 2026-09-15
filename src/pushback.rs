@@ -146,6 +146,16 @@ const STALL_SECS: f64 = 12.0;
 const MAX_SECS: f64 = 300.0;
 /// How long to wait for the tug to unhook and clear before taxiing.
 const TUG_CLEAR_SECS: f64 = 30.0;
+/// The nose turning by this much over `SWING_WINDOW_S` is the tug SWINGING
+/// us: a manoeuvre in progress, which no distance test may cut short. A
+/// Nose 90 at LXGB stand 1 ran 45 m straight before it began to turn, so
+/// the plan's 40 m plus its chase margin was spent while the nose was still
+/// 140 degrees off; `done` fired on the distance, "stop" went to a tug that
+/// finishes what it was given regardless, and the taxi then "drove" for
+/// 34 s at half a knot while the tug turned it, until the stagnation clock
+/// stood the whole mission down (08:15Z, 2026-09-15).
+const SWING_DEG: f64 = 2.0;
+const SWING_WINDOW_S: f64 = 2.0;
 // There is deliberately no re-hook deadline. A released tug is never asked
 // back: `reissued_after_release` fired four times across the whole blackbox
 // and `rehooked` never once answered it, so the wait was a pure four-for-four
@@ -294,6 +304,14 @@ pub fn sense_is_wrong(
 /// enough past that to stop chasing the alignment across the apron.
 pub fn done(back_m: f64, err_deg: f64, plan: &Plan) -> bool {
     back_m >= plan.back_m + CHASE_M || (back_m >= plan.back_m && err_deg.abs() <= ALIGN_DEG)
+}
+
+/// Is the tug still turning the nose? `err_then` is the heading error
+/// `SWING_WINDOW_S` ago. While a bar is on and this is true, the manoeuvre
+/// is in progress and [`done`] waits for the swing to end (the tug runs its
+/// whole pattern whatever it is told; see `SWING_DEG`).
+pub fn swing_in_progress(attached: bool, err_then: f64, err_now: f64) -> bool {
+    attached && (err_now - err_then).abs() >= SWING_DEG
 }
 
 /// Would asking for ANOTHER pattern actually improve things?
@@ -711,6 +729,9 @@ async fn run_inner(
     // declared released `MOVED_M` metres in, and the re-issue would re-aim
     // the tug mid-manoeuvre.
     let mut saw_attached = false;
+    // Heading-error history for the swing watch: (when, err).
+    let mut err_hist: std::collections::VecDeque<(Instant, f64)> = Default::default();
+    let mut swing_waited = false;
     loop {
         if stopping(abort) {
             send(ctx, "stop").await;
@@ -864,8 +885,28 @@ async fn run_inner(
             "att": attached,
             "tow": towing,
         }));
+        // The swing watch: the error this window ago against now.
+        let now = Instant::now();
+        err_hist.push_back((now, err));
+        while err_hist
+            .front()
+            .is_some_and(|(t, _)| now.duration_since(*t).as_secs_f64() > SWING_WINDOW_S)
+        {
+            err_hist.pop_front();
+        }
+        let err_then = err_hist.front().map(|(_, e)| *e).unwrap_or(err);
         if done(back_m, err, plan) {
-            break;
+            if swing_in_progress(attached, err_then, err) {
+                // Far enough by the numbers, but the tug is mid-swing: it
+                // will finish the pattern whatever we say, so the push ends
+                // at ITS stop (the stall path below), never here.
+                if !swing_waited {
+                    swing_waited = true;
+                    event(json!({ "event": "swing_wait", "back_m": r1(back_m), "err": r1(err) }));
+                }
+            } else {
+                break;
+            }
         }
         // The sense clock only runs while the aircraft is actually MOVING.
         // Standing still, a turn proves nothing: at Luton the ask went out at
@@ -1289,6 +1330,26 @@ mod tests {
             done(40.0 + CHASE_M + 1.0, 90.0, &p),
             "past the chase limit the push STOPS, aligned or not"
         );
+    }
+
+    /// LXGB stand 1, 2026-09-15: the Nose 90 ran 45 m straight before it
+    /// turned, so `done` fired on distance with the nose 140 degrees off
+    /// and still swinging. A swing in progress outranks the distance test;
+    /// a nose that has stopped moving does not.
+    #[test]
+    fn a_swing_in_progress_is_never_cut_short_by_the_distance_test() {
+        let p = Plan {
+            back_m: 40.1,
+            target_hdg: 176.6,
+            node: (LAT0, LON0),
+        };
+        assert!(done(65.3, 139.6, &p), "past the chase margin by the numbers");
+        // Two seconds ago the error was 146.5: the tug is turning us.
+        assert!(swing_in_progress(true, 146.5, 139.6));
+        // The same swing with the bar OFF is not the tug's doing.
+        assert!(!swing_in_progress(false, 146.5, 139.6));
+        // Error holding still: the swing has ended, the distance test stands.
+        assert!(!swing_in_progress(true, 139.9, 139.6));
     }
 
     /// The Gatwick stand that convicted the per-tick steering (2026-07-27).
