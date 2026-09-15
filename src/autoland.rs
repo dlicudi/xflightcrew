@@ -274,6 +274,8 @@ const HDG_BUG: &str = "sim/cockpit2/autopilot/heading_dial_deg_mag_pilot";
 const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
 const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
 const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
+const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
+const ALT_IND_FT: &str = crate::datarefs::ALTITUDE_FT;
 /// The thrust lever THIS airframe obeys — not always the stock one (the
 /// Citation X tracks `throttle_jet_rev_ratio`, so every write to
 /// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
@@ -487,7 +489,7 @@ pub fn run_autoland(
                 },
                 None => best_landing_runway(&apt_dat, lat0, lon0, hdg0, 40.0, 1200.0),
             };
-            let rwy = match picked {
+            let mut rwy = match picked {
                 Ok(Some(r)) => r,
                 other => {
                     tracing::warn!(target: "xvoicelayer::autoland", ?other, from=?(lat0, lon0), "no runway found");
@@ -507,9 +509,70 @@ pub fn run_autoland(
                 Priority::Warning,
             );
 
+            // The pavement's OWN elevation, not the field's. apt.dat carries one
+            // elevation per airport and the glidepath aimed at it: LEAX's
+            // header says 160 ft, its runway 30 threshold lies at ~117, and the
+            // 172 crossed the numbers 99 ft up on a path that was "on" in MSL
+            // terms, never reached the roundout band, and balked "overflew the
+            // runway" 300 m in (2026-09-15). Two probes of the sim's own mesh,
+            // the threshold and the touchdown aim; the higher wins (the aim
+            // must clear both), the header stays when they agree or the probe
+            // is absent or absurd. Said aloud when it moves the aim.
+            {
+                let (aim_lat, aim_lon) =
+                    project_latlon(rwy.thr_lat, rwy.thr_lon, rwy.course_deg, TOUCHDOWN_AIM_NM);
+                let probed = crate::terrain::sample_ft(
+                    &xp,
+                    &[(rwy.thr_lat, rwy.thr_lon), (aim_lat, aim_lon)],
+                )
+                .await;
+                let (aim, seen) = aim_elevation_ft(rwy.elev_ft, probed.as_deref());
+                crate::blackbox::record("autoland", serde_json::json!({
+                    "event": "threshold_elev", "rwy": format!("{} {}", rwy.icao, rwy.id),
+                    "header_ft": rwy.elev_ft, "probed_ft": seen, "aim_ft": aim,
+                }));
+                if (aim - rwy.elev_ft).abs() > THRESHOLD_ELEV_TRUST_FT {
+                    let diff = aim - rwy.elev_ft;
+                    announce(
+                        format!(
+                            "Runway {} threshold is {:.0} feet {} the field elevation. Aiming at {:.0} feet.",
+                            crate::circuit::spell_runway(&rwy.id),
+                            diff.abs(),
+                            if diff < 0.0 { "below" } else { "above" },
+                            aim
+                        ),
+                        Priority::Advisory,
+                    );
+                    rwy.elev_ft = aim;
+                }
+            }
+
             // Engage the AP (FD up first for airframes that need it).
             for c in &cfg.fd_commands { let _ = xp.run_command(c).await; }
             let _ = xp.run_command(CMD_SERVOS_ON).await;
+            // The altitude dial OUT OF THE WAY. Autoland flies the vertical
+            // through the VS dial and never touched the altitude dial, so it
+            // sat wherever the follower or the pilot left it: at LEAX the
+            // plan's 2,600 ft constraint, 130 ft under the arm, and the AP's
+            // altitude capture was already arresting the descent as the arm
+            // came. The VS dial's -1,200 was ignored for six seconds, flaps
+            // ballooned it to +300 fpm, and only the divergence watchdog's
+            // re-press of VS mode freed it ("not holding the descent",
+            // 2026-09-15). Parked well above and VS re-selected so no capture
+            // can start; a go-around levels there at the latest, which the
+            // per-tick VS re-select then takes down again.
+            {
+                let (dial_r, alt_r) = tokio::join!(xp.get_float(ALT_DIAL), xp.get_float(ALT_IND_FT));
+                if let (Ok(dial), Ok(alt_ind)) = (dial_r, alt_r) {
+                    if let Some(parked) = parked_altitude_dial_ft(dial, alt_ind) {
+                        let _ = xp.set_float(ALT_DIAL, parked).await;
+                        let _ = xp.run_command(CMD_VS_MODE).await;
+                        crate::blackbox::record("autoland", serde_json::json!({
+                            "event": "alt_dial_parked", "was": dial, "now": parked, "alt_ft": alt_ind,
+                        }));
+                    }
+                }
+            }
 
             let mut last_phase: Option<ApproachPhase> = None;
             let mut go_around = GoAroundLatch::new();
@@ -1524,6 +1587,45 @@ const ROUNDOUT_VS_FPM: f64 = -250.0;
 /// `path_descent_fpm`, and every approach test stays byte-identical).
 const VS_LEAD_GAIN: f64 = 2.0;
 const VS_LEAD_MAX_CLIMB_FPM: f64 = 300.0;
+
+/// The altitude dial must never be within reach BELOW the aircraft while
+/// autoland flies: an armed capture takes the vertical away from the VS dial
+/// (see the arm sequence in [`run_autoland`]). `None` = already clear.
+pub const ALT_DIAL_CLEAR_FT: f64 = 500.0;
+/// Where the dial is parked: this far above the arm altitude, rounded UP to
+/// the hundred, so a go-around's climb captures a sensible level at worst.
+pub const ALT_DIAL_PARK_ABOVE_FT: f64 = 1000.0;
+pub fn parked_altitude_dial_ft(dial_ft: f64, alt_ft: f64) -> Option<f64> {
+    if dial_ft >= alt_ft + ALT_DIAL_CLEAR_FT {
+        return None;
+    }
+    Some(((alt_ft + ALT_DIAL_PARK_ABOVE_FT) / 100.0).ceil() * 100.0)
+}
+
+/// A probed threshold elevation within this of the header is the header (the
+/// mesh and the file agree; no reason to move the aim by a few feet).
+pub const THRESHOLD_ELEV_TRUST_FT: f64 = 20.0;
+/// ...and one further than this from it is not believed (a probe off the
+/// pavement, a broken mesh): the header stays, the number is still reported.
+pub const THRESHOLD_ELEV_MAX_DIFF_FT: f64 = 300.0;
+/// The glidepath's aim elevation: the HIGHER of the probed threshold and
+/// touchdown-zone points when they disagree with the apt.dat header by more
+/// than [`THRESHOLD_ELEV_TRUST_FT`] and less than [`THRESHOLD_ELEV_MAX_DIFF_FT`];
+/// the header otherwise (and always without a probe). Returns (aim, probed).
+pub fn aim_elevation_ft(header_ft: f64, probed_ft: Option<&[f64]>) -> (f64, Option<f64>) {
+    let Some(p) = probed_ft.filter(|v| !v.is_empty()) else {
+        return (header_ft, None);
+    };
+    let probed = p.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if !probed.is_finite() {
+        return (header_ft, None);
+    }
+    let diff = (probed - header_ft).abs();
+    if diff <= THRESHOLD_ELEV_TRUST_FT || diff > THRESHOLD_ELEV_MAX_DIFF_FT {
+        return (header_ft, Some(probed));
+    }
+    (probed, Some(probed))
+}
 
 /// What to dial into the VS mode so the aircraft actually FLIES `target_fpm`.
 /// Outside a landing arrest (`arresting` false) the dial is the target, as it
@@ -4241,5 +4343,39 @@ mod tests {
         assert!(cut(0.25, 0.7) > cut(0.125, 0.7));
         // ...and closing in at a FIXED offset no longer grows it.
         assert!((cut(0.1, 1.2) - cut(0.1, 0.4)).abs() < 1e-9);
+    }
+    #[test]
+    fn the_altitude_dial_is_parked_above_the_arm() {
+        // LEAX 2026-09-15: the plan's 2,600 ft dialled, the arm at 2,733 ft
+        // indicated, the capture already arresting the descent. Parked 1,000
+        // up, rounded to the hundred; VS re-selected by the caller.
+        assert_eq!(parked_altitude_dial_ft(2600.0, 2733.0), Some(3800.0));
+        // Dial at the aircraft's own altitude (an ALT hold at the arm): parked.
+        assert_eq!(parked_altitude_dial_ft(2700.0, 2700.0), Some(3700.0));
+        // Cruise altitude still dialled far above: nothing to do.
+        assert_eq!(parked_altitude_dial_ft(8000.0, 2733.0), None);
+        // Just inside the clear band counts as in the way.
+        assert_eq!(parked_altitude_dial_ft(3100.0, 2733.0), Some(3800.0));
+        assert_eq!(parked_altitude_dial_ft(3300.0, 2733.0), None);
+    }
+
+    #[test]
+    fn the_glidepath_aims_at_the_probed_threshold() {
+        // LEAX: header 160 ft, the 30 threshold probed at 117, the aim point
+        // 300 m in at 121 - the higher of the two is the aim.
+        assert_eq!(aim_elevation_ft(160.0, Some(&[117.0, 121.0])), (121.0, Some(121.0)));
+        // Mesh and header agree within the trust band: the header stays.
+        assert_eq!(aim_elevation_ft(160.0, Some(&[150.0, 158.0])), (160.0, Some(158.0)));
+        // No probe (old plugin, paused sim): the header, and nothing seen.
+        assert_eq!(aim_elevation_ft(160.0, None), (160.0, None));
+        assert_eq!(aim_elevation_ft(160.0, Some(&[])), (160.0, None));
+        // An absurd probe (a point in the sea beside the strip) is reported,
+        // never flown.
+        assert_eq!(aim_elevation_ft(160.0, Some(&[-500.0, -480.0])), (160.0, Some(-480.0)));
+        // The LEAX approach: aimed at 121 the threshold crossing is ~57 ft
+        // over the pavement; aimed at 160 it was 99 ft (radio) and balked.
+        let tch = |aim: f64| aim + TOUCHDOWN_AIM_NM * GLIDEPATH_FT_PER_NM - 117.0;
+        assert!(tch(121.0) < 65.0 && tch(121.0) > 45.0, "{}", tch(121.0));
+        assert!(tch(160.0) > 90.0);
     }
 }

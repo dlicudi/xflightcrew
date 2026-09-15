@@ -170,6 +170,12 @@ impl FlightPlan {
     pub fn summary(&self) -> String {
         let h = (self.ete_min / 60.0).floor() as i32;
         let m = (self.ete_min % 60.0).round() as i32;
+        // "0 hours 24 minutes" is a printf, not a brief (2026-09-15).
+        let ete = if h > 0 {
+            format!("{h} hours {m} minutes")
+        } else {
+            format!("{m} minutes")
+        };
         let altn = if self.alternate.is_empty() {
             String::new()
         } else {
@@ -181,10 +187,10 @@ impl FlightPlan {
             format!("{}, ", self.aircraft)
         };
         format!(
-            "Flight plan: {}{} to {}{}. Cruise {:.0} feet, {:.0} nautical miles, about {} hours {} minutes enroute{}. \
+            "Flight plan: {}{} to {}{}. Cruise {:.0} feet, {:.0} nautical miles, about {} enroute{}. \
              Block fuel {:.0} gallons, {:.0} for the trip, {:.0} reserve.",
             acft, self.origin, self.destination, altn, self.cruise_alt_ft, self.distance_nm,
-            h, m, self.wind_phrase(), self.block_fuel_gal, self.trip_fuel_gal, self.reserve_gal,
+            ete, self.wind_phrase(), self.block_fuel_gal, self.trip_fuel_gal, self.reserve_gal,
         )
     }
 

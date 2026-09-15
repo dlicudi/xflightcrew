@@ -302,6 +302,12 @@ const PHRASE_MISHEARS: &[(&str, &str)] = &[
     ("jeans on", "engines on"),      // "And jeans on?" (2026-07-10)
     ("star engine", "start engine"), // "Star engines."
     ("star engines", "start engines"),
+    // The flight plan: "Fly the flight man." (0.97 confidence, a dead end
+    // while the mission was down, 2026-09-15), "that's the wrong flag plan",
+    // "clear the flag then" (2026-09-14).
+    ("flight man", "flight plan"),
+    ("flag plan", "flight plan"),
+    ("flag then", "flight plan"),
     // Climb / descend.
     ("they send to", "descend to"), // "They send to five thousand."
     ("claim to", "climb to"),       // "Claim to 8,000 feet." (Twotter, 2026-07-09)
@@ -656,6 +662,18 @@ mod tests {
     /// Real words that share letters with the garbles must survive untouched:
     /// the repairs only fire on whole words/phrases, and the value-guarded
     /// ones only with a settable value present.
+    #[test]
+    fn the_flight_plan_survives_whispers_spellings() {
+        assert_eq!(fix_mishears("Fly the flight man."), "Fly the flight plan.");
+        assert_eq!(
+            fix_mishears("That's the wrong flag plan."),
+            "That's the wrong flight plan."
+        );
+        assert_eq!(fix_mishears("Clear the flag then."), "Clear the flight plan.");
+        // A real flag is left alone.
+        assert_eq!(fix_mishears("raise the flag"), "raise the flag");
+    }
+
     #[test]
     fn mishear_fixes_leave_real_speech_alone() {
         for s in [

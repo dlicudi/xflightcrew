@@ -527,10 +527,25 @@ impl Station {
         {
             if service == Service::Departure && !self.dep_checked_in {
                 self.dep_checked_in = true;
-                return format!(
-                    "{}, {} Departure, radar contact.",
-                    ctx.callsign, ctx.airport
-                );
+                // The climb the pilot announced is the climb they get: the
+                // zone clearance capped them at two thousand, and "radar
+                // contact" alone left "climbing five thousand" unanswered
+                // (LXGB, 2026-09-15).
+                return match climb_announced(transcript) {
+                    Some(alt) => format!(
+                        "{}, {} Departure, radar contact, climb {alt}.",
+                        ctx.callsign, ctx.airport
+                    ),
+                    None => format!(
+                        "{}, {} Departure, radar contact.",
+                        ctx.callsign, ctx.airport
+                    ),
+                };
+            }
+            // The departure clearance's suggested readback is paid.
+            self.twr.clear_clearance_readback();
+            if let Some(c) = CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                c.pending_readback = None;
             }
             return String::new();
         }
@@ -1130,6 +1145,28 @@ impl Station {
     /// (≥ 5 kt): in calm the into-wind pick flip-flops on noise, and a
     /// controller doesn't swap the runway between two transmissions.
     fn pick_runway(&mut self, wind_from: f64, wind_kts: f64) -> String {
+        self.pick_runway_with(wind_from, wind_kts, None)
+    }
+
+    /// [`pick_runway`] with the live arrival stream: in calm wind, with no
+    /// runway in use yet, the end the traffic is landing on is the runway
+    /// in use. LXGB at 07001KT: the tower picked 27 while LiveTraffic was
+    /// landing 09 (the real field's runway), and cleared a departure into
+    /// the reciprocal stream (2026-09-15).
+    fn pick_runway_with(
+        &mut self,
+        wind_from: f64,
+        wind_kts: f64,
+        arrival_end: Option<&str>,
+    ) -> String {
+        if wind_kts < 5.0 && self.runway_in_use.is_none() {
+            if let Some(end) = arrival_end {
+                if strip(&self.apt.runways, end).is_some() {
+                    self.runway_in_use = Some(end.to_string());
+                    return end.to_string();
+                }
+            }
+        }
         // A departure being SEQUENCED owns its runway. Once a taxi clearance
         // names one, the pick is frozen until the flight leaves or the
         // clearance dies — a controller does not move you to the other
@@ -1198,11 +1235,13 @@ impl Station {
         // Restricted to the strip in use — the runway-blind version held a
         // Heathrow 09R departure for the 09L stream, indefinitely
         // (2026-07-10).
-        let ident = self.pick_runway(wx.wind_from_deg, wx.wind_kts);
+        let targets = read_tcas_targets(xp).await;
+        let arrival_end = arrival_end(&targets, &self.apt.runways, self.apt.elev_ft);
+        let ident =
+            self.pick_runway_with(wx.wind_from_deg, wx.wind_kts, arrival_end.as_deref());
         let (final_traffic, runway_occupied) = match strip(&self.apt.runways, &ident) {
             Some(r) => {
                 let r = r.clone();
-                let targets = read_tcas_targets(xp).await;
                 let occupied = targets
                     .iter()
                     .any(|t| t.on_ground && on_runway(&r, t.lat, t.lon).is_some());
@@ -2556,6 +2595,79 @@ pub struct FinalTraffic {
     pub count: usize,
 }
 
+/// Lateral capture around the extended centerline: half of the tightest
+/// real parallel spacing (Heathrow's pair is ~1,400 m apart) with room
+/// for a wobbly final.
+const CORRIDOR_HALF_M: f64 = 500.0;
+/// How far out an arrival still owns the runway.
+const FINAL_NM: f64 = 4.0;
+/// A target climbing faster than this is a DEPARTURE leaving, not an
+/// arrival: a real climb-out shows +500 fpm or more, an arrival on final
+/// descends, and a level-off or an unfed VS reads ~0 and stays counted
+/// (fail toward caution). A ghost lifting off Malaga runway 30 read as
+/// "traffic on short final" to the runway 12 incursion watch, 2026-07-12.
+const CLIMBOUT_FPM: f64 = 300.0;
+
+/// The altitude a departure check-in announces ("passing one thousand
+/// climbing five thousand" gives "five thousand"), for the controller to
+/// clear. Whatever follows the last "climbing", trimmed of punctuation.
+pub fn climb_announced(transcript: &str) -> Option<String> {
+    let t = transcript.trim_end_matches(['.', ',', ' ']);
+    let i = t.to_lowercase().rfind("climbing")?;
+    let rest = t[i + "climbing".len()..].trim();
+    let rest = rest.trim_start_matches("to ").trim();
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+/// The runway END the nearest arrival on final is landing on: on the
+/// extended centreline beyond threshold A it is landing on A, beyond B on
+/// B. Same corridor and altitude band as [`final_traffic_for`].
+pub fn arrival_end(targets: &[TcasTarget], runways: &[nav::Runway], field_elev_ft: f64) -> Option<String> {
+    let mut best: Option<(f64, String)> = None;
+    for rwy in runways {
+        let m_per_deg_lat = 111_320.0;
+        let m_per_deg_lon = 111_320.0 * rwy.lat_a.to_radians().cos();
+        let (bx, by) = (
+            (rwy.lon_b - rwy.lon_a) * m_per_deg_lon,
+            (rwy.lat_b - rwy.lat_a) * m_per_deg_lat,
+        );
+        let len2 = bx * bx + by * by;
+        if len2 < 1.0 {
+            continue;
+        }
+        let len_m = len2.sqrt();
+        for t in targets
+            .iter()
+            .filter(|t| !t.on_ground)
+            .filter(|t| (30.0..1500.0).contains(&(t.ele_ft - field_elev_ft)))
+            .filter(|t| t.vs_fpm <= CLIMBOUT_FPM)
+        {
+            let (px, py) = (
+                (t.lon - rwy.lon_a) * m_per_deg_lon,
+                (t.lat - rwy.lat_a) * m_per_deg_lat,
+            );
+            let along = (px * bx + py * by) / len2;
+            let cross_m = (px * by - py * bx).abs() / len_m;
+            let beyond = FINAL_NM * 1852.0 / len_m;
+            if cross_m > CORRIDOR_HALF_M {
+                continue;
+            }
+            let (end, dist_m) = if along < 0.0 && along >= -beyond {
+                (&rwy.ident_a, (px * px + py * py).sqrt())
+            } else if along > 1.0 && along <= 1.0 + beyond {
+                let (qx, qy) = (px - bx, py - by);
+                (&rwy.ident_b, (qx * qx + qy * qy).sqrt())
+            } else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(d, _)| dist_m < *d) {
+                best = Some((dist_m, end.clone()));
+            }
+        }
+    }
+    best.map(|(_, e)| e)
+}
+
 /// Live traffic on final for THIS strip: airborne, low over the field,
 /// inside the runway's extended-centerline corridor (either direction), and
 /// not climbing away — a departure climbing through the corridor is leaving,
@@ -2568,18 +2680,6 @@ pub fn final_traffic_for(
     rwy: &nav::Runway,
     field_elev_ft: f64,
 ) -> Option<FinalTraffic> {
-    /// Lateral capture around the extended centerline: half of the tightest
-    /// real parallel spacing (Heathrow's pair is ~1,400 m apart) with room
-    /// for a wobbly final.
-    const CORRIDOR_HALF_M: f64 = 500.0;
-    /// How far out an arrival still owns the runway.
-    const FINAL_NM: f64 = 4.0;
-    /// A target climbing faster than this is a DEPARTURE leaving, not an
-    /// arrival: a real climb-out shows +500 fpm or more, an arrival on final
-    /// descends, and a level-off or an unfed VS reads ~0 and stays counted
-    /// (fail toward caution). A ghost lifting off Malaga runway 30 read as
-    /// "traffic on short final" to the runway 12 incursion watch, 2026-07-12.
-    const CLIMBOUT_FPM: f64 = 300.0;
     let m_per_deg_lat = 111_320.0;
     let m_per_deg_lon = 111_320.0 * rwy.lat_a.to_radians().cos();
     let (bx, by) = (
@@ -7166,6 +7266,44 @@ mod tests {
     }
 
     #[test]
+    fn a_tower_only_strip_loses_the_region_but_wins_its_own_frequency() {
+        // LEAX 2026-09-15: Leoni Benabu publishes one row (a tower on 123.5)
+        // four miles ahead; Malaga, 17 nm off with ATIS, ground, approach and
+        // departure, keeps the sky on the service-weighted pick however
+        // close the arrival gets. The crew's retune to 123.5 arms the strip
+        // anyway - the same "you call it, you get it" as a keyed transmission.
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut malaga = region_apt("Malaga", 36.675, -4.499);
+        malaga.apt.freqs[0].khz = 118155;
+        for (kind, khz) in [
+            (nav::FREQ_ATIS, 118450),
+            (nav::FREQ_GROUND, 121800),
+            (nav::FREQ_APPROACH, 118455),
+            (nav::FREQ_DEPARTURE, 121025),
+        ] {
+            malaga.apt.freqs.push(nav::AtcFreq { kind, khz, name: "Malaga".into() });
+        }
+        let mut strip = region_apt("Leoni Benabu", 36.80, -4.136);
+        strip.apt.freqs[0].khz = 123500;
+        *REGION.lock().unwrap() = vec![malaga, strip];
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Malaga".into(), 36.675, -4.499));
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        let now = Instant::now();
+        // Airborne 4 nm south of the strip at 2,700 ft: the region keeps Malaga.
+        let (lat, lon) = (36.735, -4.15);
+        assert!(region_tick(lat, lon, false, now).is_none());
+        assert!(PENDING_STATION.lock().unwrap().is_none(), "the service bias holds");
+        // The crew tunes the strip's tower: armed.
+        arm_station_for_freq(123500, lat, lon, 2700.0, now);
+        let armed = PENDING_STATION.lock().unwrap().take().expect("swap armed for the strip");
+        assert_eq!(armed.1.name, "Leoni Benabu");
+        *REGION.lock().unwrap() = Vec::new();
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+    }
+
+    #[test]
     fn transmission_on_another_fields_freq_arms_the_swap() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut badajoz = region_apt("Badajoz", 38.89, -6.82);
@@ -7524,6 +7662,67 @@ mod tests {
         }
     }
 
+    /// LXGB at 07001KT (2026-09-15): the tower picked 27 while LiveTraffic
+    /// was landing 09, and cleared a departure into the reciprocal stream.
+    /// In calm wind the end the arrivals are landing on is the runway in
+    /// use; a real wind still outranks it, and a held pick is not moved.
+    #[test]
+    fn calm_wind_follows_the_arrival_stream() {
+        let path = lxgb_apt_file();
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        assert_eq!(st.pick_runway_with(70.0, 1.0, Some("09")), "09");
+        // Held now: the stream is somebody else's problem once we are sequenced.
+        assert_eq!(st.pick_runway_with(70.0, 1.0, Some("27")), "09");
+        // A real wind is not overruled by traffic.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        assert_eq!(st.pick_runway_with(250.0, 12.0, Some("09")), "27");
+        // An end this field does not have is ignored.
+        let mut st = Station::load(path.to_str().unwrap(), "LXGB").expect("LXGB loads");
+        assert_eq!(st.pick_runway_with(70.0, 1.0, Some("18")), st.pick_runway(70.0, 1.0));
+    }
+
+    #[test]
+    fn the_arrival_end_is_the_threshold_the_traffic_is_beyond() {
+        let runways = vec![nav::Runway {
+            width_m: 45.0,
+            ident_a: "09".into(),
+            ident_b: "27".into(),
+            lat_a: 36.1512,
+            lon_a: -5.3554,
+            lat_b: 36.1517,
+            lon_b: -5.3366,
+        }];
+        let target = |lon: f64, vs: f64, ground: bool| TcasTarget {
+            callsign: "HTY103".into(),
+            lat: 36.1512,
+            lon,
+            ele_ft: 700.0,
+            on_ground: ground,
+            vs_fpm: vs,
+        };
+        // West of the 09 threshold, descending: landing on 09.
+        assert_eq!(arrival_end(&[target(-5.39, -600.0, false)], &runways, 11.0).as_deref(), Some("09"));
+        // East of the 27 threshold: landing on 27.
+        assert_eq!(arrival_end(&[target(-5.30, -600.0, false)], &runways, 11.0).as_deref(), Some("27"));
+        // Climbing away, or on the ground: not an arrival.
+        assert_eq!(arrival_end(&[target(-5.39, 800.0, false)], &runways, 11.0), None);
+        assert_eq!(arrival_end(&[target(-5.39, -600.0, true)], &runways, 11.0), None);
+        // The nearer of two wins.
+        let both = [target(-5.39, -600.0, false), target(-5.33, -500.0, false)];
+        assert_eq!(arrival_end(&both, &runways, 11.0).as_deref(), Some("27"));
+    }
+
+    #[test]
+    fn the_climb_announced_is_what_departure_clears() {
+        assert_eq!(
+            climb_announced("gibraltar departure, november one seven two sierra papa, passing one thousand climbing five thousand"),
+            Some("five thousand".into())
+        );
+        assert_eq!(climb_announced("passing two thousand climbing to 5000."), Some("5000".into()));
+        assert_eq!(climb_announced("passing one thousand"), None);
+        assert_eq!(climb_announced("climbing"), None);
+    }
+
     #[test]
     fn calm_wind_holds_the_runway_in_use() {
         let path = lxgb_apt_file();
@@ -7722,6 +7921,17 @@ mod tests {
             tower::State::Parked,
             "a radio check moves nothing"
         );
+
+        // The zone clearance suggests its readback (cap, QNH, squawk) and
+        // enforces nothing; the crew's echo pays it and earns silence.
+        let r = st.route_keyed("request clearance", Service::Tower, &ctx, wx);
+        assert!(r.contains("cleared to leave the Gibraltar zone"), "{r}");
+        let owed = st.twr.suggested_readback(&ctx.callsign).expect("a suggested readback");
+        assert!(owed.starts_with("Not above two thousand feet, QNH one zero one seven, squawk"), "{owed}");
+        assert!(owed.ends_with(&format!("{}.", ctx.callsign)), "{owed}");
+        let r = st.route_keyed(&owed.to_lowercase(), Service::Tower, &ctx, wx);
+        assert_eq!(r, "", "a clearance readback keeps the frequency quiet: {r}");
+        assert!(st.twr.suggested_readback(&ctx.callsign).is_none(), "paid");
 
         let r = st.route_keyed("request clearance for taxi", Service::Tower, &ctx, wx);
         assert!(

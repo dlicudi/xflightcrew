@@ -959,6 +959,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // tick for two seconds every ten.
     let mut last_probe = std::time::Instant::now() - std::time::Duration::from_secs(60);
     let mut terrain_available = true;
+    let mut terrain_misses: u32 = 0;
     let mut said_floor: Option<f64> = None;
     let mut said_alt_hold = false;
     while idx < legs.len() {
@@ -1082,7 +1083,22 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 .unwrap_or(TERRAIN_LOOK_NM);
             let pts = look_ahead_points(lat, lon, brg, look, TERRAIN_POINTS);
             match crate::terrain::max_elevation_ft(&xp, &pts).await {
-                Some(ground) => publish_terrain_floor(Some(ground + TERRAIN_CLEARANCE_FT)),
+                Some(ground) => {
+                    terrain_misses = 0;
+                    publish_terrain_floor(Some(ground + TERRAIN_CLEARANCE_FT))
+                }
+                None if !terrain_probe_fatal(&mut terrain_misses, crate::xplane::sim_frozen(&xp).await) => {
+                    // A probe the sim never answered because it was FROZEN is
+                    // no verdict on the plugin: the pilot paused 0.6 s after
+                    // the query went out, the two-second wait ran into the
+                    // pause, and the floor was switched off for the whole
+                    // LXGB-LEAX flight (2026-09-15). Deferred; only two live
+                    // misses in a row retire it.
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "terrain_probe_deferred", "misses": terrain_misses}),
+                    );
+                }
                 None => {
                     terrain_available = false;
                     publish_terrain_floor(None);
@@ -1306,6 +1322,22 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     clear_pilot_altitude();
     publish_terrain_floor(None);
     ACTIVE.store(false, Ordering::SeqCst);
+}
+
+/// Live misses of the terrain probe before the floor is retired for the
+/// flight. One is a race with a pause or a slow frame; two in a row is a
+/// plugin that does not answer.
+pub const TERRAIN_MISSES_TO_RETIRE: u32 = 2;
+
+/// Count an unanswered terrain probe. A miss while the sim is frozen is not
+/// counted at all (the plugin's flight loop was not running to answer);
+/// returns true when the probe should be retired for the flight.
+pub fn terrain_probe_fatal(misses: &mut u32, frozen: bool) -> bool {
+    if frozen {
+        return false;
+    }
+    *misses += 1;
+    *misses >= TERRAIN_MISSES_TO_RETIRE
 }
 
 #[cfg(test)]
@@ -1851,5 +1883,20 @@ mod tests {
         assert!(approach_flyable_from(&plan, far_lat, far_lon, 3000.0));
         // Far out but too low (below platform − 500): not flyable.
         assert!(!approach_flyable_from(&plan, far_lat, far_lon, 1500.0));
+    }
+    #[test]
+    fn a_probe_lost_to_a_pause_does_not_retire_the_terrain_floor() {
+        // LXGB-LEAX 2026-09-15: the pause landed inside the probe's wait.
+        let mut m = 0;
+        assert!(!terrain_probe_fatal(&mut m, true));
+        assert_eq!(m, 0, "a frozen miss is not a miss");
+        // One live miss is deferred; the second in a row retires the floor.
+        assert!(!terrain_probe_fatal(&mut m, false));
+        assert!(terrain_probe_fatal(&mut m, false));
+        // A frozen miss between two live ones neither counts nor resets.
+        let mut m = 1;
+        assert!(!terrain_probe_fatal(&mut m, true));
+        assert_eq!(m, 1);
+        assert!(terrain_probe_fatal(&mut m, false));
     }
 }

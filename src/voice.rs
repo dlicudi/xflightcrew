@@ -732,6 +732,13 @@ impl Voice {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Is the station talking right now? A crew call rendered with a live
+    /// number (the departure check-in's altitude) waits for this to clear
+    /// before it reads the gauge, so the number is the one spoken.
+    pub fn radio_on_air(&self) -> bool {
+        radio_is_on_air(&self.inner)
+    }
+
     /// Publish whether the airframe is crashed (see `Inner::crashed`). Going
     /// crashed cuts a live station transmission mid-word, same as a power
     /// loss — the receiver just became wreckage.

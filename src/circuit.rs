@@ -697,10 +697,26 @@ pub fn circuit_detail(leg: Leg, rwy_id: &str, alt_ft: f64, target_alt_ft: f64, i
 /// speaks both the copilot's transmission and the tower's reply. Empty in
 /// copilot-only mode or with no station — the calls are simply discarded, since
 /// real/external ATC owns the radio then.
-static CREW_RADIO: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+static CREW_RADIO: Mutex<VecDeque<CrewCall>> = Mutex::new(VecDeque::new());
+
+/// A call the crew has queued for the main loop to transmit. `Text` is the
+/// finished sentence; `CheckIn` is rendered by the main loop the moment it
+/// is about to be spoken, because its altitude must be the one passing
+/// THEN: read when queued, the LXGB check-in said "passing one thousand"
+/// at 1,207 ft, twenty seconds and a party-line exchange later
+/// (08:23Z, 2026-09-15).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CrewCall {
+    Text(String),
+    CheckIn {
+        callsign: Option<String>,
+        to: String,
+        climb_to_ft: f64,
+    },
+}
 
 /// Drain the pending crew radio calls (main loop only).
-pub fn take_crew_radio() -> Vec<String> {
+pub fn take_crew_radio() -> Vec<CrewCall> {
     let mut q = CREW_RADIO.lock().unwrap_or_else(|e| e.into_inner());
     q.drain(..).collect()
 }
@@ -711,7 +727,19 @@ pub fn transmit(call: String) {
     CREW_RADIO
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push_back(call);
+        .push_back(CrewCall::Text(call));
+}
+
+/// Queue the departure check-in, rendered with the live altitude when spoken.
+pub fn transmit_check_in(callsign: Option<String>, to: String, climb_to_ft: f64) {
+    CREW_RADIO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back(CrewCall::CheckIn {
+            callsign,
+            to,
+            climb_to_ft,
+        });
 }
 
 /// The aircraft's callsign, spoken the way the tower says it ("November one
@@ -1113,6 +1141,27 @@ fn densify(pts: &[(f64, f64)], step_m: f64) -> Vec<(f64, f64)> {
 /// so the slow AP turn rolls through the corner instead of circling the point.
 const AUTHORED_CAPTURE_M: f64 = 350.0;
 
+/// How far the Rock circuit's downwind runs from the runway line, metres:
+/// SOUTH of Europa Point (4,500 m from the centreline at the lighthouse),
+/// so the loop goes AROUND the Rock, over the Strait. The old 1.3 x pattern
+/// width put it 2,050 m out, over Middle Hill (2026-09-15, runway 09): the
+/// probe read 1,098 ft under the leg, the raised pattern altitude cleared
+/// that on paper, and the aircraft crossed the ridge at 1,412 ft STILL
+/// CLIMBING, 454 ft over the ground, with the terrain check satisfied.
+const LXGB_ROCK_CLEAR_M: f64 = 5_400.0;
+
+/// The most climb the authored follower commands, feet per minute (the
+/// `vs_raw` clamp), and the fraction of it the pre-flight climb model
+/// credits: measured 550 to 650 fpm at 73 kt on the 172 against a 700 clamp.
+const AUTHORED_CLIMB_FPM: f64 = 700.0;
+const AUTHORED_CLIMB_CREDIT: f64 = 0.75;
+
+/// Feet gained per metre flown at the pattern speed, for the climb model.
+fn authored_climb_gradient(pattern_kts: f64) -> f64 {
+    let m_per_min = pattern_kts.max(40.0) * M_PER_NM / 60.0;
+    AUTHORED_CLIMB_FPM * AUTHORED_CLIMB_CREDIT / m_per_min
+}
+
 /// One authored circuit waypoint, in the departure-runway frame (see
 /// `frame_to_latlon`): `a_m` along the takeoff course from the threshold, `x_m`
 /// right of it, and the target altitude (MSL) to be at approaching it.
@@ -1150,6 +1199,10 @@ fn authored_circuit(
     let w = geom.width_m;
     let up = rwy.length_m + geom.upwind_past_m;
     let dn = geom.downwind_past_m;
+    // The downwind runs south of Europa Point, whatever the airframe's
+    // pattern width: the Rock is a fixed piece of granite, not a fraction
+    // of the turn radius.
+    let out = (w * 1.3).max(LXGB_ROCK_CLEAR_M);
     Some(vec![
         // Climb out on the runway heading.
         AuthoredWpt {
@@ -1157,20 +1210,22 @@ fn authored_circuit(
             x_m: 0.0,
             alt_msl_ft: tpa_msl_ft,
         },
-        // Turn to the bay side; downwind held wide to clear the Rock's flank.
+        // Crosswind south over the sea off the Rock's east face, the length
+        // of the Rock: the climb to pattern altitude happens here, over
+        // water, before any leg turns back toward the granite.
         AuthoredWpt {
             a_m: up,
-            x_m: side * w * 1.3,
+            x_m: side * out,
             alt_msl_ft: tpa_msl_ft,
         },
         AuthoredWpt {
             a_m: 0.0,
-            x_m: side * w * 1.3,
+            x_m: side * out,
             alt_msl_ft: tpa_msl_ft,
         },
         AuthoredWpt {
             a_m: -dn,
-            x_m: side * w * 1.3,
+            x_m: side * out,
             alt_msl_ft: tpa_msl_ft,
         },
         // Base back over the water, descending to the handoff height.
@@ -1277,18 +1332,45 @@ async fn leg_terrain_ft(
     out
 }
 
+/// The altitude (feet MSL) the climb can have reached at each waypoint:
+/// the field elevation plus `gradient_ft_per_m` over the path flown from
+/// the threshold through every waypoint before it. Uncapped; the caller
+/// caps it at the altitude actually asked for.
+fn climb_reach_ft(route: &[AuthoredWpt], field_elev_ft: f64, gradient_ft_per_m: f64) -> Vec<f64> {
+    let mut out = Vec::with_capacity(route.len());
+    let (mut pa, mut px, mut len) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for w in route {
+        len += ((w.a_m - pa).powi(2) + (w.x_m - px).powi(2)).sqrt();
+        (pa, px) = (w.a_m, w.x_m);
+        out.push(field_elev_ft + gradient_ft_per_m * len);
+    }
+    out
+}
+
 /// Raise the route's pattern altitude until every leg flown AT pattern
 /// altitude clears its terrain by [`TERRAIN_CLEAR_FT`], or refuse. Legs that
 /// descend to the handoff height (into a waypoint below the TPA) cannot be
 /// raised and are refused when their terrain needs more than the height
 /// they end at; a raise past [`MAX_TERRAIN_RAISE_FT`] is refused too.
+///
+/// "Flown at pattern altitude" is only true once the climb has got there:
+/// the follower leaves the takeoff's handoff at ~500 ft and climbs along
+/// the route, so a leg with terrain under it is also checked against the
+/// altitude the climb ([`climb_reach_ft`], `gradient_ft_per_m`) can have
+/// reached at the leg's START, and refused when the terrain needs more.
+/// Runway 09 at LXGB (2026-09-15): a 2,108 ft pattern altitude cleared the
+/// 1,098 ft under the downwind on paper, and the aircraft entered that leg
+/// at 1,130 ft.
 /// Returns the route to fly and the pattern altitude it flies.
 fn raise_for_terrain(
     route: &[AuthoredWpt],
     tpa_msl_ft: f64,
     leg_max_ft: &[Option<f64>],
+    field_elev_ft: f64,
+    gradient_ft_per_m: f64,
 ) -> Result<(Vec<AuthoredWpt>, f64), String> {
     let at_tpa = |w: &AuthoredWpt| w.alt_msl_ft >= tpa_msl_ft - 1.0;
+    let reach = climb_reach_ft(route, field_elev_ft, gradient_ft_per_m);
     let mut tpa_needed = tpa_msl_ft;
     for i in 1..route.len() {
         let Some(Some(ground)) = leg_max_ft.get(i) else {
@@ -1297,6 +1379,12 @@ fn raise_for_terrain(
         let need = ground + TERRAIN_CLEAR_FT;
         if at_tpa(&route[i - 1]) && at_tpa(&route[i]) {
             tpa_needed = tpa_needed.max(need);
+            let entry = reach[i - 1].min(tpa_needed);
+            if need > entry {
+                return Err(format!(
+                    "leg {i} needs {need:.0} ft over {ground:.0} ft ground, entered at {entry:.0} ft in the climb"
+                ));
+            }
         } else {
             let floor = route[i - 1].alt_msl_ft.min(route[i].alt_msl_ft);
             if need > floor {
@@ -1464,7 +1552,7 @@ async fn fly_authored_route(
         // Vertical: VS toward the waypoint altitude (the takeoff's proven
         // recipe), and only as much climb as the airspeed will pay for.
         let vs_raw = if alt_msl_ft.is_finite() {
-            ((wp.alt_msl_ft - alt_msl_ft) * 3.0).clamp(-500.0, 700.0)
+            ((wp.alt_msl_ft - alt_msl_ft) * 3.0).clamp(-500.0, AUTHORED_CLIMB_FPM)
         } else {
             0.0
         };
@@ -1853,7 +1941,13 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // leg raises the pattern altitude; terrain under a descending leg,
         // or a raise past MAX_TERRAIN_RAISE_FT, refuses the route.
         let leg_max = leg_terrain_ft(&xp, &rwy, &route).await;
-        let authored = match raise_for_terrain(&route, tpa_msl_ft, &leg_max) {
+        let authored = match raise_for_terrain(
+            &route,
+            tpa_msl_ft,
+            &leg_max,
+            field_elev_ft,
+            authored_climb_gradient(pattern_kts),
+        ) {
             Ok(v) => Some(v),
             Err(why) => {
                 crate::blackbox::record(
@@ -3190,8 +3284,8 @@ mod tests {
         assert_eq!(
             take_crew_radio(),
             vec![
-                "Downwind runway two seven".to_string(),
-                "Final runway two seven".to_string()
+                CrewCall::Text("Downwind runway two seven".to_string()),
+                CrewCall::Text("Final runway two seven".to_string())
             ]
         );
         assert!(take_crew_radio().is_empty(), "a second drain is empty");
@@ -3542,7 +3636,8 @@ mod tests {
         let route = authored_circuit(&lxgb_rwy(), &g(), 11.0, 1650.0, false).unwrap();
         let mut legs = vec![None; route.len()];
         legs[2] = Some(1130.0);
-        let (raised, tpa) = raise_for_terrain(&route, 1650.0, &legs).unwrap();
+        // A generous climb gradient: this test is about the raise alone.
+        let (raised, tpa) = raise_for_terrain(&route, 1650.0, &legs, 11.0, 1.0).unwrap();
         assert!((tpa - 1730.0).abs() < 0.01, "tpa {tpa}");
         for w in &raised[..4] {
             assert!(
@@ -3556,7 +3651,8 @@ mod tests {
         );
         assert!((raised[5].alt_msl_ft - 711.0).abs() < 0.01);
         // Sea under every leg: nothing changes.
-        let (same, tpa) = raise_for_terrain(&route, 1650.0, &vec![None; route.len()]).unwrap();
+        let (same, tpa) =
+            raise_for_terrain(&route, 1650.0, &vec![None; route.len()], 11.0, 1.0).unwrap();
         assert!((tpa - 1650.0).abs() < 0.01);
         assert!(same
             .iter()
@@ -3565,11 +3661,68 @@ mod tests {
         // Terrain under a DESCENDING leg cannot be out-climbed: refused.
         let mut legs = vec![None; route.len()];
         legs[4] = Some(400.0);
-        assert!(raise_for_terrain(&route, 1650.0, &legs).is_err());
+        assert!(raise_for_terrain(&route, 1650.0, &legs, 11.0, 1.0).is_err());
         // A raise past the cap is refused, not flown.
         let mut legs = vec![None; route.len()];
         legs[2] = Some(2200.0);
-        assert!(raise_for_terrain(&route, 1650.0, &legs).is_err());
+        assert!(raise_for_terrain(&route, 1650.0, &legs, 11.0, 1.0).is_err());
+    }
+
+    /// Runway 09, 2026-09-15: the raised pattern altitude cleared the ridge
+    /// under the downwind on paper, and the aircraft turned onto that leg at
+    /// 1,130 ft, still climbing, and crossed the ground 454 ft up. A leg is
+    /// checked against the altitude the climb can have reached at its START,
+    /// not the altitude the route will eventually hold.
+    #[test]
+    fn a_leg_entered_below_its_terrain_in_the_climb_is_refused() {
+        let route = authored_circuit(&lxgb_rwy(), &g(), 11.0, 2108.0, false).unwrap();
+        let grad = authored_climb_gradient(75.0);
+        // 525 fpm credited at 75 kt: about 0.23 ft per metre flown.
+        assert!((0.2..0.26).contains(&grad), "gradient {grad}");
+        let reach = climb_reach_ft(&route, 11.0, grad);
+        // The reach grows along the route and starts from the field.
+        assert!(reach.windows(2).all(|w| w[1] > w[0]));
+        assert!(reach[0] > 11.0 && reach[0] < 1000.0, "reach at wpt 0 {}", reach[0]);
+        // A 1,130 ft ridge under the downwind needs 1,730 ft; the climb
+        // reaches less than that by the end of the crosswind, so the route
+        // is refused however high the pattern altitude.
+        let mut legs = vec![None; route.len()];
+        legs[2] = Some(1130.0);
+        assert!(reach[1] < 1730.0, "reach at wpt 1 {}", reach[1]);
+        let why = raise_for_terrain(&route, 2108.0, &legs, 11.0, grad).unwrap_err();
+        assert!(why.contains("in the climb"), "{why}");
+        // The same ridge under the LAST pattern-altitude leg is out-climbed
+        // by then (the reach at its start is past the TPA) and flown.
+        let mut legs = vec![None; route.len()];
+        legs[3] = Some(1098.0);
+        assert!(reach[2] > 2108.0, "reach at wpt 2 {}", reach[2]);
+        assert!(raise_for_terrain(&route, 2108.0, &legs, 11.0, grad).is_ok());
+        // A shallow climber (a heavy twin on one engine, say) is refused
+        // even there.
+        assert!(raise_for_terrain(&route, 2108.0, &legs, 11.0, 0.05).is_err());
+    }
+
+    /// The loop goes AROUND the Rock: the downwind runs south of Europa
+    /// Point on either side, whatever the airframe's pattern width; the base
+    /// and the final handoff stay where the rectangle's would be.
+    #[test]
+    fn the_rock_circuit_downwind_runs_south_of_europa_point() {
+        for left in [true, false] {
+            let route = authored_circuit(&lxgb_rwy(), &g(), 11.0, 1074.0, left).unwrap();
+            for w in &route[1..4] {
+                assert!(
+                    w.x_m.abs() >= LXGB_ROCK_CLEAR_M - 0.01,
+                    "downwind {:.0} m out, left {left}",
+                    w.x_m
+                );
+            }
+            assert!(route[4].x_m.abs() < LXGB_ROCK_CLEAR_M * 0.5, "base inside the loop");
+            assert!(route[5].x_m.abs() < 0.1);
+            // The crosswind (leg 1) is the climb's leg: long enough at a
+            // 172's gradient to reach a raised pattern altitude over water.
+            let reach = climb_reach_ft(&route, 11.0, authored_climb_gradient(75.0));
+            assert!(reach[1] > 1600.0, "reach at the end of the crosswind {}", reach[1]);
+        }
     }
 
     #[test]

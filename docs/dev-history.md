@@ -4,6 +4,64 @@ This is the full pre-trim CLAUDE.md (archived 2026-09-05): every sortie-by-sorti
 
 ---
 
+## The chatter of one departure, LXGB to GMTN, 2026-09-15
+
+The same sortie's radio and intercom, read line by line after the push
+was fixed. What the transcript showed and what changed:
+
+- **The handoff readback went to the wrong controller.** Tower said
+  "contact Gibraltar Departure on one three zero decimal four" at 600 ft;
+  the crew's readback was queued at 1,000 ft, but the main loop SPEAKS a
+  crew call (blocking, waiting for the frequency to go quiet) before it
+  routes it, and a party-line exchange plus a traffic advisory held it
+  19 s. Full auto's fixed 4 s wait had retuned by then, so the readback
+  was routed to DEPARTURE, which answered "say again". A crew call is now
+  routed on the frequency it was keyed on, before it is spoken; the
+  audible order is unchanged.
+- **"Electrical set. Generators and bleeds on."** on a 172. The line is
+  "Electrical set." now; the start line already names the alternator and
+  avionics, and the profile's command list is what was actually set.
+- **"Taking the runway" twice** ninety seconds apart: a backtrack is two
+  executions of the line-up tool and each was announced. Once, now; the
+  tool's replies name the legs ("Backtracking runway two seven for the
+  full length", "Lining us up, runway two seven").
+- **"My takeoff" twice in one breath**: full auto's "Cleared to go" line
+  said it and the takeoff tool's first line says it. Dropped from the
+  first.
+- **"about 0 hours 24 minutes enroute"** and **"You're at 49, 4951 to
+  climb to cruise"** in the brief on the ground. Minutes alone under an
+  hour; no altitude line at all on the ground, and "feet" on it in the air.
+- **"Fly the flight man."** at 0.97 confidence was a dead end while the
+  mission was down; "flag plan" and "flag then" the day before. Three
+  whole-phrase mishears in `PHRASE_MISHEARS`, with the live transcripts as
+  the test.
+
+The rest of the list, done the same afternoon:
+
+- **The departure clearance is read back.** The tower SUGGESTS the words
+  (`Tower::clearance_readback`: "Not above two thousand feet, QNH one zero
+  two two, squawk four five zero three, callsign"), enforces nothing
+  (ICAO's mandatory list stops at the runway), publishes them as the
+  `pending_readback` the coach shows a human pilot, and answers the echo
+  with silence, clearing the suggestion. Full auto transmits it once the
+  squawk is in (`clearance_readback` event), before asking for taxi.
+- **Departure clears the climb it was told about.** The check-in's
+  "climbing five thousand" is parsed (`climb_announced`) and the first
+  reply is "radar contact, climb five thousand"; a check-in with no climb
+  gets plain radar contact as before.
+- **The check-in names the altitude being passed as it is SPOKEN.** The
+  crew radio queue carries a `CrewCall::CheckIn`, rendered by the main
+  loop after a bounded wait for the frequency to go quiet, from the
+  altimeter at that moment (`Voice::radio_on_air`). The blackbox keeps
+  `alt_ft_queued` for the comparison.
+- **Three lines at a thousand feet, not four.** The mixture manager is
+  armed silently; its own line when it first leans says what it did.
+- **In calm wind the runway in use follows the arrival stream**
+  (`arrival_end` over the TCAS picture: the threshold the nearest
+  descending arrival is beyond, inside the same corridor as the release
+  watch; `pick_runway_with`). Only with no runway in use yet and under
+  5 kt; a real wind and a held pick both outrank it.
+
 ## The push was called done mid-swing, and the taxi drove against the tug, 2026-09-15
 
 LXGB stand 1, "fly the flight plan" from cold. The plan asked the tug for
@@ -3345,6 +3403,49 @@ and the landing light stayed on (the authored loop never called
 circuit to Departure at 719 ft because the takeoff request never said "for
 circuits"; nobody answered, which was right, but the request should carry it.
 
+## The Rock circuit went over the Rock (2026-09-15)
+
+Runway 09, the 172, "fly a circuit". The authored loop's downwind sat
+1.3 x the pattern width from the runway line: 2,050 m, which at Gibraltar
+is Middle Hill, not the sea. The leg probe (150 m samples, the 2026-09-14
+fix) read 1,098 ft under the downwind, `raise_for_terrain` found the
+2,108 ft pattern altitude already 1,010 ft above it and passed the route
+with `raised_ft: 0`. The follower joined leg 1 at 500 ft, turned onto the
+downwind at 1,130 ft and crossed the ridge at 1,412 ft climbing 1,000 fpm:
+454 ft over 958 ft of ground (`state` records, t+204 s), on a route the
+check had called clear by 600 ft. The screenshot from the map showed the
+aircraft south-east of the field pointing at the east face.
+
+Two wrong assumptions, one each:
+
+- **The downwind was scaled to the airframe, the Rock is not.** The
+  "around the Rock" bulge was a multiple of the turn radius; a 172's
+  pattern width is 1,577 m and the Rock runs 4,500 m south of the runway
+  line to Europa Point. `LXGB_ROCK_CLEAR_M` (5,400 m) is now the floor for
+  the downwind offset on either side: crosswind south over the sea off the
+  east face, downwind over the Strait 800 m south of the point, base back
+  north over the bay (or the Mediterranean on 27), the final handoff where
+  it was. Every waypoint checked against the real 09/27 thresholds: sea.
+  The loop is bigger (about seven minutes) and goes AROUND the granite,
+  which is what the words meant.
+- **"Flown at pattern altitude" was assumed, not reached.** The terrain
+  check compared each pattern-altitude leg with the altitude the route
+  would eventually hold, and the follower leaves the takeoff's handoff at
+  500 ft and climbs along the route. `raise_for_terrain` now carries a
+  climb model (`climb_reach_ft`: field elevation plus
+  `authored_climb_gradient`, 75% of the follower's 700 fpm clamp at the
+  pattern speed, over the path flown from the threshold) and refuses a
+  leg whose terrain needs more than the climb can have reached at the
+  leg's START ("entered at N ft in the climb"). With the new geometry the
+  Rock is under no leg; the check is there so a future waypoint that puts
+  it back is refused on the ground instead of cleared by 454 ft. Pure,
+  tested (`a_leg_entered_below_its_terrain_in_the_climb_is_refused`,
+  `the_rock_circuit_downwind_runs_south_of_europa_point`).
+
+The refusal falls back to the rectangle as before. The base is now 4.4 km
+long, so the descent from a raised pattern altitude to the 711 ft handoff
+has the room the old 1.2 km base never had; not yet flown in the sim.
+
 ## Cabin crew: the second intercom persona (2026-07-15)
 
 Channels are physics, personas are tenants: the intercom now carries TWO
@@ -3423,3 +3524,70 @@ merged, settle any change of heart BEFORE accepting a PR. One consequence to
 keep in mind: `crates/atc` is built for extraction, and GPL means any future
 consumer of it must be GPL too, `LGPL-3.0` on that one crate is the escape
 hatch if it should ever be broadly embeddable, deliberately not done now.
+
+## LXGB-LEAX in the 172: the arm under a capture, a threshold 43 ft below its header, a strip that could not win its own sky - 2026-09-15
+
+Full auto, Gibraltar to Leoni Benabu, five enroute fixes at 8,000, the
+visual landing (LEAX has no coded approach). Four findings from the blackbox,
+three fixed, one left as it is.
+
+1. **"Autopilot is not holding the descent" at the autoland arm (13:52Z).**
+The follower's last leg dialled PIZCU's 2,600 ft; the aircraft was at 2,733
+descending 700 fpm when the arrival handed to autoland, i.e. INSIDE the AP's
+altitude capture, which was already arresting the descent (vsi -697 to -182
+over ten seconds, before the arm). Autoland wrote -1,200 to the VS dial and
+the AP, mid-capture, ignored it; flaps 10 went in at 100 kt and the aircraft
+ballooned to +295 fpm; after 12 ticks the divergence watchdog re-pressed VS
+mode and the descent resumed at -1,300 within a second. The per-tick
+`VS_STATUS <= 0.5` re-select never fired because `vvi_status` stayed 2 through
+the capture. Autoland had never touched the altitude dial in its life; it
+now parks it at the arm (`parked_altitude_dial_ft`, 1,000 ft above the arm
+altitude rounded up to the hundred, only when the dial is within 500 ft
+above or anywhere below) and re-selects VS once, blackboxed
+`alt_dial_parked`. A go-around's climb captures the parked level at worst,
+and the per-tick re-select takes it down again from an ALT hold (status 0).
+
+2. **"Going around", overflew the runway, at 52 ft radio 300 m past the LEAX
+30 numbers (14:00Z).** The approach was clean: 65-67 kt, on the 3° path to
+the foot, cross-track 30 m, trim 0.5°. The path was aimed at the apt.dat
+header elevation, 160 ft; the runway 30 threshold's mesh is at ~117 ft
+(`alt - agl` at the crossing: 216 - 99), so the aircraft crossed the
+threshold 99 ft up instead of ~57, never entered the roundout band, and on a
+1,062 m runway the float allowance is the 0.15 nm floor, so "overflew" fired
+at 0.16. The arm now probes the sim's own mesh at the threshold and the
+touchdown aim (`terrain::sample_ft`, two points) and aims at the higher when
+it differs from the header by more than 20 ft and less than 300
+(`aim_elevation_ft`, blackbox `threshold_elev`, said aloud: "Runway three
+zero threshold is 39 feet below the field elevation. Aiming at 121 feet.").
+The test pins the LEAX crossing height either way.
+
+3. **Inbound and final calls into the void; no LEAX station ever installed.**
+The region pick is service-weighted (`region_services` x 3 nm, the Trebujena
+rule): Malaga's ATIS/ground/approach/departure rows pull it 12 nm nearer than
+it is, and Leoni Benabu's one tower row pulls nothing, so at 4 nm from the
+strip the arithmetic was 4 + 5 against 17 - 12: Malaga keeps the sky over
+LEAX's own runway for ever. The crew had tuned 123.5 and waited 45 s for the
+swap that could never come. The crew's retune to the destination's tower now
+calls `station::arm_station_for_freq` - the pilot's "you call it, you get it"
+rule (2026-07-10) applied to the crew's own hand on the knob - and the
+existing swap wait finds the station on the next loop pass. Test:
+`a_tower_only_strip_loses_the_region_but_wins_its_own_frequency`.
+
+4. **`terrain_probe_unavailable` at 13:12Z, the floor off for the whole
+flight.** The pilot paused 0.6 s after a probe's query went out; the
+two-second wait for the plugin's `gen` bump ran into the pause and the None
+was read as "no plugin". `terrain_probe_fatal`: a miss while `sim_frozen` is
+not counted, two live misses in a row retire the floor, one is deferred
+(blackbox `terrain_probe_deferred`).
+
+Left alone: the region handoff's readback (13:26Z) went "void" because the
+main loop consumes the pending station on the pass after the monitor arms it,
+and the crew's readback keys two seconds later on a frequency nobody holds.
+It is a readback to a controller who has just signed off; harmless, and
+routing it through the departing station would mean holding the swap for the
+crew. Noted, not fixed.
+
+The copilot process ended at 14:00:19Z, seven seconds into the go-around,
+with no shutdown line and no macOS crash report; the sim was found paused at
+100 ft AGL in the climb. Cause unknown (a Ctrl-C at the pause is the simplest
+reading).

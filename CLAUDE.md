@@ -257,7 +257,11 @@ hardcoding. Config: `XCOPILOT_ATC_AIRPORT` / `_VOICE` / `_RATE` / `_REGION`.
 
 **Tower FSM behaviours** (each with history behind it): readback enforcement
 (runway-critical items only; `XCOPILOT_ATC_READBACK=false` keeps coaching,
-drops challenges), LinedUp + conditional line-up, a runway-in-use pick FROZEN
+drops challenges; the zone clearance's readback is SUGGESTED, never
+enforced, and the crew reads it back under full auto), a departure check-in
+answered with the climb it announced (`climb_announced`), a calm-wind
+runway pick that follows the arrival stream (`arrival_end`, only with no
+runway in use yet), LinedUp + conditional line-up, a runway-in-use pick FROZEN
 while a departure is committed (plus wind hysteresis - parallel runways
 flip-flop invisibly), a release gate that THREADS the arrival stream
 (`DEPART_GAP_NM`; inside the gap but strip clear = stage with LUAW), wake
@@ -281,6 +285,11 @@ for coach and panel.
   with no buffer is said again whole. A Warning talks straight over and is
   never stepped on. Radio-only cuts
   (retune, avionics off, crash, replay) never touch the copilot's voice.
+- **A crew call is routed on the frequency it was keyed on, before it is
+  spoken** (`say` blocks until the frequency is quiet; a handoff readback
+  held 19 s was routed after the retune and Departure said "say again",
+  2026-09-15). A call with a live number (`CrewCall::CheckIn`) is rendered
+  by the main loop as it goes out, after a bounded wait for `radio_on_air`.
 - Radio PTT vs intercom PTT: when a radio key is bound, **physical routing
   beats content routing in BOTH directions**. Content routing to ATC survives
   only for setups with no radio key.
@@ -460,7 +469,13 @@ history):
   and is terrain-probed along its LEGS every 150 m (six waypoints on sea
   either side of the Rock hid the ridge between them): terrain under a
   pattern-altitude leg raises the pattern altitude (`raise_for_terrain`,
-  said aloud), under a descending leg refuses. The takeoff sets the trim
+  said aloud), under a descending leg refuses, and a leg is checked
+  against the altitude the CLIMB can have reached at its start
+  (`climb_reach_ft`), never the altitude the route will eventually hold
+  (2026-09-15: cleared on paper by 1,010 ft, crossed climbing by 454). The
+  Rock's downwind is a fixed distance from the runway (`LXGB_ROCK_CLEAR_M`,
+  south of Europa Point, over the Strait), never a multiple of the
+  airframe's pattern width. The takeoff sets the trim
   into the takeoff band before the brakes come off (a nose-down stop trim
   is what the AP's climb lost to at the engage: -1,040 fpm at 325 ft).
   **The arrival is briefed at the gate** (`full_auto::brief_arrival` in the
@@ -494,7 +509,9 @@ history):
   follower commands goes below the highest terrain on the track
   (`terrain_floor_ahead_ft`: 16 probe points, 15 nm or to the fix, every 10 s,
   plus 1,000 ft; skipped on an approach, whose platform altitudes own the
-  descent; disabled for the flight after one unanswered probe). A plan's
+  descent; retired for the flight after TWO unanswered probes with the sim LIVE - a
+  probe that fell into a pause is no verdict on the plugin, `terrain_probe_fatal`;
+  one did, 2026-09-15, and the floor was off for the whole flight). A plan's
   altitude is only as good as the ground under it, whoever handed it down.
   **The follower flies the ALTIMETER** (`altitude_ft_pilot`): the dial, the
   plan, the chart and the controller all mean indicated feet, and on a hot
@@ -526,7 +543,18 @@ history):
   the pavement (high stays hair-trigger); the missed approach is a sticky
   `MissedStage` with a timer longer than the manoeuvre it commands (600 s);
   give-ups hand back a FLYABLE aircraft (climb power, VS zeroed, a line that
-  says what is actually held). **A tower's go-around order outranks
+  says what is actually held). **The altitude dial is parked at the arm**
+  (`parked_altitude_dial_ft`: 1,000 ft above the arm altitude, rounded up,
+  VS re-selected) - autoland flies the vertical through the VS dial and
+  never touched the altitude dial, so the plan's last constraint sat 130 ft
+  under the LEAX arm and the AP's capture ignored -1,200 for six seconds
+  ("not holding the descent", 2026-09-15). **The glidepath aims at the
+  pavement's own elevation** (`aim_elevation_ft`: the threshold and the
+  touchdown aim probed from the sim's mesh at the arm, the higher used when
+  it differs from the apt.dat header by more than 20 ft and less than 300,
+  said aloud, blackboxed `threshold_elev`): LEAX's header says 160 ft, its
+  30 threshold lies at 117, and the 172 crossed the numbers 99 ft up and
+  balked "overflew the runway" 300 m in. **A tower's go-around order outranks
   everything** (`GoAroundLatch::order`): consumed in the autoland loop,
   drained at arm time, refused on the ground; a fresh "final" report is owed
   after any go-around, made inside the FAP. **The wind crab fed forward on
@@ -594,7 +622,12 @@ history):
   (`home_tower_khz`) before it goes out: 45 s at the arrival's start, then
   DEFERRED and made at the swap while the approach flies (the region's
   nearest field held the frequency for ten more minutes across the strait
-  and the call went into the void), before the final report at the latest. A descent waits for its top of
+  and the call went into the void), before the final report at the latest. **The crew's retune to the destination's tower ARMS
+  that station** (`station::arm_station_for_freq`, the pilot's "you call
+  it, you get it" rule): the region pick weighs published services, so a
+  tower-only strip beside a primary never wins the sky over its own runway
+  (LEAX 123.5 against Malaga's five rows, inbound and final into the void,
+  2026-09-15). A descent waits for its top of
   descent (`descent_target_ft`), and THAT point is the only one announced
   while the follower flies (`procedure::planned_tod`: the monitor's
   `tod_ahead`/`tod_passed` and the spoken "how far to top of descent" read

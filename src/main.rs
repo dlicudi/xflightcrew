@@ -1690,20 +1690,47 @@ async fn run_session(
             if !calls.is_empty() && mode::atc_enabled() && voice.radio_powered() {
                 if let Some(st) = atc_station.as_mut() {
                     for call in calls {
+                        // A check-in is rendered NOW, with the frequency quiet
+                        // (bounded), so the altitude it names is the one being
+                        // passed as it is spoken.
+                        let call = match call {
+                            circuit::CrewCall::Text(t) => t,
+                            circuit::CrewCall::CheckIn {
+                                callsign,
+                                to,
+                                climb_to_ft,
+                            } => {
+                                let quiet = std::time::Instant::now();
+                                while voice.radio_on_air() && quiet.elapsed().as_secs_f64() < 20.0 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                }
+                                let alt_ft =
+                                    xplane.get_float(datarefs::ALTITUDE_FT).await.unwrap_or(0.0);
+                                full_auto::departure_check_in(&callsign, &to, alt_ft, climb_to_ft)
+                            }
+                        };
                         // The copilot transmits (its own voice), then the tower.
                         // Both sides logged so the full ATC transcript shows in
                         // the log, not just the panel.
                         tracing::info!(target: "xvoicelayer::radio", copilot = %call, "tx");
+                        // ROUTED before it is spoken: `say` blocks until the
+                        // frequency is quiet, and a handoff readback queued
+                        // behind a party-line exchange was routed 19 s later,
+                        // after full auto had retuned, so Gibraltar DEPARTURE
+                        // heard "Gibraltar Departure on one three zero decimal
+                        // four" and said "say again" (08:23Z, 2026-09-15). The
+                        // station that was tuned when the crew keyed is the one
+                        // that hears it; the audible order is unchanged.
+                        let routed = st
+                            .handle_transmission(&call.to_ascii_lowercase(), xplane.view())
+                            .await;
                         say(
                             &voice,
                             &reporter,
                             ui::LogKind::Readback,
                             &format!("{call}."),
                         );
-                        if let Some((reply, who)) = st
-                            .handle_transmission(&call.to_ascii_lowercase(), xplane.view())
-                            .await
-                        {
+                        if let Some((reply, who)) = routed {
                             if !reply.is_empty() {
                                 tracing::info!(target: "xvoicelayer::radio", station = %who.tag(), reply = %reply, "rx");
                                 reporter
@@ -5864,14 +5891,22 @@ async fn flight_plan_report(
 
     let mut line = fp.summary();
     // Where we are vs planned cruise.
-    if let Ok(alt) = xp.get_float(datarefs::ALTITUDE_FT).await {
+    // On the ground the whole climb is ahead and the summary already said
+    // the cruise: "You're at 49, 4951 to climb to cruise" is a number
+    // nobody asked for (LXGB, 2026-09-15).
+    let on_ground = xp
+        .get_float(datarefs::ON_GROUND_ANY)
+        .await
+        .is_ok_and(|v| v > 0.5);
+    if on_ground {
+    } else if let Ok(alt) = xp.get_float(datarefs::ALTITUDE_FT).await {
         let diff = fp.cruise_alt_ft - alt;
         if diff > 300.0 {
             line.push_str(&format!(
-                " You're at {alt:.0}, {diff:.0} to climb to cruise."
+                " You're at {alt:.0} feet, {diff:.0} to climb to cruise."
             ));
         } else if diff < -300.0 {
-            line.push_str(&format!(" You're at {alt:.0}, above planned cruise."));
+            line.push_str(&format!(" You're at {alt:.0} feet, above planned cruise."));
         } else {
             line.push_str(" At planned cruise.");
         }

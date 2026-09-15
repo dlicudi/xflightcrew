@@ -385,11 +385,14 @@ async fn wait_enroute_working_the_radio(
             ));
             tokio::time::sleep(Duration::from_secs(HANDOFF_READBACK_SECS)).await;
             let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+            // The altitude is read by the main loop as the call goes out, not
+            // here: the queue can hold it for twenty seconds behind a busy
+            // frequency, and "passing one thousand" was said at 1,207 ft.
             let alt_ft = xp.get_float(ALT_IND_FT).await.unwrap_or(0.0);
-            crate::circuit::transmit(departure_check_in(callsign, &to, alt_ft, climb_to_ft));
+            crate::circuit::transmit_check_in(callsign.clone(), to.clone(), climb_to_ft);
             event(
                 "departure_checkin",
-                json!({ "to": to, "khz": khz, "alt_ft": alt_ft.round() }),
+                json!({ "to": to, "khz": khz, "alt_ft_queued": alt_ft.round() }),
             );
         }
         if let Some(h) = crate::party_line::take_region_handoff() {
@@ -702,11 +705,10 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                     let _ = xp.run_command(&t.command).await;
                 }
             }
-            announce(
-                &voice,
-                Priority::Advisory,
-                "Electrical set. Generators and bleeds on.",
-            );
+            // What was set is the profile's list; "generators and bleeds"
+            // on a 172 was an airliner's line (2026-09-15), and the start
+            // line has already named the alternator and avionics.
+            announce(&voice, Priority::Advisory, "Electrical set.");
             event(
                 "electrical_set",
                 json!({
@@ -802,6 +804,14 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             .await;
             ensure_squawk(&xp, &ctx, &voice).await;
             bail_if_abort!();
+            // The clearance is read back like a real one: the zone cap, the
+            // QNH and the squawk (the tower suggests the words, enforces
+            // nothing, and answers a correct one with silence). Never done
+            // before 2026-09-15: the squawk was set and the taxi asked for.
+            if let Some(rb) = crate::party_line::readback_owed() {
+                crate::circuit::transmit(rb.trim_end_matches('.').to_string());
+                event("clearance_readback", json!({}));
+            }
         }
         // The taxi route is the tower's. Ask for it if we don't already hold
         // one — or if the one we hold WAS PLANNED FROM SOMEWHERE ELSE. A
@@ -1184,11 +1194,17 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 bail_if_abort!();
                 event("line_up_behind_clear", json!({}));
             }
-            announce(
-                &voice,
-                Priority::Advisory,
-                crate::readback::one_of(&["Lining up.", "Lining us up.", "Taking the runway."]),
-            );
+            // Once: a backtrack is two executions (the drive to the far end,
+            // then the turn onto the line), and the tool's own reply names
+            // each leg. "Taking the runway" twice in ninety seconds, LXGB 27,
+            // 2026-09-15.
+            if attempt == 0 {
+                announce(
+                    &voice,
+                    Priority::Advisory,
+                    crate::readback::one_of(&["Lining up.", "Lining us up.", "Taking the runway."]),
+                );
+            }
             if let Ok(reply) = tools.line_up.execute(&json!({}), &ctx).await {
                 announce(&voice, Priority::Advisory, &reply);
             }
@@ -1342,7 +1358,7 @@ async fn fly_route(
         voice,
         Priority::Advisory,
         &format!(
-            "Cleared to go. Flying your plan to {}. My takeoff.",
+            "Cleared to go. Flying your plan to {}.",
             route.dest_name
         ),
     );
@@ -1407,14 +1423,13 @@ async fn fly_route(
     // the continuous manager keeps it full rich below the leaning floor and
     // leans to peak EGT above it, re-trimming as the climb and the power
     // settle. The pilot's hand on the lever, or "my mixture", releases it.
+    // Armed silently: the manager says what it did when it first leans
+    // (`lean_seek`'s own line), and this moment already carries the
+    // thousand-foot callout, "flying the plan" and the handoff readback
+    // (four lines in one second at LXGB, 2026-09-15).
     if tools.piston_mixture {
         crate::tools::engine::arm_mixture_manager(config.xplane_base_url.clone());
         event("mixture_managed", json!({}));
-        announce(
-            voice,
-            Priority::Advisory,
-            "I have the mixture: full rich below three thousand, leaned for cruise.",
-        );
     }
     // Generous ceiling — ABORT bails out of the wait immediately. The wait
     // works the radio: the tower's after-takeoff handoff is owed a readback,
@@ -1522,6 +1537,15 @@ async fn fly_route(
     let mut inbound_owed: Option<i64> = None;
     if let Some(khz) = built.tower_khz.or_else(crate::party_line::home_tower_khz) {
         let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+        // You call it, you get it - for the crew's own retune as much as the
+        // pilot's. The enroute region weighs a field by its published
+        // services, so a tower-only strip beside a primary never wins the
+        // sky over its own runway (LEAX 123.5 against Malaga's five rows:
+        // both the inbound and the final went into the void on a frequency
+        // no station held, 2026-09-15). Tuning the destination's tower arms
+        // that field the way a keyed transmission on its frequency does; the
+        // swap wait below then finds it on the next loop pass.
+        crate::station::arm_station_for_freq(khz, lat, lon, alt_msl_ft, Instant::now());
         // The call is worth nothing until the station on that frequency IS
         // the destination: at PIMOS the region swapped to Gibraltar three
         // seconds AFTER "inbound for landing" went out, the call went into

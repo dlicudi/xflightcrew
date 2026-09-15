@@ -762,6 +762,11 @@ pub struct Tower {
     touch_and_go: bool,
     /// A runway-critical clearance awaiting its mandatory readback.
     pending: Option<PendingReadback>,
+    /// The departure clearance's readback, SUGGESTED and never enforced
+    /// (ICAO's mandatory list stops at the runway): the zone cap, the QNH
+    /// and the squawk. The crew reads it when it flies; a human pilot sees
+    /// it in the coach. Dropped by the next request.
+    clearance_readback: Option<String>,
 }
 
 impl Tower {
@@ -770,7 +775,13 @@ impl Tower {
             state: State::Parked,
             touch_and_go: false,
             pending: None,
+            clearance_readback: None,
         }
+    }
+
+    /// The crew has read the departure clearance back (or moved on).
+    pub fn clear_clearance_readback(&mut self) {
+        self.clearance_readback = None;
     }
 
     /// Pre-arm the touch-and-go option for an arrival that asked for it on
@@ -833,6 +844,9 @@ impl Tower {
     /// The exact readback the pilot owes, phrased — the coach's line, and the
     /// Calls tab's SAY NOW row.
     pub fn suggested_readback(&self, callsign: &str) -> Option<String> {
+        if self.pending.is_none() {
+            return self.clearance_readback.clone();
+        }
         Some(match &self.pending.as_ref()?.awaited {
             Awaited::HoldPosition => format!("Holding position, {callsign}."),
             Awaited::LineUp {
@@ -967,18 +981,30 @@ impl Tower {
         ) {
             self.pending = None;
         }
+        // A new request moves the dialogue past the clearance readback too.
+        if intent != Intent::Unknown {
+            self.clearance_readback = None;
+        }
         match intent {
             Intent::RadioCheck => {
                 format!("{}, {} Tower, reading you five.", ctx.callsign, ctx.airport)
             }
-            Intent::RequestClearance => format!(
-                "{}, cleared to leave the {} zone, not above two thousand feet{}, \
-                 squawk {}.",
-                ctx.callsign,
-                ctx.airport,
-                qnh_clause(ctx),
-                ctx.squawk
-            ),
+            Intent::RequestClearance => {
+                self.clearance_readback = Some(format!(
+                    "Not above two thousand feet{}, squawk {}, {}.",
+                    qnh_clause(ctx),
+                    ctx.squawk,
+                    ctx.callsign
+                ));
+                format!(
+                    "{}, cleared to leave the {} zone, not above two thousand feet{}, \
+                     squawk {}.",
+                    ctx.callsign,
+                    ctx.airport,
+                    qnh_clause(ctx),
+                    ctx.squawk
+                )
+            }
             // Start-up approval is not a clearance to go anywhere: no squawk,
             // no state change — the zone/taxi/takeoff chain still follows.
             Intent::RequestStartup => {
