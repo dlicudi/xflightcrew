@@ -15,6 +15,12 @@ use std::io::{BufRead, BufReader};
 
 pub(crate) use crate::nav::{bearing_deg, haversine_nm, project_latlon};
 
+static TRACKING_ERROR: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+pub fn last_tracking_error() -> Option<f64> {
+    if !ACTIVE.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+    *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 const M_PER_NM: f64 = 1852.0;
 
 /// apt.dat surface codes we will put wheels on.
@@ -390,12 +396,35 @@ pub fn run_autoland(
     cfg: ApConfig,
     approach_ias: f64,
     voice: Option<Voice>,
+    status: Option<crate::plugin_status::StatusSink>,
+    forced_rwy: Option<String>,
+) {
+    run_autoland_scoped(
+        base,
+        apt_dat,
+        cfg,
+        approach_ias,
+        voice,
+        status,
+        forced_rwy,
+        Vec::new(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_autoland_scoped(
+    base: String,
+    apt_dat: String,
+    cfg: ApConfig,
+    approach_ias: f64,
+    voice: Option<Voice>,
     // The chat mirror now rides `voice.alert`; an explicit `s.action` here too
     // double-wrote every autoland line to the transcript (2026-07-24).
     _status: Option<crate::plugin_status::StatusSink>,
     // The arrival's already-chosen landing runway (by wind). `Some` forces that
     // end; `None` self-picks by track — the emergency/manual path, unchanged.
     forced_rwy: Option<String>,
+    parents: Vec<std::sync::Arc<AtomicBool>>,
 ) {
     let my_gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
@@ -409,7 +438,8 @@ pub fn run_autoland(
             // Kept for a re-arm on a different runway (see the clearance
             // watch in the tick).
             let base_url = base.clone();
-            let xp = XPlaneClient::new(base);
+            let xp = XPlaneClient::new(base).with_parents(parents);
+            if xp.cancelled() { return; }
             ACTIVE.store(true, Ordering::SeqCst);
             let announce = |line: String, sev: Priority| {
                 tracing::info!(target: "xvoicelayer::autoland", spoke = %line, "copilot");
@@ -574,7 +604,9 @@ pub fn run_autoland(
                 }
             }
 
+            *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
             let mut last_phase: Option<ApproachPhase> = None;
+            let mut flare_power = FlarePower::default();
             let mut go_around = GoAroundLatch::new();
             // Drain any go-around order left on the party line before this
             // approach existed. The flag is a latch, not a queue: an order
@@ -626,7 +658,7 @@ pub fn run_autoland(
             // (seconds-long) lookup of one that is not at this field runs once.
             let mut clearance_checked: Option<String> = None;
             loop {
-                if GEN.load(Ordering::SeqCst) != my_gen || ABORT.load(Ordering::SeqCst) {
+                if xp.cancelled() || GEN.load(Ordering::SeqCst) != my_gen || ABORT.load(Ordering::SeqCst) {
                     break;
                 }
                 // Frozen sim (replay or pause): a replay's positions are a
@@ -718,7 +750,7 @@ pub fn run_autoland(
                                 // A new loop owns the aircraft from its first
                                 // tick; this one exits on the generation bump
                                 // and leaves ACTIVE to it.
-                                run_autoland(
+                                run_autoland_scoped(
                                     base_url.clone(),
                                     apt_dat.clone(),
                                     cfg.clone(),
@@ -726,6 +758,7 @@ pub fn run_autoland(
                                     voice.clone(),
                                     None,
                                     Some(r.id),
+                                    xp.cancellation(),
                                 );
                                 break;
                             }
@@ -1034,7 +1067,12 @@ pub fn run_autoland(
                 // disguise: the dial gets the bare target that tick, the
                 // watchdog does not count it, and the blackbox keeps `null`
                 // so the debrief can see the gauge was missing.
-                let vvi = match xp.get_float(VVI_FPM).await {
+                let throttle_name = throttle_dref();
+                let (vvi_read, throttle_read) = tokio::join!(
+                    xp.get_float(VVI_FPM), xp.get_float(&throttle_name),
+                );
+                let thr_now = throttle_read.ok().filter(|v| v.is_finite());
+                let vvi = match vvi_read {
                     Ok(v) => Some(v),
                     Err(e) => {
                         if !vvi_read_failed {
@@ -1048,6 +1086,7 @@ pub fn run_autoland(
                     Some(v) => vs_dial_fpm(g.target_vs_fpm, v, g.arresting),
                     None => g.target_vs_fpm,
                 };
+                *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(xtk_now * M_PER_NM);
                 crate::blackbox::record("autoland", serde_json::json!({
                     "rwy": format!("{} {}", rwy.icao, rwy.id), "dist": g.dist_nm,
                     "alt": alt, "gp_alt": g.glidepath_alt_ft, "cmd_vs": g.target_vs_fpm,
@@ -1090,13 +1129,15 @@ pub fn run_autoland(
                 // old loop here was P-only (0.004/kt, no trend), so it only reacted
                 // after speed was already gone and dribbled power in too slowly —
                 // the nose came up holding level, speed bled to a stall, the AP quit
-                // ("lose speed, lose AP", seen live at LERL/XLE000N). Idle in flare.
+                // ("lose speed, lose AP", seen live at LERL/XLE000N). Profile-led flare power.
                 let now = std::time::Instant::now();
                 let dt_s = (now - prev_ias_t).as_secs_f64().clamp(0.1, 2.0);
                 let trend_kts_s = prev_ias.map_or(0.0, |p| (ias - p) / dt_s);
                 prev_ias = Some(ias);
                 prev_ias_t = now;
-                let thr_now = xp.get_float(&throttle_dref()).await.unwrap_or(0.5);
+                if g.phase != ApproachPhase::Flare || missed.is_some() {
+                    flare_power.reset();
+                }
                 let thr = if missed == Some(MissedStage::Climb) {
                     // The balked landing itself is firewall, not a governor
                     // holding approach speed — the LXGB miss flew its last 20
@@ -1107,14 +1148,36 @@ pub fn run_autoland(
                     // across the whole missed approach (the first flight of the
                     // sticky version, Luton 2026-07-28) the MD-82 accelerated to
                     // 284 KIAS on the outbound leg and was still gaining.
-                    1.0
+                    Some(1.0)
                 } else if g.phase == ApproachPhase::Flare {
-                    0.0
+                    match cfg.flare_power {
+                        Some(power) => match (thr_now, vvi) {
+                            (Some(throttle), Some(vs)) => flare_power.step(power, throttle, vs, dt_s),
+                            _ => None, // No measurement: no guessed power and no ramp advance.
+                        },
+                        None => Some(0.0),
+                    }
                 } else {
                     let adj = crate::tools::speedhold::throttle_adjust(g.target_ias_kts - ias, trend_kts_s);
-                    (thr_now + adj).clamp(0.1, 1.0)
+                    thr_now.map(|throttle| (throttle + adj).clamp(0.1, 1.0))
                 };
-                let _ = xp.set_float(&throttle_dref(), thr).await;
+                let throttle_written = match thr {
+                    Some(throttle) => Some(xp.set_float(&throttle_dref(), throttle).await.is_ok()),
+                    None => None,
+                };
+                let throttle_after = if throttle_written == Some(true) {
+                    xp.get_float(&throttle_dref()).await.ok().filter(|v| v.is_finite())
+                } else { None };
+                if throttle_written == Some(false) {
+                    flare_power.reset();
+                }
+                crate::blackbox::record("autoland", serde_json::json!({
+                    "event": "power", "phase": format!("{:?}", g.phase),
+                    "throttle_before": thr_now, "throttle_command": thr,
+                    "throttle_after": throttle_after, "write_ok": throttle_written,
+                    "progressive_flare": cfg.flare_power.is_some(), "dt": dt_s,
+                    "vvi": vvi, "radio": radio_ft, "ias": ias,
+                }));
 
                 // Config: gear down inside 6 nm; flaps by distance AND vertical
                 // state (full only once on the path — see [`flap_schedule`]).
@@ -1186,6 +1249,7 @@ pub fn run_autoland(
                         }
                         ApproachPhase::Intercept => "Intercepting the final approach.",
                         ApproachPhase::Final => "On final. Gear and flaps as the speed allows.",
+                        ApproachPhase::Flare if cfg.flare_power.is_some() => "Over the threshold, flaring, easing the power back.",
                         ApproachPhase::Flare => "Over the threshold, flaring, power to idle.",
                     };
                     announce(line.into(), Priority::Caution);
@@ -1625,6 +1689,62 @@ pub fn aim_elevation_ft(header_ft: f64, probed_ft: Option<&[f64]>) -> (f64, Opti
         return (header_ft, Some(probed));
     }
     (probed, Some(probed))
+}
+
+/// Per-approach state: a go-around resets this, so a second flare starts from
+/// its own power. Never adds power or impersonates an airspeed governor in the
+/// flare. The existing overflight/go-around guard still bounds runway usage.
+#[derive(Default)]
+struct FlarePower {
+    previous_sink: Option<f64>,
+    last_command: Option<f64>,
+}
+
+impl FlarePower {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn step(
+        &mut self,
+        cfg: crate::aircraft::FlarePowerProfile,
+        measured: f64,
+        vvi: f64,
+        dt: f64,
+    ) -> Option<f64> {
+        if !measured.is_finite()
+            || !vvi.is_finite()
+            || !dt.is_finite()
+            || dt <= 0.0
+            || !cfg.reduction_per_second.is_finite()
+            || cfg.reduction_per_second <= 0.0
+            || !cfg.hold_sink_fpm.is_finite()
+            || cfg.hold_sink_fpm <= 0.0
+            || !cfg.lead_seconds.is_finite()
+            || cfg.lead_seconds < 0.0
+        {
+            return None;
+        }
+        let sink = -vvi;
+        let worsening = self
+            .previous_sink
+            .map_or(0.0, |old| ((sink - old) / dt).max(0.0));
+        self.previous_sink = Some(sink);
+        // First flare tick preserves the observed approach power. Readback may
+        // lag a write, but it must never restart the ramp or increase power.
+        let current = measured
+            .clamp(0.0, 1.0)
+            .min(self.last_command.unwrap_or(1.0));
+        let next = if self.last_command.is_none()
+            || sink.max(sink + worsening * cfg.lead_seconds) > cfg.hold_sink_fpm
+        {
+            current
+        } else {
+            (current - cfg.reduction_per_second * dt.min(1.0)).max(0.0)
+        };
+        self.last_command = Some(next);
+        Some(next)
+    }
 }
 
 /// What to dial into the VS mode so the aircraft actually FLIES `target_fpm`.
@@ -2398,6 +2518,82 @@ mod tests {
         }
         let _ = bug;
         (cross_track_nm(lat, lon, &rwy), g, trim_deg)
+    }
+
+    fn baron_flare_power() -> crate::aircraft::FlarePowerProfile {
+        let profile: crate::aircraft::AircraftProfile =
+            serde_yaml::from_str(include_str!("../profiles/beechcraft_baron_58.yaml")).unwrap();
+        profile.flare_power.unwrap()
+    }
+
+    #[test]
+    fn baron_recorded_flare_does_not_cut_power_into_renewed_sink() {
+        // LEBL 20, 2026-09-16. Replay measurements, NOT a flight-model prediction:
+        // the old rule commanded zero throughout these actual sink rates.
+        let mut power = FlarePower::default();
+        let cfg = baron_flare_power();
+        let samples = [
+            -393.65, -278.33, -148.51, -49.71, -24.33, -84.22, -211.0, -360.38, -515.28,
+        ];
+        let mut throttle = 0.30;
+        let mut commands = Vec::new();
+        for vs in samples {
+            throttle = power.step(cfg, throttle, vs, 0.67).unwrap();
+            commands.push(throttle);
+        }
+        assert_eq!(commands[0], 0.30, "no step to idle at flare entry");
+        assert_eq!(commands[1], commands[0], "hold while still sinking fast");
+        assert!(
+            commands[4] < commands[1],
+            "taper after the pitch arrests descent"
+        );
+        assert!(
+            commands[5] < commands[4],
+            "small initial trend remains below limit"
+        );
+        assert_eq!(commands[6], commands[5], "stop the cut when sink returns");
+        assert_eq!(commands[8], commands[6]);
+        assert!(
+            commands[8] > 0.0,
+            "retain residual power rather than force idle"
+        );
+    }
+
+    #[test]
+    fn flare_power_foresees_sink_and_resets_for_a_new_approach() {
+        let cfg = baron_flare_power();
+        let mut power = FlarePower::default();
+        assert_eq!(power.step(cfg, 0.3, -50.0, 0.5), Some(0.3));
+        // Still less than 200 fpm down, but deteriorating at 200 fpm per second.
+        assert_eq!(power.step(cfg, 0.3, -150.0, 0.5), Some(0.3));
+        // A balloon needs power coming off, not a sink-triggered hold.
+        assert!(power.step(cfg, 0.3, 100.0, 0.5).unwrap() < 0.3);
+        // A lagging throttle read must not restart/increase the command.
+        assert!(power.step(cfg, 0.4, -100.0, 0.5).unwrap() < 0.3);
+        power.reset();
+        assert_eq!(power.step(cfg, 0.45, -300.0, 0.5), Some(0.45));
+    }
+
+    #[test]
+    fn flare_power_reaches_idle_smoothly_and_rejects_missing_measurements() {
+        let cfg = baron_flare_power();
+        let mut power = FlarePower::default();
+        let mut throttle = power.step(cfg, 0.3, -100.0, 0.5).unwrap();
+        for _ in 0..30 {
+            let next = power.step(cfg, throttle, -100.0, 0.5).unwrap();
+            assert!((0.0..=throttle).contains(&next));
+            assert!(throttle - next <= cfg.reduction_per_second * 0.5 + 1e-9);
+            throttle = next;
+        }
+        assert_eq!(throttle, 0.0);
+        assert_eq!(power.step(cfg, f64::NAN, -100.0, 0.5), None);
+        assert_eq!(power.step(cfg, 0.3, f64::NAN, 0.5), None);
+        assert_eq!(power.step(cfg, 0.3, -100.0, 0.0), None);
+        let invalid = crate::aircraft::FlarePowerProfile {
+            reduction_per_second: -1.0,
+            ..cfg
+        };
+        assert_eq!(power.step(invalid, 0.3, -100.0, 0.5), None);
     }
 
     #[test]
@@ -4363,15 +4559,24 @@ mod tests {
     fn the_glidepath_aims_at_the_probed_threshold() {
         // LEAX: header 160 ft, the 30 threshold probed at 117, the aim point
         // 300 m in at 121 - the higher of the two is the aim.
-        assert_eq!(aim_elevation_ft(160.0, Some(&[117.0, 121.0])), (121.0, Some(121.0)));
+        assert_eq!(
+            aim_elevation_ft(160.0, Some(&[117.0, 121.0])),
+            (121.0, Some(121.0))
+        );
         // Mesh and header agree within the trust band: the header stays.
-        assert_eq!(aim_elevation_ft(160.0, Some(&[150.0, 158.0])), (160.0, Some(158.0)));
+        assert_eq!(
+            aim_elevation_ft(160.0, Some(&[150.0, 158.0])),
+            (160.0, Some(158.0))
+        );
         // No probe (old plugin, paused sim): the header, and nothing seen.
         assert_eq!(aim_elevation_ft(160.0, None), (160.0, None));
         assert_eq!(aim_elevation_ft(160.0, Some(&[])), (160.0, None));
         // An absurd probe (a point in the sea beside the strip) is reported,
         // never flown.
-        assert_eq!(aim_elevation_ft(160.0, Some(&[-500.0, -480.0])), (160.0, Some(-480.0)));
+        assert_eq!(
+            aim_elevation_ft(160.0, Some(&[-500.0, -480.0])),
+            (160.0, Some(-480.0))
+        );
         // The LEAX approach: aimed at 121 the threshold crossing is ~57 ft
         // over the pavement; aimed at 160 it was 99 ft (radio) and balked.
         let tch = |aim: f64| aim + TOUCHDOWN_AIM_NM * GLIDEPATH_FT_PER_NM - 117.0;

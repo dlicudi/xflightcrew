@@ -287,6 +287,9 @@ fn is_not_found(err: &anyhow::Error) -> bool {
 /// needs them.)
 #[async_trait]
 pub trait XPlane: Send + Sync {
+    fn cancellation(&self) -> Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        Vec::new()
+    }
     async fn get_float(&self, name: &str) -> Result<f64>;
     async fn set_float(&self, name: &str, value: f64) -> Result<()>;
     async fn set_int(&self, name: &str, value: i64) -> Result<()>;
@@ -315,6 +318,7 @@ pub async fn sim_frozen(xp: &dyn XPlane) -> bool {
 pub struct XPlaneClient {
     http: reqwest::Client,
     base: String,
+    cancel: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// The caches are PROCESS-WIDE, not per-client, keyed by base URL then name —
@@ -387,7 +391,36 @@ impl XPlaneClient {
         Self {
             http,
             base: base.trim_end_matches('/').to_string(),
+            cancel: Vec::new(),
         }
+    }
+
+    /// Scope every mutation to the worker that owns this client.
+    pub fn with_cancel(mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cancel.push(cancel);
+        self
+    }
+
+    pub fn with_parents(
+        mut self,
+        parents: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Self {
+        self.cancel.extend(parents);
+        self
+    }
+    pub fn cancellation(&self) -> Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.cancel.clone()
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancel
+            .iter()
+            .any(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn allow_write(&self) -> Result<()> {
+        anyhow::ensure!(!self.cancelled(), "automation cancelled");
+        Ok(())
     }
 
     /// Resolve a dataref's numeric id, caching the result.
@@ -573,6 +606,7 @@ impl XPlaneClient {
 
     /// Write a raw JSON value to a dataref's `value` endpoint.
     async fn set_value(&self, name: &str, value: serde_json::Value) -> Result<()> {
+        self.allow_write()?;
         // A write makes any cached value a lie, and the readback that follows
         // it is the whole trust model — drop the entry so that read is real.
         if let Some(m) = VALUE_CACHE.lock().await.get_mut(&self.base) {
@@ -584,6 +618,7 @@ impl XPlaneClient {
             let id = self.dataref_id(name).await?;
             let url = format!("{}/api/v1/datarefs/{}/value", self.base, id);
             let result = with_retry(|| async {
+                self.allow_write()?;
                 self.http
                     .patch(&url)
                     .json(&body)
@@ -741,7 +776,9 @@ impl XPlaneClient {
     /// Activate a command, holding it for `duration` seconds (e.g. cranking a
     /// starter). `0.0` is a momentary press.
     pub async fn run_command_for(&self, name: &str, duration: f64) -> Result<()> {
+        self.allow_write()?;
         let id = self.command_id(name).await?;
+        self.allow_write()?;
         let url = format!("{}/api/v2/command/{}/activate", self.base, id);
         // NOT retried: a command can be a toggle (chocks, GPU), so a retry after a
         // lost response could activate it twice. Absolute-value writes (set_value)
@@ -820,6 +857,9 @@ impl SimView<'_> {
 // implementation, and which the loop calls directly for the index/string helpers).
 #[async_trait]
 impl XPlane for XPlaneClient {
+    fn cancellation(&self) -> Vec<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.cancellation()
+    }
     async fn get_float(&self, name: &str) -> Result<f64> {
         XPlaneClient::get_float(self, name).await
     }
@@ -1039,5 +1079,181 @@ mod load_tests {
         // stale freeze flag matter: the loops re-check every tick and
         // `sim_frozen` fails open.
         assert!(super::SLOW_DATAREF_TTL < std::time::Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod failure_sequences {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
+
+    struct Reply {
+        request: &'static str,
+        status: u16,
+        body: &'static str,
+        cancel: Option<Arc<AtomicBool>>,
+    }
+    fn server(replies: Vec<Reply>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let thread = std::thread::spawn(move || {
+            for reply in replies {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut socket = loop {
+                    if let Ok((s, _)) = listener.accept() {
+                        break s;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "missing {}",
+                        reply.request
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let header_end = loop {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break request.len();
+                    }
+                };
+                let text = String::from_utf8_lossy(&request);
+                assert!(text.starts_with(reply.request), "{text}");
+                let length: usize = text
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                request.resize(header_end + length, 0);
+                socket.read_exact(&mut request[header_end..]).unwrap();
+                if let Some(cancel) = reply.cancel {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+                write!(socket, "HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.status, reply.body.len(), reply.body).unwrap();
+            }
+        });
+        (base, thread)
+    }
+    fn reply(request: &'static str, status: u16, body: &'static str) -> Reply {
+        Reply {
+            request,
+            status,
+            body,
+            cancel: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_reload_re_resolves_a_stale_write_and_reads_back_the_new_id() {
+        let (base, server) = server(vec![
+            reply(
+                "GET /api/v1/datarefs?",
+                200,
+                r#"{"data":[{"id":1,"name":"test/dial"}]}"#,
+            ),
+            reply("GET /api/v1/datarefs/1/value", 200, r#"{"data":7}"#),
+            reply("PATCH /api/v1/datarefs/1/value", 404, "{}"),
+            reply(
+                "GET /api/v1/datarefs?",
+                200,
+                r#"{"data":[{"id":2,"name":"test/dial"}]}"#,
+            ),
+            reply("PATCH /api/v1/datarefs/2/value", 200, "{}"),
+            reply("GET /api/v1/datarefs/2/value", 200, r#"{"data":9}"#),
+        ]);
+        let xp = XPlaneClient::new(base);
+        assert_eq!(xp.get_float("test/dial").await.unwrap(), 7.0);
+        xp.set_float("test/dial", 9.0).await.unwrap();
+        assert_eq!(xp.get_float("test/dial").await.unwrap(), 9.0);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_resolution_prevents_the_later_patch() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (base, server) = server(vec![Reply {
+            request: "GET /api/v1/datarefs?",
+            status: 200,
+            body: r#"{"data":[{"id":1,"name":"test/dial"}]}"#,
+            cancel: Some(cancel.clone()),
+        }]);
+        let xp = XPlaneClient::new(base).with_cancel(cancel);
+        assert!(xp
+            .set_float("test/dial", 9.0)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+        assert!(xp
+            .run_command("test/toggle")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_parent_blocks_a_child_created_after_cancellation() {
+        let parent = Arc::new(AtomicBool::new(true));
+        let child = Arc::new(AtomicBool::new(false));
+        let xp = XPlaneClient::new("http://127.0.0.1:1".into())
+            .with_cancel(child.clone())
+            .with_parents(vec![parent]);
+        assert!(xp.cancelled());
+        assert!(!child.load(Ordering::SeqCst));
+        assert!(xp
+            .set_float("test/dial", 1.0)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+        assert!(xp
+            .run_command("test/toggle")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn pause_defers_handoff_until_live_measurements_resume() {
+        let (base, server) = server(vec![
+            reply(
+                "GET /api/v1/datarefs?",
+                200,
+                r#"{"data":[{"id":1,"name":"sim/time/is_in_replay"}]}"#,
+            ),
+            reply("GET /api/v1/datarefs/1/value", 200, r#"{"data":0}"#),
+            reply(
+                "GET /api/v1/datarefs?",
+                200,
+                r#"{"data":[{"id":2,"name":"sim/time/paused"}]}"#,
+            ),
+            reply("GET /api/v1/datarefs/2/value", 200, r#"{"data":1}"#),
+            reply("GET /api/v1/datarefs/1/value", 200, r#"{"data":0}"#),
+            reply("GET /api/v1/datarefs/2/value", 200, r#"{"data":0}"#),
+        ]);
+        let xp = XPlaneClient::new(base.clone());
+        assert!(sim_frozen(&xp).await);
+        VALUE_CACHE.lock().await.remove(&base); // next sample after cache expiry
+        assert!(!sim_frozen(&xp).await);
+        server.join().unwrap();
     }
 }

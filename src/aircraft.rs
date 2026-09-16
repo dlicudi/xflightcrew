@@ -12,6 +12,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Simulator tuning, not a POH power setting. Throttle ratios per second.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct FlarePowerProfile {
+    pub reduction_per_second: f64,
+    /// Pause the reduction when measured descent exceeds this positive rate.
+    pub hold_sink_fpm: f64,
+    /// Include the recent sink trend to avoid cutting into a renewed descent.
+    pub lead_seconds: f64,
+}
+
 /// Everything the tool layer needs to know about one airframe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AircraftProfile {
@@ -40,6 +50,12 @@ pub struct AircraftProfile {
     /// against the 172's 24 volt threshold (2026-09-11). `None` = 24.
     #[serde(default)]
     pub bus_volts_nominal: Option<f64>,
+    /// Optional progressive autoland power reduction; absent retains idle flare.
+    #[serde(default)]
+    pub flare_power: Option<FlarePowerProfile>,
+    /// None = unknown; do not invent a pressurisation system in warnings.
+    #[serde(default)]
+    pub pressurised: Option<bool>,
     /// Static reference figures (V-speeds, weights, limits) the copilot recites
     /// when asked. Per-airframe, from the POH/POM. `None` = no reference answers.
     #[serde(default)]
@@ -1214,6 +1230,7 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
     let kts = |k: &str| num(k).filter(|v| *v > 0.0 && *v < 9000.0);
     let mut p = cessna_172sp();
     p.id = format!("generic_{}", icao.to_lowercase());
+    p.pressurised = None; // Unknown systems must use neutral cabin-altitude wording.
     let name = vals.get("acf/_name").map(|s| s.to_string()).unwrap_or_else(|| icao.to_string());
     // `_name` is one token here (split on whitespace); good enough for a label.
     p.display_name = format!("{name} (no profile)");
@@ -2002,6 +2019,8 @@ fn cessna_172sp() -> AircraftProfile {
         parking_brake: true,
         cabin_crew: false,
         bus_volts_nominal: None,
+        flare_power: None,
+        pressurised: Some(false),
         park_brake_valve_set: None,
         electrical: {
             let e = |key: &str, spoken: &str, on: &[&str], off: &[&str], rb: &[&str]| {
@@ -2275,6 +2294,8 @@ fn cirrus_sr22() -> AircraftProfile {
         parking_brake: true,
         cabin_crew: false,
         bus_volts_nominal: None,
+        flare_power: None,
+        pressurised: Some(false),
         park_brake_valve_set: None,
         pitot_heat: true,
         pitot_heat_dataref: None,

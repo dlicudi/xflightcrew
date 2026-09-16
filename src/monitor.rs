@@ -564,6 +564,8 @@ pub trait Check: Send {
     fn min_duration(&self) -> Duration {
         Duration::ZERO
     }
+    /// Higher values permit a fresh callout when a persistent condition worsens.
+    fn repeat_level(&self, _s: &Snapshot) -> Option<i64> { None }
     /// A command the copilot should FIRE (not just advise) to bring the state to
     /// what the SOP expects — e.g. the strobe/landing-light switches. Fired once
     /// per episode, the moment the advisory speaks, so the copilot *acts* instead
@@ -589,6 +591,7 @@ struct FireState {
     /// one flight: a stalling 172's second "getting slow" was eaten exactly
     /// there, four minutes before terrain, 2026-07-13.)
     spoke_this_episode: bool,
+    last_level: Option<i64>,
     last_spoken: Option<Instant>,
     /// When the condition most recently became true (rising edge). Used to
     /// enforce a check's `min_duration` sustain before the first callout.
@@ -599,8 +602,16 @@ impl FireState {
     fn new() -> Self {
         FireState {
             spoke_this_episode: false,
+            last_level: None,
             last_spoken: None,
             since: None,
+        }
+    }
+
+    fn observe_level(&mut self, level: Option<i64>) {
+        if let Some(level) = level {
+            if self.last_level.is_some_and(|old| level > old) { self.spoke_this_episode = false; }
+            self.last_level = Some(self.last_level.map_or(level, |old| old.max(level)));
         }
     }
 
@@ -652,7 +663,7 @@ impl FireState {
         let flying = crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
             || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
             || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
-        if !flying && self.sustained(min_duration, now) && self.should_speak(sev, now) {
+        if !flying && self.sustained(min_duration, now) && self.should_speak(if id.starts_with("cabin_alt_") { Severity::Caution } else { sev }, now) {
             // Mirror OR action, never both: `voice.alert` below already posts the
             // spoken line to the panel transcript, so a separate `s.alert` here
             // wrote every callout twice (a coloured line AND a green one). The
@@ -678,6 +689,7 @@ impl FireState {
     /// the sustain timer so the next occurrence must hold for `min_duration`
     /// again.
     fn clear(&mut self) {
+        self.last_level = None;
         self.spoke_this_episode = false;
         self.since = None;
     }
@@ -1275,6 +1287,16 @@ impl Check for AltitudeBust {
 /// warning past 12,500 (the regulatory oxygen line, and X-Plane's own annunciator
 /// threshold). Airborne only; on an unpressurized airframe the cabin altitude just
 /// tracks the real altitude, so this covers the GA singles too.
+fn cabin_message(pressurised: Option<bool>, warning: bool) -> &'static str {
+    match (pressurised, warning) {
+        (Some(false), false) => "We're unpressurised and above ten thousand feet. Check oxygen or descend when terrain permits.",
+        (Some(false), true) => "Unpressurised cabin above twelve thousand five hundred. Oxygen now, or descend when terrain permits.",
+        (Some(true), false) => "Cabin altitude above ten thousand. Check pressurisation and oxygen.",
+        (_, true) => "Cabin altitude above twelve thousand five hundred. Oxygen now, or descend when terrain permits.",
+        (None, false) => "Cabin altitude above ten thousand. Check oxygen or descend when terrain permits.",
+    }
+}
+
 struct CabinAltitude {
     id: &'static str,
     severity: Severity,
@@ -1295,6 +1317,9 @@ impl Check for CabinAltitude {
         let (low, high) = self.band_ft;
         let in_band = s.cabin_altitude_ft >= low && high.is_none_or(|h| s.cabin_altitude_ft < h);
         (!s.on_ground && in_band).then(|| self.message.to_string())
+    }
+    fn repeat_level(&self, s: &Snapshot) -> Option<i64> {
+        s.cabin_altitude_ft.is_finite().then(|| (s.cabin_altitude_ft / 1000.0).floor() as i64)
     }
     fn min_duration(&self) -> Duration {
         self.min_dur
@@ -1473,14 +1498,14 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         id: "cabin_alt_caution",
         severity: Severity::Caution,
         band_ft: (10_000.0, Some(12_500.0)),
-        message: "Cabin altitude above ten thousand. Check the pressurization or get on oxygen.",
+        message: cabin_message(profile.pressurised, false),
         min_dur: Duration::from_secs(10),
     }));
     checks.push(Box::new(CabinAltitude {
         id: "cabin_alt_warning",
         severity: Severity::Warning,
         band_ft: (12_500.0, None),
-        message: "Cabin altitude above twelve thousand five hundred. Oxygen now, or start down.",
+        message: cabin_message(profile.pressurised, true),
         min_dur: Duration::from_secs(4),
     }));
     if !profile.electrical.is_empty() {
@@ -1848,6 +1873,14 @@ pub async fn run(
     // Whether the last tick saw the sim in replay / paused, for transition logging.
     let mut was_replay = false;
     let mut was_paused = false;
+    let mut lost_since: Option<Instant> = None;
+    let mut seen_sim = false;
+    let mut disconnected = false;
+    let mut had_flying_control = false;
+    let mut control_idle_since: Option<Instant> = None;
+    let mut airspeed_recovery = crate::interaction::Recovery::default();
+    let mut cabin_recovery = crate::interaction::Recovery::default();
+    let mut landing_summary = crate::interaction::Landing::default();
     // The checklist flow's phase-boundary detector: climb, cruise, descent,
     // before landing, after landing, each once per flight.
     let mut flow_tracker = crate::flow::Tracker::default();
@@ -1872,6 +1905,10 @@ pub async fn run(
             // at something it may not have.
             cockpit_auto = crate::cockpit_auto::CockpitAuto::default();
             flow_tracker = crate::flow::Tracker::default();
+            landing_summary = crate::interaction::Landing::default();
+            airspeed_recovery = crate::interaction::Recovery::default();
+            cabin_recovery = crate::interaction::Recovery::default();
+            had_flying_control = false;
             cabin_capable = live.get().cabin_crew;
             states = checks.iter().map(|c| (c.id(), FireState::new())).collect();
             tracing::info!(
@@ -1921,6 +1958,18 @@ pub async fn run(
         }
         if let Some(mut snap) = Snapshot::read(&xp, &drefs).await {
             let now = Instant::now();
+            seen_sim = true;
+            lost_since = None;
+            if disconnected {
+                disconnected = false;
+                landing_summary = crate::interaction::Landing::default();
+                landing_summary.note_interruption();
+                airspeed_recovery = crate::interaction::Recovery::default();
+                cabin_recovery = crate::interaction::Recovery::default();
+                if crate::mode::copilot_enabled() {
+                    voice.alert(Priority::Caution, "Connected again. I'm monitoring only; you have control. Check the autopilot. Say resume the flight plan when ready.".to_string());
+                }
+            }
 
             // Fps-dip watchdog: pure diagnosis, no callout. A dip well below
             // the rolling median lands in the flight log + blackbox with a
@@ -3078,10 +3127,36 @@ pub async fn run(
             // ended. They stand down until the flight resets. And with no
             // crew aboard (ATC-only mode) there is nobody to speak them.
             if crew_on && !voice.crashed() {
+                let flying = snap.automation_flying
+                    || crate::autotakeoff::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                    || crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+                if flying { had_flying_control = true; control_idle_since = None; }
+                else if had_flying_control && !snap.on_ground {
+                    let since = *control_idle_since.get_or_insert(now);
+                    if now.duration_since(since) >= Duration::from_secs(3) {
+                        had_flying_control = false;
+                        landing_summary.note_interruption();
+                        voice.alert(Priority::Caution, "Flight automation has stopped. I'm monitoring only; you have control. Check the autopilot.".to_string());
+                    }
+                } else if snap.on_ground { had_flying_control = false; }
+                let xtk = crate::autoland::last_tracking_error();
+                if let Some(line) = landing_summary.tick(now, snap.on_ground, snap.agl_ft,
+                    snap.vsi_fpm, snap.groundspeed_kts, crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed), xtk) {
+                    crate::blackbox::record("landing_summary", serde_json::json!({"msg": &line}));
+                    if !quiet { voice.alert(Priority::Advisory, line); }
+                }
+                let mut speed_bad = false;
+                let mut speed_spoke = false;
+                let mut cabin_bad = false;
+                let mut cabin_spoke = false;
                 for check in &checks {
                     let state = states.get_mut(check.id()).expect("state per check");
                     match check.eval(&snap) {
                         Some(msg) => {
+                            let speed = check.id().starts_with("airspeed_") || check.id().starts_with("overspeed_");
+                            let cabin = check.id().starts_with("cabin_alt_");
+                            speed_bad |= speed; cabin_bad |= cabin;
+                            state.observe_level(check.repeat_level(&snap));
                             let spoke = state.active(
                                 check.id(),
                                 msg,
@@ -3091,6 +3166,8 @@ pub async fn run(
                                 status.as_ref(),
                                 now,
                             );
+                            speed_spoke |= speed && spoke;
+                            cabin_spoke |= cabin && spoke;
                             // On the rising edge, the copilot ACTS on SOP rows that
                             // carry a fix (strobes, landing lights) instead of only
                             // advising — crew business, so it's already behind the
@@ -3109,8 +3186,25 @@ pub async fn run(
                         None => state.clear(),
                     }
                 }
+                let speed_clear = airspeed_recovery.tick(speed_bad, speed_spoke, now);
+                let cabin_clear = cabin_recovery.tick(cabin_bad, cabin_spoke, now);
+                if !quiet && !snap.on_ground {
+                    if speed_clear { voice.alert(Priority::Advisory, "Airspeed recovered.".to_string()); }
+                    if cabin_clear { voice.alert(Priority::Advisory, "Cabin altitude back below the caution level.".to_string()); }
+                }
             }
-        }
+        } else if xp.get_float(crate::datarefs::ON_GROUND_ANY).await.is_err() {
+            let since = *lost_since.get_or_insert_with(Instant::now);
+            if seen_sim && !disconnected && since.elapsed() >= Duration::from_secs(3) {
+                disconnected = true;
+                had_flying_control = false;
+                crate::stand_down_for_aircraft_change();
+                crate::blackbox::record("control_ownership", serde_json::json!({"event":"connection_lost"}));
+                if crate::mode::copilot_enabled() {
+                    voice.alert(Priority::Warning, "Connection to X-Plane lost. Flight automation is stopped. You'll have control when the sim returns.".to_string());
+                }
+            }
+        } else { lost_since = None; }
         tokio::time::sleep(period).await;
     }
 }
@@ -3368,6 +3462,29 @@ mod region_coach_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cabin_copy_does_not_invent_pressurisation() {
+        assert!(cabin_message(Some(false), false).contains("unpressurised"));
+        assert!(!cabin_message(Some(false), false).contains("Check pressurisation"));
+        assert!(cabin_message(Some(true), false).contains("Check pressurisation"));
+        assert!(!cabin_message(None, false).contains("pressurisation"));
+    }
+
+    #[test]
+    fn cabin_episode_repeats_only_for_a_higher_band() {
+        let t = Instant::now(); let mut st = FireState::new();
+        st.observe_level(Some(13)); st.spoke_this_episode = true; st.last_spoken = Some(t);
+        st.observe_level(Some(13));
+        assert!(!st.should_speak(Severity::Caution, t + RENOTIFY_COOLDOWN));
+        st.observe_level(Some(14));
+        assert!(st.should_speak(Severity::Caution, t + RENOTIFY_COOLDOWN));
+        st.spoke_this_episode = true;
+        st.observe_level(Some(13)); st.observe_level(Some(14));
+        assert!(!st.should_speak(Severity::Caution, t + RENOTIFY_COOLDOWN));
+        // Critical airspeed/sink warnings retain their timed reminder.
+        assert!(st.should_speak(Severity::Warning, t + RENOTIFY_COOLDOWN));
+    }
 
     #[test]
     fn avionics_gate_reads_the_right_dataref_and_fails_open() {

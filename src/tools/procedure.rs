@@ -150,7 +150,17 @@ impl Tool for FlyProcedure {
             Ok(v) => v,
             Err(why) => return Ok(why),
         };
-        procedure::start(ctx.config.xplane_base_url.clone(), ctx.voice.cloned(), plan);
+        if !procedure::start_scoped(
+            ctx.config.xplane_base_url.clone(),
+            ctx.voice.cloned(),
+            plan,
+            ctx.xplane.cancellation(),
+        ) {
+            return Ok(
+                "The previous automation is still stopping. Ask again once it has stopped."
+                    .to_string(),
+            );
+        }
         Ok(ack)
     }
 }

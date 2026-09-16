@@ -182,7 +182,7 @@ impl Tool for AutoTakeoff {
         // Props full forward before the throttle ramps — feathered blades make
         // no thrust and the roll would stall against the stagnation reject.
         super::prop::advance_for_ground_roll(ctx.xplane, &self.prop).await;
-        autotakeoff::start(
+        if !autotakeoff::start_scoped(
             ctx.config.xplane_base_url.clone(),
             ctx.voice.cloned(),
             autotakeoff::Params {
@@ -203,7 +203,13 @@ impl Tool for AutoTakeoff {
                 needed_m: self.takeoff_roll_m.map_or(500.0, |m| m * 1.4),
                 handoff_agl_ft: autotakeoff::DEFAULT_HANDOFF_AGL_FT,
             },
-        );
+            ctx.xplane.cancellation(),
+        ) {
+            return Ok(
+                "The previous automation is still stopping. Ask again once it has stopped."
+                    .to_string(),
+            );
+        }
         Ok(
             "My takeoff. Checking the runway. Say abort takeoff or my controls any time."
                 .to_string(),

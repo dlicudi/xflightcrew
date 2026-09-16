@@ -190,7 +190,16 @@ pub fn active_managers() -> Vec<String> {
 /// spoken line. Never in [`active_managers`] (they are not tasks, and a
 /// spoken status must not read a heading bug aloud).
 pub fn panel_extras() -> Vec<String> {
-    let mut v = Vec::new();
+    let flying = procedure::ACTIVE.load(Relaxed) || circuit::ACTIVE.load(Relaxed)
+        || autoland::ACTIVE.load(Relaxed) || autotakeoff::ACTIVE.load(Relaxed)
+        || tools::recover::ACTIVE.load(Relaxed);
+    let mut v = vec![if flying {
+        "control: copilot flying".to_string()
+    } else if full_auto::ACTIVE.load(Relaxed) {
+        "control: full auto mission active".to_string()
+    } else {
+        "control: pilot; check autopilot".to_string()
+    }];
     let ap = AP_TARGETS.get();
     if !ap.is_empty() {
         v.push(ap);
@@ -220,6 +229,7 @@ pub fn compose() -> String {
     // which is exactly why it can no longer double as this signal.
     out.push(if lines.is_empty() { '0' } else { '1' });
     if lines.is_empty() {
+        out.push_str("MONITORING|You have control; check autopilot");
         return out;
     }
     let primary = lines.remove(0);

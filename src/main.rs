@@ -19,6 +19,7 @@ mod checklist;
 mod circuit;
 mod cockpit_auto;
 mod config;
+mod control;
 mod conversation;
 mod debrief;
 mod dialogue;
@@ -29,6 +30,7 @@ mod full_auto;
 mod grammar;
 mod health;
 mod instructor;
+mod interaction;
 mod livestate;
 mod mic;
 mod mode;
@@ -491,6 +493,7 @@ async fn main() -> Result<()> {
                 // The profile id already probed against this sim, so each
                 // airframe is asked about once.
                 let mut probed = String::new();
+                let mut last_plugin_probe = std::time::Instant::now();
                 loop {
                     if let Ok(icao) = xp.aircraft_icao().await {
                         let icao = icao.trim().to_string();
@@ -562,19 +565,51 @@ async fn main() -> Result<()> {
                             // the live profile relies on, looked up by name; the
                             // pilot hears what is missing before a tool fails
                             // on it (the RV-10's xlua selector, 2026-09-11).
+                            // A stale plugin is re-probed once a minute: the
+                            // pilot reloads it mid-session (2026-09-16, one
+                            // second after the app's first probe) and the
+                            // verdict must follow without an airframe swap.
+                            if probed == id
+                                && health::plugin_missing().is_some_and(|m| !m.is_empty())
+                                && last_plugin_probe.elapsed().as_secs() >= 60
+                            {
+                                probed.clear();
+                            }
                             if id == live.id() && probed != id {
-                                let names = aircraft::profile_references(&live.get());
+                                last_plugin_probe = std::time::Instant::now();
+                                let mut names = aircraft::profile_references(&live.get());
+                                let profile_total = names.len();
+                                // The plugin's side of the wire contract rides
+                                // the same index fetch: a stale .xpl is said
+                                // here, not found as a "timeout" hours later.
+                                names.extend(health::PLUGIN_DATAREFS.iter().map(|s| s.to_string()));
                                 match missing_profile_names(&xp, &names).await {
                                     Ok(missing) => {
                                         probed = id.clone();
-                                        tracing::info!(profile = %id, total = names.len(), missing = ?missing, "profile probe");
+                                        let (plugin_missing, missing): (Vec<String>, Vec<String>) =
+                                            missing.into_iter().partition(|n| n.starts_with("xcopilot/"));
+                                        tracing::info!(profile = %id, total = profile_total, missing = ?missing, "profile probe");
                                         blackbox::record(
                                             "profile_probe",
-                                            serde_json::json!({ "profile": id, "total": names.len(), "missing": missing }),
+                                            serde_json::json!({ "profile": id, "total": profile_total, "missing": missing }),
                                         );
-                                        if let Some(line) = aircraft::probe_summary(&missing, names.len()) {
+                                        if let Some(line) = aircraft::probe_summary(&missing, profile_total) {
                                             det_voice.alert(voice::Priority::Caution, line);
                                         }
+                                        tracing::info!(total = health::PLUGIN_DATAREFS.len(), missing = ?plugin_missing, "plugin probe");
+                                        blackbox::record(
+                                            "plugin_probe",
+                                            serde_json::json!({ "total": health::PLUGIN_DATAREFS.len(), "missing": plugin_missing }),
+                                        );
+                                        // Said once per process; the Health
+                                        // screen keeps showing it.
+                                        let already_said = health::plugin_missing().is_some_and(|m| !m.is_empty());
+                                        if let Some(line) = health::plugin_summary(&plugin_missing) {
+                                            if !already_said {
+                                                det_voice.alert(voice::Priority::Caution, line);
+                                            }
+                                        }
+                                        health::set_plugin_missing(plugin_missing);
                                     }
                                     // Sim unreachable: ask again next tick.
                                     Err(e) => tracing::debug!("profile probe deferred: {e:#}"),
@@ -1182,7 +1217,7 @@ fn stand_down_for_aircraft_change() {
     autoland::abort();
     tools::recover::abort();
     approach_guide::cancel();
-    autotakeoff::ACTIVE.store(false, SeqCst);
+    autotakeoff::cancel();
     autotaxi::ACTIVE.store(false, SeqCst);
     autotaxi::BACKTRACKING.store(false, SeqCst);
     tools::speedhold::ACTIVE.store(false, SeqCst);
@@ -2649,7 +2684,7 @@ async fn run_session(
                         && takeoff_flying
                         && (names_speed || names_steer || generic)
                     {
-                        autotakeoff::ACTIVE.store(false, Relaxed);
+                        autotakeoff::cancel();
                         released.push("your takeoff, power is set");
                     }
                     if !circuit_flying
@@ -3153,7 +3188,8 @@ async fn run_session(
             // refresh. Not when the intent is to *fly* it ("follow/navigate/track"
             // is the navigate tool; the word "fly" is the full-auto SimBrief
             // mission — both handled via the grammar/LLM path below).
-            let nav_intent = tl.contains("navigate")
+            let nav_intent = grammar::resume_plan_request(&tl)
+                || tl.contains("navigate")
                 || tl.contains("follow")
                 || tl.contains("track")
                 || tl
@@ -5582,6 +5618,14 @@ async fn ensure_plan(
     cache: &mut Option<(Instant, simbrief::FlightPlan)>,
     fetch: PlanFetch,
 ) -> Result<bool, String> {
+    // Full auto may have expanded the local direct plan into a checked route.
+    // Keep questions, fuel advice and later FMS loads on that same shelf.
+    if let (Some((_, current)), Some(published)) = (cache.as_mut(), simbrief::local_plan()) {
+        if current.source == simbrief::PlanSource::Local
+            && current.origin == published.origin && current.destination == published.destination {
+            *current = published;
+        }
+    }
     // A local plan (the direct-to planner) is the pilot's own decision: it
     // never expires into a SimBrief refetch, and needs no SimBrief ID. Only
     // an explicit refresh may swap it for SimBrief when that fetch succeeds.
@@ -5626,6 +5670,7 @@ async fn ensure_plan(
     // its destination — the copilot volunteers TOD instead of waiting to be
     // asked ("when is TOD" still works via time_to_tod).
     if let Some((_, fp)) = cache.as_ref() {
+        simbrief::publish_plan(fp);
         if let Some(w) = fp.waypoints.last() {
             let ring = if fp.tod_to_dest_nm > 0.0 {
                 fp.tod_to_dest_nm
@@ -5800,7 +5845,9 @@ async fn plan_flight(
             "load": req.load,
         }),
     );
-    *cache = Some((Instant::now(), planned.to_flight_plan()));
+    let fp = planned.to_flight_plan();
+    simbrief::publish_plan(&fp);
+    *cache = Some((Instant::now(), fp));
     // The same seam SimBrief uses to hand the monitor its destination (TOD).
     let _ = ensure_plan(config, cache, PlanFetch::Cached).await;
     let mut line = planned.brief(req.load);

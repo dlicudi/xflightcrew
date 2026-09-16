@@ -36,6 +36,11 @@ const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 
 /// True while the full-auto orchestrator runs.
+static RUN: sim::run::Slot = sim::run::Slot::new();
+pub fn running() -> bool {
+    RUN.running()
+}
+
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Set to cancel ("cancel" / "my controls").
 pub static ABORT: AtomicBool = AtomicBool::new(false);
@@ -85,10 +90,11 @@ pub fn status() -> Option<String> {
 
 /// Cancel the sequence and stand down every sub-loop it may have armed.
 pub fn abort() -> bool {
+    RUN.cancel();
     ABORT.store(true, SeqCst);
     clear_stage();
     crate::autotaxi::ACTIVE.store(false, SeqCst);
-    crate::autotakeoff::ACTIVE.store(false, SeqCst);
+    crate::autotakeoff::cancel();
     crate::circuit::abort();
     crate::procedure::abort();
     crate::autoland::abort();
@@ -103,10 +109,14 @@ pub enum Mission {
     /// The SimBrief route: takeoff, the enroute fixes at the plan's altitudes,
     /// then the destination's published approach (autoland as the fallback).
     Flight(Route),
+    /// Explicit checked airborne continuation; bypass every ground stage.
+    Resume(Route),
 }
 
 /// The flyable distillation of a SimBrief OFP, built by the arming tool.
 pub struct Route {
+    /// A local route was terrain-checked for this final; changed wind needs replanning.
+    pub local_runway: Option<String>,
     pub dest_icao: String,
     /// The airport's name from apt.dat ("Gibraltar"), for the announcements;
     /// falls back to the ICAO when the lookup failed.
@@ -181,18 +191,31 @@ pub struct SubTools {
 }
 
 /// Spawn the orchestrator on its own thread + runtime + client.
-pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubTools) {
+pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubTools) -> bool {
+    if crate::tools::recover::ACTIVE.load(SeqCst)
+        || crate::procedure::running()
+        || crate::autotakeoff::running()
+        || crate::circuit::ACTIVE.load(SeqCst)
+        || crate::autoland::ACTIVE.load(SeqCst)
+    {
+        return false;
+    }
+    let Some(lease) = RUN.begin() else {
+        return false;
+    };
     if ACTIVE.swap(true, SeqCst) {
-        return;
+        return false;
     }
     ABORT.store(false, SeqCst);
+    INBOUND_MADE.store(false, SeqCst);
     if let Ok(mut m) = MISSION.lock() {
         *m = match tools.mission {
             Mission::Circuit { .. } => "circuit",
-            Mission::Flight(_) => "flight",
+            Mission::Flight(_) | Mission::Resume(_) => "flight",
         };
     }
     std::thread::spawn(move || {
+        let _lease = lease.with_cleanup(&ACTIVE, clear_stage);
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -200,10 +223,16 @@ pub fn start(base_url: String, config: Config, voice: Option<Voice>, tools: SubT
             ACTIVE.store(false, SeqCst);
             return;
         };
-        rt.block_on(fly(XPlaneClient::new(base_url), config, voice, tools));
+        rt.block_on(fly(
+            XPlaneClient::new(base_url).with_cancel(_lease.cancel.clone()),
+            config,
+            voice,
+            tools,
+        ));
         ACTIVE.store(false, SeqCst);
         clear_stage();
     });
+    true
 }
 
 fn announce(voice: &Option<Voice>, priority: Priority, line: &str) {
@@ -265,6 +294,7 @@ async fn light(tools: &SubTools, ctx: &ToolCtx<'_>, key: &str, on: bool) -> bool
 
 /// Give up cleanly.
 fn give_up(voice: &Option<Voice>, line: &str, reason: &str) {
+    RUN.fail(reason);
     ACTIVE.store(false, SeqCst);
     // "Your aircraft" means every lever: the mixture manager stands down with
     // the rest, never quietly re-trimming under the pilot's hand.
@@ -334,6 +364,36 @@ const INBOUND_SWAP_WAIT_SECS: f64 = 45.0;
 /// Between the handoff readback and the retune: the readback has to be off
 /// the air on the frequency it was given on before the radio leaves it.
 const HANDOFF_READBACK_SECS: u64 = 4;
+/// The inbound call goes out this far from the destination, once the region
+/// has handed us to its own tower: twice the tower's 5 nm zone, so the crew
+/// has called before the zone watch can ask who we are. Until 2026-09-15 the
+/// call waited for the last enroute fix, and a plan ending at GRA (a mile
+/// from Granada's runway) flew the whole zone unannounced: three "say
+/// callsign and intentions" in four minutes, none answered.
+const INBOUND_CALL_NM: f64 = 10.0;
+/// The inbound call has been made this mission (by the enroute leg or the
+/// arrival), so no later stage makes it twice. Reset at the arm.
+static INBOUND_MADE: AtomicBool = AtomicBool::new(false);
+
+/// Is the inbound call owed now? Only on the DESTINATION's tower frequency
+/// (`home` is whoever the region last handed us to; at LINTO that was
+/// Tangier, mid-strait), inside [`INBOUND_CALL_NM`], and not already made. A
+/// zone challenge from that tower asks for it regardless of the distance.
+pub fn inbound_due(
+    dest_khz: Option<i64>,
+    home_khz: Option<i64>,
+    dist_nm: f64,
+    challenged: bool,
+    made: bool,
+) -> bool {
+    if made {
+        return false;
+    }
+    match (dest_khz, home_khz) {
+        (Some(d), Some(h)) if d == h => challenged || dist_nm <= INBOUND_CALL_NM,
+        _ => false,
+    }
+}
 /// Clear of the pattern: the landing AND taxi lights go off passing this
 /// height (the taxi light was lit for the taxi and nothing else puts it out).
 const LANDING_LIGHTS_OFF_AGL_FT: f64 = 1000.0;
@@ -343,16 +403,20 @@ const LANDING_LIGHTS_OFF_AGL_FT: f64 = 1000.0;
 /// on, COM1 is retuned, and the departure is checked in with altitude — the
 /// exchange nobody made at Malaga, where the flight stayed on tower for
 /// thirteen minutes and heard the party line all the way to the region swap
-/// (12:23Z, 2026-09-11). Returns true once the enroute leg completes, false
-/// on abort or the four-hour ceiling.
+/// (12:23Z, 2026-09-11). The inbound call is made HERE when the region hands
+/// us to the destination's own tower and the field is inside
+/// [`INBOUND_CALL_NM`], or the moment that tower challenges us (`dest`: the
+/// destination's position and tower frequency; `None` for a field with no
+/// tower row, where nobody is there to call). Returns true once the enroute
+/// leg completes, false on abort or the four-hour ceiling.
 async fn wait_enroute_working_the_radio(
     xp: &XPlaneClient,
     ctx: &ToolCtx<'_>,
     voice: &Option<Voice>,
     callsign: &Option<String>,
     climb_to_ft: f64,
+    dest: Option<(f64, f64, i64)>,
 ) -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
     let deadline = Instant::now() + Duration::from_secs_f64(4.0 * 3600.0);
     // Landing and taxi lights off once clear of the pattern: one read per
     // pass until the height is made, then never again this leg.
@@ -361,8 +425,8 @@ async fn wait_enroute_working_the_radio(
         if ABORT.load(SeqCst) {
             return false;
         }
-        if !crate::procedure::ACTIVE.load(Relaxed) {
-            return true;
+        if !crate::procedure::running() {
+            return crate::procedure::outcome() == Some(sim::run::Outcome::Completed);
         }
         if Instant::now() >= deadline {
             return false;
@@ -397,6 +461,41 @@ async fn wait_enroute_working_the_radio(
         }
         if let Some(h) = crate::party_line::take_region_handoff() {
             obey_region_handoff(xp, ctx, voice, callsign, h, true).await;
+        }
+        // The tower's question is drained every pass whoever asked it: an
+        // answer is owed the destination's tower (the inbound call, below);
+        // a transit field's challenge has no answer yet and is blackboxed.
+        let challenged = crate::party_line::take_zone_challenge();
+        let home = crate::party_line::home_tower_khz();
+        if let Some((dlat, dlon, dkhz)) = dest {
+            let on_dest = home == Some(dkhz);
+            if challenged && !on_dest {
+                event(
+                    "zone_challenge",
+                    json!({ "answered": false, "home_khz": home, "dest_khz": dkhz }),
+                );
+            }
+            if on_dest && !INBOUND_MADE.load(SeqCst) {
+                let dist_nm = match tokio::join!(xp.get_float(LAT), xp.get_float(LON)) {
+                    (Ok(lat), Ok(lon)) => crate::nav::haversine_nm(lat, lon, dlat, dlon),
+                    _ => f64::INFINITY,
+                };
+                if inbound_due(Some(dkhz), home, dist_nm, challenged, false) {
+                    event(
+                        "inbound_enroute",
+                        json!({
+                            "khz": dkhz, "dist_nm": (dist_nm * 10.0).round() / 10.0,
+                            "challenged": challenged,
+                        }),
+                    );
+                    call_inbound(xp, ctx, voice, callsign, dkhz, true).await;
+                }
+            }
+        } else if challenged {
+            event(
+                "zone_challenge",
+                json!({ "answered": false, "home_khz": home }),
+            );
         }
         tokio::time::sleep(Duration::from_millis(2000)).await;
     }
@@ -506,6 +605,12 @@ where
     }
 }
 
+/// Both instruments must affirm the ground gate; an API failure is no clearance.
+fn confirmed_ground(agl_m: anyhow::Result<f64>, on_ground: anyhow::Result<f64>) -> bool {
+    matches!((agl_m, on_ground), (Ok(agl), Ok(ground))
+        if agl.is_finite() && ground.is_finite() && agl * M_TO_FT <= 50.0 && ground > 0.5)
+}
+
 async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubTools) {
     macro_rules! bail_if_abort {
         () => {
@@ -524,6 +629,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         reminders: None,
     };
 
+    if let Mission::Resume(route) = &tools.mission {
+        let callsign = crate::circuit::crew_callsign(&xp).await;
+        // The normal follower owns speed, route and arrival; no duplicate laws.
+        fly_route(&xp, &config, &voice, &ctx, &tools, route, &callsign).await;
+        return;
+    }
+
     announce(
         &voice,
         Priority::Advisory,
@@ -541,18 +653,15 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     // for departure, and requested a takeoff clearance while the aircraft
     // sank (EGHI, 2026-08-02). Airborne, the honest answer is the tools that
     // fly: refuse and name them.
-    let agl_ft = xp.get_float(AGL_M).await.unwrap_or(0.0) * M_TO_FT;
-    let on_ground = xp
-        .get_float(crate::datarefs::ON_GROUND_ANY)
-        .await
-        .unwrap_or(1.0)
-        > 0.5;
-    if !on_ground && agl_ft > 50.0 {
+    let (agl, ground) = tokio::join!(
+        xp.get_float(AGL_M),
+        xp.get_float(crate::datarefs::ON_GROUND_ANY),
+    );
+    if !confirmed_ground(agl, ground) {
         give_up(
             &voice,
-            "We're already flying — full auto starts from the ground. \
-             Say navigate to follow the plan, fly the ILS, or land for me.",
-            "armed_airborne",
+            "Full auto needs confirmed ground contact. Say navigate to follow the plan, fly the ILS, or land for me when airborne.",
+            "ground_unconfirmed",
         );
         return;
     }
@@ -1304,7 +1413,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             taxi_in_after_landing(&xp, &config, &voice, &tools, true).await;
             ACTIVE.store(false, SeqCst);
         }
-        Mission::Flight(route) => {
+        Mission::Flight(route) | Mission::Resume(route) => {
             fly_route(&xp, &config, &voice, &ctx, &tools, route, &callsign).await;
         }
     }
@@ -1352,6 +1461,7 @@ async fn fly_route(
     // (The GPS already has the route: fly() writes the FMS mailbox at arm
     // time, at the gate, so the taxi happens with the plan on the map.)
 
+    if !matches!(tools.mission, Mission::Resume(_)) {
     // --- Takeoff: the proven loop, armed through its tool so every arm-time
     // gate applies (the pitch-channel probe included).
     announce(
@@ -1374,11 +1484,7 @@ async fn fly_route(
         return;
     }
     waiting("the takeoff");
-    if !wait_until(360.0, 1000, || async {
-        !crate::autotakeoff::ACTIVE.load(Relaxed)
-    })
-    .await
-    {
+    if !wait_until(360.0, 1000, || async { !crate::autotakeoff::running() }).await {
         if !ABORT.load(SeqCst) {
             give_up(
                 voice,
@@ -1388,6 +1494,14 @@ async fn fly_route(
         } else {
             give_up(voice, "Cancelled. Your aircraft.", "abort");
         }
+        return;
+    }
+    if crate::autotakeoff::outcome() != Some(sim::run::Outcome::Completed) {
+        give_up(
+            voice,
+            "The takeoff handed control back. Your aircraft.",
+            "takeoff_not_completed",
+        );
         return;
     }
     let agl_ft = xp.get_float(AGL_M).await.unwrap_or(0.0) * M_TO_FT;
@@ -1401,11 +1515,22 @@ async fn fly_route(
     }
     event("airborne", json!({ "agl_ft": agl_ft }));
 
+    } else {
+        let (ground, agl) = tokio::join!(xp.get_float(crate::datarefs::ON_GROUND_ANY), xp.get_float(AGL_M));
+        if !matches!((ground,agl), (Ok(g),Ok(h)) if g.is_finite() && h.is_finite() && g < 0.5 && h*M_TO_FT >= 1000.0) {
+            give_up(voice, "Aircraft state changed before resume. I'm monitoring only; you have control.", "resume_state_changed");
+            return;
+        }
+        event("resumed", json!({ "fix": route.legs.first().map(|l| &l.fix_ident) }));
+        // Reload only after the explicit resume; fms_goto selects the joined fix.
+        let _ = xp.set_data("xcopilot/fms/route", route.fms_payload.as_bytes()).await;
+        let _ = xp.set_int("xcopilot/fms/load", 1).await;
+    }
+
     // --- Enroute: the procedure follower over the plan's own fixes. It climbs
     // to cruise on the first constraint and flies the plan's descent numbers
     // after TOD; quiet completion (EndAction::Enroute) hands back here.
-    crate::procedure::ABORT.store(false, SeqCst);
-    crate::procedure::start(
+    if !crate::procedure::start_scoped(
         config.xplane_base_url.clone(),
         voice.clone(),
         crate::procedure::Plan {
@@ -1418,7 +1543,15 @@ async fn fly_route(
             cruise_ias_kts: tools.cruise_ias_kts,
             transition_altitude_ft: Some(tools.transition_altitude_ft),
         },
-    );
+        xp.cancellation(),
+    ) {
+        give_up(
+            voice,
+            "The previous procedure is still stopping. Your aircraft.",
+            "procedure_busy",
+        );
+        return;
+    }
     // The CLIMB and CRUISE checklists' mixture items, flown rather than read:
     // the continuous manager keeps it full rich below the leaning floor and
     // leans to peak EGT above it, re-trimming as the climb and the power
@@ -1439,7 +1572,19 @@ async fn fly_route(
         .iter()
         .filter_map(|l| l.alt1_ft)
         .fold(0.0, f64::max);
-    if !wait_enroute_working_the_radio(xp, ctx, voice, callsign, climb_to_ft).await {
+    // The destination's own position and tower, for the inbound call at the
+    // zone approach: the apt.dat row, never `home_tower_khz`, which is
+    // whoever the region last handed us to.
+    let dest_tower =
+        crate::nav::find_airport(&crate::tools::autoland::apt_dat_path(), &route.dest_icao)
+            .ok()
+            .flatten()
+            .and_then(|a| {
+                let (lat, lon) = a.position()?;
+                let khz = a.freq(crate::nav::FREQ_TOWER)?.khz;
+                Some((lat, lon, khz))
+            });
+    if !wait_enroute_working_the_radio(xp, ctx, voice, callsign, climb_to_ft, dest_tower).await {
         if !ABORT.load(SeqCst) {
             give_up(
                 voice,
@@ -1526,6 +1671,18 @@ async fn fly_route(
             tower_khz: None,
         })
     };
+    if route
+        .local_runway
+        .as_ref()
+        .is_some_and(|r| built.rwy_id.as_ref() != Some(r))
+    {
+        give_up(
+            voice,
+            "The arrival runway changed. The local route needs replanning. Your aircraft.",
+            "local_runway_changed",
+        );
+        return;
+    }
     // The radio: tune the DESTINATION'S tower from its own apt.dat comm row —
     // never `home_tower_khz`, which is whoever the enroute region last handed
     // us to. At LINTO that was Tangier (genuinely the nearest field,
@@ -1552,12 +1709,18 @@ async fn fly_route(
         // the void, and Gibraltar's zone watch challenged the arrival as an
         // unknown aircraft (12:36Z, 2026-09-11). The swap is distance-driven
         // and due about now; wait for it, bounded, and call either way.
-        waiting("the destination's frequency");
-        let swapped = wait_until(INBOUND_SWAP_WAIT_SECS, 500, || async {
-            crate::party_line::home_tower_khz() == Some(khz)
-        })
-        .await;
-        if swapped {
+        // Already made by the enroute leg (the region handed us to this
+        // tower inside INBOUND_CALL_NM): nothing owed, the tower knows us.
+        let swapped = INBOUND_MADE.load(SeqCst) || {
+            waiting("the destination's frequency");
+            wait_until(INBOUND_SWAP_WAIT_SECS, 500, || async {
+                crate::party_line::home_tower_khz() == Some(khz)
+            })
+            .await
+        };
+        if INBOUND_MADE.load(SeqCst) {
+            event("inbound_already_made", json!({ "khz": khz }));
+        } else if swapped {
             call_inbound(xp, ctx, voice, callsign, khz, true).await;
         } else {
             // Not yet the destination's frequency: the call would go into
@@ -1576,7 +1739,10 @@ async fn fly_route(
     // same runway so a tailwind can't be re-picked back in by track.
     let landing_rwy = built.rwy_id.clone();
     match built.plan {
-        Some(plan) if crate::procedure::approach_flyable_from(&plan, lat, lon, alt_msl_ft) => {
+        Some(plan)
+            if route.local_runway.is_none()
+                && crate::procedure::approach_flyable_from(&plan, lat, lon, alt_msl_ft) =>
+        {
             event(
                 "arrival_procedure",
                 json!({ "name": plan.name, "runway": landing_rwy, "wind": wind_detail }),
@@ -1586,8 +1752,19 @@ async fn fly_route(
                 Priority::Advisory,
                 &format!("Setting up {}.", plan.name),
             );
-            crate::procedure::ABORT.store(false, SeqCst);
-            crate::procedure::start(config.xplane_base_url.clone(), voice.clone(), plan);
+            if !crate::procedure::start_scoped(
+                config.xplane_base_url.clone(),
+                voice.clone(),
+                plan,
+                xp.cancellation(),
+            ) {
+                give_up(
+                    voice,
+                    "The previous procedure is still stopping. Your aircraft.",
+                    "procedure_busy",
+                );
+                return;
+            }
         }
         _ => {
             event(
@@ -1597,10 +1774,14 @@ async fn fly_route(
             announce(
                 voice,
                 Priority::Advisory,
-                "No published approach lines up from here, so I'll land us visually.",
+                if route.local_runway.is_some() {
+                    "On the local final. Landing us visually."
+                } else {
+                    "No published approach lines up from here, so I'll land us visually."
+                },
             );
             crate::autoland::ABORT.store(false, SeqCst);
-            crate::autoland::run_autoland(
+            crate::autoland::run_autoland_scoped(
                 config.xplane_base_url.clone(),
                 crate::tools::autoland::apt_dat_path(),
                 tools.circuit.cfg.clone(),
@@ -1608,6 +1789,7 @@ async fn fly_route(
                 voice.clone(),
                 None,
                 landing_rwy.clone(),
+                xp.cancellation(),
             );
         }
     };
@@ -1623,11 +1805,14 @@ async fn fly_route(
             break false;
         }
         // The deferred inbound call goes out the moment the destination's
-        // station is the one on the frequency.
+        // station is the one on the frequency, or the moment a tower on it
+        // asks who we are (the challenge is drained either way).
+        let challenged = crate::party_line::take_zone_challenge();
         if let Some(khz) = inbound_owed {
-            if crate::party_line::home_tower_khz() == Some(khz) {
+            let swapped = crate::party_line::home_tower_khz() == Some(khz);
+            if swapped || challenged {
                 inbound_owed = None;
-                call_inbound(xp, ctx, voice, callsign, khz, true).await;
+                call_inbound(xp, ctx, voice, callsign, khz, swapped).await;
             }
         }
         if crate::autoland::ACTIVE.load(Relaxed) || !crate::procedure::ACTIVE.load(Relaxed) {
@@ -1784,6 +1969,7 @@ async fn taxi_in_after_landing(
         // We have just landed, so the first thing owed is the runway itself.
         crate::taxi_in::vacate_runway(),
     );
+    RUN.record(sim::run::Outcome::HandedOff);
 }
 
 /// The arrival, briefed AT THE GATE: what the destination offers and what
@@ -1878,6 +2064,7 @@ async fn call_inbound(
         obey_region_handoff(xp, ctx, voice, callsign, h, false).await;
     }
     crate::circuit::transmit(crate::circuit::radio_call(callsign, "inbound for landing"));
+    INBOUND_MADE.store(true, SeqCst);
     event(
         "inbound_call",
         json!({ "khz": khz, "station_swapped": swapped }),
@@ -2270,6 +2457,31 @@ async fn lined_up(xp: &XPlaneClient, tools: &SubTools, _config: &Config) -> bool
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn full_auto_requires_both_instruments_to_confirm_ground_contact() {
+        use super::confirmed_ground;
+        assert!(confirmed_ground(Ok(0.0), Ok(1.0)));
+        assert!(!confirmed_ground(Ok(500.0), Ok(0.0)));
+        assert!(!confirmed_ground(Ok(0.0), Ok(0.0))); // just lifted off
+        assert!(!confirmed_ground(Ok(500.0), Ok(1.0))); // conflicting readings
+        assert!(!confirmed_ground(
+            Err(anyhow::anyhow!("AGL failed")),
+            Ok(1.0)
+        ));
+        assert!(!confirmed_ground(
+            Ok(0.0),
+            Err(anyhow::anyhow!("contact failed"))
+        ));
+        assert!(!confirmed_ground(
+            Err(anyhow::anyhow!("AGL failed")),
+            Err(anyhow::anyhow!("contact failed"))
+        ));
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!confirmed_ground(Ok(invalid), Ok(1.0)));
+            assert!(!confirmed_ground(Ok(0.0), Ok(invalid)));
+        }
+    }
+
     /// A 172 plan LXGB-LEAX as SimBrief sent it (2026-09-15), in kilos.
     fn plan(weights: bool) -> crate::simbrief::FlightPlan {
         crate::simbrief::FlightPlan {
@@ -2537,6 +2749,59 @@ mod region_handoff_tests {
         assert_eq!(line, "roger, Malaga Tower on one one eight decimal one");
         assert!(!line.contains("thousand"));
         assert!(crate::tower::is_readback(&line));
+    }
+}
+
+#[cfg(test)]
+mod inbound_tests {
+    use super::{inbound_due, INBOUND_CALL_NM};
+
+    /// LEJR-LEGR, 2026-09-15: the region handed the flight to Granada Tower
+    /// 20 nm out and the inbound waited for the last fix, a mile from the
+    /// runway. Owed on the destination's own frequency inside the call
+    /// distance; never on a transit field's, never twice.
+    #[test]
+    fn inbound_owed_on_the_destination_tower_inside_the_call_distance() {
+        let dest = Some(118_850);
+        assert!(
+            !inbound_due(dest, dest, INBOUND_CALL_NM + 5.0, false, false),
+            "still far out"
+        );
+        assert!(
+            inbound_due(dest, dest, INBOUND_CALL_NM, false, false),
+            "at the call distance"
+        );
+        assert!(inbound_due(dest, dest, 3.0, false, false));
+        assert!(!inbound_due(dest, dest, 3.0, false, true), "already made");
+        // Tangier held the frequency mid-strait: not the tower we are landing at.
+        assert!(
+            !inbound_due(dest, Some(121_700), 3.0, false, false),
+            "another region's tower"
+        );
+        assert!(
+            !inbound_due(dest, None, 3.0, false, false),
+            "no station on the air"
+        );
+        assert!(
+            !inbound_due(None, dest, 3.0, false, false),
+            "no tower row to call"
+        );
+    }
+
+    /// The tower's "say callsign and intentions" is answered at any range,
+    /// but only by the tower we are inbound to.
+    #[test]
+    fn a_challenge_from_the_destination_tower_earns_the_inbound_now() {
+        let dest = Some(118_850);
+        assert!(inbound_due(dest, dest, 30.0, true, false));
+        assert!(
+            !inbound_due(dest, dest, 30.0, true, true),
+            "already made: no second call"
+        );
+        assert!(
+            !inbound_due(dest, Some(121_700), 2.0, true, false),
+            "a transit field's question"
+        );
     }
 }
 

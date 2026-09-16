@@ -25,6 +25,24 @@ pub enum PlanSource {
     Local,
 }
 
+/// The speech loop publishes its shelf here for tool-triggered full auto.
+/// Only a local plan bypasses the explicit SimBrief fetch at the arm.
+static SHELF: std::sync::Mutex<Option<FlightPlan>> = std::sync::Mutex::new(None);
+pub fn publish_plan(plan: &FlightPlan) {
+    *SHELF.lock().unwrap() = Some(plan.clone());
+}
+pub fn loaded_plan() -> Option<FlightPlan> {
+    SHELF.lock().unwrap().clone()
+}
+pub fn local_plan() -> Option<FlightPlan> {
+    SHELF
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|p| p.source == PlanSource::Local)
+        .cloned()
+}
+
 /// The briefed essentials of a SimBrief OFP. Fuel figures are in US gallons.
 #[derive(Clone)]
 pub struct FlightPlan {

@@ -88,6 +88,17 @@ pub(crate) static DEPARTURE_HANDOFF: Mutex<Option<(String, i64)>> = Mutex::new(N
 /// and an install that wiped it would lose every handoff. `uninstall` ends it.
 pub(crate) static REGION_HANDOFF: Mutex<Option<RegionHandoff>> = Mutex::new(None);
 
+/// The zone watch challenged us on the frequency ("aircraft in the Granada
+/// control zone, you are inside controlled airspace without clearance, say
+/// callsign and intentions"): the tower has never heard from this aircraft
+/// and is asking. Armed each time the tuned line goes out; consumed by the
+/// crew that works the radio, which answers with the inbound call when the
+/// challenging tower is the destination's (a full-auto arrival flew the last
+/// enroute leg through Granada's zone with three challenges unanswered,
+/// 2026-09-15). The crew-side "we're inside the zone" variant, spoken by the
+/// copilot when the radio is NOT on the tower, never arms it.
+pub(crate) static ZONE_CHALLENGE: Mutex<bool> = Mutex::new(false);
+
 /// What the enroute controller told us at the region boundary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegionHandoff {
@@ -255,6 +266,14 @@ pub fn take_departure_handoff() -> Option<(String, i64)> {
 /// code and retunes; a pilot flying by hand gets one nudge if neither moved.
 pub fn take_region_handoff() -> Option<RegionHandoff> {
     lock(&REGION_HANDOFF).take()
+}
+
+/// Consume the zone watch's challenge ("say callsign and intentions"), spoken
+/// on the frequency to an aircraft the tower has never heard from. Drained
+/// unconditionally by the crew's loop each pass: an answer is owed the tower
+/// it came from, and a challenge nobody answered is not kept for a later one.
+pub fn take_zone_challenge() -> bool {
+    std::mem::take(&mut *lock(&ZONE_CHALLENGE))
 }
 
 /// The callsign under approach vectors, if a plan is armed.

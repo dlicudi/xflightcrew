@@ -18,6 +18,15 @@
 
 id: beechcraft_baron_58
 display_name: Beechcraft Baron 58
+pressurised: false
+
+# Experimental simulator tuning after two LEBL hard arrivals (2026-09-16).
+# Taper approach power; do not continue removing it into excessive/renewed sink.
+# FAA multiengine guidance calls for gradual reduction in roundout, not a step.
+flare_power:
+  reduction_per_second: 0.04
+  hold_sink_fpm: 200.0
+  lead_seconds: 1.0
 
 # --- Capability flags: universal-dataref tools only ---
 autopilot: true        # set_heading / set_altitude / set_vertical_speed. VERIFY LIVE

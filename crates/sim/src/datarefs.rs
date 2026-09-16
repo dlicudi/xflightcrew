@@ -11,6 +11,7 @@ pub const ALTITUDE_FT: &str = "sim/cockpit2/gauges/indicators/altitude_ft_pilot"
 pub const AIRSPEED_KTS: &str = "sim/cockpit2/gauges/indicators/airspeed_kts_pilot";
 pub const VVI_FPM: &str = "sim/cockpit2/gauges/indicators/vvi_fpm_pilot";
 pub const COMPASS_HEADING_DEG: &str = "sim/cockpit2/gauges/indicators/compass_heading_deg_mag";
+pub const BANK_DEG: &str = "sim/flightmodel/position/true_phi";
 /// The aircraft's actual magnetic heading (flight model, not a gauge) — what
 /// "keep current heading" bugs. Steadier than the whiskey compass in a turn.
 pub const MAG_PSI: &str = "sim/flightmodel/position/mag_psi";

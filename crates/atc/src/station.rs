@@ -25,7 +25,7 @@ pub use crate::party_line::RegionHandoff;
 pub(crate) use crate::party_line::{
     ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, LANDING_HANDOFF, LINE_UP_CONDITION,
     PENDING_GO_AROUND, PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, REGION_HANDOFF,
-    TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS,
+    TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS, ZONE_CHALLENGE,
 };
 
 /// Which of the station's frequencies COM1 is tuned to.
@@ -342,6 +342,7 @@ impl Station {
             .unwrap_or_else(|e| e.into_inner()) = false;
         *PENDING_LINE_UP.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *PENDING_GO_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *ZONE_CHALLENGE.lock().unwrap_or_else(|e| e.into_inner()) = false;
     }
 
     /// Content routing (shared PTT): if the utterance is a radio call AND COM1
@@ -1875,6 +1876,9 @@ pub fn compliance_tick(
         {
             w.zone_last = Some(now);
             return Some(if tuned {
+                // The crew hears the question as data too: an inbound call is
+                // the answer when this is the destination's tower.
+                *ZONE_CHALLENGE.lock().unwrap_or_else(|e| e.into_inner()) = true;
                 ComplianceCall {
                     line: format!(
                         "Aircraft in the {zone_name} control zone, you are inside \
@@ -8530,6 +8534,52 @@ mod tests {
         *ACTIVE_FIELD.lock().unwrap() = None;
         *ACTIVE_RUNWAYS.lock().unwrap() = Vec::new();
         *CONTROLLER_FREQS.lock().unwrap() = Vec::new();
+    }
+
+    #[test]
+    fn zone_challenge_on_frequency_is_published_for_the_crew() {
+        // Granada's zone watch challenged a full-auto arrival three times
+        // while it flew the last enroute leg through the zone, and the crew
+        // had no way to hear the question (2026-09-15). The tuned challenge
+        // arms the party line; the copilot's own "we're inside the zone"
+        // (radio not on the tower) does not, and the flag drains on read.
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (flat, flon) = (36.1512, -5.3554);
+        *ACTIVE_FIELD.lock().unwrap() = Some(("Gibraltar".into(), flat, flon));
+        *ACTIVE_PANEL.lock().unwrap() = Some((
+            "Gibraltar".into(),
+            11.0,
+            vec![("tower".to_string(), 131200_i64)],
+        ));
+        *CLEARANCE.lock().unwrap() = None;
+        *COMPLIANCE.lock().unwrap() = ComplianceState::NEW;
+        *ZONE_CHALLENGE.lock().unwrap() = false;
+        let t0 = Instant::now();
+        // Airborne, 2 nm out, 1,500 ft, tuned to the tower: the controller asks.
+        let t = t0 + std::time::Duration::from_secs_f64(ZONE_COOLDOWN_SECS + 1.0);
+        let call = compliance_tick(flat + 0.03, flon, 1500.0, false, 100.0, true, t)
+            .expect("the zone watch challenges an unknown aircraft");
+        assert!(!call.crew, "{}", call.line);
+        assert!(
+            call.line.contains("Say callsign and intentions"),
+            "{}",
+            call.line
+        );
+        assert!(
+            crate::party_line::take_zone_challenge(),
+            "published for the crew"
+        );
+        assert!(!crate::party_line::take_zone_challenge(), "drained on read");
+        // Radio not on the tower: the copilot's line, no question on the air.
+        let t = t + std::time::Duration::from_secs_f64(ZONE_COOLDOWN_SECS + 1.0);
+        let call = compliance_tick(flat + 0.03, flon, 1500.0, false, 100.0, false, t)
+            .expect("the copilot flags the zone");
+        assert!(call.crew, "{}", call.line);
+        assert!(
+            !crate::party_line::take_zone_challenge(),
+            "no challenge was spoken"
+        );
+        Station::uninstall();
     }
 
     #[test]

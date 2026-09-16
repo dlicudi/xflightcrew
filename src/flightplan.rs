@@ -519,6 +519,147 @@ pub fn runway_needed_ft(landing_ft: Option<f64>, takeoff_ft: Option<f64>) -> Opt
     landing_ft.or(takeoff_ft).filter(|f| *f > 0.0)
 }
 
+/// A local flight joins an eight-mile final through a sixteen-mile alignment
+/// fix. Cruise and descent remain ordinary procedure legs, with no new laws.
+pub struct LocalRoute {
+    pub runway: String,
+    pub waypoints: Vec<Waypoint>,
+    pub distance_nm: f64,
+    /// Probe points paired with the lowest altitude the route may fly there.
+    pub terrain: Vec<((f64, f64), f64)>,
+}
+
+pub fn local_route(
+    fp: &FlightPlan,
+    origin: &nav::AirportInfo,
+    dest: &nav::AirportInfo,
+    cruise_kts: f64,
+    climb_fpm: f64,
+    runway_needed_ft: f64,
+    wind: Option<(f64, f64)>,
+) -> Result<LocalRoute, String> {
+    let o = fp
+        .waypoints
+        .first()
+        .ok_or("The local plan has no origin.")?;
+    let cruise = fp.cruise_alt_ft;
+    if ![cruise, cruise_kts, climb_fpm, origin.elev_ft, dest.elev_ft]
+        .iter()
+        .all(|v| v.is_finite())
+        || cruise_kts <= 0.0
+        || climb_fpm <= 0.0
+        || cruise < dest.elev_ft + 2500.0
+    {
+        return Err("The local flight needs usable climb, cruise and arrival figures.".into());
+    }
+    let mut ends = Vec::new();
+    for r in &dest.runways {
+        let length = nav::haversine_nm(r.lat_a, r.lon_a, r.lat_b, r.lon_b) * 1852.0 * M_TO_FT;
+        if length < runway_needed_ft {
+            continue;
+        }
+        for (id, lat, lon, heading) in [
+            (&r.ident_a, r.lat_a, r.lon_a, r.heading_a_deg()),
+            (&r.ident_b, r.lat_b, r.lon_b, r.heading_b_deg()),
+        ] {
+            let target = wind
+                .filter(|(_, k)| *k >= 4.0)
+                .map(|(d, _)| d)
+                .unwrap_or_else(|| nav::bearing_deg(o.lat, o.lon, lat, lon));
+            let score = ((heading - target + 540.0).rem_euclid(360.0) - 180.0).abs();
+            ends.push((score, id.clone(), lat, lon, heading));
+        }
+    }
+    ends.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (_, runway, lat, lon, heading) = ends
+        .into_iter()
+        .next()
+        .ok_or("The destination has no runway long enough for this local flight.")?;
+    let outer = nav::project_latlon(lat, lon, heading + 180.0, 16.0);
+    let final_fix = nav::project_latlon(lat, lon, heading + 180.0, 8.0);
+    let dist = nav::haversine_nm(o.lat, o.lon, outer.0, outer.1);
+    let outer_alt = cruise.min(dest.elev_ft + 4900.0);
+    // Reserve descent at 250 ft/nm, gentler than the follower's nominal path,
+    // and five miles for the turn onto final.
+    let descent_nm = ((cruise - outer_alt) / 250.0).max(0.0) + 5.0;
+    let climb_nm = ((cruise - origin.elev_ft - 500.0).max(0.0) / (climb_fpm * 0.7))
+        * (cruise_kts + 30.0)
+        / 60.0
+        + 3.0;
+    if dist < climb_nm + descent_nm {
+        return Err("This local route has too little room for the climb, descent and final turn. Choose a farther destination or a lower cruise altitude.".into());
+    }
+    let top = nav::project_latlon(
+        o.lat,
+        o.lon,
+        nav::bearing_deg(o.lat, o.lon, outer.0, outer.1),
+        dist - descent_nm,
+    );
+    let wp = |id: &str, p: (f64, f64), alt| Waypoint {
+        ident: id.into(),
+        lat: p.0,
+        lon: p.1,
+        alt,
+    };
+    let waypoints = vec![
+        o.clone(),
+        wp("XVLCR", top, cruise),
+        wp("XVLIF", outer, outer_alt),
+        wp("XVLFA", final_fix, cruise.min(dest.elev_ft + 2500.0)),
+        wp(&fp.destination, (lat, lon), dest.elev_ft),
+    ];
+    let mut terrain = Vec::new();
+    let mut distance_nm = 0.0;
+    for (leg, pair) in waypoints.windows(2).enumerate() {
+        let a = &pair[0];
+        let b = &pair[1];
+        let d = nav::haversine_nm(a.lat, a.lon, b.lat, b.lon);
+        distance_nm += d;
+        // Final eight miles belong to the proven autoland path; verify that
+        // corridor too, with a 3-degree path and a 50-foot threshold crossing.
+        let n = (d * 1852.0 / 150.0).ceil().max(1.0) as usize;
+        for i in 0..=n {
+            let f = i as f64 / n as f64;
+            let p = nav::project_latlon(
+                a.lat,
+                a.lon,
+                nav::bearing_deg(a.lat, a.lon, b.lat, b.lon),
+                d * f,
+            );
+            let floor = if leg == 0 {
+                // Conservative reachable climb; the takeoff supplies the
+                // first 500 feet, before the follower owns any lateral turn.
+                (origin.elev_ft
+                    + 500.0
+                    + (d * f - 3.0).max(0.0) / (cruise_kts + 30.0) * 60.0 * climb_fpm * 0.7)
+                    .min(cruise)
+                    - 500.0
+            } else if leg == 3 {
+                dest.elev_ft + 50.0 + d * (1.0 - f) * 300.0
+            } else {
+                // Lowest of a continuous descent and its end constraint.
+                b.alt.min(a.alt) - 1000.0
+            };
+            terrain.push((p, floor));
+        }
+    }
+    Ok(LocalRoute {
+        runway,
+        waypoints,
+        distance_nm,
+        terrain,
+    })
+}
+
+/// Every point must be measured, finite, and below the route's clearance floor.
+pub fn local_terrain_clear(route: &LocalRoute, heights: &[f64]) -> bool {
+    heights.len() == route.terrain.len()
+        && heights
+            .iter()
+            .zip(&route.terrain)
+            .all(|(h, (_, floor))| h.is_finite() && *h <= *floor)
+}
+
 /// Everything the brief and the plan are built from.
 #[derive(Debug, Clone)]
 pub struct Planned {
@@ -873,6 +1014,75 @@ mod tests {
         assert!(r.dest.is_none());
         assert!(r.origin.is_some());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn local_route_has_flyable_legs_and_refuses_missing_or_obstructed_terrain() {
+        let mut fp = planned().to_flight_plan();
+        fp.cruise_alt_ft = 3500.0;
+        fp.waypoints[0].lat = 0.0;
+        fp.waypoints[0].lon = 0.0;
+        fp.waypoints[1].lat = 1.2;
+        fp.waypoints[1].lon = 0.0;
+        let airport = nav::AirportInfo {
+            name: "Flat field".into(),
+            elev_ft: 0.0,
+            freqs: vec![],
+            runways: vec![nav::Runway {
+                ident_a: "36".into(),
+                ident_b: "18".into(),
+                lat_a: 1.2,
+                lon_a: 0.0,
+                lat_b: 1.23,
+                lon_b: 0.0,
+                width_m: 30.0,
+            }],
+        };
+        let route = local_route(&fp, &airport, &airport, 100.0, 700.0, 2000.0, None).unwrap();
+        assert_eq!(route.runway, "36");
+        let legs = crate::procedure::enroute_legs(
+            &route.waypoints,
+            &fp.origin,
+            &fp.destination,
+            fp.cruise_alt_ft,
+        );
+        assert_eq!(legs.len(), 3);
+        assert!(legs.iter().all(|l| l.fix.is_some()));
+        assert_eq!(legs.last().unwrap().alt1_ft, Some(2500.0));
+        let mut heights = vec![0.0; route.terrain.len()];
+        assert!(local_terrain_clear(&route, &heights));
+        assert!(!local_terrain_clear(&route, &heights[..heights.len() - 1]));
+        heights[10] = route.terrain[10].1 + 1.0;
+        assert!(!local_terrain_clear(&route, &heights));
+        heights[10] = f64::NAN;
+        assert!(!local_terrain_clear(&route, &heights));
+        assert!(local_route(&fp, &airport, &airport, 100.0, 20.0, 2000.0, None).is_err());
+        assert!(local_route(&fp, &airport, &airport, 100.0, 700.0, 100000.0, None).is_err());
+        let opposite = local_route(
+            &fp,
+            &airport,
+            &airport,
+            100.0,
+            700.0,
+            2000.0,
+            Some((180.0, 10.0)),
+        )
+        .unwrap();
+        assert_eq!(opposite.runway, "18");
+        assert!(opposite.distance_nm > route.distance_nm);
+    }
+
+    #[test]
+    fn local_shelf_survives_until_an_explicit_replacement_is_published() {
+        let mut fp = planned().to_flight_plan();
+        crate::simbrief::publish_plan(&fp);
+        assert_eq!(
+            crate::simbrief::local_plan().unwrap().destination,
+            fp.destination
+        );
+        fp.source = PlanSource::SimBrief;
+        crate::simbrief::publish_plan(&fp);
+        assert!(crate::simbrief::local_plan().is_none());
     }
 
     fn planned() -> Planned {

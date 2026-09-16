@@ -108,6 +108,7 @@ pub struct ApConfig {
     /// Service ceiling (ft MSL) — altitude targets above it are refused. From the
     /// airframe's reference figures; falls back to the GA default.
     pub service_ceiling_ft: f64,
+    pub flare_power: Option<crate::aircraft::FlarePowerProfile>,
 }
 
 impl Default for ApConfig {
@@ -116,6 +117,7 @@ impl Default for ApConfig {
             fd_commands: Vec::new(),
             ac_powered: false,
             service_ceiling_ft: DEFAULT_SERVICE_CEILING_FT,
+            flare_power: None,
         }
     }
 }
@@ -944,8 +946,9 @@ impl Tool for SetAltitude {
         };
         if engaged {
             Ok(format!(
-                "Roger — {power}{} {altitude:.0} feet.{terrain}",
-                movement.to_lowercase()
+                "Roger — {power}{} {altitude:.0} feet.{terrain}{}",
+                movement.to_lowercase(),
+                crate::interaction::route_continuation(crate::procedure::ACTIVE.load(std::sync::atomic::Ordering::Relaxed))
             ))
         } else {
             Ok(format!(
@@ -1205,9 +1208,16 @@ impl Tool for SetClimb {
             None => String::new(),
         };
         if engaged {
+            let following = crate::procedure::ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+            let rate_line = if following {
+                ", with descent or climb rate managed by the route follower".to_string()
+            } else {
+                format!(" at {fpm:.0} feet per minute")
+            };
             Ok(format!(
-                "Roger — {power}{} {altitude:.0} feet at {fpm:.0} feet per minute, leveling off there.{terrain}",
-                movement.to_lowercase()
+                "Roger — {power}{} {altitude:.0} feet{rate_line}, leveling off there.{terrain}{}",
+                movement.to_lowercase(),
+                crate::interaction::route_continuation(following)
             ))
         } else {
             Ok(format!(

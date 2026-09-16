@@ -213,6 +213,7 @@ impl Registry {
                 fd_commands: prep.flight_director,
                 ac_powered: prep.ac_powered,
                 service_ceiling_ft: ceiling,
+                flare_power: profile.flare_power,
             };
             tools.push(Box::new(autopilot::SetHeading { cfg: ap.clone() }));
             tools.push(Box::new(autopilot::Navigate { cfg: ap.clone() }));

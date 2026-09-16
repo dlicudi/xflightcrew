@@ -448,7 +448,23 @@ fn has(t: &str, word: &str) -> bool {
 /// flight flag. Request-shaped: the verb "fly" (or a full-auto phrase) is
 /// required, so "load the flight plan" (the GPS load) and "brief the flight
 /// plan" (the deterministic brief, handled upstream in main) never land here.
+pub fn resume_plan_request(t: &str) -> bool {
+    let t = normalize(t);
+    // Whisper's warts on the phrase ("Resume site plan.", 2026-09-16): the
+    // plan word misheard, or pluralised. Still the closed shape after that.
+    let t = t
+        .trim_end_matches(['.', '?', '!'])
+        .replace("site plan", "flight plan")
+        .replace("flight plans", "flight plan");
+    matches!(t.as_str(),
+        "resume the flight plan" | "resume flight plan" | "resume my flight plan"
+        | "resume the route" | "continue the flight plan")
+}
+
 fn flight_plan_call(t: &str) -> Option<ToolCall> {
+    if resume_plan_request(t) {
+        return Some(call("full_auto", json!({ "resume": true })));
+    }
     let plan_words = t.contains("flight plan")
         || t.contains("simbrief")
         || t.contains("sim brief")
@@ -1854,6 +1870,17 @@ mod tests {
             let c = v.remove(0);
             (c.name, c.arguments)
         })
+    }
+
+    #[test]
+    fn resume_plan_is_an_explicit_request_not_a_brief_or_echo() {
+        for words in ["resume the flight plan", "resume flight plan", "please resume my flight plan", "continue the flight plan", "Resume site plan.", "resume flight plans"] {
+            assert!(resume_plan_request(words), "{words}");
+            assert_eq!(one(words).unwrap(), ("full_auto".into(), json!({"resume": true})));
+        }
+        for words in ["load the flight plan", "what is the flight plan", "the copilot will resume the flight plan", "do not resume the flight plan", "resume the checklist", "resume flight plan tomorrow"] {
+            assert!(!resume_plan_request(words), "{words}");
+        }
     }
 
     #[test]

@@ -787,7 +787,7 @@ pub fn abort() -> bool {
     ABORT.store(true, Ordering::SeqCst);
     // Stand down whatever phase is live. The takeoff hands off silently (power
     // stays set); the procedure/autoland arrival aborts to the pilot.
-    autotakeoff::ACTIVE.store(false, Ordering::SeqCst);
+    autotakeoff::cancel();
     crate::procedure::abort();
     crate::autoland::abort();
     ACTIVE.swap(false, Ordering::SeqCst)
@@ -1894,7 +1894,19 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // Read before the move: `p.takeoff` goes into the takeoff loop below, and
     // the base leg needs to know whether this airframe HAS gear to lower.
     let retractable_gear = p.takeoff.retract_gear;
-    autotakeoff::start(base_url.clone(), voice.clone(), p.takeoff);
+    if !autotakeoff::start_scoped(
+        base_url.clone(),
+        voice.clone(),
+        p.takeoff,
+        xp.cancellation(),
+    ) {
+        stand_down(
+            &voice,
+            "The previous takeoff is still stopping. Your aircraft.",
+            "takeoff_busy",
+        );
+        return;
+    }
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         if ABORT.load(Ordering::SeqCst) {
@@ -1905,9 +1917,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             );
             return;
         }
-        if !autotakeoff::ACTIVE.load(Ordering::SeqCst) {
+        if !autotakeoff::running() {
             break;
         }
+    }
+    if autotakeoff::outcome() != Some(sim::run::Outcome::Completed) {
+        stand_down(
+            &voice,
+            "The takeoff handed control back. Your aircraft.",
+            "takeoff_not_completed",
+        );
+        return;
     }
     let agl_ft = xp.get_float(AGL_M).await.unwrap_or(0.0) * M_TO_FT;
     if agl_ft < AIRBORNE_MIN_AGL_FT {
@@ -2135,6 +2155,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         if turning_final && ready_for_autoland(x_m, a_m.abs(), hdg_err) {
             let alt_msl = field_elev_ft + agl_ft;
             let arr = ArrivalCtx {
+                xp: &xp,
                 apt_dat: &p.apt_dat,
                 cifp_dir: &p.cifp_dir,
                 fix_data_path: &p.fix_data_path,
@@ -2465,6 +2486,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
 /// time the arrival runs, `p.takeoff` has been moved into the takeoff loop and
 /// `&p` can no longer be borrowed whole.
 struct ArrivalCtx<'a> {
+    xp: &'a XPlaneClient,
     apt_dat: &'a str,
     cifp_dir: &'a str,
     fix_data_path: &'a str,
@@ -2541,9 +2563,12 @@ async fn try_published_arrival(
         Priority::Advisory,
         &format!("Joining {}.", plan.name),
     );
-    crate::procedure::ABORT.store(false, Ordering::SeqCst);
-    crate::procedure::start(base_url.to_string(), voice.clone(), plan);
-    true
+    crate::procedure::start_scoped(
+        base_url.to_string(),
+        voice.clone(),
+        plan,
+        arr.xp.cancellation(),
+    )
 }
 
 #[cfg(test)]
@@ -3682,7 +3707,11 @@ mod tests {
         let reach = climb_reach_ft(&route, 11.0, grad);
         // The reach grows along the route and starts from the field.
         assert!(reach.windows(2).all(|w| w[1] > w[0]));
-        assert!(reach[0] > 11.0 && reach[0] < 1000.0, "reach at wpt 0 {}", reach[0]);
+        assert!(
+            reach[0] > 11.0 && reach[0] < 1000.0,
+            "reach at wpt 0 {}",
+            reach[0]
+        );
         // A 1,130 ft ridge under the downwind needs 1,730 ft; the climb
         // reaches less than that by the end of the crosswind, so the route
         // is refused however high the pattern altitude.
@@ -3716,12 +3745,19 @@ mod tests {
                     w.x_m
                 );
             }
-            assert!(route[4].x_m.abs() < LXGB_ROCK_CLEAR_M * 0.5, "base inside the loop");
+            assert!(
+                route[4].x_m.abs() < LXGB_ROCK_CLEAR_M * 0.5,
+                "base inside the loop"
+            );
             assert!(route[5].x_m.abs() < 0.1);
             // The crosswind (leg 1) is the climb's leg: long enough at a
             // 172's gradient to reach a raised pattern altitude over water.
             let reach = climb_reach_ft(&route, 11.0, authored_climb_gradient(75.0));
-            assert!(reach[1] > 1600.0, "reach at the end of the crosswind {}", reach[1]);
+            assert!(
+                reach[1] > 1600.0,
+                "reach at the end of the crosswind {}",
+                reach[1]
+            );
         }
     }
 

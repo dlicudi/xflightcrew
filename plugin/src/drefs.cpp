@@ -332,6 +332,8 @@ static int g_pitch_deflect_frames = 0;
 static XPLMDataRef g_terrain_query_dref = nullptr;
 static XPLMDataRef g_terrain_elev_dref = nullptr;
 static XPLMDataRef g_terrain_gen_dref = nullptr;
+static XPLMDataRef g_terrain_valid_dref = nullptr;
+static bool g_terrain_valid = false;
 static TextRef g_terrain_query;
 static const int kTerrainMaxPts = 32;
 static float g_terrain_elev[kTerrainMaxPts];
@@ -494,6 +496,7 @@ static int ReadTerrainElev(void*, float* out, int offset, int max) {
     return n;
 }
 static int ReadTerrainGen(void*) { return g_terrain_gen; }
+static int ReadTerrainValid(void*) { return g_terrain_valid ? 1 : 0; }
 static float ReadPitch(void*) { return g_pitch; }
 static void WritePitch(void*, float v) {
     g_pitch = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
@@ -551,18 +554,23 @@ static float TaxiAssistLoop(float, float, int, void*) {
     // A pending terrain query: probe every point this frame and publish.
     // Scenery access is flight-loop-only, which is why the accessor merely
     // flagged it. Points a pattern-radius from the aircraft are always inside
-    // the loaded scenery region; a probe miss publishes 0 (sea level).
+    // the loaded scenery region. A miss invalidates the batch: zero must
+    // never impersonate measured sea level on a longer local flight.
     if (g_terrain_pending) {
         g_terrain_pending = false;
         if (g_terrain_probe == nullptr) g_terrain_probe = XPLMCreateProbe(xplm_ProbeY);
         char buf[sizeof g_terrain_query.buf];
         std::memcpy(buf, g_terrain_query.buf, sizeof buf);
         int n = 0;
+        g_terrain_valid = true;
         char* save = nullptr;
         for (char* tok = strtok_r(buf, "|", &save); tok && n < kTerrainMaxPts;
              tok = strtok_r(nullptr, "|", &save)) {
             double lat = 0.0, lon = 0.0;
-            if (std::sscanf(tok, "%lf,%lf", &lat, &lon) != 2) continue;
+            if (std::sscanf(tok, "%lf,%lf", &lat, &lon) != 2) {
+                g_terrain_valid = false;
+                continue;
+            }
             double x = 0.0, y = 0.0, z = 0.0;
             XPLMWorldToLocal(lat, lon, 0.0, &x, &y, &z);
             XPLMProbeInfo_t info;
@@ -576,10 +584,14 @@ static float TaxiAssistLoop(float, float, int, void*) {
                 XPLMLocalToWorld(info.locationX, info.locationY, info.locationZ,
                                  &plat, &plon, &palt);
                 elev_m = static_cast<float>(palt);
+                if (!std::isfinite(elev_m)) g_terrain_valid = false;
+            } else {
+                g_terrain_valid = false;
             }
             g_terrain_elev[n++] = elev_m;
         }
         g_terrain_n = n;
+        g_terrain_valid = g_terrain_valid && n > 0;
         g_terrain_gen++;
     }
 
@@ -1053,6 +1065,10 @@ void start() {
         "xcopilot/terrain/elev_m", xplmType_FloatArray, 0,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, ReadTerrainElev, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_terrain_valid_dref = XPLMRegisterDataAccessor(
+        "xcopilot/terrain/valid", xplmType_Int, 0,
+        ReadTerrainValid, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     g_terrain_gen_dref = XPLMRegisterDataAccessor(
         "xcopilot/terrain/gen", xplmType_Int, 0,
         ReadTerrainGen, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -1115,6 +1131,7 @@ void stop_first() {
     if (g_pitch_yield_dref) { XPLMUnregisterDataAccessor(g_pitch_yield_dref); g_pitch_yield_dref = nullptr; }
     if (g_terrain_query_dref) { XPLMUnregisterDataAccessor(g_terrain_query_dref); g_terrain_query_dref = nullptr; }
     if (g_terrain_elev_dref) { XPLMUnregisterDataAccessor(g_terrain_elev_dref); g_terrain_elev_dref = nullptr; }
+    if (g_terrain_valid_dref) { XPLMUnregisterDataAccessor(g_terrain_valid_dref); g_terrain_valid_dref = nullptr; }
     if (g_terrain_gen_dref) { XPLMUnregisterDataAccessor(g_terrain_gen_dref); g_terrain_gen_dref = nullptr; }
     if (g_terrain_probe) { XPLMDestroyProbe(g_terrain_probe); g_terrain_probe = nullptr; }
     if (g_roll_dref) { XPLMUnregisterDataAccessor(g_roll_dref); g_roll_dref = nullptr; }

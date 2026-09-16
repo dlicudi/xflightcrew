@@ -160,6 +160,15 @@ tools; YAML carries per-airframe config. Standing rules:
   led nothing, 2026-09-15); read names come from `datarefs::*`, and
   `cargo test -- --ignored real_install_names` checks every `"sim/..."`
   literal in the workspace against the install's DataRefs.txt/Commands.txt.
+  **The plugin's side of the wire contract is probed the same way**
+  (`health::PLUGIN_DATAREFS`, every `xcopilot/*` literal in the source,
+  test-pinned, on the profile probe's index fetch): a stale `.xpl` is said
+  at boot and shown red on Health. Editing `plugin/src` is not done until
+  `make -C plugin`, the install AND the reload have happened: the app read
+  `xcopilot/terrain/valid` for two days from a plugin built before it
+  existed, every terrain probe failed as a "timeout", the follower's floor
+  retired itself ten seconds after each takeoff, and the airborne resume
+  refused on the route (2026-09-16).
   **A failed read is NO measurement, never a plausible number**: a control
   loop skips the tick and blackboxes `null`. A "dataref" name may really
   be a command; read-only switch positions need read-before-fire toggle tools
@@ -635,7 +644,16 @@ history):
   (`home_tower_khz`) before it goes out: 45 s at the arrival's start, then
   DEFERRED and made at the swap while the approach flies (the region's
   nearest field held the frequency for ten more minutes across the strait
-  and the call went into the void), before the final report at the latest. **The crew's retune to the destination's tower ARMS
+  and the call went into the void), before the final report at the latest.
+  **But the ENROUTE leg makes it first when it can** (`inbound_due`,
+  `INBOUND_CALL_NM` 10 nm, `INBOUND_MADE`): once the region has handed us to
+  the destination's OWN tower (its apt.dat row, never whoever holds the
+  frequency) and the field is inside 10 nm, or the moment that tower asks
+  "say callsign and intentions" (`party_line::take_zone_challenge`, drained
+  every pass) - a plan whose last fix is a mile from the runway flew
+  Granada's whole zone through three challenges before the arrival stage
+  could call (LEJR-LEGR, 2026-09-15). A crossing field's challenge is
+  blackboxed `zone_challenge`, never answered "inbound". **The crew's retune to the destination's tower ARMS
   that station** (`station::arm_station_for_freq`, the pilot's "you call
   it, you get it" rule): the region pick weighs published services, so a
   tower-only strip beside a primary never wins the sky over its own runway

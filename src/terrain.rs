@@ -14,8 +14,11 @@
 
 use crate::xplane::XPlaneClient;
 
+static MAILBOX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const QUERY: &str = "xcopilot/terrain/query";
 const ELEV_M: &str = "xcopilot/terrain/elev_m";
+const VALID: &str = "xcopilot/terrain/valid";
 const GEN: &str = "xcopilot/terrain/gen";
 const M_TO_FT: f64 = 3.280_84;
 
@@ -29,6 +32,8 @@ pub async fn sample_ft(xp: &XPlaneClient, pts: &[(f64, f64)]) -> Option<Vec<f64>
     if pts.is_empty() {
         return Some(Vec::new());
     }
+    // Query/generation/result are one transaction shared by all flight loops.
+    let _mailbox = MAILBOX.lock().await;
     let pts = &pts[..pts.len().min(MAX_POINTS)];
     let gen0 = xp.get_float(GEN).await.ok()?;
     let q: String = pts
@@ -41,11 +46,8 @@ pub async fn sample_ft(xp: &XPlaneClient, pts: &[(f64, f64)]) -> Option<Vec<f64>
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if xp.get_float(GEN).await.ok()? > gen0 + 0.5 {
-            let v = xp.get_float_array(ELEV_M).await.ok()?;
-            if v.len() < pts.len() {
-                return None;
-            }
-            return Some(v.into_iter().take(pts.len()).map(|m| m * M_TO_FT).collect());
+            let (v, valid) = tokio::join!(xp.get_float_array(ELEV_M), xp.get_float(VALID));
+            return validated_heights(v.ok()?, valid.ok()?, pts.len());
         }
     }
     None
@@ -63,4 +65,26 @@ pub async fn max_elevation_ft(xp: &XPlaneClient, pts: &[(f64, f64)]) -> Option<f
         }
     }
     best
+}
+
+fn validated_heights(values: Vec<f64>, valid: f64, wanted: usize) -> Option<Vec<f64>> {
+    if !valid.is_finite()
+        || valid <= 0.5
+        || values.len() != wanted
+        || values.iter().any(|v| !v.is_finite())
+    {
+        return None;
+    }
+    Some(values.into_iter().map(|m| m * M_TO_FT).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_failed_probe_cannot_impersonate_measured_sea_level() {
+        assert_eq!(super::validated_heights(vec![0.0], 1.0, 1), Some(vec![0.0]));
+        assert_eq!(super::validated_heights(vec![0.0], 0.0, 1), None);
+        assert_eq!(super::validated_heights(vec![0.0], 1.0, 2), None);
+        assert_eq!(super::validated_heights(vec![f64::NAN], 1.0, 1), None);
+    }
 }

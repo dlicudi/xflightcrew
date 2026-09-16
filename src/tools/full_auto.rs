@@ -176,6 +176,8 @@ struct Args {
     /// true = fly the pilot's SimBrief flight plan instead of a circuit.
     #[serde(default)]
     flight: bool,
+    #[serde(default)]
+    resume: bool,
 }
 
 #[async_trait]
@@ -201,13 +203,13 @@ impl Tool for FullAuto {
             "properties": {
                 "off": {"type": "boolean", "description": "true = cancel full auto"},
                 "right": {"type": "boolean", "description": "true = right-hand pattern (circuit only)"},
-                "flight": {"type": "boolean", "description": "true = fly the SimBrief flight plan to its destination"}
+                "flight": {"type": "boolean", "description": "true = fly the SimBrief flight plan to its destination"},
+                "resume": {"type": "boolean", "description": "resume the loaded flight plan from a checked airborne rejoin"}
             }
         })
     }
 
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
-        use std::sync::atomic::Ordering::SeqCst;
         let a: Args = serde_json::from_value(args.clone()).unwrap_or_default();
         if a.off {
             return Ok(if crate::full_auto::abort() {
@@ -216,7 +218,7 @@ impl Tool for FullAuto {
                 "Full auto isn't running.".to_string()
             });
         }
-        if crate::full_auto::ACTIVE.load(SeqCst) {
+        if crate::full_auto::running() {
             return Ok("I'm already running the full sequence. Say cancel to stop.".to_string());
         }
         if ctx
@@ -228,7 +230,12 @@ impl Tool for FullAuto {
             return Ok("We're in replay. Go back to live and ask again.".to_string());
         }
 
-        let (mission, ack) = if a.flight {
+        let (mission, ack) = if a.resume {
+            match self.build_resume_mission(ctx).await {
+                Ok(v) => v,
+                Err(why) => return Ok(why),
+            }
+        } else if a.flight {
             match self.build_flight_mission(ctx).await {
                 Ok(v) => v,
                 Err(why) => return Ok(why),
@@ -339,17 +346,144 @@ impl Tool for FullAuto {
             )
             .engine_start_secs(),
         };
-        crate::full_auto::start(
+        if !crate::full_auto::start(
             ctx.config.xplane_base_url.clone(),
             ctx.config.clone(),
             ctx.voice.cloned(),
             sub,
-        );
+        ) {
+            return Ok(
+                "The previous automation is still stopping. Ask again once it has stopped."
+                    .to_string(),
+            );
+        }
         Ok(ack)
     }
 }
 
 impl FullAuto {
+    /// An explicit resume uses only the plan on the shelf. It never refetches,
+    /// starts engines or walks the ground stages against an airborne aircraft.
+    /// Every refusal is blackboxed with its reason (five in a row over the
+    /// Gulf of Lion, 2026-09-16, and the debrief could not say why).
+    async fn build_resume_mission(&self, ctx: &ToolCtx<'_>) -> std::result::Result<(Mission, String), String> {
+        let built = self.resume_mission_checked(ctx).await;
+        match &built {
+            Ok((_, ack)) => crate::full_auto::event("resume", json!({ "ack": ack })),
+            Err(why) => crate::full_auto::event("resume_refused", json!({ "why": why })),
+        }
+        built
+    }
+
+    async fn resume_mission_checked(&self, ctx: &ToolCtx<'_>) -> std::result::Result<(Mission, String), String> {
+        let fp = crate::simbrief::loaded_plan().ok_or_else(||
+            "No plan is loaded. I'm monitoring only; you have control. Load and review the flight plan first.".to_string())?;
+        if fp.source == crate::simbrief::PlanSource::Local {
+            return Err("This local route needs a fresh terrain-checked plan after interruption. I haven't taken control. Request an approach or land for me.".into());
+        }
+        let xp = crate::xplane::XPlaneClient::new(ctx.config.xplane_base_url.clone());
+        let (ground, agl, lat, lon, altitude, bank, ias, frozen, engines, aircraft, mag_var) = tokio::join!(
+            ctx.xplane.get_float(crate::datarefs::ON_GROUND_ANY),
+            ctx.xplane.get_float(crate::datarefs::AGL_METERS),
+            ctx.xplane.get_float(crate::datarefs::LATITUDE),
+            ctx.xplane.get_float(crate::datarefs::LONGITUDE),
+            ctx.xplane.get_float(crate::datarefs::ALTITUDE_FT),
+            ctx.xplane.get_float(crate::datarefs::BANK_DEG),
+            ctx.xplane.get_float(crate::datarefs::AIRSPEED_KTS),
+            async {
+                let (pause,replay) = tokio::join!(ctx.xplane.get_float(crate::datarefs::PAUSED), ctx.xplane.get_float(crate::datarefs::IS_IN_REPLAY));
+                !matches!((pause,replay), (Ok(p),Ok(r)) if p.is_finite() && r.is_finite() && p < 0.5 && r < 0.5)
+            },
+            ctx.xplane.get_float_array("sim/flightmodel/engine/ENGN_running"),
+            xp.get_string("sim/aircraft/view/acf_ICAO"),
+            ctx.xplane.get_float("sim/flightmodel/position/magnetic_variation"),
+        );
+        let Some([ground, agl, lat, lon, altitude, bank, ias]) = crate::control::measurements(
+            "resume", [ground, agl, lat, lon, altitude, bank, ias]) else {
+            return Err("I can't verify the aircraft state. I haven't taken control; try again once the sim is connected.".into());
+        };
+        // Each gate names itself: "stable flight" told a pilot in a 28 degree
+        // orbit nothing about what to change (2026-09-16).
+        let speed_floor = crate::aircraft::floored_target(self.approach_ias, crate::aircraft::speed_floor_kts());
+        let agl_ft = agl * 3.28084;
+        let gate = if frozen {
+            Some("We're paused or in replay. Go back to live and ask again; I haven't taken control.".to_string())
+        } else if ground > 0.5 {
+            Some("We're on the ground. Resume is for the air; say fly the flight plan for the whole mission.".to_string())
+        } else if agl_ft < 1000.0 {
+            Some(format!("Resume needs a thousand feet; we're {agl_ft:.0} feet above the ground. I haven't taken control."))
+        } else if bank.abs() > 20.0 {
+            Some(format!("Wings level first; we're in {:.0} degrees of bank. Then ask again. I haven't taken control.", bank.abs()))
+        } else if ias < speed_floor {
+            Some(format!("We're slow at {ias:.0} knots; resume needs {speed_floor:.0}. I haven't taken control."))
+        } else {
+            None
+        };
+        if let Some(why) = gate {
+            return Err(why);
+        }
+        if !engines.ok().is_some_and(|v| v.len() >= self.engines && v.iter().take(self.engines).all(|v| v.is_finite() && *v > 0.5)) {
+            return Err("I can't confirm all engines running. I haven't taken control; stabilise the aircraft first.".into());
+        }
+        if !aircraft.ok().is_some_and(|a| a.trim().eq_ignore_ascii_case(&fp.aircraft)) {
+            return Err("The loaded plan's aircraft doesn't match this aircraft. Review a matching plan first; you have control.".into());
+        }
+        let mut legs = crate::procedure::enroute_legs(&fp.waypoints, &fp.origin, &fp.destination, fp.cruise_alt_ft);
+        let index = crate::interaction::rejoin_index(&legs, lat, lon, mag_var.ok().filter(|v| v.is_finite()))?;
+        legs.drain(..index);
+        let first = legs.first().unwrap();
+        let fix = first.fix.as_ref().unwrap();
+        let distance = crate::nav::haversine_nm(lat, lon, fix.lat, fix.lon);
+        if distance > 30.0 {
+            return Err("The next fix is too far away to verify the rejoin terrain. I haven't taken control; follow the GPS or request an approach.".into());
+        }
+        let target = first.alt1_ft.unwrap_or(fp.cruise_alt_ft);
+        if !target.is_finite() || target <= 0.0 || target > self.cfg.service_ceiling_ft {
+            return Err("The resumed altitude is outside this aircraft's limits. Review the plan; you have control.".into());
+        }
+        // Use the LOWER of present/target true altitude over the complete join.
+        let true_ft = xp.get_float("sim/flightmodel/position/elevation").await
+            .map_err(|_| "True altitude unavailable; I haven't taken control.".to_string())? * 3.28084;
+        let floor = altitude.min(target) + (true_ft-altitude) - 1000.0;
+        if !floor.is_finite() { return Err("Altitude unavailable; I haven't taken control.".into()); }
+        let count = ((distance*1852.0/150.0).ceil() as usize).max(1);
+        let points: Vec<_> = (0..=count).map(|i| {
+            let f=i as f64/count as f64;
+            (lat+(fix.lat-lat)*f, lon+(fix.lon-lon)*f)
+        }).collect();
+        for chunk in points.chunks(crate::terrain::MAX_POINTS) {
+            let terrain = crate::terrain::sample_ft(&xp, chunk).await.ok_or_else(||
+                "The terrain probe isn't answering, so I can't check the rejoin. I haven't taken control. Check the plugin build on the Health screen.".to_string())?;
+            if terrain.iter().any(|h| !h.is_finite() || *h > floor) {
+                return Err("The rejoin lacks terrain clearance at the planned altitude. I haven't taken control.".into());
+            }
+        }
+        let apt = ctx.config.apt_data_path.clone();
+        let cifp = ctx.config.cifp_dir.clone();
+        let fixes = ctx.config.fix_data_path.clone();
+        let dest = fp.destination.clone();
+        let arrival = tokio::task::spawn_blocking(move || crate::full_auto::brief_arrival(&apt,&cifp,&fixes,&dest))
+            .await.map_err(|_| "Arrival verification failed; you have control.".to_string())??;
+        // Probes can take time: never arm from a position that has moved away
+        // from the verified join while the pilot was waiting.
+        let (new_lat, new_lon, new_alt) = tokio::join!(
+            xp.get_float(crate::datarefs::LATITUDE),
+            xp.get_float(crate::datarefs::LONGITUDE),
+            xp.get_float(crate::datarefs::ALTITUDE_FT),
+        );
+        let Some([new_lat, new_lon, new_alt]) = crate::control::measurements(
+            "resume_recheck", [new_lat, new_lon, new_alt]) else {
+            return Err("Connection changed during verification. I haven't taken control.".into());
+        };
+        if crate::nav::haversine_nm(lat, lon, new_lat, new_lon) > 1.0 || (new_alt-altitude).abs() > 200.0 {
+            return Err("The aircraft moved beyond the verified rejoin. I haven't taken control; stabilise and try again.".into());
+        }
+        let ack = format!("Resuming toward {} at {:.0} feet, continuing to {} and the arrival. {} Say my controls to take over.", fix.ident,target,fp.destination,arrival);
+        let payload=fp.waypoints.iter().map(|w| format!("{},{:.4},{:.4},{}",w.ident,w.lat,w.lon,w.alt as i64)).collect::<Vec<_>>().join("|");
+        Ok((Mission::Resume(Route { dest_icao: fp.destination.clone(), dest_name: fp.destination,
+            legs, fms_payload: payload, local_runway: None }),ack))
+    }
+
     /// Fetch the SimBrief OFP and distil it to a flyable [`Mission::Flight`] —
     /// or an honest spoken refusal (no plan, no waypoints, or a plan that
     /// departs somewhere we aren't).
@@ -374,18 +508,20 @@ impl FullAuto {
                     .to_string(),
             );
         }
-        if ctx.config.simbrief_id.trim().is_empty() {
-            return Err(
-                "No SimBrief ID set. Add XCOPILOT_SIMBRIEF_ID and I can fly your plan.".to_string(),
-            );
-        }
-        let fp = crate::simbrief::fetch(&ctx.config.simbrief_id)
-            .await
-            .map_err(|e| {
-                tracing::warn!("simbrief fetch failed: {e:#}");
-                "Couldn't fetch your SimBrief plan. Generate one first, or check the ID."
-                    .to_string()
-            })?;
+        let mut fp = if let Some(local) = crate::simbrief::local_plan() {
+            local
+        } else {
+            if ctx.config.simbrief_id.trim().is_empty() {
+                return Err("No flight plan. Say plan a flight to, and a destination, or configure SimBrief.".into());
+            }
+            crate::simbrief::fetch(&ctx.config.simbrief_id)
+                .await
+                .map_err(|e| {
+                    tracing::warn!("simbrief fetch failed: {e:#}");
+                    "Couldn't fetch your SimBrief plan. Generate one first, or check the ID."
+                        .to_string()
+                })?
+        };
 
         // The plan must depart from where we're parked — flying LEJR's route
         // out of some other field would thread the wrong corridor entirely.
@@ -415,19 +551,6 @@ impl FullAuto {
             ));
         }
 
-        let legs = crate::procedure::enroute_legs(
-            &fp.waypoints,
-            &fp.origin,
-            &fp.destination,
-            fp.cruise_alt_ft,
-        );
-        if legs.is_empty() {
-            return Err(format!(
-                "Your plan to {} has no enroute waypoints I can fly. Generate it with a route.",
-                fp.destination
-            ));
-        }
-
         // Both fields from one blocking pass: the destination's name for the
         // ack, and each end's longest runway for the preflight.
         let (origin_apt, dest_apt) = {
@@ -445,6 +568,69 @@ impl FullAuto {
             .await
             .unwrap_or((None, None))
         };
+        let local_runway = if fp.source == crate::simbrief::PlanSource::Local {
+            let origin = origin_apt
+                .as_ref()
+                .ok_or("The origin airport is missing from the data.")?;
+            let dest = dest_apt
+                .as_ref()
+                .ok_or("The destination airport is missing from the data.")?;
+            let speed = self
+                .cruise_ias_kts
+                .ok_or("The airframe needs a cruise speed to plan this local flight.")?;
+            let route = crate::flightplan::local_route(
+                &fp,
+                origin,
+                dest,
+                speed,
+                self.climb_fpm,
+                crate::flightplan::runway_needed_ft(
+                    self.landing_distance_ft,
+                    self.takeoff_distance_ft,
+                )
+                .unwrap_or(0.0),
+                crate::weather::surface_wind(&super::autoland::xplane_root(), &fp.destination),
+            )?;
+            let xp = crate::xplane::XPlaneClient::new(ctx.config.xplane_base_url.clone());
+            let mut heights = Vec::new();
+            for chunk in route.terrain.chunks(crate::terrain::MAX_POINTS) {
+                let pts: Vec<_> = chunk.iter().map(|(p, _)| *p).collect();
+                heights.extend(crate::terrain::sample_ft(&xp, &pts).await
+                    .ok_or("I can't verify terrain along the local route. The updated plugin and loaded scenery are required.")?);
+            }
+            if !crate::flightplan::local_terrain_clear(&route, &heights) {
+                return Err("Terrain blocks the local climb or arrival corridor. Choose another destination or route.".into());
+            }
+            // Price the authored track, including the final alignment, into
+            // the same preflight fuel check. Reserve stays untouched.
+            if fp.distance_nm > 0.0 {
+                let extra = fp.trip_fuel_gal * (route.distance_nm / fp.distance_nm - 1.0).max(0.0);
+                fp.trip_fuel_gal += extra;
+                fp.block_fuel_gal += extra;
+                fp.block_fuel_kg += extra * 2.72;
+                fp.min_takeoff_fuel_kg += extra * 2.72;
+                fp.ete_min *= route.distance_nm / fp.distance_nm;
+            }
+            fp.distance_nm = route.distance_nm;
+            fp.waypoints = route.waypoints;
+            Some(route.runway)
+        } else {
+            None
+        };
+
+        let legs = crate::procedure::enroute_legs(
+            &fp.waypoints,
+            &fp.origin,
+            &fp.destination,
+            fp.cruise_alt_ft,
+        );
+        if legs.is_empty() {
+            return Err(format!(
+                "Your plan to {} has no enroute waypoints I can fly. Generate it with a route.",
+                fp.destination
+            ));
+        }
+
         let dest_name = dest_apt
             .as_ref()
             .map(|a| a.name.trim().to_string())
@@ -507,7 +693,12 @@ impl FullAuto {
         // full auto will do there. Found at the gate, it is a briefing item;
         // found 25 nm out, it was a crash (Gibraltar, 2026-09-11). A
         // destination the data can't land at is refused here, not there.
-        let arrival = {
+        let arrival = if let Some(runway) = &local_runway {
+            format!(
+                "I'll fly the checked visual final on runway {}.",
+                crate::circuit::spell_runway(runway)
+            )
+        } else {
             let (apt, cifp, fixp, dest) = (
                 ctx.config.apt_data_path.clone(),
                 ctx.config.cifp_dir.clone(),
@@ -520,6 +711,8 @@ impl FullAuto {
             .await
             .map_err(|e| format!("The arrival brief failed: {e}"))??
         };
+
+        crate::simbrief::publish_plan(&fp);
 
         let n = legs.len();
         let preflight = if preflight.is_empty() {
@@ -546,6 +739,7 @@ impl FullAuto {
                 dest_name,
                 legs,
                 fms_payload,
+                local_runway,
             }),
             ack,
         ))

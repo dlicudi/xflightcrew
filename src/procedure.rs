@@ -28,6 +28,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::autoland::true_to_mag;
+use crate::control::{measurements, set_confirmed};
 use crate::nav::ProcLeg;
 use crate::tools::autopilot::ApConfig;
 use crate::voice::{Priority, Voice};
@@ -69,6 +70,14 @@ const CAPTURE_NM: f64 = 0.8;
 const ALT_MARGIN_FT: f64 = 150.0;
 
 /// True while the procedure follower runs.
+static RUN: sim::run::Slot = sim::run::Slot::new();
+pub fn running() -> bool {
+    RUN.running()
+}
+pub fn outcome() -> Option<sim::run::Outcome> {
+    RUN.outcome()
+}
+
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Set true to cancel ("cancel" / "my controls").
 pub static ABORT: AtomicBool = AtomicBool::new(false);
@@ -248,6 +257,7 @@ pub enum AltOwner {
 /// returns whether one was running. Autoland (if the approach handed off) is
 /// aborted too — the pilot gets the aircraft.
 pub fn abort() -> bool {
+    RUN.cancel();
     ABORT.store(true, Ordering::SeqCst);
     crate::autoland::abort();
     ACTIVE.swap(false, Ordering::SeqCst)
@@ -803,12 +813,27 @@ pub fn approach_flyable_from(plan: &Plan, lat: f64, lon: f64, alt_ft: f64) -> bo
 }
 
 /// Spawn the follower on its own thread + runtime + client, the circuit's shape.
-pub fn start(base_url: String, voice: Option<Voice>, plan: Plan) {
+pub fn start_scoped(
+    base_url: String,
+    voice: Option<Voice>,
+    plan: Plan,
+    parents: Vec<std::sync::Arc<AtomicBool>>,
+) -> bool {
+    let Some(lease) = RUN.begin() else {
+        return false;
+    };
     if ACTIVE.swap(true, Ordering::SeqCst) {
-        return;
+        return false;
     }
     ABORT.store(false, Ordering::SeqCst);
     std::thread::spawn(move || {
+        let _lease = lease.with_cleanup(&ACTIVE, || {
+            publish_leg(None);
+            publish_tod(None);
+            clear_pilot_altitude();
+            publish_terrain_floor(None);
+            crate::tools::speedhold::release();
+        });
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -817,7 +842,9 @@ pub fn start(base_url: String, voice: Option<Voice>, plan: Plan) {
             return;
         };
         rt.block_on(fly(
-            XPlaneClient::new(base_url.clone()),
+            XPlaneClient::new(base_url.clone())
+                .with_cancel(_lease.cancel.clone())
+                .with_parents(parents),
             base_url,
             voice,
             plan,
@@ -826,6 +853,7 @@ pub fn start(base_url: String, voice: Option<Voice>, plan: Plan) {
         publish_leg(None);
         publish_tod(None);
     });
+    true
 }
 
 fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
@@ -836,6 +864,11 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 }
 
 fn stand_down(voice: &Option<Voice>, line: &str, reason: &str) {
+    RUN.record(if reason == "abort" {
+        sim::run::Outcome::Cancelled
+    } else {
+        sim::run::Outcome::Failed(reason.into())
+    });
     ACTIVE.store(false, Ordering::SeqCst);
     clear_pilot_altitude();
     publish_terrain_floor(None);
@@ -847,6 +880,20 @@ fn stand_down(voice: &Option<Voice>, line: &str, reason: &str) {
         serde_json::json!({"event": "stand_down", "reason": reason}),
     );
     alert(voice, Priority::Caution, line);
+}
+
+/// Share the circuit's turn reversal law, preserving the slew anchor on failure.
+async fn steer_heading(
+    xp: &dyn crate::xplane::XPlane,
+    bug: &mut f64,
+    target: f64,
+    heading: f64,
+    bank: f64,
+) {
+    let next = crate::circuit::bug_toward(*bug, target, heading, bank, 40.0);
+    if xp.set_float(HDG_BUG, next).await.is_ok() {
+        *bug = next;
+    }
 }
 
 async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Plan) {
@@ -889,30 +936,35 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     );
     alert(&voice, Priority::Advisory, &format!("Flying {name}."));
 
-    // Engage the AP: servos + heading; vertical is VS-mode + dial (the
-    // takeoff's proven recipe — `altitude_hold` holds the CURRENT altitude in
-    // X-Plane, not the dial, and never flew a constraint; the circuit's
-    // pattern flew flat at handoff height for the same reason, 2026-07-24).
+    // Seed from real instruments BEFORE engaging anything. An unconstrained
+    // first leg holds indicated altitude, just like subsequent legs.
+    let (var, psi, alt) = tokio::join!(
+        xp.get_float(MAG_VAR),
+        xp.get_float(PSI_TRUE),
+        xp.get_float(ALT_IND_FT),
+    );
+    let Some([mag_var, psi_seed, mut carry_alt]) = measurements("procedure", [var, psi, alt])
+    else {
+        stand_down(
+            &voice,
+            "Flight instruments unavailable. Your aircraft.",
+            "seed_unread",
+        );
+        return;
+    };
+    let mut bug_mag = true_to_mag(psi_seed, mag_var);
+    if !set_confirmed("procedure", &xp, HDG_BUG, bug_mag, &mut None, 0.0).await {
+        stand_down(
+            &voice,
+            "Heading selection failed. Your aircraft.",
+            "seed_unconfirmed",
+        );
+        return;
+    }
     let _ = xp.run_command(CMD_SERVOS_ON).await;
-    if xp.get_float(HDG_STATUS).await.unwrap_or(0.0) <= 0.5 {
+    if xp.get_float(HDG_STATUS).await.is_ok_and(|v| v <= 0.5) {
         let _ = xp.run_command(CMD_HDG_MODE).await;
     }
-    let mag_var = xp.get_float(MAG_VAR).await.unwrap_or(0.0);
-    // The heading bug is SLEWED, never jumped: a single write across the
-    // 0/360 seam reads as a long-way dial spin to the sim's AP (the circuit's
-    // 270-degree wrong-way turn, 2026-07-24). And the slew must START AT THE
-    // AIRCRAFT'S NOSE, never at the dial's read: seeding from a failed read
-    // (unwrap_or(0.0)) walked the dial clockwise from zero to a target 22°
-    // to our LEFT, the AP honored the spin direction, and the aircraft flew
-    // a full 340° right orbit over Jerez before converging (16:59Z,
-    // 2026-07-24). Snapping the dial to psi first is safe whatever the jump
-    // (the AP is already pointing there, so the inferred direction moves it
-    // nowhere), and every subsequent step is unambiguous.
-    let psi_seed = xp.get_float(PSI_TRUE).await.unwrap_or(0.0);
-    let mut bug_mag = true_to_mag(psi_seed, mag_var);
-    let _ = xp.set_float(HDG_BUG, bug_mag).await;
-    // Carry starts at the current altitude so an unconstrained first leg holds.
-    let mut carry_alt = xp.get_float(ELEV_M).await.unwrap_or(0.0) * M_TO_FT;
     // What we COMMANDED last tick, a different thing from the leg constraint
     // carried across unconstrained fixes, and the pacing `descent_target_ft`
     // actually needs. They were one variable until 2026-09-13, and since
@@ -951,6 +1003,10 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     }
 
     let mut idx = 0usize;
+    let mut closure: Option<(usize, crate::circuit::Closure)> = None;
+    let mut stalls = 0u32;
+    let mut progress_s = 0.0;
+    let mut tick_clock = std::time::Instant::now();
     // The FMS is sequenced once per leg, when the follower first steers at it.
     let mut fms_leg: Option<usize> = None;
     // Terrain look-ahead: probed on its own slow cadence (the ground does not
@@ -964,16 +1020,17 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     let mut said_alt_hold = false;
     while idx < legs.len() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if ABORT.load(Ordering::SeqCst) {
+        if xp.cancelled() || ABORT.load(Ordering::SeqCst) {
             stand_down(&voice, "Cancelled. Your aircraft.", "abort");
             return;
         }
         // A frozen sim (pause/replay) suspends the sequence; the AP holds.
         if crate::xplane::sim_frozen(&xp).await {
+            tick_clock = std::time::Instant::now();
             continue;
         }
 
-        let (lat, lon, elev_m, alt_ind, psi_r, hpath_r, agl_m, vs_st, hdg_st, ias_r, gs_r) = tokio::join!(
+        let (lat, lon, elev_m, alt_ind, psi_r, hpath_r, agl_m, vs_st, hdg_st, ias_r, gs_r, phi_r) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
             xp.get_float(ELEV_M),
@@ -985,14 +1042,24 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             xp.get_float(HDG_STATUS),
             xp.get_float(IAS),
             xp.get_float(GS_MS),
+            xp.get_float(crate::datarefs::BANK_DEG),
         );
-        let (Ok(lat), Ok(lon)) = (lat, lon) else {
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(tick_clock).as_secs_f64();
+        tick_clock = now;
+        let Some([lat, lon, elev_m, alt_ft, psi, agl_m, vs_st, hdg_st, ias, gs, phi]) =
+            measurements(
+                "procedure",
+                [
+                    lat, lon, elev_m, alt_ind, psi_r, agl_m, vs_st, hdg_st, ias_r, gs_r, phi_r,
+                ],
+            )
+        else {
             continue;
         };
-        // Fly the ALTIMETER; true altitude stays for the terrain floor only.
-        let true_alt_ft = elev_m.unwrap_or(0.0) * M_TO_FT;
-        let alt_ft = alt_ind.unwrap_or(true_alt_ft);
-        let agl_ft = agl_m.unwrap_or(0.0) * M_TO_FT;
+        progress_s += dt;
+        let true_alt_ft = elev_m * M_TO_FT;
+        let agl_ft = agl_m * M_TO_FT;
 
         let leg = &legs[idx];
 
@@ -1019,8 +1086,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // --- Lateral: steer the great-circle track to the fix, wind-crabbed so
         // the AP holds the GROUND track (the circuit's downwind lesson). A
         // to-altitude leg holds its own magnetic course.
-        let psi_v = psi_r.ok();
-        let crab = match (psi_v, hpath_r.ok()) {
+        let psi_v = Some(psi);
+        let crab = match (psi_v, hpath_r.ok().filter(|v| v.is_finite())) {
             (Some(psi), Some(hp)) => {
                 (((psi - hp + 540.0).rem_euclid(360.0)) - 180.0).clamp(-25.0, 25.0)
             }
@@ -1036,16 +1103,48 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // course is already magnetic; add crab to hold it as a track.
             leg.course_mag.map(|c| (c + crab).rem_euclid(360.0))
         };
+        if let Some(d) = dist_nm.filter(|_| !leg_captured(leg, dist_nm, alt_ft)) {
+            if closure.as_ref().is_none_or(|(i, _)| *i != idx) {
+                closure = Some((idx, crate::circuit::Closure::new(d * 1852.0, progress_s)));
+            }
+            if closure.as_mut().unwrap().1.stalled(d * 1852.0, progress_s) {
+                stalls += 1;
+                crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({
+                        "event": "leg_stalled", "idx": idx, "dist_nm": d, "stalls": stalls,
+                    }),
+                );
+                let heading = true_to_mag(psi, mag_var);
+                if xp.set_float(HDG_BUG, heading).await.is_ok() {
+                    bug_mag = heading;
+                }
+                if stalls < 3 {
+                    alert(
+                        &voice,
+                        Priority::Caution,
+                        "Not closing on the next fix. Rejoining.",
+                    );
+                    continue;
+                }
+                let _ = xp.set_float(VS_DIAL, 0.0).await;
+                stand_down(
+                    &voice,
+                    "Not closing on the next fix. Your aircraft.",
+                    "leg_stalled",
+                );
+                return;
+            }
+        }
         if let Some(t) = target_mag {
-            bug_mag = crate::circuit::slew_bug(bug_mag, t, 40.0);
-            let _ = xp.set_float(HDG_BUG, bug_mag).await;
+            steer_heading(&xp, &mut bug_mag, t, true_to_mag(psi, mag_var), phi).await;
         }
         // The lateral mode must actually be ON for the bug to mean anything —
         // the circuit's guard, which this follower LACKED: an AP disconnect
         // mid-climb left the servos off with only the VS re-engage watching,
         // and the aircraft spiralled at 20°/s while the loop slewed a bug
         // nobody was following (LEJR enroute, 2026-07-24).
-        if hdg_st.unwrap_or(1.0) <= 0.5 {
+        if hdg_st <= 0.5 {
             let _ = xp.run_command(CMD_SERVOS_ON).await;
             let _ = xp.run_command(CMD_HDG_MODE).await;
             crate::blackbox::record(
@@ -1061,7 +1160,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // levels off AT the constraint instead of a stale value.
         // A DESCENT waits for its top-of-descent instead of starting the
         // moment the leg arms — the constraint is at the FIX, not here.
-        let gs_kts = gs_r.map(|v| v * MS_TO_KTS).unwrap_or(0.0);
+        let gs_kts = gs * MS_TO_KTS;
 
         // --- Terrain: probe the ground AHEAD along the track and never command
         // an altitude into it. Skipped on an approach, whose own procedure owns
@@ -1087,7 +1186,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     terrain_misses = 0;
                     publish_terrain_floor(Some(ground + TERRAIN_CLEARANCE_FT))
                 }
-                None if !terrain_probe_fatal(&mut terrain_misses, crate::xplane::sim_frozen(&xp).await) => {
+                None if !terrain_probe_fatal(
+                    &mut terrain_misses,
+                    crate::xplane::sim_frozen(&xp).await,
+                ) =>
+                {
                     // A probe the sim never answered because it was FROZEN is
                     // no verdict on the plugin: the pilot paused 0.6 s after
                     // the query went out, the two-second wait ran into the
@@ -1100,11 +1203,19 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     );
                 }
                 None => {
+                    // Said aloud: a floor that retires in silence is a
+                    // safety feature the pilot believes is still on (two
+                    // days of flights without one, 2026-09-16).
                     terrain_available = false;
                     publish_terrain_floor(None);
                     crate::blackbox::record(
                         "procedure",
                         serde_json::json!({"event": "terrain_probe_unavailable"}),
+                    );
+                    alert(
+                        &voice,
+                        Priority::Caution,
+                        "The terrain probe isn't answering. No terrain floor for the rest of this flight; I'll hold the plan's altitudes. Check the plugin build.",
                     );
                 }
             }
@@ -1166,31 +1277,38 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 }
             }
         }
-        if last_alt_dial.is_none_or(|v| (v - want_alt).abs() > 50.0) {
-            let _ = xp.set_float(ALT_DIAL, want_alt).await;
-            last_alt_dial = Some(want_alt);
+        if !set_confirmed(
+            "procedure",
+            &xp,
+            ALT_DIAL,
+            want_alt,
+            &mut last_alt_dial,
+            50.0,
+        )
+        .await
+        {
+            continue;
         }
         // Speed-protected: VS mode holds RATE whatever the airspeed, so the
         // climb rate backs off as IAS sags below Vy (the takeoff's own law,
         // floored positive) — the unprotected 700 fpm stalled the LEJR climb.
         let mut vs_cmd = ((want_alt - alt_ft) * 3.0).clamp(-700.0, 700.0);
         if vs_cmd > 0.0 && vy_kts > 0.0 {
-            if let Ok(ias) = ias_r {
-                vs_cmd = vs_cmd.min(crate::autotakeoff::climb_vs_fpm(ias, vy_kts, vs_cmd));
-            }
+            vs_cmd = vs_cmd.min(crate::autotakeoff::climb_vs_fpm(ias, vy_kts, vs_cmd));
         }
-        if vs_st.unwrap_or(1.0) <= 0.5 {
+        if vs_st <= 0.5 {
             // VS mode gone NEAR the target means the preselect CAPTURED —
             // its hold is the clean level-off, leave it flying. Far from the
             // target it's a dropped mode: re-engage and rewrite the dial.
             if (want_alt - alt_ft).abs() > 100.0 {
-                let _ = xp.run_command(CMD_VS_MODE).await;
-                last_vs_cmd = None; // engage synced the dial; force a rewrite
+                last_vs_cmd = None; // engage can sync the dial even if the response is lost
+                if xp.run_command(CMD_VS_MODE).await.is_err() {
+                    continue;
+                }
             }
         }
-        if last_vs_cmd.is_none_or(|v| (v - vs_cmd).abs() > 40.0) {
-            let _ = xp.set_float(VS_DIAL, vs_cmd).await;
-            last_vs_cmd = Some(vs_cmd);
+        if !set_confirmed("procedure", &xp, VS_DIAL, vs_cmd, &mut last_vs_cmd, 40.0).await {
+            continue;
         }
         let owner = if v.floored.is_some() {
             AltOwner::Terrain
@@ -1239,7 +1357,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 // so no tick has two writers on the lever.
                 crate::tools::speedhold::release();
                 crate::autoland::ABORT.store(false, Ordering::SeqCst);
-                crate::autoland::run_autoland(
+                crate::autoland::run_autoland_scoped(
                     base_url.clone(),
                     apt_dat.clone(),
                     cfg.clone(),
@@ -1247,9 +1365,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     voice.clone(),
                     None,
                     rwy_id.clone(),
+                    xp.cancellation(),
                 );
                 clear_pilot_altitude();
                 publish_terrain_floor(None);
+                RUN.record(sim::run::Outcome::HandedOff);
                 ACTIVE.store(false, Ordering::SeqCst);
                 return;
             }
@@ -1287,6 +1407,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         }
     }
 
+    RUN.record(if matches!(end, EndAction::Approach { .. }) {
+        sim::run::Outcome::Failed("approach ended without handoff".into())
+    } else {
+        sim::run::Outcome::Completed
+    });
     // Ran off the end of the legs (a departure, or an approach with no handoff).
     // Drop any cruise-power hold before handing back (no-op if never armed).
     crate::tools::speedhold::release();
@@ -1343,6 +1468,113 @@ pub fn terrain_probe_fatal(misses: &mut u32, frozen: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_or_nonfinite_instruments_never_reach_the_laws() {
+        for missing in 0..11 {
+            let values = std::array::from_fn(|i| {
+                if i == missing {
+                    Err(anyhow::anyhow!("read failed"))
+                } else {
+                    Ok(100.0)
+                }
+            });
+            assert!(measurements::<11>("procedure", values).is_none());
+        }
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(measurements("procedure", [Ok(8000.0), Ok(invalid)]).is_none());
+        }
+        assert_eq!(
+            measurements("procedure", [Ok(0.0), Ok(-100.0)]),
+            Some([0.0, -100.0])
+        );
+    }
+
+    // Inject failures at the actual write/read boundary, including a sim that
+    // acknowledges PATCH but silently keeps its old dial value.
+    struct DialIo {
+        value: std::sync::Mutex<f64>,
+        writes: std::sync::atomic::AtomicUsize,
+        failure: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::xplane::XPlane for DialIo {
+        async fn get_float(&self, _: &str) -> anyhow::Result<f64> {
+            if self.failure.load(Ordering::SeqCst) == 2 {
+                anyhow::bail!("read failed");
+            }
+            Ok(*self.value.lock().unwrap())
+        }
+        async fn set_float(&self, _: &str, value: f64) -> anyhow::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            match self.failure.load(Ordering::SeqCst) {
+                1 => anyhow::bail!("write failed"),
+                3 => (),
+                _ => *self.value.lock().unwrap() = value,
+            }
+            Ok(())
+        }
+        async fn set_int(&self, _: &str, _: i64) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn run_command(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn run_command_for(&self, _: &str, _: f64) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn get_float_array(&self, _: &str) -> anyhow::Result<Vec<f64>> {
+            unreachable!()
+        }
+        async fn set_int_array_elem(&self, _: &str, _: usize, _: i64) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn set_float_array_elem(&self, _: &str, _: usize, _: f64) -> anyhow::Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn follower_rolls_out_before_reversing_and_preserves_failed_slew_anchor() {
+        let io = DialIo {
+            value: std::sync::Mutex::new(302.4),
+            writes: std::sync::atomic::AtomicUsize::new(0),
+            failure: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut bug = 302.4;
+        steer_heading(&io, &mut bug, 276.5, 300.5, 4.3).await;
+        assert!((bug - 300.5).abs() < 0.01);
+        assert!((*io.value.lock().unwrap() - 300.5).abs() < 0.01);
+        io.failure.store(1, Ordering::SeqCst);
+        steer_heading(&io, &mut bug, 276.5, 300.5, 2.0).await;
+        assert!((bug - 300.5).abs() < 0.01);
+        io.failure.store(0, Ordering::SeqCst);
+        steer_heading(&io, &mut bug, 276.5, 300.5, 2.0).await;
+        assert!((bug - 276.5).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn failed_or_refused_dial_writes_retry_the_same_target_after_recovery() {
+        for name in [ALT_DIAL, VS_DIAL] {
+            for failure in [1, 2, 3] {
+                let io = DialIo {
+                    value: std::sync::Mutex::new(0.0),
+                    writes: std::sync::atomic::AtomicUsize::new(0),
+                    failure: std::sync::atomic::AtomicUsize::new(failure),
+                };
+                let mut last = Some(0.0);
+                assert!(!set_confirmed("procedure", &io, name, 700.0, &mut last, 40.0).await);
+                assert_eq!(last, None);
+                io.failure.store(0, Ordering::SeqCst);
+                assert!(set_confirmed("procedure", &io, name, 700.0, &mut last, 40.0).await);
+                assert_eq!(*io.value.lock().unwrap(), 700.0);
+                assert_eq!(io.writes.load(Ordering::SeqCst), 2);
+                assert!(set_confirmed("procedure", &io, name, 700.0, &mut last, 40.0).await);
+                assert_eq!(io.writes.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
 
     /// The one formula the follower's law, the advisor and the spoken answer
     /// all read: LEJR-LXGB, 7,000 ft to 27D10 at 3,143 ft, 113 kt over the

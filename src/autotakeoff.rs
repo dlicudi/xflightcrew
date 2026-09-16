@@ -245,6 +245,18 @@ const GEAR_UP_AGL_FT: f64 = 200.0;
 
 /// True while the takeoff loop runs. Cleared by the loop, the release path
 /// in main ("my controls" — silent stand-down), or the tool's off switch.
+static RUN: sim::run::Slot = sim::run::Slot::new();
+pub fn running() -> bool {
+    RUN.running()
+}
+pub fn outcome() -> Option<sim::run::Outcome> {
+    RUN.outcome()
+}
+pub fn cancel() {
+    RUN.cancel();
+    ACTIVE.store(false, Ordering::SeqCst);
+}
+
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Set by the `auto_takeoff` tool's off switch: the loop REJECTS (throttle
 /// idle, brake pulse) rather than standing down silently.
@@ -743,9 +755,17 @@ pub fn must_reject(remaining_m: f64, ias_kts: f64, vr_kts: f64) -> bool {
 /// Spawn the takeoff loop. The tool has already gated replay, ground,
 /// clearance state, and the steer channel; the loop re-validates the runway
 /// itself (the apt.dat scan is too slow for the tool's reply).
-pub fn start(base_url: String, voice: Option<Voice>, p: Params) {
+pub fn start_scoped(
+    base_url: String,
+    voice: Option<Voice>,
+    p: Params,
+    parents: Vec<std::sync::Arc<AtomicBool>>,
+) -> bool {
+    let Some(lease) = RUN.begin() else {
+        return false;
+    };
     if ACTIVE.swap(true, Ordering::Relaxed) {
-        return;
+        return false;
     }
     REJECT.store(false, Ordering::Relaxed);
     // A cancel racing the arm lands between the claim and the clear above:
@@ -753,9 +773,10 @@ pub fn start(base_url: String, voice: Option<Voice>, p: Params) {
     // flag. The cancel wins; verify the claim survived before anything flies
     // (the same claim-clear-verify order every automation start uses).
     if !ACTIVE.load(Ordering::Relaxed) {
-        return;
+        return false;
     }
     std::thread::spawn(move || {
+        let _lease = lease.with_cleanup(&ACTIVE, || {});
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -763,9 +784,16 @@ pub fn start(base_url: String, voice: Option<Voice>, p: Params) {
             ACTIVE.store(false, Ordering::Relaxed);
             return;
         };
-        rt.block_on(fly(XPlaneClient::new(base_url), voice, p));
+        rt.block_on(fly(
+            XPlaneClient::new(base_url)
+                .with_cancel(_lease.cancel.clone())
+                .with_parents(parents),
+            voice,
+            p,
+        ));
         ACTIVE.store(false, Ordering::Relaxed);
     });
+    true
 }
 
 fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
@@ -777,6 +805,7 @@ fn alert(voice: &Option<Voice>, priority: Priority, line: &str) {
 
 /// Throttle idle, one expiring brake pulse, steering released, and say why.
 async fn reject(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &str) {
+    RUN.record(sim::run::Outcome::Failed(reason.into()));
     let _ = xp.set_float(&throttle_dref(), 0.0).await;
     if xp
         .run_command_for(crate::tools::BRAKES_REGULAR, crate::tools::BRAKE_HOLD_SECS)
@@ -793,14 +822,48 @@ async fn reject(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &s
     );
 }
 
+/// A mode command is only a request; handoff needs live mode and dial readbacks.
+async fn engage_climb(xp: &dyn crate::xplane::XPlane, vs: f64, last: &mut Option<f64>) -> bool {
+    if crate::xplane::sim_frozen(xp).await {
+        return false;
+    }
+    let (heading, vertical) = tokio::join!(xp.get_float(HDG_STATUS), xp.get_float(VS_STATUS));
+    let Some([heading, vertical]) =
+        crate::control::measurements("autotakeoff", [heading, vertical])
+    else {
+        return false;
+    };
+    if (heading <= 0.5 || vertical <= 0.5) && xp.run_command(CMD_SERVOS_ON).await.is_err() {
+        return false;
+    }
+    if heading <= 0.5 && xp.run_command(CMD_HDG_MODE).await.is_err() {
+        return false;
+    }
+    if vertical <= 0.5 {
+        *last = None; // a mode change synchronises the dial
+        if xp.run_command(CMD_VS_MODE).await.is_err() {
+            return false;
+        }
+    }
+    if !crate::control::set_confirmed("autotakeoff", xp, VS_DIAL, vs, last, 40.0).await {
+        return false;
+    }
+    let (heading, vertical) = tokio::join!(xp.get_float(HDG_STATUS), xp.get_float(VS_STATUS));
+    matches!((heading, vertical), (Ok(h), Ok(v)) if h.is_finite() && v.is_finite() && h > 0.5 && v > 0.5)
+}
+
 async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // Find the runway under the nose. A full apt.dat pass, seconds — done
     // here, off the tool's reply path.
-    let (Ok(lat), Ok(lon), Ok(psi)) = (
-        xp.get_float(LAT).await,
-        xp.get_float(LON).await,
-        xp.get_float(PSI_TRUE).await,
-    ) else {
+    let (lat, lon, psi, var) = tokio::join!(
+        xp.get_float(LAT),
+        xp.get_float(LON),
+        xp.get_float(PSI_TRUE),
+        xp.get_float(MAG_VAR)
+    );
+    let Some([lat, lon, psi, var]) =
+        crate::control::measurements("autotakeoff", [lat, lon, psi, var])
+    else {
         alert(
             &voice,
             Priority::Caution,
@@ -904,7 +967,6 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     for c in &p.cfg.fd_commands {
         let _ = xp.run_command(c).await;
     }
-    let var = xp.get_float(MAG_VAR).await.unwrap_or(0.0);
     let _ = crate::tools::autopilot::drive_heading_bug_step(
         &xp,
         true_to_mag(rwy.course_deg, var),
@@ -939,7 +1001,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let roll_start = std::time::Instant::now();
     let mut frozen_secs = 0.0_f64;
     loop {
-        if !ACTIVE.load(Ordering::Relaxed) {
+        if xp.cancelled() || !ACTIVE.load(Ordering::Relaxed) {
+            RUN.record(sim::run::Outcome::PilotOverride);
             // Released externally ("my controls"): the release path already
             // spoke. Steering expires by silence; power stays where it is —
             // a pilot taking over mid-roll wants it set.
@@ -1012,20 +1075,20 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             xp.get_float(PITCH_YIELD),
             xp.get_float(ROLL_YIELD),
         );
-        let (Ok(lat), Ok(lon), Ok(psi), Ok(gs_ms), Ok(ias), Ok(agl_m), Ok(on_ground)) =
-            (lat, lon, psi, gs_ms, ias, agl_m, on_ground)
+        let Some([lat, lon, psi, gs_ms, ias, agl_m, on_ground, theta_deg, phi_deg, q]) =
+            crate::control::measurements(
+                "autotakeoff",
+                [
+                    lat, lon, psi, gs_ms, ias, agl_m, on_ground, theta, phi, pitch_q,
+                ],
+            )
         else {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         };
         let gs_kts = gs_ms * MS_TO_KTS;
         let agl_ft = agl_m * M_TO_FT;
-        let theta_deg = theta.unwrap_or(0.0);
-        let phi_deg = phi.unwrap_or(0.0);
-        // A failed read falls back to differencing the attitude inside the
-        // law — worse, but it is one tick, and it is the behaviour the whole
-        // of this loop's history flew on.
-        let pitch_rate = pitch_q.ok();
+        let pitch_rate = Some(q);
         let now_t = std::time::Instant::now();
         let dt = last_tick
             .map_or(0.15, |t| (now_t - t).as_secs_f64())
@@ -1035,6 +1098,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         // The pilot's feet took the pedals (the plugin dropped the override
         // already): the takeoff continues as a manual one, power set.
         if !airborne && steer_yield.is_ok_and(|v| v > 0.5) {
+            RUN.record(sim::run::Outcome::PilotOverride);
             alert(&voice, Priority::Caution, "Your aircraft. Power is set.");
             crate::blackbox::record("autotakeoff", serde_json::json!({"event": "pedal_yield"}));
             return;
@@ -1046,6 +1110,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             && !ap_engaged
             && (pitch_yield.is_ok_and(|v| v > 0.5) || roll_yield.is_ok_and(|v| v > 0.5))
         {
+            RUN.record(sim::run::Outcome::PilotOverride);
             alert(&voice, Priority::Caution, "Your aircraft. Power is set.");
             crate::blackbox::record("autotakeoff", serde_json::json!({"event": "yoke_yield"}));
             return;
@@ -1068,6 +1133,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         let thr_now = thr_read.unwrap_or(thr_cmd);
         if thr_now < last_thr_cmd - 0.25 && elapsed > 2.0 {
             if thr_challenged {
+                RUN.record(sim::run::Outcome::PilotOverride);
                 alert(&voice, Priority::Warning, "Your throttle. Your aircraft.");
                 crate::blackbox::record(
                     "autotakeoff",
@@ -1250,9 +1316,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     serde_json::json!({
                         "event": "climb_manual", "ias": ias, "agl": agl_ft,
                         // `q` is the measured pitch rate the damping runs on
-                        // (null = the read failed and the law differenced the
-                        // attitude instead), and `dt` the tick it was sampled
-                        // over. The 2026-08-02 diagnosis needed both and the
+                        // (a missing read now skips the tick), and `dt` the
+                        // interval over which the law was sampled. The 2026-08-02 diagnosis needed both and the
                         // record carried neither: the ring was in the DAMPING
                         // path, and nothing logged what it damped on.
                         "theta": theta_deg, "pitch": pitch, "q": pitch_rate, "dt": dt,
@@ -1268,17 +1333,11 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // the dial to the CURRENT rate, stomping any preset (the sync
             // that made VS-mode rotation impossible in the first place).
             // The pitch channel simply expires; the servo owns the elevator.
-            ap_engaged = true;
-            let _ = xp.run_command(CMD_SERVOS_ON).await;
-            if xp.get_float(HDG_STATUS).await.unwrap_or(0.0) <= 0.5 {
-                let _ = xp.run_command(CMD_HDG_MODE).await;
-            }
-            if xp.get_float(VS_STATUS).await.unwrap_or(0.0) <= 0.5 {
-                let _ = xp.run_command(CMD_VS_MODE).await;
-            }
             let vs = climb_vs_protected(ias, p.vy_kts, p.climb_fpm, p.vne_kts);
-            let _ = xp.set_float(VS_DIAL, vs).await;
-            last_vs_cmd = Some(vs);
+            if !engage_climb(&xp, vs, &mut last_vs_cmd).await {
+                continue;
+            }
+            ap_engaged = true;
             let trim = xp.get_float(ELEV_TRIM).await.ok();
             crate::blackbox::record(
                 "autotakeoff",
@@ -1288,19 +1347,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             );
         }
         let vs = climb_vs_protected(ias, p.vy_kts, p.climb_fpm, p.vne_kts);
-        if last_vs_cmd.is_none_or(|v| (v - vs).abs() > 40.0) {
-            let _ = xp.set_float(VS_DIAL, vs).await;
-            last_vs_cmd = Some(vs);
-        }
-        // (The lever comes back with it too, through the top-of-loop writer,
-        // which commands `climb_throttle` on every airborne tick. A second
-        // change-gated write here fought that writer and lost: the guard's
-        // value survived one tick before full power was re-driven over it.)
-        if xp.get_float(VS_STATUS).await.unwrap_or(1.0) <= 0.5 {
-            // Someone (or a mode change) dropped VS: re-engage, and force a
-            // dial rewrite next tick — the engage just synced it away.
-            let _ = xp.run_command(CMD_VS_MODE).await;
-            last_vs_cmd = None;
+        if !engage_climb(&xp, vs, &mut last_vs_cmd).await {
+            continue;
         }
         DETAIL.set(format!(
             "climbing, {} ft, handoff at {} ft",
@@ -1339,6 +1387,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 serde_json::json!({"event": "handoff", "agl": agl_ft, "ias": ias,
                                    "to_caller": p.handoff_to_caller}),
             );
+            RUN.record(sim::run::Outcome::Completed);
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -1384,6 +1433,29 @@ pub fn spoken_height_ft(agl_ft: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn paused_missing_or_refused_modes_cannot_complete_the_takeoff_handoff() {
+        let xp = crate::xplane::FakeXPlane::with_reads(&[
+            (crate::datarefs::PAUSED, 1.0),
+            (crate::datarefs::IS_IN_REPLAY, 0.0),
+            (super::HDG_STATUS, 0.0),
+            (super::VS_STATUS, 0.0),
+            (super::VS_DIAL, 700.0),
+        ]);
+        let mut last = None;
+        assert!(!super::engage_climb(&xp, 700.0, &mut last).await);
+        assert!(!xp.ran(super::CMD_SERVOS_ON));
+        assert!(!xp.wrote(super::VS_DIAL));
+        xp.set_read(crate::datarefs::PAUSED, 0.0);
+        assert!(!super::engage_climb(&xp, 700.0, &mut last).await); // commands ignored
+        assert!(xp.ran(super::CMD_VS_MODE));
+        xp.set_read(super::HDG_STATUS, 1.0);
+        xp.set_read(super::VS_STATUS, 1.0);
+        assert!(super::engage_climb(&xp, 700.0, &mut last).await);
+        xp.set_read(super::VS_STATUS, f64::NAN);
+        assert!(!super::engage_climb(&xp, 700.0, &mut last).await);
+    }
+
     use super::*;
     use crate::autoland::project_latlon;
 

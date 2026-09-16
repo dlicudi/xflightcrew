@@ -91,6 +91,105 @@ pub struct Collector {
 /// the only evidence available is that its datarefs exist.
 const PLUGIN_PROBE_DREF: &str = "xcopilot/ptt_active";
 
+/// Every `xcopilot/*` dataref this build of the app reads or writes: the
+/// plugin's side of the wire contract, probed by NAME once per airframe from
+/// the same index fetch as the profile's names. A stale `.xpl` is then said
+/// aloud at boot and shown red on the Health screen instead of failing
+/// quietly hours later: the app read `xcopilot/terrain/valid` from
+/// 2026-09-15 while the loaded plugin was a 09-13 build without it, every
+/// terrain probe "timed out" for two days, the follower retired its terrain
+/// floor ten seconds after each takeoff, and the airborne resume refused
+/// "terrain verification unavailable" on the route (2026-09-16). The test
+/// below keeps this list equal to the literals in the source.
+pub const PLUGIN_DATAREFS: &[&str] = &[
+    "xcopilot/audio/cut",
+    "xcopilot/audio/play",
+    "xcopilot/fms/goto",
+    "xcopilot/fms/load",
+    "xcopilot/fms/route",
+    "xcopilot/opt/audio_bus",
+    "xcopilot/opt/cabin_crew",
+    "xcopilot/opt/camera_snap",
+    "xcopilot/opt/mode",
+    "xcopilot/opt/monitor_mute",
+    "xcopilot/opt/negative_tone",
+    "xcopilot/opt/ui_scale",
+    "xcopilot/opt/voice",
+    "xcopilot/opt/voice_list",
+    "xcopilot/pitch",
+    "xcopilot/pitch_yield",
+    "xcopilot/ptt_active",
+    "xcopilot/radio_ptt_active",
+    "xcopilot/request",
+    "xcopilot/roll",
+    "xcopilot/roll_yield",
+    "xcopilot/status/action",
+    "xcopilot/status/aircraft",
+    "xcopilot/status/alert",
+    "xcopilot/status/atc",
+    "xcopilot/status/auto",
+    "xcopilot/status/callout",
+    "xcopilot/status/coach",
+    "xcopilot/status/heard",
+    "xcopilot/status/phase",
+    "xcopilot/status/radio",
+    "xcopilot/status/strip",
+    "xcopilot/steer_yield",
+    "xcopilot/taxi_brake",
+    "xcopilot/taxi_brake_l",
+    "xcopilot/taxi_brake_r",
+    "xcopilot/taxi_steer",
+    "xcopilot/terrain/elev_m",
+    "xcopilot/terrain/gen",
+    "xcopilot/terrain/query",
+    "xcopilot/terrain/valid",
+    "xcopilot/typed",
+];
+
+/// The last plugin probe's verdict: `None` until one has run, else the names
+/// the loaded plugin lacks (empty = the build matches).
+static PLUGIN_MISSING: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+pub fn set_plugin_missing(missing: Vec<String>) {
+    *PLUGIN_MISSING.lock().unwrap_or_else(|e| e.into_inner()) = Some(missing);
+}
+
+pub fn plugin_missing() -> Option<Vec<String>> {
+    PLUGIN_MISSING.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The spoken verdict of a plugin probe: nothing when the build matches.
+pub fn plugin_summary(missing: &[String]) -> Option<String> {
+    if missing.is_empty() {
+        return None;
+    }
+    let shown: Vec<String> = missing
+        .iter()
+        .take(3)
+        .map(|m| m.trim_start_matches("xcopilot/").replace(['/', '_'], " "))
+        .collect();
+    let more = if missing.len() > 3 { format!(" and {} more", missing.len() - 3) } else { String::new() };
+    Some(format!(
+        "Plugin check: the loaded plugin is out of date. It has no {}{}. Terrain and the panel will fail until it is rebuilt and reloaded.",
+        shown.join(", "),
+        more
+    ))
+}
+
+/// The Health screen's plugin line: loaded, loaded but stale, or absent.
+fn plugin_probe(loaded: bool) -> Probe {
+    if !loaded {
+        return Probe::Down("no xcopilot/* datarefs".into());
+    }
+    match plugin_missing() {
+        Some(m) if !m.is_empty() => {
+            let more = if m.len() > 1 { format!(" and {} more", m.len() - 1) } else { String::new() };
+            Probe::Down(format!("loaded, out of date: no {}{more}", m[0]))
+        }
+        _ => Probe::Up("loaded".into()),
+    }
+}
+
 impl Collector {
     pub fn new(
         xp: XPlaneClient,
@@ -122,10 +221,7 @@ impl Collector {
         let started = std::time::Instant::now();
         let plugin = self.xp.get_float(PLUGIN_PROBE_DREF).await;
         let elapsed_ms = started.elapsed().as_millis();
-        live.plugin = match &plugin {
-            Ok(_) => Probe::Up("loaded".into()),
-            Err(_) => Probe::Down("no xcopilot/* datarefs".into()),
-        };
+        live.plugin = plugin_probe(plugin.is_ok());
 
         let position = crate::position(&self.xp).await;
         live.xplane = match (&plugin, position) {
@@ -150,5 +246,65 @@ impl Collector {
         }
 
         live
+    }
+}
+
+#[cfg(test)]
+mod plugin_contract_tests {
+    use super::*;
+
+    /// Every `"xcopilot/..."` literal in the workspace source is in
+    /// [`PLUGIN_DATAREFS`], so a new dataref is probed the day it is added.
+    #[test]
+    fn plugin_datarefs_list_every_literal_in_the_source() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        walk(&root.join("src"), &mut files);
+        walk(&root.join("crates"), &mut files);
+        let mut seen = std::collections::BTreeSet::new();
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            for (i, _) in text.match_indices("\"xcopilot/") {
+                let rest = &text[i + 1..];
+                let end = rest.find('"').unwrap();
+                let name = &rest[..end];
+                // A bare prefix or an elided "xcopilot/..." in prose is not a name.
+                if name.len() > "xcopilot/".len() && !name.contains("...") {
+                    seen.insert(name.to_string());
+                }
+            }
+        }
+        let listed: std::collections::BTreeSet<String> =
+            PLUGIN_DATAREFS.iter().map(|s| s.to_string()).collect();
+        let unlisted: Vec<_> = seen.difference(&listed).collect();
+        assert!(unlisted.is_empty(), "add to PLUGIN_DATAREFS: {unlisted:?}");
+        let unused: Vec<_> = listed.difference(&seen).collect();
+        assert!(unused.is_empty(), "no longer in the source: {unused:?}");
+    }
+
+    #[test]
+    fn a_stale_plugin_is_said_and_shown_red_a_matching_one_is_quiet() {
+        assert_eq!(plugin_summary(&[]), None);
+        let line = plugin_summary(&["xcopilot/terrain/valid".into()]).unwrap();
+        assert!(line.contains("out of date"), "{line}");
+        assert!(line.contains("terrain valid"), "{line}");
+        assert_eq!(plugin_probe(false), Probe::Down("no xcopilot/* datarefs".into()));
+        set_plugin_missing(vec!["xcopilot/terrain/valid".into(), "xcopilot/fms/goto".into()]);
+        assert_eq!(
+            plugin_probe(true),
+            Probe::Down("loaded, out of date: no xcopilot/terrain/valid and 1 more".into())
+        );
+        set_plugin_missing(vec![]);
+        assert_eq!(plugin_probe(true), Probe::Up("loaded".into()));
     }
 }

@@ -3592,6 +3592,50 @@ with no shutdown line and no macOS crash report; the sim was found paused at
 100 ft AGL in the climb. Cause unknown (a Ctrl-C at the pause is the simplest
 reading).
 
+## LEJR-LEGR: the inbound call made at the zone, not at the last fix - 2026-09-15
+
+Evening sortie, the 172 from Jerez to Granada under full auto. The enroute
+region handed the flight to Granada Tower at 21:34:36Z, twenty miles out
+("radar services terminated, contact Granada Tower on one one eight decimal
+eight five"); the crew read it back, retuned and flew on. At 21:40:10Z, five
+and a half minutes later and inside Granada's 5 nm zone, the tower's
+compliance watch challenged: "Aircraft in the Granada control zone, you are
+inside controlled airspace without clearance. Say callsign and intentions."
+Again at 21:42:10Z and 21:44:12Z. Nobody answered. The inbound call went out
+at 21:44:31Z, at `enroute_complete`, because the plan's last enroute fix is
+GRA, a mile from the runway, and the inbound call lived in the arrival stage
+that only starts when the follower finishes the last leg. The blackbox shows
+it plainly: three `atc` events with `route: compliance, crew: false` and no
+crew transmission between the `region_handoff` stage and `inbound_call`.
+
+Two rules, both in the enroute wait (`wait_enroute_working_the_radio`):
+
+- **The inbound call is owed at the zone approach.** Once the region has
+  handed us to the DESTINATION's own tower (`home_tower_khz` equals the
+  destination's apt.dat tower row, never a transit field's, which is the
+  LINTO/Tangier lesson again) and the field is inside `INBOUND_CALL_NM`
+  (10 nm, twice the tower's zone), the enroute leg makes the call
+  (`inbound_due`, pure and tested; blackbox `inbound_enroute` with the
+  distance). `INBOUND_MADE` tells the arrival stage the tower already knows
+  us, so it skips its swap wait and call (`inbound_already_made`).
+- **The tower's question is data the crew can hear.** The zone watch's tuned
+  challenge arms `party_line::ZONE_CHALLENGE` (a new accessor,
+  `take_zone_challenge`, drained every crew pass so a stale question never
+  answers a later one); from the destination's tower it earns the inbound
+  call at any range, in the enroute loop and in the arrival's owed-call
+  loop alike. A challenge from a field we are only crossing is blackboxed
+  (`zone_challenge`, `answered: false`) and left: the tower has no transit
+  intent yet, so there is nothing true to say to it.
+
+Still owed from the same tape: the region handoff readback goes into the
+void every time (`outcome: void` on "roger, Granada Tower on ...", and on the
+14th's "squawking seven thousand, Malaga Tower on ..."): the region switch
+uninstalls the old station a tick before the crew's readback is keyed on the
+old frequency, so nobody is listening. Harmless on the air, wrong in the
+debrief's narrative; a readback to a controller who just said goodbye should
+not be judged a void call. And a zone transit intent, so a crossing field's
+challenge can be answered honestly.
+
 ## The plan preflighted at the gate: fuel, load and both runways before an engine turns - 2026-09-15
 
 Asked whether "fly the flight plan" checks the fuel and the runway, the
@@ -3630,3 +3674,237 @@ with no rows is `brief_arrival`'s. Tests: `a_plan_that_fits_is_briefed...`,
 `a_load_the_sim_disagrees_with...`, and the parser's
 `the_load_sheet_parses_in_kilos...` over the fetcher's own strings.
 
+
+
+## Procedure failure handling and the full-auto ground gate — 2026-09-15
+
+Code review found four gaps: the procedure follower still called `slew_bug`
+directly after the circuit's bank-aware reversal fix; failed altitude/VS writes
+advanced their suppression caches; failed altitude reads became zero or another
+instrument and a failed IAS read bypassed climb protection; either failed input
+to full auto's airborne refusal could admit the ground sequence.
+
+The follower now shares `bug_toward`, reads bank with the instrument burst, and
+uses the circuit's `Closure` watchdog on positional legs. Two stalled intervals
+re-steer from the nose; the third hands back and cancels an enclosing full-auto
+mission so it cannot mistake failure for enroute completion. Paused and unread
+ticks do not advance the progress clock. Missing/non-finite required instruments
+skip the tick and blackbox `missing_measurement` with nulls; startup needs real
+heading, variation and indicated altitude before AP engagement. The initial
+unconstrained altitude is indicated, like the rest of the follower.
+
+Altitude and VS suppression caches advance only after a successful write and a
+readback within one unit of the intent. `write_unconfirmed` records the target
+and actual (null when unread); failure leaves the target eligible for retry.
+Full auto now requires both finite AGL at or below 50 ft and ground contact;
+unread/conflicting inputs refuse before the ground stages (`ground_unconfirmed`).
+
+Regression tests inject write errors, readback errors, silent refusal, missing
+and non-finite instruments, contradictory ground state, and the LXGB 4.3-degree
+bank reversal followed by a failed heading write and recovery. The existing
+circuit closure tests cover orbit detection versus closing flight. Verified by
+the xvl unit tests and the ignored local-install dataref-name check; these are
+code/test findings, not a new live sortie.
+
+
+## Worker ownership, explicit outcomes and locally planned full-auto flights — 2026-09-15
+
+The next review followed cancellation through the actual worker lifetimes.
+`ACTIVE=false` did not mean the worker had returned: a quick restart could clear
+its shared abort flag, and old cleanup could erase the new run's status. The
+procedure, takeoff and full-auto workers now hold `sim::run::Slot` leases with
+monotonic identities and per-run cancellation flags through I/O and cleanup.
+An immediate restart is refused until the old worker exits. Drop cleanup also
+runs on panic. Scoped X-Plane clients reject mutations after cancellation,
+including after asynchronous ID resolution and between HTTP retries; child
+procedure/takeoff clients inherit the parent's flags. Procedure/full-auto
+handoffs carry those flags into autoland, including a clearance-driven rearm.
+An HTTP request already sent cannot be recalled; a replacement worker cannot
+start over it because the old lease has not been released.
+
+Outcomes distinguish completion, handoff, cancellation, pilot override and
+failure. Full auto's enroute wait and the circuit/full-auto takeoff waits require
+`Completed`, rather than interpreting every inactive worker as success. A
+failed full-auto parent revokes its scoped children. The shared `control`
+guards require finite instrument samples and confirmed dial writes. Takeoff
+now includes pitch, bank and pitch rate in the required burst; missing attitude
+cannot become level flight. Its AP handoff is deferred in pause, on failed mode
+reads, refused mode commands or an unconfirmed VS write. Normal handoff requires
+live heading/VS mode readbacks. Startup variation also comes from a real read.
+
+Full auto previously fetched SimBrief directly and rejected an unset ID even
+with a local plan on the speech loop's shelf. The shelf is now published to the
+tool; SimBrief remains an explicit fetch when no local plan is present. Local
+flights get a cruise fix, a sixteen-mile final-alignment fix and an eight-mile
+arrival fix. The route reserves climb/descent distance using the airframe's
+speeds and climb rate, picks a sufficiently long runway by wind or arrival
+bearing, and probes the climb and arrival legs every 150 m. Missing/obstructed
+terrain refuses the arm. The longer track increases the fuel requirement while
+preserving reserve; the expanded plan goes back to the same shelf and FMS.
+A changed arrival runway requires replanning rather than silently abandoning the
+checked corridor. This is still a conservative direct route: no airway or
+controlled-airspace routing has been added.
+
+That route check exposed a plugin assumption: a failed terrain probe was
+published as 0 m, on the premise that circuit-sized queries were always inside
+loaded scenery. That is false for a local flight. The plugin now publishes
+`xcopilot/terrain/valid`; any failed/non-finite probe invalidates the entire
+batch. The app serialises query/generation/result as one mailbox transaction
+and refuses missing validity or partial results. Local full-auto therefore
+requires this plugin build and terrain within the loaded scenery region.
+Other terrain consumers retain their existing unavailable-data behavior.
+
+Regression coverage: cancellation/restart exclusion, failure/panic cleanup,
+late child creation after parent cancellation, real HTTP ID rollover after a
+plugin reload, cancellation during ID lookup, pause/resume, refused AP handoff,
+missing/invalid instruments, failed/refused dial writes, local route geometry,
+climb/runway refusal, missing/obstructed terrain, and local shelf replacement.
+Validation includes the full workspace tests, install-name audit and universal
+macOS plugin build. No new live sortie has been flown for these changes.
+
+## B58 flare: stop removing power into renewed sink (2026-09-16)
+
+Two LEBL autolands reproduced a late sink after an initially successful
+roundout. On 06L, flare entry at 23.3 ft / 98.7 KIAS / -403 fpm became
+-65 fpm at 18.5 ft, then -446 fpm at 2.5 ft. On runway 20, entry at
+23.0 ft / 97.3 KIAS / -394 fpm became -24 fpm at 20.0 ft, then -515 fpm
+at 0.9 ft / 85.8 KIAS. These are sampled VSI values, not exact impact
+measurements. The second landing had `park=0`, so the first landing's
+`park=1` does not explain the repeated airborne sink. Throttle/prop RPM
+were not recorded, so prop drag is a plausible contributor, not proved.
+
+The implementation commanded throttle 0 on EVERY Flare tick. It bypassed
+the approach governor regardless of measured sink, while the VS lead first
+arrested and then chased the renewed descent. The old plant regression is
+fitted to a 172, not this Baron. FAA Airplane Flying Handbook, Chapter 13,
+Normal Approach and Landing, describes gradually reducing residual power
+in roundout and the limited float of twins with windmilling propellers.
+It also discusses residual-power touchdowns on some twins with ample runway;
+that is general guidance, not a numerical Baron power prescription:
+https://www.faasafety.gov/files/events/SO/SO15/2022/SO15118118/TransitionToMultiengineAirplanes.pdf
+Laminar's B58 manual p.52 says props fully forward, power as required:
+https://x-plane.com/manuals/Baron_Pilot_Operating_Manual.pdf
+
+`flare_power` is now an optional aircraft-profile setting carried with the
+mission's ApConfig (including scoped autoland and runway re-arms). Only the
+B58 opts in: preserve measured entry power on the first flare tick, then
+reduce at 0.04 throttle ratio/s; pause reduction above 200 fpm sink or when
+the one-second sink projection exceeds it. Those are EXPERIMENTAL sim tuning
+values, not POH numbers. The controller never raises power, follows a lower
+observed lever, cannot restart its ramp from a stale higher readback, and
+resets outside flare/on a miss. Rollout idle and go-around full power retain
+their existing priority. Missing throttle/VSI skips the progressive power
+write rather than inventing a measurement. Other profiles retain idle flare.
+
+Autoland now records `event: power`: throttle before/command/after, write
+success, progressive policy, dt, VSI, radio height and IAS. The after value
+is a readback, not just a successful PATCH. The ramp is tested against the
+recorded runway-20 sink sequence, worsening-sink prediction, re-approach
+reset, balloon reduction, idle convergence, stale readback and invalid
+measurements. This is a controller regression, NOT proof of a softer landing.
+A repeatable live B58 approach is still owed before calling the tuning proven;
+watch float/runway remaining as well as touchdown sink. No direct-pitch
+flare, prop-RPM change or parking-brake change is included in this patch.
+
+Validation: `cargo test --workspace -- --test-threads=1` passed (796 tests,
+25 ignored); `cargo build --release --bin xvl` succeeded. The parallel
+workspace run hit an existing mock HTTP server WouldBlock failure in
+`cancellation_during_resolution_prevents_the_later_patch`; the sim tests
+and then the entire workspace passed serially with local socket access.
+
+## 2026-09-16 — Explicit control ownership and flight interaction
+
+After the B58 crash/reload, “resume flight plan” briefed the plan and the pilot
+had to request autoland separately. Resume now has an exact request grammar
+(`resume the flight plan`, `resume my flight plan`, `resume the route`,
+`continue the flight plan`) which bypasses the briefing branch. It uses the
+in-memory loaded SimBrief plan, never silently fetches a replacement, and arms
+an airborne full-auto mission without repeating startup, taxi or takeoff.
+The existing follower, arrival and taxi-in orchestration remain the flight laws.
+
+The rejoin selects the forward endpoint of an existing segment within 3 NM;
+ambiguous crossings, invalid positions and being past the route are refused.
+Arming needs live, stable flight above 1,000 ft AGL, profile speed clearance,
+running engines and a matching plan aircraft. The join is bounded to 30 NM
+and terrain-probed every 150 m against the lower of present and target true
+altitude, with 1,000 ft clearance. Unavailable terrain refuses. Arrival data
+is verified, and movement during verification causes a retry rather than
+arming a stale join. Recovery and existing flying managers exclude resume.
+Local plans currently refuse airborne resume: their checked runway metadata
+is not retained on the shelf. A process restart also requires loading/reviewing
+the plan again. This is deliberately not automatic resumption on reconnect.
+
+The monitor stops automation after a sustained connection failure, speaks the
+ownership change and the reconnect, and detects an airborne manager exit.
+It does not claim the simulator's autopilot servos are disconnected: the pilot
+is explicitly asked to check them. The panel shows monitoring/ownership even
+when no manager is active. Route altitude readbacks say the route continues;
+a follower-managed climb/descent no longer promises an exact requested VS.
+
+Cabin warnings use known profile pressurisation capability (B58 unpressurised;
+unknown profiles use neutral wording). Cabin alerts repeat on worsening
+1,000-ft bands or severity escalation, rather than at a fixed warning interval.
+Critical warnings retain their existing reminder policy. Airspeed and cabin
+recovery are announced once after five seconds clear, only if the associated
+alert actually spoke.
+
+The new pure interaction helpers collect a landing summary after a slow,
+settled rollout: last airborne VSI sample, last available autoland cross-track
+error, possible bounces, and whether automation was interrupted. They explicitly
+say the exact touchdown rate is unavailable. Sampling can miss a short bounce;
+this is not an impact sensor or landing-quality certification.
+
+Validation: workspace regression suite passed (803 tests, 25 ignored), including
+explicit-vs-echo resume grammar, conservative route rejoin, stable one-shot
+recovery, cabin escalation and delayed sampled landing summaries. Live flight
+verification of resume, reconnect and audio timing remains outstanding.
+Final verification: the 621 binary tests passed after the status/readback edits;
+all 33 monitor tests passed after grouping overspeed with airspeed recovery.
+`cargo build --release --bin xvl` succeeded. The live process was not restarted.
+
+## 2026-09-16: resume refused five times over the Gulf of Lion; the plugin was two days stale
+
+LEBL-LFLL in the Baron under full auto, the app restarted at 18:05 on the
+DIBER-SOSUR leg (25 nm to run, 7,000 ft). "Resume flight plan" was refused
+five times in three minutes, each by a different gate, and the debrief could
+not say why because the tool blackboxed nothing:
+
+1. "No plan is loaded": the shelf is in memory and a restart empties it (by
+   design; "load flight plan" refilled it from SimBrief).
+2. "Terrain verification is unavailable", on the route, wings level. This
+   was the real defect. `terrain::sample_ft` has read `xcopilot/terrain/valid`
+   since 09-15; the loaded plugin was the 09-13 build (Log.txt: `db3a8a0`),
+   which never registered it, so the read failed and every answer was
+   discarded. The same failure had been retiring the follower's terrain floor
+   ten seconds after every takeoff since 09-15 13:12 (`terrain_probe_unavailable`
+   on four flights), in silence. Probed live: the plugin answered the query
+   (gen 3 to 4, sea level back) and the `valid` name did not exist.
+   `plugin/build/mac_x64/xcopilot.xpl` had been built at 22:38 on the 15th
+   and never installed. Rebuilt as `e2f82ed-dirty`, staged into the sim
+   (rm then cp, the loaded mapping kept); the reload waits for the aircraft
+   to be parked.
+3. and 4. "Resume needs live, stable flight ... with adequate airspeed", in a
+   28 degree orbit both times (the pilot was circling while the plan was
+   argued about). The bank gate was right; the line named nothing.
+5. "Outside the route's rejoin corridor": after the orbit the aircraft was
+   4.8 nm right of DIBER-SOSUR against a 3 nm corridor. Right, and useless.
+
+Rules from it:
+
+- **The plugin's side of the wire contract is probed by name** (`health::PLUGIN_DATAREFS`,
+  pinned to every `"xcopilot/..."` literal in the source by a plain test),
+  on the same index fetch as the profile probe. A stale build is said once
+  at boot ("Plugin check: the loaded plugin is out of date. It has no
+  terrain valid ...") and the Health screen's plugin line goes red with the
+  first missing name. `plugin_probe` blackboxed per airframe.
+- **The follower says when it loses the terrain floor**
+  (`terrain_probe_unavailable` is now spoken), and resume's terrain refusal
+  points at the plugin build.
+- **Resume's gates name themselves**: paused, on the ground, the AGL, the
+  bank in degrees, the speed against the floor. Every refusal and every arm
+  is blackboxed on the `full_auto` kind (`resume_refused` / `resume`).
+- **The corridor refusal says where the route is**: the abeam leg by its
+  fixes, the side ("5 miles right of course on the DIBER to SOSUR leg"), and
+  the magnetic heading for the leg's end fix (`interaction::rejoin_index`,
+  `REJOIN_CORRIDOR_NM` 3 nm, unchanged). The pilot closes it and asks again.
+- Whisper's "Resume site plan." is the resume request (`resume_plan_request`).
