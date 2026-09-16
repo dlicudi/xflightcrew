@@ -55,7 +55,7 @@ Rust, because this is a latency- and audio-sensitive real-time loop.
 |---|---|
 | Mic capture | `cpal` |
 | STT | `whisper-rs` (whisper.cpp bindings), push-to-talk |
-| Intent | deterministic: [src/grammar.rs](src/grammar.rs) picks the tool, [src/conversation.rs](src/conversation.rs) and the state answerers handle questions, [src/dialogue.rs](src/dialogue.rs) back-references |
+| Intent | deterministic: [src/router.rs](src/router.rs) decides command / question / follow-up / echo, [src/grammar.rs](src/grammar.rs) picks the tool, [src/conversation.rs](src/conversation.rs) and the state answerers ([src/answers.rs](src/answers.rs), [src/plan.rs](src/plan.rs) for the plan's questions) handle questions, [src/dialogue.rs](src/dialogue.rs) back-references; `main.rs` keeps boot and the command loop, [src/detect.rs](src/detect.rs) the airframe swap |
 | X-Plane write | `reqwest` PATCH to the Web API (`PATCH /api/v1/datarefs/{id}/value`) |
 | TTS readback | in-process piper VITS via the `ort` crate |
 
