@@ -3960,3 +3960,35 @@ only the stock airspeed dial). No V-speeds are declared, so none are spoken.
 `known_profile` maps S76/S76C/S76D. Not done, and honestly not started: a
 rotorcraft flight law, helicopter phraseology in the tower (air taxi, a
 helipad instead of a runway), the search light's real switch.
+
+## 2026-09-16: main.rs split along its seams; flight_state, one page for the crew's statics
+
+Two refactors on a fresh branch, no law touched. `main.rs` had grown to
+9,764 lines: boot, the command loop, the aircraft detector, the plan cache,
+the ICAO map, the undo stack, the routing vocabularies and forty state
+answerers in one file. Six modules now hold whole items moved by a script
+that cut each top-level item with its doc comment and made it
+crate-visible; `main.rs` imports them by name, so `run_session` and its
+1,400 lines of tests read exactly as before (test-only names are
+`cfg(test)` imports). `pollers` (panel buttons, typed line, voice picker,
+settings switches), `detect` (the ICAO map, the live profile, the detector
+thread), `router` (command / question / follow-up / echo / bare value),
+`undo`, `plan` (shelf, fetch policy, FMS load, brief, TOD, ETA, named fix)
+and `answers` (everything read from the datarefs the tools write).
+`main.rs` is 5,370 lines: boot and the loop.
+
+The statics: 76 process-wide cells across the loop files, and the history's
+recurring bug class is one that outlives its airframe or its process. The
+party line already showed the cure for the world's side (one page, the
+writes on it). `flight_state.rs` is the crew's: `publish_airframe` (the six
+selectors, previously duplicated in `LiveProfile::new` and `swap`) and
+`stand_down` (the hand list from the detector, now also called by the
+instructor-mode entry and the monitor's connection-loss path through the
+same door). A test scans the tree for every `static ACTIVE` and asserts the
+module is named in `stand_down`; it found one the hand list had missed:
+`flow`, so a running checklist now stops on a swap, on entering instructor
+mode and on connection loss, the one deliberate behaviour change. The
+module doc inventories the per-FLIGHT facts still reset on their own paths
+(`LAST_ARRIVED`, `LANDED_RUNWAY`, `INBOUND_MADE`, the follower's `TOD`,
+`TERRAIN_FLOOR`, `PILOT_ALT`, `LEG`, and the rest); a `flight_begins` door
+for those is the next step, not this one.

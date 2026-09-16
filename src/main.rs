@@ -24,6 +24,7 @@ mod conversation;
 mod debrief;
 mod dialogue;
 mod failures;
+mod flight_state;
 mod flightplan;
 mod flow;
 mod full_auto;
@@ -84,7 +85,7 @@ use voice::{Priority, Voice};
 use xplane::XPlaneClient;
 #[cfg(test)]
 use detect::icao_to_profile;
-use detect::{spawn_aircraft_detector, known_profile, generic_profile_id, generic_profile, LiveProfile, stand_down_for_aircraft_change};
+use detect::{spawn_aircraft_detector, known_profile, generic_profile_id, generic_profile, LiveProfile};
 use router::{ConfidenceAction, classify_confidence, is_affirmative, correction_text, conversational, release_intent, looks_like_question, looks_like_command, looks_like_followup, is_bare_value, correction_value, command_subject, callout_label};
 #[cfg(test)]
 use router::has_number;
@@ -998,7 +999,7 @@ async fn run_session(
             // loop cannot share the aircraft), and a lesson does not
             // outlive the mode that allowed it.
             if now_mode == mode::Mode::Instructor && applied_mode != mode::Mode::Instructor {
-                stand_down_for_aircraft_change();
+                flight_state::stand_down();
                 instructor_noted = false;
                 voice.alert(
                     Priority::Advisory,

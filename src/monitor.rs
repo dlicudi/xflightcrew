@@ -3198,7 +3198,7 @@ pub async fn run(
             if seen_sim && !disconnected && since.elapsed() >= Duration::from_secs(3) {
                 disconnected = true;
                 had_flying_control = false;
-                crate::stand_down_for_aircraft_change();
+                crate::flight_state::stand_down();
                 crate::blackbox::record("control_ownership", serde_json::json!({"event":"connection_lost"}));
                 if crate::mode::copilot_enabled() {
                     voice.alert(Priority::Warning, "Connection to X-Plane lost. Flight automation is stopped. You'll have control when the sim returns.".to_string());

@@ -15,12 +15,7 @@ pub(crate) struct LiveProfile {
 
 impl LiveProfile {
     pub(crate) fn new(p: aircraft::AircraftProfile) -> std::sync::Arc<Self> {
-        tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
-        tools::lights::publish_exterior(&p.lights);
-        aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
-        aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());
-        aircraft::publish_bus_volts(p.bus_volts_nominal);
-        aircraft::publish_speed_floor(p.vs_clean_kts);
+        crate::flight_state::publish_airframe(&p);
         std::sync::Arc::new(Self {
             inner: std::sync::RwLock::new(p),
             generation: std::sync::atomic::AtomicU64::new(0),
@@ -42,17 +37,12 @@ impl LiveProfile {
         // Stop every owner before changing the global actuator selectors;
         // otherwise an old takeoff/autoland loop can start driving the newly
         // loaded aircraft with the previous airframe's speeds and limits.
-        stand_down_for_aircraft_change();
+        crate::flight_state::stand_down();
         // Republished on EVERY swap, including to None: a selector that
         // outlives its airframe aims the next aircraft's mode writes at a knob
         // it doesn't have (the same shape as the radio-power flag that latched
         // across a 172 -> Twin Otter change, 2026-07-27).
-        tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
-        tools::lights::publish_exterior(&p.lights);
-        aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
-        aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());
-        aircraft::publish_bus_volts(p.bus_volts_nominal);
-        aircraft::publish_speed_floor(p.vs_clean_kts);
+        crate::flight_state::publish_airframe(&p);
         *self.inner.write().unwrap() = p;
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -61,28 +51,6 @@ impl LiveProfile {
 
 /// Release every continuous manager before an aircraft profile changes.
 ///
-/// The high-level aborts cascade through their sub-loops; the direct atomic
-/// clears cover managers that can also run independently. Native pushback's
-/// command is stopped by the async detection poller, which has the X-Plane
-/// client needed to send it.
-pub(crate) fn stand_down_for_aircraft_change() {
-    use std::sync::atomic::Ordering::SeqCst;
-
-    full_auto::abort();
-    circuit::abort();
-    procedure::abort();
-    autoland::abort();
-    tools::recover::abort();
-    approach_guide::cancel();
-    autotakeoff::cancel();
-    autotaxi::ACTIVE.store(false, SeqCst);
-    autotaxi::BACKTRACKING.store(false, SeqCst);
-    tools::speedhold::ACTIVE.store(false, SeqCst);
-    tools::reverse::ACTIVE.store(false, SeqCst);
-    tools::engine::MIX_MANAGED.store(false, SeqCst);
-    tools::engine::LEAN_SEEKING.store(false, SeqCst);
-    pushback::ACTIVE.store(false, SeqCst);
-}
 
 /// Map an X-Plane ICAO type code to a profile id. Unknown types fall back to
 /// the Cessna so the app stays usable; add rows as profiles are added.

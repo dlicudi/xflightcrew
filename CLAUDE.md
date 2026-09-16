@@ -180,7 +180,13 @@ tools; YAML carries per-airframe config. Standing rules:
   `transponder_mode_knob`) are turned and CONFIRMED from the knob via one
   shared writer ([src/tools/radio.rs](src/tools/radio.rs) `set_mode`);
   selectors are republished on EVERY profile swap including to `None` -
-  process-wide facts must never outlive their airframe.
+  process-wide facts must never outlive their airframe. **The crew's
+  side has one page for that** ([src/flight_state.rs](src/flight_state.rs)):
+  `publish_airframe` sets every selector from the profile (boot and swap),
+  `stand_down` stops every loop that can hold the aircraft (swap, instructor
+  entry, connection lost), and a source-scanning test pins that list to every
+  `static ACTIVE` in the tree. A new loop or selector goes there, never in a
+  hand list in a caller.
 - **A cart and a contactor are two different things**: ground power drives the
   cart request (only when presence differs from want - firing the toggle blind
   dismisses the cart) AND `gpu_on`, and reports BUS volts, not the request.
