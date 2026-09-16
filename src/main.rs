@@ -3951,6 +3951,9 @@ fn known_profile(icao: &str) -> Option<String> {
             "EVOT" | "EVOP" => "lancair_evolution",
             "DHC6" => "dhc6_twin_otter",
             "RV10" => "vans_rv10",
+            "B738" | "B737" | "B739" => "boeing_737_800",
+            "A333" | "A332" | "A330" => "airbus_a330_300",
+            "S76" | "S76C" | "S76D" => "sikorsky_s76c",
             _ => return None,
         }
         .to_string(),

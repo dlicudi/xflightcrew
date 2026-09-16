@@ -1,0 +1,123 @@
+# Aircraft profile — X-Plane stock Sikorsky S-76C (S76).
+#
+# The first helicopter, and the profile is mostly about what it WITHHOLDS.
+# Every flying and ground law in this app is fixed-wing: the takeoff rotates
+# through the pitch channel, the landing flares through the VS dial, speed is
+# a throttle governor, the pattern is sized to a bank angle, the taxi steers
+# a nosewheel. None of that is a helicopter, so `rotorcraft: true` makes the
+# registry withhold every one of those loops (autoland, auto takeoff, circuit,
+# the follower, full auto, recover, the talk-down, ILS prep, hold speed, auto
+# taxi, line up, taxi to parking, pushback, reverse thrust) whatever the other
+# flags say. What is left is the crew: switches, lights, gear, radios,
+# transponder, altimeter, pitot heat, brakes, reminders, ATC and the
+# autopilot dials.
+#
+# Figures are from the aircraft's own `S-76C.acf` (Vne 155, Vno 139.5, Vle
+# 130, MTOW 11,700 lb, empty 7,574 lb, no stall speeds, no APU, TCAS). Its
+# xlua (s76_autopilot, s76_landgear, s76_throttles, no `replace_command`)
+# creates laminar/s76/controls/* for the gear handle, the throttle detents and
+# the fuel levers, and reads the stock gear handle and airspeed dial, so the
+# stock gear command is expected to move it. VERIFY every line live: no
+# helicopter has flown with this crew yet.
+
+id: sikorsky_s76c
+display_name: Sikorsky S-76C
+rotorcraft: true
+
+# Capability flags.
+# The dials: the S-76's autopilot script reads only the stock airspeed dial,
+# so the heading and altitude dials are assumed to be the sim's own AP. A
+# hypothesis; the readback compares the dial, not the flight path. VERIFY.
+autopilot: true
+# No throttle lever the crew works: the twist grips / engine control levers
+# are the pilot's, and a throttle governor on a helicopter is wrong by
+# construction. With `engine` and `throttle` both false no start, mixture or
+# speed tool is registered.
+throttle: false
+engine: false
+autothrottle: false
+speedbrake: false
+reverse_thrust: false
+barometer: true
+pitot_heat: true
+pitch_trim: false
+com_radio: true
+com2_radio: true
+nav_radio: true
+transponder: true
+ils: false
+parking_brake: true
+retractable_gear: true
+cabin_crew: false
+pressurised: false
+engines: 2
+
+turbine_start: false
+auto_prep: false
+magnetos: false
+carb_heat: false
+fuel_pump: false
+directional_gyro: false
+
+# Electrical on the stock commands (nothing is replaced). VERIFY.
+electrical:
+  - key: battery
+    spoken: battery
+    on_commands:  [sim/electrical/battery_1_on]
+    off_commands: [sim/electrical/battery_1_off]
+    readback:     [sim/cockpit/electrical/battery_on]
+  - key: generators
+    spoken: generators
+    on_commands:  [sim/electrical/generator_1_on, sim/electrical/generator_2_on]
+    off_commands: [sim/electrical/generator_1_off, sim/electrical/generator_2_off]
+    readback:     ["sim/cockpit/electrical/generator_on[0]", "sim/cockpit/electrical/generator_on[1]"]
+  - key: avionics
+    spoken: avionics
+    on_commands:  [sim/systems/avionics_on]
+    off_commands: [sim/systems/avionics_off]
+    readback:     [sim/cockpit/electrical/avionics_on]
+
+# Exterior lights (standard X-Plane switch datarefs). A helicopter has a
+# landing light and a search light; the stock taxi switch is declared as the
+# second lamp. VERIFY which switch the S-76's panel wires.
+lights:
+  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on, command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
+  - { key: beacon,  spoken: beacon,            dataref: sim/cockpit2/switches/beacon_on,            command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
+  - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
+  - { key: landing, spoken: landing light,     dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+  - { key: taxi,    spoken: search light,      dataref: sim/cockpit2/switches/taxi_light_on,        command_on: sim/lights/taxi_lights_on,    command_off: sim/lights/taxi_lights_off }
+
+# Vne 155 KIAS from the acf; the monitor's overspeed line.
+vne_kts: 155.0
+# No stall speed: a rotor does not stall at an airspeed, and the acf says 0.
+# Left unset so the airspeed caution never fires and the floor is never
+# computed from a number that means nothing here.
+# Gear limit speed, the acf's Vle.
+vlo_kts: 130.0
+
+# Fuel-endurance alerting. 281 US gal standard tanks; about 700 lb/hr for the
+# pair in cruise (320 kg/hr). VERIFY.
+fuel:
+  reserve_caution_min: 30.0
+  reserve_warning_min: 20.0
+  cruise_burn_kg_hr: 320.0
+
+# Static reference figures recited on request. NO V-speeds: nothing here
+# rotates, climbs at Vy or flies an approach speed, and an absent number is
+# spoken as absent rather than invented.
+reference:
+  kind: twin-engine helicopter
+  vno_kts: 139.0               # acf
+  cruise_kts: 140.0            # KTAS, typical
+  cruise_ias_kts: 140.0
+  max_gross_lb: 11700.0        # acf MTOW
+  empty_weight_lb: 7574.0      # acf empty
+  useful_load_lb: 4126.0
+  service_ceiling_ft: 15000.0  # VERIFY
+  fuel_capacity_gal: 281.0     # VERIFY
+  endurance_hours: 2.9         # 281 gal x 6.7 lb / 700 lb per hour, no reserve
+
+advisor:
+  - dataref: sim/cockpit2/ice/ice_pitot_heat_on_pilot
+    phases: [takeoff, climb, cruise, approach, landing]
+    say: Pitot heat's off.

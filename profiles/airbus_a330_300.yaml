@@ -1,0 +1,160 @@
+# Aircraft profile — X-Plane stock Airbus A330-300 (A333).
+#
+# The first widebody and the first fly-by-wire airframe: a Laminar aircraft on
+# stock systems whose xlua REPLACES more than the 737's — the battery toggles,
+# generator 1 on/off and both generator toggles, the APU commands, engine and
+# APU bleed toggles, autobrake, speedbrake, the flight director bars, wipers,
+# barometer and minimums (grepped `replace_command` across
+# plugins/xlua/scripts, 2026-09-16). A replaced command still reaches the
+# aircraft's own handler, so the stock commands below are declared and every
+# one is a hypothesis until the swap-time probe and a live readback confirm
+# it. Figures are from the aircraft: the specifications page of `X-Plane A330
+# Pilot Operating Manual.pdf` in the aircraft folder and its `A330.acf` (Vs
+# 175 / Vso 125 / Vfe 215 and 180 / Vle 250 / Vmo 330, MTOW 533,519 lb, empty
+# 285,278 lb, five flap positions 0/8/14/22/32 deg = CONF 0/1/2/3/FULL).
+#
+# ENGINE START IS THE PILOT'S (`A333.engine` is the aircraft's own script; no
+# start block fits it). The FBW protections are the aircraft's: the takeoff
+# rotation through the pitch channel is a sidestick demand here, bounded by
+# `tail_strike_deg`, and the flare through the VS dial is what the stock
+# autopilot does with it. Nothing below is proven in the air yet.
+
+id: airbus_a330_300
+display_name: Airbus A330-300
+
+# Capability flags.
+autopilot: true
+throttle: true
+# Stock autothrust exists on this model, but the `autothrottle` tool is written
+# against laminar/md82 datarefs and declaring it withholds `hold_speed`.
+autothrottle: false
+speedbrake: true
+reverse_thrust: true   # VERIFY
+barometer: true
+pitot_heat: true
+pitch_trim: true
+com_radio: true
+com2_radio: true
+nav_radio: true
+transponder: true
+ils: true
+parking_brake: true
+retractable_gear: true
+cabin_crew: true       # up to 440 seats
+pressurised: true
+engines: 2
+
+turbine_start: false
+auto_prep: false
+
+# Jet — none of the piston systems apply.
+engine: false
+magnetos: false
+carb_heat: false
+fuel_pump: false
+directional_gyro: false
+
+# Electrical. Battery on/off are NOT replaced (only the toggles are);
+# generator_1_on/off ARE, by the aircraft's handler. Two batteries. VERIFY.
+electrical:
+  - key: battery
+    spoken: batteries
+    on_commands:  [sim/electrical/battery_1_on, sim/electrical/battery_2_on]
+    off_commands: [sim/electrical/battery_1_off, sim/electrical/battery_2_off]
+    readback:     ["sim/cockpit2/electrical/battery_on[0]", "sim/cockpit2/electrical/battery_on[1]"]
+  - key: generators
+    spoken: generators
+    on_commands:  [sim/electrical/generator_1_on, sim/electrical/generator_2_on]
+    off_commands: [sim/electrical/generator_1_off, sim/electrical/generator_2_off]
+    readback:     ["sim/cockpit/electrical/generator_on[0]", "sim/cockpit/electrical/generator_on[1]"]
+  - key: avionics
+    spoken: avionics
+    on_commands:  [sim/systems/avionics_on]
+    off_commands: [sim/systems/avionics_off]
+    readback:     [sim/cockpit/electrical/avionics_on]
+
+# Exterior lights (standard X-Plane switch datarefs; no light command is replaced).
+lights:
+  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on, command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
+  - { key: beacon,  spoken: beacon,            dataref: sim/cockpit2/switches/beacon_on,            command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
+  - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
+  - { key: landing, spoken: landing lights,    dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
+  - { key: taxi,    spoken: taxi light,        dataref: sim/cockpit2/switches/taxi_light_on,        command_on: sim/lights/taxi_lights_on,    command_off: sim/lights/taxi_lights_off }
+
+# Vmo 330 KIAS (Mmo 0.89 per the POM); the acf's Vne.
+vne_kts: 330.0
+# Clean stall from the acf at a mid weight. 1.2 x this (210) is the floor any
+# handed-down target is raised to; the derived approach speed is max(1.3 Vso,
+# 1.2 Vs) so a clean floor never lands the aircraft fast on its own.
+vs_clean_kts: 175.0
+# Gear operating limit (VLO 250 extend; the acf's Vle 250).
+vlo_kts: 250.0
+
+# Tail clearance at rotation is about 12.5 degrees on the -300; the rotation
+# is bounded 2 degrees below. VERIFY.
+tail_strike_deg: 12.5
+
+# Taxi pacing as the MD-82's: at idle a widebody rolls past 10 knots on its own.
+taxi:
+  kts: 18.0
+  turn_kts: 10.0
+  sharp_kts: 6.0
+
+# Fuel-endurance alerting. 25,765 US gal (97,530 L) capacity; cruise burn
+# about 12,000 lb/hr (5,500 kg/hr) for the pair.
+fuel:
+  reserve_caution_min: 60.0
+  reserve_warning_min: 30.0
+  cruise_burn_kg_hr: 5500.0
+
+transition_altitude_ft: 18000.0
+
+# Static reference figures. One mid-weight card (about 400,000 lb, CONF 2) for
+# the reasons the 737's gives. POM: approach 140-160 full flap, takeoff
+# 8,200 ft, landing 4,750 ft, ceiling 41,000, cruise M0.86.
+reference:
+  kind: twin-engine jet
+  vr_kts: 148.0                # ~400,000 lb CONF 2 (V1 143 / V2 153). VERIFY
+  vy_kts: 220.0                # climb-out + pattern speed the laws hold
+  best_climb_fpm: 2500.0       # initial climb, light; the climb law takes 80%
+  cruise_ias_kts: 290.0        # KIAS the cruise governor holds (~M0.82 up high)
+  approach_kts: 145.0          # POM 140-160, CONF FULL / gear down
+  vs0_kts: 125.0               # acf: stall, landing configuration
+  cruise_kts: 470.0            # M0.86 at altitude, KTAS
+  max_gross_lb: 533519.0       # acf MTOW
+  empty_weight_lb: 285278.0    # acf empty
+  useful_load_lb: 248241.0     # MTOW - empty
+  service_ceiling_ft: 41000.0  # POM
+  max_crosswind_kts: 32.0      # demonstrated, dry. VERIFY
+  fuel_capacity_gal: 25765.0   # 97,530 L Jet A-1
+  endurance_hours: 14.0        # ~172,600 lb / 12,000 lb per hour, no reserve
+  takeoff_distance_ft: 8200.0  # RECITED: POM field length at MTOW
+  # GROUND ROLL at the card's mid weight, roughly 6,000 ft; the recited 8,200
+  # is the factored MTOW field length.
+  takeoff_roll_ft: 6000.0
+  landing_distance_ft: 4750.0  # POM
+
+# Five positions in the aircraft file, 0/8/14/22/32 degrees flap, which the
+# POM labels CONF 0 / 1 / 2 / 3 / FULL (slats 16/20/23/23). Limits are the
+# A330 placard (CONF 1+F 215, 2 196, 3 186, FULL 180); the acf agrees at both
+# ends. Takeoff is CONF 2, the POM's own hint. VERIFY the middle in the sim.
+flaps:
+  takeoff_ratio: 0.5
+  detents:
+    - { label: "0",    spoken: up,    ratio: 0.0 }
+    - { label: "1",    spoken: one,   ratio: 0.25, vfe_kts: 215.0 } # acf Vfe1
+    - { label: "2",    spoken: two,   ratio: 0.5,  vfe_kts: 196.0 } # VERIFY
+    - { label: "3",    spoken: three, ratio: 0.75, vfe_kts: 186.0 } # VERIFY
+    - { label: full,   spoken: full,  ratio: 1.0,  vfe_kts: 180.0 } # acf Vfe
+
+advisor:
+  - dataref: sim/cockpit2/ice/ice_pitot_heat_on_pilot
+    phases: [takeoff, climb, cruise, approach, landing]
+    say: Pitot heat's off.
+  - dataref: sim/cockpit/electrical/landing_lights_on
+    phases: [takeoff, approach, landing]
+    say: Landing lights on.
+    command: sim/lights/landing_lights_on
+  - dataref: sim/cockpit2/switches/fasten_seat_belts
+    phases: [takeoff, climb, approach, landing]
+    say: Seat belt signs are off.

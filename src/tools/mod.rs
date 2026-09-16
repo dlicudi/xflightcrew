@@ -153,11 +153,35 @@ pub struct Registry {
     tools: Vec<Box<dyn Tool>>,
 }
 
+/// The tools a rotorcraft profile never gets: every loop whose law assumes a
+/// wing, a runway roll or a throttle-for-speed (see
+/// [`crate::aircraft::AircraftProfile::rotorcraft`]).
+pub const ROTORCRAFT_WITHHELD: &[&str] = &[
+    "autoland",
+    "auto_takeoff",
+    "circuit",
+    "fly_procedure",
+    "full_auto",
+    "recover",
+    "visual_approach",
+    "prepare_ils",
+    "hold_speed",
+    "auto_taxi",
+    "line_up",
+    "taxi_to_parking",
+    "pushback",
+    "reverse_thrust",
+];
+
 impl Registry {
     /// Build the tool set for an aircraft. The profile shapes the surface: the
     /// 172 has no retractable gear, so no `gear` tool is added for it. Each
     /// system present on the airframe contributes its tool(s).
     pub fn for_aircraft(profile: &AircraftProfile) -> Self {
+        Self::build(profile)
+    }
+
+    fn build(profile: &AircraftProfile) -> Self {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
         // How briskly this airframe taxis. Resolved once here so every ground
         // drive — the spoken auto taxi, the line-up, the arrival, and the ones
@@ -587,6 +611,13 @@ impl Registry {
         // crew memory, not an airframe system, so available on any aircraft.
         tools.push(Box::new(reminder::SetReminder));
 
+        // A helicopter keeps its switches, radios and autopilot dials and
+        // loses every fixed-wing law, whatever the other flags said: the
+        // laws would rotate, flare and taxi a rotorcraft like a 172.
+        if profile.rotorcraft {
+            tools.retain(|t| !ROTORCRAFT_WITHHELD.contains(&t.name()));
+        }
+
         // Checklists are NOT registered as one-shot tools — the copilot runs them
         // interactively (narrate + act + verify + call out the pilot's items),
         // which needs the voice, so the main loop intercepts the pick. They're
@@ -734,6 +765,29 @@ mod departure_lights_tests {
             );
         }
         assert!(checked > 0, "no profiles with lights were checked");
+    }
+
+    /// The S-76C: a helicopter gets its switches, radios, gear and the
+    /// autopilot dials, and none of the fixed-wing laws.
+    #[test]
+    fn a_rotorcraft_keeps_the_switches_and_loses_every_fixed_wing_law() {
+        let p = crate::aircraft::load("sikorsky_s76c").expect("S-76C profile loads");
+        assert!(p.rotorcraft);
+        let reg = super::Registry::for_aircraft(&p);
+        let names: Vec<&str> = reg.tools.iter().map(|t| t.name()).collect();
+        for withheld in super::ROTORCRAFT_WITHHELD {
+            assert!(!names.contains(withheld), "{withheld} registered on a helicopter");
+        }
+        for kept in ["gear", "set_heading", "set_altitude", "set_com1", "set_transponder", "set_parking_brake"] {
+            assert!(names.contains(&kept), "{kept} missing on the S-76C from {names:?}");
+        }
+        // The gate is the flag, not the other flags: a fixed-wing profile
+        // with the same switches keeps its laws.
+        let mut fixed = p.clone();
+        fixed.rotorcraft = false;
+        let fixed_reg = super::Registry::for_aircraft(&fixed);
+        let names: Vec<&str> = fixed_reg.tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"autoland") && names.contains(&"auto_takeoff"));
     }
 }
 

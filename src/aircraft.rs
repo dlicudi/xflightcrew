@@ -290,6 +290,14 @@ pub struct AircraftProfile {
     #[serde(default)]
     #[allow(dead_code)]
     pub retractable_gear: bool,
+    /// A helicopter. Every flying and ground law here is fixed-wing (a
+    /// rotation through the pitch channel, a flare through the VS dial, a
+    /// throttle governor, a pattern sized to a bank angle), so the registry
+    /// withholds them all ([`crate::tools::ROTORCRAFT_WITHHELD`]) whatever
+    /// the other flags say; the crew keeps the switches, the radios and the
+    /// autopilot dials. The S-76C, 2026-09-16.
+    #[serde(default)]
+    pub rotorcraft: bool,
     /// Transition altitude (ft MSL): at or above it, "set the altimeter" dials in
     /// standard pressure (29.92 inHg / 1013 hPa) instead of local QNH — that's the
     /// rule above the transition altitude. Defaults to 18,000 ft (US FL180); lower
@@ -1505,6 +1513,35 @@ mod tests {
         }
     }
 
+    /// The stock airliners (2026-09-16): parsed strictly, and the numbers the
+    /// automation flies are the airframe's own, never the GA defaults (the
+    /// RV-10 lesson at 174,000 lb).
+    #[test]
+    fn stock_airliner_yamls_parse_strictly_and_carry_their_own_numbers() {
+        for (id, vr, roll) in [("boeing_737_800", 145.0, 5500.0), ("airbus_a330_300", 148.0, 6000.0)] {
+            let text = std::fs::read_to_string(format!("profiles/{id}.yaml")).unwrap();
+            let p: AircraftProfile = serde_yaml::from_str(&text)
+                .unwrap_or_else(|e| panic!("{id}.yaml failed to parse: {e:#}"));
+            assert_eq!(p.id, id);
+            assert_eq!(p.engines, 2);
+            assert_eq!(p.pressurised, Some(true), "{id}: cabin alerts need the real answer");
+            assert!(p.cabin_crew && p.retractable_gear && p.throttle && !p.engine);
+            assert!(!p.autothrottle, "{id}: the md82 autothrottle tool would withhold hold_speed");
+            assert!(!p.turbine_start && !p.auto_prep, "{id}: no start sequence is declared, so none is cranked");
+            let r = p.reference.as_ref().expect("reference card");
+            assert_eq!(r.vr_kts, Some(vr));
+            assert_eq!(r.takeoff_roll_ft, Some(roll), "{id}: the roll the runway check uses");
+            assert!(r.landing_distance_ft.unwrap() > 4000.0);
+            assert!(r.approach_kts.unwrap() >= 140.0 && p.vs_clean_kts.unwrap() > 130.0);
+            let f = p.flaps.as_ref().expect("flap detents");
+            let to = f.takeoff_ratio.unwrap();
+            assert!(f.detents.iter().any(|d| (d.ratio - to).abs() < 1e-9), "{id}: takeoff flap is a gate");
+            assert!(f.detents.last().unwrap().vfe_kts.is_some());
+            assert!(p.fuel.as_ref().unwrap().cruise_burn_kg_hr > 1000.0);
+            assert!(p.tail_strike_deg.is_some());
+        }
+    }
+
     #[test]
     fn dc3_yaml_loads_and_is_conservative() {
         // YAML-only profile (no built-in). Deserialize the file directly so a
@@ -1996,6 +2033,7 @@ fn cessna_172sp() -> AircraftProfile {
         mixture_notch: None,
         turboprop_start: None,
         retractable_gear: false,
+        rotorcraft: false,
         transition_altitude_ft: 18_000.0,
         view_blend: 1.0,
         locations: std::collections::HashMap::new(),
@@ -2276,6 +2314,7 @@ fn cirrus_sr22() -> AircraftProfile {
         mixture_notch: None,
         turboprop_start: None,
         retractable_gear: false,
+        rotorcraft: false,
         transition_altitude_ft: 18_000.0,
         view_blend: 1.0,
         locations: std::collections::HashMap::new(),

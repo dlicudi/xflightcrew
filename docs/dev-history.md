@@ -3908,3 +3908,55 @@ Rules from it:
   the magnetic heading for the leg's end fix (`interaction::rejoin_index`,
   `REJOIN_CORRIDOR_NM` 3 nm, unchanged). The pilot closes it and asks again.
 - Whisper's "Resume site plan." is the resume request (`resume_plan_request`).
+
+## 2026-09-16: the stock airliners get profiles (B738, A333)
+
+Decided: stock airliners before the add-ons (Zibo, ToLiss), because the risk
+is the product shape, not the datarefs. Every flying law here is GA-shaped
+(rotation through the pitch channel, the flare through the VS dial, speed
+through a throttle governor); an airliner is flown through the MCP/FCU and
+the box, and "full auto" there becomes program-the-box, set-the-modes,
+read-the-flows. The stock 737 and A330 expose those gaps on datarefs that
+can be trusted, and an add-on is then a delta on the profile.
+
+Without a profile both would have flown under `generic_from_acf` with the
+GA defaults for the runway check (`takeoff_roll_ft`) and the pattern, which
+is the RV-10 fault at 174,000 lb. `profiles/boeing_737_800.yaml` and
+`profiles/airbus_a330_300.yaml` carry the airframes' own numbers: V-speeds
+on one mid-weight card, the POM's field lengths recited and a mid-weight
+ground roll checked, the acf's stall, Vfe, Vle, Vmo and weights, every
+flap gate with its placard limit (the acf agrees at both ends of each
+ladder), pressurised, cabin crew, two engines, tail-strike attitude, a
+burn for the endurance check. `known_profile` maps B738/B737/B739 and
+A333/A332/A330.
+
+What each profile deliberately does NOT declare: a start sequence (the 737's
+xlua replaces the stock starters, the A330's `A333.engine` is its own; the
+MD-82 and CitX sequences are written against their own datarefs), so full
+auto says "no start sequence" instead of cranking blind; and the
+`autothrottle` tool (md82 datarefs; declaring it withholds `hold_speed`).
+The A330's xlua replaces the battery toggles, generator on/off, the APU and
+bleed commands and autobrake, so its electrical block is stock commands
+reaching the aircraft's own handlers: hypotheses for the swap-time probe
+and a live readback. Steering is the open question on both: the steer
+channel is rudder input and the 737 steers by tiller at the gate.
+
+## 2026-09-16: the first helicopter (S-76C) is a profile that withholds
+
+Nothing in the code knew a rotor existed (zero hits for helicopter or
+rotorcraft), and the S-76C's acf carries no stall speed, so under the generic
+path it would have had the 172's numbers and every fixed-wing law on offer:
+autoland would have flared it through the VS dial, auto takeoff rotated it
+through the pitch channel, hold speed governed its twist grips. The new
+`rotorcraft: true` flag makes the registry withhold that whole set
+(`tools::ROTORCRAFT_WITHHELD`: autoland, auto takeoff, circuit, the follower,
+full auto, recover, the talk-down, ILS prep, hold speed, auto taxi, line up,
+taxi to parking, pushback, reverse thrust) whatever the other flags say, and
+a test builds the registry from `profiles/sikorsky_s76c.yaml` to prove it.
+What stays is the crew: switches, lights, gear (the S-76's xlua mirrors the
+stock gear handle), radios, transponder, altimeter, pitot heat, brakes,
+reminders, ATC, and the autopilot dials as a hypothesis (its script reads
+only the stock airspeed dial). No V-speeds are declared, so none are spoken.
+`known_profile` maps S76/S76C/S76D. Not done, and honestly not started: a
+rotorcraft flight law, helicopter phraseology in the tower (air taxi, a
+helipad instead of a runway), the search light's real switch.
