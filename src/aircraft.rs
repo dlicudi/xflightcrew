@@ -22,6 +22,46 @@ pub struct FlarePowerProfile {
     pub lead_seconds: f64,
 }
 
+/// How the landing arrest's vertical-speed dial leads THIS autopilot's lag
+/// (`autoland::vs_dial_fpm`): dial = target + gain x (target - predicted),
+/// where predicted = actual + trend_seconds x the sink's rate of change,
+/// capped at `max_climb_fpm`. The default is the 172's, fitted to a
+/// first-order 4.5 s lag (LXGB 27, 2026-09-14). A jet's vertical-speed
+/// mode is second-order with two seconds of dead time (the 737 at EGCC,
+/// 2026-09-19: the same gain and cap pinned the dial at +300 for three
+/// seconds and ballooned it to +160 fpm at ten feet), so a slower airframe
+/// declares a lower gain, a lower cap and a trend term for damping.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ArrestLeadProfile {
+    pub gain: f64,
+    pub max_climb_fpm: f64,
+    #[serde(default)]
+    pub trend_seconds: f64,
+}
+
+impl Default for ArrestLeadProfile {
+    fn default() -> Self {
+        Self {
+            gain: 2.0,
+            max_climb_fpm: 300.0,
+            trend_seconds: 0.0,
+        }
+    }
+}
+
+impl ArrestLeadProfile {
+    /// A declared lead is only used when every number is a number.
+    pub fn valid(self) -> Option<Self> {
+        (self.gain.is_finite()
+            && (0.0..=5.0).contains(&self.gain)
+            && self.max_climb_fpm.is_finite()
+            && (0.0..=1000.0).contains(&self.max_climb_fpm)
+            && self.trend_seconds.is_finite()
+            && (0.0..=5.0).contains(&self.trend_seconds))
+        .then_some(self)
+    }
+}
+
 /// Everything the tool layer needs to know about one airframe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AircraftProfile {
@@ -58,6 +98,10 @@ pub struct AircraftProfile {
     /// thrust; `None` lets the speed law idle the engines (the pistons).
     #[serde(default)]
     pub approach_thrust_min: Option<f64>,
+    /// How the landing arrest leads this autopilot's lag. `None` = the
+    /// 172's fitted numbers (see [`ArrestLeadProfile`]).
+    #[serde(default)]
+    pub arrest_lead: Option<ArrestLeadProfile>,
     /// None = unknown; do not invent a pressurisation system in warnings.
     #[serde(default)]
     pub pressurised: Option<bool>,
@@ -1273,6 +1317,43 @@ pub fn approach_thrust_min() -> Option<f64> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// The landing arrest's lead for the live airframe (see [`ArrestLeadProfile`]).
+static ARREST_LEAD: std::sync::Mutex<ArrestLeadProfile> =
+    std::sync::Mutex::new(ArrestLeadProfile {
+        gain: 2.0,
+        max_climb_fpm: 300.0,
+        trend_seconds: 0.0,
+    });
+
+/// Publish the airframe's arrest lead. Called on EVERY profile swap; an
+/// absent or malformed block is the default, never the previous airframe's.
+pub fn publish_arrest_lead(lead: Option<ArrestLeadProfile>) {
+    *ARREST_LEAD.lock().unwrap_or_else(|e| e.into_inner()) =
+        lead.and_then(ArrestLeadProfile::valid).unwrap_or_default();
+}
+
+/// The live airframe's arrest lead.
+pub fn arrest_lead() -> ArrestLeadProfile {
+    *ARREST_LEAD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The live airframe's landing distance in metres, if its profile recites
+/// one. The autoland's float rule asks it how much pavement a landing from
+/// here still needs; `None` is the old GA figure.
+static LANDING_DISTANCE_M: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// Publish the airframe's landing distance. Called on EVERY profile swap.
+pub fn publish_landing_distance(feet: Option<f64>) {
+    *LANDING_DISTANCE_M.lock().unwrap_or_else(|e| e.into_inner()) = feet
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v * 0.3048);
+}
+
+/// The live airframe's landing distance, metres.
+pub fn landing_distance_m() -> Option<f64> {
+    *LANDING_DISTANCE_M.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `asked`, raised to the floor when it is under it. Pure; the callers say so
 /// aloud and record it.
 pub fn floored_target(asked: f64, floor: Option<f64>) -> f64 {
@@ -2179,6 +2260,7 @@ fn cessna_172sp() -> AircraftProfile {
         bus_volts_nominal: None,
         flare_power: None,
         approach_thrust_min: None,
+        arrest_lead: None,
         pressurised: Some(false),
         park_brake_valve_set: None,
         electrical: {
@@ -2458,6 +2540,7 @@ fn cirrus_sr22() -> AircraftProfile {
         bus_volts_nominal: None,
         flare_power: None,
         approach_thrust_min: None,
+        arrest_lead: None,
         pressurised: Some(false),
         park_brake_valve_set: None,
         pitot_heat: true,

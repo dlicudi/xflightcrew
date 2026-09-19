@@ -610,10 +610,23 @@ history):
   2026-09-14: the 172's VS mode follows its dial as a 4.5 s lag, longer
   than the flare itself, and three landings in a row touched down at the
   roundout's rate): in the roundout and the flare (`Guidance.arresting`)
-  the dial is target + 2 x (target - actual), capped at +300; above the
-  band the dial is the target. The tick blackboxes `cmd_vs`, `vs_dial` and
-  `vvi` so the three can be told apart; the sortie test's plant carries the
-  flare's throttle-cut sink, without which a pure lag passes the old law.
+  the dial is target + gain x (target - predicted sink), capped; above the
+  band the dial is the target. **The gain, the cap and the trend horizon
+  are the airframe's** (`ArrestLeadProfile`, default the 172's 2 / +300 /
+  0 s; the 737's VS mode is two 1.5 s lags with 2 s of dead time and the
+  172's numbers pinned its dial at +300 into a balloon and an overflight
+  go-around, EGCC 23L 2026-09-19: it declares 1.5 / +100 / 1.5 s), and
+  **the arrest's gates and targets are seconds of sink, not feet**
+  (`arrest_gates_ft`, `arrest_targets_fpm`: 25 / 50 ft and -250 / -100 at
+  a 172's speeds, 35 / 76 ft and -420 / -175 at a 737's). Over the
+  pavement above the band the path's own sink continues (the unsigned
+  glidepath distance used to turn the level-hold on at 60 ft), the lever
+  never advances in an arrest, and the overflight allowance is geometric
+  and knows the recited landing distance. The tick blackboxes `cmd_vs`,
+  `vs_dial`, `vvi` and `vvi_trend` so they can be told apart; the sortie
+  tests fly a first-order 172 plant AND the 737's second-order plant with
+  its dead time through the real law, with the flare's throttle-cut sink,
+  without which a pure lag passes the old law.
   **Every planned arrival hands its runway down**
   (`EndAction::Approach { rwy_id }` to `run_autoland`'s forced runway): the
   self-pick is the emergency path and at a field with parallels it takes
@@ -703,9 +716,13 @@ named as held, never written (one writer per dataref). Flavours:
 
 - **Crew** (pilot flying, copilot acting): the spoken "descent checklist"
   lands here.
-- **Monitor** (an automation flying): read-only cross-check, narration
-  skipped, a discrepancy spoken and blackboxed (`checklist` event
-  `discrepancy`), never a write. The mission's laws act; the list audits.
+- **Monitor** (an automation flying): read-only cross-check, silent item
+  by item (satisfied, held and call-out items alike), every discrepancy
+  blackboxed (`checklist` event `discrepancy`), ONE spoken line at the end
+  naming what is not as listed (`flow::summary_line`), never a write. The
+  mission's laws act and announce as they act; the list audits. A file
+  item conditioned on a height the list does not run at (lights above
+  10,000 in a list that runs at 2,000 ft) is a call-out, not a test.
 - **Instruct** ("talk / walk / guide me through the X checklist",
   `instruct_request`): never writes by construction; says the item, watches
   the dataref for the pilot to do it ("Good."), moves on at "next"/"set" or

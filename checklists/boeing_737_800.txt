@@ -6,6 +6,12 @@
 # to EXIST on the stock aircraft over the Web API that day. Section titles are
 # the crew's phase keys, so the tracker proposes each list at its phase.
 # Conditions are single dataref tests; items with no test are call-outs.
+# An item conditioned on a height the list does not run at (landing lights
+# off above 10,000 in a climb list that runs at 2,000 ft; QNH to standard at
+# the transition; landing lights on below 10,000 in a descent list that runs
+# at the top of descent) is a call-out: the crew's own lights law and
+# altimeter check own those switches at the right height, and a test here
+# was a guaranteed "not set" on every flight (LFLL-EGLL, 2026-09-17).
 
 sw_checklist:PREFLIGHT:PREFLIGHT
 sw_remark:PREFLIGHT
@@ -72,7 +78,6 @@ sw_item:FLAPS|5 FOR TAKEOFF:sim/cockpit2/controls/flap_ratio:0.3|0.45
 sw_item:STABILIZER TRIM|SET FOR TAKEOFF:sim/cockpit2/controls/elevator_trim:-0.15|0.15
 sw_item:FLIGHT CONTROLS|CHECKED
 sw_item:TRANSPONDER|ALT:sim/cockpit2/radios/actuators/transponder_mode:>1
-sw_item:TAXI LIGHT|ON:sim/cockpit2/switches/taxi_light_on:1
 sw_remark:BEFORE TAXI COMPLETE
 
 sw_checklist:BEFORE TAKEOFF:BEFORE TAKEOFF
@@ -92,10 +97,10 @@ sw_checklist:CLIMB:CLIMB
 sw_remark:CLIMB
 sw_item:LANDING GEAR|UP:sim/cockpit2/controls/gear_handle_down:0
 sw_item:FLAPS|UP ON SCHEDULE:sim/cockpit2/controls/flap_ratio:<0.05
-sw_item:LANDING LIGHTS|OFF ABOVE 10,000:sim/cockpit2/switches/landing_lights_on:0
+sw_item:LANDING LIGHTS|OFF ABOVE 10,000
 sw_item:TAXI LIGHT|OFF:sim/cockpit2/switches/taxi_light_on:0
 sw_item:AUTOPILOT|ENGAGED AS REQUIRED
-sw_item:ALTIMETERS|STANDARD AT TRANSITION:sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot:29.91|29.93
+sw_item:ALTIMETERS|STANDARD AT TRANSITION
 sw_item:PACKS|AUTO:sim/cockpit2/bleedair/actuators/pack_left:1
 sw_remark:CLIMB COMPLETE
 
@@ -114,7 +119,7 @@ sw_item:PRESSURISATION|LANDING ALTITUDE SET
 sw_item:APPROACH BRIEFING|COMPLETE
 sw_item:AUTOBRAKE|AS REQUIRED
 sw_item:ALTIMETERS|QNH BELOW TRANSITION
-sw_item:LANDING LIGHTS|ON BELOW 10,000:sim/cockpit2/switches/landing_lights_on:1
+sw_item:LANDING LIGHTS|ON BELOW 10,000
 sw_remark:DESCENT COMPLETE
 
 sw_checklist:BEFORE LANDING:BEFORE LANDING
@@ -124,7 +129,6 @@ sw_item:SPEED BRAKE|ARMED
 sw_item:LANDING GEAR|DOWN:sim/cockpit2/controls/gear_handle_down:1
 sw_item:FLAPS|30 OR 40:sim/cockpit2/controls/flap_ratio:>0.8
 sw_item:LANDING LIGHTS|ON:sim/cockpit2/switches/landing_lights_on:1
-sw_item:TAXI LIGHT|ON:sim/cockpit2/switches/taxi_light_on:1
 sw_item:AUTOPILOT|OFF BEFORE TOUCHDOWN
 sw_remark:BEFORE LANDING COMPLETE. VREF 145 MID WEIGHT, FLAPS 40
 
@@ -134,7 +138,6 @@ sw_item:SPEED BRAKE|DOWN:sim/cockpit2/controls/speedbrake_ratio:<0.05
 sw_item:FLAPS|UP:sim/cockpit2/controls/flap_ratio:<0.05
 sw_item:LANDING LIGHTS|OFF:sim/cockpit2/switches/landing_lights_on:0
 sw_item:STROBE LIGHTS|OFF:sim/cockpit2/switches/strobe_lights_on:0
-sw_item:TAXI LIGHT|ON:sim/cockpit2/switches/taxi_light_on:1
 sw_item:TRANSPONDER|STANDBY:sim/cockpit2/radios/actuators/transponder_mode:1
 sw_item:APU|START IF REQUIRED
 sw_remark:AFTER LANDING COMPLETE

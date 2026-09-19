@@ -50,6 +50,20 @@ flare_power:
   reduction_per_second: 0.08
   hold_sink_fpm: 400.0
   lead_seconds: 1.0
+# How the landing arrest leads THIS autopilot. The 172's law (gain 2, dial
+# cap +300, no trend term) was fitted to a first-order 4.5 s lag; this
+# aircraft's VS mode, fitted to the EGCC 23L tick log (2026-09-19), is two
+# 1.5 s lags in series with two seconds of dead time, and the 172's numbers
+# pinned the dial at +300 for three seconds, levelled it at 30 ft, and
+# ballooned it to +160 fpm at ten feet into an overflight go-around. A
+# lower gain, a cap that can never command a real climb, and a trend term
+# for damping: through the fitted plant the arrest lands at 120-180 fpm
+# without a balloon (the sortie test in autoland.rs). VERIFY on the next
+# landing; the blackbox tick carries vs_dial, vvi and vvi_trend.
+arrest_lead:
+  gain: 1.5
+  max_climb_fpm: 100.0
+  trend_seconds: 1.5
 pitot_heat: true
 pitch_trim: true
 com_radio: true
@@ -160,7 +174,12 @@ reference:
   # 1,030 ft before the follower picked it up (LFLL, 2026-09-17).
   initial_climb_kts: 170.0     # V2 150 + 20. VERIFY
   best_climb_fpm: 3000.0       # initial climb, light; the climb law takes 80%
-  cruise_ias_kts: 280.0        # KIAS the cruise governor holds (~M0.78 up high)
+  # KIAS the cruise governor holds. Nothing in the crew reads Mach, so the
+  # number must stay under Mmo 0.82 at the cruise altitudes a 737 files:
+  # 255 KIAS is M0.78 at FL360 (the old 280, the acf's Vno, is M0.84 there,
+  # and on 2026-09-17 the aircraft could not reach it and sat at 240 on the
+  # stop). Lower cruise is slower than it could be; that is the safe side.
+  cruise_ias_kts: 255.0
   approach_kts: 145.0          # POM 135-155, full flap / gear down; Vref40 ~140 mid weight
   vs0_kts: 114.0               # acf: stall, landing configuration
   cruise_kts: 450.0            # POM long-range cruise, KTAS (max level 490)

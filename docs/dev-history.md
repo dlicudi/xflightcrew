@@ -4320,3 +4320,139 @@ follower's last enroute leg ending at TARTN - 20.6 nm from CI24 at the
 plan's own 6,400 ft, which is where an ILS is armed rather than a hundred
 miles out at cruise. The GPS route loses exactly two mid-route fixes
 (TIMPO, ELVOS) and fits in 486 bytes.
+
+## 2026-09-19: the 737 profile reviewed; the monitor's checklist goes quiet; narration perishes
+
+A read of `profiles/boeing_737_800.yaml` against the install (every name in
+DataRefs.txt, the acf's limits: Vs 139, Vso 114, Vfe 250/162, Vle 270, Vne
+340, Mmo 0.82, MTOW 174,200) and against the LFLL-EGLL blackbox. The names
+and the placard ladder are right. What was not:
+
+- **The cruise speed target was above Mmo.** `cruise_ias_kts: 280` (the
+  acf's Vno) is M0.78 at FL290 but M0.84 at FL360, and nothing in the crew
+  reads Mach. On the 17th the aircraft could not reach it at FL360 and sat
+  at 240 KIAS on the stop for the whole cruise. Now 255 (M0.78 at FL360).
+  A Mach-aware governor, or an `mmo` field, is the proper fix.
+- **Three checklist items were guaranteed discrepancies.** The climb list
+  runs at climb established (2,100 ft on the 17th) and tested "landing
+  lights off above 10,000" and "altimeters standard at transition"; the
+  descent list runs at the top of descent and tested "landing lights on
+  below 10,000". Each said "Not set" on every flight. They are call-outs
+  now: the lights law and the altimeter check own those switches at the
+  right height. "Taxi light on" left the before-landing list (the lights
+  law lights it at the vacate; it said "Not set" on final at Heathrow).
+- Duplicated fact, code side: the local planner derives pressurised from
+  the `kind` string (`plan.rs`), the profile declares `pressurised: true`.
+  They agree on the 737. Left as is, noted.
+
+**The monitor flavour recited every item.** `flow::stateful` returned Say
+for a satisfied item in every flavour, so under full auto the climb list
+was ten lines at 2,000 ft and the before-landing list nine lines on short
+final at Heathrow, queued behind the radio, each confirming a switch the
+mission had set and announced itself. The doc said "narration skipped"; the
+code skipped only `Narrate` items. Now the Monitor flavour is silent item
+by item (satisfied, held, call-out and unreadable alike; every discrepancy
+still blackboxed) and speaks ONE line per list, `flow::summary_line`:
+"Climb checklist complete." or "Climb checklist complete, 2 items not as
+listed: flaps, up on schedule; altimeters, standard at transition." The
+crew and instructor flavours are unchanged (they said each item as they
+went, so their summary keeps the count). On the 17th's sortie that is 102
+spoken lines down to about 70, with the two bursts gone.
+
+**Speech lagged and never caught up** (the pilot's observation, same day).
+The arbiter's fire-and-forget `alert` had no expiry: the mission queued
+three advisories in one second at the LFLL start and they played out over
+the next ten, and a burst behind a radio exchange arrived a minute after
+the events. The perishable path existed (`alert_stale_by`, used by the taxi
+guide's cues and the stepped-on remainders) and nothing else used it. Now
+every ADVISORY queued through `alert` perishes at `ADVISORY_STALE_S` (12 s)
+if it has not started; readbacks (blocking, the pilot asked), cautions and
+warnings never expire. A dropped line is logged ("dropped stale intercom
+line") and was mirrored to the panel transcript at enqueue, so nothing is
+lost, only not said late.
+
+The ordering question ("should the speech happen first?") was answered from
+the code rather than changed: a spoken command executes, re-reads and THEN
+reads back, and that order is the safety property (a failed write must be
+said after the fact). Automations announce through the non-blocking queue,
+so their words trail the switch by synthesis time plus whatever is queued;
+the right shape is "announce as you act", the alert issued immediately
+before the write, and a follow-up only when the readback disagrees. Still
+owed: the mission sets flaps 5, strobes and the landing and taxi lights
+without a word; the pilot-monitoring's bare callout ("Flaps five.",
+"Strobes and landing lights on.") at the write site, coalesced per stage.
+
+## 2026-09-19 (later): EGLL-EGCC, the 737 could not land: two overflight balks from three 172 numbers
+
+Full auto flew the 737 from the stand at Heathrow to the RNAV 23L at
+Manchester: pushback, taxi, 27R, the plan, the region handoffs, the inbound
+call at the station swap, the approach armed from 7.4 nm. Then two
+go-arounds, both "overflew the runway", and the pilot landed the third
+approach by hand. `xvl debrief` and the ticks (blackbox flight 125):
+
+- **First approach, balked at 57 ft radio, 322 m past the numbers,
+  sinking 724 fpm, 2 m off the centreline.** The aircraft crossed the
+  threshold at 100 ft (the path's 51 ft, plus 20 ft of header-versus-probe
+  elevation just under the 20 ft trust band, plus a 32 ft standing error
+  the P law carries against this autopilot, which flies 80 fpm shallower
+  than its dial). At 64 ft, past the threshold, `alt_err` went negative
+  (the glidepath distance is unsigned) and the level-hold branch dialled
+  ZERO. One tick later, 57 ft is above the 50 ft roundout band, so the
+  overflight allowance was the fixed 0.15 nm and 0.174 nm is past it. A
+  737 sinking 724 fpm from 57 ft touches 340 m further on, 660 m in, with
+  2,400 m ahead: that was a landing.
+- **Second approach, balked at 11 ft radio, 1,537 m in, climbing.** Same
+  100 ft crossing, same zero dial at 60 ft. The roundout opened at 47 ft
+  with the aircraft sinking 712: `vs_dial_fpm` asked for -250 + 2 x 462 =
+  +674, capped to +300, and the dial sat at +300 for 2.7 s. The 737's VS
+  mode followed it: -712, -680, -623, -526, -382, -225, -90, +1, +19. It
+  levelled at 30 ft and floated 500 m while the speed law read the
+  roundout's own deceleration as five knots slow and walked the lever from
+  0.32 to 0.55. The dial then swung to -788, the aircraft dived back to
+  -513 at the 25 ft flare gate, the flare's -100 target pinned the dial at
+  +300 again for 3.6 s, and with 0.55 of lever held (the flare power's
+  hold-while-sinking rule) it climbed away from two feet at 155 kt to the
+  float allowance's end. Fitted to those ticks the 737's VS response is
+  two 1.5 s lags in series with about two seconds of dead time; the 172's
+  law was fitted to a first-order 4.5 s lag, and a first-order plant
+  cannot ring at any gain.
+
+Four laws, all shared, the 172's numbers unchanged by construction:
+
+1. **Over the pavement above the band the path's own sink continues**
+   (`guidance`: Final, `along_nm < 0`, on the centreline, target =
+   `nominal_vs`), never the level-hold and never a dive at the aim point.
+2. **The arrest's gates are seconds of sink, its targets a fraction of it**
+   (`arrest_gates_ft`: the flare gate is the greater of 25 ft and 3 s of
+   the nominal path sink, the band the greater of twice that and 6.5 s;
+   `arrest_targets_fpm`: roundout the lesser of -250 and 60% of the path,
+   flare the lesser of -100 and 25%). A 172 at 75 kt over the ground keeps
+   25 / 50 ft and -250 / -100 exactly; the 737 at 132 kt gets 35 / 76 ft
+   and -420 / -175 (a jet asked to hold -100 from 35 ft floats a kilometre).
+   The tests' 95 kt approaches now roundout at -300.
+3. **The dial's lead is the airframe's** (`ArrestLeadProfile`: gain, cap,
+   and a trend term that predicts the sink `trend_seconds` ahead from the
+   tick-to-tick change, the damping a second-order autopilot needs;
+   published per swap, `flight_state`). The default is the 172's (2, +300,
+   0). The 737 declares 1.5, +100, 1.5 s: swept over three plant fits the
+   arrest lands at 120 to 180 fpm without a balloon; with the 172's numbers
+   the same plant balloons to +70 and floats past 1,000 m
+   (`the_jets_arrest_neither_balloons_nor_floats`, a second-order plant with
+   three ticks of dead time through the real guidance and dial law).
+4. **The lever never advances in an arrest** (the roundout's `adj.min(0)`;
+   the floor still stands) and **the overflight allowance is geometric and
+   knows the airframe's landing distance** (`overflight_allowance_nm`: the
+   float's room-to-land-and-stop, less the run a 3 degree descent needs to
+   reach the band from here, floored at the old 0.15 nm; the pavement
+   needed is the recited `landing_distance_ft` when there is one, never
+   less than the 900 m GA figure; `publish_landing_distance`). EGCC 23L
+   at 57 ft gives the 737 1,406 m of float, not 278; a 172 at 160 ft over
+   EGHI still gets the hair-trigger.
+
+Left alone, noted: the 100 ft crossing itself. The aim trusts the header
+within 20 ft (the probe said 19.45), and the P law has no integral term
+against an autopilot that under-flies its dial by 80 fpm; together they are
+190 m of runway on a 737. The mission's give-up and the throttle's flare
+hold-while-sinking rule (`hold_sink_fpm`) were not touched: with the lever
+no longer advanced in the roundout the flare holds the approach setting,
+which is what the rule was written for.

@@ -635,6 +635,8 @@ pub fn run_autoland_scoped(
             let mut vs_diverged: u32 = 0;
             // Warned once per approach when the VSI cannot be read.
             let mut vvi_read_failed = false;
+            // The vertical speed one tick ago, for the arrest's trend term.
+            let mut prev_vvi: Option<(f64, std::time::Instant)> = None;
             // Airspeed history for the throttle governor's derivative term — the
             // anti-stall reflex needs the TREND (kts/sec), not just the error.
             let mut prev_ias: Option<f64> = None;
@@ -1096,15 +1098,26 @@ pub fn run_autoland_scoped(
                         None
                     }
                 };
+                // The sink's rate of change over the last tick (fpm per
+                // second), the arrest's damping term on a slow autopilot.
+                let vvi_trend = match (vvi, prev_vvi) {
+                    (Some(v), Some((p, t0))) => {
+                        let dt = t_now.duration_since(t0).as_secs_f64();
+                        if (0.1..=3.0).contains(&dt) { (v - p) / dt } else { 0.0 }
+                    }
+                    _ => 0.0,
+                };
+                prev_vvi = vvi.map(|v| (v, t_now));
+                let arrest_lead = crate::aircraft::arrest_lead();
                 let vs_dial = match vvi {
-                    Some(v) => vs_dial_fpm(g.target_vs_fpm, v, g.arresting),
+                    Some(v) => vs_dial_fpm(g.target_vs_fpm, v, vvi_trend, g.arresting, arrest_lead),
                     None => g.target_vs_fpm,
                 };
                 *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(xtk_now * M_PER_NM);
                 crate::blackbox::record("autoland", serde_json::json!({
                     "rwy": format!("{} {}", rwy.icao, rwy.id), "dist": g.dist_nm,
                     "alt": alt, "gp_alt": g.glidepath_alt_ft, "cmd_vs": g.target_vs_fpm,
-                    "vs_dial": vs_dial, "vvi": vvi, "arresting": g.arresting,
+                    "vs_dial": vs_dial, "vvi": vvi, "vvi_trend": vvi_trend, "arresting": g.arresting,
                     "cmd_hdg": g.target_heading_deg, "ias": ias, "radio": radio_ft,
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
                     "trim": trim, "xtk_m": xtk_now * M_PER_NM,
@@ -1179,6 +1192,14 @@ pub fn run_autoland_scoped(
                     let floor = crate::aircraft::config_floor_kts(last_flap.unwrap_or(0.0));
                     let target = crate::aircraft::floored_target(g.target_ias_kts, floor);
                     let adj = crate::tools::speedhold::throttle_adjust(target - ias, trend_kts_s);
+                    // In the roundout the lever only ever comes back. The
+                    // speed law read the roundout's own deceleration as
+                    // "five knots slow" and walked the 737's lever from 0.32
+                    // to 0.55 at 30 ft over EGCC 23L; the flare then held
+                    // that thrust (sink over `hold_sink_fpm`) and the
+                    // aircraft climbed away from two feet at 155 kt
+                    // (2026-09-19). The floor still stands underneath.
+                    let adj = if g.arresting { adj.min(0.0) } else { adj };
                     let min_thr = approach_power_floor(
                         g.phase,
                         radio_ft,
@@ -1606,14 +1627,33 @@ const FLOAT_MIN_REMAINING_M: f64 = 900.0;
 /// float as long as [`FLOAT_MIN_REMAINING_M`] remains, capped at half the
 /// runway (not down by halfway is a go-around on ANY runway), floored at the
 /// old margin so a short strip keeps exactly the old rule. HIGH past the
-/// threshold (above the roundout band) is still the old 0.15 nm — the 167 ft
-/// overflight and the MD-82's 51-ft-high 152 kt float both stay caught.
-pub fn overflight_allowance_nm(length_m: f64, radio_alt_ft: f64, flare_radio_ft: f64) -> f64 {
-    if radio_alt_ft > flare_radio_ft * ROUNDOUT_MULT {
-        return OVERFLIGHT_GO_AROUND_NM;
-    }
-    ((length_m - FLOAT_MIN_REMAINING_M).min(0.5 * length_m) / M_PER_NM).max(OVERFLIGHT_GO_AROUND_NM)
+/// threshold (above the roundout band) the question is geometric: where a
+/// 3 degree descent from HERE reaches the band, is the float allowance still
+/// ahead? The fixed 0.15 nm was a 172 figure twice over: at 60 kt a 172 that
+/// crosses the numbers 50 ft high is in the band 100 m later, a 737 at 140 kt
+/// is 290 m in, and EGCC 23L balked it at 57 ft and 322 m with 2,700 m of
+/// runway ahead (2026-09-19). The band's own allowance less the run to the
+/// band, floored at the old margin, so the 167 ft overflight over a short
+/// strip is still caught and a long runway is judged by its length. The
+/// pavement a landing needs is the airframe's recited landing distance when
+/// it has one (the MD-82 would float Luton away on the Baron's 900 m).
+pub fn overflight_allowance_nm(
+    length_m: f64,
+    radio_alt_ft: f64,
+    band_ft: f64,
+    landing_m: Option<f64>,
+) -> f64 {
+    let need_m = landing_m
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(FLOAT_MIN_REMAINING_M)
+        .max(FLOAT_MIN_REMAINING_M);
+    let low_m = (length_m - need_m).min(0.5 * length_m);
+    let run_to_band_m = (radio_alt_ft - band_ft).max(0.0) * M_PER_FT / GLIDEPATH_TAN;
+    ((low_m - run_to_band_m) / M_PER_NM).max(OVERFLIGHT_GO_AROUND_NM)
 }
+const M_PER_FT: f64 = 0.3048;
+/// tan(3 degrees): the metres a 3 degree path runs per metre of height.
+const GLIDEPATH_TAN: f64 = 0.052_408;
 
 /// A latched go-around climbs straight ahead until this height before the
 /// intercept guidance may turn it back toward the FAP (see GoAroundLatch).
@@ -1708,6 +1748,36 @@ const FLARE_MAX_DIST_NM: f64 = 0.35;
 /// than from the full path rate or a level float.
 const ROUNDOUT_MULT: f64 = 2.0;
 const ROUNDOUT_VS_FPM: f64 = -250.0;
+const FLARE_VS_FPM: f64 = -100.0;
+
+/// The arrest gates are SECONDS of sink, not feet: 25 ft is three seconds
+/// of a 172's path sink and two of a 737's, and the 737 through this
+/// autopilot's lag needs every one of them (EGCC 23L, 2026-09-19: the
+/// roundout opened at 50 ft with the aircraft sinking 712 fpm, 4 s from the
+/// pavement, and the arrest could only balloon or arrive firm). Both gates
+/// are the greater of the fixed feet and the seconds at the NOMINAL path
+/// sink for this groundspeed, so every airframe up to a 172's speeds keeps
+/// exactly its old feet (50 and 25 at 75 kt) and a jet's open higher: at
+/// 132 kt over the ground, 76 and 35.
+const ROUNDOUT_LEAD_S: f64 = 6.5;
+const FLARE_LEAD_S: f64 = 3.0;
+/// The gates for this approach: (flare height, roundout band top), feet.
+pub fn arrest_gates_ft(flare_radio_ft: f64, gs_kts: f64) -> (f64, f64) {
+    let sink_fps = (gs_kts.max(0.0) / 60.0) * GLIDEPATH_FT_PER_NM / 60.0;
+    let flare = flare_radio_ft.max(sink_fps * FLARE_LEAD_S);
+    let band = (flare * ROUNDOUT_MULT).max(sink_fps * ROUNDOUT_LEAD_S);
+    (flare, band)
+}
+/// The arrest's targets scale with the path sink the same way: the 172's
+/// -250 then -100 are 60% and 25% of its 400 fpm path, and a 737 asked to
+/// hold -100 from 35 ft floats a kilometre at 140 kt before it touches.
+/// (roundout, flare), fpm; never shallower than the fixed figures.
+pub fn arrest_targets_fpm(nominal_vs_fpm: f64) -> (f64, f64) {
+    (
+        ROUNDOUT_VS_FPM.min(0.6 * nominal_vs_fpm),
+        FLARE_VS_FPM.min(0.25 * nominal_vs_fpm),
+    )
+}
 
 /// The VS mode is a slow servo, and the landing arrest is the one place the
 /// dial's lag is measured in feet of runway. LXGB 27, 2026-09-14 (the 172's
@@ -1727,7 +1797,11 @@ const ROUNDOUT_VS_FPM: f64 = -250.0;
 /// [`VS_LEAD_MAX_CLIMB_FPM`] so a balloon can never be commanded, and the
 /// glidepath above the band is untouched (its own P law tracks a ramp with
 /// `path_descent_fpm`, and every approach test stays byte-identical).
+/// The 172's numbers live in [`crate::aircraft::ArrestLeadProfile::default`]
+/// (gain 2, cap +300, no trend term); a jet declares its own in its profile.
+#[cfg(test)]
 const VS_LEAD_GAIN: f64 = 2.0;
+#[cfg(test)]
 const VS_LEAD_MAX_CLIMB_FPM: f64 = 300.0;
 
 /// The altitude dial must never be within reach BELOW the aircraft while
@@ -1828,12 +1902,28 @@ impl FlarePower {
 /// What to dial into the VS mode so the aircraft actually FLIES `target_fpm`.
 /// Outside a landing arrest (`arresting` false) the dial is the target, as it
 /// always was. Inside one it leads the target by the autopilot's outstanding
-/// error - see [`VS_LEAD_GAIN`].
-pub fn vs_dial_fpm(target_fpm: f64, actual_fpm: f64, arresting: bool) -> f64 {
+/// error - see [`VS_LEAD_GAIN`] - against the sink PREDICTED `trend_seconds`
+/// ahead (`trend_fpm_s`, the vertical speed's rate of change): on a
+/// second-order autopilot the trend is the damping the bare error lacks.
+/// The gain, the cap and the trend horizon are the airframe's
+/// ([`crate::aircraft::ArrestLeadProfile`]; the default is the 172's).
+pub fn vs_dial_fpm(
+    target_fpm: f64,
+    actual_fpm: f64,
+    trend_fpm_s: f64,
+    arresting: bool,
+    lead: crate::aircraft::ArrestLeadProfile,
+) -> f64 {
     if !arresting {
         return target_fpm;
     }
-    (target_fpm + VS_LEAD_GAIN * (target_fpm - actual_fpm)).clamp(-1200.0, VS_LEAD_MAX_CLIMB_FPM)
+    let trend = if trend_fpm_s.is_finite() {
+        trend_fpm_s
+    } else {
+        0.0
+    };
+    let predicted = actual_fpm + lead.trend_seconds * trend;
+    (target_fpm + lead.gain * (target_fpm - predicted)).clamp(-1200.0, lead.max_climb_fpm)
 }
 
 /// May the roundout own the descent from HERE? Only where a
@@ -2243,7 +2333,17 @@ pub fn guidance(
     // more than the landing float is allowed? (The flare branch below, checked
     // first, owns a normal float/rollout across the numbers.)
     let along_nm = along_track_nm(cur_lat, cur_lon, rwy);
-    let float_nm = overflight_allowance_nm(rwy.length_m, radio_alt_ft, flare_radio_ft);
+    // The arrest's gates and targets for THIS groundspeed (seconds of sink,
+    // never bare feet: see `arrest_gates_ft`). `flare_radio_ft` is the floor.
+    let nominal_vs = -(gs_kts / 60.0) * GLIDEPATH_FT_PER_NM;
+    let (flare_ft, band_ft) = arrest_gates_ft(flare_radio_ft, gs_kts);
+    let (roundout_vs, flare_vs) = arrest_targets_fpm(nominal_vs);
+    let float_nm = overflight_allowance_nm(
+        rwy.length_m,
+        radio_alt_ft,
+        band_ft,
+        crate::aircraft::landing_distance_m(),
+    );
     let past_threshold = along_nm < -float_nm;
     // The flare/roundout environment: short final by plain distance, or
     // anywhere over the pavement the float allowance still covers — `dist_nm`
@@ -2253,7 +2353,7 @@ pub fn guidance(
 
     let xtk = cross_track_nm(cur_lat, cur_lon, rwy);
     let mut balk: Option<&'static str> = None;
-    let (phase, target_heading) = if radio_alt_ft <= flare_radio_ft && in_flare_zone {
+    let (phase, target_heading) = if radio_alt_ft <= flare_ft && in_flare_zone {
         // Low radio altitude alone is NOT the flare cue — terrain rises to meet
         // the approach path miles from the field (seen live: "flared" at 7 ft AGL
         // 4.1 nm out at LEMI, power cut over open ground; and again into a dip
@@ -2393,9 +2493,8 @@ pub fn guidance(
         }
     };
 
-    // Track the path with a nominal descent for the current groundspeed plus an
-    // error correction; bounded so it never dives.
-    let nominal_vs = -(gs_kts / 60.0) * GLIDEPATH_FT_PER_NM;
+    // Track the path with the nominal descent for the current groundspeed
+    // (`nominal_vs`, above) plus an error correction; bounded so it never dives.
     // SPEED PROTECTION overrides everything except the flare. Holding level below
     // the glidepath to "wait for the path" bleeds airspeed just as surely as
     // climbing does when the energy is marginal — that's the failure seen live:
@@ -2449,13 +2548,13 @@ pub fn guidance(
         && !below_terrain_floor
         && in_flare_zone
         && xtk.abs() <= FLARE_MAX_XTK_NM
-        && radio_alt_ft <= flare_radio_ft * ROUNDOUT_MULT
+        && radio_alt_ft <= band_ft
         && roundout_reaches_pavement(along_nm, radio_alt_ft, gs_kts);
 
     // What the vertical path asks for, computed first so the speed-protection
     // branch below can be measured against it.
     let path_vs = match phase {
-        ApproachPhase::Flare => -100.0, // arrest the descent near the ground
+        ApproachPhase::Flare => flare_vs, // arrest the descent near the ground
         // Below the floor without the surplus to climb: hold level while the
         // throttle bonus rebuilds it — NEVER track the glidepath down. The
         // glidepath altitude is distance-symmetric, so a rejoin on the wrong
@@ -2481,7 +2580,17 @@ pub fn guidance(
         // BEFORE the runway, where the old level-hold below let the path
         // come down to it (audit, 2026-08-02). The test is the physical one
         // — see `roundout_reaches_pavement`.
-        ApproachPhase::Final if roundout => ROUNDOUT_VS_FPM,
+        ApproachPhase::Final if roundout => roundout_vs,
+        // OVER THE PAVEMENT above the band: keep the path's own sink. The
+        // glidepath altitude is distance-symmetric, so past the threshold
+        // alt_err turns negative and the level-hold below fired at 60 ft
+        // over EGCC 23L with a 737 sinking 730 fpm; the dial read zero, the
+        // aircraft levelled at 30 ft and floated 500 m into the balloon
+        // (2026-09-19). A jet that crosses the numbers high has runway to
+        // spend and no height to hold; the float rule above still bounds
+        // how far. Never steeper either: the aim point 300 m in is not
+        // worth a dive from 90 ft.
+        ApproachPhase::Final if along_nm < 0.0 && xtk.abs() <= FLARE_MAX_XTK_NM => nominal_vs,
         // On/above speed but below the glidepath: hold level and let the path
         // descend to us — don't climb to intercept. Speed protection above has
         // already handled the case where holding level would stall us.
@@ -2957,13 +3066,14 @@ mod tests {
     /// 2026-08-02).
     #[test]
     fn the_flare_is_entered_from_a_roundout_not_a_float() {
-        let rwy = rwy_north();
+        let mut rwy = rwy_north();
         // Short final, over the pavement environment, just above the flare
         // gate (radio 40 ft, flare 25, band 50): a gentle continued descent.
         let (lat, lon) = project_latlon(0.0, 0.0, 180.0, 0.2);
         let g = guidance(lat, lon, 40.0, 40.0, 95.0, 95.0, &rwy, 95.0, 25.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Final);
-        assert_eq!(g.target_vs_fpm, ROUNDOUT_VS_FPM);
+        let (roundout, _) = arrest_targets_fpm(-(95.0 / 60.0) * GLIDEPATH_FT_PER_NM);
+        assert_eq!(g.target_vs_fpm, roundout);
 
         // The live float case: just past the threshold (inside the overflight
         // margin), 30 ft radio — alt_err is negative here and the old law
@@ -2971,15 +3081,24 @@ mod tests {
         let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.05);
         let g = guidance(lat, lon, 30.0, 30.0, 93.0, 93.0, &rwy, 95.0, 25.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Final);
+        // The roundout's target scales with the path sink (a 95 kt approach
+        // sinks 500 fpm, so its roundout is 300, not the 172's 250).
+        let (roundout, _) = arrest_targets_fpm(-(93.0 / 60.0) * GLIDEPATH_FT_PER_NM);
+        assert!(
+            roundout < ROUNDOUT_VS_FPM && roundout > -350.0,
+            "{roundout}"
+        );
         assert_eq!(
-            g.target_vs_fpm, ROUNDOUT_VS_FPM,
+            g.target_vs_fpm, roundout,
             "a level float at 30 ft is how the mush happened"
         );
 
         // Below the flare gate the flare still owns the touchdown.
         let g = guidance(lat, lon, 20.0, 20.0, 92.0, 92.0, &rwy, 95.0, 25.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Flare);
-        assert_eq!(g.target_vs_fpm, -100.0);
+        let (_, flare) = arrest_targets_fpm(-(92.0 / 60.0) * GLIDEPATH_FT_PER_NM);
+        assert!(flare < FLARE_VS_FPM && flare > -150.0, "{flare}");
+        assert_eq!(g.target_vs_fpm, flare);
 
         // Dragged LOW short of the threshold the roundout must NOT own it:
         // from 30 ft at 0.3 nm its -250 grounds ~190 m before the pavement.
@@ -2993,10 +3112,17 @@ mod tests {
             "a commanded descent here lands in the approach lights"
         );
 
-        // And a genuine overflight go-around is untouched by the roundout.
+        // And a genuine overflight go-around is untouched by the roundout:
+        // 150 ft over the pavement 0.3 nm in, where a 3 degree descent
+        // reaches the band 550 m further on. On this 3,000 m test runway
+        // that still leaves the room a landing needs (the rule is
+        // geometric now), so the strip is 1,800 m here: the band would be
+        // reached 1,100 m in with 700 m left, and that IS an overflight.
+        rwy.length_m = 1800.0;
         let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.3);
         let g = guidance(lat, lon, 150.0, 150.0, 95.0, 95.0, &rwy, 95.0, 25.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Intercept);
+        assert_eq!(g.balk, Some("overflew_the_runway"));
     }
 
     /// LXGB 27, 2026-09-14, replayed through the vertical law against the
@@ -3044,7 +3170,7 @@ mod tests {
             saw_roundout |= g.phase == ApproachPhase::Final && g.arresting;
             saw_flare |= g.phase == ApproachPhase::Flare;
             let dial = if lead {
-                vs_dial_fpm(g.target_vs_fpm, vs, g.arresting)
+                vs_dial_fpm(g.target_vs_fpm, vs, 0.0, g.arresting, Default::default())
             } else {
                 g.target_vs_fpm
             };
@@ -3104,12 +3230,193 @@ mod tests {
         );
 
         // Outside an arrest the dial is the target, exactly as before.
-        assert_eq!(vs_dial_fpm(-380.0, -600.0, false), -380.0);
+        let lead = crate::aircraft::ArrestLeadProfile::default();
+        assert_eq!(
+            (lead.gain, lead.max_climb_fpm, lead.trend_seconds),
+            (VS_LEAD_GAIN, VS_LEAD_MAX_CLIMB_FPM, 0.0)
+        );
+        assert_eq!(vs_dial_fpm(-380.0, -600.0, 0.0, false, lead), -380.0);
         // Inside one it leads by the outstanding error, capped at a gentle climb.
-        assert_eq!(vs_dial_fpm(-100.0, -300.0, true), 300.0);
-        assert_eq!(vs_dial_fpm(-100.0, -150.0, true), 0.0);
-        assert_eq!(vs_dial_fpm(-100.0, -100.0, true), -100.0);
-        assert_eq!(vs_dial_fpm(-100.0, 200.0, true), -700.0);
+        assert_eq!(vs_dial_fpm(-100.0, -300.0, 0.0, true, lead), 300.0);
+        assert_eq!(vs_dial_fpm(-100.0, -150.0, 0.0, true, lead), 0.0);
+        assert_eq!(vs_dial_fpm(-100.0, -100.0, 0.0, true, lead), -100.0);
+        assert_eq!(vs_dial_fpm(-100.0, 200.0, 0.0, true, lead), -700.0);
+        // The 172 has no trend term: a trend changes nothing for it.
+        assert_eq!(vs_dial_fpm(-100.0, -300.0, 150.0, true, lead), 300.0);
+        // A jet's lead predicts the sink `trend_seconds` ahead and caps low:
+        // sinking 300 but easing at 100 fpm/s reads as 150 in 1.5 s.
+        let jet = crate::aircraft::ArrestLeadProfile {
+            gain: 1.5,
+            max_climb_fpm: 100.0,
+            trend_seconds: 1.5,
+        };
+        assert_eq!(vs_dial_fpm(-100.0, -300.0, 100.0, true, jet), -25.0);
+        assert_eq!(vs_dial_fpm(-100.0, -700.0, 0.0, true, jet), 100.0);
+        assert_eq!(
+            vs_dial_fpm(-100.0, -300.0, f64::NAN, true, jet),
+            200.0_f64.min(100.0)
+        );
+    }
+
+    /// The gates and targets are seconds of sink: a 172 keeps its feet and
+    /// fpm exactly, a jet's open higher and aim firmer.
+    #[test]
+    fn arrest_gates_and_targets_scale_with_the_path_sink() {
+        // 172 at 65-78 kt over the ground: 25 / 50 ft, -250 / -100 fpm.
+        for gs in [55.0, 65.0, 75.0] {
+            assert_eq!(arrest_gates_ft(25.0, gs), (25.0, 50.0), "gs {gs}");
+            let (r, f) = arrest_targets_fpm(-(gs / 60.0) * GLIDEPATH_FT_PER_NM);
+            assert_eq!((r, f), (ROUNDOUT_VS_FPM, FLARE_VS_FPM), "gs {gs}");
+        }
+        // The 737 on EGCC 23L, 132 kt over the ground: 700 fpm on the path.
+        let nominal = -(132.0 / 60.0) * GLIDEPATH_FT_PER_NM;
+        let (flare, band) = arrest_gates_ft(25.0, 132.0);
+        assert!((flare - 35.0).abs() < 1.0, "{flare}");
+        assert!((band - 76.0).abs() < 1.0, "{band}");
+        let (r, f) = arrest_targets_fpm(nominal);
+        assert!((r - -420.0).abs() < 2.0, "{r}");
+        assert!((f - -175.0).abs() < 2.0, "{f}");
+        // A failed (zero) groundspeed read is the fixed gates, never zero.
+        assert_eq!(arrest_gates_ft(25.0, 0.0), (25.0, 50.0));
+    }
+
+    /// EGCC 23L, 2026-09-19, replayed: the 737 crossed the numbers at 100 ft
+    /// sinking 730 fpm, the level-hold branch dialled ZERO at 60 ft over
+    /// the pavement, and the first approach balked "overflew the runway" at
+    /// 57 ft and 0.174 nm with 2,700 m of runway ahead.
+    #[test]
+    fn a_jet_over_the_pavement_keeps_its_sink_and_is_not_an_overflight() {
+        let mut rwy = rwy_north();
+        rwy.length_m = 3040.0;
+        let gs = 132.0;
+        let nominal = -(gs / 60.0) * GLIDEPATH_FT_PER_NM;
+        // 60 ft over the runway, 150 m in, above the 76 ft band? No: in it.
+        // 90 ft, 100 m in: above the band, alt_err negative, the old law
+        // held level. Now: the path's own sink, and still Final.
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 100.0 / M_PER_NM);
+        let g = guidance(lat, lon, 90.0, 90.0, gs, 145.0, &rwy, 145.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Final);
+        assert_eq!(
+            g.target_vs_fpm, nominal,
+            "a jet over the pavement keeps descending"
+        );
+        assert!(!g.arresting);
+        // The first balk: 57 ft, 0.174 nm past the threshold, in the band.
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.174);
+        let g = guidance(lat, lon, 57.0, 57.0, gs, 145.0, &rwy, 145.0, 25.0, 0.0);
+        assert_eq!(
+            g.phase,
+            ApproachPhase::Final,
+            "this was a landing: {:?}",
+            g.balk
+        );
+        assert!(g.arresting);
+        let (roundout, _) = arrest_targets_fpm(nominal);
+        assert_eq!(g.target_vs_fpm, roundout);
+        // The second: 11 ft, 0.83 nm in, IS past what 3,040 m allows a
+        // landing that still needs 900 m (the GA figure; the profile's
+        // 1,634 m is stricter still): the overflight verdict stands there.
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.83);
+        let g = guidance(lat, lon, 11.0, 11.0, gs, 155.0, &rwy, 145.0, 25.0, 0.0);
+        assert_eq!(g.phase, ApproachPhase::Intercept);
+        assert_eq!(g.balk, Some("overflew_the_runway"));
+    }
+
+    /// The 737's vertical-speed mode, fitted to the EGCC 23L tick log
+    /// (2026-09-19): two first-order lags of 1.5 s in series and two
+    /// seconds of dead time (three ticks). Flown from 100 ft over the
+    /// numbers at the path sink, gs 132, with the flare's thrust reduction
+    /// as the same sink disturbance the 172 plant carries. Returns the sink
+    /// at the wheels, the shallowest rate seen (a balloon is positive), the
+    /// metres of runway used and whether the flare gate was reached.
+    fn fly_jet_arrest(lead: crate::aircraft::ArrestLeadProfile) -> (f64, f64, f64, bool) {
+        let mut rwy = rwy_north();
+        rwy.length_m = 3040.0;
+        let dt = 0.7;
+        let (t1, t2) = (1.5, 1.5);
+        let dead_ticks = 3;
+        let gs_kts = 132.0;
+        let nominal = -(gs_kts / 60.0) * GLIDEPATH_FT_PER_NM;
+        let mut radio = 100.0;
+        let mut vs = nominal;
+        let mut vs_rate = 0.0;
+        let mut dials = std::collections::VecDeque::from(vec![vs; dead_ticks]);
+        let mut idle_sink = 0.0;
+        let mut along_nm = 0.0;
+        let mut shallowest: f64 = vs;
+        let mut saw_flare = false;
+        let mut prev_vs = vs;
+        let mut t = 0.0;
+        loop {
+            let (lat, lon) = project_latlon(0.0, 0.0, 0.0, along_nm);
+            let g = guidance(
+                lat, lon, radio, radio, gs_kts, 145.0, &rwy, 145.0, 25.0, 0.0,
+            );
+            assert_ne!(
+                g.phase,
+                ApproachPhase::Intercept,
+                "balked at {radio:.0} ft: {:?}",
+                g.balk
+            );
+            saw_flare |= g.phase == ApproachPhase::Flare;
+            let trend = (vs - prev_vs) / dt;
+            prev_vs = vs;
+            dials.push_back(vs_dial_fpm(g.target_vs_fpm, vs, trend, g.arresting, lead));
+            let applied = dials.pop_front().unwrap();
+            let want_sink = if g.phase == ApproachPhase::Flare {
+                -250.0
+            } else {
+                0.0
+            };
+            let sub = 7;
+            for _ in 0..sub {
+                let h = dt / sub as f64;
+                let acc = (applied - vs - (t1 + t2) * vs_rate) / (t1 * t2);
+                vs_rate += acc * h;
+                vs += vs_rate * h;
+                let d_sink = (want_sink - idle_sink) * (h / 1.5);
+                idle_sink += d_sink;
+                vs += d_sink;
+                radio += vs / 60.0 * h;
+                along_nm += gs_kts * h / 3600.0;
+                if radio <= 0.0 {
+                    break;
+                }
+            }
+            shallowest = shallowest.max(vs);
+            t += dt;
+            if radio <= 0.0 {
+                return (vs, shallowest, along_nm * M_PER_NM, saw_flare);
+            }
+            assert!(t < 60.0, "never touched down");
+        }
+    }
+
+    /// The live failure and its fix, through the fitted plant: the 172's
+    /// lead (gain 2, cap +300) pins the dial at a climb for seconds and the
+    /// jet balloons and floats; its own lead (gain 1.5, cap +100, a 1.5 s
+    /// trend term) arrests it without a balloon, inside the touchdown zone.
+    #[test]
+    fn the_jets_arrest_neither_balloons_nor_floats() {
+        let (td, shallowest, along_m, flared) =
+            fly_jet_arrest(crate::aircraft::ArrestLeadProfile::default());
+        assert!(flared);
+        assert!(
+            shallowest > 0.0 || along_m > 1000.0,
+            "the 172's lead should reproduce the balloon or the float: {td:.0} fpm, {shallowest:.0} shallowest, {along_m:.0} m"
+        );
+
+        let jet = crate::aircraft::ArrestLeadProfile {
+            gain: 1.5,
+            max_climb_fpm: 100.0,
+            trend_seconds: 1.5,
+        };
+        let (td, shallowest, along_m, flared) = fly_jet_arrest(jet);
+        assert!(flared);
+        assert!(shallowest < 0.0, "ballooned to {shallowest:.0} fpm");
+        assert!(td > -300.0, "still firm: {td:.0} fpm at the wheels");
+        assert!(td < -60.0, "the arrest must still land, got {td:.0}");
+        assert!(along_m < 1000.0, "floated {along_m:.0} m");
     }
 
     /// The overflight rule must know a landing float from an overflight. At
@@ -3123,21 +3430,41 @@ mod tests {
         let mut rwy = rwy_north();
         rwy.length_m = 1723.0;
         // Low in the float: the allowance is runway-aware — 823 m here.
-        let low = overflight_allowance_nm(1723.0, 26.0, 25.0);
+        let low = overflight_allowance_nm(1723.0, 26.0, 50.0, None);
         assert!((low - 823.0 / M_PER_NM).abs() < 0.01, "{low}");
-        // High past the threshold keeps the old hair-trigger.
-        assert_eq!(overflight_allowance_nm(1723.0, 160.0, 25.0), 0.15);
+        // High past the threshold keeps the old hair-trigger: from 160 ft a
+        // 3 degree descent runs 640 m to the band, more than the float has.
+        assert_eq!(overflight_allowance_nm(1723.0, 160.0, 50.0, None), 0.15);
         // A short strip keeps the old rule even in the float, and a long one
         // is capped at half its length.
-        assert_eq!(overflight_allowance_nm(700.0, 20.0, 25.0), 0.15);
-        assert!((overflight_allowance_nm(3900.0, 20.0, 25.0) - 1950.0 / M_PER_NM).abs() < 0.01);
+        assert_eq!(overflight_allowance_nm(700.0, 20.0, 50.0, None), 0.15);
+        assert!(
+            (overflight_allowance_nm(3900.0, 20.0, 50.0, None) - 1950.0 / M_PER_NM).abs() < 0.01
+        );
+        // EGCC 23L, 2026-09-19: the 737 at 57 ft radio, 322 m past the
+        // numbers and sinking, balked as an overflight with 2,700 m ahead.
+        // Its band is 76 ft, so it is IN the float, and the pavement a
+        // landing needs is its own 1,634 m: 1,406 m of float, not 278.
+        let jet = overflight_allowance_nm(3040.0, 57.0, 76.0, Some(1634.0));
+        assert!(jet > 0.174, "{jet}");
+        assert!((jet - 1406.0 / M_PER_NM).abs() < 0.01, "{jet}");
+        // Above its band the same geometry applies: 100 ft is 24 ft above
+        // the band, 140 m of run, still 1,266 m of float.
+        let high = overflight_allowance_nm(3040.0, 100.0, 76.0, Some(1634.0));
+        assert!((high - 1266.0 / M_PER_NM).abs() < 0.02, "{high}");
+        // A recited landing distance never LOOSENS the GA figure.
+        assert_eq!(
+            overflight_allowance_nm(1723.0, 26.0, 50.0, Some(300.0)),
+            overflight_allowance_nm(1723.0, 26.0, 50.0, None)
+        );
 
         // The live balk, replayed: 0.165 nm past the threshold, 26 ft radio.
         // Must be a roundout on Final, not a go-around.
         let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.165);
         let g = guidance(lat, lon, 26.0, 26.0, 94.0, 97.0, &rwy, 95.0, 25.0, 0.0);
         assert_eq!(g.phase, ApproachPhase::Final, "this was a landing");
-        assert_eq!(g.target_vs_fpm, ROUNDOUT_VS_FPM);
+        let (roundout, _) = arrest_targets_fpm(-(94.0 / 60.0) * GLIDEPATH_FT_PER_NM);
+        assert_eq!(g.target_vs_fpm, roundout);
 
         // Deeper down the float, below the flare gate — dist past the old
         // 0.35 nm flare-zone bound — the flare still owns the touchdown.
@@ -4711,7 +5038,8 @@ mod glidepath_gain_tests {
             "slow airframes keep the old law"
         );
         let jet = glidepath_gain_fpm_per_ft(170.0);
-        assert!((jet - 3.14).abs() < 0.02, "{jet}");
+        // The 172's gain scaled by the groundspeed ratio, 2.6x it.
+        assert!((jet - 1.2 * 170.0 / 65.0).abs() < 0.02, "{jet}");
         assert!(
             (glidepath_gain_fpm_per_ft(400.0) - 3.6).abs() < 1e-9,
             "capped"

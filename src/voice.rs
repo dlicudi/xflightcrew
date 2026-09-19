@@ -355,6 +355,17 @@ const RESUME_MIN_LEFT_S: f64 = 0.4;
 /// has passed, and a fragment out of context is worse than silence.
 const RESUME_STALE_S: u64 = 20;
 
+/// A fire-and-forget ADVISORY that has not started speaking this long after
+/// it was queued is dropped. Advisories are narration ("Beacon's on",
+/// "Next, KOPOR", "Flaps up"): the mission queued three of them in one
+/// second at the LFLL start and the arbiter was still reading them out ten
+/// seconds later, and a burst behind a radio exchange plays a minute after
+/// the events it describes ("speech lags and never catches up", 2026-09-19).
+/// Spoken late, narration is disinformation; the panel transcript keeps the
+/// line (mirrored at enqueue) and a dropped one is logged. Readbacks
+/// (blocking, the pilot asked), cautions and warnings never expire.
+pub const ADVISORY_STALE_S: u64 = 12;
+
 /// The sample range to resume from: `elapsed` into a line of `len` samples at
 /// `rate`, less the lead-in. `None` when the line had effectively finished.
 fn resume_range(len: usize, rate: u32, elapsed: std::time::Duration) -> Option<std::ops::Range<usize>> {
@@ -913,7 +924,14 @@ impl Voice {
             })
     }
 
-    fn enqueue(&self, priority: Priority, text: String, done: Option<Arc<Latch>>, chime: bool) {
+    fn enqueue(
+        &self,
+        priority: Priority,
+        text: String,
+        done: Option<Arc<Latch>>,
+        chime: bool,
+        stale_by: Option<Instant>,
+    ) {
         // No em/en dashes reach the TTS — they trip it up. One chokepoint for
         // every spoken utterance (readbacks, monitor callouts, prompts).
         let text = crate::phrase::scrub_dashes(&text);
@@ -925,7 +943,7 @@ impl Voice {
             negative: false,
             station: None,
             cabin: false,
-            stale_by: None,
+            stale_by,
             resume: None,
             done,
         });
@@ -1012,7 +1030,14 @@ impl Voice {
         let text = text.into();
         crate::auto_status::note_said(&text);
         self.mirror_to_panel(priority, &text);
-        self.enqueue(priority, text, None, false);
+        // Narration perishes (`ADVISORY_STALE_S`); anything sterner waits its turn.
+        let stale_by = match priority {
+            Priority::Advisory => {
+                Some(Instant::now() + std::time::Duration::from_secs(ADVISORY_STALE_S))
+            }
+            _ => None,
+        };
+        self.enqueue(priority, text, None, false, stale_by);
     }
 
     /// Wire the panel transcript sink, so background-loop speech shows there.
@@ -1138,7 +1163,7 @@ impl Voice {
         if !crate::mode::copilot_enabled() {
             return;
         }
-        self.enqueue(priority, text.into(), None, true);
+        self.enqueue(priority, text.into(), None, true, None);
     }
 
     /// Queue an utterance and block until it has been spoken (command readbacks:
@@ -1150,7 +1175,7 @@ impl Voice {
         });
         let text = text.into();
         crate::auto_status::note_said(&text);
-        self.enqueue(priority, text, Some(latch.clone()), false);
+        self.enqueue(priority, text, Some(latch.clone()), false, None);
         let mut spoken = latch.spoken.lock().unwrap();
         while !*spoken {
             spoken = latch.cv.wait(spoken).unwrap();
@@ -1593,6 +1618,7 @@ fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         // radio transmission) is dropped: spoken late it's disinformation,
         // not guidance. The latch still fires — see `fire_latch`.
         if utt.stale_by.is_some_and(|t| Instant::now() > t) {
+            tracing::info!(target: "xvl::voice", text = %utt.text, "dropped stale intercom line");
             fire_latch(utt.done);
             continue;
         }
@@ -2177,6 +2203,35 @@ mod tests {
         assert!(voice.inner.queue.lock().unwrap().heap.is_empty());
         assert!(voice.inner.spoken.lock().unwrap().is_empty());
         crate::mode::set(crate::mode::Mode::Both);
+    }
+
+    #[test]
+    fn advisories_perish_cautions_wait() {
+        // Fire-and-forget narration expires if it cannot start in time;
+        // cautions, warnings and blocking readbacks never do.
+        let _guard = crate::mode::TEST_LOCK.lock().unwrap();
+        crate::mode::set(crate::mode::Mode::Both);
+        let voice = Voice::new(Config::default());
+        voice.set_hold(true);
+        let queued_at = Instant::now();
+        voice.alert(Priority::Advisory, "Beacon's on, spinning up the engine.");
+        voice.alert(Priority::Caution, "Airspeed low.");
+        let q = voice.inner.queue.lock().unwrap();
+        let by_text = |t: &str| q.heap.iter().find(|u| u.text == t).expect("queued");
+        let adv = by_text("Beacon's on, spinning up the engine.");
+        let stale = adv.stale_by.expect("an advisory perishes");
+        let window = stale.duration_since(queued_at).as_secs();
+        assert!(
+            (ADVISORY_STALE_S - 1..=ADVISORY_STALE_S).contains(&window),
+            "window {window}s"
+        );
+        assert!(
+            by_text("Airspeed low.").stale_by.is_none(),
+            "a caution waits"
+        );
+        drop(q);
+        voice.dismiss_crew();
+        voice.set_hold(false);
     }
 
     #[test]

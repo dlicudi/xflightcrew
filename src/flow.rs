@@ -16,8 +16,12 @@
 //!   written under the loop (one writer per dataref); hazard steps ask for a
 //!   yes/no that arrives through the command loop.
 //! - **Monitor** (the copilot flying under full auto): a read-only
-//!   cross-check. The mission's own laws act; the list confirms each item and
-//!   speaks and blackboxes a discrepancy honestly. Never writes.
+//!   cross-check. The mission's own laws act; the list confirms each item in
+//!   silence, blackboxes every discrepancy, and speaks ONE line at the end
+//!   naming the items not as listed ([`summary_line`]). Never writes. It
+//!   used to recite every item: nine lines on short final at Heathrow
+//!   (2026-09-17), queued behind the radio, telling the pilot nothing the
+//!   laws had not already said when they set the switch.
 //! - **Instruct** (the instructor): every item is a spoken instruction, then
 //!   a watch for the pilot to satisfy it ("Good."), advanced by the pilot's
 //!   "next" / "set" / "checked" or a timeout. Writes only when asked to
@@ -846,7 +850,8 @@ pub fn plan(flavour: Flavour, item: &Item, value: Option<f64>, held: Option<&str
         },
         Item::CallOut(t) => match flavour {
             Flavour::Instruct => Step::Wait(t.clone()),
-            _ => Step::Say(t.clone()),
+            Flavour::Monitor => Step::Skip,
+            Flavour::Crew => Step::Say(t.clone()),
         },
         Item::Act { say, cond, .. } => stateful(flavour, say, cond, value, held, true),
         Item::Verify {
@@ -868,10 +873,15 @@ fn stateful(
 ) -> Step {
     let satisfied = value.is_some_and(|v| cond.eval(v));
     if satisfied {
-        return Step::Say(match flavour {
-            Flavour::Instruct => format!("{say} Already done."),
-            _ => say.to_string(),
-        });
+        return match flavour {
+            Flavour::Instruct => Step::Say(format!("{say} Already done.")),
+            // The monitor confirms in silence: the mission's laws set the
+            // item and said so when they did. Reciting nine satisfied items
+            // on short final (EGLL 27L, 2026-09-17) told the pilot nothing
+            // and queued behind the radio for half a minute.
+            Flavour::Monitor => Step::Skip,
+            Flavour::Crew => Step::Say(say.to_string()),
+        };
     }
     if let Some(owner) = held {
         return Step::Held(format!("{say} {} has it.", cap_first(owner)));
@@ -879,8 +889,9 @@ fn stateful(
     match flavour {
         Flavour::Crew if settable => Step::Act,
         Flavour::Crew => Step::Say(say.to_string()),
-        // Unreadable is not a discrepancy: call it out, don't accuse.
-        Flavour::Monitor if value.is_none() => Step::Say(say.to_string()),
+        // Unreadable is not a discrepancy: the monitor blackboxes it and
+        // moves on rather than accuse.
+        Flavour::Monitor if value.is_none() => Step::Skip,
         Flavour::Monitor => Step::Discrepancy(format!("{say} Not set.")),
         Flavour::Instruct => Step::Wait(say.to_string()),
     }
@@ -1016,14 +1027,17 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
         "checklist",
         json!({ "event": "start", "title": cl.title, "flavour": flavour.name(), "items": cl.items.len() }),
     );
-    say(&match flavour {
-        Flavour::Crew => format!("Running the {} checklist.", cl.title),
-        Flavour::Monitor => format!("{} checklist.", cap_first(&title_lc)),
-        Flavour::Instruct => format!(
+    // The monitor says ONE line per list, at the end (see `summary_line`):
+    // an opening followed two seconds later by "complete" is two lines
+    // for nothing.
+    match flavour {
+        Flavour::Crew => say(&format!("Running the {} checklist.", cl.title)),
+        Flavour::Monitor => {}
+        Flavour::Instruct => say(&format!(
             "{} checklist. I'll call each item, you do it and tell me when it's done.",
             cap_first(&title_lc)
-        ),
-    });
+        )),
+    }
     let ctx = ToolCtx {
         xplane: xp,
         config,
@@ -1034,6 +1048,8 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
     let n = cl.items.len();
     let mut failed = 0usize;
     let mut discrepancies = 0usize;
+    // The monitor's discrepancies, named in its one summary line.
+    let mut not_set: Vec<String> = Vec::new();
     let mut aborted = false;
     for (i, item) in cl.items.iter().enumerate() {
         if ABORT.load(SeqCst) {
@@ -1055,7 +1071,10 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
                     "checklist",
                     json!({ "event": "held", "title": cl.title, "item": item_line(item), "by": held }),
                 );
-                say(&line);
+                // Under full auto the owner IS the mission: nothing to say.
+                if flavour != Flavour::Monitor {
+                    say(&line);
+                }
             }
             Step::Discrepancy(line) => {
                 discrepancies += 1;
@@ -1063,7 +1082,11 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
                     "checklist",
                     json!({ "event": "discrepancy", "title": cl.title, "item": item_line(item), "value": value }),
                 );
-                say(&line);
+                if flavour == Flavour::Monitor {
+                    not_set.push(item_line(item).to_string());
+                } else {
+                    say(&line);
+                }
             }
             Step::Wait(line) => {
                 say(&line);
@@ -1124,23 +1147,7 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
             }
         }
     }
-    let summary = if aborted {
-        format!("{} checklist stopped where we were.", cl.title)
-    } else if failed == 0 && discrepancies == 0 {
-        format!("{} checklist complete.", cl.title)
-    } else if flavour == Flavour::Crew {
-        format!(
-            "{} checklist complete, {failed} item{} didn't take, check the panel.",
-            cl.title,
-            if failed == 1 { "" } else { "s" }
-        )
-    } else {
-        format!(
-            "{} checklist complete, {discrepancies} item{} not as listed.",
-            cl.title,
-            if discrepancies == 1 { "" } else { "s" }
-        )
-    };
+    let summary = summary_line(&cl.title, flavour, aborted, failed, discrepancies, &not_set);
     crate::blackbox::record(
         "checklist",
         json!({
@@ -1150,6 +1157,56 @@ async fn run(cl: &Checklist, flavour: Flavour, xp: &XPlaneClient, config: &Confi
         }),
     );
     say(&summary);
+}
+
+/// The list's closing line. The monitor's is the ONLY line it speaks for a
+/// list, so it carries the discrepancies by name ("Climb checklist complete,
+/// 2 items not as listed: flaps, up on schedule; altimeters, standard at
+/// transition."); the other flavours said each item as they went.
+pub fn summary_line(
+    title: &str,
+    flavour: Flavour,
+    aborted: bool,
+    failed: usize,
+    discrepancies: usize,
+    not_set: &[String],
+) -> String {
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    if aborted {
+        return format!("{title} checklist stopped where we were.");
+    }
+    if failed == 0 && discrepancies == 0 {
+        return format!("{title} checklist complete.");
+    }
+    if flavour == Flavour::Crew {
+        return format!(
+            "{title} checklist complete, {failed} item{} didn't take, check the panel.",
+            plural(failed)
+        );
+    }
+    let mut line = format!(
+        "{title} checklist complete, {discrepancies} item{} not as listed",
+        plural(discrepancies)
+    );
+    if not_set.is_empty() {
+        line.push('.');
+    } else {
+        let names: Vec<String> = not_set
+            .iter()
+            .map(|s| {
+                let s = s.trim_end_matches('.');
+                let mut c = s.chars();
+                match c.next() {
+                    Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect();
+        line.push_str(": ");
+        line.push_str(&names.join("; "));
+        line.push('.');
+    }
+    line
 }
 
 enum Acted {
@@ -1506,10 +1563,8 @@ mod tests {
             plan(Flavour::Crew, &it, Some(0.0), None),
             Step::Say("Landing lights, off.".into())
         );
-        assert_eq!(
-            plan(Flavour::Monitor, &it, Some(0.0), None),
-            Step::Say("Landing lights, off.".into())
-        );
+        // The monitor confirms in silence (its one line is the summary).
+        assert_eq!(plan(Flavour::Monitor, &it, Some(0.0), None), Step::Skip);
         assert_eq!(
             plan(Flavour::Instruct, &it, Some(0.0), None),
             Step::Say("Landing lights, off. Already done.".into())
@@ -1530,18 +1585,16 @@ mod tests {
             Step::Held("Landing lights, off. The speed hold has it.".into())
         );
         // Unreadable: the crew still acts (the tool reads back itself); the
-        // monitor calls it out rather than calling it a discrepancy.
+        // monitor moves on rather than call it a discrepancy.
         assert_eq!(plan(Flavour::Crew, &it, None, None), Step::Act);
-        assert_eq!(
-            plan(Flavour::Monitor, &it, None, None),
-            Step::Say("Landing lights, off.".into())
-        );
-        // Narration: skipped by the monitor, spoken otherwise. Call-outs: the
-        // instructor waits on the pilot's word.
+        assert_eq!(plan(Flavour::Monitor, &it, None, None), Step::Skip);
+        // Narration and call-outs: skipped by the monitor, spoken by the
+        // crew. Call-outs: the instructor waits on the pilot's word.
         let n = Item::Narrate("Recommended climb airspeed 70 to 85 knots.".into());
         assert_eq!(plan(Flavour::Monitor, &n, None, None), Step::Skip);
         assert!(matches!(plan(Flavour::Crew, &n, None, None), Step::Say(_)));
         let c = Item::CallOut("Fuel quantity, sufficient.".into());
+        assert_eq!(plan(Flavour::Monitor, &c, None, None), Step::Skip);
         assert!(matches!(plan(Flavour::Crew, &c, None, None), Step::Say(_)));
         assert!(matches!(
             plan(Flavour::Instruct, &c, None, None),
@@ -1558,6 +1611,41 @@ mod tests {
         assert_eq!(
             plan(Flavour::Crew, &v, Some(70.0), None),
             Step::Say("Brakes, minimum possible.".into())
+        );
+    }
+
+    #[test]
+    fn monitor_summary_names_its_discrepancies() {
+        // The monitor's one line per list: clean, or the items by name.
+        assert_eq!(
+            summary_line("Climb", Flavour::Monitor, false, 0, 0, &[]),
+            "Climb checklist complete."
+        );
+        let names = vec![
+            "Flaps, up on schedule.".to_string(),
+            "Altimeters, standard at transition.".to_string(),
+        ];
+        assert_eq!(
+            summary_line("Climb", Flavour::Monitor, false, 0, 2, &names),
+            "Climb checklist complete, 2 items not as listed: flaps, up on schedule; altimeters, standard at transition."
+        );
+        assert_eq!(
+            summary_line("Descent", Flavour::Monitor, false, 0, 1, &names[..1]),
+            "Descent checklist complete, 1 item not as listed: flaps, up on schedule."
+        );
+        // The crew flavour counts failed writes; the instructor counts what
+        // the pilot never did (no names: each was said as it happened).
+        assert_eq!(
+            summary_line("Descent", Flavour::Crew, false, 1, 0, &[]),
+            "Descent checklist complete, 1 item didn't take, check the panel."
+        );
+        assert_eq!(
+            summary_line("Descent", Flavour::Instruct, false, 0, 3, &[]),
+            "Descent checklist complete, 3 items not as listed."
+        );
+        assert_eq!(
+            summary_line("Descent", Flavour::Monitor, true, 0, 1, &names),
+            "Descent checklist stopped where we were."
         );
     }
 

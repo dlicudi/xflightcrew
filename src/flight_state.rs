@@ -43,6 +43,10 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
         p.vs_clean_kts,
     );
     crate::aircraft::publish_approach_thrust_min(p.approach_thrust_min);
+    crate::aircraft::publish_arrest_lead(p.arrest_lead);
+    crate::aircraft::publish_landing_distance(
+        p.reference.as_ref().and_then(|r| r.landing_distance_ft),
+    );
 }
 
 /// Every loop that can hold the aircraft, stopped. Aborts go through each
