@@ -81,6 +81,17 @@ turbine_start: false
 auto_prep: false
 scripted_auto_start: true
 
+# The aircraft scripts its own START; the SHUTDOWN is ours, and the stock
+# mixture lever is not the control. B738.systems.lua rewrites
+# `mixture_ratio[0..1]` every frame from `condition_lever{1,2}`, itself an
+# animation output driven toward `_target`, so the stock write is accepted and
+# then erased and "fuel levers cut" was a lie at the EIDW stand (2026-09-20).
+# Probed live the same day: `condition_lever1` is_writable FALSE, `_target`
+# TRUE. Cutoff is 0; the lua lights the engine at >= 0.75.
+fuel_cutoff_levers:
+  - laminar/B738/engine/slider/condition_lever1_target
+  - laminar/B738/engine/slider/condition_lever2_target
+
 # Jet — none of the piston systems apply.
 engine: false
 magnetos: false

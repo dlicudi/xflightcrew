@@ -412,7 +412,7 @@ impl Registry {
         // Turbine start sequence (jets) — distinct from the piston one-shot start.
         if profile.turbine_start {
             tools.push(Box::new(jet_start::StartEngines));
-            tools.push(Box::new(jet_start::StopEngines));
+            tools.push(Box::new(jet_start::StopEngines::new(profile)));
         }
         // An aircraft that scripts its own start: "start the engines" fires
         // that script (the stock 737-800, `scripted_auto_start`). The SHUTDOWN
@@ -425,7 +425,7 @@ impl Registry {
         // (2026-09-17).
         if profile.scripted_auto_start && !profile.turbine_start {
             tools.push(Box::new(jet_start::ScriptedAutoStart));
-            tools.push(Box::new(jet_start::StopEngines));
+            tools.push(Box::new(jet_start::StopEngines::new(profile)));
         }
         // Procedural electrical power-up (step-by-step with callouts).
         if profile.auto_prep {

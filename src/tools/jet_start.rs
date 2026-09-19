@@ -6,6 +6,8 @@
 //! engine bleed cross-feeds route start air. If the APU/electrical isn't up yet it
 //! runs the power-up first (as the autostart does).
 
+use std::time::Duration;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -39,6 +41,11 @@ const N2_IDLE: f64 = 50.0; // self-sustaining
 const POLL_SECS: u64 = 2;
 /// Hold the starter this long (X-Plane keeps it ~6s more), enough to reach 20% N2.
 const STARTER_HOLD_SECS: f64 = 10.0;
+
+/// The shutdown readback's watch: a big fan takes several seconds to wind down
+/// past "running", so the window has to outlast the spool, not the write.
+const SHUTDOWN_POLLS: usize = 12;
+const SHUTDOWN_POLL_MS: u64 = 700;
 
 pub struct StartEngines;
 
@@ -245,12 +252,58 @@ fn cap(s: &str) -> String {
 
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 
-/// Shut the jet engines down — cut both fuel levers. Gated hard against doing it
-/// in flight: an airborne "engines off" is a refusal, not an action. Without this
-/// tool the LLM has nothing to map "engines off" to on a jet and improvises a
-/// nonsensical multi-tool cascade, so the tool exists mainly to absorb the intent
-/// and answer it safely.
-pub struct StopEngines;
+/// Shut the jet engines down — cut the fuel levers. Gated hard against doing it
+/// in flight: an airborne "engines off" is a refusal, not an action.
+///
+/// The levers are the AIRFRAME's ([`crate::aircraft::AircraftProfile::fuel_cutoff_levers`]),
+/// not the stock `mixture_ratio`, and the answer is a READBACK: the write is
+/// made, then every engine is watched down before "engines shut down" is
+/// spoken. It used to write the stock mixture and answer "Fuel levers cut" on
+/// the strength of having sent the request, both writes `.ok()`ed. On the stock
+/// 737 that write is erased by the aircraft's own lua on the next frame, so the
+/// copilot said the levers were cut at a Dublin stand while both engines ran
+/// on, and the pilot cut them by hand (2026-09-20). A silently failed write
+/// must not answer "Roger".
+pub struct StopEngines {
+    /// Per-engine cutoff lever; empty = the stock mixture handle.
+    levers: Vec<String>,
+    /// What those levers read at cutoff.
+    cutoff: f64,
+    /// How many engines must be watched down.
+    engines: usize,
+}
+
+impl StopEngines {
+    pub fn new(profile: &crate::aircraft::AircraftProfile) -> Self {
+        Self {
+            levers: profile.fuel_cutoff_levers.clone(),
+            cutoff: profile.fuel_cutoff_value,
+            engines: profile.engines.max(1),
+        }
+    }
+
+    /// Put every lever at cutoff. `Err` carries the line to speak: a write the
+    /// API refused is not a cut lever.
+    async fn cut(&self, ctx: &ToolCtx<'_>) -> Result<(), String> {
+        let fail = |e| format!("The fuel lever write failed: {e}. The levers are yours.");
+        if self.levers.is_empty() {
+            for i in 0..self.engines {
+                ctx.xplane
+                    .set_float_array_elem(MIXTURE, i, self.cutoff)
+                    .await
+                    .map_err(fail)?;
+            }
+            return Ok(());
+        }
+        for lever in &self.levers {
+            ctx.xplane
+                .set_float(lever, self.cutoff)
+                .await
+                .map_err(fail)?;
+        }
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl Tool for StopEngines {
@@ -277,14 +330,32 @@ impl Tool for StopEngines {
             );
         }
         if let Ok(r) = ctx.xplane.get_float_array(ENGN_RUNNING).await {
-            if r.len() >= 2 && r.iter().take(2).all(|&v| v < 0.5) {
+            if r.len() >= self.engines && r.iter().take(self.engines).all(|&v| v < 0.5) {
                 return Ok("Engines are already shut down.".to_string());
             }
         }
-        // Cut both fuel levers (the start sequence raises these to 1 to run).
-        ctx.xplane.set_float_array_elem(MIXTURE, 0, 0.0).await.ok();
-        ctx.xplane.set_float_array_elem(MIXTURE, 1, 0.0).await.ok();
-        Ok("Fuel levers cut, both engines shutting down.".to_string())
+        if let Err(line) = self.cut(ctx).await {
+            return Ok(line);
+        }
+        // READBACK: the levers are cut when the engines are DOWN, not when the
+        // write returned 200. Watch every one of them — element 0 can read
+        // stopped with the other still turning.
+        for _ in 0..SHUTDOWN_POLLS {
+            tokio::time::sleep(Duration::from_millis(SHUTDOWN_POLL_MS)).await;
+            let Ok(r) = ctx.xplane.get_float_array(ENGN_RUNNING).await else {
+                continue;
+            };
+            // A SHORT array is no verdict on the engines it does not carry.
+            if r.len() >= self.engines && r.iter().take(self.engines).all(|&v| v < 0.5) {
+                return Ok("Fuel levers cut, engines shut down.".to_string());
+            }
+        }
+        // The levers were written and the engines are still turning: on this
+        // airframe that write is not the control. Say so and hand them back,
+        // rather than claim a shutdown that did not happen.
+        Ok("I cut the fuel levers but the engines are still running. \
+            They're yours, cut them on the pedestal."
+            .to_string())
     }
 }
 

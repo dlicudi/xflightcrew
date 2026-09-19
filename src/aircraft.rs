@@ -186,6 +186,25 @@ pub struct AircraftProfile {
     /// full auto fires the command and waits on the engines.
     #[serde(default)]
     pub scripted_auto_start: bool,
+    /// Per-engine FUEL CUTOFF lever, when the stock `mixture_ratio` is not the
+    /// control the aircraft is actually cut with. Empty = write
+    /// `sim/cockpit2/engine/actuators/mixture_ratio[i]`, which is right on
+    /// every airframe whose levers the sim itself owns (the MD-82).
+    ///
+    /// The stock 737-800 is the case that found this (2026-09-20): its
+    /// `B738.systems.lua` rewrites `mixture_ratio[0..1]` EVERY FRAME from
+    /// `laminar/B738/engine/slider/condition_lever{1,2}`, which is itself an
+    /// animation output driven toward `..._target`. So the stock write is
+    /// accepted (`is_writable: true`), overwritten on the next frame, and does
+    /// nothing: the copilot said "fuel levers cut" at a Dublin stand and the
+    /// engines ran on until the pilot cut them by hand. The writable control is
+    /// the `_target` pair, and only a readback can tell the two apart.
+    #[serde(default)]
+    pub fuel_cutoff_levers: Vec<String>,
+    /// The value those levers take at CUTOFF. Defaults to 0.0, which is cutoff
+    /// on every lever seen so far; a lever whose sense is inverted says so here.
+    #[serde(default)]
+    pub fuel_cutoff_value: f64,
     /// Airliner autoflight extras: `set_speed` (AP airspeed select) and
     /// `autothrottle` (engage/disengage). For jets with an autothrottle.
     #[serde(default)]
@@ -1691,6 +1710,43 @@ mod tests {
         }
     }
 
+    /// An airframe whose own lua OWNS the stock mixture handle must declare the
+    /// lever it is really cut with (2026-09-20). The 737's B738.systems.lua
+    /// rewrites `mixture_ratio[0..1]` every frame from `condition_lever{1,2}`,
+    /// so the stock write is accepted and then erased, and "fuel levers cut"
+    /// was a lie at the EIDW stand. Probed live: `condition_lever1` is_writable
+    /// FALSE, `_target` TRUE — the TARGET is the control.
+    #[test]
+    fn the_737_declares_the_lever_it_is_actually_cut_with() {
+        let text = std::fs::read_to_string("profiles/boeing_737_800.yaml").unwrap();
+        let p: AircraftProfile = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(
+            p.fuel_cutoff_levers.len(),
+            p.engines,
+            "one cutoff lever per engine, or the second one runs on"
+        );
+        for lever in &p.fuel_cutoff_levers {
+            assert!(
+                !lever.contains("mixture_ratio"),
+                "{lever}: the lua rewrites the stock handle every frame"
+            );
+            assert!(
+                lever.ends_with("_target"),
+                "{lever}: condition_lever itself is an animation output, read-only"
+            );
+        }
+        assert_eq!(
+            p.fuel_cutoff_value, 0.0,
+            "the lua lights the engine at >= 0.75"
+        );
+        // And the probe covers them, so a renamed lever is said at boot rather
+        // than found at a stand.
+        let refs = profile_references(&p);
+        for lever in &p.fuel_cutoff_levers {
+            assert!(refs.contains(lever), "{lever} is not probed");
+        }
+    }
+
     /// The stock airliners (2026-09-16): parsed strictly, and the numbers the
     /// automation flies are the airframe's own, never the GA defaults (the
     /// RV-10 lesson at 174,000 lb).
@@ -2246,6 +2302,8 @@ fn cessna_172sp() -> AircraftProfile {
         turbine_start: false,
         auto_prep: false,
         scripted_auto_start: false,
+        fuel_cutoff_levers: Vec::new(),
+        fuel_cutoff_value: 0.0,
         autothrottle: false,
         speedbrake: false,
         barometer: true,
@@ -2556,6 +2614,8 @@ fn cirrus_sr22() -> AircraftProfile {
         turbine_start: false,
         auto_prep: false,
         scripted_auto_start: false,
+        fuel_cutoff_levers: Vec::new(),
+        fuel_cutoff_value: 0.0,
         autothrottle: false,
         speedbrake: false,
         // Dual battery/alternator + avionics — datarefs/commands verified against
