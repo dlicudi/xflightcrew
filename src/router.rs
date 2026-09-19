@@ -215,6 +215,20 @@ pub(crate) fn conversational(t: &str, registry: &Registry) -> Option<String> {
     None
 }
 
+/// What the pilot hears when the grammar names a tool the registry never
+/// built for this airframe. On a rotorcraft the fixed-wing laws are withheld
+/// on purpose ([`tools::ROTORCRAFT_WITHHELD`]), and "isn't wired up yet"
+/// sends the pilot looking for a bug; say why instead (S-76C, 2026-09-17).
+/// Anywhere else the generic line stands.
+pub(crate) fn unregistered_tool_line(profile: &aircraft::AircraftProfile, tool: &str) -> String {
+    if profile.rotorcraft && tools::ROTORCRAFT_WITHHELD.contains(&tool) {
+        "Not on a helicopter. Every law I have for that is fixed-wing, so it isn't offered on this airframe."
+            .to_string()
+    } else {
+        "That command isn't wired up yet.".to_string()
+    }
+}
+
 /// Human label for the on-screen callout: "FLAPS → 10", "GEAR → DOWN", "PROPS →
 /// CRUISE". Generic: the tool name minus set_, plus the argument values.
 pub(crate) fn callout_label(tool: &str, args: &serde_json::Value) -> String {
@@ -823,4 +837,29 @@ pub(crate) fn matches_keyword(w: &str) -> bool {
             .iter()
             .filter(|k| k.len() >= 5)
             .any(|k| levenshtein(w, k) <= 1)
+}
+
+#[cfg(test)]
+mod unregistered_tool_tests {
+    use super::*;
+
+    /// The S-76C: a withheld fixed-wing law is refused with its reason; an
+    /// unrelated missing tool, and any tool on a fixed-wing profile, keep
+    /// the generic line.
+    #[test]
+    fn a_withheld_law_on_a_rotorcraft_names_its_reason() {
+        let heli = aircraft::load("sikorsky_s76c").expect("S-76C profile loads");
+        assert!(heli.rotorcraft);
+        assert!(unregistered_tool_line(&heli, "circuit").starts_with("Not on a helicopter"));
+        assert_eq!(
+            unregistered_tool_line(&heli, "no_such_tool"),
+            "That command isn't wired up yet."
+        );
+        let mut fixed = heli.clone();
+        fixed.rotorcraft = false;
+        assert_eq!(
+            unregistered_tool_line(&fixed, "circuit"),
+            "That command isn't wired up yet."
+        );
+    }
 }

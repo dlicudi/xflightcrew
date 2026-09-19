@@ -53,6 +53,11 @@ pub struct AircraftProfile {
     /// Optional progressive autoland power reduction; absent retains idle flare.
     #[serde(default)]
     pub flare_power: Option<FlarePowerProfile>,
+    /// The least thrust (lever ratio) the autoland holds on a stabilised
+    /// final, when not more than a few knots fast. Jets fly the approach on
+    /// thrust; `None` lets the speed law idle the engines (the pistons).
+    #[serde(default)]
+    pub approach_thrust_min: Option<f64>,
     /// None = unknown; do not invent a pressurisation system in warnings.
     #[serde(default)]
     pub pressurised: Option<bool>,
@@ -128,6 +133,15 @@ pub struct AircraftProfile {
     /// calling out each, rather than a one-shot shortcut.
     #[serde(default)]
     pub auto_prep: bool,
+    /// The aircraft scripts its OWN start behind the stock `auto_start`
+    /// command (an xlua `replace_command`): one press runs the whole cold and
+    /// dark bring-up and the engine start with the aircraft's real switches.
+    /// The stock 737-800: battery, standby power, fire tests, APU, packs, then
+    /// starter 2 and 1 on N2, generators, probe heat, bleeds, APU off, 124 s
+    /// from cold to both running (probed 2026-09-17). `StartKind::Scripted`:
+    /// full auto fires the command and waits on the engines.
+    #[serde(default)]
+    pub scripted_auto_start: bool,
     /// Airliner autoflight extras: `set_speed` (AP airspeed select) and
     /// `autothrottle` (engage/disengage). For jets with an autothrottle.
     #[serde(default)]
@@ -762,6 +776,20 @@ pub struct ReferenceProfile {
     pub vx_kts: Option<f64>, // best angle of climb
     #[serde(default)]
     pub vy_kts: Option<f64>, // best rate of climb
+    /// The speed the INITIAL climb is flown at, KIAS — what the auto takeoff
+    /// protects between liftoff and the handoff, as opposed to the enroute
+    /// climb speed `vy_kts` holds afterwards.
+    ///
+    /// On a trainer they are the same number and this stays `None`. On a jet
+    /// they are not: the 737 lifts at V2+20 and climbs out around 170 while
+    /// its `vy_kts` of 210 is the speed the pattern and the cruise climb use.
+    /// Fed the enroute figure, the takeoff's climb law read 174 kt as
+    /// "36 knots slow", stripped 2,150 fpm off the commanded rate and
+    /// levelled a 737 at full thrust at 1,030 ft (LFLL, 2026-09-17).
+    /// Defaults to `vy_kts`, so every profile that does not set it is
+    /// unchanged.
+    #[serde(default)]
+    pub initial_climb_kts: Option<f64>,
     #[serde(default)]
     pub vr_kts: Option<f64>, // rotate
     /// Blue line: single-engine best rate of climb. A TWIN's number — the one
@@ -1176,6 +1204,75 @@ pub fn speed_floor_kts() -> Option<f64> {
     *SPEED_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The floor for the LANDING configuration: 1.2 x Vso when the profile
+/// declares one, else the clean floor. The clean floor is right for a plan's
+/// cruise target and the pattern, wrong for a flapped approach: the 737's
+/// clean Vs is 139, its Vref with flaps 40 is 145, and flooring the
+/// approach at 167 flew it to the threshold 22 kt fast, over a flap gate
+/// (Vfe40 162) the schedule could never pass, and into two go-arounds
+/// (LFLL 35L, 2026-09-17). On a 172 (Vso 40, Vs 48) the two floors are
+/// 48 and 58 under a 65 kt approach: nothing changes.
+static APPROACH_FLOOR_KTS: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// Publish the landing-configuration floor. Called on EVERY profile swap,
+/// after [`publish_speed_floor`].
+pub fn publish_approach_floor(vs0_kts: Option<f64>, vs_clean_kts: Option<f64>) {
+    let by_vso = vs0_kts
+        .filter(|v| *v > 0.0)
+        .map(|v| (v * SPEED_FLOOR_RATIO).round());
+    let clean = vs_clean_kts
+        .filter(|v| *v > 0.0)
+        .map(|v| (v * SPEED_FLOOR_RATIO).round());
+    *APPROACH_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner()) = by_vso.or(clean);
+}
+
+/// The live airframe's landing-configuration floor, kts.
+pub fn approach_floor_kts() -> Option<f64> {
+    *APPROACH_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The floor for the configuration the aircraft is IN: the clean floor with
+/// the flaps up, the landing floor with them fully out, interpolated by the
+/// flap ratio between. A speed target is only as safe as the wing under it:
+/// the 737's Vref 145 is 1.27 Vso with flaps 40 and 1.04 Vs with flaps 5,
+/// and the circuit flew its final at flaps 5 toward exactly that number
+/// (LFLL, 2026-09-17). Every leg that slows toward the approach speed
+/// floors against this with the flaps it has actually commanded.
+pub fn config_floor_kts(flap_ratio: f64) -> Option<f64> {
+    let r = if flap_ratio.is_finite() {
+        flap_ratio.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    match (speed_floor_kts(), approach_floor_kts()) {
+        (Some(clean), Some(landing)) => Some((clean + (landing - clean) * r).round()),
+        (Some(clean), None) => Some(clean),
+        (None, Some(landing)) => Some(landing),
+        (None, None) => None,
+    }
+}
+
+/// The least thrust the autoland holds on a stabilised final, as a lever
+/// ratio (`None` = idle is allowed). A jet's approach is flown ON thrust:
+/// the 737 idled for the last mile to lose the circuit's excess and arrived
+/// over the numbers 4 kt under Vref still spooling up (LFLL, 2026-09-17).
+static APPROACH_THRUST_MIN: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// Publish the airframe's approach thrust floor. Called on EVERY profile swap.
+pub fn publish_approach_thrust_min(min: Option<f64>) {
+    *APPROACH_THRUST_MIN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) =
+        min.filter(|v| v.is_finite() && (0.0..=1.0).contains(v));
+}
+
+/// The live airframe's approach thrust floor, if its profile declares one.
+pub fn approach_thrust_min() -> Option<f64> {
+    *APPROACH_THRUST_MIN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// `asked`, raised to the floor when it is under it. Pure; the callers say so
 /// aloud and record it.
 pub fn floored_target(asked: f64, floor: Option<f64>) -> f64 {
@@ -1526,8 +1623,19 @@ mod tests {
             assert_eq!(p.engines, 2);
             assert_eq!(p.pressurised, Some(true), "{id}: cabin alerts need the real answer");
             assert!(p.cabin_crew && p.retractable_gear && p.throttle && !p.engine);
-            assert!(!p.autothrottle, "{id}: the md82 autothrottle tool would withhold hold_speed");
-            assert!(!p.turbine_start && !p.auto_prep, "{id}: no start sequence is declared, so none is cranked");
+            assert!(
+                !p.autothrottle,
+                "{id}: the md82 autothrottle tool would withhold hold_speed"
+            );
+            assert!(
+                !p.turbine_start && !p.auto_prep,
+                "{id}: the MD-82's APU/bleed sequence is not this aircraft's"
+            );
+            assert_eq!(
+                p.scripted_auto_start,
+                id == "boeing_737_800",
+                "{id}: the 737 scripts its own start, the A330 does not (yet)"
+            );
             let r = p.reference.as_ref().expect("reference card");
             assert_eq!(r.vr_kts, Some(vr));
             assert_eq!(r.takeoff_roll_ft, Some(roll), "{id}: the roll the runway check uses");
@@ -1539,6 +1647,17 @@ mod tests {
             assert!(f.detents.last().unwrap().vfe_kts.is_some());
             assert!(p.fuel.as_ref().unwrap().cruise_burn_kg_hr > 1000.0);
             assert!(p.tail_strike_deg.is_some());
+            // A jet's INITIAL climb is not its enroute climb speed, and the
+            // takeoff's climb law protects the number it is given: fed the
+            // enroute 210, it read the 737's real 174 kt as thirty-six knots
+            // slow and commanded 150 fpm at takeoff thrust (2026-09-17).
+            let ic = r
+                .initial_climb_kts
+                .expect("an airliner declares its initial climb");
+            assert!(
+                ic >= vr && ic < r.vy_kts.unwrap(),
+                "{id}: initial climb {ic} must sit between Vr and the enroute climb"
+            );
         }
     }
 
@@ -2045,6 +2164,7 @@ fn cessna_172sp() -> AircraftProfile {
         prop: None,
         turbine_start: false,
         auto_prep: false,
+        scripted_auto_start: false,
         autothrottle: false,
         speedbrake: false,
         barometer: true,
@@ -2058,6 +2178,7 @@ fn cessna_172sp() -> AircraftProfile {
         cabin_crew: false,
         bus_volts_nominal: None,
         flare_power: None,
+        approach_thrust_min: None,
         pressurised: Some(false),
         park_brake_valve_set: None,
         electrical: {
@@ -2170,6 +2291,8 @@ fn cessna_172sp() -> AircraftProfile {
             va_kts: Some(99.0),
             vx_kts: Some(62.0),
             vy_kts: Some(74.0),
+            // A trainer climbs out at Vy; only airframes that do not say so.
+            initial_climb_kts: None,
             vyse_kts: None,
             vmca_kts: None,
             vr_kts: Some(55.0),
@@ -2334,6 +2457,7 @@ fn cirrus_sr22() -> AircraftProfile {
         cabin_crew: false,
         bus_volts_nominal: None,
         flare_power: None,
+        approach_thrust_min: None,
         pressurised: Some(false),
         park_brake_valve_set: None,
         pitot_heat: true,
@@ -2348,6 +2472,7 @@ fn cirrus_sr22() -> AircraftProfile {
         prop: None,
         turbine_start: false,
         auto_prep: false,
+        scripted_auto_start: false,
         autothrottle: false,
         speedbrake: false,
         // Dual battery/alternator + avionics — datarefs/commands verified against
@@ -2503,6 +2628,7 @@ fn cirrus_sr22() -> AircraftProfile {
             va_kts: Some(133.0),
             vx_kts: Some(88.0),
             vy_kts: Some(101.0),
+            initial_climb_kts: None,
             vyse_kts: None,
             vmca_kts: None,
             vr_kts: Some(73.0),
@@ -2657,8 +2783,13 @@ P _engn/0/_type RCP_INJ
         assert!(p.checklist.is_none(), "the 172's checklist is not this aircraft's");
     }
 
+    /// The floor statics are process-wide; the tests that publish them take
+    /// this so they never read each other's airframe.
+    static FLOOR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn no_target_goes_below_the_stall_floor() {
+        let _g = FLOOR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The RV-10: Vs 65, floor 78. The 172's 65 kt approach is under it.
         super::publish_speed_floor(Some(65.0));
         assert_eq!(super::speed_floor_kts(), Some(78.0));
@@ -2667,6 +2798,56 @@ P _engn/0/_type RCP_INJ
         // A profile with no Vs floors nothing (the old behaviour, honestly).
         super::publish_speed_floor(None);
         assert_eq!(super::floored_target(65.0, super::speed_floor_kts()), 65.0);
+    }
+
+    /// The 737: clean Vs 139, Vso 114, Vref 145. The approach is floored
+    /// against the LANDING configuration (137), never the clean floor (167)
+    /// that flew it to the threshold 22 kt fast (LFLL, 2026-09-17). Without
+    /// a Vso the clean floor stands in; without either, nothing floors.
+    #[test]
+    fn the_approach_floor_is_the_landing_configuration() {
+        let _g = FLOOR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        super::publish_approach_floor(Some(114.0), Some(139.0));
+        assert_eq!(super::approach_floor_kts(), Some(137.0));
+        assert_eq!(
+            super::floored_target(145.0, super::approach_floor_kts()),
+            145.0
+        );
+        super::publish_approach_floor(None, Some(139.0));
+        assert_eq!(super::approach_floor_kts(), Some(167.0));
+        super::publish_approach_floor(Some(0.0), None);
+        assert_eq!(super::approach_floor_kts(), None);
+    }
+
+    /// The 737 (Vs 139, Vso 114): flaps up floors at 167, flaps 40 at 137,
+    /// flaps 5 (0.375) at 156. A wing with no Vso floors flat at the clean
+    /// number; no stall speeds at all floors nothing.
+    #[test]
+    fn the_floor_follows_the_flaps() {
+        let _g = FLOOR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        super::publish_speed_floor(Some(139.0));
+        super::publish_approach_floor(Some(114.0), Some(139.0));
+        assert_eq!(super::config_floor_kts(0.0), Some(167.0));
+        assert_eq!(super::config_floor_kts(1.0), Some(137.0));
+        assert_eq!(super::config_floor_kts(0.375), Some(156.0));
+        assert_eq!(
+            super::config_floor_kts(f64::NAN),
+            Some(167.0),
+            "an unreadable flap is the clean floor"
+        );
+        super::publish_approach_floor(None, Some(139.0));
+        assert_eq!(super::config_floor_kts(1.0), Some(167.0));
+        super::publish_speed_floor(None);
+        super::publish_approach_floor(None, None);
+        assert_eq!(super::config_floor_kts(0.5), None);
+        super::publish_approach_thrust_min(Some(0.3));
+        assert_eq!(super::approach_thrust_min(), Some(0.3));
+        super::publish_approach_thrust_min(Some(7.0));
+        assert_eq!(
+            super::approach_thrust_min(),
+            None,
+            "a lever ratio outside 0..1 is refused"
+        );
     }
 
     // The probe asks the sim about every name a profile relies on. The RV-10's

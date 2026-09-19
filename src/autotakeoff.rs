@@ -279,8 +279,15 @@ pub struct Params {
     pub cfg: ApConfig,
     /// Rotate speed, KIAS.
     pub vr_kts: f64,
-    /// Initial climb speed, KIAS — the climb law protects it.
+    /// Enroute climb speed, KIAS. The CIRCUIT sizes its pattern off this
+    /// (`circuit::pattern_speed_kts` reads it straight off these params);
+    /// the takeoff's own climb law flies `initial_climb_kts`.
     pub vy_kts: f64,
+    /// Initial climb speed, KIAS — what the climb law protects between
+    /// liftoff and the handoff, and the speed the takeoff flaps come up at.
+    /// Equal to `vy_kts` on everything that does not declare its own (see
+    /// `ReferenceProfile::initial_climb_kts`).
+    pub initial_climb_kts: f64,
     /// Ceiling on the commanded climb, fpm.
     pub climb_fpm: f64,
     pub retract_gear: bool,
@@ -697,6 +704,32 @@ pub fn climb_vs_fpm(ias_kts: f64, vy_kts: f64, max_fpm: f64) -> f64 {
     // question any more.
     let cap = max_fpm.max(0.0);
     (cap - (vy_kts - ias_kts).max(0.0) * 60.0).clamp(150.0_f64.min(cap), cap)
+}
+
+/// What the handoff owes the takeoff flaps: `None` when they are already up,
+/// `Some(true)` to retract them now, `Some(false)` when the aircraft is too
+/// slow to clean up and the next pair of hands must be TOLD so.
+///
+/// The in-climb schedule waits for Vy, and Vy is not a speed every airframe
+/// sees before this loop ends. A 737 lifts at V2+20 and hands over at 1,000 ft
+/// doing 181 kt against a profile Vy of 210, so its one-shot never fired: the
+/// flaps stayed at 5 from Lyon to FL360 and on to Heathrow's top of descent,
+/// the entire climb sitting on their 250 kt placard (2026-09-17). A takeoff
+/// that ends with the aircraft still configured for takeoff has not finished.
+///
+/// `clean_floor_kts` is the airframe's clean-configuration minimum (1.2 x
+/// clean Vs): below it, retracting is the stall the schedule exists to avoid,
+/// so the flaps stay out and the copilot says why. An airframe that declares
+/// no floor has nothing to judge against and cleans up, as it always did.
+pub fn clean_up_at_handoff(
+    retracted: bool,
+    ias_kts: f64,
+    clean_floor_kts: Option<f64>,
+) -> Option<bool> {
+    if retracted {
+        return None;
+    }
+    Some(clean_floor_kts.is_none_or(|floor| ias_kts > floor))
 }
 
 /// How far below Vne the overspeed protection starts working, and how much
@@ -1281,7 +1314,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         }
         // Clean up the takeoff flaps once safely climbing above Vy — after the
         // gear, the way a crew does it.
-        if !flaps_retracted && agl_ft > FLAP_RETRACT_AGL_FT && ias > p.vy_kts {
+        if !flaps_retracted && agl_ft > FLAP_RETRACT_AGL_FT && ias > p.initial_climb_kts {
             flaps_retracted = true;
             let _ = xp.set_float(FLAP_HANDLE, 0.0).await;
             alert(&voice, Priority::Advisory, "Flaps up.");
@@ -1333,7 +1366,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // the dial to the CURRENT rate, stomping any preset (the sync
             // that made VS-mode rotation impossible in the first place).
             // The pitch channel simply expires; the servo owns the elevator.
-            let vs = climb_vs_protected(ias, p.vy_kts, p.climb_fpm, p.vne_kts);
+            let vs = climb_vs_protected(ias, p.initial_climb_kts, p.climb_fpm, p.vne_kts);
             if !engage_climb(&xp, vs, &mut last_vs_cmd).await {
                 continue;
             }
@@ -1346,7 +1379,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 }),
             );
         }
-        let vs = climb_vs_protected(ias, p.vy_kts, p.climb_fpm, p.vne_kts);
+        let vs = climb_vs_protected(ias, p.initial_climb_kts, p.climb_fpm, p.vne_kts);
         if !engage_climb(&xp, vs, &mut last_vs_cmd).await {
             continue;
         }
@@ -1361,6 +1394,34 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             serde_json::json!({"event": "climb", "ias": ias, "agl": agl_ft, "cmd_vs": vs}),
         );
         if agl_ft >= p.handoff_agl_ft.max(AP_ENGAGE_AGL_FT + 50.0) {
+            // Never hand over dirty. The schedule above waits for Vy, which a
+            // trainer passes in the first few hundred feet and a jet does not
+            // reach before this loop ends: a 737 lifting at V2+20 hands off at
+            // 1,000 ft and 181 kt against a Vy of 210, so nothing ever fired
+            // and the flaps stayed at 5 from Lyon to FL360 and all the way to
+            // Heathrow's top of descent, the whole climb held against their
+            // 250 kt placard (2026-09-17). Whoever takes the aircraft next
+            // flies it clean, or is TOLD it is not — the floor is the
+            // airframe's clean-configuration minimum, so a retraction can
+            // never be one into the stall it was meant to avoid.
+            let floor = crate::aircraft::speed_floor_kts();
+            if let Some(up) = clean_up_at_handoff(flaps_retracted, ias, floor) {
+                if up {
+                    let _ = xp.set_float(FLAP_HANDLE, 0.0).await;
+                    alert(&voice, Priority::Advisory, "Flaps up.");
+                } else {
+                    alert(
+                        &voice,
+                        Priority::Caution,
+                        "Flaps are still out, we're too slow to clean up. Watch the placard.",
+                    );
+                }
+                crate::blackbox::record(
+                    "autotakeoff",
+                    serde_json::json!({"event": "flaps_handoff", "ias": ias,
+                                       "floor": floor, "up": up}),
+                );
+            }
             // Say the height we ACTUALLY reached, not a hardcoded thousand: a
             // circuit hands off at 500 ft, and it announced "one thousand
             // feet" there — a number the pilot can see is wrong on the
@@ -2128,6 +2189,51 @@ mod tests {
             at_ship < 2.5,
             "the tuned point must be comfortable: {at_ship:.1} deg"
         );
+    }
+
+    /// LFLL-EGLL, 2026-09-17. The 737 lifted at V2+20 and climbed out at
+    /// 174 kt. Handed the profile's enroute `vy_kts` of 210 as its climb
+    /// reference, the law read that as thirty-six knots slow, took 2,150 fpm
+    /// off the rate and commanded 150 fpm — a jet at takeoff thrust told to
+    /// stop climbing at 300 ft. It levelled at 1,030 ft and accelerated to
+    /// 220 before the follower picked it up. The reference for the INITIAL
+    /// climb is the initial climb speed.
+    #[test]
+    fn the_initial_climb_reference_is_the_speed_the_aircraft_actually_has() {
+        // The 737-800's card: V2 150, initial climb 170, enroute Vy 210, and
+        // the rate the arming tool hands down (80% of best, clamped: 1500).
+        let cap = 1500.0;
+        let at_liftoff = climb_vs_protected(174.0, 170.0, cap, Some(340.0));
+        assert_eq!(at_liftoff, cap, "at the initial climb speed, full rate");
+        // Against the enroute figure the SAME aircraft is floored — the bug,
+        // kept here so the two numbers can never be conflated again.
+        assert_eq!(
+            climb_vs_protected(174.0, 210.0, cap, Some(340.0)),
+            150.0,
+            "the enroute climb speed floors a jet that is climbing perfectly well"
+        );
+        // Genuinely slow still trades rate for speed, jet or not.
+        let slow = climb_vs_protected(150.0, 170.0, cap, Some(340.0));
+        assert!(slow < cap && slow >= 150.0, "{slow}");
+    }
+
+    /// A takeoff that ends with the aircraft still configured for takeoff has
+    /// not finished. The in-climb schedule waits for the climb speed, which a
+    /// jet does not reach before the handoff: flaps 5 rode from Lyon to
+    /// FL360 and on to Heathrow's top of descent, the whole climb sitting on
+    /// their 250 kt placard (2026-09-17).
+    #[test]
+    fn the_handoff_never_leaves_the_takeoff_flaps_out() {
+        // Already clean: nothing owed, nothing said.
+        assert_eq!(clean_up_at_handoff(true, 181.0, Some(167.0)), None);
+        // The 737 at its handoff: 181 kt against a 167 kt clean floor.
+        assert_eq!(clean_up_at_handoff(false, 181.0, Some(167.0)), Some(true));
+        // Too slow to clean up: the flaps STAY, and the caller says so — a
+        // retraction here is the stall the schedule exists to avoid.
+        assert_eq!(clean_up_at_handoff(false, 160.0, Some(167.0)), Some(false));
+        // An airframe with no declared floor has nothing to judge against and
+        // cleans up, exactly as it always did.
+        assert_eq!(clean_up_at_handoff(false, 70.0, None), Some(true));
     }
 
     #[test]

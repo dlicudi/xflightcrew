@@ -108,6 +108,25 @@ fn publish_leg(leg: Option<ActiveLeg>) {
     *LEG.lock().unwrap_or_else(|e| e.into_inner()) = leg;
 }
 
+static FIX_DIST: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// Miles to the fix the follower is steering at, republished every tick from
+/// the number the tick already worked out. The mission's arrival watch reads
+/// THIS rather than measuring the sim itself: an orchestrator that flies its
+/// own reads to judge a loop it can already hear from is Web API load for
+/// nothing, and it would measure a different distance from the one the
+/// follower is actually closing.
+pub fn fix_distance_nm() -> Option<f64> {
+    if !ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    *FIX_DIST.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn publish_fix_dist(d: Option<f64>) {
+    *FIX_DIST.lock().unwrap_or_else(|e| e.into_inner()) = d;
+}
+
 /// The follower's OWN top of descent: where its vertical law will start down
 /// for the leg it is flying. The monitor's descent advisor and the spoken
 /// "how far to top of descent" used to measure a different point (SimBrief's
@@ -830,6 +849,7 @@ pub fn start_scoped(
         let _lease = lease.with_cleanup(&ACTIVE, || {
             publish_leg(None);
             publish_tod(None);
+            publish_fix_dist(None);
             clear_pilot_altitude();
             publish_terrain_floor(None);
             crate::tools::speedhold::release();
@@ -852,6 +872,7 @@ pub fn start_scoped(
         ACTIVE.store(false, Ordering::SeqCst);
         publish_leg(None);
         publish_tod(None);
+        publish_fix_dist(None);
     });
     true
 }
@@ -1097,6 +1118,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             let f = leg.fix.as_ref().unwrap();
             crate::nav::haversine_nm(lat, lon, f.lat, f.lon)
         });
+        publish_fix_dist(dist_nm);
         let target_mag = if let Some(brg_true) = bearing_to_fix(lat, lon, leg) {
             Some(true_to_mag(brg_true + crab, mag_var))
         } else {

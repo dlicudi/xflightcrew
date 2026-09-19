@@ -33,6 +33,10 @@ use crate::xplane::XPlaneClient;
 
 const ENGN_RUNNING: &str = "sim/flightmodel/engine/ENGN_running";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
+const VS_DIAL: &str = "sim/cockpit/autopilot/vertical_velocity";
+/// Throttle a mission give-up hands the aircraft back with — autoland's own
+/// number, for the same reason: enough to hold level flight dirty.
+const GIVE_UP_THROTTLE: f64 = 0.75;
 const COM1_FREQ_KHZ: &str = crate::datarefs::COM1_FREQ_KHZ;
 
 /// True while the full-auto orchestrator runs.
@@ -612,6 +616,10 @@ fn confirmed_ground(agl_m: anyhow::Result<f64>, on_ground: anyhow::Result<f64>) 
 }
 
 async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubTools) {
+    // A new mission starts owing nothing to the last one's destination: a pin
+    // left by the previous arrival would keep the region from ever handing
+    // this departure on (see `release_arrival_station`).
+    release_arrival_station();
     macro_rules! bail_if_abort {
         () => {
             if ABORT.load(SeqCst) {
@@ -1703,6 +1711,10 @@ async fn fly_route(
         // that field the way a keyed transmission on its frequency does; the
         // swap wait below then finds it on the next loop pass.
         crate::station::arm_station_for_freq(khz, lat, lon, alt_msl_ft, Instant::now());
+        // And HOLD it there for the rest of the arrival: arming only wins the
+        // next swap, where the region's tick keeps running all the way to the
+        // flare and will hand a nearer field the station we are talking to.
+        crate::station::pin_arrival_station(Some(khz));
         // The call is worth nothing until the station on that frequency IS
         // the destination: at PIMOS the region swapped to Gibraltar three
         // seconds AFTER "inbound for landing" went out, the call went into
@@ -1799,7 +1811,8 @@ async fn fly_route(
     // the visual). Nothing left to actuate here — the arrival loops own the
     // aircraft — so this watch is the orchestrator's last duty.
     waiting("the arrival to hand to autoland");
-    let deadline = Instant::now() + Duration::from_secs(1800);
+    let started = Instant::now();
+    let mut watch = ArrivalWatch::default();
     let called = loop {
         if ABORT.load(SeqCst) {
             break false;
@@ -1818,11 +1831,48 @@ async fn fly_route(
         if crate::autoland::ACTIVE.load(Relaxed) || !crate::procedure::ACTIVE.load(Relaxed) {
             break true;
         }
-        if Instant::now() >= deadline {
+        let elapsed = started.elapsed().as_secs_f64();
+        let stalled = watch.stalled(
+            crate::procedure::active_leg().map(|l| l.fix).as_deref(),
+            crate::procedure::fix_distance_nm(),
+            elapsed,
+        );
+        if stalled || elapsed >= ARRIVAL_CAP_SECS {
+            event(
+                "arrival_stalled",
+                json!({ "elapsed_s": elapsed.round(), "stalled": stalled }),
+            );
             break false;
         }
         tokio::time::sleep(Duration::from_millis(1000)).await;
     };
+    // Out of patience with an approach still being flown: the follower dies
+    // with this scope whatever we do here (its client refuses writes the
+    // moment the lease drops), so stand it down while we can still speak and
+    // still write, and hand back a FLYABLE aircraft — the rule autoland's own
+    // give-ups follow. Silence here is what killed the EGPH arrival.
+    if !called && !ABORT.load(SeqCst) && crate::procedure::ACTIVE.load(Relaxed) {
+        crate::procedure::abort();
+        // The follower's stand-down releases the speed governor; the throttle
+        // write has to come after it, or the governor re-commands the power we
+        // just set.
+        wait_until(5.0, 250, || async {
+            !crate::procedure::ACTIVE.load(Relaxed)
+        })
+        .await;
+        let thr = crate::aircraft::throttle_dataref();
+        let _ = tokio::join!(
+            xp.set_float(&thr, GIVE_UP_THROTTLE),
+            xp.set_float(VS_DIAL, 0.0),
+        );
+        give_up(
+            voice,
+            "The arrival isn't getting us there. Your aircraft. The autopilot is holding \
+             heading and altitude, climb power set.",
+            "arrival_stalled",
+        );
+        return;
+    }
     // A procedure→autoland handoff has a brief both-inactive window while the
     // autoland thread spins up; give it a beat before concluding nobody flies.
     if called && !crate::autoland::ACTIVE.load(Relaxed) {
@@ -1856,6 +1906,70 @@ async fn fly_route(
     }
     event("arrival_owns", json!({}));
     ACTIVE.store(false, SeqCst);
+}
+
+/// How long the arrival may stop closing on the fix the follower is steering
+/// at before the mission gives up on it, seconds. Longer than the follower's
+/// own per-leg stall watch (which rejoins twice before it stands itself down),
+/// because this is the backstop under that, not a second opinion on it.
+const ARRIVAL_STALL_SECS: f64 = 600.0;
+/// Closure that restarts that clock, miles.
+const ARRIVAL_PROGRESS_NM: f64 = 0.5;
+/// Absolute ceiling on the arrival wait, seconds — three hours. Not a judgement
+/// on the approach (the watch below is): a bound on a mission thread whose
+/// follower has wedged ACTIVE without ticking.
+const ARRIVAL_CAP_SECS: f64 = 3.0 * 3600.0;
+
+/// The mission's watch on an arrival it has handed to the follower: a watchdog
+/// on PROGRESS, not a clock.
+///
+/// It was a flat 1,800 seconds from the arm, and an approach armed far enough
+/// out simply takes longer than that to fly. EGLL-EGPH, 2026-09-17: the
+/// SimBrief route's last fix was RIBEL, 121 nm from the ILS 24 initial fix, so
+/// the arrival armed there and the follower flew the straight line at 265 kt,
+/// descending on its profile the whole way. At 4.2 nm to run — two minutes
+/// from the fix — the 1,800 seconds expired, the mission returned, and its
+/// scope cancelled the follower under it at 4,900 ft. Nothing flew the
+/// aircraft for the next eleven minutes: the speed bled from 200 to 128 kt
+/// through six minutes of airspeed warnings and the 737 sank into the ground
+/// near Perth. A clock cannot tell a long arrival from a stuck one; closure
+/// can, and closure is what the mission actually cares about.
+#[derive(Default)]
+pub(crate) struct ArrivalWatch {
+    fix: Option<String>,
+    best_nm: f64,
+    best_at_s: f64,
+}
+
+impl ArrivalWatch {
+    /// Feed the fix the follower is steering at and the miles to it. True once
+    /// per stall: no new low for [`ARRIVAL_STALL_SECS`]. A new fix starts the
+    /// judgement afresh (the distance jumps UP when a leg sequences), and a
+    /// follower steering at no fix at all holds the clock rather than starting
+    /// it — a to-altitude leg is the follower's own business.
+    pub(crate) fn stalled(&mut self, fix: Option<&str>, dist_nm: Option<f64>, now_s: f64) -> bool {
+        let (Some(fix), Some(d)) = (fix, dist_nm) else {
+            self.fix = None;
+            return false;
+        };
+        if self.fix.as_deref() != Some(fix) {
+            self.fix = Some(fix.to_string());
+            self.best_nm = d;
+            self.best_at_s = now_s;
+            return false;
+        }
+        if d < self.best_nm - ARRIVAL_PROGRESS_NM {
+            self.best_nm = d;
+            self.best_at_s = now_s;
+            return false;
+        }
+        if now_s - self.best_at_s > ARRIVAL_STALL_SECS {
+            self.best_nm = d;
+            self.best_at_s = now_s;
+            return true;
+        }
+        false
+    }
 }
 
 /// The last stage of any mission that ends with a landing: once autoland has
@@ -2065,10 +2179,24 @@ async fn call_inbound(
     }
     crate::circuit::transmit(crate::circuit::radio_call(callsign, "inbound for landing"));
     INBOUND_MADE.store(true, SeqCst);
+    // From here the destination's tower is OURS: the region's service-weighted
+    // nearest-field pick may not hand the station to a closer field while we
+    // fly its zone (London City took the station fifteen miles out and both
+    // the final report and the taxi-in request went into the void, EGLL
+    // 2026-09-17). Released by `release_arrival_station`.
+    crate::station::pin_arrival_station(Some(khz));
     event(
         "inbound_call",
         json!({ "khz": khz, "station_swapped": swapped }),
     );
+}
+
+/// Release the arrival's hold on the station (see
+/// [`crate::station::pin_arrival_station`]). Every path that ends a mission
+/// calls this, so a pin can never outlive the arrival that set it: the
+/// region's ordinary nearest-field handoffs resume for the next flight.
+pub fn release_arrival_station() {
+    crate::station::pin_arrival_station(None);
 }
 
 /// The wind the arrival picks its runway by, and where it came from: the
@@ -2369,11 +2497,37 @@ pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result
         .or(f.max_gross_lb.map(|lb| lb / LB_PER_KG));
     if let (Some(total), Some(max)) = (f.total_kg, max_tow_kg) {
         if total > max * 1.005 {
-            return Err(format!(
-                "Negative. We're at {}, over the max takeoff weight of {}. Not flying that.",
+            // SimBrief's max_tow is the OPERATIONAL limit, the least of the
+            // structural MTOW, the landing weight plus the trip's burn and the
+            // zero-fuel weight plus fuel: on a short leg it sits far under the
+            // placard (LFLL-EGLL, 2026-09-17: 153,280 lb against a 174,200 lb
+            // airframe, and the pilot asked whether that was right). Name it
+            // as the plan's, and when the load sheet says why, say that too:
+            // the excess there was 9.4 t of payload over the OFP's, not fuel.
+            let from_plan = fp.weights.as_ref().is_some_and(|w| w.max_tow_kg > 0.0);
+            let mut why = format!(
+                "Negative. We're at {}, over the {} of {}.",
                 spoken_weight(total),
+                if from_plan {
+                    "plan's takeoff limit"
+                } else {
+                    "max takeoff weight"
+                },
                 spoken_weight(max)
-            ));
+            );
+            if let (Some(w), Some(p)) = (fp.weights.as_ref(), f.payload_kg) {
+                if w.payload_kg > 0.0
+                    && p - w.payload_kg > PAYLOAD_MATCH_KG.max(w.payload_kg * PAYLOAD_MATCH_FRAC)
+                {
+                    why.push_str(&format!(
+                        " The aircraft is loaded with {} of payload against the plan's {}.",
+                        w.spoken(p),
+                        w.spoken(w.payload_kg)
+                    ));
+                }
+            }
+            why.push_str(" Not flying that.");
+            return Err(why);
         }
     }
     let mut lines = Vec::new();
@@ -2590,7 +2744,16 @@ mod tests {
             ..facts()
         };
         let why = super::preflight(&plan(true), &heavy).expect_err("refused");
-        assert_eq!(why, "Negative. We're at 2,560 pounds, over the max takeoff weight of 2,450 pounds. Not flying that.");
+        assert_eq!(why, "Negative. We're at 2,560 pounds, over the plan's takeoff limit of 2,450 pounds. Not flying that.");
+        // Overweight because the cabin is heavier than the load sheet: the
+        // refusal says so, since that is what the pilot can change.
+        let heavy_cabin = super::PreflightFacts {
+            total_kg: Some(1160.0),
+            payload_kg: Some(400.0),
+            ..facts()
+        };
+        let why = super::preflight(&plan(true), &heavy_cabin).expect_err("refused");
+        assert!(why.contains("plan's takeoff limit of 2,450 pounds. The aircraft is loaded with 880 pounds of payload against the plan's 590 pounds."), "{why}");
         // No load sheet: the profile's max gross (2,558 lb = 1,160 kg) is the limit.
         let heavy = super::PreflightFacts {
             total_kg: Some(1180.0),
@@ -2817,5 +2980,63 @@ mod squawk_tests {
         assert_eq!(squawk_owed(Some(4503), Some(7000.0)), Some(4503));
         assert_eq!(squawk_owed(Some(4503), None), Some(4503));
         assert_eq!(squawk_owed(Some(4503), Some(4503.0)), None);
+    }
+}
+
+#[cfg(test)]
+mod arrival_watch_tests {
+    use super::{ArrivalWatch, ARRIVAL_STALL_SECS};
+
+    /// The EGPH arrival, flown as it was flown: armed 121 nm from CI24 and
+    /// closing at the 4.0 nm a minute the blackbox measured, a leg that takes
+    /// half an hour. The old flat 1,800 s killed it 4 nm short; a watch on
+    /// closure never fires, because the aircraft was doing exactly what it was
+    /// told the whole way.
+    #[test]
+    fn a_long_arrival_that_keeps_closing_never_stalls() {
+        let mut w = ArrivalWatch::default();
+        let mut dist = 121.2;
+        let mut t = 0.0;
+        while dist > 0.5 {
+            assert!(
+                !w.stalled(Some("CI24"), Some(dist), t),
+                "closing at {dist:.1} nm after {t:.0}s"
+            );
+            dist -= 4.0 / 60.0;
+            t += 1.0;
+        }
+        assert!(t > 1800.0, "the leg really is longer than the old deadline");
+    }
+
+    /// An arrival that has stopped getting anywhere IS a give-up — but only
+    /// after the follower's own rejoins have had their go.
+    #[test]
+    fn an_arrival_that_stops_closing_stalls_once() {
+        let mut w = ArrivalWatch::default();
+        assert!(!w.stalled(Some("CI24"), Some(12.0), 0.0));
+        assert!(!w.stalled(Some("CI24"), Some(12.0), ARRIVAL_STALL_SECS - 1.0));
+        assert!(w.stalled(Some("CI24"), Some(12.0), ARRIVAL_STALL_SECS + 1.0));
+        // Fires once per stall: the clock restarts behind it.
+        assert!(!w.stalled(Some("CI24"), Some(12.0), ARRIVAL_STALL_SECS + 2.0));
+    }
+
+    /// A sequenced leg jumps the distance UP. That is progress, not a stall.
+    #[test]
+    fn a_new_fix_is_judged_afresh() {
+        let mut w = ArrivalWatch::default();
+        assert!(!w.stalled(Some("CI24"), Some(0.4), 0.0));
+        assert!(!w.stalled(Some("FI24"), Some(6.8), 1.0));
+        assert!(!w.stalled(Some("FI24"), Some(6.8), ARRIVAL_STALL_SECS - 1.0));
+        assert!(w.stalled(Some("FI24"), Some(6.8), ARRIVAL_STALL_SECS + 2.0));
+    }
+
+    /// A follower steering at no fix (a to-altitude leg, or between legs) is
+    /// the follower's own business: hold the clock, don't start one.
+    #[test]
+    fn no_fix_holds_the_clock() {
+        let mut w = ArrivalWatch::default();
+        assert!(!w.stalled(None, None, 0.0));
+        assert!(!w.stalled(None, None, ARRIVAL_STALL_SECS * 3.0));
+        assert!(!w.stalled(Some("CI24"), Some(9.0), ARRIVAL_STALL_SECS * 3.0 + 1.0));
     }
 }

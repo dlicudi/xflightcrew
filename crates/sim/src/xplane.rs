@@ -961,6 +961,16 @@ impl FakeXPlane {
         self.commands.lock().unwrap().iter().any(|c| c == command)
     }
 
+    /// How many times a command was fired (a stepped knob is a count).
+    pub fn ran_count(&self, command: &str) -> usize {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == command)
+            .count()
+    }
+
     /// Index of the first time `command` ran, for ordering assertions.
     pub fn command_index(&self, command: &str) -> Option<usize> {
         self.commands

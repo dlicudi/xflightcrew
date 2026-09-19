@@ -23,7 +23,7 @@ use sim::xplane::SimView;
 // `party_line`'s accessors, never these statics.
 pub use crate::party_line::RegionHandoff;
 pub(crate) use crate::party_line::{
-    ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, LANDING_HANDOFF, LINE_UP_CONDITION,
+    ARRIVAL_PIN, ASSIGNED_SQUAWK, CLEARANCE, DEPARTURE_HANDOFF, LANDING_HANDOFF, LINE_UP_CONDITION,
     PENDING_GO_AROUND, PENDING_LINE_UP, PENDING_STATION, PENDING_TAKEOFF_CLEARANCE, REGION_HANDOFF,
     TAKEOFF_HOLD, TAXI_ROUTE, TAXI_TO_STAND, VECTORS, ZONE_CHALLENGE,
 };
@@ -334,6 +334,7 @@ impl Station {
         // The doc on the party line promises this one dies here.
         *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *PENDING_STATION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *ARRIVAL_PIN.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // NOT cleared by install(): the new station is installed on the main
         // loop's next pass, before the crew has consumed the handoff.
         *REGION_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -684,12 +685,28 @@ impl Station {
                 || ctx.runway_occupied
                 || ctx.wake_secs_left.is_some())
         {
-            *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = Some(TakeoffHold {
+            let mut held = TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+            // Asking again does not restart the separation you have already
+            // waited out. The wake gate is capped at one full interval AT THE
+            // HOLD (`takeoff_hold_tick`), measured from `armed_at` — and
+            // re-stamping it on every request handed that cap back: at a field
+            // whose departure interval is shorter than the separation, a pilot
+            // who asks a second time resets their own clock, hears "wake
+            // turbulence, departing traffic ahead of you" again, and can never
+            // take off. The clock belongs to the departure ahead of us in
+            // sequence, not to our last transmission — so a hold already
+            // standing on this runway keeps the moment it was armed.
+            let armed_at = hold_armed_at(
+                held.as_ref(),
+                &self.runway_in_use.clone().unwrap_or_default(),
+                Instant::now(),
+            );
+            *held = Some(TakeoffHold {
                 callsign: ctx.callsign.clone(),
                 runway: ctx.runway.clone(),
                 runway_ident: self.runway_in_use.clone().unwrap_or_default(),
                 clear_since: None,
-                armed_at: Instant::now(),
+                armed_at,
                 logged_at: Instant::now(),
                 // A hold issued FROM the runway is already sequenced: the
                 // conditional/plain line-up put us there, so the watch owes a
@@ -2286,6 +2303,20 @@ pub fn region_tick(lat: f64, lon: f64, on_ground: bool, now: Instant) -> Option<
     if s_best + margin > s_active {
         return None;
     }
+    // A committed arrival owns the station (see [`pin_arrival_station`]): the
+    // only swap the region may still make is the one TO the pinned field.
+    // On the GROUND the pavement under the wheels outranks the pin — we
+    // landed somewhere else, or the arrival is over and nobody released it —
+    // so the relocation is taken and the pin dropped, never stranding the
+    // station at a field we have left.
+    if let Some(pin) = arrival_pin_khz() {
+        if !best.apt.freq(nav::FREQ_TOWER).is_some_and(|f| f.khz == pin) {
+            if !on_ground {
+                return None;
+            }
+            *ARRIVAL_PIN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
     let khz = best.apt.freq(nav::FREQ_TOWER)?.khz;
     // Whether ANY controller of the active station has actually worked this
     // flight in this session: two-way contact publishes a clearance state,
@@ -2455,6 +2486,28 @@ pub fn fields_in_range(lat: f64, lon: f64, alt_msl_ft: f64, limit: usize) -> Vec
 /// (a shared party line, not a facility), and the nearest match wins when
 /// fields share a frequency. Stamps the region cooldown so the automatic
 /// handoff can't immediately yank the station away from an explicit tune.
+/// Commit the station to the field we are arriving at, by its TOWER
+/// frequency: while this is set the enroute region may hand the station TO
+/// that field and never away from it, and no other field may take it.
+///
+/// The region pick is service-weighted DISTANCE, which is the right rule for
+/// crossing a country and the wrong one for the last fifteen miles. Inbound
+/// to Heathrow with the inbound call already made and answered, the tick
+/// found London City eight miles off the nose against Heathrow's fifteen and
+/// took the station; the final report and then the taxi-in request were
+/// transmitted to a tower that was no longer listening, both `void`, and the
+/// 737 landed on 27L with no clearance and sat on it for three minutes with
+/// traffic inside a mile (LFLL-EGLL, 2026-09-17). `None` releases it.
+pub fn pin_arrival_station(tower_khz: Option<i64>) {
+    *ARRIVAL_PIN.lock().unwrap_or_else(|e| e.into_inner()) = tower_khz;
+}
+
+/// The pinned arrival field's tower frequency, if the crew has committed to
+/// one. Crate-internal: the crew sets the pin, the region reads it.
+fn arrival_pin_khz() -> Option<i64> {
+    *ARRIVAL_PIN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn arm_station_for_freq(com1_khz: i64, lat: f64, lon: f64, alt_msl_ft: f64, now: Instant) {
     if PENDING_STATION
         .lock()
@@ -3611,6 +3664,24 @@ const HOLD_LOG_SECS: f64 = 15.0;
 /// arrival in its corridor, no ghost on the strip — a parallel runway's
 /// stream doesn't count) long enough, the tower comes back unprompted —
 /// like a real one — and the FSM sync is handed to the main loop.
+/// When a takeoff hold's clock started: `now` for a new hold, and the
+/// ORIGINAL moment for one already standing on the same runway.
+///
+/// Asking again does not restart the separation you have already waited out.
+/// The wake gate in [`takeoff_hold_tick`] is capped at one full interval at
+/// the hold, measured from this stamp — and re-stamping it on every request
+/// handed that cap straight back: at a field whose departure interval is
+/// shorter than the separation itself, a pilot who asks a second time resets
+/// their own clock, hears "wake turbulence, departing traffic ahead of you"
+/// again, and never takes off. The clock belongs to the departure ahead of us
+/// in sequence, not to our last transmission. A hold on a DIFFERENT runway is
+/// a different queue and starts fresh.
+fn hold_armed_at(existing: Option<&TakeoffHold>, runway_ident: &str, now: Instant) -> Instant {
+    existing
+        .filter(|h| h.runway_ident == runway_ident)
+        .map_or(now, |h| h.armed_at)
+}
+
 pub fn takeoff_hold_tick(
     targets: &[TcasTarget],
     field_elev_ft: f64,
@@ -7307,6 +7378,73 @@ mod tests {
         *LAST_REGION_SWITCH.lock().unwrap() = None;
     }
 
+    /// LFLL-EGLL, 2026-09-17. Inbound to Heathrow with the inbound call made
+    /// and answered, the region's tick found London City eight miles off the
+    /// nose against Heathrow's fifteen — nearer AND service-weighted — and
+    /// took the station. The final report and the taxi-in request both came
+    /// back `void`, the 737 landed on 27L with no clearance and sat on it for
+    /// three minutes. A committed arrival owns the station until it is over.
+    #[test]
+    fn a_committed_arrival_keeps_its_tower_from_a_nearer_field() {
+        let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heathrow = region_apt("London Heathrow", 51.4775, -0.4614);
+        heathrow.apt.freqs[0].khz = 118505;
+        let mut city = region_apt("London City", 51.5050, 0.0554);
+        city.apt.freqs[0].khz = 118075;
+        for (kind, khz) in [
+            (nav::FREQ_ATIS, 136350),
+            (nav::FREQ_GROUND, 121825),
+            (nav::FREQ_APPROACH, 132700),
+        ] {
+            city.apt.freqs.push(nav::AtcFreq {
+                kind,
+                khz,
+                name: "City".into(),
+            });
+        }
+        *REGION.lock().unwrap() = vec![heathrow, city];
+        *ACTIVE_FIELD.lock().unwrap() = Some(("London Heathrow".into(), 51.4775, -0.4614));
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        *CLEARANCE.lock().unwrap() = None;
+        *ARRIVAL_PIN.lock().unwrap() = None;
+        // The position the swap actually happened from, 13:06:42Z.
+        let (lat, lon) = (51.4, -0.1);
+        let now = Instant::now();
+        // Unpinned, the generic rule still prefers London City — this is the
+        // bug, reproduced, not a rule we are changing for everyone.
+        assert!(
+            region_tick(lat, lon, false, now).is_some(),
+            "the nearer field wins by itself"
+        );
+        assert_eq!(
+            PENDING_STATION.lock().unwrap().take().map(|(_, a)| a.name),
+            Some("London City".to_string())
+        );
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        // Inbound to Heathrow: the pin holds the station through the zone.
+        pin_arrival_station(Some(118505));
+        assert!(
+            region_tick(lat, lon, false, now).is_none(),
+            "the arrival keeps its tower"
+        );
+        assert!(PENDING_STATION.lock().unwrap().is_none());
+        // And the pin is a hold, not a freeze: on the ground the pavement
+        // under the wheels still relocates the station, and drops the pin.
+        assert!(
+            region_tick(51.5050, 0.0554, true, now).is_some(),
+            "landed at City after all"
+        );
+        assert!(
+            ARRIVAL_PIN.lock().unwrap().is_none(),
+            "a stale pin never strands the station"
+        );
+        *REGION.lock().unwrap() = Vec::new();
+        *ACTIVE_FIELD.lock().unwrap() = None;
+        *PENDING_STATION.lock().unwrap() = None;
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+    }
+
     #[test]
     fn transmission_on_another_fields_freq_arms_the_swap() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -8284,6 +8422,44 @@ mod tests {
         *TAKEOFF_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *CLEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ACTIVE_RUNWAYS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+    }
+
+    /// "Wake turbulence — I can never take off." The wake gate is capped at
+    /// one full separation interval AT THE HOLD, so a field whose departure
+    /// stream refreshes the clock faster than it expires still lets you go
+    /// (2026-07-27). But the cap is measured from when the hold was armed,
+    /// and every new takeoff request re-armed it: ask a second time at
+    /// Heathrow and you hand your own clock back to zero, for ever.
+    #[test]
+    fn asking_again_does_not_restart_the_wake_clock() {
+        let t0 = Instant::now();
+        let sec = std::time::Duration::from_secs;
+        let hold = |ident: &str, armed_at: Instant| TakeoffHold {
+            callsign: "November one two three".into(),
+            runway: "27R".into(),
+            runway_ident: ident.into(),
+            clear_since: None,
+            armed_at,
+            logged_at: armed_at,
+            lined_up: false,
+            behind: false,
+        };
+        // Nothing standing: the clock starts now.
+        assert_eq!(hold_armed_at(None, "27R", t0), t0);
+        // Ninety seconds in, the pilot asks again. The hold keeps its stamp,
+        // so thirty seconds later the cap has run and the release can come.
+        let standing = hold("27R", t0);
+        let again = hold_armed_at(Some(&standing), "27R", t0 + sec(90));
+        assert_eq!(again, t0, "re-asking must not rewind the separation");
+        assert!(
+            (t0 + sec(150)).duration_since(again).as_secs() >= WAKE_SECS,
+            "the cap must be reachable however often we ask"
+        );
+        // A hold on the OTHER strip is a different queue: its own clock.
+        assert_eq!(
+            hold_armed_at(Some(&standing), "09L", t0 + sec(90)),
+            t0 + sec(90)
+        );
     }
 
     #[test]

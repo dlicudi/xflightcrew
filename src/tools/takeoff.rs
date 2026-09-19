@@ -24,6 +24,8 @@ pub struct AutoTakeoff {
     pub cfg: ApConfig,
     pub vr_kts: f64,
     pub vy_kts: f64,
+    /// Initial climb speed (see `autotakeoff::Params::initial_climb_kts`).
+    pub initial_climb_kts: f64,
     pub climb_fpm: f64,
     pub retract_gear: bool,
     /// Flap-handle ratio set for takeoff and retracted climbing out (from the
@@ -196,6 +198,7 @@ impl Tool for AutoTakeoff {
                 cfg: self.cfg.clone(),
                 vr_kts: self.vr_kts,
                 vy_kts: self.vy_kts,
+                initial_climb_kts: self.initial_climb_kts,
                 climb_fpm: self.climb_fpm,
                 retract_gear: self.retract_gear,
                 takeoff_flap_ratio: self.takeoff_flap_ratio,

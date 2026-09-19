@@ -287,3 +287,56 @@ impl Tool for StopEngines {
         Ok("Fuel levers cut, both engines shutting down.".to_string())
     }
 }
+
+/// The stock `auto_start` command on an aircraft whose xlua REPLACES it with
+/// its own full sequence (`AircraftProfile::scripted_auto_start`). The 737-800's
+/// runs cold and dark to both engines at idle in about two minutes: battery,
+/// standby power, fire tests, APU and its generator, packs, starter 2 then 1 on
+/// N2, generators, probe heat, engine bleeds, APU off, continuous ignition
+/// (probed on the parked aircraft, 2026-09-17). The crew fires it once and
+/// watches the engines; the aircraft's own script owns every switch until
+/// then, so nothing here writes one.
+pub struct ScriptedAutoStart;
+
+const CMD_AUTO_START: &str = "sim/operation/auto_start";
+const AUTO_START_IN_PROGRESS: &str = "sim/flightmodel2/misc/auto_start_in_progress";
+
+#[async_trait]
+impl Tool for ScriptedAutoStart {
+    fn name(&self) -> &str {
+        "start_engines"
+    }
+    fn description(&self) -> &str {
+        "Start the engines using this aircraft's own scripted start sequence. Use \
+         for 'start engines', 'start the engines', 'engines on', 'start up the \
+         engines', 'fire up the engines'."
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let running = ctx
+            .xplane
+            .get_float_array(ENGN_RUNNING)
+            .await
+            .map(|v| v.iter().take(2).all(|r| *r > 0.5))
+            .unwrap_or(false);
+        if running {
+            return Ok("Engines are already running.".to_string());
+        }
+        if ctx
+            .xplane
+            .get_float(AUTO_START_IN_PROGRESS)
+            .await
+            .unwrap_or(0.0)
+            > 0.5
+        {
+            return Ok("The start sequence is already running.".to_string());
+        }
+        ctx.xplane.run_command(CMD_AUTO_START).await?;
+        Ok(
+            "Running the aircraft's own start sequence. About two minutes to both engines."
+                .to_string(),
+        )
+    }
+}

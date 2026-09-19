@@ -3992,3 +3992,331 @@ module doc inventories the per-FLIGHT facts still reset on their own paths
 (`LAST_ARRIVED`, `LANDED_RUNWAY`, `INBOUND_MADE`, the follower's `TOD`,
 `TERRAIN_FLOOR`, `PILOT_ALT`, `LEG`, and the rest); a `flight_begins` door
 for those is the next step, not this one.
+
+## 2026-09-17: the 737's first sortie (LFLL 35L): two go-arounds, three laws sized for a 172
+
+The stock 737-800 flew "fly the flight plan" from the stand at Lyon: clearance,
+squawk, pushback (77 of 89 m, judged short, the taxi joined 54 m out anyway),
+auto taxi to 35L, takeoff on clearance, a left circuit, and two balked
+landings. `xvl debrief` and the ticks named three laws whose numbers were the
+172's:
+
+- **The approach speed floor was the CLEAN one.** `run_autoland` floored the
+  145 kt Vref against `speed_floor_kts` (1.2 x clean Vs 139 = 167). The 737
+  flew the whole final at 165-169 kt, the flap schedule could never pass the
+  flaps-40 gate (Vfe 162) and landed on flaps 30, and the first approach
+  overflew the numbers 51 ft high. New `aircraft::approach_floor_kts`: 1.2 x
+  Vso when the profile declares one (137 here), the clean floor otherwise,
+  published per swap beside the clean floor; the autoland uses it, the
+  circuit and the plan keep the clean one.
+- **The glidepath correction had a fixed TIME constant.** 1.2 fpm per foot of
+  error is 50 s: 0.9 nm on a 172, 2.4 nm on a 737 whose last mile is 22 s.
+  Armed 118 ft below the path at 1.6 nm, the autoland levelled, started down
+  late through the VS mode's lag, and crossed the threshold 51 ft high with
+  86 fpm of correction in hand. `glidepath_gain_fpm_per_ft` scales the gain
+  by groundspeed over 65 kt (3.1 at 170), floored at the old law, capped 3x.
+- **The missed approach released the reposition ABEAM the join point.** The
+  latch handed back on distance alone; a 737's turn-back left it 2.7 nm
+  beside the centreline at 6.7 nm, `interceptable` accepted a 19 degree cut,
+  and the pursuit's 30 s time constant had 110 s of final for 3.5 km of
+  offset: balked at 95 ft still 84 m off. `GoAroundLatch::update` takes the
+  cross-track and releases only inside `REPOSITION_RELEASE_XTK_NM` (0.5 nm).
+
+Seen and not yet fixed: the takeoff's pitch channel has 0.10 of nose-down
+authority (`PITCH_MIN`) and the 737 ran from the 8 degree target to 17.8
+degrees after liftoff with the channel pinned, accelerating the whole time;
+the AP took over at 300 ft with a 150 fpm climb command (`climb_vs_fpm`'s
+60 fpm per knot under Vy is a GA slope: 30 kt under 210 costs 1,800 fpm);
+the base turn bottomed at 154 kt clean-ish (flaps 5) at 800 ft, the
+airspeed caution firing, before the 167 floor caught it; the fuel caution
+re-said itself seven times in five minutes as the burn-based estimate swung
+25 to 60 minutes; and the 737's checklist file has no climb or before
+landing section, so the tracker proposes nothing there. A withheld tool on a
+helicopter now says "not on a helicopter" instead of "isn't wired up yet"
+(`router::unregistered_tool_line`).
+
+**Are the datarefs right?** (same day, the aircraft parked): every name exists
+(`real_install_names`, the profile probe: 30 of 30) and the sortie wrote them
+all without a failed write; the semantics were checked against the 737's
+xlua, which assigns crew-used stock datarefs only in its command handlers and
+presets, except one. `B738_baro_memory` copies `laminar/B738/barometer/
+capt_setting` into the stock altimeter dial in before_physics EVERY frame and
+that dataref is not writable over the API: a dial write is a silent no-op,
+and the tool's immediate readback said "Roger, altimeter 30.11" to an ask of
+30.00 (the exact failure the readback rule forbids). The setter is now
+`instruments::set_altimeter`: write, re-read a frame later, and when the
+write did not stand, step the knob with `barometer_up/down` (the 737 replaces
+those, a hundredth a press; eleven presses proven live) and read again; the
+spoken tool, full auto's departure set and the monitor's fix all go through
+it, and the tool says "didn't take" when the dial disagrees. The stock
+landing-light command proved to set all four `landing_lights_switch[]`
+entries the lamps read; the taxi lamp is unproven (the cockpit switch drives
+`generic_lights_switch[4]`, the stock switch is what the readback reads).
+
+## 2026-09-17 (later): the 737's second sortie landed; the approach and landing model gets its jet laws
+
+With the morning's three fixes the 737 flew stand-to-stand: pushback,
+taxi, takeoff 35R, circuit, autoland, vacate at V4, taxi to stand, secured.
+The landing was poor and the ticks say why, each a 172 law at 737 speeds:
+
+- **The circuit handed over fast, low and at flaps 5.** Base and final were
+  flown at Vref+20 (165) with the takeoff flap, 170 ft under the path at the
+  handoff. The autoland then idled the engines for the whole last mile to
+  lose 24 kt, put flaps 30 and 40 out at 300 ft, went through Vref at 170 ft
+  still at idle, and spooled from 0.1 to 0.39 as the speed fell to 141.
+  Now: the circuit extends the landing flaps on base (half travel) and
+  final (full) by the placard gates as the speed allows, the same
+  `flap_within_limits` law autoland runs, and final slows to the approach
+  speed floored by the flaps ACTUALLY out (`aircraft::config_floor_kts`,
+  interpolating the clean and landing floors by flap ratio: flaps 5 floors
+  at 156, flaps 40 at 137). Autoland floors its own target the same way.
+- **The lever idled on a stabilised final and cut to zero at 22 ft.** A
+  swept wing at idle sinks at once: the arrest ballooned to +39 fpm at 20 ft
+  while the speed bled 142 to 131, then dropped in at -449 fpm. New profile
+  field `approach_thrust_min` (0.3 on the 737, VERIFY) is the least the
+  speed law pulls the lever to on final when not more than 10 kt fast
+  (`autoland::approach_power_floor`), and the 737 gets a `flare_power`
+  profile so the flare retards progressively (hold while sinking over 400).
+- **The give-up after three go-arounds released the aircraft at 95 ft**
+  with landing flaps and 75% thrust, "holding altitude": it accelerated at
+  300 ft AGL to 236 kt through the flap limit, and "land the aircraft" from
+  there re-armed onto 17R at 140 ft and 237 kt; the reposition's speed law
+  pulled the throttle to idle for its 179 kt target and the aircraft
+  settled into the fields ten miles out with +800 fpm on the dial, nine
+  ground contacts at 130-180 kt. Now the give-up waits for the latch's
+  Climb stage to reach 800 ft AGL (full power, go-around flap), hands back
+  there with the flaps retracted and says the height; and in a reposition
+  below the terrain floor the lever floor is FULL power: excess speed is
+  spent on the climb, never on the lever.
+
+Still open on the 737: the arrest law's +300 fpm dial cap with this AP's
+lag (the balloon at 20 ft); the takeoff pitch channel's 0.10 nose-down
+authority; the climb command of 150 fpm at the AP engage; whether the
+737's MCP accepted the stock VS-mode command at the 09:05 re-arm (the dial
+said +800 and the aircraft descended: needs a live probe from ALT HOLD);
+the self-pick of 17R (nearest threshold, the reciprocal of the runways in
+use); the checklist file's missing climb / before landing sections.
+
+**The 737's engine start and checklist** (same day). The pilot asked for
+XChecklist files. Two exist: ch4dwick's short Laminar-737 list (all 27
+names exist on the stock aircraft; its start items name
+`laminar/B738/spring_knob/starter_1/2` and the stock fuel pump, APU, bleed
+and generator datarefs) and vin_kaizen's 1,762-line Zibo list, whose
+`sw_item_c` items lean on Zibo-only names (181 of 391 exist here). The real
+find was in the aircraft's own xlua: `B738.Z.autostart` REPLACES
+`sim/operation/auto_start` with a scripted auto-board (battery, standby
+power, cond levers, fire tests, APU, packs) chained into an auto-start
+(fuel pumps, APU gens, packs off, starter 2 then 1 on N2, condition levers
+to idle, generators, probe heat, engine bleeds, APU off, continuous
+ignition). Fired once on the parked cold aircraft: both engines running and
+the APU shut down at 124 s. So the profile now declares
+`scripted_auto_start: true`, `StartKind::Scripted` fires the command and
+waits on the engines (300 s deadline), and "start the engines" is the
+`jet_start::ScriptedAutoStart` tool on such airframes; the MD-82 sequence
+stays off it. `checklists/boeing_737_800.txt` is a normal checklist written
+from the POM, the xlua's own step list and ch4dwick's items, every dataref
+verified to exist over the API, section titles equal to the phase keys so
+the tracker's climb / descent / before landing / after landing lists and
+the syllabus's ramp lists all resolve (test-pinned in `flow.rs`).
+
+## 2026-09-17 (third pass): LFLL to EGLL, and the six things the blackbox named
+
+The 737's first real sortie, stand to stand across France, plus the
+morning's three circuits at Lyon read back out of `logs/blackbox.jsonl`.
+Six defects, none of them in a control law:
+
+- **The region tick stole the station from the destination tower,
+  mid-approach.** At 12:52 the inbound call reached Heathrow (118.505) and
+  was answered "join final runway two seven right, report final". At
+  13:06:42, fifteen miles out, the enroute region's service-weighted
+  nearest-field pick found London City eight miles off the nose and took
+  the station. Everything after that went nowhere: the final report at
+  13:08:24 `void`, so the 737 landed on 27L with no landing clearance; the
+  taxi-in request at 13:28:31 `void` on London City's 118.075, sixty
+  seconds of silence, then a false "No taxi-in clearance came back, your
+  aircraft". The region only announced "We're at London Heathrow" at
+  13:28:32, twenty-three seconds AFTER touchdown. A committed arrival now
+  PINS the station to its field (`station::pin_arrival_station`, set at the
+  inbound call and at the arrival's own retune): while it is set the region
+  may hand the station TO that field and never away from it. The pin is
+  released at the stand, on every `stand_down`, at the next mission's arm,
+  and by `Station::uninstall` — and on the GROUND a relocation to the field
+  under the wheels outranks it and drops it, so a forgotten pin can never
+  strand the station at a field we have left.
+- **The vacate turned a 737 around on Heathrow's active runway.** The first
+  attempt was `vacate_no_plan` (the loaded taxi network was London City's —
+  the same root cause). The second, planned once the station was right,
+  took the nearest junction ahead, 84 m away: its only link is N4W, a rapid
+  exit built for 09R traffic that runs back east-north-east, 169 degrees
+  off our rollout. 624 m of route, a U-turn on the strip, back east past
+  our own touchdown point, `vacate_timeout` with `arrived: false`, and four
+  `runway_incursion` events as traffic closed from 2.6 to 0.5 nm. A
+  junction being AHEAD was never enough: it must also offer a taxiway you
+  can turn onto (`VACATE_TURN_MAX_DEG`, the same 100 degrees `ahead` uses),
+  and the first step of the walk is now that turn-off rather than whatever
+  lies furthest from the aircraft. Heathrow's own data picks N5W, 220 m
+  further on and 54 degrees off. A field whose every turn-off is backwards
+  yields no plan and the taxi-in starts from the runway, which is the
+  degradation the dead end already made and better than the U-turn.
+- **The takeoff flaps never came up.** LFLL to FL360 to Heathrow's top of
+  descent — eighty-five minutes at flaps 5, the whole climb sitting on
+  their 250 kt placard. The retraction is a one-shot inside the takeoff
+  loop gated on `ias > vy`, and the 737 hands off at 1,000 ft doing 181 kt
+  against a Vy of 210, so it never fired and nothing downstream owns it.
+  The handoff now cleans up (`clean_up_at_handoff`) or says it cannot: a
+  takeoff that ends with the aircraft still configured for takeoff has not
+  finished. Below the airframe's clean-configuration floor the flaps STAY
+  and the copilot says why — the retraction must never be the stall the
+  schedule exists to avoid.
+- **The initial climb was commanded at 150 fpm.** `ap_engaged` at 306 ft
+  logged `cmd_vs: 150`, held to the handoff; the jet levelled at 1,030 ft
+  at takeoff thrust and accelerated to 220 before the follower picked it
+  up. The climb law protects the speed it is handed and it was handed the
+  ENROUTE climb speed, so 174 kt (V2+20, exactly what the aircraft has at
+  400 ft) read as thirty-six knots slow and 2,150 fpm came off the rate.
+  `ReferenceProfile::initial_climb_kts` splits the two numbers; it defaults
+  to `vy_kts`, so every trainer is unchanged, and the circuit keeps `vy`
+  for its pattern. 737: 170. A330: 173.
+- **The 737 had no way to be shut down.** At the stand the pilot asked
+  seven ways in forty-five seconds ("let's shut down", "engines off",
+  "turn engines off", "shut down aircraft", "turn off engines") and gave up
+  with "my aircraft". The `scripted_auto_start` branch of the registry
+  added the START tool and not the stop, so every phrasing parsed to a tool
+  that had never been built. It registers `StopEngines` now — an aircraft
+  may script its own start, but the stop is always the crew's. Two of those
+  phrasings did not parse either: "turn off engines" (the other word order)
+  and "cut the engines", which is in the tool's own description of itself.
+- **"Short" was the wrong word for both failed pushes.** One asked for
+  88.7 m, got 77.4 with the nose 1.1 degrees off the lane — a push anyone
+  at the window watched finish — and failed by 1.3 m against a flat
+  ten-metre threshold sized for a GA stand. The other went twelve metres
+  PAST its plan and left the nose 71 degrees off, and was blackboxed
+  "short" too. `push_delivered` now also accepts a completed swing that
+  covered `DELIVERED_FRACTION` of the distance (the residual is the taxi
+  drive's, which is what its own doc always said), and `push_residual`
+  names what is actually left: "short" or "unturned".
+
+And one found while reading the wake gate rather than the log. The gate is
+capped at one full separation interval AT THE HOLD so that a field whose
+departure stream refreshes the clock faster than it expires still lets you
+go (2026-07-27) — but the cap is measured from `hold.armed_at`, and every
+new takeoff request re-stamped it. Ask a second time at Heathrow and you
+hand your own clock back to zero, hear "wake turbulence, departing traffic
+ahead of you" again, and never take off. A hold already standing on the
+same runway now keeps the moment it was armed (`hold_armed_at`): the clock
+belongs to the departure ahead of us in sequence, not to our last
+transmission.
+
+## 2026-09-17 (fourth pass): EGLL to EGPH ended in a field near Perth, killed by a 30-minute timer
+
+The 737 flew the SimBrief plan to Edinburgh, followed it fix by fix down to
+RIBEL, and the arrival armed the field's published ILS 24. Thirty-one
+minutes later it hit the ground eight miles north of the airfield with the
+copilot on its twelfth airspeed warning. The blackbox says the whole story
+in two lines one second apart:
+
+```
+17:19:08  full_auto {"stage":"arrival_owns"}
+17:19:08  procedure {"event":"stand_down","reason":"abort"}
+```
+
+and then nothing at all for eleven minutes, to the `crash` record at
+17:30:04.
+
+**What happened.** The approach armed at 16:49:07 and the follower steered
+at CI24, the ILS 24 initial fix, 121 nm away: SimBrief's route ended at
+RIBEL, in the Lake District, and the fix it had to fly to next was on the
+far side of Edinburgh. It flew it properly. Every `leg` record from 16:50
+to 17:19 shows the distance coming down at 4 nm a minute on a steady 338
+bug, and the vertical law paced its own descent from 26,000 to the leg's
+3,000 ft constraint over the same half hour. At 4.19 nm to run, two
+minutes from the fix, `full_auto`'s wait on "the arrival to hand to
+autoland" hit its flat `Duration::from_secs(1800)` - counted from the arm -
+and the mission returned. Its lease dropped, the scope cancelled the
+follower underneath it, and `stand_down` released the speed governor with
+the throttles where a descent had left them.
+
+Nobody flew the aircraft after that. The autopilot held the last dialled
+altitude while the speed decayed 200, 179, 161, 142, 131 kt; the airspeed
+warning fired every 30 seconds from 17:23:52; the 737 mushed down through
+2,000 ft of Perthshire and stopped in a field at 719 ft. The pilot got one
+Caution line ("Cancelled. Your aircraft.") from the dying follower and no
+word at all from the mission, which blackboxed `arrival_owns` - the event
+that means the arrival loops have it - as it walked away.
+
+**Three things, and the first is the bug.**
+
+- **A clock cannot tell a long arrival from a stuck one.** The 1,800 s was
+  sized for an approach armed at the top of descent, not one armed 121 nm
+  from its first fix, and it expired on an arrival that was doing exactly
+  what it had been told. The wait is now a watchdog on CLOSURE
+  (`ArrivalWatch`): the fix the follower is steering at and the miles to
+  it, fed once a second, stalling only after `ARRIVAL_STALL_SECS` with no
+  new low. A sequenced leg jumps the distance up and is judged afresh; a
+  follower on a to-altitude leg holds the clock rather than starting one.
+  The absolute cap survives at three hours, which is a bound on a wedged
+  thread, not an opinion about an approach.
+- **The distance comes from the follower, not from the sim.**
+  `procedure::fix_distance_nm()` republishes the number the tick already
+  worked out, beside `active_leg` and `planned_tod`. An orchestrator that
+  flies its own reads to judge a loop it can already hear from is Web API
+  load for nothing, and it would be measuring a different distance from
+  the one being closed.
+- **A give-up hands back a FLYABLE aircraft, and says so.** This one
+  handed back an airliner at 4,900 ft with descent power and a live
+  altitude hold, silently. The expiry path now stands the follower down
+  first (its stand-down is what releases the governor, so the throttle
+  write has to follow it), sets `GIVE_UP_THROTTLE` and zeroes the VS dial
+  through the mission's own still-live client, and speaks the Caution:
+  "The arrival isn't getting us there. Your aircraft. The autopilot is
+  holding heading and altitude, climb power set." Autoland's balk path has
+  had this rule since EGHI, 2026-08-02; the orchestrator did not.
+
+A note on the scope, because it is the reason nothing could be done from
+the follower's side: a cancelled `XPlaneClient` REFUSES writes by design -
+a dying worker must not actuate. So the hand-back has to happen in
+whatever is still alive, which is the mission, before it returns. That is
+also why the fix belongs in `full_auto` and not in `procedure::stand_down`.
+
+And one more, found by asking why the arrival was covering the last hundred
+miles at all: `parse_waypoints` capped the navlog at the first FOURTEEN
+fixes. See below - it is the reason the aircraft was ever in that position.
+
+## 2026-09-17 (fifth pass): the fourteen-fix cap amputated the arrival
+
+The EGPH plan ended at RIBEL because the parser stopped there. SimBrief's
+navlog for that OFP is twenty-one entries:
+
+```
+D257C D280G BUR D355D UMLAT WOBUN WELIN AKUPA TIMPO ELVOS TOC
+TNT POL NELSA RIBEL TOD INPIP INREV ESKDO TARTN EGPH
+```
+
+Nineteen real fixes once TOC and TOD are dropped, and `parse_waypoints`
+took the first fourteen and broke out of the loop. Fourteen lands exactly on
+RIBEL. Everything after it - INPIP, INREV, ESKDO, TARTN, the whole TARTN
+arrival into Edinburgh - and the destination airport itself were never in
+the plan the crew flew. That is why the briefing said "the 14 enroute
+fixes", why the follower's last leg ended 110 nm short of the field, why
+the arrival armed the ILS 24 from 121 nm out, and ultimately why a
+thirty-minute timer had anything to expire on.
+
+The cap was there for a real constraint: `xcopilot/fms/route` is a
+`TextRef`, 512 bytes, and `StoreText` truncates a longer write at 511 -
+mid-entry, silently. But that is the PAYLOAD's constraint, not the plan's,
+and a cap applied to the front of a list is an amputation of its tail. The
+plan the crew flies is now the whole navlog; `simbrief::fms_route_payload`
+owns the mailbox and thins the GPS route to fit by dropping fixes from the
+MIDDLE, so the origin and the destination - the two the CDU's ORIGIN/DEST
+and the whole-plan load actually need - always survive. Both payload sites
+(the spoken "load the flight plan" and full auto's own write) go through it.
+
+Thinning the GPS costs the crew nothing: the follower flies the PLAN's
+fixes, and `xcopilot/fms/goto` moves the pointer for the idents the loaded
+plan does hold - an ident it lacks changes nothing on the plugin side.
+
+The same OFP through the new code: twenty waypoints, EGLL to EGPH, with the
+follower's last enroute leg ending at TARTN - 20.6 nm from CI24 at the
+plan's own 6,400 ft, which is where an ILS is armed rather than a hundred
+miles out at cruise. The GPS route loses exactly two mid-route fixes
+(TIMPO, ELVOS) and fits in 486 bytes.

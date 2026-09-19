@@ -1,0 +1,154 @@
+# XChecklist-style normal checklist for the X-Plane 12 stock Boeing 737-800.
+# Written 2026-09-17 for XVoiceLayer from the aircraft's own Pilot Operating
+# Manual, its xlua auto-start sequence (B738.Z.autostart: the steps Laminar's
+# own script performs) and the community Laminar-737 list by ch4dwick
+# (github.com/ch4dwick/xplane-12-checklists). Every dataref below was checked
+# to EXIST on the stock aircraft over the Web API that day. Section titles are
+# the crew's phase keys, so the tracker proposes each list at its phase.
+# Conditions are single dataref tests; items with no test are call-outs.
+
+sw_checklist:PREFLIGHT:PREFLIGHT
+sw_remark:PREFLIGHT
+sw_item:PARKING BRAKE|SET:sim/cockpit2/controls/parking_brake_ratio:>0.5
+sw_item:BATTERY|ON:sim/cockpit/electrical/battery_on:1
+sw_item:GROUND POWER (IF AVAILABLE)|ON:sim/cockpit/electrical/gpu_on:1
+sw_item:APU|START:sim/cockpit2/electrical/APU_running:1
+sw_item:APU GENERATOR|ON:sim/cockpit2/electrical/APU_generator_on:1
+sw_item:BUS TRANSFER|AUTO:sim/cockpit2/electrical/cross_tie:1
+sw_item:FUEL PUMPS LEFT|ON:sim/cockpit2/fuel/fuel_tank_pump_on[0]:1
+sw_item:FUEL PUMPS CENTER|ON:sim/cockpit2/fuel/fuel_tank_pump_on[1]:1
+sw_item:FUEL PUMPS RIGHT|ON:sim/cockpit2/fuel/fuel_tank_pump_on[2]:1
+sw_item:APU BLEED|ON:sim/cockpit2/bleedair/actuators/apu_bleed:1
+sw_item:PACKS|AUTO:sim/cockpit2/bleedair/actuators/pack_left:1
+sw_item:ELECTRIC HYDRAULIC PUMPS|ON:sim/cockpit2/switches/electric_hydraulic_pump_on:1
+sw_item:SEAT BELT SIGNS|ON:sim/cockpit2/switches/fasten_seat_belts:1
+sw_item:NAVIGATION LIGHTS|ON:sim/cockpit2/switches/navigation_lights_on:1
+sw_item:LOGO LIGHTS|AS REQUIRED
+sw_item:FLIGHT PLAN|ENTERED IN THE FMC
+sw_item:ALTIMETERS|SET:sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot:>27
+sw_remark:PREFLIGHT COMPLETE
+
+sw_checklist:BEFORE START:BEFORE START
+sw_remark:BEFORE START
+sw_item:PARKING BRAKE|SET:sim/cockpit2/controls/parking_brake_ratio:>0.5
+sw_item:THRUST LEVERS|IDLE:sim/cockpit2/engine/actuators/throttle_ratio_all:<0.05
+sw_item:START LEVERS|CUTOFF:sim/cockpit2/engine/actuators/mixture_ratio[0]:<0.1
+sw_item:FLAPS|UP:sim/cockpit2/controls/flap_ratio:<0.05
+sw_item:SPEED BRAKE|DOWN DETENT:sim/cockpit2/controls/speedbrake_ratio:<0.05
+sw_item:STABILIZER TRIM|SET FOR TAKEOFF
+sw_item:TRANSPONDER|STANDBY:sim/cockpit2/radios/actuators/transponder_mode:1
+sw_item:BEACON|ON:sim/cockpit2/switches/beacon_on:1
+sw_item:FUEL QUANTITY|CHECKED:sim/flightmodel/weight/m_fuel_total:>1000
+sw_item:DOORS|CLOSED
+sw_remark:BEFORE START COMPLETE
+
+sw_checklist:ENGINE START:ENGINE START
+sw_remark:ENGINE START, THE AIRCRAFT'S OWN SEQUENCE: SAY START THE ENGINES
+sw_item:PACKS|OFF FOR START:sim/cockpit2/bleedair/actuators/pack_left:0
+sw_item:ENGINE 2 START SWITCH|GRD:laminar/B738/spring_knob/starter_2:<-0.5
+sw_item:ENGINE 2 N2 RISING|25 PERCENT:sim/cockpit2/engine/indicators/N2_percent[1]:>25
+sw_item:ENGINE 2 START LEVER|IDLE:sim/cockpit2/engine/actuators/mixture_ratio[1]:>0.4
+sw_item:ENGINE 2 STABILISED|CHECKED:sim/cockpit2/engine/indicators/N2_percent[1]:>55
+sw_item:ENGINE 1 START SWITCH|GRD:laminar/B738/spring_knob/starter_1:<-0.5
+sw_item:ENGINE 1 N2 RISING|25 PERCENT:sim/cockpit2/engine/indicators/N2_percent[0]:>25
+sw_item:ENGINE 1 START LEVER|IDLE:sim/cockpit2/engine/actuators/mixture_ratio[0]:>0.4
+sw_item:ENGINE 1 STABILISED|CHECKED:sim/cockpit2/engine/indicators/N2_percent[0]:>55
+sw_item:GENERATOR 1|ON:sim/cockpit2/electrical/generator_on[0]:1
+sw_item:GENERATOR 2|ON:sim/cockpit2/electrical/generator_on[1]:1
+sw_item:PROBE HEAT|ON:sim/cockpit2/ice/ice_pitot_heat_on_pilot:1
+sw_item:ENGINE BLEEDS|ON:sim/cockpit2/bleedair/actuators/engine_bleed_sov[0]:1
+sw_item:PACKS|AUTO:sim/cockpit2/bleedair/actuators/pack_left:1
+sw_item:APU BLEED|OFF:sim/cockpit2/bleedair/actuators/apu_bleed:0
+sw_item:APU|OFF:sim/cockpit2/electrical/APU_running:0
+sw_remark:ENGINE START COMPLETE
+
+sw_checklist:BEFORE TAXI:BEFORE TAXI
+sw_remark:BEFORE TAXI
+sw_item:GENERATORS|ON:sim/cockpit2/electrical/generator_on[0]:1
+sw_item:PROBE HEAT|ON:sim/cockpit2/ice/ice_pitot_heat_on_pilot:1
+sw_item:ANTI-ICE|AS REQUIRED
+sw_item:YAW DAMPER|ON:sim/cockpit2/switches/yaw_damper_on:1
+sw_item:FLAPS|5 FOR TAKEOFF:sim/cockpit2/controls/flap_ratio:0.3|0.45
+sw_item:STABILIZER TRIM|SET FOR TAKEOFF:sim/cockpit2/controls/elevator_trim:-0.15|0.15
+sw_item:FLIGHT CONTROLS|CHECKED
+sw_item:TRANSPONDER|ALT:sim/cockpit2/radios/actuators/transponder_mode:>1
+sw_item:TAXI LIGHT|ON:sim/cockpit2/switches/taxi_light_on:1
+sw_remark:BEFORE TAXI COMPLETE
+
+sw_checklist:BEFORE TAKEOFF:BEFORE TAKEOFF
+sw_remark:BEFORE TAKEOFF
+sw_item:FLAPS|5:sim/cockpit2/controls/flap_ratio:0.3|0.45
+sw_item:STABILIZER TRIM|IN THE GREEN BAND:sim/cockpit2/controls/elevator_trim:-0.15|0.15
+sw_item:SPEED BRAKE|DOWN DETENT:sim/cockpit2/controls/speedbrake_ratio:<0.05
+sw_item:PARKING BRAKE|RELEASED:sim/cockpit2/controls/parking_brake_ratio:<0.1
+sw_item:TRANSPONDER|ALT:sim/cockpit2/radios/actuators/transponder_mode:>1
+sw_item:STROBE LIGHTS|ON:sim/cockpit2/switches/strobe_lights_on:1
+sw_item:LANDING LIGHTS|ON:sim/cockpit2/switches/landing_lights_on:1
+sw_item:ENGINE START SWITCHES|CONT
+sw_item:CABIN|SECURE
+sw_remark:BEFORE TAKEOFF COMPLETE. V1 140, VR 145, V2 150 AT MID WEIGHT, FLAPS 5
+
+sw_checklist:CLIMB:CLIMB
+sw_remark:CLIMB
+sw_item:LANDING GEAR|UP:sim/cockpit2/controls/gear_handle_down:0
+sw_item:FLAPS|UP ON SCHEDULE:sim/cockpit2/controls/flap_ratio:<0.05
+sw_item:LANDING LIGHTS|OFF ABOVE 10,000:sim/cockpit2/switches/landing_lights_on:0
+sw_item:TAXI LIGHT|OFF:sim/cockpit2/switches/taxi_light_on:0
+sw_item:AUTOPILOT|ENGAGED AS REQUIRED
+sw_item:ALTIMETERS|STANDARD AT TRANSITION:sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot:29.91|29.93
+sw_item:PACKS|AUTO:sim/cockpit2/bleedair/actuators/pack_left:1
+sw_remark:CLIMB COMPLETE
+
+sw_checklist:CRUISE:CRUISE
+sw_remark:CRUISE
+sw_item:SEAT BELT SIGNS|AS REQUIRED
+sw_item:FUEL|BALANCED AND SUFFICIENT
+sw_item:ENGINE INSTRUMENTS|CHECKED
+sw_item:PRESSURISATION|CHECKED
+sw_remark:CRUISE COMPLETE
+
+sw_checklist:DESCENT:DESCENT
+sw_remark:DESCENT
+sw_item:SEAT BELT SIGNS|ON:sim/cockpit2/switches/fasten_seat_belts:1
+sw_item:PRESSURISATION|LANDING ALTITUDE SET
+sw_item:APPROACH BRIEFING|COMPLETE
+sw_item:AUTOBRAKE|AS REQUIRED
+sw_item:ALTIMETERS|QNH BELOW TRANSITION
+sw_item:LANDING LIGHTS|ON BELOW 10,000:sim/cockpit2/switches/landing_lights_on:1
+sw_remark:DESCENT COMPLETE
+
+sw_checklist:BEFORE LANDING:BEFORE LANDING
+sw_remark:BEFORE LANDING
+sw_item:ENGINE START SWITCHES|CONT
+sw_item:SPEED BRAKE|ARMED
+sw_item:LANDING GEAR|DOWN:sim/cockpit2/controls/gear_handle_down:1
+sw_item:FLAPS|30 OR 40:sim/cockpit2/controls/flap_ratio:>0.8
+sw_item:LANDING LIGHTS|ON:sim/cockpit2/switches/landing_lights_on:1
+sw_item:TAXI LIGHT|ON:sim/cockpit2/switches/taxi_light_on:1
+sw_item:AUTOPILOT|OFF BEFORE TOUCHDOWN
+sw_remark:BEFORE LANDING COMPLETE. VREF 145 MID WEIGHT, FLAPS 40
+
+sw_checklist:AFTER LANDING:AFTER LANDING
+sw_remark:AFTER LANDING
+sw_item:SPEED BRAKE|DOWN:sim/cockpit2/controls/speedbrake_ratio:<0.05
+sw_item:FLAPS|UP:sim/cockpit2/controls/flap_ratio:<0.05
+sw_item:LANDING LIGHTS|OFF:sim/cockpit2/switches/landing_lights_on:0
+sw_item:STROBE LIGHTS|OFF:sim/cockpit2/switches/strobe_lights_on:0
+sw_item:TAXI LIGHT|ON:sim/cockpit2/switches/taxi_light_on:1
+sw_item:TRANSPONDER|STANDBY:sim/cockpit2/radios/actuators/transponder_mode:1
+sw_item:APU|START IF REQUIRED
+sw_remark:AFTER LANDING COMPLETE
+
+sw_checklist:SHUTDOWN:SHUTDOWN
+sw_remark:SHUTDOWN
+sw_item:PARKING BRAKE|SET:sim/cockpit2/controls/parking_brake_ratio:>0.5
+sw_item:START LEVERS|CUTOFF:sim/cockpit2/engine/actuators/mixture_ratio[0]:<0.1
+sw_item:SEAT BELT SIGNS|OFF:sim/cockpit2/switches/fasten_seat_belts:0
+sw_item:BEACON|OFF:sim/cockpit2/switches/beacon_on:0
+sw_item:TAXI LIGHT|OFF:sim/cockpit2/switches/taxi_light_on:0
+sw_item:FUEL PUMPS|OFF:sim/cockpit2/fuel/fuel_tank_pump_on[0]:0
+sw_item:PROBE HEAT|OFF:sim/cockpit2/ice/ice_pitot_heat_on_pilot:0
+sw_item:APU|OFF OR AS REQUIRED
+sw_item:ELECTRIC HYDRAULIC PUMPS|OFF:sim/cockpit2/switches/electric_hydraulic_pump_on:0
+sw_item:BATTERY|OFF WHEN LEAVING:sim/cockpit/electrical/battery_on:0
+sw_remark:SHUTDOWN COMPLETE

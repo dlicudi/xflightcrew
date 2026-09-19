@@ -629,13 +629,9 @@ pub(crate) async fn load_route_to_fms(
     if fp.waypoints.is_empty() {
         return "No waypoints in the plan to load.".to_string();
     }
-    // "IDENT,lat,lon,alt|..." — the plugin parses this and builds the FMS route.
-    let payload = fp
-        .waypoints
-        .iter()
-        .map(|w| format!("{},{:.4},{:.4},{}", w.ident, w.lat, w.lon, w.alt as i64))
-        .collect::<Vec<_>>()
-        .join("|");
+    // "IDENT,lat,lon,alt|..." — the plugin parses this and builds the FMS route,
+    // thinned in the middle if the route is longer than its mailbox.
+    let payload = simbrief::fms_route_payload(&fp.waypoints);
     let (origin, dest, n) = (
         fp.origin.clone(),
         fp.destination.clone(),

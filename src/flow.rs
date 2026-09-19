@@ -1285,6 +1285,29 @@ mod tests {
         assert_eq!(find_section_in(&lists, "holding", &[]), None);
     }
 
+    /// The stock 737's list (2026-09-17) names its sections by the phase
+    /// keys outright: every phase the tracker can propose resolves, and so
+    /// do the syllabus's ramp lists, with no profile override.
+    #[test]
+    fn every_phase_section_is_found_in_the_737_file() {
+        let p = crate::aircraft::load("boeing_737_800").expect("737 profile");
+        let lists = crate::checklist::load(&p).expect("737 checklist parses");
+        let ramp = [
+            "preflight",
+            "before start",
+            "engine start",
+            "before taxi",
+            "before takeoff",
+            "shutdown",
+        ];
+        for key in SECTIONS.iter().chain(ramp.iter()) {
+            assert!(
+                find_section_in(&lists, key, &[]).is_some(),
+                "737 file lacks {key}"
+            );
+        }
+    }
+
     #[test]
     fn titled_lookup_is_exact_or_unique() {
         let lists = lists172();

@@ -11,10 +11,14 @@
 # 174,200 lb, empty 91,300 lb, nine flap positions 0/3/5/8/10/12/14/18/40 deg).
 # Lines marked VERIFY are placard figures from memory, hypotheses until probed.
 #
-# ENGINE START IS THE PILOT'S. The starters are the aircraft's own xlua
-# (`sim/starters/engage_starter_1/2` replaced), the MD-82's jet sequence is
-# written against laminar/md82/* and the CitX's against laminar/CitX/*, so no
-# start block is declared: full auto says so instead of cranking blind.
+# ENGINE START IS THE AIRCRAFT'S OWN SCRIPT. Its xlua replaces
+# `sim/operation/auto_start` with a full sequence (auto-board from cold and
+# dark: battery, standby power, fire tests, APU; then auto-start: fuel pumps,
+# APU gens, packs off, starter 2 then 1 on N2, condition levers, generators,
+# probe heat, bleeds, APU off, continuous ignition). Probed parked at LFLL
+# 2026-09-17: one press, 124 s to both engines running. `scripted_auto_start`
+# makes that the crew's start; the MD-82 APU/bleed sequence (`turbine_start`)
+# is written against laminar/md82/* and stays off.
 
 id: boeing_737_800
 display_name: Boeing 737-800
@@ -28,7 +32,24 @@ throttle: true         # thrust levers — jet, so NO piston engine group
 autothrottle: false
 speedbrake: true       # the xlua implements the stock speedbrake commands
 reverse_thrust: true   # rollout only, self-stowing (VERIFY on this airframe)
+# The stock dial is this xlua's OUTPUT: `B738_baro_memory` copies its own
+# laminar/B738/barometer/capt_setting into it every frame, and that dataref
+# is not writable over the API (403). A dial write is a silent no-op (probed
+# parked at LFLL, 2026-09-17); the crew's setter notices and steps the knob
+# with the replaced barometer_up/down commands, a hundredth a press (proven
+# live: eleven presses, 30.11 to 30.00 and back).
 barometer: true
+# The approach is flown ON thrust (about 55-60% N1 with flaps 40): the speed
+# law never pulls the lever under this on a stabilised final, and the flare
+# retards it progressively instead of cutting it (a swept wing at idle sinks
+# at once: the first landing here touched at -449 fpm and 128 kt after an
+# idle last mile and a throttle cut at 22 ft, 2026-09-17). Both VERIFY: the
+# 0.4 lever the speed law settled on at Vref that day is the only measurement.
+approach_thrust_min: 0.3
+flare_power:
+  reduction_per_second: 0.08
+  hold_sink_fpm: 400.0
+  lead_seconds: 1.0
 pitot_heat: true
 pitch_trim: true
 com_radio: true
@@ -44,6 +65,7 @@ engines: 2
 
 turbine_start: false
 auto_prep: false
+scripted_auto_start: true
 
 # Jet — none of the piston systems apply.
 engine: false
@@ -71,7 +93,14 @@ electrical:
     off_commands: [sim/systems/avionics_off]
     readback:     [sim/cockpit/electrical/avionics_on]
 
-# Exterior lights (standard X-Plane switch datarefs; no light command is replaced).
+# Exterior lights (standard X-Plane switch datarefs; no light command is
+# replaced). PROVEN 2026-09-17 on the parked aircraft: the stock landing
+# command sets all four landing_lights_switch[] entries the lamps read.
+# NOT proven: the taxi lamp. The stock command sets taxi_light_on (which the
+# readback reads) but the cockpit switch drives generic_lights_switch[4] via
+# laminar/B738/toggle_switch/taxi_light_brightness_pos_dn (0 / 0.5 / 1), and
+# no object references either name; the acf declares a stock taxi light
+# circuit. Look at the nose when the crew says "taxi light on".
 lights:
   - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on, command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
   - { key: beacon,  spoken: beacon,            dataref: sim/cockpit2/switches/beacon_on,            command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
@@ -123,6 +152,13 @@ reference:
   kind: twin-engine jet
   vr_kts: 145.0                # ~150,000 lb flaps 5 (V1 140 / V2 150). VERIFY
   vy_kts: 210.0                # climb-out + pattern speed the laws hold (250 below 10,000 is the cruise climb)
+  # The INITIAL climb, liftoff to the takeoff's handoff — V2 + 20 at this
+  # weight card, which is what the aircraft actually has at 400 ft. Distinct
+  # from `vy_kts` because the takeoff's climb law protects the speed it is
+  # given: fed the 210, it read 174 kt as thirty-six knots slow, stripped
+  # 2,150 fpm off the commanded rate and levelled a 737 at takeoff thrust at
+  # 1,030 ft before the follower picked it up (LFLL, 2026-09-17).
+  initial_climb_kts: 170.0     # V2 150 + 20. VERIFY
   best_climb_fpm: 3000.0       # initial climb, light; the climb law takes 80%
   cruise_ias_kts: 280.0        # KIAS the cruise governor holds (~M0.78 up high)
   approach_kts: 145.0          # POM 135-155, full flap / gear down; Vref40 ~140 mid weight
@@ -158,6 +194,26 @@ flaps:
     - { label: "25", spoken: twenty five, ratio: 0.75,  vfe_kts: 190.0 } # VERIFY
     - { label: "30", spoken: thirty,      ratio: 0.875, vfe_kts: 175.0 } # VERIFY
     - { label: "40", spoken: forty,       ratio: 1.0,   vfe_kts: 162.0 } # acf Vfe
+
+# The normal checklist (checklists/boeing_737_800.txt, written 2026-09-17 on
+# datarefs verified to exist on this aircraft). Section titles are the phase
+# keys, so the tracker's climb / descent / before landing / after landing
+# lists all resolve without an override.
+checklist: checklists/boeing_737_800.txt
+checklist_map:
+  - { match: parking_brake_ratio,       action: parking_brake }
+  - { match: transponder_mode,          action: transponder }
+  - { match: pitot_heat,                action: pitot_heat }
+  - { match: elevator_trim,             action: pitch_trim }
+  - { match: flap_ratio,                action: flaps }
+  - { match: throttle_ratio,            action: throttle }
+  - { match: taxi_light,                action: !light taxi }
+  - { match: landing_lights,            action: !light landing }
+  - { match: strobe_lights,             action: !light strobe }
+  - { match: beacon_on,                 action: !light beacon }
+  - { match: navigation_lights,         action: !light nav }
+  - { match: electrical/generator_on,   action: !electrical generators }
+  - { match: electrical/battery_on,     action: !electrical battery }
 
 # Phase-expectation advisor: the SOP table, the MD-82's on stock switches.
 advisor:

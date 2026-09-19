@@ -51,6 +51,13 @@ pub(crate) static VECTORS: Mutex<Option<VectorPlan>> = Mutex::new(None);
 /// `region_tick` after the handoff line is spoken.
 pub(crate) static PENDING_STATION: Mutex<Option<(String, nav::AirportInfo)>> = Mutex::new(None);
 
+/// The TOWER frequency of the field the crew has committed to arrive at.
+/// While it is set the enroute region may hand the station TO that field and
+/// never away from it: a controller we are already talking to, inbound, is
+/// not a controller a nearer strip may take from us. Set by the crew at the
+/// inbound call, cleared when the arrival is over.
+pub(crate) static ARRIVAL_PIN: Mutex<Option<i64>> = Mutex::new(None);
+
 /// Set when the monitor speaks the released takeoff clearance; the main
 /// loop consumes it and syncs the tower FSM to what was said on frequency.
 pub(crate) static PENDING_TAKEOFF_CLEARANCE: Mutex<bool> = Mutex::new(false);

@@ -8,6 +8,7 @@
 //! VAD-segmented) or `ptt` (push-to-talk).
 
 mod aircraft;
+mod answers;
 mod approach_guide;
 mod audio;
 mod auto_status;
@@ -22,6 +23,7 @@ mod config;
 mod control;
 mod conversation;
 mod debrief;
+mod detect;
 mod dialogue;
 mod failures;
 mod flight_state;
@@ -37,18 +39,15 @@ mod mic;
 mod mode;
 mod monitor;
 mod phrase;
+mod plan;
 mod plugin_status;
 mod pollers;
-mod answers;
-mod plan;
-mod undo;
-mod router;
-mod detect;
 mod prefs;
 mod procedure;
 mod pushback;
 mod radiofx;
 mod readback;
+mod router;
 mod settings;
 mod simbrief;
 mod stt;
@@ -61,6 +60,7 @@ mod tts;
 #[cfg(feature = "onnx-tts")]
 mod tts_onnx;
 mod ui;
+mod undo;
 mod vad;
 mod voice;
 mod weather;
@@ -75,28 +75,50 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
+use answers::{
+    aircraft_info, angle_delta_deg, answer_state_query, config_advice, conversation_read,
+    fuel_report, is_endurance_query, is_fuel_query, is_power_loss_query, is_taxi_query,
+    landing_readiness, lerp_angle_deg, location_answer, nav_progress, on_course_report,
+    power_loss_diagnosis, reference_limits, remote_weather_target, runway_advice, systems_check,
+    traffic_report, weather_words, RemoteWeather, AVGAS_KG_PER_GAL, HEAD_DREFS, MS_TO_KTS,
+    SNAPSHOT_DATAREFS,
+};
+#[cfg(test)]
+use answers::{battery_low, progress_line, speed_assessment_words, speed_verdict, SpeedContext};
 use audio::{Listener, PttMic};
 use config::Config;
+#[cfg(test)]
+use detect::icao_to_profile;
+use detect::{
+    generic_profile, generic_profile_id, known_profile, spawn_aircraft_detector, LiveProfile,
+};
 use livestate::LiveState;
+#[cfg(test)]
+use plan::ident_distance;
+use plan::{
+    ensure_plan, eta_to_destination, fix_answer, fix_query, flight_plan_report, load_route_to_fms,
+    plan_change_line, plan_fetch_for, plan_flight, time_to_tod, wrong_plan_complaint, PlanFetch,
+    PLAN_ASK_WINDOW,
+};
+use pollers::{
+    spawn_panel_request_poller, spawn_settings_poller, spawn_voice_picker, DR_OPT_SNAP, DR_OPT_TONE,
+};
+#[cfg(test)]
+use router::has_number;
+use router::{
+    callout_label, classify_confidence, command_subject, conversational, correction_text,
+    correction_value, is_affirmative, is_bare_value, looks_like_command, looks_like_followup,
+    looks_like_question, release_intent, ConfidenceAction,
+};
 use stt::Stt;
 use tools::{Registry, ToolCtx};
 use ui::Reporter;
+use undo::{
+    engages_autopilot, is_undo, join_and, recovery_label, undoable_drefs, UndoSnapshot,
+    UNDO_STACK_MAX,
+};
 use voice::{Priority, Voice};
 use xplane::XPlaneClient;
-#[cfg(test)]
-use detect::icao_to_profile;
-use detect::{spawn_aircraft_detector, known_profile, generic_profile_id, generic_profile, LiveProfile};
-use router::{ConfidenceAction, classify_confidence, is_affirmative, correction_text, conversational, release_intent, looks_like_question, looks_like_command, looks_like_followup, is_bare_value, correction_value, command_subject, callout_label};
-#[cfg(test)]
-use router::has_number;
-use undo::{UndoSnapshot, UNDO_STACK_MAX, engages_autopilot, undoable_drefs, recovery_label, is_undo, join_and};
-use plan::{fix_query, fix_answer, time_to_tod, eta_to_destination, PlanFetch, ensure_plan, PLAN_ASK_WINDOW, plan_flight, load_route_to_fms, flight_plan_report, plan_fetch_for, wrong_plan_complaint, plan_change_line};
-#[cfg(test)]
-use plan::ident_distance;
-use answers::{SNAPSHOT_DATAREFS, HEAD_DREFS, location_answer, lerp_angle_deg, angle_delta_deg, AVGAS_KG_PER_GAL, MS_TO_KTS, landing_readiness, config_advice, traffic_report, on_course_report, nav_progress, weather_words, RemoteWeather, remote_weather_target, runway_advice, systems_check, is_power_loss_query, power_loss_diagnosis, aircraft_info, reference_limits, is_fuel_query, is_taxi_query, is_endurance_query, fuel_report, answer_state_query, conversation_read};
-#[cfg(test)]
-use answers::{SpeedContext, battery_low, progress_line, speed_assessment_words, speed_verdict};
-use pollers::{spawn_panel_request_poller, spawn_settings_poller, spawn_voice_picker, DR_OPT_SNAP, DR_OPT_TONE};
 
 // Single-threaded runtime: the cpal stream isn't `Send`, and the loop is
 // inherently sequential (listen → think → act → speak), so there's nothing to
@@ -496,7 +518,12 @@ async fn main() -> Result<()> {
     // when it changes, so the copilot reconfigures itself (tools, limits, monitor)
     // instead of staying on whatever was loaded at startup. Auto-detect only.
     if config.aircraft.eq_ignore_ascii_case("auto") {
-        spawn_aircraft_detector(live_profile.clone(), config.xplane_base_url.clone(), voice.clone(), status_sink.clone());
+        spawn_aircraft_detector(
+            live_profile.clone(),
+            config.xplane_base_url.clone(),
+            voice.clone(),
+            status_sink.clone(),
+        );
     }
 
     // The cabin crew's state, shared between the command loop (interphone
@@ -2877,12 +2904,12 @@ async fn run_session(
             // confirmed on its own.
             let proceed = 'confirm: loop {
                 let Some(tool) = registry.get(&call.name) else {
-                    tracing::warn!("LLM picked unknown tool: {}", call.name);
+                    tracing::warn!("grammar picked a tool the registry lacks: {}", call.name);
                     say(
                         &voice,
                         &reporter,
                         ui::LogKind::Warn,
-                        "That command isn't wired up yet.",
+                        &router::unregistered_tool_line(&profile, &call.name),
                     );
                     break 'confirm false;
                 };

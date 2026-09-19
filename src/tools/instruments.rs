@@ -8,6 +8,17 @@ use serde_json::{json, Value};
 use super::{Tool, ToolCtx};
 
 const BARO: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot";
+/// The stock altimeter-knob commands, one hundredth of an inch per press. A
+/// study-level xlua that owns the knob replaces THESE (the 737's handlers move
+/// its own memory dataref), which is what makes them the path that works
+/// when the dial write does not.
+const CMD_BARO_UP: &str = "sim/instruments/barometer_up";
+const CMD_BARO_DOWN: &str = "sim/instruments/barometer_down";
+const BARO_STEP_INHG: f64 = 0.01;
+/// The whole 28.0..31.5 range is 350 presses; anything more is a bad read.
+const BARO_MAX_STEPS: usize = 350;
+/// How long a frame takes to overwrite a write that will not stand.
+const BARO_SETTLE_MS: u64 = 120;
 /// Pascals per inch of mercury (1013.25 hPa ≈ 29.92 inHg).
 const PA_PER_INHG: f64 = 3386.389;
 const DG_SYNC: &str = "sim/instruments/DG_sync_mag";
@@ -20,6 +31,54 @@ const PITOT_HEAT: &str = "sim/cockpit2/ice/ice_pitot_heat_on_pilot";
 // is read back to confirm.
 const CMD_PITOT_HEAT_ON: &str = "sim/ice/pitot_heat0_on";
 const CMD_PITOT_HEAT_OFF: &str = "sim/ice/pitot_heat0_off";
+
+/// Which knob command, and how many presses, take the dial from `actual` to
+/// `wanted`. Pure.
+pub fn baro_steps(actual: f64, wanted: f64) -> (&'static str, usize) {
+    let n = ((wanted - actual).abs() / BARO_STEP_INHG).round() as usize;
+    let cmd = if wanted >= actual {
+        CMD_BARO_UP
+    } else {
+        CMD_BARO_DOWN
+    };
+    (cmd, n.min(BARO_MAX_STEPS))
+}
+
+/// The dial reads what was asked, within a hundredth.
+pub fn altimeter_took(actual: f64, wanted: f64) -> bool {
+    (actual - wanted).abs() < BARO_STEP_INHG / 2.0
+}
+
+/// Set the altimeter and PROVE it. The stock dial is written and re-read a
+/// frame later; when the write did not stand, the knob is stepped there with
+/// the barometer commands and read again. Returns what the dial reads
+/// afterwards, which the callers compare against what they asked.
+///
+/// The 737-800's xlua copies its own `laminar/B738/barometer/capt_setting`
+/// into the stock dial every frame (`B738_baro_memory`, before_physics) and
+/// that dataref is not writable over the API: a dial write was a silent
+/// no-op and the immediate readback said "Roger, altimeter 30.11" to an ask
+/// of 30.00 (probed on the parked aircraft at LFLL, 2026-09-17). Its
+/// replaced `barometer_up/down` handlers move the memory a hundredth per
+/// press, so the steps are the one path in. On a stock airframe the first
+/// write stands and no command is sent.
+pub async fn set_altimeter(xp: &dyn crate::xplane::XPlane, inhg: f64) -> Result<f64> {
+    let inhg = inhg.clamp(28.0, 31.5);
+    xp.set_float(BARO, inhg).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(BARO_SETTLE_MS)).await;
+    let actual = xp.get_float(BARO).await?;
+    if altimeter_took(actual, inhg) {
+        return Ok(actual);
+    }
+    let (cmd, n) = baro_steps(actual, inhg);
+    for _ in 0..n {
+        xp.run_command(cmd).await?;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(BARO_SETTLE_MS)).await;
+    let now = xp.get_float(BARO).await?;
+    tracing::info!(target: "xvoicelayer::instruments", asked = inhg, dial_write_read = actual, cmd, presses = n, now, "altimeter stepped");
+    Ok(now)
+}
 
 pub struct SetBarometer;
 
@@ -61,9 +120,14 @@ impl Tool for SetBarometer {
     async fn execute(&self, args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         let args: Args = serde_json::from_value(args.clone())?;
         let inhg = args.inhg.clamp(28.0, 31.5);
-        ctx.xplane.set_float(BARO, inhg).await?;
-        let actual = ctx.xplane.get_float(BARO).await?;
-        Ok(format!("Roger, altimeter {actual:.2}."))
+        let actual = set_altimeter(ctx.xplane, inhg).await?;
+        if altimeter_took(actual, inhg) {
+            Ok(format!("Roger, altimeter {actual:.2}."))
+        } else {
+            Ok(format!(
+                "Altimeter didn't take. It reads {actual:.2}, not {inhg:.2}."
+            ))
+        }
     }
 }
 
@@ -128,8 +192,7 @@ pub async fn sync_altimeter(
         .unwrap_or(0.0);
     let was = xp.get_float(BARO).await.unwrap_or(0.0);
     let want = correct_setting_inhg(alt, transition_altitude_ft, pa);
-    xp.set_float(BARO, want).await.ok()?;
-    let now = xp.get_float(BARO).await.unwrap_or(want);
+    let now = set_altimeter(xp, want).await.ok()?;
     Some(AltimeterSync { was, now })
 }
 
@@ -305,6 +368,54 @@ impl Tool for AlignGyro {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 737's dial write never stands (its xlua copies its own memory over
+    /// it every frame): the setter must notice and step the knob there with
+    /// the commands the aircraft handles, and the tool must not say "Roger"
+    /// to a dial that still reads the old number.
+    #[tokio::test]
+    async fn a_dial_write_that_does_not_stand_is_stepped_and_never_rogered() {
+        use crate::xplane::FakeXPlane;
+        // The fake never reflects a write into its reads: the 737 exactly.
+        let fake = FakeXPlane::with_reads(&[(BARO, 30.11)]);
+        let now = set_altimeter(&fake, 30.00).await.unwrap();
+        assert!(fake.wrote(BARO), "the dial is tried first");
+        assert_eq!(
+            fake.ran_count(CMD_BARO_DOWN),
+            11,
+            "30.11 to 30.00 is eleven presses down"
+        );
+        assert!(!fake.ran(CMD_BARO_UP));
+        // The knob still reads the old number (this fake cannot move it), so
+        // the readback says so instead of Roger.
+        assert!(!altimeter_took(now, 30.00));
+        let cfg = crate::config::Config::default();
+        let ctx = ToolCtx {
+            xplane: &fake,
+            config: &cfg,
+            voice: None,
+            status: None,
+            reminders: None,
+        };
+        let out = SetBarometer
+            .execute(&json!({"inhg": 30.00}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.starts_with("Altimeter didn't take"), "{out}");
+    }
+
+    #[test]
+    fn baro_steps_count_hundredths_and_pick_the_direction() {
+        assert_eq!(baro_steps(30.11, 30.00), (CMD_BARO_DOWN, 11));
+        assert_eq!(baro_steps(29.92, 30.10), (CMD_BARO_UP, 18));
+        assert_eq!(baro_steps(30.10, 30.104).1, 0);
+        assert_eq!(
+            baro_steps(0.0, 31.5).1,
+            BARO_MAX_STEPS,
+            "a bad read never runs away"
+        );
+        assert!(altimeter_took(30.104, 30.10) && !altimeter_took(30.11, 30.10));
+    }
 
     #[test]
     fn correct_setting_is_qnh_below_and_standard_above_transition() {

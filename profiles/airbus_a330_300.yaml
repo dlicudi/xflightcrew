@@ -116,6 +116,12 @@ reference:
   kind: twin-engine jet
   vr_kts: 148.0                # ~400,000 lb CONF 2 (V1 143 / V2 153). VERIFY
   vy_kts: 220.0                # climb-out + pattern speed the laws hold
+  # The INITIAL climb, liftoff to the takeoff's handoff — V2 + 20 on this
+  # weight card. Kept apart from `vy_kts` for the reason the 737 found out:
+  # the takeoff's climb law protects the speed it is handed, and the enroute
+  # figure reads a perfectly good climb-out as thirty knots slow and takes
+  # the whole rate away (LFLL, 2026-09-17).
+  initial_climb_kts: 173.0     # V2 153 + 20. VERIFY
   best_climb_fpm: 2500.0       # initial climb, light; the climb law takes 80%
   cruise_ias_kts: 290.0        # KIAS the cruise governor holds (~M0.82 up high)
   approach_kts: 145.0          # POM 140-160, CONF FULL / gear down

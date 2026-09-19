@@ -59,6 +59,12 @@ const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 /// Gear handle — the circuit lowers it turning base (autoland's own
 /// extension only fires inside 6 nm, which this hands over well inside of).
 const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
+/// Flap handle: base and final extend the landing flaps by the placard
+/// gates as the speed allows, the same law autoland runs inside.
+const FLAP_RATIO: &str = "sim/cockpit2/controls/flap_ratio";
+/// The flap the base leg configures toward (the handle ratio): about half
+/// travel, the approach setting on every airframe here; final goes to full.
+const BASE_FLAP_RATIO: f64 = 0.5;
 /// The thrust lever THIS airframe obeys — not always the stock one (the
 /// Citation X tracks `throttle_jet_rev_ratio`, so every write to
 /// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
@@ -549,6 +555,16 @@ pub fn approach_leg_kts(pattern_kts: f64, approach_ias: f64) -> f64 {
     pattern_kts
         .min(approach_ias + APPROACH_LEG_MARGIN_KTS)
         .max(approach_ias)
+}
+
+/// The speed the FINAL leg slows toward: the approach speed, floored by the
+/// configuration the flaps are actually in (`aircraft::config_floor_kts`).
+/// Base flies the approach-setup margin; final hands autoland an aircraft
+/// already at Vref with the landing flaps out, instead of 20 kt fast at
+/// flaps 5 with a mile to fix both (the 737 at LFLL, 2026-09-17: the
+/// autoland idled the whole last mile and touched down 17 kt slow).
+pub fn final_leg_kts(approach_ias: f64, config_floor: Option<f64>) -> f64 {
+    crate::aircraft::floored_target(approach_ias, config_floor)
 }
 
 /// How far ahead the climb limiter judges the airspeed, seconds. Long enough
@@ -1760,6 +1776,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     let pattern_kts = pattern_speed_kts(p.takeoff.vy_kts, p.approach_ias, p.vs_clean_kts);
     // ...and the speed the approach-setup legs are flown at.
     let approach_kts = approach_leg_kts(pattern_kts, p.approach_ias);
+    let p_approach_ias = p.approach_ias;
     // Two radii, because the base-to-final turn is flown slower than the
     // pattern and is the one dimension where an over-estimate rolls us out
     // short of the centreline rather than merely wide.
@@ -2093,6 +2110,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     let mut descent_target: Option<f64> = None;
     // Gear goes down ONCE, at the 180, and the latch is what makes it once.
     let mut gear_lowered = !retractable_gear;
+    // The flap handle as this loop last commanded it; `None` until base.
+    let mut last_flap: Option<f64> = None;
     // Set when the base turn onto final may BEGIN. The handover waits for the
     // geometry to become flyable, not merely for the leg to change.
     let mut turning_final = false;
@@ -2396,10 +2415,38 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 }
             }
             prev_ias = Some((ias, t_now));
-            // Base and final fly the approach-setup speed; the rest of the
-            // pattern flies Vy (which is also what the geometry was sized on).
+            // Configure for landing: base toward the approach flap, final to
+            // full, each notch only once the speed is under its placard
+            // (`flap_within_limits`, autoland's own law). Airframes with no
+            // flap profile are left alone.
+            if matches!(leg, Leg::Base | Leg::Final) {
+                let limits = crate::aircraft::flap_limits();
+                if !limits.is_empty() {
+                    let wanted = if matches!(leg, Leg::Final) {
+                        1.0
+                    } else {
+                        BASE_FLAP_RATIO
+                    };
+                    let flap = crate::autoland::flap_within_limits(wanted, ias, &limits);
+                    if last_flap != Some(flap) {
+                        last_flap = Some(flap);
+                        let _ = xp.set_float(FLAP_RATIO, flap).await;
+                        crate::blackbox::record(
+                            "circuit",
+                            serde_json::json!({"event": "flaps", "leg": format!("{leg:?}"), "ratio": flap, "ias": ias}),
+                        );
+                    }
+                }
+            }
+            // Base flies the approach-setup speed, final the approach speed
+            // floored by the flaps actually out; the rest of the pattern
+            // flies Vy (which is also what the geometry was sized on).
             let want_kts = match leg {
-                Leg::Base | Leg::Final => approach_kts,
+                Leg::Final => final_leg_kts(
+                    p_approach_ias,
+                    crate::aircraft::config_floor_kts(last_flap.unwrap_or(0.0)),
+                ),
+                Leg::Base => approach_kts,
                 _ => pattern_kts,
             };
             let delta = crate::tools::speedhold::throttle_adjust(want_kts - ias, ias_trend);
@@ -3801,5 +3848,21 @@ mod tests {
         for t in 1..70 {
             assert!(!c.stalled(2500.0 - 35.0 * t as f64, t as f64));
         }
+    }
+}
+
+#[cfg(test)]
+mod final_leg_kts_tests {
+    use super::final_leg_kts;
+
+    /// The 737's Vref 145 stands with flaps 40 out (floor 137) and is raised
+    /// to 156 while the flaps are still at 5; a 172 (floor 58 under a 65 kt
+    /// approach) never notices.
+    #[test]
+    fn the_final_leg_slows_only_as_far_as_the_flaps_allow() {
+        assert_eq!(final_leg_kts(145.0, Some(137.0)), 145.0);
+        assert_eq!(final_leg_kts(145.0, Some(156.0)), 156.0);
+        assert_eq!(final_leg_kts(65.0, Some(58.0)), 65.0);
+        assert_eq!(final_leg_kts(65.0, None), 65.0);
     }
 }

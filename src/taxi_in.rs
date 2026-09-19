@@ -473,6 +473,8 @@ async fn secure(xp: &XPlaneClient, voice: &Option<Voice>, park_brake_valve_set: 
         let _ = xp.run_command(cmd).await;
     }
     crate::blackbox::record("taxi_in", json!({ "event": "secured" }));
+    // The arrival is over: hand the station back to the region's own pick.
+    crate::full_auto::release_arrival_station();
     announce(
         voice,
         Priority::Advisory,

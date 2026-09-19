@@ -1582,10 +1582,18 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     if (has(t, "stop") && (has(t, "engine") || has(t, "engines")))
         || t.contains("engine off")
         || t.contains("engines off")
+        // The other word order, which the pilot reached for twice at the
+        // Heathrow stand while nothing happened ("turn off engines", 2026-09-17).
+        // Anchored on "off <the> engine" rather than a loose off + engine, so
+        // "engine bleeds off" and friends stay other tools' words.
+        || t.contains("off engine")
+        || t.contains("off the engine")
         || t.contains("shut down")
         || has(t, "shutdown")
         || t.contains("secure the engine")
-        || (has(t, "kill") && (has(t, "engine") || has(t, "engines")))
+        // "cut the engines" / "kill the engines" — both are in the tool's own
+        // description of itself, and only one of them parsed.
+        || ((has(t, "kill") || has(t, "cut")) && (has(t, "engine") || has(t, "engines")))
     {
         return Some(call("stop_engine", json!({})));
     }
@@ -3132,6 +3140,40 @@ mod tests {
         assert!(declined("heading 270", &creg).is_none());
         // A non-AP command never declines here (handled elsewhere).
         assert!(declined("flaps up", &reg).is_none());
+    }
+
+    /// At the Heathrow stand, 2026-09-17, the pilot asked seven ways over
+    /// forty-five seconds and nothing happened, then gave up with "my
+    /// aircraft". Every phrasing parsed — to `stop_engine`, remapped to
+    /// `stop_engines`, which the 737's registry had never built: the
+    /// scripted-start branch added the START and not the stop. An airframe
+    /// you can start is an airframe you can shut down.
+    #[test]
+    fn the_737_can_be_shut_down_in_the_words_the_pilot_used() {
+        let prof = aircraft::load("boeing_737_800").expect("737 profile");
+        let reg = Registry::for_aircraft(&prof);
+        assert!(reg.get("start_engines").is_some(), "the scripted start");
+        assert!(reg.get("stop_engines").is_some(), "and the way back");
+        assert!(
+            reg.get("stop_engine").is_none(),
+            "a jet has no single lever"
+        );
+        for words in [
+            "let's shut down",
+            "let's turn engines off",
+            "engines off",
+            "turn engines off",
+            "shut down aircraft",
+            "shut down",
+            "turn off engines",
+            "cut the engines",
+        ] {
+            assert_eq!(
+                one_on("boeing_737_800", words).map(|(n, _)| n),
+                Some("stop_engines".to_string()),
+                "{words}"
+            );
+        }
     }
 
     #[test]

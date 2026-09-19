@@ -345,9 +345,39 @@ pub fn worth_another_pattern(back_m: f64, err_deg: f64, plan: &Plan) -> bool {
 /// costs the pilot a "the tug let go early" for a manoeuvre they watched go
 /// perfectly out of the window — the same wrong verb the 2026-07-28 Stansted
 /// fix removed one state earlier.
+/// How much of the planned distance a push with the NOSE where we asked for
+/// it has to have covered to count as delivered. The straight-metres test
+/// below it ([`worth_another_pattern`]) is a fixed ten, which is the right
+/// question for a fifty-metre GA push and a cliff for an airliner's ninety:
+/// a 737 asked for 88.7 m, got 77.4 with the heading 1.1 degrees off — a
+/// textbook push anyone watching would call finished — and failed by 1.3 m
+/// (LFLL, 2026-09-17). Those metres are three seconds of taxi.
+const DELIVERED_FRACTION: f64 = 0.8;
+
 pub fn push_delivered(back_m: f64, err_deg: f64, plan: &Plan) -> bool {
     done(back_m, err_deg, plan)
-        || (back_m >= MIN_BACK_M && !worth_another_pattern(back_m, err_deg, plan))
+        || (back_m >= MIN_BACK_M
+            && (!worth_another_pattern(back_m, err_deg, plan)
+                // Or: the tug ran its pattern, the nose came round to the lane,
+                // and only the last few metres of straight are owed. Both
+                // callers are TERMINAL — the bar is off, or a second command
+                // would knock it off — so nothing is going to earn those
+                // metres but the taxi drive, which is built for them.
+                || (err_deg.abs() <= ALIGN_DEG
+                    && back_m >= plan.back_m * DELIVERED_FRACTION)))
+}
+
+/// What a push that fell short actually fell short OF — the distance, or the
+/// turn. One label covered both, so a tug that pushed a 737 twelve metres
+/// PAST the plan and left the nose 71 degrees off the lane was blackboxed as
+/// "short" (LFLL, 2026-09-17); a residual you can read the wrong way is worse
+/// than no label.
+pub fn push_residual(back_m: f64, err_deg: f64, plan: &Plan) -> &'static str {
+    if err_deg.abs() > ALIGN_DEG && back_m >= plan.back_m * DELIVERED_FRACTION {
+        "unturned"
+    } else {
+        "short"
+    }
 }
 
 /// How near a published parking position the aircraft must be, and how
@@ -979,7 +1009,7 @@ async fn run_inner(
             }
             send(ctx, "stop").await;
             let _ = crate::tools::controls::drive_park_brake(ctx.xplane, true, valve_set).await;
-            return Err("short".into());
+            return Err(push_residual(back_m, err, plan).into());
         }
         tokio::time::sleep(Duration::from_millis(TICK_MS)).await;
     }
@@ -1269,6 +1299,45 @@ mod tests {
         // Southampton push (2026-08-01) must not be waved through as
         // "delivered" by the new leniency.
         assert!(!push_delivered(1.2, -130.0, &plan));
+    }
+
+    /// The airliner's ninety metres against a ten-metre threshold, and the
+    /// label the failure wore. Both LFLL, 2026-09-17.
+    #[test]
+    fn a_long_push_is_judged_on_what_is_left_not_on_ten_flat_metres() {
+        // Asked for 88.7 m, delivered 77.4 with the nose 1.1 degrees off the
+        // lane. Anyone at the window watched that push finish; it failed by
+        // 1.3 m, and full auto announced the tug had let us down.
+        let long = Plan {
+            back_m: 88.7,
+            target_hdg: 85.1,
+            node: (LAT0, LON0),
+        };
+        assert!(
+            push_delivered(77.4, 1.1, &long),
+            "eleven metres behind a completed swing is the taxi drive's"
+        );
+        // The proportion is what makes it safe on a short push: a THIRD of
+        // the way back is still in the stand, however straight the nose.
+        let short = Plan {
+            back_m: 56.35,
+            target_hdg: 265.9,
+            node: (LAT0, LON0),
+        };
+        assert!(!push_delivered(20.0, 2.0, &short), "still in the stand");
+        // And the other push that day: twelve metres PAST the plan with the
+        // nose 71 degrees off. Not delivered, and not "short" either.
+        let stand = Plan {
+            back_m: 65.7,
+            target_hdg: 157.2,
+            node: (LAT0, LON0),
+        };
+        assert!(
+            !push_delivered(78.0, 71.3, &stand),
+            "the turn never finished"
+        );
+        assert_eq!(push_residual(78.0, 71.3, &stand), "unturned");
+        assert_eq!(push_residual(30.0, 2.0, &stand), "short");
     }
 
     /// The tug's dead air is survived by HOLDING, not by failing. Three EGHI

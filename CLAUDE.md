@@ -215,6 +215,15 @@ leg the follower first steers at is written as `IDENT,lat,lon` to
 `xcopilot/fms/goto` and the plugin makes the matching loaded entry (ident,
 nearest namesake; a nameless point within a mile) the destination on both
 plans. An ident the plan lacks (an approach leg) changes nothing.
+**The plan is the WHOLE navlog; the mailbox is the payload's problem**
+(`simbrief::fms_route_payload`): `xcopilot/fms/route` is a 512-byte `TextRef`
+that truncates at 511 mid-entry, so the GPS route is thinned from the MIDDLE
+(origin and destination always survive - they are what fills ORIGIN/DEST).
+Capping the PARSE at fourteen fixes instead amputated the tail: EGLL-EGPH,
+2026-09-17, the plan stopped at RIBEL and the TARTN arrival and EGPH itself
+were never in it, so the follower ended 110 nm short and the approach armed
+from 121 nm out (see history). A cap on the front of a list is an amputation
+of its end.
 
 **Local planner** ([src/flightplan.rs](src/flightplan.rs), "plan a flight to
 X" / "divert to X" / a bare "divert" then "to where?"): a DIRECT plan in the

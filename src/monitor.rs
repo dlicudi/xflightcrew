@@ -121,6 +121,8 @@ pub struct Snapshot {
     /// check, which estimates endurance from a nominal cruise burn instead of
     /// the (near-zero) idle burn.
     pub fuel_kg: Option<f64>,
+    /// Total fuel flow, all engines, kg/s (`None` when unread).
+    pub fuel_flow_kg_sec: Option<f64>,
     /// Engine oil pressure, PSI (`None` if the read failed). Normal 50–90 (POH).
     pub oil_pressure_psi: Option<f64>,
     /// Engine oil temperature, °F (`None` if the read failed). NOTE: the
@@ -474,6 +476,7 @@ impl Snapshot {
             gyro_drift_deg,
             endurance_min,
             fuel_kg,
+            fuel_flow_kg_sec,
             oil_pressure_psi,
             oil_temp_f,
             cht_f,
@@ -1652,12 +1655,14 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             severity: Severity::Caution,
             at_or_below_min: fuel.reserve_caution_min,
             above_min: Some(fuel.reserve_warning_min),
+            cruise_burn_kg_hr: Some(fuel.cruise_burn_kg_hr).filter(|b| *b > 0.0),
         }));
         checks.push(Box::new(FuelEndurance {
             id: "fuel_warning",
             severity: Severity::Warning,
             at_or_below_min: fuel.reserve_warning_min,
             above_min: None,
+            cruise_burn_kg_hr: Some(fuel.cruise_burn_kg_hr).filter(|b| *b > 0.0),
         }));
         checks.push(Box::new(FuelPreTakeoff {
             caution_min: fuel.reserve_caution_min,
@@ -3179,7 +3184,16 @@ pub async fn run(
                                     let _ = xp.run_command(cmd).await;
                                 }
                                 if let Some((dref, value)) = check.fix_write(&snap) {
-                                    let _ = xp.set_float(dref, value).await;
+                                    // The altimeter goes through the proving
+                                    // setter: on the 737 a dial write is a
+                                    // silent no-op every 20 s otherwise.
+                                    if dref == BARO_KNOB {
+                                        let _ =
+                                            crate::tools::instruments::set_altimeter(&xp, value)
+                                                .await;
+                                    } else {
+                                        let _ = xp.set_float(dref, value).await;
+                                    }
                                 }
                             }
                         }
@@ -3331,6 +3345,31 @@ struct FuelEndurance {
     at_or_below_min: f64,
     /// … and (if set) still above this — the next, more urgent band owns below it.
     above_min: Option<f64>,
+    /// The profile's cruise burn, kg/hr: the most the estimate will ever
+    /// assume the aircraft keeps burning (see [`endurance_minutes`]).
+    cruise_burn_kg_hr: Option<f64>,
+}
+
+/// Minutes of fuel at the burn the flight will actually average: the live
+/// flow, capped at the profile's cruise burn. Takeoff and climb thrust are
+/// transient by definition, and dividing the tanks by them is how the 737
+/// with a correct 6,672 kg block heard "fuel's getting low, about 45
+/// minutes" on every departure (a 9,000 kg/hr takeoff flow against a
+/// 2,500 kg/hr cruise; LFLL, 2026-09-17), then again as the estimate swung
+/// through the 60-minute band in the climb. Below the cruise burn the live
+/// flow stands, optimistic side and all (a profile with no burn keeps the
+/// old arithmetic). `None` when nothing is burning.
+pub fn endurance_minutes(
+    fuel_kg: Option<f64>,
+    flow_kg_sec: Option<f64>,
+    cruise_burn_kg_hr: Option<f64>,
+) -> Option<f64> {
+    let (kg, flow) = (fuel_kg?, flow_kg_sec?);
+    let burn = match cruise_burn_kg_hr {
+        Some(c) if c > 0.0 => flow.min(c / 3600.0),
+        _ => flow,
+    };
+    (burn > 1e-4).then(|| kg / burn / 60.0)
 }
 
 impl Check for FuelEndurance {
@@ -3344,7 +3383,8 @@ impl Check for FuelEndurance {
         if s.on_ground || !s.engine_running {
             return None;
         }
-        let min = s.endurance_min?;
+        let min = endurance_minutes(s.fuel_kg, s.fuel_flow_kg_sec, self.cruise_burn_kg_hr)
+            .or(s.endurance_min)?;
         let in_band = min <= self.at_or_below_min && self.above_min.is_none_or(|a| min > a);
         if !in_band {
             return None;
@@ -3550,6 +3590,7 @@ mod tests {
             generator_amps_max: 0.0,
             gyro_drift_deg: 0.0,
             endurance_min: None,
+            fuel_flow_kg_sec: None,
             fuel_kg: None,
             oil_pressure_psi: None,
             oil_temp_f: None,
@@ -4073,6 +4114,7 @@ mod tests {
             severity: Severity::Caution,
             at_or_below_min: 45.0,
             above_min: Some(30.0),
+            cruise_burn_kg_hr: None,
         }
     }
     fn fuel_warning() -> FuelEndurance {
@@ -4081,6 +4123,7 @@ mod tests {
             severity: Severity::Warning,
             at_or_below_min: 30.0,
             above_min: None,
+            cruise_burn_kg_hr: None,
         }
     }
 
@@ -4334,5 +4377,29 @@ mod tests {
         s.groundspeed_kts = 0.0;
         s.vsi_fpm = 700.0;
         assert_eq!(estimate_phase(&s), Phase::Climb);
+    }
+}
+
+#[cfg(test)]
+mod endurance_minutes_tests {
+    use super::endurance_minutes;
+
+    /// The 737 at takeoff thrust: 6,672 kg at 2.5 kg/s is 44 minutes by the
+    /// live flow and 160 by the cruise burn the profile declares; the
+    /// estimate takes the cruise figure. In cruise or the descent the live
+    /// flow is under the cap and stands. No burn declared: the old sum.
+    #[test]
+    fn the_estimate_never_assumes_takeoff_thrust_for_the_whole_flight() {
+        let takeoff = endurance_minutes(Some(6672.0), Some(2.5), Some(2500.0)).unwrap();
+        assert!((takeoff - 160.1).abs() < 0.5, "{takeoff}");
+        let cruise = endurance_minutes(Some(6672.0), Some(0.6), Some(2500.0)).unwrap();
+        assert!((cruise - 185.3).abs() < 0.5, "{cruise}");
+        let raw = endurance_minutes(Some(6672.0), Some(2.5), None).unwrap();
+        assert!((raw - 44.5).abs() < 0.5, "{raw}");
+        assert_eq!(
+            endurance_minutes(Some(6672.0), Some(0.0), Some(2500.0)),
+            None
+        );
+        assert_eq!(endurance_minutes(None, Some(1.0), Some(2500.0)), None);
     }
 }

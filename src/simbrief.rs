@@ -321,10 +321,18 @@ impl FlightPlan {
 }
 
 /// Real route waypoints from the navlog (named fixes + the destination airport),
-/// skipping the pseudo points (top of climb/descent). Capped so the serialised
-/// route stays within the plugin's fixed buffer — ample for a GA route.
+/// skipping the pseudo points (top of climb/descent).
+///
+/// EVERY fix, to the end of the navlog. This was capped at the first 14 so the
+/// serialised route would fit the plugin's 512-byte mailbox, and a cap on the
+/// front of a list is an amputation of its tail: EGLL-EGPH, 2026-09-17, the
+/// B738's plan stopped at RIBEL in the Lake District and the STAR, the arrival
+/// and EGPH itself were never in it. The follower flew the 14 fixes it was
+/// given, the arrival armed the ILS 24 from 121 nm out, and what the plan did
+/// not cover the approach had to. The plugin's buffer is the PAYLOAD's problem
+/// and [`fms_route_payload`] owns it; the plan the crew flies is not shaped by
+/// the size of a dataref.
 fn parse_waypoints(v: &Value) -> Vec<Waypoint> {
-    const MAX_WAYPOINTS: usize = 14;
     let Some(fixes) = v.pointer("/navlog/fix").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -346,11 +354,41 @@ fn parse_waypoints(v: &Value) -> Vec<Waypoint> {
             lon,
             alt: f.get("altitude_feet").and_then(num_of).unwrap_or(0.0),
         });
-        if out.len() >= MAX_WAYPOINTS {
-            break;
-        }
     }
     out
+}
+
+/// The plugin's `xcopilot/fms/route` mailbox is a `TextRef`: 512 bytes, and a
+/// longer write is truncated at 511 — mid-entry, silently. So the GPS route is
+/// thinned to fit, and thinned in the MIDDLE: the origin and the destination
+/// are the two points that must survive, because they are what fills the CDU's
+/// ORIGIN/DEST and what the whole-plan load needs to read as a flight. Dropping
+/// from the end instead is what cost the EGPH arrival its last hundred miles.
+///
+/// A thinned GPS route costs the crew nothing: the follower flies the PLAN's
+/// own fixes, and `xcopilot/fms/goto` moves the pointer for the idents the
+/// loaded plan does hold — an ident it lacks changes nothing on the plugin side.
+pub fn fms_route_payload(waypoints: &[Waypoint]) -> String {
+    const FMS_ROUTE_MAX_BYTES: usize = 511;
+    let entry = |w: &Waypoint| format!("{},{:.4},{:.4},{}", w.ident, w.lat, w.lon, w.alt as i64);
+    let join = |ws: &[&Waypoint]| ws.iter().map(|w| entry(w)).collect::<Vec<_>>().join("|");
+    let mut kept: Vec<&Waypoint> = waypoints.iter().collect();
+    while kept.len() > 2 && join(&kept).len() > FMS_ROUTE_MAX_BYTES {
+        // Drop the fix nearest the middle, so what goes is enroute padding
+        // rather than either end of the flight.
+        kept.remove(kept.len() / 2);
+    }
+    let payload = join(&kept);
+    // Two points that still do not fit (absurd idents): the tail is the half
+    // that matters, so keep the destination.
+    if payload.len() > FMS_ROUTE_MAX_BYTES {
+        return kept
+            .last()
+            .map(|w| entry(w))
+            .filter(|p| p.len() <= FMS_ROUTE_MAX_BYTES)
+            .unwrap_or_default();
+    }
+    payload
 }
 
 /// Distance (nm) from the top-of-descent fix to the destination: the sum of the
@@ -425,5 +463,70 @@ mod tests {
             parse_weights(&serde_json::json!({"weights": {"pax_count": "3"}}), false).is_none()
         );
         assert!(parse_weights(&serde_json::json!({}), false).is_none());
+    }
+
+    /// An airline navlog, EGLL-EGPH shaped: a SID, the airway fixes, TOC and
+    /// TOD in the middle of it, a STAR and the destination at the end.
+    fn navlog(n: usize) -> Value {
+        let mut fixes = vec![serde_json::json!({
+            "ident": "TOC", "pos_lat": "51.9", "pos_long": "-0.6", "altitude_feet": "32000"
+        })];
+        for i in 0..n {
+            fixes.push(serde_json::json!({
+                "ident": format!("FIX{i:02}"),
+                "pos_lat": format!("{:.4}", 51.5 + i as f64 * 0.2),
+                "pos_long": "-2.5000",
+                "altitude_feet": "32000",
+            }));
+        }
+        fixes.push(serde_json::json!({
+            "ident": "TOD", "pos_lat": "55.2", "pos_long": "-3.0", "altitude_feet": "32000"
+        }));
+        fixes.push(serde_json::json!({
+            "ident": "EGPH", "pos_lat": "55.9500", "pos_long": "-3.3725", "altitude_feet": "0"
+        }));
+        serde_json::json!({ "navlog": { "fix": fixes } })
+    }
+
+    /// The EGPH sortie: the navlog ran well past the fourteenth fix and the
+    /// plan stopped there, so the route ended 110 nm short of the field and
+    /// the arrival had to cover it. Every fix, and the destination last.
+    #[test]
+    fn the_navlog_is_parsed_to_its_end() {
+        let ws = parse_waypoints(&navlog(22));
+        assert_eq!(ws.len(), 23, "22 fixes and the destination, no TOC/TOD");
+        assert_eq!(ws.last().map(|w| w.ident.as_str()), Some("EGPH"));
+        assert!(!ws.iter().any(|w| w.ident == "TOC" || w.ident == "TOD"));
+    }
+
+    /// The plugin's mailbox is 512 bytes and truncates at 511 mid-entry. The
+    /// route is thinned to fit — from the MIDDLE, so both ends of the flight
+    /// survive, which is the whole point of loading a plan at all.
+    #[test]
+    fn a_long_route_is_thinned_in_the_middle_to_fit_the_mailbox() {
+        let ws = parse_waypoints(&navlog(40));
+        let payload = fms_route_payload(&ws);
+        assert!(payload.len() <= 511, "{} bytes", payload.len());
+        let entries: Vec<&str> = payload.split('|').collect();
+        assert!(entries.len() > 2, "not thinned to nothing: {entries:?}");
+        assert!(entries[0].starts_with("FIX00,"), "{}", entries[0]);
+        assert!(
+            entries.last().unwrap().starts_with("EGPH,"),
+            "the destination survives: {}",
+            entries.last().unwrap()
+        );
+    }
+
+    /// A route that already fits is sent whole — every fix, in order.
+    #[test]
+    fn a_short_route_keeps_every_fix() {
+        let ws = parse_waypoints(&navlog(8));
+        let payload = fms_route_payload(&ws);
+        assert!(payload.len() <= 511, "{} bytes", payload.len());
+        assert_eq!(payload.split('|').count(), ws.len());
+        assert!(
+            payload.starts_with("FIX00,51.5000,-2.5000,32000|"),
+            "{payload}"
+        );
     }
 }

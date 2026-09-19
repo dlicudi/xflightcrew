@@ -281,6 +281,15 @@ impl Registry {
                 .as_ref()
                 .and_then(|r| r.vy_kts)
                 .unwrap_or(vr + 15.0);
+            // The TAKEOFF's climb reference is the INITIAL climb speed, which
+            // is `vy` on everything that does not say otherwise (see
+            // `ReferenceProfile::initial_climb_kts`). The circuit and the
+            // follower keep `vy` — those legs really are flown at it.
+            let initial_climb = profile
+                .reference
+                .as_ref()
+                .and_then(|r| r.initial_climb_kts)
+                .unwrap_or(vy);
             let climb = profile
                 .reference
                 .as_ref()
@@ -290,6 +299,7 @@ impl Registry {
                 cfg: ap.clone(),
                 vr_kts: vr,
                 vy_kts: vy,
+                initial_climb_kts: initial_climb,
                 climb_fpm: climb,
                 retract_gear: profile.retractable_gear,
                 takeoff_flap_ratio: profile.flaps.as_ref().and_then(|f| f.takeoff_ratio),
@@ -309,6 +319,7 @@ impl Registry {
                 cfg: ap.clone(),
                 vr_kts: vr,
                 vy_kts: vy,
+                initial_climb_kts: initial_climb,
                 climb_fpm: climb,
                 retract_gear: profile.retractable_gear,
                 takeoff_flap_ratio: profile.flaps.as_ref().and_then(|f| f.takeoff_ratio),
@@ -372,6 +383,7 @@ impl Registry {
                     cfg: ap,
                     vr_kts: vr,
                     vy_kts: vy,
+                    initial_climb_kts: initial_climb,
                     climb_fpm: climb,
                     retract_gear: profile.retractable_gear,
                     approach_ias,
@@ -384,6 +396,7 @@ impl Registry {
                     // instead (StartEngine's profile battery/master commands).
                     power_up_first: profile.turbine_start,
                     jet_start: profile.turbine_start,
+                    scripted_auto_start: profile.scripted_auto_start,
                 }));
             }
         }
@@ -399,6 +412,19 @@ impl Registry {
         // Turbine start sequence (jets) — distinct from the piston one-shot start.
         if profile.turbine_start {
             tools.push(Box::new(jet_start::StartEngines));
+            tools.push(Box::new(jet_start::StopEngines));
+        }
+        // An aircraft that scripts its own start: "start the engines" fires
+        // that script (the stock 737-800, `scripted_auto_start`). The SHUTDOWN
+        // is ours either way — the aircraft scripts the start, not the stop —
+        // and leaving it out gave the 737 no way to be shut down at all: at
+        // the Heathrow stand the pilot asked seven ways over forty-five
+        // seconds ("let's shut down", "engines off", "turn engines off",
+        // "shut down aircraft") and every one of them parsed to a tool the
+        // registry had not built, until they gave up with "my aircraft"
+        // (2026-09-17).
+        if profile.scripted_auto_start && !profile.turbine_start {
+            tools.push(Box::new(jet_start::ScriptedAutoStart));
             tools.push(Box::new(jet_start::StopEngines));
         }
         // Procedural electrical power-up (step-by-step with callouts).
@@ -776,10 +802,23 @@ mod departure_lights_tests {
         let reg = super::Registry::for_aircraft(&p);
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name()).collect();
         for withheld in super::ROTORCRAFT_WITHHELD {
-            assert!(!names.contains(withheld), "{withheld} registered on a helicopter");
+            assert!(
+                !names.contains(withheld),
+                "{withheld} registered on a helicopter"
+            );
         }
-        for kept in ["gear", "set_heading", "set_altitude", "set_com1", "set_transponder", "set_parking_brake"] {
-            assert!(names.contains(&kept), "{kept} missing on the S-76C from {names:?}");
+        for kept in [
+            "gear",
+            "set_heading",
+            "set_altitude",
+            "set_com1",
+            "set_transponder",
+            "set_parking_brake",
+        ] {
+            assert!(
+                names.contains(&kept),
+                "{kept} missing on the S-76C from {names:?}"
+            );
         }
         // The gate is the flag, not the other flags: a fixed-wing profile
         // with the same switches keeps its laws.

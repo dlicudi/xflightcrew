@@ -448,8 +448,11 @@ pub fn run_autoland_scoped(
             // The approach speed is a number somebody handed us; the airframe's
             // stall floor is a fact. A Cessna's 65 kt on an RV-10 whose clean
             // stall is 65 flew the speed schedule into a stall (2026-09-11).
+            // The LANDING configuration's floor, not the clean one: the 737's
+            // Vref 145 floored to the clean 167 overflew LFLL 35L twice
+            // (2026-09-17; `aircraft::approach_floor_kts`).
             let approach_ias = {
-                let floored = crate::aircraft::floored_target(approach_ias, crate::aircraft::speed_floor_kts());
+                let floored = crate::aircraft::floored_target(approach_ias, crate::aircraft::approach_floor_kts());
                 if floored > approach_ias {
                     crate::blackbox::record(
                         "autoland",
@@ -909,6 +912,7 @@ pub fn run_autoland_scoped(
                     raw.dist_nm,
                     along_nm,
                     join_point_nm(alt, rwy.elev_ft),
+                    xtk_now,
                 );
                 let ga = missed.is_some();
                 // The tower is owed this the moment it happens: it is holding a
@@ -1003,17 +1007,27 @@ pub fn run_autoland_scoped(
                 // level the wings, throttle to a safe climb, and give the
                 // aircraft back — a real crew would divert, not keep diving at
                 // a runway they can't make (LXGB Twin Otter, 2026-07-26).
-                if go_around.attempts() > MAX_GO_AROUNDS {
-                    // Same flyable-handback rule as the timeout above.
+                // Too many go-arounds: give up, but only once the climb-away
+                // is flown. The third LFLL balk released the aircraft at 95 ft
+                // with landing flaps and climb power, "holding altitude": it
+                // accelerated at 300 ft AGL to 236 kt through the flap limit
+                // (2026-09-17). The latch's Climb stage runs to
+                // GO_AROUND_TURN_AGL_FT under full power with the go-around
+                // flap; the handback happens there, flaps retracted.
+                if go_around.attempts() > MAX_GO_AROUNDS && missed != Some(MissedStage::Climb) {
                     let thr_dref = throttle_dref();
                     let _ = tokio::join!(
                         xp.set_float(&thr_dref, GIVE_UP_THROTTLE),
                         xp.set_float(VS_DIAL, 0.0),
+                        xp.set_float(FLAP_RATIO, 0.0),
                     );
                     announce(
-                        "Unable to land — we've gone around too many times. Your aircraft — \
-                         the autopilot is holding heading and altitude, gear is down."
-                            .into(),
+                        format!(
+                            "Unable to land, we've gone around too many times. Climbed away to \
+                             {} feet. Your aircraft. The autopilot is holding heading and \
+                             altitude, flaps up, gear is down.",
+                            (radio_ft / 100.0).round() * 100.0
+                        ),
                         Priority::Warning,
                     );
                     crate::blackbox::record(
@@ -1158,8 +1172,20 @@ pub fn run_autoland_scoped(
                         None => Some(0.0),
                     }
                 } else {
-                    let adj = crate::tools::speedhold::throttle_adjust(g.target_ias_kts - ias, trend_kts_s);
-                    thr_now.map(|throttle| (throttle + adj).clamp(0.1, 1.0))
+                    // The target is only as safe as the flaps actually out
+                    // (`config_floor_kts`), and the lever has a floor of its
+                    // own on final and a ceiling-only rule low in a
+                    // reposition (`approach_power_floor`).
+                    let floor = crate::aircraft::config_floor_kts(last_flap.unwrap_or(0.0));
+                    let target = crate::aircraft::floored_target(g.target_ias_kts, floor);
+                    let adj = crate::tools::speedhold::throttle_adjust(target - ias, trend_kts_s);
+                    let min_thr = approach_power_floor(
+                        g.phase,
+                        radio_ft,
+                        target - ias,
+                        crate::aircraft::approach_thrust_min(),
+                    );
+                    thr_now.map(|throttle| (throttle + adj).clamp(min_thr, 1.0))
                 };
                 let throttle_written = match thr {
                     Some(throttle) => Some(xp.set_float(&throttle_dref(), throttle).await.is_ok()),
@@ -1448,6 +1474,23 @@ impl TrackTrim {
 /// Public because the circuit descends its base leg onto the same path — a
 /// pattern that hands over 500 ft below it has already lost the approach.
 pub const GLIDEPATH_FT_PER_NM: f64 = 318.0;
+
+/// The glidepath correction, fpm per foot of path error, sized to close the
+/// error over a fixed DISTANCE of final rather than a fixed time. 1.2 fpm/ft
+/// is a 50 s time constant: 0.9 nm on a 172 at 65 kt, but 2.4 nm on a 737 at
+/// 170 kt, whose last mile is 22 s long. Captured from below at 1.6 nm, the
+/// 737 levelled, started down late, and arrived over LFLL 35L's numbers 51 ft
+/// high with a correction of 86 fpm to fix it (2026-09-17). Scaled by
+/// groundspeed over the 172's, floored at the old gain so every slow airframe
+/// flies the law it always did, capped so the gain never outruns the VS
+/// mode's own lag.
+pub fn glidepath_gain_fpm_per_ft(gs_kts: f64) -> f64 {
+    GLIDEPATH_GAIN_FPM_PER_FT
+        * (gs_kts / GLIDEPATH_GAIN_REF_KTS).clamp(1.0, GLIDEPATH_GAIN_MAX_MULT)
+}
+const GLIDEPATH_GAIN_FPM_PER_FT: f64 = 1.2;
+const GLIDEPATH_GAIN_REF_KTS: f64 = 65.0;
+const GLIDEPATH_GAIN_MAX_MULT: f64 = 3.0;
 /// Aim the glidepath at a touchdown point ~300 m (≈1,000 ft) PAST the threshold,
 /// so the path crosses the numbers at a standard ~50 ft threshold-crossing
 /// height and touches in the touchdown zone — not planted on the leading edge.
@@ -1575,11 +1618,46 @@ pub fn overflight_allowance_nm(length_m: f64, radio_alt_ft: f64, flare_radio_ft:
 /// A latched go-around climbs straight ahead until this height before the
 /// intercept guidance may turn it back toward the FAP (see GoAroundLatch).
 const GO_AROUND_TURN_AGL_FT: f64 = 800.0;
+/// How near the extended centreline the reposition leg must be before it
+/// hands back to the ordinary approach (see [`GoAroundLatch::update`]). Half
+/// a mile leaves the pursuit ~17 m of offset after four time constants on a
+/// 737's 118 s final, inside the flare gate; a 172's 280 s final never
+/// needed the rule.
+const REPOSITION_RELEASE_XTK_NM: f64 = 0.5;
 /// Terrain floor (ft AGL): below this and outside the flare zone, low radio
 /// altitude is rising terrain under the flight path, not the runway — climb away
 /// from it rather than hold level into it. Seen live 2026-07-06: held level at
 /// ~50 ft AGL 5 nm out over rising ground, no climb authority anywhere in the loop.
 const TERRAIN_FLOOR_AGL_FT: f64 = 500.0;
+
+/// Fast by more than this on final and the speed law may still idle a jet.
+const APPROACH_FAST_KTS: f64 = 10.0;
+/// The lever's idle stop in the speed law.
+const IDLE_THROTTLE: f64 = 0.1;
+
+/// The least the speed law may pull the lever to. On FINAL, not more than
+/// `APPROACH_FAST_KTS` fast, it is the airframe's approach thrust floor
+/// (jets fly the approach on thrust: the 737 idled its last mile and touched
+/// down 17 kt under Vref, LFLL 2026-09-17). In a REPOSITION below the
+/// terrain floor it is full power: excess speed there is spent on the
+/// climb, never on the lever ("land the aircraft" from 140 ft at 237 kt
+/// pulled the throttle to idle for its 179 kt target and the aircraft
+/// settled into the fields with +800 fpm on the dial, same day). Everywhere
+/// else, idle.
+pub fn approach_power_floor(
+    phase: ApproachPhase,
+    radio_alt_ft: f64,
+    err_kts: f64,
+    approach_thrust_min: Option<f64>,
+) -> f64 {
+    match phase {
+        ApproachPhase::Intercept if radio_alt_ft < TERRAIN_FLOOR_AGL_FT => 1.0,
+        ApproachPhase::Final if err_kts > -APPROACH_FAST_KTS => approach_thrust_min
+            .unwrap_or(IDLE_THROTTLE)
+            .max(IDLE_THROTTLE),
+        _ => IDLE_THROTTLE,
+    }
+}
 /// Don't enforce the terrain floor inside this range ON FINAL — here a low
 /// radio altitude IS the approach (short final), not terrain to climb over.
 /// The gate applies to Final only: in Intercept the aircraft is repositioning,
@@ -1939,10 +2017,12 @@ impl GoAroundLatch {
 
     /// Advance the latch one tick: `prev`/`now` are the raw guidance phases,
     /// `radio_ft` the radio altitude, `dist_nm` the distance to the threshold,
-    /// `along_nm` the signed along-track (positive = approach side) and
-    /// `join_nm` the [`join_point_nm`] the reposition leg is flying out to.
+    /// `along_nm` the signed along-track (positive = approach side),
+    /// `join_nm` the [`join_point_nm`] the reposition leg is flying out to
+    /// and `xtk_nm` the cross-track from the extended centreline.
     /// Returns the stage being flown, `None` when the approach is the pilot's
     /// normal one again.
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         prev: Option<ApproachPhase>,
@@ -1951,6 +2031,7 @@ impl GoAroundLatch {
         dist_nm: f64,
         along_nm: f64,
         join_nm: f64,
+        xtk_nm: f64,
     ) -> Option<MissedStage> {
         match self.stage {
             // Clear of the ground — stop climbing straight ahead and start
@@ -1965,7 +2046,18 @@ impl GoAroundLatch {
             // approach starts, so hand back. Releasing merely OUTSIDE the FAP
             // would hand back mid-outbound-leg, pointing away from the field,
             // and leave the ordinary guidance to fly a 180 on final.
-            Some(MissedStage::Reposition) if along_nm > 0.0 && dist_nm >= join_nm - 0.2 => {
+            // AT the join point, not merely abeam it: the leg homes on the
+            // point, and a fast aircraft's turn-back leaves it miles beside
+            // the centreline when the distance test first passes. The 737
+            // was released 2.7 nm abeam at 6.7 nm, called "final" 1.9 nm off
+            // (a 19 degree cut is interceptable on paper), and the pursuit's
+            // 30 s time constant had 110 s of final to close 3.5 km: it
+            // balked at 95 ft still 84 m off (LFLL 35L, 2026-09-17).
+            Some(MissedStage::Reposition)
+                if along_nm > 0.0
+                    && dist_nm >= join_nm - 0.2
+                    && xtk_nm.abs() <= REPOSITION_RELEASE_XTK_NM =>
+            {
                 self.stage = None;
             }
             None if now == ApproachPhase::Intercept
@@ -2399,7 +2491,7 @@ pub fn guidance(
         // the numbers still 190 ft high (2026-07-22). 1.2 converges a
         // 200 ft error inside the last mile; the clamp still forbids a
         // dive.
-        _ => (nominal_vs - alt_err * 1.2)
+        _ => (nominal_vs - alt_err * glidepath_gain_fpm_per_ft(gs_kts))
             .clamp(-1200.0, 0.0)
             .max(descent_limit_fpm),
     };
@@ -3526,7 +3618,7 @@ mod tests {
         use MissedStage::*;
         let mut latch = GoAroundLatch::new();
         // Just past the threshold, so along-track is negative throughout.
-        let up = |l: &mut GoAroundLatch, p, n, r| l.update(Some(p), n, r, 0.2, -0.2, FAP_NM);
+        let up = |l: &mut GoAroundLatch, p, n, r| l.update(Some(p), n, r, 0.2, -0.2, FAP_NM, 0.0);
         // Final ticking along at 60 ft: not a go-around.
         assert_eq!(up(&mut latch, Final, Final, 60.0), None);
         // Overflight: Final degrades to Intercept at 57 ft → latch, climbing.
@@ -3562,27 +3654,41 @@ mod tests {
         // Platform height puts the join point ~5.75 nm out.
         let join = join_point_nm(1600.0, 0.0);
         assert_eq!(
-            l.update(Some(Final), Intercept, 50.0, 0.2, -0.2, join),
+            l.update(Some(Final), Intercept, 50.0, 0.2, -0.2, join, 0.0),
             Some(Climb)
         );
         assert_eq!(
-            l.update(Some(Intercept), Intercept, 900.0, 1.0, -1.0, join),
+            l.update(Some(Intercept), Intercept, 900.0, 1.0, -1.0, join, 0.0),
             Some(Reposition)
         );
         // Departure side, miles out: still repositioning, however far.
         assert_eq!(
-            l.update(Some(Intercept), Intercept, 1600.0, 6.0, -6.0, join),
+            l.update(Some(Intercept), Intercept, 1600.0, 6.0, -6.0, join, 0.0),
             Some(Reposition)
         );
         // Approach side but short of the join point: an approach can't start
         // here, and handing back mid-outbound-leg means a 180 on final.
         assert_eq!(
-            l.update(Some(Intercept), Intercept, 1600.0, 5.2, 5.2, join),
+            l.update(Some(Intercept), Intercept, 1600.0, 5.2, 5.2, join, 0.0),
+            Some(Reposition)
+        );
+        // Abeam the join point but 2.7 nm beside the centreline (the 737's
+        // turn-back, LFLL 2026-09-17): not an approach yet, keep homing.
+        assert_eq!(
+            l.update(
+                Some(Intercept),
+                Intercept,
+                1600.0,
+                join + 1.3,
+                join + 1.0,
+                join,
+                -2.7
+            ),
             Some(Reposition)
         );
         // Out at the join point on the approach side: hand back.
         assert_eq!(
-            l.update(Some(Intercept), Intercept, 1600.0, join, join, join),
+            l.update(Some(Intercept), Intercept, 1600.0, join, join, join, 0.3),
             None
         );
     }
@@ -3601,7 +3707,10 @@ mod tests {
         let mut l = GoAroundLatch::new();
         // Established on final, stable, nothing wrong with the approach: the
         // aircraft would never have called this one itself.
-        assert_eq!(l.update(Some(Final), Final, 600.0, 2.0, 2.0, FAP_NM), None);
+        assert_eq!(
+            l.update(Some(Final), Final, 600.0, 2.0, 2.0, FAP_NM, 0.0),
+            None
+        );
         assert!(l.order(false), "the order starts one");
         assert_eq!(l.stage, Some(MissedStage::Climb));
         assert_eq!(l.attempts(), 1, "an ordered go-around is still a go-around");
@@ -3614,7 +3723,7 @@ mod tests {
         // Intercept — it is already turning back toward the FAP, which is
         // exactly what the latch exists to override until we are clear.)
         assert_eq!(
-            l.update(Some(Final), Intercept, 900.0, 0.5, -0.5, 6.0),
+            l.update(Some(Final), Intercept, 900.0, 0.5, -0.5, 6.0, 0.0),
             Some(MissedStage::Reposition),
             "clear of the ground, so reposition"
         );
@@ -3635,23 +3744,23 @@ mod tests {
         // the aircraft is repositioned outside the FAP, ready to try again.
         for n in 1..=3 {
             assert!(
-                l.update(Some(Final), Intercept, 50.0, 0.2, -0.2, FAP_NM)
+                l.update(Some(Final), Intercept, 50.0, 0.2, -0.2, FAP_NM, 0.0)
                     .is_some(),
                 "latched low"
             );
             assert_eq!(l.attempts(), n, "counted");
             assert!(
-                l.update(Some(Intercept), Intercept, 50.0, 0.3, -0.3, FAP_NM)
+                l.update(Some(Intercept), Intercept, 50.0, 0.3, -0.3, FAP_NM, 0.0)
                     .is_some(),
                 "stays latched climbing"
             );
             assert!(
-                l.update(Some(Intercept), Intercept, 900.0, 2.0, -2.0, FAP_NM)
+                l.update(Some(Intercept), Intercept, 900.0, 2.0, -2.0, FAP_NM, 0.0)
                     .is_some(),
                 "and stays latched repositioning"
             );
             assert!(
-                l.update(Some(Intercept), Intercept, 1600.0, 5.5, 5.5, FAP_NM)
+                l.update(Some(Intercept), Intercept, 1600.0, 5.5, 5.5, FAP_NM, 0.0)
                     .is_none(),
                 "released once established at the join point"
             );
@@ -4582,5 +4691,59 @@ mod tests {
         let tch = |aim: f64| aim + TOUCHDOWN_AIM_NM * GLIDEPATH_FT_PER_NM - 117.0;
         assert!(tch(121.0) < 65.0 && tch(121.0) > 45.0, "{}", tch(121.0));
         assert!(tch(160.0) > 90.0);
+    }
+}
+
+#[cfg(test)]
+mod glidepath_gain_tests {
+    use super::glidepath_gain_fpm_per_ft;
+
+    /// The glidepath correction closes an error over a fixed distance of
+    /// final: the 172's gain stands, a 737 at 170 kt gets 2.6x it, and a
+    /// 50 ft-high 737 over the numbers is answered with a real descent
+    /// (LFLL 35L, 2026-09-17: 86 fpm was the whole correction).
+    #[test]
+    fn glidepath_gain_scales_with_groundspeed() {
+        assert_eq!(glidepath_gain_fpm_per_ft(65.0), 1.2);
+        assert_eq!(
+            glidepath_gain_fpm_per_ft(40.0),
+            1.2,
+            "slow airframes keep the old law"
+        );
+        let jet = glidepath_gain_fpm_per_ft(170.0);
+        assert!((jet - 3.14).abs() < 0.02, "{jet}");
+        assert!(
+            (glidepath_gain_fpm_per_ft(400.0) - 3.6).abs() < 1e-9,
+            "capped"
+        );
+        assert!(
+            50.0 * jet > 150.0,
+            "50 ft high on a jet earns more than 150 fpm"
+        );
+    }
+}
+
+#[cfg(test)]
+mod approach_power_floor_tests {
+    use super::{approach_power_floor, ApproachPhase::*};
+
+    /// The 737 (thrust floor 0.3): on final at Vref the lever never goes
+    /// under 0.3; 20 kt fast it may idle; a piston with no floor idles; a
+    /// reposition under 500 ft is full power whatever the speed.
+    #[test]
+    fn the_lever_floor_follows_the_phase_and_the_airframe() {
+        assert_eq!(approach_power_floor(Final, 300.0, 0.0, Some(0.3)), 0.3);
+        assert_eq!(approach_power_floor(Final, 300.0, -6.0, Some(0.3)), 0.3);
+        assert_eq!(approach_power_floor(Final, 300.0, -20.0, Some(0.3)), 0.1);
+        assert_eq!(approach_power_floor(Final, 300.0, 0.0, None), 0.1);
+        assert_eq!(
+            approach_power_floor(Intercept, 140.0, -58.0, Some(0.3)),
+            1.0
+        );
+        assert_eq!(
+            approach_power_floor(Intercept, 1500.0, -58.0, Some(0.3)),
+            0.1
+        );
+        assert_eq!(approach_power_floor(Flare, 20.0, 0.0, Some(0.3)), 0.1);
     }
 }

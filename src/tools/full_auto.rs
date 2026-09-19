@@ -29,6 +29,10 @@ pub enum StartKind {
     Piston,
     Turboprop,
     Jet,
+    /// The aircraft's own scripted start behind the stock `auto_start`
+    /// command (`AircraftProfile::scripted_auto_start`): one press, the
+    /// aircraft's real switches, its own timing. The stock 737-800.
+    Scripted,
     /// A turbine airframe that declares NO start sequence — the Citation X,
     /// whose stock systems the MD-82's APU/bleed/cross-tie sequence does not
     /// fit. There is nothing to crank, so full auto says so instead of
@@ -48,12 +52,13 @@ pub enum StartKind {
 /// that was never going to catch. `piston` closes the other half of that hole:
 /// a turbine with no sequence declared is not a piston, it is an airframe we
 /// cannot start.
-pub fn start_kind(turboprop: bool, jet: bool, piston: bool) -> StartKind {
-    match (turboprop, jet, piston) {
-        (true, _, _) => StartKind::Turboprop,
-        (false, true, _) => StartKind::Jet,
-        (false, false, true) => StartKind::Piston,
-        (false, false, false) => StartKind::None,
+pub fn start_kind(turboprop: bool, jet: bool, piston: bool, scripted: bool) -> StartKind {
+    match (scripted, turboprop, jet, piston) {
+        (true, _, _, _) => StartKind::Scripted,
+        (false, true, _, _) => StartKind::Turboprop,
+        (false, false, true, _) => StartKind::Jet,
+        (false, false, false, true) => StartKind::Piston,
+        (false, false, false, false) => StartKind::None,
     }
 }
 
@@ -70,7 +75,9 @@ impl StartKind {
     /// aircraft" (Luton, 2026-07-27).
     pub fn engine_start_secs(self) -> f64 {
         match self {
-            StartKind::Jet => 300.0,
+            // The 737's script took 124 s from cold to both running; its
+            // fire tests and APU spin-up are inside that.
+            StartKind::Jet | StartKind::Scripted => 300.0,
             StartKind::Turboprop | StartKind::Piston | StartKind::None => 40.0,
         }
     }
@@ -100,6 +107,8 @@ pub struct FullAuto {
     /// auto piston-cranking an MD-82 ("cranking, the engine hasn't caught,
     /// check fuel and mixture") on an aircraft with neither, 2026-07-27.
     pub jet_start: bool,
+    /// The aircraft scripts its own start behind `sim/operation/auto_start`.
+    pub scripted_auto_start: bool,
     /// EVERY electrical system's ON command — the full bring-up run after the
     /// engine catches (generators AND bleed air, which feed the Twin Otter's
     /// autopilot). Empty on airframes with no electrical profile.
@@ -150,6 +159,8 @@ pub struct FullAuto {
     pub cfg: ApConfig,
     pub vr_kts: f64,
     pub vy_kts: f64,
+    /// Initial climb speed (see `autotakeoff::Params::initial_climb_kts`).
+    pub initial_climb_kts: f64,
     pub climb_fpm: f64,
     pub retract_gear: bool,
     pub approach_ias: f64,
@@ -253,6 +264,7 @@ impl Tool for FullAuto {
             self.turboprop_start.is_some(),
             self.jet_start,
             self.piston_engine,
+            self.scripted_auto_start,
         );
         let sub = crate::full_auto::SubTools {
             lights: crate::tools::lights::SetLights::new(self.lights.clone()),
@@ -267,14 +279,8 @@ impl Tool for FullAuto {
             // step. Getting this wrong is silent and total — the piston start
             // on a turbine cranks something that isn't there and reports
             // "check fuel and mixture" about levers the aircraft hasn't got.
-            start_engine: match (
-                start_kind(
-                    self.turboprop_start.is_some(),
-                    self.jet_start,
-                    self.piston_engine,
-                ),
-                &self.turboprop_start,
-            ) {
+            start_engine: match (kind, &self.turboprop_start) {
+                (StartKind::Scripted, _) => Box::new(crate::tools::jet_start::ScriptedAutoStart),
                 (StartKind::Turboprop, Some(ts)) => {
                     Box::new(crate::tools::cycle::StartTurbines::new(ts.clone()))
                 }
@@ -308,6 +314,7 @@ impl Tool for FullAuto {
                 cfg: self.cfg.clone(),
                 vr_kts: self.vr_kts,
                 vy_kts: self.vy_kts,
+                initial_climb_kts: self.initial_climb_kts,
                 climb_fpm: self.climb_fpm,
                 retract_gear: self.retract_gear,
                 takeoff_flap_ratio: self.takeoff_flap_ratio,
@@ -328,6 +335,7 @@ impl Tool for FullAuto {
                 cfg: self.cfg.clone(),
                 vr_kts: self.vr_kts,
                 vy_kts: self.vy_kts,
+                initial_climb_kts: self.initial_climb_kts,
                 climb_fpm: self.climb_fpm,
                 retract_gear: self.retract_gear,
                 takeoff_flap_ratio: self.takeoff_flap_ratio,
@@ -339,12 +347,7 @@ impl Tool for FullAuto {
             piston_mixture: self.piston_mixture,
             mission,
             power_up_first: self.power_up_first,
-            engine_start_secs: start_kind(
-                self.turboprop_start.is_some(),
-                self.jet_start,
-                self.piston_engine,
-            )
-            .engine_start_secs(),
+            engine_start_secs: kind.engine_start_secs(),
         };
         if !crate::full_auto::start(
             ctx.config.xplane_base_url.clone(),
@@ -682,12 +685,7 @@ impl FullAuto {
 
         // The GPS route payload — written by the orchestrator (only the
         // concrete client can set a byte-array dataref).
-        let fms_payload = fp
-            .waypoints
-            .iter()
-            .map(|w| format!("{},{:.4},{:.4},{}", w.ident, w.lat, w.lon, w.alt as i64))
-            .collect::<Vec<_>>()
-            .join("|");
+        let fms_payload = crate::simbrief::fms_route_payload(&fp.waypoints);
 
         // The arrival, briefed NOW: what the destination offers and what
         // full auto will do there. Found at the gate, it is a briefing item;
@@ -770,12 +768,15 @@ mod tests {
             // sequence fits it once the fuel goes in on N2 — so it starts
             // through the same path a PT6 does, not the MD-82's APU/bleed one.
             ("citation_x", StartKind::Turboprop),
+            // The stock 737 scripts its own start behind `auto_start`.
+            ("boeing_737_800", StartKind::Scripted),
         ] {
             let p = crate::aircraft::load(id).unwrap_or_else(|| panic!("{id} profile loads"));
             let got = start_kind(
                 p.turboprop_start.is_some(),
                 p.turbine_start,
                 p.engine || p.piston_start.is_some(),
+                p.scripted_auto_start,
             );
             assert_eq!(got, want, "{id}");
             // A jet has no piston engine group to fall back on, which is

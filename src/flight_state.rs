@@ -38,6 +38,11 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());
     crate::aircraft::publish_bus_volts(p.bus_volts_nominal);
     crate::aircraft::publish_speed_floor(p.vs_clean_kts);
+    crate::aircraft::publish_approach_floor(
+        p.reference.as_ref().and_then(|r| r.vs0_kts),
+        p.vs_clean_kts,
+    );
+    crate::aircraft::publish_approach_thrust_min(p.approach_thrust_min);
 }
 
 /// Every loop that can hold the aircraft, stopped. Aborts go through each
@@ -61,6 +66,10 @@ pub(crate) fn stand_down() {
     crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
     crate::tools::engine::LEAN_SEEKING.store(false, SeqCst);
     crate::pushback::ACTIVE.store(false, SeqCst);
+    // The arrival's hold on the station is a fact about a flight, not about
+    // the world: nothing is flying to that destination any more, so the
+    // region's ordinary nearest-field handoffs resume.
+    crate::full_auto::release_arrival_station();
 }
 
 #[cfg(test)]

@@ -673,6 +673,14 @@ const MAX_VACATE_STEPS: usize = 8;
 /// in the vacate.
 const VACATE_ON_RUNWAY_M: f64 = 60.0;
 
+/// The most a vacate may turn off the rollout heading to leave the runway.
+/// A right-angle turn-off is standard and a rapid exit is 30 to 45 degrees;
+/// past this the link is one built for the OTHER end of the strip and taking
+/// it means reversing on the runway (EGLL's N4W, 169 degrees off a 27L
+/// rollout, 2026-09-17). Deliberately the same generosity as
+/// [`AHEAD_OF_ABEAM_DEG`]: abeam is a turn, backwards is not.
+const VACATE_TURN_MAX_DEG: f64 = 100.0;
+
 /// The exit snap's distance bound — the same 3 km every other snap in this
 /// file caps at (`snap_within`, `runway_entrance_near`). Without it a stale
 /// clearance at one field planned a "vacate" toward a junction kilometres
@@ -1344,7 +1352,56 @@ impl TaxiNet {
             runway_nodes.insert(e.a);
             runway_nodes.insert(e.b);
         }
-        let exit = taxiway_nodes
+        // How a link is ranked against the zones it lies in. Shared by the
+        // turn-off test and the walk so both read the pavement the same way.
+        let zone_rank = |e: &TaxiEdge| -> u8 {
+            if e.zone_of.is_empty() {
+                0
+            } else if e.zone_of.iter().all(|z| zone.contains(z)) {
+                1
+            } else {
+                2
+            }
+        };
+        // The turn-off a junction actually offers this rollout: the best
+        // traversable taxiway leaving it that we can TURN ONTO, or `None`.
+        //
+        // A junction being ahead is not enough. A rapid-exit taxiway is
+        // angled toward the traffic it serves, so the ones built for the
+        // OTHER end of the strip leave the same junction pointing backwards.
+        // EGLL's N4W meets 27L eighty-four metres ahead and runs back
+        // east-north-east, 169 degrees off the landing direction: the vacate
+        // took it, drove the 737 up the runway, turned it around ON the strip
+        // and drove it back past its own touchdown point — 624 m of route and
+        // three minutes of occupancy with traffic inside a mile (2026-09-17).
+        // The turn-off that works is 220 m further on (N5W, 54 degrees off).
+        // More distance down a runway we are already rolling along is cheap;
+        // a reversal on it is not.
+        let turn_off = |id: i64, p: (f64, f64)| -> Option<(i64, (f64, f64), String, u8)> {
+            self.edges
+                .iter()
+                .filter(|e| !e.runway)
+                .filter_map(|e| {
+                    let nxt = if e.a == id {
+                        e.b
+                    } else if e.b == id && !e.oneway {
+                        e.a
+                    } else {
+                        return None;
+                    };
+                    let np = *self.nodes.get(&nxt)?;
+                    let brg = bearing_deg(p.0, p.1, np.0, np.1);
+                    if angle_diff_deg(brg, psi_true).abs() > VACATE_TURN_MAX_DEG {
+                        return None;
+                    }
+                    Some((nxt, np, e.name.clone(), zone_rank(e)))
+                })
+                .min_by(|x, y| {
+                    x.3.cmp(&y.3)
+                        .then_with(|| dist_m(here, y.1).total_cmp(&dist_m(here, x.1)))
+                })
+        };
+        let (exit, first) = taxiway_nodes
             .iter()
             .filter(|id| runway_nodes.is_empty() || runway_nodes.contains(id))
             .filter_map(|id| self.nodes.get(id).map(|&p| (*id, p)))
@@ -1352,8 +1409,13 @@ impl TaxiNet {
             // Bounded like every other snap in this file: a junction
             // kilometres away is another airport's, not our exit.
             .filter(|(_, p)| dist_m(here, *p) <= MAX_EXIT_SNAP_M)
+            // Only a junction we can leave. A field whose every turn-off is
+            // authored backwards yields no plan at all, and the caller falls
+            // through to the taxi-in from the runway — the same degradation
+            // the dead-end case makes, and better than the U-turn.
+            .filter_map(|(id, p)| turn_off(id, p).map(|s| (id, p, s)))
             .min_by(|x, y| dist_m(here, x.1).total_cmp(&dist_m(here, y.1)))
-            .map(|(id, _)| id)?;
+            .map(|(id, _, step)| (id, step))?;
 
         // Walk outward until `clear_m` past the exit, never along a runway
         // edge and never back through a node we have used. "Outward" is
@@ -1373,6 +1435,22 @@ impl TaxiNet {
         // A field whose zones swallow the apron would otherwise walk us to the
         // terminal; the vacate is the first hundred metres, not the taxi in.
         let mut left_zone = zone.is_empty();
+        // The first step is the turn-off this exit was CHOSEN for, not
+        // whatever lies furthest from the aircraft: at a junction offering
+        // both, "furthest" is the link angled back down the strip.
+        {
+            let (nxt, p, name, rank) = first;
+            let cur_p = *self.nodes.get(&exit)?;
+            if rank == 0 {
+                left_zone = true;
+            }
+            if left_zone {
+                clear_gone += dist_m(cur_p, p);
+            }
+            path_ids.push(nxt);
+            seen.insert(nxt);
+            names.push(name);
+        }
         while clear_gone < clear_m && names.len() < MAX_VACATE_STEPS {
             let cur = *path_ids.last()?;
             let cur_p = *self.nodes.get(&cur)?;
@@ -1399,16 +1477,9 @@ impl TaxiNet {
                     // runway as a way OUT and actively preferred driving
                     // across the other strip, with the metres counted as
                     // clearance (audit, 2026-08-02).
-                    let zone_rank: u8 = if e.zone_of.is_empty() {
-                        0
-                    } else if e.zone_of.iter().all(|z| zone.contains(z)) {
-                        1
-                    } else {
-                        2
-                    };
                     self.nodes
                         .get(&nxt)
-                        .map(|&p| (nxt, p, e.name.clone(), zone_rank))
+                        .map(|&p| (nxt, p, e.name.clone(), zone_rank(e)))
                 })
                 .min_by(|x, y| {
                     // Cleanest pavement first, then whichever gets us furthest
@@ -3912,6 +3983,68 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
             south.path[1].0 < lat,
             "a southbound rollout must exit south, got {:?}",
             south.path[1]
+        );
+    }
+
+    /// EGLL 27L, 2026-09-17. The nearest junction ahead was 84 m away and its
+    /// only link, N4W, ran back east-north-east — a rapid exit built for 09R
+    /// traffic, 169 degrees off our rollout. The vacate took it: up the
+    /// runway, a turn on the strip, and back east past the touchdown point,
+    /// 624 m of route and three minutes of occupancy with traffic inside a
+    /// mile. The turn-off that works, N5W at 54 degrees, was 220 m further
+    /// on. A junction is only an exit if you can turn onto what leaves it.
+    #[test]
+    fn a_vacate_refuses_an_exit_it_would_have_to_turn_back_to_take() {
+        let mut net = TaxiNet::default();
+        // Runway 09R/27L along a parallel of latitude; we roll WEST on 27L.
+        let m = |east_m: f64| -1.0 + east_m / (111_320.0 * 51.0_f64.to_radians().cos());
+        net.nodes.insert(1, (51.0, m(0.0)));
+        net.nodes.insert(2, (51.0, m(-300.0)));
+        net.nodes.insert(3, (51.0, m(-700.0)));
+        // Node 2's only turn-off is angled BACK east (the 09R rapid exit).
+        net.nodes.insert(12, (51.0009, m(-210.0)));
+        // Node 3 offers a proper forward turn-off, north-west.
+        net.nodes.insert(13, (51.0009, m(-790.0)));
+        net.nodes.insert(23, (51.0018, m(-790.0)));
+        let e = |a, b, name: &str, runway, zone: &[&str]| TaxiEdge {
+            a,
+            b,
+            name: name.into(),
+            runway,
+            oneway: false,
+            zone_of: zone.iter().map(|s| s.to_string()).collect(),
+        };
+        net.edges.push(e(1, 2, "09R/27L", true, &["09R", "27L"]));
+        net.edges.push(e(2, 3, "09R/27L", true, &["09R", "27L"]));
+        net.edges.push(e(2, 12, "N4W", false, &["09R", "27L"]));
+        net.edges.push(e(3, 13, "N5W", false, &["09R", "27L"]));
+        net.edges.push(e(13, 23, "Block 81", false, &[]));
+        let zone = ["27L".to_string(), "09R".to_string()];
+        // Stopped on the centreline, heading west, N4W's junction 300 m ahead
+        // and N5W's 700 m ahead.
+        let plan = net
+            .plan_vacate(51.0, m(0.0), 270.0, &zone, VACATE_CLEAR_M)
+            .expect("the further exit is still an exit");
+        assert!(
+            plan.seg.iter().all(|(n, _)| n != "N4W"),
+            "the backwards rapid exit must not be taken: {:?}",
+            plan.seg
+        );
+        assert_eq!(plan.exit_name, "Block 81", "walks out through N5W");
+        // And every step of it keeps going the way we were rolling: no point
+        // on the route may lie east of where the aircraft stopped.
+        let east_of_start = plan.path.iter().any(|p| p.1 > m(0.0) + 1e-9);
+        assert!(!east_of_start, "the route doubles back: {:?}", plan.path);
+
+        // A field where the ONLY turn-off is the backwards one yields no plan
+        // at all, and the caller taxis in from the runway — the same
+        // degradation the dead end makes, and better than a U-turn on it.
+        net.edges
+            .retain(|e| e.name != "N5W" && e.name != "Block 81");
+        assert!(
+            net.plan_vacate(51.0, m(0.0), 270.0, &zone, VACATE_CLEAR_M)
+                .is_none(),
+            "no exit is better than a reversal"
         );
     }
 
