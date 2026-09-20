@@ -47,6 +47,8 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::aircraft::publish_landing_distance(
         p.reference.as_ref().and_then(|r| r.landing_distance_ft),
     );
+    crate::procedure::publish_vs_limits(p.reference.as_ref());
+    crate::aircraft::publish_fuel_unit(p.fuel.as_ref());
 }
 
 /// Every loop that can hold the aircraft, stopped. Aborts go through each

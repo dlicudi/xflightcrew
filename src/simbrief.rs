@@ -7,14 +7,20 @@
 //! user hasn't generated a plan, or is offline, the caller reports that and the
 //! copilot carries on.
 //!
-//! Fuel is normalised to US gallons (the GA unit the rest of the app speaks), from
-//! whatever unit the plan was generated in (lbs or kg).
+//! Fuel is normalised to KILOGRAMS — the unit the sim's tanks are read in and
+//! the only one both ends of a comparison can share — from whatever unit the
+//! plan was generated in (lbs or kg). It is converted to the AIRFRAME's unit
+//! at the moment it is spoken ([`crate::aircraft::say_fuel_kg`]).
+//!
+//! It used to be normalised to US gallons, "the GA unit the rest of the app
+//! speaks", at AVGAS density. On a 737 that briefed kerosene 11.8% light and
+//! in a unit no airline crew uses: 3,126 kg in the tanks read back as "1,149
+//! gallons" while full auto's own preflight called the same fuel 6,891
+//! pounds (BIKF-EGPH, 2026-09-20).
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
-const AVGAS_LB_PER_GAL: f64 = 6.0;
-const AVGAS_KG_PER_GAL: f64 = 2.72;
 const LB_PER_KG: f64 = 2.204_62;
 
 /// Where a plan came from. A LOCAL plan (the direct-to planner) is the
@@ -43,7 +49,8 @@ pub fn local_plan() -> Option<FlightPlan> {
         .cloned()
 }
 
-/// The briefed essentials of a SimBrief OFP. Fuel figures are in US gallons.
+/// The briefed essentials of a SimBrief OFP. Fuel figures are in KILOGRAMS;
+/// speak them through [`crate::aircraft::say_fuel_kg`].
 #[derive(Clone)]
 pub struct FlightPlan {
     pub source: PlanSource,
@@ -54,9 +61,8 @@ pub struct FlightPlan {
     pub cruise_alt_ft: f64,
     pub distance_nm: f64,
     pub ete_min: f64,
-    pub block_fuel_gal: f64, // plan_ramp (total fuel loaded)
-    pub trip_fuel_gal: f64,  // enroute burn
-    pub reserve_gal: f64,
+    pub trip_fuel_kg: f64, // enroute burn
+    pub reserve_kg: f64,
     pub route: String,
     /// Average wind component, knots: negative = headwind, positive = tailwind.
     pub wind_comp_kts: f64,
@@ -67,8 +73,10 @@ pub struct FlightPlan {
     /// Enroute waypoints (named fixes + destination), for loading into the GPS/FMS.
     pub waypoints: Vec<Waypoint>,
     /// Block fuel in KILOGRAMS, the sim's own unit, straight from the plan's
-    /// figure and never through a fuel density: the gallon figures above go
-    /// through avgas density and are wrong by a third on a jet. 0 = unknown.
+    /// figure and never through a fuel density. It used to be the ONLY honest
+    /// fuel figure here — the spoken brief had its own set in avgas gallons,
+    /// wrong by 11.8% on a jet and in a unit no airline crew uses. They are
+    /// all kilos now and the airframe decides how they are said. 0 = unknown.
     pub block_fuel_kg: f64,
     /// The plan's MINIMUM takeoff fuel (trip + reserves, no extra), kg. Below
     /// this the departure is refused; between this and block it is a caution.
@@ -165,13 +173,6 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
         .unwrap_or("lbs")
         .to_ascii_lowercase();
     let in_kg = unit.starts_with("kg");
-    let to_gal = move |raw: f64| {
-        if in_kg {
-            raw / AVGAS_KG_PER_GAL
-        } else {
-            raw / AVGAS_LB_PER_GAL
-        }
-    };
     let to_kg = move |raw: f64| if in_kg { raw } else { raw / LB_PER_KG };
     let s = |path: &str| {
         v.pointer(path)
@@ -230,9 +231,8 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
             n("/general/air_distance")
         },
         ete_min: n("/times/est_time_enroute") / 60.0,
-        block_fuel_gal: to_gal(n("/fuel/plan_ramp")),
-        trip_fuel_gal: to_gal(n("/fuel/enroute_burn")),
-        reserve_gal: to_gal(n("/fuel/reserve")),
+        trip_fuel_kg: to_kg(n("/fuel/enroute_burn")),
+        reserve_kg: to_kg(n("/fuel/reserve")),
         route: s("/general/route"),
         wind_comp_kts: n("/general/avg_wind_comp"),
         wind_dir: n("/general/avg_wind_dir"),
@@ -278,10 +278,11 @@ impl FlightPlan {
         let h = (self.ete_min / 60.0).floor() as i32;
         let m = (self.ete_min % 60.0).round() as i32;
         // "0 hours 24 minutes" is a printf, not a brief (2026-09-15).
-        let ete = if h > 0 {
-            format!("{h} hours {m} minutes")
-        } else {
-            format!("{m} minutes")
+        // ...and "1 hours 48 minutes" is a printf too (2026-09-20).
+        let ete = match h {
+            0 => format!("{m} minutes"),
+            1 => format!("1 hour {m} minutes"),
+            _ => format!("{h} hours {m} minutes"),
         };
         let altn = if self.alternate.is_empty() {
             String::new()
@@ -295,9 +296,18 @@ impl FlightPlan {
         };
         format!(
             "Flight plan: {}{} to {}{}. Cruise {:.0} feet, {:.0} nautical miles, about {} enroute{}. \
-             Block fuel {:.0} gallons, {:.0} for the trip, {:.0} reserve.",
-            acft, self.origin, self.destination, altn, self.cruise_alt_ft, self.distance_nm,
-            ete, self.wind_phrase(), self.block_fuel_gal, self.trip_fuel_gal, self.reserve_gal,
+             Block fuel {}, {} for the trip, {} reserve.",
+            acft,
+            self.origin,
+            self.destination,
+            altn,
+            self.cruise_alt_ft,
+            self.distance_nm,
+            ete,
+            self.wind_phrase(),
+            crate::aircraft::say_fuel_kg(self.block_fuel_kg),
+            crate::aircraft::fuel_figure_kg(self.trip_fuel_kg),
+            crate::aircraft::fuel_figure_kg(self.reserve_kg),
         )
     }
 
@@ -515,6 +525,52 @@ mod tests {
             "the destination survives: {}",
             entries.last().unwrap()
         );
+    }
+
+    /// Nothing in the tree builds an FMS route entry by hand. The mailbox
+    /// rule — thin from the middle, cap at 511 — lives in
+    /// [`fms_route_payload`] and nowhere else, so a caller cannot reach the
+    /// plugin with a payload that has never met it.
+    ///
+    /// The resume path did exactly that: a byte-identical copy of the entry
+    /// format with no thinning and no cap, which overwrote full auto's fitted
+    /// payload the moment the pilot resumed (EIDW-BIKF, 2026-09-20 — 528
+    /// bytes cut to `BIKF,6`, and X-Plane refused the composed plan for an
+    /// "invalid destination airport: ELVUM"). One copy is a bug; the second
+    /// copy is this test's job.
+    #[test]
+    fn the_entry_format_lives_only_in_the_payload_builder() {
+        const ENTRY_FMT: &str = r#"{},{:.4},{:.4},{}"#;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        walk(&root, &mut files);
+        let mut offenders = Vec::new();
+        for f in &files {
+            if f.file_name().is_some_and(|n| n == "simbrief.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(f).unwrap();
+            for (i, line) in text.lines().enumerate() {
+                if line.contains(ENTRY_FMT) {
+                    offenders.push(format!("{}:{}", f.display(), i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "build the route payload with fms_route_payload, not by hand: {offenders:?}"
+        );
+        assert!(files.len() > 10, "the walk found the tree: {}", files.len());
     }
 
     /// A route that already fits is sent whole — every fix, in order.

@@ -98,9 +98,6 @@ pub(crate) async fn read1(live: Option<&LiveState>, xp: &XPlaneClient, name: &st
     xp.get_float(name).await
 }
 
-/// 100LL avgas ≈ 2.72 kg/gal (~6 lb/gal) — to report fuel in gallons.
-pub(crate) const AVGAS_KG_PER_GAL: f64 = 2.72;
-
 /// Pounds per kilogram — jet fuel flow/quantity is read in lb (airliner convention).
 pub(crate) const LB_PER_KG: f64 = 2.20462;
 
@@ -823,15 +820,15 @@ pub(crate) async fn power_loss_diagnosis(xp: &XPlaneClient, profile: &aircraft::
     let rpm = read_engine0(xp, "sim/cockpit2/engine/indicators/prop_speed_rpm")
         .await
         .unwrap_or(0.0);
-    let gph = flow_kg_s * 3600.0 / AVGAS_KG_PER_GAL;
+    let burn = crate::aircraft::say_fuel_flow_kg_hr(flow_kg_s * 3600.0);
     let mut line = if running {
         format!(
-            "Nothing obviously wrong. Engine's running at {rpm:.0} RPM, fuel flow {gph:.0} gallons an hour, throttle {:.0} percent",
+            "Nothing obviously wrong. Engine's running at {rpm:.0} RPM, fuel flow {burn}, throttle {:.0} percent",
             throttle * 100.0
         )
     } else {
         format!(
-            "Engine's stopped and the fuel and ignition look set. Fuel flow {gph:.1}, throttle {:.0} percent",
+            "Engine's stopped and the fuel and ignition look set. Fuel flow {burn}, throttle {:.0} percent",
             throttle * 100.0
         )
     };
@@ -1218,7 +1215,10 @@ pub(crate) async fn fuel_report(
     let Ok(total_kg) = read1(live, xp, datarefs::FUEL_TOTAL_KG).await else {
         return "I can't read the fuel right now — check the connection to X-Plane.".to_string();
     };
-    let gal = total_kg / AVGAS_KG_PER_GAL;
+    // The airframe's own unit and density, not the app's avgas gallons: on a
+    // 737 that rendered kerosene 11.8% light and in a unit no airline crew
+    // uses (2026-09-20).
+    let aboard = crate::aircraft::say_fuel_kg(total_kg);
 
     // Endurance: prefer the live burn (sum of per-engine fuel flow) when the
     // engines are running, since it reflects the actual power setting; fall back
@@ -1264,9 +1264,9 @@ pub(crate) async fn fuel_report(
     // An endurance question wants the *time* first; a plain fuel question leads
     // with the quantity and tacks the duration on.
     let mut line = if endurance_first && !dur.is_empty() {
-        format!("About {dur} of fuel {basis}, {gal:.0} gallons on board")
+        format!("About {dur} of fuel {basis}, {aboard} on board")
     } else {
-        let mut l = format!("{gal:.0} gallons on board");
+        let mut l = format!("{aboard} on board");
         if !dur.is_empty() {
             l.push_str(&format!(", about {dur} {basis}"));
         }
@@ -1275,9 +1275,14 @@ pub(crate) async fn fuel_report(
     // Per-tank balance, when the airframe has two tanks.
     if let Ok(tanks) = xp.get_float_array(datarefs::FUEL_PER_TANK_KG).await {
         if tanks.len() == 2 {
-            let (l, r) = (tanks[0] / AVGAS_KG_PER_GAL, tanks[1] / AVGAS_KG_PER_GAL);
+            let (l, r) = (
+                crate::aircraft::fuel_in_unit_kg(tanks[0]),
+                crate::aircraft::fuel_in_unit_kg(tanks[1]),
+            );
             line.push_str(&format!(". Left {l:.0}, right {r:.0}"));
-            if (l - r).abs() >= 5.0 {
+            // The imbalance threshold is in the SPOKEN unit, so it scales
+            // with it rather than meaning five gallons on every airframe.
+            if (l - r).abs() >= crate::aircraft::fuel_in_unit_kg(13.6) {
                 line.push_str(if l > r {
                     " — favor the right"
                 } else {
@@ -1317,7 +1322,7 @@ pub(crate) async fn fuel_report(
                     .as_ref()
                     .map(|f| f.reserve_caution_min)
                     .unwrap_or(45.0);
-                let at_dest_gal = at_dest_kg / AVGAS_KG_PER_GAL;
+                let at_dest = crate::aircraft::say_fuel_kg(at_dest_kg);
                 let verdict = if at_dest_kg <= 0.0 {
                     "that doesn't reach the destination — plan a fuel stop".to_string()
                 } else if mins_left >= reserve + 15.0 {
@@ -1328,9 +1333,7 @@ pub(crate) async fn fuel_report(
                     format!("below your {reserve:.0}-minute reserve — think about a stop short")
                 };
                 if at_dest_kg > 0.0 {
-                    line.push_str(&format!(
-                        ". Should land with about {at_dest_gal:.0} gallons, {verdict}"
-                    ));
+                    line.push_str(&format!(". Should land with about {at_dest}, {verdict}"));
                 } else {
                     line.push_str(&format!(". At this burn, {verdict}"));
                 }
@@ -1832,8 +1835,8 @@ pub(crate) async fn answer_state_query(
                 read_engine0(xp, "sim/cockpit2/engine/indicators/fuel_flow_kg_sec").await
             {
                 bits.push(format!(
-                    "fuel flow {:.1} gallons an hour",
-                    v * 3600.0 / AVGAS_KG_PER_GAL
+                    "fuel flow {}",
+                    crate::aircraft::say_fuel_flow_kg_hr(v * 3600.0)
                 ));
             }
             parts.push(bits.join(", "));
@@ -1919,8 +1922,8 @@ pub(crate) async fn answer_state_query(
                 ));
             } else {
                 parts.push(format!(
-                    "fuel flow {:.1} gallons an hour",
-                    v * 3600.0 / AVGAS_KG_PER_GAL
+                    "fuel flow {}",
+                    crate::aircraft::say_fuel_flow_kg_hr(v * 3600.0)
                 ));
             }
         }

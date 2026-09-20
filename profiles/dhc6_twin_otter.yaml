@@ -156,6 +156,10 @@ fuel:
   reserve_caution_min: 45.0
   reserve_warning_min: 30.0
   cruise_burn_kg_hr: 270.0
+  # Jet A-1, not the 100LL the shared default assumes: that briefed the
+  # 737's fuel 11.8% light and in a unit no crew uses (2026-09-20).
+  kg_per_gal: 3.04
+  spoken_unit: lb
 
 # Clean stall (KIAS) — modeled acf_Vs.
 vs_clean_kts: 60.0
@@ -168,6 +172,11 @@ vne_kts: 202.0
 # add-on's own W&B page (3363 kg).
 reference:
   kind: twin-engine turboprop
+  # Turboprop: climbs to cruise and stays, so no step-climb advisory.
+  # Enroute vertical rates: the shared 700 fpm is a GA number and a ~1 degree
+  # path at these speeds. VERIFY.
+  enroute_climb_fpm: 1000.0
+  enroute_descent_fpm: 1000.0
   vno_kts: 160.0           # max structural cruise (acf_Vno)
   vx_kts: 87.0             # best angle of climb
   vy_kts: 100.0            # best rate of climb
@@ -186,6 +195,16 @@ reference:
 # Flaps: the lever drives the stock flap handle (the cockpit selector just
 # follows flap1_deploy_ratio for animation). Modeled detents 0/10/20/30/40
 # degrees; Vfe 105 KIAS for the first notch (acf_Vfe1), 95 beyond (acf_Vfem).
+# --- Jet/turboprop figures, added 2026-09-20 after the 737 shakedown. Every
+# law below defaults to a Cessna 172's number when a profile is silent, and on
+# BIKF-EGPH that flew an airliner on a 0.8 nm capture radius, a 700 fpm
+# descent, a 0.10 nose-down limit and avgas density. VERIFY each against the
+# POM/FCOM; they are reasoned from the type, not measured on it.
+# Nose-DOWN elevator the rotation law may command. The shared default is
+# 0.10, which on a jet is not authority at all: the 737 was commanded 8
+# degrees and flew 22.4 with the law pinned at its limit. VERIFY.
+pitch_authority_down: 0.25
+
 flaps:
   takeoff_ratio: 0.25   # 10 degrees — the Twin Otter's STOL takeoff flap
   detents:

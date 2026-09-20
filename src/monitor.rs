@@ -117,6 +117,14 @@ pub struct Snapshot {
     /// Minutes of fuel remaining at the current burn (total fuel ÷ fuel flow).
     /// `None` when it can't be computed (no fuel/flow read, or flow ≈ 0).
     pub endurance_min: Option<f64>,
+    /// The region's wind profile, re-read on its own slow clock. The step-climb
+    /// advisory names the wind at the level it suggests: whether the climb is
+    /// free is the whole decision, and on EIDW-BIKF it was (one knot).
+    pub winds_aloft: Option<crate::weather::WindsAloft>,
+    /// All-up weight, kg (`None` if the read failed). The step-climb advisory
+    /// reads it: the altitude a jet flies best at is a function of weight, so
+    /// without it there is no optimum to compare against.
+    pub all_up_kg: Option<f64>,
     /// Total fuel aboard, kg. `None` if the read failed. Used by the ground
     /// check, which estimates endurance from a nominal cruise burn instead of
     /// the (near-zero) idle burn.
@@ -368,6 +376,13 @@ impl Snapshot {
             .get_float("sim/flightmodel/weight/m_fuel_total")
             .await
             .ok();
+        let all_up_kg = xp
+            .get_float(sim::datarefs::TOTAL_WEIGHT_KG)
+            .await
+            .ok()
+            .filter(|w| w.is_finite() && *w > 0.0);
+        // Cached inside the reader on its own slow clock — see `winds_aloft`.
+        let winds_aloft = crate::weather::winds_aloft(xp).await;
         let fuel_flow_kg_sec = xp
             .get_float_array("sim/cockpit2/engine/indicators/fuel_flow_kg_sec")
             .await
@@ -476,6 +491,8 @@ impl Snapshot {
             gyro_drift_deg,
             endurance_min,
             fuel_kg,
+            all_up_kg,
+            winds_aloft,
             fuel_flow_kg_sec,
             oil_pressure_psi,
             oil_temp_f,
@@ -1454,6 +1471,78 @@ impl Check for AltimeterSetting {
     }
 }
 
+/// Cruising further below the optimum altitude than a step is worth saying.
+///
+/// The altitude a jet flies best at rises as fuel burns off — roughly a level
+/// an hour on a narrowbody — and the plan picks ONE level before departure and
+/// holds it to the destination. On a long sector that is a slow, silent fuel
+/// leak: EIDW-BIKF (2026-09-20) planned FL340, and by mid-Atlantic at 62.9 t
+/// the optimum was 38,600 — 4,600 ft up, with the jet stream core so flat
+/// across FL300-FL390 that the climb would have cost one knot of headwind.
+///
+/// Advisory, and advisory ONLY. A level change belongs to ATC: the copilot
+/// says what it would ask for and the pilot asks. There is no `fix_write`
+/// here on purpose, and it is `Advisory` not `Caution` because nothing is
+/// wrong — this is money, not safety.
+struct StepClimb {
+    reference: crate::aircraft::ReferenceProfile,
+}
+
+impl StepClimb {
+    /// The level to ask for, and the optimum it is chasing. `None` unless we
+    /// are actually IN level cruise on an airframe that declares an optimum:
+    /// a climb or descent is already going somewhere, and advising a step in
+    /// the middle of one is noise.
+    fn wanted(&self, s: &Snapshot) -> Option<(f64, f64)> {
+        if s.phase != Phase::Cruise || s.on_ground || s.vsi_fpm.abs() > 300.0 {
+            return None;
+        }
+        let optimum = crate::aircraft::optimum_altitude_ft(&self.reference, s.all_up_kg?)?;
+        crate::aircraft::step_climb_ft(s.alt_ft, optimum).map(|step| (step, optimum))
+    }
+}
+
+impl Check for StepClimb {
+    fn id(&self) -> &'static str {
+        "step_climb"
+    }
+    fn severity(&self) -> Severity {
+        Severity::Advisory
+    }
+    fn eval(&self, s: &Snapshot) -> Option<String> {
+        let (step, optimum) = self.wanted(s)?;
+        // What the wind does up there is the whole decision, so say it when we
+        // know: a step into a stronger headwind can cost more than the
+        // altitude saves, and a step into the SAME wind is free money. On
+        // EIDW-BIKF the jet stream was flat across the band and the climb was
+        // worth one knot, which nobody had because nobody looked.
+        let wind = s.winds_aloft.as_ref().and_then(|w| {
+            let (here, there) = (w.at_ft(s.alt_ft)?, w.at_ft(step)?);
+            let change = there.1 - here.1;
+            Some(if change.abs() < 5.0 {
+                " The wind up there is much the same.".to_string()
+            } else if change < 0.0 {
+                format!(" The wind eases {:.0} knots up there.", -change)
+            } else {
+                format!(" It's {:.0} knots windier up there.", change)
+            })
+        });
+        Some(format!(
+            "We're {} feet below optimum at this weight. Flight level {} would burn less if \
+             you can get it.{}",
+            crate::auto_status::commas(((optimum - s.alt_ft) / 100.0).round() as i64 * 100),
+            crate::circuit::spell_runway(&format!("{:03}", (step / 100.0).round() as i64)),
+            wind.unwrap_or_default(),
+        ))
+    }
+    /// Cruise altitude wanders a little under the AP and the weight falls
+    /// steadily; a long sustain keeps this to one considered word rather than
+    /// a nag at the threshold.
+    fn min_duration(&self) -> Duration {
+        Duration::from_secs(120)
+    }
+}
+
 fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
     let mut checks: Vec<Box<dyn Check>> = vec![
         // Universal: every airframe can roll with the brake set.
@@ -1471,6 +1560,13 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             transition_altitude_ft: profile.transition_altitude_ft,
         }),
     ];
+    // Step climb: only on an airframe whose profile declares an optimum
+    // altitude, which is jets. A piston goes as high as it can and stays.
+    if let Some(r) = profile.reference.clone() {
+        if r.optimum_alt_ft.is_some() {
+            checks.push(Box::new(StepClimb { reference: r }));
+        }
+    }
 
     // Phase-expectation advisor rows from the profile's SOP table.
     for (index, item) in profile.advisor.iter().enumerate() {
@@ -3592,6 +3688,8 @@ mod tests {
             endurance_min: None,
             fuel_flow_kg_sec: None,
             fuel_kg: None,
+            all_up_kg: None,
+            winds_aloft: None,
             oil_pressure_psi: None,
             oil_temp_f: None,
             cht_f: None,
@@ -3634,6 +3732,130 @@ mod tests {
         s.qnh_pa = Some(101_946.0);
         s.automation_flying = automation_flying;
         s
+    }
+
+    /// The 737 mid-Atlantic on EIDW-BIKF (2026-09-20): FL340, 62.9 tonnes,
+    /// level, an optimum of 38,600 four and a half thousand feet overhead,
+    /// and not one word said about it for the whole crossing.
+    fn mid_atlantic_737(weight_kg: f64, alt_ft: f64) -> Snapshot {
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        s.phase = Phase::Cruise;
+        s.vsi_fpm = 40.0;
+        s.alt_ft = alt_ft;
+        s.all_up_kg = Some(weight_kg);
+        s
+    }
+
+    fn jet_reference() -> crate::aircraft::ReferenceProfile {
+        let mut r = crate::aircraft::ReferenceProfile::default();
+        r.optimum_alt_ft = Some(38_000.0);
+        r.optimum_alt_at_kg = Some(65_000.0);
+        r.optimum_alt_ft_per_1000kg = Some(290.0);
+        r
+    }
+
+    #[test]
+    fn the_step_climb_is_offered_once_the_weight_has_earned_it() {
+        let c = StepClimb {
+            reference: jet_reference(),
+        };
+        let said = c
+            .eval(&mid_atlantic_737(62_935.0, 34_000.0))
+            .expect("4,600 ft below optimum is worth a word");
+        assert!(said.contains("below optimum"), "{said}");
+        assert!(
+            said.contains("three six zero"),
+            "one step, not four: {said}"
+        );
+        assert!(said.contains("4,600"), "it names the gap it found: {said}");
+        // With no wind profile there is simply no wind clause, never a guess.
+        assert!(!said.contains("wind"), "nothing invented: {said}");
+        // Heavy off the blocks: optimum is BELOW us, nothing to offer.
+        assert_eq!(c.eval(&mid_atlantic_737(79_000.0, 34_000.0)), None);
+        // Already at optimum: silent.
+        assert_eq!(c.eval(&mid_atlantic_737(62_935.0, 38_000.0)), None);
+        // Inside one step of it: still silent, because there is no step to ask
+        // for that would not overshoot.
+        assert_eq!(c.eval(&mid_atlantic_737(62_935.0, 37_000.0)), None);
+    }
+
+    #[test]
+    fn the_step_climb_never_speaks_outside_level_cruise() {
+        let c = StepClimb {
+            reference: jet_reference(),
+        };
+        let climbing = Snapshot {
+            vsi_fpm: 1800.0,
+            ..mid_atlantic_737(62_935.0, 34_000.0)
+        };
+        assert_eq!(c.eval(&climbing), None, "already going somewhere");
+        let approaching = Snapshot {
+            phase: Phase::Approach,
+            ..mid_atlantic_737(62_935.0, 34_000.0)
+        };
+        assert_eq!(c.eval(&approaching), None, "not a cruise problem any more");
+        // No weight read is no optimum: it says nothing rather than guessing.
+        let blind = Snapshot {
+            all_up_kg: None,
+            ..mid_atlantic_737(62_935.0, 34_000.0)
+        };
+        assert_eq!(c.eval(&blind), None);
+        // And it never actuates: a level belongs to ATC.
+        assert_eq!(
+            c.fix_write(&mid_atlantic_737(62_935.0, 34_000.0)),
+            None,
+            "the copilot asks, it does not climb"
+        );
+    }
+
+    /// The climb is only worth taking if the wind up there allows it, so the
+    /// advisory says which it is. EIDW-BIKF's jet stream was flat across the
+    /// band — the fact that made the climb free.
+    #[test]
+    fn the_step_climb_says_what_the_wind_does_up_there() {
+        let c = StepClimb {
+            reference: jet_reference(),
+        };
+        let with = |w: crate::weather::WindsAloft| {
+            let mut s = mid_atlantic_737(62_935.0, 34_000.0);
+            s.winds_aloft = Some(w);
+            c.eval(&s).expect("still below optimum")
+        };
+        // Flat core: FL340 and FL360 within a knot or two of each other.
+        let flat = crate::weather::WindsAloft::from_layers(
+            &[9160.2, 10362.9, 11887.2],
+            &[50.88, 61.16, 57.40],
+            &[280.9, 278.9, 284.9],
+        )
+        .expect("layers");
+        let said = with(flat);
+        assert!(said.contains("much the same"), "{said}");
+        // A profile that strengthens sharply with height must say so, because
+        // then the step is NOT free and the pilot should weigh it.
+        let shear = crate::weather::WindsAloft::from_layers(
+            &[9000.0, 12000.0],
+            &[20.0, 80.0],
+            &[280.0, 280.0],
+        )
+        .expect("layers");
+        let said = with(shear);
+        assert!(said.contains("windier"), "{said}");
+    }
+
+    /// A piston declares no optimum, so the check is never even built for it.
+    #[test]
+    fn a_piston_is_never_given_a_step_climb_check() {
+        let c172 = crate::aircraft::builtin("cessna_172sp").expect("the 172");
+        let r = c172
+            .reference
+            .clone()
+            .expect("the 172 has reference figures");
+        assert_eq!(r.optimum_alt_ft, None);
+        assert!(
+            !build_checks(&c172).iter().any(|c| c.id() == "step_climb"),
+            "no optimum declared, no advisory built"
+        );
     }
 
     #[test]

@@ -62,10 +62,24 @@ const HDG_STATUS: &str = "sim/cockpit2/autopilot/heading_status";
 
 const M_TO_FT: f64 = 3.280_84;
 
-/// A leg's fix counts as reached inside this radius (a flyby simplification —
-/// we don't fly RF arcs or exact fly-over turns yet). 0.8 nm keeps the corridor
-/// tight without a light aircraft overshooting a sharp turn.
+/// The FLOOR on a leg's capture radius (a flyby simplification — we don't fly
+/// RF arcs or exact fly-over turns yet). 0.8 nm keeps the corridor tight
+/// without a light aircraft overshooting a sharp turn, and it is still the
+/// whole answer for a GA airframe, whose turn anticipation never reaches it.
+///
+/// It was the ONLY answer until 2026-09-20, and a jet cannot fly to it: a fix
+/// inside the aircraft's own turn circle is unreachable, so the follower
+/// turned, missed, and orbited. EIDW-BIKF in the 737 — departure fixes 1.1,
+/// 2.9 and 3.9 nm apart against a 2.5 nm turn radius at 250 kt — banked 25°
+/// for minutes on end while the distance to the fix GREW (4.5, 6.7, 7.6 nm),
+/// stalled three times and stood the follower down twice, once under full
+/// auto and again after the pilot resumed. See [`capture_radius_nm`].
 const CAPTURE_NM: f64 = 0.8;
+/// The bank an enroute turn is flown at. Measured at 25° on the 737's climb
+/// turns; assuming SHALLOWER is the safe direction, because a shallower bank
+/// means a bigger radius, which starts the turn earlier — and erring early
+/// cuts a corner, while erring late orbits the fix forever.
+const ENROUTE_BANK_DEG: f64 = 20.0;
 /// A to-altitude leg (CA/VA/FA) is satisfied within this of its target.
 const ALT_MARGIN_FT: f64 = 150.0;
 
@@ -290,11 +304,13 @@ pub enum EndAction {
         apt_dat: String,
         cfg: ApConfig,
         approach_ias: f64,
-        /// The approach's runway END ("12"), handed to autoland as its forced
-        /// runway. `None` let autoland self-pick by track, and at a field
-        /// with parallels that put the ILS 12 arrival on 13 against a
-        /// clearance for 12 (LEMG, 2026-09-12).
-        rwy_id: Option<String>,
+        /// The approach's runway END and the AIRPORT it belongs to, handed to
+        /// autoland as its forced runway. `None` lets autoland self-pick by
+        /// track, and at a field with parallels that put the ILS 12 arrival
+        /// on 13 against a clearance for 12 (LEMG, 2026-09-12). The airport
+        /// travels with it because an ident alone resolves by proximity, and
+        /// on the EGPH arrival that found EGPJ (2026-09-20).
+        rwy_id: Option<crate::autoland::PlannedRunway>,
     },
     /// Departure/arrival that ends in the enroute structure: level at the last
     /// constraint and hand back to the pilot.
@@ -339,13 +355,65 @@ pub fn bearing_to_fix(lat: f64, lon: f64, leg: &ProcLeg) -> Option<f64> {
         .map(|f| crate::nav::bearing_deg(lat, lon, f.lat, f.lon))
 }
 
-/// Has the current leg been flown? A fix leg completes inside [`CAPTURE_NM`]; a
-/// to-altitude leg completes when the altitude constraint is satisfied. Pure and
-/// position-based, so sequencing is immune to how slow the AP's turns are (the
-/// same lesson that drove the circuit off timers).
-pub fn leg_captured(leg: &ProcLeg, dist_to_fix_nm: Option<f64>, alt_ft: f64) -> bool {
+/// The turn radius an enroute turn is actually flown at, nautical miles:
+/// v²/(g·tan φ) at [`ENROUTE_BANK_DEG`].
+///
+/// NOT [`crate::circuit::turn_radius_at`], whose 250..2500 m clamp is a
+/// PATTERN bound — 2500 m is 1.35 nm, which is already less than this
+/// airframe's real radius at climb speed and a ninth of it at cruise. A clamp
+/// that exists to keep a light aircraft's circuit geometry sane must not be
+/// the thing that decides whether an airliner can reach its next fix.
+pub fn enroute_turn_radius_nm(gs_kts: f64) -> f64 {
+    let v = gs_kts.max(40.0) * 0.514_444;
+    v * v / (9.81 * ENROUTE_BANK_DEG.to_radians().tan()) / 1852.0
+}
+
+/// Turn anticipation: how far before the fix the turn onto the next leg has to
+/// begin, which is therefore how far out the leg counts as flown.
+///
+/// `R·tan(θ/2)` — the standard fly-by geometry, the distance at which a circle
+/// of radius `R` is tangent to both legs — floored at [`CAPTURE_NM`] and
+/// capped at `R` so a near-reversal can't ask for an unbounded lead.
+///
+/// The shape is what makes it right on both airframes: a 172 at 100 knots has
+/// a 0.4 nm radius, so even a 90° turn asks for less than the floor and its
+/// behaviour is unchanged; a 737 at cruise has an 8 nm radius but a 10° track
+/// change, which also lands under the floor. It only bites where it must —
+/// a big radius AND a real turn, which is exactly the jet departure that
+/// orbited.
+pub fn capture_radius_nm(gs_kts: f64, turn_deg: f64) -> f64 {
+    let r = enroute_turn_radius_nm(gs_kts);
+    let half = (turn_deg.abs().min(175.0) / 2.0).to_radians();
+    (r * half.tan()).clamp(CAPTURE_NM, r.max(CAPTURE_NM))
+}
+
+/// The track change at this leg's fix: the bearing we are flying INTO it
+/// against the bearing from it on to the next leg's fix, signed right-positive.
+/// `None` when either end has no fix to measure between — a to-altitude leg,
+/// an unresolved fix, or the last leg of the route, none of which are turns
+/// this anticipates.
+pub fn leg_turn_deg(lat: f64, lon: f64, leg: &ProcLeg, next: Option<&ProcLeg>) -> Option<f64> {
+    let here = leg.fix.as_ref()?;
+    let there = next?.fix.as_ref()?;
+    let inbound = crate::nav::bearing_deg(lat, lon, here.lat, here.lon);
+    let outbound = crate::nav::bearing_deg(here.lat, here.lon, there.lat, there.lon);
+    Some(((outbound - inbound + 540.0).rem_euclid(360.0)) - 180.0)
+}
+
+/// Has the current leg been flown? A fix leg completes inside `capture_nm`
+/// (see [`capture_radius_nm`] — the turn onto the next leg has to START
+/// there, so that IS the fix being reached); a to-altitude leg completes when
+/// the altitude constraint is satisfied. Pure and position-based, so
+/// sequencing is immune to how slow the AP's turns are (the same lesson that
+/// drove the circuit off timers).
+pub fn leg_captured(
+    leg: &ProcLeg,
+    dist_to_fix_nm: Option<f64>,
+    alt_ft: f64,
+    capture_nm: f64,
+) -> bool {
     match dist_to_fix_nm {
-        Some(d) => d <= CAPTURE_NM,
+        Some(d) => d <= capture_nm.max(CAPTURE_NM),
         // No fix: a to-altitude leg. '+' climb to at-or-above, '-' descend to
         // at-or-below, otherwise cross at the altitude.
         None => match leg.alt1_ft {
@@ -476,14 +544,45 @@ pub fn look_ahead_points(
         .collect()
 }
 
-/// The descent rate the VS law flies, fpm (its clamp).
-const DESCENT_FPM: f64 = 700.0;
+/// The GA vertical rate, fpm, and the default for any airframe whose profile
+/// declares nothing — the figure this law flew on every airframe until
+/// 2026-09-20.
+const GA_VS_FPM: f64 = 700.0;
+
+/// The enroute climb and descent rates for the LIVE airframe, republished on
+/// every profile swap by [`crate::flight_state::publish_airframe`] — a
+/// process-wide fact must never outlive its airframe.
+static CLIMB_FPM: std::sync::Mutex<f64> = std::sync::Mutex::new(GA_VS_FPM);
+static DESCENT_FPM: std::sync::Mutex<f64> = std::sync::Mutex::new(GA_VS_FPM);
+
+/// Publish the airframe's enroute vertical rates. Called on EVERY swap, with
+/// the GA figure when the profile is silent, so the last aircraft's rates can
+/// never be pointed at the next one.
+pub fn publish_vs_limits(r: Option<&crate::aircraft::ReferenceProfile>) {
+    let pick = |v: Option<f64>| v.filter(|f| f.is_finite() && *f > 0.0).unwrap_or(GA_VS_FPM);
+    *CLIMB_FPM.lock().unwrap_or_else(|e| e.into_inner()) =
+        pick(r.and_then(|r| r.enroute_climb_fpm));
+    *DESCENT_FPM.lock().unwrap_or_else(|e| e.into_inner()) =
+        pick(r.and_then(|r| r.enroute_descent_fpm));
+}
+
+/// The live airframe's enroute climb rate, fpm.
+pub fn climb_fpm() -> f64 {
+    *CLIMB_FPM.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The live airframe's enroute descent rate, fpm (magnitude). This both caps
+/// the commanded rate and places the top of descent, so the two can never
+/// disagree: the TOD is put exactly where this rate makes the constraint.
+pub fn descent_fpm() -> f64 {
+    *DESCENT_FPM.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The rate the follower's vertical law will actually fly, fpm (magnitude):
 /// what a readback must promise when the follower owns the altitude, whatever
 /// rate the pilot asked for.
 pub fn vs_clamp_fpm() -> f64 {
-    DESCENT_FPM
+    descent_fpm()
 }
 /// Start down this far before the computed top of descent, nm.
 const TOD_LEAD_NM: f64 = 1.0;
@@ -502,11 +601,12 @@ pub fn descent_target_ft(
     alt_ft: f64,
     dist_nm: Option<f64>,
     gs_kts: f64,
+    descent_fpm: f64,
 ) -> f64 {
     let Some(dist_nm) = dist_nm else {
         return leg_alt;
     };
-    let Some(tod_nm) = descent_point_nm(leg_alt, alt_ft, gs_kts) else {
+    let Some(tod_nm) = descent_point_nm(leg_alt, alt_ft, gs_kts, descent_fpm) else {
         return leg_alt;
     };
     if dist_nm <= tod_nm {
@@ -523,12 +623,12 @@ pub fn descent_target_ft(
 /// the VS law flies and the groundspeed we have, plus the lead. `None` when
 /// there is no descent to pace (the constraint is not more than 100 ft below
 /// us). The one formula behind [`descent_target_ft`] and [`planned_tod`].
-pub fn descent_point_nm(leg_alt: f64, alt_ft: f64, gs_kts: f64) -> Option<f64> {
+pub fn descent_point_nm(leg_alt: f64, alt_ft: f64, gs_kts: f64, descent_fpm: f64) -> Option<f64> {
     let drop_ft = alt_ft - leg_alt;
     if drop_ft <= 100.0 {
         return None;
     }
-    Some(drop_ft / DESCENT_FPM * (gs_kts.max(60.0) / 60.0) + TOD_LEAD_NM)
+    Some(drop_ft / descent_fpm.max(1.0) * (gs_kts.max(60.0) / 60.0) + TOD_LEAD_NM)
 }
 
 /// One tick of the follower's vertical bookkeeping, pure so every rule below
@@ -572,9 +672,10 @@ pub fn vertical_tick(
     gs_kts: f64,
     pilot: Option<f64>,
     terrain_floor: Option<f64>,
+    descent_fpm: f64,
 ) -> Vertical {
     let leg_alt = commanded_alt_ft(leg, carry);
-    let mut want_alt = descent_target_ft(leg_alt, prev_cmd, alt_ft, dist_nm, gs_kts);
+    let mut want_alt = descent_target_ft(leg_alt, prev_cmd, alt_ft, dist_nm, gs_kts, descent_fpm);
     let from_pilot = pilot.is_some();
     if let Some(p) = pilot {
         want_alt = p;
@@ -964,7 +1065,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         xp.get_float(PSI_TRUE),
         xp.get_float(ALT_IND_FT),
     );
-    let Some([mag_var, psi_seed, mut carry_alt]) = measurements("procedure", [var, psi, alt])
+    let Some([mut mag_var, psi_seed, mut carry_alt]) = measurements("procedure", [var, psi, alt])
     else {
         stand_down(
             &voice,
@@ -1011,6 +1112,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
     // law below) owns altitude; the governor owns speed. Released at every exit
     // so autoland/the arrival own the throttle alone.
     if let Some(kts) = power_hold_target(&end, cruise_ias_kts) {
+        // No altitude here to cap against — the first tick below has one and
+        // corrects it within a fifth of a second, which is why the cap lives
+        // there and not in this arm.
         crate::tools::speedhold::arm_flight(base_url.clone(), voice.clone(), kts);
         let event = if matches!(end, EndAction::Enroute) {
             "cruise_power"
@@ -1051,7 +1155,21 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             continue;
         }
 
-        let (lat, lon, elev_m, alt_ind, psi_r, hpath_r, agl_m, vs_st, hdg_st, ias_r, gs_r, phi_r) = tokio::join!(
+        let (
+            lat,
+            lon,
+            elev_m,
+            alt_ind,
+            psi_r,
+            hpath_r,
+            agl_m,
+            vs_st,
+            hdg_st,
+            ias_r,
+            gs_r,
+            phi_r,
+            var_r,
+        ) = tokio::join!(
             xp.get_float(LAT),
             xp.get_float(LON),
             xp.get_float(ELEV_M),
@@ -1064,6 +1182,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             xp.get_float(IAS),
             xp.get_float(GS_MS),
             xp.get_float(crate::datarefs::BANK_DEG),
+            xp.get_float(MAG_VAR),
         );
         let now = std::time::Instant::now();
         let dt = now.duration_since(tick_clock).as_secs_f64();
@@ -1081,6 +1200,42 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         progress_s += dt;
         let true_alt_ft = elev_m * M_TO_FT;
         let agl_ft = agl_m * M_TO_FT;
+        // The magnetic variation HERE, not at the departure airport. It is a
+        // fact of the PLACE, and this loop crosses enough of the world to
+        // change it: read once at Keflavik and carried to Scotland, it was
+        // 11.4 degrees stale, so every heading the follower wrote was 11.4
+        // degrees off the nose. The roll-out capture that is supposed to end
+        // a turn ("bug on the nose") instead commanded a standing 11 degree
+        // error, the AP held 25 degrees of bank for 95 seconds and went round
+        // 160 degrees, and the arrival's intercept could not close either
+        // (BIKF-EGPH, 2026-09-20). A stale reading kept, rather than the
+        // tick skipped: a lost read is no reason to throw away the last good
+        // variation, which is right to a fraction of a degree a minute later.
+        if let Ok(v) = var_r {
+            if v.is_finite() {
+                mag_var = v;
+            }
+        }
+        // The 250 below 10,000 limit, applied as we CLIMB THROUGH it rather
+        // than once at the arm. The cruise target is armed at a thousand feet
+        // on departure and would otherwise be held all the way up — which is
+        // exactly how a 255 kt cruise speed became a speed bust for the whole
+        // climb (2026-09-20). Re-armed only when the cap actually changes;
+        // `arm_flight` is idempotent and a running hold just takes the new
+        // number, so this costs nothing per tick.
+        if let Some(planned) = power_hold_target(&end, cruise_ias_kts) {
+            let want = crate::tools::speedhold::airspace_limited(alt_ft, planned);
+            if crate::tools::speedhold::flight_target().is_some_and(|t| (t - want).abs() > 0.5) {
+                crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({
+                        "event": "speed_limit", "alt_ft": alt_ft,
+                        "planned": planned, "target": want,
+                    }),
+                );
+                crate::tools::speedhold::arm_flight(base_url.clone(), voice.clone(), want);
+            }
+        }
 
         let leg = &legs[idx];
 
@@ -1119,13 +1274,22 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             crate::nav::haversine_nm(lat, lon, f.lat, f.lon)
         });
         publish_fix_dist(dist_nm);
+        // How far out this fix counts as reached: the turn onto the NEXT leg
+        // has to begin there. Sized to the radius this airframe actually
+        // turns at, because a fix inside that circle can never be closed on
+        // — the 737's whole EIDW departure was inside it (2026-09-20).
+        let gs_kts = gs * MS_TO_KTS;
+        let capture_nm = capture_radius_nm(
+            gs_kts,
+            leg_turn_deg(lat, lon, leg, legs.get(idx + 1)).unwrap_or(0.0),
+        );
         let target_mag = if let Some(brg_true) = bearing_to_fix(lat, lon, leg) {
             Some(true_to_mag(brg_true + crab, mag_var))
         } else {
             // course is already magnetic; add crab to hold it as a track.
             leg.course_mag.map(|c| (c + crab).rem_euclid(360.0))
         };
-        if let Some(d) = dist_nm.filter(|_| !leg_captured(leg, dist_nm, alt_ft)) {
+        if let Some(d) = dist_nm.filter(|_| !leg_captured(leg, dist_nm, alt_ft, capture_nm)) {
             if closure.as_ref().is_none_or(|(i, _)| *i != idx) {
                 closure = Some((idx, crate::circuit::Closure::new(d * 1852.0, progress_s)));
             }
@@ -1135,6 +1299,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                     "procedure",
                     serde_json::json!({
                         "event": "leg_stalled", "idx": idx, "dist_nm": d, "stalls": stalls,
+                        "cap_nm": capture_nm,
                     }),
                 );
                 let heading = true_to_mag(psi, mag_var);
@@ -1182,7 +1347,6 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // levels off AT the constraint instead of a stale value.
         // A DESCENT waits for its top-of-descent instead of starting the
         // moment the leg arms — the constraint is at the FIX, not here.
-        let gs_kts = gs * MS_TO_KTS;
 
         // --- Terrain: probe the ground AHEAD along the track and never command
         // an altitude into it. Skipped on an approach, whose own procedure owns
@@ -1255,6 +1419,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             gs_kts,
             pilot_altitude(),
             terrain_floor_ahead_ft().map(|f| floor_indicated(f, true_alt_ft, alt_ft)),
+            descent_fpm(),
         );
         let want_alt = v.want_alt;
         carry_alt = v.carry;
@@ -1263,7 +1428,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // answer: the same point the law above paces against. `carry` is the
         // leg's constraint (carried across unconstrained fixes).
         publish_tod(dist_nm.and_then(|d| {
-            descent_point_nm(v.carry, alt_ft, gs_kts).map(|tod| PlannedTod {
+            descent_point_nm(v.carry, alt_ft, gs_kts, descent_fpm()).map(|tod| PlannedTod {
                 fix: leg.fix_ident.clone(),
                 dist_nm: d,
                 to_tod_nm: d - tod,
@@ -1314,7 +1479,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // Speed-protected: VS mode holds RATE whatever the airspeed, so the
         // climb rate backs off as IAS sags below Vy (the takeoff's own law,
         // floored positive) — the unprotected 700 fpm stalled the LEJR climb.
-        let mut vs_cmd = ((want_alt - alt_ft) * 3.0).clamp(-700.0, 700.0);
+        // Both limbs are the AIRFRAME's now. The shared 700 was a GA figure
+        // and a 1.1 degree path at jet speeds: the BIKF arrival needed about
+        // 2,000 fpm on every leg inbound of BASLU and would have arrived
+        // 17,000 ft high, while the same cap on the climb made FL340 a
+        // 37-minute job burning low-altitude fuel (2026-09-20). The descent
+        // rate is the SAME one that placed the top of descent, so the point
+        // and the rate can never disagree.
+        let mut vs_cmd = ((want_alt - alt_ft) * 3.0).clamp(-descent_fpm(), climb_fpm());
         if vs_cmd > 0.0 && vy_kts > 0.0 {
             vs_cmd = vs_cmd.min(crate::autotakeoff::climb_vs_fpm(ias, vy_kts, vs_cmd));
         }
@@ -1355,6 +1527,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                 "event": "leg", "idx": idx, "type": leg.leg_type, "fix": leg.fix_ident,
                 "dist_nm": dist_nm, "alt_ft": alt_ft, "alt_true": true_alt_ft, "want_alt": want_alt,
                 "agl_ft": agl_ft, "crab": crab, "psi": psi_v, "bug": bug_mag, "tgt": target_mag,
+                // The capture radius in force, so a fix that will not close
+                // can be told from one the aircraft simply has not reached.
+                "cap_nm": capture_nm,
             }),
         );
 
@@ -1369,7 +1544,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             Some(hi),
         ) = (&end, handoff)
         {
-            if idx >= hi && leg_captured(leg, dist_nm, alt_ft) {
+            if idx >= hi && leg_captured(leg, dist_nm, alt_ft, capture_nm) {
                 crate::blackbox::record(
                     "procedure",
                     serde_json::json!({"event": "handoff_autoland", "idx": idx, "agl_ft": agl_ft}),
@@ -1415,7 +1590,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             }
         }
 
-        if leg_captured(leg, dist_nm, alt_ft) {
+        if leg_captured(leg, dist_nm, alt_ft, capture_nm) {
             idx += 1;
             if idx < legs.len() {
                 let next = &legs[idx];
@@ -1603,20 +1778,20 @@ mod tests {
     /// ground, is 11.4 nm before the fix (10.4 of descent plus the lead).
     #[test]
     fn descent_point_is_one_formula() {
-        let tod = descent_point_nm(3_143.0, 7_000.0, 113.0).unwrap();
+        let tod = descent_point_nm(3_143.0, 7_000.0, 113.0, GA_VS_FPM).unwrap();
         assert!((tod - 11.38).abs() < 0.05, "{tod}");
         // The law starts down exactly there, not before.
         assert_eq!(
-            descent_target_ft(3_143.0, 7_000.0, 7_000.0, Some(tod + 0.1), 113.0),
+            descent_target_ft(3_143.0, 7_000.0, 7_000.0, Some(tod + 0.1), 113.0, GA_VS_FPM),
             7_000.0
         );
         assert_eq!(
-            descent_target_ft(3_143.0, 7_000.0, 7_000.0, Some(tod - 0.1), 113.0),
+            descent_target_ft(3_143.0, 7_000.0, 7_000.0, Some(tod - 0.1), 113.0, GA_VS_FPM),
             3_143.0
         );
         // Nothing to descend to: no point to announce.
-        assert_eq!(descent_point_nm(7_000.0, 7_050.0, 113.0), None);
-        assert_eq!(descent_point_nm(8_000.0, 7_000.0, 113.0), None);
+        assert_eq!(descent_point_nm(7_000.0, 7_050.0, 113.0, GA_VS_FPM), None);
+        assert_eq!(descent_point_nm(8_000.0, 7_000.0, 113.0, GA_VS_FPM), None);
         // Between procedures the accessor is empty whatever was published.
         publish_tod(Some(PlannedTod {
             fix: "X".into(),
@@ -1704,7 +1879,17 @@ mod tests {
         pilot: Option<f64>,
         floor: Option<f64>,
     ) -> Vertical {
-        vertical_tick(leg, carry, prev, alt, Some(dist_nm), 135.0, pilot, floor)
+        vertical_tick(
+            leg,
+            carry,
+            prev,
+            alt,
+            Some(dist_nm),
+            135.0,
+            pilot,
+            floor,
+            GA_VS_FPM,
+        )
     }
 
     /// THE bug of 2026-09-13: the descent must WAIT for its top of descent on
@@ -1907,26 +2092,198 @@ mod tests {
     #[test]
     fn a_fix_leg_captures_inside_the_radius() {
         let l = leg("F", 36.0, -5.0);
-        assert!(!leg_captured(&l, Some(1.5), 2000.0), "far: not captured");
         assert!(
-            leg_captured(&l, Some(CAPTURE_NM - 0.1), 2000.0),
+            !leg_captured(&l, Some(1.5), 2000.0, CAPTURE_NM),
+            "far: not captured"
+        );
+        assert!(
+            leg_captured(&l, Some(CAPTURE_NM - 0.1), 2000.0, CAPTURE_NM),
             "inside: captured"
+        );
+    }
+
+    /// The EIDW departure that orbited (2026-09-20). The 737 climbing at
+    /// 250 kt turns with a radius bigger than the gap between the SID's
+    /// fixes, so the flat 0.8 nm capture was a circle the aircraft could
+    /// never enter: it banked 25°, went round, and the distance to the fix
+    /// GREW (4.5, 6.7, 7.6 nm) until the stall watchdog stood the follower
+    /// down. The capture has to be at least the turn the fix demands.
+    /// The BIKF arrival (2026-09-20), which the shared 700 fpm could not fly.
+    /// Every leg inbound of BASLU wanted about 2,000 fpm; at 700 the aircraft
+    /// would have reached the field some 17,000 ft high, and the approach
+    /// would never have armed.
+    /// A heading written with the WRONG variation is a wrong heading, and the
+    /// roll-out capture is where it does the damage: "bug on the nose" with a
+    /// stale variation is not a capture at all, it is a standing turn command.
+    ///
+    /// BIKF-EGPH (2026-09-20): departed Keflavik (about 11 degrees west),
+    /// arrived over Scotland (under one). The variation was read once before
+    /// the loop, so every tick wrote a bug 11.4 degrees right of the nose —
+    /// the log shows `bug - psi` pinned at exactly 11.4 for the whole orbit
+    /// while the crab beside it varied, which is how a constant offset tells
+    /// itself apart from a control error.
+    #[test]
+    fn a_stale_magnetic_variation_turns_a_capture_into_a_turn() {
+        // The roll-out branch commands the nose. With the right variation
+        // that is zero error and the autopilot rolls level.
+        let (psi_true, here) = (142.2, 0.78);
+        let correct = true_to_mag(psi_true, here);
+        assert!(
+            (crate::circuit::bug_toward(correct, 122.2, correct, 25.0, 40.0) - correct).abs()
+                < 0.01,
+            "on the nose is a capture"
+        );
+        // With Keflavik's variation still in hand — `true_to_mag` is
+        // positive-WEST, so Iceland's is the LARGER number — it is 11.4
+        // degrees of standing right turn, the same way the aircraft is
+        // already banked. Which is exactly what it flew.
+        let stale = true_to_mag(psi_true, here + 11.4);
+        let commanded = crate::circuit::bug_toward(stale, 122.2, stale, 25.0, 40.0);
+        let error = ((commanded - correct + 540.0).rem_euclid(360.0)) - 180.0;
+        assert!(
+            (error - 11.4).abs() < 0.1,
+            "a standing turn command, not a capture: {error:.1} degrees"
+        );
+    }
+
+    #[test]
+    fn a_jet_descent_is_paced_at_the_jets_rate_not_the_ga_one() {
+        // BASLU at 27,700 to the field, 78 nm, 340 kt over the ground.
+        let (drop_ft, dist_nm, gs) = (27_529.0, 78.0, 340.0);
+        let reach = |fpm: f64| dist_nm / gs * 60.0 * fpm;
+        assert!(
+            reach(GA_VS_FPM) < drop_ft * 0.5,
+            "the GA rate cannot lose half of it: {:.0} of {drop_ft:.0} ft",
+            reach(GA_VS_FPM)
+        );
+        assert!(
+            reach(2000.0) >= drop_ft,
+            "the jet's rate makes it: {:.0} ft",
+            reach(2000.0)
+        );
+        // ...and the top of descent moves with the rate, so the point and the
+        // rate can never disagree: three times the rate, a third of the run.
+        let ga = descent_point_nm(6_000.0, 34_000.0, 340.0, GA_VS_FPM).unwrap();
+        let jet = descent_point_nm(6_000.0, 34_000.0, 340.0, 2000.0).unwrap();
+        let ratio = (ga - TOD_LEAD_NM) / (jet - TOD_LEAD_NM);
+        assert!(
+            (ratio - 2000.0 / GA_VS_FPM).abs() < 0.01,
+            "TOD scales inversely with the rate: {ga:.0} nm vs {jet:.0} nm (x{ratio:.2})"
+        );
+        // Concretely: the GA rate would start this jet down 228 nm out, which
+        // is before the fix it is descending TO.
+        assert!(ga > 200.0 && jet < 90.0, "{ga:.0} nm vs {jet:.0} nm");
+    }
+
+    /// The rates are the airframe's, republished on every swap, and a profile
+    /// that declares nothing keeps the GA figure it always had.
+    #[test]
+    fn the_vertical_rates_are_published_per_airframe() {
+        let _g = crate::mode::TEST_LOCK.lock();
+        let mut r = crate::aircraft::ReferenceProfile::default();
+        publish_vs_limits(Some(&r));
+        assert_eq!(descent_fpm(), GA_VS_FPM, "silent profile keeps the default");
+        assert_eq!(climb_fpm(), GA_VS_FPM);
+        r.enroute_climb_fpm = Some(2000.0);
+        r.enroute_descent_fpm = Some(2000.0);
+        publish_vs_limits(Some(&r));
+        assert_eq!(descent_fpm(), 2000.0);
+        assert_eq!(climb_fpm(), 2000.0);
+        assert_eq!(vs_clamp_fpm(), 2000.0, "the spoken tool promises the truth");
+        // A swap to an airframe with no figures must not inherit the jet's:
+        // a process-wide fact never outlives its airframe.
+        publish_vs_limits(None);
+        assert_eq!(descent_fpm(), GA_VS_FPM);
+        assert_eq!(climb_fpm(), GA_VS_FPM);
+        // A nonsense figure is refused rather than flown.
+        r.enroute_descent_fpm = Some(-50.0);
+        publish_vs_limits(Some(&r));
+        assert_eq!(descent_fpm(), GA_VS_FPM);
+    }
+
+    #[test]
+    fn a_jet_sequences_a_fix_it_could_never_have_closed_on() {
+        let gs = 280.0;
+        let r = enroute_turn_radius_nm(gs);
+        assert!(
+            r > 2.0,
+            "a jet's enroute turn is nautical miles, not the pattern clamp's 1.35: {r:.2}"
+        );
+        // DE28R -> DW128 -> DW991 are 2.9 and 3.9 nm apart. A 60 degree turn
+        // at that radius must be started well outside the old flat radius.
+        let cap = capture_radius_nm(gs, 60.0);
+        assert!(
+            cap > CAPTURE_NM,
+            "the turn is anticipated, not chased: {cap:.2} nm"
+        );
+        assert!(cap <= r, "and never leads by more than the radius itself");
+        let l = leg("DW128", 53.4657, -6.3523);
+        // 1.5 nm out with the turn already due (the anticipation is 1.81 nm
+        // here): still "not reached" under the old flat radius, which is how
+        // the follower ended up chasing it round; sequenced now.
+        assert!(!leg_captured(&l, Some(1.5), 6000.0, CAPTURE_NM), "the bug");
+        assert!(leg_captured(&l, Some(1.5), 6000.0, cap), "the fix");
+    }
+
+    /// ...and the airframes that were already right stay byte-identical: in
+    /// both cases the anticipation lands under the floor, so the floor is
+    /// still the whole answer.
+    #[test]
+    fn turn_anticipation_never_disturbs_a_leg_that_already_worked() {
+        // A 172 at 100 knots, turning 90 degrees — the sharpest thing a
+        // light aircraft meets on a procedure.
+        assert_eq!(capture_radius_nm(100.0, 90.0), CAPTURE_NM);
+        // A jet at cruise: an 8 nm radius, but a 10 degree track change.
+        assert_eq!(capture_radius_nm(450.0, 10.0), CAPTURE_NM);
+        // Dead straight is always the floor, whatever the speed.
+        assert_eq!(capture_radius_nm(450.0, 0.0), CAPTURE_NM);
+    }
+
+    /// The turn is measured from where we ARE into the fix, then on to the
+    /// next one — so a leg with nothing after it anticipates nothing.
+    #[test]
+    fn the_turn_angle_comes_from_the_two_legs_it_joins() {
+        let here = leg("A", 53.5, -6.0);
+        let next = leg("B", 53.5, -5.0); // due east of A
+                                         // Approaching A from due west: the turn onto B is straight ahead.
+        let straight = leg_turn_deg(53.5, -7.0, &here, Some(&next)).unwrap();
+        assert!(straight.abs() < 1.0, "no turn: {straight:.1}");
+        // Approaching A from the south: a left turn onto the eastbound leg.
+        let left = leg_turn_deg(52.5, -6.0, &here, Some(&next)).unwrap();
+        assert!(
+            (left - 90.0).abs() < 2.0,
+            "a 90 degree turn, right-positive: {left:.1}"
+        );
+        assert_eq!(leg_turn_deg(53.5, -7.0, &here, None), None, "last leg");
+        assert_eq!(
+            leg_turn_deg(53.5, -7.0, &to_alt('+', 3000.0), Some(&next)),
+            None,
+            "a to-altitude leg has no fix to turn at"
         );
     }
 
     #[test]
     fn a_climb_leg_captures_at_or_above_the_altitude() {
         let climb = to_alt('+', 3000.0);
-        assert!(!leg_captured(&climb, None, 2000.0), "below: keep climbing");
-        assert!(leg_captured(&climb, None, 3000.0), "made it");
-        assert!(leg_captured(&climb, None, 2900.0), "within margin counts");
+        assert!(
+            !leg_captured(&climb, None, 2000.0, CAPTURE_NM),
+            "below: keep climbing"
+        );
+        assert!(leg_captured(&climb, None, 3000.0, CAPTURE_NM), "made it");
+        assert!(
+            leg_captured(&climb, None, 2900.0, CAPTURE_NM),
+            "within margin counts"
+        );
     }
 
     #[test]
     fn a_descend_leg_captures_at_or_below_the_altitude() {
         let down = to_alt('-', 3000.0);
-        assert!(!leg_captured(&down, None, 5000.0), "above: keep descending");
-        assert!(leg_captured(&down, None, 3000.0), "made it");
+        assert!(
+            !leg_captured(&down, None, 5000.0, CAPTURE_NM),
+            "above: keep descending"
+        );
+        assert!(leg_captured(&down, None, 3000.0, CAPTURE_NM), "made it");
     }
 
     #[test]
@@ -2067,34 +2424,34 @@ mod tests {
     #[test]
     fn a_descent_waits_for_its_top_of_descent() {
         assert_eq!(
-            descent_target_ft(1397.0, 3900.0, 3888.0, Some(25.0), 200.0),
+            descent_target_ft(1397.0, 3900.0, 3888.0, Some(25.0), 200.0, GA_VS_FPM),
             3900.0
         );
         // TOD: 2,491 ft at 700 fpm is 3.6 min, 11.9 nm at 200 kt, plus the lead.
         assert_eq!(
-            descent_target_ft(1397.0, 3900.0, 3888.0, Some(13.5), 200.0),
+            descent_target_ft(1397.0, 3900.0, 3888.0, Some(13.5), 200.0, GA_VS_FPM),
             3900.0
         );
         assert_eq!(
-            descent_target_ft(1397.0, 3900.0, 3888.0, Some(12.0), 200.0),
+            descent_target_ft(1397.0, 3900.0, 3888.0, Some(12.0), 200.0, GA_VS_FPM),
             1397.0
         );
         // Climbs, small steps and fix-less legs go straight to the constraint.
         assert_eq!(
-            descent_target_ft(4000.0, 2000.0, 2000.0, Some(30.0), 200.0),
+            descent_target_ft(4000.0, 2000.0, 2000.0, Some(30.0), 200.0, GA_VS_FPM),
             4000.0
         );
         assert_eq!(
-            descent_target_ft(3900.0, 4000.0, 3990.0, Some(30.0), 200.0),
+            descent_target_ft(3900.0, 4000.0, 3990.0, Some(30.0), 200.0, GA_VS_FPM),
             3900.0
         );
         assert_eq!(
-            descent_target_ft(1000.0, 4000.0, 4000.0, None, 200.0),
+            descent_target_ft(1000.0, 4000.0, 4000.0, None, 200.0, GA_VS_FPM),
             1000.0
         );
         // Never reached the previous target: hold where we are, rounded.
         assert_eq!(
-            descent_target_ft(1000.0, 6000.0, 3460.0, Some(40.0), 200.0),
+            descent_target_ft(1000.0, 6000.0, 3460.0, Some(40.0), 200.0, GA_VS_FPM),
             3500.0
         );
     }

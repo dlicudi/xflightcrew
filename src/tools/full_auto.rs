@@ -127,6 +127,7 @@ pub struct FullAuto {
     /// Flap-handle ratio set for takeoff and retracted climbing out (profile's
     /// `flaps.takeoff_ratio`); `None` leaves the flaps alone.
     pub takeoff_flap_ratio: Option<f64>,
+    pub flap_schedule: Vec<(f64, f64)>,
     /// Indicated cruise speed for the enroute cruise-power hold (profile's
     /// `reference.cruise_ias_kts`); `None` leaves cruise at climb power.
     pub cruise_ias_kts: Option<f64>,
@@ -140,6 +141,7 @@ pub struct FullAuto {
     pub pace: crate::autotaxi::Pace,
     /// Its tail-strike attitude, threaded the same way.
     pub tail_strike_deg: Option<f64>,
+    pub pitch_authority_down: Option<f64>,
     /// Vne/Vmo for the climb's overspeed protection.
     pub vne_kts: Option<f64>,
     /// Slowest the pattern may climb toward — see `circuit::climb_limit_fpm`.
@@ -300,6 +302,7 @@ impl Tool for FullAuto {
                 park_brake_valve_set: self.park_brake_valve_set,
                 prop: self.prop.clone(),
                 pace: self.pace,
+                must_start: false,
             },
             line_up: crate::tools::taxi::LineUp {
                 park_brake_valve_set: self.park_brake_valve_set,
@@ -310,6 +313,7 @@ impl Tool for FullAuto {
             circuit: crate::tools::circuit::Circuit {
                 park_brake_valve_set: self.park_brake_valve_set,
                 tail_strike_deg: self.tail_strike_deg,
+                pitch_authority_down: self.pitch_authority_down,
                 vne_kts: self.vne_kts,
                 cfg: self.cfg.clone(),
                 vr_kts: self.vr_kts,
@@ -318,6 +322,7 @@ impl Tool for FullAuto {
                 climb_fpm: self.climb_fpm,
                 retract_gear: self.retract_gear,
                 takeoff_flap_ratio: self.takeoff_flap_ratio,
+                flap_schedule: self.flap_schedule.clone(),
                 takeoff_roll_m: self.takeoff_roll_m,
                 approach_ias: self.approach_ias,
                 prop: self.prop.clone(),
@@ -331,6 +336,7 @@ impl Tool for FullAuto {
                 handoff_to_caller: true,
                 park_brake_valve_set: self.park_brake_valve_set,
                 tail_strike_deg: self.tail_strike_deg,
+                pitch_authority_down: self.pitch_authority_down,
                 vne_kts: self.vne_kts,
                 cfg: self.cfg.clone(),
                 vr_kts: self.vr_kts,
@@ -339,6 +345,7 @@ impl Tool for FullAuto {
                 climb_fpm: self.climb_fpm,
                 retract_gear: self.retract_gear,
                 takeoff_flap_ratio: self.takeoff_flap_ratio,
+                flap_schedule: self.flap_schedule.clone(),
                 takeoff_roll_m: self.takeoff_roll_m,
                 prop: self.prop.clone(),
             },
@@ -482,7 +489,15 @@ impl FullAuto {
             return Err("The aircraft moved beyond the verified rejoin. I haven't taken control; stabilise and try again.".into());
         }
         let ack = format!("Resuming toward {} at {:.0} feet, continuing to {} and the arrival. {} Say my controls to take over.", fix.ident,target,fp.destination,arrival);
-        let payload=fp.waypoints.iter().map(|w| format!("{},{:.4},{:.4},{}",w.ident,w.lat,w.lon,w.alt as i64)).collect::<Vec<_>>().join("|");
+        // THE one payload builder, never a hand-rolled join. This site had a
+        // byte-identical copy of its entry format without the middle-thinning
+        // or the 511-byte cap, so a resume overwrote full auto's fitted
+        // payload with the raw navlog: EIDW-BIKF, 2026-09-20, 528 bytes into
+        // the 512-byte mailbox, cut to "BIKF,6". The plugin dropped the
+        // malformed tail, ELVUM became the last entry, and X-Plane refused
+        // the plan it composed — "invalid destination airport: ELVUM". The
+        // arm got this right at 07:30 and the resume undid it at 07:49.
+        let payload = crate::simbrief::fms_route_payload(&fp.waypoints);
         Ok((Mission::Resume(Route { dest_icao: fp.destination.clone(), dest_name: fp.destination,
             legs, fms_payload: payload, local_runway: None }),ack))
     }
@@ -607,11 +622,12 @@ impl FullAuto {
             // Price the authored track, including the final alignment, into
             // the same preflight fuel check. Reserve stays untouched.
             if fp.distance_nm > 0.0 {
-                let extra = fp.trip_fuel_gal * (route.distance_nm / fp.distance_nm - 1.0).max(0.0);
-                fp.trip_fuel_gal += extra;
-                fp.block_fuel_gal += extra;
-                fp.block_fuel_kg += extra * 2.72;
-                fp.min_takeoff_fuel_kg += extra * 2.72;
+                // All kilos now, so the scaling needs no density at all — the
+                // `* 2.72` here was the avgas constant a third time.
+                let extra = fp.trip_fuel_kg * (route.distance_nm / fp.distance_nm - 1.0).max(0.0);
+                fp.trip_fuel_kg += extra;
+                fp.block_fuel_kg += extra;
+                fp.min_takeoff_fuel_kg += extra;
                 fp.ete_min *= route.distance_nm / fp.distance_nm;
             }
             fp.distance_nm = route.distance_nm;

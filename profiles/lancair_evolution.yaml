@@ -144,6 +144,10 @@ fuel:
   reserve_caution_min: 45.0
   reserve_warning_min: 30.0
   cruise_burn_kg_hr: 118.0
+  # Jet A-1, not the 100LL the shared default assumes: that briefed the
+  # 737's fuel 11.8% light and in a unit no crew uses (2026-09-20).
+  kg_per_gal: 3.04
+  spoken_unit: gallons
 
 # Clean stall (KIAS) — drives the airspeed-low callout. POM Vs / acf_Vs.
 vs_clean_kts: 76.0
@@ -155,6 +159,12 @@ vne_kts: 256.0
 # the .acf models 2,400 — the POM figure is quoted.)
 reference:
   kind: single-engine turboprop
+  # Owner-flown turboprop, fuelled in gallons — but JET A, which is the
+# density that was wrong.
+  # Enroute vertical rates: the shared 700 fpm is a GA number and a ~1 degree
+  # path at these speeds. VERIFY.
+  enroute_climb_fpm: 1500.0
+  enroute_descent_fpm: 1200.0
   vno_kts: 220.0           # max structural cruise
   va_kts: 190.0            # maneuvering
   vx_kts: 85.0             # best angle of climb
@@ -185,6 +195,16 @@ reference:
 
 # Flaps: UP / 50% / 100% (acf models 2 detents, 20 and 45 degrees). Per-notch
 # Vfe from the POM: 160 KIAS to 50%, 140 KIAS to 100%.
+# --- Jet/turboprop figures, added 2026-09-20 after the 737 shakedown. Every
+# law below defaults to a Cessna 172's number when a profile is silent, and on
+# BIKF-EGPH that flew an airliner on a 0.8 nm capture radius, a 700 fpm
+# descent, a 0.10 nose-down limit and avgas density. VERIFY each against the
+# POM/FCOM; they are reasoned from the type, not measured on it.
+# Nose-DOWN elevator the rotation law may command. The shared default is
+# 0.10, which on a jet is not authority at all: the 737 was commanded 8
+# degrees and flew 22.4 with the law pinned at its limit. VERIFY.
+pitch_authority_down: 0.25
+
 flaps:
   detents:
     - { label: up,   spoken: up,            ratio: 0.0 }

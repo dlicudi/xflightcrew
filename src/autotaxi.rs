@@ -280,6 +280,27 @@ pub fn driving() -> bool {
 /// must not be driven over.
 pub static LAST_ARRIVED: AtomicBool = AtomicBool::new(false);
 
+/// Stop a drive from OUTSIDE its loop, claiming nothing.
+///
+/// The arrival latch is cleared with the flags, and that is the whole point:
+/// a drive somebody else stopped did NOT arrive, and a caller waiting on
+/// [`LAST_ARRIVED`] must never read a cancelled drive as a parked aircraft.
+/// At BIKF (2026-09-20) a vacate that over-ran its budget was left running,
+/// the stand drive was never started on top of it, and when the VACATE route
+/// finally ended it set the latch — so the arrival watcher secured the
+/// aircraft, transponder to standby and lights out, 140 m from the nearest
+/// stand and ninety degrees across it, having never gone to the stand it was
+/// cleared to.
+///
+/// This stops the loop; it does not stop the AIRCRAFT. The caller holds the
+/// sim client and owes the brakes — a stage that is not moving the aircraft
+/// is holding it.
+pub fn halt() {
+    ACTIVE.store(false, Ordering::Relaxed);
+    BACKTRACKING.store(false, Ordering::Relaxed);
+    LAST_ARRIVED.store(false, Ordering::Relaxed);
+}
+
 /// One-line status for the dashboard's "managing" panel.
 /// The taxi's live line for the panel: metres left to the stop point,
 /// rounded to ten so the feed is not re-sent every tick.
@@ -429,6 +450,36 @@ impl Route {
         taxi_guide::angle_diff(taxi_guide::bearing(here, aim), heading_true)
     }
 
+    /// The yaw rate the ROUTE ITSELF asks for across the aim span, degrees
+    /// per second at this groundspeed: the route's direction at the aim point
+    /// minus its direction underfoot, over the time the aircraft takes to
+    /// cover the span.
+    ///
+    /// On a circular arc of radius R this is exactly v/R — the span subtends
+    /// L/R radians and is covered in L/v seconds — and on the polyline a
+    /// taxiway really is, it is that same measure sampled across whatever
+    /// corner lies inside the aim. Straight paint gives zero.
+    ///
+    /// This is the turn a correctly flown bend MUST carry, which is what
+    /// [`damped_err_deg`] credits back so the rate lead stops fighting it.
+    pub fn route_turn_rate_dps(&self, progress: f64, lookahead: f64, gs_kts: f64) -> f64 {
+        // Sampled over a short step either end rather than read off a leg
+        // index: `point_at` already walks the polyline, and a corner landing
+        // between two samples is a corner the aim is flying through anyway.
+        const STEP_M: f64 = 4.0;
+        if lookahead <= STEP_M || gs_kts <= 0.0 {
+            return 0.0;
+        }
+        let dir = |s: f64| {
+            taxi_guide::bearing(
+                taxi_guide::point_at(&self.pts, &self.cum, s),
+                taxi_guide::point_at(&self.pts, &self.cum, s + STEP_M),
+            )
+        };
+        let turn = taxi_guide::angle_diff(dir(progress + lookahead), dir(progress));
+        turn * (gs_kts * 0.514) / lookahead
+    }
+
     /// The direction the route's LAST segment runs, degrees true.
     ///
     /// Near the stop this replaces the pure-pursuit aim, because the aim point
@@ -526,9 +577,34 @@ pub fn slew_steer(prev: f64, want: f64, per_s: Option<f64>, dt: f64) -> f64 {
 /// the nose will be in [`STEER_RATE_LEAD_S`] checks the swing before the
 /// crest. On a linked nosewheel taxi yaw rates are small and the term is
 /// nearly inert, so the 172 keeps its proven feel.
+///
+/// But "small" was the 172's taxi, not every taxi. A derivative term fed the
+/// WHOLE measured rate opposes a steady turn as hard as it opposes a swing,
+/// and a bend is exactly where the rate stops being noise and becomes the
+/// demand. Measured on the 737 (EIDW, 2026-09-20): 22.9 deg/s of yaw per
+/// unit of steer, so in a sustained bend the 0.6 s lead subtracted 13.8 deg
+/// of error per unit commanded and the declared 30 deg full-scale was really
+/// 43.8 — a third of the steering quietly derated, in the one place it was
+/// needed. Every corner of that taxi rounded out 6 to 8 m wide with the
+/// command never past 0.55, while the straights held 0.2 m. Understeer, and
+/// the 172 hid it the way it hides every jet number: at GA taxi rates the
+/// same term is worth about a degree.
+///
+/// So the lead damps only the yaw the CORNER DID NOT ASK FOR:
+/// `required_dps` is the route's own turn rate across the aim span
+/// ([`Route::route_turn_rate_dps`]), and it is credited back. Straight paint
+/// asks for zero and the law is byte-identical to the one the 172, the SR22
+/// and the SF50 fly today — including their weave, which is a STRAIGHT-line
+/// oscillation that earns no credit.
 pub const STEER_RATE_LEAD_S: f64 = 0.6;
-pub fn damped_err_deg(err_deg: f64, yaw_rate_dps: f64, lead_s: f64) -> f64 {
-    err_deg - yaw_rate_dps * lead_s
+pub fn damped_err_deg(err_deg: f64, yaw_rate_dps: f64, required_dps: f64, lead_s: f64) -> f64 {
+    // The credit is bounded into [0, yaw_rate]: a corner may only ever weaken
+    // the lead toward zero, never reverse it into a rate DEMAND of its own,
+    // and a nose swinging the way the bend does NOT go earns nothing. The
+    // residual therefore always keeps the sign of the measured rate and never
+    // exceeds it — this can subtract damping, never add drive.
+    let credit = required_dps.clamp(yaw_rate_dps.min(0.0), yaw_rate_dps.max(0.0));
+    err_deg - (yaw_rate_dps - credit) * lead_s
 }
 
 /// Steering authority vs groundspeed: a fully deflected nosewheel at a
@@ -1445,7 +1521,10 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             }
             if t0.elapsed().as_secs_f64() > TUG_WAIT_SECS {
                 tracing::warn!("auto taxi: the tug never let go, standing down");
-                crate::blackbox::record("autotaxi", serde_json::json!({"event": "tug_never_released"}));
+                crate::blackbox::record(
+                    "autotaxi",
+                    serde_json::json!({"event": "tug_never_released"}),
+                );
                 alert(
                     &voice,
                     Priority::Caution,
@@ -1502,7 +1581,10 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         };
         let lateral = offset.abs();
         let remaining = route.remaining(progress);
-        DETAIL.set(format!("{} m to go", (remaining.max(0.0) / 10.0).round() as i64 * 10));
+        DETAIL.set(format!(
+            "{} m to go",
+            (remaining.max(0.0) / 10.0).round() as i64 * 10
+        ));
         if let Some(l) = crossing_light.as_ref() {
             let want = on_runway_span(&route.runway_spans, progress);
             if want != crossing_lit {
@@ -1533,6 +1615,15 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
             route.stop_heading_err_deg(lat, lon, psi, progress, look)
         } else {
             route.heading_err_deg(lat, lon, psi, progress, look)
+        };
+        // The turn the route asks for over that same aim span, for the rate
+        // lead to credit. Zero inside the stop zone: there the error is held
+        // against a FIXED final bearing, which is a straight line by
+        // construction, so any yaw there really is a swing to be checked.
+        let route_turn_dps = if remaining <= STOP_HEADING_HOLD_M {
+            0.0
+        } else {
+            route.route_turn_rate_dps(progress, look, gs_kts)
         };
         let allow = *join_allow.get_or_insert_with(|| {
             let a = join_allowance_m(lateral, err);
@@ -1647,7 +1738,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         yaw_rate = yaw_rate * 0.5 + raw_rate.clamp(-90.0, 90.0) * 0.5;
         let want = stop_straighten(
             steer_cmd_with(
-                damped_err_deg(err, yaw_rate, route.pace.steer_lead_s),
+                damped_err_deg(err, yaw_rate, route_turn_dps, route.pace.steer_lead_s),
                 route.pace.steer_full_deg,
             ) * steer_authority(gs_kts),
             remaining,
@@ -1689,7 +1780,12 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
                 // the log unreadable against the paint: "two metres off" says
                 // nothing about which side, and the side is the whole
                 // question when the pilot can see the line.
+                // `turn_dps` is the bend's OWN rate, the credit the lead
+                // gives back: `yaw_dps` minus it is what the law actually
+                // damps, and the pair is how a wide corner gets told apart
+                // from a swing in the trace.
                 "event": "drive", "gs": gs_kts, "err": err, "yaw_dps": yaw_rate,
+                "turn_dps": route_turn_dps,
                 "steer": steer, "lat_m": offset, "remaining_m": remaining,
                 "bs": bs_on, "bl": bl, "br": br, "tug": tug_on,
             }),
@@ -1777,12 +1873,19 @@ mod tests {
         ];
         let cum = [0.0, 100.0, 140.0, 160.0, 300.0];
         let spans = runway_spans(&seg, &cum);
-        assert_eq!(spans, vec![(100.0, 160.0)], "contiguous runway legs are one span");
+        assert_eq!(
+            spans,
+            vec![(100.0, 160.0)],
+            "contiguous runway legs are one span"
+        );
         assert!(!on_runway_span(&spans, 50.0), "well before: off");
         assert!(on_runway_span(&spans, 65.0), "40 m lead: on");
         assert!(on_runway_span(&spans, 150.0), "on the runway: on");
         assert!(!on_runway_span(&spans, 161.0), "clear: off");
-        assert!(runway_spans(&[], &cum).is_empty(), "a route with no flags has no spans");
+        assert!(
+            runway_spans(&[], &cum).is_empty(),
+            "a route with no flags has no spans"
+        );
     }
 
     use super::*;
@@ -2166,15 +2269,113 @@ mod tests {
         );
     }
 
+    /// A drive stopped from outside claims nothing. The latch is what the
+    /// taxi-in arrival watcher secures on, and leaving it set is how an
+    /// aircraft got parked on a taxiway (BIKF, 2026-09-20).
+    #[test]
+    fn halting_a_drive_never_leaves_an_arrival_behind_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _g = crate::mode::TEST_LOCK.lock();
+        ACTIVE.store(true, Relaxed);
+        BACKTRACKING.store(true, Relaxed);
+        LAST_ARRIVED.store(true, Relaxed);
+        halt();
+        assert!(!ACTIVE.load(Relaxed), "the loop is told to stop");
+        assert!(!BACKTRACKING.load(Relaxed), "including between its legs");
+        assert!(!driving(), "and `driving` agrees");
+        assert!(
+            !LAST_ARRIVED.load(Relaxed),
+            "a drive someone else stopped did NOT arrive"
+        );
+    }
+
+    /// The BIKF stop, measured: 140 m from the nearest stand with the nose
+    /// ninety degrees across its parking heading. The copilot said "At the
+    /// gate" there. The test the claim now has to pass is the tug's own.
+    #[test]
+    fn the_bikf_taxiway_stop_is_not_a_stand() {
+        use crate::pushback::on_a_stand;
+        // Stand 69, the nearest, 140 m away on heading 000; we sat on 270.
+        assert!(!on_a_stand(Some((140.0, 0.0)), 269.7, true));
+        // Close enough but still crosswise is no stand either.
+        assert!(!on_a_stand(Some((20.0, 0.0)), 269.7, true));
+        // Actually on it, nose down the stand: this is a gate.
+        assert!(on_a_stand(Some((20.0, 0.0)), 5.0, true));
+        // A field that publishes no stands cannot be second-guessed.
+        assert!(on_a_stand(None, 269.7, false));
+    }
+
     #[test]
     fn rate_lead_checks_the_swing() {
-        // Nose swinging hard through a small error: the lead commands
-        // countersteer before the crest — this is the SR22 snake killer.
-        assert!(damped_err_deg(5.0, 40.0, STEER_RATE_LEAD_S) < 0.0);
+        // Nose swinging hard through a small error on STRAIGHT paint (the
+        // route asks for nothing): the lead commands countersteer before the
+        // crest — this is the SR22 snake killer, and it must survive the
+        // corner credit untouched.
+        assert!(damped_err_deg(5.0, 40.0, 0.0, STEER_RATE_LEAD_S) < 0.0);
         // Steady nose: pure P unchanged, the 172 keeps its proven feel.
-        assert_eq!(damped_err_deg(10.0, 0.0, STEER_RATE_LEAD_S), 10.0);
+        assert_eq!(damped_err_deg(10.0, 0.0, 0.0, STEER_RATE_LEAD_S), 10.0);
         // A gentle commanded bend (~8 deg/s) keeps most of its steer.
-        assert!(damped_err_deg(15.0, 8.0, STEER_RATE_LEAD_S) > 9.0);
+        assert!(damped_err_deg(15.0, 8.0, 0.0, STEER_RATE_LEAD_S) > 9.0);
+    }
+
+    #[test]
+    fn the_lead_does_not_fight_the_turn_the_bend_asked_for() {
+        // The EIDW 737 corner, from the trace (2026-09-20): 16.6 deg of
+        // pursuit error with the nose already coming round at 10 deg/s,
+        // which is the rate that bend requires. The old law damped the whole
+        // 10 and commanded a third less steer than the error asked for.
+        let err = 16.6;
+        let yaw = 10.0;
+        let old = err - yaw * STEER_RATE_LEAD_S;
+        let new = damped_err_deg(err, yaw, yaw, STEER_RATE_LEAD_S);
+        assert_eq!(new, err, "a rate the corner asked for is credited in full");
+        assert!(
+            steer_cmd_with(new, STEER_FULL_DEG) > 1.4 * steer_cmd_with(old, STEER_FULL_DEG),
+            "the bend gets back the steering the derating took: {old} -> {new}"
+        );
+        // Credit is bounded by the measured rate: a bend asking for MORE than
+        // the nose is giving never becomes drive of its own.
+        assert_eq!(
+            damped_err_deg(err, 4.0, 30.0, STEER_RATE_LEAD_S),
+            err,
+            "over-credit clamps at the measured rate, it never adds command"
+        );
+        // And a nose swinging the way the bend does NOT go earns nothing:
+        // full damping, exactly as before.
+        assert_eq!(
+            damped_err_deg(err, 12.0, -9.0, STEER_RATE_LEAD_S),
+            err - 12.0 * STEER_RATE_LEAD_S,
+            "a swing against the bend keeps the whole lead"
+        );
+    }
+
+    #[test]
+    fn a_bend_asks_for_a_turn_rate_and_a_straight_asks_for_none() {
+        // 300 m east, then a 90-degree LEFT onto north — the watch() diagram
+        // with a long enough straight to sit well clear of the corner.
+        let w = TaxiWatch {
+            path: vec![ll(0.0, 0.0), ll(300.0, 0.0), ll(300.0, 300.0)],
+            via: String::new(),
+            seg: vec![(String::new(), false), (String::new(), false)],
+            holding_point: String::new(),
+            lead_on: Vec::new(),
+        };
+        let straight = Route::build(&w).expect("route");
+        // Underfoot and aim both on the straight: nothing owed.
+        assert_eq!(straight.route_turn_rate_dps(50.0, 40.0, 13.0), 0.0);
+        // Aim across the corner: a real rate, signed LEFT (negative).
+        let through = straight.route_turn_rate_dps(280.0, 40.0, 13.0);
+        assert!(
+            through < -5.0,
+            "the corner inside the aim asks for a left turn rate, got {through}"
+        );
+        // And it scales with speed: the same corner taken faster is a harder
+        // turn, which is the whole point of crediting a RATE and not an angle.
+        let faster = straight.route_turn_rate_dps(280.0, 40.0, 26.0);
+        assert!(
+            (faster - 2.0 * through).abs() < 0.01,
+            "twice the speed is twice the rate: {through} -> {faster}"
+        );
     }
 
     #[test]

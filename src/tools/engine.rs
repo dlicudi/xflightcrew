@@ -61,8 +61,6 @@ const LEAN_FLOOR_ALT_FT: f64 = 3000.0;
 // Auto-lean never pulls the mixture below this — a guard against an over-lean that
 // would stumble the engine; real cruise leaning stays well rich of idle-cutoff.
 const MIX_LEAN_FLOOR: f64 = 0.30;
-// Avgas mass per US gallon (~6.0 lb/gal), to turn fuel flow (kg/s) into gal/hr.
-const AVGAS_KG_PER_GAL: f64 = 2.72;
 
 /// First element of a per-engine array dataref (engine 1), or `default`.
 async fn engine0(ctx: &ToolCtx<'_>, dataref: &str, default: f64) -> f64 {
@@ -726,13 +724,18 @@ async fn lean_seek(ctx: &ToolCtx<'_>, economy: bool) -> Option<String> {
                     );
                 }
                 let pct = ctx.xplane.get_float(MIXTURE).await.unwrap_or(best + 0.03) * 100.0;
-                let gph = engine0(ctx, FUEL_FLOW_KG_S, 0.0).await * 3600.0 / AVGAS_KG_PER_GAL;
+                // Piston-only by construction, so this resolves to the avgas
+                // gallons it always was — but through the airframe's own
+                // unit, so the density lives in exactly one place.
+                let burn = crate::aircraft::say_fuel_flow_kg_hr(
+                    engine0(ctx, FUEL_FLOW_KG_S, 0.0).await * 3600.0,
+                );
                 let egt_f = egt * 9.0 / 5.0 + 32.0; // dataref is °C
                                                     // From here it's continuous: the manager re-trims as altitude
                                                     // or power changes, until the pilot takes the lever back.
                 arm_mixture_manager(ctx.config.xplane_base_url.clone());
                 Some(format!(
-                    "Leaned to peak EGT, mixture {pct:.0} percent, EGT {egt_f:.0} degrees, burning {gph:.1} gallons an hour. I'll keep it trimmed as we climb or descend."
+                    "Leaned to peak EGT, mixture {pct:.0} percent, EGT {egt_f:.0} degrees, burning {burn}. I'll keep it trimmed as we climb or descend."
                 ))
             }
             Err(e) => {

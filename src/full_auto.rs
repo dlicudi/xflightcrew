@@ -1749,7 +1749,14 @@ async fn fly_route(
     // The wind-chosen end (build_arrival) drives BOTH the published-approach
     // branch and the visual fallback — the visual autoland is forced onto the
     // same runway so a tailwind can't be re-picked back in by track.
-    let landing_rwy = built.rwy_id.clone();
+    // The runway AND the field it belongs to. A bare ident is resolved by
+    // proximity, and on the EGPH arrival that found EGPJ's 24 nine miles
+    // away across the Forth (2026-09-20) — a plan that names its destination
+    // must never let the airport be a search result.
+    let landing_rwy = built
+        .rwy_id
+        .as_deref()
+        .map(|id| crate::autoland::PlannedRunway::at(&route.dest_icao, id));
     match built.plan {
         Some(plan)
             if route.local_runway.is_none()
@@ -1757,7 +1764,7 @@ async fn fly_route(
         {
             event(
                 "arrival_procedure",
-                json!({ "name": plan.name, "runway": landing_rwy, "wind": wind_detail }),
+                json!({ "name": plan.name, "runway": built.rwy_id, "wind": wind_detail }),
             );
             announce(
                 voice,
@@ -1781,7 +1788,7 @@ async fn fly_route(
         _ => {
             event(
                 "arrival_autoland",
-                json!({ "runway": landing_rwy, "wind": wind_detail }),
+                json!({ "runway": built.rwy_id, "wind": wind_detail }),
             );
             announce(
                 voice,
@@ -1885,11 +1892,15 @@ async fn fly_route(
             call_inbound(xp, ctx, voice, callsign, khz, false).await;
         }
         let call = match &landing_rwy {
-            Some(rwy) => format!("final runway {}", crate::circuit::spell_runway(rwy)),
+            Some(rwy) => format!("final runway {}", crate::circuit::spell_runway(&rwy.id)),
             None => "final".to_string(),
         };
         crate::circuit::transmit(crate::circuit::radio_call(callsign, &call));
-        event("final_call", json!({ "runway": landing_rwy }));
+        event(
+            "final_call",
+            json!({ "runway": landing_rwy.as_ref().map(|r| &r.id),
+                    "icao": landing_rwy.as_ref().and_then(|r| r.icao.as_ref()) }),
+        );
         // The tower's answer (the clearance, and any correction of the
         // runway) is autoland's to read back and obey: it watches the party
         // line every tick and re-arms itself on the cleared end.
@@ -2278,7 +2289,7 @@ fn build_arrival(
         apt_dat: apt_dat.to_string(),
         cfg,
         approach_ias,
-        rwy_id: Some(rwy_id.clone()),
+        rwy_id: Some(crate::autoland::PlannedRunway::at(dest, &rwy_id)),
     };
     let plan = crate::procedure::approach_plan_for(
         cifp, fixp, navp, &airport, dest, &rwy_id, lat, lon, end,
@@ -2433,7 +2444,6 @@ pub struct PreflightFacts {
 }
 
 const LB_PER_KG: f64 = 2.204_62;
-const AVGAS_KG_PER_GAL: f64 = 2.72;
 /// A tank within this of the block is "as planned"; SimBrief rounds too.
 const FUEL_MATCH_FRAC: f64 = 0.03;
 /// Payload within this of the plan (and 20 kg) is "as planned".
@@ -2452,12 +2462,13 @@ const PAYLOAD_MATCH_KG: f64 = 20.0;
 /// arm, and found the fuel at the enroute caution and the runway at the hold.
 pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result<String, String> {
     use crate::flightplan::spoken_feet;
-    // Fuel in the plan's unit, or the app's gallons on a local plan (whose
-    // fuel is avgas by construction); a weight in the plan's unit, or pounds
-    // (the profile's `max_gross_lb`) when there is no load sheet.
+    // Fuel in the plan's own unit when it carries a load sheet, otherwise the
+    // AIRFRAME's — never the app's avgas gallons, which is what a local plan
+    // used to fall back to whatever it was flying; a weight in the plan's
+    // unit, or pounds (the profile's `max_gross_lb`) when there is no sheet.
     let spoken_fuel = |kg: f64| match &fp.weights {
         Some(w) => w.spoken(kg),
-        None => format!("{:.0} gallons", kg / AVGAS_KG_PER_GAL),
+        None => crate::aircraft::say_fuel_kg(kg),
     };
     let spoken_weight = |kg: f64| match &fp.weights {
         Some(w) => w.spoken(kg),
@@ -2647,9 +2658,8 @@ mod tests {
             cruise_alt_ft: 3500.0,
             distance_nm: 45.0,
             ete_min: 35.0,
-            block_fuel_gal: 40.0,
-            trip_fuel_gal: 10.7,
-            reserve_gal: 5.7,
+            trip_fuel_kg: 10.7 * 2.72,
+            reserve_kg: 5.7 * 2.72,
             route: "DCT".into(),
             wind_comp_kts: 0.0,
             wind_dir: 0.0,

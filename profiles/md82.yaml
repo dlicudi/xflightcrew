@@ -88,6 +88,15 @@ vlo_kts: 270.0
 # below this. Luton 2026-07-28: the rotation overshot its 8 degree target to
 # 10.6 at 21 ft and struck the tail. VERIFY against the POM.
 tail_strike_deg: 9.5
+# --- Jet/turboprop figures, added 2026-09-20 after the 737 shakedown. Every
+# law below defaults to a Cessna 172's number when a profile is silent, and on
+# BIKF-EGPH that flew an airliner on a 0.8 nm capture radius, a 700 fpm
+# descent, a 0.10 nose-down limit and avgas density. VERIFY each against the
+# POM/FCOM; they are reasoned from the type, not measured on it.
+# Nose-DOWN elevator the rotation law may command. The shared default is
+# 0.10, which on a jet is not authority at all: the 737 was commanded 8
+# degrees and flew 22.4 with the law pinned at its limit. VERIFY.
+pitch_authority_down: 0.5
 
 # Taxi pacing. The defaults (10/6/4) were tuned on a 172, where 10 knots is a
 # THROTTLE setting; on this airframe it is a BRAKE setting, because an MD-82 at
@@ -108,8 +117,29 @@ taxi:
 # figure is used, because the automation needs A number and a weight-computed
 # card is future work; they read high at light weight, which is the safe side
 # for a rotation speed.
+
+# Fuel endurance alerting, added 2026-09-20: without a fuel block this
+# airframe had no reserve callouts at all, and its fuel was spoken at
+# AVGAS density in gallons.
+fuel:
+  reserve_caution_min: 60.0
+  reserve_warning_min: 30.0
+  # Two JT8D-217s, about 2,700 kg/hr in the cruise. VERIFY.
+  cruise_burn_kg_hr: 2700.0
+  # Jet A-1, not 100LL — the density that briefed the 737 11.8% light.
+  kg_per_gal: 3.04
+  spoken_unit: lb
+
 reference:
   kind: twin-engine jet
+  # Same size class as the 737, so the same shape of numbers.
+  # Enroute vertical rates: the shared 700 fpm is a GA number and a ~1 degree
+  # path at these speeds. VERIFY.
+  enroute_climb_fpm: 2000.0
+  enroute_descent_fpm: 2000.0
+  optimum_alt_ft: 35000.0
+  optimum_alt_at_kg: 55000.0
+  optimum_alt_ft_per_1000kg: 290.0
   vr_kts: 140.0                # rotate, ~130,000 lb (V1 137 / V2 149). VERIFY
   vy_kts: 200.0                # climb-out + pattern speed the laws hold. VERIFY
   best_climb_fpm: 2500.0       # initial climb, light; the climb law takes 80%
@@ -173,8 +203,8 @@ flaps:
   # roll and retracts it climbing out. Without this the jet departed clean.
   takeoff_ratio: 0.275
   detents:
-    - { label: up,   spoken: up,             ratio: 0.0 }
-    - { label: "11", spoken: eleven,         ratio: 0.275, vfe_kts: 280.0 } # VERIFY
+    - { label: up,   spoken: up,             ratio: 0.0, retract_above_kts: 210.0 }
+    - { label: "11", spoken: eleven,         ratio: 0.275, vfe_kts: 280.0, retract_above_kts: 190.0 } # VERIFY
     - { label: "15", spoken: fifteen,        ratio: 0.375, vfe_kts: 240.0 } # VERIFY
     - { label: "28", spoken: twenty eight,   ratio: 0.70,  vfe_kts: 220.0 } # VERIFY
     - { label: "40", spoken: forty,          ratio: 1.0,   vfe_kts: 200.0 } # VERIFY

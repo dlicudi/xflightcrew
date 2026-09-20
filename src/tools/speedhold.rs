@@ -143,6 +143,31 @@ pub fn set_taxi_target(kts: f64) {
     }
 }
 
+/// The airspace speed limit: 250 KIAS below 10,000 feet.
+///
+/// A rule of the air, not an airframe fact, so it binds everything — and it
+/// is simply inert on anything that cannot reach it, which is every piston
+/// here. The 737 could: its profile holds 255 KIAS in the cruise (correctly,
+/// that is M0.78 up high) and the follower armed that at 1,031 ft AGL on
+/// departure and held it, busting the limit by five knots for the whole climb
+/// (BIKF-EGPH, 2026-09-20). The profile's own comment said "250 below 10,000
+/// is the cruise climb"; nothing enforced it.
+///
+/// INDICATED altitude, because that is what the rule and the altimeter both
+/// mean — the same reason the follower flies the altimeter.
+pub const BELOW_10K_LIMIT_KTS: f64 = 250.0;
+pub const SPEED_LIMIT_ALT_FT: f64 = 10_000.0;
+
+/// `wanted`, capped to [`BELOW_10K_LIMIT_KTS`] while below
+/// [`SPEED_LIMIT_ALT_FT`]. Pure, so the rule is one testable line.
+pub fn airspace_limited(alt_ft: f64, wanted: f64) -> f64 {
+    if alt_ft.is_finite() && alt_ft < SPEED_LIMIT_ALT_FT {
+        wanted.min(BELOW_10K_LIMIT_KTS)
+    } else {
+        wanted
+    }
+}
+
 /// Arm (or retarget) the FLIGHT speed-hold governor from code — the autoflight
 /// cruise-power hold. Same Flight-mode arm the `hold_speed` tool does: sets the
 /// target and, if the governor isn't already running, starts it on its own
@@ -1072,6 +1097,21 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// 255 KIAS is the 737's cruise hold and correct at altitude — M0.78 at
+    /// FL360. Armed at 1,031 ft on departure and held, it was a five knot
+    /// speed bust for the whole climb (BIKF-EGPH, 2026-09-20).
+    #[test]
+    fn the_cruise_speed_is_capped_below_ten_thousand() {
+        assert_eq!(airspace_limited(1_031.0, 255.0), 250.0, "the departure");
+        assert_eq!(airspace_limited(9_999.0, 255.0), 250.0, "right up to it");
+        assert_eq!(airspace_limited(10_000.0, 255.0), 255.0, "and free above");
+        assert_eq!(airspace_limited(35_000.0, 255.0), 255.0, "the cruise");
+        // Inert on anything that cannot reach the limit — every piston here.
+        assert_eq!(airspace_limited(1_000.0, 110.0), 110.0);
+        // A failed altitude read is no measurement: do not invent a cap.
+        assert_eq!(airspace_limited(f64::NAN, 255.0), 255.0);
+    }
     use super::*;
 
     #[test]

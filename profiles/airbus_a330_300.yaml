@@ -93,6 +93,15 @@ vlo_kts: 250.0
 # Tail clearance at rotation is about 12.5 degrees on the -300; the rotation
 # is bounded 2 degrees below. VERIFY.
 tail_strike_deg: 12.5
+# --- Jet/turboprop figures, added 2026-09-20 after the 737 shakedown. Every
+# law below defaults to a Cessna 172's number when a profile is silent, and on
+# BIKF-EGPH that flew an airliner on a 0.8 nm capture radius, a 700 fpm
+# descent, a 0.10 nose-down limit and avgas density. VERIFY each against the
+# POM/FCOM; they are reasoned from the type, not measured on it.
+# Nose-DOWN elevator the rotation law may command. The shared default is
+# 0.10, which on a jet is not authority at all: the 737 was commanded 8
+# degrees and flew 22.4 with the law pinned at its limit. VERIFY.
+pitch_authority_down: 0.5
 
 # Taxi pacing as the MD-82's: at idle a widebody rolls past 10 knots on its own.
 taxi:
@@ -106,6 +115,10 @@ fuel:
   reserve_caution_min: 60.0
   reserve_warning_min: 30.0
   cruise_burn_kg_hr: 5500.0
+  # Jet A-1, not the 100LL the shared default assumes: that briefed the
+  # 737's fuel 11.8% light and in a unit no crew uses (2026-09-20).
+  kg_per_gal: 3.04
+  spoken_unit: kg
 
 transition_altitude_ft: 18000.0
 
@@ -114,6 +127,15 @@ transition_altitude_ft: 18000.0
 # 8,200 ft, landing 4,750 ft, ceiling 41,000, cruise M0.86.
 reference:
   kind: twin-engine jet
+  # Widebody. Optimum anchored at 200 t; the -300 sits near FL330 at max takeoff
+# weight and near FL390 light, which is the ~85 ft per tonne below.
+  # Enroute vertical rates: the shared 700 fpm is a GA number and a ~1 degree
+  # path at these speeds. VERIFY.
+  enroute_climb_fpm: 2000.0
+  enroute_descent_fpm: 2000.0
+  optimum_alt_ft: 37000.0
+  optimum_alt_at_kg: 200000.0
+  optimum_alt_ft_per_1000kg: 85.0
   vr_kts: 148.0                # ~400,000 lb CONF 2 (V1 143 / V2 153). VERIFY
   vy_kts: 220.0                # climb-out + pattern speed the laws hold
   # The INITIAL climb, liftoff to the takeoff's handoff — V2 + 20 on this
@@ -147,8 +169,8 @@ reference:
 flaps:
   takeoff_ratio: 0.5
   detents:
-    - { label: "0",    spoken: up,    ratio: 0.0 }
-    - { label: "1",    spoken: one,   ratio: 0.25, vfe_kts: 215.0 } # acf Vfe1
+    - { label: "0",    spoken: up,    ratio: 0.0, retract_above_kts: 230.0 }
+    - { label: "1",    spoken: one,   ratio: 0.25, vfe_kts: 215.0, retract_above_kts: 200.0 } # acf Vfe1
     - { label: "2",    spoken: two,   ratio: 0.5,  vfe_kts: 196.0 } # VERIFY
     - { label: "3",    spoken: three, ratio: 0.75, vfe_kts: 186.0 } # VERIFY
     - { label: full,   spoken: full,  ratio: 1.0,  vfe_kts: 180.0 } # acf Vfe

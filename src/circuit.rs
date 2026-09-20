@@ -1170,6 +1170,13 @@ const LXGB_ROCK_CLEAR_M: f64 = 5_400.0;
 /// `vs_raw` clamp), and the fraction of it the pre-flight climb model
 /// credits: measured 550 to 650 fpm at 73 kt on the 172 against a 700 clamp.
 const AUTHORED_CLIMB_FPM: f64 = 700.0;
+
+/// ...or the airframe's own, when it climbs harder than a 172 does. The
+/// figure above is a measurement OF a 172 ("550 to 650 fpm at 73 kt"), which
+/// is exactly the kind of number that has no business capping a jet.
+fn authored_climb_fpm() -> f64 {
+    crate::procedure::climb_fpm().max(AUTHORED_CLIMB_FPM)
+}
 const AUTHORED_CLIMB_CREDIT: f64 = 0.75;
 
 /// Feet gained per metre flown at the pattern speed, for the climb model.
@@ -1568,7 +1575,7 @@ async fn fly_authored_route(
         // Vertical: VS toward the waypoint altitude (the takeoff's proven
         // recipe), and only as much climb as the airspeed will pay for.
         let vs_raw = if alt_msl_ft.is_finite() {
-            ((wp.alt_msl_ft - alt_msl_ft) * 3.0).clamp(-500.0, AUTHORED_CLIMB_FPM)
+            ((wp.alt_msl_ft - alt_msl_ft) * 3.0).clamp(-500.0, authored_climb_fpm())
         } else {
             0.0
         };
@@ -1686,7 +1693,11 @@ async fn fly_authored_route(
         approach_ias,
         voice,
         None,
-        Some(rwy_id.clone()),
+        // No ICAO needed: this is the runway we just took off from and have
+        // been circling for minutes, a mile away. Proximity IS the right
+        // answer here — unlike an arrival, which knows its destination and
+        // must say so (see `PlannedRunway`).
+        Some(crate::autoland::PlannedRunway::anywhere(&rwy_id)),
     );
     ACTIVE.store(false, Ordering::SeqCst);
 }
@@ -2209,7 +2220,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 p.approach_ias,
                 voice.clone(),
                 None,
-                Some(rwy_id.clone()),
+                Some(crate::autoland::PlannedRunway::anywhere(&rwy_id)),
             );
             ACTIVE.store(false, Ordering::SeqCst);
             return;
@@ -2581,7 +2592,7 @@ async fn try_published_arrival(
             apt_dat: apt_dat.clone(),
             cfg,
             approach_ias: ias,
-            rwy_id: Some(rwy_id.clone()),
+            rwy_id: Some(crate::autoland::PlannedRunway::at(&icao, &rwy_id)),
         };
         crate::procedure::approach_plan_for(
             &cifp, &fixp, &navp, &airport, &icao, &rwy_id, lat, lon, end,

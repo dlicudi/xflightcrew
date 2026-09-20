@@ -23,7 +23,6 @@ use crate::nav;
 use crate::phrase::digit_value;
 use crate::simbrief::{FlightPlan, PlanSource, Waypoint};
 
-const AVGAS_KG_PER_GAL: f64 = 2.72;
 const M_TO_FT: f64 = 3.280_84;
 
 /// Feet of cruise altitude (above the higher field) the leg length "earns":
@@ -419,7 +418,23 @@ pub struct AltInputs {
     pub service_ceiling_ft: Option<f64>,
     /// Pressurised (jets, turboprops): IFR whole-thousand levels, no oxygen cap.
     pub pressurised: bool,
+    /// The winds aloft, when the sim could be asked. `None` keeps the rule
+    /// exactly as it was — a plan made without a wind profile is still a plan.
+    pub winds: Option<crate::weather::WindsAloft>,
 }
+
+/// How far from the distance-earned level the wind is allowed to move the
+/// pick, and the gain it has to be worth.
+///
+/// The band is deliberately narrow, and the reason is that the obvious
+/// formulation is wrong: "pick the level with the least headwind" would have
+/// flown EIDW-BIKF at FL236, where the headwind is 45 kt lighter — and a
+/// turbofan down there burns far more than the 45 kt buys back. Real practice
+/// is to cruise near the efficient level and take the best wind WITHIN a step
+/// or two, which is what this does. Two thousand-foot levels either side.
+const WIND_SEARCH_FT: f64 = 4000.0;
+/// ...and only for a real gain, so a plan does not move a level for a knot.
+const WIND_WORTH_KTS: f64 = 10.0;
 
 /// The semicircular cruising level for `bearing`: odd thousands eastbound
 /// (000-179), even westbound, plus 500 for VFR piston flying.
@@ -462,16 +477,52 @@ pub fn cruise_altitude_ft(i: &AltInputs) -> f64 {
             break;
         }
     }
-    pick.unwrap_or(floor)
+    let pick = pick.unwrap_or(floor);
+    wind_adjusted(pick, floor, target, i).unwrap_or(pick)
 }
 
-/// Fuel and time for the leg, from the profile's cruise figures.
+/// Among the levels within [`WIND_SEARCH_FT`] of `pick` that the rule would
+/// also allow, the one with the least headwind on the route bearing — if it
+/// beats `pick` by [`WIND_WORTH_KTS`].
+///
+/// Deliberately a nudge to the existing answer rather than a rule of its own:
+/// every constraint that produced `pick` (terrain floor, ceiling, oxygen,
+/// semicircular direction) still binds, and the search only reorders what was
+/// already legal. `None` when there are no winds or nothing worth moving for.
+fn wind_adjusted(pick: f64, floor: f64, target: f64, i: &AltInputs) -> Option<f64> {
+    let winds = i.winds.as_ref()?;
+    let eastbound = i.bearing_deg.rem_euclid(360.0) < 180.0;
+    let vfr = !i.pressurised;
+    let here = winds.headwind_at(pick, i.bearing_deg)?;
+    let mut best = (pick, here);
+    for l in (1..=60).filter_map(|k| level_for(k, eastbound, vfr)) {
+        // The band, and every constraint that shaped the original pick. The
+        // ceiling and the oxygen cap live in `target`, so staying at or under
+        // it keeps them — this can only ever move DOWN from a capped level.
+        if (l - pick).abs() > WIND_SEARCH_FT || l < floor || l > target.max(pick) {
+            continue;
+        }
+        let Some(hw) = winds.headwind_at(l, i.bearing_deg) else {
+            continue;
+        };
+        if hw < best.1 {
+            best = (l, hw);
+        }
+    }
+    (best.0 != pick && here - best.1 >= WIND_WORTH_KTS).then_some(best.0)
+}
+
+/// Fuel and time for the leg, from the profile's cruise figures. KILOGRAMS,
+/// because that is the unit the burn arrives in and the unit the sim's tanks
+/// are read in — a density belongs at the moment of SPEAKING, once, and
+/// nowhere else. Going through gallons here meant converting kg/hr down at
+/// avgas density and back up again, on airframes that burn kerosene.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FuelPlan {
     pub ete_min: f64,
-    pub trip_gal: f64,
-    pub reserve_gal: f64,
-    pub block_gal: f64,
+    pub trip_kg: f64,
+    pub reserve_kg: f64,
+    pub block_kg: f64,
 }
 
 /// `None` when the profile lacks a cruise speed or burn: the copilot then
@@ -482,14 +533,13 @@ pub fn fuel_plan(dist_nm: f64, cruise_kts: Option<f64>, burn_kg_hr: f64) -> Opti
         return None;
     }
     let ete_min = dist_nm / cruise * 60.0 + CLIMB_ALLOWANCE_MIN;
-    let gph = burn_kg_hr / AVGAS_KG_PER_GAL;
-    let trip_gal = gph * ete_min / 60.0;
-    let reserve_gal = gph * RESERVE_MIN / 60.0;
+    let trip_kg = burn_kg_hr * ete_min / 60.0;
+    let reserve_kg = burn_kg_hr * RESERVE_MIN / 60.0;
     Some(FuelPlan {
         ete_min,
-        trip_gal,
-        reserve_gal,
-        block_gal: trip_gal + reserve_gal,
+        trip_kg,
+        reserve_kg,
+        block_kg: trip_kg + reserve_kg,
     })
 }
 
@@ -673,8 +723,15 @@ pub struct Planned {
     pub fuel: Option<FuelPlan>,
     pub cruise_kts: Option<f64>,
     /// Fuel in the tanks now, gallons; `None` = unreadable.
-    pub aboard_gal: Option<f64>,
+    /// What is actually in the tanks, KILOGRAMS — spoken in the airframe's
+    /// own unit like every other fuel figure.
+    pub aboard_kg: Option<f64>,
     pub aircraft: String,
+}
+
+/// Thousands separators for an already-converted fuel figure.
+fn commas_f(n: f64) -> String {
+    crate::auto_status::commas(n.round() as i64)
 }
 
 impl Planned {
@@ -690,13 +747,10 @@ impl Planned {
             cruise_alt_ft: self.cruise_alt_ft,
             distance_nm: self.dist_nm,
             ete_min: f.map(|f| f.ete_min).unwrap_or(0.0),
-            block_fuel_gal: f.map(|f| f.block_gal).unwrap_or(0.0),
-            trip_fuel_gal: f.map(|f| f.trip_gal).unwrap_or(0.0),
-            reserve_gal: f.map(|f| f.reserve_gal).unwrap_or(0.0),
-            block_fuel_kg: f.map(|f| f.block_gal * AVGAS_KG_PER_GAL).unwrap_or(0.0),
-            min_takeoff_fuel_kg: f
-                .map(|f| (f.trip_gal + f.reserve_gal) * AVGAS_KG_PER_GAL)
-                .unwrap_or(0.0),
+            trip_fuel_kg: f.map(|f| f.trip_kg).unwrap_or(0.0),
+            reserve_kg: f.map(|f| f.reserve_kg).unwrap_or(0.0),
+            block_fuel_kg: f.map(|f| f.block_kg).unwrap_or(0.0),
+            min_takeoff_fuel_kg: f.map(|f| f.trip_kg + f.reserve_kg).unwrap_or(0.0),
             weights: None,
             route: "direct".to_string(),
             wind_comp_kts: 0.0,
@@ -741,20 +795,28 @@ impl Planned {
         match (&self.fuel, self.cruise_kts) {
             (Some(f), Some(k)) => {
                 s.push_str(&format!(
-                    " About {} at {k:.0} knots. Trip fuel {:.0} gallons, {:.0} with a {} minute reserve",
+                    " About {} at {k:.0} knots. Trip fuel {}, {} with a {} minute reserve",
                     spoken_minutes(f.ete_min),
-                    f.trip_gal,
-                    f.block_gal,
+                    crate::aircraft::say_fuel_kg(f.trip_kg),
+                    crate::aircraft::fuel_figure_kg(f.block_kg),
                     RESERVE_MIN
                 ));
-                match self.aboard_gal {
-                    Some(a) if a + 0.5 >= f.block_gal => {
-                        s.push_str(&format!("; {a:.0} aboard, enough."))
+                // Rounded into the airframe's unit BEFORE the subtraction, so
+                // the figures the pilot hears agree with each other.
+                match self.aboard_kg {
+                    Some(kg) => {
+                        let a = crate::aircraft::fuel_in_unit_kg(kg).round();
+                        let need = crate::aircraft::fuel_in_unit_kg(f.block_kg).round();
+                        if a >= need {
+                            s.push_str(&format!("; {} aboard, enough.", commas_f(a)));
+                        } else {
+                            s.push_str(&format!(
+                                "; {} aboard, short by {}. Fuel before we go.",
+                                commas_f(a),
+                                commas_f(need - a)
+                            ));
+                        }
                     }
-                    Some(a) => s.push_str(&format!(
-                        "; {a:.0} aboard, short by {:.0}. Fuel before we go.",
-                        f.block_gal - a
-                    )),
                     None => s.push('.'),
                 }
             }
@@ -893,6 +955,90 @@ mod tests {
         assert!(parse_destination("").is_none());
     }
 
+    /// The EIDW-BIKF wind profile as the sim published it (2026-09-20), in
+    /// the sim's own units: thirteen layers, meters and meters per second.
+    fn atlantic_jetstream() -> crate::weather::WindsAloft {
+        crate::weather::WindsAloft::from_layers(
+            &[
+                0.0, 540.1, 988.5, 1948.3, 3010.8, 4206.5, 5572.0, 7182.3, 9160.2, 10362.9,
+                11887.2, 13594.1, 16179.4,
+            ],
+            &[
+                4.70, 5.17, 5.15, 6.15, 9.23, 13.36, 19.49, 31.21, 50.88, 61.16, 57.40, 39.84,
+                19.07,
+            ],
+            &[
+                274.7, 274.7, 263.4, 283.8, 277.7, 268.4, 268.6, 279.6, 280.9, 278.9, 284.9, 282.9,
+                279.6,
+            ],
+        )
+        .expect("thirteen good layers")
+    }
+
+    /// The wind moves the level, but only within the band and only for a real
+    /// gain — and it never reaches for the calm air far below, which is the
+    /// mistake the narrow band exists to prevent.
+    #[test]
+    fn the_cruise_level_takes_the_best_wind_it_can_afford() {
+        let jet = AltInputs {
+            bearing_deg: 317.0,
+            dist_nm: 900.0,
+            origin_elev_ft: 200.0,
+            dest_elev_ft: 171.0,
+            max_terrain_ft: Some(3000.0),
+            service_ceiling_ft: Some(41_000.0),
+            pressurised: true,
+            winds: None,
+        };
+        let still = cruise_altitude_ft(&jet);
+        let windy = cruise_altitude_ft(&AltInputs {
+            winds: Some(atlantic_jetstream()),
+            ..jet.clone()
+        });
+        assert!(
+            (windy - still).abs() <= WIND_SEARCH_FT,
+            "the wind nudges the rule, it does not replace it: {still} -> {windy}"
+        );
+        // FL236 is 45 kt calmer than FL340 and 10,000 ft below the band. A
+        // "least headwind" rule would have gone there and burned more.
+        assert!(
+            windy > 28_000.0,
+            "never drops out of efficient air for wind alone: {windy}"
+        );
+        // And the level it picks really is no worse on wind than the one the
+        // distance alone earned.
+        let w = atlantic_jetstream();
+        let (a, b) = (
+            w.headwind_at(still, 317.0).unwrap(),
+            w.headwind_at(windy, 317.0).unwrap(),
+        );
+        assert!(b <= a, "the pick is never a worse wind: {a:.0} -> {b:.0}");
+    }
+
+    /// The jet stream this flight actually met: a core across FL300-FL390
+    /// where climbing buys nothing, and calm air far below where descending
+    /// would cost more than it saves. Both readings come out of the profile.
+    #[test]
+    fn the_wind_profile_reads_the_core_and_the_calm_beneath_it() {
+        let w = atlantic_jetstream();
+        let hw = |ft: f64| w.headwind_at(ft, 317.3).unwrap();
+        assert!(
+            hw(34_000.0) > 90.0,
+            "FL340 is in the core: {:.0}",
+            hw(34_000.0)
+        );
+        assert!(hw(39_000.0) > 90.0, "so is FL390: {:.0}", hw(39_000.0));
+        assert!(
+            (hw(39_000.0) - hw(34_000.0)).abs() < 5.0,
+            "climbing through the core buys nothing: {:.0} vs {:.0}",
+            hw(34_000.0),
+            hw(39_000.0)
+        );
+        assert!(hw(23_600.0) < 55.0, "calm beneath: {:.0}", hw(23_600.0));
+        // A tailwind is negative, so the sign survives the round trip.
+        assert!(w.headwind_at(34_000.0, 99.0).unwrap() < -90.0, "reciprocal");
+    }
+
     #[test]
     fn altitude_rule_is_semicircular_terrain_floored_and_capped() {
         let base = AltInputs {
@@ -903,6 +1049,8 @@ mod tests {
             max_terrain_ft: Some(1400.0),
             service_ceiling_ft: Some(14_000.0),
             pressurised: false,
+            // No winds: every assertion below is the rule exactly as it was.
+            winds: None,
         };
         // 60 nm earns ~4,800: eastbound VFR level under that is 3,500 (floor 3,400).
         assert_eq!(cruise_altitude_ft(&base), 3500.0);
@@ -954,10 +1102,14 @@ mod tests {
 
     #[test]
     fn fuel_from_profile_or_nothing() {
+        // 24 kg/hr for 40 minutes, plus a 45 minute reserve — in KILOS, the
+        // unit the burn arrives in. The old assertions were the same fuel put
+        // through avgas density and back.
         let f = fuel_plan(62.0, Some(124.0), 24.0).unwrap();
         assert!((f.ete_min - 40.0).abs() < 0.1);
-        assert!((f.trip_gal - 5.9).abs() < 0.1);
-        assert!((f.reserve_gal - 6.6).abs() < 0.1);
+        assert!((f.trip_kg - 16.0).abs() < 0.1, "{}", f.trip_kg);
+        assert!((f.reserve_kg - 18.0).abs() < 0.1, "{}", f.reserve_kg);
+        assert!((f.block_kg - 34.0).abs() < 0.1, "{}", f.block_kg);
         assert!(fuel_plan(62.0, None, 24.0).is_none());
         assert!(fuel_plan(62.0, Some(124.0), 0.0).is_none());
     }
@@ -1112,7 +1264,7 @@ mod tests {
             max_terrain_ft: Some(2800.0),
             fuel: fuel_plan(62.0, Some(124.0), 25.0),
             cruise_kts: Some(124.0),
-            aboard_gal: Some(40.0),
+            aboard_kg: Some(40.0 * 2.72),
             aircraft: "Cessna 172SP".into(),
         }
     }
@@ -1135,7 +1287,7 @@ mod tests {
             "{b}"
         );
         let short = Planned {
-            aboard_gal: Some(8.0),
+            aboard_kg: Some(8.0 * 2.72),
             ..planned()
         };
         let b = short.brief(true);

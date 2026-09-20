@@ -148,6 +148,12 @@ vlo_kts: 235.0
 # extension on the -800, the longest-bodied 737 of its generation. The auto
 # takeoff bounds its rotation 2 degrees below this. VERIFY.
 tail_strike_deg: 11.0
+# Nose-down elevator the rotation law may command. The shared GA default is
+# 0.10, which on this airframe is not authority: commanded 8 degrees, it flew
+# 22.4 with the law pinned at -0.10 and the pitch rate still building, wanting
+# -0.38 (BIKF-EGPH, 2026-09-20). Half travel is enough to hold the tail-strike
+# ceiling above without being able to shove the nose at the runway.
+pitch_authority_down: 0.5
 
 # Taxi pacing: an MD-82 figure. At idle thrust a 737 rolls past 10 knots on
 # flat pavement, so 10 is a brake setting; airline practice is 15-20 straight,
@@ -163,6 +169,14 @@ fuel:
   reserve_caution_min: 60.0
   reserve_warning_min: 30.0
   cruise_burn_kg_hr: 2500.0
+  # Jet A-1, not 100LL. The shared default is avgas (2.72), which briefed this
+  # airframe's fuel 11.8% light: 3,126 kg in the tanks was read back as "1,149
+  # gallons" when it is 1,028 (BIKF-EGPH, 2026-09-20).
+  kg_per_gal: 3.04
+  # ...and an airliner is fuelled in kilos, never gallons. Full auto's own
+  # preflight already spoke pounds; the plan brief spoke gallons. One cockpit,
+  # one unit.
+  spoken_unit: kg
 
 # Transition altitude is the FLIGHT's, not the airframe's; the plan overrides
 # this when it carries one. FL180 is the default for the US.
@@ -191,6 +205,23 @@ reference:
   # and on 2026-09-17 the aircraft could not reach it and sat at 240 on the
   # stop). Lower cruise is slower than it could be; that is the safe side.
   cruise_ias_kts: 255.0
+  # Optimum cruise altitude, and how it rises as fuel burns off. Anchored at
+  # 65 t / FL380; the -800 sits near FL340 at max takeoff weight and near
+  # FL400 light, which is the ~290 ft per tonne below. Advisory only: the
+  # copilot offers the step, the pilot asks ATC for it. VERIFY against the FCOM
+  # cruise tables.
+  optimum_alt_ft: 38000.0
+  optimum_alt_at_kg: 65000.0
+  optimum_alt_ft_per_1000kg: 290.0
+  # Enroute vertical rates. The shared 700 fpm default is a GA number and a
+  # 1.1 degree path at these speeds: the BIKF arrival wanted ~2,000 fpm on
+  # every leg inbound of BASLU, and the climb to FL340 took 37 minutes at it.
+  # 2,000 fpm is an ordinary jet climb at mid-altitudes and an idle descent
+  # near enough a 3 degree path at 340 kt over the ground. The climb is still
+  # speed-protected on top of this (`climb_vs_fpm`), so a rate the aircraft
+  # cannot support up high backs itself off.
+  enroute_climb_fpm: 2000.0
+  enroute_descent_fpm: 2000.0
   approach_kts: 145.0          # POM 135-155, full flap / gear down; Vref40 ~140 mid weight
   vs0_kts: 114.0               # acf: stall, landing configuration
   cruise_kts: 450.0            # POM long-range cruise, KTAS (max level 490)
@@ -215,9 +246,13 @@ reference:
 flaps:
   takeoff_ratio: 0.375
   detents:
-    - { label: up,   spoken: up,          ratio: 0.0 }
-    - { label: "1",  spoken: one,         ratio: 0.125, vfe_kts: 250.0 }
-    - { label: "2",  spoken: two,         ratio: 0.25,  vfe_kts: 250.0 }
+    # `retract_above_kts` is the detent's manoeuvring speed and gates the
+    # climb-out retraction. Flaps 5 is the takeoff setting, so the schedule
+    # this airframe actually walks is 5 -> 1 -> up. VERIFY against the FCOM
+    # flap manoeuvring speed card for the operating weight.
+    - { label: up,   spoken: up,          ratio: 0.0,   retract_above_kts: 210.0 }
+    - { label: "1",  spoken: one,         ratio: 0.125, vfe_kts: 250.0, retract_above_kts: 190.0 }
+    - { label: "2",  spoken: two,         ratio: 0.25,  vfe_kts: 250.0, retract_above_kts: 180.0 }
     - { label: "5",  spoken: five,        ratio: 0.375, vfe_kts: 250.0 }
     - { label: "10", spoken: ten,         ratio: 0.5,   vfe_kts: 210.0 } # VERIFY
     - { label: "15", spoken: fifteen,     ratio: 0.625, vfe_kts: 200.0 } # VERIFY

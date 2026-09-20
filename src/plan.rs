@@ -555,6 +555,9 @@ pub(crate) async fn plan_flight(
         max_terrain_ft,
         service_ceiling_ft: r.and_then(|r| r.service_ceiling_ft),
         pressurised,
+        // The winds the level will actually be flown in. Best effort: a plan
+        // without them is the plan we always made.
+        winds: crate::weather::winds_aloft(xp).await,
     });
     let cruise_kts = r.and_then(|r| r.cruise_kts);
     let burn = profile
@@ -572,7 +575,7 @@ pub(crate) async fn plan_flight(
         max_terrain_ft,
         fuel: flightplan::fuel_plan(dist_nm, cruise_kts, burn),
         cruise_kts,
-        aboard_gal: fuel_kg.ok().map(|kg| kg / AVGAS_KG_PER_GAL),
+        aboard_kg: fuel_kg.ok(),
         aircraft: profile.display_name.clone(),
     };
     blackbox::record(
@@ -585,8 +588,8 @@ pub(crate) async fn plan_flight(
             "bearing": bearing.round(),
             "cruise_alt_ft": cruise_alt_ft,
             "max_terrain_ft": max_terrain_ft,
-            "block_gal": planned.fuel.as_ref().map(|f| f.block_gal),
-            "aboard_gal": planned.aboard_gal,
+            "block_kg": planned.fuel.as_ref().map(|f| f.block_kg),
+            "aboard_kg": planned.aboard_kg,
             "load": req.load,
         }),
     );
@@ -706,18 +709,24 @@ pub(crate) async fn flight_plan_report(
             fp.tod_to_dest_nm, fp.destination
         ));
     }
-    // Fuel check: planned block vs what's in the tanks (read in kg, report gallons).
+    // Fuel check: planned block against what's in the tanks. BOTH SIDES IN
+    // KILOGRAMS — the sim's own unit and the plan's — converted to the
+    // airframe's spoken unit only at the last moment, and ROUNDED THERE so
+    // the three numbers the pilot hears actually subtract.
     if let Ok(kg) = xp.get_float(datarefs::FUEL_TOTAL_KG).await {
-        let aboard = kg / AVGAS_KG_PER_GAL;
-        if aboard + 0.5 >= fp.block_fuel_gal {
+        let aboard = crate::aircraft::fuel_in_unit_kg(kg).round();
+        let need = crate::aircraft::fuel_in_unit_kg(fp.block_fuel_kg).round();
+        if aboard >= need {
             line.push_str(&format!(
-                " You have {aboard:.0} gallons aboard, enough for the plan."
+                " You have {} aboard, enough for the plan.",
+                crate::aircraft::say_fuel_figure(aboard)
             ));
         } else {
             line.push_str(&format!(
-                " You have {aboard:.0} aboard, but the plan needs {:.0}; short about {:.0}.",
-                fp.block_fuel_gal,
-                fp.block_fuel_gal - aboard
+                " You have {} aboard, but the plan needs {}; short about {}.",
+                crate::aircraft::say_fuel_figure(aboard),
+                crate::aircraft::fuel_figure_kg(fp.block_fuel_kg),
+                crate::aircraft::say_fuel_figure(need - aboard),
             ));
         }
     }

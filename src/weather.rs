@@ -403,6 +403,136 @@ pub fn briefing(xplane_root: &str, icao: &str, label: &str) -> Result<String, St
     Ok(out)
 }
 
+/// The region's wind profile: the winds we could be in at another level, as
+/// opposed to [`wind_of`]/[`surface_wind`], which are the wind somewhere
+/// specific. Layers are `(altitude ft MSL, direction FROM degrees true,
+/// speed knots)`, ascending.
+///
+/// This is what makes a cruise level a choice rather than a formula. On
+/// EIDW-BIKF (2026-09-20) the jet stream core sat across FL300-FL390 — 93 kt
+/// of headwind at the planned FL340 and 94 at FL390, but only 48 at FL236 —
+/// and nothing in the plan had ever looked.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WindsAloft {
+    pub layers: Vec<(f64, f64, f64)>,
+}
+
+/// Meters per second to knots.
+const MSC_TO_KTS: f64 = 1.943_844;
+
+impl WindsAloft {
+    /// Build from the sim's three parallel layer arrays. `None` unless all
+    /// three agree on a length and at least two layers are usable — one layer
+    /// is not a profile, and a profile is the only thing worth choosing from.
+    pub fn from_layers(alt_m: &[f64], speed_msc: &[f64], dir_deg: &[f64]) -> Option<WindsAloft> {
+        let n = alt_m.len();
+        if n != speed_msc.len() || n != dir_deg.len() {
+            return None;
+        }
+        let mut layers: Vec<(f64, f64, f64)> = alt_m
+            .iter()
+            .zip(speed_msc)
+            .zip(dir_deg)
+            .filter(|((a, s), d)| a.is_finite() && s.is_finite() && d.is_finite() && **s >= 0.0)
+            .map(|((a, s), d)| (a * 3.280_84, d.rem_euclid(360.0), s * MSC_TO_KTS))
+            .collect();
+        layers.sort_by(|a, b| a.0.total_cmp(&b.0));
+        (layers.len() >= 2).then_some(WindsAloft { layers })
+    }
+
+    /// The wind at `alt_ft` as `(east, north)` components in knots, linearly
+    /// interpolated between the bracketing layers and held flat outside them.
+    ///
+    /// Interpolated as a VECTOR, never as a direction: averaging 350° and 010°
+    /// as numbers gives 180°, a wind blowing the opposite way.
+    fn uv_at(&self, alt_ft: f64) -> Option<(f64, f64)> {
+        let uv = |&(_, d, s): &(f64, f64, f64)| {
+            let r = d.to_radians();
+            (-s * r.sin(), -s * r.cos())
+        };
+        let first = self.layers.first()?;
+        let last = self.layers.last()?;
+        if alt_ft <= first.0 {
+            return Some(uv(first));
+        }
+        if alt_ft >= last.0 {
+            return Some(uv(last));
+        }
+        let hi = self.layers.iter().position(|l| l.0 >= alt_ft)?;
+        let (lo_l, hi_l) = (&self.layers[hi - 1], &self.layers[hi]);
+        let span = hi_l.0 - lo_l.0;
+        let f = if span > 0.0 {
+            (alt_ft - lo_l.0) / span
+        } else {
+            0.0
+        };
+        let ((u0, v0), (u1, v1)) = (uv(lo_l), uv(hi_l));
+        Some((u0 + (u1 - u0) * f, v0 + (v1 - v0) * f))
+    }
+
+    /// The wind at `alt_ft` as `(direction FROM degrees true, knots)`.
+    pub fn at_ft(&self, alt_ft: f64) -> Option<(f64, f64)> {
+        let (u, v) = self.uv_at(alt_ft)?;
+        let kts = u.hypot(v);
+        let from = (u.atan2(v).to_degrees() + 180.0).rem_euclid(360.0);
+        Some((from, kts))
+    }
+
+    /// Headwind component on `track_deg` at `alt_ft`, knots. POSITIVE is a
+    /// headwind; a tailwind is negative, because the sign is the whole
+    /// question and a magnitude would hide which way the air is pushing.
+    pub fn headwind_at(&self, alt_ft: f64, track_deg: f64) -> Option<f64> {
+        let (u, v) = self.uv_at(alt_ft)?;
+        let t = track_deg.to_radians();
+        Some(-(u * t.sin() + v * t.cos()))
+    }
+}
+
+/// How often the wind profile is actually fetched. The monitor asks every
+/// tick at 3 Hz; the weather moves on its own clock, and three ARRAY reads
+/// nine times a second is exactly the kind of volume the API-load histogram
+/// exists to catch. Everything downstream tolerates a minute of staleness:
+/// the plan is made once and the step-climb advisory sustains for two.
+const WINDS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+static WINDS_CACHE: std::sync::Mutex<Option<(std::time::Instant, WindsAloft)>> =
+    std::sync::Mutex::new(None);
+
+/// Read the region's wind profile from the sim, at most once per
+/// [`WINDS_TTL`]. `None` whenever the three arrays can't all be had or don't
+/// agree — a level chosen on half a wind profile would be worse than one
+/// chosen on none, which is what the plan did before this existed.
+///
+/// A failed read keeps serving the last good profile until it expires: the
+/// wind a minute ago is a far better answer than no wind at all, and the
+/// alternative is an advisory that flickers with the API.
+pub async fn winds_aloft(xp: &sim::xplane::XPlaneClient) -> Option<WindsAloft> {
+    if let Some((t, w)) = WINDS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        if t.elapsed() < WINDS_TTL {
+            return Some(w.clone());
+        }
+    }
+    let (alt, spd, dir) = tokio::join!(
+        xp.get_float_array(sim::datarefs::WINDS_ALOFT_ALT_M),
+        xp.get_float_array(sim::datarefs::WINDS_ALOFT_SPEED_MSC),
+        xp.get_float_array(sim::datarefs::WINDS_ALOFT_DIR_DEG_TRUE),
+    );
+    let fresh = (|| WindsAloft::from_layers(&alt.ok()?, &spd.ok()?, &dir.ok()?))();
+    let mut cache = WINDS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    match fresh {
+        Some(w) => {
+            *cache = Some((std::time::Instant::now(), w.clone()));
+            Some(w)
+        }
+        // Keep the stale one rather than going blind, but do not refresh its
+        // stamp: the next tick tries again.
+        None => cache.as_ref().map(|(_, w)| w.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

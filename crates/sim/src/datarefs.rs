@@ -62,6 +62,15 @@ pub const WIND_DIR_DEG_TRUE: &str = "sim/weather/aircraft/wind_now_direction_deg
 /// Wind speed at the aircraft, METERS PER SECOND (× 1.943844 for knots).
 pub const WIND_SPEED_MSC: &str = "sim/weather/aircraft/wind_now_speed_msc";
 pub const OAT_DEG_C: &str = "sim/cockpit2/temperature/outside_air_temp_degc";
+/// The REGION's wind profile: thirteen layers, altitude MSL in meters with a
+/// matching speed and direction per index. The `aircraft/*` pair above is the
+/// wind we are IN; these are the winds we could be in at another level, which
+/// is what a cruise-level choice is actually about.
+pub const WINDS_ALOFT_ALT_M: &str = "sim/weather/region/wind_altitude_msl_m";
+/// Layer wind speeds, METERS PER SECOND (× 1.943844 for knots).
+pub const WINDS_ALOFT_SPEED_MSC: &str = "sim/weather/region/wind_speed_msc";
+/// Layer wind directions, degrees TRUE (the direction the wind comes FROM).
+pub const WINDS_ALOFT_DIR_DEG_TRUE: &str = "sim/weather/region/wind_direction_degt";
 pub const VISIBILITY_SM: &str = "sim/weather/aircraft/visibility_reported_sm";
 /// Sea-level pressure in Pascals (1 inHg = 3386.389 Pa).
 pub const QNH_PASCALS: &str = "sim/weather/aircraft/qnh_pas";

@@ -221,6 +221,17 @@ const PITCH_LEAD_S: f64 = 0.3;
 /// exists for the OVERSHOOT, which is what actually strikes.
 const TAIL_STRIKE_MARGIN_DEG: f64 = 2.0;
 const PITCH_MAX: f64 = 0.65;
+/// Nose-DOWN authority the rotation law may command. The GA figure, and the
+/// default for anything whose profile declares nothing.
+///
+/// A tenth of the travel is plenty on a light single, where the rotation only
+/// ever needs holding back, and deliberately small so a law that is about to
+/// ring cannot shove the nose at the runway. On a jet at takeoff thrust with
+/// nose-up trim it is not authority at all: BIKF-EGPH (2026-09-20) commanded
+/// 8 degrees and watched the nose go to 22.4, the law pinned at this limit
+/// for the whole divergence with the pitch RATE still building — it wanted
+/// -0.38 and could ask for -0.10. Only the autopilot engaging at 1,000 ft
+/// ended it. See [`RotatePitch::new`].
 const PITCH_MIN: f64 = -0.10;
 /// Hand the established climb to the autopilot this high — clear of ground
 /// effect, wings level, speed building; the VS dial is written AFTER the
@@ -240,6 +251,26 @@ const AIL_SLEW_PER_S: f64 = 2.0;
 /// Default hand-back height above the field, feet (a normal departure); a
 /// circuit overrides it lower via `Params::handoff_agl_ft`.
 pub const DEFAULT_HANDOFF_AGL_FT: f64 = 1000.0;
+/// The next flap setting to select, retracting: the detent ONE step cleaner
+/// than `current`, taken only once the speed allows it.
+///
+/// `schedule` is `(handle ratio, manoeuvring speed)` from the profile's
+/// detents. One step at a time, the way a crew does it and the way the flaps
+/// physically travel — never "the cleanest this speed allows", which on a
+/// fast clean-up would skip a detent the aircraft is still passing through.
+///
+/// `None` when there is nothing cleaner, or when the next step is still too
+/// fast for us. An empty schedule means the airframe declares no manoeuvring
+/// speeds and keeps the old one-shot clean-up.
+pub fn flap_retract_step(schedule: &[(f64, f64)], current: f64, ias: f64) -> Option<f64> {
+    schedule
+        .iter()
+        .filter(|(ratio, _)| *ratio < current - 1e-6)
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .filter(|(_, min_kts)| ias >= *min_kts)
+        .map(|(ratio, _)| *ratio)
+}
+
 /// Raise the gear (when there is one) above this, climbing.
 const GEAR_UP_AGL_FT: f64 = 200.0;
 
@@ -294,6 +325,10 @@ pub struct Params {
     /// Flap-handle ratio to set for takeoff, retracted once safely climbing.
     /// `None` leaves the flaps as the pilot left them.
     pub takeoff_flap_ratio: Option<f64>,
+    /// `(handle ratio, manoeuvring speed)` for every detent that declares one,
+    /// the climb-out retraction schedule. Empty on an airframe with no
+    /// declared speeds, which keeps the one-shot clean-up.
+    pub flap_schedule: Vec<(f64, f64)>,
     /// The runway END the tower cleared ("09R"), for the line-up crosscheck.
     /// `None` when no ATC is running or no runway is on the clearance.
     pub cleared_runway: Option<String>,
@@ -307,6 +342,8 @@ pub struct Params {
     /// The rotation will not command within [`TAIL_STRIKE_MARGIN_DEG`] of it.
     /// `None` on airframes short enough not to have one worth naming.
     pub tail_strike_deg: Option<f64>,
+    /// This airframe's nose-down elevator limit, 0..1. `None` = the GA tenth.
+    pub pitch_authority_down: Option<f64>,
     /// Never-exceed / Vmo, KIAS — the climb's OVERSPEED protection. `None`
     /// keeps the full-power climb every airframe flew before this existed.
     pub vne_kts: Option<f64>,
@@ -519,18 +556,31 @@ pub struct RotatePitch {
     /// with no geometry limit worth naming (the GA singles: a 172 runs out of
     /// elevator long before it runs out of tail clearance).
     ceiling: Option<f64>,
+    /// This airframe's nose-down limit — see [`PITCH_MIN`].
+    pitch_min: f64,
 }
 
 impl RotatePitch {
     /// `tail_strike_deg` is the airframe's tail-clearance attitude, from the
     /// profile. `None` leaves the law with only its own 8° target.
     pub fn new(tail_strike_deg: Option<f64>) -> Self {
+        Self::with_authority(tail_strike_deg, PITCH_MIN)
+    }
+
+    /// ...and with this airframe's own nose-down authority. A ceiling the law
+    /// cannot push against is not a ceiling: the 737 declares an 11° tail
+    /// strike, was commanded 8°, and flew 22.4° because the push it wanted
+    /// was four times what it was allowed to ask for (2026-09-20).
+    pub fn with_authority(tail_strike_deg: Option<f64>, pitch_min: f64) -> Self {
         RotatePitch {
             out: 0.0,
             prev_theta: None,
             trim: 0.0,
             target: None,
             ceiling: tail_strike_deg.map(|d| d - TAIL_STRIKE_MARGIN_DEG),
+            // Never POSITIVE — a "minimum" above zero would be a standing
+            // pull the law could not release — and never past full travel.
+            pitch_min: pitch_min.clamp(-1.0, 0.0),
         }
     }
 
@@ -590,8 +640,8 @@ impl RotatePitch {
         // integrator is left to do the one job the original comment actually
         // wanted from it — hold the standing pull the trim state demands, so
         // that on target and steady the elevator does not fall away.
-        self.trim = (self.trim + err * PITCH_TRIM_PER_DEG_S * dt).clamp(PITCH_MIN, PITCH_MAX);
-        self.out = (err * PITCH_P_PER_DEG + self.trim).clamp(PITCH_MIN, PITCH_MAX);
+        self.trim = (self.trim + err * PITCH_TRIM_PER_DEG_S * dt).clamp(self.pitch_min, PITCH_MAX);
+        self.out = (err * PITCH_P_PER_DEG + self.trim).clamp(self.pitch_min, PITCH_MAX);
         self.out
     }
 }
@@ -1014,6 +1064,8 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     }
     // Nothing to retract if we took off clean (<= a whisker of flap).
     let mut flaps_retracted = p.takeoff_flap_ratio.unwrap_or(0.0) <= 0.01;
+    // The setting the law believes is selected, for the schedule to walk down.
+    let mut flap_cmd = p.takeoff_flap_ratio.unwrap_or(0.0);
 
     let mut airborne = false;
     let mut rotated = false;
@@ -1022,7 +1074,10 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut gear_raised = !p.retract_gear;
     let mut positive_called = false;
     let mut thr_challenged = false;
-    let mut pitch_law = RotatePitch::new(p.tail_strike_deg);
+    let mut pitch_law = RotatePitch::with_authority(
+        p.tail_strike_deg,
+        p.pitch_authority_down.map_or(PITCH_MIN, |a| -a.abs()),
+    );
     let mut wings = WingsLevel::default();
     let mut last_vs_cmd: Option<f64> = None;
     let mut last_thr_cmd = 0.3_f64;
@@ -1312,12 +1367,37 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             let _ = xp.set_float(GEAR_HANDLE, 0.0).await;
             alert(&voice, Priority::Advisory, "Gear up.");
         }
-        // Clean up the takeoff flaps once safely climbing above Vy — after the
-        // gear, the way a crew does it.
-        if !flaps_retracted && agl_ft > FLAP_RETRACT_AGL_FT && ias > p.initial_climb_kts {
-            flaps_retracted = true;
-            let _ = xp.set_float(FLAP_HANDLE, 0.0).await;
-            alert(&voice, Priority::Advisory, "Flaps up.");
+        // Clean up the takeoff flaps once safely climbing — after the gear,
+        // the way a crew does it. On an airframe that declares manoeuvring
+        // speeds this walks the schedule a detent at a time and each step
+        // waits for its own speed; without one it is the old single shot.
+        if !flaps_retracted && agl_ft > FLAP_RETRACT_AGL_FT {
+            if p.flap_schedule.is_empty() {
+                if ias > p.initial_climb_kts {
+                    flaps_retracted = true;
+                    let _ = xp.set_float(FLAP_HANDLE, 0.0).await;
+                    alert(&voice, Priority::Advisory, "Flaps up.");
+                }
+            } else if let Some(next) = flap_retract_step(&p.flap_schedule, flap_cmd, ias) {
+                flap_cmd = next;
+                flaps_retracted = next <= 1e-6;
+                let _ = xp.set_float(FLAP_HANDLE, next).await;
+                crate::blackbox::record(
+                    "autotakeoff",
+                    serde_json::json!({
+                        "event": "flap_step", "to": next, "ias": ias, "agl_ft": agl_ft,
+                    }),
+                );
+                alert(
+                    &voice,
+                    Priority::Advisory,
+                    if flaps_retracted {
+                        "Flaps up."
+                    } else {
+                        "Flaps coming up a stage."
+                    },
+                );
+            }
         }
         if !ap_engaged {
             if agl_ft < AP_ENGAGE_AGL_FT {
@@ -1494,6 +1574,61 @@ pub fn spoken_height_ft(agl_ft: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The BIKF departure (2026-09-20): commanded 8 degrees, flew 22.4. The
+    /// law was pinned at its nose-down limit the whole way with the pitch
+    /// RATE still building — it wanted about -0.38 and could ask for -0.10.
+    #[test]
+    fn the_rotation_can_push_hard_enough_to_hold_its_own_ceiling() {
+        // The trace, replayed: 20.1 degrees against an 8 degree target with
+        // the nose still coming up at 2 deg/s.
+        let (theta, rate) = (20.1, 2.05);
+        let mut ga = RotatePitch::new(None);
+        let mut jet = RotatePitch::with_authority(Some(11.0), -0.5);
+        // Walk both to the cap so the ramp is finished and the target is 8.
+        for _ in 0..40 {
+            ga.step(8.0, Some(0.0), 0.2);
+            jet.step(8.0, Some(0.0), 0.2);
+        }
+        let ga_out = ga.step(theta, Some(rate), 0.2);
+        let jet_out = jet.step(theta, Some(rate), 0.2);
+        assert!(
+            (ga_out - PITCH_MIN).abs() < 1e-6,
+            "the GA limit saturates and stays there: {ga_out}"
+        );
+        assert!(
+            jet_out < ga_out - 0.2,
+            "the jet can actually push: {jet_out} vs {ga_out}"
+        );
+        // ...and the limit is still a limit: never past full travel, never a
+        // standing pull dressed up as a minimum.
+        let silly = RotatePitch::with_authority(None, 4.0);
+        assert!(silly.pitch_min <= 0.0);
+        let deep = RotatePitch::with_authority(None, -9.0);
+        assert!(deep.pitch_min >= -1.0);
+    }
+
+    /// Flaps come up a detent at a time, each step waiting for its own
+    /// manoeuvring speed. The old law took flaps 5 straight to 0 at 170 kt.
+    #[test]
+    fn the_flaps_walk_their_schedule_instead_of_going_straight_to_zero() {
+        // The 737's declared schedule: up at 210, flaps 1 at 190, 2 at 180.
+        let sched = [(0.0, 210.0), (0.125, 190.0), (0.25, 180.0)];
+        // Flaps 5 at 170 kt, which is what the old rule cleaned up at.
+        assert_eq!(flap_retract_step(&sched, 0.375, 170.0), None, "too slow");
+        // 190 earns the first step, and ONLY the first.
+        assert_eq!(flap_retract_step(&sched, 0.375, 190.0), Some(0.25));
+        // From flaps 1, going clean waits for 210.
+        assert_eq!(flap_retract_step(&sched, 0.125, 200.0), None);
+        assert_eq!(flap_retract_step(&sched, 0.125, 210.0), Some(0.0));
+        // Already clean: nothing left.
+        assert_eq!(flap_retract_step(&sched, 0.0, 250.0), None);
+        // Fast enough for everything still only takes ONE step: the flaps
+        // have to travel through the detents either way.
+        assert_eq!(flap_retract_step(&sched, 0.375, 300.0), Some(0.25));
+        // An airframe with no declared speeds keeps the one-shot clean-up.
+        assert_eq!(flap_retract_step(&[], 0.375, 300.0), None);
+    }
     #[tokio::test]
     async fn paused_missing_or_refused_modes_cannot_complete_the_takeoff_handoff() {
         let xp = crate::xplane::FakeXPlane::with_reads(&[

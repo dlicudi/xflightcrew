@@ -26,6 +26,7 @@ pub struct Circuit {
     pub climb_fpm: f64,
     pub retract_gear: bool,
     pub takeoff_flap_ratio: Option<f64>,
+    pub flap_schedule: Vec<(f64, f64)>,
     pub takeoff_roll_m: Option<f64>,
     /// Approach speed handed to autoland on final (KIAS).
     pub approach_ias: f64,
@@ -34,6 +35,7 @@ pub struct Circuit {
     pub prop: Option<PropProfile>,
     /// This airframe's tail-strike attitude, degrees (profile).
     pub tail_strike_deg: Option<f64>,
+    pub pitch_authority_down: Option<f64>,
     /// Vne/Vmo for the climb's overspeed protection.
     pub vne_kts: Option<f64>,
     /// The slowest the pattern may climb toward — blue line on a twin, else a
@@ -217,6 +219,7 @@ impl Tool for Circuit {
                 cfg: self.cfg.clone(),
                 takeoff: autotakeoff::Params {
                     tail_strike_deg: self.tail_strike_deg,
+                    pitch_authority_down: self.pitch_authority_down,
                     vne_kts: self.vne_kts,
                     apt_dat: super::autoland::apt_dat_path(),
                     cfg: self.cfg.clone(),
@@ -226,6 +229,7 @@ impl Tool for Circuit {
                     climb_fpm: self.climb_fpm,
                     retract_gear: self.retract_gear,
                     takeoff_flap_ratio: self.takeoff_flap_ratio,
+                    flap_schedule: self.flap_schedule.clone(),
                     cleared_runway: party_line::clearance_runway(),
                     needed_m: self.takeoff_roll_m.map_or(500.0, |m| m * 1.4),
                     // Hand off low so the circuit turns crosswind while still

@@ -301,6 +301,10 @@ fuel:
   reserve_caution_min: 45.0
   reserve_warning_min: 30.0
   cruise_burn_kg_hr: 261.0
+  # Jet A-1, not the 100LL the shared default assumes: that briefed the
+  # 737's fuel 11.8% light and in a unit no crew uses (2026-09-20).
+  kg_per_gal: 3.04
+  spoken_unit: lb
 
 # Never-exceed, KIAS. The .acf models 250 and so does the real aircraft's Vmo;
 # the POM's Operating-Speeds table says 320, which is not a figure this airframe
@@ -353,17 +357,33 @@ vlo_kts: 160.0
 # and 150 its full-flap limit, which is very likely what the POM's stray
 # "Vle 150" row actually is - it is the one number in that table with nowhere
 # else to belong. The descending ladder below is VERIFY on the second notch.
+# --- Jet/turboprop figures, added 2026-09-20 after the 737 shakedown. Every
+# law below defaults to a Cessna 172's number when a profile is silent, and on
+# BIKF-EGPH that flew an airliner on a 0.8 nm capture radius, a 700 fpm
+# descent, a 0.10 nose-down limit and avgas density. VERIFY each against the
+# POM/FCOM; they are reasoned from the type, not measured on it.
+# Nose-DOWN elevator the rotation law may command. The shared default is
+# 0.10, which on a jet is not authority at all: the 737 was commanded 8
+# degrees and flew 22.4 with the law pinned at its limit. VERIFY.
+pitch_authority_down: 0.35
+
 flaps:
   takeoff_ratio: 0.5
   detents:
-    - { label: up,   spoken: up,                ratio: 0.0 }
-    - { label: "10", spoken: ten degrees,       ratio: 0.5, vfe_kts: 190.0 }
+    - { label: up,   spoken: up,                ratio: 0.0, retract_above_kts: 140.0 }
+    - { label: "10", spoken: ten degrees,       ratio: 0.5, vfe_kts: 190.0, retract_above_kts: 110.0 }
     - { label: "35", spoken: thirty five degrees, ratio: 1.0, vfe_kts: 150.0 }
 
 # Static reference figures recited on request. POM p.5 (specifications) and
 # p.61 (Operating-Speeds), with the .acf consulted where they disagree.
 reference:
   kind: single-engine jet
+  # Light jet. No optimum-altitude advisory: it cruises at or near its ceiling,
+# so there is no step to offer.
+  # Enroute vertical rates: the shared 700 fpm is a GA number and a ~1 degree
+  # path at these speeds. VERIFY.
+  enroute_climb_fpm: 1500.0
+  enroute_descent_fpm: 1500.0
   vr_kts: 90.0             # POM: rotate
   vx_kts: 91.0             # POM: best angle
   # NOTE Vy: the POM's best-rate figure is 160 KIAS, which is a CRUISE climb,

@@ -240,7 +240,15 @@ async fn vacate(
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     while crate::autotaxi::driving() {
         if std::time::Instant::now() >= deadline {
+            // STOP it, don't just stop waiting for it. A drive left running
+            // past its budget is still steering, still holding the arrival
+            // latch, and the stand drive cannot start on top of it: at BIKF
+            // (2026-09-20) this vacate ran 179 s past here with 1,082 m to
+            // go, outlived the overrun guard below, and its eventual arrival
+            // was taken for the stand's.
             crate::blackbox::record("taxi_in", json!({ "event": "vacate_timeout" }));
+            crate::autotaxi::halt();
+            let _ = crate::tools::controls::drive_park_brake(xp, true, park_brake_valve_set).await;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -398,6 +406,7 @@ async fn fly(
         park_brake_valve_set,
         prop,
         pace,
+        must_start: true,
     };
     // A vacate that over-ran its budget may still be driving; arming the
     // stand drive on top would be refused, and the fall-through below would
@@ -409,6 +418,17 @@ async fn fly(
     let overrun = std::time::Instant::now() + std::time::Duration::from_secs(120);
     while crate::autotaxi::driving() && std::time::Instant::now() < overrun {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    // Waiting it out was a RACE, and the vacate won it: the budget here has
+    // to be a limit on the old drive, not a hope about it. Anything still
+    // driving at this point is stopped outright, which also clears the
+    // arrival latch the guard below depends on.
+    if crate::autotaxi::driving() {
+        crate::blackbox::record("taxi_in", json!({ "event": "overrun_halt" }));
+        crate::autotaxi::halt();
+        let _ = crate::tools::controls::drive_park_brake(&xp, true, park_brake_valve_set).await;
+        // Give the loop its tick to see the flag and let go of the channels.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     }
     crate::autotaxi::LAST_ARRIVED.store(false, std::sync::atomic::Ordering::Relaxed);
     match auto_taxi.execute(&json!({}), &ctx).await {
@@ -445,6 +465,48 @@ async fn fly(
 /// mixture cutoff vs a turboprop's condition levers) and wants sim validation
 /// before the copilot cuts an engine on its own.
 async fn secure(xp: &XPlaneClient, voice: &Option<Voice>, park_brake_valve_set: Option<f64>) {
+    // Are we actually ON a stand? The claim was never checked: any arrival
+    // latch at all earned "At the gate", and at BIKF (2026-09-20) that was
+    // said 140 m from the nearest stand, ninety degrees across it, on a
+    // taxiway, after a drive that never went to the stand it was cleared to.
+    //
+    // The test already existed for the tug (`pushback::on_a_stand`, an
+    // apt.dat 1300 row within 35 m with the nose inside 60 degrees of its
+    // parking heading) — this just asks it. A field that publishes no stands
+    // keeps the old behaviour, because there is nothing to check against.
+    let (lat_r, lon_r, psi_r) = tokio::join!(
+        xp.get_float(crate::autotaxi::LAT),
+        xp.get_float(crate::autotaxi::LON),
+        xp.get_float(crate::autotaxi::PSI_TRUE),
+    );
+    let at_stand = match (lat_r, lon_r, psi_r) {
+        (Ok(lat), Ok(lon), Ok(psi)) => crate::pushback::on_a_stand(
+            crate::party_line::nearest_stand(lat, lon).map(|s| (s.dist_m, s.heading)),
+            psi,
+            crate::party_line::stands_known(),
+        ),
+        // A failed read is no measurement: say nothing we cannot support, and
+        // do not strip the transponder and lights off an aircraft that may be
+        // sitting on live pavement.
+        _ => false,
+    };
+    crate::blackbox::record(
+        "taxi_in",
+        json!({ "event": "secure", "at_stand": at_stand }),
+    );
+    if !at_stand {
+        // Hold it where it is and hand back. Securing here is what put an
+        // aircraft on a taxiway with its transponder in standby.
+        let _ = crate::tools::controls::drive_park_brake(xp, true, park_brake_valve_set).await;
+        announce(
+            voice,
+            Priority::Caution,
+            "We've stopped short of the stand. Brakes set, but we're not parked \
+             and I've left the lights and transponder alone. Your aircraft.",
+        );
+        crate::full_auto::release_arrival_station();
+        return;
+    }
     announce(
         voice,
         Priority::Advisory,

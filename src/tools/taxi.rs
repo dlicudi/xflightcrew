@@ -32,6 +32,17 @@ pub struct AutoTaxi {
     /// feather at arm time — a turboprop makes no taxi thrust with feathered
     /// blades however far the power lever comes up. `None` on the pistons.
     pub prop: Option<PropProfile>,
+    /// This arm is a CALLER's, not a pilot's: it asked for one specific route
+    /// to be driven, so "a drive is already running" is a failure, not a
+    /// reassurance.
+    ///
+    /// The spoken path wants the opposite — a pilot who says "taxi" while
+    /// already taxiing should be told so, kindly. But taxi-in used the same
+    /// door, and when its vacate over-ran, the reassuring `Ok` read to the
+    /// caller as "my stand drive started": it then watched the OLD drive,
+    /// took its arrival for its own, and secured the aircraft on a taxiway
+    /// (BIKF, 2026-09-20). A caller that names a route gets an error.
+    pub must_start: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -82,8 +93,14 @@ impl Tool for AutoTaxi {
                 "I wasn't taxiing us.".to_string()
             });
         }
-        // Already driving: a pace request retargets, anything else reassures.
+        // Already driving: a pace request retargets, anything else reassures
+        // — unless the caller named a route, for whom this is a failure.
         if autotaxi::ACTIVE.load(Relaxed) {
+            if self.must_start && a.knots.is_none() {
+                return Err(anyhow::anyhow!(
+                    "A taxi drive is already running; I can't start another."
+                ));
+            }
             return Ok(if let Some(k) = a.knots {
                 let k = speedhold::clamp_taxi_target(k);
                 speedhold::set_taxi_target(k);
@@ -510,5 +527,44 @@ impl Tool for TaxiToParking {
             vacate_from,
         );
         Ok("Taxiing to parking — getting the clearance.".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Taxi-in names its route, so its arm must FAIL when a drive is already
+    /// running rather than be reassured by one. The spoken path keeps the
+    /// kind answer: a pilot saying "taxi" while taxiing should be told so.
+    ///
+    /// Read from the source, because the bug was a construction site and not
+    /// a branch: taxi-in built the same tool the pilot's words build, got
+    /// back "I already have the taxi", read that `Ok` as its own stand drive
+    /// starting, then watched the OLD drive and secured on its arrival 140 m
+    /// from the nearest stand (BIKF, 2026-09-20).
+    #[test]
+    fn taxi_in_is_the_caller_that_must_start_its_own_drive() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let sites = |text: &str| -> Vec<bool> {
+            text.match_indices("AutoTaxi {")
+                .map(|(i, _)| {
+                    let tail = &text[i..];
+                    let end = tail.find('}').unwrap_or(tail.len());
+                    tail[..end].contains("must_start: true")
+                })
+                .collect()
+        };
+        let taxi_in = std::fs::read_to_string(root.join("taxi_in.rs")).unwrap();
+        let built = sites(&taxi_in);
+        assert!(!built.is_empty(), "taxi_in builds the tool");
+        assert!(
+            built.iter().all(|&b| b),
+            "every taxi-in arm names its route: {built:?}"
+        );
+        // ...and the pilot's own door keeps the reassurance.
+        let registry = std::fs::read_to_string(root.join("tools").join("mod.rs")).unwrap();
+        assert!(
+            sites(&registry).iter().all(|&b| !b),
+            "the spoken tool stays forgiving"
+        );
     }
 }

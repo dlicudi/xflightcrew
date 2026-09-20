@@ -123,6 +123,11 @@ pub struct AircraftProfile {
     /// long before tail clearance does — every GA single so far.
     #[serde(default)]
     pub tail_strike_deg: Option<f64>,
+    /// Nose-DOWN elevator the rotation law may command, 0..1. `None` = the GA
+    /// tenth, which is right for a light single and is not authority at all
+    /// on a jet — see `autotakeoff::PITCH_MIN`.
+    #[serde(default)]
+    pub pitch_authority_down: Option<f64>,
     /// Path to an XChecklist file to interpret (relative to the working dir).
     /// `None` means no checklists for this airframe. The file is read-only input;
     /// the copilot interprets it (see [`crate::checklist`]).
@@ -486,6 +491,126 @@ pub struct FuelProfile {
     /// endurance before takeoff (current idle burn would read as near-infinite),
     /// so "you're low for a flight" can fire while parked. The 172 burns ~24 kg/hr.
     pub cruise_burn_kg_hr: f64,
+    /// Density of what this airframe actually burns, kg per US gallon.
+    /// `None` = 100LL (2.72), which is every piston here.
+    ///
+    /// Jet A-1 is 3.04. Briefing a 737's kerosene at avgas density inflated
+    /// every fuel figure it spoke by 11.8% (BIKF-EGPH, 2026-09-20: 3,126 kg
+    /// in the tanks read back as "1,149 gallons" — 1,028 is the truth).
+    #[serde(default)]
+    pub kg_per_gal: Option<f64>,
+    /// The unit the CREW of this airframe works in: "gallons", "kg" or "lb".
+    /// `None` = gallons.
+    ///
+    /// An airliner is never fuelled in gallons, and the app briefed one in
+    /// them because gallons were the GA unit it was built around — while full
+    /// auto's own preflight quoted the SAME fuel in pounds. Two parts of one
+    /// cockpit, two units, one of them not the airframe's.
+    #[serde(default)]
+    pub spoken_unit: Option<String>,
+}
+
+/// How a given airframe's fuel is spoken.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FuelSpoken {
+    Gallons,
+    Kilos,
+    Pounds,
+}
+
+/// The live airframe's fuel density and spoken unit, republished on every
+/// profile swap — a process-wide fact must never outlive its airframe.
+static FUEL_UNIT: std::sync::Mutex<(f64, FuelSpoken)> =
+    std::sync::Mutex::new((AVGAS_KG_PER_GAL, FuelSpoken::Gallons));
+
+/// 100LL, the default for anything that declares nothing.
+pub const AVGAS_KG_PER_GAL: f64 = 2.72;
+const LB_PER_KG: f64 = 2.204_62;
+
+/// Publish the airframe's fuel density and spoken unit. Called on EVERY swap.
+pub fn publish_fuel_unit(f: Option<&FuelProfile>) {
+    let density = f
+        .and_then(|f| f.kg_per_gal)
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .unwrap_or(AVGAS_KG_PER_GAL);
+    let unit = match f
+        .and_then(|f| f.spoken_unit.as_deref())
+        .unwrap_or("gallons")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "kg" | "kgs" | "kilos" | "kilograms" => FuelSpoken::Kilos,
+        "lb" | "lbs" | "pounds" => FuelSpoken::Pounds,
+        _ => FuelSpoken::Gallons,
+    };
+    *FUEL_UNIT.lock().unwrap_or_else(|e| e.into_inner()) = (density, unit);
+}
+
+/// The live airframe's (kg per gallon, spoken unit).
+pub fn fuel_unit() -> (f64, FuelSpoken) {
+    *FUEL_UNIT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Thousands separators. A local copy on purpose: this module compiles into
+/// the LIB as well as the bin, and `auto_status` is the bin's.
+fn commas(n: i64) -> String {
+    let (sign, mut d) = (if n < 0 { "-" } else { "" }, n.abs().to_string());
+    let mut out = String::new();
+    while d.len() > 3 {
+        out.insert_str(0, &format!(",{}", &d[d.len() - 3..]));
+        d.truncate(d.len() - 3);
+    }
+    format!("{sign}{d}{out}")
+}
+
+/// `kg` of fuel as this airframe's crew would say it, with its unit word.
+pub fn say_fuel_kg(kg: f64) -> String {
+    say_fuel_figure(fuel_in_unit_kg(kg))
+}
+
+/// `kg` as a NUMBER in the airframe's unit — for a caller that has to round
+/// before it subtracts. Three independently rounded figures do not add up:
+/// "You have 1149 aboard, but the plan needs 3002; short about 1852" was off
+/// by one because each was rounded from its own float (2026-09-20).
+pub fn fuel_in_unit_kg(kg: f64) -> f64 {
+    let (density, unit) = fuel_unit();
+    match unit {
+        FuelSpoken::Gallons => kg / density,
+        FuelSpoken::Kilos => kg,
+        FuelSpoken::Pounds => kg * LB_PER_KG,
+    }
+}
+
+/// The same figure with no unit word — for the second and third numbers in a
+/// list that has already named the unit once.
+pub fn fuel_figure_kg(kg: f64) -> String {
+    commas(fuel_in_unit_kg(kg).round() as i64)
+}
+
+/// A fuel FLOW in kg/hr, as this airframe's crew would say it. Same rule as
+/// the quantity: an airliner's burn is tonnes an hour, not gallons an hour at
+/// the density of petrol.
+pub fn say_fuel_flow_kg_hr(kg_hr: f64) -> String {
+    let (density, unit) = fuel_unit();
+    match unit {
+        FuelSpoken::Gallons => format!("{:.1} gallons an hour", kg_hr / density),
+        FuelSpoken::Kilos => format!("{} kilos an hour", commas(kg_hr.round() as i64)),
+        FuelSpoken::Pounds => format!(
+            "{} pounds an hour",
+            commas((kg_hr * LB_PER_KG).round() as i64)
+        ),
+    }
+}
+
+/// A number already in the airframe's unit, said with its unit word.
+pub fn say_fuel_figure(n: f64) -> String {
+    let word = match fuel_unit().1 {
+        FuelSpoken::Gallons => "gallons",
+        FuelSpoken::Kilos => "kilos",
+        FuelSpoken::Pounds => "pounds",
+    };
+    format!("{} {word}", commas(n.round() as i64))
 }
 
 /// Fuel tank selector positions, per airframe — the tool's whole surface is
@@ -808,6 +933,21 @@ pub struct FlapProfile {
     pub takeoff_ratio: Option<f64>,
 }
 
+/// The climb-out retraction schedule from a flap profile: `(handle ratio,
+/// manoeuvring speed)` for every detent that declares one, cleanest first.
+/// Empty when none do, which keeps the old single-shot clean-up.
+pub fn flap_schedule(f: Option<&FlapProfile>) -> Vec<(f64, f64)> {
+    let mut v: Vec<(f64, f64)> = f
+        .map(|f| f.detents.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|d| Some((d.ratio, d.retract_above_kts?)))
+        .filter(|(r, k)| r.is_finite() && k.is_finite() && *k > 0.0)
+        .collect();
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    v
+}
+
 /// One flap handle position.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlapDetent {
@@ -821,6 +961,18 @@ pub struct FlapDetent {
     /// detent — the placard Vfe. `None` for retraction (always allowed).
     #[serde(default)]
     pub vfe_kts: Option<f64>,
+    /// MINIMUM indicated airspeed (kts) at which this configuration is safe to
+    /// fly — the detent's manoeuvring speed, and therefore the gate on
+    /// RETRACTING to it. `None` leaves the detent out of the climb-out
+    /// retraction schedule.
+    ///
+    /// Retraction had no speed gate at all: the takeoff cleaned up in ONE
+    /// step, flaps to zero, on height plus `initial_climb_kts`. On a light
+    /// single that is right — one flap setting, and Vy is the speed. On a
+    /// 737 it took flaps 5 straight to 0 at 657 ft and 170 kt, some forty
+    /// knots below flaps-up manoeuvring speed (BIKF-EGPH, 2026-09-20).
+    #[serde(default)]
+    pub retract_above_kts: Option<f64>,
 }
 
 /// Static reference figures recited on request (V-speeds, weights, limits), from
@@ -879,6 +1031,38 @@ pub struct ReferenceProfile {
     /// figure (usually a TAS). `None` = no automatic cruise-power reduction.
     #[serde(default)]
     pub cruise_ias_kts: Option<f64>,
+    /// Optimum cruise altitude at [`Reference::optimum_alt_at_kg`], feet, and
+    /// how many feet it rises per 1,000 kg burned off. Jets only: the altitude
+    /// that flies best moves UP as the aircraft gets lighter, by roughly a
+    /// level an hour on a narrowbody, and nothing in the tree ever looked
+    /// (EIDW-BIKF, 2026-09-20: planned FL340 and held it for the whole
+    /// crossing, 4,600 ft below optimum by mid-Atlantic). `None` on anything
+    /// that does not step-climb, which is every piston here — the copilot then
+    /// says nothing rather than inventing a number.
+    #[serde(default)]
+    pub optimum_alt_ft: Option<f64>,
+    #[serde(default)]
+    pub optimum_alt_at_kg: Option<f64>,
+    #[serde(default)]
+    pub optimum_alt_ft_per_1000kg: Option<f64>,
+    /// The rates the ENROUTE vertical law climbs and descends at, fpm. Both
+    /// default to the GA figure when a profile is silent.
+    ///
+    /// Distinct from `best_climb_fpm`, which is the takeoff's initial climb.
+    /// These pace the follower between fixes, and the descent one also places
+    /// the top of descent, so the two stay consistent by construction: the
+    /// TOD is put exactly where this rate can make the constraint.
+    ///
+    /// 700 fpm is a 1.1 degree path at jet speeds. The EIDW-BIKF arrival
+    /// (2026-09-20) needed about 2,000 fpm on every leg from BASLU inbound
+    /// and the law could offer a third of it — the aircraft would have
+    /// reached Keflavík some 17,000 ft high. The same constant capped the
+    /// CLIMB, which is why FL340 took 37 minutes instead of 20, all of it
+    /// burning low-altitude fuel.
+    #[serde(default)]
+    pub enroute_climb_fpm: Option<f64>,
+    #[serde(default)]
+    pub enroute_descent_fpm: Option<f64>,
     #[serde(default)]
     pub best_climb_fpm: Option<f64>,
     #[serde(default)]
@@ -1267,6 +1451,43 @@ pub fn speed_floor_kts() -> Option<f64> {
     *SPEED_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The altitude this airframe cruises best at, at `weight_kg`.
+///
+/// A straight line through the profile's one reference point, because that is
+/// what the real curve is over the weights an airliner actually cruises at:
+/// the 737-800 sits near FL340 at max takeoff weight and near FL400 empty,
+/// which is about 290 ft per tonne burned off. `None` unless the profile
+/// declares all three numbers, so nothing invents an optimum for an airframe
+/// that does not have one.
+///
+/// This is an ADVISORY number, never a target: a level belongs to ATC. See
+/// [`step_climb_ft`].
+pub fn optimum_altitude_ft(r: &ReferenceProfile, weight_kg: f64) -> Option<f64> {
+    let (at, ft, slope) = (
+        r.optimum_alt_at_kg?,
+        r.optimum_alt_ft?,
+        r.optimum_alt_ft_per_1000kg?,
+    );
+    (weight_kg.is_finite() && weight_kg > 0.0).then(|| ft + (at - weight_kg) / 1000.0 * slope)
+}
+
+/// How far below optimum is worth a word, and the step it would take.
+///
+/// The penalty for cruising low is real but gentle, so this does NOT fire for
+/// being a few hundred feet off: only when a WHOLE standard step (2,000 ft,
+/// the spacing of same-direction levels) sits between us and the optimum is
+/// there anything a pilot could act on.
+const STEP_CLIMB_FT: f64 = 2000.0;
+
+/// The next same-direction level up, if cruising `cruise_ft` is at least a
+/// full step below `optimum_ft`. `None` when we are at or near optimum, or
+/// above it — a jet above optimum is a different problem and not this one's
+/// to solve. The step is always exactly one level: a climb is a request to
+/// ATC, and asking for two at once is how you get neither.
+pub fn step_climb_ft(cruise_ft: f64, optimum_ft: f64) -> Option<f64> {
+    (optimum_ft - cruise_ft >= STEP_CLIMB_FT).then(|| cruise_ft + STEP_CLIMB_FT)
+}
+
 /// The floor for the LANDING configuration: 1.2 x Vso when the profile
 /// declares one, else the clean floor. The clean floor is right for a plan's
 /// cruise target and the pattern, wrong for a flapped approach: the 737's
@@ -1478,6 +1699,9 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
             spoken: "up".into(),
             ratio: 0.0,
             vfe_kts: None,
+            // A generic airframe declares no manoeuvring speeds, so it keeps
+            // the one-step clean-up on `initial_climb_kts`.
+            retract_above_kts: None,
         }];
         for (i, d) in degs.iter().enumerate() {
             let full = i + 1 == n;
@@ -1490,6 +1714,7 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
                 spoken: if full { "full".into() } else { format!("{d:.0} degrees") },
                 ratio: (d / last * 10_000.0).round() / 10_000.0,
                 vfe_kts: vfe.map(f64::round),
+                retract_above_kts: None,
             });
         }
         p.flaps = Some(FlapProfile {
@@ -1627,6 +1852,428 @@ pub fn builtin(id: &str) -> Option<AircraftProfile> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    /// Every test that publishes the fuel unit holds this. `FUEL_UNIT` is
+    /// process-wide, cargo runs these threads in parallel, and without it
+    /// they overwrite each other's airframe mid-assertion — the same trap
+    /// the station's `SIDE_STATE_LOCK` exists for.
+    static FUEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// EVERY speed and EVERY rate in the flight laws, classified once.
+    ///
+    /// This is the rule CLAUDE.md already states — "all automation numbers
+    /// are per-airframe, defaulting to the old GA figures when a profile is
+    /// silent" — with something behind it at last. The rule was written
+    /// before 2026-09-20 and on that date a 737 still flew a 0.8 nm capture
+    /// radius, a 700 fpm descent, a 0.10 nose-down limit, avgas density and
+    /// an 800 fpm go-around, because prose does not fail a build.
+    ///
+    /// A constant named in knots, feet per minute or degrees per second is
+    /// a number the AIRCRAFT achieves, and those are the ones that were
+    /// wrong. Each is listed here with what it is, and anything new or
+    /// renamed fails until someone decides which it is. That decision is
+    /// cheap at the moment of writing and expensive at 34,000 feet.
+    #[test]
+    fn every_speed_and_rate_in_the_laws_is_classified() {
+        // (module, NAME) -> why it may be a shared constant.
+        const REVIEWED: &[(&str, &str, &str)] = &[
+            // --- Properties of the SIM or the SENSORS, not the airframe ---
+            (
+                "autotakeoff",
+                "STAGNANT_GS_KTS",
+                "the ASI is dead below ~20 kt on any airframe",
+            ),
+            (
+                "autotakeoff",
+                "TRIM_MIN_GS_KTS",
+                "integrator arming: below this nothing steers yet",
+            ),
+            (
+                "autotaxi",
+                "STRAIGHTEN_HOLD_KTS",
+                "walking pace; a stop is a stop",
+            ),
+            (
+                "autotaxi",
+                "CREEP_KTS",
+                "the speed below which the sim reads as stopped",
+            ),
+            (
+                "speedhold",
+                "SURGE_KTS_S",
+                "acceleration that means a surge, not a schedule",
+            ),
+            (
+                "speedhold",
+                "SETTLING_KTS_S",
+                "deceleration that means settling, likewise",
+            ),
+            // --- Rules and ceilings that bind every aircraft ---
+            (
+                "speedhold",
+                "TAXI_MAX_KTS",
+                "a safety ceiling on taxi, never a target",
+            ),
+            (
+                "autoland",
+                "VACATE_HANDOFF_KTS",
+                "taxi speed off the runway, not a flight speed",
+            ),
+            // --- Aerodynamic ramps: airflow over a surface, not performance ---
+            (
+                "autotakeoff",
+                "LOW_SPEED_FULL_KTS",
+                "rudder authority builds with airflow",
+            ),
+            (
+                "autotakeoff",
+                "POWER_LEAD_FADE_KTS",
+                "throttle lead fades as the surface bites",
+            ),
+            (
+                "autotakeoff",
+                "THROTTLE_HOLD_MAX_GS_KTS",
+                "holds power while the nose swings",
+            ),
+            (
+                "autotaxi",
+                "BRAKE_STEER_MIN_KTS",
+                "differential brake bites above walking pace",
+            ),
+            (
+                "autotaxi",
+                "BRAKE_STEER_FULL_KTS",
+                "...and is fully effective above this",
+            ),
+            // --- Handling conventions, flown the same in anything ---
+            (
+                "autotakeoff",
+                "ROTATE_RATE_DEG_S",
+                "2-3 deg/s is how a rotation is flown",
+            ),
+            // --- GA DEFAULTS with a per-airframe override already in place ---
+            (
+                "autotaxi",
+                "STRAIGHT_KTS",
+                "default: Pace::from_profile overrides",
+            ),
+            (
+                "autotaxi",
+                "TURN_KTS",
+                "default: Pace::from_profile overrides",
+            ),
+            (
+                "autotaxi",
+                "SHARP_KTS",
+                "default: Pace::from_profile overrides",
+            ),
+            (
+                "procedure",
+                "GA_VS_FPM",
+                "default: publish_vs_limits overrides",
+            ),
+            (
+                "autoland",
+                "ROUNDOUT_VS_FPM",
+                "default: arrest_targets_fpm overrides",
+            ),
+            (
+                "autoland",
+                "FLARE_VS_FPM",
+                "default: arrest_targets_fpm overrides",
+            ),
+            (
+                "autoland",
+                "VS_LEAD_MAX_CLIMB_FPM",
+                "default: ArrestLeadProfile overrides",
+            ),
+            (
+                "autoland",
+                "MAX_CLIMB_FPM",
+                "floor only: max_climb_fpm() takes the airframe's",
+            ),
+            (
+                "circuit",
+                "AUTHORED_CLIMB_FPM",
+                "floor only: authored_climb_fpm() takes the airframe's",
+            ),
+            // --- Scaling REFERENCES, not targets: the law divides by them ---
+            (
+                "autoland",
+                "GLIDEPATH_GAIN_REF_KTS",
+                "gain scales by actual/this, so it self-corrects",
+            ),
+            (
+                "autotakeoff",
+                "PITCH_TRIM_PER_DEG_S",
+                "integrator rate; authority is per-airframe",
+            ),
+            // --- MARGINS in knots. Honest debt: a 10 kt margin is a sixth of
+            // a 172's approach speed and a fourteenth of a 737's. None has
+            // been caught misbehaving, and each is reviewed here rather than
+            // silently shared.
+            (
+                "autoland",
+                "SPEED_FLOOR_MARGIN_KTS",
+                "MARGIN: above the airframe's own floor",
+            ),
+            (
+                "autoland",
+                "APPROACH_FAST_KTS",
+                "MARGIN: over the approach speed",
+            ),
+            (
+                "autoland",
+                "CLIMB_SPEED_MARGIN_KTS",
+                "MARGIN: surplus before a climb engages",
+            ),
+            (
+                "autoland",
+                "CLIMB_ENERGY_BONUS_KTS",
+                "MARGIN: speed asked for under the floor",
+            ),
+            (
+                "autotakeoff",
+                "OVERSPEED_GUARD_KTS",
+                "MARGIN: below Vne, which is per-airframe",
+            ),
+            (
+                "circuit",
+                "APPROACH_LEG_MARGIN_KTS",
+                "MARGIN: over the approach speed",
+            ),
+            // --- Known debt, named. Suspect on a jet, not yet measured wrong.
+            (
+                "autotakeoff",
+                "OVERSPEED_VS_MAX_FPM",
+                "DEBT: 1500 is a jet's ordinary climb",
+            ),
+            (
+                "circuit",
+                "ALT_MAX_EXTRA_DESCENT_FPM",
+                "DEBT: 500 extra is little for a jet",
+            ),
+        ];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let files = [
+            ("autotakeoff", root.join("autotakeoff.rs")),
+            ("autotaxi", root.join("autotaxi.rs")),
+            ("autoland", root.join("autoland.rs")),
+            ("circuit", root.join("circuit.rs")),
+            ("procedure", root.join("procedure.rs")),
+            ("pushback", root.join("pushback.rs")),
+            ("taxi_in", root.join("taxi_in.rs")),
+            ("speedhold", root.join("tools").join("speedhold.rs")),
+        ];
+        let mut found = Vec::new();
+        for (module, path) in &files {
+            let text = std::fs::read_to_string(path).unwrap();
+            for line in text.lines() {
+                // Laws only, and a law is declared at the top level. A
+                // constant indented inside a function is that test's or that
+                // helper's own fixture and binds no aircraft. (Truncating at
+                // `#[cfg(test)]` instead cut several real laws out of the
+                // scan, because these files gate items throughout.)
+                let Some(rest) = line.strip_prefix("const ") else {
+                    continue;
+                };
+                let Some((name, _)) = rest.split_once(": f64 = ") else {
+                    continue;
+                };
+                if name == "MS_TO_KTS" {
+                    continue; // a unit, not a speed
+                }
+                if name.ends_with("_KTS")
+                    || name.ends_with("_FPM")
+                    || name.ends_with("_DEG_S")
+                    || name.ends_with("_KTS_S")
+                {
+                    found.push((*module, name.to_string()));
+                }
+            }
+        }
+        assert!(found.len() > 25, "the scan found the laws: {}", found.len());
+        let unreviewed: Vec<String> = found
+            .iter()
+            .filter(|(m, n)| !REVIEWED.iter().any(|(rm, rn, _)| rm == m && rn == n))
+            .map(|(m, n)| format!("{m}::{n}"))
+            .collect();
+        assert!(
+            unreviewed.is_empty(),
+            "new speed/rate constants must be per-airframe or reviewed here \
+             (see CLAUDE.md: all automation numbers are per-airframe): {unreviewed:?}"
+        );
+        // ...and the list must not rot: an entry for a constant that no
+        // longer exists is a reason nobody has read in a while.
+        let stale: Vec<&str> = REVIEWED
+            .iter()
+            .filter(|(m, n, _)| !found.iter().any(|(fm, fn_)| fm == m && fn_ == n))
+            .map(|(_, n, _)| *n)
+            .collect();
+        assert!(stale.is_empty(), "reviewed but gone: {stale:?}");
+    }
+
+    /// EVERY jet and turboprop declares the numbers the laws would otherwise
+    /// take from a Cessna 172, and they PARSE.
+    ///
+    /// The 737 was fixed on 2026-09-20 and five more turbine profiles were
+    /// still silent that evening — each one would have repeated the whole
+    /// sortie: a 0.8 nm capture radius, a 700 fpm descent, a 0.10 nose-down
+    /// limit, avgas density and an 800 fpm go-around. Silence is a legal
+    /// default (it has to be, so nothing GA moves), which is exactly why the
+    /// turbines have to be named here instead.
+    #[test]
+    fn every_turbine_profile_declares_its_own_numbers() {
+        const TURBINES: &[&str] = &[
+            "boeing_737_800",
+            "airbus_a330_300",
+            "md82",
+            "citation_x",
+            "cirrus_vision_sf50",
+            "dhc6_twin_otter",
+            "king_air_c90b",
+            "lancair_evolution",
+        ];
+        for id in TURBINES {
+            let p = load(id).unwrap_or_else(|| panic!("{id} loads"));
+            let kind = p
+                .reference
+                .as_ref()
+                .and_then(|r| r.kind.as_deref())
+                .unwrap_or("");
+            assert!(
+                kind.contains("jet") || kind.contains("turboprop"),
+                "{id} is listed as a turbine but says {kind:?}"
+            );
+            assert!(
+                p.pitch_authority_down.is_some_and(|a| a > 0.10),
+                "{id}: the rotation needs more push than a 172's tenth"
+            );
+            let f = p
+                .fuel
+                .as_ref()
+                .unwrap_or_else(|| panic!("{id} has no fuel block, so it briefs in avgas"));
+            assert_eq!(f.kg_per_gal, Some(3.04), "{id} burns Jet A-1, not 100LL");
+            assert!(f.spoken_unit.is_some(), "{id} must name its crew's unit");
+            let r = p.reference.as_ref().expect("reference");
+            let climb = r.enroute_climb_fpm.unwrap_or(0.0);
+            let descent = r.enroute_descent_fpm.unwrap_or(0.0);
+            assert!(
+                climb > 700.0 && descent > 700.0,
+                "{id}: {climb}/{descent} is the GA figure or worse"
+            );
+            // The optimum-altitude advisory is all-or-nothing: a partial
+            // declaration would silently produce no advice at all.
+            let opt = [
+                r.optimum_alt_ft,
+                r.optimum_alt_at_kg,
+                r.optimum_alt_ft_per_1000kg,
+            ];
+            assert!(
+                opt.iter().all(Option::is_some) || opt.iter().all(Option::is_none),
+                "{id}: optimum altitude is half-declared, which advises nothing"
+            );
+        }
+    }
+
+    /// Everything this airframe was given today, read back out of its YAML —
+    /// a profile field that does not parse is a fix that never shipped.
+    #[test]
+    fn the_737_profile_declares_its_jet_numbers() {
+        let p = load("boeing_737_800").expect("the 737 profile loads");
+        assert_eq!(p.pitch_authority_down, Some(0.5), "nose-down authority");
+        assert_eq!(p.tail_strike_deg, Some(11.0));
+        let f = p.fuel.as_ref().expect("fuel block");
+        assert_eq!(f.kg_per_gal, Some(3.04), "Jet A-1, not 100LL");
+        assert_eq!(f.spoken_unit.as_deref(), Some("kg"));
+        let r = p.reference.as_ref().expect("reference block");
+        assert_eq!(r.enroute_climb_fpm, Some(2000.0));
+        assert_eq!(r.enroute_descent_fpm, Some(2000.0));
+        assert_eq!(r.optimum_alt_ft, Some(38_000.0));
+        // The retraction schedule the climb-out walks: up at 210, 1 at 190,
+        // 2 at 180 — cleanest first.
+        assert_eq!(
+            flap_schedule(p.flaps.as_ref()),
+            vec![(0.0, 210.0), (0.125, 190.0), (0.25, 180.0)]
+        );
+    }
+
+    /// The BIKF-EGPH brief, verbatim from the panel (2026-09-20): 3,126 kg in
+    /// a 737's tanks read back as "1,149 gallons". That figure is 3126/2.72 —
+    /// AVGAS density, on an airframe that burns Jet A-1.
+    #[test]
+    fn a_jets_fuel_is_not_spoken_in_avgas_gallons() {
+        let _g = FUEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let jet = FuelProfile {
+            reserve_caution_min: 60.0,
+            reserve_warning_min: 30.0,
+            cruise_burn_kg_hr: 2500.0,
+            kg_per_gal: Some(3.04),
+            spoken_unit: Some("kg".into()),
+        };
+        publish_fuel_unit(Some(&jet));
+        assert_eq!(say_fuel_kg(3126.0), "3,126 kilos", "the crew's own unit");
+        // Had it stayed in gallons, it would at least be the right ones.
+        let jet_gal = FuelProfile {
+            spoken_unit: Some("gallons".into()),
+            ..jet.clone()
+        };
+        publish_fuel_unit(Some(&jet_gal));
+        assert_eq!(say_fuel_kg(3126.0), "1,028 gallons", "Jet A, not 100LL");
+        // A piston declares nothing and is unchanged: 100LL, gallons — the
+        // 1,149 that started all this is CORRECT for a light aircraft.
+        publish_fuel_unit(None);
+        assert_eq!(say_fuel_kg(3126.0), "1,149 gallons");
+        assert_eq!(fuel_unit().0, AVGAS_KG_PER_GAL);
+        // And a swap off the jet must not leave its density behind.
+        publish_fuel_unit(Some(&jet));
+        publish_fuel_unit(None);
+        assert_eq!(
+            say_fuel_kg(3126.0),
+            "1,149 gallons",
+            "never outlives its airframe"
+        );
+    }
+
+    /// The figures in the brief are rounded into the airframe's unit BEFORE
+    /// they are subtracted, so they add up on screen. The panel said "You
+    /// have 1149 aboard, but the plan needs 3002; short about 1852" — and
+    /// 3002 minus 1149 is 1853.
+    #[test]
+    fn the_spoken_fuel_figures_agree_with_each_other() {
+        let _g = FUEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        publish_fuel_unit(None);
+        let aboard = fuel_in_unit_kg(3126.0).round();
+        let need = fuel_in_unit_kg(8165.0).round();
+        assert_eq!(say_fuel_figure(aboard), "1,149 gallons");
+        assert_eq!(say_fuel_figure(need), "3,002 gallons");
+        assert_eq!(
+            say_fuel_figure(need - aboard),
+            "1,853 gallons",
+            "a difference of rounded figures, never a rounded difference"
+        );
+    }
+
+    #[test]
+    fn a_bad_fuel_declaration_is_refused_rather_than_flown() {
+        let _g = FUEL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let bad = FuelProfile {
+            reserve_caution_min: 60.0,
+            reserve_warning_min: 30.0,
+            cruise_burn_kg_hr: 2500.0,
+            kg_per_gal: Some(0.0),
+            spoken_unit: Some("furlongs".into()),
+        };
+        publish_fuel_unit(Some(&bad));
+        assert_eq!(fuel_unit().0, AVGAS_KG_PER_GAL, "a zero density is refused");
+        assert_eq!(
+            fuel_unit().1,
+            FuelSpoken::Gallons,
+            "an unknown unit falls back"
+        );
+        publish_fuel_unit(None);
+    }
 
     #[test]
     fn cessna_yaml_loads_and_matches() {
@@ -2252,6 +2899,7 @@ mod tests {
 /// beyond. Fixed gear. Full piston panel + a heading/altitude/VS autopilot.
 fn cessna_172sp() -> AircraftProfile {
     let detent = |label: &str, spoken: &str, ratio: f64, vfe: Option<f64>| FlapDetent {
+        retract_above_kts: None,
         label: label.into(),
         spoken: spoken.into(),
         ratio,
@@ -2413,6 +3061,8 @@ fn cessna_172sp() -> AircraftProfile {
         fuel: Some(FuelProfile {
             reserve_caution_min: 45.0,
             reserve_warning_min: 30.0,
+            kg_per_gal: None,
+            spoken_unit: None,
             cruise_burn_kg_hr: 24.0,
         }),
         // 172SP clean stall ~48 KIAS (power-off, flaps up).
@@ -2424,9 +3074,20 @@ fn cessna_172sp() -> AircraftProfile {
         taxi: None,
         throttle_dataref: None,
         tail_strike_deg: None,
+        // A light single runs out of elevator before it runs out of tail
+        // clearance, and only ever needs the rotation held BACK.
+        pitch_authority_down: None,
         // Reference figures from the X-Plane C172 Pilot's Operating Manual.
         reference: Some(ReferenceProfile {
             kind: Some("single-engine aircraft".into()),
+            // A piston does not step-climb: it goes as high as it can and
+            // stays. No optimum to advise, so nothing is said.
+            optimum_alt_ft: None,
+            // ...and the GA vertical rates are the shared default already.
+            enroute_climb_fpm: None,
+            enroute_descent_fpm: None,
+            optimum_alt_at_kg: None,
+            optimum_alt_ft_per_1000kg: None,
             vno_kts: Some(129.0),
             va_kts: Some(99.0),
             vx_kts: Some(62.0),
@@ -2540,6 +3201,7 @@ fn cessna_172sp() -> AircraftProfile {
 /// Still off: carb heat (fuel-injected) and the vacuum DG (G1000 glass).
 fn cirrus_sr22() -> AircraftProfile {
     let detent = |label: &str, spoken: &str, ratio: f64, vfe: Option<f64>| FlapDetent {
+        retract_above_kts: None,
         label: label.into(),
         spoken: spoken.into(),
         ratio,
@@ -2752,6 +3414,8 @@ fn cirrus_sr22() -> AircraftProfile {
         fuel: Some(FuelProfile {
             reserve_caution_min: 45.0,
             reserve_warning_min: 30.0,
+            kg_per_gal: None,
+            spoken_unit: None,
             cruise_burn_kg_hr: 46.0,
         }),
         // VS1 (clean) ~76 KIAS; VS0 (landing) ~61.
@@ -2763,10 +3427,21 @@ fn cirrus_sr22() -> AircraftProfile {
         taxi: None,
         throttle_dataref: None,
         tail_strike_deg: None,
+        // A light single runs out of elevator before it runs out of tail
+        // clearance, and only ever needs the rotation held BACK.
+        pitch_authority_down: None,
         // Reference figures from the X-Plane Cirrus SR22 Pilot's Operating Manual
         // (the modeled aircraft is the turbo TSIO-550-K, ceiling 25,000 ft).
         reference: Some(ReferenceProfile {
             kind: Some("single-engine aircraft".into()),
+            // A piston does not step-climb: it goes as high as it can and
+            // stays. No optimum to advise, so nothing is said.
+            optimum_alt_ft: None,
+            // ...and the GA vertical rates are the shared default already.
+            enroute_climb_fpm: None,
+            enroute_descent_fpm: None,
+            optimum_alt_at_kg: None,
+            optimum_alt_ft_per_1000kg: None,
             vno_kts: Some(178.0),
             va_kts: Some(133.0),
             vx_kts: Some(88.0),

@@ -191,8 +191,30 @@ vlo_kts: 210.0
 # takeoff law holds and the circuit's pattern speed derives from, so it carries
 # a departure figure instead. The circuit caps the pattern at 1.5x the approach
 # speed anyway, but a profile should not need saving by a clamp.
+
+# Fuel endurance alerting, added 2026-09-20: without a fuel block this
+# airframe had no reserve callouts at all, and its fuel was spoken at
+# AVGAS density in gallons.
+fuel:
+  reserve_caution_min: 45.0
+  reserve_warning_min: 30.0
+  # Two AE3007C1s, about 700 kg/hr in the cruise. VERIFY.
+  cruise_burn_kg_hr: 700.0
+  # Jet A-1, not 100LL — the density that briefed the 737 11.8% light.
+  kg_per_gal: 3.04
+  spoken_unit: lb
+
 reference:
   kind: twin-engine jet
+  # Very high performance: it climbs and descends harder than an airliner and
+# cruises far above one.
+  # Enroute vertical rates: the shared 700 fpm is a GA number and a ~1 degree
+  # path at these speeds. VERIFY.
+  enroute_climb_fpm: 3000.0
+  enroute_descent_fpm: 2500.0
+  optimum_alt_ft: 43000.0
+  optimum_alt_at_kg: 13000.0
+  optimum_alt_ft_per_1000kg: 900.0
   vr_kts: 145.0                # POM: rotate
   vy_kts: 200.0               # initial climb-out / pattern speed (POM Vy 300 is cruise climb)
   vx_kts: 270.0                # POM best angle (again a cruise figure)
@@ -222,11 +244,21 @@ taxi:
 # Four detents in the aircraft file (0/5/15/35 degrees). The POM gives a single
 # Vfe of 180 KIAS; the per-notch limits below are the usual descending ladder
 # and are all VERIFY.
+# --- Jet/turboprop figures, added 2026-09-20 after the 737 shakedown. Every
+# law below defaults to a Cessna 172's number when a profile is silent, and on
+# BIKF-EGPH that flew an airliner on a 0.8 nm capture radius, a 700 fpm
+# descent, a 0.10 nose-down limit and avgas density. VERIFY each against the
+# POM/FCOM; they are reasoned from the type, not measured on it.
+# Nose-DOWN elevator the rotation law may command. The shared default is
+# 0.10, which on a jet is not authority at all: the 737 was commanded 8
+# degrees and flew 22.4 with the law pinned at its limit. VERIFY.
+pitch_authority_down: 0.5
+
 flaps:
   takeoff_ratio: 0.333
   detents:
-    - { label: up,   spoken: up,          ratio: 0.0 }
-    - { label: "5",  spoken: five,        ratio: 0.333, vfe_kts: 250.0 } # VERIFY
+    - { label: up,   spoken: up,          ratio: 0.0, retract_above_kts: 200.0 }
+    - { label: "5",  spoken: five,        ratio: 0.333, vfe_kts: 250.0, retract_above_kts: 170.0 } # VERIFY
     - { label: "15", spoken: fifteen,     ratio: 0.667, vfe_kts: 210.0 } # VERIFY
     - { label: "35", spoken: thirty five, ratio: 1.0,   vfe_kts: 180.0 } # POM Vfe
 

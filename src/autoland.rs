@@ -200,21 +200,63 @@ pub fn best_landing_runway(
     Ok(best)
 }
 
-/// The specific hard runway END matching `id` at the nearest field within
-/// `max_nm` — used when the arrival has ALREADY chosen the runway (by wind) and
-/// autoland must honour that end instead of re-picking by track. `None` if no
-/// such end is in range (the caller falls back to [`best_landing_runway`]).
+/// The runway an ARRIVAL chose, and the airport it belongs to.
+///
+/// The two travel together, and that is the entire point: **a runway ident is
+/// not unique**. Handed only "24", the lookup below resolved it by proximity
+/// and found EGPJ (Fife) instead of the planned EGPH (Edinburgh), nine miles
+/// away across the Forth — a plan with a destination in it flew an ILS to a
+/// different airport (2026-09-20). When a plan names where we are going, the
+/// airport is not a search result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedRunway {
+    /// The runway END ("24", "27L").
+    pub id: String,
+    /// The airport that end belongs to. `None` only where nothing named one —
+    /// a spoken "land the aircraft" with no plan — and only then may the
+    /// ident be resolved by proximity.
+    pub icao: Option<String>,
+}
+
+impl PlannedRunway {
+    pub fn at(icao: &str, id: &str) -> Self {
+        PlannedRunway {
+            id: id.to_string(),
+            icao: Some(icao.to_string()),
+        }
+    }
+    /// An ident with no airport behind it — proximity is all there is.
+    pub fn anywhere(id: &str) -> Self {
+        PlannedRunway {
+            id: id.to_string(),
+            icao: None,
+        }
+    }
+}
+
+/// The specific hard runway END matching `id` within `max_nm`, AT `icao` when
+/// one is given — used when the arrival has ALREADY chosen the runway (by
+/// wind) and autoland must honour that end instead of re-picking by track.
+/// `None` if no such end is in range (the caller falls back to
+/// [`best_landing_runway`]).
+///
+/// With `icao: None` this is the old nearest-ident behaviour, which is right
+/// for a self-pick and wrong for anything that knows its destination.
 pub fn runway_by_id(
     apt_dat: &str,
     lat: f64,
     lon: f64,
     id: &str,
     max_nm: f64,
+    icao: Option<&str>,
 ) -> std::io::Result<Option<Runway>> {
     let want = id.trim();
+    let at = icao.map(str::trim);
     // nearby_runways is already nearest-threshold-first.
     let cands = nearby_runways(apt_dat, lat, lon, max_nm)?;
-    Ok(cands.into_iter().find(|r| r.hard() && r.id.trim() == want))
+    Ok(cands.into_iter().find(|r| {
+        r.hard() && r.id.trim() == want && at.is_none_or(|a| r.icao.trim().eq_ignore_ascii_case(a))
+    }))
 }
 
 // ---- Stage 3: the control loop (AP-first, like the reference plugin) ----------
@@ -397,7 +439,7 @@ pub fn run_autoland(
     approach_ias: f64,
     voice: Option<Voice>,
     status: Option<crate::plugin_status::StatusSink>,
-    forced_rwy: Option<String>,
+    forced_rwy: Option<PlannedRunway>,
 ) {
     run_autoland_scoped(
         base,
@@ -421,9 +463,10 @@ pub fn run_autoland_scoped(
     // The chat mirror now rides `voice.alert`; an explicit `s.action` here too
     // double-wrote every autoland line to the transcript (2026-07-24).
     _status: Option<crate::plugin_status::StatusSink>,
-    // The arrival's already-chosen landing runway (by wind). `Some` forces that
-    // end; `None` self-picks by track — the emergency/manual path, unchanged.
-    forced_rwy: Option<String>,
+    // The arrival's already-chosen landing runway (by wind) AND its airport.
+    // `Some` forces that end; `None` self-picks by track — the emergency and
+    // manual path, unchanged.
+    forced_rwy: Option<PlannedRunway>,
     parents: Vec<std::sync::Arc<AtomicBool>>,
 ) {
     let my_gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
@@ -481,12 +524,20 @@ pub fn run_autoland_scoped(
             // against a "cleared to land runway one two" (2026-09-12) — every
             // planned arrival must hand its runway down (see `EndAction`).
             let cleared = crate::party_line::clearance_runway();
-            let picked = match forced_rwy.as_deref() {
-                Some(id) => match runway_by_id(&apt_dat, lat0, lon0, id, 40.0) {
+            let picked = match forced_rwy.as_ref() {
+                Some(planned_rwy) => match runway_by_id(
+                    &apt_dat,
+                    lat0,
+                    lon0,
+                    &planned_rwy.id,
+                    40.0,
+                    planned_rwy.icao.as_deref(),
+                ) {
                     Ok(None) => {
                         crate::blackbox::record(
                             "autoland",
-                            serde_json::json!({"event": "forced_runway_missing", "id": id}),
+                            serde_json::json!({"event": "forced_runway_missing",
+                                "id": planned_rwy.id, "icao": planned_rwy.icao}),
                         );
                         best_landing_runway(&apt_dat, lat0, lon0, hdg0, 40.0, 1200.0)
                     }
@@ -495,7 +546,14 @@ pub fn run_autoland_scoped(
                         // an end at the SAME field — a stale departure clearance
                         // must never send us to a "09" forty miles away.
                         match cleared.as_deref().filter(|c| clearance_differs(&planned.id, c)) {
-                            Some(c) => match runway_by_id(&apt_dat, lat0, lon0, c, 40.0) {
+                            Some(c) => match runway_by_id(
+                                &apt_dat,
+                                lat0,
+                                lon0,
+                                c,
+                                40.0,
+                                Some(planned.icao.as_str()),
+                            ) {
                                 Ok(Some(r)) if r.icao == planned.icao => {
                                     crate::blackbox::record(
                                         "autoland",
@@ -637,6 +695,10 @@ pub fn run_autoland_scoped(
             let mut vvi_read_failed = false;
             // The vertical speed one tick ago, for the arrest's trend term.
             let mut prev_vvi: Option<(f64, std::time::Instant)> = None;
+            // The flare's elevator law. Its integrator is per-approach: a
+            // standing pull must not survive a go-around into the next one.
+            let mut flare_pitch = FlarePitch::default();
+            let mut pitch_yielded = false;
             // Airspeed history for the throttle governor's derivative term — the
             // anti-stall reflex needs the TREND (kts/sec), not just the error.
             let mut prev_ias: Option<f64> = None;
@@ -735,7 +797,7 @@ pub fn run_autoland_scoped(
                         clearance_checked.as_deref(),
                     ) {
                         clearance_checked = Some(c.clone());
-                        match runway_by_id(&apt_dat, lat, lon, &c, 40.0) {
+                        match runway_by_id(&apt_dat, lat, lon, &c, 40.0, Some(rwy.icao.as_str())) {
                             Ok(Some(r)) if r.icao == rwy.icao => {
                                 crate::blackbox::record(
                                     "autoland",
@@ -762,7 +824,7 @@ pub fn run_autoland_scoped(
                                     approach_ias,
                                     voice.clone(),
                                     None,
-                                    Some(r.id),
+                                    Some(PlannedRunway::at(&r.icao, &r.id)),
                                     xp.cancellation(),
                                 );
                                 break;
@@ -1100,6 +1162,10 @@ pub fn run_autoland_scoped(
                 };
                 // The sink's rate of change over the last tick (fpm per
                 // second), the arrest's damping term on a slow autopilot.
+                let tick_dt = prev_vvi
+                    .map(|(_, t0)| t_now.duration_since(t0).as_secs_f64())
+                    .filter(|d| (0.02..=3.0).contains(d))
+                    .unwrap_or(0.2);
                 let vvi_trend = match (vvi, prev_vvi) {
                     (Some(v), Some((p, t0))) => {
                         let dt = t_now.duration_since(t0).as_secs_f64();
@@ -1113,6 +1179,24 @@ pub fn run_autoland_scoped(
                     Some(v) => vs_dial_fpm(g.target_vs_fpm, v, vvi_trend, g.arresting, arrest_lead),
                     None => g.target_vs_fpm,
                 };
+                // THE ARREST FLIES THE ELEVATOR, not the autopilot's VS dial.
+                // Only while actually arresting, and only with both
+                // measurements in hand: anywhere else the dial is right and
+                // proven. The channel is a 1 s expiring heartbeat, so simply
+                // ceasing to write it hands the pitch back by itself.
+                let flare_elev = match (g.arresting, vvi, pitch_yielded) {
+                    // Once the pilot has taken the pitch it stays taken for
+                    // this approach — the debounce the taxi and takeoff
+                    // channels learned: a latch that re-arms is a fight over
+                    // a control with a person on the other end.
+                    (true, Some(v), false) => {
+                        Some(flare_pitch.step(g.target_vs_fpm, v, vvi_trend, tick_dt))
+                    }
+                    _ => {
+                        flare_pitch.reset();
+                        None
+                    }
+                };
                 *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(xtk_now * M_PER_NM);
                 crate::blackbox::record("autoland", serde_json::json!({
                     "rwy": format!("{} {}", rwy.icao, rwy.id), "dist": g.dist_nm,
@@ -1121,6 +1205,7 @@ pub fn run_autoland_scoped(
                     "cmd_hdg": g.target_heading_deg, "ias": ias, "radio": radio_ft,
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
                     "trim": trim, "xtk_m": xtk_now * M_PER_NM,
+                    "flare_elev": flare_elev,
                 }));
 
                 // Lateral: heading bug in MAGNETIC (guidance is TRUE — see
@@ -1139,15 +1224,60 @@ pub fn run_autoland_scoped(
                 // around's 178° flip stalled this loop ~5 s per tick (2026-07-14) —
                 // no VS/throttle updates the whole time. 30°/tick keeps a full
                 // reversal turning while the loop stays live.
-                let _ = crate::tools::autopilot::drive_heading_bug_step(&xp, mag_hdg, 30.0).await;
-                if xp.get_float(HDG_STATUS).await.unwrap_or(0.0) <= 0.5 {
+                // The bug, the VS dial and BOTH mode checks in one burst. They
+                // were four sequential round trips on the hot path, and at
+                // 40-70 ms each that is a quarter of a second of tick time
+                // spent waiting — on top of the sleep. Nothing here depends on
+                // anything else here: the mode reads decide whether to re-engage
+                // AFTER the fact, and a dial written while its mode is off is
+                // exactly what the re-engage below is for.
+                // The elevator rides in the SAME burst. Written every tick it
+                // is wanted (the plugin channel is a 1 s heartbeat, so a
+                // change-gate would drop it exactly where it sits still), and
+                // simply not written otherwise — which hands the pitch back
+                // inside a second with nothing to remember.
+                let (_, hdg_st, vs_st, _, yield_r) = tokio::join!(
+                    crate::tools::autopilot::drive_heading_bug_step(&xp, mag_hdg, 30.0),
+                    xp.get_float(HDG_STATUS),
+                    xp.get_float(VS_STATUS),
+                    xp.set_float(VS_DIAL, vs_dial),
+                    async {
+                        match flare_elev {
+                            Some(e) => {
+                                let _ = xp.set_float(FLARE_PITCH, e).await;
+                                xp.get_float(FLARE_PITCH_YIELD).await
+                            }
+                            None => Ok(0.0),
+                        }
+                    },
+                );
+                // The pilot pulled or pushed: the plugin has already dropped
+                // the override this frame. Stop commanding and let the dial
+                // fly what is left — the VS path is still running underneath.
+                if yield_r.is_ok_and(|v| v > 0.5) {
+                    if !pitch_yielded {
+                        pitch_yielded = true;
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "pitch_yield", "radio": radio_ft}),
+                        );
+                        announce(
+                            "You have the pitch. I'm still on the bug and the power.".into(),
+                            Priority::Caution,
+                        );
+                    }
+                    flare_pitch.reset();
+                }
+                if hdg_st.unwrap_or(0.0) <= 0.5 {
                     let _ = xp.run_command(CMD_HDG_MODE).await;
                 }
                 // Vertical: VS mode to the glidepath rate.
-                if xp.get_float(VS_STATUS).await.unwrap_or(0.0) <= 0.5 {
+                if vs_st.unwrap_or(0.0) <= 0.5 {
                     let _ = xp.run_command(CMD_VS_MODE).await;
+                    // The engage syncs the dial to the CURRENT rate, so the
+                    // rate we want has to be written again after it.
+                    let _ = xp.set_float(VS_DIAL, vs_dial).await;
                 }
-                let _ = xp.set_float(VS_DIAL, vs_dial).await;
 
                 // Speed: hold the approach speed with the SAME governor the copilot
                 // uses for speed hold (speedhold::throttle_adjust) — a P+D law whose
@@ -1212,9 +1342,22 @@ pub fn run_autoland_scoped(
                     Some(throttle) => Some(xp.set_float(&throttle_dref(), throttle).await.is_ok()),
                     None => None,
                 };
-                let throttle_after = if throttle_written == Some(true) {
-                    xp.get_float(&throttle_dref()).await.ok().filter(|v| v.is_finite())
-                } else { None };
+                // A second round trip purely for the blackbox — whether the
+                // lever TOOK the write, which is how an add-on re-driving it
+                // gets caught. Worth it for the whole approach and not worth
+                // it in the flare, where the tick budget is the landing: the
+                // next tick's `throttle_before` says the same thing anyway,
+                // one tick later.
+                let throttle_after = if throttle_written == Some(true)
+                    && g.phase != ApproachPhase::Flare
+                {
+                    xp.get_float(&throttle_dref())
+                        .await
+                        .ok()
+                        .filter(|v| v.is_finite())
+                } else {
+                    None
+                };
                 if throttle_written == Some(false) {
                     flare_power.reset();
                 }
@@ -1304,7 +1447,7 @@ pub fn run_autoland_scoped(
 
                 // (Touchdown + rollout-to-stop is handled at the top of the loop,
                 // latched by `rolling_out`, before the approach guidance.)
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(tick_ms(last_phase))).await;
             }
             // A newer loop (the clearance re-arm above, or any later arm) has
             // already set ACTIVE for itself; clearing it here would report
@@ -1734,6 +1877,16 @@ const CLIMB_SPEED_MARGIN_KTS: f64 = 5.0;
 /// effective 5,000+ fpm, 2026-07-22). The climb gate already requires
 /// surplus airspeed, and speed protection still owns the slow case.
 const MAX_CLIMB_FPM: f64 = 800.0;
+
+/// ...and the AIRFRAME's climb when it has more, because 800 fpm is a light
+/// single's answer to terrain and an airliner's idea of level flight. It was
+/// raised from 500 once already for being anemic; on a 737 it is anemic
+/// again — the EGPH go-around (2026-09-20) climbed away from a balked
+/// approach at exactly this number. Never LESS than the GA figure, so
+/// nothing that flew before gets weaker.
+fn max_climb_fpm() -> f64 {
+    crate::procedure::climb_fpm().max(MAX_CLIMB_FPM)
+}
 /// While below the terrain floor, command the throttle governor to this much over
 /// the approach speed, so it builds the surplus the climb gate needs.
 const CLIMB_ENERGY_BONUS_KTS: f64 = 12.0;
@@ -1900,6 +2053,69 @@ impl FlarePower {
 }
 
 /// What to dial into the VS mode so the aircraft actually FLIES `target_fpm`.
+/// The plugin's direct elevator channel, and the pilot's take-back latch —
+/// the SAME pair the takeoff rotates on. `override_joystick_pitch` bypasses
+/// the autopilot's pitch servo while leaving it the roll, so the flare can be
+/// flown on the elevator with the AP still holding the bug.
+const FLARE_PITCH: &str = "xcopilot/pitch";
+const FLARE_PITCH_YIELD: &str = "xcopilot/pitch_yield";
+
+/// Elevator for a wanted sink rate, flown DIRECTLY instead of asked of the
+/// autopilot's vertical-speed mode.
+///
+/// The whole `vs_dial_fpm` lead exists to compensate for a lag we chose to
+/// fly through: the 737's VS mode is two 1.5 s lags with 1.5 s of dead time,
+/// and the arrest is over in three seconds. Commanding the elevator removes
+/// the lag rather than predicting it — which is what the TAKEOFF already
+/// does, for the same reason, in its own comment: "the AP's VS mode is too
+/// slow for a rotation". EGPH (2026-09-20) touched down at 977 fpm against a
+/// 175 fpm target with the arrest asking the dial nicely.
+///
+/// P on the sink-rate error plus D on its trend, in units of elevator. Small
+/// gains and a tight clamp on purpose: this is three seconds of flight a few
+/// feet up, and a flare that over-rotates is a tail strike. The trim term is
+/// the standing pull the aircraft needs to hold the attitude, found by the
+/// integrator rather than assumed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FlarePitch {
+    trim: f64,
+}
+
+/// Elevator per 100 fpm of sink error. A flare corrects hundreds of fpm with
+/// a few percent of travel.
+const FLARE_P_PER_100FPM: f64 = 0.060;
+/// Damping on the sink TREND, per 100 fpm per second — the term that stops
+/// the pull becoming a balloon.
+const FLARE_D_PER_100FPM_S: f64 = 0.050;
+/// The integrator's rate, per 100 fpm of standing error per second. Small:
+/// it is there to find the standing pull, not to fly the arrest — wound
+/// harder it carried the 737 through its target into a 66 fpm float.
+const FLARE_TRIM_PER_100FPM_S: f64 = 0.015;
+/// Total elevator the flare may command. Up is positive.
+const FLARE_PITCH_MAX: f64 = 0.35;
+/// ...and the push, which is deliberately far smaller: the ground is there.
+const FLARE_PITCH_MIN: f64 = -0.10;
+
+impl FlarePitch {
+    /// `vvi_trend` is fpm per second, positive = sink easing (the same sign
+    /// the VS lead uses). `None` for either measurement holds what we had.
+    pub fn step(&mut self, target_fpm: f64, vvi_fpm: f64, vvi_trend: f64, dt_s: f64) -> f64 {
+        let dt = dt_s.clamp(0.02, 0.5);
+        // Positive error = sinking FASTER than wanted = pull.
+        let err = (target_fpm - vvi_fpm) / 100.0;
+        self.trim = (self.trim + err * FLARE_TRIM_PER_100FPM_S * dt)
+            .clamp(FLARE_PITCH_MIN, FLARE_PITCH_MAX);
+        (err * FLARE_P_PER_100FPM - (vvi_trend / 100.0) * FLARE_D_PER_100FPM_S + self.trim)
+            .clamp(FLARE_PITCH_MIN, FLARE_PITCH_MAX)
+    }
+
+    /// Let go — the channel expires on its own within a second, but the
+    /// integrator must not carry a standing pull into the next approach.
+    pub fn reset(&mut self) {
+        self.trim = 0.0;
+    }
+}
+
 /// Outside a landing arrest (`arresting` false) the dial is the target, as it
 /// always was. Inside one it leads the target by the autopilot's outstanding
 /// error - see [`VS_LEAD_GAIN`] - against the sink PREDICTED `trend_seconds`
@@ -2203,7 +2419,7 @@ pub fn missed_approach_guidance(
 ) -> Guidance {
     let slow = approach_ias - ias_kts > SPEED_FLOOR_MARGIN_KTS;
     let (target_heading_deg, target_vs_fpm) = match stage {
-        MissedStage::Climb => (rwy.course_deg, if slow { 0.0 } else { MAX_CLIMB_FPM }),
+        MissedStage::Climb => (rwy.course_deg, if slow { 0.0 } else { max_climb_fpm() }),
         MissedStage::Reposition => {
             // Same join point the ordinary guidance uses, so the handback is
             // continuous.
@@ -2211,7 +2427,7 @@ pub fn missed_approach_guidance(
             let recip = (rwy.course_deg + 180.0) % 360.0;
             let (jlat, jlon) = project_latlon(rwy.thr_lat, rwy.thr_lon, recip, join_nm);
             let vs = if radio_alt_ft < REPOSITION_MIN_AGL_FT - 50.0 && !slow {
-                ((REPOSITION_MIN_AGL_FT - radio_alt_ft) * 2.0).clamp(100.0, MAX_CLIMB_FPM)
+                ((REPOSITION_MIN_AGL_FT - radio_alt_ft) * 2.0).clamp(100.0, max_climb_fpm())
             } else {
                 0.0
             };
@@ -2239,6 +2455,30 @@ pub enum ApproachPhase {
     Final,
     /// Very short — over the threshold, flaring.
     Flare,
+}
+
+/// How long to sleep between ticks, milliseconds — by what the loop is
+/// actually flying.
+///
+/// 400 ms everywhere made the tick 0.6 s end to end (measured on the EGPH
+/// landing, 2026-09-20: `dt` median 0.59 s, so 1.7 Hz), and a flare is over
+/// in three seconds. The 737's own `ArrestLeadProfile` declares 1.5 s of
+/// dead time, so an arrest commanded six times a flare gets about TWO
+/// commands the aircraft can still act on — it touched down at 977 fpm
+/// against a 175 fpm target, and the yoke visibly stepped between updates.
+/// No gain fixes that; there is not enough bandwidth to fly a flare.
+///
+/// The Web API is served from X-Plane's flight loop, so this is sim frame
+/// time and it is spent where it buys something: fast where feet matter,
+/// unchanged out on the intercept where nothing moves in half a second.
+fn tick_ms(phase: Option<ApproachPhase>) -> u64 {
+    match phase {
+        // Over the threshold: the flare and the arrest.
+        Some(ApproachPhase::Flare) => 100,
+        // Established, configuring, closing the last miles.
+        Some(ApproachPhase::Final) => 200,
+        _ => 400,
+    }
 }
 
 /// The command the control loop should fly this tick.
@@ -2627,7 +2867,7 @@ pub fn guidance(
             ApproachPhase::Intercept => REPOSITION_MIN_AGL_FT,
             _ => TERRAIN_FLOOR_AGL_FT,
         };
-        ((floor_ft - radio_alt_ft) * 2.0).clamp(100.0, MAX_CLIMB_FPM)
+        ((floor_ft - radio_alt_ft) * 2.0).clamp(100.0, max_climb_fpm())
     } else {
         path_vs
     };
@@ -2658,6 +2898,122 @@ pub fn guidance(
 
 #[cfg(test)]
 mod tests {
+
+    /// The flare flies the ELEVATOR, and it has to arrest a real sink in the
+    /// three seconds it has. Flown against a plant with no autopilot in it —
+    /// elevator to pitch rate to sink — because removing the autopilot's
+    /// 1.5 s of dead time is the entire point of the change.
+    #[test]
+    fn the_flare_arrests_a_jets_sink_on_the_elevator() {
+        // A 737-ish short-period response: elevator commands a pitch rate,
+        // pitch changes the sink, both first order and quick. Deliberately
+        // NOT the VS-mode plant, which is what we stopped flying through.
+        struct Plant {
+            vvi: f64,
+            rate: f64,
+        }
+        impl Plant {
+            fn step(&mut self, elev: f64, dt: f64) {
+                // Elevator to vertical acceleration, with a short lag.
+                let want = elev * 1400.0; // fpm/s at full commanded travel
+                self.rate += (want - self.rate) * (dt / 0.35).min(1.0);
+                self.vvi += self.rate * dt;
+            }
+        }
+        let mut law = FlarePitch::default();
+        let mut p = Plant {
+            vvi: -900.0,
+            rate: 0.0,
+        };
+        let target = -175.0; // the 737's flare target
+        let dt = 0.1; // the flare tick rate
+        let mut prev = p.vvi;
+        let mut worst_up: f64 = 0.0;
+        for _ in 0..30 {
+            // 3 seconds
+            let trend = (p.vvi - prev) / dt;
+            prev = p.vvi;
+            let e = law.step(target, p.vvi, trend, dt);
+            worst_up = worst_up.max(e);
+            p.step(e, dt);
+        }
+        assert!(
+            p.vvi > target - 120.0,
+            "three seconds must arrest 900 fpm to near {target}: got {:.0}",
+            p.vvi
+        );
+        assert!(
+            p.vvi < 0.0,
+            "and must not balloon: the arrest settles ON the target, it does \
+             not fly through it: got {:.0}",
+            p.vvi
+        );
+        assert!(
+            (p.vvi - target).abs() < 60.0,
+            "settled on {target}, not merely near it: got {:.0}",
+            p.vvi
+        );
+        assert!(
+            worst_up <= FLARE_PITCH_MAX + 1e-9,
+            "never past the clamp: {worst_up}"
+        );
+    }
+
+    /// The old VS path could not do it, which is why the change exists: the
+    /// same three seconds through the 737's declared lag and dead time.
+    #[test]
+    fn the_vs_dial_could_not_have_arrested_it() {
+        // 1.5 s of dead time plus a 1.5 s lag, the 737's ArrestLeadProfile.
+        let (dt, target) = (0.6f64, -175.0f64); // and the OLD tick rate
+        let mut vvi = -900.0f64;
+        let mut queue = std::collections::VecDeque::from(vec![vvi; 3]);
+        for _ in 0..5 {
+            // 3 seconds at the old rate is five commands
+            let commanded = target;
+            queue.push_back(commanded);
+            let effective = queue.pop_front().unwrap_or(commanded);
+            vvi += (effective - vvi) * (dt / 1.5).min(1.0);
+        }
+        // Three seconds of dead time and lag leave it at about -436 against a
+        // -175 target: a quarter of a G of unarrested sink still to absorb in
+        // the undercarriage. The elevator law above settles ON -175 in the
+        // same three seconds, which is the whole argument for the change.
+        assert!(
+            vvi < target - 200.0,
+            "the dial path is still {:.0} fpm fast at touchdown: {vvi:.0}",
+            target - vvi
+        );
+    }
+
+    /// The tick rate is the bandwidth the flare has to fly with.
+    ///
+    /// 400 ms everywhere measured 0.59 s end to end on the EGPH landing
+    /// (2026-09-20) — 1.7 Hz. A flare lasts about three seconds and the
+    /// 737 declares 1.5 s of dead time, so the arrest got roughly two
+    /// commands the aircraft could still act on: it touched down at 977 fpm
+    /// against a 175 fpm target, and the yoke stepped visibly between
+    /// updates. No gain fixes a bandwidth problem.
+    #[test]
+    fn the_flare_ticks_fast_enough_to_fly_an_arrest() {
+        assert_eq!(tick_ms(None), 400, "nothing to fly yet: unchanged");
+        assert_eq!(tick_ms(Some(ApproachPhase::Intercept)), 400, "miles out");
+        assert!(tick_ms(Some(ApproachPhase::Final)) <= 200);
+        let flare = tick_ms(Some(ApproachPhase::Flare));
+        assert!(flare <= 100, "the flare needs feet, not seconds: {flare}");
+        // The 737's arrest lead is 1.5 s of dead time; a three second flare
+        // must carry enough commands to matter through it.
+        let commands_in_flare = 3000 / flare;
+        assert!(
+            commands_in_flare >= 20,
+            "only {commands_in_flare} commands in a flare"
+        );
+        // ...and it must never get SLOWER as the aircraft gets closer.
+        assert!(
+            tick_ms(Some(ApproachPhase::Flare)) <= tick_ms(Some(ApproachPhase::Final))
+                && tick_ms(Some(ApproachPhase::Final)) <= tick_ms(Some(ApproachPhase::Intercept)),
+            "the tick rate must rise monotonically toward the ground"
+        );
+    }
     // LEMG 13, 2026-09-12: the raw heading-minus-track fed straight back to
     // the heading bug hunted the final (crab sd 0.5° on the intercept, 4.0°
     // at the numbers, a ±9° swing with a ~13 s period) into the lateral
@@ -4666,14 +5022,14 @@ mod tests {
         .unwrap();
         let p = path.to_str().unwrap();
         // The into-wind end the arrival chose (27) resolves to the hard runway.
-        let r = runway_by_id(p, 36.15, -5.34, "27", 40.0)
+        let r = runway_by_id(p, 36.15, -5.34, "27", 40.0, None)
             .unwrap()
             .expect("27 is at the field");
         assert_eq!(r.id, "27");
         assert!(r.hard(), "27 is asphalt");
         // Its reciprocal is equally resolvable.
         assert_eq!(
-            runway_by_id(p, 36.15, -5.34, "09", 40.0)
+            runway_by_id(p, 36.15, -5.34, "09", 40.0, None)
                 .unwrap()
                 .unwrap()
                 .id,
@@ -4681,12 +5037,16 @@ mod tests {
         );
         // The grass end is filtered out (not a landing runway for autoland).
         assert!(
-            runway_by_id(p, 36.15, -5.34, "05", 40.0).unwrap().is_none(),
+            runway_by_id(p, 36.15, -5.34, "05", 40.0, None)
+                .unwrap()
+                .is_none(),
             "grass is skipped"
         );
         // An ident that isn't here → None (caller falls back to track pick).
         assert!(
-            runway_by_id(p, 36.15, -5.34, "18", 40.0).unwrap().is_none(),
+            runway_by_id(p, 36.15, -5.34, "18", 40.0, None)
+                .unwrap()
+                .is_none(),
             "no 18 here"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4702,6 +5062,61 @@ mod tests {
     // capture. This pins the DIFFERENCE between the two picks: on downwind
     // (heading away from the landing end), the track search does not return
     // the near field, and forcing the ident does.
+    /// A runway ident is NOT unique, and the old lookup resolved it by
+    /// proximity alone. EGPH-bound over the Forth, the nearest "24" was EGPJ
+    /// (Fife) nine miles away, and the ILS was flown to a different airport
+    /// (2026-09-20). The previous test could never catch this: its two fields
+    /// had different idents, so the ambiguity never arose.
+    #[test]
+    fn a_planned_arrival_lands_at_the_airport_the_plan_named() {
+        let dir = std::env::temp_dir().join(format!("xvl_two_24s_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("apt.dat");
+        // Both fields have a 24. EGPJ is NEARER the aircraft; EGPH is the
+        // destination. Geometry taken from the real pair across the Forth.
+        std::fs::write(
+            &path,
+            "1 395 0 0 EGPJ Fife\n\
+             100 45 1 0 0.25 0 0 0 06 56.180 -3.420 0 0 1 0 0 0 24 56.190 -3.390 0 0 1 0 0 0\n\
+             1 136 0 0 EGPH Edinburgh\n\
+             100 45 1 0 0.25 0 0 0 06 55.940 -3.400 0 0 1 0 0 0 24 55.960 -3.340 0 0 1 0 0 0\n",
+        )
+        .unwrap();
+        let p = path.to_str().unwrap();
+        // North of Edinburgh, closer to Fife — where the aircraft actually was.
+        let (lat, lon) = (56.166, -3.286);
+
+        // The bug: an ident with no airport behind it goes to the near field.
+        let bare = runway_by_id(p, lat, lon, "24", 40.0, None)
+            .unwrap()
+            .expect("some 24 is in range");
+        assert_eq!(bare.icao, "EGPJ", "proximity picks the wrong field");
+
+        // The fix: the plan names its destination, so there is nothing to pick.
+        let planned = runway_by_id(p, lat, lon, "24", 40.0, Some("EGPH"))
+            .unwrap()
+            .expect("EGPH has a 24");
+        assert_eq!(planned.icao, "EGPH");
+        assert!(
+            planned.dist_nm > bare.dist_nm,
+            "and it is the FURTHER one, which is the whole point"
+        );
+
+        // An ident the named field does not have is None — the caller falls
+        // back to the track search rather than silently landing elsewhere.
+        assert!(runway_by_id(p, lat, lon, "13", 40.0, Some("EGPH"))
+            .unwrap()
+            .is_none());
+        // Case and whitespace in the ICAO must not send us to the wrong place.
+        assert_eq!(
+            runway_by_id(p, lat, lon, "24", 40.0, Some(" egph "))
+                .unwrap()
+                .map(|r| r.icao),
+            Some("EGPH".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_forced_ident_beats_the_track_search_at_the_wrong_field() {
         let dir = std::env::temp_dir().join(format!("xvl_circuit_rwy_{}", std::process::id()));
@@ -4724,7 +5139,7 @@ mod tests {
         let (lat, lon, hdg) = (50.958, -1.330, 20.0);
 
         // Forcing the pattern's ident lands us at the near field, every time.
-        let forced = runway_by_id(p, lat, lon, "20", 40.0)
+        let forced = runway_by_id(p, lat, lon, "20", 40.0, None)
             .unwrap()
             .expect("20 is the pattern runway, right here");
         assert_eq!(forced.id, "20");
@@ -4824,7 +5239,7 @@ mod tests {
         )
         .unwrap();
         let p = path.to_str().unwrap();
-        let r = runway_by_id(p, 50.984, -1.311, "20", 40.0)
+        let r = runway_by_id(p, 50.984, -1.311, "20", 40.0, None)
             .unwrap()
             .expect("surface 22 is a paved runway and must resolve");
         assert_eq!(r.id, "20");
