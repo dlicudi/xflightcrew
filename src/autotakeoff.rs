@@ -231,7 +231,7 @@ const PITCH_MAX: f64 = 0.65;
 /// 8 degrees and watched the nose go to 22.4, the law pinned at this limit
 /// for the whole divergence with the pitch RATE still building — it wanted
 /// -0.38 and could ask for -0.10. Only the autopilot engaging at 1,000 ft
-/// ended it. See [`RotatePitch::new`].
+/// ended it. See [`RotatePitch::with_authority`].
 const PITCH_MIN: f64 = -0.10;
 /// Hand the established climb to the autopilot this high — clear of ground
 /// effect, wings level, speed building; the VS dial is written AFTER the
@@ -562,12 +562,15 @@ pub struct RotatePitch {
 
 impl RotatePitch {
     /// `tail_strike_deg` is the airframe's tail-clearance attitude, from the
-    /// profile. `None` leaves the law with only its own 8° target.
-    pub fn new(tail_strike_deg: Option<f64>) -> Self {
-        Self::with_authority(tail_strike_deg, PITCH_MIN)
-    }
-
-    /// ...and with this airframe's own nose-down authority. A ceiling the law
+    /// profile; `None` leaves the law with only its own 8° target.
+    ///
+    /// There is deliberately no constructor that leaves the authority
+    /// implicit. One existed and every caller but the tests moved off it
+    /// within the hour — an argument nobody passes is an argument nobody
+    /// thinks about, and this one is the difference between a ceiling and a
+    /// suggestion. Pass `PITCH_MIN` to mean the GA figure and say so.
+    ///
+    /// A ceiling the law
     /// cannot push against is not a ceiling: the 737 declares an 11° tail
     /// strike, was commanded 8°, and flew 22.4° because the push it wanted
     /// was four times what it was allowed to ask for (2026-09-20).
@@ -1583,7 +1586,7 @@ mod tests {
         // The trace, replayed: 20.1 degrees against an 8 degree target with
         // the nose still coming up at 2 deg/s.
         let (theta, rate) = (20.1, 2.05);
-        let mut ga = RotatePitch::new(None);
+        let mut ga = RotatePitch::with_authority(None, PITCH_MIN);
         let mut jet = RotatePitch::with_authority(Some(11.0), -0.5);
         // Walk both to the cap so the ramp is finished and the target is 8.
         for _ in 0..40 {
@@ -2030,7 +2033,7 @@ mod tests {
     /// oscillation for the rest of the initial climb.
     #[test]
     fn the_rotation_walks_the_nose_up_instead_of_snatching_it() {
-        let mut law = RotatePitch::new(None);
+        let mut law = RotatePitch::with_authority(None, PITCH_MIN);
         // First tick from a nose-on-the-ground attitude: the commanded target
         // starts THERE, so the error is small and the elevator stays gentle.
         let first = law.step(0.0, None, 0.15);
@@ -2050,7 +2053,7 @@ mod tests {
         assert!(law.target_deg() < 1.0, "target starts at the nose");
         // Two seconds later the commanded attitude has walked up about
         // 2.5°/s, and no further than the 8° target.
-        let mut ramp = RotatePitch::new(None);
+        let mut ramp = RotatePitch::with_authority(None, PITCH_MIN);
         for _ in 0..14 {
             ramp.step(0.0, None, 0.15);
         }
@@ -2067,7 +2070,7 @@ mod tests {
         // A nose FOLLOWING the ramp is doing what was asked, so the elevator
         // must not keep winding: the rate damping measures the rate ERROR, not
         // the rotation itself.
-        let mut good = RotatePitch::new(None);
+        let mut good = RotatePitch::with_authority(None, PITCH_MIN);
         let mut theta = 0.0;
         let mut peak: f64 = 0.0;
         for _ in 0..60 {
@@ -2086,7 +2089,7 @@ mod tests {
     #[test]
     fn a_tail_strike_limit_caps_the_commanded_attitude() {
         // 9.5° geometry, 2° margin → 7.5°, below the law's own 8° target.
-        let mut md = RotatePitch::new(Some(9.5));
+        let mut md = RotatePitch::with_authority(Some(9.5), PITCH_MIN);
         for _ in 0..80 {
             md.step(0.0, None, 0.15);
         }
@@ -2096,7 +2099,7 @@ mod tests {
             md.target_deg()
         );
         // Past the ceiling, the law pushes back rather than holding the pull.
-        let mut over = RotatePitch::new(Some(9.5));
+        let mut over = RotatePitch::with_authority(Some(9.5), PITCH_MIN);
         for _ in 0..40 {
             over.step(0.0, None, 0.15);
         }
@@ -2110,7 +2113,7 @@ mod tests {
             over.out
         );
         // No limit declared → the plain 8° target, unchanged.
-        let mut ga = RotatePitch::new(None);
+        let mut ga = RotatePitch::with_authority(None, PITCH_MIN);
         for _ in 0..80 {
             ga.step(0.0, None, 0.15);
         }

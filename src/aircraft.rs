@@ -356,6 +356,17 @@ pub struct AircraftProfile {
     /// (the MD-82 jet sequence) and the piston `engine`/`piston_start` groups.
     #[serde(default)]
     pub turboprop_start: Option<TurbineStartProfile>,
+    /// Mode-selector + master-switch jet start: the AIRLINER pattern, and the
+    /// one the existing blocks could not express.
+    ///
+    /// `turbine_start` is the MD-82's, hardcoded to `laminar/md82/*`;
+    /// `turboprop_start` is condition levers and starter commands. An Airbus
+    /// or a 737 has neither — it has an ENG MODE knob and two guarded master
+    /// switches, so every airliner here but the MD-82 had `turbine_start:
+    /// false` and no way to start its own engines at all (found in the A330,
+    /// 2026-09-20).
+    #[serde(default)]
+    pub airliner_start: Option<AirlinerStartProfile>,
     /// Pitot heat anti-ice (`set_pitot_heat`).
     #[serde(default)]
     pub pitot_heat: bool,
@@ -765,6 +776,111 @@ fn default_apu_light_n1() -> f64 {
 }
 fn default_apu_ready_secs() -> f64 {
     90.0
+}
+
+/// One switch on the way to a running APU: fire `command`, but only when the
+/// switch is not already where we want it.
+///
+/// Read-before-fire, because these are TOGGLES: firing one blind turns a
+/// switch that was already on back off. The same rule the transponder knob
+/// and the light pairs learned, and the reason `position` is a separate name
+/// from `command` — on this aircraft they are frequently the same string
+/// meaning two different things.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartStep {
+    pub command: String,
+    /// The switch POSITION to read first. `None` fires unconditionally, which
+    /// is right for a momentary button and wrong for anything that latches.
+    #[serde(default)]
+    pub position: Option<String>,
+    #[serde(default = "one")]
+    pub want: f64,
+    /// A momentary press-and-hold (the APU START button is one), seconds.
+    /// `None` is a single press.
+    #[serde(default)]
+    pub held_secs: Option<f64>,
+}
+
+/// The airliner start: bleed air up, ENG MODE to IGN/START, each master
+/// switch lifted past its guard and set, then the knob back to NORM.
+///
+/// Every field is a name the aircraft answers to, so every one is a
+/// hypothesis until the swap-time probe confirms it — `profile_references`
+/// walks this like the rest of the profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AirlinerStartProfile {
+    /// ENG MODE selector, and the values for IGN/START and NORM.
+    pub mode_selector: String,
+    pub mode_start: f64,
+    pub mode_norm: f64,
+    /// Engine master switch ARRAY — one element per engine.
+    pub masters: String,
+    #[serde(default = "one")]
+    pub master_on: f64,
+    #[serde(default)]
+    pub master_off: f64,
+    /// Per-engine guard the master sits under, lifted to `guard_lift` while
+    /// the switch is set and dropped `guard_secs` later. Empty when the
+    /// switch has no guard. The A330's masters do: its own autostart lifts,
+    /// sets, and drops after a quarter second — a bare switch write with the
+    /// guard down is the kind of silent no-op a study-level add-on is full of.
+    #[serde(default)]
+    pub master_guards: Vec<String>,
+    #[serde(default = "guard_lift_default")]
+    pub guard_lift: f64,
+    #[serde(default = "guard_secs_default")]
+    pub guard_secs: f64,
+    /// Bringing the APU up: an ORDERED list of switch presses, because that
+    /// is what the aircraft has. Batteries, APU battery, APU master, APU
+    /// START, bleed.
+    ///
+    /// Not a list of datarefs. `laminar/A333/buttons/APU_start` exists as
+    /// BOTH a dataref and a command — the dataref is the button's position,
+    /// which the aircraft rewrites every frame, so setting it is the silent
+    /// no-op a study-level add-on is full of. It was declared as a dataref
+    /// here first and the APU never moved (2026-09-20).
+    #[serde(default)]
+    pub apu_steps: Vec<StartStep>,
+    /// The N1 gauge that says the bleed source is actually there.
+    pub apu_n1: String,
+    /// Everything between a running APU and the first master switch: bleed
+    /// air, the beacon, and the FUEL PUMPS. Same read-before-fire rule.
+    ///
+    /// The pumps are the reason this list exists. The first version of this
+    /// block went straight from the APU to the master switches, which is a
+    /// start with no fuel at the engine — and the aircraft's own sequence
+    /// spends eight of its twenty-four steps on them (2026-09-20).
+    #[serde(default)]
+    pub pre_start_steps: Vec<StartStep>,
+    /// ...and everything after both engines are running: packs, APU bleed
+    /// off, APU off. Leaving the APU running on its bleed is not a failed
+    /// start, but it is not a finished one either.
+    #[serde(default)]
+    pub post_start_steps: Vec<StartStep>,
+    /// The APU N1 at which it can supply start air.
+    #[serde(default = "apu_ready_default")]
+    pub apu_ready_n1: f64,
+    /// Spool gauge and the value that means this engine is away. N2 on most,
+    /// N3 on a three-spool Trent — the profile names which dataref.
+    pub spool: String,
+    #[serde(default = "spool_idle_default")]
+    pub spool_idle: f64,
+}
+
+fn one() -> f64 {
+    1.0
+}
+fn guard_lift_default() -> f64 {
+    0.002
+}
+fn guard_secs_default() -> f64 {
+    0.25
+}
+fn apu_ready_default() -> f64 {
+    95.0
+}
+fn spool_idle_default() -> f64 {
+    50.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1859,6 +1975,56 @@ mod tests {
     /// the station's `SIDE_STATE_LOCK` exists for.
     static FUEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// An array element is never written by name-with-a-subscript.
+    ///
+    /// `set_float("sim/.../eng_master[0]", 1.0)` names a dataref that does not
+    /// exist — the API answers "not found" and the caller, using `let _ =`,
+    /// hears nothing. On the A330 the APU came up, the bleed came on, all
+    /// eight fuel pumps came on, and both master switches sat at zero while
+    /// the start waited two minutes for an idle that was never coming
+    /// (2026-09-20). `set_float_array_elem` reads, patches the index and
+    /// writes the whole array back.
+    ///
+    /// Cheap to write by accident and invisible when you do, which is the
+    /// definition of a thing that belongs in a test rather than a comment.
+    #[test]
+    fn no_array_element_is_written_by_subscripted_name() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        walk(&root, &mut files);
+        let mut offenders = Vec::new();
+        for f in &files {
+            let text = std::fs::read_to_string(f).unwrap();
+            for (i, line) in text.lines().enumerate() {
+                let t = line.trim_start();
+                // A set_* whose name argument is a format! building a
+                // subscript. The array writers take an index instead.
+                let writes_scalar = t.contains("set_float(") || t.contains("set_int(");
+                if writes_scalar && t.contains("format!(") && t.contains('[') && t.contains("{idx")
+                {
+                    offenders.push(format!("{}:{}", f.display(), i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use set_float_array_elem / set_int_array_elem for an element, not \
+             a subscripted name — the API does not know that dataref and the \
+             write is lost silently: {offenders:?}"
+        );
+        assert!(files.len() > 10, "the walk found the tree: {}", files.len());
+    }
+
     /// EVERY speed and EVERY rate in the flight laws, classified once.
     ///
     /// This is the rule CLAUDE.md already states — "all automation numbers
@@ -2112,6 +2278,94 @@ mod tests {
             .map(|(_, n, _)| *n)
             .collect();
         assert!(stale.is_empty(), "reviewed but gone: {stale:?}");
+    }
+
+    /// The A330 can start its own engines, and the block PARSES — every name
+    /// and value out of the aircraft's own autostart script.
+    ///
+    /// It could not until 2026-09-20: neither existing start block could
+    /// express an ENG MODE knob and guarded master switches, so the profile
+    /// said "engine start is the pilot's" and the copilot had no route to it
+    /// at all. Found sitting on the ramp unable to start.
+    #[test]
+    fn the_a330_declares_an_airliner_start() {
+        let p = load("airbus_a330_300").expect("the A330 loads");
+        let a = p.airliner_start.as_ref().expect("an airliner start block");
+        assert!(a.mode_selector.ends_with("eng_mode_selector"));
+        assert_eq!((a.mode_start, a.mode_norm), (1.0, 0.0), "IGN/START, NORM");
+        assert!(a.masters.ends_with("eng_master"));
+        // One guard per engine, or none at all — a guard list that covers
+        // only some of the switches would silently no-op the rest.
+        assert!(
+            a.master_guards.is_empty() || a.master_guards.len() == p.engines,
+            "{} guards for {} engines",
+            a.master_guards.len(),
+            p.engines
+        );
+        assert_eq!(a.guard_lift, 0.002, "the script's own lift value");
+        assert!(a.guard_secs > 0.0, "and it must be dropped again");
+        // The APU is a sequence of COMMANDS, and the momentary START button
+        // is the one step with no position to read — it does not latch.
+        assert!(
+            a.apu_steps.len() >= 4,
+            "batteries, APU battery, master, START"
+        );
+        assert!(
+            a.apu_steps.iter().any(|s| s.held_secs.is_some()),
+            "the START button is a press-and-hold"
+        );
+        assert!(
+            a.apu_steps
+                .iter()
+                .filter(|s| s.held_secs.is_none())
+                .all(|s| s.position.is_some()),
+            "every LATCHING step reads before it fires: a toggle at a switch \
+             already on turns it off"
+        );
+        // The FUEL PUMPS. The first version of this block went APU straight
+        // to master switches — a start with no fuel at the engine. The
+        // aircraft's own sequence spends eight of its twenty-four steps here,
+        // so a pre-start list without them is not a start sequence.
+        let pumps = a
+            .pre_start_steps
+            .iter()
+            .filter(|s| s.command.contains("pump"))
+            .count();
+        assert_eq!(pumps, 8, "all eight fuel pumps, as the aircraft does it");
+        assert!(
+            a.pre_start_steps
+                .iter()
+                .any(|s| s.command.contains("apu_toggle")),
+            "start air has to be selected"
+        );
+        // ...and the APU stops carrying the bleed once the engines have it.
+        assert!(
+            a.post_start_steps.iter().any(|s| s.want == 0.0),
+            "the APU is shut down, not left running on its bleed"
+        );
+        assert!(
+            a.post_start_steps
+                .iter()
+                .filter(|s| s.command.contains("pack"))
+                .count()
+                == 2,
+            "both packs come back on"
+        );
+        // The START button is a command, and its name is ALSO a dataref on
+        // this aircraft — the button's position, rewritten every frame.
+        // Declaring it as a dataref is what made the APU never move.
+        assert!(a
+            .apu_steps
+            .iter()
+            .any(|s| s.command.ends_with("APU_start") && s.position.is_none()));
+        assert!(a.spool_idle > 0.0 && a.apu_ready_n1 > 0.0);
+        // ...and it must not also claim a start block it cannot fly: two
+        // tools called `start_engines` is a registry that answers twice.
+        assert!(
+            !p.turbine_start,
+            "the MD-82 sequence is not this aircraft's"
+        );
+        assert!(p.turboprop_start.is_none(), "nor are condition levers");
     }
 
     /// EVERY jet and turboprop declares the numbers the laws would otherwise
@@ -2936,6 +3190,8 @@ fn cessna_172sp() -> AircraftProfile {
         piston_start: None,
         mixture_notch: None,
         turboprop_start: None,
+        // A piston has no ENG MODE knob and no master switches.
+        airliner_start: None,
         retractable_gear: false,
         rotorcraft: false,
         transition_altitude_ft: 18_000.0,
@@ -3238,6 +3494,8 @@ fn cirrus_sr22() -> AircraftProfile {
         piston_start: None,
         mixture_notch: None,
         turboprop_start: None,
+        // A piston has no ENG MODE knob and no master switches.
+        airliner_start: None,
         retractable_gear: false,
         rotorcraft: false,
         transition_altitude_ft: 18_000.0,

@@ -44,8 +44,70 @@ cabin_crew: true       # up to 440 seats
 pressurised: true
 engines: 2
 
-turbine_start: false
+turbine_start: false   # the MD-82's bleed/crank sequence; not this aircraft's
 auto_prep: false
+
+# The ENGINE START, at last — every name and value read out of the aircraft's
+# own `A333.Z.autostart.lua`, not guessed. ENG MODE to IGN/START, each master
+# lifted past its guard and set, wait for the spool, knob back to NORM.
+#
+# Until 2026-09-20 this said "engine start is the pilot's" because neither
+# existing block could express it: `turbine_start` is the MD-82's, hardcoded
+# to laminar/md82/*, and `turboprop_start` is condition levers and starter
+# commands. An Airbus has an ENG MODE knob and two guarded master switches.
+#
+# The guard is not decoration: the script lifts it, sets the switch, and drops
+# it a quarter second later. A bare write with the guard down is exactly the
+# silent no-op a study-level add-on is full of. VERIFY on the ramp.
+airliner_start:
+  mode_selector: sim/cockpit2/engine/actuators/eng_mode_selector
+  mode_start: 1.0        # IGN/START (the script's own value)
+  mode_norm: 0.0         # NORM
+  masters: sim/cockpit2/engine/actuators/eng_master
+  master_guards:
+    - laminar/A333/switches/engine1_start_lift
+    - laminar/A333/switches/engine2_start_lift
+  # The APU, in the order and with the controls the aircraft's own script
+  # uses. COMMANDS, not datarefs: `laminar/A333/buttons/APU_start` exists as
+  # both, and the dataref is the button's POSITION, which the aircraft
+  # rewrites every frame. Declared as a dataref first, the APU never moved
+  # and the start timed out saying it had no bleed air (2026-09-20).
+  #
+  # Every latching step reads its position first — these are toggles, and one
+  # fired at a switch already on turns it off.
+  apu_steps:
+    - { command: sim/electrical/battery_1_toggle,       position: "sim/cockpit2/electrical/battery_on[0]", want: 1.0 }
+    - { command: sim/electrical/battery_2_toggle,       position: "sim/cockpit2/electrical/battery_on[1]", want: 1.0 }
+    - { command: laminar/A333/buttons/APU_batt_toggle,  position: laminar/A333/buttons/APU_batt_pos, want: 1.0 }
+    - { command: laminar/A333/buttons/APU_master,       position: laminar/A333/buttons/apu_master_ctct_on_off, want: 1.0 }
+    # Momentary press-and-hold, and the only step with no position to read.
+    - { command: laminar/A333/buttons/APU_start,        held_secs: 1.0 }
+  apu_n1: sim/cockpit2/electrical/APU_N1_percent
+  # Trent 700s are three-spool, but the sim's gauge the script watches is N2.
+  # AUTO-START steps 1-14, in the aircraft's own order. The EIGHT FUEL PUMPS
+  # are the reason this list exists: the first version of this block went
+  # straight from the APU to the master switches, which is a start with no
+  # fuel at the engine. The aircraft spends a third of its sequence on them.
+  pre_start_steps:
+    - { command: sim/lights/beacon_lights_on,  position: sim/cockpit2/switches/beacon_on, want: 1.0 }        # step 1
+    - { command: sim/bleed_air/apu_toggle,     position: laminar/A333/switch_memory/apu_bleed_on_off, want: 1.0 }  # step 2
+    - { command: laminar/A333/switches/left1_pump_toggle,         position: laminar/A333/fuel/buttons/left1_pump_pos,       want: 1.0 }  # step 7
+    - { command: laminar/A333/switches/left2_pump_toggle,         position: laminar/A333/fuel/buttons/left2_pump_pos,       want: 1.0 }  # step 8
+    - { command: laminar/A333/switches/left_stby_pump_toggle,     position: laminar/A333/fuel/buttons/left_stby_pump_pos,   want: 1.0 }  # step 9
+    - { command: laminar/A333/switches/right1_pump_toggle,        position: laminar/A333/fuel/buttons/right1_pump_pos,      want: 1.0 }  # step 10
+    - { command: laminar/A333/switches/right2_pump_toggle,        position: laminar/A333/fuel/buttons/right2_pump_pos,      want: 1.0 }  # step 11
+    - { command: laminar/A333/switches/right_stby_pump_toggle,    position: laminar/A333/fuel/buttons/right_stby_pump_pos,  want: 1.0 }  # step 12
+    - { command: laminar/A333/switches/center_left_pump_toggle,   position: laminar/A333/fuel/buttons/center_left_pump_pos, want: 1.0 }  # step 13
+    - { command: laminar/A333/switches/center_right_pump_toggle,  position: laminar/A333/fuel/buttons/center_right_pump_pos, want: 1.0 } # step 14
+
+  # AUTO-START steps 20-23: packs on, then the APU stops carrying the bleed.
+  post_start_steps:
+    - { command: sim/bleed_air/pack_left_toggle,   position: laminar/A333/buttons/pack_1_pos, want: 1.0 }   # step 20
+    - { command: sim/bleed_air/pack_right_toggle,  position: laminar/A333/buttons/pack_2_pos, want: 1.0 }   # step 21
+    - { command: sim/bleed_air/apu_toggle,         position: laminar/A333/switch_memory/apu_bleed_on_off, want: 0.0 }  # step 22
+    - { command: laminar/A333/buttons/APU_master,  position: laminar/A333/buttons/apu_master_ctct_on_off,  want: 0.0 }  # step 23
+  spool: sim/cockpit2/engine/indicators/N2_percent
+  spool_idle: 50.0
 
 # Jet — none of the piston systems apply.
 engine: false

@@ -384,6 +384,7 @@ impl Registry {
                     piston_engine: profile.engine || profile.piston_start.is_some(),
                     piston_mixture: profile.engine,
                     turboprop_start: profile.turboprop_start.clone(),
+                    airliner_start: profile.airliner_start.clone(),
                     all_electrical_on_cmds: all_electrical_on_cmds(&profile.electrical),
                     all_electrical_toggles: all_electrical_toggles(&profile.electrical),
                     cfg: ap,
@@ -415,8 +416,16 @@ impl Registry {
         if let Some(prop) = &profile.prop {
             tools.push(Box::new(prop::SetProp::new(prop.clone())));
         }
+        // The AIRLINER start: an ENG MODE knob and guarded master switches.
+        // Declared first because it is the specific one — an airframe with
+        // this block never wants the MD-82's bleed/crank sequence as well,
+        // and two tools of the same name is a registry that answers twice.
+        if let Some(a) = profile.airliner_start.clone() {
+            tools.push(Box::new(jet_start::AirlinerStart::new(a, profile.engines)));
+            tools.push(Box::new(jet_start::StopEngines::new(profile)));
+        }
         // Turbine start sequence (jets) — distinct from the piston one-shot start.
-        if profile.turbine_start {
+        if profile.turbine_start && profile.airliner_start.is_none() {
             tools.push(Box::new(jet_start::StartEngines));
             tools.push(Box::new(jet_start::StopEngines::new(profile)));
         }
@@ -429,7 +438,10 @@ impl Registry {
         // "shut down aircraft") and every one of them parsed to a tool the
         // registry had not built, until they gave up with "my aircraft"
         // (2026-09-17).
-        if profile.scripted_auto_start && !profile.turbine_start {
+        if profile.scripted_auto_start
+            && !profile.turbine_start
+            && profile.airliner_start.is_none()
+        {
             tools.push(Box::new(jet_start::ScriptedAutoStart));
             tools.push(Box::new(jet_start::StopEngines::new(profile)));
         }

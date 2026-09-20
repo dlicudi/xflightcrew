@@ -411,3 +411,206 @@ impl Tool for ScriptedAutoStart {
         )
     }
 }
+
+// ---- The airliner start: ENG MODE + guarded master switches -----------------
+
+use crate::aircraft::AirlinerStartProfile;
+
+/// `start_engines` for an airframe that starts the way an airliner does.
+///
+/// The MD-82 sequence above is that aircraft's, and `turboprop_start` is
+/// condition levers. An Airbus or a Boeing has an ENG MODE knob and two
+/// guarded master switches and fits neither, so every airliner here but the
+/// MD-82 simply could not start its own engines (found in the A330 on the
+/// ramp, 2026-09-20). The steps and every value come from the aircraft's OWN
+/// autostart script, which is the only honest source for a study-level model.
+pub struct AirlinerStart {
+    p: AirlinerStartProfile,
+    engines: usize,
+}
+
+impl AirlinerStart {
+    pub fn new(p: AirlinerStartProfile, engines: usize) -> Self {
+        AirlinerStart {
+            p,
+            engines: engines.clamp(1, 4),
+        }
+    }
+
+    /// Lift the guard, set the switch, drop the guard. A bare write with the
+    /// guard down is the silent no-op a study-level add-on is full of.
+    async fn set_master(&self, xp: &dyn crate::xplane::XPlane, idx: usize, on: bool) {
+        let guard = self.p.master_guards.get(idx);
+        if let Some(g) = guard {
+            let _ = xp.set_float(g, self.p.guard_lift).await;
+        }
+        let want = if on {
+            self.p.master_on
+        } else {
+            self.p.master_off
+        };
+        // `set_float_array_elem`, NOT a scalar write to "name[0]": that string
+        // is not a dataref the API knows, so the write went nowhere and
+        // returned nothing to say so. The APU came up, the bleed came on, all
+        // eight pumps came on, and the masters sat at zero while the engine
+        // was given two minutes to reach an idle it was never going to reach
+        // (2026-09-20). A failed write is now recorded, because a silent one
+        // is what cost the sortie.
+        if let Err(e) = xp.set_float_array_elem(&self.p.masters, idx, want).await {
+            crate::blackbox::record(
+                "airliner_start",
+                serde_json::json!({
+                    "event": "master_write_failed", "idx": idx, "err": e.to_string(),
+                }),
+            );
+        }
+        if let Some(g) = guard {
+            tokio::time::sleep(Duration::from_secs_f64(self.p.guard_secs)).await;
+            let _ = xp.set_float(g, 0.0).await;
+        }
+    }
+
+    /// Fire an ordered list of switch presses, reading each one's position
+    /// first where it has one.
+    async fn run_steps(
+        &self,
+        xp: &dyn crate::xplane::XPlane,
+        steps: &[crate::aircraft::StartStep],
+    ) {
+        for step in steps {
+            // Read before fire. These are toggles, and a toggle fired at a
+            // switch already on turns it OFF — which on the APU battery is a
+            // start that never begins, with no error anywhere.
+            if let Some(pos) = &step.position {
+                let at = xp.get_float(pos).await.ok().filter(|v| v.is_finite());
+                if at.is_some_and(|v| (v - step.want).abs() < 0.5) {
+                    continue;
+                }
+            }
+            match step.held_secs {
+                Some(secs) => {
+                    let _ = xp.run_command_for(&step.command, secs).await;
+                }
+                None => {
+                    let _ = xp.run_command(&step.command).await;
+                }
+            }
+            // The aircraft's own script spaces these half a second apart; a
+            // contactor needs a moment to make before the next press.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+    }
+
+    /// This engine's spool gauge, or `None` when the read fails — which is no
+    /// measurement, never a zero.
+    async fn spool(&self, xp: &dyn crate::xplane::XPlane, idx: usize) -> Option<f64> {
+        xp.get_float_array(&self.p.spool)
+            .await
+            .ok()
+            .and_then(|v| v.get(idx).copied())
+            .filter(|v| v.is_finite())
+    }
+}
+
+#[async_trait]
+impl Tool for AirlinerStart {
+    fn name(&self) -> &str {
+        "start_engines"
+    }
+    fn description(&self) -> &str {
+        "Start the engines: APU and bleed air up, engine mode selector to \
+         ignition/start, each master switch on in turn, calling out each as it \
+         reaches idle, then the selector back to normal. Use for 'start \
+         engines', 'start the engines', 'engines on', 'start up the engines', \
+         'fire up the engines'."
+    }
+    fn parameters(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
+        let xp = ctx.xplane;
+        if let Ok(r) = xp.get_float_array(ENGN_RUNNING).await {
+            if r.len() >= self.engines && r.iter().take(self.engines).all(|&v| v > 0.5) {
+                return Ok("Engines are already running.".to_string());
+            }
+        }
+        let say = |v: Option<&Voice>, s: &str| {
+            if let Some(v) = v {
+                v.alert(Priority::Advisory, s.to_string());
+            }
+        };
+
+        // --- Bleed air. Without it the starters have nothing to turn. ---
+        let apu_n1 = xp
+            .get_float(&self.p.apu_n1)
+            .await
+            .ok()
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        if apu_n1 < self.p.apu_ready_n1 {
+            say(ctx.voice, "Batteries on, starting the A.P.U.");
+            self.run_steps(xp, &self.p.apu_steps).await;
+            // It takes its own time, and a start attempted without it just
+            // hangs the engine at a few percent with nothing to say why.
+            let deadline = std::time::Instant::now() + Duration::from_secs(90);
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let n1 = xp.get_float(&self.p.apu_n1).await.unwrap_or(0.0);
+                if n1 >= self.p.apu_ready_n1 {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(
+                        "The A.P.U. hasn't come up, so there's no start air. Your aircraft."
+                            .to_string(),
+                    );
+                }
+            }
+            say(ctx.voice, "A.P.U. running.");
+        }
+        // Bleed air, beacon, and the FUEL PUMPS — the engine needs something
+        // to burn before a master switch means anything. The first version of
+        // this went straight from the APU to the masters (2026-09-20).
+        say(ctx.voice, "Bleed air and fuel pumps.");
+        self.run_steps(xp, &self.p.pre_start_steps).await;
+
+        // --- ENG MODE to IGN/START, and leave it there for both engines. ---
+        let _ = xp.set_float(&self.p.mode_selector, self.p.mode_start).await;
+        say(ctx.voice, "Ignition start. Starting number one.");
+
+        let mut started = 0usize;
+        for idx in 0..self.engines {
+            self.set_master(xp, idx, true).await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                match self.spool(xp, idx).await {
+                    Some(n) if n >= self.p.spool_idle => break,
+                    _ if std::time::Instant::now() >= deadline => {
+                        // Knob back to normal before handing back: a selector
+                        // left in IGN/START is a continuous-ignition item the
+                        // pilot has to find for themselves.
+                        let _ = xp.set_float(&self.p.mode_selector, self.p.mode_norm).await;
+                        return Ok(format!(
+                            "Number {} hasn't come up to idle. Selector back to normal. Your aircraft.",
+                            idx + 1
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            started += 1;
+            if idx + 1 < self.engines {
+                say(
+                    ctx.voice,
+                    &format!("Number {} at idle. Starting number {}.", idx + 1, idx + 2),
+                );
+            }
+        }
+        let _ = xp.set_float(&self.p.mode_selector, self.p.mode_norm).await;
+        // Packs on, APU bleed off, APU off — the aircraft's own sequence
+        // finishes the job rather than leaving the APU carrying the bleed.
+        self.run_steps(xp, &self.p.post_start_steps).await;
+        Ok(format!("{started} engines running, packs on, A.P.U. off."))
+    }
+}

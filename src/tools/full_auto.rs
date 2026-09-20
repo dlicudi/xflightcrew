@@ -33,6 +33,13 @@ pub enum StartKind {
     /// command (`AircraftProfile::scripted_auto_start`): one press, the
     /// aircraft's real switches, its own timing. The stock 737-800.
     Scripted,
+    /// ENG MODE knob and guarded master switches — the airliner pattern
+    /// (`AircraftProfile::airliner_start`). Added 2026-09-20: the standalone
+    /// `start_engines` tool was registered for the A330 and full auto still
+    /// said "I don't have an engine start for this aircraft", because the
+    /// class it dispatches on had never heard of it. A tool the registry
+    /// builds and the mission cannot reach is not a capability.
+    Airliner,
     /// A turbine airframe that declares NO start sequence — the Citation X,
     /// whose stock systems the MD-82's APU/bleed/cross-tie sequence does not
     /// fit. There is nothing to crank, so full auto says so instead of
@@ -52,13 +59,24 @@ pub enum StartKind {
 /// that was never going to catch. `piston` closes the other half of that hole:
 /// a turbine with no sequence declared is not a piston, it is an airframe we
 /// cannot start.
-pub fn start_kind(turboprop: bool, jet: bool, piston: bool, scripted: bool) -> StartKind {
-    match (scripted, turboprop, jet, piston) {
-        (true, _, _, _) => StartKind::Scripted,
-        (false, true, _, _) => StartKind::Turboprop,
-        (false, false, true, _) => StartKind::Jet,
-        (false, false, false, true) => StartKind::Piston,
-        (false, false, false, false) => StartKind::None,
+pub fn start_kind(
+    turboprop: bool,
+    jet: bool,
+    piston: bool,
+    scripted: bool,
+    airliner: bool,
+) -> StartKind {
+    // The airliner block wins over everything: it is the most specific, and an
+    // airframe that declares it has switches the others' sequences would be
+    // cranking past. Scripted comes next for the same reason it always did —
+    // the aircraft's own start beats ours.
+    match (airliner, scripted, turboprop, jet, piston) {
+        (true, ..) => StartKind::Airliner,
+        (false, true, ..) => StartKind::Scripted,
+        (false, false, true, _, _) => StartKind::Turboprop,
+        (false, false, false, true, _) => StartKind::Jet,
+        (false, false, false, false, true) => StartKind::Piston,
+        (false, false, false, false, false) => StartKind::None,
     }
 }
 
@@ -77,7 +95,7 @@ impl StartKind {
         match self {
             // The 737's script took 124 s from cold to both running; its
             // fire tests and APU spin-up are inside that.
-            StartKind::Jet | StartKind::Scripted => 300.0,
+            StartKind::Jet | StartKind::Scripted | StartKind::Airliner => 300.0,
             StartKind::Turboprop | StartKind::Piston | StartKind::None => 40.0,
         }
     }
@@ -101,6 +119,7 @@ pub struct FullAuto {
     /// auto cranks a PT6 with this instead of the piston start (which never
     /// catches on a turbine).
     pub turboprop_start: Option<crate::aircraft::TurbineStartProfile>,
+    pub airliner_start: Option<crate::aircraft::AirlinerStartProfile>,
     /// Jet with an APU (profile `turbine_start`): full auto cranks it with the
     /// `start_engines` sequence — bleed air, N2, fuel at 20% — not the piston
     /// start. THREE airframe classes, three starts; the missing third had full
@@ -267,6 +286,7 @@ impl Tool for FullAuto {
             self.jet_start,
             self.piston_engine,
             self.scripted_auto_start,
+            self.airliner_start.is_some(),
         );
         let sub = crate::full_auto::SubTools {
             lights: crate::tools::lights::SetLights::new(self.lights.clone()),
@@ -282,6 +302,12 @@ impl Tool for FullAuto {
             // on a turbine cranks something that isn't there and reports
             // "check fuel and mixture" about levers the aircraft hasn't got.
             start_engine: match (kind, &self.turboprop_start) {
+                (StartKind::Airliner, _) if self.airliner_start.is_some() => {
+                    Box::new(crate::tools::jet_start::AirlinerStart::new(
+                        self.airliner_start.clone().expect("checked"),
+                        self.engines,
+                    ))
+                }
                 (StartKind::Scripted, _) => Box::new(crate::tools::jet_start::ScriptedAutoStart),
                 (StartKind::Turboprop, Some(ts)) => {
                     Box::new(crate::tools::cycle::StartTurbines::new(ts.clone()))
@@ -786,6 +812,11 @@ mod tests {
             ("citation_x", StartKind::Turboprop),
             // The stock 737 scripts its own start behind `auto_start`.
             ("boeing_737_800", StartKind::Scripted),
+            // ENG MODE knob and guarded masters. The standalone tool was
+            // registered for this aircraft and full auto still said "I don't
+            // have an engine start for this aircraft" — the class it
+            // dispatches on had never heard of the block (2026-09-20).
+            ("airbus_a330_300", StartKind::Airliner),
         ] {
             let p = crate::aircraft::load(id).unwrap_or_else(|| panic!("{id} profile loads"));
             let got = start_kind(
@@ -793,6 +824,14 @@ mod tests {
                 p.turbine_start,
                 p.engine || p.piston_start.is_some(),
                 p.scripted_auto_start,
+                p.airliner_start.is_some(),
+            );
+            // Whatever class it lands in, the mission must be able to BUILD
+            // a start for it: a class with no tool behind it is the hole
+            // this test exists to close.
+            assert!(
+                got != StartKind::None || p.airliner_start.is_none(),
+                "{id}: declares an airliner start but classes as None"
             );
             assert_eq!(got, want, "{id}");
             // A jet has no piston engine group to fall back on, which is

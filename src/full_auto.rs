@@ -615,6 +615,32 @@ fn confirmed_ground(agl_m: anyhow::Result<f64>, on_ground: anyhow::Result<f64>) 
         if agl.is_finite() && ground.is_finite() && agl * M_TO_FT <= 50.0 && ground > 0.5)
 }
 
+/// Is the published taxi route one WE can drive from where we are standing?
+///
+/// A departure route (not a taxi-in to a stand) whose path passes within
+/// 200 m of us. The same test gates the initial check and the wait for a new
+/// clearance — they used to differ, and the weaker one accepted the stale
+/// route it had just rejected (Edinburgh, 2026-09-20).
+async fn taxi_route_is_ours(xp: &XPlaneClient) -> bool {
+    if crate::party_line::taxi_to_stand() {
+        return false;
+    }
+    let (lat_r, lon_r) = tokio::join!(xp.get_float(LAT), xp.get_float(LON));
+    match (lat_r, lon_r) {
+        (Ok(lat), Ok(lon)) => crate::party_line::with_taxi_route(|r| {
+            r.map(|w| {
+                w.path
+                    .iter()
+                    .any(|p| crate::nav::haversine_nm(lat, lon, p.0, p.1) * 1852.0 < 200.0)
+            })
+        })
+        .unwrap_or(false),
+        // Position unknown: trust the route rather than re-request in a loop
+        // we cannot verify our way out of.
+        _ => crate::party_line::with_taxi_route(|r| r.is_some()),
+    }
+}
+
 async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubTools) {
     // A new mission starts owing nothing to the last one's destination: a pin
     // left by the previous arrival would keep the region from ever handing
@@ -951,22 +977,7 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // "taxi to holding point Hotel Whiskey one FIRST", and the line-up
         // then failed (2026-08-05). The party line already knows which kind
         // of route it published; nobody had asked it.
-        let route_is_ours = !crate::party_line::taxi_to_stand() && {
-            let (lat_r, lon_r) = tokio::join!(xp.get_float(LAT), xp.get_float(LON));
-            match (lat_r, lon_r) {
-                (Ok(lat), Ok(lon)) => crate::party_line::with_taxi_route(|r| {
-                    r.map(|w| {
-                        w.path
-                            .iter()
-                            .any(|p| crate::nav::haversine_nm(lat, lon, p.0, p.1) * 1852.0 < 200.0)
-                    })
-                })
-                .unwrap_or(false),
-                // Position unknown: trust the route rather than re-request in
-                // a loop we can't verify our way out of.
-                _ => crate::party_line::with_taxi_route(|r| r.is_some()),
-            }
-        };
+        let route_is_ours = taxi_route_is_ours(&xp).await;
         if !route_is_ours {
             if crate::party_line::with_taxi_route(|r| r.is_some()) {
                 let arrival = crate::party_line::taxi_to_stand();
@@ -1018,10 +1029,18 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // is, a queued frequency will someday beat it by a second; 180
             // outlasts two worked arrivals.
             waiting("a taxi route");
-            let got = wait_until(180.0, 1000, || async {
-                crate::party_line::with_taxi_route(|r| r.is_some())
-            })
-            .await;
+            // Wait for a route that is OURS, by the same test that just
+            // rejected the old one — not merely for "a route exists".
+            //
+            // The stale route is still published while we ask for a new one
+            // (the party line is the world's to write; the crew cannot
+            // retire it, and should not be able to). So the weaker condition
+            // was satisfied by the very route it had just announced as
+            // stale: at Edinburgh the request went out and `at_hold`,
+            // `request_departure` and the line-up all fired 0.2 s later, on a
+            // route starting 180 m away that the taxi drive then refused
+            // (2026-09-20). Six stages in a fifth of a second is not a taxi.
+            let got = wait_until(180.0, 1000, || async { taxi_route_is_ours(&xp).await }).await;
             if !got {
                 give_up(
                     &voice,
