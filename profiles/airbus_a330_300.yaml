@@ -89,6 +89,25 @@ airliner_start:
   # straight from the APU to the master switches, which is a start with no
   # fuel at the engine. The aircraft spends a third of its sequence on them.
   pre_start_steps:
+    # THE ADIRS FIRST — AUTO-BOARD steps 27-32 and 19-21, which the first
+    # version of this block skipped entirely. Without them the aircraft has no
+    # attitude, heading or air data: SPD, ATT, ALT, V/S, HDG and MACH all flag
+    # red on the PFD and the ND says MAP NOT AVAIL and GPS PRIMARY LOST. The
+    # engines ran perfectly and there was nothing to fly them on (2026-09-20).
+    #
+    # Alignment then runs in the background while the engines start, which is
+    # what a crew does; the flags clear when it finishes.
+    - { command: laminar/A333/buttons/adirs/ir1_toggle,  position: laminar/A333/buttons/adirs/ir1_pos, want: 1.0 }   # step 27
+    - { command: laminar/A333/buttons/adirs/ir2_toggle,  position: laminar/A333/buttons/adirs/ir2_pos, want: 1.0 }   # step 28
+    - { command: laminar/A333/buttons/adirs/ir3_toggle,  position: laminar/A333/buttons/adirs/ir3_pos, want: 1.0 }   # step 29
+    - { command: laminar/A333/buttons/adirs/adr1_toggle, position: laminar/A333/buttons/adirs/adr1_pos, want: 1.0 }  # step 30
+    - { command: laminar/A333/buttons/adirs/adr2_toggle, position: laminar/A333/buttons/adirs/adr2_pos, want: 1.0 }  # step 31
+    - { command: laminar/A333/buttons/adirs/adr3_toggle, position: laminar/A333/buttons/adirs/adr3_pos, want: 1.0 }  # step 32
+    # The selectors are OFF / NAV / ATT; NAV is 1, and the direction depends
+    # on where the knob is — hence `down_command`.
+    - { command: laminar/A333/knobs/adirs/ir1_knob_right, down_command: laminar/A333/knobs/adirs/ir1_knob_left, position: laminar/A333/buttons/adirs/ir1_knob_pos, want: 1.0 }  # step 19
+    - { command: laminar/A333/knobs/adirs/ir2_knob_right, down_command: laminar/A333/knobs/adirs/ir2_knob_left, position: laminar/A333/buttons/adirs/ir2_knob_pos, want: 1.0 }  # step 20
+    - { command: laminar/A333/knobs/adirs/ir3_knob_right, down_command: laminar/A333/knobs/adirs/ir3_knob_left, position: laminar/A333/buttons/adirs/ir3_knob_pos, want: 1.0 }  # step 21
     - { command: sim/lights/beacon_lights_on,  position: sim/cockpit2/switches/beacon_on, want: 1.0 }        # step 1
     - { command: sim/bleed_air/apu_toggle,     position: laminar/A333/switch_memory/apu_bleed_on_off, want: 1.0 }  # step 2
     - { command: laminar/A333/switches/left1_pump_toggle,         position: laminar/A333/fuel/buttons/left1_pump_pos,       want: 1.0 }  # step 7
@@ -119,15 +138,28 @@ directional_gyro: false
 # Electrical. Battery on/off are NOT replaced (only the toggles are);
 # generator_1_on/off ARE, by the aircraft's handler. Two batteries. VERIFY.
 electrical:
+  # TOGGLES, not on/off. The aircraft replaces `battery_1_toggle` and
+  # `battery_2_toggle` and leaves `_on`/`_off` stock, so firing the latter
+  # reached nothing — this profile's own header warned about it and the
+  # block did it anyway (found by the write audit, 2026-09-20). `toggles`
+  # reads each switch first and fires only when it disagrees, which is the
+  # only safe way to drive a toggle to a known state.
   - key: battery
     spoken: batteries
-    on_commands:  [sim/electrical/battery_1_on, sim/electrical/battery_2_on]
-    off_commands: [sim/electrical/battery_1_off, sim/electrical/battery_2_off]
+    on_commands:  []
+    off_commands: []
+    toggles:
+      - { command: sim/electrical/battery_1_toggle, dataref: "sim/cockpit2/electrical/battery_on[0]" }
+      - { command: sim/electrical/battery_2_toggle, dataref: "sim/cockpit2/electrical/battery_on[1]" }
     readback:     ["sim/cockpit2/electrical/battery_on[0]", "sim/cockpit2/electrical/battery_on[1]"]
+  # Generator 1 has its on/off replaced; generator 2 does NOT — only its
+  # toggle. "Generators on" brought up one of two and said both.
   - key: generators
     spoken: generators
-    on_commands:  [sim/electrical/generator_1_on, sim/electrical/generator_2_on]
-    off_commands: [sim/electrical/generator_1_off, sim/electrical/generator_2_off]
+    on_commands:  [sim/electrical/generator_1_on]
+    off_commands: [sim/electrical/generator_1_off]
+    toggles:
+      - { command: sim/electrical/generator_2_toggle, dataref: "sim/cockpit/electrical/generator_on[1]" }
     readback:     ["sim/cockpit/electrical/generator_on[0]", "sim/cockpit/electrical/generator_on[1]"]
   - key: avionics
     spoken: avionics
@@ -238,6 +270,53 @@ flaps:
     - { label: full,   spoken: full,  ratio: 1.0,  vfe_kts: 180.0 } # acf Vfe
 
 advisor:
+  # THE ADIRS, watched and FIXED. The start sequence sets them from cold, but
+  # an aircraft can be loaded with them off, or a start can miss them — and
+  # when it does the engines run beautifully with no attitude, heading or air
+  # data behind them: SPD, ATT, ALT, V/S, HDG and MACH all flag red and the ND
+  # reads MAP NOT AVAIL (2026-09-20). Nothing was watching for it.
+  #
+  # `command` makes these ACTIONED rather than asked about, like the light
+  # rows: there is no judgement in "the IR should be on".
+  - dataref: laminar/A333/buttons/adirs/ir1_pos
+    phases: [ground, takeoff, climb, cruise, approach, landing]
+    say: Inertial reference one is off. Switching it on.
+    command: laminar/A333/buttons/adirs/ir1_toggle
+  - dataref: laminar/A333/buttons/adirs/ir2_pos
+    phases: [ground, takeoff, climb, cruise, approach, landing]
+    say: Inertial reference two is off. Switching it on.
+    command: laminar/A333/buttons/adirs/ir2_toggle
+  - dataref: laminar/A333/buttons/adirs/ir3_pos
+    phases: [ground, takeoff, climb, cruise, approach, landing]
+    say: Inertial reference three is off. Switching it on.
+    command: laminar/A333/buttons/adirs/ir3_toggle
+  - dataref: laminar/A333/buttons/adirs/adr1_pos
+    phases: [ground, takeoff, climb, cruise, approach, landing]
+    say: Air data reference one is off. Switching it on.
+    command: laminar/A333/buttons/adirs/adr1_toggle
+  - dataref: laminar/A333/buttons/adirs/adr2_pos
+    phases: [ground, takeoff, climb, cruise, approach, landing]
+    say: Air data reference two is off. Switching it on.
+    command: laminar/A333/buttons/adirs/adr2_toggle
+  - dataref: laminar/A333/buttons/adirs/adr3_pos
+    phases: [ground, takeoff, climb, cruise, approach, landing]
+    say: Air data reference three is off. Switching it on.
+    command: laminar/A333/buttons/adirs/adr3_toggle
+  # The selectors. `expect_on` only distinguishes OFF from not-OFF, which is
+  # the failure that matters: a knob in ATT still feeds attitude, a knob at
+  # OFF feeds nothing. One press right takes OFF to NAV.
+  - dataref: laminar/A333/buttons/adirs/ir1_knob_pos
+    phases: [ground, takeoff, climb, cruise, approach, landing]
+    say: A.D.I.R.S. one is off. Selecting nav.
+    command: laminar/A333/knobs/adirs/ir1_knob_right
+  - dataref: laminar/A333/buttons/adirs/ir2_knob_pos
+    phases: [ground, takeoff, climb, cruise, approach, landing]
+    say: A.D.I.R.S. two is off. Selecting nav.
+    command: laminar/A333/knobs/adirs/ir2_knob_right
+  - dataref: laminar/A333/buttons/adirs/ir3_knob_pos
+    phases: [ground, takeoff, climb, cruise, approach, landing]
+    say: A.D.I.R.S. three is off. Selecting nav.
+    command: laminar/A333/knobs/adirs/ir3_knob_right
   - dataref: sim/cockpit2/ice/ice_pitot_heat_on_pilot
     phases: [takeoff, climb, cruise, approach, landing]
     say: Pitot heat's off.

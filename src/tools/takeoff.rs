@@ -34,6 +34,9 @@ pub struct AutoTakeoff {
     pub flap_schedule: Vec<(f64, f64)>,
     /// POH takeoff ground roll, meters, when the profile knows it.
     pub takeoff_roll_m: Option<f64>,
+    /// Max takeoff weight, kg — the weight `takeoff_roll_m` is quoted AT, so
+    /// the roll can be scaled to what the aircraft actually weighs today.
+    pub mtow_kg: Option<f64>,
     /// Constant-speed prop levers, advanced to full-forward before the roll.
     /// A feathered turboprop makes no thrust at any power (`None` on pistons).
     pub prop: Option<PropProfile>,
@@ -163,6 +166,15 @@ impl Tool for AutoTakeoff {
                 );
             }
         }
+        // What the aircraft weighs NOW: the roll figure in the profile is
+        // quoted at max takeoff weight. A failed read falls back to that
+        // figure, which is the conservative end.
+        let weight_now = ctx
+            .xplane
+            .get_float(sim::datarefs::TOTAL_WEIGHT_KG)
+            .await
+            .ok()
+            .filter(|w| w.is_finite() && *w > 0.0);
         if !crate::autotaxi::steer_channel_ok(ctx.xplane).await {
             return Ok(
                 "I can't steer. The XVoiceLayer plugin needs updating, so this takeoff is yours."
@@ -207,7 +219,12 @@ impl Tool for AutoTakeoff {
                 takeoff_flap_ratio: self.takeoff_flap_ratio,
                 flap_schedule: self.flap_schedule.clone(),
                 cleared_runway: party_line::clearance_runway(),
-                needed_m: self.takeoff_roll_m.map_or(500.0, |m| m * 1.4),
+                // The roll is a MAX-WEIGHT figure; scale it to today's. An
+                // A330 on a light sector was refused a 2,549 m runway by
+                // eleven metres, from every position on it (2026-09-20).
+                needed_m: self.takeoff_roll_m.map_or(500.0, |m| {
+                    crate::aircraft::takeoff_roll_m(m, weight_now, self.mtow_kg) * 1.4
+                }),
                 handoff_agl_ft: autotakeoff::DEFAULT_HANDOFF_AGL_FT,
             },
             ctx.xplane.cancellation(),

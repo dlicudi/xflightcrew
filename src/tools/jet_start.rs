@@ -481,18 +481,28 @@ impl AirlinerStart {
             // Read before fire. These are toggles, and a toggle fired at a
             // switch already on turns it OFF — which on the APU battery is a
             // start that never begins, with no error anywhere.
+            // Which way to turn, for a knob that has a way to turn.
+            let mut cmd = step.command.as_str();
             if let Some(pos) = &step.position {
                 let at = xp.get_float(pos).await.ok().filter(|v| v.is_finite());
                 if at.is_some_and(|v| (v - step.want).abs() < 0.5) {
                     continue;
                 }
+                // Past the wanted position: step back down instead. Without
+                // this an ADIRS knob left in ATT is driven further from NAV,
+                // not toward it.
+                if let (Some(v), Some(down)) = (at, step.down_command.as_deref()) {
+                    if v > step.want + 0.5 {
+                        cmd = down;
+                    }
+                }
             }
             match step.held_secs {
                 Some(secs) => {
-                    let _ = xp.run_command_for(&step.command, secs).await;
+                    let _ = xp.run_command_for(cmd, secs).await;
                 }
                 None => {
-                    let _ = xp.run_command(&step.command).await;
+                    let _ = xp.run_command(cmd).await;
                 }
             }
             // The aircraft's own script spaces these half a second apart; a

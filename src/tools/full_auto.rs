@@ -137,6 +137,7 @@ pub struct FullAuto {
     // taxi / line-up
     pub park_brake_valve_set: Option<f64>,
     pub takeoff_roll_m: Option<f64>,
+    pub mtow_kg: Option<f64>,
     /// Book figures for the arm-time preflight of a Flight mission
     /// (`full_auto::preflight`): the runway at each end and the all-up weight
     /// are checked at the gate, not found at the hold or 25 nm out.
@@ -356,6 +357,7 @@ impl Tool for FullAuto {
                 vs_clean_kts: self.vs_clean_kts,
             },
             takeoff: crate::tools::takeoff::AutoTakeoff {
+                mtow_kg: self.mtow_kg,
                 // The Flight mission arms the takeoff through this copy, and
                 // the orchestrator takes the climb from the handoff — the
                 // pilot must not be told "your aircraft" there.

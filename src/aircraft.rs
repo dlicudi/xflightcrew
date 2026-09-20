@@ -799,6 +799,15 @@ pub struct StartStep {
     /// `None` is a single press.
     #[serde(default)]
     pub held_secs: Option<f64>,
+    /// For a KNOB rather than a toggle: the command that steps the other way,
+    /// used when the position sits ABOVE `want`.
+    ///
+    /// The ADIRS selectors are three-position (OFF / NAV / ATT) and the
+    /// aircraft's own script picks a direction from where the knob is. A
+    /// toggle model cannot say that: told only "press right until it reads
+    /// NAV", a knob left in ATT walks the wrong way.
+    #[serde(default)]
+    pub down_command: Option<String>,
 }
 
 /// The airliner start: bleed air up, ENG MODE to IGN/START, each master
@@ -1565,6 +1574,38 @@ pub fn publish_speed_floor(vs_clean_kts: Option<f64>) {
 /// The live airframe's speed floor, kts, if its profile declares a clean stall.
 pub fn speed_floor_kts() -> Option<f64> {
     *SPEED_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The ground roll to check a runway against, scaled by ACTUAL weight.
+///
+/// `roll_at_mtow_m` is the profile's figure, which is a MAX-TAKEOFF-WEIGHT
+/// number; applying it at every weight is why an A330 on a light sector was
+/// refused Edinburgh's 2,549 m runway by eleven metres — and refused from
+/// every position on it, having been sent to line up and then to backtrack
+/// (2026-09-20). Real A330s operate there.
+///
+/// LINEAR in weight, and that choice is the safety argument. Ground roll
+/// physically scales nearer W², but measured against the published field
+/// lengths (about 2,500 m at 242 t, about 1,800 m at 180 t) the real
+/// exponent is about 1.1. Linear therefore asks for slightly MORE runway
+/// than the aircraft needs, and the square law would ask for far less —
+/// 1,416 m against a true 1,900 at that weight. When a margin has to be
+/// wrong, it is wrong upward.
+///
+/// Clamped to half the MTOW roll at the bottom: nothing here models density
+/// altitude, contamination or a rejected takeoff, and the factor the caller
+/// applies is not a substitute for a performance calculation. Unknown weight
+/// or unknown MTOW keeps the profile's figure exactly as before.
+pub fn takeoff_roll_m(roll_at_mtow_m: f64, weight_kg: Option<f64>, mtow_kg: Option<f64>) -> f64 {
+    let (Some(w), Some(mtow)) = (weight_kg, mtow_kg) else {
+        return roll_at_mtow_m;
+    };
+    if !w.is_finite() || !mtow.is_finite() || w <= 0.0 || mtow <= 0.0 {
+        return roll_at_mtow_m;
+    }
+    // Never LESS demanding than half, and never less demanding than the
+    // profile figure would be above max weight.
+    roll_at_mtow_m * (w / mtow).clamp(0.5, 1.0)
 }
 
 /// The altitude this airframe cruises best at, at `weight_kg`.
@@ -2338,6 +2379,77 @@ mod tests {
                 .any(|s| s.command.contains("apu_toggle")),
             "start air has to be selected"
         );
+        // THE ADIRS. Without them the engines run and the aircraft has no
+        // attitude, heading or air data to fly on: every PFD tape flags red
+        // and the ND reads MAP NOT AVAIL. Three IRs, three ADRs, three
+        // selectors to NAV.
+        let count = |frag: &str| {
+            a.pre_start_steps
+                .iter()
+                .filter(|s| s.command.contains(frag))
+                .count()
+        };
+        assert_eq!(
+            count("/ir1_toggle") + count("/ir2_toggle") + count("/ir3_toggle"),
+            3
+        );
+        assert_eq!(
+            count("adr1_toggle") + count("adr2_toggle") + count("adr3_toggle"),
+            3
+        );
+        let knobs: Vec<_> = a
+            .pre_start_steps
+            .iter()
+            .filter(|s| s.command.contains("knob"))
+            .collect();
+        assert_eq!(knobs.len(), 3, "one selector per ADIRS");
+        // A three-position knob needs a direction. Told only "press right
+        // until it reads NAV", one left in ATT walks away from it.
+        assert!(
+            knobs.iter().all(|s| s.down_command.is_some()),
+            "every knob can step both ways"
+        );
+        // ...and the ADIRS come BEFORE the engines are cranked, so alignment
+        // runs while they start rather than after.
+        let first_adirs = a
+            .pre_start_steps
+            .iter()
+            .position(|s| s.command.contains("adirs"))
+            .expect("adirs present");
+        let beacon = a
+            .pre_start_steps
+            .iter()
+            .position(|s| s.command.contains("beacon"))
+            .expect("beacon present");
+        assert!(first_adirs < beacon, "alignment starts first");
+
+        // ...and the copilot WATCHES them for the rest of the flight, not
+        // just at the start. A start can be missed, and an aircraft can be
+        // loaded with them off — and the failure is silent until every tape
+        // on the PFD is red. These rows fix rather than ask: there is no
+        // judgement in "the inertial reference should be on".
+        let watched: Vec<_> = p
+            .advisor
+            .iter()
+            .filter(|r| r.dataref.contains("adirs"))
+            .collect();
+        assert_eq!(watched.len(), 9, "three IRs, three ADRs, three selectors");
+        assert!(
+            watched.iter().all(|r| r.command.is_some()),
+            "every ADIRS row is actioned, not merely advised"
+        );
+        assert!(
+            watched.iter().all(|r| r.expect_on),
+            "off is always the failure"
+        );
+        // Watched on the GROUND too — before it matters, not once airborne
+        // with nothing to fly on.
+        assert!(
+            watched
+                .iter()
+                .all(|r| r.phases.iter().any(|p| p == "ground")),
+            "caught before we go"
+        );
         // ...and the APU stops carrying the bleed once the engines have it.
         assert!(
             a.post_start_steps.iter().any(|s| s.want == 0.0),
@@ -2366,6 +2478,47 @@ mod tests {
             "the MD-82 sequence is not this aircraft's"
         );
         assert!(p.turboprop_start.is_none(), "nor are condition levers");
+    }
+
+    /// The ground roll is scaled to what the aircraft WEIGHS, and the
+    /// scaling errs upward.
+    ///
+    /// Edinburgh 24 is 2,549 m; the A330's profile roll of 6,000 ft times the
+    /// caller's 1.4 factor asks 2,560. Eleven metres, at MAX takeoff weight,
+    /// on a light sector — and the refusal came from every position on the
+    /// runway, having sent the pilot to line up and then to backtrack
+    /// (2026-09-20). Real A330s operate into Edinburgh.
+    #[test]
+    fn the_takeoff_roll_follows_the_weight_and_errs_upward() {
+        let mtow = 533_519.0 * 0.453_592; // the A330's, kg
+        let roll = 6000.0 * 0.3048; // its MTOW ground roll, m
+                                    // At max weight nothing changes — the profile figure IS that case.
+        assert_eq!(takeoff_roll_m(roll, Some(mtow), Some(mtow)), roll);
+        // On a light sector it asks for less, and EGPH becomes flyable.
+        let light = takeoff_roll_m(roll, Some(180_000.0), Some(mtow));
+        assert!(
+            light * 1.4 < 2549.0,
+            "EGPH fits at 180 t: {:.0}",
+            light * 1.4
+        );
+        // ...but NOT as little as the square law would allow. Measured
+        // against published field lengths the real exponent is about 1.1, so
+        // linear asks slightly MORE than the aircraft needs and the square
+        // law asks far less. When a margin is wrong it is wrong upward.
+        let square = roll * (180_000.0 / mtow).powi(2);
+        assert!(
+            light > square * 1.2,
+            "linear must be well above the square law: {light:.0} vs {square:.0}"
+        );
+        // A floor, because nothing here models density altitude, a wet
+        // runway or a rejected takeoff.
+        assert_eq!(takeoff_roll_m(roll, Some(1.0), Some(mtow)), roll * 0.5);
+        // Over max weight asks no less than the figure itself.
+        assert_eq!(takeoff_roll_m(roll, Some(mtow * 2.0), Some(mtow)), roll);
+        // An unknown weight or MTOW keeps the old behaviour exactly.
+        assert_eq!(takeoff_roll_m(roll, None, Some(mtow)), roll);
+        assert_eq!(takeoff_roll_m(roll, Some(180_000.0), None), roll);
+        assert_eq!(takeoff_roll_m(roll, Some(f64::NAN), Some(mtow)), roll);
     }
 
     /// EVERY jet and turboprop declares the numbers the laws would otherwise
@@ -4080,5 +4233,185 @@ mod real_install_names {
         let src = format!("const A: &str = {q}sim/a/b{q}; x({q}sim/c/d[3]{q}); list({q}sim/e/rel_{q}); t({q}sim/f/g/{q});");
         let want: Vec<String> = ["a/b", "c/d"].iter().map(|t| format!("sim/{t}")).collect();
         assert_eq!(sim_literals(&src), want);
+    }
+}
+
+/// Does the write LAND? The companion to `real_install_names`, which only
+/// asks whether a name resolves.
+///
+/// A study-level add-on owns much of its own cockpit: it REPLACES stock
+/// commands (our fire reaches its handler — fine), and it WRITES stock
+/// datarefs every frame (our write is overwritten a frame later — a silent
+/// no-op). Both resolve. Both probe clean. One of them does nothing.
+///
+/// Three failures in one evening on the A330 (2026-09-20) were this shape:
+/// a name declared as a dataref that was really a command, an array element
+/// written by subscript, and an `_on` command the aircraft leaves stock while
+/// replacing only its `_toggle`. Every one passed the existence probe.
+///
+/// Needs the aircraft on disk:
+/// `cargo test -- --ignored real_install_writes`.
+#[cfg(test)]
+mod real_install_writes {
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    /// Profiles to audit, and the aircraft folder each is written against.
+    const AUDIT: &[(&str, &str)] = &[
+        ("airbus_a330_300", "Laminar Research/Airbus A330-300"),
+        ("boeing_737_800", "Laminar Research/Boeing 737-800"),
+        ("md82", "Laminar Research/McDonnell Douglas MD-82"),
+        ("citation_x", "Laminar Research/Cessna Citation X"),
+        ("cirrus_vision_sf50", "Laminar Research/Cirrus Vision SF50"),
+        ("king_air_c90b", "Laminar Research/Beechcraft King Air C90B"),
+        ("dhc6_twin_otter", "Laminar Research/DHC-6 Twin Otter"),
+        ("lancair_evolution", "Laminar Research/Lancair Evolution"),
+    ];
+
+    fn lua_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                lua_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "lua") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// Stock datarefs the aircraft ASSIGNS TO — anything it writes each frame
+    /// is its output, and ours is lost.
+    fn aircraft_owned(src: &str) -> HashSet<String> {
+        let mut handles = Vec::new();
+        let mut rest = src;
+        while let Some(i) = rest.find("= find_dataref(\"sim/") {
+            let before = &rest[..i];
+            let handle = before
+                .rsplit(|c: char| c.is_whitespace())
+                .find(|t| !t.is_empty())
+                .unwrap_or("")
+                .to_string();
+            let body = &rest[i + "= find_dataref(\"".len()..];
+            if let Some(end) = body.find('"') {
+                handles.push((handle, body[..end].to_string()));
+            }
+            rest = &rest[i + 4..];
+        }
+        handles
+            .into_iter()
+            .filter(|(h, _)| {
+                !h.is_empty() && (src.contains(&format!("{h} =")) || src.contains(&format!("{h}[")))
+            })
+            .map(|(_, n)| n)
+            .collect()
+    }
+
+    fn replaced(src: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let mut rest = src;
+        while let Some(i) = rest.find("replace_command(\"") {
+            let body = &rest[i + "replace_command(\"".len()..];
+            if let Some(end) = body.find('"') {
+                out.insert(body[..end].to_string());
+            }
+            rest = &rest[i + 4..];
+        }
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn profile_writes_are_not_silently_owned_by_the_aircraft() {
+        // aircraft.rs compiles into the LIB too, where `tools` is the bin's.
+        let root = std::env::var("XCOPILOT_XPLANE_ROOT").unwrap_or_else(|_| {
+            format!("{}/X-Plane 12", std::env::var("HOME").unwrap_or_default())
+        });
+        let mut findings = Vec::new();
+        let mut audited = 0usize;
+        for (id, folder) in AUDIT {
+            let dir = Path::new(&root).join("Aircraft").join(folder);
+            if !dir.exists() {
+                continue;
+            }
+            let Some(p) = super::load(id) else { continue };
+            let mut files = Vec::new();
+            lua_files(&dir, &mut files);
+            if files.is_empty() {
+                continue; // no xlua: nothing can own anything
+            }
+            audited += 1;
+            let src: String = files
+                .iter()
+                .filter_map(|f| std::fs::read_to_string(f).ok())
+                .collect::<Vec<_>>()
+                .join("\n");
+            // OWNERSHIP is the systems model rewriting a dataref every frame.
+            // The aircraft's own AUTOSTART script also assigns to some of
+            // them — but that is a script pressing switches, exactly as we
+            // do, and it proves the write lands rather than that it is lost.
+            // Scanning it flagged the A330's engine masters and ENG MODE
+            // knob, both of which demonstrably work (2026-09-20).
+            let systems: String = files
+                .iter()
+                .filter(|f| {
+                    !f.to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains("autostart")
+                })
+                .filter_map(|f| std::fs::read_to_string(f).ok())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let owned = aircraft_owned(&systems);
+            let repl = replaced(&src);
+
+            // Commands the profile FIRES. A stock command the aircraft
+            // neither replaces nor needs is fine; one whose SIBLING is
+            // replaced while this one is not is the trap.
+            for e in &p.electrical {
+                for c in e.on_commands.iter().chain(e.off_commands.iter()) {
+                    if !c.starts_with("sim/") || repl.contains(c) {
+                        continue;
+                    }
+                    let sibling = c.rsplit_once('_').map(|(stem, _)| format!("{stem}_toggle"));
+                    if sibling.is_some_and(|s| repl.contains(&s)) {
+                        findings.push(format!(
+                            "{id}: fires {c}, which the aircraft leaves stock while REPLACING \
+                             its _toggle — use the toggle with a read-before-fire"
+                        ));
+                    }
+                }
+            }
+            // Datarefs the profile WRITES that the aircraft owns.
+            if let Some(d) = &p.pitot_heat_dataref {
+                if owned.contains(d) {
+                    findings.push(format!("{id}: writes {d}, which the aircraft rewrites"));
+                }
+            }
+            // Written directly and OBSERVED to work: the A330's engines
+            // started on 2026-09-20. The switches script assigns these only
+            // inside its own knob handlers, which this scan cannot tell from
+            // a per-frame rewrite. Evidence beats the heuristic; anything NEW
+            // still has to be justified here.
+            const PROVEN: &[&str] = &["sim/cockpit2/engine/actuators/eng_mode_selector"];
+            if let Some(a) = &p.airliner_start {
+                for n in [&a.mode_selector, &a.masters] {
+                    if PROVEN.contains(&n.as_str()) {
+                        continue;
+                    }
+                    if owned.contains(n) {
+                        findings.push(format!("{id}: writes {n}, which the aircraft rewrites"));
+                    }
+                }
+            }
+        }
+        assert!(audited > 0, "no audited aircraft found under {root}");
+        assert!(
+            findings.is_empty(),
+            "silent writes:\n  {}",
+            findings.join("\n  ")
+        );
     }
 }

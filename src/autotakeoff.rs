@@ -402,6 +402,90 @@ pub fn runway_fit(
     best.map(|(r, _, rem)| (r, rem))
 }
 
+/// Why [`runway_fit`] found nothing — the nearest near-miss, so a refusal can
+/// name the problem instead of guessing at it.
+///
+/// The four failures want four different actions from the pilot, and the
+/// caller used to collapse them into one line. At Edinburgh (2026-09-20) the
+/// aircraft sat on runway 24, aligned to within a degree and dead on the
+/// centreline, 2,408 m along a 2,549 m strip — 141 m of runway ahead. The
+/// refusal said "We're not on the runway yet. Say line us up", while the
+/// tower was simultaneously saying "you are on runway two four without
+/// clearance, traffic on short final, exit immediately". The fit was right
+/// and the words were a lie.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NoFit {
+    /// Nothing within reach on this field at all.
+    NoneNear,
+    /// On the pavement, aligned, but not enough runway ahead of the nose —
+    /// and there WOULD be from the threshold. Backtracking fixes this one.
+    TooLittleLeft {
+        id: String,
+        remaining_m: f64,
+        needed_m: f64,
+    },
+    /// The whole runway is shorter than this aircraft needs. Position is
+    /// irrelevant: no line-up and no backtrack can help.
+    ///
+    /// Edinburgh 24 is 2,549 m; the A330 asks 2,560 (a 6,000 ft roll times
+    /// the 1.4 factor). Eleven metres. The refusal said "we're not on the
+    /// runway yet", so the pilot lined up, was told the same thing, backtracked
+    /// the full length, and was told it a third time (2026-09-20).
+    RunwayTooShort {
+        id: String,
+        length_m: f64,
+        needed_m: f64,
+    },
+    /// On (or near) a strip, but lying across it.
+    NotAligned { id: String, err_deg: f64 },
+    /// Aligned with a runway but sitting beside it.
+    Offset { id: String, lateral_m: f64 },
+    /// Aligned and on the centreline, but still short of the threshold.
+    ShortOfThreshold { id: String, m: f64 },
+}
+
+/// Diagnose a failed [`runway_fit`]: the best-aligned candidate, and the FIRST
+/// gate it fails — in the same order the fit applies them, so the answer is
+/// always the thing that actually stopped it.
+pub fn why_no_fit(cands: &[Runway], lat: f64, lon: f64, psi_true: f64, needed_m: f64) -> NoFit {
+    let Some(r) = cands
+        .iter()
+        .min_by(|a, b| {
+            heading_diff(psi_true, a.course_deg).total_cmp(&heading_diff(psi_true, b.course_deg))
+        })
+        .filter(|r| (cross_track_nm(lat, lon, r) * M_PER_NM).abs() < 2.0 * LATERAL_MAX_M)
+    else {
+        return NoFit::NoneNear;
+    };
+    let id = r.id.clone();
+    let err = heading_diff(psi_true, r.course_deg);
+    if err > ALIGN_MAX_DEG {
+        return NoFit::NotAligned { id, err_deg: err };
+    }
+    let lateral_m = (cross_track_nm(lat, lon, r) * M_PER_NM).abs();
+    if lateral_m > LATERAL_MAX_M {
+        return NoFit::Offset { id, lateral_m };
+    }
+    let along_m = along_track_nm(lat, lon, r) * M_PER_NM;
+    if along_m > BEFORE_THRESHOLD_MAX_M {
+        return NoFit::ShortOfThreshold { id, m: along_m };
+    }
+    let need = needed_m.max(MIN_REMAINING_M);
+    // Would the FULL strip do? If not, where we stand is beside the point.
+    if r.length_m < need {
+        return NoFit::RunwayTooShort {
+            id,
+            length_m: r.length_m,
+            needed_m: need,
+        };
+    }
+    NoFit::TooLittleLeft {
+        id,
+        remaining_m: r.length_m - (-along_m).max(0.0),
+        needed_m: need,
+    }
+}
+
 /// The string crosscheck's escape hatch for duplicated pavement: apt.dat can
 /// carry ONE physical strip as two rows under different designators —
 /// Stansted's 3,052 m 04/22 and its 1,048 m 04C/22C are collinear to under a
@@ -970,17 +1054,85 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
         }
     };
     let Some((rwy, remaining_m)) = runway_fit(&cands, lat, lon, psi, p.needed_m) else {
-        // At the hold with a line-up in reach, point at the maneuver that
-        // exists for exactly this — otherwise the honest refusal.
-        let line =
-            if crate::autotaxi::pick_line_up(&cands, lat, lon, p.cleared_runway.as_deref(), None)
-                .is_some()
+        // Say WHICH of the four things is wrong. They want four different
+        // actions, and "not on the runway yet" was said to an aircraft
+        // sitting on the runway with the tower telling it to vacate.
+        let why = why_no_fit(&cands, lat, lon, psi, p.needed_m);
+        let can_line_up =
+            crate::autotaxi::pick_line_up(&cands, lat, lon, p.cleared_runway.as_deref(), None)
+                .is_some();
+        crate::blackbox::record(
+            "autotakeoff",
+            serde_json::json!({"event": "no_runway_fit", "why": format!("{why:?}")}),
+        );
+        let (line, urgent) = match &why {
+            // The runway itself is too short. Say so plainly, with both
+            // numbers, and do NOT send the pilot to line up or backtrack —
+            // neither can add pavement.
+            NoFit::RunwayTooShort {
+                id,
+                length_m,
+                needed_m,
+            } => (
+                format!(
+                    "Runway {} is {:.0} metres and I need {:.0} for this aircraft. It's too \
+                     short — lining up or backtracking won't change that. Your takeoff if \
+                     you want it.",
+                    crate::circuit::spell_runway(id),
+                    length_m,
+                    needed_m
+                ),
+                true,
+            ),
+            // ON the runway with too little ahead: we are occupying a strip
+            // we cannot depart from, which is a vacate, not a line-up.
+            NoFit::TooLittleLeft {
+                id,
+                remaining_m,
+                needed_m,
+            } => (
+                format!(
+                    "We're lined up on {} but at the far end — {:.0} metres left and I need {:.0}.                      Backtrack or vacate; I can't take off from here.",
+                    crate::circuit::spell_runway(id),
+                    remaining_m,
+                    needed_m
+                ),
+                true,
+            ),
+            // Across the pavement: the worst place to be and the one the old
+            // message actively denied.
+            NoFit::NotAligned { id, err_deg } if *err_deg < 90.0 => (
+                format!(
+                    "We're on {} but {:.0} degrees off the centreline. Line us up, or vacate if                      there's traffic.",
+                    crate::circuit::spell_runway(id),
+                    err_deg
+                ),
+                true,
+            ),
+            NoFit::ShortOfThreshold { .. } | NoFit::NotAligned { .. } | NoFit::Offset { .. }
+                if can_line_up =>
             {
-                "We're not on the runway yet. Say line us up, then give me the takeoff."
-            } else {
+                (
+                    "We're not on the runway yet. Say line us up, then give me the takeoff."
+                        .to_string(),
+                    false,
+                )
+            }
+            _ => (
                 "We're not lined up on a runway I can use. Line us up and ask me again."
-            };
-        alert(&voice, Priority::Caution, line);
+                    .to_string(),
+                false,
+            ),
+        };
+        alert(
+            &voice,
+            if urgent {
+                Priority::Warning
+            } else {
+                Priority::Caution
+            },
+            &line,
+        );
         return;
     };
     if let Some(clr) = &p.cleared_runway {
@@ -1577,6 +1729,60 @@ pub fn spoken_height_ft(agl_ft: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The Edinburgh refusal, from the measured geometry (2026-09-20): on
+    /// runway 24, aligned to 0.9 degrees, dead on the centreline, 2,408 m
+    /// along a 2,549 m strip. The fit correctly refused — 141 m of runway
+    /// ahead against a 500 m minimum — and then said "we're not on the
+    /// runway yet" while the tower said "you are on runway two four".
+    #[test]
+    fn a_refused_takeoff_says_which_of_the_four_things_is_wrong() {
+        // The 2,000 m north strip, and a position 1,900 m down it: aligned,
+        // on the centreline, 100 m of runway left — Edinburgh's shape.
+        let cands = vec![rwy_north()];
+        let far = (1900.0 / 111_320.0, 0.0);
+        match why_no_fit(&cands, far.0, far.1, 0.0, 500.0) {
+            NoFit::TooLittleLeft {
+                id, remaining_m, ..
+            } => {
+                assert_eq!(id, "36");
+                assert!(
+                    remaining_m < 200.0,
+                    "a hundred metres of runway left, not a line-up problem: {remaining_m:.0}"
+                );
+            }
+            other => panic!("expected TooLittleLeft, got {other:?}"),
+        }
+        // Lying ACROSS the runway — on it, and the worst place to be.
+        assert!(matches!(
+            why_no_fit(&cands, 0.0, 0.0, 90.0, 500.0),
+            NoFit::NotAligned { .. }
+        ));
+        // Aligned at the right end: this one fits, so there is no diagnosis
+        // to give.
+        assert!(runway_fit(&cands, 0.0, 0.0, 0.0, 500.0).is_some());
+        // Nothing anywhere near.
+        assert_eq!(why_no_fit(&[], 0.0, 0.0, 0.0, 500.0), NoFit::NoneNear);
+
+        // THE RUNWAY ITSELF TOO SHORT. Edinburgh's shape: on the numbers,
+        // aligned, full length ahead — and the aircraft needs more than the
+        // strip has. No position fixes this, and the old answer sent the
+        // pilot to line up and then to backtrack, twice, for eleven metres.
+        match why_no_fit(&cands, 0.0, 0.0, 0.0, 2560.0) {
+            NoFit::RunwayTooShort {
+                length_m, needed_m, ..
+            } => {
+                assert!(length_m < needed_m, "{length_m} vs {needed_m}");
+            }
+            other => panic!("a short runway is not a position problem: {other:?}"),
+        }
+        // ...and it is reported even from the threshold, where "not enough
+        // LEFT" would be technically true and completely useless.
+        assert!(matches!(
+            why_no_fit(&cands, 0.0, 0.0, 0.0, 2560.0),
+            NoFit::RunwayTooShort { .. }
+        ));
+    }
 
     /// The BIKF departure (2026-09-20): commanded 8 degrees, flew 22.4. The
     /// law was pinned at its nose-down limit the whole way with the pitch
