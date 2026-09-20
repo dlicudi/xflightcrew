@@ -1128,6 +1128,10 @@ mod failure_sequences {
                     );
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 };
+                // BSD hands the accepted socket the listener's O_NONBLOCK; Linux
+                // does not. Left set, every read here is a race with the bytes
+                // arriving and `read_exact` returns WouldBlock (macos CI, 2026-09-19).
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(std::time::Duration::from_secs(3)))
                     .unwrap();
