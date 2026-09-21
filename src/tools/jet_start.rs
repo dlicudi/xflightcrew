@@ -296,10 +296,15 @@ impl StopEngines {
             return Ok(());
         }
         for lever in &self.levers {
-            ctx.xplane
-                .set_float(lever, self.cutoff)
-                .await
-                .map_err(fail)?;
+            // A lever may be one element of an array (the 747's four fuel
+            // control switches are `toggle_sw_pos[0..3]`): an element is
+            // written by index, never by a subscripted name.
+            let (base, idx) = super::lights::split_index(lever);
+            match idx {
+                Some(i) => ctx.xplane.set_float_array_elem(base, i, self.cutoff).await,
+                None => ctx.xplane.set_float(base, self.cutoff).await,
+            }
+            .map_err(fail)?;
         }
         Ok(())
     }
@@ -429,12 +434,80 @@ pub struct AirlinerStart {
     engines: usize,
 }
 
+/// A crew's flow pace: one switch every second and a half. A pilot monitoring
+/// works the overhead at about this rate, and the aircraft's own script
+/// spaces its steps so a contactor can make before the next press. Twenty
+/// presses in two seconds reads as a macro; the pace is what makes the flow
+/// followable from the other seat.
+const FLOW_STEP_MS: u64 = 1500;
+/// How long a switch is given to reach the position it was sent to before
+/// the step is recorded as NOT taken. Pushbuttons animate over a few hundred
+/// milliseconds; a knob stepped twice takes two presses' worth.
+const CONFIRM_SECS: f64 = 3.0;
+const CONFIRM_POLL_MS: u64 = 250;
+
+/// What one step of the flow did, read back from the switch it moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// Already in the wanted position: nothing fired, no pause.
+    AlreadySet,
+    /// Fired, and the position read back as wanted.
+    Confirmed,
+    /// Fired, and the position never reached the wanted value. Named in the
+    /// closing line: a silent no-op is what cost the first A330 start.
+    NotTaken,
+    /// Fired with no position to read (a momentary button).
+    Fired,
+}
+
+/// A step's switch position, which may be one element of an array
+/// (`battery_on[0]`). Read as a scalar, an indexed name is a 400 from the Web
+/// API: both A330 battery steps came back `before: null, after: null` and
+/// were reported as not taken on a ramp where they had (EGPF, 2026-09-21).
+/// `None` is no measurement.
+async fn read_position(xp: &dyn crate::xplane::XPlane, pos: &str) -> Option<f64> {
+    let v = match crate::tools::lights::split_index(pos) {
+        (base, Some(i)) => xp.get_float_array(base).await.ok()?.get(i).copied()?,
+        (name, None) => xp.get_float(name).await.ok()?,
+    };
+    v.is_finite().then_some(v)
+}
+
+/// A step's short name for the panel and the closing line: the last path
+/// segment of its position (else its command), underscores as spaces, the
+/// `_pos` / `_toggle` suffixes dropped. "left1_pump_toggle" -> "left1 pump".
+pub fn step_short_name(step: &crate::aircraft::StartStep) -> String {
+    let src = step.position.as_deref().unwrap_or(&step.command);
+    let tail = src.rsplit('/').next().unwrap_or(src);
+    let mut t = tail.to_string();
+    for suffix in ["_pos", "_toggle", "_on_off", "_knob"] {
+        if let Some(stripped) = t.strip_suffix(suffix) {
+            t = stripped.to_string();
+        }
+    }
+    t.replace('_', " ")
+}
+
 impl AirlinerStart {
     pub fn new(p: AirlinerStartProfile, engines: usize) -> Self {
         AirlinerStart {
             p,
             engines: engines.clamp(1, 4),
         }
+    }
+
+    /// The engines in the order the profile starts them (the A330's POM says
+    /// number two first); `0, 1, ...` when the profile is silent or names an
+    /// engine it does not have.
+    pub fn start_order(&self) -> Vec<usize> {
+        let declared = &self.p.start_order;
+        if !declared.is_empty()
+            && declared.iter().all(|&i| i < self.engines)
+            && declared.len() == self.engines
+        {
+            return declared.clone();
+        }
+        (0..self.engines).collect()
     }
 
     /// Lift the guard, set the switch, drop the guard. A bare write with the
@@ -470,31 +543,53 @@ impl AirlinerStart {
         }
     }
 
-    /// Fire an ordered list of switch presses, reading each one's position
-    /// first where it has one.
+    /// Fire an ordered list of switch presses at a crew's pace, reading each
+    /// one's position first where it has one and AFTER, until it agrees.
+    ///
+    /// The pace is gated on the aircraft, not the clock: a step waits for its
+    /// switch to read back, then a human beat before the next. A switch
+    /// already set is passed over without a pause (eyes move faster than
+    /// hands). Every step is blackboxed and shown on the panel transcript;
+    /// only a step's `say` milestone is spoken, and only once it confirmed.
+    /// Returns the steps that did NOT take, by short name, for the closing
+    /// line.
     async fn run_steps(
         &self,
         xp: &dyn crate::xplane::XPlane,
         steps: &[crate::aircraft::StartStep],
-    ) {
+        say: &mut (dyn FnMut(&str) + Send),
+        panel: &mut (dyn FnMut(&str) + Send),
+    ) -> Vec<String> {
+        let mut not_taken = Vec::new();
         for step in steps {
+            let short = step_short_name(step);
             // Read before fire. These are toggles, and a toggle fired at a
             // switch already on turns it OFF — which on the APU battery is a
             // start that never begins, with no error anywhere.
-            // Which way to turn, for a knob that has a way to turn.
             let mut cmd = step.command.as_str();
-            if let Some(pos) = &step.position {
-                let at = xp.get_float(pos).await.ok().filter(|v| v.is_finite());
-                if at.is_some_and(|v| (v - step.want).abs() < 0.5) {
-                    continue;
+            let before = match &step.position {
+                Some(pos) => read_position(xp, pos).await,
+                None => None,
+            };
+            if step.position.is_some() && before.is_some_and(|v| (v - step.want).abs() < 0.5) {
+                crate::blackbox::record(
+                    "airliner_start",
+                    serde_json::json!({"event": "step", "command": step.command, "position": step.position,
+                                       "before": before, "after": before,
+                                       "outcome": format!("{:?}", StepOutcome::AlreadySet)}),
+                );
+                panel(&format!("{short}: already set"));
+                if let Some(line) = &step.say {
+                    say(line);
                 }
-                // Past the wanted position: step back down instead. Without
-                // this an ADIRS knob left in ATT is driven further from NAV,
-                // not toward it.
-                if let (Some(v), Some(down)) = (at, step.down_command.as_deref()) {
-                    if v > step.want + 0.5 {
-                        cmd = down;
-                    }
+                continue;
+            }
+            // Past the wanted position: step back down instead. Without
+            // this an ADIRS knob left in ATT is driven further from NAV,
+            // not toward it.
+            if let (Some(v), Some(down)) = (before, step.down_command.as_deref()) {
+                if v > step.want + 0.5 {
+                    cmd = down;
                 }
             }
             match step.held_secs {
@@ -505,10 +600,44 @@ impl AirlinerStart {
                     let _ = xp.run_command(cmd).await;
                 }
             }
-            // The aircraft's own script spaces these half a second apart; a
-            // contactor needs a moment to make before the next press.
-            tokio::time::sleep(Duration::from_millis(600)).await;
+            // Wait for the switch to agree — the aircraft's pace, not ours.
+            let (outcome, after) = match &step.position {
+                None => (StepOutcome::Fired, None),
+                Some(pos) => {
+                    let deadline =
+                        tokio::time::Instant::now() + Duration::from_secs_f64(CONFIRM_SECS);
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(CONFIRM_POLL_MS)).await;
+                        let now = read_position(xp, pos).await;
+                        if now.is_some_and(|v| (v - step.want).abs() < 0.5) {
+                            break (StepOutcome::Confirmed, now);
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            break (StepOutcome::NotTaken, now);
+                        }
+                    }
+                }
+            };
+            crate::blackbox::record(
+                "airliner_start",
+                serde_json::json!({"event": "step", "command": cmd, "position": step.position,
+                                   "before": before, "after": after, "outcome": format!("{outcome:?}")}),
+            );
+            match outcome {
+                StepOutcome::NotTaken => {
+                    panel(&format!("{short}: did not take"));
+                    not_taken.push(short);
+                }
+                _ => {
+                    panel(&short);
+                    if let Some(line) = &step.say {
+                        say(line);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(FLOW_STEP_MS)).await;
         }
+        not_taken
     }
 
     /// This engine's spool gauge, or `None` when the read fails — which is no
@@ -520,6 +649,148 @@ impl AirlinerStart {
             .and_then(|v| v.get(idx).copied())
             .filter(|v| v.is_finite())
     }
+
+    /// The whole start, from whatever state the aircraft is in to both
+    /// engines at idle and the after-start flow done. `say` is the voice
+    /// (milestones only), `panel` the transcript (every switch). Returns the
+    /// closing line. Pure over the sim handle so a test can fly it against a
+    /// fake with the clock paused.
+    pub async fn run(
+        &self,
+        xp: &dyn crate::xplane::XPlane,
+        say: &mut (dyn FnMut(&str) + Send),
+        panel: &mut (dyn FnMut(&str) + Send),
+    ) -> String {
+        let mut not_taken: Vec<String> = Vec::new();
+
+        // Seat belt signs before anything turns, whoever asked for the start.
+        if crate::tools::signs::set(xp, true).await == Some(false) {
+            not_taken.push("seat belt signs".into());
+        }
+
+        // --- Bleed air. Without it the starters have nothing to turn. ---
+        let apu_n1 = xp
+            .get_float(&self.p.apu_n1)
+            .await
+            .ok()
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        if apu_n1 < self.p.apu_ready_n1 {
+            say("Starting the A.P.U.");
+            not_taken.extend(self.run_steps(xp, &self.p.apu_steps, say, panel).await);
+            // It takes its own time, and a start attempted without it just
+            // hangs the engine at a few percent with nothing to say why.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let n1 = xp.get_float(&self.p.apu_n1).await.unwrap_or(0.0);
+                if n1 >= self.p.apu_ready_n1 {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return not_taken_suffix(
+                        "The A.P.U. hasn't come up, so there's no start air. Your aircraft.",
+                        &not_taken,
+                    );
+                }
+            }
+            say("A.P.U. running.");
+        }
+        // The pre-start flow: ADIRS, bleed, beacon, the FUEL PUMPS — the
+        // engine needs something to burn before a master switch means
+        // anything (the first version went straight from the APU to the
+        // masters, 2026-09-20). Silent but for the profile's milestones.
+        not_taken.extend(
+            self.run_steps(xp, &self.p.pre_start_steps, say, panel)
+                .await,
+        );
+
+        // --- ENG MODE to IGN/START, and leave it there for every engine. ---
+        let _ = xp.set_float(&self.p.mode_selector, self.p.mode_start).await;
+        let order = self.start_order();
+        say(&format!(
+            "Ignition start. Starting number {}.",
+            spoken_engine(order[0])
+        ));
+
+        let mut started = 0usize;
+        for (n, &idx) in order.iter().enumerate() {
+            self.set_master(xp, idx, true).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                match self.spool(xp, idx).await {
+                    Some(v) if v >= self.p.spool_idle => break,
+                    _ if tokio::time::Instant::now() >= deadline => {
+                        // Knob back to normal before handing back: a selector
+                        // left in IGN/START is a continuous-ignition item the
+                        // pilot has to find for themselves.
+                        let _ = xp.set_float(&self.p.mode_selector, self.p.mode_norm).await;
+                        return not_taken_suffix(
+                            &format!(
+                                "Number {} hasn't come up to idle. Selector back to normal. Your aircraft.",
+                                spoken_engine(idx)
+                            ),
+                            &not_taken,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            started += 1;
+            if let Some(&next) = order.get(n + 1) {
+                say(&format!(
+                    "Number {} at idle. Starting number {}.",
+                    spoken_engine(idx),
+                    spoken_engine(next)
+                ));
+            }
+        }
+        let _ = xp.set_float(&self.p.mode_selector, self.p.mode_norm).await;
+        // The after-start flow — generators, bleeds, packs, APU off — the
+        // aircraft's own sequence finishes the job rather than leaving the APU
+        // carrying the bleed.
+        not_taken.extend(
+            self.run_steps(xp, &self.p.post_start_steps, say, panel)
+                .await,
+        );
+        let engines = if started == 2 {
+            "Both engines".to_string()
+        } else {
+            format!("{started} engines")
+        };
+        not_taken_suffix(
+            &format!("{engines} running. After-start flow complete."),
+            &not_taken,
+        )
+    }
+}
+
+fn spoken_engine(idx: usize) -> &'static str {
+    ["one", "two", "three", "four"]
+        .get(idx)
+        .copied()
+        .unwrap_or("one")
+}
+
+/// The closing line, with every switch that did not take named after it —
+/// the readback compares against the INTENT, and a flow that says "complete"
+/// over a pump that never came on is the lie this whole module exists to
+/// stop telling.
+fn not_taken_suffix(line: &str, not_taken: &[String]) -> String {
+    if not_taken.is_empty() {
+        return line.to_string();
+    }
+    let n = not_taken.len();
+    format!(
+        "{line} {} didn't take: {}.",
+        if n == 1 {
+            "One switch".to_string()
+        } else {
+            format!("{n} switches")
+        },
+        not_taken.join(", ")
+    )
 }
 
 #[async_trait]
@@ -544,83 +815,355 @@ impl Tool for AirlinerStart {
                 return Ok("Engines are already running.".to_string());
             }
         }
-        let say = |v: Option<&Voice>, s: &str| {
-            if let Some(v) = v {
+        let voice = ctx.voice;
+        let status = ctx.status;
+        // Mirror OR action, never both: `alert` already posts the spoken
+        // line to the panel; the silent switches go to the panel only.
+        let mut say = |s: &str| {
+            if let Some(v) = voice {
                 v.alert(Priority::Advisory, s.to_string());
             }
         };
-
-        // --- Bleed air. Without it the starters have nothing to turn. ---
-        let apu_n1 = xp
-            .get_float(&self.p.apu_n1)
-            .await
-            .ok()
-            .filter(|v| v.is_finite())
-            .unwrap_or(0.0);
-        if apu_n1 < self.p.apu_ready_n1 {
-            say(ctx.voice, "Batteries on, starting the A.P.U.");
-            self.run_steps(xp, &self.p.apu_steps).await;
-            // It takes its own time, and a start attempted without it just
-            // hangs the engine at a few percent with nothing to say why.
-            let deadline = std::time::Instant::now() + Duration::from_secs(90);
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let n1 = xp.get_float(&self.p.apu_n1).await.unwrap_or(0.0);
-                if n1 >= self.p.apu_ready_n1 {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Ok(
-                        "The A.P.U. hasn't come up, so there's no start air. Your aircraft."
-                            .to_string(),
-                    );
-                }
+        let mut panel = |s: &str| {
+            if let Some(st) = status {
+                st.action(s);
             }
-            say(ctx.voice, "A.P.U. running.");
-        }
-        // Bleed air, beacon, and the FUEL PUMPS — the engine needs something
-        // to burn before a master switch means anything. The first version of
-        // this went straight from the APU to the masters (2026-09-20).
-        say(ctx.voice, "Bleed air and fuel pumps.");
-        self.run_steps(xp, &self.p.pre_start_steps).await;
+        };
+        Ok(self.run(xp, &mut say, &mut panel).await)
+    }
+}
 
-        // --- ENG MODE to IGN/START, and leave it there for both engines. ---
-        let _ = xp.set_float(&self.p.mode_selector, self.p.mode_start).await;
-        say(ctx.voice, "Ignition start. Starting number one.");
+#[cfg(test)]
+mod airliner_start_tests {
+    use super::*;
+    use crate::aircraft::{AirlinerStartProfile, StartStep};
+    use crate::xplane::XPlane;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
-        let mut started = 0usize;
-        for idx in 0..self.engines {
-            self.set_master(xp, idx, true).await;
-            let deadline = std::time::Instant::now() + Duration::from_secs(120);
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                match self.spool(xp, idx).await {
-                    Some(n) if n >= self.p.spool_idle => break,
-                    _ if std::time::Instant::now() >= deadline => {
-                        // Knob back to normal before handing back: a selector
-                        // left in IGN/START is a continuous-ignition item the
-                        // pilot has to find for themselves.
-                        let _ = xp.set_float(&self.p.mode_selector, self.p.mode_norm).await;
-                        return Ok(format!(
-                            "Number {} hasn't come up to idle. Selector back to normal. Your aircraft.",
-                            idx + 1
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-            started += 1;
-            if idx + 1 < self.engines {
-                say(
-                    ctx.voice,
-                    &format!("Number {} at idle. Starting number {}.", idx + 1, idx + 2),
-                );
+    /// A sim whose switches MOVE when their commands fire — the fake the
+    /// flow needs, because the flow's whole point is reading them back.
+    struct Cockpit {
+        reads: Mutex<HashMap<String, f64>>,
+        /// command -> (position dataref, value it produces). A toggle flips.
+        wiring: HashMap<String, (String, Option<f64>)>,
+        commands: Mutex<Vec<String>>,
+        writes: Mutex<Vec<(String, usize, f64)>>,
+        /// Commands that do NOTHING to their switch: the silent no-op.
+        dead: Vec<String>,
+    }
+
+    impl Cockpit {
+        fn new() -> Self {
+            Cockpit {
+                reads: Mutex::new(HashMap::new()),
+                wiring: HashMap::new(),
+                commands: Mutex::new(Vec::new()),
+                writes: Mutex::new(Vec::new()),
+                dead: Vec::new(),
             }
         }
-        let _ = xp.set_float(&self.p.mode_selector, self.p.mode_norm).await;
-        // Packs on, APU bleed off, APU off — the aircraft's own sequence
-        // finishes the job rather than leaving the APU carrying the bleed.
-        self.run_steps(xp, &self.p.post_start_steps).await;
-        Ok(format!("{started} engines running, packs on, A.P.U. off."))
+        fn set(&self, name: &str, v: f64) {
+            self.reads.lock().unwrap().insert(name.to_string(), v);
+        }
+        fn toggle(&mut self, cmd: &str, pos: &str) {
+            self.wiring.insert(cmd.to_string(), (pos.to_string(), None));
+        }
+        fn sets(&mut self, cmd: &str, pos: &str, v: f64) {
+            self.wiring
+                .insert(cmd.to_string(), (pos.to_string(), Some(v)));
+        }
+        fn ran(&self) -> Vec<String> {
+            self.commands.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl XPlane for Cockpit {
+        async fn get_float(&self, name: &str) -> Result<f64> {
+            self.reads
+                .lock()
+                .unwrap()
+                .get(name)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("no read for {name}"))
+        }
+        async fn set_float(&self, name: &str, value: f64) -> Result<()> {
+            self.set(name, value);
+            Ok(())
+        }
+        async fn set_int(&self, name: &str, value: i64) -> Result<()> {
+            self.set(name, value as f64);
+            Ok(())
+        }
+        async fn run_command(&self, name: &str) -> Result<()> {
+            self.commands.lock().unwrap().push(name.to_string());
+            if self.dead.iter().any(|d| d == name) {
+                return Ok(());
+            }
+            if let Some((pos, v)) = self.wiring.get(name) {
+                let cur = self.reads.lock().unwrap().get(pos).copied().unwrap_or(0.0);
+                let next = v.unwrap_or(if cur > 0.5 { 0.0 } else { 1.0 });
+                self.set(pos, next);
+            }
+            Ok(())
+        }
+        async fn run_command_for(&self, name: &str, _d: f64) -> Result<()> {
+            self.run_command(name).await
+        }
+        async fn get_float_array(&self, name: &str) -> Result<Vec<f64>> {
+            let r = self.reads.lock().unwrap();
+            Ok((0..4)
+                .map(|i| r.get(&format!("{name}[{i}]")).copied().unwrap_or(0.0))
+                .collect())
+        }
+        async fn set_int_array_elem(&self, name: &str, index: usize, value: i64) -> Result<()> {
+            self.set_float_array_elem(name, index, value as f64).await
+        }
+        async fn set_float_array_elem(&self, name: &str, index: usize, value: f64) -> Result<()> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((name.to_string(), index, value));
+            self.set(&format!("{name}[{index}]"), value);
+            // The engine lights off once its master is on: the spool gauge
+            // reads idle from the next poll.
+            if name == "masters" && value > 0.5 {
+                self.set(&format!("n2[{index}]"), 60.0);
+            }
+            Ok(())
+        }
+    }
+
+    fn step(cmd: &str, pos: &str, want: f64, say: Option<&str>) -> StartStep {
+        StartStep {
+            command: cmd.into(),
+            position: Some(pos.into()),
+            want,
+            held_secs: None,
+            down_command: None,
+            say: say.map(str::to_string),
+        }
+    }
+
+    fn profile() -> AirlinerStartProfile {
+        AirlinerStartProfile {
+            mode_selector: "mode".into(),
+            mode_start: 1.0,
+            mode_norm: 0.0,
+            masters: "masters".into(),
+            master_on: 1.0,
+            master_off: 0.0,
+            master_guards: vec![],
+            guard_lift: 0.002,
+            guard_secs: 0.0,
+            start_order: vec![1, 0],
+            apu_steps: vec![
+                step("bat1_tog", "bat1", 1.0, None),
+                step("apu_master_tog", "apu_master", 1.0, None),
+            ],
+            apu_n1: "apu_n1".into(),
+            pre_start_steps: vec![
+                step("ir1_tog", "ir1", 1.0, None),
+                step("ir2_tog", "ir2", 1.0, Some("A.D.I.R.S. on, aligning.")),
+                step("pumpL_tog", "pumpL", 1.0, None),
+                step("pumpR_tog", "pumpR", 1.0, Some("Fuel pumps on.")),
+            ],
+            post_start_steps: vec![step("pack1_tog", "pack1", 1.0, Some("Packs on."))],
+            apu_ready_n1: 95.0,
+            spool: "n2".into(),
+            spool_idle: 50.0,
+        }
+    }
+
+    fn cold_cockpit() -> Cockpit {
+        let mut c = Cockpit::new();
+        for (cmd, pos) in [
+            ("bat1_tog", "bat1"),
+            ("apu_master_tog", "apu_master"),
+            ("ir1_tog", "ir1"),
+            ("ir2_tog", "ir2"),
+            ("pumpL_tog", "pumpL"),
+            ("pumpR_tog", "pumpR"),
+            ("pack1_tog", "pack1"),
+        ] {
+            c.toggle(cmd, pos);
+            c.set(pos, 0.0);
+        }
+        // The APU master coming on is what brings the APU up.
+        c.sets("apu_master_tog", "apu_master", 1.0);
+        c.set("apu_n1", 0.0);
+        c.set("mode", 0.0);
+        c
+    }
+
+    /// Drive the flow with the clock paused: every sleep advances instantly,
+    /// so a thirty-second flow runs in milliseconds and the order and the
+    /// readbacks are what is tested, not the wall clock.
+    async fn fly(c: &Cockpit, p: AirlinerStartProfile) -> (String, Vec<String>, Vec<String>) {
+        let tool = AirlinerStart::new(p, 2);
+        let mut said = Vec::new();
+        let mut panel = Vec::new();
+        // The APU spools once its master is on (the master step sets it).
+        let apu = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if c.get_float("apu_master").await.unwrap_or(0.0) > 0.5 {
+                    c.set("apu_n1", 100.0);
+                }
+            }
+        };
+        let mut say = |s: &str| said.push(s.to_string());
+        let mut show = |s: &str| panel.push(s.to_string());
+        let line = tokio::select! {
+            l = tool.run(c, &mut say, &mut show) => l,
+            _ = apu => unreachable!(),
+        };
+        (line, said, panel)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_flow_speaks_milestones_and_logs_every_switch() {
+        let c = cold_cockpit();
+        let (line, said, panel) = fly(&c, profile()).await;
+        assert_eq!(line, "Both engines running. After-start flow complete.");
+        assert_eq!(
+            said,
+            vec![
+                "Starting the A.P.U.",
+                "A.P.U. running.",
+                "A.D.I.R.S. on, aligning.",
+                "Fuel pumps on.",
+                "Ignition start. Starting number two.",
+                "Number two at idle. Starting number one.",
+                "Packs on.",
+            ],
+            "the voice says the state, not the switches"
+        );
+        // Every switch reached the panel transcript, by short name.
+        for name in [
+            "bat1",
+            "apu master",
+            "ir1",
+            "ir2",
+            "pumpL",
+            "pumpR",
+            "pack1",
+        ] {
+            assert!(
+                panel.iter().any(|l| l == name),
+                "panel lacks {name}: {panel:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn engines_start_in_the_profiles_order() {
+        let c = cold_cockpit();
+        let _ = fly(&c, profile()).await;
+        let masters: Vec<usize> = c
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _, v)| n == "masters" && *v > 0.5)
+            .map(|(_, i, _)| *i)
+            .collect();
+        assert_eq!(
+            masters,
+            vec![1, 0],
+            "number two first, as the A330's POM says"
+        );
+    }
+
+    /// EGPF, 2026-09-21: `battery_on[0]` read as a scalar is a 400, so both
+    /// A330 battery steps logged `before: null, after: null` and "did not
+    /// take" on a ramp where they had. An indexed position is one element.
+    #[tokio::test]
+    async fn an_indexed_position_reads_its_element() {
+        let xp = crate::xplane::FakeXPlane::new();
+        xp.set_read_array("sim/cockpit2/electrical/battery_on", &[1.0, 0.0]);
+        let base = "sim/cockpit2/electrical/battery_on";
+        assert_eq!(read_position(&xp, &format!("{base}[0]")).await, Some(1.0));
+        assert_eq!(read_position(&xp, &format!("{base}[1]")).await, Some(0.0));
+        assert_eq!(read_position(&xp, &format!("{base}[7]")).await, None);
+        xp.set_read("laminar/A333/buttons/APU_batt_pos", 1.0);
+        assert_eq!(read_position(&xp, "laminar/A333/buttons/APU_batt_pos").await, Some(1.0));
+        assert_eq!(read_position(&xp, "not/there").await, None, "no measurement");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_switch_already_set_is_never_toggled_off() {
+        let c = cold_cockpit();
+        c.set("ir1", 1.0);
+        c.set("pumpL", 1.0);
+        let _ = fly(&c, profile()).await;
+        let ran = c.ran();
+        assert!(
+            !ran.iter().any(|r| r == "ir1_tog"),
+            "ir1 was already on: {ran:?}"
+        );
+        assert!(!ran.iter().any(|r| r == "pumpL_tog"));
+        assert_eq!(c.get_float("ir1").await.unwrap(), 1.0);
+        assert_eq!(c.get_float("pumpL").await.unwrap(), 1.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_switch_that_does_not_take_is_named_and_its_milestone_withheld() {
+        let mut c = cold_cockpit();
+        // The right pump's command reaches nothing — the study-level no-op.
+        c.dead.push("pumpR_tog".into());
+        let (line, said, panel) = fly(&c, profile()).await;
+        assert_eq!(
+            line,
+            "Both engines running. After-start flow complete. One switch didn't take: pumpR."
+        );
+        assert!(
+            !said.iter().any(|s| s == "Fuel pumps on."),
+            "no milestone over a dead switch: {said:?}"
+        );
+        assert!(panel.iter().any(|l| l == "pumpR: did not take"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_pace_is_a_crews_not_a_macros() {
+        let c = cold_cockpit();
+        let t0 = tokio::time::Instant::now();
+        let _ = fly(&c, profile()).await;
+        let secs = t0.elapsed().as_secs_f64();
+        // Seven fired switches at a beat and a half each, plus confirm polls
+        // and the engine spools' first 2 s polls: tens of seconds, not two.
+        assert!(
+            secs > 12.0,
+            "flow took {secs:.1} s of sim time: that is a macro"
+        );
+        assert!(
+            secs < 90.0,
+            "flow took {secs:.1} s: something waited on a timeout"
+        );
+    }
+
+    #[test]
+    fn short_names_read_like_a_switch_label() {
+        let s = step(
+            "laminar/A333/switches/left1_pump_toggle",
+            "laminar/A333/fuel/buttons/left1_pump_pos",
+            1.0,
+            None,
+        );
+        assert_eq!(step_short_name(&s), "left1 pump");
+        let k = StartStep {
+            command: "laminar/A333/buttons/APU_start".into(),
+            position: None,
+            want: 1.0,
+            held_secs: Some(1.0),
+            down_command: None,
+            say: None,
+        };
+        assert_eq!(step_short_name(&k), "APU start");
+        assert_eq!(
+            not_taken_suffix("Done.", &["left1 pump".into(), "apu bleed".into()]),
+            "Done. 2 switches didn't take: left1 pump, apu bleed."
+        );
     }
 }

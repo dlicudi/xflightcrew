@@ -116,6 +116,8 @@ pub const AUDIO_SELECTION_COM1: &str = "sim/cockpit2/radios/actuators/audio_sele
 /// Tail number string ("N172SP") — the spoken callsign.
 #[allow(dead_code)] // consumed by the atc binary's tree, not the copilot's (yet)
 pub const TAILNUM: &str = "sim/aircraft/view/acf_tailnum";
+/// Maximum gross mass, kg. The wake turbulence category is read off it.
+pub const ACF_M_MAX_KG: &str = "sim/aircraft/weight/acf_m_max";
 
 // --- Autopilot status (read-only; > 0 = engaged/armed) ---
 pub const SERVOS_ON: &str = "sim/cockpit2/autopilot/servos_on";

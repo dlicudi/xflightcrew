@@ -749,10 +749,27 @@ struct StallSpeed {
     severity: Severity,
     /// Clean stall speed (kts) the bands scale off.
     vs_clean_kts: f64,
+    /// Landing-configuration stall speed, when the profile declares one. The
+    /// full-flap stall is then THIS number and the flap-adjusted speed runs
+    /// straight between the two; without it the 17% trainer reduction
+    /// applies, which on the A330 (Vs 175, Vso 125) put a stabilised 150 kt
+    /// final inside the WARNING band the whole way down (2026-09-20).
+    vs0_kts: Option<f64>,
     /// Fires when IAS ≤ this × the flap-adjusted stall speed …
     at_or_below_factor: f64,
     /// … and (if set) still above this × it — the more urgent band owns below.
     above_factor: Option<f64>,
+}
+
+/// The stall speed at this flap setting: a straight line from the clean
+/// stall to the landing-configuration stall when the profile declares one,
+/// else the trainer's fixed reduction. Never above clean, never below Vso.
+pub fn stall_speed_at_flap(vs_clean_kts: f64, vs0_kts: Option<f64>, flap_ratio: f64) -> f64 {
+    let f = flap_ratio.clamp(0.0, 1.0);
+    match vs0_kts.filter(|v| *v > 0.0 && *v < vs_clean_kts) {
+        Some(vs0) => vs_clean_kts - (vs_clean_kts - vs0) * f,
+        None => vs_clean_kts * (1.0 - FLAP_STALL_REDUCTION * f),
+    }
 }
 
 impl Check for StallSpeed {
@@ -769,7 +786,7 @@ impl Check for StallSpeed {
             return None;
         }
         // Stall speed for the current flap setting.
-        let vs = self.vs_clean_kts * (1.0 - FLAP_STALL_REDUCTION * s.flap_ratio.clamp(0.0, 1.0));
+        let vs = stall_speed_at_flap(self.vs_clean_kts, self.vs0_kts, s.flap_ratio);
         // Anticipate: when the speed is washing off, project it forward so the
         // band trips while there's still margin to recover. Only a *decaying*
         // trend counts (`.min(0.0)`), so this can lower the effective speed but
@@ -811,6 +828,18 @@ struct Overspeed {
     below_factor: Option<f64>,
 }
 
+/// The overspeed warning's words, by what the aircraft is doing. "Ease off
+/// the descent" was said five times to an A330 climbing at 2,600 fpm (EGPH,
+/// 2026-09-20): the pilot can see the nose is up, and an instruction that is
+/// visibly wrong takes the whole sentence with it.
+pub fn overspeed_line(vsi_fpm: f64) -> &'static str {
+    if vsi_fpm < -300.0 {
+        "Overspeed! Reduce power, ease off the descent."
+    } else {
+        "Overspeed! Reduce power."
+    }
+}
+
 impl Check for Overspeed {
     fn id(&self) -> &'static str {
         self.id
@@ -834,7 +863,7 @@ impl Check for Overspeed {
             return None;
         }
         Some(match self.severity {
-            Severity::Warning => "Overspeed! Reduce power, ease off the descent.".to_string(),
+            Severity::Warning => overspeed_line(s.vsi_fpm).to_string(),
             _ => "Airspeed — you're getting fast.".to_string(),
         })
     }
@@ -1107,7 +1136,8 @@ impl Check for TodAhead {
             let mins = (s.groundspeed_kts > 60.0).then(|| to_tod / s.groundspeed_kts * 60.0);
             return Some(match mins {
                 Some(m) => format!(
-                    "Descent coming up. Top of descent in about {m:.0} minutes, {to_tod:.0} miles ahead, down to {alt} feet."
+                    "Descent coming up. Top of descent in about {}, {to_tod:.0} miles ahead, down to {alt} feet.",
+                    spoken_minutes(m)
                 ),
                 None => format!(
                     "Descent coming up. Top of descent {to_tod:.0} miles ahead, down to {alt} feet."
@@ -1125,7 +1155,8 @@ impl Check for TodAhead {
         let mins = (s.groundspeed_kts > 60.0).then(|| to_tod / s.groundspeed_kts * 60.0);
         Some(match mins {
             Some(m) => format!(
-                "Descent coming up. Top of descent in about {m:.0} minutes, {to_tod:.0} miles ahead."
+                "Descent coming up. Top of descent in about {}, {to_tod:.0} miles ahead.",
+                spoken_minutes(m)
             ),
             None => format!("Descent coming up. Top of descent {to_tod:.0} miles ahead."),
         })
@@ -1425,7 +1456,7 @@ impl AltimeterSetting {
         }
         let want = crate::tools::instruments::correct_setting_inhg(
             s.alt_ft,
-            self.transition_altitude_ft,
+            crate::tools::instruments::transition_in_force_ft(self.transition_altitude_ft),
             pa,
         );
         ((baro - want).abs() >= crate::tools::instruments::ALTIMETER_TOLERANCE_INHG)
@@ -1446,7 +1477,9 @@ impl Check for AltimeterSetting {
         Some(if s.automation_flying {
             format!("Altimeter reset, {}.", spoken(want))
         } else {
-            let what = if s.alt_ft >= self.transition_altitude_ft {
+            let what = if s.alt_ft
+                >= crate::tools::instruments::transition_in_force_ft(self.transition_altitude_ft)
+            {
                 "standard"
             } else {
                 "QNH"
@@ -1708,10 +1741,12 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
         // below ~1.1×Vs. Disjoint bands so only one speaks; the factors are
         // applied to the *flap-adjusted* stall speed at eval time, so a slow but
         // safe flaps-down approach doesn't trip it.
+        let vs0 = profile.reference.as_ref().and_then(|r| r.vs0_kts);
         checks.push(Box::new(StallSpeed {
             id: "airspeed_caution",
             severity: Severity::Caution,
             vs_clean_kts: vs,
+            vs0_kts: vs0,
             at_or_below_factor: 1.20,
             above_factor: Some(1.10),
         }));
@@ -1719,6 +1754,7 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             id: "airspeed_warning",
             severity: Severity::Warning,
             vs_clean_kts: vs,
+            vs0_kts: vs0,
             at_or_below_factor: 1.10,
             above_factor: None,
         }));
@@ -2308,6 +2344,7 @@ pub async fn run(
                 || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
                 || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed)
                 || voice.crashed();
+            feed_surface_wind();
             if !quiet {
                 // One COM1 read serves the incursion shout, the ATIS loop and
                 // the traffic advisories below.
@@ -2392,12 +2429,8 @@ pub async fn run(
                                     // controller call — an unaddressed "exit
                                     // the runway" reads as talking to nobody
                                     // (pilot feedback, 2026-07-10).
-                                    let callsign = xp
-                                        .get_string(crate::datarefs::TAILNUM)
+                                    let callsign = crate::circuit::crew_callsign(&xp)
                                         .await
-                                        .ok()
-                                        .map(|t| crate::tower::spoken_callsign(&t))
-                                        .filter(|s| !s.is_empty())
                                         .unwrap_or_else(|| "aircraft on the runway".to_string());
                                     let line = if urgent {
                                         format!(
@@ -3005,12 +3038,8 @@ pub async fn run(
                             );
                             let speaker = com1.and_then(crate::station::tuned_controller);
                             if let Some(who) = speaker {
-                                let callsign = xp
-                                    .get_string(crate::datarefs::TAILNUM)
+                                let callsign = crate::circuit::crew_callsign(&xp)
                                     .await
-                                    .ok()
-                                    .map(|t| crate::tower::spoken_callsign(&t))
-                                    .filter(|s| !s.is_empty())
                                     .unwrap_or_else(|| "traffic alert".to_string());
                                 let line = format!(
                                     "{callsign}, {}",
@@ -3066,12 +3095,8 @@ pub async fn run(
                             // callsign; otherwise read the tail number.
                             let callsign = match &vectored {
                                 Some(c) => c.clone(),
-                                None => xp
-                                    .get_string(crate::datarefs::TAILNUM)
+                                None => crate::circuit::crew_callsign(&xp)
                                     .await
-                                    .ok()
-                                    .map(|t| crate::tower::spoken_callsign(&t))
-                                    .filter(|s| !s.is_empty())
                                     .unwrap_or_else(|| "traffic alert".to_string()),
                             };
                             let line = format!("{callsign}, {call}");
@@ -3595,8 +3620,77 @@ mod region_coach_tests {
     }
 }
 
+/// "a minute", "2 minutes": a rounded duration the way it is said ("about 1
+/// minutes" was spoken at every short step-down, 2026-09-21).
+fn spoken_minutes(m: f64) -> String {
+    match m.round() as i64 {
+        n if n <= 1 => "a minute".to_string(),
+        n => format!("{n} minutes"),
+    }
+}
+
+/// Hand the active field's SURFACE wind (the sim's real-weather METAR) down
+/// to the station, once a minute, off the tick. The tower picked its runway
+/// by the wind datarefs, which are the air the AIRCRAFT is in: for an arrival
+/// at 2,700 ft that was 350 at 8 while the field reported 190 at 3, and crew
+/// and tower chose opposite ends of Exeter (2026-09-21). Above the `quiet`
+/// gate on purpose: an autoland in progress is exactly when the tower's wind
+/// matters.
+fn feed_surface_wind() {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed().as_secs() < 60) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    let Some((icao, lat, lon)) = crate::station::active_icao() else {
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        let wind = crate::weather::surface_wind(&crate::tools::autoland::xplane_root(), &icao);
+        crate::station::set_surface_wind(lat, lon, wind);
+    });
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_overspeed_warning_never_blames_a_descent_in_a_climb() {
+        assert!(super::overspeed_line(-1500.0).contains("descent"));
+        assert!(!super::overspeed_line(2600.0).contains("descent"));
+        assert!(!super::overspeed_line(0.0).contains("descent"));
+        assert!(!super::overspeed_line(f64::NAN).contains("descent"));
+    }
+
+    use super::stall_speed_at_flap;
+
+    #[test]
+    fn the_flap_stall_is_the_profiles_vso_when_it_has_one() {
+        // A330: Vs 175 clean, Vso 125 full flap. Full flap is Vso, half flap
+        // halfway, clean is clean; the MCDU's VAPP of 154 sits above the 1.2
+        // x 125 caution line, where the old 17% rule (145) had put it inside
+        // the WARNING band.
+        assert_eq!(stall_speed_at_flap(175.0, Some(125.0), 1.0), 125.0);
+        assert_eq!(stall_speed_at_flap(175.0, Some(125.0), 0.5), 150.0);
+        assert_eq!(stall_speed_at_flap(175.0, Some(125.0), 0.0), 175.0);
+        assert!(154.0 > 1.2 * stall_speed_at_flap(175.0, Some(125.0), 1.0));
+        assert!(
+            154.0 <= 1.2 * stall_speed_at_flap(175.0, None, 1.0),
+            "the old rule flagged it"
+        );
+        assert!(
+            154.0 <= 1.1 * stall_speed_at_flap(175.0, None, 1.0),
+            "...as a WARNING"
+        );
+        // No Vso on file: the trainer's 17% reduction, as before.
+        let c172 = stall_speed_at_flap(48.0, None, 1.0);
+        assert!((c172 - 48.0 * 0.83).abs() < 1e-9);
+        // A nonsense Vso (above clean) is ignored, never a raised stall.
+        assert_eq!(stall_speed_at_flap(48.0, Some(60.0), 1.0), c172);
+    }
+
     use super::*;
 
     #[test]
@@ -4275,6 +4369,7 @@ mod tests {
             id: "c",
             severity: Severity::Caution,
             vs_clean_kts: 48.0,
+            vs0_kts: None,
             at_or_below_factor: 1.20,
             above_factor: Some(1.10),
         };
@@ -4282,6 +4377,7 @@ mod tests {
             id: "w",
             severity: Severity::Warning,
             vs_clean_kts: 48.0,
+            vs0_kts: None,
             at_or_below_factor: 1.10,
             above_factor: None,
         };

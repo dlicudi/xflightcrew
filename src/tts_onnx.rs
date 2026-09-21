@@ -227,7 +227,7 @@ impl OnnxTts {
         let t = std::time::Instant::now();
         let gap = vec![0.0_f32; (self.sample_rate as f64 * SENTENCE_GAP_S) as usize];
         let mut samples = Vec::new();
-        for chunk in speech_chunks(text) {
+        for chunk in speech_chunks(&undot_acronyms(text)) {
             if !samples.is_empty() {
                 samples.extend_from_slice(&gap);
             }
@@ -402,6 +402,50 @@ const LETTER_NAMES: [&str; 26] = [
     "zee",
 ];
 
+/// Rewrite a dotted acronym ("A.P.U.", "A.D.I.R.S.") as the spaced letters the
+/// readbacks use ("A P U"). Each dot is a full stop to everything downstream:
+/// `speech_chunks` cut "A.P.U. running." into two synths with a sentence gap
+/// between them, and `phonemize` put a stop's pause after every letter. The
+/// closing dot survives only where it also ends the sentence (end of text, or a
+/// capitalised word follows).
+fn undot_acronyms(text: &str) -> String {
+    let toks: Vec<&str> = text.split(' ').collect();
+    let mut out: Vec<String> = Vec::with_capacity(toks.len());
+    for (i, tok) in toks.iter().enumerate() {
+        let core = tok.trim_end_matches(|c: char| matches!(c, ',' | ';' | ':' | '!' | '?'));
+        let b = core.as_bytes();
+        let dotted = b.len() >= 3
+            && b.iter().enumerate().all(|(j, c)| {
+                if j % 2 == 0 {
+                    c.is_ascii_uppercase()
+                } else {
+                    *c == b'.'
+                }
+            });
+        if !dotted {
+            out.push(tok.to_string());
+            continue;
+        }
+        let letters: Vec<String> = core
+            .chars()
+            .filter(|c| *c != '.')
+            .map(String::from)
+            .collect();
+        let mut spoken = letters.join(" ");
+        let tail = &tok[core.len()..];
+        let ends_sentence = toks[i + 1..]
+            .iter()
+            .find(|t| !t.is_empty())
+            .map_or(true, |next| next.starts_with(|c: char| c.is_uppercase()));
+        if core.ends_with('.') && tail.is_empty() && ends_sentence {
+            spoken.push('.');
+        }
+        spoken.push_str(tail);
+        out.push(spoken);
+    }
+    out.join(" ")
+}
+
 /// Expand standalone single capital letters to their spoken names (keeping any
 /// attached punctuation), so the spelled-out acronym convention in the readbacks
 /// is pronounced correctly. Lowercase words and multi-letter tokens are untouched.
@@ -507,6 +551,42 @@ mod tests {
         // An overlong single sentence falls back to comma packing.
         let long = format!("one{}", ", and some more words here".repeat(20));
         assert!(speech_chunks(&long).iter().all(|c| c.len() <= 220));
+    }
+
+    #[test]
+    fn dotted_acronyms_are_spoken_as_spaced_letters() {
+        // The A330 start, as heard: "A.P.U." then a sentence gap then "running."
+        assert_eq!(undot_acronyms("A.P.U. running."), "A P U running.");
+        assert_eq!(speech_chunks(&undot_acronyms("A.P.U. running.")).len(), 1);
+        assert_eq!(undot_acronyms("Starting the A.P.U."), "Starting the A P U.");
+        assert_eq!(
+            undot_acronyms("Beacon and A.P.U. bleed on."),
+            "Beacon and A P U bleed on."
+        );
+        assert_eq!(
+            undot_acronyms("A.D.I.R.S. one is off. Selecting nav."),
+            "A D I R S one is off. Selecting nav."
+        );
+        // The closing dot is kept where it ends the sentence too.
+        assert_eq!(
+            undot_acronyms("Check the A.P.U. Your aircraft."),
+            "Check the A P U. Your aircraft."
+        );
+        assert_eq!(undot_acronyms("No A.P.U., no start."), "No A P U, no start.");
+        // Letters come out as names, never a schwa.
+        assert_eq!(
+            say_letters(&undot_acronyms("A.P.U. off.")),
+            "eigh pee you off."
+        );
+        // Decimals, lone letters and plain sentences are untouched.
+        for s in [
+            "Roger, altimeter 30.17.",
+            "Runway 27 L.",
+            "Flaps up. Gear up.",
+            "A P U running.",
+        ] {
+            assert_eq!(undot_acronyms(s), s);
+        }
     }
 
     // Needs the vendored model + espeak-ng, so off by default. Run with:

@@ -13,11 +13,26 @@
 # 175 / Vso 125 / Vfe 215 and 180 / Vle 250 / Vmo 330, MTOW 533,519 lb, empty
 # 285,278 lb, five flap positions 0/8/14/22/32 deg = CONF 0/1/2/3/FULL).
 #
-# ENGINE START IS THE PILOT'S (`A333.engine` is the aircraft's own script; no
-# start block fits it). The FBW protections are the aircraft's: the takeoff
+# The engine start is `airliner_start` below, read out of the aircraft's own
+# autostart script. The FBW protections are the aircraft's: the takeoff
 # rotation through the pitch channel is a sidestick demand here, bounded by
 # `tail_strike_deg`, and the flare through the VS dial is what the stock
-# autopilot does with it. Nothing below is proven in the air yet.
+# autopilot does with it.
+#
+# AUDITED AGAINST THE SCRIPTS (every per-frame write in plugins/xlua/scripts
+# mapped, 2026-09-20): the aircraft REWRITES the stock seat-belt and
+# no-smoking signs, transponder mode, every probe-heat switch, the nav and
+# strobe light switches, battery/generator/bus-tie states, APU and engine
+# bleeds, packs (on ditching), fuel pumps and electric hydraulic pumps every
+# frame from its own laminar/A333 switch positions. A stock write to any of
+# those is a silent no-op; the stock dataref is still an HONEST READ. Hence
+# the laminar commands on the lights and signs below, the transponder knob,
+# and the checklist's laminar positions. Stock writes that DO work: throttle,
+# the AP dials (altitude, speed, VS; heading only in selected HDG), flaps,
+# gear, speedbrake, parking brake ratio, autobrake level, barometer, COM
+# frequencies, transponder code, landing lights [0] and [1], beacon.
+# The parking brake is a VALVE on this airframe (its own auto-board sets
+# `park_brake_valve` 1 = set), so `park_brake_valve_set` is declared.
 
 id: airbus_a330_300
 display_name: Airbus A330-300
@@ -67,6 +82,8 @@ airliner_start:
   master_guards:
     - laminar/A333/switches/engine1_start_lift
     - laminar/A333/switches/engine2_start_lift
+  # Number two first: the POM's own order (p.66), the way Airbus crews do it.
+  start_order: [1, 0]
   # The APU, in the order and with the controls the aircraft's own script
   # uses. COMMANDS, not datarefs: `laminar/A333/buttons/APU_start` exists as
   # both, and the dataref is the button's POSITION, which the aircraft
@@ -82,6 +99,8 @@ airliner_start:
     - { command: laminar/A333/buttons/APU_master,       position: laminar/A333/buttons/apu_master_ctct_on_off, want: 1.0 }
     # Momentary press-and-hold, and the only step with no position to read.
     - { command: laminar/A333/buttons/APU_start,        held_secs: 1.0 }
+    # POM step 7: the APU generator carries the buses until the engines do.
+    - { command: laminar/A333/buttons/APU_gen_toggle,   position: laminar/A333/buttons/gen_apu_pos, want: 1.0 }
   apu_n1: sim/cockpit2/electrical/APU_N1_percent
   # Trent 700s are three-spool, but the sim's gauge the script watches is N2.
   # AUTO-START steps 1-14, in the aircraft's own order. The EIGHT FUEL PUMPS
@@ -107,9 +126,11 @@ airliner_start:
     # on where the knob is — hence `down_command`.
     - { command: laminar/A333/knobs/adirs/ir1_knob_right, down_command: laminar/A333/knobs/adirs/ir1_knob_left, position: laminar/A333/buttons/adirs/ir1_knob_pos, want: 1.0 }  # step 19
     - { command: laminar/A333/knobs/adirs/ir2_knob_right, down_command: laminar/A333/knobs/adirs/ir2_knob_left, position: laminar/A333/buttons/adirs/ir2_knob_pos, want: 1.0 }  # step 20
-    - { command: laminar/A333/knobs/adirs/ir3_knob_right, down_command: laminar/A333/knobs/adirs/ir3_knob_left, position: laminar/A333/buttons/adirs/ir3_knob_pos, want: 1.0 }  # step 21
+    - { command: laminar/A333/knobs/adirs/ir3_knob_right, down_command: laminar/A333/knobs/adirs/ir3_knob_left, position: laminar/A333/buttons/adirs/ir3_knob_pos, want: 1.0,
+        say: "A.D.I.R.S. on and aligning." }  # step 21
     - { command: sim/lights/beacon_lights_on,  position: sim/cockpit2/switches/beacon_on, want: 1.0 }        # step 1
-    - { command: sim/bleed_air/apu_toggle,     position: laminar/A333/switch_memory/apu_bleed_on_off, want: 1.0 }  # step 2
+    - { command: sim/bleed_air/apu_toggle,     position: laminar/A333/switch_memory/apu_bleed_on_off, want: 1.0,
+        say: "Beacon and A.P.U. bleed on." }  # step 2
     - { command: laminar/A333/switches/left1_pump_toggle,         position: laminar/A333/fuel/buttons/left1_pump_pos,       want: 1.0 }  # step 7
     - { command: laminar/A333/switches/left2_pump_toggle,         position: laminar/A333/fuel/buttons/left2_pump_pos,       want: 1.0 }  # step 8
     - { command: laminar/A333/switches/left_stby_pump_toggle,     position: laminar/A333/fuel/buttons/left_stby_pump_pos,   want: 1.0 }  # step 9
@@ -117,14 +138,30 @@ airliner_start:
     - { command: laminar/A333/switches/right2_pump_toggle,        position: laminar/A333/fuel/buttons/right2_pump_pos,      want: 1.0 }  # step 11
     - { command: laminar/A333/switches/right_stby_pump_toggle,    position: laminar/A333/fuel/buttons/right_stby_pump_pos,  want: 1.0 }  # step 12
     - { command: laminar/A333/switches/center_left_pump_toggle,   position: laminar/A333/fuel/buttons/center_left_pump_pos, want: 1.0 }  # step 13
-    - { command: laminar/A333/switches/center_right_pump_toggle,  position: laminar/A333/fuel/buttons/center_right_pump_pos, want: 1.0 } # step 14
+    - { command: laminar/A333/switches/center_right_pump_toggle,  position: laminar/A333/fuel/buttons/center_right_pump_pos, want: 1.0,
+        say: "Fuel pumps on, eight of eight." } # step 14
 
-  # AUTO-START steps 20-23: packs on, then the APU stops carrying the bleed.
+  # The after-start flow, the POM's order (p.68-69): engine generators on
+  # and the APU generator off, APU bleed off, ENGINE BLEEDS ON, packs on, APU
+  # master off. The first version of this list did the packs and shut the
+  # APU down and never opened the engine bleeds or touched a generator
+  # (profile review, 2026-09-20): the packs had no air. Generator 1's stock
+  # on/off is replaced by the aircraft (reaches gen1_pos); generator 2 only
+  # has its toggle replaced, so it is read first. Engine bleed toggles are
+  # replaced too; every position is the aircraft's own pushbutton.
   post_start_steps:
-    - { command: sim/bleed_air/pack_left_toggle,   position: laminar/A333/buttons/pack_1_pos, want: 1.0 }   # step 20
-    - { command: sim/bleed_air/pack_right_toggle,  position: laminar/A333/buttons/pack_2_pos, want: 1.0 }   # step 21
-    - { command: sim/bleed_air/apu_toggle,         position: laminar/A333/switch_memory/apu_bleed_on_off, want: 0.0 }  # step 22
-    - { command: laminar/A333/buttons/APU_master,  position: laminar/A333/buttons/apu_master_ctct_on_off,  want: 0.0 }  # step 23
+    - { command: sim/electrical/generator_1_on,        position: laminar/A333/buttons/gen1_pos,    want: 1.0 }
+    - { command: sim/electrical/generator_2_toggle,    position: laminar/A333/buttons/gen2_pos,    want: 1.0,
+        say: "Generators on." }
+    - { command: laminar/A333/buttons/APU_gen_toggle,  position: laminar/A333/buttons/gen_apu_pos, want: 0.0 }
+    - { command: sim/bleed_air/apu_toggle,             position: laminar/A333/switch_memory/apu_bleed_on_off, want: 0.0 }  # step 22
+    - { command: sim/bleed_air/engine_1_toggle,        position: laminar/A333/buttons/eng_bleed_1_pos, want: 1.0 }
+    - { command: sim/bleed_air/engine_2_toggle,        position: laminar/A333/buttons/eng_bleed_2_pos, want: 1.0 }
+    - { command: sim/bleed_air/pack_left_toggle,       position: laminar/A333/buttons/pack_1_pos, want: 1.0 }   # step 20
+    - { command: sim/bleed_air/pack_right_toggle,      position: laminar/A333/buttons/pack_2_pos, want: 1.0,
+        say: "Engine bleeds and packs on." }   # step 21
+    - { command: laminar/A333/buttons/APU_master,      position: laminar/A333/buttons/apu_master_ctct_on_off,  want: 0.0,
+        say: "A.P.U. off." }  # step 23
   spool: sim/cockpit2/engine/indicators/N2_percent
   spool_idle: 50.0
 
@@ -167,16 +204,87 @@ electrical:
     off_commands: [sim/systems/avionics_off]
     readback:     [sim/cockpit/electrical/avionics_on]
 
-# Exterior lights (standard X-Plane switch datarefs; no light command is replaced).
+# Exterior lights. The nav and strobe switches are the aircraft's own
+# (A333.lighting.lua rewrites the stock `navigation_lights_on` and
+# `strobe_lights_on` every frame from `laminar/a333/switches/nav_pos` and
+# `strobe_pos`), so the stock commands went nowhere and the readback read
+# what the aircraft was doing anyway. The laminar commands step those
+# switches: nav 0 OFF / 1 ON / 2 ON+LOGO, strobe 0 OFF / 1 AUTO / 2 ON. The
+# nose light is a three-position switch on `landing_lights_switch[1]` (OFF 0
+# / TAXI 0.5 / T.O. 1.0): "taxi light" is the TAXI detent; the T.O. position
+# is the checklist's before takeoff. Beacon and landing lights are stock.
 lights:
-  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on, command_on: sim/lights/nav_lights_on,     command_off: sim/lights/nav_lights_off }
-  - { key: beacon,  spoken: beacon,            dataref: sim/cockpit2/switches/beacon_on,            command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
-  - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,     command_on: sim/lights/strobe_lights_on,  command_off: sim/lights/strobe_lights_off }
-  - { key: landing, spoken: landing lights,    dataref: sim/cockpit2/switches/landing_lights_on,    command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }
-  - { key: taxi,    spoken: taxi light,        dataref: sim/cockpit2/switches/taxi_light_on,        command_on: sim/lights/taxi_lights_on,    command_off: sim/lights/taxi_lights_off }
+  - { key: nav,     spoken: navigation lights, dataref: sim/cockpit2/switches/navigation_lights_on,  command_on: laminar/A333/toggle_switch/nav_light_pos_up, command_off: laminar/A333/toggle_switch/nav_light_pos_dn }
+  - { key: beacon,  spoken: beacon,            dataref: sim/cockpit2/switches/beacon_on,             command_on: sim/lights/beacon_lights_on,  command_off: sim/lights/beacon_lights_off }
+  - { key: strobe,  spoken: strobe lights,     dataref: sim/cockpit2/switches/strobe_lights_on,      command_on: laminar/A333/toggle_switch/strobe_pos_on, command_off: laminar/A333/toggle_switch/strobe_pos_off }
+  - { key: landing, spoken: landing lights,    dataref: "sim/cockpit2/switches/landing_lights_switch[0]", command_on: sim/lights/landing_lights_on, command_off: sim/lights/landing_lights_off }  # VERIFY the stock command reaches [0]
+  - { key: taxi,    spoken: taxi light,        dataref: "sim/cockpit2/switches/landing_lights_switch[1]", command_on: laminar/A333/switch/lighting/taxi_light_taxi, command_off: laminar/A333/switch/lighting/taxi_light_off }
 
-# Vmo 330 KIAS (Mmo 0.89 per the POM); the acf's Vne.
+# Vmo 330 KIAS (Mmo 0.89 per the POM); the acf's Vne. The flight governor's
+# ceiling is derived from it (Vne less a margin), so a cruise target of 290
+# is no longer clamped to a GA 250.
 vne_kts: 330.0
+
+# The parking brake is a VALVE here: the aircraft's own auto-board writes
+# `park_brake_valve = 1` for SET and its ECAM reads the brake from the valve
+# (A333.Z.autostart.lua:501, ecam_fws200.lua:301). Any brake application with
+# the valve set latches, so the crew goes through the valve-aware seam. VERIFY.
+park_brake_valve_set: 1.0
+
+# The transponder MODE is the aircraft's own knob (`A333.transponder.lua`
+# rewrites the stock `transponder_mode` every frame from it): -1 STBY, 0 AUTO
+# (mode S on the ground, mode C airborne — the Airbus SOP position), 1 ON.
+# There is no OFF; standby is the nearest thing. "Altitude" is AUTO, so the
+# crew's SOP knob position and the checklist's agree. The knob dataref is
+# READ-ONLY (probed live 2026-09-21: is_writable false; the flight before
+# went out in standby), so the knob is stepped by the aircraft's own
+# commands (A333.transponder.lua: right = -1 -> 0 -> 1, left the reverse).
+transponder_mode_knob:
+  dataref: laminar/A333/transponder/auto_on_knob_pos
+  off: -1
+  standby: -1
+  on: 1
+  altitude: 0
+  up_command: laminar/A333/transponder/auto_on_off_right
+  down_command: laminar/A333/transponder/auto_on_off_left
+  # AUTO is not enough. The script computes the stock mode from THREE knobs,
+  # and with TCAS left in STBY (where the aircraft loads) AUTO is stock mode 1:
+  # standby. Read live 2026-09-21, airborne in Glasgow's zone: knob 0, TA/RA
+  # knob 0, stock mode 1, and the takeoff had logged the mode as set. TA/RA
+  # (2) and altitude reporting (1) are turned too, and the stock mode is what
+  # confirms (7 airborne, 5 or 6 on the ground). Both read-only, both stepped.
+  also:
+    - { dataref: laminar/A333/transponder/alt_rpt_knob_pos, want: 1,
+        up_command: laminar/A333/transponder/alt_rpt_on, down_command: laminar/A333/transponder/alt_rpt_off }
+    - { dataref: laminar/A333/transponder/ta_ra_knob_pos, want: 2,
+        up_command: laminar/A333/transponder/ta_ra_right, down_command: laminar/A333/transponder/ta_ra_left }
+# What the crew sets after start and confirms before the brakes come off,
+# beyond flaps, trim and the altitude selector (src/takeoff_config.rs), and at
+# the gear on the way in. All three are stock writes that work here (header).
+# The checklist has always asked for them and nothing ever set them: the
+# Monitor list named "speed brake, armed" and "autobrake" on every flight.
+# MED is stock level 4 on this aircraft (its annunciator script: LO 3, MED 4).
+# The seat belt switch is the aircraft's own, OFF 0 / AUTO 1 / ON 2
+# (A333.switches.lua; the stock dataref is rewritten from it every frame).
+# The crew has it ON from before start to ten thousand, AUTO in cruise (the
+# signs return with the flaps or gear by themselves), ON again below ten.
+seat_belt_signs:
+  position: laminar/A333/switches/fasten_seatbelts
+  on: 2
+  off: 1
+  up_command: laminar/A333/switches/seatbelt_signs_up
+  down_command: laminar/A333/switches/seatbelt_signs_dn
+# The circuit puts its pattern altitude on the FCU and the autopilot's own
+# capture holds the level legs (the VS law wandered 1,796 to 1,840 ft down the
+# EGPF downwind, 2026-09-21, behind a dial at 100). Stock dial and VS writes
+# work on this aircraft (header). VERIFY in the air: that the stock VS command
+# leaves ALT for the base leg's descent (blackbox `circuit` `leg`: `ap_level`
+# true on the downwind, false with `vs_on` true on base).
+ap_altitude_capture: true
+takeoff_config:
+  arm_spoilers: true
+  autobrake_rto: true
+  landing_autobrake_level: 4
 # Clean stall from the acf at a mid weight. 1.2 x this (210) is the floor any
 # handed-down target is raised to; the derived approach speed is max(1.3 Vso,
 # 1.2 Vs) so a clean floor never lands the aircraft fast on its own.
@@ -187,6 +295,23 @@ vlo_kts: 250.0
 # Tail clearance at rotation is about 12.5 degrees on the -300; the rotation
 # is bounded 2 degrees below. VERIFY.
 tail_strike_deg: 12.5
+
+# The landing laws the 737 learned on the same stock autopilot (LFLL and
+# EGCC, 2026-09-17/19), absent here until the profile review: without them
+# the final is flown down to idle, the throttle is CUT at the flare, and the
+# arrest leads the AP with a 172's gain and cap. A big turbofan spools slowly
+# and the stock AP's VS mode lags its dial by seconds; these are the 737's
+# numbers as the starting hypothesis for a heavier aircraft. VERIFY on the
+# first landing, from the `cmd_vs` / `vs_dial` / `vvi` columns.
+approach_thrust_min: 0.3
+flare_power:
+  reduction_per_second: 0.08
+  hold_sink_fpm: 400.0
+  lead_seconds: 1.0
+arrest_lead:
+  gain: 1.5
+  max_climb_fpm: 100.0
+  trend_seconds: 1.5
 # --- Jet/turboprop figures, added 2026-09-20 after the 737 shakedown. Every
 # law below defaults to a Cessna 172's number when a profile is silent, and on
 # BIKF-EGPH that flew an airliner on a 0.8 nm capture radius, a 700 fpm
@@ -203,12 +328,15 @@ taxi:
   turn_kts: 10.0
   sharp_kts: 6.0
 
-# Fuel-endurance alerting. 25,765 US gal (97,530 L) capacity; cruise burn
-# about 12,000 lb/hr (5,500 kg/hr) for the pair.
+# Fuel-endurance alerting. The SIM's tanks, not the real aircraft's: the acf
+# carries 240,712 lb (109,190 kg, the POM's 109,000) where the real -300
+# holds 97,530 L. The burn is the POM's "average 15,800 lb/h" for the pair
+# (7,170 kg/h); this said 5,500 until the profile review (2026-09-20), which
+# briefed every endurance 30% long.
 fuel:
   reserve_caution_min: 60.0
   reserve_warning_min: 30.0
-  cruise_burn_kg_hr: 5500.0
+  cruise_burn_kg_hr: 7170.0
   # Jet A-1, not the 100LL the shared default assumes: that briefed the
   # 737's fuel 11.8% light and in a unit no crew uses (2026-09-20).
   kg_per_gal: 3.04
@@ -238,9 +366,19 @@ reference:
   # figure reads a perfectly good climb-out as thirty knots slow and takes
   # the whole rate away (LFLL, 2026-09-17).
   initial_climb_kts: 173.0     # V2 153 + 20. VERIFY
+  # Where the climb-out stops holding that speed and starts accelerating and
+  # cleaning up. Below it the takeoff climbs as hard as `best_climb_fpm` to
+  # keep the speed, and the flaps stay put (EGPH 2026-09-21: 1,500 fpm at
+  # takeoff thrust was 240 kt through 1,000 ft, the flaps up by 740). VERIFY
+  # in the air: blackbox `autotakeoff` `climb`, `ias` near the hold to 1,000 ft.
+  acceleration_height_agl_ft: 1000.0
   best_climb_fpm: 2500.0       # initial climb, light; the climb law takes 80%
   cruise_ias_kts: 290.0        # KIAS the cruise governor holds (~M0.82 up high)
-  approach_kts: 145.0          # POM 140-160, CONF FULL / gear down
+  # POM 140-160 CONF FULL; the MCDU's own example is VLS 149 / VAPP 154.
+  # 145 sat under the 1.2 x Vso floor (150) and was raised, aloud, on every
+  # arm, and 150 is exactly the monitor's caution line; 154 is the box's own
+  # VAPP, inside the book and above both.
+  approach_kts: 154.0
   vs0_kts: 125.0               # acf: stall, landing configuration
   cruise_kts: 470.0            # M0.86 at altitude, KTAS
   max_gross_lb: 533519.0       # acf MTOW
@@ -248,8 +386,8 @@ reference:
   useful_load_lb: 248241.0     # MTOW - empty
   service_ceiling_ft: 41000.0  # POM
   max_crosswind_kts: 32.0      # demonstrated, dry. VERIFY
-  fuel_capacity_gal: 25765.0   # 97,530 L Jet A-1
-  endurance_hours: 14.0        # ~172,600 lb / 12,000 lb per hour, no reserve
+  fuel_capacity_gal: 35900.0   # acf 240,712 lb at 6.7 lb/gal Jet A-1
+  endurance_hours: 15.0        # 240,712 lb / 15,800 lb per hour, no reserve
   takeoff_distance_ft: 8200.0  # RECITED: POM field length at MTOW
   # GROUND ROLL at the card's mid weight, roughly 6,000 ft; the recited 8,200
   # is the factored MTOW field length.
@@ -263,11 +401,34 @@ reference:
 flaps:
   takeoff_ratio: 0.5
   detents:
-    - { label: "0",    spoken: up,    ratio: 0.0, retract_above_kts: 230.0 }
-    - { label: "1",    spoken: one,   ratio: 0.25, vfe_kts: 215.0, retract_above_kts: 200.0 } # acf Vfe1
+    # 210, not the 230 this carried: CONF 1's placard is 215, so a clean-up
+    # gated at 230 could never happen legally and never did (EGPH 2026-09-20,
+    # flap 1 carried to 330 kt). 210 is the clean floor (1.2 x 175).
+    - { label: "0",    spoken: up,    ratio: 0.0, retract_above_kts: 210.0 }
+    # 180 (about F speed at mid weights), under CONF 2's 196 placard; the 200
+    # this carried stepped the flaps four knots over it. VERIFY
+    - { label: "1",    spoken: one,   ratio: 0.25, vfe_kts: 215.0, retract_above_kts: 180.0 } # acf Vfe1
     - { label: "2",    spoken: two,   ratio: 0.5,  vfe_kts: 196.0 } # VERIFY
     - { label: "3",    spoken: three, ratio: 0.75, vfe_kts: 186.0 } # VERIFY
     - { label: full,   spoken: full,  ratio: 1.0,  vfe_kts: 180.0 } # acf Vfe
+
+# The normal checklist (checklists/airbus_a330_300.txt, 2026-09-20, from the
+# POM's own lists and the aircraft's switch positions). Section titles are the
+# phase keys, so the tracker's climb / cruise / descent / before landing /
+# after landing lists resolve without an override; until this file existed
+# the tracker logged `no_section` at every phase (EGPH, 2026-09-20).
+checklist: checklists/airbus_a330_300.txt
+checklist_map:
+  - { match: parking_brake_ratio,        action: parking_brake }
+  - { match: flap_ratio,                 action: flaps }
+  - { match: throttle_ratio,             action: throttle }
+  - { match: "landing_lights_switch[1]", action: !light taxi }
+  - { match: "landing_lights_switch[0]", action: !light landing }
+  - { match: strobe_pos,                 action: !light strobe }
+  - { match: beacon_on,                  action: !light beacon }
+  - { match: navigation_lights,          action: !light nav }
+  - { match: buttons/gen1_pos,           action: !electrical generators }
+  - { match: buttons/battery1_pos,       action: !electrical battery }
 
 advisor:
   # THE ADIRS, watched and FIXED. The start sequence sets them from cold, but
@@ -324,6 +485,15 @@ advisor:
     phases: [takeoff, approach, landing]
     say: Landing lights on.
     command: sim/lights/landing_lights_on
+  # The sign switch is OFF / AUTO / ON on the aircraft's own dataref; the
+  # stock one is derived every frame, so it is the honest read and the
+  # laminar command is the hand. One press up: OFF to AUTO (belts on with
+  # flaps out or gear down), a second AUTO to ON.
+  # The CREW works the switch now (`seat_belt_signs` above: on before start,
+  # AUTO through ten thousand, on again below). This row is the pilot-flying
+  # net for the takeoff and the landing only: in the climb AUTO legitimately
+  # reads dark, and pressing "up" at it there fought the crew's own AUTO.
   - dataref: sim/cockpit2/switches/fasten_seat_belts
-    phases: [takeoff, climb, approach, landing]
-    say: Seat belt signs are off.
+    phases: [takeoff, approach, landing]
+    say: Seat belt signs are off. Switching them on.
+    command: laminar/A333/switches/seatbelt_signs_up

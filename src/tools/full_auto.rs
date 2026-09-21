@@ -276,9 +276,11 @@ impl Tool for FullAuto {
         } else {
             (
                 Mission::Circuit { right: a.right },
-                "Full auto. I'll power up, start the engine, get our taxi, line us up, \
-                 and fly the circuit. Say cancel or my controls any time."
-                    .to_string(),
+                format!(
+                    "Full auto. I'll power up, start the {}, get our taxi, line us up, \
+                     and fly the circuit. Say cancel or my controls any time.",
+                    if self.engines > 1 { "engines" } else { "engine" }
+                ),
             )
         };
 
@@ -334,6 +336,7 @@ impl Tool for FullAuto {
             line_up: crate::tools::taxi::LineUp {
                 park_brake_valve_set: self.park_brake_valve_set,
                 takeoff_roll_m: self.takeoff_roll_m,
+                mtow_kg: self.mtow_kg,
                 prop: self.prop.clone(),
                 pace: self.pace,
             },
@@ -351,6 +354,7 @@ impl Tool for FullAuto {
                 takeoff_flap_ratio: self.takeoff_flap_ratio,
                 flap_schedule: self.flap_schedule.clone(),
                 takeoff_roll_m: self.takeoff_roll_m,
+                mtow_kg: self.mtow_kg,
                 approach_ias: self.approach_ias,
                 prop: self.prop.clone(),
                 climb_floor_kts: self.climb_floor_kts,
@@ -358,6 +362,8 @@ impl Tool for FullAuto {
             },
             takeoff: crate::tools::takeoff::AutoTakeoff {
                 mtow_kg: self.mtow_kg,
+                // An orchestrator takes this handoff; the field is unused.
+                cruise_ias_kts: None,
                 // The Flight mission arms the takeoff through this copy, and
                 // the orchestrator takes the climb from the handoff — the
                 // pilot must not be told "your aircraft" there.
@@ -726,6 +732,18 @@ impl FullAuto {
             }),
         );
         let preflight = preflight?;
+
+        // The flight's own transition altitude and level, ahead of the
+        // airframe's default, for every altimeter rule from here on (the
+        // departure set, the follower, the monitor's check). Cleared with
+        // the mission (`full_auto::abort` / stand-down).
+        crate::tools::instruments::publish_flight_transition(Some(
+            crate::tools::instruments::FlightTransition {
+                altitude_ft: fp.transition_altitude_ft,
+                level_ft: fp.transition_level_ft,
+                descending: false,
+            },
+        ));
 
         // The GPS route payload — written by the orchestrator (only the
         // concrete client can set a byte-array dataref).

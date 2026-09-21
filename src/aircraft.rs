@@ -164,6 +164,10 @@ pub struct AircraftProfile {
     /// Piston engine controls (throttle, mixture).
     #[serde(default)]
     pub engine: bool,
+    /// Move the gear lever with the stock gear COMMANDS, not a handle write
+    /// (see `tools::gear::Gear::by_command`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gear_by_command: bool,
     /// Thrust levers (`set_throttle`) without the piston controls — for turbine
     /// aircraft that have a throttle but no mixture/magnetos/piston start. A piston
     /// `engine` already implies a throttle, so it's only set for jets/turboprops.
@@ -242,6 +246,21 @@ pub struct AircraftProfile {
     /// [`TransponderModeKnob`]). `None` = the stock actuator, the universal case.
     #[serde(default)]
     pub transponder_mode_knob: Option<TransponderModeKnob>,
+    /// What this airframe's crew sets before the roll and at the gear beyond
+    /// flaps, trim and the altitude selector (see [`crate::takeoff_config`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeoff_config: Option<TakeoffConfigProfile>,
+    /// The seat belt sign switch, where it is the add-on's own (see
+    /// [`crate::tools::signs`]). `None` with `cabin_crew` is the stock switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_belt_signs: Option<SeatBeltSigns>,
+    /// The circuit selects its pattern altitude on the altitude dial and lets
+    /// the autopilot's capture hold the level legs, instead of flying altitude
+    /// through the VS dial (`circuit::ap_holds_level`). Per airframe because
+    /// it rests on the stock VS command taking the aircraft OUT of an altitude
+    /// hold, which is still unproven on the 737's MCP (history, 2026-09-19).
+    #[serde(default)]
+    pub ap_altitude_capture: bool,
     /// ILS approach setup (`prepare_ils`) — needs a NAV radio + approach mode.
     #[serde(default)]
     pub ils: bool,
@@ -808,6 +827,12 @@ pub struct StartStep {
     /// NAV", a knob left in ATT walks the wrong way.
     #[serde(default)]
     pub down_command: Option<String>,
+    /// A milestone SPOKEN once this step has confirmed ("Fuel pumps on, eight
+    /// of eight."). Most steps carry none: a crew's flow is silent, and the
+    /// voice says the state of the aircraft, not the name of every switch.
+    /// Every step is still blackboxed and shown on the panel transcript.
+    #[serde(default)]
+    pub say: Option<String>,
 }
 
 /// The airliner start: bleed air up, ENG MODE to IGN/START, each master
@@ -839,6 +864,11 @@ pub struct AirlinerStartProfile {
     pub guard_lift: f64,
     #[serde(default = "guard_secs_default")]
     pub guard_secs: f64,
+    /// The order the engines are started in, as ENGINE INDICES (0 = number
+    /// one). Empty = 0, 1, 2... The A330's POM starts number two first, the
+    /// way Airbus crews do; the MD-82's and the 737's start number one.
+    #[serde(default)]
+    pub start_order: Vec<usize>,
     /// Bringing the APU up: an ORDERED list of switch presses, because that
     /// is what the aircraft has. Batteries, APU battery, APU master, APU
     /// START, bleed.
@@ -1130,6 +1160,13 @@ pub struct ReferenceProfile {
     /// unchanged.
     #[serde(default)]
     pub initial_climb_kts: Option<f64>,
+    /// Height AGL where the climb-out stops holding `initial_climb_kts` and
+    /// starts accelerating and cleaning up. A jet's declaration: below it the
+    /// takeoff climbs as hard as it must (to `best_climb_fpm`) to keep the
+    /// speed, and the flaps stay where the takeoff set them. `None` keeps the
+    /// trainer's climb-out (see `autotakeoff::ClimbOut`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceleration_height_agl_ft: Option<f64>,
     #[serde(default)]
     pub vr_kts: Option<f64>, // rotate
     /// Blue line: single-engine best rate of climb. A TWIN's number — the one
@@ -1422,6 +1459,72 @@ pub struct TransponderModeKnob {
     pub standby: i64,
     pub on: i64,
     pub altitude: i64,
+    /// Commands that turn the knob one position up / down, for a knob whose
+    /// dataref is READ-ONLY. The A330's `auto_on_knob_pos` is: probed live it
+    /// reports `is_writable: false`, so every mode write on that airframe was
+    /// a silent no-op and the flight went out in standby to "negative radar
+    /// contact, recycle transponder" (EGPH, 2026-09-20). With both declared
+    /// the knob is STEPPED, read before each step, and the dataref is only
+    /// ever read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub down_command: Option<String>,
+    /// Other knobs the box needs before ON or ALTITUDE transmits anything.
+    /// The A330 has three: with the mode knob in AUTO and the TCAS knob left
+    /// in STBY its script writes stock mode 1, so the takeoff blackboxed
+    /// `transponder_alt ok: true` from the one knob it looked at and the
+    /// flight squawked standby round Glasgow's zone (2026-09-21). Turned
+    /// after the mode knob, never for OFF or STANDBY, and the answer is then
+    /// the STOCK mode, which the add-on computes from all of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<CompanionKnob>,
+}
+
+/// An add-on's own seat belt sign switch: a read-only position stepped by
+/// its commands. `off` is where the crew leaves it in cruise (AUTO on an
+/// Airbus: the signs come back with the flaps or the gear by themselves).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeatBeltSigns {
+    pub position: String,
+    pub on: i64,
+    pub off: i64,
+    pub up_command: String,
+    pub down_command: String,
+}
+
+/// The configuration items an airliner's crew owns and a trainer has not got.
+/// Stock datarefs on purpose (`speedbrake_ratio`, `auto_brake_level`): the
+/// profile declares THAT the airframe has them, never a name.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TakeoffConfigProfile {
+    /// Ground spoilers armed for landing, and for takeoff unless
+    /// `takeoff_speedbrake_down`. Also declares the speedbrake lever itself.
+    #[serde(default)]
+    pub arm_spoilers: bool,
+    /// Boeing practice: the lever sits in the DOWN detent for takeoff (armed
+    /// is a takeoff configuration warning on the 737, and its own Before
+    /// Takeoff list says so); a reject raises it by hand. Armed only at the
+    /// gear. An Airbus leaves this false and arms for the roll.
+    #[serde(default)]
+    pub takeoff_speedbrake_down: bool,
+    /// Autobrake to RTO / MAX before the roll (stock level 0).
+    #[serde(default)]
+    pub autobrake_rto: bool,
+    /// The stock `auto_brake_level` autoland selects at the gear. The A330's
+    /// script lights LO at 3 and MED at 4. `None` leaves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_autobrake_level: Option<i64>,
+}
+
+/// One more knob a transponder needs set (see [`TransponderModeKnob::also`]):
+/// read-only, stepped by its commands to `want`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompanionKnob {
+    pub dataref: String,
+    pub want: i64,
+    pub up_command: String,
+    pub down_command: String,
 }
 
 /// Custom on/off commands for the electric boost pumps, for airframes where the
@@ -1576,6 +1679,31 @@ pub fn speed_floor_kts() -> Option<f64> {
     *SPEED_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The highest speed the flight governor may be asked to hold, from the
+/// airframe's Vne/Vmo. `None` = the profile declares no Vne.
+///
+/// The governor's sanity cap was a flat 250 kt, which is a GA number: the
+/// A330's cruise governor was armed at its profile's 290 and held 250 with
+/// nothing said, and a spoken "hold two eighty" in any jet was quietly 250
+/// (found on the profile review, 2026-09-20). The cap is now the airframe's
+/// own, `SPEED_CEILING_MARGIN_KTS` under Vne, republished per swap like the
+/// floor. Below 10,000 ft the 250 kt rule still applies on top of it
+/// (`speedhold::BELOW_10K_LIMIT_KTS`); that is airspace, not airframe.
+static SPEED_CEILING_KTS: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+pub const SPEED_CEILING_MARGIN_KTS: f64 = 15.0;
+
+/// Publish the airframe's speed ceiling from its Vne. Called on EVERY profile swap.
+pub fn publish_speed_ceiling(vne_kts: Option<f64>) {
+    *SPEED_CEILING_KTS.lock().unwrap_or_else(|e| e.into_inner()) = vne_kts
+        .filter(|v| *v > 0.0)
+        .map(|v| (v - SPEED_CEILING_MARGIN_KTS).round());
+}
+
+/// The live airframe's speed ceiling, kts, if its profile declares a Vne.
+pub fn speed_ceiling_kts() -> Option<f64> {
+    *SPEED_CEILING_KTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The ground roll to check a runway against, scaled by ACTUAL weight.
 ///
 /// `roll_at_mtow_m` is the profile's figure, which is a MAX-TAKEOFF-WEIGHT
@@ -1606,6 +1734,59 @@ pub fn takeoff_roll_m(roll_at_mtow_m: f64, weight_kg: Option<f64>, mtow_kg: Opti
     // Never LESS demanding than half, and never less demanding than the
     // profile figure would be above max weight.
     roll_at_mtow_m * (w / mtow).clamp(0.5, 1.0)
+}
+
+/// The ground roll a profile checks runways against, metres, and the weight
+/// it is quoted at, kg. Prefer the declared GROUND ROLL; the recited takeoff
+/// distance is the fallback the GA profiles have always used (on an airliner
+/// that figure is a factored field length, see
+/// `ReferenceProfile::takeoff_roll_ft`). One derivation for the tool registry
+/// and the spoken "do we have enough runway".
+pub fn profile_takeoff_roll(profile: &AircraftProfile) -> (Option<f64>, Option<f64>) {
+    let r = profile.reference.as_ref();
+    (
+        r.and_then(|r| r.takeoff_roll_ft.or(r.takeoff_distance_ft))
+            .map(|f| f * 0.3048),
+        r.and_then(|r| r.max_gross_lb).map(|lb| lb * 0.453_592),
+    )
+}
+
+/// Pavement the takeoff needs, metres: the weight-scaled ground roll with a
+/// 1.4 factor (the book figure is a test pilot's on a dry day), never under
+/// `floor_m`. No roll on file = the floor.
+///
+/// ONE rule for the line-up's full-length check, full auto's "are we lined
+/// up" fit, the circuit's and the takeoff's runway fit and the arm-time field
+/// check. It was five copies, and the weight scaling reached one of them: the
+/// spoken takeoff accepted Edinburgh 24 while full auto, asking the same
+/// question of the same aircraft on the same centreline, gave up with "I
+/// couldn't get us onto the runway" (2026-09-20, the tower logging
+/// `lined_up=true` throughout).
+pub fn takeoff_needed_m(
+    roll_at_mtow_m: Option<f64>,
+    weight_kg: Option<f64>,
+    mtow_kg: Option<f64>,
+    floor_m: f64,
+) -> f64 {
+    roll_at_mtow_m.map_or(floor_m, |m| {
+        (takeoff_roll_m(m, weight_kg, mtow_kg) * 1.4).max(floor_m)
+    })
+}
+
+/// [`takeoff_needed_m`] at what the aircraft weighs NOW. A failed weight read
+/// keeps the max-weight figure, which is the conservative end.
+pub async fn takeoff_needed_now_m(
+    xp: &dyn sim::xplane::XPlane,
+    roll_at_mtow_m: Option<f64>,
+    mtow_kg: Option<f64>,
+    floor_m: f64,
+) -> f64 {
+    let weight_now = xp
+        .get_float(sim::datarefs::TOTAL_WEIGHT_KG)
+        .await
+        .ok()
+        .filter(|w| w.is_finite() && *w > 0.0);
+    takeoff_needed_m(roll_at_mtow_m, weight_now, mtow_kg, floor_m)
 }
 
 /// The altitude this airframe cruises best at, at `weight_kg`.
@@ -2260,6 +2441,31 @@ mod tests {
                 "ALT_MAX_EXTRA_DESCENT_FPM",
                 "DEBT: 500 extra is little for a jet",
             ),
+            (
+                "autoland",
+                "FLAP_EXTEND_MARGIN_KTS",
+                "MARGIN: under the airframe's own per-detent Vfe",
+            ),
+            (
+                "autoland",
+                "FLAP_RETRACT_MARGIN_KTS",
+                "MARGIN: over the airframe's own per-detent Vfe",
+            ),
+            (
+                "procedure",
+                "DRAG_OUT_KTS",
+                "MARGIN: over the governor's own target",
+            ),
+            (
+                "procedure",
+                "DRAG_IN_KTS",
+                "MARGIN: over the governor's own target",
+            ),
+            (
+                "procedure",
+                "DRAG_MIN_DESCENT_FPM",
+                "a gate on the COMMANDED rate, which is already the airframe's descent_fpm",
+            ),
         ];
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -2521,6 +2727,64 @@ mod tests {
         assert_eq!(takeoff_roll_m(roll, Some(f64::NAN), Some(mtow)), roll);
     }
 
+    /// A retraction schedule has to be FLYABLE: the speed that lets a detent
+    /// be selected must sit under the placard of the detent being left. The
+    /// A330 cleaned up "above 230" out of a CONF 1 whose Vfe is 215, so the
+    /// clean-up could never legally happen and never did: flap 1 rode the
+    /// climb to 330 kt (EGPH, 2026-09-20).
+    #[test]
+    fn every_profiles_flap_schedule_can_be_flown_inside_its_placards() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles");
+        let mut checked = 0;
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let Ok(profile) = serde_yaml::from_str::<AircraftProfile>(&text) else {
+                continue;
+            };
+            let Some(flaps) = &profile.flaps else { continue };
+            let mut detents = flaps.detents.clone();
+            detents.sort_by(|a, b| a.ratio.total_cmp(&b.ratio));
+            for pair in detents.windows(2) {
+                let (cleaner, dirtier) = (&pair[0], &pair[1]);
+                if let (Some(gate), Some(vfe)) = (cleaner.retract_above_kts, dirtier.vfe_kts) {
+                    checked += 1;
+                    assert!(
+                        gate < vfe,
+                        "{}: retracting to {} waits for {gate} kt, past the {vfe} kt placard of {}",
+                        path.display(),
+                        cleaner.label,
+                        dirtier.label
+                    );
+                }
+            }
+        }
+        assert!(checked > 0, "no schedule was checked");
+    }
+
+    /// The pavement rule is ONE function. Full auto kept its own copy without
+    /// the weight scaling and said "I couldn't get us onto the runway" to an
+    /// A330 on Edinburgh 24's centreline, which the spoken takeoff accepted
+    /// (2026-09-20, about 200 t on the wheels).
+    #[test]
+    fn one_pavement_rule_and_edinburgh_fits_it_at_the_weight_flown() {
+        let mtow = 533_519.0 * 0.453_592;
+        let roll = Some(6000.0 * 0.3048);
+        // As flown: fits the 2,549 m strip, and the 2,338 m left from the
+        // displaced threshold the lead-on joins at.
+        let flown = takeoff_needed_m(roll, Some(200_000.0), Some(mtow), 500.0);
+        assert!(flown < 2338.0, "{flown:.0}");
+        // At max weight, or with the weight unread, the old refusal stands.
+        assert!(takeoff_needed_m(roll, Some(mtow), Some(mtow), 500.0) > 2549.0);
+        assert!(takeoff_needed_m(roll, None, Some(mtow), 500.0) > 2549.0);
+        // No roll on file is the caller's floor; a tiny roll never goes under it.
+        assert_eq!(takeoff_needed_m(None, Some(1000.0), Some(1100.0), 400.0), 400.0);
+        assert_eq!(takeoff_needed_m(Some(100.0), None, None, 500.0), 500.0);
+    }
+
     /// EVERY jet and turboprop declares the numbers the laws would otherwise
     /// take from a Cessna 172, and they PARSE.
     ///
@@ -2535,6 +2799,7 @@ mod tests {
         const TURBINES: &[&str] = &[
             "boeing_737_800",
             "airbus_a330_300",
+            "boeing_747_400",
             "md82",
             "citation_x",
             "cirrus_vision_sf50",
@@ -3346,6 +3611,7 @@ fn cessna_172sp() -> AircraftProfile {
         // A piston has no ENG MODE knob and no master switches.
         airliner_start: None,
         retractable_gear: false,
+        gear_by_command: false,
         rotorcraft: false,
         transition_altitude_ft: 18_000.0,
         view_blend: 1.0,
@@ -3369,6 +3635,9 @@ fn cessna_172sp() -> AircraftProfile {
         transponder: true,
         // Stock actuator: both builtins model a sim-native transponder.
         transponder_mode_knob: None,
+        takeoff_config: None,
+        seat_belt_signs: None,
+        ap_altitude_capture: false,
         ils: true,
         parking_brake: true,
         cabin_crew: false,
@@ -3503,6 +3772,7 @@ fn cessna_172sp() -> AircraftProfile {
             vy_kts: Some(74.0),
             // A trainer climbs out at Vy; only airframes that do not say so.
             initial_climb_kts: None,
+            acceleration_height_agl_ft: None,
             vyse_kts: None,
             vmca_kts: None,
             vr_kts: Some(55.0),
@@ -3650,6 +3920,7 @@ fn cirrus_sr22() -> AircraftProfile {
         // A piston has no ENG MODE knob and no master switches.
         airliner_start: None,
         retractable_gear: false,
+        gear_by_command: false,
         rotorcraft: false,
         transition_altitude_ft: 18_000.0,
         view_blend: 1.0,
@@ -3665,6 +3936,9 @@ fn cirrus_sr22() -> AircraftProfile {
         transponder: true,
         // Stock actuator: both builtins model a sim-native transponder.
         transponder_mode_knob: None,
+        takeoff_config: None,
+        seat_belt_signs: None,
+        ap_altitude_capture: false,
         ils: true,
         parking_brake: true,
         cabin_crew: false,
@@ -3858,6 +4132,7 @@ fn cirrus_sr22() -> AircraftProfile {
             vx_kts: Some(88.0),
             vy_kts: Some(101.0),
             initial_climb_kts: None,
+            acceleration_height_agl_ft: None,
             vyse_kts: None,
             vmca_kts: None,
             vr_kts: Some(73.0),

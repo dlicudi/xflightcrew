@@ -152,6 +152,11 @@ pub struct Ctx {
     /// emergency gets the trucks, not a landing clearance; seen live
     /// 2026-07-09: mayday from the stand was "cleared to land").
     pub on_ground: bool,
+    /// The aircraft is standing ON the strip in use: the sim put it there (a
+    /// runway start), nobody taxied it. A "ready for departure" from there is
+    /// a lined-up aircraft asking for its clearance, not a stand asking to
+    /// skip the taxi.
+    pub own_on_runway: bool,
 }
 
 /// Spoken position of traffic on final: "short final" inside 1.5 nm, else
@@ -552,6 +557,28 @@ pub fn is_readback(transcript: &str) -> bool {
     .iter()
     .any(|w| word(w))
         || t.contains("line up")
+        || frequency_readback(&t)
+}
+
+/// A frequency change read back: the facility and the digits, nothing else
+/// ("Edinburgh Departure on one two four decimal eight two five"). It carries
+/// none of the readback verbs, so the crew's own handoff readback earned
+/// "Edinburgh Tower, say again" on every departure (EGPH, 2026-09-21).
+fn frequency_readback(t: &str) -> bool {
+    let word = |w: &str| t.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == w);
+    (word("decimal") || word("point"))
+        && [
+            "tower",
+            "ground",
+            "departure",
+            "approach",
+            "radar",
+            "control",
+            "director",
+            "information",
+        ]
+        .iter()
+        .any(|w| word(w))
 }
 
 /// The runway-critical instructions whose readback is MANDATORY (ICAO Doc
@@ -683,6 +710,18 @@ fn lower_tokens(t: &str) -> Vec<String> {
 fn canon_runway(t: &str) -> Option<String> {
     let toks = lower_tokens(t);
     (0..toks.len()).find_map(|i| designator_at(&toks[i..]))
+}
+
+/// The runway an ARRIVAL names for itself ("final runway two six", "inbound
+/// runway zero eight"), canonical, for the station's runway pick.
+pub fn stated_runway(transcript: &str) -> Option<String> {
+    runway_after_keyword(transcript)
+}
+
+/// [`canon_runway`] for the station: does this strip ident match a canonical
+/// designator a transmission named?
+pub fn runway_matches(ident: &str, canon: &str) -> bool {
+    canon_runway(ident).as_deref() == Some(canon)
 }
 
 /// The designator a TRANSMISSION names — only after the word "runway", so a
@@ -1159,6 +1198,18 @@ impl Tower {
                     );
                     line
                 }
+                // Standing on the strip with no taxi behind it: a runway
+                // start. The sim's own spawn point answered "taxi to holding
+                // point Alpha first", full auto therefore never called at
+                // all, and the A330 flew Glasgow's zone to "you are inside
+                // controlled airspace without clearance" (2026-09-21). It is
+                // a lined-up aircraft; every gate a lined-up aircraft meets
+                // (traffic, wake, an occupied strip) is met by asking again
+                // from LinedUp.
+                _ if ctx.own_on_runway && ctx.on_ground => {
+                    self.state = State::LinedUp;
+                    return self.handle(Intent::RequestTakeoff, ctx);
+                }
                 // A takeoff request from anywhere else gets the taxi first —
                 // the tower never clears a takeoff from a parking stand.
                 _ => {
@@ -1319,6 +1370,26 @@ impl Default for Tower {
     }
 }
 
+/// ICAO wake turbulence: HEAVY is a maximum takeoff mass of 136,000 kg or
+/// more. The A330-300 (242 t) is one; the 737-800 (79 t) is a MEDIUM.
+pub const HEAVY_MTOW_KG: f64 = 136_000.0;
+
+/// The callsign with its wake suffix, the way a heavy identifies on every
+/// initial call and the tower addresses it: "... Kilo November heavy". An
+/// A330 was worked at Edinburgh as plain "Delta Alpha India Kilo November"
+/// and the tower's wake clock knew nothing about it (2026-09-20). Unknown or
+/// unreadable mass = no suffix, never a guess.
+pub fn spoken_callsign_wake(tail: &str, mtow_kg: Option<f64>) -> String {
+    let base = spoken_callsign(tail);
+    if base.is_empty() {
+        return base;
+    }
+    match mtow_kg {
+        Some(m) if m.is_finite() && m >= HEAVY_MTOW_KG => format!("{base} heavy"),
+        _ => base,
+    }
+}
+
 /// A tail number spoken ICAO-style: letters as NATO words, digits read out.
 /// "N172SP" -> "November one seven two Sierra Papa".
 pub fn spoken_callsign(tail: &str) -> String {
@@ -1352,6 +1423,7 @@ mod tests {
             final_traffic_callsign: None,
             final_traffic_count: 0,
             runway_occupied: false,
+            own_on_runway: false,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
@@ -1847,6 +1919,35 @@ mod tests {
         let mut twr = Tower::new();
         let r = twr.handle(parse_intent("what about my transponder code?"), &ctx());
         assert!(r.contains("squawk seven zero zero zero"), "{r}");
+    }
+
+    /// EGPF, 2026-09-21: the sim starts the aircraft ON the runway, so the
+    /// FSM is still Parked. "Ready for departure" from there is a lined-up
+    /// aircraft, cleared like one and held like one; from a stand it is still
+    /// "taxi first", and airborne the flag means nothing.
+    #[test]
+    fn a_runway_start_is_a_lined_up_aircraft() {
+        let mut on_strip = ctx();
+        on_strip.own_on_runway = true;
+        on_strip.on_ground = true;
+        let mut twr = Tower::new();
+        let r = twr.handle(Intent::RequestTakeoff, &on_strip);
+        assert!(r.contains("cleared for takeoff"), "{r}");
+        assert_eq!(twr.state, State::TakeoffCleared);
+
+        // Traffic on final holds it, exactly as it holds a taxied departure.
+        let mut held = busy(1.8);
+        held.own_on_runway = true;
+        held.on_ground = true;
+        let mut twr = Tower::new();
+        let r = twr.handle(Intent::RequestTakeoff, &held);
+        assert!(r.contains("hold position"), "{r}");
+        assert_eq!(twr.state, State::LinedUp);
+
+        // A stand is still a stand.
+        let mut twr = Tower::new();
+        let r = twr.handle(Intent::RequestTakeoff, &ctx());
+        assert!(r.contains("first"), "{r}");
     }
 
     #[test]
@@ -2353,6 +2454,26 @@ mod tests {
         );
         assert_eq!(spoken_callsign("G-ABCD"), "Golf Alpha Bravo Charlie Delta");
         assert_eq!(spoken_callsign(""), "");
+    }
+
+    #[test]
+    fn a_heavy_says_so_and_a_medium_does_not() {
+        assert_eq!(
+            spoken_callsign_wake("D-AIKN", Some(242_000.0)),
+            "Delta Alpha India Kilo November heavy",
+            "the A330 is a heavy"
+        );
+        assert_eq!(
+            spoken_callsign_wake("G-ABCD", Some(79_000.0)),
+            "Golf Alpha Bravo Charlie Delta",
+            "the 737 is a medium"
+        );
+        assert_eq!(
+            spoken_callsign_wake("N172SP", None),
+            "November one seven two Sierra Papa",
+            "unknown mass is no suffix"
+        );
+        assert_eq!(spoken_callsign_wake("", Some(300_000.0)), "");
     }
 
     #[test]

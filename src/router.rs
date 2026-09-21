@@ -224,6 +224,13 @@ pub(crate) fn unregistered_tool_line(profile: &aircraft::AircraftProfile, tool: 
     if profile.rotorcraft && tools::ROTORCRAFT_WITHHELD.contains(&tool) {
         "Not on a helicopter. Every law I have for that is fixed-wing, so it isn't offered on this airframe."
             .to_string()
+    } else if !profile.autopilot && tools::ROTORCRAFT_WITHHELD.contains(&tool) {
+        // The 747-400: its scripts own the autopilot, so nothing that flies
+        // through the stock dials registers. "Let's do a circuit" got the
+        // generic line and the pilot loaded another aircraft to find out why
+        // (EGPF, 2026-09-21).
+        "Not on this airframe. I can't reach its autopilot yet, so the automations aren't offered here."
+            .to_string()
     } else {
         "That command isn't wired up yet.".to_string()
     }
@@ -857,8 +864,16 @@ mod unregistered_tool_tests {
         );
         let mut fixed = heli.clone();
         fixed.rotorcraft = false;
+        fixed.autopilot = true;
         assert_eq!(
             unregistered_tool_line(&fixed, "circuit"),
+            "That command isn't wired up yet."
+        );
+        // An airframe whose autopilot we cannot drive says that instead.
+        fixed.autopilot = false;
+        assert!(unregistered_tool_line(&fixed, "full_auto").starts_with("Not on this airframe"));
+        assert_eq!(
+            unregistered_tool_line(&fixed, "no_such_tool"),
             "That command isn't wired up yet."
         );
     }

@@ -37,6 +37,9 @@ pub struct AutoTakeoff {
     /// Max takeoff weight, kg — the weight `takeoff_roll_m` is quoted AT, so
     /// the roll can be scaled to what the aircraft actually weighs today.
     pub mtow_kg: Option<f64>,
+    /// The profile's cruise IAS: what the governor holds after a PILOT
+    /// handoff. `None` leaves the throttle where the climb left it.
+    pub cruise_ias_kts: Option<f64>,
     /// Constant-speed prop levers, advanced to full-forward before the roll.
     /// A feathered turboprop makes no thrust at any power (`None` on pistons).
     pub prop: Option<PropProfile>,
@@ -166,15 +169,15 @@ impl Tool for AutoTakeoff {
                 );
             }
         }
-        // What the aircraft weighs NOW: the roll figure in the profile is
-        // quoted at max takeoff weight. A failed read falls back to that
-        // figure, which is the conservative end.
-        let weight_now = ctx
-            .xplane
-            .get_float(sim::datarefs::TOTAL_WEIGHT_KG)
-            .await
-            .ok()
-            .filter(|w| w.is_finite() && *w > 0.0);
+        // The roll figure in the profile is quoted at max takeoff weight;
+        // the seam scales it to what the aircraft weighs NOW.
+        let needed_m = crate::aircraft::takeoff_needed_now_m(
+            ctx.xplane,
+            self.takeoff_roll_m,
+            self.mtow_kg,
+            500.0,
+        )
+        .await;
         if !crate::autotaxi::steer_channel_ok(ctx.xplane).await {
             return Ok(
                 "I can't steer. The XVoiceLayer plugin needs updating, so this takeoff is yours."
@@ -205,6 +208,8 @@ impl Tool for AutoTakeoff {
                 // Registry copy: the pilot asked, the pilot gets the
                 // aircraft. Full auto's copy sets true — see the field doc.
                 handoff_to_caller: self.handoff_to_caller,
+                handoff_speed_kts: self.cruise_ias_kts,
+                base_url: ctx.config.xplane_base_url.clone(),
                 park_brake_valve_set: self.park_brake_valve_set,
                 tail_strike_deg: self.tail_strike_deg,
                 pitch_authority_down: self.pitch_authority_down,
@@ -222,9 +227,8 @@ impl Tool for AutoTakeoff {
                 // The roll is a MAX-WEIGHT figure; scale it to today's. An
                 // A330 on a light sector was refused a 2,549 m runway by
                 // eleven metres, from every position on it (2026-09-20).
-                needed_m: self.takeoff_roll_m.map_or(500.0, |m| {
-                    crate::aircraft::takeoff_roll_m(m, weight_now, self.mtow_kg) * 1.4
-                }),
+                needed_m,
+                level_ft: None,
                 handoff_agl_ft: autotakeoff::DEFAULT_HANDOFF_AGL_FT,
             },
             ctx.xplane.cancellation(),

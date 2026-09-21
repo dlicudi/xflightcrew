@@ -302,6 +302,10 @@ impl XpdrMode {
             XpdrMode::Altitude => 3,
         }
     }
+    /// ON and ALTITUDE reply to radar; OFF and STANDBY do not.
+    fn transmits(self) -> bool {
+        matches!(self, XpdrMode::On | XpdrMode::Altitude)
+    }
     fn spoken(self) -> &'static str {
         match self {
             XpdrMode::Off => "off",
@@ -369,10 +373,73 @@ pub async fn set_mode(xp: &dyn crate::xplane::XPlane, mode: XpdrMode) -> bool {
                 .is_ok_and(|v| v.round() as i64 == mode.stock());
     };
     let want = mode.knob(&k);
-    if xp.set_int(&k.dataref, want).await.is_err() {
-        return false;
+    let knob_ok = if let (Some(up), Some(down)) = (&k.up_command, &k.down_command) {
+        step_knob(xp, &k.dataref, want, up, down).await
+    } else if xp.set_int(&k.dataref, want).await.is_err() {
+        false
+    } else {
+        xp.get_float(&k.dataref)
+            .await
+            .is_ok_and(|v| v.round() as i64 == want)
+    };
+    if !knob_ok || k.also.is_empty() || !mode.transmits() {
+        return knob_ok;
     }
-    xp.get_float(&k.dataref)
+    // The box has more knobs than the one that names the mode. Turn each,
+    // then believe the STOCK mode: here it is the add-on's own verdict over
+    // all of them, and a knob that reads right on a box in standby is the
+    // readback that confirms the half it looked at.
+    for c in &k.also {
+        if !step_knob(xp, &c.dataref, c.want, &c.up_command, &c.down_command).await {
+            return false;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    xp.get_float(XPDR_MODE)
+        .await
+        .is_ok_and(|v| stock_transmits(v.round() as i64))
+}
+
+/// Whether a stock `transponder_mode` is a box that replies: 2 ON, 3 ALT, 5
+/// ground mode S, 6 TA, 7 TA/RA. 0 off, 1 standby and 4 test are not.
+pub fn stock_transmits(mode: i64) -> bool {
+    matches!(mode, 2 | 3 | 5 | 6 | 7)
+}
+
+/// The most a stepped knob is turned for one request. No selector here has
+/// more positions than this, and a knob that ignores its commands must not
+/// be hammered.
+const KNOB_MAX_STEPS: usize = 6;
+
+/// Which way a stepped knob turns next: `Some(true)` up, `Some(false)` down,
+/// `None` when it already reads what was asked.
+pub fn knob_step_up(at: i64, want: i64) -> Option<bool> {
+    (at != want).then_some(at < want)
+}
+
+/// Turn a READ-ONLY knob by its commands: read, step once toward `want`, let
+/// the add-on move it, read again. A failed read ends it (no measurement, no
+/// step); the answer is what the knob READS at the end, never the intent.
+pub(crate) async fn step_knob(
+    xp: &dyn crate::xplane::XPlane,
+    dataref: &str,
+    want: i64,
+    up: &str,
+    down: &str,
+) -> bool {
+    for _ in 0..KNOB_MAX_STEPS {
+        let Ok(at) = xp.get_float(dataref).await else {
+            return false;
+        };
+        let Some(go_up) = knob_step_up(at.round() as i64, want) else {
+            return true;
+        };
+        if xp.run_command(if go_up { up } else { down }).await.is_err() {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    xp.get_float(dataref)
         .await
         .is_ok_and(|v| v.round() as i64 == want)
 }
@@ -476,6 +543,96 @@ mod tests {
         let stuck = FakeXPlane::with_reads(&[(knob.dataref.as_str(), 1.0)]);
         assert!(!set_mode(&stuck, XpdrMode::Altitude).await);
 
+        publish_mode_knob(None);
+    }
+
+    /// The A330's knob dataref is read-only (probed live, 2026-09-21): the
+    /// knob is turned by its commands, read before every step, and the
+    /// dataref is never written. AUTO is the SOP position and the profile's
+    /// "altitude".
+    #[tokio::test]
+    async fn a_read_only_knob_is_stepped_by_its_commands() {
+        let _g = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p = crate::aircraft::load("airbus_a330_300").expect("A330 profile loads");
+        let knob = p.transponder_mode_knob.clone().expect("the knob is declared");
+        let up = knob.up_command.clone().expect("stepped by command");
+        let down = knob.down_command.clone().expect("stepped by command");
+        publish_mode_knob(Some(knob.clone()));
+
+        assert_eq!(knob_step_up(-1, 0), Some(true));
+        assert_eq!(knob_step_up(1, 0), Some(false));
+        assert_eq!(knob_step_up(0, 0), None);
+
+        // Already at AUTO, its companions set, the box replying: confirmed,
+        // nothing fired.
+        let (alt_rpt, ta_ra) = (&knob.also[0], &knob.also[1]);
+        let set = FakeXPlane::with_reads(&[
+            (knob.dataref.as_str(), 0.0),
+            (alt_rpt.dataref.as_str(), 1.0),
+            (ta_ra.dataref.as_str(), 2.0),
+            (XPDR_MODE, 7.0),
+        ]);
+        assert!(set_mode(&set, XpdrMode::Altitude).await);
+        assert!(!set.ran(&ta_ra.up_command) && !set.ran(&alt_rpt.up_command));
+        assert!(!set.ran(&up) && !set.ran(&down));
+        assert!(!set.wrote(&knob.dataref), "a read-only dataref is never written");
+
+        // In standby, and a knob that never moves: stepped UP, bounded, and
+        // reported as not set.
+        let stuck = FakeXPlane::with_reads(&[(knob.dataref.as_str(), -1.0)]);
+        assert!(!set_mode(&stuck, XpdrMode::Altitude).await);
+        assert_eq!(stuck.ran_count(&up), KNOB_MAX_STEPS);
+        assert!(!stuck.ran(&down));
+        assert!(!stuck.wrote(&knob.dataref));
+
+        publish_mode_knob(None);
+    }
+
+    /// EGPF, 2026-09-21, read live in Glasgow's zone: mode knob AUTO, the TCAS
+    /// knob still in STBY where the aircraft loads, stock mode 1. The takeoff
+    /// had blackboxed `transponder_alt ok: true` from the one knob it read.
+    /// The companions are turned, and the verdict is the box's own.
+    #[tokio::test]
+    async fn auto_with_tcas_in_standby_is_not_altitude() {
+        let _g = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p = crate::aircraft::load("airbus_a330_300").expect("A330 profile loads");
+        let knob = p.transponder_mode_knob.clone().expect("the knob is declared");
+        let ta_ra = knob
+            .also
+            .iter()
+            .find(|c| c.dataref.ends_with("ta_ra_knob_pos"))
+            .expect("the TCAS knob is a companion");
+        assert_eq!(ta_ra.want, 2, "TA/RA");
+        publish_mode_knob(Some(knob.clone()));
+
+        // As found: the TCAS knob is asked for, and while the box still reads
+        // standby the answer is no.
+        let found = FakeXPlane::with_reads(&[
+            (knob.dataref.as_str(), 0.0),
+            (knob.also[0].dataref.as_str(), 1.0),
+            (ta_ra.dataref.as_str(), 0.0),
+            (XPDR_MODE, 1.0),
+        ]);
+        assert!(!set_mode(&found, XpdrMode::Altitude).await);
+        assert!(found.ran(&ta_ra.up_command), "the TCAS knob is turned");
+        assert!(!found.wrote(&ta_ra.dataref), "read-only, never written");
+
+        // Every knob right and the box still in standby (no AC power): no.
+        let dead = FakeXPlane::with_reads(&[
+            (knob.dataref.as_str(), 0.0),
+            (knob.also[0].dataref.as_str(), 1.0),
+            (ta_ra.dataref.as_str(), 2.0),
+            (XPDR_MODE, 1.0),
+        ]);
+        assert!(!set_mode(&dead, XpdrMode::Altitude).await);
+
+        // Standby is the mode knob alone: the companions stay where they are.
+        let stby = FakeXPlane::with_reads(&[(knob.dataref.as_str(), -1.0)]);
+        assert!(set_mode(&stby, XpdrMode::Standby).await);
+        assert!(!stby.ran(&ta_ra.up_command) && !stby.ran(&ta_ra.down_command));
+
+        assert!(stock_transmits(7) && stock_transmits(5) && stock_transmits(3));
+        assert!(!stock_transmits(0) && !stock_transmits(1) && !stock_transmits(4));
         publish_mode_knob(None);
     }
 

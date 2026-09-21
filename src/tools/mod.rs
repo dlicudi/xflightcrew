@@ -33,6 +33,7 @@ pub mod radio;
 pub mod recover;
 pub mod reminder;
 pub mod reverse;
+pub mod signs;
 pub mod speedhold;
 pub mod takeoff;
 pub mod taxi;
@@ -195,18 +196,9 @@ impl Registry {
         // past the end of real runways (see `ReferenceProfile::takeoff_roll_ft`).
         // One computation, because the line-up and the takeoff must agree on
         // what "enough runway" means.
-        let takeoff_roll_m = profile
-            .reference
-            .as_ref()
-            .and_then(|r| r.takeoff_roll_ft.or(r.takeoff_distance_ft))
-            .map(|f| f * 0.3048);
         // ...and the weight that roll is quoted AT, so it can be scaled to
         // the aircraft's actual weight rather than assumed at max.
-        let mtow_kg = profile
-            .reference
-            .as_ref()
-            .and_then(|r| r.max_gross_lb)
-            .map(|lb| lb * 0.453_592);
+        let (takeoff_roll_m, mtow_kg) = crate::aircraft::profile_takeoff_roll(profile);
 
         if let Some(flaps) = &profile.flaps {
             tools.push(Box::new(flaps::SetFlaps::new(flaps.clone())));
@@ -215,6 +207,7 @@ impl Registry {
         if profile.retractable_gear {
             tools.push(Box::new(gear::Gear {
                 vlo_kts: profile.vlo_kts,
+                by_command: profile.gear_by_command,
             }));
         }
 
@@ -313,6 +306,7 @@ impl Registry {
                 flap_schedule: crate::aircraft::flap_schedule(profile.flaps.as_ref()),
                 takeoff_roll_m,
                 mtow_kg,
+                cruise_ias_kts: profile.reference.as_ref().and_then(|r| r.cruise_ias_kts),
                 prop: profile.prop.clone(),
                 tail_strike_deg: profile.tail_strike_deg,
                 pitch_authority_down: profile.pitch_authority_down,
@@ -336,6 +330,7 @@ impl Registry {
                 takeoff_flap_ratio: profile.flaps.as_ref().and_then(|f| f.takeoff_ratio),
                 flap_schedule: crate::aircraft::flap_schedule(profile.flaps.as_ref()),
                 takeoff_roll_m,
+                mtow_kg,
                 approach_ias,
                 prop: profile.prop.clone(),
                 climb_floor_kts: circuit::climb_floor(profile),
@@ -363,7 +358,7 @@ impl Registry {
                     bus_power_on_cmds: bus_power_on_cmds(&profile.electrical),
                     park_brake_valve_set: profile.park_brake_valve_set,
                     takeoff_roll_m,
-                mtow_kg,
+                    mtow_kg,
                     landing_distance_ft: profile
                         .reference
                         .as_ref()
@@ -491,6 +486,7 @@ impl Registry {
             tools.push(Box::new(taxi::LineUp {
                 park_brake_valve_set: profile.park_brake_valve_set,
                 takeoff_roll_m,
+                mtow_kg,
                 prop: profile.prop.clone(),
                 pace,
             }));

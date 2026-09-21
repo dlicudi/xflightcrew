@@ -83,6 +83,14 @@ pub struct FlightPlan {
     pub min_takeoff_fuel_kg: f64,
     /// The load sheet, when the plan carries one (a local plan does not).
     pub weights: Option<PlanWeights>,
+    /// The ORIGIN's transition altitude and the DESTINATION's transition
+    /// level, ft, when the plan carries them (`origin/trans_alt`,
+    /// `destination/trans_level`). The profile's figure is an airframe's
+    /// guess at a fact about airspace: the 737's US 18,000 flew Edinburgh to
+    /// Exeter at "one seven thousand" on QNH, the monitor resetting the knob
+    /// to each new QNH all the way down England (2026-09-21).
+    pub transition_altitude_ft: Option<f64>,
+    pub transition_level_ft: Option<f64>,
 }
 
 /// The OFP's load sheet, in kilograms. SimBrief plans in the user's unit
@@ -219,6 +227,8 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
     }
 
     Ok(FlightPlan {
+        transition_altitude_ft: Some(n("/origin/trans_alt")).filter(|v| *v >= 1000.0),
+        transition_level_ft: Some(n("/destination/trans_level")).filter(|v| *v >= 1000.0),
         source: PlanSource::SimBrief,
         origin,
         destination,

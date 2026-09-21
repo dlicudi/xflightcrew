@@ -1,0 +1,220 @@
+# Aircraft profile — Sparky744, the Boeing 747-400 (B744).
+#
+# mSparks' xtlua overhaul of the Laminar 747 (`Aircraft/Sparky/747-400`). A
+# STUDY-LEVEL aircraft: its scripts own the autopilot, the engines' FADEC, the
+# lights, the gear lever, the transponder and the fuel control switches, across
+# FOUR script folders (plugins/xtlua, xtlua_keysystems, xtlua_fdr, xtlua_nd).
+# Its B747_Commands.txt and B747_Datarefs.txt ship EMPTY, so every name below
+# was read out of those scripts (names only: the aircraft is CC-BY-NC) and then
+# asked of the running sim, parked cold and dark, 2026-09-21.
+#
+# ONE TRAP THAT IS THIS AIRCRAFT'S OWN: every xtlua dataref reports
+# `is_writable: true`. Writability proves nothing here, because the script may
+# rewrite the value next frame. The only probe is a write and a read a second
+# later. PROVEN that way: a stock taxi-light write is erased within a second;
+# `laminar/B747/toggle_switch/position[]` ignores writes (an animation output);
+# the light TOGGLE commands move the real switches (nav = switch 9, taxi =
+# switch 7; 0.0 is ON, 1.0 is OFF) and the stock light datarefs follow as
+# honest reads.
+#
+# NO AUTOPILOT TOOLS YET, ON PURPOSE. `B747.70.xt.autopilot.lua` parks the
+# stock altitude dial at 150,000 ft (it calls it `simDR_disabled_...`) and
+# flies its own capture off `laminar/B747/autopilot/altitude_dial_ft`; in HDG
+# SEL it rewrites the stock heading bug EVERY FRAME from
+# `laminar/B747/autopilot/heading/degrees`; the servos engage on its own
+# `laminar/B747/autopilot/button_switch/cmd_L`. Every autopilot tool and every
+# automation here writes the STOCK dials, so on this aircraft they would steer
+# nothing and say "Roger". Until the crew has a per-airframe autopilot seam
+# (heading input, altitude input, engage command), `autopilot: false` keeps
+# that whole surface off the registry: no heading/altitude tools, no auto
+# takeoff, circuit, autoland or full auto. The 747's own MCP flies it.
+
+id: boeing_747_400
+display_name: Boeing 747-400
+
+autopilot: false
+throttle: true
+# The thrust levers are a FADEC's input: `B747.42.xt.EEC` holds
+# `override_throttles` and PIDs each engine to a thrust-lever-angle target, so
+# a lever write is obeyed with the EEC's lag on top of the spool. VERIFY with
+# engines running.
+autothrottle: false
+speedbrake: true       # the aircraft replaces the stock speedbrake commands with its own lever logic
+reverse_thrust: true   # the stock reverser commands are replaced the same way. VERIFY
+barometer: true        # `B747.60.xt.fltInst` writes the stock setting from its own knob. VERIFY a dial write survives
+pitot_heat: false      # automatic on the 747; no switch to move
+pitch_trim: true
+com_radio: true
+com2_radio: true
+nav_radio: true
+transponder: true
+ils: true
+parking_brake: true
+retractable_gear: true
+# The lever is the aircraft's own three-position `laminar/B747/actuator/
+# gear_handle` (0 down, 1 off, 2 up); the stock handle is its OUTPUT. The
+# aircraft replaces `landing_gear_up` / `_down` to move both, so the lever is
+# worked by command and read back from the stock handle.
+gear_by_command: true
+cabin_crew: true
+pressurised: true
+engines: 4
+
+# The aircraft replaces `sim/operation/auto_start` and `auto_board` with its
+# own sequences (B747.95.xt.AI). VERIFY: one press from cold and dark, timed.
+turbine_start: false
+auto_prep: false
+scripted_auto_start: true
+
+# The four fuel control switches. The stock mixture is their output
+# (`B747.40.xt.engines` writes it), so a stock cutoff is erased. 0 = cutoff,
+# 1 = run; the array exists and reads [0,0,0,0] parked.
+fuel_cutoff_levers:
+  - "laminar/B747/fuel/fuel_control/toggle_sw_pos[0]"
+  - "laminar/B747/fuel/fuel_control/toggle_sw_pos[1]"
+  - "laminar/B747/fuel/fuel_control/toggle_sw_pos[2]"
+  - "laminar/B747/fuel/fuel_control/toggle_sw_pos[3]"
+
+engine: false
+magnetos: false
+carb_heat: false
+fuel_pump: false
+directional_gyro: false
+
+# The aircraft REPLACES the stock battery, generator and avionics commands and
+# routes them to its own switches (read in B747.01.xt.manipulators: the battery
+# handler presses its own battery button when the position differs), so the
+# stock commands are the right input and the stock datarefs the honest read.
+# VERIFY powered.
+electrical:
+  - key: battery
+    spoken: battery
+    on_commands:  [sim/electrical/battery_1_on]
+    off_commands: [sim/electrical/battery_1_off]
+    readback:     [sim/cockpit/electrical/battery_on]
+  - key: generators
+    spoken: generators
+    on_commands:  [sim/electrical/generator_1_on, sim/electrical/generator_2_on, sim/electrical/generator_3_on, sim/electrical/generator_4_on]
+    off_commands: [sim/electrical/generator_1_off, sim/electrical/generator_2_off, sim/electrical/generator_3_off, sim/electrical/generator_4_off]
+    readback:     ["sim/cockpit/electrical/generator_on[0]", "sim/cockpit/electrical/generator_on[1]", "sim/cockpit/electrical/generator_on[2]", "sim/cockpit/electrical/generator_on[3]"]
+
+# Exterior lights: TOGGLE commands, read before firing, confirmed from the
+# stock datarefs the lighting script drives. Nav and taxi PROVEN 2026-09-21
+# (fired, the switch moved, the stock dataref followed, fired back). The four
+# landing lights are four switches; with the gear lever out of DOWN the script
+# halves their stock value to 0.5, which the light reader counts as lit. The
+# beacon is a three-position up/down switch with no toggle: not declared until
+# it has a mechanism, so "beacon on" says there is no such tool rather than
+# pretending. VERIFY strobe and landing.
+lights:
+  - key: nav
+    spoken: navigation lights
+    dataref: sim/cockpit2/switches/navigation_lights_on
+    toggles: [{ command: laminar/B747/toggle_switch/nav_light, dataref: sim/cockpit2/switches/navigation_lights_on }]
+  - key: strobe
+    spoken: strobe lights
+    dataref: sim/cockpit2/switches/strobe_lights_on
+    toggles: [{ command: laminar/B747/toggle_switch/strobe_light, dataref: sim/cockpit2/switches/strobe_lights_on }]
+  - key: taxi
+    spoken: taxi light
+    dataref: sim/cockpit2/switches/taxi_light_on
+    toggles: [{ command: laminar/B747/toggle_switch/taxi_light, dataref: sim/cockpit2/switches/taxi_light_on }]
+  - key: landing
+    spoken: landing lights
+    dataref: "sim/cockpit2/switches/landing_lights_switch[0]"
+    toggles:
+      - { command: laminar/B747/toggle_switch/landing_light_OBL, dataref: "sim/cockpit2/switches/landing_lights_switch[0]" }
+      - { command: laminar/B747/toggle_switch/landing_light_IBL, dataref: "sim/cockpit2/switches/landing_lights_switch[1]" }
+      - { command: laminar/B747/toggle_switch/landing_light_IBR, dataref: "sim/cockpit2/switches/landing_lights_switch[2]" }
+      - { command: laminar/B747/toggle_switch/landing_light_OBR, dataref: "sim/cockpit2/switches/landing_lights_switch[3]" }
+
+# The transponder MODE is the aircraft's selector: B747.30.xt.fltMgmt writes
+# the stock mode as min(selector + 1, 2), so selector 0 is standby and
+# anything from 1 up replies. 4 is TA/RA, the position the crew flies with.
+# The selector took a write parked (0 -> 4 -> 0); the stock mode did not
+# follow with the aircraft unpowered. VERIFY powered.
+transponder_mode_knob:
+  dataref: laminar/B747/flt_mgmt/txpdr/mode_sel_pos
+  off: 0
+  standby: 0
+  on: 1
+  altitude: 4
+
+# Vmo 365 KIAS. The acf carries Vne 399 / Vno 347; the placard is the limit.
+vne_kts: 365.0
+# Clean stall. The acf says 216, which is a maximum-weight figure: 1.2 x 216 is
+# 259, ABOVE the 250 the crew holds below 10,000 ft, so that floor would fight
+# every speed target on a normal-weight flight. 190 is the clean stall near a
+# typical 300 t, floor 228. VERIFY against the FCOM, and the floor wants
+# weight-scaling before an automation flies this airframe.
+vs_clean_kts: 190.0
+vlo_kts: 270.0                # gear extend/retract limit (the acf's Vle)
+
+# About 12.5 degrees with the body gear on the ground; bounded 2 below. VERIFY.
+tail_strike_deg: 12.5
+pitch_authority_down: 0.5
+
+# A 747 turns with body-gear steering and a 100 m wheelbase of inertia.
+taxi:
+  kts: 15.0
+  turn_kts: 8.0
+  sharp_kts: 5.0
+
+fuel:
+  reserve_caution_min: 60.0
+  reserve_warning_min: 30.0
+  cruise_burn_kg_hr: 10500.0   # about 23,000 lb/hr for the four, mid-cruise. VERIFY
+  kg_per_gal: 3.04
+  spoken_unit: kg
+
+transition_altitude_ft: 18000.0
+
+# One mid-weight card (about 300 t, flaps 20 takeoff). acf: MTOW 385,554 kg,
+# empty 183,523 kg, fuel 173,069 kg, Vso 110 (the acf's; a real Vref30 at
+# maximum landing weight is near 150).
+reference:
+  kind: four-engine jet
+  vr_kts: 160.0                # VERIFY
+  vy_kts: 250.0
+  initial_climb_kts: 185.0     # V2 ~175 + 10 (the FCTM's V2+10). VERIFY
+  best_climb_fpm: 2500.0
+  cruise_ias_kts: 290.0        # about M0.85 at FL350
+  optimum_alt_ft: 35000.0
+  optimum_alt_at_kg: 300000.0
+  optimum_alt_ft_per_1000kg: 60.0
+  enroute_climb_fpm: 1800.0
+  enroute_descent_fpm: 2000.0
+  approach_kts: 152.0          # Vref30 + 5 near maximum landing weight. VERIFY
+  vs0_kts: 110.0               # acf
+  cruise_kts: 490.0            # KTAS
+  max_gross_lb: 850000.0       # acf 385,554 kg
+  empty_weight_lb: 404600.0    # acf 183,523 kg
+  useful_load_lb: 445400.0
+  service_ceiling_ft: 45100.0
+  max_crosswind_kts: 30.0      # VERIFY
+  fuel_capacity_gal: 57000.0   # acf 173,069 kg at 3.04 kg/gal
+  endurance_hours: 16.0
+  takeoff_distance_ft: 10800.0 # RECITED: factored field length at MTOW
+  takeoff_roll_ft: 7500.0      # ground roll at MTOW; scaled to the weight on the wheels
+  landing_distance_ft: 7000.0  # at maximum landing weight. VERIFY
+
+# Seven handle positions, UP/1/5/10/20/25/30, which the flight controls script
+# snaps the stock lever to (0 / .167 / .333 / .5 / .667 / .833 / 1). Placards
+# are the 747-400's; the retraction gates sit under the placard of the detent
+# being left (test-enforced). VERIFY the manoeuvring speeds for the weight.
+flaps:
+  takeoff_ratio: 0.667
+  detents:
+    - { label: up,   spoken: up,          ratio: 0.0,   retract_above_kts: 250.0 }
+    - { label: "1",  spoken: one,         ratio: 0.167, vfe_kts: 280.0, retract_above_kts: 230.0 }
+    - { label: "5",  spoken: five,        ratio: 0.333, vfe_kts: 260.0, retract_above_kts: 210.0 }
+    - { label: "10", spoken: ten,         ratio: 0.5,   vfe_kts: 240.0, retract_above_kts: 190.0 }
+    - { label: "20", spoken: twenty,      ratio: 0.667, vfe_kts: 230.0 }
+    - { label: "25", spoken: twenty five, ratio: 0.833, vfe_kts: 205.0 }
+    - { label: "30", spoken: thirty,      ratio: 1.0,   vfe_kts: 180.0 }
+
+# Phase advisor on the stock reads the lighting script keeps honest.
+advisor:
+  - dataref: sim/cockpit2/switches/fasten_seat_belts
+    phases: [takeoff, climb, approach, landing]
+    say: Seat belt signs are off.

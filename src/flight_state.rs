@@ -33,11 +33,16 @@ use crate::aircraft::AircraftProfile;
 /// its airframe, and a selector that is only set when present is the bug.
 pub(crate) fn publish_airframe(p: &AircraftProfile) {
     crate::tools::radio::publish_mode_knob(p.transponder_mode_knob.clone());
+    crate::takeoff_config::publish(p.takeoff_config.clone());
+    crate::autotakeoff::publish_climb_out(crate::autotakeoff::ClimbOut::from_profile(p));
+    crate::tools::signs::publish(p.seat_belt_signs.clone(), p.cabin_crew);
+    crate::circuit::publish_ap_altitude_capture(p.ap_altitude_capture);
     crate::tools::lights::publish_exterior(&p.lights);
     crate::aircraft::publish_throttle_dataref(p.throttle_dataref.clone());
     crate::aircraft::publish_config_limits(p.vlo_kts, p.flaps.as_ref());
     crate::aircraft::publish_bus_volts(p.bus_volts_nominal);
     crate::aircraft::publish_speed_floor(p.vs_clean_kts);
+    crate::aircraft::publish_speed_ceiling(p.vne_kts);
     crate::aircraft::publish_approach_floor(
         p.reference.as_ref().and_then(|r| r.vs0_kts),
         p.vs_clean_kts,
@@ -49,6 +54,8 @@ pub(crate) fn publish_airframe(p: &AircraftProfile) {
     );
     crate::procedure::publish_vs_limits(p.reference.as_ref());
     crate::aircraft::publish_fuel_unit(p.fuel.as_ref());
+    // A plan's transition belongs to the flight it was armed for.
+    crate::tools::instruments::publish_flight_transition(None);
 }
 
 /// Every loop that can hold the aircraft, stopped. Aborts go through each

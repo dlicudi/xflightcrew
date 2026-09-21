@@ -47,11 +47,13 @@ mod procedure;
 mod pushback;
 mod radiofx;
 mod readback;
+mod reversal;
 mod router;
 mod settings;
 mod simbrief;
 mod stt;
 mod stt_eval;
+mod takeoff_config;
 mod taxi_guide;
 mod taxi_in;
 mod terrain;
@@ -481,12 +483,8 @@ async fn main() -> Result<()> {
                                 .await
                                 .map(|v| v > 0.5)
                                 .unwrap_or(true);
-                            let callsign = xp
-                                .get_string(datarefs::TAILNUM)
+                            let callsign = crate::circuit::crew_callsign(&xp)
                                 .await
-                                .ok()
-                                .map(|t| tower::spoken_callsign(&t))
-                                .filter(|s| !s.is_empty())
                                 .unwrap_or_else(|| "your callsign".to_string());
                             let dist = station::active_field()
                                 .map(|(_, flat, flon, _)| nav::haversine_nm(lat, lon, flat, flon));
@@ -2238,12 +2236,8 @@ async fn run_session(
                         .await
                         .map(|v| v > 0.5)
                         .unwrap_or(true);
-                    let callsign = xplane
-                        .get_string(datarefs::TAILNUM)
+                    let callsign = crate::circuit::crew_callsign(&xplane)
                         .await
-                        .ok()
-                        .map(|t| tower::spoken_callsign(&t))
-                        .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| "your callsign".to_string());
                     let dist = match (position(&xplane).await, station::active_field()) {
                         (Some((lat, lon, _)), Some((_, flat, flon, _))) => {
@@ -2505,6 +2499,15 @@ async fn run_session(
             }
             // Runway choice — answered from apt.dat + the wind, never the LLM
             // (which once invented "runway 18" at a field that only has 10/28).
+            // "Do we have enough runway for takeoff?": the takeoff's own fit
+            // and pavement rule, said as two numbers. Ahead of the runway
+            // ADVICE below, whose "use"/"should" would otherwise take it.
+            if !is_reminder && answers::takeoff_runway_query(&tl) {
+                reporter.status(ui::Phase::Thinking);
+                let line = answers::takeoff_runway_answer(&xplane, &profile).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
+            }
             if !is_reminder
                 && tl.contains("runway")
                 && (tl.contains("which")
@@ -3828,6 +3831,8 @@ mod tests {
 
     fn plan(origin: &str, dest: &str, route: &str, n: usize) -> crate::simbrief::FlightPlan {
         crate::simbrief::FlightPlan {
+            transition_altitude_ft: None,
+            transition_level_ft: None,
             source: crate::simbrief::PlanSource::SimBrief,
             origin: origin.into(),
             destination: dest.into(),
@@ -5231,6 +5236,8 @@ mod gap_tests_2026_09_12 {
             alt: 8000.0,
         };
         simbrief::FlightPlan {
+            transition_altitude_ft: None,
+            transition_level_ft: None,
             source: simbrief::PlanSource::Local,
             origin: "LXGB".into(),
             destination: "LEMG".into(),
@@ -5315,6 +5322,47 @@ mod gap_tests_2026_09_12 {
         assert!(remote_weather_target("whats the wind here", Some(&fp)).is_none());
         assert!(weather_words("what weather can we expect on arrival"));
         assert!(!weather_words("how much fuel do we have"));
+    }
+
+    /// "Do we have enough runway for takeoff?" went unanswered on the A330
+    /// at Edinburgh (2026-09-20, transcript verbatim). The answer is the
+    /// takeoff's own fit, said as two numbers.
+    #[test]
+    fn the_runway_length_question_is_answered_from_the_takeoffs_own_fit() {
+        use crate::answers::{takeoff_runway_line, takeoff_runway_query};
+        use crate::autotakeoff::NoFit;
+        for q in [
+            "Do we have enough runway for takeoff?",
+            "is the runway long enough",
+            "how much runway do we need",
+            "is this runway too short for us",
+        ] {
+            assert!(takeoff_runway_query(q), "{q}");
+        }
+        // Commands, advice and chatter stay where they were.
+        for q in [
+            "line us up runway two four",
+            "which runway should we use",
+            "runway two four cleared for takeoff",
+            "do we have enough fuel",
+        ] {
+            assert!(!takeoff_runway_query(q), "{q}");
+        }
+        assert_eq!(
+            takeoff_runway_line(Ok(("24".into(), 2338.0)), 2113.0),
+            "Yes. Runway two four, 2,340 metres ahead of us, and we need 2,110 at this weight."
+        );
+        let short = takeoff_runway_line(
+            Err(NoFit::RunwayTooShort { id: "24".into(), length_m: 2549.0, needed_m: 2560.0 }),
+            2560.0,
+        );
+        assert!(short.starts_with("No. Runway two four is 2,550 metres and we need 2,560"), "{short}");
+        let far = takeoff_runway_line(
+            Err(NoFit::TooLittleLeft { id: "24".into(), remaining_m: 141.0, needed_m: 2113.0 }),
+            2113.0,
+        );
+        assert!(far.starts_with("Not from here. 140 metres left"), "{far}");
+        assert!(takeoff_runway_line(Err(NoFit::NoneNear), 2113.0).contains("not lined up"));
     }
 
     #[test]

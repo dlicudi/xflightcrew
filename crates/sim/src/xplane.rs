@@ -790,6 +790,16 @@ impl XPlaneClient {
             .await
             .with_context(|| format!("POST {url}"))?
             .error_for_status()?;
+        // A command can move ANY dataref, so every cached value is suspect:
+        // the read-before-fire / read-after tools (toggles, stepped knobs)
+        // rest on the read after it being real. The altimeter knob sits in
+        // the 500 ms slow cache, and three `barometer_up` presses read back
+        // the value from BEFORE them: "altimeter stepped ... now=30.35" with
+        // the dial at 30.38 (2026-09-21). Commands are rare; the cache is for
+        // the per-tick reads between them.
+        if let Some(m) = VALUE_CACHE.lock().await.get_mut(&self.base) {
+            m.clear();
+        }
         Ok(())
     }
 

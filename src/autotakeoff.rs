@@ -67,6 +67,8 @@ const VS_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
 /// Elevator trim, -1 (nose down) .. +1, recorded at the AP engage: the one
 /// number that says whether the climb the servo is handed is flyable.
 const ELEV_TRIM: &str = "sim/cockpit2/controls/elevator_trim";
+const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
+const ALT_IND_FT: &str = sim::datarefs::ALTITUDE_FT;
 const TAXI_STEER: &str = "xcopilot/taxi_steer";
 const STEER_YIELD: &str = "xcopilot/steer_yield";
 const TAKEOFF_PITCH: &str = "xcopilot/pitch";
@@ -334,6 +336,11 @@ pub struct Params {
     pub cleared_runway: Option<String>,
     /// Runway needed for the roll, meters (POH distance with margin).
     pub needed_m: f64,
+    /// The altitude the CALLER will level at, feet, selected on the altitude
+    /// dial before the roll (the circuit's pattern altitude). `None` leaves a
+    /// dial the pilot set and lifts one the climb could never capture
+    /// (`takeoff_config::initial_altitude_ft`).
+    pub level_ft: Option<f64>,
     /// Height AGL to hand back at, feet. 1000 for a normal departure; a circuit
     /// hands off LOWER (~500) so it turns crosswind while still climbing,
     /// instead of running four kilometres straight ahead to reach 1000 first.
@@ -359,6 +366,13 @@ pub struct Params {
     /// while nobody flies — and the whole trust model here rests on the
     /// copilot being right about who has the aircraft.
     pub handoff_to_caller: bool,
+    /// The speed the governor is armed at when the PILOT takes the handoff
+    /// (the profile's cruise IAS, capped to 250 below 10,000 ft), and the
+    /// base URL it is armed over. `None` leaves the throttle where the climb
+    /// left it. Never used when an orchestrator takes the aircraft: it owns
+    /// the throttle from there.
+    pub handoff_speed_kts: Option<f64>,
+    pub base_url: String,
     /// The airframe's park-brake valve SET sense, for the brakes-off before the
     /// roll. `None` = the airframe models no valve, and the ratio is the whole
     /// of the parking brake.
@@ -442,6 +456,72 @@ pub enum NoFit {
     Offset { id: String, lateral_m: f64 },
     /// Aligned and on the centreline, but still short of the threshold.
     ShortOfThreshold { id: String, m: f64 },
+}
+
+/// What to SAY about a failed fit, and whether it is urgent (a Warning: we
+/// are occupying a runway we cannot depart from). One wording for the spoken
+/// takeoff and for full auto's line-up check, so neither can call an aircraft
+/// on the centreline "not on the runway".
+pub fn no_fit_line(why: &NoFit, can_line_up: bool) -> (String, bool) {
+    match why {
+        // The runway itself is too short. Say so plainly, with both
+        // numbers, and do NOT send the pilot to line up or backtrack —
+        // neither can add pavement.
+        NoFit::RunwayTooShort {
+            id,
+            length_m,
+            needed_m,
+        } => (
+            format!(
+                "Runway {} is {:.0} metres and I need {:.0} for this aircraft. It's too \
+                 short — lining up or backtracking won't change that. Your takeoff if \
+                 you want it.",
+                crate::circuit::spell_runway(id),
+                length_m,
+                needed_m
+            ),
+            true,
+        ),
+        // ON the runway with too little ahead: we are occupying a strip
+        // we cannot depart from, which is a vacate, not a line-up.
+        NoFit::TooLittleLeft {
+            id,
+            remaining_m,
+            needed_m,
+        } => (
+            format!(
+                "We're lined up on {} but at the far end — {:.0} metres left and I need {:.0}.                      Backtrack or vacate; I can't take off from here.",
+                crate::circuit::spell_runway(id),
+                remaining_m,
+                needed_m
+            ),
+            true,
+        ),
+        // Across the pavement: the worst place to be and the one the old
+        // message actively denied.
+        NoFit::NotAligned { id, err_deg } if *err_deg < 90.0 => (
+            format!(
+                "We're on {} but {:.0} degrees off the centreline. Line us up, or vacate if                      there's traffic.",
+                crate::circuit::spell_runway(id),
+                err_deg
+            ),
+            true,
+        ),
+        NoFit::ShortOfThreshold { .. } | NoFit::NotAligned { .. } | NoFit::Offset { .. }
+            if can_line_up =>
+        {
+            (
+                "We're not on the runway yet. Say line us up, then give me the takeoff."
+                    .to_string(),
+                false,
+            )
+        }
+        _ => (
+            "We're not lined up on a runway I can use. Line us up and ask me again."
+                .to_string(),
+            false,
+        ),
+    }
 }
 
 /// Diagnose a failed [`runway_fit`]: the best-aligned candidate, and the FIRST
@@ -820,7 +900,7 @@ pub fn tick_throttle_want(
     vne_kts: Option<f64>,
 ) -> f64 {
     if airborne {
-        climb_throttle(ias_kts, vne_kts)
+        climb_throttle(ias_kts, climb_guard_vne(vne_kts))
     } else {
         throttle_cmd(elapsed_s, err_deg, gs_kts)
     }
@@ -869,6 +949,39 @@ pub fn clean_up_at_handoff(
     Some(clean_floor_kts.is_none_or(|floor| ias_kts > floor))
 }
 
+/// How long the handoff waits, still flying the climb, for the speed that
+/// lets the flaps come up. The A330 reached its handoff height at 203 kt
+/// against a 210 kt clean floor, accelerating at 2.5 kt a second: the loop
+/// said "too slow to clean up", left, and the aircraft passed the 215 kt
+/// placard twelve seconds later with nobody on the flap lever (EGPH,
+/// 2026-09-20). Three seconds more would have cleaned it up.
+pub const CLEAN_UP_WAIT_S: f64 = 30.0;
+
+/// Whether the handoff holds off, still climbing, for the clean-up: dirty,
+/// under the clean floor, and inside [`CLEAN_UP_WAIT_S`].
+pub fn handoff_waits_for_clean_up(
+    retracted: bool,
+    ias_kts: f64,
+    clean_floor_kts: Option<f64>,
+    waited_s: f64,
+) -> bool {
+    clean_up_at_handoff(retracted, ias_kts, clean_floor_kts) == Some(false)
+        && waited_s < CLEAN_UP_WAIT_S
+}
+
+/// The altitude dial a PILOT handoff leaves behind. A dial the climb can
+/// never capture (at or under us: the A330's sat at 100 ft, and the VS climb
+/// ran through 11,000 with "check altitude capture" said three times) is set
+/// 2,000 ft up, rounded up to the thousand. A dial the pilot set above us is
+/// the pilot's: `None`.
+pub const HANDOFF_DIAL_CLEAR_FT: f64 = 500.0;
+pub fn handoff_altitude_dial_ft(dial_ft: f64, alt_ft: f64) -> Option<f64> {
+    if dial_ft >= alt_ft + HANDOFF_DIAL_CLEAR_FT {
+        return None;
+    }
+    Some(((alt_ft + 2000.0) / 1000.0).ceil() * 1000.0)
+}
+
 /// How far below Vne the overspeed protection starts working, and how much
 /// climb rate it trades in per knot of excess.
 const OVERSPEED_GUARD_KTS: f64 = 20.0;
@@ -877,6 +990,19 @@ const OVERSPEED_VS_MAX_FPM: f64 = 1500.0;
 /// Thrust is pulled no lower than this in the climb — enough to keep climbing.
 const CLIMB_THROTTLE_MIN: f64 = 0.55;
 const OVERSPEED_THR_PER_KT: f64 = 0.02;
+
+/// The speed the climb-out guards against: the airframe's Vne, or the 250 kt
+/// rule below 10,000 ft plus the guard band, whichever is lower.
+///
+/// The guard was Vne alone. A 172's Vne is 163 and it cannot get there in a
+/// climb; an A330's is 330, and at TOGA with a 1,500 fpm dial it reached 273
+/// kt by the 1,000 ft handoff, then Vmo, and the aircraft's own high-speed
+/// protection pitched it into a 5,400 fpm climb (EGPH, 2026-09-20). Every
+/// takeoff is below 10,000 ft, so the band starts at 250 on any airframe
+/// that could exceed it; airframes with a lower Vne are untouched.
+pub fn climb_guard_vne(vne_kts: Option<f64>) -> Option<f64> {
+    vne_kts.map(|v| v.min(crate::tools::speedhold::BELOW_10K_LIMIT_KTS + OVERSPEED_GUARD_KTS))
+}
 
 /// Climb rate with speed protection on BOTH sides.
 ///
@@ -914,6 +1040,88 @@ pub fn climb_throttle(ias_kts: f64, vne_kts: Option<f64>) -> f64 {
         return 1.0;
     }
     (1.0 - over * OVERSPEED_THR_PER_KT).max(CLIMB_THROTTLE_MIN)
+}
+
+/// A jet's climb-out, declared by the profile (`acceleration_height_agl_ft`
+/// and `best_climb_fpm`) and republished on every swap.
+///
+/// EGPH 24, 2026-09-21, the 737: every airframe climbed out on one capped
+/// 1,500 fpm dial at takeoff thrust. That is a 172's whole climb and a fifth
+/// of a 737's excess power, so the rest went into speed: 185 kt at 340 ft,
+/// the flaps running up on speed alone at 400, 500 and 740 ft, 240 kt through
+/// 1,000 ft. A crew holds V2 + 20 to the acceleration height by PITCH, then
+/// lowers the nose and cleans up on the schedule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClimbOut {
+    pub accel_agl_ft: f64,
+    /// The hardest the speed hold may climb, fpm.
+    pub max_fpm: f64,
+}
+
+impl ClimbOut {
+    pub fn from_profile(p: &crate::aircraft::AircraftProfile) -> Option<Self> {
+        let r = p.reference.as_ref()?;
+        let accel_agl_ft = r.acceleration_height_agl_ft.filter(|h| h.is_finite() && *h > 0.0)?;
+        Some(ClimbOut {
+            accel_agl_ft,
+            max_fpm: r.best_climb_fpm.filter(|f| f.is_finite()).unwrap_or(0.0),
+        })
+    }
+}
+
+static CLIMB_OUT: std::sync::Mutex<Option<ClimbOut>> = std::sync::Mutex::new(None);
+
+/// Republished on every swap, including to `None`
+/// ([`crate::flight_state::publish_airframe`]).
+pub fn publish_climb_out(c: Option<ClimbOut>) {
+    *CLIMB_OUT.lock().unwrap_or_else(|e| e.into_inner()) = c;
+}
+
+/// The declaration, for a takeoff that hands off at or above its height. A
+/// circuit hands off at 500 ft into its own climb law and keeps the old
+/// climb-out whole: half a profile is worse than either.
+fn climb_out_for(handoff_agl_ft: f64) -> Option<ClimbOut> {
+    CLIMB_OUT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .filter(|c| handoff_agl_ft >= c.accel_agl_ft)
+}
+
+/// Climb rate bought per knot above the initial climb speed, below the
+/// acceleration height. A 737 loses about a knot a second per 1,000 fpm, so
+/// this closes the speed loop at about 0.1 rad/s: slow against the five
+/// seconds of lag and dead time in its VS mode (sixty degrees of margin).
+const SPEED_HOLD_FPM_PER_KT: f64 = 100.0;
+
+/// The climb-out's commanded rate. Below the acceleration height the speed is
+/// held by climbing: every knot over `target_kts` buys rate, up to the
+/// airframe's best. At and above it, and on any airframe that declares none,
+/// the protected climb every takeoff has always flown.
+pub fn climb_out_vs_fpm(
+    ias_kts: f64,
+    target_kts: f64,
+    base_fpm: f64,
+    vne_kts: Option<f64>,
+    agl_ft: f64,
+    climb_out: Option<ClimbOut>,
+) -> f64 {
+    let base = climb_vs_protected(ias_kts, target_kts, base_fpm, vne_kts);
+    match climb_out {
+        Some(c) if agl_ft < c.accel_agl_ft => {
+            let hold = base + (ias_kts - target_kts).max(0.0) * SPEED_HOLD_FPM_PER_KT;
+            hold.min(c.max_fpm.max(base))
+        }
+        _ => base,
+    }
+}
+
+/// How long the handoff waits, still climbing, for the flap SCHEDULE to
+/// finish on an airframe that declares a climb-out. The handoff's own
+/// clean-up is one shot to zero on the clean floor: flaps 5 to up at 195 kt,
+/// fifteen under the 737's flaps-up manoeuvring speed.
+pub const SCHEDULE_WAIT_S: f64 = 45.0;
+pub fn handoff_waits_for_schedule(retracted: bool, has_schedule: bool, waited_s: f64) -> bool {
+    !retracted && has_schedule && waited_s < SCHEDULE_WAIT_S
 }
 
 /// Reject when the runway is running out and rotation speed is still short:
@@ -985,6 +1193,7 @@ async fn reject(xp: &XPlaneClient, voice: &Option<Voice>, line: &str, reason: &s
         crate::tools::note_brake_cmd();
     }
     let _ = xp.set_float(TAXI_STEER, 0.0).await;
+    crate::takeoff_config::on_reject(xp).await;
     alert(voice, Priority::Warning, line);
     crate::blackbox::record(
         "autotakeoff",
@@ -1065,65 +1274,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             "autotakeoff",
             serde_json::json!({"event": "no_runway_fit", "why": format!("{why:?}")}),
         );
-        let (line, urgent) = match &why {
-            // The runway itself is too short. Say so plainly, with both
-            // numbers, and do NOT send the pilot to line up or backtrack —
-            // neither can add pavement.
-            NoFit::RunwayTooShort {
-                id,
-                length_m,
-                needed_m,
-            } => (
-                format!(
-                    "Runway {} is {:.0} metres and I need {:.0} for this aircraft. It's too \
-                     short — lining up or backtracking won't change that. Your takeoff if \
-                     you want it.",
-                    crate::circuit::spell_runway(id),
-                    length_m,
-                    needed_m
-                ),
-                true,
-            ),
-            // ON the runway with too little ahead: we are occupying a strip
-            // we cannot depart from, which is a vacate, not a line-up.
-            NoFit::TooLittleLeft {
-                id,
-                remaining_m,
-                needed_m,
-            } => (
-                format!(
-                    "We're lined up on {} but at the far end — {:.0} metres left and I need {:.0}.                      Backtrack or vacate; I can't take off from here.",
-                    crate::circuit::spell_runway(id),
-                    remaining_m,
-                    needed_m
-                ),
-                true,
-            ),
-            // Across the pavement: the worst place to be and the one the old
-            // message actively denied.
-            NoFit::NotAligned { id, err_deg } if *err_deg < 90.0 => (
-                format!(
-                    "We're on {} but {:.0} degrees off the centreline. Line us up, or vacate if                      there's traffic.",
-                    crate::circuit::spell_runway(id),
-                    err_deg
-                ),
-                true,
-            ),
-            NoFit::ShortOfThreshold { .. } | NoFit::NotAligned { .. } | NoFit::Offset { .. }
-                if can_line_up =>
-            {
-                (
-                    "We're not on the runway yet. Say line us up, then give me the takeoff."
-                        .to_string(),
-                    false,
-                )
-            }
-            _ => (
-                "We're not lined up on a runway I can use. Line us up and ask me again."
-                    .to_string(),
-                false,
-            ),
-        };
+        let (line, urgent) = no_fit_line(&why, can_line_up);
         alert(
             &voice,
             if urgent {
@@ -1170,12 +1321,18 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // path's stopping pulse included — back into the parking brake.
     // Trim for takeoff BEFORE the brakes come off (see `trim_for_takeoff`:
     // a nose-down stop trim is what the AP's climb loses to at the engage).
-    if let Some((was, now)) = crate::tools::controls::trim_for_takeoff(&xp).await {
-        crate::blackbox::record(
-            "autotakeoff",
-            serde_json::json!({"event": "trim_set", "was": was, "now": now}),
-        );
-        alert(&voice, Priority::Advisory, "Trim set for takeoff.");
+    // The WHOLE configuration, and the brakes wait for the flaps to arrive:
+    // the handle used to be written after "Rolling", and an A330's CONF 2
+    // was still running out at sixty knots (EGPF, 2026-09-21). After full
+    // auto's after-start call this finds everything set and says nothing.
+    let config =
+        crate::takeoff_config::set_for_takeoff(&xp, p.takeoff_flap_ratio, p.level_ft, true).await;
+    if let Some(line) = crate::takeoff_config::line("Takeoff config", &config) {
+        alert(&voice, Priority::Advisory, &line);
+    }
+    // An abort said during the flap wait: the brakes are still set.
+    if xp.cancelled() || !ACTIVE.load(Ordering::Relaxed) {
+        return;
     }
     crate::tools::controls::release_park_brake_for_roll(&xp, p.park_brake_valve_set).await;
     tracing::info!(
@@ -1225,6 +1382,15 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     let mut airborne = false;
     let mut rotated = false;
     let mut ap_engaged = false;
+    let climb_out = climb_out_for(p.handoff_agl_ft);
+    if let Some(c) = climb_out {
+        crate::blackbox::record(
+            "autotakeoff",
+            serde_json::json!({"event": "climb_out", "accel_agl_ft": c.accel_agl_ft,
+                               "max_fpm": c.max_fpm, "hold_kts": p.initial_climb_kts}),
+        );
+    }
+    let mut handoff_wait: Option<std::time::Instant> = None;
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     let mut gear_raised = !p.retract_gear;
     let mut positive_called = false;
@@ -1501,8 +1667,31 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 // which rewrites the stock dataref from its knob every frame)
                 // gets its KNOB turned rather than a write nothing reads. A
                 // no-op on an airframe with no transponder, so no profile gate.
-                let _ = crate::tools::radio::set_mode(&xp, crate::tools::radio::XpdrMode::Altitude)
+                // On its own task: a knob stepped by commands takes a few
+                // hundred milliseconds, and this loop is about to rotate. And
+                // the result is KEPT: it was discarded, and the A330 flew out
+                // in standby to two "recycle transponder" calls with nothing
+                // said on the flight deck (EGPH, 2026-09-20).
+                let (url, v) = (p.base_url.clone(), voice.clone());
+                tokio::spawn(async move {
+                    let xp = XPlaneClient::new(url);
+                    let ok = crate::tools::radio::set_mode(
+                        &xp,
+                        crate::tools::radio::XpdrMode::Altitude,
+                    )
                     .await;
+                    crate::blackbox::record(
+                        "autotakeoff",
+                        serde_json::json!({"event": "transponder_alt", "ok": ok}),
+                    );
+                    if !ok {
+                        alert(
+                            &v,
+                            Priority::Caution,
+                            "The transponder didn't take altitude mode. Check the knob.",
+                        );
+                    }
+                });
                 crate::blackbox::record(
                     "autotakeoff",
                     serde_json::json!({"event": "liftoff", "ias": ias}),
@@ -1521,12 +1710,13 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             gear_raised = true;
             let _ = xp.set_float(GEAR_HANDLE, 0.0).await;
             alert(&voice, Priority::Advisory, "Gear up.");
+            crate::takeoff_config::after_liftoff(&xp).await;
         }
         // Clean up the takeoff flaps once safely climbing — after the gear,
         // the way a crew does it. On an airframe that declares manoeuvring
         // speeds this walks the schedule a detent at a time and each step
         // waits for its own speed; without one it is the old single shot.
-        if !flaps_retracted && agl_ft > FLAP_RETRACT_AGL_FT {
+        if !flaps_retracted && agl_ft > climb_out.map_or(FLAP_RETRACT_AGL_FT, |c| c.accel_agl_ft) {
             if p.flap_schedule.is_empty() {
                 if ias > p.initial_climb_kts {
                     flaps_retracted = true;
@@ -1601,7 +1791,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // the dial to the CURRENT rate, stomping any preset (the sync
             // that made VS-mode rotation impossible in the first place).
             // The pitch channel simply expires; the servo owns the elevator.
-            let vs = climb_vs_protected(ias, p.initial_climb_kts, p.climb_fpm, p.vne_kts);
+            let vs = climb_out_vs_fpm(
+                ias,
+                p.initial_climb_kts,
+                p.climb_fpm,
+                climb_guard_vne(p.vne_kts),
+                agl_ft,
+                climb_out,
+            );
             if !engage_climb(&xp, vs, &mut last_vs_cmd).await {
                 continue;
             }
@@ -1614,7 +1811,14 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 }),
             );
         }
-        let vs = climb_vs_protected(ias, p.initial_climb_kts, p.climb_fpm, p.vne_kts);
+        let vs = climb_out_vs_fpm(
+            ias,
+            p.initial_climb_kts,
+            p.climb_fpm,
+            climb_guard_vne(p.vne_kts),
+            agl_ft,
+            climb_out,
+        );
         if !engage_climb(&xp, vs, &mut last_vs_cmd).await {
             continue;
         }
@@ -1629,6 +1833,22 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             serde_json::json!({"event": "climb", "ias": ias, "agl": agl_ft, "cmd_vs": vs}),
         );
         if agl_ft >= p.handoff_agl_ft.max(AP_ENGAGE_AGL_FT + 50.0) {
+            // At the height, dirty, and a few knots short of the clean-up:
+            // keep flying the climb until the schedule above has done it.
+            let floor = crate::aircraft::speed_floor_kts();
+            let waited = handoff_wait.get_or_insert_with(std::time::Instant::now);
+            let waited_s = waited.elapsed().as_secs_f64();
+            if handoff_waits_for_clean_up(flaps_retracted, ias, floor, waited_s)
+                || (climb_out.is_some()
+                    && handoff_waits_for_schedule(
+                        flaps_retracted,
+                        !p.flap_schedule.is_empty(),
+                        waited_s,
+                    ))
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                continue;
+            }
             // Never hand over dirty. The schedule above waits for Vy, which a
             // trainer passes in the first few hundred feet and a jet does not
             // reach before this loop ends: a 737 lifting at V2+20 hands off at
@@ -1639,7 +1859,6 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // flies it clean, or is TOLD it is not — the floor is the
             // airframe's clean-configuration minimum, so a retraction can
             // never be one into the stall it was meant to avoid.
-            let floor = crate::aircraft::speed_floor_kts();
             if let Some(up) = clean_up_at_handoff(flaps_retracted, ias, floor) {
                 if up {
                     let _ = xp.set_float(FLAP_HANDLE, 0.0).await;
@@ -1662,19 +1881,54 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // feet" there — a number the pilot can see is wrong on the
             // altimeter, from the same sentence that tells them who is flying.
             let height = spoken_height_ft(agl_ft);
+            // A PILOT handoff leaves a flyable aircraft, the rule autoland's
+            // give-ups follow: a level the climb will capture and a speed
+            // somebody holds. This loop's own overspeed guard dies with it,
+            // and a jet at takeoff thrust in a 1,500 fpm VS climb was at Vmo
+            // by 10,000 ft with the dial still at 100 (EGPH, 2026-09-20).
+            let mut held = String::new();
+            if !p.handoff_to_caller {
+                let (dial, alt) = tokio::join!(xp.get_float(ALT_DIAL), xp.get_float(ALT_IND_FT));
+                if let (Ok(dial), Ok(alt)) = (dial, alt) {
+                    let level = match handoff_altitude_dial_ft(dial, alt) {
+                        Some(set) => {
+                            let ok = xp.set_float(ALT_DIAL, set).await.is_ok();
+                            crate::blackbox::record(
+                                "autotakeoff",
+                                serde_json::json!({"event": "handoff_alt_dial", "was": dial,
+                                                   "now": set, "alt_ft": alt, "ok": ok}),
+                            );
+                            ok.then_some(set)
+                        }
+                        None => Some(dial),
+                    };
+                    if let Some(level) = level {
+                        held.push_str(&format!(" to {}", crate::flightplan::spoken_feet(level)));
+                    }
+                    if let Some(kts) = p.handoff_speed_kts {
+                        let kts = crate::tools::speedhold::airspace_limited(alt, kts);
+                        crate::tools::speedhold::arm_flight(p.base_url.clone(), voice.clone(), kts);
+                        crate::blackbox::record(
+                            "autotakeoff",
+                            serde_json::json!({"event": "handoff_speed", "target": kts}),
+                        );
+                        held.push_str(&format!(", and I'm holding {kts:.0} knots"));
+                    }
+                }
+            }
             alert(
                 &voice,
                 Priority::Caution,
                 &format!(
-                    "{height}, {} knots. {}",
+                    "{height}, {} knots. {}{held}.",
                     ias.round() as i64,
                     if p.handoff_to_caller {
                         // The circuit, full auto or a procedure is taking it.
                         // Saying "your aircraft" here is a lie about the one
                         // thing that must never be wrong.
-                        "The autopilot is holding runway heading and the climb."
+                        "The autopilot is holding runway heading and the climb"
                     } else {
-                        "Your aircraft. The autopilot is holding runway heading and the climb."
+                        "Your aircraft. The autopilot is holding runway heading and the climb"
                     }
                 ),
             );
@@ -1763,6 +2017,32 @@ mod tests {
         assert!(runway_fit(&cands, 0.0, 0.0, 0.0, 500.0).is_some());
         // Nothing anywhere near.
         assert_eq!(why_no_fit(&[], 0.0, 0.0, 0.0, 500.0), NoFit::NoneNear);
+        // EGPH 2026-09-20: at the handoff height at 203 kt against a 210 kt
+        // clean floor. The handoff waits, flying, and goes once clean or fast
+        // enough, and never waits past its bound or for a clean wing.
+        assert!(handoff_waits_for_clean_up(false, 203.0, Some(210.0), 0.0));
+        assert!(!handoff_waits_for_clean_up(false, 211.0, Some(210.0), 3.0));
+        assert!(!handoff_waits_for_clean_up(true, 203.0, Some(210.0), 0.0));
+        assert!(!handoff_waits_for_clean_up(false, 203.0, None, 0.0));
+        assert!(!handoff_waits_for_clean_up(false, 203.0, Some(210.0), CLEAN_UP_WAIT_S));
+        // The dial at 100 ft passing 1,150: set 2,000 up, to the thousand.
+        assert_eq!(handoff_altitude_dial_ft(100.0, 1150.0), Some(4000.0));
+        assert_eq!(handoff_altitude_dial_ft(1150.0, 1150.0), Some(4000.0));
+        // The pilot's own level above us stands.
+        assert_eq!(handoff_altitude_dial_ft(6000.0, 1150.0), None);
+        assert_eq!(handoff_altitude_dial_ft(1650.0, 1150.0), None);
+        // The words never deny a runway we are sitting on.
+        for why in [
+            NoFit::RunwayTooShort { id: "24".into(), length_m: 2549.0, needed_m: 2560.0 },
+            NoFit::TooLittleLeft { id: "24".into(), remaining_m: 141.0, needed_m: 2560.0 },
+            NoFit::NotAligned { id: "24".into(), err_deg: 35.0 },
+        ] {
+            for can_line_up in [true, false] {
+                let (line, urgent) = no_fit_line(&why, can_line_up);
+                assert!(urgent, "{line}");
+                assert!(!line.contains("not on the runway"), "{line}");
+            }
+        }
 
         // THE RUNWAY ITSELF TOO SHORT. Edinburgh's shape: on the numbers,
         // aligned, full length ahead — and the aircraft needs more than the
@@ -2660,6 +2940,20 @@ mod tests {
     }
 
     #[test]
+    fn the_climb_guard_is_the_250_kt_rule_on_a_jet_and_vne_on_a_trainer() {
+        // A330: Vne 330, the band starts at 250 (270 - 20) not 310.
+        assert_eq!(climb_guard_vne(Some(330.0)), Some(270.0));
+        assert!(
+            climb_throttle(273.0, climb_guard_vne(Some(330.0))) < 1.0,
+            "273 kt at 1,000 ft is over"
+        );
+        assert_eq!(climb_throttle(240.0, climb_guard_vne(Some(330.0))), 1.0);
+        // 172: Vne 163 stays the reference.
+        assert_eq!(climb_guard_vne(Some(163.0)), Some(163.0));
+        assert_eq!(climb_guard_vne(None), None);
+    }
+
+    #[test]
     fn runway_end_reject_fires_only_slow_and_short() {
         // 200 m left at 30 kt against a 55 kt Vr: no takeoff today.
         assert!(must_reject(200.0, 30.0, 55.0));
@@ -2911,5 +3205,128 @@ mod tests {
             "trim never learned the P-factor: {}",
             steer_law.trim()
         );
+    }
+
+    /// The 737's climb-out as the blackbox drew it at EGPH 24 (2026-09-21):
+    /// 4.1 kt/s of excess thrust at takeoff power, a knot a second given back
+    /// per 1,000 fpm, and a VS mode that is two 1.5 s lags behind 2 s of dead
+    /// time. Returns (ias at the acceleration height, flap steps as (agl, ias,
+    /// ratio), handoff (agl, ias), VS command reversals below the height).
+    fn fly_737_climb_out(
+        climb_out: Option<ClimbOut>,
+    ) -> (f64, Vec<(f64, f64, f64)>, (f64, f64), usize) {
+        let schedule = crate::aircraft::flap_schedule(
+            crate::aircraft::load("boeing_737_800").unwrap().flaps.as_ref(),
+        );
+        let (hold_kts, base_fpm, handoff_agl, dt) = (170.0, 1500.0, 1000.0, 0.4);
+        let vne = climb_guard_vne(Some(340.0));
+        // As the AP took it: 340 ft, 185 kt, climbing 1,600 fpm.
+        let (mut agl, mut ias, mut vs1, mut vs) = (340.0_f64, 185.0_f64, 1600.0_f64, 1600.0_f64);
+        let mut delay = std::collections::VecDeque::from(vec![1600.0_f64; 5]);
+        let (mut flap, mut steps, mut at_accel) = (0.375_f64, Vec::new(), None);
+        let (mut reversals, mut last_cmd, mut last_dir) = (0usize, None::<f64>, 0.0_f64);
+        let mut waited = None::<f64>;
+        for tick in 0..400 {
+            let t = tick as f64 * dt;
+            let gate = climb_out.map_or(FLAP_RETRACT_AGL_FT, |c| c.accel_agl_ft);
+            if flap > 1e-6 && agl > gate {
+                if let Some(next) = flap_retract_step(&schedule, flap, ias) {
+                    flap = next;
+                    steps.push((agl, ias, next));
+                }
+            }
+            let cmd = climb_out_vs_fpm(ias, hold_kts, base_fpm, vne, agl, climb_out);
+            if climb_out.is_some_and(|c| agl < c.accel_agl_ft) {
+                if let Some(prev) = last_cmd {
+                    let dir = (cmd - prev).signum();
+                    if (cmd - prev).abs() > 50.0 {
+                        if dir == -last_dir {
+                            reversals += 1;
+                        }
+                        last_dir = dir;
+                    }
+                }
+                last_cmd = Some(cmd);
+            }
+            if at_accel.is_none() && agl >= 1000.0 {
+                at_accel = Some(ias);
+            }
+            if agl >= handoff_agl {
+                let w = t - *waited.get_or_insert(t);
+                let retracted = flap <= 1e-6;
+                if !(climb_out.is_some() && handoff_waits_for_schedule(retracted, true, w)) {
+                    return (at_accel.unwrap(), steps, (agl, ias), reversals);
+                }
+            }
+            delay.push_back(cmd);
+            let seen = delay.pop_front().unwrap();
+            vs1 += (seen - vs1) * dt / 1.5;
+            vs += (vs1 - vs) * dt / 1.5;
+            ias += (4.1 - 1.06 * vs / 1000.0) * dt;
+            agl += vs / 60.0 * dt;
+        }
+        panic!("never handed off");
+    }
+
+    #[test]
+    fn the_plant_flies_the_egph_climb_out_under_the_old_law() {
+        // 240 kt through 1,000 ft and the flaps gone by 740: the flight.
+        let (at_accel, steps, _, _) = fly_737_climb_out(None);
+        assert!((230.0..255.0).contains(&at_accel), "{at_accel}");
+        assert!(steps.iter().all(|(agl, _, _)| *agl < 1000.0), "{steps:?}");
+    }
+
+    #[test]
+    fn a_jet_holds_its_climb_speed_to_the_acceleration_height() {
+        let c = ClimbOut { accel_agl_ft: 1000.0, max_fpm: 3000.0 };
+        let (at_accel, steps, (h_agl, h_ias), reversals) = fly_737_climb_out(Some(c));
+        // Handed 185 kt at 340 ft with 3,000 fpm to spend against 3,900 of
+        // excess: not V2 + 20, but thirty-five knots under what it was, and
+        // still under the flaps-up speed, so the schedule has steps to take.
+        assert!(at_accel < 210.0, "{at_accel}");
+        assert!(reversals <= 1, "the speed hold hunted: {reversals}");
+        // Flaps 5 stays to the height, then every detent at its own speed.
+        assert_eq!(steps.len(), 3, "{steps:?}");
+        assert!(steps.iter().all(|(agl, _, _)| *agl > 1000.0), "{steps:?}");
+        assert!(steps[2].1 >= 210.0 && steps[2].2 <= 1e-6, "{steps:?}");
+        // The handoff is clean, inside the wait, and nowhere near 250.
+        assert!(h_ias < 235.0 && h_agl < 2500.0, "{h_agl} ft {h_ias} kt");
+    }
+
+    #[test]
+    fn the_speed_hold_is_a_jets_below_its_height_and_nobody_elses() {
+        let c = Some(ClimbOut { accel_agl_ft: 1000.0, max_fpm: 3000.0 });
+        // On speed: the base rate. Ten over: a thousand more. Capped at best.
+        assert_eq!(climb_out_vs_fpm(170.0, 170.0, 1500.0, None, 500.0, c), 1500.0);
+        assert_eq!(climb_out_vs_fpm(180.0, 170.0, 1500.0, None, 500.0, c), 2500.0);
+        assert_eq!(climb_out_vs_fpm(200.0, 170.0, 1500.0, None, 500.0, c), 3000.0);
+        // Slow is still slow: the rate is backed off, never added to.
+        assert_eq!(climb_out_vs_fpm(160.0, 170.0, 1500.0, None, 500.0, c), 900.0);
+        // At the height, and on a trainer at any height, the old climb.
+        assert_eq!(climb_out_vs_fpm(200.0, 170.0, 1500.0, None, 1000.0, c), 1500.0);
+        assert_eq!(climb_out_vs_fpm(90.0, 74.0, 560.0, None, 500.0, None), 560.0);
+        // A best rate under the base never LOWERS the climb.
+        let low = Some(ClimbOut { accel_agl_ft: 1000.0, max_fpm: 0.0 });
+        assert_eq!(climb_out_vs_fpm(200.0, 170.0, 1500.0, None, 500.0, low), 1500.0);
+    }
+
+    #[test]
+    fn a_circuit_keeps_the_old_climb_out_whole() {
+        let _g = CLIMB_OUT_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        publish_climb_out(Some(ClimbOut { accel_agl_ft: 1000.0, max_fpm: 3000.0 }));
+        assert!(climb_out_for(DEFAULT_HANDOFF_AGL_FT).is_some());
+        assert!(climb_out_for(500.0).is_none());
+        publish_climb_out(None);
+        assert!(climb_out_for(DEFAULT_HANDOFF_AGL_FT).is_none());
+    }
+
+    static CLIMB_OUT_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_jets_declare_a_climb_out_and_the_trainer_does_not() {
+        for (id, want) in [("boeing_737_800", true), ("airbus_a330_300", true), ("cessna_172sp", false)] {
+            let Some(p) = crate::aircraft::load(id) else { continue };
+            assert_eq!(ClimbOut::from_profile(&p).is_some(), want, "{id}");
+        }
     }
 }

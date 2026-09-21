@@ -145,17 +145,30 @@ fn summarise(flight: &[&Value]) -> String {
         let mut driving = false;
         let mut rolling = false;
         let mut stops = 0u32;
+        // A halt counts once the taxi ROLLS AGAIN from it: the halt at the
+        // holding point is logged before the `holding_point` event, and was
+        // reported as a taxi that "rolled to a stop before its holding
+        // point" on a taxi that never did (EGPH, 2026-09-21).
+        let mut halted = false;
         for e in flight {
             match (s(e, "kind").as_str(), s(e, "event").as_str()) {
                 ("autotaxi", "engaged") => driving = true,
-                ("autotaxi", "holding_point" | "off_route") => driving = false,
+                ("autotaxi", "holding_point" | "off_route") => {
+                    driving = false;
+                    rolling = false;
+                    halted = false;
+                }
                 ("state", _) if driving => {
                     let gs = f(e, "gs").unwrap_or(0.0);
                     if gs > 2.0 {
+                        if halted {
+                            stops += 1;
+                            halted = false;
+                        }
                         rolling = true;
                     } else if gs < 0.5 && rolling {
                         rolling = false;
-                        stops += 1;
+                        halted = true;
                     }
                 }
                 _ => {}

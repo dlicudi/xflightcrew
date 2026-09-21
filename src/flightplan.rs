@@ -739,6 +739,8 @@ impl Planned {
     pub fn to_flight_plan(&self) -> FlightPlan {
         let f = self.fuel.as_ref();
         FlightPlan {
+            transition_altitude_ft: None,
+            transition_level_ft: None,
             source: PlanSource::Local,
             origin: self.origin.icao.clone(),
             destination: self.dest.icao.clone(),

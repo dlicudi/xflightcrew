@@ -28,6 +28,8 @@ pub struct Circuit {
     pub takeoff_flap_ratio: Option<f64>,
     pub flap_schedule: Vec<(f64, f64)>,
     pub takeoff_roll_m: Option<f64>,
+    /// The weight `takeoff_roll_m` is quoted AT, kg.
+    pub mtow_kg: Option<f64>,
     /// Approach speed handed to autoland on final (KIAS).
     pub approach_ias: f64,
     /// Constant-speed prop levers, advanced out of feather before the circuit's
@@ -207,6 +209,13 @@ impl Tool for Circuit {
         }
         // Props full forward before the circuit's takeoff roll begins.
         super::prop::advance_for_ground_roll(ctx.xplane, &self.prop).await;
+        let needed_m = crate::aircraft::takeoff_needed_now_m(
+            ctx.xplane,
+            self.takeoff_roll_m,
+            self.mtow_kg,
+            500.0,
+        )
+        .await;
         circuit::start(
             ctx.config.xplane_base_url.clone(),
             ctx.voice.cloned(),
@@ -231,12 +240,16 @@ impl Tool for Circuit {
                     takeoff_flap_ratio: self.takeoff_flap_ratio,
                     flap_schedule: self.flap_schedule.clone(),
                     cleared_runway: party_line::clearance_runway(),
-                    needed_m: self.takeoff_roll_m.map_or(500.0, |m| m * 1.4),
+                    needed_m,
                     // Hand off low so the circuit turns crosswind while still
                     // climbing — a normal-size pattern, not a 4 km straightaway.
+                    // Filled in by the circuit once the pattern is chosen.
+                    level_ft: None,
                     handoff_agl_ft: 500.0,
                     // The CIRCUIT takes it at the handoff, not the pilot.
                     handoff_to_caller: true,
+                    handoff_speed_kts: None,
+                    base_url: ctx.config.xplane_base_url.clone(),
                     park_brake_valve_set: self.park_brake_valve_set,
                 },
                 approach_ias: self.approach_ias,

@@ -292,7 +292,10 @@ async fn read_switch(xp: &dyn XPlane, dr: &str) -> Option<bool> {
         Some(i) => xp.get_float_array(base).await.ok()?.get(i).copied()?,
         None => xp.get_float(base).await.ok()?,
     };
-    Some(v > 0.5)
+    // At or above the half: the A330's nose light is a three-position switch
+    // on `landing_lights_switch[1]` (OFF 0 / TAXI 0.5 / T.O. 1.0), and its
+    // TAXI detent is a lit light, not an unlit one.
+    Some(v >= 0.5)
 }
 
 /// Drive one profile light to `on` and report the state it ACTUALLY reached.
@@ -461,7 +464,7 @@ impl SetFloodLights {
 }
 
 /// Split a `name[i]` dataref into base + index; `(name, None)` if unindexed.
-fn split_index(dr: &str) -> (&str, Option<usize>) {
+pub(crate) fn split_index(dr: &str) -> (&str, Option<usize>) {
     if let Some(open) = dr.rfind('[') {
         if let Some(inner) = dr.strip_suffix(']') {
             if let Ok(i) = inner[open + 1..].parse::<usize>() {

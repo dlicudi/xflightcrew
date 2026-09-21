@@ -27,7 +27,7 @@ sw_item:FUEL PUMPS RIGHT|ON:sim/cockpit2/fuel/fuel_tank_pump_on[2]:1
 sw_item:APU BLEED|ON:sim/cockpit2/bleedair/actuators/apu_bleed:1
 sw_item:PACKS|AUTO:sim/cockpit2/bleedair/actuators/pack_left:1
 sw_item:ELECTRIC HYDRAULIC PUMPS|ON:sim/cockpit2/switches/electric_hydraulic_pump_on:1
-sw_item:SEAT BELT SIGNS|ON:sim/cockpit2/switches/fasten_seat_belts:1
+sw_item:SEAT BELT SIGNS|ON:sim/cockpit2/switches/fasten_seat_belts:2
 sw_item:NAVIGATION LIGHTS|ON:sim/cockpit2/switches/navigation_lights_on:1
 sw_item:LOGO LIGHTS|AS REQUIRED
 sw_item:FLIGHT PLAN|ENTERED IN THE FMC
@@ -114,7 +114,7 @@ sw_remark:CRUISE COMPLETE
 
 sw_checklist:DESCENT:DESCENT
 sw_remark:DESCENT
-sw_item:SEAT BELT SIGNS|ON:sim/cockpit2/switches/fasten_seat_belts:1
+sw_item:SEAT BELT SIGNS|ON:sim/cockpit2/switches/fasten_seat_belts:2
 sw_item:PRESSURISATION|LANDING ALTITUDE SET
 sw_item:APPROACH BRIEFING|COMPLETE
 sw_item:AUTOBRAKE|AS REQUIRED

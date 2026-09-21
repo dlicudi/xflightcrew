@@ -425,9 +425,22 @@ async fn wait_enroute_working_the_radio(
     // Landing and taxi lights off once clear of the pattern: one read per
     // pass until the height is made, then never again this leg.
     let mut landing_off = false;
+    // The signs follow the flight through ten thousand, both ways.
+    let mut signs = crate::tools::signs::Watch::default();
     loop {
         if ABORT.load(SeqCst) {
             return false;
+        }
+        if let Ok(alt_ft) = xp.get_float(ALT_IND_FT).await {
+            if let Some(on) = signs.tick(alt_ft) {
+                if crate::tools::signs::set(xp, on).await == Some(true) {
+                    announce(
+                        voice,
+                        Priority::Advisory,
+                        if on { "Seat belt signs on." } else { "Seat belt signs off." },
+                    );
+                }
+            }
         }
         if !crate::procedure::running() {
             return crate::procedure::outcome() == Some(sim::run::Outcome::Completed);
@@ -794,6 +807,10 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             event("lights_panel", json!({ "on": lit }));
         }
         event("lights_beacon", json!({ "beacon": beacon }));
+        // Seat belt signs on before anything turns (see `tools::signs`).
+        if let Some(ok) = crate::tools::signs::set(&xp, true).await {
+            event("seat_belt_signs", json!({ "on": true, "ok": ok }));
+        }
         // Only claim the beacon on an airframe that has one — the Lancair's
         // switch row is NAV / LAND / STRB and nothing else.
         announce(
@@ -860,6 +877,26 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 }),
             );
         }
+    }
+    bail_if_abort!();
+
+    // The after-start flow's last item: the takeoff configuration, set with
+    // the whole taxi ahead of it, not during the roll (see `takeoff_config`).
+    // The takeoff confirms it before the brakes come off and there selects
+    // the level its caller hands down; on the ground and engines running
+    // only, so an airborne resume is never reconfigured for a takeoff.
+    if !matches!(tools.mission, Mission::Resume(_)) && engine_running(&xp).await {
+        let cfg = crate::takeoff_config::set_for_takeoff(
+            &xp,
+            tools.takeoff.takeoff_flap_ratio,
+            None,
+            false,
+        )
+        .await;
+        if let Some(line) = crate::takeoff_config::line("Takeoff config", &cfg) {
+            announce(&voice, Priority::Advisory, &line);
+        }
+        event("takeoff_config", json!({"set": cfg.set, "not_taken": cfg.not_taken}));
     }
     bail_if_abort!();
 
@@ -1362,15 +1399,31 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 return;
             }
             bail_if_abort!();
-            if lined_up(&xp, &tools, &config).await {
-                break;
-            }
-            if attempt == 1 {
-                give_up(
-                    &voice,
-                    "I couldn't get us onto the runway. Your aircraft.",
-                    "line_up_failed",
-                );
+            let why = match runway_check(&xp, &tools).await {
+                Ok(()) => break,
+                Err(why) => why,
+            };
+            // A runway that is too short stays too short: no second line-up.
+            let hopeless = matches!(why, Some(crate::autotakeoff::NoFit::RunwayTooShort { .. }));
+            if attempt == 1 || hopeless {
+                // Say which gate failed. "I couldn't get us onto the runway"
+                // was said to an A330 on Edinburgh 24's centreline, aligned
+                // within a degree, the tower logging `lined_up=true`: the fit
+                // had failed on LENGTH (2026-09-20).
+                event("line_up_no_fit", json!({ "why": format!("{why:?}") }));
+                use crate::autotakeoff::NoFit;
+                let line = match &why {
+                    Some(
+                        w @ (NoFit::RunwayTooShort { .. }
+                        | NoFit::TooLittleLeft { .. }
+                        | NoFit::NotAligned { .. }),
+                    ) => format!(
+                        "{} Your aircraft.",
+                        crate::autotakeoff::no_fit_line(w, false).0
+                    ),
+                    _ => "I couldn't get us onto the runway. Your aircraft.".to_string(),
+                };
+                give_up(&voice, &line, "line_up_failed");
                 return;
             }
         }
@@ -1398,6 +1451,40 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             return;
         }
         bail_if_abort!();
+    } else {
+        // A RUNWAY START: the sim put us on the numbers and nobody taxied.
+        // "Skip straight to the circuit" used to mean skipping the tower too:
+        // no call, no clearance, no strobes, and the A330 flew Glasgow's zone
+        // to "you are inside controlled airspace without clearance" (EGPF,
+        // 2026-09-21). The tower now takes a "ready" from the strip as a
+        // lined-up aircraft (`Ctx::own_on_runway`), so the same call and the
+        // same wait as the taxied departure apply.
+        let strobe = light(&tools, &ctx, "strobe", true).await;
+        let landing = light(&tools, &ctx, "landing", true).await;
+        event(
+            "lights_takeoff",
+            json!({ "strobe": strobe, "landing": landing, "runway_start": true }),
+        );
+        if crate::mode::atc_enabled() && crate::party_line::clearance_state().is_some() {
+            if let Some(khz) = crate::party_line::home_tower_khz() {
+                let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+            }
+            request_departure(&voice, &callsign).await;
+            bail_if_abort!();
+            let mut read_back = false;
+            waiting("the takeoff clearance");
+            if !ensure_takeoff_cleared(&voice, &callsign, &mut read_back, false).await {
+                give_up(
+                    &voice,
+                    "We're on the runway, but the tower never cleared us for takeoff. \
+                     Your aircraft. Say full auto again once we're cleared.",
+                    "no_takeoff_clearance",
+                );
+                return;
+            }
+            ensure_squawk(&xp, &ctx, &voice).await;
+            bail_if_abort!();
+        }
     }
 
     // --- Stage 4: the mission — a circuit, or the SimBrief flight -------------
@@ -1628,6 +1715,9 @@ async fn fly_route(
         return;
     }
     event("enroute_complete", json!({}));
+    // Whatever the cruise did with them, the signs are on for the arrival (a
+    // short sector never crossed ten thousand; nothing pressed when already on).
+    let _ = crate::tools::signs::set(xp, true).await;
     // The BEFORE LANDING item: full rich for the arrival, whatever the field
     // elevation (the manager's own floor would leave a leaned lever over a
     // high field), before the approach or the visual landing is built.
@@ -2089,7 +2179,9 @@ async fn taxi_in_after_landing(
         crate::autoland::VACATE_FOLLOWS.store(false, Relaxed);
         event(
             "no_taxi_in",
-            json!({ "landed": landed, "on_ground": on_ground, "crashed": crashed }),
+            // `autoland_ended`, not "landed": autoland also goes inactive on
+            // a give-up, and `landed: true` was logged at 1,900 ft.
+            json!({ "autoland_ended": landed, "on_ground": on_ground, "crashed": crashed }),
         );
         return;
     }
@@ -2207,6 +2299,18 @@ async fn call_inbound(
     if let Some(h) = crate::party_line::take_region_handoff() {
         obey_region_handoff(xp, ctx, voice, callsign, h, false).await;
     }
+    // ON the tower's frequency before the call is keyed. The enroute leg
+    // calls when the region has made the destination's tower the station,
+    // but a region change near a field is a crew notice ("closest field is
+    // Exeter"), not a handoff, and nothing retunes on a notice: EGPH-EGTE
+    // made this call on Carlisle's frequency, where COM1 had sat since the
+    // Scottish border, it went into the void marked as made, and Exeter
+    // challenged the arrival as an unknown aircraft (2026-09-21).
+    let tuned = xp.get_float(COM1_FREQ_KHZ).await.ok().map(|v| v.round() as i64);
+    if !inbound_on_frequency(tuned, khz) {
+        let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+        event("inbound_retune", json!({ "khz": khz, "was": tuned }));
+    }
     crate::circuit::transmit(crate::circuit::radio_call(callsign, "inbound for landing"));
     INBOUND_MADE.store(true, SeqCst);
     // From here the destination's tower is OURS: the region's service-weighted
@@ -2219,6 +2323,12 @@ async fn call_inbound(
         "inbound_call",
         json!({ "khz": khz, "station_swapped": swapped }),
     );
+}
+
+/// Is COM1 already on the tower the inbound call is for? A failed read is
+/// not "yes": the retune is one write and the void call cost a zone challenge.
+pub fn inbound_on_frequency(com1_khz: Option<i64>, tower_khz: i64) -> bool {
+    com1_khz == Some(tower_khz)
 }
 
 /// Release the arrival's hold on the station (see
@@ -2439,13 +2549,6 @@ async fn ensure_takeoff_cleared(
     true
 }
 
-/// Pavement the takeoff needs, metres: the profile's ground roll with a 1.4
-/// factor (the POH figure is a test pilot's on a dry day), never under 500 m.
-/// One rule for the line-up's fit test and the arm-time field check.
-pub fn takeoff_needed_m(takeoff_roll_m: Option<f64>) -> f64 {
-    takeoff_roll_m.map_or(500.0, |m| (m * 1.4).max(500.0))
-}
-
 /// What the arm-time preflight compares the plan against: the tanks and the
 /// load as the sim has them NOW, the airframe's book figures, and the longest
 /// runway at each end. `None`/0 = unknown, and an unknown is never a refusal.
@@ -2509,7 +2612,14 @@ pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result
     }
     // This end: the pavement the roll needs, factored, or the line-up would
     // find out at the hold after the start and the taxi.
-    let need_ft = takeoff_needed_m(f.takeoff_roll_m) * M_TO_FT;
+    // The roll is quoted at the PROFILE's max gross, whatever the plan's
+    // operational limit is; scaled to the weight on the wheels now.
+    let need_ft = crate::aircraft::takeoff_needed_m(
+        f.takeoff_roll_m,
+        f.total_kg,
+        f.max_gross_lb.map(|lb| lb / LB_PER_KG),
+        500.0,
+    ) * M_TO_FT;
     if f.takeoff_roll_m.is_some() && f.origin_longest_ft > 0.0 && f.origin_longest_ft < need_ft {
         return Err(format!(
             "Negative. {}'s longest runway is {}, and the takeoff needs {}. Not flying that.",
@@ -2622,21 +2732,42 @@ pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result
 /// Whether we're already sitting on a runway ready to depart — then taxi and
 /// line-up are skipped. Uses the takeoff loop's own fit against apt.dat.
 async fn lined_up(xp: &XPlaneClient, tools: &SubTools, _config: &Config) -> bool {
+    runway_check(xp, tools).await.is_ok()
+}
+
+/// The takeoff loop's own fit, asked with the takeoff's own pavement rule
+/// (`aircraft::takeoff_needed_now_m`), and on a miss the gate that failed.
+/// `Err(None)` = airborne, or no position to fit.
+async fn runway_check(
+    xp: &XPlaneClient,
+    tools: &SubTools,
+) -> Result<(), Option<crate::autotakeoff::NoFit>> {
     // Airborne is not "lined up"; and a fit needs a valid position.
     if xp.get_float(ON_GROUND).await.unwrap_or(1.0) < 0.5 {
-        return false;
+        return Err(None);
     }
     let (Ok(lat), Ok(lon), Ok(psi)) = (
         xp.get_float("sim/flightmodel/position/latitude").await,
         xp.get_float("sim/flightmodel/position/longitude").await,
         xp.get_float("sim/flightmodel/position/psi").await,
     ) else {
-        return false;
+        return Err(None);
     };
-    let needed_m = takeoff_needed_m(tools.line_up.takeoff_roll_m);
+    let needed_m = crate::aircraft::takeoff_needed_now_m(
+        xp,
+        tools.line_up.takeoff_roll_m,
+        tools.line_up.mtow_kg,
+        500.0,
+    )
+    .await;
     let apt = crate::tools::autoland::apt_dat_path();
     let cands = crate::autoland::nearby_runways(&apt, lat, lon, 3.0).unwrap_or_default();
-    crate::autotakeoff::runway_fit(&cands, lat, lon, psi, needed_m).is_some()
+    match crate::autotakeoff::runway_fit(&cands, lat, lon, psi, needed_m) {
+        Some(_) => Ok(()),
+        None => Err(Some(crate::autotakeoff::why_no_fit(
+            &cands, lat, lon, psi, needed_m,
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -2669,6 +2800,8 @@ mod tests {
     /// A 172 plan LXGB-LEAX as SimBrief sent it (2026-09-15), in kilos.
     fn plan(weights: bool) -> crate::simbrief::FlightPlan {
         crate::simbrief::FlightPlan {
+            transition_altitude_ft: None,
+            transition_level_ft: None,
             source: crate::simbrief::PlanSource::SimBrief,
             origin: "LXGB".into(),
             destination: "LEAX".into(),
@@ -2745,7 +2878,8 @@ mod tests {
             why,
             "Negative. LEAX's longest runway is 1,200 feet, and we need 1,335 feet to land. Not flying that."
         );
-        // The takeoff needs the roll x 1.4: 1,630 ft -> 2,282 ft.
+        // The takeoff needs the roll x 1.4 (1,630 ft -> 2,282 ft at max
+        // gross), scaled to the 1,100 kg on the wheels against 1,160: 2,163.
         let short_origin = super::PreflightFacts {
             origin_longest_ft: 2000.0,
             ..facts()
@@ -2753,7 +2887,7 @@ mod tests {
         let why = super::preflight(&plan(true), &short_origin).expect_err("refused");
         assert!(
             why.starts_with(
-                "Negative. LXGB's longest runway is 2,000 feet, and the takeoff needs 2,282 feet."
+                "Negative. LXGB's longest runway is 2,000 feet, and the takeoff needs 2,163 feet."
             ),
             "{why}"
         );

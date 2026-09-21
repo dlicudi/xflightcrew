@@ -282,10 +282,11 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
+                let mtow_kg = sim.get_float(datarefs::ACF_M_MAX_KG).ok();
                 let callsign = sim
                     .get_string(datarefs::TAILNUM)
                     .ok()
-                    .map(|t| tower::spoken_callsign(&t))
+                    .map(|t| tower::spoken_callsign_wake(&t, mtow_kg))
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "aircraft calling".to_string());
                 let ctx = tower::Ctx {
@@ -312,6 +313,7 @@ fn main() -> Result<()> {
                     taxi_via: Vec::new(),
                     taxi_crossings: Vec::new(),
                     on_ground: false,
+                    own_on_runway: false,
                 };
                 let intent = if heard.confidence < config.stt_min_confidence {
                     tower::Intent::Unknown // garbled call → "say again", never a guessed clearance

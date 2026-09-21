@@ -466,7 +466,11 @@ fn parse_item(rest: &str, map: &[ChecklistMapEntry], fuel: &[FuelPosition]) -> I
     };
     let (base, index) = split_index(dataref.trim());
 
-    match action_for(map, &base, &cond, fuel) {
+    // The map sees the dataref WITH its index: a per-element entry
+    // ("landing_lights_switch[1]", the A330's taxi light on a three-position
+    // nose-light switch, 2026-09-20) can only match against the full name,
+    // and a base-only entry matches the full name just the same.
+    match action_for(map, dataref.trim(), &cond, fuel) {
         Some((tool, args)) => {
             let confirm = confirm_for(tool, &args);
             Item::Act {

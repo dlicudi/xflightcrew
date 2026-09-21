@@ -1,0 +1,159 @@
+# XChecklist-style normal checklist for the X-Plane 12 stock Airbus A330-300.
+# Written 2026-09-20 for XVoiceLayer from the aircraft's own Pilot Operating
+# Manual (pp.55-84, the only checklists it prints), its xlua auto-board /
+# auto-start sequences (A333.Z.autostart.lua) and an audit of which stock
+# datarefs its scripts rewrite every frame. Every test below reads a dataref
+# the aircraft OWNS or leaves alone: the stock seat-belt, transponder-mode,
+# battery, generator, bleed, pack, pump and strobe/nav datarefs are all
+# DERIVED per frame from the laminar/A333 switch positions, which makes them
+# honest READS (they say what the aircraft is doing) even though a write to
+# them is a silent no-op. Section titles are the crew's phase keys, so the
+# tracker proposes each list at its phase. Items with no test are call-outs.
+# An item conditioned on a height the list does not run at is a call-out.
+
+sw_checklist:PREFLIGHT:PREFLIGHT
+sw_remark:PREFLIGHT
+sw_item:PARKING BRAKE|ON:sim/cockpit2/controls/parking_brake_ratio:>0.5
+sw_item:TRANSPONDER|STANDBY:laminar/A333/transponder/auto_on_knob_pos:<-0.5
+sw_item:BATTERY 1|ON:laminar/A333/buttons/battery1_pos:1
+sw_item:BATTERY 2|ON:laminar/A333/buttons/battery2_pos:1
+sw_item:BEACON|ON:sim/cockpit2/switches/beacon_on:1
+sw_item:NAV LIGHTS|ON:sim/cockpit2/switches/navigation_lights_on:1
+sw_item:APU BATTERY|ON:laminar/A333/buttons/APU_batt_pos:1
+sw_item:APU MASTER|ON:laminar/A333/buttons/apu_master_ctct_on_off:1
+sw_item:APU|AVAIL:sim/cockpit2/electrical/APU_N1_percent:>95
+sw_item:APU GENERATOR|ON:laminar/A333/buttons/gen_apu_pos:1
+sw_item:IR 1, 2, 3|ON:laminar/A333/buttons/adirs/ir1_pos:1
+sw_item:ADR 1, 2, 3|ON:laminar/A333/buttons/adirs/adr1_pos:1
+sw_item:ADIRS SELECTORS|NAV:laminar/A333/buttons/adirs/ir1_knob_pos:1
+sw_item:APU BLEED|ON:sim/cockpit2/bleedair/actuators/apu_bleed:1
+sw_item:MCDU|INIT AND PERF ENTERED
+sw_item:FLIGHT CONTROL COMPUTERS|ALL ON
+sw_item:GPWS|ALL ON:laminar/A333/buttons/gpws/system_status:1
+sw_item:ELECTRIC HYDRAULIC PUMPS|AUTO:laminar/A333/hyd/elec_green_contactor:1
+sw_item:FUEL PUMPS|ALL ON:sim/cockpit2/fuel/fuel_tank_pump_on[0]:1
+sw_item:BUS TIE|AUTO:laminar/A333/buttons/bus_tie_pos:1
+sw_item:ALTIMETERS|SET:sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot:>27
+sw_remark:PREFLIGHT COMPLETE
+
+sw_checklist:BEFORE START:BEFORE START
+sw_remark:BEFORE START
+sw_item:PARKING BRAKE|ON:sim/cockpit2/controls/parking_brake_ratio:>0.5
+sw_item:THRUST LEVERS|IDLE:sim/cockpit2/engine/actuators/throttle_ratio_all:<0.05
+sw_item:ENGINE MASTERS|OFF:laminar/A333/switches/engine1_start_pos:0
+sw_item:FLAPS|0:sim/cockpit2/controls/flap_ratio:<0.05
+sw_item:SPEED BRAKE|RETRACTED:sim/cockpit2/controls/speedbrake_ratio:<0.05
+sw_item:FUEL QUANTITY|CHECKED:sim/flightmodel/weight/m_fuel_total:>3000
+sw_item:FUEL PUMPS|ALL ON:sim/cockpit2/fuel/fuel_tank_pump_on[1]:1
+sw_item:APU BLEED|ON:sim/cockpit2/bleedair/actuators/apu_bleed:1
+sw_item:DOORS|CLOSED
+sw_remark:BEFORE START COMPLETE
+
+sw_checklist:ENGINE START:ENGINE START
+sw_remark:ENGINE START, NUMBER TWO FIRST: SAY START THE ENGINES
+sw_item:ENGINE MODE SELECTOR|IGN START:sim/cockpit2/engine/actuators/eng_mode_selector:>0.5
+sw_item:ENGINE 2 MASTER|ON:laminar/A333/switches/engine2_start_pos:1
+sw_item:ENGINE 2 STABILISED|CHECKED:sim/cockpit2/engine/indicators/N2_percent[1]:>50
+sw_item:ENGINE 1 MASTER|ON:laminar/A333/switches/engine1_start_pos:1
+sw_item:ENGINE 1 STABILISED|CHECKED:sim/cockpit2/engine/indicators/N2_percent[0]:>50
+sw_item:ENGINE MODE SELECTOR|NORM:sim/cockpit2/engine/actuators/eng_mode_selector:-0.5|0.5
+sw_item:GENERATOR 1|ON:laminar/A333/buttons/gen1_pos:1
+sw_item:GENERATOR 2|ON:laminar/A333/buttons/gen2_pos:1
+sw_item:APU GENERATOR|OFF:laminar/A333/buttons/gen_apu_pos:0
+sw_item:APU BLEED|OFF:laminar/A333/switch_memory/apu_bleed_on_off:0
+sw_item:ENGINE BLEEDS|ON:laminar/A333/buttons/eng_bleed_1_pos:1
+sw_item:PACKS|ON:laminar/A333/buttons/pack_1_pos:1
+sw_item:APU MASTER|OFF:laminar/A333/buttons/apu_master_ctct_on_off:0
+sw_remark:ENGINE START COMPLETE
+
+sw_checklist:BEFORE TAXI:BEFORE TAXI
+sw_remark:BEFORE TAXI
+sw_item:SEAT BELT SIGNS|ON:sim/cockpit2/switches/fasten_seat_belts:1
+sw_item:TAXI LIGHT|TAXI:sim/cockpit2/switches/landing_lights_switch[1]:>0.25
+sw_item:TRANSPONDER|AUTO:laminar/A333/transponder/auto_on_knob_pos:-0.5|0.5
+sw_item:TCAS|TA RA:laminar/A333/transponder/ta_ra_knob_pos:2
+sw_item:FLAPS|CONF 2 FOR TAKEOFF:sim/cockpit2/controls/flap_ratio:0.4|0.6
+sw_item:SPEED BRAKE|ARMED:sim/cockpit2/controls/speedbrake_ratio:<-0.25
+sw_item:AUTOBRAKE|MAX:sim/cockpit2/switches/auto_brake_level:<0.5
+sw_item:FLIGHT CONTROLS|CHECKED
+sw_item:PARKING BRAKE|OFF:sim/cockpit2/controls/parking_brake_ratio:<0.1
+sw_remark:BEFORE TAXI COMPLETE
+
+sw_checklist:BEFORE TAKEOFF:BEFORE TAKEOFF
+sw_remark:BEFORE TAKEOFF
+sw_item:ALTIMETERS|SET:sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot:>27
+sw_item:FLAPS|CONF 2:sim/cockpit2/controls/flap_ratio:0.4|0.6
+sw_item:SPEED BRAKE|ARMED:sim/cockpit2/controls/speedbrake_ratio:<-0.25
+sw_item:AUTOBRAKE|MAX:sim/cockpit2/switches/auto_brake_level:<0.5
+sw_item:TRANSPONDER|AUTO:laminar/A333/transponder/auto_on_knob_pos:-0.5|0.5
+sw_item:LANDING LIGHTS|ON:sim/cockpit2/switches/landing_lights_switch[0]:1
+sw_item:TAXI LIGHT|TAKEOFF:sim/cockpit2/switches/landing_lights_switch[1]:>0.75
+sw_item:STROBES|ON:laminar/a333/switches/strobe_pos:>0.5
+sw_item:PARKING BRAKE|OFF:sim/cockpit2/controls/parking_brake_ratio:<0.1
+sw_item:CABIN|SECURE
+sw_remark:BEFORE TAKEOFF COMPLETE. V1 143, VR 148, V2 153 AT MID WEIGHT, CONF 2
+
+sw_checklist:CLIMB:CLIMB
+sw_remark:CLIMB
+sw_item:LANDING GEAR|UP:sim/cockpit2/controls/gear_handle_down:0
+sw_item:FLAPS|RETRACTED ON SCHEDULE:sim/cockpit2/controls/flap_ratio:<0.05
+sw_item:THRUST|CLIMB
+sw_item:SPEED BRAKE|DISARMED:sim/cockpit2/controls/speedbrake_ratio:>-0.25
+sw_item:LANDING LIGHTS|OFF ABOVE 10,000
+sw_item:TAXI LIGHT|OFF:sim/cockpit2/switches/landing_lights_switch[1]:<0.25
+sw_item:ALTIMETERS|STANDARD AT TRANSITION
+sw_item:PACKS|ON:laminar/A333/buttons/pack_1_pos:1
+sw_remark:CLIMB COMPLETE
+
+sw_checklist:CRUISE:CRUISE
+sw_remark:CRUISE
+sw_item:SEAT BELT SIGNS|AS REQUIRED
+sw_item:LANDING LIGHTS|OFF:sim/cockpit2/switches/landing_lights_switch[0]:0
+sw_item:FUEL|BALANCED AND SUFFICIENT
+sw_item:ENGINE INSTRUMENTS|CHECKED
+sw_item:PRESSURISATION|CHECKED
+sw_remark:CRUISE COMPLETE
+
+sw_checklist:DESCENT:DESCENT
+sw_remark:DESCENT
+sw_item:SEAT BELT SIGNS|ON:sim/cockpit2/switches/fasten_seat_belts:1
+sw_item:APPROACH BRIEFING|COMPLETE
+sw_item:MCDU|APPROACH PHASE AND MINIMUMS SET
+sw_item:AUTOBRAKE|AS REQUIRED
+sw_item:ALTIMETERS|QNH BELOW TRANSITION
+sw_item:LANDING LIGHTS|ON BELOW 10,000
+sw_remark:DESCENT COMPLETE
+
+sw_checklist:BEFORE LANDING:BEFORE LANDING
+sw_remark:BEFORE LANDING
+sw_item:SPEED BRAKE|ARMED:sim/cockpit2/controls/speedbrake_ratio:<-0.25
+sw_item:AUTOBRAKE|LO OR MED:sim/cockpit2/switches/auto_brake_level:>2.5
+sw_item:LANDING GEAR|DOWN:sim/cockpit2/controls/gear_handle_down:1
+sw_item:FLAPS|CONF 3 OR FULL:sim/cockpit2/controls/flap_ratio:>0.7
+sw_item:LANDING LIGHTS|ON:sim/cockpit2/switches/landing_lights_switch[0]:1
+sw_item:TAXI LIGHT|TAKEOFF:sim/cockpit2/switches/landing_lights_switch[1]:>0.75
+sw_remark:BEFORE LANDING COMPLETE. VAPP 154 MID WEIGHT, CONF FULL
+
+sw_checklist:AFTER LANDING:AFTER LANDING
+sw_remark:AFTER LANDING
+sw_item:FLAPS|RETRACTED:sim/cockpit2/controls/flap_ratio:<0.05
+sw_item:SPEED BRAKE|DISARMED:sim/cockpit2/controls/speedbrake_ratio:>-0.25
+sw_item:LANDING LIGHTS|OFF:sim/cockpit2/switches/landing_lights_switch[0]:0
+sw_item:TAXI LIGHT|TAXI:sim/cockpit2/switches/landing_lights_switch[1]:0.25|0.75
+sw_item:STROBES|OFF OR AUTO:laminar/a333/switches/strobe_pos:<1.5
+sw_item:TRANSPONDER|AS REQUIRED
+sw_remark:AFTER LANDING COMPLETE
+
+sw_checklist:SHUTDOWN:SHUTDOWN
+sw_remark:SHUTDOWN
+sw_item:PARKING BRAKE|ON:sim/cockpit2/controls/parking_brake_ratio:>0.5
+sw_item:SEAT BELT SIGNS|OFF:sim/cockpit2/switches/fasten_seat_belts:0
+sw_item:TRANSPONDER|STANDBY:laminar/A333/transponder/auto_on_knob_pos:<-0.5
+sw_item:ENGINE 1 MASTER|OFF:laminar/A333/switches/engine1_start_pos:0
+sw_item:ENGINE 2 MASTER|OFF:laminar/A333/switches/engine2_start_pos:0
+sw_item:FUEL PUMPS|ALL OFF:sim/cockpit2/fuel/fuel_tank_pump_on[0]:0
+sw_item:ADIRS SELECTORS|OFF:laminar/A333/buttons/adirs/ir1_knob_pos:0
+sw_item:BEACON|OFF:sim/cockpit2/switches/beacon_on:0
+sw_item:NAV LIGHTS|OFF:sim/cockpit2/switches/navigation_lights_on:0
+sw_item:BATTERIES|OFF:laminar/A333/buttons/battery1_pos:0
+sw_remark:SHUTDOWN COMPLETE

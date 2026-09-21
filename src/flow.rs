@@ -838,6 +838,14 @@ pub fn held_by_automation(dataref: &str) -> Option<&'static str> {
     if dataref.contains("flap") && crate::autoland::ACTIVE.load(Relaxed) {
         return Some("autoland");
     }
+    // Full auto works the signs by height (off through ten thousand, on
+    // again through it on the way down). The descent list runs at the top of
+    // descent, seven thousand feet above that, and "seat belt signs, on" was
+    // spoken as a discrepancy on a flight that was exactly as it should be
+    // (EGPH-EGTE, 2026-09-21).
+    if crate::full_auto::ACTIVE.load(Relaxed) && crate::tools::signs::is_signs_dataref(dataref) {
+        return Some("the signs schedule");
+    }
     None
 }
 
@@ -1363,6 +1371,45 @@ mod tests {
                 "737 file lacks {key}"
             );
         }
+    }
+
+    /// The stock A330's list (2026-09-20), same shape: the tracker's phases
+    /// and the syllabus's ramp lists all resolve, and every conditioned item
+    /// reads a dataref the aircraft owns or leaves alone (the map turns the
+    /// ones with a tool into acts, the rest stay verifies).
+    #[test]
+    fn every_phase_section_is_found_in_the_a330_file() {
+        let p = crate::aircraft::load("airbus_a330_300").expect("A330 profile");
+        let lists = crate::checklist::load(&p).expect("A330 checklist parses");
+        let ramp = [
+            "preflight",
+            "before start",
+            "engine start",
+            "before taxi",
+            "before takeoff",
+            "shutdown",
+        ];
+        for key in SECTIONS.iter().chain(ramp.iter()) {
+            assert!(
+                find_section_in(&lists, key, &[]).is_some(),
+                "A330 file lacks {key}"
+            );
+        }
+        // The before-taxi list's taxi light is an ACT through the map, not a
+        // bare verify: the A330's nose light is a three-position switch on
+        // one element of `landing_lights_switch`, so the map entry carries
+        // the index. (The transponder stays a verify: its mode is a laminar
+        // knob whose values the shared stock decoding does not speak.)
+        let bt = &lists[find_section_in(&lists, "before taxi", &[]).unwrap()];
+        let acts: Vec<&str> = bt
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                crate::checklist::Item::Act { tool, .. } => Some(*tool),
+                _ => None,
+            })
+            .collect();
+        assert!(acts.contains(&"set_lights"), "taxi light is an act: {acts:?}");
     }
 
     #[test]

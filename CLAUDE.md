@@ -128,6 +128,14 @@ tools; YAML carries per-airframe config. Standing rules:
   static), `takeoff_roll_ft` (the ground roll the automation checks runways
   against) vs `takeoff_distance_ft` (the recited, factored field length),
   pattern altitude/speeds, park-brake valve sense, etc.
+- **"Enough runway" is ONE rule** (`aircraft::takeoff_needed_m` /
+  `takeoff_needed_now_m`: the roll scaled to the weight on the wheels, x 1.4,
+  the caller's floor) behind the takeoff, the circuit, the line-up's
+  full-length check, full auto's `runway_check` and the arm preflight. It was
+  five copies and the weight fix reached one: full auto said "I couldn't get
+  us onto the runway" to an A330 lined up on EGPH 24 (2026-09-20). A failed
+  fit is SPOKEN by its gate (`autotakeoff::no_fit_line`), never as "not on
+  the runway".
 - **Multi-engine tools take `engines` and act per engine**; the readback reads
   the LAST element written (element 0 can be right while a later one refused).
   Singles stay byte-identical (element 0, starter 1).
@@ -142,11 +150,20 @@ tools; YAML carries per-airframe config. Standing rules:
   and only if the file is unreadable do the 172 numbers apply, said aloud.
   Approach speed derived = max(1.3 Vso, 1.2 Vs). `bus_volts_nominal`
   scales the start gate (12 volt systems exist).
+- **A flow runs at a crew's pace and the voice says milestones, not
+  switches** (`jet_start::AirlinerStart::run_steps`, 2026-09-20): a switch
+  is fired, its position READ BACK until it agrees, then a beat; one
+  already set is passed over; every step is blackboxed and on the panel,
+  only a profile `say:` milestone is spoken, and a switch that never took
+  is named in the closing line. Twenty presses in two seconds is a macro.
 - **No automation target goes below the airframe's speed floor**
   (`aircraft::speed_floor_kts`, 1.2 x clean Vs, republished per swap):
   `speedhold::arm_flight` and `run_autoland` raise the target to it, say so,
   and blackbox `target_floored` / `approach_ias_floored`. A wrong number
   handed down from a profile, a plan or a pilot is still a wrong number.
+  The governor's CEILING is the airframe's too (`speed_ceiling_kts`, Vne
+  less 15, republished per swap; 250 only with no Vne on file): a flat 250
+  held an A330's 290 kt cruise with nothing said (2026-09-20).
 - **A profile line is a HYPOTHESIS until probed live**: `is_writable` and
   existence are one curl away when the sim is up. And it IS probed: on
   every airframe the detection thread walks the live profile for every
@@ -174,6 +191,11 @@ tools; YAML carries per-airframe config. Standing rules:
   be a command; read-only switch positions need read-before-fire toggle tools
   (`*_toggle`), carried through full auto's copies too. Paired lights are
   written together (one pod lit is a readback confirming the half it looked at).
+  **A read-only KNOB is stepped by its commands** (`TransponderModeKnob`
+  `up_command`/`down_command`, `radio::step_knob`: read, one step, read
+  again, bounded): the A330's transponder knob reports `is_writable: false`
+  and every mode write on it was a silent no-op (2026-09-20). Still owed:
+  the profile probe checks existence, not writability.
 - **Study-level add-ons**: the stock dataref can be the add-on's OUTPUT (its
   Lua rewrites it every frame), so a stock write is a silent no-op. When a
   tool "does nothing" on an add-on, read its Lua. Declared knobs (e.g.
@@ -187,6 +209,29 @@ tools; YAML carries per-airframe config. Standing rules:
   entry, connection lost), and a source-scanning test pins that list to every
   `static ACTIVE` in the tree. A new loop or selector goes there, never in a
   hand list in a caller.
+- **A crew configures the aircraft before it moves**
+  ([src/takeoff_config.rs](src/takeoff_config.rs), EGPF 2026-09-21: flaps
+  written after "Rolling", the dial at the 100 ft the A330 loads with, spoilers
+  and autobrake never set). One page, three callers: full auto after the
+  start, the takeoff before the brakes come off (it WAITS for the flaps to
+  arrive), autoland at the gear. Flaps, trim and the altitude dial everywhere
+  (`initial_altitude_ft`: the caller's level, else 3,000 ft above the field;
+  a dial the pilot set is the pilot's); spoilers and autobrake where the
+  profile's `takeoff_config:` declares them. **Armed for the roll is an
+  Airbus habit**: a Boeing declares `takeoff_speedbrake_down` (the 737's own
+  BEFORE TAKEOFF item; the lever is put DOWN, a reject above 40 kt raises it,
+  `on_reject`), and spoilers armed for a roll are disarmed after the gear
+  (`after_liftoff`; the 737 climbed through 7,000 ft with SPEED BRAKE ARMED
+  lit, EGPH 2026-09-21). Read first, left alone in state,
+  read back, named when it did not take, one milestone line. **Seat belt
+  signs** ([src/tools/signs.rs](src/tools/signs.rs)): on before anything
+  turns, off through ten thousand, on again through ten thousand, on for the
+  arrival; an add-on's own switch is declared (`seat_belt_signs:`) and
+  stepped, a stock cabin gets the stock switch.
+- **A box with several knobs is confirmed from its output**
+  (`TransponderModeKnob.also`, `radio::stock_transmits`): the A330 in AUTO
+  with TCAS in STBY is stock mode 1, and `transponder_alt ok: true` was
+  logged from the one knob that was turned while the flight squawked standby.
 - **A cart and a contactor are two different things**: ground power drives the
   cart request (only when presence differs from want - firing the toggle blind
   dismisses the cart) AND `gpu_on`, and reports BUS volts, not the request.
@@ -311,6 +356,16 @@ CIFP platform altitudes, dialect by ICAO prefix (FAA vs ICAO/CAP 413;
 `qnh_clause` is the one pressure seam), `suggest_call` as the single source
 for coach and panel.
 
+**The tower's wind is the FIELD's** (`station::set_surface_wind`, fed from
+the METAR file by `monitor::feed_surface_wind`, above the quiet gate, keyed
+by position): the wind datarefs are the air the aircraft is in, and at
+2,700 ft they picked the opposite end to the crew's METAR pick (EGTE,
+2026-09-21). Arrival states freeze the runway in use like departure states
+do; an arrival's STATED runway stands when the wind is inside the swap margin
+and no stream lands the other way (`note_stated_runway`). A frequency read
+back is a readback (`frequency_readback`); a readback within 45 s of a region
+switch is `handoff_readback`, not `void`.
+
 **Audio and PTT rules:**
 
 - TWO independent half-duplex channels: copilot INTERCOM and station RADIO,
@@ -417,6 +472,24 @@ history):
   pitch damping uses the sim's measured `Q`, never attitude differenced over
   a tick, lead 0.3 s. **The handoff line must be true about who has the
   aircraft** (`handoff_to_caller`) and about the height actually reached.
+  **A pilot handoff leaves a FLYABLE aircraft** (EGPH 2026-09-20: takeoff
+  thrust, VS +1,500, flap 1, the dial at 100 ft, Vmo by 10,000): the handoff
+  waits, still climbing, for the clean-up (`handoff_waits_for_clean_up`,
+  30 s); a dial the climb cannot capture is set 2,000 ft up
+  (`handoff_altitude_dial_ft`); the flight governor takes the speed the
+  loop's own overspeed guard was holding (`handoff_speed_kts`, 250 below
+  10,000), and the line names both. A flap schedule must be flyable inside
+  its placards (test-enforced over every profile). **A jet's climb-out is
+  declared** (`reference.acceleration_height_agl_ft`, `autotakeoff::ClimbOut`,
+  republished per swap): below the height the VS dial HOLDS
+  `initial_climb_kts` by climbing harder (`climb_out_vs_fpm`, 100 fpm a knot,
+  to `best_climb_fpm`) and the flaps stay put; above it the old 1,500 fpm
+  accelerates, the schedule steps, and the handoff waits for the schedule
+  (`handoff_waits_for_schedule`, 45 s) instead of one shot to zero. One
+  capped 1,500 fpm at takeoff thrust was 240 kt through 1,000 ft with the
+  flaps up by 740 (EGPH, 2026-09-21). A circuit (handoff 500 ft) keeps the
+  old climb-out whole. Still owed: the hand-flown 8 degrees below 300 ft is
+  where the first fifteen knots go.
 - **Pushback** ([src/pushback.rs](src/pushback.rs)): X-Plane's three pushback
   commands are WHOLE manoeuvres the tug executes (a "Nose 90" is ~90 degrees,
   and that belongs in the plan's arithmetic) - sent ONCE, at the summon,
@@ -496,6 +569,14 @@ history):
   other exit, and on the 172 it shares the wing cluster with the landing
   lamp); at the vacate landing off and taxi on
   (`after_vacate`); all off at the stand.
+  **The autopilot's own capture holds the level legs where the airframe
+  declares it** (`ap_altitude_capture`, `circuit::circuit_dial_ft`,
+  `ap_holds_level`): the level target goes on the dial, a CAPTURED hold on
+  that dial owns the leg and the VS law stands off, a new level is a new dial
+  plus VS, the glidepath parks the dial above. Per airframe because it rests
+  on the stock VS command leaving ALT (unproven on the 737); an autopilot
+  that refuses VS for 8 s is said once (`vs_refused`). The authored route
+  does not do it yet.
   **The sim's heading mode never reverses a turn in progress** (LXGB
   2026-09-14, five minutes of orbits): a bug stepped to the OUTSIDE of a
   bank goes round the long way, so every pursuit steer goes through
@@ -569,6 +650,9 @@ history):
   An autopilot target is judged against that SAME floor, not just the ground
   under the wheels: a climb still into it is RAISED to the floor and said
   aloud, a descent below it refused with the number that works.
+- **Autoland takes the autopilot out at the wheels**
+  (`disconnect_autopilot`, at the rollout latch): a heading servo on the
+  ground cannot close its error and winds the yoke over (EGCC, 2026-09-21).
 - **Autoland**: pursuit aim keeps its full lead all the way in
   (`pursuit_aim_nm` - the aim walks down the runway, bounded by pavement);
   roundout band (`ROUNDOUT_MULT`/`ROUNDOUT_VS_FPM`) before the flare - a
@@ -631,6 +715,10 @@ history):
   (`EndAction::Approach { rwy_id }` to `run_autoland`'s forced runway): the
   self-pick is the emergency path and at a field with parallels it takes
   the nearer threshold (ILS 12 flown, landing on 13, cleared for 12). The
+  self-pick itself (`autoland::self_pick`, `landing_score`) takes the
+  AIRFRAME's minimum (`self_pick_min_length_m`, landing distance x 1.3, never
+  under 1,200 m), each field's METAR surface wind (a tailwind costs half a
+  mile a knot) and a small bonus for the longer parallel. The
   tower's clearance outranks the plan for an end at the SAME field, said
   aloud and blackboxed `runway_from_clearance`, and it is watched THROUGH
   the approach, not read once at the arm: the final report that earns the
@@ -644,6 +732,27 @@ history):
   DESTINATION's METAR before the aircraft's own wind datarefs
   (`weather::surface_wind`, `arrival_wind`; the datarefs at 30 nm and
   7,000 ft are the winds aloft), blackboxed on the `arrival_*` event.
+- **A reposition is a PATTERN, never a point** ([src/reversal.rs](src/reversal.rs),
+  EGTE 2026-09-21: a 737 re-armed from the 26 final onto 08 homed on a
+  centreline point, called "final" flying away from the runway, overshot by
+  1,880 m and balked at 94 ft, twice). Outbound on a line PARALLEL to the
+  centreline three sizing radii out, base, inbound on the final's own
+  pursuit; the latch's Reposition stage is HELD until the pattern ends, and
+  an ordinary approach starts one when `reversal::needed` (a final called
+  more than 75 degrees off the course, or an aim point it would reach
+  outbound). Sized for a SHALLOW bank on purpose; platform in MSL, fixed at
+  the start (a radio-altimeter platform chases the hills); half flap and
+  `pattern_ias` on the downwind; three patterns, then a give-up. **The
+  stabilised gate is a thousand feet and it is about TIME**
+  (`unstabilised_at_gate`, `reversal::predicted_residual_m`): position alone
+  calls 1,880 m at 3.3 nm interceptable, and a jet with 74 s to run arrives
+  207 m off. **A missed approach is never re-aimed** (`clearance_switch` takes
+  `going_around`): the go-around's own ClearedToLand to Inbound published a
+  flipped runway in use and replaced the climb-away at 60 ft. **The receding
+  guard measures from as far out as the approach has legitimately been**
+  (`recede_ref_nm`). **Flaps do not cycle on a placard**
+  (`flap_held_within_limits`). **A give-up hands the SPEED to the governor**
+  (`hand_back_speed_kts`): the flat 0.75 lever took a level 737 to 346 kt.
 - **A straight-in is only as good as its fixes** (LXGB 09, 2026-09-11): a
   DME-fix reconstruction keeps only fixes ON the final approach course
   (`RECON_ALIGN_DEG`), and `approach_plan_for` refuses any FAF autoland could
@@ -658,6 +767,13 @@ history):
   (`stabilised_xtk` = the circuit's `interceptable`, inside the FAP only) or
   it balks with height in hand - the flare gate under 100 ft was the only
   lateral balk, which is why the crash happened at 95 ft.
+  **The VS watchdog excuses a slow autopilot, never a dead one**
+  (`vs_not_held`: 700 fpm off the command AND not closing on it), and its
+  line names what is commanded (descent, climb, level).
+- **A runway start is a lined-up aircraft, and it still calls**
+  (`tower::Ctx::own_on_runway`, full auto's runway-start branch): the sim's
+  spawn on the numbers used to skip the call, the clearance, the squawk and
+  the strobes, and the A330 flew Glasgow's zone uncleared (2026-09-21).
 - **The crew works the radio as full auto flies** (same sortie): a
   conditional line-up waits on `party_line::line_up_condition_clear()` (the
   world's traffic picture, published by the release watch every tick) before
@@ -695,6 +811,17 @@ history):
   300 ft of cruise IS cruise, a JOIN projects along the nose (`project_signed_facing`), and the
   taxi law's idle-and-brake needs the speed to actually be over by 2 kt
   unless the build is a surge (`SURGE_KTS_S`).
+- **A descent that outruns the governor gets drag, then a shallower rate**
+  (`procedure::descent_drag`: speedbrake at 8 kt over the target where the
+  airframe declares `arm_spoilers`, in at 3, 75 % of the rate at 12 over and
+  half at 20; stowed on every exit). 2,000 fpm at idle reached the last fix at
+  278 kt (EGTE, 2026-09-21). **The inbound call is keyed on the tower's
+  frequency** (`call_inbound` tunes COM1 first): a region NOTICE near a field
+  retunes nothing, and the call went out on Carlisle's, marked as made.
+  **The transition altitude is the FLIGHT's** (`instruments::FlightTransition`,
+  from the plan's `origin/trans_alt` and `destination/trans_level`, published
+  at the arm, resolved by every consumer of `correct_setting_inhg`): the
+  profile's figure is only the default.
 - **Taxi guide** ([src/taxi_guide.rs](src/taxi_guide.rs)): early gentle cue,
   quiet inside the 60 m where the compliance watch takes over - never two
   voices on one mistake; gates on `pushback::ACTIVE` and along-track progress
@@ -863,7 +990,8 @@ hits / failures / slowest every 30 s (log + blackbox `api_load`, with a
 per-dataref histogram - the only thing that can name a hog). Reads go through
 a 60 ms value cache (a write drops its own entry so readbacks stay real);
 near-static flags (`is_in_replay`, `paused`, ...) are `SLOW_DATAREFS` at
-500 ms. Volume, not duplication, is where the cost is: `cached=0` in a window
+500 ms. A COMMAND clears the whole value cache (it can move any dataref, and
+the stepped-knob tools rest on the read after it). Volume, not duplication, is where the cost is: `cached=0` in a window
 is the honest answer, not a broken cache.
 
 ## Battle-test surface

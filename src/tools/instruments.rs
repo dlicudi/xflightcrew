@@ -156,6 +156,54 @@ pub fn correct_setting_inhg(
     }
 }
 
+/// THIS FLIGHT's transition: the origin's altitude on the way up, the
+/// destination's level on the way down, from the plan. `None` fields fall
+/// back to the airframe's default. Process-wide because the consumers are
+/// (the monitor's check, the spoken tool, full auto, the follower); set at
+/// the arm, cleared when the mission ends or the airframe changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FlightTransition {
+    pub altitude_ft: Option<f64>,
+    pub level_ft: Option<f64>,
+    /// The descent has begun: the destination's level is the one that counts.
+    pub descending: bool,
+}
+
+static FLIGHT_TRANSITION: std::sync::Mutex<Option<FlightTransition>> = std::sync::Mutex::new(None);
+
+pub fn publish_flight_transition(t: Option<FlightTransition>) {
+    *FLIGHT_TRANSITION.lock().unwrap_or_else(|e| e.into_inner()) = t;
+}
+
+/// The follower has started down: from here the destination's level rules.
+pub fn note_descending() {
+    if let Some(t) = FLIGHT_TRANSITION.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        t.descending = true;
+    }
+}
+
+/// The transition altitude in force: the flight's when a plan gave one, else
+/// `airframe_default_ft`. Every consumer of [`correct_setting_inhg`] resolves
+/// its number here, so they still cannot disagree.
+pub fn transition_in_force_ft(airframe_default_ft: f64) -> f64 {
+    resolve_transition(
+        *FLIGHT_TRANSITION.lock().unwrap_or_else(|e| e.into_inner()),
+        airframe_default_ft,
+    )
+}
+
+pub fn resolve_transition(flight: Option<FlightTransition>, airframe_default_ft: f64) -> f64 {
+    let Some(t) = flight else {
+        return airframe_default_ft;
+    };
+    let (first, second) = if t.descending {
+        (t.level_ft, t.altitude_ft)
+    } else {
+        (t.altitude_ft, t.level_ft)
+    };
+    first.or(second).unwrap_or(airframe_default_ft)
+}
+
 /// "three zero one zero" for 30.10: the way a setting is read on the air.
 pub fn spoken_setting(inhg: f64) -> String {
     crate::atis::spoken_digits(&format!("{inhg:.2}").replace('.', ""))
@@ -191,7 +239,7 @@ pub async fn sync_altimeter(
         .await
         .unwrap_or(0.0);
     let was = xp.get_float(BARO).await.unwrap_or(0.0);
-    let want = correct_setting_inhg(alt, transition_altitude_ft, pa);
+    let want = correct_setting_inhg(alt, transition_in_force_ft(transition_altitude_ft), pa);
     let now = set_altimeter(xp, want).await.ok()?;
     Some(AltimeterSync { was, now })
 }
@@ -235,11 +283,12 @@ impl Tool for SetAltimeterCurrent {
             .await
             .unwrap_or(0.0);
         let pa = ctx.xplane.get_float(crate::datarefs::QNH_PASCALS).await?;
-        let inhg = correct_setting_inhg(alt, self.transition_altitude_ft, pa);
+        let transition_ft = transition_in_force_ft(self.transition_altitude_ft);
+        let inhg = correct_setting_inhg(alt, transition_ft, pa);
         ctx.xplane.set_float(BARO, inhg).await?;
         let actual = ctx.xplane.get_float(BARO).await?;
-        if alt >= self.transition_altitude_ft {
-            let fl = (self.transition_altitude_ft / 100.0).round() as i64;
+        if alt >= transition_ft {
+            let fl = (transition_ft / 100.0).round() as i64;
             return Ok(format!(
                 "Roger, above the transition altitude — altimeter standard, {actual:.2}. \
                  (Local QNH below flight level {fl}.)"
@@ -367,6 +416,25 @@ impl Tool for AlignGyro {
 
 #[cfg(test)]
 mod tests {
+    /// EGPH-EGTE, 2026-09-21: the plan said 6,000; the 737's profile said
+    /// 18,000, and the cruise at "one seven thousand" was flown on QNH.
+    #[test]
+    fn the_plans_transition_outranks_the_airframes() {
+        let none = None;
+        assert_eq!(resolve_transition(none, 18_000.0), 18_000.0);
+        let uk = FlightTransition { altitude_ft: Some(6_000.0), level_ft: Some(7_000.0), descending: false };
+        assert_eq!(resolve_transition(Some(uk), 18_000.0), 6_000.0);
+        assert_eq!(correct_setting_inhg(17_000.0, resolve_transition(Some(uk), 18_000.0), 103_000.0), STANDARD_INHG);
+        // Down from cruise the destination's level is the one that counts...
+        let down = FlightTransition { descending: true, ..uk };
+        assert_eq!(resolve_transition(Some(down), 18_000.0), 7_000.0);
+        // ...and a plan with only one of the two uses it both ways.
+        let half = FlightTransition { altitude_ft: Some(5_000.0), level_ft: None, descending: true };
+        assert_eq!(resolve_transition(Some(half), 18_000.0), 5_000.0);
+        // A local plan carries neither: the airframe's default stands.
+        assert_eq!(resolve_transition(Some(FlightTransition::default()), 18_000.0), 18_000.0);
+    }
+
     use super::*;
 
     /// The 737's dial write never stands (its xlua copies its own memory over

@@ -99,6 +99,38 @@ pub const OFFLINE_MAX_SEGMENTS: usize = 12;
 pub const OFFLINE_TURN_DEG: f64 = 20.0;
 pub const OFFLINE_TURN_RATE_DPS: f64 = 1.0;
 
+/// Offline: a smaller heading change is still a TURN, not a wander, when the
+/// aircraft settles on the new heading: past the private heading tolerance
+/// and then steady (within `OFFLINE_SETTLED_DEG`) for `OFFLINE_SETTLED_S`.
+/// A route's 10 to 20 degree turns at its fixes were graded as "heading 19
+/// degrees left (FAIL)" on six of nine segments of a followed plan
+/// (EGPH-EGTE, 2026-09-21); a wander comes back and is still graded.
+pub const OFFLINE_COURSE_CHANGE_DEG: f64 = 10.0;
+pub const OFFLINE_SETTLED_DEG: f64 = 4.0;
+pub const OFFLINE_SETTLED_S: f64 = 30.0;
+
+/// Do the samples from here on hold a NEW heading, off `ref_hdg` by more than
+/// the tolerance, for the settled window? `ahead[0]` is the sample in question.
+pub fn course_change_at(ahead: &[Sample], ref_hdg: f64) -> bool {
+    let Some(first) = ahead.first() else {
+        return false;
+    };
+    if wrap180(first.hdg_deg - ref_hdg).abs() <= OFFLINE_COURSE_CHANGE_DEG {
+        return false;
+    }
+    let window: Vec<&Sample> = ahead
+        .iter()
+        .take_while(|s| s.t_s - first.t_s <= OFFLINE_SETTLED_S)
+        .collect();
+    let spans = window
+        .last()
+        .is_some_and(|l| l.t_s - first.t_s >= OFFLINE_SETTLED_S * 0.8);
+    spans
+        && window
+            .iter()
+            .all(|s| wrap180(s.hdg_deg - first.hdg_deg).abs() <= OFFLINE_SETTLED_DEG)
+}
+
 /// The certificate whose standards apply.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
@@ -2279,8 +2311,18 @@ pub fn grade_flight(states: &[&Value], profile: Option<&AircraftProfile>, level:
         let mut ref_hdg = samples[start].hdg_deg;
         let mut i = start + 1;
         while i < b {
-            if wrap180(samples[i].hdg_deg - ref_hdg).abs() > OFFLINE_TURN_DEG {
-                straight.push((seg, start, i));
+            let settled_turn = course_change_at(&samples[i..b], ref_hdg);
+            if wrap180(samples[i].hdg_deg - ref_hdg).abs() > OFFLINE_TURN_DEG || settled_turn {
+                // A turn is recognised partway round it (twenty degrees in,
+                // or after it has settled), so the straight run ends where
+                // the heading last sat on the old one: the first twenty
+                // degrees of every turn were being graded as the run's
+                // heading error, "20 degrees left (FAIL)" on a followed plan.
+                let end = (start..i)
+                    .rev()
+                    .find(|&k| wrap180(samples[k].hdg_deg - ref_hdg).abs() <= OFFLINE_SETTLED_DEG)
+                    .map_or(i, |k| k + 1);
+                straight.push((seg, start, end));
                 // Skip the turn: consecutive samples still swinging.
                 let mut j = i;
                 while j + 1 < b {

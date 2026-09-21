@@ -163,6 +163,9 @@
 - {text: "wilco", intent: unknown, readback: true}
 - {text: "squawk seven zero zero zero", intent: unknown, readback: true}
 - {text: "squawking seven thousand", intent: unknown, readback: true}
+# The crew's own handoff readback, answered "Edinburgh Tower, say again" (EGPH, 2026-09-21).
+- {text: "november eight one six november november, edinburgh departure on one two four decimal eight two five", intent: unknown, readback: true}
+- {text: "Exeter Tower on one one niner decimal eight, November eight one six November November", intent: unknown, readback: true}
 - {text: "with you passing one thousand five hundred", intent: unknown, readback: true}
 - {text: "Headace, do copy.", intent: unknown, readback: true}
 - {text: "roger, holding point alpha", intent: unknown, readback: true}

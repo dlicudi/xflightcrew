@@ -139,6 +139,20 @@ vne_kts: 340.0
 # ABOVE the flaps-40 approach speed on purpose: a clean-configuration floor is
 # what the automation may be handed from a plan, and the derived approach speed
 # is max(1.3 Vso, 1.2 Vs) anyway.
+# Set after start, confirmed before the brakes come off, and at the gear
+# (src/takeoff_config.rs). Probed parked 2026-09-21, a write and a read 1.2 s
+# later: `speedbrake_ratio` -0.5 (armed) holds, `auto_brake_level` 0 (RTO)
+# holds. Landing autobrake 2 is stock level 3 (0 RTO, 1 off, 2..5 = 1, 2, 3,
+# MAX). VERIFY in the air that the armed lever deploys at touchdown.
+# Boeing: the lever is DOWN for takeoff (the BEFORE TAKEOFF list's own item;
+# armed is a takeoff configuration warning), raised by the crew on a reject,
+# armed at the gear. EGPH 2026-09-21: armed after start and still armed
+# climbing through 7,000 ft.
+takeoff_config:
+  arm_spoilers: true
+  takeoff_speedbrake_down: true
+  autobrake_rto: true
+  landing_autobrake_level: 3
 vs_clean_kts: 139.0
 # Gear operating limit (VLO 235 to extend in the real aircraft; the acf's
 # Vle 270 is the extended limit). The tool refuses cycling above this.
@@ -198,6 +212,12 @@ reference:
   # 2,150 fpm off the commanded rate and levelled a 737 at takeoff thrust at
   # 1,030 ft before the follower picked it up (LFLL, 2026-09-17).
   initial_climb_kts: 170.0     # V2 150 + 20. VERIFY
+  # Where the climb-out stops holding that speed and starts accelerating and
+  # cleaning up. Below it the takeoff climbs as hard as `best_climb_fpm` to
+  # keep the speed, and the flaps stay put (EGPH 2026-09-21: 1,500 fpm at
+  # takeoff thrust was 240 kt through 1,000 ft, the flaps up by 740). VERIFY
+  # in the air: blackbox `autotakeoff` `climb`, `ias` near the hold to 1,000 ft.
+  acceleration_height_agl_ft: 1000.0
   best_climb_fpm: 3000.0       # initial climb, light; the climb law takes 80%
   # KIAS the cruise governor holds. Nothing in the crew reads Mach, so the
   # number must stay under Mmo 0.82 at the cruise altitudes a 737 files:
@@ -292,6 +312,11 @@ advisor:
     phases: [takeoff, approach, landing]
     say: Landing lights on.
     command: sim/lights/landing_lights_on
+  # The crew works the switch (`tools::signs`, the stock switch here: on
+  # before start, off through ten thousand, on again below), so the climb is
+  # not a phase where "off" is a fault. Probed parked 2026-09-21: 0 off,
+  # 1 AUTO, 2 ON all hold and the annunciator follows; the checklist's "ON"
+  # tested for 1, which is AUTO.
   - dataref: sim/cockpit2/switches/fasten_seat_belts
-    phases: [takeoff, climb, approach, landing]
+    phases: [takeoff, approach, landing]
     say: Seat belt signs are off.

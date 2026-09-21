@@ -247,6 +247,8 @@ pub struct LineUp {
     /// instead (LXGB's taxiways only reach the east half; holding point
     /// Charlie left an SR22 580 m for a 09 departure, 2026-07-22).
     pub takeoff_roll_m: Option<f64>,
+    /// The weight `takeoff_roll_m` is quoted AT, kg.
+    pub mtow_kg: Option<f64>,
     /// Constant-speed prop levers, advanced out of feather before the drive
     /// (a line-up is an auto taxi — same feathered-blade wall). `None` on
     /// the pistons.
@@ -356,9 +358,15 @@ impl Tool for LineUp {
             .get("backtrack")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        // Full-length check: the POH roll with the takeoff tool's 1.4
-        // margin, floored at the plain line-up's own minimum.
-        let needed_m = self.takeoff_roll_m.map_or(400.0, |m| (m * 1.4).max(400.0));
+        // Full-length check: the takeoff's own rule (weight-scaled roll,
+        // 1.4 margin), floored at the plain line-up's own minimum.
+        let needed_m = crate::aircraft::takeoff_needed_now_m(
+            ctx.xplane,
+            self.takeoff_roll_m,
+            self.mtow_kg,
+            400.0,
+        )
+        .await;
         // The cleared route's trimmed tail — the authored yellow lead-on from
         // the hold onto the centreline. The line-up drives it when it's ours.
         let lead_on =

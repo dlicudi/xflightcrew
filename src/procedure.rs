@@ -663,6 +663,48 @@ pub fn floor_indicated(floor_true_ft: f64, true_alt_ft: f64, indicated_alt_ft: f
     floor_true_ft - (true_alt_ft - indicated_alt_ft)
 }
 
+const SPEEDBRAKE: &str = "sim/cockpit2/controls/speedbrake_ratio";
+/// The flight detent: half. Full is a ground spoiler setting on most jets.
+const SPEEDBRAKE_FLIGHT: f64 = 0.5;
+/// The follower put the speedbrake out, so the follower puts it away. A
+/// lever the pilot pulled is the pilot's.
+static DRAG_OURS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Over the governor's target by this much in a descent: brakes out...
+const DRAG_OUT_KTS: f64 = 8.0;
+/// ...and back in this near it (hysteresis: a comparator on airspeed cycles).
+const DRAG_IN_KTS: f64 = 3.0;
+/// A commanded descent gentler than this is not one the brakes are for.
+const DRAG_MIN_DESCENT_FPM: f64 = 500.0;
+
+/// What a descent that is running away with the speed gets: whether the
+/// speedbrake should be out, and the fraction of the commanded rate to fly.
+///
+/// EGPH-EGTE, 2026-09-21: 2,000 fpm down with the governor's lever already at
+/// idle and nothing else to slow with. 258 kt through ten thousand against a
+/// 250 target, 267 at six, 278 at the last fix, where the approach armed. A
+/// governor with no drag device can only watch a descent accelerate. A crew
+/// pulls the speedbrake, and if that is not enough it shallows the descent:
+/// the speed is owed to the approach that starts at the bottom, the height
+/// can be lost later. Pure; `out` is the brake's state going in.
+pub fn descent_drag(out: bool, ias_kts: f64, target_kts: Option<f64>, vs_cmd_fpm: f64) -> (bool, f64) {
+    let Some(target) = target_kts else {
+        return (false, 1.0);
+    };
+    if vs_cmd_fpm > -DRAG_MIN_DESCENT_FPM {
+        return (false, 1.0);
+    }
+    let over = ias_kts - target;
+    let want_out = if out { over > DRAG_IN_KTS } else { over > DRAG_OUT_KTS };
+    let scale = if over > 20.0 {
+        0.5
+    } else if over > 12.0 {
+        0.75
+    } else {
+        1.0
+    };
+    (want_out, scale)
+}
+
 pub fn vertical_tick(
     leg: &ProcLeg,
     carry: f64,
@@ -962,14 +1004,28 @@ pub fn start_scoped(
             ACTIVE.store(false, Ordering::SeqCst);
             return;
         };
-        rt.block_on(fly(
-            XPlaneClient::new(base_url.clone())
-                .with_cancel(_lease.cancel.clone())
-                .with_parents(parents),
-            base_url,
-            voice,
-            plan,
-        ));
+        rt.block_on(async {
+            // A second client for the one thing owed on EVERY exit: a
+            // speedbrake this follower put out goes back in, whoever ended
+            // the flight and however (uncancelled on purpose).
+            let stow = XPlaneClient::new(base_url.clone());
+            fly(
+                XPlaneClient::new(base_url.clone())
+                    .with_cancel(_lease.cancel.clone())
+                    .with_parents(parents),
+                base_url,
+                voice,
+                plan,
+            )
+            .await;
+            if DRAG_OURS.swap(false, Ordering::SeqCst) {
+                let _ = stow.set_float(SPEEDBRAKE, 0.0).await;
+                crate::blackbox::record(
+                    "procedure",
+                    serde_json::json!({"event": "speedbrake", "out": false, "why": "follower_ended"}),
+                );
+            }
+        });
         ACTIVE.store(false, Ordering::SeqCst);
         publish_leg(None);
         publish_tod(None);
@@ -1490,6 +1546,44 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         if vs_cmd > 0.0 && vy_kts > 0.0 {
             vs_cmd = vs_cmd.min(crate::autotakeoff::climb_vs_fpm(ias, vy_kts, vs_cmd));
         }
+        if vs_cmd < -DRAG_MIN_DESCENT_FPM {
+            // Down from cruise: the destination's transition level rules.
+            crate::tools::instruments::note_descending();
+        }
+        // A descent that outruns the governor (`descent_drag`): speedbrake
+        // where the airframe has one, a shallower rate either way.
+        {
+            let ours = DRAG_OURS.load(Ordering::SeqCst);
+            let (want_out, scale) =
+                descent_drag(ours, ias, crate::tools::speedhold::flight_target(), vs_cmd);
+            vs_cmd *= scale;
+            if want_out != ours && crate::takeoff_config::has_speedbrake() {
+                // Read first: a lever already out is the pilot's, and an
+                // ARMED one (negative) is stowed-and-armed, ours to use.
+                let at = xp.get_float(SPEEDBRAKE).await.ok();
+                let write = match (want_out, at) {
+                    (true, Some(v)) if v <= 0.05 => Some(SPEEDBRAKE_FLIGHT),
+                    (false, Some(_)) => Some(0.0),
+                    _ => None,
+                };
+                if let Some(v) = write {
+                    if xp.set_float(SPEEDBRAKE, v).await.is_ok() {
+                        DRAG_OURS.store(want_out, Ordering::SeqCst);
+                        crate::blackbox::record(
+                            "procedure",
+                            serde_json::json!({"event": "speedbrake", "out": want_out,
+                                "ias": ias, "target": crate::tools::speedhold::flight_target(),
+                                "vs_cmd": vs_cmd}),
+                        );
+                        alert(
+                            &voice,
+                            Priority::Advisory,
+                            if want_out { "Speedbrake." } else { "Speedbrake in." },
+                        );
+                    }
+                }
+            }
+        }
         if vs_st <= 0.5 {
             // VS mode gone NEAR the target means the preselect CAPTURED —
             // its hold is the clean level-off, leave it flying. Far from the
@@ -1664,6 +1758,25 @@ pub fn terrain_probe_fatal(misses: &mut u32, frozen: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// EGPH-EGTE, 2026-09-21: 2,000 fpm down at idle, 258 kt through ten
+    /// thousand against 250, 278 at the last fix.
+    #[test]
+    fn a_descent_that_outruns_the_governor_gets_drag_then_a_shallower_rate() {
+        // Through ten thousand, 8 over: not yet. 9 over: brakes.
+        assert_eq!(descent_drag(false, 258.0, Some(250.0), -2000.0), (false, 1.0));
+        assert_eq!(descent_drag(false, 259.0, Some(250.0), -2000.0), (true, 1.0));
+        // Out, they stay out until the speed is nearly back...
+        assert_eq!(descent_drag(true, 254.0, Some(250.0), -2000.0), (true, 1.0));
+        assert_eq!(descent_drag(true, 252.0, Some(250.0), -2000.0), (false, 1.0));
+        // ...and a runaway shallows the descent as well.
+        assert_eq!(descent_drag(true, 267.0, Some(250.0), -2000.0), (true, 0.75));
+        assert_eq!(descent_drag(true, 278.0, Some(250.0), -2000.0), (true, 0.5));
+        // Level, climbing, or with no governor target: nothing.
+        assert_eq!(descent_drag(true, 278.0, Some(250.0), 0.0), (false, 1.0));
+        assert_eq!(descent_drag(false, 278.0, Some(250.0), 800.0), (false, 1.0));
+        assert_eq!(descent_drag(false, 278.0, None, -2000.0), (false, 1.0));
+    }
+
     use super::*;
 
     #[test]

@@ -104,6 +104,9 @@ earshot = "1.1.0"
 
 [dev-dependencies]
 tempfile = "3"
+# `start_paused` for the flows that sleep at a crew's pace: a thirty-second
+# start runs in milliseconds with the clock paused and the order still tested.
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [features]
 # Native in-process ONNX TTS is the default voice backend (arm64 onnxruntime via

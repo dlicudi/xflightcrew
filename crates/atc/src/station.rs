@@ -79,6 +79,9 @@ pub struct Station {
     /// for takeoff on two seven, then re-cleared on zero niner two minutes
     /// later in the same calm. A runway change needs actual wind.
     runway_in_use: Option<String>,
+    /// The runway the arrival now calling named for itself, consumed by the
+    /// pick that answers the call (`note_stated_runway`).
+    stated_runway: Option<String>,
     /// The departure controller has said "radar contact" to this flight.
     dep_checked_in: bool,
     /// The ATIS information letter the pilot last reported having ("with
@@ -196,6 +199,7 @@ impl Station {
             apt,
             twr: tower::Tower::new(),
             runway_in_use: None,
+            stated_runway: None,
             dep_checked_in: false,
             pilot_info: None,
             assigned_squawk: None,
@@ -308,6 +312,7 @@ impl Station {
     /// the app leaves an ATC-capable mode; the region index and background
     /// caches (taxi net, ILS facts) survive so re-enabling is cheap.
     pub fn uninstall() {
+        *SURFACE_WIND.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *ACTIVE_FIELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *CONTROLLER_FREQS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
         *ACTIVE_PANEL.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -392,6 +397,7 @@ impl Station {
             );
             return None;
         };
+        self.note_stated_runway(transcript, intent);
         let (ctx, wx) = self.build_ctx(xp, intent).await;
         let before = self.twr.state;
         let reply = self.route_unkeyed(transcript, service, &ctx, wx)?;
@@ -456,11 +462,13 @@ impl Station {
             sim::blackbox::record(
                 "atc",
                 serde_json::json!({
-                    "route": "keyed", "outcome": "void", "transcript": transcript,
+                    "route": "keyed", "outcome": void_outcome(transcript, Instant::now()),
+                    "transcript": transcript,
                 }),
             );
             return None;
         };
+        self.note_stated_runway(transcript, tower::parse_intent(transcript));
         let (ctx, wx) = self.build_ctx(xp, tower::parse_intent(transcript)).await;
         let before = self.twr.state;
         let reply = self.route_keyed(transcript, service, &ctx, wx);
@@ -919,6 +927,12 @@ impl Station {
         // Publish it for the crew (the transponder gets dialled to this).
         *ASSIGNED_SQUAWK.lock().unwrap_or_else(|e| e.into_inner()) = Some(code);
         let mut w = SQUAWK_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        // Same code from a new controller: the watch keeps its history (no
+        // second grace period, no second "radar contact") but the VOICE is
+        // whoever issued it last, the one we are actually talking to.
+        if let Some(w) = w.as_mut().filter(|w| w.code == code) {
+            w.speaker = speaker;
+        }
         if w.as_ref().map(|w| w.code) != Some(code) {
             *w = Some(SquawkWatch {
                 code,
@@ -1159,6 +1173,19 @@ impl Station {
         )
     }
 
+    /// Remember the runway an ARRIVAL names for itself, for the pick this
+    /// call is about to make (see `pick_runway_with`). Arrival calls only: a
+    /// departure is told its runway, it does not choose one.
+    fn note_stated_runway(&mut self, transcript: &str, intent: tower::Intent) {
+        self.stated_runway = match intent {
+            tower::Intent::ReportFinal
+            | tower::Intent::ReportDownwind
+            | tower::Intent::ReportBase
+            | tower::Intent::RequestLanding { .. } => tower::stated_runway(transcript),
+            _ => None,
+        };
+    }
+
     /// The runway in use. Re-picked from the wind only when there IS wind
     /// (≥ 5 kt): in calm the into-wind pick flip-flops on noise, and a
     /// controller doesn't swap the runway between two transmissions.
@@ -1189,12 +1216,50 @@ impl Station {
         // names one, the pick is frozen until the flight leaves or the
         // clearance dies — a controller does not move you to the other
         // parallel between your taxi clearance and your takeoff clearance.
+        // ...and so does an ARRIVAL told to join it or cleared to land on it.
+        // A go-around takes the state from ClearedToLand back to Inbound; on
+        // a wind dead across the strip the pick flipped in that moment, the
+        // party line published the other end, and the crew's approach was
+        // re-aimed at it from 60 ft (EGTE 08 to 26, 2026-09-21).
         let committed = matches!(
             self.twr.state,
-            tower::State::TaxiCleared | tower::State::LinedUp | tower::State::TakeoffCleared
+            tower::State::TaxiCleared
+                | tower::State::LinedUp
+                | tower::State::TakeoffCleared
+                | tower::State::Inbound
+                | tower::State::ClearedToLand
         );
         if committed && self.runway_in_use.is_some() {
             return self.runway_in_use.clone().unwrap_or_default();
+        }
+        // AN ARRIVAL'S OWN RUNWAY STANDS WHEN THE WIND DOES NOT ARGUE. "Final
+        // runway two six" into 350 at 8, dead across both ends, earned
+        // "negative, runway zero eight": a headwind of a fraction of a knot
+        // sent a 737 round the field from a five mile final (same sortie). A
+        // controller with nothing else on the runway clears the end the
+        // traffic is lined up on. Only uncommitted, only without an arrival
+        // stream on another end, only inside the swap margin.
+        if let Some(stated) = self.stated_runway.take() {
+            let ident = self
+                .apt
+                .runways
+                .iter()
+                .flat_map(|r| [r.ident_a.clone(), r.ident_b.clone()])
+                .find(|id| tower::runway_matches(id, &stated));
+            if let Some(ident) = ident {
+                let stream_elsewhere = arrival_end.is_some_and(|end| end != ident);
+                let hw = nav::headwind_for(&self.apt.runways, &ident, wind_from, wind_kts);
+                let best = nav::best_runway_for_wind(&self.apt.runways, wind_from, wind_kts)
+                    .map(|(_, _, hw)| hw);
+                let wind_indifferent = match (hw, best) {
+                    (Some(hw), Some(best)) => best - hw <= RUNWAY_SWAP_MARGIN_KTS,
+                    _ => false,
+                };
+                if !stream_elsewhere && wind_indifferent {
+                    self.runway_in_use = Some(ident.clone());
+                    return ident;
+                }
+            }
         }
         if wind_kts >= 5.0 || self.runway_in_use.is_none() {
             if let Some((id, _, hw)) =
@@ -1228,7 +1293,7 @@ impl Station {
     /// a failed read falls back to silence on that item rather than a wrong
     /// number.
     async fn build_ctx(&mut self, xp: SimView<'_>, intent: tower::Intent) -> (tower::Ctx, Wx) {
-        let wx = Wx {
+        let mut wx = Wx {
             wind_from_deg: xp
                 .get_float(datarefs::WIND_DIR_DEG_TRUE)
                 .await
@@ -1239,14 +1304,28 @@ impl Station {
             Ok(pa) => spoken_pressure(pa, self.dialect),
             Err(_) => String::new(),
         };
+        // The wake category rides the sim's own MTOW, so the tower says
+        // "heavy" to an A330 without the crew's profile in its dep tree.
+        let mtow_kg = xp.get_float(datarefs::ACF_M_MAX_KG).await.ok();
         let callsign = xp
             .get_string(datarefs::TAILNUM)
             .await
             .ok()
-            .map(|t| tower::spoken_callsign(&t))
+            .map(|t| tower::spoken_callsign_wake(&t, mtow_kg))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "aircraft calling".to_string());
         let on_ground = xp.get_float(datarefs::ON_GROUND_ANY).await.unwrap_or(0.0) > 0.5;
+        // The wind a tower reads out and picks its runway by is the wind ON
+        // THE FIELD. The sim's wind datarefs are the air the aircraft is in:
+        // for a caller on the ground the same thing, for an arrival at
+        // 2,700 ft the winds aloft (350 at 8 against the field's 190 at 3,
+        // EGTE 2026-09-21: crew and tower picked opposite ends).
+        if !on_ground {
+            if let Some((from, kts)) = surface_wind_at(self.apt.position()) {
+                wx.wind_from_deg = from;
+                wx.wind_kts = kts;
+            }
+        }
         // The controller's own traffic picture, read once per call: an
         // arrival in OUR runway's corridor gates takeoff clearances and
         // sequences downwind joins; a ghost ON the strip blocks line-ups.
@@ -1286,11 +1365,14 @@ impl Station {
             || (matches!(intent, tower::Intent::RequestTaxi)
                 && self.twr.state == tower::State::ClearedToLand);
         self.planned_route = None;
+        let mut own_on_runway = false;
         if on_ground {
             if let (Ok(lat), Ok(lon)) = (
                 xp.get_float(datarefs::LATITUDE).await,
                 xp.get_float(datarefs::LONGITUDE).await,
             ) {
+                own_on_runway = strip(&self.apt.runways, &ident)
+                    .is_some_and(|r| on_runway(r, lat, lon).is_some());
                 self.planned_route = if arrival {
                     plan_taxi_route_to_stand(&self.apt.runways, lat, lon)
                 } else {
@@ -1298,19 +1380,18 @@ impl Station {
                 };
             }
         }
-        (
-            self.make_ctx(
-                wx,
-                qnh,
-                callsign,
-                on_ground,
-                arrival,
-                final_traffic,
-                runway_occupied,
-                wake_secs_left,
-            ),
+        let mut ctx = self.make_ctx(
             wx,
-        )
+            qnh,
+            callsign,
+            on_ground,
+            arrival,
+            final_traffic,
+            runway_occupied,
+            wake_secs_left,
+        );
+        ctx.own_on_runway = own_on_runway;
+        (ctx, wx)
     }
 
     /// The pure half of [`Station::build_ctx`] — everything after the sim
@@ -1376,6 +1457,8 @@ impl Station {
                 })
                 .unwrap_or_default(),
             on_ground,
+            // The sim read is `build_ctx`'s; scripted contexts are off it.
+            own_on_runway: false,
         }
     }
 }
@@ -3341,6 +3424,69 @@ pub fn active_field() -> Option<(String, f64, f64, f64)> {
     Some((spoken_airport(&name).to_string(), lat, lon, elev))
 }
 
+/// A readback of the region's handoff, made on the frequency it came on, is
+/// heard by the controller who gave it even though that station has already
+/// been swapped for the next: it is not a call into the void. Six flights out
+/// of six logged "radio call into the VOID" for "squawking seven thousand,
+/// Carlisle Tower on ..." and the debrief listed each as a lost call.
+const HANDOFF_READBACK_WINDOW_SECS: u64 = 45;
+
+fn void_outcome(transcript: &str, now: Instant) -> &'static str {
+    let recent = LAST_REGION_SWITCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|t| now.saturating_duration_since(t).as_secs() <= HANDOFF_READBACK_WINDOW_SECS);
+    if recent && tower::is_readback(transcript) {
+        "handoff_readback"
+    } else {
+        "void"
+    }
+}
+
+/// The active field's SURFACE wind as the app last read it from the sim's
+/// real-weather METAR file: (field lat, lon, from deg true, kts). The station
+/// cannot read weather files (its sim handle is the read-only dataref view),
+/// so the app hands the report down, the way it hands the ATIS its weather.
+/// Keyed by POSITION: a station knows where it is, not what it is called.
+static SURFACE_WIND: Mutex<Option<(f64, f64, f64, f64)>> = Mutex::new(None);
+
+/// A published wind is this field's when it was read for a point this near.
+const SURFACE_WIND_FIELD_NM: f64 = 3.0;
+
+/// Publish (or retire, with `None`) the surface wind of the field at
+/// `lat`/`lon`.
+pub fn set_surface_wind(lat: f64, lon: f64, wind: Option<(f64, f64)>) {
+    *SURFACE_WIND.lock().unwrap_or_else(|e| e.into_inner()) =
+        wind.map(|(from, kts)| (lat, lon, from, kts));
+}
+
+/// The published surface wind, only if it is THIS field's.
+fn surface_wind_at(pos: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    let (lat, lon) = pos?;
+    SURFACE_WIND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|(wlat, wlon, _, _)| nav::haversine_nm(lat, lon, *wlat, *wlon) <= SURFACE_WIND_FIELD_NM)
+        .map(|(_, _, from, kts)| (*from, *kts))
+}
+
+/// The active station's ICAO and position, from the region index (the
+/// station itself carries a name, not an identifier): for the app's METAR
+/// lookup. `None` before the index has loaded or with no station up.
+pub fn active_icao() -> Option<(String, f64, f64)> {
+    let (_, lat, lon) = ACTIVE_FIELD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    REGION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|a| nav::haversine_nm(lat, lon, a.lat, a.lon) < 0.5)
+        .map(|a| (a.icao.clone(), lat, lon))
+}
+
 /// What the party line remembers about a ghost between passes.
 struct GhostMemory {
     last_seen: Instant,
@@ -5167,6 +5313,11 @@ mod tests {
     #[test]
     fn squawk_watch_calls_radar_contact_only_when_the_code_shows() {
         let _guard = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The code is derived from the callsign, and a watch is only re-armed
+        // for a DIFFERENT code: a watch left by an earlier test with this
+        // callsign (armed by Departure, already nudged) was this test's watch
+        // about one run in four, by test order.
+        *SQUAWK_WATCH.lock().unwrap() = None;
         let mut st = lxgb();
         let spoken = st.assign_squawk(
             "November one seven two Sierra Papa",
@@ -7183,6 +7334,7 @@ mod tests {
             departure_khz: None,
             twr: tower::Tower::new(),
             runway_in_use: None,
+            stated_runway: None,
             dep_checked_in: false,
             pilot_info: None,
             assigned_squawk: None,
@@ -7878,6 +8030,50 @@ mod tests {
         assert_eq!(st.pick_runway(170.0, 0.0), "27");
         // Actual wind changes the runway like a real controller would.
         assert_eq!(st.pick_runway(90.0, 10.0), "09");
+    }
+
+    #[test]
+    fn a_handoff_readback_after_the_swap_is_not_a_void_call() {
+        let _g = SIDE_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let readback = "november eight one six november november, squawking seven thousand, carlisle tower on one two three decimal six zero five";
+        *LAST_REGION_SWITCH.lock().unwrap() = Some(now);
+        assert_eq!(void_outcome(readback, now + std::time::Duration::from_secs(4)), "handoff_readback");
+        // A real call to nobody is still a void call...
+        assert_eq!(void_outcome("exeter tower, inbound for landing", now), "void");
+        // ...and so is a readback long after any handoff.
+        assert_eq!(void_outcome(readback, now + std::time::Duration::from_secs(300)), "void");
+        *LAST_REGION_SWITCH.lock().unwrap() = None;
+        assert_eq!(void_outcome(readback, now), "void");
+    }
+
+    /// EGTE, 2026-09-21. "Final runway two six" into a wind dead across the
+    /// strip earned "negative, runway zero eight" and a trip round the field;
+    /// then the go-around (ClearedToLand back to Inbound) flipped the pick to
+    /// 26 and the crew's missed approach was re-aimed from 60 ft.
+    #[test]
+    fn an_arrival_keeps_its_runway_on_a_wind_that_favours_neither_end() {
+        let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
+        // Nothing in use yet, wind across (LXGB is 09/27): the end the
+        // arrival is lined up on stands.
+        st.note_stated_runway("november one two three, final runway two seven", tower::Intent::ReportFinal);
+        assert_eq!(st.pick_runway(0.0, 8.0), "27");
+        // A wind that really favours the other end still wins.
+        let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
+        st.note_stated_runway("final runway two seven", tower::Intent::ReportFinal);
+        assert_eq!(st.pick_runway(90.0, 12.0), "09");
+        // A departure does not choose its runway.
+        let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
+        st.note_stated_runway("ready for departure runway two seven", tower::Intent::RequestTakeoff);
+        assert_eq!(st.stated_runway, None);
+        // And once an arrival is on a runway the pick is frozen, through the
+        // go-around's Inbound, whatever the wind does.
+        let mut st = Station::load(lxgb_apt_file().to_str().unwrap(), "LXGB").expect("LXGB loads");
+        st.runway_in_use = Some("09".into());
+        for state in [tower::State::ClearedToLand, tower::State::Inbound] {
+            st.twr.state = state;
+            assert_eq!(st.pick_runway(270.0, 15.0), "09", "{state:?}");
+        }
     }
 
     /// Two parallels have the SAME heading to within rounding error, so which
@@ -8950,6 +9146,7 @@ mod tests {
             final_traffic_callsign: None,
             final_traffic_count: 0,
             runway_occupied: false,
+            own_on_runway: false,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
@@ -9327,6 +9524,7 @@ mod tests {
                 final_traffic_callsign: None,
                 final_traffic_count: 0,
                 runway_occupied: false,
+                own_on_runway: false,
                 wake_secs_left: None,
                 taxi_via: Vec::new(),
                 taxi_crossings: Vec::new(),
@@ -9586,6 +9784,7 @@ mod tests {
             final_traffic_callsign: None,
             final_traffic_count: 0,
             runway_occupied: false,
+            own_on_runway: false,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),

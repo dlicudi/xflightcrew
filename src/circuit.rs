@@ -762,10 +762,13 @@ pub fn transmit_check_in(callsign: Option<String>, to: String, climb_to_ft: f64)
 /// seven two Sierra Papa"), so the copilot's calls sound like a real pilot's.
 /// `None` if the tail number can't be read.
 pub async fn crew_callsign(xp: &XPlaneClient) -> Option<String> {
+    // With the wake suffix: a heavy says "heavy" on every call it initiates,
+    // and the tower addresses it the same way (`station::build_ctx`).
+    let mtow_kg = xp.get_float(crate::datarefs::ACF_M_MAX_KG).await.ok();
     xp.get_string(crate::datarefs::TAILNUM)
         .await
         .ok()
-        .map(|t| crate::tower::spoken_callsign(&t))
+        .map(|t| crate::tower::spoken_callsign_wake(&t, mtow_kg))
         .filter(|s| !s.is_empty())
 }
 
@@ -837,6 +840,50 @@ pub struct Params {
     /// The slowest the pattern may climb toward, KIAS. See
     /// [`climb_limit_fpm`]; 0 disables the protection.
     pub climb_floor_kts: f64,
+}
+
+/// The profile's `ap_altitude_capture`: the pattern altitude goes on the
+/// altitude dial and the autopilot's own capture holds the level legs (see
+/// [`ap_holds_level`]). Off, the VS law flies altitude as it always has and
+/// the dial is only lifted out of the way. Republished on every swap
+/// ([`crate::flight_state::publish_airframe`]).
+static AP_ALTITUDE_CAPTURE: AtomicBool = AtomicBool::new(false);
+
+pub fn publish_ap_altitude_capture(on: bool) {
+    AP_ALTITUDE_CAPTURE.store(on, Ordering::SeqCst);
+}
+
+const ALT_DIAL: &str = "sim/cockpit2/autopilot/altitude_dial_ft";
+const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
+
+/// The altitude the dial should read for this tick's vertical target. A LEVEL
+/// target (pattern altitude, the base leg's height) is selected to the hundred
+/// so the autopilot captures it; on the glidepath the dial is parked above,
+/// autoland's own rule, because a capture under a descent eats the descent
+/// (LEAX, 2026-09-15). `None` = leave it.
+pub fn circuit_dial_ft(target_rate_fpm: f64, target_alt_ft: f64, dial_ft: f64, alt_ft: f64) -> Option<f64> {
+    if target_rate_fpm != 0.0 {
+        return crate::autoland::parked_altitude_dial_ft(dial_ft, alt_ft);
+    }
+    let want = (target_alt_ft / 100.0).round() * 100.0;
+    ((dial_ft - want).abs() > 50.0).then_some(want)
+}
+
+/// How long VS mode may stay off under a command for it before it is said.
+pub const VS_REFUSED_SECS: f64 = 8.0;
+pub fn vs_stuck(off_for_s: f64) -> bool {
+    off_for_s >= VS_REFUSED_SECS
+}
+
+/// Whether the autopilot's altitude hold has the level leg, so the VS law
+/// stands off. CAPTURED (status 2) on a dial that IS this tick's level target:
+/// re-pressing VS mode then would drop the hold it just made, every tick. The
+/// A330 wandered 1,796 to 1,840 ft down the EGPF downwind on the VS law
+/// (2026-09-21) with an altitude hold sitting unused behind a dial at 100 ft.
+pub fn ap_holds_level(target_rate_fpm: f64, target_alt_ft: f64, dial_ft: f64, alt_hold_status: f64) -> bool {
+    target_rate_fpm == 0.0
+        && alt_hold_status.round() as i64 == 2
+        && (dial_ft - (target_alt_ft / 100.0).round() * 100.0).abs() <= 50.0
 }
 
 /// The four legs after the departure runway; `Final` is the handoff to autoland.
@@ -1922,10 +1969,19 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // Read before the move: `p.takeoff` goes into the takeoff loop below, and
     // the base leg needs to know whether this airframe HAS gear to lower.
     let retractable_gear = p.takeoff.retract_gear;
+    // Where the airframe declares it, the pattern altitude goes on the
+    // altitude dial before the roll and the autopilot's own capture holds it
+    // (see `ap_holds_level`). Otherwise the takeoff only lifts a dial the
+    // climb would bust through, well clear of the pattern.
+    let p_ap_capture = AP_ALTITUDE_CAPTURE.load(Ordering::SeqCst);
+    let mut takeoff = p.takeoff;
+    if p_ap_capture {
+        takeoff.level_ft = Some(tpa_msl_ft);
+    }
     if !autotakeoff::start_scoped(
         base_url.clone(),
         voice.clone(),
-        p.takeoff,
+        takeoff,
         xp.cancellation(),
     ) {
         stand_down(
@@ -2103,6 +2159,9 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     // VS-dial bookkeeping (the takeoff's recipe: engage syncs the dial away,
     // so rewrite after any re-engage; skip no-op writes otherwise).
     let mut last_vs_cmd: Option<f64> = None;
+    let mut vs_refused: Option<std::time::Instant> = None;
+    let mut vs_refused_said = false;
+    let mut lights_done = false;
     // Speed-hold bookkeeping: power works the throttle to hold `pattern_kts`,
     // leading on the airspeed trend EMA'd tick to tick (the flight law's input).
     let mut prev_ias: Option<(f64, std::time::Instant)> = None;
@@ -2153,7 +2212,12 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
             xp.get_float(VS_STATUS),
         );
         let thr_dref = throttle_dref();
-        let (ias_r, thr_r) = tokio::join!(xp.get_float(IAS), xp.get_float(&thr_dref));
+        let (ias_r, thr_r, dial_r, alt_hold_r) = tokio::join!(
+            xp.get_float(IAS),
+            xp.get_float(&thr_dref),
+            xp.get_float(ALT_DIAL),
+            xp.get_float(ALT_HOLD_STATUS),
+        );
         let (Ok(lat), Ok(lon)) = (lat, lon) else {
             continue;
         };
@@ -2400,13 +2464,71 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         };
         let full_kts = climb_full_rate_kts(want_now, p_vy_kts, p_climb_floor_kts);
         let vs_cmd = climb_limit_fpm(vs_want, ias_read, ias_trend, full_kts, p_climb_floor_kts);
-        if !vs_on {
-            let _ = xp.run_command(CMD_VS_MODE).await;
-            last_vs_cmd = None; // engage synced the dial; force a rewrite
+        // Landing and taxi lights off through 1,000 ft. The authored route's
+        // comment said "as the rectangle does" and the rectangle never did:
+        // the A330's climb list named "taxi light, off" (EGPF, 2026-09-21).
+        if !lights_done && alt_msl_ft.is_finite() && alt_msl_ft - field_elev_ft > LIGHTS_OFF_AGL_FT {
+            lights_done = true;
+            let did = crate::tools::lights::after_climb(&xp).await;
+            crate::blackbox::record(
+                "circuit",
+                serde_json::json!({"event": "lights_climb", "off": did}),
+            );
         }
-        if last_vs_cmd.is_none_or(|v| (v - vs_cmd).abs() > 40.0) {
-            let _ = xp.set_float(VS_DIAL, vs_cmd).await;
-            last_vs_cmd = Some(vs_cmd);
+
+        // The autopilot's own capture flies the level legs where the airframe
+        // declares it. Failed reads are no measurement: no dial write, no
+        // hold believed, and the VS law below carries on as it always has.
+        let mut ap_level = false;
+        if p_ap_capture && alt_msl_ft.is_finite() {
+            if let (Ok(dial), Ok(hold)) = (&dial_r, &alt_hold_r) {
+                match circuit_dial_ft(target_rate, target_alt, *dial, alt_msl_ft) {
+                    Some(want) => {
+                        let ok = xp.set_float(ALT_DIAL, want).await.is_ok();
+                        crate::blackbox::record(
+                            "circuit",
+                            serde_json::json!({"event": "alt_dial", "was": dial, "now": want,
+                                               "leg": format!("{leg:?}"), "ok": ok}),
+                        );
+                    }
+                    None => ap_level = ap_holds_level(target_rate, target_alt, *dial, *hold),
+                }
+            }
+        }
+        if ap_level {
+            // Whatever the VS dial says now is stale the moment VS re-engages.
+            last_vs_cmd = None;
+            vs_refused = None;
+        } else {
+            if !vs_on {
+                let _ = xp.run_command(CMD_VS_MODE).await;
+                last_vs_cmd = None; // engage synced the dial; force a rewrite
+            }
+            if last_vs_cmd.is_none_or(|v| (v - vs_cmd).abs() > 40.0) {
+                let _ = xp.set_float(VS_DIAL, vs_cmd).await;
+                last_vs_cmd = Some(vs_cmd);
+            }
+            // The one thing the capture rests on: VS taking the aircraft back
+            // OUT of the hold. An autopilot that will not is said, once, while
+            // there is still a downwind's worth of height to act on.
+            if p_ap_capture && !vs_on {
+                let since = *vs_refused.get_or_insert_with(std::time::Instant::now);
+                if vs_stuck(since.elapsed().as_secs_f64()) && !vs_refused_said {
+                    vs_refused_said = true;
+                    crate::blackbox::record(
+                        "circuit",
+                        serde_json::json!({"event": "vs_refused", "leg": format!("{leg:?}"),
+                                           "cmd_vs": vs_cmd}),
+                    );
+                    alert(
+                        &voice,
+                        Priority::Warning,
+                        "The autopilot won't take vertical speed. Check the vertical mode.",
+                    );
+                }
+            } else {
+                vs_refused = None;
+            }
         }
 
         // --- Power for speed: the throttle holds the pattern speed (~Vy) while
@@ -2478,7 +2600,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
                 "event": "leg", "leg": format!("{leg:?}"), "agl_ft": agl_ft,
                 "a_m": a_m, "x_m": x_m, "crab": crab,
                 "bug": bug_mag, "tgt": target_mag, "psi": psi_v,
-                "hdg_on": hdg_on, "vs_on": vs_on, "cmd_vs": vs_cmd,
+                "hdg_on": hdg_on, "vs_on": vs_on, "ap_level": ap_level, "cmd_vs": vs_cmd,
                 "alt_msl": alt_msl_ft, "target_alt": target_alt,
                 "ias": ias_now, "pat_kts": pattern_kts,
             }),
@@ -2631,6 +2753,28 @@ async fn try_published_arrival(
 
 #[cfg(test)]
 mod tests {
+
+    /// EGPF, 2026-09-21: pattern 1,796 ft, the FCU at 100. Level targets go
+    /// on the dial to the hundred, a captured hold on that dial owns the leg,
+    /// and the glidepath parks the dial above like autoland does.
+    #[test]
+    fn the_autopilot_holds_the_level_legs() {
+        // Climbing to the pattern: select it.
+        assert_eq!(circuit_dial_ft(0.0, 1795.8, 100.0, 600.0), Some(1800.0));
+        assert_eq!(circuit_dial_ft(0.0, 1795.8, 1800.0, 1700.0), None);
+        // Armed is not captured: the VS law is still flying the climb.
+        assert!(!ap_holds_level(0.0, 1795.8, 1800.0, 1.0));
+        assert!(ap_holds_level(0.0, 1795.8, 1800.0, 2.0));
+        // The base leg's height: a new dial, and the old hold is not ours.
+        assert_eq!(circuit_dial_ft(0.0, 820.0, 1800.0, 1796.0), Some(800.0));
+        assert!(!ap_holds_level(0.0, 820.0, 1800.0, 2.0));
+        // On the path a capture would eat the descent: parked above, once.
+        let parked = circuit_dial_ft(-700.0, 700.0, 800.0, 810.0).expect("parked");
+        assert!(parked >= 810.0 + 500.0, "{parked}");
+        assert_eq!(circuit_dial_ft(-700.0, 600.0, parked, 700.0), None);
+        assert!(!ap_holds_level(-700.0, 800.0, 800.0, 2.0));
+        assert!(!vs_stuck(3.0) && vs_stuck(VS_REFUSED_SECS));
+    }
     use super::*;
 
     /// The base leg hands autoland an aircraft ON the path it is about to fly,

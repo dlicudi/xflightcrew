@@ -15,9 +15,18 @@ const GEAR_HANDLE: &str = "sim/cockpit2/controls/gear_handle_down";
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
 const IAS_KTS: &str = "sim/cockpit2/gauges/indicators/airspeed_kts_pilot";
 
+const CMD_GEAR_UP: &str = "sim/flight_controls/landing_gear_up";
+const CMD_GEAR_DOWN: &str = "sim/flight_controls/landing_gear_down";
+
 pub struct Gear {
     /// Gear limit speed (VLO/VLE), KIAS — refuse cycling above it. `None` = no gate.
     pub vlo_kts: Option<f64>,
+    /// Move the lever with the stock gear COMMANDS instead of writing the
+    /// handle. For an add-on whose lever is its own and whose script replaces
+    /// those commands to move it (the Sparky 747: a three-position
+    /// `laminar/B747/actuator/gear_handle`, the stock handle its output). The
+    /// readback is the stock handle either way.
+    pub by_command: bool,
 }
 
 #[derive(Deserialize)]
@@ -75,18 +84,32 @@ impl Tool for Gear {
             }
         }
 
-        ctx.xplane
-            .set_float(GEAR_HANDLE, if up { 0.0 } else { 1.0 })
-            .await?;
+        if self.by_command {
+            ctx.xplane
+                .run_command(if up { CMD_GEAR_UP } else { CMD_GEAR_DOWN })
+                .await?;
+            // The add-on moves its lever on its own thread.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        } else {
+            ctx.xplane
+                .set_float(GEAR_HANDLE, if up { 0.0 } else { 1.0 })
+                .await?;
+        }
         // Read the handle back (the gear itself takes seconds to cycle, but the
-        // handle reflects the commanded position immediately).
-        let down = ctx
-            .xplane
-            .get_float(GEAR_HANDLE)
-            .await
-            .unwrap_or(if up { 0.0 } else { 1.0 })
-            > 0.5;
-        Ok(format!("Roger, gear {}.", if down { "down" } else { "up" }))
+        // handle reflects the commanded position immediately). Compared with
+        // the INTENT: a failed read used to answer with whatever was asked,
+        // and a handle that stayed put answered "Roger" with the wrong word.
+        let want = if up { "up" } else { "down" };
+        match ctx.xplane.get_float(GEAR_HANDLE).await {
+            Ok(v) if (v > 0.5) != up => Ok(format!("Roger, gear {want}.")),
+            Ok(_) => Ok(format!(
+                "The gear handle didn't move. It's still {}.",
+                if up { "down" } else { "up" }
+            )),
+            Err(_) => Ok(format!(
+                "Gear {want} selected, but I can't read the handle. Check the lights."
+            )),
+        }
     }
 }
 
@@ -110,7 +133,7 @@ mod tests {
         let cfg = crate::config::Config::default();
         // On the ground: refused, and the handle is never touched.
         let grounded = FakeXPlane::with_reads(&[(ON_GROUND, 1.0)]);
-        let out = Gear { vlo_kts: None }
+        let out = Gear { vlo_kts: None , by_command: false}
             .execute(&json!({"position": "up"}), &ctx(&grounded, &cfg))
             .await
             .unwrap();
@@ -120,7 +143,7 @@ mod tests {
         // The ground read FAILS (no preset): an unknown state must refuse too.
         // This gate used to default to airborne and raise the gear on the ramp.
         let unknown = FakeXPlane::new();
-        let out = Gear { vlo_kts: None }
+        let out = Gear { vlo_kts: None , by_command: false}
             .execute(&json!({"position": "up"}), &ctx(&unknown, &cfg))
             .await
             .unwrap();
@@ -129,7 +152,7 @@ mod tests {
 
         // Airborne and under the gear speed: the handle moves.
         let flying = FakeXPlane::with_reads(&[(ON_GROUND, 0.0), (IAS_KTS, 100.0), (GEAR_HANDLE, 0.0)]);
-        let out = Gear { vlo_kts: Some(150.0) }
+        let out = Gear { vlo_kts: Some(150.0) , by_command: false}
             .execute(&json!({"position": "up"}), &ctx(&flying, &cfg))
             .await
             .unwrap();
