@@ -176,6 +176,32 @@ pub fn normalize(transcript: &str) -> String {
         // slips to "electronics", the trailing "on" to "zone".
         ("electronics systems", "electrical systems"),
         ("electrical system zone", "electrical systems on"),
+        // ...and the same "s on" glue lands as a word again and again:
+        // "Electric source." (737, 2026-09-22), "Electric sauce." (Baron,
+        // 2026-09-16), "Electric software." (172, 2026-09-17). Nobody
+        // commands any of the three.
+        ("electric source", "electrics on"),
+        ("electric sauce", "electrics on"),
+        ("electric software", "electrics on"),
+        // "my controls" — the universal hand-back — heard as "Mind controls."
+        // (737, 2026-09-20). A missed hand-back leaves an automation flying
+        // an aircraft the pilot has already taken, so this one is not
+        // optional.
+        ("mind controls", "my controls"),
+        // "flight plan" garbles on the plan phrasings: "Resume the fight
+        // plan." (737, 2026-09-20), "That's the wrong flag plan." and "Fly
+        // the flight man." (172, 2026-09-17). None of the three is a phrase.
+        ("fight plan", "flight plan"),
+        ("flag plan", "flight plan"),
+        ("flight man", "flight plan"),
+        // "autoland" splits and slips: "All to land." / "Cancel all to
+        // land?" / "Cancel Autolamp." (Baron, 2026-09-16, the pilot arming
+        // and cancelling). "All to land" is not English anyone speaks.
+        ("all to land", "autoland"),
+        ("autolamp", "autoland"),
+        // The load sheet, verb pluralised: "Loads the aircraft." (737,
+        // 2026-09-22). The whole phrase, so a bare "loads" is untouched.
+        ("loads the aircraft", "load the aircraft"),
     ] {
         s = s.replace(heard, meant);
     }
@@ -188,6 +214,10 @@ pub fn normalize(transcript: &str) -> String {
         let fixed = format!(" {s} ")
             .replace(" crops ", " props ")
             .replace(" crop ", " prop ")
+            // "knots" heard as "notes" ("Taxi at ten notes.", 737,
+            // 2026-09-20) — the only unit a cockpit number carries, and
+            // nobody dictates notes to a copilot.
+            .replace(" notes ", " knots ")
             .replace(" powers ", " power ");
         s = fixed.trim().to_string();
     }
@@ -246,6 +276,28 @@ pub fn declined(transcript: &str, registry: &Registry) -> Option<String> {
         && registry.get("set_carb_heat").is_none()
     {
         return Some("This engine is fuel injected, so there's no carburettor heat.".to_string());
+    }
+    // Engine start/stop on an airframe that declares no engine tool (the
+    // S-76C: `engine: false`, because the twist grips are the pilot's). The
+    // words are a real command and the profile is deliberate, so say which it
+    // is. At the pad on 2026-09-17 the pilot asked four ways in eleven
+    // seconds — "start engines", "start the engines", "engine's on", "engines
+    // on" — and every one went into the silence of a miss.
+    let engine_intent = (has(&t, "start") || has(&t, "stop") || has(&t, "shut"))
+        && (has(&t, "engine") || has(&t, "engines"))
+        || t == "engines on"
+        || t == "engine on"
+        || t == "engines off"
+        || t == "engine off";
+    if engine_intent
+        && registry.get("start_engine").is_none()
+        && registry.get("start_engines").is_none()
+        && registry.get("stop_engine").is_none()
+        && registry.get("stop_engines").is_none()
+    {
+        return Some(
+            "The engines are yours on this aircraft. I have no start or shutdown here.".to_string(),
+        );
     }
     None
 }
@@ -1145,6 +1197,15 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     if t == "taxi"
         || t == "taxi to holding point"
         || t == "taxi to the holding point"
+        // The runway named as the destination and nothing else ("Taxi to
+        // runway.", Twin Otter, 2026-09-22, followed by three more tries and
+        // a give-up). Exact like the holding-point shapes above and for the
+        // same reason: a taxi READBACK always carries the specifics being
+        // echoed (the runway number, the route, "via ..."), so it is longer
+        // than this and never lands here.
+        || t == "taxi to runway"
+        || t == "taxi to the runway"
+        || t == "taxi to the active"
         || t.contains("taxi for me")
         || t.contains("taxi for us")
         || t.contains("you have the taxi")
@@ -1775,6 +1836,17 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     if t.contains("land the aircraft")
         || t.contains("land the plane")
         || t.contains("land us")
+        // The bare ask, which is what a pilot actually says: "Let's land."
+        // (737, 2026-09-17) and "Let's land right now." (A330, 2026-09-20)
+        // both peel to these. Exact shapes, so "land at Jerez" (a diversion,
+        // not this tool) and any longer sentence still fall through. The
+        // normaliser peels a trailing "now", which is what leaves "land
+        // right".
+        || t == "land"
+        || t == "land now"
+        || t == "land right"
+        || t == "land right now"
+        || t == "land here"
         || t.contains("get us down")
         || t.contains("get us on the ground")
         || has(t, "autoland")
@@ -2010,6 +2082,100 @@ mod tests {
             assert!(!load_aircraft_request(words), "{words}");
         }
         assert_eq!(one("refuel").unwrap().0, "request_service");
+    }
+
+    /// Four sorties' worth of missed phrasings from the logs, each the live
+    /// transcript that went unanswered. Whisper's warts first: the hand-back,
+    /// the plan word, the autoland, the electrics and the unit.
+    #[test]
+    fn the_warts_the_logs_caught_resolve_to_the_tool_the_pilot_meant() {
+        // "my controls" — a missed hand-back is an automation still flying.
+        assert_eq!(one("Mind controls.").unwrap().0, "autopilot_off");
+        // The plan word, three ways.
+        assert!(resume_plan_request("Resume the fight plan."));
+        assert_eq!(one("Fly the flight man.").unwrap().0, "full_auto");
+        assert!(normalize("That's the wrong flag plan.").contains("flight plan"));
+        // Autoland, armed and cancelled.
+        assert_eq!(one("All to land.").unwrap(), ("autoland".into(), json!({})));
+        assert_eq!(
+            one("Cancel all to land?").unwrap(),
+            ("autoland".into(), json!({ "cancel": true }))
+        );
+        assert_eq!(
+            one("Cancel Autolamp.").unwrap(),
+            ("autoland".into(), json!({ "cancel": true }))
+        );
+        // The "s on" glue, three more renderings of "electrics on".
+        for words in ["Electric source.", "Electric sauce.", "Electric software."] {
+            assert_eq!(
+                one(words).unwrap(),
+                (
+                    "set_electrical".into(),
+                    json!({ "system": "all", "on": true })
+                ),
+                "{words}"
+            );
+        }
+        // The unit, and the load sheet's verb. A pace with a number in it is
+        // the governor's front door, which is where a taxi pace belongs.
+        assert_eq!(
+            one("Taxi at ten notes.").unwrap(),
+            ("hold_speed".into(), json!({ "knots": 10 }))
+        );
+        assert!(load_aircraft_request("Loads the aircraft."));
+        // ...and the words they sound like are left alone.
+        assert_eq!(normalize("power idle"), "power idle");
+    }
+
+    /// The taxi and the landing asked in the fewest words there are. Both
+    /// were logged as misses with the pilot trying again and giving up.
+    #[test]
+    fn the_shortest_taxi_and_landing_asks_are_requests() {
+        // Twin Otter, 2026-09-22: four tries at the taxi, then full auto.
+        assert_eq!(one("Taxi to runway.").unwrap().0, "auto_taxi");
+        assert_eq!(one("taxi to the runway").unwrap().0, "auto_taxi");
+        // ...but a readback carries its specifics and is still not a request.
+        assert!(
+            one("taxi to runway zero nine via alpha").is_none_or(|(tool, _)| tool != "auto_taxi")
+        );
+        assert!(
+            one("taxi to holding point charlie one runway zero four left")
+                .is_none_or(|(tool, _)| tool != "auto_taxi")
+        );
+        // 737 2026-09-17 and A330 2026-09-20.
+        assert_eq!(one("Let's land.").unwrap(), ("autoland".into(), json!({})));
+        assert_eq!(
+            one("Let's land right now.").unwrap(),
+            ("autoland".into(), json!({}))
+        );
+        // A named field is a diversion, not the autoland tool.
+        assert!(one("let's land at jerez").is_none_or(|(tool, _)| tool != "autoland"));
+    }
+
+    /// The S-76C declares `engine: false` — the twist grips are the pilot's,
+    /// so no start or shutdown tool is built. At the pad on 2026-09-17 the
+    /// pilot asked four ways in eleven seconds and heard nothing at all. A
+    /// capability the airframe lacks is said, not swallowed.
+    #[test]
+    fn the_helicopters_engines_are_declined_not_swallowed() {
+        let prof = aircraft::load("sikorsky_s76c").expect("s76 profile");
+        let reg = Registry::for_aircraft(&prof);
+        assert!(reg.get("start_engine").is_none() && reg.get("start_engines").is_none());
+        for words in [
+            "Start engines.",
+            "Start the engines.",
+            "Engine's on.",
+            "Engines on.",
+            "shut down the engines",
+        ] {
+            assert!(declined(words, &reg).is_some(), "{words}");
+        }
+        // The airframes that do have the tool are untouched.
+        let (creg, _) = setup();
+        assert!(declined("start the engine", &creg).is_none());
+        let jet = aircraft::load("boeing_737_800").expect("737 profile");
+        let jreg = Registry::for_aircraft(&jet);
+        assert!(declined("engines off", &jreg).is_none());
     }
 
     fn one(t: &str) -> Option<(String, Value)> {
