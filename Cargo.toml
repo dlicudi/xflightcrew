@@ -10,6 +10,10 @@ members = ["crates/atc", "crates/sim"]
 # only. Decided 2026-07-30; see the Licensing section of CLAUDE.md.
 [workspace.package]
 license = "GPL-3.0-or-later"
+# Cargo's bookkeeping only, never shown: the product version is the date of
+# the commit a build sits on, stamped by build.rs (and the plugin's Makefile).
+# Nothing here is published, so this never needs to move.
+version = "0.0.0"
 
 # One version of each shared dep across the workspace, so the crates never drift.
 [workspace.dependencies]
@@ -29,7 +33,7 @@ tracing = "0.1"
 # target prefix — if you ever change it, change the RUST_LOG default in
 # src/main.rs with it or every crew-side log line silently disappears.
 name = "xvoicelayer"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 # Plain `cargo run` means the copilot; the atc binary is opt-in (--bin atc).
 default-run = "xvl"

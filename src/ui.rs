@@ -936,8 +936,8 @@ mod tests {
     fn app_with(log: Vec<(LogKind, String)>) -> App {
         App {
             boot: health::Boot {
-                version: "0.1.0".into(),
-                build: "abc1234".into(),
+                version: "2026.9.22".into(),
+                build: "abc1234, release".into(),
                 whisper: "base.en · gpu".into(),
                 listen: "ptt dataref · xcopilot/ptt_active".into(),
                 mic: "MacBook Pro Microphone".into(),

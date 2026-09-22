@@ -5,9 +5,13 @@
 
 #include "imgui.h"
 
-// Project version. Single version for the whole product (app + plugin ship and
-// must be compatible as a pair); keep in sync with Cargo.toml.
-#define XCOPILOT_VERSION "0.1.0"
+// Project version: the date of the commit the build sits on (2026.9.22),
+// injected by the Makefile (-DXCOPILOT_VERSION=...) exactly as the app's
+// build.rs computes it, so app and plugin name the same build the same way.
+// "dev" if built outside the Makefile.
+#ifndef XCOPILOT_VERSION
+#define XCOPILOT_VERSION "dev"
+#endif
 // Git build id, injected by the Makefile (-DXCOPILOT_BUILD=...). Lets us confirm
 // from the log/panel exactly which build is loaded after a reload. "dev" if built
 // outside the Makefile.

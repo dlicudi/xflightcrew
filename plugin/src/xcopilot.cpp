@@ -57,8 +57,8 @@ PLUGIN_API int XPluginStart(char* name, char* sig, char* desc) {
 
     char started[160];
     std::snprintf(started, sizeof started,
-                  "XVoiceLayer plugin: started, build %s, AIRAC %s (ptt + ImGui status panel)\n",
-                  XCOPILOT_BUILD,
+                  "XVoiceLayer plugin: started, version %s, build %s, AIRAC %s (ptt + ImGui status panel)\n",
+                  XCOPILOT_VERSION, XCOPILOT_BUILD,
                   fms::airac_cycle().empty() ? "unknown" : fms::airac_cycle().c_str());
     XPLMDebugString(started);
     return 1;

@@ -168,8 +168,9 @@ async fn main() -> Result<()> {
     // First line in the log: which build this is, so there's no doubt about whether
     // a rebuilt copilot was actually picked up (pairs with the plugin's build line).
     tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = env!("XVL_VERSION"),
         build = env!("XCOPILOT_BUILD"),
+        profile = env!("XVL_PROFILE"),
         "XVoiceLayer starting"
     );
 
@@ -3602,8 +3603,8 @@ fn boot_health(config: &Config) -> health::Boot {
     }
 
     health::Boot {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        build: env!("XCOPILOT_BUILD").to_string(),
+        version: env!("XVL_VERSION").to_string(),
+        build: concat!(env!("XCOPILOT_BUILD"), ", ", env!("XVL_PROFILE")).to_string(),
         whisper: format!(
             "{} · {}",
             whisper_model_label(&config.whisper_model_path),

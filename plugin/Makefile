@@ -12,14 +12,18 @@ XPLANE  ?= $(HOME)/X-Plane 12
 
 CXX      := clang++
 ARCHS    := -arch arm64 -arch x86_64
-# Git build id (short SHA, with -dirty when there are uncommitted changes), so the
-# plugin's startup log and panel title show exactly which build is loaded.
-BUILD    := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell git diff --quiet 2>/dev/null || echo -dirty.$$(date +%H%M%S))
+# Version: the date of the commit the build sits on (2026.9.22), computed the
+# way the app's build.rs computes it, so the pair can be compared at a glance.
+VERSION  := $(shell git log -1 --format=%cd --date=format:%Y.%-m.%-d 2>/dev/null || echo dev)
+# Git build id (short SHA, with -dirty when there are uncommitted changes, staged
+# ones included), so the plugin's startup log and panel title show exactly which
+# build is loaded.
+BUILD    := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell test -z "$$(git status --porcelain --untracked-files=no 2>/dev/null)" || echo -dirty.$$(date +%H%M%S))
 CXXFLAGS := -std=c++17 -fPIC -fvisibility=hidden -O2 -mmacosx-version-min=12.0 \
             -Wno-deprecated-declarations -Wno-exceptions \
             -DAPL=1 -DIBM=0 -DLIN=0 -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 \
             -DXPLM400=1 -DXPLM410=1 -DXPLM420=1 -DXPLM430=1 -DXPLM440=1 \
-            -DXCOPILOT_BUILD='"$(BUILD)"' \
+            -DXCOPILOT_VERSION='"$(VERSION)"' -DXCOPILOT_BUILD='"$(BUILD)"' \
             -I$(SDK)/CHeaders/XPLM -Ithird_party/imgui
 LDFLAGS  := -dynamiclib -mmacosx-version-min=12.0 -F$(SDK)/Libraries/Mac \
             -framework XPLM -framework ApplicationServices \
