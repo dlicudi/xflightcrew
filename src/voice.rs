@@ -77,22 +77,42 @@ pub enum Priority {
 /// that doesn't survive the audition gets removed here (or its file deleted
 /// — [`local_voices_on_disk`] quietly drops specs whose model is missing).
 fn local_accents_for(icao: &str) -> &'static [&'static str] {
-    let p2 = icao.get(0..2).unwrap_or("");
-    match p2 {
-        // Spain + Canaries: EMPTY — every Castilian candidate failed the
-        // 2026-07-12 audition (davefx, both sharvard speakers; the rest of
-        // Piper's es_ES catalogue is low quality). Quality beats accent:
-        // Spanish fields draw from the neutral pool until a Castilian voice
-        // worth having exists. Candidates go through
-        // `audition_spanish_voices` before they're seated here.
-        "LE" | "GC" => &[],
-        // Spanish-speaking Latin America: ALSO empty since 2026-07-12 —
-        // ald-medium and even claude-high (the only high-quality Spanish
-        // Piper voice) failed the same audition. The whole Piper Spanish
-        // catalogue is below the bar; accent casting resumes when a voice
-        // worth having exists (likely a cloned one, not a Piper pick).
+    // Seated by the 2026-09-22 audition (42 samples, radio effect on, the
+    // accent pace, pass/fail by ear): a model that only ever heard its own
+    // language reads English as guesses, and most of Piper's catalogue fails
+    // on that alone. Six passed. Every French, Italian and Belgian candidate
+    // failed, as did both multi-speaker `mls` sets, so those countries stay
+    // neutral until a voice worth having exists (likely one trained on
+    // accented ENGLISH, not a Piper pick).
+    match icao.get(0..2).unwrap_or("") {
+        // Spain + Canaries: davefx, rejected on 2026-07-12 without the radio
+        // effect and passed through it on 2026-09-22. sharvard (both
+        // speakers) failed both times.
+        "LE" | "GC" => &["models/es_ES-davefx-medium.onnx"],
+        // Germany.
+        "ED" | "ET" => &["models/de_DE-thorsten-high.onnx"],
+        // The Netherlands: two, so the tower and the ATIS differ.
+        "EH" => &[
+            "models/nl_NL-pim-medium.onnx",
+            "models/nl_NL-ronnie-medium.onnx",
+        ],
+        // Portugal, Madeira and the Azores (Brazil is SB: a different
+        // accent, and stays neutral).
+        "LP" => &["models/pt_PT-tugao-medium.onnx"],
+        // Argentina. Never Spain: geography, as the es_MX rule was.
+        "SA" => &["models/es_AR-daniela-high.onnx"],
+        // Mexico and the rest of Spanish Latin America: empty since
+        // 2026-07-12 (ald and claude-high failed; claude-high again
+        // 2026-09-22).
         _ => &[],
     }
+}
+
+/// A non-English model reading English: an accent, voiced at the measured
+/// pace (see `StationVoice::build`), and never in the neutral pool.
+fn is_accent_model(spec: &str) -> bool {
+    let file = spec.rsplit('/').next().unwrap_or(spec);
+    !file.starts_with("en_")
 }
 
 /// The local voices for `icao` whose model files actually exist — what the
@@ -1274,8 +1294,9 @@ impl StationVoice {
                     // was "a bit fast" at the brisk 0.8 and still fast at a
                     // natural-ish 0.95 (both heard live 2026-07-09) — through
                     // a radio effect, an accent needs a measured pace to stay
-                    // intelligible.
-                    let pace = if model.contains("/es_") { 1.1 } else { 0.8 };
+                    // intelligible. Every non-English model is an accent (the
+                    // German, Dutch and Portuguese seats of 2026-09-22 too).
+                    let pace = if is_accent_model(model) { 1.1 } else { 0.8 };
                     engine.override_scales(
                         None,
                         Some(env_f32("XCOPILOT_ATC_TTS_LENGTH", pace)),
@@ -2018,21 +2039,33 @@ mod tests {
             station_model(StationSpeaker::Atis, &cfg, seed, &solo),
             "es1.onnx"
         );
-        // Geography: Castilian in Spain and the Canaries (with real variety
-        // on the roster), es_MX only in Spanish Latin America, neutral
-        // elsewhere (and NEVER es_MX in Spain).
-        // Spain is deliberately EMPTY since the 2026-07-12 audition (every
-        // Castilian model failed the ear; quality beats accent) — but if a
-        // voice ever returns, it must be es_ES, never es_MX.
-        assert!(local_accents_for("LEMD")
-            .iter()
-            .all(|m| m.contains("es_ES")));
-        assert!(local_accents_for("GCXO")
-            .iter()
-            .all(|m| m.contains("es_ES")));
+        // Geography: each country's own language, never a neighbour's -
+        // Castilian in Spain and the Canaries, Argentine only in Argentina,
+        // and nothing Latin American in Spain.
+        for (icao, lang) in [
+            ("LEMD", "es_ES"),
+            ("GCXO", "es_ES"),
+            ("EDDF", "de_DE"),
+            ("EHAM", "nl_NL"),
+            ("LPPT", "pt_PT"),
+            ("SAEZ", "es_AR"),
+        ] {
+            let roster = local_accents_for(icao);
+            assert!(!roster.is_empty(), "{icao} has a seat");
+            assert!(roster.iter().all(|m| m.contains(lang)), "{icao}");
+        }
         assert!(local_accents_for("MMMX")
             .iter()
             .all(|m| m.contains("es_MX")));
+        // The countries whose every candidate failed stay neutral.
+        for icao in ["LFPB", "EBLG", "LIRF"] {
+            assert!(local_accents_for(icao).is_empty(), "{icao}");
+        }
+        // Accents are voiced slower; English is not an accent.
+        assert!(is_accent_model("models/nl_NL-pim-medium.onnx"));
+        assert!(is_accent_model("models/es_AR-daniela-high.onnx"));
+        assert!(!is_accent_model("models/en_US-libritts_r-medium.onnx#90"));
+        assert!(!is_accent_model("models/en_GB-alba-medium.onnx"));
         assert!(
             local_accents_for("SBGR").is_empty(),
             "Brazil speaks Portuguese, stays neutral"

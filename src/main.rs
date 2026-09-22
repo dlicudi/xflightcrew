@@ -253,23 +253,75 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `cargo run -- tts ["phrase"]` synthesizes one phrase with the configured ONNX
-    // voice (honouring the XCOPILOT_TTS_LENGTH/NOISE/NOISE_W scale overrides) and
-    // plays it — an audition tool for tuning the voice without launching the loop.
+    // `xvl tts ["phrase"] [--voice SPEC] [--pace N] [--radio] [--out FILE.wav]`
+    // synthesizes one phrase - an audition tool for voices without launching
+    // the loop. Defaults: the copilot's configured voice (honouring the
+    // XCOPILOT_TTS_LENGTH/NOISE/NOISE_W scale overrides), played aloud.
+    // `--voice` takes any model, `models/x.onnx#12` picking a speaker of a
+    // multi-speaker one; `--pace` is the length scale (the stations run 0.8,
+    // accented voices 1.1); `--radio` applies the station's transmission
+    // effect; `--out` writes a WAV instead of playing, so a sample can be
+    // made while the sim is flying without talking over it.
     #[cfg(feature = "onnx-tts")]
     if std::env::args().nth(1).as_deref() == Some("tts") {
-        let text = std::env::args().nth(2).unwrap_or_else(|| {
+        let mut text: Option<String> = None;
+        let (mut voice, mut pace, mut radio, mut out) =
+            (config.piper_voice.clone(), None, false, None);
+        let mut args = std::env::args().skip(2);
+        while let Some(a) = args.next() {
+            match a.as_str() {
+                "--voice" => {
+                    voice = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--voice needs a model path"))?
+                }
+                "--pace" => {
+                    pace = Some(
+                        args.next()
+                            .ok_or_else(|| anyhow!("--pace needs a number"))?
+                            .parse::<f32>()?,
+                    )
+                }
+                "--radio" => radio = true,
+                "--out" => {
+                    out = Some(
+                        args.next()
+                            .ok_or_else(|| anyhow!("--out needs a file name"))?,
+                    )
+                }
+                _ => text = Some(a),
+            }
+        }
+        let text = text.unwrap_or_else(|| {
             "Roger, flaps up. Gear down, three green. Caution, fuel endurance forty minutes.".into()
         });
-        {
-            eprintln!(
-                "voice: {}  (length={} noise={} noise_w={})",
-                config.piper_voice,
-                std::env::var("XCOPILOT_TTS_LENGTH").unwrap_or_else(|_| "model".into()),
-                std::env::var("XCOPILOT_TTS_NOISE").unwrap_or_else(|_| "model".into()),
-                std::env::var("XCOPILOT_TTS_NOISE_W").unwrap_or_else(|_| "model".into())
-            );
-            tts_onnx::OnnxTts::load(&config.piper_voice)?.speak(&text)?;
+        eprintln!(
+            "voice: {voice}  (length={} noise={} noise_w={})",
+            pace.map(|p| p.to_string())
+                .or_else(|| std::env::var("XCOPILOT_TTS_LENGTH").ok())
+                .unwrap_or_else(|| "model".into()),
+            std::env::var("XCOPILOT_TTS_NOISE").unwrap_or_else(|_| "model".into()),
+            std::env::var("XCOPILOT_TTS_NOISE_W").unwrap_or_else(|_| "model".into())
+        );
+        let mut v = tts_onnx::OnnxTts::load(&voice)?;
+        if pace.is_some() {
+            v.override_scales(None, pace, None);
+        }
+        let mut samples = v.render(&text)?;
+        if radio {
+            match radiofx::load_tail_wav("assets/afv/Click_f32.wav", v.sample_rate()) {
+                Ok(tail) => radiofx::radioize_with_tail(&mut samples, v.sample_rate(), 1, &tail),
+                Err(_) => radiofx::radioize_variant(&mut samples, v.sample_rate(), 1),
+            }
+        }
+        let path = match &out {
+            Some(p) => std::path::PathBuf::from(p),
+            None => std::env::temp_dir().join("xvoicelayer-tts.wav"),
+        };
+        tts_onnx::write_wav(&path, &samples, v.sample_rate())?;
+        match out {
+            Some(_) => eprintln!("wrote {}", path.display()),
+            None => tts::play(&path)?,
         }
         return Ok(());
     }

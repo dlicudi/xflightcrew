@@ -360,11 +360,19 @@ impl Config {
             // were both sitting in here, so some airport was always going to
             // answer in your first officer's voice. With 154 addressable
             // voices in models/ there is no reason to share one. Accented non-English
-            // voices stay out too — es_* are cast by country, so a German
-            // field never draws a Spanish controller from here.
+            // voices stay out too - they are cast by country
+            // (`voice::local_accents_for`), so a German field never draws a
+            // Spanish controller from here. Eight libritts_r speakers (one
+            // model, 904 American voices; #720 and #810 passed the
+            // 2026-09-22 audition too) - eight, because more would break
+            // the pool's one-third-British rule (see its test).
             atc_voice_pool: env_or(
                 "XCOPILOT_ATC_VOICE_POOL",
                 "models/en_GB-vctk-medium.onnx#4,models/en_GB-vctk-medium.onnx#19,\
+                 models/en_US-libritts_r-medium.onnx#0,models/en_US-libritts_r-medium.onnx#90,\
+                 models/en_US-libritts_r-medium.onnx#180,models/en_US-libritts_r-medium.onnx#270,\
+                 models/en_US-libritts_r-medium.onnx#360,models/en_US-libritts_r-medium.onnx#450,\
+                 models/en_US-libritts_r-medium.onnx#540,models/en_US-libritts_r-medium.onnx#630,\
                  models/en_GB-vctk-medium.onnx#33,models/en_GB-vctk-medium.onnx#58,\
                  models/en_GB-vctk-medium.onnx#80,models/en_GB-vctk-medium.onnx#96,\
                  models/en_GB-aru-medium.onnx#2,models/en_GB-aru-medium.onnx#7,\

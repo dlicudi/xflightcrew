@@ -196,16 +196,6 @@ impl OnnxTts {
         Ok(data.to_vec())
     }
 
-    /// Synthesize and play the readback. The session stays warm for the next call.
-    /// Long texts are synthesized sentence by sentence (see [`speech_chunks`]) and
-    /// stitched with a short pause — one giant pass comes out rushed.
-    pub fn speak(&mut self, text: &str) -> Result<()> {
-        let samples = self.synth_chunked(text)?;
-        let wav = std::env::temp_dir().join("xvoicelayer-onnx.wav");
-        write_wav(&wav, &samples, self.sample_rate)?;
-        crate::tts::play(&wav)
-    }
-
     /// Synthesize and run `fx` over the raw samples, returning them WITHOUT
     /// playing: the seam the ATC radio-transmission effect plugs into (see
     /// `radiofx`). The caller plays via [`crate::tts::play_pcm`]; the speech
@@ -219,6 +209,14 @@ impl OnnxTts {
         let mut samples = self.synth_chunked(text)?;
         fx(&mut samples, self.sample_rate);
         Ok(samples)
+    }
+
+    /// The whole utterance as the app renders it, without playing it: for
+    /// `xvl tts`. Long texts are synthesized sentence by sentence (see
+    /// [`speech_chunks`]) and stitched with a short pause - one giant pass
+    /// comes out rushed.
+    pub fn render(&mut self, text: &str) -> Result<Vec<f32>> {
+        self.synth_chunked(text)
     }
 
     fn synth_chunked(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -644,7 +642,7 @@ mod tests {
 }
 
 /// Write mono `f32` samples as 16-bit PCM WAV.
-fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
+pub fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
@@ -737,6 +735,115 @@ mod station_voice_tests {
             let wav = out_dir.join(format!("{label}.wav"));
             super::write_wav(&wav, &s, v.sample_rate).expect("write wav");
             println!("audition: {}", wav.display());
+        }
+    }
+
+    /// The European roster, auditioned the way the Spanish one was: each
+    /// candidate reads its own country's tower call at the accent cadence the
+    /// caster applies (1.1), radio effect on, one WAV each in
+    /// `$XCOPILOT_AUDITION_DIR` (default `$TMPDIR/xc-audition/eu`). The line
+    /// printed per voice names the English phonemes the model's map LACKS:
+    /// those are dropped in silence by `synth`, so a long list is a voice that
+    /// will mumble whatever it sounds like. Also a slice of `libritts_r`'s 904
+    /// American speakers at the brisk station cadence, for the neutral pool.
+    /// Survivors are seated in `voice::local_accents_for`. Run:
+    /// `cargo test --release --lib audition_european_voices -- --ignored --nocapture`
+    #[test]
+    #[ignore = "writes audition WAVs from the real models; run manually"]
+    fn audition_european_voices() {
+        let call = |tower: &str, rwy: &str, wind: &str| {
+            format!(
+                "November two four four Kilo Romeo, {tower}, runway {rwy}, \
+                 wind {wind} degrees, eight knots, cleared to land."
+            )
+        };
+        let fr = call("Le Bourget Tower", "two seven", "two six zero");
+        let be = call("Liege Tower", "zero four right", "zero five zero");
+        let nl = call("Schiphol Tower", "one eight right", "two zero zero");
+        let de = call("Frankfurt Tower", "two five left", "two four zero");
+        let it = call("Roma Tower", "one six right", "one seven zero");
+        let pt = call("Lisboa Tower", "zero two", "three five zero");
+        let us = call("Kennedy Tower", "three one left", "three zero zero");
+        let mut specs: Vec<(String, String, String, f32)> = Vec::new();
+        let mut add = |spec: &str, text: &str, pace: f32| {
+            let label = spec
+                .trim_start_matches("models/")
+                .replace(".onnx", "")
+                .replace('#', "-s");
+            specs.push((spec.to_string(), label, text.to_string(), pace));
+        };
+        for m in ["fr_FR-siwis-medium", "fr_FR-tom-medium"] {
+            add(&format!("models/{m}.onnx"), &fr, 1.1);
+        }
+        for sid in [0, 1] {
+            add(&format!("models/fr_FR-upmc-medium.onnx#{sid}"), &fr, 1.1);
+        }
+        for sid in [0, 25, 50, 75, 100] {
+            add(&format!("models/fr_FR-mls-medium.onnx#{sid}"), &fr, 1.1);
+        }
+        for m in ["nl_BE-nathalie-medium", "nl_BE-rdh-medium"] {
+            add(&format!("models/{m}.onnx"), &be, 1.1);
+        }
+        for m in [
+            "nl_NL-alex-medium",
+            "nl_NL-pim-medium",
+            "nl_NL-ronnie-medium",
+        ] {
+            add(&format!("models/{m}.onnx"), &nl, 1.1);
+        }
+        for sid in [0, 15, 30, 45] {
+            add(&format!("models/nl_NL-mls-medium.onnx#{sid}"), &nl, 1.1);
+        }
+        add("models/de_DE-thorsten-high.onnx", &de, 1.1);
+        for sid in [0, 50, 100, 150, 200] {
+            add(&format!("models/de_DE-mls-medium.onnx#{sid}"), &de, 1.1);
+        }
+        for m in ["it_IT-paola-medium", "it_IT-serena-high"] {
+            add(&format!("models/{m}.onnx"), &it, 1.1);
+        }
+        add("models/pt_PT-tugao-medium.onnx", &pt, 1.1);
+        for sid in [0, 90, 180, 270, 360, 450, 540, 630, 720, 810] {
+            add(
+                &format!("models/en_US-libritts_r-medium.onnx#{sid}"),
+                &us,
+                0.8,
+            );
+        }
+
+        let out_dir = std::env::var("XCOPILOT_AUDITION_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("xc-audition").join("eu"));
+        std::fs::create_dir_all(&out_dir).expect("mkdir");
+        for (i, (spec, label, text, pace)) in specs.iter().enumerate() {
+            let mut v = match super::OnnxTts::load(spec) {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("skip {label}: {e:#}");
+                    continue;
+                }
+            };
+            let ipa = super::phonemize(text).expect("phonemize");
+            let mut missing: Vec<char> = ipa
+                .chars()
+                .filter(|c| !c.is_whitespace() && !v.phoneme_ids.contains_key(&c.to_string()))
+                .collect();
+            missing.sort_unstable();
+            missing.dedup();
+            v.override_scales(None, Some(*pace), Some(1.0));
+            let mut s = v.synth(text).expect("synth");
+            match crate::radiofx::load_tail_wav("assets/afv/Click_f32.wav", v.sample_rate) {
+                Ok(tail) => {
+                    crate::radiofx::radioize_with_tail(&mut s, v.sample_rate, i as u32 + 1, &tail)
+                }
+                Err(_) => crate::radiofx::radioize_variant(&mut s, v.sample_rate, i as u32 + 1),
+            }
+            let wav = out_dir.join(format!("{label}.wav"));
+            super::write_wav(&wav, &s, v.sample_rate).expect("write wav");
+            let missing: String = missing.into_iter().collect();
+            println!(
+                "audition: {label:36} missing=[{missing}]  {}",
+                wav.display()
+            );
         }
     }
 
