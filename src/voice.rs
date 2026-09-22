@@ -108,6 +108,70 @@ fn local_accents_for(icao: &str) -> &'static [&'static str] {
     }
 }
 
+/// A station voice's pace, as a multiple of the model's natural pace (see
+/// `OnnxTts::override_scales`): brisk 0.8 for a controller, 1.1 for an
+/// accent, and 1.15 for the VCTK speakers, who read fast by nature - picked
+/// by ear from 0.8 to 1.2 on 2026-09-22 ("1.1 or 1.2"), 0.8 and 1.0 both
+/// "too fast".
+fn station_pace(model: &str) -> f32 {
+    if is_accent_model(model) {
+        1.1
+    } else if let Some((_, pace)) = MEASURED_PACE.iter().find(|(spec, _)| *spec == model) {
+        *pace
+    } else if model.contains("en_GB-vctk") {
+        1.15
+    } else {
+        0.8
+    }
+}
+
+/// Per-speaker paces for the multi-speaker British sets, which read at very
+/// different natural speeds (VCTK p259 is 0.79 of VCTK p239's pace): each
+/// speaker's natural length on one tower call, measured with `xvl tts`,
+/// scaled so every one of them speaks at the rate picked by ear for p239 at
+/// 1.15 (2026-09-22). Every entry passed the same day's audition, except
+/// VCTK #58, #80 and #96, pool members from before it that were not rated.
+const MEASURED_PACE: &[(&str, f32)] = &[
+    ("models/en_GB-vctk-medium.onnx#0", 1.15),
+    ("models/en_GB-vctk-medium.onnx#1", 0.99),
+    ("models/en_GB-vctk-medium.onnx#2", 0.83),
+    ("models/en_GB-vctk-medium.onnx#3", 0.94),
+    ("models/en_GB-vctk-medium.onnx#4", 0.79),
+    ("models/en_GB-vctk-medium.onnx#5", 0.85),
+    ("models/en_GB-vctk-medium.onnx#6", 0.82),
+    ("models/en_GB-vctk-medium.onnx#7", 0.94),
+    ("models/en_GB-vctk-medium.onnx#8", 0.95),
+    ("models/en_GB-vctk-medium.onnx#9", 0.72),
+    ("models/en_GB-vctk-medium.onnx#14", 0.82),
+    ("models/en_GB-vctk-medium.onnx#15", 1.16),
+    ("models/en_GB-vctk-medium.onnx#18", 1.21),
+    ("models/en_GB-vctk-medium.onnx#19", 0.94),
+    ("models/en_GB-vctk-medium.onnx#20", 0.97),
+    ("models/en_GB-vctk-medium.onnx#22", 0.9),
+    ("models/en_GB-vctk-medium.onnx#27", 0.79),
+    ("models/en_GB-vctk-medium.onnx#34", 0.98),
+    ("models/en_GB-vctk-medium.onnx#37", 0.81),
+    ("models/en_GB-vctk-medium.onnx#58", 0.73),
+    ("models/en_GB-vctk-medium.onnx#80", 0.79),
+    ("models/en_GB-vctk-medium.onnx#96", 0.96),
+    ("models/en_GB-aru-medium.onnx#0", 0.77),
+    ("models/en_GB-aru-medium.onnx#1", 0.95),
+    ("models/en_GB-aru-medium.onnx#2", 1.0),
+    ("models/en_GB-aru-medium.onnx#3", 0.66),
+    ("models/en_GB-aru-medium.onnx#4", 0.88),
+    ("models/en_GB-aru-medium.onnx#5", 0.9),
+    ("models/en_GB-aru-medium.onnx#6", 0.78),
+    ("models/en_GB-aru-medium.onnx#7", 0.94),
+    ("models/en_GB-aru-medium.onnx#8", 0.99),
+    ("models/en_GB-aru-medium.onnx#9", 0.91),
+    ("models/en_GB-aru-medium.onnx#10", 0.95),
+    ("models/en_GB-aru-medium.onnx#11", 0.82),
+    ("models/en_GB-semaine-medium.onnx#0", 0.77),
+    ("models/en_GB-semaine-medium.onnx#1", 0.74),
+    ("models/en_GB-semaine-medium.onnx#2", 0.67),
+    ("models/en_GB-jenny_dioco-medium.onnx", 0.65),
+];
+
 /// A non-English model reading English: an accent, voiced at the measured
 /// pace (see `StationVoice::build`), and never in the neutral pool.
 fn is_accent_model(spec: &str) -> bool {
@@ -1296,7 +1360,7 @@ impl StationVoice {
                     // a radio effect, an accent needs a measured pace to stay
                     // intelligible. Every non-English model is an accent (the
                     // German, Dutch and Portuguese seats of 2026-09-22 too).
-                    let pace = if is_accent_model(model) { 1.1 } else { 0.8 };
+                    let pace = station_pace(model);
                     engine.override_scales(
                         None,
                         Some(env_f32("XCOPILOT_ATC_TTS_LENGTH", pace)),
@@ -2066,6 +2130,23 @@ mod tests {
         assert!(is_accent_model("models/es_AR-daniela-high.onnx"));
         assert!(!is_accent_model("models/en_US-libritts_r-medium.onnx#90"));
         assert!(!is_accent_model("models/en_GB-alba-medium.onnx"));
+        // And the paces the ear picked.
+        assert_eq!(station_pace("models/en_GB-alba-medium.onnx"), 0.8);
+        assert_eq!(station_pace("models/en_GB-vctk-medium.onnx#0"), 1.15);
+        // A slow reader measured and sped up to the same rate.
+        assert!(station_pace("models/en_GB-vctk-medium.onnx#4") < 0.85);
+        // Every measured voice is in the pool, and every British pool voice
+        // with a measurement is paced by it.
+        let pool = crate::config::Config::from_env()
+            .expect("config")
+            .atc_voice_pool;
+        for (spec, _) in MEASURED_PACE {
+            assert!(
+                pool.contains(&format!("{spec},")) || pool.ends_with(spec),
+                "{spec}"
+            );
+        }
+        assert_eq!(station_pace("models/nl_NL-pim-medium.onnx"), 1.1);
         assert!(
             local_accents_for("SBGR").is_empty(),
             "Brazil speaks Portuguese, stays neutral"

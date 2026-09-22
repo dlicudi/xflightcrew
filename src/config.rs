@@ -362,28 +362,50 @@ impl Config {
             // voices in models/ there is no reason to share one. Accented non-English
             // voices stay out too - they are cast by country
             // (`voice::local_accents_for`), so a German field never draws a
-            // Spanish controller from here. Eight libritts_r speakers (one
-            // model, 904 American voices; #720 and #810 passed the
-            // 2026-09-22 audition too) - eight, because more would break
-            // the pool's one-third-British rule (see its test).
+            // Spanish controller from here. The 2026-09-22 auditions seated
+            // ten libritts_r speakers (one model, 904 American voices) and
+            // the British passes: 22 VCTK, all 12 aru, three semaine and
+            // jenny_dioco, each at a measured pace (`voice::MEASURED_PACE`),
+            // which keeps the pool well over its one-third-British rule.
             atc_voice_pool: env_or(
                 "XCOPILOT_ATC_VOICE_POOL",
-                "models/en_GB-vctk-medium.onnx#4,models/en_GB-vctk-medium.onnx#19,\
-                 models/en_US-libritts_r-medium.onnx#0,models/en_US-libritts_r-medium.onnx#90,\
-                 models/en_US-libritts_r-medium.onnx#180,models/en_US-libritts_r-medium.onnx#270,\
-                 models/en_US-libritts_r-medium.onnx#360,models/en_US-libritts_r-medium.onnx#450,\
-                 models/en_US-libritts_r-medium.onnx#540,models/en_US-libritts_r-medium.onnx#630,\
-                 models/en_GB-vctk-medium.onnx#33,models/en_GB-vctk-medium.onnx#58,\
+                "models/en_GB-vctk-medium.onnx#0,models/en_GB-vctk-medium.onnx#1,\
+                 models/en_GB-vctk-medium.onnx#2,models/en_GB-vctk-medium.onnx#3,\
+                 models/en_GB-vctk-medium.onnx#4,models/en_GB-vctk-medium.onnx#5,\
+                 models/en_GB-vctk-medium.onnx#6,models/en_GB-vctk-medium.onnx#7,\
+                 models/en_GB-vctk-medium.onnx#8,models/en_GB-vctk-medium.onnx#9,\
+                 models/en_GB-vctk-medium.onnx#14,models/en_GB-vctk-medium.onnx#15,\
+                 models/en_GB-vctk-medium.onnx#18,models/en_GB-vctk-medium.onnx#19,\
+                 models/en_GB-vctk-medium.onnx#20,models/en_GB-vctk-medium.onnx#22,\
+                 models/en_GB-vctk-medium.onnx#27,models/en_GB-vctk-medium.onnx#34,\
+                 models/en_GB-vctk-medium.onnx#37,models/en_GB-vctk-medium.onnx#58,\
                  models/en_GB-vctk-medium.onnx#80,models/en_GB-vctk-medium.onnx#96,\
-                 models/en_GB-aru-medium.onnx#2,models/en_GB-aru-medium.onnx#7,\
-                 models/en_GB-cori-medium.onnx,\
+                 models/en_GB-aru-medium.onnx#0,models/en_GB-aru-medium.onnx#1,\
+                 models/en_GB-aru-medium.onnx#2,models/en_GB-aru-medium.onnx#3,\
+                 models/en_GB-aru-medium.onnx#4,models/en_GB-aru-medium.onnx#5,\
+                 models/en_GB-aru-medium.onnx#6,models/en_GB-aru-medium.onnx#7,\
+                 models/en_GB-aru-medium.onnx#8,models/en_GB-aru-medium.onnx#9,\
+                 models/en_GB-aru-medium.onnx#10,models/en_GB-aru-medium.onnx#11,\
+                 models/en_GB-semaine-medium.onnx#0,models/en_GB-semaine-medium.onnx#1,\
+                 models/en_GB-semaine-medium.onnx#2,\
+                 models/en_GB-jenny_dioco-medium.onnx,models/en_GB-cori-medium.onnx,\
                  models/en_GB-southern_english_female-low.onnx,\
                  models/en_US-joe-medium.onnx,models/en_US-danny-low.onnx,\
                  models/en_US-bryce-medium.onnx,models/en_US-john-medium.onnx,\
                  models/en_US-norman-medium.onnx,models/en_US-kusal-medium.onnx,\
                  models/en_US-lessac-medium.onnx,models/en_US-hfc_male-medium.onnx,\
                  models/en_US-reza_ibrahim-medium.onnx,models/en_US-mike-medium.onnx,\
-                 models/en_US-sam-medium.onnx,models/en_US-kathleen-low.onnx",
+                 models/en_US-sam-medium.onnx,models/en_US-kathleen-low.onnx,\
+                 models/en_US-libritts_r-medium.onnx#0,\
+                 models/en_US-libritts_r-medium.onnx#90,\
+                 models/en_US-libritts_r-medium.onnx#180,\
+                 models/en_US-libritts_r-medium.onnx#270,\
+                 models/en_US-libritts_r-medium.onnx#360,\
+                 models/en_US-libritts_r-medium.onnx#450,\
+                 models/en_US-libritts_r-medium.onnx#540,\
+                 models/en_US-libritts_r-medium.onnx#630,\
+                 models/en_US-libritts_r-medium.onnx#720,\
+                 models/en_US-libritts_r-medium.onnx#810",
             ),
             atc_voice_shift: env_or("XCOPILOT_ATC_VOICE_SHIFT", "true") != "false",
             atc_squelch_wav: env_or("XCOPILOT_SQUELCH_WAV", "assets/afv/Click_f32.wav"),

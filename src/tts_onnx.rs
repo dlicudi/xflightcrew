@@ -27,6 +27,9 @@ pub struct OnnxTts {
     sample_rate: u32,
     /// `[noise_scale, length_scale, noise_w]` — the VITS inference scales.
     scales: [f32; 3],
+    /// The model's OWN `length_scale` from its `.onnx.json`: its natural
+    /// pace. A pace override is a multiple of it (see [`Self::override_scales`]).
+    native_length: f32,
     /// Speaker id for MULTI-speaker voices (`Some` only when the model hosts
     /// more than one): one .onnx file, several distinct people. Selected by
     /// the `#N` suffix on the voice spec ("es_ES-sharvard-medium.onnx#1").
@@ -88,6 +91,7 @@ impl OnnxTts {
         // timbre/pitch variation, `length_scale` = pace (lower is faster/peppier),
         // `noise_w` = rhythm variation. Nudging a flat voice: length down, noise_w up.
         let inf = &cfg["inference"];
+        let native_length = inf["length_scale"].as_f64().unwrap_or(1.0) as f32;
         let scales = [
             env_scale(
                 "XCOPILOT_TTS_NOISE",
@@ -113,6 +117,7 @@ impl OnnxTts {
             phoneme_ids,
             sample_rate,
             scales,
+            native_length,
             speaker,
         })
     }
@@ -125,8 +130,14 @@ impl OnnxTts {
 
     /// Override this voice's VITS scales after load — per-instance, unlike the
     /// `XCOPILOT_TTS_*` env knobs which apply to every voice in the process.
-    /// `None` keeps the current value. noise = timbre variation, length = pace
-    /// (lower is faster), noise_w = rhythm variation.
+    /// `None` keeps the current value. noise = timbre variation, noise_w =
+    /// rhythm variation, both absolute. `length` = pace, lower is faster, and
+    /// it is a MULTIPLE of the model's natural pace, never an absolute scale:
+    /// models ship their own (`en_GB-vctk-medium` 1.4, `hfc_male` and `sam`
+    /// 0.8, the rest 1.0), and the station's absolute 0.8 ran VCTK's
+    /// controllers at 0.57 of their natural length - "too fast" at every
+    /// audition (2026-09-22). 0.8 now means 20% brisker than natural for
+    /// every voice alike.
     pub fn override_scales(
         &mut self,
         noise: Option<f32>,
@@ -137,7 +148,7 @@ impl OnnxTts {
             self.scales[0] = v;
         }
         if let Some(v) = length {
-            self.scales[1] = v;
+            self.scales[1] = self.native_length * v;
         }
         if let Some(v) = noise_w {
             self.scales[2] = v;
