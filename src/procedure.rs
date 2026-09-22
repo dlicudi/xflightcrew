@@ -686,7 +686,12 @@ const DRAG_MIN_DESCENT_FPM: f64 = 500.0;
 /// pulls the speedbrake, and if that is not enough it shallows the descent:
 /// the speed is owed to the approach that starts at the bottom, the height
 /// can be lost later. Pure; `out` is the brake's state going in.
-pub fn descent_drag(out: bool, ias_kts: f64, target_kts: Option<f64>, vs_cmd_fpm: f64) -> (bool, f64) {
+pub fn descent_drag(
+    out: bool,
+    ias_kts: f64,
+    target_kts: Option<f64>,
+    vs_cmd_fpm: f64,
+) -> (bool, f64) {
     let Some(target) = target_kts else {
         return (false, 1.0);
     };
@@ -694,7 +699,11 @@ pub fn descent_drag(out: bool, ias_kts: f64, target_kts: Option<f64>, vs_cmd_fpm
         return (false, 1.0);
     }
     let over = ias_kts - target;
-    let want_out = if out { over > DRAG_IN_KTS } else { over > DRAG_OUT_KTS };
+    let want_out = if out {
+        over > DRAG_IN_KTS
+    } else {
+        over > DRAG_OUT_KTS
+    };
     let scale = if over > 20.0 {
         0.5
     } else if over > 12.0 {
@@ -1094,17 +1103,14 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         if let Some(sync) = crate::tools::instruments::sync_altimeter(&xp, ta).await {
             crate::blackbox::record(
                 "procedure",
-                serde_json::json!({"event": "altimeter_set", "was": sync.was, "now": sync.now}),
+                serde_json::json!({"event": "altimeter_set", "was": sync.was, "now": sync.now, "want": sync.want, "took": sync.took()}),
             );
-            if sync.changed() {
-                alert(
-                    &voice,
-                    Priority::Advisory,
-                    &format!(
-                        "Altimeter set, {}.",
-                        crate::tools::instruments::spoken_setting(sync.now)
-                    ),
-                );
+            // A set that did not take is never quiet: every altitude below
+            // is wrong by the difference (EGSS 2026-09-22, 12,500 ft).
+            if !sync.took() {
+                alert(&voice, Priority::Warning, &sync.line());
+            } else if sync.changed() {
+                alert(&voice, Priority::Advisory, &sync.line());
             }
         }
     }
@@ -1578,7 +1584,11 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
                         alert(
                             &voice,
                             Priority::Advisory,
-                            if want_out { "Speedbrake." } else { "Speedbrake in." },
+                            if want_out {
+                                "Speedbrake."
+                            } else {
+                                "Speedbrake in."
+                            },
                         );
                     }
                 }
@@ -1763,13 +1773,25 @@ mod tests {
     #[test]
     fn a_descent_that_outruns_the_governor_gets_drag_then_a_shallower_rate() {
         // Through ten thousand, 8 over: not yet. 9 over: brakes.
-        assert_eq!(descent_drag(false, 258.0, Some(250.0), -2000.0), (false, 1.0));
-        assert_eq!(descent_drag(false, 259.0, Some(250.0), -2000.0), (true, 1.0));
+        assert_eq!(
+            descent_drag(false, 258.0, Some(250.0), -2000.0),
+            (false, 1.0)
+        );
+        assert_eq!(
+            descent_drag(false, 259.0, Some(250.0), -2000.0),
+            (true, 1.0)
+        );
         // Out, they stay out until the speed is nearly back...
         assert_eq!(descent_drag(true, 254.0, Some(250.0), -2000.0), (true, 1.0));
-        assert_eq!(descent_drag(true, 252.0, Some(250.0), -2000.0), (false, 1.0));
+        assert_eq!(
+            descent_drag(true, 252.0, Some(250.0), -2000.0),
+            (false, 1.0)
+        );
         // ...and a runaway shallows the descent as well.
-        assert_eq!(descent_drag(true, 267.0, Some(250.0), -2000.0), (true, 0.75));
+        assert_eq!(
+            descent_drag(true, 267.0, Some(250.0), -2000.0),
+            (true, 0.75)
+        );
         assert_eq!(descent_drag(true, 278.0, Some(250.0), -2000.0), (true, 0.5));
         // Level, climbing, or with no governor target: nothing.
         assert_eq!(descent_drag(true, 278.0, Some(250.0), 0.0), (false, 1.0));

@@ -57,6 +57,9 @@ char coach_group();
 // marker — true while something the CANCEL button can stand down is running.
 const TextRef& auto_status();
 bool auto_active();
+// The plan's side of the load sheet ("ORIGIN|DEST|block_kg|payload_kg|
+// max_tow_kg|pax|unit", kilos; empty = no plan), for the Route tab.
+const TextRef& load_sheet();
 const std::vector<AtcField>& atc_fields();
 
 // COM1, for the ATC tab: khz read (0 if the sim dataref is missing) and the
@@ -86,6 +89,8 @@ void set_opt_ui_scale(int v);
 void set_typed(const char* text);
 int opt_voice();
 void set_opt_voice(int v);
+int opt_cabin_voice();
+void set_opt_cabin_voice(int v);
 const char* voice_list();
 int voice_list_len();
 

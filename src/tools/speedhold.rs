@@ -179,7 +179,11 @@ pub fn arm_flight(base_url: String, voice: Option<crate::voice::Voice>, target_k
     let asked = clamp_target(target_kts);
     let target = crate::aircraft::floored_target(asked, crate::aircraft::speed_floor_kts());
     if target > asked {
-        tracing::warn!(asked, floor = target, "speed governor: target raised to the airframe's floor");
+        tracing::warn!(
+            asked,
+            floor = target,
+            "speed governor: target raised to the airframe's floor"
+        );
         crate::blackbox::record(
             "speedhold",
             serde_json::json!({"event": "target_floored", "asked": asked, "floor": target}),
@@ -614,12 +618,8 @@ impl Tool for HoldSpeed {
         // stagnant with 602 of 631 m to run). An airframe declaring no valve
         // is untouched.
         if taxi {
-            super::controls::ensure_park_brake_valve(
-                ctx.xplane,
-                false,
-                self.park_brake_valve_set,
-            )
-            .await;
+            super::controls::ensure_park_brake_valve(ctx.xplane, false, self.park_brake_valve_set)
+                .await;
         }
         let target = if taxi {
             match a.knots {
@@ -1039,7 +1039,8 @@ async fn governor(xp: XPlaneClient, voice: Option<crate::voice::Voice>) {
                                 }
                             }
                         }
-                    } else if should_release_brake_channel(braking, brake_released) && !trim_fallback
+                    } else if should_release_brake_channel(braking, brake_released)
+                        && !trim_fallback
                     {
                         // Release the trim channel promptly instead of riding
                         // out its expiry; a failure here is covered by that

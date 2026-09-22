@@ -18,6 +18,9 @@ struct Prefs {
     /// picked from the panel's Settings tab. `None` = never chosen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pilot_voice: Option<String>,
+    /// The cabin crew's voice, the panel's second picker. `None` = never chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cabin_voice: Option<String>,
     /// The app mode ("both" | "copilot" | "atc" | "instructor") — the panel's last pick,
     /// honored at the next boot unless `XCOPILOT_MODE` overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,6 +62,18 @@ pub fn pilot_voice() -> Option<String> {
 pub fn save_pilot_voice(spec: &str) {
     let mut prefs = load();
     prefs.pilot_voice = Some(spec.to_string());
+    store(prefs);
+}
+
+/// The saved cabin-voice pick, if its model is still on disk.
+pub fn cabin_voice() -> Option<String> {
+    load().cabin_voice.filter(|p| Path::new(p).exists())
+}
+
+/// Persist a new cabin-voice pick. Best-effort, like the pilot's.
+pub fn save_cabin_voice(spec: &str) {
+    let mut prefs = load();
+    prefs.cabin_voice = Some(spec.to_string());
     store(prefs);
 }
 

@@ -201,6 +201,17 @@ pub struct Snapshot {
     /// descent advisors: the point the hands will use is the only one worth
     /// announcing.
     pub follower_tod: Option<crate::procedure::PlannedTod>,
+    /// A procedure follower is flying the plan ([`crate::procedure::ACTIVE`]).
+    /// THE RING IS NEVER CONSULTED WHILE THIS IS TRUE, even on a leg where
+    /// the follower has no top of descent to publish: `follower_tod` is
+    /// `None` on a leg with no fix or whose constraint is not below us, and
+    /// falling through to the destination ring there let the two advisors
+    /// take turns. EGLF-LFPB (2026-09-22) heard "top of descent in about a
+    /// minute" from the follower, then "12 miles ahead" from the ring, then
+    /// the ring's "we're past the descent point" as a Caution, then the
+    /// follower's "7 miles ahead" again - four calls, two geometries, one
+    /// descent that was being flown correctly the whole time.
+    pub follower_flying: bool,
     /// The altimeter knob (inHg) and the sim's local QNH (Pa), best-effort,
     /// for the altimeter cross-check. `None` = that read failed this tick.
     pub baro_inhg: Option<f64>,
@@ -521,6 +532,7 @@ impl Snapshot {
             dest_elev_ft,
             tod_ring_nm,
             follower_tod: crate::procedure::planned_tod(),
+            follower_flying: crate::procedure::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
             baro_inhg,
             qnh_pa,
             automation_flying,
@@ -683,7 +695,17 @@ impl FireState {
         let flying = crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
             || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
             || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed);
-        if !flying && self.sustained(min_duration, now) && self.should_speak(if id.starts_with("cabin_alt_") { Severity::Caution } else { sev }, now) {
+        if !flying
+            && self.sustained(min_duration, now)
+            && self.should_speak(
+                if id.starts_with("cabin_alt_") || id == "fuel_warning" {
+                    Severity::Caution
+                } else {
+                    sev
+                },
+                now,
+            )
+        {
             // Mirror OR action, never both: `voice.alert` below already posts the
             // spoken line to the panel transcript, so a separate `s.alert` here
             // wrote every callout twice (a coloured line AND a green one). The
@@ -1144,6 +1166,9 @@ impl Check for TodAhead {
                 ),
             });
         }
+        if s.follower_flying {
+            return None; // the follower's point or nothing — see `follower_flying`
+        }
         let (dist, elev, ring) = (s.dest_dist_nm?, s.dest_elev_ft?, s.tod_ring_nm?);
         if s.alt_ft < elev + 6000.0 {
             return None; // already low; TOD math is meaningless
@@ -1198,6 +1223,9 @@ impl Check for TodPassed {
                 "We're past the descent point and still level. About {fpm:.0} feet a minute makes {alt} feet at the fix."
             ));
         }
+        if s.follower_flying {
+            return None; // the follower's point or nothing — see `follower_flying`
+        }
         let (dist, elev, ring) = (s.dest_dist_nm?, s.dest_elev_ft?, s.tod_ring_nm?);
         if s.alt_ft < elev + 4000.0 || dist >= ring - 1.0 || s.groundspeed_kts < 60.0 {
             return None;
@@ -1235,7 +1263,7 @@ impl Check for HighOnProfile {
         // The follower's profile is its own (700 fpm to the next fix, not
         // 300 ft/nm to the field): judging it against the ring's slope would
         // call a correct descent high.
-        if s.follower_tod.is_some() {
+        if s.follower_tod.is_some() || s.follower_flying {
             return None;
         }
         let (dist, elev, ring) = (s.dest_dist_nm?, s.dest_elev_ft?, s.tod_ring_nm?);
@@ -1527,13 +1555,31 @@ impl StepClimb {
     /// a climb or descent is already going somewhere, and advising a step in
     /// the middle of one is noise.
     fn wanted(&self, s: &Snapshot) -> Option<(f64, f64)> {
-        if s.phase != Phase::Cruise || s.on_ground || s.vsi_fpm.abs() > 300.0 {
+        // A LEVEL THE PLAN HANDED DOWN IS NOT A LEVEL TO ARGUE WITH. The
+        // follower publishes its own top of descent for the leg it is
+        // flying; while that exists the aircraft is going DOWN shortly, on
+        // the plan's own constraint, and money saved by climbing first is
+        // money nobody can spend. EGLF-LFPB (2026-09-22) said "sixteen
+        // thousand feet below optimum, flight level two five zero would burn
+        // less" - twice - at FL230, which the plan had just brought us down
+        // to from FL250, with the descent advisory already given.
+        if s.follower_tod.is_some() {
+            return None;
+        }
+        if s.phase != Phase::Cruise || s.on_ground || s.vsi_fpm.abs() > CRUISE_WANDER_FPM {
             return None;
         }
         let optimum = crate::aircraft::optimum_altitude_ft(&self.reference, s.all_up_kg?)?;
         crate::aircraft::step_climb_ft(s.alt_ft, optimum).map(|step| (step, optimum))
     }
 }
+
+/// A level cruise under an autopilot wanders, and every crossing of this gate
+/// ENDS the advisory's episode and re-arms it. At 300 fpm the 737's own
+/// level hold tripped it twice in six minutes and said the same thing three
+/// times (EGLF-LFPB, 2026-09-22). The phase gate above already decides what
+/// counts as cruise; this only has to ignore the wobble inside it.
+const CRUISE_WANDER_FPM: f64 = 600.0;
 
 impl Check for StepClimb {
     fn id(&self) -> &'static str {
@@ -1573,6 +1619,13 @@ impl Check for StepClimb {
     /// a nag at the threshold.
     fn min_duration(&self) -> Duration {
         Duration::from_secs(120)
+    }
+    /// ...and when it does speak again it must have something NEW to say.
+    /// Keyed on the level it would ask for, so burning off the weight into a
+    /// higher step is worth a word and holding the same cruise is not.
+    fn repeat_level(&self, s: &Snapshot) -> Option<i64> {
+        self.wanted(s)
+            .map(|(step, _)| (step / 1000.0).round() as i64)
     }
 }
 
@@ -1788,6 +1841,7 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             at_or_below_min: fuel.reserve_caution_min,
             above_min: Some(fuel.reserve_warning_min),
             cruise_burn_kg_hr: Some(fuel.cruise_burn_kg_hr).filter(|b| *b > 0.0),
+            entered: Default::default(),
         }));
         checks.push(Box::new(FuelEndurance {
             id: "fuel_warning",
@@ -1795,6 +1849,7 @@ fn build_checks(profile: &AircraftProfile) -> Vec<Box<dyn Check>> {
             at_or_below_min: fuel.reserve_warning_min,
             above_min: None,
             cruise_burn_kg_hr: Some(fuel.cruise_burn_kg_hr).filter(|b| *b > 0.0),
+            entered: Default::default(),
         }));
         checks.push(Box::new(FuelPreTakeoff {
             caution_min: fuel.reserve_caution_min,
@@ -1954,6 +2009,7 @@ pub async fn run(
     // change-gated publish would leave the Flight tab blank until the next
     // real change (the aircraft-chip heartbeat is the same lesson).
     let mut last_auto = String::new();
+    let mut last_sheet = String::new();
     let mut auto_resend = 0u8;
 
     // Talk-down pacing: when the last callout went out, and whether we've
@@ -2344,7 +2400,67 @@ pub async fn run(
                 || crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
                 || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed)
                 || voice.crashed();
+            // The CABIN is not part of that. `quiet` mutes the world's
+            // narration while the flight deck is busy, and an autoland is
+            // exactly when it is - but the cabin is a state machine that has
+            // to SEE the flight, not a commentator. Gated with the rest it was
+            // never called from the autoland arm to the rollout handoff, so it
+            // missed its own landing every time an automation flew the
+            // approach (Liege 2026-09-22, "cabin is secure for departure"
+            // during the taxi in). A recovery, the panel's mute and a wreck
+            // still silence it; a normal landing does not.
+            let cabin_quiet = crate::tools::recover::ACTIVE
+                .load(std::sync::atomic::Ordering::Relaxed)
+                || PANEL_MUTE.load(std::sync::atomic::Ordering::Relaxed)
+                || voice.crashed();
             feed_surface_wind();
+            // Cabin crew watches (crew-side, airframes with a cabin crew
+            // only): the owed "cabin secure" report after an acknowledged
+            // prepare call, and the seatbelt-sign interphone call. The
+            // sterile-cockpit rule lives in the cabin module — safety
+            // reports come through, flavor stays above 10,000 ft.
+            if crew_on && !cabin_quiet && crate::cabin::aboard(cabin_capable) {
+                let (own, belt_line, tick_line) = {
+                    let mut cab = cabin.lock().unwrap_or_else(|e| e.into_inner());
+                    (
+                        // The cabin's own initiative first: what it
+                        // starts here, `tick` reports when due.
+                        cab.watch(
+                            now,
+                            crate::cabin::View {
+                                agl_ft: snap.agl_ft,
+                                on_ground: snap.on_ground,
+                                groundspeed_kts: snap.groundspeed_kts,
+                                vsi_fpm: snap.vsi_fpm,
+                                engine_running: snap.engine_running,
+                                pushing_back: snap.pushing_back || snap.tug_attached,
+                            },
+                        ),
+                        snap.seatbelt_sign
+                            .and_then(|on| cab.seatbelt(on, snap.agl_ft)),
+                        cab.tick(now, snap.agl_ft, snap.on_ground),
+                    )
+                };
+                let own_line = own.and_then(|i| {
+                    if i.line.is_none() {
+                        crate::blackbox::record(
+                            "cabin",
+                            serde_json::json!({ "route": "watch", "event": i.event }),
+                        );
+                    }
+                    i.line
+                });
+                for line in [own_line, belt_line, tick_line].into_iter().flatten() {
+                    if let Some(s) = status.as_ref() {
+                        s.action(&format!("CAB: {line}"));
+                    }
+                    crate::blackbox::record(
+                        "cabin",
+                        serde_json::json!({ "route": "watch", "line": &line }),
+                    );
+                    voice.alert_cabin(Priority::Advisory, line);
+                }
+            }
             if !quiet {
                 // One COM1 read serves the incursion shout, the ATIS loop and
                 // the traffic advisories below.
@@ -2762,31 +2878,6 @@ pub async fn run(
                         }
                     } else {
                         taxi_guide = None;
-                    }
-                }
-                // Cabin crew watches (crew-side, airframes with a cabin crew
-                // only): the owed "cabin secure" report after an acknowledged
-                // prepare call, and the seatbelt-sign interphone call. The
-                // sterile-cockpit rule lives in the cabin module — safety
-                // reports come through, flavor stays above 10,000 ft.
-                if crew_on && crate::cabin::aboard(cabin_capable) {
-                    let (belt_line, tick_line) = {
-                        let mut cab = cabin.lock().unwrap_or_else(|e| e.into_inner());
-                        (
-                            snap.seatbelt_sign
-                                .and_then(|on| cab.seatbelt(on, snap.agl_ft)),
-                            cab.tick(now, snap.agl_ft, snap.on_ground),
-                        )
-                    };
-                    for line in [belt_line, tick_line].into_iter().flatten() {
-                        if let Some(s) = status.as_ref() {
-                            s.action(&format!("CAB: {line}"));
-                        }
-                        crate::blackbox::record(
-                            "cabin",
-                            serde_json::json!({ "route": "watch", "line": &line }),
-                        );
-                        voice.alert_cabin(Priority::Advisory, line);
                     }
                 }
                 // Live-traffic watches off one TCAS target read: the
@@ -3238,6 +3329,13 @@ pub async fn run(
                 // the 1 Hz radio poller because that thread only exists when
                 // ATC is configured — auto status must flow with ATC off.
                 let auto = crate::auto_status::compose();
+                // The Route tab's load sheet rides the same gate and resend.
+                let sheet =
+                    crate::simbrief::loadsheet_payload(crate::simbrief::loaded_plan().as_ref());
+                if sheet != last_sheet || auto_resend == 0 {
+                    s.load_sheet(&sheet);
+                    last_sheet = sheet;
+                }
                 if auto != last_auto || auto_resend == 0 {
                     s.auto_status(&auto);
                     last_auto = auto;
@@ -3309,9 +3407,25 @@ pub async fn run(
                                     // setter: on the 737 a dial write is a
                                     // silent no-op every 20 s otherwise.
                                     if dref == BARO_KNOB {
-                                        let _ =
+                                        // The line above promised a reset; a
+                                        // knob that did not get there is said.
+                                        if let Ok(now) =
                                             crate::tools::instruments::set_altimeter(&xp, value)
-                                                .await;
+                                                .await
+                                        {
+                                            let sync = crate::tools::instruments::AltimeterSync {
+                                                was: now,
+                                                now,
+                                                want: value.clamp(28.0, 31.5),
+                                            };
+                                            crate::blackbox::record(
+                                                "callout",
+                                                serde_json::json!({"id": "altimeter_reset", "now": now, "want": sync.want, "took": sync.took()}),
+                                            );
+                                            if !sync.took() {
+                                                voice.alert(Priority::Warning, sync.line());
+                                            }
+                                        }
                                     } else {
                                         let _ = xp.set_float(dref, value).await;
                                     }
@@ -3469,7 +3583,18 @@ struct FuelEndurance {
     /// The profile's cruise burn, kg/hr: the most the estimate will ever
     /// assume the aircraft keeps burning (see [`endurance_minutes`]).
     cruise_burn_kg_hr: Option<f64>,
+    /// The band has been entered this flight. The estimate rides the live
+    /// flow, and a governor working the lever walks it back and forth over
+    /// the band's edge: every wobble was a cleared-and-recurred episode, and
+    /// the 737 heard the same "about 60 minutes" every 31 s for four minutes
+    /// (EGSS, 2026-09-22). Once in, the band holds until the estimate is
+    /// [`FUEL_BAND_HYSTERESIS_MIN`] clear of it.
+    entered: std::sync::atomic::AtomicBool,
 }
+
+const FUEL_BAND_HYSTERESIS_MIN: f64 = 10.0;
+/// A fuel callout is said again for each of these lost, never on a clock.
+const FUEL_REPEAT_STEP_MIN: f64 = 10.0;
 
 /// Minutes of fuel at the burn the flight will actually average: the live
 /// flow, capped at the profile's cruise burn. Takeoff and climb thrust are
@@ -3506,18 +3631,41 @@ impl Check for FuelEndurance {
         }
         let min = endurance_minutes(s.fuel_kg, s.fuel_flow_kg_sec, self.cruise_burn_kg_hr)
             .or(s.endurance_min)?;
-        let in_band = min <= self.at_or_below_min && self.above_min.is_none_or(|a| min > a);
-        if !in_band {
+        use std::sync::atomic::Ordering::Relaxed;
+        let above_floor = self.above_min.is_none_or(|a| min > a);
+        let in_band = min <= self.at_or_below_min && above_floor;
+        let held = self.entered.load(Relaxed)
+            && min <= self.at_or_below_min + FUEL_BAND_HYSTERESIS_MIN
+            && above_floor;
+        self.entered.store(in_band || held, Relaxed);
+        if !(in_band || held) {
             return None;
         }
-        // Round to the nearest 5 minutes — it's an estimate, not a stopwatch.
+        // Round to the nearest 5 minutes: it's an estimate, not a stopwatch.
         let approx = (min / 5.0).round() * 5.0;
-        Some(match self.severity {
-            Severity::Warning => {
-                format!("Low fuel — about {approx:.0} minutes at this burn. Plan to land.")
+        // The first line of a band introduces it; the later ones are a crew
+        // keeping count, each said once as another ten minutes goes.
+        let first = min > self.at_or_below_min - FUEL_REPEAT_STEP_MIN;
+        Some(match (self.severity, first) {
+            (Severity::Warning, true) => {
+                format!("Low fuel, about {approx:.0} minutes at this burn. Plan to land.")
             }
-            _ => format!("Fuel's getting low — about {approx:.0} minutes remaining."),
+            (Severity::Warning, false) if approx <= 10.0 => {
+                format!("About {approx:.0} minutes of fuel. We land now.")
+            }
+            (Severity::Warning, false) => {
+                format!("Fuel is down to about {approx:.0} minutes. We need to be landing.")
+            }
+            (_, true) => format!("Fuel's getting low, about {approx:.0} minutes remaining."),
+            (_, false) => format!("Fuel check, about {approx:.0} minutes now."),
         })
+    }
+    /// Each ten minutes lost is a new level, and a new level is the only
+    /// thing that says a fuel line twice (see `FireState::should_speak`).
+    fn repeat_level(&self, s: &Snapshot) -> Option<i64> {
+        let min = endurance_minutes(s.fuel_kg, s.fuel_flow_kg_sec, self.cruise_burn_kg_hr)
+            .or(s.endurance_min)?;
+        Some(((self.at_or_below_min - min) / FUEL_REPEAT_STEP_MIN).floor() as i64)
     }
 }
 
@@ -3550,7 +3698,7 @@ impl Check for FuelPreTakeoff {
         }
         let approx = (endurance_min / 5.0).round() * 5.0;
         Some(format!(
-            "Low fuel for departure — about {approx:.0} minutes at cruise burn. Consider refueling."
+            "Low fuel for departure, about {approx:.0} minutes at cruise burn. Consider refueling."
         ))
     }
 }
@@ -3809,6 +3957,7 @@ mod tests {
             dest_elev_ft: None,
             tod_ring_nm: None,
             follower_tod: None,
+            follower_flying: false,
             baro_inhg: None,
             qnh_pa: None,
             automation_flying: false,
@@ -3895,6 +4044,34 @@ mod tests {
             ..mid_atlantic_737(62_935.0, 34_000.0)
         };
         assert_eq!(c.eval(&blind), None);
+        // A cruise that wanders under the autopilot is still a cruise: at the
+        // old 300 fpm gate every wobble ended the episode and re-armed it,
+        // and the same advice went out three times in six minutes.
+        let wobbling = Snapshot {
+            vsi_fpm: 352.0,
+            ..mid_atlantic_737(62_935.0, 34_000.0)
+        };
+        assert!(
+            c.eval(&wobbling).is_some(),
+            "a 352 fpm wobble is level cruise, not a climb"
+        );
+        // The plan is taking us DOWN shortly: a climb is arguing with the
+        // flight plan the copilot is itself flying.
+        let going_down = Snapshot {
+            follower_tod: Some(crate::procedure::PlannedTod {
+                fix: "PETAX".into(),
+                dist_nm: 40.0,
+                to_tod_nm: 12.0,
+                target_ft: 20_200.0,
+                started: false,
+            }),
+            ..mid_atlantic_737(62_935.0, 34_000.0)
+        };
+        assert_eq!(
+            c.eval(&going_down),
+            None,
+            "the plan's own descent outranks the money"
+        );
         // And it never actuates: a level belongs to ATC.
         assert_eq!(
             c.fix_write(&mid_atlantic_737(62_935.0, 34_000.0)),
@@ -4113,6 +4290,45 @@ mod tests {
             HighOnProfile.eval(&s).is_none(),
             "the follower owns its profile"
         );
+    }
+
+    /// EGLF-LFPB, 2026-09-22: between the legs that HAVE a descent the
+    /// follower publishes no point at all, and the ring filled the silence.
+    /// Four calls on one arrival, from two geometries: the follower's "about
+    /// a minute, 2 miles, down to 23,000", then the ring's "12 miles ahead",
+    /// then the ring's "we're past the descent point" as a CAUTION, then the
+    /// follower's "7 miles ahead, down to 20,200". Nothing was wrong: the
+    /// descent was being flown leg by leg the whole time.
+    ///
+    /// While a follower flies, the ring is not a fallback. It is silence.
+    #[test]
+    fn the_ring_never_fills_the_follower_s_silence() {
+        // The ring's own geometry says all three of these things.
+        let mut s = cruise_with_dest(38.0);
+        assert!(TodPassed.eval(&s).is_some(), "the ring alone still speaks");
+        let ahead = cruise_with_dest(50.0);
+        assert!(TodAhead.eval(&ahead).is_some(), "and so does its run-up");
+        // Now a follower is flying, on a leg with nothing to descend to yet.
+        s.follower_flying = true;
+        assert_eq!(s.follower_tod, None, "no point to publish on this leg");
+        assert_eq!(
+            TodPassed.eval(&s),
+            None,
+            "the ring must not call a correctly flown plan late"
+        );
+        let mut ahead = ahead;
+        ahead.follower_flying = true;
+        assert_eq!(TodAhead.eval(&ahead), None, "nor announce its own point");
+        // ...and the high-on-profile advisor keeps the same rule.
+        let mut high = cruise_with_dest(30.0);
+        high.vsi_fpm = -700.0;
+        high.alt_ft = 13_000.0;
+        assert!(HighOnProfile.eval(&high).is_some(), "the ring's rule alone");
+        high.follower_flying = true;
+        assert_eq!(HighOnProfile.eval(&high), None, "the follower owns it");
+        // With no follower flying, nothing above has changed.
+        let plain = cruise_with_dest(38.0);
+        assert!(TodPassed.eval(&plain).is_some(), "the ring is still there");
     }
 
     #[test]
@@ -4425,6 +4641,48 @@ mod tests {
         assert!(caution.eval(&s).is_none() && warn.eval(&s).is_none());
     }
 
+    /// EGSS, 2026-09-22: the governor walked the estimate over the 60 minute
+    /// edge and the same caution was said every 31 s. One episode, one line,
+    /// then one more per ten minutes lost, in different words.
+    #[test]
+    fn a_fuel_band_is_held_over_a_wobble_and_said_again_only_per_ten_minutes() {
+        let caution = fuel_caution(); // 45 down to 30
+        let mut s = snap(true, true);
+        s.on_ground = false;
+        s.fuel_flow_kg_sec = None;
+        s.fuel_kg = None;
+        s.endurance_min = Some(44.0);
+        let first = caution.eval(&s).unwrap();
+        assert!(first.starts_with("Fuel's getting low"), "{first}");
+        assert_eq!(caution.repeat_level(&s), Some(0));
+        // The wobble back over the edge does not end the episode...
+        s.endurance_min = Some(47.0);
+        assert!(caution.eval(&s).is_some());
+        assert_eq!(caution.repeat_level(&s), Some(-1), "and is no new level");
+        // ...a real change (fuel found, a big power change) does.
+        s.endurance_min = Some(56.0);
+        assert!(caution.eval(&s).is_none());
+        s.endurance_min = Some(47.0);
+        assert!(
+            caution.eval(&s).is_none(),
+            "outside the band and never latched"
+        );
+        // Ten minutes on is a new level with its own words.
+        s.endurance_min = Some(34.0);
+        assert_eq!(caution.repeat_level(&s), Some(1));
+        assert_eq!(
+            caution.eval(&s).unwrap(),
+            "Fuel check, about 35 minutes now."
+        );
+        let warn = fuel_warning();
+        s.endurance_min = Some(9.0);
+        assert_eq!(
+            warn.eval(&s).unwrap(),
+            "About 10 minutes of fuel. We land now."
+        );
+        assert!(!warn.eval(&s).unwrap().contains('\u{2014}'));
+    }
+
     /// The 172's fuel bands: caution ≤ 45 min, warning ≤ 30 min.
     fn fuel_caution() -> FuelEndurance {
         FuelEndurance {
@@ -4433,6 +4691,7 @@ mod tests {
             at_or_below_min: 45.0,
             above_min: Some(30.0),
             cruise_burn_kg_hr: None,
+            entered: Default::default(),
         }
     }
     fn fuel_warning() -> FuelEndurance {
@@ -4442,6 +4701,7 @@ mod tests {
             at_or_below_min: 30.0,
             above_min: None,
             cruise_burn_kg_hr: None,
+            entered: Default::default(),
         }
     }
 

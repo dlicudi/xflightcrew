@@ -669,7 +669,10 @@ mod tests {
             fix_mishears("That's the wrong flag plan."),
             "That's the wrong flight plan."
         );
-        assert_eq!(fix_mishears("Clear the flag then."), "Clear the flight plan.");
+        assert_eq!(
+            fix_mishears("Clear the flag then."),
+            "Clear the flight plan."
+        );
         // A real flag is left alone.
         assert_eq!(fix_mishears("raise the flag"), "raise the flag");
     }
@@ -815,7 +818,11 @@ pub fn without_coached_phrase(text: &str) -> String {
     let bytes = text.as_bytes();
     for (i, b) in bytes.iter().enumerate() {
         if matches!(b, b'.' | b'!' | b'?') || i + 1 == bytes.len() {
-            let end = if matches!(b, b'.' | b'!' | b'?') { i + 1 } else { i + 1 };
+            let end = if matches!(b, b'.' | b'!' | b'?') {
+                i + 1
+            } else {
+                i + 1
+            };
             let sentence = &text[start..end];
             let lead = sentence
                 .trim_start_matches(|c: char| !c.is_alphanumeric())

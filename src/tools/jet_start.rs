@@ -1088,8 +1088,15 @@ mod airliner_start_tests {
         assert_eq!(read_position(&xp, &format!("{base}[1]")).await, Some(0.0));
         assert_eq!(read_position(&xp, &format!("{base}[7]")).await, None);
         xp.set_read("laminar/A333/buttons/APU_batt_pos", 1.0);
-        assert_eq!(read_position(&xp, "laminar/A333/buttons/APU_batt_pos").await, Some(1.0));
-        assert_eq!(read_position(&xp, "not/there").await, None, "no measurement");
+        assert_eq!(
+            read_position(&xp, "laminar/A333/buttons/APU_batt_pos").await,
+            Some(1.0)
+        );
+        assert_eq!(
+            read_position(&xp, "not/there").await,
+            None,
+            "no measurement"
+        );
     }
 
     #[tokio::test(start_paused = true)]

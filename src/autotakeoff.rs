@@ -172,9 +172,19 @@ const POWER_LEAD_FADE_KTS: f64 = 40.0;
 /// is the maximum yaw moment at the exact moment steering authority is
 /// highest and airflow over the rudder is zero.
 const THROTTLE_RAMP_S: f64 = 2.5;
-/// Centreline correction: degrees of cut per meter of offset, clamped.
+/// Centreline correction: degrees of cut per meter of offset, clamped. The
+/// figure is quoted AT [`XTK_GAIN_REF_KTS`] and scaled down above it - see
+/// [`roll_target_heading`].
 const XTK_GAIN_DEG_PER_M: f64 = 0.4;
 const XTK_MAX_DEG: f64 = 8.0;
+/// The pace the cut's gain was fitted at. Below it nothing changes; above it
+/// the gain is scaled by ref/gs, which holds the lateral CLOSURE TIME
+/// constant instead of the angle.
+const XTK_GAIN_REF_KTS: f64 = 40.0;
+/// How far ahead the cut looks, in seconds of cross-track closure. The lead
+/// the outer loop needs to cover the inner loop's lag: the nose takes a
+/// second or two to reach a commanded cut and as long again to give it back.
+const XTK_LEAD_S: f64 = 2.0;
 /// Rotation pitch attitude, degrees nose up — the elevator flies the nose
 /// here and HOLDS it through the initial climb; at full power in a light
 /// single that settles near Vy. Rotation is ELEVATOR, not the autopilot:
@@ -429,8 +439,13 @@ pub fn runway_fit(
 /// and the words were a lie.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NoFit {
-    /// Nothing within reach on this field at all.
-    NoneNear,
+    /// Nothing within reach on this field at all: no candidate runway, or the
+    /// best-aligned one lies further off than a line-up could ever be. `id`
+    /// and `lateral_m` name that strip when there was one, so the refusal can
+    /// say WHICH runway it looked for and how far away it is — the vague "I
+    /// couldn't get us onto the runway" is what sent the pilot to the logs
+    /// (LFPB 2026-09-22). Empty id = no pavement near us at all.
+    NoneNear { id: String, lateral_m: f64 },
     /// On the pavement, aligned, but not enough runway ahead of the nose —
     /// and there WOULD be from the threshold. Backtracking fixes this one.
     TooLittleLeft {
@@ -490,7 +505,8 @@ pub fn no_fit_line(why: &NoFit, can_line_up: bool) -> (String, bool) {
             needed_m,
         } => (
             format!(
-                "We're lined up on {} but at the far end — {:.0} metres left and I need {:.0}.                      Backtrack or vacate; I can't take off from here.",
+                "We're lined up on {} but at the far end — {:.0} metres left and I need \
+                 {:.0}. Backtrack or vacate; I can't take off from here.",
                 crate::circuit::spell_runway(id),
                 remaining_m,
                 needed_m
@@ -501,7 +517,8 @@ pub fn no_fit_line(why: &NoFit, can_line_up: bool) -> (String, bool) {
         // message actively denied.
         NoFit::NotAligned { id, err_deg } if *err_deg < 90.0 => (
             format!(
-                "We're on {} but {:.0} degrees off the centreline. Line us up, or vacate if                      there's traffic.",
+                "We're on {} but {:.0} degrees off the centreline. Line us up, or vacate \
+                 if there's traffic.",
                 crate::circuit::spell_runway(id),
                 err_deg
             ),
@@ -516,9 +533,19 @@ pub fn no_fit_line(why: &NoFit, can_line_up: bool) -> (String, bool) {
                 false,
             )
         }
+        // Not near any usable pavement. Name the strip we looked for and how
+        // far off it is: "I couldn't get us onto the runway" told the pilot
+        // nothing while the aircraft sat exactly where the tower sent it.
+        NoFit::NoneNear { id, lateral_m } if !id.is_empty() => (
+            format!(
+                "Runway {} is {:.0} metres away from us, too far for me to line up on.",
+                crate::circuit::spell_runway(id),
+                lateral_m
+            ),
+            false,
+        ),
         _ => (
-            "We're not lined up on a runway I can use. Line us up and ask me again."
-                .to_string(),
+            "We're not lined up on a runway I can use. Line us up and ask me again.".to_string(),
             false,
         ),
     }
@@ -528,14 +555,18 @@ pub fn no_fit_line(why: &NoFit, can_line_up: bool) -> (String, bool) {
 /// gate it fails — in the same order the fit applies them, so the answer is
 /// always the thing that actually stopped it.
 pub fn why_no_fit(cands: &[Runway], lat: f64, lon: f64, psi_true: f64, needed_m: f64) -> NoFit {
-    let Some(r) = cands
-        .iter()
-        .min_by(|a, b| {
-            heading_diff(psi_true, a.course_deg).total_cmp(&heading_diff(psi_true, b.course_deg))
-        })
-        .filter(|r| (cross_track_nm(lat, lon, r) * M_PER_NM).abs() < 2.0 * LATERAL_MAX_M)
+    let best = cands.iter().min_by(|a, b| {
+        heading_diff(psi_true, a.course_deg).total_cmp(&heading_diff(psi_true, b.course_deg))
+    });
+    let Some(r) =
+        best.filter(|r| (cross_track_nm(lat, lon, r) * M_PER_NM).abs() < 2.0 * LATERAL_MAX_M)
     else {
-        return NoFit::NoneNear;
+        return NoFit::NoneNear {
+            id: best.map(|r| r.id.clone()).unwrap_or_default(),
+            lateral_m: best
+                .map(|r| (cross_track_nm(lat, lon, r) * M_PER_NM).abs())
+                .unwrap_or(0.0),
+        };
     };
     let id = r.id.clone();
     let err = heading_diff(psi_true, r.course_deg);
@@ -607,9 +638,41 @@ pub fn runway_matches(fitted: &str, cleared: &str) -> bool {
 
 /// The heading to hold on the roll: runway course with a bounded cut back
 /// toward the centreline (`xtk_m` right-positive, same convention as
-/// autoland's final).
-pub fn roll_target_heading(course_deg: f64, xtk_m: f64) -> f64 {
-    let corr = (xtk_m * XTK_GAIN_DEG_PER_M).clamp(-XTK_MAX_DEG, XTK_MAX_DEG);
+/// autoland's final; `xtk_rate_m_s` right-positive too).
+///
+/// THE CUT IS SIZED FOR A CLOSURE TIME, NOT AN ANGLE PER METRE. A fixed
+/// 0.4 deg/m closes an offset in `1 / (V * gain)` seconds, so the faster the
+/// aircraft the tighter the outer loop winds - at 40 kt that is 7 seconds and
+/// the loop is placid, at 150 kt it is under 2 and sits on top of the inner
+/// loop's own lag. The pair then oscillates, and it did at both ends of the
+/// same sortie (EGLF 24 / LFPB 03, 2026-09-22): the takeoff wandered
+/// +1.7, -4.6, +10.1 m and LIFTED OFF ten metres right of the centreline,
+/// and the landing rollout wove +3.1 / -5.7 m through four degrees of heading
+/// before it damped. Scaling the gain by `ref/gs` above [`XTK_GAIN_REF_KTS`]
+/// holds the closure time at the placid figure for every speed; below that
+/// pace nothing changes, so the low-speed behaviour the takeoff was tuned
+/// around (the sortie-three pirouette) is untouched.
+///
+/// [`XTK_LEAD_S`] is the other half: the cut is taken against where the
+/// offset WILL be, not where it is. Autoland's final learned this years
+/// earlier ("P alone converged asymptotically and S-ed under wind") and the
+/// roll never got it.
+pub fn roll_target_heading(course_deg: f64, xtk_m: f64, xtk_rate_m_s: f64, gs_kts: f64) -> f64 {
+    let offset = if xtk_m.is_finite() { xtk_m } else { 0.0 };
+    let rate = if xtk_rate_m_s.is_finite() {
+        xtk_rate_m_s
+    } else {
+        0.0
+    };
+    // A missing or absurd groundspeed reads as the reference pace, which is
+    // the gain this has always had.
+    let pace = if gs_kts.is_finite() {
+        gs_kts.abs().max(XTK_GAIN_REF_KTS)
+    } else {
+        XTK_GAIN_REF_KTS
+    };
+    let gain = XTK_GAIN_DEG_PER_M * (XTK_GAIN_REF_KTS / pace);
+    let corr = ((offset + rate * XTK_LEAD_S) * gain).clamp(-XTK_MAX_DEG, XTK_MAX_DEG);
     (course_deg - corr).rem_euclid(360.0)
 }
 
@@ -1406,6 +1469,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
     // swinging-nose hold (throttle is commanded before position is read).
     let mut last_err = 0.0_f64;
     let mut steer_law = RollSteer::default();
+    // Previous cross-track, for the roll's own closure rate (see
+    // [`roll_target_heading`]). Metres, right-positive.
+    let mut prev_xtk_m: Option<f64> = None;
     let mut last_tick: Option<std::time::Instant> = None;
     let roll_start = std::time::Instant::now();
     let mut frozen_secs = 0.0_f64;
@@ -1585,7 +1651,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
             // Steer the centreline: PD plus the learned P-factor trim,
             // slew-limited (no tick slams the wheel).
             let xtk_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
-            let target = roll_target_heading(rwy.course_deg, xtk_m);
+            let xtk_rate = prev_xtk_m.map_or(0.0, |p| (xtk_m - p) / dt);
+            prev_xtk_m = Some(xtk_m);
+            let target = roll_target_heading(rwy.course_deg, xtk_m, xtk_rate, gs_kts);
             let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
             last_err = err;
             let steer = steer_law.step(err, dt, gs_kts, thr_cmd);
@@ -1616,6 +1684,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                     "theta": theta_deg, "pitch_tgt": pitch_law.target_deg(),
                     "q": pitch_rate,
                     "steer": steer, "trim": steer_law.trim(), "xtk_m": xtk_m,
+                    "xtk_rate": xtk_rate,
                     "thr": thr_cmd, "remaining_m": remaining, "dt": dt,
                 }),
             );
@@ -2016,7 +2085,13 @@ mod tests {
         // to give.
         assert!(runway_fit(&cands, 0.0, 0.0, 0.0, 500.0).is_some());
         // Nothing anywhere near.
-        assert_eq!(why_no_fit(&[], 0.0, 0.0, 0.0, 500.0), NoFit::NoneNear);
+        assert_eq!(
+            why_no_fit(&[], 0.0, 0.0, 0.0, 500.0),
+            NoFit::NoneNear {
+                id: String::new(),
+                lateral_m: 0.0
+            }
+        );
         // EGPH 2026-09-20: at the handoff height at 203 kt against a 210 kt
         // clean floor. The handoff waits, flying, and goes once clean or fast
         // enough, and never waits past its bound or for a clean wing.
@@ -2062,6 +2137,38 @@ mod tests {
             why_no_fit(&cands, 0.0, 0.0, 0.0, 2560.0),
             NoFit::RunwayTooShort { .. }
         ));
+
+        // NOTHING NEAR, but we know WHAT we looked for. LFPB 2026-09-22: the
+        // cleared runway 07 lay 169 m off, and both the tool and full auto
+        // said only "I couldn't get us onto the runway". A strip 400 m abeam
+        // the north runway is that shape.
+        let abeam = why_no_fit(&cands, 0.0, 400.0 / (111_320.0 * 0.0_f64.cos()), 0.0, 500.0);
+        match &abeam {
+            NoFit::NoneNear { id, lateral_m } => {
+                assert_eq!(id, "36");
+                assert!((*lateral_m - 400.0).abs() < 5.0, "{lateral_m}");
+            }
+            other => panic!("expected NoneNear with the strip named, got {other:?}"),
+        }
+        let (line, urgent) = no_fit_line(&abeam, false);
+        assert!(
+            line.contains("three six") && line.contains("400 metres"),
+            "{line}"
+        );
+        assert!(
+            !urgent,
+            "beside the field is not an occupied runway: {line}"
+        );
+        // ...and with no pavement at all in the data, the old wording stands —
+        // there is nothing truthful to name.
+        let (bare, _) = no_fit_line(
+            &NoFit::NoneNear {
+                id: String::new(),
+                lateral_m: 0.0,
+            },
+            false,
+        );
+        assert!(bare.contains("not lined up on a runway"), "{bare}");
     }
 
     /// The BIKF departure (2026-09-20): commanded 8 degrees, flew 22.4. The
@@ -2284,12 +2391,176 @@ mod tests {
 
     #[test]
     fn roll_target_cuts_toward_the_centreline_bounded() {
-        // 10 m right of the line: cut left of runway heading, bounded.
-        let tgt = roll_target_heading(0.0, 10.0);
+        // 10 m right of the line at taxi pace: cut left of runway heading,
+        // bounded, and exactly as it always was at or below the reference.
+        let tgt = roll_target_heading(0.0, 10.0, 0.0, XTK_GAIN_REF_KTS);
         assert!(tgt > 350.0 && tgt < 360.0, "cut left, got {tgt}");
+        assert!(
+            (360.0 - tgt - 10.0 * XTK_GAIN_DEG_PER_M).abs() < 1e-9,
+            "the reference pace keeps the gain it was fitted with: {tgt}"
+        );
+        assert_eq!(
+            roll_target_heading(0.0, 10.0, 0.0, 5.0),
+            tgt,
+            "below the reference nothing changes - the low-speed roll is tuned"
+        );
         // 100 m off (should never happen): still clamped to the max cut.
-        let tgt = roll_target_heading(0.0, 100.0);
+        let tgt = roll_target_heading(0.0, 100.0, 0.0, XTK_GAIN_REF_KTS);
         assert!((360.0 - tgt - XTK_MAX_DEG).abs() < 0.01, "{tgt}");
+    }
+
+    /// The cut is sized for a CLOSURE TIME, so the lateral closure a given
+    /// offset earns is the same at every speed. That is the whole fix: a
+    /// fixed angle per metre winds the outer loop tighter the faster you go,
+    /// until it sits on the inner loop's lag and the pair weaves.
+    #[test]
+    fn the_roll_cut_closes_in_the_same_time_at_any_speed() {
+        let closure_m_s = |gs_kts: f64| {
+            let tgt = roll_target_heading(0.0, 10.0, 0.0, gs_kts);
+            let cut = (360.0 - tgt).to_radians();
+            gs_kts * MS_TO_KTS.recip() * cut.sin()
+        };
+        let reference = closure_m_s(XTK_GAIN_REF_KTS);
+        for gs in [60.0, 100.0, 140.0, 160.0] {
+            let got = closure_m_s(gs);
+            assert!(
+                (got - reference).abs() < reference * 0.02,
+                "at {gs} kt a 10 m offset must still close at {reference:.2} m/s, got {got:.2}"
+            );
+        }
+        // And the cut itself shrinks, which is the same statement said the
+        // other way round: 4 degrees at 150 kt was the weave.
+        let fast = 360.0 - roll_target_heading(0.0, 10.0, 0.0, 150.0);
+        assert!(fast < 1.5, "a 10 m offset at 150 kt is a small cut: {fast}");
+    }
+
+    /// LFPB 03 and EGLF 24, 2026-09-22: the same law at both ends of one
+    /// sortie, weaving. The rollout wandered +3.1 / -5.7 m through four
+    /// degrees of heading; the takeoff went +1.7, -4.6, +10.1 and LIFTED OFF
+    /// ten metres right of the centreline.
+    ///
+    /// The plant is the cascade that did it, fitted to the LFPB tick log: a
+    /// rudder that commands a yaw RATE through a 0.7 s lag, the loop's own
+    /// half-second of transport delay, and the ground geometry closing the
+    /// cross-track. Both laws fly it, because a test that only shows the fix
+    /// working proves nothing about the bug.
+    #[test]
+    fn the_roll_does_not_weave_down_the_centreline() {
+        /// One run. `scaled` picks the law: false is the old fixed angle per
+        /// metre, true is [`roll_target_heading`] as it now stands.
+        fn fly_roll(
+            scaled: bool,
+            gs0: f64,
+            xtk0: f64,
+            psi0: f64,
+            decel: f64,
+            secs: f64,
+        ) -> Vec<f64> {
+            const COURSE: f64 = 24.76;
+            const TICK: f64 = 0.42;
+            const DELAY_TICKS: usize = 1;
+            let mut law = RollSteer::default();
+            let (mut psi, mut yaw, mut xtk, mut gs) = (psi0, 0.0_f64, xtk0, gs0);
+            let mut pipe = std::collections::VecDeque::from(vec![0.0; DELAY_TICKS]);
+            let mut prev: Option<f64> = None;
+            let mut track = Vec::new();
+            let mut t = 0.0;
+            while t < secs {
+                let rate = prev.map_or(0.0, |p| (xtk - p) / TICK);
+                prev = Some(xtk);
+                let target = if scaled {
+                    roll_target_heading(COURSE, xtk, rate, gs)
+                } else {
+                    // The law as it was: a fixed cut per metre, no lead.
+                    let corr = (xtk * XTK_GAIN_DEG_PER_M).clamp(-XTK_MAX_DEG, XTK_MAX_DEG);
+                    (COURSE - corr).rem_euclid(360.0)
+                };
+                let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
+                pipe.push_back(law.step(err, TICK, gs, 0.0));
+                let steer = pipe.pop_front().unwrap_or(0.0);
+                // Sub-steps: the airframe does not tick at the loop's rate.
+                for _ in 0..12 {
+                    let h = TICK / 12.0;
+                    // Yaw rate follows the rudder through a 0.7 s lag, with
+                    // the surface biting harder the faster the air over it.
+                    let want = 18.0 * steer * (gs / 120.0).min(1.0);
+                    yaw += (want - yaw) * (h / 0.7).min(1.0);
+                    psi += yaw * h;
+                    xtk += gs / MS_TO_KTS * (psi - COURSE).to_radians().sin() * h;
+                    gs = (gs - decel * h).max(8.0);
+                }
+                track.push(xtk);
+                t += TICK;
+            }
+            track
+        }
+        let span = |t: &[f64]| {
+            t.iter().cloned().fold(f64::MIN, f64::max) - t.iter().cloned().fold(f64::MAX, f64::min)
+        };
+
+        // The landing rollout: 140 kt, four metres left, decelerating hard.
+        let old = fly_roll(false, 140.0, -4.2, 24.3, 4.0, 20.0);
+        let new = fly_roll(true, 140.0, -4.2, 24.3, 4.0, 20.0);
+        assert!(
+            span(&old) > 10.0,
+            "the plant must still weave under the old law, or this test is \
+             not about LFPB any more: span {:.1} m",
+            span(&old)
+        );
+        assert!(
+            span(&new) < span(&old) * 0.6,
+            "the scaled cut takes the weave out: {:.1} m against {:.1}",
+            span(&new),
+            span(&old)
+        );
+        assert!(
+            new.last().is_some_and(|x| x.abs() < 2.0),
+            "and it ends ON the centreline, not merely swinging through it: {:?}",
+            new.last()
+        );
+
+        // The takeoff roll: accelerating, so the gain the old law held all
+        // the way to Vr is the one that grew a 10 m offset by liftoff.
+        let old = fly_roll(false, 41.0, 1.74, 24.63, -2.9, 21.0);
+        let new = fly_roll(true, 41.0, 1.74, 24.63, -2.9, 21.0);
+        assert!(
+            new.last().unwrap().abs() < old.last().unwrap().abs(),
+            "the wheels leave the ground nearer the centreline: {:.1} against {:.1}",
+            new.last().unwrap(),
+            old.last().unwrap()
+        );
+        assert!(
+            span(&new) <= span(&old),
+            "and no new excursion is bought for it: {:.1} against {:.1}",
+            span(&new),
+            span(&old)
+        );
+    }
+
+    /// The lead looks at where the offset WILL be. Drifting AWAY earns more
+    /// cut than the offset alone; already closing fast earns less, which is
+    /// what stops the overshoot.
+    #[test]
+    fn the_roll_cut_leads_the_cross_track() {
+        let gs = 140.0;
+        let held = 360.0 - roll_target_heading(0.0, 5.0, 0.0, gs);
+        let diverging = 360.0 - roll_target_heading(0.0, 5.0, 1.0, gs);
+        let closing = roll_target_heading(0.0, 5.0, -3.0, gs);
+        assert!(diverging > held, "drifting off earns more cut: {diverging}");
+        assert!(
+            closing < 1.0 || closing > 359.0,
+            "closing fast enough, the cut is already given back: {closing}"
+        );
+        // Nothing the sim can hand us turns the target into a NaN.
+        for bad in [f64::NAN, f64::INFINITY] {
+            for tgt in [
+                roll_target_heading(0.0, bad, 0.0, gs),
+                roll_target_heading(0.0, 5.0, bad, gs),
+                roll_target_heading(0.0, 5.0, 0.0, bad),
+            ] {
+                assert!(tgt.is_finite(), "a bad read must not steer by NaN");
+            }
+        }
     }
 
     #[test]
@@ -3059,6 +3330,7 @@ mod tests {
 
         let mut af = Airframe::lined_up_nose_right();
         let mut steer_law = RollSteer::default();
+        let mut sortie_prev_xtk: Option<f64> = None;
         let mut pitch_law = RotatePitch::default();
 
         // Loop state mirrored from `fly`.
@@ -3122,7 +3394,9 @@ mod tests {
             }
 
             // Steer the centreline (cross-track held by the model, not geodesy).
-            let target = roll_target_heading(course_deg, af.xtk_m);
+            let xtk_rate = sortie_prev_xtk.map_or(0.0, |p: f64| (af.xtk_m - p) / dt);
+            sortie_prev_xtk = Some(af.xtk_m);
+            let target = roll_target_heading(course_deg, af.xtk_m, xtk_rate, gs_kts);
             let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
             last_err = err;
             let steer = steer_law.step(err, dt, gs_kts, thr_cmd);

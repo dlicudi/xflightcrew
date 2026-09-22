@@ -1,7 +1,6 @@
 //! Undo: the snapshot stack of datarefs a tool changed, and the "undo that"
 //! grammar. Split out of main.rs on 2026-09-16.
 
-
 /// How to recover from one utterance's worth of actions. The command loop keeps a
 /// stack of these so "belay that" can walk back command by command, each with its
 /// own recovery (the whole point: remember what was done and how to undo it).

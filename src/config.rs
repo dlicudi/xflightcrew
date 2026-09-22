@@ -254,7 +254,10 @@ impl Config {
             piper_voice: crate::prefs::pilot_voice()
                 .or_else(|| std::env::var("PIPER_VOICE").ok())
                 .unwrap_or_else(|| "models/en_US-amy-medium.onnx".into()),
-            cabin_piper_voice: env_or("XCOPILOT_CABIN_VOICE", "models/en_US-hfc_female-medium.onnx"),
+            // The panel's pick wins over the env default, as the pilot's does.
+            cabin_piper_voice: crate::prefs::cabin_voice().unwrap_or_else(|| {
+                env_or("XCOPILOT_CABIN_VOICE", "models/en_US-hfc_female-medium.onnx")
+            }),
             // NOTE: a copilot/cabin collision is resolved after construction —
             // see `resolve_persona_voices`. The panel's voice picker can set
             // the pilot to anything, including this default.

@@ -52,7 +52,7 @@ pub(crate) const LON: &str = "sim/flightmodel/position/longitude";
 /// TRUE heading, matching the route bearings computed in the local
 /// east/north frame — never the magnetic compass.
 pub(crate) const PSI_TRUE: &str = "sim/flightmodel/position/psi";
-const GS_MS: &str = "sim/flightmodel/position/groundspeed";
+pub(crate) const GS_MS: &str = "sim/flightmodel/position/groundspeed";
 /// The thrust lever THIS airframe obeys — not always the stock one (the
 /// Citation X tracks `throttle_jet_rev_ratio`, so every write to
 /// `throttle_ratio_all` went nowhere and it flew a whole pattern at takeoff
@@ -2735,6 +2735,67 @@ mod tests {
                 );
             }
             LineUpPlan::Backtrack(_) => println!("backtrack picked"),
+        }
+    }
+
+    /// Le Bourget 07, the whole chain the pilot actually heard fail.
+    /// `cargo test -- --ignored live_lfpb_line_up --nocapture`
+    ///
+    /// Full auto taxied to the cleared holding point, stopped there, and the
+    /// line-up answered "I can't find runway zero seven next to us" — the
+    /// stop was 169 m off 07's centreline (the line-up's lateral gate is
+    /// 150 m) and the lead-on ended 34 m off it (the authored path's gate is
+    /// 20 m), because the route had been planned to runway 09's entrance
+    /// (2026-09-22). Both gates are the line-up's own and both were right;
+    /// the route was wrong, so this test starts at the tower's plan.
+    #[test]
+    #[ignore]
+    fn live_lfpb_line_up_finds_runway_07() {
+        let apt =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let Ok(Some(net)) = crate::nav::find_taxi_net(apt, "LFPB") else {
+            return; // no install, no verdict
+        };
+        let runways = crate::nav::find_runways(apt, "LFPB").unwrap();
+        let strip = runways.iter().find(|r| r.ident_a == "07").unwrap();
+        let zones: Vec<String> = vec!["07".into(), "25".into()];
+        let plan = net
+            .plan_to_runway(
+                48.95620,
+                2.43880,
+                strip.lat_a,
+                strip.lon_a,
+                100.0,
+                &zones,
+                Some(strip),
+            )
+            .expect("a route to 07");
+        // From the route's own end — where the drive stops, 48.962592,
+        // 2.421745 on the day, heading 266.9 (the hold faces west).
+        let &(hlat, hlon) = plan.path.last().unwrap();
+        let cands = crate::autoland::nearby_runways(apt, hlat, hlon, 1.0).unwrap();
+        let (rwy, lp) = pick_line_up_plan(
+            &cands,
+            hlat,
+            hlon,
+            Some("07"),
+            2000.0,
+            false,
+            Some(266.9),
+            Some(&plan.lead_on),
+        )
+        .expect("a line-up plan for runway 07");
+        assert_eq!(rwy.id, "07");
+        match lp {
+            LineUpPlan::Plain(p) => {
+                println!("lined up via {} authored points", p.len());
+                assert!(
+                    p.len() > 3,
+                    "rides the drawn lead-on, not a synthetic diagonal: {}",
+                    p.len()
+                );
+            }
+            LineUpPlan::Backtrack(p) => panic!("a 2,991 m strip needs no backtrack: {p:?}"),
         }
     }
 

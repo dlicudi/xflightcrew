@@ -861,7 +861,12 @@ const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
 /// so the autopilot captures it; on the glidepath the dial is parked above,
 /// autoland's own rule, because a capture under a descent eats the descent
 /// (LEAX, 2026-09-15). `None` = leave it.
-pub fn circuit_dial_ft(target_rate_fpm: f64, target_alt_ft: f64, dial_ft: f64, alt_ft: f64) -> Option<f64> {
+pub fn circuit_dial_ft(
+    target_rate_fpm: f64,
+    target_alt_ft: f64,
+    dial_ft: f64,
+    alt_ft: f64,
+) -> Option<f64> {
     if target_rate_fpm != 0.0 {
         return crate::autoland::parked_altitude_dial_ft(dial_ft, alt_ft);
     }
@@ -880,7 +885,12 @@ pub fn vs_stuck(off_for_s: f64) -> bool {
 /// re-pressing VS mode then would drop the hold it just made, every tick. The
 /// A330 wandered 1,796 to 1,840 ft down the EGPF downwind on the VS law
 /// (2026-09-21) with an altitude hold sitting unused behind a dial at 100 ft.
-pub fn ap_holds_level(target_rate_fpm: f64, target_alt_ft: f64, dial_ft: f64, alt_hold_status: f64) -> bool {
+pub fn ap_holds_level(
+    target_rate_fpm: f64,
+    target_alt_ft: f64,
+    dial_ft: f64,
+    alt_hold_status: f64,
+) -> bool {
     target_rate_fpm == 0.0
         && alt_hold_status.round() as i64 == 2
         && (dial_ft - (target_alt_ft / 100.0).round() * 100.0).abs() <= 50.0
@@ -1978,12 +1988,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
     if p_ap_capture {
         takeoff.level_ft = Some(tpa_msl_ft);
     }
-    if !autotakeoff::start_scoped(
-        base_url.clone(),
-        voice.clone(),
-        takeoff,
-        xp.cancellation(),
-    ) {
+    if !autotakeoff::start_scoped(base_url.clone(), voice.clone(), takeoff, xp.cancellation()) {
         stand_down(
             &voice,
             "The previous takeoff is still stopping. Your aircraft.",
@@ -2467,7 +2472,8 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, p: Params
         // Landing and taxi lights off through 1,000 ft. The authored route's
         // comment said "as the rectangle does" and the rectangle never did:
         // the A330's climb list named "taxi light, off" (EGPF, 2026-09-21).
-        if !lights_done && alt_msl_ft.is_finite() && alt_msl_ft - field_elev_ft > LIGHTS_OFF_AGL_FT {
+        if !lights_done && alt_msl_ft.is_finite() && alt_msl_ft - field_elev_ft > LIGHTS_OFF_AGL_FT
+        {
             lights_done = true;
             let did = crate::tools::lights::after_climb(&xp).await;
             crate::blackbox::record(

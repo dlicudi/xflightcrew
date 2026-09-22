@@ -40,7 +40,8 @@ const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 /// "taxi to parking" at 38 kt, the arrest, then "Parking brake is set and
 /// we're rolling — release it"). Dropped the moment the brake is released
 /// for the drive or the taxi-in gives the aircraft back.
-pub(crate) static ARREST_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static ARREST_HOLD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the taxi-in is holding the aircraft on the parking brake it set
 /// arresting a rolling handoff.
@@ -270,7 +271,10 @@ async fn vacate(
         // rule (an airframe with only a landing lamp keeps it after dusk).
         let dark = crate::tools::lights::dark_now(xp).await;
         let did = crate::tools::lights::after_vacate(xp, dark).await;
-        crate::blackbox::record("taxi_in", json!({ "event": "lights_vacated", "did": did, "dark": dark }));
+        crate::blackbox::record(
+            "taxi_in",
+            json!({ "event": "lights_vacated", "did": did, "dark": dark }),
+        );
     }
 }
 
@@ -320,7 +324,11 @@ async fn fly(
             let _ = crate::tools::controls::drive_park_brake(&xp, true, park_brake_valve_set).await;
             // Say so: a brake the pilot did not set, on a roll they may still
             // think is theirs, is announced, not discovered.
-            announce(&voice, Priority::Caution, "Brakes on, holding for the taxi clearance.");
+            announce(
+                &voice,
+                Priority::Caution,
+                "Brakes on, holding for the taxi clearance.",
+            );
             crate::blackbox::record(
                 "taxi_in",
                 json!({ "event": "arrest_rolling", "gs": gs_kts.unwrap_or(-1.0) }),

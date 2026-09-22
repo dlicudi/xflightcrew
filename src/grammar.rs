@@ -20,9 +20,9 @@
 use serde_json::{json, Value};
 
 use crate::aircraft::AircraftProfile;
-use crate::tools::ToolCall;
 use crate::phrase::word_value;
 use crate::tools::Registry;
+use crate::tools::ToolCall;
 
 /// Markers of a relative/contextual command the dialogue stack resolves, not the grammar.
 const RELATIVE: &[&str] = &[
@@ -264,6 +264,10 @@ pub fn try_parse(
     if let Some(c) = flight_plan_call(&t) {
         return Some(vec![c]);
     }
+    // "Load the fuel and payload" carries "and" too, and is one intent.
+    if let Some(c) = load_aircraft_call(&t) {
+        return valid(&c, registry, profile).then_some(vec![c]);
+    }
     if let Some(c) = full_auto_call(&t) {
         return Some(vec![c]);
     }
@@ -333,10 +337,24 @@ fn number(t: &str) -> Option<i64> {
     // rule set 12% instead of 50). The pre-"to" value is kept as a fallback so
     // "50 to, uh, taxi" still yields 50 rather than a miss.
     let mut before_to: Option<i64> = None;
+    // A digit WORD straight after a digit word is the next digit of the same
+    // number, the way a speed or a heading is said on the air: "two two zero"
+    // is 220. Summed (2 + 2 + 0) it armed the governor at four knots on a
+    // 737 at 2,000 ft (typed line, EGSS 2026-09-22; speech is normalised to
+    // digits before it gets here, typed text is not).
+    let mut after_digit_word = false;
     for tok in t.split(|c: char| !c.is_ascii_alphanumeric()) {
         if tok.is_empty() {
             continue;
         }
+        let digit_word = crate::phrase::word_value(tok).is_some_and(|(v, mult)| !mult && v <= 9)
+            && tok.parse::<i64>().is_err();
+        if digit_word && after_digit_word {
+            let (v, _) = crate::phrase::word_value(tok).unwrap_or((0, false));
+            cur = cur * 10 + v;
+            continue;
+        }
+        after_digit_word = digit_word;
         if let Ok(d) = tok.parse::<i64>() {
             // A single digit after a bare tens value ADDS: whisper writes
             // "twenty-eight" as "twenty 8", and the old concatenation made 208
@@ -456,9 +474,14 @@ pub fn resume_plan_request(t: &str) -> bool {
         .trim_end_matches(['.', '?', '!'])
         .replace("site plan", "flight plan")
         .replace("flight plans", "flight plan");
-    matches!(t.as_str(),
-        "resume the flight plan" | "resume flight plan" | "resume my flight plan"
-        | "resume the route" | "continue the flight plan")
+    matches!(
+        t.as_str(),
+        "resume the flight plan"
+            | "resume flight plan"
+            | "resume my flight plan"
+            | "resume the route"
+            | "continue the flight plan"
+    )
 }
 
 fn flight_plan_call(t: &str) -> Option<ToolCall> {
@@ -484,6 +507,92 @@ fn flight_plan_call(t: &str) -> Option<ToolCall> {
         return Some(call("full_auto", json!({ "off": true })));
     }
     Some(call("full_auto", json!({ "flight": true })))
+}
+
+/// Is this the load-sheet request ("load the aircraft", "set the fuel and
+/// payload from the plan")? The main loop asks before its FMS-load branch,
+/// whose "load ... plan" shape these words also have.
+pub fn load_aircraft_request(t: &str) -> bool {
+    load_aircraft_call(&normalize(t)).is_some()
+}
+
+/// The `load_aircraft` intent: the plan's block fuel and payload into the
+/// sim. CLOSED shape, a loading verb and a load-sheet object:
+/// "load the aircraft", "load / set up the fuel and payload", "set the fuel
+/// from the plan", "fuel the aircraft", "board the passengers". Never the fuel
+/// SYSTEM ("set fuel to left", "fuel pump on"), never the fuel truck
+/// ("refuel", "top off the tanks": `request_service`), never a question
+/// ("did you load the fuel?"), never the FMS load ("load the flight plan").
+fn load_aircraft_call(t: &str) -> Option<ToolCall> {
+    const QUESTION_OPENERS: &[&str] = &[
+        "what", "how", "is", "are", "did", "do", "does", "have", "has", "why", "when", "where",
+        "which", "should", "will",
+    ];
+    const FUEL_SYSTEM: &[&str] = &[
+        "pump",
+        "pumps",
+        "selector",
+        "left",
+        "right",
+        "both",
+        "flow",
+        "cutoff",
+        "crossfeed",
+        "valve",
+        "tank",
+        "off",
+        "on",
+        "refuel",
+    ];
+    let first = t.split_whitespace().next()?;
+    if QUESTION_OPENERS.contains(&first) || FUEL_SYSTEM.iter().any(|w| has(t, w)) {
+        return None;
+    }
+    let fuel_obj = has(t, "fuel");
+    let payload_obj = [
+        "payload",
+        "passengers",
+        "pax",
+        "cargo",
+        "bags",
+        "baggage",
+        "loadsheet",
+    ]
+    .iter()
+    .any(|w| has(t, w))
+        || t.contains("load sheet")
+        || t.contains("weight and balance");
+    let craft_obj = ["aircraft", "airplane", "aeroplane", "plane", "jet"]
+        .iter()
+        .any(|w| has(t, w));
+    let plan_ref = t.contains("plan") || t.contains("simbrief") || t.contains("sim brief");
+    let verb_load = has(t, "load") && !t.contains("the load") || has(t, "board");
+    // "the load" as a noun is the payload: "set up the load and fuel".
+    let load_noun = t.contains("the load") || t.contains("load and fuel");
+    let verb_set = has(t, "set") || has(t, "setup") || has(t, "match");
+    // "fuel" as the verb: "fuel the aircraft", "fuel us up".
+    let verb_fuel = first == "fuel" && (craft_obj || has(t, "us") || has(t, "up") || plan_ref);
+
+    let what = if verb_fuel {
+        if payload_obj {
+            "both"
+        } else {
+            "fuel"
+        }
+    } else if verb_load && (fuel_obj || payload_obj) || verb_set && (payload_obj || load_noun) {
+        match (fuel_obj, payload_obj || load_noun) {
+            (true, true) => "both",
+            (true, false) => "fuel",
+            _ => "payload",
+        }
+    } else if verb_load && craft_obj && !plan_ref || verb_load && craft_obj && has(t, "from") {
+        "both"
+    } else if verb_set && fuel_obj && plan_ref {
+        "fuel"
+    } else {
+        return None;
+    };
+    Some(call("load_aircraft", json!({ "what": what })))
 }
 
 /// The `full_auto` intent — the entire flight from cold (power up, engine,
@@ -1621,15 +1730,14 @@ fn parse_one(t: &str) -> Option<ToolCall> {
         || t.contains("i want");
     // "Please take over" was dropped without a word (LEMG, 2026-09-12):
     // the same hand-over as "take control", with the same direction test.
-    let whole_aircraft_takeover = (t.contains("take control")
-        || t.contains("take the controls")
-        || t.contains("take over"))
-        && !pilot_takes
-        && ![
-            "throttle", "power", "radio", "radios", "flaps", "speed", "heading", "lights",
-        ]
-        .iter()
-        .any(|sys| has(t, sys));
+    let whole_aircraft_takeover =
+        (t.contains("take control") || t.contains("take the controls") || t.contains("take over"))
+            && !pilot_takes
+            && ![
+                "throttle", "power", "radio", "radios", "flaps", "speed", "heading", "lights",
+            ]
+            .iter()
+            .any(|sys| has(t, sys));
     // The pilot taking over is a release: autopilot off, recovery dropped.
     if pilot_takes
         && (t.contains("control")
@@ -1861,6 +1969,49 @@ mod tests {
         (Registry::for_aircraft(&profile), profile)
     }
 
+    /// The load sheet: a loading verb and a load-sheet object, and nothing
+    /// that belongs to the fuel system, the fuel truck or the FMS.
+    #[test]
+    fn the_load_sheet_is_one_intent_and_never_the_fuel_system() {
+        for (words, what) in [
+            ("load the aircraft", "both"),
+            ("Load the aircraft from the flight plan.", "both"),
+            ("load the fuel and payload", "both"),
+            ("set up the load and fuel", "both"),
+            ("set the fuel and payload from the plan", "both"),
+            ("load the fuel from the flight plan", "fuel"),
+            ("set the fuel from the plan", "fuel"),
+            ("fuel the aircraft", "fuel"),
+            ("fuel us up for the flight plan", "fuel"),
+            ("board the passengers", "payload"),
+            ("set the payload", "payload"),
+            ("load the passengers and cargo", "payload"),
+        ] {
+            assert_eq!(
+                one(words),
+                Some(("load_aircraft".into(), json!({ "what": what }))),
+                "{words}"
+            );
+            assert!(load_aircraft_request(words), "{words}");
+        }
+        for words in [
+            "load the flight plan",
+            "load it",
+            "load the route into the gps",
+            "load the flight plan into the aircraft",
+            "did you load the fuel",
+            "how much fuel do we have",
+            "set fuel to left",
+            "fuel pump on",
+            "fuel selector both",
+            "we should stop for fuel at the next field",
+            "set the flaps",
+        ] {
+            assert!(!load_aircraft_request(words), "{words}");
+        }
+        assert_eq!(one("refuel").unwrap().0, "request_service");
+    }
+
     fn one(t: &str) -> Option<(String, Value)> {
         let (reg, prof) = setup();
         try_parse(t, &reg, &prof).map(|mut v| {
@@ -1882,11 +2033,28 @@ mod tests {
 
     #[test]
     fn resume_plan_is_an_explicit_request_not_a_brief_or_echo() {
-        for words in ["resume the flight plan", "resume flight plan", "please resume my flight plan", "continue the flight plan", "Resume site plan.", "resume flight plans"] {
+        for words in [
+            "resume the flight plan",
+            "resume flight plan",
+            "please resume my flight plan",
+            "continue the flight plan",
+            "Resume site plan.",
+            "resume flight plans",
+        ] {
             assert!(resume_plan_request(words), "{words}");
-            assert_eq!(one(words).unwrap(), ("full_auto".into(), json!({"resume": true})));
+            assert_eq!(
+                one(words).unwrap(),
+                ("full_auto".into(), json!({"resume": true}))
+            );
         }
-        for words in ["load the flight plan", "what is the flight plan", "the copilot will resume the flight plan", "do not resume the flight plan", "resume the checklist", "resume flight plan tomorrow"] {
+        for words in [
+            "load the flight plan",
+            "what is the flight plan",
+            "the copilot will resume the flight plan",
+            "do not resume the flight plan",
+            "resume the checklist",
+            "resume flight plan tomorrow",
+        ] {
             assert!(!resume_plan_request(words), "{words}");
         }
     }
@@ -2341,7 +2509,10 @@ mod tests {
         assert_eq!(one("please take over").unwrap().0, "recover");
         assert_eq!(one("can you take over").unwrap().0, "recover");
         assert_eq!(one("let me take over").unwrap().0, "autopilot_off");
-        assert_ne!(one("take over the radios").map(|(t, _)| t).as_deref(), Some("recover"));
+        assert_ne!(
+            one("take over the radios").map(|(t, _)| t).as_deref(),
+            Some("recover")
+        );
         assert_eq!(one("you have the aircraft").unwrap().0, "recover");
         // Talk-down arm/cancel phrasings, including the live whisper garbles
         // ("top me down", "toadown") and the natural landing-help ask.
@@ -2948,7 +3119,11 @@ mod tests {
             "don't push back",
             "forget the pushback",
         ] {
-            assert_eq!(one(refusal).unwrap().1, json!({"action":"stop"}), "{refusal}");
+            assert_eq!(
+                one(refusal).unwrap().1,
+                json!({"action":"stop"}),
+                "{refusal}"
+            );
         }
         assert_eq!(one("request ground services").unwrap().0, "request_service");
         assert_eq!(one("refuel").unwrap().0, "request_service");
@@ -3011,6 +3186,21 @@ mod tests {
         assert!(one("speed brakes out").is_none_or(|(n, _)| n == "speedbrake"));
         // Bare "brakes" with no verb is ambiguous: fall through, never guess.
         assert!(one("brakes").is_none());
+    }
+
+    /// EGSS, 2026-09-22: a typed "hold two two zero knots" armed the governor
+    /// at 2 + 2 + 0 = 4 knots. Digit words said in a row are digits.
+    #[test]
+    fn digit_words_in_a_row_are_one_number() {
+        assert_eq!(number("hold two two zero knots"), Some(220));
+        assert_eq!(number("heading zero niner zero"), Some(90));
+        assert_eq!(number("two hundred and forty"), Some(240));
+        assert_eq!(number("twenty two"), Some(22));
+        assert_eq!(number("two thousand five hundred"), Some(2500));
+        assert_eq!(
+            one("hold two two zero knots").unwrap(),
+            ("hold_speed".into(), json!({"knots": 220}))
+        );
     }
 
     #[test]
@@ -3344,6 +3534,7 @@ mod tests {
             (8, "line_up"),
             (9, "auto_takeoff"),
             (10, "full_auto"),
+            (12, "load_aircraft"),
         ];
         assert_eq!(expect.len(), crate::auto_status::REQUEST_PHRASES.len());
         for (code, phrase) in crate::auto_status::REQUEST_PHRASES {

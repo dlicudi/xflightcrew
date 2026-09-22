@@ -237,6 +237,15 @@ pub struct Sample {
 /// exterior-lights rule has put the landing light out at 1,000 ft: at 800 the
 /// cross-check read "landing lights off, not set" every departure.
 pub const CLIMB_AGL_FT: f64 = 1200.0;
+/// ...and held this long. EVERY other boundary here is sustained; the climb
+/// was the one that fired on a single tick, and it fired straight into the
+/// automation's own thousand-foot actions. EGLF 2026-09-22: the list ran at
+/// 1,200 ft and reported "flaps, up on schedule" at 0.125 and "taxi light,
+/// off" still lit - the flaps finished retracting four seconds later and
+/// `lights_climb` put both lamps out six seconds later at 1,379 ft. The
+/// mission's laws act and the list audits, so the list has to look after
+/// they have acted, not through them.
+pub const CLIMB_SECS: f64 = 15.0;
 /// Cruise list: level this long, this high (a pattern at 1,000 ft is not a cruise).
 pub const CRUISE_LEVEL_SECS: f64 = 30.0;
 pub const CRUISE_MIN_AGL_FT: f64 = 2000.0;
@@ -258,6 +267,7 @@ pub struct Tracker {
     fired: Vec<&'static str>,
     airborne_seen: bool,
     peak_agl_ft: f64,
+    climbing_since: Option<Instant>,
     level_since: Option<Instant>,
     descending_since: Option<Instant>,
     low_descent_since: Option<Instant>,
@@ -285,6 +295,7 @@ impl Tracker {
             now.duration_since(t).as_secs_f64() >= secs
         };
         if s.on_ground {
+            self.climbing_since = None;
             self.level_since = None;
             self.descending_since = None;
             self.low_descent_since = None;
@@ -314,7 +325,12 @@ impl Tracker {
         self.airborne_seen = true;
         self.stopped_since = None;
         self.peak_agl_ft = self.peak_agl_ft.max(s.agl_ft);
-        if !self.fired("climb") && s.vsi_fpm > 300.0 && s.agl_ft >= CLIMB_AGL_FT {
+        let climbing = held(
+            &mut self.climbing_since,
+            s.vsi_fpm > 300.0 && s.agl_ft >= CLIMB_AGL_FT,
+            CLIMB_SECS,
+        );
+        if climbing && !self.fired("climb") {
             return self.fire("climb");
         }
         let level = held(
@@ -1409,7 +1425,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(acts.contains(&"set_lights"), "taxi light is an act: {acts:?}");
+        assert!(
+            acts.contains(&"set_lights"),
+            "taxi light is an act: {acts:?}"
+        );
     }
 
     #[test]
@@ -1439,11 +1458,16 @@ mod tests {
         assert_eq!(t.tick(&sample(true, 0.0, 0.0, 50.0), s(5.0)), None);
         // Liftoff: not yet a climb list.
         assert_eq!(t.tick(&sample(false, 100.0, 700.0, 70.0), s(10.0)), None);
+        // Through 1,200 ft climbing - and it WAITS. The single tick used to
+        // fire here, straight into the automation's own thousand-foot flap
+        // and light actions, and audited them half done (EGLF, 2026-09-22).
+        assert_eq!(t.tick(&sample(false, 1300.0, 700.0, 75.0), s(60.0)), None);
+        assert_eq!(t.tick(&sample(false, 1900.0, 700.0, 75.0), s(70.0)), None);
         assert_eq!(
-            t.tick(&sample(false, 1300.0, 700.0, 75.0), s(60.0)),
+            t.tick(&sample(false, 2600.0, 700.0, 75.0), s(76.0)),
             Some("climb")
         );
-        assert_eq!(t.tick(&sample(false, 1200.0, 700.0, 75.0), s(70.0)), None);
+        assert_eq!(t.tick(&sample(false, 3000.0, 700.0, 75.0), s(80.0)), None);
         // Level at 4,500: cruise after the hold.
         assert_eq!(t.tick(&sample(false, 4500.0, 0.0, 110.0), s(300.0)), None);
         assert_eq!(t.tick(&sample(false, 4500.0, 50.0, 110.0), s(320.0)), None);
@@ -1485,8 +1509,30 @@ mod tests {
         // Sitting there says nothing more; the next roll re-arms the flight.
         assert_eq!(t.tick(&sample(true, 0.0, 0.0, 0.0), s(1500.0)), None);
         assert_eq!(t.tick(&sample(true, 0.0, 0.0, 50.0), s(1600.0)), None);
+        assert_eq!(t.tick(&sample(false, 1300.0, 700.0, 75.0), s(1700.0)), None);
         assert_eq!(
-            t.tick(&sample(false, 1300.0, 700.0, 75.0), s(1700.0)),
+            t.tick(&sample(false, 1900.0, 700.0, 75.0), s(1716.0)),
+            Some("climb")
+        );
+    }
+
+    /// A climb that stops being one before the hold is up starts the clock
+    /// again: levelling at 1,300 ft is not the climb the list belongs to.
+    #[test]
+    fn the_climb_list_needs_a_sustained_climb_not_a_moment_of_one() {
+        let mut t = Tracker::default();
+        let t0 = Instant::now();
+        let s = |secs: f64| t0 + Duration::from_secs_f64(secs);
+        t.tick(&sample(true, 0.0, 0.0, 50.0), s(0.0));
+        assert_eq!(t.tick(&sample(false, 1300.0, 700.0, 75.0), s(10.0)), None);
+        // Levels off: the climb is over and the clock is thrown away.
+        assert_eq!(t.tick(&sample(false, 1400.0, 0.0, 75.0), s(18.0)), None);
+        assert_eq!(t.tick(&sample(false, 1400.0, 0.0, 75.0), s(30.0)), None);
+        // Climbing again: the hold starts from HERE, not from the first pass.
+        assert_eq!(t.tick(&sample(false, 1500.0, 700.0, 75.0), s(31.0)), None);
+        assert_eq!(t.tick(&sample(false, 2000.0, 700.0, 75.0), s(40.0)), None);
+        assert_eq!(
+            t.tick(&sample(false, 2600.0, 700.0, 75.0), s(47.0)),
             Some("climb")
         );
     }
@@ -1497,8 +1543,9 @@ mod tests {
         let t0 = Instant::now();
         let s = |secs: f64| t0 + Duration::from_secs_f64(secs);
         t.tick(&sample(true, 0.0, 0.0, 50.0), s(0.0));
+        assert_eq!(t.tick(&sample(false, 1300.0, 700.0, 75.0), s(30.0)), None);
         assert_eq!(
-            t.tick(&sample(false, 1300.0, 700.0, 75.0), s(30.0)),
+            t.tick(&sample(false, 1400.0, 700.0, 75.0), s(46.0)),
             Some("climb")
         );
         // Downwind at 1,000 ft for two minutes.

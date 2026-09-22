@@ -119,7 +119,12 @@ mod tests {
 
     #[test]
     fn parse_roundtrips_and_forgives() {
-        for m in [Mode::Both, Mode::CopilotOnly, Mode::AtcOnly, Mode::Instructor] {
+        for m in [
+            Mode::Both,
+            Mode::CopilotOnly,
+            Mode::AtcOnly,
+            Mode::Instructor,
+        ] {
             assert_eq!(Mode::parse(m.as_str()), Some(m));
             assert_eq!(Mode::from_panel_index(m.panel_index()), Some(m));
         }

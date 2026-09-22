@@ -1670,8 +1670,9 @@ pub const SPEED_FLOOR_RATIO: f64 = 1.2;
 /// Publish the airframe's speed floor from its clean stall speed. Called on
 /// EVERY profile swap.
 pub fn publish_speed_floor(vs_clean_kts: Option<f64>) {
-    *SPEED_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner()) =
-        vs_clean_kts.filter(|v| *v > 0.0).map(|v| (v * SPEED_FLOOR_RATIO).round());
+    *SPEED_FLOOR_KTS.lock().unwrap_or_else(|e| e.into_inner()) = vs_clean_kts
+        .filter(|v| *v > 0.0)
+        .map(|v| (v * SPEED_FLOOR_RATIO).round());
 }
 
 /// The live airframe's speed floor, kts, if its profile declares a clean stall.
@@ -1948,7 +1949,10 @@ pub fn gear_limit_kts() -> Option<f64> {
 
 /// The live airframe's flap detents as `(ratio, Vfe)`, retracted first.
 pub fn flap_limits() -> Vec<(f64, Option<f64>)> {
-    FLAP_LIMITS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    FLAP_LIMITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// The dataref every throttle write and read should use.
@@ -1995,7 +1999,10 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
     let mut p = cessna_172sp();
     p.id = format!("generic_{}", icao.to_lowercase());
     p.pressurised = None; // Unknown systems must use neutral cabin-altitude wording.
-    let name = vals.get("acf/_name").map(|s| s.to_string()).unwrap_or_else(|| icao.to_string());
+    let name = vals
+        .get("acf/_name")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| icao.to_string());
     // `_name` is one token here (split on whitespace); good enough for a label.
     p.display_name = format!("{name} (no profile)");
     p.checklist = None;
@@ -2014,7 +2021,10 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
         .get("_engn/0/_type")
         .is_some_and(|t| t.contains("INJ") || !t.starts_with("RCP"));
     p.carb_heat = !injected;
-    if vals.get("_engn/0/_type").is_some_and(|t| !t.starts_with("RCP")) {
+    if vals
+        .get("_engn/0/_type")
+        .is_some_and(|t| !t.starts_with("RCP"))
+    {
         // Not a piston: the magneto and mixture-side tools would be lies.
         p.magnetos = false;
         p.fuel_pump = false;
@@ -2048,8 +2058,16 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
                 (a, b) => b.or(a),
             };
             list.push(FlapDetent {
-                label: if full { "full".into() } else { format!("{d:.0}") },
-                spoken: if full { "full".into() } else { format!("{d:.0} degrees") },
+                label: if full {
+                    "full".into()
+                } else {
+                    format!("{d:.0}")
+                },
+                spoken: if full {
+                    "full".into()
+                } else {
+                    format!("{d:.0} degrees")
+                },
                 ratio: (d / last * 10_000.0).round() / 10_000.0,
                 vfe_kts: vfe.map(f64::round),
                 retract_above_kts: None,
@@ -2105,8 +2123,18 @@ pub fn generic_from_acf(icao: &str, acf_text: &str) -> AircraftProfile {
 /// file paths are skipped, an `[index]` suffix is dropped.
 pub fn profile_references(p: &AircraftProfile) -> Vec<String> {
     const SKIP_KEYS: [&str; 12] = [
-        "match", "say", "spoken", "label", "key", "kind", "checklist", "id", "display_name",
-        "voice", "phases", "positions_spoken",
+        "match",
+        "say",
+        "spoken",
+        "label",
+        "key",
+        "kind",
+        "checklist",
+        "id",
+        "display_name",
+        "voice",
+        "phases",
+        "positions_spoken",
     ];
     fn walk(v: &serde_yaml::Value, key: &str, out: &mut Vec<String>) {
         match v {
@@ -2169,7 +2197,11 @@ pub fn probe_summary(missing: &[String], total: usize) -> Option<String> {
         .take(3)
         .map(|m| m.rsplit('/').next().unwrap_or(m).replace('_', " "))
         .collect();
-    let more = if missing.len() > 3 { format!(" and {} more", missing.len() - 3) } else { String::new() };
+    let more = if missing.len() > 3 {
+        format!(" and {} more", missing.len() - 3)
+    } else {
+        String::new()
+    };
     Some(format!(
         "Profile check: {} of {total} names this profile relies on are not in this aircraft: {}{more}. The tools that use them will fail.",
         missing.len(),
@@ -2312,6 +2344,13 @@ mod tests {
                 "autotakeoff",
                 "LOW_SPEED_FULL_KTS",
                 "rudder authority builds with airflow",
+            ),
+            (
+                "autotakeoff",
+                "XTK_GAIN_REF_KTS",
+                "not a speed the aircraft flies: the pace the centreline gain \
+                 is QUOTED at, above which it scales by ref/gs to hold the \
+                 closure time - the same geometry on every airframe",
             ),
             (
                 "autotakeoff",
@@ -2745,7 +2784,9 @@ mod tests {
             let Ok(profile) = serde_yaml::from_str::<AircraftProfile>(&text) else {
                 continue;
             };
-            let Some(flaps) = &profile.flaps else { continue };
+            let Some(flaps) = &profile.flaps else {
+                continue;
+            };
             let mut detents = flaps.detents.clone();
             detents.sort_by(|a, b| a.ratio.total_cmp(&b.ratio));
             for pair in detents.windows(2) {
@@ -2781,7 +2822,10 @@ mod tests {
         assert!(takeoff_needed_m(roll, Some(mtow), Some(mtow), 500.0) > 2549.0);
         assert!(takeoff_needed_m(roll, None, Some(mtow), 500.0) > 2549.0);
         // No roll on file is the caller's floor; a tiny roll never goes under it.
-        assert_eq!(takeoff_needed_m(None, Some(1000.0), Some(1100.0), 400.0), 400.0);
+        assert_eq!(
+            takeoff_needed_m(None, Some(1000.0), Some(1100.0), 400.0),
+            400.0
+        );
         assert_eq!(takeoff_needed_m(Some(100.0), None, None, 500.0), 500.0);
     }
 
@@ -3071,13 +3115,20 @@ mod tests {
     /// RV-10 lesson at 174,000 lb).
     #[test]
     fn stock_airliner_yamls_parse_strictly_and_carry_their_own_numbers() {
-        for (id, vr, roll) in [("boeing_737_800", 145.0, 5500.0), ("airbus_a330_300", 148.0, 6000.0)] {
+        for (id, vr, roll) in [
+            ("boeing_737_800", 145.0, 5500.0),
+            ("airbus_a330_300", 148.0, 6000.0),
+        ] {
             let text = std::fs::read_to_string(format!("profiles/{id}.yaml")).unwrap();
             let p: AircraftProfile = serde_yaml::from_str(&text)
                 .unwrap_or_else(|e| panic!("{id}.yaml failed to parse: {e:#}"));
             assert_eq!(p.id, id);
             assert_eq!(p.engines, 2);
-            assert_eq!(p.pressurised, Some(true), "{id}: cabin alerts need the real answer");
+            assert_eq!(
+                p.pressurised,
+                Some(true),
+                "{id}: cabin alerts need the real answer"
+            );
             assert!(p.cabin_crew && p.retractable_gear && p.throttle && !p.engine);
             assert!(
                 !p.autothrottle,
@@ -3094,12 +3145,19 @@ mod tests {
             );
             let r = p.reference.as_ref().expect("reference card");
             assert_eq!(r.vr_kts, Some(vr));
-            assert_eq!(r.takeoff_roll_ft, Some(roll), "{id}: the roll the runway check uses");
+            assert_eq!(
+                r.takeoff_roll_ft,
+                Some(roll),
+                "{id}: the roll the runway check uses"
+            );
             assert!(r.landing_distance_ft.unwrap() > 4000.0);
             assert!(r.approach_kts.unwrap() >= 140.0 && p.vs_clean_kts.unwrap() > 130.0);
             let f = p.flaps.as_ref().expect("flap detents");
             let to = f.takeoff_ratio.unwrap();
-            assert!(f.detents.iter().any(|d| (d.ratio - to).abs() < 1e-9), "{id}: takeoff flap is a gate");
+            assert!(
+                f.detents.iter().any(|d| (d.ratio - to).abs() < 1e-9),
+                "{id}: takeoff flap is a gate"
+            );
             assert!(f.detents.last().unwrap().vfe_kts.is_some());
             assert!(p.fuel.as_ref().unwrap().cruise_burn_kg_hr > 1000.0);
             assert!(p.tail_strike_deg.is_some());
@@ -4251,7 +4309,11 @@ P _engn/0/_type RCP_INJ
 ";
         let p = super::generic_from_acf("RV10", acf);
         assert_eq!(p.id, "generic_rv10");
-        assert!(p.display_name.contains("(no profile)"), "{}", p.display_name);
+        assert!(
+            p.display_name.contains("(no profile)"),
+            "{}",
+            p.display_name
+        );
         assert_eq!(p.vs_clean_kts, Some(65.0));
         assert_eq!(p.vne_kts, Some(200.0));
         assert!(!p.retractable_gear, "Vle 99999 is fixed gear");
@@ -4265,7 +4327,11 @@ P _engn/0/_type RCP_INJ
             (r.vno_kts, r.vx_kts, r.vy_kts, r.vs0_kts),
             (Some(156.0), Some(78.0), Some(90.0), Some(50.0))
         );
-        assert_eq!(r.va_kts, Some(99.0), "a zero placard keeps the base's figure");
+        assert_eq!(
+            r.va_kts,
+            Some(99.0),
+            "a zero placard keeps the base's figure"
+        );
         assert_eq!(r.cruise_ias_kts, Some(133.0));
         assert_eq!(r.max_gross_lb, Some(2700.0));
         assert_eq!(r.useful_load_lb, Some(1000.0));
@@ -4284,7 +4350,10 @@ P _engn/0/_type RCP_INJ
                 ("full".into(), 1.0, Some(87.0)),
             ]
         );
-        assert!(p.checklist.is_none(), "the 172's checklist is not this aircraft's");
+        assert!(
+            p.checklist.is_none(),
+            "the 172's checklist is not this aircraft's"
+        );
     }
 
     /// The floor statics are process-wide; the tests that publish them take
@@ -4298,7 +4367,10 @@ P _engn/0/_type RCP_INJ
         super::publish_speed_floor(Some(65.0));
         assert_eq!(super::speed_floor_kts(), Some(78.0));
         assert_eq!(super::floored_target(65.0, super::speed_floor_kts()), 78.0);
-        assert_eq!(super::floored_target(100.0, super::speed_floor_kts()), 100.0);
+        assert_eq!(
+            super::floored_target(100.0, super::speed_floor_kts()),
+            100.0
+        );
         // A profile with no Vs floors nothing (the old behaviour, honestly).
         super::publish_speed_floor(None);
         assert_eq!(super::floored_target(65.0, super::speed_floor_kts()), 65.0);
@@ -4370,34 +4442,68 @@ P _engn/0/_type RCP_INJ
         ] {
             assert!(refs.iter().any(|r| r == must), "missing {must} in {refs:?}");
         }
-        assert!(!refs.iter().any(|r| r.contains("checklists/")), "file paths are not datarefs");
-        assert!(!refs.iter().any(|r| r.contains('[')), "indices dropped: {refs:?}");
-        assert!(!refs.iter().any(|r| r.contains(' ')), "prose is not a dataref: {refs:?}");
+        assert!(
+            !refs.iter().any(|r| r.contains("checklists/")),
+            "file paths are not datarefs"
+        );
+        assert!(
+            !refs.iter().any(|r| r.contains('[')),
+            "indices dropped: {refs:?}"
+        );
+        assert!(
+            !refs.iter().any(|r| r.contains(' ')),
+            "prose is not a dataref: {refs:?}"
+        );
         let n = refs.len();
-        assert_eq!(refs.iter().collect::<std::collections::BTreeSet<_>>().len(), n, "deduplicated");
+        assert_eq!(
+            refs.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            n,
+            "deduplicated"
+        );
 
-        let have: std::collections::HashSet<String> =
-            refs.iter().filter(|r| r.starts_with("sim/")).cloned().collect();
-        let cmds: std::collections::HashSet<String> =
-            ["laminar/rv10/tank_sel_left".to_string()].into_iter().collect();
+        let have: std::collections::HashSet<String> = refs
+            .iter()
+            .filter(|r| r.starts_with("sim/"))
+            .cloned()
+            .collect();
+        let cmds: std::collections::HashSet<String> = ["laminar/rv10/tank_sel_left".to_string()]
+            .into_iter()
+            .collect();
         let missing = super::missing_references(&refs, &have, &cmds);
-        assert!(missing.iter().any(|m| m == "laminar/rv10/tank_sel_right"), "{missing:?}");
-        assert!(!missing.iter().any(|m| m == "laminar/rv10/tank_sel_left"), "a command counts");
-        assert!(!missing.iter().any(|m| m.starts_with("sim/")), "{missing:?}");
+        assert!(
+            missing.iter().any(|m| m == "laminar/rv10/tank_sel_right"),
+            "{missing:?}"
+        );
+        assert!(
+            !missing.iter().any(|m| m == "laminar/rv10/tank_sel_left"),
+            "a command counts"
+        );
+        assert!(
+            !missing.iter().any(|m| m.starts_with("sim/")),
+            "{missing:?}"
+        );
 
         assert_eq!(super::probe_summary(&[], 40), None);
         let s = super::probe_summary(&["laminar/rv10/tank_sel_left".into()], 40).unwrap();
         assert!(s.contains("1 of 40") && s.contains("tank sel left"), "{s}");
         let many: Vec<String> = (0..5).map(|i| format!("sim/x/name_{i}")).collect();
-        assert!(super::probe_summary(&many, 40).unwrap().contains("and 2 more"));
+        assert!(super::probe_summary(&many, 40)
+            .unwrap()
+            .contains("and 2 more"));
     }
 
     #[test]
     fn the_start_gate_scales_with_the_system_voltage() {
         super::publish_bus_volts(None);
-        assert!((super::min_start_volts() - 23.0).abs() < 1e-9, "24 volt default");
+        assert!(
+            (super::min_start_volts() - 23.0).abs() < 1e-9,
+            "24 volt default"
+        );
         super::publish_bus_volts(Some(12.0));
-        assert!((super::min_start_volts() - 11.5).abs() < 1e-9, "a healthy 12 is not low");
+        assert!(
+            (super::min_start_volts() - 11.5).abs() < 1e-9,
+            "a healthy 12 is not low"
+        );
         super::publish_bus_volts(None);
     }
 }
@@ -4420,7 +4526,9 @@ mod real_install_names {
     const NOT_NAMES: &[&str] = &["sim/operation/failures/rel_whatsit_thing"];
 
     fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -4448,7 +4556,9 @@ mod real_install_names {
             };
             if !name.ends_with('_')
                 && !name.ends_with('/')
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '_')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '_')
             {
                 out.push(name.to_string());
             }
@@ -4478,7 +4588,11 @@ mod real_install_names {
         let plugins = root.join("Resources").join("plugins");
         let mut known = first_column(&plugins.join("DataRefs.txt"));
         known.extend(first_column(&plugins.join("Commands.txt")));
-        assert!(known.len() > 1000, "DataRefs.txt looks empty: {}", known.len());
+        assert!(
+            known.len() > 1000,
+            "DataRefs.txt looks empty: {}",
+            known.len()
+        );
 
         let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut files = Vec::new();
@@ -4491,13 +4605,21 @@ mod real_install_names {
             let src = std::fs::read_to_string(f).unwrap();
             for name in sim_literals(&src) {
                 if !known.contains(&name) && !NOT_NAMES.contains(&name.as_str()) {
-                    missing.push(format!("{} <- {}", name, f.strip_prefix(&repo).unwrap().display()));
+                    missing.push(format!(
+                        "{} <- {}",
+                        name,
+                        f.strip_prefix(&repo).unwrap().display()
+                    ));
                 }
             }
         }
         missing.sort();
         missing.dedup();
-        assert!(missing.is_empty(), "names the sim does not have:\n{}", missing.join("\n"));
+        assert!(
+            missing.is_empty(),
+            "names the sim does not have:\n{}",
+            missing.join("\n")
+        );
     }
 
     #[test]

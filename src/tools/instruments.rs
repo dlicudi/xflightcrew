@@ -15,8 +15,15 @@ const BARO: &str = "sim/cockpit2/gauges/actuators/barometer_setting_in_hg_pilot"
 const CMD_BARO_UP: &str = "sim/instruments/barometer_up";
 const CMD_BARO_DOWN: &str = "sim/instruments/barometer_down";
 const BARO_STEP_INHG: f64 = 0.01;
-/// The whole 28.0..31.5 range is 350 presses; anything more is a bad read.
+/// One ROUND of presses: the whole 28.0..31.5 range. The dial is read again
+/// after every round, and only a dial that is closing on the ask earns
+/// another ([`keep_stepping`]).
 const BARO_MAX_STEPS: usize = 350;
+/// 0.0 to 31.5 is nine rounds. The 737 loaded with its baro memory at ZERO
+/// (EGSS, 2026-09-22): one capped round per ask moved it 3.5 inHg at a time,
+/// five asks left it at 17.5, the altimeter read 12,500 ft low, and the
+/// follower "levelled at 4,600 ft" at 17,000.
+const BARO_MAX_ROUNDS: usize = 10;
 /// How long a frame takes to overwrite a write that will not stand.
 const BARO_SETTLE_MS: u64 = 120;
 /// Pascals per inch of mercury (1013.25 hPa ≈ 29.92 inHg).
@@ -70,14 +77,35 @@ pub async fn set_altimeter(xp: &dyn crate::xplane::XPlane, inhg: f64) -> Result<
     if altimeter_took(actual, inhg) {
         return Ok(actual);
     }
-    let (cmd, n) = baro_steps(actual, inhg);
-    for _ in 0..n {
-        xp.run_command(cmd).await?;
+    let mut now = actual;
+    let mut presses = 0;
+    for round in 1..=BARO_MAX_ROUNDS {
+        let (cmd, n) = baro_steps(now, inhg);
+        for _ in 0..n {
+            xp.run_command(cmd).await?;
+        }
+        presses += n;
+        tokio::time::sleep(std::time::Duration::from_millis(BARO_SETTLE_MS)).await;
+        let before = now;
+        now = xp.get_float(BARO).await?;
+        tracing::info!(target: "xvoicelayer::instruments", asked = inhg, dial_write_read = actual, cmd, round, presses, now, "altimeter stepped");
+        if !keep_stepping(before, now, inhg, n) {
+            break;
+        }
     }
-    tokio::time::sleep(std::time::Duration::from_millis(BARO_SETTLE_MS)).await;
-    let now = xp.get_float(BARO).await?;
-    tracing::info!(target: "xvoicelayer::instruments", asked = inhg, dial_write_read = actual, cmd, presses = n, now, "altimeter stepped");
     Ok(now)
+}
+
+/// Another round of presses is earned only by a dial that is not there yet
+/// AND answered the last round: it closed on the ask by at least half of what
+/// was pressed. A bad read, a dead knob or a box that owns its own number
+/// shows no progress and gets no second round. Pure.
+pub fn keep_stepping(before: f64, now: f64, wanted: f64, pressed: usize) -> bool {
+    if altimeter_took(now, wanted) || pressed == 0 {
+        return false;
+    }
+    let closed = (before - wanted).abs() - (now - wanted).abs();
+    closed >= pressed as f64 * BARO_STEP_INHG / 2.0
 }
 
 pub struct SetBarometer;
@@ -177,7 +205,11 @@ pub fn publish_flight_transition(t: Option<FlightTransition>) {
 
 /// The follower has started down: from here the destination's level rules.
 pub fn note_descending() {
-    if let Some(t) = FLIGHT_TRANSITION.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(t) = FLIGHT_TRANSITION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
         t.descending = true;
     }
 }
@@ -214,9 +246,31 @@ pub fn spoken_setting(inhg: f64) -> String {
 pub struct AltimeterSync {
     pub was: f64,
     pub now: f64,
+    /// What was asked: `now` is the knob, this is the intent.
+    pub want: f64,
 }
 
 impl AltimeterSync {
+    /// The knob reads what was asked.
+    pub fn took(&self) -> bool {
+        altimeter_took(self.now, self.want)
+    }
+
+    /// What a crew says after the set: the setting when it took, and both
+    /// numbers when it did not (everything flown off the altimeter is wrong
+    /// by the difference, so it is never a quiet line).
+    pub fn line(&self) -> String {
+        if self.took() {
+            format!("Altimeter set, {}.", spoken_setting(self.now))
+        } else {
+            format!(
+                "The altimeter did not take. It reads {}, the setting is {}. Set it by hand.",
+                spoken_setting(self.now),
+                spoken_setting(self.want)
+            )
+        }
+    }
+
     /// The knob actually moved (by more than the tolerance).
     pub fn changed(&self) -> bool {
         (self.now - self.was).abs() >= ALTIMETER_TOLERANCE_INHG
@@ -241,7 +295,7 @@ pub async fn sync_altimeter(
     let was = xp.get_float(BARO).await.unwrap_or(0.0);
     let want = correct_setting_inhg(alt, transition_in_force_ft(transition_altitude_ft), pa);
     let now = set_altimeter(xp, want).await.ok()?;
-    Some(AltimeterSync { was, now })
+    Some(AltimeterSync { was, now, want })
 }
 
 pub struct SetAltimeterCurrent {
@@ -422,17 +476,34 @@ mod tests {
     fn the_plans_transition_outranks_the_airframes() {
         let none = None;
         assert_eq!(resolve_transition(none, 18_000.0), 18_000.0);
-        let uk = FlightTransition { altitude_ft: Some(6_000.0), level_ft: Some(7_000.0), descending: false };
+        let uk = FlightTransition {
+            altitude_ft: Some(6_000.0),
+            level_ft: Some(7_000.0),
+            descending: false,
+        };
         assert_eq!(resolve_transition(Some(uk), 18_000.0), 6_000.0);
-        assert_eq!(correct_setting_inhg(17_000.0, resolve_transition(Some(uk), 18_000.0), 103_000.0), STANDARD_INHG);
+        assert_eq!(
+            correct_setting_inhg(17_000.0, resolve_transition(Some(uk), 18_000.0), 103_000.0),
+            STANDARD_INHG
+        );
         // Down from cruise the destination's level is the one that counts...
-        let down = FlightTransition { descending: true, ..uk };
+        let down = FlightTransition {
+            descending: true,
+            ..uk
+        };
         assert_eq!(resolve_transition(Some(down), 18_000.0), 7_000.0);
         // ...and a plan with only one of the two uses it both ways.
-        let half = FlightTransition { altitude_ft: Some(5_000.0), level_ft: None, descending: true };
+        let half = FlightTransition {
+            altitude_ft: Some(5_000.0),
+            level_ft: None,
+            descending: true,
+        };
         assert_eq!(resolve_transition(Some(half), 18_000.0), 5_000.0);
         // A local plan carries neither: the airframe's default stands.
-        assert_eq!(resolve_transition(Some(FlightTransition::default()), 18_000.0), 18_000.0);
+        assert_eq!(
+            resolve_transition(Some(FlightTransition::default()), 18_000.0),
+            18_000.0
+        );
     }
 
     use super::*;
@@ -472,6 +543,42 @@ mod tests {
         assert!(out.starts_with("Altimeter didn't take"), "{out}");
     }
 
+    /// EGSS, 2026-09-22: the 737 loaded with its baro memory at 0.0 and one
+    /// capped round per ask left it at 17.5 after five asks. One ask gets
+    /// there, a round at a time, because every round is answered.
+    #[tokio::test]
+    async fn a_knob_at_zero_is_walked_all_the_way_in_one_ask() {
+        use crate::xplane::FakeXPlane;
+        let fake = FakeXPlane::with_reads(&[(BARO, 0.0)]);
+        fake.step_on_command(CMD_BARO_UP, BARO, BARO_STEP_INHG);
+        let now = set_altimeter(&fake, 30.40).await.unwrap();
+        assert!(altimeter_took(now, 30.40), "{now}");
+        assert_eq!(fake.ran_count(CMD_BARO_UP), 3040);
+    }
+
+    /// A knob that does not answer is pressed for ONE round, never ten.
+    #[tokio::test]
+    async fn a_dead_knob_gets_one_round() {
+        use crate::xplane::FakeXPlane;
+        let fake = FakeXPlane::with_reads(&[(BARO, 0.0)]);
+        let now = set_altimeter(&fake, 30.40).await.unwrap();
+        assert_eq!(fake.ran_count(CMD_BARO_UP), BARO_MAX_STEPS);
+        let sync = AltimeterSync {
+            was: 0.0,
+            now,
+            want: 30.40,
+        };
+        assert!(!sync.took());
+        assert!(
+            sync.line().starts_with("The altimeter did not take"),
+            "{}",
+            sync.line()
+        );
+        assert!(keep_stepping(0.0, 3.5, 30.4, 350));
+        assert!(!keep_stepping(0.0, 0.0, 30.4, 350));
+        assert!(!keep_stepping(30.39, 30.40, 30.4, 1));
+    }
+
     #[test]
     fn baro_steps_count_hundredths_and_pick_the_direction() {
         assert_eq!(baro_steps(30.11, 30.00), (CMD_BARO_DOWN, 11));
@@ -480,7 +587,7 @@ mod tests {
         assert_eq!(
             baro_steps(0.0, 31.5).1,
             BARO_MAX_STEPS,
-            "a bad read never runs away"
+            "a round is bounded; the next one is earned (keep_stepping)"
         );
         assert!(altimeter_took(30.104, 30.10) && !altimeter_took(30.11, 30.10));
     }
@@ -506,12 +613,14 @@ mod tests {
     fn a_sync_within_tolerance_did_not_change_anything() {
         assert!(!AltimeterSync {
             was: 30.15,
-            now: 30.16
+            now: 30.16,
+            want: 30.16
         }
         .changed());
         assert!(AltimeterSync {
             was: 30.15,
-            now: 30.10
+            now: 30.10,
+            want: 30.10
         }
         .changed());
     }

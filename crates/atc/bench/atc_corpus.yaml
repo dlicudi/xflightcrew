@@ -100,6 +100,17 @@
 - {text: "taxi to the gate", intent: request_taxi_in, radio: false}
 - {text: "request taxi to the apron", intent: request_taxi_in, radio: true}
 
+# --- Off the runway: a REPORT, acknowledged, never a clearance ----------------
+# The crew's own call, and it earned "say again" twice in one Liege arrival
+# (2026-09-22) before the tower had an intent for it.
+- {text: "november eight one six november november, runway vacated", intent: runway_vacated, radio: true}
+- {text: "runway vacated", intent: runway_vacated, radio: true}
+- {text: "vacated runway zero four right", intent: runway_vacated, radio: true}
+- {text: "we are clear of the runway", intent: runway_vacated, radio: true}
+- {text: "vacating via sierra three", intent: runway_vacated, radio: true}
+# ...and the combined wording the station itself suggests is still the REQUEST.
+- {text: "runway vacated, request taxi to parking", intent: request_taxi_in, radio: true}
+
 # --- Final reports ------------------------------------------------------------
 - {text: "november one seven two, final", intent: report_final, radio: true}
 - {text: "turning final", intent: report_final, radio: true}

@@ -80,7 +80,10 @@ pub fn clear_ap_targets() {
 pub fn ap_targets_line(hdg_mag: Option<f64>, alt_ft: Option<f64>, vs_fpm: Option<f64>) -> String {
     let mut parts = Vec::new();
     if let Some(h) = hdg_mag {
-        parts.push(format!("hdg {:03}", (h.rem_euclid(360.0).round() as i64) % 360));
+        parts.push(format!(
+            "hdg {:03}",
+            (h.rem_euclid(360.0).round() as i64) % 360
+        ));
     }
     if let Some(a) = alt_ft {
         parts.push(format!("alt {}", commas((a / 10.0).round() as i64 * 10)));
@@ -120,7 +123,6 @@ static LAST_SAID: Detail = Detail::new();
 pub fn note_said(text: &str) {
     LAST_SAID.set(text.trim());
 }
-
 
 use crate::{approach_guide, autoland, autotakeoff, autotaxi, circuit, full_auto, procedure};
 use crate::{flow, pushback, tools};
@@ -190,8 +192,10 @@ pub fn active_managers() -> Vec<String> {
 /// spoken line. Never in [`active_managers`] (they are not tasks, and a
 /// spoken status must not read a heading bug aloud).
 pub fn panel_extras() -> Vec<String> {
-    let flying = procedure::ACTIVE.load(Relaxed) || circuit::ACTIVE.load(Relaxed)
-        || autoland::ACTIVE.load(Relaxed) || autotakeoff::ACTIVE.load(Relaxed)
+    let flying = procedure::ACTIVE.load(Relaxed)
+        || circuit::ACTIVE.load(Relaxed)
+        || autoland::ACTIVE.load(Relaxed)
+        || autotakeoff::ACTIVE.load(Relaxed)
         || tools::recover::ACTIVE.load(Relaxed);
     let mut v = vec![if flying {
         "control: copilot flying".to_string()
@@ -317,6 +321,8 @@ pub const REQUEST_PHRASES: &[(i64, &str)] = &[
     (8, "line us up"),
     (9, "take off for me"),
     (10, "do a circuit"),
+    // 11 is CANCEL. The Route tab's load sheet button.
+    (12, "load the aircraft"),
 ];
 
 /// The CANCEL button's request code, handled outside [`REQUEST_PHRASES`].
@@ -332,7 +338,10 @@ mod detail_tests {
             ap_targets_line(Some(83.6), Some(5497.0), Some(512.0)),
             "ap: hdg 084, alt 5,500, vs +500"
         );
-        assert_eq!(ap_targets_line(Some(359.7), None, Some(-30.0)), "ap: hdg 000, vs -50");
+        assert_eq!(
+            ap_targets_line(Some(359.7), None, Some(-30.0)),
+            "ap: hdg 000, vs -50"
+        );
         assert_eq!(ap_targets_line(None, None, None), "");
     }
 

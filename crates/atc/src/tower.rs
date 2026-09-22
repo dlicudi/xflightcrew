@@ -74,6 +74,14 @@ pub enum Intent {
     SquawkCheck,
     /// "taxi to parking" — an arrival leaving the runway, not a departure.
     RequestTaxiIn,
+    /// "runway vacated" / "clear of the runway" — an arrival reporting itself
+    /// off the strip. A REPORT, not a request: it earns an acknowledgement and
+    /// changes nothing, because the call that tells a tower its runway is free
+    /// must not also be able to hand out a clearance. Our own crew makes it
+    /// from the taxiway before asking for the taxi in, and it earned "say
+    /// again" every time — twice in one arrival at Liege (2026-09-22), which
+    /// reads as a controller who did not hear the one call they most want.
+    RunwayVacated,
     /// "request vectors" — the tower redirects to the approach frequency.
     RequestVectors,
     /// "good evening, Merida" / "hello tower" — an initial hail carrying no
@@ -400,6 +408,20 @@ pub fn parse_intent(transcript: &str) -> Intent {
     if word("landed") {
         return Intent::RequestTaxiIn;
     }
+    // "runway vacated" / "clear of the runway" — off the strip, reported.
+    // Anything that also ASKS is that request instead: the station's own
+    // suggested wording is "runway vacated, request taxi to parking", and the
+    // parking rule above owns it. "cleared of" is not "clear of" — a landing
+    // clearance read back must not become a vacate report.
+    if (word("vacated")
+        || word("vacating")
+        || t.contains("clear of the runway")
+        || t.contains("clear of runway"))
+        && !t.contains("taxi")
+        && !t.contains("request")
+    {
+        return Intent::RunwayVacated;
+    }
     // "landing light on" / "landing gear down" / "flaps set for landing" are
     // cockpit commands, not arrival calls — same discipline as the taxi guard
     // below.
@@ -508,6 +530,7 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
         "wind_check" => Intent::WindCheck,
         "squawk_check" => Intent::SquawkCheck,
         "request_taxi_in" => Intent::RequestTaxiIn,
+        "runway_vacated" => Intent::RunwayVacated,
         "request_vectors" => Intent::RequestVectors,
         "greeting" => Intent::Greeting,
         "flight_following" => Intent::RequestFlightFollowing,
@@ -1061,6 +1084,11 @@ impl Tower {
                 self.state = State::Parked;
                 taxi_in_reply(ctx)
             }
+            // Acknowledged and nothing else. The state deliberately stands:
+            // a bare "request taxi" after a landing clearance is inferred as
+            // the taxi IN (below), and moving to Parked here would turn the
+            // next one into a departure clearance to the holding point.
+            Intent::RunwayVacated => format!("{}, roger, thank you.", ctx.callsign),
             Intent::RequestTaxi if self.state == State::ClearedToLand => {
                 self.state = State::Parked;
                 taxi_in_reply(ctx)
@@ -1567,6 +1595,44 @@ mod tests {
         // "I've just landed" is an arrival on the runway, not "say again".
         assert_eq!(parse_intent("i've just landed"), Intent::RequestTaxiIn);
         assert_eq!(parse_intent("we have landed"), Intent::RequestTaxiIn);
+        // Off the strip, reported. The crew's own call, twice answered "say
+        // again" at Liege (2026-09-22).
+        assert_eq!(parse_intent("runway vacated"), Intent::RunwayVacated);
+        assert_eq!(
+            parse_intent("november eight one six november november, runway vacated"),
+            Intent::RunwayVacated
+        );
+        assert_eq!(
+            parse_intent("vacated runway zero four right"),
+            Intent::RunwayVacated
+        );
+        assert_eq!(
+            parse_intent("we're clear of the runway"),
+            Intent::RunwayVacated
+        );
+        assert_eq!(
+            parse_intent("vacating via sierra three"),
+            Intent::RunwayVacated
+        );
+        // ...but a call that also ASKS is that request. The station's own
+        // suggested wording is the combined one, and it must still earn the
+        // taxi, not an acknowledgement.
+        assert_eq!(
+            parse_intent("runway vacated, request taxi to parking"),
+            Intent::RequestTaxiIn
+        );
+        assert_eq!(
+            parse_intent("runway vacated, request taxi"),
+            Intent::RequestTaxi,
+            "a bare taxi request is still a taxi request; the FSM infers the \
+             taxi IN from the landing clearance"
+        );
+        // A landing clearance read back is not a vacate report: "cleared"
+        // contains "clear" and the two calls are seconds apart on the tape.
+        assert_ne!(
+            parse_intent("cleared to land runway zero four right"),
+            Intent::RunwayVacated
+        );
         // "request clearance for taxi" wants the taxi, not the zone clearance
         // (asked three times on 2026-07-08; each got "cleared to leave the
         // zone" while parked at the stand).
@@ -1686,6 +1752,7 @@ mod tests {
             WindCheck,
             SquawkCheck,
             RequestTaxiIn,
+            RunwayVacated,
             RequestVectors,
             Greeting,
             RequestFlightFollowing,
@@ -1746,6 +1813,9 @@ mod tests {
                     // A hail, flight following, and radio housekeeping are
                     // answered without touching the sequence.
                     Greeting | RequestFlightFollowing | RequestFrequencyChange => start,
+                    // A position report off the runway is acknowledged and
+                    // changes nothing — see the handler.
+                    RunwayVacated => start,
                     // ctx() has an approach frequency, so vectors redirect
                     // without touching the sequence.
                     RequestVectors => start,
@@ -2474,6 +2544,33 @@ mod tests {
             "unknown mass is no suffix"
         );
         assert_eq!(spoken_callsign_wake("", Some(300_000.0)), "");
+    }
+
+    /// Liege 2026-09-22: the crew reported "runway vacated" from the taxiway,
+    /// as it does on every arrival, and the tower said "say again" - twice.
+    /// The report is acknowledged now, and acknowledging it must not spend the
+    /// landing clearance the taxi-in inference rests on.
+    #[test]
+    fn a_vacate_report_is_acknowledged_and_spends_nothing() {
+        let mut c = ctx();
+        c.stand = "stand one two".into();
+        let mut twr = Tower::new();
+        twr.state = State::ClearedToLand;
+        let reply = twr.handle(Intent::RunwayVacated, &c);
+        assert!(!reply.contains("say again"), "{reply:?}");
+        assert!(reply.contains(&c.callsign), "{reply:?}");
+        assert!(
+            !reply.contains("cleared") && !reply.contains("taxi"),
+            "a report earns words, never a clearance: {reply:?}"
+        );
+        assert_eq!(
+            twr.state,
+            State::ClearedToLand,
+            "the state stands, so the bare taxi request below is still the taxi IN"
+        );
+        assert!(twr
+            .handle(Intent::RequestTaxi, &c)
+            .contains("taxi to stand one two"));
     }
 
     #[test]

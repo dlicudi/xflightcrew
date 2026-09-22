@@ -91,6 +91,62 @@ pub struct Reversal {
     /// read off the radio altimeter every tick chases the hills under it
     /// (+330 to -360 fpm commanded in "level" flight over Devon).
     pub platform_ft: f64,
+    /// Too high to turn base yet ([`too_high_to_turn`], set by the caller
+    /// every tick from the altitude it already has): the downwind extends.
+    pub high: bool,
+}
+
+/// The gentle platform law's descent, fpm.
+const PLATFORM_DESCENT_FPM: f64 = 800.0;
+/// Above the platform by more than this the pattern descends at the
+/// airframe's enroute rate instead.
+const HIGH_ABOVE_PLATFORM_FT: f64 = 1500.0;
+/// The enroute rate is capped here in the pattern: half flap, pattern speed.
+const HIGH_DESCENT_CAP_FPM: f64 = 1500.0;
+/// The downwind is never extended past this, nm along. Past it the turn is
+/// made anyway and the stabilised gate has the last word.
+const MAX_OUTBOUND_NM: f64 = 25.0;
+
+/// The descent the pattern commands from `above_ft` over its platform, fpm
+/// (positive). Pure.
+pub fn pattern_descent_fpm(above_ft: f64, enroute_descent_fpm: f64) -> f64 {
+    if above_ft > HIGH_ABOVE_PLATFORM_FT {
+        enroute_descent_fpm.clamp(PLATFORM_DESCENT_FPM, HIGH_DESCENT_CAP_FPM)
+    } else {
+        PLATFORM_DESCENT_FPM
+    }
+}
+
+/// Is the aircraft higher than the REST of the pattern can lose? Turning base
+/// here leaves the crossing and the run back in to the join; what that takes
+/// at the pattern's descent is all the height there is to give. EGSS,
+/// 2026-09-22: a 737 asked to land from 16,700 ft, 13 nm out, flew the
+/// pattern at 800 fpm and turned final 12,600 ft above the field. Pure.
+pub fn too_high_to_turn(
+    alt_ft: f64,
+    platform_ft: f64,
+    along_nm: f64,
+    join_nm: f64,
+    gs_kts: f64,
+    enroute_descent_fpm: f64,
+) -> bool {
+    if along_nm >= MAX_OUTBOUND_NM {
+        return false;
+    }
+    let above = alt_ft - platform_ft;
+    let track_nm = OFFSET_RADII * sizing_radius_nm(gs_kts) + (along_nm - join_nm).max(0.0);
+    let minutes = track_nm / gs_kts.max(50.0) * 60.0;
+    above > pattern_descent_fpm(above, enroute_descent_fpm) * minutes + 300.0
+}
+
+/// An inbound leg that has passed the threshold without ever being called a
+/// final has FAILED, and has no way back: the pursuit's aim is behind it, the
+/// capped cut flips sign with every crossing of the centreline, and the
+/// aircraft flies away on the runway heading. EGSS, 2026-09-22: inbound
+/// 12,600 ft over the field, then 258/188/258 for 52 nm. The caller drops
+/// the pattern; the ordinary `needed` test starts the next one or gives up.
+pub fn overflown(rev: &Reversal, along_nm: f64) -> bool {
+    rev.leg == Leg::Inbound && along_nm < 0.0
 }
 
 /// Turn radius the pattern is sized for, nm.
@@ -173,7 +229,7 @@ pub fn step(
     let recip = (rwy.course_deg + 180.0) % 360.0;
     let toward_line = (rwy.course_deg + if rev.side > 0.0 { 270.0 } else { 90.0 }) % 360.0;
 
-    if rev.leg == Leg::Outbound && along_nm >= base_along - r {
+    if rev.leg == Leg::Outbound && along_nm >= base_along - r && !rev.high {
         rev.leg = Leg::Base;
     }
     // Turn inbound a radius before the line; an aircraft that began the
@@ -186,7 +242,12 @@ pub fn step(
             // Pursue the offset line, never home on its far end: a homing run
             // from beside the runway converges on the point and arrives with
             // whatever spacing is left, which is how 5.3 km became 1.25.
-            let ahead = (along_nm + 2.0 * r).min(base_along + r);
+            // An extended downwind keeps pursuing the line past the base point.
+            let ahead = if rev.high {
+                along_nm + 2.0 * r
+            } else {
+                (along_nm + 2.0 * r).min(base_along + r)
+            };
             let (plat, plon) = pattern_point(rwy, ahead, rev.side * offset);
             let brg = bearing_deg(lat, lon, plat, plon);
             // Never steeper across the downwind line than 45 degrees, and
@@ -214,12 +275,21 @@ pub fn step(
 
 /// Vertical speed that holds the pattern's platform: a deadband, a gentle
 /// proportional law, never a climb without the speed for it.
-pub fn platform_vs_fpm(platform_ft: f64, alt_ft: f64, slow: bool, max_climb_fpm: f64) -> f64 {
+pub fn platform_vs_fpm(
+    platform_ft: f64,
+    alt_ft: f64,
+    slow: bool,
+    max_climb_fpm: f64,
+    enroute_descent_fpm: f64,
+) -> f64 {
     let err = platform_ft - alt_ft;
     if err.abs() < 50.0 {
         return 0.0;
     }
-    let vs = (err * 4.0).clamp(-800.0, max_climb_fpm);
+    let vs = (err * 4.0).clamp(
+        -pattern_descent_fpm(-err, enroute_descent_fpm),
+        max_climb_fpm,
+    );
     if slow && vs > 0.0 {
         0.0
     } else {
@@ -313,6 +383,7 @@ mod tests {
             side,
             leg: Leg::Outbound,
             platform_ft: 1700.0,
+            high: false,
         });
         let mut legs = vec![Leg::Outbound];
         let mut worst_inside_3: f64 = 0.0;
@@ -421,6 +492,7 @@ mod tests {
             side: -1.0,
             leg: Leg::Outbound,
             platform_ft: 1700.0,
+            high: false,
         };
         let h = step(
             &mut rev,
@@ -486,11 +558,87 @@ mod tests {
     }
 
     #[test]
+    fn an_inbound_leg_past_the_threshold_is_over() {
+        let mut rev = Reversal {
+            side: 1.0,
+            leg: Leg::Inbound,
+            platform_ft: 1938.0,
+            high: false,
+        };
+        assert!(!overflown(&rev, 3.0));
+        assert!(overflown(&rev, -0.5));
+        rev.leg = Leg::Outbound;
+        assert!(
+            !overflown(&rev, -0.5),
+            "the downwind starts beside the runway"
+        );
+    }
+
+    #[test]
+    fn a_pattern_begun_far_too_high_extends_its_downwind_and_descends_harder() {
+        // EGSS 22, 2026-09-22: 16,700 ft at the base point, platform 1,938.
+        assert!(too_high_to_turn(16_700.0, 1_938.0, 7.0, 5.0, 230.0, 2000.0));
+        assert_eq!(pattern_descent_fpm(14_700.0, 2000.0), 1500.0);
+        // A 172 a few hundred feet over its platform turns where it always did.
+        assert!(!too_high_to_turn(2_100.0, 1_700.0, 4.0, 3.0, 90.0, 500.0));
+        assert_eq!(pattern_descent_fpm(400.0, 500.0), 800.0);
+        // The extension is bounded: past the cap the turn is made.
+        assert!(!too_high_to_turn(
+            16_700.0, 1_938.0, 25.0, 5.0, 230.0, 2000.0
+        ));
+        // A high downwind does not turn base at the base point...
+        let rwy = egte_08();
+        let r = sizing_radius_nm(200.0);
+        let (lat, lon) = pattern_point(&rwy, 12.0, -OFFSET_RADII * r);
+        let mut rev = Reversal {
+            side: -1.0,
+            leg: Leg::Outbound,
+            platform_ft: 1700.0,
+            high: true,
+        };
+        step(
+            &mut rev,
+            &rwy,
+            lat,
+            lon,
+            12.0,
+            -OFFSET_RADII * r,
+            259.0,
+            200.0,
+            5.75,
+            false,
+        );
+        assert_eq!(rev.leg, Leg::Outbound);
+        // ...and turns the tick the height is in hand.
+        rev.high = false;
+        step(
+            &mut rev,
+            &rwy,
+            lat,
+            lon,
+            12.0,
+            -OFFSET_RADII * r,
+            259.0,
+            200.0,
+            5.75,
+            false,
+        );
+        assert_eq!(rev.leg, Leg::Base);
+        assert_eq!(
+            platform_vs_fpm(1700.0, 9700.0, false, 800.0, 2000.0),
+            -1500.0
+        );
+    }
+
+    #[test]
     fn the_platform_is_held_with_a_deadband_and_never_climbed_slow() {
-        assert_eq!(platform_vs_fpm(1700.0, 1730.0, false, 800.0), 0.0);
-        assert_eq!(platform_vs_fpm(1700.0, 1500.0, false, 800.0), 800.0);
-        assert_eq!(platform_vs_fpm(1700.0, 1500.0, true, 800.0), 0.0);
-        assert_eq!(platform_vs_fpm(1700.0, 2700.0, false, 800.0), -800.0);
-        assert_eq!(platform_vs_fpm(1700.0, 1800.0, true, 800.0), -400.0);
+        assert_eq!(platform_vs_fpm(1700.0, 1730.0, false, 800.0, 2000.0), 0.0);
+        assert_eq!(platform_vs_fpm(1700.0, 1500.0, false, 800.0, 2000.0), 800.0);
+        assert_eq!(platform_vs_fpm(1700.0, 1500.0, true, 800.0, 2000.0), 0.0);
+        assert_eq!(
+            platform_vs_fpm(1700.0, 2700.0, false, 800.0, 2000.0),
+            -800.0
+        );
+        assert_eq!(platform_vs_fpm(1700.0, 1800.0, true, 800.0, 2000.0), -400.0);
     }
 }

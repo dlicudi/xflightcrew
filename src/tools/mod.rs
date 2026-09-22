@@ -26,6 +26,7 @@ pub mod ground;
 pub mod instruments;
 pub mod jet_start;
 pub mod lights;
+pub mod loading;
 pub mod power;
 pub mod procedure;
 pub mod prop;
@@ -442,9 +443,7 @@ impl Registry {
         // "shut down aircraft") and every one of them parsed to a tool the
         // registry had not built, until they gave up with "my aircraft"
         // (2026-09-17).
-        if profile.scripted_auto_start
-            && !profile.turbine_start
-            && profile.airliner_start.is_none()
+        if profile.scripted_auto_start && !profile.turbine_start && profile.airliner_start.is_none()
         {
             tools.push(Box::new(jet_start::ScriptedAutoStart));
             tools.push(Box::new(jet_start::StopEngines::new(profile)));
@@ -656,6 +655,10 @@ impl Registry {
         tools.push(Box::new(ground::SetGroundPower));
         tools.push(Box::new(ground::Pushback));
         tools.push(Box::new(ground::RequestService));
+
+        // The load sheet is the plan's, not an airframe system: every
+        // aircraft has tanks and a payload.
+        tools.push(Box::new(loading::LoadAircraft));
 
         // Reminders ("wake me at top of descent", "tell me at the next waypoint") are
         // crew memory, not an airframe system, so available on any aircraft.

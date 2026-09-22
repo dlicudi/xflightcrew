@@ -29,6 +29,7 @@ const DR_RADIO: &str = "xcopilot/status/radio";
 const DR_ATC: &str = "xcopilot/status/atc";
 const DR_COACH: &str = "xcopilot/status/coach";
 const DR_AUTO: &str = "xcopilot/status/auto";
+const DR_LOADSHEET: &str = "xcopilot/status/loadsheet";
 
 /// Keep text within the plugin's fixed display buffer (512 bytes, NUL-terminated)
 /// — long enough for a full engine/weather summary readback.
@@ -64,6 +65,8 @@ enum Update {
     /// The Flight tab's automation feed (`auto_status::compose` payload:
     /// marker byte + manager lines). Marker '0' alone means idle.
     Auto(String),
+    /// The Route tab's load sheet feed (`simbrief::loadsheet_payload`).
+    LoadSheet(String),
 }
 
 /// Severity of a panel alert — drives the chip colour/label in the plugin.
@@ -158,6 +161,10 @@ impl StatusSink {
     pub fn auto_status(&self, payload: &str) {
         let _ = self.0.send(Update::Auto(clip(payload)));
     }
+    /// Refresh the Route tab's load sheet (the plan's side of it).
+    pub fn load_sheet(&self, payload: &str) {
+        let _ = self.0.send(Update::LoadSheet(clip(payload)));
+    }
 }
 
 /// Scrub em/en dashes (the panel font can't render them) and trim to the plugin
@@ -189,6 +196,7 @@ enum Slot {
     Atc,
     Coach,
     Auto,
+    LoadSheet,
 }
 
 /// The resolved numeric ids of the plugin's status datarefs. All `None` until a
@@ -206,6 +214,7 @@ struct Ids {
     atc: Option<i64>,
     coach: Option<i64>,
     auto: Option<i64>,
+    loadsheet: Option<i64>,
 }
 
 impl Ids {
@@ -222,6 +231,7 @@ impl Ids {
             Slot::Atc => self.atc,
             Slot::Coach => self.coach,
             Slot::Auto => self.auto,
+            Slot::LoadSheet => self.loadsheet,
         }
     }
     /// True once at least one dataref resolved (i.e. the plugin is present).
@@ -245,6 +255,7 @@ fn resolve_all(http: &reqwest::blocking::Client, rest: &str) -> Ids {
         atc: resolve_id(http, rest, DR_ATC),
         coach: resolve_id(http, rest, DR_COACH),
         auto: resolve_id(http, rest, DR_AUTO),
+        loadsheet: resolve_id(http, rest, DR_LOADSHEET),
     }
 }
 
@@ -345,6 +356,9 @@ fn run(base: String, rx: Receiver<Update>) {
                 Update::Coach(text) => (Slot::Coach, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Callout(text) => (Slot::Callout, json!(STANDARD.encode(text.as_bytes()))),
                 Update::Auto(text) => (Slot::Auto, json!(STANDARD.encode(text.as_bytes()))),
+                Update::LoadSheet(text) => {
+                    (Slot::LoadSheet, json!(STANDARD.encode(text.as_bytes())))
+                }
             };
             healthy = patch(&http, &rest, &ids, slot, value);
         }

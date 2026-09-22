@@ -185,7 +185,14 @@ pub fn rejoin_index(
         // cross(leg direction, aircraft - A) < 0: the aircraft is right of course.
         let right = dx * (-ay) - dy * (-ax) < 0.0;
         let bearing = (bx.atan2(by).to_degrees() + 360.0) % 360.0;
-        abeam.push((distance, i + 1, right, bearing, a.ident.clone(), b.ident.clone()));
+        abeam.push((
+            distance,
+            i + 1,
+            right,
+            bearing,
+            a.ident.clone(),
+            b.ident.clone(),
+        ));
     }
     abeam.sort_by(|a, b| a.0.total_cmp(&b.0));
     let Some((distance, index, right, bearing, from, to)) = abeam.first().cloned() else {
@@ -194,7 +201,10 @@ pub fn rejoin_index(
     if distance > REJOIN_CORRIDOR_NM {
         let miles = distance.round().max(1.0);
         let heading = match mag_var {
-            Some(v) => format!("{:03}", (((bearing - v) % 360.0 + 360.0) % 360.0).round() as i64 % 360),
+            Some(v) => format!(
+                "{:03}",
+                (((bearing - v) % 360.0 + 360.0) % 360.0).round() as i64 % 360
+            ),
             None => format!("{:03} true", bearing.round() as i64 % 360),
         };
         return Err(format!(
@@ -254,7 +264,10 @@ mod tests {
         let straight = legs(&[(0.0, 0.0), (0.0, 1.0), (0.0, 2.0)]);
         // 6 nm north of an eastbound leg is LEFT of course.
         let why = rejoin_index(&straight, 0.1, 1.4, Some(0.0)).unwrap_err();
-        assert!(why.contains("6 miles left of course on the FIX1 to FIX2 leg"), "{why}");
+        assert!(
+            why.contains("6 miles left of course on the FIX1 to FIX2 leg"),
+            "{why}"
+        );
         assert!(why.contains("Steer 099 for FIX2"), "{why}");
         // South is right of course; a 3 degree east variation moves the heading west.
         let why = rejoin_index(&straight, -0.1, 1.4, Some(3.0)).unwrap_err();

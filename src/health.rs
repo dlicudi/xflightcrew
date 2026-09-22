@@ -109,6 +109,7 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/fms/route",
     "xcopilot/opt/audio_bus",
     "xcopilot/opt/cabin_crew",
+    "xcopilot/opt/cabin_voice",
     "xcopilot/opt/camera_snap",
     "xcopilot/opt/mode",
     "xcopilot/opt/monitor_mute",
@@ -131,6 +132,7 @@ pub const PLUGIN_DATAREFS: &[&str] = &[
     "xcopilot/status/callout",
     "xcopilot/status/coach",
     "xcopilot/status/heard",
+    "xcopilot/status/loadsheet",
     "xcopilot/status/phase",
     "xcopilot/status/radio",
     "xcopilot/status/strip",
@@ -155,7 +157,10 @@ pub fn set_plugin_missing(missing: Vec<String>) {
 }
 
 pub fn plugin_missing() -> Option<Vec<String>> {
-    PLUGIN_MISSING.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    PLUGIN_MISSING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// The spoken verdict of a plugin probe: nothing when the build matches.
@@ -168,7 +173,11 @@ pub fn plugin_summary(missing: &[String]) -> Option<String> {
         .take(3)
         .map(|m| m.trim_start_matches("xcopilot/").replace(['/', '_'], " "))
         .collect();
-    let more = if missing.len() > 3 { format!(" and {} more", missing.len() - 3) } else { String::new() };
+    let more = if missing.len() > 3 {
+        format!(" and {} more", missing.len() - 3)
+    } else {
+        String::new()
+    };
     Some(format!(
         "Plugin check: the loaded plugin is out of date. It has no {}{}. Terrain and the panel will fail until it is rebuilt and reloaded.",
         shown.join(", "),
@@ -183,7 +192,11 @@ fn plugin_probe(loaded: bool) -> Probe {
     }
     match plugin_missing() {
         Some(m) if !m.is_empty() => {
-            let more = if m.len() > 1 { format!(" and {} more", m.len() - 1) } else { String::new() };
+            let more = if m.len() > 1 {
+                format!(" and {} more", m.len() - 1)
+            } else {
+                String::new()
+            };
             Probe::Down(format!("loaded, out of date: no {}{more}", m[0]))
         }
         _ => Probe::Up("loaded".into()),
@@ -298,8 +311,14 @@ mod plugin_contract_tests {
         let line = plugin_summary(&["xcopilot/terrain/valid".into()]).unwrap();
         assert!(line.contains("out of date"), "{line}");
         assert!(line.contains("terrain valid"), "{line}");
-        assert_eq!(plugin_probe(false), Probe::Down("no xcopilot/* datarefs".into()));
-        set_plugin_missing(vec!["xcopilot/terrain/valid".into(), "xcopilot/fms/goto".into()]);
+        assert_eq!(
+            plugin_probe(false),
+            Probe::Down("no xcopilot/* datarefs".into())
+        );
+        set_plugin_missing(vec![
+            "xcopilot/terrain/valid".into(),
+            "xcopilot/fms/goto".into(),
+        ]);
         assert_eq!(
             plugin_probe(true),
             Probe::Down("loaded, out of date: no xcopilot/terrain/valid and 1 more".into())

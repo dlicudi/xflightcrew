@@ -394,7 +394,11 @@ pub fn manager_seek_window(mix: f64) -> (f64, f64, f64) {
     if mix >= RICH_LEVER {
         (0.95, MIX_LEAN_FLOOR, 0.03)
     } else {
-        ((mix + 0.05).min(0.95), (mix - 0.05).max(MIX_LEAN_FLOOR), 0.015)
+        (
+            (mix + 0.05).min(0.95),
+            (mix - 0.05).max(MIX_LEAN_FLOOR),
+            0.015,
+        )
     }
 }
 

@@ -135,6 +135,9 @@ mod tests {
             }
         }
         assert!(checked >= 10, "expected the loop modules, found {checked}");
-        assert!(missing.is_empty(), "loops with a static ACTIVE not in stand_down: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "loops with a static ACTIVE not in stand_down: {missing:?}"
+        );
     }
 }

@@ -55,6 +55,12 @@ static std::vector<RoutePoint> parse_route() {
 // Display copy for the panel's Route tab, refreshed whenever the app writes.
 static std::vector<RoutePoint> g_route_pts;
 
+// The follower's last goto named a leg the loaded plan lacks (an approach
+// leg): the FMS destination is then stale and the goto itself is the truth.
+static bool g_goto_off_plan = false;
+static std::string g_goto_ident;
+static double g_goto_lat = 0.0, g_goto_lon = 0.0;
+
 static void WriteFmsRoute(void*, void* in, int offset, int len) {
     StoreText(&g_fms_route, in, offset, len);
     g_route_pts = parse_route();
@@ -108,6 +114,7 @@ static int fms_row_type(const RoutePoint& p) {
 }
 
 static void load_fms_route() {
+    g_goto_off_plan = false; // a new plan: the old flight's approach leg is history
     const XPLMNavType kTypes = xplm_Nav_Fix | xplm_Nav_VOR | xplm_Nav_NDB |
                                xplm_Nav_DME | xplm_Nav_Airport;
 
@@ -235,6 +242,10 @@ static void WriteFmsGoto(void*, void* in, int offset, int len) {
     char* slon = strtok_r(nullptr, ",", &save);
     if (!ident || !slat || !slon) return;
     const int i = find_fms_entry(ident, std::atof(slat), std::atof(slon));
+    g_goto_off_plan = i < 0;
+    g_goto_ident = ident;
+    g_goto_lat = std::atof(slat);
+    g_goto_lon = std::atof(slon);
     char msg[160];
     if (i < 0) {
         std::snprintf(msg, sizeof msg, "XVoiceLayer plugin: fms/goto %s: no such entry in the loaded plan\n", ident);
@@ -285,5 +296,64 @@ void read_airac_cycle() { read_airac_cycle_impl(); }
 const std::string& airac_cycle() { return g_airac_cycle; }
 
 const std::vector<RoutePoint>& route_points() { return g_route_pts; }
+
+double distance_nm(double lat1, double lon1, double lat2, double lon2) {
+    return approx_nm(lat1, lon1, lat2, lon2);
+}
+
+double bearing_true_deg(double lat1, double lon1, double lat2, double lon2) {
+    const double dlat = lat2 - lat1;
+    const double dlon = (lon2 - lon1) * std::cos((lat1 + lat2) * 0.5 * M_PI / 180.0);
+    double b = std::atan2(dlon, dlat) * 180.0 / M_PI;
+    if (b < 0.0) b += 360.0;
+    return b;
+}
+
+// The row of the display route this fix is: ident first, nearest among
+// namesakes, else the nearest nameless point within a mile.
+static int route_row(const std::string& ident, double lat, double lon) {
+    int best = -1;
+    double best_nm = 1e9;
+    bool best_named = false;
+    for (size_t i = 0; i < g_route_pts.size(); ++i) {
+        const RoutePoint& p = g_route_pts[i];
+        const double d = approx_nm(lat, lon, p.lat, p.lon);
+        const bool named = !ident.empty() && ident_eq(p.ident.c_str(), ident.c_str());
+        if (named && !best_named) {
+            best = static_cast<int>(i); best_nm = d; best_named = true;
+        } else if (named == best_named && d < best_nm) {
+            best = static_cast<int>(i); best_nm = d;
+        }
+    }
+    if (best >= 0 && !best_named && best_nm > 1.0) return -1;
+    return best;
+}
+
+ActiveFix active_fix() {
+    ActiveFix a = {false, "", 0.0, 0.0, -1};
+    if (g_goto_off_plan) {
+        a.valid = true;
+        a.ident = g_goto_ident;
+        a.lat = g_goto_lat;
+        a.lon = g_goto_lon;
+        return a;
+    }
+    const int n = XPLMCountFMSEntries();
+    const int i = XPLMGetDestinationFMSEntry();
+    if (n <= 0 || i < 0 || i >= n) return a;
+    XPLMNavType type = xplm_Nav_Unknown;
+    char id[256] = {0};
+    XPLMNavRef ref = XPLM_NAV_NOT_FOUND;
+    int alt = 0;
+    float la = 0.0f, lo = 0.0f;
+    XPLMGetFMSEntryInfo(i, &type, id, &ref, &alt, &la, &lo);
+    if (la == 0.0f && lo == 0.0f) return a;
+    a.valid = true;
+    a.ident = id;
+    a.lat = la;
+    a.lon = lo;
+    a.row = route_row(a.ident, a.lat, a.lon);
+    return a;
+}
 
 } // namespace fms

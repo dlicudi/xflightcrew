@@ -884,6 +884,7 @@ impl Station {
             | tower::Intent::RequestTakeoff
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
+            | tower::Intent::RunwayVacated
             | tower::Intent::RequestStartup
             | tower::Intent::RequestShutdown
             | tower::Intent::RequestClearance => format!(
@@ -1038,6 +1039,7 @@ impl Station {
             | tower::Intent::RequestTakeoff
             | tower::Intent::RequestTaxi
             | tower::Intent::RequestTaxiIn
+            | tower::Intent::RunwayVacated
             | tower::Intent::RequestStartup
             | tower::Intent::RequestShutdown
             | tower::Intent::RequestClearance => format!(
@@ -1510,6 +1512,16 @@ pub fn is_radio_call(t: &str, airport_lc: &str) -> bool {
         || t.contains("left base")
         || t.contains("right base")
         || t.contains("base leg")
+        // "Runway vacated" is radio speech for the same reason a pattern call
+        // is: nobody tells their copilot they have left the runway, and the
+        // tower is the one party that needs to know. It earns an
+        // acknowledgement and nothing else, so routing it here cannot buy a
+        // clearance. "Clear of the runway" needs the runway word with it —
+        // "clear left", "all clear" and "clear to taxi" are not this call.
+        || word("vacated")
+        || word("vacating")
+        || t.contains("clear of the runway")
+        || t.contains("clear of runway")
 }
 
 /// This flight's discrete squawk, deterministic from the callsign so tests
@@ -4295,7 +4307,7 @@ fn plan_taxi_route_to(
         (r.width_m / 2.0 + 30.0).max(nav::HOLD_SHORT_STANDOFF_M)
     };
     let zone = [r.ident_a.clone(), r.ident_b.clone()];
-    let mut plan = net.plan_to_runway(lat, lon, tlat, tlon, standoff, &zone)?;
+    let mut plan = net.plan_to_runway(lat, lon, tlat, tlon, standoff, &zone, Some(r))?;
     mark_runway_crossings(&mut plan, runways);
     Some(plan)
 }

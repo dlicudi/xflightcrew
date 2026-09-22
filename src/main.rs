@@ -419,6 +419,7 @@ async fn main() -> Result<()> {
             config.xplane_base_url.clone(),
             voice.clone(),
             config.piper_voice.clone(),
+            config.cabin_piper_voice.clone(),
         );
     }
 
@@ -1911,6 +1912,11 @@ async fn run_session(
             // ("cabin crew, doors to manual" carries no cockpit keyword) —
             // the cabin handler below answers it deterministically.
             && cabin::Cabin::addressed(&command).is_none()
+            // So is the call that follows a bare "cabin crew?".
+            && !cabin_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .line_open(Instant::now())
         {
             // A conversational follow-up shortly after a command is let through
             // even without a keyword. Outside the window, the strict gate holds.
@@ -1974,12 +1980,25 @@ async fn run_session(
         // The address is the routing (no third PTT; see crate::cabin). On an
         // airframe with no cabin crew the copilot answers honestly instead
         // of letting the model improvise a flight attendant.
-        if let Some(rest) = cabin::Cabin::addressed(&command) {
+        // A bare "cabin crew?" leaves the line open: the next utterance is
+        // theirs without the address, when it is a cabin call.
+        let addressed = cabin::Cabin::addressed(&command);
+        let on_open_line = match addressed {
+            Some(_) => None,
+            None => cabin_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_open_line(&command, Instant::now()),
+        };
+        if addressed.is_some() || on_open_line.is_some() {
             if cabin::aboard(profile.cabin_crew) {
-                let reply = cabin_state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .handle(&rest, Instant::now());
+                let reply = match on_open_line {
+                    Some(reply) => reply,
+                    None => cabin_state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .handle(addressed.as_deref().unwrap_or(""), Instant::now()),
+                };
                 blackbox::record(
                     "cabin",
                     serde_json::json!({ "route": "call", "call": &command, "reply": &reply }),
@@ -2610,7 +2629,10 @@ async fn run_session(
             // follow-up the brief itself invites.
             let load_followup =
                 fp_cache.is_some() && tl.split_whitespace().any(|w| w == "it" || w == "that");
-            let wants_load = (tl.contains("load") || tl.contains("program") || tl.contains("send"))
+            // Not the load SHEET ("load the fuel from the flight plan"): that is
+            // the `load_aircraft` tool's, through the grammar below.
+            let wants_load = !grammar::load_aircraft_request(&tl)
+                && (tl.contains("load") || tl.contains("program") || tl.contains("send"))
                 && (routeish
                     || load_followup
                     || tl.contains("plan")
@@ -5353,16 +5375,45 @@ mod gap_tests_2026_09_12 {
             "Yes. Runway two four, 2,340 metres ahead of us, and we need 2,110 at this weight."
         );
         let short = takeoff_runway_line(
-            Err(NoFit::RunwayTooShort { id: "24".into(), length_m: 2549.0, needed_m: 2560.0 }),
+            Err(NoFit::RunwayTooShort {
+                id: "24".into(),
+                length_m: 2549.0,
+                needed_m: 2560.0,
+            }),
             2560.0,
         );
-        assert!(short.starts_with("No. Runway two four is 2,550 metres and we need 2,560"), "{short}");
+        assert!(
+            short.starts_with("No. Runway two four is 2,550 metres and we need 2,560"),
+            "{short}"
+        );
         let far = takeoff_runway_line(
-            Err(NoFit::TooLittleLeft { id: "24".into(), remaining_m: 141.0, needed_m: 2113.0 }),
+            Err(NoFit::TooLittleLeft {
+                id: "24".into(),
+                remaining_m: 141.0,
+                needed_m: 2113.0,
+            }),
             2113.0,
         );
         assert!(far.starts_with("Not from here. 140 metres left"), "{far}");
-        assert!(takeoff_runway_line(Err(NoFit::NoneNear), 2113.0).contains("not lined up"));
+        assert!(takeoff_runway_line(
+            Err(NoFit::NoneNear {
+                id: String::new(),
+                lateral_m: 0.0
+            }),
+            2113.0
+        )
+        .contains("not lined up"));
+        // A length question with no runway near still cannot be measured, even
+        // now that `NoneNear` knows which strip it looked for — that naming is
+        // the REFUSAL's job (`autotakeoff::no_fit_line`), not this answer's.
+        let away = takeoff_runway_line(
+            Err(NoFit::NoneNear {
+                id: "07".into(),
+                lateral_m: 169.0,
+            }),
+            2113.0,
+        );
+        assert!(away.contains("not lined up"), "{away}");
     }
 
     #[test]

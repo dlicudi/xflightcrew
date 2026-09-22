@@ -948,7 +948,9 @@ impl Tool for SetAltitude {
             Ok(format!(
                 "Roger — {power}{} {altitude:.0} feet.{terrain}{}",
                 movement.to_lowercase(),
-                crate::interaction::route_continuation(crate::procedure::ACTIVE.load(std::sync::atomic::Ordering::Relaxed))
+                crate::interaction::route_continuation(
+                    crate::procedure::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                )
             ))
         } else {
             Ok(format!(

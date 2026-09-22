@@ -912,6 +912,9 @@ pub struct FakeXPlane {
     writes: std::sync::Mutex<Vec<(String, f64)>>,
     /// Every command run, in order.
     commands: std::sync::Mutex<Vec<String>>,
+    /// A command that moves a read: (dataref, delta per press). A stepped
+    /// knob whose dial write does not stand (the 737's altimeter) is this.
+    command_steps: std::sync::Mutex<HashMap<String, (String, f64)>>,
 }
 
 impl FakeXPlane {
@@ -921,7 +924,16 @@ impl FakeXPlane {
             array_reads: std::sync::Mutex::new(HashMap::new()),
             writes: std::sync::Mutex::new(Vec::new()),
             commands: std::sync::Mutex::new(Vec::new()),
+            command_steps: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Make `command` move the read of `dataref` by `delta` per press.
+    pub fn step_on_command(&self, command: &str, dataref: &str, delta: f64) {
+        self.command_steps
+            .lock()
+            .unwrap()
+            .insert(command.to_string(), (dataref.to_string(), delta));
     }
 
     /// Preset the values reads will return.
@@ -1020,6 +1032,14 @@ impl XPlane for FakeXPlane {
     }
     async fn run_command(&self, name: &str) -> Result<()> {
         self.commands.lock().unwrap().push(name.to_string());
+        if let Some((dref, delta)) = self.command_steps.lock().unwrap().get(name) {
+            *self
+                .reads
+                .lock()
+                .unwrap()
+                .entry(dref.clone())
+                .or_insert(0.0) += delta;
+        }
         Ok(())
     }
     async fn run_command_for(&self, name: &str, _duration: f64) -> Result<()> {

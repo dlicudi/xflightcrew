@@ -92,7 +92,10 @@ pub(crate) fn known_profile(icao: &str) -> Option<String> {
 
 /// The names a profile relies on that the running sim does not have: two
 /// index fetches (every dataref, every command), one membership test each.
-pub(crate) async fn missing_profile_names(xp: &XPlaneClient, names: &[String]) -> Result<Vec<String>> {
+pub(crate) async fn missing_profile_names(
+    xp: &XPlaneClient,
+    names: &[String],
+) -> Result<Vec<String>> {
     let datarefs: std::collections::HashSet<String> = xp
         .dataref_index()
         .await?
@@ -114,7 +117,10 @@ pub(crate) fn generic_profile_id(icao: &str) -> String {
 /// file (`acf_relative_path`, relative to the install), the placards come
 /// out of it. `None` when the file can't be found or read — the caller then
 /// falls back to the 172's numbers and SAYS so.
-pub(crate) async fn generic_profile(xp: &XPlaneClient, icao: &str) -> Option<aircraft::AircraftProfile> {
+pub(crate) async fn generic_profile(
+    xp: &XPlaneClient,
+    icao: &str,
+) -> Option<aircraft::AircraftProfile> {
     let rel = xp
         .get_string("sim/aircraft/view/acf_relative_path")
         .await

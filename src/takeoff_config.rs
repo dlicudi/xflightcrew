@@ -188,7 +188,10 @@ async fn speedbrake_down(xp: &dyn XPlane, armed_only: bool) -> Option<bool> {
     match xp.get_float(SPEEDBRAKE).await {
         Ok(at) if at < -0.25 || (!armed_only && at > 0.05) => Some(
             xp.set_float(SPEEDBRAKE, 0.0).await.is_ok()
-                && xp.get_float(SPEEDBRAKE).await.is_ok_and(|v| v.abs() <= 0.05),
+                && xp
+                    .get_float(SPEEDBRAKE)
+                    .await
+                    .is_ok_and(|v| v.abs() <= 0.05),
         ),
         Ok(_) => None,
         Err(_) => Some(false),
@@ -433,7 +436,10 @@ mod tests {
         publish(None);
         let xp = FakeXPlane::with_reads(&[(SPEEDBRAKE, -0.5)]);
         after_liftoff(&xp).await;
-        assert!(!xp.wrote(SPEEDBRAKE), "a silent airframe has no lever of ours");
+        assert!(
+            !xp.wrote(SPEEDBRAKE),
+            "a silent airframe has no lever of ours"
+        );
     }
 
     /// With nothing armed, a reject at speed raises the lever; a stop from a

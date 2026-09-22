@@ -127,6 +127,11 @@ static int g_opt_voice = -1;
 static XPLMDataRef g_opt_voice_dref = nullptr;
 static int ReadOptVoice(void*) { return g_opt_voice; }
 static void WriteOptVoice(void*, int v) { g_opt_voice = v; }
+// The cabin crew's pick from the same roster.
+static int g_opt_cabin_voice = -1;
+static XPLMDataRef g_opt_cabin_voice_dref = nullptr;
+static int ReadOptCabinVoice(void*) { return g_opt_cabin_voice; }
+static void WriteOptCabinVoice(void*, int v) { g_opt_cabin_voice = v; }
 static struct { char buf[4096]; int len; } g_voice_list = {{0}, 0};
 static XPLMDataRef g_voice_list_dref = nullptr;
 static int ReadVoiceList(void*, void* out, int offset, int max) {
@@ -174,6 +179,9 @@ static TextRef g_coach = {{0}, 0};
 // (full auto stage, autoland phase, taxi governor...). Marker byte + one line
 // per active manager, primary first as "NAME|stage".
 static TextRef g_auto = {{0}, 0};
+// The plan's side of the load sheet, for the Route tab:
+// "ORIGIN|DEST|block_kg|payload_kg|max_tow_kg|pax|unit". Empty = no plan.
+static TextRef g_loadsheet = {{0}, 0};
 
 static XPLMDataRef g_phase_dref = nullptr;
 static XPLMDataRef g_heard_dref = nullptr;
@@ -186,6 +194,7 @@ static XPLMDataRef g_radio_dref = nullptr;
 static XPLMDataRef g_atc_dref = nullptr;
 static XPLMDataRef g_coach_dref = nullptr;
 static XPLMDataRef g_auto_dref = nullptr;
+static XPLMDataRef g_loadsheet_dref = nullptr;
 // COM1 active frequency (integer kHz despite the sim's `hz` name) — read for
 // the ATC tab's tuned highlight, written by its click-to-tune.
 static XPLMDataRef g_com1_dref = nullptr;
@@ -790,6 +799,10 @@ static float TaxiAssistLoop(float, float, int, void*) {
 static void WriteStrip(void*, void* in, int offset, int len) {
     StoreText(&g_strip, in, offset, len);
 }
+// The load sheet feed — refreshed like the strip, not logged.
+static void WriteLoadSheet(void*, void* in, int offset, int len) {
+    StoreText(&g_loadsheet, in, offset, len);
+}
 // Radio row — refreshed continuously like the strip, not logged.
 static void WriteRadio(void*, void* in, int offset, int len) {
     StoreText(&g_radio, in, offset, len);
@@ -972,6 +985,10 @@ void start() {
         "xcopilot/opt/voice", xplmType_Int, 1,
         ReadOptVoice, WriteOptVoice, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    g_opt_cabin_voice_dref = XPLMRegisterDataAccessor(
+        "xcopilot/opt/cabin_voice", xplmType_Int, 1,
+        ReadOptCabinVoice, WriteOptCabinVoice, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
     g_opt_mode_dref = XPLMRegisterDataAccessor(
         "xcopilot/opt/mode", xplmType_Int, 1,
         ReadOptMode, WriteOptMode, nullptr, nullptr, nullptr, nullptr,
@@ -1004,6 +1021,10 @@ void start() {
         "xcopilot/status/auto", xplmType_Data, 1,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr, ReadText, WriteAuto, &g_auto, &g_auto);
+    g_loadsheet_dref = XPLMRegisterDataAccessor(
+        "xcopilot/status/loadsheet", xplmType_Data, 1,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, ReadText, WriteLoadSheet, &g_loadsheet, &g_loadsheet);
     g_opt_ui_scale_dref = XPLMRegisterDataAccessor(
         "xcopilot/opt/ui_scale", xplmType_Int, 1,
         ReadOptUiScale, WriteOptUiScale, nullptr, nullptr, nullptr, nullptr,
@@ -1141,6 +1162,7 @@ void stop_first() {
     if (g_steer_brake_r_dref) { XPLMUnregisterDataAccessor(g_steer_brake_r_dref); g_steer_brake_r_dref = nullptr; }
     if (g_typed_dref) { XPLMUnregisterDataAccessor(g_typed_dref); g_typed_dref = nullptr; }
     if (g_opt_ui_scale_dref) { XPLMUnregisterDataAccessor(g_opt_ui_scale_dref); g_opt_ui_scale_dref = nullptr; }
+    if (g_loadsheet_dref) { XPLMUnregisterDataAccessor(g_loadsheet_dref); g_loadsheet_dref = nullptr; }
     if (g_auto_dref) { XPLMUnregisterDataAccessor(g_auto_dref); g_auto_dref = nullptr; }
     if (g_coach_dref) { XPLMUnregisterDataAccessor(g_coach_dref); g_coach_dref = nullptr; }
     if (g_atc_dref) { XPLMUnregisterDataAccessor(g_atc_dref); g_atc_dref = nullptr; }
@@ -1153,6 +1175,7 @@ void stop_rest() {
     if (g_opt_cabin_dref) { XPLMUnregisterDataAccessor(g_opt_cabin_dref); g_opt_cabin_dref = nullptr; }
     if (g_opt_mode_dref) { XPLMUnregisterDataAccessor(g_opt_mode_dref); g_opt_mode_dref = nullptr; }
     if (g_opt_voice_dref) { XPLMUnregisterDataAccessor(g_opt_voice_dref); g_opt_voice_dref = nullptr; }
+    if (g_opt_cabin_voice_dref) { XPLMUnregisterDataAccessor(g_opt_cabin_voice_dref); g_opt_cabin_voice_dref = nullptr; }
     if (g_opt_mute_dref) { XPLMUnregisterDataAccessor(g_opt_mute_dref); g_opt_mute_dref = nullptr; }
     if (g_opt_tone_dref) { XPLMUnregisterDataAccessor(g_opt_tone_dref); g_opt_tone_dref = nullptr; }
     if (g_opt_snap_dref) { XPLMUnregisterDataAccessor(g_opt_snap_dref); g_opt_snap_dref = nullptr; }
@@ -1186,6 +1209,7 @@ const TextRef& coach() { return g_coach; }
 bool coach_urgent() { return g_coach_urgent; }
 char coach_group() { return g_coach_group; }
 const TextRef& auto_status() { return g_auto; }
+const TextRef& load_sheet() { return g_loadsheet; }
 bool auto_active() { return g_auto_active; }
 const std::vector<AtcField>& atc_fields() { return g_atc_fields; }
 
@@ -1214,6 +1238,8 @@ void set_typed(const char* text) {
 }
 int opt_voice() { return g_opt_voice; }
 void set_opt_voice(int v) { g_opt_voice = v; }
+int opt_cabin_voice() { return g_opt_cabin_voice; }
+void set_opt_cabin_voice(int v) { g_opt_cabin_voice = v; }
 const char* voice_list() { return g_voice_list.buf; }
 int voice_list_len() { return g_voice_list.len; }
 

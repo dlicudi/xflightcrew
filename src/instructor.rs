@@ -59,6 +59,24 @@ pub const TURN_OUT_BANK_DEG: f64 = 10.0;
 pub const FINAL_AGL_FT: f64 = 800.0;
 /// A touchdown sinking faster than this is "firm"; drift past this is drift.
 pub const FIRM_TOUCHDOWN_FPM: f64 = 300.0;
+/// The touchdown's sink is the steepest seen this long before the ground
+/// flag, not the last sample: at the monitor's 1 Hz the last "airborne"
+/// sample can already be on the oleos (LFPG 09R, 2026-09-22: -690 at 12 ft,
+/// -221 one sample later with the flag still clear, -672 by the sim's own
+/// report, and the debrief said 221).
+pub const TOUCHDOWN_WINDOW_S: f64 = 2.5;
+
+/// The sink at the wheels from `recent` airborne samples `(t_s, vsi_fpm)`
+/// and the first ground sample: the steepest inside [`TOUCHDOWN_WINDOW_S`]
+/// of it, the ground sample included (the oleos have eaten part of it by
+/// then; LXGB 27, 2026-09-14: -309 in the air, -156 on the ground).
+pub fn touchdown_sink_fpm(recent: &[(f64, f64)], t_ground_s: f64, ground_vsi_fpm: f64) -> f64 {
+    recent
+        .iter()
+        .filter(|(t, _)| t_ground_s - *t <= TOUCHDOWN_WINDOW_S)
+        .map(|(_, v)| *v)
+        .fold(ground_vsi_fpm, f64::min)
+}
 pub const DRIFT_DEG: f64 = 5.0;
 /// Pattern altitude is judged this close to it (the upwind and the descent
 /// on base are not the pattern altitude).
@@ -348,7 +366,11 @@ impl Refs {
         Refs {
             vy_kts: vy,
             vr_kts: r.and_then(|r| r.vr_kts),
-            taxi_kts: p.taxi.as_ref().and_then(|t| t.kts).unwrap_or(DEFAULT_TAXI_KTS),
+            taxi_kts: p
+                .taxi
+                .as_ref()
+                .and_then(|t| t.kts)
+                .unwrap_or(DEFAULT_TAXI_KTS),
             approach_kts: approach,
             cruise_ias_kts: r.and_then(|r| r.cruise_ias_kts),
             va_kts: r.and_then(|r| r.va_kts),
@@ -449,7 +471,7 @@ impl Task {
                     hdg_deg: hdg,
                     ias_kts: Some(round_to(entry.ias_kts, 5.0)),
                     bank_deg: None,
-                ..Targets::default()
+                    ..Targets::default()
                 }
             }
             Task::SteepTurns => {
@@ -479,7 +501,7 @@ impl Task {
                     hdg_deg: None,
                     ias_kts: refs.pattern_kts.map(|k| k.round()),
                     bank_deg: None,
-                ..Targets::default()
+                    ..Targets::default()
                 }
             }
             Task::Landing => Targets {
@@ -549,7 +571,10 @@ impl Task {
         }
         let mut std: Vec<String> = Vec::new();
         if self == Task::Taxi {
-            std.push(format!("no more than {:.0} knots over the pace", s.ias_plus));
+            std.push(format!(
+                "no more than {:.0} knots over the pace",
+                s.ias_plus
+            ));
         }
         if let Some(a) = s.alt_ft {
             std.push(format!("altitude within {a:.0} feet"));
@@ -818,7 +843,11 @@ impl AxisGrade {
             return format!("{}: not judged.", cap_first(self.axis.name()));
         }
         if self.pass {
-            format!("{}: {}, within standards.", cap_first(self.axis.name()), self.worst_words())
+            format!(
+                "{}: {}, within standards.",
+                cap_first(self.axis.name()),
+                self.worst_words()
+            )
         } else {
             format!(
                 "{}: {}, outside for {:.0} seconds.",
@@ -955,6 +984,9 @@ pub struct Scorer {
     /// The task itself went wrong (levelled at the wrong altitude, a firm
     /// or drifting touchdown): a fail whatever the axes say.
     task_failed: bool,
+    /// Airborne `(t_s, vsi_fpm)` inside the touchdown window, for
+    /// [`touchdown_sink_fpm`].
+    sink_window: Vec<(f64, f64)>,
 }
 
 impl Scorer {
@@ -1003,6 +1035,7 @@ impl Scorer {
             notes: Vec::new(),
             complete: false,
             task_failed: false,
+            sink_window: Vec::new(),
         }
     }
 
@@ -1012,7 +1045,6 @@ impl Scorer {
         self.landing_kts = kts.map(f64::round);
         self
     }
-
 
     pub fn task(&self) -> Task {
         self.task
@@ -1085,20 +1117,26 @@ impl Scorer {
             Task::Taxi => {
                 let gs = s.gs_kts.abs();
                 if gs > TAXI_MOVING_KTS {
-                    judge(&mut self.pace, gs - self.targets.pace_kts.unwrap_or(gs), &mut lines);
+                    judge(
+                        &mut self.pace,
+                        gs - self.targets.pace_kts.unwrap_or(gs),
+                        &mut lines,
+                    );
                 }
                 self.moved_m += gs * KTS_TO_MPS * dt;
                 if s.on_ground && gs > ROLL_KTS * 2.0 {
                     // Straight onto the runway and rolling: no hold-short.
                     self.complete = true;
                     self.task_failed = true;
-                    self.notes.push("Rolled without stopping at the hold line.".into());
+                    self.notes
+                        .push("Rolled without stopping at the hold line.".into());
                     lines.push("You never stopped at the hold line.".into());
                 } else if self.moved_m >= TAXI_MIN_M && gs < 0.5 {
                     self.stopped_s += dt;
                     if self.stopped_s >= TAXI_STOP_S {
                         self.complete = true;
-                        self.notes.push(format!("Taxied {:.0} metres and held.", self.moved_m));
+                        self.notes
+                            .push(format!("Taxied {:.0} metres and held.", self.moved_m));
                         lines.push("Stopped. Holding short, I take it.".into());
                     }
                 } else {
@@ -1115,7 +1153,8 @@ impl Scorer {
                     }
                     return lines;
                 }
-                let judging_hdg = (s.on_ground && gs > ROLL_JUDGE_KTS) || (!s.on_ground && s.agl_ft < TAKEOFF_TOP_AGL_FT);
+                let judging_hdg = (s.on_ground && gs > ROLL_JUDGE_KTS)
+                    || (!s.on_ground && s.agl_ft < TAKEOFF_TOP_AGL_FT);
                 if judging_hdg {
                     judge(&mut self.hdg, hdg_dev(self.targets.hdg_deg), &mut lines);
                 }
@@ -1136,7 +1175,11 @@ impl Scorer {
                     lines.push("Airborne.".into());
                 }
                 if self.lifted && s.agl_ft > CLIMB_JUDGE_AGL_FT {
-                    judge(&mut self.ias, s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts), &mut lines);
+                    judge(
+                        &mut self.ias,
+                        s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts),
+                        &mut lines,
+                    );
                 }
                 if self.lifted && s.agl_ft >= TAKEOFF_TOP_AGL_FT {
                     self.complete = true;
@@ -1144,9 +1187,17 @@ impl Scorer {
                 }
             }
             Task::StraightAndLevel | Task::SlowFlight => {
-                judge(&mut self.alt, s.alt_ft - self.targets.alt_ft.unwrap_or(s.alt_ft), &mut lines);
+                judge(
+                    &mut self.alt,
+                    s.alt_ft - self.targets.alt_ft.unwrap_or(s.alt_ft),
+                    &mut lines,
+                );
                 judge(&mut self.hdg, hdg_dev(self.targets.hdg_deg), &mut lines);
-                judge(&mut self.ias, s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts), &mut lines);
+                judge(
+                    &mut self.ias,
+                    s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts),
+                    &mut lines,
+                );
                 if self.task == Task::SlowFlight {
                     judge(&mut self.bank, s.bank_deg.abs(), &mut lines);
                 }
@@ -1162,11 +1213,19 @@ impl Scorer {
             }
             Task::Climb | Task::Descent => {
                 judge(&mut self.hdg, hdg_dev(self.targets.hdg_deg), &mut lines);
-                let moving = if self.task == Task::Climb { climbing } else { descending };
+                let moving = if self.task == Task::Climb {
+                    climbing
+                } else {
+                    descending
+                };
                 if moving {
                     self.level_s = 0.0;
                     self.level_wrong_s = 0.0;
-                    judge(&mut self.ias, s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts), &mut lines);
+                    judge(
+                        &mut self.ias,
+                        s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts),
+                        &mut lines,
+                    );
                 } else if level && self.elapsed_s() > LEVEL_OFF_HOLD_S {
                     let target = self.targets.alt_ft.unwrap_or(s.alt_ft);
                     let dev = s.alt_ft - target;
@@ -1203,14 +1262,26 @@ impl Scorer {
                 }
             }
             Task::SteepTurns => {
-                judge(&mut self.alt, s.alt_ft - self.targets.alt_ft.unwrap_or(s.alt_ft), &mut lines);
-                judge(&mut self.ias, s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts), &mut lines);
+                judge(
+                    &mut self.alt,
+                    s.alt_ft - self.targets.alt_ft.unwrap_or(s.alt_ft),
+                    &mut lines,
+                );
+                judge(
+                    &mut self.ias,
+                    s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts),
+                    &mut lines,
+                );
                 let bank = s.bank_deg.abs();
                 if self.in_turn {
                     // The bank is judged in the turn; the roll-out itself
                     // is judged by its heading, not as a shallow bank.
                     if bank >= TURN_OUT_BANK_DEG {
-                        judge(&mut self.bank, bank - self.targets.bank_deg.unwrap_or(bank), &mut lines);
+                        judge(
+                            &mut self.bank,
+                            bank - self.targets.bank_deg.unwrap_or(bank),
+                            &mut lines,
+                        );
                     }
                     if bank < TURN_OUT_BANK_DEG {
                         self.in_turn = false;
@@ -1250,7 +1321,11 @@ impl Scorer {
                     }
                     if level {
                         judge(&mut self.alt, s.alt_ft - tpa, &mut lines);
-                        judge(&mut self.ias, s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts), &mut lines);
+                        judge(
+                            &mut self.ias,
+                            s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts),
+                            &mut lines,
+                        );
                     }
                 }
                 self.landing_tick(s, &prev, &mut lines);
@@ -1265,6 +1340,11 @@ impl Scorer {
     /// The final and the touchdown, shared by the pattern and the landing.
     fn landing_tick(&mut self, s: &Sample, prev: &Sample, lines: &mut Vec<String>) {
         let dt = (s.t_s - prev.t_s).clamp(0.0, 5.0);
+        if !s.on_ground {
+            self.sink_window
+                .retain(|(t, _)| s.t_s - *t <= TOUCHDOWN_WINDOW_S);
+            self.sink_window.push((s.t_s, s.vsi_fpm));
+        }
         let on_final = !s.on_ground && s.agl_ft < FINAL_AGL_FT && s.vsi_fpm < -100.0;
         if on_final {
             // The pattern's speed axis is the pattern speed; on final the
@@ -1286,9 +1366,13 @@ impl Scorer {
             }
         }
         if s.on_ground && !prev.on_ground {
-            let sink = prev.vsi_fpm.abs();
+            let sink = touchdown_sink_fpm(&self.sink_window, s.t_s, s.vsi_fpm).abs();
             let drift = s.track_deg.map(|tr| wrap180(s.hdg_deg - tr).abs());
-            let mut note = format!("Touchdown at {:.0} feet per minute, {:.0} knots", sink.round(), prev.ias_kts.round());
+            let mut note = format!(
+                "Touchdown at {:.0} feet per minute, {:.0} knots",
+                sink.round(),
+                prev.ias_kts.round()
+            );
             if let Some(d) = drift {
                 if d > DRIFT_DEG {
                     note.push_str(&format!(", {d:.0} degrees of drift"));
@@ -1337,8 +1421,12 @@ impl Scorer {
 enum Stage {
     Idle,
     /// Briefed, waiting for "begin".
-    Briefed { task: Task },
-    Flying { scorer: Box<Scorer> },
+    Briefed {
+        task: Task,
+    },
+    Flying {
+        scorer: Box<Scorer>,
+    },
     /// The full flight from the ramp, step by step.
     Syllabus(Box<Syllabus>),
 }
@@ -1495,7 +1583,9 @@ pub fn request(text: &str) -> Option<Request> {
     {
         return Some(Request::Interim);
     }
-    if (has("standards") || has("the numbers") || has("the brief")) && (has("again") || has("repeat") || has("say") || has("what are")) {
+    if (has("standards") || has("the numbers") || has("the brief"))
+        && (has("again") || has("repeat") || has("say") || has("what are"))
+    {
         return Some(Request::Standards);
     }
     if teaching {
@@ -1519,8 +1609,25 @@ pub fn request(text: &str) -> Option<Request> {
     let briefed = matches!(lesson().stage, Stage::Briefed { .. });
     if briefed {
         const BEGIN: &[&str] = &[
-            "begin", "beginning", "ready", "go", "ahead", "starting", "start", "now", "lets", "ok",
-            "okay", "im", "i", "am", "the", "lesson", "task", "yes", "roger",
+            "begin",
+            "beginning",
+            "ready",
+            "go",
+            "ahead",
+            "starting",
+            "start",
+            "now",
+            "lets",
+            "ok",
+            "okay",
+            "im",
+            "i",
+            "am",
+            "the",
+            "lesson",
+            "task",
+            "yes",
+            "roger",
         ];
         let any_begin = has_word("begin")
             || has_word("beginning")
@@ -1555,7 +1662,10 @@ pub fn handle(req: Request, now_s: f64) -> String {
         Request::Menu => menu(),
         Request::SetLevel(level) => {
             l.level = level;
-            crate::blackbox::record("instructor", json!({ "event": "level", "level": level.name() }));
+            crate::blackbox::record(
+                "instructor",
+                json!({ "event": "level", "level": level.name() }),
+            );
             format!("{} standards from here on.", cap_first(level.name()))
         }
         Request::FullFlight => {
@@ -1573,7 +1683,8 @@ pub fn handle(req: Request, now_s: f64) -> String {
                 return "I can't see the aircraft yet. Give me a moment and ask again.".into();
             };
             if !s.on_ground {
-                return "The full flight starts on the ramp. Land first, or pick an air task.".into();
+                return "The full flight starts on the ramp. Land first, or pick an air task."
+                    .into();
             }
             let level = l.level;
             let syllabus = Syllabus::new(&s, l.refs.clone(), level);
@@ -1606,7 +1717,12 @@ pub fn handle(req: Request, now_s: f64) -> String {
                 return format!("For {}, {why}.", task.name());
             }
             let targets = task.assign(&s, &l.refs, l.level);
-            if targets.ias_kts.is_none() && matches!(task, Task::Climb | Task::SlowFlight | Task::Landing | Task::Pattern) {
+            if targets.ias_kts.is_none()
+                && matches!(
+                    task,
+                    Task::Climb | Task::SlowFlight | Task::Landing | Task::Pattern
+                )
+            {
                 return format!(
                     "I have no book speed for {} on this airframe, so I can't grade it. Pick another task.",
                     task.name()
@@ -1639,11 +1755,14 @@ pub fn handle(req: Request, now_s: f64) -> String {
             // altitude for the whole task.
             let level = l.level;
             let targets = task.assign(&s, &l.refs, level);
-            let mut scorer = Scorer::new(task, level, targets).with_landing_speed(l.refs.approach_kts);
+            let mut scorer =
+                Scorer::new(task, level, targets).with_landing_speed(l.refs.approach_kts);
             let mut first = s;
             first.t_s = now_s;
             scorer.tick(&first);
-            l.stage = Stage::Flying { scorer: Box::new(scorer) };
+            l.stage = Stage::Flying {
+                scorer: Box::new(scorer),
+            };
             crate::blackbox::record(
                 "instructor",
                 json!({
@@ -1654,7 +1773,15 @@ pub fn handle(req: Request, now_s: f64) -> String {
             let mut line = String::from("Your aircraft. Go.");
             if let Some(a) = targets.alt_ft {
                 if task == Task::Climb || task == Task::Descent {
-                    line = format!("Your aircraft. {} to {}. Go.", if task == Task::Climb { "Climb" } else { "Descend" }, feet(a));
+                    line = format!(
+                        "Your aircraft. {} to {}. Go.",
+                        if task == Task::Climb {
+                            "Climb"
+                        } else {
+                            "Descend"
+                        },
+                        feet(a)
+                    );
                 }
             }
             line
@@ -1683,7 +1810,10 @@ pub fn handle(req: Request, now_s: f64) -> String {
             match stage {
                 Stage::Idle => "No lesson running.".into(),
                 Stage::Briefed { task } => {
-                    crate::blackbox::record("instructor", json!({ "event": "end", "task": task.key(), "reason": "cancelled" }));
+                    crate::blackbox::record(
+                        "instructor",
+                        json!({ "event": "end", "task": task.key(), "reason": "cancelled" }),
+                    );
                     "Lesson cancelled.".into()
                 }
                 Stage::Flying { scorer } => {
@@ -1703,7 +1833,10 @@ pub fn handle(req: Request, now_s: f64) -> String {
                             json!({ "event": "end", "reason": "pilot", "grade": g.json() }),
                         );
                     }
-                    crate::blackbox::record("instructor", json!({ "event": "syllabus_end", "reason": "pilot" }));
+                    crate::blackbox::record(
+                        "instructor",
+                        json!({ "event": "syllabus_end", "reason": "pilot" }),
+                    );
                     format!("Lesson over. {}", sy.summary())
                 }
             }
@@ -1734,7 +1867,12 @@ impl SyllabusIo for FlowIo<'_> {
         crate::flow::find_section(key)
     }
     fn start_list(&mut self, idx: usize) -> bool {
-        crate::flow::start(idx, crate::flow::Flavour::Instruct, self.config.clone(), self.voice.clone())
+        crate::flow::start(
+            idx,
+            crate::flow::Flavour::Instruct,
+            self.config.clone(),
+            self.voice.clone(),
+        )
     }
     fn list_running(&self) -> bool {
         crate::flow::ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
@@ -1773,7 +1911,10 @@ pub fn tick_with(s: Sample, io: &mut dyn SyllabusIo) -> Vec<String> {
     if let Stage::Syllabus(sy) = &mut l.stage {
         let (lines, done) = sy.tick(&s, io);
         if done {
-            crate::blackbox::record("instructor", json!({ "event": "syllabus_end", "reason": "complete" }));
+            crate::blackbox::record(
+                "instructor",
+                json!({ "event": "syllabus_end", "reason": "complete" }),
+            );
             l.stage = Stage::Idle;
         }
         return lines;
@@ -1805,7 +1946,10 @@ pub fn tick_with(s: Sample, io: &mut dyn SyllabusIo) -> Vec<String> {
 /// ticks and the main loop's "begin" must share one clock.
 pub fn clock_s() -> f64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
 }
 
 /// End whatever lesson stands, without a debrief (the mode changed under
@@ -1836,7 +1980,9 @@ pub fn status() -> Option<String> {
     let l = lesson();
     match &l.stage {
         Stage::Idle => None,
-        Stage::Briefed { task } => Some(format!("lesson: {}, briefed", task.key().replace('_', " "))),
+        Stage::Briefed { task } => {
+            Some(format!("lesson: {}, briefed", task.key().replace('_', " ")))
+        }
         Stage::Flying { scorer } => Some(format!(
             "lesson: {}, {:.0} s",
             scorer.task().key().replace('_', " "),
@@ -1871,7 +2017,11 @@ pub fn take_target(tool: &str, args: &Value) -> Option<String> {
             if k <= 0.0 {
                 return None;
             }
-            (Axis::Airspeed, k, format!("{} it is.", cap_first(&knots(k))))
+            (
+                Axis::Airspeed,
+                k,
+                format!("{} it is.", cap_first(&knots(k))),
+            )
         }
         _ => return None,
     };
@@ -1934,18 +2084,40 @@ impl Step {
 }
 
 const STEPS: &[Step] = &[
-    Step::List { name: "preflight", keys: &["preflight", "cockpit preparation", "cold and dark"] },
-    Step::List { name: "before start", keys: &["before starting engine", "before engine start", "before start"] },
-    Step::List { name: "engine start", keys: &["starting engine", "engine start"] },
+    Step::List {
+        name: "preflight",
+        keys: &["preflight", "cockpit preparation", "cold and dark"],
+    },
+    Step::List {
+        name: "before start",
+        keys: &[
+            "before starting engine",
+            "before engine start",
+            "before start",
+        ],
+    },
+    Step::List {
+        name: "engine start",
+        keys: &["starting engine", "engine start"],
+    },
     Step::WaitEngine,
-    Step::List { name: "before taxi", keys: &["before taxi", "before taxiing"] },
+    Step::List {
+        name: "before taxi",
+        keys: &["before taxi", "before taxiing"],
+    },
     Step::Fly(Task::Taxi),
-    Step::List { name: "before takeoff", keys: &["before takeoff", "holding point"] },
+    Step::List {
+        name: "before takeoff",
+        keys: &["before takeoff", "holding point"],
+    },
     Step::Fly(Task::Takeoff),
     Step::Enroute,
     Step::Fly(Task::Landing),
     Step::WaitStopped,
-    Step::List { name: "shutdown", keys: &["engine shutdown", "shutdown", "parking", "securing"] },
+    Step::List {
+        name: "shutdown",
+        keys: &["engine shutdown", "shutdown", "parking", "securing"],
+    },
 ];
 
 /// The full flight from the ramp: the ground lists read and watched, the
@@ -1981,7 +2153,15 @@ impl Syllabus {
         let i = if s.engine_running {
             STEPS
                 .iter()
-                .position(|st| matches!(st, Step::List { name: "before taxi", .. }))
+                .position(|st| {
+                    matches!(
+                        st,
+                        Step::List {
+                            name: "before taxi",
+                            ..
+                        }
+                    )
+                })
                 .unwrap_or(0)
         } else {
             0
@@ -2023,8 +2203,12 @@ impl Syllabus {
     fn interim(&self) -> String {
         match (self.step(), &self.scorer) {
             (Some(Step::Fly(_)), Some(sc)) => sc.grade().spoken(),
-            (Some(Step::List { name, .. }), _) => format!("We're on the {name} checklist. {}", self.summary()),
-            (Some(Step::Enroute), _) => format!("Your flight; the landing's next. {}", self.summary()),
+            (Some(Step::List { name, .. }), _) => {
+                format!("We're on the {name} checklist. {}", self.summary())
+            }
+            (Some(Step::Enroute), _) => {
+                format!("Your flight; the landing's next. {}", self.summary())
+            }
             (Some(Step::WaitEngine), _) => "Waiting for the engine.".into(),
             (Some(Step::WaitStopped), _) => "Taxi in and stop; the shutdown list is next.".into(),
             _ => self.summary(),
@@ -2111,9 +2295,13 @@ impl Syllabus {
                 Step::List { name, keys } => {
                     self.list_idx = keys.iter().find_map(|k| io.find_list(k));
                     match self.list_idx {
-                        Some(_) => lines.push(format!("{} checklist. I'll read, you do.", cap_first(name))),
+                        Some(_) => {
+                            lines.push(format!("{} checklist. I'll read, you do.", cap_first(name)))
+                        }
                         None => {
-                            lines.push(format!("No {name} list on this airframe. Do it from memory and carry on."));
+                            lines.push(format!(
+                                "No {name} list on this airframe. Do it from memory and carry on."
+                            ));
                             self.advance();
                             continue;
                         }
@@ -2132,7 +2320,10 @@ impl Syllabus {
                             "alt": targets.alt_ft, "hdg": targets.hdg_deg, "ias": targets.ias_kts, "pace": targets.pace_kts,
                         }),
                     );
-                    lines.push(task.brief(&targets, self.level).replace(" Say begin when you're ready.", ""));
+                    lines.push(
+                        task.brief(&targets, self.level)
+                            .replace(" Say begin when you're ready.", ""),
+                    );
                     self.scorer = Some(Box::new(sc));
                 }
                 Step::Enroute => {
@@ -2164,7 +2355,10 @@ impl Syllabus {
                 }
                 if self.list_seen_running {
                     self.lists_done.push(name.to_string());
-                    crate::blackbox::record("instructor", json!({ "event": "list_done", "name": name }));
+                    crate::blackbox::record(
+                        "instructor",
+                        json!({ "event": "list_done", "name": name }),
+                    );
                     self.advance();
                 }
             }
@@ -2229,7 +2423,11 @@ impl Syllabus {
 /// touchdown. Targets are captured at each segment's entry (rounded the
 /// way the brief would round them); the airframe's book speeds come from
 /// the profile when one is named. Lines for the debrief.
-pub fn grade_flight(states: &[&Value], profile: Option<&AircraftProfile>, level: Level) -> Vec<String> {
+pub fn grade_flight(
+    states: &[&Value],
+    profile: Option<&AircraftProfile>,
+    level: Level,
+) -> Vec<String> {
     let refs = profile.map(Refs::from_profile).unwrap_or_default();
     let f = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64);
     let samples: Vec<Sample> = states
@@ -2327,7 +2525,9 @@ pub fn grade_flight(states: &[&Value], profile: Option<&AircraftProfile>, level:
                 let mut j = i;
                 while j + 1 < b {
                     let dt = (samples[j + 1].t_s - samples[j].t_s).max(0.1);
-                    if wrap180(samples[j + 1].hdg_deg - samples[j].hdg_deg).abs() / dt < OFFLINE_TURN_RATE_DPS {
+                    if wrap180(samples[j + 1].hdg_deg - samples[j].hdg_deg).abs() / dt
+                        < OFFLINE_TURN_RATE_DPS
+                    {
                         break;
                     }
                     j += 1;
@@ -2432,12 +2632,20 @@ pub fn grade_flight(states: &[&Value], profile: Option<&AircraftProfile>, level:
                         ..Targets::default()
                     },
                 );
-                let from = (0..i).rev().find(|&j| samples[j].on_ground || samples[j].agl_ft > FINAL_AGL_FT).map(|j| j + 1).unwrap_or(0);
+                let from = (0..i)
+                    .rev()
+                    .find(|&j| samples[j].on_ground || samples[j].agl_ft > FINAL_AGL_FT)
+                    .map(|j| j + 1)
+                    .unwrap_or(0);
                 for s in &samples[from..=i] {
                     scorer.tick(s);
                 }
                 let g = scorer.grade();
-                out.push(format!("{}Z final and landing: {}", hms(samples[i].t_s), g.written()));
+                out.push(format!(
+                    "{}Z final and landing: {}",
+                    hms(samples[i].t_s),
+                    g.written()
+                ));
             }
         }
     }
@@ -2466,17 +2674,41 @@ impl Scorer {
         };
         match self.task {
             Task::StraightAndLevel | Task::SteepTurns => {
-                judge(&mut self.alt, s.alt_ft - self.targets.alt_ft.unwrap_or(s.alt_ft));
-                judge(&mut self.ias, s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts));
+                judge(
+                    &mut self.alt,
+                    s.alt_ft - self.targets.alt_ft.unwrap_or(s.alt_ft),
+                );
+                judge(
+                    &mut self.ias,
+                    s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts),
+                );
                 if self.task == Task::StraightAndLevel {
-                    judge(&mut self.hdg, self.targets.hdg_deg.map(|h| wrap180(s.hdg_deg - h)).unwrap_or(0.0));
+                    judge(
+                        &mut self.hdg,
+                        self.targets
+                            .hdg_deg
+                            .map(|h| wrap180(s.hdg_deg - h))
+                            .unwrap_or(0.0),
+                    );
                 } else {
-                    judge(&mut self.bank, s.bank_deg.abs() - self.targets.bank_deg.unwrap_or(45.0));
+                    judge(
+                        &mut self.bank,
+                        s.bank_deg.abs() - self.targets.bank_deg.unwrap_or(45.0),
+                    );
                 }
             }
             Task::Climb | Task::Descent => {
-                judge(&mut self.hdg, self.targets.hdg_deg.map(|h| wrap180(s.hdg_deg - h)).unwrap_or(0.0));
-                judge(&mut self.ias, s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts));
+                judge(
+                    &mut self.hdg,
+                    self.targets
+                        .hdg_deg
+                        .map(|h| wrap180(s.hdg_deg - h))
+                        .unwrap_or(0.0),
+                );
+                judge(
+                    &mut self.ias,
+                    s.ias_kts - self.targets.ias_kts.unwrap_or(s.ias_kts),
+                );
             }
             _ => {}
         }
@@ -2515,7 +2747,12 @@ fn median(it: impl Iterator<Item = f64>) -> f64 {
 
 fn hms(t: f64) -> String {
     let secs = t.max(0.0) as u64 % 86_400;
-    format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    )
 }
 
 fn mins(s: f64) -> String {
@@ -2571,7 +2808,11 @@ mod tests {
         assert_eq!(c.alt_ft, Some(4500.0), "next 500 at least 1,000 up");
         assert_eq!(c.ias_kts, Some(74.0), "Vy");
         let d = Task::Descent.assign(&entry, &refs172(), Level::Private);
-        assert_eq!(d.alt_ft, Some(2000.0), "1,000 down to a 500, and ground plus 1,500 is 2,000 too");
+        assert_eq!(
+            d.alt_ft,
+            Some(2000.0),
+            "1,000 down to a 500, and ground plus 1,500 is 2,000 too"
+        );
         assert_eq!(d.ias_kts, Some(105.0), "the entry speed, rounded");
         let brief = Task::Climb.brief(&c, Level::Private);
         assert!(brief.contains("4,500 feet"), "{brief}");
@@ -2603,14 +2844,27 @@ mod tests {
         let mut sc = Scorer::new(Task::StraightAndLevel, Level::Private, t);
         let mut lines = Vec::new();
         for i in 0..=125 {
-            let s = air(i as f64, 3500.0 + (i % 5) as f64 * 8.0, 270.0 + ((i % 3) as f64 - 1.0) * 2.0, 108.0 + (i % 2) as f64 * 3.0);
+            let s = air(
+                i as f64,
+                3500.0 + (i % 5) as f64 * 8.0,
+                270.0 + ((i % 3) as f64 - 1.0) * 2.0,
+                108.0 + (i % 2) as f64 * 3.0,
+            );
             lines.extend(sc.tick(&s));
         }
         assert!(sc.complete());
-        assert_eq!(lines, vec!["That's time.".to_string()], "no excursion narrated");
+        assert_eq!(
+            lines,
+            vec!["That's time.".to_string()],
+            "no excursion narrated"
+        );
         let g = sc.grade();
         assert!(g.pass, "{}", g.spoken());
-        assert!(g.spoken().ends_with("That meets the standard."), "{}", g.spoken());
+        assert!(
+            g.spoken().ends_with("That meets the standard."),
+            "{}",
+            g.spoken()
+        );
     }
 
     #[test]
@@ -2626,7 +2880,11 @@ mod tests {
         let mut lines = Vec::new();
         for i in 0..40 {
             // 130 ft low from t=10 to t=25, then back.
-            let alt = if (10..25).contains(&i) { 3370.0 } else { 3500.0 };
+            let alt = if (10..25).contains(&i) {
+                3370.0
+            } else {
+                3500.0
+            };
             lines.extend(sc.tick(&air(i as f64, alt, 270.0, 108.0)));
         }
         assert_eq!(
@@ -2659,14 +2917,24 @@ mod tests {
             let alt = if i == 10 || i == 11 { 3610.0 } else { 3500.0 };
             sc.tick(&air(i as f64, alt, 270.0, 108.0));
         }
-        let alt = sc.grade().axes.into_iter().find(|a| a.axis == Axis::Altitude).unwrap();
+        let alt = sc
+            .grade()
+            .axes
+            .into_iter()
+            .find(|a| a.axis == Axis::Altitude)
+            .unwrap();
         assert!(alt.pass, "2 s outside, corrected promptly");
         let mut sc = Scorer::new(Task::StraightAndLevel, Level::Private, t);
         for i in 0..30 {
             let alt = if i == 10 { 3750.0 } else { 3500.0 };
             sc.tick(&air(i as f64, alt, 270.0, 108.0));
         }
-        let alt = sc.grade().axes.into_iter().find(|a| a.axis == Axis::Altitude).unwrap();
+        let alt = sc
+            .grade()
+            .axes
+            .into_iter()
+            .find(|a| a.axis == Axis::Altitude)
+            .unwrap();
         assert!(!alt.pass, "250 ft is gross however brief");
     }
 
@@ -2683,7 +2951,12 @@ mod tests {
         for i in 0..10 {
             sc.tick(&air(i as f64, 3500.0, 358.0, 108.0));
         }
-        let h = sc.grade().axes.into_iter().find(|a| a.axis == Axis::Heading).unwrap();
+        let h = sc
+            .grade()
+            .axes
+            .into_iter()
+            .find(|a| a.axis == Axis::Heading)
+            .unwrap();
         assert_eq!(h.worst, -7.0, "358 is 7 left of 005, not 353 right");
         assert!(h.pass);
     }
@@ -2714,12 +2987,23 @@ mod tests {
             t_s += 1.0;
         }
         assert!(sc.complete(), "{lines:?}");
-        assert!(lines.iter().any(|l| l == "Level. That completes the task."), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l == "Level. That completes the task."),
+            "{lines:?}"
+        );
         let g = sc.grade();
         assert!(g.pass, "{}", g.spoken());
         let ias = g.axes.iter().find(|a| a.axis == Axis::Airspeed).unwrap();
-        assert!(ias.judged_s > 60.0 && ias.judged_s < 100.0, "speed judged in the climb only: {}", ias.judged_s);
-        assert!(g.notes[0].starts_with("Levelled at 4,460 feet, 40 below"), "{:?}", g.notes);
+        assert!(
+            ias.judged_s > 60.0 && ias.judged_s < 100.0,
+            "speed judged in the climb only: {}",
+            ias.judged_s
+        );
+        assert!(
+            g.notes[0].starts_with("Levelled at 4,460 feet, 40 below"),
+            "{:?}",
+            g.notes
+        );
     }
 
     #[test]
@@ -2742,7 +3026,12 @@ mod tests {
             lines.extend(sc.tick(&air(i as f64, 4000.0, 270.0, 100.0)));
         }
         assert!(sc.complete());
-        assert!(lines.iter().any(|l| l.contains("levelled at 4,000 feet. The assignment was 4,500 feet")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("levelled at 4,000 feet. The assignment was 4,500 feet")),
+            "{lines:?}"
+        );
         assert!(!sc.grade().pass);
     }
 
@@ -2758,7 +3047,11 @@ mod tests {
         let mut sc = Scorer::new(Task::SteepTurns, Level::Private, t);
         let mut lines = Vec::new();
         let mut t_s = 0.0;
-        let turn = |sc: &mut Scorer, lines: &mut Vec<String>, t_s: &mut f64, sign: f64, rollout_hdg: f64| {
+        let turn = |sc: &mut Scorer,
+                    lines: &mut Vec<String>,
+                    t_s: &mut f64,
+                    sign: f64,
+                    rollout_hdg: f64| {
             for i in 0..30 {
                 let mut s = air(*t_s, 3500.0, 90.0 + sign * i as f64 * 12.0, 95.0);
                 s.bank_deg = sign * 45.0;
@@ -2771,7 +3064,10 @@ mod tests {
             }
         };
         turn(&mut sc, &mut lines, &mut t_s, 1.0, 94.0);
-        assert!(lines.iter().any(|l| l == "One. Now the other way."), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l == "One. Now the other way."),
+            "{lines:?}"
+        );
         turn(&mut sc, &mut lines, &mut t_s, -1.0, 82.0);
         assert!(sc.complete());
         let g = sc.grade();
@@ -2779,6 +3075,21 @@ mod tests {
         assert!(g.notes[0].contains("4 degrees right"), "{:?}", g.notes);
         assert!(g.notes[1].contains("8 degrees left"), "{:?}", g.notes);
         assert!(g.pass, "{}", g.spoken());
+    }
+
+    /// LFPG 09R, 2026-09-22, at the monitor's rate: -690 at 12 ft, then a
+    /// sample on the oleos at -221 with the flag still clear, then ground.
+    /// The wheels met the runway at 690, and the grade says so.
+    #[test]
+    fn the_touchdown_sink_is_the_steepest_in_the_window_not_the_last_sample() {
+        let recent = [(0.0, -772.0), (1.1, -750.0), (2.1, -690.0), (3.2, -221.0)];
+        assert_eq!(touchdown_sink_fpm(&recent, 4.3, -38.0), -690.0);
+        // Only the window counts: a steep rate five seconds up is the approach.
+        let recent = [(0.0, -900.0), (2.5, -300.0), (3.5, -250.0)];
+        assert_eq!(touchdown_sink_fpm(&recent, 4.5, -156.0), -300.0);
+        // The ground sample itself when it is the steepest on record.
+        assert_eq!(touchdown_sink_fpm(&[(4.0, -100.0)], 4.5, -180.0), -180.0);
+        assert_eq!(touchdown_sink_fpm(&[], 4.5, -180.0), -180.0);
     }
 
     #[test]
@@ -2805,7 +3116,11 @@ mod tests {
         lines.extend(sc.tick(&down));
         assert!(sc.complete());
         let g = sc.grade();
-        assert!(g.notes[0].starts_with("Touchdown at 500 feet per minute, 66 knots, no drift. Firm."), "{:?}", g.notes);
+        assert!(
+            g.notes[0].starts_with("Touchdown at 500 feet per minute, 66 knots, no drift. Firm."),
+            "{:?}",
+            g.notes
+        );
         assert!(!g.pass, "a firm arrival is not to standard");
         let ias = g.axes.iter().find(|a| a.axis == Axis::Airspeed).unwrap();
         assert!(ias.pass, "1 kt fast on final");
@@ -2815,17 +3130,38 @@ mod tests {
     fn requests_are_a_closed_vocabulary() {
         let _g = crate::mode::TEST_LOCK.lock().unwrap();
         lesson().stage = Stage::Idle;
-        assert_eq!(request("teach me steep turns"), Some(Request::Start(Task::SteepTurns)));
-        assert_eq!(request("let's practice slow flight"), Some(Request::Start(Task::SlowFlight)));
-        assert_eq!(request("lesson on the traffic pattern"), Some(Request::Start(Task::Pattern)));
-        assert_eq!(request("coach me through a normal landing"), Some(Request::Start(Task::Landing)));
-        assert_eq!(request("practice a constant airspeed climb"), Some(Request::Start(Task::Climb)));
-        assert_eq!(request("teach me straight and level"), Some(Request::Start(Task::StraightAndLevel)));
+        assert_eq!(
+            request("teach me steep turns"),
+            Some(Request::Start(Task::SteepTurns))
+        );
+        assert_eq!(
+            request("let's practice slow flight"),
+            Some(Request::Start(Task::SlowFlight))
+        );
+        assert_eq!(
+            request("lesson on the traffic pattern"),
+            Some(Request::Start(Task::Pattern))
+        );
+        assert_eq!(
+            request("coach me through a normal landing"),
+            Some(Request::Start(Task::Landing))
+        );
+        assert_eq!(
+            request("practice a constant airspeed climb"),
+            Some(Request::Start(Task::Climb))
+        );
+        assert_eq!(
+            request("teach me straight and level"),
+            Some(Request::Start(Task::StraightAndLevel))
+        );
         assert_eq!(request("teach me something"), Some(Request::Menu));
         assert_eq!(request("what can you teach"), Some(Request::Menu));
         assert_eq!(request("end the lesson"), Some(Request::End));
         assert_eq!(request("how am I doing?"), Some(Request::Interim));
-        assert_eq!(request("commercial standards please"), Some(Request::SetLevel(Level::Commercial)));
+        assert_eq!(
+            request("commercial standards please"),
+            Some(Request::SetLevel(Level::Commercial))
+        );
         assert_eq!(request("say the standards again"), Some(Request::Standards));
         // Commands and chatter are not lessons.
         assert_eq!(request("climb to four thousand"), None);
@@ -2846,13 +3182,25 @@ mod tests {
             l.level = Level::Private;
             l.latest = None;
         }
-        assert!(handle(Request::Start(Task::StraightAndLevel), 0.0).contains("can't see the aircraft"));
+        assert!(
+            handle(Request::Start(Task::StraightAndLevel), 0.0).contains("can't see the aircraft")
+        );
         tick(air(0.0, 3480.0, 271.0, 106.0));
         let brief = handle(Request::Start(Task::StraightAndLevel), 0.0);
-        assert!(brief.starts_with("Straight and level. Hold 3,500 feet, heading 270, 108 knots"), "{brief}");
-        assert_eq!(request("begin"), Some(Request::Begin), "a brief is standing");
+        assert!(
+            brief.starts_with("Straight and level. Hold 3,500 feet, heading 270, 108 knots"),
+            "{brief}"
+        );
+        assert_eq!(
+            request("begin"),
+            Some(Request::Begin),
+            "a brief is standing"
+        );
         assert_eq!(request("okay ready"), Some(Request::Begin));
-        assert_eq!(status().as_deref(), Some("lesson: straight and level, briefed"));
+        assert_eq!(
+            status().as_deref(),
+            Some("lesson: straight and level, briefed")
+        );
         assert_eq!(handle(Request::Begin, 1.0), "Your aircraft. Go.");
         assert!(active());
         // A refused AP command becomes the target.
@@ -2867,7 +3215,10 @@ mod tests {
         }
         assert!(!active(), "complete: back to idle");
         assert_eq!(said.first().map(String::as_str), Some("That's time."));
-        assert!(said.last().unwrap().ends_with("That meets the standard."), "{said:?}");
+        assert!(
+            said.last().unwrap().ends_with("That meets the standard."),
+            "{said:?}"
+        );
         assert!(handle(Request::Interim, 200.0).ends_with("That meets the standard."));
         assert_eq!(handle(Request::End, 200.0), "No lesson running.");
         assert_eq!(request("begin"), None, "nothing briefed any more");
@@ -2886,26 +3237,43 @@ mod tests {
         ground.on_ground = true;
         ground.agl_ft = 0.0;
         tick(ground);
-        assert_eq!(handle(Request::Start(Task::SteepTurns), 0.0), "For steep turns, get airborne first.");
+        assert_eq!(
+            handle(Request::Start(Task::SteepTurns), 0.0),
+            "For steep turns, get airborne first."
+        );
         let brief = handle(Request::Start(Task::Pattern), 0.0);
-        assert!(brief.starts_with("Traffic pattern. Pattern altitude 1,100 feet, 74 knots on the downwind"), "{brief}");
+        assert!(
+            brief.starts_with(
+                "Traffic pattern. Pattern altitude 1,100 feet, 74 knots on the downwind"
+            ),
+            "{brief}"
+        );
         assert_eq!(handle(Request::End, 0.0), "Lesson cancelled.");
         let mut low = air(1.0, 1200.0, 90.0, 100.0);
         low.agl_ft = 900.0;
         tick(low);
-        assert_eq!(handle(Request::Start(Task::SlowFlight), 1.0), "For slow flight, climb above fifteen hundred feet first.");
+        assert_eq!(
+            handle(Request::Start(Task::SlowFlight), 1.0),
+            "For slow flight, climb above fifteen hundred feet first."
+        );
     }
 
     #[test]
     fn the_offline_grader_finds_the_level_runs_and_the_landing() {
-        let mk = |t: f64, alt: f64, agl: f64, hdg: f64, ias: f64, vsi: f64, ground: bool| {
-            json!({ "t": t, "alt": alt, "agl": agl, "hdg": hdg, "ias": ias, "vsi": vsi, "ground": ground, "track": hdg, "bank": 0.0 })
-        };
+        let mk = |t: f64, alt: f64, agl: f64, hdg: f64, ias: f64, vsi: f64, ground: bool| json!({ "t": t, "alt": alt, "agl": agl, "hdg": hdg, "ias": ias, "vsi": vsi, "ground": ground, "track": hdg, "bank": 0.0 });
         let mut states = Vec::new();
         let mut t = 1000.0;
         // 90 s level at 3,500, wandering 40 ft.
         for i in 0..90 {
-            states.push(mk(t, 3500.0 + (i % 4) as f64 * 10.0, 3000.0, 180.0, 105.0, 0.0, false));
+            states.push(mk(
+                t,
+                3500.0 + (i % 4) as f64 * 10.0,
+                3000.0,
+                180.0,
+                105.0,
+                0.0,
+                false,
+            ));
             t += 1.0;
         }
         // 60 s descent at 500 fpm, 100 kt.
@@ -2917,7 +3285,11 @@ mod tests {
         }
         // 120 s level at 3,000 but 160 ft low for 30 s.
         for i in 0..120 {
-            let a = if (40..70).contains(&i) { 2840.0 } else { 3000.0 };
+            let a = if (40..70).contains(&i) {
+                2840.0
+            } else {
+                3000.0
+            };
             states.push(mk(t, a, a - 500.0, 180.0, 105.0, 0.0, false));
             t += 1.0;
         }
@@ -2933,10 +3305,31 @@ mod tests {
         let profile = crate::aircraft::load("cessna_172sp").expect("172 profile");
         let lines = grade_flight(&refs, Some(&profile), Level::Private);
         assert_eq!(lines.len(), 4, "{lines:#?}");
-        assert!(lines[0].contains("level at 3500 ft for 89 s") && lines[0].contains("Within private standards"), "{}", lines[0]);
-        assert!(lines[1].contains("descent from 3500 ft for 59 s") && lines[1].contains("Within"), "{}", lines[1]);
-        assert!(lines[2].contains("level at 3000 ft for 2 min") && lines[2].contains("altitude 160 feet low (FAIL)"), "{}", lines[2]);
-        assert!(lines[3].contains("final and landing") && lines[3].contains("; Touchdown at 400 feet per minute, 68 knots, no drift. Firm. Below"), "{}", lines[3]);
+        assert!(
+            lines[0].contains("level at 3500 ft for 89 s")
+                && lines[0].contains("Within private standards"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("descent from 3500 ft for 59 s") && lines[1].contains("Within"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("level at 3000 ft for 2 min")
+                && lines[2].contains("altitude 160 feet low (FAIL)"),
+            "{}",
+            lines[2]
+        );
+        assert!(
+            lines[3].contains("final and landing")
+                && lines[3].contains(
+                    "; Touchdown at 400 feet per minute, 68 knots, no drift. Firm. Below"
+                ),
+            "{}",
+            lines[3]
+        );
     }
 
     fn gnd(t: f64, gs: f64, hdg: f64, eng: bool) -> Sample {
@@ -2973,18 +3366,27 @@ mod tests {
             lines.extend(sc.tick(&gnd(t_s, 20.0, 90.0, true)));
             t_s += 1.0;
         }
-        assert_eq!(lines, vec!["Pace, 5 over. Ease the power back and hold it with the brakes.".to_string()]);
+        assert_eq!(
+            lines,
+            vec!["Pace, 5 over. Ease the power back and hold it with the brakes.".to_string()]
+        );
         for _ in 0..10 {
             lines.extend(sc.tick(&gnd(t_s, 12.0, 90.0, true)));
             t_s += 1.0;
         }
-        assert_eq!(lines.last().map(String::as_str), Some("Good, back on pace."));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("Good, back on pace.")
+        );
         for _ in 0..12 {
             lines.extend(sc.tick(&gnd(t_s, 0.0, 90.0, true)));
             t_s += 1.0;
         }
         assert!(sc.complete(), "{lines:?}");
-        assert_eq!(lines.last().map(String::as_str), Some("Stopped. Holding short, I take it."));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("Stopped. Holding short, I take it.")
+        );
         let g = sc.grade();
         assert!(!g.pass, "6 s over the pace: {}", g.spoken());
         assert!(g.notes[0].starts_with("Taxied 4"), "{:?}", g.notes);
@@ -3028,9 +3430,15 @@ mod tests {
         }
         assert!(sc.complete(), "{lines:?}");
         assert!(lines.contains(&"Airborne.".to_string()));
-        assert_eq!(lines.last().map(String::as_str), Some("A thousand feet. That completes the takeoff."));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("A thousand feet. That completes the takeoff.")
+        );
         let g = sc.grade();
-        assert_eq!(g.notes[0], "Rotated at 54 knots, Vr is 55.", "the last sample on the wheels");
+        assert_eq!(
+            g.notes[0], "Rotated at 54 knots, Vr is 55.",
+            "the last sample on the wheels"
+        );
         let h = g.axes.iter().find(|a| a.axis == Axis::Heading).unwrap();
         assert_eq!(h.target, 92.0, "the roll heading, not the hold-short's");
         assert_eq!(h.worst, 2.0);
@@ -3103,16 +3511,29 @@ mod tests {
         run(gnd(t_s, 0.0, 180.0, false), &mut io, &mut said);
         assert!(handle(Request::Start(Task::SteepTurns), t_s).contains("get airborne first"));
         let opener = handle(Request::FullFlight, t_s);
-        assert!(opener.starts_with("Full flight from cold and dark."), "{opener}");
-        assert_eq!(status().as_deref(), Some("lesson: full flight, preflight checklist"));
+        assert!(
+            opener.starts_with("Full flight from cold and dark."),
+            "{opener}"
+        );
+        assert_eq!(
+            status().as_deref(),
+            Some("lesson: full flight, preflight checklist")
+        );
         assert!(syllabus_active());
         assert!(handle(Request::FullFlight, t_s).contains("already on the full flight"));
         // The three ramp lists this airframe lacks are skipped in one tick,
         // then the engine is waited for.
         t_s += 1.0;
         run(gnd(t_s, 0.0, 180.0, false), &mut io, &mut said);
-        assert_eq!(said.iter().filter(|l| l.starts_with("No ")).count(), 3, "{said:?}");
-        assert_eq!(status().as_deref(), Some("lesson: full flight, engine start"));
+        assert_eq!(
+            said.iter().filter(|l| l.starts_with("No ")).count(),
+            3,
+            "{said:?}"
+        );
+        assert_eq!(
+            status().as_deref(),
+            Some("lesson: full flight, engine start")
+        );
         // Engine comes alive: the before taxi list runs for two ticks.
         for _ in 0..5 {
             t_s += 1.0;
@@ -3121,10 +3542,21 @@ mod tests {
         assert!(said.contains(&"Engine's running.".to_string()));
         assert!(said.contains(&"Before taxi checklist. I'll read, you do.".to_string()));
         assert_eq!(io.started, vec![0]);
-        assert_eq!(status().as_deref(), Some("lesson: full flight, taxi"), "{said:?}");
-        assert!(said.iter().any(|l| l.starts_with("Taxi. Get your clearance")), "{said:?}");
+        assert_eq!(
+            status().as_deref(),
+            Some("lesson: full flight, taxi"),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|l| l.starts_with("Taxi. Get your clearance")),
+            "{said:?}"
+        );
         // A pace command during the taxi retargets the pace, never writes.
-        assert_eq!(take_target("hold_speed", &json!({ "knots": 12 })).as_deref(), Some("12 knots it is. Your hands."));
+        assert_eq!(
+            take_target("hold_speed", &json!({ "knots": 12 })).as_deref(),
+            Some("12 knots it is. Your hands.")
+        );
         // Taxi 60 s at 10 kt, stop 11 s.
         for _ in 0..60 {
             t_s += 1.0;
@@ -3134,14 +3566,21 @@ mod tests {
             t_s += 1.0;
             run(gnd(t_s, 0.0, 180.0, true), &mut io, &mut said);
         }
-        assert!(said.contains(&"Stopped. Holding short, I take it.".to_string()), "{said:?}");
+        assert!(
+            said.contains(&"Stopped. Holding short, I take it.".to_string()),
+            "{said:?}"
+        );
         // Before takeoff list, then the takeoff.
         for _ in 0..4 {
             t_s += 1.0;
             run(gnd(t_s, 0.0, 180.0, true), &mut io, &mut said);
         }
         assert_eq!(io.started, vec![0, 1]);
-        assert_eq!(status().as_deref(), Some("lesson: full flight, takeoff"), "{said:?}");
+        assert_eq!(
+            status().as_deref(),
+            Some("lesson: full flight, takeoff"),
+            "{said:?}"
+        );
         let mut gs = 0.0;
         while gs < 58.0 {
             t_s += 1.0;
@@ -3157,8 +3596,14 @@ mod tests {
             run(s, &mut io, &mut said);
             agl += 700.0 / 60.0;
         }
-        assert!(said.contains(&"A thousand feet. That completes the takeoff.".to_string()), "{said:?}");
-        assert!(said.iter().any(|l| l.starts_with("Your flight.")), "{said:?}");
+        assert!(
+            said.contains(&"A thousand feet. That completes the takeoff.".to_string()),
+            "{said:?}"
+        );
+        assert!(
+            said.iter().any(|l| l.starts_with("Your flight.")),
+            "{said:?}"
+        );
         assert_eq!(status().as_deref(), Some("lesson: full flight, enroute"));
         // Cruise, then a final: the landing is taken.
         for _ in 0..30 {
@@ -3174,7 +3619,10 @@ mod tests {
             run(s, &mut io, &mut said);
             agl -= 250.0 / 60.0;
         }
-        assert!(said.contains(&"On final. I have the landing.".to_string()), "{said:?}");
+        assert!(
+            said.contains(&"On final. I have the landing.".to_string()),
+            "{said:?}"
+        );
         t_s += 1.0;
         run(gnd(t_s, 55.0, 92.0, true), &mut io, &mut said);
         assert!(said.iter().any(|l| l.starts_with("Down.")), "{said:?}");
@@ -3204,10 +3652,19 @@ mod tests {
         }
         tick(gnd(0.0, 0.0, 180.0, true));
         let opener = handle(Request::FullFlight, 0.0);
-        assert!(opener.starts_with("Full flight from here. Engine's running"), "{opener}");
-        assert_eq!(status().as_deref(), Some("lesson: full flight, before taxi checklist"));
+        assert!(
+            opener.starts_with("Full flight from here. Engine's running"),
+            "{opener}"
+        );
+        assert_eq!(
+            status().as_deref(),
+            Some("lesson: full flight, before taxi checklist")
+        );
         assert_eq!(request("teach me a full flight"), Some(Request::FullFlight));
-        assert_eq!(request("lesson from cold and dark"), Some(Request::FullFlight));
+        assert_eq!(
+            request("lesson from cold and dark"),
+            Some(Request::FullFlight)
+        );
         assert!(handle(Request::Start(Task::Taxi), 0.0).contains("on the full flight"));
         let end = handle(Request::End, 0.0);
         assert!(end.starts_with("Lesson over. Nothing graded yet."), "{end}");
@@ -3220,7 +3677,12 @@ mod tests {
     #[test]
     fn the_refusal_names_the_action_and_the_way_back() {
         let first = refusal("FLAPS > 1", true);
-        assert!(first.starts_with("Instructor mode: I don't touch the controls. Flaps 1: that's your hands."), "{first}");
+        assert!(
+            first.starts_with(
+                "Instructor mode: I don't touch the controls. Flaps 1: that's your hands."
+            ),
+            "{first}"
+        );
         assert!(first.contains("Settings"));
         assert_eq!(refusal("HEADING > 270", false), "Heading 270: your hands.");
     }
@@ -3232,7 +3694,10 @@ mod tests {
             for level in [Level::Private, Level::Commercial] {
                 let t = task.assign(&entry, &refs172(), level);
                 let b = task.brief(&t, level);
-                assert!(!b.contains('\u{2014}') && !b.contains('\u{2013}') && !b.contains(" - "), "{b}");
+                assert!(
+                    !b.contains('\u{2014}') && !b.contains('\u{2013}') && !b.contains(" - "),
+                    "{b}"
+                );
                 assert!(b.contains("standards:"), "{b}");
             }
         }

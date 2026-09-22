@@ -121,25 +121,34 @@ fn summarise(flight: &[&Value]) -> String {
             }
         ));
         // Touchdowns: airborne -> ground transitions, with the sink rate.
-        // The rate at the wheels is the STEEPER of the last airborne sample
-        // and the first ground one: by the time the ground flag samples the
-        // oleos have eaten part of it (LXGB 27, 2026-09-14: -309 in the air,
-        // -156 on the ground, and the grader below already said 309).
+        // The rate at the wheels is the STEEPEST sink in the last seconds
+        // of airborne samples or the first ground one
+        // (`instructor::touchdown_sink_fpm`): by the time the ground flag
+        // samples the oleos have eaten part of it (LXGB 27, 2026-09-14:
+        // -309 in the air, -156 on the ground), and at this log's 1 Hz the
+        // LAST airborne sample can be on the oleos too (LFPG 09R,
+        // 2026-09-22: -690, then -221 with the flag still clear, then
+        // ground; the sim's own report said -672 and this line said 221).
         let mut prev_ground = None::<bool>;
-        let mut prev_vsi = 0.0_f64;
+        let mut recent: Vec<(f64, f64)> = Vec::new();
         for e in &states {
             let g = b(e, "ground").unwrap_or(true);
             let vsi = f(e, "vsi").unwrap_or(0.0);
+            let t = f(e, "t").unwrap_or(0.0);
             if prev_ground == Some(false) && g {
                 out.push_str(&format!(
                     "Touchdown {}Z at {:.0} fpm, {:.0} kt.\n",
-                    hms(f(e, "t").unwrap_or(0.0)),
-                    vsi.min(prev_vsi),
+                    hms(t),
+                    crate::instructor::touchdown_sink_fpm(&recent, t, vsi),
                     f(e, "ias").unwrap_or(0.0)
                 ));
             }
+            if g {
+                recent.clear();
+            } else {
+                recent.push((t, vsi));
+            }
             prev_ground = Some(g);
-            prev_vsi = vsi;
         }
         // Stops during an auto taxi: rolling to a halt while the drive was on.
         let mut driving = false;
@@ -506,6 +515,24 @@ mod tests {
         );
         assert!(r.contains("CRASH at 114 ft"), "{r}");
         assert!(r.contains("full auto: airborne (agl_ft=1019.6)"), "{r}");
+    }
+
+    /// LFPG 09R, 2026-09-22: the last airborne sample was already on the
+    /// oleos. The touchdown line takes the steepest sink in the window.
+    #[test]
+    fn the_touchdown_line_is_not_fooled_by_a_sample_on_the_oleos() {
+        let lines = [
+            r#"{"kind":"state","t":1000.0,"alt":30.0,"agl":0.0,"ias":0.0,"gs":0.0,"ground":true,"vsi":0.0}"#,
+            r#"{"kind":"state","t":1200.0,"alt":3900.0,"agl":3800.0,"ias":180.0,"gs":200.0,"ground":false,"vsi":0.0}"#,
+            r#"{"kind":"state","t":1400.0,"alt":460.0,"agl":93.0,"ias":149.0,"gs":146.0,"ground":false,"vsi":-806.0}"#,
+            r#"{"kind":"state","t":1401.1,"alt":424.0,"agl":46.0,"ias":148.0,"gs":145.0,"ground":false,"vsi":-779.0}"#,
+            r#"{"kind":"state","t":1402.2,"alt":396.0,"agl":15.0,"ias":147.0,"gs":145.0,"ground":false,"vsi":-750.0}"#,
+            r#"{"kind":"state","t":1403.3,"alt":383.0,"agl":1.9,"ias":147.0,"gs":145.0,"ground":false,"vsi":-708.0}"#,
+            r#"{"kind":"state","t":1404.4,"alt":374.0,"agl":1.6,"ias":144.0,"gs":144.0,"ground":false,"vsi":-221.0}"#,
+            r#"{"kind":"state","t":1405.5,"alt":372.0,"agl":0.7,"ias":141.0,"gs":138.0,"ground":true,"vsi":-38.0}"#,
+        ];
+        let r = report(lines.iter().copied());
+        assert!(r.contains("Touchdown 00:23:25Z at -708 fpm"), "{r}");
     }
 
     #[test]

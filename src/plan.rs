@@ -367,7 +367,9 @@ pub(crate) async fn ensure_plan(
     // Keep questions, fuel advice and later FMS loads on that same shelf.
     if let (Some((_, current)), Some(published)) = (cache.as_mut(), simbrief::local_plan()) {
         if current.source == simbrief::PlanSource::Local
-            && current.origin == published.origin && current.destination == published.destination {
+            && current.origin == published.origin
+            && current.destination == published.destination
+        {
             *current = published;
         }
     }
@@ -728,6 +730,10 @@ pub(crate) async fn flight_plan_report(
                 crate::aircraft::fuel_figure_kg(fp.block_fuel_kg),
                 crate::aircraft::say_fuel_figure(need - aboard),
             ));
+            // The crew can do the load sheet, on the ground only.
+            if on_ground {
+                line.push_str(" Say load the aircraft and I'll set it from the plan.");
+            }
         }
     }
     line

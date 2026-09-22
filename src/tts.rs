@@ -267,7 +267,8 @@ static BUS_IDS: [std::sync::atomic::AtomicI64; 2] = [
 /// Where the sim's Web API is, for the bus writes, and the environment's
 /// verdict. Called once at startup.
 pub fn configure_audio_bus(enabled: bool, base_url: &str) {
-    *BUS_BASE_URL.lock().unwrap_or_else(|e| e.into_inner()) = base_url.trim_end_matches('/').to_string();
+    *BUS_BASE_URL.lock().unwrap_or_else(|e| e.into_inner()) =
+        base_url.trim_end_matches('/').to_string();
     AUDIO_BUS.store(enabled, std::sync::atomic::Ordering::Relaxed);
     AUDIO_BUS_PINNED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
@@ -300,7 +301,10 @@ fn bus_write(slot: usize, name: &str, value: serde_json::Value) -> Result<()> {
     if tokio::runtime::Handle::try_current().is_ok() {
         bail!("audio bus write from an async thread");
     }
-    let base = BUS_BASE_URL.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let base = BUS_BASE_URL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     if base.is_empty() {
         bail!("audio bus not configured");
     }
@@ -358,7 +362,12 @@ fn play_on_bus(path: &std::path::Path, samples: usize, sample_rate: u32) -> Resu
     use std::sync::atomic::Ordering::SeqCst;
     let ch = thread_channel();
     let gen = CUT_GEN[ch as usize].load(SeqCst);
-    let payload = format!("{}|{:.2}|{}", ch as usize, channel_volume(ch), path.display());
+    let payload = format!(
+        "{}|{:.2}|{}",
+        ch as usize,
+        channel_volume(ch),
+        path.display()
+    );
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
     bus_write(0, BUS_PLAY, serde_json::json!(b64))?;

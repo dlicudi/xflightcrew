@@ -5,6 +5,7 @@
 #include "panel.h"
 
 #include <cfloat>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +19,7 @@
 #include "XPLMMenus.h"
 #include "XPLMPlugin.h"
 #include "XPLMProcessing.h"
+#include "XPLMScenery.h"
 #include "XPLMUtilities.h"
 
 #include "imgui.h"
@@ -728,7 +730,126 @@ protected:
 
     // The route the app pushed (SimBrief import), visible before/after it lands
     // in the FMS — plus a manual re-push for after an aircraft or plan reload.
+    // One load sheet row: the plan's figure against the aircraft's, the
+    // aircraft's coloured by whether it agrees.
+    void loadSheetRow(const char* label, double plan, double actual, double k,
+                      ImU32 col) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%s", label);
+        ImGui::TableNextColumn();
+        if (plan > 0.0) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE), "%.0f", plan * k);
+        } else {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "-");
+        }
+        ImGui::TableNextColumn();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%.0f", actual * k);
+        ImGui::TableNextColumn();
+        if (plan > 0.0) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%+.0f",
+                               (actual - plan) * k);
+        }
+    }
+
+    // The plan's load sheet against what the sim is carrying, with the
+    // button that says "load the aircraft". The plan's side comes from the
+    // app; the aircraft's side is read here, live.
+    void buildLoadSheet() {
+        const TextRef& feed = drefs::load_sheet();
+        if (feed.len <= 0) return;
+        char buf[sizeof feed.buf];
+        std::memcpy(buf, feed.buf, sizeof buf);
+        buf[sizeof buf - 1] = '\0';
+        char* f[7] = {nullptr};
+        char* save = nullptr;
+        int n = 0;
+        for (char* t = strtok_r(buf, "|", &save); t != nullptr && n < 7;
+             t = strtok_r(nullptr, "|", &save)) {
+            f[n++] = t;
+        }
+        if (n < 7) return;
+        const double block = std::atof(f[2]);
+        const double payload = std::atof(f[3]);
+        const double max_tow = std::atof(f[4]);
+        const int pax = std::atoi(f[5]);
+        const bool lbs = std::strcmp(f[6], "lbs") == 0;
+        const double k = lbs ? 2.20462 : 1.0;
+
+        static XPLMDataRef fuel_ref = XPLMFindDataRef("sim/flightmodel/weight/m_fuel_total");
+        static XPLMDataRef fixed_ref = XPLMFindDataRef("sim/flightmodel/weight/m_fixed");
+        static XPLMDataRef total_ref = XPLMFindDataRef("sim/flightmodel/weight/m_total");
+        if (!fuel_ref || !fixed_ref || !total_ref) return;
+        const double fuel = XPLMGetDataf(fuel_ref);
+        const double fixed = XPLMGetDataf(fixed_ref);
+        const double total = XPLMGetDataf(total_ref);
+
+        // The preflight's own tolerances: fuel within 3 % of the block (more
+        // is never a fault), payload within 10 % and 20 kg, weight under the
+        // plan's takeoff limit.
+        const ImU32 fuel_col = (block <= 0.0 || fuel >= block * 0.97) ? COL_GREEN : COL_RED;
+        const double off = std::fabs(fixed - payload);
+        const ImU32 pay_col =
+            (payload <= 0.0 || off <= 20.0 || off <= payload * 0.10) ? COL_GREEN : COL_AMBER;
+        const ImU32 tow_col = (max_tow <= 0.0 || total <= max_tow * 1.005) ? COL_GREEN : COL_RED;
+
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "LOAD SHEET  %s > %s  (%s)",
+                           f[0], f[1], lbs ? "lb" : "kg");
+        if (pax > 0) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "  %d pax", pax);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Load aircraft")) drefs::set_request(12);
+        if (ImGui::BeginTable("loadsheet", 4, ImGuiTableFlags_BordersInnerV)) {
+            ImGui::TableSetupColumn("");
+            ImGui::TableSetupColumn("PLAN");
+            ImGui::TableSetupColumn("ACTUAL");
+            ImGui::TableSetupColumn("DIFF");
+            ImGui::TableHeadersRow();
+            loadSheetRow("Fuel", block, fuel, k, fuel_col);
+            loadSheetRow("Payload", payload, fixed, k, pay_col);
+            loadSheetRow("Weight / max TOW", max_tow, total, k, tow_col);
+            ImGui::EndTable();
+        }
+        ImGui::Separator();
+    }
+
+    // The fix being flown to, with its magnetic bearing and distance from
+    // the aircraft, and the minutes to it at the present groundspeed.
+    // Returns the route row to highlight, or -1.
+    int buildActiveFix() {
+        const fms::ActiveFix a = fms::active_fix();
+        if (!a.valid) return -1;
+        static XPLMDataRef lat_ref = XPLMFindDataRef("sim/flightmodel/position/latitude");
+        static XPLMDataRef lon_ref = XPLMFindDataRef("sim/flightmodel/position/longitude");
+        static XPLMDataRef gs_ref = XPLMFindDataRef("sim/flightmodel/position/groundspeed");
+        if (!lat_ref || !lon_ref) return a.row;
+        const double lat = XPLMGetDatad(lat_ref);
+        const double lon = XPLMGetDatad(lon_ref);
+        const double nm = fms::distance_nm(lat, lon, a.lat, a.lon);
+        float brg = XPLMDegTrueToDegMagnetic(
+            static_cast<float>(fms::bearing_true_deg(lat, lon, a.lat, a.lon)));
+        int deg = static_cast<int>(brg + 0.5f) % 360;
+        if (deg <= 0) deg += 360;
+        const double kts = gs_ref ? XPLMGetDataf(gs_ref) * 1.94384 : 0.0;
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "ACTIVE");
+        ImGui::SameLine();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_GREEN), "%s",
+                           a.ident.empty() ? "(pos)" : a.ident.c_str());
+        ImGui::SameLine();
+        if (kts > 30.0) {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE),
+                               "  %03d M   %.1f nm   %.0f min", deg, nm, nm / kts * 60.0);
+        } else {
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE),
+                               "  %03d M   %.1f nm", deg, nm);
+        }
+        return a.row;
+    }
+
     void buildRouteTab() {
+        buildLoadSheet();
         const std::vector<RoutePoint>& route_pts = fms::route_points();
         if (route_pts.empty()) {
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
@@ -748,6 +869,7 @@ protected:
             fms::load_route();
             AppendLog("COPILOT", COL_GREEN, "Flight plan sent to the FMS.");
         }
+        const int active_row = buildActiveFix();
         if (ImGui::BeginTable("route", 4,
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_BordersInnerV)) {
@@ -760,7 +882,9 @@ protected:
             for (size_t i = 0; i < route_pts.size(); ++i) {
                 const RoutePoint& p = route_pts[i];
                 bool endpoint = (i == 0 || i + 1 == route_pts.size());
-                ImU32 col = endpoint ? COL_CYAN : COL_WHITE;
+                ImU32 col = static_cast<int>(i) == active_row
+                                ? COL_GREEN
+                                : (endpoint ? COL_CYAN : COL_WHITE);
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%d",
@@ -1060,6 +1184,23 @@ protected:
                     bool selected = (i == voice);
                     if (ImGui::Selectable(names[static_cast<size_t>(i)].c_str(), selected)) {
                         drefs::set_opt_voice(i);
+                    }
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            // The cabin crew's voice, same roster. Picking the copilot's own
+            // voice is refused by the app, which puts the old index back.
+            const int cabin_voice = drefs::opt_cabin_voice();
+            const bool cabin_picked =
+                cabin_voice >= 0 && cabin_voice < static_cast<int>(names.size());
+            const char* cabin_preview =
+                cabin_picked ? names[static_cast<size_t>(cabin_voice)].c_str() : "(default)";
+            if (ImGui::BeginCombo("Cabin crew voice", cabin_preview)) {
+                for (int i = 0; i < static_cast<int>(names.size()); ++i) {
+                    bool selected = (i == cabin_voice);
+                    if (ImGui::Selectable(names[static_cast<size_t>(i)].c_str(), selected)) {
+                        drefs::set_opt_cabin_voice(i);
                     }
                     if (selected) ImGui::SetItemDefaultFocus();
                 }

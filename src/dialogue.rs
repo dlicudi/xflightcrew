@@ -26,9 +26,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::tools::ToolCall;
 use crate::phrase::word_value;
 use crate::tools::Registry;
+use crate::tools::ToolCall;
 
 /// How long a recorded action stays a valid anchor for a back-reference.
 /// Matches the conversational horizon: past this, "a bit more" has lost its
@@ -250,11 +250,7 @@ impl Dialogue {
     fn resolve_repeat(&self, tokens: &[String], registry: &Registry) -> Option<Resolution> {
         let within = tokens.iter().all(|w| REPEAT_VOCAB.contains(&w.as_str()));
         let has = |w: &str| tokens.iter().any(|x| x == w);
-        let pair = |a: &str, b: &str| {
-            tokens
-                .windows(2)
-                .any(|p| p[0] == a && p[1] == b)
-        };
+        let pair = |a: &str, b: &str| tokens.windows(2).any(|p| p[0] == a && p[1] == b);
         // "say again"/"repeat that" belong to the conversational layer
         // (repeat the READBACK); this shape must carry a doing word or a
         // repeat idiom, never match bare "again?" chatter.
@@ -374,7 +370,10 @@ impl Dialogue {
         if named.is_empty() {
             if tokens.iter().any(|w| IMPLIES_SPEED.contains(&w.as_str())) {
                 named.extend(ADJUSTABLE.iter().filter(|a| a.key == "knots"));
-            } else if tokens.iter().any(|w| IMPLIES_ALTITUDE.contains(&w.as_str())) {
+            } else if tokens
+                .iter()
+                .any(|w| IMPLIES_ALTITUDE.contains(&w.as_str()))
+            {
                 named.extend(ADJUSTABLE.iter().filter(|a| a.tool == "set_altitude"));
             }
         }
@@ -429,7 +428,11 @@ impl Dialogue {
             return None;
         }
         let old = anchor.args.get(a.key).and_then(Value::as_f64)?;
-        let dir = if a.wrap { f64::from(lateral) } else { f64::from(sign) };
+        let dir = if a.wrap {
+            f64::from(lateral)
+        } else {
+            f64::from(sign)
+        };
         let amount = match number {
             Some(n) if n > 0.0 => n,
             _ => a.step * if big { 2.0 } else { 1.0 },
@@ -483,7 +486,10 @@ mod tests {
         let mut d = Dialogue::new();
         d.record("hold_speed", &json!({"knots": 70}));
         let (name, args) = calls(d.resolve("a bit faster", &reg));
-        assert_eq!((name.as_str(), args["knots"].as_i64()), ("hold_speed", Some(75)));
+        assert_eq!(
+            (name.as_str(), args["knots"].as_i64()),
+            ("hold_speed", Some(75))
+        );
         let (_, args) = calls(d.resolve("a bit slower", &reg));
         assert_eq!(args["knots"].as_i64(), Some(65));
         // "a lot" doubles the step; an explicit number beats it entirely.
@@ -501,7 +507,10 @@ mod tests {
         let mut d = Dialogue::new();
         d.record("set_heading", &json!({"heading": 350}));
         let (name, args) = calls(d.resolve("come left 10", &reg));
-        assert_eq!((name.as_str(), args["heading"].as_i64()), ("set_heading", Some(340)));
+        assert_eq!(
+            (name.as_str(), args["heading"].as_i64()),
+            ("set_heading", Some(340))
+        );
         // Wraps the compass, never clamps at it.
         let (_, args) = calls(d.resolve("right a bit", &reg));
         assert_eq!(args["heading"].as_i64(), Some(0));
@@ -518,7 +527,10 @@ mod tests {
         d.record("set_heading", &json!({"heading": 90}));
         // Heading is newer, but "faster" can only mean the speed.
         let (name, args) = calls(d.resolve("faster", &reg));
-        assert_eq!((name.as_str(), args["knots"].as_i64()), ("hold_speed", Some(75)));
+        assert_eq!(
+            (name.as_str(), args["knots"].as_i64()),
+            ("hold_speed", Some(75))
+        );
     }
 
     #[test]
@@ -555,7 +567,10 @@ mod tests {
         let mut d = Dialogue::new();
         d.record("set_flaps", &json!({"notch": "10"}));
         let (name, args) = calls(d.resolve("do that again", &reg));
-        assert_eq!((name.as_str(), args["notch"].as_str()), ("set_flaps", Some("10")));
+        assert_eq!(
+            (name.as_str(), args["notch"].as_str()),
+            ("set_flaps", Some("10"))
+        );
         // An automation arm is never repeated from a vague back-reference.
         d.record("full_auto", &json!({}));
         let line = say(d.resolve("do that again", &reg));

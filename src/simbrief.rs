@@ -49,6 +49,32 @@ pub fn local_plan() -> Option<FlightPlan> {
         .cloned()
 }
 
+/// The Route tab's load sheet feed (`xcopilot/status/loadsheet`): the plan's
+/// side only, the plugin reads the aircraft's side itself every frame.
+/// "ORIGIN|DEST|block_kg|payload_kg|max_tow_kg|pax|unit", kilos throughout,
+/// `unit` the plan's spoken one (lbs or kgs); a figure the plan lacks is 0.
+/// Empty with no plan on the shelf.
+pub fn loadsheet_payload(plan: Option<&FlightPlan>) -> String {
+    let Some(fp) = plan else {
+        return String::new();
+    };
+    let w = fp.weights.as_ref();
+    format!(
+        "{}|{}|{:.0}|{:.0}|{:.0}|{}|{}",
+        fp.origin,
+        fp.destination,
+        fp.block_fuel_kg,
+        w.map_or(0.0, |w| w.payload_kg),
+        w.map_or(0.0, |w| w.max_tow_kg),
+        w.map_or(0, |w| w.pax),
+        if w.is_some_and(|w| w.spoken_lbs) {
+            "lbs"
+        } else {
+            "kgs"
+        },
+    )
+}
+
 /// The briefed essentials of a SimBrief OFP. Fuel figures are in KILOGRAMS;
 /// speak them through [`crate::aircraft::say_fuel_kg`].
 #[derive(Clone)]

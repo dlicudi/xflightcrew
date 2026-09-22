@@ -40,4 +40,20 @@ const std::string& airac_cycle();
 // Display copy for the panel's Route tab, refreshed whenever the app writes.
 const std::vector<RoutePoint>& route_points();
 
+// The fix being flown to, for the Route tab: the FMS's own destination entry
+// (whoever sequenced it, the follower's goto or the sim's GPS), or the
+// follower's last goto when that named a leg the loaded plan lacks (an
+// approach leg). `row` is the matching row of route_points(), or -1.
+struct ActiveFix {
+    bool valid;
+    std::string ident;
+    double lat, lon;
+    int row;
+};
+ActiveFix active_fix();
+
+// Great-circle-ish distance (nm) and true bearing (deg) between two points.
+double distance_nm(double lat1, double lon1, double lat2, double lon2);
+double bearing_true_deg(double lat1, double lon1, double lat2, double lon2);
+
 } // namespace fms

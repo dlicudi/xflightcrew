@@ -133,29 +133,45 @@ mod tests {
         let cfg = crate::config::Config::default();
         // On the ground: refused, and the handle is never touched.
         let grounded = FakeXPlane::with_reads(&[(ON_GROUND, 1.0)]);
-        let out = Gear { vlo_kts: None , by_command: false}
-            .execute(&json!({"position": "up"}), &ctx(&grounded, &cfg))
-            .await
-            .unwrap();
+        let out = Gear {
+            vlo_kts: None,
+            by_command: false,
+        }
+        .execute(&json!({"position": "up"}), &ctx(&grounded, &cfg))
+        .await
+        .unwrap();
         assert!(out.contains("on the ground"), "{out}");
-        assert!(!grounded.wrote(GEAR_HANDLE), "refusal must not move the handle");
+        assert!(
+            !grounded.wrote(GEAR_HANDLE),
+            "refusal must not move the handle"
+        );
 
         // The ground read FAILS (no preset): an unknown state must refuse too.
         // This gate used to default to airborne and raise the gear on the ramp.
         let unknown = FakeXPlane::new();
-        let out = Gear { vlo_kts: None , by_command: false}
-            .execute(&json!({"position": "up"}), &ctx(&unknown, &cfg))
-            .await
-            .unwrap();
-        assert!(out.contains("on the ground"), "failed read errs safe: {out}");
+        let out = Gear {
+            vlo_kts: None,
+            by_command: false,
+        }
+        .execute(&json!({"position": "up"}), &ctx(&unknown, &cfg))
+        .await
+        .unwrap();
+        assert!(
+            out.contains("on the ground"),
+            "failed read errs safe: {out}"
+        );
         assert!(!unknown.wrote(GEAR_HANDLE));
 
         // Airborne and under the gear speed: the handle moves.
-        let flying = FakeXPlane::with_reads(&[(ON_GROUND, 0.0), (IAS_KTS, 100.0), (GEAR_HANDLE, 0.0)]);
-        let out = Gear { vlo_kts: Some(150.0) , by_command: false}
-            .execute(&json!({"position": "up"}), &ctx(&flying, &cfg))
-            .await
-            .unwrap();
+        let flying =
+            FakeXPlane::with_reads(&[(ON_GROUND, 0.0), (IAS_KTS, 100.0), (GEAR_HANDLE, 0.0)]);
+        let out = Gear {
+            vlo_kts: Some(150.0),
+            by_command: false,
+        }
+        .execute(&json!({"position": "up"}), &ctx(&flying, &cfg))
+        .await
+        .unwrap();
         assert!(out.contains("gear up"), "{out}");
         assert_eq!(flying.last_write(GEAR_HANDLE), Some(0.0));
     }

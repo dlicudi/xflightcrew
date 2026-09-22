@@ -368,7 +368,11 @@ pub const ADVISORY_STALE_S: u64 = 12;
 
 /// The sample range to resume from: `elapsed` into a line of `len` samples at
 /// `rate`, less the lead-in. `None` when the line had effectively finished.
-fn resume_range(len: usize, rate: u32, elapsed: std::time::Duration) -> Option<std::ops::Range<usize>> {
+fn resume_range(
+    len: usize,
+    rate: u32,
+    elapsed: std::time::Duration,
+) -> Option<std::ops::Range<usize>> {
     let played = (elapsed.as_secs_f64() * rate as f64) as usize;
     let lead = (RESUME_LEAD_S * rate as f64) as usize;
     let min_left = (RESUME_MIN_LEFT_S * rate as f64) as usize;
@@ -571,6 +575,9 @@ struct Inner {
     /// engine, never mid-word. Station voices are cast separately (see
     /// [`StationSpeaker`]) and unaffected.
     pilot_swap: Mutex<Option<String>>,
+    /// The cabin crew's pending voice pick, applied between utterances like
+    /// the pilot's.
+    cabin_swap: Mutex<Option<String>>,
     /// Range to the active station in nm (f32 bits; NaN = unknown), published
     /// by the monitor each tick and read per transmission — the radio's
     /// signal-quality model ([`crate::radiofx::signal_quality`]). Fail open:
@@ -617,6 +624,7 @@ impl Voice {
             paused: std::sync::atomic::AtomicBool::new(false),
             spoken: Mutex::new(Vec::new()),
             pilot_swap: Mutex::new(None),
+            cabin_swap: Mutex::new(None),
             station_range_nm: std::sync::atomic::AtomicU32::new(f32::NAN.to_bits()),
             status: Mutex::new(None),
         });
@@ -674,6 +682,17 @@ impl Voice {
         *self
             .inner
             .pilot_swap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(spec.into());
+    }
+
+    /// Swap the cabin crew's voice live (the panel's second picker). The
+    /// cabin's engine is built lazily, so a swap only drops the old one: the
+    /// next cabin line builds the new voice.
+    pub fn set_cabin_voice(&self, spec: impl Into<String>) {
+        *self
+            .inner
+            .cabin_swap
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(spec.into());
     }
@@ -1566,7 +1585,7 @@ fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
     // The cabin crew's voice: same channel, different person. Built LAZILY on
     // the first cabin utterance — most flights (and every airframe without a
     // cabin_crew profile flag) never pay the model load.
-    let cabin_config = {
+    let mut cabin_config = {
         let mut c = config.clone();
         c.piper_voice = c.cabin_piper_voice.clone();
         c
@@ -1612,6 +1631,16 @@ fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
             .take()
         {
             speaker.set_voice(spec);
+        }
+        if let Some(spec) = inner
+            .cabin_swap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            tracing::info!(model = %spec, "TTS: cabin voice swapped");
+            cabin_config.piper_voice = spec;
+            cabin_speaker = None;
         }
 
         // Perishable speech that missed its window (including waiting out a
@@ -2076,6 +2105,7 @@ mod tests {
             paused: std::sync::atomic::AtomicBool::new(false),
             spoken: Mutex::new(Vec::new()),
             pilot_swap: Mutex::new(None),
+            cabin_swap: Mutex::new(None),
             station_range_nm: std::sync::atomic::AtomicU32::new(f32::NAN.to_bits()),
         }
     }
@@ -2265,7 +2295,10 @@ mod tests {
         // Cut with nothing worth saying left: nothing owed.
         assert!(resume_range(5 * 22_050, 22_050, std::time::Duration::from_secs(5)).is_none());
         assert!(radio_interrupts(Priority::Advisory) && radio_interrupts(Priority::Caution));
-        assert!(!radio_interrupts(Priority::Warning), "a warning talks over the radio");
+        assert!(
+            !radio_interrupts(Priority::Warning),
+            "a warning talks over the radio"
+        );
 
         // Live: an advisory two seconds into a five-second line when the
         // tower keys up. The line is cut and its remainder queued, perishable.
@@ -2283,12 +2316,19 @@ mod tests {
             done: Some(latch.clone()),
         });
         interrupt_intercom_for_radio(&inner);
-        assert!(inner.intercom_playing.lock().unwrap().is_none(), "stepped on");
+        assert!(
+            inner.intercom_playing.lock().unwrap().is_none(),
+            "stepped on"
+        );
         let q = inner.queue.lock().unwrap();
         let utt = q.heap.peek().expect("the remainder is queued");
         assert_eq!(utt.priority, Priority::Advisory);
         let r = utt.resume.as_ref().expect("a rendered tail, not a re-say");
-        assert!((r.samples.len() as f64 - 3.4 * 22_050.0).abs() < 100.0, "{}", r.samples.len());
+        assert!(
+            (r.samples.len() as f64 - 3.4 * 22_050.0).abs() < 100.0,
+            "{}",
+            r.samples.len()
+        );
         assert!(utt.stale_by.is_some(), "a fragment out of context expires");
         assert!(utt.done.is_some(), "the caller waits for the remainder");
         assert!(!*latch.spoken.lock().unwrap(), "not released on the cut");
@@ -2304,7 +2344,10 @@ mod tests {
             done: None,
         });
         interrupt_intercom_for_radio(&inner);
-        assert!(inner.intercom_playing.lock().unwrap().is_some(), "warnings are not stepped on");
+        assert!(
+            inner.intercom_playing.lock().unwrap().is_some(),
+            "warnings are not stepped on"
+        );
         assert_eq!(inner.queue.lock().unwrap().heap.len(), 1);
 
         // A subprocess voice has no buffer: the line is said again whole.
@@ -2319,7 +2362,11 @@ mod tests {
         interrupt_intercom_for_radio(&inner);
         let q = inner.queue.lock().unwrap();
         assert_eq!(q.heap.len(), 2);
-        let again = q.heap.iter().find(|u| u.text == "flaps ten").expect("re-said");
+        let again = q
+            .heap
+            .iter()
+            .find(|u| u.text == "flaps ten")
+            .expect("re-said");
         assert!(again.resume.is_none() && again.cabin);
         drop(q);
 
@@ -2337,8 +2384,15 @@ mod tests {
             done: Some(latch.clone()),
         });
         interrupt_intercom_for_radio(&inner);
-        assert_eq!(inner.queue.lock().unwrap().heap.len(), 2, "nothing more queued");
-        assert!(*latch.spoken.lock().unwrap(), "released: the sentence was finished");
+        assert_eq!(
+            inner.queue.lock().unwrap().heap.len(),
+            2,
+            "nothing more queued"
+        );
+        assert!(
+            *latch.spoken.lock().unwrap(),
+            "released: the sentence was finished"
+        );
     }
 
     #[test]

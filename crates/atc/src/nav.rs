@@ -1205,6 +1205,7 @@ impl TaxiNet {
             hold_short_m,
             hold_zone,
             false,
+            None,
         )
     }
 
@@ -1217,6 +1218,12 @@ impl TaxiNet {
     /// is handed the standing route's already-trimmed holding point — which
     /// sits a hold-short standoff from the runway and must NOT be dragged back
     /// onto the junction the trim just removed.
+    ///
+    /// `strip` is the destination runway's own pavement, and it is what keeps
+    /// the entrance search on the right strip at a field whose thresholds sit
+    /// on top of each other (see [`Self::runway_entrance_near`]). `None`
+    /// falls back to nearest-entrance-anywhere.
+    #[allow(clippy::too_many_arguments)]
     pub fn plan_to_runway(
         &self,
         from_lat: f64,
@@ -1225,6 +1232,7 @@ impl TaxiNet {
         to_lon: f64,
         hold_short_m: f64,
         hold_zone: &[String],
+        strip: Option<&Runway>,
     ) -> Option<TaxiRoutePlan> {
         self.plan_inner(
             from_lat,
@@ -1234,6 +1242,7 @@ impl TaxiNet {
             hold_short_m,
             hold_zone,
             true,
+            strip,
         )
     }
 
@@ -1288,6 +1297,31 @@ impl TaxiNet {
             let brg = bearing_deg(lat, lon, p.0, p.1);
             angle_diff_deg(brg, psi_true).abs() <= AHEAD_OF_ABEAM_DEG
         };
+        // Which side of the rollout a point lies on, metres, right-positive.
+        // The rollout heading IS the runway direction to within a few degrees,
+        // so this needs no strip geometry passed in.
+        let side_of = |p: (f64, f64)| -> f64 {
+            let dx = (p.1 - lon) * m_per_deg_lon;
+            let dy = (p.0 - lat) * m_per_deg_lat;
+            let (sin, cos) = psi_true.to_radians().sin_cos();
+            dx * cos - dy * sin
+        };
+        // ...and which side the PARKING is on, because a vacate turns TOWARD
+        // the apron. At Liege (2026-09-22) a 737 landed 04R and took C3, the
+        // link to the parallel 04L: 35 m nearer than S3 and the only test was
+        // distance. It ended 148 m out on the wrong side of 04R, inside 04L's
+        // authored zone, with every stand and every other exit behind it - so
+        // the taxi-in clearance came back "via Charlie three, Sierra three,
+        // cross runway zero four right" and the drive was asked for a 180 on a
+        // taxiway a 737 cannot turn on. The nearest suitable stand is the
+        // proxy for the apron: at a field with parking on both sides that
+        // picks the near one, which is the answer anyway. No stands in the
+        // data leaves the old distance-only rule.
+        let apron_side = self
+            .nearest_stand(lat, lon)
+            .map(|st| side_of((st.lat, st.lon)))
+            .filter(|s| s.abs() > 1.0)
+            .map(f64::signum);
 
         let mut taxiway_nodes: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for e in self.edges.iter().filter(|e| !e.runway) {
@@ -1394,6 +1428,16 @@ impl TaxiNet {
                     if angle_diff_deg(brg, psi_true).abs() > VACATE_TURN_MAX_DEG {
                         return None;
                     }
+                    // Never onto ANOTHER runway's protected pavement. Ranking
+                    // it last was not enough: at Liege it was the only link C3
+                    // offered past its midpoint, so the walk took it and
+                    // stopped 62 m from runway 04L's centreline, inside its
+                    // departure AND arrival zones. Vacating one runway is
+                    // covered by the landing clearance we hold; entering
+                    // another is not covered by anything.
+                    if zone_rank(e) == 2 {
+                        return None;
+                    }
                     Some((nxt, np, e.name.clone(), zone_rank(e)))
                 })
                 .min_by(|x, y| {
@@ -1414,7 +1458,18 @@ impl TaxiNet {
             // through to the taxi-in from the runway — the same degradation
             // the dead-end case makes, and better than the U-turn.
             .filter_map(|(id, p)| turn_off(id, p).map(|s| (id, p, s)))
-            .min_by(|x, y| dist_m(here, x.1).total_cmp(&dist_m(here, y.1)))
+            .min_by(|x, y| {
+                // Toward the apron first, then nearest. A turn-off that leads
+                // away from the parking is a longer taxi at best and, where
+                // the pavement between two parallels is the thing it leads
+                // onto, a drive that cannot be completed at all.
+                let toward = |c: &(i64, (f64, f64), (i64, (f64, f64), String, u8))| -> bool {
+                    apron_side.is_none_or(|a| side_of(c.2 .1) * a >= 0.0)
+                };
+                toward(y)
+                    .cmp(&toward(x))
+                    .then_with(|| dist_m(here, x.1).total_cmp(&dist_m(here, y.1)))
+            })
             .map(|(id, _, step)| (id, step))?;
 
         // Walk outward until `clear_m` past the exit, never along a runway
@@ -1477,6 +1532,10 @@ impl TaxiNet {
                     // runway as a way OUT and actively preferred driving
                     // across the other strip, with the metres counted as
                     // clearance (audit, 2026-08-02).
+                    // ...and the walk refuses it too, for the same reason.
+                    if zone_rank(e) == 2 {
+                        return None;
+                    }
                     self.nodes
                         .get(&nxt)
                         .map(|&p| (nxt, p, e.name.clone(), zone_rank(e)))
@@ -1558,6 +1617,7 @@ impl TaxiNet {
         hold_short_m: f64,
         hold_zone: &[String],
         to_runway: bool,
+        strip: Option<&Runway>,
     ) -> Option<TaxiRoutePlan> {
         let m_per_deg_lat = 111_320.0;
         let m_per_deg_lon = 111_320.0 * from_lat.to_radians().cos();
@@ -1596,7 +1656,7 @@ impl TaxiNet {
         // class, not a field: 3,498 of 21,656 runway ends snap to a
         // non-entrance, 551 of them badly (EFHK 04R, ENBO 07, ESNN 34).
         let goal = to_runway
-            .then(|| self.runway_entrance_near(to_lat, to_lon, &taxiway_nodes))
+            .then(|| self.runway_entrance_near(to_lat, to_lon, &taxiway_nodes, strip))
             .flatten()
             .or_else(|| snap_within(to_lat, to_lon, &taxiway_nodes))?;
         if start == goal {
@@ -1868,16 +1928,31 @@ impl TaxiNet {
     /// or one hop from a node that does — which is exactly how a network draws
     /// the stub from a holding point out to the centreline.
     ///
-    /// Nearest wins among entrances, with no check that the entrance belongs to
-    /// the runway asked for. At a parallel-runway field the entrances of the
-    /// other strip sit a runway separation away, so the right one wins on
-    /// distance anyway; a field that breaks that assumption would need the
-    /// destination runway's own geometry passed in.
+    /// ...and it must be an entrance to THIS strip, decided by geometry like
+    /// every other "is that pavement ours" question here: a runway node counts
+    /// only when it lies on `strip`'s own rectangle. Nearest-entrance-anywhere
+    /// was the rule, on the reasoning that a parallel field's other strip sits
+    /// a runway separation away and loses on distance. Le Bourget breaks it
+    /// end-on: 07 and 09 start 18 m apart and diverge, so 09's entrance (node
+    /// 201, 43 m from 07's threshold) beat 07's own (node 134, 67 m). The
+    /// tower cleared "holding point Alpha runway zero seven", the route was
+    /// planned to 09's hold, the active-zone trim cut its last three edges,
+    /// and the drive stopped 169 m from runway 07's centreline — 19 m outside
+    /// [`LINE_UP_MAX_LATERAL_M`](crate::nav) as the line-up sees it. The
+    /// lead-on ended 34 m off the 07 centreline too, so the authored entry
+    /// was refused as well, and full auto said "I couldn't get us onto the
+    /// runway" with the aircraft correctly parked where it had been sent
+    /// (2026-09-22). Across the whole apt.dat this is a class like the dead-end
+    /// snap above: 5,228 of 75,812 runway ends start within 300 m of a
+    /// different strip's end on a different course, at 1,815 fields.
+    /// `None` for the strip, or a strip no runway node sits on, keeps the old
+    /// nearest-anywhere rule — thin data degrades, never refuses.
     fn runway_entrance_near(
         &self,
         lat: f64,
         lon: f64,
         taxiway_nodes: &std::collections::HashSet<i64>,
+        strip: Option<&Runway>,
     ) -> Option<i64> {
         let m_per_deg_lat = 111_320.0;
         let m_per_deg_lon = 111_320.0 * lat.to_radians().cos();
@@ -1888,6 +1963,32 @@ impl TaxiNet {
         }
         if runway_nodes.is_empty() {
             return None;
+        }
+        // Ours, by geometry. The margin is the pavement's own half-width plus
+        // a shoulder for an author whose node sits off the painted edge; the
+        // along-track window is the strip's length plus the same, so a node
+        // just off the numbers still counts.
+        if let Some(r) = strip {
+            let half = (r.width_m / 2.0).max(15.0) + STRIP_NODE_SHOULDER_M;
+            let course = r.heading_a_deg();
+            let length = haversine_nm(r.lat_a, r.lon_a, r.lat_b, r.lon_b) * 1852.0;
+            let on_strip = |id: &i64| {
+                let Some(&(plat, plon)) = self.nodes.get(id) else {
+                    return false;
+                };
+                let d = haversine_nm(r.lat_a, r.lon_a, plat, plon) * 1852.0;
+                let brg = bearing_deg(r.lat_a, r.lon_a, plat, plon);
+                let ang = angle_diff_deg(brg, course).to_radians();
+                let along = d * ang.cos();
+                (d * ang.sin()).abs() <= half
+                    && along >= -STRIP_NODE_SHOULDER_M
+                    && along <= length + STRIP_NODE_SHOULDER_M
+            };
+            let ours: std::collections::HashSet<i64> =
+                runway_nodes.iter().copied().filter(on_strip).collect();
+            if !ours.is_empty() {
+                runway_nodes = ours;
+            }
         }
         let mut adjacent: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for e in &self.edges {
@@ -1913,6 +2014,11 @@ impl TaxiNet {
             .map(|(id, _)| id)
     }
 }
+
+/// How far off a strip's pavement a 1201 node may sit and still be read as a
+/// node ON that strip. Authors place the centreline nodes by hand, and the
+/// runway rectangle is the only geometry we have to judge them against.
+const STRIP_NODE_SHOULDER_M: f64 = 15.0;
 
 /// Pick the runway end best aligned into the wind. Returns the end's ident,
 /// its true heading, and the headwind component (negative = tailwind).
@@ -2928,7 +3034,7 @@ mod tests {
         // Routing to the runway ends at the entrance, hold-short trimmed off
         // the junction, with the drawn lead-on kept for the line-up.
         let plan = net
-            .plan_to_runway(35.9985, -5.0075, thr27.0, thr27.1, 40.0, &[])
+            .plan_to_runway(35.9985, -5.0075, thr27.0, thr27.1, 40.0, &[], None)
             .expect("a route exists");
         let end = *plan.path.last().unwrap();
         assert!(
@@ -2971,9 +3077,200 @@ mod tests {
             .unwrap()
             .expect("a network");
         assert!(
-            bare.plan_to_runway(35.9990, -5.0081, thr27.0, thr27.1, 40.0, &[])
+            bare.plan_to_runway(35.9990, -5.0081, thr27.0, thr27.1, 40.0, &[], None)
                 .is_some(),
             "no entrance in the data is not a reason to refuse to taxi"
+        );
+    }
+
+    /// Liege's shape: two parallels with a link between them, and the apron
+    /// on one side only (2026-09-22).
+    ///
+    /// A 737 landed 04R and the vacate took the link toward the parallel 04L
+    /// because its junction was 35 m nearer than the apron exit's, and
+    /// distance was the only test. It ended on the wrong side of the strip,
+    /// inside the other runway's authored zone, with every stand behind it -
+    /// so the taxi-in clearance came back across the runway and the drive was
+    /// asked for a 180 on a taxiway.
+    #[test]
+    fn a_vacate_turns_toward_the_apron_not_the_parallel() {
+        // Two east-west strips 400 m apart, a link between them, and an apron
+        // exit on the SOUTH side. Landing east on the south strip.
+        //
+        //        ======================== 09L/27R (north)
+        //                  |
+        //                 (20) link, 1 m NEARER than the apron exit
+        //                  |
+        //   ===(10)=======(11)=====(12)== 09R/27L (south, we land here)
+        //                                  |
+        //                                 (30) apron exit
+        //                                  |
+        //                                 (31) stand
+        let path = std::env::temp_dir().join("xc-taxi-parallel.dat");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "1    50 0 0 LTPA Parallel").unwrap();
+        writeln!(f, "100 45.00 1 0 0.25 0 3 0  09R 36.0000000 -5.0100000 0 0 3 3 0 1 27L 36.0000000 -4.9900000 0 0 3 3 0 1").unwrap();
+        writeln!(f, "100 45.00 1 0 0.25 0 3 0  09L 36.0036000 -5.0100000 0 0 3 3 0 1 27R 36.0036000 -4.9900000 0 0 3 3 0 1").unwrap();
+        writeln!(f, "1201 36.0000000 -5.0060000 both 10 rwyw").unwrap();
+        writeln!(f, "1201 36.0000000 -5.0010000 both 11 link").unwrap();
+        writeln!(f, "1201 36.0000000 -5.0004000 both 12 apron").unwrap();
+        writeln!(f, "1201 36.0018000 -5.0010000 both 19 linkmid").unwrap();
+        writeln!(f, "1201 36.0036000 -5.0010000 both 20 rwyn").unwrap();
+        writeln!(f, "1201 35.9982000 -5.0004000 both 30 s1").unwrap();
+        writeln!(f, "1201 35.9973000 -5.0004000 both 31 s2").unwrap();
+        writeln!(f, "1202 10 11 twoway runway 09R/27L").unwrap();
+        writeln!(f, "1202 11 12 twoway runway 09R/27L").unwrap();
+        // The link's FIRST hop is inside our own runway's zone, exactly as
+        // Liege's C3 is - so the "never onto another runway's pavement" rule
+        // cannot see the trap from the junction. Only the far half carries
+        // the parallel's zone, and by then the aircraft is committed.
+        writeln!(f, "1202 11 19 twoway taxiway A").unwrap();
+        writeln!(f, "1204 departure 09R,27L").unwrap();
+        writeln!(f, "1204 arrival 09R,27L").unwrap();
+        writeln!(f, "1202 19 20 twoway taxiway A").unwrap();
+        writeln!(f, "1204 departure 09L,27R").unwrap();
+        writeln!(f, "1204 arrival 09L,27R").unwrap();
+        writeln!(f, "1202 12 30 twoway taxiway S").unwrap();
+        writeln!(f, "1202 30 31 twoway taxiway S").unwrap();
+        writeln!(
+            f,
+            "1300 35.9971000 -5.0004000 0.0 gate jets|turboprops|props Stand 1"
+        )
+        .unwrap();
+        drop(f);
+        let net = find_taxi_net(path.to_str().unwrap(), "LTPA")
+            .unwrap()
+            .expect("a network");
+        let zone: Vec<String> = vec!["09R".into(), "27L".into()];
+        // Rolling east down 09R, west of both turn-offs.
+        let plan = net
+            .plan_vacate(36.0000, -5.0050, 90.0, &zone, VACATE_CLEAR_M)
+            .expect("a vacate plan");
+        let end = *plan.path.last().unwrap();
+        assert!(
+            end.0 < 36.0000,
+            "south, toward the apron - not north onto the parallel's link: {end:?}"
+        );
+        assert_eq!(plan.exit_name, "S");
+        // ...and with no stands at all in the data, the old distance-only
+        // rule stands: thin data degrades, it does not refuse.
+        let bare_path = std::env::temp_dir().join("xc-taxi-parallel-nostand.dat");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with("1300 "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&bare_path, text).unwrap();
+        let bare = find_taxi_net(bare_path.to_str().unwrap(), "LTPA")
+            .unwrap()
+            .expect("a network");
+        assert!(
+            bare.plan_vacate(36.0000, -5.0050, 90.0, &zone, VACATE_CLEAR_M)
+                .is_some(),
+            "no stands is not a reason to refuse to vacate"
+        );
+    }
+
+    /// Two strips that START next to each other and diverge — Le Bourget's
+    /// shape, which sent a departure to the wrong runway's holding point
+    /// (2026-09-22).
+    ///
+    /// LFPB's 07 and 09 thresholds are 18 m apart. Node 201, the stub that
+    /// enters runway 09, sits 43 m from the 07 threshold; node 134, the stub
+    /// that enters 07, sits 67 m. Nearest-entrance-anywhere therefore picked
+    /// 09's. The tower cleared "holding point Alpha runway zero seven", the
+    /// active-zone trim cut the route's last three edges, and the drive
+    /// stopped 169 m off runway 07's centreline with a lead-on that ended
+    /// 34 m off it — outside both of the line-up's gates, so full auto said
+    /// "I couldn't get us onto the runway" about an aircraft standing exactly
+    /// where it had been sent. An entrance has to be an entrance to the strip
+    /// that was asked for.
+    #[test]
+    fn a_runway_entrance_belongs_to_the_runway_asked_for() {
+        // Two strips from a common west end, diverging east. Each has its own
+        // stub off the same taxiway; the WRONG strip's stub is nearer the
+        // threshold we are routing to — the whole trap.
+        //
+        //          (11)===== 05/23 (diverges NE)
+        //   05 thr /
+        //   09 thr (10)===================== 09/27
+        //           |          |
+        //          (21)       (20)        <- 21 enters 05, 20 enters 09
+        //           |          |
+        //          (31)-------(30) taxiway A -- (40) stand
+        let path = std::env::temp_dir().join("xc-taxi-diverge.dat");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "1    50 0 0 LTDV Diverge").unwrap();
+        // 09/27 due east along lat 36.0000.
+        writeln!(f, "100 45.00 1 0 0.25 0 3 0  09 36.0000000 -5.0100000 0 0 3 3 0 1 27 36.0000000 -5.0000000 0 0 3 3 0 1").unwrap();
+        // 05/23 from 18 m north of the same west end, climbing NE.
+        writeln!(f, "100 45.00 1 0 0.25 0 3 0  05 36.0001600 -5.0100000 0 0 3 3 0 1 23 36.0060000 -5.0030000 0 0 3 3 0 1").unwrap();
+        writeln!(f, "1201 36.0000000 -5.0095000 both 10 rwy09").unwrap();
+        writeln!(f, "1201 36.0005000 -5.0089000 both 11 rwy05").unwrap();
+        writeln!(f, "1201 35.9996500 -5.0095000 both 20 hp09").unwrap();
+        writeln!(f, "1201 35.9996500 -5.0090000 both 21 hp05").unwrap();
+        writeln!(f, "1201 35.9993000 -5.0095000 both 30 a09").unwrap();
+        writeln!(f, "1201 35.9993000 -5.0090000 both 31 a05").unwrap();
+        writeln!(f, "1201 35.9993000 -5.0080000 both 40 stand").unwrap();
+        writeln!(f, "1202 10 60 twoway runway 09/27").unwrap();
+        writeln!(f, "1201 36.0000000 -5.0040000 both 60 rwy09e").unwrap();
+        writeln!(f, "1202 11 61 twoway runway 05/23").unwrap();
+        writeln!(f, "1201 36.0040000 -5.0055000 both 61 rwy05e").unwrap();
+        writeln!(f, "1202 20 10 twoway taxiway A1").unwrap();
+        writeln!(f, "1202 21 11 twoway taxiway A2").unwrap();
+        writeln!(f, "1202 30 20 twoway taxiway A").unwrap();
+        writeln!(f, "1202 31 21 twoway taxiway A").unwrap();
+        writeln!(f, "1202 30 31 twoway taxiway A").unwrap();
+        writeln!(f, "1202 40 30 twoway taxiway A").unwrap();
+        drop(f);
+        let net = find_taxi_net(path.to_str().unwrap(), "LTDV")
+            .unwrap()
+            .expect("a network");
+        let runways = find_runways(path.to_str().unwrap(), "LTDV").unwrap();
+        let five = runways
+            .iter()
+            .find(|r| r.ident_a == "05")
+            .expect("the 05/23 strip");
+        let m = |a: (f64, f64), b: (f64, f64)| {
+            let dx = (a.1 - b.1) * 111_320.0 * 36.0_f64.to_radians().cos();
+            let dy = (a.0 - b.0) * 111_320.0;
+            dx.hypot(dy)
+        };
+        let thr05 = (36.00016, -5.0100);
+        let (hp05, hp09) = ((35.99965, -5.0090), (35.99965, -5.0095));
+        // The trap: 09's stub really is the nearer node to 05's threshold.
+        assert!(
+            m(hp09, thr05) < m(hp05, thr05),
+            "the wrong strip's entrance is nearest — that is the whole trap"
+        );
+
+        // Without the strip, the old rule: 09's holding point for a 05
+        // departure.
+        let wrong = net
+            .plan_to_runway(35.9993, -5.0080, thr05.0, thr05.1, 40.0, &[], None)
+            .expect("a route");
+        assert_eq!(
+            wrong.holding_point, "A1",
+            "nearest-anywhere picks 09's stub: {:?}",
+            wrong.via
+        );
+
+        // With it, 05's own.
+        let right = net
+            .plan_to_runway(35.9993, -5.0080, thr05.0, thr05.1, 40.0, &[], Some(five))
+            .expect("a route");
+        assert_eq!(
+            right.holding_point, "A2",
+            "the strip we were asked for owns the entrance: {:?}",
+            right.via
+        );
+        // ...and the lead-on the line-up will drive ends on 05's centreline,
+        // not 34 m off somebody else's.
+        let last = *right.lead_on.last().expect("a lead-on to drive");
+        assert!(
+            m(last, (36.0005, -5.0089)) < 5.0,
+            "the lead-on ends at 05's junction node: {last:?}"
         );
     }
 
@@ -3211,7 +3508,7 @@ mod tests {
         let (tlat, tlon) = (36.6620, -4.5100); // runway 13 threshold, near enough
         let zone: Vec<String> = vec!["13".into(), "31".into()];
         let plan = net
-            .plan_to_runway(slat, slon, tlat, tlon, 100.0, &zone)
+            .plan_to_runway(slat, slon, tlat, tlon, 100.0, &zone, None)
             .expect("a route");
         // Distance from each route point to the nearest drawn centreline,
         // whatever direction it runs — a plain "how far off the paint is it".
@@ -3297,7 +3594,7 @@ mod tests {
         let (tlat, tlon) = (50.9589489, -1.3519495);
         let zone: Vec<String> = vec!["02".into(), "20".into()];
         let plan = net
-            .plan_to_runway(slat, slon, tlat, tlon, 100.0, &zone)
+            .plan_to_runway(slat, slon, tlat, tlon, 100.0, &zone, None)
             .expect("a route");
         let end = *plan.path.last().unwrap();
         let m = |a: (f64, f64), b: (f64, f64)| {
@@ -3321,6 +3618,97 @@ mod tests {
         assert!(
             !plan.lead_on.is_empty(),
             "a real entrance leaves the line-up a drawn lead-on"
+        );
+    }
+
+    /// The real Liege network behind the vacate-toward-the-apron fix.
+    /// `cargo test -p atc -- --ignored live_eblg_vacate --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn live_eblg_vacate_04r_turns_toward_the_apron() {
+        let path =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let Ok(Some(net)) = find_taxi_net(path, "EBLG") else {
+            return; // no install, no verdict
+        };
+        // Runway 04R, and the rolling handoff from the blackbox.
+        let thr = (50.6271539, 5.4278755);
+        let far = (50.6505719, 5.4650074);
+        let course = bearing_deg(thr.0, thr.1, far.0, far.1);
+        let ct = |p: (f64, f64)| {
+            let d = haversine_nm(thr.0, thr.1, p.0, p.1) * 1852.0;
+            let b = bearing_deg(thr.0, thr.1, p.0, p.1);
+            d * angle_diff_deg(b, course).to_radians().sin()
+        };
+        let zone = vec!["04R".to_string(), "22L".to_string()];
+        let plan = net
+            .plan_vacate(50.6357615, 5.4415500, 45.2, &zone, VACATE_CLEAR_M)
+            .expect("a vacate plan");
+        let end = *plan.path.last().unwrap();
+        println!(
+            "exit {} ends {:+.0} m from 04R (stand 35 is at {:+.0})",
+            plan.exit_name,
+            ct(end),
+            ct((50.637141, 5.449387))
+        );
+        // Every stand in the 13-35 group is on the positive side; C3, which
+        // the old nearest-junction rule took, is the link to the parallel
+        // 04L and ends 149 m out on the other one, inside 04L's own
+        // departure and arrival zones.
+        assert!(
+            ct(end) > 0.0,
+            "vacated onto the apron's side of the strip, not across to 04L: {:+.0} m",
+            ct(end)
+        );
+        assert_ne!(plan.exit_name, "C3", "C3 goes to the other runway");
+    }
+
+    /// The real Le Bourget network behind the diverging-strips fix.
+    /// `cargo test -p atc -- --ignored live_lfpb_runway_07 --nocapture`
+    #[test]
+    #[ignore] // needs the real X-Plane install; run with --ignored
+    fn live_lfpb_runway_07_holds_on_its_own_strip() {
+        let path =
+            "/Users/duanelicudi/X-Plane 12/Global Scenery/Global Airports/Earth nav data/apt.dat";
+        let Ok(Some(net)) = find_taxi_net(path, "LFPB") else {
+            return; // no install, no verdict
+        };
+        let runways = find_runways(path, "LFPB").unwrap();
+        let strip = runways
+            .iter()
+            .find(|r| r.ident_a == "07")
+            .expect("LFPB 07/25");
+        // The stand the sortie pushed off, and 07's threshold.
+        let (slat, slon) = (48.95620, 2.43880);
+        let (tlat, tlon) = (strip.lat_a, strip.lon_a);
+        let zone: Vec<String> = vec!["07".into(), "25".into()];
+        let plan = net
+            .plan_to_runway(slat, slon, tlat, tlon, 100.0, &zone, Some(strip))
+            .expect("a route");
+        // Cross-track of a point from 07's centreline, metres.
+        let course = strip.heading_a_deg();
+        let ct = |p: (f64, f64)| {
+            let d = haversine_nm(tlat, tlon, p.0, p.1) * 1852.0;
+            let b = bearing_deg(tlat, tlon, p.0, p.1);
+            d * angle_diff_deg(b, course).to_radians().sin()
+        };
+        let last = *plan.lead_on.last().expect("a lead-on to drive");
+        println!(
+            "holding point {} via {:?}, lead-on {} pts ending {:.1} m off 07",
+            plan.holding_point,
+            plan.via,
+            plan.lead_on.len(),
+            ct(last)
+        );
+        // Node 201 (the runway 09 stub, 34 m off 07) is what the old rule
+        // picked; node 134 (2.5 m off 07) is 07's own. The line-up's
+        // `line_up_path_from_lead_on` needs the lead-on to END on the
+        // centreline it is lining up on, within 20 m.
+        assert!(
+            ct(last).abs() < 20.0,
+            "the lead-on ends on runway 07's centreline, not runway 09's \
+             stub: {:.1} m off",
+            ct(last)
         );
     }
 
@@ -3890,7 +4278,7 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
         // behind a "runway behaviour unchanged" message — probed, the call
         // really does return None here, so assert it.
         assert!(
-            net.plan_to_runway(50.95005, -1.36005, 50.94995, -1.35985, 0.0, &[])
+            net.plan_to_runway(50.95005, -1.36005, 50.94995, -1.35985, 0.0, &[], None)
                 .is_none(),
             "a runway destination on the node we are already at is no taxi"
         );
@@ -3900,7 +4288,7 @@ SID:030,5,BLN4L,RW30,BLN,LE,D, ,VE  , ,   ,TF, , , , , ,      ,    ,    ,    ,  
         // refusal, because "no entrance in the data" is not a reason to refuse
         // to taxi (776 runway ends worldwide have none).
         let far = net
-            .plan_to_runway(50.95005, -1.36005, 50.9520, -1.3600, 0.0, &[])
+            .plan_to_runway(50.95005, -1.36005, 50.9520, -1.3600, 0.0, &[], None)
             .expect("no runway edges means the plain snap, not a refusal");
         let plain = net
             .plan(50.95005, -1.36005, 50.9520, -1.3600, 0.0, &[])

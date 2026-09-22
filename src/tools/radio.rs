@@ -554,7 +554,10 @@ mod tests {
     async fn a_read_only_knob_is_stepped_by_its_commands() {
         let _g = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p = crate::aircraft::load("airbus_a330_300").expect("A330 profile loads");
-        let knob = p.transponder_mode_knob.clone().expect("the knob is declared");
+        let knob = p
+            .transponder_mode_knob
+            .clone()
+            .expect("the knob is declared");
         let up = knob.up_command.clone().expect("stepped by command");
         let down = knob.down_command.clone().expect("stepped by command");
         publish_mode_knob(Some(knob.clone()));
@@ -575,7 +578,10 @@ mod tests {
         assert!(set_mode(&set, XpdrMode::Altitude).await);
         assert!(!set.ran(&ta_ra.up_command) && !set.ran(&alt_rpt.up_command));
         assert!(!set.ran(&up) && !set.ran(&down));
-        assert!(!set.wrote(&knob.dataref), "a read-only dataref is never written");
+        assert!(
+            !set.wrote(&knob.dataref),
+            "a read-only dataref is never written"
+        );
 
         // In standby, and a knob that never moves: stepped UP, bounded, and
         // reported as not set.
@@ -596,7 +602,10 @@ mod tests {
     async fn auto_with_tcas_in_standby_is_not_altitude() {
         let _g = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p = crate::aircraft::load("airbus_a330_300").expect("A330 profile loads");
-        let knob = p.transponder_mode_knob.clone().expect("the knob is declared");
+        let knob = p
+            .transponder_mode_knob
+            .clone()
+            .expect("the knob is declared");
         let ta_ra = knob
             .also
             .iter()

@@ -572,7 +572,10 @@ mod tests {
             undot_acronyms("Check the A.P.U. Your aircraft."),
             "Check the A P U. Your aircraft."
         );
-        assert_eq!(undot_acronyms("No A.P.U., no start."), "No A P U, no start.");
+        assert_eq!(
+            undot_acronyms("No A.P.U., no start."),
+            "No A P U, no start."
+        );
         // Letters come out as names, never a schwa.
         assert_eq!(
             say_letters(&undot_acronyms("A.P.U. off.")),

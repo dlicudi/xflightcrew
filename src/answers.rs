@@ -60,7 +60,10 @@ pub(crate) const HEAD_DREFS: [&str; 6] = [
 /// spatial knowledge PDF manuals can't carry. Self-gated: only a where/location
 /// question, and only for an item the profile actually knows (longest key match
 /// wins, so "fuel selector" beats "fuel"). `None` falls through to normal handling.
-pub(crate) fn location_answer(command: &str, profile: &aircraft::AircraftProfile) -> Option<String> {
+pub(crate) fn location_answer(
+    command: &str,
+    profile: &aircraft::AircraftProfile,
+) -> Option<String> {
     if profile.locations.is_empty() {
         return None;
     }
@@ -111,7 +114,10 @@ pub(crate) const MS_TO_KTS: f64 = 1.943_844;
 /// gear (where it retracts), flap state, speed against the approach reference,
 /// and the landing-phase SOP rows (landing light). Went to "No reading for
 /// that" live; this is the one question a copilot must answer well.
-pub(crate) async fn landing_readiness(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> String {
+pub(crate) async fn landing_readiness(
+    xp: &XPlaneClient,
+    profile: &aircraft::AircraftProfile,
+) -> String {
     let airborne = xp
         .get_float("sim/flightmodel/failures/onground_any")
         .await
@@ -193,7 +199,10 @@ pub(crate) async fn landing_readiness(xp: &XPlaneClient, profile: &aircraft::Air
 /// "Do we need any lights on?" / "are we configured right?" — the profile's SOP
 /// advisor table crossed with the live switches, spoken as a conclusion. Went to
 /// "No reading for that" live: the table knew the answer, nothing asked it.
-pub(crate) async fn config_advice(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> String {
+pub(crate) async fn config_advice(
+    xp: &XPlaneClient,
+    profile: &aircraft::AircraftProfile,
+) -> String {
     if profile.advisor.is_empty() {
         return "No configuration table for this airframe yet.".to_string();
     }
@@ -459,7 +468,10 @@ pub(crate) enum RemoteWeather {
 /// the plan's destination ("on arrival", "at the destination", "when we
 /// land"), its alternate, its origin ("back at departure"), or an ICAO
 /// spoken after "at/for/in". `None` means the sim's own weather answers.
-pub(crate) fn remote_weather_target(t: &str, plan: Option<&simbrief::FlightPlan>) -> Option<RemoteWeather> {
+pub(crate) fn remote_weather_target(
+    t: &str,
+    plan: Option<&simbrief::FlightPlan>,
+) -> Option<RemoteWeather> {
     let words: Vec<&str> = t.split_whitespace().collect();
     let has = |w: &str| words.contains(&w);
     let dest_cue = t.contains("arrival")
@@ -641,7 +653,9 @@ pub(crate) fn takeoff_runway_line(
             crate::circuit::spell_runway(&id),
             m(length_m)
         ),
-        Err(NoFit::TooLittleLeft { id, remaining_m, .. }) => format!(
+        Err(NoFit::TooLittleLeft {
+            id, remaining_m, ..
+        }) => format!(
             "Not from here. {} metres left on runway {}, and we need {need} at this weight. \
              A backtrack would do it.",
             m(remaining_m),
@@ -678,7 +692,9 @@ pub(crate) async fn takeoff_runway_answer(
     .unwrap_or_default();
     let fit = match crate::autotakeoff::runway_fit(&cands, lat, lon, psi, needed_m) {
         Some((rwy, remaining_m)) => Ok((rwy.id, remaining_m)),
-        None => Err(crate::autotakeoff::why_no_fit(&cands, lat, lon, psi, needed_m)),
+        None => Err(crate::autotakeoff::why_no_fit(
+            &cands, lat, lon, psi, needed_m,
+        )),
     };
     takeoff_runway_line(fit, needed_m)
 }
@@ -697,7 +713,10 @@ pub(crate) async fn read_engine0(xp: &XPlaneClient, name: &str) -> Option<f64> {
 /// the monitor uses, instead of reciting static POH numbers. (oil temp / CHT
 /// datarefs read °F despite their names.) The deterministic answer to "check all
 /// systems".
-pub(crate) async fn systems_check(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> String {
+pub(crate) async fn systems_check(
+    xp: &XPlaneClient,
+    profile: &aircraft::AircraftProfile,
+) -> String {
     let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running")
         .await
         .is_some_and(|v| v > 0.5);
@@ -821,7 +840,10 @@ pub(crate) fn is_power_loss_query(t: &str) -> bool {
 /// first, with the remedy in the same breath (the pilot asking this is about to
 /// be busy). Same trust model as `systems_check`: read the datarefs, never the
 /// LLM.
-pub(crate) async fn power_loss_diagnosis(xp: &XPlaneClient, profile: &aircraft::AircraftProfile) -> String {
+pub(crate) async fn power_loss_diagnosis(
+    xp: &XPlaneClient,
+    profile: &aircraft::AircraftProfile,
+) -> String {
     let running = read_engine0(xp, "sim/flightmodel/engine/ENGN_running")
         .await
         .is_some_and(|v| v > 0.5);

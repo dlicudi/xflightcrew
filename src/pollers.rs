@@ -122,6 +122,31 @@ pub(crate) const DR_OPT_VOICE: &str = "xcopilot/opt/voice";
 
 pub(crate) const DR_OPT_VOICE_LIST: &str = "xcopilot/opt/voice_list";
 
+/// The cabin crew's pick from the same roster. `-1` = unpublished.
+pub(crate) const DR_OPT_CABIN_VOICE: &str = "xcopilot/opt/cabin_voice";
+
+/// What a cabin-voice pick earns: the two intercom personas must never be
+/// one voice (the chime is not enough to tell the back from the right seat).
+#[derive(Debug, PartialEq)]
+pub(crate) enum CabinPick {
+    /// Already applied, or an index the roster lacks.
+    Ignore,
+    /// The copilot's own voice: refused, the old index republished.
+    Refuse,
+    Apply(String),
+}
+
+pub(crate) fn cabin_pick(v: i64, applied: i64, choices: &[String], pilot_spec: &str) -> CabinPick {
+    if v == applied {
+        return CabinPick::Ignore;
+    }
+    match usize::try_from(v).ok().and_then(|i| choices.get(i)) {
+        None => CabinPick::Ignore,
+        Some(spec) if spec == pilot_spec => CabinPick::Refuse,
+        Some(spec) => CabinPick::Apply(spec.clone()),
+    }
+}
+
 /// The panel's app-mode radio buttons (Both / Copilot only / ATC only) —
 /// values are `mode::Mode::panel_index`, `-1` = plugin default (unpublished).
 pub(crate) const DR_OPT_MODE: &str = "xcopilot/opt/mode";
@@ -147,7 +172,16 @@ pub(crate) static UI_SCALE: std::sync::atomic::AtomicI64 = std::sync::atomic::At
 /// stays empty. The roster re-publishes whenever the index reads -1 with a pick
 /// on record — that's the plugin's freshly-registered default, i.e. a plugin
 /// reload or sim restart wiped the panel's state.
-pub(crate) fn spawn_voice_picker(base_url: String, voice: Voice, current_spec: String) {
+///
+/// The cabin crew's picker rides the same thread and roster with its own
+/// index ([`DR_OPT_CABIN_VOICE`], resolved separately so a plugin built
+/// before it existed costs only the cabin's combo).
+pub(crate) fn spawn_voice_picker(
+    base_url: String,
+    voice: Voice,
+    current_spec: String,
+    current_cabin_spec: String,
+) {
     std::thread::spawn(move || {
         use base64::Engine;
         let choices = voice::pilot_voice_choices();
@@ -182,6 +216,13 @@ pub(crate) fn spawn_voice_picker(base_url: String, voice: Voice, current_spec: S
             .position(|c| *c == current_spec)
             .map_or(-1, |i| i as i64);
         let mut ids: Option<(i64, i64)> = None; // (list, index)
+        let mut pilot_spec = current_spec.clone();
+        let mut cabin_applied: i64 = choices
+            .iter()
+            .position(|c| *c == current_cabin_spec)
+            .map_or(-1, |i| i as i64);
+        let mut cabin_id: Option<i64> = None;
+        let mut pass: u64 = 0;
 
         let patch = |id: i64, value: serde_json::Value| -> bool {
             http.patch(format!("{rest}/datarefs/{id}/value"))
@@ -210,13 +251,53 @@ pub(crate) fn spawn_voice_picker(base_url: String, voice: Voice, current_spec: S
             let Some((list_id, idx_id)) = ids else {
                 continue;
             };
-            let picked = http
-                .get(format!("{rest}/datarefs/{idx_id}/value"))
-                .send()
-                .ok()
-                .filter(|r| r.status().is_success())
-                .and_then(|r| r.json::<serde_json::Value>().ok())
-                .and_then(|b| b.get("data").and_then(|d| d.as_i64()));
+            let read = |id: i64| -> Option<i64> {
+                http.get(format!("{rest}/datarefs/{id}/value"))
+                    .send()
+                    .ok()
+                    .filter(|r| r.status().is_success())
+                    .and_then(|r| r.json::<serde_json::Value>().ok())
+                    .and_then(|b| b.get("data").and_then(|d| d.as_i64()))
+            };
+            // The cabin's index first: the pilot's handling below leaves the
+            // pass early.
+            pass += 1;
+            if cabin_id.is_none() && pass % 10 == 1 {
+                cabin_id = crate::plugin_status::resolve_id(&http, &rest, DR_OPT_CABIN_VOICE)
+                    .filter(|id| patch(*id, serde_json::json!(cabin_applied)));
+            }
+            if let Some(cid) = cabin_id {
+                match read(cid) {
+                    None => cabin_id = None,
+                    // The plugin reloaded: republish.
+                    Some(v) if v < 0 => {
+                        if cabin_applied >= 0 && !patch(cid, serde_json::json!(cabin_applied)) {
+                            cabin_id = None;
+                        }
+                    }
+                    Some(v) => match cabin_pick(v, cabin_applied, &choices, &pilot_spec) {
+                        CabinPick::Ignore => {}
+                        CabinPick::Refuse => {
+                            patch(cid, serde_json::json!(cabin_applied));
+                            voice.say(
+                                voice::Priority::Advisory,
+                                "That's my voice. Pick another for the cabin.",
+                            );
+                        }
+                        CabinPick::Apply(spec) => {
+                            cabin_applied = v;
+                            tracing::info!(model = %spec, "panel cabin voice pick");
+                            voice.set_cabin_voice(spec.clone());
+                            prefs::save_cabin_voice(&spec);
+                            voice.say_cabin(
+                                voice::Priority::Advisory,
+                                "Flight deck, cabin crew. New voice, checked in.",
+                            );
+                        }
+                    },
+                }
+            }
+            let picked = read(idx_id);
             let Some(v) = picked else {
                 ids = None; // stale ids (sim restarted) — re-resolve
                 continue;
@@ -240,6 +321,7 @@ pub(crate) fn spawn_voice_picker(base_url: String, voice: Voice, current_spec: S
             tracing::info!(model = %spec, "panel voice pick");
             voice.set_pilot_voice(spec.clone());
             prefs::save_pilot_voice(&spec);
+            pilot_spec = spec.clone();
             // Confirmed in the new voice itself: the swap applies before the
             // next intercom utterance, which is exactly this line.
             voice.say(voice::Priority::Advisory, "New voice, checked in.");
@@ -387,3 +469,29 @@ pub(crate) const DR_OPT_SNAP: &str = "xcopilot/opt/camera_snap";
 pub(crate) const DR_OPT_TONE: &str = "xcopilot/opt/negative_tone";
 
 pub(crate) const DR_OPT_AUDIO_BUS: &str = "xcopilot/opt/audio_bus";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cabin_pick_is_never_the_copilots_voice() {
+        let choices: Vec<String> = ["models/amy.onnx", "models/cori.onnx", "models/hfc.onnx"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let pilot = "models/amy.onnx";
+        assert_eq!(cabin_pick(2, 2, &choices, pilot), CabinPick::Ignore);
+        assert_eq!(cabin_pick(7, 2, &choices, pilot), CabinPick::Ignore);
+        assert_eq!(cabin_pick(0, 2, &choices, pilot), CabinPick::Refuse);
+        assert_eq!(
+            cabin_pick(1, 2, &choices, pilot),
+            CabinPick::Apply("models/cori.onnx".to_string())
+        );
+        // A cabin voice from outside the roster (custom env path) shows -1.
+        assert_eq!(
+            cabin_pick(2, -1, &choices, pilot),
+            CabinPick::Apply("models/hfc.onnx".to_string())
+        );
+    }
+}

@@ -17,7 +17,9 @@ pub(crate) use crate::nav::{bearing_deg, haversine_nm, project_latlon};
 
 static TRACKING_ERROR: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
 pub fn last_tracking_error() -> Option<f64> {
-    if !ACTIVE.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+    if !ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -183,7 +185,9 @@ pub fn best_landing_runway(
     max_nm: f64,
     min_length_m: f64,
 ) -> std::io::Result<Option<Runway>> {
-    best_landing_runway_in_wind(apt_dat, lat, lon, track_deg, max_nm, min_length_m, &|_| None)
+    best_landing_runway_in_wind(apt_dat, lat, lon, track_deg, max_nm, min_length_m, &|_| {
+        None
+    })
 }
 
 /// The shortest strip the self-pick will take, metres: the airframe's landing
@@ -195,7 +199,9 @@ pub const SELF_PICK_MIN_LENGTH_M: f64 = 1200.0;
 pub fn self_pick_min_length_m(landing_distance_m: Option<f64>) -> f64 {
     landing_distance_m
         .filter(|d| d.is_finite() && *d > 0.0)
-        .map_or(SELF_PICK_MIN_LENGTH_M, |d| (d * 1.3).max(SELF_PICK_MIN_LENGTH_M))
+        .map_or(SELF_PICK_MIN_LENGTH_M, |d| {
+            (d * 1.3).max(SELF_PICK_MIN_LENGTH_M)
+        })
 }
 
 /// Nautical miles of detour one knot of TAILWIND is worth: ten knots on the
@@ -393,6 +399,8 @@ const IAS: &str = "sim/flightmodel/position/indicated_airspeed";
 /// lateral law feeds forward on final (heading vs track, the reference recipe).
 const PSI_TRUE: &str = "sim/flightmodel/position/psi";
 const HPATH_TRUE: &str = "sim/flightmodel/position/hpath";
+/// Bank, for the arrest's wings-level law once the servos are off.
+const PHI_TRUE: &str = "sim/flightmodel/position/true_phi";
 /// The vertical speed actually flown (the pilot's VSI). The shared name, not a
 /// local spelling: `cockpit2/gauges/indicators/vvi_dial_fpm` does not exist
 /// in X-Plane 12, and from 2026-07 to 2026-09-14 every read of it failed and
@@ -531,7 +539,6 @@ pub fn landed_runway() -> Option<String> {
         .unwrap_or_else(|e| e.into_inner())
         .clone()
 }
-
 
 /// Wheels on: the autopilot's approach is over and its servos come off. It
 /// flew the heading bug and the VS dial to the ground, and nothing ever took
@@ -859,6 +866,13 @@ pub fn run_autoland_scoped(
             // standing pull must not survive a go-around into the next one.
             let mut flare_pitch = FlarePitch::default();
             let mut pitch_yielded = false;
+            // The arrest has the servos (see `arrest_hands_step`); the
+            // wings-level law that holds the track while it does; the
+            // pilot has taken the roll for this approach.
+            let mut arrest_hands = false;
+            let mut wings = crate::autotakeoff::WingsLevel::default();
+            let mut roll_yielded = false;
+            let mut last_arresting = false;
             // Airspeed history for the throttle governor's derivative term — the
             // anti-stall reflex needs the TREND (kts/sec), not just the error.
             let mut prev_ias: Option<f64> = None;
@@ -909,11 +923,11 @@ pub fn run_autoland_scoped(
                 }
                 // One read burst — nine sequential HTTP awaits is the slow-tick
                 // disease that gave the takeoff its slew weave (sortie four).
-                let (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r, psi_r, hpath_r, ground_r) = tokio::join!(
+                let (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r, psi_r, hpath_r, ground_r, phi_r) = tokio::join!(
                     xp.get_float(LAT), xp.get_float(LON), xp.get_float(ELEV_M),
                     xp.get_float(AGL_M), xp.get_float(GS_MS), xp.get_float(MAG_VAR),
                     xp.get_float(IAS), xp.get_float(PSI_TRUE), xp.get_float(HPATH_TRUE),
-                    xp.get_float(ON_GROUND),
+                    xp.get_float(ON_GROUND), xp.get_float(PHI_TRUE),
                 );
                 let (Ok(lat), Ok(lon), Ok(elev_m), Ok(agl_m), Ok(gs_ms), Ok(var), Ok(ias), Ok(on_ground)) =
                     (lat_r, lon_r, elev_r, agl_r, gs_r, var_r, ias_r, ground_r)
@@ -1052,11 +1066,45 @@ pub fn run_autoland_scoped(
                         *LANDED_RUNWAY.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(rwy.id.clone());
                     }
-                    let xtk_m = cross_track_nm(lat, lon, &rwy) * M_PER_NM;
-                    let target = crate::autotakeoff::roll_target_heading(rwy.course_deg, xtk_m);
+                    let xtk_nm = cross_track_nm(lat, lon, &rwy);
+                    let xtk_m = xtk_nm * M_PER_NM;
+                    // The roll's own closure rate and its own tick time. The
+                    // approach path below never runs again once we are rolling
+                    // out, so `prev_xtk` is ours from here; its last value is
+                    // the final's, which is the continuity we want at the
+                    // wheels. The steering law used to be handed a HARDCODED
+                    // 0.4 s while this loop actually ticks at 300 ms plus two
+                    // round trips, so its lead term and its slew limit were
+                    // both computed against a clock that did not exist.
+                    let t_roll = std::time::Instant::now();
+                    let roll_dt = prev_xtk
+                        .map(|(_, t0)| t_roll.duration_since(t0).as_secs_f64())
+                        .filter(|d| (0.05..=3.0).contains(d))
+                        .unwrap_or(0.4);
+                    let xtk_rate = prev_xtk
+                        .filter(|_| roll_dt > 0.0)
+                        .map_or(0.0, |(x0, _)| (xtk_m - x0 * M_PER_NM) / roll_dt);
+                    prev_xtk = Some((xtk_nm, t_roll));
+                    let target = crate::autotakeoff::roll_target_heading(
+                        rwy.course_deg,
+                        xtk_m,
+                        xtk_rate,
+                        gs_kts,
+                    );
                     let psi = psi_r.as_ref().copied().unwrap_or(rwy.course_deg);
                     let err = ((target - psi + 540.0).rem_euclid(360.0)) - 180.0;
-                    let steer = roll_law.step(err, 0.4, gs_kts, 0.0);
+                    let steer = roll_law.step(err, roll_dt, gs_kts, 0.0);
+                    // The rollout kept no record of its own: the EGLF and LFPB
+                    // weaves had to be reconstructed from the 1 Hz `state`
+                    // samples, which is no way to read a control loop.
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({
+                            "event": "rollout", "gs": gs_kts, "xtk_m": xtk_m,
+                            "xtk_rate": xtk_rate, "err": err, "steer": steer,
+                            "trim": roll_law.trim(), "psi": psi, "dt": roll_dt,
+                        }),
+                    );
                     let thr_dref = throttle_dref();
                     let (_, _) = tokio::join!(
                         xp.set_float(&thr_dref, 0.0),
@@ -1243,6 +1291,7 @@ pub fn run_autoland_scoped(
                             side,
                             leg: crate::reversal::Leg::Outbound,
                             platform_ft,
+                            high: false,
                         });
                         if missed == Some(MissedStage::Reposition) {
                             go_around.hold_reposition();
@@ -1270,9 +1319,43 @@ pub fn run_autoland_scoped(
                 // speed until the aircraft is inbound and the ordinary
                 // guidance calls a final it is actually pointing down.
                 let mut pattern: Option<(f64, crate::reversal::Leg, f64)> = None;
+                // An inbound leg that went over the field is over: left
+                // alone it flies the runway heading away for ever.
+                if reversal.as_ref().is_some_and(|r| crate::reversal::overflown(r, along_nm)) {
+                    reversal = None;
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "reversal_overflown", "alt": alt,
+                            "radio": radio_ft, "dist": raw.dist_nm, "flown": reversals_flown}),
+                    );
+                }
                 if let Some(rev) = reversal.as_mut() {
                     recede_ref_nm = recede_ref_nm.max(raw.dist_nm);
                     let join = join_point_nm(rev.platform_ft, rwy.elev_ft);
+                    // Height first: a downwind begun far above the platform
+                    // extends until the rest of the pattern can lose it.
+                    let high = rev.leg == crate::reversal::Leg::Outbound
+                        && crate::reversal::too_high_to_turn(
+                            alt,
+                            rev.platform_ft,
+                            along_nm,
+                            join,
+                            gs_kts,
+                            crate::procedure::descent_fpm(),
+                        );
+                    if high && !rev.high {
+                        let above = ((alt - rev.platform_ft) / 100.0).round() * 100.0;
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "downwind_extended", "above_ft": above,
+                                               "along_nm": along_nm, "alt": alt}),
+                        );
+                        announce(
+                            format!("We're {above:.0} feet above the pattern. Extending the downwind to lose it."),
+                            Priority::Advisory,
+                        );
+                    }
+                    rev.high = high;
                     match crate::reversal::step(
                         rev,
                         &rwy,
@@ -1449,6 +1532,7 @@ pub fn run_autoland_scoped(
                                 alt,
                                 slow,
                                 max_climb_fpm(),
+                                crate::procedure::descent_fpm(),
                             ),
                             target_ias_kts: if inbound {
                                 scheduled_ias(g.dist_nm, approach_ias)
@@ -1540,12 +1624,74 @@ pub fn run_autoland_scoped(
                     // channels learned: a latch that re-arms is a fight over
                     // a control with a person on the other end.
                     (true, Some(v), false) => {
-                        Some(flare_pitch.step(g.target_vs_fpm, v, vvi_trend, tick_dt))
+                        Some(flare_pitch.step(
+                            g.target_vs_fpm,
+                            v,
+                            vvi_trend,
+                            tick_dt,
+                            g.phase == ApproachPhase::Flare,
+                        ))
                     }
                     _ => {
                         flare_pitch.reset();
                         None
                     }
+                };
+                // THE ARREST TAKES THE SERVOS. The pitch channel writes the
+                // yoke under the joystick override and the autopilot's pitch
+                // servo writes it back the same frame: LFPG 09R (2026-09-22)
+                // held 0.35 of elevator for three seconds and touched down at
+                // 0.1 degrees of pitch and -672 fpm, the sink following the
+                // VS dial's own slow shape exactly as it had before the
+                // elevator law existed (every 737 landing since it shipped
+                // shows the same). The channel is proven with the servos
+                // OFF - the takeoff rotates on it - so the roundout gate is
+                // where the autopilot comes off: pitch on the elevator
+                // channel, the runway track on the roll channel (the
+                // takeoff's wings-level law, banking toward the crabbed
+                // heading), the power on the governor. A balk or leaving
+                // the band hands the servos back and re-engages the modes;
+                // the rollout latch finds them already off.
+                let crabbed_true = match g.phase {
+                    ApproachPhase::Final | ApproachPhase::Flare => {
+                        (g.target_heading_deg + crab + trim).rem_euclid(360.0)
+                    }
+                    ApproachPhase::Intercept => g.target_heading_deg,
+                };
+                match arrest_hands_step(arrest_hands, g.arresting) {
+                    ArrestHands::Take => {
+                        let ok = xp.run_command(CMD_SERVOS_OFF).await.is_ok();
+                        arrest_hands = true;
+                        wings = crate::autotakeoff::WingsLevel::default();
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "arrest_hands", "taken": true, "ok": ok, "radio": radio_ft}),
+                        );
+                    }
+                    ArrestHands::Return => {
+                        let ok = xp.run_command(CMD_SERVOS_ON).await.is_ok();
+                        let _ = xp.run_command(CMD_HDG_MODE).await;
+                        let _ = xp.run_command(CMD_VS_MODE).await;
+                        let _ = xp.set_float(VS_DIAL, vs_dial).await;
+                        arrest_hands = false;
+                        crate::blackbox::record(
+                            "autoland",
+                            serde_json::json!({"event": "arrest_hands", "taken": false, "ok": ok, "radio": radio_ft}),
+                        );
+                    }
+                    ArrestHands::Off | ArrestHands::Keep => {}
+                }
+                // The wings while the arrest has the servos: a shallow bank
+                // toward the crabbed heading, wings level with no heading
+                // read. No bank read is no command (the channel expires).
+                let flare_ail = match (arrest_hands, phi_r.as_ref().ok().copied(), roll_yielded) {
+                    (true, Some(phi), false) => {
+                        let hdg_err = psi_r.as_ref().ok().map_or(0.0, |psi| {
+                            ((crabbed_true - psi + 540.0).rem_euclid(360.0)) - 180.0
+                        });
+                        Some(wings.step(phi, crate::autotakeoff::climb_bank_target(hdg_err), tick_dt))
+                    }
+                    _ => None,
                 };
                 *TRACKING_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(xtk_now * M_PER_NM);
                 crate::blackbox::record("autoland", serde_json::json!({
@@ -1555,20 +1701,21 @@ pub fn run_autoland_scoped(
                     "cmd_hdg": g.target_heading_deg, "ias": ias, "radio": radio_ft,
                     "phase": format!("{:?}", g.phase), "ga": ga, "crab": crab, "crab_raw": crab_raw,
                     "trim": trim, "xtk_m": xtk_now * M_PER_NM,
-                    "flare_elev": flare_elev,
+                    "flare_elev": flare_elev, "flare_ail": flare_ail, "hands": arrest_hands,
+                    "phi": phi_r.as_ref().ok().copied(),
+                    // Which leg of a reversal is flying: every pattern tick
+                    // reports phase Intercept, so without this the outbound,
+                    // the base and the inbound are one undifferentiated block
+                    // in the log and an overshoot cannot be read back to the
+                    // leg that flew it.
+                    "leg": pattern.map(|(_, leg, _)| leg.word()),
                 }));
 
                 // Lateral: heading bug in MAGNETIC (guidance is TRUE — see
                 // [`true_to_mag`] for the variation sign trap). On final and in
                 // the flare, add the wind crab so the commanded heading flies a
                 // runway-aligned TRACK; intercept vectors stay coarse.
-                let crabbed = match g.phase {
-                    ApproachPhase::Final | ApproachPhase::Flare => {
-                        (g.target_heading_deg + crab + trim).rem_euclid(360.0)
-                    }
-                    ApproachPhase::Intercept => g.target_heading_deg,
-                };
-                let mag_hdg = true_to_mag(crabbed, var);
+                let mag_hdg = true_to_mag(crabbed_true, var);
                 // Knob presses, not a raw write — registers on glass (G1000) too.
                 // Slew-capped: each press is an HTTP round trip, and the LXGB go-
                 // around's 178° flip stalled this loop ~5 s per tick (2026-07-14) —
@@ -1586,7 +1733,7 @@ pub fn run_autoland_scoped(
                 // change-gate would drop it exactly where it sits still), and
                 // simply not written otherwise — which hands the pitch back
                 // inside a second with nothing to remember.
-                let (_, hdg_st, vs_st, _, yield_r) = tokio::join!(
+                let (_, hdg_st, vs_st, _, yield_r, roll_yield_r) = tokio::join!(
                     crate::tools::autopilot::drive_heading_bug_step(&xp, mag_hdg, 30.0),
                     xp.get_float(HDG_STATUS),
                     xp.get_float(VS_STATUS),
@@ -1596,6 +1743,15 @@ pub fn run_autoland_scoped(
                             Some(e) => {
                                 let _ = xp.set_float(FLARE_PITCH, e).await;
                                 xp.get_float(FLARE_PITCH_YIELD).await
+                            }
+                            None => Ok(0.0),
+                        }
+                    },
+                    async {
+                        match flare_ail {
+                            Some(a) => {
+                                let _ = xp.set_float(FLARE_ROLL, a).await;
+                                xp.get_float(FLARE_ROLL_YIELD).await
                             }
                             None => Ok(0.0),
                         }
@@ -1612,21 +1768,40 @@ pub fn run_autoland_scoped(
                             serde_json::json!({"event": "pitch_yield", "radio": radio_ft}),
                         );
                         announce(
-                            "You have the pitch. I'm still on the bug and the power.".into(),
+                            "You have the pitch. I'm holding the wings and the power.".into(),
                             Priority::Caution,
                         );
                     }
                     flare_pitch.reset();
                 }
-                if hdg_st.unwrap_or(0.0) <= 0.5 {
-                    let _ = xp.run_command(CMD_HDG_MODE).await;
+                // Likewise the roll: the plugin dropped that override the
+                // frame the hand moved, and the elevator keeps flying.
+                if roll_yield_r.is_ok_and(|v| v > 0.5) && !roll_yielded {
+                    roll_yielded = true;
+                    crate::blackbox::record(
+                        "autoland",
+                        serde_json::json!({"event": "roll_yield", "radio": radio_ft}),
+                    );
+                    announce(
+                        "You have the roll. I'm on the elevator and the power.".into(),
+                        Priority::Caution,
+                    );
                 }
-                // Vertical: VS mode to the glidepath rate.
-                if vs_st.unwrap_or(0.0) <= 0.5 {
-                    let _ = xp.run_command(CMD_VS_MODE).await;
-                    // The engage syncs the dial to the CURRENT rate, so the
-                    // rate we want has to be written again after it.
-                    let _ = xp.set_float(VS_DIAL, vs_dial).await;
+                // Mode housekeeping is the autopilot's while it flies. With
+                // the arrest on the channels a mode press is at best nothing
+                // and at worst (an MCP that engages the master with the
+                // mode) the servo back on the yoke mid-flare.
+                if !arrest_hands {
+                    if hdg_st.unwrap_or(0.0) <= 0.5 {
+                        let _ = xp.run_command(CMD_HDG_MODE).await;
+                    }
+                    // Vertical: VS mode to the glidepath rate.
+                    if vs_st.unwrap_or(0.0) <= 0.5 {
+                        let _ = xp.run_command(CMD_VS_MODE).await;
+                        // The engage syncs the dial to the CURRENT rate, so the
+                        // rate we want has to be written again after it.
+                        let _ = xp.set_float(VS_DIAL, vs_dial).await;
+                    }
                 }
 
                 // Speed: hold the approach speed with the SAME governor the copilot
@@ -1772,7 +1947,11 @@ pub fn run_autoland_scoped(
                 // mode and tell the pilot — this is exactly when a hand on the
                 // yoke matters.
                 let vs_err = vvi.map(|v| v - g.target_vs_fpm);
+                // ...and never inside the arrest, where the autopilot has
+                // no vertical to hold: a watchdog re-engaging the servos at
+                // fifty feet would be the fight this change removes.
                 let not_held = g.phase != ApproachPhase::Flare
+                    && !g.arresting
                     && vs_err.is_some_and(|e| vs_not_held(e, prev_vs_err));
                 prev_vs_err = vs_err;
                 if not_held {
@@ -1856,6 +2035,7 @@ pub fn run_autoland_scoped(
                 if last_phase != Some(g.phase) {
                     let prev = last_phase;
                     last_phase = Some(g.phase);
+                    last_arresting = g.arresting;
                     // The landing light for the landing, at the final: the
                     // exterior-lights rule lights it lined up and puts it out
                     // at the vacate, and nothing lit it for the ARRIVAL. The
@@ -1888,7 +2068,7 @@ pub fn run_autoland_scoped(
 
                 // (Touchdown + rollout-to-stop is handled at the top of the loop,
                 // latched by `rolling_out`, before the approach guidance.)
-                tokio::time::sleep(std::time::Duration::from_millis(tick_ms(last_phase))).await;
+                tokio::time::sleep(std::time::Duration::from_millis(tick_ms(last_phase, last_arresting))).await;
             }
             // A newer loop (the clearance re-arm above, or any later arm) has
             // already set ACTIVE for itself; clearing it here would report
@@ -2270,7 +2450,11 @@ pub fn pattern_ias(approach_ias: f64, flap_limits: &[(f64, Option<f64>)]) -> f64
 /// The speed a give-up leaves the governor holding: the pattern speed, inside
 /// the placard of whatever flap is actually out, never under the approach
 /// speed. With the flaps up it is the clean approach speed.
-pub fn hand_back_speed_kts(approach_ias: f64, flap_ratio: f64, flap_limits: &[(f64, Option<f64>)]) -> f64 {
+pub fn hand_back_speed_kts(
+    approach_ias: f64,
+    flap_ratio: f64,
+    flap_limits: &[(f64, Option<f64>)],
+) -> f64 {
     if flap_ratio < 0.05 {
         return clean_approach_ias(approach_ias);
     }
@@ -2595,6 +2779,10 @@ impl FlarePower {
 /// flown on the elevator with the AP still holding the bug.
 const FLARE_PITCH: &str = "xcopilot/pitch";
 const FLARE_PITCH_YIELD: &str = "xcopilot/pitch_yield";
+/// The roll channel the takeoff's climb-out flies, and its take-back latch:
+/// with the servos off for the arrest, the runway track is held here.
+const FLARE_ROLL: &str = "xcopilot/roll";
+const FLARE_ROLL_YIELD: &str = "xcopilot/roll_yield";
 
 /// Elevator for a wanted sink rate, flown DIRECTLY instead of asked of the
 /// autopilot's vertical-speed mode.
@@ -2612,9 +2800,28 @@ const FLARE_PITCH_YIELD: &str = "xcopilot/pitch_yield";
 /// feet up, and a flare that over-rotates is a tail strike. The trim term is
 /// the standing pull the aircraft needs to hold the attitude, found by the
 /// integrator rather than assumed.
+///
+/// IN THE FLARE THE COLUMN ONLY COMES BACK, never forward (`ratchet`). A
+/// tracker that has BEATEN its target relaxes, and forward column a few feet
+/// up is a nosewheel-first landing. EGLF 06 (2026-09-22): the arrest pulled
+/// the 737 from -511 to -102 fpm against a -197 target, the error went
+/// negative and the elevator came back 0.35 -> 0.185 at thirteen feet, while
+/// [`FlarePower`] - unlocked by that very same arrest, sink now inside its
+/// `hold_sink_fpm` - walked the lever 0.29 to idle over the last 3.4 s. The
+/// thrust left DURING the arrest instead of before it, the sink rebuilt to
+/// -358 and worsening, and by then the law was saturated at
+/// [`FLARE_PITCH_MAX`] with nothing left to give. The cap still bounds the
+/// attitude, so the ratchet cannot buy a tail strike; a float it can buy is
+/// the overflight guard's to judge, and the guard already knows the recited
+/// landing distance.
+///
+/// The ROUNDOUT above the flare is ordinary flying and stays free both ways:
+/// the ratchet is the last few feet, where the only question left is how
+/// hard the wheels arrive.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FlarePitch {
     trim: f64,
+    held: f64,
 }
 
 /// Elevator per 100 fpm of sink error. A flare corrects hundreds of fpm with
@@ -2635,20 +2842,66 @@ const FLARE_PITCH_MIN: f64 = -0.10;
 impl FlarePitch {
     /// `vvi_trend` is fpm per second, positive = sink easing (the same sign
     /// the VS lead uses). `None` for either measurement holds what we had.
-    pub fn step(&mut self, target_fpm: f64, vvi_fpm: f64, vvi_trend: f64, dt_s: f64) -> f64 {
+    ///
+    /// `ratchet` is the flare proper (as against the roundout above it): see
+    /// [`FlarePitch`] for why the column only ever comes further back there.
+    pub fn step(
+        &mut self,
+        target_fpm: f64,
+        vvi_fpm: f64,
+        vvi_trend: f64,
+        dt_s: f64,
+        ratchet: bool,
+    ) -> f64 {
         let dt = dt_s.clamp(0.02, 0.5);
         // Positive error = sinking FASTER than wanted = pull.
         let err = (target_fpm - vvi_fpm) / 100.0;
         self.trim = (self.trim + err * FLARE_TRIM_PER_100FPM_S * dt)
             .clamp(FLARE_PITCH_MIN, FLARE_PITCH_MAX);
-        (err * FLARE_P_PER_100FPM - (vvi_trend / 100.0) * FLARE_D_PER_100FPM_S + self.trim)
-            .clamp(FLARE_PITCH_MIN, FLARE_PITCH_MAX)
+        let want = (err * FLARE_P_PER_100FPM - (vvi_trend / 100.0) * FLARE_D_PER_100FPM_S
+            + self.trim)
+            .clamp(FLARE_PITCH_MIN, FLARE_PITCH_MAX);
+        if !ratchet {
+            // The roundout is still ordinary flying: the law is free both ways.
+            self.held = 0.0;
+            return want;
+        }
+        self.held = self.held.max(want);
+        self.held
     }
 
-    /// Let go — the channel expires on its own within a second, but the
-    /// integrator must not carry a standing pull into the next approach.
+    /// Let go — the channel expires on its own within a second, but neither
+    /// the integrator nor the ratchet may carry a standing pull into the
+    /// next approach.
     pub fn reset(&mut self) {
-        self.trim = 0.0;
+        *self = Self::default();
+    }
+}
+
+/// Who has the servos this tick. The arrest flies the channels with the
+/// autopilot's servos OFF (the pitch servo writes the yoke back over the
+/// channel otherwise; LFPG 09R, 2026-09-22), takes them at the roundout
+/// gate and hands them back the tick the arrest ends without a landing (a
+/// balk, leaving the band). The rollout latch never reaches this decision:
+/// it disconnects on its own and finds the servos already off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrestHands {
+    /// The autopilot flies; nothing to do.
+    Off,
+    /// This tick: servos off, the channels take over.
+    Take,
+    /// The arrest has the servos and keeps flying the channels.
+    Keep,
+    /// This tick: servos on, modes re-engaged, the channels expire.
+    Return,
+}
+
+pub fn arrest_hands_step(taken: bool, arresting: bool) -> ArrestHands {
+    match (taken, arresting) {
+        (false, false) => ArrestHands::Off,
+        (false, true) => ArrestHands::Take,
+        (true, true) => ArrestHands::Keep,
+        (true, false) => ArrestHands::Return,
     }
 }
 
@@ -3033,7 +3286,12 @@ pub enum ApproachPhase {
 /// The Web API is served from X-Plane's flight loop, so this is sim frame
 /// time and it is spent where it buys something: fast where feet matter,
 /// unchanged out on the intercept where nothing moves in half a second.
-fn tick_ms(phase: Option<ApproachPhase>) -> u64 {
+fn tick_ms(phase: Option<ApproachPhase>, arresting: bool) -> u64 {
+    // The roundout is hand-flown on the channels too (it is where the
+    // servos come off), and it needs the flare's rate, not Final's.
+    if arresting {
+        return 100;
+    }
     match phase {
         // Over the threshold: the flare and the arrest.
         Some(ApproachPhase::Flare) => 100,
@@ -3510,7 +3768,7 @@ mod tests {
             // 3 seconds
             let trend = (p.vvi - prev) / dt;
             prev = p.vvi;
-            let e = law.step(target, p.vvi, trend, dt);
+            let e = law.step(target, p.vvi, trend, dt, false);
             worst_up = worst_up.max(e);
             p.step(e, dt);
         }
@@ -3533,6 +3791,100 @@ mod tests {
         assert!(
             worst_up <= FLARE_PITCH_MAX + 1e-9,
             "never past the clamp: {worst_up}"
+        );
+    }
+
+    /// EGLF 06, 2026-09-22: the arrest worked and then gave the runway back.
+    /// The law beat its target at thirteen feet, relaxed the column from 0.35
+    /// to 0.185 because the error had gone negative, and [`FlarePower`] -
+    /// unlocked by that very arrest - took the lever from 0.29 to idle over
+    /// the last 3.4 s. Touchdown at about 360 fpm and still worsening.
+    ///
+    /// The plant is the flare plant above with the thrust leaving underneath
+    /// it: a sinking bias that ramps in over three seconds, which is what
+    /// losing a third of a lever's travel at 140 kt feels like. Without the
+    /// ratchet the law hands it back; with it the column stays where the
+    /// arrest put it and the wheels arrive softly.
+    #[test]
+    fn the_flare_does_not_hand_back_the_arrest_when_the_thrust_leaves() {
+        struct Plant {
+            vvi: f64,
+            rate: f64,
+            /// Sink the departing thrust adds, fpm/s at full effect.
+            thrust_loss: f64,
+        }
+        impl Plant {
+            fn step(&mut self, elev: f64, dt: f64, retard: f64) {
+                let want = elev * 1400.0 - self.thrust_loss * retard;
+                self.rate += (want - self.rate) * (dt / 0.35).min(1.0);
+                self.vvi += self.rate * dt;
+            }
+        }
+
+        /// Fly the last four seconds and return the touchdown sink.
+        fn fly(ratchet: bool) -> f64 {
+            let mut law = FlarePitch::default();
+            let mut p = Plant {
+                vvi: -510.0, // where the EGLF arrest had got to at 21 ft
+                rate: 0.0,
+                thrust_loss: 260.0,
+            };
+            let (target, dt) = (-197.0, 0.1);
+            let mut prev = p.vvi;
+            for tick in 0..40 {
+                // The lever walks off over the last 3.4 s, as it did live.
+                let retard = (tick as f64 * dt / 3.4).clamp(0.0, 1.0);
+                let trend = (p.vvi - prev) / dt;
+                prev = p.vvi;
+                let e = law.step(target, p.vvi, trend, dt, ratchet);
+                p.step(e, dt, retard);
+            }
+            p.vvi
+        }
+
+        let handed_back = fly(false);
+        assert!(
+            handed_back < -300.0,
+            "the tracker must still reproduce the firm landing, or this test \
+             is not about EGLF any more: got {handed_back:.0}"
+        );
+        let held = fly(true);
+        assert!(
+            held > -300.0,
+            "the column stays where the arrest put it, so the wheels arrive \
+             under the instructor's firm threshold: got {held:.0}"
+        );
+        assert!(held < 0.0, "and the aircraft still lands: got {held:.0}");
+    }
+
+    /// The ratchet is the flare's, not the roundout's, and it never outlives
+    /// its approach: a balk and the next arrest starts from nothing.
+    #[test]
+    fn the_ratchet_is_the_flares_alone_and_resets_with_the_approach() {
+        let mut law = FlarePitch::default();
+        // Sinking hard: the law pulls, and the ratchet remembers it.
+        let pulled = law.step(-197.0, -600.0, 0.0, 0.1, true);
+        assert!(pulled > 0.0, "a sink that fast is a pull: {pulled}");
+        // Now beating the target by a mile. The tracker wants the column
+        // forward; in the flare it does not get it.
+        let held = law.step(-197.0, 0.0, 0.0, 0.1, true);
+        assert!(
+            held >= pulled,
+            "the flare's column only comes back: {pulled} then {held}"
+        );
+        // The same tick in the ROUNDOUT is ordinary flying.
+        let mut loose = FlarePitch::default();
+        loose.step(-197.0, -600.0, 0.0, 0.1, false);
+        let relaxed = loose.step(-197.0, 0.0, 0.0, 0.1, false);
+        assert!(
+            relaxed < held,
+            "the roundout is free both ways: {relaxed} against {held}"
+        );
+        law.reset();
+        let fresh = law.step(-197.0, 0.0, 0.0, 0.1, true);
+        assert!(
+            fresh < held,
+            "a new approach inherits no standing pull: {fresh} against {held}"
         );
     }
 
@@ -3572,10 +3924,17 @@ mod tests {
     /// updates. No gain fixes a bandwidth problem.
     #[test]
     fn the_flare_ticks_fast_enough_to_fly_an_arrest() {
-        assert_eq!(tick_ms(None), 400, "nothing to fly yet: unchanged");
-        assert_eq!(tick_ms(Some(ApproachPhase::Intercept)), 400, "miles out");
-        assert!(tick_ms(Some(ApproachPhase::Final)) <= 200);
-        let flare = tick_ms(Some(ApproachPhase::Flare));
+        assert_eq!(tick_ms(None, false), 400, "nothing to fly yet: unchanged");
+        assert_eq!(
+            tick_ms(Some(ApproachPhase::Intercept), false),
+            400,
+            "miles out"
+        );
+        assert!(tick_ms(Some(ApproachPhase::Final), false) <= 200);
+        let flare = tick_ms(Some(ApproachPhase::Flare), false);
+        // The roundout is the arrest's first half, flown on the same
+        // channels with the servos off: it ticks at the flare's rate.
+        assert_eq!(tick_ms(Some(ApproachPhase::Final), true), flare);
         assert!(flare <= 100, "the flare needs feet, not seconds: {flare}");
         // The 737's arrest lead is 1.5 s of dead time; a three second flare
         // must carry enough commands to matter through it.
@@ -3586,8 +3945,10 @@ mod tests {
         );
         // ...and it must never get SLOWER as the aircraft gets closer.
         assert!(
-            tick_ms(Some(ApproachPhase::Flare)) <= tick_ms(Some(ApproachPhase::Final))
-                && tick_ms(Some(ApproachPhase::Final)) <= tick_ms(Some(ApproachPhase::Intercept)),
+            tick_ms(Some(ApproachPhase::Flare), false)
+                <= tick_ms(Some(ApproachPhase::Final), false)
+                && tick_ms(Some(ApproachPhase::Final), false)
+                    <= tick_ms(Some(ApproachPhase::Intercept), false),
             "the tick rate must rise monotonically toward the ground"
         );
     }
@@ -4261,9 +4622,13 @@ mod tests {
         assert_eq!(g.balk, Some("overflew_the_runway"));
     }
 
-    /// The 737's vertical-speed mode, fitted to the EGCC 23L tick log
-    /// (2026-09-19): two first-order lags of 1.5 s in series and two
-    /// seconds of dead time (three ticks). Flown from 100 ft over the
+    /// The 737's vertical-speed mode, fitted to the LFPG 09R tick log
+    /// (2026-09-22, the dial stepped from -788 to +30 at the roundout gate
+    /// and to +100 at the flare's, the sink -801 to -699 in six seconds):
+    /// two first-order lags of 5 s in series and three seconds of dead time
+    /// (four ticks). The EGCC fit before it (1.5 s lags, 2 s dead) was
+    /// three times too quick, which is how the dial-path tests passed
+    /// while the aircraft arrived at -672. Flown from 100 ft over the
     /// numbers at the path sink, gs 132, with the flare's thrust reduction
     /// as the same sink disturbance the 172 plant carries. Returns the sink
     /// at the wheels, the shallowest rate seen (a balloon is positive), the
@@ -4272,8 +4637,8 @@ mod tests {
         let mut rwy = rwy_north();
         rwy.length_m = 3040.0;
         let dt = 0.7;
-        let (t1, t2) = (1.5, 1.5);
-        let dead_ticks = 3;
+        let (t1, t2) = (5.0, 5.0);
+        let dead_ticks = 4;
         let gs_kts = 132.0;
         let nominal = -(gs_kts / 60.0) * GLIDEPATH_FT_PER_NM;
         let mut radio = 100.0;
@@ -4331,31 +4696,48 @@ mod tests {
         }
     }
 
-    /// The live failure and its fix, through the fitted plant: the 172's
-    /// lead (gain 2, cap +300) pins the dial at a climb for seconds and the
-    /// jet balloons and floats; its own lead (gain 1.5, cap +100, a 1.5 s
-    /// trend term) arrests it without a balloon, inside the touchdown zone.
+    /// Through the servo as logged, the dial path arrives hard whatever
+    /// the lead: the 172's, the 737's own, or a dial pinned at the cap from
+    /// the gate. Six seconds of arrest against three of dead time and ten
+    /// of lag is arithmetic, not tuning, and it is why the arrest takes the
+    /// servos and flies the elevator (`arrest_hands_step`).
     #[test]
-    fn the_jets_arrest_neither_balloons_nor_floats() {
-        let (td, shallowest, along_m, flared) =
-            fly_jet_arrest(crate::aircraft::ArrestLeadProfile::default());
-        assert!(flared);
-        assert!(
-            shallowest > 0.0 || along_m > 1000.0,
-            "the 172's lead should reproduce the balloon or the float: {td:.0} fpm, {shallowest:.0} shallowest, {along_m:.0} m"
-        );
-
+    fn the_dial_path_cannot_arrest_the_737_through_its_logged_servo() {
         let jet = crate::aircraft::ArrestLeadProfile {
             gain: 1.5,
             max_climb_fpm: 100.0,
             trend_seconds: 1.5,
         };
-        let (td, shallowest, along_m, flared) = fly_jet_arrest(jet);
-        assert!(flared);
-        assert!(shallowest < 0.0, "ballooned to {shallowest:.0} fpm");
-        assert!(td > -300.0, "still firm: {td:.0} fpm at the wheels");
-        assert!(td < -60.0, "the arrest must still land, got {td:.0}");
-        assert!(along_m < 1000.0, "floated {along_m:.0} m");
+        let pinned = crate::aircraft::ArrestLeadProfile {
+            gain: 5.0,
+            max_climb_fpm: 1000.0,
+            trend_seconds: 0.0,
+        };
+        for (name, lead) in [
+            (
+                "the 172's lead",
+                crate::aircraft::ArrestLeadProfile::default(),
+            ),
+            ("the 737's lead", jet),
+            ("a dial pinned at +1000", pinned),
+        ] {
+            let (td, _, _, flared) = fly_jet_arrest(lead);
+            assert!(flared, "{name}: never reached the flare gate");
+            assert!(
+                td < -450.0,
+                "{name}: the logged servo cannot have arrested it, yet the plant landed at {td:.0} fpm"
+            );
+        }
+    }
+
+    /// The decision itself: taken at the roundout gate, kept through the
+    /// flare, returned the tick the arrest ends without wheels on.
+    #[test]
+    fn the_arrest_takes_the_servos_once_and_returns_them_on_a_balk() {
+        assert_eq!(arrest_hands_step(false, false), ArrestHands::Off);
+        assert_eq!(arrest_hands_step(false, true), ArrestHands::Take);
+        assert_eq!(arrest_hands_step(true, true), ArrestHands::Keep);
+        assert_eq!(arrest_hands_step(true, false), ArrestHands::Return);
     }
 
     /// The overflight rule must know a landing float from an overflight. At
@@ -4450,7 +4832,18 @@ mod tests {
         let at = |along_nm: f64, xtk_m: f64, radio: f64, gs: f64| {
             let (lat, lon) = project_latlon(0.0, 0.0, 180.0, along_nm);
             let (lat, lon) = project_latlon(lat, lon, 90.0, xtk_m / M_PER_NM);
-            guidance(lat, lon, radio, radio, gs, gs, &rwy_north(), 150.0, 25.0, 0.0)
+            guidance(
+                lat,
+                lon,
+                radio,
+                radio,
+                gs,
+                gs,
+                &rwy_north(),
+                150.0,
+                25.0,
+                0.0,
+            )
         };
         let g = at(3.0, 1880.0, 990.0, 160.0);
         assert_eq!(g.balk, Some("unstabilised_at_gate"));
@@ -4492,14 +4885,22 @@ mod tests {
     /// lever; 346 kt followed.
     #[test]
     fn a_give_up_hands_back_a_speed_the_configuration_allows() {
-        let limits = [(0.0, None), (0.5, Some(210.0)), (0.875, Some(175.0)), (1.0, Some(162.0))];
+        let limits = [
+            (0.0, None),
+            (0.5, Some(210.0)),
+            (0.875, Some(175.0)),
+            (1.0, Some(162.0)),
+        ];
         let half = hand_back_speed_kts(148.0, 0.5, &limits);
         assert!((160.0..=195.0).contains(&half), "{half}");
         // Full flap still out: inside ITS placard, never under the approach speed.
         let full = hand_back_speed_kts(148.0, 1.0, &limits);
         assert!((148.0..=150.0).contains(&full), "{full}");
         // Clean: the clean approach speed.
-        assert_eq!(hand_back_speed_kts(148.0, 0.0, &limits), clean_approach_ias(148.0));
+        assert_eq!(
+            hand_back_speed_kts(148.0, 0.0, &limits),
+            clean_approach_ias(148.0)
+        );
     }
 
     #[test]
@@ -4522,7 +4923,11 @@ mod tests {
         assert_eq!(stage, Some(MissedStage::Reposition));
         latch.hold_reposition();
         let stage = latch.update(None, ApproachPhase::Intercept, 1600.0, 5.8, 5.7, 5.75, 0.4);
-        assert_eq!(stage, Some(MissedStage::Reposition), "held abeam the join point");
+        assert_eq!(
+            stage,
+            Some(MissedStage::Reposition),
+            "held abeam the join point"
+        );
         latch.finish_reposition();
         assert!(!latch.active());
         // Unheld, the old rule still releases there.
@@ -6080,7 +6485,10 @@ mod tests {
         let wind = Some((240.0, 12.0));
         let downwind_end = landing_score(5.0, 0.0, 60.0, wind, 2500.0, 1200.0);
         let into_wind_end = landing_score(8.0, 40.0, 240.0, wind, 2500.0, 1200.0);
-        assert!(into_wind_end < downwind_end, "{into_wind_end} vs {downwind_end}");
+        assert!(
+            into_wind_end < downwind_end,
+            "{into_wind_end} vs {downwind_end}"
+        );
         // With no wind known the nearer end ahead still wins, as before.
         assert!(
             landing_score(5.0, 0.0, 60.0, None, 2500.0, 1200.0)

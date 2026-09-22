@@ -410,8 +410,7 @@ mod tests {
     #[tokio::test]
     async fn a_cart_still_driving_up_is_cancelled_by_disconnect() {
         let _g = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(std::time::Instant::now());
+        *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
         let cfg = crate::config::Config::default();
         let fake = FakeXPlane::with_reads(&[(GPU_VOLTS, 0.0), (GPU_ON, 0.0)]);
         let out = SetGroundPower
@@ -436,8 +435,7 @@ mod tests {
     async fn a_stale_cart_request_never_summons_a_cart() {
         let _g = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *CART_REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(
-            std::time::Instant::now()
-                - std::time::Duration::from_secs(CART_REQUEST_TTL_SECS + 60),
+            std::time::Instant::now() - std::time::Duration::from_secs(CART_REQUEST_TTL_SECS + 60),
         );
         let cfg = crate::config::Config::default();
         let fake = FakeXPlane::with_reads(&[(GPU_VOLTS, 0.0), (GPU_ON, 0.0)]);

@@ -503,6 +503,10 @@ pub(crate) const COMMAND_KEYWORDS: &[&str] = &[
     "plan",
     "route",
     "load",
+    // the load sheet ("board the passengers", "set the payload")
+    "payload",
+    "passengers",
+    "cargo",
     "program",
     "gps",
     "fms",

@@ -297,15 +297,86 @@ async fn light(tools: &SubTools, ctx: &ToolCtx<'_>, key: &str, on: bool) -> bool
 }
 
 /// Give up cleanly.
-fn give_up(voice: &Option<Voice>, line: &str, reason: &str) {
+/// The fastest a give-up may set the PARKING brake. The taxi governor only
+/// runs at taxi speeds, so this is belt and braces against a future caller:
+/// a park brake is a chock, not a stopping device.
+const HAND_BACK_BRAKE_MAX_KTS: f64 = 25.0;
+
+async fn give_up(
+    xp: &XPlaneClient,
+    valve_set: Option<f64>,
+    voice: &Option<Voice>,
+    line: &str,
+    reason: &str,
+) {
     RUN.fail(reason);
     ACTIVE.store(false, SeqCst);
     // "Your aircraft" means every lever: the mixture manager stands down with
     // the rest, never quietly re-trimming under the pilot's hand.
     crate::tools::engine::MIX_MANAGED.store(false, SeqCst);
     event("give_up", json!({ "reason": reason }));
+    // Held before it is said: the line claims the pilot has the aircraft, so
+    // whatever is going to hold it should already be holding it.
+    hand_back_brakes(xp, valve_set).await;
     clear_stage();
     announce(voice, Priority::Caution, line);
+}
+
+/// ...and on the ground it means the PARKING BRAKE holds the aircraft, not a
+/// control loop of ours.
+///
+/// A taxi that reaches its holding point stops there with the governor still
+/// running, target zero, squeezing the wheel brakes. That is deliberate, so
+/// the next "go" is instant, and the line it says is "holding position, brakes
+/// set" - but nothing ever turned it into a real parking brake when the
+/// MISSION ended. At Le Bourget the line-up refused, full auto said "your
+/// aircraft", and the governor went on holding the 737 for twenty-seven
+/// minutes: 3,736 more ticks of Web API load the sim did not get, `park` still
+/// 0.0 in every state record, and a proportional brake squeeze the pilot
+/// cannot find or release (the governor's own exit path says exactly that).
+/// CLAUDE.md has had the rule since the first orchestrator - brakes set for
+/// every wait, and every abort or give-up path sets them too - and this was
+/// the path that did not.
+///
+/// Only while the TAXI governor is the thing holding us, so a give-up at
+/// rolling speed or in the air can never slam a parking brake on: the flavour
+/// check is `taxi_hold_active`, and the governor's own next tick then sees the
+/// brake, closes the throttle, stands down and releases its own squeeze.
+async fn hand_back_brakes(xp: &XPlaneClient, valve_set: Option<f64>) {
+    hand_back_brakes_if(xp, crate::tools::speedhold::taxi_hold_active(), valve_set).await;
+}
+
+/// [`hand_back_brakes`] with the governor's flavour handed in, so the gates are
+/// a plain `cargo test` against the fake sim instead of a process-wide static.
+async fn hand_back_brakes_if(
+    xp: &dyn crate::xplane::XPlane,
+    taxi_holding: bool,
+    valve_set: Option<f64>,
+) {
+    if !taxi_holding {
+        return;
+    }
+    let (ground, gs) = tokio::join!(
+        xp.get_float(crate::datarefs::ON_GROUND_ANY),
+        xp.get_float(crate::autotaxi::GS_MS),
+    );
+    if !matches!(ground, Ok(g) if g > 0.5) {
+        return;
+    }
+    // A failed read is no measurement, and a parking brake is not a brake to
+    // set at a speed we could not confirm.
+    if !matches!(gs, Ok(v) if v.is_finite() && v.abs() * MS_TO_KTS < HAND_BACK_BRAKE_MAX_KTS) {
+        return;
+    }
+    let held = crate::tools::controls::drive_park_brake(xp, true, valve_set)
+        .await
+        .unwrap_or(false);
+    // Recorded, not `event`: the mission is over, so this must not reappear as
+    // a stage on the panel the moment `clear_stage` has run.
+    crate::blackbox::record(
+        "full_auto",
+        json!({ "stage": "hand_back_brakes", "detail": { "held": held } }),
+    );
 }
 
 /// The squawk still to dial: the tower's assigned code when the transponder
@@ -662,7 +733,14 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     macro_rules! bail_if_abort {
         () => {
             if ABORT.load(SeqCst) {
-                give_up(&voice, "Cancelled. Your aircraft.", "abort");
+                give_up(
+                    &xp,
+                    tools.taxi.park_brake_valve_set,
+                    &voice,
+                    "Cancelled. Your aircraft.",
+                    "abort",
+                )
+                .await;
                 return;
             }
         };
@@ -706,10 +784,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     );
     if !confirmed_ground(agl, ground) {
         give_up(
+            &xp,
+            tools.taxi.park_brake_valve_set,
             &voice,
             "Full auto needs confirmed ground contact. Say navigate to follow the plan, fly the ILS, or land for me when airborne.",
             "ground_unconfirmed",
-        );
+        )
+        .await;
         return;
     }
     // The callsign the tower knows us by, so our calls sound like a real pilot.
@@ -742,10 +823,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // the MD-82 taught us, from the other side (see `StartKind::None`).
         if tools.no_start_sequence {
             give_up(
+                &xp,
+                tools.taxi.park_brake_valve_set,
                 &voice,
                 "I don't have an engine start for this aircraft. Get the engines running and say full auto again.",
                 "no_start_sequence",
-            );
+            )
+            .await;
             return;
         }
         // Only turbine airframes need the APU/electrical bring-up; a piston's
@@ -838,10 +922,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         waiting("the engine to catch");
         if !wait_until(tools.engine_start_secs, 500, || engine_running(&xp)).await {
             give_up(
+                &xp,
+                tools.taxi.park_brake_valve_set,
                 &voice,
                 "The engine didn't catch. Full auto is off, your aircraft.",
                 "no_engine",
-            );
+            )
+            .await;
             return;
         }
         event("engine_running", json!({}));
@@ -919,17 +1006,15 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
     if let Some(sync) =
         crate::tools::instruments::sync_altimeter(&xp, tools.transition_altitude_ft).await
     {
-        announce(
-            &voice,
-            Priority::Advisory,
-            &format!(
-                "Altimeter set, {}.",
-                crate::tools::instruments::spoken_setting(sync.now)
-            ),
-        );
+        let priority = if sync.took() {
+            Priority::Advisory
+        } else {
+            Priority::Warning
+        };
+        announce(&voice, priority, &sync.line());
         event(
             "altimeter_set",
-            json!({ "inhg": (sync.now * 100.0).round() / 100.0, "was": (sync.was * 100.0).round() / 100.0 }),
+            json!({ "inhg": (sync.now * 100.0).round() / 100.0, "was": (sync.was * 100.0).round() / 100.0, "want": (sync.want * 100.0).round() / 100.0, "took": sync.took() }),
         );
     }
 
@@ -1080,10 +1165,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             let got = wait_until(180.0, 1000, || async { taxi_route_is_ours(&xp).await }).await;
             if !got {
                 give_up(
+                    &xp,
+                    tools.taxi.park_brake_valve_set,
                     &voice,
                     "No taxi clearance came back. Tune the tower and request taxi, then say full auto again.",
                     "no_taxi_clearance",
-                );
+                )
+                .await;
                 return;
             }
         }
@@ -1238,10 +1326,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             && !wait_until(600.0, 1000, || async { !crate::autotaxi::driving() }).await
         {
             give_up(
+                &xp,
+                tools.taxi.park_brake_valve_set,
                 &voice,
                 "The taxi didn't finish. Your aircraft.",
                 "taxi_stalled",
-            );
+            )
+            .await;
             return;
         }
         bail_if_abort!();
@@ -1262,10 +1353,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                     let (Ok(lat), Ok(lon)) = (xp.get_float(LAT).await, xp.get_float(LON).await)
                     else {
                         give_up(
+                            &xp,
+                            tools.taxi.park_brake_valve_set,
                             &voice,
                             "I can't read our position. Your aircraft.",
                             "no_position",
-                        );
+                        )
+                        .await;
                         return;
                     };
                     let dist_m = crate::nav::haversine_nm(lat, lon, hl, hn) * 1852.0;
@@ -1276,11 +1370,14 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             };
             if !near_hold {
                 give_up(
+                    &xp,
+                    tools.taxi.park_brake_valve_set,
                     &voice,
                     "The taxi ended before the holding point, so I'm standing down. \
                      Say fly the flight plan or full auto again and I'll take it from here.",
                     "taxi_incomplete",
-                );
+                )
+                .await;
                 return;
             }
         }
@@ -1327,11 +1424,14 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 // runway, below.
                 if !ensure_takeoff_cleared(&voice, &callsign, &mut read_back, true).await {
                     give_up(
+                        &xp,
+                        tools.taxi.park_brake_valve_set,
                         &voice,
                         "The tower never cleared us for takeoff. Your aircraft. \
                          Say full auto again once we're cleared.",
                         "no_takeoff_clearance",
-                    );
+                    )
+                    .await;
                     return;
                 }
                 bail_if_abort!();
@@ -1358,10 +1458,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 .await
                 {
                     give_up(
+                        &xp,
+                        tools.taxi.park_brake_valve_set,
                         &voice,
                         "The landing traffic never cleared. Holding short. Your aircraft.",
                         "line_up_behind_timeout",
-                    );
+                    )
+                    .await;
                     return;
                 }
                 bail_if_abort!();
@@ -1392,10 +1495,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 && !wait_until(600.0, 1000, || async { !crate::autotaxi::driving() }).await
             {
                 give_up(
+                    &xp,
+                    tools.taxi.park_brake_valve_set,
                     &voice,
                     "The line-up didn't finish. Your aircraft.",
                     "line_up_stalled",
-                );
+                )
+                .await;
                 return;
             }
             bail_if_abort!();
@@ -1411,19 +1517,35 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
                 // within a degree, the tower logging `lined_up=true`: the fit
                 // had failed on LENGTH (2026-09-20).
                 event("line_up_no_fit", json!({ "why": format!("{why:?}") }));
+                // ...and `NoneNear` is a gate like the rest when it knows
+                // which strip it looked for: at Le Bourget that was the runway
+                // the tower had cleared, sitting 169 m away, and the vague
+                // line was all the pilot got (2026-09-22).
                 use crate::autotakeoff::NoFit;
-                let line = match &why {
+                let named = match &why {
+                    Some(NoFit::NoneNear { id, .. }) => !id.is_empty(),
                     Some(
-                        w @ (NoFit::RunwayTooShort { .. }
+                        NoFit::RunwayTooShort { .. }
                         | NoFit::TooLittleLeft { .. }
-                        | NoFit::NotAligned { .. }),
-                    ) => format!(
+                        | NoFit::NotAligned { .. },
+                    ) => true,
+                    _ => false,
+                };
+                let line = match (&why, named) {
+                    (Some(w), true) => format!(
                         "{} Your aircraft.",
                         crate::autotakeoff::no_fit_line(w, false).0
                     ),
                     _ => "I couldn't get us onto the runway. Your aircraft.".to_string(),
                 };
-                give_up(&voice, &line, "line_up_failed");
+                give_up(
+                    &xp,
+                    tools.taxi.park_brake_valve_set,
+                    &voice,
+                    &line,
+                    "line_up_failed",
+                )
+                .await;
                 return;
             }
         }
@@ -1443,11 +1565,14 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // (already satisfied when the held-short path above got it first).
         if atc_running && !ensure_takeoff_cleared(&voice, &callsign, &mut read_back, false).await {
             give_up(
+                &xp,
+                tools.taxi.park_brake_valve_set,
                 &voice,
                 "We're lined up and ready, but the tower never cleared us for takeoff. \
                  Your aircraft. Say full auto again once we're cleared.",
                 "no_takeoff_clearance",
-            );
+            )
+            .await;
             return;
         }
         bail_if_abort!();
@@ -1475,11 +1600,14 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             waiting("the takeoff clearance");
             if !ensure_takeoff_cleared(&voice, &callsign, &mut read_back, false).await {
                 give_up(
+                    &xp,
+                    tools.taxi.park_brake_valve_set,
                     &voice,
                     "We're on the runway, but the tower never cleared us for takeoff. \
                      Your aircraft. Say full auto again once we're cleared.",
                     "no_takeoff_clearance",
-                );
+                )
+                .await;
                 return;
             }
             ensure_squawk(&xp, &ctx, &voice).await;
@@ -1512,10 +1640,13 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
             // already been spoken; this only stands the sequence down.
             if !crate::circuit::ACTIVE.load(SeqCst) {
                 give_up(
+                    &xp,
+                    tools.taxi.park_brake_valve_set,
                     &voice,
                     "The circuit didn't arm, so I'm standing down. Your aircraft.",
                     "circuit_refused",
-                );
+                )
+                .await;
                 return;
             }
             event("circuit_armed", json!({}));
@@ -1576,68 +1707,99 @@ async fn fly_route(
     // time, at the gate, so the taxi happens with the plan on the map.)
 
     if !matches!(tools.mission, Mission::Resume(_)) {
-    // --- Takeoff: the proven loop, armed through its tool so every arm-time
-    // gate applies (the pitch-channel probe included).
-    announce(
-        voice,
-        Priority::Advisory,
-        &format!(
-            "Cleared to go. Flying your plan to {}.",
-            route.dest_name
-        ),
-    );
-    if let Ok(reply) = tools.takeoff.execute(&json!({}), ctx).await {
-        announce(voice, Priority::Advisory, &reply);
-    }
-    if !crate::autotakeoff::ACTIVE.load(Relaxed) {
-        give_up(
+        // --- Takeoff: the proven loop, armed through its tool so every arm-time
+        // gate applies (the pitch-channel probe included).
+        announce(
             voice,
-            "The takeoff didn't arm, so the flight is off. Your aircraft.",
-            "takeoff_refused",
+            Priority::Advisory,
+            &format!("Cleared to go. Flying your plan to {}.", route.dest_name),
         );
-        return;
-    }
-    waiting("the takeoff");
-    if !wait_until(360.0, 1000, || async { !crate::autotakeoff::running() }).await {
-        if !ABORT.load(SeqCst) {
-            give_up(
-                voice,
-                "The takeoff never finished. Your aircraft.",
-                "takeoff_stalled",
-            );
-        } else {
-            give_up(voice, "Cancelled. Your aircraft.", "abort");
+        if let Ok(reply) = tools.takeoff.execute(&json!({}), ctx).await {
+            announce(voice, Priority::Advisory, &reply);
         }
-        return;
-    }
-    if crate::autotakeoff::outcome() != Some(sim::run::Outcome::Completed) {
-        give_up(
-            voice,
-            "The takeoff handed control back. Your aircraft.",
-            "takeoff_not_completed",
-        );
-        return;
-    }
-    let agl_ft = xp.get_float(AGL_M).await.unwrap_or(0.0) * M_TO_FT;
-    if agl_ft < AIRBORNE_MIN_AGL_FT {
-        give_up(
-            voice,
-            "The takeoff didn't get us airborne, so the flight is off.",
-            "takeoff_rejected",
-        );
-        return;
-    }
-    event("airborne", json!({ "agl_ft": agl_ft }));
-
-    } else {
-        let (ground, agl) = tokio::join!(xp.get_float(crate::datarefs::ON_GROUND_ANY), xp.get_float(AGL_M));
-        if !matches!((ground,agl), (Ok(g),Ok(h)) if g.is_finite() && h.is_finite() && g < 0.5 && h*M_TO_FT >= 1000.0) {
-            give_up(voice, "Aircraft state changed before resume. I'm monitoring only; you have control.", "resume_state_changed");
+        if !crate::autotakeoff::ACTIVE.load(Relaxed) {
+            give_up(
+                xp,
+                tools.taxi.park_brake_valve_set,
+                voice,
+                "The takeoff didn't arm, so the flight is off. Your aircraft.",
+                "takeoff_refused",
+            )
+            .await;
             return;
         }
-        event("resumed", json!({ "fix": route.legs.first().map(|l| &l.fix_ident) }));
+        waiting("the takeoff");
+        if !wait_until(360.0, 1000, || async { !crate::autotakeoff::running() }).await {
+            if !ABORT.load(SeqCst) {
+                give_up(
+                    xp,
+                    tools.taxi.park_brake_valve_set,
+                    voice,
+                    "The takeoff never finished. Your aircraft.",
+                    "takeoff_stalled",
+                )
+                .await;
+            } else {
+                give_up(
+                    xp,
+                    tools.taxi.park_brake_valve_set,
+                    voice,
+                    "Cancelled. Your aircraft.",
+                    "abort",
+                )
+                .await;
+            }
+            return;
+        }
+        if crate::autotakeoff::outcome() != Some(sim::run::Outcome::Completed) {
+            give_up(
+                xp,
+                tools.taxi.park_brake_valve_set,
+                voice,
+                "The takeoff handed control back. Your aircraft.",
+                "takeoff_not_completed",
+            )
+            .await;
+            return;
+        }
+        let agl_ft = xp.get_float(AGL_M).await.unwrap_or(0.0) * M_TO_FT;
+        if agl_ft < AIRBORNE_MIN_AGL_FT {
+            give_up(
+                xp,
+                tools.taxi.park_brake_valve_set,
+                voice,
+                "The takeoff didn't get us airborne, so the flight is off.",
+                "takeoff_rejected",
+            )
+            .await;
+            return;
+        }
+        event("airborne", json!({ "agl_ft": agl_ft }));
+    } else {
+        let (ground, agl) = tokio::join!(
+            xp.get_float(crate::datarefs::ON_GROUND_ANY),
+            xp.get_float(AGL_M)
+        );
+        if !matches!((ground,agl), (Ok(g),Ok(h)) if g.is_finite() && h.is_finite() && g < 0.5 && h*M_TO_FT >= 1000.0)
+        {
+            give_up(
+                xp,
+                tools.taxi.park_brake_valve_set,
+                voice,
+                "Aircraft state changed before resume. I'm monitoring only; you have control.",
+                "resume_state_changed",
+            )
+            .await;
+            return;
+        }
+        event(
+            "resumed",
+            json!({ "fix": route.legs.first().map(|l| &l.fix_ident) }),
+        );
         // Reload only after the explicit resume; fms_goto selects the joined fix.
-        let _ = xp.set_data("xcopilot/fms/route", route.fms_payload.as_bytes()).await;
+        let _ = xp
+            .set_data("xcopilot/fms/route", route.fms_payload.as_bytes())
+            .await;
         let _ = xp.set_int("xcopilot/fms/load", 1).await;
     }
 
@@ -1660,10 +1822,13 @@ async fn fly_route(
         xp.cancellation(),
     ) {
         give_up(
+            xp,
+            tools.taxi.park_brake_valve_set,
             voice,
             "The previous procedure is still stopping. Your aircraft.",
             "procedure_busy",
-        );
+        )
+        .await;
         return;
     }
     // The CLIMB and CRUISE checklists' mixture items, flown rather than read:
@@ -1701,17 +1866,34 @@ async fn fly_route(
     if !wait_enroute_working_the_radio(xp, ctx, voice, callsign, climb_to_ft, dest_tower).await {
         if !ABORT.load(SeqCst) {
             give_up(
+                xp,
+                tools.taxi.park_brake_valve_set,
                 voice,
                 "The enroute leg never completed. Your aircraft.",
                 "enroute_stalled",
-            );
+            )
+            .await;
         } else {
-            give_up(voice, "Cancelled. Your aircraft.", "abort");
+            give_up(
+                xp,
+                tools.taxi.park_brake_valve_set,
+                voice,
+                "Cancelled. Your aircraft.",
+                "abort",
+            )
+            .await;
         }
         return;
     }
     if ABORT.load(SeqCst) {
-        give_up(voice, "Cancelled. Your aircraft.", "abort");
+        give_up(
+            xp,
+            tools.taxi.park_brake_valve_set,
+            voice,
+            "Cancelled. Your aircraft.",
+            "abort",
+        )
+        .await;
         return;
     }
     event("enroute_complete", json!({}));
@@ -1737,10 +1919,13 @@ async fn fly_route(
     // safe corridor, the circuit's arrival rule); a visual autoland otherwise.
     let (Ok(lat), Ok(lon)) = (xp.get_float(LAT).await, xp.get_float(LON).await) else {
         give_up(
+            xp,
+            tools.taxi.park_brake_valve_set,
             voice,
             "I can't read our position for the arrival. Your aircraft.",
             "no_position",
-        );
+        )
+        .await;
         return;
     };
     let alt_msl_ft = xp.get_float(ALT_IND_FT).await.unwrap_or(0.0);
@@ -1794,10 +1979,13 @@ async fn fly_route(
         .is_some_and(|r| built.rwy_id.as_ref() != Some(r))
     {
         give_up(
+            xp,
+            tools.taxi.park_brake_valve_set,
             voice,
             "The arrival runway changed. The local route needs replanning. Your aircraft.",
             "local_runway_changed",
-        );
+        )
+        .await;
         return;
     }
     // The radio: tune the DESTINATION'S tower from its own apt.dat comm row —
@@ -1887,10 +2075,13 @@ async fn fly_route(
                 xp.cancellation(),
             ) {
                 give_up(
+                    xp,
+                    tools.taxi.park_brake_valve_set,
                     voice,
                     "The previous procedure is still stopping. Your aircraft.",
                     "procedure_busy",
-                );
+                )
+                .await;
                 return;
             }
         }
@@ -1982,11 +2173,14 @@ async fn fly_route(
             xp.set_float(VS_DIAL, 0.0),
         );
         give_up(
+            xp,
+            tools.taxi.park_brake_valve_set,
             voice,
             "The arrival isn't getting us there. Your aircraft. The autopilot is holding \
              heading and altitude, climb power set.",
             "arrival_stalled",
-        );
+        )
+        .await;
         return;
     }
     // A procedure→autoland handoff has a brief both-inactive window while the
@@ -2232,44 +2426,63 @@ pub fn brief_arrival(
             airport.name
         ));
     }
+    // (kind, spoken runway) per end with a published approach; the spoken
+    // runway per end with only a DME-fix straight-in.
     let (mut published, mut straight_in) = (Vec::new(), Vec::new());
     for r in &airport.runways {
         for id in [&r.ident_a, &r.ident_b] {
             let spoken = crate::circuit::spell_runway(id);
             if let Some(appch) = crate::nav::best_approach(cifp, dest, id) {
-                published.push(format!(
-                    "the {} on {spoken}",
-                    crate::procedure::approach_kind(&appch)
-                ));
+                published.push((crate::procedure::approach_kind(&appch), spoken));
             } else if !crate::nav::reconstruct_approach(fix_path, &airport, dest, id).is_empty() {
                 straight_in.push(spoken);
             }
         }
     }
-    let name = &airport.name;
-    let mut parts = Vec::new();
-    if !published.is_empty() {
-        parts.push(format!("{name} has {}", published.join(", ")));
-    }
-    if !straight_in.is_empty() {
-        parts.push(format!(
-            "{}a straight-in on {}",
-            if published.is_empty() {
-                format!("{name} has ")
-            } else {
-                "and ".to_string()
-            },
-            straight_in.join(" and ")
-        ));
-    }
-    Ok(if parts.is_empty() {
-        format!("{name} has no published approach and no straight-in, so I'll land visually. The wind at the time picks the runway.")
+    Ok(arrival_brief_line(
+        &airport.name,
+        airport.runways.len() * 2,
+        &published,
+        &straight_in,
+    ))
+}
+
+/// One line, sized to the field: a big airport's approaches are SUMMARISED
+/// ("the ILS on every runway"), a small one's are named. Eight runway ends
+/// read out one by one was a paragraph before the mission was said, and the
+/// wind sentence that followed said nothing the pilot did not know (EGSS-LFPG,
+/// 2026-09-22). Pure, tested.
+fn arrival_brief_line(
+    name: &str,
+    ends: usize,
+    published: &[(&str, String)],
+    straight_in: &[String],
+) -> String {
+    let kinds: std::collections::BTreeSet<&str> = published.iter().map(|(k, _)| *k).collect();
+    let what = if kinds.len() == 1 {
+        format!("the {}", kinds.iter().next().unwrap())
     } else {
-        format!(
-            "{}. The wind at the time picks the runway.",
-            parts.join(" ")
-        )
-    })
+        "a published approach".to_string()
+    };
+    let n = published.len();
+    if n > 0 && n == ends {
+        return format!("{name} has {what} on every runway.");
+    }
+    if n > 2 {
+        return format!("{name} has {what} on {n} of {ends} runway ends.");
+    }
+    let mut parts: Vec<String> = published
+        .iter()
+        .map(|(k, rwy)| format!("the {k} on {rwy}"))
+        .collect();
+    if !straight_in.is_empty() {
+        parts.push(format!("a straight-in on {}", straight_in.join(" and ")));
+    }
+    if parts.is_empty() {
+        format!("{name} has no published approach, so I'll land visually.")
+    } else {
+        format!("{name} has {}.", parts.join(" and "))
+    }
 }
 
 /// What the blocking arrival builder found: the approach plan + runway when
@@ -2673,26 +2886,32 @@ pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result
     let mut lines = Vec::new();
     // Fuel: below the minimum takeoff fuel is a refusal; under the block but
     // above the minimum is said with both numbers; at the block is a check.
+    // The unit is said ONCE: "12,880 pounds for the plan's 12,990" (the ack
+    // was a paragraph, EGSS-LFPG 2026-09-22).
     if let Some(fuel) = f.fuel_kg.filter(|_| fp.block_fuel_kg > 0.0) {
         let min = fp.min_takeoff_fuel_kg;
         if min > 0.0 && fuel < min * (1.0 - FUEL_MATCH_FRAC) {
             return Err(format!(
-                "Negative. {} of fuel aboard, and the plan needs at least {} to go. Fuel up and say it again.",
+                "Negative. {} of fuel aboard, and the plan needs at least {} to go. Say load the aircraft and I'll fuel it from the plan, then say it again.",
                 spoken_fuel(fuel),
                 spoken_fuel(min)
             ));
         }
+        let bare = |s: String| {
+            s.split_once(' ')
+                .map_or_else(|| s.clone(), |(n, _)| n.to_string())
+        };
         if fuel < fp.block_fuel_kg * (1.0 - FUEL_MATCH_FRAC) {
             lines.push(format!(
-                "Fuel {} aboard against a {} block, above the minimum, so we can go.",
+                "Fuel {} against a {} block, above the minimum.",
                 spoken_fuel(fuel),
-                spoken_fuel(fp.block_fuel_kg)
+                bare(spoken_fuel(fp.block_fuel_kg))
             ));
         } else {
             lines.push(format!(
-                "Fuel {} aboard for the plan's {}.",
+                "Fuel {} for the plan's {}.",
                 spoken_fuel(fuel),
-                spoken_fuel(fp.block_fuel_kg)
+                bare(spoken_fuel(fp.block_fuel_kg))
             ));
         }
     }
@@ -2718,7 +2937,7 @@ pub fn preflight(fp: &crate::simbrief::FlightPlan, f: &PreflightFacts) -> Result
                         w.spoken(w.payload_kg)
                     ));
                 } else {
-                    load.push_str(", loaded as planned");
+                    load.push_str(" as planned");
                 }
             }
             _ => {}
@@ -2772,6 +2991,69 @@ async fn runway_check(
 
 #[cfg(test)]
 mod tests {
+    /// LFPB 2026-09-22: the line-up refused at the holding point, full auto
+    /// said "your aircraft", and the taxi governor went on holding the 737 on
+    /// its wheel brakes for twenty-seven minutes with `park` at 0.0. A give-up
+    /// on the ground hands the hold to the PARKING brake so the loop can stop.
+    #[tokio::test]
+    async fn a_ground_give_up_hands_the_hold_to_the_parking_brake() {
+        use super::hand_back_brakes_if;
+        use crate::xplane::FakeXPlane;
+        const SET: &str = "sim/flight_controls/park_brake_set";
+        const PARK: &str = "sim/cockpit2/controls/parking_brake_ratio";
+
+        // Stopped at the hold with the governor holding us: the brake goes on,
+        // and the valve goes with it (the Baron's latching valve is why the
+        // raw ratio write is never the seam).
+        let xp = FakeXPlane::with_reads(&[
+            (crate::datarefs::ON_GROUND_ANY, 1.0),
+            (crate::autotaxi::GS_MS, 0.0),
+            (PARK, 0.0),
+        ]);
+        xp.step_on_command(SET, PARK, 1.0);
+        hand_back_brakes_if(&xp, true, Some(1.0)).await;
+        assert!(xp.ran(SET), "the parking brake is set");
+        assert!(
+            xp.ran("sim/flight_controls/park_brake_valve_open"),
+            "valve-aware, never a raw ratio write"
+        );
+
+        // Airborne: nothing. A give-up in the air hands back a flying
+        // aircraft, and a parking brake is not part of that.
+        let air = FakeXPlane::with_reads(&[
+            (crate::datarefs::ON_GROUND_ANY, 0.0),
+            (crate::autotaxi::GS_MS, 90.0),
+            (PARK, 0.0),
+        ]);
+        hand_back_brakes_if(&air, true, Some(1.0)).await;
+        assert!(!air.ran(SET), "no park brake in the air");
+
+        // Rolling: a parking brake is a chock, not a stopping device.
+        let fast = FakeXPlane::with_reads(&[
+            (crate::datarefs::ON_GROUND_ANY, 1.0),
+            (crate::autotaxi::GS_MS, 40.0),
+            (PARK, 0.0),
+        ]);
+        hand_back_brakes_if(&fast, true, Some(1.0)).await;
+        assert!(!fast.ran(SET), "not at 78 knots");
+
+        // Nothing of ours holding the aircraft: leave the brakes alone. The
+        // pilot may be sitting on the pedals, and a give-up is not a licence
+        // to move a control nobody asked us to move.
+        let idle = FakeXPlane::with_reads(&[
+            (crate::datarefs::ON_GROUND_ANY, 1.0),
+            (crate::autotaxi::GS_MS, 0.0),
+            (PARK, 0.0),
+        ]);
+        hand_back_brakes_if(&idle, false, Some(1.0)).await;
+        assert!(!idle.ran(SET), "no governor, no change");
+
+        // A failed groundspeed read is NO measurement, never an assumed zero.
+        let blind = FakeXPlane::with_reads(&[(crate::datarefs::ON_GROUND_ANY, 1.0), (PARK, 0.0)]);
+        hand_back_brakes_if(&blind, true, Some(1.0)).await;
+        assert!(!blind.ran(SET), "a speed we could not read is not a stop");
+    }
+
     #[test]
     fn full_auto_requires_both_instruments_to_confirm_ground_contact() {
         use super::confirmed_ground;
@@ -2855,12 +3137,12 @@ mod tests {
         let brief = super::preflight(&plan(true), &facts()).expect("fits");
         assert_eq!(
             brief,
-            "Fuel 240 pounds aboard for the plan's 240 pounds. \
-             3 passengers and 70 pounds of cargo, loaded as planned."
+            "Fuel 240 pounds for the plan's 240. \
+             3 passengers and 70 pounds of cargo as planned."
         );
         // A local plan has no load sheet and speaks the app's gallons.
         let brief = super::preflight(&plan(false), &facts()).expect("fits");
-        assert_eq!(brief, "Fuel 40 gallons aboard for the plan's 40 gallons.");
+        assert_eq!(brief, "Fuel 40 gallons for the plan's 40.");
         // Nothing readable, nothing said, nothing refused.
         let brief =
             super::preflight(&plan(true), &super::PreflightFacts::default()).expect("no facts");
@@ -2931,14 +3213,17 @@ mod tests {
             ..facts()
         };
         let why = super::preflight(&plan(true), &dry).expect_err("refused");
-        assert_eq!(why, "Negative. 180 pounds of fuel aboard, and the plan needs at least 230 pounds to go. Fuel up and say it again.");
+        assert_eq!(why, "Negative. 180 pounds of fuel aboard, and the plan needs at least 230 pounds to go. Say load the aircraft and I'll fuel it from the plan, then say it again.");
         // Between the minimum and the block: said, not refused.
         let light = super::PreflightFacts {
             fuel_kg: Some(104.0),
             ..facts()
         };
         let brief = super::preflight(&plan(true), &light).expect("goes");
-        assert!(brief.starts_with("Fuel 230 pounds aboard against a 240 pounds block, above the minimum, so we can go."), "{brief}");
+        assert!(
+            brief.starts_with("Fuel 230 pounds against a 240 block, above the minimum."),
+            "{brief}"
+        );
     }
 
     #[test]
@@ -2958,8 +3243,55 @@ mod tests {
         w.cargo_kg = 0.0;
         let brief = super::preflight(&solo, &facts()).expect("goes");
         assert!(
-            brief.ends_with("No passengers or cargo, loaded as planned."),
+            brief.ends_with("No passengers or cargo as planned."),
             "{brief}"
+        );
+    }
+
+    /// EGSS-LFPG, 2026-09-22: eight runway ends read out one by one before
+    /// the mission was even said. A field the approaches cover is one clause.
+    #[test]
+    fn the_arrival_brief_is_sized_to_the_field() {
+        let s = |v: &str| v.to_string();
+        let ils = |rwy: &str| ("ILS", s(rwy));
+        // Charles de Gaulle: four runways, the ILS on all eight ends.
+        let cdg: Vec<_> = [
+            "zero nine left",
+            "two seven right",
+            "zero nine right",
+            "two seven left",
+            "zero eight left",
+            "two six right",
+            "zero eight right",
+            "two six left",
+        ]
+        .into_iter()
+        .map(ils)
+        .collect();
+        assert_eq!(
+            super::arrival_brief_line("Charles De Gaulle", 8, &cdg, &[]),
+            "Charles De Gaulle has the ILS on every runway."
+        );
+        // Mixed kinds still cover the field.
+        let mut mixed = cdg.clone();
+        mixed[7] = ("RNAV", s("two six left"));
+        assert_eq!(
+            super::arrival_brief_line("Charles De Gaulle", 8, &mixed, &[]),
+            "Charles De Gaulle has a published approach on every runway."
+        );
+        // Partial cover on a big field is a count, not a list.
+        assert_eq!(
+            super::arrival_brief_line("Charles De Gaulle", 8, &cdg[..5], &[s("two six left")]),
+            "Charles De Gaulle has the ILS on 5 of 8 runway ends."
+        );
+        // A small field is named end by end.
+        assert_eq!(
+            super::arrival_brief_line("Exeter", 2, &[ils("two six")], &[s("zero eight")]),
+            "Exeter has the ILS on two six and a straight-in on zero eight."
+        );
+        assert_eq!(
+            super::arrival_brief_line("Axarquia", 2, &[], &[]),
+            "Axarquia has no published approach, so I'll land visually."
         );
     }
 
@@ -3009,10 +3341,7 @@ mod tests {
             "LXGB",
         )
         .expect("a brief");
-        assert_eq!(
-            brief,
-            "Gibraltar has a straight-in on two seven. The wind at the time picks the runway."
-        );
+        assert_eq!(brief, "Gibraltar has a straight-in on two seven.");
         // A destination the data doesn't have is a refusal, at the gate.
         let why = super::brief_arrival(
             apt.to_str().unwrap(),

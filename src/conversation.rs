@@ -628,8 +628,8 @@ fn preview_request(t: &str) -> Option<&str> {
         return Some("");
     }
     let rest = ["preview ", "explain "]
-    .iter()
-    .find_map(|prefix| t.strip_prefix(prefix))?;
+        .iter()
+        .find_map(|prefix| t.strip_prefix(prefix))?;
     rest.trim_start_matches("the ").strip_suffix(" checklist")
 }
 
@@ -729,14 +729,17 @@ pub fn resolve_there(text: &str, topic_query: Option<&str>) -> Option<String> {
     if !reminder || !toks.contains(&"there") {
         return None;
     }
-    let explicit = ["waypoint", "fix", "descent", "tod", "feet", "minutes", "minute", "altitude"]
-        .iter()
-        .any(|w| toks.contains(w));
+    let explicit = [
+        "waypoint", "fix", "descent", "tod", "feet", "minutes", "minute", "altitude",
+    ]
+    .iter()
+    .any(|w| toks.contains(w));
     if explicit {
         return None;
     }
     let topic = topic_query?;
-    let target = if topic.contains("waypoint") || topic.contains("fix") || topic.contains("how far") {
+    let target = if topic.contains("waypoint") || topic.contains("fix") || topic.contains("how far")
+    {
         "the next waypoint"
     } else if topic.contains("descent") || topic.contains("tod") {
         "top of descent"
@@ -994,7 +997,10 @@ mod tests {
             Some(Response::Checklist("before takeoff".into()))
         );
         // "Walk me through" is the instructor's, not the preview's.
-        assert_eq!(c.respond("walk me through the before takeoff checklist", now), None);
+        assert_eq!(
+            c.respond("walk me through the before takeoff checklist", now),
+            None
+        );
         let line = c.start_preview(
             "Before Takeoff".into(),
             vec!["Brakes set".into(), "Flaps ten".into()],
@@ -1076,7 +1082,11 @@ mod tests {
         let now = Instant::now();
         let mut c = Conversation::default();
         assert!(resolve_there("remind me when we get there", None).is_none());
-        c.observe("How long till next waypoint?", "Next waypoint PIMOS, 18 miles, 18 minutes.", now);
+        c.observe(
+            "How long till next waypoint?",
+            "Next waypoint PIMOS, 18 miles, 18 minutes.",
+            now,
+        );
         let topic = c.recent_observation_query(now);
         assert_eq!(topic.as_deref(), Some("how long till next waypoint"));
         assert_eq!(
@@ -1084,19 +1094,45 @@ mod tests {
             Some("remind me when we get the next waypoint")
         );
         // An explicit target is left alone; so is a reminder with no "there".
-        assert!(resolve_there("remind me when we get to the next waypoint", topic.as_deref()).is_none());
+        assert!(resolve_there(
+            "remind me when we get to the next waypoint",
+            topic.as_deref()
+        )
+        .is_none());
         assert!(resolve_there("remind me in ten minutes", topic.as_deref()).is_none());
         // Top of descent as the topic.
-        c.observe("when is top of descent", "About 20 minutes to top of descent, 30 miles ahead.", now);
+        c.observe(
+            "when is top of descent",
+            "About 20 minutes to top of descent, 30 miles ahead.",
+            now,
+        );
         assert_eq!(
-            resolve_there("wake me when we get there", c.recent_observation_query(now).as_deref()).as_deref(),
+            resolve_there(
+                "wake me when we get there",
+                c.recent_observation_query(now).as_deref()
+            )
+            .as_deref(),
             Some("wake me when we get top of descent")
         );
         // A destination ETA has no reminder to arm: unresolved, on purpose.
-        c.observe("how long shall we get to arrival", "About 41 minutes to LEMG.", now);
-        assert!(resolve_there("remind me when we get there", c.recent_observation_query(now).as_deref()).is_none());
+        c.observe(
+            "how long shall we get to arrival",
+            "About 41 minutes to LEMG.",
+            now,
+        );
+        assert!(resolve_there(
+            "remind me when we get there",
+            c.recent_observation_query(now).as_deref()
+        )
+        .is_none());
         // The topic expires with the conversation's own TTL.
-        c.observe("how far to the next fix", "Next waypoint PIMOS, 5 miles.", now);
-        assert!(c.recent_observation_query(now + TOPIC_TTL + Duration::from_secs(1)).is_none());
+        c.observe(
+            "how far to the next fix",
+            "Next waypoint PIMOS, 5 miles.",
+            now,
+        );
+        assert!(c
+            .recent_observation_query(now + TOPIC_TTL + Duration::from_secs(1))
+            .is_none());
     }
 }

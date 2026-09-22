@@ -644,15 +644,45 @@ pub(crate) fn project_signed(path: &[(f64, f64)], lat: f64, lon: f64) -> Option<
 /// 60 m short of its node, the plain projection put the Baron on the
 /// stand-to-node leg it had just been pushed down, and the join drove a
 /// loop back to the node before setting off (Malaga, 12:11Z, 2026-09-11).
+///
+/// ...but only while the facing paint is paint we could actually be joining.
+/// The filter used to be all-or-nothing - whatever survived it won, however
+/// far away, and the plain projection was consulted only when NOTHING
+/// survived. At Liege (2026-09-22) the taxi-in route ran back the way the
+/// aircraft had just vacated, so at the engage every segment was outside the
+/// window, the fallback correctly gave 0.9 m at 5 m along, and `remaining`
+/// sat frozen there for fourteen seconds while the drive tried to turn round.
+/// Then the nose swung far enough for ONE far segment - the leg back across
+/// the runway - to enter the window, and it became the whole projection:
+/// offset 13 m to 155 m and progress 5 m to 144.6 m between two ticks, which
+/// tripped the off-route guard and stopped the aircraft with "we're off the
+/// cleared route" about a route it was sitting on. A jump in a projection is
+/// never a movement of the aircraft. Past [`FACING_REACH_M`] the facing pick
+/// is not a leg we are joining, it is a leg somewhere else, and the nearest
+/// paint is the honest answer.
 pub(crate) fn project_signed_facing(
     path: &[(f64, f64)],
     lat: f64,
     lon: f64,
     heading_true: f64,
 ) -> Option<(f64, f64)> {
-    project_signed_with(path, lat, lon, Some(heading_true))
-        .or_else(|| project_signed_with(path, lat, lon, None))
+    let plain = project_signed_with(path, lat, lon, None);
+    match project_signed_with(path, lat, lon, Some(heading_true)) {
+        Some(facing)
+            if facing.1.abs() <= FACING_REACH_M
+                || plain.is_none_or(|p| facing.1.abs() <= p.1.abs()) =>
+        {
+            Some(facing)
+        }
+        _ => plain,
+    }
 }
+
+/// How far off a facing segment may lie and still be read as the leg the
+/// aircraft is joining. The auto-taxi's own engage limit
+/// ([`crate::autotaxi::MAX_JOIN_M`]): further off than that is a refusal
+/// there, so it cannot be the thing we are steering at here either.
+const FACING_REACH_M: f64 = crate::autotaxi::MAX_JOIN_M;
 
 fn project_signed_with(
     path: &[(f64, f64)],
@@ -735,6 +765,52 @@ mod tests {
         // No leg runs the way we face: the plain nearest, never nothing.
         let east = [ll(0.0, 0.0), ll(200.0, 0.0)];
         assert!(project_signed_facing(&east, ll(100.0, 5.0).0, ll(100.0, 5.0).1, 270.0).is_some());
+    }
+
+    /// Liege 2026-09-22: the taxi-in route ran back the way the aircraft had
+    /// just vacated, so at the engage no segment faced the nose and the plain
+    /// nearest (0.9 m, 5 m along) was right. Fourteen seconds later the nose
+    /// had swung far enough for the leg back across the runway to enter the
+    /// facing window, and that leg - 155 m away - became the whole projection.
+    /// The off-route guard saw 155 m, stopped the aircraft and said "we're off
+    /// the cleared route" about a route it was standing on.
+    #[test]
+    fn a_facing_leg_out_of_reach_never_becomes_the_projection() {
+        // A route that leaves us, doubles back 160 m to the side and runs on:
+        // the doubled-back leg faces roughly the way we end up pointing.
+        let route = [
+            ll(0.0, 0.0),
+            ll(0.0, -200.0),
+            ll(160.0, -200.0),
+            ll(160.0, 200.0),
+        ];
+        // On the first leg, 1 m to the side, pointing back up it (north) -
+        // nothing faces us, so the nearest paint is the answer.
+        let (lat, lon) = ll(1.0, -5.0);
+        let (along, off) = project_signed_facing(&route, lat, lon, 0.0).unwrap();
+        assert!(
+            (along - 5.0).abs() < 2.0 && off.abs() < 3.0,
+            "the paint under us: along {along}, off {off}"
+        );
+        // Now swung to the north-ish, where the far leg (+160 m out, running
+        // north) IS within the facing window. It is still 159 m away and the
+        // paint under us is 1 m away: the projection must not jump to it.
+        let (along2, off2) = project_signed_facing(&route, lat, lon, 10.0).unwrap();
+        assert!(
+            off2.abs() < 10.0,
+            "a projection that jumps 150 m is not a movement of the aircraft: \
+             along {along2}, off {off2}"
+        );
+        // ...and a facing leg that IS within reach still wins, which is the
+        // whole point of the filter (the Malaga pushback above).
+        let near = [
+            ll(0.0, 0.0),
+            ll(0.0, -200.0),
+            ll(40.0, -200.0),
+            ll(40.0, 200.0),
+        ];
+        let (_, off3) = project_signed_facing(&near, lat, lon, 10.0).unwrap();
+        assert!(off3.abs() > 20.0, "the facing leg 39 m out: {off3}");
     }
 
     /// Right of the route is positive, left is negative, and the plain

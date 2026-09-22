@@ -1412,7 +1412,10 @@ mod tests {
             target_hdg: 176.6,
             node: (LAT0, LON0),
         };
-        assert!(done(65.3, 139.6, &p), "past the chase margin by the numbers");
+        assert!(
+            done(65.3, 139.6, &p),
+            "past the chase margin by the numbers"
+        );
         // Two seconds ago the error was 146.5: the tug is turning us.
         assert!(swing_in_progress(true, 146.5, 139.6));
         // The same swing with the bar OFF is not the tug's doing.
