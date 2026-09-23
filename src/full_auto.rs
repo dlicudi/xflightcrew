@@ -508,7 +508,11 @@ async fn wait_enroute_working_the_radio(
                     announce(
                         voice,
                         Priority::Advisory,
-                        if on { "Seat belt signs on." } else { "Seat belt signs off." },
+                        if on {
+                            "Seat belt signs on."
+                        } else {
+                            "Seat belt signs off."
+                        },
                     );
                 }
             }
@@ -983,7 +987,10 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         if let Some(line) = crate::takeoff_config::line("Takeoff config", &cfg) {
             announce(&voice, Priority::Advisory, &line);
         }
-        event("takeoff_config", json!({"set": cfg.set, "not_taken": cfg.not_taken}));
+        event(
+            "takeoff_config",
+            json!({"set": cfg.set, "not_taken": cfg.not_taken}),
+        );
     }
     bail_if_abort!();
 
@@ -2519,7 +2526,11 @@ async fn call_inbound(
     // made this call on Carlisle's frequency, where COM1 had sat since the
     // Scottish border, it went into the void marked as made, and Exeter
     // challenged the arrival as an unknown aircraft (2026-09-21).
-    let tuned = xp.get_float(COM1_FREQ_KHZ).await.ok().map(|v| v.round() as i64);
+    let tuned = xp
+        .get_float(COM1_FREQ_KHZ)
+        .await
+        .ok()
+        .map(|v| v.round() as i64);
     if !inbound_on_frequency(tuned, khz) {
         let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
         event("inbound_retune", json!({ "khz": khz, "was": tuned }));

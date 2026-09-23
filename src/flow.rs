@@ -34,6 +34,8 @@
 //! checklist when you're ready?") and "go ahead" starts the Crew flavour,
 //! "talk me through it" the Instruct flavour. A proposal never acts on its
 //! own (the cockpit_auto rule: an unasked action is a fight with the pilot).
+//! The after-landing list is not proposed: it is the copilot's own clean-up
+//! off the runway and runs at once in the Crew flavour.
 //!
 //! The runner is a thread like the automations', speaking through the crew
 //! voice; replies (yes/no/next/skip/stop) come from the command loop via
@@ -397,6 +399,15 @@ pub fn phase_boundary(section: &str, config: &Config, voice: &Voice) {
     // itself, read-and-watch, no proposal: the student is flying it.
     if crate::instructor::syllabus_active() {
         start(idx, Flavour::Instruct, config.clone(), voice.clone());
+        return;
+    }
+    // The after-landing list is the copilot's own clean-up once off the
+    // runway (flaps, lights, transponder): the pilot is taxiing, and the
+    // proposal was one more thing to answer (asked, 2026-09-22). It runs at
+    // once, Crew flavour, which still reads each item first and never
+    // rewrites one in state. In instructor mode `start` makes it Instruct.
+    if section == "after landing" {
+        start(idx, Flavour::Crew, config.clone(), voice.clone());
         return;
     }
     *lock(&PROPOSAL) = Some((idx, Instant::now()));

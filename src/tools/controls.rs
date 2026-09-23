@@ -122,6 +122,28 @@ pub(crate) async fn ensure_park_brake_valve(
 /// an armed valve is squeeze itself back to a standstill (see
 /// `ensure_park_brake_valve`). The asymmetry is the whole bug — the SET path
 /// went through the valve-aware routine and the RELEASE path did not.
+/// A shutdown's parking brake: set it if it is off (the pilot asked for this,
+/// 2026-09-22, rather than hear "set the parking brake first"). The caller has
+/// already checked the aircraft is stopped on the ground. `Ok(Some(line))` is
+/// the prefix to speak when the brake was set here, `Ok(None)` when it was
+/// already on; `Err(line)` the refusal when it would not take.
+pub(crate) async fn park_for_shutdown(
+    xp: &dyn crate::xplane::XPlane,
+    valve_set: Option<f64>,
+) -> std::result::Result<Option<&'static str>, String> {
+    if xp.get_float(PARK_BRAKE).await.is_ok_and(|b| b >= 0.5) {
+        return Ok(None);
+    }
+    match drive_park_brake(xp, true, valve_set).await {
+        Ok(true) => Ok(Some("Parking brake set. ")),
+        _ => Err(
+            "The parking brake did not set, so I've left the engines running. \
+                  Set it and ask again."
+                .to_string(),
+        ),
+    }
+}
+
 pub(crate) async fn release_park_brake_for_roll(
     xp: &dyn crate::xplane::XPlane,
     valve_set: Option<f64>,

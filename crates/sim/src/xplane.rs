@@ -642,6 +642,30 @@ impl XPlaneClient {
         }
     }
 
+    /// Write ONE element of an array dataref (`?index=`), leaving the others
+    /// untouched. `set_float_array_elem` reads the whole array and writes it
+    /// back, which rewrites every other element with a value read a round trip
+    /// ago: fine for a switch, a fight for a control loop ticking at 10 Hz on
+    /// an array whose other elements the sim moves itself (the S-76's
+    /// `prop_ratio[1]` follows the collective, measured 2026-09-22). Not
+    /// retried and not re-resolved: the next tick is the retry.
+    pub async fn set_float_index(&self, name: &str, index: usize, value: f64) -> Result<()> {
+        self.allow_write()?;
+        if let Some(m) = VALUE_CACHE.lock().await.get_mut(&self.base) {
+            m.remove(name);
+        }
+        let id = self.dataref_id(name).await?;
+        let url = format!("{}/api/v1/datarefs/{}/value?index={index}", self.base, id);
+        self.http
+            .patch(&url)
+            .json(&json!({ "data": value }))
+            .send()
+            .await
+            .with_context(|| format!("PATCH {url}"))?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// Resolve a command's numeric id (commands are on the v2 API). The v2
     /// `filter[name]` query doesn't work for commands, so we fetch the full
     /// index once and cache it.

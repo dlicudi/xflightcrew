@@ -48,6 +48,19 @@ const N1_PERCENT: &str = "sim/cockpit2/engine/indicators/N1_percent"; // per-eng
 /// Per-engine N2 — the high-pressure spool a TURBOFAN's start is flown
 /// against (see [`crate::aircraft::TurbineStartProfile::fuel_intro_n2`]).
 const N2_PERCENT: &str = "sim/cockpit2/engine/indicators/N2_percent";
+/// Bleed duct pressure, left / centre / right: the air a turbofan's starter
+/// turns the engine with.
+const BLEED_AVAILABLE: [&str; 3] = [
+    "sim/cockpit2/bleedair/indicators/bleed_available_left",
+    "sim/cockpit2/bleedair/indicators/bleed_available_center",
+    "sim/cockpit2/bleedair/indicators/bleed_available_right",
+];
+/// A starter that has not moved the spool past this in `NO_TURN_SECS` is not
+/// turning the engine, and cranking on is only time.
+const NO_TURN_PCT: f64 = 2.0;
+const NO_TURN_SECS: f64 = 10.0;
+/// After the crank time, how long a lit engine may take to reach idle.
+const SPOOL_UP_SECS: u32 = 30;
 
 /// Drive a [`CycleSwitch`] to `target` by reading its position and firing
 /// `up`/`down`. Bounded by the detent span so a stuck switch can't loop forever.
@@ -626,6 +639,13 @@ async fn start_apu(
                 }
             }
         }
+        crate::blackbox::record(
+            "turbine_start",
+            json!({
+                "event": "apu", "lit": lit, "up": up,
+                "n1": ctx.xplane.get_float(&apu.n1_dataref).await.ok(),
+            }),
+        );
         if !up {
             return Err(
                 "The APU didn't come up, so there's no bleed air to turn the engines. Your aircraft."
@@ -639,8 +659,55 @@ async fn start_apu(
         let _ = ctx.xplane.run_command(cmd).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // READ BACK the air, not the switch: the crank is only worth starting
+    // once a duct has pressure in it. Measured on the Citation X with the APU
+    // bleed ON: 1.2 to 1.5 in the centre and right ducts (2026-09-22).
+    let mut air = bleed_air(ctx).await;
+    for _ in 0..BLEED_WAIT_SECS {
+        if has_air(&air) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        air = bleed_air(ctx).await;
+    }
+    crate::blackbox::record(
+        "turbine_start",
+        json!({ "event": "apu_loaded", "air": air, "volts": bus_volts(ctx).await }),
+    );
+    if !has_air(&air) {
+        return Err(
+            "The APU is running but no bleed air reached the engines. Check the APU bleed switch. \
+             Your aircraft."
+                .to_string(),
+        );
+    }
     Ok(())
+}
+
+/// Any duct with pressure in it. A failed read is no measurement: all three
+/// unreadable is "no answer", which is not a reason to refuse the start.
+fn has_air(air: &[Option<f64>]) -> bool {
+    air.iter().all(Option::is_none) || air.iter().flatten().any(|&p| p >= BLEED_MIN_PSI)
+}
+
+/// Duct pressure that counts as air for the starters, and how long to wait
+/// for it after the APU bleed is opened.
+const BLEED_MIN_PSI: f64 = 0.5;
+const BLEED_WAIT_SECS: u32 = 10;
+
+/// The three bleed ducts' pressure (left, centre, right), for the trace: a
+/// turbofan that does not turn on its starter is a question about the air.
+/// A failed read is `null`, never a number.
+async fn bleed_air(ctx: &ToolCtx<'_>) -> Vec<Option<f64>> {
+    let mut out = Vec::with_capacity(BLEED_AVAILABLE.len());
+    for d in BLEED_AVAILABLE {
+        out.push(ctx.xplane.get_float(d).await.ok());
+    }
+    out
+}
+
+async fn bus_volts(ctx: &ToolCtx<'_>) -> Option<Vec<f64>> {
+    ctx.xplane.get_float_array(BUS_VOLTS).await.ok()
 }
 
 async fn n2_percent(ctx: &ToolCtx<'_>, idx: usize) -> f64 {
@@ -719,6 +786,7 @@ impl Tool for StartTurbines {
         }
 
         let mut started = 0usize;
+        let mut verdicts: Vec<(usize, CrankVerdict)> = Vec::new();
         for &i in &dead {
             // POM start items from the FUEL panel + checklist: this engine's boost
             // pump feeds it until its engine-driven pump runs, and auto-ignition is
@@ -748,6 +816,8 @@ impl Tool for StartTurbines {
             let deadline = (self.start.crank_secs / 0.7) as u32;
             let mut fuel_in = false;
             let mut lit = false;
+            let mut peak = 0.0_f64;
+            let cranked = std::time::Instant::now();
             for _ in 0..deadline {
                 tokio::time::sleep(Duration::from_millis(700)).await;
                 if self.start.starter_held {
@@ -766,6 +836,13 @@ impl Tool for StartTurbines {
                     Some(n2) => (n2_percent(ctx, i).await, n2),
                     None => (n1, FUEL_INTRO_N1),
                 };
+                peak = peak.max(spool);
+                // Nothing turning: the starter is not moving this engine, and
+                // the full crank was a minute and a half of silence before
+                // "nothing lit" (the Citation from a cold APU, 2026-09-22).
+                if peak < NO_TURN_PCT && cranked.elapsed().as_secs_f64() >= NO_TURN_SECS {
+                    break;
+                }
                 if !fuel_in && spool >= intro {
                     ctx.xplane
                         .set_float_array_elem(
@@ -781,9 +858,38 @@ impl Tool for StartTurbines {
                     break;
                 }
             }
+            // Lit but still spooling to idle when the crank time ran out: that
+            // is a start, not a failure. The Citation's right engine was at
+            // 59 % N2 and 17.5 % N1 against an 18 % idle at 31 s, and the
+            // fuel was cut on a running engine (EDDV 2026-09-22). It gets its
+            // own time to reach idle, and fuel stays in while it runs.
+            if fuel_in && !lit && engine_running(ctx, i).await {
+                for _ in 0..SPOOL_UP_SECS {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if n1_percent(ctx, i).await >= self.start.n1_idle {
+                        lit = true;
+                        break;
+                    }
+                }
+                // Running and short of the idle figure is still running: the
+                // figure is the profile's hypothesis, the flag is the sim's.
+                lit = lit || engine_running(ctx, i).await;
+            }
             if let Some(dn) = self.start.start_dn.get(i) {
                 ctx.xplane.run_command(dn).await?; // starter off (held starters release themselves)
             }
+            let verdict = CrankVerdict::judge(peak, fuel_in, lit);
+            crate::blackbox::record(
+                "turbine_start",
+                json!({
+                    "event": "crank", "engine": i, "verdict": format!("{verdict:?}"),
+                    "peak_spool": peak, "intro": self.start.fuel_intro_n2.unwrap_or(FUEL_INTRO_N1),
+                    "spool": if self.start.fuel_intro_n2.is_some() { "n2" } else { "n1" },
+                    "n1": n1_percent(ctx, i).await, "secs": cranked.elapsed().as_secs_f64(),
+                    "air": bleed_air(ctx).await, "volts": bus_volts(ctx).await,
+                }),
+            );
+            verdicts.push((i, verdict));
             if lit {
                 started += 1;
                 ctx.xplane
@@ -806,19 +912,124 @@ impl Tool for StartTurbines {
         }
 
         match started {
-            0 => Ok(
-                "Cranking — nothing lit. Check the condition levers and bus power, then try again."
-                    .to_string(),
-            ),
+            0 => Ok(failed_start_line(
+                &verdicts,
+                n,
+                self.start.fuel_intro_n2.is_some(),
+            )),
             s if s == dead.len() && dead.len() == n => Ok(format!(
                 "Roger — starters cut at idle, generators on. All {n} running."
             )),
             s if s == dead.len() => Ok(format!("Roger — relit {s}, all engines running.")),
             s => Ok(format!(
-                "Got {s} of {} lit. The other didn't catch — check it and try again.",
-                dead.len()
+                "Got {s} of {} lit. {}",
+                dead.len(),
+                failed_start_line(&verdicts, n, self.start.fuel_intro_n2.is_some())
             )),
         }
+    }
+}
+
+/// What one engine's crank came to, from what was measured on it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CrankVerdict {
+    Lit,
+    /// The starter never moved the spool: no air, or no starter at all.
+    NeverTurned,
+    /// It turned, but never reached the speed where fuel goes in.
+    TooSlowForFuel,
+    /// Turned, fuelled, and did not light.
+    NoLight,
+}
+
+impl CrankVerdict {
+    fn judge(peak_spool: f64, fuel_in: bool, lit: bool) -> Self {
+        if lit {
+            Self::Lit
+        } else if fuel_in {
+            Self::NoLight
+        } else if peak_spool < NO_TURN_PCT {
+            Self::NeverTurned
+        } else {
+            Self::TooSlowForFuel
+        }
+    }
+}
+
+fn engine_name(i: usize, n: usize) -> String {
+    match (n, i) {
+        (2, 0) => "the left engine".to_string(),
+        (2, 1) => "the right engine".to_string(),
+        _ => format!("engine {}", i + 1),
+    }
+}
+
+/// The spoken line for engines that did not start: what each one did, so
+/// the pilot hears where it stopped instead of one line for every failure
+/// ("Cranking, nothing lit. Check the condition levers" to a Citation whose
+/// engines never turned, 2026-09-22). `turbofan` names the fuel levers.
+fn failed_start_line(verdicts: &[(usize, CrankVerdict)], n: usize, turbofan: bool) -> String {
+    let failed: Vec<(usize, CrankVerdict)> = verdicts
+        .iter()
+        .copied()
+        .filter(|(_, v)| *v != CrankVerdict::Lit)
+        .collect();
+    let Some(&(_, first)) = failed.first() else {
+        return "Nothing lit. Check the fuel and bus power, then try again.".to_string();
+    };
+    let levers = if turbofan {
+        "fuel levers"
+    } else {
+        "condition levers"
+    };
+    let turn_fix = if turbofan {
+        "Check the bleed air, then try again."
+    } else {
+        "Check the starters and bus power, then try again."
+    };
+    let slow_fix = if turbofan { "bleed air" } else { "bus power" };
+    // Every engine failed the same way: say it once.
+    if failed.len() > 1 && failed.iter().all(|(_, v)| *v == first) {
+        let (none, all) = if failed.len() == 2 {
+            ("Neither engine", "Both engines")
+        } else {
+            ("No engine", "All the engines")
+        };
+        return match first {
+            CrankVerdict::NeverTurned => format!("{none} turned on the starter. {turn_fix}"),
+            CrankVerdict::TooSlowForFuel => format!(
+                "{all} turned but never got fast enough for fuel. \
+                 Check the {slow_fix}, then try again."
+            ),
+            _ => format!(
+                "{all} had fuel and did not light. \
+                 Check the {levers} and ignition, then try again."
+            ),
+        };
+    }
+    failed
+        .iter()
+        .map(|&(i, v)| {
+            let who = cap(&engine_name(i, n));
+            match v {
+                CrankVerdict::NeverTurned => format!("{who} never turned on the starter. {turn_fix}"),
+                CrankVerdict::TooSlowForFuel => format!(
+                    "{who} turned but never got fast enough for fuel. Check the {slow_fix}, then try again."
+                ),
+                _ => format!(
+                    "{who} had fuel and did not light. Check the {levers} and ignition, then try again."
+                ),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn cap(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
     }
 }
 
@@ -912,9 +1123,11 @@ mod tests {
         let s = p.turboprop_start.expect("start sequence");
         let apu = s.apu.expect("a jet start needs the APU");
         assert!(!apu.starter_commands.is_empty());
+        // Loaded at the aircraft's own READY TO LOAD (CitX_APU.lua lights
+        // it at N1 >= 99), not at a spooling 95.
         assert!(
-            apu.ready_n1 >= 90.0,
-            "wait for a RUNNING APU: {}",
+            apu.ready_n1 >= 99.0,
+            "wait for a READY APU: {}",
             apu.ready_n1
         );
         // Generator AND bleed: the air motors the engine, the generator powers
@@ -927,6 +1140,58 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} start"));
             assert!(t.apu.is_none(), "{id} needs no APU");
         }
+    }
+
+    /// A failed start names where each engine stopped. At EDDV (2026-09-22)
+    /// the Citation's engines never turned from a cold APU and the pilot
+    /// heard "Cranking, nothing lit. Check the condition levers", a
+    /// turboprop's line about fuel, after a minute and a half.
+    #[test]
+    fn a_failed_start_says_where_each_engine_stopped() {
+        use super::{failed_start_line, CrankVerdict as V};
+        assert_eq!(V::judge(0.0, false, false), V::NeverTurned);
+        assert_eq!(V::judge(8.0, false, false), V::TooSlowForFuel);
+        assert_eq!(V::judge(30.0, true, false), V::NoLight);
+        assert_eq!(V::judge(64.0, true, true), V::Lit);
+
+        let both = [(0, V::NeverTurned), (1, V::NeverTurned)];
+        assert_eq!(
+            failed_start_line(&both, 2, true),
+            "Neither engine turned on the starter. Check the bleed air, then try again."
+        );
+        let mixed = [(0, V::Lit), (1, V::NoLight)];
+        assert_eq!(
+            failed_start_line(&mixed, 2, true),
+            "The right engine had fuel and did not light. \
+             Check the fuel levers and ignition, then try again."
+        );
+        // A free turbine keeps its condition levers.
+        assert!(failed_start_line(&[(0, V::NoLight)], 1, false).contains("condition levers"));
+        // Never a dash: the TTS and the panel font choke on them.
+        for v in [V::NeverTurned, V::TooSlowForFuel, V::NoLight] {
+            for line in [
+                failed_start_line(&[(0, v), (1, v)], 2, true),
+                failed_start_line(&[(0, V::Lit), (1, v)], 2, false),
+            ] {
+                assert!(
+                    !line.contains('\u{2014}') && !line.contains('\u{2013}'),
+                    "{line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_crank_waits_for_air_in_a_duct() {
+        use super::has_air;
+        assert!(!has_air(&[Some(0.0), Some(0.0), Some(0.0)]));
+        assert!(
+            has_air(&[Some(0.0), Some(1.5), Some(1.5)]),
+            "APU bleed ON, measured"
+        );
+        // Unreadable is no verdict: the start goes on and the crank judges it.
+        assert!(has_air(&[None, None, None]));
+        assert!(!has_air(&[None, Some(0.1), None]));
     }
 
     #[test]

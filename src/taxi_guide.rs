@@ -754,10 +754,16 @@ mod tests {
         let route = [ll(0.0, 0.0), ll(0.0, -120.0), ll(-100.0, -70.0)];
         let (lat, lon) = ll(-15.0, -60.0);
         let (along_plain, _) = project_signed(&route, lat, lon).unwrap();
-        assert!((along_plain - 60.0).abs() < 1.0, "nearest paint: the stand leg, {along_plain}");
+        assert!(
+            (along_plain - 60.0).abs() < 1.0,
+            "nearest paint: the stand leg, {along_plain}"
+        );
         let nw = bearing((0.0, -120.0), (-100.0, -70.0));
         let (along_facing, off) = project_signed_facing(&route, lat, lon, nw).unwrap();
-        assert!(along_facing > 120.0, "facing NW: the NW leg, {along_facing}");
+        assert!(
+            along_facing > 120.0,
+            "facing NW: the NW leg, {along_facing}"
+        );
         assert!(off.abs() < 60.0, "within joining distance: {off}");
         // Facing the way the stand leg runs, the plain answer stands.
         let (along_south, _) = project_signed_facing(&route, lat, lon, 180.0).unwrap();
@@ -826,7 +832,10 @@ mod tests {
         let east = [ll(0.0, 0.0), ll(200.0, 0.0)];
         let (along, off) = project_signed(&east, ll(100.0, 5.0).0, ll(100.0, 5.0).1).unwrap();
         assert!((along - 100.0).abs() < 1.0, "{along}");
-        assert!((off + 5.0).abs() < 0.2, "north of an eastbound leg is left: {off}");
+        assert!(
+            (off + 5.0).abs() < 0.2,
+            "north of an eastbound leg is left: {off}"
+        );
         let (_, right) = project_signed(&east, ll(100.0, -5.0).0, ll(100.0, -5.0).1).unwrap();
         assert!((right - 5.0).abs() < 0.2, "south of it is right: {right}");
         // Reverse the leg and the sides swap — the sign is about the

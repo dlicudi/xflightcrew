@@ -1124,7 +1124,9 @@ pub struct ClimbOut {
 impl ClimbOut {
     pub fn from_profile(p: &crate::aircraft::AircraftProfile) -> Option<Self> {
         let r = p.reference.as_ref()?;
-        let accel_agl_ft = r.acceleration_height_agl_ft.filter(|h| h.is_finite() && *h > 0.0)?;
+        let accel_agl_ft = r
+            .acceleration_height_agl_ft
+            .filter(|h| h.is_finite() && *h > 0.0)?;
         Some(ClimbOut {
             accel_agl_ft,
             max_fpm: r.best_climb_fpm.filter(|f| f.is_finite()).unwrap_or(0.0),
@@ -1744,11 +1746,9 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, p: Params) {
                 let (url, v) = (p.base_url.clone(), voice.clone());
                 tokio::spawn(async move {
                     let xp = XPlaneClient::new(url);
-                    let ok = crate::tools::radio::set_mode(
-                        &xp,
-                        crate::tools::radio::XpdrMode::Altitude,
-                    )
-                    .await;
+                    let ok =
+                        crate::tools::radio::set_mode(&xp, crate::tools::radio::XpdrMode::Altitude)
+                            .await;
                     crate::blackbox::record(
                         "autotakeoff",
                         serde_json::json!({"event": "transponder_alt", "ok": ok}),
@@ -2099,7 +2099,12 @@ mod tests {
         assert!(!handoff_waits_for_clean_up(false, 211.0, Some(210.0), 3.0));
         assert!(!handoff_waits_for_clean_up(true, 203.0, Some(210.0), 0.0));
         assert!(!handoff_waits_for_clean_up(false, 203.0, None, 0.0));
-        assert!(!handoff_waits_for_clean_up(false, 203.0, Some(210.0), CLEAN_UP_WAIT_S));
+        assert!(!handoff_waits_for_clean_up(
+            false,
+            203.0,
+            Some(210.0),
+            CLEAN_UP_WAIT_S
+        ));
         // The dial at 100 ft passing 1,150: set 2,000 up, to the thousand.
         assert_eq!(handoff_altitude_dial_ft(100.0, 1150.0), Some(4000.0));
         assert_eq!(handoff_altitude_dial_ft(1150.0, 1150.0), Some(4000.0));
@@ -2108,9 +2113,20 @@ mod tests {
         assert_eq!(handoff_altitude_dial_ft(1650.0, 1150.0), None);
         // The words never deny a runway we are sitting on.
         for why in [
-            NoFit::RunwayTooShort { id: "24".into(), length_m: 2549.0, needed_m: 2560.0 },
-            NoFit::TooLittleLeft { id: "24".into(), remaining_m: 141.0, needed_m: 2560.0 },
-            NoFit::NotAligned { id: "24".into(), err_deg: 35.0 },
+            NoFit::RunwayTooShort {
+                id: "24".into(),
+                length_m: 2549.0,
+                needed_m: 2560.0,
+            },
+            NoFit::TooLittleLeft {
+                id: "24".into(),
+                remaining_m: 141.0,
+                needed_m: 2560.0,
+            },
+            NoFit::NotAligned {
+                id: "24".into(),
+                err_deg: 35.0,
+            },
         ] {
             for can_line_up in [true, false] {
                 let (line, urgent) = no_fit_line(&why, can_line_up);
@@ -3490,7 +3506,10 @@ mod tests {
         climb_out: Option<ClimbOut>,
     ) -> (f64, Vec<(f64, f64, f64)>, (f64, f64), usize) {
         let schedule = crate::aircraft::flap_schedule(
-            crate::aircraft::load("boeing_737_800").unwrap().flaps.as_ref(),
+            crate::aircraft::load("boeing_737_800")
+                .unwrap()
+                .flaps
+                .as_ref(),
         );
         let (hold_kts, base_fpm, handoff_agl, dt) = (170.0, 1500.0, 1000.0, 0.4);
         let vne = climb_guard_vne(Some(340.0));
@@ -3552,7 +3571,10 @@ mod tests {
 
     #[test]
     fn a_jet_holds_its_climb_speed_to_the_acceleration_height() {
-        let c = ClimbOut { accel_agl_ft: 1000.0, max_fpm: 3000.0 };
+        let c = ClimbOut {
+            accel_agl_ft: 1000.0,
+            max_fpm: 3000.0,
+        };
         let (at_accel, steps, (h_agl, h_ias), reversals) = fly_737_climb_out(Some(c));
         // Handed 185 kt at 340 ft with 3,000 fpm to spend against 3,900 of
         // excess: not V2 + 20, but thirty-five knots under what it was, and
@@ -3569,25 +3591,55 @@ mod tests {
 
     #[test]
     fn the_speed_hold_is_a_jets_below_its_height_and_nobody_elses() {
-        let c = Some(ClimbOut { accel_agl_ft: 1000.0, max_fpm: 3000.0 });
+        let c = Some(ClimbOut {
+            accel_agl_ft: 1000.0,
+            max_fpm: 3000.0,
+        });
         // On speed: the base rate. Ten over: a thousand more. Capped at best.
-        assert_eq!(climb_out_vs_fpm(170.0, 170.0, 1500.0, None, 500.0, c), 1500.0);
-        assert_eq!(climb_out_vs_fpm(180.0, 170.0, 1500.0, None, 500.0, c), 2500.0);
-        assert_eq!(climb_out_vs_fpm(200.0, 170.0, 1500.0, None, 500.0, c), 3000.0);
+        assert_eq!(
+            climb_out_vs_fpm(170.0, 170.0, 1500.0, None, 500.0, c),
+            1500.0
+        );
+        assert_eq!(
+            climb_out_vs_fpm(180.0, 170.0, 1500.0, None, 500.0, c),
+            2500.0
+        );
+        assert_eq!(
+            climb_out_vs_fpm(200.0, 170.0, 1500.0, None, 500.0, c),
+            3000.0
+        );
         // Slow is still slow: the rate is backed off, never added to.
-        assert_eq!(climb_out_vs_fpm(160.0, 170.0, 1500.0, None, 500.0, c), 900.0);
+        assert_eq!(
+            climb_out_vs_fpm(160.0, 170.0, 1500.0, None, 500.0, c),
+            900.0
+        );
         // At the height, and on a trainer at any height, the old climb.
-        assert_eq!(climb_out_vs_fpm(200.0, 170.0, 1500.0, None, 1000.0, c), 1500.0);
-        assert_eq!(climb_out_vs_fpm(90.0, 74.0, 560.0, None, 500.0, None), 560.0);
+        assert_eq!(
+            climb_out_vs_fpm(200.0, 170.0, 1500.0, None, 1000.0, c),
+            1500.0
+        );
+        assert_eq!(
+            climb_out_vs_fpm(90.0, 74.0, 560.0, None, 500.0, None),
+            560.0
+        );
         // A best rate under the base never LOWERS the climb.
-        let low = Some(ClimbOut { accel_agl_ft: 1000.0, max_fpm: 0.0 });
-        assert_eq!(climb_out_vs_fpm(200.0, 170.0, 1500.0, None, 500.0, low), 1500.0);
+        let low = Some(ClimbOut {
+            accel_agl_ft: 1000.0,
+            max_fpm: 0.0,
+        });
+        assert_eq!(
+            climb_out_vs_fpm(200.0, 170.0, 1500.0, None, 500.0, low),
+            1500.0
+        );
     }
 
     #[test]
     fn a_circuit_keeps_the_old_climb_out_whole() {
         let _g = CLIMB_OUT_TEST.lock().unwrap_or_else(|e| e.into_inner());
-        publish_climb_out(Some(ClimbOut { accel_agl_ft: 1000.0, max_fpm: 3000.0 }));
+        publish_climb_out(Some(ClimbOut {
+            accel_agl_ft: 1000.0,
+            max_fpm: 3000.0,
+        }));
         assert!(climb_out_for(DEFAULT_HANDOFF_AGL_FT).is_some());
         assert!(climb_out_for(500.0).is_none());
         publish_climb_out(None);
@@ -3598,8 +3650,14 @@ mod tests {
 
     #[test]
     fn the_jets_declare_a_climb_out_and_the_trainer_does_not() {
-        for (id, want) in [("boeing_737_800", true), ("airbus_a330_300", true), ("cessna_172sp", false)] {
-            let Some(p) = crate::aircraft::load(id) else { continue };
+        for (id, want) in [
+            ("boeing_737_800", true),
+            ("airbus_a330_300", true),
+            ("cessna_172sp", false),
+        ] {
+            let Some(p) = crate::aircraft::load(id) else {
+                continue;
+            };
             assert_eq!(ClimbOut::from_profile(&p).is_some(), want, "{id}");
         }
     }

@@ -170,7 +170,6 @@ pub const ROTORCRAFT_WITHHELD: &[&str] = &[
     "hold_speed",
     "auto_taxi",
     "line_up",
-    "taxi_to_parking",
     "pushback",
     "reverse_thrust",
 ];
@@ -516,6 +515,7 @@ impl Registry {
             }));
             tools.push(Box::new(engine::StopEngine {
                 engines: profile.engines,
+                park_brake_valve_set: profile.park_brake_valve_set,
             }));
         }
 

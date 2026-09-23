@@ -865,6 +865,8 @@ pub fn run_autoland_scoped(
             // The flare's elevator law. Its integrator is per-approach: a
             // standing pull must not survive a go-around into the next one.
             let mut flare_pitch = FlarePitch::default();
+            // Last tick was the flare: a balloon stays in it (`hold_flare`).
+            let mut flaring = false;
             let mut pitch_yielded = false;
             // The arrest has the servos (see `arrest_hands_step`); the
             // wings-level law that holds the track while it does; the
@@ -1170,6 +1172,7 @@ pub fn run_autoland_scoped(
                 let crab = crab_filter.update(crab_raw, dt_s.clamp(0.0, 3.0));
 
                 let raw = guidance(lat, lon, alt, radio_ft, gs_kts, ias, &rwy, approach_ias, 25.0, xtk_rate);
+                let raw = hold_flare(raw, flaring, radio_ft, gs_kts, 25.0);
                 // A missed approach called low is flown by the latch (full power,
                 // straight ahead) until clear of the ground — the raw intercept
                 // guidance turns back to the FAP immediately, which is a killer
@@ -1204,6 +1207,7 @@ pub fn run_autoland_scoped(
                     join_point_nm(alt, rwy.elev_ft),
                     xtk_now,
                 );
+                flaring = raw.phase == ApproachPhase::Flare && missed.is_none();
                 // THE COURSE REVERSAL. Started by the missed approach's
                 // reposition stage, or by an ordinary approach that finds
                 // itself steering at a centreline point it would reach flying
@@ -2866,6 +2870,17 @@ impl FlarePitch {
             self.held = 0.0;
             return want;
         }
+        if vvi_fpm > 0.0 {
+            // A BALLOON: the pull has beaten the ground and the aircraft is
+            // climbing. The ratchet exists for a sink that is being arrested,
+            // and held through a climb it kept the Citation going up, 28 to
+            // 58 ft at +545 fpm with the speed bleeding away (EDDV 27L,
+            // 2026-09-22). The pull eases toward neutral and never becomes a
+            // push, so the aircraft settles; the ratchet takes over again
+            // from there as soon as it sinks.
+            self.held = want.max(0.0);
+            return self.held;
+        }
         self.held = self.held.max(want);
         self.held
     }
@@ -3352,6 +3367,45 @@ pub fn pursuit_aim_nm(along_nm: f64, gs_kts: f64, rwy_len_m: f64) -> f64 {
     let lead_nm = (gs_kts / 120.0).clamp(0.6, 1.5);
     let past_nm = (rwy_len_m / M_PER_NM * 0.8).clamp(0.2, 1.5);
     (along_nm - lead_nm).max(-past_nm)
+}
+
+/// ONCE FLARING, STAY FLARING. `guidance` decides the phase from this tick's
+/// radio height alone, so a flare that ballooned back above its gate became
+/// "final" again, and final's law put the nose down: forward elevator and a
+/// -1,200 fpm dial from 58 ft, then the flare again at 24 ft with the column
+/// already at its stop, and the wheels arrived at -1,031 fpm (the Citation,
+/// EDDV 27L, 2026-09-22). A pilot holds a balloon and lets it settle, or
+/// goes around. So: a tick that was flaring and now reads Final stays in the
+/// flare up to the top of the roundout band; above the band the landing is
+/// balked (`balloon`) and the go-around latch flies it. Anything else
+/// guidance decided (a balk, an overflight) stands.
+pub fn hold_flare(
+    g: Guidance,
+    was_flaring: bool,
+    radio_ft: f64,
+    gs_kts: f64,
+    flare_radio_ft: f64,
+) -> Guidance {
+    if !was_flaring || g.phase != ApproachPhase::Final {
+        return g;
+    }
+    let (_, band_ft) = arrest_gates_ft(flare_radio_ft, gs_kts);
+    if radio_ft > band_ft {
+        return Guidance {
+            phase: ApproachPhase::Intercept,
+            balk: Some("balloon"),
+            arresting: false,
+            ..g
+        };
+    }
+    let nominal_vs = -(gs_kts / 60.0) * GLIDEPATH_FT_PER_NM;
+    let (_, flare_vs) = arrest_targets_fpm(nominal_vs);
+    Guidance {
+        phase: ApproachPhase::Flare,
+        target_vs_fpm: flare_vs,
+        arresting: true,
+        ..g
+    }
 }
 
 /// Compute the approach guidance: steer to the final approach point then track the
@@ -3855,6 +3909,109 @@ mod tests {
              under the instructor's firm threshold: got {held:.0}"
         );
         assert!(held < 0.0, "and the aircraft still lands: got {held:.0}");
+    }
+
+    /// EDDV 27L, 2026-09-22, the Citation: the flare at 28 ft held its pull
+    /// through a climb (+545 fpm, up to 58 ft), and the phase flipped back to
+    /// final, which pushed. The plant needs a STANDING pull to hold the flare
+    /// attitude (`E_TRIM`), so neutral elevator sinks and anything held above
+    /// it climbs: that is what makes a held pull a balloon. The old ratchet
+    /// is exactly the running maximum of the free law (the integrator never
+    /// reads `held`), so the test flies both.
+    #[test]
+    fn a_balloon_eases_the_pull_and_settles_onto_the_runway() {
+        const E_TRIM: f64 = 0.10;
+        struct Plant {
+            h: f64,
+            vvi: f64,
+            rate: f64,
+        }
+        impl Plant {
+            fn step(&mut self, elev: f64, dt: f64) {
+                let want = (elev - E_TRIM) * 1400.0;
+                self.rate += (want - self.rate) * (dt / 0.35).min(1.0);
+                self.vvi += self.rate * dt;
+                self.h += self.vvi / 60.0 * dt;
+            }
+        }
+        // (peak height, touchdown sink) from the flare gate at 140 kt.
+        fn fly(old_ratchet: bool) -> (f64, f64) {
+            let mut law = FlarePitch::default();
+            let mut p = Plant {
+                h: 37.0,
+                vvi: -480.0,
+                rate: 0.0,
+            };
+            let (_, target) = arrest_targets_fpm(-(140.0 / 60.0) * GLIDEPATH_FT_PER_NM);
+            let dt = 0.1;
+            let (mut prev, mut peak, mut held) = (p.vvi, p.h, f64::MIN);
+            for _ in 0..300 {
+                let trend = (p.vvi - prev) / dt;
+                prev = p.vvi;
+                let e = if old_ratchet {
+                    held = held.max(law.step(target, p.vvi, trend, dt, false));
+                    held
+                } else {
+                    law.step(target, p.vvi, trend, dt, true)
+                };
+                p.step(e, dt);
+                peak = peak.max(p.h);
+                if p.h <= 0.0 {
+                    return (peak, p.vvi);
+                }
+            }
+            (peak, p.vvi)
+        }
+        let (old_peak, _) = fly(true);
+        assert!(
+            old_peak > 55.0,
+            "the old ratchet must still balloon, or this test is not about \
+             EDDV any more: peaked at {old_peak:.0} ft"
+        );
+        let (peak, sink) = fly(false);
+        assert!(
+            peak < old_peak - 10.0,
+            "eased: {peak:.0} ft against {old_peak:.0}"
+        );
+        let (_, band) = arrest_gates_ft(25.0, 140.0);
+        assert!(
+            peak < band,
+            "never high enough to balk: {peak:.0} against {band:.0}"
+        );
+        assert!(
+            sink > -400.0 && sink < 0.0,
+            "and it lands softly: {sink:.0} fpm"
+        );
+    }
+
+    /// Once flaring, a balloon is still the flare; above the roundout band it
+    /// is a balked landing, never "final" again with its push.
+    #[test]
+    fn a_balloon_stays_in_the_flare_and_a_big_one_goes_around() {
+        let rwy = rwy_north();
+        let (lat, lon) = project_latlon(0.0, 0.0, 0.0, 0.05);
+        let (flare_ft, band_ft) = arrest_gates_ft(25.0, 140.0);
+        let at =
+            |radio: f64| guidance(lat, lon, radio, radio, 140.0, 140.0, &rwy, 132.0, 25.0, 0.0);
+
+        let g = at(58.0);
+        assert!(58.0 > flare_ft && 58.0 < band_ft, "{flare_ft} {band_ft}");
+        assert_eq!(g.phase, ApproachPhase::Final, "the tick that pushed");
+        let held = hold_flare(g, true, 58.0, 140.0, 25.0);
+        assert_eq!(held.phase, ApproachPhase::Flare);
+        assert!(held.arresting);
+        let (_, flare_vs) = arrest_targets_fpm(-(140.0 / 60.0) * GLIDEPATH_FT_PER_NM);
+        assert_eq!(held.target_vs_fpm, flare_vs);
+        // Never flared: nothing changes.
+        assert_eq!(
+            hold_flare(g, false, 58.0, 140.0, 25.0).phase,
+            ApproachPhase::Final
+        );
+
+        let high = band_ft + 10.0;
+        let balked = hold_flare(at(high), true, high, 140.0, 25.0);
+        assert_eq!(balked.phase, ApproachPhase::Intercept);
+        assert_eq!(balked.balk, Some("balloon"));
     }
 
     /// The ratchet is the flare's, not the roundout's, and it never outlives

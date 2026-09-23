@@ -251,6 +251,19 @@ fn cap(s: &str) -> String {
 }
 
 const ON_GROUND: &str = "sim/flightmodel/failures/onground_any";
+const GROUNDSPEED: &str = "sim/flightmodel/position/groundspeed"; // m/s
+
+/// Stopped on the ground: a shutdown here is the end of a flight, not a
+/// hazard, so it is not confirmed (the pilot asked, 2026-09-22: "Confirm,
+/// shut both engines down?" at every stand) and the tool sets the parking
+/// brake itself. Rolling, the confirm stands. A failed read is not stopped.
+pub async fn stopped_on_ground(xp: &XPlaneClient) -> bool {
+    let (g, gs) = tokio::join!(xp.get_float(ON_GROUND), xp.get_float(GROUNDSPEED));
+    matches!((g, gs), (Ok(g), Ok(gs)) if g > 0.5 && gs.abs() < STOPPED_MPS)
+}
+
+/// Under this groundspeed (m/s, about a knot) the aircraft is stopped.
+const STOPPED_MPS: f64 = 0.5;
 
 /// Shut the jet engines down — cut the fuel levers. Gated hard against doing it
 /// in flight: an airborne "engines off" is a refusal, not an action.
@@ -271,6 +284,9 @@ pub struct StopEngines {
     cutoff: f64,
     /// How many engines must be watched down.
     engines: usize,
+    /// The airframe's park-brake valve sense, for the brake a stopped
+    /// shutdown sets.
+    park_brake_valve_set: Option<f64>,
 }
 
 impl StopEngines {
@@ -279,6 +295,7 @@ impl StopEngines {
             levers: profile.fuel_cutoff_levers.clone(),
             cutoff: profile.fuel_cutoff_value,
             engines: profile.engines.max(1),
+            park_brake_valve_set: profile.park_brake_valve_set,
         }
     }
 
@@ -339,8 +356,23 @@ impl Tool for StopEngines {
                 return Ok("Engines are already shut down.".to_string());
             }
         }
+        // Stopped, the shutdown sets the parking brake itself; rolling (a
+        // confirmed shutdown on the move) it is left to the pilot.
+        let stopped = ctx
+            .xplane
+            .get_float(GROUNDSPEED)
+            .await
+            .is_ok_and(|gs| gs.abs() < STOPPED_MPS);
+        let parked = if stopped {
+            match super::controls::park_for_shutdown(ctx.xplane, self.park_brake_valve_set).await {
+                Ok(p) => p.unwrap_or(""),
+                Err(line) => return Ok(line),
+            }
+        } else {
+            ""
+        };
         if let Err(line) = self.cut(ctx).await {
-            return Ok(line);
+            return Ok(format!("{parked}{line}"));
         }
         // READBACK: the levers are cut when the engines are DOWN, not when the
         // write returned 200. Watch every one of them — element 0 can read
@@ -352,15 +384,16 @@ impl Tool for StopEngines {
             };
             // A SHORT array is no verdict on the engines it does not carry.
             if r.len() >= self.engines && r.iter().take(self.engines).all(|&v| v < 0.5) {
-                return Ok("Fuel levers cut, engines shut down.".to_string());
+                return Ok(format!("{parked}Fuel levers cut, engines shut down."));
             }
         }
         // The levers were written and the engines are still turning: on this
         // airframe that write is not the control. Say so and hand them back,
         // rather than claim a shutdown that did not happen.
-        Ok("I cut the fuel levers but the engines are still running. \
-            They're yours, cut them on the pedestal."
-            .to_string())
+        Ok(format!(
+            "{parked}I cut the fuel levers but the engines are still running. \
+             They're yours, cut them on the pedestal."
+        ))
     }
 }
 

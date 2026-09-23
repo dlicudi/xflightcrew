@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{Tool, ToolCtx, PARK_BRAKE};
+use super::{Tool, ToolCtx};
 use crate::aircraft::FuelSelectorProfile;
 
 const THROTTLE: &str = "sim/cockpit2/engine/actuators/throttle_ratio_all";
@@ -1396,6 +1396,8 @@ pub struct StopEngine {
     /// read stopped while a later engine keeps turning (the magnetos lesson:
     /// confirm the LAST engine, not the first).
     pub engines: usize,
+    /// The airframe's park-brake valve sense, for the brake the shutdown sets.
+    pub park_brake_valve_set: Option<f64>,
 }
 
 #[async_trait]
@@ -1414,8 +1416,8 @@ impl Tool for StopEngine {
     }
     async fn execute(&self, _args: &Value, ctx: &ToolCtx<'_>) -> Result<String> {
         // Shutting the engine down in flight is an engine failure. Rather than
-        // ask for confirmation, refuse unless it's actually safe: on the ground,
-        // stopped, and parking brake set.
+        // ask for confirmation, refuse unless it's actually safe: on the ground
+        // and stopped. The parking brake the shutdown sets itself.
         if ctx.xplane.get_float(ONGROUND).await? < 0.5 {
             return Ok(
                 "Negative — we're airborne. I won't shut the engine down in flight.".to_string(),
@@ -1424,9 +1426,11 @@ impl Tool for StopEngine {
         if ctx.xplane.get_float(GROUNDSPEED).await? > 1.0 {
             return Ok("Negative — still moving. Bring her to a stop first.".to_string());
         }
-        if ctx.xplane.get_float(PARK_BRAKE).await? < 0.5 {
-            return Ok("Set the parking brake first, then I'll shut the engine down.".to_string());
-        }
+        let parked =
+            match super::controls::park_for_shutdown(ctx.xplane, self.park_brake_valve_set).await {
+                Ok(p) => p.unwrap_or(""),
+                Err(line) => return Ok(line),
+            };
 
         ctx.xplane.set_float(MIXTURE, 0.0).await?; // idle cutoff
         ctx.xplane.run_command(CMD_MAGS_OFF).await?;
@@ -1444,12 +1448,12 @@ impl Tool for StopEngine {
                 }
             }
             if !any_running {
-                return Ok(
-                    "Roger — mixture to idle cutoff, magnetos off. Engine shut down.".to_string(),
-                );
+                return Ok(format!(
+                    "{parked}Roger, mixture to idle cutoff, magnetos off. Engine shut down."
+                ));
             }
         }
-        Ok("Mixture to cutoff, engine winding down.".to_string())
+        Ok(format!("{parked}Mixture to cutoff, engine winding down."))
     }
 }
 

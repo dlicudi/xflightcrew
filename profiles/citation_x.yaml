@@ -78,7 +78,11 @@ turboprop_start:
     master_readback: laminar/CitX/APU/master_switch
     starter_commands: [laminar/CitX/APU/starter_switch_up, laminar/CitX/APU/starter_switch_up]
     n1_dataref: sim/cockpit/engine/APU_N1
-    ready_n1: 95.0
+    # CitX_APU.lua lights READY TO LOAD at N1 >= 99: that is when the
+    # generator and bleed go on. 95 loaded a spooling APU, and from a cold
+    # APU neither engine turned (EDDV 2026-09-22; from a running one, the
+    # same start lit). The start now also waits for air in a duct.
+    ready_n1: 99.0
     ready_secs: 90.0
     after_ready_commands: [laminar/CitX/APU/gen_switch_up, laminar/CitX/APU/bleed_switch_up]
   condition_lever: sim/cockpit2/engine/actuators/mixture_ratio  # fuel cutoff -> idle
