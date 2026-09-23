@@ -80,8 +80,9 @@ fn local_accents_for(icao: &str) -> &'static [&'static str] {
     // Seated by the 2026-09-22 audition (42 samples, radio effect on, the
     // accent pace, pass/fail by ear): a model that only ever heard its own
     // language reads English as guesses, and most of Piper's catalogue fails
-    // on that alone. Six passed. Every French, Italian and Belgian candidate
-    // failed, as did both multi-speaker `mls` sets, so those countries stay
+    // on that alone. Six passed (five since thorsten failed in service).
+    // Every French, Italian and Belgian candidate failed, as did both
+    // multi-speaker `mls` sets, so those countries stay
     // neutral until a voice worth having exists (likely one trained on
     // accented ENGLISH, not a Piper pick).
     match icao.get(0..2).unwrap_or("") {
@@ -89,8 +90,9 @@ fn local_accents_for(icao: &str) -> &'static [&'static str] {
         // effect and passed through it on 2026-09-22. sharvard (both
         // speakers) failed both times.
         "LE" | "GC" => &["models/es_ES-davefx-medium.onnx"],
-        // Germany.
-        "ED" | "ET" => &["models/de_DE-thorsten-high.onnx"],
+        // Germany: none. thorsten passed the 2026-09-22 audition and failed
+        // in service at EDDV the next day (the pilot: "accent /
+        // intelligibility"), so German fields cast from the neutral pool.
         // The Netherlands: two, so the tower and the ATIS differ.
         "EH" => &[
             "models/nl_NL-pim-medium.onnx",
@@ -2109,7 +2111,6 @@ mod tests {
         for (icao, lang) in [
             ("LEMD", "es_ES"),
             ("GCXO", "es_ES"),
-            ("EDDF", "de_DE"),
             ("EHAM", "nl_NL"),
             ("LPPT", "pt_PT"),
             ("SAEZ", "es_AR"),
@@ -2122,7 +2123,7 @@ mod tests {
             .iter()
             .all(|m| m.contains("es_MX")));
         // The countries whose every candidate failed stay neutral.
-        for icao in ["LFPB", "EBLG", "LIRF"] {
+        for icao in ["LFPB", "EBLG", "LIRF", "EDDV"] {
             assert!(local_accents_for(icao).is_empty(), "{icao}");
         }
         // Accents are voiced slower; English is not an accent.
