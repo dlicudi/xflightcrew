@@ -485,6 +485,36 @@ async fn call_departure(xp: &XPlaneClient, voice: &Option<Voice>) {
     );
 }
 
+const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
+const VVI_STATUS: &str = "sim/cockpit2/autopilot/vvi_status";
+
+/// The vertical-speed rate back to `level_ft` from `alt_ft`: 700 fpm each
+/// way, less inside 700 ft so the capture is gentle.
+pub fn recovery_vs_fpm(alt_ft: f64, level_ft: f64) -> f64 {
+    (level_ft - alt_ft).clamp(-700.0, 700.0).round()
+}
+
+/// Back to the cruise level: the dial on it, vertical speed toward it,
+/// altitude hold arming itself to capture (what caught the 4,200 ft climb
+/// by hand, 2026-09-23).
+async fn recover_level(xp: &XPlaneClient, alt_ft: f64, level_ft: f64) {
+    let _ = xp
+        .set_float("sim/cockpit2/autopilot/altitude_dial_ft", level_ft)
+        .await;
+    let vs = recovery_vs_fpm(alt_ft, level_ft);
+    let _ = xp
+        .set_float("sim/cockpit2/autopilot/vvi_dial_fpm", vs)
+        .await;
+    if xp.get_float(VVI_STATUS).await.is_ok_and(|v| v < 0.5) {
+        let _ = xp.run_command("sim/autopilot/vertical_speed").await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Engaging the mode syncs the dial to the rate of the moment.
+        let _ = xp
+            .set_float("sim/cockpit2/autopilot/vvi_dial_fpm", vs)
+            .await;
+    }
+}
+
 /// The inbound call to the destination's tower, on its frequency, and the
 /// station pinned to it for the arrival (the aeroplanes' `call_inbound`).
 async fn call_inbound(xp: &XPlaneClient, khz: i64) {
@@ -760,6 +790,7 @@ async fn fly(
     let mut law: Option<SpeedLaw> = None;
     let mut final_from: Option<(f64, f64)> = None;
     let mut bug_set: Option<f64> = None;
+    let mut unheld_since: Option<std::time::Instant> = None;
     let mut last = std::time::Instant::now();
     let mut tick_n = 0u64;
     while ACTIVE.load(Ordering::SeqCst) {
@@ -840,10 +871,13 @@ async fn fly(
                             (track - variation).rem_euclid(360.0).round(),
                         )
                         .await;
+                    // Altitude hold engages at the level the climb reached (the
+                    // departure climbed to the cruise level for exactly this);
+                    // the dial is NOT moved afterwards: moving it turned the
+                    // hold into "armed", nothing held the pitch, and the speed
+                    // law's power climbed the S-76 at 1,200 fpm through 4,200
+                    // ft over a 2,200 dial (ETHB-EDVW, 2026-09-23).
                     let ok = hover::cruise_modes(&xp).await;
-                    let _ = xp
-                        .set_float("sim/cockpit2/autopilot/altitude_dial_ft", cruise_alt_ft)
-                        .await;
                     crate::blackbox::record(
                         "heli_route",
                         serde_json::json!({ "event": "handover_cruise", "ok": ok, "collective": c, "ias": s.ias, "agl": s.agl_ft }),
@@ -923,6 +957,32 @@ async fn fly(
                         call_inbound(&xp, khz).await;
                     }
                 }
+                // The vertical is the autopilot's, and it must actually be
+                // HELD: neither altitude hold nor vertical speed engaged for
+                // 5 s is the level coming back on vertical speed to the
+                // cruise dial, altitude hold armed to capture it.
+                let (ah, vm, alt_now) = tokio::join!(
+                    xp.get_float(ALT_HOLD_STATUS),
+                    xp.get_float(VVI_STATUS),
+                    xp.get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot"),
+                );
+                let (alt_hold, vvi_mode) = (ah.ok(), vm.ok());
+                let unheld = alt_hold.is_some_and(|a| a < 1.5) && vvi_mode.is_some_and(|v| v < 1.5);
+                if unheld {
+                    let since = *unheld_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed().as_secs_f64() > 5.0 {
+                        if let Ok(alt) = alt_now {
+                            recover_level(&xp, alt, cruise_alt_ft).await;
+                            crate::blackbox::record(
+                                "heli_route",
+                                serde_json::json!({ "event": "level_recovered", "alt": alt, "cruise_alt_ft": cruise_alt_ft, "alt_hold": alt_hold }),
+                            );
+                        }
+                        unheld_since = None;
+                    }
+                } else {
+                    unheld_since = None;
+                }
                 let want = if phase == Phase::Slow {
                     HANDOVER_KTS
                 } else {
@@ -934,7 +994,7 @@ async fn fly(
                     if tick_n % 4 == 0 {
                         crate::blackbox::record(
                             "heli_route",
-                            serde_json::json!({ "event": "tick", "phase": format!("{phase:?}"), "fix": ident, "d_fix_m": dist(here, to), "to_pad_m": to_pad, "ias": s.ias, "target": l.target(), "collective": c, "agl": s.agl_ft, "bug": bug, "hdg": s.mag, "theta": s.theta, "phi": s.phi }),
+                            serde_json::json!({ "event": "tick", "phase": format!("{phase:?}"), "fix": ident, "d_fix_m": dist(here, to), "to_pad_m": to_pad, "ias": s.ias, "target": l.target(), "collective": c, "agl": s.agl_ft, "bug": bug, "hdg": s.mag, "theta": s.theta, "phi": s.phi, "alt_hold": alt_hold, "vvi_mode": vvi_mode }),
                         );
                     }
                 }
@@ -1148,6 +1208,13 @@ mod tests {
         let s = sample_legs(&line, 1000.0);
         assert!(s.len() >= 7 && s.len() <= 9, "{}", s.len());
         assert_eq!(*s.last().unwrap(), (52.0, 9.1));
+    }
+
+    #[test]
+    fn a_lost_level_comes_back_gently() {
+        assert_eq!(recovery_vs_fpm(4200.0, 2200.0), -700.0);
+        assert_eq!(recovery_vs_fpm(2000.0, 2200.0), 200.0);
+        assert_eq!(recovery_vs_fpm(2200.0, 2200.0), 0.0);
     }
 
     #[test]

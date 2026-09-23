@@ -314,6 +314,7 @@ fn main() -> Result<()> {
                     taxi_crossings: Vec::new(),
                     on_ground: false,
                     own_on_runway: false,
+                    helicopter: false,
                 };
                 let intent = if heard.confidence < config.stt_min_confidence {
                     tower::Intent::Unknown // garbled call → "say again", never a guessed clearance

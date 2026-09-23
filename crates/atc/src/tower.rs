@@ -165,6 +165,11 @@ pub struct Ctx {
     /// a lined-up aircraft asking for its clearance, not a stand asking to
     /// skip the taxi.
     pub own_on_runway: bool,
+    /// The aircraft is a helicopter (the sim's own `is_helicopter`): a
+    /// "ready for departure" from the ground is cleared from its present
+    /// position, never sent to a runway holding point (the S-76 on its pad at
+    /// ETHB got "taxi to holding point Foxtrot runway two five", 2026-09-23).
+    pub helicopter: bool,
 }
 
 /// Spoken position of traffic on final: "short final" inside 1.5 nm, else
@@ -1226,6 +1231,15 @@ impl Tower {
                     );
                     line
                 }
+                // A helicopter on the ground departs from where it is: no
+                // taxi, no runway, and so no runway to read back.
+                _ if ctx.helicopter && ctx.on_ground => {
+                    self.state = State::TakeoffCleared;
+                    format!(
+                        "{}, cleared for takeoff from present position, wind {}.",
+                        ctx.callsign, ctx.wind
+                    )
+                }
                 // Standing on the strip with no taxi behind it: a runway
                 // start. The sim's own spawn point answered "taxi to holding
                 // point Alpha first", full auto therefore never called at
@@ -1452,6 +1466,7 @@ mod tests {
             final_traffic_count: 0,
             runway_occupied: false,
             own_on_runway: false,
+            helicopter: false,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
@@ -2018,6 +2033,27 @@ mod tests {
         let mut twr = Tower::new();
         let r = twr.handle(Intent::RequestTakeoff, &ctx());
         assert!(r.contains("first"), "{r}");
+    }
+
+    /// A helicopter on its pad is cleared from where it is (ETHB, 2026-09-23:
+    /// the S-76 got "taxi to holding point Foxtrot runway two five" and its
+    /// route waited out a clearance that was never coming). In the air it is
+    /// no different from anyone else.
+    #[test]
+    fn a_helicopter_departs_from_present_position() {
+        let mut heli = ctx();
+        heli.helicopter = true;
+        heli.on_ground = true;
+        let mut twr = Tower::new();
+        let r = twr.handle(Intent::RequestTakeoff, &heli);
+        assert!(r.contains("cleared for takeoff from present position"), "{r}");
+        assert!(!r.contains("runway"), "{r}");
+        assert_eq!(twr.state, State::TakeoffCleared);
+        let mut airborne = heli.clone();
+        airborne.on_ground = false;
+        let mut twr = Tower::new();
+        let r = twr.handle(Intent::RequestTakeoff, &airborne);
+        assert!(!r.contains("present position"), "{r}");
     }
 
     #[test]

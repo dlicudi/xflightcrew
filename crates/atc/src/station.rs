@@ -1393,6 +1393,10 @@ impl Station {
             wake_secs_left,
         );
         ctx.own_on_runway = own_on_runway;
+        ctx.helicopter = xp
+            .get_float("sim/aircraft2/metadata/is_helicopter")
+            .await
+            .is_ok_and(|v| v > 0.5);
         (ctx, wx)
     }
 
@@ -1461,6 +1465,7 @@ impl Station {
             on_ground,
             // The sim read is `build_ctx`'s; scripted contexts are off it.
             own_on_runway: false,
+            helicopter: false,
         }
     }
 }
@@ -9159,6 +9164,7 @@ mod tests {
             final_traffic_count: 0,
             runway_occupied: false,
             own_on_runway: false,
+            helicopter: false,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
@@ -9537,6 +9543,7 @@ mod tests {
                 final_traffic_count: 0,
                 runway_occupied: false,
                 own_on_runway: false,
+                helicopter: false,
                 wake_secs_left: None,
                 taxi_via: Vec::new(),
                 taxi_crossings: Vec::new(),
@@ -9797,6 +9804,7 @@ mod tests {
             final_traffic_count: 0,
             runway_occupied: false,
             own_on_runway: false,
+            helicopter: false,
             wake_secs_left: None,
             taxi_via: Vec::new(),
             taxi_crossings: Vec::new(),
