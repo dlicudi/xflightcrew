@@ -5701,3 +5701,72 @@ Six new corpus cases. Still owed: reporting vacated is also how a real tower
 learns its runway is free, and ours still learns that from the taxi request.
 
 NOT flown.
+
+## 2026-09-23: the S-76 flies itself, pad to pad
+
+Two sessions, the helicopter from a hover that crept to a flight plan flown
+end to end. The rules are in CLAUDE.md's helicopter section; this is the
+evidence.
+
+### The hover mode is a groundspeed hold, and it captures
+
+`sim/autopilot/hover` writes the velocity of the moment into
+`hover_vector`: after a drift hand-back the vector read [-4.9, -4.7] m/s,
+the drift it had been told to hold by a recapture at 6.8 m/s. Asked for
+zero it still ran forward at 4 to 8 kt (nose +1.5 against the good hover's
++6.2), so the loop owns the vector: command plus `DriftTrim`, an integral
+on the measured `local_vx/vz` error. The first hands-off hover after it held
+10 ft and 30 ft to 0.1 to 0.4 m/s. The yaw swings of the first sessions were
+the pilot's twist axis, not the aircraft.
+
+### A moving target is the whole low-speed envelope
+
+The same mode followed a moving vector: 5 and 10 kt air taxis to 0.1-0.2 m/s,
+a departure to 30 kt and 300 ft to 0.7, a turn to 0.4. The nose does not
+follow the track (a turn flew 45 degrees sideways, a leg backwards at -28 kt
+indicated), and the pedal law that fixed it was the second: the S-76's pedal
+is a yaw-rate command (0.1 = 4.7 deg/s, neutral holds to 0.01 deg, measured
+in a hover), and a D term on `R` at 2.4 of loop gain through a quarter-second
+tick rang the tail until the fault latch stood it down. Two circuits landed
+1.9 and 6.4 m from their spot; a third on the final build 4.6 m. The mode
+lets go near 47 kt and will not re-engage that fast.
+
+### Two AP-off hand-backs and a plunge
+
+A speed probe above the hover mode's range, then a takeover from a hard
+deceleration (collective 0.30, nose 12 up), each ended in a hand-back that
+turned the autopilot off with nobody flying: one caught by hand at 54 kt,
+one at 1,600 fpm into a field and a ground spin. The EDDV-ETHC route crashed
+through a chain: CEL lies past the pad so the slow-down came late, the
+arrival takeover aimed its captured speed at the pad, the hand-back put
+altitude hold on a 35 kt aircraft that drifted backwards, a "hold position"
+wound the trim to 0.9, the attitude hand-back parked the lever there, and
+the pilot's "land the aircraft" integrated it to 0.0: 3,100 fpm. The fixes:
+never AP-off in the air, a trim bounded to the power curve (a test flies the
+crash's own climb: 1,317 fpm of sink without the band, 401 with), a takeover
+aimed along the velocity it captured, the slow-down on the distance still to
+fly, terminal fixes dropped.
+
+### The route, and parking like an aeroplane
+
+The cruise modes work: hand-over at 36-40 kt, heading and altitude hold, a
+collective speed law at 120.0 kt. EDDV-ETNW flew end to end, 7.3 m from the
+landing point. Parking was first built as a helicopter's own direct hover
+taxi, then as its own tower request, and the pilot's objection was right
+both times ("helicopter should be like another aircraft"): it is now the
+aeroplanes' `taxi_to_parking` and taxi-in, and only the drive differs. The
+tower called the hover taxi an uncleared takeoff; under 100 ft a helicopter
+is on the ground for it now.
+
+### What the aircraft taught besides
+
+Engine 2's throttle sat at 0.61 after "throttles to fly" (a heavy lift
+drooped the rotor to 83 % at 0.9 collective): the start reads every throttle
+back, and a rotor guard caps the collective. An unlocked tail wheel let the
+torque spin it on the ground at up to 20 deg/s with the brake set and the
+pedals neutral, until the engines were cut; the engage command does nothing
+on the S-76, the toggle does, read first. `groundspeed` carries the vertical
+speed. Whisper's "hover" arrives as "how about", "over at", "prove at",
+"hova"; "execute the flight plan" read the plan's brief instead of flying
+it. Restarting the app mid hover taxi forced a manual landing: restarts wait
+for the ground.

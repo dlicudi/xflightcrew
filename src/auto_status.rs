@@ -155,6 +155,15 @@ pub fn active_managers() -> Vec<String> {
     if let Some(s) = circuit::status() {
         v.push(s);
     }
+    if let Some(s) = crate::heli_route::status() {
+        v.push(s);
+    }
+    if let Some(s) = crate::heli_circuit::status() {
+        v.push(s);
+    }
+    if let Some(s) = crate::hover::status() {
+        v.push(s);
+    }
     if let Some(s) = procedure::status() {
         v.push(s);
     }

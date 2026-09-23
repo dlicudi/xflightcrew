@@ -23,6 +23,7 @@ pub mod flaps;
 pub mod full_auto;
 pub mod gear;
 pub mod ground;
+pub mod heli;
 pub mod instruments;
 pub mod jet_start;
 pub mod lights;
@@ -495,6 +496,15 @@ impl Registry {
                 prop: profile.prop.clone(),
                 pace,
             }));
+        } else if profile.rotorcraft && profile.heli_start.is_some() {
+            // A helicopter taxis in like any other aircraft: the same tool,
+            // the same call to the tower and the same clearance; only the
+            // drive differs (`taxi_in` hover-taxis the route).
+            tools.push(Box::new(taxi::TaxiToParking {
+                park_brake_valve_set: profile.park_brake_valve_set,
+                prop: profile.prop.clone(),
+                pace,
+            }));
         }
 
         // Airliner autoflight extras: AP speed select + autothrottle.
@@ -576,6 +586,29 @@ impl Registry {
         if let Some(ts) = &profile.turboprop_start {
             tools.push(Box::new(cycle::StartTurbines::new(ts.clone())));
             tools.push(Box::new(cycle::StopTurbines::new(ts.clone())));
+        }
+        if let Some(h) = &profile.heli_start {
+            let battery_on = profile
+                .electrical
+                .iter()
+                .filter(|e| e.key == "battery")
+                .flat_map(|e| e.on_commands.clone())
+                .collect();
+            let start = heli::StartHelicopter::new(h.clone(), profile.engines, battery_on);
+            tools.push(Box::new(start.clone()));
+            tools.push(Box::new(heli::StopHelicopter::new(
+                h.clone(),
+                profile.engines,
+            )));
+            tools.push(Box::new(heli::Hover::new(
+                h,
+                start,
+                crate::heli_route::TaxiIn {
+                    park_brake_valve_set: profile.park_brake_valve_set,
+                    prop: profile.prop.clone(),
+                    pace: crate::autotaxi::Pace::from_profile(profile.taxi.as_ref()),
+                },
+            )));
         }
 
         if profile.parking_brake {

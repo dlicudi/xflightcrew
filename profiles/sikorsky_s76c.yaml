@@ -29,10 +29,9 @@ rotorcraft: true
 # so the heading and altitude dials are assumed to be the sim's own AP. A
 # hypothesis; the readback compares the dial, not the flight path. VERIFY.
 autopilot: true
-# No throttle lever the crew works: the twist grips / engine control levers
-# are the pilot's, and a throttle governor on a helicopter is wrong by
-# construction. With `engine` and `throttle` both false no start, mixture or
-# speed tool is registered.
+# No throttle GOVERNOR: a throttle-for-speed law on a helicopter is wrong by
+# construction, so `engine` and `throttle` stay false and no mixture or speed
+# tool is registered. The start and shutdown come from `heli_start` below.
 throttle: false
 engine: false
 autothrottle: false
@@ -53,6 +52,43 @@ pressurised: false
 engines: 2
 
 turbine_start: false
+
+# Engine start and shutdown, measured by hand over the Web API on 2026-09-22
+# before the tool existed. The throttles (the engine control levers) are the
+# fuel control: 0 is OFF, and above it the mixture comes to 1 by itself (a
+# mixture write is put back to 0 every frame). Batteries alone give 24 V. Each
+# engine was started on a 0.2 throttle with its starter held (1.5 s re-arms of a
+# 2 s hold), lit within two seconds and settled at 62 % N1; both throttles to
+# 1.0 then took the rotor to 313 rpm (the acf's `_des_rpm_prp`) in under ten
+# seconds, still on the ground with the collective down. `prop_ratio[0]` is the
+# collective (the cockpit lever writes it); `prop_ratio_all` reads 0.25 with it
+# fully down, so it is never the one read.
+heli_start:
+  starters: [sim/starters/engage_starter_1, sim/starters/engage_starter_2]
+  throttle: sim/cockpit2/engine/actuators/throttle_ratio
+  idle: 0.2
+  fly: 1.0
+  # The checklist releases the starter at 54 % N1; engine 1 cleared a 55 %
+  # mark by 0.6 on the first run of the tool.
+  idle_n1: 52.0
+  crank_secs: 40.0
+  collective: sim/cockpit2/engine/actuators/prop_ratio
+  rotor_brake: sim/cockpit2/switches/rotor_brake_ratio
+  rotor_rpm: sim/cockpit2/engine/indicators/prop_speed_rpm
+  rotor_rpm_governed: 313.0
+  generators: [sim/electrical/generator_1_on, sim/electrical/generator_2_on]
+  # The aircraft's own STARTING ENGINES list (avionics, inverter, cabin
+  # electricals) and BEFORE STARTING's STICK TRIM, which is the stock yaw
+  # damper switch here. Without them the autopilot refused servos, flight
+  # director and every mode (2026-09-22, live).
+  after_start:
+    - sim/systems/avionics_on
+    - sim/electrical/inverters_on
+    - sim/electrical/cross_tie_on
+    - sim/systems/yaw_damper_on
+  # Locked before the rotor turns, read first (it is a toggle): unlocked, the
+  # torque spun the S-76 on the ground at up to 20 deg/s (ETNW, 2026-09-23).
+  tail_wheel_lock: sim/flight_controls/tail_wheel_lock_toggle
 auto_prep: false
 magnetos: false
 carb_heat: false
@@ -63,8 +99,8 @@ directional_gyro: false
 electrical:
   - key: battery
     spoken: battery
-    on_commands:  [sim/electrical/battery_1_on]
-    off_commands: [sim/electrical/battery_1_off]
+    on_commands:  [sim/electrical/battery_1_on, sim/electrical/battery_2_on]
+    off_commands: [sim/electrical/battery_1_off, sim/electrical/battery_2_off]
     readback:     [sim/cockpit/electrical/battery_on]
   - key: generators
     spoken: generators

@@ -432,7 +432,8 @@ Orchestrators compose proven loops; no new flight laws in orchestrators. All
 laws battle-test as plain `cargo test`; everything blackboxes to
 `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autotakeoff`, `pushback`, `checklist`,
 `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`, `cabin`,
-`instructor`, `loading`, `api_load`). Cross-cutting rules, each learned the hard way (details in
+`instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
+`heli_route`, `api_load`). Cross-cutting rules, each learned the hard way (details in
 history):
 
 - **A stage that is not moving the aircraft is holding it**: brakes set for
@@ -728,7 +729,7 @@ history):
   before it, the sink rebuilt to -358 and worsening, and the law was
   saturated at `FLARE_PITCH_MAX` with nothing left. The cap still bounds
   the attitude, so the ratchet cannot buy a tail strike; a float it can buy
-  is the overflight guard's to judge. Still owed: the retard is keyed on
+  is the overflight guard's to judge. **But not through a climb**: a BALLOON (vvi above zero) eases the pull toward neutral, never a push, and a flare stays a flare until the top of the roundout band (`hold_flare`; above it the balk is `balloon`): the Citation held its pull 28 to 58 ft, flipped back to final, was pushed at -1,200 and landed at -1,031 fpm (EDDV 27L, 2026-09-22). Still owed: the retard is keyed on
   the sink the arrest is removing, so it fires latest exactly when it
   should already be done.
 - **Autoland**: pursuit aim keeps its full lead all the way in
@@ -940,6 +941,104 @@ history):
   direction. On-demand "which way?" is question-shaped so a readback never
   triggers it.
 
+## Helicopters: the hover loop
+
+Rotorcraft withhold every fixed-wing law (`tools::ROTORCRAFT_WITHHELD`); a
+helicopter flies on its own loop ([src/hover.rs](src/hover.rs), blackbox
+`hover`), measured on the S-76C before and while it was written (EDDV,
+2026-09-22/23):
+
+- **The split is the classic one: cyclic to the autopilot, collective to
+  us.** The AP engages only with the stick trim / inverter on and never moves
+  the collective (no autothrottle); `servos_fdir_off` disconnects it, plain
+  `servos_off` does not. The collective is `prop_ratio[0]`, written INDEXED
+  (element 1 moves by itself).
+- **The AP's hover mode is a groundspeed HOLD, and it captures**: engaging it
+  (`sim/autopilot/hover`, fired only when `hover_status` reads off - it may
+  toggle) writes the velocity of the moment into `hover_vector` (x east, z
+  south, m/s). A recapture while drifting told it to hold the drift; the
+  loop owns the vector: command + `DriftTrim` (an integral on the measured
+  `local_vx/vz` error, capped 3 m/s, reset on the ground), rewritten when it
+  moves. Asked for zero it still ran forward at 4 to 8 kt without the trim.
+- **A moving target is an air taxi, a departure, a circuit**: the hover mode
+  followed a moving vector to 0.1-0.7 m/s at 5 to 40 kt. Speed slews at
+  `RAMP_ACCEL_MPS2`, the track at 3 deg/s (`slew_track`), and the goals are
+  `Hover`, `Land` (holds height until slowed, then down), `Depart` (level
+  until `DEPART_CLIMB_MPS`, the height-velocity diagram, then 500 fpm) and
+  `Fly` (an orchestrator's vector). **The mode lets go at about 47 kt** and
+  will not re-engage that fast: `DEPART_MAX_MPS` is 40 kt, faster is the
+  cruise modes' (not built).
+- **`groundspeed` carries the vertical speed** (1.27 m/s at 250 fpm): drift
+  and error are judged on `local_vx/vz`.
+- **The pedals are a yaw-RATE command with a heading hold** (0.1 of pedal =
+  4.7 deg/s, neutral holds the heading to 0.01 deg, measured in the hover):
+  in the hover the aircraft keeps its own heading; above `PEDALS_ON_MPS` the
+  nose is held on the track through the plugin's `taxi_steer` channel by a
+  law that asks a RATE (`HeadingHold`), never damps on `R` (a D term at 2.4
+  of loop gain through a quarter-second tick rang the tail until the
+  `PEDAL_FAULT_DPS` latch stood it down). Without it the S-76 flew a turn 45
+  degrees sideways and a leg backwards.
+- **The collective follows the power curve** (`level_collective`: 0.66 in an
+  OGE hover, 0.46 at 30 kt, 0.42 at 72): the trim is moved by the curve's
+  slope as the commanded speed changes, and an in-flight takeover starts the
+  trim at the curve's figure, not at the lever. Ground effect is the trim's
+  (0.555 at lift-off, 0.582 at 9 ft; KI 0.12 so it chases the rise).
+- **In the air the autopilot is never simply turned off** (`hand_back`):
+  above 43 kt the cruise modes at the heading and altitude of the moment
+  (altitude hold at 35 kt drifted backwards and sank); slower, the hover
+  mode asked for zero; the lever at `steady()`, near the power curve. Twice
+  an AP-off hand-back left an S-76 with nobody flying it.
+- **The collective trim is bounded to the power curve** (-0.15/+0.20 of
+  `level_collective`, the lever never 0.05 under the band): an integrator on
+  a big error ran it to 0.9 on a takeover, then to 0.0 on the landing asked
+  in the climb that followed, and a 3,100 fpm plunge crashed it (ETHC,
+  2026-09-23). **The rotor guard** caps it too (`droop_ceiling`: no higher
+  below 97 % Nr, lower below 94 %); a lift that droops 5 s low down is set
+  down. **The start reads every throttle back at FLY** (engine 2 sat at 0.61
+  and a heavy lift drooped the rotor to 83 %), and **locks the tail wheel**
+  first (read, then the TOGGLE; the engage command does nothing on the
+  S-76): unlocked, torque spun it on the ground at 20 deg/s with the brake
+  set until the engines were cut.
+- **Airborne requests take over** below `TAKEOVER_MAX_MPS` and
+  `DEPART_MAX_FT` ("hold position", "set it down", "hover at N"); a drift in
+  a hover becomes a set-down, a departure that stops following its command
+  stops to a hover at the height reached.
+- **The circuit** ([src/heli_circuit.rs](src/heli_circuit.rs), blackbox
+  `heli_circuit`): laid out from the take-off spot and the nose (upwind,
+  crosswind, downwind back past the spot, base), flown as `Fly` vectors at
+  300 ft / 30 kt, and a final whose speed tapers to stop on the spot at
+  `FINAL_DECEL_MPS2` on a 6-degree path LED by the height loop's lag (the
+  first final ran 30 ft high), then `Land`. Two flown, landing 1.9 and 6.4 m
+  from the spot. Any goal change from outside ends it.
+- **The route** ([src/heli_route.rs](src/heli_route.rs), blackbox
+  `heli_route`) flies the SimBrief plan and is the whole flight, as full
+  auto is: the engine start from cold, the lift, a hover-loop departure to
+  1,000 ft AGL at 35 kt, the hand-over to heading and altitude hold
+  (`hover::release`, the AP never goes off) with [`SpeedLaw`] on the
+  collective to 120 kt, the bug stepped only past 2 degrees (rewritten each
+  tick it jittered the yaw), the slow-down on the distance still to FLY to
+  38 kt, a hover-loop takeover aimed along the captured velocity, a 6-degree
+  final to the helipad nearest the inbound fix (fixes within 10 km of it
+  dropped: CEL lies past ETHC), then the aeroplanes' own taxi-in. Flown
+  EDDV-ETNW end to end (7.3 m from the point), then ETNW-ETHB from cold with
+  nobody touching it: start, lift, cruise, pad H1, and the tower's taxi-in to
+  the stand the pad sits on. It takes a local plan first (as full auto
+  does), refuses a plan that starts more than 5 km away, calls "ready for
+  departure" (60 s bounded wait) and "inbound for landing" on the
+  destination tower's apt.dat frequency, and cruises 1,000 ft over the
+  HIGHEST ground probed along its legs (plugin terrain, 1 km spacing); the
+  last three unflown.
+- **Parking is the aeroplanes' tool** (`taxi_to_parking`, unwithheld for a
+  rotorcraft): the same call to the tower, the same clearance; only the drive
+  differs, a hover taxi of the cleared route (`heli_route::park`, 12 ft, 10
+  kt, slowed for corners by `corner_factor`). For the TOWER a helicopter
+  under 100 ft is on the ground (`hover::tower_on_ground`), so a hover taxi
+  is not an uncleared takeoff.
+- Words: "hover at N", "set it down" / "land the helicopter", "move forward
+  at N knots", "hold position", "take off" / "depart to N feet", "turn
+  heading N" and "speed N knots" during a departure (the AP's mode tools are
+  refused while the loop flies: `hover::blocks`), "fly a circuit".
+
 ## Checklist flows: the list at its phase, three flavours
 
 [src/flow.rs](src/flow.rs) runs the airframe's XChecklist sections
@@ -982,7 +1081,9 @@ finished), level 30 s above
 flavour starts at once; with a pilot flying the copilot PROPOSES ("Climb
 checklist when you're ready?", `PROPOSAL_TTL`) and "go ahead" runs it,
 "talk me through it" teaches it, "not now" declines - a proposal never acts
-by itself (the cockpit_auto rule). Section-to-title is the same matcher a
+by itself (the cockpit_auto rule). The after-landing list is the exception:
+the copilot's own clean-up off the runway, it runs at once in the Crew
+flavour, no proposal (asked, 2026-09-22). Section-to-title is the same matcher a
 spoken "climb checklist" uses; a file whose titles differ maps them in the
 profile's `checklist_flow:`; a section the file lacks proposes nothing.
 Panel: `flow::status()` ("checklist: climb, 3 of 8") and CANCEL picks "stop

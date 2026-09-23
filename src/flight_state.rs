@@ -72,6 +72,9 @@ pub(crate) fn stand_down() {
     crate::approach_guide::cancel();
     crate::autotakeoff::cancel();
     crate::flow::abort();
+    crate::heli_circuit::abort();
+    crate::heli_route::abort();
+    crate::hover::abort();
     crate::autotaxi::ACTIVE.store(false, SeqCst);
     crate::autotaxi::BACKTRACKING.store(false, SeqCst);
     crate::tools::speedhold::ACTIVE.store(false, SeqCst);

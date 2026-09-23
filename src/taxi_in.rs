@@ -400,6 +400,28 @@ async fn fly(
     crate::tools::controls::release_park_brake_for_roll(&xp, park_brake_valve_set).await;
     arrest_release();
 
+    // A helicopter flies the same cleared route as a hover taxi: everything
+    // before this (the call, the clearance, the wait) is the aeroplanes'.
+    if let Some(collective) = crate::hover::collective_dref() {
+        let route = crate::party_line::with_taxi_route(|r| {
+            r.filter(|w| w.path.len() >= 2)
+                .map(|w| (w.path.clone(), crate::station::spoken_taxiway(&w.via)))
+        });
+        let Some((path, via)) = route else {
+            announce(&voice, Priority::Caution, "No taxi route to fly. Your aircraft.");
+            return;
+        };
+        crate::blackbox::record("taxi_in", json!({ "event": "hover_taxi", "nodes": path.len() }));
+        announce(&voice, Priority::Advisory, &format!("My taxi. Hover taxi via {via}."));
+        crate::heli_route::park(
+            voice.clone(),
+            config.xplane_base_url.clone(),
+            collective,
+            crate::heli_route::ParkTarget::Route { path, via },
+        );
+        return;
+    }
+
     // Drive the cleared stand route. AutoTaxi owns the gates (on ground, on the
     // route, steer channel) and speaks the readback ("My taxi. stand ...").
     let ctx = ToolCtx {

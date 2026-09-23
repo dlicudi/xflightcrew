@@ -597,7 +597,9 @@ pub trait Check: Send {
         Duration::ZERO
     }
     /// Higher values permit a fresh callout when a persistent condition worsens.
-    fn repeat_level(&self, _s: &Snapshot) -> Option<i64> { None }
+    fn repeat_level(&self, _s: &Snapshot) -> Option<i64> {
+        None
+    }
     /// A command the copilot should FIRE (not just advise) to bring the state to
     /// what the SOP expects — e.g. the strobe/landing-light switches. Fired once
     /// per episode, the moment the advisory speaks, so the copilot *acts* instead
@@ -642,7 +644,9 @@ impl FireState {
 
     fn observe_level(&mut self, level: Option<i64>) {
         if let Some(level) = level {
-            if self.last_level.is_some_and(|old| level > old) { self.spoke_this_episode = false; }
+            if self.last_level.is_some_and(|old| level > old) {
+                self.spoke_this_episode = false;
+            }
             self.last_level = Some(self.last_level.map_or(level, |old| old.max(level)));
         }
     }
@@ -1398,7 +1402,9 @@ impl Check for CabinAltitude {
         (!s.on_ground && in_band).then(|| self.message.to_string())
     }
     fn repeat_level(&self, s: &Snapshot) -> Option<i64> {
-        s.cabin_altitude_ft.is_finite().then(|| (s.cabin_altitude_ft / 1000.0).floor() as i64)
+        s.cabin_altitude_ft
+            .is_finite()
+            .then(|| (s.cabin_altitude_ft / 1000.0).floor() as i64)
     }
     fn min_duration(&self) -> Duration {
         self.min_dur
@@ -2745,7 +2751,7 @@ pub async fn run(
                         snap.lat,
                         snap.lon,
                         snap.alt_ft,
-                        snap.on_ground,
+                        crate::hover::tower_on_ground(snap.on_ground, snap.agl_ft),
                         snap.groundspeed_kts,
                         tuned_speaker.is_some(),
                         now,
@@ -3354,20 +3360,33 @@ pub async fn run(
                 let flying = snap.automation_flying
                     || crate::autotakeoff::ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
                     || crate::tools::recover::ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
-                if flying { had_flying_control = true; control_idle_since = None; }
-                else if had_flying_control && !snap.on_ground {
+                if flying {
+                    had_flying_control = true;
+                    control_idle_since = None;
+                } else if had_flying_control && !snap.on_ground {
                     let since = *control_idle_since.get_or_insert(now);
                     if now.duration_since(since) >= Duration::from_secs(3) {
                         had_flying_control = false;
                         landing_summary.note_interruption();
                         voice.alert(Priority::Caution, "Flight automation has stopped. I'm monitoring only; you have control. Check the autopilot.".to_string());
                     }
-                } else if snap.on_ground { had_flying_control = false; }
+                } else if snap.on_ground {
+                    had_flying_control = false;
+                }
                 let xtk = crate::autoland::last_tracking_error();
-                if let Some(line) = landing_summary.tick(now, snap.on_ground, snap.agl_ft,
-                    snap.vsi_fpm, snap.groundspeed_kts, crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed), xtk) {
+                if let Some(line) = landing_summary.tick(
+                    now,
+                    snap.on_ground,
+                    snap.agl_ft,
+                    snap.vsi_fpm,
+                    snap.groundspeed_kts,
+                    crate::autoland::ACTIVE.load(std::sync::atomic::Ordering::Relaxed),
+                    xtk,
+                ) {
                     crate::blackbox::record("landing_summary", serde_json::json!({"msg": &line}));
-                    if !quiet { voice.alert(Priority::Advisory, line); }
+                    if !quiet {
+                        voice.alert(Priority::Advisory, line);
+                    }
                 }
                 let mut speed_bad = false;
                 let mut speed_spoke = false;
@@ -3377,9 +3396,11 @@ pub async fn run(
                     let state = states.get_mut(check.id()).expect("state per check");
                     match check.eval(&snap) {
                         Some(msg) => {
-                            let speed = check.id().starts_with("airspeed_") || check.id().starts_with("overspeed_");
+                            let speed = check.id().starts_with("airspeed_")
+                                || check.id().starts_with("overspeed_");
                             let cabin = check.id().starts_with("cabin_alt_");
-                            speed_bad |= speed; cabin_bad |= cabin;
+                            speed_bad |= speed;
+                            cabin_bad |= cabin;
                             state.observe_level(check.repeat_level(&snap));
                             let spoke = state.active(
                                 check.id(),
@@ -3438,8 +3459,15 @@ pub async fn run(
                 let speed_clear = airspeed_recovery.tick(speed_bad, speed_spoke, now);
                 let cabin_clear = cabin_recovery.tick(cabin_bad, cabin_spoke, now);
                 if !quiet && !snap.on_ground {
-                    if speed_clear { voice.alert(Priority::Advisory, "Airspeed recovered.".to_string()); }
-                    if cabin_clear { voice.alert(Priority::Advisory, "Cabin altitude back below the caution level.".to_string()); }
+                    if speed_clear {
+                        voice.alert(Priority::Advisory, "Airspeed recovered.".to_string());
+                    }
+                    if cabin_clear {
+                        voice.alert(
+                            Priority::Advisory,
+                            "Cabin altitude back below the caution level.".to_string(),
+                        );
+                    }
                 }
             }
         } else if xp.get_float(crate::datarefs::ON_GROUND_ANY).await.is_err() {
@@ -3448,12 +3476,17 @@ pub async fn run(
                 disconnected = true;
                 had_flying_control = false;
                 crate::flight_state::stand_down();
-                crate::blackbox::record("control_ownership", serde_json::json!({"event":"connection_lost"}));
+                crate::blackbox::record(
+                    "control_ownership",
+                    serde_json::json!({"event":"connection_lost"}),
+                );
                 if crate::mode::copilot_enabled() {
                     voice.alert(Priority::Warning, "Connection to X-Plane lost. Flight automation is stopped. You'll have control when the sim returns.".to_string());
                 }
             }
-        } else { lost_since = None; }
+        } else {
+            lost_since = None;
+        }
         tokio::time::sleep(period).await;
     }
 }
@@ -3851,14 +3884,18 @@ mod tests {
 
     #[test]
     fn cabin_episode_repeats_only_for_a_higher_band() {
-        let t = Instant::now(); let mut st = FireState::new();
-        st.observe_level(Some(13)); st.spoke_this_episode = true; st.last_spoken = Some(t);
+        let t = Instant::now();
+        let mut st = FireState::new();
+        st.observe_level(Some(13));
+        st.spoke_this_episode = true;
+        st.last_spoken = Some(t);
         st.observe_level(Some(13));
         assert!(!st.should_speak(Severity::Caution, t + RENOTIFY_COOLDOWN));
         st.observe_level(Some(14));
         assert!(st.should_speak(Severity::Caution, t + RENOTIFY_COOLDOWN));
         st.spoke_this_episode = true;
-        st.observe_level(Some(13)); st.observe_level(Some(14));
+        st.observe_level(Some(13));
+        st.observe_level(Some(14));
         assert!(!st.should_speak(Severity::Caution, t + RENOTIFY_COOLDOWN));
         // Critical airspeed/sink warnings retain their timed reminder.
         assert!(st.should_speak(Severity::Warning, t + RENOTIFY_COOLDOWN));

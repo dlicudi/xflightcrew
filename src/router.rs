@@ -319,6 +319,10 @@ pub(crate) fn release_intent(t: &str) -> bool {
 /// ("Nautilapuku") before it reaches the LLM, which would otherwise force-match
 /// it to the nearest tool. Whole-word, case-insensitive.
 pub(crate) const COMMAND_KEYWORDS: &[&str] = &[
+    // a helicopter's hover ("lift to a hover" was dropped here as "not a
+    // command", twice, on the S-76's first hover, 2026-09-22)
+    "hover",
+    "liftoff",
     // radio calls to the ATC station ("request taxi"/"radio"/"takeoff"/
     // "departure" are already covered below; these two aren't)
     "clearance",
@@ -690,6 +694,11 @@ pub(crate) fn looks_like_command(text: &str) -> bool {
         || t.contains("line us up")
         || t.contains("line me up")
         || t.contains("lined up")
+        || t.contains("lift off")
+        || t.contains("set it down")
+        || t.contains("set us down")
+        || t.contains("put it down")
+        || t.contains("put us down")
     {
         return true;
     }
@@ -853,6 +862,21 @@ pub(crate) fn matches_keyword(w: &str) -> bool {
 #[cfg(test)]
 mod unregistered_tool_tests {
     use super::*;
+
+    /// The hover's words clear the domain gate: the S-76's first "lift to a
+    /// hover" never reached the grammar (2026-09-22).
+    #[test]
+    fn a_helicopters_words_are_commands() {
+        for w in [
+            "Lift to a hover.",
+            "hover at fifteen feet",
+            "Set it down.",
+            "set us down",
+            "lift off",
+        ] {
+            assert!(looks_like_command(w), "{w}");
+        }
+    }
 
     /// The S-76C: a withheld fixed-wing law is refused with its reason; an
     /// unrelated missing tool, and any tool on a fixed-wing profile, keep

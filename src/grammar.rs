@@ -314,6 +314,16 @@ pub fn try_parse(
     // split them. Full auto first: "start up and fly a circuit" contains
     // "circuit" and must not fall to the circuit rule.
     if let Some(c) = flight_plan_call(&t) {
+        // A helicopter flies the plan on its own route follower: full auto
+        // is withheld there. Stopping it is a hold.
+        if registry.get("hover").is_some() && registry.get(&c.name).is_none() {
+            let off = c.arguments.get("off").and_then(|v| v.as_bool()) == Some(true);
+            return Some(vec![if off {
+                call("hover", json!({ "action": "hold" }))
+            } else {
+                call("hover", json!({ "action": "route" }))
+            }]);
+        }
         return Some(vec![c]);
     }
     // "Load the fuel and payload" carries "and" too, and is one intent.
@@ -324,7 +334,25 @@ pub fn try_parse(
         return Some(vec![c]);
     }
     if let Some(c) = circuit_call(&t) {
+        // A helicopter flies its own circuit on the hover loop: the fixed-
+        // wing mission is withheld there. Stopping it is a hold.
+        if registry.get("hover").is_some() && registry.get(&c.name).is_none() {
+            let off = c.arguments.get("off").and_then(|v| v.as_bool()) == Some(true);
+            let right = c.arguments.get("right").and_then(|v| v.as_bool()) == Some(true);
+            return Some(vec![if off {
+                call("hover", json!({ "action": "hold" }))
+            } else {
+                call("hover", json!({ "action": "circuit", "right": right }))
+            }]);
+        }
         return Some(vec![c]);
+    }
+    // A helicopter's hover and set-down. Only where the airframe has the
+    // tool: "set it down" means nothing to an aeroplane.
+    if registry.get("hover").is_some() {
+        if let Some(c) = hover_call(&t) {
+            return Some(vec![c]);
+        }
     }
     // Fly a real published procedure ("fly the ILS", "shoot the approach", "fly
     // the SID") — request-shaped, checked before the compound gate and never on
@@ -358,6 +386,20 @@ pub fn try_parse(
     // that's the tool this airframe has. Ten consecutive dead ends on the
     // 2026-07-09 final approach. Only the absolute forms map (knots/preset);
     // a relative "reduce by 20" needs the AP bug and stays unmapped.
+    // A helicopter's speed is the hover loop's (a departure's), and the AP
+    // speed select and the governor are not on it: "speed fifty knots" in a
+    // departure went nowhere (EDDV, 2026-09-23).
+    if c.name == "set_speed"
+        && registry.get("set_speed").is_none()
+        && registry.get("hover").is_some()
+    {
+        if let Some(k) = c.arguments.get("knots").and_then(|v| v.as_f64()) {
+            return Some(vec![call(
+                "hover",
+                json!({ "action": "speed", "speed_kts": k }),
+            )]);
+        }
+    }
     if c.name == "set_speed"
         && registry.get("set_speed").is_none()
         && registry.get("hold_speed").is_some()
@@ -366,6 +408,147 @@ pub fn try_parse(
         c.name = "hold_speed".to_string();
     }
     valid(&c, registry, profile).then_some(vec![c])
+}
+
+/// "Lift to a hover", "hover at fifteen feet", "lift off"; "set it down",
+/// "set us down", "put it down". A height is feet.
+fn hover_call(t: &str) -> Option<ToolCall> {
+    // "Land" on a helicopter is the set-down: autoland is withheld there, and
+    // "land the aircraft" / "let's land" went nowhere at the S-76's first
+    // hover (2026-09-22). Whole phrases only: "landing light" and "landing
+    // gear" are other tools.
+    let land = t == "land"
+        || [
+            "land the aircraft",
+            "land the helicopter",
+            "land it",
+            "land us",
+            "land here",
+            "land now",
+            "lets land",
+            "let's land",
+        ]
+        .iter()
+        .any(|p| t.contains(p))
+        // Whisper's "land 3 helicopter?" for "land the helicopter" (EDDV,
+        // 2026-09-23): a land word and the airframe's name is the request.
+        || (t.starts_with("land ") && t.contains("helicopter"));
+    // "Willis on the ground" is whisper's "put us on the ground".
+    let down = land
+        || t.contains("willis on the ground")
+        || [
+            "set it down",
+            "set us down",
+            "put it down",
+            "put us down",
+            "set down",
+            "put it on the ground",
+            "put us on the ground",
+        ]
+        .iter()
+        .any(|p| t.contains(p));
+    if down {
+        return Some(call("hover", json!({ "action": "down" })));
+    }
+    // Out of the hover into forward flight. "Take off" here is the
+    // helicopter's own: the fixed-wing takeoff is withheld on rotorcraft.
+    if [
+        "take off",
+        "takeoff",
+        "depart",
+        "transition",
+        "forward flight",
+    ]
+    .iter()
+    .any(|p| t.contains(p))
+        && !t.contains("clear")
+    {
+        let mut args = json!({ "action": "depart" });
+        if let Some(n) = number(t) {
+            // "climb to five hundred" vs "at forty knots": a knots word
+            // makes it the speed.
+            if t.contains("knot") {
+                args["speed_kts"] = json!(n as f64);
+            } else {
+                args["height_ft"] = json!(n as f64);
+            }
+        }
+        return Some(call("hover", args));
+    }
+    // Stop over the spot: before "move", which "stop moving" also contains.
+    if [
+        "hold position",
+        "hold your position",
+        "hold the hover",
+        "stop moving",
+        "hover here",
+        "stay here",
+    ]
+    .iter()
+    .any(|p| t.contains(p))
+    {
+        return Some(call("hover", json!({ "action": "hold" })));
+    }
+    // An air taxi: "move forward", "air taxi forward at five knots", "hover
+    // taxi left". A move word AND a direction, so "forward" alone (a seat,
+    // a CG) is not a manoeuvre.
+    let moving = [
+        "move ",
+        "air taxi",
+        "hover taxi",
+        "taxi ",
+        "drift ",
+        "slide ",
+    ]
+    .iter()
+    .any(|p| t.contains(p) || t.starts_with(p.trim()));
+    let direction = [
+        ("forward", "forward"),
+        ("ahead", "forward"),
+        ("back", "back"),
+        ("backward", "back"),
+        ("left", "left"),
+        ("right", "right"),
+    ]
+    .iter()
+    .find(|(w, _)| has(t, w))
+    .map(|(_, d)| *d);
+    if let (true, Some(d)) = (moving, direction) {
+        let mut args = json!({ "action": "move", "direction": d });
+        if let Some(n) = number(t) {
+            args["speed_kts"] = json!(n as f64);
+        }
+        return Some(call("hover", args));
+    }
+    // Whisper's "hover" at a height (2026-09-23, every one live): "how about
+    // ten feet", "what about ten feet", "over at 30 feet", "over ten feet",
+    // "prove at thirty feet", "hova, fifty feet", "hold that at 30 feet". A
+    // height in FEET with one of those is the hover; without the unit, "over"
+    // and "how about" are conversation.
+    let feet = has(t, "feet") || has(t, "foot") || has(t, "ft");
+    let hover_wart = feet
+        && number(t).is_some()
+        && [
+            "how about",
+            "what about",
+            "over at",
+            "over ",
+            "prove at",
+            "hova",
+            "hold that at",
+            "hold at",
+        ]
+        .iter()
+        .any(|p| t.starts_with(p) || t.contains(&format!(" {p}")));
+    let up = has(t, "hover") || hover_wart || t.contains("lift off") || t.contains("liftoff");
+    if !up {
+        return None;
+    }
+    let mut args = json!({ "action": "up" });
+    if let Some(n) = number(t) {
+        args["height_ft"] = json!(n as f64);
+    }
+    Some(call("hover", args))
 }
 
 fn call(name: &str, args: Value) -> ToolCall {
@@ -540,14 +723,23 @@ fn flight_plan_call(t: &str) -> Option<ToolCall> {
     if resume_plan_request(t) {
         return Some(call("full_auto", json!({ "resume": true })));
     }
+    // Whisper: "fly the flight gun".
     let plan_words = t.contains("flight plan")
+        || t.contains("flight gun")
+        || (has(t, "execute") && (has(t, "plan") || has(t, "flight")))
         || t.contains("simbrief")
         || t.contains("sim brief")
         || t.contains("the plan");
     if !plan_words {
         return None;
     }
-    let fly_shaped = has(t, "fly") || has(t, "flying") || t.contains("full auto");
+    // "Execute the flight plan" is the same ask (said live, 2026-09-23, and
+    // read back as the plan's brief).
+    let fly_shaped = has(t, "fly")
+        || has(t, "flying")
+        || has(t, "execute")
+        || t.starts_with("flight to flight plan")
+        || t.contains("full auto");
     if !fly_shaped {
         return None;
     }
@@ -1155,6 +1347,9 @@ fn parse_one(t: &str) -> Option<ToolCall> {
     // "taxi to stand 12 via ..." is a taxi READBACK to the tower, not a request
     // to the copilot (the same trap auto_taxi dodges).
     if t.contains("taxi to parking")
+        // Whisper, twice live: "request parking to taxi", "talk to taxi".
+        || t.contains("parking to taxi")
+        || t == "talk to taxi"
         || t.contains("taxi to the stand")
         || t.contains("taxi to the gate")
         || t.contains("taxi to the ramp")
@@ -2157,18 +2352,26 @@ mod tests {
     /// pilot asked four ways in eleven seconds and heard nothing at all. A
     /// capability the airframe lacks is said, not swallowed.
     #[test]
-    fn the_helicopters_engines_are_declined_not_swallowed() {
+    fn the_helicopters_engines_reach_its_start_tool() {
+        // The S-76C had no start tool and its engine words were declined
+        // aloud (2026-09-22, morning); it has one now, measured on the
+        // aircraft, and the same words reach it.
         let prof = aircraft::load("sikorsky_s76c").expect("s76 profile");
         let reg = Registry::for_aircraft(&prof);
-        assert!(reg.get("start_engine").is_none() && reg.get("start_engines").is_none());
-        for words in [
-            "Start engines.",
-            "Start the engines.",
-            "Engine's on.",
-            "Engines on.",
-            "shut down the engines",
+        for (words, tool) in [
+            ("Start engines.", "start_engines"),
+            ("Start the engines.", "start_engines"),
+            ("Engine's on.", "start_engines"),
+            ("Engines on.", "start_engines"),
+            ("shut down the engines", "stop_engines"),
         ] {
-            assert!(declined(words, &reg).is_some(), "{words}");
+            assert!(declined(words, &reg).is_none(), "{words}");
+            let calls = try_parse(words, &reg, &prof).unwrap_or_default();
+            assert_eq!(
+                calls.first().map(|c| c.name.as_str()),
+                Some(tool),
+                "{words}"
+            );
         }
         // The airframes that do have the tool are untouched.
         let (creg, _) = setup();
@@ -2176,6 +2379,126 @@ mod tests {
         let jet = aircraft::load("boeing_737_800").expect("737 profile");
         let jreg = Registry::for_aircraft(&jet);
         assert!(declined("engines off", &jreg).is_none());
+    }
+
+    #[test]
+    fn a_helicopter_hovers_and_sets_down_by_voice() {
+        let prof = aircraft::load("sikorsky_s76c").expect("s76 profile");
+        let reg = Registry::for_aircraft(&prof);
+        let first = |w: &str| try_parse(w, &reg, &prof).and_then(|mut v| v.drain(..).next());
+        let c = first("Lift to a hover.").expect("hover");
+        assert_eq!(
+            (c.name.as_str(), c.arguments["action"].as_str()),
+            ("hover", Some("up"))
+        );
+        let c = first("hover at fifteen feet").expect("height");
+        assert_eq!(c.arguments["height_ft"].as_f64(), Some(15.0));
+        let c = first("Set it down.").expect("down");
+        assert_eq!(c.arguments["action"].as_str(), Some("down"));
+        for w in [
+            "Land the aircraft.",
+            "Let's land.",
+            "land",
+            "Put it on the ground.",
+            "Land 3 helicopter?",
+        ] {
+            let c = first(w).unwrap_or_else(|| panic!("{w}"));
+            assert_eq!(
+                (c.name.as_str(), c.arguments["action"].as_str()),
+                ("hover", Some("down")),
+                "{w}"
+            );
+        }
+        let c = first("Move forward at five knots.").expect("move");
+        assert_eq!(c.arguments["action"].as_str(), Some("move"));
+        assert_eq!(c.arguments["direction"].as_str(), Some("forward"));
+        assert_eq!(c.arguments["speed_kts"].as_f64(), Some(5.0));
+        let c = first("air taxi left").expect("left");
+        assert_eq!(c.arguments["direction"].as_str(), Some("left"));
+        for w in ["Hold position.", "stop moving", "hover here"] {
+            let c = first(w).unwrap_or_else(|| panic!("{w}"));
+            assert_eq!(c.arguments["action"].as_str(), Some("hold"), "{w}");
+        }
+        for w in [
+            "Take off.",
+            "depart to five hundred feet",
+            "transition to forward flight",
+        ] {
+            let c = first(w).unwrap_or_else(|| panic!("{w}"));
+            assert_eq!(c.arguments["action"].as_str(), Some("depart"), "{w}");
+        }
+        let c = first("depart to five hundred feet").unwrap();
+        assert_eq!(c.arguments["height_ft"].as_f64(), Some(500.0));
+        // A readback of a clearance is not a request.
+        assert!(first("cleared for takeoff").is_none_or(|c| c.name != "hover"));
+        // A departure's speed rides the AP's speed words: EDDV 2026-09-23,
+        // both missed.
+        for w in [
+            "speed fifty knots",
+            "speed forty knots",
+            "set speed 60 knots",
+        ] {
+            let c = first(w).unwrap_or_else(|| panic!("{w}: {:?}", try_parse(w, &reg, &prof)));
+            assert_eq!(
+                (c.name.as_str(), c.arguments["action"].as_str()),
+                ("hover", Some("speed")),
+                "{w}"
+            );
+        }
+        for w in ["fly the flight plan", "fly my flight plan"] {
+            let c = first(w).unwrap_or_else(|| panic!("{w}"));
+            assert_eq!(c.arguments["action"].as_str(), Some("route"), "{w}");
+        }
+        // Parking is the aeroplanes' own tool on a helicopter too.
+        for w in ["taxi to parking", "park us", "take us to the stand"] {
+            let c = first(w).unwrap_or_else(|| panic!("{w}"));
+            assert_eq!(c.name, "taxi_to_parking", "{w}");
+        }
+        // Every one of these was heard live on 2026-09-23 and missed.
+        for (w, h) in [
+            ("How about ten feet?", 10.0),
+            ("What about ten feet?", 10.0),
+            ("Over at 30 feet.", 30.0),
+            ("Over ten feet.", 10.0),
+            ("Prove at thirty feet.", 30.0),
+            ("Hova, fifty feet.", 50.0),
+            ("Hold that at 30 feet.", 30.0),
+        ] {
+            let c = first(w).unwrap_or_else(|| panic!("{w}"));
+            assert_eq!(c.arguments["height_ft"].as_f64(), Some(h), "{w}");
+        }
+        assert!(first("how about the weather").is_none_or(|c| c.name != "hover"));
+        let c = first("Willis on the ground.").expect("willis");
+        assert_eq!(c.arguments["action"].as_str(), Some("down"));
+        for w in [
+            "Execute flight plan.",
+            "Execute plan.",
+            "execute flight.",
+            "and fly the flight gun.",
+            "Flight to flight plan.",
+        ] {
+            let c = first(w).unwrap_or_else(|| panic!("{w}"));
+            assert_eq!(c.arguments["action"].as_str(), Some("route"), "{w}");
+        }
+        for w in ["Request parking to taxi.", "Talk to taxi."] {
+            let c = first(w).unwrap_or_else(|| panic!("{w}"));
+            assert_eq!(c.name, "taxi_to_parking", "{w}");
+        }
+        let c = first("Let's fly a circuit.").expect("circuit");
+        assert_eq!(
+            (c.name.as_str(), c.arguments["action"].as_str()),
+            ("hover", Some("circuit"))
+        );
+        let c = first("right hand circuit").expect("right");
+        assert_eq!(c.arguments["right"].as_bool(), Some(true));
+        let c = first("cancel the circuit").expect("cancel");
+        assert_eq!(c.arguments["action"].as_str(), Some("hold"));
+        // The lights and the gear keep their own tools.
+        assert!(first("landing light on").is_none_or(|c| c.name != "hover"));
+        assert!(first("gear down for landing").is_none_or(|c| c.name != "hover"));
+        // An aeroplane has no hover: the words are not grabbed there.
+        let (creg, cprof) = setup();
+        assert!(try_parse("set it down", &creg, &cprof).is_none_or(|v| v[0].name != "hover"));
     }
 
     fn one(t: &str) -> Option<(String, Value)> {

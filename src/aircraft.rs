@@ -410,6 +410,11 @@ pub struct AircraftProfile {
     /// autopilot dials. The S-76C, 2026-09-16.
     #[serde(default)]
     pub rotorcraft: bool,
+    /// A helicopter's engine start and shutdown ([`crate::tools::heli`]):
+    /// held starters, throttles as the fuel control (0 is OFF), the rotor
+    /// read back at its governed speed.
+    #[serde(default)]
+    pub heli_start: Option<HeliStartProfile>,
     /// Transition altitude (ft MSL): at or above it, "set the altimeter" dials in
     /// standard pressure (29.92 inHg / 1013 hPa) instead of local QNH — that's the
     /// rule above the transition altitude. Defaults to 18,000 ft (US FL180); lower
@@ -920,6 +925,53 @@ fn apu_ready_default() -> f64 {
 }
 fn spool_idle_default() -> f64 {
     50.0
+}
+
+/// A helicopter's engine start, measured live on the S-76C (2026-09-22):
+/// throttle 0 is OFF and anything above it lets fuel in (the mixture follows
+/// the throttle by itself), the starter is held, each engine settles at about
+/// 62 % N1 on the idle throttle, and both throttles to FLY bring the rotor to
+/// its governed speed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeliStartProfile {
+    /// Per-engine starter command, HELD while the engine cranks.
+    pub starters: Vec<String>,
+    /// Per-engine throttle array: 0 off, `idle` to start, `fly` to run.
+    pub throttle: String,
+    pub idle: f64,
+    pub fly: f64,
+    /// N1 at which an engine is lit and self-sustaining on the idle throttle.
+    pub idle_n1: f64,
+    /// How long one engine may crank before it is given up on.
+    #[serde(default = "heli_crank_secs")]
+    pub crank_secs: f64,
+    /// Collective array (element 0 is the lever). A start with it up is refused.
+    pub collective: String,
+    /// Rotor brake ratio, released before the start.
+    #[serde(default)]
+    pub rotor_brake: Option<String>,
+    /// Rotor speed (element 0) and the governed figure it should reach.
+    pub rotor_rpm: String,
+    pub rotor_rpm_governed: f64,
+    /// Fired once both engines are at FLY.
+    #[serde(default)]
+    pub generators: Vec<String>,
+    /// Fired after the generators: what the rest of the start leaves on so
+    /// the autopilot can engage (the S-76's autopilot refused every mode
+    /// until the stick trim / yaw damper and the inverter were on).
+    #[serde(default)]
+    pub after_start: Vec<String>,
+    /// The tail wheel lock's TOGGLE command (the engage command did nothing on
+    /// the S-76), fired only when the lock reads off. Unlocked, rotor torque
+    /// pivoted the S-76 on its main wheels at up to 20 deg/s with the brake
+    /// set and the pedals neutral, until the engines were cut (ETNW,
+    /// 2026-09-23).
+    #[serde(default)]
+    pub tail_wheel_lock: Option<String>,
+}
+
+fn heli_crank_secs() -> f64 {
+    40.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3671,6 +3723,7 @@ fn cessna_172sp() -> AircraftProfile {
         retractable_gear: false,
         gear_by_command: false,
         rotorcraft: false,
+        heli_start: None,
         transition_altitude_ft: 18_000.0,
         view_blend: 1.0,
         locations: std::collections::HashMap::new(),
@@ -3980,6 +4033,7 @@ fn cirrus_sr22() -> AircraftProfile {
         retractable_gear: false,
         gear_by_command: false,
         rotorcraft: false,
+        heli_start: None,
         transition_altitude_ft: 18_000.0,
         view_blend: 1.0,
         locations: std::collections::HashMap::new(),

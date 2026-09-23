@@ -524,7 +524,10 @@ impl Tool for TaxiToParking {
         // Vacate first only if we are still ON the runway — see
         // `taxi_in::vacate_runway` for why a standing landing clearance is
         // the signal and a bare `clearance_runway` is not.
-        let vacate_from = crate::taxi_in::vacate_runway();
+        // A helicopter does not roll off a runway; it hover-taxis the route
+        // from where it sits.
+        let vacate_from = crate::taxi_in::vacate_runway()
+            .filter(|_| crate::hover::collective_dref().is_none());
         crate::taxi_in::start(
             ctx.config.xplane_base_url.clone(),
             ctx.config.clone(),

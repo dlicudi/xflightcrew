@@ -32,6 +32,9 @@ mod flow;
 mod full_auto;
 mod grammar;
 mod health;
+mod heli_circuit;
+mod heli_route;
+mod hover;
 mod instructor;
 mod interaction;
 mod livestate;
@@ -2135,7 +2138,15 @@ async fn run_session(
                 let circuit_flying = circuit::ACTIVE.load(Relaxed);
                 let procedure_flying = procedure::ACTIVE.load(Relaxed);
                 let full_auto_running = full_auto::ACTIVE.load(Relaxed);
-                if (speed_held
+                let hover_holding = hover::ACTIVE.load(Relaxed);
+                // A helicopter's route or circuit: in cruise the hover loop
+                // is not running, and the route's speed law owns the
+                // collective until it is told to let go.
+                let heli_flying =
+                    heli_route::ACTIVE.load(Relaxed) || heli_circuit::ACTIVE.load(Relaxed);
+                if (hover_holding
+                    || heli_flying
+                    || speed_held
                     || mix_held
                     || reverse_in
                     || taxi_driving
@@ -2170,6 +2181,20 @@ async fn run_session(
                         && !names_steer
                         && !tl.contains("brake");
                     let mut released: Vec<&str> = Vec::new();
+                    // A helicopter's hover: the collective is ours and the
+                    // autopilot holds the position. "My controls" or naming
+                    // the collective hands both back where they are.
+                    if heli_flying && (generic || tl.contains("collective")) {
+                        // The route lets go of the collective where it is and
+                        // leaves the autopilot in the mode it is flying.
+                        heli_route::abort();
+                        heli_circuit::abort();
+                        released.push("route off");
+                    }
+                    if hover_holding && (generic || tl.contains("collective")) {
+                        hover::abort();
+                        released.push("hover off, your controls");
+                    }
                     // Full auto owns the entire chain (engine, taxi, line-up,
                     // circuit); cancelling it stands them all down and wins the
                     // release, so the per-loop branches below are skipped.
@@ -2726,7 +2751,7 @@ async fn run_session(
                 || tl.contains("track")
                 || tl
                     .split(|c: char| !c.is_ascii_alphanumeric())
-                    .any(|w| w == "fly");
+                    .any(|w| w == "fly" || w == "execute");
             let is_plan = !nav_intent
                 && (tl.contains("flight plan")
                     || tl.contains("simbrief")
@@ -2958,6 +2983,51 @@ async fn run_session(
                 break;
             }
 
+            // A helicopter's hover owns the autopilot's modes: a heading
+            // selected mid-hover replaced the hover mode and flew the S-76
+            // forward out of it (2026-09-22). One door, before any confirm.
+            // ...and a speed, which changes the speed it is flying.
+            if call.name == "set_speed" {
+                if let Some(line) = call
+                    .arguments
+                    .get("knots")
+                    .and_then(|k| k.as_f64())
+                    .and_then(hover::depart_speed)
+                {
+                    blackbox::record(
+                        "hover",
+                        serde_json::json!({ "event": "depart_speed_asked", "args": call.arguments }),
+                    );
+                    say(&voice, &reporter, ui::LogKind::Readback, &line);
+                    break;
+                }
+            }
+            // ...except a heading during a departure, which turns the
+            // track the hover mode is flying.
+            if call.name == "set_heading" {
+                if let Some(line) = call
+                    .arguments
+                    .get("heading")
+                    .and_then(|h| h.as_f64())
+                    .and_then(hover::depart_turn)
+                {
+                    blackbox::record(
+                        "hover",
+                        serde_json::json!({ "event": "depart_turn_asked", "args": call.arguments }),
+                    );
+                    say(&voice, &reporter, ui::LogKind::Readback, &line);
+                    break;
+                }
+            }
+            if let Some(line) = hover::blocks(&call.name) {
+                blackbox::record(
+                    "hover",
+                    serde_json::json!({ "event": "blocked", "tool": call.name }),
+                );
+                say(&voice, &reporter, ui::LogKind::Readback, line);
+                break;
+            }
+
             // A checklist isn't a one-shot tool — the copilot runs it as a FLOW
             // on its own thread (`flow::start`, Crew flavour): reads each item,
             // does the ones it can, calls out the pilot's, and takes its
@@ -2991,7 +3061,9 @@ async fn run_session(
                     );
                     break 'confirm false;
                 };
-                let intent = if config.confirm_critical {
+                let parked_shutdown = call.name == "stop_engines"
+                    && tools::jet_start::stopped_on_ground(&xplane).await;
+                let intent = if config.confirm_critical && !parked_shutdown {
                     tool.confirm_prompt(&call.arguments)
                 } else {
                     None
