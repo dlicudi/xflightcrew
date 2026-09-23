@@ -176,13 +176,6 @@ pub fn normalize(transcript: &str) -> String {
         // slips to "electronics", the trailing "on" to "zone".
         ("electronics systems", "electrical systems"),
         ("electrical system zone", "electrical systems on"),
-        // ...and the same "s on" glue lands as a word again and again:
-        // "Electric source." (737, 2026-09-22), "Electric sauce." (Baron,
-        // 2026-09-16), "Electric software." (172, 2026-09-17). Nobody
-        // commands any of the three.
-        ("electric source", "electrics on"),
-        ("electric sauce", "electrics on"),
-        ("electric software", "electrics on"),
         // "my controls" — the universal hand-back — heard as "Mind controls."
         // (737, 2026-09-20). A missed hand-back leaves an automation flying
         // an aircraft the pilot has already taken, so this one is not
@@ -544,6 +537,11 @@ fn hover_call(t: &str) -> Option<ToolCall> {
     if !up {
         return None;
     }
+    // "Hover at zero feet" is the set-down (EDDV, 2026-09-22: refused as
+    // outside the 3 to 50 ft band, then said again as "hover at 1 foot").
+    if number(t) == Some(0) && feet {
+        return Some(call("hover", json!({ "action": "down" })));
+    }
     let mut args = json!({ "action": "up" });
     if let Some(n) = number(t) {
         args["height_ft"] = json!(n as f64);
@@ -723,9 +721,16 @@ fn flight_plan_call(t: &str) -> Option<ToolCall> {
     if resume_plan_request(t) {
         return Some(call("full_auto", json!({ "resume": true })));
     }
-    // Whisper: "fly the flight gun".
+    // Whisper garbles the last word and keeps the shape: "fly the flight
+    // gun / path / bluff / class / time", "fly the flat band" (737 and S-76,
+    // 2026-09-22/23, each followed by "fly the flight plan"). Nothing else in
+    // a cockpit is flown "the flight" anything.
+    let garbled_plan = has(t, "fly")
+        && (t.contains("the flight ") || t.contains("the flat "))
+        && !t.contains("director")
+        && !t.contains("level");
     let plan_words = t.contains("flight plan")
-        || t.contains("flight gun")
+        || garbled_plan
         || (has(t, "execute") && (has(t, "plan") || has(t, "flight")))
         || t.contains("simbrief")
         || t.contains("sim brief")
@@ -735,10 +740,13 @@ fn flight_plan_call(t: &str) -> Option<ToolCall> {
     }
     // "Execute the flight plan" is the same ask (said live, 2026-09-23, and
     // read back as the plan's brief).
+    // "Play the flight plan" is whisper's "fly" (EBLG, 2026-09-22: read back
+    // as the brief, then said again as "fly the flight plan").
     let fly_shaped = has(t, "fly")
         || has(t, "flying")
         || has(t, "execute")
         || t.starts_with("flight to flight plan")
+        || t.starts_with("play the flight plan")
         || t.contains("full auto");
     if !fly_shaped {
         return None;
@@ -751,6 +759,14 @@ fn flight_plan_call(t: &str) -> Option<ToolCall> {
         return Some(call("full_auto", json!({ "off": true })));
     }
     Some(call("full_auto", json!({ "flight": true })))
+}
+
+/// Is this a request to FLY (or resume, or stop) the flight plan? The main
+/// loop asks before its plan-brief branch, so the brief never answers words
+/// the grammar would fly: "Flight to flight plan" got the brief twice while
+/// the grammar had flown it since 2026-09-20.
+pub fn flight_plan_request(t: &str) -> bool {
+    flight_plan_call(&normalize(t)).is_some()
 }
 
 /// Is this the load-sheet request ("load the aircraft", "set the fuel and
@@ -2300,16 +2316,14 @@ mod tests {
             one("Cancel Autolamp.").unwrap(),
             ("autoland".into(), json!({ "cancel": true }))
         );
-        // The "s on" glue, three more renderings of "electrics on".
+        // "Electric source / sauce / software" were once rewritten to
+        // "electrics ON". Every one was said at the SHUTDOWN, straight after
+        // "engines off", and followed within seconds by "electrics off"
+        // (172 2026-09-14, Baron 2026-09-16, 737 2026-09-22): the pilot meant
+        // OFF. With no confirm on an all-off (it runs airborne too), a guess
+        // either way is wrong: they miss, and the pilot says it again.
         for words in ["Electric source.", "Electric sauce.", "Electric software."] {
-            assert_eq!(
-                one(words).unwrap(),
-                (
-                    "set_electrical".into(),
-                    json!({ "system": "all", "on": true })
-                ),
-                "{words}"
-            );
+            assert!(one(words).is_none(), "{words}");
         }
         // The unit, and the load sheet's verb. A pace with a number in it is
         // the governor's front door, which is where a taxi pace belongs.
@@ -2382,10 +2396,53 @@ mod tests {
     }
 
     #[test]
+    fn the_flight_plan_is_flown_through_whispers_garbles() {
+        // Every one said live and followed by "fly the flight plan" (737 and
+        // S-76, 2026-09-22/23): the last word goes, the shape stays.
+        let jet = aircraft::load("boeing_737_800").expect("737 profile");
+        let jreg = Registry::for_aircraft(&jet);
+        let heli = aircraft::load("sikorsky_s76c").expect("s76 profile");
+        let hreg = Registry::for_aircraft(&heli);
+        for words in [
+            "Fly the flight path.",
+            "Fly the flight bluff.",
+            "Let's fly the flight bluff.",
+            "Fly the flight class.",
+            "Fly the flat band?",
+            "Okay, fly the flight time.",
+            "Play the flight plan.",
+            "Flight to flight plan.",
+        ] {
+            let c = try_parse(words, &jreg, &jet).expect(words);
+            assert_eq!(c[0].name, "full_auto", "{words}");
+            assert_eq!(c[0].arguments, json!({ "flight": true }), "{words}");
+            assert!(
+                flight_plan_request(words),
+                "the brief must not catch {words}"
+            );
+            let h = try_parse(words, &hreg, &heli).expect(words);
+            assert_eq!(h[0].arguments, json!({ "action": "route" }), "{words}");
+        }
+        // Not the plan: other things flown, and the plan's brief.
+        for words in [
+            "Fly the flight director.",
+            "Fly flight level three five zero.",
+            "What's the flight plan?",
+            "Load the flight plan.",
+        ] {
+            assert!(!flight_plan_request(words), "{words}");
+        }
+    }
+
+    #[test]
     fn a_helicopter_hovers_and_sets_down_by_voice() {
         let prof = aircraft::load("sikorsky_s76c").expect("s76 profile");
         let reg = Registry::for_aircraft(&prof);
         let first = |w: &str| try_parse(w, &reg, &prof).and_then(|mut v| v.drain(..).next());
+        // A hover at zero feet is the set-down (EDDV, 2026-09-22: refused as
+        // outside the band).
+        let c = first("Hover at 0 feet.").expect("zero");
+        assert_eq!(c.arguments, json!({ "action": "down" }));
         let c = first("Lift to a hover.").expect("hover");
         assert_eq!(
             (c.name.as_str(), c.arguments["action"].as_str()),

@@ -406,7 +406,22 @@ that request instead.
   only for setups with no radio key.
 - **Any PTT mutes everything while held** (mic hygiene on speakers); release
   rejoins LIVE audio, no replay - recovery is procedural ("say again"), never
-  an auto-repeat.
+  an auto-repeat. **And the recovery knows what was cut**
+  (`voice::SpeechMemory`, `router::recall_line`, 2026-09-23): a press keeps
+  the copilot line it silenced and the ones it drained as OWED (a radio
+  remainder too, until it plays), 90 s; "what were you saying?" says the owed
+  lines, "say again" the NEWEST of owed, last readback and last volunteered
+  line. It used to know only the last command readback, so a caution the
+  pilot keyed over was gone and "say again" answered with an older line.
+  **The frequency's "say again" repeats the controller** (`tower::is_say_again`,
+  `voice::controller_repeat`, `main::repeat_controller`): the controller's
+  LAST transmission addressed to us (logged at air time, or when a press
+  blocked it; never ATIS, a ghost, or `alert_station_overheard`), word for
+  word, within 60 s, on the SAME COM1 frequency. Being the last word, a
+  cancelled clearance is never on file. Before, every one earned "say again"
+  back, even straight after a takeoff clearance. "What did the tower say?"
+  on the intercom reports the same line (5 min); with external ATC the crew
+  says it cannot hear the frequency.
 - The radio needs POWER both directions (station audio dropped, transmissions
   go nowhere, copilot says "radios are dead"). **FAIL OPEN, and the flag is
   RESTORED every tick** - a process-wide fact that merely stops being
@@ -1027,7 +1042,33 @@ helicopter flies on its own loop ([src/hover.rs](src/hover.rs), blackbox
   departure" (60 s bounded wait) and "inbound for landing" on the
   destination tower's apt.dat frequency, and cruises 1,000 ft over the
   HIGHEST ground probed along its legs (plugin terrain, 1 km spacing); the
-  last three unflown.
+  last three unflown. **It works the radio with the aeroplanes' code**
+  (`full_auto::get_zone_clearance` before the departure call,
+  `obey_departure_handoff` / `obey_region_handoff` from the fly loop, off
+  the control tick; source-pinned by
+  `every_mission_that_leaves_a_field_works_the_radio`): EDVW-ETND
+  (2026-09-23) left on a takeoff clearance alone, ignored the region's
+  handoff to Eimbeckhausen, and the crew called its own zone "without
+  clearance" four times. Transit fields' challenges are still unanswered
+  (full auto's gap too). **The inbound call is the aeroplanes' sequence**
+  (tune, `arm_station_for_freq`, pin, wait up to 45 s for the station to be
+  the destination, then call; spawned off the tick): into ETND it went out
+  15 s before Diepholz became the station and the final was challenged twice.
+  **The approach comes down at speed** (`Phase::Approach`, 2026-09-23): 70 kt
+  on the collective, the autopilot's vertical-speed mode down a 6.5 degree
+  path (`approach_target_ft`, `approach_vs_fpm`: the target's own rate fed
+  forward, 2 fpm a foot) to a gate 500 ft over the pad, lifted to clear the
+  ground still ahead by 400 ft (`gate_agl_ft`, probed at the approach's
+  start); the dial is set only with the mode's engage (moved under altitude
+  hold it leaves the pitch unheld); the slow-down is level at the gate and
+  the hover loop takes over where the final's own path from the gate begins
+  (`approach_slow_m`), never above it (`final_command` dives to its path).
+  Before, the whole descent was the hover loop's at 38 kt from the cruise
+  height: 5.5 min from 1,000 ft, 8.3 into ETND from 2,000 ft, 7 of them on a
+  final a headwind held to 21 kt. No pad elevation (no probe), the old
+  slow-down at the cruise height. Offline only (sortie test on a lagged VS
+  plant); the final's GROUNDSPEED cap in a headwind is still owed, pending
+  whether the hover mode's 47 kt let-go is airspeed or groundspeed.
 - **Parking is the aeroplanes' tool** (`taxi_to_parking`, unwithheld for a
   rotorcraft): the same call to the tower, the same clearance; only the drive
   differs, a hover taxi of the cleared route (`heli_route::park`, 12 ft, 10

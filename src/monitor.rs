@@ -3031,7 +3031,11 @@ pub async fn run(
                                         if let Some(s) = status.as_ref() {
                                             s.action(&format!("~{}: {}", who.tag(), l.text));
                                         }
-                                        voice.alert_station(Priority::Advisory, who, l.text);
+                                        voice.alert_station_overheard(
+                                            Priority::Advisory,
+                                            who,
+                                            l.text,
+                                        );
                                     }
                                 }
                             }

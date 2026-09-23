@@ -113,7 +113,8 @@ use router::has_number;
 use router::{
     callout_label, classify_confidence, command_subject, conversational, correction_text,
     correction_value, is_affirmative, is_bare_value, looks_like_command, looks_like_followup,
-    looks_like_question, release_intent, ConfidenceAction,
+    atc_recall_line, atc_recall_request, eta_question, looks_like_question, recall_ask, recall_line,
+    release_intent, ConfidenceAction,
 };
 use stt::Stt;
 use tools::{Registry, ToolCtx};
@@ -1341,6 +1342,7 @@ async fn run_session(
             if let Ok(mut last) = LAST_READBACK.lock() {
                 *last = None;
             }
+            voice.forget_speech();
             tracing::info!(aircraft = %profile.display_name, "reconfigured for new aircraft");
         }
 
@@ -1573,6 +1575,17 @@ async fn run_session(
             // to step on the real controller's answer.
             if !mode::atc_enabled() {
                 reporter.log(ui::LogKind::Info, "transmitted; external ATC has the radio");
+                continue;
+            }
+            // "Say again" on the air: the controller on this frequency
+            // repeats its last transmission to us, word for word. Never a
+            // new clearance: only what was already said, and only its LAST
+            // word (see `voice::controller_repeat`). Nothing on file falls
+            // through to the station, whose answer is "say again" back.
+            if atc_station.is_some()
+                && tower::is_say_again(&command)
+                && repeat_controller(&voice, &reporter, &command, "keyed")
+            {
                 continue;
             }
             if let Some(st) = atc_station.as_mut() {
@@ -2543,26 +2556,10 @@ async fn run_session(
                     continue;
                 }
             }
-            // ETA to the destination ("time before we land", "when do we get in"):
-            // distance to the destination airport over groundspeed. Needs a destination
-            // cue plus a time cue, so it beats the next-waypoint branch below.
-            if !is_reminder
-                && (tl.contains("land")
-                    || tl.contains("destination")
-                    || tl.contains("arrive")
-                    || tl.contains("arrival")
-                    || tl.contains("get there")
-                    || tl.contains("get in")
-                    || tl.contains("en route")
-                    || tl.contains("enroute")
-                    || tl.contains("on route"))
-                && (tl.contains("time")
-                    || tl.contains("eta")
-                    || tl.contains("when")
-                    || tl.contains("how long")
-                    || tl.contains("estimat")
-                    || tl.contains("remaining"))
-            {
+            // ETA to the destination ("time before we land", "when do we get in",
+            // "how far before we land"): distance to the destination airport over
+            // groundspeed. Beats the next-waypoint branch below (`eta_question`).
+            if !is_reminder && eta_question(&tl) {
                 let line = eta_to_destination(&config, &xplane, &mut fp_cache).await;
                 conversation.observe(&command, &line, Instant::now());
                 say(&voice, &reporter, ui::LogKind::Readback, &line);
@@ -2745,7 +2742,8 @@ async fn run_session(
             // refresh. Not when the intent is to *fly* it ("follow/navigate/track"
             // is the navigate tool; the word "fly" is the full-auto SimBrief
             // mission — both handled via the grammar/LLM path below).
-            let nav_intent = grammar::resume_plan_request(&tl)
+            let nav_intent = grammar::flight_plan_request(&tl)
+                || grammar::resume_plan_request(&tl)
                 || tl.contains("navigate")
                 || tl.contains("follow")
                 || tl.contains("track")
@@ -2792,8 +2790,43 @@ async fn run_session(
             None => matchable,
         };
 
-        // Conversational glue (acks, "what can you do", "say again") — deterministic,
-        // takes no action. Checked before commands/questions so pleasantries don't
+        // "Say again" / "what were you saying?": the line the pilot keyed over
+        // or the radio stepped on is owed, and outranks an older readback.
+        // "What did the tower say?": only what actually went out on OUR
+        // radio. With external ATC (copilot mode) the crew never hears the
+        // frequency, and says so rather than pretend.
+        if let Some(line) = atc_recall_request(&matchable).then(|| {
+            atc_recall_line(
+                mode::atc_enabled(),
+                voice.last_controller_line().as_ref(),
+                Instant::now(),
+            )
+        }) {
+            say(&voice, &reporter, ui::LogKind::Readback, &line);
+            continue;
+        }
+        if let Some(ask) = recall_ask(&matchable) {
+            let readback = LAST_READBACK.lock().ok().and_then(|l| l.clone());
+            let line = match recall_line(
+                ask,
+                &voice.unsaid(),
+                readback.as_ref(),
+                voice.last_volunteered().as_ref(),
+            ) {
+                Some((line, spends)) => {
+                    if spends {
+                        voice.forget_unsaid();
+                    }
+                    tracing::info!(?ask, owed = spends, line = %line, "recall");
+                    line
+                }
+                None => "Nothing to repeat yet.".to_string(),
+            };
+            say(&voice, &reporter, ui::LogKind::Readback, &line);
+            continue;
+        }
+        // Conversational glue (acks, "what can you do") — deterministic, takes
+        // no action. Checked before commands/questions so pleasantries don't
         // fall through to "Say again?".
         if let Some(reply) = conversational(&matchable, &registry) {
             say(&voice, &reporter, ui::LogKind::Readback, &reply);
@@ -3634,7 +3667,7 @@ fn next_input(
 /// The last genuine readback/answer spoken — so "say again" can repeat it. Only
 /// real readbacks are stored (not warnings like "Say again?"), single-threaded
 /// session so a plain Mutex is fine.
-static LAST_READBACK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static LAST_READBACK: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
 
 fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
     tracing::info!(spoke = %line, "spoke");
@@ -3644,7 +3677,7 @@ fn say(voice: &Voice, reporter: &Reporter, kind: ui::LogKind, line: &str) {
     reporter.status(ui::Phase::Listening);
     if matches!(kind, ui::LogKind::Readback) {
         if let Ok(mut last) = LAST_READBACK.lock() {
-            *last = Some(line.to_string());
+            *last = Some((line.to_string(), Instant::now()));
         }
     }
 }
@@ -3839,6 +3872,18 @@ async fn try_route_content_atc(
     if dual_ptt || !voice.radio_powered() || voice.crashed() || voice.replay() || voice.paused() {
         return false;
     }
+    // "Gibraltar Tower, say again" with no radio key: addressed to the
+    // station by name, so the controller repeats (the bare "say again" is
+    // the copilot's).
+    if tower::is_say_again(tl)
+        && station::is_radio_call(
+            tl,
+            &station::spoken_airport(st.airport_name()).to_lowercase(),
+        )
+        && repeat_controller(voice, reporter, tl, "unkeyed")
+    {
+        return true;
+    }
     let Some((reply, who)) = st.try_handle(tl, xplane.view()).await else {
         return false;
     };
@@ -3857,6 +3902,33 @@ async fn try_route_content_atc(
 /// while it's in VHF range — parked 200 nm out, "Gibraltar: tower one three
 /// one decimal two" reads as if Gibraltar could answer (2026-07-10). Out of
 /// range, name what IS reachable instead, or say honestly that nothing is.
+/// The pilot's "say again" on the air: the controller on this frequency
+/// repeats its last transmission to us word for word, if it made one in the
+/// last minute (`voice::controller_repeat`). Never a new clearance: only the
+/// controller's LAST word to us, so a cancelled clearance is not on file.
+/// `false`: nothing to repeat, and the station answers "say again" back.
+fn repeat_controller(voice: &Voice, reporter: &Reporter, transcript: &str, route: &str) -> bool {
+    let Some(last) = voice.repeat_on_frequency() else {
+        return false;
+    };
+    blackbox::record(
+        "atc",
+        serde_json::json!({
+            "route": route, "outcome": "say_again_repeat", "transcript": transcript,
+            "service": last.speaker.tag(), "reply": &last.text,
+            "age_s": last.at.elapsed().as_secs(),
+        }),
+    );
+    reporter.status(ui::Phase::Speaking);
+    reporter.log(
+        ui::LogKind::Readback,
+        format!("{}: {}", last.speaker.tag(), last.text),
+    );
+    voice.say_station(Priority::Readback, last.speaker, &last.text);
+    reporter.status(ui::Phase::Listening);
+    true
+}
+
 async fn void_briefing(xp: &XPlaneClient, st: &station::Station) -> String {
     let com1 = xp
         .get_float(datarefs::COM1_FREQ_KHZ)

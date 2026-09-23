@@ -545,6 +545,23 @@ pub fn intent_from_label(label: &str) -> Option<Intent> {
     })
 }
 
+/// Is this transmission the pilot asking the controller to REPEAT its last
+/// transmission ("say again", "Gibraltar Tower, say again all after runway",
+/// "repeat your last")? Until 2026-09-23 it parsed as `Unknown` and every
+/// one was answered "say again" back, clearance or not, so a clearance the
+/// pilot keyed over (a press cuts the station, no resume) was gone for good.
+/// The station half of the answer lives with the audio (the crew side knows
+/// what actually went out on the air); a request that also asks for
+/// something ("say again, request taxi") is that request instead.
+pub fn is_say_again(transcript: &str) -> bool {
+    let t = transcript.to_lowercase();
+    let asks = t.contains("say again")
+        || t.contains("repeat your last")
+        || t.contains("repeat the last")
+        || t.contains("repeat last");
+    asks && !t.contains("request") && !t.contains("ready")
+}
+
 /// Is this transmission a pilot READBACK of an instruction ("descending to one
 /// thousand five hundred", "heading two five zero, November 172SP") rather than
 /// a new request? A correct readback earns silence on a real frequency — the
@@ -1997,6 +2014,17 @@ mod tests {
         let mut twr = Tower::new();
         let r = twr.handle(Intent::ReportCrosswind, &ctx());
         assert!(r.contains("report downwind"), "{r}");
+    }
+
+    #[test]
+    fn say_again_is_a_repeat_request_unless_it_also_asks() {
+        assert!(is_say_again("say again"));
+        assert!(is_say_again("gibraltar tower, say again"));
+        assert!(is_say_again("say again all after runway"));
+        assert!(is_say_again("tower, repeat your last"));
+        assert!(!is_say_again("say again, request taxi"));
+        assert!(!is_say_again("ready for departure"));
+        assert!(!is_say_again("roger, holding point alpha"));
     }
 
     #[test]

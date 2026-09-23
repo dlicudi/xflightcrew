@@ -419,6 +419,62 @@ async fn ensure_squawk(xp: &XPlaneClient, ctx: &ToolCtx<'_>, voice: &Option<Voic
     }
 }
 
+/// Clearance first, the real order: the zone clearance from the home tower,
+/// its squawk dialled and the clearance read back. Only with a simulated
+/// tower to answer (real/external ATC and copilot-only leave the clearance
+/// to the pilot), and only if we don't already hold a squawk. Shared by every
+/// mission that leaves a towered field (full auto before the taxi, the
+/// helicopter route before its departure call): the S-76 called "ready for
+/// departure" with no zone clearance and flew the zone that way (EDVW,
+/// 2026-09-23).
+pub(crate) async fn get_zone_clearance(
+    xp: &XPlaneClient,
+    ctx: &ToolCtx<'_>,
+    voice: &Option<Voice>,
+    callsign: &Option<String>,
+) {
+    if !crate::mode::atc_enabled() || crate::party_line::assigned_squawk().is_some() {
+        return;
+    }
+    if let Some(khz) = crate::party_line::home_tower_khz() {
+        let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+    }
+    announce(
+        voice,
+        Priority::Advisory,
+        crate::readback::one_of(&[
+            "Requesting clearance.",
+            "Getting our clearance.",
+            "Calling for our clearance.",
+        ]),
+    );
+    crate::circuit::transmit(crate::circuit::radio_call(callsign, "request clearance"));
+    event("request_clearance", json!({}));
+    // The tower answers with a discrete squawk; wait for it, then dial it
+    // into the transponder and read it back — the crew's clearance copy.
+    // The clock starts when the call is QUEUED, and the call rides the
+    // speech queue behind our own arming brief and anyone the tower is
+    // working: at Malaga 30 s gave up 13 s before the clearance came
+    // back, the squawk was never set, and the tower spent the climb
+    // asking us to confirm 4503 while we showed 7000 (23:06Z,
+    // 2026-09-12). So the wait is longer, and the squawk is OWED, not
+    // missed: `ensure_squawk` sets a late one at the hold and lined up.
+    waiting("the squawk");
+    wait_until(60.0, 500, || async {
+        crate::party_line::assigned_squawk().is_some()
+    })
+    .await;
+    ensure_squawk(xp, ctx, voice).await;
+    // The clearance is read back like a real one: the zone cap, the
+    // QNH and the squawk (the tower suggests the words, enforces
+    // nothing, and answers a correct one with silence). Never done
+    // before 2026-09-15: the squawk was set and the taxi asked for.
+    if let Some(rb) = crate::party_line::readback_owed() {
+        crate::circuit::transmit(rb.trim_end_matches('.').to_string());
+        event("clearance_readback", json!({}));
+    }
+}
+
 async fn engine_running(xp: &XPlaneClient) -> bool {
     xp.get_float_array(ENGN_RUNNING)
         .await
@@ -535,21 +591,7 @@ async fn wait_enroute_working_the_radio(
             }
         }
         if let Some((to, khz)) = crate::party_line::take_departure_handoff() {
-            crate::circuit::transmit(crate::circuit::radio_call(
-                callsign,
-                &format!("{to} on {}", crate::atis::spoken_mhz(khz)),
-            ));
-            tokio::time::sleep(Duration::from_secs(HANDOFF_READBACK_SECS)).await;
-            let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
-            // The altitude is read by the main loop as the call goes out, not
-            // here: the queue can hold it for twenty seconds behind a busy
-            // frequency, and "passing one thousand" was said at 1,207 ft.
-            let alt_ft = xp.get_float(ALT_IND_FT).await.unwrap_or(0.0);
-            crate::circuit::transmit_check_in(callsign.clone(), to.clone(), climb_to_ft);
-            event(
-                "departure_checkin",
-                json!({ "to": to, "khz": khz, "alt_ft_queued": alt_ft.round() }),
-            );
+            obey_departure_handoff(xp, callsign, to, khz, climb_to_ft).await;
         }
         if let Some(h) = crate::party_line::take_region_handoff() {
             obey_region_handoff(xp, ctx, voice, callsign, h, true).await;
@@ -593,6 +635,33 @@ async fn wait_enroute_working_the_radio(
     }
 }
 
+/// Obey the tower's after-takeoff handoff: read it back on the tower's
+/// frequency, retune, check in with the climb. Shared with the helicopter
+/// route, which never took one (EDVW, 2026-09-23).
+pub(crate) async fn obey_departure_handoff(
+    xp: &XPlaneClient,
+    callsign: &Option<String>,
+    to: String,
+    khz: i64,
+    climb_to_ft: f64,
+) {
+    crate::circuit::transmit(crate::circuit::radio_call(
+        callsign,
+        &format!("{to} on {}", crate::atis::spoken_mhz(khz)),
+    ));
+    tokio::time::sleep(Duration::from_secs(HANDOFF_READBACK_SECS)).await;
+    let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
+    // The altitude is read by the main loop as the call goes out, not
+    // here: the queue can hold it for twenty seconds behind a busy
+    // frequency, and "passing one thousand" was said at 1,207 ft.
+    let alt_ft = xp.get_float(ALT_IND_FT).await.unwrap_or(0.0);
+    crate::circuit::transmit_check_in(callsign.clone(), to.clone(), climb_to_ft);
+    event(
+        "departure_checkin",
+        json!({ "to": to, "khz": khz, "alt_ft_queued": alt_ft.round() }),
+    );
+}
+
 /// The crew's readback of the enroute handoff, on the frequency it came on:
 /// "squawking seven thousand, Malaga Tower on one one eight decimal one".
 /// Shaped as a READBACK (the tower FSM's `is_readback` words) so the
@@ -615,7 +684,7 @@ pub fn region_readback(callsign: &Option<String>, h: &crate::party_line::RegionH
 /// NEW tower as a garbled call), give the discrete code back, retune COM1.
 /// The spoken line had no crew consumer until 2026-09-14: the flight kept the
 /// departure code and the old frequency until its own arrival stage.
-async fn obey_region_handoff(
+pub(crate) async fn obey_region_handoff(
     xp: &XPlaneClient,
     ctx: &ToolCtx<'_>,
     voice: &Option<Voice>,
@@ -1045,46 +1114,8 @@ async fn fly(xp: XPlaneClient, config: Config, voice: Option<Voice>, tools: SubT
         // Clearance first — the real order is clearance, THEN taxi. Only with a
         // simulated tower to answer (real/external ATC and copilot-only leave the
         // clearance to the pilot), and only if we don't already hold a squawk.
-        if crate::mode::atc_enabled() && crate::party_line::assigned_squawk().is_none() {
-            if let Some(khz) = crate::party_line::home_tower_khz() {
-                let _ = xp.set_float(COM1_FREQ_KHZ, khz as f64).await;
-            }
-            announce(
-                &voice,
-                Priority::Advisory,
-                crate::readback::one_of(&[
-                    "Requesting clearance.",
-                    "Getting our clearance.",
-                    "Calling for our clearance.",
-                ]),
-            );
-            crate::circuit::transmit(crate::circuit::radio_call(&callsign, "request clearance"));
-            event("request_clearance", json!({}));
-            // The tower answers with a discrete squawk; wait for it, then dial it
-            // into the transponder and read it back — the crew's clearance copy.
-            // The clock starts when the call is QUEUED, and the call rides the
-            // speech queue behind our own arming brief and anyone the tower is
-            // working: at Malaga 30 s gave up 13 s before the clearance came
-            // back, the squawk was never set, and the tower spent the climb
-            // asking us to confirm 4503 while we showed 7000 (23:06Z,
-            // 2026-09-12). So the wait is longer, and the squawk is OWED, not
-            // missed: `ensure_squawk` sets a late one at the hold and lined up.
-            waiting("the squawk");
-            wait_until(60.0, 500, || async {
-                crate::party_line::assigned_squawk().is_some()
-            })
-            .await;
-            ensure_squawk(&xp, &ctx, &voice).await;
-            bail_if_abort!();
-            // The clearance is read back like a real one: the zone cap, the
-            // QNH and the squawk (the tower suggests the words, enforces
-            // nothing, and answers a correct one with silence). Never done
-            // before 2026-09-15: the squawk was set and the taxi asked for.
-            if let Some(rb) = crate::party_line::readback_owed() {
-                crate::circuit::transmit(rb.trim_end_matches('.').to_string());
-                event("clearance_readback", json!({}));
-            }
-        }
+        get_zone_clearance(&xp, &ctx, &voice, &callsign).await;
+        bail_if_abort!();
         // The taxi route is the tower's. Ask for it if we don't already hold
         // one — or if the one we hold WAS PLANNED FROM SOMEWHERE ELSE. A
         // clearance outlives a reposition: the tower planned a route from the

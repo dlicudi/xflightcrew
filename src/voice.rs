@@ -393,6 +393,10 @@ struct Utterance {
     /// every voice arbitrated: they can never talk over each other, and the
     /// mic stays gated across all of them.
     station: Option<StationSpeaker>,
+    /// A station line addressed to SOMEONE ELSE (the tower answering a ghost
+    /// in an overheard exchange): aired, but never the controller's last
+    /// word to us, so a "say again" never repeats another aircraft's clearance.
+    overheard: bool,
     /// Speak as the CABIN CREW: the second intercom persona (interphone, not
     /// radio — same channel and discipline as the copilot, different voice).
     /// Meaningless when `station` is set.
@@ -518,6 +522,15 @@ fn interrupt_intercom_for_radio(inner: &Inner) {
     match owed {
         Some(resume) => {
             tracing::info!(text = %p.text, resumed = resume.is_some(), "radio stepped on the intercom; remainder queued");
+            // Owed until the remainder actually plays; if it perishes
+            // waiting, "what were you saying?" still has it.
+            if !p.cabin {
+                inner
+                    .memory
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .cut(&p.text, Instant::now());
+            }
             push_intercom(
                 inner,
                 Utterance {
@@ -527,6 +540,7 @@ fn interrupt_intercom_for_radio(inner: &Inner) {
                     chime: false,
                     negative: false,
                     station: None,
+                    overheard: false,
                     cabin: p.cabin,
                     stale_by: Some(Instant::now() + std::time::Duration::from_secs(RESUME_STALE_S)),
                     done: p.done,
@@ -669,6 +683,132 @@ struct Inner {
     /// signal-quality model ([`crate::radiofx::signal_quality`]). Fail open:
     /// unknown reads as a perfect signal.
     station_range_nm: std::sync::atomic::AtomicU32,
+    /// What the copilot last volunteered and what it was cut off saying, for
+    /// "say again" / "what were you saying?" (see [`SpeechMemory`]).
+    memory: Mutex<SpeechMemory>,
+    /// COM1 in kHz as of the monitor's last good read (`i64::MIN` unknown):
+    /// the frequency a controller line went out on, so a "say again" is only
+    /// ever answered by the controller who said it.
+    com1_khz: std::sync::atomic::AtomicI64,
+    /// The last controller transmission addressed to US (see
+    /// [`ControllerLine`]).
+    radio_log: Mutex<Option<ControllerLine>>,
+}
+
+/// A controller line addressed to us, as it went out on the air (or was
+/// keyed over by the pilot): what the frequency's "say again" repeats and
+/// what "what did the tower say?" reports. Never ATIS, never a ghost pilot,
+/// never the controller's half of an exchange with another aircraft.
+#[derive(Clone, Debug)]
+pub struct ControllerLine {
+    pub text: String,
+    pub speaker: StationSpeaker,
+    /// COM1 when it was aired; `None` before any monitor read.
+    pub khz: Option<i64>,
+    pub at: Instant,
+}
+
+/// A controller repeats its last transmission for this long after it: the
+/// pilot's "say again" is immediate practice, and past a minute the picture
+/// may have moved on without a word (a readback challenge let go).
+pub const RADIO_REPEAT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Is `speaker` a controller position (not the ATIS loop, not a ghost pilot)?
+fn is_controller(speaker: StationSpeaker) -> bool {
+    matches!(
+        speaker,
+        StationSpeaker::Tower | StationSpeaker::Approach | StationSpeaker::Departure
+    )
+}
+
+/// The line a controller repeats for a pilot's "say again" on the air: the
+/// last transmission addressed to us, fresh, on the SAME frequency (a region
+/// switch or a retune gets a new controller, who never said it). With COM1
+/// unknown on either side, the tuned position must match instead, failing
+/// open like the rest of the radio. It is always the controller's LAST word
+/// to us, so a clearance since cancelled is never repeated: the cancellation
+/// was itself a transmission, and it is the one on file.
+pub fn controller_repeat(
+    line: Option<&ControllerLine>,
+    khz_now: Option<i64>,
+    tuned_now: Option<StationSpeaker>,
+    now: Instant,
+) -> Option<&ControllerLine> {
+    let line = line?;
+    if now.duration_since(line.at) >= RADIO_REPEAT_TTL {
+        return None;
+    }
+    let same_freq = match (line.khz, khz_now) {
+        (Some(a), Some(b)) => (a - b).abs() <= 5,
+        _ => tuned_now.is_none_or(|t| t == line.speaker),
+    };
+    same_freq.then_some(line)
+}
+
+/// Record a controller line addressed to us.
+fn log_controller_line(inner: &Inner, text: &str, speaker: StationSpeaker, at: Instant) {
+    if !is_controller(speaker) || text.trim().is_empty() {
+        return;
+    }
+    let khz = inner.com1_khz.load(std::sync::atomic::Ordering::Relaxed);
+    *inner.radio_log.lock().unwrap_or_else(|e| e.into_inner()) = Some(ControllerLine {
+        text: text.trim().to_string(),
+        speaker,
+        khz: (khz != i64::MIN).then_some(khz),
+        at,
+    });
+}
+
+/// A line the copilot was cut off saying stays owed this long. Past it the
+/// moment has gone, and "what were you saying?" gets the newest line instead.
+pub const UNSAID_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The copilot's own speech, remembered for the pilot's recovery words. A PTT
+/// press drops every crew line (mic hygiene) and "release rejoins LIVE audio,
+/// no replay": the recovery is procedural, "say again". But "say again" only
+/// ever knew the last command READBACK, so a caution the pilot keyed over
+/// ("gear's still up") was gone for good, and the answer was an older line.
+/// Here, `unsaid` holds copilot lines a press cut or drained, and radio
+/// remainders that perished waiting; `last` is the newest line the copilot
+/// VOLUNTEERED (an alert, reminder or cue that actually started playing).
+/// Blocking replies stay the main loop's `LAST_READBACK`. Cabin and station
+/// lines are never kept here: this is the right seat's memory.
+#[derive(Default)]
+pub struct SpeechMemory {
+    last: Option<(String, Instant)>,
+    unsaid: Vec<(String, Instant)>,
+}
+
+impl SpeechMemory {
+    /// A line started playing. Volunteered lines become `last`; any line that
+    /// is being said now is no longer owed (a stepped-on remainder resumed).
+    fn started(&mut self, text: &str, volunteered: bool, now: Instant) {
+        self.unsaid.retain(|(t, _)| t != text);
+        if volunteered {
+            self.last = Some((text.to_string(), now));
+        }
+    }
+
+    /// A line the pilot never heard to the end: cut by a press, drained from
+    /// the queue by one, or a stepped-on remainder that went stale.
+    fn cut(&mut self, text: &str, now: Instant) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.unsaid.retain(|(t, _)| t != text);
+        self.unsaid.push((text.to_string(), now));
+        self.unsaid
+            .retain(|(_, at)| now.duration_since(*at) < UNSAID_TTL);
+    }
+
+    fn unsaid(&self, now: Instant) -> Vec<(String, Instant)> {
+        self.unsaid
+            .iter()
+            .filter(|(_, at)| now.duration_since(*at) < UNSAID_TTL)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Handle to the speech arbiter. Cheap to clone — hand one to every thread that
@@ -713,6 +853,9 @@ impl Voice {
             cabin_swap: Mutex::new(None),
             station_range_nm: std::sync::atomic::AtomicU32::new(f32::NAN.to_bits()),
             status: Mutex::new(None),
+            memory: Mutex::new(SpeechMemory::default()),
+            com1_khz: std::sync::atomic::AtomicI64::new(i64::MIN),
+            radio_log: Mutex::new(None),
         });
         // Independent channel volumes (a real audio panel's COM vs intercom
         // knobs). Applied in tts::play per thread channel.
@@ -927,9 +1070,12 @@ impl Voice {
     pub fn set_com1(&self, com1_khz: Option<i64>, tuned: Option<StationSpeaker>) {
         // A failed read is no information — never cut a live transmission on
         // a fluke, and don't poison the stored tuning.
-        if com1_khz.is_none() {
+        let Some(khz) = com1_khz else {
             return;
-        }
+        };
+        self.inner
+            .com1_khz
+            .store(khz, std::sync::atomic::Ordering::Relaxed);
         *self
             .inner
             .tuned_station
@@ -982,6 +1128,45 @@ impl Voice {
             .now_playing
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        // What the copilot was saying, and had queued, is owed: the press
+        // silenced it, it did not answer it ("what were you saying?").
+        let now = Instant::now();
+        let playing = self
+            .inner
+            .intercom_playing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|p| !p.cabin)
+            .map(|p| p.text.clone());
+        {
+            let mut memory = self.inner.memory.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(text) = playing {
+                memory.cut(&text, now);
+            }
+            let q = self.inner.queue.lock().unwrap();
+            let mut queued: Vec<&Utterance> = q
+                .heap
+                .iter()
+                .filter(|u| !u.cabin && !u.negative && u.station.is_none())
+                .collect();
+            queued.sort_by_key(|u| u.seq);
+            for utt in queued {
+                memory.cut(&utt.text, now);
+            }
+        }
+        {
+            // The controller transmitted what was queued for us; the press
+            // blocked it. It is what the frequency's "say again" repeats.
+            let q = self.inner.radio_queue.lock().unwrap();
+            let mut queued: Vec<&Utterance> = q.heap.iter().filter(|u| !u.overheard).collect();
+            queued.sort_by_key(|u| u.seq);
+            for utt in queued {
+                if let Some(who) = utt.station {
+                    log_controller_line(&self.inner, &utt.text, who, now);
+                }
+            }
+        }
         for queue in [&self.inner.queue, &self.inner.radio_queue] {
             let mut q = queue.lock().unwrap();
             for utt in q.heap.drain() {
@@ -996,6 +1181,79 @@ impl Voice {
         // latch and clears its own speaking flag.
         crate::tts::stop_playback();
         self.gate.set_speaking(false);
+    }
+
+    /// Copilot lines the pilot never heard to the end, oldest first, within
+    /// [`UNSAID_TTL`].
+    pub fn unsaid(&self) -> Vec<(String, Instant)> {
+        self.inner
+            .memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unsaid(Instant::now())
+    }
+
+    /// The owed lines have been said again: owed no longer.
+    pub fn forget_unsaid(&self) {
+        self.inner
+            .memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unsaid
+            .clear();
+    }
+
+    /// The newest line the copilot volunteered (not a reply), with when it
+    /// started playing.
+    pub fn last_volunteered(&self) -> Option<(String, Instant)> {
+        self.inner
+            .memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last
+            .clone()
+    }
+
+    /// An airframe swap: the old aircraft's owed lines die with it, and so
+    /// does the controller's last word to it.
+    pub fn forget_speech(&self) {
+        *self.inner.memory.lock().unwrap_or_else(|e| e.into_inner()) = SpeechMemory::default();
+        *self
+            .inner
+            .radio_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The last controller transmission addressed to us, whenever it was.
+    pub fn last_controller_line(&self) -> Option<ControllerLine> {
+        self.inner
+            .radio_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// What the controller on COM1 now repeats for a pilot's "say again", if
+    /// anything (see [`controller_repeat`]).
+    pub fn repeat_on_frequency(&self) -> Option<ControllerLine> {
+        let khz = self
+            .inner
+            .com1_khz
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let tuned = *self
+            .inner
+            .tuned_station
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let log = self.last_controller_line();
+        controller_repeat(
+            log.as_ref(),
+            (khz != i64::MIN).then_some(khz),
+            tuned,
+            Instant::now(),
+        )
+        .cloned()
     }
 
     /// Dismiss only the crew side: queued copilot/cabin lines are dropped and
@@ -1047,6 +1305,7 @@ impl Voice {
             chime,
             negative: false,
             station: None,
+            overheard: false,
             cabin: false,
             stale_by,
             resume: None,
@@ -1070,6 +1329,7 @@ impl Voice {
             chime: false,
             negative: false,
             station: Some(speaker),
+            overheard: false,
             cabin: false,
             stale_by: None,
             resume: None,
@@ -1108,6 +1368,7 @@ impl Voice {
             chime: false,
             negative: true,
             station: None,
+            overheard: false,
             cabin: false,
             stale_by: None,
             resume: None,
@@ -1187,6 +1448,7 @@ impl Voice {
             chime: false,
             negative: false,
             station: None,
+            overheard: false,
             cabin: false,
             stale_by: Some(stale_by),
             resume: None,
@@ -1216,6 +1478,7 @@ impl Voice {
             chime: true,
             negative: false,
             station: None,
+            overheard: false,
             cabin: true,
             stale_by: None,
             resume: None,
@@ -1242,6 +1505,7 @@ impl Voice {
             chime: true,
             negative: false,
             station: None,
+            overheard: false,
             cabin: true,
             stale_by: None,
             resume: None,
@@ -1259,6 +1523,32 @@ impl Voice {
         text: impl Into<String>,
     ) {
         self.enqueue_station(priority, text.into(), None, speaker);
+    }
+
+    /// Queue a station line addressed to ANOTHER aircraft (the controller's
+    /// half of an overheard exchange): aired like any other, never logged as
+    /// the controller's last word to us.
+    pub fn alert_station_overheard(
+        &self,
+        priority: Priority,
+        speaker: StationSpeaker,
+        text: impl Into<String>,
+    ) {
+        let text = crate::phrase::scrub_dashes(&text.into());
+        tracing::info!(transmitting = %text, "station (overheard)");
+        self.push(Utterance {
+            priority,
+            seq: 0,
+            text,
+            chime: false,
+            negative: false,
+            station: Some(speaker),
+            overheard: true,
+            cabin: false,
+            stale_by: None,
+            resume: None,
+            done: None,
+        });
     }
 
     /// Queue an utterance preceded by the attention chime, and return immediately.
@@ -1772,6 +2062,16 @@ fn intercom_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
         // subprocess voices start (no buffer, so a re-say), replaced with the
         // rendered buffer when the ONNX path hands it over. The record holds
         // the caller's latch; whoever finishes the sentence fires it.
+        if !utt.cabin {
+            // A line that starts is no longer owed; a VOLUNTEERED one (no
+            // blocking caller: alerts, reminders, cues) is what "say again"
+            // means when it is newer than the last readback.
+            inner
+                .memory
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .started(&utt.text, utt.done.is_none(), Instant::now());
+        }
         let gen_at_start = tts::channel_generation(tts::Channel::Intercom);
         let register = |audio: Option<Resume>| {
             *inner
@@ -1877,6 +2177,11 @@ fn radio_loop(inner: &Arc<Inner>, config: Config, gate: MicGate) {
 
         set_channel_speaking(inner, &gate, true, true);
         interrupt_intercom_for_radio(inner);
+        if !utt.overheard {
+            if let Some(who) = utt.station {
+                log_controller_line(inner, &utt.text, who, Instant::now());
+            }
+        }
         // A panicking station voice is demoted to the `say` fallback for the
         // rest of the session (same catch_unwind rationale as the intercom).
         let seed = inner
@@ -2021,6 +2326,7 @@ mod tests {
             chime: false,
             negative: false,
             station: None,
+            overheard: false,
             cabin: false,
             stale_by: None,
             resume: None,
@@ -2222,6 +2528,9 @@ mod tests {
             pilot_swap: Mutex::new(None),
             cabin_swap: Mutex::new(None),
             station_range_nm: std::sync::atomic::AtomicU32::new(f32::NAN.to_bits()),
+            memory: Mutex::new(SpeechMemory::default()),
+            com1_khz: std::sync::atomic::AtomicI64::new(i64::MIN),
+            radio_log: Mutex::new(None),
         }
     }
 
@@ -2508,6 +2817,181 @@ mod tests {
             *latch.spoken.lock().unwrap(),
             "released: the sentence was finished"
         );
+    }
+
+    #[test]
+    fn a_press_keeps_what_the_copilot_was_saying() {
+        // The pilot keys over a caution: the press silences the cockpit, but
+        // the line playing and the copilot lines queued behind it are OWED,
+        // oldest first. Cabin and station lines are not the copilot's.
+        let _guard = crate::mode::TEST_LOCK.lock().unwrap();
+        crate::mode::set(crate::mode::Mode::Both);
+        let voice = Voice::new(Config::default());
+        voice.set_hold(true);
+        voice.alert(Priority::Caution, "Gear's still up.");
+        voice.alert(Priority::Advisory, "Next, KOPOR.");
+        voice.alert_cabin(Priority::Advisory, "Cabin is secure.");
+        voice.alert_station(
+            Priority::Advisory,
+            StationSpeaker::Tower,
+            "Cleared to land.",
+        );
+        *voice.inner.intercom_playing.lock().unwrap() = Some(IntercomPlay {
+            priority: Priority::Caution,
+            audio: None,
+            started: Instant::now(),
+            text: "We're a little high, about 600 feet.".into(),
+            cabin: false,
+            done: None,
+        });
+        voice.shutup();
+        let owed: Vec<String> = voice.unsaid().into_iter().map(|(t, _)| t).collect();
+        assert_eq!(
+            owed,
+            [
+                "We're a little high, about 600 feet.",
+                "Gear's still up.",
+                "Next, KOPOR."
+            ]
+        );
+        voice.forget_unsaid();
+        assert!(voice.unsaid().is_empty(), "said again: owed no longer");
+        *voice.inner.intercom_playing.lock().unwrap() = None;
+        voice.set_hold(false);
+    }
+
+    #[test]
+    fn say_again_on_the_air_repeats_only_this_controllers_last_word() {
+        let t0 = Instant::now();
+        let line = ControllerLine {
+            text: "November one seven two Sierra Papa, cleared for takeoff.".into(),
+            speaker: StationSpeaker::Tower,
+            khz: Some(118_500),
+            at: t0,
+        };
+        let later = t0 + std::time::Duration::from_secs(8);
+        // Same frequency, eight seconds on: the tower says it again.
+        assert!(controller_repeat(Some(&line), Some(118_500), None, later).is_some());
+        // 8.33 naming: 5 kHz off the carrier is the same channel.
+        assert!(controller_repeat(Some(&line), Some(118_505), None, later).is_some());
+        // Retuned to departure: that controller never said it.
+        assert!(controller_repeat(Some(&line), Some(120_900), None, later).is_none());
+        // A minute on: the picture may have moved without a word.
+        assert!(
+            controller_repeat(Some(&line), Some(118_500), None, t0 + RADIO_REPEAT_TTL).is_none()
+        );
+        // COM1 unknown: the tuned position must match, failing open.
+        let blind = ControllerLine {
+            khz: None,
+            ..line.clone()
+        };
+        assert!(controller_repeat(Some(&blind), None, None, later).is_some());
+        assert!(
+            controller_repeat(Some(&blind), None, Some(StationSpeaker::Tower), later).is_some()
+        );
+        assert!(
+            controller_repeat(Some(&blind), None, Some(StationSpeaker::Approach), later).is_none()
+        );
+        // Nothing said: nothing to repeat.
+        assert!(controller_repeat(None, Some(118_500), None, later).is_none());
+    }
+
+    #[test]
+    fn a_press_over_the_tower_keeps_its_line_but_never_anothers() {
+        // The pilot keys up while the tower's clearance is queued: blocked,
+        // but SAID, so the frequency's "say again" repeats it. ATIS, a ghost
+        // pilot and the tower's half of another aircraft's exchange are
+        // never the controller's word to us.
+        let _guard = crate::mode::TEST_LOCK.lock().unwrap();
+        crate::mode::set(crate::mode::Mode::Both);
+        let voice = Voice::new(Config::default());
+        voice.set_com1(Some(118_500), Some(StationSpeaker::Tower));
+        voice.set_hold(true);
+        voice.alert_station(
+            Priority::Advisory,
+            StationSpeaker::Atis,
+            "Information Bravo.",
+        );
+        voice.alert_station(
+            Priority::Advisory,
+            StationSpeaker::Tower,
+            "November one seven two Sierra Papa, cleared to land runway two seven.",
+        );
+        voice.alert_station(
+            Priority::Advisory,
+            StationSpeaker::Ghost { seed: 3 },
+            "Speedbird 306, wilco.",
+        );
+        voice.alert_station_overheard(
+            Priority::Advisory,
+            StationSpeaker::Tower,
+            "Speedbird 306, line up and wait runway two seven.",
+        );
+        voice.shutup();
+        let last = voice.repeat_on_frequency().expect("the tower's line to us");
+        assert_eq!(
+            last.text,
+            "November one seven two Sierra Papa, cleared to land runway two seven."
+        );
+        assert_eq!(last.khz, Some(118_500));
+        // The airframe changed: its radio history goes with it.
+        voice.forget_speech();
+        assert!(voice.last_controller_line().is_none());
+        voice.set_hold(false);
+    }
+
+    #[test]
+    fn a_stepped_on_line_is_owed_until_its_remainder_plays() {
+        let inner = bare_inner();
+        *inner.intercom_playing.lock().unwrap() = Some(IntercomPlay {
+            priority: Priority::Advisory,
+            audio: None,
+            started: Instant::now(),
+            text: "Fuel's balanced.".into(),
+            cabin: false,
+            done: None,
+        });
+        interrupt_intercom_for_radio(&inner);
+        let now = Instant::now();
+        let owed = |inner: &Inner| inner.memory.lock().unwrap().unsaid(now).len();
+        assert_eq!(owed(&inner), 1, "the tower cut it: owed");
+        // The remainder plays once the frequency is quiet: said, not owed.
+        inner
+            .memory
+            .lock()
+            .unwrap()
+            .started("Fuel's balanced.", true, now);
+        assert_eq!(owed(&inner), 0);
+        // A cabin line stepped on is the cabin's to repeat, not the copilot's.
+        *inner.intercom_playing.lock().unwrap() = Some(IntercomPlay {
+            priority: Priority::Advisory,
+            audio: None,
+            started: Instant::now(),
+            text: "Cabin is secure.".into(),
+            cabin: true,
+            done: None,
+        });
+        interrupt_intercom_for_radio(&inner);
+        assert_eq!(owed(&inner), 0);
+    }
+
+    #[test]
+    fn speech_memory_keeps_volunteered_lines_and_expires_owed_ones() {
+        let t0 = Instant::now();
+        let mut m = SpeechMemory::default();
+        // A reply to the pilot (blocking caller) is the main loop's readback,
+        // not a volunteered line.
+        m.started("Flaps ten.", false, t0);
+        assert!(m.last.is_none());
+        m.started("Top of descent in two minutes.", true, t0);
+        assert_eq!(m.last.as_ref().unwrap().0, "Top of descent in two minutes.");
+        // Owed lines are unique and perish.
+        m.cut("Gear's still up.", t0);
+        m.cut("Gear's still up.", t0);
+        assert_eq!(m.unsaid(t0).len(), 1);
+        assert!(m.unsaid(t0 + UNSAID_TTL).is_empty(), "the moment has gone");
+        m.cut("   ", t0);
+        assert_eq!(m.unsaid(t0).len(), 1, "nothing said is nothing owed");
     }
 
     #[test]

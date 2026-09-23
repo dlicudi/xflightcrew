@@ -53,6 +53,22 @@ const GLIDE_DEG: f64 = 6.0;
 const FINAL_DECEL_MPS2: f64 = 0.3;
 const FINAL_HOVER_FT: f64 = 30.0;
 const ARRIVED_M: f64 = 12.0;
+/// The approach: down from the cruise at speed, under the autopilot's
+/// vertical-speed mode with the collective on [`APPROACH_KTS`], to a gate
+/// [`GATE_FT`] over the pad, then the slow-down level at the gate and the
+/// hover loop's final from there. Until 2026-09-23 the whole descent was
+/// the hover loop's, at 38 kt or less from the cruise height: 5.5 minutes
+/// from a 1,000 ft cruise, 8.3 into ETND from 2,000 ft, 7 of them on a final
+/// that a 17 kt headwind held to 21 kt over the ground.
+pub const APPROACH_KTS: f64 = 70.0;
+/// The approach path, degrees: about 800 fpm at 70 kt.
+const APPROACH_DEG: f64 = 6.5;
+/// The gate: this high over the pad, where the final's own path begins.
+pub const GATE_FT: f64 = 500.0;
+/// The gate clears the highest ground still to be crossed by this much.
+const APPROACH_CLEAR_FT: f64 = 400.0;
+/// The steepest the approach asks of the vertical-speed mode.
+const APPROACH_MAX_SINK_FPM: f64 = 1200.0;
 /// A standard-rate turn's radius at a groundspeed, m.
 fn turn_radius_m(gs_mps: f64) -> f64 {
     gs_mps / 3f64.to_radians()
@@ -162,6 +178,63 @@ pub fn slow_start_m(cruise_kts: f64, agl_ft: f64) -> f64 {
     let decel_m = secs * (cruise_kts + HANDOVER_KTS) / 2.0 * kt;
     let final_m = (agl_ft - FINAL_HOVER_FT).max(0.0) / 3.28084 / GLIDE_DEG.to_radians().tan();
     decel_m + final_m + 1000.0
+}
+
+/// The final's length on its own path from `agl_ft`, m.
+pub fn final_len_m(agl_ft: f64) -> f64 {
+    (agl_ft - FINAL_HOVER_FT).max(0.0) / 3.28084 / GLIDE_DEG.to_radians().tan()
+}
+
+/// Distance flown slowing from `from_kts` to `to_kts` at the law's rate, m.
+fn decel_m(from_kts: f64, to_kts: f64) -> f64 {
+    let secs = (from_kts - to_kts).max(0.0) / DECEL_KTS_S;
+    secs * (from_kts + to_kts) / 2.0 * 0.5144
+}
+
+/// The gate's height over the pad: [`GATE_FT`], or higher where the ground
+/// still to be crossed (`floor_ft`, its highest point, same feet as `pad_ft`)
+/// needs [`APPROACH_CLEAR_FT`] over it.
+pub fn gate_agl_ft(pad_ft: f64, floor_ft: Option<f64>) -> f64 {
+    floor_ft.map_or(GATE_FT, |f| (f + APPROACH_CLEAR_FT - pad_ft).max(GATE_FT))
+}
+
+/// Where the slow-down to the hand-over speed starts on an approach, m before
+/// the pad: level at the gate, it ends where the final's path from the gate
+/// begins, so the final starts ON its path, never above it (from above,
+/// `final_command` dives to it: 2,000 ft into ETND, 2026-09-23).
+pub fn approach_slow_m(gate_agl: f64) -> f64 {
+    final_len_m(gate_agl) + decel_m(APPROACH_KTS, HANDOVER_KTS)
+}
+
+/// The approach's target altitude (ft, the dial's) at `d_m` from the pad: the
+/// path down to the gate where the slow-down starts, never above the cruise.
+pub fn approach_target_ft(d_m: f64, pad_ft: f64, gate_agl: f64, cruise_ft: f64) -> f64 {
+    let gate = pad_ft + gate_agl;
+    let path = gate
+        + (d_m - approach_slow_m(gate_agl)).max(0.0) * APPROACH_DEG.to_radians().tan() * 3.28084;
+    path.min(cruise_ft.max(gate))
+}
+
+/// Where the approach starts, m before the pad: the slow-down from the cruise
+/// speed to the approach speed, then the path from the cruise height.
+pub fn approach_start_m(cruise_ft: f64, pad_ft: f64, gate_agl: f64) -> f64 {
+    let above = (cruise_ft - pad_ft - gate_agl).max(0.0);
+    let path_m = above / 3.28084 / APPROACH_DEG.to_radians().tan();
+    approach_slow_m(gate_agl) + path_m + decel_m(CRUISE_KTS, APPROACH_KTS)
+}
+
+/// The vertical-speed dial on the approach: the target's own descent rate
+/// (`target_ft` now against `ahead_ft`, the target 10 s down the track),
+/// fed forward, plus 2 fpm a foot toward it. A P term alone rides a falling
+/// path ~120 ft high. Capped at [`APPROACH_MAX_SINK_FPM`] down and 500 fpm
+/// up: under the terrain floor it climbs.
+pub fn approach_vs_fpm(alt_ft: f64, target_ft: f64, ahead_ft: f64) -> f64 {
+    let rate = (ahead_ft - target_ft) * 6.0; // ft per 10 s, as fpm
+    let want = rate + 2.0 * (target_ft - alt_ft);
+    (want / 50.0)
+        .round()
+        .clamp(-APPROACH_MAX_SINK_FPM / 50.0, 10.0)
+        * 50.0
 }
 
 /// The helipads of a field in apt.dat (row 102), (lat, lon, name).
@@ -440,10 +513,13 @@ pub struct Route {
 /// (said): a tower that never answers must not strand a flight on the pad.
 const DEPARTURE_WAIT_S: u64 = 60;
 
-/// The departure call, the aeroplanes' own words: COM1 to the tower, "ready
-/// for departure", then a bounded wait for the clearance. No simulated tower,
-/// no call.
-async fn call_departure(xp: &XPlaneClient, voice: &Option<Voice>) {
+/// The departure call, the aeroplanes' own words: the zone clearance first
+/// (`full_auto::get_zone_clearance`: squawk dialled, clearance read back),
+/// then COM1 to the tower, "ready for departure", and a bounded wait for the
+/// clearance. No simulated tower, no call. Until 2026-09-23 it went straight
+/// to "ready for departure": cleared for takeoff, the S-76 left EDVW with no
+/// zone clearance and no squawk.
+async fn call_departure(xp: &XPlaneClient, voice: &Option<Voice>, config: &crate::config::Config) {
     use crate::tower::State::{LinedUp, TakeoffCleared};
     if !crate::mode::atc_enabled() {
         return;
@@ -451,10 +527,26 @@ async fn call_departure(xp: &XPlaneClient, voice: &Option<Voice>) {
     let Some(khz) = crate::party_line::home_tower_khz() else {
         return;
     };
+    let callsign = crate::circuit::crew_callsign(xp).await;
+    DETAIL.set("waiting for the zone clearance");
+    let ctx = crate::tools::ToolCtx {
+        xplane: xp,
+        config,
+        voice: voice.as_ref(),
+        status: None,
+        reminders: None,
+    };
+    crate::full_auto::get_zone_clearance(xp, &ctx, voice, &callsign).await;
+    crate::blackbox::record(
+        "heli_route",
+        serde_json::json!({
+            "event": "zone_clearance",
+            "squawk": crate::party_line::assigned_squawk(),
+        }),
+    );
     let _ = xp
         .set_float(crate::datarefs::COM1_FREQ_KHZ, khz as f64)
         .await;
-    let callsign = crate::circuit::crew_callsign(xp).await;
     crate::circuit::transmit(crate::circuit::radio_call(&callsign, "ready for departure"));
     DETAIL.set("waiting for the departure clearance");
     crate::blackbox::record(
@@ -483,6 +575,49 @@ async fn call_departure(xp: &XPlaneClient, voice: &Option<Voice>) {
         Priority::Caution,
         "No departure clearance came back. Departing.",
     );
+}
+
+/// The tower's after-takeoff handoff and the region's "radar services
+/// terminated, contact X Tower", obeyed with the aeroplanes' own code
+/// (`full_auto::obey_departure_handoff` / `obey_region_handoff`: readback on
+/// the old frequency, squawk, retune, check-in). Off the control loop: the
+/// readback holds the frequency for seconds and the collective law must keep
+/// ticking. Until 2026-09-23 nothing took them: at EDVW-ETND the region's
+/// handoff to Eimbeckhausen went unanswered, COM1 stayed on Hameln, and the
+/// crew then called its own zone "without clearance" four times.
+fn obey_handoffs(base_url: &str, voice: &Option<Voice>, climb_to_ft: f64) {
+    let departure = crate::party_line::take_departure_handoff();
+    let region = crate::party_line::take_region_handoff();
+    if departure.is_none() && region.is_none() {
+        return;
+    }
+    let (base, voice) = (base_url.to_string(), voice.clone());
+    tokio::spawn(async move {
+        let xp = XPlaneClient::new(base);
+        let config = crate::settings::live();
+        let ctx = crate::tools::ToolCtx {
+            xplane: &xp,
+            config: &config,
+            voice: voice.as_ref(),
+            status: None,
+            reminders: None,
+        };
+        let callsign = crate::circuit::crew_callsign(&xp).await;
+        if let Some((to, khz)) = departure {
+            crate::blackbox::record(
+                "heli_route",
+                serde_json::json!({ "event": "departure_handoff", "to": &to, "khz": khz }),
+            );
+            crate::full_auto::obey_departure_handoff(&xp, &callsign, to, khz, climb_to_ft).await;
+        }
+        if let Some(h) = region {
+            crate::blackbox::record(
+                "heli_route",
+                serde_json::json!({ "event": "region_handoff", "to": &h.to, "khz": h.khz }),
+            );
+            crate::full_auto::obey_region_handoff(&xp, &ctx, &voice, &callsign, h, true).await;
+        }
+    });
 }
 
 const ALT_HOLD_STATUS: &str = "sim/cockpit2/autopilot/altitude_hold_status";
@@ -515,22 +650,70 @@ async fn recover_level(xp: &XPlaneClient, alt_ft: f64, level_ft: f64) {
     }
 }
 
-/// The inbound call to the destination's tower, on its frequency, and the
-/// station pinned to it for the arrival (the aeroplanes' `call_inbound`).
-async fn call_inbound(xp: &XPlaneClient, khz: i64) {
+/// Down on the vertical-speed mode toward `dial_ft`: the dial first, the
+/// rate, the mode if it is not on, the rate again (engaging the mode syncs
+/// the dial to the rate of the moment). `recover_level`'s sequence.
+async fn descend_on_vs(xp: &XPlaneClient, dial_ft: f64, vs_fpm: f64) {
+    let _ = xp
+        .set_float("sim/cockpit2/autopilot/altitude_dial_ft", dial_ft.round())
+        .await;
+    let _ = xp
+        .set_float("sim/cockpit2/autopilot/vvi_dial_fpm", vs_fpm)
+        .await;
+    if xp.get_float(VVI_STATUS).await.is_ok_and(|v| v < 0.5) {
+        let _ = xp.run_command("sim/autopilot/vertical_speed").await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = xp
+            .set_float("sim/cockpit2/autopilot/vvi_dial_fpm", vs_fpm)
+            .await;
+    }
+}
+
+/// How long the inbound call waits for the destination's tower to become the
+/// station before going out regardless (full auto's own bound).
+const INBOUND_SWAP_WAIT_S: u64 = 45;
+
+/// The inbound call to the destination's tower, the aeroplanes' sequence:
+/// COM1 on its frequency, that field ARMED as the station (you call it, you
+/// get it) and pinned for the arrival, then a bounded wait for the station
+/// to be it before the call goes out. Off the control loop (the wait is up
+/// to 45 s). Until 2026-09-23 it transmitted at once: into ETND the call
+/// went out at 19:20:45, the region made Diepholz the station at 19:21:00,
+/// the call went into the void and Diepholz challenged the final twice.
+fn call_inbound(base_url: &str, khz: i64) {
     if !crate::mode::atc_enabled() {
         return;
     }
-    let _ = xp
-        .set_float(crate::datarefs::COM1_FREQ_KHZ, khz as f64)
-        .await;
-    let callsign = crate::circuit::crew_callsign(xp).await;
-    crate::circuit::transmit(crate::circuit::radio_call(&callsign, "inbound for landing"));
-    crate::station::pin_arrival_station(Some(khz));
-    crate::blackbox::record(
-        "heli_route",
-        serde_json::json!({ "event": "inbound_call", "khz": khz }),
-    );
+    let base = base_url.to_string();
+    tokio::spawn(async move {
+        let xp = XPlaneClient::new(base);
+        let _ = xp
+            .set_float(crate::datarefs::COM1_FREQ_KHZ, khz as f64)
+            .await;
+        let (lat, lon, alt) = tokio::join!(
+            xp.get_float(crate::datarefs::LATITUDE),
+            xp.get_float(crate::datarefs::LONGITUDE),
+            xp.get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot"),
+        );
+        if let (Ok(lat), Ok(lon), Ok(alt)) = (lat, lon, alt) {
+            crate::station::arm_station_for_freq(khz, lat, lon, alt, std::time::Instant::now());
+        }
+        crate::station::pin_arrival_station(Some(khz));
+        let mut swapped = false;
+        for _ in 0..INBOUND_SWAP_WAIT_S * 2 {
+            if crate::party_line::home_tower_khz() == Some(khz) {
+                swapped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let callsign = crate::circuit::crew_callsign(&xp).await;
+        crate::circuit::transmit(crate::circuit::radio_call(&callsign, "inbound for landing"));
+        crate::blackbox::record(
+            "heli_route",
+            serde_json::json!({ "event": "inbound_call", "khz": khz, "station_swapped": swapped }),
+        );
+    });
 }
 
 /// The taxi-in's settings, for the parking at the destination (the same
@@ -612,6 +795,7 @@ fn say(voice: &Option<Voice>, p: Priority, text: impl Into<String>) {
 enum Phase {
     Depart,
     Cruise,
+    Approach,
     Slow,
     Arrive,
 }
@@ -703,7 +887,7 @@ async fn before_route(
         }
     }
     if ends.lift {
-        call_departure(xp, voice).await;
+        call_departure(xp, voice, config).await;
         DETAIL.set("lifting");
         hover::request(
             base_url.to_string(),
@@ -780,6 +964,28 @@ async fn fly(
     // The departure climbs to it on the radio height over the field; altitude
     // hold then holds what it engages at.
     let depart_agl_ft = (cruise_alt_ft - ground_ft).max(CRUISE_AGL_FT);
+    // The approach measures the pad and the ground ahead with the plugin's
+    // terrain probe (true feet) and flies the altimeter's (the dial's):
+    // the offset between them, taken once here. No probe, no approach: the
+    // slow-down happens at the cruise height as it always did.
+    let pad_ll = route.points.last().map(|p| (p.1, p.2));
+    let (pad_true, elev_m) = tokio::join!(
+        async {
+            match pad_ll {
+                Some(ll) => crate::terrain::max_elevation_ft(&xp, &[ll]).await,
+                None => None,
+            }
+        },
+        xp.get_float("sim/flightmodel/position/elevation"),
+    );
+    let ind_offset_ft = elev_m.ok().map(|m| alt0 - m * 3.28084);
+    let pad_ft = match (pad_true, ind_offset_ft, terrain_ft) {
+        (Some(p), Some(o), Some(_)) => Some(p + o),
+        _ => None,
+    };
+    let mut gate: Option<(f64, f64)> = None;
+    let mut level_ft = cruise_alt_ft;
+    let mut vs_written: Option<f64> = None;
     crate::blackbox::record(
         "heli_route",
         serde_json::json!({ "event": "start", "points": route.points.iter().map(|p| &p.0).collect::<Vec<_>>(), "cruise_alt_ft": cruise_alt_ft, "terrain_ft": terrain_ft, "samples": samples.len() }),
@@ -830,6 +1036,9 @@ async fn fly(
         let to_pad = dist(here, pad);
         let variation = angle_diff(s.psi, s.mag);
 
+        // The radio is worked whatever the phase: the handoffs arrive in the
+        // climb (the tower's) and anywhere enroute (the region's).
+        obey_handoffs(&base_url, &voice, cruise_alt_ft);
         match phase {
             Phase::Depart => {
                 let running = hover::ACTIVE.load(Ordering::SeqCst);
@@ -899,7 +1108,7 @@ async fn fly(
                     );
                 }
             }
-            Phase::Cruise | Phase::Slow => {
+            Phase::Cruise | Phase::Approach | Phase::Slow => {
                 // The cruise modes are the autopilot's to keep: a mode that
                 // dropped is put back, an autopilot turned off is the pilot's.
                 if s.ap < 0.5 {
@@ -940,21 +1149,69 @@ async fn fly(
                 // Slowing is keyed on the distance still to FLY, not on the
                 // last leg: the fix before the pad can lie past it.
                 let pts_m: Vec<(f64, f64)> = pts.iter().map(|p| p.1).collect();
-                if phase == Phase::Cruise
-                    && remaining_m(here, &pts_m, leg) < slow_start_m(CRUISE_KTS, depart_agl_ft)
-                {
-                    phase = Phase::Slow;
-                    crate::blackbox::record(
-                        "heli_route",
-                        serde_json::json!({ "event": "slow", "to_pad_m": to_pad, "ias": s.ias }),
-                    );
-                    say(
-                        &voice,
-                        Priority::Readback,
-                        format!("Slowing for {}.", route.destination),
-                    );
-                    if let Some(khz) = route.dest_tower_khz {
-                        call_inbound(&xp, khz).await;
+                let remaining = remaining_m(here, &pts_m, leg);
+                if phase == Phase::Cruise {
+                    match pad_ft {
+                        Some(pad) if remaining < approach_start_m(cruise_alt_ft, pad, GATE_FT) => {
+                            // The gate clears the ground still to be crossed,
+                            // probed now along what is left of the route; a
+                            // failed probe falls back on the whole route's.
+                            let mut rest = vec![(s.lat, s.lon)];
+                            rest.extend(
+                                route.points[leg.min(route.points.len())..]
+                                    .iter()
+                                    .map(|p| (p.1, p.2)),
+                            );
+                            let ahead =
+                                crate::terrain::max_elevation_ft(&xp, &sample_legs(&rest, 500.0))
+                                    .await
+                                    .or(terrain_ft);
+                            let floor = ahead.map(|f| f + ind_offset_ft.unwrap_or(0.0));
+                            let g = gate_agl_ft(pad, floor);
+                            gate = Some((pad, g));
+                            level_ft = pad + g;
+                            phase = Phase::Approach;
+                            crate::blackbox::record(
+                                "heli_route",
+                                serde_json::json!({ "event": "approach", "to_pad_m": to_pad, "remaining_m": remaining, "pad_ft": pad, "floor_ft": floor, "gate_agl": g, "ias": s.ias }),
+                            );
+                            say(
+                                &voice,
+                                Priority::Readback,
+                                format!("Starting down for {}.", route.destination),
+                            );
+                            if let Some(khz) = route.dest_tower_khz {
+                                call_inbound(&base_url, khz);
+                            }
+                        }
+                        None if remaining < slow_start_m(CRUISE_KTS, depart_agl_ft) => {
+                            phase = Phase::Slow;
+                            crate::blackbox::record(
+                                "heli_route",
+                                serde_json::json!({ "event": "slow", "to_pad_m": to_pad, "ias": s.ias, "approach": false }),
+                            );
+                            say(
+                                &voice,
+                                Priority::Readback,
+                                format!("Slowing for {}.", route.destination),
+                            );
+                            if let Some(khz) = route.dest_tower_khz {
+                                call_inbound(&base_url, khz);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if phase == Phase::Approach {
+                    if let Some((_, g)) = gate {
+                        if remaining < approach_slow_m(g) {
+                            phase = Phase::Slow;
+                            crate::blackbox::record(
+                                "heli_route",
+                                serde_json::json!({ "event": "slow", "to_pad_m": to_pad, "ias": s.ias, "agl": s.agl_ft, "approach": true }),
+                            );
+                            say(&voice, Priority::Readback, "Slowing for the pad.");
+                        }
                     }
                 }
                 // The vertical is the autopilot's, and it must actually be
@@ -972,10 +1229,10 @@ async fn fly(
                     let since = *unheld_since.get_or_insert_with(std::time::Instant::now);
                     if since.elapsed().as_secs_f64() > 5.0 {
                         if let Ok(alt) = alt_now {
-                            recover_level(&xp, alt, cruise_alt_ft).await;
+                            recover_level(&xp, alt, level_ft).await;
                             crate::blackbox::record(
                                 "heli_route",
-                                serde_json::json!({ "event": "level_recovered", "alt": alt, "cruise_alt_ft": cruise_alt_ft, "alt_hold": alt_hold }),
+                                serde_json::json!({ "event": "level_recovered", "alt": alt, "level_ft": level_ft, "alt_hold": alt_hold }),
                             );
                         }
                         unheld_since = None;
@@ -983,10 +1240,44 @@ async fn fly(
                 } else {
                     unheld_since = None;
                 }
-                let want = if phase == Phase::Slow {
-                    HANDOVER_KTS
-                } else {
-                    CRUISE_KTS
+                // The approach's vertical: down the path on the vertical-speed
+                // mode, the dial on the gate so the autopilot's own capture
+                // levels us there. The dial moves only with the mode's engage
+                // (moved under altitude hold it leaves the pitch unheld).
+                let mut vs_cmd: Option<f64> = None;
+                let mut target_alt: Option<f64> = None;
+                if let (Some((pad, g)), Ok(alt), Phase::Approach | Phase::Slow) =
+                    (gate, alt_now.as_ref().copied(), phase)
+                {
+                    let target = approach_target_ft(remaining, pad, g, cruise_alt_ft);
+                    let ahead = approach_target_ft(
+                        (remaining - s.gs * 10.0).max(0.0),
+                        pad,
+                        g,
+                        cruise_alt_ft,
+                    );
+                    let vs = approach_vs_fpm(alt, target, ahead);
+                    let engaged = vvi_mode.is_some_and(|v| v > 1.5);
+                    if !engaged && vs <= -100.0 && alt > pad + g + 60.0 {
+                        descend_on_vs(&xp, pad + g, vs).await;
+                        vs_written = Some(vs);
+                        crate::blackbox::record(
+                            "heli_route",
+                            serde_json::json!({ "event": "descent_vs", "alt": alt, "target": target, "vs": vs, "dial": (pad + g).round() }),
+                        );
+                    } else if engaged && vs_written.is_none_or(|w| (w - vs).abs() >= 50.0) {
+                        let _ = xp
+                            .set_float("sim/cockpit2/autopilot/vvi_dial_fpm", vs)
+                            .await;
+                        vs_written = Some(vs);
+                    }
+                    vs_cmd = Some(vs);
+                    target_alt = Some(target.round());
+                }
+                let want = match phase {
+                    Phase::Slow => HANDOVER_KTS,
+                    Phase::Approach => APPROACH_KTS,
+                    _ => CRUISE_KTS,
                 };
                 if let Some(l) = law.as_mut() {
                     let c = l.step(want, s.ias, dt);
@@ -994,13 +1285,23 @@ async fn fly(
                     if tick_n % 4 == 0 {
                         crate::blackbox::record(
                             "heli_route",
-                            serde_json::json!({ "event": "tick", "phase": format!("{phase:?}"), "fix": ident, "d_fix_m": dist(here, to), "to_pad_m": to_pad, "ias": s.ias, "target": l.target(), "collective": c, "agl": s.agl_ft, "bug": bug, "hdg": s.mag, "theta": s.theta, "phi": s.phi, "alt_hold": alt_hold, "vvi_mode": vvi_mode }),
+                            serde_json::json!({ "event": "tick", "phase": format!("{phase:?}"), "fix": ident, "d_fix_m": dist(here, to), "to_pad_m": to_pad, "ias": s.ias, "target": l.target(), "collective": c, "agl": s.agl_ft, "bug": bug, "hdg": s.mag, "theta": s.theta, "phi": s.phi, "alt_hold": alt_hold, "vvi_mode": vvi_mode, "alt": alt_now.as_ref().ok(), "target_alt": target_alt, "vs_cmd": vs_cmd }),
                         );
                     }
                 }
                 // Slowed and level: the hover loop takes the aircraft at the
                 // velocity it has, and flies the final.
+                // On an approach, down at the gate as well, so the final
+                // starts on its own path; a descent that never arrived still
+                // hands over inside the final's length rather than fly past.
+                let at_gate = match (gate, alt_now.as_ref().ok()) {
+                    (Some((pad, g)), Some(alt)) => {
+                        *alt <= pad + g + 80.0 || remaining < final_len_m(g) * 0.8
+                    }
+                    _ => true,
+                };
                 if phase == Phase::Slow
+                    && at_gate
                     && s.ias < HANDOVER_KTS + 2.0
                     && s.gs < hover::TAKEOVER_MAX_MPS
                 {
@@ -1088,6 +1389,148 @@ fn record_end(_voice: &Option<Voice>, why: &str, phase: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The approach, flown on a plant: speed through the law's own ramp and a
+    /// first-order lag, the vertical-speed mode as two 1.5 s lags with a
+    /// second of dead time, the dial rewritten by the real law every half
+    /// second. From a 1,000 ft and a 2,000 ft cruise over flat ground and over
+    /// a ridge near the pad: at the gate when the slow-down starts, never
+    /// under the path's floor, never past the sink cap, and minutes faster
+    /// than the old slow-down at the cruise height.
+    #[test]
+    fn the_approach_comes_down_at_speed_to_the_gate() {
+        struct Case {
+            cruise_agl: f64,
+            ridge_ft: Option<f64>,
+        }
+        for case in [
+            Case {
+                cruise_agl: 1000.0,
+                ridge_ft: None,
+            },
+            Case {
+                cruise_agl: 2000.0,
+                ridge_ft: None,
+            },
+            Case {
+                cruise_agl: 1500.0,
+                ridge_ft: Some(400.0),
+            },
+        ] {
+            let pad = 100.0;
+            let cruise = pad + case.cruise_agl;
+            let g = gate_agl_ft(pad, case.ridge_ft.map(|r| pad + r));
+            let start = approach_start_m(cruise, pad, GATE_FT);
+            let slow_at = approach_slow_m(g);
+            let dt = 0.5;
+            let (mut d, mut ias, mut alt) = (start, CRUISE_KTS, cruise);
+            let (mut target_kts, mut v1, mut v2) = (CRUISE_KTS, 0.0_f64, 0.0_f64);
+            let mut dial_hist = std::collections::VecDeque::from(vec![0.0; 2]);
+            let mut t = 0.0;
+            let mut worst_sink: f64 = 0.0;
+            let mut alt_at_slow = None;
+            while d > final_len_m(g) {
+                let want = if d < slow_at {
+                    HANDOVER_KTS
+                } else {
+                    APPROACH_KTS
+                };
+                target_kts += (want - target_kts).clamp(-DECEL_KTS_S * dt, DECEL_KTS_S * dt);
+                ias += (target_kts - ias) * dt / 3.0;
+                let target = approach_target_ft(d, pad, g, cruise);
+                let ahead = approach_target_ft((d - ias * 0.5144 * 10.0).max(0.0), pad, g, cruise);
+                let vs = approach_vs_fpm(alt, target, ahead);
+                worst_sink = worst_sink.max(-vs);
+                // Level at the gate once captured: the dial is the gate.
+                let vs = if alt <= pad + g + 5.0 && vs < 0.0 {
+                    0.0
+                } else {
+                    vs
+                };
+                dial_hist.push_back(vs);
+                let delayed = dial_hist.pop_front().unwrap();
+                v1 += (delayed - v1) * dt / 1.5;
+                v2 += (v1 - v2) * dt / 1.5;
+                alt += v2 / 60.0 * dt;
+                assert!(
+                    alt > pad + g - 60.0,
+                    "{}: {alt:.0} ft under the gate {:.0} at {d:.0} m",
+                    case.cruise_agl,
+                    pad + g
+                );
+                if alt_at_slow.is_none() && d < slow_at {
+                    alt_at_slow = Some(alt);
+                }
+                d -= ias * 0.5144 * dt;
+                t += dt;
+            }
+            let at_slow = alt_at_slow.expect("reached the slow-down");
+            assert!(
+                (at_slow - (pad + g)).abs() < 80.0,
+                "{}: {at_slow:.0} ft at the slow-down, gate {:.0}",
+                case.cruise_agl,
+                pad + g
+            );
+            assert!(worst_sink <= APPROACH_MAX_SINK_FPM + 1.0);
+            // The old way: slow at the cruise height, the final from there.
+            let old = slow_start_m(CRUISE_KTS, case.cruise_agl);
+            let final_old = final_len_m(case.cruise_agl);
+            let new_final = final_len_m(g);
+            let old_s = (CRUISE_KTS - HANDOVER_KTS) / DECEL_KTS_S
+                + (old - decel_m(CRUISE_KTS, HANDOVER_KTS) - final_old).max(0.0)
+                    / (HANDOVER_KTS * 0.5144)
+                + final_old / (HANDOVER_KTS * 0.5144);
+            let new_s = t + new_final / (HANDOVER_KTS * 0.5144);
+            eprintln!(
+                "cruise {} ft AGL, gate {g:.0}: approach {:.0} s + final {:.0} s against the old {:.0} s",
+                case.cruise_agl,
+                t,
+                new_final / (HANDOVER_KTS * 0.5144),
+                old_s
+            );
+            assert!(
+                new_s < old_s - 60.0,
+                "{}: {new_s:.0} s against {old_s:.0} s",
+                case.cruise_agl
+            );
+        }
+    }
+
+    #[test]
+    fn the_approach_path_and_gate() {
+        // The gate is 500 ft over the pad, or clears a ridge by 400.
+        assert_eq!(gate_agl_ft(100.0, None), GATE_FT);
+        assert_eq!(gate_agl_ft(100.0, Some(150.0)), GATE_FT);
+        assert_eq!(gate_agl_ft(100.0, Some(600.0)), 900.0);
+        // The path: level at the cruise far out, down to the gate at the
+        // slow-down, level at the gate inside it.
+        let (pad, cruise) = (100.0, 1100.0);
+        let slow = approach_slow_m(GATE_FT);
+        assert_eq!(approach_target_ft(20_000.0, pad, GATE_FT, cruise), cruise);
+        assert_eq!(
+            approach_target_ft(slow, pad, GATE_FT, cruise),
+            pad + GATE_FT
+        );
+        assert_eq!(
+            approach_target_ft(100.0, pad, GATE_FT, cruise),
+            pad + GATE_FT
+        );
+        // It starts where the path from the cruise meets the level, plus the
+        // slow-down to the approach speed.
+        let start = approach_start_m(cruise, pad, GATE_FT);
+        assert!(start > slow + decel_m(CRUISE_KTS, APPROACH_KTS));
+        // The final from the gate begins on its own path.
+        assert!((final_command(final_len_m(GATE_FT), GATE_FT, 19.5).1 - GATE_FT).abs() < 60.0);
+        // The vertical law: level on the target, down toward it, and up when
+        // under the floor.
+        assert_eq!(approach_vs_fpm(1000.0, 1000.0, 1000.0), 0.0);
+        assert!(approach_vs_fpm(1300.0, 1000.0, 1000.0) < -500.0);
+        assert!(approach_vs_fpm(900.0, 1000.0, 1000.0) > 0.0);
+        assert_eq!(
+            approach_vs_fpm(5000.0, 1000.0, 900.0),
+            -APPROACH_MAX_SINK_FPM
+        );
+    }
 
     /// The speed law under altitude hold: collective above the level figure
     /// is acceleration, through a lag. It reaches cruise and comes back to
@@ -1215,6 +1658,40 @@ mod tests {
         assert_eq!(recovery_vs_fpm(4200.0, 2200.0), -700.0);
         assert_eq!(recovery_vs_fpm(2000.0, 2200.0), 200.0);
         assert_eq!(recovery_vs_fpm(2200.0, 2200.0), 0.0);
+    }
+
+    #[test]
+    fn every_mission_that_leaves_a_field_works_the_radio() {
+        // One radio crew, not two: the aeroplane and the helicopter get the
+        // zone clearance and take both handoffs through the same functions.
+        // The S-76 once flew EDVW-ETND on a takeoff clearance alone.
+        let src = |f: &str| {
+            std::fs::read_to_string(format!("{}/src/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+        };
+        for (file, calls) in [
+            (
+                "full_auto.rs",
+                &[
+                    "get_zone_clearance(&xp",
+                    "obey_departure_handoff(xp",
+                    "obey_region_handoff(xp",
+                ][..],
+            ),
+            (
+                "heli_route.rs",
+                &[
+                    "full_auto::get_zone_clearance(",
+                    "full_auto::obey_departure_handoff(",
+                    "full_auto::obey_region_handoff(",
+                    "obey_handoffs(&base_url",
+                ][..],
+            ),
+        ] {
+            let text = src(file);
+            for c in calls {
+                assert!(text.contains(c), "{file} no longer calls {c}");
+            }
+        }
     }
 
     #[test]

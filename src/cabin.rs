@@ -410,6 +410,32 @@ impl Cabin {
                 return Some(rest.trim_start_matches([',', '.', ' ', ':']).to_string());
             }
         }
+        // The status QUESTION with the cabin inside it: "how's the cabin?"
+        // (737, 2026-09-21, twice, a dead miss). Answered as the status read,
+        // never as the instruction its words resemble: "is the cabin ready
+        // for departure?" asks, it does not start the securing.
+        // The cabin's SYSTEMS stay the copilot's ("how's the cabin pressure").
+        const SYSTEMS: [&str; 7] = [
+            "pressur",
+            "temperature",
+            "altitude",
+            "light",
+            "heat",
+            "air",
+            "dump",
+        ];
+        for q in [
+            "how's the cabin",
+            "hows the cabin",
+            "how is the cabin",
+            "is the cabin secure",
+            "is the cabin ready",
+            "are we secure in the back",
+        ] {
+            if t.starts_with(q) && !SYSTEMS.iter().any(|w| t.contains(w)) {
+                return Some("status".to_string());
+            }
+        }
         // Bare "cabin" is ambiguous — cabin lights, cabin pressure, the
         // Lancair's cabin dump switch are all COPILOT business — so it only
         // addresses the crew when the rest is unmistakably a crew instruction.
@@ -592,6 +618,32 @@ mod tests {
 
     fn t0() -> Instant {
         Instant::now()
+    }
+
+    #[test]
+    fn a_status_question_about_the_cabin_is_the_cabins_and_never_an_order() {
+        // "How's the cabin?" (737, 2026-09-21, twice): a dead miss.
+        assert_eq!(
+            Cabin::addressed("How's the cabin?").as_deref(),
+            Some("status")
+        );
+        assert_eq!(
+            Cabin::addressed("Is the cabin ready for departure?").as_deref(),
+            Some("status")
+        );
+        // The status read answers; a question never starts the securing.
+        let mut c = Cabin::new();
+        let now = Instant::now();
+        let reply = c.handle("status", now);
+        assert!(
+            reply.contains("flight deck") || reply.contains("Cabin"),
+            "{reply}"
+        );
+        assert!(c.pending.is_none(), "a question secured the cabin");
+        // Cabin SYSTEMS stay the copilot's.
+        assert!(Cabin::addressed("cabin lights on").is_none());
+        assert!(Cabin::addressed("How's the cabin pressure?").is_none());
+        assert!(Cabin::addressed("how is the cabin temperature").is_none());
     }
 
     #[test]

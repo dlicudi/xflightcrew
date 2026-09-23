@@ -108,6 +108,166 @@ pub(crate) fn correction_text(reply: &str) -> Option<String> {
     }
 }
 
+/// The pilot's recovery words, and which line they ask for.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum RecallAsk {
+    /// "Say again" / "repeat that": the newest thing the copilot said, or was
+    /// saying when it was cut off.
+    Newest,
+    /// "What were you saying?": the line the pilot keyed over (or the radio
+    /// stepped on), even when a readback has been said since.
+    Interrupted,
+}
+
+/// Is this utterance a request to hear the copilot again? `t` is normalized.
+pub(crate) fn recall_ask(t: &str) -> Option<RecallAsk> {
+    if t.contains("were you saying")
+        || t.contains("you were saying")
+        || t.contains("you were going to say")
+        || t.contains("you were about to say")
+    {
+        return Some(RecallAsk::Interrupted);
+    }
+    (t.contains("say again")
+        || t.contains("repeat")
+        || t.contains("come again")
+        || t.contains("what did you say")
+        || t.contains("didnt catch that"))
+    .then_some(RecallAsk::Newest)
+}
+
+/// A question about the time or distance to the DESTINATION ("when do we
+/// land", "time to destination", "how far before we land", "how much to
+/// land?"). The answer (`eta_to_destination`) gives both, minutes and miles,
+/// so a distance cue is as good as a time cue. Until 2026-09-23 it needed a
+/// time word: "how far before we land?" fell to the next-WAYPOINT branch
+/// ("Next waypoint NIE, 11 miles", with ETND 34 miles out) and "how much to
+/// land?" missed. Never a fuel or runway question ("how much fuel will we
+/// land with", "how much runway to land").
+pub(crate) fn eta_question(tl: &str) -> bool {
+    let destination = tl.contains("land")
+        || tl.contains("destination")
+        || tl.contains("arrive")
+        || tl.contains("arrival")
+        || tl.contains("get there")
+        || tl.contains("get in")
+        || tl.contains("en route")
+        || tl.contains("enroute")
+        || tl.contains("on route");
+    let time = tl.contains("time")
+        || tl.contains("eta")
+        || tl.contains("when")
+        || tl.contains("how long")
+        || tl.contains("estimat")
+        || tl.contains("remaining");
+    let distance = tl.contains("how far")
+        || tl.contains("how much")
+        || tl.contains("how many miles")
+        || tl.contains("distance");
+    let other = ["fuel", "runway", "gear", "flap", "light", "weight", "speed"]
+        .iter()
+        .any(|w| tl.contains(w));
+    destination && !other && (time || distance)
+}
+
+/// "What did the tower say?" / "what was that from ATC?": the crew asked
+/// what the CONTROLLER said, not the copilot. `t` is normalized.
+pub(crate) fn atc_recall_request(t: &str) -> bool {
+    const WHO: &[&str] = &[
+        "tower",
+        "atc",
+        "approach",
+        "departure",
+        "controller",
+        "ground",
+    ];
+    let names_atc = t
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| WHO.contains(&w));
+    names_atc
+        && (t.contains("what did") && t.contains("say")
+            || t.contains("what was that")
+            || t.contains("what were we told")
+            || t.contains("did you catch"))
+}
+
+/// How long the crew can report the controller's last word to us. Longer
+/// than the controller's own repeat: the crew remembers a clearance.
+pub(crate) const ATC_RECALL_TTL: Duration = Duration::from_secs(300);
+
+/// The crew's answer to "what did the tower say?", from the controller's
+/// last transmission addressed to us as it went out on the air. Grounded:
+/// with external ATC the crew hears nothing and says so; with nothing on
+/// file it says it heard nothing, never a guess.
+pub(crate) fn atc_recall_line(
+    simulated_atc: bool,
+    last: Option<&crate::voice::ControllerLine>,
+    now: Instant,
+) -> String {
+    if !simulated_atc {
+        return "I can't hear the real controller. Ask them to say again.".to_string();
+    }
+    match last.filter(|l| now.duration_since(l.at) < ATC_RECALL_TTL) {
+        Some(l) => {
+            let who = match l.speaker {
+                crate::voice::StationSpeaker::Approach => "Approach",
+                crate::voice::StationSpeaker::Departure => "Departure",
+                _ => "Tower",
+            };
+            format!("{who} said: {}", l.text)
+        }
+        None => "Nothing from ATC in the last five minutes.".to_string(),
+    }
+}
+
+/// Owed lines said again at most this many at a time: a recovery, not a
+/// monologue. The newest are the ones kept.
+const RECALL_MAX_LINES: usize = 3;
+
+/// The line to say for a recovery ask, and whether it spends the owed
+/// (`unsaid`) lines. `unsaid` are copilot lines cut before the end, oldest
+/// first; `readback` the last reply to a pilot request; `volunteered` the last
+/// line the copilot offered unasked. `None`: there is nothing to say again,
+/// and the copilot says so rather than inventing a line.
+pub(crate) fn recall_line(
+    ask: RecallAsk,
+    unsaid: &[(String, Instant)],
+    readback: Option<&(String, Instant)>,
+    volunteered: Option<&(String, Instant)>,
+) -> Option<(String, bool)> {
+    let owed = (!unsaid.is_empty()).then(|| {
+        let from = unsaid.len().saturating_sub(RECALL_MAX_LINES);
+        let text = unsaid[from..]
+            .iter()
+            .map(|(t, _)| t.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        (text, unsaid.last().map(|(_, at)| *at).expect("non-empty"))
+    });
+    if ask == RecallAsk::Interrupted {
+        if let Some((text, _)) = owed {
+            return Some((text, true));
+        }
+    }
+    // Newest of the three, by when it was said (or cut).
+    let mut best: Option<(String, Instant, bool)> = None;
+    let mut consider = |text: &str, at: Instant, spends: bool| {
+        if best.as_ref().is_none_or(|(_, b, _)| at > *b) {
+            best = Some((text.to_string(), at, spends));
+        }
+    };
+    if let Some((text, at)) = &owed {
+        consider(text, *at, true);
+    }
+    if let Some((text, at)) = readback {
+        consider(text, *at, false);
+    }
+    if let Some((text, at)) = volunteered {
+        consider(text, *at, false);
+    }
+    best.map(|(text, _, spends)| (text, spends))
+}
+
 /// Deterministic conversational glue — the cockpit chatter that isn't a command or
 /// a state question: "what can you do", "say again", and acknowledgments. Returns
 /// the spoken reply, or `None` to fall through to the normal command/question path.
@@ -115,18 +275,8 @@ pub(crate) fn correction_text(reply: &str) -> Option<String> {
 /// registry, so the answer matches the actual aircraft.
 pub(crate) fn conversational(t: &str, registry: &Registry) -> Option<String> {
     let has = |w: &str| t.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == w);
-    // "say again" / "repeat that" / "what did you say" → repeat the last readback.
-    if t.contains("say again")
-        || t.contains("repeat")
-        || t.contains("come again")
-        || t.contains("what did you say")
-        || t.contains("didnt catch that")
-    {
-        return Some(match LAST_READBACK.lock().ok().and_then(|l| l.clone()) {
-            Some(prev) => prev,
-            None => "Nothing to repeat yet.".to_string(),
-        });
-    }
+    // "say again" / "what were you saying" are answered before this, from the
+    // voice's memory (`recall_ask` / `recall_line`).
     // "what can you do" / "help" / "what can I ask" → list live capabilities.
     // Bare "help me" only: "help me land on runway 28" is a request for that
     // specific help (the talk-down), not a menu (it got the menu, live).
@@ -865,6 +1015,131 @@ mod unregistered_tool_tests {
 
     /// The hover's words clear the domain gate: the S-76's first "lift to a
     /// hover" never reached the grammar (2026-09-22).
+    #[test]
+    fn recovery_words_pick_their_line() {
+        assert_eq!(recall_ask("say again"), Some(RecallAsk::Newest));
+        assert_eq!(recall_ask("didnt catch that"), Some(RecallAsk::Newest));
+        assert_eq!(
+            recall_ask("what were you saying"),
+            Some(RecallAsk::Interrupted)
+        );
+        assert_eq!(
+            recall_ask("sorry you were saying"),
+            Some(RecallAsk::Interrupted)
+        );
+        assert_eq!(recall_ask("flaps ten"), None);
+        assert_eq!(recall_ask("what's our altitude"), None);
+    }
+
+    #[test]
+    fn say_again_is_the_newest_line_and_what_were_you_saying_the_cut_one() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        // The copilot was saying the caution when the pilot keyed up (t=10)
+        // to ask for flaps; "Flaps ten" was read back at t=12.
+        let cut = vec![("Gear's still up.".to_string(), at(10))];
+        let readback = ("Flaps ten.".to_string(), at(12));
+        // "Say again": the readback, the newest thing said. The cut line stays owed.
+        assert_eq!(
+            recall_line(RecallAsk::Newest, &cut, Some(&readback), None),
+            Some(("Flaps ten.".to_string(), false))
+        );
+        // "What were you saying?": the cut line, which it then spends.
+        assert_eq!(
+            recall_line(RecallAsk::Interrupted, &cut, Some(&readback), None),
+            Some(("Gear's still up.".to_string(), true))
+        );
+        // Keyed over with nothing said since: "say again" is the cut line too.
+        let old_readback = ("Flaps ten.".to_string(), at(5));
+        assert_eq!(
+            recall_line(RecallAsk::Newest, &cut, Some(&old_readback), None),
+            Some(("Gear's still up.".to_string(), true))
+        );
+        // A volunteered line newer than the readback outranks it: before, "say
+        // again" after an unasked caution repeated an older command readback.
+        let volunteered = ("Top of descent in two minutes.".to_string(), at(20));
+        assert_eq!(
+            recall_line(RecallAsk::Newest, &[], Some(&readback), Some(&volunteered)),
+            Some(("Top of descent in two minutes.".to_string(), false))
+        );
+        // Nothing cut: "what were you saying" is the newest line.
+        assert_eq!(
+            recall_line(RecallAsk::Interrupted, &[], Some(&readback), None),
+            Some(("Flaps ten.".to_string(), false))
+        );
+        // Nothing at all: no invented line.
+        assert_eq!(recall_line(RecallAsk::Newest, &[], None, None), None);
+    }
+
+    #[test]
+    fn what_did_the_tower_say_is_grounded_in_what_went_out() {
+        use crate::voice::{ControllerLine, StationSpeaker};
+        assert!(atc_recall_request("what did the tower say"));
+        assert!(atc_recall_request("what did approach say"));
+        assert!(atc_recall_request("what was that from atc"));
+        assert!(!atc_recall_request("what did you say"));
+        assert!(!atc_recall_request("what's the tower frequency"));
+        let t0 = Instant::now();
+        let line = ControllerLine {
+            text: "November one seven two Sierra Papa, descend three thousand feet.".into(),
+            speaker: StationSpeaker::Approach,
+            khz: Some(120_650),
+            at: t0,
+        };
+        let later = t0 + Duration::from_secs(40);
+        assert_eq!(
+            atc_recall_line(true, Some(&line), later),
+            "Approach said: November one seven two Sierra Papa, descend three thousand feet."
+        );
+        // External ATC (copilot mode): the crew cannot hear it, and says so.
+        let ext = atc_recall_line(false, Some(&line), later);
+        assert!(ext.contains("can't hear"), "{ext}");
+        assert!(!ext.contains("descend"), "{ext}");
+        // Nothing on file, or too old: no invented clearance.
+        assert!(atc_recall_line(true, None, later).starts_with("Nothing from ATC"));
+        assert!(
+            atc_recall_line(true, Some(&line), t0 + ATC_RECALL_TTL).starts_with("Nothing from ATC")
+        );
+    }
+
+    #[test]
+    fn landing_questions_get_the_destination_not_the_next_fix() {
+        for q in [
+            "how far before we land?",
+            "how much to land?",
+            "how much before we land?",
+            "how long left before we land?",
+            "when do we land?",
+            "time to destination.",
+            "how far to the destination",
+        ] {
+            assert!(eta_question(&q.to_lowercase()), "{q}");
+        }
+        for q in [
+            "how much fuel will we land with?",
+            "how much runway do we need to land?",
+            "landing lights on",
+            "how far to the next waypoint?",
+            "what's our landing speed?",
+        ] {
+            assert!(!eta_question(q), "{q}");
+        }
+    }
+
+    #[test]
+    fn owed_lines_are_said_again_newest_three_in_order() {
+        let t0 = Instant::now();
+        let cut: Vec<(String, Instant)> = ["One.", "Two.", "Three.", "Four."]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.to_string(), t0 + Duration::from_secs(i as u64)))
+            .collect();
+        assert_eq!(
+            recall_line(RecallAsk::Interrupted, &cut, None, None),
+            Some(("Two. Three. Four.".to_string(), true))
+        );
+    }
+
     #[test]
     fn a_helicopters_words_are_commands() {
         for w in [
