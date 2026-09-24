@@ -426,7 +426,7 @@ async fn fly(
             return;
         };
         crate::blackbox::record("taxi_in", json!({ "event": "hover_taxi", "nodes": path.len() }));
-        announce(&voice, Priority::Advisory, &format!("My taxi. Hover taxi via {via}."));
+        // The park says the lift itself, with the time to stop it.
         crate::heli_route::park(
             voice.clone(),
             config.xplane_base_url.clone(),
@@ -607,7 +607,7 @@ const SHUTDOWN_CONFIRM_SECS: f64 = 60.0;
 /// then every electrical system off through `set_electrical`. Engines still
 /// turning leave the electrics on and say so. Asked 2026-09-24: full auto
 /// ended at "Parking items done. Shut down when you're ready."
-async fn shut_down_at_stand(xp: &XPlaneClient, config: &Config, voice: &Option<Voice>) {
+pub(crate) async fn shut_down_at_stand(xp: &XPlaneClient, config: &Config, voice: &Option<Voice>) {
     let Some(profile) = crate::aircraft::live_profile() else {
         announce(voice, Priority::Advisory, "Parked. Your aircraft for the shutdown.");
         return;

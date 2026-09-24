@@ -132,6 +132,9 @@ pub struct Route {
     /// on this route (`nav::sid_minimums`). Empty for a resume or a plan with
     /// no SID.
     pub climb_minimums: Vec<crate::nav::ClimbMinimum>,
+    /// The planned STAR's restrictions on this route, already clamped into
+    /// `legs` (`procedure::apply_arrival_constraints`). Empty with no STAR.
+    pub arrival_constraints: Vec<crate::nav::StarConstraint>,
     /// The runway the planned SID departs from, asked for at the taxi request.
     pub departure_rwy: Option<String>,
     /// The plugin FMS-mailbox payload ("IDENT,lat,lon,alt|...") for the whole
@@ -1922,6 +1925,7 @@ async fn fly_route(
             cruise_ias_kts: tools.cruise_ias_kts,
             transition_altitude_ft: Some(tools.transition_altitude_ft),
             climb_minimums: route.climb_minimums.clone(),
+            arrival_constraints: route.arrival_constraints.clone(),
             visual_deg: None,
             missed_legs: Vec::new(),
         },

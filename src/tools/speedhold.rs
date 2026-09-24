@@ -327,6 +327,41 @@ pub fn clamp_target(kts: f64) -> f64 {
     kts.clamp(55.0, ceiling)
 }
 
+/// A SPOKEN flight target, judged before anything is armed: `Err` is the
+/// line to say instead. A number past the airframe's ceiling or under its
+/// landing floor is a MISHEAR and is refused, never clamped: "set speed 85"
+/// heard as "885 knots" on an SR22's final was clamped to its 189 kt ceiling
+/// and the governor took the throttle to go and get it, and "17 knots" became
+/// a 55 kt hold the airspeed warning called nine seconds later (LSZS-LILO,
+/// 2026-09-24). Between the landing floor and the floor for the flaps
+/// actually out, the target is raised to that floor and the line says so.
+pub fn spoken_flight_target(
+    asked: f64,
+    ceiling: f64,
+    config_floor: Option<f64>,
+    landing_floor: Option<f64>,
+) -> std::result::Result<(f64, Option<String>), String> {
+    let ceiling = ceiling.max(55.0);
+    if asked > ceiling {
+        return Err(format!(
+            "{asked:.0} knots is past this airframe's {ceiling:.0} knot limit. Say the speed again."
+        ));
+    }
+    let bottom = landing_floor.unwrap_or(55.0).max(55.0);
+    if asked < bottom {
+        return Err(format!(
+            "{asked:.0} knots is below the stall margin, {bottom:.0} at the least. Say the speed again."
+        ));
+    }
+    match config_floor {
+        Some(f) if asked < f => Ok((
+            f,
+            Some(format!("{asked:.0} is below the {f:.0} knot floor with these flaps. ")),
+        )),
+        _ => Ok((asked, None)),
+    }
+}
+
 /// Sanity bounds for a taxi target. 0 is legitimate ("hold short" = stop).
 pub fn clamp_taxi_target(kts: f64) -> f64 {
     kts.clamp(0.0, 25.0)
@@ -674,6 +709,7 @@ impl Tool for HoldSpeed {
             super::controls::ensure_park_brake_valve(ctx.xplane, false, self.park_brake_valve_set)
                 .await;
         }
+        let mut floor_note: Option<String> = None;
         let target = if taxi {
             match a.knots {
                 Some(k) => clamp_taxi_target(k),
@@ -681,7 +717,29 @@ impl Tool for HoldSpeed {
                 None => clamp_taxi_target(ctx.xplane.get_float(GS_MS).await? * MS_TO_KTS),
             }
         } else if let Some(k) = a.knots {
-            clamp_target(k)
+            let flaps = ctx
+                .xplane
+                .get_float(crate::datarefs::FLAP_RATIO)
+                .await
+                .unwrap_or(0.0);
+            match spoken_flight_target(
+                k,
+                crate::aircraft::speed_ceiling_kts().unwrap_or(250.0),
+                crate::aircraft::config_floor_kts(flaps),
+                crate::aircraft::approach_floor_kts().or(crate::aircraft::speed_floor_kts()),
+            ) {
+                Err(line) => {
+                    crate::blackbox::record(
+                        "speedhold",
+                        json!({"event": "spoken_target_refused", "asked": k}),
+                    );
+                    return Ok(line);
+                }
+                Ok((t, note)) => {
+                    floor_note = note;
+                    t
+                }
+            }
         } else if a.preset.as_deref() == Some("approach") {
             match self.approach_kts {
                 Some(k) => clamp_target(k),
@@ -739,7 +797,8 @@ impl Tool for HoldSpeed {
             }
         } else {
             format!(
-                "I have the throttle, holding {target:.0} knots. Say stop holding speed to take it back."
+                "{}I have the throttle, holding {target:.0} knots. Say stop holding speed to take it back.",
+                floor_note.unwrap_or_default()
             )
         })
     }
@@ -1303,6 +1362,20 @@ mod tests {
     #[test]
     fn spoken_targets_are_sanity_bounded() {
         assert_eq!(clamp_target(70.0), 70.0);
+        // LSZS-LILO: the SR22's 189 ceiling, floors 84 clean / 74 landing.
+        assert!(spoken_flight_target(885.0, 189.0, Some(84.0), Some(74.0))
+            .unwrap_err()
+            .contains("189"));
+        assert!(spoken_flight_target(17.0, 189.0, Some(74.0), Some(74.0))
+            .unwrap_err()
+            .contains("74"));
+        assert_eq!(
+            spoken_flight_target(85.0, 189.0, Some(74.0), Some(74.0)),
+            Ok((85.0, None))
+        );
+        let (t, note) = spoken_flight_target(80.0, 189.0, Some(84.0), Some(74.0)).unwrap();
+        assert_eq!(t, 84.0);
+        assert!(note.unwrap().contains("84"));
         assert_eq!(
             clamp_target(7.0),
             55.0,

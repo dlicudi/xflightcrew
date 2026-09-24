@@ -351,6 +351,12 @@ pub struct Plan {
     /// crossing is predicted, a short one is said, and one that will not be made
     /// hands the aircraft back with the numbers (`watch_minimum`).
     pub climb_minimums: Vec<crate::nav::ClimbMinimum>,
+    /// The planned STAR's crossing restrictions on this route
+    /// (`nav::star_constraints`), already clamped into the legs' altitudes by
+    /// [`apply_arrival_constraints`]. The loop keeps every altitude one ahead
+    /// reachable at the descent rate ([`arrival_ceiling_ft`]) and slows for
+    /// every speed limit in time ([`arrival_speed_cap`]).
+    pub arrival_constraints: Vec<crate::nav::StarConstraint>,
     /// An approach to a missed approach point short of the runway (LSZS): the
     /// angle of its visual segment, handed to the landing at the MAP.
     pub visual_deg: Option<f64>,
@@ -484,6 +490,114 @@ pub fn watch_minimum(alt_ft: f64, vs_fpm: f64, gs_kts: f64, dist_nm: f64, min_ft
     } else {
         MinimumWatch::OnTrack
     }
+}
+
+/// The arrival restriction published for this leg's fix, if any.
+fn restriction_at<'a>(
+    cons: &'a [crate::nav::StarConstraint],
+    leg: &ProcLeg,
+) -> Option<&'a crate::nav::StarConstraint> {
+    cons.iter().find(|c| c.fix.eq_ignore_ascii_case(&leg.fix_ident))
+}
+
+/// Clamp a plan's altitudes into its STAR's restrictions, at arm time. Each
+/// restricted fix gets its window ([`crate::nav::StarConstraint::clamp_ft`]);
+/// past the first restricted fix the profile only goes DOWN unless a fix's
+/// own minimum says otherwise, so SimBrief's 8,000 after a 7,000 "at or
+/// below" is never a climb back. Returns how many legs it changed.
+pub fn apply_arrival_constraints(legs: &mut [ProcLeg], cons: &[crate::nav::StarConstraint]) -> usize {
+    let mut changed = 0;
+    let mut prev: Option<f64> = None;
+    for leg in legs.iter_mut() {
+        let Some(alt) = leg.alt1_ft else { continue };
+        let own = restriction_at(cons, leg);
+        let mut want = own.map_or(alt, |c| c.clamp_ft(alt));
+        if let Some(p) = prev {
+            want = want.min(p);
+            if let Some(min) = own.and_then(|c| c.min_ft) {
+                want = want.max(min);
+            }
+        }
+        if own.is_some() || prev.is_some() {
+            prev = Some(want);
+        }
+        if (want - alt).abs() > 0.5 {
+            leg.alt1_ft = Some(want);
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// The highest altitude leg `idx`'s fix may be crossed at so that every
+/// arrival "at or below" further on is still reachable at `ft_per_nm`
+/// (the descent law's rate over the groundspeed), never under that fix's
+/// own minimum. `None` with no ceiling ahead. Pacing each leg only to its
+/// OWN fix left a restriction two fixes on to the last leg: FL070 at TARTN
+/// with 12 nm from HAVEN is not a descent that starts at HAVEN. Geometric,
+/// so a descent already made is never climbed back out of.
+pub fn arrival_ceiling_ft(
+    legs: &[ProcLeg],
+    cons: &[crate::nav::StarConstraint],
+    idx: usize,
+    ft_per_nm: f64,
+) -> Option<f64> {
+    let from = legs.get(idx)?.fix.as_ref()?;
+    let mut ceiling: Option<f64> = None;
+    for (k, leg) in legs.iter().enumerate().skip(idx) {
+        let Some(max) = restriction_at(cons, leg).and_then(|c| c.max_ft) else {
+            continue;
+        };
+        let d = distance_to_leg_nm(from.lat, from.lon, legs, idx, k);
+        let c = max + d * ft_per_nm;
+        ceiling = Some(ceiling.map_or(c, |x: f64| x.min(c)));
+    }
+    let floor = restriction_at(cons, &legs[idx]).and_then(|c| c.min_ft);
+    ceiling.map(|c| floor.map_or(c, |f| c.max(f)))
+}
+
+/// Descent gradient the ceiling is planned at, as a share of what the law
+/// flies: the rest is margin for the deceleration a speed limit asks for.
+const ARRIVAL_GRADIENT_SHARE: f64 = 0.85;
+
+/// Feet per nm the arrival ceiling is planned on at this groundspeed.
+pub fn arrival_ft_per_nm(descent_fpm: f64, gs_kts: f64) -> f64 {
+    ARRIVAL_GRADIENT_SHARE * descent_fpm / (gs_kts.max(60.0) / 60.0)
+}
+
+/// Knots a second the governor is planned to lose speed at in a descent.
+const ARRIVAL_DECEL_KTS_S: f64 = 0.5;
+/// Slowed this far before the fix, nm, on top of the deceleration itself.
+const ARRIVAL_SPEED_LEAD_NM: f64 = 2.0;
+
+/// The arrival's speed limit now: the lowest of every limit already passed
+/// (a limit holds from its fix on) and every one ahead whose slow-down has
+/// begun, at [`ARRIVAL_DECEL_KTS_S`] from `ias_kts` plus the lead. `(knots,
+/// fix)`; `None` when nothing applies yet.
+pub fn arrival_speed_cap(
+    legs: &[ProcLeg],
+    cons: &[crate::nav::StarConstraint],
+    idx: usize,
+    lat: f64,
+    lon: f64,
+    ias_kts: f64,
+    gs_kts: f64,
+) -> Option<(f64, String)> {
+    let mut cap: Option<(f64, String)> = None;
+    for (k, leg) in legs.iter().enumerate() {
+        let Some(kts) = restriction_at(cons, leg).and_then(|c| c.max_kts) else {
+            continue;
+        };
+        let applies = k < idx || {
+            let d = distance_to_leg_nm(lat, lon, legs, idx, k);
+            let slow_nm = (ias_kts - kts).max(0.0) / ARRIVAL_DECEL_KTS_S * gs_kts.max(60.0) / 3600.0;
+            d <= slow_nm + ARRIVAL_SPEED_LEAD_NM
+        };
+        if applies && cap.as_ref().is_none_or(|(c, _)| kts < *c) {
+            cap = Some((kts, leg.fix_ident.clone()));
+        }
+    }
+    cap
 }
 
 /// The true great-circle bearing to a leg's fix, or `None` for a to-altitude
@@ -1040,6 +1154,7 @@ pub fn approach_plan_for(
         cruise_ias_kts: None, // the follower holds the clean approach speed
         transition_altitude_ft: None,
         climb_minimums: Vec::new(),
+        arrival_constraints: Vec::new(),
         visual_deg,
         missed_legs,
     })
@@ -1362,6 +1477,7 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         cruise_ias_kts,
         transition_altitude_ft,
         climb_minimums,
+        arrival_constraints,
         visual_deg,
         missed_legs,
     } = plan;
@@ -1463,6 +1579,15 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         );
     }
 
+    let mut said_star_speed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut star_ceiling_logged: Option<usize> = None;
+    if !arrival_constraints.is_empty() {
+        crate::blackbox::record(
+            "procedure",
+            serde_json::json!({"event": "star_constraints", "constraints": arrival_constraints.iter().map(|c|
+                serde_json::json!({"fix": c.fix, "min_ft": c.min_ft, "max_ft": c.max_ft, "max_kts": c.max_kts})).collect::<Vec<_>>()}),
+        );
+    }
     let mut idx = 0usize;
     let mut closure: Option<(usize, crate::circuit::Closure)> = None;
     let mut stalls = 0u32;
@@ -1655,6 +1780,25 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
             // airframe goes up: at cruise speed the SF50 made 375 ft a mile
             // where MOGT3H asks 600 (LOWI, 2026-09-24).
             let planned = if unmet.is_some() && vy_kts > 0.0 { vy_kts } else { planned };
+            // The STAR's speed limits: slowed in time for each, held after.
+            let star_cap = arrival_speed_cap(&legs, &arrival_constraints, idx, lat, lon, ias, gs * MS_TO_KTS);
+            let planned = match &star_cap {
+                Some((kts, fix)) if *kts < planned => {
+                    if said_star_speed.insert(fix.clone()) {
+                        crate::blackbox::record(
+                            "procedure",
+                            serde_json::json!({"event": "star_speed", "fix": fix, "kts": kts, "ias": ias}),
+                        );
+                        alert(
+                            &voice,
+                            Priority::Advisory,
+                            &format!("Slowing to {kts:.0} knots for {fix}."),
+                        );
+                    }
+                    *kts
+                }
+                _ => planned,
+            };
             // On the final to a MAP: landing speed and configuration, so the
             // visual segment is flown stabilised (a jet cannot slow down and
             // go down 4.7 degrees in two miles).
@@ -1876,8 +2020,31 @@ async fn fly(xp: XPlaneClient, base_url: String, voice: Option<Voice>, plan: Pla
         // both. The autopilot tool hands a commanded altitude to the follower
         // rather than writing the dial, so the follower stays the one writer
         // and an override cannot be undone by the next tick.
+        // The STAR's "at or below"s ahead, kept reachable: this fix's target
+        // comes down to whatever still makes the tightest one further on.
+        let star_leg;
+        let leg_for_vertical = match (
+            leg.alt1_ft,
+            arrival_ceiling_ft(&legs, &arrival_constraints, idx, arrival_ft_per_nm(descent_fpm(), gs_kts)),
+        ) {
+            (Some(a), Some(c)) if c < a - 50.0 => {
+                if star_ceiling_logged != Some(idx) {
+                    star_ceiling_logged = Some(idx);
+                    crate::blackbox::record(
+                        "procedure",
+                        serde_json::json!({"event": "star_ceiling", "idx": idx, "fix": leg.fix_ident,
+                                           "plan_ft": a, "ceiling_ft": c}),
+                    );
+                }
+                let mut l = leg.clone();
+                l.alt1_ft = Some((c / 100.0).floor() * 100.0);
+                star_leg = l;
+                &star_leg
+            }
+            _ => leg,
+        };
         let v = vertical_tick(
-            leg,
+            leg_for_vertical,
             carry_alt,
             prev_cmd_alt,
             alt_ft,
@@ -2563,6 +2730,126 @@ mod tests {
         publish_leg(None);
     }
 
+    /// EGPH AGPE1E's shape, on a line north: HAVEN 250 kt, TARTN "FL070,
+    /// 230 kt" after SimBrief's guess at 9,000, then 8,000 on the far side.
+    fn star_route() -> (Vec<ProcLeg>, Vec<crate::nav::StarConstraint>) {
+        let at = |id: &str, nm: f64, alt: f64| {
+            let mut l = leg(id, nm / 60.0, 0.0);
+            l.alt1_ft = Some(alt);
+            l
+        };
+        let legs = vec![
+            at("AGPED", 0.0, 26_000.0),
+            at("HAVEN", 30.0, 20_000.0),
+            at("MIDDL", 55.0, 15_000.0),
+            at("TARTN", 70.0, 9_000.0),
+            at("AFTER", 80.0, 8_000.0),
+        ];
+        let c = |fix: &str, min, max, kts| crate::nav::StarConstraint {
+            fix: fix.into(),
+            min_ft: min,
+            max_ft: max,
+            max_kts: kts,
+        };
+        let cons = vec![
+            c("AGPED", Some(26_000.0), Some(26_000.0), None),
+            c("HAVEN", None, None, Some(250.0)),
+            c("TARTN", None, Some(7_000.0), Some(230.0)),
+        ];
+        (legs, cons)
+    }
+
+    #[test]
+    fn a_stars_window_is_clamped_into_the_plan_and_never_climbed_back_out_of() {
+        let (mut legs, cons) = star_route();
+        assert_eq!(apply_arrival_constraints(&mut legs, &cons), 2);
+        let alts: Vec<f64> = legs.iter().map(|l| l.alt1_ft.unwrap()).collect();
+        assert_eq!(alts, vec![26_000.0, 20_000.0, 15_000.0, 7_000.0, 7_000.0]);
+        // A minimum past the first restriction still raises its own fix.
+        let mut legs2 = star_route().0;
+        let mut cons2 = cons.clone();
+        cons2.push(crate::nav::StarConstraint {
+            fix: "AFTER".into(),
+            min_ft: Some(7_500.0),
+            max_ft: None,
+            max_kts: None,
+        });
+        apply_arrival_constraints(&mut legs2, &cons2);
+        assert_eq!(legs2[4].alt1_ft, Some(7_500.0));
+    }
+
+    #[test]
+    fn a_restriction_two_fixes_on_brings_the_descent_forward() {
+        let (mut legs, cons) = star_route();
+        apply_arrival_constraints(&mut legs, &cons);
+        let grad = arrival_ft_per_nm(2_000.0, 300.0);
+        assert!((grad - 340.0).abs() < 1.0, "{grad}");
+        let c = arrival_ceiling_ft(&legs, &cons, 2, grad).unwrap();
+        assert!((c - (7_000.0 + 15.0 * 340.0)).abs() < 30.0, "MIDDL {c}");
+        // Further out the ceiling is above the plan and changes nothing...
+        let c = arrival_ceiling_ft(&legs, &cons, 1, grad).unwrap();
+        assert!(c > 20_000.0, "HAVEN {c}");
+        // ...and a fix's own "at" stands over it.
+        assert_eq!(arrival_ceiling_ft(&legs, &cons, 0, grad), Some(26_000.0));
+        assert_eq!(arrival_ceiling_ft(&legs, &cons, 4, grad), None, "nothing ahead");
+    }
+
+    /// Fly the loop's vertical bookkeeping down the route at 300 kt and
+    /// 2,000 fpm: with the ceiling TARTN is crossed at FL070, without it
+    /// (each leg paced only to its own fix) it is not.
+    #[test]
+    fn the_arrival_crosses_its_restriction_at_the_published_altitude() {
+        fn fly(with_ceiling: bool) -> f64 {
+            let (mut legs, cons) = star_route();
+            apply_arrival_constraints(&mut legs, &cons);
+            let (gs, rate) = (300.0, 2_000.0);
+            let (mut lat, mut alt, mut idx) = (-5.0 / 60.0, 26_000.0, 0usize);
+            let (mut carry, mut prev) = (alt, alt);
+            loop {
+                let f = legs[idx].fix.clone().unwrap();
+                let d = crate::nav::haversine_nm(lat, 0.0, f.lat, f.lon);
+                if d < 0.3 {
+                    if legs[idx].fix_ident == "TARTN" {
+                        return alt;
+                    }
+                    idx += 1;
+                    continue;
+                }
+                let mut l = legs[idx].clone();
+                if with_ceiling {
+                    if let Some(c) = arrival_ceiling_ft(&legs, &cons, idx, arrival_ft_per_nm(rate, gs)) {
+                        if c < l.alt1_ft.unwrap() - 50.0 {
+                            l.alt1_ft = Some((c / 100.0).floor() * 100.0);
+                        }
+                    }
+                }
+                let v = vertical_tick(&l, carry, prev, alt, Some(d), gs, None, None, rate);
+                carry = v.carry;
+                prev = v.prev_cmd;
+                if v.want_alt < alt - 20.0 {
+                    alt = (alt - rate / 60.0).max(v.want_alt);
+                }
+                lat += gs / 3600.0 / 60.0;
+            }
+        }
+        let crossed = fly(true);
+        assert!(crossed <= 7_100.0, "crossed TARTN at {crossed}");
+        assert!(fly(false) > 8_000.0, "the test must bite without the ceiling");
+    }
+
+    #[test]
+    fn a_stars_speed_limits_start_in_time_and_hold_after() {
+        let (legs, cons) = star_route();
+        // 20 nm short of HAVEN at 290 kt: nothing yet.
+        assert_eq!(arrival_speed_cap(&legs, &cons, 1, 10.0 / 60.0, 0.0, 290.0, 400.0), None);
+        // 40 kt to lose at 0.5 kt/s is 80 s, 8.9 nm at 400 kt, plus 2.
+        let near = arrival_speed_cap(&legs, &cons, 1, 20.0 / 60.0, 0.0, 290.0, 400.0);
+        assert_eq!(near, Some((250.0, "HAVEN".to_string())));
+        // Past HAVEN the 250 holds; nearing TARTN its 230 takes over.
+        assert_eq!(arrival_speed_cap(&legs, &cons, 2, 31.0 / 60.0, 0.0, 250.0, 300.0).unwrap().0, 250.0);
+        assert_eq!(arrival_speed_cap(&legs, &cons, 3, 66.0 / 60.0, 0.0, 250.0, 300.0).unwrap().0, 230.0);
+    }
+
     fn leg(fix_ident: &str, lat: f64, lon: f64) -> ProcLeg {
         ProcLeg {
             seq: 0,
@@ -3214,6 +3501,7 @@ mod tests {
             cruise_ias_kts: None,
             transition_altitude_ft: None,
             climb_minimums: Vec::new(),
+            arrival_constraints: Vec::new(),
             visual_deg: None,
             missed_legs: Vec::new(),
         };

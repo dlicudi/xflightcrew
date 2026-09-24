@@ -1295,6 +1295,7 @@ pub fn run_autoland_scoped(
                                     cruise_ias_kts: None,
                                     transition_altitude_ft: None,
                                     climb_minimums: Vec::new(),
+                                    arrival_constraints: Vec::new(),
                                     visual_deg: None,
                                     missed_legs: Vec::new(),
                                 },
@@ -2403,31 +2404,77 @@ pub const GLIDEPATH_FT_PER_NM: f64 = 318.0;
 /// steeper one down for its visual segment (`set_next_glidepath_deg`; LSZS
 /// RNAV 03's MAP is 996 ft above the threshold two miles out, 4.7 degrees).
 /// Set at every arm, so no approach inherits another's.
+/// In a test build both live per THREAD: the LSZS visual-segment test arms a
+/// 4.5 degree path, and every other test landing at the same moment flew it
+/// (the balloon test failed one run in three, 2026-09-24). One landing per
+/// process is the app's truth; one per test is the tests'.
+#[cfg(not(test))]
 static GLIDEPATH_DEG: std::sync::Mutex<f64> = std::sync::Mutex::new(3.0);
 /// The angle the NEXT arm takes, consumed there.
+#[cfg(not(test))]
 static NEXT_GLIDEPATH_DEG: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+thread_local! {
+    static GLIDEPATH_DEG_T: std::cell::Cell<f64> = const { std::cell::Cell::new(3.0) };
+    static NEXT_GLIDEPATH_DEG_T: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
 /// The steepest path the landing will fly.
 pub const MAX_GLIDEPATH_DEG: f64 = 5.5;
 
+#[cfg(not(test))]
+fn next_glidepath(set: Option<Option<f64>>) -> Option<f64> {
+    let mut g = NEXT_GLIDEPATH_DEG.lock().unwrap_or_else(|e| e.into_inner());
+    match set {
+        Some(v) => {
+            *g = v;
+            v
+        }
+        None => g.take(),
+    }
+}
+#[cfg(test)]
+fn next_glidepath(set: Option<Option<f64>>) -> Option<f64> {
+    NEXT_GLIDEPATH_DEG_T.with(|c| match set {
+        Some(v) => {
+            c.set(v);
+            v
+        }
+        None => c.take(),
+    })
+}
+#[cfg(not(test))]
+fn live_glidepath(set: Option<f64>) -> f64 {
+    let mut g = GLIDEPATH_DEG.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = set {
+        *g = v;
+    }
+    *g
+}
+#[cfg(test)]
+fn live_glidepath(set: Option<f64>) -> f64 {
+    GLIDEPATH_DEG_T.with(|c| {
+        if let Some(v) = set {
+            c.set(v);
+        }
+        c.get()
+    })
+}
+
 /// Hand the next autoland arm a glidepath angle (the follower does, at a MAP).
 pub fn set_next_glidepath_deg(deg: Option<f64>) {
-    *NEXT_GLIDEPATH_DEG.lock().unwrap_or_else(|e| e.into_inner()) = deg;
+    next_glidepath(Some(deg));
 }
 
 /// Take the handed-down angle for this arm (3 without one), clamped.
 fn arm_glidepath() -> f64 {
-    let deg = NEXT_GLIDEPATH_DEG
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
+    let deg = next_glidepath(None)
         .filter(|d| d.is_finite())
         .map_or(3.0, |d| d.clamp(3.0, MAX_GLIDEPATH_DEG));
-    *GLIDEPATH_DEG.lock().unwrap_or_else(|e| e.into_inner()) = deg;
-    deg
+    live_glidepath(Some(deg))
 }
 
 fn glidepath_deg() -> f64 {
-    *GLIDEPATH_DEG.lock().unwrap_or_else(|e| e.into_inner())
+    live_glidepath(None)
 }
 
 /// Feet of path per nautical mile for this approach (318 at 3 degrees, the

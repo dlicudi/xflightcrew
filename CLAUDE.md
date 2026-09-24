@@ -463,7 +463,7 @@ laws battle-test as plain `cargo test`; everything blackboxes to
 `logs/blackbox.jsonl` (kinds: `atc`, `autotaxi`, `autotakeoff`, `pushback`, `checklist`,
 `taxi_guide`, `cockpit_auto`, `full_auto`, `circuit`, `procedure`, `cabin`,
 `instructor`, `loading`, `turbine_start`, `heli_start`, `hover`, `heli_circuit`,
-`heli_route`, `rapport`, `cabin_air`, `api_load`). Cross-cutting rules, each learned the hard way (details in
+`heli_route`, `rapport`, `cabin_air`, `api_load`, `plan_audit`). Cross-cutting rules, each learned the hard way (details in
 history):
 
 - **A stage that is not moving the aircraft is holding it**: brakes set for
@@ -910,7 +910,29 @@ history):
   says a short one and hands over when one will not be made
   (`watch_minimum`). The taxi request names the SID's runway (the tower
   honours it unless the wind really favours another end), and a different
-  cleared runway is said and handed back on the ramp.
+  cleared runway is said and handed back on the ramp. **An arrival is flown
+  to its chart too** (`nav::star_constraints`, SimBrief `star_ident` /
+  `destination/plan_rwy`, 2026-09-24, unflown): the STAR's windows are
+  clamped into the plan's altitudes at the arm (`apply_arrival_constraints`,
+  never climbed back out of), every fix's target is capped so each "at or
+  below" further on stays reachable at the descent rate
+  (`arrival_ceiling_ft`, blackbox `star_ceiling`), and each speed limit is
+  slowed for in time and held after (`arrival_speed_cap`, `star_speed`).
+- **The whole plan is dry-run before it is flown**
+  ([src/plan_audit.rs](src/plan_audit.rs), at the full-auto arm and on
+  "check the flight plan" / "is the plan safe" / "is the aircraft suitable",
+  asked BEFORE the systems check): the follower's own vertical rules flown
+  over the route at the airframe's rates. REFUSED: a plan for another type,
+  a cruise above the ceiling, block fuel over the tanks, a distance past the
+  airframe's own burn plus 45 min, a runway short at either end, a STAR
+  minimum over the ceiling, a climb that cannot clear PROBED ground near the
+  departure at best rate (the only scenery loaded before takeoff). CAUTIONS
+  (said, flown): a leg under the grid MORA (`earth_mora.dat`, row = the
+  cell's south edge) outside 25 nm of either field, a STAR crossing predicted
+  high or low, a STAR speed under the clean floor, a trip burn under 70 % of
+  ours, an overweight landing, the destination's crosswind now, a cruise
+  never reached, unpressurised above 12,500. The all-clear names what was
+  checked AND what could not be. Unflown (2026-09-24).
 - **A mountain field is an approach we can fly or a hand-over, never a
   visual autoland** (`mountain_field`: MSA from `earth_msa.dat` 3,000 ft or
   more above the field). An approach that ends at a MAP short of the runway
@@ -1149,6 +1171,34 @@ helicopter flies on its own loop ([src/hover.rs](src/hover.rs), blackbox
   slow-down at the cruise height. Offline only (sortie test on a lagged VS
   plant); the final's GROUNDSPEED cap in a headwind is still owed, pending
   whether the hover mode's 47 kt let-go is airspeed or groundspeed.
+- **The climb out is checked against the ground at the arm**
+  (`heli_route::climb_conflict`, 15 nm probed 500 m either side, the 500 fpm
+  departure within 500 ft of it refuses with the numbers; LILO-LILB
+  2026-09-24 flew into a 7,728 ft ridge 4.3 nm out: the cruise was sized over
+  it, the climb to it never was). The cruise itself is sized over a 1 km
+  corridor (`sample_corridor`), not the track. No helipad lands on the hard
+  runway end nearest the arrival (`runway_spot`), never the reference point.
+  A helipad landing ENDS there, shut down; a hover taxi off a runway is said
+  and waits 5 s for "my controls" (the pilot stopped an unannounced lift off
+  LILO's H1). The parking brake is set at a landing only under 2 kt
+  (`touchdown_brake_due`: the first cut set it at 19 kt on the ridge).
+  **The climb out is FAST where the ground allows** (`fast_climb`, picked at
+  the arm by `climb_conflict` on both profiles): the hover loop to 500 ft,
+  then the autopilot on vertical speed at 800 fpm to the cruise dial with the
+  collective on 75 kt, eased to 400 fpm under 55 kt; it is shallower over the
+  ground than the 35 kt climb, so a valley that only the slow climb clears
+  gets the slow climb, said. **The approach gate comes down** as the high
+  ground passes behind (re-probed at each fix, `gate_lowered`). Both unflown.
+  **Below 50 kt collective is not a speed control** (LILO-LILB, 2026-09-24,
+  crashed): a gate reached at 86 kt put the speed law's collective at its
+  0.25 floor, the VS mode held the level with 15 degrees of nose-up, the
+  speed fell to 25 kt, the law drove the collective to 0.65 and the
+  helicopter CLIMBED, and the pitch/collective cycle grew past the 20 degree
+  limit over a ridge. The approach and slow-down floor the collective at
+  0.35 (`APPROACH_COLLECTIVE_MIN`), the hover loop takes over once slowed
+  whatever the height, the approach floor is probed over the 1 km corridor,
+  and a point near the pad is dropped only when it lies PAST the pad (the
+  drop of the pilot's lake point sent the last leg over the hills). Unflown.
 - **Parking is the aeroplanes' tool** (`taxi_to_parking`, unwithheld for a
   rotorcraft): the same call to the tower, the same clearance; only the drive
   differs, a hover taxi of the cleared route (`heli_route::park`, 12 ft, 10

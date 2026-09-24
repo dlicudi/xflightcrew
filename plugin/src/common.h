@@ -27,6 +27,8 @@ static const ImU32 COL_AMBER = IM_COL32(255, 185, 40, 255);
 static const ImU32 COL_CYAN  = IM_COL32(90, 200, 255, 255);
 static const ImU32 COL_WHITE = IM_COL32(235, 235, 240, 255);
 static const ImU32 COL_RED   = IM_COL32(240, 90, 80, 255);
+// The active leg, as a G1000 draws it.
+static const ImU32 COL_MAGENTA = IM_COL32(235, 110, 235, 255);
 
 // Fixed buffer for a text dataref the app PATCHes over the Web API.
 struct TextRef { char buf[512]; int len; };

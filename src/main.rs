@@ -47,6 +47,7 @@ mod plan;
 mod plugin_status;
 mod pollers;
 mod prefs;
+mod plan_audit;
 mod procedure;
 mod pushback;
 mod radiofx;
@@ -2481,6 +2482,14 @@ async fn run_session(
                     say(&voice, &reporter, ui::LogKind::Readback, &line);
                     continue;
                 }
+            }
+            // "Check the flight plan": the whole-flight audit, nothing armed. Before the
+            // systems check, whose "check ... aircraft" these words can have.
+            if grammar::plan_check_request(&tl) {
+                reporter.status(ui::Phase::Thinking);
+                let line = plan::plan_check_report(&config, &xplane, &mut fp_cache).await;
+                say(&voice, &reporter, ui::LogKind::Readback, &line);
+                continue;
             }
             if tl.contains("all systems") || tl.contains("systems check") || tl.contains("safe parameter")
                 || tl.contains("in the green") || tl.contains("status check")

@@ -606,7 +606,16 @@ async fn route(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<String> {
         .ok()
         .flatten()
         .and_then(|a| a.staffed_tower().map(|f| f.khz));
-    let pad_name = match crate::heli_route::pick_pad(&pads, inbound) {
+    // No helipad: the runway end nearest the arrival, never the reference
+    // point (LILB's is 120 m off its strip).
+    let on_pad = !pads.is_empty();
+    let spot = crate::heli_route::pick_pad(&pads, inbound).or_else(|| {
+        crate::nav::find_airport(&ctx.config.apt_data_path, &dest)
+            .ok()
+            .flatten()
+            .and_then(|a| crate::heli_route::runway_spot(&a, inbound))
+    });
+    let pad_name = match spot {
         Some((lat, lon, name)) => {
             if let Some(last) = points.last_mut() {
                 *last = (format!("{dest} {name}"), lat, lon);
@@ -621,6 +630,68 @@ async fn route(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<String> {
         .take(points.len() - 1)
         .map(|p| p.0.clone())
         .collect();
+    // The climb out, against the ground it will meet: from the ground, the
+    // hover loop climbs at 500 fpm along the track, and nothing in the air
+    // looks ahead of it (LILO-LILB, 2026-09-24: into the ridge 4.3 nm out).
+    let mut climb_note = "";
+    // Without a probed climb-out, the slow departure: the steeper one.
+    let mut fast_climb = false;
+    if on_ground {
+        let (here_lat, here_lon, elev) = tokio::join!(
+            ctx.xplane.get_float(crate::datarefs::LATITUDE),
+            ctx.xplane.get_float(crate::datarefs::LONGITUDE),
+            ctx.xplane.get_float("sim/flightmodel/position/elevation"),
+        );
+        if let (Ok(la), Ok(lo), Ok(el)) = (here_lat, here_lon, elev) {
+            let mut line = vec![(la, lo)];
+            line.extend(points.iter().skip(1).map(|p| (p.1, p.2)));
+            let stations = crate::heli_route::climb_stations(
+                &line,
+                crate::heli_route::CLIMB_CHECK_NM,
+                400.0,
+                500.0,
+            );
+            let xp = crate::xplane::XPlaneClient::new(ctx.config.xplane_base_url.clone());
+            let mut ground: Vec<(f64, f64)> = Vec::new();
+            let mut probed = true;
+            for chunk in stations.chunks(crate::terrain::MAX_POINTS) {
+                let pts: Vec<(f64, f64)> = chunk.iter().map(|s| (s.1, s.2)).collect();
+                match crate::terrain::sample_ft(&xp, &pts).await {
+                    Some(h) => ground.extend(chunk.iter().map(|s| s.0).zip(h)),
+                    None => {
+                        probed = false;
+                        break;
+                    }
+                }
+            }
+            // The fast climb where the ground allows it, the slow valley
+            // climb where only that clears, else no departure at all.
+            let field = el * 3.280_84;
+            let fast_conflict = crate::heli_route::climb_conflict(field, &ground, true);
+            let conflict = crate::heli_route::climb_conflict(field, &ground, false);
+            fast_climb = probed && fast_conflict.is_none();
+            crate::blackbox::record(
+                "heli_route",
+                serde_json::json!({ "event": "climb_check", "probed": probed, "points": ground.len(), "fast": fast_climb,
+                    "conflict": conflict.map(|c| serde_json::json!({"nm": c.0, "ground_ft": c.1, "climb_ft": c.2})),
+                    "fast_conflict": fast_conflict.map(|c| serde_json::json!({"nm": c.0, "ground_ft": c.1, "climb_ft": c.2})) }),
+            );
+            if let Some((d, g, a)) = conflict {
+                return Ok(format!(
+                    "Negative. Climbing out at 500 feet a minute we'd be at about {} {:.0} miles out, where the ground rises to {}. Plan a route that climbs up a valley.",
+                    crate::flightplan::spoken_feet((a / 100.0).round() * 100.0),
+                    d,
+                    crate::flightplan::spoken_feet(g)
+                ));
+            }
+            if probed && !fast_climb {
+                climb_note = " Slow climb out for the terrain.";
+            }
+            if !probed {
+                climb_note = " I couldn't check all the ground on the climb out.";
+            }
+        }
+    }
     hover::set_motion(hover::Motion::default());
     crate::heli_route::start(
         ctx.voice.cloned(),
@@ -628,6 +699,8 @@ async fn route(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<String> {
         collective.to_string(),
         crate::heli_route::Route {
             points,
+            on_pad,
+            fast_climb,
             destination: dest.clone(),
             dest_tower_khz,
         },
@@ -637,12 +710,17 @@ async fn route(tool: &Hover, ctx: &ToolCtx<'_>) -> Result<String> {
             taxi: tool.taxi.clone(),
         },
     );
+    // The numbers, never the fix list: twelve lat/lon idents read aloud
+    // were a paragraph (LSZS-LILO, 2026-09-24). The cruise level is said by
+    // the route once the ground has been probed, since only then is it known.
     Ok(format!(
-        "Flying the plan to {dest}{}: {}, {:.0} knots at {:.0} feet above the ground.",
-        pad_name.map(|n| format!(", pad {n}")).unwrap_or_default(),
-        names.join(", "),
-        crate::heli_route::CRUISE_KTS,
-        crate::heli_route::CRUISE_AGL_FT
+        "Flying the plan to {dest}{}, {} {}, {:.0} knots.{climb_note}",
+        pad_name
+            .map(|n| if on_pad { format!(", pad {n}") } else { format!(", {n}") })
+            .unwrap_or_default(),
+        names.len(),
+        if names.len() == 1 { "fix" } else { "fixes" },
+        crate::heli_route::cruise_kts(),
     ))
 }
 

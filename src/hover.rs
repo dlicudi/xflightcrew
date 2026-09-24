@@ -442,8 +442,19 @@ const LEVER_BELOW_BAND: f64 = 0.05;
 const STEADY_BAND: f64 = 0.08;
 /// The ramp that finds lift-off from a flat pitch.
 const LIFT_RAMP: f64 = 0.04;
-/// Once on the ground after a landing, the collective comes down at this.
-const LOWER_RATE: f64 = 0.10;
+/// Groundspeed under which a landing's parking brake is set, m/s (2 kt).
+const TOUCHDOWN_BRAKE_MAX_MPS: f64 = 1.0;
+
+/// Whether a landing on the ground at `gs` m/s may set the parking brake.
+pub fn touchdown_brake_due(gs: f64) -> bool {
+    gs.is_finite() && gs < TOUCHDOWN_BRAKE_MAX_MPS
+}
+
+/// Once on the ground after a landing, the collective comes down at this:
+/// about 3 s from a hover's 0.6. At 0.10 it took six, and the S-76 sat light
+/// on its wheels for all of them, rolling at a knot and a half on the second
+/// set-down at LILO ("not entirely firmly on the ground", 2026-09-24).
+const LOWER_RATE: f64 = 0.20;
 pub const COLLECTIVE_MAX: f64 = 0.9;
 /// A climb this fast, or leaving the ground, ends the lift-off ramp.
 const LIFTED_FPM: f64 = 60.0;
@@ -992,6 +1003,7 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
     let mut pedals_on = false;
     let mut pedals_yielded = false;
     let mut grounded_since: Option<Instant> = None;
+    let mut touchdown_braked = false;
     let mut tick_n: u64 = 0;
     let mut last_recapture: Option<Instant> = None;
     let mut ff_speed: Option<f64> = None;
@@ -1370,6 +1382,20 @@ async fn fly(xp: XPlaneClient, voice: Option<Voice>, collective: String) {
             Goal::Fly { .. } => {}
             Goal::Land => {
                 if on_ground && !law.airborne() {
+                    // Down and nearly stopped: the wheels are held from
+                    // here, not rolled on while the lever comes down. Never
+                    // at speed: a drift set-down on the LILO-LILB ridge
+                    // touched at 19 kt and the first cut of this set the
+                    // parking brake there (2026-09-24).
+                    if !touchdown_braked && gs.is_some_and(touchdown_brake_due) {
+                        touchdown_braked = true;
+                        let valve = crate::aircraft::live_profile().and_then(|p| p.park_brake_valve_set);
+                        let set = crate::tools::controls::drive_park_brake(&xp, true, valve).await;
+                        crate::blackbox::record(
+                            "hover",
+                            serde_json::json!({ "event": "touchdown_brake", "set": set.as_ref().ok(), "gs": gs }),
+                        );
+                    }
                     let since = *grounded_since.get_or_insert(now);
                     if (now - since).as_secs_f64() >= LANDED_SECS && cmd <= 0.001 {
                         let _ = xp.run_command(CMD_AP_OFF).await;
@@ -1864,4 +1890,11 @@ mod tests {
         let c = law.step(-100.0, 0.0, true, 0.1);
         assert!(c < 0.3 && c >= 0.0);
     }
+    #[test]
+    fn the_touchdown_brake_waits_for_a_stop() {
+        assert!(super::touchdown_brake_due(0.3));
+        assert!(!super::touchdown_brake_due(9.7), "the ridge set-down at 19 kt");
+        assert!(!super::touchdown_brake_due(f64::NAN));
+    }
+
 }

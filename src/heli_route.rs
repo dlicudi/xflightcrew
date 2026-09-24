@@ -43,11 +43,54 @@ pub fn status() -> Option<String> {
 
 /// Cruise height above the departure ground, and the airspeeds.
 pub const CRUISE_AGL_FT: f64 = 1000.0;
+/// The cruise speed when the airframe declares none (see [`cruise_kts`]).
 pub const CRUISE_KTS: f64 = 120.0;
+
+/// The cruise speed: the airframe's own (`reference.cruise_ias_kts`, 140 kt
+/// on the S-76, whose Vno is 139.5), never past its speed ceiling (Vne less
+/// 15), [`CRUISE_KTS`] when it declares none. A flat 120 flew the S-76 20 kt
+/// under its book cruise with the collective at 0.72 of a 0.85 cap
+/// (LILO-LILB, 2026-09-24). Where the power is not there the cruise settles
+/// at what it makes ([`power_limited_kts`]).
+pub fn cruise_kts() -> f64 {
+    let own = crate::aircraft::live_profile()
+        .and_then(|p| p.reference.as_ref().and_then(|r| r.cruise_ias_kts))
+        .filter(|k| *k >= 60.0);
+    let k = own.unwrap_or(CRUISE_KTS);
+    crate::aircraft::speed_ceiling_kts().map_or(k, |c| k.min(c))
+}
+
+/// The collective at its cap this long in a level cruise is a speed the
+/// power cannot make.
+pub const POWER_LIMIT_S: f64 = 15.0;
+
+/// The cruise speed once the power has run out: what is being made, down to
+/// the 5 kt, never under the approach speed. Pure.
+pub fn power_limited_kts(ias_kts: f64) -> f64 {
+    ((ias_kts / 5.0).floor() * 5.0).max(APPROACH_KTS)
+}
+
+/// Whether the speed law's collective is at its cap.
+pub fn collective_capped(c: f64) -> bool {
+    c >= COLLECTIVE_MAX - 0.005
+}
 /// The hover mode's side of the hand-over, both ways: level, inside the
 /// 40 kt the mode has been flown at.
 pub const HANDOVER_KTS: f64 = 38.0;
 const DEPART_MPS: f64 = 18.0;
+/// The fast departure: the hover loop to [`FAST_HANDOVER_AGL_FT`], then the
+/// autopilot climbs at [`CLIMB_FPM`] with the collective on [`CLIMB_KTS`]
+/// (about Vy). The whole climb at the hover mode's 35 kt took 11 minutes to
+/// 4,800 ft over Samedan (2026-09-24). It is SHALLOWER over the ground than
+/// the slow climb (about 560 ft a mile against 860), so the arm picks it only
+/// where the probed ground allows (`climb_conflict`).
+pub const FAST_HANDOVER_AGL_FT: f64 = 500.0;
+pub const CLIMB_KTS: f64 = 75.0;
+pub const CLIMB_FPM: f64 = 800.0;
+/// Below this in the fast climb the power is not there: the climb eases to
+/// [`CLIMB_EASED_FPM`] rather than trade the speed away.
+const CLIMB_MIN_KTS: f64 = 55.0;
+const CLIMB_EASED_FPM: f64 = 400.0;
 /// The final: its path, its deceleration, the hover it ends in.
 const GLIDE_DEG: f64 = 6.0;
 const FINAL_DECEL_MPS2: f64 = 0.3;
@@ -83,6 +126,9 @@ const BUG_HYSTERESIS_DEG: f64 = 2.0;
 /// itself is ramped so an acceleration or a slow-down is gentle.
 #[derive(Debug, Clone, Copy)]
 pub struct SpeedLaw {
+    /// The collective's floor: [`COLLECTIVE_MIN`] in the cruise, higher on
+    /// the approach and the slow-down ([`APPROACH_COLLECTIVE_MIN`]).
+    floor: f64,
     cmd: f64,
     trim: f64,
     target_kts: f64,
@@ -93,12 +139,21 @@ const SPEED_KI_PER_KT_S: f64 = 0.0005;
 const COLLECTIVE_SLEW: f64 = 0.03;
 const COLLECTIVE_MIN: f64 = 0.25;
 const COLLECTIVE_MAX: f64 = 0.85;
+/// The collective's floor on the approach and the slow-down. At 0.25 the
+/// speed law cut it to nothing for a gate reached at 86 kt, the helicopter
+/// sank, the vertical-speed mode held the level with 15 degrees of nose-up,
+/// the speed fell to 25 kt, the law then drove the collective to 0.65 and it
+/// climbed: a growing cycle that tripped the 20 degree limit over a ridge
+/// (LILO-LILB, 2026-09-24). Near the power curve's 0.42 the pitch has less
+/// to hold and the cycle has nothing to swing on.
+const APPROACH_COLLECTIVE_MIN: f64 = 0.35;
 const ACCEL_KTS_S: f64 = 1.5;
 const DECEL_KTS_S: f64 = 1.0;
 
 impl SpeedLaw {
     pub fn from(collective: f64, ias_kts: f64) -> Self {
         Self {
+            floor: COLLECTIVE_MIN,
             cmd: collective,
             trim: collective,
             target_kts: ias_kts,
@@ -106,6 +161,12 @@ impl SpeedLaw {
     }
     pub fn target(&self) -> f64 {
         self.target_kts
+    }
+    pub fn cmd(&self) -> f64 {
+        self.cmd
+    }
+    pub fn set_floor(&mut self, floor: f64) {
+        self.floor = floor.clamp(COLLECTIVE_MIN, COLLECTIVE_MAX);
     }
     pub fn step(&mut self, want_kts: f64, ias_kts: f64, dt_s: f64) -> f64 {
         let dt = dt_s.clamp(0.05, 1.0);
@@ -116,9 +177,8 @@ impl SpeedLaw {
         } * dt;
         self.target_kts += (want_kts - self.target_kts).clamp(-step, step);
         let err = self.target_kts - ias_kts;
-        self.trim =
-            (self.trim + err * SPEED_KI_PER_KT_S * dt).clamp(COLLECTIVE_MIN, COLLECTIVE_MAX);
-        let want = (self.trim + err * SPEED_KP_PER_KT).clamp(COLLECTIVE_MIN, COLLECTIVE_MAX);
+        self.trim = (self.trim + err * SPEED_KI_PER_KT_S * dt).clamp(self.floor, COLLECTIVE_MAX);
+        let want = (self.trim + err * SPEED_KP_PER_KT).clamp(self.floor, COLLECTIVE_MAX);
         self.cmd += (want - self.cmd).clamp(-COLLECTIVE_SLEW * dt, COLLECTIVE_SLEW * dt);
         self.cmd
     }
@@ -158,6 +218,26 @@ pub fn sample_legs(line: &[(f64, f64)], step_m: f64) -> Vec<(f64, f64)> {
     }
     if let Some(last) = line.last() {
         out.push(*last);
+    }
+    out
+}
+
+/// Half-width of the corridor the cruise is sized over, m.
+pub const CORRIDOR_HALF_M: f64 = 1000.0;
+
+/// [`sample_legs`] plus a point `half_m` either side of the track at each
+/// sample: the ground a drift or a cut corner can reach. The track alone
+/// sized LSZS-LILO's cruise at 9,100 ft while the Forcola di Livigno wall
+/// stood at 9,069 ft 750 m off it and 9,528 ft at a kilometre (probed
+/// 2026-09-24): a valley route has its hazards beside the line, not on it.
+pub fn sample_corridor(line: &[(f64, f64)], step_m: f64, half_m: f64) -> Vec<(f64, f64)> {
+    let track = sample_legs(line, step_m);
+    let mut out = track.clone();
+    for w in track.windows(2) {
+        let brg = crate::nav::bearing_deg(w[0].0, w[0].1, w[1].0, w[1].1);
+        for side in [-90.0, 90.0] {
+            out.push(crate::nav::project_latlon(w[0].0, w[0].1, brg + side, half_m / 1852.0));
+        }
     }
     out
 }
@@ -217,10 +297,10 @@ pub fn approach_target_ft(d_m: f64, pad_ft: f64, gate_agl: f64, cruise_ft: f64) 
 
 /// Where the approach starts, m before the pad: the slow-down from the cruise
 /// speed to the approach speed, then the path from the cruise height.
-pub fn approach_start_m(cruise_ft: f64, pad_ft: f64, gate_agl: f64) -> f64 {
+pub fn approach_start_m(cruise_ft: f64, pad_ft: f64, gate_agl: f64, cruise_kts: f64) -> f64 {
     let above = (cruise_ft - pad_ft - gate_agl).max(0.0);
     let path_m = above / 3.28084 / APPROACH_DEG.to_radians().tan();
-    approach_slow_m(gate_agl) + path_m + decel_m(CRUISE_KTS, APPROACH_KTS)
+    approach_slow_m(gate_agl) + path_m + decel_m(cruise_kts, APPROACH_KTS)
 }
 
 /// The vertical-speed dial on the approach: the target's own descent rate
@@ -279,6 +359,102 @@ pub fn pick_pad(pads: &[(f64, f64, String)], inbound: (f64, f64)) -> Option<(f64
         .cloned()
 }
 
+/// The departure climb, as the hover loop flies it: level while it
+/// accelerates to [`hover::DEPART_CLIMB_MPS`], then [`DEPART_CLIMB_FPM`] at
+/// [`DEPART_MPS`] (the steeper climb at the slower speeds in between is
+/// margin). Feet over the field `d_nm` along the track.
+pub fn depart_climb_ft(d_nm: f64, fast: bool) -> f64 {
+    let level_nm = hover::DEPART_CLIMB_MPS.powi(2) / (2.0 * DEPART_ACCEL_MPS2) / 1852.0;
+    let slow_ft_per_nm = DEPART_CLIMB_FPM / (DEPART_MPS * 1.943_84 / 60.0);
+    let d = (d_nm - level_nm).max(0.0);
+    let hover_nm = FAST_HANDOVER_AGL_FT / slow_ft_per_nm;
+    if !fast || d <= hover_nm {
+        return d * slow_ft_per_nm;
+    }
+    // Planned at 15 % over the climb speed for true airspeed at height:
+    // a faster true airspeed is a shallower climb.
+    FAST_HANDOVER_AGL_FT + (d - hover_nm) * CLIMB_FPM / (CLIMB_KTS * 1.15 / 60.0)
+}
+/// The hover loop's speed ramp and departure climb rate (mirrors).
+const DEPART_ACCEL_MPS2: f64 = 0.4;
+const DEPART_CLIMB_FPM: f64 = 500.0;
+/// How far out the departure climb is checked against the ground, nm: past
+/// this it has gained more than any ridge in Europe asks.
+pub const CLIMB_CHECK_NM: f64 = 15.0;
+/// The clearance the departure climb must keep over probed ground, ft.
+pub const CLIMB_MARGIN_FT: f64 = 500.0;
+
+/// Probe stations along the first `max_nm` of `line`: (nm along, lat, lon),
+/// on the track and `half_m` either side.
+pub fn climb_stations(line: &[(f64, f64)], max_nm: f64, step_m: f64, half_m: f64) -> Vec<(f64, f64, f64)> {
+    let mut out = Vec::new();
+    let mut along = 0.0;
+    for w in line.windows(2) {
+        let seg = crate::nav::haversine_nm(w[0].0, w[0].1, w[1].0, w[1].1);
+        let brg = crate::nav::bearing_deg(w[0].0, w[0].1, w[1].0, w[1].1);
+        let n = ((seg * 1852.0 / step_m).ceil() as usize).max(1);
+        for i in 0..n {
+            let d = seg * i as f64 / n as f64;
+            if along + d > max_nm {
+                return out;
+            }
+            let (la, lo) = crate::nav::project_latlon(w[0].0, w[0].1, brg, d);
+            out.push((along + d, la, lo));
+            for side in [-90.0, 90.0] {
+                let (a, b) = crate::nav::project_latlon(la, lo, brg + side, half_m / 1852.0);
+                out.push((along + d, a, b));
+            }
+        }
+        along += seg;
+    }
+    out
+}
+
+/// The worst place the departure climb comes within [`CLIMB_MARGIN_FT`] of
+/// the probed ground: (nm along, ground ft, climb ft). `ground` is (nm along,
+/// ft MSL); `field_ft` where the climb starts. LILO-LILB (2026-09-24): the
+/// direct line leaves the Valtellina over a 7,728 ft ridge 4.3 nm out, and
+/// the climb would have been at about 4,600 there. The cruise was sized over
+/// the ridge; the climb to it never was.
+/// The margin is half the height the climb has gained, up to
+/// [`CLIMB_MARGIN_FT`]: a flat 500 ft refused every departure over a level
+/// valley floor, where 0.3 nm out the climb has only gained 220 ft (the LILO
+/// valley route, probed the same evening).
+pub fn climb_conflict(field_ft: f64, ground: &[(f64, f64)], fast: bool) -> Option<(f64, f64, f64)> {
+    ground
+        .iter()
+        .filter(|(d, _)| *d > 0.3)
+        .map(|&(d, g)| (d, g, field_ft + depart_climb_ft(d, fast)))
+        .filter(|(_, g, a)| *a < g + (0.5 * (a - field_ft)).min(CLIMB_MARGIN_FT))
+        .min_by(|x, y| (x.2 - x.1).total_cmp(&(y.2 - y.1)))
+}
+
+/// Where a helicopter lands at a field with no helipad: on the hard runway
+/// end nearest the arrival, [`RUNWAY_SPOT_M`] in from the threshold (never
+/// the reference point, which at LILB is 120 m off the strip in whatever is
+/// there). (lat, lon, name).
+pub fn runway_spot(apt: &crate::nav::AirportInfo, inbound: (f64, f64)) -> Option<(f64, f64, String)> {
+    let mut best: Option<(f64, (f64, f64, String))> = None;
+    for r in apt.runways.iter().filter(|r| r.is_hard()) {
+        let len_nm = crate::nav::haversine_nm(r.lat_a, r.lon_a, r.lat_b, r.lon_b);
+        let into = (RUNWAY_SPOT_M / 1852.0).min(len_nm / 2.0);
+        for (thr, far, id) in [
+            ((r.lat_a, r.lon_a), (r.lat_b, r.lon_b), &r.ident_a),
+            ((r.lat_b, r.lon_b), (r.lat_a, r.lon_a), &r.ident_b),
+        ] {
+            let d = crate::nav::haversine_nm(inbound.0, inbound.1, thr.0, thr.1);
+            if best.as_ref().is_none_or(|b| d < b.0) {
+                let brg = crate::nav::bearing_deg(thr.0, thr.1, far.0, far.1);
+                let (la, lo) = crate::nav::project_latlon(thr.0, thr.1, brg, into);
+                best = Some((d, (la, lo, format!("runway {id}"))));
+            }
+        }
+    }
+    best.map(|b| b.1)
+}
+const RUNWAY_SPOT_M: f64 = 150.0;
+
+
 /// A fix this close to the destination is a terminal fix (a field's VOR, an
 /// approach point): a helicopter goes direct to its pad instead. CEL lies
 /// past ETHC, and the route flew over the field to it and back, starting its
@@ -291,9 +467,16 @@ pub fn drop_terminal_fixes(mut points: Vec<(String, f64, f64)>) -> Vec<(String, 
     while points.len() >= 3 {
         let pad = points[points.len() - 1].clone();
         let fix = &points[points.len() - 2];
+        let prev = &points[points.len() - 3];
         let geo = Geo::new(pad.1);
         let d = dist((0.0, 0.0), geo.to_m((pad.1, pad.2), (fix.1, fix.2)));
-        if d < TERMINAL_FIX_M {
+        // Only a fix at or PAST the pad (farther from the leg before it than
+        // the pad is): one short of it is the pilot's way in. Dropping
+        // LILO-LILB's lake point sent the last leg over the hills east of
+        // Como, and the approach met 3,870 ft of ridge (2026-09-24).
+        let past = dist((0.0, 0.0), geo.to_m((prev.1, prev.2), (fix.1, fix.2)))
+            >= dist((0.0, 0.0), geo.to_m((prev.1, prev.2), (pad.1, pad.2)));
+        if d < TERMINAL_FIX_M && past {
             points.remove(points.len() - 2);
         } else {
             break;
@@ -384,6 +567,8 @@ pub fn corner_factor(pts: &[(f64, f64)], here: (f64, f64)) -> f64 {
 
 /// The look-ahead along a cleared route, m.
 const ROUTE_AHEAD_M: f64 = 25.0;
+/// The warning before a hover taxi lifts a helicopter off the ground, s.
+const LIFT_WARNING_S: f64 = 5.0;
 /// A route's taxi height: a hover taxi, above the ground cushion's worst.
 pub const ROUTE_TAXI_FT: f64 = 12.0;
 
@@ -420,11 +605,31 @@ async fn fly_park(
     let _detail = crate::auto_status::DetailGuard::hold(&DETAIL);
     let (path_ll, name, height) = match &target {
         ParkTarget::Route { path, via } => {
-            (path.clone(), format!("the stand via {via}"), ROUTE_TAXI_FT)
+            let name = if via.trim().is_empty() {
+                "the stand".to_string()
+            } else {
+                format!("the stand via {via}")
+            };
+            (path.clone(), name, ROUTE_TAXI_FT)
         }
     };
     if path_ll.is_empty() {
         return;
+    }
+    // A helicopter on the ground is never lifted without warning: said,
+    // then [`LIFT_WARNING_S`] for "my controls" to keep it where it is.
+    say(
+        &voice,
+        Priority::Advisory,
+        format!("Hover taxi to {name}. Lifting in five seconds. Say my controls to stay here."),
+    );
+    let wait = std::time::Instant::now();
+    while wait.elapsed().as_secs_f64() < LIFT_WARNING_S {
+        tokio::time::sleep(TICK).await;
+        if !ACTIVE.load(Ordering::SeqCst) {
+            crate::blackbox::record("heli_route", serde_json::json!({ "event": "park_declined" }));
+            return;
+        }
     }
     crate::blackbox::record(
         "heli_route",
@@ -504,9 +709,53 @@ async fn fly_park(
 pub struct Route {
     /// (ident, lat, lon), the destination's pad last.
     pub points: Vec<(String, f64, f64)>,
+    /// The last point is a published helipad: the flight ends there, shut
+    /// down, and never lifts again to taxi. A runway spot is vacated.
+    pub on_pad: bool,
+    /// The departure climbs fast (see [`FAST_HANDOVER_AGL_FT`]); the arm
+    /// sets it only where the probed ground allows.
+    pub fast_climb: bool,
     pub destination: String,
     /// The destination's staffed tower (apt.dat), for the inbound call.
     pub dest_tower_khz: Option<i64>,
+}
+
+/// The FMS's copy of the route (`xcopilot/fms/route`, then a load), so the
+/// GPS and the panel's Route tab show the plan the helicopter is flying: the
+/// pad goes in under the destination's ICAO, which is what fills the CDU's
+/// DEST. Best effort, like the follower's.
+async fn publish_fms(xp: &XPlaneClient, route: &Route, cruise_alt_ft: f64) {
+    let n = route.points.len();
+    let wps: Vec<crate::simbrief::Waypoint> = route
+        .points
+        .iter()
+        .enumerate()
+        .map(|(i, (id, lat, lon))| crate::simbrief::Waypoint {
+            ident: if i + 1 == n { route.destination.clone() } else { id.clone() },
+            lat: *lat,
+            lon: *lon,
+            alt: if i == 0 || i + 1 == n { 0.0 } else { cruise_alt_ft },
+        })
+        .collect();
+    let payload = crate::simbrief::fms_route_payload(&wps);
+    let ok = xp.set_data("xcopilot/fms/route", payload.as_bytes()).await.is_ok()
+        && xp.set_int("xcopilot/fms/load", 1).await.is_ok();
+    crate::blackbox::record(
+        "heli_route",
+        serde_json::json!({ "event": "fms_loaded", "waypoints": wps.len(), "ok": ok }),
+    );
+}
+
+/// The FMS's active entry to point `i` (the pad under the destination ICAO).
+async fn fms_goto(xp: &XPlaneClient, route: &Route, i: usize) {
+    let Some((id, lat, lon)) = route.points.get(i) else { return };
+    let ident = if i + 1 == route.points.len() { &route.destination } else { id };
+    let _ = xp
+        .set_data(
+            "xcopilot/fms/goto",
+            crate::procedure::fms_goto_payload(ident, *lat, *lon).as_bytes(),
+        )
+        .await;
 }
 
 /// How long the departure call waits for a clearance before going anyway
@@ -754,6 +1003,7 @@ pub fn start(
             return;
         };
         let xp = XPlaneClient::new(base_url.clone());
+        let on_pad = route.on_pad;
         let landed = rt.block_on(async {
             if !before_route(&xp, &voice, &config, &base_url, &collective, &ends).await {
                 return false;
@@ -768,7 +1018,16 @@ pub fn start(
             .await
         });
         ACTIVE.store(false, Ordering::SeqCst);
-        // Down at the destination: the aeroplanes' own taxi-in (the tower's
+        // Down on a helipad: that is where the flight ends, shut down. A
+        // pad landing is never lifted again to taxi: at LILO the helicopter
+        // rose off H1 unannounced for a stand and the pilot stopped it
+        // (2026-09-24).
+        if landed && on_pad {
+            crate::blackbox::record("heli_route", serde_json::json!({ "event": "pad_shutdown" }));
+            rt.block_on(crate::taxi_in::shut_down_at_stand(&xp, &config, &voice));
+            return;
+        }
+        // Down on a runway: the aeroplanes' own taxi-in (the tower's
         // clearance, then the hover taxi of its route).
         if landed && crate::mode::atc_enabled() && crate::party_line::home_tower_khz().is_some() {
             crate::blackbox::record("heli_route", serde_json::json!({ "event": "taxi_in" }));
@@ -954,12 +1213,13 @@ async fn fly(
         .unwrap_or(0.0);
     let ground_ft = alt0 - s0.agl_ft;
     // The cruise level is 1,000 ft over the HIGHEST ground on the route,
-    // probed along every leg at a kilometre's spacing before departure; the
+    // probed along every leg at a kilometre's spacing, and a kilometre either
+    // side of it (`sample_corridor`), before departure; the
     // departure field is only the floor of it. No terrain data (an old
     // plugin) keeps the departure-ground rule and says so in the log.
     let mut line: Vec<(f64, f64)> = vec![origin];
     line.extend(route.points.iter().map(|p| (p.1, p.2)));
-    let samples = sample_legs(&line, 1000.0);
+    let samples = sample_corridor(&line, 1000.0, CORRIDOR_HALF_M);
     let terrain_ft = crate::terrain::max_elevation_ft(&xp, &samples).await;
     let cruise_alt_ft = cruise_altitude_ft(ground_ft, terrain_ft);
     // The departure climbs to it on the radio height over the field; altitude
@@ -992,7 +1252,25 @@ async fn fly(
         serde_json::json!({ "event": "start", "points": route.points.iter().map(|p| &p.0).collect::<Vec<_>>(), "cruise_alt_ft": cruise_alt_ft, "terrain_ft": terrain_ft, "samples": samples.len() }),
     );
 
+    publish_fms(&xp, &route, cruise_alt_ft).await;
+    fms_goto(&xp, &route, 1).await;
+    say(
+        &voice,
+        Priority::Readback,
+        match terrain_ft {
+            Some(_) => format!("Cruise {}.", crate::flightplan::spoken_feet(cruise_alt_ft)),
+            None => format!(
+                "Cruise {}. I couldn't probe the ground on the route.",
+                crate::flightplan::spoken_feet(cruise_alt_ft)
+            ),
+        },
+    );
     let mut phase = Phase::Depart;
+    let mut climbing = false;
+    let mut cruise_speed = cruise_kts();
+    let mut capped_since: Option<std::time::Instant> = None;
+    let mut climb_eased = false;
+    let mut gate_leg: Option<usize> = None;
     let mut leg = 0usize;
     let mut law: Option<SpeedLaw> = None;
     let mut final_from: Option<(f64, f64)> = None;
@@ -1028,6 +1306,7 @@ async fn fly(
                     "heli_route",
                     serde_json::json!({ "event": "fix", "passed": pts[leg - 1].0, "next": pts[leg].0 }),
                 );
+                fms_goto(&xp, &route, leg).await;
             } else {
                 break;
             }
@@ -1059,7 +1338,12 @@ async fn fly(
                     speed_mps: DEPART_MPS,
                     track_deg: track,
                 });
-                if s.agl_ft > depart_agl_ft - 60.0 && s.gs > DEPART_MPS - 2.0 {
+                let handover_agl = if route.fast_climb {
+                    depart_agl_ft.min(FAST_HANDOVER_AGL_FT)
+                } else {
+                    depart_agl_ft
+                };
+                if s.agl_ft > handover_agl - 60.0 && s.gs > DEPART_MPS - 2.0 {
                     // The hand-over: the loop let go without the autopilot
                     // going off, then the cruise modes on what we are doing.
                     hover::release();
@@ -1102,11 +1386,35 @@ async fn fly(
                     }
                     law = Some(SpeedLaw::from(c, s.ias));
                     phase = Phase::Cruise;
-                    say(
-                        &voice,
-                        Priority::Readback,
-                        format!("Autopilot has it. Accelerating to {CRUISE_KTS:.0} knots, {ident} next."),
-                    );
+                    // The fast departure goes on up under the autopilot: the
+                    // cruise dial, vertical speed, altitude hold armed to
+                    // capture it (`recover_level`'s sequence, flown).
+                    let alt_now = xp
+                        .get_float("sim/cockpit2/gauges/indicators/altitude_ft_pilot")
+                        .await
+                        .ok();
+                    if route.fast_climb && alt_now.is_some_and(|a| a < cruise_alt_ft - 300.0) {
+                        descend_on_vs(&xp, cruise_alt_ft, CLIMB_FPM).await;
+                        climbing = true;
+                        crate::blackbox::record(
+                            "heli_route",
+                            serde_json::json!({ "event": "climb", "to_ft": cruise_alt_ft, "vs": CLIMB_FPM, "kts": CLIMB_KTS }),
+                        );
+                        say(
+                            &voice,
+                            Priority::Readback,
+                            format!(
+                                "Autopilot has it. Climbing to {} at {CLIMB_KTS:.0} knots, {ident} next.",
+                                crate::flightplan::spoken_feet(cruise_alt_ft)
+                            ),
+                        );
+                    } else {
+                        say(
+                            &voice,
+                            Priority::Readback,
+                            format!("Autopilot has it. Accelerating to {cruise_speed:.0} knots, {ident} next."),
+                        );
+                    }
                 }
             }
             Phase::Cruise | Phase::Approach | Phase::Slow => {
@@ -1153,7 +1461,7 @@ async fn fly(
                 let remaining = remaining_m(here, &pts_m, leg);
                 if phase == Phase::Cruise {
                     match pad_ft {
-                        Some(pad) if remaining < approach_start_m(cruise_alt_ft, pad, GATE_FT) => {
+                        Some(pad) if remaining < approach_start_m(cruise_alt_ft, pad, GATE_FT, cruise_speed) => {
                             // The gate clears the ground still to be crossed,
                             // probed now along what is left of the route; a
                             // failed probe falls back on the whole route's.
@@ -1164,12 +1472,13 @@ async fn fly(
                                     .map(|p| (p.1, p.2)),
                             );
                             let ahead =
-                                crate::terrain::max_elevation_ft(&xp, &sample_legs(&rest, 500.0))
+                                crate::terrain::max_elevation_ft(&xp, &sample_corridor(&rest, 500.0, CORRIDOR_HALF_M))
                                     .await
                                     .or(terrain_ft);
                             let floor = ahead.map(|f| f + ind_offset_ft.unwrap_or(0.0));
                             let g = gate_agl_ft(pad, floor);
                             gate = Some((pad, g));
+                            gate_leg = Some(leg);
                             level_ft = pad + g;
                             phase = Phase::Approach;
                             crate::blackbox::record(
@@ -1185,7 +1494,7 @@ async fn fly(
                                 call_inbound(&base_url, khz);
                             }
                         }
-                        None if remaining < slow_start_m(CRUISE_KTS, depart_agl_ft) => {
+                        None if remaining < slow_start_m(cruise_speed, depart_agl_ft) => {
                             phase = Phase::Slow;
                             crate::blackbox::record(
                                 "heli_route",
@@ -1201,6 +1510,34 @@ async fn fly(
                             }
                         }
                         _ => {}
+                    }
+                }
+                // Each fix passed on the approach: the ground still ahead is
+                // probed again, and a gate held up for ground now behind us
+                // comes down (LILO: 1,874 ft over the pad for a 2,426 ft bump
+                // already passed, 5.3 km of final at hover speeds).
+                if phase == Phase::Approach && gate_leg.is_some_and(|l| l != leg) {
+                    gate_leg = Some(leg);
+                    if let Some((pad, g)) = gate {
+                        let mut rest = vec![(s.lat, s.lon)];
+                        rest.extend(
+                            route.points[leg.min(route.points.len())..]
+                                .iter()
+                                .map(|p| (p.1, p.2)),
+                        );
+                        if let Some(ahead) =
+                            crate::terrain::max_elevation_ft(&xp, &sample_corridor(&rest, 500.0, CORRIDOR_HALF_M)).await
+                        {
+                            let ng = gate_agl_ft(pad, Some(ahead + ind_offset_ft.unwrap_or(0.0)));
+                            if ng < g - 50.0 {
+                                gate = Some((pad, ng));
+                                level_ft = pad + ng;
+                                crate::blackbox::record(
+                                    "heli_route",
+                                    serde_json::json!({ "event": "gate_lowered", "from": g, "to": ng, "leg": leg }),
+                                );
+                            }
+                        }
                     }
                 }
                 if phase == Phase::Approach {
@@ -1275,12 +1612,63 @@ async fn fly(
                     vs_cmd = Some(vs);
                     target_alt = Some(target.round());
                 }
+                // The fast climb ends at the level (captured, or within
+                // 150 ft); until then the collective holds the climb speed,
+                // and a speed the power cannot keep eases the climb once.
+                if climbing {
+                    let captured = alt_hold.is_some_and(|a| a > 1.5)
+                        || alt_now.as_ref().is_ok_and(|a| *a > cruise_alt_ft - 150.0);
+                    if captured {
+                        climbing = false;
+                        crate::blackbox::record(
+                            "heli_route",
+                            serde_json::json!({ "event": "climb_done", "alt": alt_now.as_ref().ok() }),
+                        );
+                    } else if !climb_eased && s.ias < CLIMB_MIN_KTS && s.ias > 1.0 {
+                        climb_eased = true;
+                        let _ = xp
+                            .set_float("sim/cockpit2/autopilot/vvi_dial_fpm", CLIMB_EASED_FPM)
+                            .await;
+                        crate::blackbox::record(
+                            "heli_route",
+                            serde_json::json!({ "event": "climb_eased", "ias": s.ias, "vs": CLIMB_EASED_FPM }),
+                        );
+                    }
+                }
                 let want = match phase {
                     Phase::Slow => HANDOVER_KTS,
                     Phase::Approach => APPROACH_KTS,
-                    _ => CRUISE_KTS,
+                    _ if climbing => CLIMB_KTS,
+                    _ => cruise_speed,
                 };
+                // Level in the cruise with the collective pinned at its cap:
+                // the speed the power makes becomes the cruise, said once.
+                if phase == Phase::Cruise && !climbing {
+                    let capped = law.as_ref().is_some_and(|l| collective_capped(l.cmd()));
+                    match (capped, capped_since) {
+                        (true, None) => capped_since = Some(std::time::Instant::now()),
+                        (true, Some(t)) if t.elapsed().as_secs_f64() > POWER_LIMIT_S => {
+                            let k = power_limited_kts(s.ias);
+                            if k < cruise_speed {
+                                cruise_speed = k;
+                                crate::blackbox::record(
+                                    "heli_route",
+                                    serde_json::json!({ "event": "power_limited", "ias": s.ias, "cruise_kts": k }),
+                                );
+                                say(&voice, Priority::Advisory, format!("Power limited. Cruising at {k:.0} knots."));
+                            }
+                            capped_since = None;
+                        }
+                        (false, _) => capped_since = None,
+                        _ => {}
+                    }
+                }
                 if let Some(l) = law.as_mut() {
+                    l.set_floor(if matches!(phase, Phase::Approach | Phase::Slow) {
+                        APPROACH_COLLECTIVE_MIN
+                    } else {
+                        COLLECTIVE_MIN
+                    });
                     let c = l.step(want, s.ias, dt);
                     let _ = xp.set_float_index(&collective, 0, c).await;
                     if tick_n % 4 == 0 {
@@ -1301,8 +1689,12 @@ async fn fly(
                     }
                     _ => true,
                 };
+                // Slowed is enough on its own: the hover loop is what holds
+                // a helicopter at these speeds, and waiting for the gate's
+                // height kept the cycle above going over the ridge.
+                let slowed = s.ias < HANDOVER_KTS + 2.0;
                 if phase == Phase::Slow
-                    && at_gate
+                    && (at_gate || slowed)
                     && s.ias < HANDOVER_KTS + 2.0
                     && s.gs < hover::TAKEOVER_MAX_MPS
                 {
@@ -1421,7 +1813,7 @@ mod tests {
             let pad = 100.0;
             let cruise = pad + case.cruise_agl;
             let g = gate_agl_ft(pad, case.ridge_ft.map(|r| pad + r));
-            let start = approach_start_m(cruise, pad, GATE_FT);
+            let start = approach_start_m(cruise, pad, GATE_FT, CRUISE_KTS);
             let slow_at = approach_slow_m(g);
             let dt = 0.5;
             let (mut d, mut ias, mut alt) = (start, CRUISE_KTS, cruise);
@@ -1518,7 +1910,7 @@ mod tests {
         );
         // It starts where the path from the cruise meets the level, plus the
         // slow-down to the approach speed.
-        let start = approach_start_m(cruise, pad, GATE_FT);
+        let start = approach_start_m(cruise, pad, GATE_FT, CRUISE_KTS);
         assert!(start > slow + decel_m(CRUISE_KTS, APPROACH_KTS));
         // The final from the gate begins on its own path.
         assert!((final_command(final_len_m(GATE_FT), GATE_FT, 19.5).1 - GATE_FT).abs() < 60.0);
@@ -1612,6 +2004,13 @@ mod tests {
             p("PAD", 52.594, 10.028),
         ];
         assert_eq!(drop_terminal_fixes(far.clone()).len(), 3);
+        // LILO-LILB: the lake point short of LILB is the way in, kept.
+        let lake = vec![
+            p("4553N00909E", 45.8833, 9.15),
+            p("4550N00905E", 45.8333, 9.0833),
+            p("LILB runway 21", 45.7706, 9.1628),
+        ];
+        assert_eq!(drop_terminal_fixes(lake).len(), 3);
         let pts = [(0.0, 1000.0), (1000.0, 1000.0), (1000.0, 0.0)];
         assert!((remaining_m((0.0, 0.0), &pts, 0) - 3000.0).abs() < 1e-6);
         assert!((remaining_m((1000.0, 500.0), &pts, 2) - 500.0).abs() < 1e-6);
@@ -1644,6 +2043,88 @@ mod tests {
     }
 
     #[test]
+    fn a_departure_climb_into_a_ridge_is_found_with_its_numbers() {
+        // 500 fpm at 35 kt is about 857 ft a mile after an 80 m level run.
+        assert!((depart_climb_ft(4.3, false) - 3_650.0).abs() < 60.0, "{}", depart_climb_ft(4.3, false));
+        // The fast climb: the same to 500 ft, then about 560 ft a mile.
+        assert_eq!(depart_climb_ft(0.5, true), depart_climb_ft(0.5, false));
+        let f = depart_climb_ft(4.3, true);
+        assert!(f < depart_climb_ft(4.3, false) && (f - 2_500.0).abs() < 150.0, "{f}");
+        // LILO-LILB, probed 2026-09-24: 946 ft field, the ridge 7,728 at 4.3 nm.
+        let ground = [(1.1, 2_360.0), (3.3, 6_619.0), (4.3, 7_728.0), (5.4, 4_730.0)];
+        let (d, g, a) = climb_conflict(946.0, &ground, false).expect("into the ridge");
+        assert_eq!((d, g), (4.3, 7_728.0));
+        assert!(a < 5_000.0, "{a}");
+        // Up a valley (LSZS, the Engadin): nothing.
+        let valley = [(1.0, 5_700.0), (2.5, 6_638.0), (6.0, 6_100.0)];
+        assert!(climb_conflict(5_600.0, &valley, false).is_none());
+        // The LILO valley route: a level floor right off the pad is no
+        // conflict (0.3 nm: 954 ft ground, the climb at about 1,170).
+        let floor = [(0.35, 954.0), (1.0, 1_047.0), (3.0, 948.0)];
+        assert!(climb_conflict(946.0, &floor, true).is_none());
+    }
+
+    #[test]
+    fn climb_stations_stop_at_the_distance_and_carry_both_sides() {
+        let line = [(46.0, 9.0), (46.0, 9.5)];
+        let s = climb_stations(&line, 2.0, 500.0, 500.0);
+        assert!(s.iter().all(|p| p.0 <= 2.0));
+        assert_eq!(s.len() % 3, 0);
+        assert!((s[1].1 - 46.0).abs() > 0.004, "a side point is off the track");
+    }
+
+    #[test]
+    fn no_helipad_lands_on_the_runway_near_the_arrival() {
+        let apt = crate::nav::AirportInfo {
+            name: "Alzate Brianza".into(),
+            elev_ft: 1_258.0,
+            runways: vec![crate::nav::Runway {
+                ident_a: "03".into(),
+                ident_b: "21".into(),
+                lat_a: 45.7671573,
+                lon_a: 9.1605458,
+                lat_b: 45.7720916,
+                lon_b: 9.1636892,
+                width_m: 15.0,
+                surface: 1,
+            }],
+            freqs: Vec::new(),
+        };
+        // Arriving from the north-east (Lake Como): runway 21's end.
+        let (la, lo, name) = runway_spot(&apt, (45.85, 9.25)).expect("a spot");
+        assert_eq!(name, "runway 21");
+        let from_thr = crate::nav::haversine_nm(45.7720916, 9.1636892, la, lo) * 1852.0;
+        assert!((from_thr - 150.0).abs() < 5.0, "{from_thr}");
+        let mut grass = apt.clone();
+        grass.runways[0].surface = 3;
+        assert!(runway_spot(&grass, (45.85, 9.25)).is_none(), "no hard runway, no spot");
+    }
+
+    #[test]
+    fn the_cruise_is_the_airframes_and_settles_where_the_power_runs_out() {
+        assert_eq!(power_limited_kts(131.7), 130.0);
+        assert_eq!(power_limited_kts(52.0), APPROACH_KTS, "never under the approach speed");
+        assert!(collective_capped(0.85) && collective_capped(0.846) && !collective_capped(0.83));
+    }
+
+    #[test]
+    fn the_approach_collective_never_drops_to_nothing() {
+        // The LILO-LILB gate: 86 kt against a 70 kt target.
+        let mut l = SpeedLaw::from(0.40, 86.0);
+        l.set_floor(APPROACH_COLLECTIVE_MIN);
+        let mut c = 0.4;
+        for _ in 0..60 {
+            c = l.step(70.0, 86.0, 0.5);
+        }
+        assert!((c - APPROACH_COLLECTIVE_MIN).abs() < 1e-9, "{c}");
+        let mut cruise = SpeedLaw::from(0.40, 86.0);
+        for _ in 0..60 {
+            c = cruise.step(70.0, 86.0, 0.5);
+        }
+        assert!(c < 0.3, "the cruise floor stays 0.25: {c}");
+    }
+
+    #[test]
     fn the_cruise_clears_the_highest_ground_on_the_route() {
         assert_eq!(cruise_altitude_ft(187.0, Some(256.0)), 1300.0);
         assert_eq!(cruise_altitude_ft(187.0, Some(1500.0)), 2500.0);
@@ -1652,6 +2133,13 @@ mod tests {
         let s = sample_legs(&line, 1000.0);
         assert!(s.len() >= 7 && s.len() <= 9, "{}", s.len());
         assert_eq!(*s.last().unwrap(), (52.0, 9.1));
+        // The corridor: the track plus both sides, a kilometre out.
+        let c = sample_corridor(&line, 1000.0, 1000.0);
+        assert_eq!(c.len(), s.len() + 2 * (s.len() - 1));
+        let north = c.iter().map(|p| p.0).fold(f64::MIN, f64::max);
+        let south = c.iter().map(|p| p.0).fold(f64::MAX, f64::min);
+        assert!(((north - 52.0) * 60.0 * 1852.0 - 1000.0).abs() < 20.0, "{north}");
+        assert!(((52.0 - south) * 60.0 * 1852.0 - 1000.0).abs() < 20.0, "{south}");
     }
 
     #[test]

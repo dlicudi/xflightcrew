@@ -787,6 +787,17 @@ pub fn pivot_brake_split(steer: f64, gs_kts: f64) -> (f64, f64) {
     }
 }
 const PIVOT_MIN_ERR_DEG: f64 = 60.0;
+
+/// Whether a castoring nosewheel's turn is a PIVOT: a join past
+/// [`PIVOT_MIN_ERR_DEG`], or ANY error that big at a pace under the taxi
+/// split's full authority. The pace cap slows the aircraft exactly when the
+/// error is large, and under [`BRAKE_STEER_MIN_KTS`] the taxi split is zero:
+/// the SR22 swung left through the LSZS 03 lead-on, the error ran 37 to 130
+/// degrees at 3 kt with full right steer and no brake at all, and it rolled
+/// 25 m off the line into a give-up (2026-09-24).
+pub fn pivot_due(err_deg: f64, gs_kts: f64, joining: bool) -> bool {
+    err_deg.abs() > PIVOT_MIN_ERR_DEG && (joining || gs_kts < BRAKE_STEER_FULL_KTS)
+}
 const PIVOT_BRAKE_MAX: f64 = 0.45;
 
 /// Steering held while still rolling, even after the distance fade has run
@@ -1877,7 +1888,7 @@ async fn drive(xp: XPlaneClient, voice: Option<Voice>, route: Route, base_kts: f
         // three. The 2026-07-28 lesson was about sequential awaits dragging
         // the loop to a second, not about the number of writes.)
         let (bl, br) = if route.pace.brake_steer {
-            let pivot = join_allow.unwrap_or(0.0) > 0.0 && err.abs() > PIVOT_MIN_ERR_DEG;
+            let pivot = pivot_due(err, gs_kts, join_allow.unwrap_or(0.0) > 0.0);
             let (wl, wr) = if pivot {
                 pivot_brake_split(steer, gs_kts)
             } else {
@@ -3359,5 +3370,15 @@ mod tests {
         assert!(l < 0.1, "{l}");
         assert!((pl - 0.45).abs() < 1e-9 && pr == 0.0, "{pl}");
         assert_eq!(super::pivot_brake_split(-1.0, 0.5), (0.0, 0.0), "not while stopped");
+    }
+
+    #[test]
+    fn a_big_error_at_walking_pace_pivots_off_a_join_too() {
+        // LSZS 03 lead-on: err 63 at 3.9 kt, steer 0.99, no brake.
+        assert!(super::pivot_due(63.0, 3.9, false));
+        assert!(super::brake_steer_split(0.99, 3.9) == (0.0, 0.0), "the starved split");
+        assert!(!super::pivot_due(63.0, 9.0, false), "a taxi corner at pace keeps the taxi split");
+        assert!(!super::pivot_due(30.0, 3.0, false));
+        assert!(super::pivot_due(-70.0, 9.0, true), "a join as before");
     }
 }

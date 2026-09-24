@@ -97,7 +97,19 @@ static CUT_GEN: [std::sync::atomic::AtomicU64; 2] = [
 /// detects a cut that landed while the process was spawning, and rides the
 /// hang watchdog. One speaker thread per channel, so one slot per channel is
 /// the whole story.
-fn run_audible(mut cmd: Command, what: &str) -> Result<()> {
+fn run_audible(cmd: Command, what: &str) -> Result<()> {
+    // A test never talks out loud: the voice tests queue real lines ("cleared
+    // to land", "station line still queued") through real speaker threads,
+    // and every `cargo test` played them into the cockpit mid-flight
+    // (2026-09-24). What reaches this point has already been queued, routed
+    // and gated, which is all a test asserts.
+    if cfg!(test) {
+        return Ok(());
+    }
+    spawn_audible(cmd, what)
+}
+
+fn spawn_audible(mut cmd: Command, what: &str) -> Result<()> {
     use std::sync::atomic::Ordering::SeqCst;
     let ch = thread_channel() as usize;
     let gen = CUT_GEN[ch].load(SeqCst);

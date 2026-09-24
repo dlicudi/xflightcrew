@@ -870,35 +870,121 @@ protected:
             AppendLog("COPILOT", COL_GREEN, "Flight plan sent to the FMS.");
         }
         const int active_row = buildActiveFix();
-        if (ImGui::BeginTable("route", 4,
+        buildFlightPlanTable(route_pts, active_row);
+    }
+
+    // The flight plan page, G1000 FPL style: per waypoint the desired track
+    // (magnetic) and length of the leg INTO it, the distance still to fly to
+    // it along the route, the time to it at the present groundspeed, and the
+    // planned altitude. Flown legs are dim; the active leg is magenta and
+    // measured live from the aircraft; the rest are the plan's own legs
+    // summed onward from there.
+    void buildFlightPlanTable(const std::vector<RoutePoint>& pts, int active) {
+        static XPLMDataRef lat_ref = XPLMFindDataRef("sim/flightmodel/position/latitude");
+        static XPLMDataRef lon_ref = XPLMFindDataRef("sim/flightmodel/position/longitude");
+        static XPLMDataRef gs_ref = XPLMFindDataRef("sim/flightmodel/position/groundspeed");
+        const double lat = lat_ref ? XPLMGetDatad(lat_ref) : 0.0;
+        const double lon = lon_ref ? XPLMGetDatad(lon_ref) : 0.0;
+        const double kts = gs_ref ? XPLMGetDataf(gs_ref) * 1.94384 : 0.0;
+        const bool live = active >= 0 && lat_ref && lon_ref;
+        const size_t n = pts.size();
+        auto mag = [](double true_deg) {
+            int d = static_cast<int>(XPLMDegTrueToDegMagnetic(static_cast<float>(true_deg)) + 0.5f) % 360;
+            return d <= 0 ? d + 360 : d;
+        };
+        // Leg i runs from point i-1 to point i (leg 0 has none), and the
+        // distance still to fly to each point: live from the aircraft to the
+        // active point, then leg by leg. -1 = behind us / unknown.
+        std::vector<double> leg_nm(n, 0.0), rem_nm(n, -1.0);
+        std::vector<int> leg_dtk(n, -1);
+        double total = 0.0;
+        for (size_t i = 1; i < n; ++i) {
+            leg_nm[i] = fms::distance_nm(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon);
+            leg_dtk[i] = mag(fms::bearing_true_deg(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon));
+            total += leg_nm[i];
+        }
+        if (live) {
+            double acc = fms::distance_nm(lat, lon, pts[active].lat, pts[active].lon);
+            rem_nm[active] = acc;
+            for (size_t i = active + 1; i < n; ++i) {
+                acc += leg_nm[i];
+                rem_nm[i] = acc;
+            }
+        }
+        // Summary: the plan's length, what is left, and the time to go.
+        const double to_go = live ? rem_nm[n - 1] : total;
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "TOTAL");
+        ImGui::SameLine();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE), "%.0f nm", total);
+        if (live) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "   TO GO");
+            ImGui::SameLine();
+            ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE), "%.0f nm", to_go);
+            if (kts > 30.0) {
+                const int mins = static_cast<int>(to_go / kts * 60.0 + 0.5);
+                ImGui::SameLine();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "   ETE");
+                ImGui::SameLine();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_WHITE), "%d:%02d", mins / 60, mins % 60);
+            }
+        }
+        static int scrolled_to = -2;
+        if (ImGui::BeginTable("route", 6,
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_BordersInnerV)) {
+            const float num = ImGui::CalcTextSize("0000.0").x;
             ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 28.0f);
-            ImGui::TableSetupColumn("IDENT");
-            ImGui::TableSetupColumn("ALT", ImGuiTableColumnFlags_WidthFixed, 60.0f);
-            ImGui::TableSetupColumn("POSITION");
+            ImGui::TableSetupColumn("WAYPOINT");
+            ImGui::TableSetupColumn("DTK", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("DTK ").x);
+            ImGui::TableSetupColumn("DIS", ImGuiTableColumnFlags_WidthFixed, num);
+            ImGui::TableSetupColumn("REM", ImGuiTableColumnFlags_WidthFixed, num);
+            ImGui::TableSetupColumn("ETE", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("00:00").x);
+            ImGui::TableSetupColumn("ALT", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("00000").x);
             ImGui::TableHeadersRow();
-            for (size_t i = 0; i < route_pts.size(); ++i) {
-                const RoutePoint& p = route_pts[i];
-                bool endpoint = (i == 0 || i + 1 == route_pts.size());
-                ImU32 col = static_cast<int>(i) == active_row
-                                ? COL_GREEN
-                                : (endpoint ? COL_CYAN : COL_WHITE);
+            for (size_t i = 0; i < n; ++i) {
+                const RoutePoint& p = pts[i];
+                const int row = static_cast<int>(i);
+                const bool flown = live && row < active;
+                const bool is_active = row == active;
+                const bool endpoint = (i == 0 || i + 1 == n);
+                const ImU32 col = is_active ? COL_MAGENTA
+                                  : flown   ? COL_DIM
+                                  : endpoint ? COL_CYAN
+                                             : COL_WHITE;
+                const ImVec4 c = ImGui::ColorConvertU32ToFloat4(col);
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM), "%d",
-                                   static_cast<int>(i + 1));
-                ImGui::TableNextColumn();
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%s",
+                if (is_active && scrolled_to != active) {
+                    ImGui::SetScrollHereY(0.3f);
+                    scrolled_to = active;
+                }
+                ImGui::TextColored(c, "%s%s", is_active ? "> " : "  ",
                                    p.ident.empty() ? "(pos)" : p.ident.c_str());
-                ImGui::TableNextColumn();
-                if (p.alt > 0) {
-                    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(col), "%d", p.alt);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%.4f, %.4f", p.lat, p.lon);
+                }
+                // The active leg is flown from where we ARE: its track and
+                // distance are the aircraft's, as the G1000 shows them.
+                int dtk = leg_dtk[i];
+                double dis = leg_nm[i];
+                if (is_active && live) {
+                    dtk = mag(fms::bearing_true_deg(lat, lon, p.lat, p.lon));
+                    dis = rem_nm[i];
                 }
                 ImGui::TableNextColumn();
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(COL_DIM),
-                                   "%.4f, %.4f", p.lat, p.lon);
+                if (dtk >= 0) ImGui::TextColored(c, "%03d", dtk);
+                ImGui::TableNextColumn();
+                if (i > 0 || is_active) ImGui::TextColored(c, "%.1f", dis);
+                ImGui::TableNextColumn();
+                if (rem_nm[i] >= 0.0) ImGui::TextColored(c, "%.0f", rem_nm[i]);
+                ImGui::TableNextColumn();
+                if (rem_nm[i] >= 0.0 && kts > 30.0) {
+                    const int mins = static_cast<int>(rem_nm[i] / kts * 60.0 + 0.5);
+                    ImGui::TextColored(c, "%d:%02d", mins / 60, mins % 60);
+                }
+                ImGui::TableNextColumn();
+                if (p.alt > 0) ImGui::TextColored(c, "%d", p.alt);
             }
             ImGui::EndTable();
         }

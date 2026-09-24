@@ -188,6 +188,52 @@ pub struct Waypoint {
     pub alt: f64,
 }
 
+/// The ICAO lat/lon points of a route string, in order, at `alt_ft`:
+/// "4610N00944E" (degrees and minutes) or "46N009E" (whole degrees). Any
+/// other token (an airway, a named fix, DCT) is skipped: without nav data it
+/// has no position.
+pub fn latlon_waypoints(route: &str, alt_ft: f64) -> Vec<Waypoint> {
+    route
+        .split_whitespace()
+        .filter_map(|tok| {
+            let b = tok.as_bytes();
+            let (lat_len, lon_len, minutes) = match b.len() {
+                11 => (4, 5, true),
+                7 => (2, 3, false),
+                _ => return None,
+            };
+            let (ns, ew) = (b[lat_len] as char, b[lat_len + 1 + lon_len] as char);
+            if !matches!(ns, 'N' | 'S') || !matches!(ew, 'E' | 'W') {
+                return None;
+            }
+            let lat_s = &tok[..lat_len];
+            let lon_s = &tok[lat_len + 1..lat_len + 1 + lon_len];
+            if !lat_s.bytes().chain(lon_s.bytes()).all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let deg = |s: &str, d: usize| -> f64 {
+                let whole: f64 = s[..d].parse().unwrap_or(0.0);
+                let mins: f64 = if minutes { s[d..].parse().unwrap_or(0.0) } else { 0.0 };
+                whole + mins / 60.0
+            };
+            let mut lat = deg(lat_s, 2);
+            let mut lon = deg(lon_s, 3);
+            if ns == 'S' {
+                lat = -lat;
+            }
+            if ew == 'W' {
+                lon = -lon;
+            }
+            (lat.abs() <= 90.0 && lon.abs() <= 180.0).then(|| Waypoint {
+                ident: tok.to_string(),
+                lat,
+                lon,
+                alt: alt_ft,
+            })
+        })
+        .collect()
+}
+
 /// Fetch and parse the user's latest SimBrief OFP. `Err` if the id is empty, the
 /// request fails, or SimBrief has no plan for the user.
 pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
@@ -238,6 +284,20 @@ pub async fn fetch(user_id: &str) -> Result<FlightPlan> {
     // airport already; the origin is missing (the route starts at the first SID
     // fix), so prepend it.
     let mut waypoints = parse_waypoints(&v);
+    // SimBrief sometimes keeps a route string it never built into a navlog:
+    // LILO-LILB's fourteen lat/lon points came back with an empty navlog and
+    // the direct distance, and the helicopter was checked on the direct line
+    // over a ridge (2026-09-24). A lat/lon point needs no nav data, so the
+    // route is read from the string itself.
+    if waypoints.is_empty() {
+        waypoints = latlon_waypoints(&s("/general/route"), n("/general/initial_altitude"));
+        if !waypoints.is_empty() {
+            tracing::warn!(
+                n = waypoints.len(),
+                "simbrief navlog empty; route read from its lat/lon points"
+            );
+        }
+    }
     let o_lat = n("/origin/pos_lat");
     let o_lon = n("/origin/pos_long");
     if !origin.is_empty() && (o_lat != 0.0 || o_lon != 0.0) {
@@ -483,6 +543,20 @@ fn num_of(v: &Value) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_route_simbrief_never_built_is_read_from_its_lat_lon_points() {
+        let w = super::latlon_waypoints(
+            "DCT 4610N00944E 4608N00934E UL9 BIG 46N009E 3330S07040W",
+            4000.0,
+        );
+        let got: Vec<(&str, f64, f64)> = w.iter().map(|w| (w.ident.as_str(), w.lat, w.lon)).collect();
+        assert_eq!(got.len(), 4);
+        assert!((got[0].1 - (46.0 + 10.0 / 60.0)).abs() < 1e-9 && (got[0].2 - (9.0 + 44.0 / 60.0)).abs() < 1e-9);
+        assert_eq!((got[2].1, got[2].2), (46.0, 9.0));
+        assert!(got[3].1 < -33.4 && got[3].2 < -70.6, "south and west");
+        assert!(w.iter().all(|w| w.alt == 4000.0));
+    }
+
     use super::*;
 
     /// The load sheet as the fetcher sends it (LXGB-LEAX in the 172,

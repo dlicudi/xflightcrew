@@ -769,6 +769,27 @@ pub fn flight_plan_request(t: &str) -> bool {
     flight_plan_call(&normalize(t)).is_some()
 }
 
+/// Is this an ask to check the whole plan before flying it (`plan_audit`)?
+/// CLOSED shape: a checking word and a plan word, as WORDS ("checklist" is
+/// not "check"): "check the flight plan", "is the plan safe", "any problems
+/// with the route", "can this aircraft do the plan", "is the aircraft
+/// suitable for this flight plan". Never "fly the flight plan".
+pub fn plan_check_request(t: &str) -> bool {
+    let t = normalize(t);
+    let words: Vec<&str> = t
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has = |w: &str| words.contains(&w);
+    let checking = ["check", "verify", "validate", "audit", "safe", "suitable", "problems",
+        "problem", "issues", "concerns", "feasible", "workable"]
+        .iter()
+        .any(|w| has(w))
+        || (has("can") && (has("aircraft") || has("we")) && (has("do") || has("make")));
+    let plan = has("plan") || has("route") || has("flight");
+    checking && plan && !has("fly") && !has("load") && !has("checklist")
+}
+
 /// Is this the load-sheet request ("load the aircraft", "set the fuel and
 /// payload from the plan")? The main loop asks before its FMS-load branch,
 /// whose "load ... plan" shape these words also have.
@@ -4130,4 +4151,27 @@ mod tests {
         // None and did nothing, silently (EGHI, 2026-08-02).
         assert_eq!(one("my controls").unwrap().0, "autopilot_off");
     }
+    #[test]
+    fn a_plan_check_is_its_own_ask() {
+        for yes in [
+            "check the flight plan",
+            "Is the plan safe?",
+            "any problems with the route",
+            "is the aircraft suitable for this flight plan",
+            "can this aircraft do the plan",
+            "verify the route please",
+        ] {
+            assert!(plan_check_request(yes), "{yes}");
+        }
+        for no in [
+            "fly the flight plan",
+            "load the flight plan",
+            "before takeoff checklist",
+            "what's the flight plan",
+            "check the flaps",
+        ] {
+            assert!(!plan_check_request(no), "{no}");
+        }
+    }
+
 }

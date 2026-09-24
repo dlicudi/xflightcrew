@@ -529,6 +529,11 @@ impl FullAuto {
             ),
             None => why,
         })?;
+        // Clamped before the drain: a resume inside the arrival still owes
+        // the restrictions ahead, and the profile rule runs from the STAR's
+        // first fix.
+        let (arrival_constraints, _) =
+            crate::plan_audit::arrival_restrictions(&ctx.config.cifp_dir, &fp, &mut legs);
         legs.drain(..index);
         let first = legs.first().unwrap();
         let fix = first.fix.as_ref().unwrap();
@@ -617,6 +622,7 @@ impl FullAuto {
                 dest_icao: fp.destination.clone(),
                 dest_name: fp.destination,
                 climb_minimums: Vec::new(),
+                arrival_constraints,
                 departure_rwy: None,
                 legs,
                 fms_payload: payload,
@@ -761,12 +767,14 @@ impl FullAuto {
             None
         };
 
-        let legs = crate::procedure::enroute_legs(
+        let mut legs = crate::procedure::enroute_legs(
             &fp.waypoints,
             &fp.origin,
             &fp.destination,
             fp.cruise_alt_ft,
         );
+        let (arrival_constraints, arrival_line) =
+            crate::plan_audit::arrival_restrictions(&ctx.config.cifp_dir, &fp, &mut legs);
         if legs.is_empty() {
             return Err(format!(
                 "Your plan to {} has no enroute waypoints I can fly. Generate it with a route.",
@@ -879,6 +887,40 @@ impl FullAuto {
         );
         let preflight = preflight?;
 
+        // The whole flight, dry-run before anything moves: is this aircraft
+        // fit for this plan, does the climb clear the ground here, does the
+        // route sit under the grid's safe altitudes, can the STAR's
+        // restrictions be made (`plan_audit`). A refusal names the numbers;
+        // cautions ride the ack.
+        let audit_xp = crate::xplane::XPlaneClient::new(ctx.config.xplane_base_url.clone());
+        let suit = crate::plan_audit::gather_suitability(
+            &audit_xp,
+            &fp,
+            origin_apt.as_ref(),
+            dest_apt.as_ref(),
+        )
+        .await;
+        let audit = crate::plan_audit::check(
+            &audit_xp,
+            &ctx.config.fix_data_path,
+            &fp,
+            &legs,
+            &arrival_constraints,
+            origin_apt.as_ref().map_or(0.0, |a| a.elev_ft),
+            crate::plan_audit::live_airframe(Some(self.cfg.service_ceiling_ft)),
+            Some(&suit),
+            true,
+        )
+        .await;
+        if let Some(stop) = audit.stop() {
+            return Err(stop.line.clone());
+        }
+        let audit_line = audit
+            .cautions()
+            .next()
+            .is_some()
+            .then(|| crate::plan_audit::spoken(&audit, false));
+
         // The flight's own transition altitude and level, ahead of the
         // airframe's default, for every altimeter rule from here on (the
         // departure set, the follower, the monitor's check). Cleared with
@@ -934,6 +976,14 @@ impl FullAuto {
             Some(l) => format!("{preflight}{l} "),
             None => preflight,
         };
+        let preflight = match &arrival_line {
+            Some(l) => format!("{preflight}{l} "),
+            None => preflight,
+        };
+        let preflight = match &audit_line {
+            Some(l) => format!("{preflight}{l} "),
+            None => preflight,
+        };
         let ack = format!(
             "Full auto, {} to {}. {}Cruise {}, {} enroute {}. {} Cancel or my controls any time.",
             fp.origin,
@@ -950,6 +1000,7 @@ impl FullAuto {
                 dest_name,
                 departure_rwy: fp.procedures.sid.as_ref().and(fp.procedures.origin_rwy.clone()),
                 climb_minimums,
+                arrival_constraints,
                 legs,
                 fms_payload,
                 local_runway,

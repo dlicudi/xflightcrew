@@ -739,6 +739,59 @@ pub(crate) async fn flight_plan_report(
     line
 }
 
+/// "Check the flight plan": the arm's whole-flight audit, spoken in full,
+/// without arming anything (`plan_audit`). The departure is probed only on
+/// the ground at the origin, where that scenery is loaded.
+pub(crate) async fn plan_check_report(
+    config: &Config,
+    xp: &XPlaneClient,
+    cache: &mut Option<(Instant, simbrief::FlightPlan)>,
+) -> String {
+    if let Err(msg) = ensure_plan(config, cache, PlanFetch::Asked).await {
+        return msg;
+    }
+    let Some((_, fp)) = cache.as_ref() else {
+        return "Couldn't fetch your SimBrief plan.".to_string();
+    };
+    let fp = fp.clone();
+    let mut legs =
+        crate::procedure::enroute_legs(&fp.waypoints, &fp.origin, &fp.destination, fp.cruise_alt_ft);
+    let (stars, _) = crate::plan_audit::arrival_restrictions(&config.cifp_dir, &fp, &mut legs);
+    let (path, o, d) = (config.apt_data_path.clone(), fp.origin.clone(), fp.destination.clone());
+    let (origin, dest) = tokio::task::spawn_blocking(move || {
+        (
+            crate::nav::find_airport(&path, &o).ok().flatten(),
+            crate::nav::find_airport(&path, &d).ok().flatten(),
+        )
+    })
+    .await
+    .unwrap_or((None, None));
+    let (ground, lat, lon) = tokio::join!(
+        xp.get_float(datarefs::ON_GROUND_ANY),
+        xp.get_float("sim/flightmodel/position/latitude"),
+        xp.get_float("sim/flightmodel/position/longitude"),
+    );
+    let at_origin = ground.is_ok_and(|g| g > 0.5)
+        && match (lat, lon, fp.waypoints.first()) {
+            (Ok(la), Ok(lo), Some(w)) => crate::nav::haversine_nm(la, lo, w.lat, w.lon) < 5.0,
+            _ => false,
+        };
+    let suit = crate::plan_audit::gather_suitability(xp, &fp, origin.as_ref(), dest.as_ref()).await;
+    let audit = crate::plan_audit::check(
+        xp,
+        &config.fix_data_path,
+        &fp,
+        &legs,
+        &stars,
+        origin.as_ref().map_or(0.0, |a| a.elev_ft),
+        crate::plan_audit::live_airframe(None),
+        Some(&suit),
+        at_origin,
+    )
+    .await;
+    format!("{} to {}. {}", fp.origin, fp.destination, crate::plan_audit::spoken(&audit, true))
+}
+
 /// The fetch policy a spoken plan ask carries: "refresh / reload / update"
 /// forces SimBrief even over a local plan; any other ask re-fetches a
 /// SimBrief plan and keeps a local one.

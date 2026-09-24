@@ -2715,6 +2715,185 @@ pub fn sid_minimums_in<'a>(
     out
 }
 
+/// X-Plane's grid MORA (`earth_mora.dat`): the minimum off-route altitude of
+/// every one-degree cell, feet, the highest ground or obstacle in it plus
+/// 1,000 ft (2,000 where that ground is above 5,000 ft). A line is "LAT LON"
+/// then 30 cells eastward in hundreds of feet; LAT is the cell's SOUTH edge
+/// (Everest, 27.99N 86.93E, is the 311 in row +27, column 86).
+#[derive(Debug, Clone, Default)]
+pub struct MoraGrid {
+    cells: std::collections::HashMap<(i32, i32), f64>,
+}
+
+impl MoraGrid {
+    /// Parse the file's lines. Unparseable lines are skipped.
+    pub fn parse<'a>(lines: impl Iterator<Item = &'a str>) -> MoraGrid {
+        let mut cells = std::collections::HashMap::new();
+        for line in lines {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 3 {
+                continue;
+            }
+            let (Ok(lat), Ok(lon0)) = (f[0].parse::<i32>(), f[1].parse::<i32>()) else {
+                continue;
+            };
+            for (i, v) in f[2..].iter().enumerate() {
+                if let Ok(h) = v.parse::<f64>() {
+                    cells.insert((lat, lon0 + i as i32), h * 100.0);
+                }
+            }
+        }
+        MoraGrid { cells }
+    }
+
+    /// Load `earth_mora.dat`; `None` when it cannot be read.
+    pub fn load(path: &str) -> Option<MoraGrid> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let g = MoraGrid::parse(text.lines());
+        (!g.cells.is_empty()).then_some(g)
+    }
+
+    /// The MORA of the cell holding this point, feet.
+    pub fn at(&self, lat: f64, lon: f64) -> Option<f64> {
+        self.cells
+            .get(&(lat.floor() as i32, lon.floor() as i32))
+            .copied()
+    }
+}
+
+/// The highest ground a MORA stands for, feet: its 2,000 ft margin above
+/// 7,000, its 1,000 below. Sea cells (1,000 or less) are sea level.
+pub fn mora_ground_ft(mora_ft: f64) -> f64 {
+    if mora_ft > 7_000.0 {
+        mora_ft - 2_000.0
+    } else {
+        (mora_ft - 1_000.0).max(0.0)
+    }
+}
+
+/// One published crossing restriction of an arrival (STAR) fix: altitude
+/// bounds in feet (either or both; an "at" sets both) and a speed limit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StarConstraint {
+    pub fix: String,
+    /// At or above (a `+`, an "at", a `B` window's lower bound).
+    pub min_ft: Option<f64>,
+    /// At or below (a `-`, an "at", a `B` window's upper bound).
+    pub max_ft: Option<f64>,
+    /// At or below this indicated speed crossing the fix, and from there on.
+    pub max_kts: Option<f64>,
+}
+
+impl StarConstraint {
+    /// The altitude a plan's `planned_ft` becomes at this fix: clamped into
+    /// the published window. An "at" is exactly its number.
+    pub fn clamp_ft(&self, planned_ft: f64) -> f64 {
+        let mut a = planned_ft;
+        if let Some(max) = self.max_ft {
+            a = a.min(max);
+        }
+        if let Some(min) = self.min_ft {
+            a = a.max(min);
+        }
+        a
+    }
+}
+
+/// The crossing restrictions of STAR `star` at `icao`, for the fixes on the
+/// route: its common part, the enroute transition the route enters by (a
+/// transition named for a fix in `route_fixes`), and the runway transition
+/// for `runway` ("ALL" and a parallel's "RW10B" included). Speed cells are
+/// field 26 (descriptor) and 27: a blank or `-` descriptor is a limit, a `+`
+/// is a minimum the governor has no use for. EGPH's STARs all end "FL070,
+/// 230 knots" at TARTN, and the follower flew SimBrief's own guess at a
+/// descent there, 278 kt at the last fix (EGTE 2026-09-21 had the same shape).
+pub fn star_constraints(
+    cifp_dir: &str,
+    icao: &str,
+    star: &str,
+    runway: Option<&str>,
+    route_fixes: &[&str],
+) -> Vec<StarConstraint> {
+    let path = std::path::Path::new(cifp_dir).join(format!("{icao}.dat"));
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    star_constraints_in(text.lines(), star, runway, route_fixes)
+}
+
+/// [`star_constraints`] over the file's lines (pure, for tests). One entry
+/// per fix, in procedure order; a fix published twice keeps the tighter
+/// bounds of both.
+pub fn star_constraints_in<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    star: &str,
+    runway: Option<&str>,
+    route_fixes: &[&str],
+) -> Vec<StarConstraint> {
+    let on_route = |f: &str| route_fixes.iter().any(|r| r.eq_ignore_ascii_case(f));
+    let mut out: Vec<StarConstraint> = Vec::new();
+    for line in lines {
+        let Some(body) = line.strip_prefix("STAR:") else {
+            continue;
+        };
+        let f: Vec<&str> = body.split(',').collect();
+        if !cifp_field(&f, 2).eq_ignore_ascii_case(star) {
+            continue;
+        }
+        let tr = cifp_field(&f, 3);
+        let ours = if tr.is_empty() || tr.eq_ignore_ascii_case("ALL") {
+            true
+        } else if let Some(r) = tr.strip_prefix("RW") {
+            match runway {
+                Some(want) if r.ends_with('B') => runway_number(r) == runway_number(want),
+                Some(want) => runway_matches(r, want) && r.len() == want.len(),
+                // No planned runway: a runway transition's numbers are a
+                // guess, and a wrong guess is a wrong number.
+                None => false,
+            }
+        } else {
+            on_route(tr)
+        };
+        let fix = cifp_field(&f, 4);
+        if !ours || fix.is_empty() || !on_route(fix) {
+            continue;
+        }
+        let (a1, a2) = (arinc_alt_ft(cifp_field(&f, 23)), arinc_alt_ft(cifp_field(&f, 24)));
+        let (min_ft, max_ft) = match cifp_field(&f, 22).chars().next().unwrap_or(' ') {
+            ' ' | '@' => (a1, a1),
+            '+' => (a1, None),
+            '-' => (None, a1),
+            'B' => (a2, a1),
+            _ => (None, None),
+        };
+        let max_kts = match cifp_field(&f, 26).chars().next().unwrap_or(' ') {
+            ' ' | '-' | '@' => cifp_field(&f, 27).parse::<f64>().ok().filter(|k| *k > 0.0),
+            _ => None,
+        };
+        if min_ft.is_none() && max_ft.is_none() && max_kts.is_none() {
+            continue;
+        }
+        let tighter = |a: Option<f64>, b: Option<f64>, lo: bool| match (a, b) {
+            (Some(x), Some(y)) => Some(if lo { x.max(y) } else { x.min(y) }),
+            (x, y) => x.or(y),
+        };
+        match out.iter_mut().find(|c| c.fix.eq_ignore_ascii_case(fix)) {
+            Some(c) => {
+                c.min_ft = tighter(c.min_ft, min_ft, true);
+                c.max_ft = tighter(c.max_ft, max_ft, false);
+                c.max_kts = tighter(c.max_kts, max_kts, false);
+            }
+            None => out.push(StarConstraint {
+                fix: fix.to_string(),
+                min_ft,
+                max_ft,
+                max_kts,
+            }),
+        }
+    }
+    out
+}
+
 /// A SID that departs `runway` at `icao` — the first ident with a leg whose
 /// transition is `RW<runway>`. `None` if the field publishes no SID for it.
 pub fn sid_for_runway(cifp_dir: &str, icao: &str, runway: &str) -> Option<String> {
@@ -3231,6 +3410,61 @@ SID:100,5,MOGT3H,RW26,MOGTI,LO,E,A,E   , ,   ,TF, , , , , ,      ,    ,    ,    
         let got: Vec<(&str, f64)> = m.iter().map(|m| (m.fix.as_str(), m.min_ft)).collect();
         assert_eq!(got, vec![("WI505", 4000.0), ("WI506", 7850.0), ("WI507", 8400.0)]);
         assert!(sid_minimums_in(file.lines(), "OTHER1A", "26").is_empty());
+    }
+
+    /// Rows from the installed `earth_mora.dat` (cycle 2406).
+    #[test]
+    fn the_mora_grid_is_read_by_the_cells_south_west_corner() {
+        let file = "I\n1150 Version - data cycle 2406\n\n\
++27 +060 095 113 112 097 087 099 108 101 022 020 024 025 025 026 038 048 039 026 019 019 019 029 083 098 101 167 311 310 305 263
++47 +000 035 035 035 044 044 044 078 085 112 114 138 140 150 136 110 100 070 040 052 059 059 040 049 068 096 094 083 029 033 029
++55 -030 010 010 010 010 010 010 010 010 010 010 010 010 010 010 010 010 010 010 010 010 013 038 038 040 042 041 041 041 037 014";
+        let g = MoraGrid::parse(file.lines());
+        assert_eq!(g.at(27.99, 86.93), Some(31_100.0), "Everest");
+        assert_eq!(g.at(47.26, 11.35), Some(14_000.0), "Innsbruck");
+        assert_eq!(g.at(55.95, -3.36), Some(4_100.0), "Edinburgh");
+        assert_eq!(g.at(10.0, 10.0), None);
+        assert_eq!(mora_ground_ft(31_100.0), 29_100.0);
+        assert_eq!(mora_ground_ft(4_100.0), 3_100.0);
+        assert_eq!(mora_ground_ft(1_000.0), 0.0);
+    }
+
+    /// EGPH AGPE1E and KSFO ALWYS3 (AIRAC 2609): an "at", a speed limit, a
+    /// window, a runway transition, and an enroute transition not flown.
+    #[test]
+    fn a_stars_restrictions_are_read_for_the_fixes_on_the_route() {
+        let egph = "\
+STAR:010,5,AGPE1E,ALL,AGPED,EG,E,A,E   , ,   ,IF, , , , , ,      ,    ,    ,    ,    , ,FL260,     ,     , ,   ,    ,   , , , , , , , , ;
+STAR:020,5,AGPE1E,ALL,HAVEN,EG,E,A,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,     ,-,250,    ,   , , , , , , , , ;
+STAR:030,5,AGPE1E,ALL,TARTN,EG,P,C,EE H, ,   ,TF, , , , , ,      ,    ,    ,    ,    , ,FL070,     ,     ,-,230,    ,   , , , , , , , , ;";
+        let c = star_constraints_in(egph.lines(), "AGPE1E", None, &["AGPED", "HAVEN", "TARTN"]);
+        assert_eq!(c.len(), 3);
+        assert_eq!((c[0].min_ft, c[0].max_ft, c[0].max_kts), (Some(26_000.0), Some(26_000.0), None));
+        assert_eq!((c[1].min_ft, c[1].max_ft, c[1].max_kts), (None, None, Some(250.0)));
+        assert_eq!((c[2].max_ft, c[2].max_kts), (Some(7_000.0), Some(230.0)));
+        assert_eq!(c[2].clamp_ft(9_500.0), 7_000.0);
+        let partial = star_constraints_in(egph.lines(), "AGPE1E", None, &["TARTN"]);
+        assert_eq!(partial.len(), 1, "fixes the route does not fly are not constraints");
+
+        let ksfo = "\
+STAR:010,4,ALWYS3,INYOE,INYOE,K2,E,A,E  H, ,   ,IF, , , , , ,      ,    ,    ,    ,    , ,     ,     ,18000, ,   ,    ,   , , , , , , , , ;
+STAR:020,4,ALWYS3,INYOE,DYAMD,K2,P,C,EE  , ,   ,TF, , , , , ,      ,    ,    ,    ,    ,+,FL270,     ,     , ,270,    ,   , , , , , , , , ;
+STAR:020,4,ALWYS3,RUSME,DYAMD,K2,P,C,EE  , ,   ,TF, , , , , ,      ,    ,    ,    ,    ,+,FL300,     ,     , ,270,    ,   , , , , , , , , ;
+STAR:020,5,ALWYS3, ,LAANE,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    ,B,FL260,FL220,     , ,260,    ,   , , , , , , , , ;
+STAR:030,6,ALWYS3,RW10B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    , ,10000,     ,     , ,240,    ,   , , , , , , , , ;
+STAR:030,6,ALWYS3,RW28B,ARRTU,K2,P,C,E   , ,   ,TF, , , , , ,      ,    ,    ,    ,    , ,12000,     ,     , ,250,    ,   , , , , , , , , ;";
+        let route = ["INYOE", "DYAMD", "LAANE", "ARRTU"];
+        let c = star_constraints_in(ksfo.lines(), "ALWYS3", Some("28L"), &route);
+        let dyamd = c.iter().find(|c| c.fix == "DYAMD").unwrap();
+        assert_eq!(dyamd.min_ft, Some(27_000.0), "the INYOE transition, not RUSME's");
+        let laane = c.iter().find(|c| c.fix == "LAANE").unwrap();
+        assert_eq!((laane.min_ft, laane.max_ft), (Some(22_000.0), Some(26_000.0)));
+        assert_eq!(laane.clamp_ft(30_000.0), 26_000.0);
+        assert_eq!(laane.clamp_ft(15_000.0), 22_000.0);
+        let arrtu = c.iter().find(|c| c.fix == "ARRTU").unwrap();
+        assert_eq!((arrtu.max_ft, arrtu.max_kts), (Some(12_000.0), Some(250.0)), "28L's, not 10's");
+        let unknown = star_constraints_in(ksfo.lines(), "ALWYS3", None, &route);
+        assert!(unknown.iter().all(|c| c.fix != "ARRTU"), "no runway, no runway transition");
     }
 
     /// LSZS RNAV 03 (AIRAC 2609): a final to a MAP two miles short, then a
